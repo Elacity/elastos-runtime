@@ -102,6 +102,18 @@ impl std::fmt::Display for GrantDuration {
     }
 }
 
+/// Affordance-consent binding carried into
+/// [`PendingRequestStore::create_affordance_request`] so the eventual grant is
+/// scoped to the exact affordance + arguments and can never be replayed for a
+/// different method or with different arguments (W2 step 3).
+#[derive(Debug, Clone)]
+pub struct AffordanceBinding {
+    pub capsule: String,
+    pub principal_id: String,
+    pub method_id: String,
+    pub input_hash: String,
+}
+
 /// A pending capability request
 #[derive(Debug, Clone)]
 pub struct PendingCapabilityRequest {
@@ -130,6 +142,22 @@ pub struct PendingCapabilityRequest {
     /// at request time (G-ID interim) so the eventual grant can mint at it instead
     /// of the session-id shim. `None` when the session has no capsule identity.
     pub requester_capsule_id: Option<String>,
+
+    /// Affordance-consent binding (W2 step 3). Set ONLY for affordance-consent
+    /// requests; `None` for ordinary session-capability requests
+    /// (behaviour-neutral default). Binds the eventual grant to this exact
+    /// affordance + argument hash so an approval can never be replayed for a
+    /// different method or different arguments (fail-closed; see
+    /// `with_affordance_binding`). Orthogonal to `requester_capsule_id`:
+    /// that records *who* asked (carrier identity); these record *what* the
+    /// consent is scoped to (the affordance + args).
+    pub capsule: Option<String>,
+    /// Principal the affordance-consent request was raised for.
+    pub principal_id: Option<String>,
+    /// Affordance method id the consent is scoped to.
+    pub method_id: Option<String>,
+    /// Canonical hash of the invocation arguments the consent is scoped to.
+    pub input_hash: Option<String>,
 }
 
 impl PendingCapabilityRequest {
@@ -152,7 +180,30 @@ impl PendingCapabilityRequest {
             expires_at,
             status: RequestStatus::Pending,
             requester_capsule_id: None,
+            capsule: None,
+            principal_id: None,
+            method_id: None,
+            input_hash: None,
         }
+    }
+
+    /// Attach affordance-consent binding to this request (W2 step 3). Used by the
+    /// affordance-consent path so the eventual grant binds to the exact
+    /// `(capsule, principal, method, argument-hash)` and cannot be replayed for a
+    /// different method or with different arguments. Ordinary session-capability
+    /// requests never call this and keep all four fields `None`.
+    pub fn with_affordance_binding(
+        mut self,
+        capsule: impl Into<String>,
+        principal_id: impl Into<String>,
+        method_id: impl Into<String>,
+        input_hash: impl Into<String>,
+    ) -> Self {
+        self.capsule = Some(capsule.into());
+        self.principal_id = Some(principal_id.into());
+        self.method_id = Some(method_id.into());
+        self.input_hash = Some(input_hash.into());
+        self
     }
 
     /// Check if the request has expired
@@ -237,15 +288,47 @@ impl PendingRequestStore {
 
     /// Like [`create_request`], but records the requester's real capsule identity
     /// (the carrier "vm-{name}") on the pending request so the eventual grant can
-    /// mint at it instead of the session-id shim (G-ID interim). Recorded only; no
-    /// gate reads it yet. `None` when the session has no capsule identity (a bare
-    /// shell), recorded honestly rather than fabricated.
+    /// mint at it instead of the session-id shim (G-ID interim). `None` when the
+    /// session has no capsule identity (a bare shell), recorded honestly rather
+    /// than fabricated.
     pub async fn create_request_with_capsule(
         &self,
         session_id: SessionId,
         resource: ResourceId,
         action: Action,
         requester_capsule_id: Option<String>,
+    ) -> PendingCapabilityRequest {
+        self.create_request_inner(session_id, resource, action, requester_capsule_id, None)
+            .await
+    }
+
+    /// Create a pending affordance-consent request bound to the exact
+    /// `(capsule, principal, method, argument-hash)` so the eventual grant can
+    /// never be replayed for a different method or with different arguments
+    /// (W2 step 3; the binding is read at grant time in step 6). Shares one
+    /// creation path with the session flow.
+    pub async fn create_affordance_request(
+        &self,
+        session_id: SessionId,
+        resource: ResourceId,
+        action: Action,
+        binding: AffordanceBinding,
+    ) -> PendingCapabilityRequest {
+        self.create_request_inner(session_id, resource, action, None, Some(binding))
+            .await
+    }
+
+    /// Shared creation path for the session, capsule-aware, and affordance-consent
+    /// requests. Applies the requester capsule identity and the affordance binding
+    /// (each when present) before storing, so the capacity guards, the per-session
+    /// rate limit, the session index, and the audit emit are identical for all.
+    async fn create_request_inner(
+        &self,
+        session_id: SessionId,
+        resource: ResourceId,
+        action: Action,
+        requester_capsule_id: Option<String>,
+        binding: Option<AffordanceBinding>,
     ) -> PendingCapabilityRequest {
         // Capacity guard: evict expired if at limit
         {
@@ -307,6 +390,14 @@ impl PendingRequestStore {
             self.timeout_secs,
         );
         request.requester_capsule_id = requester_capsule_id;
+        if let Some(b) = binding {
+            request = request.with_affordance_binding(
+                b.capsule,
+                b.principal_id,
+                b.method_id,
+                b.input_hash,
+            );
+        }
 
         // Store request
         {
@@ -1182,5 +1273,88 @@ mod tests {
             )
             .await;
         assert_eq!(without.requester_capsule_id, None);
+    }
+
+    #[tokio::test]
+    async fn affordance_binding_survives_storage_and_defaults_none() {
+        // W2 step 3: an affordance-consent request carries the full binding and it
+        // survives a store->retrieve round-trip; an ordinary session request keeps
+        // all four binding fields None (behaviour-neutral).
+        let store = create_test_store();
+
+        let bound = store
+            .create_affordance_request(
+                SessionId::from_string("session-aff"),
+                ResourceId::new("elastos://rights/play"),
+                Action::Execute,
+                AffordanceBinding {
+                    capsule: "vm-player".to_string(),
+                    principal_id: "did:ela:alice".to_string(),
+                    method_id: "play".to_string(),
+                    input_hash: "abc123".to_string(),
+                },
+            )
+            .await;
+
+        let got = store
+            .get_request(bound.id.as_str())
+            .await
+            .expect("affordance request is stored");
+        assert_eq!(got.capsule.as_deref(), Some("vm-player"));
+        assert_eq!(got.principal_id.as_deref(), Some("did:ela:alice"));
+        assert_eq!(got.method_id.as_deref(), Some("play"));
+        assert_eq!(got.input_hash.as_deref(), Some("abc123"));
+
+        // A plain session request carries no binding.
+        let plain = store
+            .create_request(
+                SessionId::from_string("session-plain"),
+                ResourceId::new("localhost://Users/self/Documents/x"),
+                Action::Read,
+            )
+            .await;
+        assert_eq!(plain.capsule, None);
+        assert_eq!(plain.method_id, None);
+        assert_eq!(plain.input_hash, None);
+    }
+
+    #[tokio::test]
+    async fn requester_identity_and_affordance_binding_coexist() {
+        // The collision reconciliation (G-ID requester_capsule_id vs W2 binding):
+        // both must be able to live on the SAME request. requester_capsule_id
+        // records WHO asked (carrier identity); the binding records WHAT the
+        // consent is scoped to (affordance + args). Neither overwrites the other.
+        let store = create_test_store();
+
+        let req = store
+            .create_request_inner(
+                SessionId::from_string("session-both"),
+                ResourceId::new("elastos://rights/play"),
+                Action::Execute,
+                Some("vm-caller".to_string()),
+                Some(AffordanceBinding {
+                    capsule: "vm-player".to_string(),
+                    principal_id: "did:ela:alice".to_string(),
+                    method_id: "play".to_string(),
+                    input_hash: "deadbeef".to_string(),
+                }),
+            )
+            .await;
+
+        let got = store
+            .get_request(req.id.as_str())
+            .await
+            .expect("request is stored");
+        assert_eq!(
+            got.requester_capsule_id.as_deref(),
+            Some("vm-caller"),
+            "identity (who asked) is preserved"
+        );
+        assert_eq!(
+            got.capsule.as_deref(),
+            Some("vm-player"),
+            "binding (what it's scoped to) is preserved alongside identity"
+        );
+        assert_eq!(got.input_hash.as_deref(), Some("deadbeef"));
     }
 }

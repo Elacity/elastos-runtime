@@ -4,6 +4,7 @@ use elastos_common::{
     AffordanceApprovalMode, AffordanceRisk, CapsuleAffordanceDescriptor,
     CapsuleInterfaceDescriptor, CapsuleManifest, CapsuleRole, CapsuleType,
 };
+use elastos_runtime::capability::Action;
 use serde::{Deserialize, Serialize};
 
 use super::*;
@@ -11,6 +12,31 @@ use super::*;
 const CAPSULE_CATALOG_SCHEMA: &str = "elastos.capsules.catalog/v1";
 const CAPSULE_INTERFACE_REGISTRY_SCHEMA: &str = "elastos.capsules.interfaces/v1";
 const CAPSULE_INTERFACE_INVOKE_RESULT_SCHEMA: &str = "elastos.capsules.invoke-result/v1";
+const CAPSULE_AFFORDANCE_CONSENT_PENDING_SCHEMA: &str =
+    "elastos.capsules.affordance-consent-pending/v1";
+
+/// The 202 body returned when a consent-gated affordance is invoked: a pending
+/// consent request the user must approve in the shell. Token-INCAPABLE by type —
+/// there is no token/output field, so the gateway can never leak a capability
+/// here. NOTE (W2): the eventual grant is scoped to `(resource, action,
+/// gateway-attach session)`; `principal_id` and the argument `input_hash` are
+/// recorded for audit and future per-principal/per-argument binding but are NOT
+/// yet enforced by the runtime at grant time, so a shell MUST NOT imply stronger
+/// per-invocation or per-principal consent than the token actually carries.
+#[derive(Debug, Serialize)]
+struct AffordanceConsentPending {
+    schema: String,
+    status: String,
+    request_id: String,
+    resource: String,
+    action: String,
+    risk: AffordanceRisk,
+    approval: AffordanceApprovalMode,
+    capsule: String,
+    interface: String,
+    method: String,
+    principal_id: String,
+}
 
 pub(super) async fn capsule_catalog(
     State(state): State<GatewayState>,
@@ -102,38 +128,110 @@ pub(super) async fn capsule_interface_invoke(
     }
 
     let output = match enforce_affordance_invocation_policy(&resolved) {
-        Ok(()) => match dispatch_capsule_affordance(&state, &context, &resolved, &request).await {
-            Ok(output) => output,
-            Err((status, code, message)) => {
-                let _ = append_provider_effect_audit(
-                    &state.data_dir,
-                    ProviderEffectAuditInput {
-                        capsule_id: &resolved.capsule,
-                        event_type: "capsule.affordance.failed",
-                        principal_id: &context.principal_id,
-                        session_id: &context.session_id,
-                        request_id: &request_id,
-                        result: "failed",
-                        reason: &message,
-                    },
-                );
-                return capsule_invoke_error(&resolved, status, code, &message);
+        InvocationGate::Direct => {
+            match dispatch_capsule_affordance(&state, &context, &resolved, &request).await {
+                Ok(output) => output,
+                Err((status, code, message)) => {
+                    let _ = append_provider_effect_audit(
+                        &state.data_dir,
+                        ProviderEffectAuditInput {
+                            capsule_id: &resolved.capsule,
+                            event_type: "capsule.affordance.failed",
+                            principal_id: &context.principal_id,
+                            session_id: &context.session_id,
+                            request_id: &request_id,
+                            result: "failed",
+                            reason: &message,
+                        },
+                    );
+                    return capsule_invoke_error(&resolved, status, code, &message);
+                }
             }
-        },
-        Err((status, code, message)) => {
+        }
+        InvocationGate::Consent => {
+            // Consent-gated affordance: derive the (resource, action) scope, raise a
+            // consent request through the runtime, return 202 + request_id. Never a
+            // token and never dispatch; every path in this arm diverges (returns).
+            let (resource, action, risk) = match affordance_consent_descriptor(&resolved) {
+                Ok(value) => value,
+                Err((status, code, message)) => {
+                    let _ = append_provider_effect_audit(
+                        &state.data_dir,
+                        ProviderEffectAuditInput {
+                            capsule_id: &resolved.capsule,
+                            event_type: "capsule.affordance.consent_failed",
+                            principal_id: &context.principal_id,
+                            session_id: &context.session_id,
+                            request_id: &request_id,
+                            result: "failed",
+                            reason: &message,
+                        },
+                    );
+                    return capsule_invoke_error(&resolved, status, code, &message);
+                }
+            };
+            let input_hash = elastos_common::canonical_input_hash(&request.input);
+            let action_str = action.to_string();
+            let consent_request_id = match request_affordance_consent(
+                &state.data_dir,
+                &resource,
+                &action_str,
+                &resolved.capsule,
+                &context.principal_id,
+                &resolved.method.id,
+                &input_hash,
+            )
+            .await
+            {
+                Ok(id) => id,
+                Err((status, code, message)) => {
+                    let _ = append_provider_effect_audit(
+                        &state.data_dir,
+                        ProviderEffectAuditInput {
+                            capsule_id: &resolved.capsule,
+                            event_type: "capsule.affordance.consent_failed",
+                            principal_id: &context.principal_id,
+                            session_id: &context.session_id,
+                            request_id: &request_id,
+                            result: "failed",
+                            reason: &message,
+                        },
+                    );
+                    return capsule_invoke_error(&resolved, status, code, &message);
+                }
+            };
             let _ = append_provider_effect_audit(
                 &state.data_dir,
                 ProviderEffectAuditInput {
                     capsule_id: &resolved.capsule,
-                    event_type: "capsule.affordance.failed",
+                    event_type: "capsule.affordance.consent_requested",
                     principal_id: &context.principal_id,
                     session_id: &context.session_id,
                     request_id: &request_id,
-                    result: "failed",
-                    reason: message,
+                    result: "approval_pending",
+                    reason: &format!(
+                        "{} requires user approval for {} ({}, {})",
+                        resolved.capsule, resolved.method.id, resource, action_str
+                    ),
                 },
             );
-            return capsule_invoke_error(&resolved, status, code, message);
+            return (
+                StatusCode::ACCEPTED,
+                Json(AffordanceConsentPending {
+                    schema: CAPSULE_AFFORDANCE_CONSENT_PENDING_SCHEMA.to_string(),
+                    status: "approval_pending".to_string(),
+                    request_id: consent_request_id,
+                    resource,
+                    action: action_str,
+                    risk,
+                    approval: resolved.method.approval.clone(),
+                    capsule: resolved.capsule.clone(),
+                    interface: resolved.interface_id.clone(),
+                    method: resolved.method.id.clone(),
+                    principal_id: context.principal_id.clone(),
+                }),
+            )
+                .into_response();
         }
     };
 
@@ -326,15 +424,20 @@ fn resolve_capsule_affordance(
     })
 }
 
-fn enforce_affordance_invocation_policy(
-    resolved: &ResolvedCapsuleAffordance,
-) -> Result<(), (StatusCode, &'static str, &'static str)> {
+/// Whether an affordance invocation dispatches directly or must first pass a
+/// user-consent round-trip. The flat 403 is gone: consent-gated methods now raise
+/// a consent request instead of dead-rejecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvocationGate {
+    /// Low-risk, runtime-policy method — dispatch directly.
+    Direct,
+    /// `AffordanceApprovalMode::User` or a high-risk class — require user consent.
+    Consent,
+}
+
+fn enforce_affordance_invocation_policy(resolved: &ResolvedCapsuleAffordance) -> InvocationGate {
     if resolved.method.approval == AffordanceApprovalMode::User {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "approval_required",
-            "user-approved affordance invocation is not enabled yet",
-        ));
+        return InvocationGate::Consent;
     }
     if matches!(
         resolved.method.risk,
@@ -343,13 +446,250 @@ fn enforce_affordance_invocation_policy(
             | AffordanceRisk::Actuator
             | AffordanceRisk::Privileged
     ) {
+        return InvocationGate::Consent;
+    }
+    InvocationGate::Direct
+}
+
+/// Narrowest [`Action`] implied by a declared [`AffordanceRisk`] class. Total and
+/// exhaustive so the first real high-risk affordance forces a compile-time review
+/// of this table. NOTE: risk alone NEVER yields `Admin` — because the eventual
+/// grant is scoped purely to this `(resource, action)` today, an `Admin` token on
+/// a wildcard resource would be an over-grant; `Admin` is reachable only via an
+/// authoritative admin/manage operation (see [`affordance_consent_descriptor`]).
+fn action_from_risk(risk: &AffordanceRisk) -> Action {
+    match risk {
+        AffordanceRisk::Read => Action::Read,
+        AffordanceRisk::Write => Action::Write,
+        AffordanceRisk::Launch => Action::Execute,
+        AffordanceRisk::Payment => Action::Execute,
+        AffordanceRisk::Rights => Action::Execute,
+        AffordanceRisk::Actuator => Action::Write,
+        AffordanceRisk::Privileged => Action::Execute,
+    }
+}
+
+/// Map a declared method `operation` to an [`Action`] by substring, first match
+/// wins. `None` means the operation maps to no known action, which the caller
+/// treats as a fail-closed `operation_unmapped` (never a default).
+fn action_from_operation(operation: &str) -> Option<Action> {
+    let op = operation.to_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|n| op.contains(n));
+    if has(&["admin", "manage"]) {
+        Some(Action::Admin)
+    } else if has(&["delete", "remove"]) {
+        Some(Action::Delete)
+    } else if has(&["execute", "invoke", "launch", "call", "run"]) {
+        Some(Action::Execute)
+    } else if has(&["send", "post", "message"]) {
+        Some(Action::Message)
+    } else if has(&["write", "create", "update", "set", "put"]) {
+        Some(Action::Write)
+    } else if has(&["read", "get", "list", "query"]) {
+        Some(Action::Read)
+    } else {
+        None
+    }
+}
+
+/// Privilege rank used to take the stronger of two actions. Higher = more power.
+fn action_rank(action: &Action) -> u8 {
+    match action {
+        Action::Read => 0,
+        Action::Message => 1,
+        Action::Write => 2,
+        Action::Delete => 3,
+        Action::Execute => 4,
+        Action::Admin => 5,
+    }
+}
+
+/// The stronger (higher-privilege) of two actions.
+fn max_privilege(a: Action, b: Action) -> Action {
+    if action_rank(&a) >= action_rank(&b) {
+        a
+    } else {
+        b
+    }
+}
+
+/// Derive the `(resource, action, risk)` a consent-gated affordance must request,
+/// fail-closed. `resource` comes from the method's DECLARED resource (no default);
+/// `action` is the narrowest action implied by the operation and risk. `Admin` is
+/// reachable ONLY when the operation is authoritatively admin/manage — risk alone
+/// is capped at `Execute`, because today this `(resource, action)` pair is the
+/// entire scope of the token the user later approves.
+fn affordance_consent_descriptor(
+    resolved: &ResolvedCapsuleAffordance,
+) -> Result<(String, Action, AffordanceRisk), (StatusCode, &'static str, String)> {
+    let resource = resolved
+        .method
+        .resource
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "descriptor_resource_missing",
+            "consent-gated affordance declares no resource; cannot scope consent".to_string(),
+        ))?
+        .to_string();
+
+    let risk_action = action_from_risk(&resolved.method.risk);
+    let action = match resolved.method.operation.as_deref() {
+        Some(operation) => {
+            let op_action = action_from_operation(operation).ok_or((
+                StatusCode::BAD_REQUEST,
+                "operation_unmapped",
+                format!("method operation '{operation}' does not map to a known action"),
+            ))?;
+            let operation_is_admin = matches!(op_action, Action::Admin);
+            let combined = max_privilege(risk_action, op_action);
+            // Operation is the only authority that may mint Admin; risk may only
+            // tighten within non-Admin.
+            if matches!(combined, Action::Admin) && !operation_is_admin {
+                Action::Execute
+            } else {
+                combined
+            }
+        }
+        None => match risk_action {
+            Action::Admin => Action::Execute,
+            other => other,
+        },
+    };
+
+    Ok((resource, action, resolved.method.risk.clone()))
+}
+
+/// Raise a user-consent request through the runtime for a consent-gated
+/// affordance, returning the runtime's `request_id`. NEVER returns or holds a
+/// token: the gateway is a thin adapter; the runtime (key holder) owns minting.
+/// Mirrors the inbox approve/deny seam (load coords -> attach shell token ->
+/// Bearer POST). All four binding fields are sent together (the runtime rejects a
+/// partial set 400); the status is default-deny (only "pending" yields an id).
+async fn request_affordance_consent(
+    data_dir: &std::path::Path,
+    resource: &str,
+    action: &str,
+    capsule: &str,
+    principal_id: &str,
+    method_id: &str,
+    input_hash: &str,
+) -> Result<String, (StatusCode, &'static str, String)> {
+    // The runtime stores binding fields verbatim with no emptiness check; an empty
+    // field would silently weaken the binding, so reject before the POST.
+    for (label, value) in [
+        ("capsule", capsule),
+        ("principal_id", principal_id),
+        ("method_id", method_id),
+        ("input_hash", input_hash),
+    ] {
+        if value.trim().is_empty() {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "binding_field_empty",
+                format!("consent binding field '{label}' is empty"),
+            ));
+        }
+    }
+
+    let coords = load_live_runtime_coords(data_dir).await.ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "runtime_unavailable",
+        "local runtime is not running".to_string(),
+    ))?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "consent_client_failed",
+                err.to_string(),
+            )
+        })?;
+    let shell_token = home_attach_shell(&client, &coords.api_url, &coords.attach_secret)
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "consent_attach_failed",
+                err.to_string(),
+            )
+        })?;
+    let response = client
+        .post(format!("{}/api/capability/request", coords.api_url))
+        .header(AUTHORIZATION, format!("Bearer {shell_token}"))
+        .json(&serde_json::json!({
+            "resource": resource,
+            "action": action,
+            "capsule": capsule,
+            "principal_id": principal_id,
+            "method_id": method_id,
+            "input_hash": input_hash,
+        }))
+        .send()
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "consent_post_failed",
+                err.to_string(),
+            )
+        })?;
+
+    if !response.status().is_success() {
+        // Keep the runtime refusal in the gateway audit only; never forward raw
+        // runtime prose to the caller (avoids leaking internal resource topology).
+        let runtime_status = response.status();
+        let runtime_body = response.text().await.unwrap_or_default();
         return Err((
-            StatusCode::FORBIDDEN,
-            "approval_required",
-            "high-risk affordances require explicit user approval before invocation",
+            StatusCode::BAD_GATEWAY,
+            "consent_rejected",
+            format!("runtime rejected consent request ({runtime_status}): {runtime_body}"),
         ));
     }
-    Ok(())
+
+    let body: serde_json::Value = response.json().await.map_err(|err| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "consent_parse_failed",
+            err.to_string(),
+        )
+    })?;
+
+    // Default-deny: only an explicit "pending" status yields a request_id; every
+    // other status (including a token-bearing "granted") fails closed.
+    match body.get("status").and_then(|s| s.as_str()) {
+        Some("pending") => body
+            .get("request_id")
+            .and_then(|r| r.as_str())
+            .map(str::to_string)
+            .ok_or((
+                StatusCode::BAD_GATEWAY,
+                "consent_missing_request_id",
+                "runtime returned pending without a request_id".to_string(),
+            )),
+        Some("granted") => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected_grant",
+            "runtime auto-granted a consent-gated affordance".to_string(),
+        )),
+        Some("denied") => Err((
+            StatusCode::FORBIDDEN,
+            "consent_denied",
+            "runtime denied the consent request".to_string(),
+        )),
+        other => Err((
+            StatusCode::BAD_GATEWAY,
+            "unexpected_status",
+            format!(
+                "unexpected consent status: {}",
+                other.unwrap_or("<missing>")
+            ),
+        )),
+    }
 }
 
 async fn dispatch_capsule_affordance(
@@ -1086,8 +1426,9 @@ mod tests {
     }
 
     #[test]
-    fn capsule_affordance_policy_rejects_high_risk_without_approval_binding() {
-        let resolved = ResolvedCapsuleAffordance {
+    fn capsule_affordance_policy_routes_consent_vs_direct() {
+        // High-risk (Payment) now routes to consent instead of a flat 403.
+        let high_risk = ResolvedCapsuleAffordance {
             capsule: "wallet".to_string(),
             interface_id: "elastos.wallet.payment".to_string(),
             method: CapsuleAffordanceDescriptor {
@@ -1102,9 +1443,127 @@ mod tests {
                 output_schema: None,
             },
         };
+        assert_eq!(
+            enforce_affordance_invocation_policy(&high_risk),
+            InvocationGate::Consent
+        );
 
-        let err = enforce_affordance_invocation_policy(&resolved).unwrap_err();
-        assert_eq!(err.0, StatusCode::FORBIDDEN);
-        assert_eq!(err.1, "approval_required");
+        // AffordanceApprovalMode::User routes to consent regardless of (low) risk.
+        let user_gated = resolved_with(AffordanceRisk::Read, Some("elastos://x"), Some("read"));
+        assert_eq!(
+            enforce_affordance_invocation_policy(&user_gated),
+            InvocationGate::Consent
+        );
+
+        // Low-risk + RuntimePolicy dispatches directly (no consent).
+        let direct = ResolvedCapsuleAffordance {
+            capsule: "viewer".to_string(),
+            interface_id: "elastos.viewer.media".to_string(),
+            method: CapsuleAffordanceDescriptor {
+                id: "catalog.list".to_string(),
+                description: None,
+                risk: AffordanceRisk::Read,
+                approval: AffordanceApprovalMode::RuntimePolicy,
+                audit: elastos_common::AffordanceAuditMode::Summary,
+                resource: Some("elastos://capsules/*".to_string()),
+                operation: Some("list".to_string()),
+                input_schema: None,
+                output_schema: None,
+            },
+        };
+        assert_eq!(
+            enforce_affordance_invocation_policy(&direct),
+            InvocationGate::Direct
+        );
+    }
+
+    fn resolved_with(
+        risk: AffordanceRisk,
+        resource: Option<&str>,
+        operation: Option<&str>,
+    ) -> ResolvedCapsuleAffordance {
+        ResolvedCapsuleAffordance {
+            capsule: "viewer".to_string(),
+            interface_id: "elastos.viewer.media".to_string(),
+            method: CapsuleAffordanceDescriptor {
+                id: "open".to_string(),
+                description: None,
+                risk,
+                approval: AffordanceApprovalMode::User,
+                audit: elastos_common::AffordanceAuditMode::Full,
+                resource: resource.map(str::to_string),
+                operation: operation.map(str::to_string),
+                input_schema: None,
+                output_schema: None,
+            },
+        }
+    }
+
+    #[test]
+    fn consent_descriptor_fails_closed_without_resource() {
+        let none = affordance_consent_descriptor(&resolved_with(
+            AffordanceRisk::Payment,
+            None,
+            Some("send"),
+        ));
+        assert_eq!(none.unwrap_err().1, "descriptor_resource_missing");
+        let blank = affordance_consent_descriptor(&resolved_with(
+            AffordanceRisk::Payment,
+            Some("   "),
+            Some("send"),
+        ));
+        assert_eq!(blank.unwrap_err().1, "descriptor_resource_missing");
+    }
+
+    #[test]
+    fn consent_descriptor_fails_closed_on_unmapped_operation() {
+        let err = affordance_consent_descriptor(&resolved_with(
+            AffordanceRisk::Write,
+            Some("elastos://content/x"),
+            Some("frobnicate"),
+        ))
+        .unwrap_err();
+        assert_eq!(err.1, "operation_unmapped");
+    }
+
+    #[test]
+    fn consent_descriptor_never_grants_admin_from_risk_alone() {
+        // Privileged risk with no operation must NOT yield Admin (capped at Execute).
+        let (_, action, _) = affordance_consent_descriptor(&resolved_with(
+            AffordanceRisk::Privileged,
+            Some("elastos://sys/*"),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(action, Action::Execute);
+        // Privileged risk with a non-admin operation also stays capped at Execute.
+        let (_, action2, _) = affordance_consent_descriptor(&resolved_with(
+            AffordanceRisk::Privileged,
+            Some("elastos://sys/*"),
+            Some("read"),
+        ))
+        .unwrap();
+        assert_eq!(action2, Action::Execute);
+        // Admin is reachable ONLY via an authoritative admin/manage operation.
+        let (_, action3, _) = affordance_consent_descriptor(&resolved_with(
+            AffordanceRisk::Privileged,
+            Some("elastos://sys/*"),
+            Some("admin.reset"),
+        ))
+        .unwrap();
+        assert_eq!(action3, Action::Admin);
+    }
+
+    #[test]
+    fn consent_descriptor_maps_resource_and_action() {
+        let (resource, action, risk) = affordance_consent_descriptor(&resolved_with(
+            AffordanceRisk::Read,
+            Some("elastos://content/film-x"),
+            Some("get"),
+        ))
+        .unwrap();
+        assert_eq!(resource, "elastos://content/film-x");
+        assert_eq!(action, Action::Read);
+        assert_eq!(risk, AffordanceRisk::Read);
     }
 }

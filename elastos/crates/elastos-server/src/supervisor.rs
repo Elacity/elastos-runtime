@@ -693,11 +693,15 @@ impl Supervisor {
         let mut dead: Vec<(String, Option<ProviderRoute>)> = Vec::new();
         {
             let mut running = self.running.write().await;
+            // iter_mut so the VM branch can REAP a self-exited child via
+            // has_exited() (try_wait), not merely probe liveness. A zombie still
+            // answers kill(pid,0), so an is_running()-only sweep would never
+            // collect it (BUG-1). We hold the write lock here, so reaping is safe.
             let dead_handles: Vec<String> = running
-                .iter()
+                .iter_mut()
                 .filter_map(|(handle, capsule)| {
-                    let alive = match &capsule.backend {
-                        CapsuleBackend::Vm(vm) => vm.is_running(),
+                    let alive = match &mut capsule.backend {
+                        CapsuleBackend::Vm(vm) => !vm.has_exited(),
                         CapsuleBackend::Carrier => true, // managed by carrier service bridge
                     };
                     if alive {

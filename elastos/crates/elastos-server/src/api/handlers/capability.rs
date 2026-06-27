@@ -16,8 +16,9 @@ use elastos_common::localhost::{
 };
 use elastos_runtime::approval::{self, ApprovalDecision};
 use elastos_runtime::capability::{
-    pending::PendingRequestStore, Action, CapabilityManager, GrantDuration, PolicyEvaluator,
-    PolicyOutcome, ResourceId, TokenConstraints,
+    pending::{AffordanceBinding, PendingRequestStore},
+    Action, CapabilityManager, GrantDuration, PolicyEvaluator, PolicyOutcome, ResourceId,
+    TokenConstraints,
 };
 use elastos_runtime::session::Session;
 
@@ -38,6 +39,17 @@ pub struct RequestCapabilityInput {
     pub resource: String,
     /// Action to request (e.g., "read", "write")
     pub action: String,
+    /// Affordance-consent binding (W2). All four are present together for an
+    /// affordance-consent request and absent together for an ordinary session
+    /// capability request; a partial set is rejected fail-closed.
+    #[serde(default)]
+    pub capsule: Option<String>,
+    #[serde(default)]
+    pub principal_id: Option<String>,
+    #[serde(default)]
+    pub method_id: Option<String>,
+    #[serde(default)]
+    pub input_hash: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,10 +134,53 @@ pub async fn request_capability(
     // For now, all requests go to pending (no auto-grant policy yet)
     // Future: check if session already has this capability, or if policy allows auto-grant
 
-    let request = state
-        .pending_store
-        .create_request_with_capsule(session.id.clone(), resource, action, session.vm_id.clone())
-        .await;
+    // Affordance-consent requests (W2) carry all four binding fields together and
+    // route through create_affordance_request so the eventual grant binds to the
+    // exact (capsule, principal, method, args). Ordinary session requests carry
+    // none and keep flint's G-ID behaviour (mint at the real capsule identity,
+    // session.vm_id). A partial binding is rejected fail-closed, never silently
+    // dropped.
+    let request = match (
+        input.capsule.as_ref(),
+        input.principal_id.as_ref(),
+        input.method_id.as_ref(),
+        input.input_hash.as_ref(),
+    ) {
+        (None, None, None, None) => {
+            state
+                .pending_store
+                .create_request_with_capsule(
+                    session.id.clone(),
+                    resource,
+                    action,
+                    session.vm_id.clone(),
+                )
+                .await
+        }
+        (Some(capsule), Some(principal_id), Some(method_id), Some(input_hash)) => {
+            state
+                .pending_store
+                .create_affordance_request(
+                    session.id.clone(),
+                    resource,
+                    action,
+                    AffordanceBinding {
+                        capsule: capsule.clone(),
+                        principal_id: principal_id.clone(),
+                        method_id: method_id.clone(),
+                        input_hash: input_hash.clone(),
+                    },
+                )
+                .await
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "affordance-consent binding requires all of capsule, principal_id, method_id, input_hash"
+                    .to_string(),
+            ));
+        }
+    };
 
     // If pre-denied (e.g. rate limit), surface the denial immediately
     if request.is_denied() {
@@ -876,6 +931,10 @@ mod tests {
             Json(RequestCapabilityInput {
                 resource: "elastos://rights/has".to_string(),
                 action: "read".to_string(),
+                capsule: None,
+                principal_id: None,
+                method_id: None,
+                input_hash: None,
             }),
         )
         .await
@@ -909,6 +968,10 @@ mod tests {
             Json(RequestCapabilityInput {
                 resource: "elastos://rights/has".to_string(),
                 action: "read".to_string(),
+                capsule: None,
+                principal_id: None,
+                method_id: None,
+                input_hash: None,
             }),
         )
         .await
@@ -959,6 +1022,10 @@ mod tests {
             Json(RequestCapabilityInput {
                 resource: "elastos://rights/has".to_string(),
                 action: "read".to_string(),
+                capsule: None,
+                principal_id: None,
+                method_id: None,
+                input_hash: None,
             }),
         )
         .await
@@ -986,6 +1053,10 @@ mod tests {
             Json(RequestCapabilityInput {
                 resource: "elastos://ipfs/add".to_string(),
                 action: "write".to_string(),
+                capsule: None,
+                principal_id: None,
+                method_id: None,
+                input_hash: None,
             }),
         )
         .await
@@ -1005,6 +1076,10 @@ mod tests {
             Json(RequestCapabilityInput {
                 resource: "elastos://content/publish".to_string(),
                 action: "write".to_string(),
+                capsule: None,
+                principal_id: None,
+                method_id: None,
+                input_hash: None,
             }),
         )
         .await

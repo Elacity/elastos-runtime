@@ -2474,6 +2474,10 @@ mod tests {
             Json(RequestCapabilityInput {
                 resource: rights_resource.clone(),
                 action: "read".to_string(),
+                capsule: None,
+                principal_id: None,
+                method_id: None,
+                input_hash: None,
             }),
         )
         .await
@@ -2559,6 +2563,10 @@ mod tests {
             Json(RequestCapabilityInput {
                 resource: rights_resource.clone(),
                 action: "write".to_string(),
+                capsule: None,
+                principal_id: None,
+                method_id: None,
+                input_hash: None,
             }),
         )
         .await

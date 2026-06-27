@@ -1,5 +1,6 @@
 //! Common types and utilities for ElastOS
 
+pub mod canonical_hash;
 pub mod chat_protocol;
 mod error;
 pub mod localhost;
@@ -8,6 +9,7 @@ pub mod protected_content;
 pub mod timestamp;
 mod types;
 
+pub use canonical_hash::canonical_input_hash;
 pub use error::{ElastosError, Result};
 pub use manifest::{
     AffordanceApprovalMode, AffordanceAuditMode, AffordanceRisk, CapsuleAffordanceDescriptor,
