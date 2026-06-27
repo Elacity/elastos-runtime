@@ -172,11 +172,18 @@ pub(super) async fn capsule_interface_invoke(
             };
             let input_hash = elastos_common::canonical_input_hash(&request.input);
             let action_str = action.to_string();
+            // Bind consent to the CANONICAL capsule identity ("vm-{name}", the
+            // G-ID convention every gate validates against), not the bare manifest
+            // name. The eventual single-use token (W2 step 6) is minted at this
+            // identity, so it validates at the same domain the carrier/HTTP gates
+            // use — affordance tokens live in the ONE identity domain, not a second
+            // one (the anti-pattern G-ID already eliminated).
+            let bound_capsule = format!("vm-{}", resolved.capsule);
             let consent_request_id = match request_affordance_consent(
                 &state.data_dir,
                 &resource,
                 &action_str,
-                &resolved.capsule,
+                &bound_capsule,
                 &context.principal_id,
                 &resolved.method.id,
                 &input_hash,

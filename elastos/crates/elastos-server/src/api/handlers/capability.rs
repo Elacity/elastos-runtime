@@ -15,10 +15,11 @@ use elastos_common::localhost::{
     is_overbroad_grant_resource, is_supported_resource_scheme, is_system_only_backend_resource,
 };
 use elastos_runtime::approval::{self, ApprovalDecision};
+use elastos_runtime::capability::manager::ValidationError;
 use elastos_runtime::capability::{
     pending::{AffordanceBinding, PendingRequestStore},
-    Action, CapabilityManager, GrantDuration, PolicyEvaluator, PolicyOutcome, ResourceId,
-    TokenConstraints,
+    Action, CapabilityManager, CapabilityToken, GrantDuration, PolicyEvaluator, PolicyOutcome,
+    ResourceId, TokenConstraints,
 };
 use elastos_runtime::session::Session;
 
@@ -212,6 +213,143 @@ pub struct RequestStatusOutput {
     /// Reason (if denied)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+// === Validate And Consume (W2 step 7) ===
+
+/// Parse an action string into an [`Action`], or a 400 listing the allowed set.
+fn parse_action(raw: &str) -> Result<Action, (StatusCode, String)> {
+    match raw.to_lowercase().as_str() {
+        "read" => Ok(Action::Read),
+        "write" => Ok(Action::Write),
+        "execute" => Ok(Action::Execute),
+        "delete" => Ok(Action::Delete),
+        "message" => Ok(Action::Message),
+        "admin" => Ok(Action::Admin),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Invalid action: {raw}. Expected: read, write, execute, delete, message, admin"
+            ),
+        )),
+    }
+}
+
+/// Map a [`ValidationError`] to a fail-closed response with a DISTINCT, safe code
+/// per failure. We never forward the error's `Display` (it embeds expected/got
+/// resources + capsule ids), which would leak internal topology to the caller.
+fn map_validation_error(err: &ValidationError) -> (StatusCode, String) {
+    let code = match err {
+        ValidationError::InvalidVersion { .. } => "token_version_unsupported",
+        ValidationError::InvalidSignature => "token_signature_invalid",
+        ValidationError::UntrustedIssuer => "token_issuer_untrusted",
+        ValidationError::WrongCapsule { .. } => "token_wrong_caller",
+        ValidationError::WrongAction { .. } => "token_wrong_action",
+        ValidationError::WrongResource { .. } => "token_wrong_resource",
+        ValidationError::TokenRevoked => "token_revoked",
+        ValidationError::TokenExpired => "token_expired",
+        ValidationError::FutureDatedToken => "token_not_yet_valid",
+        ValidationError::UseLimitExceeded { .. } => "token_already_used",
+        ValidationError::ClassificationExceeded { .. } => "token_classification_insufficient",
+        ValidationError::DelegationNotAllowed => "token_delegation_not_allowed",
+        ValidationError::DelegationScopeWidened => "token_delegation_scope_widened",
+    };
+    (StatusCode::FORBIDDEN, code.to_string())
+}
+
+/// Body for `POST /api/capability/validate-and-consume`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidateAndConsumeInput {
+    /// The granted affordance-consent token (base64).
+    pub token: String,
+    /// The affordance method being invoked; must equal the token's bound method.
+    pub method_id: String,
+    /// The resource the invocation targets; must match the token's resource.
+    pub resource: String,
+    /// The action being performed; must match the token's action.
+    pub action: String,
+    /// The invocation arguments; re-hashed and compared to the token's binding.
+    #[serde(default)]
+    pub input: serde_json::Value,
+}
+
+/// Result of a successful redemption.
+#[derive(Debug, Serialize)]
+pub struct ValidateAndConsumeOutput {
+    /// Always "consumed" on success (the single use has been atomically spent).
+    pub status: String,
+}
+
+/// POST /api/capability/validate-and-consume
+///
+/// Redeem an affordance-consent token for a SINGLE invocation (W2 step 7). The
+/// runtime — the sole key holder — re-validates the token AND re-checks that the
+/// invocation matches the EXACT `(method, arguments)` the user approved, then
+/// atomically consumes the single use (emitting a signed `CapabilityUse`). This
+/// is the only validator for affordance-consent tokens; the edge cannot bypass
+/// it. Every failure is fail-closed with a distinct code and no internal prose.
+pub async fn validate_and_consume(
+    State(state): State<CapabilityState>,
+    Extension(session): Extension<Session>,
+    Json(input): Json<ValidateAndConsumeInput>,
+) -> Result<Json<ValidateAndConsumeOutput>, (StatusCode, String)> {
+    // The caller identity is the AUTHENTICATED session's capsule identity
+    // ("vm-{name}"), never a value from the request body (Principle 16: a surface
+    // is not authority). Fail closed when the session has no capsule identity.
+    let caller = session.vm_id.as_deref().ok_or((
+        StatusCode::FORBIDDEN,
+        "redeeming session has no capsule identity".to_string(),
+    ))?;
+
+    // Decode the token; a malformed token is refused, never trusted.
+    let token = CapabilityToken::from_base64(&input.token).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "malformed capability token".to_string(),
+        )
+    })?;
+
+    // This endpoint redeems ONLY affordance-consent tokens — they carry a binding.
+    // A token without one must go through the ordinary capability gate, not here.
+    let (bound_method, bound_hash) = match (
+        token.constraints().method_id(),
+        token.constraints().input_hash(),
+    ) {
+        (Some(method), Some(hash)) => (method, hash),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "token is not an affordance-consent token".to_string(),
+            ));
+        }
+    };
+
+    // Re-check the binding BEFORE consuming, so a mismatched redemption fails
+    // closed WITHOUT burning the single use. Distinct codes for method vs args.
+    if bound_method != input.method_id {
+        return Err((StatusCode::FORBIDDEN, "consent_method_mismatch".to_string()));
+    }
+    let recomputed = elastos_common::canonical_input_hash(&input.input);
+    if bound_hash != recomputed {
+        return Err((StatusCode::FORBIDDEN, "consent_args_mismatch".to_string()));
+    }
+
+    // Full validation (signature, issuer, caller, action, resource, revocation,
+    // expiry) AND the atomic single-use consume + signed CapabilityUse all happen
+    // inside validate() — the one canonical validator. It consumes only after
+    // every check passes, so the failures above never spend the use either.
+    let resource = ResourceId::new(&input.resource);
+    let action = parse_action(&input.action)?;
+    state
+        .capability_manager
+        .validate(&token, caller, action, &resource, None)
+        .await
+        .map_err(|err| map_validation_error(&err))?;
+
+    Ok(Json(ValidateAndConsumeOutput {
+        status: "consumed".to_string(),
+    }))
 }
 
 /// GET /api/capability/request/:id
@@ -1111,6 +1249,138 @@ mod tests {
                 .await
                 .is_err(),
             "token does not validate at the requesting session identity"
+        );
+    }
+
+    /// Helper: run request -> grant for an affordance-consent request bound to
+    /// vm-player and return the minted base64 token.
+    async fn mint_affordance_token(
+        state: &CapabilityState,
+        method_id: &str,
+        input_hash: &str,
+    ) -> String {
+        let session = Session::new_capsule("vm-player".to_string());
+        let req = request_capability(
+            State(state.clone()),
+            Extension(session.clone()),
+            Json(RequestCapabilityInput {
+                resource: "elastos://rights/play".to_string(),
+                action: "execute".to_string(),
+                capsule: Some("vm-player".to_string()),
+                principal_id: Some("did:ela:alice".to_string()),
+                method_id: Some(method_id.to_string()),
+                input_hash: Some(input_hash.to_string()),
+            }),
+        )
+        .await
+        .expect("affordance request accepted")
+        .0;
+        grant_request(
+            State(state.clone()),
+            Extension(session),
+            Json(GrantRequestInput {
+                request_id: req.request_id.expect("request id"),
+                duration: "session".to_string(),
+                rationale: None,
+            }),
+        )
+        .await
+        .expect("affordance grant")
+        .0
+        .token
+        .expect("token minted")
+    }
+
+    fn redeem_input(
+        token: &str,
+        method_id: &str,
+        args: serde_json::Value,
+    ) -> ValidateAndConsumeInput {
+        ValidateAndConsumeInput {
+            token: token.to_string(),
+            method_id: method_id.to_string(),
+            resource: "elastos://rights/play".to_string(),
+            action: "execute".to_string(),
+            input: args,
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_and_consume_enforces_binding_single_use_and_caller() {
+        // W2 step 7: the runtime re-validates an affordance token AND re-checks the
+        // exact (method, args) the user approved, then atomically spends the one
+        // use. Every mismatch fails closed; only a correct redemption consumes.
+        let state = test_state();
+        let hash = elastos_common::canonical_input_hash(&serde_json::json!({"x": 1}));
+        let player = || Extension(Session::new_capsule("vm-player".to_string()));
+
+        // Correct redemption succeeds once; replay is refused (single use spent).
+        let token = mint_affordance_token(&state, "play", &hash).await;
+        assert!(
+            validate_and_consume(
+                State(state.clone()),
+                player(),
+                Json(redeem_input(&token, "play", serde_json::json!({"x": 1}))),
+            )
+            .await
+            .is_ok(),
+            "a correct redemption consumes the single use"
+        );
+        assert!(
+            validate_and_consume(
+                State(state.clone()),
+                player(),
+                Json(redeem_input(&token, "play", serde_json::json!({"x": 1}))),
+            )
+            .await
+            .is_err(),
+            "a single-use affordance token cannot be replayed"
+        );
+
+        // A fresh token: method-swap, args-swap, and wrong-caller each fail closed
+        // and must NOT burn the use (the binding checks precede the consume).
+        let t2 = mint_affordance_token(&state, "play", &hash).await;
+        assert!(
+            validate_and_consume(
+                State(state.clone()),
+                player(),
+                Json(redeem_input(&t2, "delete", serde_json::json!({"x": 1}))),
+            )
+            .await
+            .is_err(),
+            "method-swap is refused"
+        );
+        assert!(
+            validate_and_consume(
+                State(state.clone()),
+                player(),
+                Json(redeem_input(&t2, "play", serde_json::json!({"x": 2}))),
+            )
+            .await
+            .is_err(),
+            "argument-swap is refused"
+        );
+        assert!(
+            validate_and_consume(
+                State(state.clone()),
+                Extension(Session::new_capsule("vm-other".to_string())),
+                Json(redeem_input(&t2, "play", serde_json::json!({"x": 1}))),
+            )
+            .await
+            .is_err(),
+            "a different caller identity is refused"
+        );
+        // The three refused attempts did not spend the use: a correct redemption
+        // of the same token still succeeds.
+        assert!(
+            validate_and_consume(
+                State(state.clone()),
+                player(),
+                Json(redeem_input(&t2, "play", serde_json::json!({"x": 1}))),
+            )
+            .await
+            .is_ok(),
+            "fail-closed attempts must not burn the single use"
         );
     }
 

@@ -239,6 +239,10 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         )
         .route("/api/capability/request/:id", get(handlers::request_status))
         .route("/api/capability/list", get(handlers::list_capabilities))
+        .route(
+            "/api/capability/validate-and-consume",
+            post(handlers::validate_and_consume),
+        )
         .layer(axum_middleware::from_fn_with_state(
             general_rate_state.clone(),
             rate_limit_middleware,
