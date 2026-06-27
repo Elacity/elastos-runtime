@@ -6,383 +6,660 @@
     <title>Create</title>
     <style>
       :root {
-        --bg: #f6f7f9;
-        --surface: #ffffff;
-        --line: #e4e7ec;
-        --text: #14181f;
-        --muted: #5b6472;
-        --accent: #2f6bff;
-        --accent-weak: #eaf0ff;
+        /* First-party ElastOS cluster tokens (system / inbox / documents). */
+        --bg: #edf1fb;
+        --panel: rgba(255, 255, 255, 0.9);
+        --panel-strong: #ffffff;
+        --panel-soft: #eef2ff;
+        --line: rgba(83, 103, 164, 0.14);
+        --line-strong: rgba(83, 103, 164, 0.22);
+        --border: rgba(83, 103, 164, 0.18);
+        --ink: #1d2438;
+        --text: #1d2438;
+        --muted: #66708a;
+        --accent: #5f76d8;
+        --accent-soft: #e8edff;
+        --accent-deep: #3c53a7;
+        --accent-focus: rgba(95, 118, 216, 0.45);
+        --brand: #f6921a;
         --ok: #1f9d57;
-        --err: #d23b3b;
-        --radius: 12px;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        --err: #b14c5a;
+        --radius: 18px;
+        --radius-input: 12px;
+        --radius-btn: 12px;
+        font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", Roboto, sans-serif;
       }
       * { box-sizing: border-box; }
       body {
         margin: 0;
-        background: var(--bg);
         color: var(--text);
         min-height: 100vh;
-        display: flex;
-        justify-content: center;
+        background:
+          radial-gradient(1200px 600px at 15% -10%, #f7f9ff 0%, rgba(247, 249, 255, 0) 55%),
+          radial-gradient(900px 500px at 100% 0%, #eef2ff 0%, rgba(238, 242, 255, 0) 50%),
+          var(--bg);
+        background-attachment: fixed;
+        font-family: inherit;
       }
       main {
         width: 100%;
-        max-width: 560px;
-        padding: 28px 22px 56px;
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 28px 22px 64px;
       }
-      header h1 { font-size: 22px; margin: 0 0 2px; letter-spacing: -0.01em; }
-      header p { margin: 0 0 22px; color: var(--muted); font-size: 13px; }
+
+      /* ── Header ─────────────────────────────────────────────────────────── */
+      header { margin-bottom: 18px; }
+      .brand-row { display: flex; align-items: center; gap: 10px; }
+      .brand-mark {
+        width: 22px; height: 22px; border-radius: 7px; flex: none;
+        background: linear-gradient(135deg, var(--brand), #ffb457);
+        box-shadow: 0 2px 8px rgba(246, 146, 26, 0.35);
+      }
+      header h1 { font-size: 26px; margin: 0; letter-spacing: -0.02em; }
+      header .lede { margin: 8px 0 0; color: var(--muted); font-size: 14px; max-width: 60ch; }
+      details.trust { margin-top: 12px; }
+      details.trust > summary {
+        cursor: pointer; font-size: 12.5px; font-weight: 600; color: var(--accent);
+        list-style: none; display: inline-flex; align-items: center; gap: 6px; width: fit-content;
+      }
+      details.trust > summary::-webkit-details-marker { display: none; }
+      details.trust > summary::before { content: "ⓘ"; font-size: 12px; }
+      details.trust[open] > summary { margin-bottom: 8px; }
+      details.trust p {
+        margin: 0; font-size: 12.5px; color: var(--muted); line-height: 1.55;
+        background: var(--panel-strong); border: 1px solid var(--line);
+        border-radius: 12px; padding: 12px 14px; max-width: 64ch;
+      }
+
+      /* ── Two-column studio layout ───────────────────────────────────────── */
+      .studio-grid { display: grid; grid-template-columns: 1fr; gap: 18px; align-items: start; }
+      @media (min-width: 900px) {
+        .studio-grid { grid-template-columns: minmax(0, 1fr) 320px; }
+        .studio-preview { position: sticky; top: 20px; }
+      }
+      .studio-form { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+
+      /* ── Cards & sections ───────────────────────────────────────────────── */
       .card {
-        background: var(--surface);
+        background: var(--panel-strong);
         border: 1px solid var(--line);
         border-radius: var(--radius);
-        padding: 18px;
-        margin-bottom: 16px;
+        padding: 20px;
+        box-shadow: 0 1px 2px rgba(29, 36, 56, 0.04), 0 8px 24px rgba(29, 36, 56, 0.05);
       }
-      label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin: 0 0 6px; }
+      .section-title {
+        font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;
+        color: var(--accent-deep); margin: 0 0 16px;
+        display: flex; align-items: center; gap: 8px;
+      }
+      .section-title .num {
+        display: inline-grid; place-items: center; width: 20px; height: 20px; border-radius: 999px;
+        background: var(--accent-soft); color: var(--accent-deep); font-size: 11px; font-weight: 700;
+      }
+      .section-lede { font-size: 12.5px; color: var(--muted); margin: -8px 0 16px; line-height: 1.5; }
+
+      /* ── Fields & controls ──────────────────────────────────────────────── */
+      label { display: block; font-size: 12px; font-weight: 700; color: var(--muted); margin: 0 0 6px; }
       input[type="text"], input[type="number"], textarea, select {
         width: 100%;
-        border: 1px solid var(--line);
-        border-radius: 8px;
-        padding: 10px 12px;
+        border: 1px solid var(--line-strong);
+        border-radius: var(--radius-input);
+        padding: 0.66rem 0.78rem;
         font-size: 14px;
-        background: #fff;
+        font-family: inherit;
+        background: var(--panel-strong);
         color: var(--text);
+        transition: border-color .15s, box-shadow .15s;
+      }
+      input:focus, textarea:focus, select:focus {
+        outline: none;
+        border-color: var(--accent-focus);
+        box-shadow: 0 0 0 3px rgba(95, 118, 216, 0.16);
       }
       textarea { resize: vertical; min-height: 64px; }
-      .row { display: flex; gap: 12px; }
-      .row > div { flex: 1; }
+      .row { display: flex; gap: 12px; flex-wrap: wrap; }
+      .row > div { flex: 1 1 160px; min-width: 0; }
       .field { margin-bottom: 14px; }
       .field:last-child { margin-bottom: 0; }
+      .field-err { font-size: 11.5px; color: var(--err); margin-top: 6px; min-height: 0; }
+      .field-err:empty { margin-top: 0; }
+
+      /* ── Drop zones ─────────────────────────────────────────────────────── */
       .drop {
-        border: 1.5px dashed var(--line);
+        border: 1.5px dashed var(--line-strong);
         border-radius: var(--radius);
         padding: 26px 18px;
         text-align: center;
         color: var(--muted);
         cursor: pointer;
+        background: var(--panel-soft);
         transition: border-color .15s, background .15s;
       }
-      .drop:hover, .drop.over { border-color: var(--accent); background: var(--accent-weak); }
+      .drop.drop-sm { padding: 16px; }
+      .drop:hover, .drop.over { border-color: var(--accent); background: var(--accent-soft); }
+      .drop:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
       .drop strong { color: var(--text); display: block; font-size: 14px; }
       .drop .meta { font-size: 12px; margin-top: 4px; }
+      .thumb-preview { margin-top: 10px; display: flex; align-items: center; gap: 10px; }
+      .thumb-preview img {
+        width: 64px; height: 64px; object-fit: cover; border-radius: 10px; border: 1px solid var(--line);
+      }
+      .btn-mini {
+        border: 1px solid var(--line-strong); background: var(--panel-strong); color: var(--text);
+        border-radius: 9px; padding: 6px 10px; font-size: 12px; cursor: pointer; font-family: inherit;
+      }
+      .btn-mini:hover { background: var(--panel-soft); }
+
       .badge {
         display: inline-block;
         font-size: 11px;
         font-weight: 600;
-        padding: 2px 8px;
+        padding: 2px 9px;
         border-radius: 999px;
-        background: var(--accent-weak);
-        color: var(--accent);
+        background: var(--accent-soft);
+        color: var(--accent-deep);
         margin-left: 6px;
       }
+
+      /* ── Buttons ────────────────────────────────────────────────────────── */
       button.primary {
         width: 100%;
         border: 0;
-        border-radius: 10px;
+        border-radius: var(--radius-btn);
         background: var(--accent);
-        color: #fff;
+        color: #f8fbff;
         font-size: 15px;
-        font-weight: 600;
+        font-weight: 700;
+        font-family: inherit;
         padding: 13px;
         cursor: pointer;
+        transition: background .15s, box-shadow .15s;
       }
-      button.primary:disabled { background: #b9c6e8; cursor: not-allowed; }
-      /* "Mint another" — a calm secondary action shown after a mint is broadcast. */
+      button.primary:hover:not(:disabled) { background: var(--accent-deep); }
+      button.primary:disabled { background: #c4cdec; color: #f4f6ff; cursor: not-allowed; }
       button.secondary {
         width: 100%;
         margin-top: 10px;
-        border: 1px solid var(--line);
-        border-radius: 10px;
-        background: #fff;
-        color: var(--accent);
+        border: 1px solid var(--line-strong);
+        border-radius: var(--radius-btn);
+        background: var(--panel-strong);
+        color: var(--accent-deep);
         padding: 11px 14px;
-        font-weight: 600;
+        font-weight: 700;
+        font-family: inherit;
         cursor: pointer;
       }
-      button.secondary:hover { background: #f4f7ff; }
+      button.secondary:hover { background: var(--panel-soft); }
+      button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
       /* Promote "Enable trading" once the mint confirms on-chain so it reads as the next action. */
-      button.primary.is-ready {
-        animation: enable-trading-pulse 1.6s ease-in-out infinite;
-      }
+      button.primary.is-ready { animation: enable-trading-pulse 1.6s ease-in-out infinite; }
       @keyframes enable-trading-pulse {
-        0%, 100% { box-shadow: 0 0 0 0 rgba(64, 120, 240, 0.45); }
-        50% { box-shadow: 0 0 0 7px rgba(64, 120, 240, 0); }
+        0%, 100% { box-shadow: 0 0 0 0 rgba(95, 118, 216, 0.45); }
+        50% { box-shadow: 0 0 0 7px rgba(95, 118, 216, 0); }
       }
       @media (prefers-reduced-motion: reduce) {
-        button.primary.is-ready { animation: none; box-shadow: 0 0 0 3px rgba(64, 120, 240, 0.35); }
+        button.primary.is-ready { animation: none; box-shadow: 0 0 0 3px rgba(95, 118, 216, 0.35); }
       }
+
+      /* ── Mint progress (PC2-style live pipeline) ────────────────────────── */
+      .mint-progress {
+        margin: 0 0 14px;
+        padding: 14px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--panel-soft);
+      }
+      /* Overall smooth bar — shown while a mint is running. */
+      .overall-progress { margin-bottom: 12px; }
+      .overall-progress.hidden { display: none !important; }
+      .overall-progress-track {
+        height: 8px; border-radius: 999px; background: var(--bg);
+        overflow: hidden; border: 1px solid var(--line);
+      }
+      .overall-progress-fill {
+        height: 100%; width: 0%; border-radius: 999px;
+        background: linear-gradient(90deg, var(--accent), var(--accent-deep));
+        transition: width .45s ease;
+      }
+      .overall-progress-meta {
+        display: flex; justify-content: space-between; align-items: baseline;
+        margin-top: 6px; font-size: 12px; color: var(--muted);
+      }
+      .overall-progress-pct { font-weight: 700; color: var(--accent-deep); }
+      .overall-progress.done .overall-progress-fill { background: var(--ok); }
+
+      /* Steps panel (open by default — the roadmap is always visible). */
+      details.steps-panel { border: 0; }
+      details.steps-panel > summary {
+        cursor: pointer; font-size: 12px; font-weight: 700; color: var(--accent-deep);
+        list-style: none; display: inline-flex; align-items: center; gap: 6px; margin-bottom: 8px;
+      }
+      details.steps-panel > summary::-webkit-details-marker { display: none; }
+      details.steps-panel > summary::after { content: "▾"; font-size: 10px; transition: transform .15s; }
+      details.steps-panel[open] > summary::after { transform: rotate(180deg); }
+
       .steps { list-style: none; padding: 0; margin: 0; }
-      .steps li {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        font-size: 13px;
-        color: var(--muted);
-        padding: 7px 0;
+      .steps li { padding: 6px 0; }
+      .step-row { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
+      .step-icon {
+        width: 18px; text-align: center; font-size: 13px; flex: none; color: var(--muted);
+        line-height: 1;
       }
-      .steps li .dot {
-        width: 16px; height: 16px; border-radius: 50%;
-        border: 2px solid var(--line); flex: none;
+      .step-label { flex: 1; min-width: 0; }
+      .step-status { font-size: 11px; color: var(--muted); white-space: nowrap; }
+      .step-bar {
+        display: block; height: 3px; margin: 7px 0 0 28px; border-radius: 3px;
+        background: var(--bg); overflow: hidden;
       }
-      .steps li.active { color: var(--text); }
-      .steps li.active .dot { border-color: var(--accent); }
-      .steps li.done .dot { border-color: var(--ok); background: var(--ok); }
-      .steps li.err { color: var(--err); }
-      .steps li.err .dot { border-color: var(--err); background: var(--err); }
-      .tech-progress {
-        margin: 12px 0;
-        padding: 10px 12px;
-        border: 1px solid var(--border, #2a2a2a);
-        border-radius: 8px;
-        background: rgba(255, 255, 255, 0.02);
+      .step-bar-fill {
+        display: block; height: 100%; width: 0%; border-radius: 3px;
+        background: var(--accent); transition: width .4s ease;
       }
-      .tech-progress > summary {
-        cursor: pointer;
-        font-size: 13px;
-        font-weight: 600;
-        margin-bottom: 8px;
+      .steps li.active .step-row { color: var(--text); font-weight: 600; }
+      .steps li.active .step-icon { color: var(--accent); animation: tech-pulse 1s ease-in-out infinite; }
+      .steps li.done .step-row { color: var(--text); }
+      .steps li.done .step-icon { color: var(--ok); animation: none; }
+      .steps li.done .step-bar-fill { width: 100% !important; background: var(--ok); }
+      .steps li.err .step-row { color: var(--err); }
+      .steps li.err .step-icon { color: var(--err); animation: none; }
+      .steps li.err .step-bar-fill { width: 100% !important; background: var(--err); }
+      @keyframes tech-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+      /* Indeterminate "working" state — honest motion without a fabricated percentage.
+         An active stage shows a sweeping segment (we do not yet measure transcode %); the
+         bar's *filled* width only ever reflects real, server-confirmed stage milestones. */
+      @keyframes step-sweep { 0% { transform: translateX(-120%); } 100% { transform: translateX(320%); } }
+      .step-bar-fill.indeterminate {
+        width: 40% !important;
+        background: linear-gradient(90deg, transparent, var(--accent), transparent);
+        animation: step-sweep 1.15s ease-in-out infinite;
       }
-      .tech-progress .steps li.active .dot {
-        animation: tech-pulse 1s ease-in-out infinite;
+      @keyframes overall-shimmer { 0% { background-position: 0% 0; } 100% { background-position: 200% 0; } }
+      .overall-progress-fill.indeterminate {
+        background: linear-gradient(90deg, var(--accent), var(--accent-deep), var(--accent));
+        background-size: 200% 100%;
+        animation: overall-shimmer 1.4s linear infinite;
       }
-      @keyframes tech-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
-      .status { font-size: 13px; margin-top: 14px; min-height: 18px; }
+
+      @media (prefers-reduced-motion: reduce) {
+        .steps li.active .step-icon { animation: none; }
+        .overall-progress-fill, .step-bar-fill { transition: none; }
+        .step-bar-fill.indeterminate, .overall-progress-fill.indeterminate { animation: none; }
+      }
+
+      .status { font-size: 13px; margin-top: 14px; min-height: 18px; line-height: 1.5; }
       .status.err { color: var(--err); }
       .status.ok { color: var(--ok); }
-      .hint { font-size: 11px; color: var(--muted); margin-top: 6px; }
+      .hint { font-size: 11.5px; color: var(--muted); margin-top: 6px; line-height: 1.5; }
       .hidden { display: none !important; }
-      /* Access-method selector cards (free / buy_once / buy_and_resell) */
+
+      /* ── Access-method selector ─────────────────────────────────────────── */
       .method-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+      @media (max-width: 380px) { .method-grid { grid-template-columns: 1fr; } }
       .method {
-        border: 1.5px solid var(--line);
-        border-radius: 10px;
-        padding: 10px 8px;
+        border: 1.5px solid var(--line-strong);
+        border-radius: 12px;
+        padding: 12px 8px;
         text-align: center;
         cursor: pointer;
-        transition: border-color .15s, background .15s;
+        background: var(--panel-strong);
+        transition: border-color .15s, background .15s, box-shadow .15s;
       }
       .method:hover { border-color: var(--accent); }
-      .method.sel { border-color: var(--accent); background: var(--accent-weak); }
+      .method:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .method.sel { border-color: var(--accent); background: var(--accent-soft); box-shadow: 0 0 0 1px var(--accent) inset; }
       .method strong { display: block; font-size: 13px; color: var(--text); }
       .method span { font-size: 10.5px; color: var(--muted); }
-      /* Royalty split rows */
-      .royalty-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
+
+      /* ── Royalty split ──────────────────────────────────────────────────── */
+      .royalty-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; flex-wrap: wrap; }
       .royalty-row input { padding: 8px 10px; font-size: 13px; }
-      .royalty-row .ry-addr { flex: 1; }
-      .royalty-row .ry-pct { width: 72px; }
+      .royalty-row .ry-addr { flex: 1 1 160px; min-width: 0; }
+      .royalty-row .ry-pct { flex: 0 0 72px; width: 72px; }
       .royalty-row .ry-del {
-        border: 1px solid var(--line); background: #fff; color: var(--err);
-        border-radius: 8px; width: 30px; height: 34px; cursor: pointer; flex: none;
+        border: 1px solid var(--line-strong); background: var(--panel-strong); color: var(--err);
+        border-radius: 9px; width: 32px; height: 36px; cursor: pointer; flex: none; font-family: inherit;
       }
+      .royalty-row .ry-del:hover { background: var(--panel-soft); }
       .btn-add {
-        border: 1px dashed var(--line); background: #fff; color: var(--accent);
-        border-radius: 8px; padding: 7px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
+        border: 1px dashed var(--line-strong); background: var(--panel-strong); color: var(--accent-deep);
+        border-radius: 9px; padding: 7px 12px; font-size: 12px; font-weight: 600; cursor: pointer; font-family: inherit;
       }
-      .royalty-total { font-size: 11px; margin-top: 6px; }
+      .btn-add:hover { background: var(--panel-soft); }
+      .royalty-total { font-size: 11.5px; margin-top: 6px; }
       .royalty-total.bad { color: var(--err); }
       .royalty-total.ok { color: var(--ok); }
+
+      /* ── Checkboxes & disclosures ───────────────────────────────────────── */
       .check { display: flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 500; color: var(--text); }
       .check input { width: auto; }
+      details.more { border-top: 1px solid var(--line); margin-top: 16px; padding-top: 14px; }
+      details.more > summary {
+        cursor: pointer; font-size: 12px; font-weight: 700; color: var(--accent-deep);
+        list-style: none; display: inline-flex; align-items: center; gap: 6px;
+      }
+      details.more > summary::-webkit-details-marker { display: none; }
+      details.more > summary::after { content: "▾"; font-size: 10px; transition: transform .15s; }
+      details.more[open] > summary::after { transform: rotate(180deg); }
+      details.more[open] > summary { margin-bottom: 12px; }
+
+      /* ── Live listing preview ───────────────────────────────────────────── */
+      .lp-card {
+        background: var(--panel-strong);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        overflow: hidden;
+        box-shadow: 0 1px 2px rgba(29, 36, 56, 0.04), 0 8px 24px rgba(29, 36, 56, 0.06);
+      }
+      .lp-cover { position: relative; aspect-ratio: 16 / 10; background: var(--panel-soft); }
+      .lp-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+      .lp-cover-ph {
+        position: absolute; inset: 0; display: grid; place-items: center;
+        background: linear-gradient(160deg, #ffffff 0%, var(--bg) 100%);
+      }
+      .lp-cover-ph span {
+        font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+        color: var(--accent-deep); background: var(--accent-soft);
+        padding: 6px 12px; border-radius: 999px;
+      }
+      .lp-body { padding: 14px; }
+      .lp-title {
+        font-size: 15px; font-weight: 700; color: var(--ink); line-height: 1.35;
+        overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+      }
+      .lp-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; }
+      .lp-price { font-size: 14px; font-weight: 700; color: var(--accent-deep); }
+      .lp-badges { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+      .lp-chip {
+        font-size: 10.5px; font-weight: 600; padding: 3px 9px; border-radius: 999px;
+        background: var(--panel-soft); color: var(--muted); border: 1px solid var(--line);
+      }
+      .lp-chip.warn { background: #fdeef0; color: var(--err); border-color: rgba(177, 76, 90, 0.2); }
+      .lp-caption { font-size: 11px; color: var(--muted); text-align: center; margin-top: 10px; }
     </style>
   </head>
   <body>
     <main>
       <header>
-        <h1>Create</h1>
-        <p>Mint an asset to your own quorum &mdash; PQ custody, no Lit.</p>
+        <div class="brand-row">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <h1>Create</h1>
+        </div>
+        <p class="lede">Upload, set your terms, and publish a protected asset you fully own.</p>
+        <details class="trust">
+          <summary>How this works</summary>
+          <p>
+            <strong>Protection.</strong> Your file is encrypted before it is published. Decryption keys
+            are split across independent dKMS nodes &mdash; decentralized operators, not a single
+            company vault. No one node can unlock your content alone; recovery requires a quorum
+            (2-of-3) using post-quantum cryptography. You sign every step from your own wallet;
+            this app never holds your keys.
+          </p>
+          <p style="margin-top:10px">
+            <strong>Ownership &amp; market.</strong> Minting deploys a smart contract on Base that
+            represents your asset and tokenizes access rights (editions). Buyers receive
+            rights &mdash; not a raw file copy. Once the mint confirms, enable trading so those
+            rights become transferable capital others can buy, hold, and resell on your terms.
+          </p>
+        </details>
       </header>
 
-      <section class="card">
-        <div id="drop" class="drop" tabindex="0" role="button" aria-label="Choose a file">
-          <strong id="drop-title">Choose a file</strong>
-          <div class="meta" id="drop-meta">media or any document &middot; click or drop</div>
-          <input id="file" type="file" class="hidden" />
-        </div>
-      </section>
-
-      <section class="card">
-        <div class="field">
-          <label for="title">Title</label>
-          <input id="title" type="text" placeholder="My asset" />
-        </div>
-        <div class="field">
-          <label for="desc">Description</label>
-          <textarea id="desc" placeholder="What is it?"></textarea>
-        </div>
-        <div class="field">
-          <label for="thumb-input">Cover thumbnail (optional)</label>
-          <div id="thumb-drop" class="drop" tabindex="0" role="button" aria-label="Choose a cover image" style="padding:16px">
-            <strong id="thumb-drop-title">Add a cover image</strong>
-            <div class="meta" id="thumb-drop-meta">Auto-generated if you skip this &middot; click or drop</div>
-            <input id="thumb-input" type="file" accept="image/*" class="hidden" />
-          </div>
-          <div id="thumb-preview-wrap" class="hidden" style="margin-top:10px;display:flex;align-items:center;gap:10px">
-            <img id="thumb-preview-img" alt="cover preview" style="width:64px;height:64px;object-fit:cover;border-radius:8px;border:1px solid var(--line)" />
-            <button id="thumb-remove" type="button" style="border:1px solid var(--line);background:#fff;border-radius:8px;padding:6px 10px;font-size:12px;cursor:pointer">Remove</button>
-          </div>
-          <div class="hint" id="thumb-hint">No cover? A degraded preview is generated automatically (blurred for images, a frame for video, a waveform for audio, a template otherwise) — the full asset stays encrypted.</div>
-        </div>
-        <div class="field">
-          <label>Access method</label>
-          <div class="method-grid" id="method-grid">
-            <div class="method sel" data-method="free" role="button" tabindex="0">
-              <strong>Free</strong><span>Open access</span>
+      <div class="studio-grid">
+        <div class="studio-form">
+          <!-- 1 · Publish to ─────────────────────────────────────────────── -->
+          <!-- Wallet + channel come first: they're hard prerequisites. If the creator has no
+               channel they create one here (PC2 parity) before touching the rest of the form. -->
+          <section class="card">
+            <h2 class="section-title"><span class="num">1</span> Publish to</h2>
+            <p class="section-lede">Connect your wallet and choose a channel first &mdash; create one here if you don&rsquo;t have one yet.</p>
+            <div class="field">
+              <label for="wallet">Wallet</label>
+              <select id="wallet"><option value="">Connect a wallet on Base&hellip;</option></select>
+              <div class="hint" id="wallet-hint">The wallet that signs the mint &mdash; must be linked on Base.</div>
             </div>
-            <div class="method" data-method="buy_once" role="button" tabindex="0">
-              <strong>Buy now</strong><span>One-time sale</span>
+            <div class="field" style="margin-bottom:0">
+              <label for="channel">Channel</label>
+              <select id="channel"><option value="">Select a wallet first&hellip;</option></select>
+              <div class="hint" id="channel-hint">Your channels are discovered on-chain.</div>
+              <div class="field hidden" id="channel-manual" style="margin-top:10px">
+                <label for="channel-manual-input">Channel contract address</label>
+                <input id="channel-manual-input" type="text" placeholder="0x&hellip; (your channel on Base)" autocomplete="off" spellcheck="false" />
+                <div class="hint" id="channel-manual-hint">Paste your channel&rsquo;s contract address. It&rsquo;s verified on-chain (must be created by your wallet) before minting.</div>
+              </div>
+              <div class="field hidden" id="create-channel" style="margin-top:10px;margin-bottom:0">
+                <label for="channel-name">New channel name</label>
+                <input id="channel-name" type="text" placeholder="My channel" />
+                <div class="field row" style="margin-top:10px">
+                  <div>
+                    <label for="channel-scope">Scope</label>
+                    <select id="channel-scope">
+                      <option value="private">Private (subscription)</option>
+                      <option value="public">Public</option>
+                    </select>
+                  </div>
+                  <div style="display:flex;align-items:flex-end">
+                    <button id="create-channel-btn" class="primary" type="button">Create channel</button>
+                  </div>
+                </div>
+                <div class="hint" id="create-channel-hint">Deploys a new channel from your wallet (you approve in Wallet).</div>
+              </div>
             </div>
-            <div class="method" data-method="buy_and_resell" role="button" tabindex="0">
-              <strong>Buy &amp; resell</strong><span>Tradable + royalty</span>
+          </section>
+
+          <!-- 2 · Upload ─────────────────────────────────────────────────── -->
+          <section class="card">
+            <h2 class="section-title"><span class="num">2</span> Upload</h2>
+            <div id="drop" class="drop" tabindex="0" role="button" aria-label="Choose a file" aria-describedby="drop-meta">
+              <strong id="drop-title">Choose a file</strong>
+              <div class="meta" id="drop-meta">Media or any document &middot; click or drop</div>
+              <input id="file" type="file" class="hidden" aria-label="Choose a file to mint" />
             </div>
-          </div>
-        </div>
-        <div class="field row hidden" id="price-row">
-          <div>
-            <label for="price">Price</label>
-            <input id="price" type="number" min="0" step="0.0001" value="0" />
-          </div>
-          <div>
-            <label for="currency">Currency</label>
-            <select id="currency">
-              <option value="ELA">ELA</option>
-              <option value="USDC">USDC</option>
-              <option value="ETH">ETH</option>
-            </select>
-          </div>
-        </div>
-        <div class="field row">
-          <div>
-            <label for="copies">Access tokens (supply)</label>
-            <input id="copies" type="number" min="1" step="1" value="10000" />
-            <div class="hint" id="copies-hint">How many holders can be granted access. Each access token unlocks the content for one owner.</div>
-          </div>
-          <div>
-            <label for="category">Category</label>
-            <select id="category">
-              <option value="">Auto-detect</option>
-              <option value="art">Art</option>
-              <option value="music">Music</option>
-              <option value="video">Video</option>
-              <option value="image">Image</option>
-              <option value="document">Document</option>
-              <option value="ebook">eBook</option>
-              <option value="comic">Comic</option>
-              <option value="3d-model">3D model</option>
-              <option value="ai-model">AI model</option>
-            </select>
-          </div>
-        </div>
+            <div class="hint" id="thumb-hint" style="margin-top:12px">A listing image is created automatically from your file and shown in the preview. The full asset stays encrypted.</div>
+            <!-- Custom listing image: hidden from the main flow — auto-gen is the default.
+                 IDs kept for creator.js; revealed only via More options if we wire it there. -->
+            <div id="thumb-drop" class="drop drop-sm hidden" tabindex="0" role="button" aria-label="Choose a custom listing image">
+              <strong id="thumb-drop-title">Replace listing image</strong>
+              <div class="meta" id="thumb-drop-meta">Optional &middot; click or drop</div>
+              <input id="thumb-input" type="file" accept="image/*" class="hidden" aria-label="Choose a custom listing image" />
+            </div>
+            <div id="thumb-preview-wrap" class="hidden thumb-preview">
+              <img id="thumb-preview-img" alt="listing image preview" />
+              <button id="thumb-remove" type="button" class="btn-mini">Use auto image</button>
+            </div>
+          </section>
 
-        <div class="field" id="resell-field">
-          <label for="reseller-cut">Resale royalty (RRL %)</label>
-          <input id="reseller-cut" type="number" min="0" max="100" step="0.1" value="90" />
-          <div class="hint">Your cut on every secondary trade (resale). PC2 default 90%.</div>
-        </div>
-
-        <div class="field" id="royalty-field">
-          <label>Royalty split</label>
-          <div id="royalty-rows"></div>
-          <button id="royalty-add" type="button" class="btn-add">+ Add payee</button>
-          <div id="royalty-total" class="royalty-total"></div>
-          <div class="hint">Payees share primary-sale revenue. The protocol takes 5% automatically, so your rows must total 95%. Leave empty to send the full 95% to your wallet.</div>
-        </div>
-
-        <div class="field">
-          <label class="check">
-            <input id="ai-licensing" type="checkbox" />
-            <span>Grant AI training rights</span>
-          </label>
-          <div class="hint">Off = perpetual personal-use license only. On = buyers may use the asset to train AI models (PC2 <em>training-rights</em>).</div>
-        </div>
-
-        <div class="field">
-          <label class="check">
-            <input id="adult-flag" type="checkbox" />
-            <span>Adult content (18+)</span>
-          </label>
-        </div>
-
-        <div class="field">
-          <label class="check">
-            <input id="legal-attest" type="checkbox" />
-            <span>I own or have the rights to distribute this content</span>
-          </label>
-          <div class="hint" id="legal-hint">Required legal attestation, signed into the asset metadata.</div>
-        </div>
-        <div class="field hidden" id="preview-settings">
-          <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-            <input id="preview-enabled" type="checkbox" style="width:auto" />
-            <span>Free preview clip (video/audio)</span>
-          </label>
-          <div id="preview-controls" class="hidden" style="margin-top:8px">
-            <input id="preview-duration" type="range" min="5" max="60" step="5" value="15" style="width:100%" />
-            <div class="hint">Plays the first <strong id="preview-duration-display">15s</strong> unencrypted as a public teaser (max 60s). The full asset stays dKMS-encrypted.</div>
-          </div>
-        </div>
-        <div class="field">
-          <label for="wallet">Wallet</label>
-          <select id="wallet"><option value="">Connect a wallet on Base…</option></select>
-          <div class="hint" id="wallet-hint">The wallet that signs the mint — must be linked on Base.</div>
-        </div>
-        <div class="field">
-          <label for="channel">Channel</label>
-          <select id="channel"><option value="">Select a wallet first…</option></select>
-          <div class="hint" id="channel-hint">Your channels are discovered on-chain.</div>
-          <div class="field hidden" id="channel-manual" style="margin-top:10px">
-            <label for="channel-manual-input">Channel contract address</label>
-            <input id="channel-manual-input" type="text" placeholder="0x… (your channel on Base)" autocomplete="off" spellcheck="false" />
-            <div class="hint" id="channel-manual-hint">Paste your channel's contract address. It's verified on-chain (must be created by your wallet) before minting.</div>
-          </div>
-        </div>
-        <div class="field hidden" id="create-channel">
-          <label for="channel-name">New channel name</label>
-          <input id="channel-name" type="text" placeholder="My channel" />
-          <div class="field row" style="margin-top:10px">
-            <div>
-              <label for="channel-scope">Scope</label>
-              <select id="channel-scope">
-                <option value="private">Private (subscription)</option>
-                <option value="public">Public</option>
+          <!-- 3 · Details ──────────────────────────────────────────────── -->
+          <section class="card">
+            <h2 class="section-title"><span class="num">3</span> Details</h2>
+            <div class="field">
+              <label for="title">Title</label>
+              <input id="title" type="text" placeholder="My asset" />
+              <div class="field-err" id="title-err"></div>
+            </div>
+            <div class="field">
+              <label for="desc">Description</label>
+              <textarea id="desc" placeholder="What is it?"></textarea>
+            </div>
+            <div class="field" style="margin-bottom:0">
+              <label for="category">Category</label>
+              <select id="category">
+                <option value="">Auto-detect</option>
+                <option value="art">Art</option>
+                <option value="music">Music</option>
+                <option value="video">Video</option>
+                <option value="image">Image</option>
+                <option value="document">Document</option>
+                <option value="ebook">eBook</option>
+                <option value="comic">Comic</option>
+                <option value="3d-model">3D model</option>
+                <option value="ai-model">AI model</option>
               </select>
             </div>
-            <div style="display:flex;align-items:flex-end">
-              <button id="create-channel-btn" class="primary" type="button">Create channel</button>
+            <details class="more">
+              <summary>More options</summary>
+              <div class="field">
+                <label class="check">
+                  <input id="ai-licensing" type="checkbox" />
+                  <span>Grant AI training rights</span>
+                </label>
+                <div class="hint">Off = perpetual personal-use license only. On = buyers may use the asset to train AI models (PC2 <em>training-rights</em>).</div>
+              </div>
+              <div class="field" style="margin-bottom:0">
+                <label class="check">
+                  <input id="adult-flag" type="checkbox" />
+                  <span>Adult content (18+)</span>
+                </label>
+              </div>
+            </details>
+          </section>
+
+          <!-- 4 · Monetize ─────────────────────────────────────────────── -->
+          <section class="card">
+            <h2 class="section-title"><span class="num">4</span> Monetize</h2>
+            <div class="field">
+              <label>Access method</label>
+              <div class="method-grid" id="method-grid" role="group" aria-label="Access method">
+                <div class="method sel" data-method="free" role="button" tabindex="0" aria-pressed="true">
+                  <strong>Free</strong><span>Open access</span>
+                </div>
+                <div class="method" data-method="buy_once" role="button" tabindex="0" aria-pressed="false">
+                  <strong>Buy now</strong><span>One-time sale</span>
+                </div>
+                <div class="method" data-method="buy_and_resell" role="button" tabindex="0" aria-pressed="false">
+                  <strong>Buy &amp; resell</strong><span>Tradable + royalty</span>
+                </div>
+              </div>
+            </div>
+            <div class="field row hidden" id="price-row">
+              <div>
+                <label for="price">Price</label>
+                <input id="price" type="number" min="0" step="0.0001" value="0" />
+              </div>
+              <div>
+                <label for="currency">Currency</label>
+                <select id="currency">
+                  <option value="USDC">USDC</option>
+                  <option value="ETH">ETH</option>
+                </select>
+              </div>
+            </div>
+            <div class="field">
+              <label for="copies">Editions (supply)</label>
+              <input id="copies" type="number" min="1" step="1" value="10000" />
+              <div class="hint" id="copies-hint">How many holders can be granted access. Each edition unlocks the content for one owner.</div>
+            </div>
+            <div class="field hidden" id="resell-field">
+              <label for="reseller-cut">Resale royalty (%)</label>
+              <input id="reseller-cut" type="number" min="0" max="100" step="0.1" value="90" />
+              <div class="hint">Your cut on every secondary trade (resale). PC2 default 90%.</div>
+            </div>
+            <div class="field hidden" id="royalty-field">
+              <label>Royalty split</label>
+              <div id="royalty-rows"></div>
+              <button id="royalty-add" type="button" class="btn-add">+ Add payee</button>
+              <div id="royalty-total" class="royalty-total"></div>
+              <div class="hint">Payees share primary-sale revenue. The protocol takes 5% automatically, so your rows must total 95%. Leave empty to send the full 95% to your wallet.</div>
+            </div>
+            <div class="field hidden" id="preview-settings" style="margin-bottom:0">
+              <label class="check">
+                <input id="preview-enabled" type="checkbox" />
+                <span>Free preview clip (video/audio)</span>
+              </label>
+              <div id="preview-controls" class="hidden" style="margin-top:8px">
+                <input id="preview-duration" type="range" min="5" max="60" step="5" value="15" style="width:100%" />
+                <div class="hint">Plays the first <strong id="preview-duration-display">15s</strong> unencrypted as a public teaser (max 60s). The full asset stays dKMS-encrypted.</div>
+              </div>
+            </div>
+          </section>
+
+          <!-- Mint ─────────────────────────────────────────────────────── -->
+          <section class="card mint-card">
+            <!-- Live pipeline: overall bar (during mint) + open-by-default step roadmap.
+                 Sits ABOVE the legal attestation so the creator always sees what will happen
+                 and, once minting, exactly where it is (PC2 parity). -->
+            <div id="mint-progress" class="mint-progress">
+              <div id="overall-progress" class="overall-progress hidden" aria-hidden="true">
+                <div class="overall-progress-track">
+                  <div id="overall-progress-fill" class="overall-progress-fill"></div>
+                </div>
+                <div class="overall-progress-meta">
+                  <span id="overall-progress-label">Preparing your asset&hellip;</span>
+                  <span id="overall-progress-pct" class="overall-progress-pct"></span>
+                </div>
+              </div>
+              <details class="steps-panel" id="steps-panel" open>
+                <summary>Encoding &amp; publishing steps</summary>
+                <ul class="steps" id="steps">
+                  <li data-step="analyze" class="media-step">
+                    <div class="step-row"><span class="step-icon">○</span><span class="step-label">Analyze source</span><span class="step-status">Waiting</span></div>
+                    <span class="step-bar"><span class="step-bar-fill"></span></span>
+                  </li>
+                  <li data-step="package" class="media-step">
+                    <div class="step-row"><span class="step-icon">○</span><span class="step-label">Transcode &amp; package (DASH)</span><span class="step-status">Waiting</span></div>
+                    <span class="step-bar"><span class="step-bar-fill"></span></span>
+                  </li>
+                  <li data-step="encrypt">
+                    <div class="step-row"><span class="step-icon">○</span><span class="step-label">Encrypt &amp; escrow to your quorum</span><span class="step-status">Waiting</span></div>
+                    <span class="step-bar"><span class="step-bar-fill"></span></span>
+                  </li>
+                  <li data-step="publish">
+                    <div class="step-row"><span class="step-icon">○</span><span class="step-label">Publish to IPFS</span><span class="step-status">Waiting</span></div>
+                    <span class="step-bar"><span class="step-bar-fill"></span></span>
+                  </li>
+                  <li data-step="sign">
+                    <div class="step-row"><span class="step-icon">○</span><span class="step-label">Assemble mint</span><span class="step-status">Waiting</span></div>
+                    <span class="step-bar"><span class="step-bar-fill"></span></span>
+                  </li>
+                  <li data-step="broadcast">
+                    <div class="step-row"><span class="step-icon">○</span><span class="step-label">Sign &amp; broadcast in wallet</span><span class="step-status">Waiting</span></div>
+                    <span class="step-bar"><span class="step-bar-fill"></span></span>
+                  </li>
+                  <li data-step="approve">
+                    <div class="step-row"><span class="step-icon">○</span><span class="step-label">Enable trading</span><span class="step-status">Waiting</span></div>
+                    <span class="step-bar"><span class="step-bar-fill"></span></span>
+                  </li>
+                </ul>
+              </details>
+            </div>
+            <div class="field" style="margin-bottom:14px">
+              <label class="check">
+                <input id="legal-attest" type="checkbox" />
+                <span>I own or have the rights to distribute this content</span>
+              </label>
+              <div class="hint" id="legal-hint">Required legal attestation, signed into the asset metadata.</div>
+            </div>
+            <button id="mint" class="primary" disabled>Mint</button>
+            <div class="hint" id="mint-requirements"></div>
+            <div id="status" class="status" role="status" aria-live="polite"></div>
+            <button id="enable-trading" class="primary" hidden>Step 2 &mdash; Enable trading</button>
+            <div id="enable-trading-hint" class="hint" hidden>
+              Once the mint confirms on-chain, approve the gateway so others can trade your asset.
+            </div>
+            <button id="mint-another" class="secondary" type="button" hidden>+ Mint another asset</button>
+          </section>
+        </div>
+
+        <!-- Live listing preview ───────────────────────────────────────── -->
+        <aside class="studio-preview" aria-label="Listing preview">
+          <div class="lp-card">
+            <div class="lp-cover" id="lp-cover">
+              <img id="lp-cover-img" class="hidden" alt="" />
+              <div class="lp-cover-ph" id="lp-cover-ph"><span id="lp-cover-type">Asset</span></div>
+            </div>
+            <div class="lp-body">
+              <div class="lp-title" id="lp-title">Untitled asset</div>
+              <div class="lp-meta">
+                <span class="lp-price" id="lp-price">Free</span>
+                <span class="badge" id="lp-method">Free</span>
+              </div>
+              <div class="lp-badges" id="lp-badges"></div>
             </div>
           </div>
-          <div class="hint" id="create-channel-hint">Deploys a new channel from your wallet (you approve in Wallet).</div>
-        </div>
-      </section>
-
-      <section class="card">
-        <button id="mint" class="primary" disabled>Mint</button>
-        <details id="tech-progress" class="tech-progress" hidden open>
-          <summary>Encoding &amp; publishing progress</summary>
-          <ul class="steps" id="tech-steps">
-            <li data-tech="analyze"><span class="dot"></span> Analyze source</li>
-            <li data-tech="package"><span class="dot"></span> Transcode &amp; fragment (DASH)</li>
-            <li data-tech="encrypt"><span class="dot"></span> Encrypt &amp; escrow to quorum</li>
-            <li data-tech="publish"><span class="dot"></span> Publish to IPFS</li>
-            <li data-tech="sign"><span class="dot"></span> Assemble mint</li>
-          </ul>
-        </details>
-        <ul class="steps" id="steps">
-          <li data-step="encrypt"><span class="dot"></span> Encrypt &amp; escrow to quorum</li>
-          <li data-step="publish"><span class="dot"></span> Assemble mint</li>
-          <li data-step="sign"><span class="dot"></span> Sign with wallet</li>
-          <li data-step="broadcast"><span class="dot"></span> Broadcast</li>
-          <li data-step="approve"><span class="dot"></span> Approve gateway (enable trading)</li>
-        </ul>
-        <div id="status" class="status"></div>
-        <button id="enable-trading" class="primary" hidden>Step 2 — Enable trading</button>
-        <div id="enable-trading-hint" class="hint" hidden>
-          Once the mint confirms on-chain, approve the gateway so others can trade your asset.
-        </div>
-        <button id="mint-another" class="secondary" type="button" hidden>+ Mint another asset</button>
-      </section>
+          <div class="lp-caption">Live preview &mdash; listing image and terms update as you edit.</div>
+        </aside>
+      </div>
     </main>
-    <script src="creator.js?v=creator-20260618a"></script>
+    <script src="creator.js?v=creator-20260622d"></script>
   </body>
 </html>

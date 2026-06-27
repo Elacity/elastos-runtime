@@ -141,20 +141,198 @@ function setStatus(text, kind) {
   els.status.className = "status" + (kind ? " " + kind : "");
 }
 
-function setStep(name, state) {
-  const li = els.steps.querySelector('li[data-step="' + name + '"]');
-  if (li) li.className = state || "";
+// ── Live pipeline progress ───────────────────────────────────────────────────
+// An overall bar plus a default-open step roadmap (icon · label · status · thin bar).
+// The backend reports coarse stage status (pending|active|done|err); there is NO per-frame
+// ffmpeg telemetry yet, so we DO NOT fabricate a precise percentage. An active stage shows an
+// indeterminate (sweeping) bar to convey activity, and the bar's *filled* width / numeric %
+// move only on real, server-confirmed stage milestones. (Improvement A — measured transcode %
+// via ffmpeg `-progress` + a job-keyed channel — will replace the indeterminate state.)
+const STEP_ICON = { waiting: "○", active: "◉", done: "✓", err: "✗" };
+const STEP_STATUS_TEXT = { waiting: "Waiting", active: "In progress", done: "Done", err: "Failed" };
+// Relative weights — transcode dominates the wall-clock for video, so it owns the widest band.
+const STEP_WEIGHTS = {
+  analyze: 1, package: 6, encrypt: 2, publish: 2, sign: 1, broadcast: 3, approve: 1,
+};
+
+const progressState = { active: null, activeSince: 0, done: new Set(), errored: null, timer: null };
+
+function stepRow(name) {
+  return els.steps ? els.steps.querySelector('li[data-step="' + name + '"]') : null;
 }
 
-// ── Live encode/publish progress (PC2's default-open tech panel) ──────────────
+// The ordered list of currently-VISIBLE steps (media rows are hidden for non-media assets).
+function visibleSteps() {
+  if (!els.steps) return [];
+  return Array.from(els.steps.querySelectorAll("li[data-step]"))
+    .filter((li) => !li.classList.contains("hidden"))
+    .map((li) => li.dataset.step);
+}
+
+// Cumulative [start,end] milestone band per visible step, weighted by STEP_WEIGHTS over 0..100.
+function milestoneBands() {
+  const steps = visibleSteps();
+  const total = steps.reduce((a, s) => a + (STEP_WEIGHTS[s] || 1), 0) || 1;
+  const bands = {};
+  let acc = 0;
+  for (const s of steps) {
+    const start = (acc / total) * 100;
+    acc += STEP_WEIGHTS[s] || 1;
+    bands[s] = { start, end: (acc / total) * 100 };
+  }
+  return bands;
+}
+
+function setStepVisual(name, vstate) {
+  const li = stepRow(name);
+  if (!li) return;
+  li.classList.remove("active", "done", "err");
+  if (vstate === "active") li.classList.add("active");
+  else if (vstate === "done") li.classList.add("done");
+  else if (vstate === "err") li.classList.add("err");
+  const icon = li.querySelector(".step-icon");
+  const status = li.querySelector(".step-status");
+  const key = vstate || "waiting";
+  if (icon) icon.textContent = STEP_ICON[key] || STEP_ICON.waiting;
+  if (status) status.textContent = STEP_STATUS_TEXT[key] || STEP_STATUS_TEXT.waiting;
+  const fill = li.querySelector(".step-bar-fill");
+  if (fill) {
+    if (vstate === "active") {
+      // Indeterminate sweep — no fabricated fill level; activity without a fake measurement.
+      fill.classList.add("indeterminate");
+      fill.style.width = "";
+    } else {
+      fill.classList.remove("indeterminate");
+      // done/err widths are forced by CSS; waiting resets to 0.
+      if (!vstate) fill.style.width = "0%";
+    }
+  }
+}
+
+function setOverall(pct, label) {
+  const fill = document.getElementById("overall-progress-fill");
+  const pctEl = document.getElementById("overall-progress-pct");
+  const labelEl = document.getElementById("overall-progress-label");
+  const wrap = document.getElementById("overall-progress");
+  const clamped = Math.max(0, Math.min(100, pct));
+  if (fill) {
+    fill.style.width = clamped.toFixed(1) + "%";
+    fill.classList.toggle("indeterminate", clamped < 100);
+  }
+  // No fabricated precise %: the number appears only at true completion. Until then the moving
+  // (indeterminate) bar conveys activity and the filled width reflects only real stage milestones.
+  if (pctEl) pctEl.textContent = clamped >= 100 ? "100%" : "";
+  if (label && labelEl) labelEl.textContent = label;
+  if (wrap) wrap.classList.toggle("done", clamped >= 100);
+}
+
+// Drive a stage to a MEASURED percentage: determinate step bar + overall within its band.
+// Used only when the server reports a real pct (e.g. ffmpeg transcode progress).
+function setStepPct(name, pct) {
+  const li = stepRow(name);
+  if (!li) return;
+  const clamped = Math.max(0, Math.min(100, pct));
+  const fill = li.querySelector(".step-bar-fill");
+  if (fill) {
+    fill.classList.remove("indeterminate");
+    fill.style.width = clamped + "%";
+  }
+  const band = milestoneBands()[name];
+  if (band) {
+    const frac = clamped / 100;
+    setOverall(band.start + frac * (band.end - band.start), currentStageLabel(name));
+  }
+}
+
+function showOverall(show) {
+  const wrap = document.getElementById("overall-progress");
+  if (wrap) wrap.classList.toggle("hidden", !show);
+  if (show && wrap) wrap.setAttribute("aria-hidden", "false");
+  else if (wrap) wrap.setAttribute("aria-hidden", "true");
+}
+
+function stopProgressLoop() {
+  if (progressState.timer) {
+    clearInterval(progressState.timer);
+    progressState.timer = null;
+  }
+}
+
+// Drive one step. Accepts the same coarse states the server reports (active|done|err) plus ""
+// (reset to waiting). Maintains the creep engine + overall bar; later-stage "done" implicitly
+// completes earlier visible stages, matching the server's monotonic advance.
+function setStep(name, state) {
+  if (!stepRow(name)) return;
+  const bands = milestoneBands();
+  if (state === "active") {
+    if (progressState.active && progressState.active !== name) {
+      progressState.done.add(progressState.active);
+      setStepVisual(progressState.active, "done");
+    }
+    progressState.active = name;
+    progressState.activeSince = Date.now();
+    setStepVisual(name, "active");
+    if (bands[name]) setOverall(bands[name].start, currentStageLabel(name));
+  } else if (state === "done") {
+    // Complete this step and every earlier visible step (server advance is monotonic).
+    const order = visibleSteps();
+    const idx = order.indexOf(name);
+    for (let i = 0; i <= idx; i += 1) {
+      progressState.done.add(order[i]);
+      setStepVisual(order[i], "done");
+    }
+    if (progressState.active === name) progressState.active = null;
+    if (bands[name]) setOverall(bands[name].end, currentStageLabel(name));
+  } else if (state === "err") {
+    progressState.errored = name;
+    setStepVisual(name, "err");
+    if (progressState.active === name) progressState.active = null;
+    stopProgressLoop();
+  } else {
+    setStepVisual(name, "");
+  }
+}
+
+const STAGE_LABEL = {
+  analyze: "Analyzing source…",
+  package: "Transcoding & packaging…",
+  encrypt: "Encrypting & escrowing to your quorum…",
+  publish: "Publishing to IPFS…",
+  sign: "Assembling the mint…",
+  broadcast: "Waiting for the on-chain mint…",
+  approve: "Enabling trading…",
+};
+function currentStageLabel(name) {
+  return STAGE_LABEL[name] || "Working…";
+}
+
+// Mark the whole pipeline complete: every visible step done, overall at 100%.
+function completeProgress() {
+  visibleSteps().forEach((s) => {
+    progressState.done.add(s);
+    setStepVisual(s, "done");
+  });
+  progressState.active = null;
+  stopProgressLoop();
+  setOverall(100, "Published successfully");
+}
+
+// Show/hide the media-only timeline rows (Analyze / Transcode) for non-media assets.
+function setMediaStepsVisible(visible) {
+  els.steps
+    .querySelectorAll(".media-step")
+    .forEach((li) => li.classList.toggle("hidden", !visible));
+}
+
+// ── Live encode/publish progress ─────────────────────────────────────────────
 // The mint stays a single blocking POST; the server records coarse stage progress
 // (analyze → package → encrypt → publish → sign) under a client job id, which we
-// poll @1.5s to drive the panel instead of showing a frozen spinner.
+// poll @1.5s to drive the SAME unified timeline instead of showing a frozen spinner.
+// The server stage names map 1:1 onto the timeline's data-step ids.
 let techPollTimer = null;
 
 function setTechStep(name, state) {
-  const li = document.querySelector('#tech-steps li[data-tech="' + name + '"]');
-  if (li) li.className = state || "";
+  setStep(name, state);
 }
 
 function stopTechProgress() {
@@ -165,11 +343,7 @@ function stopTechProgress() {
 }
 
 function startTechProgress(jobId) {
-  const panel = document.getElementById("tech-progress");
-  if (!panel) return;
   ["analyze", "package", "encrypt", "publish", "sign"].forEach((s) => setTechStep(s, ""));
-  panel.hidden = false;
-  panel.open = true;
   stopTechProgress();
   const poll = async () => {
     try {
@@ -185,6 +359,12 @@ function startTechProgress(jobId) {
             ? st.status
             : "";
           setTechStep(st.name, cls);
+          // Measured transcode % (Improvement A): when the server reports a real pct for the
+          // active stage, switch that stage from indeterminate to a determinate bar and drive
+          // the overall bar within the stage's milestone band. Absent ⇒ stays indeterminate.
+          if (cls === "active" && typeof st.pct === "number") {
+            setStepPct(st.name, st.pct);
+          }
         }
       }
       if (data.done) stopTechProgress();
@@ -199,11 +379,22 @@ function startTechProgress(jobId) {
 function resetSteps() {
   mintWatchToken += 1; // cancel any in-flight mint-confirmation watcher from a prior mint
   tradeGated = false;
-  ["encrypt", "publish", "sign", "broadcast", "approve"].forEach((s) => setStep(s, ""));
+  stopProgressLoop();
+  progressState.active = null;
+  progressState.activeSince = 0;
+  progressState.done = new Set();
+  progressState.errored = null;
+  // The step roadmap stays visible (open by default); only reset rows to "Waiting" and hide
+  // the overall bar until a mint actually starts.
+  ["analyze", "package", "encrypt", "publish", "sign", "broadcast", "approve"].forEach((s) => {
+    setStepVisual(s, "");
+    const li = stepRow(s);
+    const fill = li && li.querySelector(".step-bar-fill");
+    if (fill) fill.style.width = "0%";
+  });
   stopTechProgress();
-  ["analyze", "package", "encrypt", "publish", "sign"].forEach((s) => setTechStep(s, ""));
-  const techPanel = document.getElementById("tech-progress");
-  if (techPanel) techPanel.hidden = true;
+  showOverall(false);
+  setOverall(0, "Preparing your asset…");
   if (els.enableTrading) els.enableTrading.classList.remove("is-ready");
   if (els.enableTrading) els.enableTrading.disabled = false;
   if (els.enableTradingHint) els.enableTradingHint.textContent = DEFAULT_TRADE_HINT;
@@ -219,6 +410,7 @@ function resetSteps() {
 function resetForMintAnother() {
   selectedFile = null;
   customThumbnail = null;
+  autoCoverUrl = "";
   currentMintContentId = "";
   currentMintRequestId = "";
   if (els.file) els.file.value = "";
@@ -305,8 +497,23 @@ function onFile(file) {
   if (els.previewSettings) els.previewSettings.classList.toggle("hidden", !isMedia);
   if (els.previewEnabled) els.previewEnabled.checked = isMedia;
   if (els.previewControls) els.previewControls.classList.toggle("hidden", !isMedia);
+  // Reflect the file type in the step roadmap immediately: media gets the Analyze/Transcode
+  // rows; non-media skips them. Shows the creator exactly what will happen before they mint.
+  setMediaStepsVisible(isMedia);
   autoDetectCategory(file, mime);
   refreshMintEnabled();
+  // Generate the file-derived cover so the live preview shows the actual cover the asset will
+  // use (a frame for video, a waveform card for audio, a blurred still for images, etc.) —
+  // not just a type chip. A custom upload still overrides it.
+  autoCoverUrl = "";
+  generateAutoThumbnail(file, mime)
+    .then((thumb) => {
+      if (selectedFile === file && thumb && thumb.b64) {
+        autoCoverUrl = "data:" + (thumb.mime || "image/jpeg") + ";base64," + thumb.b64;
+        renderPreview();
+      }
+    })
+    .catch(() => {});
 }
 
 // Source-code mimes that should land in the "document" category (mirrors the dDRM viewer's code
@@ -358,15 +565,24 @@ function selectedChannel() {
   return v && v !== CREATE_CHANNEL_VALUE ? v : "";
 }
 
+// Join a list into a readable "a, b and c" clause for the requirements hint.
+function listToText(items) {
+  if (items.length <= 1) return items.join("");
+  return items.slice(0, -1).join(", ") + " and " + items[items.length - 1];
+}
+
 function refreshMintEnabled() {
   // Fail-closed: a wallet AND a real channel selection are required — no silent default.
-  els.mint.disabled = !(
-    selectedFile &&
-    els.title.value.trim() &&
-    els.wallet.value &&
-    selectedChannel()
-  );
+  const missing = [];
+  if (!selectedFile) missing.push("a file");
+  if (!els.title.value.trim()) missing.push("a title");
+  if (!els.wallet.value) missing.push("a wallet");
+  if (!selectedChannel()) missing.push("a channel");
+  els.mint.disabled = missing.length > 0;
+  const req = document.getElementById("mint-requirements");
+  if (req) req.textContent = missing.length ? "Add " + listToText(missing) + " to mint." : "";
   refreshTradeEnabled();
+  renderPreview();
 }
 
 // The trade-enabling 2nd tx targets the newest minted asset in the selected channel, so the
@@ -656,15 +872,16 @@ async function canvasToThumb(canvas, quality) {
   return { b64: await blobToBase64(blob), mime: "image/jpeg" };
 }
 
-// Brand placeholder tokens (canvas literals; see the design-token contract). The card is a dark
-// graphite surface with a soft hairline border; the only accent (#b7ff5a lime) is reserved for
-// verified/active/success states and must NEVER appear on a placeholder.
-const PLACEHOLDER_BG = "#111111"; // --color-graphite
-const PLACEHOLDER_BORDER = "rgba(255,255,255,0.10)"; // --color-border-soft
-const PLACEHOLDER_CHIP_BG = "rgba(255,255,255,0.08)"; // muted surface
-const PLACEHOLDER_CHIP_TEXT = "rgba(255,255,255,0.48)"; // muted label
-const PLACEHOLDER_TITLE = "rgba(255,255,255,0.72)";
-const PLACEHOLDER_SUBTLE = "rgba(255,255,255,0.40)";
+// Brand placeholder tokens (canvas literals) — aligned to the first-party ElastOS cluster
+// palette so the generated cover matches the rest of the product (Library / Marketplace are
+// light). A soft white→lavender card, a periwinkle file-type chip, ink/muted text.
+const PLACEHOLDER_BG = "#ffffff"; // --panel-strong (top of the gradient)
+const PLACEHOLDER_BG2 = "#edf1fb"; // --bg (bottom of the gradient)
+const PLACEHOLDER_BORDER = "rgba(83,103,164,0.22)"; // --line-strong
+const PLACEHOLDER_CHIP_BG = "#e8edff"; // --accent-soft
+const PLACEHOLDER_CHIP_TEXT = "#3c53a7"; // --accent-deep
+const PLACEHOLDER_TITLE = "#1d2438"; // --ink
+const PLACEHOLDER_SUBTLE = "#66708a"; // --muted
 
 function roundRectPath(ctx, x, y, w, h, r) {
   ctx.beginPath();
@@ -753,9 +970,9 @@ async function thumbFromText(file) {
   c.width = 400;
   c.height = 300;
   const ctx = c.getContext("2d");
-  ctx.fillStyle = "#f8f9fa";
+  ctx.fillStyle = "#ffffff";
   ctx.fillRect(0, 0, 400, 300);
-  ctx.fillStyle = "#1e293b";
+  ctx.fillStyle = "#1d2438";
   ctx.font = "13px monospace";
   ctx.textBaseline = "top";
   let y = 16;
@@ -768,9 +985,9 @@ async function thumbFromText(file) {
     y += 16;
   }
   const g = ctx.createLinearGradient(0, 120, 0, 300);
-  g.addColorStop(0, "rgba(248,249,250,0)");
-  g.addColorStop(0.6, "rgba(248,249,250,0.85)");
-  g.addColorStop(1, "rgba(248,249,250,1)");
+  g.addColorStop(0, "rgba(255,255,255,0)");
+  g.addColorStop(0.6, "rgba(255,255,255,0.85)");
+  g.addColorStop(1, "rgba(255,255,255,1)");
   ctx.fillStyle = g;
   ctx.fillRect(0, 120, 400, 180);
   return canvasToThumb(c, 0.8);
@@ -783,7 +1000,10 @@ async function thumbGeneric(file, mime) {
   c.width = 640;
   c.height = 360;
   const ctx = c.getContext("2d");
-  ctx.fillStyle = PLACEHOLDER_BG;
+  const grad = ctx.createLinearGradient(0, 0, 0, 360);
+  grad.addColorStop(0, PLACEHOLDER_BG);
+  grad.addColorStop(1, PLACEHOLDER_BG2);
+  ctx.fillStyle = grad;
   ctx.fillRect(0, 0, 640, 360);
   // File-type chip on a muted surface.
   const badge = (file.name.split(".").pop() || "?").toUpperCase().slice(0, 5);
@@ -808,20 +1028,27 @@ async function thumbGeneric(file, mime) {
   return canvasToThumb(c, 0.85);
 }
 
+// The file-derived cover cascade (ignores any custom upload): a blurred still for images, a
+// frame for video, a teaser card for text, a branded type card otherwise. Used both to show a
+// real cover in the live preview and as the mint-time fallback when no custom cover is chosen.
+async function generateAutoThumbnail(file, mime) {
+  if (mime.startsWith("image/")) return await thumbFromImage(file);
+  if (mime.startsWith("video/")) {
+    const t = await thumbFromVideo(file);
+    if (t) return t;
+  } else if (mime === "text/plain" || mime.startsWith("text/")) {
+    const t = await thumbFromText(file);
+    if (t) return t;
+  }
+  return await thumbGeneric(file, mime);
+}
+
 // Produce { b64, mime } for the cover, or null. Never throws — a thumbnail failure must not
 // block the mint (the asset just lists with the type-icon placeholder).
 async function generateThumbnail(file, mime) {
   try {
     if (customThumbnail) return await thumbFromCustom(customThumbnail);
-    if (mime.startsWith("image/")) return await thumbFromImage(file);
-    if (mime.startsWith("video/")) {
-      const t = await thumbFromVideo(file);
-      if (t) return t;
-    } else if (mime === "text/plain" || mime.startsWith("text/")) {
-      const t = await thumbFromText(file);
-      if (t) return t;
-    }
-    return await thumbGeneric(file, mime);
+    return await generateAutoThumbnail(file, mime);
   } catch (err) {
     try {
       return await thumbGeneric(file, mime);
@@ -862,9 +1089,16 @@ async function mint() {
   els.mint.disabled = true;
   resetSteps();
   setStatus("Encrypting…", null);
-  setStep("encrypt", "active");
 
   const mime = resolveMime(selectedFile);
+  setMediaStepsVisible(classifyMedia(mime));
+  // Reveal the overall smooth bar and open the step panel now that the mint is running.
+  showOverall(true);
+  const stepsPanel = document.getElementById("steps-panel");
+  if (stepsPanel) stepsPanel.open = true;
+  // For media, the server drives analyze→package→… via the progress poll; for non-media the
+  // first real stage is encrypt. Start the engine on the first stage either way.
+  setStep(classifyMedia(mime) ? "analyze" : "encrypt", "active");
   // Access-token supply: how many editions/holders can be granted access. Clamp to >=1;
   // the host falls back to its default when unset.
   const copies = Math.max(1, parseInt(els.copies && els.copies.value, 10) || 0) || undefined;
@@ -1081,6 +1315,7 @@ async function enableTrading() {
     }
     if (result.already_approved) {
       setStep("approve", "done");
+      completeProgress();
       setStatus("Gateway already approved — your asset is tradable.", "ok");
       els.enableTrading.hidden = true;
       if (els.enableTradingHint) els.enableTradingHint.hidden = true;
@@ -1163,6 +1398,7 @@ async function watchMintConfirmation(channel, creatorAddress, contentId) {
       setStep("broadcast", "done");
       if (alreadyApproved) {
         setStep("approve", "done");
+        completeProgress();
         setStatus("Mint confirmed on-chain ✓ — your asset is already tradable.", "ok");
         if (els.enableTrading) els.enableTrading.hidden = true;
         if (els.enableTradingHint) els.enableTradingHint.hidden = true;
@@ -1207,12 +1443,101 @@ async function watchTradeApproval(channel, creatorAddress, contentId) {
     if (mintWatchToken !== token) return;
     if (approved) {
       setStep("approve", "done");
+      completeProgress();
       setStatus("Gateway approved ✓ — your asset is now tradable.", "ok");
       if (els.enableTrading) els.enableTrading.hidden = true;
       if (els.enableTradingHint) els.enableTradingHint.hidden = true;
       return;
     }
     delay = Math.min(delay + 2000, 12000);
+  }
+}
+
+// ── live listing preview ─────────────────────────────────────────────────────
+// A presentational mirror of how the asset will appear once listed. Reads the same
+// form state the mint payload uses — it holds no authority and triggers no network.
+const preview = {
+  img: document.getElementById("lp-cover-img"),
+  ph: document.getElementById("lp-cover-ph"),
+  type: document.getElementById("lp-cover-type"),
+  title: document.getElementById("lp-title"),
+  price: document.getElementById("lp-price"),
+  method: document.getElementById("lp-method"),
+  badges: document.getElementById("lp-badges"),
+};
+let previewCoverUrl = "";
+// Data URL of the auto-generated cover (frame/blur/waveform/type-card) derived from the file.
+let autoCoverUrl = "";
+const METHOD_LABELS = { free: "Free", buy_once: "Buy now", buy_and_resell: "Buy & resell" };
+
+function prettyCategory(value) {
+  return (value || "").replace(/-/g, " ");
+}
+
+// Point the preview cover at a source, revoking any prior object URL. `isObjectUrl` marks blob
+// URLs (which must be revoked); data URLs (the auto cover) are passed with isObjectUrl=false.
+function setPreviewCover(src, isObjectUrl) {
+  if (previewCoverUrl) {
+    URL.revokeObjectURL(previewCoverUrl);
+    previewCoverUrl = "";
+  }
+  if (isObjectUrl) previewCoverUrl = src;
+  preview.img.src = src;
+  preview.img.classList.remove("hidden");
+  preview.ph.classList.add("hidden");
+}
+
+function renderPreview() {
+  if (!preview.title) return;
+  preview.title.textContent = (els.title && els.title.value.trim()) || "Untitled asset";
+  if (preview.method) preview.method.textContent = METHOD_LABELS[accessMethod] || "Free";
+  if (preview.price) {
+    if (isPaidMethod()) {
+      const amount = (els.price && els.price.value) || "0";
+      const currency = (els.currency && els.currency.value) || "USDC";
+      preview.price.textContent = (Number(amount) > 0 ? amount : "0") + " " + currency;
+    } else {
+      preview.price.textContent = "Free";
+    }
+  }
+  // Cover priority: a custom upload wins; otherwise an image file shows directly; otherwise the
+  // auto-generated cover (frame/blur/waveform); otherwise a branded type chip while none exists.
+  const isImageSource =
+    selectedFile && resolveMime(selectedFile).startsWith("image/") ? selectedFile : null;
+  const coverFile = customThumbnail || isImageSource;
+  if (coverFile && preview.img && preview.ph) {
+    setPreviewCover(URL.createObjectURL(coverFile), true);
+  } else if (autoCoverUrl && preview.img && preview.ph) {
+    setPreviewCover(autoCoverUrl, false);
+  } else if (preview.img && preview.ph) {
+    if (previewCoverUrl) {
+      URL.revokeObjectURL(previewCoverUrl);
+      previewCoverUrl = "";
+    }
+    preview.img.classList.add("hidden");
+    preview.ph.classList.remove("hidden");
+    if (preview.type) {
+      const category = (els.category && els.category.value) || "";
+      if (category) preview.type.textContent = prettyCategory(category);
+      else if (selectedFile)
+        preview.type.textContent = (selectedFile.name.split(".").pop() || "file").toUpperCase();
+      else preview.type.textContent = "Asset";
+    }
+  }
+  if (preview.badges) {
+    preview.badges.innerHTML = "";
+    const chips = [];
+    const category = (els.category && els.category.value) || "";
+    if (category) chips.push({ text: prettyCategory(category), warn: false });
+    if (accessMethod === "buy_and_resell") chips.push({ text: "Resale royalty", warn: false });
+    if (els.aiLicensing && els.aiLicensing.checked) chips.push({ text: "AI training", warn: false });
+    if (els.adultFlag && els.adultFlag.checked) chips.push({ text: "18+", warn: true });
+    chips.forEach((chip) => {
+      const span = document.createElement("span");
+      span.className = "lp-chip" + (chip.warn ? " warn" : "");
+      span.textContent = chip.text;
+      preview.badges.appendChild(span);
+    });
   }
 }
 
@@ -1232,7 +1557,21 @@ els.drop.addEventListener("drop", (e) => {
   els.drop.classList.remove("over");
   onFile(e.dataTransfer.files && e.dataTransfer.files[0]);
 });
-els.title.addEventListener("input", refreshMintEnabled);
+els.title.addEventListener("input", () => {
+  const titleErr = document.getElementById("title-err");
+  if (titleErr && els.title.value.trim()) titleErr.textContent = "";
+  refreshMintEnabled();
+});
+els.title.addEventListener("blur", () => {
+  const titleErr = document.getElementById("title-err");
+  if (titleErr) titleErr.textContent = els.title.value.trim() ? "" : "A title is required.";
+});
+// Keep the live preview in sync with monetization + detail changes.
+if (els.price) els.price.addEventListener("input", renderPreview);
+if (els.currency) els.currency.addEventListener("change", renderPreview);
+if (els.category) els.category.addEventListener("change", renderPreview);
+if (els.adultFlag) els.adultFlag.addEventListener("change", renderPreview);
+if (els.aiLicensing) els.aiLicensing.addEventListener("change", renderPreview);
 els.wallet.addEventListener("change", () => loadChannels());
 els.channel.addEventListener("change", onChannelChange);
 els.channelManualInput.addEventListener("input", () => {
@@ -1249,6 +1588,7 @@ function setCustomThumbnail(file) {
   if (els.thumbPreviewImg) els.thumbPreviewImg.src = URL.createObjectURL(file);
   if (els.thumbPreviewWrap) els.thumbPreviewWrap.classList.remove("hidden");
   if (els.thumbDrop) els.thumbDrop.classList.add("hidden");
+  renderPreview();
 }
 if (els.thumbDrop) {
   els.thumbDrop.addEventListener("click", () => els.thumbInput && els.thumbInput.click());
@@ -1274,6 +1614,7 @@ if (els.thumbRemove) {
     if (els.thumbInput) els.thumbInput.value = "";
     if (els.thumbPreviewWrap) els.thumbPreviewWrap.classList.add("hidden");
     if (els.thumbDrop) els.thumbDrop.classList.remove("hidden");
+    renderPreview();
   });
 }
 if (els.previewEnabled) {
@@ -1300,7 +1641,9 @@ function isPaidMethod() {
 function syncMethodUI() {
   if (els.methodGrid) {
     els.methodGrid.querySelectorAll(".method").forEach((card) => {
-      card.classList.toggle("sel", card.dataset.method === accessMethod);
+      const selected = card.dataset.method === accessMethod;
+      card.classList.toggle("sel", selected);
+      card.setAttribute("aria-pressed", selected ? "true" : "false");
     });
   }
   if (els.priceRow) els.priceRow.classList.toggle("hidden", !isPaidMethod());
@@ -1309,6 +1652,7 @@ function syncMethodUI() {
     els.resellField.classList.toggle("hidden", accessMethod !== "buy_and_resell");
   if (els.royaltyField)
     els.royaltyField.classList.toggle("hidden", !isPaidMethod());
+  renderPreview();
 }
 
 function addRoyaltyRow(address, percent) {
@@ -1399,6 +1743,10 @@ if (els.royaltyAdd) {
   els.royaltyAdd.addEventListener("click", () => addRoyaltyRow("", ""));
 }
 syncMethodUI();
+
+// Initial roadmap: hide the media-only rows until a media file is chosen, so the default panel
+// shows the generic path (encrypt → publish → sign → broadcast → enable trading).
+setMediaStepsVisible(false);
 
 els.createChannelBtn.addEventListener("click", createChannel);
 els.mint.addEventListener("click", mint);
