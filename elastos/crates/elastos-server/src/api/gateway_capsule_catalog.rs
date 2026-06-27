@@ -127,8 +127,9 @@ pub(super) async fn capsule_interface_invoke(
         );
     }
 
-    let output = match enforce_affordance_invocation_policy(&resolved) {
-        InvocationGate::Direct => {
+    let gate = enforce_affordance_invocation_policy(&resolved);
+    let output = match plan_affordance_dispatch(gate, request.consent_token.is_some()) {
+        AffordanceDispatchPlan::DispatchDirect => {
             match dispatch_capsule_affordance(&state, &context, &resolved, &request).await {
                 Ok(output) => output,
                 Err((status, code, message)) => {
@@ -148,10 +149,11 @@ pub(super) async fn capsule_interface_invoke(
                 }
             }
         }
-        InvocationGate::Consent => {
-            // Consent-gated affordance: derive the (resource, action) scope, raise a
-            // consent request through the runtime, return 202 + request_id. Never a
-            // token and never dispatch; every path in this arm diverges (returns).
+        AffordanceDispatchPlan::RaiseConsent => {
+            // Consent-gated affordance, first call (no token): derive the
+            // (resource, action) scope, raise a consent request through the
+            // runtime, return 202 + request_id. Never a token and never dispatch;
+            // every path in this arm diverges (returns).
             let (resource, action, risk) = match affordance_consent_descriptor(&resolved) {
                 Ok(value) => value,
                 Err((status, code, message)) => {
@@ -239,6 +241,83 @@ pub(super) async fn capsule_interface_invoke(
                 }),
             )
                 .into_response();
+        }
+        AffordanceDispatchPlan::RedeemThenDispatch => {
+            // Consent-gated retry: a consent token was presented. Derive the same
+            // (resource, action) scope, redeem the token via validate-and-consume
+            // (forwarding the caller's own authorization so the runtime checks it
+            // as the bound capsule), and ONLY THEN dispatch — gated by the witness.
+            let (resource, action, _risk) = match affordance_consent_descriptor(&resolved) {
+                Ok(value) => value,
+                Err((status, code, message)) => {
+                    let _ = append_provider_effect_audit(
+                        &state.data_dir,
+                        ProviderEffectAuditInput {
+                            capsule_id: &resolved.capsule,
+                            event_type: "capsule.affordance.consent_failed",
+                            principal_id: &context.principal_id,
+                            session_id: &context.session_id,
+                            request_id: &request_id,
+                            result: "failed",
+                            reason: &message,
+                        },
+                    );
+                    return capsule_invoke_error(&resolved, status, code, &message);
+                }
+            };
+            let action_str = action.to_string();
+            let app_authorization = headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            let consent_token = request.consent_token.as_deref().unwrap_or_default();
+            let grant = match redeem_affordance_grant(
+                &state.data_dir,
+                app_authorization,
+                consent_token,
+                &resolved,
+                &resource,
+                &action_str,
+                &request.input,
+            )
+            .await
+            {
+                Ok(grant) => grant,
+                Err((status, code, message)) => {
+                    let _ = append_provider_effect_audit(
+                        &state.data_dir,
+                        ProviderEffectAuditInput {
+                            capsule_id: &resolved.capsule,
+                            event_type: "capsule.affordance.consent_redeem_failed",
+                            principal_id: &context.principal_id,
+                            session_id: &context.session_id,
+                            request_id: &request_id,
+                            result: "failed",
+                            reason: &message,
+                        },
+                    );
+                    return capsule_invoke_error(&resolved, status, code, &message);
+                }
+            };
+            match dispatch_consented_affordance(&state, &context, &resolved, &request, grant).await
+            {
+                Ok(output) => output,
+                Err((status, code, message)) => {
+                    let _ = append_provider_effect_audit(
+                        &state.data_dir,
+                        ProviderEffectAuditInput {
+                            capsule_id: &resolved.capsule,
+                            event_type: "capsule.affordance.failed",
+                            principal_id: &context.principal_id,
+                            session_id: &context.session_id,
+                            request_id: &request_id,
+                            result: "failed",
+                            reason: &message,
+                        },
+                    );
+                    return capsule_invoke_error(&resolved, status, code, &message);
+                }
+            }
         }
     };
 
@@ -456,6 +535,174 @@ fn enforce_affordance_invocation_policy(resolved: &ResolvedCapsuleAffordance) ->
         return InvocationGate::Consent;
     }
     InvocationGate::Direct
+}
+
+/// What to do with an affordance invocation, given the policy gate and whether
+/// the caller presented a consent token. Pure and total so the routing decision
+/// is unit-testable without any I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AffordanceDispatchPlan {
+    /// Low-risk: dispatch directly, no consent needed.
+    DispatchDirect,
+    /// Consent-gated, no token yet: raise a consent request (HTTP 202).
+    RaiseConsent,
+    /// Consent-gated and a token was presented: redeem it, then dispatch.
+    RedeemThenDispatch,
+}
+
+/// Decide the dispatch plan. A consent-gated method dispatches ONLY when a
+/// consent token is presented (which is then redeemed); otherwise it raises a
+/// consent request. A low-risk method always dispatches directly.
+fn plan_affordance_dispatch(
+    gate: InvocationGate,
+    has_consent_token: bool,
+) -> AffordanceDispatchPlan {
+    match (gate, has_consent_token) {
+        (InvocationGate::Direct, _) => AffordanceDispatchPlan::DispatchDirect,
+        (InvocationGate::Consent, false) => AffordanceDispatchPlan::RaiseConsent,
+        (InvocationGate::Consent, true) => AffordanceDispatchPlan::RedeemThenDispatch,
+    }
+}
+
+/// Unforgeable proof that an affordance-consent token was redeemed via
+/// validate-and-consume (W2 step 8). The field is private to this module, so a
+/// value can ONLY be produced by [`redeem_affordance_grant`] on a SUCCESSFUL
+/// redemption — there is no other constructor. Requiring one by value in
+/// [`dispatch_consented_affordance`] makes "no consent-gated dispatch without a
+/// live, consumed grant" a property the COMPILER enforces, not a convention.
+struct ValidatedAffordanceGrant {
+    /// The affordance method the grant authorises (re-asserted at dispatch).
+    method_id: String,
+}
+
+/// Redeem a consent token against the runtime's `validate-and-consume`, returning
+/// the witness ONLY on a successful single-use consume. The APP's own
+/// authorization is forwarded verbatim, so the runtime authenticates the
+/// redemption as the calling capsule (`vm-{name}`) — i.e. the identity the token
+/// is bound to — rather than as the shell. Any non-success fails closed: no
+/// witness, therefore no dispatch.
+async fn redeem_affordance_grant(
+    data_dir: &std::path::Path,
+    app_authorization: &str,
+    consent_token: &str,
+    resolved: &ResolvedCapsuleAffordance,
+    resource: &str,
+    action: &str,
+    input: &serde_json::Value,
+) -> Result<ValidatedAffordanceGrant, (StatusCode, &'static str, String)> {
+    if app_authorization.trim().is_empty() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "redeem_no_authorization",
+            "no caller authorization to redeem the consent grant".to_string(),
+        ));
+    }
+    let coords = load_live_runtime_coords(data_dir).await.ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "runtime_unavailable",
+        "local runtime is not running".to_string(),
+    ))?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "redeem_client_failed",
+                err.to_string(),
+            )
+        })?;
+    let response = client
+        .post(format!(
+            "{}/api/capability/validate-and-consume",
+            coords.api_url
+        ))
+        .header(AUTHORIZATION, app_authorization)
+        .json(&serde_json::json!({
+            "token": consent_token,
+            "method_id": resolved.method.id,
+            "resource": resource,
+            "action": action,
+            "input": input,
+        }))
+        .send()
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "redeem_post_failed",
+                err.to_string(),
+            )
+        })?;
+
+    if !response.status().is_success() {
+        // Keep the runtime's refusal in the gateway audit only; never forward raw
+        // runtime prose (avoids leaking internal resource topology).
+        let runtime_status = response.status();
+        let _ = response.text().await;
+        return Err((
+            StatusCode::FORBIDDEN,
+            "consent_redeem_rejected",
+            format!("runtime refused the redemption ({runtime_status})"),
+        ));
+    }
+
+    let body: serde_json::Value = response.json().await.map_err(|err| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "redeem_parse_failed",
+            err.to_string(),
+        )
+    })?;
+    match body.get("status").and_then(|s| s.as_str()) {
+        Some("consumed") => Ok(ValidatedAffordanceGrant {
+            method_id: resolved.method.id.clone(),
+        }),
+        other => Err((
+            StatusCode::BAD_GATEWAY,
+            "redeem_unexpected_status",
+            format!("unexpected redeem status: {}", other.unwrap_or("<missing>")),
+        )),
+    }
+}
+
+/// Dispatch a CONSENT-GATED affordance. Requires a [`ValidatedAffordanceGrant`]
+/// BY VALUE: it is a compile error to reach here without a redeemed grant. Also
+/// re-asserts the grant authorises THIS method (defence in depth) and records an
+/// audit entry linking the dispatch to the consumed grant.
+async fn dispatch_consented_affordance(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+    resolved: &ResolvedCapsuleAffordance,
+    request: &CapsuleInterfaceInvokeRequest,
+    grant: ValidatedAffordanceGrant,
+) -> Result<serde_json::Value, (StatusCode, &'static str, String)> {
+    if grant.method_id != resolved.method.id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "grant_method_mismatch",
+            "redeemed grant does not authorise this method".to_string(),
+        ));
+    }
+    let _ = append_provider_effect_audit(
+        &state.data_dir,
+        ProviderEffectAuditInput {
+            capsule_id: &resolved.capsule,
+            event_type: "capsule.affordance.consented_dispatch",
+            principal_id: &context.principal_id,
+            session_id: &context.session_id,
+            request_id: &format!(
+                "affordance-consent:{}:{}",
+                resolved.capsule, grant.method_id
+            ),
+            result: "consented",
+            reason: &format!(
+                "dispatching {} under a redeemed consent grant",
+                grant.method_id
+            ),
+        },
+    );
+    dispatch_capsule_affordance(state, context, resolved, request).await
 }
 
 /// Narrowest [`Action`] implied by a declared [`AffordanceRisk`] class. Total and
@@ -1159,6 +1406,12 @@ pub(super) struct CapsuleInterfaceInvokeRequest {
     method: String,
     #[serde(default)]
     input: serde_json::Value,
+    /// A granted affordance-consent token (base64), presented on the RETRY of a
+    /// consent-gated invocation (W2 step 8). Absent on the first call (which
+    /// raises a consent request). When present, the gateway redeems it via
+    /// validate-and-consume before dispatching — no token, no consented dispatch.
+    #[serde(default)]
+    consent_token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1220,6 +1473,29 @@ struct CapsuleInterfaceRegistryPolicy {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn plan_affordance_dispatch_routes_each_case() {
+        // Low-risk always dispatches directly, with or without a token.
+        assert_eq!(
+            plan_affordance_dispatch(InvocationGate::Direct, false),
+            AffordanceDispatchPlan::DispatchDirect
+        );
+        assert_eq!(
+            plan_affordance_dispatch(InvocationGate::Direct, true),
+            AffordanceDispatchPlan::DispatchDirect
+        );
+        // Consent-gated, no token -> raise a consent request (never dispatch).
+        assert_eq!(
+            plan_affordance_dispatch(InvocationGate::Consent, false),
+            AffordanceDispatchPlan::RaiseConsent
+        );
+        // Consent-gated, token presented -> redeem then dispatch.
+        assert_eq!(
+            plan_affordance_dispatch(InvocationGate::Consent, true),
+            AffordanceDispatchPlan::RedeemThenDispatch
+        );
+    }
 
     fn write_capsule(data_dir: &std::path::Path, name: &str, role: &str, capsule_type: &str) {
         let dir = data_dir.join("capsules").join(name);
@@ -1408,6 +1684,7 @@ mod tests {
             interface: "elastos.marketplace.catalog".to_string(),
             method: "catalog.list".to_string(),
             input: serde_json::json!({}),
+            consent_token: None,
         };
         let resolved = resolve_capsule_affordance(data_dir.path(), &request).unwrap();
         assert_eq!(resolved.capsule, "marketplace");

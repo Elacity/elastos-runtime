@@ -15,7 +15,7 @@ agent-containment audit (EU AI Act Art 12/14).
 **Status at a glance (2026-06-27):** substrate + intent compiler DONE; security audited + hardened
 ~9/10 (AUD-1..5); Astrid research DONE; adoption wedges 1-2 (MCP-serve + dataflow) DONE; the PRODUCT +
 STRATEGY resolved (KEEP, the PDR, the shell vision, the ESP protocol, the narrative); now executing the
-**ESP build wedges W0-W7** toward the shell — **W2 (consent act path) IN PROGRESS (~70%)**.
+**ESP build wedges W0-W7** toward the shell — **W2 (consent act path) IN PROGRESS (~80%)**.
 
 ---
 
@@ -78,7 +78,7 @@ The PDR/ESP plan: build the honest substrate first, then the shell as a read-onl
 |---|---|---|
 | **W0** | Core-derived reach (the honest halo) | not started |
 | **W1** | Egress-as-capability | not started |
-| **W2** | **Unstub the consent act path** | **IN PROGRESS ~70%** (below) |
+| **W2** | **Unstub the consent act path** | **IN PROGRESS ~80%** (below) |
 | **W3** | De-hardcode "the shell" → "a shell" + rename `consent-broker` | not started |
 | **W4** | Write ESP v0 (protocol doc + TS types) | not started |
 | **W5** | The v1 Svelte projection shell + the hero dDRM act | not started |
@@ -102,13 +102,19 @@ signed token** (`TokenConstraints` + `signable_bytes`) — tamper-evidence prove
 the exact `(method, args)` the user approved, then atomically spends the single use (signed
 `CapabilityUse`); every mismatch fails closed with a distinct code and burns no use. The
 identity-domain follow-up is **RESOLVED**: consent now binds the canonical `vm-{name}` (G-ID), so the
-affordance token lives in the one identity domain. REMAINING: 8 (`ValidatedAffordanceGrant` witness =
-compiler-enforced dispatch gate — wire dispatch to *require* a validate-and-consume result), 9 (signed
-BLOCKING audit + receipt), 10 (journey test + fail-closed branches), 11 (alignment + docs). Step 8 =
-the last structural piece of the crux.
+affordance token lives in the one identity domain. **Step 8 DONE** (this slice): the
+`ValidatedAffordanceGrant` witness — an unforgeable proof (module-private, constructed ONLY by a
+successful `validate-and-consume` redemption) that `dispatch_consented_affordance` requires **by
+value**, so a consent-gated affordance cannot be dispatched without a live redeemed grant (a *compile*
+guarantee, not a convention). The invoke handler now routes via a pure, unit-tested
+`plan_affordance_dispatch` (Direct / RaiseConsent / RedeemThenDispatch); on a consent retry it redeems
+the token by **forwarding the caller's own authorization** (runtime authenticates as the bound
+`vm-{name}`), fail-closed on any non-success (no witness → no dispatch). REMAINING: 9 (signed BLOCKING
+audit + receipt on the grant→use chain), 10 (full journey test + fail-closed branch matrix — this also
+verifies the live identity round-trip end-to-end), 11 (alignment assertions + docs).
 
-**Immediate next (on `claude/keep-consent-architecture-0fz0ll`):** W2 step 8 (`ValidatedAffordanceGrant`
-witness gates dispatch) → 9 → 10 → 11 → W3 → … → W7.
+**Immediate next (on `claude/keep-consent-architecture-0fz0ll`):** W2 step 9 (signed blocking audit +
+receipt) → 10 (journey) → 11 → W3 → … → W7.
 
 ---
 
