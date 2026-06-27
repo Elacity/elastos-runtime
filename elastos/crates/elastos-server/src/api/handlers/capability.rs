@@ -434,40 +434,75 @@ pub async fn grant_request(
         )
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    // Create the capability token (reached only on an Approved AND attested decision)
-    let constraints = match duration {
-        GrantDuration::Once => TokenConstraints::new(0, false, None, Some(1)),
-        GrantDuration::Session => TokenConstraints::default(),
-    };
-
-    // G-ID flip: mint at the requester's REAL capsule identity ("vm-{name}",
-    // recorded on the request), not the session-id shim. Fail closed FORBIDDEN if
-    // the requester had no capsule identity -- mint NOTHING rather than fabricate
-    // one (mirror of the approval guard above). The request stays Pending.
-    let requester_capsule_id = match request.requester_capsule_id.as_deref() {
-        Some(id) => id,
-        None => {
-            return Err((
-                StatusCode::FORBIDDEN,
-                format!(
-                    "capability grant has no requester capsule identity: {}",
-                    input.request_id
-                ),
+    // Create the capability token (reached only on an Approved AND attested
+    // decision).
+    //
+    // W2 step 6 (the enforcement crux): an affordance-consent request carries a
+    // binding, so its grant READS that binding and is scoped to the EXACT
+    // affordance + arguments — minted at the BOUND capsule, single-use, with a
+    // short expiry, and with (method_id, input_hash) sealed into the signed
+    // token. This is deliberately distinct from the ordinary session/capability
+    // grant, which keeps flint's G-ID identity path unchanged.
+    let (token, grant_duration) = match (
+        request.capsule.as_deref(),
+        request.method_id.as_deref(),
+        request.input_hash.as_deref(),
+    ) {
+        (Some(capsule), Some(method_id), Some(input_hash)) => {
+            // 1 hour: long enough for a human to act on the consent prompt, short
+            // enough that an approved-but-unused grant lapses rather than lingers.
+            const AFFORDANCE_GRANT_TTL_SECS: u64 = 3600;
+            let constraints = TokenConstraints::for_affordance(method_id, input_hash);
+            let expiry = Some(elastos_common::SecureTimestamp::after_secs(
+                AFFORDANCE_GRANT_TTL_SECS,
             ));
+            let token = state.capability_manager.grant(
+                capsule,
+                request.resource.clone(),
+                request.action,
+                constraints,
+                expiry,
+            );
+            (token, GrantDuration::Once)
+        }
+        _ => {
+            let constraints = match duration {
+                GrantDuration::Once => TokenConstraints::new(0, false, None, Some(1)),
+                GrantDuration::Session => TokenConstraints::default(),
+            };
+
+            // G-ID flip: mint at the requester's REAL capsule identity ("vm-{name}",
+            // recorded on the request), not the session-id shim. Fail closed
+            // FORBIDDEN if the requester had no capsule identity -- mint NOTHING
+            // rather than fabricate one (mirror of the approval guard above). The
+            // request stays Pending.
+            let requester_capsule_id = match request.requester_capsule_id.as_deref() {
+                Some(id) => id,
+                None => {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        format!(
+                            "capability grant has no requester capsule identity: {}",
+                            input.request_id
+                        ),
+                    ));
+                }
+            };
+            let token = state.capability_manager.grant(
+                requester_capsule_id,
+                request.resource.clone(),
+                request.action,
+                constraints,
+                None, // No expiry for now (session-scoped)
+            );
+            (token, duration)
         }
     };
-    let token = state.capability_manager.grant(
-        requester_capsule_id,
-        request.resource.clone(),
-        request.action,
-        constraints,
-        None, // No expiry for now (session-scoped)
-    );
 
     // Mark request as granted
     state
         .pending_store
-        .grant_request(&input.request_id, token.clone(), duration)
+        .grant_request(&input.request_id, token.clone(), grant_duration)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -1006,6 +1041,76 @@ mod tests {
                 .await
                 .is_err(),
             "and not against a different identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn affordance_grant_reads_binding_and_mints_single_use_bound_token() {
+        // W2 step 6 (enforcement crux): an affordance-consent request (all four
+        // binding fields present) is granted into a token minted at the BOUND
+        // capsule, single-use, carrying the exact (method_id, input_hash) the user
+        // approved -- distinct from the ordinary G-ID session path.
+        use elastos_runtime::capability::token::CapabilityToken;
+        use elastos_runtime::capability::{Action, ResourceId};
+        let state = test_state();
+        // The requesting session is vm-caller; the affordance binds vm-player.
+        let session = Session::new_capsule("vm-caller".to_string());
+        let req = request_capability(
+            State(state.clone()),
+            Extension(session.clone()),
+            Json(RequestCapabilityInput {
+                resource: "elastos://rights/play".to_string(),
+                action: "execute".to_string(),
+                capsule: Some("vm-player".to_string()),
+                principal_id: Some("did:ela:alice".to_string()),
+                method_id: Some("play".to_string()),
+                input_hash: Some("hash123".to_string()),
+            }),
+        )
+        .await
+        .expect("affordance request accepted")
+        .0;
+        let grant = grant_request(
+            State(state.clone()),
+            Extension(session),
+            Json(GrantRequestInput {
+                request_id: req.request_id.expect("request id"),
+                duration: "session".to_string(),
+                rationale: None,
+            }),
+        )
+        .await
+        .expect("affordance grant approved + attested")
+        .0;
+        let token = CapabilityToken::from_base64(&grant.token.expect("token minted")).unwrap();
+
+        // The binding the user approved is carried in the (signed) token.
+        assert_eq!(token.constraints().method_id(), Some("play"));
+        assert_eq!(token.constraints().input_hash(), Some("hash123"));
+        assert_eq!(
+            token.constraints().max_uses(),
+            Some(1),
+            "affordance grant is single-use"
+        );
+
+        // Minted at the BOUND capsule (vm-player), NOT the requesting session
+        // identity (vm-caller): validates at vm-player and nowhere else.
+        let resource = ResourceId::new("elastos://rights/play");
+        assert!(
+            state
+                .capability_manager
+                .validate(&token, "vm-player", Action::Execute, &resource, None)
+                .await
+                .is_ok(),
+            "token validates at the bound capsule vm-player"
+        );
+        assert!(
+            state
+                .capability_manager
+                .validate(&token, "vm-caller", Action::Execute, &resource, None)
+                .await
+                .is_err(),
+            "token does not validate at the requesting session identity"
         );
     }
 

@@ -15,7 +15,7 @@ agent-containment audit (EU AI Act Art 12/14).
 **Status at a glance (2026-06-27):** substrate + intent compiler DONE; security audited + hardened
 ~9/10 (AUD-1..5); Astrid research DONE; adoption wedges 1-2 (MCP-serve + dataflow) DONE; the PRODUCT +
 STRATEGY resolved (KEEP, the PDR, the shell vision, the ESP protocol, the narrative); now executing the
-**ESP build wedges W0-W7** toward the shell — **W2 (consent act path) IN PROGRESS (~40%)**.
+**ESP build wedges W0-W7** toward the shell — **W2 (consent act path) IN PROGRESS (~60%)**.
 
 ---
 
@@ -78,7 +78,7 @@ The PDR/ESP plan: build the honest substrate first, then the shell as a read-onl
 |---|---|---|
 | **W0** | Core-derived reach (the honest halo) | not started |
 | **W1** | Egress-as-capability | not started |
-| **W2** | **Unstub the consent act path** | **IN PROGRESS ~40%** (below) |
+| **W2** | **Unstub the consent act path** | **IN PROGRESS ~60%** (below) |
 | **W3** | De-hardcode "the shell" → "a shell" + rename `consent-broker` | not started |
 | **W4** | Write ESP v0 (protocol doc + TS types) | not started |
 | **W5** | The v1 Svelte projection shell + the hero dDRM act | not started |
@@ -89,16 +89,22 @@ W0/W1 make the halo *truthful*; W2 makes consent *real*; W3/W4 open the *modular
 the *first* shell; W7 *turns the flywheel once*. (W0/W1 are the PDR's "the halo is a lie + no egress
 control" fixes — the precondition for the honest-manifestation moat.)
 
-**W2 sub-status (`W2_CONSENT_PLAN.md`):** steps 3 (binding fields), 4a (request-half receiver), 4b
-(gateway consent path: shared canonical hash + descriptor + `InvocationGate` + the token-incapable 202
-POST seam) DONE + gated green; parked on `origin/w2-consent-source`. REMAINING: **re-integrate onto
-flint's hardened code** (W2 was built on the older `ddrm` base — collides with G-ID /
-`create_request_with_capsule`), then step 5 (SSE — already surfaces by construction), **6 (the grant
-READS the binding — the enforcement crux)**, 7 (validate-and-consume endpoint), 8 (`ValidatedAffordanceGrant`
-witness = compiler-enforced dispatch gate), 9 (signed BLOCKING audit + receipt), 10 (journey test),
-11 (alignment + docs). Steps 6-8 = the security crux (binding actually enforced).
+**W2 sub-status (`W2_CONSENT_PLAN.md`):** steps 1–4 DONE and **re-integrated onto the hardened
+`claude/keep-consent-architecture-0fz0ll` line** (commit `4833f89`): binding fields reconciled
+*alongside* flint's G-ID `requester_capsule_id` (one `create_request_inner` carries both), shared
+`canonical_input_hash`, the `/api/capability/request` binding route, and the gateway 403→`InvocationGate`
+consent path (POSTs a scoped request to the runtime over HTTP — the edge holds no key). Step 5 (SSE)
+surfaces by construction. **Step 6 DONE** (this slice): the grant READS the binding and mints a
+single-use token at the bound capsule, +1h expiry, with `(method_id, input_hash)` **sealed into the
+signed token** (`TokenConstraints` + `signable_bytes`) — tamper-evidence proven by test. Also fixed
+**BUG-1** (zombie reaping, `try_wait`). REMAINING: 7 (validate-and-consume endpoint), 8
+(`ValidatedAffordanceGrant` witness = compiler-enforced dispatch gate), 9 (signed BLOCKING audit +
+receipt), 10 (journey test + fail-closed branches), 11 (alignment + docs). Steps 7-8 = the remaining
+security crux. **Known follow-up:** confirm the binding `capsule` identity domain (manifest name vs
+`vm-{name}`) matches the carrier gate before the step-10 journey test.
 
-**Immediate next (in the cloud, on `flint`):** re-integrate W2 → step 6 → finish W2 → W3 → … → W7.
+**Immediate next (on `claude/keep-consent-architecture-0fz0ll`):** W2 step 7 (validate-and-consume) →
+step 8 (witness) → 9 → 10 → 11 → W3 → … → W7.
 
 ---
 

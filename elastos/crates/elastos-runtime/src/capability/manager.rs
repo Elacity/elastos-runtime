@@ -443,12 +443,16 @@ impl CapabilityManager {
             (None, None) => None,
         };
 
-        // Non-delegatable, inherits parent action
+        // Non-delegatable, inherits parent action. A delegated token is never an
+        // affordance-consent token (those are minted non-delegatable), so it
+        // carries no affordance binding.
         let constraints = TokenConstraints {
             delegatable: false,
             epoch: parent.constraints.epoch,
             max_classification: parent.constraints.max_classification,
             max_uses: parent.constraints.max_uses,
+            method_id: None,
+            input_hash: None,
         };
 
         let token = self.grant(
