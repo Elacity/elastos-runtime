@@ -2926,12 +2926,14 @@ impl ContentProvider {
                 })
             }
             Some("file") => {
+                // Pre-effect request-shape rejection (before the IPFS add): missing
+                // data rejects identically on replay → DidNotAct (refundable).
                 let data = request
                     .get("data")
                     .and_then(|data| data.as_str())
                     .filter(|data| !data.trim().is_empty())
                     .ok_or_else(|| {
-                        ProviderError::Provider("content file publish requires data".into())
+                        ProviderError::DidNotAct("content file publish requires data".into())
                     })?;
                 let filename = request
                     .get("filename")
@@ -3221,15 +3223,20 @@ impl ContentProvider {
 
     async fn import_exact(&self, request: &Value) -> Result<Value, ProviderError> {
         validate_import_exact_invocation(request)?;
+        // Pre-effect request-shape validation (before payload extraction + the IPFS
+        // add): a missing/invalid cid rejects identically on replay, so DidNotAct
+        // refunds the unused single-use. The `storage_quota_exceeded` check below
+        // stays a structured error — capacity is transient (a replay could act).
         let cid = request
             .get("cid")
             .and_then(|cid| cid.as_str())
             .filter(|cid| !cid.trim().is_empty())
-            .ok_or_else(|| ProviderError::Provider("content import_exact requires cid".into()))?;
+            .ok_or_else(|| {
+                ProviderError::DidNotAct("content import_exact requires a cid".into())
+            })?;
         if !is_valid_cid(cid) {
-            return Ok(provider_error(
-                "invalid_cid",
-                "content import_exact requires a valid CID",
+            return Err(ProviderError::DidNotAct(
+                "content import_exact requires a valid CID".into(),
             ));
         }
         let bytes = import_exact_payload_bytes(request)?;
@@ -9230,6 +9237,38 @@ mod tests {
         assert!(err
             .to_string()
             .contains("requires Runtime provider invocation metadata"));
+    }
+
+    /// BUG-4: ContentProvider request-shape rejections on the WRITE ops
+    /// (import_exact invalid cid, publish file missing data) are pre-effect — they
+    /// reject before the IPFS add — so they return DidNotAct (refundable). Quota /
+    /// capacity rejections deliberately stay structured errors (transient).
+    #[tokio::test]
+    async fn content_write_request_shape_rejections_return_did_not_act() {
+        let (_data_dir, _registry, _ipfs, content) = registry_with_content_and_ipfs().await;
+
+        // Valid invocation metadata but an invalid cid → pre-effect, refundable.
+        let invalid_cid = content
+            .send_raw(&json!({
+                "op": "import_exact",
+                "cid": "not-a-cid",
+                "stream": test_stream_payload(b"x"),
+                "_runtime_invocation": carrier_import_exact_invocation(),
+            }))
+            .await;
+        assert!(
+            matches!(invalid_cid, Err(ProviderError::DidNotAct(_))),
+            "import_exact invalid cid → DidNotAct; got {invalid_cid:?}"
+        );
+
+        // publish a file with no data → pre-effect, refundable.
+        let publish_no_data = content
+            .send_raw(&json!({ "op": "publish", "kind": "file" }))
+            .await;
+        assert!(
+            matches!(publish_no_data, Err(ProviderError::DidNotAct(_))),
+            "publish file missing data → DidNotAct; got {publish_no_data:?}"
+        );
     }
 
     #[tokio::test]
