@@ -15,7 +15,7 @@ agent-containment audit (EU AI Act Art 12/14).
 **Status at a glance (2026-06-27):** substrate + intent compiler DONE; security audited + hardened
 ~9/10 (AUD-1..5); Astrid research DONE; adoption wedges 1-2 (MCP-serve + dataflow) DONE; the PRODUCT +
 STRATEGY resolved (KEEP, the PDR, the shell vision, the ESP protocol, the narrative); now executing the
-**ESP build wedges W0-W7** toward the shell — **W2 ✅ CLOSED**; **W0 (honest halo) IN PROGRESS** — the core-derived reach engine landed; projection wiring next.
+**ESP build wedges W0-W7** toward the shell — **W2 ✅ CLOSED · W0 ✅ CLOSED** (honest halo: reach is core-computed AND projected); next is **W1** (egress-as-capability).
 
 ---
 
@@ -76,7 +76,7 @@ The PDR/ESP plan: build the honest substrate first, then the shell as a read-onl
 
 | Wedge | What it is | Status |
 |---|---|---|
-| **W0** | Core-derived reach (the honest halo) | **IN PROGRESS** — engine landed (`reach.rs`); projection wiring (W0b) next |
+| **W0** | Core-derived reach (the honest halo) | **✅ DONE** — engine (`reach.rs`) + projected onto the catalog (`affordance_reach`); W1 adds per-host egress |
 | **W1** | Egress-as-capability | not started |
 | **W2** | **Unstub the consent act path** | **✅ DONE (steps 1-11)** (below) |
 | **W3** | De-hardcode "the shell" → "a shell" + rename `consent-broker` | not started |

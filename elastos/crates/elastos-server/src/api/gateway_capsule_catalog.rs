@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use elastos_common::{
     AffordanceApprovalMode, AffordanceRisk, CapsuleAffordanceDescriptor,
-    CapsuleInterfaceDescriptor, CapsuleManifest, CapsuleRole, CapsuleType,
+    CapsuleInterfaceDescriptor, CapsuleManifest, CapsuleRole, CapsuleType, ReachDescriptorV1,
 };
 use elastos_runtime::capability::Action;
 use serde::{Deserialize, Serialize};
@@ -1095,6 +1095,31 @@ fn catalog_capsule_summary(
     let role = manifest.role.clone();
     let capsule_type = manifest.capsule_type.clone();
     let category = capsule_category(&role);
+
+    // W0b: stamp the CORE-DERIVED reach onto each declared affordance, computed
+    // here where the full manifest (isolation type + ENFORCED permissions) is in
+    // hand, and projected as a parallel view so the manifest descriptor itself
+    // stays a pure declaration. The shell renders its blast-radius halo from this,
+    // not from the self-declared `risk`.
+    let mut affordance_reach: Vec<AffordanceReachView> = Vec::new();
+    for interface in &manifest.interfaces {
+        for method in &interface.methods {
+            let reach = ReachDescriptorV1::derive(
+                manifest.capsule_type.clone(),
+                &manifest.permissions,
+                method.resource.as_deref(),
+                method.operation.as_deref(),
+            );
+            let declared_understates_reach = reach.declared_understates_reach(&method.risk);
+            affordance_reach.push(AffordanceReachView {
+                interface_id: interface.id.clone(),
+                method_id: method.id.clone(),
+                risk: method.risk.clone(),
+                reach,
+                declared_understates_reach,
+            });
+        }
+    }
     let launchable = target.is_some() && role.is_shell_launchable();
     let signature_state = if manifest
         .signature
@@ -1145,6 +1170,7 @@ fn catalog_capsule_summary(
             .collect(),
         capabilities: manifest.capabilities,
         interfaces: manifest.interfaces,
+        affordance_reach,
         viewer: manifest.viewer,
         cid,
         cid_state: cid_state.to_string(),
@@ -1347,6 +1373,22 @@ struct CapsuleCatalogPolicy {
     drm_note: String,
 }
 
+/// Shell-facing, core-DERIVED reach for one declared affordance (W0b). Projected
+/// alongside the pure manifest descriptor; the `reach` is computed from the
+/// capsule's enforced capability, NOT the self-declared `risk` (which is carried
+/// here only so the shell can show the declaration next to the truth).
+#[derive(Debug, Clone, Serialize)]
+struct AffordanceReachView {
+    interface_id: String,
+    method_id: String,
+    /// The capsule's self-declared risk (advisory).
+    risk: AffordanceRisk,
+    /// The core-computed reach (authoritative).
+    reach: ReachDescriptorV1,
+    /// True when the declaration reads low but the observed reach is far.
+    declared_understates_reach: bool,
+}
+
 #[derive(Serialize)]
 struct CapsuleSummary {
     name: String,
@@ -1374,6 +1416,11 @@ struct CapsuleSummary {
     capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     interfaces: Vec<CapsuleInterfaceDescriptor>,
+    /// W0b: core-DERIVED reach per declared affordance (the blast-radius halo
+    /// data), projected ALONGSIDE the pure manifest `interfaces` so the shell can
+    /// render reach from real state. Keyed by (interface_id, method_id).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    affordance_reach: Vec<AffordanceReachView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     viewer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1646,6 +1693,85 @@ mod tests {
         assert_eq!(marketplace_entry.interface.methods.len(), 2);
         assert_eq!(marketplace_entry.interface.methods[1].id, "capsule.open");
         assert_eq!(registry.policy.invocation_state, "runtime-gated");
+    }
+
+    #[test]
+    fn catalog_projects_core_derived_reach_per_affordance() {
+        use elastos_common::{EgressReach, IsolationTier, ResourceScope, Reversibility};
+        let data_dir = tempfile::tempdir().unwrap();
+        write_capsule_json(
+            data_dir.path(),
+            "reachy",
+            serde_json::json!({
+                "schema": "elastos.capsule/v1",
+                "name": "reachy",
+                "version": "0.1.0",
+                "description": "reach projection test",
+                "author": "elastos",
+                "role": "app",
+                "type": "wasm",
+                "entrypoint": "reachy.wasm",
+                "signature": "test-signature",
+                "interfaces": [{
+                    "id": "iface.reach",
+                    "version": "0.1.0",
+                    "methods": [
+                        {
+                            "id": "scan.all",
+                            "risk": "read",
+                            "approval": "runtime_policy",
+                            "audit": "event",
+                            "resource": "elastos://*",
+                            "operation": "read"
+                        },
+                        {
+                            "id": "open.one",
+                            "risk": "read",
+                            "approval": "runtime_policy",
+                            "audit": "event",
+                            "resource": "elastos://rights/film-x",
+                            "operation": "read"
+                        }
+                    ]
+                }]
+            }),
+        );
+
+        let catalog = capsule_catalog_summary(data_dir.path());
+        let reachy = catalog
+            .capsules
+            .iter()
+            .find(|capsule| capsule.name == "reachy")
+            .expect("reachy capsule in the catalog");
+
+        // Every declared affordance carries a core-derived reach view.
+        let scan = reachy
+            .affordance_reach
+            .iter()
+            .find(|view| view.method_id == "scan.all")
+            .expect("reach projected for scan.all");
+        assert_eq!(scan.reach.isolation, IsolationTier::Wasm);
+        assert_eq!(scan.reach.egress, EgressReach::None);
+        assert_eq!(scan.reach.scope, ResourceScope::System); // scheme-level wildcard
+        assert_eq!(scan.reach.reversibility, Reversibility::Reversible);
+        assert!(scan.reach.observed);
+        // Declared "read" but the reach is system-wide → the lie is flagged on the
+        // projection the shell renders.
+        assert!(
+            scan.declared_understates_reach,
+            "declared-low + system-scope must be flagged on the projection"
+        );
+
+        let open = reachy
+            .affordance_reach
+            .iter()
+            .find(|view| view.method_id == "open.one")
+            .expect("reach projected for open.one");
+        assert_eq!(open.reach.scope, ResourceScope::Object);
+        assert!(
+            !open.declared_understates_reach,
+            "a genuinely contained read is not flagged"
+        );
     }
 
     #[test]
