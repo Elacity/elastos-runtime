@@ -277,6 +277,34 @@ fn gate_author_signature(
     Ok(())
 }
 
+/// Lowest assignable vsock guest CID. 0 (any/hypervisor), 1 (local), and 2
+/// (host) are reserved by the vsock transport, so guest CIDs start at 3.
+const MIN_GUEST_CID: u32 = 3;
+
+/// Pick the next free vsock CID at or after `from`, skipping reserved low CIDs
+/// and any CID currently in use by a live VM, wrapping the u32 space WITHOUT
+/// overflow (the old `*next += 1` could wrap and re-hand a live VM's CID — BUG-8).
+///
+/// Returns `(cid, advance)` where `cid` is the allocated CID and `advance` is the
+/// value to store as the next starting point. Returns `None` (fail-closed) only
+/// if every CID is in use — the caller refuses the launch rather than colliding.
+///
+/// Pure + VM-free so it is unit-testable without a crosvm boot. The scan is
+/// bounded by `in_use.len() + 1` candidates: by pigeonhole, that many distinct
+/// CIDs cannot all be occupied if any free CID exists.
+fn allocate_cid(from: u32, in_use: &HashSet<u32>) -> Option<(u32, u32)> {
+    let mut candidate = from.max(MIN_GUEST_CID);
+    for _ in 0..=in_use.len() {
+        if !in_use.contains(&candidate) {
+            // Wrap back to the first guest CID instead of overflowing past u32::MAX.
+            let advance = candidate.checked_add(1).unwrap_or(MIN_GUEST_CID);
+            return Some((candidate, advance));
+        }
+        candidate = candidate.checked_add(1).unwrap_or(MIN_GUEST_CID);
+    }
+    None
+}
+
 impl Supervisor {
     fn initial_cid_seed() -> u32 {
         let millis = SystemTime::now()
@@ -1027,12 +1055,26 @@ impl Supervisor {
         self.verify_host_artifact("crosvm", &self.crosvm_config.crosvm_bin)?;
         self.verify_host_artifact("vmlinux", &self.crosvm_config.kernel_path)?;
 
-        // Assign vsock CID (unique per VM)
+        // Assign vsock CID (unique per live VM). Hold the counter lock across the
+        // live-set scan so concurrent launches serialize; the scan is the
+        // belt-and-suspenders guard that a wrapped counter never re-hands a CID a
+        // running VM still holds (BUG-8).
         let cid = {
             let mut next = self.next_cid.write().await;
-            let cid = *next;
-            *next += 1;
-            cid
+            let in_use: HashSet<u32> = {
+                let running = self.running.read().await;
+                running.values().map(|c| c.vsock_cid).collect()
+            };
+            match allocate_cid(*next, &in_use) {
+                Some((cid, advance)) => {
+                    *next = advance;
+                    cid
+                }
+                None => bail!(
+                    "no free vsock CID available ({} live VMs occupy the CID space)",
+                    in_use.len()
+                ),
+            }
         };
 
         let handle = Self::unique_handle(name, cid);
@@ -1603,6 +1645,57 @@ mod tests {
     };
     use sha2::Digest;
     use std::sync::Arc;
+
+    // ── BUG-8: vsock CID allocation is checked + collision-free ──
+
+    #[test]
+    fn allocate_cid_floors_reserved_low_cids() {
+        // 0/1/2 are reserved; an allocator seeded below 3 must floor to 3.
+        let (cid, advance) = allocate_cid(0, &HashSet::new()).unwrap();
+        assert_eq!(cid, MIN_GUEST_CID);
+        assert_eq!(advance, MIN_GUEST_CID + 1);
+    }
+
+    #[test]
+    fn allocate_cid_skips_live_cids() {
+        let in_use = HashSet::from([5u32, 6, 7]);
+        let (cid, advance) = allocate_cid(5, &in_use).unwrap();
+        assert_eq!(cid, 8, "5/6/7 are live, so 8 is the first free CID");
+        assert_eq!(advance, 9);
+    }
+
+    #[test]
+    fn allocate_cid_wraps_without_overflow() {
+        // The old `*next += 1` would overflow/wrap here; the allocator wraps
+        // cleanly back to the first guest CID for the NEXT call.
+        let (cid, advance) = allocate_cid(u32::MAX, &HashSet::new()).unwrap();
+        assert_eq!(cid, u32::MAX);
+        assert_eq!(
+            advance, MIN_GUEST_CID,
+            "advance wraps to 3, not 0 or overflow"
+        );
+    }
+
+    /// THE bug: a counter that wraps onto a CID a live VM still holds must NOT
+    /// re-hand it — the live-set scan steps past the collision to a free CID.
+    #[test]
+    fn allocate_cid_wrap_does_not_collide_with_a_live_vm() {
+        // Counter has wrapped to u32::MAX, but a long-lived VM already holds it.
+        let in_use = HashSet::from([u32::MAX]);
+        let (cid, advance) = allocate_cid(u32::MAX, &in_use).unwrap();
+        assert_eq!(cid, MIN_GUEST_CID, "skips the live MAX CID, wraps to 3");
+        assert_eq!(advance, MIN_GUEST_CID + 1);
+        assert!(!in_use.contains(&cid), "the chosen CID is provably free");
+    }
+
+    #[test]
+    fn allocate_cid_returns_a_free_cid_within_the_bound() {
+        // A contiguous live block is stepped over to the next free CID.
+        let in_use = HashSet::from([3u32, 4, 5, 6]);
+        let (cid, _) = allocate_cid(3, &in_use).unwrap();
+        assert_eq!(cid, 7);
+        assert!(!in_use.contains(&cid));
+    }
 
     #[test]
     fn shell_token_eligible_is_role_based_and_fail_closed() {
