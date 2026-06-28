@@ -1,5 +1,15 @@
 # W2 — unstub the consent ACT path (approval-ready plan)
 
+> **STATUS: ✅ CLOSED (steps 1–11).** Implemented on `claude/keep-consent-architecture-0fz0ll`
+> (commits `4833f89` → `025109e` → `c290d65` → `1365acc` → alignment/docs slice). Consent is real,
+> cryptographically enforced, single-use + bound, witness-gated at dispatch, blocking-audited, and
+> returns a runtime-signed `AffordanceGrantReceiptV1` — with the invariants pinned in
+> `check-wci-alignment.sh` against regression. Gates: elastos-runtime capability 128 pass,
+> elastos-server lib 854 pass, clippy `-D warnings` + fmt clean, alignment OK.
+> **Open follow-up (not blocking):** sign the gateway provider-effect *telemetry* envelope
+> (`signer_did: None`); the authoritative attestation is the runtime-signed receipt. The live
+> gateway→runtime forwarded-bearer→`vm-{name}` redeem round-trip is integration-verified, not unit-tested.
+
 From planning swarm `wuuc4f5jd` (3 read-only cartographers mapped the live `elastos-runtime` tree at
 HEAD `97bcd3689` → architect → 3 adversarial security reviewers, all "needs-fixes", every fix folded
 in). PLAN ONLY — per the `elastos-runtime` CLAUDE.md contract, no code until the founder approves.

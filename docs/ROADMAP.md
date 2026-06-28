@@ -15,7 +15,7 @@ agent-containment audit (EU AI Act Art 12/14).
 **Status at a glance (2026-06-27):** substrate + intent compiler DONE; security audited + hardened
 ~9/10 (AUD-1..5); Astrid research DONE; adoption wedges 1-2 (MCP-serve + dataflow) DONE; the PRODUCT +
 STRATEGY resolved (KEEP, the PDR, the shell vision, the ESP protocol, the narrative); now executing the
-**ESP build wedges W0-W7** toward the shell — **W2 (consent act path) IN PROGRESS (~95%)**.
+**ESP build wedges W0-W7** toward the shell — **W2 (consent act path) ✅ CLOSED**; next is W0/W1 (the honest halo).
 
 ---
 
@@ -78,7 +78,7 @@ The PDR/ESP plan: build the honest substrate first, then the shell as a read-onl
 |---|---|---|
 | **W0** | Core-derived reach (the honest halo) | not started |
 | **W1** | Egress-as-capability | not started |
-| **W2** | **Unstub the consent act path** | **IN PROGRESS ~95%** (below) |
+| **W2** | **Unstub the consent act path** | **✅ DONE (steps 1-11)** (below) |
 | **W3** | De-hardcode "the shell" → "a shell" + rename `consent-broker` | not started |
 | **W4** | Write ESP v0 (protocol doc + TS types) | not started |
 | **W5** | The v1 Svelte projection shell + the hero dDRM act | not started |
@@ -125,11 +125,20 @@ not-an-affordance-token fail closed; combined with the step-7 matrix (method-swa
 wrong-caller, replay) and the `validate()` conformance battery (expired/forged/signature), the
 fail-closed surface is covered. Honest scope: the gateway→runtime HTTP redeem round-trip runs against
 the harness's stub runtime, so the live forwarded-bearer→`vm-{name}` round-trip stays an integration
-check (not unit-verified). REMAINING: 11 (alignment-script assertions pinning the W2 invariants + update
-state.md / TASKS.md) — then W2 is CLOSED.
+check (not unit-verified). **Step 11 DONE — W2 CLOSED:** the invariants are pinned in
+`check-wci-alignment.sh` so they cannot silently regress — the flat 403 stub can't return to the
+gateway, `validate-and-consume` must stay the registered redemption route, consent dispatch must go
+through `dispatch_consented_affordance` + the `ValidatedAffordanceGrant` witness, and affordance use
+must fail closed via `AuditWriteFailed`. **One open follow-up** (not blocking W2): sign the gateway
+provider-effect *telemetry* envelope (`signer_did: None`) — the authoritative attestation is already the
+runtime-signed receipt.
 
-**Immediate next (on `claude/keep-consent-architecture-0fz0ll`):** W2 step 11 (alignment assertions +
-docs) → W2 CLOSED → W0 → W1 → W3 → … → W7.
+**W2 is CLOSED** (steps 1–11; commits `4833f89` → `025109e` → `c290d65` → `1365acc` → this slice).
+Consent is real, cryptographically enforced, fail-closed, witness-gated, and receipted — and pinned
+against regression.
+
+**Immediate next (on `claude/keep-consent-architecture-0fz0ll`):** **W0** (core-derived reach — make the
+halo a *computed* fact) → **W1** (egress-as-capability) → W3 → W4 → … → W7.
 
 ---
 

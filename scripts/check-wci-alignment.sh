@@ -172,6 +172,20 @@ check_forbidden 'proxy_pass http://127\.0\.0\.1:8081' 'public nginx edge should 
 check_forbidden_in_path '/api/provider/did/sign([^_[:alnum:]]|$)' elastos/crates 'capsules must not call arbitrary DID signing routes'
 check_forbidden_in_path '"operations":.*"sign"' capsules/did-provider/capsule.json 'did-provider must expose typed signing intents, not generic sign(data)'
 
+# --- W2: consent act path enforcement (ratchet — must not silently regress) ---
+# The flat 403 stub that dead-rejected every consent-gated affordance must never
+# return; consent-gated invocations raise a real consent request instead. Scoped
+# to the gateway source (the doc that quotes the old stub string is exempt).
+check_forbidden_in_path 'user-approved affordance invocation is not enabled yet' elastos/crates/elastos-server/src/api/gateway_capsule_catalog.rs 'W2: the flat 403 consent stub must not return; consent-gated affordances raise a consent request'
+# validate-and-consume is the one redemption path for affordance-consent tokens.
+check_required '/api/capability/validate-and-consume' elastos/crates/elastos-server/src/api/server.rs 'W2: validate-and-consume must be the registered affordance-redemption route'
+# Consent-gated dispatch goes only through the witness-gated dispatcher, and the
+# witness itself must exist (a value can only come from a successful redemption).
+check_required 'dispatch_consented_affordance' elastos/crates/elastos-server/src/api/gateway_capsule_catalog.rs 'W2: consent-gated dispatch must go through the witness-gated dispatcher'
+check_required 'ValidatedAffordanceGrant' elastos/crates/elastos-server/src/api/gateway_capsule_catalog.rs 'W2: the unforgeable consent witness must gate consent dispatch'
+# Affordance use fails closed if the signed durable record cannot be written.
+check_required 'AuditWriteFailed' elastos/crates/elastos-runtime/src/capability/manager.rs 'W2: affordance use must fail closed when the signed durable use-record cannot be written'
+
 check_required 'Home front door' README.md 'README must teach Home front door'
 check_required 'No Ambient Authority' PRINCIPLES.md 'principles file must codify explicit authority boundaries'
 check_required 'Carrier Plane For Local And Off-Box' PRINCIPLES.md 'principles file must codify the Carrier capability plane for local and off-box transport'
