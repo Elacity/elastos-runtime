@@ -23,7 +23,7 @@ use elastos_common::localhost::{
     is_supported_resource_scheme, is_system_only_backend_resource, rooted_localhost_fs_path,
     rooted_localhost_uri,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 use elastos_compute::providers::BridgePipes;
 use elastos_runtime::capability::CapabilityManager;
@@ -31,6 +31,123 @@ use elastos_runtime::provider::ProviderRegistry;
 
 const CAPABILITY_APPROVAL_POLL_MS: u64 = 100;
 const CAPABILITY_APPROVAL_MAX_POLLS: usize = 300;
+
+/// Hard cap on one newline-delimited request from an (untrusted) guest, enforced
+/// DURING the read. The previous code checked the length AFTER `read_line` /
+/// `.lines()` had already buffered the whole line, so a line with no newline
+/// could OOM the host before the check ran (BUG-6). The bounded readers below
+/// cap the allocation while reading, then drain to the next newline so the
+/// stream realigns to the following request.
+const MAX_LINE_BYTES: usize = 1_048_576; // 1 MB
+/// Chunk size for draining an oversized line back to stream alignment — bounded
+/// so the drain itself never reintroduces the OOM it is preventing.
+const DRAIN_CHUNK_BYTES: u64 = 64 * 1024;
+
+/// Outcome of reading one bounded, newline-delimited request line.
+#[derive(Debug)]
+enum BoundedLine {
+    /// A complete request line (trailing `\n`/`\r\n` stripped). May be empty.
+    Line(String),
+    /// Clean EOF — the peer closed with no pending bytes.
+    Eof,
+    /// The line exceeded `MAX_LINE_BYTES` before a newline arrived; the overflow
+    /// has been drained up to (and including) the next newline so the stream is
+    /// realigned to the next request. The caller should reply `request_too_large`.
+    TooLarge,
+}
+
+/// Read one line from an async reader without ever buffering more than
+/// `MAX_LINE_BYTES` (+1) bytes — the fail-closed inverse of an unbounded
+/// `read_line`. On overflow it drains to the next newline and reports
+/// [`BoundedLine::TooLarge`] rather than allocating the whole oversized line.
+async fn read_bounded_line<R>(reader: &mut R) -> std::io::Result<BoundedLine>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut buf = Vec::new();
+    // `take` makes the read itself stop at the cap, so a newline-less flood
+    // cannot grow `buf` past the bound regardless of how much the guest sends.
+    let n = (&mut *reader)
+        .take(MAX_LINE_BYTES as u64 + 1)
+        .read_until(b'\n', &mut buf)
+        .await?;
+    if n == 0 {
+        return Ok(BoundedLine::Eof);
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+        // Lossy is safe: a ≤1 MB buffer, and a non-UTF8 body just fails JSON
+        // parsing downstream (bridge_error) instead of killing the connection.
+        return Ok(BoundedLine::Line(
+            String::from_utf8_lossy(&buf).into_owned(),
+        ));
+    }
+    // Hit the cap with no newline → oversized. Realign, then report.
+    drain_to_newline_async(reader).await?;
+    Ok(BoundedLine::TooLarge)
+}
+
+/// Discard bytes (in bounded chunks) up to and including the next newline, so the
+/// reader is positioned at the start of the next request after an overflow.
+async fn drain_to_newline_async<R>(reader: &mut R) -> std::io::Result<()>
+where
+    R: AsyncBufRead + Unpin,
+{
+    loop {
+        let mut sink = Vec::new();
+        let n = (&mut *reader)
+            .take(DRAIN_CHUNK_BYTES)
+            .read_until(b'\n', &mut sink)
+            .await?;
+        if n == 0 || sink.last() == Some(&b'\n') {
+            return Ok(()); // EOF, or realigned at the newline
+        }
+        // Still draining a huge line; `sink` is dropped each pass so memory
+        // stays bounded by DRAIN_CHUNK_BYTES.
+    }
+}
+
+/// Synchronous twin of [`read_bounded_line`] for the pipe-backed WASM bridges
+/// (`std::io::BufRead`), with the same fail-closed bound + realign semantics.
+fn read_bounded_line_sync<R: std::io::BufRead>(reader: &mut R) -> std::io::Result<BoundedLine> {
+    use std::io::{BufRead, Read};
+    let mut buf = Vec::new();
+    let n = reader
+        .by_ref()
+        .take(MAX_LINE_BYTES as u64 + 1)
+        .read_until(b'\n', &mut buf)?;
+    if n == 0 {
+        return Ok(BoundedLine::Eof);
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+        return Ok(BoundedLine::Line(
+            String::from_utf8_lossy(&buf).into_owned(),
+        ));
+    }
+    drain_to_newline_sync(reader)?;
+    Ok(BoundedLine::TooLarge)
+}
+
+fn drain_to_newline_sync<R: std::io::BufRead>(reader: &mut R) -> std::io::Result<()> {
+    use std::io::{BufRead, Read};
+    loop {
+        let mut sink = Vec::new();
+        let n = reader
+            .by_ref()
+            .take(DRAIN_CHUNK_BYTES)
+            .read_until(b'\n', &mut sink)?;
+        if n == 0 || sink.last() == Some(&b'\n') {
+            return Ok(());
+        }
+    }
+}
 
 /// Resources needed by the bridge to handle requests.
 #[derive(Clone)]
@@ -83,36 +200,32 @@ pub async fn spawn_carrier_bridge(
             socket_display
         );
         let (reader, mut writer) = stream.into_split();
-        const MAX_LINE_BYTES: usize = 1_048_576; // 1 MB — prevent OOM from malicious guest
         let mut reader = BufReader::new(reader);
 
-        let mut line = String::new();
         loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => break, // EOF — guest shut down
-                Ok(_) => {}
+            let line = match read_bounded_line(&mut reader).await {
+                Ok(BoundedLine::Eof) => break, // EOF — guest shut down
+                Ok(BoundedLine::Line(line)) => line,
+                Ok(BoundedLine::TooLarge) => {
+                    tracing::warn!(
+                        "Carrier bridge: oversized line (> {} bytes), dropping",
+                        MAX_LINE_BYTES
+                    );
+                    let error = serde_json::json!({
+                        "id": 0,
+                        "type": "error",
+                        "error": "request_too_large"
+                    });
+                    let _ = writer.write_all(error.to_string().as_bytes()).await;
+                    let _ = writer.write_all(b"\n").await;
+                    let _ = writer.flush().await;
+                    continue;
+                }
                 Err(e) => {
                     tracing::debug!("Carrier bridge read error: {}", e);
                     break;
                 }
-            }
-
-            if line.len() > MAX_LINE_BYTES {
-                tracing::warn!(
-                    "Carrier bridge: oversized line ({} bytes), dropping",
-                    line.len()
-                );
-                let error = serde_json::json!({
-                    "id": 0,
-                    "type": "error",
-                    "error": "request_too_large"
-                });
-                let _ = writer.write_all(error.to_string().as_bytes()).await;
-                let _ = writer.write_all(b"\n").await;
-                let _ = writer.flush().await;
-                continue;
-            }
+            };
 
             tracing::debug!("[serial-bridge] → {}", line.trim());
             let response = match handle_request(&line, &ctx).await {
@@ -157,17 +270,23 @@ pub fn spawn_wasm_carrier_bridge(pipes: BridgePipes, ctx: BridgeContext) {
     if let Err(e) = std::thread::Builder::new()
         .name("wasm-carrier-bridge".into())
         .spawn(move || {
-            use std::io::{BufRead, Write};
+            use std::io::Write;
 
-            let reader = std::io::BufReader::new(pipes.capsule_stdout);
+            let mut reader = std::io::BufReader::new(pipes.capsule_stdout);
             let mut writer = pipes.capsule_stdin;
             let ctx = Some(ctx);
 
-            const MAX_LINE_BYTES: usize = 1_048_576; // 1 MB
-
-            for line_result in reader.lines() {
-                let line = match line_result {
-                    Ok(l) => l,
+            loop {
+                let line = match read_bounded_line_sync(&mut reader) {
+                    Ok(BoundedLine::Eof) => break,
+                    Ok(BoundedLine::Line(line)) => line,
+                    Ok(BoundedLine::TooLarge) => {
+                        tracing::warn!("WASM bridge: oversized line (> {} bytes), dropping", MAX_LINE_BYTES);
+                        let error = serde_json::json!({"id":0,"type":"error","error":"request_too_large"});
+                        let _ = writeln!(writer, "{}", error);
+                        let _ = writer.flush();
+                        continue;
+                    }
                     Err(e) => {
                         tracing::debug!("WASM bridge read error: {}", e);
                         break;
@@ -175,14 +294,6 @@ pub fn spawn_wasm_carrier_bridge(pipes: BridgePipes, ctx: BridgeContext) {
                 };
 
                 if line.trim().is_empty() {
-                    continue;
-                }
-
-                if line.len() > MAX_LINE_BYTES {
-                    tracing::warn!("WASM bridge: oversized line ({} bytes), dropping", line.len());
-                    let error = serde_json::json!({"id":0,"type":"error","error":"request_too_large"});
-                    let _ = writeln!(writer, "{}", error);
-                    let _ = writer.flush();
                     continue;
                 }
 
@@ -231,14 +342,25 @@ pub fn spawn_wasm_api_bridge(pipes: BridgePipes, api_url: String, client_token: 
     if let Err(e) = std::thread::Builder::new()
         .name("wasm-api-bridge".into())
         .spawn(move || {
-            use std::io::{BufRead, Write};
+            use std::io::Write;
 
-            let reader = std::io::BufReader::new(pipes.capsule_stdout);
+            let mut reader = std::io::BufReader::new(pipes.capsule_stdout);
             let mut writer = pipes.capsule_stdin;
 
-            for line_result in reader.lines() {
-                let line = match line_result {
-                    Ok(l) => l,
+            loop {
+                let line = match read_bounded_line_sync(&mut reader) {
+                    Ok(BoundedLine::Eof) => break,
+                    Ok(BoundedLine::Line(line)) => line,
+                    Ok(BoundedLine::TooLarge) => {
+                        tracing::warn!(
+                            "WASM API bridge: oversized line (> {} bytes), dropping",
+                            MAX_LINE_BYTES
+                        );
+                        let error = serde_json::json!({"id":0,"type":"error","error":"request_too_large"});
+                        let _ = writeln!(writer, "{}", error);
+                        let _ = writer.flush();
+                        continue;
+                    }
                     Err(e) => {
                         tracing::debug!("WASM API bridge read error: {}", e);
                         break;
@@ -2616,5 +2738,93 @@ mod tests {
             has_failed_use,
             "the denied act is attested as a failed CapabilityUse (success=false)"
         );
+    }
+
+    // --- BUG-6: bounded line reads (untrusted-guest OOM hardening) ---
+
+    #[tokio::test]
+    async fn read_bounded_line_reads_complete_lines_then_eof() {
+        let data = b"{\"a\":1}\n{\"b\":2}\n";
+        let mut reader = BufReader::new(&data[..]);
+        assert!(
+            matches!(read_bounded_line(&mut reader).await.unwrap(), BoundedLine::Line(l) if l == "{\"a\":1}")
+        );
+        assert!(
+            matches!(read_bounded_line(&mut reader).await.unwrap(), BoundedLine::Line(l) if l == "{\"b\":2}")
+        );
+        assert!(matches!(
+            read_bounded_line(&mut reader).await.unwrap(),
+            BoundedLine::Eof
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_bounded_line_strips_crlf() {
+        let data = b"hello\r\n";
+        let mut reader = BufReader::new(&data[..]);
+        assert!(
+            matches!(read_bounded_line(&mut reader).await.unwrap(), BoundedLine::Line(l) if l == "hello")
+        );
+    }
+
+    /// THE bug: an oversized line with no newline must be rejected WITHOUT being
+    /// fully buffered, and the stream must realign so the NEXT request parses.
+    #[tokio::test]
+    async fn read_bounded_line_bounds_oversized_then_realigns() {
+        let mut data = vec![b'a'; MAX_LINE_BYTES + 4096]; // > cap, no newline yet
+        data.push(b'\n'); // terminator of the oversized line
+        data.extend_from_slice(b"{\"ok\":1}\n"); // the next, valid request
+        let mut reader = BufReader::new(&data[..]);
+
+        // 1) oversized line is reported TooLarge (and drained internally)
+        assert!(matches!(
+            read_bounded_line(&mut reader).await.unwrap(),
+            BoundedLine::TooLarge
+        ));
+        // 2) the stream realigned — the following request reads cleanly
+        assert!(
+            matches!(read_bounded_line(&mut reader).await.unwrap(), BoundedLine::Line(l) if l == "{\"ok\":1}")
+        );
+        assert!(matches!(
+            read_bounded_line(&mut reader).await.unwrap(),
+            BoundedLine::Eof
+        ));
+    }
+
+    /// An oversized line that never terminates (EOF mid-flood) is TooLarge, then
+    /// the drain hits EOF cleanly — no infinite loop, no unbounded buffer.
+    #[tokio::test]
+    async fn read_bounded_line_oversized_at_eof() {
+        let data = vec![b'a'; MAX_LINE_BYTES + 4096]; // no newline, then EOF
+        let mut reader = BufReader::new(&data[..]);
+        assert!(matches!(
+            read_bounded_line(&mut reader).await.unwrap(),
+            BoundedLine::TooLarge
+        ));
+        assert!(matches!(
+            read_bounded_line(&mut reader).await.unwrap(),
+            BoundedLine::Eof
+        ));
+    }
+
+    /// The synchronous twin enforces the same bound + realign over `BufRead`.
+    #[test]
+    fn read_bounded_line_sync_bounds_oversized_then_realigns() {
+        let mut data = vec![b'a'; MAX_LINE_BYTES + 4096];
+        data.push(b'\n');
+        data.extend_from_slice(b"{\"ok\":1}\n");
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(data));
+
+        assert!(matches!(
+            read_bounded_line_sync(&mut reader).unwrap(),
+            BoundedLine::TooLarge
+        ));
+        assert!(
+            matches!(read_bounded_line_sync(&mut reader).unwrap(), BoundedLine::Line(l) if l == "{\"ok\":1}")
+        );
+        assert!(matches!(
+            read_bounded_line_sync(&mut reader).unwrap(),
+            BoundedLine::Eof
+        ));
     }
 }
