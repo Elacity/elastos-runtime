@@ -120,8 +120,20 @@ the next product arc, none of it started here:
 - **Dual-receipt PLATFORM self-attestation** — the platform co-signs its own
   accountability at gate time (get a legal-admissibility opinion first).
 - **Act-over-MCP (the write path)** — agents *doing*, not just reading, through the
-  one consent gate + meter.
+  one consent gate + meter. This is the natural debit site for the spend meter
+  (`carrier_bridge` `send_raw` dispatch, where the single-use token is consumed).
 - **The spend meter** — bounds an agent's AI/resource spend (adoption wedge #4).
+  **MECHANISM LANDED in-cloud `W3b-turn`:** `primitives::spend::SpendMeter` — a
+  per-capsule budget with atomic, fail-closed `try_debit` (unprovisioned ⇒ zero, not
+  unlimited) and a provably-no-op `refund` mirroring the single-use token's
+  `try_use_token`/`refund_token_use` + the BUG-4 `DidNotAct` contract; the
+  `concurrent_debits_never_overspend` test proves 64 racing debits never exceed the
+  budget. **NOT yet wired** to dispatch (nothing charges it in prod yet) — the wiring
+  is the act-over-MCP chunk above: inject `Arc<SpendMeter>` into `BridgeContext`,
+  `try_debit` before `send_raw`, `refund` on the `NoProvider`/`DidNotAct` no-op
+  branches (exactly where the token use is already refunded), and add a
+  `SpendDebit`/`BudgetExhausted` audit event. Provisioning policy (per-capsule limits,
+  default budget, unit) is a founder decision to make at wiring time.
 - **Free-text NL → intent** (adoption wedge #3) — the AI-backend "brain" track.
 - **The marketplace of shells** — multiple untrusted shells over the ESP protocol.
 

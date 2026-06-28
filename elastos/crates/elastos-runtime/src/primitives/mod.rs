@@ -5,11 +5,14 @@
 
 pub mod audit;
 pub mod metrics;
+pub mod spend;
 pub mod time;
 
 #[allow(unused_imports)]
 pub use audit::{AuditEvent, AuditLog};
 #[allow(unused_imports)]
 pub use metrics::CapsuleMetrics;
+#[allow(unused_imports)]
+pub use spend::{SpendError, SpendMeter, SpendUnits};
 #[allow(unused_imports)]
 pub use time::SecureTimestamp;

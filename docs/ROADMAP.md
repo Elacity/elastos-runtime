@@ -159,10 +159,14 @@ halo a *computed* fact) → **W1** (egress-as-capability) → W3 → W4 → … 
 - **BUG-1..8** — VM-lifecycle leak/zombie cluster (needs crosvm/KVM → local/Cursor). `KNOWN_GAPS.md`.
 - **Performance** (speed 5/10): reflink rootfs overlay (free win, local/Cursor); audit group-commit
   (measure first; never coalesce a custody record / cache a revocation).
-- **AUD-4 plane-(a)** — `verify_chain` on startup (Wave 2). **Carrier-service author gate** — AUD-1
-  residual. **G-CIE** — ACCEPTED. **AUD-1 ACTIVATION** — production trust roots = config (founder/Cursor).
+- **AUD-4 plane-(a) / G8 verify-on-read** — DONE in-cloud: `AuditLog::with_file_verified` (opt-in via
+  `ELASTOS_AUDIT_LOG_PATH`) walks the chain on open AND a `<log>.head-anchor` catches tail truncation,
+  both fail-closed. Residual: off-box/co-signed anchor + a live mid-session re-verify. **Carrier-service
+  author gate** — AUD-1 residual. **G-CIE** — ACCEPTED. **AUD-1 ACTIVATION** — production trust roots = config.
 - **PDR NEXT-band (beyond W0-W7 v1):** the dual-receipt PLATFORM self-attestation (co-sign at gate
   time; legal admissibility opinion first); act-over-MCP (the write path); the meter; free-text NL.
+  **Spend-meter MECHANISM landed `W3b-turn`** — `primitives::spend::SpendMeter` (atomic fail-closed
+  `try_debit` + no-op `refund`, concurrency-proven); NOT yet wired to dispatch (that rides act-over-MCP).
 
 ## 💻 LOCAL / CURSOR (founder's device — VM env + operational)
 1. Activate AUD-1 (generate author key via `trust_cmd` → config `trusted_keys` → re-sign capsules).
