@@ -13,8 +13,13 @@
     "capabilities": [
       {
         "resource": "elastos://net/*",
-        "actions": ["read", "write"],
-        "operations": ["status", "resolve", "connect", "stream", "http"]
+        "actions": ["read"],
+        "operations": ["status", "resolve"]
+      },
+      {
+        "resource": "elastos://net/*",
+        "actions": ["execute"],
+        "operations": ["connect", "stream", "http"]
       }
     ],
     "audit_events": ["net.status", "net.request.denied", "net.exit.unavailable"]

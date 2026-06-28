@@ -13,8 +13,13 @@
     "capabilities": [
       {
         "resource": "elastos://encrypt/*",
+        "actions": ["read"],
+        "operations": ["status"]
+      },
+      {
+        "resource": "elastos://encrypt/*",
         "actions": ["write"],
-        "operations": ["status", "seal"]
+        "operations": ["seal"]
       }
     ],
     "audit_events": ["encrypt.status", "encrypt.seal.denied"]

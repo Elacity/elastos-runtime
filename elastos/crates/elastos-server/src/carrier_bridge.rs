@@ -2230,26 +2230,14 @@ mod tests {
             // -- object-provider `share` STAYS: grants access — security-touching,
             //    held for a dedicated review (Miller).
             ("object-provider", "share"),
-            // -- class C: EXECUTE / egress / actuator; sensitive, Execute-or-Admin.
-            ("net-provider", "connect"),
-            ("net-provider", "http"),
-            ("net-provider", "stream"),
-            ("exit-provider", "open_stream"),
-            ("exit-provider", "close_stream"),
-            ("exit-provider", "http_fetch"),
-            ("exit-provider", "quote"),
+            // -- class C: EXECUTE / actuator. net/exit egress drained in the ch3
+            //    split (now declare `execute`); browser-actuator + drm remain.
             ("browser-engine-adapter", "launch"),
             ("browser-engine-adapter", "input"),
             ("browser-engine-adapter", "close_page"),
             ("browser-engine-adapter", "attach_stream"),
             ("browser-engine-adapter", "webrtc_signal"),
             ("drm-provider", "open"),
-            // -- class D: manifest OVER-declares (blanket action); the verb map is
-            //    already correct. Fix = split the MANIFEST's capability blocks, not
-            //    the verb map. did/ai/llama/tunnel were drained in the chunk-2 split;
-            //    `encrypt-provider status` remains (its block also carries `seal`,
-            //    a HIGH-RISK op held in class E — split together when seal is reviewed).
-            ("encrypt-provider", "status"),
             // -- class E: HIGH-RISK (keys / signing / spend / secret export / decrypt);
             //    Miller's verdict: KEEP Admin — do NOT loosen without a dedicated review.
             ("wallet-provider", "approve_approval"),

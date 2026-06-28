@@ -13,8 +13,13 @@
     "capabilities": [
       {
         "resource": "elastos://exit/*",
-        "actions": ["read", "write"],
-        "operations": ["status", "quote", "open_stream", "close_stream", "http_fetch"]
+        "actions": ["read"],
+        "operations": ["status"]
+      },
+      {
+        "resource": "elastos://exit/*",
+        "actions": ["execute"],
+        "operations": ["quote", "open_stream", "close_stream", "http_fetch"]
       }
     ],
     "audit_events": [
