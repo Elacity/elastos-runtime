@@ -29,7 +29,7 @@ pub struct CreateSessionOutput {
 }
 
 /// POST /api/orchestrator/session — mint a fresh capsule session.
-/// Requires shell session auth (via shell_only_middleware).
+/// Requires consent-broker session auth (via consent_broker_only_middleware).
 pub async fn create_session(
     State(state): State<OrchestratorState>,
     Json(_input): Json<CreateSessionInput>,

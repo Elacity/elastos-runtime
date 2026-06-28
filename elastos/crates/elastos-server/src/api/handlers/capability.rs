@@ -568,7 +568,7 @@ pub async fn grant_request(
 
     // Canonical consent gate (G4a, Principle 10): the live grant is authorized by
     // the SAME fail-closed core the preview uses (approval::decide). The
-    // authenticated shell POST (it passed shell_only_middleware and references an
+    // authenticated consent-broker POST (it passed consent_broker_only_middleware and references an
     // existing pending request) is the explicit approver, so today this resolves
     // to Approved; routing it THROUGH decide means any future approver source that
     // yields None / Some(false) fails closed and mints nothing, instead of the old

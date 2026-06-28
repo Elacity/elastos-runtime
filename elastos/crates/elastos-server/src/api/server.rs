@@ -22,8 +22,8 @@ use crate::api::handlers::docs::DocsState;
 use crate::api::handlers::identity::IdentityState;
 use crate::api::handlers::{self, CapabilityState, NamespaceState};
 use crate::api::middleware::{
-    auth_middleware, rate_limit_middleware, shell_only_middleware, ApiState, RateLimitState,
-    RateLimiter,
+    auth_middleware, consent_broker_only_middleware, rate_limit_middleware, ApiState,
+    RateLimitState, RateLimiter,
 };
 use crate::api::routes;
 use crate::runtime::Runtime;
@@ -267,7 +267,7 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         // Audit log endpoints
         .route("/api/audit", get(handlers::get_audit_log))
         .route("/api/audit/types", get(handlers::get_audit_event_types))
-        .layer(axum_middleware::from_fn(shell_only_middleware))
+        .layer(axum_middleware::from_fn(consent_broker_only_middleware))
         .layer(axum_middleware::from_fn_with_state(
             api_state.clone(),
             auth_middleware,
@@ -283,7 +283,7 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
             "/api/orchestrator/session",
             post(handlers::orchestrator::create_session),
         )
-        .layer(axum_middleware::from_fn(shell_only_middleware))
+        .layer(axum_middleware::from_fn(consent_broker_only_middleware))
         .layer(axum_middleware::from_fn_with_state(
             api_state.clone(),
             auth_middleware,
@@ -325,7 +325,7 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
                 "/api/supervisor/start-gateway",
                 post(handlers::supervisor_api::start_gateway),
             )
-            .layer(axum_middleware::from_fn(shell_only_middleware))
+            .layer(axum_middleware::from_fn(consent_broker_only_middleware))
             .layer(axum_middleware::from_fn_with_state(
                 api_state.clone(),
                 auth_middleware,
@@ -481,7 +481,7 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         .route("/api/capsules", get(routes::list_capsules))
         .route("/api/capsules", post(routes::launch_capsule))
         .route("/api/capsules/:id", delete(routes::stop_capsule))
-        .layer(axum_middleware::from_fn(shell_only_middleware))
+        .layer(axum_middleware::from_fn(consent_broker_only_middleware))
         .layer(axum_middleware::from_fn_with_state(
             api_state.clone(),
             auth_middleware,
