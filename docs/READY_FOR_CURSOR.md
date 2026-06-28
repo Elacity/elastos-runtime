@@ -90,9 +90,12 @@ but they are NOT the whole list. The authoritative, complete sources of truth ar
   in via the `ELASTOS_AUDIT_LOG_PATH` env (durable EU AI Act custody mode); default stays memory.
   **Cursor TODO:** (a) set `ELASTOS_AUDIT_LOG_PATH=<data_dir>/audit/audit.log`, restart, confirm the
   "Durable audit log enabled (verified-on-open)" log line, then hand-tamper a record and confirm the
-  next start REFUSES; (b) the persisted **head-anchor** for *tail-truncation* detection is still
-  open (verify-on-open can't see records removed from the end); (c) no LIVE read path (inspector /
-  W7 export) re-runs `verify_chain` mid-session yet — startup-only.
+  next start REFUSES; (b) **tail-truncation is now CLOSED in-cloud** — a `<log>.head-anchor` sibling
+  records the committed head seq each emit, and verify-on-open refuses when fewer records verify than
+  the anchor promised (hand-test: `tail -n -1` the log, confirm the next start REFUSES with
+  "tail-truncated"); the residual is only the *off-box / co-signed* anchor for a full-disk attacker
+  who rewrites both files; (c) no LIVE read path (inspector / W7 export) re-runs `verify_chain`
+  mid-session yet — startup-only.
 - **G8 / G8b (capability plane)** — deny/approve/revoke (request- AND token-level) + affordance-use
   are now all fail-closed-signed. Remaining: ordinary grant/use stay best-effort by design (the
   per-validate hot path; needs the group-commit rewrite below before adding an fsync).

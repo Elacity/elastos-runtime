@@ -464,12 +464,28 @@ impl AuditLog {
     pub fn with_file_verified(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let log = Self::with_file(path)?;
         let vk = log.signer.as_ref().map(|s| s.verifying_key());
-        log.verify_chain(vk.as_ref()).map_err(|e| {
+        let verified = log.verify_chain(vk.as_ref()).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("audit log failed integrity verification on open: {e}"),
             )
         })?;
+        // Tail-truncation guard: the committed head-anchor is a LOWER bound on how many records must
+        // be on disk. Fewer verified than the anchor promised ⇒ records were sliced off the END (a
+        // cut the chain walk alone can't see — it would just observe a shorter, validly-linked log).
+        if let Some(p) = &log.log_path {
+            if let Some(anchor_seq) = read_head_anchor(p)? {
+                if verified < anchor_seq {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "audit log tail-truncated: head-anchor committed seq {anchor_seq} but \
+                             only {verified} records verify on disk"
+                        ),
+                    ));
+                }
+            }
+        }
         Ok(log)
     }
 
@@ -574,6 +590,15 @@ impl AuditLog {
         // Committed: advance the chain head.
         chain.last_seq = seq;
         chain.prev_hash = record_hash;
+
+        // Persist the committed head seq for tail-truncation detection (file-backed only). Done under
+        // the chain lock so the anchor advances monotonically with the head; best-effort — the record
+        // is already durable and the log was written first, so a failed/lagging anchor never lies.
+        if let Some(path) = &self.log_path {
+            if let Err(e) = write_head_anchor(path, seq) {
+                tracing::error!("AUDIT head-anchor write failed (seq {seq}): {e}");
+            }
+        }
         drop(chain);
 
         // Store in the in-memory ring buffer (best-effort; the durable record is the source of truth).
@@ -1132,6 +1157,46 @@ fn load_or_create_signer(log_path: &Path) -> std::io::Result<SigningKey> {
     Ok(signing_key)
 }
 
+/// Persist the committed chain-head sequence to `<log>.head-anchor` (atomic temp+rename) so a later
+/// [`AuditLog::with_file_verified`] can detect TAIL TRUNCATION — records sliced off the END that a
+/// plain chain walk would never notice (it would just observe a shorter, validly-linked chain).
+///
+/// Best-effort by design: a failed anchor write is logged but never fails the emit, because the
+/// audit RECORD is already durably committed and the log is written BEFORE the anchor, so
+/// `anchor_seq <= on-disk head` always holds — a stale/lagging anchor can only ever under-count
+/// (never a false truncation alarm, never a false loss).
+///
+/// THREAT MODEL (honest): the anchor is an unsigned host file on the same disk. It defends against
+/// truncation by something that does NOT also rewrite the anchor (log-rotation bugs, partial tamper,
+/// naive `tail`/`truncate` deletion). A full-disk attacker who rewrites BOTH is not stopped here —
+/// that needs an off-box / co-signed anchor (roadmap, same custody caveat as the signing key).
+fn write_head_anchor(log_path: &Path, committed_seq: u64) -> std::io::Result<()> {
+    let anchor_path = sibling(log_path, "head-anchor");
+    let tmp_path = sibling(log_path, "head-anchor.tmp");
+    std::fs::write(&tmp_path, committed_seq.to_string())?;
+    std::fs::rename(&tmp_path, &anchor_path)
+}
+
+/// Read the committed chain-head sequence from `<log>.head-anchor`.
+///
+/// - `Ok(None)` — no anchor (a pre-anchor log or a brand-new file); the truncation check is skipped.
+/// - `Ok(Some(seq))` — a well-formed anchor (the LOWER bound on how many records must be present).
+/// - `Err` — the anchor exists but is unparseable; fail-CLOSED, since the atomic rename rules out a
+///   torn write, so a corrupt anchor in durable mode is genuinely suspicious.
+fn read_head_anchor(log_path: &Path) -> std::io::Result<Option<u64>> {
+    let anchor_path = sibling(log_path, "head-anchor");
+    match std::fs::read_to_string(&anchor_path) {
+        Ok(s) => s.trim().parse::<u64>().map(Some).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("audit head-anchor at {anchor_path:?} is unparseable: {e}"),
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Build a sibling path `<log>.<suffix>` next to the audit log.
 fn sibling(log_path: &Path, suffix: &str) -> PathBuf {
     let mut name = log_path
@@ -1482,6 +1547,45 @@ mod tests {
         assert!(
             err.to_string().contains("integrity verification"),
             "a tampered log must refuse to open: {err}"
+        );
+    }
+
+    #[test]
+    fn with_file_verified_detects_tail_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+
+        // Three durable records → head-anchor commits seq 3.
+        {
+            let log = AuditLog::with_file(&path).unwrap();
+            log.runtime_start("1.0.0");
+            log.runtime_start("1.0.1");
+            log.runtime_start("1.0.2");
+        }
+        assert_eq!(
+            super::read_head_anchor(&path).unwrap(),
+            Some(3),
+            "anchor records the committed head"
+        );
+
+        // A clean log opens fine.
+        drop(AuditLog::with_file_verified(&path).unwrap());
+
+        // Slice the LAST record off the end. The remaining 2-record chain is itself valid — only the
+        // head-anchor (still 3) reveals that a committed record was removed.
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<&str> = content.lines().collect();
+        lines.pop();
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let err = match AuditLog::with_file_verified(&path) {
+            Ok(_) => panic!("tail truncation must be detected"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("tail-truncated"),
+            "a sliced-off tail must be detected: {err}"
         );
     }
 
