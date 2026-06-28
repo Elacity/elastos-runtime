@@ -113,6 +113,15 @@ export interface CapsuleSummary {
   category: string;
   installed: boolean;
   launchable: boolean;
+  /**
+   * The runtime's trust verdict (Channel 1 source). One of:
+   * `cid-with-manifest-signature` | `local-manifest-signature` |
+   * `cid-without-manifest-signature` | `local-dev`. The shell PROJECTS this — it
+   * does not re-derive the crypto.
+   */
+  trust_state: string;
+  signature_state: string;
+  cid_state: string;
   interfaces?: CapsuleInterfaceDescriptor[];
   /** W0b: core-derived reach per declared affordance. */
   affordance_reach?: AffordanceReachView[];
