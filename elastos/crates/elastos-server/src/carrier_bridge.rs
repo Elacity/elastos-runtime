@@ -26,6 +26,8 @@ use elastos_common::localhost::{
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 use elastos_compute::providers::BridgePipes;
+use elastos_runtime::capability::pending::{PendingRequestStore, RequestStatus};
+use elastos_runtime::capability::token::CapabilityToken;
 use elastos_runtime::capability::CapabilityManager;
 use elastos_runtime::provider::ProviderRegistry;
 
@@ -147,6 +149,53 @@ fn drain_to_newline_sync<R: std::io::BufRead>(reader: &mut R) -> std::io::Result
             return Ok(());
         }
     }
+}
+
+/// Terminal outcome of awaiting the consent-broker's decision on a pending
+/// capability request.
+enum CapabilityDecision {
+    Granted(Box<CapabilityToken>),
+    Denied(String),
+    Expired,
+    /// No decision within the poll budget.
+    TimedOut,
+}
+
+/// Classify a pending request's current status into a terminal decision, or
+/// `None` while it is still pending / absent.
+async fn poll_capability_decision(
+    store: &PendingRequestStore,
+    request_id: &str,
+) -> Option<CapabilityDecision> {
+    let req = store.get_request(request_id).await?;
+    match req.status {
+        RequestStatus::Granted { token, .. } => Some(CapabilityDecision::Granted(token)),
+        RequestStatus::Denied { reason } => Some(CapabilityDecision::Denied(reason)),
+        RequestStatus::Expired => Some(CapabilityDecision::Expired),
+        _ => None,
+    }
+}
+
+/// Await the consent-broker's grant/deny decision: poll the store on an interval,
+/// then do ONE final read after the loop. The loop sleeps BEFORE each check, so a
+/// decision landing between the last in-loop poll and loop exit would otherwise be
+/// dropped to a spurious timeout (BUG-5); the trailing read closes that window.
+async fn await_capability_decision(
+    store: &PendingRequestStore,
+    request_id: &str,
+    max_polls: usize,
+    poll_ms: u64,
+) -> CapabilityDecision {
+    for _ in 0..max_polls {
+        tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
+        if let Some(decision) = poll_capability_decision(store, request_id).await {
+            return decision;
+        }
+    }
+    // Final read — catch a decision that landed after the last in-loop poll.
+    poll_capability_decision(store, request_id)
+        .await
+        .unwrap_or(CapabilityDecision::TimedOut)
 }
 
 /// Resources needed by the bridge to handle requests.
@@ -971,81 +1020,70 @@ pub(crate) async fn handle_request(
                         "message": "capability request denied (too many pending)",
                     })
                 } else {
-                    // Poll for the shell's decision (AutoGrantEngine or manual).
-                    // The shell polls /api/capability/pending and grants/denies.
-                    let mut granted_token = None;
-                    for _ in 0..CAPABILITY_APPROVAL_MAX_POLLS {
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            CAPABILITY_APPROVAL_POLL_MS,
-                        ))
-                        .await;
-                        if let Some(req) = ctx.pending_store.get_request(&request_id).await {
-                            match &req.status {
-                                elastos_runtime::capability::pending::RequestStatus::Granted {
-                                    token,
-                                    ..
-                                } => {
-                                    granted_token = Some(token.clone());
-                                    break;
-                                }
-                                elastos_runtime::capability::pending::RequestStatus::Denied {
-                                    reason,
-                                } => {
-                                    tracing::info!(
-                                        "bridge: denied {} {} for capsule '{}': {}",
-                                        action,
-                                        resource,
-                                        ctx.capsule_id,
-                                        reason,
-                                    );
-                                    return Ok(serde_json::json!({
-                                        "id": id,
-                                        "response": {
-                                            "type": "error",
-                                            "code": "denied",
-                                            "message": reason,
-                                        },
-                                    }));
-                                }
-                                elastos_runtime::capability::pending::RequestStatus::Expired => {
-                                    return Ok(serde_json::json!({
-                                        "id": id,
-                                        "response": {
-                                            "type": "error",
-                                            "code": "expired",
-                                            "message": "capability request expired",
-                                        },
-                                    }));
-                                }
-                                _ => {} // still pending
-                            }
+                    // Await the consent-broker's decision (AutoGrantEngine or
+                    // manual): poll the store, then a final read so a grant that
+                    // lands after the last poll is not dropped to a timeout (BUG-5).
+                    match await_capability_decision(
+                        &ctx.pending_store,
+                        &request_id,
+                        CAPABILITY_APPROVAL_MAX_POLLS,
+                        CAPABILITY_APPROVAL_POLL_MS,
+                    )
+                    .await
+                    {
+                        CapabilityDecision::Granted(token) => {
+                            let token_b64 = encode_bridge_capability_token(&token);
+                            tracing::info!(
+                                "bridge: shell granted {} {} to capsule '{}'",
+                                action,
+                                resource,
+                                ctx.capsule_id,
+                            );
+                            serde_json::json!({
+                                "type": "capability_token",
+                                "token": token_b64,
+                            })
                         }
-                    }
-
-                    if let Some(token) = granted_token {
-                        let token_b64 = encode_bridge_capability_token(&token);
-                        tracing::info!(
-                            "bridge: shell granted {} {} to capsule '{}'",
-                            action,
-                            resource,
-                            ctx.capsule_id,
-                        );
-                        serde_json::json!({
-                            "type": "capability_token",
-                            "token": token_b64,
-                        })
-                    } else {
-                        tracing::warn!(
-                            "bridge: capability request timed out {} {} for capsule '{}'",
-                            action,
-                            resource,
-                            ctx.capsule_id,
-                        );
-                        serde_json::json!({
-                            "type": "error",
-                            "code": "timeout",
-                            "message": "capability request not approved within 30s",
-                        })
+                        CapabilityDecision::Denied(reason) => {
+                            tracing::info!(
+                                "bridge: denied {} {} for capsule '{}': {}",
+                                action,
+                                resource,
+                                ctx.capsule_id,
+                                reason,
+                            );
+                            return Ok(serde_json::json!({
+                                "id": id,
+                                "response": {
+                                    "type": "error",
+                                    "code": "denied",
+                                    "message": reason,
+                                },
+                            }));
+                        }
+                        CapabilityDecision::Expired => {
+                            return Ok(serde_json::json!({
+                                "id": id,
+                                "response": {
+                                    "type": "error",
+                                    "code": "expired",
+                                    "message": "capability request expired",
+                                },
+                            }));
+                        }
+                        CapabilityDecision::TimedOut => {
+                            tracing::warn!(
+                                "bridge: capability request timed out {} {} for capsule '{}'",
+                                action,
+                                resource,
+                                ctx.capsule_id,
+                            );
+                            serde_json::json!({
+                                "type": "error",
+                                "code": "timeout",
+                                "message": "capability request not approved within 30s",
+                            })
+                        }
                     }
                 }
             } else {
@@ -2826,5 +2864,69 @@ mod tests {
             read_bounded_line_sync(&mut reader).unwrap(),
             BoundedLine::Eof
         ));
+    }
+
+    // --- BUG-5: a late-landing grant is not dropped to a timeout ---
+
+    /// THE bug: a grant that lands AFTER the poll loop's last iteration must still
+    /// be returned. With `max_polls = 0` the loop body never runs, so ONLY the
+    /// post-loop final read can find the grant — proving the trailing read closes
+    /// the window the old code dropped.
+    #[tokio::test]
+    async fn await_capability_decision_catches_a_grant_after_the_loop() {
+        use elastos_runtime::capability::pending::GrantDuration;
+        use elastos_runtime::primitives::audit::AuditLog;
+        use elastos_runtime::session::SessionId;
+
+        let store = PendingRequestStore::new(Arc::new(AuditLog::new()));
+        let req = store
+            .create_request(
+                SessionId("vm-test".to_string()),
+                ResourceId::new("elastos://peer/*"),
+                Action::Execute,
+            )
+            .await;
+        let request_id = req.id.to_string();
+
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let token = CapabilityToken::new(
+            "vm-test".to_string(),
+            signing_key.verifying_key().to_bytes(),
+            ResourceId::new("elastos://peer/*"),
+            Action::Execute,
+            TokenConstraints::default(),
+            SecureTimestamp::now(),
+            None,
+        );
+        store
+            .grant_request(&request_id, token, GrantDuration::Once)
+            .await
+            .expect("grant should succeed");
+
+        // max_polls = 0 → the loop never polls; only the trailing read can catch it.
+        let decision = await_capability_decision(&store, &request_id, 0, 1).await;
+        assert!(
+            matches!(decision, CapabilityDecision::Granted(_)),
+            "the grant landing after the loop is returned, not dropped (BUG-5)"
+        );
+    }
+
+    /// An unresolved request times out cleanly — the loop polls, finds nothing,
+    /// the final read finds nothing → TimedOut (no false grant from the new read).
+    #[tokio::test]
+    async fn await_capability_decision_times_out_when_unresolved() {
+        use elastos_runtime::primitives::audit::AuditLog;
+        use elastos_runtime::session::SessionId;
+
+        let store = PendingRequestStore::new(Arc::new(AuditLog::new()));
+        let req = store
+            .create_request(
+                SessionId("vm-test".to_string()),
+                ResourceId::new("elastos://peer/*"),
+                Action::Execute,
+            )
+            .await;
+        let decision = await_capability_decision(&store, &req.id.to_string(), 2, 1).await;
+        assert!(matches!(decision, CapabilityDecision::TimedOut));
     }
 }
