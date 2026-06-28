@@ -422,6 +422,7 @@ pub async fn run_serve(
             s.set_provider_registry(infra.provider_registry.clone());
             s.set_capability_manager(infra.capability_manager.clone());
             s.set_pending_store(infra.pending_store.clone());
+            s.set_spend_policy(infra.spend_policy.clone());
             // AUD-1: seed the author-signature launch gate from config `trusted_keys`.
             // Empty by default (gate inert, launches byte-for-byte unchanged); a
             // malformed hex key aborts serve startup LOUDLY (fail-closed at boot) rather

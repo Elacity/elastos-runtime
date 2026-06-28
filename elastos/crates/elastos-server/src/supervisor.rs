@@ -222,6 +222,8 @@ pub struct Supervisor {
     capability_manager: Option<Arc<elastos_runtime::capability::CapabilityManager>>,
     /// Pending capability request store for shell-mediated approval.
     pending_store: Option<Arc<elastos_runtime::capability::pending::PendingRequestStore>>,
+    /// Per-act spend policy for the microVM Carrier act path; `None` ⇒ unmetered.
+    spend_policy: Option<crate::carrier_bridge::SpendPolicy>,
     /// Author-signature verifier for the launch gate (AUD-1). Default is empty (no
     /// trusted keys), in which case the gate skips and launches are byte-for-byte
     /// today's behavior; seeded from config `trusted_keys` at serve time to activate.
@@ -474,6 +476,7 @@ impl Supervisor {
             provider_registry: None,
             capability_manager: None,
             pending_store: None,
+            spend_policy: None,
             signature_verifier: SignatureVerifier::new(),
             gateway: Arc::new(RwLock::new(None)),
         }
@@ -525,6 +528,12 @@ impl Supervisor {
         pending_store: Arc<elastos_runtime::capability::pending::PendingRequestStore>,
     ) {
         self.pending_store = Some(pending_store);
+    }
+
+    /// Attach the per-act spend policy so microVM capsule acts are metered (act-over-MCP). `None`
+    /// (the default) leaves the microVM carrier path unmetered.
+    pub fn set_spend_policy(&mut self, spend_policy: Option<crate::carrier_bridge::SpendPolicy>) {
+        self.spend_policy = spend_policy;
     }
 
     /// Seed the author-signature launch gate with trusted keys (AUD-1). Called at
@@ -1248,8 +1257,8 @@ impl Supervisor {
                     capsule_id: format!("vm-{}", name),
                     principal_id: principal_id.clone(),
                     data_dir: Some(self.data_dir.clone()),
-                    // microVM-carrier metering is a follow-up; the serve act path is metered first.
-                    spend_policy: None,
+                    // microVM capsule acts are metered under the canonical vm-{name} budget.
+                    spend_policy: self.spend_policy.clone(),
                 }),
                 _ => None,
             };

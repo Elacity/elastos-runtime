@@ -130,14 +130,17 @@ the next product arc, none of it started here:
   canonical capsule id) BEFORE `send_raw`, refuses fail-closed with `budget_exhausted` + refunds the
   single-use token when the budget is gone, and refunds the spend on the same `NoProvider`/`DidNotAct`
   no-op branches as the token. Signed `SpendDebit`/`BudgetExhausted` audit events on Plane A. Enabled
-  by `ELASTOS_DEFAULT_SPEND_BUDGET` (unset ⇒ unmetered; `0` ⇒ hard-stop). Proven by
-  `carrier_act_is_refused_when_spend_budget_is_exhausted` + `did_not_act_refunds_the_spend_debit`.
-  **Cursor TODO / residual:** (a) only the **serve** act path carries the policy — the **microVM
-  supervisor** (`vm-{name}`) and **WASM** carrier sites are `spend_policy: None` (documented
-  follow-up; wire them from infra the same way); (b) cost is a flat **1 unit per act** (bounds the
-  NUMBER of acts) — provider-reported variable cost (real AI tokens) is the next refinement; (c) the
-  consent/affordance dispatch path (`gateway_capsule_catalog`) is not yet metered; (d) per-capsule
-  budgets are a flat default — a real per-principal/quota policy + a top-up path is a product decision.
+  by `ELASTOS_DEFAULT_SPEND_BUDGET` (unset ⇒ unmetered; `0` ⇒ hard-stop). **Variable cost** is wired:
+  a provider may report `cost_units` (real resource consumed) and the meter reconciles it post-success
+  (reserve 1 → drain the overage saturating); absent ⇒ flat 1/act (back-compatible). Both the **serve**
+  AND the **microVM-supervisor** (`vm-{name}`) act paths now share the same meter via `infra.spend_policy`.
+  Proven by `carrier_act_is_refused_when_spend_budget_is_exhausted`, `did_not_act_refunds_the_spend_debit`,
+  and `variable_cost_charges_provider_reported_units`. **Cursor TODO / residual:** (a) the **WASM** carrier
+  site (`runtime.rs`) is still `spend_policy: None` (lower-traffic; wire from infra the same way); (b) the
+  microVM path can only be EXERCISED on KVM — confirm a `vm-{name}` capsule's acts debit the budget and the
+  `budget_exhausted` refusal surfaces in the guest; (c) the consent/affordance dispatch path
+  (`gateway_capsule_catalog`) is not yet metered; (d) per-capsule budgets are a flat default — a real
+  per-principal/quota policy + a top-up path is a product decision.
 - **Free-text NL → intent** (adoption wedge #3) — the AI-backend "brain" track.
 - **The marketplace of shells** — multiple untrusted shells over the ESP protocol.
 
