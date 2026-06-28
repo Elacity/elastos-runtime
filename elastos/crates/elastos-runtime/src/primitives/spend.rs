@@ -7,11 +7,11 @@
 //! (`capability::store::CapabilityStore::try_use_token`), including the provably-no-op REFUND for an
 //! action that was charged but then did not act (the BUG-4 / `DidNotAct` discipline).
 //!
-//! SCOPE (honest): this is the MECHANISM. The debit is NOT yet wired into the provider-dispatch /
-//! act path — that is the next slice (the act-over-MCP write path; the natural call site is
-//! `carrier_bridge`'s `send_raw` dispatch, right where the single-use token is consumed). Until
-//! then nothing charges the meter in production; the primitive is exercised by its own tests and is
-//! ready for the wiring chunk to call.
+//! WIRED: the carrier `carrier_invoke` act path charges this meter — it reserves 1 unit before
+//! dispatch (fail-closed if the budget is gone) and reconciles the provider-reported `cost_units`
+//! (variable cost) post-success, refunding on the provably-no-op branches. Enabled per deployment
+//! via `ELASTOS_DEFAULT_SPEND_BUDGET` on the serve act path; the microVM/WASM carrier sites are
+//! follow-ups (see `docs/READY_FOR_CURSOR.md`).
 //!
 //! KEYING: a budget is keyed by an opaque string the caller picks — in production the canonical
 //! `vm-{name}` capsule id (the same identity the carrier gate validates), so a budget bounds one
@@ -143,6 +143,26 @@ impl SpendMeter {
         Ok(bal.remaining())
     }
 
+    /// Debit up to `amount`, draining no further than zero, and return the amount ACTUALLY debited
+    /// (less than `amount` when the budget could not cover it). For a POST-HOC charge whose action
+    /// has ALREADY happened (e.g. a provider reporting the units it actually consumed): the act can
+    /// no longer be refused, so an over-budget cost drains the remainder and the next act is refused
+    /// fail-closed by [`try_debit`]. Unprovisioned/poisoned ⇒ debits nothing.
+    pub fn debit_saturating(&self, key: &str, amount: SpendUnits) -> SpendUnits {
+        let mut balances = match self.balances.write() {
+            Ok(b) => b,
+            Err(_) => return 0,
+        };
+        match balances.get_mut(key) {
+            Some(bal) => {
+                let take = amount.min(bal.remaining());
+                bal.spent += take;
+                take
+            }
+            None => 0,
+        }
+    }
+
     /// Refund a prior debit (saturating). ONLY for a charge whose action provably did NOT occur —
     /// the same contract as `refund_token_use` + `ProviderError::DidNotAct`: refundable only when
     /// nothing acted AND a replay would be a guaranteed no-op. Returns remaining AFTER the refund.
@@ -250,6 +270,29 @@ mod tests {
                 requested: 1,
                 remaining: 0
             }
+        );
+    }
+
+    #[test]
+    fn debit_saturating_drains_to_zero_and_reports_actual() {
+        let meter = SpendMeter::new();
+        meter.set_budget("vm-alice", 10);
+        assert_eq!(
+            meter.debit_saturating("vm-alice", 3),
+            3,
+            "fits: debits all 3"
+        );
+        // Only 7 remain; an 11-unit post-hoc charge drains the remainder and reports 7.
+        assert_eq!(
+            meter.debit_saturating("vm-alice", 11),
+            7,
+            "drains to zero, reports actual"
+        );
+        assert_eq!(meter.remaining("vm-alice"), 0);
+        assert_eq!(
+            meter.debit_saturating("vm-ghost", 5),
+            0,
+            "unprovisioned debits nothing"
         );
     }
 

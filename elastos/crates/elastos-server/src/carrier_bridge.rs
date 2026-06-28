@@ -988,18 +988,10 @@ pub(crate) async fn handle_request(
                     .meter
                     .try_debit(&bridge_ctx.capsule_id, CARRIER_ACT_COST)
                 {
-                    Ok(remaining) => {
-                        bridge_ctx.capability_manager.audit_log().emit_best_effort(
-                            elastos_runtime::primitives::audit::AuditEvent::SpendDebit {
-                                timestamp: elastos_runtime::primitives::time::SecureTimestamp::now(
-                                ),
-                                capsule_id: bridge_ctx.capsule_id.clone(),
-                                operation: dispatch.operation.clone(),
-                                cost: CARRIER_ACT_COST,
-                                remaining,
-                            },
-                        );
-                    }
+                    // Reserved the minimum 1 unit (fail-closed if broke). The SpendDebit is recorded
+                    // POST-dispatch — after we know the act stuck and the provider's actual cost — so
+                    // the refund branches don't leave a phantom debit in the custody log.
+                    Ok(_remaining) => {}
                     Err(spend_err) => {
                         let remaining_use = bridge_ctx
                             .capability_manager
@@ -1039,10 +1031,42 @@ pub(crate) async fn handle_request(
                 .send_raw(&dispatch.scheme, &dispatch.request)
                 .await
             {
-                Ok(result) => serde_json::json!({
-                    "type": "carrier_result",
-                    "result": result,
-                }),
+                Ok(result) => {
+                    // The act stuck. Record the real charge: the reserved 1 unit plus any provider-
+                    // reported overage. A provider may report `cost_units` (real resource consumed,
+                    // e.g. AI tokens); absent ⇒ the flat 1/act (back-compatible). The overage is
+                    // charged saturating — the act already happened, so an over-budget cost drains
+                    // the remainder to zero and the NEXT act is refused fail-closed by `try_debit`.
+                    if let Some(policy) = &bridge_ctx.spend_policy {
+                        let reported = result
+                            .get("cost_units")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(CARRIER_ACT_COST)
+                            .max(CARRIER_ACT_COST);
+                        let mut charged = CARRIER_ACT_COST;
+                        if reported > CARRIER_ACT_COST {
+                            charged += policy.meter.debit_saturating(
+                                &bridge_ctx.capsule_id,
+                                reported - CARRIER_ACT_COST,
+                            );
+                        }
+                        let remaining = policy.meter.remaining(&bridge_ctx.capsule_id);
+                        bridge_ctx.capability_manager.audit_log().emit_best_effort(
+                            elastos_runtime::primitives::audit::AuditEvent::SpendDebit {
+                                timestamp: elastos_runtime::primitives::time::SecureTimestamp::now(
+                                ),
+                                capsule_id: bridge_ctx.capsule_id.clone(),
+                                operation: dispatch.operation.clone(),
+                                cost: charged,
+                                remaining,
+                            },
+                        );
+                    }
+                    serde_json::json!({
+                        "type": "carrier_result",
+                        "result": result,
+                    })
+                }
                 Err(elastos_runtime::provider::ProviderError::NoProvider(scheme)) => {
                     // BUG-4 safe slice: the registry matched NO provider, so NOTHING
                     // ran — the consumed single use was provably a no-op. Refund it
@@ -1892,6 +1916,101 @@ mod tests {
             meter.remaining(&ctx.capsule_id),
             1,
             "DidNotAct refunds the spend; the budget is intact for a real act"
+        );
+    }
+
+    /// A provider that reports the units it actually consumed (`cost_units`), so the meter bounds
+    /// real spend, not just the call count.
+    struct CostReportingProvider;
+    #[async_trait::async_trait]
+    impl elastos_runtime::provider::Provider for CostReportingProvider {
+        async fn handle(
+            &self,
+            _r: elastos_runtime::provider::ResourceRequest,
+        ) -> Result<
+            elastos_runtime::provider::ResourceResponse,
+            elastos_runtime::provider::ProviderError,
+        > {
+            Err(elastos_runtime::provider::ProviderError::Provider(
+                "test cost provider answers via send_raw only".into(),
+            ))
+        }
+        fn schemes(&self) -> Vec<&'static str> {
+            vec!["rights"]
+        }
+        fn name(&self) -> &'static str {
+            "test-cost-reporting"
+        }
+        async fn send_raw(
+            &self,
+            _request: &serde_json::Value,
+        ) -> Result<serde_json::Value, elastos_runtime::provider::ProviderError> {
+            Ok(serde_json::json!({ "status": "ok", "cost_units": 5 }))
+        }
+    }
+
+    /// Variable cost: a provider reporting 5 units exhausts a budget of 8 in TWO acts (5 + drain to
+    /// 0), and the third act is refused before dispatch — the budget bounds real spend, not calls.
+    #[tokio::test]
+    async fn variable_cost_charges_provider_reported_units() {
+        use elastos_runtime::capability::token::TokenConstraints;
+        use elastos_runtime::primitives::spend::SpendMeter;
+
+        let mut ctx = bridge_context();
+        let meter = Arc::new(SpendMeter::new());
+        ctx.spend_policy = Some(super::SpendPolicy {
+            meter: meter.clone(),
+            default_budget: 8,
+        });
+        ctx.provider_registry
+            .register(Arc::new(CostReportingProvider))
+            .await;
+
+        let uri = "elastos://rights/has_access_by_content_id";
+        let operation = "has_access_by_content_id";
+        let probe = serde_json::json!({
+            "type": "carrier_invoke", "uri": uri, "operation": operation, "body": {}
+        });
+        let dispatch = carrier_invoke_dispatch(&probe, None).expect("dispatch parses");
+        let token = encode_bridge_capability_token(&ctx.capability_manager.grant(
+            &ctx.capsule_id,
+            ResourceId::new(&dispatch.resource),
+            required_action_for(&dispatch.operation),
+            TokenConstraints::new(0, false, None, Some(10)),
+            None,
+        ));
+        let call = |tok: &str| {
+            serde_json::json!({
+                "id": 1,
+                "request": {
+                    "type": "carrier_invoke", "uri": uri, "operation": operation,
+                    "token": tok, "body": {}
+                }
+            })
+            .to_string()
+        };
+        let ctx_opt = Some(ctx.clone());
+
+        let r1 = handle_request(&call(&token), &ctx_opt).await.unwrap();
+        assert_eq!(r1["response"]["type"], "carrier_result");
+        assert_eq!(
+            meter.remaining(&ctx.capsule_id),
+            3,
+            "first act charged the reported 5 of 8"
+        );
+
+        let r2 = handle_request(&call(&token), &ctx_opt).await.unwrap();
+        assert_eq!(r2["response"]["type"], "carrier_result");
+        assert_eq!(
+            meter.remaining(&ctx.capsule_id),
+            0,
+            "second act drains the remaining 3 (saturating — the act already happened)"
+        );
+
+        let r3 = handle_request(&call(&token), &ctx_opt).await.unwrap();
+        assert_eq!(
+            r3["response"]["code"], "budget_exhausted",
+            "the over-budget third act is refused before dispatch: {r3}"
         );
     }
 
