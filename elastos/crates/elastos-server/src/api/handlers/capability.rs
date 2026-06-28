@@ -1335,6 +1335,143 @@ mod tests {
         }
     }
 
+    /// Helper: run request -> grant for an ORDINARY (non-affordance) session
+    /// capability and return the minted base64 token (no binding).
+    async fn mint_session_token(state: &CapabilityState) -> String {
+        let session = Session::new_capsule("vm-player".to_string());
+        let req = request_capability(
+            State(state.clone()),
+            Extension(session.clone()),
+            Json(RequestCapabilityInput {
+                resource: "elastos://rights/play".to_string(),
+                action: "execute".to_string(),
+                capsule: None,
+                principal_id: None,
+                method_id: None,
+                input_hash: None,
+            }),
+        )
+        .await
+        .expect("session request accepted")
+        .0;
+        grant_request(
+            State(state.clone()),
+            Extension(session),
+            Json(GrantRequestInput {
+                request_id: req.request_id.expect("request id"),
+                duration: "session".to_string(),
+                rationale: None,
+            }),
+        )
+        .await
+        .expect("session grant")
+        .0
+        .token
+        .expect("token minted")
+    }
+
+    /// The end-to-end consent journey: a consent-gated invocation is requested,
+    /// approved, redeemed for its signed receipt — and every "user said no / the
+    /// grant is dead / this isn't a consent token" branch fails closed. The
+    /// (method-swap, arg-swap, wrong-caller, replay) matrix is covered by
+    /// `validate_and_consume_enforces_binding_single_use_and_caller`; the
+    /// signature/expiry/revocation primitives are enforced inside `validate()`
+    /// (covered by the capability-conformance battery) and flow through here
+    /// unchanged.
+    #[tokio::test]
+    async fn test_affordance_consent_journey() {
+        let state = test_state();
+        let hash = elastos_common::canonical_input_hash(&serde_json::json!({"track": "film-x"}));
+        let args = || serde_json::json!({"track": "film-x"});
+        let player = || Extension(Session::new_capsule("vm-player".to_string()));
+
+        // ── Happy path: request (consent-gated) → grant → redeem → signed receipt.
+        let token = mint_affordance_token(&state, "play", &hash).await;
+        let redeemed = validate_and_consume(
+            State(state.clone()),
+            player(),
+            Json(redeem_input(&token, "play", args())),
+        )
+        .await
+        .expect("the approved invocation redeems exactly once");
+        assert_eq!(redeemed.0.status, "consumed");
+        assert!(
+            redeemed
+                .0
+                .receipt
+                .verify(state.capability_manager.public_key()),
+            "the journey yields a receipt that verifies under the runtime key"
+        );
+        assert_eq!(redeemed.0.receipt.method_id, "play");
+        assert_eq!(redeemed.0.receipt.input_hash, hash);
+        assert_eq!(redeemed.0.receipt.capsule, "vm-player");
+
+        // ── Deny branch: the user refuses; the request is denied and never
+        // yields a redeemable token.
+        let session = Session::new_capsule("vm-player".to_string());
+        let pending = request_capability(
+            State(state.clone()),
+            Extension(session.clone()),
+            Json(RequestCapabilityInput {
+                resource: "elastos://rights/play".to_string(),
+                action: "execute".to_string(),
+                capsule: Some("vm-player".to_string()),
+                principal_id: Some("did:ela:alice".to_string()),
+                method_id: Some("play".to_string()),
+                input_hash: Some(hash.clone()),
+            }),
+        )
+        .await
+        .expect("consent request accepted")
+        .0;
+        let denied = deny_request(
+            State(state.clone()),
+            Extension(session),
+            Json(DenyRequestInput {
+                request_id: pending.request_id.expect("request id"),
+                reason: Some("not now".to_string()),
+            }),
+        )
+        .await
+        .expect("deny is recorded")
+        .0;
+        assert!(denied.success, "the user's refusal is recorded fail-closed");
+
+        // ── Revoked branch: a revoked grant cannot be redeemed.
+        let token2 = mint_affordance_token(&state, "play", &hash).await;
+        let revoked_id = *CapabilityToken::from_base64(&token2)
+            .expect("decode token")
+            .id();
+        state
+            .capability_manager
+            .revoke(revoked_id, "journey: revoked before redemption")
+            .await;
+        assert!(
+            validate_and_consume(
+                State(state.clone()),
+                player(),
+                Json(redeem_input(&token2, "play", args())),
+            )
+            .await
+            .is_err(),
+            "a revoked grant cannot be redeemed"
+        );
+
+        // ── Not-an-affordance-token: an ordinary session token is refused here
+        // (it carries no binding; it must use the ordinary capability gate).
+        let ordinary = mint_session_token(&state).await;
+        assert!(
+            validate_and_consume(
+                State(state.clone()),
+                player(),
+                Json(redeem_input(&ordinary, "play", args())),
+            )
+            .await
+            .is_err(),
+            "an ordinary session token is not redeemable as an affordance consent"
+        );
+    }
+
     #[tokio::test]
     async fn validate_and_consume_enforces_binding_single_use_and_caller() {
         // W2 step 7: the runtime re-validates an affordance token AND re-checks the

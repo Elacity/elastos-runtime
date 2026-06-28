@@ -15,7 +15,7 @@ agent-containment audit (EU AI Act Art 12/14).
 **Status at a glance (2026-06-27):** substrate + intent compiler DONE; security audited + hardened
 ~9/10 (AUD-1..5); Astrid research DONE; adoption wedges 1-2 (MCP-serve + dataflow) DONE; the PRODUCT +
 STRATEGY resolved (KEEP, the PDR, the shell vision, the ESP protocol, the narrative); now executing the
-**ESP build wedges W0-W7** toward the shell — **W2 (consent act path) IN PROGRESS (~90%)**.
+**ESP build wedges W0-W7** toward the shell — **W2 (consent act path) IN PROGRESS (~95%)**.
 
 ---
 
@@ -78,7 +78,7 @@ The PDR/ESP plan: build the honest substrate first, then the shell as a read-onl
 |---|---|---|
 | **W0** | Core-derived reach (the honest halo) | not started |
 | **W1** | Egress-as-capability | not started |
-| **W2** | **Unstub the consent act path** | **IN PROGRESS ~90%** (below) |
+| **W2** | **Unstub the consent act path** | **IN PROGRESS ~95%** (below) |
 | **W3** | De-hardcode "the shell" → "a shell" + rename `consent-broker` | not started |
 | **W4** | Write ESP v0 (protocol doc + TS types) | not started |
 | **W5** | The v1 Svelte projection shell + the hero dDRM act | not started |
@@ -119,10 +119,17 @@ key, binding (capsule, method, input_hash, resource, action); tampering any fiel
 (proven). REMAINING: 10 (full journey test + fail-closed branch matrix — also verifies the live
 identity round-trip end-to-end), 11 (alignment assertions + docs). Small follow-up: sign the gateway
 provider-effect *telemetry* envelope (`signer_did: None`) — the authoritative attestation is the
-runtime-signed receipt.
+runtime-signed receipt. **Step 10 DONE** (this slice): `test_affordance_consent_journey` walks the full
+loop (request consent-gated → grant → redeem → verifying signed receipt) and asserts deny / revoked /
+not-an-affordance-token fail closed; combined with the step-7 matrix (method-swap, arg-swap,
+wrong-caller, replay) and the `validate()` conformance battery (expired/forged/signature), the
+fail-closed surface is covered. Honest scope: the gateway→runtime HTTP redeem round-trip runs against
+the harness's stub runtime, so the live forwarded-bearer→`vm-{name}` round-trip stays an integration
+check (not unit-verified). REMAINING: 11 (alignment-script assertions pinning the W2 invariants + update
+state.md / TASKS.md) — then W2 is CLOSED.
 
-**Immediate next (on `claude/keep-consent-architecture-0fz0ll`):** W2 step 10 (journey test +
-fail-closed matrix) → 11 (alignment + docs) → W3 → … → W7.
+**Immediate next (on `claude/keep-consent-architecture-0fz0ll`):** W2 step 11 (alignment assertions +
+docs) → W2 CLOSED → W0 → W1 → W3 → … → W7.
 
 ---
 
