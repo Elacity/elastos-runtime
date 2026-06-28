@@ -15,7 +15,7 @@ agent-containment audit (EU AI Act Art 12/14).
 **Status at a glance (2026-06-27):** substrate + intent compiler DONE; security audited + hardened
 ~9/10 (AUD-1..5); Astrid research DONE; adoption wedges 1-2 (MCP-serve + dataflow) DONE; the PRODUCT +
 STRATEGY resolved (KEEP, the PDR, the shell vision, the ESP protocol, the narrative); now executing the
-**ESP build wedges W0-W7** toward the shell — **W2 ✅ · W0 ✅ · W1 model ✅ (W1b firewall → KVM lane) · W3 IN PROGRESS** (shell de-hardcoded; consent-broker rename = W3b).
+**ESP build wedges W0-W7** toward the shell — **W2 ✅ · W0 ✅ · W1 model ✅ · W3 de-hardcoded ✅ · W4 ✅** (ESP v0 doc + TS types). Next is **W5** (the v1 projection shell + hero dDRM act). Tails: W1b firewall (KVM lane), W3b consent-broker rename.
 
 ---
 
@@ -80,7 +80,7 @@ The PDR/ESP plan: build the honest substrate first, then the shell as a read-onl
 | **W1** | Egress-as-capability | **IN PROGRESS** — model landed (`EgressReach::Allowlisted` + fail-closed `EgressAllowlist`); **W1b** (kernel TAP firewall + launch-path threading) needs KVM/CAP_NET_ADMIN → local lane |
 | **W2** | **Unstub the consent act path** | **✅ DONE (steps 1-11)** (below) |
 | **W3** | De-hardcode "the shell" → "a shell" + rename `consent-broker` | **IN PROGRESS** — role-based active-shell token issuance landed (`shell_token_eligible` + `active_shell` pointer); **W3b** = the `consent-broker` rename (wide mechanical) |
-| **W4** | Write ESP v0 (protocol doc + TS types) | not started |
+| **W4** | Write ESP v0 (protocol doc + TS types) | **✅ DONE** — `docs/ESP_V0.md` + `elastos/esp/esp_v0.ts` (tsc strict), extracted from shipped emitters; alignment-pinned against drift |
 | **W5** | The v1 Svelte projection shell + the hero dDRM act | not started |
 | **W6** | The refraction toggle + shell-picker | not started |
 | **W7** | Export the receipt chain as the EU AI Act audit artifact (the flywheel) | not started |

@@ -186,6 +186,18 @@ check_required 'ValidatedAffordanceGrant' elastos/crates/elastos-server/src/api/
 # Affordance use fails closed if the signed durable record cannot be written.
 check_required 'AuditWriteFailed' elastos/crates/elastos-runtime/src/capability/manager.rs 'W2: affordance use must fail closed when the signed durable use-record cannot be written'
 
+# --- W4: ESP v0 doc/code agreement (the spec must not drift from what ships) ---
+# The schema tags ESP_V0.md documents must still exist where it cites them.
+check_required 'elastos.capsules.catalog/v1' elastos/crates/elastos-server/src/api/gateway_capsule_catalog.rs 'ESP v0: capsule-catalog schema tag must match docs/ESP_V0.md'
+check_required 'elastos.capsules.interfaces/v1' elastos/crates/elastos-server/src/api/gateway_capsule_catalog.rs 'ESP v0: interface-registry schema tag must match docs/ESP_V0.md'
+check_required 'elastos.capsules.affordance-consent-pending/v1' elastos/crates/elastos-server/src/api/gateway_capsule_catalog.rs 'ESP v0: consent-pending schema tag must match docs/ESP_V0.md'
+check_required 'elastos.reach.v1' elastos/crates/elastos-common/src/reach.rs 'ESP v0: reach schema tag must match docs/ESP_V0.md'
+check_required 'elastos.affordance.receipt.v1' elastos/crates/elastos-runtime/src/capability/receipt.rs 'ESP v0: receipt schema tag must match docs/ESP_V0.md'
+# The projection routes ESP_V0.md documents must still be served.
+check_required '/api/capsules/catalog' elastos/crates/elastos-server/src/api/gateway.rs 'ESP v0: capsule-catalog route must match docs/ESP_V0.md'
+check_required '/api/capsules/interfaces' elastos/crates/elastos-server/src/api/gateway.rs 'ESP v0: interface-registry route must match docs/ESP_V0.md'
+check_required '/api/capsules/interfaces/invoke' elastos/crates/elastos-server/src/api/gateway.rs 'ESP v0: affordance-invoke route must match docs/ESP_V0.md'
+
 check_required 'Home front door' README.md 'README must teach Home front door'
 check_required 'No Ambient Authority' PRINCIPLES.md 'principles file must codify explicit authority boundaries'
 check_required 'Carrier Plane For Local And Off-Box' PRINCIPLES.md 'principles file must codify the Carrier capability plane for local and off-box transport'
