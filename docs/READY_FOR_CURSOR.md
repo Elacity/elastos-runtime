@@ -17,6 +17,13 @@ bash ../scripts/check-wci-alignment.sh
 ```
 All four should pass. (Server lib ~876 tests, runtime ~345, common ~95.)
 
+> **Known env-dependent failures (NOT regressions):** the cloud sandbox cannot run
+> a few integration tests — ~9 failures in the **browser-engine** path and some
+> **checksum/VM** tests that need a real Linux host. They pass on your machine.
+> So a *full* `cargo test` (not just `--lib`) may show those; cross-check any
+> failure against `docs/ROADMAP.md` (LOCAL/CURSOR section) before treating it as a
+> real break. The `--lib` suites above are the clean in-cloud signal.
+
 ## 1. W1b — the real egress firewall  ← highest leverage
 
 **Design:** `docs/W1B_EGRESS_FIREWALL.md` (complete — read it first).
@@ -62,6 +69,50 @@ only the live Svelte paint + a visual snapshot test remain.
 - Fail-closed; name every deferral with a ratchet or a privilege requirement.
 - The G3b conformance ratchet (`all_provider_manifests_preview_actions_match_verb_map_or_tracked`)
   will fail the build if any preview/enforce drift sneaks in — keep it green.
+
+## The COMPLETE remaining registry (no blind spots)
+
+The three items above (W1b, BUG-2/3/7, W5b) are the **highest-leverage** pickups,
+but they are NOT the whole list. The authoritative, complete sources of truth are
+**`docs/ROADMAP.md`** (the "DEFERRED / TRACKED" + "LOCAL / CURSOR" sections) and
+**`docs/KNOWN_GAPS.md`** (the gap registry, each with a close-criterion or a
+`#[ignore]`d ratchet test). Everything else still open, so nothing surprises you:
+
+- **AUD-1 ACTIVATION (production trust):** the author-signature launch gate is
+  wired + fail-closed-when-configured, but inert until you generate an author key
+  (`trust_cmd`) and set `trusted_keys` in config, then re-sign the capsules. Until
+  then only operator sha256 pinning protects launch. (Local/Cursor — founder config.)
+- **Carrier-service author gate** — AUD-1 residual (host-binary launch path needs a
+  distinct entrypoint-hash design to avoid false-denies).
+- **AUD-4 plane-(a)** — `verify_chain` on the file-backed audit log at startup
+  (needs the `AuditLog::with_file` switch + a persisted head-anchor). Wave 2.
+- **G8 / G8b** — route capability deny/grant/use/revoke through the ONE signed+durable
+  plane + verify-on-read (the inspector's "attested" already verifies; the rest is wiring).
+- **G1b / G2b serve-wiring** — the live `serve` path attaches only `AuthAuditSource`
+  / registers capsules without verifying; thread the grant source + `verified_signer`
+  (blocked on confirming the content-hash domain for the MicroVM artifact).
+- **Performance (speed 5/10):** the free reflink/COW rootfs-overlay win
+  (`supervisor.rs:1152`), then the audit group-commit rewrite (MEASURE first; never
+  coalesce a custody record or cache a revocation/expiry/use-count check).
+- **G3b dangerous tail (13, deliberately LOCKED):** drm `open`, encrypt `seal`,
+  wallet signing/approval/secret-export, key `release`, decrypt, chain broadcast,
+  object `share` — each needs a per-op security decision; the conformance ratchet
+  keeps them visible. Do NOT bulk-loosen.
+- **Helper-gated DidNotAct** — the last `import_exact` validations (shared-helper
+  contract change). Low value.
+
+## Beyond W0-W7 — the macro vision's NEXT band (product roadmap, not bugs)
+
+W0-W7 is the **foundation** of the Sovereign Computer / KEEP, not the whole product.
+The PDR ("NEXT" band, see `docs/PDR_SOVEREIGN_COMPUTER.md` + `docs/ROADMAP.md`) is
+the next product arc, none of it started here:
+- **Dual-receipt PLATFORM self-attestation** — the platform co-signs its own
+  accountability at gate time (get a legal-admissibility opinion first).
+- **Act-over-MCP (the write path)** — agents *doing*, not just reading, through the
+  one consent gate + meter.
+- **The spend meter** — bounds an agent's AI/resource spend (adoption wedge #4).
+- **Free-text NL → intent** (adoption wedge #3) — the AI-backend "brain" track.
+- **The marketplace of shells** — multiple untrusted shells over the ESP protocol.
 
 ## When ready to merge
 
