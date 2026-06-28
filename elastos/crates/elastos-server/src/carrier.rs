@@ -4532,18 +4532,20 @@ impl Provider for CarrierGossipProvider {
                         "gossip_join requires a non-empty topic".into(),
                     ));
                 }
-                // No-op rejections (state read-only; nothing joined/sent yet) — the
-                // single use is refundable (BUG-4 DidNotAct). Only the join below,
-                // which may partially act, stays a structured error.
+                // `already_joined` is a STABLE no-op (a replay yields the same
+                // already-joined result), so it is refundable (DidNotAct). But
+                // `too_many_topics` is a TRANSIENT capacity condition — a replay
+                // could ACT once capacity frees, so it is NOT a guaranteed no-op and
+                // stays a structured error (the holder re-requests for a retry).
                 if state.joined_topics.contains(topic_name) {
                     return Err(ProviderError::DidNotAct(
                         "gossip_join: topic already joined".into(),
                     ));
                 }
                 if state.joined_topics.len() >= MAX_TOPICS {
-                    return Err(ProviderError::DidNotAct(
-                        "gossip_join: topic limit reached".into(),
-                    ));
+                    return Ok(
+                        serde_json::json!({"status":"error","code":"too_many_topics","message":"topic limit reached"}),
+                    );
                 }
 
                 match join_gossip_topic(&mut state, topic_name, force_direct).await {

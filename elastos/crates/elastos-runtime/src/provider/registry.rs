@@ -115,12 +115,18 @@ pub enum ProviderError {
     /// precondition/validation failure (missing field, bad shape, unknown op)
     /// that provably left no observable state change.
     ///
-    /// Ocap contract (load-bearing): a provider may return this ONLY when it is
-    /// certain nothing was mutated/emitted/spent, so the caller may safely refund
-    /// a single-use capability (a replay is an idempotent no-op). Any failure that
-    /// MIGHT have partially acted must use `Provider`/`Io`/`NotFound` instead, so
-    /// the use stays consumed (BUG-4: refunding a partial effect would enable a
-    /// second execution). When in doubt, do NOT use this variant.
+    /// Ocap contract (load-bearing): a provider may return this ONLY when a refund
+    /// of the single-use capability is safe — which requires BOTH that nothing was
+    /// mutated/emitted/spent at the point of rejection, AND that a REPLAY of the
+    /// same request is a GUARANTEED no-op (the rejection is a property of the
+    /// REQUEST — a missing/invalid/unsupported field — or of a STABLE state, not a
+    /// TRANSIENT condition). In particular, a transient capacity/quota/rate
+    /// rejection (e.g. `too_many_topics`) is NOT `DidNotAct`: a replay could ACT
+    /// once capacity frees, so refunding would let one consent drive an effect on
+    /// retry — keep it a structured error and let the holder re-request. Any
+    /// failure that MIGHT have partially acted must use `Provider`/`Io`/`NotFound`
+    /// instead (BUG-4: refunding a partial effect would enable a second execution).
+    /// When in doubt, do NOT use this variant.
     DidNotAct(String),
     /// IO error
     Io(std::io::Error),

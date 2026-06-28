@@ -2732,15 +2732,18 @@ impl ContentProvider {
     }
 
     async fn fetch(&self, request: &Value) -> Result<Value, ProviderError> {
+        // Pre-effect request-shape validation (before any registry/IPFS fetch): a
+        // missing/invalid cid or path is a deterministic no-op (a replay rejects
+        // identically), so DidNotAct lets the carrier refund the unused single-use
+        // (BUG-4). The actual fetch below may fail mid-stream and stays Provider/Io.
         let cid = request
             .get("cid")
             .and_then(|cid| cid.as_str())
             .filter(|cid| !cid.trim().is_empty())
-            .ok_or_else(|| ProviderError::Provider("content fetch requires cid".into()))?;
+            .ok_or_else(|| ProviderError::DidNotAct("content fetch requires a cid".into()))?;
         if !is_valid_cid(cid) {
-            return Ok(provider_error(
-                "invalid_cid",
-                "content fetch requires a valid CID",
+            return Err(ProviderError::DidNotAct(
+                "content fetch requires a valid CID".into(),
             ));
         }
 
@@ -2749,7 +2752,7 @@ impl ContentProvider {
             .and_then(|path| path.as_str())
             .unwrap_or("");
         if let Err(message) = validate_content_path(path) {
-            return Ok(provider_error("invalid_path", &message));
+            return Err(ProviderError::DidNotAct(format!("invalid path: {message}")));
         }
 
         let registry = self.registry()?;
@@ -11253,27 +11256,32 @@ mod tests {
 
     #[tokio::test]
     async fn content_fetch_rejects_invalid_cid_and_path() {
+        // BUG-4: `fetch`'s request-shape rejections are pre-effect, deterministic
+        // no-ops (a replay rejects identically), so they return DidNotAct — the
+        // carrier refunds the unused single-use rather than burning the grant.
         let (_data_dir, _registry, _ipfs, content) = registry_with_content_and_ipfs().await;
+
+        let missing_cid = content.send_raw(&json!({ "op": "fetch" })).await;
+        assert!(
+            matches!(missing_cid, Err(ProviderError::DidNotAct(_))),
+            "missing cid → DidNotAct; got {missing_cid:?}"
+        );
+
         let invalid_cid = content
-            .send_raw(&json!({
-                "op": "fetch",
-                "cid": "not-a-cid",
-            }))
-            .await
-            .unwrap();
-        assert_eq!(invalid_cid["status"], "error");
-        assert_eq!(invalid_cid["code"], "invalid_cid");
+            .send_raw(&json!({ "op": "fetch", "cid": "not-a-cid" }))
+            .await;
+        assert!(
+            matches!(invalid_cid, Err(ProviderError::DidNotAct(_))),
+            "invalid cid → DidNotAct; got {invalid_cid:?}"
+        );
 
         let invalid_path = content
-            .send_raw(&json!({
-                "op": "fetch",
-                "cid": TEST_CID,
-                "path": "../secret",
-            }))
-            .await
-            .unwrap();
-        assert_eq!(invalid_path["status"], "error");
-        assert_eq!(invalid_path["code"], "invalid_path");
+            .send_raw(&json!({ "op": "fetch", "cid": TEST_CID, "path": "../secret" }))
+            .await;
+        assert!(
+            matches!(invalid_path, Err(ProviderError::DidNotAct(_))),
+            "invalid path → DidNotAct; got {invalid_path:?}"
+        );
     }
 
     #[tokio::test]
