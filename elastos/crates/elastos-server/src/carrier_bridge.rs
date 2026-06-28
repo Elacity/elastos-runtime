@@ -204,6 +204,38 @@ async fn await_capability_decision(
         .unwrap_or(CapabilityDecision::TimedOut)
 }
 
+/// Poll `poll` up to `max_polls` times on an interval, then do ONE final read —
+/// the transport-agnostic shape of the BUG-5 fix. `poll` returns `Ok(Some(_))`
+/// once a decision is reached, `Ok(None)` while still pending; transport errors
+/// propagate. The trailing read closes the window where a decision lands between
+/// the last in-loop poll and the timeout (the in-process twin is
+/// `await_capability_decision`; this serves the WASM-API bridge's HTTP poll).
+async fn poll_then_final_read<T, F, Fut>(
+    max_polls: usize,
+    poll_ms: u64,
+    mut poll: F,
+) -> anyhow::Result<Option<T>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Option<T>>>,
+{
+    for _ in 0..max_polls {
+        tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
+        if let Some(decided) = poll().await? {
+            return Ok(Some(decided));
+        }
+    }
+    poll().await
+}
+
+/// A decided outcome of polling the remote capability endpoint over HTTP.
+enum RemoteCapabilityPoll {
+    /// The capability was granted; carries the encoded token.
+    Token(String),
+    /// A terminal error (denied/expired) already shaped as the bridge response.
+    Terminal(serde_json::Value),
+}
+
 /// Resources needed by the bridge to handle requests.
 #[derive(Clone)]
 pub struct BridgeContext {
@@ -1342,48 +1374,51 @@ async fn handle_remote_request(
                     .and_then(|r| r.as_str())
                     .ok_or_else(|| anyhow::anyhow!("capability response missing request_id"))?;
 
-                // NOTE: this HTTP poll shares BUG-5's shape — a grant landing
-                // after the last GET but before the timeout is missed. Unlike the
-                // in-process loop (fixed via `await_capability_decision`'s trailing
-                // read), the fix here needs an HTTP-mock test to gate; tracked as
-                // the BUG-5 residual in docs/KNOWN_GAPS.md, not silently "fine".
-                let mut token = None;
-                for _ in 0..CAPABILITY_APPROVAL_MAX_POLLS {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        CAPABILITY_APPROVAL_POLL_MS,
-                    ))
-                    .await;
-                    let resp = client
-                        .get(api_base.join(&format!("/api/capability/request/{}", request_id))?)
-                        .header("Authorization", format!("Bearer {}", client_token))
-                        .send()
-                        .await?;
-                    let status: serde_json::Value = resp.json().await?;
-                    if let Some(granted) = status.get("token").and_then(|t| t.as_str()) {
-                        token = Some(granted.to_string());
-                        break;
-                    }
-                    match status.get("status").and_then(|s| s.as_str()) {
-                        Some("denied") | Some("expired") => {
-                            return Ok(serde_json::json!({
-                                "id": id,
-                                "response": {
-                                    "type": "error",
-                                    "code": status.get("status").and_then(|s| s.as_str()).unwrap_or("error"),
-                                    "message": status.get("reason").and_then(|r| r.as_str()).unwrap_or("capability request failed"),
-                                }
-                            }));
+                // Poll the remote decision, then a final read so a grant landing
+                // after the last poll is not dropped to a timeout (BUG-5, HTTP twin
+                // of the in-process `await_capability_decision`).
+                let outcome = poll_then_final_read(
+                    CAPABILITY_APPROVAL_MAX_POLLS,
+                    CAPABILITY_APPROVAL_POLL_MS,
+                    || async {
+                        let resp = client
+                            .get(api_base.join(&format!("/api/capability/request/{}", request_id))?)
+                            .header("Authorization", format!("Bearer {}", client_token))
+                            .send()
+                            .await?;
+                        let status: serde_json::Value = resp.json().await?;
+                        if let Some(granted) = status.get("token").and_then(|t| t.as_str()) {
+                            return Ok(Some(RemoteCapabilityPoll::Token(granted.to_string())));
                         }
-                        _ => {}
+                        match status.get("status").and_then(|s| s.as_str()) {
+                            Some("denied") | Some("expired") => {
+                                Ok(Some(RemoteCapabilityPoll::Terminal(serde_json::json!({
+                                    "id": id,
+                                    "response": {
+                                        "type": "error",
+                                        "code": status.get("status").and_then(|s| s.as_str()).unwrap_or("error"),
+                                        "message": status.get("reason").and_then(|r| r.as_str()).unwrap_or("capability request failed"),
+                                    }
+                                }))))
+                            }
+                            _ => Ok(None),
+                        }
+                    },
+                )
+                .await?;
+
+                match outcome {
+                    Some(RemoteCapabilityPoll::Token(token)) => serde_json::json!({
+                        "type": "capability_token",
+                        "token": token,
+                    }),
+                    Some(RemoteCapabilityPoll::Terminal(json)) => return Ok(json),
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "capability request still pending after 30s"
+                        ))
                     }
                 }
-
-                let token = token
-                    .ok_or_else(|| anyhow::anyhow!("capability request still pending after 30s"))?;
-                serde_json::json!({
-                    "type": "capability_token",
-                    "token": token,
-                })
             }
         }
         "ping" => serde_json::json!({"type": "pong"}),
@@ -3330,5 +3365,37 @@ mod tests {
             .await;
         let decision = await_capability_decision(&store, &req.id.to_string(), 2, 1).await;
         assert!(matches!(decision, CapabilityDecision::TimedOut));
+    }
+
+    /// BUG-5 (HTTP twin): `poll_then_final_read` must catch a decision that lands
+    /// AFTER the loop. With `max_polls = 0` the loop never runs, so ONLY the
+    /// trailing read can return it — the exact gap the WASM-API HTTP poll had.
+    #[tokio::test]
+    async fn poll_then_final_read_catches_a_decision_after_the_loop() {
+        use std::cell::Cell;
+
+        let calls = Cell::new(0);
+        let out: Option<&str> = poll_then_final_read(0, 1, || {
+            calls.set(calls.get() + 1);
+            async { Ok(Some("granted")) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            out,
+            Some("granted"),
+            "the trailing read returns the decision"
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "exactly the one trailing poll ran (loop was skipped)"
+        );
+
+        // A poll that stays pending times out to None after the trailing read.
+        let pending: Option<&str> = poll_then_final_read(2, 1, || async { Ok(None) })
+            .await
+            .unwrap();
+        assert!(pending.is_none());
     }
 }
