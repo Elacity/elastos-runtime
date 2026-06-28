@@ -58,6 +58,12 @@ enum BoundedLine {
     TooLarge,
 }
 
+/// The single canonical `request_too_large` reply, shared by all three bridges so
+/// the wire shape can never drift between them.
+fn oversized_request_error() -> serde_json::Value {
+    serde_json::json!({ "id": 0, "type": "error", "error": "request_too_large" })
+}
+
 /// Read one line from an async reader without ever buffering more than
 /// `MAX_LINE_BYTES` (+1) bytes — the fail-closed inverse of an unbounded
 /// `read_line`. On overflow it drains to the next newline and reports
@@ -260,11 +266,7 @@ pub async fn spawn_carrier_bridge(
                         "Carrier bridge: oversized line (> {} bytes), dropping",
                         MAX_LINE_BYTES
                     );
-                    let error = serde_json::json!({
-                        "id": 0,
-                        "type": "error",
-                        "error": "request_too_large"
-                    });
+                    let error = oversized_request_error();
                     let _ = writer.write_all(error.to_string().as_bytes()).await;
                     let _ = writer.write_all(b"\n").await;
                     let _ = writer.flush().await;
@@ -331,7 +333,7 @@ pub fn spawn_wasm_carrier_bridge(pipes: BridgePipes, ctx: BridgeContext) {
                     Ok(BoundedLine::Line(line)) => line,
                     Ok(BoundedLine::TooLarge) => {
                         tracing::warn!("WASM bridge: oversized line (> {} bytes), dropping", MAX_LINE_BYTES);
-                        let error = serde_json::json!({"id":0,"type":"error","error":"request_too_large"});
+                        let error = oversized_request_error();
                         let _ = writeln!(writer, "{}", error);
                         let _ = writer.flush();
                         continue;
@@ -405,7 +407,7 @@ pub fn spawn_wasm_api_bridge(pipes: BridgePipes, api_url: String, client_token: 
                             "WASM API bridge: oversized line (> {} bytes), dropping",
                             MAX_LINE_BYTES
                         );
-                        let error = serde_json::json!({"id":0,"type":"error","error":"request_too_large"});
+                        let error = oversized_request_error();
                         let _ = writeln!(writer, "{}", error);
                         let _ = writer.flush();
                         continue;
@@ -1317,6 +1319,11 @@ async fn handle_remote_request(
                     .and_then(|r| r.as_str())
                     .ok_or_else(|| anyhow::anyhow!("capability response missing request_id"))?;
 
+                // NOTE: this HTTP poll shares BUG-5's shape — a grant landing
+                // after the last GET but before the timeout is missed. Unlike the
+                // in-process loop (fixed via `await_capability_decision`'s trailing
+                // read), the fix here needs an HTTP-mock test to gate; tracked as
+                // the BUG-5 residual in docs/KNOWN_GAPS.md, not silently "fine".
                 let mut token = None;
                 for _ in 0..CAPABILITY_APPROVAL_MAX_POLLS {
                     tokio::time::sleep(std::time::Duration::from_millis(
