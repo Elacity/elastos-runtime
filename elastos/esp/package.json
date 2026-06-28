@@ -6,6 +6,6 @@
   "description": "ESP v0 — ElastOS Shell Protocol shared types + read-only projection client (two-channel object, hero consent act). See docs/ESP_V0.md.",
   "scripts": {
     "build": "tsc",
-    "test": "tsc && node --test build/two_channel.test.js build/shell_picker.test.js"
+    "test": "tsc && node --test build/two_channel.test.js build/shell_picker.test.js build/ai_act_audit.test.js"
   }
 }
