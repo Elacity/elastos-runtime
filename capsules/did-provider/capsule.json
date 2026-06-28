@@ -13,8 +13,18 @@
     "capabilities": [
       {
         "resource": "elastos://did/*",
+        "actions": ["read"],
+        "operations": ["get_did", "resolve", "get_nickname", "get_persona_did"]
+      },
+      {
+        "resource": "elastos://did/*",
+        "actions": ["write"],
+        "operations": ["set_nickname"]
+      },
+      {
+        "resource": "elastos://did/*",
         "actions": ["execute"],
-        "operations": ["get_did", "resolve", "sign_chat_message", "verify", "verify_did_recovery", "get_nickname", "set_nickname", "get_persona_did"]
+        "operations": ["sign_chat_message", "verify", "verify_did_recovery"]
       }
     ],
     "audit_events": ["did.resolve", "did.sign", "did.profile_update"]

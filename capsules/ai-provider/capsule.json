@@ -16,8 +16,13 @@
     "capabilities": [
       {
         "resource": "elastos://ai/*",
+        "actions": ["read"],
+        "operations": ["list_backends", "ping"]
+      },
+      {
+        "resource": "elastos://ai/*",
         "actions": ["execute"],
-        "operations": ["chat_completions", "list_backends", "ping"]
+        "operations": ["chat_completions"]
       }
     ],
     "audit_events": ["ai.request", "ai.backend_select"]

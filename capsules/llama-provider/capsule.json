@@ -17,8 +17,13 @@
     "capabilities": [
       {
         "resource": "elastos://llama/*",
+        "actions": ["read"],
+        "operations": ["status", "health", "list_models"]
+      },
+      {
+        "resource": "elastos://llama/*",
         "actions": ["execute"],
-        "operations": ["chat_completions", "status", "health", "list_models"]
+        "operations": ["chat_completions"]
       }
     ],
     "audit_events": ["llama.request", "llama.status"]

@@ -16,8 +16,13 @@
     "capabilities": [
       {
         "resource": "elastos://tunnel/*",
+        "actions": ["read"],
+        "operations": ["status", "ping"]
+      },
+      {
+        "resource": "elastos://tunnel/*",
         "actions": ["admin"],
-        "operations": ["start", "stop", "status", "ping"]
+        "operations": ["start", "stop"]
       }
     ],
     "audit_events": ["tunnel.start", "tunnel.stop", "tunnel.status"]

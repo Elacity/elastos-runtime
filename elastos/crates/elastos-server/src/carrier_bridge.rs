@@ -2227,14 +2227,6 @@ mod tests {
         // this test, and removing a fixed op without updating here also fails (so
         // the ledger cannot rot).
         let known_divergences: BTreeSet<(&str, &str)> = [
-            // -- still-blanket manifests (fixed in the chunk-2 manifest split):
-            ("ai-provider", "list_backends"),
-            ("ai-provider", "ping"),
-            ("llama-provider", "health"),
-            ("llama-provider", "list_models"),
-            ("llama-provider", "status"),
-            ("tunnel-provider", "ping"),
-            ("tunnel-provider", "status"),
             // -- object-provider `share` STAYS: grants access — security-touching,
             //    held for a dedicated review (Miller).
             ("object-provider", "share"),
@@ -2254,12 +2246,9 @@ mod tests {
             ("drm-provider", "open"),
             // -- class D: manifest OVER-declares (blanket action); the verb map is
             //    already correct. Fix = split the MANIFEST's capability blocks, not
-            //    the verb map (did/* declares blanket "execute" for read+write ops).
-            ("did-provider", "get_did"),
-            ("did-provider", "get_nickname"),
-            ("did-provider", "get_persona_did"),
-            ("did-provider", "resolve"),
-            ("did-provider", "set_nickname"),
+            //    the verb map. did/ai/llama/tunnel were drained in the chunk-2 split;
+            //    `encrypt-provider status` remains (its block also carries `seal`,
+            //    a HIGH-RISK op held in class E — split together when seal is reviewed).
             ("encrypt-provider", "status"),
             // -- class E: HIGH-RISK (keys / signing / spend / secret export / decrypt);
             //    Miller's verdict: KEEP Admin — do NOT loosen without a dedicated review.
