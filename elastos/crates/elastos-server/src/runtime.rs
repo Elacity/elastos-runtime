@@ -91,6 +91,7 @@ impl Runtime {
         capability_manager: Arc<elastos_runtime::capability::CapabilityManager>,
         pending_store: Arc<elastos_runtime::capability::pending::PendingRequestStore>,
         data_dir: std::path::PathBuf,
+        spend_policy: Option<crate::carrier_bridge::SpendPolicy>,
     ) {
         // Configure WASM bridge if we have a concrete WasmProvider reference
         if let Some(ref wasm) = self.wasm_provider {
@@ -105,8 +106,8 @@ impl Runtime {
                     capsule_id: pipes.capsule_id.clone(),
                     principal_id: pipes.principal_id.clone(),
                     data_dir: Some(data_dir.clone()),
-                    // WASM-carrier metering is a follow-up; the serve act path is metered first.
-                    spend_policy: None,
+                    // WASM capsule acts are metered under the same shared budget as serve/microVM.
+                    spend_policy: spend_policy.clone(),
                 };
                 crate::carrier_bridge::spawn_wasm_carrier_bridge(pipes, ctx);
             }));

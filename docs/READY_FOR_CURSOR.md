@@ -135,12 +135,17 @@ the next product arc, none of it started here:
   (reserve 1 → drain the overage saturating); absent ⇒ flat 1/act (back-compatible). Both the **serve**
   AND the **microVM-supervisor** (`vm-{name}`) act paths now share the same meter via `infra.spend_policy`.
   Proven by `carrier_act_is_refused_when_spend_budget_is_exhausted`, `did_not_act_refunds_the_spend_debit`,
-  and `variable_cost_charges_provider_reported_units`. **Cursor TODO / residual:** (a) the **WASM** carrier
-  site (`runtime.rs`) is still `spend_policy: None` (lower-traffic; wire from infra the same way); (b) the
-  microVM path can only be EXERCISED on KVM — confirm a `vm-{name}` capsule's acts debit the budget and the
-  `budget_exhausted` refusal surfaces in the guest; (c) the consent/affordance dispatch path
-  (`gateway_capsule_catalog`) is not yet metered; (d) per-capsule budgets are a flat default — a real
-  per-principal/quota policy + a top-up path is a product decision.
+  and `variable_cost_charges_provider_reported_units`. **ALL THREE carrier act paths now share the one
+  meter via `infra.spend_policy`:** serve, microVM-supervisor (`vm-{name}`), AND WASM (`runtime.rs` bridge
+  spawner) — the enforcement is the shared `carrier_invoke` dispatch, so the three only differ in wiring.
+  **Cursor TODO / residual:** (a) the microVM + WASM paths can only be EXERCISED on KVM / with a running
+  WASM capsule — confirm a capsule's acts debit the budget and the `budget_exhausted` refusal surfaces in
+  the guest (the logic itself is unit-tested via the shared dispatch); (b) the consent/affordance dispatch
+  path (`gateway_capsule_catalog::dispatch_consented_affordance`) is the LAST unmetered act path — until it
+  is metered, an agent could route a consented affordance to spend uncharged; (c) per-capsule budgets are a
+  flat default — a real per-principal/quota policy + a top-up path is a product decision; (d) `cost_units`
+  is provider-reported (trusted infra) — a malicious provider under-reporting to dodge the meter is out of
+  scope (providers run under operator authority), but worth naming.
 - **Free-text NL → intent** (adoption wedge #3) — the AI-backend "brain" track.
 - **The marketplace of shells** — multiple untrusted shells over the ESP protocol.
 

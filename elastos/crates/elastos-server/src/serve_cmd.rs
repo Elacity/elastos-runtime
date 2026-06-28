@@ -275,6 +275,7 @@ pub async fn run_serve(
                         infra.capability_manager.clone(),
                         infra.pending_store.clone(),
                         data_dir.clone(),
+                        infra.spend_policy.clone(),
                     )
                     .await;
 
@@ -304,6 +305,7 @@ pub async fn run_serve(
             infra.capability_manager.clone(),
             infra.pending_store.clone(),
             data_dir.clone(),
+            infra.spend_policy.clone(),
         )
         .await;
 

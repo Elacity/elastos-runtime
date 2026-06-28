@@ -168,9 +168,10 @@ halo a *computed* fact) → **W1** (egress-as-capability) → W3 → W4 → … 
   **Spend-meter WIRED `W3b-turn`** — `primitives::spend::SpendMeter` (atomic fail-closed `try_debit` +
   no-op `refund`, concurrency-proven) now charges the carrier `carrier_invoke` act path before dispatch
   (fail-closed `budget_exhausted` + token refund; spend refunded on NoProvider/DidNotAct; signed
-  SpendDebit/BudgetExhausted), enabled via `ELASTOS_DEFAULT_SPEND_BUDGET`. Now covers BOTH the serve AND
-  microVM-supervisor (`vm-{name}`) act paths (shared meter) WITH provider-reported variable `cost_units`.
-  Residual: WASM carrier site + affordance-dispatch metering + per-principal/top-up policy (see READY_FOR_CURSOR).
+  SpendDebit/BudgetExhausted), enabled via `ELASTOS_DEFAULT_SPEND_BUDGET`. Now covers ALL THREE carrier act
+  paths — serve, microVM-supervisor (`vm-{name}`), AND WASM (`runtime.rs`) — via the one shared meter, WITH
+  provider-reported variable `cost_units`. Residual: the consent/affordance dispatch path (last unmetered
+  act path) + per-principal/top-up policy (see READY_FOR_CURSOR).
 
 ## 💻 LOCAL / CURSOR (founder's device — VM env + operational)
 1. Activate AUD-1 (generate author key via `trust_cmd` → config `trusted_keys` → re-sign capsules).
