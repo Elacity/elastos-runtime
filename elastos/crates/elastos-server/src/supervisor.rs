@@ -19,8 +19,22 @@ use crate::ownership;
 use crate::setup::{CapsuleEntry, ComponentsManifest};
 use crate::vm_provider::VmCapsuleProvider;
 
+use elastos_common::CapsuleRole;
 use elastos_crosvm::{CrosvmConfig, NetworkConfig, RunningVm, VmConfig};
 use elastos_runtime::provider::ProviderRegistry;
+
+/// The capsule the runtime treats as the active shell when no active-shell
+/// pointer has been set. Preserves historical behaviour (the bundled `shell`).
+const DEFAULT_ACTIVE_SHELL: &str = "shell";
+
+/// Whether a launching capsule is eligible for the privileged shell session
+/// token (W3). De-hardcodes the old `name == "shell"` magic string: a capsule
+/// gets the shell token ONLY if it both holds the `Shell` role AND is the
+/// user-selected active shell. Fail-closed — a non-`Shell` capsule can never
+/// receive the shell token even if the active-shell pointer names it.
+fn shell_token_eligible(name: &str, role: &CapsuleRole, active_shell: &str) -> bool {
+    matches!(role, CapsuleRole::Shell) && name == active_shell
+}
 use elastos_runtime::session::{SessionRegistry, SessionType};
 use elastos_runtime::signature::{hash_content, SignatureVerifier};
 
@@ -192,8 +206,12 @@ pub struct Supervisor {
     next_cid: Arc<RwLock<u32>>,
     /// crosvm configuration (paths to binary, kernel, etc.)
     crosvm_config: CrosvmConfig,
-    /// Shell session token — only injected into the shell capsule VM
+    /// Shell session token — only injected into the active shell capsule VM
     shell_token: Option<String>,
+    /// Name of the capsule currently selected as the active shell (W3). The
+    /// privileged shell token is issued only to this capsule, and only if it
+    /// holds the `Shell` role. Defaults to [`DEFAULT_ACTIVE_SHELL`].
+    active_shell: String,
     /// API address injected into VM boot args (set by forward_to_shell)
     api_addr: Option<String>,
     /// Session registry for minting per-capsule tokens
@@ -422,6 +440,7 @@ impl Supervisor {
             next_cid: Arc::new(RwLock::new(Self::initial_cid_seed())),
             crosvm_config,
             shell_token: None,
+            active_shell: DEFAULT_ACTIVE_SHELL.to_string(),
             api_addr: None,
             session_registry: None,
             provider_registry: None,
@@ -444,6 +463,19 @@ impl Supervisor {
         self.shell_token = Some(shell_token);
         self.api_addr = Some(api_addr);
         self.session_registry = Some(session_registry);
+    }
+
+    /// Select which capsule is the active shell (W3). The privileged shell token
+    /// is issued only to this capsule, and only if it holds the `Shell` role
+    /// (see [`shell_token_eligible`]). Lets a user run a shell other than the
+    /// bundled default without the runtime hardcoding a name.
+    pub fn set_active_shell(&mut self, active_shell: impl Into<String>) {
+        self.active_shell = active_shell.into();
+    }
+
+    /// The capsule currently selected as the active shell.
+    pub fn active_shell(&self) -> &str {
+        &self.active_shell
     }
 
     /// Attach runtime provider registry so launched VM providers can be routed.
@@ -1065,7 +1097,7 @@ impl Supervisor {
         // Inject session credentials — shell gets its privileged token,
         // all other capsules get a fresh Capsule-type token.
         if let Some(api_addr) = &self.api_addr {
-            let token = if name == "shell" {
+            let token = if shell_token_eligible(name, &manifest.role, &self.active_shell) {
                 self.shell_token.clone()
             } else {
                 // Mint a fresh Capsule token via the session registry
@@ -1571,6 +1603,25 @@ mod tests {
     };
     use sha2::Digest;
     use std::sync::Arc;
+
+    #[test]
+    fn shell_token_eligible_is_role_based_and_fail_closed() {
+        // The bundled shell (Shell role, matches the active pointer) stays eligible
+        // — behaviour-neutral default.
+        assert!(shell_token_eligible(
+            "shell",
+            &CapsuleRole::Shell,
+            DEFAULT_ACTIVE_SHELL
+        ));
+        // The de-hardcoded point: a DIFFERENT Shell-role capsule selected as the
+        // active shell is eligible — no longer tied to the magic name "shell".
+        assert!(shell_token_eligible("flint", &CapsuleRole::Shell, "flint"));
+        // Fail-closed: a non-Shell capsule can NEVER get the shell token, even if
+        // the active-shell pointer names it.
+        assert!(!shell_token_eligible("flint", &CapsuleRole::App, "flint"));
+        // A Shell-role capsule that is NOT the active shell is not eligible.
+        assert!(!shell_token_eligible("flint", &CapsuleRole::Shell, "shell"));
+    }
 
     #[test]
     fn test_supervisor_request_serialization() {
