@@ -15,7 +15,7 @@ agent-containment audit (EU AI Act Art 12/14).
 **Status at a glance (2026-06-27):** substrate + intent compiler DONE; security audited + hardened
 ~9/10 (AUD-1..5); Astrid research DONE; adoption wedges 1-2 (MCP-serve + dataflow) DONE; the PRODUCT +
 STRATEGY resolved (KEEP, the PDR, the shell vision, the ESP protocol, the narrative); now executing the
-**ESP build wedges W0-W7** toward the shell — **W2 ✅ · W0 ✅ · W1 model ✅ · W3 de-hardcoded ✅ · W4 ✅ · W5a ✅** (the two-channel projection client; never-seen moment proven in tests). Next is **W6** (refraction toggle + shell-picker) and **W5b** the visual Svelte shell (browser/local lane). Tails: W1b firewall, W3b rename.
+**ESP build wedges W0-W7** toward the shell — **W2 ✅ · W0 ✅ · W1 model ✅ · W3 de-hardcoded ✅ · W4 ✅ · W5a ✅** (the two-channel projection client; never-seen moment proven in tests). W6 ✅ (shell-picker + refraction toggle). Next is **W7** (export receipt as EU AI Act audit artifact — the flywheel). Tails: W5b visual shell, W1b firewall, W3b rename.
 
 ---
 
@@ -82,7 +82,7 @@ The PDR/ESP plan: build the honest substrate first, then the shell as a read-onl
 | **W3** | De-hardcode "the shell" → "a shell" + rename `consent-broker` | **IN PROGRESS** — role-based active-shell token issuance landed (`shell_token_eligible` + `active_shell` pointer); **W3b** = the `consent-broker` rename (wide mechanical) |
 | **W4** | Write ESP v0 (protocol doc + TS types) | **✅ DONE** — `docs/ESP_V0.md` + `elastos/esp/esp_v0.ts` (tsc strict), extracted from shipped emitters; alignment-pinned against drift |
 | **W5** | The v1 Svelte projection shell + the hero dDRM act | **W5a ✅** — headless ESP-v0 two-channel projection client (`elastos/esp/two_channel.ts`, 11 node:test, tsc strict); the never-seen "verified can be more dangerous than unsigned" proven from real fact shapes. **W5b** = the visual Svelte shell on the browser/local lane |
-| **W6** | The refraction toggle + shell-picker | not started |
+| **W6** | The refraction toggle + shell-picker | **✅ DONE** — `shell_picker.ts` (fail-closed: only role-shell+launchable selectable) + `refraction.ts` (focus-swap preserves projected state); 21 node:test, tsc strict; pure projection, no Rust change |
 | **W7** | Export the receipt chain as the EU AI Act audit artifact (the flywheel) | not started |
 
 W0/W1 make the halo *truthful*; W2 makes consent *real*; W3/W4 open the *modular* shell; W5/W6 build
