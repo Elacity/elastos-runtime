@@ -27,6 +27,8 @@ pub(crate) struct ServerInfrastructure {
     pub(crate) host_helpers: Vec<api::server::HostHelperProcess>,
 }
 
+/// Opt-in durable, verified-on-open audit log (the EU AI Act custody mode). Unset → in-memory.
+const AUDIT_LOG_PATH_ENV: &str = "ELASTOS_AUDIT_LOG_PATH";
 const CONTENT_REPAIR_SCHEDULER_ENV: &str = "ELASTOS_CONTENT_REPAIR_SCHEDULER";
 const CONTENT_REPAIR_SCHEDULER_INTERVAL_ENV: &str = "ELASTOS_CONTENT_REPAIR_INTERVAL_SECS";
 const CONTENT_REPAIR_SCHEDULER_LIMIT_ENV: &str = "ELASTOS_CONTENT_REPAIR_LIMIT";
@@ -47,13 +49,50 @@ pub(crate) async fn setup_control_plane_infrastructure() -> anyhow::Result<Serve
     setup_server_infrastructure_impl(false).await
 }
 
+/// Build the server's audit log.
+///
+/// DEFAULT (unset env): the in-memory fail-loud chain — no per-emit `fsync` on the hot path. Making
+/// the default file-backed would force an fsync on every capability validate; that perf change waits
+/// on the audit group-commit rewrite (KNOWN_GAPS G8, measure-first).
+///
+/// DURABLE CUSTODY MODE (`ELASTOS_AUDIT_LOG_PATH` set): the log is file-backed AND **verified on
+/// open** — if the existing on-disk chain fails the hash + signature walk, startup ABORTS rather
+/// than appending a fresh, valid-looking tail onto a tampered history. This is the EU AI Act
+/// durable audit trail an operator opts into. The path may be absolute or relative to `data_dir`.
+fn build_audit_log(data_dir: &Path) -> anyhow::Result<Arc<primitives::audit::AuditLog>> {
+    match std::env::var_os(AUDIT_LOG_PATH_ENV) {
+        Some(raw) if !raw.is_empty() => {
+            let configured = PathBuf::from(raw);
+            let path = if configured.is_absolute() {
+                configured
+            } else {
+                data_dir.join(configured)
+            };
+            let log = primitives::audit::AuditLog::with_file_verified(&path).map_err(|e| {
+                anyhow::anyhow!(
+                    "durable audit log at {} failed to open or verify ({e}); set {} only to a \
+                     trusted, untampered custody log",
+                    path.display(),
+                    AUDIT_LOG_PATH_ENV
+                )
+            })?;
+            tracing::info!(
+                "Durable audit log enabled (verified-on-open): {}",
+                path.display()
+            );
+            Ok(Arc::new(log))
+        }
+        _ => Ok(Arc::new(primitives::audit::AuditLog::new())),
+    }
+}
+
 async fn setup_server_infrastructure_impl(
     spawn_host_providers: bool,
 ) -> anyhow::Result<ServerInfrastructure> {
     let data_dir = default_data_dir();
     let _ = ownership::repair_path_recursive(&data_dir);
 
-    let audit_log = Arc::new(primitives::audit::AuditLog::new());
+    let audit_log = build_audit_log(&data_dir)?;
     let session_registry = Arc::new(session::SessionRegistry::new(audit_log.clone()));
     session_registry
         .set_default_owner(local_session_owner(&data_dir)?)

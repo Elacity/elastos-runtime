@@ -84,10 +84,18 @@ but they are NOT the whole list. The authoritative, complete sources of truth ar
   then only operator sha256 pinning protects launch. (Local/Cursor — founder config.)
 - **Carrier-service author gate** — AUD-1 residual (host-binary launch path needs a
   distinct entrypoint-hash design to avoid false-denies).
-- **AUD-4 plane-(a)** — `verify_chain` on the file-backed audit log at startup
-  (needs the `AuditLog::with_file` switch + a persisted head-anchor). Wave 2.
-- **G8 / G8b** — route capability deny/grant/use/revoke through the ONE signed+durable
-  plane + verify-on-read (the inspector's "attested" already verifies; the rest is wiring).
+- **AUD-4 plane-(a) / G8 verify-on-read** — PARTLY LANDED in-cloud: `AuditLog::with_file_verified`
+  now opens a file-backed log AND walks the existing hash+signature chain, failing closed (server
+  startup aborts) on any tamper, so you can't append onto a laundered history. `server_infra` opts
+  in via the `ELASTOS_AUDIT_LOG_PATH` env (durable EU AI Act custody mode); default stays memory.
+  **Cursor TODO:** (a) set `ELASTOS_AUDIT_LOG_PATH=<data_dir>/audit/audit.log`, restart, confirm the
+  "Durable audit log enabled (verified-on-open)" log line, then hand-tamper a record and confirm the
+  next start REFUSES; (b) the persisted **head-anchor** for *tail-truncation* detection is still
+  open (verify-on-open can't see records removed from the end); (c) no LIVE read path (inspector /
+  W7 export) re-runs `verify_chain` mid-session yet — startup-only.
+- **G8 / G8b (capability plane)** — deny/approve/revoke (request- AND token-level) + affordance-use
+  are now all fail-closed-signed. Remaining: ordinary grant/use stay best-effort by design (the
+  per-validate hot path; needs the group-commit rewrite below before adding an fsync).
 - **G1b / G2b serve-wiring** — the live `serve` path attaches only `AuthAuditSource`
   / registers capsules without verifying; thread the grant source + `verified_signer`
   (blocked on confirming the content-hash domain for the MicroVM artifact).

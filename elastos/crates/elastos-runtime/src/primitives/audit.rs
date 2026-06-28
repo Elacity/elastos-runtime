@@ -448,6 +448,31 @@ impl AuditLog {
         })
     }
 
+    /// Open a file-backed log AND verify the existing on-disk chain before returning, refusing to
+    /// resume on a broken/tampered log. This is the fail-closed **verify-on-read** entry point: an
+    /// operator who enables the durable audit trail (e.g. the EU AI Act custody record) must never
+    /// append new records onto a chain whose existing records fail the hash + signature walk — a
+    /// silent append would launder a tampered history under a fresh, valid-looking tail. A clean or
+    /// empty log resumes normally (`Ok`).
+    ///
+    /// Verifies under the log's OWN persisted signing key (the same key future appends use), so a
+    /// missing/swapped key file is caught as a signature failure.
+    ///
+    /// NOTE (truncation): `verify_chain` detects edit / reorder / mid-drop of records that ARE on
+    /// disk, but a *tail* truncation removes records the walk never sees — detecting that needs an
+    /// externally persisted head-anchor (still open; tracked in KNOWN_GAPS G8 verify-on-read).
+    pub fn with_file_verified(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let log = Self::with_file(path)?;
+        let vk = log.signer.as_ref().map(|s| s.verifying_key());
+        log.verify_chain(vk.as_ref()).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("audit log failed integrity verification on open: {e}"),
+            )
+        })?;
+        Ok(log)
+    }
+
     /// Enable/disable echoing to stdout
     pub fn set_echo_stdout(&mut self, echo: bool) {
         self.echo_stdout = echo;
@@ -1406,6 +1431,57 @@ mod tests {
         assert_eq!(
             last.seq, 3,
             "reopened log appended at seq 3, never truncated"
+        );
+    }
+
+    #[test]
+    fn with_file_verified_resumes_clean_log_and_rejects_tamper() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+
+        // Write a few signed records and fully flush by dropping the writer.
+        {
+            let log = AuditLog::with_file(&path).unwrap();
+            log.runtime_start("1.0.0");
+            log.content_open(
+                "s",
+                "person:local:alice",
+                "elastos://c/1",
+                "view",
+                "opened",
+                "src",
+                None,
+            )
+            .unwrap();
+            log.runtime_stop();
+        }
+
+        // Clean log: verify-on-open resumes without error and continues the chain (seq 4).
+        let reopened = AuditLog::with_file_verified(&path).unwrap();
+        reopened.runtime_start("1.0.1");
+        let vk = read_verifying_key(&reopened);
+        assert_eq!(
+            reopened.verify_chain(Some(&vk)).unwrap(),
+            4,
+            "a clean log resumes and appends"
+        );
+        drop(reopened);
+
+        // Tamper a record on disk, then re-open: verify-on-open must FAIL CLOSED rather than append
+        // a fresh tail onto a laundered history.
+        let content = std::fs::read_to_string(&path).unwrap();
+        let tampered = content.replacen("person:local:alice", "person:local:mallory", 1);
+        assert_ne!(content, tampered, "the edit must have applied");
+        std::fs::write(&path, tampered).unwrap();
+
+        let err = match AuditLog::with_file_verified(&path) {
+            Ok(_) => panic!("a tampered log must refuse to open"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("integrity verification"),
+            "a tampered log must refuse to open: {err}"
         );
     }
 
