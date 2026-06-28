@@ -2905,7 +2905,10 @@ impl ContentProvider {
                     .cloned()
                     .unwrap_or_else(|| Value::Array(Vec::new()));
                 if !files.is_array() {
-                    return Ok(provider_error("invalid_request", "files must be an array"));
+                    // Pre-effect request-shape rejection (before the IPFS add).
+                    return Err(ProviderError::DidNotAct(
+                        "content publish: files must be an array".into(),
+                    ));
                 }
                 let files = with_directory_object_manifest(
                     files,
@@ -2948,9 +2951,10 @@ impl ContentProvider {
                 })
             }
             Some(_) | None => {
-                return Ok(provider_error(
-                    "unsupported_content_kind",
-                    "content publish supports kind=directory or kind=file",
+                // Pre-effect request-shape rejection: an unsupported/missing kind
+                // rejects identically on replay → DidNotAct (refundable).
+                return Err(ProviderError::DidNotAct(
+                    "content publish supports kind=directory or kind=file".into(),
                 ));
             }
         };
@@ -9268,6 +9272,24 @@ mod tests {
         assert!(
             matches!(publish_no_data, Err(ProviderError::DidNotAct(_))),
             "publish file missing data → DidNotAct; got {publish_no_data:?}"
+        );
+
+        // publish with an unsupported kind → pre-effect, refundable.
+        let bad_kind = content
+            .send_raw(&json!({ "op": "publish", "kind": "bogus" }))
+            .await;
+        assert!(
+            matches!(bad_kind, Err(ProviderError::DidNotAct(_))),
+            "publish unsupported kind → DidNotAct; got {bad_kind:?}"
+        );
+
+        // publish a directory with a non-array `files` → pre-effect, refundable.
+        let bad_files = content
+            .send_raw(&json!({ "op": "publish", "kind": "directory", "files": "not-an-array" }))
+            .await;
+        assert!(
+            matches!(bad_files, Err(ProviderError::DidNotAct(_))),
+            "publish directory non-array files → DidNotAct; got {bad_files:?}"
         );
     }
 
