@@ -368,9 +368,19 @@ impl RequestHandler {
             }
         };
 
-        self.capability_manager
+        if self
+            .capability_manager
             .revoke(token_bytes, "Revoked by shell")
-            .await;
+            .await
+            .is_err()
+        {
+            // Fail-closed: the token is NOT revoked if the durable signed record
+            // could not be written (the caller must retry / alert).
+            return RuntimeResponse::error(
+                "revoke_not_durable",
+                "Revoke aborted: the durable signed audit record could not be written",
+            );
+        }
 
         RuntimeResponse::ok()
     }
@@ -941,9 +951,17 @@ impl RequestHandler {
             }
         };
 
-        self.capability_manager
+        if self
+            .capability_manager
             .revoke(parsed, "Revoked via inspector")
-            .await;
+            .await
+            .is_err()
+        {
+            return RuntimeResponse::error(
+                "revoke_not_durable",
+                "Revoke aborted: the durable signed audit record could not be written",
+            );
+        }
 
         // Audit who drove the revoke (the revoke itself is also audited by the
         // capability manager).

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use super::receipt::AffordanceGrantReceiptV1;
 use super::store::CapabilityStore;
 use super::token::{Action, CapabilityToken, ResourceId, TokenConstraints, TokenId};
-use crate::primitives::audit::{AuditEvent, AuditLog};
+use crate::primitives::audit::{AuditError, AuditEvent, AuditLog};
 use crate::primitives::metrics::MetricsManager;
 use crate::primitives::time::SecureTimestamp;
 
@@ -557,10 +557,23 @@ impl CapabilityManager {
         Ok(token)
     }
 
-    /// Revoke a specific token
-    pub async fn revoke(&self, token_id: TokenId, reason: &str) {
+    /// Revoke a specific token, FAIL-CLOSED with durable signed custody.
+    ///
+    /// Emits the signed durable `CapabilityRevoke` record BEFORE killing the token
+    /// (emit-before-mutate, mirroring AUD-3's `revoke_request`/`deny_request`): if
+    /// the audit write fails the revoke ABORTS (the token stays valid) and the
+    /// error propagates, so a revoke can never silently complete without a durable
+    /// signed record — symmetric with the fail-closed deny. (Accepted AUD-3
+    /// tradeoff: a revoke that cannot be recorded does not happen; a degraded audit
+    /// surfaces loudly rather than losing custody.)
+    pub async fn revoke(&self, token_id: TokenId, reason: &str) -> Result<(), AuditError> {
+        self.audit_log.emit(AuditEvent::CapabilityRevoke {
+            timestamp: SecureTimestamp::now(),
+            token_id: token_id.to_string(),
+            reason: reason.to_string(),
+        })?;
         self.store.revoke_token(token_id).await;
-        self.audit_log.capability_revoke(&token_id, reason);
+        Ok(())
     }
 
     /// Revoke all tokens by advancing the epoch
@@ -765,7 +778,7 @@ mod tests {
         );
 
         // Revoke this specific token
-        manager.revoke(token.id, "test revocation").await;
+        manager.revoke(token.id, "test revocation").await.unwrap();
 
         // Token should now be invalid
         let result = manager
@@ -779,6 +792,51 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ValidationError::TokenRevoked)));
+    }
+
+    #[tokio::test]
+    async fn revoke_fails_closed_when_audit_write_fails() {
+        // G8b: a read-only audit makes the durable signed write fail — the revoke
+        // must ABORT (emit-before-mutate) and the token must stay VALID, never
+        // silently killed without a durable record (mirrors AUD-3 revoke_request).
+        let path = std::env::temp_dir().join(format!("mgr-revoke-ro-{}.log", std::process::id()));
+        std::fs::File::create(&path).unwrap();
+        let ro = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+        let manager = CapabilityManager::new(
+            Arc::new(CapabilityStore::new()),
+            Arc::new(AuditLog::with_file_handle(ro)),
+            Arc::new(MetricsManager::new()),
+        );
+
+        let token = manager.grant(
+            "test-capsule",
+            ResourceId::new("localhost://Users/self/Documents/test.txt"),
+            Action::Read,
+            TokenConstraints::default(),
+            None,
+        );
+
+        let res = manager.revoke(token.id, "compromised").await;
+        assert!(
+            res.is_err(),
+            "revoke must fail closed when its durable audit write fails"
+        );
+
+        // The token must STILL validate — the revoke aborted before mutating.
+        let still_valid = manager
+            .validate(
+                &token,
+                "test-capsule",
+                Action::Read,
+                &ResourceId::new("localhost://Users/self/Documents/test.txt"),
+                None,
+            )
+            .await;
+        assert!(
+            still_valid.is_ok(),
+            "token stays valid when its revocation audit write fails (got {still_valid:?})"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
@@ -1027,7 +1085,7 @@ mod tests {
         );
 
         // Revoke the parent
-        manager.revoke(parent.id, "compromised").await;
+        manager.revoke(parent.id, "compromised").await.unwrap();
 
         // Delegation should fail because parent is revoked
         let result = manager
@@ -1173,7 +1231,7 @@ mod tests {
         // Revoke the token mid-flight
         let mgr = Arc::clone(&manager);
         set.spawn(async move {
-            mgr.revoke(token_id, "concurrent test").await;
+            mgr.revoke(token_id, "concurrent test").await.unwrap();
             Ok(()) // Return Ok so we can join uniformly
         });
 
@@ -1265,7 +1323,7 @@ mod tests {
         for _ in 0..50 {
             let mgr = Arc::clone(&manager);
             set.spawn(async move {
-                mgr.revoke(token_id, "concurrent revoke").await;
+                mgr.revoke(token_id, "concurrent revoke").await.unwrap();
             });
         }
 

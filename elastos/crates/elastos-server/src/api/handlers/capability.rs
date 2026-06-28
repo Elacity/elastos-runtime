@@ -809,11 +809,20 @@ pub async fn revoke_capability(
     // Check if it was granted
     match &request.status {
         elastos_runtime::capability::RequestStatus::Granted { token, .. } => {
-            // Revoke the token
+            // Revoke the token, FAIL-CLOSED on durable custody (G8b): the manager
+            // emits the signed revoke record BEFORE killing the token, so on an
+            // audit-write failure the token stays valid and we surface it rather
+            // than reporting a revoke with no durable record.
             state
                 .capability_manager
                 .revoke(*token.id(), "Revoked by user via API")
-                .await;
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("revoke could not be durably attested: {e}"),
+                    )
+                })?;
 
             // Mark the request as revoked in the pending store, fail-closed on the
             // audit record (AUD-3): the token is already revoked above, but if the
@@ -1445,7 +1454,8 @@ mod tests {
         state
             .capability_manager
             .revoke(revoked_id, "journey: revoked before redemption")
-            .await;
+            .await
+            .unwrap();
         assert!(
             validate_and_consume(
                 State(state.clone()),
