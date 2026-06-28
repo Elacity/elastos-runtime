@@ -2203,6 +2203,170 @@ mod tests {
         }
     }
 
+    /// G3b: UNIVERSAL preview==enforce — for EVERY shipped provider manifest, the
+    /// previewed action set (`plan_provider_operation`, manifest authority) must
+    /// equal the carrier-enforced action (`required_action_for`, verb map) for
+    /// every declared op, OR the op is a KNOWN, tracked divergence. The two tables
+    /// stay DISJOINT (no shared function), so drift fails loudly. A NEW divergence
+    /// or a silently-fixed known one fails this test.
+    #[test]
+    fn all_provider_manifests_preview_actions_match_verb_map_or_tracked() {
+        use crate::provider_resource::required_action_for;
+        use elastos_common::CapsuleManifest;
+        use elastos_runtime::invoke::plan_provider_operation;
+        use std::collections::BTreeSet;
+
+        // KNOWN preview≠enforce ledger: ops where the verb-map-enforced action is
+        // NOT in the manifest's declared set for that op. ALL are fail-CLOSED today
+        // (previewed-but-denied — the user is shown a weaker action than enforcement
+        // demands), so none is an escalation. A 4-agent classification swarm
+        // produced the PROVISIONAL triage below — the class comments are guidance
+        // (confirm per-op at fix time); the (provider, op) PAIRS are authoritative
+        // (the test enforces only those). Fix is per-op follow-up (G3b in
+        // docs/KNOWN_GAPS.md). This set must SHRINK, never grow — a NEW drift fails
+        // this test, and removing a fixed op without updating here also fails (so
+        // the ledger cannot rot).
+        let known_divergences: BTreeSet<(&str, &str)> = [
+            // -- class A: verb-map incomplete; op is a non-sensitive READ the
+            //    manifest already grants. Fix = add the verb-map entry (safe loosen).
+            ("ai-provider", "list_backends"),
+            ("ai-provider", "ping"),
+            ("llama-provider", "health"),
+            ("llama-provider", "list_models"),
+            ("llama-provider", "status"),
+            ("tunnel-provider", "ping"),
+            ("tunnel-provider", "status"),
+            ("operator-drive-adapter", "metadata_index"),
+            ("operator-drive-adapter", "read_bytes"),
+            ("object-provider", "events"),
+            ("content-market", "reconstruct_listing"),
+            ("content-block-graph-provider", "export_graph"),
+            // -- class B: WRITE/DELETE ops (mutate); fix = verb-map entry, but the
+            //    action loosens to Write/Delete — review the resource scope first.
+            ("operator-drive-adapter", "write_bytes"),
+            ("object-provider", "restore"),
+            ("object-provider", "download"),
+            ("object-provider", "empty_trash"), // permanent delete
+            ("object-provider", "share"),       // grants access — security-touching
+            ("content-block-graph-provider", "import_graph"),
+            // -- class C: EXECUTE / egress / actuator; sensitive, Execute-or-Admin.
+            ("net-provider", "connect"),
+            ("net-provider", "http"),
+            ("net-provider", "stream"),
+            ("exit-provider", "open_stream"),
+            ("exit-provider", "close_stream"),
+            ("exit-provider", "http_fetch"),
+            ("exit-provider", "quote"),
+            ("browser-engine-adapter", "launch"),
+            ("browser-engine-adapter", "input"),
+            ("browser-engine-adapter", "close_page"),
+            ("browser-engine-adapter", "attach_stream"),
+            ("browser-engine-adapter", "webrtc_signal"),
+            ("drm-provider", "open"),
+            ("publish-provider", "prepare_publish"),
+            // -- class D: manifest OVER-declares (blanket action); the verb map is
+            //    already correct. Fix = split the MANIFEST's capability blocks, not
+            //    the verb map (did/* declares blanket "execute" for read+write ops).
+            ("did-provider", "get_did"),
+            ("did-provider", "get_nickname"),
+            ("did-provider", "get_persona_did"),
+            ("did-provider", "resolve"),
+            ("did-provider", "set_nickname"),
+            ("encrypt-provider", "status"),
+            // -- class E: HIGH-RISK (keys / signing / spend / secret export / decrypt);
+            //    Miller's verdict: KEEP Admin — do NOT loosen without a dedicated review.
+            ("wallet-provider", "approve_approval"),
+            ("wallet-provider", "complete_approval"),
+            ("wallet-provider", "export_managed_secret"),
+            ("wallet-provider", "reject_approval"),
+            ("wallet-provider", "sign_approved"),
+            ("key-provider", "release"),
+            ("decrypt-provider", "open_session"),
+            ("decrypt-provider", "render"),
+            ("encrypt-provider", "seal"),
+            ("chain-provider", "broadcast_transaction"),
+            ("chain-provider", "prepare_transaction"),
+        ]
+        .into_iter()
+        .collect();
+
+        let capsules_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../capsules");
+        let mut parsed = 0usize;
+        let mut found: BTreeSet<(String, String)> = BTreeSet::new();
+
+        for entry in std::fs::read_dir(capsules_dir).expect("capsules dir exists") {
+            let dir = entry.expect("dir entry").path();
+            let manifest_path = dir.join("capsule.json");
+            if !manifest_path.exists() {
+                continue;
+            }
+            let provider = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            let raw = std::fs::read_to_string(&manifest_path).expect("read manifest");
+            // Skip non-provider or non-conforming manifests (no authority / parse).
+            let manifest: CapsuleManifest = match serde_json::from_str(&raw) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let Some(authority) = manifest.authority else {
+                continue;
+            };
+            parsed += 1;
+
+            let mut ops: Vec<String> = authority
+                .capabilities
+                .iter()
+                .flat_map(|cap| cap.operations.iter().cloned())
+                .collect();
+            ops.sort();
+            ops.dedup();
+
+            for op in &ops {
+                let previewed: Vec<String> = match plan_provider_operation(&authority, op) {
+                    Ok(plan) => {
+                        let mut a: Vec<String> =
+                            plan.actions.iter().map(|x| x.to_string()).collect();
+                        a.sort();
+                        a
+                    }
+                    Err(_) => {
+                        found.insert((provider.clone(), op.clone()));
+                        continue;
+                    }
+                };
+                // The honesty invariant: the action the verb map ENFORCES for the
+                // op must be among the actions the manifest DECLARES for it. A
+                // multi-action capability block legitimately previews a union, so
+                // membership (not set-equality) is the universal check; a true
+                // drift is when enforcement requires an action the manifest never
+                // granted for that op (e.g. a verb-map Admin fallthrough).
+                let enforced = required_action_for(op).to_string();
+                if !previewed.contains(&enforced) {
+                    found.insert((provider.clone(), op.clone()));
+                }
+            }
+        }
+
+        assert!(
+            parsed >= 10,
+            "expected to cover many provider manifests, only parsed {parsed}"
+        );
+
+        let found_refs: BTreeSet<(&str, &str)> = found
+            .iter()
+            .map(|(p, o)| (p.as_str(), o.as_str()))
+            .collect();
+        let new_drift: Vec<_> = found_refs.difference(&known_divergences).collect();
+        let healed: Vec<_> = known_divergences.difference(&found_refs).collect();
+        assert!(
+            new_drift.is_empty() && healed.is_empty(),
+            "G3b preview!=enforce ledger out of date.\n  parsed manifests: {parsed}\n  NEW drift (add to known or fix the verb map): {new_drift:?}\n  HEALED (remove from known): {healed:?}\n  full found set: {found:?}"
+        );
+    }
+
     #[test]
     fn carrier_invoke_dispatch_uses_uri_resource_contract() {
         let dispatch = carrier_invoke_dispatch(
