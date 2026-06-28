@@ -300,6 +300,16 @@ impl CapabilityManager {
         token
     }
 
+    /// Refund one consumed use of a token (saturating). The caller must only
+    /// invoke this when the consumed use was provably a NO-OP — e.g. the act it
+    /// authorized never reached a provider (a routing failure), so no side effect
+    /// occurred. Returns the new use count. NEVER call this after a provider may
+    /// have acted: refunding a partially-applied effect would enable a second
+    /// execution (BUG-4 — see the carrier dispatch path for the safe slice).
+    pub async fn refund_use(&self, token_id: &TokenId) -> u32 {
+        self.store.refund_token_use(token_id).await
+    }
+
     /// Validate a token for use
     ///
     /// This performs all 12 validation checks as specified in PHASE3.md.

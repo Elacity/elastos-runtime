@@ -854,7 +854,15 @@ pub(crate) async fn handle_request(
 
             // Validate capability token before dispatching to provider.
             // The guest SDK sends the token it received from request_capability.
-            if !token_b64.is_empty() {
+            // The id of the (single-use-)consumed token is captured so that a
+            // PROVABLY no-op failure — the provider was never invoked (routing
+            // failure) — can refund the use instead of burning the grant (BUG-4).
+            // Reaching the provider dispatch below implies a token was validated
+            // and its single use consumed — so this is bound exactly once (no dead
+            // `None` init); the only fall-through is the validated path.
+            let consumed_token_id: elastos_runtime::capability::token::TokenId = if !token_b64
+                .is_empty()
+            {
                 use elastos_runtime::capability::token::{CapabilityToken, ResourceId};
                 match CapabilityToken::from_base64(token_b64) {
                     Ok(token) => {
@@ -878,6 +886,8 @@ pub(crate) async fn handle_request(
                                 }
                             }));
                         }
+                        // Validation passed — the single use is now consumed.
+                        *token.id()
                     }
                     Err(_) => {
                         return Ok(serde_json::json!({
@@ -900,7 +910,7 @@ pub(crate) async fn handle_request(
                         "message": "carrier_invoke requires a capability token",
                     }
                 }));
-            }
+            };
 
             if let Some(response) = protected_principal_root_carrier_response(
                 bridge_ctx,
@@ -922,7 +932,35 @@ pub(crate) async fn handle_request(
                     "type": "carrier_result",
                     "result": result,
                 }),
+                Err(elastos_runtime::provider::ProviderError::NoProvider(scheme)) => {
+                    // BUG-4 safe slice: the registry matched NO provider, so NOTHING
+                    // ran — the consumed single use was provably a no-op. Refund it
+                    // so the holder is not charged for a routing failure. This is the
+                    // ONLY error class where a refund cannot enable a double-effect:
+                    // every provider op is non-atomic on its own Err path (write-then-
+                    // fail is possible), so an op failure keeps the use consumed
+                    // (fail-closed) — see docs/KNOWN_GAPS.md BUG-4.
+                    let remaining = bridge_ctx
+                        .capability_manager
+                        .refund_use(&consumed_token_id)
+                        .await;
+                    tracing::warn!(
+                        "bridge: no provider for scheme '{}'; refunded the unused \
+                         single-use grant (use count now {})",
+                        scheme,
+                        remaining,
+                    );
+                    serde_json::json!({
+                        "type": "error",
+                        "code": "provider_not_found",
+                        "message": "No provider for the requested scheme",
+                    })
+                }
                 Err(e) => {
+                    // The provider RAN and failed; it may have partially acted, so the
+                    // single use stays consumed (refunding could enable a re-run of a
+                    // partially-applied effect — BUG-4 residual, deferred until a
+                    // provider "did-not-act" signal exists).
                     tracing::warn!(
                         "Bridge carrier_invoke failed for {}/{}: {}",
                         dispatch.scheme,
@@ -1418,6 +1456,71 @@ mod tests {
         assert!(is_runtime_control_request("provider_call"));
         assert!(!is_runtime_control_request("carrier_invoke"));
         assert!(!is_runtime_control_request("request_capability"));
+    }
+
+    /// BUG-4 safe slice: when the registry matches NO provider (routing failure),
+    /// nothing ran, so the consumed single-use grant is refunded and stays usable.
+    /// Proven through the public `handle_request` path: the SAME single-use token
+    /// reaches the provider lookup TWICE. Under the old burn-on-failure code the
+    /// second call would be `capability_denied` (use limit exceeded).
+    #[tokio::test]
+    async fn carrier_invoke_refunds_single_use_grant_on_missing_provider() {
+        use elastos_runtime::capability::token::TokenConstraints;
+
+        let ctx = bridge_context(); // empty ProviderRegistry → every scheme is NoProvider
+        let uri = "elastos://rights/has_access_by_content_id";
+        let operation = "has_access_by_content_id";
+        let probe = serde_json::json!({
+            "type": "carrier_invoke",
+            "uri": uri,
+            "operation": operation,
+            "body": {}
+        });
+        // Compute the exact resource + action the bridge will enforce, so the
+        // token matches and validation actually consumes the single use.
+        let dispatch = carrier_invoke_dispatch(&probe, None).expect("dispatch parses");
+        let required = required_action_for(&dispatch.operation);
+        let token = ctx.capability_manager.grant(
+            &ctx.capsule_id,
+            ResourceId::new(&dispatch.resource),
+            required,
+            TokenConstraints::new(0, false, None, Some(1)), // single-use
+            None,
+        );
+        let token_b64 = encode_bridge_capability_token(&token);
+
+        let call = |tok: String| {
+            serde_json::json!({
+                "id": 1,
+                "request": {
+                    "type": "carrier_invoke",
+                    "uri": uri,
+                    "operation": operation,
+                    "token": tok,
+                    "body": {}
+                }
+            })
+            .to_string()
+        };
+
+        let ctx_opt = Some(ctx.clone());
+
+        // 1st call: provider missing → routing failure → refund the unused use.
+        let r1 = handle_request(&call(token_b64.clone()), &ctx_opt)
+            .await
+            .expect("bridge responds");
+        assert_eq!(r1["response"]["code"], "provider_not_found");
+
+        // 2nd call with the SAME token: the refund made the single use available
+        // again, so validation passes and we reach the provider lookup once more —
+        // NOT capability_denied, which is what burning the grant would have caused.
+        let r2 = handle_request(&call(token_b64), &ctx_opt)
+            .await
+            .expect("bridge responds");
+        assert_eq!(
+            r2["response"]["code"], "provider_not_found",
+            "refunded single-use grant is reusable; old code would return capability_denied"
+        );
     }
 
     // End-to-end over the Carrier bridge: a capsule's capability-gated
