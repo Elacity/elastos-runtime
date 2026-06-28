@@ -2040,17 +2040,20 @@ impl CarrierAvailabilityProvider {
         &self,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
+        // Pre-effect request-shape validation (no state locked / no announce yet):
+        // a missing/invalid cid is a provable no-op, so DidNotAct lets the carrier
+        // refund the consumed single-use (BUG-4). The `join_failed` path below
+        // stays a structured error — it runs after a join that may have acted.
         let cid = match request.get("cid").and_then(|value| value.as_str()) {
             Some(cid) => cid.trim(),
             None => {
-                return Ok(carrier_availability_error(
-                    "invalid_request",
-                    "Carrier availability requires cid",
+                return Err(ProviderError::DidNotAct(
+                    "carrier availability requires a cid".into(),
                 ))
             }
         };
         if let Err(err) = validate_content_cid(cid) {
-            return Ok(carrier_availability_error("invalid_cid", err));
+            return Err(ProviderError::DidNotAct(format!("invalid cid: {err}")));
         }
         let uri = request
             .get("uri")
@@ -2345,24 +2348,25 @@ impl CarrierAvailabilityProvider {
         &self,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
+        // Pre-effect request-shape validation (no fetch issued yet) — DidNotAct so
+        // the carrier refunds the unused single-use on a provable no-op (BUG-4).
         let cid = match request.get("cid").and_then(|value| value.as_str()) {
             Some(cid) => cid.trim(),
             None => {
-                return Ok(carrier_availability_error(
-                    "invalid_request",
-                    "Carrier availability fetch requires cid",
+                return Err(ProviderError::DidNotAct(
+                    "carrier availability fetch requires a cid".into(),
                 ))
             }
         };
         if let Err(err) = validate_content_cid(cid) {
-            return Ok(carrier_availability_error("invalid_cid", err));
+            return Err(ProviderError::DidNotAct(format!("invalid cid: {err}")));
         }
         let path = request
             .get("path")
             .and_then(|value| value.as_str())
             .unwrap_or("");
         if let Err(err) = validate_carrier_content_path(path) {
-            return Ok(carrier_availability_error("invalid_path", err));
+            return Err(ProviderError::DidNotAct(format!("invalid path: {err}")));
         }
         let topic_name = content_availability_topic_name(cid);
         let messages = {
@@ -4528,15 +4532,18 @@ impl Provider for CarrierGossipProvider {
                         "gossip_join requires a non-empty topic".into(),
                     ));
                 }
+                // No-op rejections (state read-only; nothing joined/sent yet) — the
+                // single use is refundable (BUG-4 DidNotAct). Only the join below,
+                // which may partially act, stays a structured error.
                 if state.joined_topics.contains(topic_name) {
-                    return Ok(
-                        serde_json::json!({"status":"error","code":"already_joined","message":"already joined"}),
-                    );
+                    return Err(ProviderError::DidNotAct(
+                        "gossip_join: topic already joined".into(),
+                    ));
                 }
                 if state.joined_topics.len() >= MAX_TOPICS {
-                    return Ok(
-                        serde_json::json!({"status":"error","code":"too_many_topics","message":"topic limit reached"}),
-                    );
+                    return Err(ProviderError::DidNotAct(
+                        "gossip_join: topic limit reached".into(),
+                    ));
                 }
 
                 match join_gossip_topic(&mut state, topic_name, force_direct).await {
@@ -7871,6 +7878,46 @@ mod tests {
             assert!(
                 matches!(resp, Err(ProviderError::DidNotAct(_))),
                 "{op} with an empty topic must return DidNotAct (refundable); got {resp:?}"
+            );
+        }
+    }
+
+    /// BUG-4 second REAL migration: the carrier-only CarrierAvailabilityProvider
+    /// returns `DidNotAct` for pre-effect request-shape rejections (missing/invalid
+    /// cid on `ensure`/`fetch`), so the carrier refunds the unused single-use.
+    #[tokio::test]
+    async fn carrier_availability_request_shape_rejections_return_did_not_act() {
+        use elastos_runtime::provider::Provider;
+
+        let (local_sk, local_did) = elastos_identity::derive_did(&[37u8; 32]);
+        let endpoint = Endpoint::builder()
+            .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
+            .bind()
+            .await
+            .unwrap();
+        let memory_lookup = MemoryLookup::new();
+        endpoint.address_lookup().add(memory_lookup.clone());
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let state = Arc::new(Mutex::new(GossipState::new(
+            endpoint.clone(),
+            gossip,
+            memory_lookup,
+            Some(local_sk),
+            Some(local_did),
+        )));
+        let provider = CarrierAvailabilityProvider::new(state);
+
+        // Missing cid (announce + fetch) and an invalid cid are provable no-ops.
+        let cases = [
+            serde_json::json!({ "op": "ensure" }),
+            serde_json::json!({ "op": "fetch" }),
+            serde_json::json!({ "op": "ensure", "cid": "bad cid with spaces!" }),
+        ];
+        for req in cases {
+            let resp = provider.send_raw(&req).await;
+            assert!(
+                matches!(resp, Err(ProviderError::DidNotAct(_))),
+                "{req} must return DidNotAct (refundable); got {resp:?}"
             );
         }
     }
