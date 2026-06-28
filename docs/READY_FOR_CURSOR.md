@@ -123,17 +123,21 @@ the next product arc, none of it started here:
   one consent gate + meter. This is the natural debit site for the spend meter
   (`carrier_bridge` `send_raw` dispatch, where the single-use token is consumed).
 - **The spend meter** — bounds an agent's AI/resource spend (adoption wedge #4).
-  **MECHANISM LANDED in-cloud `W3b-turn`:** `primitives::spend::SpendMeter` — a
-  per-capsule budget with atomic, fail-closed `try_debit` (unprovisioned ⇒ zero, not
-  unlimited) and a provably-no-op `refund` mirroring the single-use token's
-  `try_use_token`/`refund_token_use` + the BUG-4 `DidNotAct` contract; the
-  `concurrent_debits_never_overspend` test proves 64 racing debits never exceed the
-  budget. **NOT yet wired** to dispatch (nothing charges it in prod yet) — the wiring
-  is the act-over-MCP chunk above: inject `Arc<SpendMeter>` into `BridgeContext`,
-  `try_debit` before `send_raw`, `refund` on the `NoProvider`/`DidNotAct` no-op
-  branches (exactly where the token use is already refunded), and add a
-  `SpendDebit`/`BudgetExhausted` audit event. Provisioning policy (per-capsule limits,
-  default budget, unit) is a founder decision to make at wiring time.
+  **MECHANISM + ACT-PATH WIRING LANDED in-cloud `W3b-turn`:** `primitives::spend::SpendMeter`
+  (atomic fail-closed `try_debit`, no-op `refund`, `ensure_budget` first-touch; the
+  `concurrent_debits_never_overspend` test proves 64 racing debits never exceed the budget) is now
+  WIRED into the carrier `carrier_invoke` dispatch: it debits the capsule's budget (keyed on the
+  canonical capsule id) BEFORE `send_raw`, refuses fail-closed with `budget_exhausted` + refunds the
+  single-use token when the budget is gone, and refunds the spend on the same `NoProvider`/`DidNotAct`
+  no-op branches as the token. Signed `SpendDebit`/`BudgetExhausted` audit events on Plane A. Enabled
+  by `ELASTOS_DEFAULT_SPEND_BUDGET` (unset ⇒ unmetered; `0` ⇒ hard-stop). Proven by
+  `carrier_act_is_refused_when_spend_budget_is_exhausted` + `did_not_act_refunds_the_spend_debit`.
+  **Cursor TODO / residual:** (a) only the **serve** act path carries the policy — the **microVM
+  supervisor** (`vm-{name}`) and **WASM** carrier sites are `spend_policy: None` (documented
+  follow-up; wire them from infra the same way); (b) cost is a flat **1 unit per act** (bounds the
+  NUMBER of acts) — provider-reported variable cost (real AI tokens) is the next refinement; (c) the
+  consent/affordance dispatch path (`gateway_capsule_catalog`) is not yet metered; (d) per-capsule
+  budgets are a flat default — a real per-principal/quota policy + a top-up path is a product decision.
 - **Free-text NL → intent** (adoption wedge #3) — the AI-backend "brain" track.
 - **The marketplace of shells** — multiple untrusted shells over the ESP protocol.
 

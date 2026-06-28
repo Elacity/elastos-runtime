@@ -105,6 +105,8 @@ impl Runtime {
                     capsule_id: pipes.capsule_id.clone(),
                     principal_id: pipes.principal_id.clone(),
                     data_dir: Some(data_dir.clone()),
+                    // WASM-carrier metering is a follow-up; the serve act path is metered first.
+                    spend_policy: None,
                 };
                 crate::carrier_bridge::spawn_wasm_carrier_bridge(pipes, ctx);
             }));

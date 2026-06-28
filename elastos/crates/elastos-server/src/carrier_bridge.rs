@@ -236,6 +236,21 @@ enum RemoteCapabilityPoll {
     Terminal(serde_json::Value),
 }
 
+/// Per-act spend-meter policy for the carrier act path: a shared meter plus the default per-capsule
+/// budget to lazily provision on first sight. Carried as `Option` on [`BridgeContext`] — `None` ⇒
+/// metering OFF (acts flow unmetered, today's behavior). Enabled only when an operator configures a
+/// default budget (`ELASTOS_DEFAULT_SPEND_BUDGET`); a default of `0` is fail-closed-zero (every act
+/// refused), so an unset/empty env stays unmetered while an explicit `0` hard-stops all acts.
+#[derive(Clone)]
+pub struct SpendPolicy {
+    pub meter: Arc<elastos_runtime::primitives::spend::SpendMeter>,
+    pub default_budget: elastos_runtime::primitives::spend::SpendUnits,
+}
+
+/// Spend charged per carrier act (v0: one unit per act — bounds the NUMBER of acts a capsule may
+/// take; provider-reported variable cost, e.g. AI tokens consumed, is the follow-up).
+const CARRIER_ACT_COST: elastos_runtime::primitives::spend::SpendUnits = 1;
+
 /// Resources needed by the bridge to handle requests.
 #[derive(Clone)]
 pub struct BridgeContext {
@@ -248,6 +263,8 @@ pub struct BridgeContext {
     pub principal_id: Option<String>,
     /// Runtime data directory used by protected principal-root storage helpers.
     pub data_dir: Option<PathBuf>,
+    /// Per-act spend budget enforcement; `None` ⇒ unmetered (see [`SpendPolicy`]).
+    pub spend_policy: Option<SpendPolicy>,
 }
 
 /// Spawn a Carrier bridge handler for a microVM capsule.
@@ -957,6 +974,66 @@ pub(crate) async fn handle_request(
                 }));
             }
 
+            // SPEND METER (act-over-MCP): charge the capsule's budget for this act BEFORE dispatch,
+            // keyed on the canonical capsule id. Fail-closed: an exhausted budget REFUSES the act and
+            // refunds the single-use token — nothing reached the provider, so a replay is a guaranteed
+            // no-op, the SAME provably-no-op refund as the NoProvider routing-failure branch below.
+            if let Some(policy) = &bridge_ctx.spend_policy {
+                // Lazily provision the per-capsule default on first sight (idempotent — never resets
+                // an existing balance). default_budget == 0 ⇒ fail-closed-zero (every act refused).
+                policy
+                    .meter
+                    .ensure_budget(&bridge_ctx.capsule_id, policy.default_budget);
+                match policy
+                    .meter
+                    .try_debit(&bridge_ctx.capsule_id, CARRIER_ACT_COST)
+                {
+                    Ok(remaining) => {
+                        bridge_ctx.capability_manager.audit_log().emit_best_effort(
+                            elastos_runtime::primitives::audit::AuditEvent::SpendDebit {
+                                timestamp: elastos_runtime::primitives::time::SecureTimestamp::now(
+                                ),
+                                capsule_id: bridge_ctx.capsule_id.clone(),
+                                operation: dispatch.operation.clone(),
+                                cost: CARRIER_ACT_COST,
+                                remaining,
+                            },
+                        );
+                    }
+                    Err(spend_err) => {
+                        let remaining_use = bridge_ctx
+                            .capability_manager
+                            .refund_use(&consumed_token_id)
+                            .await;
+                        bridge_ctx.capability_manager.audit_log().emit_best_effort(
+                            elastos_runtime::primitives::audit::AuditEvent::BudgetExhausted {
+                                timestamp: elastos_runtime::primitives::time::SecureTimestamp::now(
+                                ),
+                                capsule_id: bridge_ctx.capsule_id.clone(),
+                                operation: dispatch.operation.clone(),
+                                requested: CARRIER_ACT_COST,
+                            },
+                        );
+                        tracing::warn!(
+                            "bridge: spend budget exhausted for capsule '{}' op '{}' ({}); refused \
+                             before dispatch, refunded the single-use grant (use count now {})",
+                            bridge_ctx.capsule_id,
+                            dispatch.operation,
+                            spend_err,
+                            remaining_use,
+                        );
+                        return Ok(serde_json::json!({
+                            "id": id,
+                            "response": {
+                                "type": "error",
+                                "code": "budget_exhausted",
+                                "message": "Spend budget exhausted for this capsule",
+                            }
+                        }));
+                    }
+                }
+            }
+
             match bridge_ctx
                 .provider_registry
                 .send_raw(&dispatch.scheme, &dispatch.request)
@@ -978,6 +1055,12 @@ pub(crate) async fn handle_request(
                         .capability_manager
                         .refund_use(&consumed_token_id)
                         .await;
+                    // Nothing acted ⇒ also refund the spend debit (the same provably-no-op contract).
+                    if let Some(policy) = &bridge_ctx.spend_policy {
+                        policy
+                            .meter
+                            .refund(&bridge_ctx.capsule_id, CARRIER_ACT_COST);
+                    }
                     tracing::warn!(
                         "bridge: no provider for scheme '{}'; refunded the unused \
                          single-use grant (use count now {})",
@@ -999,6 +1082,12 @@ pub(crate) async fn handle_request(
                         .capability_manager
                         .refund_use(&consumed_token_id)
                         .await;
+                    // Provably pre-effect ⇒ also refund the spend debit (replay is idempotent).
+                    if let Some(policy) = &bridge_ctx.spend_policy {
+                        policy
+                            .meter
+                            .refund(&bridge_ctx.capsule_id, CARRIER_ACT_COST);
+                    }
                     tracing::warn!(
                         "bridge: provider rejected '{}/{}' before acting ({}); refunded \
                          the unused single-use grant (use count now {})",
@@ -1476,6 +1565,7 @@ mod tests {
             capsule_id: "test-capsule".to_string(),
             principal_id: None,
             data_dir: None,
+            spend_policy: None,
         }
     }
 
@@ -1709,6 +1799,102 @@ mod tests {
         );
     }
 
+    // --- spend meter: the act-over-MCP budget bounds the number of acts, fail-closed ---
+
+    /// With budget N, the first N acts dispatch and the (N+1)th is REFUSED before the provider —
+    /// and the over-limit act's single-use token is refunded (nothing acted).
+    #[tokio::test]
+    async fn carrier_act_is_refused_when_spend_budget_is_exhausted() {
+        use elastos_runtime::capability::token::TokenConstraints;
+        use elastos_runtime::primitives::spend::SpendMeter;
+
+        let mut ctx = bridge_context();
+        let meter = Arc::new(SpendMeter::new());
+        ctx.spend_policy = Some(super::SpendPolicy {
+            meter: meter.clone(),
+            default_budget: 2,
+        });
+        ctx.provider_registry
+            .register(Arc::new(RightsOkProvider))
+            .await;
+
+        let uri = "elastos://rights/has_access_by_content_id";
+        let operation = "has_access_by_content_id";
+        let probe = serde_json::json!({
+            "type": "carrier_invoke", "uri": uri, "operation": operation, "body": {}
+        });
+        let dispatch = carrier_invoke_dispatch(&probe, None).expect("dispatch parses");
+        // The token is NOT the limiting factor here (10 uses); the budget (2) is.
+        let token = encode_bridge_capability_token(&ctx.capability_manager.grant(
+            &ctx.capsule_id,
+            ResourceId::new(&dispatch.resource),
+            required_action_for(&dispatch.operation),
+            TokenConstraints::new(0, false, None, Some(10)),
+            None,
+        ));
+        let call = |tok: &str| {
+            serde_json::json!({
+                "id": 1,
+                "request": {
+                    "type": "carrier_invoke", "uri": uri, "operation": operation,
+                    "token": tok, "body": {}
+                }
+            })
+            .to_string()
+        };
+        let ctx_opt = Some(ctx.clone());
+
+        // Budget 2 → the first two acts reach the provider.
+        for i in 1..=2 {
+            let r = handle_request(&call(&token), &ctx_opt).await.unwrap();
+            assert_eq!(
+                r["response"]["type"], "carrier_result",
+                "act {i} should dispatch within budget: {r}"
+            );
+        }
+        assert_eq!(meter.remaining(&ctx.capsule_id), 0, "budget fully spent");
+
+        // Third act: refused fail-closed, before the provider.
+        let denied = handle_request(&call(&token), &ctx_opt).await.unwrap();
+        assert_eq!(
+            denied["response"]["code"], "budget_exhausted",
+            "the over-budget act must be refused before dispatch: {denied}"
+        );
+        assert_eq!(
+            meter.remaining(&ctx.capsule_id),
+            0,
+            "a refused act charges nothing further"
+        );
+    }
+
+    /// An act the provider rejects BEFORE acting (DidNotAct) refunds the spend debit — a no-op act
+    /// costs no budget, exactly mirroring the single-use token refund on the same branch.
+    #[tokio::test]
+    async fn did_not_act_refunds_the_spend_debit() {
+        use elastos_runtime::primitives::spend::SpendMeter;
+
+        let mut ctx = bridge_context();
+        let meter = Arc::new(SpendMeter::new());
+        ctx.spend_policy = Some(super::SpendPolicy {
+            meter: meter.clone(),
+            default_budget: 1,
+        });
+        ctx.provider_registry
+            .register(Arc::new(RejectsBeforeActingProvider))
+            .await;
+
+        let (token_b64, call) = single_use_rights_call(&ctx).await;
+        let ctx_opt = Some(ctx.clone());
+
+        let r = handle_request(&call(token_b64), &ctx_opt).await.unwrap();
+        assert_eq!(r["response"]["code"], "rejected");
+        assert_eq!(
+            meter.remaining(&ctx.capsule_id),
+            1,
+            "DidNotAct refunds the spend; the budget is intact for a real act"
+        );
+    }
+
     /// An ACTED failure (provider ran and may have partially mutated) keeps the
     /// single use consumed — the second call is denied (refund would double-act).
     #[tokio::test]
@@ -1787,6 +1973,7 @@ mod tests {
             capsule_id: "test-capsule".to_string(),
             principal_id: None,
             data_dir: None,
+            spend_policy: None,
         });
 
         // With a valid capability: reaches the provider.
@@ -1881,6 +2068,7 @@ mod tests {
             capsule_id: "test-capsule".to_string(),
             principal_id: None,
             data_dir: None,
+            spend_policy: None,
         });
 
         let line = serde_json::json!({
@@ -1953,6 +2141,7 @@ mod tests {
             capsule_id: "test-capsule".to_string(),
             principal_id: None,
             data_dir: None,
+            spend_policy: None,
         });
 
         // Read-side ops the product provider serves. (self/revoke live on the
@@ -2093,6 +2282,7 @@ mod tests {
             capsule_id: "test-capsule".to_string(),
             principal_id: None,
             data_dir: None,
+            spend_policy: None,
         });
 
         // 1. PREVIEW (executed through the carrier): the action the agent is SHOWN
@@ -3029,6 +3219,7 @@ mod tests {
             capsule_id: capsule_id.clone(),
             principal_id: None,
             data_dir: None,
+            spend_policy: None,
         });
 
         // The capability resource the carrier enforces for this op; request + grant

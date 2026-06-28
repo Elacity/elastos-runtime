@@ -566,6 +566,8 @@ pub async fn run_mcp_serve() -> anyhow::Result<()> {
         capsule_id: MCP_BRIDGE_ID.to_string(),
         principal_id: None,
         data_dir: None,
+        // Act-over-MCP spend metering (enabled when ELASTOS_DEFAULT_SPEND_BUDGET is set).
+        spend_policy: infra.spend_policy.clone(),
     });
 
     eprintln!("elastos mcp serve: ready (stdio, read-only inspect; operator-authority).");

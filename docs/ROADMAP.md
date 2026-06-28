@@ -165,8 +165,11 @@ halo a *computed* fact) → **W1** (egress-as-capability) → W3 → W4 → … 
   author gate** — AUD-1 residual. **G-CIE** — ACCEPTED. **AUD-1 ACTIVATION** — production trust roots = config.
 - **PDR NEXT-band (beyond W0-W7 v1):** the dual-receipt PLATFORM self-attestation (co-sign at gate
   time; legal admissibility opinion first); act-over-MCP (the write path); the meter; free-text NL.
-  **Spend-meter MECHANISM landed `W3b-turn`** — `primitives::spend::SpendMeter` (atomic fail-closed
-  `try_debit` + no-op `refund`, concurrency-proven); NOT yet wired to dispatch (that rides act-over-MCP).
+  **Spend-meter WIRED `W3b-turn`** — `primitives::spend::SpendMeter` (atomic fail-closed `try_debit` +
+  no-op `refund`, concurrency-proven) now charges the carrier `carrier_invoke` act path before dispatch
+  (fail-closed `budget_exhausted` + token refund; spend refunded on NoProvider/DidNotAct; signed
+  SpendDebit/BudgetExhausted), enabled via `ELASTOS_DEFAULT_SPEND_BUDGET`. Residual: microVM/WASM carrier
+  sites + variable (AI-token) cost + affordance-dispatch metering are follow-ups (see READY_FOR_CURSOR).
 
 ## 💻 LOCAL / CURSOR (founder's device — VM env + operational)
 1. Activate AUD-1 (generate author key via `trust_cmd` → config `trusted_keys` → re-sign capsules).

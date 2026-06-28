@@ -103,6 +103,20 @@ impl SpendMeter {
             .or_insert(Balance { limit, spent: 0 });
     }
 
+    /// Provision `key` with `limit` ONLY if it has no budget yet (idempotent first-touch). Unlike
+    /// [`set_budget`](Self::set_budget) this NEVER disturbs an existing budget's limit or spent — so
+    /// it is safe to call on every act to lazily provision a per-capsule default without ever
+    /// resetting accumulated spend.
+    pub fn ensure_budget(&self, key: &str, limit: SpendUnits) {
+        let mut balances = match self.balances.write() {
+            Ok(b) => b,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        balances
+            .entry(key.to_string())
+            .or_insert(Balance { limit, spent: 0 });
+    }
+
     /// Remaining budget for `key` (0 if unprovisioned).
     pub fn remaining(&self, key: &str) -> SpendUnits {
         match self.balances.read() {
@@ -236,6 +250,20 @@ mod tests {
                 requested: 1,
                 remaining: 0
             }
+        );
+    }
+
+    #[test]
+    fn ensure_budget_provisions_once_and_never_resets_spend() {
+        let meter = SpendMeter::new();
+        meter.ensure_budget("vm-alice", 100);
+        meter.try_debit("vm-alice", 40).unwrap();
+        // A second ensure_budget (even with a different limit) must NOT reset the 40 already spent.
+        meter.ensure_budget("vm-alice", 5);
+        assert_eq!(
+            meter.remaining("vm-alice"),
+            60,
+            "ensure_budget is first-touch only; spend is preserved and the limit is untouched"
         );
     }
 

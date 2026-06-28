@@ -274,6 +274,24 @@ pub enum AuditEvent {
         approver: String,
     },
 
+    /// A capsule's spend budget was debited for an act (the meter charged the act-over-MCP path).
+    SpendDebit {
+        timestamp: SecureTimestamp,
+        capsule_id: String,
+        operation: String,
+        cost: u64,
+        remaining: u64,
+    },
+
+    /// A capsule's act was REFUSED because its spend budget was exhausted (fail-closed before
+    /// dispatch; the single-use token was refunded since nothing acted).
+    BudgetExhausted {
+        timestamp: SecureTimestamp,
+        capsule_id: String,
+        operation: String,
+        requested: u64,
+    },
+
     /// Identity registered (passkey)
     IdentityRegistered {
         timestamp: SecureTimestamp,
@@ -1030,6 +1048,8 @@ impl AuditEvent {
             AuditEvent::CapabilityRequested { .. } => "capability_requested",
             AuditEvent::CapabilityDenied { .. } => "capability_denied",
             AuditEvent::CapabilityApproved { .. } => "capability_approved",
+            AuditEvent::SpendDebit { .. } => "spend_debit",
+            AuditEvent::BudgetExhausted { .. } => "budget_exhausted",
             AuditEvent::IdentityRegistered { .. } => "identity_registered",
             AuditEvent::StorageAccess { .. } => "storage_access",
             AuditEvent::MessageSent { .. } => "message_sent",

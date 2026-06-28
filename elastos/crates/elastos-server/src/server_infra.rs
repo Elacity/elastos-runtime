@@ -25,10 +25,15 @@ pub(crate) struct ServerInfrastructure {
     pub(crate) provider_cid: String,
     pub(crate) shell_cid: Option<String>,
     pub(crate) host_helpers: Vec<api::server::HostHelperProcess>,
+    /// Per-act spend metering for the act-over-MCP path; `None` ⇒ unmetered (default).
+    pub(crate) spend_policy: Option<elastos_server::carrier_bridge::SpendPolicy>,
 }
 
 /// Opt-in durable, verified-on-open audit log (the EU AI Act custody mode). Unset → in-memory.
 const AUDIT_LOG_PATH_ENV: &str = "ELASTOS_AUDIT_LOG_PATH";
+/// Opt-in per-capsule act budget for the act-over-MCP path. Unset/empty → unmetered; an explicit
+/// integer (incl. `0`, which hard-stops all acts) enables fail-closed metering.
+const DEFAULT_SPEND_BUDGET_ENV: &str = "ELASTOS_DEFAULT_SPEND_BUDGET";
 const CONTENT_REPAIR_SCHEDULER_ENV: &str = "ELASTOS_CONTENT_REPAIR_SCHEDULER";
 const CONTENT_REPAIR_SCHEDULER_INTERVAL_ENV: &str = "ELASTOS_CONTENT_REPAIR_INTERVAL_SECS";
 const CONTENT_REPAIR_SCHEDULER_LIMIT_ENV: &str = "ELASTOS_CONTENT_REPAIR_LIMIT";
@@ -83,6 +88,32 @@ fn build_audit_log(data_dir: &Path) -> anyhow::Result<Arc<primitives::audit::Aud
             Ok(Arc::new(log))
         }
         _ => Ok(Arc::new(primitives::audit::AuditLog::new())),
+    }
+}
+
+/// Build the act-over-MCP spend policy from `ELASTOS_DEFAULT_SPEND_BUDGET`.
+///
+/// Unset or empty ⇒ `None` (unmetered — today's behavior). An explicit non-negative integer enables
+/// metering with that per-capsule default budget; `0` is a valid value that fail-closes every act. A
+/// non-integer value is a hard configuration error (fail-closed: refuse to start rather than run
+/// unmetered against an operator who believed they had enabled a budget).
+fn build_spend_policy() -> anyhow::Result<Option<elastos_server::carrier_bridge::SpendPolicy>> {
+    match std::env::var(DEFAULT_SPEND_BUDGET_ENV) {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let default_budget: u64 = raw.trim().parse().map_err(|e| {
+                anyhow::anyhow!(
+                    "{DEFAULT_SPEND_BUDGET_ENV}={raw:?} is not a non-negative integer ({e})"
+                )
+            })?;
+            tracing::info!(
+                "Act spend metering enabled: default per-capsule budget {default_budget}"
+            );
+            Ok(Some(elastos_server::carrier_bridge::SpendPolicy {
+                meter: Arc::new(primitives::spend::SpendMeter::new()),
+                default_budget,
+            }))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -1026,6 +1057,7 @@ async fn setup_server_infrastructure_impl(
         provider_cid,
         shell_cid,
         host_helpers: managed_host_processes,
+        spend_policy: build_spend_policy()?,
     })
 }
 

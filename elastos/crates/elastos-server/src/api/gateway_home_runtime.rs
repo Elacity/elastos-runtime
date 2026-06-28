@@ -492,6 +492,8 @@ fn system_runtime_event_summary(
         | AuditEvent::CapabilityRequested { timestamp, .. }
         | AuditEvent::CapabilityDenied { timestamp, .. }
         | AuditEvent::CapabilityApproved { timestamp, .. }
+        | AuditEvent::SpendDebit { timestamp, .. }
+        | AuditEvent::BudgetExhausted { timestamp, .. }
         | AuditEvent::IdentityRegistered { timestamp, .. }
         | AuditEvent::StorageAccess { timestamp, .. }
         | AuditEvent::MessageSent { timestamp, .. }
@@ -562,6 +564,13 @@ fn system_runtime_event_summary(
         AuditEvent::CapabilityApproved {
             action, resource, ..
         } => format!("Capability approved — {action} {resource}"),
+        // Per-act debits are too frequent for the ribbon; an EXHAUSTION (a refused act) is notable.
+        AuditEvent::SpendDebit { .. } => return None,
+        AuditEvent::BudgetExhausted {
+            capsule_id,
+            operation,
+            ..
+        } => format!("Spend budget exhausted — {capsule_id} ({operation})"),
         AuditEvent::IdentityRegistered {
             user_id, method, ..
         } => format!("Registered identity {user_id} via {method}"),

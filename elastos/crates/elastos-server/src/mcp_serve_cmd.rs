@@ -264,6 +264,7 @@ mod tests {
             capsule_id: MCP_BRIDGE_ID.to_string(),
             principal_id: None,
             data_dir: None,
+            spend_policy: None,
         });
         (ctx, token, tmp)
     }

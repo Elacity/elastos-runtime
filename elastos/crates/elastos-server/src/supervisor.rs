@@ -1248,6 +1248,8 @@ impl Supervisor {
                     capsule_id: format!("vm-{}", name),
                     principal_id: principal_id.clone(),
                     data_dir: Some(self.data_dir.clone()),
+                    // microVM-carrier metering is a follow-up; the serve act path is metered first.
+                    spend_policy: None,
                 }),
                 _ => None,
             };
