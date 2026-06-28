@@ -13,8 +13,13 @@
     "capabilities": [
       {
         "resource": "elastos://browser-engine/*",
-        "actions": ["read", "write"],
-        "operations": ["status", "launch", "attach_stream", "close_page", "page_status", "screenshot", "frame", "input", "webrtc_signal"]
+        "actions": ["read"],
+        "operations": ["status", "page_status", "screenshot", "frame"]
+      },
+      {
+        "resource": "elastos://browser-engine/*",
+        "actions": ["execute"],
+        "operations": ["launch", "attach_stream", "close_page", "input", "webrtc_signal"]
       }
     ],
     "audit_events": [

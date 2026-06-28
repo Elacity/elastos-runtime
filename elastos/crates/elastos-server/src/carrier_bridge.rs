@@ -2230,13 +2230,9 @@ mod tests {
             // -- object-provider `share` STAYS: grants access — security-touching,
             //    held for a dedicated review (Miller).
             ("object-provider", "share"),
-            // -- class C: EXECUTE / actuator. net/exit egress drained in the ch3
-            //    split (now declare `execute`); browser-actuator + drm remain.
-            ("browser-engine-adapter", "launch"),
-            ("browser-engine-adapter", "input"),
-            ("browser-engine-adapter", "close_page"),
-            ("browser-engine-adapter", "attach_stream"),
-            ("browser-engine-adapter", "webrtc_signal"),
+            // -- class C: EXECUTE / actuator. net/exit egress + browser-actuator
+            //    drained (now declare `execute`); drm `open` remains (protected-
+            //    content session — held for a content-protection review).
             ("drm-provider", "open"),
             // -- class E: HIGH-RISK (keys / signing / spend / secret export / decrypt);
             //    Miller's verdict: KEEP Admin — do NOT loosen without a dedicated review.
