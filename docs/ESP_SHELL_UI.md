@@ -1,0 +1,175 @@
+# ESP Shell UI (W5b) — the visual projection shell
+
+**Status:** spec (in-cloud). The component *contracts* are defined here; the live
+Svelte paint lands in the browser/local lane. Every contract below maps directly
+onto a proven, tested ESP projection function (W5a/W6/W7) — the UI adds **no new
+logic**, it only renders what the headless projection already computed.
+
+## The one invariant (non-negotiable — Bret Victor's law)
+
+> **Every pixel is a read-only projection of signed runtime state. No component
+> holds a key, a token, or any authority.**
+
+Concretely, for every component in this spec:
+
+1. **Props in = ESP fact types only** (the serde-mirrored types in `esp/esp_v0.ts`),
+   each carrying a `schema` tag from `ESP_SCHEMA_TAGS`. A component must IGNORE
+   unknown fact fields (forward-compat) and must NOT reconstruct authority from
+   them.
+2. **Pixels out** — the component renders; it computes nothing security-relevant
+   that the headless layer (`two_channel.ts`, `consent_act.ts`, `shell_picker.ts`,
+   `ai_act_audit.ts`) hasn't already decided. If a badge says "verified," it is
+   because `trustMaterial()` returned `"verified"`, not because the view guessed.
+3. **Actions out = INTENTS, never authority.** A click emits an event (`approve`,
+   `deny`, `select-shell`, `invoke`) that travels back over the ESP protocol to
+   the runtime. The runtime is the ONLY minter of tokens/receipts. The view can
+   never grant itself anything; worst case a compromised view can *ask*, and the
+   consent broker still gates.
+4. **Fail-honest rendering.** Unknown/missing trust → render as `unsigned`
+   (never blank, never optimistic). Incomplete reach → render the hazard as
+   `incomplete`, not `cool`. This mirrors the headless fail-closed defaults.
+
+This is the moat made visible: the buyer can diff any pixel against the signed
+fact behind it.
+
+## Component contracts
+
+Each component lists: **props** (the ESP fact type + its schema tag), the
+**headless function** it projects (the single source of truth), what it
+**renders**, and the **intent** it may emit.
+
+### `<CapsuleCard>` — the trust badge
+- **Props:** `CapsuleSummary` (`elastos.capsules.catalog/v1`).
+- **Projects:** `trustMaterial(capsule)` → `"verified" | "content_addressed" | "unsigned"`.
+- **Renders:** name + a trust chip whose colour/label is a pure function of the
+  `TrustMaterial` value (verified = signed-and-checked; content_addressed = CID
+  pinned but unsigned; unsigned = neither). Unknown `trust_state` → `unsigned`.
+- **Intent:** `open(capsule.name)` (navigates; mints nothing).
+
+### `<TwoChannelObject>` — the hero ("never-seen moment")
+- **Props:** `TrustMaterial` + `AffordanceReachView` (the catalog's per-affordance
+  reach), or directly a `TwoChannelObject` from `twoChannel(trust, view)`.
+- **Projects:** `twoChannel(trust, view)`. The load-bearing field is
+  `refuseTrained = trust === "verified" && blast.level === "hot"` — the object the
+  user has been *trained by every other OS to trust* (a signed, verified app) is
+  shown as the one to scrutinise *because* its blast radius is hot. Trust and
+  reach are **two independent channels**, never collapsed into one "safe/unsafe."
+- **Renders:** two side-by-side channels — TRUST (the badge) and REACH (the
+  hazard meter, below) — plus the `refuseTrained` call-out when set.
+- **Intent:** none (pure display); it frames the `<ConsentSheet>`.
+
+### `<HazardMeter>` — blast radius
+- **Props:** `ReachDescriptorV1` (`elastos.reach.v1`).
+- **Projects:** `blastRadius(reach)` → `{ level: "cool" | "warm" | "hot", reasons, incomplete }`.
+- **Renders:** a 3-stop meter. Open egress drives `hot`; allowlisted egress is
+  strictly cooler than open; `!observed` reach renders `incomplete` (honest
+  "we haven't watched this run yet"), never a confident `cool`.
+- **Intent:** none.
+
+### `<ConsentSheet>` — the hero consent act
+- **Props:** `AffordanceConsentPending` (`elastos.capsules.affordance-consent-pending/v1`).
+- **Projects:** `consentPendingIsWellFormed(pending)` — the sheet renders the act
+  ONLY if the pending fact is well-formed; otherwise it shows an error, never a
+  blank approve button.
+- **Renders:** "⟨capsule⟩ wants to ⟨method⟩ ⟨resource⟩" with the two-channel
+  object above it, the risk class, and the approval mode. Approve/Deny buttons.
+- **Intent:** `approve(request_id)` / `deny(request_id)` — sent to the consent
+  broker. The view never mints the token; it only relays the human decision. The
+  runtime's `validate-and-consume` is what actually issues authority.
+
+### `<ReceiptBadge>` — proof the act happened in the user's name
+- **Props:** `AffordanceGrantReceiptV1` (`elastos.affordance.receipt.v1`) + the
+  originating request.
+- **Projects:** `receiptMatchesRequest(receipt, request)` — the badge is "valid"
+  only when the signed receipt attests the EXACT requested `(capsule, method,
+  input_hash, resource, action)`. A mismatch renders as a warning, not a tick.
+- **Renders:** a signed-receipt chip (signer fingerprint, redeemed-at) — never the
+  raw signature bytes or token (Principle 16: no authority/secret in the view).
+- **Intent:** none.
+
+### `<ShellPicker>` — choose the active shell (W6)
+- **Props:** `CapsuleCatalogResponse` (`elastos.capsules.catalog/v1`) + optional
+  active shell name.
+- **Projects:** `shellPicker(catalog, active)` → `{ shells, active }`, built from
+  `selectableShells()` (role === "shell" && launchable) and `shellTrustCard()`.
+  Selecting routes through `withActiveShell(picker, name)` which returns `null`
+  for a non-selectable name (the view shows the choice as rejected, fail-closed).
+- **Renders:** a list of selectable shells, each a `<CapsuleCard>`-style trust
+  card; the active one marked. A non-shell/non-launchable capsule is simply
+  absent (not greyed — it was never a candidate).
+- **Intent:** `select-shell(name)` — relayed to the supervisor's
+  `set_active_shell`; the runtime re-issues the privileged shell token, not the view.
+
+### `<RefractionToggle>` — focus flip without losing the projection (W6)
+- **Props:** `RefractionState<T>` (generic over any projected ESP fact `T`).
+- **Projects:** `toggleFocus(state)` — flips focus between the two faces (e.g.
+  consumer view ⇄ auditor view of the SAME signed object) while preserving the
+  projected payload via `{ ...state }`. The two faces are two refractions of one
+  fact, never two different facts.
+- **Renders:** the focused face; a toggle affordance.
+- **Intent:** `toggle()` (local UI state only; no runtime call).
+
+### `<AiActAuditCard>` — the enterprise containment surface (W7)
+- **Props:** `AiActAuditRecordV1` (`elastos.audit.ai-act.v1`) + `ContainmentEvidence`.
+- **Projects:** `toAiActAuditRecord(consent, receipt)` then
+  `containmentEvidence(record)` → `{ article_12_met, article_14_met, contained }`.
+- **Renders:** the SAME signed receipt the consumer saw, re-projected as the
+  regulator/insurer view: Art 12 (record-keeping / signed) and Art 14 (human
+  oversight) as met/unmet chips, with a `contained` verdict. Fail-closed: an
+  unsigned record shows Art 12 unmet; a high-risk act with no human shows Art 14
+  unmet. This is the flywheel made legible — consumer delight and compliance
+  evidence are one object.
+- **Intent:** `export-audit(record)` (download/relay the record; mints nothing).
+
+## Composition
+
+```
+<ShellPicker>                         ← pick the consent surface
+  └─ <CapsuleCard> …                  ← per shell, the trust badge
+
+<ConsentSheet>                        ← the hero act
+  ├─ <TwoChannelObject>               ← trust ∥ reach, refuseTrained
+  │    └─ <HazardMeter>               ← blast radius
+  └─ (approve/deny → consent broker)
+        └─ <ReceiptBadge>             ← proof, on success
+              └─ <RefractionToggle>   ← flip to the auditor face
+                    └─ <AiActAuditCard>  ← Art 12 / Art 14 / contained
+```
+
+## Schema-tag pinning (so the ratchet can guard the UI later)
+
+Every component is bound to the ESP schema tag of the fact it consumes (table
+below). When the Svelte components land, `scripts/check-wci-alignment.sh` should
+pin that each component imports its declared fact type and that the tag string
+still exists in `esp/esp_v0.ts` — the same ratchet style used for the W4 ESP
+routes. This keeps the "pixel ⇄ signed fact" mapping enforceable, not aspirational.
+
+| Component | Fact type | Schema tag |
+|-----------|-----------|------------|
+| `<CapsuleCard>` | `CapsuleSummary` | `elastos.capsules.catalog/v1` |
+| `<TwoChannelObject>` | `TwoChannelObject` (trust + `AffordanceReachView`) | `elastos.capsules.catalog/v1` |
+| `<HazardMeter>` | `ReachDescriptorV1` | `elastos.reach.v1` |
+| `<ConsentSheet>` | `AffordanceConsentPending` | `elastos.capsules.affordance-consent-pending/v1` |
+| `<ReceiptBadge>` | `AffordanceGrantReceiptV1` | `elastos.affordance.receipt.v1` |
+| `<ShellPicker>` | `CapsuleCatalogResponse` | `elastos.capsules.catalog/v1` |
+| `<RefractionToggle>` | `RefractionState<T>` | (generic — the wrapped fact's tag) |
+| `<AiActAuditCard>` | `AiActAuditRecordV1` | `elastos.audit.ai-act.v1` |
+
+## What W5b implementation must NOT do
+
+- No component may call a signing/minting API or hold a token — props are facts,
+  events are intents (enforced by the type signatures: no component takes a
+  `CapabilityToken` or key as a prop).
+- No re-deriving trust/hazard/containment in the view — call the headless
+  function; if a verdict is wrong, fix it once in `esp/*.ts` (tested) and every
+  pixel follows.
+- No optimistic UI on consent — the approve button does not pre-render success;
+  the `<ReceiptBadge>` appears only when a real signed `AffordanceGrantReceiptV1`
+  arrives.
+
+## Lane
+
+The contracts are in-cloud (this doc + the proven `esp/*.ts` they project). The
+live Svelte components, a browser harness, and a visual snapshot test are the
+browser/local lane — tracked as the remaining W5b implementation step in
+`ROADMAP.md`.

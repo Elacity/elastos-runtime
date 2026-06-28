@@ -198,6 +198,11 @@ check_required '/api/capsules/catalog' elastos/crates/elastos-server/src/api/gat
 check_required '/api/capsules/interfaces' elastos/crates/elastos-server/src/api/gateway.rs 'ESP v0: interface-registry route must match docs/ESP_V0.md'
 check_required '/api/capsules/interfaces/invoke' elastos/crates/elastos-server/src/api/gateway.rs 'ESP v0: affordance-invoke route must match docs/ESP_V0.md'
 
+# W5b: the shell-UI spec must stay anchored to the projections it claims to render.
+check_required 'elastos.audit.ai-act.v1' elastos/esp/ai_act_audit.ts 'W5b: AiActAuditCard fact tag must exist in esp/ai_act_audit.ts'
+check_required 'AiActAuditCard' docs/ESP_SHELL_UI.md 'W5b: shell-UI spec must define the AI-Act containment card'
+check_required 'read-only projection of signed runtime state' docs/ESP_SHELL_UI.md 'W5b: shell-UI spec must codify the no-authority-in-the-view invariant'
+
 check_required 'Home front door' README.md 'README must teach Home front door'
 check_required 'No Ambient Authority' PRINCIPLES.md 'principles file must codify explicit authority boundaries'
 check_required 'Carrier Plane For Local And Off-Box' PRINCIPLES.md 'principles file must codify the Carrier capability plane for local and off-box transport'
