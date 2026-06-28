@@ -4520,9 +4520,13 @@ impl Provider for CarrierGossipProvider {
                     .map(|mode| mode.eq_ignore_ascii_case("direct"))
                     .unwrap_or(false);
                 if topic_name.is_empty() {
-                    return Ok(
-                        serde_json::json!({"status":"error","code":"missing_topic","message":"topic required"}),
-                    );
+                    // Pre-effect request-shape rejection: nothing joined/sent yet, so
+                    // a consumed single-use is provably a no-op and is refunded (BUG-4
+                    // DidNotAct ocap contract). The `join_failed` path below stays
+                    // `Provider` because the join may have partially acted.
+                    return Err(ProviderError::DidNotAct(
+                        "gossip_join requires a non-empty topic".into(),
+                    ));
                 }
                 if state.joined_topics.contains(topic_name) {
                     return Ok(
@@ -4546,9 +4550,10 @@ impl Provider for CarrierGossipProvider {
             "gossip_leave" => {
                 let topic_name = request["topic"].as_str().unwrap_or_default();
                 if topic_name.is_empty() {
-                    return Ok(
-                        serde_json::json!({"status":"error","code":"missing_topic","message":"topic required"}),
-                    );
+                    // Pre-effect request-shape rejection (nothing removed yet) — refundable.
+                    return Err(ProviderError::DidNotAct(
+                        "gossip_leave requires a non-empty topic".into(),
+                    ));
                 }
 
                 let removed_sender = state.senders.remove(topic_name);
@@ -7830,6 +7835,44 @@ mod tests {
         assert_eq!(requests[1]["request"]["object_did"], "did:key:zObject");
         assert_eq!(requests[2]["op"], "status");
         endpoint.close().await;
+    }
+
+    /// BUG-4 first REAL provider migration: the carrier-only CarrierGossipProvider
+    /// returns `DidNotAct` for a pre-effect request-shape rejection (empty topic),
+    /// so the carrier can safely refund the consumed single-use capability. Proven
+    /// against the real provider (not a mock); the carrier's refund-on-DidNotAct is
+    /// already covered by carrier_bridge::tests.
+    #[tokio::test]
+    async fn gossip_join_and_leave_empty_topic_return_did_not_act() {
+        use elastos_runtime::provider::Provider;
+
+        let (local_sk, local_did) = elastos_identity::derive_did(&[31u8; 32]);
+        let endpoint = Endpoint::builder()
+            .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
+            .bind()
+            .await
+            .unwrap();
+        let memory_lookup = MemoryLookup::new();
+        endpoint.address_lookup().add(memory_lookup.clone());
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let state = Arc::new(Mutex::new(GossipState::new(
+            endpoint.clone(),
+            gossip,
+            memory_lookup,
+            Some(local_sk),
+            Some(local_did),
+        )));
+        let provider = CarrierGossipProvider::new(state);
+
+        for op in ["gossip_join", "gossip_leave"] {
+            let resp = provider
+                .send_raw(&serde_json::json!({ "op": op, "topic": "" }))
+                .await;
+            assert!(
+                matches!(resp, Err(ProviderError::DidNotAct(_))),
+                "{op} with an empty topic must return DidNotAct (refundable); got {resp:?}"
+            );
+        }
     }
 
     #[tokio::test]
