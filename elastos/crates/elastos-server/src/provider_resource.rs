@@ -76,7 +76,17 @@ pub fn required_action_for(op: &str) -> Action {
         | "roots"
         | "ping"
         | "list_backends"
-        | "list_channels" => Action::Read,
+        | "list_channels"
+        // G3b drain (swarm-verified reads; manifest already declares `read`):
+        | "download"
+        | "events"
+        | "metadata_index"
+        | "read_bytes"
+        | "reconstruct_listing"
+        | "export_graph"
+        | "prepare_publish"
+        | "health"
+        | "list_models" => Action::Read,
         // ---- Write: creates/changes state but does not destroy --------------------------------
         "write"
         | "mkdir"
@@ -94,9 +104,14 @@ pub fn required_action_for(op: &str) -> Action {
         | "save"
         | "rename"
         | "move"
-        | "copy" => Action::Write,
+        | "copy"
+        // G3b drain (swarm-verified writes; manifest already declares `write`):
+        | "restore"
+        | "write_bytes"
+        | "import_graph" => Action::Write,
         // ---- Delete: destroys state -----------------------------------------------------------
-        "delete" | "delete_permanently" | "trash" | "unpublish" => Action::Delete,
+        // (G3b drain: `empty_trash` is swarm-verified destructive; manifest declares `delete`.)
+        "delete" | "delete_permanently" | "trash" | "unpublish" | "empty_trash" => Action::Delete,
         // ---- Message: peer messaging ----------------------------------------------------------
         "gossip_send" => Action::Message,
         // ---- Execute: invoke an authorized capability (sign/decrypt/connect/tx-assembly) ------

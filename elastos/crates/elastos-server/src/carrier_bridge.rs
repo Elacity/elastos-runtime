@@ -2227,8 +2227,7 @@ mod tests {
         // this test, and removing a fixed op without updating here also fails (so
         // the ledger cannot rot).
         let known_divergences: BTreeSet<(&str, &str)> = [
-            // -- class A: verb-map incomplete; op is a non-sensitive READ the
-            //    manifest already grants. Fix = add the verb-map entry (safe loosen).
+            // -- still-blanket manifests (fixed in the chunk-2 manifest split):
             ("ai-provider", "list_backends"),
             ("ai-provider", "ping"),
             ("llama-provider", "health"),
@@ -2236,19 +2235,9 @@ mod tests {
             ("llama-provider", "status"),
             ("tunnel-provider", "ping"),
             ("tunnel-provider", "status"),
-            ("operator-drive-adapter", "metadata_index"),
-            ("operator-drive-adapter", "read_bytes"),
-            ("object-provider", "events"),
-            ("content-market", "reconstruct_listing"),
-            ("content-block-graph-provider", "export_graph"),
-            // -- class B: WRITE/DELETE ops (mutate); fix = verb-map entry, but the
-            //    action loosens to Write/Delete — review the resource scope first.
-            ("operator-drive-adapter", "write_bytes"),
-            ("object-provider", "restore"),
-            ("object-provider", "download"),
-            ("object-provider", "empty_trash"), // permanent delete
-            ("object-provider", "share"),       // grants access — security-touching
-            ("content-block-graph-provider", "import_graph"),
+            // -- object-provider `share` STAYS: grants access — security-touching,
+            //    held for a dedicated review (Miller).
+            ("object-provider", "share"),
             // -- class C: EXECUTE / egress / actuator; sensitive, Execute-or-Admin.
             ("net-provider", "connect"),
             ("net-provider", "http"),
@@ -2263,7 +2252,6 @@ mod tests {
             ("browser-engine-adapter", "attach_stream"),
             ("browser-engine-adapter", "webrtc_signal"),
             ("drm-provider", "open"),
-            ("publish-provider", "prepare_publish"),
             // -- class D: manifest OVER-declares (blanket action); the verb map is
             //    already correct. Fix = split the MANIFEST's capability blocks, not
             //    the verb map (did/* declares blanket "execute" for read+write ops).
