@@ -958,11 +958,34 @@ pub(crate) async fn handle_request(
                         "message": "No provider for the requested scheme",
                     })
                 }
+                Err(elastos_runtime::provider::ProviderError::DidNotAct(reason)) => {
+                    // BUG-4 (op-failure slice): the provider rejected the request
+                    // BEFORE any side effect (its DidNotAct ocap contract), so the
+                    // consumed single use was a no-op — refund it. A replay of the
+                    // same rejected request is idempotent, so this cannot double-act.
+                    let remaining = bridge_ctx
+                        .capability_manager
+                        .refund_use(&consumed_token_id)
+                        .await;
+                    tracing::warn!(
+                        "bridge: provider rejected '{}/{}' before acting ({}); refunded \
+                         the unused single-use grant (use count now {})",
+                        dispatch.scheme,
+                        dispatch.operation,
+                        reason,
+                        remaining,
+                    );
+                    serde_json::json!({
+                        "type": "error",
+                        "code": "rejected",
+                        "message": "Provider rejected the request before acting",
+                    })
+                }
                 Err(e) => {
-                    // The provider RAN and failed; it may have partially acted, so the
-                    // single use stays consumed (refunding could enable a re-run of a
-                    // partially-applied effect — BUG-4 residual, deferred until a
-                    // provider "did-not-act" signal exists).
+                    // The provider RAN and may have partially acted, so the single
+                    // use stays consumed (refunding could enable a re-run of a
+                    // partially-applied effect — BUG-4). Only NoProvider (routing)
+                    // and DidNotAct (pre-effect rejection) are refund-safe.
                     tracing::warn!(
                         "Bridge carrier_invoke failed for {}/{}: {}",
                         dispatch.scheme,
@@ -1527,6 +1550,150 @@ mod tests {
         assert_eq!(
             r2["response"]["code"], "provider_not_found",
             "refunded single-use grant is reusable; old code would return capability_denied"
+        );
+    }
+
+    // --- BUG-4 (op-failure slice): DidNotAct refunds; an acted failure does not ---
+
+    /// A provider that PROVABLY rejects before any side effect (the DidNotAct ocap
+    /// contract) — e.g. a read-only / validate-first provider.
+    struct RejectsBeforeActingProvider;
+    #[async_trait::async_trait]
+    impl elastos_runtime::provider::Provider for RejectsBeforeActingProvider {
+        async fn handle(
+            &self,
+            _r: elastos_runtime::provider::ResourceRequest,
+        ) -> Result<
+            elastos_runtime::provider::ResourceResponse,
+            elastos_runtime::provider::ProviderError,
+        > {
+            Err(elastos_runtime::provider::ProviderError::DidNotAct(
+                "unused".into(),
+            ))
+        }
+        fn schemes(&self) -> Vec<&'static str> {
+            vec!["rights"]
+        }
+        fn name(&self) -> &'static str {
+            "test-rejects-before-acting"
+        }
+        async fn send_raw(
+            &self,
+            _request: &serde_json::Value,
+        ) -> Result<serde_json::Value, elastos_runtime::provider::ProviderError> {
+            Err(elastos_runtime::provider::ProviderError::DidNotAct(
+                "precondition failed; nothing mutated".into(),
+            ))
+        }
+    }
+
+    /// A provider that MUTATED and then failed — refunding here would let the
+    /// holder re-run a partially-applied effect, so the use must stay consumed.
+    struct ActsThenFailsProvider;
+    #[async_trait::async_trait]
+    impl elastos_runtime::provider::Provider for ActsThenFailsProvider {
+        async fn handle(
+            &self,
+            _r: elastos_runtime::provider::ResourceRequest,
+        ) -> Result<
+            elastos_runtime::provider::ResourceResponse,
+            elastos_runtime::provider::ProviderError,
+        > {
+            Err(elastos_runtime::provider::ProviderError::Provider(
+                "unused".into(),
+            ))
+        }
+        fn schemes(&self) -> Vec<&'static str> {
+            vec!["rights"]
+        }
+        fn name(&self) -> &'static str {
+            "test-acts-then-fails"
+        }
+        async fn send_raw(
+            &self,
+            _request: &serde_json::Value,
+        ) -> Result<serde_json::Value, elastos_runtime::provider::ProviderError> {
+            Err(elastos_runtime::provider::ProviderError::Provider(
+                "wrote then failed".into(),
+            ))
+        }
+    }
+
+    // Grant a single-use rights token + a two-arg `handle_request` driver over the
+    // shared rights-op dispatch, for the two op-failure cases below.
+    async fn single_use_rights_call(ctx: &BridgeContext) -> (String, impl Fn(String) -> String) {
+        use elastos_runtime::capability::token::TokenConstraints;
+        let uri = "elastos://rights/has_access_by_content_id";
+        let operation = "has_access_by_content_id";
+        let probe = serde_json::json!({
+            "type": "carrier_invoke", "uri": uri, "operation": operation, "body": {}
+        });
+        let dispatch = carrier_invoke_dispatch(&probe, None).expect("dispatch parses");
+        let required = required_action_for(&dispatch.operation);
+        let token = ctx.capability_manager.grant(
+            &ctx.capsule_id,
+            ResourceId::new(&dispatch.resource),
+            required,
+            TokenConstraints::new(0, false, None, Some(1)),
+            None,
+        );
+        let token_b64 = encode_bridge_capability_token(&token);
+        let call = move |tok: String| {
+            serde_json::json!({
+                "id": 1,
+                "request": {
+                    "type": "carrier_invoke", "uri": uri, "operation": operation,
+                    "token": tok, "body": {}
+                }
+            })
+            .to_string()
+        };
+        (token_b64, call)
+    }
+
+    /// DidNotAct (provably pre-effect) refunds the single use — the SAME token
+    /// reaches the provider twice (second call is still `rejected`, not denied).
+    #[tokio::test]
+    async fn carrier_invoke_refunds_single_use_grant_on_did_not_act() {
+        let ctx = bridge_context();
+        ctx.provider_registry
+            .register(Arc::new(RejectsBeforeActingProvider))
+            .await;
+        let (token_b64, call) = single_use_rights_call(&ctx).await;
+        let ctx_opt = Some(ctx.clone());
+
+        let r1 = handle_request(&call(token_b64.clone()), &ctx_opt)
+            .await
+            .unwrap();
+        assert_eq!(r1["response"]["code"], "rejected");
+
+        let r2 = handle_request(&call(token_b64), &ctx_opt).await.unwrap();
+        assert_eq!(
+            r2["response"]["code"], "rejected",
+            "DidNotAct refunds the single use; the grant is reusable"
+        );
+    }
+
+    /// An ACTED failure (provider ran and may have partially mutated) keeps the
+    /// single use consumed — the second call is denied (refund would double-act).
+    #[tokio::test]
+    async fn carrier_invoke_keeps_single_use_consumed_on_acted_failure() {
+        let ctx = bridge_context();
+        ctx.provider_registry
+            .register(Arc::new(ActsThenFailsProvider))
+            .await;
+        let (token_b64, call) = single_use_rights_call(&ctx).await;
+        let ctx_opt = Some(ctx.clone());
+
+        let r1 = handle_request(&call(token_b64.clone()), &ctx_opt)
+            .await
+            .unwrap();
+        assert_eq!(r1["response"]["code"], "provider_error");
+
+        let r2 = handle_request(&call(token_b64), &ctx_opt).await.unwrap();
+        assert_eq!(
+            r2["response"]["code"], "capability_denied",
+            "an acted failure keeps the use consumed (no unsafe refund)"
         );
     }
 

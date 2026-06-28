@@ -111,6 +111,17 @@ pub enum ProviderError {
     Provider(String),
     /// No provider for scheme
     NoProvider(String),
+    /// The provider REJECTED the request before performing any side effect — a
+    /// precondition/validation failure (missing field, bad shape, unknown op)
+    /// that provably left no observable state change.
+    ///
+    /// Ocap contract (load-bearing): a provider may return this ONLY when it is
+    /// certain nothing was mutated/emitted/spent, so the caller may safely refund
+    /// a single-use capability (a replay is an idempotent no-op). Any failure that
+    /// MIGHT have partially acted must use `Provider`/`Io`/`NotFound` instead, so
+    /// the use stays consumed (BUG-4: refunding a partial effect would enable a
+    /// second execution). When in doubt, do NOT use this variant.
+    DidNotAct(String),
     /// IO error
     Io(std::io::Error),
 }
@@ -406,6 +417,9 @@ impl std::fmt::Display for ProviderError {
             ProviderError::InvalidUri(uri) => write!(f, "invalid URI: {}", uri),
             ProviderError::Provider(msg) => write!(f, "provider error: {}", msg),
             ProviderError::NoProvider(scheme) => write!(f, "no provider for scheme: {}", scheme),
+            ProviderError::DidNotAct(msg) => {
+                write!(f, "request rejected before any effect: {}", msg)
+            }
             ProviderError::Io(e) => write!(f, "IO error: {}", e),
         }
     }

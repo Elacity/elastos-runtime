@@ -82,6 +82,7 @@ impl From<ProviderError> for StorageApiError {
             ProviderError::NoProvider(m) => {
                 StorageApiError::Internal(format!("No provider: {}", m))
             }
+            ProviderError::DidNotAct(m) => StorageApiError::InvalidPath(m),
             ProviderError::Provider(m) => StorageApiError::Internal(m),
             ProviderError::Io(e) => StorageApiError::Internal(e.to_string()),
         }
