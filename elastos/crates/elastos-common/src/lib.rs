@@ -19,7 +19,7 @@ pub use manifest::{
     ResourceLimits, SCHEMA_V1,
 };
 pub use reach::{
-    EgressReach, IsolationTier, ReachDescriptorV1, ResourceScope, Reversibility,
+    EgressAllowlist, EgressReach, IsolationTier, ReachDescriptorV1, ResourceScope, Reversibility,
     REACH_DESCRIPTOR_SCHEMA_V1,
 };
 pub use timestamp::{SecureTimestamp, CLOCK_SKEW_TOLERANCE_SECS};

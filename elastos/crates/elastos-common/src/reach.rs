@@ -13,9 +13,12 @@
 //! pinned (a resource-less or operation-less affordance), so the halo renders
 //! "incomplete" instead of a falsely-cool reading.
 //!
-//! v0 distinguishes only whether the network is reachable at all
-//! (`EgressReach::{None,Open}`); the host-level allow-list granularity arrives
-//! with W1 (egress-as-capability).
+//! W1 adds the egress-as-capability vocabulary: [`EgressReach::Allowlisted`]
+//! (a leashed, host-scoped grant) vs [`EgressReach::Open`] (wide), with the
+//! fail-closed [`EgressAllowlist`] matcher. Enforcing the allow-list at the
+//! kernel network boundary (the crosvm TAP firewall) is W1b — it needs KVM +
+//! `CAP_NET_ADMIN`, so the model lands here and the boundary lands on a host
+//! that has them.
 
 use serde::{Deserialize, Serialize};
 
@@ -24,15 +27,75 @@ use crate::manifest::{AffordanceRisk, CapsuleType, Permissions};
 /// Schema tag for the v1 reach descriptor.
 pub const REACH_DESCRIPTOR_SCHEMA_V1: &str = "elastos.reach.v1";
 
-/// Network egress an act can perform. v0 is coarse on purpose — the per-host
-/// allow-list (`Allowlisted`) is introduced by W1's egress-as-capability.
+/// Network egress an act can perform, tightest → broadest. The crucial moat
+/// distinction is `Allowlisted` (scoped, leashed) vs `Open` (anywhere): a
+/// verified capsule with `Open` egress can be visibly MORE dangerous than one
+/// scoped to a handful of hosts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EgressReach {
     /// No network egress — the capsule holds no NIC and is not a host process.
     None,
-    /// Can reach the network (a guest NIC or a host-process carrier service).
+    /// Network egress scoped to a bound [`EgressAllowlist`] — leashed, not open.
+    Allowlisted,
+    /// Unrestricted network egress (a NIC or host process with no reach scope).
     Open,
+}
+
+/// A reach-scoped egress capability: the exact hosts and schemes a capsule is
+/// permitted to reach (W1). Fail-closed by construction — an empty allow-list
+/// permits NOTHING, so "no grant" and "grant nothing" both deny.
+///
+/// NOTE (W1a scope): this is the egress-capability MODEL and its fail-closed
+/// matcher. Enforcing it at the wasmtime/crosvm network boundary (the kernel TAP
+/// firewall) and threading a bound allow-list through the launch path is W1b —
+/// it needs `/dev/kvm` + `CAP_NET_ADMIN`, which a sandbox CI host lacks, so it is
+/// deliberately NOT claimed here rather than faked.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressAllowlist {
+    /// Exact hostnames the capsule may reach (no wildcards in v1).
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    /// URL schemes the capsule may use (e.g. `https`).
+    #[serde(default)]
+    pub allowed_schemes: Vec<String>,
+}
+
+impl EgressAllowlist {
+    /// True when this allow-list grants no reach at all (so egress is denied).
+    pub fn is_empty(&self) -> bool {
+        self.allowed_hosts.is_empty() && self.allowed_schemes.is_empty()
+    }
+
+    /// Fail-closed admission: a `(host, scheme)` is permitted ONLY if the host is
+    /// explicitly listed AND the scheme is explicitly listed. An empty list on
+    /// either axis denies everything on that axis.
+    pub fn permits(&self, host: &str, scheme: &str) -> bool {
+        let host = host.trim();
+        let scheme = scheme.trim();
+        !host.is_empty()
+            && !scheme.is_empty()
+            && self.allowed_hosts.iter().any(|h| h == host)
+            && self.allowed_schemes.iter().any(|s| s == scheme)
+    }
+}
+
+impl EgressReach {
+    /// Resolve the egress reach from whether the capsule holds a net capability
+    /// and the reach allow-list bound to it (if any). Fail-closed and honest:
+    /// - no net capability                  → `None`
+    /// - net capability + non-empty allow   → `Allowlisted` (leashed)
+    /// - net capability + no/empty allow    → `Open` (wide — surfaced as the
+    ///   dangerous reading, never quietly downgraded)
+    pub fn resolve(has_net_capability: bool, allowlist: Option<&EgressAllowlist>) -> Self {
+        if !has_net_capability {
+            return EgressReach::None;
+        }
+        match allowlist {
+            Some(list) if !list.is_empty() => EgressReach::Allowlisted,
+            _ => EgressReach::Open,
+        }
+    }
 }
 
 /// The isolation boundary the capsule runs within — the container the blast is
@@ -287,6 +350,76 @@ mod tests {
             !no_verb.observed,
             "an operation-less affordance is incomplete"
         );
+    }
+
+    #[test]
+    fn egress_allowlist_is_fail_closed() {
+        // Empty allow-list permits nothing.
+        let empty = EgressAllowlist::default();
+        assert!(empty.is_empty());
+        assert!(!empty.permits("api.ela.city", "https"));
+
+        let list = EgressAllowlist {
+            allowed_hosts: vec!["api.ela.city".to_string()],
+            allowed_schemes: vec!["https".to_string()],
+        };
+        assert!(
+            list.permits("api.ela.city", "https"),
+            "listed host+scheme is permitted"
+        );
+        assert!(
+            !list.permits("evil.example", "https"),
+            "off-list host is denied"
+        );
+        assert!(
+            !list.permits("api.ela.city", "http"),
+            "off-list scheme is denied"
+        );
+        assert!(!list.permits("", "https"), "empty host is denied");
+    }
+
+    #[test]
+    fn egress_resolves_none_allowlisted_open_fail_closed() {
+        // No net capability → no egress, regardless of any allow-list.
+        assert_eq!(EgressReach::resolve(false, None), EgressReach::None);
+        let list = EgressAllowlist {
+            allowed_hosts: vec!["api.ela.city".to_string()],
+            allowed_schemes: vec!["https".to_string()],
+        };
+        assert_eq!(EgressReach::resolve(false, Some(&list)), EgressReach::None);
+        // Net capability scoped by a non-empty allow-list → leashed.
+        assert_eq!(
+            EgressReach::resolve(true, Some(&list)),
+            EgressReach::Allowlisted
+        );
+        // Net capability with no/empty scope → honestly wide open.
+        assert_eq!(EgressReach::resolve(true, None), EgressReach::Open);
+        assert_eq!(
+            EgressReach::resolve(true, Some(&EgressAllowlist::default())),
+            EgressReach::Open
+        );
+    }
+
+    #[test]
+    fn allowlisted_egress_is_not_far_reaching_but_open_is() {
+        // The moat distinction: a leashed egress is NOT far; an open one is.
+        let leashed = ReachDescriptorV1 {
+            schema: REACH_DESCRIPTOR_SCHEMA_V1.to_string(),
+            egress: EgressReach::Allowlisted,
+            isolation: IsolationTier::MicroVm,
+            scope: ResourceScope::Object,
+            reversibility: Reversibility::Reversible,
+            observed: true,
+        };
+        assert!(
+            !leashed.is_far_reaching(),
+            "a scoped (allowlisted) egress is not far-reaching"
+        );
+        let open = ReachDescriptorV1 {
+            egress: EgressReach::Open,
+            ..leashed.clone()
+        };
+        assert!(open.is_far_reaching(), "an open egress is far-reaching");
     }
 
     #[test]
