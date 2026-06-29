@@ -656,6 +656,7 @@ impl InspectSource for AggregateInspectSource {
 pub struct InspectProvider {
     source: Arc<dyn InspectSource>,
     audit: Option<Arc<dyn AuditSource>>,
+    spend_meter: Option<Arc<elastos_runtime::primitives::spend::SpendMeter>>,
 }
 
 impl InspectProvider {
@@ -663,6 +664,7 @@ impl InspectProvider {
         Self {
             source,
             audit: None,
+            spend_meter: None,
         }
     }
 
@@ -670,6 +672,26 @@ impl InspectProvider {
     pub fn with_audit(mut self, audit: Arc<dyn AuditSource>) -> Self {
         self.audit = Some(audit);
         self
+    }
+
+    /// Attach the shared spend meter so a capsule's detail view projects its live budget
+    /// (read-only — the inspector reflects the meter, never edits it). `None` ⇒ no `spend_budget`.
+    pub fn with_spend_meter(
+        mut self,
+        spend_meter: Option<Arc<elastos_runtime::primitives::spend::SpendMeter>>,
+    ) -> Self {
+        self.spend_meter = spend_meter;
+        self
+    }
+
+    /// Read-only projection of a capsule's budget (keyed on the canonical `vm-{name}`, the same key
+    /// the meter is debited under). `Null` when no meter is attached or the capsule is unprovisioned.
+    fn spend_budget_value(&self, entry: &InspectEntry) -> Value {
+        self.spend_meter
+            .as_ref()
+            .and_then(|m| m.snapshot(&format!("vm-{}", entry.name)))
+            .and_then(|snap| serde_json::to_value(snap).ok())
+            .unwrap_or(Value::Null)
     }
 
     fn scope_label(scope: InspectScope) -> &'static str {
@@ -682,7 +704,7 @@ impl InspectProvider {
     /// Project a capsule into the inspector wire contract (see
     /// docs/CAPSULE_INSPECTOR.md). Read-only; unknown fields are null rather
     /// than fabricated, and no bearer token / raw signature is ever included.
-    fn project(entry: &InspectEntry, audit: Value, granted: Value) -> Value {
+    fn project(entry: &InspectEntry, audit: Value, granted: Value, spend_budget: Value) -> Value {
         fn field(v: &Value, key: &str) -> Value {
             v.get(key).cloned().unwrap_or(Value::Null)
         }
@@ -801,6 +823,9 @@ impl InspectProvider {
             // + unsigned per G8, and NEVER the manifest's requested capabilities
             // (those stay in required_capabilities above). Empty when unobserved.
             "granted_capabilities": granted,
+            // Live per-capsule spend budget {limit, spent, remaining}, keyed on vm-{name} — a
+            // read-only projection of the meter the act paths debit. Null when unmetered/unprovisioned.
+            "spend_budget": spend_budget,
             "storage_namespaces": manifest
                 .pointer("/permissions/storage")
                 .cloned()
@@ -905,7 +930,8 @@ impl InspectProvider {
                     Some(entry) => {
                         let audit = self.audit_value(&entry).await;
                         let granted = self.granted_value(&entry).await;
-                        json!({ "status": "ok", "data": Self::project(&entry, audit, granted) })
+                        let spend_budget = self.spend_budget_value(&entry);
+                        json!({ "status": "ok", "data": Self::project(&entry, audit, granted, spend_budget) })
                     }
                     None => provider_error("not_found", "no such capsule"),
                 },
@@ -933,7 +959,8 @@ impl InspectProvider {
                     Some(entry) => {
                         let audit = self.audit_value(&entry).await;
                         let granted_v = self.granted_value(&entry).await;
-                        json!({ "status": "ok", "data": Self::project(&entry, audit, granted_v) })
+                        let spend_budget = self.spend_budget_value(&entry);
+                        json!({ "status": "ok", "data": Self::project(&entry, audit, granted_v, spend_budget) })
                     }
                     None => provider_error("not_found", "no such capsule"),
                 }
@@ -1298,6 +1325,42 @@ mod tests {
         assert_eq!(resp["data"]["scope"], "system");
         assert_eq!(resp["data"]["capsules"][0]["id"], "cap_probe_1");
         assert_eq!(resp["data"]["capsules"][0]["name"], "probe");
+    }
+
+    #[tokio::test]
+    async fn capsule_detail_projects_live_spend_budget() {
+        use elastos_runtime::primitives::spend::SpendMeter;
+
+        // A capsule's budget is keyed on the canonical vm-{name}; the detail view reflects it.
+        let meter = Arc::new(SpendMeter::new());
+        meter.set_budget("vm-probe", 100);
+        meter.try_debit("vm-probe", 30).unwrap();
+
+        let provider = InspectProvider::new(Arc::new(MockSource {
+            entries: vec![probe_entry()],
+        }))
+        .with_spend_meter(Some(meter.clone()));
+        let resp = provider
+            .send_raw(&json!({ "op": "capsule", "id": "cap_probe_1" }))
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["data"]["spend_budget"]["limit"], 100);
+        assert_eq!(resp["data"]["spend_budget"]["spent"], 30);
+        assert_eq!(
+            resp["data"]["spend_budget"]["remaining"], 70,
+            "the inspector projects the live remaining budget: {resp}"
+        );
+
+        // No meter attached ⇒ null, never fabricated (honest projection).
+        let bare = provider_with_probe()
+            .send_raw(&json!({ "op": "capsule", "id": "cap_probe_1" }))
+            .await
+            .unwrap();
+        assert!(
+            bare["data"]["spend_budget"].is_null(),
+            "an unmetered inspector must project null, not a fabricated budget"
+        );
     }
 
     fn provider_entry(id: &str, name: &str, resource: &str, ops: &[&str]) -> InspectEntry {

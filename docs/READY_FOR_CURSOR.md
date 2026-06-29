@@ -140,11 +140,12 @@ the next product arc, none of it started here:
   spawner) — the enforcement is the shared `carrier_invoke` dispatch, so the three only differ in wiring.
   **Cursor TODO / residual:** (a) the microVM + WASM paths can only be EXERCISED on KVM / with a running
   WASM capsule — confirm a capsule's acts debit the budget and the `budget_exhausted` refusal surfaces in
-  the guest (the logic itself is unit-tested via the shared dispatch); (b) **OBSERVABILITY** — `SpendMeter::snapshot`
-  + the serializable `BudgetSnapshot {limit, spent, remaining}` are landed (the read-only projection the
-  moat promises), but NOT yet surfaced on the inspector / Home UI / a read endpoint — wiring it needs the
-  meter threaded into the read component (same plumbing as below); SpendDebit audit events already carry
-  `remaining` in the meantime; (c) the consent/affordance dispatch path
+  the guest (the logic itself is unit-tested via the shared dispatch); (b) **OBSERVABILITY — surfaced:** the capsule
+  inspector detail view (`inspect/capsule` + `inspect/self`) now projects a read-only `spend_budget`
+  `{limit, spent, remaining}` field, keyed on the canonical `vm-{name}`, via
+  `InspectProvider::with_spend_meter` over the shared `infra.spend_policy` meter (null when unmetered, never
+  fabricated). The Home UI just renders this field — no new crypto, a pure projection. Remaining: a Home-UI
+  pixel for it + (optionally) a dedicated read endpoint; (c) the consent/affordance dispatch path
   (`gateway_capsule_catalog::dispatch_consented_affordance`) is NOT metered — but it is **human-consent-
   gated per act** (each dispatch consumes a single-use `ValidatedAffordanceGrant` that only a successful
   redeem produces), so it is NOT an autonomous-agent bypass; metering it is defense-in-depth and needs the

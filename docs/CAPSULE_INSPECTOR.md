@@ -286,7 +286,15 @@ resource + action), mirroring the runtime-side fold so the two agree. These are
 *observed / best-effort / unsigned* (per G8), `granted=false` means an observed
 grant whose later use was denied, and they are **never** the manifest's requested
 capabilities (those stay in `required_capabilities`). Honest empty when nothing
-was observed. **Remaining (G1b):** the live serve path still attaches only
+was observed.
+
+**`spend_budget` (observed, wired):** a read-only `{limit, spent, remaining}` projection of the
+capsule's live spend budget (keyed on the canonical `vm-{name}`), via
+`InspectProvider::with_spend_meter` over the shared `infra.spend_policy` meter — the same meter the
+act paths debit. `null` when no meter is attached or the capsule is unprovisioned (never fabricated).
+This is a pure projection: the Home UI renders it; the meter stays the single source of truth.
+
+**Remaining (G1b):** the live serve path still attaches only
 `AuthAuditSource` (signed activity, no grants), so production inspect populates
 grants only once serve *composes* the grant source in. Everything else is done:
 projection, scope, no-leak, transport wiring, source aggregation, rich manifest

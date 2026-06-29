@@ -210,7 +210,13 @@ pub async fn run_serve(
                     ));
                     let audit = Arc::new(ip::CompositeAuditSource::new(activity, grants));
                     provider_registry
-                        .register(Arc::new(ip::InspectProvider::new(source).with_audit(audit)))
+                        .register(Arc::new(
+                            ip::InspectProvider::new(source)
+                                .with_audit(audit)
+                                .with_spend_meter(
+                                    infra.spend_policy.as_ref().map(|p| p.meter.clone()),
+                                ),
+                        ))
                         .await;
                 }
 
@@ -338,7 +344,11 @@ pub async fn run_serve(
         let audit = Arc::new(ip::CompositeAuditSource::new(activity, grants));
         infra
             .provider_registry
-            .register(Arc::new(ip::InspectProvider::new(source).with_audit(audit)))
+            .register(Arc::new(
+                ip::InspectProvider::new(source)
+                    .with_audit(audit)
+                    .with_spend_meter(infra.spend_policy.as_ref().map(|p| p.meter.clone())),
+            ))
             .await;
     }
 
@@ -557,7 +567,11 @@ pub async fn run_mcp_serve() -> anyhow::Result<()> {
         let audit = Arc::new(ip::CompositeAuditSource::new(activity, grants));
         infra
             .provider_registry
-            .register(Arc::new(ip::InspectProvider::new(source).with_audit(audit)))
+            .register(Arc::new(
+                ip::InspectProvider::new(source)
+                    .with_audit(audit)
+                    .with_spend_meter(infra.spend_policy.as_ref().map(|p| p.meter.clone())),
+            ))
             .await;
     }
 
