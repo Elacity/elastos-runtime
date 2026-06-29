@@ -2415,4 +2415,39 @@ mod tests {
             "a tampered entrypoint must fail the signature gate"
         );
     }
+
+    // AUD-1 ACTIVATION round-trip: the founder path is config `trusted_keys` (HEX) →
+    // `from_trusted_keys_hex` (the seed) → `gate_author_signature` (the launch gate).
+    // These pin that the seed and the gate compose end to end, so a HEX-configured key
+    // admits exactly its own capsules — not just that `add_trusted_key(vk)` works.
+    #[test]
+    fn aud1_activation_hex_configured_key_admits_its_capsule() {
+        let (sk, vk) = generate_keypair();
+        let (dir, manifest) = aud1_signed_capsule(&sk, b"rootfs bytes");
+        // Exactly what serve does: seed the verifier from the configured hex public key.
+        let verifier =
+            SignatureVerifier::from_trusted_keys_hex([hex::encode(vk.as_bytes())]).unwrap();
+        assert!(
+            verifier.is_enabled(),
+            "a configured key must enable the gate"
+        );
+        assert!(
+            gate_author_signature(&verifier, dir.path(), &manifest).is_ok(),
+            "a capsule signed by the hex-configured trusted key must launch"
+        );
+    }
+
+    #[test]
+    fn aud1_activation_hex_configured_key_refuses_a_foreign_capsule() {
+        let (_founder_sk, founder_vk) = generate_keypair();
+        let (foreign_sk, _foreign_vk) = generate_keypair();
+        // The capsule is signed by a key NOT in the founder's configured trusted set.
+        let (dir, manifest) = aud1_signed_capsule(&foreign_sk, b"rootfs bytes");
+        let verifier =
+            SignatureVerifier::from_trusted_keys_hex([hex::encode(founder_vk.as_bytes())]).unwrap();
+        assert!(
+            gate_author_signature(&verifier, dir.path(), &manifest).is_err(),
+            "a capsule signed by a key outside the configured trusted set must be refused"
+        );
+    }
 }
