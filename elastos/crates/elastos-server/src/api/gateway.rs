@@ -1145,7 +1145,7 @@ mod aud2_audit_failclosed_tests {
 #[cfg(test)]
 mod audit_unification_tests {
     use super::*;
-    use elastos_runtime::primitives::audit::{AuditEvent, AuditLog};
+    use elastos_runtime::primitives::audit::AuditLog;
 
     fn state_with_audit(
         dir: &std::path::Path,
@@ -1162,32 +1162,54 @@ mod audit_unification_tests {
     }
 
     #[test]
-    fn gateway_unifies_onto_a_durable_shared_chain_and_records_verifiably() {
-        // When the shared runtime log is durable, the gateway must reuse that SAME chain
-        // (one unified custody log), and an event recorded through the gateway handle must
-        // verify on it (the folded verify-on-read proof).
+    fn gateway_records_a_real_content_open_onto_the_shared_chain_and_it_verifies() {
+        // A REAL gateway custody event — the `content_open` record the owned-open path writes
+        // (viewer_open.rs) — must land on infra.audit_log AND verify under chain_attestation, not
+        // merely share an Arc. Read the attestation from the ORIGINAL infra handle to prove the
+        // event reached infra.audit_log itself.
         let dir = tempfile::tempdir().unwrap();
-        let shared = Arc::new(AuditLog::with_file(dir.path().join("unified.log")).unwrap());
-        let cell = seed_gateway_audit_log(Some(shared.clone()));
+        let infra = Arc::new(AuditLog::with_file(dir.path().join("unified.log")).unwrap());
+
+        // SEED-BEFORE-USE: the cell is born seeded at construction, so no audit_log() call can run
+        // first and silently leave the gateway on its own file (a later OnceLock::set would no-op).
+        let cell = seed_gateway_audit_log(Some(infra.clone()));
+        assert!(
+            cell.get().is_some(),
+            "the durable shared log must be seeded eagerly at construction (before any audit_log() call)"
+        );
         let state = state_with_audit(dir.path(), cell);
 
         let got = state.audit_log().expect("durable shared log is available");
         assert!(
-            Arc::ptr_eq(&got, &shared),
+            Arc::ptr_eq(&got, &infra),
             "gateway must ride the SAME shared custody chain, not a separate sink"
         );
 
-        got.emit(AuditEvent::Custom {
-            event_type: "gateway_unification_probe".into(),
-            details: serde_json::json!({"k": "v"}),
-        })
-        .expect("emit onto the unified durable chain");
-        let att = got
+        // The exact custody call the gateway's owned-open path makes for a denied open.
+        got.content_open(
+            "sess-1",
+            "did:ela:alice",
+            "bafyreigatewayprobe",
+            "open",
+            "denied",
+            "rights-provider",
+            None,
+        )
+        .expect("the gateway content_open record commits to the unified durable chain");
+
+        // Attest from the ORIGINAL infra handle (not `got`): the gateway's event is on
+        // infra.audit_log, and the live full-chain verify-on-read walk accepts it.
+        let att = infra
             .chain_attestation()
             .expect("a durable chain attests itself");
         assert!(
-            att.verified && att.records >= 1,
-            "a gateway-recorded event must be verifiable on the unified chain (got {att:?})"
+            att.verified,
+            "the gateway-recorded content_open must verify on the unified chain (got {att:?})"
+        );
+        assert!(
+            att.records >= 1,
+            "the gateway content_open must be present on infra.audit_log (records {})",
+            att.records
         );
     }
 
