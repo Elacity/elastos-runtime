@@ -28,6 +28,16 @@ use std::sync::RwLock;
 /// go negative; the caller owns the unit and stays consistent.
 pub type SpendUnits = u64;
 
+/// A read-only view of one key's budget — the projection a UI / inspector / API renders. Per the
+/// moat ("every pixel is a read-only projection of real crypto"), a surface shows THIS; it never
+/// holds an editable budget field. Serializable so a projection layer can ship it as-is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct BudgetSnapshot {
+    pub limit: SpendUnits,
+    pub spent: SpendUnits,
+    pub remaining: SpendUnits,
+}
+
 /// Why a debit was refused. Every variant means **nothing was debited** (fail-closed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpendError {
@@ -123,6 +133,18 @@ impl SpendMeter {
             Ok(balances) => balances.get(key).map(Balance::remaining).unwrap_or(0),
             Err(_) => 0,
         }
+    }
+
+    /// A read-only [`BudgetSnapshot`] of `key` for projection (UI / inspector / API). `None` if the
+    /// key has no provisioned budget. OBSERVE-only — it never mutates; the meter stays the single
+    /// source of truth the projection reflects.
+    pub fn snapshot(&self, key: &str) -> Option<BudgetSnapshot> {
+        let balances = self.balances.read().ok()?;
+        balances.get(key).map(|b| BudgetSnapshot {
+            limit: b.limit,
+            spent: b.spent,
+            remaining: b.remaining(),
+        })
     }
 
     /// Atomically debit `cost` from `key` if it fits, else refuse and debit NOTHING. On success
@@ -270,6 +292,26 @@ mod tests {
                 requested: 1,
                 remaining: 0
             }
+        );
+    }
+
+    #[test]
+    fn snapshot_projects_limit_spent_remaining() {
+        let meter = SpendMeter::new();
+        assert_eq!(
+            meter.snapshot("vm-ghost"),
+            None,
+            "an unprovisioned key has no budget to project"
+        );
+        meter.set_budget("vm-alice", 100);
+        meter.try_debit("vm-alice", 30).unwrap();
+        assert_eq!(
+            meter.snapshot("vm-alice"),
+            Some(BudgetSnapshot {
+                limit: 100,
+                spent: 30,
+                remaining: 70,
+            })
         );
     }
 

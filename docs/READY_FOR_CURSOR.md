@@ -140,12 +140,18 @@ the next product arc, none of it started here:
   spawner) — the enforcement is the shared `carrier_invoke` dispatch, so the three only differ in wiring.
   **Cursor TODO / residual:** (a) the microVM + WASM paths can only be EXERCISED on KVM / with a running
   WASM capsule — confirm a capsule's acts debit the budget and the `budget_exhausted` refusal surfaces in
-  the guest (the logic itself is unit-tested via the shared dispatch); (b) the consent/affordance dispatch
-  path (`gateway_capsule_catalog::dispatch_consented_affordance`) is the LAST unmetered act path — until it
-  is metered, an agent could route a consented affordance to spend uncharged; (c) per-capsule budgets are a
-  flat default — a real per-principal/quota policy + a top-up path is a product decision; (d) `cost_units`
-  is provider-reported (trusted infra) — a malicious provider under-reporting to dodge the meter is out of
-  scope (providers run under operator authority), but worth naming.
+  the guest (the logic itself is unit-tested via the shared dispatch); (b) **OBSERVABILITY** — `SpendMeter::snapshot`
+  + the serializable `BudgetSnapshot {limit, spent, remaining}` are landed (the read-only projection the
+  moat promises), but NOT yet surfaced on the inspector / Home UI / a read endpoint — wiring it needs the
+  meter threaded into the read component (same plumbing as below); SpendDebit audit events already carry
+  `remaining` in the meantime; (c) the consent/affordance dispatch path
+  (`gateway_capsule_catalog::dispatch_consented_affordance`) is NOT metered — but it is **human-consent-
+  gated per act** (each dispatch consumes a single-use `ValidatedAffordanceGrant` that only a successful
+  redeem produces), so it is NOT an autonomous-agent bypass; metering it is defense-in-depth and needs the
+  gateway to share infra's meter (the same unification follow-on as the gateway audit sink); (d) per-capsule
+  budgets are a flat default — a real per-principal/quota policy + a top-up path is a product decision;
+  (e) `cost_units` is provider-reported (trusted infra) — a malicious provider under-reporting to dodge the
+  meter is out of scope (providers run under operator authority), but worth naming.
 - **Free-text NL → intent** (adoption wedge #3) — the AI-backend "brain" track.
 - **The marketplace of shells** — multiple untrusted shells over the ESP protocol.
 
