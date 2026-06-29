@@ -205,6 +205,8 @@ check_required 'read-only projection of signed runtime state' docs/ESP_SHELL_UI.
 check_required 'spendBudgetView' elastos/esp/spend_audit.ts 'W5b: SpendBudgetMeter must project the spend_budget snapshot via spendBudgetView'
 check_required 'auditChainView' elastos/esp/spend_audit.ts 'W5b: AuditChainBadge must project the audit chain attestation via auditChainView'
 check_required 'homeCustodyView' elastos/esp/spend_audit.ts 'W5b: the Home capsule-detail custody panel must compose the two projections via homeCustodyView'
+check_required 'data-channel="audit"' elastos/esp/CapsuleCustodyPanel.svelte 'W5b: CapsuleCustodyPanel must paint the audit-chain custody channel'
+check_required 'CapsuleCustodyPanel' docs/ESP_SHELL_UI.md 'W5b: shell-UI spec must define the capsule custody panel component'
 check_required 'SpendBudgetMeter' docs/ESP_SHELL_UI.md 'W5b: shell-UI spec must define the spend-budget meter'
 check_required 'AuditChainBadge' docs/ESP_SHELL_UI.md 'W5b: shell-UI spec must define the audit-chain badge'
 

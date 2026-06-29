@@ -143,10 +143,24 @@ Each component lists: **props** (the ESP fact type + its schema tag), the
   **broken** (a tamper warning surfacing the first break), never optimistically green.
 - **Intent:** none (pure display).
 
-The Home capsule-detail panel paints both together via `homeCustodyView(spend_budget,
-audit.chain)` — a PURE composition (`{ spend, audit }`, no roll-up verdict), so the
-panel can only be "green" when BOTH the spend meter and the audit chain are themselves
-honestly green; an absent/broken chain or exhausted budget can never be masked.
+### `<CapsuleCustodyPanel>` — the Home capsule-detail custody panel
+- **Props:** a `HomeCustodyView` (from `homeCustodyView(spend_budget, audit.chain)`).
+- **Projects:** nothing of its own — it is **pure paint** over the already-projected
+  view. It maps each honest sub-state to a display label + a `data-state` attribute
+  and nothing else.
+- **Renders:** two channels — Spend (`unmetered` / `ok` / `warning` / `exhausted`)
+  and Audit chain (`absent` / `verified` / `broken`). There is deliberately no
+  "all-good" affordance keyed on anything but the honest sub-states, so an unmetered/
+  exhausted budget or an absent/broken chain can never be masked by a green panel.
+- **Intent:** none (pure display).
+- **Harness:** server-side rendered (`svelte/server`) and snapshot-tested headlessly
+  under `node:test` (`capsule_custody_panel.test.mjs`) — macOS-gateable, no browser.
+
+The Home capsule-detail panel paints both facts together via `homeCustodyView(
+spend_budget, audit.chain)` — a PURE composition (`{ spend, audit }`, no roll-up
+verdict), so the panel can only be "green" when BOTH the spend meter and the audit
+chain are themselves honestly green; an absent/broken chain or exhausted budget can
+never be masked.
 
 ## Composition
 
