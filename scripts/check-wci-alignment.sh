@@ -202,6 +202,10 @@ check_required '/api/capsules/interfaces/invoke' elastos/crates/elastos-server/s
 check_required 'elastos.audit.ai-act.v1' elastos/esp/ai_act_audit.ts 'W5b: AiActAuditCard fact tag must exist in esp/ai_act_audit.ts'
 check_required 'AiActAuditCard' docs/ESP_SHELL_UI.md 'W5b: shell-UI spec must define the AI-Act containment card'
 check_required 'read-only projection of signed runtime state' docs/ESP_SHELL_UI.md 'W5b: shell-UI spec must codify the no-authority-in-the-view invariant'
+check_required 'spendBudgetView' elastos/esp/spend_audit.ts 'W5b: SpendBudgetMeter must project the spend_budget snapshot via spendBudgetView'
+check_required 'auditChainView' elastos/esp/spend_audit.ts 'W5b: AuditChainBadge must project the audit chain attestation via auditChainView'
+check_required 'SpendBudgetMeter' docs/ESP_SHELL_UI.md 'W5b: shell-UI spec must define the spend-budget meter'
+check_required 'AuditChainBadge' docs/ESP_SHELL_UI.md 'W5b: shell-UI spec must define the audit-chain badge'
 
 # W1b: the egress-firewall design must stay anchored to the reach API + TAP hook it builds on.
 check_required 'EgressReach::resolve' elastos/crates/elastos-common/src/reach.rs 'W1b: the firewall keys on EgressReach::resolve, which must exist in reach.rs'

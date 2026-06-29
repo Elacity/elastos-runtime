@@ -121,6 +121,28 @@ Each component lists: **props** (the ESP fact type + its schema tag), the
   evidence are one object.
 - **Intent:** `export-audit(record)` (download/relay the record; mints nothing).
 
+### `<SpendBudgetMeter>` — the agent's act budget (adoption wedge #4)
+- **Props:** `BudgetSnapshotV1 | null` (the inspector's `spend_budget` field, mirror
+  of `primitives::spend::BudgetSnapshot`).
+- **Projects:** `spendBudgetView(snapshot)` → `{ metered, limit, spent, remaining,
+  fractionUsed, exhausted, state }`.
+- **Renders:** a budget meter. Fail-honest: `null` ⇒ **unmetered** (the meter is
+  hidden, NOT shown as a satisfied 0/0); a drained or hard-stop (limit 0) budget
+  renders **exhausted**; `fractionUsed ≥ 0.8` renders a **warning**. The view never
+  fabricates a budget and never edits the meter.
+- **Intent:** none (pure display).
+
+### `<AuditChainBadge>` — the flight recorder's live integrity
+- **Props:** `ChainAttestation | null` (the inspector `audit_attestation` op /
+  `audit.chain` field, mirror of `primitives::audit::ChainAttestation`).
+- **Projects:** `auditChainView(chain)` → `{ present, verified, records, signer,
+  error, state }`.
+- **Renders:** a chain-integrity chip. Fail-honest: `null` ⇒ **absent** ("no durable
+  chain to attest" — neither pass nor fail, mirroring a memory-only plane); a present
+  clean walk ⇒ **verified** (records + signer); a present-but-unverified chain ⇒
+  **broken** (a tamper warning surfacing the first break), never optimistically green.
+- **Intent:** none (pure display).
+
 ## Composition
 
 ```
@@ -154,6 +176,8 @@ routes. This keeps the "pixel ⇄ signed fact" mapping enforceable, not aspirati
 | `<ShellPicker>` | `CapsuleCatalogResponse` | `elastos.capsules.catalog/v1` |
 | `<RefractionToggle>` | `RefractionState<T>` | (generic — the wrapped fact's tag) |
 | `<AiActAuditCard>` | `AiActAuditRecordV1` | `elastos.audit.ai-act.v1` |
+| `<SpendBudgetMeter>` | `BudgetSnapshotV1` | (inspector `spend_budget`; mirrors `primitives::spend::BudgetSnapshot`) |
+| `<AuditChainBadge>` | `ChainAttestation` | (inspector `audit.chain`; mirrors `primitives::audit::ChainAttestation`) |
 
 ## What W5b implementation must NOT do
 
