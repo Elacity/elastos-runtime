@@ -47,6 +47,29 @@ impl SignatureVerifier {
         Ok(())
     }
 
+    /// Build a verifier from an iterator of hex-encoded trusted keys, FAIL-CLOSED.
+    ///
+    /// This is the AUD-1 activation seed: the author-signature launch gate becomes
+    /// enabled (and fail-closed at launch) exactly when the founder configures
+    /// `trusted_keys`. Semantics, all-or-nothing:
+    /// - an EMPTY iterator yields a DISABLED verifier (`is_enabled() == false`) — the
+    ///   gate stays inert and launches are byte-for-byte unchanged;
+    /// - a single malformed/invalid-length/bad-point hex key returns `Err`, so the
+    ///   caller (serve startup) aborts LOUDLY rather than proceeding with a PARTIAL or
+    ///   empty keyset that would fail OPEN. Either every configured key is trusted, or
+    ///   the process refuses to start.
+    pub fn from_trusted_keys_hex<I, S>(keys: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut verifier = Self::new();
+        for key in keys {
+            verifier.add_trusted_key_hex(key.as_ref())?;
+        }
+        Ok(verifier)
+    }
+
     /// Load trusted keys from a file (one hex-encoded key per line)
     pub fn load_trusted_keys(&mut self, path: &Path) -> Result<usize> {
         let content = std::fs::read_to_string(path)?;
@@ -443,6 +466,47 @@ mod tests {
         verifier.add_trusted_key_hex(&hex_key).unwrap();
 
         assert_eq!(verifier.trusted_key_count(), 1);
+    }
+
+    #[test]
+    fn from_trusted_keys_hex_empty_is_disabled() {
+        // No configured keys ⇒ AUD-1 gate stays inert (launches byte-for-byte unchanged).
+        let verifier = SignatureVerifier::from_trusted_keys_hex(Vec::<String>::new()).unwrap();
+        assert!(
+            !verifier.is_enabled(),
+            "an empty keyset must leave the gate disabled"
+        );
+        assert_eq!(verifier.trusted_key_count(), 0);
+    }
+
+    #[test]
+    fn from_trusted_keys_hex_valid_keys_enable_the_gate() {
+        let (_, vk1) = generate_keypair();
+        let (_, vk2) = generate_keypair();
+        let keys = vec![hex::encode(vk1.as_bytes()), hex::encode(vk2.as_bytes())];
+        let verifier = SignatureVerifier::from_trusted_keys_hex(keys).unwrap();
+        assert!(
+            verifier.is_enabled(),
+            "configured keys must enable the gate"
+        );
+        assert_eq!(verifier.trusted_key_count(), 2);
+    }
+
+    #[test]
+    fn from_trusted_keys_hex_fails_closed_on_a_malformed_key() {
+        // A single bad entry must abort the build (Err) — never a PARTIAL keyset that
+        // would fail OPEN. A valid key before the bad one does not rescue it.
+        let (_, vk) = generate_keypair();
+        let keys = vec![hex::encode(vk.as_bytes()), "nothex".to_string()];
+        assert!(
+            SignatureVerifier::from_trusted_keys_hex(keys).is_err(),
+            "a malformed trusted key must fail closed, not yield a partial verifier"
+        );
+        // Valid hex but wrong byte length also fails closed (not a 32-byte ed25519 key).
+        assert!(
+            SignatureVerifier::from_trusted_keys_hex(vec!["deadbeef"]).is_err(),
+            "a wrong-length key must fail closed"
+        );
     }
 
     #[test]

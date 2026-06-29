@@ -441,15 +441,16 @@ pub async fn run_serve(
             // AUD-1: seed the author-signature launch gate from config `trusted_keys`.
             // Empty by default (gate inert, launches byte-for-byte unchanged); a
             // malformed hex key aborts serve startup LOUDLY (fail-closed at boot) rather
-            // than dropping it and leaving a partial/empty keyset that fails open.
-            let mut verifier = elastos_runtime::signature::SignatureVerifier::new();
-            for key_hex in runtime_config.effective_trusted_keys() {
-                verifier.add_trusted_key_hex(&key_hex).map_err(|e| {
-                    anyhow::anyhow!(
-                        "invalid trusted_keys entry in runtime config (refusing to start): {e}"
-                    )
-                })?;
-            }
+            // than dropping it and leaving a partial/empty keyset that fails open. The
+            // all-or-nothing seed is the unit-tested `from_trusted_keys_hex` primitive.
+            let verifier = elastos_runtime::signature::SignatureVerifier::from_trusted_keys_hex(
+                runtime_config.effective_trusted_keys(),
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid trusted_keys entry in runtime config (refusing to start): {e}"
+                )
+            })?;
             s.set_signature_verifier(verifier);
             Some(Arc::new(s))
         } else {
