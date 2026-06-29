@@ -15,6 +15,7 @@ import type { ChainAttestation } from "./ai_act_audit.js";
 import {
   SPEND_WARNING_FRACTION,
   auditChainView,
+  homeCustodyView,
   spendBudgetView,
   type BudgetSnapshotV1,
 } from "./spend_audit.js";
@@ -104,5 +105,54 @@ describe("auditChainView (the flight recorder)", () => {
     assert.equal(v.state, "broken");
     assert.equal(v.verified, false);
     assert.ok((v.error ?? "").includes("tamper"), "the first break is surfaced, not hidden");
+  });
+});
+
+describe("homeCustodyView (the Home capsule-detail custody panel)", () => {
+  const verified: ChainAttestation = { verified: true, records: 42, signer: "deadbeefkey", error: null };
+  const broken: ChainAttestation = {
+    verified: false,
+    records: 0,
+    signer: "deadbeefkey",
+    error: "audit tamper at seq 7: record_hash mismatch",
+  };
+
+  it("is a pure composition — each field is exactly its own projection", () => {
+    const snap: BudgetSnapshotV1 = { limit: 100, spent: 30, remaining: 70 };
+    const v = homeCustodyView(snap, verified);
+    assert.deepEqual(v.spend, spendBudgetView(snap));
+    assert.deepEqual(v.audit, auditChainView(verified));
+    // No roll-up verdict field was invented (no new logic over the two projections).
+    assert.deepEqual(Object.keys(v).sort(), ["audit", "spend"]);
+  });
+
+  it("the ONLY all-green panel is metered-ok + verified", () => {
+    const v = homeCustodyView({ limit: 100, spent: 30, remaining: 70 }, verified);
+    assert.equal(v.spend.state, "ok");
+    assert.equal(v.audit.state, "verified");
+  });
+
+  it("unmetered + absent never reads as a satisfied/green panel", () => {
+    const v = homeCustodyView(null, null);
+    assert.equal(v.spend.state, "unmetered");
+    assert.equal(v.spend.metered, false);
+    assert.equal(v.audit.state, "absent");
+    assert.equal(v.audit.present, false);
+    // Absence on both channels must NOT masquerade as verified/ok.
+    assert.ok(v.audit.state !== "verified", "absent chain must not read as verified");
+    assert.ok(v.spend.state !== "ok", "unmetered spend must not read as ok");
+  });
+
+  it("a warning budget is carried through verbatim (not softened)", () => {
+    const v = homeCustodyView({ limit: 100, spent: 90, remaining: 10 }, verified);
+    assert.equal(v.spend.state, "warning");
+    assert.equal(v.audit.state, "verified");
+  });
+
+  it("exhausted spend + broken chain surfaces BOTH alarms, never green", () => {
+    const v = homeCustodyView({ limit: 100, spent: 100, remaining: 0 }, broken);
+    assert.equal(v.spend.state, "exhausted");
+    assert.equal(v.audit.state, "broken");
+    assert.equal(v.audit.verified, false, "a tampered chain can never render verified on the panel");
   });
 });

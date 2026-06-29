@@ -204,6 +204,7 @@ check_required 'AiActAuditCard' docs/ESP_SHELL_UI.md 'W5b: shell-UI spec must de
 check_required 'read-only projection of signed runtime state' docs/ESP_SHELL_UI.md 'W5b: shell-UI spec must codify the no-authority-in-the-view invariant'
 check_required 'spendBudgetView' elastos/esp/spend_audit.ts 'W5b: SpendBudgetMeter must project the spend_budget snapshot via spendBudgetView'
 check_required 'auditChainView' elastos/esp/spend_audit.ts 'W5b: AuditChainBadge must project the audit chain attestation via auditChainView'
+check_required 'homeCustodyView' elastos/esp/spend_audit.ts 'W5b: the Home capsule-detail custody panel must compose the two projections via homeCustodyView'
 check_required 'SpendBudgetMeter' docs/ESP_SHELL_UI.md 'W5b: shell-UI spec must define the spend-budget meter'
 check_required 'AuditChainBadge' docs/ESP_SHELL_UI.md 'W5b: shell-UI spec must define the audit-chain badge'
 

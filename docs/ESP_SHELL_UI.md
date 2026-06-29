@@ -143,6 +143,11 @@ Each component lists: **props** (the ESP fact type + its schema tag), the
   **broken** (a tamper warning surfacing the first break), never optimistically green.
 - **Intent:** none (pure display).
 
+The Home capsule-detail panel paints both together via `homeCustodyView(spend_budget,
+audit.chain)` — a PURE composition (`{ spend, audit }`, no roll-up verdict), so the
+panel can only be "green" when BOTH the spend meter and the audit chain are themselves
+honestly green; an absent/broken chain or exhausted budget can never be masked.
+
 ## Composition
 
 ```

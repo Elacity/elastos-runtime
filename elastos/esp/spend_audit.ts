@@ -118,3 +118,33 @@ export function auditChainView(chain: ChainAttestation | null | undefined): Audi
     state: chain.verified ? "verified" : "broken",
   };
 }
+
+// ─────────────────────────── Home capsule-detail custody panel ───────────────
+// The Home capsule-detail surface paints BOTH custody facts side by side. This is
+// a PURE COMPOSITION of the two projections above — it adds NO logic of its own
+// (no roll-up verdict, no "overall safe" flag), so the Home pixel can only render
+// exactly the two honest sub-states. A green panel is impossible unless BOTH the
+// spend meter and the audit chain are themselves honestly green.
+
+/** Render-ready view-model for the Home capsule-detail custody panel. */
+export interface HomeCustodyView {
+  spend: SpendBudgetView;
+  audit: AuditChainView;
+}
+
+/**
+ * Compose the inspector's `spend_budget` + `audit.chain` facts into the Home
+ * capsule-detail custody view-model. Pure composition: each field is exactly its
+ * own fail-honest projection (`spendBudgetView` / `auditChainView`) — unmetered /
+ * exhausted spend and absent / broken chain are carried through verbatim, never
+ * masked by an optimistic roll-up.
+ */
+export function homeCustodyView(
+  spendBudget: BudgetSnapshotV1 | null | undefined,
+  auditChain: ChainAttestation | null | undefined,
+): HomeCustodyView {
+  return {
+    spend: spendBudgetView(spendBudget),
+    audit: auditChainView(auditChain),
+  };
+}
