@@ -173,6 +173,15 @@ pub trait AuditSource: Send + Sync {
     ) -> Vec<GrantRecord> {
         Vec::new()
     }
+
+    /// A LIVE full-chain integrity attestation of the audit plane backing this source, when it is
+    /// file-backed (durable mode). Default `None`: a source without a verifiable durable chain
+    /// honestly reports nothing rather than fabricating an "ok".
+    async fn chain_attestation(
+        &self,
+    ) -> Option<elastos_runtime::primitives::audit::ChainAttestation> {
+        None
+    }
 }
 
 /// Composes signed activity (one source) with observed grants (another) so the
@@ -206,6 +215,14 @@ impl AuditSource for CompositeAuditSource {
         self.grants
             .granted_for_capsule(capsule_key, recent_limit)
             .await
+    }
+
+    // The grants source owns the runtime AuditLog (the plane with the hash chain), so the
+    // chain attestation comes from there — not the auth-state activity source.
+    async fn chain_attestation(
+        &self,
+    ) -> Option<elastos_runtime::primitives::audit::ChainAttestation> {
+        self.grants.chain_attestation().await
     }
 }
 
@@ -336,6 +353,13 @@ impl AuditSource for RuntimeAuditLogGrantSource {
     // source reports no activity (honest empty) and only observed grants.
     async fn for_capsule(&self, _capsule_key: &str, _recent_limit: usize) -> CapsuleAudit {
         CapsuleAudit::default()
+    }
+
+    // This source owns the runtime AuditLog, so it can run the full-chain walk live.
+    async fn chain_attestation(
+        &self,
+    ) -> Option<elastos_runtime::primitives::audit::ChainAttestation> {
+        self.audit_log.chain_attestation()
     }
 
     async fn granted_for_capsule(
@@ -872,8 +896,17 @@ impl InspectProvider {
                 })
             })
             .collect();
+        // LIVE full-chain integrity (not just per-event signatures, not just at startup): the
+        // whole hash+signature walk, projected when the audit plane is file-backed. Null otherwise
+        // (memory-only ⇒ no durable chain to attest); never a fabricated ok.
+        let chain = audit
+            .chain_attestation()
+            .await
+            .and_then(|att| serde_json::to_value(att).ok())
+            .unwrap_or(Value::Null);
         json!({
             "counts": { "total": a.total, "denied": a.denied, "attested": a.attested },
+            "chain": chain,
             "recent": recent,
         })
     }
@@ -1361,6 +1394,56 @@ mod tests {
             bare["data"]["spend_budget"].is_null(),
             "an unmetered inspector must project null, not a fabricated budget"
         );
+    }
+
+    #[tokio::test]
+    async fn capsule_detail_projects_live_chain_attestation() {
+        use elastos_runtime::primitives::audit::AuditLog;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let log = Arc::new(AuditLog::with_file(&path).unwrap());
+        log.runtime_start("1.0.0");
+        log.runtime_stop();
+
+        // The grants source owns the file-backed AuditLog; the composite delegates the chain walk.
+        let grants: Arc<dyn AuditSource> = Arc::new(RuntimeAuditLogGrantSource::new(log.clone()));
+        let composite = Arc::new(CompositeAuditSource::new(grants.clone(), grants));
+        let provider = InspectProvider::new(Arc::new(MockSource {
+            entries: vec![probe_entry()],
+        }))
+        .with_audit(composite);
+
+        // Clean chain: a LIVE inspect projects verified=true (verify-on-read beyond startup).
+        let resp = provider
+            .send_raw(&json!({ "op": "capsule", "id": "cap_probe_1" }))
+            .await
+            .unwrap();
+        assert_eq!(resp["data"]["audit"]["chain"]["verified"], true);
+        assert_eq!(resp["data"]["audit"]["chain"]["records"], 2);
+
+        // Tamper the on-disk chain; the NEXT live inspect catches it (not just startup).
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, content.replacen("1.0.0", "9.9.9", 1)).unwrap();
+        let after = provider
+            .send_raw(&json!({ "op": "capsule", "id": "cap_probe_1" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            after["data"]["audit"]["chain"]["verified"], false,
+            "a tampered chain must project verified=false live: {after}"
+        );
+        assert!(after["data"]["audit"]["chain"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("tamper"));
+
+        // A memory-only inspector projects null chain (no durable chain to attest, never faked ok).
+        let mem = provider_with_probe()
+            .send_raw(&json!({ "op": "capsule", "id": "cap_probe_1" }))
+            .await
+            .unwrap();
+        assert!(mem["data"]["audit"]["chain"].is_null());
     }
 
     fn provider_entry(id: &str, name: &str, resource: &str, ops: &[&str]) -> InspectEntry {

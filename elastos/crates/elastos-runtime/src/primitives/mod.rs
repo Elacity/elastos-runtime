@@ -9,7 +9,7 @@ pub mod spend;
 pub mod time;
 
 #[allow(unused_imports)]
-pub use audit::{AuditEvent, AuditLog};
+pub use audit::{AuditEvent, AuditLog, ChainAttestation};
 #[allow(unused_imports)]
 pub use metrics::CapsuleMetrics;
 #[allow(unused_imports)]

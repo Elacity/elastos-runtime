@@ -397,6 +397,22 @@ pub enum FetchSource {
 /// Maximum events to keep in memory buffer
 const MAX_MEMORY_EVENTS: usize = 1000;
 
+/// A LIVE full-chain integrity attestation of a file-backed audit log — the read-surface projection
+/// of [`AuditLog::chain_attestation`]. Distinct from per-event signature checks (AUD-4): this is the
+/// whole-chain walk (`verify_chain`), so it also catches reorder / drop / truncation, mid-session,
+/// not just at startup.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChainAttestation {
+    /// The full hash + signature chain walked clean end to end.
+    pub verified: bool,
+    /// Number of records verified (the chain length) on a clean walk; 0 on failure.
+    pub records: u64,
+    /// The signing key (hex) the chain verifies under, when signed.
+    pub signer: Option<String>,
+    /// The first break naming why verification failed (`verified == false`); `None` when clean.
+    pub error: Option<String>,
+}
+
 /// Audit log manager
 pub struct AuditLog {
     writer: Option<Mutex<BufWriter<File>>>,
@@ -695,6 +711,33 @@ impl AuditLog {
             expected_seq += 1;
         }
         Ok(expected_seq - 1)
+    }
+
+    /// A LIVE, full-chain integrity attestation for a READ surface (inspector / audit-artifact
+    /// export) to project — closing the "verify-on-read is startup-only" gap. Walks the on-disk
+    /// hash + signature chain under the log's OWN key and reports the result.
+    ///
+    /// `None` for a memory-only log: there is no durable chain to walk, and verify-on-read is
+    /// meaningful only in durable mode. Honest under tamper: a broken chain reports
+    /// `verified == false` with the first break, NEVER a fabricated ok.
+    pub fn chain_attestation(&self) -> Option<ChainAttestation> {
+        self.log_path.as_ref()?; // memory-only ⇒ nothing durable to attest
+        let vk = self.signer.as_ref().map(|s| s.verifying_key());
+        let signer = self.verifying_key_hex();
+        Some(match self.verify_chain(vk.as_ref()) {
+            Ok(records) => ChainAttestation {
+                verified: true,
+                records,
+                signer,
+                error: None,
+            },
+            Err(e) => ChainAttestation {
+                verified: false,
+                records: 0,
+                signer,
+                error: Some(e),
+            },
+        })
     }
 
     /// Best-effort emit for NON-custody events (capsule lifecycle, capability use, etc.): logs
@@ -1567,6 +1610,38 @@ mod tests {
         assert!(
             err.to_string().contains("integrity verification"),
             "a tampered log must refuse to open: {err}"
+        );
+    }
+
+    #[test]
+    fn chain_attestation_reports_live_integrity_and_catches_tamper() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let log = AuditLog::with_file(&path).unwrap();
+        log.runtime_start("1.0.0");
+        log.runtime_stop();
+
+        // Memory-only logs have no durable chain to attest.
+        assert!(
+            AuditLog::new().chain_attestation().is_none(),
+            "memory-only ⇒ no attestation, never a fabricated ok"
+        );
+
+        // A clean file-backed chain attests verified with its record count + signer.
+        let att = log.chain_attestation().expect("file-backed ⇒ Some");
+        assert!(att.verified, "clean chain verifies: {att:?}");
+        assert_eq!(att.records, 2);
+        assert!(att.signer.is_some(), "a signed chain names its key");
+        assert!(att.error.is_none());
+
+        // Tamper a record on disk; a LIVE attestation (not just startup) catches it.
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, content.replacen("1.0.0", "9.9.9", 1)).unwrap();
+        let tampered = log.chain_attestation().expect("Some");
+        assert!(!tampered.verified, "a content edit must fail the live walk");
+        assert!(
+            tampered.error.unwrap_or_default().contains("tamper"),
+            "the attestation names the break"
         );
     }
 

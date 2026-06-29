@@ -294,6 +294,13 @@ capsule's live spend budget (keyed on the canonical `vm-{name}`), via
 act paths debit. `null` when no meter is attached or the capsule is unprovisioned (never fabricated).
 This is a pure projection: the Home UI renders it; the meter stays the single source of truth.
 
+**`audit.chain` (live verify-on-read, wired):** when the audit plane is file-backed (durable mode),
+the detail view projects a `{verified, records, signer, error}` attestation from
+`AuditLog::chain_attestation` — the FULL hash+signature `verify_chain` walk run LIVE on each inspect,
+not just at startup and stronger than the per-event `attested` count (it also catches reorder / drop
+/ tamper across the whole chain). `null` for a memory-only plane (nothing durable to attest, never a
+fabricated ok). A tampered on-disk chain projects `verified=false` with the first break in `error`.
+
 **Remaining (G1b):** the live serve path still attaches only
 `AuthAuditSource` (signed activity, no grants), so production inspect populates
 grants only once serve *composes* the grant source in. Everything else is done:
