@@ -224,6 +224,11 @@ pub struct Supervisor {
     pending_store: Option<Arc<elastos_runtime::capability::pending::PendingRequestStore>>,
     /// Per-act spend policy for the microVM Carrier act path; `None` ⇒ unmetered.
     spend_policy: Option<crate::carrier_bridge::SpendPolicy>,
+    /// The shared runtime/infra custody log, threaded to the serve gateway so its audit
+    /// events ride the SAME signed chain as carrier/capability/spend. `None` ⇒ the gateway
+    /// keeps its own file sink. Only adopted by the gateway when durable (see
+    /// [`crate::api::gateway::seed_gateway_audit_log`]) — never a durable→memory downgrade.
+    shared_audit_log: Option<Arc<elastos_runtime::primitives::audit::AuditLog>>,
     /// Author-signature verifier for the launch gate (AUD-1). Default is empty (no
     /// trusted keys), in which case the gate skips and launches are byte-for-byte
     /// today's behavior; seeded from config `trusted_keys` at serve time to activate.
@@ -477,6 +482,7 @@ impl Supervisor {
             capability_manager: None,
             pending_store: None,
             spend_policy: None,
+            shared_audit_log: None,
             signature_verifier: SignatureVerifier::new(),
             gateway: Arc::new(RwLock::new(None)),
         }
@@ -534,6 +540,17 @@ impl Supervisor {
     /// (the default) leaves the microVM carrier path unmetered.
     pub fn set_spend_policy(&mut self, spend_policy: Option<crate::carrier_bridge::SpendPolicy>) {
         self.spend_policy = spend_policy;
+    }
+
+    /// Attach the shared runtime/infra custody log so the serve gateway unifies its audit
+    /// events onto the one signed chain (carrier/capability/spend). `None` (the default)
+    /// leaves the gateway with its own file sink. The gateway adopts this only when it is
+    /// durable — see [`crate::api::gateway::seed_gateway_audit_log`].
+    pub fn set_shared_audit_log(
+        &mut self,
+        shared_audit_log: Option<Arc<elastos_runtime::primitives::audit::AuditLog>>,
+    ) {
+        self.shared_audit_log = shared_audit_log;
     }
 
     /// Seed the author-signature launch gate with trusted keys (AUD-1). Called at
@@ -1622,6 +1639,8 @@ impl Supervisor {
             let data_dir = self.data_dir.clone();
             // Unify the gateway act budget with the carrier paths: the same shared meter.
             let spend_policy = self.spend_policy.clone();
+            // Unify the gateway audit sink onto the shared runtime custody chain (when durable).
+            let shared_audit_log = self.shared_audit_log.clone();
             async move {
                 if let Err(e) = crate::api::gateway::start_gateway_server(
                     &listen_addr,
@@ -1629,6 +1648,7 @@ impl Supervisor {
                     cache_path,
                     data_dir,
                     spend_policy,
+                    shared_audit_log,
                 )
                 .await
                 {

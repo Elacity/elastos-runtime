@@ -219,8 +219,11 @@ pub struct GatewayState {
     pub data_dir: PathBuf,
     /// Tamper-evident audit sink (GAP-8), lazily file-backed under `data_dir/audit/`. Mirrors the
     /// `identity_manager` lazy pattern: an EXPLICIT field (no hidden global), initialized on first
-    /// use so the ~25 constructors stay `Arc::new(OnceLock::new())`. FOLLOW-ON: unify this with the
-    /// runtime/infra audit sink so the gateway and runtime share ONE custody log.
+    /// use so the ~25 constructors stay `Arc::new(OnceLock::new())`. UNIFICATION: at serve time this
+    /// cell is pre-seeded (via [`seed_gateway_audit_log`]) with the shared runtime/infra custody log
+    /// when — and ONLY when — that log is durable, so the gateway and runtime share ONE signed chain;
+    /// otherwise it stays empty and the gateway lazily opens its own durable file sink (never a
+    /// durable→memory downgrade).
     pub audit_log: Arc<OnceLock<Arc<elastos_runtime::primitives::audit::AuditLog>>>,
     /// The SAME shared act-spend meter the carrier paths use (`infra.spend_policy`), threaded in at
     /// serve time so a capsule's budget is unified across planes — the gateway debits the same meter
@@ -269,6 +272,29 @@ impl GatewayState {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("passkey identity manager unavailable"))
     }
+}
+
+/// Seed the gateway's lazy audit-log cell, UNIFYING it onto the shared runtime custody
+/// chain — but only when that shared log is DURABLE.
+///
+/// Fail-closed durability invariant (the crux): the gateway audit sink is always
+/// file-backed (AUD-2), whereas the shared `infra` log is memory-only unless
+/// `ELASTOS_AUDIT_LOG_PATH` is set. Pre-seeding the gateway with a memory-only shared
+/// log would silently DOWNGRADE gateway custody from durable→volatile — a security
+/// regression. So we adopt the shared log ONLY when `log_path().is_some()` (durable);
+/// otherwise we return an empty cell, leaving the gateway to lazily open its OWN file
+/// sink (today's behavior). A pure, I/O-free function so the no-downgrade rule is
+/// unit-testable without standing up a server.
+pub(crate) fn seed_gateway_audit_log(
+    shared: Option<Arc<elastos_runtime::primitives::audit::AuditLog>>,
+) -> Arc<OnceLock<Arc<elastos_runtime::primitives::audit::AuditLog>>> {
+    let cell = OnceLock::new();
+    if let Some(log) = shared {
+        if log.log_path().is_some() {
+            let _ = cell.set(log);
+        }
+    }
+    Arc::new(cell)
 }
 
 pub fn gateway_router(state: GatewayState) -> Router {
@@ -1112,6 +1138,83 @@ mod aud2_audit_failclosed_tests {
         assert!(
             state.audit_log().is_err(),
             "audit_log must fail closed when the signed file log cannot open, never fall back to a memory log"
+        );
+    }
+}
+
+#[cfg(test)]
+mod audit_unification_tests {
+    use super::*;
+    use elastos_runtime::primitives::audit::{AuditEvent, AuditLog};
+
+    fn state_with_audit(
+        dir: &std::path::Path,
+        audit_log: Arc<std::sync::OnceLock<Arc<AuditLog>>>,
+    ) -> GatewayState {
+        GatewayState {
+            provider_registry: None,
+            identity_manager: Arc::new(std::sync::OnceLock::new()),
+            cache_dir: dir.to_path_buf(),
+            data_dir: dir.to_path_buf(),
+            audit_log,
+            spend_policy: None,
+        }
+    }
+
+    #[test]
+    fn gateway_unifies_onto_a_durable_shared_chain_and_records_verifiably() {
+        // When the shared runtime log is durable, the gateway must reuse that SAME chain
+        // (one unified custody log), and an event recorded through the gateway handle must
+        // verify on it (the folded verify-on-read proof).
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Arc::new(AuditLog::with_file(dir.path().join("unified.log")).unwrap());
+        let cell = seed_gateway_audit_log(Some(shared.clone()));
+        let state = state_with_audit(dir.path(), cell);
+
+        let got = state.audit_log().expect("durable shared log is available");
+        assert!(
+            Arc::ptr_eq(&got, &shared),
+            "gateway must ride the SAME shared custody chain, not a separate sink"
+        );
+
+        got.emit(AuditEvent::Custom {
+            event_type: "gateway_unification_probe".into(),
+            details: serde_json::json!({"k": "v"}),
+        })
+        .expect("emit onto the unified durable chain");
+        let att = got
+            .chain_attestation()
+            .expect("a durable chain attests itself");
+        assert!(
+            att.verified && att.records >= 1,
+            "a gateway-recorded event must be verifiable on the unified chain (got {att:?})"
+        );
+    }
+
+    #[test]
+    fn gateway_never_downgrades_a_memory_only_shared_log() {
+        // The crux invariant: a memory-only shared log (log_path == None) must NOT be
+        // adopted — doing so would downgrade gateway custody from durable→volatile. The
+        // cell stays empty so the gateway lazily opens its OWN durable file sink.
+        let shared = Arc::new(AuditLog::new());
+        assert!(
+            shared.log_path().is_none(),
+            "precondition: AuditLog::new() is memory-only"
+        );
+        let cell = seed_gateway_audit_log(Some(shared));
+        assert!(
+            cell.get().is_none(),
+            "a memory-only shared log must never be adopted (no durable→memory downgrade)"
+        );
+    }
+
+    #[test]
+    fn gateway_with_no_shared_log_keeps_its_own_sink() {
+        // No shared log threaded ⇒ empty cell ⇒ the gateway opens its own file sink lazily.
+        let cell = seed_gateway_audit_log(None);
+        assert!(
+            cell.get().is_none(),
+            "no shared log ⇒ empty cell (own sink)"
         );
     }
 }

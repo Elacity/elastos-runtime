@@ -60,6 +60,8 @@ where
         // The control-plane gateway serves infrastructure capsules under service authority (not
         // user act surfaces), so it is unmetered; the user-facing serve gateway carries the meter.
         None,
+        // Control-plane gateway keeps its own durable file sink (no shared infra log here).
+        None,
     )
     .await
 }

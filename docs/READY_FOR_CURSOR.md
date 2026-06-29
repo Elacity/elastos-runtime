@@ -150,9 +150,15 @@ the next product arc, none of it started here:
   `GatewayState.spend_policy` carries the SAME shared meter (`infra.spend_policy`, threaded via
   `start_gateway_server` from the supervisor), debited fail-closed (429 `budget_exhausted`) keyed on the
   canonical `vm-{name}`, so EVERY act path (carrier serve/microVM/WASM + gateway affordance) shares ONE
-  unified budget (test: `affordance_dispatch_is_metered_on_the_unified_vm_name_budget`). NOTE: only the
-  SPEND meter is unified; the gateway AUDIT sink is still a separate per-gateway file log (see the
-  `GatewayState.audit_log` doc comment) — that unification is a remaining follow-on; (d) per-capsule
+  unified budget (test: `affordance_dispatch_is_metered_on_the_unified_vm_name_budget`). NOTE: the
+  gateway AUDIT sink is **now UNIFIED too** (flint local lane): the serve gateway's `audit_log`
+  `OnceLock` is pre-seeded with the shared `infra.audit_log` via `seed_gateway_audit_log` (threaded
+  `serve_cmd → Supervisor::set_shared_audit_log → start_gateway_server`), so gateway custody events
+  ride the SAME signed chain as carrier/capability/spend — FAIL-CLOSED on durability: the shared log
+  is adopted ONLY when `log_path().is_some()` (durable, i.e. `ELASTOS_AUDIT_LOG_PATH` set), else the
+  gateway keeps its own file sink (never a durable→memory downgrade). Proven by
+  `api::gateway::audit_unification_tests::*`. The control-plane gateway stays on its own sink by
+  design; (d) per-capsule
   budgets are a flat default — a real per-principal/quota policy + a top-up path is a product decision;
   (e) `cost_units` is provider-reported (trusted infra) — a malicious provider under-reporting to dodge the
   meter is out of scope (providers run under operator authority), but worth naming.

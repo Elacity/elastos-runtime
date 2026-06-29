@@ -14,13 +14,16 @@ pub async fn start_gateway_server(
     cache_dir: PathBuf,
     data_dir: PathBuf,
     spend_policy: Option<crate::carrier_bridge::SpendPolicy>,
+    shared_audit_log: Option<Arc<elastos_runtime::primitives::audit::AuditLog>>,
 ) -> anyhow::Result<()> {
     let state = GatewayState {
         provider_registry,
         identity_manager: Arc::new(OnceLock::new()),
         cache_dir,
         data_dir,
-        audit_log: Arc::new(OnceLock::new()),
+        // Unify onto the shared runtime custody chain when it is durable; otherwise the
+        // gateway opens its own durable file sink (never a durable→memory downgrade).
+        audit_log: super::seed_gateway_audit_log(shared_audit_log),
         spend_policy,
     };
     let app = gateway_router(state);
