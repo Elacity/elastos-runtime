@@ -222,6 +222,10 @@ pub struct GatewayState {
     /// use so the ~25 constructors stay `Arc::new(OnceLock::new())`. FOLLOW-ON: unify this with the
     /// runtime/infra audit sink so the gateway and runtime share ONE custody log.
     pub audit_log: Arc<OnceLock<Arc<elastos_runtime::primitives::audit::AuditLog>>>,
+    /// The SAME shared act-spend meter the carrier paths use (`infra.spend_policy`), threaded in at
+    /// serve time so a capsule's budget is unified across planes — the gateway debits the same meter
+    /// as serve/microVM/WASM, not a separate one. `None` ⇒ unmetered (tests + control plane).
+    pub spend_policy: Option<crate::carrier_bridge::SpendPolicy>,
 }
 
 impl GatewayState {
@@ -1103,6 +1107,7 @@ mod aud2_audit_failclosed_tests {
             cache_dir: dir.path().to_path_buf(),
             data_dir: dir.path().to_path_buf(),
             audit_log: Arc::new(std::sync::OnceLock::new()),
+            spend_policy: None,
         };
         assert!(
             state.audit_log().is_err(),

@@ -13,6 +13,7 @@ pub async fn start_gateway_server(
     provider_registry: Option<Arc<ProviderRegistry>>,
     cache_dir: PathBuf,
     data_dir: PathBuf,
+    spend_policy: Option<crate::carrier_bridge::SpendPolicy>,
 ) -> anyhow::Result<()> {
     let state = GatewayState {
         provider_registry,
@@ -20,6 +21,7 @@ pub async fn start_gateway_server(
         cache_dir,
         data_dir,
         audit_log: Arc::new(OnceLock::new()),
+        spend_policy,
     };
     let app = gateway_router(state);
     let listener = TcpListener::bind(addr).await?;

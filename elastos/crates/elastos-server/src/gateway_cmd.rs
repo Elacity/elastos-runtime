@@ -57,6 +57,9 @@ where
         Some(control_plane.provider_registry),
         cache_path,
         data_dir,
+        // The control-plane gateway serves infrastructure capsules under service authority (not
+        // user act surfaces), so it is unmetered; the user-facing serve gateway carries the meter.
+        None,
     )
     .await
 }

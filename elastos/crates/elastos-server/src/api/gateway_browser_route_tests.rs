@@ -2063,6 +2063,7 @@ async fn test_browser_net_provider_fails_closed_without_adapter_provider() {
         cache_dir: dir.path().to_path_buf(),
         data_dir: dir.path().to_path_buf(),
         audit_log: Arc::new(std::sync::OnceLock::new()),
+        spend_policy: None,
     });
 
     let forbidden = app

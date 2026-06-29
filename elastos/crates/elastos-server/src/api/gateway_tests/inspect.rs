@@ -42,6 +42,7 @@ async fn inspect_test_state(dir: &std::path::Path) -> GatewayState {
         cache_dir: dir.to_path_buf(),
         data_dir: dir.to_path_buf(),
         audit_log: Arc::new(std::sync::OnceLock::new()),
+        spend_policy: None,
     }
 }
 

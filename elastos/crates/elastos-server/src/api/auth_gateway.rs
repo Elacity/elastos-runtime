@@ -2940,6 +2940,7 @@ mod tests {
             provider_registry: None,
             identity_manager: Arc::new(std::sync::OnceLock::new()),
             audit_log: Arc::new(std::sync::OnceLock::new()),
+            spend_policy: None,
             cache_dir: data_dir.to_path_buf(),
             data_dir: data_dir.to_path_buf(),
         }
@@ -2963,6 +2964,7 @@ mod tests {
             provider_registry: Some(registry),
             identity_manager: Arc::new(std::sync::OnceLock::new()),
             audit_log: Arc::new(std::sync::OnceLock::new()),
+            spend_policy: None,
             cache_dir: data_dir.to_path_buf(),
             data_dir: data_dir.to_path_buf(),
         }

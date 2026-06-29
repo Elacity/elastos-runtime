@@ -1620,12 +1620,15 @@ impl Supervisor {
             let listen_addr = listen_addr.clone();
             let cache_path = cache_path.clone();
             let data_dir = self.data_dir.clone();
+            // Unify the gateway act budget with the carrier paths: the same shared meter.
+            let spend_policy = self.spend_policy.clone();
             async move {
                 if let Err(e) = crate::api::gateway::start_gateway_server(
                     &listen_addr,
                     Some(registry),
                     cache_path,
                     data_dir,
+                    spend_policy,
                 )
                 .await
                 {
