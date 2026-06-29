@@ -702,7 +702,35 @@ async fn dispatch_consented_affordance(
             ),
         },
     );
+    // Defense-in-depth on the human-consent-gated path: charge the SAME shared budget the carrier
+    // act paths use BEFORE the dispatch, fail-closed.
+    charge_affordance_spend(state, &resolved.capsule)?;
     dispatch_capsule_affordance(state, context, resolved, request).await
+}
+
+/// Debit the shared act-spend budget for one affordance dispatch, keyed on the canonical `vm-{name}`
+/// (the SAME key the carrier paths debit — so the budget is unified, not per-plane). Fail-closed:
+/// returns a 429 `budget_exhausted` when the budget is gone. Unmetered gateway (`None`) ⇒ no charge.
+///
+/// A flat 1 unit/act: the affordance result carries no provider-reported cost, and unlike the
+/// carrier path there is no `DidNotAct` taxonomy here, so the charge stands on any post-debit
+/// outcome (conservative — errs toward charging, never over-refunds a human-approved act).
+fn charge_affordance_spend(
+    state: &GatewayState,
+    capsule: &str,
+) -> Result<(), (StatusCode, &'static str, String)> {
+    if let Some(policy) = &state.spend_policy {
+        let key = format!("vm-{capsule}");
+        policy.meter.ensure_budget(&key, policy.default_budget);
+        if let Err(e) = policy.meter.try_debit(&key, 1) {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "budget_exhausted",
+                format!("spend budget exhausted for {key}: {e}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Narrowest [`Action`] implied by a declared [`AffordanceRisk`] class. Total and
@@ -1833,6 +1861,51 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn affordance_dispatch_is_metered_on_the_unified_vm_name_budget() {
+        use elastos_runtime::primitives::spend::SpendMeter;
+        use std::sync::OnceLock;
+
+        let dir = tempfile::tempdir().unwrap();
+        let meter = Arc::new(SpendMeter::new());
+        let metered = GatewayState {
+            provider_registry: None,
+            identity_manager: Arc::new(OnceLock::new()),
+            cache_dir: dir.path().to_path_buf(),
+            data_dir: dir.path().to_path_buf(),
+            audit_log: Arc::new(OnceLock::new()),
+            spend_policy: Some(crate::carrier_bridge::SpendPolicy {
+                meter: meter.clone(),
+                default_budget: 1,
+            }),
+        };
+
+        // First affordance act fits budget 1 and debits the CANONICAL vm-{name} key — the same key
+        // the carrier paths debit, so the budget is unified, not a separate per-plane meter.
+        assert!(charge_affordance_spend(&metered, "viewer").is_ok());
+        assert_eq!(
+            meter.remaining("vm-viewer"),
+            0,
+            "the affordance debit lands on the unified vm-{{name}} budget"
+        );
+
+        // The over-budget second act is refused fail-closed (429), before any dispatch.
+        let err = charge_affordance_spend(&metered, "viewer").unwrap_err();
+        assert_eq!(err.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(err.1, "budget_exhausted");
+
+        // An unmetered gateway (no policy) never charges — affordance flows unchanged.
+        let unmetered = GatewayState {
+            provider_registry: None,
+            identity_manager: Arc::new(OnceLock::new()),
+            cache_dir: dir.path().to_path_buf(),
+            data_dir: dir.path().to_path_buf(),
+            audit_log: Arc::new(OnceLock::new()),
+            spend_policy: None,
+        };
+        assert!(charge_affordance_spend(&unmetered, "viewer").is_ok());
     }
 
     #[test]

@@ -146,10 +146,13 @@ the next product arc, none of it started here:
   `InspectProvider::with_spend_meter` over the shared `infra.spend_policy` meter (null when unmetered, never
   fabricated). The Home UI just renders this field — no new crypto, a pure projection. Remaining: a Home-UI
   pixel for it + (optionally) a dedicated read endpoint; (c) the consent/affordance dispatch path
-  (`gateway_capsule_catalog::dispatch_consented_affordance`) is NOT metered — but it is **human-consent-
-  gated per act** (each dispatch consumes a single-use `ValidatedAffordanceGrant` that only a successful
-  redeem produces), so it is NOT an autonomous-agent bypass; metering it is defense-in-depth and needs the
-  gateway to share infra's meter (the same unification follow-on as the gateway audit sink); (d) per-capsule
+  (`gateway_capsule_catalog::dispatch_consented_affordance`) is **now METERED** `W3b-turn` —
+  `GatewayState.spend_policy` carries the SAME shared meter (`infra.spend_policy`, threaded via
+  `start_gateway_server` from the supervisor), debited fail-closed (429 `budget_exhausted`) keyed on the
+  canonical `vm-{name}`, so EVERY act path (carrier serve/microVM/WASM + gateway affordance) shares ONE
+  unified budget (test: `affordance_dispatch_is_metered_on_the_unified_vm_name_budget`). NOTE: only the
+  SPEND meter is unified; the gateway AUDIT sink is still a separate per-gateway file log (see the
+  `GatewayState.audit_log` doc comment) — that unification is a remaining follow-on; (d) per-capsule
   budgets are a flat default — a real per-principal/quota policy + a top-up path is a product decision;
   (e) `cost_units` is provider-reported (trusted infra) — a malicious provider under-reporting to dodge the
   meter is out of scope (providers run under operator authority), but worth naming.
