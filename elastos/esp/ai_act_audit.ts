@@ -19,6 +19,22 @@ import type { AffordanceConsentPending, AffordanceGrantReceiptV1 } from "./esp_v
 
 export const AI_ACT_AUDIT_SCHEMA_V1 = "elastos.audit.ai-act.v1";
 
+/**
+ * Mirror of the runtime's `primitives::audit::ChainAttestation` (serde): a LIVE full hash+signature
+ * walk of the custody log backing this evidence. The exported artifact embeds this so a consumer
+ * can see the chain verified — `records` long, under `signer` — rather than trusting the export.
+ */
+export interface ChainAttestation {
+  /** The full hash + signature chain walked clean end to end. */
+  verified: boolean;
+  /** Records verified (chain length) on a clean walk; 0 on failure. */
+  records: number;
+  /** The signing key (hex) the chain verifies under, when signed. */
+  signer: string | null;
+  /** The first break naming why verification failed; null when clean. */
+  error: string | null;
+}
+
 /** Risk classes that require a human in the loop regardless of approval mode. */
 const HIGH_RISK: ReadonlySet<string> = new Set(["payment", "rights", "actuator", "privileged"]);
 
@@ -52,6 +68,12 @@ export interface AiActAuditRecordV1 {
     signer: string;
     signature: string;
     recorded_at: unknown;
+    /**
+     * Live integrity of the custody chain backing this record, when the export had access to a
+     * file-backed audit plane. `null` when unavailable (memory-only plane / not threaded) — absence
+     * is NOT a pass; it just falls back to the signed-record check (see `containmentEvidence`).
+     */
+    chain_attestation: ChainAttestation | null;
   };
   /** Plain-language mapping of each fact to the control it satisfies. */
   controls: {
@@ -70,6 +92,7 @@ export interface AiActAuditRecordV1 {
 export function toAiActAuditRecord(
   consent: ConsentContext,
   receipt: AffordanceGrantReceiptV1,
+  chain: ChainAttestation | null = null,
 ): AiActAuditRecordV1 {
   const requiresHuman = consent.approval === "user" || HIGH_RISK.has(consent.risk);
   const signed = receipt.signer.length > 0 && receipt.signature.length > 0;
@@ -94,6 +117,7 @@ export function toAiActAuditRecord(
       signer: receipt.signer,
       signature: receipt.signature,
       recorded_at: receipt.redeemed_at,
+      chain_attestation: chain,
     },
     controls: {
       article_12_logging:
@@ -107,26 +131,38 @@ export function toAiActAuditRecord(
 }
 
 export interface ContainmentEvidence {
-  /** A tamper-evident signed record exists (Art 12). */
+  /** A tamper-evident signed record exists AND its custody chain verified (Art 12). */
   article_12_met: boolean;
   /** Where human oversight was required, a human actually consented (Art 14). */
   article_14_met: boolean;
+  /**
+   * The custody chain backing the record verified live. `true` when no attestation was available
+   * (memory-only / not threaded) — absence is not a failure, but a PRESENT-and-broken chain is.
+   */
+  chain_intact: boolean;
   /** Both controls satisfied — the act is provably contained. */
   contained: boolean;
 }
 
 /**
  * Whether the audit record demonstrates containment. Fail-closed at the audit
- * layer: an unsigned record fails Art 12 (no receipt → no provable act), and a
+ * layer: an unsigned record fails Art 12 (no receipt → no provable act), a
+ * PRESENT-but-broken custody chain also fails Art 12 (the tamper-evident record
+ * is compromised — a tampered chain cannot back the evidence), and a
  * high-risk/user-approval act executed without human consent fails Art 14.
  */
 export function containmentEvidence(record: AiActAuditRecordV1): ContainmentEvidence {
-  const article12Met = record.record_keeping.signed;
+  const chain = record.record_keeping.chain_attestation;
+  // Absent attestation (null) ⇒ fall back to the signed-record check (memory-only / not threaded);
+  // a PRESENT attestation that did not verify breaks the tamper-evidence and fails Art 12.
+  const chainIntact = chain === null || chain.verified;
+  const article12Met = record.record_keeping.signed && chainIntact;
   const article14Met =
     !record.human_oversight.required || record.human_oversight.mechanism === "user-consent";
   return {
     article_12_met: article12Met,
     article_14_met: article14Met,
+    chain_intact: chainIntact,
     contained: article12Met && article14Met,
   };
 }

@@ -16,8 +16,22 @@ import {
   AI_ACT_AUDIT_SCHEMA_V1,
   containmentEvidence,
   toAiActAuditRecord,
+  type ChainAttestation,
   type ConsentContext,
 } from "./ai_act_audit.js";
+
+const verifiedChain: ChainAttestation = {
+  verified: true,
+  records: 42,
+  signer: "deadbeefkey",
+  error: null,
+};
+const brokenChain: ChainAttestation = {
+  verified: false,
+  records: 0,
+  signer: "deadbeefkey",
+  error: "audit tamper at seq 7: record_hash mismatch (content edited)",
+};
 
 function receipt(p: Partial<AffordanceGrantReceiptV1> = {}): AffordanceGrantReceiptV1 {
   return {
@@ -92,6 +106,34 @@ describe("the AI Act audit artifact (W7)", () => {
     const record = toAiActAuditRecord(lowRiskAuto, receipt({ method_id: "list", action: "read" }));
     assert.equal(record.human_oversight.required, false);
     const ev = containmentEvidence(record);
+    assert.equal(ev.contained, true);
+  });
+
+  it("embeds a verified custody-chain attestation; the artifact is self-verifying", () => {
+    const record = toAiActAuditRecord(userConsent, receipt(), verifiedChain);
+    assert.equal(record.record_keeping.chain_attestation?.verified, true);
+    assert.equal(record.record_keeping.chain_attestation?.records, 42);
+    const ev = containmentEvidence(record);
+    assert.equal(ev.chain_intact, true);
+    assert.equal(ev.article_12_met, true);
+    assert.equal(ev.contained, true);
+  });
+
+  it("a signed record on a BROKEN custody chain fails Art 12 (tamper-evidence compromised)", () => {
+    const record = toAiActAuditRecord(userConsent, receipt(), brokenChain);
+    assert.equal(record.record_keeping.signed, true, "the receipt itself is signed");
+    const ev = containmentEvidence(record);
+    assert.equal(ev.chain_intact, false);
+    assert.equal(ev.article_12_met, false, "a tampered custody chain cannot back the record");
+    assert.equal(ev.contained, false);
+  });
+
+  it("an absent attestation falls back to the signed-record check (no new failure)", () => {
+    // Default (no chain arg) ⇒ null ⇒ memory-only / not-threaded; back-compatible.
+    const record = toAiActAuditRecord(userConsent, receipt());
+    assert.equal(record.record_keeping.chain_attestation, null);
+    const ev = containmentEvidence(record);
+    assert.equal(ev.chain_intact, true, "absence is not a failure");
     assert.equal(ev.contained, true);
   });
 });
