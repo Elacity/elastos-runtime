@@ -88,14 +88,19 @@ but they are NOT the whole list. The authoritative, complete sources of truth ar
   now opens a file-backed log AND walks the existing hash+signature chain, failing closed (server
   startup aborts) on any tamper, so you can't append onto a laundered history. `server_infra` opts
   in via the `ELASTOS_AUDIT_LOG_PATH` env (durable EU AI Act custody mode); default stays memory.
-  **Cursor TODO:** (a) set `ELASTOS_AUDIT_LOG_PATH=<data_dir>/audit/audit.log`, restart, confirm the
-  "Durable audit log enabled (verified-on-open)" log line, then hand-tamper a record and confirm the
-  next start REFUSES; (b) **tail-truncation is now CLOSED in-cloud** — a `<log>.head-anchor` sibling
-  records the committed head seq each emit, and verify-on-open refuses when fewer records verify than
-  the anchor promised (hand-test: `tail -n -1` the log, confirm the next start REFUSES with
-  "tail-truncated"); the residual is only the *off-box / co-signed* anchor for a full-disk attacker
-  who rewrites both files; (c) no LIVE read path (inspector / W7 export) re-runs `verify_chain`
-  mid-session yet — startup-only.
+  **VERIFIED on real microVM (nested-KVM, `flint @ 5d4f4c7d1`, 2026-06-29) — P1/P5/P6/P7 of the
+  7/7 (see `docs/KNOWN_GAPS.md` G-HWV):** (a) `ELASTOS_AUDIT_LOG_PATH` set → the
+  "Durable audit log enabled (verified-on-open)" line emitted + the custody.log + `.head-anchor` +
+  `.pubkey` + `.signing-key` sidecars created; a restart re-walked the full 27-record chain
+  (5 `spend_debit` + 1 `budget_exhausted`) and verified clean. (b) Hand-tamper (flip a
+  `spend_debit` field, leave its `record_hash` stale) → next start REFUSED, exact error
+  `audit tamper at seq 25: record_hash mismatch (content edited)`. Tail-truncation (drop the last
+  record) → next start REFUSED via the head-anchor, exact error `audit log tail-truncated:
+  head-anchor committed seq 27 but only 26 records verify on disk`. Residual unchanged: the
+  off-box / co-signed anchor for a full-disk attacker who rewrites both files; (c) the LIVE
+  read path (`inspect/audit_attestation` mid-session) re-runs the SAME `verify_chain` but was not
+  exercised externally here (it is reachable only in-process / via the home-token gateway) —
+  startup verify-on-open is the authoritative fail-closed gate and it is now hardware-proven.
 - **G8 / G8b (capability plane)** — deny/approve/revoke (request- AND token-level) + affordance-use
   are now all fail-closed-signed. Remaining: ordinary grant/use stay best-effort by design (the
   per-validate hot path; needs the group-commit rewrite below before adding an fsync).
@@ -138,9 +143,19 @@ the next product arc, none of it started here:
   and `variable_cost_charges_provider_reported_units`. **ALL THREE carrier act paths now share the one
   meter via `infra.spend_policy`:** serve, microVM-supervisor (`vm-{name}`), AND WASM (`runtime.rs` bridge
   spawner) — the enforcement is the shared `carrier_invoke` dispatch, so the three only differ in wiring.
-  **Cursor TODO / residual:** (a) the microVM + WASM paths can only be EXERCISED on KVM / with a running
-  WASM capsule — confirm a capsule's acts debit the budget and the `budget_exhausted` refusal surfaces in
-  the guest (the logic itself is unit-tested via the shared dispatch); (b) **OBSERVABILITY — surfaced:** the capsule
+  **Cursor TODO / residual:** (a) the **microVM path is now VERIFIED on real nested-KVM**
+  (`flint @ 5d4f4c7d1`, 2026-06-29 — P2/P3/P4 of the 7/7, see `docs/KNOWN_GAPS.md` G-HWV): a guest
+  capsule's `carrier_invoke` acts debit the canonical `vm-{name}` budget end-to-end (`5 × spend_debit`
+  for `vm-act-emitter` on the durable chain, `remaining:0` at the 5th), and the `budget_exhausted`
+  refusal is observed **inside the guest** (`ACT 6 REFUSED budget_exhausted`), not just host-side —
+  the meter bounds the agent from within the VM. Exercised via the `act-emitter` verification fixture
+  (`capsules/act-emitter/`) doing exactly N `carrier_invoke` calls through the SHIPPED guest carrier
+  client. **One honest residual (G-HWV):** this ran on a `localhost://Public/...` root, since the plain
+  `elastos capsule` CLI cannot inject a signed Home launch-grant; the meter/carrier/audit path is
+  byte-identical regardless of storage root, so the verification is valid, but `Users/self`-scoped
+  storage metering is still unverified on hardware (needs the Home launch-grant flow). The WASM path
+  still needs a running WASM capsule to exercise (logic unit-tested via the shared dispatch);
+  (b) **OBSERVABILITY — surfaced:** the capsule
   inspector detail view (`inspect/capsule` + `inspect/self`) now projects a read-only `spend_budget`
   `{limit, spent, remaining}` field, keyed on the canonical `vm-{name}`, via
   `InspectProvider::with_spend_meter` over the shared `infra.spend_policy` meter (null when unmetered, never

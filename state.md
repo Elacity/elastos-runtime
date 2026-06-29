@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-05-25 UTC
+Last updated: 2026-06-29 UTC
 
 Product state and open truths for the ElastOS runtime on this branch.
 For open work, see [TASKS.md](TASKS.md).
@@ -13,6 +13,7 @@ For direction, see [ROADMAP.md](ROADMAP.md).
 - Same-host native ↔ WASM chat interop on shared runtime (proven 2026-03-30).
 - Sovereign room control with DID-backed invite/accept flow and hosted `chat-room` access through the explicit operator lane.
 - WASM and microVM capsule execution with capability-gated provider access.
+- microVM act spend-metering + durable audit, **VERIFIED end-to-end on real nested-KVM** (`flint @ 5d4f4c7d1`, 2026-06-29, 7/7): a guest capsule's `carrier_invoke` acts debit the canonical `vm-{name}` budget, the `budget_exhausted` refusal is observed inside the guest, the `spend_debit`/`budget_exhausted` events land on the signed durable custody chain, and verify-on-open fail-closes serve startup on tamper or tail-truncation. Exercised via the `act-emitter` verification fixture on a `localhost://Public/...` root; the meter/carrier/audit path is root-agnostic, but `Users/self`-scoped storage metering (which needs a signed Home launch-grant) is still unverified on hardware (see `docs/KNOWN_GAPS.md` G-HWV; reproduce via `docs/MICROVM_LOCAL_KVM_PROVISIONING.md`).
 - Signed release, update, and publish pipeline (Carrier-first, explicit web bootstrap/override only).
 - Operator-only remote node status, room control, and trusted-source update control over Carrier via `elastos node ...`.
 - Content sharing, local site hosting, site publish/activate/rollback.
