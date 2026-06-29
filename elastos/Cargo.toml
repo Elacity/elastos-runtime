@@ -30,6 +30,13 @@ debug = "line-tables-only"    # Enough for backtraces, ~60% less artifact size
 [profile.dev.package."*"]
 opt-level = 1                 # Optimize deps (compiled once, run many times)
 
+# Full debug info for the gateway/runtime binary only (the rest of the workspace stays
+# "line-tables-only" for build size). Lets a debugger (lldb/CodeLLDB) inspect locals/params in
+# elastos-server without bloating every crate. Provider capsules are separate crates and already
+# build with full debug info in dev, so they need no override here.
+[profile.dev.package.elastos-server]
+debug = 2
+
 [profile.test]
 opt-level = 0
 debug = "line-tables-only"
