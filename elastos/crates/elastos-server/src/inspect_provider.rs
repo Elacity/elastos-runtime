@@ -957,6 +957,25 @@ impl InspectProvider {
                     "data": { "scope": Self::scope_label(InspectScope::System), "capsules": capsules },
                 })
             }
+            // System-scope GLOBAL custody-chain attestation: a LIVE full-chain `verify_chain` walk
+            // of the audit plane, for an exporter to embed in the W7 EU-AI-Act artifact so the
+            // exported evidence is self-verifying (the chain is global, not per-capsule, so this is
+            // its own op rather than riding an arbitrary capsule's detail). `null` when the plane is
+            // memory-only (nothing durable to attest) or no audit source is attached — never faked.
+            "audit_attestation" => {
+                let chain = match &self.audit {
+                    Some(a) => a
+                        .chain_attestation()
+                        .await
+                        .and_then(|att| serde_json::to_value(att).ok())
+                        .unwrap_or(Value::Null),
+                    None => Value::Null,
+                };
+                json!({
+                    "status": "ok",
+                    "data": { "scope": Self::scope_label(InspectScope::System), "chain": chain },
+                })
+            }
             // System-scope detail.
             "capsule" => match request.get("id").and_then(Value::as_str) {
                 Some(id) => match self.source.inspect_get(id).await {
@@ -1394,6 +1413,49 @@ mod tests {
             bare["data"]["spend_budget"].is_null(),
             "an unmetered inspector must project null, not a fabricated budget"
         );
+    }
+
+    #[tokio::test]
+    async fn audit_attestation_op_returns_live_global_chain_for_export() {
+        use elastos_runtime::primitives::audit::AuditLog;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let log = Arc::new(AuditLog::with_file(&path).unwrap());
+        log.runtime_start("1.0.0");
+        log.runtime_stop();
+
+        let grants: Arc<dyn AuditSource> = Arc::new(RuntimeAuditLogGrantSource::new(log.clone()));
+        let provider = InspectProvider::new(Arc::new(MockSource {
+            entries: vec![probe_entry()],
+        }))
+        .with_audit(Arc::new(CompositeAuditSource::new(grants.clone(), grants)));
+
+        // The dedicated export read path: a clean file-backed plane attests verified.
+        let resp = provider
+            .send_raw(&json!({ "op": "audit_attestation" }))
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["data"]["chain"]["verified"], true);
+        assert_eq!(resp["data"]["chain"]["records"], 2);
+        assert!(resp["data"]["chain"]["signer"].is_string());
+
+        // After an on-disk tamper the SAME live read path reports verified=false.
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, content.replacen("1.0.0", "9.9.9", 1)).unwrap();
+        let after = provider
+            .send_raw(&json!({ "op": "audit_attestation" }))
+            .await
+            .unwrap();
+        assert_eq!(after["data"]["chain"]["verified"], false, "{after}");
+
+        // No audit source / memory-only ⇒ null (never a fabricated ok).
+        let bare = provider_with_probe()
+            .send_raw(&json!({ "op": "audit_attestation" }))
+            .await
+            .unwrap();
+        assert!(bare["data"]["chain"].is_null());
     }
 
     #[tokio::test]
