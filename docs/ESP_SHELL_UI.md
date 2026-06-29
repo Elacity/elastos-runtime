@@ -162,6 +162,17 @@ verdict), so the panel can only be "green" when BOTH the spend meter and the aud
 chain are themselves honestly green; an absent/broken chain or exhausted budget can
 never be masked.
 
+### `<CapsuleDetail>` — the Home capsule-detail surface (trust ∥ custody)
+- **Props:** a `CapsuleDetailView` (from `capsuleDetailView(capsule, spend_budget,
+  audit.chain)`), composing `trustMaterial` (Channel 1) + `homeCustodyView` (Channel 2).
+- **Projects:** nothing of its own — **pure paint** over the composed view.
+- **Renders:** the capsule header + three independent channels — Trust (`verified` /
+  `content_addressed` / `unsigned`), Spend, and Audit chain. The two channels are
+  INDEPENDENT (no blended "overall safe" affordance): a verified capsule still shows an
+  exhausted budget / broken chain, and an unsigned capsule is never dressed up by a
+  clean custody panel. Self-contained for the SSR snapshot harness.
+- **Intent:** none (pure display).
+
 ## Composition
 
 ```

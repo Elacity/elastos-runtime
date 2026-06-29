@@ -207,6 +207,9 @@ check_required 'auditChainView' elastos/esp/spend_audit.ts 'W5b: AuditChainBadge
 check_required 'homeCustodyView' elastos/esp/spend_audit.ts 'W5b: the Home capsule-detail custody panel must compose the two projections via homeCustodyView'
 check_required 'data-channel="audit"' elastos/esp/CapsuleCustodyPanel.svelte 'W5b: CapsuleCustodyPanel must paint the audit-chain custody channel'
 check_required 'CapsuleCustodyPanel' docs/ESP_SHELL_UI.md 'W5b: shell-UI spec must define the capsule custody panel component'
+check_required 'capsuleDetailView' elastos/esp/capsule_detail.ts 'W5b: the Home capsule-detail surface must compose trust + custody via capsuleDetailView'
+check_required 'data-channel="trust"' elastos/esp/CapsuleDetail.svelte 'W5b: CapsuleDetail must paint the trust channel independently of custody'
+check_required 'CapsuleDetail' docs/ESP_SHELL_UI.md 'W5b: shell-UI spec must define the capsule-detail surface'
 check_required 'SpendBudgetMeter' docs/ESP_SHELL_UI.md 'W5b: shell-UI spec must define the spend-budget meter'
 check_required 'AuditChainBadge' docs/ESP_SHELL_UI.md 'W5b: shell-UI spec must define the audit-chain badge'
 
