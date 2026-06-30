@@ -1870,7 +1870,9 @@ assert(
     servicesScript.includes("/api/apps/services/summary") &&
     servicesScript.includes("/api/apps/services/offers") &&
     servicesScript.includes("Browser Engine") &&
-    servicesScript.includes("Exit Node") &&
+    servicesScript.includes("Browser Exit service") &&
+    !servicesScript.includes("Exit Node") &&
+    !servicesCapsule.includes("Exit Node") &&
     servicesScript.includes("activateServicesSection") &&
     servicesScript.includes("EXIT_SERVICE_KIND") &&
     servicesScript.includes('const EXIT_SERVICE_KIND = "remote_exit"') &&
@@ -1947,7 +1949,7 @@ assert(
     gatewayApi.includes("HOME_SERVICES_REQUESTS_TOPIC") &&
     gatewayApi.includes("service-approve-request:") &&
     shellJs.includes('services: new Set(["browser", "chat-room"])'),
-  "Services must be a first-party capsule with Mine/Others Browser Engine + Exit Node UI and a scoped summary API",
+  "Services must be a first-party capsule with Mine/Others Browser Engine + Browser Exit service UI and a scoped summary API",
 );
 for (const staleServicesToken of [
   "Services needs a signed Home launch token",

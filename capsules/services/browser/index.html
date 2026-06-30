@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Services · ElastOS</title>
+  <link rel="stylesheet" href="./style.css?v=services-20260626a">
+</head>
+<body>
+  <section id="locked-shell" class="locked-shell hidden">
+    <div class="locked-card">
+      <p class="eyebrow">ElastOS</p>
+      <h1>Open from Home</h1>
+      <p class="subtitle">This app needs a signed Home launch token.</p>
+    </div>
+  </section>
+
+  <main id="services-shell" class="settings-container hidden" aria-label="Services">
+    <div class="settings">
+      <aside class="settings-sidebar" aria-label="Service sections">
+        <button class="settings-sidebar-item active" type="button" data-section-target="mine-services">
+          <span class="settings-sidebar-icon settings-sidebar-icon-mine" aria-hidden="true"></span>
+          <span class="settings-sidebar-text">Mine</span>
+          <strong id="mine-count">0</strong>
+        </button>
+        <button class="settings-sidebar-item" type="button" data-section-target="other-services">
+          <span class="settings-sidebar-icon settings-sidebar-icon-others" aria-hidden="true"></span>
+          <span class="settings-sidebar-text">Others</span>
+          <strong id="others-count">0</strong>
+        </button>
+      </aside>
+
+      <div class="settings-content-container">
+        <section class="settings-content active" aria-label="Services">
+          <div class="services-toolbar">
+            <button id="refresh-services" class="pc2-btn" type="button">Refresh</button>
+          </div>
+
+          <div id="services-status" class="services-status" role="status" hidden></div>
+
+          <section id="mine-services" class="pc2-section" aria-labelledby="mine-services-title">
+            <h2 id="mine-services-title" class="pc2-section-title">Mine</h2>
+            <div id="mine-services-list" class="services-list"></div>
+          </section>
+
+          <section id="other-services" class="pc2-section" aria-labelledby="other-services-title">
+            <h2 id="other-services-title" class="pc2-section-title">Others</h2>
+            <div id="other-services-list" class="services-list"></div>
+          </section>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <script type="module" src="./services.js?v=services-20260626g"></script>
+</body>
+</html>
