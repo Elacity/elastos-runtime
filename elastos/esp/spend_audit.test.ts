@@ -16,8 +16,10 @@ import {
   SPEND_WARNING_FRACTION,
   auditChainView,
   homeCustodyView,
+  intentProofView,
   spendBudgetView,
   type BudgetSnapshotV1,
+  type IntentProofSummaryV1,
 } from "./spend_audit.js";
 
 describe("spendBudgetView (adoption wedge #4)", () => {
@@ -108,6 +110,45 @@ describe("auditChainView (the flight recorder)", () => {
   });
 });
 
+describe("intentProofView (the prover/verifier custody channel)", () => {
+  it("renders null as ABSENT — no intent-proof custody, neither pass nor fail", () => {
+    const v = intentProofView(null);
+    assert.equal(v.present, false);
+    assert.equal(v.state, "absent");
+    assert.equal(v.flagged, 0);
+    assert.deepEqual(intentProofView(undefined), v);
+  });
+
+  it("renders an all-zero summary as CLEAN (only when present)", () => {
+    const v = intentProofView({ denied: 0, diverged: 0, undelivered: 0 });
+    assert.equal(v.present, true);
+    assert.equal(v.state, "clean");
+    assert.equal(v.flagged, 0);
+    // Absent must NOT equal clean — absence is not a pass.
+    assert.ok(v.state !== intentProofView(null).state, "absent must not equal clean");
+  });
+
+  it("flags ANY non-zero denied/diverged/undelivered (never masked)", () => {
+    for (const summary of [
+      { denied: 1, diverged: 0, undelivered: 0 },
+      { denied: 0, diverged: 2, undelivered: 0 },
+      { denied: 0, diverged: 0, undelivered: 3 },
+    ] as IntentProofSummaryV1[]) {
+      const v = intentProofView(summary);
+      assert.equal(v.state, "flagged", `must flag ${JSON.stringify(summary)}`);
+      assert.ok(v.flagged > 0);
+    }
+    const all = intentProofView({ denied: 1, diverged: 2, undelivered: 3 });
+    assert.equal(all.flagged, 6, "flagged is the sum of the three honest counts");
+  });
+
+  it("floors negative counts at 0 (never a negative flag)", () => {
+    const v = intentProofView({ denied: -5, diverged: 0, undelivered: 0 });
+    assert.equal(v.denied, 0);
+    assert.equal(v.state, "clean");
+  });
+});
+
 describe("homeCustodyView (the Home capsule-detail custody panel)", () => {
   const verified: ChainAttestation = { verified: true, records: 42, signer: "deadbeefkey", error: null };
   const broken: ChainAttestation = {
@@ -122,8 +163,9 @@ describe("homeCustodyView (the Home capsule-detail custody panel)", () => {
     const v = homeCustodyView(snap, verified);
     assert.deepEqual(v.spend, spendBudgetView(snap));
     assert.deepEqual(v.audit, auditChainView(verified));
-    // No roll-up verdict field was invented (no new logic over the two projections).
-    assert.deepEqual(Object.keys(v).sort(), ["audit", "spend"]);
+    assert.deepEqual(v.intent, intentProofView(undefined));
+    // No roll-up verdict field was invented (no new logic over the three projections).
+    assert.deepEqual(Object.keys(v).sort(), ["audit", "intent", "spend"]);
   });
 
   it("the ONLY all-green panel is metered-ok + verified", () => {
@@ -154,5 +196,19 @@ describe("homeCustodyView (the Home capsule-detail custody panel)", () => {
     assert.equal(v.spend.state, "exhausted");
     assert.equal(v.audit.state, "broken");
     assert.equal(v.audit.verified, false, "a tampered chain can never render verified on the panel");
+  });
+
+  it("the intent channel is independent — a flagged verdict sits beside a clean chain", () => {
+    // verified chain + within-budget, BUT flagged intents ⇒ the intent alarm is NOT masked
+    // by the two green channels (the moat: three independent channels).
+    const v = homeCustodyView({ limit: 100, spent: 1, remaining: 99 }, verified, {
+      denied: 2,
+      diverged: 1,
+      undelivered: 0,
+    });
+    assert.equal(v.spend.state, "ok");
+    assert.equal(v.audit.state, "verified");
+    assert.equal(v.intent.state, "flagged", "a flagged intent verdict is never masked by green spend/audit");
+    assert.equal(v.intent.flagged, 3);
   });
 });

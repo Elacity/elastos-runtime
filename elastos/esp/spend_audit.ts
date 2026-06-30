@@ -126,25 +126,83 @@ export function auditChainView(chain: ChainAttestation | null | undefined): Audi
 // exactly the two honest sub-states. A green panel is impossible unless BOTH the
 // spend meter and the audit chain are themselves honestly green.
 
+// ─────────────────────────── Intent-proof verdict (the prover/verifier custody) ──
+// The intent-proof loop (docs/INTENT_PROOF_LOOP.md) records, per capsule, how many
+// self-declared agent intents were DENIED (intent ⊄ envelope), DIVERGED (the act differed
+// from what was declared), or UNDELIVERED (declared, never completed). This projects that
+// summary fail-honestly: a `null` summary is ABSENT (the capsule has no intent-proof
+// custody — e.g. it isn't an autonomous standing-grant capsule), NEVER a satisfied "clean";
+// any non-zero count is FLAGGED (an alarm), never masked.
+
+/** Mirror of the inspector's per-capsule intent-proof summary. Counts are non-negative. */
+export interface IntentProofSummaryV1 {
+  denied: number;
+  diverged: number;
+  undelivered: number;
+}
+
+export type IntentProofState = "absent" | "clean" | "flagged";
+
+/** Render-ready view-model for the intent-proof custody channel. */
+export interface IntentProofView {
+  /** An intent-proof summary was projected (the capsule runs under the intent gate). */
+  present: boolean;
+  denied: number;
+  diverged: number;
+  undelivered: number;
+  /** Total flagged = denied + diverged + undelivered. */
+  flagged: number;
+  state: IntentProofState;
+}
+
+/**
+ * Project the inspector's intent-proof summary into a render-ready view-model.
+ * `null`/`undefined` ⇒ ABSENT (no intent-proof custody for this capsule — neither a pass
+ * nor a failure; absence is rendered as absence). A present summary with any non-zero
+ * denied/diverged/undelivered ⇒ FLAGGED (an alarm); all-zero ⇒ CLEAN. Counts floor at 0.
+ */
+export function intentProofView(
+  summary: IntentProofSummaryV1 | null | undefined,
+): IntentProofView {
+  if (summary === null || summary === undefined) {
+    return { present: false, denied: 0, diverged: 0, undelivered: 0, flagged: 0, state: "absent" };
+  }
+  const denied = Math.max(0, summary.denied);
+  const diverged = Math.max(0, summary.diverged);
+  const undelivered = Math.max(0, summary.undelivered);
+  const flagged = denied + diverged + undelivered;
+  return {
+    present: true,
+    denied,
+    diverged,
+    undelivered,
+    flagged,
+    state: flagged > 0 ? "flagged" : "clean",
+  };
+}
+
 /** Render-ready view-model for the Home capsule-detail custody panel. */
 export interface HomeCustodyView {
   spend: SpendBudgetView;
   audit: AuditChainView;
+  intent: IntentProofView;
 }
 
 /**
- * Compose the inspector's `spend_budget` + `audit.chain` facts into the Home
- * capsule-detail custody view-model. Pure composition: each field is exactly its
- * own fail-honest projection (`spendBudgetView` / `auditChainView`) — unmetered /
- * exhausted spend and absent / broken chain are carried through verbatim, never
- * masked by an optimistic roll-up.
+ * Compose the inspector's `spend_budget` + `audit.chain` + intent-proof facts into the
+ * Home capsule-detail custody view-model. Pure composition: each field is exactly its own
+ * fail-honest projection — unmetered / exhausted spend, absent / broken chain, and
+ * absent / flagged intent-proof are carried through verbatim, never masked by an
+ * optimistic roll-up. `intentProof` is optional (absent when not supplied).
  */
 export function homeCustodyView(
   spendBudget: BudgetSnapshotV1 | null | undefined,
   auditChain: ChainAttestation | null | undefined,
+  intentProof?: IntentProofSummaryV1 | null,
 ): HomeCustodyView {
   return {
     spend: spendBudgetView(spendBudget),
     audit: auditChainView(auditChain),
+    intent: intentProofView(intentProof),
   };
 }

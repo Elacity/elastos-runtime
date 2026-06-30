@@ -12,6 +12,7 @@
 
   const spend = view.spend;
   const audit = view.audit;
+  const intent = view.intent;
 
   // Honest display labels — one per fail-honest state from the projection.
   const SPEND_LABEL = {
@@ -24,6 +25,12 @@
     absent: "No durable chain",
     verified: "Chain verified",
     broken: "Chain tampered",
+  };
+  // Intent-proof verdict — absence is NOT a pass; any flagged count is an alarm.
+  const INTENT_LABEL = {
+    absent: "No agent-intent custody",
+    clean: "Intents within grant",
+    flagged: "Intents flagged",
   };
 </script>
 
@@ -41,6 +48,14 @@
     <span class="value">{AUDIT_LABEL[audit.state]}</span>
     {#if audit.present}
       <span class="detail">{audit.records} records</span>
+    {/if}
+  </div>
+
+  <div class="custody-channel intent" data-channel="intent" data-state={intent.state}>
+    <span class="label">Agent intents</span>
+    <span class="value">{INTENT_LABEL[intent.state]}</span>
+    {#if intent.flagged > 0}
+      <span class="detail">{intent.denied} denied · {intent.diverged} diverged · {intent.undelivered} undelivered</span>
     {/if}
   </div>
 </section>

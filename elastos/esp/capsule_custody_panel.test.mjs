@@ -28,8 +28,8 @@ const outUrl = new URL("./build/CapsuleCustodyPanel.gen.mjs", import.meta.url);
 writeFileSync(outUrl, js.code);
 const { default: CapsuleCustodyPanel } = await import(outUrl.href);
 
-function paint(spendBudget, auditChain) {
-  const view = homeCustodyView(spendBudget, auditChain);
+function paint(spendBudget, auditChain, intentProof) {
+  const view = homeCustodyView(spendBudget, auditChain, intentProof);
   return render(CapsuleCustodyPanel, { props: { view } }).body;
 }
 
@@ -63,4 +63,36 @@ test("exhausted spend + broken chain paints both alarms, never verified", () => 
   assert.ok(body.includes('data-state="exhausted"'));
   assert.ok(body.includes('data-state="broken"'));
   assert.ok(!body.includes("Chain verified"), "a tampered chain must never render as verified");
+});
+
+test("the intent channel is ABSENT by default — absence is not a pass", () => {
+  const body = paint(null, null);
+  assert.ok(body.includes('data-channel="intent"'), "the intent channel is rendered");
+  assert.ok(body.includes("No agent-intent custody"), "absent intent custody label");
+  assert.ok(!body.includes("Intents within grant"), "absent must never read as clean");
+});
+
+test("a flagged intent verdict paints an alarm BESIDE a verified chain (independent channels)", () => {
+  const body = paint({ limit: 100, spent: 1, remaining: 99 }, verified, {
+    denied: 2,
+    diverged: 1,
+    undelivered: 0,
+  });
+  // Two green channels...
+  assert.ok(body.includes("Chain verified"));
+  assert.ok(body.includes("Within budget"));
+  // ...do NOT mask the flagged intent verdict; the counts are surfaced.
+  assert.ok(body.includes("Intents flagged"));
+  assert.ok(body.includes('data-state="flagged"'), "the intent channel marks flagged");
+  assert.ok(body.includes("2 denied"), "the denied count is surfaced, not hidden");
+});
+
+test("a clean intent verdict reads clean only when the summary is present", () => {
+  const body = paint({ limit: 100, spent: 1, remaining: 99 }, verified, {
+    denied: 0,
+    diverged: 0,
+    undelivered: 0,
+  });
+  assert.ok(body.includes("Intents within grant"));
+  assert.ok(body.includes('data-state="clean"'));
 });
