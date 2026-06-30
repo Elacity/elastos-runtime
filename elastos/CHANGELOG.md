@@ -2,9 +2,125 @@
 
 All notable changes to the public ElastOS Runtime repository.
 
-## [Next]
+## [0.5.0] - Unreleased
 
-No changes yet.
+0.5.0 is the current public review candidate. It brings the Mac, Jetson, and
+server work into one candidate line and keeps the release truth explicit:
+Browser is available for review, but product Browser completion is not claimed
+until target-device media, audio, input, and installed-path proof are closed.
+
+Notes that were previously listed under 0.4.1 are folded into this entry because
+0.4.1 was not published.
+
+### Added
+- Added the first Services app so local services start disabled, can be enabled
+  intentionally, and remote services from trusted people are shown separately.
+- Added opt-in People discovery, `elastos://peer/invite?...` pairing, trusted
+  people, display names, and the 1:1 chat path while moving service management
+  out of People.
+- Added service registry flows for enabling local services, requesting access to
+  services from trusted people, and approving remote Browser Exit use.
+- Added Browser Engine and Exit selection in Browser so non-KVM hosts can serve
+  the Browser UI and use approved remote engines instead of pretending to be
+  local VM providers.
+- Added Browser Session Manager capacity receipts, page ownership checks,
+  heartbeats, stale-session cleanup, and fail-closed page control.
+- Added Mac VZ and Linux crosvm Browser VM target support, including WebRTC-only
+  display, VM artifact preflight, target refresh, runtime relay setup, active
+  target audits, and remote VM launcher support.
+- Added Runtime-owned Browser relay helpers for WebRTC and private stream
+  wiring, including TURN setup when `turnserver` is available.
+- Added Browser profile-disk descriptors and principal-owned reset handling,
+  with the storage truth documented as reset-scoped but not yet encrypted or
+  recoverable.
+- Added Inbox fresh-passkey approval for built-in Wallet requests while keeping
+  Wallet as the review surface for wallet authority.
+- Added the Inspector approved-provider dispatch surface with fresh passkey
+  approval and typed provider invocation boundaries.
+- Added public install and release proof helpers for component checksums,
+  publisher bootstrap integrity, source-home setup, source-home restart, and
+  installed-path smoke testing.
+- Added the public `AGENTS.md` operator contract and onboarding docs for review,
+  setup, target Browser proof, People conversations, and Inspector testing.
+
+### Changed
+- Reworked Home authority boundaries around passkey principals, launch tokens,
+  localhost `Users/self` mapping, protected content providers, Browser page
+  ownership, and sanitized provider responses.
+- Removed Browser `runtime_frame`, `diagnostic_frame`, screenshot, and
+  image-polling fallbacks from the product path. Browser launches now use
+  WebRTC remote display only.
+- Clarified the server role on non-KVM hosts: serve Home and Browser UI, then
+  delegate Browser execution to approved remote engines when needed.
+- Hardened Browser VM preflight and setup so stale Unix sockets no longer count
+  as launch-ready and gateway-only hosts keep remote VM wiring instead of being
+  overwritten with unusable local crosvm defaults.
+- Hardened Browser Wallet and dapp bridge behavior so Wallet reads, prepare,
+  signing, and broadcast stay Runtime-mediated and reviewed through
+  Wallet/Inbox.
+- Cleaned the System, People, and Services app surfaces so first-party app
+  navigation is quieter, People focuses on people, and Services focuses on
+  manageable services.
+- Aligned the default publish/setup profile with the current Home surface,
+  including System, People, Services, Browser, Wallet, Documents, Library,
+  Marketplace, Archive Manager, and Inbox.
+- Tightened release publishing so `elastos publish-release` uses the explicit
+  `home` profile by default, demo-only capsules stay behind the `demo` profile,
+  and first-party artifacts require sha256 or sha512 checksums before signing or
+  serving.
+- Hardened public-install smokes so they pin the installer-selected components
+  manifest and fail unless the selected gateway serves a 0.5.0-compatible
+  `home` profile with checksummed artifacts.
+- Hardened trusted-source Carrier bootstrap stamping so installer refresh and
+  release publishing require one publisher-scoped ticket/node pair.
+- Removed private staging, reconciliation, and local-machine proof wrappers from
+  the public script surface. Public proof now names reusable gates and explicit
+  target checks instead.
+- Updated release, install, Mac, Browser VM, People, Services, Inspector, and
+  architecture docs so proof claims distinguish source gates, installed-path
+  checks, target-device proof, and Browser product acceptance.
+
+### Fixed
+- Hardened Home app launch materialization so release-installed app bundles can
+  be refreshed from signed package metadata, stale bundles missing their
+  declared entrypoint are detected before launch, and source/dev launches remain
+  local when no release package identity is present.
+- Added macOS ARM64 setup metadata and Home runtime transport fixes so managed
+  Home can reuse a live local runtime, route WASM carrier calls through the host
+  runtime when FIFO bridge transport is unavailable, and avoid Linux `/proc`
+  process-liveness assumptions.
+- Cleaned the capsule catalog count construction so strict workspace clippy
+  gates pass with `-D warnings`.
+- Fixed Browser VM supervisor autostart smoke cleanup so fake launchers are
+  reaped after each run instead of leaving orphaned `node -` processes.
+- Fixed public install identity smoke permissions so the documented installed
+  DID/profile proof reaches the publisher check instead of failing locally with
+  `Permission denied`.
+- Fixed public installs to refresh trusted-source metadata from the live
+  Publisher Carrier bootstrap route instead of relying on stale publish-time
+  peer tickets.
+
+### Verification Status
+- Source/review proof should cite concrete commands: `git diff --check`,
+  `node scripts/home-entropy-check.mjs`,
+  `node scripts/browser-entropy-check.mjs`,
+  `bash scripts/check-wci-alignment.sh`, `just candidate-command-audit`, and
+  touched Rust or capsule tests.
+- Auth, wallet, chain-authority, Inspector, Services, People, and Browser wallet
+  bridge smokes are part of the required review proof set.
+- Target Browser VM parity proof remains operator-supplied. Use
+  `scripts/jetson-browser-runtime-audit.mjs` with explicit target host, user,
+  data directory, and source checkout arguments.
+- Public install proof still requires a staged or published 0.5.0-compatible
+  manifest with the current `home` profile and checksummed artifacts, followed
+  by `scripts/public-install-identity-smoke.sh` and
+  `scripts/public-install-home-frontdoor-smoke.sh`.
+- Product Browser completion is not claimed until
+  `scripts/browser-objective-audit.mjs` has accepted product media proof plus
+  hash-bound manual UX evidence.
+- Manual installed-device checks on Mac and Jetson are still required before a
+  release handoff: `elastos setup`, open Home, visit first-party apps, and
+  return Home cleanly on the installed path.
 
 ## [0.4.0] - 2026-06-09
 
@@ -243,7 +359,7 @@ No changes yet.
 - Moved the visible Browser preview request path from HTTP fetch to stream-session reservation so the UI exercises the intended browser path and reports `byte_transport: not_attached` until a Browser Engine Adapter exists.
 - Added `browser-engine-adapter` as the internal Browser Engine Adapter contract with fail-closed `status`, `launch`, `attach_stream`, and `close_page` operations; it requires explicit operator config and attached `adapter_ipc` byte transport before any page launch can succeed.
 - Added `/api/apps/browser/open` as the high-level Browser product route that performs Runtime-owned Net validation, Exit stream reservation, and Browser Engine Adapter launch without exposing raw Exit or Browser Engine provider routes to ordinary capsules.
-- Added Browser Session Manager proof surfaces: launch reservations, per-principal/total capacity receipts, page heartbeats, stale active-page cleanup, and smokes that prove concurrent Home-launched Browser pages close without leaving capacity behind.
+- Added Browser Session Manager proof surfaces: launch reservations, per-principal/total capacity receipts, page heartbeats, stale active-page cleanup, and gateway-level smokes that prove concurrent Home-launched Browser page accounting closes without leaving capacity behind.
 - Added a protected-content Browser reachability smoke for the known `ela.city` item route. This is intentionally scoped to route/session cleanup and does not claim purchase, key release, decrypt, or playback readiness.
 - Added typed `elastos.adapter-ipc/v1` descriptors for configured Browser stream backends and stripped those private endpoint descriptors from Browser UI responses while passing them to the internal Browser Engine Adapter.
 - Added typed `elastos.exit.relay-ipc/v1` descriptors for private Exit relay sockets; Gateway uses them only internally to relay bytes from the Runtime-owned Browser stream socket to an operator/Carrier exit daemon, strips them from Browser UI, and never passes them to the Browser Engine Adapter.

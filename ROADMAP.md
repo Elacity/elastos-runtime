@@ -284,6 +284,31 @@ credentials.
 FROST can be a classical helper for v0 receipt/cohort signing, but it is not the
 long-term dKMS root because Schnorr/ECC security is not post-quantum.
 
+#### Secrets Vault / Password Manager Direction
+
+dKMS and dDRM can also support a password manager, but they are the substrate,
+not the product by themselves. The product layer should be a Runtime-mediated
+Secrets Vault:
+- store passwords, API keys, recovery codes, and other small secrets as typed
+  encrypted objects under the active principal root
+- use random per-secret data-encryption keys, wrapped only to explicit
+  protectors such as the principal data key, WebAuthn PRF when available,
+  DID/recovery protectors, or dKMS recipient grants
+- use dDRM-style rights, grants, revocation, and audit when a secret is shared
+  with another principal, device, agent, or runtime
+- expose secrets to apps and Browser only through scoped Runtime capabilities;
+  app capsules and web pages must never receive raw vault APIs or key material
+- bind Browser autofill to verified origin, user approval, and isolated
+  Runtime/provider insertion rather than page-visible JavaScript access
+- harden local unlock, recovery, device revocation, clipboard timeout,
+  plaintext logging prevention, phishing/origin warnings, and export/import
+  before calling it a full password manager
+
+This should come after the protected-root/key-envelope work is stable. The
+first slice can be a Secrets capsule plus provider contract for create/read/
+update/delete/generate/share/revoke, with Browser autofill added only after
+origin binding and approval UX are proven.
+
 ### 3. Build passkey-first authority, then blockchain proof adapters
 
 The authority foundation is not EID, Essentials, UniversalX, BTC, Base, SIWE, or
@@ -804,6 +829,27 @@ Home evolves from "launch apps" to "navigate your objects." The natural tabs bec
 - **System** — services, updates, trust configuration
 
 Users navigate objects. Capsules appear when an object needs one.
+
+People is also the right product surface for discovering trusted service offers,
+but it must not become the provider control plane. A person/contact may expose
+`elastos.service.offer/v1` cards such as conversation, remote Exit, storage,
+relay, or model service offers. Enabling one creates or selects a
+principal-scoped provider grant; the provider still enforces policy, quotas,
+expiry, and audit. Browser, storage, or AI capsules then discover enabled
+services through their provider contracts, not by reading People state directly.
+Home carries the same records in a top-level `elastos.runtime.services/v1`
+summary: local offers are what this Runtime can advertise, remote offers are
+trusted People/Carrier discoveries, and capsules still see only capability
+contracts such as `capsule -> runtime capability -> provider grant -> service`.
+Current local offers are conversation hosting, Browser Exit, Browser Engine,
+object storage, content availability/pinning backed by the content/IPFS
+provider plane, and webspace hosting when their provider config or binary is
+installed. Browser Engine offers carry a runtime-contract summary so a gateway
+can distinguish a local microVM substrate from a remote/operator VM substrate
+without inventing a non-VM Browser provider. Vault/password-manager style UX
+belongs on top of an explicit future
+vault/content/key provider contract; it should not be advertised as a current
+service or as raw IPFS access.
 
 **The browser is a capsule, not the platform.**
 A web browser capsule gets `localhost://Users/<principal-root>/Bookmarks/*` and explicit outbound network capability. It is one viewer among many, not the runtime itself. This is the inversion from ChromeOS: instead of everything running in the browser, everything runs in the runtime and the browser is one sandboxed capsule.

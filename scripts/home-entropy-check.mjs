@@ -1198,10 +1198,12 @@ assert(
     agentsContract.includes("## Public Live Deployment") &&
     agentsContract.includes("## Staging Machines") &&
     agentsContract.includes("## Browser Claim Discipline") &&
-    agentsContract.includes("0.5.0/reconcile") &&
+    agentsContract.includes("review/0.5.0") &&
+    agentsContract.includes("reporting its exact branch, commit, tree id, dirty status") &&
+    agentsContract.includes("Target proof must cite the exact source tree") &&
     agentsContract.includes("explicit user approval before the mutation") &&
     agentsContract.includes("WebRTC remote display"),
-  "Root AGENTS.md must preserve the operator contract headings, active branch role, public-live approval rule, and Browser claim discipline",
+  "Root AGENTS.md must preserve the operator contract headings, review branch role, target proof discipline, public-live approval rule, and Browser claim discipline",
 );
 assert(
   linuxSourceHomeRestart.includes("process_matches_gateway_listener") &&

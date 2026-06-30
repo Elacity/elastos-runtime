@@ -47,6 +47,9 @@ Selkies/GStreamer is the current hosted baseline:
 - reports the display coordinate size used by datachannel input,
 - supports Runtime/provider address navigation, back, forward, and reload,
 - keeps browser networking behind Runtime Exit with `direct_network=false`,
+- Operators that need traversal beyond direct host UDP must pass `--ice-server`
+  to the operator target wrapper; those STUN/TURN/TURNS values must surface as
+  typed `display_session.ice_servers`, not hidden provider fallback state,
 - supports the Runtime-mediated wallet bridge and Glide connect-wallet smoke.
 
 It is not accepted as the final browser UX:
@@ -134,7 +137,7 @@ ELASTOS_BROWSER_KASM_CONTROL_CONFIG='{
 node scripts/browser-hosted-product-operator-config.mjs \
   --candidate kasm-workspaces \
   --out-dir /opt/elastos/kasm-workspaces \
-  --supervisor-program /home/wau/elastos-runtime/scripts/browser-hosted-product-supervisor.mjs \
+  --supervisor-program "$PWD/scripts/browser-hosted-product-supervisor.mjs" \
   --control-socket /run/elastos/kasm-workspaces-control.sock
 ```
 
@@ -174,7 +177,7 @@ Operator prerequisites:
 node scripts/browser-hosted-product-operator-config.mjs \
   --candidate browserbox \
   --out-dir /opt/elastos/browserbox \
-  --supervisor-program /home/wau/elastos-runtime/scripts/browser-hosted-product-supervisor.mjs \
+  --supervisor-program "$PWD/scripts/browser-hosted-product-supervisor.mjs" \
   --control-socket /run/elastos/browserbox-control.sock
 ```
 
@@ -307,13 +310,13 @@ license confirmation, CLI, or API credentials.
 Generated placeholder socket paths must not be shown as operator instructions;
 they are normalized to "operator control socket not provisioned" until a durable
 candidate control socket is configured.
-For the current Selkies baseline, the report also reads the control-service
-status. If `single_session=true` and `active_pages>0`, do not run a product
-bake-off against that target; close the active Browser page or use a separate
-provider instance. In that state, Selkies is marked `ready_for_bakeoff=false`
-even if its preflight passed; the underlying preflight result is preserved as
-`preflight_ready_for_bakeoff` so operators can distinguish configuration
-readiness from live-session availability. An active single-session target is a serialization limit,
+For older singleton Selkies baselines, the report also reads the control-service
+status. If `single_session=true`, `single_vm_session` is not true, and
+`active_pages>0`, do not run a product bake-off against that target; close the
+active Browser page or use a separate provider instance. Current source-home VM
+controls report `single_vm_session=true`, which means the one profile-owned VM
+can host multiple page sessions and should not be treated as busy merely because
+one Browser page is open. An active singleton target is a serialization limit,
 not an audio acceptance result.
 
 When proof artifacts are supplied, the decision report summarizes them

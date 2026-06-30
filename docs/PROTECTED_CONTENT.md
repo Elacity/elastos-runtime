@@ -44,6 +44,56 @@ backends behind `rights-provider`, `key-provider`, and `decrypt-provider`; they
 must not give app or viewer capsules raw CEK, wallet, chain, IPFS, or Elacity
 authority.
 
+## dDRM Decrypt Rail Options And Recommendation
+
+The v0.4.0 provider chain intentionally proves the fail-closed sockets:
+
+`drm-provider -> rights-provider -> key-provider -> decrypt-provider`
+
+The remaining architecture decision is how the live CEK reaches the decrypt
+boundary once real decryption is wired. The recommended default is a
+sealed-material rail:
+
+- Runtime orchestrates the normal provider chain through `drm`, `rights`, and
+  `key`.
+- `decrypt-provider` creates a per-session one-time public key for the decrypt
+  sandbox.
+- `key-provider` or the dKMS release backend seals the CEK to that one-time
+  decrypt-session public key, using the approved PQ-hybrid envelope profile.
+- The decrypt step receives sealed material in the decrypt-session request,
+  unwraps it inside the sandbox, decrypts/renders, zeroizes the live CEK, and
+  returns only scoped output.
+- `decrypt-provider` does not pull keys by making outbound capability calls.
+  The component that briefly sees the live CEK must have the smallest possible
+  authority surface.
+
+This keeps the rights/key/decrypt separation while avoiding an outbound
+authority grant to the highest-risk boundary. It also explains the current
+schema gap: `ReleaseReceiptV1` proves authorization, but it intentionally carries
+no key material; the next contract addition should add a sealed decrypt material
+envelope to the key/decrypt handoff instead of sending a raw CEK or letting
+decrypt fetch one.
+
+Other options were considered and rejected as the normal Runtime path:
+
+| Option | Shape | Assessment |
+|--------|-------|------------|
+| Decrypt pulls keys | `decrypt-provider` calls `key-provider` or a key backend after authorization | Flexible, but grants outbound authority to the boundary that briefly holds live CEK. Keep only for controlled diagnostics or explicit capability-gated adapters. |
+| One combined key/decrypt provider | Key release and decrypt/render run in one provider | Simpler CEK path, but collapses authority separation and increases blast radius. Useful for tests, not the target trust boundary. |
+| Runtime relays raw CEK | Runtime receives CEK and passes it to decrypt | Not acceptable. Runtime would become a key-material holder instead of an orchestrator. |
+| Runtime relays sealed material | Runtime passes a sealed envelope without being able to open it | Acceptable if the envelope is transcript-bound and Runtime never sees raw CEK. This is the practical form of the recommended rail. |
+| dKMS direct-to-decrypt sealing | dKMS seals directly to the one-time decrypt-session key | Best target when available. `key-provider` brokers policy and receipts without seeing raw CEK. |
+| Lit/Chipotle backend | Vendor-backed key release returns a CEK envelope, as PC2 does today | Useful compatibility backend only. The Runtime contract must remain backend-neutral and must also support an ElastOS-native dKMS path. |
+
+Before live decrypt is enabled, the sealed material envelope must bind the full
+transcript: principal, session, object, action, viewer interface, output kind,
+expiry, release receipt hash, decrypt-session public key, envelope algorithm,
+and provider identity. It must use nonce-safe authenticated encryption, signature
+verification, replay rejection, short expiry, zeroization, and audit. PC2's
+current `ddrm-decrypt` WASM pattern proves the containment invariant, but its
+P-256 and Lit/Chipotle details are implementation references rather than
+Runtime product truth.
+
 ## Protected Object Shape
 
 New protected objects should publish as sealed SmartWeb objects:
@@ -93,6 +143,9 @@ New protected content should use algorithm-agile sealed objects:
   where size and speed are acceptable.
 - Reconstruct the CEK only inside the key/decrypt provider boundary, then return
   scoped render/decrypt output to the viewer instead of raw CEKs.
+- When the decrypt engine is wired, prefer dKMS-direct sealing to the decrypt
+  session key. If an intermediate key-provider re-seal is used during migration,
+  it must remain provider-internal, signed, auditable, and short-lived.
 
 Current EVM/BTC/ELA wallet proofs and dDRM chain state are still classical. They
 are useful authorization inputs today, but they should not be the only permanent
@@ -130,7 +183,8 @@ The provider plane should expose typed questions instead:
 
 1. Wire real `elastos://drm/open` orchestration behind the declared sequence:
    content status/fetch, typed rights checks, rights-bound key release,
-   release-receipt-bound decrypt/render sessions, and signed release receipts.
+   release-receipt-bound decrypt/render sessions, sealed decrypt material, and
+   signed release receipts.
 2. Wire `key-provider` to an ElastOS PQ-hybrid threshold release backend.
 3. Wire `decrypt-provider` to a real decrypt/render backend that keeps CEKs
    inside the provider boundary.
@@ -139,8 +193,12 @@ The provider plane should expose typed questions instead:
    provenance, key-envelope, and viewer-interface generation exist.
 5. Add a permissioned ElastOS PQ-hybrid dKMS v0 for new content only.
 
-No visible protected-content UI should ship before fail-closed provider tests and
-capability-resource checks cover the full open path.
+Visible protected-content UI may ship only as a disabled/read-only readiness
+rail until fail-closed provider tests and capability-resource checks cover the
+full open path. The current Library rail can show Provider Chain/status
+receipts and a disabled `Encrypted recipients` option, but it must not claim
+production encrypted-recipient sharing, dDRM completion, or generic decrypt/
+render readiness.
 
 ## Executable Proof
 

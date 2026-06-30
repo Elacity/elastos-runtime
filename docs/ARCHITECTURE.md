@@ -46,6 +46,22 @@ remote:
 
 `capsule -> runtime capability -> Carrier/provider plane -> object/service`
 
+People surfaces are discovery and trust views, not authority shortcuts. A
+contact may advertise typed `elastos.service.offer/v1` cards for conversation,
+remote Exit, storage, relay, model inference, or similar services. The card is
+only a user-facing offer; enabling it must create or select a principal-scoped
+provider grant, and the relevant provider remains the enforcement path for
+policy, quota, expiry, routing, and audit.
+Home mirrors these records in `elastos.runtime.services/v1`: local offers are
+the services this Runtime can advertise, remote offers are trusted
+People/Carrier discoveries, and capsules consume both through provider
+capability contracts instead of People state.
+Configured local offers currently cover conversation hosting, Browser Exit,
+Browser Engine, object storage, content availability/pinning through the
+content/IPFS provider plane, and webspace hosting. Vault-like replicated secret
+or password-manager UX remains future provider work until an explicit
+vault/content/key contract exists.
+
 That means app, viewer, and content capsules do not branch on "local file",
 "IPFS", "Telegram", "browser", or "internet". They request a capability-scoped
 operation against an object or service. The runtime authorizes and routes it.
@@ -122,7 +138,8 @@ Recovery Kit phrase with AES-256-GCM, stores a runtime-encrypted downloadable
 archive plus verified protector metadata, can package downloads behind an
 optional user password, and verifies imports against the encrypted root
 descriptor. Protected roots now use a runtime-owned AES-256-GCM
-object envelope for Documents working copies, Home browser state, and
+object envelope for Documents working copies, Home shell browser state
+(window/layout/session metadata, not Browser VM Chromium profile disks), and
 viewer/content storage. The envelope is bound to the principal, localhost root,
 data-key ID, and object URI. Protected roots reject plaintext reads instead of
 silently migrating or falling back. A lost RP domain or deleted passkey must not
@@ -863,11 +880,19 @@ trait Provider {
 | `elastos://rights/` | Typed protected-content rights questions through `rights-provider`; no contract SDKs, chain RPC, wallet RPC, or raw key authority |
 | `elastos://key/` | Protected-content key-release requests through `key-provider`; no raw CEKs, KMS credentials, chain RPC, or wallet RPC |
 
+Room sync normally reaches Carrier through the `elastos://peer/` provider plane.
+The trusted-source install/update path has one explicit exception: a
+Runtime-owned trusted-source Room bootstrap exception may consume the stamped or
+live publisher Carrier ticket to seed Room gossip. That ticket stays in Runtime
+trusted-source state and provider calls; no ordinary capsule, Home summary, or
+Room UI receives a raw trusted-source ticket, decoded endpoint, or direct socket
+authority.
+
 The visible Browser capsule uses `/api/apps/browser/open` as its product route.
 That route validates the Browser launch grant, reserves a Runtime Net/Exit
 stream, and calls the internal Browser Engine Adapter. When an operator
-configures the Playwright proof helper, Browser UI receives only a page id plus
-Runtime screenshot/input routes for the rendered page. Ordinary apps do not get
+configures a Browser engine helper, Browser UI receives a page id plus a
+WebRTC display session and Runtime-scoped control routes. Ordinary apps do not get
 raw `elastos://exit/*` or `elastos://browser-engine/*` provider access.
 Raw `elastos.adapter-ipc/v1` endpoint descriptors are internal handoff data and
 are stripped from Browser UI responses.
@@ -897,6 +922,15 @@ daemon that dials only operator-allowlisted public TCP/TLS targets after Runtime
 has validated the Browser stream request. It is the current Browser path's only
 DNS/TCP dialer; Browser UI, Browser Engine Adapter, and stream bridge still have
 no direct host network authority.
+The cross-runtime Exit shape is `remote_carrier_exits` on `exit-provider`:
+Runtime grants a named principal access to a named remote Runtime DID/service
+with a private `connect_ticket` under a stable operator `grant_id`, bounded by
+public target policy and optional grant expiry plus global/per-principal
+active-stream accounting. The resulting
+`elastos.exit.remote-carrier-session/v1` receipt uses
+`byte_transport=carrier_stream`; no Browser capsule receives route tickets,
+local socket paths, or direct host networking from that handoff.
+
 | `elastos://decrypt/` | Protected-content decrypt/render sessions through `decrypt-provider`; no raw CEKs, raw plaintext, filesystem authority, key-backend SDKs, KMS credentials, chain RPC, or wallet RPC |
 | `cloud://` | OAuth-style external provider API, caching (aspirational example, not implemented) |
 | `elastos://ai/` | Model routing, API keys, response handling |
@@ -928,6 +962,14 @@ Runtime -> Home: { "ok": true, "token": "..." }
 The exact transport can be HTTP, stdio, serial, or another host adapter. The
 authority model must not change: the runtime validates the caller and mints a
 scoped grant.
+
+The current browser-hosted Home adapter still carries the launch token in the
+route query so the child app can bootstrap its `x-elastos-home-token` header.
+That query placement is compatibility transport only. Authority is the signed,
+app-bound, non-delegatable grant, not the URL shape, route path, or iframe
+placement. `TASKS.md` tracks replacing this with a same-origin or HttpOnly
+session-bound launch context before the browser-hosted adapter is treated as the
+final capsule ABI.
 
 ---
 
@@ -987,7 +1029,7 @@ elastos-runtime/                        # Repo root
 │   └── tools/
 │       ├── vsock-proxy/               # Guest bridge helper for Carrier control/network provider wiring
 │       ├── browser-engine-supervisor/ # Linux native Browser Engine launch supervisor
-│       ├── browser-playwright-engine/ # Server/headless Browser Engine screenshot-input proof
+│       ├── browser-playwright-engine/ # Server/headless Browser Engine WebRTC proof
 │       ├── browser-stream-bridge/     # Linux Browser Engine Unix stream bridge
 │       └── browser-local-exit/        # Server-side allowlisted Browser Exit relay
 │
