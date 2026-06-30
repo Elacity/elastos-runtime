@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
-use crate::carrier_service::CarrierServiceProvider;
+use crate::carrier_service::{CarrierLiveness, CarrierServiceProvider};
 use crate::ownership;
 use crate::setup::{CapsuleEntry, ComponentsManifest};
 use crate::vm_provider::VmCapsuleProvider;
@@ -170,7 +170,10 @@ enum CapsuleBackend {
     Vm(Box<RunningVm>),
     /// Carrier-plane host process (for `permissions.carrier: true`).
     /// These are explicit runtime-owned providers, not ordinary app capsules.
-    Carrier,
+    /// BUG-7: carries a pending-safe liveness probe over the host child so reap
+    /// can collect a dead carrier service. `None` when route registration did not
+    /// produce a provider (no child to probe) ⇒ treated as alive (fail-safe).
+    Carrier(Option<CarrierLiveness>),
 }
 
 struct RunningCapsule {
@@ -824,7 +827,7 @@ impl Supervisor {
         binary_path: &Path,
         env_vars: Vec<(String, String)>,
         init_config: serde_json::Value,
-    ) -> Option<ProviderRoute> {
+    ) -> Option<(ProviderRoute, CarrierLiveness)> {
         if !vm_provider_bridge_enabled() {
             return None;
         }
@@ -836,13 +839,16 @@ impl Supervisor {
             ProviderRoute::Scheme(scheme) => scheme.clone(),
         };
 
-        let provider: Arc<dyn elastos_runtime::provider::Provider> =
-            Arc::new(CarrierServiceProvider::new(
-                provider_scheme,
-                binary_path.display().to_string(),
-                env_vars,
-                init_config,
-            ));
+        let concrete = CarrierServiceProvider::new(
+            provider_scheme,
+            binary_path.display().to_string(),
+            env_vars,
+            init_config,
+        );
+        // BUG-7: grab the liveness probe over the SAME bridge before the concrete
+        // provider is erased into Arc<dyn Provider> and handed to the registry.
+        let liveness = concrete.liveness();
+        let provider: Arc<dyn elastos_runtime::provider::Provider> = Arc::new(concrete);
 
         match route.clone() {
             ProviderRoute::SubProvider(sub) => {
@@ -854,7 +860,7 @@ impl Supervisor {
                             capsule_name,
                             binary_path.display()
                         );
-                        Some(ProviderRoute::SubProvider(sub))
+                        Some((ProviderRoute::SubProvider(sub), liveness))
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -875,7 +881,7 @@ impl Supervisor {
                     capsule_name,
                     binary_path.display()
                 );
-                Some(ProviderRoute::Scheme(scheme))
+                Some((ProviderRoute::Scheme(scheme), liveness))
             }
         }
     }
@@ -913,7 +919,13 @@ impl Supervisor {
                 .filter_map(|(handle, capsule)| {
                     let alive = match &mut capsule.backend {
                         CapsuleBackend::Vm(vm) => !vm.has_exited(),
-                        CapsuleBackend::Carrier => true, // managed by carrier service bridge
+                        // BUG-7: a carrier service whose host child has exited is now
+                        // reaped instead of treated as unconditionally alive. The probe
+                        // is pending-safe (a lazily-not-yet-spawned child reads alive);
+                        // a missing probe (registration produced no provider) is alive.
+                        CapsuleBackend::Carrier(probe) => {
+                            probe.as_ref().map(|p| p.is_alive()).unwrap_or(true)
+                        }
                     };
                     if alive {
                         None
@@ -1574,8 +1586,9 @@ impl Supervisor {
             env_vars.push(("ELASTOS_TOKEN".into(), session.token));
         }
 
-        // Register provider route using CarrierServiceProvider
-        let provider_route = self
+        // Register provider route using CarrierServiceProvider. The route carries
+        // a BUG-7 liveness probe over the host child so reap can collect it.
+        let (provider_route, carrier_liveness) = match self
             .register_carrier_service_route(
                 name,
                 provides.as_deref(),
@@ -1583,7 +1596,11 @@ impl Supervisor {
                 env_vars,
                 config,
             )
-            .await;
+            .await
+        {
+            Some((route, liveness)) => (Some(route), Some(liveness)),
+            None => (None, None),
+        };
 
         eprintln!(
             "[supervisor] Launched carrier service '{}': handle={} binary={}",
@@ -1602,7 +1619,7 @@ impl Supervisor {
                     vsock_cid: cid,
                     started_at: std::time::Instant::now(),
                     provider_route,
-                    backend: CapsuleBackend::Carrier,
+                    backend: CapsuleBackend::Carrier(carrier_liveness),
                     // Carrier services have no per-launch microVM Carrier bridge.
                     bridge_task: None,
                     carrier_socket: None,
@@ -1663,10 +1680,11 @@ impl Supervisor {
                     .join(format!("{}.ext4", handle));
                 let _ = tokio::fs::remove_file(&overlay_path).await;
             }
-            CapsuleBackend::Carrier => {
+            CapsuleBackend::Carrier(_) => {
                 // Carrier service child process is killed when CarrierServiceProvider
                 // is dropped (via CarrierServiceBridge::drop). Unregistering the
-                // provider route above drops the last Arc reference.
+                // provider route above drops the last Arc reference. (The liveness
+                // probe holds an Arc too, but it is dropped with `capsule` here.)
             }
         }
 
@@ -1724,7 +1742,7 @@ impl Supervisor {
                 let _ = tokio::fs::remove_file(&overlay_path).await;
                 code
             }
-            CapsuleBackend::Carrier => {
+            CapsuleBackend::Carrier(_) => {
                 // Carrier services are background services — they don't "exit".
                 // Waiting on them is a no-op; they run until stopped.
                 eprintln!(
@@ -1754,7 +1772,12 @@ impl Supervisor {
                             "stopped"
                         }
                     }
-                    CapsuleBackend::Carrier => "running",
+                    // BUG-7: report a carrier whose host child has exited as stopped
+                    // (pending/not-yet-spawned and probe-less both read running, fail-safe).
+                    CapsuleBackend::Carrier(probe) => match probe {
+                        Some(p) if !p.is_alive() => "stopped",
+                        _ => "running",
+                    },
                 };
 
                 Ok(SupervisorResponse {
