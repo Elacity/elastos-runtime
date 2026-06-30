@@ -47,6 +47,8 @@ enum Request {
         principal_id: Option<String>,
         #[serde(default)]
         reason: Option<String>,
+        #[serde(default)]
+        stream_nonce: Option<String>,
     },
     Http {
         #[serde(default)]
@@ -120,7 +122,8 @@ impl NetProvider {
                 target,
                 principal_id,
                 reason,
-            } => self.stream(&target, principal_id, reason),
+                stream_nonce,
+            } => self.stream(&target, principal_id, reason, stream_nonce),
             Request::Http {
                 schema,
                 url,
@@ -202,6 +205,7 @@ impl NetProvider {
         target: &str,
         principal_id: Option<String>,
         reason: Option<String>,
+        stream_nonce: Option<String>,
     ) -> Response {
         let Ok(url) = Url::parse(target) else {
             return Response::error("invalid_request", "stream target must be an absolute URL");
@@ -224,6 +228,7 @@ impl NetProvider {
                 "target": target,
                 "principal_id": principal_id,
                 "reason": reason,
+                "stream_nonce": stream_nonce,
             }),
         )
     }

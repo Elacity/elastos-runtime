@@ -1,5 +1,6 @@
 use super::*;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 mod support;
@@ -131,15 +132,22 @@ fn init_bitcoin_rpc_provider(provider: &mut ChainProvider, rpc_url: String) {
     assert!(matches!(init, Response::Ok { .. }));
 }
 
-fn add_true_node_supervisor(provider: &mut ChainProvider, network_id: &str) {
+fn write_node_supervisor_helper(data_dir: &Path) -> String {
+    let helper = data_dir.join("test-node-supervisor");
+    fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+    helper.to_string_lossy().into_owned()
+}
+
+fn add_test_node_supervisor(provider: &mut ChainProvider, network_id: &str, program: &str) {
     let init = provider.handle(Request::Init {
         config: json!({
             "node_supervisor": {
                 "networks": {
                     network_id: {
-                        "start": { "program": "/bin/true", "args": [] },
-                        "stop": { "program": "/bin/true", "args": [] },
-                        "restart": { "program": "/bin/true", "args": [] },
+                        "start": { "program": program, "args": [] },
+                        "stop": { "program": program, "args": [] },
+                        "restart": { "program": program, "args": [] },
                         "timeout_ms": 1000
                     }
                 }
@@ -551,6 +559,21 @@ fn prepares_typed_evm_transaction_intent_without_node_write() {
 }
 
 #[test]
+fn prepare_transaction_rejects_oversized_data_before_backend() {
+    let mut provider = provider_with_rpc("http://127.0.0.1:9".to_string());
+    let oversized = format!("0x{}", "00".repeat(256 * 1024 + 1));
+    let response = provider.handle(Request::PrepareTransaction {
+        network: "esc-local".to_string(),
+        from: "0x0000000000000000000000000000000000000001".to_string(),
+        to: "0x0000000000000000000000000000000000000002".to_string(),
+        value: "0x0".to_string(),
+        data: Some(oversized),
+    });
+
+    assert_eq!(error_code(response), "invalid_data");
+}
+
+#[test]
 fn exposes_typed_evm_dapp_read_helpers_without_raw_rpc_urls() {
     let rpc_url = spawn_rpc_sequence_server(vec![
         ("eth_getTransactionCount", json!("0x7")),
@@ -676,7 +699,8 @@ fn node_lifecycle_runs_operator_supervisor_for_loopback_nodes() {
     let data_dir = TestDataDir::new();
     let mut provider =
         provider_with_bitcoin_rpc_in(data_dir.path(), "http://127.0.0.1:18446".to_string());
-    add_true_node_supervisor(&mut provider, "btc-local");
+    let supervisor_program = write_node_supervisor_helper(data_dir.path());
+    add_test_node_supervisor(&mut provider, "btc-local", &supervisor_program);
 
     let status = ok_data(provider.handle(Request::NodeLifecycle {
         network: "btc-local".to_string(),
@@ -685,7 +709,7 @@ fn node_lifecycle_runs_operator_supervisor_for_loopback_nodes() {
     assert_eq!(status["managed"], true);
     assert_eq!(status["control_available"], true);
     assert_eq!(status["state"], "managed_local");
-    assert_json_strings_do_not_contain(&status, "/bin/true");
+    assert_json_strings_do_not_contain(&status, &supervisor_program);
     assert_json_strings_do_not_contain(&status, "18446");
 
     let start = ok_data(provider.handle(Request::NodeLifecycle {
@@ -695,14 +719,16 @@ fn node_lifecycle_runs_operator_supervisor_for_loopback_nodes() {
     assert_eq!(start["action"], "start");
     assert_eq!(start["control_available"], true);
     assert_eq!(start["state"], "managed_local");
-    assert_json_strings_do_not_contain(&start, "/bin/true");
+    assert_json_strings_do_not_contain(&start, &supervisor_program);
     assert_json_strings_do_not_contain(&start, "18446");
 }
 
 #[test]
 fn node_lifecycle_rejects_supervisor_control_for_remote_backends() {
+    let data_dir = TestDataDir::new();
     let mut provider = provider_with_rpc("https://example.invalid/rpc".to_string());
-    add_true_node_supervisor(&mut provider, "esc-local");
+    let supervisor_program = write_node_supervisor_helper(data_dir.path());
+    add_test_node_supervisor(&mut provider, "esc-local", &supervisor_program);
 
     let response = provider.handle(Request::NodeLifecycle {
         network: "esc-local".to_string(),

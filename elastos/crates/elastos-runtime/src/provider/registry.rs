@@ -466,6 +466,7 @@ const RESERVED_SUB_NAMES: &[&str] = &[
     "rights",
     "key",
     "decrypt",
+    "inspect",
     "availability",
     "block-graph",
 ];
@@ -690,6 +691,12 @@ impl ProviderRegistry {
     pub async fn schemes(&self) -> Vec<String> {
         let providers = self.providers.read().await;
         providers.keys().cloned().collect()
+    }
+
+    /// List all registered `elastos://` sub-provider schemes.
+    pub async fn sub_provider_schemes(&self) -> Vec<String> {
+        let sub_providers = self.sub_providers.read().await;
+        sub_providers.keys().cloned().collect()
     }
 
     /// Check if a scheme has a registered provider

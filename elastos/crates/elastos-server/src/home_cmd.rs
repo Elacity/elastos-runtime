@@ -143,22 +143,22 @@ const CORE_ACTIONS: &[ActionSpec] = &[
     },
     ActionSpec {
         id: "room-approve",
-        label: "Approve browser access",
-        description: "Approve the next pending Chat Room browser access request.",
+        label: "Approve web guest",
+        description: "Approve the next pending Chat join request from the public link.",
         args: &[],
         core: false,
     },
     ActionSpec {
         id: "room-deny",
-        label: "Deny browser access",
-        description: "Deny the next pending Chat Room browser access request.",
+        label: "Deny web guest",
+        description: "Deny the next pending Chat join request from the public link.",
         args: &[],
         core: false,
     },
     ActionSpec {
         id: "room-revoke-all",
         label: "Disconnect browsers",
-        description: "Revoke all active room browser sessions.",
+        description: "Disconnect all active web guest sessions from Chat.",
         args: &[],
         core: false,
     },
@@ -1040,6 +1040,23 @@ async fn run_home_capsule(
     let api_url = api_url.to_string();
     let client_token = client_token.to_string();
 
+    let api_hostcall_url = api_url.clone();
+    let api_hostcall_token = client_token.clone();
+    let api_hostcall_handle = tokio::runtime::Handle::current();
+    runtime.set_wasm_bridge_hostcall(std::sync::Arc::new(
+        move |line, _capsule_id, principal_id| {
+            let response = api_hostcall_handle
+                .block_on(elastos_server::carrier_bridge::handle_remote_request(
+                    line,
+                    &api_hostcall_url,
+                    &api_hostcall_token,
+                    principal_id,
+                ))
+                .map_err(|err| err.to_string())?;
+            serde_json::to_string(&response).map_err(|err| err.to_string())
+        },
+    ));
+
     runtime.set_wasm_bridge_spawner(std::sync::Arc::new(move |pipes| {
         elastos_server::carrier_bridge::spawn_wasm_api_bridge(
             pipes,
@@ -1166,10 +1183,10 @@ async fn dispatch_action(
         return match elastos_server::room_service::approve_request(&default_data_dir(), request_id)?
         {
             Some(outcome) => Ok(format!(
-                "Approved Chat Room browser access for {} on {}.",
+                "Approved Chat web guest access for {} on {}.",
                 outcome.display_name, outcome.device_label
             )),
-            None => Ok("That room browser request is no longer pending.".to_string()),
+            None => Ok("That Chat web guest request is no longer pending.".to_string()),
         };
     }
     if let Some(request_id) = action_id.strip_prefix("room-deny-request:") {
@@ -1179,24 +1196,26 @@ async fn dispatch_action(
             "Denied in Home",
         )? {
             Some(outcome) => Ok(format!(
-                "Denied Chat Room browser access for {} on {}.",
+                "Denied Chat web guest access for {} on {}.",
                 outcome.display_name, outcome.device_label
             )),
-            None => Ok("That room browser request is no longer pending.".to_string()),
+            None => Ok("That Chat web guest request is no longer pending.".to_string()),
         };
     }
     if let Some(token) = action_id.strip_prefix("room-revoke-session:") {
         return match elastos_server::room_service::revoke_session(&default_data_dir(), token)? {
             Some(outcome) => Ok(format!(
-                "Disconnected room browser session for {} on {}.",
+                "Disconnected Chat web guest session for {} on {}.",
                 outcome.display_name, outcome.device_label
             )),
-            None => Ok("That room browser session is already gone.".to_string()),
+            None => Ok("That Chat web guest session is already gone.".to_string()),
         };
     }
     if let Some(invite_id) = action_id.strip_prefix("room-accept-invite:") {
         let actor_did = snapshot.room.local_runtime_did.clone().ok_or_else(|| {
-            anyhow::anyhow!("local runtime DID is not available for room invite acceptance")
+            anyhow::anyhow!(
+                "local ElastOS identity is not available for ElastOS user invite acceptance"
+            )
         })?;
         let member = elastos_server::room_service::accept_room_invite(
             &default_data_dir(),
@@ -1205,7 +1224,7 @@ async fn dispatch_action(
                 invite_id: invite_id.to_string(),
             },
         )?;
-        return Ok(format!("Joined room as {}.", member.member_did));
+        return Ok(format!("Joined Chat as {}.", member.member_did));
     }
     if let Some(invite_id) = action_id.strip_prefix("room-revoke-invite:") {
         let actor_did = require_room_admin_actor(snapshot)?;
@@ -1215,10 +1234,10 @@ async fn dispatch_action(
             invite_id,
         )? {
             Some(invite) => Ok(format!(
-                "Revoked sovereign member invite for {}.",
+                "Canceled ElastOS user invite for {}.",
                 invite.invited_did
             )),
-            None => Ok("That sovereign member invite is already gone.".to_string()),
+            None => Ok("That ElastOS user invite is already gone.".to_string()),
         };
     }
     if let Some(member_did) = action_id.strip_prefix("room-remove-member:") {
@@ -1231,10 +1250,10 @@ async fn dispatch_action(
             },
         )? {
             Some(member) => Ok(format!(
-                "Removed sovereign member {} from the room.",
+                "Removed trusted participant {} from Chat.",
                 member.member_did
             )),
-            None => Ok("That sovereign member is already gone.".to_string()),
+            None => Ok("That trusted participant is already gone.".to_string()),
         };
     }
     if action_id == "room-policy-toggle-guests" {
@@ -1249,9 +1268,9 @@ async fn dispatch_action(
             },
         )?;
         return Ok(if updated.allow_guest_invites {
-            "Opened hosted guest access for the room.".to_string()
+            "Opened public Chat join requests.".to_string()
         } else {
-            "Closed hosted guest access for the room.".to_string()
+            "Closed public Chat join requests.".to_string()
         });
     }
     if action_id == "room-policy-toggle-members" {
@@ -1266,9 +1285,9 @@ async fn dispatch_action(
             },
         )?;
         return Ok(if updated.allow_member_invites {
-            "Opened sovereign member invites for the room.".to_string()
+            "Opened ElastOS user invites for Chat.".to_string()
         } else {
-            "Closed sovereign member invites for the room.".to_string()
+            "Closed ElastOS user invites for Chat.".to_string()
         });
     }
     if action_id == "room-policy-toggle-member-hosts" {
@@ -1283,9 +1302,9 @@ async fn dispatch_action(
             },
         )?;
         return Ok(if updated.allow_members_to_host_guests {
-            "Allowed ordinary members to host browser guests for the room.".to_string()
+            "Allowed trusted ElastOS users to approve web guests.".to_string()
         } else {
-            "Restricted guest browser hosting to owners and admins.".to_string()
+            "Restricted web guest approvals to conversation managers.".to_string()
         });
     }
 
@@ -1347,10 +1366,10 @@ async fn run_action(
         ActionLaunch::ManagedRoomApprove => {
             match elastos_server::room_service::approve_next_request(&default_data_dir())? {
                 Some(outcome) => Ok(format!(
-                    "Approved Chat Room browser access for {} on {}.",
+                    "Approved Chat web guest access for {} on {}.",
                     outcome.display_name, outcome.device_label
                 )),
-                None => Ok("No pending room browser requests.".to_string()),
+                None => Ok("No pending Chat web guest requests.".to_string()),
             }
         }
         ActionLaunch::ManagedRoomDeny => {
@@ -1359,10 +1378,10 @@ async fn run_action(
                 "Denied in Home",
             )? {
                 Some(outcome) => Ok(format!(
-                    "Denied Chat Room browser access for {} on {}.",
+                    "Denied Chat web guest access for {} on {}.",
                     outcome.display_name, outcome.device_label
                 )),
-                None => Ok("No pending room browser requests.".to_string()),
+                None => Ok("No pending Chat web guest requests.".to_string()),
             }
         }
         ActionLaunch::ManagedRoomRevokeAll => {
@@ -1380,11 +1399,11 @@ async fn run_action(
                         .collect::<Vec<_>>()
                         .join(", ");
                     Ok(format!(
-                        "Disconnected {} room browser session(s): {}.",
+                        "Disconnected {} Chat web guest session(s): {}.",
                         outcome.revoked_count, detail
                     ))
                 }
-                None => Ok("No active room browser sessions.".to_string()),
+                None => Ok("No active Chat web guest sessions.".to_string()),
             }
         }
         ActionLaunch::ManagedLocalSitePreview => {
@@ -1561,13 +1580,13 @@ fn action_command_with_kvm(
         return "home: open localhost://MyWebSite in browser".to_string();
     }
     if action.id == "room-approve" {
-        return "home: approve the next pending room browser request".to_string();
+        return "home: approve the next pending Chat web guest request".to_string();
     }
     if action.id == "room-deny" {
-        return "home: deny the next pending room browser request".to_string();
+        return "home: deny the next pending Chat web guest request".to_string();
     }
     if action.id == "room-revoke-all" {
-        return "home: revoke all active room browser sessions".to_string();
+        return "home: disconnect all active Chat web guest sessions".to_string();
     }
     if action.id == "site-ephemeral" {
         return "home: open a temporary HTTPS URL for MyWebSite and return home".to_string();
@@ -1977,7 +1996,7 @@ async fn gather_runtime_status(data_dir: &Path) -> RuntimeStatus {
             peer_count: None,
             ticket: None,
             running_capsules: Vec::new(),
-            note: Some("No active local runtime".to_string()),
+            note: Some("No active local ElastOS service".to_string()),
         };
     };
 
@@ -2204,7 +2223,6 @@ async fn localhost_exists(access: &SessionAccess, path: &str) -> anyhow::Result<
         "exists",
         &serde_json::json!({
             "path": path,
-            "token": access.read_cap,
         }),
     )
     .await?;
@@ -2225,7 +2243,6 @@ async fn read_localhost_file(access: &SessionAccess, path: &str) -> anyhow::Resu
         "read",
         &serde_json::json!({
             "path": path,
-            "token": access.read_cap,
         }),
     )
     .await?;
@@ -2263,7 +2280,6 @@ async fn write_localhost_file(
         "write",
         &serde_json::json!({
             "path": path,
-            "token": access.write_cap,
             "content": content,
             "append": false,
         }),
@@ -2282,7 +2298,6 @@ async fn delete_localhost_file(access: &SessionAccess, path: &str) -> anyhow::Re
         "delete",
         &serde_json::json!({
             "path": path,
-            "token": access.write_cap,
             "recursive": false,
         }),
     )
@@ -2357,18 +2372,18 @@ fn print_status(snapshot: &HomeSnapshot) -> anyhow::Result<()> {
         ) {
             (Some(name), Some(device)) => format!("{} on {}", name, device),
             (Some(name), None) => name.to_string(),
-            _ => "browser access approval needed".to_string(),
+            _ => "web guest approval needed".to_string(),
         };
         writeln!(
             out,
-            "  Pairing:   {} pending ({})",
+            "  Chat join: {} pending ({})",
             snapshot.room.pending_count, latest
         )?;
     }
     if snapshot.room.active_session_count > 0 {
         writeln!(
             out,
-            "  Room:      {} browser(s) active ({})",
+            "  Chat:      {} web guest(s) active ({})",
             snapshot.room.active_session_count,
             format_room_participants(&snapshot.room.active_participants)
         )?;
@@ -2420,7 +2435,7 @@ fn print_status(snapshot: &HomeSnapshot) -> anyhow::Result<()> {
         if snapshot.runtime.peer_count.unwrap_or_default() == 0 {
             "local only until another Home joins Chat"
         } else {
-            "open Chat and send a line to confirm room delivery"
+            "open Chat and send a line to confirm delivery"
         }
     )?;
     writeln!(out, "  Roots:     localhost://Users, localhost://UsersAI")?;
@@ -2554,7 +2569,7 @@ fn action_readiness(action_id: &str, snapshot: &HomeSnapshot) -> ActionReadiness
         {
             ActionReadiness::Ready
         } else {
-            ActionReadiness::Blocked("browser access request is no longer pending".to_string())
+            ActionReadiness::Blocked("web guest request is no longer pending".to_string())
         };
     }
     if let Some(request_id) = action_id.strip_prefix("room-deny-request:") {
@@ -2566,7 +2581,7 @@ fn action_readiness(action_id: &str, snapshot: &HomeSnapshot) -> ActionReadiness
         {
             ActionReadiness::Ready
         } else {
-            ActionReadiness::Blocked("browser access request is no longer pending".to_string())
+            ActionReadiness::Blocked("web guest request is no longer pending".to_string())
         };
     }
     if let Some(token) = action_id.strip_prefix("room-revoke-session:") {
@@ -2578,7 +2593,7 @@ fn action_readiness(action_id: &str, snapshot: &HomeSnapshot) -> ActionReadiness
         {
             ActionReadiness::Ready
         } else {
-            ActionReadiness::Blocked("browser session is no longer active".to_string())
+            ActionReadiness::Blocked("web guest session is no longer active".to_string())
         };
     }
 
@@ -2595,14 +2610,14 @@ fn action_readiness(action_id: &str, snapshot: &HomeSnapshot) -> ActionReadiness
         ),
         "room-approve" | "room-deny" => {
             if snapshot.room.pending_count == 0 {
-                ActionReadiness::Blocked("no browser access requests pending".to_string())
+                ActionReadiness::Blocked("no web guest requests pending".to_string())
             } else {
                 ActionReadiness::Ready
             }
         }
         "room-revoke-all" => {
             if snapshot.room.active_session_count == 0 {
-                ActionReadiness::Blocked("no active browser sessions".to_string())
+                ActionReadiness::Blocked("no active web guest sessions".to_string())
             } else {
                 ActionReadiness::Ready
             }
@@ -2646,7 +2661,7 @@ fn action_readiness(action_id: &str, snapshot: &HomeSnapshot) -> ActionReadiness
                 ActionReadiness::Ready
             } else {
                 ActionReadiness::Blocked(
-                    "only owners and admins may change room access policy".to_string(),
+                    "only conversation managers may change Chat access policy".to_string(),
                 )
             }
         }
@@ -2655,7 +2670,7 @@ fn action_readiness(action_id: &str, snapshot: &HomeSnapshot) -> ActionReadiness
                 ActionReadiness::Ready
             } else {
                 ActionReadiness::Blocked(
-                    "only owners and admins may revoke sovereign member invites".to_string(),
+                    "only conversation managers may cancel ElastOS user invites".to_string(),
                 )
             }
         }
@@ -2664,7 +2679,7 @@ fn action_readiness(action_id: &str, snapshot: &HomeSnapshot) -> ActionReadiness
                 ActionReadiness::Ready
             } else {
                 ActionReadiness::Blocked(
-                    "only owners and admins may remove sovereign members".to_string(),
+                    "only conversation managers may remove trusted participants".to_string(),
                 )
             }
         }
@@ -2672,7 +2687,7 @@ fn action_readiness(action_id: &str, snapshot: &HomeSnapshot) -> ActionReadiness
             if snapshot.room.local_runtime_did.is_some() {
                 ActionReadiness::Ready
             } else {
-                ActionReadiness::Blocked("local runtime DID is not available yet".to_string())
+                ActionReadiness::Blocked("local ElastOS identity is not available yet".to_string())
             }
         }
         _ => ActionReadiness::Blocked("unknown action".to_string()),
@@ -2685,48 +2700,50 @@ fn gather_room_actions(snapshot: &HomeSnapshot) -> Vec<ActionInfo> {
         actions.push(ActionInfo {
             id: "room-policy-toggle-guests".to_string(),
             label: if snapshot.room.allow_guest_invites {
-                "Close hosted guest access".to_string()
+                "Close public join requests".to_string()
             } else {
-                "Open hosted guest access".to_string()
+                "Open public join requests".to_string()
             },
             description: if snapshot.room.allow_guest_invites {
-                "Stop new browser guests from requesting access on the hosted room URL.".to_string()
+                "Stop new web guests from requesting access through the public Chat link."
+                    .to_string()
             } else {
-                "Allow new browser guests to request access on the hosted room URL.".to_string()
+                "Allow new web guests to request access through the public Chat link.".to_string()
             },
-            command: "home: toggle hosted guest access for this room".to_string(),
+            command: "home: toggle public Chat join requests".to_string(),
             ready: true,
             reason: None,
         });
         actions.push(ActionInfo {
             id: "room-policy-toggle-members".to_string(),
             label: if snapshot.room.allow_member_invites {
-                "Close sovereign member invites".to_string()
+                "Close ElastOS user invites".to_string()
             } else {
-                "Open sovereign member invites".to_string()
+                "Open ElastOS user invites".to_string()
             },
             description: if snapshot.room.allow_member_invites {
-                "Stop issuing new sovereign Home member invites for this room.".to_string()
+                "Stop issuing new invites for trusted ElastOS users.".to_string()
             } else {
-                "Allow new sovereign Home member invites for this room.".to_string()
+                "Allow new invites for trusted ElastOS users.".to_string()
             },
-            command: "home: toggle sovereign member invites for this room".to_string(),
+            command: "home: toggle ElastOS user invites for Chat".to_string(),
             ready: true,
             reason: None,
         });
         actions.push(ActionInfo {
             id: "room-policy-toggle-member-hosts".to_string(),
             label: if snapshot.room.allow_members_to_host_guests {
-                "Restrict member guest hosting".to_string()
+                "Restrict web guest approvals".to_string()
             } else {
-                "Allow member guest hosting".to_string()
+                "Allow trusted guest approvals".to_string()
             },
             description: if snapshot.room.allow_members_to_host_guests {
-                "Limit hosted guest access to owners and admins only.".to_string()
+                "Limit web guest approvals to conversation managers.".to_string()
             } else {
-                "Allow ordinary members to host browser guests from their runtimes.".to_string()
+                "Allow trusted ElastOS users to approve web guests from their Homes.".to_string()
             },
-            command: "home: toggle whether ordinary members may host browser guests".to_string(),
+            command: "home: toggle whether trusted ElastOS users may approve web guests"
+                .to_string(),
             ready: true,
             reason: None,
         });
@@ -2736,11 +2753,9 @@ fn gather_room_actions(snapshot: &HomeSnapshot) -> Vec<ActionInfo> {
             if invite.invited_did == local_runtime_did {
                 actions.push(ActionInfo {
                     id: format!("room-accept-invite:{}", invite.invite_id),
-                    label: format!("Join as {} member", invite.role),
-                    description: "Accept this sovereign member invite on the local runtime."
-                        .to_string(),
-                    command: "home: accept this sovereign room invite on the local runtime"
-                        .to_string(),
+                    label: "Join trusted conversation".to_string(),
+                    description: "Accept this ElastOS user invite on the local Home.".to_string(),
+                    command: "home: accept this ElastOS user invite on the local Home".to_string(),
                     ready: true,
                     reason: None,
                 });
@@ -2752,8 +2767,8 @@ fn gather_room_actions(snapshot: &HomeSnapshot) -> Vec<ActionInfo> {
             actions.push(ActionInfo {
                 id: format!("room-revoke-invite:{}", invite.invite_id),
                 label: format!("Revoke invite for {}", invite.invited_did),
-                description: format!("Revoke this pending sovereign {} invite.", invite.role),
-                command: "home: revoke this specific sovereign member invite".to_string(),
+                description: "Cancel this pending ElastOS user invite.".to_string(),
+                command: "home: cancel this specific ElastOS user invite".to_string(),
                 ready: true,
                 reason: None,
             });
@@ -2769,8 +2784,8 @@ fn gather_room_actions(snapshot: &HomeSnapshot) -> Vec<ActionInfo> {
                 actions.push(ActionInfo {
                     id: format!("room-remove-member:{}", member.member_did),
                     label: format!("Remove {}", member.member_did),
-                    description: format!("Remove this sovereign {} from the room.", member.role),
-                    command: "home: remove this sovereign member from the room".to_string(),
+                    description: "Remove this trusted participant from Chat.".to_string(),
+                    command: "home: remove this trusted participant from Chat".to_string(),
                     ready: true,
                     reason: None,
                 });
@@ -2784,16 +2799,16 @@ fn gather_room_actions(snapshot: &HomeSnapshot) -> Vec<ActionInfo> {
                 "Approve {} on {}",
                 request.display_name, request.device_label
             ),
-            description: "Approve this specific room browser request.".to_string(),
-            command: "home: approve this specific room browser request".to_string(),
+            description: "Approve this specific web guest join request.".to_string(),
+            command: "home: approve this specific Chat web guest request".to_string(),
             ready: true,
             reason: None,
         });
         actions.push(ActionInfo {
             id: format!("room-deny-request:{}", request.request_id),
             label: format!("Deny {} on {}", request.display_name, request.device_label),
-            description: "Deny this specific room browser request.".to_string(),
-            command: "home: deny this specific room browser request".to_string(),
+            description: "Deny this specific web guest join request.".to_string(),
+            command: "home: deny this specific Chat web guest request".to_string(),
             ready: true,
             reason: None,
         });
@@ -2805,8 +2820,8 @@ fn gather_room_actions(snapshot: &HomeSnapshot) -> Vec<ActionInfo> {
                 "Disconnect {} on {}",
                 session.display_name, session.device_label
             ),
-            description: "Disconnect this specific room browser session.".to_string(),
-            command: "home: disconnect this specific room browser session".to_string(),
+            description: "Disconnect this specific web guest session.".to_string(),
+            command: "home: disconnect this specific Chat web guest session".to_string(),
             ready: true,
             reason: None,
         });
@@ -2831,16 +2846,16 @@ fn can_manage_member(snapshot: &HomeSnapshot, member: &RoomMemberStatus) -> bool
 
 fn require_room_admin_actor(snapshot: &HomeSnapshot) -> anyhow::Result<String> {
     if !room_admin_role(snapshot) {
-        anyhow::bail!("only owners and admins may change room access policy");
+        anyhow::bail!("only conversation managers may change Chat access policy");
     }
     snapshot.room.local_runtime_did.clone().ok_or_else(|| {
-        anyhow::anyhow!("local runtime DID is not available for room policy changes")
+        anyhow::anyhow!("local ElastOS identity is not available for Chat access policy changes")
     })
 }
 
 fn format_room_participants(participants: &[RoomParticipantStatus]) -> String {
     if participants.is_empty() {
-        return "browser room active".to_string();
+        return "web guest session active".to_string();
     }
     participants
         .iter()
@@ -3241,9 +3256,9 @@ mod tests {
             .into_iter()
             .map(|action| action.label)
             .collect();
-        assert!(labels.contains(&"Close hosted guest access".to_string()));
-        assert!(labels.contains(&"Open sovereign member invites".to_string()));
-        assert!(labels.contains(&"Restrict member guest hosting".to_string()));
+        assert!(labels.contains(&"Close public join requests".to_string()));
+        assert!(labels.contains(&"Open ElastOS user invites".to_string()));
+        assert!(labels.contains(&"Restrict web guest approvals".to_string()));
     }
 
     #[test]

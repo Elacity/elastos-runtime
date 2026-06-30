@@ -32,8 +32,8 @@ use sha2::{Digest, Sha256};
 
 use super::gateway::{
     home_session_cookie_header_for_token, is_wallet_connector_capsule_id,
-    issue_home_launch_token_for_auth_grant, require_fresh_passkey_home_token,
-    require_home_launch_token_for_any, GatewayState, HOME_CAPSULE_ID, WALLET_LINK_CAPSULE_IDS,
+    issue_home_launch_token_for_auth_grant, require_fresh_passkey_home_token, GatewayState,
+    HOME_CAPSULE_ID, WALLET_LINK_CAPSULE_IDS,
 };
 
 const AUTH_SESSION_TTL_SECS: u64 = 12 * 60 * 60;
@@ -541,20 +541,37 @@ pub async fn revoke_session(
     Path(session_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(err) = require_home_launch_token_for_any(
-        &state.data_dir,
-        &headers,
-        &[HOME_CAPSULE_ID, super::gateway::SYSTEM_CAPSULE_ID],
-    ) {
-        return auth_error_response(err);
-    }
+    let context = match require_auth_home_or_system_context(&state, &headers) {
+        Ok(context) => context,
+        Err(err) => return auth_error_response(err),
+    };
     let now = crate::auth::now_ts();
-    match crate::auth::revoke_session_grant(&state.data_dir, &session_id, now) {
+    let auth_data_dir = super::gateway::home_launch_auth_data_dir(&state.data_dir);
+    let target = match crate::auth::load_active_session_grant(&auth_data_dir, &session_id, now) {
+        Ok(target) => target,
+        Err(err) => return auth_error_response(err),
+    };
+    let actor = match require_active_principal_for_context(&state, &context) {
+        Ok(actor) => actor,
+        Err(err) => return auth_error_response(err),
+    };
+    if target.session_id != context.session_id && !crate::auth::is_admin(&actor) {
+        return auth_error_response(anyhow::anyhow!(
+            "admin authority required to revoke another auth session"
+        ));
+    }
+
+    match crate::auth::revoke_session_grant(&auth_data_dir, &session_id, now) {
         Ok(()) => {
+            if auth_data_dir != state.data_dir {
+                let _ = crate::auth::revoke_session_grant(&state.data_dir, &session_id, now);
+            }
             let _ = crate::auth::append_audit_event(
-                &state.data_dir,
+                &auth_data_dir,
                 audit_event(AuditEventInput {
                     event_type: "auth.session.revoked",
+                    principal_id: Some(actor.principal_id),
+                    proof_binding_id: context.proof_binding_id,
                     session_id: Some(session_id.clone()),
                     result: "ok",
                     reason: "session revoked",
@@ -590,9 +607,13 @@ fn sign_out_session_inner(
 ) -> anyhow::Result<AuthRevokeResponse> {
     let context = super::gateway::require_home_token_context(&state.data_dir, headers)?;
     let now = crate::auth::now_ts();
-    crate::auth::revoke_session_grant(&state.data_dir, &context.session_id, now)?;
+    let auth_data_dir = super::gateway::home_launch_auth_data_dir(&state.data_dir);
+    crate::auth::revoke_session_grant(&auth_data_dir, &context.session_id, now)?;
+    if auth_data_dir != state.data_dir {
+        let _ = crate::auth::revoke_session_grant(&state.data_dir, &context.session_id, now);
+    }
     let _ = crate::auth::append_audit_event(
-        &state.data_dir,
+        &auth_data_dir,
         audit_event(AuditEventInput {
             event_type: "auth.session.signed_out",
             principal_id: Some(context.principal_id),
@@ -1976,10 +1997,11 @@ fn refresh_session_inner(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("missing proof-bound auth session"))?;
     let now = crate::auth::now_ts();
+    let auth_data_dir = super::gateway::home_launch_auth_data_dir(&state.data_dir);
     let previous =
-        crate::auth::load_active_session_grant(&state.data_dir, &context.session_id, now)?;
+        crate::auth::load_active_session_grant(&auth_data_dir, &context.session_id, now)?;
     let principal =
-        crate::auth::load_principal_for_proof_binding(&state.data_dir, &proof_binding_id)?;
+        crate::auth::load_principal_for_proof_binding(&auth_data_dir, &proof_binding_id)?;
     crate::auth::ensure_proof_binding_not_revoked(&principal)?;
     if previous.principal_id != context.principal_id
         || previous.proof_binding_id != proof_binding_id
@@ -1997,9 +2019,12 @@ fn refresh_session_inner(
         expires_at: now.saturating_add(AUTH_SESSION_TTL_SECS),
         apps: previous.apps,
     };
-    crate::auth::store_session_grant(&state.data_dir, grant.clone())?;
+    crate::auth::store_session_grant(&auth_data_dir, grant.clone())?;
+    if auth_data_dir != state.data_dir {
+        let _ = crate::auth::store_session_grant(&state.data_dir, grant.clone());
+    }
     crate::auth::append_audit_event(
-        &state.data_dir,
+        &auth_data_dir,
         audit_event(AuditEventInput {
             event_type: "auth.session.refreshed",
             principal_id: Some(grant.principal_id.clone()),
@@ -2933,7 +2958,36 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
     use elastos_runtime::provider::{Provider, ProviderError, ResourceRequest, ResourceResponse};
-    use std::sync::Arc;
+    use std::ffi::OsString;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    fn trusted_auth_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    struct EnvVarRestore {
+        key: &'static str,
+        value: Option<OsString>,
+    }
+
+    impl EnvVarRestore {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                value: std::env::var_os(key),
+            }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            match self.value.as_ref() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     fn test_gateway_state(data_dir: &std::path::Path) -> GatewayState {
         GatewayState {
@@ -4439,6 +4493,10 @@ mod tests {
 
     #[test]
     fn refresh_session_reissues_proof_bound_home_and_system_tokens() {
+        let _guard = trusted_auth_env_lock();
+        let _restore =
+            EnvVarRestore::capture(super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV);
+        std::env::remove_var(super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV);
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
         let credential = test_credential();
@@ -4471,6 +4529,10 @@ mod tests {
 
     #[test]
     fn refresh_session_accepts_http_only_home_cookie() {
+        let _guard = trusted_auth_env_lock();
+        let _restore =
+            EnvVarRestore::capture(super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV);
+        std::env::remove_var(super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV);
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
         let credential = test_credential();
@@ -4494,7 +4556,60 @@ mod tests {
     }
 
     #[test]
+    fn refresh_session_uses_trusted_auth_data_dir_for_refreshed_tokens() {
+        let _guard = trusted_auth_env_lock();
+        let _restore =
+            EnvVarRestore::capture(super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV);
+        let temp = tempfile::tempdir().unwrap();
+        let trusted = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        let credential = test_credential();
+        let grant = issue_passkey_session_grant(
+            &state,
+            "identity-test",
+            &credential,
+            "https://elastos.elacitylabs.com",
+            true,
+            "test passkey grant",
+        )
+        .unwrap();
+        let state_auth = crate::auth::load_auth_state(temp.path()).unwrap();
+        crate::auth::save_auth_state(trusted.path(), &state_auth).unwrap();
+        std::env::set_var(
+            super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV,
+            trusted.path(),
+        );
+
+        let response =
+            refresh_session_inner(&state, &home_token_headers(&grant.home_token)).unwrap();
+        let refreshed_headers = home_token_headers(&response.home_token);
+        let refreshed_context =
+            super::super::gateway::require_home_token_context(temp.path(), &refreshed_headers)
+                .unwrap();
+        let signed_out = sign_out_session_inner(&state, &refreshed_headers).unwrap();
+
+        assert_eq!(refreshed_context.session_id, response.session_id);
+        assert_eq!(signed_out.session_id, response.session_id);
+        assert!(crate::auth::is_auth_session_active(
+            trusted.path(),
+            &grant.session_id,
+            crate::auth::now_ts(),
+        )
+        .unwrap());
+        assert!(!crate::auth::is_auth_session_active(
+            trusted.path(),
+            &response.session_id,
+            crate::auth::now_ts(),
+        )
+        .unwrap());
+    }
+
+    #[test]
     fn sign_out_revokes_http_only_home_cookie_session() {
+        let _guard = trusted_auth_env_lock();
+        let _restore =
+            EnvVarRestore::capture(super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV);
+        std::env::remove_var(super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV);
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
         let credential = test_credential();
@@ -4522,7 +4637,54 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn revoke_session_uses_trusted_auth_data_dir_for_target_session() {
+        let _guard = trusted_auth_env_lock();
+        let _restore =
+            EnvVarRestore::capture(super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV);
+        let temp = tempfile::tempdir().unwrap();
+        let trusted = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        let credential = test_credential();
+        let grant = issue_passkey_session_grant(
+            &state,
+            "identity-test",
+            &credential,
+            "https://elastos.elacitylabs.com",
+            true,
+            "test passkey grant",
+        )
+        .unwrap();
+        let state_auth = crate::auth::load_auth_state(temp.path()).unwrap();
+        crate::auth::save_auth_state(trusted.path(), &state_auth).unwrap();
+        std::env::set_var(
+            super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV,
+            trusted.path(),
+        );
+
+        let response = revoke_session(
+            State(state),
+            Path(grant.session_id.clone()),
+            home_token_headers(&grant.home_token),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!crate::auth::is_auth_session_active(
+            trusted.path(),
+            &grant.session_id,
+            crate::auth::now_ts(),
+        )
+        .unwrap());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn sign_out_response_clears_home_cookie() {
+        let _guard = trusted_auth_env_lock();
+        let _restore =
+            EnvVarRestore::capture(super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV);
+        std::env::remove_var(super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV);
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
         let credential = test_credential();

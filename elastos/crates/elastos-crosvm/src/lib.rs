@@ -22,6 +22,10 @@
 //! ```
 
 mod config;
+#[cfg(target_os = "linux")]
+mod network;
+#[cfg(not(target_os = "linux"))]
+#[path = "network_stub.rs"]
 mod network;
 mod provider;
 mod proxy;

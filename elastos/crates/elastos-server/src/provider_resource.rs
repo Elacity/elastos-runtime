@@ -5,28 +5,23 @@
 //! local and capsule-kernel calls from drifting.
 
 use elastos_common::localhost::rooted_localhost_uri;
+use elastos_runtime::capability::Action;
 use serde_json::Value;
 
 /// Build the capability resource string for a provider request.
 ///
 /// First-party `elastos://` sub-providers use `elastos://<scheme>/...`.
-/// All other schemes use their native `<scheme>://*` format.
+/// Unknown schemes and operations fail closed instead of creating wildcard
+/// authority such as `<scheme>://*`.
 pub fn build_capability_resource(
     scheme: &str,
     op: &str,
     request: &Value,
 ) -> Result<String, String> {
     match scheme {
-        "localhost" => match request
-            .get("path")
-            .and_then(|value| value.as_str())
-            .filter(|path| !path.is_empty())
-        {
-            Some(path) => rooted_localhost_uri(path)
-                .ok_or_else(|| format!("Invalid rooted localhost path: {}", path)),
-            None => Err("localhost provider request missing path".to_string()),
-        },
+        "localhost" => localhost_resource(op, request),
         "ai" => {
+            ensure_supported_operation("ai", op, &["chat_completions", "list_backends", "ping"])?;
             let backend = request.get("backend").and_then(|value| value.as_str());
             match backend {
                 Some(backend) => {
@@ -36,6 +31,12 @@ pub fn build_capability_resource(
                 None => Ok(format!("elastos://ai/meta/{op}")),
             }
         }
+        "availability" => simple_elastos_resource("availability", op, &["ensure", "status"]),
+        "block-graph" => simple_elastos_resource(
+            "block-graph",
+            op,
+            &["export_graph", "import_graph", "status"],
+        ),
         "chain" => {
             if op == "networks" {
                 return Ok("elastos://chain/meta/networks".to_string());
@@ -82,9 +83,42 @@ pub fn build_capability_resource(
         "key" => key_resource(op),
         "decrypt" => decrypt_resource(op),
         "wallet" => wallet_resource(op, request),
+        "did" => did_resource(op),
+        "ipfs" => ipfs_resource(op),
+        "llama" => simple_elastos_resource(
+            "llama",
+            op,
+            &["chat_completions", "status", "health", "list_models"],
+        ),
+        "object" => object_resource(op),
+        "operator-drive-adapter" => simple_elastos_resource(
+            "operator-drive-adapter",
+            op,
+            &["status", "metadata_index", "read_bytes", "write_bytes"],
+        ),
+        "peer" => simple_elastos_resource("peer", op, &["connect"]),
+        "tunnel" => simple_elastos_resource("tunnel", op, &["start", "stop", "status", "ping"]),
         "content" => content_resource(op),
-        "did" | "peer" => Ok(format!("elastos://{scheme}/*")),
-        _ => Ok(format!("{scheme}://*")),
+        "inspect" => inspect_resource(op),
+        _ => Err(format!("Unsupported provider scheme: {scheme}")),
+    }
+}
+
+/// Canonical capability action for provider operations where the Runtime owns
+/// the operation-to-action contract directly.
+pub fn provider_operation_action(scheme: &str, op: &str) -> Option<Action> {
+    match scheme {
+        "inspect" => inspect_op_required_action(op),
+        _ => None,
+    }
+}
+
+/// Canonical capability action each Capsule Inspector operation requires.
+pub fn inspect_op_required_action(op: &str) -> Option<Action> {
+    match op {
+        "capsules" | "capsule" | "self" | "plan" => Some(Action::Read),
+        "revoke" => Some(Action::Write),
+        _ => None,
     }
 }
 
@@ -110,6 +144,35 @@ fn validate_chain_network(network: &str) -> Result<(), String> {
     Err(format!("Invalid chain network: {network}"))
 }
 
+fn ensure_supported_operation(provider: &str, op: &str, supported: &[&str]) -> Result<(), String> {
+    if supported.contains(&op) {
+        return Ok(());
+    }
+    Err(format!("Unsupported {provider} provider operation: {op}"))
+}
+
+fn simple_elastos_resource(provider: &str, op: &str, supported: &[&str]) -> Result<String, String> {
+    ensure_supported_operation(provider, op, supported)?;
+    Ok(format!("elastos://{provider}/{op}"))
+}
+
+fn localhost_resource(op: &str, request: &Value) -> Result<String, String> {
+    ensure_supported_operation(
+        "localhost",
+        op,
+        &["read", "write", "list", "stat", "exists", "resolve", "ping"],
+    )?;
+    match request
+        .get("path")
+        .and_then(|value| value.as_str())
+        .filter(|path| !path.is_empty())
+    {
+        Some(path) => rooted_localhost_uri(path)
+            .ok_or_else(|| format!("Invalid rooted localhost path: {}", path)),
+        None => Err("localhost provider request missing path".to_string()),
+    }
+}
+
 fn validate_wallet_chain_namespace(value: &str) -> Result<(), String> {
     if !value.is_empty()
         && value != "."
@@ -128,6 +191,73 @@ fn validate_wallet_chain_namespace(value: &str) -> Result<(), String> {
     Err(format!("Invalid wallet chain namespace: {value}"))
 }
 
+fn did_resource(op: &str) -> Result<String, String> {
+    simple_elastos_resource(
+        "did",
+        op,
+        &[
+            "get_did",
+            "resolve",
+            "sign_chat_message",
+            "verify",
+            "verify_did_recovery",
+            "get_nickname",
+            "set_nickname",
+            "get_persona_did",
+        ],
+    )
+}
+
+fn ipfs_resource(op: &str) -> Result<String, String> {
+    simple_elastos_resource(
+        "ipfs",
+        op,
+        &[
+            "add_bytes",
+            "add_path",
+            "add_directory",
+            "cat",
+            "cat_to_path",
+            "get_bytes",
+            "ls",
+            "download_directory",
+            "pin",
+            "unpin",
+            "health",
+            "status",
+        ],
+    )
+}
+
+fn object_resource(op: &str) -> Result<String, String> {
+    simple_elastos_resource(
+        "object",
+        op,
+        &[
+            "roots",
+            "list",
+            "stat",
+            "read",
+            "download",
+            "write",
+            "mkdir",
+            "rename",
+            "move",
+            "copy",
+            "trash",
+            "restore",
+            "delete_permanently",
+            "empty_trash",
+            "status",
+            "events",
+            "publish",
+            "unpublish",
+            "repair",
+            "share",
+        ],
+    )
+}
+
 fn content_resource(op: &str) -> Result<String, String> {
     match op {
         "publish" => Ok("elastos://content/publish".to_string()),
@@ -137,6 +267,13 @@ fn content_resource(op: &str) -> Result<String, String> {
         "repair" => Ok("elastos://content/repair".to_string()),
         "unpublish" => Ok("elastos://content/unpublish".to_string()),
         _ => Err(format!("Unsupported content provider operation: {op}")),
+    }
+}
+
+fn inspect_resource(op: &str) -> Result<String, String> {
+    match inspect_op_required_action(op) {
+        Some(_) => Ok(format!("elastos://inspect/{op}")),
+        None => Err(format!("Unsupported inspect provider operation: {op}")),
     }
 }
 
@@ -158,8 +295,7 @@ fn browser_engine_resource(op: &str) -> Result<String, String> {
         "attach_stream" => Ok("elastos://browser-engine/attach_stream".to_string()),
         "close_page" => Ok("elastos://browser-engine/close_page".to_string()),
         "page_status" => Ok("elastos://browser-engine/page/status".to_string()),
-        "frame" => Ok("elastos://browser-engine/page/frame".to_string()),
-        "screenshot" => Ok("elastos://browser-engine/page/screenshot".to_string()),
+        "diagnostics" => Ok("elastos://browser-engine/page/diagnostics".to_string()),
         "input" => Ok("elastos://browser-engine/page/input".to_string()),
         "webrtc_signal" => Ok("elastos://browser-engine/page/webrtc_signal".to_string()),
         _ => Err(format!(
@@ -279,8 +415,8 @@ mod tests {
 
     #[test]
     fn ai_resource_invalid_backend_fails_closed() {
-        let request = serde_json::json!({"backend": "bad/name", "op": "chat"});
-        let err = build_capability_resource("ai", "chat", &request).unwrap_err();
+        let request = serde_json::json!({"backend": "bad/name", "op": "chat_completions"});
+        let err = build_capability_resource("ai", "chat_completions", &request).unwrap_err();
         assert!(err.contains("Invalid backend name"));
     }
 
@@ -308,6 +444,12 @@ mod tests {
             &serde_json::json!({"path": "../host"})
         )
         .is_err());
+        assert!(build_capability_resource(
+            "localhost",
+            "raw_storage",
+            &serde_json::json!({"path": "localhost://TestRoot/Documents/demo.md"})
+        )
+        .is_err());
     }
 
     #[test]
@@ -315,12 +457,67 @@ mod tests {
         let request = serde_json::json!({});
         assert_eq!(
             build_capability_resource("did", "get_did", &request).unwrap(),
-            "elastos://did/*"
+            "elastos://did/get_did"
         );
         assert_eq!(
             build_capability_resource("peer", "connect", &request).unwrap(),
-            "elastos://peer/*"
+            "elastos://peer/connect"
         );
+        assert!(build_capability_resource("did", "raw_secret", &request).is_err());
+        assert!(build_capability_resource("peer", "raw_socket", &request).is_err());
+    }
+
+    #[test]
+    fn first_party_manifest_provider_operations_are_explicit() {
+        let request = serde_json::json!({});
+        for (scheme, op, resource) in [
+            ("availability", "ensure", "elastos://availability/ensure"),
+            (
+                "block-graph",
+                "export_graph",
+                "elastos://block-graph/export_graph",
+            ),
+            ("ipfs", "cat", "elastos://ipfs/cat"),
+            (
+                "llama",
+                "chat_completions",
+                "elastos://llama/chat_completions",
+            ),
+            ("object", "read", "elastos://object/read"),
+            (
+                "operator-drive-adapter",
+                "metadata_index",
+                "elastos://operator-drive-adapter/metadata_index",
+            ),
+            ("tunnel", "start", "elastos://tunnel/start"),
+        ] {
+            assert_eq!(
+                build_capability_resource(scheme, op, &request).unwrap(),
+                resource
+            );
+        }
+
+        for (scheme, op) in [
+            ("availability", "raw_replication_socket"),
+            ("block-graph", "raw_car"),
+            ("ipfs", "raw_kubo_rpc"),
+            ("llama", "raw_model_socket"),
+            ("object", "raw_storage_path"),
+            ("operator-drive-adapter", "resolver_credentials"),
+            ("tunnel", "raw_cloudflared_admin"),
+        ] {
+            assert!(
+                build_capability_resource(scheme, op, &request).is_err(),
+                "{scheme}/{op} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_provider_scheme_fails_closed() {
+        let err =
+            build_capability_resource("socket", "connect", &serde_json::json!({})).unwrap_err();
+        assert_eq!(err, "Unsupported provider scheme: socket");
     }
 
     #[test]
@@ -354,6 +551,33 @@ mod tests {
             build_capability_resource("content", "unpin", &request).unwrap_err(),
             "Unsupported content provider operation: unpin"
         );
+    }
+
+    #[test]
+    fn inspect_resource_and_actions_are_canonical() {
+        let request = serde_json::json!({});
+        assert_eq!(
+            build_capability_resource("inspect", "capsules", &request).unwrap(),
+            "elastos://inspect/capsules"
+        );
+        assert_eq!(
+            build_capability_resource("inspect", "plan", &request).unwrap(),
+            "elastos://inspect/plan"
+        );
+        assert_eq!(
+            provider_operation_action("inspect", "capsules"),
+            Some(elastos_runtime::capability::Action::Read)
+        );
+        assert_eq!(
+            provider_operation_action("inspect", "plan"),
+            Some(elastos_runtime::capability::Action::Read)
+        );
+        assert_eq!(
+            provider_operation_action("inspect", "revoke"),
+            Some(elastos_runtime::capability::Action::Write)
+        );
+        assert!(build_capability_resource("inspect", "raw", &request).is_err());
+        assert_eq!(provider_operation_action("chain", "status"), None);
     }
 
     #[test]
@@ -576,13 +800,9 @@ mod tests {
             "elastos://browser-engine/page/status"
         );
         assert_eq!(
-            build_capability_resource("browser-engine", "frame", &serde_json::json!({})).unwrap(),
-            "elastos://browser-engine/page/frame"
-        );
-        assert_eq!(
-            build_capability_resource("browser-engine", "screenshot", &serde_json::json!({}))
+            build_capability_resource("browser-engine", "diagnostics", &serde_json::json!({}))
                 .unwrap(),
-            "elastos://browser-engine/page/screenshot"
+            "elastos://browser-engine/page/diagnostics"
         );
         assert_eq!(
             build_capability_resource("browser-engine", "input", &serde_json::json!({})).unwrap(),

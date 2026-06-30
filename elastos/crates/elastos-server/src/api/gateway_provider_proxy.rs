@@ -1342,6 +1342,16 @@ pub(super) async fn gateway_provider_proxy(
                     .into_response()
             }
         },
+        "inspect" => match op.as_str() {
+            "capsules" | "capsule" | "self" | "plan" | "request_act" => &[SYSTEM_CAPSULE_ID],
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    "Gateway provider operation not found",
+                )
+                    .into_response()
+            }
+        },
         _ => return (StatusCode::NOT_FOUND, "Gateway provider not found").into_response(),
     };
     let context =
@@ -1375,6 +1385,13 @@ pub(super) async fn gateway_provider_proxy(
             Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
         }
     };
+    if let Some(field) = provider_proxy_runtime_metadata_field(&request) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("provider request must not predeclare Runtime metadata field {field}"),
+        )
+            .into_response();
+    }
     request["op"] = serde_json::Value::String(op.clone());
     if scheme == "documents" || scheme == "object" || scheme == "net" {
         request["principal_id"] = serde_json::Value::String(principal_id.clone());
@@ -1408,7 +1425,14 @@ pub(super) async fn gateway_provider_proxy(
         return gateway_browser::gateway_browser_net_http(registry.as_ref(), &request).await;
     }
     if scheme == "net" && op == "stream" {
-        return gateway_browser::gateway_browser_net_stream(registry.as_ref(), &request).await;
+        return (
+            StatusCode::GONE,
+            "legacy /api/provider/net/stream is disabled; Browser streams must be opened through /api/apps/browser/open",
+        )
+            .into_response();
+    }
+    if scheme == "inspect" && op == "request_act" {
+        return gateway_inspect_action_request(&state, &context, &request).await;
     }
 
     let chain_lifecycle_audit = chain_lifecycle_effect_audit(&scheme, &op, &request);
@@ -1556,6 +1580,17 @@ pub(super) async fn gateway_provider_proxy(
     }
 
     Json(response).into_response()
+}
+
+pub(super) fn provider_proxy_runtime_metadata_field(request: &serde_json::Value) -> Option<&str> {
+    request
+        .as_object()?
+        .keys()
+        .find(|key| {
+            key.starts_with("_runtime")
+                || matches!(key.as_str(), "connect_ticket" | "carrier_route" | "carrier")
+        })
+        .map(String::as_str)
 }
 
 fn library_operation_emits_events(op: &str) -> bool {

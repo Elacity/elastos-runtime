@@ -4,10 +4,11 @@ use axum::body::Body;
 use axum::extract::{Path as AxumPath, State as AxumState};
 use axum::http::{
     header::{CONTENT_TYPE, COOKIE},
-    HeaderMap, HeaderValue, Request,
+    HeaderMap, Request,
 };
 use axum::routing::{get, post};
 use axum::Json as AxumJson;
+use base64::Engine;
 use ed25519_dalek::{Signer as _, Verifier as _};
 use elastos_runtime::auth::{
     ethereum_signed_message_hash, verify_siwe_challenge, AuthChallengeInput, AuthChallengeV1,
@@ -264,6 +265,105 @@ async fn browser_engine_policy_blocked_test_state(cache_dir: &std::path::Path) -
     }
 }
 
+async fn browser_engine_remote_carrier_exit_test_state(
+    cache_dir: &std::path::Path,
+) -> GatewayState {
+    browser_engine_remote_carrier_exit_test_state_with_close_calls(
+        cache_dir,
+        Arc::new(TokioMutex::new(Vec::new())),
+    )
+    .await
+}
+
+async fn browser_engine_remote_carrier_exit_test_state_with_close_calls(
+    cache_dir: &std::path::Path,
+    close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+) -> GatewayState {
+    browser_engine_remote_carrier_exit_test_state_with_close_failures(cache_dir, close_calls, 0)
+        .await
+}
+
+async fn browser_engine_remote_carrier_exit_test_state_with_close_failures(
+    cache_dir: &std::path::Path,
+    close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    close_failures: usize,
+) -> GatewayState {
+    seed_test_browser_capsules(cache_dir);
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider("net", Arc::new(MockNetProvider))
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider(
+            "exit",
+            Arc::new(MockRemoteCarrierExitProvider::with_close_failures(
+                close_calls,
+                close_failures,
+            )),
+        )
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider("browser-engine", Arc::new(MockBrowserEngineProvider))
+        .await
+        .unwrap();
+    GatewayState {
+        provider_registry: Some(registry),
+        identity_manager: Arc::new(std::sync::OnceLock::new()),
+        cache_dir: cache_dir.to_path_buf(),
+        data_dir: cache_dir.to_path_buf(),
+    }
+}
+
+async fn rejecting_browser_engine_remote_carrier_exit_test_state_with_close_calls(
+    cache_dir: &std::path::Path,
+    close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+) -> GatewayState {
+    rejecting_browser_engine_remote_carrier_exit_test_state_with_close_failures(
+        cache_dir,
+        close_calls,
+        0,
+    )
+    .await
+}
+
+async fn rejecting_browser_engine_remote_carrier_exit_test_state_with_close_failures(
+    cache_dir: &std::path::Path,
+    close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    close_failures: usize,
+) -> GatewayState {
+    seed_test_browser_capsules(cache_dir);
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider("net", Arc::new(MockNetProvider))
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider(
+            "exit",
+            Arc::new(MockRemoteCarrierExitProvider::with_close_failures(
+                close_calls,
+                close_failures,
+            )),
+        )
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider(
+            "browser-engine",
+            Arc::new(MockRejectingBrowserEngineProvider),
+        )
+        .await
+        .unwrap();
+    GatewayState {
+        provider_registry: Some(registry),
+        identity_manager: Arc::new(std::sync::OnceLock::new()),
+        cache_dir: cache_dir.to_path_buf(),
+        data_dir: cache_dir.to_path_buf(),
+    }
+}
+
 async fn malformed_browser_summary_test_state(cache_dir: &std::path::Path) -> GatewayState {
     seed_test_browser_capsules(cache_dir);
     let registry = Arc::new(ProviderRegistry::new());
@@ -373,10 +473,12 @@ async fn wallet_chain_test_state_with_wallet_provider(
 include!("support_providers.rs");
 include!("support_runtime.rs");
 
+mod browser_profile;
 mod documents;
 #[path = "../gateway_browser_route_tests.rs"]
 mod gateway_browser_route_tests;
 mod home_system;
+mod inspect;
 mod library;
 mod marketplace;
 mod recovery;

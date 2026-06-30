@@ -20,6 +20,8 @@ exclude_globs=(
   --glob '!plans/**'
   --glob '!scripts/check-wci-alignment.sh'
   --glob '!target/**'
+  --glob '!**/target/**'
+  --glob '!**/node_modules/**'
 )
 
 failed=0
@@ -29,23 +31,17 @@ trap 'rm -f "$tmp"' EXIT
 rg_search() {
   local pattern="$1"
   shift
-  if command -v rg >/dev/null 2>&1; then
+  if [[ "${ELASTOS_FORCE_GREP_FALLBACK:-0}" != "1" ]] && command -v rg >/dev/null 2>&1; then
     rg -n "$pattern" "$@"
     return
   fi
-  local grep_args=(-R -n -E)
   local paths=()
+  local globs=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --glob)
         shift
-        case "${1:-}" in
-          '!archive/**') grep_args+=(--exclude-dir=archive) ;;
-          '!docs/ANTI_DRIFT.md') grep_args+=(--exclude=ANTI_DRIFT.md) ;;
-          '!plans/**') grep_args+=(--exclude-dir=plans) ;;
-          '!scripts/check-wci-alignment.sh') grep_args+=(--exclude=check-wci-alignment.sh) ;;
-          '!target/**') grep_args+=(--exclude-dir=target) ;;
-        esac
+        globs+=("${1:-}")
         ;;
       *)
         paths+=("$1")
@@ -53,42 +49,160 @@ rg_search() {
     esac
     shift || true
   done
-  grep "${grep_args[@]}" -- "$pattern" "${paths[@]}"
+  local python_args=("$pattern")
+  if [[ "${#paths[@]}" -gt 0 ]]; then
+    python_args+=("${paths[@]}")
+  fi
+  python_args+=(--)
+  if [[ "${#globs[@]}" -gt 0 ]]; then
+    python_args+=("${globs[@]}")
+  fi
+  python3 - "${python_args[@]}" <<'PY'
+import fnmatch
+import os
+import re
+import sys
+from pathlib import Path
+
+pattern = sys.argv[1]
+args = sys.argv[2:]
+try:
+    split = args.index("--")
+except ValueError:
+    split = len(args)
+paths = args[:split] or ["."]
+globs = args[split + 1:]
+includes = [glob for glob in globs if glob and not glob.startswith("!")]
+excludes = [
+    "target/**",
+    "**/target/**",
+    "node_modules/**",
+    "**/node_modules/**",
+    ".git/**",
+    "**/.git/**",
+]
+excludes.extend(glob[1:] for glob in globs if glob.startswith("!"))
+cwd = Path.cwd()
+
+for source, replacement in {
+    "[:space:]": r"\s",
+    "[:digit:]": r"\d",
+    "[:alnum:]": r"A-Za-z0-9",
+    "[:alpha:]": r"A-Za-z",
+}.items():
+    pattern = pattern.replace(source, replacement)
+regex = re.compile(pattern)
+
+def rel_name(path):
+    try:
+        return path.resolve().relative_to(cwd.resolve()).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+def matches(pattern, rel):
+    return (
+        fnmatch.fnmatch(rel, pattern)
+        or fnmatch.fnmatch(f"./{rel}", pattern)
+        or fnmatch.fnmatch(Path(rel).name, pattern)
+    )
+
+def accepted(path):
+    rel = rel_name(path)
+    if includes and not any(matches(pattern, rel) for pattern in includes):
+        return False
+    if any(matches(pattern, rel) for pattern in excludes):
+        return False
+    return True
+
+def excluded_dir(path):
+    rel = rel_name(path)
+    probe = f"{rel}/__elastos_probe__"
+    return any(matches(pattern, rel) or matches(pattern, probe) for pattern in excludes)
+
+def iter_files(root):
+    if root.is_file():
+        yield root
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        current = Path(dirpath)
+        dirnames[:] = [
+            dirname for dirname in dirnames
+            if dirname not in {"target", "node_modules", ".git"}
+            and not excluded_dir(current / dirname)
+        ]
+        for filename in filenames:
+            yield current / filename
+
+seen = set()
+found = False
+for raw in paths:
+    root = Path(raw)
+    if not root.exists():
+        continue
+    for path in iter_files(root):
+        rel = rel_name(path)
+        if rel in seen or not accepted(path):
+            continue
+        seen.add(rel)
+        try:
+            with path.open("rb") as handle:
+                sample = handle.read(8192)
+                if b"\0" in sample:
+                    continue
+                handle.seek(0)
+                for line_number, raw_line in enumerate(handle, 1):
+                    line = raw_line.decode("utf-8", errors="ignore")
+                    if regex.search(line):
+                        print(f"{rel}:{line_number}:{line.rstrip()}")
+                        found = True
+        except OSError:
+            continue
+sys.exit(0 if found else 1)
+PY
 }
 
 check_forbidden() {
   local pattern="$1"
   local label="$2"
-  if rg_search "$pattern" "${scope[@]}" "${exclude_globs[@]}" >"$tmp" 2>/dev/null; then
+  local search_status=0
+  rg_search "$pattern" "${scope[@]}" "${exclude_globs[@]}" >"$tmp" 2>/dev/null || search_status=$?
+  if [[ "$search_status" -eq 0 ]]; then
     echo "[alignment] forbidden pattern found: $label"
     cat "$tmp"
     echo
     failed=1
   fi
+  return 0
 }
 
 check_required() {
   local pattern="$1"
   local path="$2"
   local label="$3"
-  if ! rg_search "$pattern" "$path" >"$tmp" 2>/dev/null; then
+  local search_status=0
+  rg_search "$pattern" "$path" >"$tmp" 2>/dev/null || search_status=$?
+  if [[ "$search_status" -ne 0 ]]; then
     echo "[alignment] required pattern missing: $label"
     echo "  file: $path"
     echo
     failed=1
   fi
+  return 0
 }
 
 check_forbidden_in_path() {
   local pattern="$1"
   local path="$2"
   local label="$3"
-  if rg_search "$pattern" "$path" >"$tmp" 2>/dev/null; then
+  local search_status=0
+  rg_search "$pattern" "$path" >"$tmp" 2>/dev/null || search_status=$?
+  if [[ "$search_status" -eq 0 ]]; then
     echo "[alignment] forbidden pattern found: $label"
     cat "$tmp"
     echo
     failed=1
   fi
+  return 0
 }
 
 check_forbidden 'AgenticAI' 'legacy root AgenticAI'
@@ -238,7 +352,10 @@ check_required 'elastos.exit.stream-session/v1' capsules/exit-provider/src/main.
 check_required 'elastos.adapter-ipc/v1' capsules/exit-provider/src/main.rs 'exit-provider stream relay must model private Browser Engine Adapter IPC descriptors'
 check_required 'elastos.exit.relay-ipc/v1' capsules/exit-provider/src/main.rs 'exit-provider stream relay must model private Exit relay IPC descriptors'
 check_required 'RelayIpcConfig' capsules/exit-provider/src/main.rs 'exit-provider stream relay config must separate engine adapter IPC from Exit relay IPC'
-check_required 'gateway_browser_net_stream' elastos/crates/elastos-server/src/api/gateway_browser_stream.rs 'Browser streams must route Browser -> Net validation -> internal Exit handoff'
+check_required 'max_active_streams_per_principal' capsules/exit-provider/src/main.rs 'remote Carrier Exit grants must support per-principal stream quotas'
+check_required 'browser_reserve_stream_session' elastos/crates/elastos-server/src/api/gateway_browser_stream.rs 'Browser streams must route Browser -> Net validation -> internal Exit handoff'
+check_required 'remote_exit_id' elastos/crates/elastos-server/src/api/gateway_browser_stream.rs 'Browser stream reservation must preserve selected remote Exit identity'
+check_required 'stream_nonce' elastos/crates/elastos-server/src/api/gateway_browser_stream.rs 'Browser stream reservation must preserve per-open stream nonce'
 check_required 'browser-native-supervisor-smoke\.sh' TASKS.md 'native browser isolation proof must remain tracked in tasks'
 check_required 'browser-native-supervisor-smoke\.sh' docs/BROWSER_CAPSULE.md 'browser docs must record the host-gated native supervisor proof'
 check_required 'browser-native-proxy-engine-smoke\.sh' TASKS.md 'native browser proxy wrapper smoke must remain tracked in tasks'
@@ -321,7 +438,8 @@ check_required 'elastos://chain/\{network\}/broadcast_transaction' elastos/crate
 check_required 'browser_visible_stream_session' elastos/crates/elastos-server/src/api/gateway_browser_stream.rs 'Browser open must strip private adapter_ipc descriptors from UI responses'
 check_required 'browser_attach_runtime_stream_path' elastos/crates/elastos-server/src/api/gateway_browser_stream.rs 'Browser open must allocate Runtime-owned stream socket paths before engine launch'
 check_required 'browser_stream_relay' elastos/crates/elastos-server/src/api/gateway_browser_stream.rs 'Browser open must validate private Exit relay IPC descriptors before relaying bytes'
-check_required 'elastos.exit.relay-open/v1' elastos/crates/elastos-server/src/api/gateway_browser_stream.rs 'Browser open must send typed Exit relay-open handshakes before forwarding bytes'
+check_required 'read_browser_relay_open_line' elastos/crates/elastos-server/src/api/gateway_browser_stream.rs 'Browser runtime stream relay must forward bounded typed Exit relay-open handshakes before forwarding bytes'
+check_required 'BROWSER_RUNTIME_RELAY_OPEN_MAX_BYTES' elastos/crates/elastos-server/src/api/gateway_browser_stream.rs 'Browser runtime stream relay must bound relay-open handshakes before forwarding bytes'
 check_required 'browser_engine_stream_session' elastos/crates/elastos-server/src/api/gateway_browser_stream.rs 'Browser open must build the private engine stream session separately from the visible Browser response'
 check_required 'object.remove\("relay_ipc"\)' elastos/crates/elastos-server/src/api/gateway_browser_stream.rs 'Browser open must strip private Exit relay IPC descriptors from Browser UI responses'
 check_required 'copy_bidirectional' elastos/crates/elastos-server/src/api/gateway_browser_stream.rs 'Browser runtime stream relay must use local byte forwarding, not raw host networking'
@@ -337,15 +455,26 @@ check_required 'invalid WebAuthn Origin header' elastos/crates/elastos-server/sr
 if rg_search 'passkey|webauthn|PublicKeyCredential|credentials\.(create|get)' capsules \
   --glob '!capsules/home/browser/*' \
   --glob '!capsules/system/browser/*' \
+  --glob '!capsules/inbox/browser/*' \
   --glob '!capsules/wallet/*' \
   --glob '!capsules/*-provider/**' \
   --glob '!**/target/**' >"$tmp" 2>/dev/null; then
-  echo "[alignment] forbidden pattern found: passkey ceremonies must stay in Home/System/runtime auth surfaces"
+  echo "[alignment] forbidden pattern found: passkey ceremonies must stay in Home/System/Inbox/Wallet/runtime auth surfaces"
   cat "$tmp"
   echo
   failed=1
 fi
+check_forbidden_in_path 'credentials\.create|passkey/register|webauthn/register' capsules/inbox 'Inbox may request fresh passkey authentication for wallet or Inspector approval, but must not register passkeys'
 check_forbidden_in_path 'credentials\.create|passkey/register|webauthn/register' capsules/wallet 'Wallet may request fresh passkey authentication for protected recovery, but must not register passkeys'
+if rg_search $'fetch[[:space:]]*\\([[:space:]]*["\\\'`]https?://|\\.open[[:space:]]*\\([[:space:]]*["\\\'`][A-Z]+["\\\'`][[:space:]]*,[[:space:]]*["\\\'`]https?://|new[[:space:]]+WebSocket[[:space:]]*\\([[:space:]]*["\\\'`]wss?://|new[[:space:]]+EventSource[[:space:]]*\\([[:space:]]*["\\\'`]https?://|sendBeacon[[:space:]]*\\([[:space:]]*["\\\'`]https?://' capsules \
+  --glob '*/browser/**' \
+  --glob '!capsules/*-provider/**' \
+  --glob '!**/target/**' >"$tmp" 2>/dev/null; then
+  echo "[alignment] forbidden pattern found: app capsules must not open absolute external network URLs directly"
+  cat "$tmp"
+  echo
+  failed=1
+fi
 if rg_search 'WalletConnect|walletconnect|MetaMask|metamask|UniSat|unisat|window\.ethereum|window\.unisat|ethereum\.request|personal_sign|eth_requestAccounts|eth_sendTransaction|wallet_switchEthereumChain|signMessage' capsules \
   --glob '!capsules/home/browser/*' \
   --glob '!capsules/system/browser/*' \
@@ -402,6 +531,17 @@ fi
 check_forbidden_in_path 'home_session_cookie_header|home_session_cookie_is_valid|SET_COOKIE' elastos/crates/elastos-server/src/api/browser_capsules.rs 'Home static route must not auto-mint a local session cookie'
 check_forbidden_in_path 'default chat profile' docs/GETTING_STARTED.md 'onboarding must teach the default Home profile, not the old chat profile'
 check_forbidden_in_path 'darwin\)' scripts/install.sh 'public installer must stay Linux-only until update/install support macOS coherently'
+check_required 'Current public install preview: Linux x86_64/aarch64' scripts/install.sh 'installer help must label public install as Linux preview'
+check_required 'Current public install preview is Linux-only' scripts/install.sh 'installer must fail cleanly on non-Linux hosts'
+check_required 'if \[\[ \$\{#GATEWAYS\[@\]\} -gt 0 \]\]; then' scripts/install.sh 'installer must safely prepend publisher gateway without expanding an empty Bash array'
+check_required 'current Linux `x86_64`/`aarch64` preview' README.md 'README install path must be scoped to Linux preview'
+check_required 'current Linux `x86_64`/`aarch64` preview' docs/INSTALL.md 'install docs must scope public installer to Linux preview'
+check_required 'current Linux `x86_64`/`aarch64`' docs/GETTING_STARTED.md 'getting started must scope binary install to Linux preview'
+check_required 'System, People, Services, Browser, Wallet, Documents, Library,' docs/INSTALL.md 'install docs must list the current default Home visible surfaces'
+check_required 'Marketplace, Archive, and Inbox' docs/INSTALL.md 'install docs must list Marketplace and Archive in the default Home visible surfaces'
+check_required 'People is Home-owned state and UI' docs/INSTALL.md 'install docs must not describe People as a separate installed capsule'
+check_required 'separate capsule' docs/INSTALL.md 'install docs must explicitly distinguish People from installed capsules'
+check_required 'System, People, Services, Browser, Wallet, Documents, Library, Marketplace,' docs/GETTING_STARTED.md 'getting started must list the current default Home visible surfaces'
 check_forbidden_in_path 'http://' elastos/crates/elastos-runtime/src/provider/registry.rs 'provider-registry tests/docs must not preserve http:// parity assumptions'
 check_forbidden_in_path 'localhost:// = ' README.md 'public docs must not flatten localhost:// into a single-root slogan'
 check_forbidden_in_path 'localhost:// = ' docs/OVERVIEW.md 'overview must describe rooted localhost spaces, not a flattened single-root slogan'
@@ -422,7 +562,7 @@ check_forbidden_in_path 'send_raw\("ipfs"|ipfs_cat_via_provider|try_download_cap
 check_required 'managed dashboard runtime' docs/OVERVIEW.md 'overview must teach Home as the front door'
 
 python3 - <<'PY'
-import json, sys
+import json, re, sys
 from pathlib import Path
 
 components = json.loads(Path("components.json").read_text())
@@ -455,6 +595,16 @@ def is_system_only_backend(resource):
     head = rest.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
     return head in system_only_elastos_backends
 
+def is_supported_resource_scheme(resource):
+    return isinstance(resource, str) and (
+        resource.startswith("elastos://") or resource.startswith("localhost://")
+    )
+
+def require_supported_resource_scheme(path, label, resource):
+    if not is_supported_resource_scheme(resource):
+        print(f"[alignment] {path} {label} uses unsupported resource scheme: {resource}")
+        sys.exit(1)
+
 def is_test_or_generated_path(path):
     names = set(path.parts)
     lowered_name = path.name.lower()
@@ -466,6 +616,29 @@ def is_test_or_generated_path(path):
         or "test" in lowered_name
         or "spec" in lowered_name
     )
+
+direct_external_network_patterns = [
+    (
+        re.compile(r"""fetch\s*\(\s*["'`]https?://"""),
+        "absolute external fetch",
+    ),
+    (
+        re.compile(r"""\.open\s*\(\s*["'`][A-Z]+["'`]\s*,\s*["'`]https?://"""),
+        "absolute external XMLHttpRequest",
+    ),
+    (
+        re.compile(r"""new\s+WebSocket\s*\(\s*["'`]wss?://"""),
+        "absolute external WebSocket",
+    ),
+    (
+        re.compile(r"""new\s+EventSource\s*\(\s*["'`]https?://"""),
+        "absolute external EventSource",
+    ),
+    (
+        re.compile(r"""sendBeacon\s*\(\s*["'`]https?://"""),
+        "absolute external beacon",
+    ),
+]
 
 manifest_paths = sorted(Path("capsules").glob("*/capsule.json")) + sorted(Path("elastos/capsules").glob("*/capsule.json"))
 for path in manifest_paths:
@@ -510,6 +683,8 @@ for path in manifest_paths:
     if role == "provider" and not provides:
         print(f"[alignment] provider capsule {manifest.get('name', path)} must declare a provides namespace")
         sys.exit(1)
+    if provides:
+        require_supported_resource_scheme(path, "provides namespace", provides)
     if role == "provider":
         authority = manifest.get("authority")
         if not isinstance(authority, dict):
@@ -521,6 +696,13 @@ for path in manifest_paths:
         if not authority.get("capabilities"):
             print(f"[alignment] provider capsule {manifest.get('name', path)} authority capability schema is empty")
             sys.exit(1)
+        for index, capability in enumerate(authority.get("capabilities") or []):
+            if isinstance(capability, dict):
+                require_supported_resource_scheme(
+                    path,
+                    f"authority capability {index} resource",
+                    capability.get("resource"),
+                )
         if not authority.get("audit_events"):
             print(f"[alignment] provider capsule {manifest.get('name', path)} authority audit events are empty")
             sys.exit(1)
@@ -605,6 +787,10 @@ for path in manifest_paths:
                 if source.name in {"mgba.js"} or source.suffix not in {".html", ".rs", ".ts", ".tsx", ".js", ".mjs"}:
                     continue
                 text = source.read_text(errors="ignore")
+                for pattern, reason in direct_external_network_patterns:
+                    if pattern.search(text):
+                        print(f"[alignment] ordinary capsule {manifest.get('name', path)} opens direct external network in {source}: {reason}")
+                        sys.exit(1)
                 for pattern, reason in forbidden_source_patterns.items():
                     if pattern in text:
                         print(f"[alignment] ordinary capsule {manifest.get('name', path)} leaks host topology in {source}: {reason}")
@@ -615,11 +801,20 @@ def platform_info(component, platform):
     return platforms.get(platform) or platforms.get("*")
 
 home = components["profiles"]["home"]["components"]
-forbidden = {"kubo", "ipfs-provider", "availability-provider", "site-provider", "tunnel-provider", "cloudflared", "chain-provider", "wallet-provider", "drm-provider", "rights-provider", "key-provider", "decrypt-provider"}
+forbidden = {"kubo", "ipfs-provider", "availability-provider", "site-provider", "tunnel-provider", "cloudflared", "drm-provider", "rights-provider", "key-provider", "decrypt-provider"}
 bad = sorted(forbidden.intersection(home))
 if bad:
-    print("[alignment] home profile includes non-default off-box/public-edge/chain/wallet components:", ", ".join(bad))
+    print("[alignment] home profile includes non-default off-box/public-edge/protected-content components:", ", ".join(bad))
     sys.exit(1)
+wallet_browser_surfaces = {"wallet", "wallet-metamask", "wallet-unisat", "wallet-walletconnect", "browser", "inbox"}
+wallet_browser_providers = {"chain-provider", "wallet-provider"}
+for profile_name, profile in sorted(components["profiles"].items()):
+    profile_components = set(profile.get("components") or [])
+    if wallet_browser_surfaces.intersection(profile_components):
+        missing_providers = sorted(wallet_browser_providers.difference(profile_components))
+        if missing_providers:
+            print(f"[alignment] {profile_name} profile installs Wallet/Browser surfaces without providers: {', '.join(missing_providers)}")
+            sys.exit(1)
 required = {
     "shell",
     "localhost-provider",
@@ -677,6 +872,71 @@ missing_demo = sorted(required_demo.difference(demo_components))
 if missing_demo:
     print("[alignment] demo profile missing required demo components:", ", ".join(missing_demo))
     sys.exit(1)
+def shell_array_items(text, name):
+    match = re.search(rf"^{re.escape(name)}=\((.*?)^\)", text, re.MULTILINE | re.DOTALL)
+    if not match:
+        print(f"[alignment] missing shell array {name}")
+        sys.exit(1)
+    return set(re.findall(r"^\s*([A-Za-z0-9_-]+)\s*$", match.group(1), re.MULTILINE))
+
+def rust_const_items(text, name):
+    match = re.search(rf"const\s+{re.escape(name)}:\s*&\[\&str\]\s*=\s*&\[(.*?)\];", text, re.DOTALL)
+    if not match:
+        print(f"[alignment] missing Rust const {name}")
+        sys.exit(1)
+    return set(re.findall(r'"([^"]+)"', match.group(1)))
+
+publish_release = Path("scripts/publish-release.sh").read_text()
+publish_rs = Path("elastos/crates/elastos-server/src/publish.rs").read_text()
+if "components-release-integrity-check.py" not in publish_release or "validate_generated_components_json" not in publish_release:
+    print("[alignment] publish-release must validate generated components.json release checksums")
+    sys.exit(1)
+publish_release_default = shell_array_items(publish_release, "DEFAULT_CAPSULES")
+publish_release_required = shell_array_items(publish_release, "REQUIRED_SUPPORTED_CAPSULES")
+publish_rust_home = rust_const_items(publish_rs, "HOME_PUBLISH_CAPSULES")
+publish_rust_demo = rust_const_items(publish_rs, "DEMO_PUBLISH_CAPSULES")
+publish_rust_required = rust_const_items(publish_rs, "REQUIRED_SUPPORTED_PUBLISH_CAPSULES")
+home_profile_capsules = {
+    name for name in components["profiles"]["home"]["components"]
+    if name in components.get("external", {}) and Path("capsules", name, "capsule.json").exists()
+}
+legacy_capsules = {
+    name for name in components["profiles"]["home"]["components"]
+    if name in components.get("external", {}) and Path("elastos/capsules", name, "capsule.json").exists()
+}
+home_profile_capsules |= legacy_capsules
+if publish_release_default != home_profile_capsules:
+    print("[alignment] publish-release default capsules must match setup home capsule surface")
+    print("[alignment] missing from publish-release:", ", ".join(sorted(home_profile_capsules - publish_release_default)) or "(none)")
+    print("[alignment] extra in publish-release:", ", ".join(sorted(publish_release_default - home_profile_capsules)) or "(none)")
+    sys.exit(1)
+if publish_release_required != home_profile_capsules:
+    print("[alignment] publish-release required capsules must match setup home capsule surface")
+    print("[alignment] missing from required:", ", ".join(sorted(home_profile_capsules - publish_release_required)) or "(none)")
+    print("[alignment] extra in required:", ", ".join(sorted(publish_release_required - home_profile_capsules)) or "(none)")
+    sys.exit(1)
+if publish_rust_home != home_profile_capsules or publish_rust_required != home_profile_capsules:
+    print("[alignment] Rust home/required publish capsules must match setup home capsule surface")
+    print("[alignment] missing from Rust home:", ", ".join(sorted(home_profile_capsules - publish_rust_home)) or "(none)")
+    print("[alignment] extra in Rust home:", ", ".join(sorted(publish_rust_home - home_profile_capsules)) or "(none)")
+    sys.exit(1)
+for demo_capsule in ["chat", "chat-wasm", "gba-emulator", "gba-ucity", "chat-room", "ipfs-provider", "tunnel-provider"]:
+    if demo_capsule not in publish_rust_demo:
+        print(f"[alignment] Rust demo publish profile missing {demo_capsule}")
+        sys.exit(1)
+for provider in sorted(wallet_browser_providers):
+    if provider not in publish_release_default:
+        print(f"[alignment] publish-release default capsule set missing {provider}")
+        sys.exit(1)
+    if provider not in publish_release_required:
+        print(f"[alignment] publish-release required supported capsule set missing {provider}")
+        sys.exit(1)
+    if provider not in publish_rust_home:
+        print(f"[alignment] Rust home publish capsule set missing {provider}")
+        sys.exit(1)
+    if provider not in publish_rust_required:
+        print(f"[alignment] Rust required supported publish capsule set missing {provider}")
+        sys.exit(1)
 chat = components["profiles"].get("chat")
 if not chat:
     print("[alignment] chat profile is missing")
@@ -809,7 +1069,7 @@ wallet_component = components["external"].get("wallet-provider")
 if not wallet_component:
     print("[alignment] wallet-provider is missing from external components")
     sys.exit(1)
-for platform in ("linux-amd64", "linux-arm64"):
+for platform in ("linux-amd64", "linux-arm64", "darwin-arm64"):
     info = (wallet_component.get("platforms") or {}).get(platform)
     if not info:
         print(f"[alignment] wallet-provider missing {platform} release metadata")

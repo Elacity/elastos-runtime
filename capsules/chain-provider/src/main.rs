@@ -870,6 +870,9 @@ impl ChainProvider {
         if let Err(err) = validate_hex(data, None, "transaction data") {
             return Response::error("invalid_data", &err);
         }
+        if data.len() > 256 * 1024 {
+            return Response::error("invalid_data", "transaction data is too large");
+        }
         let Some(chain_id) = network.chain_id else {
             return Response::error("invalid_network", "EVM network missing chain_id");
         };

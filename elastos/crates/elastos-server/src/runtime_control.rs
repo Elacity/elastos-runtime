@@ -27,6 +27,7 @@ pub const RUNTIME_KIND_MANAGED_CHAT: &str = "managed-chat";
 pub const RUNTIME_KIND_MANAGED_HOME: &str = "managed-home";
 pub const OPERATOR_RUNTIME_REQUIRED_MESSAGE: &str =
     "This command requires a running runtime.\n\n  elastos serve\n\nThen run this command again.";
+const CARRIER_MDNS_ENV: &str = "ELASTOS_CARRIER_MDNS";
 
 enum ManagedRuntimeStart {
     Owner(ManagedRuntimeStartGuard),
@@ -40,6 +41,15 @@ struct ManagedRuntimeStartGuard {
 
 fn default_runtime_kind() -> String {
     RUNTIME_KIND_OPERATOR.to_string()
+}
+
+fn managed_runtime_default_carrier_mdns(runtime_kind: &str) -> Option<&'static str> {
+    match runtime_kind {
+        RUNTIME_KIND_MANAGED_CHAT | RUNTIME_KIND_MANAGED_HOME | RUNTIME_KIND_MANAGED_IDENTITY => {
+            Some("0")
+        }
+        _ => None,
+    }
 }
 
 fn managed_runtime_start_lock_path(data_dir: &Path) -> PathBuf {
@@ -318,8 +328,54 @@ pub fn runtime_coord_path(data_dir: &Path) -> PathBuf {
     data_dir.join("runtime-coords.json")
 }
 
+/// Portable PID liveness check.
+///
+/// Previously the codebase used `PathBuf::from(format!("/proc/{}", pid)).exists()`,
+/// which works on Linux but silently always returns `false` on macOS (no /proc).
+/// That caused `read_runtime_coords` to delete the coords file every time it was
+/// invoked on Darwin, which in turn made `elastos home` / `elastos chat` /
+/// gateway-launch paths time out waiting for a runtime that was actually alive.
+///
+/// `kill(pid, 0)` is the portable POSIX way: it returns 0 when the target exists
+/// and the caller can signal it, sets `ESRCH` when no such process exists, and
+/// sets `EPERM` when the process exists but the caller may not signal it (still
+/// alive from our perspective). Anything other than `ESRCH` means alive.
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let pid_i32: libc::pid_t = match pid.try_into() {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let ret = unsafe { libc::kill(pid_i32, 0) };
+        if ret == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        // Conservative fallback: assume alive so we don't tear down a live
+        // runtime's coords. Implement a Win32 OpenProcess-based check when
+        // Windows support lands.
+        let _ = pid;
+        true
+    }
+}
+
 fn home_runtime_coord_path(data_dir: &Path) -> PathBuf {
     data_dir.join("home-runtime-coords.json")
+}
+
+fn managed_runtime_child_home_dir(data_dir: &Path, runtime_kind: &str) -> PathBuf {
+    data_dir
+        .join("managed-runtimes")
+        .join(managed_runtime_kind_label(runtime_kind))
+        .join("home")
+}
+
+fn managed_runtime_child_xdg_data_home(child_home: &Path) -> PathBuf {
+    child_home.join(".local").join("share")
 }
 
 pub fn write_runtime_coords(path: &Path, coords: &RuntimeCoords) -> anyhow::Result<()> {
@@ -348,7 +404,7 @@ pub async fn read_runtime_coords(path: &Path) -> Option<RuntimeCoords> {
         }
     };
 
-    if !PathBuf::from(format!("/proc/{}", coords.pid)).exists() {
+    if !pid_is_alive(coords.pid) {
         let _ = std::fs::remove_file(path);
         return None;
     }
@@ -432,19 +488,18 @@ async fn terminate_managed_chat_runtime(coords: &RuntimeCoords, coords_path: &Pa
         libc::kill(coords.pid as i32, libc::SIGTERM);
     }
 
-    let proc_path = PathBuf::from(format!("/proc/{}", coords.pid));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    while proc_path.exists() && std::time::Instant::now() < deadline {
+    while pid_is_alive(coords.pid) && std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     #[cfg(unix)]
-    if proc_path.exists() {
+    if pid_is_alive(coords.pid) {
         unsafe {
             libc::kill(coords.pid as i32, libc::SIGKILL);
         }
         let kill_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while proc_path.exists() && std::time::Instant::now() < kill_deadline {
+        while pid_is_alive(coords.pid) && std::time::Instant::now() < kill_deadline {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
@@ -777,8 +832,12 @@ async fn ensure_managed_runtime(
     let self_exe = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("Failed to determine runtime binary: {}", e))?;
     let binary_sha256 = sha256_file(&self_exe)?;
+    let (_home_launch_signing_key, home_launch_signer_did) =
+        elastos_identity::load_or_create_did(data_dir)?;
     let policy = serde_json::json!({
-        "allow": allow_resources
+        "allow": allow_resources,
+        "home_launch_signer_did": home_launch_signer_did.clone(),
+        "home_launch_auth_data_dir": data_dir.display().to_string(),
     });
     let policy_sha256 = sha256_bytes(serde_json::to_vec(&policy)?.as_slice());
 
@@ -850,6 +909,11 @@ async fn ensure_managed_runtime(
         Some(owner) => anyhow::bail!(managed_runtime_lane_conflict_message(surface_name, &owner)),
         None => false,
     };
+    let child_home_dir =
+        subordinate_gateway_host.then(|| managed_runtime_child_home_dir(data_dir, runtime_kind));
+    if let Some(child_home_dir) = child_home_dir.as_ref() {
+        std::fs::create_dir_all(managed_runtime_child_xdg_data_home(child_home_dir))?;
+    }
 
     if let Some(pid) = current_process_managed_runtime_child(runtime_kind) {
         if runtime_notices_enabled() {
@@ -938,8 +1002,29 @@ async fn ensure_managed_runtime(
         .stdout(std::process::Stdio::from(log_file.try_clone()?))
         .stderr(std::process::Stdio::from(log_file))
         .stdin(std::process::Stdio::null());
+    if std::env::var_os(CARRIER_MDNS_ENV).is_none() {
+        if let Some(value) = managed_runtime_default_carrier_mdns(runtime_kind) {
+            child.env(CARRIER_MDNS_ENV, value);
+        }
+    }
     if subordinate_gateway_host {
         child.env("ELASTOS_ALLOW_SUBORDINATE_RUNTIME_HOST", "1");
+        child.env("ELASTOS_RUNTIME_COORDS_FILE", &coords_path);
+        child.env("ELASTOS_CAPSULE_BIN_DIR", data_dir.join("bin"));
+        child.env(
+            crate::api::gateway::HOME_LAUNCH_TRUSTED_SIGNER_DID_ENV,
+            &home_launch_signer_did,
+        );
+        child.env(
+            crate::api::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV,
+            data_dir,
+        );
+        if let Some(child_home_dir) = child_home_dir.as_ref() {
+            child.env("HOME", child_home_dir).env(
+                "XDG_DATA_HOME",
+                managed_runtime_child_xdg_data_home(child_home_dir),
+            );
+        }
     }
     let mut child = child
         .spawn()
@@ -1227,6 +1312,26 @@ mod tests {
     }
 
     #[test]
+    fn managed_runtimes_default_carrier_mdns_off() {
+        assert_eq!(
+            managed_runtime_default_carrier_mdns(RUNTIME_KIND_MANAGED_HOME),
+            Some("0")
+        );
+        assert_eq!(
+            managed_runtime_default_carrier_mdns(RUNTIME_KIND_MANAGED_CHAT),
+            Some("0")
+        );
+        assert_eq!(
+            managed_runtime_default_carrier_mdns(RUNTIME_KIND_MANAGED_IDENTITY),
+            Some("0")
+        );
+        assert_eq!(
+            managed_runtime_default_carrier_mdns(RUNTIME_KIND_OPERATOR),
+            None
+        );
+    }
+
+    #[test]
     fn home_runtime_coord_path_uses_data_dir_and_not_env_override() {
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var(
@@ -1236,6 +1341,19 @@ mod tests {
         let actual = home_runtime_coord_path(tmp.path());
         std::env::remove_var("ELASTOS_RUNTIME_COORDS_FILE");
         assert_eq!(actual, tmp.path().join("home-runtime-coords.json"));
+    }
+
+    #[test]
+    fn subordinate_managed_runtime_home_is_nested_under_parent_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = managed_runtime_child_home_dir(tmp.path(), RUNTIME_KIND_MANAGED_HOME);
+
+        assert!(home.starts_with(tmp.path()));
+        assert!(home.ends_with("managed-runtimes/home/home"));
+        assert_eq!(
+            managed_runtime_child_xdg_data_home(&home),
+            home.join(".local/share")
+        );
     }
 
     #[test]

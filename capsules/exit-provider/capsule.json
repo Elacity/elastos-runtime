@@ -14,11 +14,12 @@
       {
         "resource": "elastos://exit/*",
         "actions": ["read", "write"],
-        "operations": ["status", "quote", "open_stream", "close_stream", "http_fetch"]
+        "operations": ["status", "discover_remote_carrier_exits", "quote", "open_stream", "close_stream", "http_fetch"]
       }
     ],
     "audit_events": [
       "exit.status",
+      "exit.remote_carrier.discovered",
       "exit.quote",
       "exit.open.denied",
       "exit.stream.reserved",

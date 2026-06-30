@@ -79,7 +79,8 @@ pub(super) fn append_home_launch_token(
     let mut serializer = form_urlencoded::Serializer::new(String::new());
     serializer.append_pair("home_token", &token);
     for (key, value) in query {
-        if key.trim().is_empty() {
+        let key = key.trim();
+        if key.is_empty() || key == "home_token" {
             continue;
         }
         serializer.append_pair(key, value);
@@ -167,6 +168,7 @@ pub(super) fn load_gateway_identity_summary(data_dir: &std::path::Path) -> HomeI
     HomeIdentitySummary {
         device_did: load_gateway_device_did(data_dir),
         handle: None,
+        profile_card: None,
     }
 }
 
@@ -182,9 +184,15 @@ pub(super) fn load_gateway_identity_summary_for_context(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
 ) -> HomeIdentitySummary {
+    let profile_card = home_profile_card_summary_for_context(data_dir, context);
+    let handle = profile_card
+        .as_ref()
+        .map(|card| card.display_name.clone())
+        .or_else(|| principal_display_name_for_context(data_dir, context));
     HomeIdentitySummary {
         device_did: load_gateway_device_did(data_dir),
-        handle: principal_display_name_for_context(data_dir, context),
+        handle,
+        profile_card,
     }
 }
 
@@ -283,7 +291,10 @@ fn materialize_source_wasm_capsule_for_runtime(
         .join("release")
         .join(&manifest.entrypoint);
     if !built_entrypoint.is_file() {
-        return Ok(capsule_dir.to_path_buf());
+        anyhow::bail!(
+            "capsule runtime entrypoint missing: {}",
+            capsule_dir.join(&manifest.entrypoint).display()
+        );
     }
 
     let bundle_dir = data_dir.join("dev-capsules").join(&manifest.name);
@@ -338,8 +349,7 @@ async fn ensure_home_target_package(
     target: &str,
     required: bool,
 ) -> Result<(), String> {
-    let installed_dir = data_dir.join("capsules").join(target);
-    if !required && !installed_dir.exists() {
+    if !required && !crate::setup::capsule_component_has_release_identity(data_dir, target) {
         return Ok(());
     }
 
@@ -647,10 +657,11 @@ pub(super) fn wallet_connector_evm_chains() -> serde_json::Value {
 fn app_shell_title(name: &str) -> String {
     match name {
         DOCUMENTS_CAPSULE_ID => "Documents".to_string(),
-        CHAT_ROOM_CAPSULE_ID => "Chat Room".to_string(),
+        CHAT_ROOM_CAPSULE_ID => "Chat".to_string(),
         LIBRARY_CAPSULE_ID => "Library".to_string(),
         MARKETPLACE_CAPSULE_ID => "Marketplace".to_string(),
         INBOX_CAPSULE_ID => "Inbox".to_string(),
+        SERVICES_CAPSULE_ID => "Services".to_string(),
         SYSTEM_CAPSULE_ID => "System".to_string(),
         BROWSER_CAPSULE_ID => "Browser".to_string(),
         WALLET_CAPSULE_ID => "Wallet".to_string(),
@@ -666,14 +677,13 @@ fn app_shell_description(name: &str, manifest_description: Option<String>) -> St
         DOCUMENTS_CAPSULE_ID => {
             "Create, edit, and publish markdown documents from this device.".to_string()
         }
-        CHAT_ROOM_CAPSULE_ID => {
-            "Open the local sovereign room from this runtime inside ElastOS.".to_string()
-        }
+        CHAT_ROOM_CAPSULE_ID => "Open Chat conversations inside ElastOS.".to_string(),
         LIBRARY_CAPSULE_ID => "Browse documents and open them in Documents.".to_string(),
         MARKETPLACE_CAPSULE_ID => {
             "Browse installed capsules, providers, viewers, and content.".to_string()
         }
         INBOX_CAPSULE_ID => "Review requests and approvals for this Home.".to_string(),
+        SERVICES_CAPSULE_ID => "Manage Browser Exit Node sharing and subscriptions.".to_string(),
         SYSTEM_CAPSULE_ID => {
             "Manage passkeys, appearance, and runtime settings for this Home.".to_string()
         }
@@ -734,12 +744,16 @@ pub(super) fn home_state(data_dir: &std::path::Path) -> HomeState {
     {
         apply_room_access(&mut room_summary, access);
     }
+    let people = home_people_summary(&room_summary, identity.did.as_deref());
+    let services = home_services_summary(data_dir, &room_summary, &people);
     let _ = crate::notifications::sync_room_notifications(data_dir, &room_summary);
     let notifications = crate::notifications::load_summary(data_dir).unwrap_or_default();
 
     HomeState {
         site,
         room: home_room_summary(room_summary),
+        people,
+        services,
         notifications: home_notifications_summary(notifications),
     }
 }
@@ -810,6 +824,531 @@ fn home_room_summary(summary: crate::room_service::RoomSummary) -> HomeRoomSumma
                 last_seen_at: session.last_seen_at,
             })
             .collect(),
+    }
+}
+
+fn home_people_summary(
+    summary: &crate::room_service::RoomSummary,
+    local_did: Option<&str>,
+) -> HomePeopleSummary {
+    let active_by_member = summary
+        .active_participants
+        .iter()
+        .filter_map(|participant| {
+            participant
+                .member_did
+                .as_deref()
+                .map(|member_did| (member_did.to_string(), participant))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut contacts = summary
+        .room_control
+        .members
+        .iter()
+        .filter(|member| local_did != Some(member.member_did.as_str()))
+        .enumerate()
+        .map(|(index, member)| {
+            let active = active_by_member.get(&member.member_did);
+            let profile_card = member
+                .profile_card
+                .clone()
+                .map(home_profile_card_from_room_profile);
+            let display_name = profile_card
+                .as_ref()
+                .map(|card| card.display_name.clone())
+                .or_else(|| active.map(|participant| participant.display_name.clone()))
+                .unwrap_or_else(|| home_people_fallback_display_name(&member.role, index));
+            HomePeopleContactSummary {
+                contact_id: home_people_contact_id(&member.member_did),
+                added_at: member.added_at,
+                display_name,
+                handle: profile_card.as_ref().and_then(|card| card.handle.clone()),
+                relationship: "conversation".to_string(),
+                route: format!("/apps/{CHAT_ROOM_CAPSULE_ID}/"),
+                can_message: true,
+                device_label: active.map(|participant| participant.device_label.clone()),
+                profile_card,
+                last_seen_at: active.map(|participant| participant.last_seen_at),
+            }
+        })
+        .collect::<Vec<_>>();
+    contacts.sort_by(|left, right| {
+        left.display_name
+            .to_lowercase()
+            .cmp(&right.display_name.to_lowercase())
+            .then_with(|| left.contact_id.cmp(&right.contact_id))
+    });
+    let service_offers = contacts
+        .iter()
+        .flat_map(home_service_offers_for_people_contact)
+        .collect::<Vec<_>>();
+    HomePeopleSummary {
+        contact_count: contacts.len(),
+        service_offer_count: service_offers.len(),
+        contacts,
+        service_offers,
+        ..HomePeopleSummary::default()
+    }
+}
+
+pub(super) fn home_service_offers_for_people_contact(
+    contact: &HomePeopleContactSummary,
+) -> Vec<HomeServiceOfferSummary> {
+    let mut offers = Vec::new();
+    if contact.can_message {
+        offers.push(HomeServiceOfferSummary {
+            schema: "elastos.service.offer/v1".to_string(),
+            offer_id: format!("offer:{}:conversation", contact.contact_id),
+            service_uri: "elastos://peer/conversation".to_string(),
+            service_kind: "conversation".to_string(),
+            display_name: format!("Chat with {}", contact.display_name),
+            provider_uri: Some("elastos://carrier/conversation".to_string()),
+            provider_label: "Conversation provider".to_string(),
+            policy_summary: "Enabled for this accepted contact; Runtime keeps message transport behind the Chat capability.".to_string(),
+            status: "enabled".to_string(),
+            enabled: true,
+            grant_required: false,
+            grant_scope: "chat_room_contact".to_string(),
+            capsule_contract: "chat-room -> Home launch grant -> room.access -> conversation provider".to_string(),
+            source: "people_contact".to_string(),
+            runtime_contract: None,
+            contact_id: Some(contact.contact_id.clone()),
+            capsule_hint: Some(CHAT_ROOM_CAPSULE_ID.to_string()),
+            route: Some(format!("/apps/{CHAT_ROOM_CAPSULE_ID}/")),
+        });
+    }
+    offers.push(HomeServiceOfferSummary {
+        schema: "elastos.service.offer/v1".to_string(),
+        offer_id: format!("offer:{}:browser-exit", contact.contact_id),
+        service_uri: "elastos://peer/browser-exit".to_string(),
+        service_kind: "remote_exit".to_string(),
+        display_name: format!("{}'s Browser Exit", contact.display_name),
+        provider_uri: Some("elastos://exit/remote-carrier".to_string()),
+        provider_label: "Remote Exit".to_string(),
+        policy_summary: "Request access from this person; a principal-scoped remote Exit grant must be installed before Browser can use it.".to_string(),
+        status: "requestable".to_string(),
+        enabled: false,
+        grant_required: true,
+        grant_scope: "principal_scoped_remote_exit_grant".to_string(),
+        capsule_contract: "browser -> runtime capability -> remote Exit grant -> provider".to_string(),
+        source: "people_contact".to_string(),
+        runtime_contract: None,
+        contact_id: Some(contact.contact_id.clone()),
+        capsule_hint: Some("browser".to_string()),
+        route: None,
+    });
+    offers
+}
+
+fn home_services_summary(
+    data_dir: &std::path::Path,
+    room_summary: &crate::room_service::RoomSummary,
+    people: &HomePeopleSummary,
+) -> HomeServicesSummary {
+    let mut local_offers = home_local_service_offers(data_dir, room_summary);
+    local_offers.sort_by(|left, right| {
+        left.service_kind
+            .cmp(&right.service_kind)
+            .then_with(|| left.offer_id.cmp(&right.offer_id))
+    });
+    let mut remote_offers = people.service_offers.clone();
+    remote_offers.extend(home_configured_remote_exit_offers(data_dir));
+    remote_offers.sort_by(|left, right| {
+        left.service_kind
+            .cmp(&right.service_kind)
+            .then_with(|| left.display_name.cmp(&right.display_name))
+            .then_with(|| left.offer_id.cmp(&right.offer_id))
+    });
+    HomeServicesSummary {
+        local_offer_count: local_offers.len(),
+        remote_offer_count: remote_offers.len(),
+        local_offers,
+        remote_offers,
+        ..HomeServicesSummary::default()
+    }
+}
+
+pub(super) fn home_configured_remote_exit_offers(
+    data_dir: &std::path::Path,
+) -> Vec<HomeServiceOfferSummary> {
+    let config_path = data_dir.join("config/exit-provider.json");
+    let Some(exits) = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|config| {
+            config
+                .get("remote_carrier_exits")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+        })
+    else {
+        return Vec::new();
+    };
+    exits
+        .iter()
+        .enumerate()
+        .filter_map(home_configured_remote_exit_offer)
+        .collect()
+}
+
+fn home_configured_remote_exit_offer(
+    (index, exit): (usize, &serde_json::Value),
+) -> Option<HomeServiceOfferSummary> {
+    let id = home_configured_remote_exit_id(exit, index)?;
+    let display_name = home_configured_remote_exit_display_name(&id);
+    Some(HomeServiceOfferSummary {
+        schema: "elastos.service.offer/v1".to_string(),
+        offer_id: format!("configured:remote-exit:{id}"),
+        service_uri: "elastos://exit/remote-carrier".to_string(),
+        service_kind: "remote_exit".to_string(),
+        display_name,
+        provider_uri: Some("elastos://exit/remote-carrier".to_string()),
+        provider_label: "Remote Exit".to_string(),
+        policy_summary: "Installed remote Exit grant. Browser can use it through Runtime without exposing private route tickets to apps.".to_string(),
+        status: "active".to_string(),
+        enabled: true,
+        grant_required: false,
+        grant_scope: "installed_remote_carrier_exit_grant".to_string(),
+        capsule_contract: "browser -> runtime capability -> installed remote Exit grant -> provider".to_string(),
+        source: "configured_remote_exit".to_string(),
+        runtime_contract: None,
+        contact_id: None,
+        capsule_hint: Some("browser".to_string()),
+        route: Some("/apps/browser/".to_string()),
+    })
+}
+
+fn home_configured_remote_exit_id(exit: &serde_json::Value, index: usize) -> Option<String> {
+    let raw = exit
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| exit.get("grant_id").and_then(serde_json::Value::as_str))
+        .unwrap_or("remote-carrier-exit");
+    let sanitized = raw
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == ':' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized.trim_matches('-').trim();
+    if sanitized.is_empty() || sanitized.len() > 128 {
+        return Some(format!("remote-carrier-exit-{index}"));
+    }
+    Some(sanitized.to_string())
+}
+
+fn home_configured_remote_exit_display_name(id: &str) -> String {
+    let label = id
+        .trim()
+        .replace(['-', '_', ':'], " ")
+        .split_whitespace()
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if label.is_empty() {
+        "Remote Browser Exit".to_string()
+    } else {
+        format!("{label} Browser Exit")
+    }
+}
+
+fn home_browser_engine_runtime_contract(
+    data_dir: &std::path::Path,
+) -> HomeServiceRuntimeContractSummary {
+    let mut display_modes = std::collections::BTreeSet::new();
+    let mut guarantee_levels = std::collections::BTreeSet::new();
+    let mut has_microvm = false;
+    let mut has_remote_operator_vm = false;
+    let mut has_policy_webview = false;
+    let mut has_operator_rbi = false;
+    let config_path = data_dir.join("config/browser-engine-adapter.json");
+
+    let config = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    if let Some(adapters) = config
+        .as_ref()
+        .and_then(|value| value.get("adapters"))
+        .and_then(|value| value.as_array())
+    {
+        for adapter in adapters {
+            if let Some(modes) = adapter
+                .get("display_modes")
+                .and_then(|value| value.as_array())
+            {
+                for mode in modes.iter().filter_map(|value| value.as_str()) {
+                    if home_browser_engine_supported_display_mode(mode) {
+                        display_modes.insert(mode.to_string());
+                    }
+                }
+            }
+            let kind = adapter.get("kind").and_then(|value| value.as_str());
+            match kind {
+                Some("chromium_microvm") => {
+                    has_microvm = true;
+                    guarantee_levels.insert("mechanism_microvm".to_string());
+                    if browser_engine_adapter_uses_remote_vm_launcher(adapter) {
+                        has_remote_operator_vm = true;
+                    }
+                }
+                Some("cef") | Some("webview2") | Some("geckoview") | Some("wkwebview") => {
+                    has_policy_webview = true;
+                    guarantee_levels.insert("policy_webview".to_string());
+                }
+                Some("selkies_gstreamer")
+                | Some("hosted_remote_browser")
+                | Some("chromium_headless")
+                | Some("contract_proof") => {
+                    has_operator_rbi = true;
+                    guarantee_levels.insert("operator_rbi".to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let backing_substrate = if has_remote_operator_vm {
+        "remote_operator_vm"
+    } else if has_microvm {
+        "local_microvm"
+    } else if has_policy_webview {
+        "host_policy_webview"
+    } else if has_operator_rbi {
+        "operator_rbi"
+    } else if config_path.is_file() {
+        "configured_provider"
+    } else {
+        "installed_provider"
+    };
+
+    HomeServiceRuntimeContractSummary {
+        schema: "elastos.service.runtime-contract/v1".to_string(),
+        backing_substrate: backing_substrate.to_string(),
+        supported_display_modes: display_modes.into_iter().collect(),
+        supported_guarantee_levels: guarantee_levels.into_iter().collect(),
+        direct_network: false,
+        wallet_injection: false,
+    }
+}
+
+fn home_browser_engine_supported_display_mode(mode: &str) -> bool {
+    matches!(mode, "webrtc_remote_display" | "native_surface")
+}
+
+fn browser_engine_adapter_uses_remote_vm_launcher(adapter: &serde_json::Value) -> bool {
+    let launcher = adapter
+        .get("supervisor")
+        .and_then(|value| value.get("env"))
+        .and_then(|value| value.get("ELASTOS_BROWSER_VM_CONTROL_LAUNCHER"))
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            adapter
+                .get("supervisor")
+                .and_then(|value| value.get("program"))
+                .and_then(|value| value.as_str())
+        })
+        .unwrap_or_default();
+    std::path::Path::new(launcher)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|name| name.starts_with("browser-vm-remote-vz-launcher"))
+        .unwrap_or(false)
+}
+
+fn home_local_service_offers(
+    data_dir: &std::path::Path,
+    room_summary: &crate::room_service::RoomSummary,
+) -> Vec<HomeServiceOfferSummary> {
+    let mut offers = Vec::new();
+    let conversation_status = if room_summary.local_runtime_did.is_none() {
+        "identity_required"
+    } else if room_summary.browser_access_allowed {
+        "available"
+    } else {
+        "blocked"
+    };
+    let conversation_policy = room_summary
+        .browser_access_block_reason
+        .clone()
+        .unwrap_or_else(|| "Your Runtime can host trusted People conversations; guests still need invite approval and Chat capability.".to_string());
+    offers.push(HomeServiceOfferSummary {
+        schema: "elastos.service.offer/v1".to_string(),
+        offer_id: "local:carrier:conversation-host".to_string(),
+        service_uri: "elastos://carrier/conversation".to_string(),
+        service_kind: "conversation_host".to_string(),
+        display_name: "Conversation hosting".to_string(),
+        provider_uri: Some("elastos://carrier/room".to_string()),
+        provider_label: "Conversation provider".to_string(),
+        policy_summary: conversation_policy,
+        status: conversation_status.to_string(),
+        enabled: room_summary.local_runtime_did.is_some() && room_summary.browser_access_allowed,
+        grant_required: true,
+        grant_scope: "room.access".to_string(),
+        capsule_contract: "chat-room -> room.access -> conversation provider".to_string(),
+        source: "local_runtime".to_string(),
+        runtime_contract: None,
+        contact_id: None,
+        capsule_hint: Some(CHAT_ROOM_CAPSULE_ID.to_string()),
+        route: Some(format!("/apps/{CHAT_ROOM_CAPSULE_ID}/")),
+    });
+    if data_dir.join("config/exit-provider.json").is_file() {
+        offers.push(HomeServiceOfferSummary {
+            schema: "elastos.service.offer/v1".to_string(),
+            offer_id: "local:provider:browser-exit".to_string(),
+            service_uri: "elastos://exit/browser".to_string(),
+            service_kind: "remote_exit".to_string(),
+            display_name: "Browser Exit node".to_string(),
+            provider_uri: Some("elastos://exit/*".to_string()),
+            provider_label: "Exit provider".to_string(),
+            policy_summary: "Can be offered to trusted people; Exit provider enforces destination policy, quotas, audit, and principal-scoped grants.".to_string(),
+            status: "configured".to_string(),
+            enabled: true,
+            grant_required: true,
+            grant_scope: "principal_scoped_exit_grant".to_string(),
+            capsule_contract: "browser -> net capability -> exit grant -> Exit provider".to_string(),
+            source: "local_provider".to_string(),
+            runtime_contract: None,
+            contact_id: None,
+            capsule_hint: Some("browser".to_string()),
+            route: None,
+        });
+    }
+    if data_dir
+        .join("config/browser-engine-adapter.json")
+        .is_file()
+        || data_dir.join("bin/browser-engine-adapter").is_file()
+    {
+        let runtime_contract = home_browser_engine_runtime_contract(data_dir);
+        let policy_summary = match runtime_contract.backing_substrate.as_str() {
+            "remote_operator_vm" => "Delegates Browser pages to an approved remote VM provider through a local Runtime-facing control socket; provider enforces display/input/stream receipts and no direct network or wallet authority.",
+            "local_microvm" => "Runs isolated Browser pages through a local VM substrate and Runtime-mediated Exit streams; provider enforces display/input/stream receipts and no direct network or wallet authority.",
+            _ => "Runs Browser pages only through the Browser Engine Adapter contract; provider must prove display/input/stream receipts and no direct network or wallet authority.",
+        };
+        offers.push(HomeServiceOfferSummary {
+            schema: "elastos.service.offer/v1".to_string(),
+            offer_id: "local:provider:browser-engine".to_string(),
+            service_uri: "elastos://browser-engine/launch".to_string(),
+            service_kind: "browser_engine".to_string(),
+            display_name: "Browser Engine".to_string(),
+            provider_uri: Some("elastos://browser-engine/*".to_string()),
+            provider_label: "Browser Engine Adapter".to_string(),
+            policy_summary: policy_summary.to_string(),
+            status: "configured".to_string(),
+            enabled: true,
+            grant_required: true,
+            grant_scope: "principal_scoped_browser_engine_grant".to_string(),
+            capsule_contract: "browser -> browser-engine capability -> Browser Engine Adapter"
+                .to_string(),
+            source: "local_provider".to_string(),
+            runtime_contract: Some(runtime_contract),
+            contact_id: None,
+            capsule_hint: Some("browser".to_string()),
+            route: Some("/apps/browser/".to_string()),
+        });
+    }
+    if data_dir.join("bin/ipfs-provider").is_file() {
+        offers.push(HomeServiceOfferSummary {
+            schema: "elastos.service.offer/v1".to_string(),
+            offer_id: "local:provider:content-availability".to_string(),
+            service_uri: "elastos://content/availability".to_string(),
+            service_kind: "content_availability".to_string(),
+            display_name: "Content availability".to_string(),
+            provider_uri: Some("elastos://content/*".to_string()),
+            provider_label: "Content provider / IPFS backend".to_string(),
+            policy_summary: "Pins and republishes selected content through provider-owned availability policy; capsules use content grants instead of raw IPFS authority.".to_string(),
+            status: "configured".to_string(),
+            enabled: true,
+            grant_required: true,
+            grant_scope: "principal_scoped_content_grant".to_string(),
+            capsule_contract: "capsule -> content capability -> availability provider -> ipfs-provider".to_string(),
+            source: "local_provider".to_string(),
+            runtime_contract: None,
+            contact_id: None,
+            capsule_hint: Some(LIBRARY_CAPSULE_ID.to_string()),
+            route: Some(format!("/apps/{LIBRARY_CAPSULE_ID}/")),
+        });
+    }
+    if data_dir.join("bin/object-provider").is_file() {
+        offers.push(HomeServiceOfferSummary {
+            schema: "elastos.service.offer/v1".to_string(),
+            offer_id: "local:provider:object-storage".to_string(),
+            service_uri: "elastos://object/storage".to_string(),
+            service_kind: "object_storage".to_string(),
+            display_name: "Object storage".to_string(),
+            provider_uri: Some("elastos://object/*".to_string()),
+            provider_label: "Object provider".to_string(),
+            policy_summary: "Can back spaces and shares; Object provider enforces namespace grants before capsules read or write.".to_string(),
+            status: "configured".to_string(),
+            enabled: true,
+            grant_required: true,
+            grant_scope: "principal_scoped_object_grant".to_string(),
+            capsule_contract: "capsule -> object capability -> Object provider".to_string(),
+            source: "local_provider".to_string(),
+            runtime_contract: None,
+            contact_id: None,
+            capsule_hint: Some(LIBRARY_CAPSULE_ID.to_string()),
+            route: Some(format!("/apps/{LIBRARY_CAPSULE_ID}/")),
+        });
+    }
+    if data_dir.join("bin/webspace-provider").is_file() {
+        offers.push(HomeServiceOfferSummary {
+            schema: "elastos.service.offer/v1".to_string(),
+            offer_id: "local:provider:webspace-hosting".to_string(),
+            service_uri: "elastos://site/hosting".to_string(),
+            service_kind: "webspace_hosting".to_string(),
+            display_name: "Webspace hosting".to_string(),
+            provider_uri: Some("elastos://webspace/*".to_string()),
+            provider_label: "Webspace provider".to_string(),
+            policy_summary: "Can publish selected site objects; Webspace provider enforces release, quota, and publication grants.".to_string(),
+            status: "configured".to_string(),
+            enabled: true,
+            grant_required: true,
+            grant_scope: "principal_scoped_webspace_grant".to_string(),
+            capsule_contract: "capsule -> publish capability -> Webspace provider".to_string(),
+            source: "local_provider".to_string(),
+            runtime_contract: None,
+            contact_id: None,
+            capsule_hint: None,
+            route: None,
+        });
+    }
+    offers
+}
+
+fn home_profile_card_from_room_profile(
+    card: crate::room_service::RoomProfileCardView,
+) -> HomeProfileCardSummary {
+    HomeProfileCardSummary {
+        schema: card.schema,
+        profile_id: card.profile_id,
+        display_name: card.display_name,
+        handle: card.handle,
+        updated_at: card.updated_at,
+    }
+}
+
+pub(super) fn home_people_contact_id(member_did: &str) -> String {
+    let digest = Sha256::digest(format!("elastos.people.contact.v1:{member_did}").as_bytes());
+    format!("contact:{}", hex::encode(&digest[..12]))
+}
+
+fn home_people_fallback_display_name(role: &crate::room_service::RoomRole, index: usize) -> String {
+    match role {
+        crate::room_service::RoomRole::Owner => "Conversation host".to_string(),
+        crate::room_service::RoomRole::Admin => "Conversation manager".to_string(),
+        crate::room_service::RoomRole::Member => format!("Conversation member {}", index + 1),
     }
 }
 
@@ -999,4 +1538,39 @@ async fn home_list_runtime_capsules(
         .collect::<Vec<_>>();
     names.sort();
     Ok(names)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_home_launch_token_drops_reserved_query_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = local_home_launch_token_context(dir.path()).unwrap();
+        let mut query = BTreeMap::new();
+        query.insert("home_token".to_string(), "attacker".to_string());
+        query.insert("capsule".to_string(), "documents".to_string());
+
+        let route = append_home_launch_token(
+            dir.path(),
+            "/apps/documents/",
+            "documents",
+            &query,
+            &context,
+        )
+        .unwrap();
+        let parsed = url::Url::parse(&format!("http://localhost{route}")).unwrap();
+        let query_pairs = parsed.query_pairs().collect::<Vec<_>>();
+        let home_tokens = query_pairs
+            .iter()
+            .filter(|(key, _)| key == "home_token")
+            .collect::<Vec<_>>();
+
+        assert_eq!(home_tokens.len(), 1);
+        assert_ne!(home_tokens[0].1.as_ref(), "attacker");
+        assert!(query_pairs
+            .iter()
+            .any(|(key, value)| key == "capsule" && value == "documents"));
+    }
 }

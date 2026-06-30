@@ -917,7 +917,13 @@ fn reject_forbidden_protected_content_fields(value: &Value) -> anyhow::Result<()
         "wallet_rpc",
         "chain_rpc",
         "kubo_api",
+        "kubo_api_url",
+        "ipfs_api",
+        "ipfs_api_url",
         "elacity_sdk",
+        "elacity_sdk_token",
+        "contract_sdk",
+        "key_backend_sdk",
     ];
     let mut stack = vec![value];
     while let Some(value) = stack.pop() {
@@ -6866,5 +6872,166 @@ mod tests {
         assert!(schemes.contains(&"object"));
         assert!(!schemes.contains(&"library"));
         assert_eq!(provider.name(), "object-provider");
+    }
+
+    #[test]
+    fn protected_content_provider_response_rejects_authority_fields() {
+        let forbidden = [
+            "raw_cek",
+            "wallet_rpc",
+            "chain_rpc",
+            "kubo_api",
+            "ipfs_api",
+            "elacity_sdk",
+            "elacity_sdk_token",
+            "contract_sdk",
+            "key_backend_sdk",
+        ];
+        for key in forbidden {
+            let value = json!({
+                "schema": "elastos.test/v1",
+                "nested": [{ key: "must-not-cross-boundary" }]
+            });
+            assert!(
+                reject_forbidden_protected_content_fields(&value).is_err(),
+                "{key} must be rejected before app/viewer handoff"
+            );
+        }
+
+        assert!(reject_forbidden_protected_content_fields(&json!({
+            "schema": "elastos.decrypt.session/v1",
+            "output": "viewer_capsule_session:fixture"
+        }))
+        .is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ELASTOS_LIVE_IPFS_PROVIDER_BIN and ELASTOS_LIVE_IPFS_DATA_DIR"]
+    async fn library_live_ipfs_publish_provider_route_smoke() {
+        let Ok(ipfs_provider_bin) = std::env::var("ELASTOS_LIVE_IPFS_PROVIDER_BIN") else {
+            eprintln!("skipping live Library publish smoke: ELASTOS_LIVE_IPFS_PROVIDER_BIN unset");
+            return;
+        };
+        let Ok(ipfs_data_dir) = std::env::var("ELASTOS_LIVE_IPFS_DATA_DIR") else {
+            eprintln!("skipping live Library publish smoke: ELASTOS_LIVE_IPFS_DATA_DIR unset");
+            return;
+        };
+        let ipfs_provider_bin = PathBuf::from(ipfs_provider_bin);
+        let ipfs_data_dir = PathBuf::from(ipfs_data_dir);
+        assert!(
+            ipfs_provider_bin.is_file(),
+            "ipfs-provider missing: {}",
+            ipfs_provider_bin.display()
+        );
+        assert!(
+            ipfs_data_dir.is_dir(),
+            "IPFS data dir missing: {}",
+            ipfs_data_dir.display()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let ipfs_config = elastos_runtime::provider::BridgeProviderConfig {
+            base_path: ipfs_data_dir.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let bridge = Arc::new(
+            elastos_runtime::provider::ProviderBridge::spawn(&ipfs_provider_bin, ipfs_config)
+                .await
+                .expect("spawn live ipfs-provider"),
+        );
+        let ipfs_provider: Arc<dyn Provider> = Arc::new(
+            elastos_runtime::provider::CapsuleProvider::with_scheme(Arc::clone(&bridge), "ipfs"),
+        );
+        registry
+            .register_sub_provider("ipfs", ipfs_provider)
+            .await
+            .unwrap();
+        let content_provider = Arc::new(crate::content::ContentProvider::new(
+            dir.path().to_path_buf(),
+            Arc::downgrade(&registry),
+        ));
+        registry.register(content_provider.clone()).await;
+        registry
+            .register_sub_provider("content", content_provider)
+            .await
+            .unwrap();
+
+        let principal_id = "did:key:z6MklibraryLiveIpfsSmoke";
+        let roots = handle_object_provider_runtime_request(
+            dir.path(),
+            Arc::clone(&registry),
+            &json!({
+                "op": "roots",
+                "principal_id": principal_id,
+            }),
+        )
+        .await;
+        assert_eq!(roots["status"], "ok", "{roots}");
+        let public_uri = roots["data"]["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|root| root["id"] == "public")
+            .and_then(|root| root["uri"].as_str())
+            .expect("public Library root")
+            .to_string();
+
+        let body = format!("Library live IPFS provider route smoke {}\n", now_ts());
+        let file_uri = format!("{public_uri}/library-live-ipfs-provider-smoke.txt");
+        let write = handle_object_provider_runtime_request(
+            dir.path(),
+            Arc::clone(&registry),
+            &json!({
+                "op": "write",
+                "principal_id": principal_id,
+                "uri": file_uri,
+                "mime": "text/plain",
+                "data": base64::engine::general_purpose::STANDARD.encode(body.as_bytes()),
+            }),
+        )
+        .await;
+        assert_eq!(write["status"], "ok", "{write}");
+        let revision = write["data"]["object"]["revision"]
+            .as_str()
+            .expect("write revision")
+            .to_string();
+
+        let publish = handle_object_provider_runtime_request(
+            dir.path(),
+            Arc::clone(&registry),
+            &json!({
+                "op": "publish",
+                "principal_id": principal_id,
+                "uri": file_uri,
+                "if_revision": revision,
+            }),
+        )
+        .await;
+        assert_eq!(publish["status"], "ok", "{publish}");
+        let cid = publish["data"]["cid"].as_str().expect("publish cid");
+        assert!(!cid.trim().is_empty());
+        assert_eq!(publish["data"]["uri"], format!("elastos://{cid}"));
+        assert_eq!(publish["data"]["availability"]["status"], "local_pinned");
+        assert_eq!(publish["data"]["object"]["published_cid"], cid);
+
+        let status = handle_object_provider_runtime_request(
+            dir.path(),
+            Arc::clone(&registry),
+            &json!({
+                "op": "status",
+                "principal_id": principal_id,
+                "uri": file_uri,
+            }),
+        )
+        .await;
+        assert_eq!(status["status"], "ok", "{status}");
+        assert_eq!(status["data"]["published"]["cid"], cid);
+
+        bridge
+            .shutdown()
+            .await
+            .expect("shutdown live ipfs-provider");
+        println!("library live IPFS provider route cid={cid}");
     }
 }

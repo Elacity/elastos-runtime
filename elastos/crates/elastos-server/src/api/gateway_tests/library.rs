@@ -724,6 +724,47 @@ async fn test_library_provider_rejects_unknown_operation() {
 }
 
 #[tokio::test]
+async fn test_gateway_provider_proxy_rejects_predeclared_runtime_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let token = issue_home_launch_token(dir.path(), LIBRARY_CAPSULE_ID).unwrap();
+
+    for reserved in [
+        "_runtime_invocation",
+        "_runtime_transfer",
+        "connect_ticket",
+        "carrier_route",
+        "carrier",
+    ] {
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/provider/object/roots")
+                    .header("x-elastos-home-token", token.clone())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            reserved: { "schema": "spoofed" }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(rejected.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let message = String::from_utf8(body.to_vec()).unwrap();
+        assert!(message.contains("provider request must not predeclare Runtime metadata field"));
+        assert!(message.contains(reserved));
+    }
+}
+
+#[tokio::test]
 async fn test_library_provider_object_lifecycle() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(library_test_state(dir.path()).await);

@@ -7,12 +7,12 @@
   "role": "provider",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
-  "provides": "operator-drive-adapter://*",
+  "provides": "elastos://operator-drive-adapter/*",
   "authority": {
     "reason": "Attaches an operator-managed resolver namespace to localhost://WebSpaces without exposing resolver credentials, host paths, or raw backend APIs to app capsules.",
     "capabilities": [
       {
-        "resource": "operator-drive-adapter://*",
+        "resource": "elastos://operator-drive-adapter/*",
         "actions": ["read", "write"],
         "operations": ["status", "metadata_index", "read_bytes", "write_bytes"]
       }

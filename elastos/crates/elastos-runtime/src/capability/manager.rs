@@ -25,6 +25,7 @@ pub enum ValidationError {
     TokenExpired,
     FutureDatedToken,
     UseLimitExceeded { current: u32, max: u32 },
+    ClassificationUnavailable { token: u8 },
     ClassificationExceeded { token: u8, resource: u8 },
     InvalidVersion { expected: u8, got: u8 },
     DelegationNotAllowed,
@@ -50,6 +51,13 @@ impl std::fmt::Display for ValidationError {
             Self::FutureDatedToken => write!(f, "token issued_at is in the future"),
             Self::UseLimitExceeded { current, max } => {
                 write!(f, "use limit exceeded: {} >= {}", current, max)
+            }
+            Self::ClassificationUnavailable { token } => {
+                write!(
+                    f,
+                    "resource classification required for token capped at {}",
+                    token
+                )
             }
             Self::ClassificationExceeded { token, resource } => {
                 write!(
@@ -359,27 +367,37 @@ impl CapabilityManager {
             }
         }
 
-        // 11. Use count verification (if limited) — atomic check-and-increment
+        // 11. Classification verification. A token that carries a classification
+        // ceiling must only be evaluated against an explicitly classified resource.
+        match (
+            token.constraints.max_classification,
+            resource_classification,
+        ) {
+            (Some(token_max), Some(resource_class)) if token_max < resource_class => {
+                self.audit_validation_failure(token, caller_capsule_id, "classification_exceeded");
+                return Err(ValidationError::ClassificationExceeded {
+                    token: token_max,
+                    resource: resource_class,
+                });
+            }
+            (Some(token_max), None) => {
+                self.audit_validation_failure(
+                    token,
+                    caller_capsule_id,
+                    "classification_unavailable",
+                );
+                return Err(ValidationError::ClassificationUnavailable { token: token_max });
+            }
+            _ => {}
+        }
+
+        // 12. Use count verification (if limited) — atomic check-and-increment
         if let Some(max_uses) = token.constraints.max_uses {
             if let Err(current) = self.store.try_use_token(&token.id, max_uses).await {
                 self.audit_validation_failure(token, caller_capsule_id, "use_limit_exceeded");
                 return Err(ValidationError::UseLimitExceeded {
                     current,
                     max: max_uses,
-                });
-            }
-        }
-
-        // 12. Classification verification (if specified)
-        if let (Some(token_max), Some(resource_class)) = (
-            token.constraints.max_classification,
-            resource_classification,
-        ) {
-            if token_max < resource_class {
-                self.audit_validation_failure(token, caller_capsule_id, "classification_exceeded");
-                return Err(ValidationError::ClassificationExceeded {
-                    token: token_max,
-                    resource: resource_class,
                 });
             }
         }
@@ -852,6 +870,92 @@ mod tests {
         assert!(matches!(
             result,
             Err(ValidationError::ClassificationExceeded { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_classification_ceiling_requires_resource_classification() {
+        let manager = create_test_manager();
+
+        let token = manager.grant(
+            "test-capsule",
+            ResourceId::new("localhost://Users/self/Documents/test.txt"),
+            Action::Read,
+            TokenConstraints {
+                max_classification: Some(2),
+                ..Default::default()
+            },
+            None,
+        );
+
+        let result = manager
+            .validate(
+                &token,
+                "test-capsule",
+                Action::Read,
+                &ResourceId::new("localhost://Users/self/Documents/test.txt"),
+                None,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ValidationError::ClassificationUnavailable { token: 2 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_classification_failure_does_not_consume_limited_token() {
+        let manager = create_test_manager();
+
+        let token = manager.grant(
+            "test-capsule",
+            ResourceId::new("localhost://Users/self/Documents/test.txt"),
+            Action::Read,
+            TokenConstraints {
+                max_classification: Some(2),
+                max_uses: Some(1),
+                ..Default::default()
+            },
+            None,
+        );
+
+        let missing_classification = manager
+            .validate(
+                &token,
+                "test-capsule",
+                Action::Read,
+                &ResourceId::new("localhost://Users/self/Documents/test.txt"),
+                None,
+            )
+            .await;
+        assert!(matches!(
+            missing_classification,
+            Err(ValidationError::ClassificationUnavailable { .. })
+        ));
+
+        assert!(manager
+            .validate(
+                &token,
+                "test-capsule",
+                Action::Read,
+                &ResourceId::new("localhost://Users/self/Documents/test.txt"),
+                Some(1),
+            )
+            .await
+            .is_ok());
+
+        let exhausted = manager
+            .validate(
+                &token,
+                "test-capsule",
+                Action::Read,
+                &ResourceId::new("localhost://Users/self/Documents/test.txt"),
+                Some(1),
+            )
+            .await;
+        assert!(matches!(
+            exhausted,
+            Err(ValidationError::UseLimitExceeded { .. })
         ));
     }
 

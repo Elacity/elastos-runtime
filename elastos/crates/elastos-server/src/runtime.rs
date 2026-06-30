@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use elastos_common::{CapsuleManifest, CapsuleType, ElastosError, Result};
-use elastos_compute::providers::{BridgeSpawner, WasmProvider};
+use elastos_compute::providers::{BridgeHostcall, BridgeSpawner, WasmProvider};
 use elastos_compute::{CapsuleHandle, ComputeProvider};
 use elastos_storage::StorageProvider;
 
@@ -37,6 +37,9 @@ pub struct Runtime {
     compute_providers: Vec<Arc<dyn ComputeProvider>>,
     /// Signature verifier for capsule integrity
     signature_verifier: RwLock<SignatureVerifier>,
+    /// Dev/source mode allows unsigned local capsules. Release paths should set
+    /// this false and configure trusted keys.
+    signature_dev_mode: RwLock<bool>,
     /// Provider registry (optional, set when server mode is active)
     provider_registry: RwLock<Option<Arc<ProviderRegistry>>>,
     /// Registry of running capsules (for API queries)
@@ -52,6 +55,7 @@ impl Runtime {
             _storage: storage,
             compute_providers: vec![compute],
             signature_verifier: RwLock::new(SignatureVerifier::new()),
+            signature_dev_mode: RwLock::new(false),
             provider_registry: RwLock::new(None),
             running_capsules: RwLock::new(HashMap::new()),
             wasm_provider: None,
@@ -69,6 +73,7 @@ impl Runtime {
             _storage: storage,
             compute_providers,
             signature_verifier: RwLock::new(SignatureVerifier::new()),
+            signature_dev_mode: RwLock::new(false),
             provider_registry: RwLock::new(None),
             running_capsules: RwLock::new(HashMap::new()),
             wasm_provider,
@@ -92,6 +97,7 @@ impl Runtime {
             let reg = registry.clone();
             let cap_mgr = capability_manager.clone();
             let pending = pending_store.clone();
+            let bridge_data_dir = data_dir.clone();
             wasm.set_bridge_spawner(Arc::new(move |pipes| {
                 let ctx = crate::carrier_bridge::BridgeContext {
                     provider_registry: reg.clone(),
@@ -99,11 +105,33 @@ impl Runtime {
                     pending_store: pending.clone(),
                     capsule_id: pipes.capsule_id.clone(),
                     principal_id: pipes.principal_id.clone(),
-                    data_dir: Some(data_dir.clone()),
+                    data_dir: Some(bridge_data_dir.clone()),
                 };
                 crate::carrier_bridge::spawn_wasm_carrier_bridge(pipes, ctx);
             }));
-            tracing::info!("WASM Carrier bridge configured (real token minting)");
+
+            let host_reg = registry.clone();
+            let host_cap_mgr = capability_manager.clone();
+            let host_pending = pending_store.clone();
+            let host_data_dir = data_dir.clone();
+            let host_handle = tokio::runtime::Handle::current();
+            wasm.set_bridge_hostcall(Arc::new(move |line, capsule_id, principal_id| {
+                let ctx = crate::carrier_bridge::BridgeContext {
+                    provider_registry: host_reg.clone(),
+                    capability_manager: host_cap_mgr.clone(),
+                    pending_store: host_pending.clone(),
+                    capsule_id: capsule_id.to_string(),
+                    principal_id: principal_id.map(ToOwned::to_owned),
+                    data_dir: Some(host_data_dir.clone()),
+                };
+                let response = host_handle
+                    .block_on(crate::carrier_bridge::handle_wasm_carrier_request(
+                        line, ctx,
+                    ))
+                    .map_err(|err| err.to_string())?;
+                serde_json::to_string(&response).map_err(|err| err.to_string())
+            }));
+            tracing::info!("WASM Carrier bridge configured (hostcall + FIFO fallback)");
         }
 
         let mut guard = self.provider_registry.write().await;
@@ -121,6 +149,16 @@ impl Runtime {
         }
     }
 
+    /// Override the default WASM carrier host-call handler.
+    ///
+    /// Used by attached-runtime WASM execution to route guest calls
+    /// through the already-running local runtime API.
+    pub fn set_wasm_bridge_hostcall(&self, hostcall: BridgeHostcall) {
+        if let Some(ref wasm) = self.wasm_provider {
+            wasm.set_bridge_hostcall(hostcall);
+        }
+    }
+
     /// Find a compute provider that supports the given capsule type
     fn get_provider(&self, capsule_type: &CapsuleType) -> Option<&Arc<dyn ComputeProvider>> {
         self.compute_providers
@@ -131,6 +169,45 @@ impl Runtime {
     /// Get mutable access to the signature verifier for configuration
     pub async fn signature_verifier(&self) -> tokio::sync::RwLockWriteGuard<'_, SignatureVerifier> {
         self.signature_verifier.write().await
+    }
+
+    /// Configure capsule manifest signature verification from runtime config.
+    ///
+    /// `dev_mode=true` is the source-home/dev escape hatch for unsigned local
+    /// capsules. With `dev_mode=false`, at least one trusted key is required
+    /// and unsigned capsules fail closed.
+    pub async fn configure_signature_verification(
+        &self,
+        trusted_keys: &[String],
+        dev_mode: bool,
+    ) -> Result<()> {
+        let mut verifier = SignatureVerifier::new();
+        for key in trusted_keys {
+            verifier.add_trusted_key_hex(key)?;
+        }
+
+        if !dev_mode && !verifier.is_enabled() {
+            return Err(ElastosError::InvalidManifest(
+                "Capsule signature enforcement requires trusted_keys; set dev_mode = true for source-home/dev unsigned capsules".into(),
+            ));
+        }
+
+        let trusted_key_count = verifier.trusted_key_count();
+        *self.signature_verifier.write().await = verifier;
+        *self.signature_dev_mode.write().await = dev_mode;
+
+        if dev_mode {
+            tracing::warn!(
+                "Capsule signature verification running in dev_mode=true; unsigned local capsules are allowed"
+            );
+        } else {
+            tracing::info!(
+                "Capsule signature verification enforced with {} trusted key(s)",
+                trusted_key_count
+            );
+        }
+
+        Ok(())
     }
 
     /// Load and run a capsule from a local directory
@@ -245,16 +322,25 @@ impl Runtime {
     ) -> Result<()> {
         let verifier = self.signature_verifier.read().await;
 
-        // If no trusted keys configured, skip verification (development mode)
-        if !verifier.is_enabled() {
-            tracing::warn!("Signature verification skipped (no trusted keys configured)");
-            return Ok(());
+        let dev_mode = *self.signature_dev_mode.read().await;
+
+        if manifest.signature.is_none() {
+            if dev_mode {
+                tracing::warn!(
+                    "Unsigned capsule '{}' allowed because dev_mode=true",
+                    manifest.name
+                );
+                return Ok(());
+            }
+
+            return Err(ElastosError::InvalidManifest(
+                "Capsule is unsigned and dev_mode=false".into(),
+            ));
         }
 
-        // If verification is enabled, capsule must be signed
-        if manifest.signature.is_none() {
+        if !verifier.is_enabled() {
             return Err(ElastosError::InvalidManifest(
-                "Capsule is unsigned but signature verification is enabled".into(),
+                "Capsule signature verification has no trusted keys configured".into(),
             ));
         }
 
@@ -374,5 +460,128 @@ impl Runtime {
         self.unregister_capsule(id).await;
 
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use elastos_common::{
+        CapsuleId, CapsuleManifest, CapsuleRole, CapsuleStatus, CapsuleType, Permissions,
+        ResourceLimits, SCHEMA_V1,
+    };
+    use elastos_compute::{CapsuleInfo, ComputeProvider};
+    use elastos_storage::providers::LocalFSProvider;
+
+    struct NoopComputeProvider;
+
+    #[async_trait]
+    impl ComputeProvider for NoopComputeProvider {
+        async fn load(&self, _path: &Path, manifest: CapsuleManifest) -> Result<CapsuleHandle> {
+            Ok(CapsuleHandle {
+                id: CapsuleId::new("test-capsule"),
+                manifest,
+                args: Vec::new(),
+            })
+        }
+
+        async fn start(&self, _handle: &CapsuleHandle) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stop(&self, _handle: &CapsuleHandle) -> Result<()> {
+            Ok(())
+        }
+
+        async fn status(&self, _handle: &CapsuleHandle) -> Result<CapsuleStatus> {
+            Ok(CapsuleStatus::Running)
+        }
+
+        async fn info(&self, handle: &CapsuleHandle) -> Result<CapsuleInfo> {
+            Ok(CapsuleInfo {
+                id: handle.id.clone(),
+                name: handle.manifest.name.clone(),
+                status: CapsuleStatus::Running,
+                memory_used_mb: 0,
+            })
+        }
+
+        fn supports(&self, _capsule_type: &CapsuleType) -> bool {
+            true
+        }
+    }
+
+    async fn test_runtime() -> (Runtime, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(
+            LocalFSProvider::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let compute = Arc::new(NoopComputeProvider);
+        (Runtime::new(storage, compute), temp_dir)
+    }
+
+    fn unsigned_manifest() -> CapsuleManifest {
+        CapsuleManifest {
+            schema: SCHEMA_V1.to_string(),
+            version: "0.1.0".to_string(),
+            name: "unsigned-test".to_string(),
+            description: None,
+            author: None,
+            role: CapsuleRole::App,
+            capsule_type: CapsuleType::Wasm,
+            entrypoint: "app.wasm".to_string(),
+            requires: Vec::new(),
+            provides: None,
+            authority: None,
+            capabilities: Vec::new(),
+            interfaces: Vec::new(),
+            resources: ResourceLimits::default(),
+            permissions: Permissions::default(),
+            microvm: None,
+            providers: None,
+            viewer: None,
+            signature: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_signature_mode_requires_trusted_keys() {
+        let (runtime, _temp_dir) = test_runtime().await;
+
+        let err = runtime
+            .configure_signature_verification(&[], false)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("requires trusted_keys"));
+    }
+
+    #[tokio::test]
+    async fn dev_signature_mode_allows_unsigned_capsules() {
+        let (runtime, temp_dir) = test_runtime().await;
+        runtime
+            .configure_signature_verification(&[], true)
+            .await
+            .unwrap();
+
+        runtime
+            .verify_capsule_signature(&unsigned_manifest(), temp_dir.path())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn strict_signature_mode_rejects_unsigned_capsules() {
+        let (runtime, temp_dir) = test_runtime().await;
+
+        let err = runtime
+            .verify_capsule_signature(&unsigned_manifest(), temp_dir.path())
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("dev_mode=false"));
     }
 }
