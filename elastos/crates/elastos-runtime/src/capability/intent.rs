@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 
 use crate::capability::receipt::AffordanceGrantReceiptV1;
 use crate::capability::token::CapabilityToken;
-use crate::primitives::audit::AuditEvent;
+use crate::primitives::audit::{AuditError, AuditEvent, AuditLog};
 use crate::primitives::time::SecureTimestamp;
 
 /// Schema tag for the v1 intent declaration.
@@ -452,6 +452,78 @@ pub fn intent_reconciled_event(
     }
 }
 
+// ─────────────────────────── The enforcement gate (chunk 4) ───────────────────
+// The orchestrator that RUNS the loop: declare → verify → [abort | act → reconcile],
+// fail-closed. This is the reusable enforcement unit a STANDING-GRANT dispatch mode calls
+// to run an agent act unsupervised. It is deliberately NOT wired into the live per-act
+// carrier path: that path already enforces via validate-and-consume (single-use consent),
+// so re-checking an envelope derived from the very token that authorized the act would be
+// redundant. The gate belongs to the standing-grant mode (net-new dispatch); see
+// docs/INTENT_PROOF_LOOP.md.
+
+/// The result of running the intent gate over one act.
+#[derive(Debug)]
+pub enum IntentGateOutcome {
+    /// The declaration could not be recorded — the act was NOT run (custody is mandatory).
+    BlockedNoCustody(AuditError),
+    /// The intent fell outside its envelope — the act was NOT run (fail-closed).
+    Denied(EnvelopeDenial),
+    /// The act ran; here is the signed declared-vs-done reconciliation.
+    Acted(IntentReconciliationV1),
+}
+
+/// Run the intent-proof loop over a single agent act, fail-closed. The ORDER is the
+/// enforcement:
+///   1. record the declaration FIRST — if custody fails, the act never runs
+///      (`BlockedNoCustody`), because a custody chain is mandatory;
+///   2. verify `intent ⊆ envelope` — a denial aborts BEFORE the act (`Denied`, with the
+///      denial recorded on-chain);
+///   3. run `act` ONLY past the fail-closed gate;
+///   4. reconcile declared-vs-done and record the verdict (best-effort: the act already
+///      happened, so this emit cannot un-run it, but it is loud on failure).
+///
+/// `act` returns the act's signed receipt, or `None` if it did not act (⇒ an `Undelivered`
+/// reconciliation). The closure runs at most once and only in step 3.
+pub fn run_intent_gate<F>(
+    audit: &AuditLog,
+    signing_key: &SigningKey,
+    signer_pubkey: [u8; 32],
+    intent: &IntentDeclarationV1,
+    envelope: &StandingGrantEnvelope,
+    act: F,
+) -> IntentGateOutcome
+where
+    F: FnOnce() -> Option<AffordanceGrantReceiptV1>,
+{
+    // 1. Custody FIRST, fail-closed: no recorded declaration ⇒ no act.
+    if let Err(e) = audit.emit(intent_declared_event(intent)) {
+        return IntentGateOutcome::BlockedNoCustody(e);
+    }
+    // 2. Verify intent ⊆ envelope (fail-closed): a denial aborts before the act, recorded.
+    if let EnvelopeCheck::Denied(reason) = check_intent_within_envelope(intent, envelope) {
+        audit.emit_best_effort(intent_denied_event(intent, reason));
+        return IntentGateOutcome::Denied(reason);
+    }
+    // 3. The act runs ONLY past the fail-closed gate.
+    let receipt = act();
+    // 4. Reconcile declared-vs-done and record the verdict.
+    let (status, detail) = reconcile(intent, receipt.as_ref());
+    let receipt_id = receipt
+        .as_ref()
+        .map(|r| r.token_id.clone())
+        .unwrap_or_default();
+    let rec = IntentReconciliationV1::issue(
+        signing_key,
+        signer_pubkey,
+        &intent.intent_id,
+        &receipt_id,
+        status,
+        &detail,
+    );
+    audit.emit_best_effort(intent_reconciled_event(&rec, &intent.capsule));
+    IntentGateOutcome::Acted(rec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,6 +832,111 @@ mod tests {
             !detail.is_empty(),
             "undelivered is recorded with a reason, never silent"
         );
+    }
+
+    // ── Chunk 4: the enforcement gate (the act runs ONLY past a passing verify) ─
+
+    fn gate_log() -> (tempfile::TempDir, crate::primitives::audit::AuditLog) {
+        let dir = tempfile::tempdir().unwrap();
+        let log = crate::primitives::audit::AuditLog::with_file(dir.path().join("a.log")).unwrap();
+        (dir, log)
+    }
+
+    #[test]
+    fn the_gate_denies_outside_the_envelope_and_never_runs_the_act() {
+        let (_dir, log) = gate_log();
+        let sk = key();
+        let intent = an_intent(&sk, "delete", "h"); // method not in the envelope
+        let env = an_envelope(&["send"]);
+        let ran = std::cell::Cell::new(false);
+        let outcome = run_intent_gate(
+            &log,
+            &sk,
+            sk.verifying_key().to_bytes(),
+            &intent,
+            &env,
+            || {
+                ran.set(true);
+                Some(a_receipt(
+                    &sk,
+                    "vm-agent",
+                    "delete",
+                    "h",
+                    "elastos://mail/send",
+                    "execute",
+                ))
+            },
+        );
+        assert!(matches!(
+            outcome,
+            IntentGateOutcome::Denied(EnvelopeDenial::MethodNotInEnvelope)
+        ));
+        assert!(
+            !ran.get(),
+            "a denied intent must NEVER run the act (fail-closed enforcement)"
+        );
+        // declared + denied are both on-chain, and the chain verifies.
+        let att = log.chain_attestation().unwrap();
+        assert!(att.verified);
+        assert_eq!(att.records, 2, "declared + denied, no act");
+    }
+
+    #[test]
+    fn the_gate_runs_the_act_past_the_envelope_and_reconciles_matched() {
+        let (_dir, log) = gate_log();
+        let sk = key();
+        let intent = an_intent(&sk, "send", "args-abc");
+        let env = an_envelope(&["send"]);
+        let ran = std::cell::Cell::new(false);
+        let outcome = run_intent_gate(
+            &log,
+            &sk,
+            sk.verifying_key().to_bytes(),
+            &intent,
+            &env,
+            || {
+                ran.set(true);
+                Some(a_receipt(
+                    &sk,
+                    "vm-agent",
+                    "send",
+                    "args-abc",
+                    "elastos://mail/send",
+                    "execute",
+                ))
+            },
+        );
+        assert!(ran.get(), "an allowed intent runs the act");
+        match outcome {
+            IntentGateOutcome::Acted(rec) => assert_eq!(rec.status, ReconciliationStatus::Matched),
+            other => panic!("expected Acted(matched), got {other:?}"),
+        }
+        let att = log.chain_attestation().unwrap();
+        assert!(att.verified);
+        assert_eq!(att.records, 2, "declared + reconciled, no denial");
+    }
+
+    #[test]
+    fn the_gate_records_undelivered_when_the_act_does_not_act() {
+        let (_dir, log) = gate_log();
+        let sk = key();
+        let intent = an_intent(&sk, "send", "args-abc");
+        let env = an_envelope(&["send"]);
+        let outcome = run_intent_gate(
+            &log,
+            &sk,
+            sk.verifying_key().to_bytes(),
+            &intent,
+            &env,
+            || None,
+        );
+        match outcome {
+            IntentGateOutcome::Acted(rec) => {
+                assert_eq!(rec.status, ReconciliationStatus::Undelivered);
+                assert!(rec.receipt_id.is_empty(), "no receipt id when undelivered");
+            }
+            other => panic!("expected Acted(undelivered), got {other:?}"),
+        }
     }
 
     // ── Chunk 2: on-chain custody events ───────────────────────────────────────
