@@ -318,3 +318,23 @@ async fn discover_rejects_non_system_app() {
         "a non-System app must not reach discover"
     );
 }
+
+/// W5b browser-lane DEV MINT (sanctioned, run-gated): print a real, validator-accepted
+/// SYSTEM home-launch token for an EXISTING runtime data dir (signed by that runtime's
+/// own DID via `load_or_create_did`). It uses the validator's supported local path
+/// (`proof_binding_id: None`, so no live auth-session is required) — exactly what the
+/// gateway accepts at `require_home_launch_token_for_any_context`. This is NOT a product
+/// path: the shipped binary mints SYSTEM tokens ONLY via the passkey/wallet auth-grant
+/// flow (`issue_home_launch_token_for_auth_grant`); this `#[cfg(test)]` helper exists so
+/// a local browser confirmation can drive the home-token gateway without WebAuthn.
+/// Run:  ELASTOS_MINT_DATA_DIR=<data_dir> cargo test -p elastos-server \
+///         mint_system_home_token_for_existing_data_dir -- --ignored --nocapture
+#[tokio::test]
+#[ignore = "dev mint: requires ELASTOS_MINT_DATA_DIR pointing at a provisioned runtime data dir"]
+async fn mint_system_home_token_for_existing_data_dir() {
+    let dir = std::env::var("ELASTOS_MINT_DATA_DIR")
+        .expect("set ELASTOS_MINT_DATA_DIR to the runtime data dir to mint against");
+    let token = issue_home_launch_token(std::path::Path::new(&dir), SYSTEM_CAPSULE_ID)
+        .expect("mint SYSTEM home-launch token against the runtime DID");
+    println!("ELASTOS_SYSTEM_TOKEN={token}");
+}
