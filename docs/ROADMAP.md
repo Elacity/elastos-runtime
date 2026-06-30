@@ -172,14 +172,20 @@ halo a *computed* fact) → **W1** (egress-as-capability) → W3 → W4 → … 
   paths — serve, microVM-supervisor (`vm-{name}`), AND WASM (`runtime.rs`) — via the one shared meter, WITH
   provider-reported variable `cost_units`. Residual: the consent/affordance dispatch path (last unmetered
   act path) + per-principal/top-up policy (see READY_FOR_CURSOR).
-- **Intent-proof loop DESIGN DONE** (`docs/INTENT_PROOF_LOOP.md`): the prover/verifier loop for agent
+- **Intent-proof loop — CORE BUILT (`docs/INTENT_PROOF_LOOP.md`).** The prover/verifier loop for agent
   *actions* — declare intent → verify `intent ⊆ standing grant` (fail-closed) → act → record
-  declared-vs-done as a signed custody fact (`IntentDeclarationV1` / `IntentReconciliationV1`). Most of the
-  verifier substrate already ships (W2 binding + `canonical_input_hash` + `AffordanceGrantReceiptV1` + the
-  signed audit chain); the new surface is the intent record, the reconciliation record (Matched/Diverged/
-  Undelivered), and the standing-grant envelope that lets the loop run unsupervised. Verifies
-  containment+custody, NOT correctness of judgment. Full fail-closed branch matrix + test plan in the doc;
-  implementation is in-cloud (no hardware lane).
+  declared-vs-done as a signed custody fact. Verifies containment+custody, NOT correctness of judgment.
+  - **DONE (in-cloud, gated):** ch1 signed records + fail-closed verifier matrix; ch2 emit
+    declared/denied/reconciled onto the signed audit chain; ch3 `StandingGrantEnvelope::from_token` (derive
+    from a real `CapabilityToken`); ch4 `run_intent_gate` fail-closed orchestrator (the act runs ONLY past a
+    passing verify — proven by test); ch5 ESP `intentProofView` custody channel + `<CapsuleCustodyPanel>`
+    paint; ch5b runtime `count_intent_proof` + `AuditLog::intent_proof_summary` (presence-aware:
+    absent / clean / flagged).
+  - **REMAINING:** **5b-inspector** — wire `intent_proof_summary` through the `AuditSource` trait + project an
+    `intent_proof` field + the ESP data path (latent: absent for every capsule until the gate is live).
+    **4b — the standing-grant dispatch mode**: the net-new live path that issues/revokes standing envelopes and
+    routes self-declared agent acts through `run_intent_gate`. A deliberate product fork (unsupervised-autonomy
+    UX), not a quick slice.
 
 ## 💻 LOCAL / CURSOR (founder's device — VM env + operational)
 1. Activate AUD-1 (generate author key via `trust_cmd` → config `trusted_keys` → re-sign capsules).

@@ -189,6 +189,37 @@ Fail-closed branch matrix (Kent Beck — each row is a test):
    honest alarm sub-state and is never masked by a clean trust/spend channel (mirror the W5b
    independent-channels SSR tests).
 
+## Implementation status (as built on `flint`)
+
+The verifiable core is built, gated, and on-chain — `capability/intent.rs` + the `AuditEvent`
+intent variants + the ESP `intentProofView`. What is NOT yet built is the live dispatch mode that
+*calls* the gate.
+
+- ✅ **ch1** — `IntentDeclarationV1` / `IntentReconciliationV1` (ed25519-signed) + the fail-closed
+  verifier matrix (`check_intent_within_envelope`, `reconcile`).
+- ✅ **ch2** — `AuditEvent::{IntentDeclared,IntentDenied,IntentReconciled}` + builders; emit-and-
+  `chain_attestation`-verify test (the verdict is tamper-evident custody).
+- ✅ **ch3** — `StandingGrantEnvelope::from_token` derives the envelope from a real
+  `CapabilityToken` (capsule/resource/action/expiry signed-in; methods + revocation supplied by the
+  caller — named, not faked).
+- ✅ **ch4** — `run_intent_gate` orchestrator: custody-first → verify → the act runs ONLY past a
+  passing gate → reconcile. The load-bearing test proves a denied intent NEVER runs the act.
+- ✅ **ch5** — ESP `intentProofView` + `<CapsuleCustodyPanel>` paint: the verdict is a third
+  INDEPENDENT custody channel (absent / clean / flagged), never masked by a green chain/meter.
+- ✅ **ch5b (runtime)** — `count_intent_proof` + `AuditLog::intent_proof_summary`, PRESENCE-aware
+  (a non-gated capsule is ABSENT, not falsely "clean").
+- ⬜ **ch5b (inspector)** — expose `intent_proof_summary` through the `AuditSource` trait, project an
+  `intent_proof` field, thread it through the ESP data path. Latent: every capsule reads ABSENT until
+  the gate is live.
+- ⬜ **ch4b** — the standing-grant dispatch mode: issue/revoke standing envelopes and route
+  self-declared agent acts through `run_intent_gate`. The net-new product surface (unsupervised-
+  autonomy UX) that turns the built gate into a live path. **This is the gate to "an agent runs
+  unsupervised under this loop."**
+
+NOTE: the gate is deliberately NOT wired into the existing per-act carrier path — that path already
+enforces via validate-and-consume (single-use consent), so re-checking an envelope derived from the
+same token would be redundant. The gate belongs to ch4b's standing-grant mode.
+
 ## One-line summary for `state.md`
 
 > Intent-proof loop = the prover/verifier loop for agent *actions*: declare intent → verify
