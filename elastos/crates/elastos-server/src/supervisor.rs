@@ -20,7 +20,10 @@ use crate::setup::{CapsuleEntry, ComponentsManifest};
 use crate::vm_provider::VmCapsuleProvider;
 
 use elastos_common::CapsuleRole;
-use elastos_crosvm::{CrosvmConfig, NetworkConfig, RunningVm, VmConfig};
+use elastos_crosvm::{
+    CrosvmConfig, EgressFirewall, NetworkConfig, RunningVm, VmConfig, EGRESS_LOG_RATE_PER_SEC,
+    EGRESS_NFLOG_GROUP,
+};
 use elastos_runtime::provider::ProviderRegistry;
 
 /// The capsule the runtime treats as the active shell when no active-shell
@@ -1293,6 +1296,36 @@ impl Supervisor {
 
         // Start the VM (after bridge socket is listening)
         let mut vm = RunningVm::new(vm_config, manifest, socket_path);
+
+        // W1b: bind the per-TAP egress firewall before boot. Keyed on the REAL
+        // TAP device name (not vm-{name}); the guest is leashed to the host
+        // runtime API and default-drops everything else, fail-closed. Installed
+        // and torn down with the TAP inside RunningVm.
+        let net_params = vm
+            .config
+            .network
+            .as_ref()
+            .map(|n| (n.tap_name.clone(), n.host_ip.clone()));
+        if let Some((tap_name, host_ip)) = net_params {
+            // The one allowed destination port is the host runtime HTTP API.
+            // Absent (carrier-only token path) ⇒ port 0 ⇒ no accept ⇒ deny-all.
+            let api_port = self
+                .api_addr
+                .as_ref()
+                .and_then(|a| a.rsplit(':').next())
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(0);
+            let firewall = EgressFirewall::new(
+                &tap_name,
+                &host_ip,
+                api_port,
+                EGRESS_NFLOG_GROUP,
+                EGRESS_LOG_RATE_PER_SEC,
+            )
+            .map_err(|e| anyhow::anyhow!("egress firewall build failed for '{}': {}", name, e))?;
+            vm.set_egress_firewall(Some(firewall));
+        }
+
         vm.start(&self.crosvm_config.crosvm_bin)
             .await
             .map_err(|e| anyhow::anyhow!("VM boot failed for '{}': {}", name, e))?;

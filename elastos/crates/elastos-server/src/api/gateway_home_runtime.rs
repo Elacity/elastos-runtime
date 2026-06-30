@@ -494,6 +494,7 @@ fn system_runtime_event_summary(
         | AuditEvent::CapabilityApproved { timestamp, .. }
         | AuditEvent::SpendDebit { timestamp, .. }
         | AuditEvent::BudgetExhausted { timestamp, .. }
+        | AuditEvent::EgressDenied { timestamp, .. }
         | AuditEvent::IdentityRegistered { timestamp, .. }
         | AuditEvent::StorageAccess { timestamp, .. }
         | AuditEvent::MessageSent { timestamp, .. }
@@ -571,6 +572,10 @@ fn system_runtime_event_summary(
             operation,
             ..
         } => format!("Spend budget exhausted — {capsule_id} ({operation})"),
+        // A contained egress attempt is a notable custody moment for the ribbon.
+        AuditEvent::EgressDenied {
+            capsule_id, dest, ..
+        } => format!("Egress blocked — {capsule_id} → {dest}"),
         AuditEvent::IdentityRegistered {
             user_id, method, ..
         } => format!("Registered identity {user_id} via {method}"),

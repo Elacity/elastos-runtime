@@ -292,6 +292,29 @@ pub enum AuditEvent {
         requested: u64,
     },
 
+    /// A guest's network egress was DROPPED by the per-TAP kernel firewall (W1b).
+    ///
+    /// The drop itself happens in-kernel and NEVER depends on this record being
+    /// written — this is the best-effort-durable custody of a contained attempt
+    /// ("guest X tried to reach <dest> and was stopped"). It is emitted from a
+    /// userspace NFLOG reader fed by the chain's rate-limited `log` rule, so a
+    /// down or flooded reader loses audit records, never containment.
+    EgressDenied {
+        timestamp: SecureTimestamp,
+        /// Canonical capsule identity (`vm-{name}`) for custody correlation with
+        /// the spend/grant chain — NOT the TAP device name.
+        capsule_id: String,
+        /// The TAP device the drop was observed on (e.g. `cv1a2b3c4d`).
+        tap: String,
+        /// The blocked destination (`IP` or `IP:port`).
+        dest: String,
+        /// The transport of the blocked packet (e.g. `tcp`, `udp`, `icmp`).
+        proto: String,
+        /// Further drops the kernel rate-limit suppressed and folded into this
+        /// record (0 = a lone drop; >0 = "and N more were suppressed").
+        suppressed: u64,
+    },
+
     /// Identity registered (passkey)
     IdentityRegistered {
         timestamp: SecureTimestamp,
@@ -1093,6 +1116,7 @@ impl AuditEvent {
             AuditEvent::CapabilityApproved { .. } => "capability_approved",
             AuditEvent::SpendDebit { .. } => "spend_debit",
             AuditEvent::BudgetExhausted { .. } => "budget_exhausted",
+            AuditEvent::EgressDenied { .. } => "egress_denied",
             AuditEvent::IdentityRegistered { .. } => "identity_registered",
             AuditEvent::StorageAccess { .. } => "storage_access",
             AuditEvent::MessageSent { .. } => "message_sent",
@@ -1403,6 +1427,40 @@ mod tests {
         assert!(
             recs.iter().all(|r| r.alg == AUDIT_SIG_ALG_ED25519),
             "records carry the agility tag"
+        );
+    }
+
+    #[test]
+    fn egress_denied_tags_serializes_and_chains_signed() {
+        // W1b C0: the contained-egress custody event carries the canonical
+        // capsule id (not the TAP), tags as "egress_denied", round-trips its
+        // snake_case JSON, and chains+verifies on the same signed plane as the
+        // spend/grant events it correlates with.
+        let event = AuditEvent::EgressDenied {
+            timestamp: SecureTimestamp::now(),
+            capsule_id: "vm-act-emitter".to_string(),
+            tap: "cv1a2b3c4d".to_string(),
+            dest: "1.2.3.4:443".to_string(),
+            proto: "tcp".to_string(),
+            suppressed: 0,
+        };
+        assert_eq!(event.event_type_name(), "egress_denied");
+
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "egress_denied", "serde tag is snake_case");
+        assert_eq!(json["capsule_id"], "vm-act-emitter");
+        assert_eq!(json["tap"], "cv1a2b3c4d");
+        assert_eq!(json["dest"], "1.2.3.4:443");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let log = AuditLog::with_file(&path).unwrap();
+        log.emit(event).expect("egress_denied must emit durably");
+        let vk = read_verifying_key(&log);
+        assert_eq!(
+            log.verify_chain(Some(&vk)).unwrap(),
+            1,
+            "the egress_denied record chains and verifies"
         );
     }
 

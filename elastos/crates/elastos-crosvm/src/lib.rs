@@ -28,6 +28,8 @@
 //! ```
 
 mod config;
+mod egress_audit;
+mod egress_firewall;
 #[cfg(target_os = "linux")]
 mod network;
 #[cfg(not(target_os = "linux"))]
@@ -39,6 +41,12 @@ mod rootfs;
 mod vm;
 
 pub use config::{CrosvmConfig, VmConfig};
+#[cfg(target_os = "linux")]
+pub use egress_audit::NflogReader;
+pub use egress_audit::{parse_nflog_message, EgressDrop};
+pub use egress_firewall::{
+    EgressFirewall, EGRESS_LOG_RATE_PER_SEC, EGRESS_NFLOG_GROUP, EGRESS_TABLE,
+};
 pub use network::NetworkConfig;
 pub use provider::CrosvmProvider;
 pub use proxy::TcpProxy;

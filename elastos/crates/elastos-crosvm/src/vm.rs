@@ -32,6 +32,12 @@ pub struct RunningVm {
 
     /// Path to crosvm binary (for `crosvm stop`)
     crosvm_bin: Option<PathBuf>,
+
+    /// W1b per-TAP egress firewall. Installed at [`Self::start`] together with
+    /// the TAP and torn down on every exit path next to the TAP teardown, so a
+    /// `guest_network` device is never up without its leash and never leaks a
+    /// stale chain onto a recycled TAP.
+    egress_firewall: Option<crate::EgressFirewall>,
 }
 
 impl RunningVm {
@@ -45,6 +51,22 @@ impl RunningVm {
             process: None,
             pid: None,
             crosvm_bin: None,
+            egress_firewall: None,
+        }
+    }
+
+    /// Bind the per-TAP egress firewall to this VM before [`Self::start`]. Keyed
+    /// on the real TAP device name (W1b/F1); installed and torn down with the TAP.
+    pub fn set_egress_firewall(&mut self, firewall: Option<crate::EgressFirewall>) {
+        self.egress_firewall = firewall;
+    }
+
+    /// Tear down the per-TAP egress firewall (best-effort, idempotent). Called
+    /// next to every TAP teardown so the leash never outlives the TAP nor leaks
+    /// a stale chain onto a recycled device.
+    fn teardown_egress_firewall(&self) {
+        if let Some(ref firewall) = self.egress_firewall {
+            firewall.teardown();
         }
     }
 
@@ -98,6 +120,26 @@ impl RunningVm {
             })?;
         }
 
+        // W1b: leash the TAP fail-closed. The TAP now exists; install the per-TAP
+        // egress firewall BEFORE booting the guest. If the leash cannot be
+        // installed, tear the TAP back down and fail the launch — never boot a
+        // guest_network device without its containment.
+        if let Some(ref firewall) = self.egress_firewall {
+            firewall.apply().map_err(|e| {
+                if let Some(ref network) = self.config.network {
+                    let _ = network.teardown();
+                }
+                ElastosError::Compute(format!(
+                    "egress firewall install failed for '{}': {}",
+                    self.manifest.name, e
+                ))
+            })?;
+            tracing::info!(
+                "Egress firewall installed for VM '{}' (default-deny, host-API-only)",
+                self.manifest.name
+            );
+        }
+
         // Ensure socket directory exists and is writable.
         // setcap binaries run with AT_SECURE which may restrict /tmp access.
         if let Some(parent) = self.socket_path.parent() {
@@ -141,6 +183,7 @@ impl RunningVm {
             if let Some(ref network) = self.config.network {
                 let _ = network.teardown();
             }
+            self.teardown_egress_firewall();
             ElastosError::Compute(format!("Failed to start crosvm: {}", e))
         })?;
 
@@ -249,6 +292,7 @@ impl RunningVm {
         if let Some(ref network) = self.config.network {
             let _ = network.teardown();
         }
+        self.teardown_egress_firewall();
 
         Ok(())
     }
@@ -275,6 +319,7 @@ impl RunningVm {
         if let Some(ref network) = self.config.network {
             let _ = network.teardown();
         }
+        self.teardown_egress_firewall();
 
         Ok(())
     }
@@ -350,6 +395,7 @@ impl Drop for RunningVm {
         if let Some(ref network) = self.config.network {
             let _ = network.teardown();
         }
+        self.teardown_egress_firewall();
     }
 }
 
