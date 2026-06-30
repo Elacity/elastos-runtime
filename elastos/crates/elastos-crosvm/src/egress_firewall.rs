@@ -158,18 +158,7 @@ impl EgressFirewall {
     /// already gone. Must be read BEFORE [`Self::teardown`] deletes the chains
     /// (which zeroes the counters), or the final delta is lost.
     pub fn read_drop_count(&self) -> Option<u64> {
-        let mut total = 0u64;
-        for chain in [self.input_chain(), self.forward_chain()] {
-            let out = Command::new("nft")
-                .args(["-j", "list", "chain", "inet", EGRESS_TABLE, &chain])
-                .output()
-                .ok()?;
-            if !out.status.success() {
-                return None;
-            }
-            total = total.saturating_add(sum_counter_packets(&out.stdout));
-        }
-        Some(total)
+        read_drop_count_for_tap(&self.tap)
     }
 
     /// Remove the chains, best-effort and idempotent (errors are swallowed so a
@@ -217,6 +206,28 @@ fn run_nft_atomic(script: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Read the TOTAL packets dropped by a TAP's egress chains by name alone — the
+/// reconciliation ground truth (`total_dropped - per_drop_logged = suppressed`)
+/// for callers (the server audit reader) that hold only the TAP, not the
+/// [`EgressFirewall`]. Chain names derive solely from `tap`, so this stays
+/// correct without the firewall instance. Best-effort: `None` if nft is
+/// unavailable or the chains are already gone. Must be read BEFORE teardown
+/// deletes the chains (which zeroes the counters), or the final delta is lost.
+pub fn read_drop_count_for_tap(tap: &str) -> Option<u64> {
+    let mut total = 0u64;
+    for chain in [format!("in_{tap}"), format!("fw_{tap}")] {
+        let out = Command::new("nft")
+            .args(["-j", "list", "chain", "inet", EGRESS_TABLE, &chain])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        total = total.saturating_add(sum_counter_packets(&out.stdout));
+    }
+    Some(total)
 }
 
 /// Sum the `packets` of every anonymous `counter` expression in an `nft -j list

@@ -78,6 +78,35 @@ sudo sysctl -w kernel.unprivileged_userns_clone=1   # belt-and-suspenders
 (`/dev/kvm` must also be present and group-accessible — for a Lima guest, add the
 user to the `kvm` group and restart the VM so the membership takes effect.)
 
+## Prereq 3 — load the NFLOG module (W1b egress-audit custody)
+
+**Symptom:** the per-TAP egress firewall still DROPS correctly, but no `EgressDenied`
+custody is recorded — the audit reader's `NETLINK_NETFILTER` bind fails closed because
+the kernel has no NFLOG backend. (Enforcement is independent of the reader by design, so
+containment is never lost; only the audit half goes dark.)
+
+**Cause:** the `nft ... log group N` rules deliver drops through `nfnetlink_log`, which is a
+loadable module not always present on a minimal box.
+
+**Fix:**
+
+```bash
+sudo modprobe nfnetlink_log
+lsmod | grep nfnetlink_log   # confirm it's loaded
+# persist via /etc/modules-load.d/ if the box survives reboots
+```
+
+This is required to run the W1b C4 egress exercise — the in-tree `#[ignore]`d harness
+`tests/c4_egress_spine.rs`, run as root:
+
+```bash
+sudo -E cargo test -p elastos-server --test c4_egress_spine -- --ignored --nocapture
+```
+
+It is compile-gated in normal CI (so W1b API drift fails the build) but only runs when
+asked. Without NFLOG the firewall still enforces, but the per-drop NFLOG → signed
+`EgressDenied` custody (and the flood→`suppressed` reconcile marker) cannot be proven.
+
 ## Offline catalog (capsule sourcing only — never stub meter/carrier/audit)
 
 The plain `serve` daemon + supervisor resolve binaries/capsules from

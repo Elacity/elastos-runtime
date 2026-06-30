@@ -236,6 +236,9 @@ pub struct Supervisor {
     /// `EgressDenied` keyed on the canonical capsule identity. Populated at firewall-install;
     /// shared with the NFLOG audit-reader thread.
     tap_registry: crate::egress_audit::TapRegistry,
+    /// W1b/C3: per-TAP reconciliation counters (per-drop emitted vs. kernel-suppressed accounted),
+    /// shared with the reader + reconcile-sweep threads and read at teardown for the final delta.
+    egress_counters: crate::egress_audit::EgressCounters,
     /// Author-signature verifier for the launch gate (AUD-1). Default is empty (no
     /// trusted keys), in which case the gate skips and launches are byte-for-byte
     /// today's behavior; seeded from config `trusted_keys` at serve time to activate.
@@ -491,6 +494,7 @@ impl Supervisor {
             spend_policy: None,
             shared_audit_log: None,
             tap_registry: crate::egress_audit::TapRegistry::new(),
+            egress_counters: crate::egress_audit::EgressCounters::new(),
             signature_verifier: SignatureVerifier::new(),
             gateway: Arc::new(RwLock::new(None)),
         }
@@ -571,7 +575,38 @@ impl Supervisor {
             crate::egress_audit::spawn_egress_audit_reader(
                 audit_log.clone(),
                 self.tap_registry.clone(),
+                self.egress_counters.clone(),
             );
+            // W1b/C3: alongside the per-drop reader, the periodic reconcile sweep emits a signed
+            // suppressed-marker EgressDenied for drops the kernel rate-limit elided (counter ground
+            // truth − per-drop logged). Also best-effort and enforcement-independent.
+            #[cfg(target_os = "linux")]
+            crate::egress_audit::spawn_egress_reconcile_poller(
+                audit_log.clone(),
+                self.tap_registry.clone(),
+                self.egress_counters.clone(),
+            );
+        }
+    }
+
+    /// W1b/C3: best-effort FINAL suppressed-delta read for a VM-backed capsule's TAP, called at an
+    /// orchestrated teardown BEFORE the egress chains are deleted (teardown zeroes the nft
+    /// counters, so the last sub-sweep-interval delta would otherwise be lost). Custody-only and
+    /// enforcement-independent — it never gates or alters the teardown (C2 still deletes the chains
+    /// reader-independently at all four `RunningVm` sites). Also forgets the TAP's registry/counter
+    /// entries to bound memory.
+    fn final_egress_reconcile(&self, backend: &CapsuleBackend) {
+        if let (Some(audit_log), CapsuleBackend::Vm(vm)) = (&self.shared_audit_log, backend) {
+            if let Some(tap) = vm.config.network.as_ref().map(|n| n.tap_name.as_str()) {
+                crate::egress_audit::reconcile_tap(
+                    audit_log,
+                    &self.tap_registry,
+                    &self.egress_counters,
+                    tap,
+                );
+                self.tap_registry.forget(tap);
+                self.egress_counters.forget(tap);
+            }
         }
     }
 
@@ -821,6 +856,9 @@ impl Supervisor {
                 .collect();
             for handle in dead_handles {
                 if let Some(capsule) = running.remove(&handle) {
+                    // W1b/C3: read the TAP's final suppressed delta before `capsule` drops here
+                    // (RunningVm::Drop tears down the egress chains, zeroing the counters).
+                    self.final_egress_reconcile(&capsule.backend);
                     dead.push((handle, capsule.provider_route));
                 }
             }
@@ -1493,6 +1531,9 @@ impl Supervisor {
             self.unregister_provider_route(route).await;
         }
 
+        // W1b/C3: final suppressed-delta read before `vm.stop()` deletes the egress chains.
+        self.final_egress_reconcile(&capsule.backend);
+
         match capsule.backend {
             CapsuleBackend::Vm(mut vm) => {
                 vm.stop()
@@ -1532,6 +1573,9 @@ impl Supervisor {
         if let Some(route) = capsule.provider_route.as_ref() {
             self.unregister_provider_route(route).await;
         }
+
+        // W1b/C3: final suppressed-delta read before the VM drops and tears down its egress chains.
+        self.final_egress_reconcile(&capsule.backend);
 
         let exit_code = match capsule.backend {
             CapsuleBackend::Vm(mut vm) => {

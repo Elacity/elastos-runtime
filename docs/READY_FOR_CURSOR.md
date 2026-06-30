@@ -24,22 +24,38 @@ All four should pass. (Server lib ~876 tests, runtime ~345, common ~95.)
 > failure against `docs/ROADMAP.md` (LOCAL/CURSOR section) before treating it as a
 > real break. The `--lib` suites above are the clean in-cloud signal.
 
-## 1. W1b — the real egress firewall  ← highest leverage
+## 1. W1b — the real egress firewall  ← VERIFIED on real kernel
 
-**STATUS (in-cloud-gated, NOT hardware-proven):** the default-deny spine is built and
-in-cloud-gated. C0 `EgressDenied` event + C1 per-TAP nft rule-gen (`egress_firewall.rs`,
-default-drop + rate-limited NFLOG + counter) + C2 lifecycle (install fail-closed-before-boot,
-teardown at all four TAP sites) + C3-core hostile-input-hardened NFLOG parser
-(`egress_audit.rs` in crosvm) + **C3-glue** (`elastos-server/src/egress_audit.rs`: the
-`TapRegistry` TAP→`vm-{name}` map, the per-drop → signed `EgressDenied` reader thread wired
-in `serve_cmd` → `Supervisor::start_egress_audit_reader`). All Linux `--lib` gated.
-**PENDING ON THE BOX:** (i) the `suppressed=delta` reconciliation WIRING (the pure delta
-`reconcile_suppressed` + the nft `counter` exist; the periodic + final-read-before-teardown
-loop needs the live `nft` counter to validate); (ii) **C4** — the hardware exercise (guest
-provably blocked from a denied host; `EgressDenied` per-drop + a `suppressed` marker under a
-synthetic flood land on the durable chain + survive verify-on-open; `nft list ruleset` clean
-after teardown). NOTE F2: this spine is **host-only containment** (no NAT) — the `Allowlisted`
-internet-egress positive is a deliberate, separate architecture decision, intentionally NOT built.
+**STATUS — VERIFIED on real kernel (nft v1.0.9 + real NFLOG group 100):** the default-deny
+spine is built and proven end-to-end. C0 `EgressDenied` event + C1 per-TAP nft rule-gen
+(`egress_firewall.rs`, default-drop + rate-limited NFLOG + counter) + C2 lifecycle (install
+fail-closed-before-boot, teardown at all four TAP sites) + C3-core hostile-input-hardened
+NFLOG parser (`egress_audit.rs` in crosvm) + **C3-glue** (`elastos-server/src/egress_audit.rs`:
+the `TapRegistry` TAP→`vm-{name}` map, the per-drop → signed `EgressDenied` reader thread wired
+in `serve_cmd` → `Supervisor::start_egress_audit_reader`) + the `suppressed=delta` reconciliation
+WIRING (periodic poller + best-effort final-read in the supervisor reap/stop path, before C2's
+reader-independent teardown deletes the chains) + **C4** the hardware exercise.
+
+**What C4 actually exercised (precise scope — the in-tree `#[ignore]`d harness `tests/c4_egress_spine.rs`, run `sudo -E cargo test -p elastos-server --test c4_egress_spine -- --ignored`):**
+a **netns-peer harness** drives the ACTUAL `EgressFirewall` + `NflogReader` code against a real
+`veth`/netns interface — NOT a booted microVM guest. 7/7: real `nft v1.0.9` accepts
+`EgressFirewall::install_script`; the allowed host runtime-API is reachable while every other
+destination is **dropped + counted + NFLOG'd** (the compromised-guest backstop, exercising both
+the `input` and `forward` hooks); per-drop `EgressDenied` (kernel NFLOG → signed custody, keyed
+`vm-{name}`) **and** a flood→`suppressed` marker land on the durable chain and **survive
+verify-on-open**; `nft list ruleset` is **clean after teardown** (no leak). The two wrong netlink
+constants found here (`NFNL_SUBSYS_ULOG` 5→4, `NFULA_PREFIX` 2→10) are fixed — they were invisible
+to the symmetric `--lib` parser tests and only surfaced against the live kernel.
+
+The **crosvm-guest-over-TAP seam is orthogonal** (the firewall is interface-keyed) and already
+boot-proven (spend/audit 7/7); it is established by construction — the firewall keys on the guest's
+own TAP — so the netns peer makes the identical logical assertion on host-only topology.
+NOTE F2: this spine is **host-only containment** (no NAT) — the `Allowlisted` internet-egress
+positive is a deliberate, separate architecture decision, intentionally NOT built.
+
+> **Box provisioning:** C4 needs the NFLOG kernel module loaded — `sudo modprobe nfnetlink_log`
+> (see `docs/MICROVM_LOCAL_KVM_PROVISIONING.md`). Without it the reader's bind fails closed and
+> enforcement still drops, but no `EgressDenied` custody is recorded.
 
 **Design:** `docs/W1B_EGRESS_FIREWALL.md` (complete — read it first).
 **Why it matters:** converts the reach *model* (already built + tested) into

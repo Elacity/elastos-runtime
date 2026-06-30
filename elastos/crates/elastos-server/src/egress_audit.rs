@@ -25,7 +25,7 @@
 //! non-flood drop (the kernel rate-limit only elides logs above the per-second cap).
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use elastos_runtime::primitives::audit::{AuditEvent, AuditLog};
 use elastos_runtime::primitives::time::SecureTimestamp;
@@ -64,6 +64,69 @@ impl TapRegistry {
     /// [`record`](Self::record) overwrites on reuse; this only bounds memory over a long session.
     pub fn forget(&self, tap: &str) {
         if let Ok(mut m) = self.inner.write() {
+            m.remove(tap);
+        }
+    }
+
+    /// Snapshot the currently-known TAPs (for the reconcile poller to sweep). Lock-poison tolerant
+    /// (a poisoned lock yields an empty sweep this tick, never a panic).
+    pub fn taps(&self) -> Vec<String> {
+        self.inner
+            .read()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// Per-TAP reconciliation bookkeeping shared between the NFLOG reader (which increments `emitted`
+/// once per per-drop record it lands) and the reconcile sweep / final-read (which increments
+/// `suppressed_emitted` as it accounts for kernel-suppressed drops). Two counters because the
+/// suppressed total is `kernel_counter - emitted`, and we must only emit the *new* slice of it.
+#[derive(Default, Clone, Copy)]
+struct TapCounters {
+    /// Per-drop `EgressDenied` records the reader has landed for this TAP.
+    emitted: u64,
+    /// Suppressed-marker drops already accounted onto the chain for this TAP.
+    suppressed_emitted: u64,
+}
+
+/// Shared per-TAP counters. Cheaply cloneable; lock-poison tolerant (a poisoned lock degrades to a
+/// no-op for that operation — we lose a reconciliation tick, never enforcement and never a panic).
+#[derive(Clone, Default)]
+pub struct EgressCounters {
+    inner: Arc<Mutex<HashMap<String, TapCounters>>>,
+}
+
+impl EgressCounters {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Note that the reader landed one more per-drop `EgressDenied` for this TAP.
+    pub fn note_emitted(&self, tap: &str) {
+        if let Ok(mut m) = self.inner.lock() {
+            m.entry(tap.to_string()).or_default().emitted += 1;
+        }
+    }
+
+    /// Given the live kernel drop counter for `tap`, return the not-yet-accounted suppressed delta
+    /// and advance the accounted baseline by it. `suppressed_total = counter - emitted` (saturating,
+    /// per [`reconcile_suppressed`]); the returned delta is that minus what we already emitted, so
+    /// repeated sweeps never double-count and a counter read that lags the emit count yields `0`.
+    pub fn take_suppressed_delta(&self, tap: &str, total_dropped: u64) -> u64 {
+        let Ok(mut m) = self.inner.lock() else {
+            return 0;
+        };
+        let c = m.entry(tap.to_string()).or_default();
+        let suppressed_total = reconcile_suppressed(total_dropped, c.emitted);
+        let delta = suppressed_total.saturating_sub(c.suppressed_emitted);
+        c.suppressed_emitted = c.suppressed_emitted.saturating_add(delta);
+        delta
+    }
+
+    /// Forget a TAP's counters (best-effort cleanliness on teardown; only bounds memory).
+    pub fn forget(&self, tap: &str) {
+        if let Ok(mut m) = self.inner.lock() {
             m.remove(tap);
         }
     }
@@ -111,7 +174,11 @@ pub fn reconcile_suppressed(total_dropped: u64, per_drop_emitted: u64) -> u64 {
 /// `nfnetlink_log`) or `recv` fails, the reader logs loudly and exits — the in-kernel DROP is
 /// unaffected. Runs on a dedicated blocking thread (the `recv` is a blocking syscall).
 #[cfg(target_os = "linux")]
-pub fn spawn_egress_audit_reader(audit_log: Arc<AuditLog>, registry: TapRegistry) {
+pub fn spawn_egress_audit_reader(
+    audit_log: Arc<AuditLog>,
+    registry: TapRegistry,
+    counters: EgressCounters,
+) {
     use elastos_crosvm::{NflogReader, EGRESS_NFLOG_GROUP};
     let _ = std::thread::Builder::new()
         .name("egress-audit-reader".to_string())
@@ -135,6 +202,9 @@ pub fn spawn_egress_audit_reader(audit_log: Arc<AuditLog>, registry: TapRegistry
                             audit_log.emit_best_effort(build_egress_denied(
                                 capsule_id, &d.tap, &d.dest, &d.proto, 0,
                             ));
+                            // Count this per-drop record so the reconcile sweep can tell how many
+                            // kernel drops the rate-limit suppressed (counter − emitted = delta).
+                            counters.note_emitted(&d.tap);
                         }
                     }
                     Err(e) => {
@@ -151,7 +221,77 @@ pub fn spawn_egress_audit_reader(audit_log: Arc<AuditLog>, registry: TapRegistry
 
 /// Non-Linux: no NFLOG, so the reader is a no-op (the firewall itself is Linux-only too).
 #[cfg(not(target_os = "linux"))]
-pub fn spawn_egress_audit_reader(_audit_log: Arc<AuditLog>, _registry: TapRegistry) {}
+pub fn spawn_egress_audit_reader(
+    _audit_log: Arc<AuditLog>,
+    _registry: TapRegistry,
+    _counters: EgressCounters,
+) {
+}
+
+/// How often the reconcile sweep reads the live nft drop counters. Frequent enough that a synthetic
+/// flood's suppressed marker lands in near-real-time (so C4 evidence is captured during VM life,
+/// independent of the final-read-before-teardown), cheap enough to be invisible at idle.
+#[cfg(target_os = "linux")]
+const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Spawn the periodic reconcile sweep: every [`RECONCILE_INTERVAL`], read each known TAP's live nft
+/// drop counter and emit a signed suppressed-marker `EgressDenied` for any kernel-suppressed drops
+/// not yet accounted (the rate-limit elides logs above the per-second cap; the counter is ground
+/// truth). Best-effort and enforcement-independent, exactly like the reader.
+#[cfg(target_os = "linux")]
+pub fn spawn_egress_reconcile_poller(
+    audit_log: Arc<AuditLog>,
+    registry: TapRegistry,
+    counters: EgressCounters,
+) {
+    let _ = std::thread::Builder::new()
+        .name("egress-reconcile".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(RECONCILE_INTERVAL);
+            for tap in registry.taps() {
+                reconcile_tap(&audit_log, &registry, &counters, &tap);
+            }
+        });
+}
+
+/// Read `tap`'s live kernel drop counter and, if the rate-limit suppressed any drops beyond what
+/// the reader has logged per-drop, emit ONE signed suppressed-marker `EgressDenied` for the new
+/// slice (`dest = "(rate-limited)"`, `proto = "-"`). Best-effort: a missing counter (chains already
+/// gone) or a zero delta is a no-op. Used by both the periodic sweep and the supervisor's
+/// final-read-before-teardown (which MUST run before the chains are deleted, or the delta is lost).
+#[cfg(target_os = "linux")]
+pub fn reconcile_tap(
+    audit_log: &AuditLog,
+    registry: &TapRegistry,
+    counters: &EgressCounters,
+    tap: &str,
+) {
+    let Some(total) = elastos_crosvm::read_drop_count_for_tap(tap) else {
+        return;
+    };
+    let delta = counters.take_suppressed_delta(tap, total);
+    if delta > 0 {
+        let capsule_id = capsule_id_for_tap(registry, tap);
+        audit_log.emit_best_effort(build_egress_denied(
+            capsule_id,
+            tap,
+            "(rate-limited)",
+            "-",
+            delta,
+        ));
+    }
+}
+
+/// Non-Linux: no nft counters, so the final reconcile is a no-op (keeps the supervisor call site
+/// platform-uniform).
+#[cfg(not(target_os = "linux"))]
+pub fn reconcile_tap(
+    _audit_log: &AuditLog,
+    _registry: &TapRegistry,
+    _counters: &EgressCounters,
+    _tap: &str,
+) {
+}
 
 #[cfg(test)]
 mod tests {
@@ -232,6 +372,26 @@ mod tests {
         let att = log.chain_attestation().expect("file-backed ⇒ attestable");
         assert!(att.verified, "the EgressDenied record verifies: {att:?}");
         assert_eq!(att.records, 1);
+    }
+
+    #[test]
+    fn take_suppressed_delta_emits_only_the_new_slice_and_never_double_counts() {
+        let counters = EgressCounters::new();
+        let tap = "cv1a2b3c4d";
+        // No drops logged yet, counter at 0 → nothing suppressed.
+        assert_eq!(counters.take_suppressed_delta(tap, 0), 0);
+        // Reader logged 3 per-drop records; counter shows 10 → 7 suppressed, all new.
+        counters.note_emitted(tap);
+        counters.note_emitted(tap);
+        counters.note_emitted(tap);
+        assert_eq!(counters.take_suppressed_delta(tap, 10), 7);
+        // Same counter on the next sweep → nothing new (no double-count).
+        assert_eq!(counters.take_suppressed_delta(tap, 10), 0);
+        // Flood continues: counter climbs to 25 with no new per-drop logs → 15 new suppressed.
+        assert_eq!(counters.take_suppressed_delta(tap, 25), 15);
+        // A counter read that lags the emit count never yields a negative slice.
+        counters.note_emitted(tap);
+        assert_eq!(counters.take_suppressed_delta(tap, 25), 0);
     }
 
     #[test]

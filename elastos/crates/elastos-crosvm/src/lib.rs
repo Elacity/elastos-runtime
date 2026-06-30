@@ -45,7 +45,8 @@ pub use config::{CrosvmConfig, VmConfig};
 pub use egress_audit::NflogReader;
 pub use egress_audit::{parse_nflog_message, EgressDrop};
 pub use egress_firewall::{
-    EgressFirewall, EGRESS_LOG_RATE_PER_SEC, EGRESS_NFLOG_GROUP, EGRESS_TABLE,
+    read_drop_count_for_tap, EgressFirewall, EGRESS_LOG_RATE_PER_SEC, EGRESS_NFLOG_GROUP,
+    EGRESS_TABLE,
 };
 pub use network::NetworkConfig;
 pub use provider::CrosvmProvider;
