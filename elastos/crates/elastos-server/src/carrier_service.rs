@@ -234,6 +234,25 @@ impl CarrierLiveness {
     pub fn is_alive(&self) -> bool {
         self.bridge.is_alive()
     }
+
+    /// Test-only: a probe whose host child has already spawned and exited, so
+    /// `is_alive()` reports dead. Used by the supervisor reap test to prove the
+    /// reap loop collects a dead carrier service (BUG-7). Reaps the child before
+    /// handing back the probe so the dead state is observed deterministically.
+    #[cfg(test)]
+    pub(crate) fn exited_for_test() -> Self {
+        let bridge = Arc::new(CarrierServiceBridge::new(
+            "true".into(),
+            vec![],
+            serde_json::json!({}),
+        ));
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let _ = child.wait(); // ensure exited before the probe observes it
+        *bridge.child.lock().unwrap() = Some(child);
+        CarrierLiveness { bridge }
+    }
 }
 
 /// Carrier-plane provider that runs a capsule binary directly on the host.

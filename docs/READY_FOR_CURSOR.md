@@ -72,15 +72,33 @@ Build steps (all specified in the design doc):
 - The 5 tests in the design doc, incl. the **compromised-guest backstop** (a guest
   bypassing the provider SDK is still dropped by the kernel chain).
 
-## 2. BUG-2 / BUG-3 / BUG-7 — VM-lifecycle leaks
+## 2. BUG-2 / BUG-3 / BUG-7 — VM-lifecycle leaks  — ✅ CLOSED, VERIFIED on real kernel
 
-**Spec:** `docs/KNOWN_GAPS.md` ("Performance + bugs" section).
-These need a real crosvm boot to test, so they're KVM-lane:
-- **BUG-2:** per-launch `-carrier.sock` + detached bridge accept-loop leaked on
-  teardown → store + abort the `JoinHandle`, remove the sock.
-- **BUG-3:** boot-failure orphan: overlay + sockets + task leaked when `vm.start()`
-  errors before the running-map insert → cleanup on the error path.
-- **BUG-7:** reap treats the Carrier backend as unconditionally alive → real liveness.
+**Spec:** `docs/KNOWN_GAPS.md` ("Performance + bugs" section). Fixed + in-cloud
+gated, then exercised against the real aarch64 Linux + KVM box (nft v1.0.9, /dev/kvm):
+- **BUG-2** (commit `267cb17`): the per-launch `-carrier.sock` + detached bridge
+  accept-loop leaked on teardown → `spawn_carrier_bridge` now returns its
+  `JoinHandle`; `RunningCapsule` holds it + the sock; stop/reap/wait route through
+  `cleanup_bridge_artifacts` (abort task + unlink sock). The real socket-unlink +
+  task-abort path is exercised on the box by the BUG-3 guard run below (the real
+  bridge socket is created by `spawn_carrier_bridge` then cleaned).
+- **BUG-3** (commit `267cb17`): boot-failure orphan (overlay + sock + task + tap
+  entry leaked when `vm.start()` errors before the running-map insert) → a
+  defuse-on-success `LaunchCleanupGuard` cleans every error path by construction.
+  **Box-VERIFIED:** the `#[ignore]`d `launch_failure_leaves_no_orphaned_*` test
+  drives the REAL `launch_capsule` to a real `vm.start()` failure (non-root
+  `guest_network` → `TUNSETIFF` EPERM) AFTER the overlay/sock/tap were tracked;
+  the guard cleaned all three (deterministic across re-runs, no orphaned tap / nft
+  chain / overlay / sock on the host).
+- **BUG-7** (commit `bd23ec9`): reap treated the Carrier backend as unconditionally
+  alive (zombie leak) → `CarrierServiceBridge::is_alive()` via `try_wait`,
+  PENDING-SAFE (not-yet-spawned/poison/error = alive), surfaced as a `CarrierLiveness`
+  probe on `CapsuleBackend::Carrier`. **Box-VERIFIED:** `reap_collects_a_dead_carrier_but_spares_a_pending_one`
+  reaps an exited-child carrier and spares a pending (probe-less) one.
+
+Re-run the box-only forced-boot-failure proof (non-root, on the provisioned box):
+  `cargo test -p elastos-server --lib -- --ignored --nocapture launch_failure_leaves_no_orphaned`
+
 (BUG-1, BUG-5, BUG-6, BUG-8 are already CLOSED in-cloud; BUG-4 mechanism is closed
 with 3 real-provider migrations.)
 
@@ -103,8 +121,9 @@ only the live Svelte paint + a visual snapshot test remain.
 
 ## The COMPLETE remaining registry (no blind spots)
 
-The three items above (W1b, BUG-2/3/7, W5b) are the **highest-leverage** pickups,
-but they are NOT the whole list. The authoritative, complete sources of truth are
+Of the three items above, **W1b ✅ and BUG-2/3/7 ✅ are now CLOSED + box-verified**;
+**W5b** (the visual shell) is the remaining highest-leverage pickup. These are NOT
+the whole list. The authoritative, complete sources of truth are
 **`docs/ROADMAP.md`** (the "DEFERRED / TRACKED" + "LOCAL / CURSOR" sections) and
 **`docs/KNOWN_GAPS.md`** (the gap registry, each with a close-criterion or a
 `#[ignore]`d ratchet test). Everything else still open, so nothing surprises you:

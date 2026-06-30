@@ -2204,6 +2204,196 @@ mod tests {
             .contains("principal launch grants are only valid for shell-launchable capsules"));
     }
 
+    /// Snapshot the file names directly under `dir` (empty set if it doesn't exist),
+    /// so a leaked artifact shows up as a set difference across a launch attempt.
+    #[cfg(target_os = "linux")]
+    fn dir_snapshot(dir: &Path) -> std::collections::HashSet<String> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// BUG-3 BOX VALIDATION — the forced-boot-failure proof the cloud can't run.
+    ///
+    /// Drives the REAL `launch_capsule` against the real kernel + real crosvm/vmlinux,
+    /// then forces `vm.start()` to fail AFTER the `LaunchCleanupGuard` has tracked all
+    /// four supervisor-created artifacts (rootfs overlay, carrier socket, bridge task,
+    /// tap_registry entry). A `guest_network` capsule makes `vm.start()` create a TAP,
+    /// which needs CAP_NET_ADMIN; run as the NON-root box user it fails deterministically
+    /// in the fragile window. The guard must then have removed the overlay + carrier
+    /// socket and forgotten the tap_registry entry — no orphans.
+    ///
+    /// `#[ignore]`d: it COMPILES in normal CI (so launch-path drift fails the build here)
+    /// but only RUNS on the provisioned box. Prereqs: real `~/.local/share/elastos`
+    /// (components.json with linux-arm64 crosvm+vmlinux that verify, and the act-emitter
+    /// capsule's rootfs.ext4); a readable `/dev/kvm`; a NON-root shell (so the TAP create
+    /// fails). Run:
+    ///   cargo test -p elastos-server --lib -- --ignored --nocapture launch_failure_leaves_no_orphaned
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "box-only: needs real ~/.local/share/elastos provisioning + /dev/kvm + a non-root shell"]
+    async fn launch_failure_leaves_no_orphaned_overlay_socket_or_tap_on_real_kernel() {
+        let data_dir =
+            std::path::PathBuf::from(std::env::var("HOME").expect("HOME set")).join(".local/share/elastos");
+        let components_path = data_dir.join("components.json");
+        let mut registry: ComponentsManifest = serde_json::from_str(
+            &std::fs::read_to_string(&components_path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", components_path.display())),
+        )
+        .expect("parse components.json");
+
+        // Reuse the act-emitter fixture's real rootfs.ext4 so the overlay copy succeeds
+        // and the launch reaches vm.start().
+        let src_rootfs = data_dir.join("capsules/act-emitter/rootfs.ext4");
+        assert!(
+            src_rootfs.is_file(),
+            "missing act-emitter rootfs.ext4 fixture at {}",
+            src_rootfs.display()
+        );
+
+        let name = format!("bug3leaktest{}", std::process::id());
+        // ensure_capsule resolves a local capsule when the registry CID matches the
+        // cached CID and the sha is empty (skips the artifact-sha gate). Register a
+        // local entry so the load reaches the launch path instead of a download.
+        registry.capsules.insert(
+            name.clone(),
+            CapsuleEntry {
+                cid: format!("local-{name}"),
+                sha256: String::new(),
+                size: 0,
+                repository: None,
+                source_path: None,
+                platforms: vec![],
+            },
+        );
+        let capsule_dir = data_dir.join("capsules").join(&name);
+        std::fs::create_dir_all(&capsule_dir).unwrap();
+        let dst_rootfs = capsule_dir.join("rootfs.ext4");
+        // Hardlink the 335MB image (same filesystem); fall back to a copy.
+        if std::fs::hard_link(&src_rootfs, &dst_rootfs).is_err() {
+            std::fs::copy(&src_rootfs, &dst_rootfs).unwrap();
+        }
+        std::fs::write(capsule_dir.join(CACHED_CID_FILE), format!("local-{name}\n")).unwrap();
+        std::fs::write(
+            capsule_dir.join("capsule.json"),
+            serde_json::json!({
+                "schema": "elastos.capsule/v1",
+                "name": name,
+                "version": "0.1.0",
+                "role": "provider",
+                "type": "microvm",
+                "entrypoint": "rootfs.ext4",
+                "permissions": { "guest_network": true }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut supervisor = Supervisor::new(data_dir.clone(), registry);
+        // The carrier bridge (and thus the socket the guard must clean) only spawns
+        // when a provider registry is present.
+        supervisor.set_provider_registry(Arc::new(ProviderRegistry::new()));
+
+        let overlay_dir = data_dir.join("rootfs-cache/overlays");
+        let socket_dir = data_dir.join("crosvm");
+        let overlays_before = dir_snapshot(&overlay_dir);
+        let socks_before = dir_snapshot(&socket_dir);
+
+        let result = supervisor
+            .launch_capsule(&name, serde_json::json!({}), None)
+            .await;
+
+        // Remove the fixture capsule dir (and its hardlinked rootfs) regardless of outcome.
+        let _ = std::fs::remove_dir_all(&capsule_dir);
+
+        println!("[BUG-3] launch_capsule result: {result:?}");
+        assert!(
+            result.is_err(),
+            "guest_network launch as non-root must fail at TAP creation (did this run as root?)"
+        );
+
+        // 1) tap_registry entry forgotten (the registry is fresh per Supervisor).
+        let leaked_taps = supervisor.tap_registry.taps();
+        println!("[BUG-3] tap_registry after failed launch: {leaked_taps:?}");
+        assert!(
+            leaked_taps.is_empty(),
+            "BUG-3: orphaned tap_registry entries: {leaked_taps:?}"
+        );
+
+        // 2) no new overlay .ext4 and 3) no new -carrier.sock leaked.
+        let leaked_overlays: Vec<_> = dir_snapshot(&overlay_dir)
+            .difference(&overlays_before)
+            .cloned()
+            .collect();
+        let leaked_socks: Vec<_> = dir_snapshot(&socket_dir)
+            .difference(&socks_before)
+            .cloned()
+            .collect();
+        println!("[BUG-3] leaked overlays: {leaked_overlays:?} | leaked socks: {leaked_socks:?}");
+        assert!(
+            leaked_overlays.is_empty(),
+            "BUG-3: orphaned rootfs overlay(s): {leaked_overlays:?}"
+        );
+        assert!(
+            leaked_socks.is_empty(),
+            "BUG-3: orphaned carrier socket(s): {leaked_socks:?}"
+        );
+    }
+
+    /// BUG-7: the reap loop collects a carrier service whose host child has exited,
+    /// while a pending (probe-less / not-yet-spawned) carrier survives — the
+    /// pending-safe fail-safe that prevents reaping a live, just-unused service.
+    #[tokio::test]
+    async fn reap_collects_a_dead_carrier_but_spares_a_pending_one() {
+        let supervisor = make_test_supervisor();
+        {
+            let mut running = supervisor.running.write().await;
+            running.insert(
+                "carrier-dead".to_string(),
+                RunningCapsule {
+                    name: "carrier-dead".to_string(),
+                    handle: "carrier-dead".to_string(),
+                    vsock_cid: 0,
+                    started_at: std::time::Instant::now(),
+                    provider_route: None,
+                    backend: CapsuleBackend::Carrier(Some(CarrierLiveness::exited_for_test())),
+                    bridge_task: None,
+                    carrier_socket: None,
+                },
+            );
+            running.insert(
+                "carrier-pending".to_string(),
+                RunningCapsule {
+                    name: "carrier-pending".to_string(),
+                    handle: "carrier-pending".to_string(),
+                    vsock_cid: 0,
+                    started_at: std::time::Instant::now(),
+                    provider_route: None,
+                    // No probe ⇒ pending/indeterminate ⇒ alive (fail-safe).
+                    backend: CapsuleBackend::Carrier(None),
+                    bridge_task: None,
+                    carrier_socket: None,
+                },
+            );
+        }
+
+        supervisor.reap_dead_capsules().await;
+
+        let running = supervisor.running.read().await;
+        assert!(
+            !running.contains_key("carrier-dead"),
+            "BUG-7: a carrier whose child exited must be reaped"
+        );
+        assert!(
+            running.contains_key("carrier-pending"),
+            "BUG-7 fail-safe: a pending (probe-less) carrier must NOT be reaped"
+        );
+    }
+
     #[test]
     fn test_supervisor_request_download_external() {
         let json = r#"{"op":"download_external","name":"kubo","platform":"linux-amd64"}"#;
