@@ -1,8 +1,4 @@
 const errorNode = document.querySelector(".system-error");
-const handleForm = document.querySelector("#handle-form");
-const handleInput = document.querySelector("#handle-input");
-const handleSaveButton = document.querySelector("#handle-save");
-const handleStatusNode = document.querySelector('[data-field="handle-status"]');
 const storageNoteNode = document.querySelector('[data-field="storage-note"]');
 const backgroundInput = document.querySelector("#background-input");
 const backgroundResetButton = document.querySelector("#background-reset");
@@ -28,11 +24,16 @@ const recoveryAttachButton = document.querySelector("#recovery-attach");
 const recoveryCancelButton = document.querySelector("#recovery-cancel");
 const webspaceListNode = document.querySelector("#webspace-list");
 const chainTableNode = document.querySelector("#chain-table");
+const inspectListNode = document.querySelector("#inspect-list");
+const inspectDetailNode = document.querySelector("#inspect-detail");
+const inspectStatusNode = document.querySelector("#inspect-status");
+const inspectRefreshButton = document.querySelector("#inspect-refresh");
 const frameHomeToken = readQueryParam("home_token");
 let apiHomeToken = frameHomeToken;
 let chainNetworks = [];
 let chainStatusById = new Map();
 let chainLifecycleById = new Map();
+let inspectEntries = [];
 let currentAccess = {};
 let passkeyAuthorityActive = false;
 let pendingRecoveryImport = null;
@@ -65,16 +66,53 @@ boot().catch((error) => {
 });
 
 async function boot() {
-  configureHandleEditor();
+  configureSettingsTabs();
   configureAppearanceEditor();
   configureGuestAccess();
   configurePasskeyAccess();
   configureRecoveryAccess();
   configureChainAccess();
+  configureInspector();
   await refreshSystemSummary();
   await refreshAccountList().catch(() => {});
   await refreshRecoveryStatus();
   await refreshChainNetworks();
+  await refreshInspector().catch((error) => showInspectStatus(String(error.message || error), "error"));
+}
+
+function configureSettingsTabs() {
+  const settingsShell = document.querySelector(".settings");
+  if (!settingsShell) {
+    return;
+  }
+  settingsShell.addEventListener("click", (event) => {
+    const item = event.target.closest(".settings-sidebar-item");
+    if (!item || !settingsShell.contains(item)) {
+      return;
+    }
+    activateSettingsTab(item.dataset.settings);
+    document.querySelector(".settings-sidebar")?.classList.remove("active");
+  });
+  document.querySelector(".sidebar-toggle")?.addEventListener("click", () => {
+    document.querySelector(".settings-sidebar")?.classList.toggle("active");
+  });
+}
+
+function activateSettingsTab(settings) {
+  const tab = readText(settings);
+  if (!tab) {
+    return;
+  }
+  for (const item of document.querySelectorAll(".settings-sidebar-item")) {
+    item.classList.toggle("active", item.dataset.settings === tab);
+  }
+  const container = document.querySelector(".settings-content-container");
+  for (const content of document.querySelectorAll(".settings-content")) {
+    content.classList.toggle("active", content.dataset.settings === tab);
+  }
+  if (container) {
+    container.scrollTop = 0;
+  }
 }
 
 function hasShellAccess() {
@@ -108,7 +146,6 @@ function renderSystemSummary(systemSummary) {
   const webspace = systemSummary.webspace || {};
 
   setField("device-did", shortDid(identity.device_did), "", identity.device_did);
-  setHandle(identity.handle);
   setAccessPolicy(access);
   setPasskeyAuthority(authority);
   setAppearance(appearance);
@@ -139,25 +176,6 @@ function setTextFields(field, value) {
 function setHiddenFields(field, hidden) {
   for (const node of document.querySelectorAll(`[data-field="${field}"]`)) {
     node.hidden = hidden;
-  }
-}
-
-function setHandle(value) {
-  const handle = readText(value);
-  if (handleInput && document.activeElement !== handleInput) {
-    handleInput.value = handle;
-  }
-}
-
-function configureHandleEditor() {
-  if (!handleInput || !handleSaveButton) {
-    return;
-  }
-  const editable = hasShellAccess();
-  handleInput.disabled = !editable;
-  handleSaveButton.disabled = !editable;
-  if (editable && handleForm) {
-    handleForm.addEventListener("submit", onHandleSubmit);
   }
 }
 
@@ -265,31 +283,20 @@ function configureChainAccess() {
   }
 }
 
-async function onHandleSubmit(event) {
-  event.preventDefault();
-  if (!handleInput || !handleSaveButton || !hasShellAccess()) {
-    return;
+function configureInspector() {
+  if (inspectListNode) {
+    inspectListNode.addEventListener("click", onInspectListClick);
   }
-  const handle = handleInput.value.trim();
-  clearHandleStatus();
-  handleInput.disabled = true;
-  handleSaveButton.disabled = true;
-  try {
-    const identity = await fetchJson("/api/apps/system/identity/handle", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-elastos-home-token": apiHomeToken,
-      },
-      body: JSON.stringify({ handle }),
-    });
-    setHandle(identity.handle);
-    showHandleStatus("Saved.", "success");
-  } catch (error) {
-    showHandleStatus(String(error.message || error), "error");
-  } finally {
-    handleInput.disabled = false;
-    handleSaveButton.disabled = false;
+  if (inspectDetailNode) {
+    inspectDetailNode.addEventListener("click", onInspectDetailClick);
+  }
+  if (inspectRefreshButton) {
+    inspectRefreshButton.disabled = !hasShellAccess();
+    if (hasShellAccess()) {
+      inspectRefreshButton.addEventListener("click", () => {
+        refreshInspector().catch((error) => showInspectStatus(String(error.message || error), "error"));
+      });
+    }
   }
 }
 
@@ -604,6 +611,298 @@ function openCapsuleTarget(target) {
     type: "home:open-target",
     target: id,
   }, window.location.origin);
+}
+
+async function refreshInspector() {
+  if (!inspectListNode || !hasShellAccess()) {
+    return;
+  }
+  setInspectBusy(true);
+  showInspectStatus("Loading", "muted");
+  try {
+    const result = await inspectProvider("capsules", {});
+    inspectEntries = Array.isArray(result.capsules) ? result.capsules : [];
+    renderInspectList(inspectEntries);
+    showInspectStatus("", "muted");
+    const first = inspectEntries[0];
+    if (first && readText(first.id)) {
+      await showInspectObject(readText(first.id));
+    } else if (inspectDetailNode) {
+      inspectDetailNode.replaceChildren(inspectEmpty("No inspectable capsules or providers."));
+    }
+  } finally {
+    setInspectBusy(false);
+  }
+}
+
+function renderInspectList(entries) {
+  if (!inspectListNode) {
+    return;
+  }
+  inspectListNode.replaceChildren();
+  if (entries.length === 0) {
+    inspectListNode.append(inspectEmpty("No inspectable capsules or providers."));
+    return;
+  }
+  for (const entry of entries) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "inspect-row";
+    button.dataset.inspectId = readText(entry.id);
+    button.setAttribute("aria-label", `Inspect ${inspectName(entry)}`);
+
+    const marker = document.createElement("span");
+    marker.className = "inspect-marker";
+    marker.textContent = readText(entry.kind) === "provider" ? "P" : "C";
+
+    const main = document.createElement("span");
+    main.className = "inspect-main";
+    const name = document.createElement("strong");
+    name.textContent = inspectName(entry);
+    const id = document.createElement("small");
+    id.textContent = readText(entry.id);
+    main.append(name, id);
+
+    const state = document.createElement("span");
+    state.className = "inspect-state";
+    state.textContent = inspectState(entry);
+    button.append(marker, main, state);
+    inspectListNode.append(button);
+  }
+}
+
+async function onInspectListClick(event) {
+  const row = event.target.closest("[data-inspect-id]");
+  if (!row || !hasShellAccess()) {
+    return;
+  }
+  await showInspectObject(readText(row.dataset.inspectId));
+}
+
+async function showInspectObject(id) {
+  const inspectId = readText(id);
+  if (!inspectDetailNode || !inspectId) {
+    return;
+  }
+  setInspectSelection(inspectId);
+  inspectDetailNode.replaceChildren(inspectEmpty("Loading"));
+  const result = await inspectProvider("capsule", { id: inspectId });
+  renderInspectDetail(result);
+}
+
+function renderInspectDetail(object) {
+  if (!inspectDetailNode) {
+    return;
+  }
+  inspectDetailNode.replaceChildren();
+  const header = document.createElement("div");
+  header.className = "inspect-detail-header";
+  const title = document.createElement("strong");
+  title.textContent = readText(object.name) || readText(object.id) || "Inspectable object";
+  const meta = document.createElement("small");
+  meta.textContent = [readText(object.kind), readText(object.state)].filter(Boolean).join(" · ");
+  header.append(title, meta);
+
+  const authority = object && object.authority && typeof object.authority === "object" ? object.authority : {};
+  const provenance = object && object.provenance && typeof object.provenance === "object" ? object.provenance : {};
+  const manifest = object && object.manifest && typeof object.manifest === "object" ? object.manifest : {};
+  const capabilities = Array.isArray(authority.capabilities) ? authority.capabilities : [];
+  const actions = [...new Set(capabilities.flatMap((capability) => (
+    Array.isArray(capability.actions) ? capability.actions.map(readText) : []
+  )).filter(Boolean))];
+  const operations = [...new Set(capabilities.flatMap((capability) => (
+    Array.isArray(capability.operations) ? capability.operations.map(readText) : []
+  )).filter(Boolean))];
+
+  const facts = document.createElement("div");
+  facts.className = "inspect-facts";
+  facts.append(
+    inspectFact("Type", `${readText(object.type) || "unknown"} · ${readText(manifest.role) || "unknown"}`),
+    inspectFact("Provides", readText(manifest.provides) || "none"),
+    inspectFact("CID", shortText(readText(provenance.cid), 18) || "not stamped"),
+    inspectFact("Signature", provenance.signature_present === true ? shortText(readText(provenance.signature_fingerprint), 16) : "not present"),
+  );
+
+  const preview = document.createElement("div");
+  preview.className = "inspect-preview";
+  const previewTitle = document.createElement("div");
+  previewTitle.className = "inspect-preview-title";
+  previewTitle.textContent = "Gate preview";
+  preview.append(previewTitle);
+  if (operations.length === 0) {
+    preview.append(inspectEmpty("No declared provider operations."));
+  } else {
+    const controls = document.createElement("div");
+    controls.className = "inspect-preview-actions";
+    for (const operation of operations.slice(0, 8)) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "inspect-plan-button";
+      button.dataset.inspectPlanId = readText(object.id);
+      button.dataset.inspectOperation = operation;
+      button.textContent = operation;
+      controls.append(button);
+    }
+    preview.append(controls);
+  }
+  const output = document.createElement("pre");
+  output.className = "inspect-plan-output";
+  output.textContent = operations.length > 0
+    ? "Select an operation to reflect the capability gate."
+    : "No gate metadata declared.";
+  preview.append(output);
+  const actButton = document.createElement("button");
+  actButton.type = "button";
+  actButton.className = "inspect-plan-button";
+  actButton.dataset.inspectActId = "";
+  actButton.dataset.inspectActOperation = "";
+  actButton.hidden = true;
+  actButton.textContent = "Request approval";
+  preview.append(actButton);
+
+  const affordances = document.createElement("div");
+  affordances.className = "inspect-affordances";
+  affordances.append(
+    inspectFact("Actions", actions.join(", ") || "none"),
+    inspectFact("Audit", Array.isArray(authority.audit_events) ? authority.audit_events.map(readText).filter(Boolean).join(", ") || "none" : "none"),
+  );
+
+  inspectDetailNode.append(header, facts, preview, affordances);
+}
+
+async function onInspectDetailClick(event) {
+  const actButton = event.target.closest("[data-inspect-act-id]");
+  if (actButton && hasShellAccess()) {
+    const id = readText(actButton.dataset.inspectActId);
+    const operation = readText(actButton.dataset.inspectActOperation);
+    if (!id || !operation) {
+      return;
+    }
+    const output = inspectDetailNode.querySelector(".inspect-plan-output");
+    if (output) {
+      output.textContent = "Creating Inbox approval request...";
+    }
+    try {
+      const result = await inspectProvider("request_act", { id, operation, request: {} });
+      if (output) {
+        output.textContent = JSON.stringify({
+          status: result.status || "pending",
+          request_id: result.request_id,
+          operation: result.operation,
+          plan: result.plan || null,
+        }, null, 2);
+      }
+      actButton.hidden = true;
+    } catch (error) {
+      if (output) {
+        output.textContent = String(error.message || error);
+      }
+    }
+    return;
+  }
+  const button = event.target.closest("[data-inspect-plan-id]");
+  if (!button || !hasShellAccess()) {
+    return;
+  }
+  const id = readText(button.dataset.inspectPlanId);
+  const operation = readText(button.dataset.inspectOperation);
+  if (!id || !operation) {
+    return;
+  }
+  const output = inspectDetailNode.querySelector(".inspect-plan-output");
+  if (output) {
+    output.textContent = "Reflecting gate preview...";
+  }
+  try {
+    const result = await inspectProvider("plan", { id, operation });
+    if (output) {
+      output.textContent = JSON.stringify({
+        operation: result.operation,
+        capabilities: result.capabilities || [],
+        audit_events: result.audit_events || [],
+        execution: result.execution || null,
+        dispatch: result.dispatch === true,
+      }, null, 2);
+    }
+    const requestButton = inspectDetailNode.querySelector("[data-inspect-act-id]");
+    if (requestButton) {
+      requestButton.dataset.inspectActId = id;
+      requestButton.dataset.inspectActOperation = operation;
+      requestButton.hidden = false;
+    }
+  } catch (error) {
+    if (output) {
+      output.textContent = String(error.message || error);
+    }
+  }
+}
+
+async function inspectProvider(operation, body) {
+  const response = await fetchJson(`/api/provider/inspect/${encodeURIComponent(operation)}`, {
+    method: "POST",
+    headers: shellHeaders({ "content-type": "application/json" }),
+    body: JSON.stringify(body || {}),
+  });
+  if (response.status === "ok") {
+    return response.data || {};
+  }
+  if (
+    operation === "request_act" &&
+    response.schema === "elastos.inspect.action-request/v1" &&
+    response.status === "pending"
+  ) {
+    return response;
+  }
+  throw new Error(readText(response.message) || readText(response.code) || "inspect provider error");
+}
+
+function inspectFact(label, value) {
+  const item = document.createElement("span");
+  item.className = "inspect-fact";
+  const key = document.createElement("b");
+  key.textContent = label;
+  const text = document.createElement("span");
+  text.textContent = readText(value) || "none";
+  item.append(key, text);
+  return item;
+}
+
+function inspectEmpty(message) {
+  const empty = document.createElement("div");
+  empty.className = "inspect-empty";
+  empty.textContent = message;
+  return empty;
+}
+
+function inspectName(entry) {
+  return readText(entry && entry.name) || readText(entry && entry.id) || "Object";
+}
+
+function inspectState(entry) {
+  const state = readText(entry && entry.state);
+  return state ? state.charAt(0).toUpperCase() + state.slice(1) : "Unknown";
+}
+
+function setInspectSelection(id) {
+  for (const row of document.querySelectorAll("[data-inspect-id]")) {
+    row.classList.toggle("active", row.dataset.inspectId === id);
+  }
+}
+
+function setInspectBusy(busy) {
+  if (inspectRefreshButton) {
+    inspectRefreshButton.disabled = busy || !hasShellAccess();
+  }
+}
+
+function showInspectStatus(message, tone) {
+  if (!inspectStatusNode) {
+    return;
+  }
+  const text = readText(message);
+  inspectStatusNode.hidden = text.length === 0;
+  inspectStatusNode.textContent = text;
+  inspectStatusNode.dataset.tone = tone;
 }
 
 function webspaceName(entry) {
@@ -1598,24 +1897,6 @@ function shortDid(did) {
   const prefix = value.startsWith("did:key:") ? "did:key:" : "";
   const body = prefix ? value.slice(prefix.length) : value;
   return `${prefix}${body.slice(0, 10)}…${body.slice(-8)}`;
-}
-
-function showHandleStatus(message, tone) {
-  if (!handleStatusNode) {
-    return;
-  }
-  handleStatusNode.hidden = false;
-  handleStatusNode.dataset.tone = tone;
-  handleStatusNode.textContent = message;
-}
-
-function clearHandleStatus() {
-  if (!handleStatusNode) {
-    return;
-  }
-  handleStatusNode.hidden = true;
-  handleStatusNode.textContent = "";
-  handleStatusNode.dataset.tone = "";
 }
 
 function setRuntimeState(runtime) {

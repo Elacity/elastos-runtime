@@ -14,6 +14,11 @@ export const toolbarInboxButton = document.querySelector("#toolbar-inbox");
 export const toolbarInboxCount = document.querySelector("#toolbar-inbox-count");
 export const toolbarFullscreenButton = document.querySelector("#toolbar-fullscreen");
 export const toolbarSignOutButton = document.querySelector("#toolbar-sign-out");
+export const homeNotificationToast = document.querySelector("#home-notification-toast");
+export const homeNotificationTitle = document.querySelector("#home-notification-title");
+export const homeNotificationBody = document.querySelector("#home-notification-body");
+export const homeNotificationAction = document.querySelector("#home-notification-action");
+export const homeNotificationDismiss = document.querySelector("#home-notification-dismiss");
 export const taskbarTargets = document.querySelector("#taskbar-targets");
 export const clockNode = document.querySelector("#clock");
 export const windowSnapPreview = document.querySelector("#window-snap-preview");
@@ -25,8 +30,11 @@ export const taskbarItemTemplate = document.querySelector("#taskbar-item-templat
 
 export const SHELL_APP_ID = "home";
 export const SYSTEM_APP_ID = "system";
+export const PEOPLE_TARGET_ID = "people";
 const TARGET_TITLE_OVERRIDES = Object.freeze({
   "archive-manager": "Archive",
+  [SYSTEM_APP_ID]: "System",
+  [PEOPLE_TARGET_ID]: "People",
 });
 const MAX_RECENT_TARGETS = 10;
 export const ICON_DRAG_THRESHOLD = 6;
@@ -129,12 +137,29 @@ export async function fetchJson(url, init) {
 }
 
 export function allVisibleTargets(summary) {
-  return (summary && Array.isArray(summary.targets))
-    ? summary.targets.map((target) => ({
+  if (!summary || !Array.isArray(summary.targets)) {
+    return [];
+  }
+  const targets = summary.targets.map((target) => ({
       ...target,
       title: canonicalTargetTitle(target?.target, target?.title),
-    }))
-    : [];
+    }));
+  if (
+    summary.authority &&
+    summary.authority.signed_in === true &&
+    !targets.some((target) => target.target === PEOPLE_TARGET_ID)
+  ) {
+    targets.push({
+      target: PEOPLE_TARGET_ID,
+      title: "People",
+      description: "See accepted ElastOS contacts and start conversations.",
+      route: "home://people",
+      attach_kind: "home",
+      role: "app",
+      target_kind: "app",
+    });
+  }
+  return targets;
 }
 
 export function desktopObjects(summary) {
@@ -278,11 +303,17 @@ export function initializeShellLayout(summary) {
       normalizedDesktopHidden,
     ) ||
     typeof stored.desktopIconsVisible !== "boolean";
+  const occupiedPositions = [];
   for (const [index, entry] of desktopLayoutEntries(summary).entries()) {
     const defaultPosition = defaultDesktopPosition(index);
     const storedPosition = stored && stored.desktop ? stored.desktop[entry.id] : null;
-    const position = clampDesktopPosition(normalizeDesktopPosition(storedPosition, defaultPosition));
+    let position = clampDesktopPosition(normalizeDesktopPosition(storedPosition, defaultPosition));
+    if (desktopPositionOverlapsAny(position, occupiedPositions)) {
+      position = nextAvailableDesktopPosition(occupiedPositions, index);
+      changed = true;
+    }
     shellState.shellLayoutState.desktop[entry.id] = position;
+    occupiedPositions.push(position);
     if (!storedPosition || !positionsEqual(storedPosition, position)) {
       changed = true;
     }
@@ -473,6 +504,33 @@ function defaultDesktopPosition(index) {
   };
 }
 
+function desktopPositionsOverlap(left, right) {
+  return (
+    Math.abs(left.x - right.x) < DESKTOP_ICON_WIDTH &&
+    Math.abs(left.y - right.y) < DESKTOP_ICON_HEIGHT
+  );
+}
+
+function desktopPositionOverlapsAny(position, positions) {
+  return positions.some((candidate) => desktopPositionsOverlap(position, candidate));
+}
+
+function nextAvailableDesktopPosition(occupiedPositions, preferredIndex) {
+  for (let offset = 0; offset < 200; offset += 1) {
+    const candidate = clampDesktopPosition(defaultDesktopPosition(preferredIndex + offset));
+    if (!desktopPositionOverlapsAny(candidate, occupiedPositions)) {
+      return candidate;
+    }
+  }
+  return clampDesktopPosition(defaultDesktopPosition(preferredIndex));
+}
+
+function occupiedDesktopPositionsExcept(targetId) {
+  return Object.entries(shellState.shellLayoutState.desktop)
+    .filter(([entryId]) => entryId !== targetId)
+    .map(([, position]) => clampDesktopPosition(position));
+}
+
 export function clampDesktopPosition(position) {
   const rect = desktop.getBoundingClientRect();
   const maxX = Math.max(
@@ -494,7 +552,10 @@ export function desktopPositionForTarget(targetId, defaultIndex) {
   if (stored) {
     return clampDesktopPosition(stored);
   }
-  const defaultPosition = defaultDesktopPosition(defaultIndex);
+  const defaultPosition = nextAvailableDesktopPosition(
+    occupiedDesktopPositionsExcept(targetId),
+    defaultIndex,
+  );
   shellState.shellLayoutState.desktop[targetId] = defaultPosition;
   saveShellLayoutState();
   return defaultPosition;
@@ -659,6 +720,9 @@ export function glyphTone(targetId) {
   if (targetId.includes("room")) {
     return "room";
   }
+  if (targetId === PEOPLE_TARGET_ID) {
+    return "room";
+  }
   if (targetId.includes("md") || targetId.includes("doc") || targetId.includes("viewer")) {
     return "docs";
   }
@@ -722,6 +786,16 @@ function glyphSvg(targetId) {
         <path d="M8 9h8" />
         <path d="M8 13h4.5" />
         <circle cx="16.75" cy="13.25" r="1.25" fill="currentColor" stroke="none" />
+      </svg>
+    `;
+  }
+  if (targetId === PEOPLE_TARGET_ID) {
+    return `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="9" cy="8" r="3" />
+        <circle cx="16.5" cy="9.25" r="2.25" />
+        <path d="M4.5 19.25a4.5 4.5 0 0 1 9 0" />
+        <path d="M13.25 17.75a3.5 3.5 0 0 1 6.25 1.5" />
       </svg>
     `;
   }

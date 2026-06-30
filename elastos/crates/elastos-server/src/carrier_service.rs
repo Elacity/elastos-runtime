@@ -224,28 +224,28 @@ impl CarrierServiceProvider {
     fn to_raw_request(request: &ResourceRequest) -> serde_json::Value {
         match request.action {
             ResourceAction::Read => serde_json::json!({
-                "op": "read", "path": request.path, "token": "",
+                "op": "read", "path": request.path,
             }),
             ResourceAction::Write => serde_json::json!({
-                "op": "write", "path": request.path, "token": "",
+                "op": "write", "path": request.path,
                 "content": request.content.clone().unwrap_or_default(), "append": false,
             }),
             ResourceAction::Delete => serde_json::json!({
-                "op": "delete", "path": request.path, "token": "",
+                "op": "delete", "path": request.path,
                 "recursive": request.recursive,
             }),
             ResourceAction::List => serde_json::json!({
-                "op": "list", "path": request.path, "token": "",
+                "op": "list", "path": request.path,
             }),
             ResourceAction::Stat => serde_json::json!({
-                "op": "stat", "path": request.path, "token": "",
+                "op": "stat", "path": request.path,
             }),
             ResourceAction::Mkdir => serde_json::json!({
-                "op": "mkdir", "path": request.path, "token": "",
+                "op": "mkdir", "path": request.path,
                 "parents": true,
             }),
             ResourceAction::Exists => serde_json::json!({
-                "op": "exists", "path": request.path, "token": "",
+                "op": "exists", "path": request.path,
             }),
         }
     }

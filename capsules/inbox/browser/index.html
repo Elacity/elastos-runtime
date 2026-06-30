@@ -7,30 +7,27 @@
   <style>
     :root {
       color-scheme: light;
-      --bg: #edf1fb;
-      --bg-strong: #e3e9fb;
-      --panel: rgba(255, 255, 255, 0.9);
+      --bg: #ffffff;
+      --sidebar-bg: #f9f9f9;
+      --toolbar-bg: #fafafa;
+      --panel: #ffffff;
       --panel-strong: #ffffff;
-      --panel-soft: #eef2ff;
-      --line: rgba(83, 103, 164, 0.14);
-      --line-strong: rgba(83, 103, 164, 0.22);
-      --ink: #1d2438;
-      --muted: #66708a;
+      --panel-soft: #f9f9f9;
+      --line: #e5e7eb;
+      --line-strong: #d1d5db;
+      --ink: #1f2937;
+      --muted: #6b7280;
       --brand: #f6921a;
-      --brand-soft: #fff1dc;
-      --accent: #5f76d8;
-      --accent-soft: #e8edff;
-      --accent-deep: #3c53a7;
+      --accent: #007aff;
+      --accent-soft: #e5f0ff;
       --danger: #b14c5a;
-      --self: #edf2ff;
-      --shadow: 0 24px 60px rgba(34, 49, 88, 0.12);
+      --shadow: none;
       --border: var(--line);
       --border-strong: var(--line-strong);
       --text: var(--ink);
-      --radius-xl: 26px;
-      --radius-lg: 18px;
-      --radius-md: 14px;
-      font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
+      --radius-lg: 8px;
+      --radius-md: 6px;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
     }
 
     * {
@@ -41,10 +38,7 @@
       margin: 0;
       min-height: 100vh;
       min-height: 100dvh;
-      background:
-        radial-gradient(circle at top left, rgba(95, 118, 216, 0.14), transparent 28%),
-        radial-gradient(circle at bottom right, rgba(126, 149, 226, 0.12), transparent 24%),
-        linear-gradient(180deg, #f7f9ff 0%, var(--bg) 100%);
+      background: var(--bg);
       color: var(--text);
     }
 
@@ -69,9 +63,8 @@
     .main {
       border: 1px solid var(--border);
       background: var(--panel);
-      border-radius: var(--radius-xl);
+      border-radius: var(--radius-lg);
       box-shadow: var(--shadow);
-      backdrop-filter: blur(18px);
     }
 
     .locked-card {
@@ -80,38 +73,50 @@
     }
 
     .shell {
-      min-height: 100vh;
-      min-height: 100dvh;
+      height: 100vh;
+      height: 100dvh;
       display: grid;
-      grid-template-columns: minmax(240px, 290px) minmax(0, 1fr);
-      gap: 24px;
-      padding: 24px;
+      grid-template-columns: 200px minmax(0, 1fr);
+      gap: 0;
+      overflow: hidden;
+      background: var(--panel);
     }
 
     .sidebar,
     .main {
       min-width: 0;
-      padding: 22px;
     }
 
     .sidebar {
       display: flex;
       flex-direction: column;
-      gap: 18px;
+      gap: 4px;
+      padding: 20px;
+      border: 0;
+      border-right: 1px solid var(--line);
+      border-radius: 0;
+      background: var(--sidebar-bg);
+      box-shadow: none;
     }
 
     .main {
       display: flex;
       flex-direction: column;
-      gap: 18px;
+      min-height: 0;
+      overflow: hidden;
+      border: 0;
+      border-radius: 0;
+      background: var(--panel);
+      box-shadow: none;
     }
 
     .eyebrow {
-      margin: 0 0 10px;
-      font-size: 0.82rem;
-      letter-spacing: 0.12em;
+      margin: 0;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
       text-transform: uppercase;
-      color: var(--accent);
+      color: var(--muted);
     }
 
     h1,
@@ -121,14 +126,16 @@
     }
 
     h1 {
-      font-size: clamp(2rem, 6vw, 3.4rem);
-      letter-spacing: -0.05em;
-      line-height: 0.95;
+      font-size: 24px;
+      font-weight: 500;
+      letter-spacing: 0;
+      line-height: 1.2;
     }
 
     h2 {
-      font-size: clamp(1.4rem, 3vw, 2.2rem);
-      letter-spacing: -0.035em;
+      font-size: 18px;
+      font-weight: 500;
+      letter-spacing: 0;
     }
 
     .subtitle,
@@ -137,50 +144,94 @@
       line-height: 1.5;
     }
 
+    .sidebar-title {
+      margin: 15px 0 16px;
+      color: var(--muted);
+      font-size: 19px;
+      font-weight: 700;
+    }
+
     .summary-stack {
       display: grid;
-      gap: 10px;
-      margin-top: auto;
+      gap: 4px;
     }
 
     .summary-card {
-      padding: 14px;
-      border: 1px solid rgba(83, 103, 164, 0.1);
-      border-radius: var(--radius-lg);
-      background: rgba(255, 255, 255, 0.7);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-height: 34px;
+      padding: 7px 10px;
+      border: 0;
+      border-radius: 4px;
+      background: transparent;
+      color: var(--ink);
+    }
+
+    .summary-card.active,
+    .summary-card:hover {
+      background: var(--line);
     }
 
     .summary-card strong {
-      display: block;
-      font-size: 1.45rem;
-      letter-spacing: -0.04em;
+      order: 2;
+      min-width: 28px;
+      color: var(--muted);
+      font-size: 13px;
+      text-align: right;
     }
 
     .summary-card span {
-      color: var(--muted);
-      font-size: 0.9rem;
+      overflow: hidden;
+      font-size: 14px;
+      font-weight: 500;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     .toolbar {
       display: flex;
-      align-items: flex-start;
+      align-items: center;
       justify-content: space-between;
-      gap: 16px;
-      padding-bottom: 18px;
-      border-bottom: 1px solid rgba(83, 103, 164, 0.1);
+      gap: 12px;
+      min-height: 49px;
+      padding: 6px 10px 6px 14px;
+      border-bottom: 1px solid var(--line);
+      background: var(--toolbar-bg);
+    }
+
+    .toolbar-title {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .toolbar-title h1 {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .status {
+      min-height: 1.4em;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
     }
 
     .action-secondary,
     .entry-action {
-      min-height: 38px;
-      border-radius: 999px;
+      min-height: 30px;
+      border-radius: 6px;
       border: 1px solid var(--border);
-      padding: 8px 14px;
-      background: rgba(255, 255, 255, 0.8);
+      padding: 5px 10px;
+      background: #fff;
       color: var(--text);
       cursor: pointer;
-      font-weight: 700;
-      transition: background 160ms ease, border-color 160ms ease, transform 160ms ease;
+      font-weight: 600;
+      transition: background 150ms ease, border-color 150ms ease;
     }
 
     .action-secondary:hover,
@@ -188,32 +239,32 @@
     .entry-action:hover,
     .entry-action:focus-visible {
       border-color: var(--border-strong);
-      background: #f8fbff;
+      background: #f9fafb;
       outline: none;
-      transform: translateY(-1px);
     }
 
     .entry-list {
       display: grid;
-      gap: 12px;
+      gap: 8px;
+      min-height: 0;
+      overflow: auto;
+      padding: 12px;
     }
 
     .entry {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
-      gap: 18px;
-      padding: 18px;
-      border: 1px solid rgba(83, 103, 164, 0.1);
-      border-radius: var(--radius-lg);
-      background: var(--panel-strong);
-      box-shadow: 0 14px 34px rgba(34, 49, 88, 0.08);
+      gap: 12px;
+      padding: 12px;
+      border: 1px solid #d0d0d0;
+      border-radius: 8px;
+      background: var(--panel-soft);
+      box-shadow: none;
     }
 
     .entry[data-severity="attention"] {
-      border-color: rgba(95, 118, 216, 0.28);
-      background:
-        linear-gradient(135deg, rgba(95, 118, 216, 0.1), transparent 42%),
-        var(--panel-strong);
+      border-color: rgba(0, 122, 255, 0.35);
+      background: #f5f9ff;
     }
 
     .entry-copy {
@@ -231,31 +282,32 @@
 
     .entry-title {
       font-size: 1.05rem;
-      font-weight: 800;
-      letter-spacing: -0.02em;
+      font-weight: 600;
+      letter-spacing: 0;
     }
 
     .entry-badge {
       display: inline-flex;
       align-items: center;
-      min-height: 23px;
-      padding: 0 9px;
-      border-radius: 999px;
+      min-height: 20px;
+      padding: 0 7px;
+      border-radius: 5px;
       background: var(--accent-soft);
       color: var(--accent);
       font-size: 0.72rem;
-      font-weight: 900;
-      letter-spacing: 0.08em;
+      font-weight: 700;
+      letter-spacing: 0.04em;
       text-transform: uppercase;
     }
 
     .entry-time {
       color: var(--muted);
-      font-size: 0.86rem;
+      font-size: 12px;
     }
 
     .entry-body {
       color: var(--muted);
+      font-size: 13px;
       line-height: 1.45;
     }
 
@@ -264,8 +316,8 @@
       flex-wrap: wrap;
       justify-content: flex-end;
       align-content: flex-start;
-      gap: 8px;
-      min-width: 200px;
+      gap: 6px;
+      min-width: 160px;
     }
 
     .entry-action.primary {
@@ -283,28 +335,28 @@
     .entry-action:disabled {
       cursor: wait;
       opacity: 0.55;
-      transform: none;
     }
 
     .empty-state {
-      min-height: 260px;
+      min-height: 0;
+      flex: 1 1 auto;
       display: grid;
       place-items: center;
-      padding: 28px;
-      border: 1px dashed rgba(83, 103, 164, 0.18);
-      border-radius: var(--radius-xl);
-      background: rgba(255, 255, 255, 0.55);
+      margin: 12px;
+      padding: 20px;
+      border: 1px solid #d0d0d0;
+      border-radius: 8px;
+      background: var(--panel-soft);
       text-align: center;
-    }
-
-    .status {
-      min-height: 1.5em;
-      color: var(--muted);
     }
 
     @media (max-width: 900px) {
       .shell {
         grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        display: none;
       }
 
       .summary-stack {
@@ -314,8 +366,8 @@
 
     @media (max-width: 640px) {
       .shell {
-        gap: 8px;
-        padding: 4px;
+        height: 100vh;
+        height: 100dvh;
       }
 
       .locked-shell {
@@ -325,14 +377,8 @@
       .locked-card,
       .sidebar,
       .main {
-        border-radius: 14px;
-        box-shadow: 0 10px 26px rgba(34, 49, 88, 0.08);
-      }
-
-      .locked-card,
-      .sidebar,
-      .main {
-        padding: 8px;
+        border-radius: 0;
+        box-shadow: none;
       }
 
       .toolbar,
@@ -341,7 +387,7 @@
       }
 
       .toolbar {
-        display: grid;
+        display: flex;
         gap: 8px;
       }
 
@@ -372,11 +418,9 @@
 
   <section id="inbox-shell" class="shell hidden">
     <aside class="sidebar">
-      <div>
-        <p class="eyebrow">Inbox</p>
-      </div>
+      <div class="sidebar-title">Inbox</div>
       <div class="summary-stack" aria-label="Inbox summary">
-        <article class="summary-card">
+        <article class="summary-card active">
           <strong id="pending-count">0</strong>
           <span>Pending</span>
         </article>
@@ -389,8 +433,8 @@
 
     <main class="main">
       <div class="toolbar">
-        <div>
-          <p class="eyebrow">Requests</p>
+        <div class="toolbar-title">
+          <h1>Requests</h1>
           <p id="status-text" class="status">Loading...</p>
         </div>
         <button id="refresh" class="action-secondary" type="button">Refresh</button>
@@ -483,10 +527,88 @@
       return response.json();
     }
 
-    async function inboxAction(actionId) {
+    async function requestFreshPasskeyHomeToken() {
+      if (!window.PublicKeyCredential) {
+        throw new Error("Passkey verification is unavailable in this browser.");
+      }
+      const begin = await passkeyJson("/api/auth/passkey/authenticate/begin", { method: "POST" });
+      const credential = await navigator.credentials.get(toRequestOptions(begin.options));
+      if (!credential) {
+        throw new Error("Passkey verification was cancelled.");
+      }
+      const complete = await passkeyJson("/api/auth/passkey/authenticate/complete", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          ceremony_id: begin.ceremony_id,
+          response: serializeAssertionCredential(credential),
+        }),
+      });
+      const homeToken = typeof complete.home_token === "string" ? complete.home_token.trim() : "";
+      if (!homeToken) {
+        throw new Error("Fresh passkey token was not issued.");
+      }
+      return homeToken;
+    }
+
+    async function passkeyJson(path, options) {
+      const response = await fetch(path, options);
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        throw new Error(text || "Passkey verification failed.");
+      }
+      return response.json();
+    }
+
+    function toRequestOptions(options) {
+      const publicKey = Object.assign({}, options && options.publicKey ? options.publicKey : {});
+      publicKey.challenge = base64UrlToBuffer(publicKey.challenge);
+      publicKey.allowCredentials = (publicKey.allowCredentials || []).map((credential) => Object.assign({}, credential, {
+        id: base64UrlToBuffer(credential.id),
+      }));
+      return { publicKey };
+    }
+
+    function serializeAssertionCredential(credential) {
+      return {
+        id: credential.id,
+        rawId: bufferToBase64Url(credential.rawId),
+        type: credential.type,
+        response: {
+          clientDataJson: bufferToBase64Url(credential.response.clientDataJSON),
+          authenticatorData: bufferToBase64Url(credential.response.authenticatorData),
+          signature: bufferToBase64Url(credential.response.signature),
+          userHandle: credential.response.userHandle
+            ? bufferToBase64Url(credential.response.userHandle)
+            : null,
+        },
+      };
+    }
+
+    function base64UrlToBuffer(value) {
+      const base64 = String(value || "").replace(/-/g, "+").replace(/_/g, "/");
+      const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
+      const raw = window.atob(padded);
+      const bytes = new Uint8Array(raw.length);
+      for (let index = 0; index < raw.length; index += 1) {
+        bytes[index] = raw.charCodeAt(index);
+      }
+      return bytes.buffer;
+    }
+
+    function bufferToBase64Url(buffer) {
+      const bytes = new Uint8Array(buffer);
+      let binary = "";
+      for (const byte of bytes) {
+        binary += String.fromCharCode(byte);
+      }
+      return window.btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+    }
+
+    async function inboxAction(actionId, fields = {}) {
       return api("/api/apps/inbox/actions", {
         method: "POST",
-        body: JSON.stringify({ action_id: actionId }),
+        body: JSON.stringify(Object.assign({ action_id: actionId }, fields)),
       });
     }
 
@@ -580,17 +702,24 @@
         actions.appendChild(createActionButton("Deny", "room-deny-request:" + actionId.slice("room-approve-request:".length), "danger"));
       } else if (typeof actionId === "string" && actionId.startsWith("wallet-approve-request:")) {
         const requestId = actionId.slice("wallet-approve-request:".length);
-        actions.appendChild(createButton("Review in Wallet", () => openSource("wallet", { wallet_request: requestId }), "primary"));
+        actions.appendChild(createButton("Approve", (button) => approveWalletRequest(button, requestId), "primary"));
+        actions.appendChild(createButton("Review in Wallet", () => openSource("wallet", { wallet_request: requestId })));
         actions.appendChild(createActionButton("Reject", "wallet-reject-request:" + actionId.slice("wallet-approve-request:".length), "danger"));
       } else if (typeof actionId === "string" && actionId.startsWith("capability-approve-request:")) {
         actions.appendChild(createActionButton("Approve", actionId, "primary"));
         actions.appendChild(createActionButton("Deny", "capability-deny-request:" + actionId.slice("capability-approve-request:".length), "danger"));
+      } else if (typeof actionId === "string" && actionId.startsWith("inspect-approve-request:")) {
+        const requestId = actionId.slice("inspect-approve-request:".length);
+        const approveButton = createButton("Approve", (button) => approveInspectRequest(button, requestId), "primary");
+        approveButton.dataset.actionId = actionId;
+        actions.appendChild(approveButton);
+        actions.appendChild(createActionButton("Deny", "inspect-deny-request:" + actionId.slice("inspect-approve-request:".length), "danger"));
       } else if (typeof actionId === "string" && actionId.startsWith("wallet-price-http-approve:")) {
         actions.appendChild(createActionButton("Approve", actionId, "primary"));
         actions.appendChild(createActionButton("Reject", "wallet-price-http-deny:" + actionId.slice("wallet-price-http-approve:".length), "danger"));
       }
 
-      if (entry.kind !== "wallet_approval_request" && entry.kind !== "capability_request" && entry.kind !== "external_http_request") {
+      if (entry.kind !== "wallet_approval_request" && entry.kind !== "capability_request" && entry.kind !== "inspect_action_request" && entry.kind !== "external_http_request") {
         actions.appendChild(createActionButton("Dismiss", "notification-dismiss:" + entry.id));
       }
       article.append(copy, actions);
@@ -626,6 +755,46 @@
       }
     }
 
+    async function approveWalletRequest(button, requestId) {
+      if (!requestId) {
+        return;
+      }
+      setButtonsDisabled(true);
+      button.disabled = true;
+      setStatus("Confirm with your passkey to sign.");
+      try {
+        const homeToken = await requestFreshPasskeyHomeToken();
+        await inboxAction("wallet-approve-request:" + requestId, {
+          home_token: homeToken,
+        });
+        setStatus("Request signed.");
+        await loadInbox();
+        notifyHome();
+      } finally {
+        setButtonsDisabled(false);
+      }
+    }
+
+    async function approveInspectRequest(button, requestId) {
+      if (!requestId) {
+        return;
+      }
+      setButtonsDisabled(true);
+      button.disabled = true;
+      setStatus("Confirm with your passkey to approve this Inspector action.");
+      try {
+        const homeToken = await requestFreshPasskeyHomeToken();
+        await inboxAction("inspect-approve-request:" + requestId, {
+          home_token: homeToken,
+        });
+        setStatus("Inspector action approved.");
+        await loadInbox();
+        notifyHome();
+      } finally {
+        setButtonsDisabled(false);
+      }
+    }
+
     function setButtonsDisabled(disabled) {
       for (const button of elements.entryList.querySelectorAll("button")) {
         button.disabled = disabled;
@@ -656,10 +825,14 @@
       Promise.all(
         unreadIds.map((id) => inboxAction("notification-read:" + id).catch(() => null)),
       ).then(() => {
+        const unreadIdSet = new Set(unreadIds);
         for (const entry of state.entries) {
-          entry.read = true;
+          if (unreadIdSet.has(entry.id)) {
+            entry.read = true;
+          }
         }
-        renderInbox(Object.assign({}, notifications, { unread_count: 0 }));
+        const unreadCount = Math.max(0, Number(notifications.unread_count || 0) - unreadIds.length);
+        renderInbox(Object.assign({}, notifications, { unread_count: unreadCount }));
         notifyHome();
       });
     }

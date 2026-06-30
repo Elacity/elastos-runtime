@@ -33,6 +33,8 @@ struct HomeSnapshot {
     #[serde(default)]
     room: RoomStatus,
     #[serde(default)]
+    people: PeopleStatus,
+    #[serde(default)]
     notifications: NotificationStatus,
     roots: Vec<RootStatus>,
     actions: Vec<ActionInfo>,
@@ -88,8 +90,6 @@ struct RoomStatus {
     allow_member_invites: bool,
     #[serde(default)]
     allow_members_to_host_guests: bool,
-    #[serde(default)]
-    local_runtime_did: Option<String>,
     #[serde(default)]
     local_runtime_role: Option<String>,
     #[serde(default)]
@@ -149,7 +149,28 @@ struct RoomInviteStatus {
     #[allow(dead_code)]
     invite_id: String,
     invited_did: String,
-    role: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PeopleStatus {
+    #[serde(default)]
+    contact_count: usize,
+    #[serde(default)]
+    contacts: Vec<PeopleContactStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PeopleContactStatus {
+    #[allow(dead_code)]
+    contact_id: String,
+    display_name: String,
+    relationship: String,
+    #[allow(dead_code)]
+    route: String,
+    #[serde(default)]
+    can_message: bool,
+    #[serde(default)]
+    device_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -414,7 +435,6 @@ fn storage_read(token: &str, path: &str) -> Result<Vec<u8>> {
         "read",
         &serde_json::json!({
             "path": path,
-            "token": token,
         }),
     )?;
     let data = result
@@ -443,7 +463,6 @@ fn storage_write(token: &str, path: &str, content: Vec<u8>) -> Result<()> {
         "write",
         &serde_json::json!({
             "path": path,
-            "token": token,
             "content": content,
             "append": false,
         }),
@@ -1347,25 +1366,53 @@ fn render_people_tab(buf: &mut String, snapshot: &HomeSnapshot, state: &TuiState
         push_section_lines(&mut left, "Actions", &actions);
     }
 
+    let contacts = if snapshot.people.contacts.is_empty() {
+        vec!["No accepted ElastOS contacts yet. Join a shared conversation first.".to_string()]
+    } else {
+        snapshot
+            .people
+            .contacts
+            .iter()
+            .take(8)
+            .map(|contact| {
+                let device = contact
+                    .device_label
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| format!(" on {value}"))
+                    .unwrap_or_default();
+                let action = if contact.can_message {
+                    " · Message opens Chat"
+                } else {
+                    ""
+                };
+                format!(
+                    "{}{} · {}{}",
+                    contact.display_name, device, contact.relationship, action
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    push_section_lines(&mut left, "Contacts", &contacts);
+
     let mut connections = vec![
         format!(
             "Chat       {}",
             action_state_label(action_by_id(snapshot, "chat"))
         ),
-        "Flow       Home -> Chat shows bootstrap, room join, peer count, and send status"
+        "Flow       Home -> Chat shows conversation, people, sync status, and object sharing"
             .to_string(),
         format!(
             "Delivery   {}",
             if snapshot.runtime.peer_count.unwrap_or_default() == 0 {
-                "Local only until another participant joins Chat"
+                "Local only until another ElastOS user joins Chat"
             } else {
                 "Open Chat and send a line to confirm room delivery"
             }
         ),
     ];
-    connections.push(
-        "Mode       Native chat is the current first-class Home conversation path.".to_string(),
-    );
+    connections
+        .push("Mode       Chat is the current first-class Home conversation path.".to_string());
     push_section_lines(&mut right, "Connections", &connections);
 
     let mut room = vec![
@@ -1374,26 +1421,26 @@ fn render_people_tab(buf: &mut String, snapshot: &HomeSnapshot, state: &TuiState
         format!(
             "Guests     {}",
             if snapshot.room.allow_guest_invites {
-                "hosted guest invites enabled"
+                "public join requests enabled"
             } else {
-                "hosted guest invites disabled"
+                "public join requests disabled"
             }
         ),
         format!(
-            "Members    {}",
+            "ElastOS    {}",
             if snapshot.room.allow_member_invites {
-                "sovereign member invites enabled"
+                "user invites enabled"
             } else {
-                "sovereign member invites disabled"
+                "user invites disabled"
             }
         ),
     ];
     room.push(format!(
-        "Hosting    {}",
+        "Approvals  {}",
         if snapshot.room.allow_members_to_host_guests {
-            "members may host browser guests"
+            "trusted users may approve web guests"
         } else {
-            "only owners and admins may host browser guests"
+            "conversation managers approve web guests"
         }
     ));
     room.push(format!("Invites    {}", snapshot.room.pending_invite_count));
@@ -1410,7 +1457,7 @@ fn render_people_tab(buf: &mut String, snapshot: &HomeSnapshot, state: &TuiState
         ));
     }
     if snapshot.room.pending_requests.is_empty() {
-        room.push("Requests   no browser access requests pending".to_string());
+        room.push("Requests   no web guest join requests pending".to_string());
     } else {
         for request in snapshot.room.pending_requests.iter().take(4) {
             room.push(format!(
@@ -1420,26 +1467,23 @@ fn render_people_tab(buf: &mut String, snapshot: &HomeSnapshot, state: &TuiState
         }
     }
     if snapshot.room.active_sessions.is_empty() {
-        room.push("Browsers   no active browser sessions".to_string());
+        room.push("Web guests no active web guest sessions".to_string());
     } else {
         for session in snapshot.room.active_sessions.iter().take(4) {
             room.push(format!(
-                "Browser    {} on {}",
+                "Web guest  {} on {}",
                 session.display_name, session.device_label
             ));
         }
     }
     for invite in snapshot.room.pending_invites.iter().take(2) {
         room.push(format!(
-            "Invite     {} as {}",
+            "Invite     {} pending",
             truncate(&invite.invited_did, column_width.saturating_sub(18).max(16)),
-            invite.role
         ));
     }
-    room.push(
-        "Control    Open Apps -> Chat Room to review browser access and disconnect.".to_string(),
-    );
-    push_section_lines(&mut right, "Chat Room", &room);
+    room.push("Control    Open Apps -> Shared Conversation to review access.".to_string());
+    push_section_lines(&mut right, "Conversation", &room);
 
     if let Some(action) = selected_action(snapshot, &people_actions, state.people_index) {
         let mut profile = vec![
@@ -1678,6 +1722,7 @@ fn people_summary_lines(snapshot: &HomeSnapshot) -> Vec<String> {
         format!("You        {}", snapshot.user),
         format!("Nick       {}", display_name(snapshot)),
         format!("Identity   {}", identity_summary(snapshot)),
+        format!("Contacts   {}", snapshot.people.contact_count),
         format!("Network    {}", network_summary(snapshot)),
         format!(
             "Profile    {}",
@@ -2242,9 +2287,9 @@ fn home_action_state<'a>(action: &'a ActionInfo, snapshot: &HomeSnapshot) -> &'a
 fn home_action_summary(action: &ActionInfo) -> &str {
     match action.id.as_str() {
         "chat" => "Send a message and return home",
-        "room-approve" => "Approve the next pending room browser request",
-        "room-deny" => "Deny the next pending room browser request",
-        "room-revoke-all" => "Revoke active room browser sessions",
+        "room-approve" => "Approve the next pending Chat web guest request",
+        "room-deny" => "Deny the next pending Chat web guest request",
+        "room-revoke-all" => "Disconnect active Chat web guest sessions",
         "site-local" => "Stage, preview, and check live state for MyWebSite",
         "site-ephemeral" => "Open a temporary public HTTPS URL for MyWebSite",
         "shares-list" => "Review shared channels, open links, and next steps",
@@ -2296,7 +2341,7 @@ fn alerts_lines(snapshot: &HomeSnapshot, width: usize, notice: Option<&str>) -> 
     }
     if snapshot.room.active_session_count > 0 {
         alerts.push(format!(
-            "Chat Room has {} active browser session(s): {}.",
+            "Chat has {} active web guest session(s): {}.",
             snapshot.room.active_session_count,
             format_room_participants(&snapshot.room.active_participants)
         ));
@@ -2535,12 +2580,12 @@ fn chat_room_app_entry(snapshot: &HomeSnapshot) -> Option<AppEntry> {
     Some(AppEntry {
         name: "chat-room".to_string(),
         action_id: "chat-room".to_string(),
-        label: "Chat Room".to_string(),
+        label: "Shared Conversation".to_string(),
         category: "Communication",
         description:
-            "Hosted guest room plus sovereign Home member room control, with per-browser session approval."
+            "Chat with other ElastOS users and approved web guests, with attachments opening as ElastOS documents."
                 .to_string(),
-        command: "Home room control stays local to this runtime.".to_string(),
+        command: "Conversation access stays local to this Home.".to_string(),
         state: state.to_string(),
         is_control: false,
     })
@@ -2598,57 +2643,45 @@ fn chat_room_app_detail_lines(
         details.push(format!("Title      {}", snapshot.room.title));
     }
     if !snapshot.room.room_slug.is_empty() {
-        details.push(format!("Room       {}", snapshot.room.room_slug));
+        details.push(format!("Channel    {}", snapshot.room.room_slug));
     }
     if let Some(role) = snapshot.room.local_runtime_role.as_deref() {
-        details.push(format!("Role       {}", role));
+        details.push(format!("Access     {}", conversation_role_label(role)));
     } else {
-        details.push("Role       local runtime is not a room member".to_string());
-    }
-    if let Some(runtime_did) = snapshot.room.local_runtime_did.as_deref() {
-        details.push(format!(
-            "Runtime    {}",
-            truncate(runtime_did, width.saturating_sub(13).max(16))
-        ));
-    }
-    if let Some(owner_did) = snapshot.room.owner_did.as_deref() {
-        details.push(format!(
-            "Owner      {}",
-            truncate(owner_did, width.saturating_sub(13).max(16))
-        ));
+        details.push("Access     this device is not connected to this conversation".to_string());
     }
     details.push(format!(
-        "Members    {} total · {} active · {} admin",
-        snapshot.room.member_count, snapshot.room.active_member_count, snapshot.room.admin_count
+        "People     {} trusted · {} admins · {} active",
+        snapshot.room.member_count, snapshot.room.admin_count, snapshot.room.active_member_count
     ));
     details.push(format!("Key epoch  {}", snapshot.room.current_key_epoch));
     details.push(format!(
-        "Guests     {}",
+        "Web guests {}",
         if snapshot.room.allow_guest_invites {
-            "hosted guest invites enabled"
+            "public join requests enabled"
         } else {
-            "hosted guest invites disabled"
+            "public join requests disabled"
         }
     ));
     details.push(format!(
-        "Members    {}",
+        "ElastOS    {}",
         if snapshot.room.allow_member_invites {
-            "sovereign member invites enabled"
+            "user invites enabled"
         } else {
-            "sovereign member invites disabled"
+            "user invites disabled"
         }
     ));
     details.push(format!(
-        "Hosting    {}",
+        "Approvals  {}",
         if snapshot.room.allow_members_to_host_guests {
-            "members may host browser guests"
+            "trusted users may approve web guests"
         } else {
-            "only owners and admins may host browser guests"
+            "conversation managers approve web guests"
         }
     ));
     if let Some(url) = snapshot.room.canonical_hosted_guest_url.as_deref() {
         details.push(format!(
-            "Hosted URL {}",
+            "Public URL {}",
             truncate(url, width.saturating_sub(12).max(28))
         ));
     }
@@ -2665,50 +2698,49 @@ fn chat_room_app_detail_lines(
         ));
         for invite in snapshot.room.pending_invites.iter().take(3) {
             details.push(format!(
-                "Invite     {} as {}",
+                "Invite     {} pending",
                 truncate(&invite.invited_did, width.saturating_sub(18).max(16)),
-                invite.role
             ));
         }
     } else {
-        details.push("Invites    no sovereign member invites pending".to_string());
+        details.push("Invites    no ElastOS user invites pending".to_string());
     }
     if snapshot.room.owner_did.is_none() {
-        details.push("CLI        elastos room seed --title \"Room\"".to_string());
+        details.push("Advanced   elastos room seed --title \"Chat\"".to_string());
     } else if matches!(
         snapshot.room.local_runtime_role.as_deref(),
         Some("owner") | Some("admin")
     ) {
-        details.push("CLI        elastos room invite <did:key:...> --role member".to_string());
+        details.push("Advanced   elastos room invite <did:key:...>".to_string());
     }
 
     if snapshot.room.members.is_empty() {
-        details.push("Roster     no sovereign members yet".to_string());
+        details.push("People     no trusted ElastOS users yet".to_string());
     } else {
         for member in snapshot.room.members.iter().take(4) {
             details.push(format!(
-                "Member     {} ({})",
+                "Person     {} ({})",
                 truncate(&member.member_did, width.saturating_sub(18).max(16)),
-                member.role
+                conversation_role_label(&member.role)
             ));
         }
     }
 
     if !snapshot.room.browser_access_allowed {
         if let Some(reason) = snapshot.room.browser_access_block_reason.as_deref() {
-            details.extend(wrap_with_label("Browser", reason, width));
+            details.extend(wrap_with_label("Web link", reason, width));
         } else {
-            details.push("Browser    access blocked on this runtime".to_string());
+            details.push("Web link   access blocked on this device".to_string());
         }
     } else {
-        details.push("Browser    access allowed for this runtime".to_string());
+        details.push("Web link   access allowed from this device".to_string());
     }
 
     if snapshot.room.pending_requests.is_empty() {
-        details.push("Pending    no browser access requests".to_string());
+        details.push("Pending    no web guest join requests".to_string());
     } else {
         details.push(format!(
-            "Pending    {} browser request(s)",
+            "Pending    {} web guest request(s)",
             snapshot.room.pending_requests.len()
         ));
         for request in snapshot.room.pending_requests.iter().take(3) {
@@ -2720,15 +2752,15 @@ fn chat_room_app_detail_lines(
     }
 
     if snapshot.room.active_sessions.is_empty() {
-        details.push("Browsers   no active browser sessions".to_string());
+        details.push("Web guests no active web guest sessions".to_string());
     } else {
         details.push(format!(
-            "Browsers   {} active session(s)",
+            "Web guests {} active session(s)",
             snapshot.room.active_sessions.len()
         ));
         for session in snapshot.room.active_sessions.iter().take(3) {
             details.push(format!(
-                "Browser    {} on {}",
+                "Web guest  {} on {}",
                 session.display_name, session.device_label
             ));
         }
@@ -2736,10 +2768,10 @@ fn chat_room_app_detail_lines(
 
     let available_controls = room_control_entries(snapshot);
     if available_controls.is_empty() {
-        details.push("Control    No room actions are waiting right now.".to_string());
+        details.push("Control    No conversation actions are waiting right now.".to_string());
     } else {
         details.push(format!(
-            "Control    {} targeted room action(s) are available below this room in Apps.",
+            "Control    {} targeted conversation action(s) are available below this entry in Apps.",
             available_controls.len()
         ));
         for control in available_controls.iter().take(3) {
@@ -2929,6 +2961,14 @@ fn truncate(value: &str, max: usize) -> String {
     format!("{}…{}", start, end)
 }
 
+fn conversation_role_label(role: &str) -> String {
+    match role {
+        "owner" | "admin" => "conversation manager".to_string(),
+        "member" => "trusted participant".to_string(),
+        _ => role.to_string(),
+    }
+}
+
 fn visible_text_width(text: &str) -> usize {
     let bytes = text.as_bytes();
     let mut idx = 0;
@@ -3001,7 +3041,6 @@ mod tests {
                 allow_guest_invites: true,
                 allow_member_invites: true,
                 allow_members_to_host_guests: true,
-                local_runtime_did: Some("did:key:z6MkhExample".to_string()),
                 local_runtime_role: Some("owner".to_string()),
                 canonical_hosted_guest_url: Some(
                     "https://elastos.elacitylabs.com/apps/chat-room/".to_string(),
@@ -3020,6 +3059,7 @@ mod tests {
                 }],
                 pending_invites: Vec::new(),
             },
+            people: PeopleStatus::default(),
             notifications: NotificationStatus::default(),
             roots: vec![
                 RootStatus {
@@ -3289,7 +3329,7 @@ mod tests {
         assert!(entries.iter().any(|entry| entry.label == "GBA UCity"));
         assert!(entries
             .iter()
-            .any(|entry| entry.label == "Chat Room" && entry.state == "ready"));
+            .any(|entry| entry.label == "Shared Conversation" && entry.state == "ready"));
         assert!(!entries.iter().any(|entry| entry.label == "Shared"));
         assert!(!entries.iter().any(|entry| entry.label == "Codex"));
         assert!(!entries.iter().any(|entry| entry.label == "Mystery Capsule"));
@@ -3350,8 +3390,8 @@ mod tests {
             id: "room-pair-request:req-1".to_string(),
             source_app: "chat-room".to_string(),
             kind: "room_pair_request".to_string(),
-            title: "Alice requests room access".to_string(),
-            body: "Alice on Phone requests browser access to Room.".to_string(),
+            title: "Alice wants to join Chat".to_string(),
+            body: "Alice on Phone wants to join Chat.".to_string(),
             action_ref: Some(NotificationActionRefStatus {
                 app: "chat-room".to_string(),
                 action_id: "room-approve-request:req-1".to_string(),
@@ -3365,7 +3405,7 @@ mod tests {
             1,
             ActionInfo {
                 id: "room-approve".to_string(),
-                label: "Approve browser access".to_string(),
+                label: "Approve web guest".to_string(),
                 description: String::new(),
                 command: "home approve".to_string(),
                 ready: true,
@@ -3376,7 +3416,7 @@ mod tests {
             2,
             ActionInfo {
                 id: "room-deny".to_string(),
-                label: "Deny browser access".to_string(),
+                label: "Deny web guest".to_string(),
                 description: String::new(),
                 command: "home deny".to_string(),
                 ready: true,
@@ -3401,7 +3441,7 @@ mod tests {
         let alerts = alerts_lines(&snapshot, 120, None);
         assert!(alerts
             .iter()
-            .any(|line| line.contains("Alice on Phone requests browser access to Room.")));
+            .any(|line| line.contains("Alice on Phone wants to join Chat.")));
     }
 
     #[test]
@@ -3440,9 +3480,10 @@ mod tests {
         );
 
         let alerts = alerts_lines(&snapshot, 120, None);
-        assert!(alerts.iter().any(
-            |line| line.contains("2 active browser session(s): Alice on Phone, Bob on Safari")
-        ));
+        assert!(alerts
+            .iter()
+            .any(|line| line
+                .contains("2 active web guest session(s): Alice on Phone, Bob on Safari")));
     }
 
     #[test]
@@ -3493,9 +3534,9 @@ mod tests {
 
         let mut buf = String::new();
         render_people_tab(&mut buf, &snapshot, &TuiState::default(), 120);
-        assert!(buf.contains("Chat Room"));
+        assert!(buf.contains("Conversation"));
         assert!(buf.contains("Request    Alice on Phone"));
-        assert!(buf.contains("Browser    Bob on Safari"));
+        assert!(buf.contains("Web guest  Bob on Safari"));
     }
 
     #[test]
@@ -3519,7 +3560,6 @@ mod tests {
         snapshot.room.pending_invites = vec![RoomInviteStatus {
             invite_id: "inv-1".to_string(),
             invited_did: "did:key:z6invitee".to_string(),
-            role: "member".to_string(),
         }];
         snapshot.room.active_session_count = 1;
         snapshot.room.active_sessions = vec![RoomSessionStatus {
@@ -3540,7 +3580,7 @@ mod tests {
 
         let entry_index = app_entries(&snapshot)
             .iter()
-            .position(|entry| entry.label == "Chat Room")
+            .position(|entry| entry.label == "Shared Conversation")
             .expect("room entry missing");
 
         let mut state = TuiState::default();
@@ -3549,23 +3589,23 @@ mod tests {
 
         let mut buf = String::new();
         render_apps_tab(&mut buf, &snapshot, &state, 120);
-        assert!(buf.contains("Chat Room"));
-        assert!(buf.contains("Role       owner"));
-        assert!(buf.contains("Members    4 total"));
+        assert!(buf.contains("Shared Conversation"));
+        assert!(buf.contains("Access     conversation manager"));
+        assert!(buf.contains("People     4 trusted"));
         assert!(buf.contains("Request    Alice on Phone"));
-        assert!(buf.contains("Browser    Bob on Safari"));
+        assert!(buf.contains("Web guest  Bob on Safari"));
 
         let detail_lines =
             chat_room_app_detail_lines(&snapshot, &app_entries(&snapshot)[entry_index], 120);
         assert!(detail_lines.iter().any(
-            |line| line.contains("Hosted URL https://elastos.elacitylabs.com/apps/chat-room/")
+            |line| line.contains("Public URL https://elastos.elacitylabs.com/apps/chat-room/")
         ));
         assert!(detail_lines
             .iter()
-            .any(|line| line.contains("Invite     did:key:z6invitee as member")));
+            .any(|line| line.contains("Invite     did:key:z6invitee pending")));
         assert!(detail_lines
             .iter()
-            .any(|line| line.contains("Member     did:key:z6member (member)")));
+            .any(|line| line.contains("Person     did:key:z6member (trusted participant)")));
     }
 
     #[test]
@@ -3583,7 +3623,6 @@ mod tests {
         snapshot.room.pending_invites = vec![RoomInviteStatus {
             invite_id: "inv-1".to_string(),
             invited_did: "did:key:z6member".to_string(),
-            role: "member".to_string(),
         }];
         snapshot.room.active_session_count = 1;
         snapshot.room.active_sessions = vec![RoomSessionStatus {
@@ -3597,25 +3636,25 @@ mod tests {
         });
         snapshot.actions.push(ActionInfo {
             id: "room-policy-toggle-guests".to_string(),
-            label: "Close hosted guest access".to_string(),
-            description: "Stop new browser guests from requesting access on the hosted room URL."
+            label: "Close public join requests".to_string(),
+            description: "Stop new web guests from requesting access through the public Chat link."
                 .to_string(),
-            command: "home toggle hosted guest access".to_string(),
+            command: "home toggle public join requests".to_string(),
             ready: true,
             reason: None,
         });
         snapshot.actions.push(ActionInfo {
             id: "room-policy-toggle-members".to_string(),
-            label: "Open sovereign member invites".to_string(),
-            description: "Allow new sovereign Home member invites for this room.".to_string(),
-            command: "home toggle sovereign member invites".to_string(),
+            label: "Open ElastOS user invites".to_string(),
+            description: "Allow new invites for trusted ElastOS users.".to_string(),
+            command: "home toggle ElastOS user invites".to_string(),
             ready: true,
             reason: None,
         });
         snapshot.actions.push(ActionInfo {
             id: "room-revoke-invite:inv-1".to_string(),
             label: "Revoke invite for did:key:z6member".to_string(),
-            description: "Revoke this specific sovereign member invite".to_string(),
+            description: "Cancel this pending ElastOS user invite".to_string(),
             command: "home revoke invite".to_string(),
             ready: true,
             reason: None,
@@ -3623,7 +3662,7 @@ mod tests {
         snapshot.actions.push(ActionInfo {
             id: "room-remove-member:did:key:z6member".to_string(),
             label: "Remove did:key:z6member".to_string(),
-            description: "Remove this sovereign member".to_string(),
+            description: "Remove this trusted participant".to_string(),
             command: "home remove member".to_string(),
             ready: true,
             reason: None,
@@ -3631,7 +3670,7 @@ mod tests {
         snapshot.actions.push(ActionInfo {
             id: "room-approve-request:req-1".to_string(),
             label: "Approve Alice on Phone".to_string(),
-            description: "Approve this browser".to_string(),
+            description: "Approve this web guest".to_string(),
             command: "home approve specific".to_string(),
             ready: true,
             reason: None,
@@ -3656,13 +3695,13 @@ mod tests {
         let entries = app_entries(&snapshot);
         assert!(entries
             .iter()
-            .any(|entry| entry.label == "Chat Room" && !entry.is_control));
+            .any(|entry| entry.label == "Shared Conversation" && !entry.is_control));
         assert!(entries
             .iter()
-            .any(|entry| entry.label == "Close hosted guest access" && entry.is_control));
+            .any(|entry| entry.label == "Close public join requests" && entry.is_control));
         assert!(entries
             .iter()
-            .any(|entry| entry.label == "Open sovereign member invites" && entry.is_control));
+            .any(|entry| entry.label == "Open ElastOS user invites" && entry.is_control));
         assert!(entries
             .iter()
             .any(|entry| entry.label == "Revoke invite for did:key:z6member" && entry.is_control));
@@ -3687,7 +3726,7 @@ mod tests {
 
         let list = render_app_list(&entries, control_index).join("\n");
         assert!(list.contains("  Approve Alice on Phone [ready]"));
-        assert!(list.contains("  Close hosted guest access [ready]"));
+        assert!(list.contains("  Close public join requests [ready]"));
     }
 
     #[test]
@@ -3699,8 +3738,8 @@ mod tests {
             id: "room-pair-request:req-1".to_string(),
             source_app: "chat-room".to_string(),
             kind: "room_pair_request".to_string(),
-            title: "Alice requests room access".to_string(),
-            body: "Alice on Phone requests browser access to Room.".to_string(),
+            title: "Alice wants to join Chat".to_string(),
+            body: "Alice on Phone wants to join Chat.".to_string(),
             action_ref: Some(NotificationActionRefStatus {
                 app: "chat-room".to_string(),
                 action_id: "room-approve-request:req-1".to_string(),
@@ -3722,7 +3761,7 @@ mod tests {
 
         let mut buf = String::new();
         render_inbox_tab(&mut buf, &snapshot, &state, 120);
-        assert!(buf.contains("Alice requests room access"));
+        assert!(buf.contains("Alice wants to join Chat"));
         assert!(buf.contains("Approve Alice on Phone"));
         assert_eq!(
             state.activate(&snapshot),

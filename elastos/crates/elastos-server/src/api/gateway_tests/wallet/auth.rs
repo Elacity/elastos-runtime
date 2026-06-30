@@ -313,6 +313,77 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
 }
 
 #[tokio::test]
+async fn test_auth_session_revoke_rejects_other_principal_home_and_system_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let admin = passkey_authority_with_name(dir.path(), Some("admin"));
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+
+    for token in [guest.home_token.clone(), guest.system_token.clone()] {
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/auth/sessions/{}/revoke", admin.session_id))
+                    .header("x-elastos-home-token", token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+        assert!(crate::auth::is_auth_session_active(
+            dir.path(),
+            &admin.session_id,
+            crate::auth::now_ts()
+        )
+        .unwrap());
+    }
+}
+
+#[tokio::test]
+async fn test_auth_session_revoke_allows_admin_to_revoke_guest_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let admin = passkey_authority_with_name(dir.path(), Some("admin"));
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+
+    let revoked = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/auth/sessions/{}/revoke", guest.session_id))
+                .header("x-elastos-home-token", admin.system_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::OK);
+    assert!(!crate::auth::is_auth_session_active(
+        dir.path(),
+        &guest.session_id,
+        crate::auth::now_ts()
+    )
+    .unwrap());
+    assert!(crate::auth::is_auth_session_active(
+        dir.path(),
+        &admin.session_id,
+        crate::auth::now_ts()
+    )
+    .unwrap());
+}
+
+#[tokio::test]
 async fn test_metamask_connector_token_can_link_evm_wallet() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(wallet_test_state(dir.path()).await);

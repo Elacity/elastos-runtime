@@ -263,7 +263,6 @@ pub fn list_peers(peer_token: &str) -> Result<Vec<String>> {
         .unwrap_or_default())
 }
 
-
 pub fn send_gossip(
     peer_token: &str,
     topic: &str,
@@ -324,7 +323,9 @@ pub fn announce_presence(
     };
     let content = serde_json::to_string(&payload)?;
     // Sign presence announcements — prevents peer impersonation via fake tickets
-    let signature = sign_message(identity_token, sender_id, ts, &content).ok().flatten();
+    let signature = sign_message(identity_token, sender_id, ts, &content)
+        .ok()
+        .flatten();
     send_gossip(
         peer_token,
         &chat_discovery_topic(room),
@@ -367,8 +368,7 @@ pub fn recv_presence_announcements(
             if !verified {
                 eprintln!(
                     "Dropping unverified presence from {} ({})",
-                    presence.nick,
-                    presence.did
+                    presence.nick, presence.did
                 );
                 return None;
             }

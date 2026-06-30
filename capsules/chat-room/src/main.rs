@@ -14,6 +14,6 @@ fn main() {
         launched_at
     );
 
-    // The runtime records a real capsule launch; the hosted view renders Chat Room
+    // The runtime records a real capsule launch; the hosted view renders Chat
     // and calls back through capacity-token APIs instead of ambient browser IO.
 }

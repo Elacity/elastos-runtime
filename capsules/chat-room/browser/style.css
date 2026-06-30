@@ -297,6 +297,49 @@ body[data-room-access-mode="gateway"][data-room-session-active="false"] .browser
   width: 100%;
 }
 
+.conversation-join {
+  align-self: center;
+  width: min(100%, 34rem);
+  display: grid;
+  gap: 0.85rem;
+  margin: auto;
+  padding: 1rem;
+  border-radius: 1.2rem;
+  border: 1px solid rgba(95, 118, 216, 0.16);
+  background: rgba(255, 255, 255, 0.72);
+  box-shadow: 0 16px 42px rgba(34, 49, 88, 0.08);
+}
+
+.conversation-join-copy {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.conversation-join-copy h2 {
+  font-size: 1.1rem;
+}
+
+.conversation-join-copy p {
+  color: var(--muted);
+  font-size: 0.86rem;
+  line-height: 1.45;
+}
+
+.conversation-join-form,
+.join-link-output {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.45rem;
+}
+
+.conversation-join-form input,
+.join-link-output input {
+  min-height: 2.5rem;
+  padding: 0.66rem 0.72rem;
+  border-radius: 0.9rem;
+  font-size: 0.82rem;
+}
+
 .browser-access-actions {
   display: flex;
   flex-wrap: wrap;
@@ -429,6 +472,7 @@ body[data-room-access-mode="gateway"][data-room-session-active="false"] .convers
   gap: 0.55rem;
 }
 
+.join-link-card,
 .browser-access-request,
 .node-row,
 .policy-row {
@@ -447,6 +491,21 @@ body[data-room-access-mode="gateway"][data-room-session-active="false"] .convers
   align-items: baseline;
   justify-content: space-between;
   gap: 0.55rem;
+}
+
+.join-link-copy {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.join-link-copy h4 {
+  font-size: 0.84rem;
+}
+
+.join-link-copy p {
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 1.35;
 }
 
 .browser-access-request-name,
@@ -484,7 +543,10 @@ body[data-room-access-mode="gateway"][data-room-session-active="false"] .convers
 .browser-access-request-actions button,
 .node-row-actions button,
 .policy-row button,
-.node-invite-form button {
+.node-invite-form button,
+.join-link-card > button,
+.join-link-output button,
+.conversation-join-form button {
   flex: 1 1 auto;
   min-height: 2rem;
   padding: 0.58rem 0.8rem;
@@ -755,6 +817,9 @@ body[data-room-access-mode="shell"][data-room-session-active="false"] .roster-he
 .attachment-open {
   display: inline-block;
   margin-top: 0.5rem;
+  padding: 0;
+  border: 0;
+  background: transparent;
   color: var(--accent-deep);
   text-decoration: none;
   font-size: 0.82rem;

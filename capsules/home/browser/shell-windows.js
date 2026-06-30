@@ -2,6 +2,7 @@ import {
   desktop,
   windowTemplate,
   windowErrorTemplate,
+  PEOPLE_TARGET_ID,
   SYSTEM_APP_ID,
   shellState,
   fetchJson,
@@ -19,19 +20,25 @@ import {
   clearShellSessionState,
   ignoreRepeatedAction,
   targetById,
-} from "./shell-core.js?v=home-20260607e";
+} from "./shell-core.js?v=home-20260627a";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
+  fitWindowToLargestBrowserAspect,
   applyWindowPlacement,
   rememberWindowRestoreBounds,
   restoreWindowFromSpecialState,
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260607e";
+} from "./shell-window-geometry.js?v=home-20260627a";
 
 let windowHooks = null;
+const PEOPLE_DISCOVERY_AUTO_REFRESH_INITIAL_MS = 1_500;
+const PEOPLE_DISCOVERY_AUTO_REFRESH_FAST_MS = 3_000;
+const PEOPLE_DISCOVERY_AUTO_REFRESH_STABLE_MS = 15_000;
+const PEOPLE_DISCOVERY_AUTO_REFRESH_IDLE_MS = 30_000;
+const PEOPLE_DISCOVERY_AUTO_REFRESH_MAX_MS = 60_000;
 const REQUIRED_WINDOW_HOOKS = [
   "clearIdentitySurface",
   "hideLauncher",
@@ -44,8 +51,9 @@ const WINDOW_CONTROL_GUARD_MS = 400;
 const WINDOW_MAXIMIZE_CLOSE_GUARD_MS = 360;
 const WINDOW_OPEN_CLOSE_GHOST_GUARD_MS = 2600;
 const WINDOW_CLOSE_GUARD_MOVE_PX = 18;
+const BROWSER_DESKTOP_OPEN_GUARD_MS = 700;
 const MAX_SESSION_WINDOWS = 24;
-const SINGLE_SESSION_TARGETS = new Set(["browser"]);
+const SINGLE_SESSION_TARGETS = new Set([PEOPLE_TARGET_ID, "inbox", "wallet"]);
 const COMMON_IFRAME_SANDBOX = [
   "allow-downloads",
   "allow-forms",
@@ -68,7 +76,9 @@ const SYSTEM_IFRAME_SANDBOX_EXTRAS = [
 ];
 const COMMON_IFRAME_ALLOW = ["autoplay", "fullscreen"];
 const BROWSER_IFRAME_ALLOW_EXTRAS = ["clipboard-read", "clipboard-write"];
-const WEBAUTHN_IFRAME_ALLOW_TARGETS = new Set(["wallet"]);
+const WEBAUTHN_IFRAME_ALLOW_TARGETS = new Set(["inbox", "wallet"]);
+const pendingWindowLaunches = new Set();
+const peopleDiscoveryRefreshTimers = new WeakMap();
 
 function iframeSandboxForLaunch(launched) {
   const tokens = [...COMMON_IFRAME_SANDBOX];
@@ -139,7 +149,9 @@ function currentWindowRestoreBounds(node) {
 }
 
 function persistedBrowserSessionEntries() {
-  return sortWindowEntriesByZOrder(browserWindowEntries())
+  return sortWindowEntriesByZOrder(
+    browserWindowEntries(),
+  )
     .reverse()
     .slice(0, MAX_SESSION_WINDOWS)
     .map((entry) => {
@@ -149,7 +161,9 @@ function persistedBrowserSessionEntries() {
         target: entry.targetId,
         hidden: entry.node.classList.contains("hidden"),
         active: shellState.activeWindowId === entry.id,
-        maximized: entry.node.dataset.maximized === "true",
+        maximized:
+          entry.node.dataset.maximized === "true" ||
+          entry.node.dataset.browserMaximized === "true",
         snap: entry.node.dataset.snap || "",
         x: bounds.x,
         y: bounds.y,
@@ -159,6 +173,7 @@ function persistedBrowserSessionEntries() {
         restoreY: restoreBounds.y,
         restoreWidth: restoreBounds.width,
         restoreHeight: restoreBounds.height,
+        query: normalizedLaunchQuery(entry.launchQuery),
       };
     });
 }
@@ -175,22 +190,29 @@ function persistBrowserSession() {
   saveShellSessionState({ windows });
 }
 
-function normalizeRestorableSession(summary, storedSession) {
+export function normalizeRestorableSession(summary, storedSession) {
   const storedWindows = Array.isArray(storedSession?.windows) ? storedSession.windows : [];
   const seenTargets = new Set();
   const normalized = [];
   for (const item of storedWindows) {
     const targetId = typeof item?.target === "string" ? item.target : "";
-    if (!targetId || seenTargets.has(targetId) || !targetById(summary, targetId)) {
+    if (
+      !targetId ||
+      (SINGLE_SESSION_TARGETS.has(targetId) && seenTargets.has(targetId)) ||
+      !targetById(summary, targetId)
+    ) {
       continue;
     }
-    seenTargets.add(targetId);
+    if (SINGLE_SESSION_TARGETS.has(targetId)) {
+      seenTargets.add(targetId);
+    }
     normalized.push({
       target: targetId,
       hidden: item?.hidden === true,
       active: item?.active === true,
       maximized: item?.maximized === true,
       snap: typeof item?.snap === "string" ? item.snap : "",
+      query: restorableLaunchQuery(targetId, item),
       x: Number.isFinite(item?.x) ? item.x : 48,
       y: Number.isFinite(item?.y) ? item.y : 60,
       width: Number.isFinite(item?.width) ? item.width : 560,
@@ -205,6 +227,14 @@ function normalizeRestorableSession(summary, storedSession) {
     }
   }
   return normalized;
+}
+
+function restorableLaunchQuery(targetId, item) {
+  const query = normalizedLaunchQuery(item?.query);
+  if (targetId === "browser" && !query.browser_instance) {
+    query.browser_instance = nextBrowserInstanceId();
+  }
+  return query;
 }
 
 function renderWindowTaskbar() {
@@ -410,6 +440,7 @@ function removeWindowEntries(entries) {
   for (const entry of entries) {
     releaseFrameRuntimePage(entry.node);
     cleanupFrameAutoFit(entry.node);
+    cleanupPeopleDiscoveryAutoRefresh(entry.node);
     shellState.windows.delete(entry.id);
     entry.node.remove();
   }
@@ -516,11 +547,12 @@ function renderTargetLaunchError(targetId, error) {
   });
 }
 
-function createWindow({ id, title, x, y, width, height, tone }) {
+function createWindow({ id, title, x, y, width, height, tone, glyphTarget }) {
   const bounds = fitWindowBounds({ x, y, width, height });
   const node = windowTemplate.content.firstElementChild.cloneNode(true);
   node.dataset.windowId = id;
   node.dataset.maximized = "false";
+  node.dataset.browserMaximized = "false";
   node.dataset.snap = "";
   node.setAttribute("aria-label", title);
   node.setAttribute("aria-hidden", "false");
@@ -530,7 +562,7 @@ function createWindow({ id, title, x, y, width, height, tone }) {
   node.style.width = `${bounds.width}px`;
   node.style.height = `${bounds.height}px`;
   node.querySelector(".window-head-title").textContent = title;
-  mountGlyph(node.querySelector(".window-head-icon"), id, tone);
+  mountGlyph(node.querySelector(".window-head-icon"), glyphTarget || id, tone);
 
   node.addEventListener("pointerdown", () => {
     focusWindow(id);
@@ -601,21 +633,691 @@ export function openTarget(targetId, options = {}) {
     activateTargetGroup(targetId);
     return;
   }
-  const launchOptions = targetId === "browser"
-    ? withBrowserInstanceQuery(options)
-    : options;
-  if (ignoreRepeatedAction(launchActionKey(targetId, launchOptions.query))) {
+  if (targetId === PEOPLE_TARGET_ID) {
+    openPeopleWindow(options);
     return;
   }
-  launchBrowserTargetWindow(targetId, launchOptions).catch((error) => {
-    const status = Number(error && error.status);
-    if (status === 401 || status === 403) {
-      requireWindowHooks().requestHomeUnlock?.();
+  const baseQuery = normalizedLaunchQuery(options.query);
+  let guardedByBrowserActivation = false;
+  if (targetId === "browser" && !baseQuery.browser_instance) {
+    if (ignoreRepeatedAction("open-target:browser", BROWSER_DESKTOP_OPEN_GUARD_MS)) {
       return;
     }
-    console.error(`failed to open ${targetId}`, error);
-    renderTargetLaunchError(targetId, error);
+    guardedByBrowserActivation = true;
+  }
+  const launchOptions = targetId === "browser"
+    ? withBrowserInstanceQuery({ ...options, query: baseQuery })
+    : { ...options, query: baseQuery };
+  const pendingLaunchKey = guardedByBrowserActivation
+    ? "open-target:browser:desktop"
+    : launchActionKey(targetId, launchOptions.query);
+  if (pendingWindowLaunches.has(pendingLaunchKey)) {
+    return;
+  }
+  if (!guardedByBrowserActivation && ignoreRepeatedAction(pendingLaunchKey)) {
+    return;
+  }
+  pendingWindowLaunches.add(pendingLaunchKey);
+  launchBrowserTargetWindow(targetId, launchOptions)
+    .catch((error) => {
+      const status = Number(error && error.status);
+      if (status === 401 || status === 403) {
+        requireWindowHooks().requestHomeUnlock?.();
+        return;
+      }
+      console.error(`failed to open ${targetId}`, error);
+      renderTargetLaunchError(targetId, error);
+    })
+    .finally(() => {
+      pendingWindowLaunches.delete(pendingLaunchKey);
+    });
+}
+
+function openPeopleWindow(options = {}) {
+  const summary = shellState.currentSummary;
+  if (!summary) {
+    return null;
+  }
+  const restoredPlacement = options.restoredPlacement || null;
+  const offset = browserWindowEntries().length;
+  const windowSpec = restoredPlacement || peopleWindowSpec(offset);
+  const windowId = nextBrowserWindowId(PEOPLE_TARGET_ID);
+  const node = createWindow({
+    id: windowId,
+    title: "People",
+    x: windowSpec.x,
+    y: windowSpec.y,
+    width: windowSpec.width,
+    height: windowSpec.height,
+    tone: glyphTone(PEOPLE_TARGET_ID),
+    glyphTarget: PEOPLE_TARGET_ID,
   });
+  armWindowControlGuard(node, { closeMs: WINDOW_OPEN_CLOSE_GHOST_GUARD_MS });
+  node.dataset.target = PEOPLE_TARGET_ID;
+  const entry = {
+    id: windowId,
+    targetId: PEOPLE_TARGET_ID,
+    serial: shellState.browserWindowSerial,
+    node,
+    kind: "browser",
+    title: "People",
+  };
+  shellState.windows.set(windowId, entry);
+  renderPeopleWindowBody(entry, summary);
+  desktop.appendChild(node);
+  if (restoredPlacement) {
+    applyWindowPlacement(node, restoredPlacement);
+  }
+  renderWindowTaskbar();
+  focusWindow(windowId);
+  if (restoredPlacement?.hidden) {
+    entry.node.classList.add("hidden");
+    entry.node.classList.remove("window-active");
+    entry.node.setAttribute("aria-hidden", "true");
+  }
+  if (!shellState.restoringSession) {
+    persistBrowserSession();
+  }
+  return entry;
+}
+
+export function refreshHomeInternalWindows(summary) {
+  for (const entry of shellState.windows.values()) {
+    if (entry.targetId === PEOPLE_TARGET_ID) {
+      renderPeopleWindowBody(entry, summary || shellState.currentSummary);
+    }
+  }
+}
+
+function renderPeopleWindowBody(entry, summary) {
+  if (!entry || !summary) {
+    return;
+  }
+  const people = summary.people && typeof summary.people === "object" ? summary.people : {};
+  const identity = summary.identity && typeof summary.identity === "object" ? summary.identity : {};
+  const contacts = Array.isArray(people.contacts) ? people.contacts : [];
+  const discovery = people.discovery && typeof people.discovery === "object" ? people.discovery : {};
+  const discoveredPeers = filterDiscoveredPeople(
+    Array.isArray(discovery.discovered_peers) ? discovery.discovered_peers : [],
+    contacts,
+  );
+  const discoveryRequests = Array.isArray(discovery.requests)
+    ? discovery.requests.filter(peopleDiscoveryRequestIsVisible)
+    : [];
+  const body = entry.node.querySelector(".window-body");
+  body.classList.remove("window-body-frame");
+  body.classList.add("home-people-body");
+  const profileMarkup = peopleProfileMarkup(identity);
+  const peopleMarkup = contacts.length === 0
+    ? `
+      <div class="home-people-empty">
+        <h3>No people yet</h3>
+        <p>Turn on Discovery to find another ElastOS home and send a request.</p>
+      </div>
+    `
+    : contacts.map(peopleListCardMarkup).join("");
+  body.innerHTML = `
+    <section class="home-people-shell" aria-label="People">
+      <aside class="home-people-sidebar" aria-label="People sections">
+        <button class="home-people-sidebar-item active" type="button" data-people-jump="people">
+          <span class="home-people-sidebar-icon home-people-sidebar-icon-people" aria-hidden="true"></span>
+          <span class="home-people-sidebar-text">People</span>
+        </button>
+        <button class="home-people-sidebar-item" type="button" data-people-jump="discovery">
+          <span class="home-people-sidebar-icon home-people-sidebar-icon-discovery" aria-hidden="true"></span>
+          <span class="home-people-sidebar-text">Discovery</span>
+        </button>
+      </aside>
+      <main class="home-people-main-panel">
+        <div class="home-people-status" role="status" hidden></div>
+        <div class="home-people-content">
+          <section class="home-people-section" data-people-section="people" aria-label="People">
+            ${profileMarkup}
+            <div class="home-people-list">${peopleMarkup}</div>
+          </section>
+          <section class="home-people-section" data-people-section="discovery" aria-label="Discovery">
+            ${peopleDiscoveryMarkup(discovery, discoveredPeers, discoveryRequests)}
+          </section>
+        </div>
+      </main>
+    </section>
+  `;
+  bindPeopleWindowActions(body);
+  schedulePeopleDiscoveryAutoRefresh(body, discovery);
+}
+
+function peopleProfileMarkup(identity) {
+  const displayName = peopleProfileDisplayName(identity);
+  return `
+    <section class="home-people-profile-card" aria-labelledby="home-people-profile-title">
+      <div class="home-people-profile-copy">
+        <h3 id="home-people-profile-title">My Profile</h3>
+        <p>Shown to people you connect with.</p>
+      </div>
+      <form class="home-people-profile-form" data-people-profile-form>
+        <label class="home-people-profile-label" for="home-people-profile-name">Display name</label>
+        <input id="home-people-profile-name" class="home-people-profile-input" type="text" maxlength="32" autocomplete="nickname" placeholder="Your name" value="${escapeHtml(displayName)}" data-people-profile-input>
+        <button class="home-people-action" type="submit" data-people-profile-save>Save</button>
+      </form>
+    </section>
+  `;
+}
+
+function peopleDiscoveryMarkup(discovery, peers, requests) {
+  const visibleRequests = requests.filter(peopleDiscoveryRequestIsVisible);
+  const remainingSeconds = peopleDiscoveryRemainingSeconds(discovery);
+  const enabled = discovery.enabled === true && remainingSeconds > 0;
+  const remainingLabel = peopleDiscoveryRemainingText(remainingSeconds);
+  const peerMarkup = peers.length
+    ? peers.map(peopleDiscoveryPeerMarkup).join("")
+    : `<div class="home-people-empty"><h3>No visible people yet</h3><p>Turn on discovery for 10 minutes while another ElastOS home is discoverable. People will appear automatically.</p></div>`;
+  const requestMarkup = visibleRequests.length
+    ? visibleRequests.map(peopleDiscoveryRequestMarkup).join("")
+    : `<div class="home-people-empty"><h3>No requests</h3><p>Requests to add people will appear here.</p></div>`;
+  return `
+    <div class="home-people-discovery-grid">
+      <div class="home-people-discovery-column">
+        <div class="home-people-discovery-header">
+          <h4>Visible People</h4>
+          <div class="home-people-discovery-actions" aria-label="Discovery controls">
+            ${enabled ? `<span class="home-people-discovery-countdown" data-people-discovery-countdown>Discoverable for ${remainingLabel}</span>` : ""}
+            <button class="home-people-action" type="button" data-people-action="toggle-discovery" data-discovery-enabled="${enabled ? "false" : "true"}">${enabled ? "Stop" : "Turn On"}</button>
+            <button class="home-people-action" type="button" data-people-action="refresh-discovery">Refresh</button>
+          </div>
+        </div>
+        <div class="home-people-list">${peerMarkup}</div>
+      </div>
+      <div class="home-people-discovery-column">
+        <h4>Requests</h4>
+        <div class="home-people-list">${requestMarkup}</div>
+      </div>
+    </div>
+  `;
+}
+
+function peopleDiscoveryRemainingSeconds(discovery) {
+  const value = Number(discovery?.remaining_seconds || 0);
+  return Number.isFinite(value) && value > 0 ? Math.ceil(value) : 0;
+}
+
+function peopleDiscoveryRemainingText(seconds) {
+  if (seconds <= 0) {
+    return "0 sec";
+  }
+  if (seconds >= 60) {
+    const minutes = Math.ceil(seconds / 60);
+    return `${minutes} min`;
+  }
+  return `${seconds} sec`;
+}
+
+function peopleDiscoveryPeerMarkup(peer) {
+  const peerId = normalizePeopleText(peer?.peer_id, "");
+  const rawDisplayName = peopleDisplayName(peer, "Visible person");
+  const displayName = escapeHtml(rawDisplayName);
+  const handle = normalizePeopleText(peer?.handle, "");
+  const status = escapeHtml(normalizePeopleText(peer?.status, "visible"));
+  const handleCopy = handle && handle !== rawDisplayName ? handle : "Discoverable";
+  return `
+    <article class="home-people-card">
+      <div class="home-people-avatar" aria-hidden="true">${displayName.slice(0, 1).toUpperCase() || "E"}</div>
+      <div class="home-people-card-copy">
+        <h3>${displayName}</h3>
+        <p><span>${escapeHtml(handleCopy)}</span><span>${status}</span></p>
+      </div>
+      <div class="home-people-card-actions">
+        <button class="home-people-action" type="button" data-people-action="request-peer" data-peer-id="${escapeHtml(peerId)}" ${peerId ? "" : "disabled"}>Request</button>
+      </div>
+    </article>
+  `;
+}
+
+function peopleDiscoveryRequestMarkup(request) {
+  const requestId = escapeHtml(normalizePeopleText(request?.request_id, ""));
+  const rawDisplayName = peopleDisplayName(request, "Person");
+  const displayName = escapeHtml(rawDisplayName);
+  const status = escapeHtml(normalizePeopleText(request?.status, "requested"));
+  const rawStatus = normalizePeopleText(request?.status, "requested");
+  const actionMarkup = rawStatus === "incoming"
+    ? `<button class="home-people-action" type="button" data-people-action="accept-request" data-request-id="${requestId}" ${requestId ? "" : "disabled"}>Accept</button>`
+    : rawStatus === "requested"
+      ? `<span class="home-people-badge">Requested</span>`
+      : "";
+  return `
+    <article class="home-people-card">
+      <div class="home-people-avatar" aria-hidden="true">${displayName.slice(0, 1).toUpperCase() || "E"}</div>
+      <div class="home-people-card-copy">
+        <h3>${displayName}</h3>
+        <p><span>${status}</span></p>
+      </div>
+      ${actionMarkup ? `<div class="home-people-card-actions">${actionMarkup}</div>` : ""}
+    </article>
+  `;
+}
+
+function peopleListCardMarkup(contact) {
+  const rawDisplayName = peopleDisplayName(contact, "Person");
+  const displayName = escapeHtml(rawDisplayName);
+  const relationship = escapeHtml(normalizePeopleText(contact?.relationship, "connected"));
+  const handle = normalizePeopleText(contact?.handle, "");
+  const device = normalizePeopleText(contact?.device_label, "");
+  const handleLine = handle && handle !== rawDisplayName ? `<span>${escapeHtml(handle)}</span>` : "";
+  const deviceLine = device && device !== rawDisplayName ? `<span>${escapeHtml(device)}</span>` : "";
+  const contactId = escapeHtml(normalizePeopleText(contact?.contact_id, ""));
+  const route = normalizePeopleText(contact?.route, "");
+  const chatAction = contact?.can_message === true && route
+    ? `<button class="home-people-action" type="button" data-people-action="chat" data-contact-route="${escapeHtml(route)}">Chat</button>`
+    : "";
+  return `
+    <article class="home-people-card">
+      <div class="home-people-avatar" aria-hidden="true">${escapeHtml(rawDisplayName.slice(0, 1).toUpperCase() || "E")}</div>
+      <div class="home-people-card-copy">
+        <h3>${displayName}</h3>
+        <p><span>${relationship}</span>${handleLine}${deviceLine}</p>
+      </div>
+      <div class="home-people-card-actions">
+        ${chatAction}
+        <button class="home-people-action home-people-action-danger" type="button" data-people-action="remove" data-contact-id="${contactId}">Remove</button>
+      </div>
+    </article>
+  `;
+}
+
+function bindPeopleWindowActions(body) {
+  body.querySelector("[data-people-profile-form]")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    savePeopleProfile(body, event.currentTarget).catch((error) => {
+      setPeopleStatus(body, error.message || "Could not save profile.", "error");
+    });
+  });
+  for (const button of body.querySelectorAll("[data-people-jump]")) {
+    button.addEventListener("click", (event) => {
+      const sectionId = event.currentTarget?.dataset?.peopleJump || "";
+      const section = body.querySelector(`[data-people-section="${sectionId}"]`);
+      if (section) {
+        section.scrollIntoView({ block: "start", behavior: "smooth" });
+      }
+      for (const item of body.querySelectorAll("[data-people-jump]")) {
+        item.classList.toggle("active", item === event.currentTarget);
+      }
+    });
+  }
+  body.querySelector("[data-people-action='toggle-discovery']")?.addEventListener("click", (event) => {
+    togglePeopleDiscovery(body, event.currentTarget).catch((error) => {
+      setPeopleStatus(body, error.message || "Could not update discovery.", "error");
+    });
+  });
+  body.querySelector("[data-people-action='refresh-discovery']")?.addEventListener("click", () => {
+    refreshPeopleDiscovery(body).catch((error) => {
+      setPeopleStatus(body, error.message || "Could not refresh discovery.", "error");
+    });
+  });
+  for (const button of body.querySelectorAll("[data-people-action='request-peer']")) {
+    button.addEventListener("click", (event) => {
+      requestPeopleDiscoveryPeer(body, event.currentTarget).catch((error) => {
+        setPeopleStatus(body, error.message || "Could not request this person.", "error");
+      });
+    });
+  }
+  for (const button of body.querySelectorAll("[data-people-action='accept-request']")) {
+    button.addEventListener("click", (event) => {
+      acceptPeopleDiscoveryRequest(body, event.currentTarget).catch((error) => {
+        setPeopleStatus(body, error.message || "Could not accept this request.", "error");
+      });
+    });
+  }
+  for (const button of body.querySelectorAll("[data-people-action='chat']")) {
+    button.addEventListener("click", (event) => {
+      try {
+        openPersonChat(body, event.currentTarget);
+      } catch (error) {
+        setPeopleStatus(body, error.message || "Could not open chat.", "error");
+      }
+    });
+  }
+  for (const button of body.querySelectorAll("[data-people-action='remove']")) {
+    button.addEventListener("click", (event) => {
+      removePersonFromPeople(body, event.currentTarget).catch((error) => {
+        setPeopleStatus(body, error.message || "Could not remove person.", "error");
+      });
+    });
+  }
+}
+
+function peopleDiscoveryRequestIsVisible(request) {
+  const status = normalizePeopleText(request?.status, "requested");
+  return status === "incoming" || status === "requested";
+}
+
+function filterDiscoveredPeople(peers, contacts) {
+  const existingPeerIds = new Set();
+  for (const contact of contacts) {
+    const deviceLabel = normalizePeopleText(contact?.device_label, "");
+    if (deviceLabel) {
+      existingPeerIds.add(deviceLabel);
+    }
+    const route = normalizePeopleText(contact?.route, "");
+    if (route.startsWith("elastos://peer/")) {
+      const peerId = route.slice("elastos://peer/".length).trim();
+      if (peerId) {
+        existingPeerIds.add(peerId);
+      }
+    }
+  }
+  return peers.filter((peer) => {
+    const peerId = normalizePeopleText(peer?.peer_id, "");
+    return !peerId || !existingPeerIds.has(peerId);
+  });
+}
+
+function peopleDisplayName(person, fallback) {
+  const profileCard = person?.profile_card && typeof person.profile_card === "object" ? person.profile_card : {};
+  const displayName =
+    normalizePeopleText(profileCard.display_name, "") ||
+    normalizePeopleText(person?.display_name, "");
+  const handle =
+    normalizePeopleText(profileCard.handle, "") ||
+    normalizePeopleText(person?.handle, "");
+  const peer = normalizePeopleText(person?.device_label || person?.peer_id, "");
+  if (displayName && displayName !== "ElastOS user") {
+    return displayName;
+  }
+  return handle || peer || fallback;
+}
+
+function peopleProfileDisplayName(identity) {
+  const profileCard = identity?.profile_card && typeof identity.profile_card === "object" ? identity.profile_card : {};
+  return normalizePeopleText(profileCard.display_name, "") || normalizePeopleText(identity?.handle, "");
+}
+
+async function savePeopleProfile(body, form) {
+  const input = form?.querySelector("[data-people-profile-input]");
+  const button = form?.querySelector("[data-people-profile-save]");
+  if (!(input instanceof HTMLInputElement)) {
+    throw new Error("Profile name field is missing.");
+  }
+  const handle = input.value.trim();
+  input.disabled = true;
+  setPeopleBusy(button, true);
+  try {
+    await fetchJson("/api/apps/people/profile-card", {
+      method: "POST",
+      body: JSON.stringify({ handle }),
+    });
+    setPeopleStatus(body, "Profile saved.", "ok");
+    await shellState.requestSummaryRefresh?.();
+  } finally {
+    input.disabled = false;
+    setPeopleBusy(button, false);
+  }
+}
+
+async function togglePeopleDiscovery(body, button) {
+  const enabled = button?.dataset?.discoveryEnabled === "true";
+  setPeopleBusy(button, true);
+  try {
+    const discovery = await fetchJson("/api/apps/people/discovery", {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    });
+    const remainingText = peopleDiscoveryRemainingText(peopleDiscoveryRemainingSeconds(discovery));
+    setPeopleStatus(body, enabled ? `Discoverable for ${remainingText}.` : "Discovery is off.", "ok");
+    if (!enabled) {
+      cleanupPeopleDiscoveryAutoRefresh(body);
+    }
+    await shellState.requestSummaryRefresh?.();
+  } finally {
+    setPeopleBusy(button, false);
+  }
+}
+
+async function refreshPeopleDiscovery(body, options = {}) {
+  const discovery = await fetchJson("/api/apps/people/discovery/refresh", { method: "POST" });
+  if (!options.silent) {
+    setPeopleStatus(body, "Discovery refreshed.", "ok");
+  }
+  if (options.updateSummary !== false) {
+    await shellState.requestSummaryRefresh?.();
+  }
+  return discovery;
+}
+
+function schedulePeopleDiscoveryAutoRefresh(body, discovery) {
+  if (!body || discovery.enabled !== true) {
+    cleanupPeopleDiscoveryAutoRefresh(body);
+    return;
+  }
+  let state = peopleDiscoveryRefreshTimers.get(body);
+  if (state) {
+    state.lastFingerprint = peopleDiscoveryFingerprint(discovery) || state.lastFingerprint;
+    if (!state.timer) {
+      queuePeopleDiscoveryAutoRefresh(body, state, PEOPLE_DISCOVERY_AUTO_REFRESH_INITIAL_MS);
+    }
+    return;
+  }
+  state = {
+    inFlight: false,
+    timer: 0,
+    emptyTicks: 0,
+    lastFingerprint: peopleDiscoveryFingerprint(discovery),
+  };
+  peopleDiscoveryRefreshTimers.set(body, state);
+  queuePeopleDiscoveryAutoRefresh(body, state, PEOPLE_DISCOVERY_AUTO_REFRESH_INITIAL_MS);
+}
+
+function queuePeopleDiscoveryAutoRefresh(body, state, delayMs) {
+  window.clearTimeout(state.timer);
+  state.timer = window.setTimeout(() => {
+    runPeopleDiscoveryAutoRefresh(body, state);
+  }, clampPeopleDiscoveryRefreshDelay(delayMs));
+}
+
+async function runPeopleDiscoveryAutoRefresh(body, state) {
+  state.timer = 0;
+  if (!body.isConnected) {
+    cleanupPeopleDiscoveryAutoRefresh(body);
+    return;
+  }
+  const windowNode = body.closest(".window");
+  if (windowNode?.classList.contains("hidden")) {
+    queuePeopleDiscoveryAutoRefresh(body, state, PEOPLE_DISCOVERY_AUTO_REFRESH_STABLE_MS);
+    return;
+  }
+  if (state.inFlight) {
+    queuePeopleDiscoveryAutoRefresh(body, state, PEOPLE_DISCOVERY_AUTO_REFRESH_FAST_MS);
+    return;
+  }
+  state.inFlight = true;
+  try {
+    const discovery = await refreshPeopleDiscovery(body, { silent: true, updateSummary: false });
+    const fingerprint = peopleDiscoveryFingerprint(discovery);
+    const changed = discovery?.changed === true || (fingerprint && state.lastFingerprint && fingerprint !== state.lastFingerprint);
+    state.lastFingerprint = fingerprint || state.lastFingerprint;
+    if (changed || discovery?.enabled === false) {
+      await shellState.requestSummaryRefresh?.();
+    } else {
+      updatePeopleDiscoveryCountdown(body, discovery);
+    }
+    if (discovery?.enabled === true) {
+      queuePeopleDiscoveryAutoRefresh(body, state, peopleDiscoveryNextAutoRefreshDelay(discovery, state, changed));
+    } else {
+      cleanupPeopleDiscoveryAutoRefresh(body);
+    }
+  } catch {
+    // Manual Refresh still reports errors; background discovery should stay quiet.
+    queuePeopleDiscoveryAutoRefresh(body, state, PEOPLE_DISCOVERY_AUTO_REFRESH_STABLE_MS);
+  } finally {
+    state.inFlight = false;
+  }
+}
+
+function peopleDiscoveryNextAutoRefreshDelay(discovery, state, changed) {
+  if (changed) {
+    state.emptyTicks = 0;
+    return PEOPLE_DISCOVERY_AUTO_REFRESH_FAST_MS;
+  }
+  const hasVisibleWork = Number(discovery?.discovered_count || 0) > 0 || Number(discovery?.request_count || 0) > 0;
+  if (hasVisibleWork) {
+    state.emptyTicks = 0;
+    return Math.max(Number(discovery?.next_refresh_after_ms || 0), PEOPLE_DISCOVERY_AUTO_REFRESH_IDLE_MS);
+  }
+  state.emptyTicks += 1;
+  if (state.emptyTicks <= 3) {
+    return PEOPLE_DISCOVERY_AUTO_REFRESH_FAST_MS;
+  }
+  return Math.max(Number(discovery?.next_refresh_after_ms || 0), PEOPLE_DISCOVERY_AUTO_REFRESH_STABLE_MS);
+}
+
+function peopleDiscoveryFingerprint(discovery) {
+  if (typeof discovery?.refresh_fingerprint === "string" && discovery.refresh_fingerprint.trim() !== "") {
+    return discovery.refresh_fingerprint;
+  }
+  const peers = Array.isArray(discovery?.discovered_peers)
+    ? discovery.discovered_peers.map((peer) => `${peer.peer_id || ""}:${peer.last_seen_at || 0}:${peer.status || ""}`).sort()
+    : [];
+  const requests = Array.isArray(discovery?.requests)
+    ? discovery.requests.map((request) => `${request.request_id || ""}:${request.status || ""}:${request.created_at || 0}`).sort()
+    : [];
+  return JSON.stringify({
+    enabled: discovery?.enabled === true,
+    status: discovery?.status || "",
+    local_peer_id: discovery?.local_peer_id || "",
+    peers,
+    requests,
+  });
+}
+
+function clampPeopleDiscoveryRefreshDelay(value) {
+  const delay = Number(value || 0);
+  if (!Number.isFinite(delay) || delay <= 0) {
+    return PEOPLE_DISCOVERY_AUTO_REFRESH_STABLE_MS;
+  }
+  return Math.min(Math.max(delay, PEOPLE_DISCOVERY_AUTO_REFRESH_INITIAL_MS), PEOPLE_DISCOVERY_AUTO_REFRESH_MAX_MS);
+}
+
+function updatePeopleDiscoveryCountdown(body, discovery) {
+  const countdown = body.querySelector("[data-people-discovery-countdown]");
+  if (!countdown) {
+    return;
+  }
+  const remainingSeconds = peopleDiscoveryRemainingSeconds(discovery);
+  countdown.textContent = `Discoverable for ${peopleDiscoveryRemainingText(remainingSeconds)}`;
+}
+
+function cleanupPeopleDiscoveryAutoRefresh(nodeOrBody) {
+  const body = nodeOrBody?.classList?.contains("window-body")
+    ? nodeOrBody
+    : nodeOrBody?.querySelector?.(".window-body");
+  if (!body) {
+    return;
+  }
+  const state = peopleDiscoveryRefreshTimers.get(body);
+  if (!state) {
+    return;
+  }
+  window.clearTimeout(state.timer);
+  peopleDiscoveryRefreshTimers.delete(body);
+}
+
+async function requestPeopleDiscoveryPeer(body, button) {
+  const peerId = typeof button?.dataset?.peerId === "string" ? button.dataset.peerId : "";
+  if (!peerId) {
+    throw new Error("Discovery peer id is missing.");
+  }
+  setPeopleBusy(button, true);
+  try {
+    await fetchJson("/api/apps/people/discovery/requests", {
+      method: "POST",
+      body: JSON.stringify({ peer_id: peerId }),
+    });
+    setPeopleStatus(body, "Request sent.", "ok");
+    await shellState.requestSummaryRefresh?.();
+  } finally {
+    setPeopleBusy(button, false);
+  }
+}
+
+async function acceptPeopleDiscoveryRequest(body, button) {
+  const requestId = typeof button?.dataset?.requestId === "string" ? button.dataset.requestId : "";
+  if (!requestId) {
+    throw new Error("Discovery request id is missing.");
+  }
+  setPeopleBusy(button, true);
+  try {
+    await fetchJson(`/api/apps/people/discovery/requests/${encodeURIComponent(requestId)}/accept`, {
+      method: "POST",
+    });
+    setPeopleStatus(body, "Request accepted. This person is now in People.", "ok");
+    await shellState.requestSummaryRefresh?.();
+  } finally {
+    setPeopleBusy(button, false);
+  }
+}
+
+async function removePersonFromPeople(body, button) {
+  const contactId = typeof button?.dataset?.contactId === "string" ? button.dataset.contactId : "";
+  if (!contactId) {
+    throw new Error("Person id is missing.");
+  }
+  const card = button.closest(".home-people-card");
+  const label = card?.querySelector(".home-people-card-copy h3")?.textContent?.trim() || "this person";
+  if (!window.confirm(`Remove ${label} from People?`)) {
+    return;
+  }
+  setPeopleBusy(button, true);
+  try {
+    await fetchJson("/api/apps/people/contacts/remove", {
+      method: "POST",
+      body: JSON.stringify({ contact_id: contactId }),
+    });
+    setPeopleStatus(body, "Removed from People.", "ok");
+    await shellState.requestSummaryRefresh?.();
+  } finally {
+    setPeopleBusy(button, false);
+  }
+}
+
+function openPersonChat(body, button) {
+  const route = normalizePeopleText(button?.dataset?.contactRoute, "");
+  const targetId = homeTargetFromRoute(route);
+  if (targetId !== "chat-room") {
+    throw new Error("Chat is not available for this person yet.");
+  }
+  setPeopleStatus(body, "Opening chat.", "ok");
+  openTarget(targetId);
+}
+
+function homeTargetFromRoute(route) {
+  if (!route) {
+    return "";
+  }
+  try {
+    const url = new URL(route, window.location.origin);
+    const match = url.pathname.match(/^\/apps\/([^/]+)\/?$/);
+    return match ? decodeURIComponent(match[1]) : "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+function setPeopleBusy(button, busy) {
+  if (button instanceof HTMLButtonElement) {
+    button.disabled = busy;
+  }
+}
+
+function setPeopleStatus(body, text, tone = "muted") {
+  const node = body.querySelector(".home-people-status");
+  if (!node) {
+    return;
+  }
+  node.textContent = text;
+  node.dataset.tone = tone;
+  node.hidden = !text;
+}
+
+function normalizePeopleText(value, fallback) {
+  return typeof value === "string" && value.trim() ? value.trim() : fallback;
 }
 
 function withBrowserInstanceQuery(options) {
@@ -670,11 +1372,14 @@ export function handleTaskbarTargetClick(targetId) {
 }
 
 async function launchBrowserTargetWindow(targetId, options = {}) {
+  const launchQuery = targetId === "browser"
+    ? withBrowserInstanceQuery({ query: options.query }).query
+    : normalizedLaunchQuery(options.query);
   const launched = await fetchJson("/api/apps/home/launch", {
     method: "POST",
     body: JSON.stringify({
       target: targetId,
-      query: normalizedLaunchQuery(options.query),
+      query: launchQuery,
     }),
   });
   launched.title = canonicalTargetTitle(launched.target, launched.title);
@@ -701,6 +1406,7 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
     width: windowSpec.width,
     height: windowSpec.height,
     tone: glyphTone(launched.target),
+    glyphTarget: launched.target,
   });
   armWindowControlGuard(node, { closeMs: WINDOW_OPEN_CLOSE_GHOST_GUARD_MS });
   node.dataset.target = launched.target;
@@ -718,6 +1424,10 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
   desktop.appendChild(node);
   if (restoredPlacement) {
     applyWindowPlacement(node, restoredPlacement);
+  } else if (launched.target === "browser" && node.dataset.maximized === "true") {
+    node.dataset.maximized = "false";
+    node.dataset.browserMaximized = "true";
+    fitWindowToLargestBrowserAspect(node);
   }
   const entry = {
     id: windowId,
@@ -726,16 +1436,21 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
     node,
     kind: "browser",
     title: launched.title,
+    launchQuery,
   };
   shellState.windows.set(windowId, entry);
   syncBrowserWindow(entry, launched);
-  renderWindowTaskbar();
-  focusWindow(windowId);
+  if (entry.targetId === "browser") {
+    fitLaunchedWindow(entry);
+  }
   if (restoredPlacement?.hidden) {
     entry.node.classList.add("hidden");
     entry.node.classList.remove("window-active");
     entry.node.setAttribute("aria-hidden", "true");
+  } else {
+    focusWindow(windowId);
   }
+  renderWindowTaskbar();
   if (!shellState.restoringSession) {
     persistBrowserSession();
   }
@@ -779,6 +1494,7 @@ function fitLaunchedWindow(entry) {
   }
   if (entry.targetId === "browser") {
     fitWindowToBrowserAspect(entry.node);
+    rememberWindowRestoreBounds(entry.node);
     return;
   }
   fitWindowToFrame(entry.node, entry.node.querySelector(".window-frame"));
@@ -941,6 +1657,15 @@ function browserWindowSpec(launched, offset) {
   };
 }
 
+function peopleWindowSpec(offset) {
+  return {
+    x: 72 + offset * 18,
+    y: 72 + offset * 18,
+    width: 680,
+    height: 520,
+  };
+}
+
 function fitWindowToFrame(node, frame) {
   if (!node || !frame || node.dataset.maximized === "true" || node.dataset.snap) {
     return;
@@ -1029,7 +1754,10 @@ function toggleWindowMaximize(id) {
   }
   const node = entry.node;
   armWindowControlGuard(node, { closeMs: WINDOW_MAXIMIZE_CLOSE_GUARD_MS });
-  if (node.dataset.maximized === "true") {
+  if (
+    node.dataset.maximized === "true" ||
+    node.dataset.browserMaximized === "true"
+  ) {
     restoreWindowFromSpecialState(node);
     fitLaunchedWindow(entry);
     focusWindow(id);
@@ -1038,6 +1766,15 @@ function toggleWindowMaximize(id) {
   }
   rememberWindowRestoreBounds(node);
   node.dataset.snap = "";
+  if (entry.targetId === "browser") {
+    node.dataset.maximized = "false";
+    node.dataset.browserMaximized = "true";
+    fitWindowToLargestBrowserAspect(node);
+    focusWindow(id);
+    persistBrowserSession();
+    return;
+  }
+  node.dataset.browserMaximized = "false";
   node.dataset.maximized = "true";
   focusWindow(id);
   persistBrowserSession();
@@ -1067,9 +1804,12 @@ export async function restoreShellSession() {
       restoredSingleSessionTargets.add(restoredWindow.target);
     }
     try {
-      const entry = await launchBrowserTargetWindow(restoredWindow.target, {
-        restoredPlacement: restoredWindow,
-      });
+      const entry = restoredWindow.target === PEOPLE_TARGET_ID
+        ? openPeopleWindow({ restoredPlacement: restoredWindow })
+        : await launchBrowserTargetWindow(restoredWindow.target, {
+          restoredPlacement: restoredWindow,
+          query: restoredWindow.query,
+        });
       if (entry) {
         restoredEntries.push({ entry, restoredWindow });
       }
@@ -1102,6 +1842,7 @@ export function cleanupBeforeUnload() {
   for (const entry of shellState.windows.values()) {
     releaseFrameRuntimePage(entry.node);
     cleanupFrameAutoFit(entry.node);
+    cleanupPeopleDiscoveryAutoRefresh(entry.node);
   }
 }
 

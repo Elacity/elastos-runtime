@@ -101,23 +101,34 @@ export function createLibraryActions({
   }
 
   async function attachObject(object) {
-    const cid = publishedCid(object);
-    if (!object.published || !cid) {
-      setStatus("Publish this object before attaching it.");
-      showMenuForObject(object, window.innerWidth / 2, 120);
-      return;
+    const targetLabel = state.returnTarget === "browser" ? "Browser" : "Chat Room";
+    setStatus("Preparing attachment...");
+    try {
+      const raw = await downloadObjectRaw({ uri: object.uri });
+      const cid = publishedCid(object);
+      const payload = {
+        type: state.returnTarget === "browser"
+          ? "browser:file-picker-selection"
+          : "chat-room:attach-library-item",
+        blob: raw.blob,
+        fileName: object.name || raw.filename || "Library item",
+        mimeType: object.mime || raw.blob?.type || "application/octet-stream",
+        sizeBytes: raw.blob?.size || object.size || 0,
+        title: object.name || "",
+        objectUri: object.uri,
+      };
+      if (state.returnTarget === "chat-room" && object.published && cid) {
+        payload.publishedUri = "elastos://" + cid;
+      }
+      if (deliverToTarget(state.returnTarget, payload)) {
+        setStatus(`Attached to ${targetLabel}.`);
+        window.setTimeout(closeSelf, 80);
+        return;
+      }
+      setStatus(`Open ${targetLabel} from Home.`);
+    } catch (error) {
+      setStatus(error?.message || "Could not attach this Library item.");
     }
-    if (deliverToTarget(state.returnTarget, {
-      type: "chat-room:attach-library-item",
-      uri: "elastos://" + cid,
-      title: object.name || "",
-      objectUri: object.uri,
-    })) {
-      setStatus("Attached to Chat Room.");
-      window.setTimeout(closeSelf, 80);
-      return;
-    }
-    setStatus("Open Chat Room from Home.");
   }
 
   function deliverArchiveObject(object) {
@@ -556,7 +567,10 @@ export function createLibraryActions({
   }
 
   function isAttachMode() {
-    return state.mode === "attach" && state.returnTarget === "chat-room";
+    return (
+      state.mode === "attach" &&
+      (state.returnTarget === "chat-room" || state.returnTarget === "browser")
+    );
   }
 
   function isArchiveOpenMode() {

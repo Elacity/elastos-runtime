@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::engine::general_purpose::{
+    STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD,
+};
 use base64::Engine as _;
 use elastos_common::localhost::rooted_localhost_fs_path;
 use rand::RngCore;
@@ -33,6 +35,8 @@ const ROOM_UPLOADS_DIR: &str = "uploads";
 const ROOM_LOCK_FILE: &str = "state.lock";
 const ROOM_INVITE_ENVELOPE_SCHEMA: &str = "elastos.room.invite.v1";
 const ROOM_INVITE_ENVELOPE_DOMAIN: &str = "elastos.room.invite.v1";
+const ROOM_JOIN_INVITE_SCHEMA: &str = "elastos.room.join-invite.v1";
+const ROOM_JOIN_INVITE_DOMAIN: &str = "elastos.room.join-invite.v1";
 const ROOM_ACCEPT_ENVELOPE_SCHEMA: &str = "elastos.room.accept.v1";
 const ROOM_ACCEPT_ENVELOPE_DOMAIN: &str = "elastos.room.accept.v1";
 const ROOM_OBJECT_ENVELOPE_SCHEMA: &str = "elastos.room.object.v1";
@@ -41,7 +45,6 @@ const SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 const UPLOAD_TTL_SECS: u64 = 15 * 60;
 const INVITE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 const MAX_OBJECTS: usize = 500;
-const MAX_TRANSPORT_SYNC_OBJECTS: usize = 64;
 const MAX_OBJECT_BODY_LEN: usize = 2_000;
 const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 pub const ATTACHMENT_UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
@@ -110,6 +113,12 @@ pub struct LocalRuntimeSessionOutput {
     pub expires_at: u64,
     #[serde(default)]
     pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalRuntimeSessionWithTransportOutput {
+    pub session: LocalRuntimeSessionOutput,
+    pub transport_envelope: Option<RoomObjectEnvelope>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,6 +262,18 @@ pub struct RoomMemberView {
     pub role: RoomRole,
     pub added_at: u64,
     pub added_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_card: Option<RoomProfileCardView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoomProfileCardView {
+    pub schema: String,
+    pub profile_id: String,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    pub updated_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -439,6 +460,44 @@ pub struct RoomInviteAcceptInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomJoinInviteInput {
+    pub actor_did: String,
+    pub issuer_gateway: String,
+    pub inviter_profile: Option<RoomProfileCardView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomJoinInviteView {
+    pub token: String,
+    pub invite_url: String,
+    pub issuer_gateway: String,
+    pub room_title: String,
+    pub invited_by: String,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedRoomJoinInviteEnvelope {
+    pub payload: SignedRoomJoinInvitePayload,
+    pub signature: String,
+    pub signer_did: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedRoomJoinInvitePayload {
+    pub schema: String,
+    pub room_slug: String,
+    pub room_title: String,
+    pub issuer_gateway: String,
+    pub invited_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inviter_profile: Option<RoomProfileCardView>,
+    pub role: RoomRole,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedRoomInviteEnvelope {
     pub payload: SignedRoomInvitePayload,
     pub signature: String,
@@ -457,6 +516,8 @@ pub struct SignedRoomInvitePayload {
     pub invited_did: String,
     pub role: RoomRole,
     pub invited_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inviter_profile: Option<RoomProfileCardView>,
     pub created_at: u64,
     pub expires_at: u64,
 }
@@ -480,6 +541,8 @@ pub struct SignedRoomAcceptPayload {
     pub member_did: String,
     pub role: RoomRole,
     pub invited_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_profile: Option<RoomProfileCardView>,
     pub accepted_at: u64,
 }
 
@@ -562,6 +625,8 @@ struct RoomMemberRecord {
     added_at: u64,
     added_by: String,
     active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile_card: Option<RoomProfileCardView>,
     #[serde(default)]
     removed_at: Option<u64>,
     #[serde(default)]
@@ -574,6 +639,8 @@ struct RoomInviteRecord {
     invited_did: String,
     role: RoomRole,
     invited_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inviter_profile: Option<RoomProfileCardView>,
     created_at: u64,
     expires_at: u64,
     status: InviteStatus,
@@ -882,6 +949,14 @@ pub fn invite_room_member(
     data_dir: &Path,
     input: RoomInviteInput,
 ) -> anyhow::Result<RoomInviteView> {
+    invite_room_member_with_profile(data_dir, input, None)
+}
+
+fn invite_room_member_with_profile(
+    data_dir: &Path,
+    input: RoomInviteInput,
+    inviter_profile: Option<RoomProfileCardView>,
+) -> anyhow::Result<RoomInviteView> {
     let actor_did = normalize_member_did(&input.actor_did)?;
     let invited_did = normalize_member_did(&input.invited_did)?;
     if actor_did == invited_did {
@@ -890,7 +965,7 @@ pub fn invite_room_member(
     with_locked_state(data_dir, |_, state| {
         require_room_owner_seeded(state)?;
         if !state.control.allow_member_invites {
-            anyhow::bail!("sovereign member invites are disabled for this room");
+            anyhow::bail!("ElastOS user invites are disabled for this conversation");
         }
         let actor_role = require_active_member_role(state, &actor_did)?;
         if !can_invite_role(&actor_role, &input.role) {
@@ -914,6 +989,7 @@ pub fn invite_room_member(
             invited_did,
             role: input.role.clone(),
             invited_by: actor_did,
+            inviter_profile,
             created_at: now,
             expires_at: now + INVITE_TTL_SECS,
             status: InviteStatus::Pending,
@@ -963,13 +1039,21 @@ pub fn export_room_invite_envelope(
     data_dir: &Path,
     input: RoomInviteInput,
 ) -> anyhow::Result<SignedRoomInviteEnvelope> {
+    export_room_invite_envelope_with_profile(data_dir, input, None)
+}
+
+pub fn export_room_invite_envelope_with_profile(
+    data_dir: &Path,
+    input: RoomInviteInput,
+    inviter_profile: Option<RoomProfileCardView>,
+) -> anyhow::Result<SignedRoomInviteEnvelope> {
     let actor_did = normalize_member_did(&input.actor_did)?;
-    let invite = invite_room_member(data_dir, input)?;
+    let invite = invite_room_member_with_profile(data_dir, input, inviter_profile)?;
     let (signing_key, local_did) = elastos_identity::load_or_create_did(data_dir)?;
     let local_did = normalize_member_did(&local_did)?;
     if local_did != actor_did {
         anyhow::bail!(
-            "local runtime DID {} does not match invite actor {}",
+            "local ElastOS identity {} does not match invite actor {}",
             local_did,
             actor_did
         );
@@ -992,6 +1076,7 @@ pub fn export_room_invite_envelope(
             invited_did: invite_record.invited_did.clone(),
             role: invite_record.role.clone(),
             invited_by: actor_did.clone(),
+            inviter_profile: invite_record.inviter_profile.clone(),
             created_at: invite_record.created_at,
             expires_at: invite_record.expires_at,
         })
@@ -1015,6 +1100,162 @@ pub fn export_room_invite_envelope(
         signature,
         signer_did,
     })
+}
+
+pub fn export_room_join_invite(
+    data_dir: &Path,
+    input: RoomJoinInviteInput,
+) -> anyhow::Result<RoomJoinInviteView> {
+    let actor_did = normalize_member_did(&input.actor_did)?;
+    let issuer_gateway = normalize_join_invite_gateway(&input.issuer_gateway)?;
+    let (signing_key, local_did) = elastos_identity::load_or_create_did(data_dir)?;
+    let local_did = normalize_member_did(&local_did)?;
+    if local_did != actor_did {
+        anyhow::bail!(
+            "local ElastOS identity {} does not match invite actor {}",
+            local_did,
+            actor_did
+        );
+    }
+
+    let payload = with_locked_state(data_dir, |_, state| {
+        require_room_owner_seeded(state)?;
+        if !state.control.allow_member_invites {
+            anyhow::bail!("ElastOS user invites are disabled for this conversation");
+        }
+        let actor_role = require_active_member_role(state, &actor_did)?;
+        if !can_invite_role(&actor_role, &RoomRole::Member) {
+            anyhow::bail!(
+                "{} cannot create conversation join links",
+                actor_role_label(&actor_role)
+            );
+        }
+        let now = now_ts();
+        Ok(SignedRoomJoinInvitePayload {
+            schema: ROOM_JOIN_INVITE_SCHEMA.to_string(),
+            room_slug: state.room_slug.clone(),
+            room_title: state.control.title.clone(),
+            issuer_gateway: issuer_gateway.clone(),
+            invited_by: actor_did.clone(),
+            inviter_profile: input.inviter_profile.clone(),
+            role: RoomRole::Member,
+            created_at: now,
+            expires_at: now + INVITE_TTL_SECS,
+        })
+    })?;
+    let canonical = serde_json::to_string(&serde_json::to_value(&payload)?)?;
+    let (signature, signer_did) = crate::crypto::domain_separated_sign(
+        &signing_key,
+        ROOM_JOIN_INVITE_DOMAIN,
+        canonical.as_bytes(),
+    );
+    if signer_did != actor_did {
+        anyhow::bail!(
+            "signed join invite DID {} does not match actor {}",
+            signer_did,
+            actor_did
+        );
+    }
+    let envelope = SignedRoomJoinInviteEnvelope {
+        payload: payload.clone(),
+        signature,
+        signer_did,
+    };
+    let token = BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope)?);
+    Ok(RoomJoinInviteView {
+        invite_url: format!("elastos://peer/invite?token={token}"),
+        token,
+        issuer_gateway: payload.issuer_gateway,
+        room_title: payload.room_title,
+        invited_by: payload.invited_by,
+        expires_at: payload.expires_at,
+    })
+}
+
+pub fn claim_room_join_invite(
+    data_dir: &Path,
+    token_or_url: &str,
+    invited_did: &str,
+) -> anyhow::Result<SignedRoomInviteEnvelope> {
+    let token = room_join_invite_token_from_input(token_or_url)?;
+    let (envelope, signer_did) = decode_room_join_invite_token(&token)?;
+    let payload = envelope.payload;
+    if payload.invited_by != signer_did || envelope.signer_did != signer_did {
+        anyhow::bail!("join invite signer does not match inviter DID");
+    }
+    export_room_invite_envelope_with_profile(
+        data_dir,
+        RoomInviteInput {
+            actor_did: signer_did,
+            invited_did: invited_did.to_string(),
+            role: payload.role,
+        },
+        payload.inviter_profile,
+    )
+}
+
+pub fn decode_room_join_invite_token(
+    token: &str,
+) -> anyhow::Result<(SignedRoomJoinInviteEnvelope, String)> {
+    let token = room_join_invite_token_from_input(token)?;
+    let bytes = BASE64_URL_SAFE_NO_PAD
+        .decode(token.as_bytes())
+        .context("conversation join token is not valid base64url")?;
+    let (envelope_value, signer_did) = crate::crypto::verify_signed_json_envelope_against_dids(
+        &bytes,
+        ROOM_JOIN_INVITE_DOMAIN,
+        &[],
+    )?;
+    let envelope: SignedRoomJoinInviteEnvelope = serde_json::from_value(envelope_value)?;
+    let payload = &envelope.payload;
+    if payload.schema != ROOM_JOIN_INVITE_SCHEMA {
+        anyhow::bail!(
+            "unsupported conversation join invite schema: {}",
+            payload.schema
+        );
+    }
+    if payload.room_slug != ROOM_SLUG {
+        anyhow::bail!(
+            "join invite is for room '{}' not '{}'",
+            payload.room_slug,
+            ROOM_SLUG
+        );
+    }
+    if payload.expires_at <= now_ts() {
+        anyhow::bail!("conversation join invite is expired");
+    }
+    let normalized_gateway = normalize_join_invite_gateway(&payload.issuer_gateway)?;
+    if normalized_gateway != payload.issuer_gateway {
+        anyhow::bail!("conversation join invite issuer gateway is not canonical");
+    }
+    if payload.invited_by != signer_did || envelope.signer_did != signer_did {
+        anyhow::bail!("join invite signer does not match inviter DID");
+    }
+    Ok((envelope, signer_did))
+}
+
+pub fn room_join_invite_token_from_input(input: &str) -> anyhow::Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("conversation join invite must not be empty");
+    }
+    if let Ok(parsed) = Url::parse(trimmed) {
+        if parsed.scheme() == "elastos" {
+            let path = parsed.path().trim_start_matches('/');
+            if parsed.host_str() != Some("peer") || path != "invite" {
+                anyhow::bail!("unsupported conversation join invite URI");
+            }
+            if let Some((_, token)) = parsed.query_pairs().find(|(key, _)| key == "token") {
+                let token = token.trim().to_string();
+                if token.is_empty() {
+                    anyhow::bail!("conversation join invite link is missing a token");
+                }
+                return Ok(token);
+            }
+            anyhow::bail!("conversation join invite link is missing a token");
+        }
+    }
+    Ok(trimmed.to_string())
 }
 
 pub fn import_room_invite_envelope(
@@ -1046,7 +1287,7 @@ pub fn import_room_invite_envelope(
     let invited_did = normalize_member_did(&payload.invited_did)?;
     if invited_did != local_did {
         anyhow::bail!(
-            "invite is addressed to {} but local runtime DID is {}",
+            "invite is addressed to {} but local ElastOS identity is {}",
             invited_did,
             local_did
         );
@@ -1064,7 +1305,7 @@ pub fn import_room_invite_envelope(
             return Ok(room_invite_view_from_record(existing));
         }
         if active_member_record(state, &invited_did).is_some() {
-            anyhow::bail!("local runtime is already an active member of this room");
+            anyhow::bail!("this device is already part of this conversation");
         }
         let room_was_uninitialized =
             state.control.owner_did.is_none() || state.control.created_at == 0;
@@ -1078,8 +1319,18 @@ pub fn import_room_invite_envelope(
                         owner_did
                     );
                 }
-                None => state.control.owner_did = Some(owner_did),
+                None => state.control.owner_did = Some(owner_did.clone()),
                 _ => {}
+            }
+            if owner_did != invited_did {
+                ensure_active_member_with_profile(
+                    state,
+                    &owner_did,
+                    RoomRole::Owner,
+                    &owner_did,
+                    payload.created_at,
+                    payload.inviter_profile.clone(),
+                );
             }
         }
         if room_was_uninitialized {
@@ -1098,6 +1349,7 @@ pub fn import_room_invite_envelope(
             invited_did: invited_did.clone(),
             role: payload.role.clone(),
             invited_by: signer_did.clone(),
+            inviter_profile: payload.inviter_profile.clone(),
             created_at: payload.created_at,
             expires_at: payload.expires_at,
             status: InviteStatus::Pending,
@@ -1113,6 +1365,14 @@ pub fn import_room_invite_envelope(
 pub fn export_room_acceptance_envelope(
     data_dir: &Path,
     invite_id: &str,
+) -> anyhow::Result<SignedRoomAcceptEnvelope> {
+    export_room_acceptance_envelope_with_profile(data_dir, invite_id, None)
+}
+
+pub fn export_room_acceptance_envelope_with_profile(
+    data_dir: &Path,
+    invite_id: &str,
+    member_profile: Option<RoomProfileCardView>,
 ) -> anyhow::Result<SignedRoomAcceptEnvelope> {
     let invite_id = invite_id.trim();
     if invite_id.is_empty() {
@@ -1142,6 +1402,7 @@ pub fn export_room_acceptance_envelope(
             member_did: local_did.clone(),
             role: invite_record.role.clone(),
             invited_by: invite_record.invited_by.clone(),
+            member_profile: member_profile.clone(),
             accepted_at,
         })
     })?;
@@ -1153,7 +1414,7 @@ pub fn export_room_acceptance_envelope(
     );
     if signer_did != local_did {
         anyhow::bail!(
-            "signed acceptance envelope DID {} does not match local runtime DID {}",
+            "signed acceptance envelope DID {} does not match local ElastOS identity {}",
             signer_did,
             local_did
         );
@@ -1248,12 +1509,13 @@ pub fn import_room_acceptance_envelope(
         state.invites[invite_index].status = InviteStatus::Accepted;
         state.invites[invite_index].acted_at = Some(payload.accepted_at);
         state.invites[invite_index].acted_by = Some(member_did.clone());
-        let member = ensure_active_member(
+        let member = ensure_active_member_with_profile(
             state,
             &member_did,
             payload.role.clone(),
             &payload.invited_by,
             payload.accepted_at,
+            payload.member_profile.clone(),
         )
         .clone();
         rotate_key_epoch_record(
@@ -1436,7 +1698,7 @@ pub fn browser_access_status(
             .pending_requests
             .iter()
             .find(|item| item.request_id == request_id)
-            .ok_or_else(|| anyhow::anyhow!("browser access request not found"))?;
+            .ok_or_else(|| anyhow::anyhow!("web guest request not found"))?;
 
         Ok(BrowserAccessStatusOutput {
             request_id: request.request_id.clone(),
@@ -1456,6 +1718,21 @@ pub fn start_local_runtime_session(
     display_name: &str,
     device_label: &str,
 ) -> anyhow::Result<LocalRuntimeSessionOutput> {
+    Ok(start_local_runtime_session_with_transport(
+        data_dir,
+        member_did,
+        display_name,
+        device_label,
+    )?
+    .session)
+}
+
+pub fn start_local_runtime_session_with_transport(
+    data_dir: &Path,
+    member_did: &str,
+    display_name: &str,
+    device_label: &str,
+) -> anyhow::Result<LocalRuntimeSessionWithTransportOutput> {
     start_local_runtime_session_for_actor(data_dir, member_did, None, display_name, device_label)
 }
 
@@ -1466,6 +1743,24 @@ pub fn start_local_principal_runtime_session(
     display_name: &str,
     device_label: &str,
 ) -> anyhow::Result<LocalRuntimeSessionOutput> {
+    let actor_id = local_principal_room_actor_id(principal_id)?;
+    Ok(start_local_runtime_session_for_actor(
+        data_dir,
+        member_did,
+        Some(actor_id),
+        display_name,
+        device_label,
+    )?
+    .session)
+}
+
+pub fn start_local_principal_runtime_session_with_transport(
+    data_dir: &Path,
+    member_did: &str,
+    principal_id: &str,
+    display_name: &str,
+    device_label: &str,
+) -> anyhow::Result<LocalRuntimeSessionWithTransportOutput> {
     let actor_id = local_principal_room_actor_id(principal_id)?;
     start_local_runtime_session_for_actor(
         data_dir,
@@ -1482,18 +1777,18 @@ fn start_local_runtime_session_for_actor(
     actor_id: Option<String>,
     display_name: &str,
     device_label: &str,
-) -> anyhow::Result<LocalRuntimeSessionOutput> {
+) -> anyhow::Result<LocalRuntimeSessionWithTransportOutput> {
     let member_did = normalize_member_did(member_did)?;
     let display_name = normalize_display_name(display_name)?;
     let device_label = normalize_device_label(device_label);
 
-    with_locked_state(data_dir, |_, state| {
+    with_locked_state(data_dir, |paths, state| {
         let local_access = local_runtime_access_from_state(state, Some(&member_did));
         if local_access.member_role.is_none() && !local_access.browser_access_allowed {
             anyhow::bail!(
                 "{}",
                 local_access.block_reason.unwrap_or_else(|| {
-                    "local runtime is not an active member of this room".to_string()
+                    "this device is not part of this conversation".to_string()
                 })
             );
         }
@@ -1515,7 +1810,7 @@ fn start_local_runtime_session_for_actor(
             if active_member_record(state, session_member_did).is_none()
                 && room_requires_active_membership(state)
             {
-                anyhow::bail!("local runtime is not an active member of this room");
+                anyhow::bail!("this device is not part of this conversation");
             }
         }
         let now = now_ts();
@@ -1561,11 +1856,14 @@ fn start_local_runtime_session_for_actor(
             existing.capabilities = capabilities.clone();
             existing.last_seen_at = now;
             existing.expires_at = now + SESSION_TTL_SECS;
-            return Ok(LocalRuntimeSessionOutput {
-                token: existing.token.clone(),
-                display_name: existing.display_name.clone(),
-                expires_at: existing.expires_at,
-                capabilities: existing.capabilities.clone(),
+            return Ok(LocalRuntimeSessionWithTransportOutput {
+                session: LocalRuntimeSessionOutput {
+                    token: existing.token.clone(),
+                    display_name: existing.display_name.clone(),
+                    expires_at: existing.expires_at,
+                    capabilities: existing.capabilities.clone(),
+                },
+                transport_envelope: None,
             });
         }
 
@@ -1592,9 +1890,10 @@ fn start_local_runtime_session_for_actor(
             capabilities,
         };
         state.sessions.push(session);
+        let mut transport_envelope = None;
         match session_member_did.as_deref() {
             Some(member_did) if !had_existing_session => {
-                push_member_system_object_for_actor(
+                let object = push_member_system_object_for_actor(
                     state,
                     member_did,
                     actor_id.as_deref(),
@@ -1602,13 +1901,17 @@ fn start_local_runtime_session_for_actor(
                     "joined the room".to_string(),
                     now,
                 );
+                transport_envelope = transport_envelope_from_record(paths, state, &object);
             }
             None => {
                 push_system_object(state, display_name, "joined the room".to_string(), now);
             }
             _ => {}
         }
-        Ok(output)
+        Ok(LocalRuntimeSessionWithTransportOutput {
+            session: output,
+            transport_envelope,
+        })
     })
 }
 
@@ -1660,12 +1963,10 @@ fn approve_request_at_index(
         .clone();
     if room_requires_active_membership(state) {
         let member_did = host_member_did.as_deref().ok_or_else(|| {
-            anyhow::anyhow!("browser access request is not bound to a host room member DID")
+            anyhow::anyhow!("web guest request is not bound to a host ElastOS identity")
         })?;
         if active_member_record(state, member_did).is_none() {
-            anyhow::bail!(
-                "browser access request host member DID is no longer active in this room"
-            );
+            anyhow::bail!("web guest request host is no longer part of this conversation");
         }
     }
     let (request_id, display_name, device_label, capabilities) = {
@@ -1982,6 +2283,13 @@ pub fn session_view(data_dir: &Path, token: &str) -> anyhow::Result<SessionView>
 }
 
 pub fn leave_session(data_dir: &Path, token: &str) -> anyhow::Result<ConversationObjectView> {
+    Ok(leave_session_with_transport(data_dir, token)?.object)
+}
+
+pub fn leave_session_with_transport(
+    data_dir: &Path,
+    token: &str,
+) -> anyhow::Result<AppendedConversationObject> {
     with_locked_state(data_dir, |paths, state| {
         let now = now_ts();
         let session_index = state
@@ -1992,6 +2300,7 @@ pub fn leave_session(data_dir: &Path, token: &str) -> anyhow::Result<Conversatio
         let session = state.sessions.remove(session_index);
         invalidate_approved_requests(state, std::slice::from_ref(&session.token));
         remove_uploads_for_tokens(paths, state, std::slice::from_ref(&session.token));
+        let sender_member_did = session.member_did.clone();
         let object = match session.member_did.as_deref() {
             Some(member_did)
                 if !state
@@ -2014,7 +2323,12 @@ pub fn leave_session(data_dir: &Path, token: &str) -> anyhow::Result<Conversatio
                 now,
             ),
         };
-        Ok(object_view_from_record(object, None))
+        let transport_envelope = transport_envelope_from_record(paths, state, &object);
+        Ok(AppendedConversationObject {
+            object: object_view_from_record(object, None),
+            sender_member_did,
+            transport_envelope,
+        })
     })
 }
 
@@ -2126,21 +2440,6 @@ pub fn append_object_with_transport(
     })
 }
 
-pub fn room_transport_backlog(
-    data_dir: &Path,
-    local_runtime_did: &str,
-    preferred: Option<&RoomObjectEnvelope>,
-) -> anyhow::Result<Vec<RoomObjectEnvelope>> {
-    with_locked_state(data_dir, |paths, state| {
-        Ok(transport_backlog_from_state(
-            paths,
-            state,
-            local_runtime_did,
-            preferred,
-        ))
-    })
-}
-
 pub fn ingest_room_object_envelope(
     data_dir: &Path,
     envelope: &RoomObjectEnvelope,
@@ -2156,7 +2455,9 @@ pub fn ingest_room_object_envelope(
                 state.room_slug
             );
         }
-        if active_member_record(state, &sender_member_did).is_none() {
+        if active_member_record(state, &sender_member_did).is_none()
+            && room_requires_active_membership(state)
+        {
             anyhow::bail!("sender member DID is not active in this room");
         }
         if state
@@ -2198,6 +2499,35 @@ pub fn ingest_room_object_envelope(
             },
         );
         Ok(Some(object_view_from_record(object, None)))
+    })
+}
+
+pub fn recent_local_room_object_envelopes(
+    data_dir: &Path,
+    sender_member_did: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<RoomObjectEnvelope>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let sender_member_did = normalize_member_did(sender_member_did)?;
+    with_locked_state(data_dir, |paths, state| {
+        let mut envelopes = state
+            .objects
+            .iter()
+            .rev()
+            .filter(|object| {
+                object
+                    .sender_member_did
+                    .as_deref()
+                    .map(|did| did == sender_member_did)
+                    .unwrap_or(false)
+            })
+            .filter_map(|object| transport_envelope_from_record(paths, state, object))
+            .take(limit)
+            .collect::<Vec<_>>();
+        envelopes.reverse();
+        Ok(envelopes)
     })
 }
 
@@ -2369,7 +2699,7 @@ pub fn finish_attachment_upload(
     token: &str,
     upload_id: &str,
 ) -> anyhow::Result<AppendedConversationObject> {
-    with_locked_state(data_dir, |paths, state| {
+    let (output, staged_path) = with_locked_state(data_dir, |paths, state| {
         let (sender, sender_member_did, sender_actor_id, current_session) = {
             let session = validate_session(state, token)?;
             session.last_seen_at = now_ts();
@@ -2385,7 +2715,7 @@ pub fn finish_attachment_upload(
             .iter()
             .position(|upload| upload.upload_id == upload_id && upload.token == token)
             .ok_or_else(|| anyhow::anyhow!("upload not found"))?;
-        let upload = state.uploads.remove(upload_index);
+        let upload = state.uploads[upload_index].clone();
         if upload.received_bytes != upload.size_bytes {
             anyhow::bail!(
                 "upload incomplete: received {} of {} bytes",
@@ -2397,7 +2727,6 @@ pub fn finish_attachment_upload(
         let staged_path = upload_staging_path(paths, &upload.upload_id);
         let bytes = fs::read(&staged_path)
             .with_context(|| format!("failed to read staged upload {}", upload.upload_id))?;
-        let _ = fs::remove_file(&staged_path);
         let object = append_attachment_record(
             paths,
             state,
@@ -2411,13 +2740,19 @@ pub fn finish_attachment_upload(
                 bytes: &bytes,
             },
         )?;
+        state.uploads.remove(upload_index);
         let transport_envelope = transport_envelope_from_record(paths, state, &object);
-        Ok(AppendedConversationObject {
-            object: object_view_from_record(object, Some(&current_session)),
-            sender_member_did,
-            transport_envelope,
-        })
-    })
+        Ok((
+            AppendedConversationObject {
+                object: object_view_from_record(object, Some(&current_session)),
+                sender_member_did,
+                transport_envelope,
+            },
+            staged_path,
+        ))
+    })?;
+    let _ = fs::remove_file(staged_path);
+    Ok(output)
 }
 
 pub fn read_attachment(
@@ -2489,7 +2824,7 @@ fn participant_views_from_state(
             continue;
         };
 
-        let participant_key = participant_member_key(member_did, &object.sender_actor_id);
+        let participant_key = participant_member_key(member_did);
         let participant = members
             .entry(participant_key)
             .or_insert_with(|| ParticipantAggregate {
@@ -2562,7 +2897,7 @@ fn participant_views_from_state(
             continue;
         };
 
-        let participant_key = participant_member_key(member_did, &session.actor_id);
+        let participant_key = participant_member_key(member_did);
         let participant = members
             .entry(participant_key)
             .or_insert_with(|| ParticipantAggregate {
@@ -2594,27 +2929,9 @@ fn participant_views_from_state(
         participant.last_seen_at = participant.last_seen_at.max(session.last_seen_at);
     }
 
-    let principal_session_member_dids = state
-        .sessions
-        .iter()
-        .filter(|session| session.actor_id.trim().starts_with("principal:"))
-        .filter_map(|session| session.member_did.as_deref())
-        .map(ToOwned::to_owned)
-        .collect::<BTreeSet<_>>();
-
     let mut participants = members
         .into_values()
-        .filter(|participant| {
-            if !participant.active_in_room {
-                return false;
-            }
-            let is_legacy_runtime_actor = participant.local_session_count == 0
-                && participant
-                    .member_did
-                    .as_deref()
-                    .is_some_and(|did| principal_session_member_dids.contains(did));
-            !is_legacy_runtime_actor
-        })
+        .filter(|participant| participant.active_in_room)
         .map(|participant| ParticipantView {
             display_name: participant.display_name,
             device_label: participant.device_label,
@@ -2650,30 +2967,23 @@ fn participant_role_rank(role: Option<&RoomRole>) -> u8 {
     }
 }
 
-fn participant_member_key(member_did: &str, actor_id: &str) -> String {
-    let actor_id = actor_id.trim();
-    if actor_id.starts_with("principal:") {
-        format!("member:{member_did}:actor:{actor_id}")
-    } else {
-        format!("member:{member_did}")
-    }
+fn participant_member_key(member_did: &str) -> String {
+    format!("member:{member_did}")
 }
 
 fn default_member_display_name(member_did: &str, role: Option<&RoomRole>) -> String {
     match role {
-        Some(RoomRole::Owner) => "Owner".to_string(),
-        Some(RoomRole::Admin) => format!("Admin {}", short_did_suffix(member_did)),
-        Some(RoomRole::Member) => format!("Member {}", short_did_suffix(member_did)),
-        None => format!("Member {}", short_did_suffix(member_did)),
+        Some(RoomRole::Owner) => "ElastOS user".to_string(),
+        Some(RoomRole::Admin) | Some(RoomRole::Member) | None => {
+            format!("ElastOS user {}", short_did_suffix(member_did))
+        }
     }
 }
 
 fn default_member_device_label(role: Option<&RoomRole>) -> String {
     match role {
-        Some(RoomRole::Owner) => "owner runtime".to_string(),
-        Some(RoomRole::Admin) => "admin runtime".to_string(),
-        Some(RoomRole::Member) => "member runtime".to_string(),
-        None => "room runtime".to_string(),
+        Some(RoomRole::Owner) => "primary ElastOS device".to_string(),
+        Some(RoomRole::Admin) | Some(RoomRole::Member) | None => "ElastOS device".to_string(),
     }
 }
 
@@ -2791,7 +3101,7 @@ fn local_runtime_access_from_state(
                 member_role: Some(role),
                 browser_access_allowed: false,
                 block_reason: Some(
-                    "This room only allows owners and admins to host browser guests.".to_string(),
+                    "This conversation only lets managers approve web guests.".to_string(),
                 ),
             };
         }
@@ -2806,9 +3116,7 @@ fn local_runtime_access_from_state(
             runtime_did: Some(runtime_did.to_string()),
             member_role: None,
             browser_access_allowed: false,
-            block_reason: Some(
-                "This runtime is not an active member of this exclusive room.".to_string(),
-            ),
+            block_reason: Some("This device is not part of this conversation yet.".to_string()),
         }
     }
 }
@@ -2829,7 +3137,7 @@ fn ensure_browser_access_allowed_for_member(
             "{}",
             access
                 .block_reason
-                .unwrap_or_else(|| "browser access is not allowed for this runtime".to_string())
+                .unwrap_or_else(|| "web guest access is not allowed from this device".to_string())
         )
     }
 }
@@ -2896,6 +3204,7 @@ fn room_member_view_from_record(record: &RoomMemberRecord) -> RoomMemberView {
         role: record.role.clone(),
         added_at: record.added_at,
         added_by: record.added_by.clone(),
+        profile_card: record.profile_card.clone(),
     }
 }
 
@@ -2956,6 +3265,17 @@ fn ensure_active_member<'a>(
     added_by: &str,
     now: u64,
 ) -> &'a RoomMemberRecord {
+    ensure_active_member_with_profile(state, member_did, role, added_by, now, None)
+}
+
+fn ensure_active_member_with_profile<'a>(
+    state: &'a mut RoomState,
+    member_did: &str,
+    role: RoomRole,
+    added_by: &str,
+    now: u64,
+    profile_card: Option<RoomProfileCardView>,
+) -> &'a RoomMemberRecord {
     if let Some(index) = state
         .members
         .iter()
@@ -2966,6 +3286,9 @@ fn ensure_active_member<'a>(
         member.active = true;
         member.removed_at = None;
         member.removed_by = None;
+        if profile_card.is_some() {
+            member.profile_card = profile_card;
+        }
         return member;
     }
     state.members.push(RoomMemberRecord {
@@ -2974,6 +3297,7 @@ fn ensure_active_member<'a>(
         added_at: now,
         added_by: added_by.to_string(),
         active: true,
+        profile_card,
         removed_at: None,
         removed_by: None,
     });
@@ -3007,7 +3331,7 @@ fn can_invite_role(actor_role: &RoomRole, invited_role: &RoomRole) -> bool {
     match actor_role {
         RoomRole::Owner => matches!(invited_role, RoomRole::Admin | RoomRole::Member),
         RoomRole::Admin => matches!(invited_role, RoomRole::Member),
-        RoomRole::Member => false,
+        RoomRole::Member => matches!(invited_role, RoomRole::Member),
     }
 }
 
@@ -3304,32 +3628,6 @@ fn transport_envelope_from_record(
         attachment_bytes_b64,
         created_at: object.created_at,
     })
-}
-
-fn transport_backlog_from_state(
-    paths: &RoomPaths,
-    state: &RoomState,
-    local_runtime_did: &str,
-    preferred: Option<&RoomObjectEnvelope>,
-) -> Vec<RoomObjectEnvelope> {
-    let mut envelopes = state
-        .objects
-        .iter()
-        .rev()
-        .filter_map(|object| transport_envelope_from_record(paths, state, object))
-        .filter(|object| object.sender_member_did == local_runtime_did)
-        .take(MAX_TRANSPORT_SYNC_OBJECTS)
-        .collect::<Vec<_>>();
-    envelopes.reverse();
-    if let Some(preferred) = preferred {
-        if !envelopes
-            .iter()
-            .any(|item| item.event_id == preferred.event_id)
-        {
-            envelopes.push(preferred.clone());
-        }
-    }
-    envelopes
 }
 
 fn with_locked_state<T>(
@@ -4019,6 +4317,21 @@ fn classify_link_object(input: &str) -> Option<LinkPreviewView> {
     })
 }
 
+fn normalize_join_invite_gateway(input: &str) -> anyhow::Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("conversation join invite gateway must not be empty");
+    }
+    let parsed = Url::parse(trimmed).context("conversation join invite gateway is not a URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("conversation join invite gateway must use http or https");
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("conversation join invite gateway must include a host");
+    }
+    Ok(parsed.origin().ascii_serialization())
+}
+
 fn short_link_label(value: &str) -> String {
     if value.len() <= 18 {
         value.to_string()
@@ -4324,7 +4637,7 @@ mod tests {
         .unwrap_err();
         assert!(err
             .to_string()
-            .contains("sovereign member invites are disabled"));
+            .contains("ElastOS user invites are disabled"));
     }
 
     #[test]
@@ -4477,7 +4790,6 @@ mod tests {
         let guest = tempfile::tempdir().unwrap();
         let (_owner_sk, owner_did) = elastos_identity::load_or_create_did(owner.path()).unwrap();
         let (_guest_sk, guest_did) = elastos_identity::load_or_create_did(guest.path()).unwrap();
-
         let _ = seed_room_owner(
             owner.path(),
             RoomOwnerSeedInput {
@@ -4532,6 +4844,138 @@ mod tests {
             .members
             .iter()
             .any(|member| member.member_did == guest_did && member.role == RoomRole::Member));
+    }
+
+    #[test]
+    fn conversation_join_link_claims_targeted_invite_and_syncs_acceptance() {
+        let owner = tempfile::tempdir().unwrap();
+        let guest = tempfile::tempdir().unwrap();
+        let (_owner_sk, owner_did) = elastos_identity::load_or_create_did(owner.path()).unwrap();
+        let (_guest_sk, guest_did) = elastos_identity::load_or_create_did(guest.path()).unwrap();
+        let owner_profile = RoomProfileCardView {
+            schema: "elastos.profile-card/v1".to_string(),
+            profile_id: "profile:local:owner".to_string(),
+            display_name: "Owner".to_string(),
+            handle: Some("owner".to_string()),
+            updated_at: 10,
+        };
+        let guest_profile = RoomProfileCardView {
+            schema: "elastos.profile-card/v1".to_string(),
+            profile_id: "profile:local:guest".to_string(),
+            display_name: "Guest".to_string(),
+            handle: Some("guest".to_string()),
+            updated_at: 20,
+        };
+
+        let _ = seed_room_owner(
+            owner.path(),
+            RoomOwnerSeedInput {
+                owner_did: owner_did.clone(),
+                title: "Exec Room".to_string(),
+            },
+        )
+        .unwrap();
+
+        let join = export_room_join_invite(
+            owner.path(),
+            RoomJoinInviteInput {
+                actor_did: owner_did.clone(),
+                issuer_gateway: "https://elastos.example".to_string(),
+                inviter_profile: Some(owner_profile.clone()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            room_join_invite_token_from_input(&join.invite_url).unwrap(),
+            join.token
+        );
+        let chat_uri_err =
+            room_join_invite_token_from_input(&format!("elastos://chat/join?token={}", join.token))
+                .unwrap_err();
+        assert!(chat_uri_err
+            .to_string()
+            .contains("unsupported conversation join invite URI"));
+        let (decoded, signer_did) = decode_room_join_invite_token(&join.token).unwrap();
+        assert_eq!(signer_did, owner_did);
+        assert_eq!(decoded.payload.issuer_gateway, "https://elastos.example");
+        assert_eq!(decoded.payload.role, RoomRole::Member);
+        assert_eq!(
+            decoded
+                .payload
+                .inviter_profile
+                .as_ref()
+                .unwrap()
+                .display_name,
+            "Owner"
+        );
+
+        let invite = claim_room_join_invite(owner.path(), &join.invite_url, &guest_did).unwrap();
+        assert_eq!(invite.payload.invited_did, guest_did);
+        assert_eq!(invite.payload.invited_by, owner_did);
+        assert_eq!(
+            invite
+                .payload
+                .inviter_profile
+                .as_ref()
+                .unwrap()
+                .display_name,
+            "Owner"
+        );
+
+        let imported_invite =
+            import_room_invite_envelope(guest.path(), &serde_json::to_vec(&invite).unwrap())
+                .unwrap();
+        let guest_control_after_import = load_room_control(guest.path()).unwrap();
+        assert!(guest_control_after_import.members.iter().any(|member| {
+            member.member_did == owner_did
+                && member
+                    .profile_card
+                    .as_ref()
+                    .map(|card| card.display_name.as_str())
+                    == Some("Owner")
+        }));
+        let accepted = accept_room_invite(
+            guest.path(),
+            RoomInviteAcceptInput {
+                actor_did: guest_did.clone(),
+                invite_id: imported_invite.invite_id.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(accepted.member_did, guest_did);
+
+        let acceptance = export_room_acceptance_envelope_with_profile(
+            guest.path(),
+            &imported_invite.invite_id,
+            Some(guest_profile),
+        )
+        .unwrap();
+        let synced = import_room_acceptance_envelope(
+            owner.path(),
+            &serde_json::to_vec(&acceptance).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(synced.member_did, guest_did);
+        assert_eq!(
+            synced.profile_card.as_ref().unwrap().display_name.as_str(),
+            "Guest"
+        );
+
+        let control = load_room_control(owner.path()).unwrap();
+        assert!(control.pending_invites.is_empty());
+        assert!(control
+            .members
+            .iter()
+            .any(|member| member.member_did == owner_did && member.role == RoomRole::Owner));
+        assert!(control.members.iter().any(|member| {
+            member.member_did == guest_did
+                && member.role == RoomRole::Member
+                && member
+                    .profile_card
+                    .as_ref()
+                    .map(|card| card.display_name.as_str())
+                    == Some("Guest")
+        }));
     }
 
     #[test]
@@ -4683,7 +5127,7 @@ mod tests {
         .unwrap_err();
         assert!(non_member
             .to_string()
-            .contains("not an active member of this exclusive room"));
+            .contains("not part of this conversation"));
 
         let allowed = request_browser_access(
             tmp.path(),
@@ -4739,7 +5183,7 @@ mod tests {
         .unwrap_err();
         assert!(err
             .to_string()
-            .contains("only allows owners and admins to host browser guests"));
+            .contains("only lets managers approve web guests"));
     }
 
     #[test]
@@ -4877,7 +5321,7 @@ mod tests {
     }
 
     #[test]
-    fn same_runtime_passkey_principals_remain_distinct_room_actors() {
+    fn same_runtime_passkey_principals_share_one_member_roster_row() {
         let tmp = tempfile::tempdir().unwrap();
         let runtime_did = "did:key:z6runtime";
 
@@ -4905,19 +5349,15 @@ mod tests {
         let admin_poll = room_poll(tmp.path(), &admin.token, 0).unwrap();
         let guest_poll = room_poll(tmp.path(), &guest.token, 0).unwrap();
 
-        assert_eq!(admin_poll.participants.len(), 2);
-        assert_eq!(guest_poll.participants.len(), 2);
-        assert!(admin_poll
-            .participants
-            .iter()
-            .any(
-                |participant| participant.display_name == "Admin" && participant.is_current_session
-            ));
-        assert!(admin_poll
-            .participants
-            .iter()
-            .any(|participant| participant.display_name == "Guest"
-                && !participant.is_current_session));
+        assert_eq!(admin_poll.participants.len(), 1);
+        assert_eq!(guest_poll.participants.len(), 1);
+        assert_eq!(
+            admin_poll.participants[0].member_did.as_deref(),
+            Some(runtime_did)
+        );
+        assert_eq!(admin_poll.participants[0].local_session_count, 2);
+        assert!(admin_poll.participants[0].is_current_session);
+        assert!(guest_poll.participants[0].is_current_session);
         assert!(admin_poll.objects.iter().any(|object| {
             object.body.as_deref() == Some("admin hello") && object.from_current_session
         }));
@@ -4933,7 +5373,62 @@ mod tests {
     }
 
     #[test]
-    fn passkey_principal_participants_replace_legacy_runtime_actor_row() {
+    fn stale_principal_actor_objects_collapse_to_one_member_roster_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_did = "did:key:z6runtime";
+
+        with_locked_state(tmp.path(), |_, state| {
+            state.members.push(RoomMemberRecord {
+                member_did: runtime_did.to_string(),
+                role: RoomRole::Owner,
+                added_at: 1,
+                added_by: runtime_did.to_string(),
+                active: true,
+                profile_card: None,
+                removed_at: None,
+                removed_by: None,
+            });
+            state.objects.push(ConversationObjectRecord {
+                seq: 1,
+                event_id: "evt-admin".to_string(),
+                sender: "Admin".to_string(),
+                sender_member_did: Some(runtime_did.to_string()),
+                sender_actor_id: "principal:admin".to_string(),
+                kind: ConversationObjectKind::Text,
+                body: Some("admin hello".to_string()),
+                emoji: None,
+                link: None,
+                attachment: None,
+                created_at: 10,
+            });
+            state.objects.push(ConversationObjectRecord {
+                seq: 2,
+                event_id: "evt-guest".to_string(),
+                sender: "Guest".to_string(),
+                sender_member_did: Some(runtime_did.to_string()),
+                sender_actor_id: "principal:guest".to_string(),
+                kind: ConversationObjectKind::Text,
+                body: Some("guest hello".to_string()),
+                emoji: None,
+                link: None,
+                attachment: None,
+                created_at: 20,
+            });
+            Ok(())
+        })
+        .unwrap();
+
+        let summary = load_summary(tmp.path()).unwrap();
+        assert_eq!(summary.active_participants.len(), 1);
+        assert_eq!(
+            summary.active_participants[0].member_did.as_deref(),
+            Some(runtime_did)
+        );
+        assert_eq!(summary.active_participants[0].display_name, "Guest");
+    }
+
+    #[test]
+    fn passkey_principal_participant_replaces_legacy_runtime_actor_row() {
         let tmp = tempfile::tempdir().unwrap();
         let runtime_did = "did:key:z6runtime";
 
@@ -4962,15 +5457,13 @@ mod tests {
         let poll = room_poll(tmp.path(), &admin.token, 0).unwrap();
 
         assert!(room_poll(tmp.path(), &legacy.token, 0).is_err());
-        assert_eq!(poll.participants.len(), 2);
-        assert!(poll.participants.iter().any(
-            |participant| participant.display_name == "Admin" && participant.is_current_session
-        ));
-        assert!(poll
-            .participants
-            .iter()
-            .any(|participant| participant.display_name == "Guest"
-                && !participant.is_current_session));
+        assert_eq!(poll.participants.len(), 1);
+        assert_eq!(
+            poll.participants[0].member_did.as_deref(),
+            Some(runtime_did)
+        );
+        assert_eq!(poll.participants[0].local_session_count, 2);
+        assert!(poll.participants[0].is_current_session);
         assert!(!poll
             .participants
             .iter()
@@ -4980,12 +5473,8 @@ mod tests {
         }));
 
         let guest_poll = room_poll(tmp.path(), &guest.token, 0).unwrap();
-        assert!(guest_poll
-            .participants
-            .iter()
-            .any(
-                |participant| participant.display_name == "Guest" && participant.is_current_session
-            ));
+        assert_eq!(guest_poll.participants.len(), 1);
+        assert!(guest_poll.participants[0].is_current_session);
     }
 
     #[test]
@@ -5005,15 +5494,15 @@ mod tests {
         )
         .unwrap();
         let _ = approve_next_request(tmp.path()).unwrap().unwrap();
-        let _token = browser_access_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id)
             .unwrap()
             .token
             .unwrap();
 
-        let backlog = room_transport_backlog(tmp.path(), "did:key:z6owner", None).unwrap();
-        assert!(!backlog.iter().any(|object| {
+        let poll = room_poll(tmp.path(), &token, 0).unwrap();
+        assert!(!poll.objects.iter().any(|object| {
             object.kind == ConversationObjectKind::System
-                && object.sender_member_did == "did:key:z6owner"
+                && object.sender_member_did.as_deref() == Some("did:key:z6owner")
                 && object.body.as_deref() == Some("joined the room")
         }));
     }
@@ -5079,6 +5568,33 @@ mod tests {
         assert_eq!(envelope.kind, ConversationObjectKind::Text);
         assert_eq!(envelope.body.as_deref(), Some("hello world"));
         assert!(!envelope.event_id.is_empty());
+    }
+
+    #[test]
+    fn open_room_ingests_transport_objects_without_preseeded_membership() {
+        let tmp = tempfile::tempdir().unwrap();
+        let envelope = RoomObjectEnvelope {
+            schema: ROOM_OBJECT_ENVELOPE_SCHEMA.to_string(),
+            room_slug: ROOM_SLUG.to_string(),
+            event_id: "event-open-room".to_string(),
+            sender: "Remote runtime".to_string(),
+            sender_member_did: "did:key:z6remote".to_string(),
+            kind: ConversationObjectKind::Text,
+            body: Some("global hello".to_string()),
+            emoji: None,
+            link: None,
+            attachment: None,
+            attachment_bytes_b64: None,
+            created_at: now_ts(),
+        };
+
+        let first = ingest_room_object_envelope(tmp.path(), &envelope)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.body.as_deref(), Some("global hello"));
+        assert_eq!(first.sender_member_did.as_deref(), Some("did:key:z6remote"));
+        let second = ingest_room_object_envelope(tmp.path(), &envelope).unwrap();
+        assert!(second.is_none());
     }
 
     #[test]
@@ -5222,6 +5738,106 @@ mod tests {
     }
 
     #[test]
+    fn attachment_upload_finish_preserves_retry_state_when_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let request =
+            request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
+        let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
+        let token = browser_access_status(tmp.path(), &request.request_id)
+            .unwrap()
+            .token
+            .unwrap();
+
+        let upload =
+            start_attachment_upload(tmp.path(), &token, "draft.txt", "text/plain", 5).unwrap();
+        append_attachment_upload_chunk(tmp.path(), &token, &upload.upload_id, 0, b"he").unwrap();
+
+        let err = finish_attachment_upload(tmp.path(), &token, &upload.upload_id)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("upload incomplete"));
+
+        append_attachment_upload_chunk(tmp.path(), &token, &upload.upload_id, 2, b"llo").unwrap();
+        let finished = finish_attachment_upload(tmp.path(), &token, &upload.upload_id).unwrap();
+        let attachment_id = &finished.object.attachment.as_ref().unwrap().attachment_id;
+        let (_meta, bytes) = read_attachment(tmp.path(), &token, attachment_id).unwrap();
+        assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn attachment_upload_finish_preserves_retry_state_when_staged_file_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let request =
+            request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
+        let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
+        let token = browser_access_status(tmp.path(), &request.request_id)
+            .unwrap()
+            .token
+            .unwrap();
+
+        let upload =
+            start_attachment_upload(tmp.path(), &token, "draft.txt", "text/plain", 4).unwrap();
+        append_attachment_upload_chunk(tmp.path(), &token, &upload.upload_id, 0, b"data").unwrap();
+        let paths = storage_paths(tmp.path()).unwrap();
+        let staged_path = upload_staging_path(&paths, &upload.upload_id);
+        fs::remove_file(&staged_path).unwrap();
+
+        let err = finish_attachment_upload(tmp.path(), &token, &upload.upload_id)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed to read staged upload"));
+
+        fs::write(&staged_path, b"data").unwrap();
+        let finished = finish_attachment_upload(tmp.path(), &token, &upload.upload_id).unwrap();
+        let attachment_id = &finished.object.attachment.as_ref().unwrap().attachment_id;
+        let (_meta, bytes) = read_attachment(tmp.path(), &token, attachment_id).unwrap();
+        assert_eq!(bytes, b"data");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attachment_upload_finish_preserves_retry_state_when_final_state_save_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let request =
+            request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
+        let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
+        let token = browser_access_status(tmp.path(), &request.request_id)
+            .unwrap()
+            .token
+            .unwrap();
+
+        let upload =
+            start_attachment_upload(tmp.path(), &token, "draft.txt", "text/plain", 4).unwrap();
+        append_attachment_upload_chunk(tmp.path(), &token, &upload.upload_id, 0, b"data").unwrap();
+        let paths = storage_paths(tmp.path()).unwrap();
+        let staged_path = upload_staging_path(&paths, &upload.upload_id);
+        fs::create_dir_all(&paths.attachments_dir).unwrap();
+        fs::set_permissions(&paths.attachments_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&paths.room_dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let err = finish_attachment_upload(tmp.path(), &token, &upload.upload_id)
+            .unwrap_err()
+            .to_string();
+        fs::set_permissions(&paths.room_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(err.contains("failed to write") || err.contains("Permission denied"));
+        assert!(
+            staged_path.exists(),
+            "failed final commit must keep staged upload bytes"
+        );
+
+        let finished = finish_attachment_upload(tmp.path(), &token, &upload.upload_id).unwrap();
+        assert!(
+            !staged_path.exists(),
+            "successful finish should clean the staged upload file"
+        );
+        let attachment_id = &finished.object.attachment.as_ref().unwrap().attachment_id;
+        let (_meta, bytes) = read_attachment(tmp.path(), &token, attachment_id).unwrap();
+        assert_eq!(bytes, b"data");
+    }
+
+    #[test]
     fn attachment_object_classifies_audio_and_video() {
         let tmp = tempfile::tempdir().unwrap();
         let request =
@@ -5285,17 +5901,18 @@ mod tests {
         let session =
             start_local_runtime_session(tmp.path(), "did:key:z6owner", "Alice", "Laptop").unwrap();
 
-        let left = leave_session(tmp.path(), &session.token).unwrap();
-        assert_eq!(left.kind, ConversationObjectKind::System);
-        assert_eq!(left.body.as_deref(), Some("left the room"));
-        assert_eq!(left.sender_member_did.as_deref(), Some("did:key:z6owner"));
+        let left = leave_session_with_transport(tmp.path(), &session.token).unwrap();
+        assert_eq!(left.object.kind, ConversationObjectKind::System);
+        assert_eq!(left.object.body.as_deref(), Some("left the room"));
+        assert_eq!(
+            left.object.sender_member_did.as_deref(),
+            Some("did:key:z6owner")
+        );
+        let envelope = left.transport_envelope.expect("leave transport envelope");
+        assert_eq!(envelope.kind, ConversationObjectKind::System);
+        assert_eq!(envelope.sender_member_did, "did:key:z6owner");
+        assert_eq!(envelope.body.as_deref(), Some("left the room"));
 
-        let backlog = room_transport_backlog(tmp.path(), "did:key:z6owner", None).unwrap();
-        assert!(backlog.iter().any(|object| {
-            object.kind == ConversationObjectKind::System
-                && object.sender_member_did == "did:key:z6owner"
-                && object.body.as_deref() == Some("left the room")
-        }));
         let summary = load_summary(tmp.path()).unwrap();
         assert!(summary.active_participants.is_empty());
     }

@@ -10,7 +10,7 @@ import {
   beginShellInteraction,
   clamp,
   endShellInteraction,
-} from "./shell-core.js?v=home-20260607e";
+} from "./shell-core.js?v=home-20260627a";
 
 const WINDOW_MIN_VISIBLE_DRAG_WIDTH = 96;
 const WINDOW_MIN_VISIBLE_DRAG_HEIGHT = 32;
@@ -24,7 +24,7 @@ function safeClamp(value, min, max) {
 }
 
 function browserAspectConfig(node) {
-  if (node?.dataset?.target !== BROWSER_TARGET_ID || node.dataset.maximized === "true" || node.dataset.snap) {
+  if (node?.dataset?.target !== BROWSER_TARGET_ID || node.dataset.maximized === "true") {
     return null;
   }
   const headHeight = Math.round(
@@ -57,6 +57,27 @@ function browserAspectBoundsFromWidth(node, bounds) {
     fitted = fitWindowBounds({ ...fitted, width, height: fitted.height }, { allowPartial: true });
   }
   return fitted;
+}
+
+function browserAspectBoundsForState(node, bounds, state) {
+  const fitted = browserAspectBoundsFromWidth(node, bounds);
+  const horizontalRoom = Math.max(0, bounds.width - fitted.width);
+  const verticalRoom = Math.max(0, bounds.height - fitted.height);
+  const anchorRight = state === "right" || state === "ne" || state === "se";
+  const anchorBottom = state === "sw" || state === "se";
+  const centerHorizontal = state === "maximize";
+  const centerVertical = state === "maximize" || state === "left" || state === "right";
+  return {
+    ...fitted,
+    x: Math.round(
+      bounds.x +
+        (centerHorizontal ? horizontalRoom / 2 : anchorRight ? horizontalRoom : 0),
+    ),
+    y: Math.round(
+      bounds.y +
+        (centerVertical ? verticalRoom / 2 : anchorBottom ? verticalRoom : 0),
+    ),
+  };
 }
 
 function browserAspectResizeBounds(node, bounds, resizing, limits) {
@@ -196,8 +217,23 @@ export function fitWindowToBrowserAspect(node) {
   applyWindowBounds(node, browserAspectBoundsFromWidth(node, normalWindowBounds(node)));
 }
 
+export function fitWindowToLargestBrowserAspect(node) {
+  const config = browserAspectConfig(node);
+  if (!config) {
+    return;
+  }
+  applyWindowBounds(
+    node,
+    browserAspectBoundsForState(node, snappedWindowBounds("maximize"), "maximize"),
+  );
+}
+
 export function rememberWindowRestoreBounds(node) {
-  if (node.dataset.maximized === "true" || node.dataset.snap) {
+  if (
+    node.dataset.maximized === "true" ||
+    node.dataset.browserMaximized === "true" ||
+    node.dataset.snap
+  ) {
     return;
   }
   const bounds = normalWindowBounds(node);
@@ -209,6 +245,7 @@ export function rememberWindowRestoreBounds(node) {
 
 export function restoreWindowFromSpecialState(node) {
   node.dataset.maximized = "false";
+  node.dataset.browserMaximized = "false";
   node.dataset.snap = "";
   if (
     node.dataset.restoreLeft &&
@@ -240,15 +277,28 @@ export function applyWindowPlacement(node, placement) {
 
   if (placement?.maximized) {
     node.dataset.snap = "";
+    if (node.dataset.target === BROWSER_TARGET_ID) {
+      node.dataset.maximized = "false";
+      node.dataset.browserMaximized = "true";
+      fitWindowToLargestBrowserAspect(node);
+      return;
+    }
     node.dataset.maximized = "true";
+    node.dataset.browserMaximized = "false";
     return;
   }
 
   node.dataset.maximized = "false";
+  node.dataset.browserMaximized = "false";
   const snapState = typeof placement?.snap === "string" ? placement.snap : "";
   if (snapState === "left" || snapState === "right" || snapState === "nw" || snapState === "ne" || snapState === "sw" || snapState === "se") {
     node.dataset.snap = snapState;
-    applyWindowBounds(node, snappedWindowBounds(snapState));
+    applyWindowBounds(
+      node,
+      node.dataset.target === BROWSER_TARGET_ID
+        ? browserAspectBoundsForState(node, snappedWindowBounds(snapState), snapState)
+        : snappedWindowBounds(snapState),
+    );
     return;
   }
 
@@ -283,7 +333,11 @@ export function attachWindowDrag(windowNode, handle, focusWindow, onWindowGeomet
     const workspaceRect = desktop.getBoundingClientRect();
     let offsetX;
     let offsetY;
-    if (windowNode.dataset.maximized === "true" || windowNode.dataset.snap) {
+    if (
+      windowNode.dataset.maximized === "true" ||
+      windowNode.dataset.browserMaximized === "true" ||
+      windowNode.dataset.snap
+    ) {
       const restoredBounds = restoreWindowForDrag(windowNode, event.clientX, event.clientY);
       offsetX = event.clientX - workspaceRect.left - restoredBounds.x;
       offsetY = event.clientY - workspaceRect.top - restoredBounds.y;
@@ -374,8 +428,9 @@ export function attachWindowResize(windowNode, focusWindow, onWindowGeometryChan
       }
       event.stopPropagation();
       hideWindowSnapPreview();
-      if (windowNode.dataset.snap) {
+      if (windowNode.dataset.snap || windowNode.dataset.browserMaximized === "true") {
         windowNode.dataset.snap = "";
+        windowNode.dataset.browserMaximized = "false";
       }
       focusWindow(windowNode.dataset.windowId);
       const bounds = normalWindowBounds(windowNode);
@@ -611,10 +666,23 @@ function applyWindowSnap(node, target) {
   hideWindowSnapPreview();
   if (target.state === "maximize") {
     node.dataset.snap = "";
+    if (node.dataset.target === BROWSER_TARGET_ID) {
+      node.dataset.maximized = "false";
+      node.dataset.browserMaximized = "true";
+      fitWindowToLargestBrowserAspect(node);
+      return;
+    }
     node.dataset.maximized = "true";
+    node.dataset.browserMaximized = "false";
     return;
   }
   node.dataset.maximized = "false";
+  node.dataset.browserMaximized = "false";
   node.dataset.snap = target.state;
-  applyWindowBounds(node, target.bounds);
+  applyWindowBounds(
+    node,
+    node.dataset.target === BROWSER_TARGET_ID
+      ? browserAspectBoundsForState(node, target.bounds, target.state)
+      : target.bounds,
+  );
 }
