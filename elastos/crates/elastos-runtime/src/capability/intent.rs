@@ -1,0 +1,596 @@
+//! Intent-proof loop — chunk 1: the two signed records + the pure verifier.
+//!
+//! The prover/verifier loop for agent *actions* (design: `docs/INTENT_PROOF_LOOP.md`).
+//! An agent DECLARES what it intends to do ([`IntentDeclarationV1`]) before acting; the
+//! runtime PROVES that intent is within a standing authorization
+//! ([`check_intent_within_envelope`], fail-closed) before the act fires; and after the
+//! act the declared-vs-done delta is recorded as a signed custody fact
+//! ([`IntentReconciliationV1`] built from [`reconcile`]).
+//!
+//! This chunk is the crypto + pure logic only — the records sign/verify like
+//! [`crate::capability::receipt::AffordanceGrantReceiptV1`], and the verifier is a pure
+//! function with the full fail-closed branch matrix under test. EMISSION onto the audit
+//! chain (new `AuditEvent` variants) and WIRING into the live dispatch path are the next
+//! chunks; nothing here touches the act path yet.
+//!
+//! Scope boundary (carried from the design): this verifies CONTAINMENT + CUSTODY — that an
+//! intent is within the authorized envelope, and a tamper-evident record of declared vs
+//! done — NOT the correctness/wisdom of the act.
+
+use std::collections::BTreeSet;
+
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::capability::receipt::AffordanceGrantReceiptV1;
+use crate::primitives::time::SecureTimestamp;
+
+/// Schema tag for the v1 intent declaration.
+pub const INTENT_DECLARATION_SCHEMA_V1: &str = "elastos.intent.declaration.v1";
+/// Schema tag for the v1 intent reconciliation.
+pub const INTENT_RECONCILIATION_SCHEMA_V1: &str = "elastos.intent.reconciliation.v1";
+
+/// Domain-separation tags so an intent/reconciliation signature can never be confused
+/// with any other ed25519 signature this key produces (mirrors `receipt.rs`).
+const INTENT_SIG_DOMAIN: &[u8] = b"elastos.intent.declaration.v1\0";
+const RECONCILE_SIG_DOMAIN: &[u8] = b"elastos.intent.reconciliation.v1\0";
+
+// ─────────────────────────── The agent's pre-act proof obligation ────────────
+
+/// A signed declaration of what an agent INTENDS to do, recorded before the act fires.
+/// The agent's proof obligation: `input_hash` is the `canonical_input_hash` of the
+/// declared arguments (same hashing path as the W2 binding), so the later receipt can be
+/// compared field-for-field. Signed exactly like [`AffordanceGrantReceiptV1`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntentDeclarationV1 {
+    pub schema: String,
+    /// Stable id for this declaration (the reconciliation references it).
+    pub intent_id: String,
+    /// The acting capsule identity (`vm-{name}`).
+    pub capsule: String,
+    /// The affordance method the agent intends to invoke.
+    pub method_id: String,
+    /// Canonical hash of the declared invocation arguments.
+    pub input_hash: String,
+    /// The resource the act targets.
+    pub resource: String,
+    /// The action to be performed.
+    pub action: String,
+    /// The standing-grant envelope this intent is claimed to fall within.
+    pub standing_grant_id: String,
+    /// When the intent was declared.
+    pub declared_at: SecureTimestamp,
+    /// Issuer ed25519 public key (hex) that signed this declaration.
+    pub signer: String,
+    /// Ed25519 signature (base64) over the canonical declaration bytes.
+    pub signature: String,
+}
+
+impl IntentDeclarationV1 {
+    fn signable_digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(INTENT_SIG_DOMAIN);
+        for field in [
+            self.schema.as_str(),
+            self.intent_id.as_str(),
+            self.capsule.as_str(),
+            self.method_id.as_str(),
+            self.input_hash.as_str(),
+            self.resource.as_str(),
+            self.action.as_str(),
+            self.standing_grant_id.as_str(),
+            self.signer.as_str(),
+        ] {
+            hasher.update((field.len() as u64).to_le_bytes());
+            hasher.update(field.as_bytes());
+        }
+        let ts = serde_json::to_vec(&self.declared_at).unwrap_or_default();
+        hasher.update((ts.len() as u64).to_le_bytes());
+        hasher.update(&ts);
+        hasher.finalize().into()
+    }
+
+    /// Build and sign an intent declaration with the issuer signing key.
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue(
+        signing_key: &SigningKey,
+        signer_pubkey: [u8; 32],
+        intent_id: &str,
+        capsule: &str,
+        method_id: &str,
+        input_hash: &str,
+        resource: &str,
+        action: &str,
+        standing_grant_id: &str,
+    ) -> Self {
+        let mut intent = Self {
+            schema: INTENT_DECLARATION_SCHEMA_V1.to_string(),
+            intent_id: intent_id.to_string(),
+            capsule: capsule.to_string(),
+            method_id: method_id.to_string(),
+            input_hash: input_hash.to_string(),
+            resource: resource.to_string(),
+            action: action.to_string(),
+            standing_grant_id: standing_grant_id.to_string(),
+            declared_at: SecureTimestamp::now(),
+            signer: hex::encode(signer_pubkey),
+            signature: String::new(),
+        };
+        let signature: Signature = signing_key.sign(&intent.signable_digest());
+        intent.signature = BASE64.encode(signature.to_bytes());
+        intent
+    }
+
+    /// Verify the signature against a verifying key. Fails closed on any malformed signature.
+    pub fn verify(&self, verifying_key: &VerifyingKey) -> bool {
+        verify_b64_sig(&self.signature, &self.signable_digest(), verifying_key)
+    }
+}
+
+// ─────────────────────────── The standing authorization envelope ─────────────
+
+/// The fields of a standing grant the containment check needs (chunk-1 representation).
+///
+/// A standing grant authorizes a METHOD on a RESOURCE with an ACTION for a capsule — it
+/// deliberately does NOT freeze an `input_hash`, so the agent may declare-and-act
+/// repeatedly with different arguments within the envelope (the whole point of
+/// unsupervised autonomy). Wiring this from a real issued `CapabilityToken` / grant is a
+/// later chunk; here it is the value the pure check consumes.
+#[derive(Debug, Clone)]
+pub struct StandingGrantEnvelope {
+    pub grant_id: String,
+    pub capsule: String,
+    /// The method ids the envelope authorizes (a sorted set for stable, fast containment).
+    pub allowed_methods: BTreeSet<String>,
+    pub resource: String,
+    pub action: String,
+    pub expires_at: SecureTimestamp,
+    pub revoked: bool,
+}
+
+impl StandingGrantEnvelope {
+    /// Active = not revoked AND not past expiry. Fail-closed: a revoked or expired
+    /// envelope authorizes nothing.
+    pub fn is_active(&self) -> bool {
+        !self.revoked && self.expires_at.is_future()
+    }
+}
+
+/// Why an intent was denied against an envelope — one variant per fail-closed branch, so
+/// the denial reason is explicit and testable (and can be recorded honestly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvelopeDenial {
+    Revoked,
+    Expired,
+    WrongCapsule,
+    MethodNotInEnvelope,
+    WrongResource,
+    WrongAction,
+}
+
+/// The verifier's verdict: the intent is within the envelope, or denied with a reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvelopeCheck {
+    Allowed,
+    Denied(EnvelopeDenial),
+}
+
+/// Prove `intent ⊆ standing grant`, fail-closed. Envelope validity (revoked / expired) is
+/// checked BEFORE field containment, so an inactive envelope authorizes nothing regardless
+/// of the intent. `input_hash` is intentionally NOT checked — the envelope authorizes the
+/// method/resource/action, not a frozen argument hash.
+pub fn check_intent_within_envelope(
+    intent: &IntentDeclarationV1,
+    envelope: &StandingGrantEnvelope,
+) -> EnvelopeCheck {
+    if envelope.revoked {
+        return EnvelopeCheck::Denied(EnvelopeDenial::Revoked);
+    }
+    if !envelope.expires_at.is_future() {
+        return EnvelopeCheck::Denied(EnvelopeDenial::Expired);
+    }
+    if intent.capsule != envelope.capsule {
+        return EnvelopeCheck::Denied(EnvelopeDenial::WrongCapsule);
+    }
+    if !envelope.allowed_methods.contains(&intent.method_id) {
+        return EnvelopeCheck::Denied(EnvelopeDenial::MethodNotInEnvelope);
+    }
+    if intent.resource != envelope.resource {
+        return EnvelopeCheck::Denied(EnvelopeDenial::WrongResource);
+    }
+    if intent.action != envelope.action {
+        return EnvelopeCheck::Denied(EnvelopeDenial::WrongAction);
+    }
+    EnvelopeCheck::Allowed
+}
+
+// ─────────────────────────── Declared-vs-done reconciliation ──────────────────
+
+/// The declared-vs-done verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationStatus {
+    /// The receipt's bound fields equal the declared intent.
+    Matched,
+    /// A receipt exists but a bound field differs from the declared intent (the act fired
+    /// within the envelope, but not as declared — flagged, never masked).
+    Diverged,
+    /// The intent was declared but no receipt was produced (the act never completed).
+    /// Absence is recorded, never a silent pass.
+    Undelivered,
+}
+
+impl ReconciliationStatus {
+    /// Stable string form for the signature digest and the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReconciliationStatus::Matched => "matched",
+            ReconciliationStatus::Diverged => "diverged",
+            ReconciliationStatus::Undelivered => "undelivered",
+        }
+    }
+}
+
+/// Compare a declared intent against the receipt of what was actually redeemed. Returns the
+/// status and, when not matched, a human-readable detail (the diverged field list, or the
+/// undelivered reason). Pure — the signed [`IntentReconciliationV1`] is built from this.
+pub fn reconcile(
+    intent: &IntentDeclarationV1,
+    receipt: Option<&AffordanceGrantReceiptV1>,
+) -> (ReconciliationStatus, String) {
+    let Some(r) = receipt else {
+        return (
+            ReconciliationStatus::Undelivered,
+            "no receipt produced for the declared intent".to_string(),
+        );
+    };
+    let mut diffs: Vec<&str> = Vec::new();
+    if r.capsule != intent.capsule {
+        diffs.push("capsule");
+    }
+    if r.method_id != intent.method_id {
+        diffs.push("method_id");
+    }
+    if r.input_hash != intent.input_hash {
+        diffs.push("input_hash");
+    }
+    if r.resource != intent.resource {
+        diffs.push("resource");
+    }
+    if r.action != intent.action {
+        diffs.push("action");
+    }
+    if diffs.is_empty() {
+        (ReconciliationStatus::Matched, String::new())
+    } else {
+        (
+            ReconciliationStatus::Diverged,
+            format!("diverged fields: {}", diffs.join(",")),
+        )
+    }
+}
+
+/// A signed record of the declared-vs-done verdict. `receipt_id` is empty for an
+/// `Undelivered` status; `divergence_detail` is empty for a `Matched` status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntentReconciliationV1 {
+    pub schema: String,
+    /// The [`IntentDeclarationV1::intent_id`] this reconciles.
+    pub intent_id: String,
+    /// The reconciled receipt's `token_id` (empty when `Undelivered`).
+    pub receipt_id: String,
+    pub status: ReconciliationStatus,
+    /// Human-readable detail (diverged fields / undelivered reason); empty when `Matched`.
+    pub divergence_detail: String,
+    pub reconciled_at: SecureTimestamp,
+    pub signer: String,
+    pub signature: String,
+}
+
+impl IntentReconciliationV1 {
+    fn signable_digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(RECONCILE_SIG_DOMAIN);
+        for field in [
+            self.schema.as_str(),
+            self.intent_id.as_str(),
+            self.receipt_id.as_str(),
+            self.status.as_str(),
+            self.divergence_detail.as_str(),
+            self.signer.as_str(),
+        ] {
+            hasher.update((field.len() as u64).to_le_bytes());
+            hasher.update(field.as_bytes());
+        }
+        let ts = serde_json::to_vec(&self.reconciled_at).unwrap_or_default();
+        hasher.update((ts.len() as u64).to_le_bytes());
+        hasher.update(&ts);
+        hasher.finalize().into()
+    }
+
+    /// Build and sign a reconciliation record from a [`reconcile`] result.
+    pub fn issue(
+        signing_key: &SigningKey,
+        signer_pubkey: [u8; 32],
+        intent_id: &str,
+        receipt_id: &str,
+        status: ReconciliationStatus,
+        divergence_detail: &str,
+    ) -> Self {
+        let mut record = Self {
+            schema: INTENT_RECONCILIATION_SCHEMA_V1.to_string(),
+            intent_id: intent_id.to_string(),
+            receipt_id: receipt_id.to_string(),
+            status,
+            divergence_detail: divergence_detail.to_string(),
+            reconciled_at: SecureTimestamp::now(),
+            signer: hex::encode(signer_pubkey),
+            signature: String::new(),
+        };
+        let signature: Signature = signing_key.sign(&record.signable_digest());
+        record.signature = BASE64.encode(signature.to_bytes());
+        record
+    }
+
+    /// Verify the signature against a verifying key. Fails closed on any malformed signature.
+    pub fn verify(&self, verifying_key: &VerifyingKey) -> bool {
+        verify_b64_sig(&self.signature, &self.signable_digest(), verifying_key)
+    }
+}
+
+/// Shared base64-signature verification (fail-closed on any malformed input).
+fn verify_b64_sig(signature_b64: &str, digest: &[u8; 32], verifying_key: &VerifyingKey) -> bool {
+    let Ok(sig_bytes) = BASE64.decode(signature_b64) else {
+        return false;
+    };
+    let sig_arr: [u8; 64] = match sig_bytes.try_into() {
+        Ok(arr) => arr,
+        Err(_) => return false,
+    };
+    let signature = Signature::from_bytes(&sig_arr);
+    verifying_key.verify(digest, &signature).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key() -> SigningKey {
+        SigningKey::generate(&mut rand::thread_rng())
+    }
+
+    fn an_intent(sk: &SigningKey, method: &str, args_hash: &str) -> IntentDeclarationV1 {
+        IntentDeclarationV1::issue(
+            sk,
+            sk.verifying_key().to_bytes(),
+            "intent-1",
+            "vm-agent",
+            method,
+            args_hash,
+            "elastos://mail/send",
+            "execute",
+            "grant-1",
+        )
+    }
+
+    fn an_envelope(methods: &[&str]) -> StandingGrantEnvelope {
+        StandingGrantEnvelope {
+            grant_id: "grant-1".to_string(),
+            capsule: "vm-agent".to_string(),
+            allowed_methods: methods.iter().map(|m| m.to_string()).collect(),
+            resource: "elastos://mail/send".to_string(),
+            action: "execute".to_string(),
+            expires_at: SecureTimestamp::after_secs(3600),
+            revoked: false,
+        }
+    }
+
+    fn a_receipt(
+        sk: &SigningKey,
+        capsule: &str,
+        method: &str,
+        args_hash: &str,
+        resource: &str,
+        action: &str,
+    ) -> AffordanceGrantReceiptV1 {
+        AffordanceGrantReceiptV1::issue(
+            sk,
+            sk.verifying_key().to_bytes(),
+            "tok-1",
+            capsule,
+            method,
+            args_hash,
+            resource,
+            action,
+        )
+    }
+
+    // ── Records sign + verify, and tampering breaks the signature ──────────────
+
+    #[test]
+    fn intent_declaration_signs_and_verifies_and_tamper_breaks_it() {
+        let sk = key();
+        let vk = sk.verifying_key();
+        let intent = an_intent(&sk, "send", "args-abc");
+        assert_eq!(intent.schema, INTENT_DECLARATION_SCHEMA_V1);
+        assert!(intent.verify(&vk), "a freshly issued intent verifies");
+        // A different key never verifies.
+        assert!(!intent.verify(&key().verifying_key()));
+        // Every bound field is covered.
+        for mutate in [
+            |i: &mut IntentDeclarationV1| i.method_id = "delete".to_string(),
+            |i: &mut IntentDeclarationV1| i.input_hash = "deadbeef".to_string(),
+            |i: &mut IntentDeclarationV1| i.capsule = "vm-evil".to_string(),
+            |i: &mut IntentDeclarationV1| i.resource = "elastos://mail/all".to_string(),
+            |i: &mut IntentDeclarationV1| i.action = "admin".to_string(),
+            |i: &mut IntentDeclarationV1| i.standing_grant_id = "grant-evil".to_string(),
+        ] {
+            let mut t = intent.clone();
+            mutate(&mut t);
+            assert!(!t.verify(&vk), "a tampered intent must not verify");
+        }
+    }
+
+    #[test]
+    fn reconciliation_record_signs_and_verifies() {
+        let sk = key();
+        let vk = sk.verifying_key();
+        let rec = IntentReconciliationV1::issue(
+            &sk,
+            vk.to_bytes(),
+            "intent-1",
+            "tok-1",
+            ReconciliationStatus::Matched,
+            "",
+        );
+        assert!(rec.verify(&vk));
+        // Tampering the status (the load-bearing field) breaks it.
+        let mut t = rec.clone();
+        t.status = ReconciliationStatus::Diverged;
+        assert!(
+            !t.verify(&vk),
+            "flipping the verdict must break the signature"
+        );
+    }
+
+    // ── The fail-closed envelope-containment branch matrix ─────────────────────
+
+    #[test]
+    fn intent_within_envelope_is_allowed() {
+        let sk = key();
+        let intent = an_intent(&sk, "send", "args-abc");
+        assert_eq!(
+            check_intent_within_envelope(&intent, &an_envelope(&["send", "draft"])),
+            EnvelopeCheck::Allowed
+        );
+    }
+
+    #[test]
+    fn method_outside_envelope_is_denied() {
+        let sk = key();
+        let intent = an_intent(&sk, "delete", "args-abc"); // not in the envelope
+        assert_eq!(
+            check_intent_within_envelope(&intent, &an_envelope(&["send", "draft"])),
+            EnvelopeCheck::Denied(EnvelopeDenial::MethodNotInEnvelope)
+        );
+    }
+
+    #[test]
+    fn wrong_capsule_resource_or_action_is_denied() {
+        let sk = key();
+        let base = an_envelope(&["send"]);
+
+        let mut wrong_cap = base.clone();
+        wrong_cap.capsule = "vm-other".to_string();
+        assert_eq!(
+            check_intent_within_envelope(&an_intent(&sk, "send", "h"), &wrong_cap),
+            EnvelopeCheck::Denied(EnvelopeDenial::WrongCapsule)
+        );
+
+        let mut wrong_res = base.clone();
+        wrong_res.resource = "elastos://mail/all".to_string();
+        assert_eq!(
+            check_intent_within_envelope(&an_intent(&sk, "send", "h"), &wrong_res),
+            EnvelopeCheck::Denied(EnvelopeDenial::WrongResource)
+        );
+
+        let mut wrong_act = base.clone();
+        wrong_act.action = "admin".to_string();
+        assert_eq!(
+            check_intent_within_envelope(&an_intent(&sk, "send", "h"), &wrong_act),
+            EnvelopeCheck::Denied(EnvelopeDenial::WrongAction)
+        );
+    }
+
+    #[test]
+    fn revoked_or_expired_envelope_is_denied_before_any_field_match() {
+        let sk = key();
+        let intent = an_intent(&sk, "send", "h");
+
+        let mut revoked = an_envelope(&["send"]);
+        revoked.revoked = true;
+        assert_eq!(
+            check_intent_within_envelope(&intent, &revoked),
+            EnvelopeCheck::Denied(EnvelopeDenial::Revoked),
+            "a revoked envelope authorizes nothing, even a perfectly-matching intent"
+        );
+
+        let mut expired = an_envelope(&["send"]);
+        expired.expires_at = SecureTimestamp::at(1); // far in the past
+        assert_eq!(
+            check_intent_within_envelope(&intent, &expired),
+            EnvelopeCheck::Denied(EnvelopeDenial::Expired)
+        );
+        assert!(!expired.is_active());
+    }
+
+    #[test]
+    fn input_hash_is_not_constrained_by_the_envelope() {
+        // The envelope authorizes the method/resource/action, NOT a frozen arg hash — two
+        // intents with different args both pass (repeated acts within one standing grant).
+        let sk = key();
+        let env = an_envelope(&["send"]);
+        assert_eq!(
+            check_intent_within_envelope(&an_intent(&sk, "send", "args-one"), &env),
+            EnvelopeCheck::Allowed
+        );
+        assert_eq!(
+            check_intent_within_envelope(&an_intent(&sk, "send", "args-two"), &env),
+            EnvelopeCheck::Allowed
+        );
+    }
+
+    // ── The reconciliation branch matrix ───────────────────────────────────────
+
+    #[test]
+    fn reconcile_matched_when_receipt_equals_intent() {
+        let sk = key();
+        let intent = an_intent(&sk, "send", "args-abc");
+        let receipt = a_receipt(
+            &sk,
+            "vm-agent",
+            "send",
+            "args-abc",
+            "elastos://mail/send",
+            "execute",
+        );
+        let (status, detail) = reconcile(&intent, Some(&receipt));
+        assert_eq!(status, ReconciliationStatus::Matched);
+        assert_eq!(detail, "");
+    }
+
+    #[test]
+    fn reconcile_diverged_when_a_bound_field_differs() {
+        let sk = key();
+        let intent = an_intent(&sk, "send", "args-abc");
+        // Same method/resource/action, but the redeemed ARGS differ from the declared ones.
+        let receipt = a_receipt(
+            &sk,
+            "vm-agent",
+            "send",
+            "args-XXX",
+            "elastos://mail/send",
+            "execute",
+        );
+        let (status, detail) = reconcile(&intent, Some(&receipt));
+        assert_eq!(status, ReconciliationStatus::Diverged);
+        assert!(
+            detail.contains("input_hash"),
+            "the diverged field is named: {detail}"
+        );
+    }
+
+    #[test]
+    fn reconcile_undelivered_when_no_receipt() {
+        let sk = key();
+        let intent = an_intent(&sk, "send", "args-abc");
+        let (status, detail) = reconcile(&intent, None);
+        assert_eq!(status, ReconciliationStatus::Undelivered);
+        assert!(
+            !detail.is_empty(),
+            "undelivered is recorded with a reason, never silent"
+        );
+    }
+}

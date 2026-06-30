@@ -5,6 +5,7 @@
 //! capability token signed by the runtime.
 
 pub mod evaluator;
+pub mod intent;
 pub mod manager;
 pub mod pending;
 pub mod policy;
@@ -14,6 +15,12 @@ pub mod token;
 
 #[allow(unused_imports)]
 pub use evaluator::PolicyEvaluator;
+#[allow(unused_imports)]
+pub use intent::{
+    check_intent_within_envelope, reconcile, EnvelopeCheck, EnvelopeDenial, IntentDeclarationV1,
+    IntentReconciliationV1, ReconciliationStatus, StandingGrantEnvelope,
+    INTENT_DECLARATION_SCHEMA_V1, INTENT_RECONCILIATION_SCHEMA_V1,
+};
 #[allow(unused_imports)]
 pub use manager::CapabilityManager;
 #[allow(unused_imports)]
