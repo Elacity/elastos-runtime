@@ -180,11 +180,73 @@ struct RunningCapsule {
     started_at: std::time::Instant,
     provider_route: Option<ProviderRoute>,
     backend: CapsuleBackend,
+    /// BUG-2: the microVM Carrier bridge accept-loop task. Previously detached
+    /// (`spawn_carrier_bridge` dropped its `JoinHandle`), so it leaked on every
+    /// teardown. Held here so stop/reap/wait abort it. `None` for the Carrier
+    /// backend and for a launch with no provider registry (no bridge spawned).
+    bridge_task: Option<tokio::task::JoinHandle<()>>,
+    /// BUG-2: the per-launch `<handle>-carrier.sock` unix socket file. Previously
+    /// never unlinked on teardown. Held here so it is removed with the task.
+    carrier_socket: Option<PathBuf>,
 }
 
 struct RunningGateway {
     addr: String,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// BUG-3: defuse-on-success cleanup for the microVM launch window. Between
+/// creating the rootfs overlay / spawning the Carrier bridge / recording the TAP
+/// and the running-map insert, an early return (e.g. `vm.start()` boot failure)
+/// would orphan all of those. This guard owns them and, UNLESS explicitly defused
+/// after a successful insert, runs best-effort cleanup on drop — so every error
+/// path in that window is covered by construction, including ones added later.
+/// (`RunningVm::start` already tears down its OWN TAP + egress firewall on its
+/// internal error paths; this guard covers only the supervisor-created artifacts.)
+struct LaunchCleanupGuard {
+    carrier_socket: Option<PathBuf>,
+    bridge_task: Option<tokio::task::JoinHandle<()>>,
+    overlay_path: Option<PathBuf>,
+    tap_name: Option<String>,
+    tap_registry: crate::egress_audit::TapRegistry,
+    armed: bool,
+}
+
+impl Drop for LaunchCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Drop is sync: use std::fs + the sync JoinHandle::abort (best-effort).
+        if let Some(task) = self.bridge_task.take() {
+            task.abort();
+        }
+        if let Some(ref sock) = self.carrier_socket {
+            let _ = std::fs::remove_file(sock);
+        }
+        if let Some(ref overlay) = self.overlay_path {
+            let _ = std::fs::remove_file(overlay);
+        }
+        if let Some(ref tap) = self.tap_name {
+            self.tap_registry.forget(tap);
+        }
+        tracing::warn!("launch aborted: cleaned up orphaned microVM launch artifacts");
+    }
+}
+
+/// BUG-2: abort the Carrier-bridge accept-loop task and unlink its per-launch unix
+/// socket on a teardown path. Best-effort + idempotent (both are `None` for the
+/// Carrier backend or a registry-less launch).
+async fn cleanup_bridge_artifacts(
+    bridge_task: Option<tokio::task::JoinHandle<()>>,
+    carrier_socket: Option<PathBuf>,
+) {
+    if let Some(task) = bridge_task {
+        task.abort();
+    }
+    if let Some(sock) = carrier_socket {
+        let _ = tokio::fs::remove_file(&sock).await;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -833,7 +895,13 @@ impl Supervisor {
     }
 
     async fn reap_dead_capsules(&self) {
-        let mut dead: Vec<(String, Option<ProviderRoute>)> = Vec::new();
+        #[allow(clippy::type_complexity)]
+        let mut dead: Vec<(
+            String,
+            Option<ProviderRoute>,
+            Option<tokio::task::JoinHandle<()>>,
+            Option<PathBuf>,
+        )> = Vec::new();
         {
             let mut running = self.running.write().await;
             // iter_mut so the VM branch can REAP a self-exited child via
@@ -855,19 +923,26 @@ impl Supervisor {
                 })
                 .collect();
             for handle in dead_handles {
-                if let Some(capsule) = running.remove(&handle) {
+                if let Some(mut capsule) = running.remove(&handle) {
                     // W1b/C3: read the TAP's final suppressed delta before `capsule` drops here
                     // (RunningVm::Drop tears down the egress chains, zeroing the counters).
                     self.final_egress_reconcile(&capsule.backend);
-                    dead.push((handle, capsule.provider_route));
+                    dead.push((
+                        handle,
+                        capsule.provider_route,
+                        capsule.bridge_task.take(),
+                        capsule.carrier_socket.take(),
+                    ));
                 }
             }
         }
 
-        for (handle, route) in dead {
+        for (handle, route, bridge_task, carrier_socket) in dead {
             if let Some(route) = route.as_ref() {
                 self.unregister_provider_route(route).await;
             }
+            // BUG-2: abort the Carrier-bridge task + unlink its socket (both leaked before).
+            cleanup_bridge_artifacts(bridge_task, carrier_socket).await;
             let overlay_path = self
                 .crosvm_config
                 .rootfs_cache_dir
@@ -1306,6 +1381,19 @@ impl Supervisor {
         vm_config.carrier_socket_path = Some(carrier_socket.clone());
         vm_config.boot_args = format!("{} elastos.carrier_path=/dev/hvc0", vm_config.boot_args);
 
+        // BUG-3: arm the defuse-on-success cleanup for the launch window. Every
+        // early return from here until the running-map insert (overlay copy,
+        // egress-firewall build, `vm.start()` boot failure, …) now cleans up the
+        // supervisor-created artifacts by construction. Defused after the insert.
+        let mut cleanup = LaunchCleanupGuard {
+            carrier_socket: None,
+            bridge_task: None,
+            overlay_path: None,
+            tap_name: None,
+            tap_registry: self.tap_registry.clone(),
+            armed: true,
+        };
+
         // Create rootfs overlay (writable copy)
         let rootfs_base = capsule_dir.join("rootfs.ext4");
         if rootfs_base.is_file() {
@@ -1313,6 +1401,8 @@ impl Supervisor {
             tokio::fs::create_dir_all(&overlay_dir).await?;
             let overlay_path = overlay_dir.join(format!("{}.ext4", handle));
             let _ = tokio::fs::remove_file(&overlay_path).await;
+            // Track BEFORE the fallible copy so a partial overlay is cleaned too.
+            cleanup.overlay_path = Some(overlay_path.clone());
             tokio::fs::copy(&rootfs_base, &overlay_path).await?;
             vm_config.rootfs_path = overlay_path;
         }
@@ -1339,7 +1429,7 @@ impl Supervisor {
                 }),
                 _ => None,
             };
-            if let Err(e) = crate::carrier_bridge::spawn_carrier_bridge(
+            match crate::carrier_bridge::spawn_carrier_bridge(
                 &carrier_socket,
                 registry.clone(),
                 session_token,
@@ -1347,7 +1437,15 @@ impl Supervisor {
             )
             .await
             {
-                tracing::warn!("Carrier bridge failed for '{}': {}", name, e);
+                // BUG-2: hold the accept-loop task + its socket so teardown (and
+                // the launch-failure guard) abort the task and unlink the socket.
+                Ok(task) => {
+                    cleanup.bridge_task = Some(task);
+                    cleanup.carrier_socket = Some(carrier_socket.clone());
+                }
+                Err(e) => {
+                    tracing::warn!("Carrier bridge failed for '{}': {}", name, e);
+                }
             }
         }
 
@@ -1384,6 +1482,8 @@ impl Supervisor {
             // becomes an EgressDenied keyed on the same identity as the spend/grant chain.
             // Overwrite-on-record handles TAP reuse (re-label before any of the new VM's drops).
             self.tap_registry.record(&tap_name, &format!("vm-{name}"));
+            // BUG-3: a boot failure after this must forget the registry entry.
+            cleanup.tap_name = Some(tap_name.clone());
             vm.set_egress_firewall(Some(firewall));
         }
 
@@ -1405,6 +1505,13 @@ impl Supervisor {
                 None
             };
 
+        // BUG-3: launch survived the fragile window — defuse the guard and move its
+        // tracked bridge task + socket into the RunningCapsule for normal teardown
+        // (BUG-2). The overlay + TAP-registry entry now belong to the live VM.
+        let bridge_task = cleanup.bridge_task.take();
+        let carrier_socket = cleanup.carrier_socket.take();
+        cleanup.armed = false;
+
         // Register as running
         {
             let mut running = self.running.write().await;
@@ -1417,6 +1524,8 @@ impl Supervisor {
                     started_at: std::time::Instant::now(),
                     provider_route,
                     backend: CapsuleBackend::Vm(Box::new(vm)),
+                    bridge_task,
+                    carrier_socket,
                 },
             );
         }
@@ -1494,6 +1603,9 @@ impl Supervisor {
                     started_at: std::time::Instant::now(),
                     provider_route,
                     backend: CapsuleBackend::Carrier,
+                    // Carrier services have no per-launch microVM Carrier bridge.
+                    bridge_task: None,
+                    carrier_socket: None,
                 },
             );
         }
@@ -1523,7 +1635,7 @@ impl Supervisor {
     /// Stop a running capsule.
     async fn stop_capsule(&self, handle: &str) -> Result<()> {
         let mut running = self.running.write().await;
-        let capsule = running
+        let mut capsule = running
             .remove(handle)
             .ok_or_else(|| anyhow::anyhow!("no capsule with handle '{handle}'"))?;
 
@@ -1533,6 +1645,9 @@ impl Supervisor {
 
         // W1b/C3: final suppressed-delta read before `vm.stop()` deletes the egress chains.
         self.final_egress_reconcile(&capsule.backend);
+
+        // BUG-2: abort the Carrier-bridge task + unlink its socket (both leaked before).
+        cleanup_bridge_artifacts(capsule.bridge_task.take(), capsule.carrier_socket.take()).await;
 
         match capsule.backend {
             CapsuleBackend::Vm(mut vm) => {
@@ -1563,7 +1678,7 @@ impl Supervisor {
     /// Returns Ok(exit_code) on clean exit, Err on wait failure or non-zero exit.
     pub async fn wait_for_exit(&self, handle: &str) -> Result<i32> {
         // Take the capsule out of running map so we get exclusive access to the VM
-        let capsule = {
+        let mut capsule = {
             let mut running = self.running.write().await;
             running
                 .remove(handle)
@@ -1576,6 +1691,9 @@ impl Supervisor {
 
         // W1b/C3: final suppressed-delta read before the VM drops and tears down its egress chains.
         self.final_egress_reconcile(&capsule.backend);
+
+        // BUG-2: abort the Carrier-bridge task + unlink its socket (both leaked before).
+        cleanup_bridge_artifacts(capsule.bridge_task.take(), capsule.carrier_socket.take()).await;
 
         let exit_code = match capsule.backend {
             CapsuleBackend::Vm(mut vm) => {
@@ -1829,6 +1947,118 @@ mod tests {
         let (cid, _) = allocate_cid(3, &in_use).unwrap();
         assert_eq!(cid, 7);
         assert!(!in_use.contains(&cid));
+    }
+
+    // ── BUG-2 / BUG-3: the Carrier-bridge task + its socket no longer leak ──
+    // These exercise the leak-prone logic WITHOUT a crosvm boot (the boot-failure
+    // path + reap integration are validated on the KVM box).
+
+    #[tokio::test]
+    async fn cleanup_bridge_artifacts_unlinks_socket_and_aborts_task() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("h-carrier.sock");
+        std::fs::write(&sock, b"").unwrap();
+        assert!(sock.exists());
+
+        // A long-running task that flips the flag ONLY if it is never aborted.
+        let completed = Arc::new(AtomicBool::new(false));
+        let flag = completed.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        cleanup_bridge_artifacts(Some(task), Some(sock.clone())).await;
+
+        assert!(
+            !sock.exists(),
+            "BUG-2: the per-launch carrier socket must be unlinked on teardown"
+        );
+        // Give the runtime a beat; an aborted task never reaches completion.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !completed.load(Ordering::SeqCst),
+            "BUG-2: the bridge accept-loop task must be aborted, not left running"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_bridge_artifacts_is_a_noop_when_nothing_to_clean() {
+        // The Carrier backend / registry-less launch path passes both None.
+        cleanup_bridge_artifacts(None, None).await;
+    }
+
+    #[test]
+    fn launch_cleanup_guard_armed_drop_removes_overlay_socket_and_forgets_tap() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("h-carrier.sock");
+        let overlay = dir.path().join("h.ext4");
+        std::fs::write(&sock, b"").unwrap();
+        std::fs::write(&overlay, b"").unwrap();
+        let reg = crate::egress_audit::TapRegistry::default();
+        reg.record("cvtap0001", "vm-x");
+
+        {
+            let _guard = LaunchCleanupGuard {
+                carrier_socket: Some(sock.clone()),
+                bridge_task: None,
+                overlay_path: Some(overlay.clone()),
+                tap_name: Some("cvtap0001".to_string()),
+                tap_registry: reg.clone(),
+                armed: true,
+            };
+        } // BUG-3: armed guard cleans up the launch window on drop.
+
+        assert!(!sock.exists(), "armed guard must unlink the carrier socket");
+        assert!(
+            !overlay.exists(),
+            "armed guard must remove the rootfs overlay"
+        );
+        assert!(
+            reg.resolve("cvtap0001").is_none(),
+            "armed guard must forget the TAP-registry entry"
+        );
+    }
+
+    #[test]
+    fn launch_cleanup_guard_defused_drop_preserves_the_live_capsules_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("h-carrier.sock");
+        let overlay = dir.path().join("h.ext4");
+        std::fs::write(&sock, b"").unwrap();
+        std::fs::write(&overlay, b"").unwrap();
+        let reg = crate::egress_audit::TapRegistry::default();
+        reg.record("cvtap0002", "vm-y");
+
+        {
+            let mut guard = LaunchCleanupGuard {
+                carrier_socket: Some(sock.clone()),
+                bridge_task: None,
+                overlay_path: Some(overlay.clone()),
+                tap_name: Some("cvtap0002".to_string()),
+                tap_registry: reg.clone(),
+                armed: true,
+            };
+            // Mirror the success path: move the task/sock into the RunningCapsule
+            // and defuse — the live VM owns the overlay + TAP entry.
+            let _ = guard.bridge_task.take();
+            let _ = guard.carrier_socket.take();
+            guard.armed = false;
+        }
+
+        assert!(
+            sock.exists(),
+            "defused guard must NOT remove the carrier socket"
+        );
+        assert!(
+            overlay.exists(),
+            "defused guard must NOT remove the overlay"
+        );
+        assert!(
+            reg.resolve("cvtap0002").is_some(),
+            "defused guard must keep the live capsule's TAP entry"
+        );
     }
 
     #[test]

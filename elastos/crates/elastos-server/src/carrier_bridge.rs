@@ -278,7 +278,7 @@ pub async fn spawn_carrier_bridge(
     _provider_registry: Arc<ProviderRegistry>,
     _session_token: String,
     bridge_ctx: Option<BridgeContext>,
-) -> Result<()> {
+) -> Result<tokio::task::JoinHandle<()>> {
     // Remove stale socket and create a listener BEFORE crosvm starts.
     // crosvm --serial type=unix-stream connects to this socket on launch.
     let _ = tokio::fs::remove_file(socket_path).await;
@@ -290,8 +290,10 @@ pub async fn spawn_carrier_bridge(
 
     // Accept one bidirectional connection in background — crosvm connects when
     // the VM boots. The supported contract is a single `unix-stream` socket
-    // with `input-unix-stream` enabled on the crosvm side.
-    tokio::spawn(async move {
+    // with `input-unix-stream` enabled on the crosvm side. The handle is returned
+    // so the supervisor can abort this task on VM teardown (BUG-2: it was detached
+    // and leaked, along with the unix socket file).
+    let task = tokio::spawn(async move {
         let (stream, _) = match listener.accept().await {
             Ok(s) => s,
             Err(e) => {
@@ -354,7 +356,7 @@ pub async fn spawn_carrier_bridge(
         tracing::info!("Carrier bridge closed for {}", socket_display);
     });
 
-    Ok(())
+    Ok(task)
 }
 
 /// Spawn a Carrier bridge for a WASM capsule.
