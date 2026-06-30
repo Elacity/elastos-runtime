@@ -1,6 +1,10 @@
 use super::*;
 
-pub(super) fn display_session_receipt(display_mode: BrowserDisplayMode, stream_id: &str) -> Value {
+pub(super) fn display_session_receipt(
+    display_mode: BrowserDisplayMode,
+    stream_id: &str,
+    page_id: &str,
+) -> Value {
     json!({
         "schema": "elastos.browser.display-session/v1",
         "session_id": format!("display:{stream_id}"),
@@ -8,8 +12,12 @@ pub(super) fn display_session_receipt(display_mode: BrowserDisplayMode, stream_i
         "network_mode": "runtime_net_only",
         "direct_network": false,
         "input": "runtime_route",
+        "signaling_url": format!("/api/apps/browser/pages/{}/webrtc", page_id.replace(':', "%3A")),
+        "display_backend": "proof_surface",
+        "backend_class": "proof_surface",
+        "media_transport": "runtime_relay",
         "audio": false,
-        "video": false,
+        "video": true,
     })
 }
 
@@ -51,17 +59,6 @@ pub(super) fn validate_display_session(
         );
     }
     match expected_display_mode {
-        BrowserDisplayMode::DiagnosticFrame => {
-            if display_session
-                .get("input")
-                .and_then(|value| value.as_str())
-                != Some("runtime_route")
-            {
-                return Err(
-                    "diagnostic_frame display session must use runtime_route input".to_string(),
-                );
-            }
-        }
         BrowserDisplayMode::WebrtcRemoteDisplay => {
             let input_mode = display_session
                 .get("input")

@@ -1,4 +1,7 @@
 use super::*;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixListener;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn error_code(response: Response) -> String {
     serde_json::to_value(response).unwrap()["code"]
@@ -24,19 +27,86 @@ fn stream_receipt(byte_transport: &str) -> StreamSessionReceipt {
     }
 }
 
+fn test_browser_profile() -> BrowserProfileDescriptor {
+    BrowserProfileDescriptor {
+        schema: "elastos.browser.profile/v1".to_string(),
+        scope: "active_principal".to_string(),
+        storage: "principal_owned_profile_disk".to_string(),
+        storage_posture: "principal_owned_reset_scoped_unprotected".to_string(),
+        protected_storage: false,
+        encrypted: false,
+        recoverable: false,
+        recovery: "not_recovery_kit_packaged".to_string(),
+        uri: "localhost://Users/0123456789ab/BrowserProfiles/default/profile.ext4".to_string(),
+        public_uri: "localhost://Users/self/BrowserProfiles/default/profile.ext4".to_string(),
+        profile_key: "profile-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            .to_string(),
+        disk_path: "/tmp/elastos-browser-profile-test/BrowserProfiles/default/profile.ext4"
+            .to_string(),
+        reset: "whole_profile".to_string(),
+    }
+}
+
+fn spawn_status_socket(body: Value) -> String {
+    spawn_status_socket_requests(body, 1)
+}
+
+fn spawn_status_socket_requests(body: Value, request_count: usize) -> String {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = format!(
+        "/tmp/elastos-browser-engine-adapter-test-{}-{suffix}.sock",
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).expect("test status socket should bind");
+    listener
+        .set_nonblocking(true)
+        .expect("test status socket should be nonblocking");
+    let response_body = body.to_string();
+    let socket_path = path.clone();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut handled = 0_usize;
+        while handled < request_count && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buffer = [0_u8; 1024];
+                    let _ = stream.read(&mut buffer);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    handled += 1;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = std::fs::remove_file(socket_path);
+    });
+    path
+}
+
 fn proof_adapter_config() -> Value {
     json!({
         "adapters": [{
             "id": "linux-proof",
             "kind": "contract_proof",
-            "display_modes": ["diagnostic_frame"]
+            "display_modes": ["webrtc_remote_display"]
         }]
     })
 }
 
 #[test]
 fn status_is_unavailable_without_configured_adapter() {
-    let provider = BrowserEngineAdapter::new();
+    let mut provider = BrowserEngineAdapter::new();
     let response =
         serde_json::to_value(provider.status(Some("person:local:test".to_string()))).unwrap();
     assert_eq!(response["status"], "ok");
@@ -77,7 +147,11 @@ fn configured_adapter_reports_contract_without_raw_authority() {
     );
     assert_eq!(
         status["data"]["supported_display_modes"][0],
-        "diagnostic_frame"
+        "webrtc_remote_display"
+    );
+    assert_eq!(
+        status["data"]["supported_guarantee_levels"][0],
+        "operator_rbi"
     );
 }
 
@@ -115,6 +189,51 @@ fn launch_requires_attached_byte_transport() {
 }
 
 #[test]
+fn launch_rejects_invalid_browser_profile_descriptor() {
+    let mut provider = BrowserEngineAdapter::new();
+    let init = provider.init(proof_adapter_config());
+    assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+
+    let mut profile = test_browser_profile();
+    profile.storage = "runtime_owned_profile_disk".to_string();
+
+    assert_eq!(
+        error_code(provider.launch_with_viewport(LaunchContext {
+            url: "https://glidefinance.io/",
+            stream_session: &stream_receipt("adapter_ipc"),
+            profile,
+            adapter_id: None,
+            principal_id: Some("person:local:test".to_string()),
+            reason: Some("open browser page".to_string()),
+            wallet: json!({}),
+            viewport: None,
+            display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+            guarantee_level: BrowserGuaranteeLevel::OperatorRbi,
+        })),
+        "invalid_profile"
+    );
+
+    let mut profile = test_browser_profile();
+    profile.encrypted = true;
+
+    assert_eq!(
+        error_code(provider.launch_with_viewport(LaunchContext {
+            url: "https://glidefinance.io/",
+            stream_session: &stream_receipt("adapter_ipc"),
+            profile,
+            adapter_id: None,
+            principal_id: Some("person:local:test".to_string()),
+            reason: Some("open browser page".to_string()),
+            wallet: json!({}),
+            viewport: None,
+            display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+            guarantee_level: BrowserGuaranteeLevel::OperatorRbi,
+        })),
+        "invalid_profile"
+    );
+}
+
+#[test]
 fn launch_rejects_unimplemented_product_display_modes() {
     let mut provider = BrowserEngineAdapter::new();
     let init = provider.init(proof_adapter_config());
@@ -124,13 +243,39 @@ fn launch_rejects_unimplemented_product_display_modes() {
         error_code(provider.launch_with_viewport(LaunchContext {
             url: "https://glidefinance.io/",
             stream_session: &stream_receipt("adapter_ipc"),
+            profile: test_browser_profile(),
+            adapter_id: None,
+            principal_id: None,
+            reason: None,
+            wallet: json!({}),
+            viewport: None,
+            display_mode: BrowserDisplayMode::NativeSurface,
+            guarantee_level: BrowserGuaranteeLevel::PolicyWebview,
+        })),
+        "display_session_unavailable"
+    );
+}
+
+#[test]
+fn launch_rejects_mismatched_guarantee_level() {
+    let mut provider = BrowserEngineAdapter::new();
+    let init = provider.init(proof_adapter_config());
+    assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+
+    assert_eq!(
+        error_code(provider.launch_with_viewport(LaunchContext {
+            url: "https://glidefinance.io/",
+            stream_session: &stream_receipt("adapter_ipc"),
+            profile: test_browser_profile(),
+            adapter_id: None,
             principal_id: None,
             reason: None,
             wallet: json!({}),
             viewport: None,
             display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+            guarantee_level: BrowserGuaranteeLevel::PolicyWebview,
         })),
-        "display_session_unavailable"
+        "guarantee_unavailable"
     );
 }
 
@@ -206,7 +351,122 @@ fn launch_accepts_attached_adapter_ipc_stream_receipt() {
     );
     assert_eq!(
         response["data"]["display_session"]["mode"],
-        "diagnostic_frame"
+        "webrtc_remote_display"
+    );
+}
+
+#[test]
+fn launch_can_select_configured_adapter_id() {
+    let mut provider = BrowserEngineAdapter::new();
+    let init = provider.init(json!({
+        "adapters": [
+            {
+                "id": "mac-engine",
+                "kind": "contract_proof",
+                "display_modes": ["webrtc_remote_display"]
+            },
+            {
+                "id": "jetson-engine",
+                "kind": "contract_proof",
+                "display_modes": ["webrtc_remote_display"]
+            }
+        ]
+    }));
+    assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+
+    let status = serde_json::to_value(provider.status(None)).unwrap();
+    assert_eq!(status["data"]["adapter_count"], 2);
+    assert_eq!(status["data"]["adapters"][0]["id"], "mac-engine");
+    assert_eq!(status["data"]["adapters"][0]["default"], true);
+    assert_eq!(
+        status["data"]["adapters"][0]["backing_substrate"],
+        "operator_rbi"
+    );
+    assert_eq!(status["data"]["adapters"][1]["id"], "jetson-engine");
+    assert_eq!(
+        status["data"]["adapters"][1]["supported_display_modes"][0],
+        "webrtc_remote_display"
+    );
+
+    let response = serde_json::to_value(provider.launch_with_viewport(LaunchContext {
+        url: "https://ela.city/",
+        stream_session: &stream_receipt("adapter_ipc"),
+        profile: test_browser_profile(),
+        adapter_id: Some("jetson-engine".to_string()),
+        principal_id: Some("person:local:test".to_string()),
+        reason: Some("open browser page".to_string()),
+        wallet: json!({}),
+        viewport: None,
+        display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+        guarantee_level: BrowserGuaranteeLevel::OperatorRbi,
+    }))
+    .unwrap();
+
+    assert_eq!(response["status"], "ok");
+    assert_eq!(response["data"]["adapter"], "jetson-engine");
+}
+
+#[test]
+fn status_reports_remote_vz_backing_substrate_without_host_paths() {
+    let mut provider = BrowserEngineAdapter::new();
+    let init = provider.init(json!({
+        "adapters": [{
+            "id": "browser-vm-product",
+            "kind": "chromium_microvm",
+            "display_modes": ["webrtc_remote_display"],
+            "supervisor": {
+                "program": "/tmp/browser-vm-remote-vz-launcher",
+                "control_socket_path": "/tmp/elastos-browser-vm-control-test.sock"
+            }
+        }]
+    }));
+    assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+
+    let status = serde_json::to_value(provider.status(None)).unwrap();
+    assert_eq!(
+        status["data"]["adapters"][0]["backing_substrate"],
+        "remote_operator_vm"
+    );
+    let public_status = status.to_string();
+    assert!(!public_status.contains("browser-vm-remote-vz-launcher"));
+    assert!(!public_status.contains("elastos-browser-vm-control-test.sock"));
+}
+
+#[test]
+fn launch_rejects_unknown_or_unsafe_adapter_id() {
+    let mut provider = BrowserEngineAdapter::new();
+    let init = provider.init(proof_adapter_config());
+    assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+
+    assert_eq!(
+        error_code(provider.launch_with_viewport(LaunchContext {
+            url: "https://ela.city/",
+            stream_session: &stream_receipt("adapter_ipc"),
+            profile: test_browser_profile(),
+            adapter_id: Some("missing-engine".to_string()),
+            principal_id: Some("person:local:test".to_string()),
+            reason: Some("open browser page".to_string()),
+            wallet: json!({}),
+            viewport: None,
+            display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+            guarantee_level: BrowserGuaranteeLevel::OperatorRbi,
+        })),
+        "engine_unavailable"
+    );
+    assert_eq!(
+        error_code(provider.launch_with_viewport(LaunchContext {
+            url: "https://ela.city/",
+            stream_session: &stream_receipt("adapter_ipc"),
+            profile: test_browser_profile(),
+            adapter_id: Some("../mac-engine".to_string()),
+            principal_id: Some("person:local:test".to_string()),
+            reason: Some("open browser page".to_string()),
+            wallet: json!({}),
+            viewport: None,
+            display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+            guarantee_level: BrowserGuaranteeLevel::OperatorRbi,
+        })),
+        "invalid_request"
     );
 }
 
@@ -268,12 +528,12 @@ fn init_rejects_supervisor_timeout_above_hosted_limit() {
 #[test]
 fn native_adapter_launches_only_through_supervisor_result_contract() {
     let mut provider = BrowserEngineAdapter::new();
-    let script = r#"printf '%s' "$ELASTOS_BROWSER_ENGINE_REQUEST" | grep -q '"principal_id":"person:local:test"' || exit 7; printf '%s\n' '{"schema":"elastos.browser.engine.supervisor-result/v1","page_id":"page:native-proof","adapter":"linux-chromium-headless","engine":"chromium_headless","stream_id":"stream:proof:test","network_mode":"runtime_net_only","direct_network":false,"wallet_injection":false,"display_session":{"schema":"elastos.browser.display-session/v1","session_id":"display:stream:proof:test","mode":"diagnostic_frame","network_mode":"runtime_net_only","direct_network":false,"input":"runtime_route","audio":false,"video":false}}'"#;
+    let script = r#"printf '%s' "$ELASTOS_BROWSER_ENGINE_REQUEST" | grep -q '"principal_id":"person:local:test"' || exit 7; printf '%s\n' '{"schema":"elastos.browser.engine.supervisor-result/v1","page_id":"page:native-proof","adapter":"linux-chromium-headless","engine":"chromium_headless","stream_id":"stream:proof:test","network_mode":"runtime_net_only","direct_network":false,"wallet_injection":false,"display_session":{"schema":"elastos.browser.display-session/v1","session_id":"display:stream:proof:test","mode":"webrtc_remote_display","network_mode":"runtime_net_only","direct_network":false,"input":"runtime_route","audio":false,"video":true,"signaling_url":"/api/apps/browser/pages/page%3Anative-proof/webrtc"}}'"#;
     let init = provider.init(json!({
         "adapters": [{
             "id": "linux-chromium-headless",
             "kind": "chromium_headless",
-            "display_modes": ["diagnostic_frame"],
+            "display_modes": ["webrtc_remote_display"],
             "supervisor": {
                 "program": "/bin/sh",
                 "args": ["-c", script],
@@ -298,6 +558,43 @@ fn native_adapter_launches_only_through_supervisor_result_contract() {
     assert_eq!(response["data"]["rendering"], "host_supervisor");
     assert_eq!(response["data"]["direct_network"], false);
     assert_eq!(response["data"]["wallet_injection"], false);
+}
+
+#[test]
+fn supervisor_launch_clears_configured_prewarm_flag() {
+    let mut provider = BrowserEngineAdapter::new();
+    let script = r#"if [ "$ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE" = "1" ] && [ -z "$ELASTOS_BROWSER_ENGINE_REQUEST" ]; then printf '%s\n' '{"schema":"elastos.browser.vm-engine-prewarm/v1","ok":true,"control_socket_path":"/tmp/elastos-browser-vm-prewarm.sock","control_status":{"schema":"elastos.browser.vm-control-service.status/v1","pid":123,"active_pages":0,"max_active_pages":2,"network_mode":"runtime_net_only","direct_network":false},"network_mode":"runtime_net_only","direct_network":false}'; exit 0; fi; if [ "$ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE" = "1" ]; then echo prewarm leaked into launch >&2; exit 9; fi; printf '%s' "$ELASTOS_BROWSER_ENGINE_REQUEST" | grep -q '"stream_id":"stream:proof:test"' || exit 8; printf '%s\n' '{"schema":"elastos.browser.engine.supervisor-result/v1","page_id":"page:prewarm-clear-proof","adapter":"linux-chromium-headless","engine":"chromium_headless","stream_id":"stream:proof:test","network_mode":"runtime_net_only","direct_network":false,"wallet_injection":false,"display_session":{"schema":"elastos.browser.display-session/v1","session_id":"display:stream:proof:test","mode":"webrtc_remote_display","network_mode":"runtime_net_only","direct_network":false,"input":"runtime_route","audio":false,"video":true,"signaling_url":"/api/apps/browser/pages/page%3Aprewarm-clear-proof/webrtc"}}'"#;
+    let init = provider.init(json!({
+        "adapters": [{
+            "id": "linux-chromium-headless",
+            "kind": "chromium_headless",
+            "display_modes": ["webrtc_remote_display"],
+            "supervisor": {
+                "program": "/bin/sh",
+                "args": ["-c", script],
+                "timeout_ms": 2000,
+                "control_socket_path": "/tmp/elastos-browser-vm-prewarm.sock",
+                "env": {
+                    "ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE": "1"
+                }
+            }
+        }]
+    }));
+    let init = serde_json::to_value(init).unwrap();
+    assert_eq!(init["status"], "ok");
+    assert_eq!(init["data"]["prewarm_results"][0]["status"], "ok");
+
+    let response = serde_json::to_value(provider.launch(
+        "https://glidefinance.io/",
+        &stream_receipt("adapter_ipc"),
+        Some("person:local:test".to_string()),
+        Some("open browser page".to_string()),
+        json!({}),
+    ))
+    .unwrap();
+
+    assert_eq!(response["status"], "ok");
+    assert_eq!(response["data"]["page_id"], "page:prewarm-clear-proof");
 }
 
 #[test]
@@ -326,11 +623,14 @@ fn native_adapter_can_declare_webrtc_display_mode() {
     let response = serde_json::to_value(provider.launch_with_viewport(LaunchContext {
         url: "https://glidefinance.io/",
         stream_session: &stream_receipt("adapter_ipc"),
+        profile: test_browser_profile(),
+        adapter_id: None,
         principal_id: Some("person:local:test".to_string()),
         reason: Some("open browser page".to_string()),
         wallet: json!({}),
         viewport: None,
         display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+        guarantee_level: BrowserGuaranteeLevel::OperatorRbi,
     }))
     .unwrap();
 
@@ -368,11 +668,14 @@ fn webrtc_proof_surface_cannot_advertise_audio() {
         error_code(provider.launch_with_viewport(LaunchContext {
             url: "https://youtube.com/",
             stream_session: &stream_receipt("adapter_ipc"),
+            profile: test_browser_profile(),
+            adapter_id: None,
             principal_id: Some("person:local:test".to_string()),
             reason: Some("open browser page".to_string()),
             wallet: json!({}),
             viewport: None,
             display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+            guarantee_level: BrowserGuaranteeLevel::OperatorRbi,
         })),
         "invalid_supervisor_result"
     );
@@ -399,11 +702,14 @@ fn webrtc_product_compositor_can_advertise_audio() {
     let response = serde_json::to_value(provider.launch_with_viewport(LaunchContext {
         url: "https://youtube.com/",
         stream_session: &stream_receipt("adapter_ipc"),
+        profile: test_browser_profile(),
+        adapter_id: None,
         principal_id: Some("person:local:test".to_string()),
         reason: Some("open browser page".to_string()),
         wallet: json!({}),
         viewport: None,
         display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+        guarantee_level: BrowserGuaranteeLevel::OperatorRbi,
     }))
     .unwrap();
 
@@ -441,17 +747,24 @@ fn supervisor_launch_registers_page_scoped_control_session() {
     let response = serde_json::to_value(provider.launch_with_viewport(LaunchContext {
         url: "https://ela.city/",
         stream_session: &stream_receipt("adapter_ipc"),
+        profile: test_browser_profile(),
+        adapter_id: None,
         principal_id: Some("person:local:test".to_string()),
         reason: Some("open browser page".to_string()),
         wallet: json!({}),
         viewport: None,
         display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+        guarantee_level: BrowserGuaranteeLevel::OperatorRbi,
     }))
     .unwrap();
 
     assert_eq!(response["status"], "ok");
     assert_eq!(response["data"]["engine_control"], "page_scoped");
     assert_eq!(response["data"]["isolated_engine_session"], true);
+    assert_eq!(
+        response["data"]["isolation"]["kind"],
+        "per_launch_selkies_target"
+    );
     assert!(response["data"].get("control_socket_path").is_none());
 
     let session = provider
@@ -468,7 +781,50 @@ fn supervisor_launch_registers_page_scoped_control_session() {
 #[test]
 fn launch_fails_closed_when_session_capacity_is_full() {
     let mut provider = BrowserEngineAdapter::new();
-    let script = r#"printf '%s\n' '{"schema":"elastos.browser.engine.supervisor-result/v1","page_id":"page:capacity-a","adapter":"hosted-product","engine":"selkies_gstreamer","stream_id":"stream:proof:test","network_mode":"runtime_net_only","direct_network":false,"wallet_injection":false,"control_socket_path":"/tmp/elastos-browser-capacity-a.sock","isolated_session":true,"isolation":{"schema":"elastos.browser.engine.isolation/v1","kind":"per_launch_selkies_target","session_dir":"/tmp/elastos-browser-sessions/capacity-a"},"display_session":{"schema":"elastos.browser.display-session/v1","session_id":"display:stream:proof:test","mode":"webrtc_remote_display","network_mode":"runtime_net_only","direct_network":false,"input":"datachannel","width":1280,"height":720,"display_backend":"selkies_gstreamer_webrtc","backend_class":"product_compositor","audio":true,"video":true,"signaling_url":"/api/apps/browser/pages/page%3Acapacity-a/webrtc"}}'"#;
+    let status_socket = spawn_status_socket_requests(
+        json!({
+            "schema": "elastos.browser.vm-control-service.status/v1",
+            "ok": true,
+            "active_pages": 1,
+            "page_ids": ["page:capacity-a"],
+            "network_mode": "runtime_net_only",
+            "direct_network": false
+        }),
+        2,
+    );
+    let launch_result = json!({
+        "schema": "elastos.browser.engine.supervisor-result/v1",
+        "page_id": "page:capacity-a",
+        "adapter": "hosted-product",
+        "engine": "selkies_gstreamer",
+        "stream_id": "stream:proof:test",
+        "network_mode": "runtime_net_only",
+        "direct_network": false,
+        "wallet_injection": false,
+        "control_socket_path": status_socket,
+        "isolated_session": true,
+        "isolation": {
+            "schema": "elastos.browser.engine.isolation/v1",
+            "kind": "per_launch_selkies_target",
+            "session_dir": "/tmp/elastos-browser-sessions/capacity-a"
+        },
+        "display_session": {
+            "schema": "elastos.browser.display-session/v1",
+            "session_id": "display:stream:proof:test",
+            "mode": "webrtc_remote_display",
+            "network_mode": "runtime_net_only",
+            "direct_network": false,
+            "input": "datachannel",
+            "width": 1280,
+            "height": 720,
+            "display_backend": "selkies_gstreamer_webrtc",
+            "backend_class": "product_compositor",
+            "audio": true,
+            "video": true,
+            "signaling_url": "/api/apps/browser/pages/page%3Acapacity-a/webrtc"
+        }
+    });
+    let script = format!("printf '%s\n' '{}'", launch_result);
     let init = provider.init(json!({
         "max_active_sessions": 1,
         "adapters": [{
@@ -487,11 +843,14 @@ fn launch_fails_closed_when_session_capacity_is_full() {
     let first = serde_json::to_value(provider.launch_with_viewport(LaunchContext {
         url: "https://ela.city/",
         stream_session: &stream_receipt("adapter_ipc"),
+        profile: test_browser_profile(),
+        adapter_id: None,
         principal_id: Some("person:local:test".to_string()),
         reason: Some("open browser page".to_string()),
         wallet: json!({}),
         viewport: None,
         display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+        guarantee_level: BrowserGuaranteeLevel::OperatorRbi,
     }))
     .unwrap();
     assert_eq!(first["status"], "ok");
@@ -505,14 +864,214 @@ fn launch_fails_closed_when_session_capacity_is_full() {
         error_code(provider.launch_with_viewport(LaunchContext {
             url: "https://glidefinance.io/",
             stream_session: &stream_receipt("adapter_ipc"),
+            profile: test_browser_profile(),
+            adapter_id: None,
             principal_id: Some("person:local:test".to_string()),
             reason: Some("open second browser page".to_string()),
             wallet: json!({}),
             viewport: None,
             display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+            guarantee_level: BrowserGuaranteeLevel::OperatorRbi,
         })),
         "browser_capacity_unavailable"
     );
+}
+
+#[test]
+fn init_prewarms_configured_vm_control_service() {
+    let mut provider = BrowserEngineAdapter::new();
+    let script = r#"if [ "$ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE" != "1" ]; then exit 9; fi; printf '%s\n' '{"schema":"elastos.browser.vm-engine-prewarm/v1","ok":true,"control_socket_path":"/tmp/elastos-browser-vm-prewarm.sock","control_status":{"schema":"elastos.browser.vm-control-service.status/v1","pid":123,"active_pages":0,"max_active_pages":2,"network_mode":"runtime_net_only","direct_network":false},"network_mode":"runtime_net_only","direct_network":false}'"#;
+
+    let init = serde_json::to_value(provider.init(json!({
+        "max_active_sessions": 2,
+        "adapters": [{
+            "id": "mac-vm-product",
+            "kind": "chromium_microvm",
+            "display_modes": ["webrtc_remote_display"],
+            "supervisor": {
+                "program": "/bin/sh",
+                "args": ["-c", script],
+                "timeout_ms": 2000,
+                "control_socket_path": "/tmp/elastos-browser-vm-prewarm.sock",
+                "env": {
+                    "ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE": "1"
+                }
+            }
+        }]
+    })))
+    .unwrap();
+
+    assert_eq!(init["status"], "ok");
+    assert_eq!(
+        init["data"]["prewarm_results"][0]["adapter"],
+        "mac-vm-product"
+    );
+    assert_eq!(init["data"]["prewarm_results"][0]["status"], "ok");
+    assert_eq!(
+        init["data"]["prewarm_results"][0]["result"]["control_status"]["max_active_pages"],
+        2
+    );
+}
+
+#[test]
+fn init_fails_when_configured_vm_prewarm_fails() {
+    let mut provider = BrowserEngineAdapter::new();
+
+    assert_eq!(
+        error_code(provider.init(json!({
+            "adapters": [{
+                "id": "mac-vm-product",
+                "kind": "chromium_microvm",
+                "display_modes": ["webrtc_remote_display"],
+                "supervisor": {
+                    "program": "/bin/sh",
+                    "args": ["-c", "echo prewarm failed >&2; exit 42"],
+                    "timeout_ms": 2000,
+                    "control_socket_path": "/tmp/elastos-browser-vm-prewarm-fail.sock",
+                    "env": {
+                        "ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE": "1"
+                    }
+                }
+            }]
+        }))),
+        "engine_process_unavailable"
+    );
+}
+
+#[test]
+fn launch_reaps_stale_isolated_vm_session_before_capacity_check() {
+    let mut provider = BrowserEngineAdapter::new();
+    let status_socket = spawn_status_socket(json!({
+        "schema": "elastos.browser.vm-control-service.status/v1",
+        "ok": true,
+        "active_pages": 0,
+        "page_ids": [],
+        "network_mode": "runtime_net_only",
+        "direct_network": false
+    }));
+    let launch_result = json!({
+        "schema": "elastos.browser.engine.supervisor-result/v1",
+        "page_id": "page:capacity-reaped",
+        "adapter": "mac-vm-product",
+        "engine": "chromium_microvm",
+        "stream_id": "stream:proof:test",
+        "network_mode": "runtime_net_only",
+        "direct_network": false,
+        "wallet_injection": false,
+        "control_socket_path": status_socket,
+        "isolated_session": true,
+        "isolation": {
+            "schema": "elastos.browser.engine.isolation/v1",
+            "kind": "per_launch_vm_target",
+            "session_dir": "/tmp/elastos-browser-vm-sessions/capacity-reaped"
+        },
+        "display_session": {
+            "schema": "elastos.browser.display-session/v1",
+            "session_id": "display:stream:proof:test",
+            "mode": "webrtc_remote_display",
+            "network_mode": "runtime_net_only",
+            "direct_network": false,
+            "input": "datachannel",
+            "width": 1280,
+            "height": 720,
+            "display_backend": "chromium_microvm_webrtc",
+            "backend_class": "product_compositor",
+            "media_transport": "runtime_relay",
+            "audio": true,
+            "video": true,
+            "signaling_url": "/api/apps/browser/pages/page%3Acapacity-reaped/webrtc"
+        }
+    });
+    let control_socket_path = launch_result["control_socket_path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let script = format!("printf '%s\n' '{}'", launch_result);
+    let init = provider.init(json!({
+        "max_active_sessions": 1,
+        "adapters": [{
+            "id": "mac-vm-product",
+            "kind": "chromium_microvm",
+            "display_modes": ["webrtc_remote_display"],
+            "supervisor": {
+                "program": "/bin/sh",
+                "args": ["-c", script],
+                "timeout_ms": 2000,
+                "control_socket_path": control_socket_path.clone()
+            }
+        }]
+    }));
+    assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+    provider.page_control_sessions.insert(
+        "page:stale-vm".to_string(),
+        PageControlSession {
+            socket_path: control_socket_path.clone(),
+            shutdown_socket_path: Some(control_socket_path),
+            adapter_id: "mac-vm-product".to_string(),
+            principal_id: Some("person:local:test".to_string()),
+            engine: AdapterKind::ChromiumMicrovm,
+            display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+            guarantee_level: BrowserGuaranteeLevel::MechanismMicrovm,
+            isolated_session: true,
+            isolation_session_dir: Some("/tmp/elastos-browser-vm-sessions/stale-vm".to_string()),
+            isolation_kind: Some("per_launch_vm_target".to_string()),
+        },
+    );
+
+    let response = serde_json::to_value(provider.launch_with_viewport(LaunchContext {
+        url: "https://ela.city/",
+        stream_session: &stream_receipt("adapter_ipc"),
+        profile: test_browser_profile(),
+        adapter_id: None,
+        principal_id: Some("person:local:test".to_string()),
+        reason: Some("open browser page".to_string()),
+        wallet: json!({}),
+        viewport: None,
+        display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+        guarantee_level: BrowserGuaranteeLevel::MechanismMicrovm,
+    }))
+    .unwrap();
+
+    assert_eq!(response["status"], "ok");
+    assert_eq!(response["data"]["page_id"], "page:capacity-reaped");
+    assert!(!provider.page_control_sessions.contains_key("page:stale-vm"));
+    assert!(provider
+        .page_control_sessions
+        .contains_key("page:capacity-reaped"));
+}
+
+#[test]
+fn status_reaps_isolated_vm_session_when_control_socket_is_gone() {
+    let mut provider = BrowserEngineAdapter::new();
+    provider.page_control_sessions.insert(
+        "page:dead-vm".to_string(),
+        PageControlSession {
+            socket_path: format!(
+                "/tmp/elastos-browser-vm-dead-{}-{}.sock",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ),
+            shutdown_socket_path: None,
+            adapter_id: "mac-vm-product".to_string(),
+            principal_id: Some("person:local:test".to_string()),
+            engine: AdapterKind::ChromiumMicrovm,
+            display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+            guarantee_level: BrowserGuaranteeLevel::MechanismMicrovm,
+            isolated_session: true,
+            isolation_session_dir: Some("/tmp/elastos-browser-vm-sessions/dead-vm".to_string()),
+            isolation_kind: Some("per_launch_vm_target".to_string()),
+        },
+    );
+
+    let status = serde_json::to_value(provider.status(None)).unwrap();
+
+    assert_eq!(status["status"], "ok");
+    assert_eq!(status["data"]["stale_sessions_reaped"], 1);
+    assert_eq!(status["data"]["active_sessions"], 0);
+    assert!(provider.page_control_sessions.is_empty());
 }
 
 #[test]
@@ -557,9 +1116,182 @@ fn page_operations_fail_without_page_scoped_control_session() {
         "engine_process_unavailable"
     );
     assert_eq!(
+        error_code(provider.diagnostics("page:not-launched", None)),
+        "engine_process_unavailable"
+    );
+    assert_eq!(
         error_code(provider.input("page:not-launched", json!({"type": "click"}), None)),
         "engine_process_unavailable"
     );
+}
+
+#[test]
+fn page_operations_reject_mismatched_principal() {
+    let mut provider = BrowserEngineAdapter::new();
+    provider.page_control_sessions.insert(
+        "page:owned".to_string(),
+        PageControlSession {
+            socket_path: "/tmp/elastos-browser-owned-unused.sock".to_string(),
+            shutdown_socket_path: None,
+            adapter_id: "hosted-product".to_string(),
+            principal_id: Some("person:local:owner".to_string()),
+            engine: AdapterKind::SelkiesGstreamer,
+            display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+            guarantee_level: BrowserGuaranteeLevel::OperatorRbi,
+            isolated_session: false,
+            isolation_session_dir: None,
+            isolation_kind: None,
+        },
+    );
+
+    let other = Some("person:local:other".to_string());
+    assert_eq!(
+        error_code(provider.page_status("page:owned", other.clone())),
+        "page_not_found"
+    );
+    assert_eq!(
+        error_code(provider.diagnostics("page:owned", other.clone())),
+        "page_not_found"
+    );
+    assert_eq!(
+        error_code(provider.input("page:owned", json!({"type": "click"}), other.clone())),
+        "page_not_found"
+    );
+    assert_eq!(
+        error_code(provider.webrtc_signal(
+            "page:owned",
+            json!({
+                "schema": "elastos.browser.webrtc-offer/v1",
+                "type": "offer",
+                "sdp": "v=0\r\ns=ElastOS Browser Test\r\n"
+            }),
+            Some("video".to_string()),
+            other.clone(),
+        )),
+        "page_not_found"
+    );
+    assert_eq!(
+        error_code(provider.close_page("page:owned", other)),
+        "page_not_found"
+    );
+    assert!(provider.page_control_sessions.contains_key("page:owned"));
+}
+
+#[test]
+fn close_page_retains_non_isolated_session_when_close_fails() {
+    let mut provider = BrowserEngineAdapter::new();
+    let socket_path = "/tmp/elastos-browser-close-missing.sock";
+    let _ = std::fs::remove_file(socket_path);
+    provider.page_control_sessions.insert(
+        "page:retry-close".to_string(),
+        PageControlSession {
+            socket_path: socket_path.to_string(),
+            shutdown_socket_path: None,
+            adapter_id: "hosted-product".to_string(),
+            principal_id: Some("person:local:test".to_string()),
+            engine: AdapterKind::SelkiesGstreamer,
+            display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+            guarantee_level: BrowserGuaranteeLevel::OperatorRbi,
+            isolated_session: false,
+            isolation_session_dir: None,
+            isolation_kind: None,
+        },
+    );
+
+    assert_eq!(
+        error_code(provider.close_page("page:retry-close", Some("person:local:test".to_string()),)),
+        "engine_process_unavailable"
+    );
+    assert!(provider
+        .page_control_sessions
+        .contains_key("page:retry-close"));
+}
+
+#[test]
+fn close_page_retains_isolated_session_when_shutdown_and_cleanup_fail() {
+    let mut provider = BrowserEngineAdapter::new();
+    let socket_path = "/tmp/elastos-browser-isolated-close-missing.sock";
+    let _ = std::fs::remove_file(socket_path);
+    provider.page_control_sessions.insert(
+        "page:retry-isolated-close".to_string(),
+        PageControlSession {
+            socket_path: socket_path.to_string(),
+            shutdown_socket_path: Some(socket_path.to_string()),
+            adapter_id: "hosted-product".to_string(),
+            principal_id: Some("person:local:test".to_string()),
+            engine: AdapterKind::SelkiesGstreamer,
+            display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+            guarantee_level: BrowserGuaranteeLevel::OperatorRbi,
+            isolated_session: true,
+            isolation_session_dir: Some("/tmp/not-an-elastos-browser-session".to_string()),
+            isolation_kind: Some("per_launch_selkies_target".to_string()),
+        },
+    );
+
+    assert_eq!(
+        error_code(provider.close_page(
+            "page:retry-isolated-close",
+            Some("person:local:test".to_string()),
+        )),
+        "engine_process_unavailable"
+    );
+    assert!(provider
+        .page_control_sessions
+        .contains_key("page:retry-isolated-close"));
+}
+
+#[test]
+fn page_status_includes_redacted_engine_identity() {
+    let status_socket = spawn_status_socket(json!({
+        "schema": "elastos.browser.page-status/v1",
+        "actual_url": "https://ela.city/channels",
+        "title": "ela.city",
+        "direct_network": false,
+        "display_session": {
+            "schema": "elastos.browser.display-session/v1",
+            "mode": "webrtc_remote_display",
+            "media_transport": "runtime_relay",
+            "display_backend": "selkies_gstreamer_webrtc",
+            "backend_class": "product_compositor",
+            "network_mode": "runtime_net_only",
+            "direct_network": false
+        }
+    }));
+    let mut provider = BrowserEngineAdapter::new();
+    provider.page_control_sessions.insert(
+        "page:browser-vm-status".to_string(),
+        PageControlSession {
+            socket_path: status_socket,
+            shutdown_socket_path: None,
+            adapter_id: "browser-vm-product".to_string(),
+            principal_id: Some("person:local:test".to_string()),
+            engine: AdapterKind::ChromiumMicrovm,
+            display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+            guarantee_level: BrowserGuaranteeLevel::MechanismMicrovm,
+            isolated_session: true,
+            isolation_session_dir: Some("/tmp/elastos-browser-vm-sessions/status".to_string()),
+            isolation_kind: Some("per_launch_vm_target".to_string()),
+        },
+    );
+
+    let response = serde_json::to_value(provider.page_status(
+        "page:browser-vm-status",
+        Some("person:local:test".to_string()),
+    ))
+    .unwrap();
+    assert_eq!(response["status"], "ok");
+    let identity = &response["data"]["engine_identity"];
+    assert_eq!(identity["schema"], "elastos.browser.engine.identity/v1");
+    assert_eq!(identity["adapter"], "browser-vm-product");
+    assert_eq!(identity["engine"], "chromium_microvm");
+    assert_eq!(identity["display_mode"], "webrtc_remote_display");
+    assert_eq!(identity["guarantee_level"], "mechanism_microvm");
+    assert_eq!(identity["engine_control"], "page_scoped");
+    assert_eq!(identity["isolated_engine_session"], true);
+    assert_eq!(identity["isolation_kind"], "per_launch_vm_target");
+    assert!(identity.get("socket_path").is_none());
+    assert!(identity.get("shutdown_socket_path").is_none());
+    assert!(identity.get("session_dir").is_none());
 }
 
 #[test]
@@ -581,20 +1313,34 @@ fn isolated_close_uses_target_shutdown_contract() {
     let handle = thread::spawn({
         let socket_path = socket_path.clone();
         move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 1024];
-            let size = stream.read(&mut request).unwrap();
-            let request = String::from_utf8_lossy(&request[..size]);
-            assert!(request.starts_with("POST /shutdown HTTP/1.1"));
-            let body = r#"{"schema":"elastos.browser.selkies-control.shutdown/v1","ok":true}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
-            let _ = std::fs::remove_file(socket_path);
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 1024];
+                let size = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..size]);
+                if !request.starts_with("POST /shutdown HTTP/1.1") {
+                    let body = r#"{"schema":"elastos.browser.test-probe/v1","ok":true}"#;
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                    continue;
+                }
+                let body = r#"{"schema":"elastos.browser.selkies-control.shutdown/v1","ok":true}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+                let _ = std::fs::remove_file(socket_path);
+                return;
+            }
+            panic!("test listener did not receive POST /shutdown");
         }
     });
 
@@ -603,10 +1349,17 @@ fn isolated_close_uses_target_shutdown_contract() {
         "page:isolated-close".to_string(),
         PageControlSession {
             socket_path: socket_path.clone(),
+            shutdown_socket_path: None,
+            adapter_id: "hosted-product".to_string(),
+            principal_id: Some("person:local:test".to_string()),
+            engine: AdapterKind::SelkiesGstreamer,
+            display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+            guarantee_level: BrowserGuaranteeLevel::OperatorRbi,
             isolated_session: true,
             isolation_session_dir: Some(
                 "/tmp/elastos-browser-sessions/stream_isolated-close-test".to_string(),
             ),
+            isolation_kind: Some("per_launch_selkies_target".to_string()),
         },
     );
 
@@ -626,6 +1379,387 @@ fn isolated_close_uses_target_shutdown_contract() {
         "elastos.browser.selkies-control.shutdown/v1"
     );
     handle.join().unwrap();
+}
+
+#[test]
+fn vm_isolated_close_uses_global_shutdown_socket() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+    use std::time::Duration;
+
+    let socket_path = format!(
+        "/tmp/elastos-browser-vm-close-{}-{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let handle = thread::spawn({
+        let socket_path = socket_path.clone();
+        move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 256];
+            loop {
+                let size = stream.read(&mut buffer).unwrap_or(0);
+                if size == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..size]);
+                let request_text = String::from_utf8_lossy(&request);
+                if request_text.contains("\r\n\r\n")
+                    && request_text.contains("\"page_id\":\"page:browser-vm-close\"")
+                {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("POST /shutdown HTTP/1.1"));
+            assert!(request.contains("\"page_id\":\"page:browser-vm-close\""));
+            let body = r#"{"schema":"elastos.browser.vm-engine.shutdown/v1","ok":true}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            let _ = std::fs::remove_file(socket_path);
+        }
+    });
+
+    let mut provider = BrowserEngineAdapter::new();
+    provider.page_control_sessions.insert(
+        "page:browser-vm-close".to_string(),
+        PageControlSession {
+            socket_path: "/tmp/elastos-browser-vm-page-control-not-used.sock".to_string(),
+            shutdown_socket_path: Some(socket_path),
+            adapter_id: "browser-vm-product".to_string(),
+            principal_id: Some("person:local:test".to_string()),
+            engine: AdapterKind::ChromiumMicrovm,
+            display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+            guarantee_level: BrowserGuaranteeLevel::MechanismMicrovm,
+            isolated_session: true,
+            isolation_session_dir: Some("/tmp/evzl/bvm-vm-close-test".to_string()),
+            isolation_kind: Some("per_launch_vm_target".to_string()),
+        },
+    );
+
+    let response = serde_json::to_value(provider.close_page(
+        "page:browser-vm-close",
+        Some("person:local:test".to_string()),
+    ))
+    .unwrap();
+    assert_eq!(response["status"], "ok");
+    assert_eq!(response["data"]["closed"], true);
+    assert_eq!(
+        response["data"]["shutdown"]["schema"],
+        "elastos.browser.vm-engine.shutdown/v1"
+    );
+    handle.join().unwrap();
+}
+
+#[test]
+fn supervisor_accepts_vm_isolation_kind() {
+    let result = SupervisorLaunchResult {
+        schema: "elastos.browser.engine.supervisor-result/v1".to_string(),
+        page_id: "page:browser-vm".to_string(),
+        adapter: "browser-vm-product".to_string(),
+        engine: AdapterKind::ChromiumMicrovm,
+        stream_id: "stream:proof:test".to_string(),
+        actual_url: None,
+        title: None,
+        network_mode: AdapterNetworkMode::RuntimeNetOnly,
+        direct_network: false,
+        wallet_injection: false,
+        display_session: json!({
+            "schema": "elastos.browser.display-session/v1",
+            "session_id": "display:stream:proof:test",
+            "mode": "webrtc_remote_display",
+            "network_mode": "runtime_net_only",
+            "direct_network": false,
+            "input": "datachannel",
+            "width": 1280,
+            "height": 720,
+            "display_backend": "vm_selkies_gstreamer_webrtc",
+            "backend_class": "product_compositor",
+            "media_transport": "runtime_relay",
+            "audio": true,
+            "video": true,
+            "signaling_url": "/api/apps/browser/pages/page%3Abrowser-vm/webrtc"
+        }),
+        view: None,
+        wallet_bridge: None,
+        control_socket_path: Some("/tmp/elastos-browser-vm.sock".to_string()),
+        isolated_session: true,
+        isolation: Some(SupervisorIsolation {
+            schema: "elastos.browser.engine.isolation/v1".to_string(),
+            kind: "per_launch_vm_target".to_string(),
+            session_dir: "/tmp/elastos-browser-vm-sessions/test".to_string(),
+        }),
+    };
+    let adapter = AdapterConfig {
+        id: "browser-vm-product".to_string(),
+        kind: AdapterKind::ChromiumMicrovm,
+        network_mode: AdapterNetworkMode::RuntimeNetOnly,
+        display_modes: vec![BrowserDisplayMode::WebrtcRemoteDisplay],
+        supervisor: None,
+    };
+
+    validate_supervisor_result(
+        &result,
+        &adapter,
+        &stream_receipt("adapter_ipc"),
+        BrowserDisplayMode::WebrtcRemoteDisplay,
+    )
+    .unwrap();
+}
+
+#[test]
+fn supervisor_rejects_video_only_vm_product_display() {
+    let result = SupervisorLaunchResult {
+        schema: "elastos.browser.engine.supervisor-result/v1".to_string(),
+        page_id: "page:browser-vm".to_string(),
+        adapter: "browser-vm-product".to_string(),
+        engine: AdapterKind::ChromiumMicrovm,
+        stream_id: "stream:proof:test".to_string(),
+        actual_url: None,
+        title: None,
+        network_mode: AdapterNetworkMode::RuntimeNetOnly,
+        direct_network: false,
+        wallet_injection: false,
+        display_session: json!({
+            "schema": "elastos.browser.display-session/v1",
+            "session_id": "display:stream:proof:test",
+            "mode": "webrtc_remote_display",
+            "network_mode": "runtime_net_only",
+            "direct_network": false,
+            "input": "datachannel",
+            "width": 1280,
+            "height": 720,
+            "display_backend": "vm_selkies_gstreamer_webrtc",
+            "backend_class": "product_compositor",
+            "media_transport": "runtime_relay",
+            "audio": false,
+            "video": true,
+            "signaling_url": "/api/apps/browser/pages/page%3Abrowser-vm/webrtc"
+        }),
+        view: None,
+        wallet_bridge: None,
+        control_socket_path: Some("/tmp/elastos-browser-vm.sock".to_string()),
+        isolated_session: true,
+        isolation: Some(SupervisorIsolation {
+            schema: "elastos.browser.engine.isolation/v1".to_string(),
+            kind: "per_launch_vm_target".to_string(),
+            session_dir: "/tmp/elastos-browser-vm-sessions/test".to_string(),
+        }),
+    };
+    let adapter = AdapterConfig {
+        id: "browser-vm-product".to_string(),
+        kind: AdapterKind::ChromiumMicrovm,
+        network_mode: AdapterNetworkMode::RuntimeNetOnly,
+        display_modes: vec![BrowserDisplayMode::WebrtcRemoteDisplay],
+        supervisor: None,
+    };
+
+    let err = validate_supervisor_result(
+        &result,
+        &adapter,
+        &stream_receipt("adapter_ipc"),
+        BrowserDisplayMode::WebrtcRemoteDisplay,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        "Browser VM product display sessions must advertise audio=true and video=true"
+    );
+}
+
+#[test]
+fn supervisor_rejects_vm_product_display_without_video() {
+    let result = SupervisorLaunchResult {
+        schema: "elastos.browser.engine.supervisor-result/v1".to_string(),
+        page_id: "page:browser-vm".to_string(),
+        adapter: "browser-vm-product".to_string(),
+        engine: AdapterKind::ChromiumMicrovm,
+        stream_id: "stream:proof:test".to_string(),
+        actual_url: None,
+        title: None,
+        network_mode: AdapterNetworkMode::RuntimeNetOnly,
+        direct_network: false,
+        wallet_injection: false,
+        display_session: json!({
+            "schema": "elastos.browser.display-session/v1",
+            "session_id": "display:stream:proof:test",
+            "mode": "webrtc_remote_display",
+            "network_mode": "runtime_net_only",
+            "direct_network": false,
+            "input": "datachannel",
+            "width": 1280,
+            "height": 720,
+            "display_backend": "vm_selkies_gstreamer_webrtc",
+            "backend_class": "product_compositor",
+            "media_transport": "runtime_relay",
+            "audio": false,
+            "video": false,
+            "signaling_url": "/api/apps/browser/pages/page%3Abrowser-vm/webrtc"
+        }),
+        view: None,
+        wallet_bridge: None,
+        control_socket_path: Some("/tmp/elastos-browser-vm.sock".to_string()),
+        isolated_session: true,
+        isolation: Some(SupervisorIsolation {
+            schema: "elastos.browser.engine.isolation/v1".to_string(),
+            kind: "per_launch_vm_target".to_string(),
+            session_dir: "/tmp/elastos-browser-vm-sessions/test".to_string(),
+        }),
+    };
+    let adapter = AdapterConfig {
+        id: "browser-vm-product".to_string(),
+        kind: AdapterKind::ChromiumMicrovm,
+        network_mode: AdapterNetworkMode::RuntimeNetOnly,
+        display_modes: vec![BrowserDisplayMode::WebrtcRemoteDisplay],
+        supervisor: None,
+    };
+
+    let err = validate_supervisor_result(
+        &result,
+        &adapter,
+        &stream_receipt("adapter_ipc"),
+        BrowserDisplayMode::WebrtcRemoteDisplay,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        "Browser VM product display sessions must advertise audio=true and video=true"
+    );
+}
+
+#[test]
+fn supervisor_rejects_non_relay_vm_media_transport() {
+    let result = SupervisorLaunchResult {
+        schema: "elastos.browser.engine.supervisor-result/v1".to_string(),
+        page_id: "page:browser-vm".to_string(),
+        adapter: "browser-vm-product".to_string(),
+        engine: AdapterKind::ChromiumMicrovm,
+        stream_id: "stream:proof:test".to_string(),
+        actual_url: None,
+        title: None,
+        network_mode: AdapterNetworkMode::RuntimeNetOnly,
+        direct_network: false,
+        wallet_injection: false,
+        display_session: json!({
+            "schema": "elastos.browser.display-session/v1",
+            "session_id": "display:stream:proof:test",
+            "mode": "webrtc_remote_display",
+            "network_mode": "runtime_net_only",
+            "direct_network": false,
+            "input": "datachannel",
+            "input_protocol": "selkies_v1",
+            "width": 1280,
+            "height": 720,
+            "display_backend": "vm_selkies_gstreamer_webrtc",
+            "backend_class": "product_compositor",
+            "media_transport": "host_media",
+            "audio": true,
+            "video": true,
+            "signaling_url": "/api/apps/browser/pages/page%3Abrowser-vm/webrtc"
+        }),
+        view: None,
+        wallet_bridge: None,
+        control_socket_path: Some("/tmp/elastos-browser-vm.sock".to_string()),
+        isolated_session: true,
+        isolation: Some(SupervisorIsolation {
+            schema: "elastos.browser.engine.isolation/v1".to_string(),
+            kind: "per_launch_vm_target".to_string(),
+            session_dir: "/tmp/elastos-browser-vm-sessions/test".to_string(),
+        }),
+    };
+    let adapter = AdapterConfig {
+        id: "browser-vm-product".to_string(),
+        kind: AdapterKind::ChromiumMicrovm,
+        network_mode: AdapterNetworkMode::RuntimeNetOnly,
+        display_modes: vec![BrowserDisplayMode::WebrtcRemoteDisplay],
+        supervisor: None,
+    };
+
+    let err = validate_supervisor_result(
+        &result,
+        &adapter,
+        &stream_receipt("adapter_ipc"),
+        BrowserDisplayMode::WebrtcRemoteDisplay,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        "Browser VM display sessions must report media_transport=runtime_relay"
+    );
+}
+
+#[test]
+fn vm_isolation_requires_runtime_relay_media_transport() {
+    let result = SupervisorLaunchResult {
+        schema: "elastos.browser.engine.supervisor-result/v1".to_string(),
+        page_id: "page:browser-vm".to_string(),
+        adapter: "browser-vm-product".to_string(),
+        engine: AdapterKind::ChromiumMicrovm,
+        stream_id: "stream:proof:test".to_string(),
+        actual_url: None,
+        title: None,
+        network_mode: AdapterNetworkMode::RuntimeNetOnly,
+        direct_network: false,
+        wallet_injection: false,
+        display_session: json!({
+            "schema": "elastos.browser.display-session/v1",
+            "session_id": "display:stream:proof:test",
+            "mode": "webrtc_remote_display",
+            "network_mode": "runtime_net_only",
+            "direct_network": false,
+            "input": "datachannel",
+            "width": 1280,
+            "height": 720,
+            "display_backend": "vm_selkies_gstreamer_webrtc",
+            "backend_class": "product_compositor",
+            "audio": true,
+            "video": true,
+            "signaling_url": "/api/apps/browser/pages/page%3Abrowser-vm/webrtc"
+        }),
+        view: None,
+        wallet_bridge: None,
+        control_socket_path: Some("/tmp/elastos-browser-vm.sock".to_string()),
+        isolated_session: true,
+        isolation: Some(SupervisorIsolation {
+            schema: "elastos.browser.engine.isolation/v1".to_string(),
+            kind: "per_launch_vm_target".to_string(),
+            session_dir: "/tmp/elastos-browser-vm-sessions/test".to_string(),
+        }),
+    };
+    let adapter = AdapterConfig {
+        id: "browser-vm-product".to_string(),
+        kind: AdapterKind::ChromiumMicrovm,
+        network_mode: AdapterNetworkMode::RuntimeNetOnly,
+        display_modes: vec![BrowserDisplayMode::WebrtcRemoteDisplay],
+        supervisor: None,
+    };
+
+    let err = validate_supervisor_result(
+        &result,
+        &adapter,
+        &stream_receipt("adapter_ipc"),
+        BrowserDisplayMode::WebrtcRemoteDisplay,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        "Browser VM display sessions must report media_transport=runtime_relay"
+    );
 }
 
 #[test]
@@ -674,11 +1808,14 @@ fn hosted_remote_browser_can_declare_product_compositor() {
     let response = serde_json::to_value(provider.launch_with_viewport(LaunchContext {
         url: "https://example.com/",
         stream_session: &stream_receipt("adapter_ipc"),
+        profile: test_browser_profile(),
+        adapter_id: None,
         principal_id: Some("person:local:test".to_string()),
         reason: Some("open browser page".to_string()),
         wallet: json!({}),
         viewport: None,
         display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+        guarantee_level: BrowserGuaranteeLevel::OperatorRbi,
     }))
     .unwrap();
 
@@ -695,7 +1832,7 @@ fn hosted_remote_browser_can_declare_product_compositor() {
 #[test]
 fn native_adapter_can_declare_native_surface_display_mode() {
     let mut provider = BrowserEngineAdapter::new();
-    let script = r#"printf '%s\n' '{"schema":"elastos.browser.engine.supervisor-result/v1","page_id":"page:native-surface-proof","adapter":"linux-cef","engine":"cef","stream_id":"stream:proof:test","network_mode":"runtime_net_only","direct_network":false,"wallet_injection":false,"display_session":{"schema":"elastos.browser.display-session/v1","session_id":"display:stream:proof:test","mode":"native_surface","surface_id":"surface:native-proof","network_mode":"runtime_net_only","direct_network":false,"input":"native_ipc","audio":true,"video":true}}'"#;
+    let script = r#"printf '%s\n' '{"schema":"elastos.browser.engine.supervisor-result/v1","page_id":"page:native-surface-proof","adapter":"linux-cef","engine":"cef","stream_id":"stream:proof:test","network_mode":"runtime_net_only","direct_network":false,"wallet_injection":false,"display_session":{"schema":"elastos.browser.display-session/v1","session_id":"display:stream:proof:test","mode":"native_surface","surface_id":"surface:native-proof","network_mode":"runtime_net_only","direct_network":false,"input":"native_ipc","width":1280,"height":720,"audio":true,"video":true},"view":{"schema":"elastos.browser.view/v1","mode":"native_surface","width":1280,"height":720}}'"#;
     let init = provider.init(json!({
         "adapters": [{
             "id": "linux-cef",
@@ -713,11 +1850,14 @@ fn native_adapter_can_declare_native_surface_display_mode() {
     let response = serde_json::to_value(provider.launch_with_viewport(LaunchContext {
         url: "https://glidefinance.io/",
         stream_session: &stream_receipt("adapter_ipc"),
+        profile: test_browser_profile(),
+        adapter_id: None,
         principal_id: Some("person:local:test".to_string()),
         reason: Some("open browser page".to_string()),
         wallet: json!({}),
         viewport: None,
         display_mode: BrowserDisplayMode::NativeSurface,
+        guarantee_level: BrowserGuaranteeLevel::PolicyWebview,
     }))
     .unwrap();
 
@@ -732,17 +1872,79 @@ fn native_adapter_can_declare_native_surface_display_mode() {
         "surface:native-proof"
     );
     assert_eq!(response["data"]["display_session"]["input"], "native_ipc");
+    assert_eq!(response["data"]["display_session"]["width"], 1280);
+    assert_eq!(response["data"]["display_session"]["height"], 720);
+    assert_eq!(
+        response["data"]["view"]["schema"],
+        "elastos.browser.view/v1"
+    );
+    assert_eq!(response["data"]["view"]["mode"], "native_surface");
+    assert_eq!(response["data"]["view"]["width"], 1280);
+    assert_eq!(response["data"]["view"]["height"], 720);
+}
+
+#[test]
+fn native_surface_supervisor_result_requires_view_geometry() {
+    let result = SupervisorLaunchResult {
+        schema: "elastos.browser.engine.supervisor-result/v1".to_string(),
+        page_id: "page:native-surface-proof".to_string(),
+        adapter: "linux-cef".to_string(),
+        engine: AdapterKind::Cef,
+        stream_id: "stream:proof:test".to_string(),
+        actual_url: None,
+        title: None,
+        network_mode: AdapterNetworkMode::RuntimeNetOnly,
+        direct_network: false,
+        wallet_injection: false,
+        display_session: json!({
+            "schema": "elastos.browser.display-session/v1",
+            "session_id": "display:stream:proof:test",
+            "mode": "native_surface",
+            "surface_id": "surface:native-proof",
+            "network_mode": "runtime_net_only",
+            "direct_network": false,
+            "input": "native_ipc",
+            "width": 1280,
+            "height": 720,
+            "audio": true,
+            "video": true
+        }),
+        view: None,
+        wallet_bridge: None,
+        control_socket_path: None,
+        isolated_session: false,
+        isolation: None,
+    };
+    let adapter = AdapterConfig {
+        id: "linux-cef".to_string(),
+        kind: AdapterKind::Cef,
+        network_mode: AdapterNetworkMode::RuntimeNetOnly,
+        display_modes: vec![BrowserDisplayMode::NativeSurface],
+        supervisor: None,
+    };
+
+    let err = validate_supervisor_result(
+        &result,
+        &adapter,
+        &stream_receipt("adapter_ipc"),
+        BrowserDisplayMode::NativeSurface,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        "native_surface supervisor result omitted view geometry"
+    );
 }
 
 #[test]
 fn native_adapter_passes_operator_supervisor_env() {
     let mut provider = BrowserEngineAdapter::new();
-    let script = r#"test "$ELASTOS_BROWSER_ENGINE_TEST_ENV" = "ok" && printf '%s\n' '{"schema":"elastos.browser.engine.supervisor-result/v1","page_id":"page:native-proof","adapter":"linux-chromium-headless","engine":"chromium_headless","stream_id":"stream:proof:test","network_mode":"runtime_net_only","direct_network":false,"wallet_injection":false,"display_session":{"schema":"elastos.browser.display-session/v1","session_id":"display:stream:proof:test","mode":"diagnostic_frame","network_mode":"runtime_net_only","direct_network":false,"input":"runtime_route","audio":false,"video":false}}'"#;
+    let script = r#"test "$ELASTOS_BROWSER_ENGINE_TEST_ENV" = "ok" && printf '%s\n' '{"schema":"elastos.browser.engine.supervisor-result/v1","page_id":"page:native-proof","adapter":"linux-chromium-headless","engine":"chromium_headless","stream_id":"stream:proof:test","network_mode":"runtime_net_only","direct_network":false,"wallet_injection":false,"display_session":{"schema":"elastos.browser.display-session/v1","session_id":"display:stream:proof:test","mode":"webrtc_remote_display","network_mode":"runtime_net_only","direct_network":false,"input":"runtime_route","audio":false,"video":true,"signaling_url":"/api/apps/browser/pages/page%3Anative-proof/webrtc"}}'"#;
     let init = provider.init(json!({
         "adapters": [{
             "id": "linux-chromium-headless",
             "kind": "chromium_headless",
-            "display_modes": ["diagnostic_frame"],
+            "display_modes": ["webrtc_remote_display"],
             "supervisor": {
                 "program": "/bin/sh",
                 "args": ["-c", script],
@@ -771,12 +1973,12 @@ fn native_adapter_passes_operator_supervisor_env() {
 #[test]
 fn native_adapter_rejects_supervisor_claiming_direct_network() {
     let mut provider = BrowserEngineAdapter::new();
-    let script = r#"printf '%s\n' '{"schema":"elastos.browser.engine.supervisor-result/v1","page_id":"page:native-proof","adapter":"linux-chromium-headless","engine":"chromium_headless","stream_id":"stream:proof:test","network_mode":"runtime_net_only","direct_network":true,"wallet_injection":false,"display_session":{"schema":"elastos.browser.display-session/v1","session_id":"display:stream:proof:test","mode":"diagnostic_frame","network_mode":"runtime_net_only","direct_network":false,"input":"runtime_route","audio":false,"video":false}}'"#;
+    let script = r#"printf '%s\n' '{"schema":"elastos.browser.engine.supervisor-result/v1","page_id":"page:native-proof","adapter":"linux-chromium-headless","engine":"chromium_headless","stream_id":"stream:proof:test","network_mode":"runtime_net_only","direct_network":true,"wallet_injection":false,"display_session":{"schema":"elastos.browser.display-session/v1","session_id":"display:stream:proof:test","mode":"webrtc_remote_display","network_mode":"runtime_net_only","direct_network":false,"input":"runtime_route","audio":false,"video":true,"signaling_url":"/api/apps/browser/pages/page%3Anative-proof/webrtc"}}'"#;
     let init = provider.init(json!({
         "adapters": [{
             "id": "linux-chromium-headless",
             "kind": "chromium_headless",
-            "display_modes": ["diagnostic_frame"],
+            "display_modes": ["webrtc_remote_display"],
             "supervisor": {
                 "program": "/bin/sh",
                 "args": ["-c", script],
@@ -809,6 +2011,7 @@ fn request_decode_rejects_hidden_host_authority_fields() {
             "target": "tls://glidefinance.io:443",
             "byte_transport": "adapter_ipc"
         },
+        "profile": test_browser_profile(),
         "raw_socket": true
     }))
     .unwrap_err()
@@ -835,6 +2038,7 @@ fn webrtc_signal_rejects_unsupported_payloads() {
 
     let response = serde_json::to_value(provider.handle(Request::WebrtcSignal {
         page_id: "page:test".to_string(),
+        channel: Some("video".to_string()),
         signal: json!({
             "schema": "elastos.browser.webrtc-unsupported/v1",
             "type": "unsupported"

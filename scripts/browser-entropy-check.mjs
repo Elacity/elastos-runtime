@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 const repoRoot = new URL("../", import.meta.url);
 
 function read(path) {
   return readFileSync(new URL(path, repoRoot), "utf8");
+}
+
+function exists(path) {
+  return existsSync(new URL(path, repoRoot));
 }
 
 function readAll(paths) {
@@ -62,6 +66,8 @@ const browserJs = readAll([
   "capsules/browser/browser/browser-status.js",
   "capsules/browser/browser/browser-webrtc.js",
 ]);
+const browserInputSurface = read("capsules/browser/browser/browser-input-surface.js");
+const browserRemoteDisplay = read("capsules/browser/browser/browser-remote-display.js");
 const browserStyle = read("capsules/browser/browser/style.css");
 const homeShellWindows = read("capsules/home/browser/shell-windows.js");
 const netProvider = read("capsules/net-provider/src/main.rs");
@@ -77,6 +83,11 @@ const browserEngineAdapter = readAll([
 const browserEngineSupervisor = read(
   "elastos/tools/browser-engine-supervisor/src/main.rs",
 );
+const browserPlaywrightEngine = read(
+  "elastos/tools/browser-playwright-engine/src/supervisor.mjs",
+);
+const browserLocalExit = read("elastos/tools/browser-local-exit/src/main.rs");
+const browserRuntimeProxySmoke = read("scripts/browser-runtime-proxy-smoke.sh");
 const browserNativeOperatorConfig = read(
   "scripts/browser-native-operator-config.mjs",
 );
@@ -88,17 +99,115 @@ const browserProviderDecisionReport = read(
 const browserHostedProviderBakeoff = read(
   "scripts/browser-hosted-provider-bakeoff.sh",
 );
+const browserHostedProductWebrtcSmoke = read(
+  "scripts/browser-hosted-product-webrtc-smoke.mjs",
+);
+const browserHostedProductSupervisor = read(
+  "scripts/browser-hosted-product-supervisor.mjs",
+);
 const browserNativeTargetPreflight = read(
   "scripts/browser-native-target-preflight.sh",
 );
 const browserSelkiesControlService = read(
   "scripts/browser-selkies-control-service.mjs",
 );
+const browserSelkiesControlServiceSmoke = read(
+  "scripts/browser-selkies-control-service-smoke.sh",
+);
 const browserSelkiesRuntimeExitTarget = read(
   "scripts/browser-selkies-runtime-exit-target.sh",
 );
 const browserPerLaunchSelkiesSupervisor = read(
   "scripts/browser-per-launch-selkies-supervisor.mjs",
+);
+const browserVmEngineSupervisor = read(
+  "scripts/browser-vm-engine-supervisor.mjs",
+);
+const browserVmLocalCrosvmLauncher = read(
+  "scripts/browser-vm-local-crosvm-launcher.mjs",
+);
+const browserVmEnginePreflight = read(
+  "scripts/browser-vm-engine-preflight.sh",
+);
+const browserVmArtifactPreflight = read(
+  "scripts/browser-vm-artifact-preflight.sh",
+);
+const browserVmArtifactPreflightSmoke = read(
+  "scripts/browser-vm-artifact-preflight-smoke.sh",
+);
+const browserVmControlService = read("scripts/browser-vm-control-service.mjs");
+const browserVmRemoteVzLauncher = read("scripts/browser-vm-remote-vz-launcher.mjs");
+const browserVmControlServiceSmoke = read(
+  "scripts/browser-vm-control-service-smoke.sh",
+);
+const browserVmControlServicePersistentSmoke = read(
+  "scripts/browser-vm-control-service-persistent-smoke.sh",
+);
+const remoteCarrierExitArtifactReadiness = read(
+  "scripts/remote-carrier-exit-artifact-readiness.mjs",
+);
+const remoteCarrierExitArtifactReadinessSmoke = read(
+  "scripts/remote-carrier-exit-artifact-readiness-smoke.sh",
+);
+const remoteCarrierExitReadiness = read(
+  "scripts/remote-carrier-exit-readiness.mjs",
+);
+const remoteCarrierExitReadinessSmoke = read(
+  "scripts/remote-carrier-exit-readiness-smoke.sh",
+);
+const browserVmEngineContractSmoke = read(
+  "scripts/browser-vm-engine-contract-smoke.sh",
+);
+const browserVmRemoteControlPreflightSmoke = read(
+  "scripts/browser-vm-remote-control-preflight-smoke.sh",
+);
+const browserVmTargetPreflight = read(
+  "scripts/browser-vm-target-preflight.sh",
+);
+const browserVmTargetPreflightSmoke = read(
+  "scripts/browser-vm-target-preflight-smoke.sh",
+);
+const browserVmTargetRefresh = read("scripts/browser-vm-target-refresh.sh");
+const browserVmRuntimeRelay = read(
+  "elastos/tools/browser-vm-runtime-relay/src/main.rs",
+);
+const browserVmRuntimeRelaySmoke = read(
+  "scripts/browser-vm-runtime-relay-smoke.sh",
+);
+const browserVmGuestControlBridge = read(
+  "elastos/tools/browser-vm-guest-control-bridge/src/main.rs",
+);
+const browserVmGuestControlBridgeSmoke = read(
+  "scripts/browser-vm-guest-control-bridge-smoke.sh",
+);
+const browserVzEngineSupervisor = read(
+  "elastos/crates/elastos-vz/src/bin/browser-vz-engine-supervisor.rs",
+);
+const browserVmTargetStage = read("scripts/build/stage-browser-vm-target.sh");
+const browserVmTargetStageSmoke = read(
+  "scripts/build/stage-browser-vm-target-smoke.sh",
+);
+const browserVmRootfsBuild = read("scripts/build/build-browser-vm-rootfs.sh");
+const browserVmTargetDoc = read("docs/BROWSER_VM_TARGET.md");
+const architectureDoc = read("docs/ARCHITECTURE.md");
+const installDoc = read("docs/INSTALL.md");
+const browserMacVmProof = read("scripts/browser-mac-vm-proof.sh");
+const macDoc = read("docs/MAC.md");
+const homePasskeyVirtualAuthSmoke = read("scripts/home-passkey-virtual-auth-smoke.mjs");
+const elastosCommon = read("elastos/crates/elastos-common/src/lib.rs");
+const browserSourceHomeConfig = read("scripts/browser-source-home-config.mjs");
+const browserSourceHomeConfigSmoke = read("scripts/browser-source-home-config-smoke.sh");
+const browserRuntimeTurn = read("scripts/browser-runtime-turn.mjs");
+const browserRuntimeTurnSmoke = read("scripts/browser-runtime-turn-smoke.mjs");
+const setupSourceHome = read("scripts/setup-source-home.sh");
+const setupSourceHomeBrowserArtifacts = read(
+  "scripts/setup-source-home-browser-artifacts.sh",
+);
+const setupSourceHomeBrowserConfigSmoke = read(
+  "scripts/setup-source-home-browser-config-smoke.sh",
+);
+const setupSourceHomeBrowserArtifactsSmoke = read(
+  "scripts/setup-source-home-browser-artifacts-smoke.sh",
 );
 const browserPerLaunchSelkiesSupervisorSmoke = read(
   "scripts/browser-per-launch-selkies-supervisor-smoke.sh",
@@ -134,6 +243,11 @@ const gatewayBrowserApi = readAll([
   "elastos/crates/elastos-server/src/api/gateway_browser_wallet_bridge.rs",
   "elastos/crates/elastos-server/src/api/gateway_browser_wallet_reads.rs",
 ]);
+const browserProfileResetRoute = sourceBlock(
+  gatewayBrowserApi,
+  "pub(super) async fn browser_app_profile_reset",
+  "Browser profile reset route",
+);
 const gatewayApi = readAll([
   "elastos/crates/elastos-server/src/api/gateway.rs",
   "elastos/crates/elastos-server/src/api/gateway_home_runtime.rs",
@@ -142,7 +256,22 @@ const gatewayApi = readAll([
   "elastos/crates/elastos-server/src/api/gateway_provider_proxy.rs",
   "elastos/crates/elastos-server/src/api/gateway_server.rs",
 ]);
+assert(
+  gatewayApi.includes("legacy /api/provider/net/stream is disabled") &&
+    !gatewayApi.includes(
+      "return gateway_browser::gateway_browser_net_stream(registry.as_ref(), &request).await;",
+    ),
+  "Legacy /api/provider/net/stream must fail closed instead of delegating to Browser stream reservation",
+);
+const gatewayBrowserProfileTests = read(
+  "elastos/crates/elastos-server/src/api/gateway_tests/browser_profile.rs",
+);
+const gatewayHomeSystemTests = read(
+  "elastos/crates/elastos-server/src/api/gateway_tests/home_system.rs",
+);
 const shellWindows = read("capsules/home/browser/shell-windows.js");
+const browserSettingsPanelIndex = browser.indexOf('id="browser-settings-panel"');
+const browserProfileResetIndex = browser.indexOf('id="browser-profile-reset"');
 
 assert(
   browserManifest.includes('"name": "browser"') &&
@@ -154,10 +283,21 @@ assert(
 );
 
 assert(
+  browserSettingsPanelIndex >= 0 &&
+    browserProfileResetIndex > browserSettingsPanelIndex,
+  "Browser profile reset control must live inside Browser settings, not the main navigation toolbar",
+);
+
+assert(
   browser.includes("https://ela.city/") &&
     browser.includes('id="browser-back"') &&
     browser.includes('id="browser-forward"') &&
     browser.includes('id="browser-refresh"') &&
+    browser.includes('id="browser-profile-reset"') &&
+    browser.includes('id="browser-settings"') &&
+    browser.includes('id="browser-settings-panel"') &&
+    browser.includes('id="browser-exit"') &&
+    browser.includes('class="browser-exit-select"') &&
     browser.includes('id="browser-url"') &&
     !browser.includes("Runtime boundary") &&
     !browser.includes("Last request") &&
@@ -188,6 +328,19 @@ assert(
     ) &&
     browserJs.includes("Only http and https addresses") &&
     browserJs.includes("/api/apps/browser/open") &&
+    browserJs.includes("/api/apps/browser/summary") &&
+    browserJs.includes("visibleRemoteCarrierExits") &&
+    browserJs.includes("This device") &&
+    browserJs.includes("Seed Exit Node") &&
+    browserJs.includes("Shared Exit Node") &&
+    browserJs.includes("remote_exit_id") &&
+    browserJs.includes('requestRuntimeOpen(nextUrl, { history: "replace" })') &&
+    browserJs.includes("exitSelect.disabled = loading") &&
+    browserJs.includes("selectedRemoteExitId = currentRemoteExitId") &&
+    !browserJs.includes("Exit changed. Open the address again to use it.") &&
+    browserJs.includes("Browser could not use the selected Exit Node.") &&
+    browserInputSurface.includes('target.closest?.("#browser-settings-panel")') &&
+    browserInputSurface.includes('target.id === "browser-exit"') &&
     browserJs.includes("elastos.browser.open-result/v1") &&
     browserJs.includes("Browser failed closed") &&
     browserJs.includes("Blocked by Browser Exit policy") &&
@@ -198,8 +351,11 @@ assert(
 assert(
   browserJs.includes("isMissingRuntimePageError") &&
     browserJs.includes("scheduleRemoteReconnect") &&
-    browserJs.includes("Browser Runtime page heartbeat was lost.") &&
-    browserJs.includes("Remote display reconnected through Runtime.") &&
+    browserJs.includes("function scheduleRemoteReconnect(message, { retry = true } = {})") &&
+    browserRemoteDisplay.includes('onRecoveryRequired(message, { retry: false })') &&
+    browserJs.includes("recoverMissingRuntimePage") &&
+    browserJs.includes("Browser session heartbeat was lost.") &&
+    browserJs.includes("Browser session reconnected.") &&
     browserJs.includes("track.addEventListener(\"mute\"") &&
     browserJs.includes("track.addEventListener(\"ended\"") &&
     !browserJs.includes("Browser session ended. Open the address again") &&
@@ -238,13 +394,47 @@ assert(
     exitProvider.includes("direct host networking") &&
     exitProvider.includes("deny_unknown_fields") &&
     exitProvider.includes("allowed_hosts") &&
+    exitProvider.includes("allowed_private_targets") &&
+    exitProvider.includes("allows_private_target") &&
+    exitProvider.includes("stream_backend_can_allow_exact_runtime_gateway_private_target_only") &&
+    exitProvider.includes("remote_carrier_exits") &&
+    exitProvider.includes("elastos.exit.remote-carrier.discovery/v1") &&
+    exitProvider.includes("elastos.exit.remote-carrier.quote/v1") &&
+    exitProvider.includes("elastos.exit.remote-carrier-session/v1") &&
+    exitProvider.includes("grant_id") &&
+    exitProvider.includes("expires_at") &&
+    exitProvider.includes('"state": exit.state(now)') &&
+    exitProvider.includes("remote Carrier Exit grant_id must be a safe identifier") &&
+    exitProvider.includes("Remote Carrier Exit grant is expired") &&
+    exitProvider.includes("exit_permission_denied") &&
+    exitProvider.includes("exit_quota_exceeded") &&
+    exitProvider.includes("remote_carrier_exit_discovery_is_principal_scoped_and_policy_filtered") &&
+    exitProvider.includes("remote_carrier_exit_expired_grant_is_diagnosable_but_not_usable") &&
+    exitProvider.includes("remote_carrier_exit_enforces_active_stream_quota") &&
+    exitProvider.includes("max_active_streams_per_principal") &&
+    exitProvider.includes("remote_carrier_exit_enforces_principal_stream_quota_on_shared_grant") &&
+    exitProvider.includes('"byte_transport": "carrier_stream"') &&
+    remoteCarrierExitArtifactReadiness.includes("browser_exit_stream") &&
+    remoteCarrierExitArtifactReadiness.includes("elastos.browser.carrier-stream/v1") &&
+    remoteCarrierExitArtifactReadiness.includes("elastos.exit.remote-carrier-session/v1") &&
+    remoteCarrierExitArtifactReadinessSmoke.includes("stale_gateway_rejected") &&
+    remoteCarrierExitArtifactReadinessSmoke.includes("stale_exit_provider_rejected") &&
+    remoteCarrierExitReadiness.includes("config_sha256") &&
+    remoteCarrierExitReadiness.includes("sha256File(args.sourceConfig)") &&
+    remoteCarrierExitReadinessSmoke.includes("hash-bound to source and exit configs") &&
+    gatewayBrowserApi.includes("browser_visible_remote_carrier_exits") &&
+    gatewayBrowserApi.includes("scrub_exit_authority_fields") &&
+    gatewayBrowserApi.includes('"remote_carrier_exit_count"') &&
+    gatewayBrowserApi.includes('"remote_carrier_exits"') &&
+    gatewayBrowserApi.includes('"allowed_principals"') &&
+    gatewayBrowserApi.includes('"connect_ticket"') &&
     exitProvider.includes("max_body_bytes") &&
     exitProvider.includes("elastos.exit.http-fetch.result/v1") &&
     exitProvider.includes("elastos.exit.stream-session/v1") &&
     exitProvider.includes("elastos.adapter-ipc/v1") &&
     exitProvider.includes("elastos.exit.relay-ipc/v1") &&
     !exitProvider.includes("runtime_stream_path"),
-  "Exit provider must expose typed HTTP/stream exits without raw host networking or public Runtime stream-path authority",
+  "Exit provider must expose typed HTTP/stream/remote-Carrier exits with permission/accounting and without raw host networking or public Runtime stream-path authority",
 );
 
 assert(
@@ -260,9 +450,25 @@ assert(
     browserEngineAdapter.includes("validate_supervisor_result") &&
     browserEngineAdapter.includes("display_modes") &&
     browserEngineAdapter.includes("webrtc_signal") &&
+    browserEngineAdapter.includes("diagnostics") &&
+    browserEngineAdapter.includes("/pages/{page_id}/diagnostics") &&
     browserEngineAdapter.includes("direct_network") &&
-    browserEngineAdapter.includes("wallet_injection"),
+    browserEngineAdapter.includes("wallet_injection") &&
+    read("capsules/browser-engine-adapter/capsule.json").includes("diagnostics"),
   "Browser Engine Adapter must be an explicit fail-closed adapter contract, not host browser authority",
+);
+
+assert(
+  browserPlaywrightEngine.includes("state.runtimeProxy.activePrincipalId = normalizePrincipalId(request.principal_id)") &&
+    browserPlaywrightEngine.includes("principal_id: normalizePrincipalId(runtimeProxy?.activePrincipalId)") &&
+    browserPlaywrightEngine.includes("function normalizePrincipalId") &&
+    browserLocalExit.includes("elastos.browser.local-exit.relay-open/v1") &&
+    browserLocalExit.includes("relay_open_log_preserves_principal_attribution") &&
+    browserRuntimeProxySmoke.includes("smoke_principal_id=") &&
+    browserRuntimeProxySmoke.includes("principal_id: process.env.BROWSER_SMOKE_PRINCIPAL_ID") &&
+    browserRuntimeProxySmoke.includes("localExitRelayOpenLogs") &&
+    browserRuntimeProxySmoke.includes("local Exit relay-open did not preserve the launch principal_id"),
+  "Playwright proof proxy must preserve launch principal attribution in local Exit relay-open proofs",
 );
 
 assert(
@@ -281,6 +487,14 @@ assert(
 assert(
   browserEngineSupervisor.includes("display_capabilities: DisplayCapabilities") &&
     browserEngineSupervisor.includes("config.display_capabilities.audio") &&
+    browserEngineSupervisor.includes('"view": {') &&
+    browserEngineSupervisor.includes('"mode": "native_surface"') &&
+    browserEngineSupervisor.includes('"width": viewport.width') &&
+    browserEngineAdapter.includes("validate_native_surface_geometry") &&
+    browserEngineAdapter.includes("native_surface_supervisor_result_requires_view_geometry") &&
+    browserEngineAdapter.includes(
+      "native_surface display dimensions must match Runtime view geometry",
+    ) &&
     browserNativeOperatorConfig.includes("nativeAudio: false") &&
     browserNativeOperatorConfig.includes("nativeVideo: false") &&
     browserNativeOperatorConfig.includes("--native-audio") &&
@@ -295,20 +509,14 @@ assert(
 );
 
 assert(
-  browserJs.includes(
-    "Diagnostic Browser display mode requires debug=1 or metrics=1.",
-  ) &&
-    browserJs.includes(
-      'if (value === "diagnostic" || value === "diagnostic_frame")',
-    ) &&
-    !browserJs.includes(
-      '["webrtc_remote_display", "native_surface", "diagnostic_frame"].includes(value)',
-    ) &&
-    browserDisplayModeSmoke.includes("diagnostic_requires_debug") &&
-    browserCapsuleDoc.includes(
-      "`diagnostic_frame` is accepted only when Browser is opened with explicit",
-    ),
-  "Browser diagnostic display mode must remain debug-only and never become a normal product fallback",
+  !browserJs.includes(["diagnostic", "frame"].join("_")) &&
+    !browserJs.includes(["runtime", "frame"].join("_")) &&
+    !browserDisplayModeSmoke.includes(["diagnostic", "frame"].join("_")) &&
+    !browserDisplayModeSmoke.includes(["runtime", "frame"].join("_")) &&
+    !browserCapsuleDoc.includes(["diagnostic", "frame"].join("_")) &&
+    !browserCapsuleDoc.includes("/api/apps/browser/pages/:page_id/frame") &&
+    !browserCapsuleDoc.includes("Playwright Chromium frame/input"),
+  "Browser diagnostic/runtime frame display paths must be removed from product Browser code",
 );
 
 assert(
@@ -318,6 +526,7 @@ assert(
     browserJs.includes('nextPeerConnection.addTransceiver("audio"') &&
     browserJs.includes('event?.type === "resize"') &&
     browserJs.includes('event?.type === "paste_text"') &&
+    browserJs.includes('event?.type === "file_upload"') &&
     browserJs.includes("Remote audio enabled.") &&
     browserDisplayModeSmoke.includes("audio_invariants_checked"),
   "Browser UI must keep WebRTC audio explicit, user-gesture unlocked, resize protocol-aware, and covered by display-mode smoke",
@@ -362,7 +571,9 @@ assert(
 assert(
   gatewayBrowserApi.includes("browser_attach_runtime_stream_path") &&
     gatewayBrowserApi.includes("browser_stream_relay") &&
-    gatewayBrowserApi.includes("elastos.exit.relay-open/v1") &&
+    gatewayBrowserApi.includes("read_browser_relay_open_line") &&
+    gatewayBrowserApi.includes("BROWSER_RUNTIME_RELAY_OPEN_MAX_BYTES") &&
+    gatewayBrowserApi.includes("write_all(&open_line)") &&
     gatewayBrowserApi.includes("copy_bidirectional") &&
     gatewayBrowserApi.includes("spawn_browser_runtime_stream_listener") &&
     gatewayBrowserApi.includes("validate_browser_stream_receipt") &&
@@ -408,6 +619,14 @@ assert(
 );
 
 assert(
+  browserSelkiesControlService.includes('config.signaling_protocol || "auto"') &&
+    browserSelkiesControlServiceSmoke.includes('response.signaling_protocol !== "auto"') &&
+    browserSelkiesControlServiceSmoke.includes('signaling_protocol: "auto"') &&
+    browserSelkiesControlServiceSmoke.includes("fake-selkies-force-legacy"),
+  "Selkies signaling must default to auto while keeping explicit legacy fallback coverage",
+);
+
+assert(
   browserSelkiesControlService.includes("eip6963:announceProvider") &&
     browserSelkiesControlService.includes("wallet_getPermissions") &&
     browserSelkiesControlService.includes("eth_coinbase") &&
@@ -426,14 +645,31 @@ assert(
     ) &&
     browserSelkiesControlService.includes("approval_required") &&
     browserSelkiesControlService.includes("personal_sign") &&
+    browserSelkiesControlService.includes("eth_signTypedData_v4") &&
     browserSelkiesControlService.includes("eth_sendTransaction") &&
-    browserSelkiesControlService.includes("runtimePost(state.approvalUrl") &&
+    browserSelkiesControlService.includes("Runtime.addBinding") &&
+    browserSelkiesControlService.includes("__elastosBrowserWalletRuntime") &&
+    browserSelkiesControlService.includes('runtimePost("approval"') &&
+    browserSelkiesControlService.includes("walletApprovalPending") &&
+    browserSelkiesControlService.includes("waitForCachedWalletApproval") &&
+    browserSelkiesControlService.includes("approval_reuse") &&
+    browserSelkiesControlService.includes("request_suffix") &&
+    !browserSelkiesControlService.includes("runtimePost(state.approvalUrl") &&
     browserSelkiesControlService.includes(
       "if (status.transaction_hash) return status.transaction_hash",
     ) &&
+    browserSelkiesControlService.includes('runtimePost("transactionBroadcast"') &&
     browserSelkiesControlService.includes(
-      "runtimePost(state.transactionBroadcastUrl",
+      "Runtime transaction broadcast completed without a transaction hash.",
     ) &&
+    browserSelkiesControlService.includes("transaction_broadcast") &&
+    !browserSelkiesControlService.includes("bridgeUrl:") &&
+    !browserSelkiesControlService.includes("approvalUrl:") &&
+    !browserSelkiesControlService.includes("transactionUrl:") &&
+    !browserSelkiesControlService.includes("readUrl:") &&
+    !browserSelkiesControlService.includes("transactionBroadcastUrl:") &&
+    !browserSelkiesControlService.includes("approvalStatusUrl:") &&
+    !browserSelkiesControlService.includes("runtimePost(state.transactionBroadcastUrl") &&
     browserSelkiesControlService.includes("waitForApproval") &&
     browserSelkiesControlService.includes(
       "__elastosBrowserNavigationPolicyInstalled",
@@ -452,8 +688,29 @@ assert(
     browserHostedProductWalletSmoke.includes("eip6963") &&
     browserHostedProductWalletSmoke.includes("wallet_getPermissions") &&
     browserHostedProductWalletSmoke.includes("approval_required") &&
-    browserHostedProductWalletSmoke.includes("addedEscChain"),
-  "Hosted Browser wallet bridge must be fail-present and expose modern injected-wallet discovery, Runtime approval routing, and permission compatibility without giving pages raw wallet or node authority",
+    browserHostedProductWalletSmoke.includes("addedEscChain") &&
+    browserSelkiesControlServiceSmoke.includes("wallet:smoke-eth-sign") &&
+    browserSelkiesControlServiceSmoke.includes("wallet:smoke-typed-data") &&
+    browserSelkiesControlServiceSmoke.includes("eth_signTypedData_v4") &&
+    browserSelkiesControlServiceSmoke.includes("Runtime wallet eth_sign request was not normalized to personal_sign") &&
+    browserCapsuleDoc.includes("The product Browser control service exposes a constrained `window.ethereum`") &&
+    browserCapsuleDoc.includes("Playwright proof remains a") &&
+    browserCapsuleDoc.includes("diagnostic/account-chain/personal-sign surface"),
+  "Hosted Browser wallet bridge must be fail-present, coalesce duplicate in-flight signature approvals, and expose modern injected-wallet discovery, Runtime approval routing, and permission compatibility without giving pages raw wallet or node authority",
+);
+
+assert(
+  gatewayBrowserApi.includes('"eth_getTransactionByHash" =>') &&
+    gatewayBrowserApi.includes('.get("transaction")') &&
+    gatewayBrowserApi.includes(
+      "chain provider transaction response is missing transaction",
+    ) &&
+    gatewayBrowserApi.includes('"eth_getTransactionReceipt" =>') &&
+    gatewayBrowserApi.includes('.get("receipt")') &&
+    gatewayBrowserApi.includes(
+      "chain provider receipt response is missing receipt",
+    ),
+  "Browser wallet reads must return raw EVM transaction and receipt objects, not chain-provider wrapper receipts",
 );
 
 assert(
@@ -502,11 +759,31 @@ assert(
     'const BROWSER_PROGRAM_ENV = "ELASTOS_BROWSER_SELKIES_BROWSER_PROGRAM"',
   ) &&
     browserPerLaunchSelkiesSupervisor.includes("--browser-program") &&
+    browserPerLaunchSelkiesSupervisor.includes("PROFILE_ROOT_ENV") &&
+    browserPerLaunchSelkiesSupervisor.includes("DEFAULT_STARTUP_TIMEOUT_MS = 90000") &&
+    browserPerLaunchSelkiesSupervisor.includes("readinessDiagnostics(outDir)") &&
+    browserPerLaunchSelkiesSupervisor.includes("`profile-${digest}`") &&
+    !browserPerLaunchSelkiesSupervisor.includes("`principal-${digest}`") &&
+    browserPerLaunchSelkiesSupervisor.includes("--profile-dir") &&
     browserPerLaunchSelkiesSupervisor.includes("result.control_socket_path = controlSocket") &&
     browserPerLaunchSelkiesSupervisor.includes("result.isolated_session = true") &&
     browserPerLaunchSelkiesSupervisor.includes("killProcessGroup(target)") &&
+    browserSelkiesRuntimeExitTarget.includes("--profile-dir") &&
+    browserSelkiesRuntimeExitTarget.includes("/var/lib/elastos-browser-profile") &&
+    browserSelkiesRuntimeExitTarget.includes(".elastos-profile.lock") &&
+    browserSelkiesRuntimeExitTarget.includes("profile_persistent: true") &&
+    !browserSelkiesRuntimeExitTarget.includes("/tmp/chromium-profile") &&
     browserPerLaunchSelkiesSupervisorSmoke.includes(
       "ELASTOS_BROWSER_SERVICE_HOME",
+    ) &&
+    browserPerLaunchSelkiesSupervisorSmoke.includes(
+      "ELASTOS_BROWSER_PROFILE_ROOT",
+    ) &&
+    browserPerLaunchSelkiesSupervisorSmoke.includes(
+      "profile_persistent === true",
+    ) &&
+    browserPerLaunchSelkiesSupervisorSmoke.includes(
+      "/^profile-[0-9a-f]{64}$/",
     ) &&
     browserPerLaunchSelkiesSupervisorSmoke.includes(
       "stream:per-launch-smoke:a",
@@ -523,13 +800,713 @@ assert(
     browserPerLaunchSelkiesSupervisorSmoke.includes(
       "POST\", a.control_socket_path, \"/shutdown\"",
     ),
-  "Per-launch Browser supervisor must use explicit executable discovery, return page-scoped control sockets, prove two isolated sessions, and shut them down",
+  "Per-launch Browser supervisor must use explicit executable discovery, return page-scoped control sockets, persist per-principal Browser profiles, fail fast with diagnostics, prove two isolated sessions, and shut them down",
+);
+
+assert(
+  browserSourceHomeConfig.includes("SUPPORTED_PLATFORMS") &&
+    browserSourceHomeConfig.includes("browser-vm-product") &&
+    browserSourceHomeConfig.includes("chromium_microvm") &&
+    browserSourceHomeConfig.includes("browser-vm-engine-supervisor") &&
+    browserSourceHomeConfig.includes("browser-vm-local-crosvm-launcher") &&
+    browserSourceHomeConfig.includes('path.join(args.dataDir, "bvm")') &&
+    browserSourceHomeConfig.includes("ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR") &&
+    browserSourceHomeConfig.includes("ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE") &&
+    browserSourceHomeConfig.includes("ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT") &&
+    browserSourceHomeConfig.includes("ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_SCRIPT") &&
+    browserVmLocalCrosvmLauncher.includes("refillPreparedRootfsPoolSync") &&
+    browserVmLocalCrosvmLauncher.includes("function rootfsPoolRefillCommand") &&
+    browserVmLocalCrosvmLauncher.includes("return { command: refillScript, args: [] }") &&
+    browserVmLocalCrosvmLauncher.includes("rootfs-pool-refill-sync.log") &&
+    browserVmLocalCrosvmLauncher.includes("prepared rootfs pool synchronous refill completed") &&
+    browserSourceHomeConfig.includes('"pool-required"') &&
+    browserSourceHomeConfig.includes('display_modes: ["webrtc_remote_display"]') &&
+    !browserSourceHomeConfig.includes("preferred_display_mode") &&
+    browserSourceHomeConfig.includes("relay_ipc") &&
+    browserSourceHomeConfig.includes("relay_ipc: true") &&
+    browserSourceHomeConfig.includes("-relay.sock") &&
+    browserSourceHomeConfig.includes("browser-local-exit.json") &&
+    browserSourceHomeConfig.includes("elastos.browser.local-exit.config/v1") &&
+    browserSourceHomeConfig.includes("runtimeGatewayPrivateTargets") &&
+    browserSourceHomeConfig.includes("ELASTOS_BROWSER_RUNTIME_GATEWAY_PORTS") &&
+    browserSourceHomeConfig.includes('host: "localhost"') &&
+    browserSourceHomeConfig.includes('ports: [80, 443]') &&
+    browserSourceHomeConfig.includes("relay_ipc_path") &&
+    browserSourceHomeConfig.includes("control_socket_path") &&
+    browserSourceHomeConfig.includes("/tmp/elastos-browser-vm-control-${args.platform}.sock") &&
+    browserSourceHomeConfig.includes("ELASTOS_BROWSER_VM_CONTROL_SOCKET") &&
+    !browserSourceHomeConfig.includes("ELASTOS_BROWSER_VM_PROFILE_DISK_ROOT") &&
+    browserSourceHomeConfig.includes("ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS") &&
+    browserSourceHomeConfig.includes('const VM_ADAPTER_MAX_ACTIVE_SESSIONS = "4"') &&
+    browserSourceHomeConfig.includes('const VM_CONTROL_MAX_ACTIVE_PAGES = "1"') &&
+    browserSourceHomeConfigSmoke.includes("multiple isolated Browser VM sessions") &&
+    browserSourceHomeConfigSmoke.includes("single active Browser VM page") &&
+    browserSourceHomeConfig.includes('const VM_IDLE_KEEPALIVE_MS = "300000"') &&
+    browserSourceHomeConfig.includes('const VM_LINUX_IDLE_KEEPALIVE_MS = "0"') &&
+    browserSourceHomeConfig.includes('const VM_REUSE_IDLE_VMS = "1"') &&
+    browserSourceHomeConfig.includes('const VM_LINUX_REUSE_IDLE_VMS = "0"') &&
+    browserSourceHomeConfig.includes("ELASTOS_BROWSER_VM_REUSE_IDLE_VMS") &&
+    browserSourceHomeConfig.includes("ELASTOS_BROWSER_REMOTE_VZ_LAUNCH_TIMEOUT_MS") &&
+    browserSourceHomeConfig.includes('const VM_EGRESS_MAX_SESSIONS = "16"') &&
+    browserSourceHomeConfigSmoke.includes("bound pre-opened Runtime egress streams") &&
+    browserSourceHomeConfigSmoke.includes("Runtime launch descriptors, not a global profile root env") &&
+    browserSourceHomeConfigSmoke.includes("must not use the old hosted Browser profile root env") &&
+    browserSourceHomeConfigSmoke.includes("Linux VM adapter must not retain warm crosvm sessions") &&
+    browserSourceHomeConfigSmoke.includes("Mac VZ source-home Browser config may keep same-principal Browser VMs warm briefly") &&
+    browserSourceHomeConfigSmoke.includes("pin the remote launcher budget instead of inheriting ambient env") &&
+    browserSourceHomeConfig.includes("ELASTOS_BROWSER_VM_MEDIA_RELAY_HOST_IPV4") &&
+    browserSourceHomeConfigSmoke.includes("Linux source-home Browser config must default to the local crosvm VM control launcher") &&
+    browserSourceHomeConfigSmoke.includes("Linux source-home Browser config must use a prepared rootfs pool") &&
+    browserSourceHomeConfigSmoke.includes("VM Browser source-home config must advertise only the WebRTC product display mode") &&
+    browserSourceHomeConfig.includes("deriveGuestIpv4") &&
+    browserSourceHomeConfig.includes("turnIpv4HostFromUrl") &&
+    browserSourceHomeConfig.includes("runtimeTurnEnvCandidates") &&
+    browserSourceHomeConfig.includes("turn-credentials.env") &&
+    browserSourceHomeConfig.includes("ELASTOS_BROWSER_RUNTIME_TURN_ENV") &&
+    browserSourceHomeConfig.includes("ELASTOS_BROWSER_VM_CONTROL_STATUS_PROBE_TIMEOUT_MS") &&
+    browserSourceHomeConfig.includes("ELASTOS_BROWSER_VM_DEBUG_HOLD_ON_OPEN_ERROR_MS") &&
+    browserSourceHomeConfig.includes("isRemoteVzControlLauncher") &&
+    browserSourceHomeConfig.includes("remoteVzControlLauncher") &&
+    browserSourceHomeConfig.includes('? "/tmp/evzs"') &&
+    browserSourceHomeConfig.includes("ELASTOS_BROWSER_VM_CONTROL_READY_TIMEOUT_MS") &&
+    browserSourceHomeConfigSmoke.includes("Linux remote VZ source-home Browser config must use the remote VZ VM root") &&
+    browserSourceHomeConfigSmoke.includes("Linux remote VZ source-home Browser config must not inherit local crosvm rootfs-pool env") &&
+    browserSourceHomeConfigSmoke.includes("Linux remote VZ source-home Browser config must let the remote launcher derive an inner guest-ready margin") &&
+    browserSourceHomeConfigSmoke.includes("assertNoRemoteVzLocalTurnEnv") &&
+    browserSourceHomeConfigSmoke.includes("Remote VZ source-home Browser config") &&
+    browserSourceHomeConfigSmoke.includes("Linux remote VZ source-home Browser config") &&
+    browserSourceHomeConfigSmoke.includes("must not inherit local") &&
+    browserSourceHomeConfigSmoke.includes("Remote VZ source-home Browser config must let the remote launcher derive an inner guest-ready margin") &&
+    browserSourceHomeConfigSmoke.includes("Local VZ source-home Browser config must keep the guest control readiness budget bounded") &&
+    browserRuntimeTurn.includes("elastos.browser.runtime-turn/v1") &&
+    browserRuntimeTurn.includes("turnserver") &&
+    browserRuntimeTurn.includes("ELASTOS_BROWSER_VM_TURNSERVER_BIN") &&
+    setupSourceHome.includes("ELASTOS_BROWSER_VM_TURNSERVER_BIN") &&
+    browserSourceHomeConfig.includes("ELASTOS_BROWSER_VM_TURNSERVER_BIN") &&
+    browserVmLocalCrosvmLauncher.includes("ELASTOS_BROWSER_VM_TURNSERVER_BIN") &&
+    browserRuntimeTurn.includes("DEFAULT_DARWIN_MEDIA_HOST_IPV4") &&
+    browserRuntimeTurn.includes("DEFAULT_DARWIN_MEDIA_GUEST_IPV4") &&
+    browserRuntimeTurn.includes("ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY=relay") &&
+    browserRuntimeTurn.includes("ELASTOS_BROWSER_VM_MEDIA_RELAY_HOST_IPV4") &&
+    browserRuntimeTurn.includes("ELASTOS_BROWSER_VM_MEDIA_RELAY_GUEST_IPV4") &&
+    browserRuntimeTurn.includes("ELASTOS_BROWSER_VM_MEDIA_RELAY_PREFIX") &&
+    browserRuntimeTurn.includes("detectDefaultRouteIpv4") &&
+    browserRuntimeTurn.includes('"route", "get", "1.1.1.1"') &&
+    browserRuntimeTurn.includes("pushTurnUrls") &&
+    browserRuntimeTurn.includes("runtime TURN did not become reachable") &&
+    browserRuntimeTurnSmoke.includes("elastos.browser.runtime-turn-smoke/v1") &&
+    browserRuntimeTurnSmoke.includes("turn:10.44.0.10:3478?transport=udp") &&
+    browserRuntimeTurnSmoke.includes("ELASTOS_BROWSER_VM_MEDIA_RELAY_GUEST_IPV4=10.44.0.2") &&
+    browserRuntimeTurnSmoke.includes("runtime TURN env must use only credentialed ICE_SERVERS_JSON") &&
+    setupSourceHome.includes("start_browser_runtime_turn") &&
+    setupSourceHome.includes("skip Browser runtime TURN relay: remote Browser VM control is preserved") &&
+    setupSourceHome.includes("has_remote_browser_vm_control_config") &&
+    setupSourceHome.includes("use existing Browser runtime TURN env") &&
+    setupSourceHome.includes("browser-runtime-turn.mjs") &&
+    setupSourceHomeBrowserConfigSmoke.includes("shared-runtime-turn-secret") &&
+    setupSourceHomeBrowserConfigSmoke.includes("use existing Browser runtime TURN env") &&
+    browserSourceHomeConfigSmoke.includes("runtime-turn-user") &&
+    browserSourceHomeConfigSmoke.includes("guest-control status probe diagnostics") &&
+    browserSourceHomeConfigSmoke.includes("open-error debug hold diagnostics") &&
+    browserSourceHomeConfigSmoke.includes("Mac source-home Browser config must load runtime TURN credentials") &&
+    browserSourceHomeConfig.includes('engine_mode: "vm"') &&
+    browserSourceHomeConfig.includes("source-home-browser-exit") &&
+    !browserSourceHomeConfig.includes("--engine-mode") &&
+    !browserSourceHomeConfig.includes("hosted-proof") &&
+    !browserSourceHomeConfig.includes("allow-insecure-hosted-proof") &&
+    !browserSourceHomeConfig.includes("insecure_hosted_proof") &&
+    !browserSourceHomeConfig.includes("mac-container-product") &&
+    !browserSourceHomeConfig.includes("hosted-product") &&
+    browserCapsuleDoc.includes("The source-home Browser config is VM-only") &&
+    browserCapsuleDoc.includes("does not expose a hosted-proof") &&
+    browserVmTargetDoc.includes("Source-home config is VM-only") &&
+    setupSourceHome.includes("browser-source-home-config.mjs") &&
+    setupSourceHome.includes("browser-vm-engine-supervisor.mjs") &&
+    setupSourceHome.includes("browser-vm-control-service.mjs") &&
+    setupSourceHome.includes("browser-vm-remote-vz-launcher.mjs") &&
+    setupSourceHome.includes("browser-vm-local-crosvm-launcher.mjs") &&
+    setupSourceHome.includes("browser-vm-prepare-rootfs-pool.mjs") &&
+    setupSourceHome.includes("browser-vz-engine-supervisor") &&
+    setupSourceHome.includes("build Browser VZ engine supervisor") &&
+    setupSourceHome.includes("-p elastos-vz --bin browser-vz-engine-supervisor") &&
+    setupSourceHome.includes("browser-vm-engine-preflight.sh") &&
+    setupSourceHome.includes("browser-vm-artifact-preflight.sh") &&
+    setupSourceHome.includes("browser-vm-target-preflight.sh") &&
+    setupSourceHome.includes("setup-source-home-browser-artifacts.sh") &&
+    setupSourceHomeBrowserArtifacts.includes("elastos.setup-source-home.browser-artifacts/v1") &&
+    setupSourceHomeBrowserArtifacts.includes("managed-runtimes") &&
+    setupSourceHomeBrowserArtifacts.includes("browser-vm/rootfs.ext4") &&
+    setupSourceHomeBrowserArtifacts.includes("bin/crosvm") &&
+    setupSourceHomeBrowserArtifacts.includes("browser-vm/initrd") &&
+    setupSourceHomeBrowserArtifacts.includes("bin/initrd") &&
+    setupSourceHomeBrowserArtifactsSmoke.includes("elastos.setup-source-home.browser-artifacts-smoke/v1") &&
+    setupSourceHomeBrowserArtifactsSmoke.includes("existing real kernel file must not be replaced") &&
+    setupSourceHomeBrowserArtifactsSmoke.includes("Linux managed setup must not create the Mac VZ initrd path") &&
+    setupSourceHomeBrowserArtifactsSmoke.includes("Mac managed setup must not create a crosvm link") &&
+    setupSourceHome.includes("browser-selkies-control-service.mjs") &&
+    setupSourceHome.includes("browser-vm-selkies-start") &&
+    setupSourceHome.includes("browser-vm-init") &&
+    setupSourceHome.includes("extract_browser_vm_init") &&
+    setupSourceHome.includes("extract_browser_vm_selkies_start") &&
+    setupSourceHome.includes("write_browser_vm_target_manifest") &&
+    setupSourceHome.includes('"guarantee_level": "mechanism_microvm"') &&
+    setupSourceHome.includes("/etc/elastos/browser-vm-target.json") &&
+    setupSourceHome.includes("resolve_browser_vm_native_proxy_source") &&
+    setupSourceHome.includes("validate_linux_guest_binary") &&
+    setupSourceHome.includes("/opt/elastos/bin/browser-native-proxy-engine") &&
+    setupSourceHome.includes("refresh_browser_vm_initrd_control_service") &&
+    setupSourceHome.includes("refresh_browser_vm_rootfs_files") &&
+    setupSourceHome.includes("ELASTOS_DEBUGFS_BIN") &&
+    setupSourceHome.includes("debugfs") &&
+    setupSourceHome.includes("ELASTOS_NODE_BIN") &&
+    setupSourceHome.includes("ELASTOS_BROWSER_VM_CONTROL_LAUNCHER") &&
+    setupSourceHome.includes("existing_remote_browser_vm_config") &&
+    setupSourceHome.includes("preserve existing remote Browser VM control config") &&
+    setupSourceHome.includes("SETUP_SOURCE_HOME_CONFIG_ONLY") &&
+    setupSourceHomeBrowserConfigSmoke.includes("elastos.setup-source-home.browser-config-smoke/v1") &&
+    setupSourceHomeBrowserConfigSmoke.includes("did not preserve the existing remote control socket") &&
+    setupSourceHomeBrowserConfigSmoke.includes("remote VZ setup must not inherit local crosvm rootfs pool env") &&
+    setupSourceHomeBrowserConfigSmoke.includes("remote VZ setup must not inherit local") &&
+    !setupSourceHome.includes("ELASTOS_BROWSER_ENGINE_MODE") &&
+    !setupSourceHome.includes("ELASTOS_BROWSER_ALLOW_INSECURE_HOSTED_PROOF") &&
+    !setupSourceHome.includes("--mac-supervisor") &&
+    !setupSourceHome.includes("browser-mac-container-supervisor") &&
+    !setupSourceHome.includes("browser-per-launch-selkies-supervisor"),
+  "Source-home Browser setup must be VM-only and must not expose hosted Browser runtimes as product config",
+);
+
+assert(
+  gatewayHomeSystemTests.includes('"display_modes": ["webrtc_remote_display"]') &&
+    !gatewayHomeSystemTests.includes('"runtime_frame"') &&
+    !gatewayHomeSystemTests.includes('"diagnostic_frame"'),
+  "Home/System Browser fixtures must not advertise removed Browser display modes",
+);
+
+assert(
+  !exists("scripts/browser-mac-container-preflight.sh") &&
+    !exists("scripts/browser-mac-container-supervisor.mjs") &&
+    !browserEngineAdapter.includes("per_launch_mac_container_target") &&
+    !browserEngineAdapter.includes("cleanup_mac_container_session") &&
+    !browserEngineAdapter.includes("apple_container_selkies_webrtc"),
+  "Removed Mac container Browser product path must not remain wired into scripts or adapter code",
+);
+
+assert(
+  browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_REMOTE_VZ_SSH") &&
+    browserVmRemoteVzLauncher.includes("-R") &&
+    !browserVmRemoteVzLauncher.includes("control-forward") &&
+    !browserVmRemoteVzLauncher.includes("waitForLocalTcpPort") &&
+    browserVmRemoteVzLauncher.includes("control-stdio") &&
+    browserVmRemoteVzLauncher.includes("startLocalTcpToUnixBridge") &&
+    browserVmRemoteVzLauncher.includes("startLocalUnixToRemoteUnixBridge") &&
+    browserVmRemoteVzLauncher.includes("waitForLocalControlHttp") &&
+    browserVmRemoteVzLauncher.includes("def write_all(fd, data):") &&
+    browserVmRemoteVzLauncher.includes("while sent < len(view):") &&
+    browserVmRemoteVzLauncher.includes("write_all(1, data)") &&
+    !browserVmRemoteVzLauncher.includes("os.write(1, data)") &&
+    browserVmRemoteVzLauncher.includes("startRemoteUnixToTcpBridge") &&
+    !browserVmRemoteVzLauncher.includes("startRemoteTcpToUnixBridge") &&
+    browserVmRemoteVzLauncher.includes("await startRemoteRelayTunnel") &&
+    browserVmRemoteVzLauncher.includes("await startControlTunnel") &&
+    browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_VM_ICE_SERVER") &&
+    browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_VM_MEDIA_RELAY_HOST_IPV4") &&
+    browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_REMOTE_VZ_PROFILE_ROOT") &&
+    browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_REMOTE_VZ_TURN_ENV") &&
+    browserVmRemoteVzLauncher.includes("optionalRemoteEnvExports") &&
+    browserVmRemoteVzLauncher.includes("remoteRuntimeTurnEnv") &&
+    browserVmRemoteVzLauncher.includes("remoteProfileDiskPath") &&
+    browserVmRemoteVzLauncher.includes("BrowserProfiles/default/profile.ext4") &&
+    browserVmRemoteVzLauncher.includes('ELASTOS_BROWSER_VM_CONTROL_READY_TIMEOUT_MS') &&
+    browserVmRemoteVzLauncher.includes("remoteControlReadyTimeoutMs") &&
+    browserVmRemoteVzLauncher.includes("launchTimeoutMs - 30_000") &&
+    browserVmRemoteVzLauncher.includes("120_000") &&
+    browserVmRemoteVzLauncher.includes("remoteDebugHoldOnOpenErrorMs") &&
+    browserVmRemoteVzLauncher.includes("remainingLaunchMarginMs") &&
+    browserVmRemoteVzLauncher.includes("launchTimeoutMs - readyTimeoutMs - 5_000") &&
+    browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_VM_CONTROL_PROXY_REQUEST_TIMEOUT_MS") &&
+    browserVmRemoteVzLauncher.includes('defaultControlProxyRequestTimeoutMs = "120000"') &&
+    browserVmRemoteVzLauncher.includes("process.env.ELASTOS_BROWSER_VM_CONTROL_PROXY_REQUEST_TIMEOUT_MS || defaultControlProxyRequestTimeoutMs") &&
+    browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_VM_CONTROL_STATUS_PROBE_TIMEOUT_MS") &&
+    browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_VM_DEBUG_HOLD_ON_OPEN_ERROR_MS") &&
+    browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS") &&
+    browserVmRemoteVzLauncher.includes('ELASTOS_BROWSER_REMOTE_VZ_RELAY_MAX_SESSIONS || "16"') &&
+    browserVmRemoteVzLauncher.includes("remoteSupervisorCleanupCommand") &&
+    browserVmRemoteVzLauncher.includes("remoteStaleSupervisorCleanupCommand") &&
+    browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_REMOTE_VZ_REAP_STALE_SUPERVISORS") &&
+    browserVmRemoteVzLauncher.includes("remoteStaleRelayCleanupCommand") &&
+    browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_REMOTE_VZ_REAP_STALE_RELAYS") &&
+    browserVmRemoteVzLauncher.includes("[remote-vz cleanup] reaping stale relay shim") &&
+    browserVmRemoteVzLauncher.includes('proc_command=$(ps -p "$pid" -o command= 2>/dev/null || true)') &&
+    browserVmRemoteVzLauncher.includes("[remote-vz cleanup] reaping stale browser-vz-engine-supervisor") &&
+    browserVmRemoteVzLauncher.includes("supervisor-${suffix}.pid") &&
+    browserVmRemoteVzLauncher.includes("cleanup_supervisor") &&
+    browserVmRemoteVzLauncher.includes("remoteRelayCleanupCommand") &&
+    browserVmRemoteVzLauncher.includes("relay-${suffix}.pid") &&
+    browserVmRemoteVzLauncher.includes("ELASTOS_BRIDGE_PIDFILE") &&
+    browserVmRemoteVzLauncher.includes("cleanup_bridge") &&
+    browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_VM_TRACE_EGRESS") &&
+    browserVmRemoteVzLauncher.includes("filterSupervisorStderr") &&
+    browserVmRemoteVzLauncher.includes("Browser VM host egress bridge (accepted session|session)") &&
+    browserVmRemoteVzLauncher.includes("errorWithSupervisorTail") &&
+    browserVmRemoteVzLauncher.includes('child.kill("SIGTERM")') &&
+    browserVmRemoteVzLauncher.includes("/tmp/evzl") &&
+    browserVmRemoteVzLauncher.includes("/tmp/evzs") &&
+    browserVmRemoteVzLauncher.includes("sessionSuffix") &&
+    browserVmRemoteVzLauncher.includes("bvm-") &&
+    browserVmRemoteVzLauncher.includes("validateUnixSocketPathBudget") &&
+    browserVmRemoteVzLauncher.includes("adapter_ipc") &&
+    browserVmRemoteVzLauncher.includes("runtime_stream_path") &&
+    browserVmRemoteVzLauncher.includes("control_socket_path") &&
+    browserVmRemoteVzLauncher.includes("rm -f") &&
+    browserVmRemoteVzLauncher.includes("per_launch_vm_target") &&
+    !browserVmRemoteVzLauncher.includes("remote_provider:"),
+  "Remote Browser VZ launcher must bridge Runtime stream IPC and VM control sockets with short macOS-safe socket paths",
+);
+
+assert(
+  browserVmEngineSupervisor.includes("ELASTOS_BROWSER_VM_CONTROL_SOCKET") &&
+    browserVmEngineSupervisor.includes("Browser VM engine target is not launch-ready") &&
+    browserVmEngineSupervisor.includes("remote/operator VM provider") &&
+    browserVmEngineSupervisor.includes("browser-vm-local-crosvm-launcher") &&
+    browserVmEngineSupervisor.includes("sanitizedVmControlServiceEnv") &&
+    browserVmEngineSupervisor.includes("delete env[REQUEST_ENV]") &&
+    browserVmEngineSupervisor.includes('path.join(dataDir, "bvm")') &&
+    browserVmEngineSupervisor.includes("/tmp/evzs") &&
+    browserVmEngineSupervisor.includes("sessionSuffix") &&
+    browserVmEngineSupervisor.includes("bvm-") &&
+    browserVmEngineSupervisor.includes("elastos.browser.vm-engine.open/v1") &&
+    browserVmEngineSupervisor.includes("chromium_microvm") &&
+    browserVmEngineSupervisor.includes("per_launch_vm_target") &&
+    browserVmEngineSupervisor.includes("validateBrowserProfileDescriptor") &&
+    browserVmEngineSupervisor.includes("principal_owned_profile_disk") &&
+    browserVmEngineSupervisor.includes("principal_owned_reset_scoped_unprotected") &&
+    browserVmEngineSupervisor.includes("protected_storage !== false") &&
+    browserVmEngineSupervisor.includes("BrowserProfiles/default/profile.ext4") &&
+    !browserVmEngineSupervisor.includes("PROFILE_ROOT_ENV") &&
+    !browserVmEngineSupervisor.includes("profileDirForRequest") &&
+    !browserVmEngineSupervisor.includes("`principal-${digest}`") &&
+    browserVmEngineSupervisor.includes("Browser VM supervisor requires webrtc_remote_display") &&
+    browserVmEngineSupervisor.includes("Browser VM display sessions must report media_transport=runtime_relay") &&
+    browserVmEngineSupervisor.includes("isRemoteVzControlLauncher") &&
+    browserVmEngineSupervisor.includes("applyRemoteVzControlDefaults") &&
+    browserVmEngineSupervisor.includes("ELASTOS_BROWSER_REMOTE_VZ_LAUNCH_TIMEOUT_MS") &&
+    browserVmEngineSupervisor.includes("ELASTOS_BROWSER_REMOTE_VZ_") &&
+    browserVmEngineSupervisor.includes("remote_vz_launch_timeout_ms") &&
+    browserVmEngineSupervisor.includes("launchTimeoutMs - 30000") &&
+    browserVmEngineSupervisor.includes("runtime_net_only") &&
+    browserVmEngineSupervisor.includes("direct_network !== false") &&
+    browserVmEnginePreflight.includes("elastos.browser.vm-engine-preflight/v1") &&
+    browserVmEnginePreflight.includes("remote_control_supported") &&
+    browserVmEnginePreflight.includes("control_socket_status") &&
+    browserVmEnginePreflight.includes("GET /status HTTP/1.1") &&
+    browserVmEnginePreflight.includes("missing_for_local_substrate") &&
+    browserVmEnginePreflight.includes("Local crosvm Browser VM is unavailable because /dev/kvm is missing") &&
+    browserVmEnginePreflight.includes("apple_virtualization_framework") &&
+    browserVmEnginePreflight.includes('"kernel": stat(kernel)') &&
+    browserVmEnginePreflight.includes("crosvm") &&
+    browserVmArtifactPreflight.includes("elastos.browser.vm-artifact-preflight/v1") &&
+    browserVmArtifactPreflight.includes("inspect_ext4_sidecar_manifest") &&
+    browserVmArtifactPreflight.includes("local_substrate_artifacts_ready") &&
+    browserVmArtifactPreflight.includes("browser-vm-selkies-start") &&
+    browserVmArtifactPreflight.includes("browser-vm-guest-control-bridge") &&
+    browserVmArtifactPreflight.includes("AUDIO_ROOTFS_FILES") &&
+    browserVmArtifactPreflight.includes("audio_default_ready") &&
+    browserVmArtifactPreflight.includes("rootfs manifest target preflight reports audio_default_ready=false") &&
+    browserVmArtifactPreflight.includes('"pipewire": "/usr/bin/pipewire"') &&
+    browserVmArtifactPreflight.includes('"pipewire_pulse": "/usr/bin/pipewire-pulse"') &&
+    browserVmArtifactPreflight.includes('"wireplumber": "/usr/bin/wireplumber"') &&
+    browserVmArtifactPreflight.includes('"pw_cli": "/usr/bin/pw-cli"') &&
+    browserVmArtifactPreflight.includes("FORBIDDEN_INIT_SNIPPETS") &&
+    browserVmArtifactPreflight.includes("must not reference stale console discovery") &&
+    browserVmArtifactPreflight.includes("apple_virtualization_framework") &&
+    browserVmArtifactPreflightSmoke.includes("elastos.browser.vm-artifact-preflight-smoke/v1") &&
+    browserVmArtifactPreflightSmoke.includes("ELASTOS_BROWSER_VM_STAGED_ROOTFS") &&
+    browserVmControlService.includes("elastos.browser.vm-control-service.config/v1") &&
+    browserVmControlService.includes("Browser VM control service accepts only chromium_microvm") &&
+    browserVmControlService.includes("Browser VM control service requires webrtc_remote_display") &&
+    browserVmControlService.includes('const expectedMediaTransport = "runtime_relay"') &&
+    browserVmControlService.includes("Browser VM display sessions must report media_transport=${expectedMediaTransport}") &&
+    browserVmControlService.includes("Browser VM product display sessions must advertise audio=true and video=true") &&
+    browserVmControlService.includes("Browser VM product display sessions must include an audio WebRTC offer") &&
+    browserVmEngineSupervisor.includes("launcher: controlServiceArtifactFingerprints(config.launcher_program)") &&
+    browserVmControlService.includes("persistent_launcher") &&
+    browserVmControlService.includes("runPersistentProgram") &&
+    browserVmControlService.includes("terminatePersistentLauncher") &&
+    browserVmControlService.includes("sameLaunchIdentity") &&
+    browserVmControlService.includes("reuse_idle_vms") &&
+    browserVmControlService.includes("idleVmReuseEnabled") &&
+    browserVmControlService.includes("idle_vm_reuse_disabled_retired") &&
+    browserVmControlService.includes("retireNonReusableIdleVmsForSinglePageRuntime") &&
+    browserVmControlService.includes("single_active_page_non_reusable_profile") &&
+    browserVmControlService.includes("max_active_pages") &&
+    browserVmControlService.includes("launch_reused") &&
+    browserVmControlService.includes('reason: "same_stream"') &&
+    browserVmControlService.includes("Browser VM active page capacity reached") &&
+    browserVmControlService.includes("per_launch_vm_target") &&
+    browserVmControlServiceSmoke.includes("elastos.browser.vm-control-service-smoke/v1") &&
+    browserVmControlServiceSmoke.includes("second stream did not launch the new URL") &&
+    browserVmControlServiceSmoke.includes("single-page replacement did not preserve one active page") &&
+    browserVmControlServicePersistentSmoke.includes("elastos.browser.vm-control-service-persistent-smoke/v1") &&
+    browserVmControlServicePersistentSmoke.includes("same stream launch was not idempotent") &&
+    browserVmControlServicePersistentSmoke.includes("wrong single-page persistent status") &&
+    browserVmControlServicePersistentSmoke.includes("fake-invalid-persistent-vm-launcher") &&
+    browserVmControlServicePersistentSmoke.includes("idle keepalive retained a VM without explicit reuse opt-in") &&
+    browserVmControlServicePersistentSmoke.includes("different principal/profile launch did not terminate the previous idle VM") &&
+    browserVmControlServicePersistentSmoke.includes('"reuse_idle_vms": True') &&
+    browserVmControlServicePersistentSmoke.includes("Browser VM launcher output is not JSON") &&
+    browserVmEngineContractSmoke.includes("elastos.browser.vm-engine-contract-smoke/v1") &&
+    browserVmRemoteControlPreflightSmoke.includes("elastos.browser.vm-remote-control-preflight-smoke/v1") &&
+    browserVmRemoteControlPreflightSmoke.includes("remote_vm_control_socket") &&
+    browserVmRemoteControlPreflightSmoke.includes("stale remote control socket must fail closed") &&
+    browserVmEngineContractSmoke.includes("browser-vm-product") &&
+    !browserVmEngineContractSmoke.includes("--engine-mode") &&
+    browserVmEngineContractSmoke.includes("vm_selkies_gstreamer_webrtc") &&
+    browserVmEngineContractSmoke.includes("media_transport: \"runtime_relay\"") &&
+    browserVmTargetPreflight.includes("elastos.browser.vm-target-preflight/v1") &&
+    browserVmTargetPreflight.includes("Additional --require-runtime-deps contract") &&
+    browserVmTargetPreflight.includes("audio_default_ready") &&
+    browserVmTargetPreflight.includes("target and missing audio support fails this preflight") &&
+    browserVmTargetPreflight.includes("browser-vm-runtime-relay") &&
+    browserVmTargetPreflight.includes("browser-vm-guest-control-bridge") &&
+    browserVmTargetPreflight.includes("elastos.browser.vm-guest-control-bridge.config/v1") &&
+    browserVmTargetPreflight.includes("control_socket_ready_timeout_ms") &&
+    browserVmTargetPreflight.includes("control_request_timeout_ms") &&
+    browserVmTargetPreflight.includes("browser-vm-selkies-start") &&
+    browserVmTargetPreflight.includes("ELASTOS_BROWSER_SELKIES_CONTROL_CONFIG") &&
+    browserVmTargetPreflight.includes("ELASTOS_BROWSER_VM_CONTROL_BRIDGE_CONFIG") &&
+    browserVmTargetPreflight.includes("optional_audio = {") &&
+    browserVmTargetPreflight.includes("audio_default_ready = None") &&
+    browserVmTargetPreflight.includes("missing.append(name)") &&
+    browserVmTargetPreflight.includes('"pipewire": first_present') &&
+    browserVmTargetPreflight.includes('"pipewire_pulse": first_present') &&
+    browserVmTargetPreflight.includes('"wireplumber": first_present') &&
+    browserVmTargetPreflight.includes('"pw_cli": first_present') &&
+    browserVmTargetPreflight.includes("rootfs_checkpoint()") &&
+    browserVmTargetPreflight.includes("selkies_checkpoint()") &&
+    browserVmTargetPreflight.includes("ELASTOS_BROWSER_VM_ICE_SERVERS_JSON") &&
+    browserVmTargetPreflight.includes("/run/elastos/browser-rtc.json") &&
+    browserVmTargetPreflight.includes("/run/elastos/browser-ice-servers.json") &&
+    browserVmTargetPreflight.includes("/run/elastos/browser-ice-transport-policy") &&
+    browserVmTargetPreflight.includes("/run/elastos/browser-media-relay-network.json") &&
+    browserVmTargetPreflight.includes("ELASTOS_BROWSER_VM_MEDIA_RELAY_GUEST_IPV4") &&
+    browserVmTargetPreflight.includes("patch_selkies_relay_policy") &&
+    browserVmTargetPreflight.includes("ice-transport-policy") &&
+    browserVmTargetPreflight.includes("script_errors") &&
+    browserVmTargetPreflight.includes("runtime_exit_transport must be carrier_stream or vsock_relay") &&
+    browserVmTargetPreflight.includes("control_transport must be vsock_relay") &&
+    browserVmTargetPreflight.includes("--host-resolver-rules=MAP * ~NOTFOUND") &&
+    browserVmTargetPreflight.includes("must not reference stale console discovery") &&
+    browserVmTargetPreflightSmoke.includes("elastos.browser.vm-target-preflight-smoke/v1") &&
+    browserVmTargetRefresh.includes("--guest-control-bridge-bin") &&
+    browserVmTargetRefresh.includes("ELASTOS_BROWSER_VM_GUEST_CONTROL_BRIDGE_BIN") &&
+    browserVmTargetRefresh.includes("/opt/elastos/bin/browser-vm-guest-control-bridge") &&
+    browserVmTargetRefresh.includes("verify_rootfs_guest_control_bridge_contract") &&
+    browserVmTargetRefresh.includes("rootfs guest-control bridge is stale") &&
+    browserVmTargetRefresh.includes("/opt/elastos/bin/browser-vm-init") &&
+    browserVmTargetRefresh.includes("extract_browser_vm_init") &&
+    browserVmRuntimeRelay.includes("elastos.browser.vm-runtime-relay.config/v1") &&
+    browserVmRuntimeRelay.includes("browser VM runtime relay must not grant direct network") &&
+    browserVmRuntimeRelay.includes("VsockListen") &&
+    browserVmRuntimeRelaySmoke.includes("elastos.browser.vm-runtime-relay-smoke/v1") &&
+    browserVmGuestControlBridge.includes("elastos.browser.vm-guest-control-bridge.config/v1") &&
+    browserVmGuestControlBridge.includes("browser VM guest control bridge must not grant direct network") &&
+    browserVmGuestControlBridge.includes("control_socket_ready_timeout_ms") &&
+    browserVmGuestControlBridge.includes("control_request_timeout_ms") &&
+    browserVmGuestControlBridge.includes("DEFAULT_CONTROL_SOCKET_READY_TIMEOUT_MS") &&
+    browserVmGuestControlBridge.includes("DEFAULT_CONTROL_REQUEST_TIMEOUT_MS") &&
+    browserVmGuestControlBridge.includes("connect_guest_control_socket") &&
+    browserVmGuestControlBridge.includes("wait_for_readable") &&
+    browserVmGuestControlBridge.includes("VsockListen") &&
+    browserVmGuestControlBridgeSmoke.includes("elastos.browser.vm-guest-control-bridge-smoke/v1") &&
+    browserVmGuestControlBridgeSmoke.includes("control_socket_ready_timeout_ms") &&
+    browserVmGuestControlBridgeSmoke.includes("control_request_timeout_ms") &&
+    browserVzEngineSupervisor.includes("browser-vz-engine-supervisor requires macOS arm64") &&
+    browserVzEngineSupervisor.includes("init=/opt/elastos/bin/browser-vm-init") &&
+    browserVzEngineSupervisor.includes("root=/dev/vda rootfstype=ext4 rw") &&
+    browserVzEngineSupervisor.includes("DEFAULT_CONTROL_PORT: u32 = 19092") &&
+    browserVzEngineSupervisor.includes("DEFAULT_RELAY_PORT: u32 = 19091") &&
+    browserVzEngineSupervisor.includes("DEFAULT_CONTROL_PROXY_REQUEST_TIMEOUT_MS") &&
+    browserVzEngineSupervisor.includes("ELASTOS_BROWSER_VM_CONTROL_PROXY_REQUEST_TIMEOUT_MS") &&
+    browserVzEngineSupervisor.includes("DEFAULT_CONTROL_STATUS_PROBE_TIMEOUT_MS") &&
+    browserVzEngineSupervisor.includes("ELASTOS_BROWSER_VM_CONTROL_STATUS_PROBE_TIMEOUT_MS") &&
+    browserVzEngineSupervisor.includes("probe_guest_control_status") &&
+    browserVzEngineSupervisor.includes("guest control status probe") &&
+    browserVzEngineSupervisor.includes("UNIX_SOCKET_PATH_BUDGET") &&
+    browserVzEngineSupervisor.includes("validate_unix_socket_path_budget") &&
+    browserVzEngineSupervisor.includes("/tmp/evzs") &&
+    browserVzEngineSupervisor.includes("Browser VZ launcher requires adapter_ipc.runtime_stream_path") &&
+    browserVzEngineSupervisor.includes("validate_runtime_stream_socket_path") &&
+    browserVzEngineSupervisor.includes("launch_requires_runtime_owned_stream_path_for_egress") &&
+    browserVzEngineSupervisor.includes("Browser VZ webrtc_remote_display requires") &&
+    browserVzEngineSupervisor.includes("elastos.browser_ice_config_hex") &&
+    browserVzEngineSupervisor.includes("elastos.browser_width") &&
+    browserVzEngineSupervisor.includes("elastos.browser_height") &&
+    browserVzEngineSupervisor.includes("display_boot_args_include_launch_viewport") &&
+    browserVzEngineSupervisor.includes("engine=chromium_microvm") &&
+    browserVzEngineSupervisor.includes("selkies_gstreamer") &&
+    browserVzEngineSupervisor.includes("media_transport") &&
+    browserVzEngineSupervisor.includes("runtime_relay") &&
+    browserVzEngineSupervisor.includes("normalize_display_media_from_offer") &&
+    browserVzEngineSupervisor.includes("sdp_has_media_kind") &&
+    browserVzEngineSupervisor.includes("vm_selkies_gstreamer_webrtc") &&
+    browserVzEngineSupervisor.includes("per_launch_vm_target") &&
+    browserVzEngineSupervisor.includes("const BROWSER_VM_TARGET_VERSION") &&
+    browserVzEngineSupervisor.includes('option_env!("ELASTOS_RELEASE_VERSION")') &&
+    browserVzEngineSupervisor.includes('concat!(env!("CARGO_PKG_VERSION"), "-dev")') &&
+    !browserVzEngineSupervisor.includes('version: "0.4.1".to_string()') &&
+    browserVzEngineSupervisor.includes("DEFAULT_PROFILE_DISK_MIB") &&
+    !browserVzEngineSupervisor.includes("ELASTOS_BROWSER_VM_PROFILE_DISK_ROOT") &&
+    browserVzEngineSupervisor.includes("ELASTOS_BROWSER_VM_PROFILE_DISK_MIB") &&
+    browserVzEngineSupervisor.includes('env_u32("ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS", 16)') &&
+    browserVzEngineSupervisor.includes("attach_browser_profile_disk") &&
+    browserVzEngineSupervisor.includes("profile_disk_from_request") &&
+    browserVzEngineSupervisor.includes("validate_profile_disk_path") &&
+    browserVzEngineSupervisor.includes("data_disk_path = Some") &&
+    browserVzEngineSupervisor.includes("elastos.browser_profile_disk=required") &&
+    browserVzEngineSupervisor.includes("browser_profile_uses_principal_owned_data_disk_descriptor") &&
+    browserVzEngineSupervisor.includes("BrowserVmHibernation::from_env") &&
+    browserVzEngineSupervisor.includes("discard_bad_hibernation_state") &&
+    browserVzEngineSupervisor.includes("discard_hibernation_tmp_state") &&
+    browserVzEngineSupervisor.includes("hibernation_key_changes_when_profile_artifacts_resources_or_boot_args_change") &&
+    browserVzEngineSupervisor.includes("hibernation_prepare_launch_rootfs_removes_stale_state_when_cache_is_missing") &&
+    browserVzEngineSupervisor.includes("hibernation_restore_failure_cleanup_removes_bad_state_file") &&
+    browserVzEngineSupervisor.includes("hibernation_save_failure_cleanup_removes_tmp_state_file") &&
+    browserVzEngineSupervisor.includes('#[cfg(target_os = "macos")]') &&
+    browserVmTargetStage.includes("elastos.browser.vm-target-stage/v1") &&
+    browserVmTargetStage.includes("browser-vm-init") &&
+    browserVmTargetStage.includes("browser-vm-selkies-start") &&
+    browserVmTargetStage.includes("selkies_checkpoint()") &&
+    browserVmTargetStage.includes("profile initialized") &&
+    browserVmTargetStage.includes("dependencies checked") &&
+    browserVmTargetStage.includes("PipeWire is required for Browser audio") &&
+    browserVmTargetStage.includes("pipewire-pulse is required for Browser audio") &&
+    browserVmTargetStage.includes("WirePlumber is required for Browser audio") &&
+    browserVmTargetStage.includes("pw-cli is required for Browser audio") &&
+    !browserVmTargetStage.includes("audio unavailable; continuing with video-only display") &&
+    browserVmRootfsBuild.includes("pipewire-pulse") &&
+    browserVmRootfsBuild.includes("gst-inspect-1.0 pulsesrc") &&
+    browserVmRootfsBuild.includes("forcing audio SDP offer for split product audio peer") &&
+    !browserVmTargetStage.includes("console_device") &&
+    !browserVmTargetStage.includes('console=*)') &&
+    !browserVmTargetStage.includes("/dev/hvc0 /dev/ttyS0 /dev/console") &&
+    browserVmTargetStage.includes("virtio_console") &&
+    browserVmRootfsBuild.includes("virtio_console") &&
+    browserVmTargetStage.includes("cmdline_value elastos.browser_profile") &&
+    browserVmTargetStage.includes("cmdline_value elastos.browser_profile_disk") &&
+    browserVmTargetStage.includes("/dev/vdb") &&
+    browserVmTargetStage.includes("mount_browser_profile_disk") &&
+    browserVmTargetStage.includes("principal-owned Browser profile disk is required but $disk is missing") &&
+    browserVmTargetStage.includes('mount_dir="/var/lib/elastos/browser-profile-disk"') &&
+    browserVmTargetStage.includes('ELASTOS_BROWSER_VM_PROFILE_DIR="$mount_dir/profiles/$key"') &&
+    browserVmTargetStage.includes("browser-vm-guest-control-bridge") &&
+    browserVmTargetStage.includes("validate_linux_guest_binary") &&
+    browserVmTargetStage.includes("--target-platform") &&
+    browserVmTargetStage.includes("selkies-gstreamer") &&
+    browserVmTargetStage.includes("python3 -m selkies_gstreamer") &&
+    browserVmTargetStage.includes("--web_root=/opt/gst-web") &&
+    browserVmTargetStage.includes('ELASTOS_BROWSER_VM_SELKIES_ENCODER:=openh264enc') &&
+    browserVmTargetStage.includes('--encoder="$ELASTOS_BROWSER_VM_SELKIES_ENCODER"') &&
+    !browserVmTargetStage.includes("--encoder=x264enc") &&
+    browserVmTargetStage.includes("ELASTOS_BROWSER_VM_ICE_SERVER") &&
+    browserVmTargetStage.includes("ELASTOS_BROWSER_VM_ICE_SERVERS_JSON") &&
+    browserVmTargetStage.includes("ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY") &&
+    browserVmTargetStage.includes("ELASTOS_BROWSER_VM_MEDIA_RELAY_HOST_IPV4") &&
+    browserVmTargetStage.includes("browser-media-relay-network.json") &&
+    browserVmTargetStage.includes("media relay IPv4") &&
+    browserVmTargetStage.includes("elastos.browser_ice_config_hex") &&
+    browserVmTargetStage.includes("cmdline_value elastos.browser_width") &&
+    browserVmTargetStage.includes("validate_display_dimension") &&
+    browserVmTargetStage.includes("setup_media_relay_network") &&
+    browserVmTargetStage.includes("virtio_net") &&
+    browserVmTargetStage.includes("found_media_iface") &&
+    browserVmTargetStage.includes('[ -n "$found_media_iface" ] && break') &&
+    browserVmTargetStage.includes("patch_selkies_relay_policy") &&
+    browserVmTargetStage.includes("_elastos_raw_caps_with_framerate") &&
+    browserVmTargetStage.includes("stale Selkies Gst.Fraction constructor remains") &&
+    browserVmTargetStage.includes("/run/elastos/browser-ice-transport-policy") &&
+    browserVmTargetStage.includes("ice-transport-policy") &&
+    browserVmTargetStage.includes("elastos_ice_transport_policy") &&
+    browserVmTargetStage.includes("confirmed ICE transport policy after TURN setup") &&
+    browserVmTargetStage.includes("emitting ICE candidate") &&
+    browserVmTargetStage.includes("browser-vm-selkies-start: ICE config follows") &&
+    browserVmTargetStage.includes("ip addr show dev") &&
+    browserVmTargetStage.includes("webrtc_remote_display requires at least one turn:/turns:") &&
+    browserVmTargetStage.includes("browser-ice-servers.json") &&
+    browserVmTargetStage.includes('"ice_servers": $(cat /run/elastos/browser-ice-servers.json)') &&
+    browserVmTargetStage.includes("mount_if_needed proc proc /proc") &&
+    browserVmTargetStage.includes("--no-sandbox") &&
+    browserVmTargetStage.includes('"--window-size=${ELASTOS_BROWSER_VM_WIDTH},${ELASTOS_BROWSER_VM_HEIGHT}"') &&
+    !browserVmTargetStage.includes("--force-device-scale-factor") &&
+    browserVmTargetStage.includes('"css_width": ${ELASTOS_BROWSER_VM_WIDTH}') &&
+    browserVmTargetStage.includes('"css_height": ${ELASTOS_BROWSER_VM_HEIGHT}') &&
+    browserVmTargetStage.includes("(async () =>") &&
+    browserVmTargetStage.includes("runtime_net_only") &&
+    browserVmTargetStage.includes("ELASTOS_BROWSER_VM_RELAY_PORT") &&
+    browserVmTargetStage.includes("ELASTOS_BROWSER_VM_CONTROL_BRIDGE_PORT") &&
+    browserVmTargetStage.includes("rootfs_mark()") &&
+    browserVmTargetStage.includes("rootfs_checkpoint()") &&
+    browserVmTargetStage.includes("browser-vm-rootfs-entry.log") &&
+    browserVmTargetStage.includes("entered rootfs init") &&
+    browserVmTargetStage.includes("opening main init log") &&
+    browserVmTargetStage.includes("rootfs diagnostics initialized") &&
+    browserVmTargetStage.includes("browser control socket present") &&
+    browserVmTargetStage.includes("guest control bridge started") &&
+    browserVmTargetStage.includes("mount -t proc proc /proc") &&
+    !browserVmTargetStage.includes('[ -w "/dev/$console_device" ] &&') &&
+    !browserVmTargetStage.includes('>"$ELASTOS_BROWSER_VM_SERIAL_LOG_DEV"') &&
+    browserVmTargetStage.includes('"control_socket_ready_timeout_ms": 60000') &&
+    browserVmTargetStage.includes('"control_request_timeout_ms": 120000') &&
+    !browserVmTargetStage.includes("--proxy-bypass-list=<-loopback>") &&
+    browserVmRootfsBuild.includes("elastos.browser.vm-rootfs-build/v1") &&
+    browserVmRootfsBuild.includes("debootstrap") &&
+    browserVmRootfsBuild.includes("elastos-tiny-initrd") &&
+    browserVmRootfsBuild.includes('exec /usr/bin/chromium "\\$@"') &&
+    browserVmRootfsBuild.includes('exec /opt/elastos/bin/chromium.real "\\$@"') &&
+    browserVmRootfsBuild.includes("browser-vm-initrd") &&
+    browserVmRootfsBuild.includes("require_mounts_clean") &&
+    browserVmRootfsBuild.includes("rootfs pseudo-filesystem still mounted") &&
+    browserVmRootfsBuild.includes("initrd_dump_diagnostics") &&
+    browserVmRootfsBuild.includes("_elastos_raw_caps_with_framerate") &&
+    browserVmRootfsBuild.includes("Selkies stale Gst.Fraction constructor remains") &&
+    browserVmRootfsBuild.includes("browser-vm-initrd.log") &&
+    browserVmRootfsBuild.includes("tail dmesg sync chmod") &&
+    browserVmRootfsBuild.includes("initrd_mark_newroot") &&
+    browserVmRootfsBuild.includes("mounted /dev/vda on /newroot") &&
+    browserVmRootfsBuild.includes("post-mount compatibility patch complete") &&
+    browserVmRootfsBuild.includes("exec switch_root to /opt/elastos/bin/browser-vm-init") &&
+    browserVmRootfsBuild.includes("exec switch_root /newroot /opt/elastos/bin/browser-vm-init >>/newroot/var/log/elastos/browser-vm-initrd.log 2>&1") &&
+    browserVmRootfsBuild.includes("block device /dev/vda did not appear") &&
+    browserVmRootfsBuild.includes("exec switch_root failed to start with status") &&
+    browserVmRootfsBuild.includes("builder\": \"debootstrap\"") &&
+    browserVmRootfsBuild.includes("package-time update-initramfs skipped") &&
+    browserVmRootfsBuild.includes("dpkg-divert --quiet --local --add --rename") &&
+    browserVmRootfsBuild.includes("chromium") &&
+    browserVmRootfsBuild.includes("selkies-gstreamer-web_v") &&
+    browserVmRootfsBuild.includes("elastos_ice_transport_policy") &&
+    browserVmRootfsBuild.includes("ice-transport-policy") &&
+    browserVmRootfsBuild.includes("confirmed ICE transport policy after TURN setup") &&
+    browserVmRootfsBuild.includes("emitting ICE candidate") &&
+    browserVmRootfsBuild.includes("virtio_net") &&
+    browserVmRootfsBuild.includes("Selkies must apply ElastOS relay-only ICE policy") &&
+    browserVmRootfsBuild.includes("/opt/gst-web/index.html") &&
+    browserVmRootfsBuild.includes("python3 -m pip install") &&
+    browserVmRootfsBuild.includes("linux-libc-dev") &&
+    browserVmRootfsBuild.includes("mke2fs -q -t ext4") &&
+    !browserVmRootfsBuild.includes("docker ") &&
+    !browserVmRootfsBuild.includes("Docker is used here only as an") &&
+    browserVmTargetStageSmoke.includes("elastos.browser.vm-target-stage-smoke/v1") &&
+    browserVmTargetStageSmoke.includes("elastos.browser_profile_disk") &&
+    browserVmTargetStageSmoke.includes("/dev/vdb") &&
+    browserVmTargetStageSmoke.includes('--user-data-dir=${ELASTOS_BROWSER_VM_PROFILE_DIR}') &&
+    browserVmTargetStageSmoke.includes("ELASTOS_BROWSER_VM_SELKIES_ENCODER:=openh264enc") &&
+    browserVmTargetStageSmoke.includes('--encoder="$ELASTOS_BROWSER_VM_SELKIES_ENCODER"') &&
+    browserVmTargetDoc.includes("Browser product target is a per-launch VM") &&
+    browserVmTargetDoc.includes("Selkies is the in-guest display/input transport, not the isolation boundary") &&
+    browserVmTargetDoc.includes("The Linux guest contract is the portable layer across Linux and macOS") &&
+    browserVmTargetDoc.includes("The source-home Browser display path is WebRTC-only") &&
+    browserVmTargetDoc.includes("`ELASTOS_BROWSER_VM_SELKIES_ENCODER` defaults to `openh264enc`") &&
+    browserVmTargetDoc.includes("Runtime-frame display is not a source-home") &&
+    browserVmTargetDoc.includes("does not automatically start a hidden Browser VM") &&
+    browserVmTargetDoc.includes("warm sessions must be Runtime/provider-owned") &&
+    browserVmTargetDoc.includes("Cold-booting a brand-new") &&
+    browserVmTargetDoc.includes("is not the desired product") &&
+    browserVmTargetDoc.includes("build-browser-vm-rootfs.sh") &&
+    browserVmTargetDoc.includes("full bootable rootfs must also pass runtime dependency mode") &&
+    browserVmTargetDoc.includes("--target-dir /path/to/full-rootfs --require-runtime-deps") &&
+    browserVmTargetDoc.includes("PipeWire, PipeWire Pulse, WirePlumber") &&
+    browserVmTargetDoc.includes("Refresh-only is not") &&
+    browserVmTargetDoc.includes("sufficient for package/dependency changes") &&
+    browserVmTargetDoc.includes("browser-vm-runtime-relay") &&
+    browserVmTargetDoc.includes("browser-vm-guest-control-bridge") &&
+    browserVmTargetDoc.includes("browser-vm-selkies-start") &&
+    browserVmTargetDoc.includes("rejects host binaries") &&
+    browserVmTargetDoc.includes("stage-browser-vm-target.sh") &&
+    browserVmTargetDoc.includes("media_transport=runtime_relay") &&
+    browserVmTargetDoc.includes("active-principal `localhost://Users/<root>/BrowserProfiles/default/profile.ext4`") &&
+    browserVmTargetDoc.includes("principal-owned persistent ext4") &&
+    browserVmTargetDoc.includes("Current H038 boundary") &&
+    browserVmTargetDoc.includes("not yet protected principal-root object storage") &&
+    browserVmTargetDoc.includes("not a claim that Chromium cookies") &&
+    browserVmTargetDoc.includes("storage_posture=principal_owned_reset_scoped_unprotected") &&
+    browserVmTargetDoc.includes("protected_storage=false") &&
+    browserCapsuleDoc.includes("0.5.0 truth boundary") &&
+    browserCapsuleDoc.includes("not yet a protected principal-root") &&
+    browserCapsuleDoc.includes("object envelope") &&
+    browserCapsuleDoc.includes("not yet exported/imported by Recovery Kit") &&
+    browserCapsuleDoc.includes("not be described as encrypted/recoverable") &&
+    browserCapsuleDoc.includes("storage_posture=principal_owned_reset_scoped_unprotected") &&
+    !browserCapsuleDoc.includes("recoverable/migratable") &&
+    state.includes("Browser VM Chromium profile disks are principal-owned and reset-scoped") &&
+    state.includes("not protected principal-root envelopes or Recovery Kit-packaged state yet") &&
+    state.includes("storage_posture=principal_owned_reset_scoped_unprotected") &&
+    state.includes("this does not include Browser VM Chromium profile disks yet") &&
+    architectureDoc.includes("Home shell browser state") &&
+    architectureDoc.includes("not Browser VM Chromium profile disks") &&
+    browserVmTargetDoc.includes("POST /api/apps/browser/profile/reset") &&
+    installDoc.includes("Browser VM target maintenance is an operator path") &&
+    installDoc.includes("Refresh-only is not sufficient for package/dependency changes") &&
+    installDoc.includes("scripts/browser-vm-artifact-preflight.sh") &&
+    installDoc.includes("PipeWire/WirePlumber/GStreamer dependency set") &&
+    elastosCommon.includes("browser_profile_key_from_value") &&
+    elastosCommon.includes("Sha256::digest") &&
+    elastosCommon.includes('"profile-{}"') &&
+    elastosCommon.includes("is_safe_browser_profile_key") &&
+    !elastosCommon.includes(".file_name()") &&
+    gatewayApi.includes("/api/apps/browser/profile/reset") &&
+    gatewayBrowserApi.includes("browser_app_profile_reset") &&
+    gatewayBrowserApi.includes("browser_principal_has_live_sessions") &&
+    gatewayBrowserApi.includes("principal_owned_profile_disk") &&
+    gatewayBrowserApi.includes("BROWSER_PROFILE_STORAGE_POSTURE") &&
+    gatewayBrowserApi.includes('"protected_storage": false') &&
+    browserProfileResetRoute.includes('"scope": "active_principal"') &&
+    !browserProfileResetRoute.includes('"profile_key": profile_key') &&
+    !browserProfileResetRoute.includes('"principal_id": context.principal_id') &&
+    gatewayBrowserProfileTests.includes("browser_profile_reset_removes_only_principal_profile_disk") &&
+    gatewayBrowserProfileTests.includes("principal_owned_reset_scoped_unprotected") &&
+    gatewayBrowserProfileTests.includes('payload["profile"]["encrypted"], false') &&
+    gatewayBrowserProfileTests.includes("browser_profile_reset_refuses_live_principal_session") &&
+    browserEngineAdapter.includes("launch_with_supervisor") &&
+    browserEngineAdapter.includes("display_session_receipt") &&
+    browserEngineAdapter.includes("elastos.browser.engine.identity/v1") &&
+    browserEngineAdapter.includes("cleanup_isolated_session"),
+  "Browser VM engine path must be explicit, fail-closed, cross-platform-preflighted, artifact-buildable, and separate from Docker/container cleanup",
+);
+
+assert(
+  browserMacVmProof.includes("elastos.browser.mac-vm-proof/v1") &&
+    browserMacVmProof.includes("HOME_VIRTUAL_AUTH_BROWSER_EMBEDDED_UI_INPUT=1") &&
+    browserMacVmProof.includes("HOME_VIRTUAL_AUTH_BROWSER_DIAGNOSTICS=1") &&
+    browserMacVmProof.includes("curl -fsS -m 2 --unix-socket") &&
+    browserMacVmProof.includes("decoded_frames_after_click") &&
+    browserMacVmProof.includes("dropped_frames_after_click") &&
+    browserMacVmProof.includes("quality_gates") &&
+    browserMacVmProof.includes("max_remote_video_ready_ms") &&
+    browserMacVmProof.includes("decoded_frame_delta_ok") &&
+    browserMacVmProof.includes("device_pixel_ratio_ok") &&
+    browserMacVmProof.includes("source_video_matches_panel") &&
+    browserMacVmProof.includes("broken_image_count") &&
+    browserMacVmProof.includes("pending_image_count") &&
+    browserMacVmProof.includes("pending_image_samples") &&
+    homePasskeyVirtualAuthSmoke.includes("diagnostics.body.images") &&
+    browserMacVmProof.includes('status: "not_recorded"') &&
+    macDoc.includes("scripts/browser-mac-vm-proof.sh") &&
+    macDoc.includes("`quality_gates`") &&
+    macDoc.includes("manual_acceptance.status=not_recorded"),
+  "Mac Browser VM proof collector must bundle health, hash parity, remote video/input, diagnostics, cleanup, zoom/performance quality gates, and an explicit no-manual-acceptance marker",
 );
 
 assert(
   browserJs.includes("clipboard_write") &&
     browserJs.includes("clipboard_read") &&
     browserJs.includes("paste_text") &&
+    browserJs.includes('{ type: "paste_text", text: event.key }') &&
+    browserSelkiesControlService.includes("Page.setInterceptFileChooserDialog") &&
+    browserSelkiesControlService.includes("DOM.setFileInputFiles") &&
+    browserSelkiesControlService.includes("uploadFileIntoBrowserPage") &&
+    browserSelkiesControlService.includes("cleanupBrowserUploadTempFiles") &&
+    browserSelkiesControlService.includes("Runtime wallet bridge proxy is required") &&
+    !browserSelkiesControlService.includes("walletRuntimeFetchDirect") &&
+    browserJs.includes("browser:file-picker-selection") &&
     browserSelkiesControlService.includes("Input.insertText") &&
     browserSelkiesControlService.includes("pasteTextIntoBrowserPage") &&
     browserJs.includes("handleSelkiesClipboardMessage") &&
@@ -544,7 +1521,7 @@ assert(
     browserStyle.includes(".browser-keyboard-capture") &&
     browserJs.includes("cw,") &&
     browserJs.includes('"cr"'),
-  "Browser UI must bridge copy through Selkies clipboard messages and paste through a Runtime/provider CDP insertText command instead of simulated Ctrl+V",
+  "Browser UI must bridge copy through Selkies clipboard messages and paste/printable keys through Runtime/provider CDP insertText while file uploads are Library-mediated",
 );
 assert(
   homeShellWindows.includes("function iframeAllowForLaunch") &&
@@ -561,13 +1538,132 @@ assert(
     browserJs.includes("navigator.clipboard.writeText(message)") &&
     browserStyle.includes('.browser-status[data-visible="true"][data-copyable="true"]') &&
     browserStyle.includes(".browser-status-copy") &&
-    browser.includes("browser-20260524d"),
+    browser.includes("browser-20260629b"),
   "Browser sticky status/errors must be copyable so live product failures can produce actionable evidence",
 );
 
 assert(
-  browserJs.includes('event?.type === "resize"') &&
-    browserJs.includes('currentDisplayMode === "webrtc_remote_display"') &&
+  browserJs.includes("function resetBrowserProfile") &&
+    browserJs.includes("/api/apps/browser/profile/reset") &&
+    browserJs.includes("Reset Browser cookies, local storage, history, and cache for this account?") &&
+    browserJs.includes("await closeRuntimePage(activePage)") &&
+    browserJs.includes("await closeRuntimePage(stalePage)") &&
+    browserJs.includes("publishRuntimePageForHost(null)") &&
+    browserJs.includes("Browser profile reset. Open the address again.") &&
+    !browserJs.includes("ELASTOS_BROWSER_VM_PROFILE_DISK_ROOT") &&
+    browserStyle.includes(".browser-settings-danger"),
+  "Browser profile reset must be a user-confirmed Runtime route after closing active pages, without exposing host profile disk paths",
+);
+
+assert(
+  browserJs.includes('const PRODUCT_DISPLAY_MODE = "webrtc_remote_display"') &&
+    !browserJs.includes("DISPLAY_MODE_PREFERENCE") &&
+    !browserJs.includes("function displayModeForReconnect") &&
+    !browserJs.includes("function shouldRecoverStalledWebrtc") &&
+    !browserJs.includes("displayModeOverride") &&
+    browserJs.includes('|| "webrtc_remote_display"') &&
+    !browserJs.includes(["screen", "shot"].join("")) &&
+    !browserJs.includes("fetchBrowserFrame") &&
+    !browserJs.includes(`|| "${["runtime", "frame"].join("_")}";`),
+  "Browser UI must default to VM WebRTC/datachannel without image polling fallbacks",
+);
+
+assert(
+  browserJs.includes("browser-status.js?v=browser-20260626e") &&
+    browserRemoteDisplay.includes("browser-status.js?v=browser-20260626e") &&
+    !browserJs.includes("browser-status.js?v=browser-20260616c") &&
+    !browserRemoteDisplay.includes("browser-status.js?v=browser-20260616c") &&
+    !browserRemoteDisplay.includes("browser-status.js?v=browser-20260616a") &&
+    !browserJs.includes("browser-status.js?v=browser-20260615e") &&
+    !browserJs.includes("browser-status.js?v=browser-20260615f") &&
+    !browserJs.includes("browser-status.js?v=browser-20260615g"),
+  "Browser status module cache key must advance with display default changes",
+);
+
+assert(
+  browserJs.includes("browser-remote-display.js?v=browser-20260629a") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260627a") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260618b") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260616e") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260616d") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260616c") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260616b") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260616a") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260615g"),
+  "Browser remote-display module cache key must advance with WebRTC default changes",
+);
+
+assert(
+  browserJs.includes("Remote display negotiated but no video frame arrived") &&
+    browserJs.includes("pollEngineCandidates") &&
+    browserJs.includes("WEBRTC_ENGINE_CANDIDATE_POLL_ATTEMPTS") &&
+    browserJs.includes("signalCandidate(null)") &&
+    browserJs.includes('const iceTransportPolicy =') &&
+    browserJs.includes('displaySession.media_transport === "runtime_relay" ? "relay" : "all"') &&
+    browserJs.includes("iceTransportPolicy,") &&
+    browserJs.includes("The Browser Engine is running, but the secure display connection is not ready.") &&
+    browserJs.includes("Refresh Browser, or choose another Browser Engine or Exit Node.") &&
+    browserJs.includes("failRemoteDisplay(nextPeerConnection, \"no_first_frame\")") &&
+    browserJs.includes("The stuck Browser session was closed"),
+  "Browser WebRTC must use relay-only ICE for runtime_relay sessions, poll late engine candidates, and recover without downgrading display modes or exposing relay internals to users",
+);
+
+assert(
+  browserJs.includes("function isBrowserErrorUrl") &&
+    browserJs.includes("chrome-error://chromewebdata/") &&
+    browserJs.includes("if (isBrowserErrorUrl(currentUrl))") &&
+    browserJs.includes("if (crossStreamTarget)") &&
+    !browserJs.includes("through a fresh Runtime route") &&
+    browserJs.includes("Reopening ${visibleAddressForUrl(nextUrl)} in a fresh Browser session") &&
+    browserJs.includes("return requestRuntimeOpen(nextUrl);") &&
+    browserSelkiesControlService.includes("assertBrowserNavigationSucceeded(navigation, \"navigation\")") &&
+    browserSelkiesControlService.includes("assertBrowserStateDidNotLandOnErrorPage(state, \"navigation\")") &&
+    browserSelkiesControlService.includes("chrome-error://chromewebdata/") &&
+    browserSelkiesControlService.includes("browser CDP ${label} failed") &&
+    browserSelkiesControlService.includes("navigation.errorText") &&
+    browserSelkiesControlService.includes("replaceBrowserPageTarget") &&
+    browserSelkiesControlService.includes("browser_page_command_navigation_retarget") &&
+    browserSelkiesControlServiceSmoke.includes("https://docs-late.ela.city/") &&
+    browserSelkiesControlServiceSmoke.includes("late Chrome error navigation must retry on a fresh target"),
+  "Browser navigation must surface CDP navigation failures and recover chrome-error pages through a fresh engine target or Runtime open",
+);
+
+assert(
+  browserJs.includes(`if (remoteVideo.srcObject !== stream) {
+        remoteVideo.srcObject = stream;
+      }
+      remoteVideo.hidden = false;
+      renderEmpty.hidden = true;`),
+  "Browser WebRTC display must expose the video sink when a stream attaches instead of blocking first-frame events behind hidden layout",
+);
+
+assert(
+    browserJs.includes("browser-input-surface.js?v=browser-20260620d") &&
+    browserInputSurface.includes('renderPanel.addEventListener("click"') &&
+    !browserJs.includes('renderImage.addEventListener("click"') &&
+    browserInputSurface.includes('remoteVideo.addEventListener("click"') &&
+    browserInputSurface.includes("isMediaClickTarget(event.target)") &&
+    browserInputSurface.includes("event.stopPropagation();") &&
+    browserInputSurface.includes("const target = remoteVideo;") &&
+    browserInputSurface.includes("if (!target || target.hidden)") &&
+    browserInputSurface.includes("target.videoWidth || view.width || rect.width") &&
+    browserInputSurface.includes("target.videoHeight || view.height || rect.height") &&
+    !browserJs.includes("browser-input-surface.js?v=browser-20260617b"),
+  "Browser clicks must map against the WebRTC video surface without double dispatch or image fallback",
+);
+
+assert(
+  browserJs.includes("function recoverMissingRuntimePage") &&
+    browserJs.includes('recoverMissingRuntimePage(error, "Browser session was released.")') &&
+    !browserJs.includes("Browser Runtime frame was released.") &&
+    browserJs.includes('showStatus("Browser session reconnected.")'),
+  "Browser visible WebRTC pages must recover when the VM page was released behind the iframe",
+);
+
+assert(
+  !browserJs.includes('type: "resize"') &&
+    browserJs.includes("sendBrowserInput(") &&
+    browserJs.includes("function scheduleViewportResize()") &&
     browserJs.includes("lastViewport = viewport;") &&
     !browserJs.includes('event?.type === "resize" && event.viewport') &&
     browserSelkiesControlService.includes(
@@ -576,8 +1672,63 @@ assert(
     browserSelkiesControlService.includes(
       "deviceScaleFactor: config.displaySurface.deviceScaleFactor",
     ) &&
+    browserSelkiesControlService.includes("function mediaKindsForSdp") &&
+    !browserSelkiesControlService.includes("isSelkiesAudioUnavailable") &&
+    !browserSelkiesControlService.includes("audio_offer_unavailable") &&
+    browserSelkiesControlService.includes("const audioMedia = mediaKindsForSdp(audioSdp)") &&
+    browserSelkiesControlService.includes("this.webrtcMedia = { audio: audioMedia.audio, video: media.video }") &&
+    browserSelkiesControlService.includes("audio: audioMedia.audio") &&
+    browserSelkiesControlService.includes("video: media.video") &&
+    browserSelkiesControlServiceSmoke.includes("audio-unavailable product display launch unexpectedly succeeded") &&
+    browserSelkiesControlServiceSmoke.includes("audio-unavailable launch did not fail with a Selkies audio error") &&
+    browserHostedProductSupervisor.includes("hosted product display session must advertise video=true") &&
+    browserHostedProductSupervisor.includes("hosted product display session must report audio availability") &&
+    browserHostedProductSupervisor.includes("hosted product audio sessions must include an audio media section") &&
+    !browserEngineAdapter.includes("supervisor_accepts_video_only_vm_product_display") &&
+    browserEngineAdapter.includes("Browser VM product display sessions must advertise audio=true and video=true") &&
     browserSelkiesControlService.includes('body?.event?.type === "resize"'),
-  "Browser viewport changes must never go through the Selkies pointer datachannel, and stable WebRTC must not send resize commands that freeze the current fixed-compositor stream",
+  "Browser viewport changes must never go through the Selkies pointer datachannel, VM staging must not force a zoomed CSS surface, and media flags must match the negotiated SDP",
+);
+assert(
+  browserJs.includes("const LIBRARY_FILE_PICKER_MAX_BYTES = 16 * 1024 * 1024") &&
+    browserSelkiesControlService.includes("const MAX_BROWSER_FILE_UPLOAD_BYTES = 16 * 1024 * 1024") &&
+    browserVmControlService.includes("const MAX_BROWSER_FILE_UPLOAD_BYTES = 16 * 1024 * 1024") &&
+    browserVmControlService.includes("MAX_BROWSER_INPUT_BODY_BYTES") &&
+    browserVmControlService.includes("await readJsonBody(req, MAX_BROWSER_INPUT_BODY_BYTES)") &&
+    gatewayApi.includes("const BROWSER_FILE_UPLOAD_BYTES: usize = 16 * 1024 * 1024") &&
+    gatewayApi.includes("const BROWSER_INPUT_BODY_MAX_BYTES") &&
+    gatewayApi.includes("DefaultBodyLimit::max(BROWSER_INPUT_BODY_MAX_BYTES)"),
+  "Browser Library file-picker upload size must be enforced consistently in Browser UI, Selkies, VM control, and gateway body limits",
+);
+
+assert(
+  browserJs.includes("function syncDisplayInputFromSession(displaySession)") &&
+    browserJs.includes("syncDisplayInputFromSession(page.display_session)") &&
+    browserJs.includes("currentPage?.display_session?.input === \"datachannel\"") &&
+    browserJs.includes("currentPage?.display_session?.input_protocol === \"selkies_v1\"") &&
+    browserJs.includes('currentInputTransport() === "datachannel"') &&
+    browserJs.includes("PAGE_STATUS_AFTER_INPUT_DELAY_MS") &&
+    browserJs.includes("PAGE_STATUS_AFTER_INPUT_FOLLOWUP_DELAYS_MS") &&
+    browserJs.includes("pageStatusRefreshTimers = delays.map") &&
+    browserJs.includes("schedulePageStatusRefresh") &&
+    browserJs.includes("forceAddress: true") &&
+    browserJs.includes("(!forceAddress && isAddressEditing())") &&
+    browserJs.includes("fast = false") &&
+    browserJs.includes("?fast=1") &&
+    browserJs.includes("fetchPageStatus({ fast: true })") &&
+    browserJs.includes("fetchPageStatus({ history, forceAddress })") &&
+    browserSelkiesControlService.includes("function cachedBrowserPageState(browserPage)") &&
+    browserSelkiesControlService.includes('state_source: fastStatus ? "cache" : "cdp"') &&
+    browserSelkiesControlService.includes("refreshBrowserPageState(") &&
+    browserSelkiesControlService.includes("broken_image_count") &&
+    browserSelkiesControlService.includes("clickable_elements") &&
+    browserSelkiesControlService.includes("top_element") &&
+    browserSelkiesControlService.includes("viewport_width") &&
+    browserSelkiesControlServiceSmoke.includes(
+      "status did not refresh CDP URL after datachannel navigation",
+    ) &&
+    browserSelkiesControlServiceSmoke.includes("fast page status must be cache-backed"),
+  "Browser UI must use the launch display_session as the source of truth for WebRTC datachannel/Selkies input, keep passive polling cache-backed, and force a bounded Runtime page-status refresh after datachannel navigation instead of leaving stale URL/image diagnostics",
 );
 
 assert(
@@ -622,13 +1773,20 @@ assert(
 
 assert(
   browserSessionCapacitySmoke.includes("HOME_VIRTUAL_AUTH_BROWSER_SUMMARY=1") &&
-    browserSessionCapacitySmoke.includes("HOME_VIRTUAL_AUTH_BROWSER_OPEN=0") &&
-    browserSessionCapacitySmoke.includes("node scripts/home-passkey-virtual-auth-smoke.mjs") &&
+    browserSessionCapacitySmoke.includes("HOME_VIRTUAL_AUTH_BROWSER_OPEN=1") &&
+    browserSessionCapacitySmoke.includes("HOME_VIRTUAL_AUTH_BROWSER_EXPECT_CAPACITY_REJECTION") &&
+    browserSessionCapacitySmoke.includes("HOME_VIRTUAL_AUTH_BROWSER_OPEN_CONCURRENT") &&
+    browserSessionCapacitySmoke.includes('HOME_VIRTUAL_AUTH_BROWSER_OPEN_HOLD_MS="${HOME_VIRTUAL_AUTH_BROWSER_OPEN_HOLD_MS:-30000}"') &&
+    browserSessionCapacitySmoke.includes("scripts/home-passkey-virtual-auth-smoke.mjs") &&
     read("scripts/home-passkey-virtual-auth-smoke.mjs").includes(
-      "HOME_VIRTUAL_AUTH_BROWSER_SUMMARY",
+      "HOME_VIRTUAL_AUTH_BROWSER_EXPECT_CAPACITY_REJECTION",
     ) &&
-    read("scripts/README.md").includes("browser-session-capacity-smoke.sh"),
-  "Browser session-capacity proof must have a lightweight summary-only operator gate before heavy Browser opens",
+    read("scripts/home-passkey-virtual-auth-smoke.mjs").includes("await heartbeat();") &&
+    read("scripts/home-passkey-virtual-auth-smoke.mjs").includes("browser_capacity_unavailable") &&
+    read("scripts/README.md").includes("HOME_VIRTUAL_AUTH_BROWSER_OPEN=0 HOME_VIRTUAL_AUTH_BROWSER_SUMMARY=1") &&
+    read("scripts/README.md").includes("holds heartbeats for") &&
+    read("scripts/README.md").includes("browser_capacity_unavailable"),
+  "Browser session-capacity proof must document summary-only checks separately and exercise long-hold heartbeat continuity plus active-page capacity rejection",
 );
 
 for (const component of [

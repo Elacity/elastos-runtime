@@ -35,9 +35,9 @@ pub(super) fn validate_adapter(adapter: &AdapterConfig) -> Result<(), String> {
         return Err("adapter must declare at least one display mode".to_string());
     }
     if adapter.kind == AdapterKind::ContractProof
-        && adapter.display_modes != vec![BrowserDisplayMode::DiagnosticFrame]
+        && adapter.display_modes != vec![BrowserDisplayMode::WebrtcRemoteDisplay]
     {
-        return Err("contract_proof adapters may only declare diagnostic_frame".to_string());
+        return Err("contract_proof adapters may only declare webrtc_remote_display".to_string());
     }
     match adapter.kind {
         AdapterKind::ContractProof => {
@@ -124,6 +124,72 @@ pub(super) fn validate_viewport(viewport: ViewportRequest) -> Result<(), String>
         return Err("browser viewport must be within 320x240 and 3840x2160".to_string());
     }
     Ok(())
+}
+
+pub(super) fn validate_browser_profile(profile: &BrowserProfileDescriptor) -> Result<(), String> {
+    if profile.schema != "elastos.browser.profile/v1" {
+        return Err("unsupported Browser profile schema".to_string());
+    }
+    if profile.scope != "active_principal" {
+        return Err("Browser profile scope must be active_principal".to_string());
+    }
+    if profile.storage != "principal_owned_profile_disk" {
+        return Err("Browser profile storage must be principal_owned_profile_disk".to_string());
+    }
+    if profile.storage_posture != "principal_owned_reset_scoped_unprotected"
+        || profile.protected_storage
+        || profile.encrypted
+        || profile.recoverable
+        || profile.recovery != "not_recovery_kit_packaged"
+    {
+        return Err(
+            "Browser profile storage posture must be principal-owned, reset-scoped, unprotected, unencrypted, and unrecoverable".to_string(),
+        );
+    }
+    if profile.reset != "whole_profile" {
+        return Err("Browser profile reset policy must be whole_profile".to_string());
+    }
+    if profile.public_uri != "localhost://Users/self/BrowserProfiles/default/profile.ext4" {
+        return Err("Browser profile public_uri must use the Users/self alias".to_string());
+    }
+    if !profile.uri.starts_with("localhost://Users/")
+        || !profile
+            .uri
+            .ends_with("/BrowserProfiles/default/profile.ext4")
+        || profile.uri.contains(['\0', '\r', '\n'])
+        || profile.uri.contains("/../")
+        || profile.uri.ends_with("/..")
+    {
+        return Err(
+            "Browser profile uri must be under the active principal BrowserProfiles root"
+                .to_string(),
+        );
+    }
+    if !is_safe_browser_profile_key(&profile.profile_key) {
+        return Err("Browser profile_key must be a safe non-reversible profile id".to_string());
+    }
+    if profile.disk_path.is_empty()
+        || !profile.disk_path.starts_with('/')
+        || profile.disk_path.contains(['\0', '\r', '\n'])
+        || profile.disk_path.contains("/../")
+        || profile.disk_path.ends_with("/..")
+        || !profile
+            .disk_path
+            .ends_with("/BrowserProfiles/default/profile.ext4")
+    {
+        return Err(
+            "Browser profile disk_path must be an absolute active-principal profile disk path"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn is_safe_browser_profile_key(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix("profile-") else {
+        return false;
+    };
+    suffix.len() == 64 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 pub(super) fn validate_stream_session(receipt: &StreamSessionReceipt) -> Result<(), String> {
