@@ -151,6 +151,12 @@ pub async fn run_serve(
                     .and_then(|m| m.http_port)
                     .unwrap_or(4100);
 
+                // G2b: resolve the honest verified-signer (Some only on a real trusted-key
+                // ed25519 match; None when verification is off / unsigned / unmatched), so
+                // the inspector reports "verified" trust strictly behind a genuine check.
+                let verified_signer = runtime
+                    .resolve_verified_signer(&handle.manifest, &capsule_dir)
+                    .await;
                 let runtime_arc = Arc::new(runtime);
                 let capsule_info = elastos_server::runtime::RunningCapsuleInfo {
                     id: handle.id.0.clone(),
@@ -159,6 +165,7 @@ pub async fn run_serve(
                     capsule_type: handle.manifest.capsule_type.clone(),
                     manifest: Box::new(handle.manifest.clone()),
                     handle: Some(handle.clone()),
+                    verified_signer,
                 };
                 runtime_arc.register_capsule(capsule_info).await;
 

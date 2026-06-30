@@ -2237,8 +2237,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "box-only: needs real ~/.local/share/elastos provisioning + /dev/kvm + a non-root shell"]
     async fn launch_failure_leaves_no_orphaned_overlay_socket_or_tap_on_real_kernel() {
-        let data_dir =
-            std::path::PathBuf::from(std::env::var("HOME").expect("HOME set")).join(".local/share/elastos");
+        let data_dir = std::path::PathBuf::from(std::env::var("HOME").expect("HOME set"))
+            .join(".local/share/elastos");
         let components_path = data_dir.join("components.json");
         let mut registry: ComponentsManifest = serde_json::from_str(
             &std::fs::read_to_string(&components_path)

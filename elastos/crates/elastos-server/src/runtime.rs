@@ -11,7 +11,7 @@ use elastos_compute::{CapsuleHandle, ComputeProvider};
 use elastos_storage::StorageProvider;
 
 use elastos_runtime::provider::ProviderRegistry;
-use elastos_runtime::signature::{hash_content, SignatureVerifier};
+use elastos_runtime::signature::{hash_content, key_fingerprint, SignatureVerifier};
 
 /// Information about a running capsule (for API responses and lifecycle management)
 #[derive(Debug, Clone)]
@@ -31,6 +31,12 @@ pub struct RunningCapsuleInfo {
     pub manifest: Box<CapsuleManifest>,
     /// Handle for stopping the capsule (optional, not all capsules have handles)
     pub handle: Option<CapsuleHandle>,
+    /// The HONEST verified-signer fingerprint, set at launch ONLY when the configured
+    /// verifier's real ed25519 check matched a trusted key (G2b). `None` when signature
+    /// verification was disabled (no trusted keys), the capsule was unsigned, or no
+    /// trusted key matched — so the inspector reports "verified" trust strictly behind a
+    /// genuine signature check, never from mere signature presence.
+    pub verified_signer: Option<String>,
 }
 
 /// The main ElastOS runtime
@@ -287,6 +293,24 @@ impl Runtime {
         Ok(())
     }
 
+    /// Resolve the HONEST verified-signer fingerprint for a capsule, for trust
+    /// projection by the inspector (G2b). Thin wrapper that reads the configured
+    /// verifier and delegates to [`resolve_verified_signer_with`].
+    ///
+    /// This is ADDITIVE display truth, NOT an enforcement gate: the fail-closed launch
+    /// gate is [`Runtime::verify_capsule_signature`]. A capsule that launched with the
+    /// gate ENABLED has, by construction, already passed a real check (so this returns
+    /// `Some`); with the gate DISABLED (dev mode) nothing was verified, so this returns
+    /// `None` and the inspector keeps reporting honest presence-based trust.
+    pub async fn resolve_verified_signer(
+        &self,
+        manifest: &CapsuleManifest,
+        path: &Path,
+    ) -> Option<String> {
+        let verifier = self.signature_verifier.read().await;
+        resolve_verified_signer_with(&verifier, manifest, path).await
+    }
+
     /// Stop a running capsule
     pub async fn stop(&self, handle: &CapsuleHandle) -> Result<()> {
         // Find the provider that supports this capsule type
@@ -382,5 +406,157 @@ impl Runtime {
         self.unregister_capsule(id).await;
 
         Ok(true)
+    }
+}
+
+/// Resolve the verified-signer fingerprint for a capsule against a specific verifier
+/// (G2b) — the testable core behind [`Runtime::resolve_verified_signer`].
+///
+/// Returns `Some(fingerprint)` ONLY when ALL hold: the verifier has trusted keys
+/// (`is_enabled()`), the manifest carries a signature, the entrypoint is readable, and a
+/// real ed25519 check matches one of the trusted keys. Any other case — disabled
+/// verifier, unsigned manifest, unreadable entrypoint, structurally bad signature, or no
+/// trusted-key match — is `None`. It NEVER fabricates a signer: absence of a genuine
+/// match is `None`, so a capsule can read "verified" only behind a real signature check.
+pub(crate) async fn resolve_verified_signer_with(
+    verifier: &SignatureVerifier,
+    manifest: &CapsuleManifest,
+    path: &Path,
+) -> Option<String> {
+    if !verifier.is_enabled() {
+        return None;
+    }
+    // Unsigned ⇒ no verified signer (the launch gate rejects this when enabled anyway).
+    manifest.signature.as_ref()?;
+    let entrypoint_path = path.join(&manifest.entrypoint);
+    let content = tokio::fs::read(&entrypoint_path).await.ok()?;
+    let content_hash = hash_content(&content);
+    // A real ed25519 check; `Err` (bad signature bytes) and `Ok(None)` (no trusted key
+    // matched) both collapse to `None` — never an upgraded trust without a true match.
+    let key = verifier
+        .verify_capsule_signer(manifest, &content_hash)
+        .ok()??;
+    Some(key_fingerprint(&key))
+}
+
+#[cfg(test)]
+mod verified_signer_tests {
+    use super::*;
+    use elastos_common::{CapsuleType, Permissions, ResourceLimits};
+    use elastos_runtime::signature::{generate_keypair, key_fingerprint, sign_capsule};
+
+    fn test_manifest() -> CapsuleManifest {
+        CapsuleManifest {
+            schema: elastos_common::SCHEMA_V1.into(),
+            version: "0.1.0".into(),
+            name: "vm-player".into(),
+            description: Some("Test".into()),
+            author: Some("Test Author".into()),
+            role: elastos_common::CapsuleRole::App,
+            capsule_type: CapsuleType::Wasm,
+            entrypoint: "main.wasm".into(),
+            requires: Vec::new(),
+            provides: None,
+            authority: None,
+            capabilities: Vec::new(),
+            interfaces: Vec::new(),
+            resources: ResourceLimits::default(),
+            permissions: Permissions::default(),
+            microvm: None,
+            providers: None,
+            viewer: None,
+            signature: None,
+        }
+    }
+
+    /// Write the entrypoint bytes into a temp dir and sign the manifest over their hash,
+    /// exactly as the launch path will read+verify them. Returns (dir, content_bytes).
+    fn signed_capsule_dir(
+        signing_key: &elastos_runtime::signature::SigningKey,
+        manifest: &mut CapsuleManifest,
+    ) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let content = b"entrypoint bytes";
+        std::fs::write(dir.path().join(&manifest.entrypoint), content).unwrap();
+        let content_hash = hash_content(content);
+        sign_capsule(signing_key, manifest, &content_hash).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn a_trusted_key_match_yields_the_signer_fingerprint() {
+        let (sk, vk) = generate_keypair();
+        let mut manifest = test_manifest();
+        let dir = signed_capsule_dir(&sk, &mut manifest);
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_trusted_key(vk);
+
+        let signer = resolve_verified_signer_with(&verifier, &manifest, dir.path()).await;
+        assert_eq!(
+            signer,
+            Some(key_fingerprint(&vk)),
+            "a real trusted-key match yields that key's fingerprint"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disabled_verifier_yields_none_even_for_a_signed_capsule() {
+        let (sk, _vk) = generate_keypair();
+        let mut manifest = test_manifest();
+        let dir = signed_capsule_dir(&sk, &mut manifest);
+        // No trusted keys ⇒ verification was OFF ⇒ no verified signer (honest), even
+        // though the manifest is signed.
+        let verifier = SignatureVerifier::new();
+        assert_eq!(
+            resolve_verified_signer_with(&verifier, &manifest, dir.path()).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_signer_yields_none() {
+        let (sk, _vk) = generate_keypair();
+        let (_other_sk, other_vk) = generate_keypair();
+        let mut manifest = test_manifest();
+        let dir = signed_capsule_dir(&sk, &mut manifest);
+        // The capsule is signed, but by a key the verifier does not trust.
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_trusted_key(other_vk);
+        assert_eq!(
+            resolve_verified_signer_with(&verifier, &manifest, dir.path()).await,
+            None,
+            "an untrusted signature is not a verified signer (verification, not presence)"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_manifest_yields_none() {
+        let (_sk, vk) = generate_keypair();
+        let manifest = test_manifest(); // never signed
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(&manifest.entrypoint), b"x").unwrap();
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_trusted_key(vk);
+        assert_eq!(
+            resolve_verified_signer_with(&verifier, &manifest, dir.path()).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_entrypoint_yields_none_not_a_panic() {
+        let (sk, vk) = generate_keypair();
+        let mut manifest = test_manifest();
+        // Sign over some content, but DON'T write the entrypoint file — the resolver must
+        // fail honest (None), never panic or fabricate a signer.
+        let content_hash = hash_content(b"entrypoint bytes");
+        sign_capsule(&sk, &mut manifest, &content_hash).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_trusted_key(vk);
+        assert_eq!(
+            resolve_verified_signer_with(&verifier, &manifest, dir.path()).await,
+            None
+        );
     }
 }

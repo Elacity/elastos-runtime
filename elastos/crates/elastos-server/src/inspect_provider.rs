@@ -427,9 +427,10 @@ fn running_to_entry(info: crate::runtime::RunningCapsuleInfo) -> InspectEntry {
         capsule_type: format!("{:?}", info.capsule_type).to_lowercase(),
         manifest: Some(*info.manifest),
         cid: None,
-        // Launch-time verification result is threaded here in loop 3c; until then
-        // running capsules report honest presence-based trust, never "verified".
-        verified_signer: None,
+        // G2b: the launch-time verified-signer is threaded straight through — `Some` only
+        // when a real trusted-key ed25519 check matched at launch, so a running capsule
+        // reads "verified" trust strictly behind a genuine signature check.
+        verified_signer: info.verified_signer,
     }
 }
 
