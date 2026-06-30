@@ -495,6 +495,9 @@ fn system_runtime_event_summary(
         | AuditEvent::SpendDebit { timestamp, .. }
         | AuditEvent::BudgetExhausted { timestamp, .. }
         | AuditEvent::EgressDenied { timestamp, .. }
+        | AuditEvent::IntentDeclared { timestamp, .. }
+        | AuditEvent::IntentDenied { timestamp, .. }
+        | AuditEvent::IntentReconciled { timestamp, .. }
         | AuditEvent::IdentityRegistered { timestamp, .. }
         | AuditEvent::StorageAccess { timestamp, .. }
         | AuditEvent::MessageSent { timestamp, .. }
@@ -576,6 +579,31 @@ fn system_runtime_event_summary(
         AuditEvent::EgressDenied {
             capsule_id, dest, ..
         } => format!("Egress blocked — {capsule_id} → {dest}"),
+        // The routine "before" of every act (intent-proof loop) — too frequent for the ribbon.
+        AuditEvent::IntentDeclared { .. } => return None,
+        // A refused act (intent ⊄ envelope) is a notable containment moment.
+        AuditEvent::IntentDenied {
+            capsule_id,
+            method_id,
+            reason,
+            ..
+        } => format!("Intent denied — {capsule_id} {method_id} ({reason})"),
+        // Only a DIVERGED / UNDELIVERED verdict is notable; a clean match is routine.
+        AuditEvent::IntentReconciled {
+            capsule_id,
+            status,
+            divergence_detail,
+            ..
+        } => {
+            if status == "matched" {
+                return None;
+            }
+            if divergence_detail.is_empty() {
+                format!("Intent {status} — {capsule_id}")
+            } else {
+                format!("Intent {status} — {capsule_id} ({divergence_detail})")
+            }
+        }
         AuditEvent::IdentityRegistered {
             user_id, method, ..
         } => format!("Registered identity {user_id} via {method}"),

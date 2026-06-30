@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::capability::receipt::AffordanceGrantReceiptV1;
+use crate::primitives::audit::AuditEvent;
 use crate::primitives::time::SecureTimestamp;
 
 /// Schema tag for the v1 intent declaration.
@@ -168,6 +169,20 @@ pub enum EnvelopeDenial {
     MethodNotInEnvelope,
     WrongResource,
     WrongAction,
+}
+
+impl EnvelopeDenial {
+    /// Stable snake_case reason string for the on-chain `IntentDenied` record.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EnvelopeDenial::Revoked => "revoked",
+            EnvelopeDenial::Expired => "expired",
+            EnvelopeDenial::WrongCapsule => "wrong_capsule",
+            EnvelopeDenial::MethodNotInEnvelope => "method_not_in_envelope",
+            EnvelopeDenial::WrongResource => "wrong_resource",
+            EnvelopeDenial::WrongAction => "wrong_action",
+        }
+    }
 }
 
 /// The verifier's verdict: the intent is within the envelope, or denied with a reason.
@@ -351,6 +366,57 @@ fn verify_b64_sig(signature_b64: &str, digest: &[u8; 32], verifying_key: &Verify
     };
     let signature = Signature::from_bytes(&sig_arr);
     verifying_key.verify(digest, &signature).is_ok()
+}
+
+// ─────────────────────────── On-chain custody events (chunk 2) ────────────────
+// Turn the intent records + verdict into `AuditEvent`s for the signed hash chain, so the
+// declaration, a denial, and the declared-vs-done verdict are tamper-evident custody —
+// keyed on the canonical `vm-{name}` like the spend/grant/egress records. Emitting these
+// onto a live `AuditLog` (and the wiring into dispatch) is the caller's job / a later
+// chunk; these are the pure event builders.
+
+/// Custody event for a declared intent (the agent's recorded proof obligation).
+pub fn intent_declared_event(intent: &IntentDeclarationV1) -> AuditEvent {
+    AuditEvent::IntentDeclared {
+        timestamp: SecureTimestamp::now(),
+        capsule_id: intent.capsule.clone(),
+        intent_id: intent.intent_id.clone(),
+        method_id: intent.method_id.clone(),
+        resource: intent.resource.clone(),
+        action: intent.action.clone(),
+        standing_grant_id: intent.standing_grant_id.clone(),
+    }
+}
+
+/// Custody event for an intent DENIED outside its envelope (`intent ⊄ envelope`),
+/// carrying the fail-closed reason — a refused act leaves a signed trace.
+pub fn intent_denied_event(intent: &IntentDeclarationV1, denial: EnvelopeDenial) -> AuditEvent {
+    AuditEvent::IntentDenied {
+        timestamp: SecureTimestamp::now(),
+        capsule_id: intent.capsule.clone(),
+        intent_id: intent.intent_id.clone(),
+        method_id: intent.method_id.clone(),
+        resource: intent.resource.clone(),
+        action: intent.action.clone(),
+        standing_grant_id: intent.standing_grant_id.clone(),
+        reason: denial.as_str().to_string(),
+    }
+}
+
+/// Custody event for the declared-vs-done verdict. `capsule_id` (the acting `vm-{name}`)
+/// is supplied by the caller, since the reconciliation record correlates by `intent_id`.
+pub fn intent_reconciled_event(
+    reconciliation: &IntentReconciliationV1,
+    capsule_id: &str,
+) -> AuditEvent {
+    AuditEvent::IntentReconciled {
+        timestamp: SecureTimestamp::now(),
+        capsule_id: capsule_id.to_string(),
+        intent_id: reconciliation.intent_id.clone(),
+        receipt_id: reconciliation.receipt_id.clone(),
+        status: reconciliation.status.as_str().to_string(),
+        divergence_detail: reconciliation.divergence_detail.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -591,6 +657,105 @@ mod tests {
         assert!(
             !detail.is_empty(),
             "undelivered is recorded with a reason, never silent"
+        );
+    }
+
+    // ── Chunk 2: on-chain custody events ───────────────────────────────────────
+
+    #[test]
+    fn intent_events_carry_their_type_names_and_denial_reason() {
+        let sk = key();
+        let intent = an_intent(&sk, "send", "h");
+        assert_eq!(
+            intent_declared_event(&intent).event_type_name(),
+            "intent_declared"
+        );
+        let denied = intent_denied_event(&intent, EnvelopeDenial::MethodNotInEnvelope);
+        assert_eq!(denied.event_type_name(), "intent_denied");
+        match denied {
+            AuditEvent::IntentDenied { reason, .. } => {
+                assert_eq!(reason, "method_not_in_envelope")
+            }
+            other => panic!("expected IntentDenied, got {other:?}"),
+        }
+        let rec = IntentReconciliationV1::issue(
+            &sk,
+            sk.verifying_key().to_bytes(),
+            "intent-1",
+            "",
+            ReconciliationStatus::Matched,
+            "",
+        );
+        assert_eq!(
+            intent_reconciled_event(&rec, "vm-agent").event_type_name(),
+            "intent_reconciled"
+        );
+    }
+
+    #[test]
+    fn every_denial_reason_has_a_stable_string() {
+        for (denial, expected) in [
+            (EnvelopeDenial::Revoked, "revoked"),
+            (EnvelopeDenial::Expired, "expired"),
+            (EnvelopeDenial::WrongCapsule, "wrong_capsule"),
+            (
+                EnvelopeDenial::MethodNotInEnvelope,
+                "method_not_in_envelope",
+            ),
+            (EnvelopeDenial::WrongResource, "wrong_resource"),
+            (EnvelopeDenial::WrongAction, "wrong_action"),
+        ] {
+            assert_eq!(denial.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn intent_custody_events_emit_onto_the_durable_chain_and_verify() {
+        // The Kent Beck bar: the declaration, the denial (with reason), and the verdict ride
+        // the SAME ed25519 signed hash chain as every other custody record — and the whole
+        // chain self-verifies via chain_attestation, exactly as in production.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let log = crate::primitives::audit::AuditLog::with_file(&path).unwrap();
+
+        let sk = key();
+        let intent = an_intent(&sk, "send", "args-abc");
+
+        // 1. declared
+        log.emit(intent_declared_event(&intent))
+            .expect("emit declared");
+
+        // 2. denied — method not in this envelope ⇒ a real EnvelopeDenial reason on-chain
+        let EnvelopeCheck::Denied(reason) =
+            check_intent_within_envelope(&intent, &an_envelope(&["draft"]))
+        else {
+            panic!("expected a denial");
+        };
+        log.emit(intent_denied_event(&intent, reason))
+            .expect("emit denied");
+
+        // 3. reconciled — undelivered (declared, no receipt)
+        let (status, detail) = reconcile(&intent, None);
+        let rec = IntentReconciliationV1::issue(
+            &sk,
+            sk.verifying_key().to_bytes(),
+            &intent.intent_id,
+            "",
+            status,
+            &detail,
+        );
+        log.emit(intent_reconciled_event(&rec, &intent.capsule))
+            .expect("emit reconciled");
+
+        // The whole chain (declared → denied → reconciled) verifies under the log's key.
+        let att = log.chain_attestation().expect("file-backed ⇒ attestable");
+        assert!(
+            att.verified,
+            "intent custody records chain + verify: {att:?}"
+        );
+        assert_eq!(
+            att.records, 3,
+            "all three intent custody records are on-chain"
         );
     }
 }

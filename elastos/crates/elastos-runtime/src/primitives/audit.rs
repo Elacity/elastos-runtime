@@ -315,6 +315,52 @@ pub enum AuditEvent {
         suppressed: u64,
     },
 
+    /// An agent DECLARED an intent before acting (intent-proof loop). The agent's signed
+    /// proof obligation, recorded on-chain so "what it said it would do" is tamper-evident
+    /// custody independent of the outcome. See `capability::intent::IntentDeclarationV1`.
+    IntentDeclared {
+        timestamp: SecureTimestamp,
+        /// Canonical capsule identity (`vm-{name}`) for custody correlation.
+        capsule_id: String,
+        /// The declaration id (`IntentDeclarationV1::intent_id`).
+        intent_id: String,
+        method_id: String,
+        resource: String,
+        action: String,
+        /// The standing-grant envelope the intent claimed to fall within.
+        standing_grant_id: String,
+    },
+
+    /// An intent was DENIED because it fell outside its standing-grant envelope
+    /// (`intent ⊄ envelope`), fail-closed. A refused act leaves a signed trace WITH its
+    /// reason — absence is never a pass.
+    IntentDenied {
+        timestamp: SecureTimestamp,
+        capsule_id: String,
+        intent_id: String,
+        method_id: String,
+        resource: String,
+        action: String,
+        standing_grant_id: String,
+        /// The fail-closed denial reason (`EnvelopeDenial`, e.g. `method_not_in_envelope`).
+        reason: String,
+    },
+
+    /// The declared-vs-done verdict for an intent (intent-proof loop): `matched`,
+    /// `diverged` (a redeemed field differs from the declaration), or `undelivered`
+    /// (declared, no receipt). The gap between said and done, made tamper-evident.
+    IntentReconciled {
+        timestamp: SecureTimestamp,
+        capsule_id: String,
+        intent_id: String,
+        /// The reconciled receipt's token id (empty when `undelivered`).
+        receipt_id: String,
+        /// `matched` | `diverged` | `undelivered`.
+        status: String,
+        /// Diverged-field list / undelivered reason; empty when `matched`.
+        divergence_detail: String,
+    },
+
     /// Identity registered (passkey)
     IdentityRegistered {
         timestamp: SecureTimestamp,
@@ -1117,6 +1163,9 @@ impl AuditEvent {
             AuditEvent::SpendDebit { .. } => "spend_debit",
             AuditEvent::BudgetExhausted { .. } => "budget_exhausted",
             AuditEvent::EgressDenied { .. } => "egress_denied",
+            AuditEvent::IntentDeclared { .. } => "intent_declared",
+            AuditEvent::IntentDenied { .. } => "intent_denied",
+            AuditEvent::IntentReconciled { .. } => "intent_reconciled",
             AuditEvent::IdentityRegistered { .. } => "identity_registered",
             AuditEvent::StorageAccess { .. } => "storage_access",
             AuditEvent::MessageSent { .. } => "message_sent",
