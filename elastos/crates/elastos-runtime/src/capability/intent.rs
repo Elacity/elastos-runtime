@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::capability::receipt::AffordanceGrantReceiptV1;
+use crate::capability::token::CapabilityToken;
 use crate::primitives::audit::AuditEvent;
 use crate::primitives::time::SecureTimestamp;
 
@@ -147,15 +148,45 @@ pub struct StandingGrantEnvelope {
     pub allowed_methods: BTreeSet<String>,
     pub resource: String,
     pub action: String,
-    pub expires_at: SecureTimestamp,
+    /// Expiry; `None` = never expires (until revoked), mirroring `CapabilityToken::expiry`.
+    pub expires_at: Option<SecureTimestamp>,
     pub revoked: bool,
 }
 
 impl StandingGrantEnvelope {
     /// Active = not revoked AND not past expiry. Fail-closed: a revoked or expired
-    /// envelope authorizes nothing.
+    /// envelope authorizes nothing. A `None` expiry never expires (until revoked).
     pub fn is_active(&self) -> bool {
-        !self.revoked && self.expires_at.is_future()
+        if self.revoked {
+            return false;
+        }
+        match self.expires_at {
+            Some(exp) => exp.is_future(),
+            None => true,
+        }
+    }
+
+    /// Derive a standing envelope from a real issued [`CapabilityToken`] (chunk 3): the
+    /// token supplies the authority that is actually signed into it — `capsule`,
+    /// `resource`, `action`, and `expiry`. The token does NOT enumerate affordance
+    /// methods, nor does it carry revocation status (revocation is external state held by
+    /// the `CapabilityManager`), so `allowed_methods` and `revoked` are supplied by the
+    /// caller. This is the honest seam: the cryptographic grant gives the resource/action
+    /// envelope; the method mapping + revocation check are layered on by the dispatcher.
+    pub fn from_token(
+        token: &CapabilityToken,
+        allowed_methods: BTreeSet<String>,
+        revoked: bool,
+    ) -> Self {
+        StandingGrantEnvelope {
+            grant_id: token.id().to_string(),
+            capsule: token.capsule().to_string(),
+            allowed_methods,
+            resource: token.resource().to_string(),
+            action: token.action().to_string(),
+            expires_at: token.expiry().copied(),
+            revoked,
+        }
     }
 }
 
@@ -203,8 +234,10 @@ pub fn check_intent_within_envelope(
     if envelope.revoked {
         return EnvelopeCheck::Denied(EnvelopeDenial::Revoked);
     }
-    if !envelope.expires_at.is_future() {
-        return EnvelopeCheck::Denied(EnvelopeDenial::Expired);
+    if let Some(exp) = envelope.expires_at {
+        if !exp.is_future() {
+            return EnvelopeCheck::Denied(EnvelopeDenial::Expired);
+        }
     }
     if intent.capsule != envelope.capsule {
         return EnvelopeCheck::Denied(EnvelopeDenial::WrongCapsule);
@@ -448,7 +481,7 @@ mod tests {
             allowed_methods: methods.iter().map(|m| m.to_string()).collect(),
             resource: "elastos://mail/send".to_string(),
             action: "execute".to_string(),
-            expires_at: SecureTimestamp::after_secs(3600),
+            expires_at: Some(SecureTimestamp::after_secs(3600)),
             revoked: false,
         }
     }
@@ -584,7 +617,7 @@ mod tests {
         );
 
         let mut expired = an_envelope(&["send"]);
-        expired.expires_at = SecureTimestamp::at(1); // far in the past
+        expired.expires_at = Some(SecureTimestamp::at(1)); // far in the past
         assert_eq!(
             check_intent_within_envelope(&intent, &expired),
             EnvelopeCheck::Denied(EnvelopeDenial::Expired)
@@ -605,6 +638,75 @@ mod tests {
         assert_eq!(
             check_intent_within_envelope(&an_intent(&sk, "send", "args-two"), &env),
             EnvelopeCheck::Allowed
+        );
+    }
+
+    // ── Chunk 3: derive the envelope from a real CapabilityToken ───────────────
+
+    #[test]
+    fn from_token_derives_the_envelope_and_drives_the_same_check() {
+        use crate::capability::token::{Action, ResourceId, TokenConstraints};
+
+        let token = CapabilityToken::new(
+            "vm-agent".to_string(),
+            [0u8; 32],
+            ResourceId::new("elastos://mail/send"),
+            Action::Execute,
+            TokenConstraints::default(),
+            SecureTimestamp::now(),
+            Some(SecureTimestamp::after_secs(3600)),
+        );
+        let methods: BTreeSet<String> = ["send", "draft"].iter().map(|m| m.to_string()).collect();
+        let env = StandingGrantEnvelope::from_token(&token, methods, false);
+
+        // The token supplies capsule/resource/action/expiry that were actually signed in.
+        assert_eq!(env.capsule, "vm-agent");
+        assert_eq!(env.resource, "elastos://mail/send");
+        assert_eq!(env.action, "execute", "Action::Execute → \"execute\"");
+        assert_eq!(env.grant_id, token.id().to_string());
+        assert!(
+            env.is_active(),
+            "a fresh, unrevoked, future-expiry token is active"
+        );
+
+        // The token-derived envelope drives the SAME containment check as a hand-built one.
+        let sk = key();
+        assert_eq!(
+            check_intent_within_envelope(&an_intent(&sk, "send", "h"), &env),
+            EnvelopeCheck::Allowed
+        );
+        assert_eq!(
+            check_intent_within_envelope(&an_intent(&sk, "delete", "h"), &env),
+            EnvelopeCheck::Denied(EnvelopeDenial::MethodNotInEnvelope)
+        );
+    }
+
+    #[test]
+    fn from_token_none_expiry_never_expires_and_revoked_is_honored() {
+        use crate::capability::token::{Action, ResourceId, TokenConstraints};
+
+        // None expiry = "until revoked": the envelope never expires on time alone.
+        let token = CapabilityToken::new(
+            "vm-agent".to_string(),
+            [0u8; 32],
+            ResourceId::new("elastos://mail/send"),
+            Action::Execute,
+            TokenConstraints::default(),
+            SecureTimestamp::now(),
+            None,
+        );
+        let methods: BTreeSet<String> = ["send"].iter().map(|m| m.to_string()).collect();
+        let active = StandingGrantEnvelope::from_token(&token, methods.clone(), false);
+        assert_eq!(active.expires_at, None);
+        assert!(active.is_active(), "None expiry never expires");
+
+        // The caller's external revocation check is honored, fail-closed.
+        let revoked = StandingGrantEnvelope::from_token(&token, methods, true);
+        assert!(!revoked.is_active());
+        let sk = key();
+        assert_eq!(
+            check_intent_within_envelope(&an_intent(&sk, "send", "h"), &revoked),
+            EnvelopeCheck::Denied(EnvelopeDenial::Revoked)
         );
     }
 
