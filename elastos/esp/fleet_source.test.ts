@@ -21,7 +21,7 @@ import {
   inspectCustody,
   spendFromInspect,
 } from "./fleet_source.js";
-import { homeView } from "./home.js";
+import { homeCapsules, homeView } from "./home.js";
 
 // A faithful slice of inspect_provider.rs `project()` output for one capsule. Carries
 // the inspector's OWN trust_level ("signed" — a vocabulary we must IGNORE) and extra
@@ -121,6 +121,28 @@ describe("fleetEntries (catalog ⨝ inspector custody)", () => {
     // vm-c has no inspector custody yet ⇒ fail-honest null/null (unmetered + absent).
     assert.equal(entries[2].spendBudget, null);
     assert.equal(entries[2].auditChain, null);
+  });
+
+  it("scoping to Home capsules first drops infra noise from the live attention count", () => {
+    // The live finding: a full catalog of mostly-unsigned providers read as "44 of 45 need
+    // attention". Scoping to the user-facing set (homeCapsules) BEFORE the join means the
+    // headline reflects only user capsules — exactly one app here, honestly un-flagged.
+    const fullCatalog = [
+      { name: "vm-act", title: "Act", trust_state: "cid-with-manifest-signature", role: "app" },
+      ...Array.from({ length: 20 }, (_, i) => ({
+        name: `prov-${i}`,
+        title: `Provider ${i}`,
+        trust_state: "local-dev", // unsigned infra — each would trip attention if shown
+        role: "provider",
+      })),
+    ];
+    const scoped = homeCapsules(fullCatalog);
+    const custody = custodyMap([
+      inspectData({ name: "vm-act", spend_budget: { limit: 100, spent: 1, remaining: 99 }, audit: { chain: { verified: true, records: 3, signer: "k", error: null } } }),
+    ]);
+    const view = homeView(fleetEntries(scoped, custody));
+    assert.equal(view.total, 1, "only the user-facing app remains on Home");
+    assert.equal(view.needsAttention, 0, "no infra providers left to cry wolf over");
   });
 
   it("end-to-end: fleetEntries → homeView attention reflects the joined honest states", () => {

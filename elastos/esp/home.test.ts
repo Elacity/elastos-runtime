@@ -13,7 +13,13 @@ import { describe, it } from "node:test";
 
 import type { ChainAttestation } from "./ai_act_audit.js";
 import { capsuleDetailView } from "./capsule_detail.js";
-import { homeView, capsuleNeedsAttention, type CapsuleFleetEntry } from "./home.js";
+import {
+  homeView,
+  capsuleNeedsAttention,
+  homeCapsules,
+  isHomeCapsule,
+  type CapsuleFleetEntry,
+} from "./home.js";
 
 const verifiedChain: ChainAttestation = { verified: true, records: 9, signer: "k", error: null };
 const brokenChain: ChainAttestation = { verified: false, records: 0, signer: "k", error: "tamper" };
@@ -83,6 +89,29 @@ describe("homeView (Home fleet composition)", () => {
     assert.deepEqual(v.capsules, []);
     assert.equal(v.total, 0);
     assert.equal(v.needsAttention, 0);
+  });
+
+  it("homeCapsules scopes to the user-facing set (drops provider/content infra)", () => {
+    const catalog = [
+      { name: "vm-agent", title: "Agent", trust_state: "local-dev", role: "app" },
+      { name: "vm-owned", title: "Owned Video", trust_state: "local-dev", role: "viewer" },
+      { name: "shell", title: "Shell", trust_state: "local-dev", role: "shell" },
+      { name: "ai-provider", title: "Ai Provider", trust_state: "local-dev", role: "provider" },
+      { name: "block", title: "Content Block", trust_state: "local-dev", role: "content" },
+    ];
+    const home = homeCapsules(catalog);
+    assert.deepEqual(
+      home.map((c) => c.name),
+      ["vm-agent", "vm-owned", "shell"],
+      "providers and content are dropped; app/viewer/shell kept in order",
+    );
+    // The predicate mirrors CapsuleRole::is_shell_launchable.
+    assert.equal(isHomeCapsule("app"), true);
+    assert.equal(isHomeCapsule("viewer"), true);
+    assert.equal(isHomeCapsule("shell"), true);
+    assert.equal(isHomeCapsule("provider"), false);
+    assert.equal(isHomeCapsule("content"), false);
+    assert.equal(isHomeCapsule("some-future-role"), false, "unknown role is not Home (fail-honest)");
   });
 
   it("a single wrong sub-state is enough — attention is OR over the three", () => {

@@ -40,6 +40,31 @@ export interface HomeView {
 }
 
 /**
+ * Capsule roles that belong on the USER-FACING Home — the shell-launchable set, mirroring
+ * the runtime's `CapsuleRole::is_shell_launchable` (`shell | app | viewer`). Infrastructure
+ * roles (`provider`, `content`) are operator / data surfaces, not Home: they are never
+ * signed by a third-party author, so showing them on Home as "unsigned → needs attention"
+ * cries wolf over what is by-design internal machinery. Excluding them keeps Home a
+ * truthful view of what a user actually launches.
+ */
+const HOME_ROLES: ReadonlySet<string> = new Set(["shell", "app", "viewer"]);
+
+/** Whether a capsule role belongs on the user-facing Home (see [`HOME_ROLES`]). */
+export function isHomeCapsule(role: string): boolean {
+  return HOME_ROLES.has(role);
+}
+
+/**
+ * Scope a catalog down to the user-facing Home set (drops infrastructure providers and
+ * content). Pure filter, input order preserved — the Home renders what a user launches,
+ * not the runtime's internal provider capsules. Apply BEFORE `fleetEntries` so the
+ * attention count reflects only user-facing capsules.
+ */
+export function homeCapsules<T extends { role: string }>(capsules: ReadonlyArray<T>): T[] {
+  return capsules.filter((c) => isHomeCapsule(c.role));
+}
+
+/**
  * Whether a capsule is in an unambiguously-wrong custody/trust state that an auditor
  * should be drawn to. This is a pure DISPLAY policy (like `SPEND_WARNING_FRACTION`):
  * it flags only the three states that mean "something is wrong or unprovable" —
