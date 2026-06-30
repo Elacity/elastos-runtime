@@ -29,7 +29,12 @@ The script preserves initrd/rootfs symlinks by updating their resolved targets.
 It creates timestamped backups before every changed installed helper or VM
 artifact write. Finish target closeout by running:
 
-  scripts/jetson-browser-runtime-audit.mjs --require-parity
+  scripts/jetson-browser-runtime-audit.mjs \
+    --host <target-host> \
+    --user <target-user> \
+    --data-dir <target-elastos-data-dir> \
+    --source-dir <target-source-checkout> \
+    --require-parity
 EOF
 }
 

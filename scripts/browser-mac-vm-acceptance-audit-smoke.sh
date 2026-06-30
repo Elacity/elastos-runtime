@@ -363,7 +363,7 @@ write_machine_proof "$tmp_dir/mac-generic-profile.json" "Log In Profile director
   const proof = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
   proof.profile_reset.receipt.profile.profile_key = "profile-secret";
   proof.profile_reset.receipt.profile.principal_id = "person:local:secret";
-  proof.profile_reset.receipt.profile.disk_path = "/Users/anders/elastos/Users/0123456789ab/BrowserProfiles/default/profile.ext4";
+  proof.profile_reset.receipt.profile.disk_path = "/Users/operator/elastos/Users/0123456789ab/BrowserProfiles/default/profile.ext4";
   fs.writeFileSync(process.argv[2], `${JSON.stringify(proof, null, 2)}\n`);
 ' "$tmp_dir/mac-authenticated.json" "$tmp_dir/mac-leaky-profile-reset.json"
 
@@ -411,13 +411,13 @@ const sourceHomeRestart = {
   ok: true,
   dry_run: false,
   generated_at: "2026-06-19T00:00:00.000Z",
-  repo: "/Users/anders/Code/elastos-runtime",
-  test_home: "/Users/anders/elastos-mac-test-home",
-  data_dir: "/Users/anders/elastos-mac-test-home/Library/Application Support/elastos",
+  repo: "/Users/operator/Code/elastos-runtime",
+  test_home: "/Users/operator/elastos-mac-test-home",
+  data_dir: "/Users/operator/elastos-mac-test-home/Library/Application Support/elastos",
   addr: "localhost:61180",
   home_url: "http://localhost:61180/apps/home/",
-  gateway_bin: "/Users/anders/Code/elastos-runtime/elastos/target/release/elastos",
-  gateway_log: "/Users/anders/elastos-mac-test-home/logs/gateway-smoke.log",
+  gateway_bin: "/Users/operator/Code/elastos-runtime/elastos/target/release/elastos",
+  gateway_log: "/Users/operator/elastos-mac-test-home/logs/gateway-smoke.log",
   http_code: 200,
   served_index_sha256: proof.home.installed_index_sha256,
   installed_index_sha256: proof.home.installed_index_sha256,

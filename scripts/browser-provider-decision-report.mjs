@@ -6,9 +6,7 @@ import { spawnSync } from "node:child_process";
 import process from "node:process";
 
 const selkiesBaselineConfig = "/tmp/elastos-browser-selkies-live/browser-engine-adapter.json";
-const gatewayLiveConfig = "/home/wau/.local/share/elastos-public-gateway-live/xdg-data/elastos/config/browser-engine-adapter.json";
 const userDataHomeConfig = path.join(os.homedir(), "Library/Application Support/elastos/config/browser-engine-adapter.json");
-const macStagingConfig = path.join(os.homedir(), "elastos-mac-test-home/Library/Application Support/elastos/config/browser-engine-adapter.json");
 const nodeBinary = process.execPath;
 
 function defaultLiveConfig() {
@@ -16,8 +14,6 @@ function defaultLiveConfig() {
     return process.env.ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG;
   }
   for (const candidate of [
-    gatewayLiveConfig,
-    macStagingConfig,
     userDataHomeConfig,
     selkiesBaselineConfig,
   ]) {
@@ -136,13 +132,6 @@ function discoverNativeBrowserProgram(explicitProgram) {
   for (const command of ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "brave-browser"]) {
     const found = commandPath(command);
     if (found) return found;
-  }
-  for (const candidate of [
-    "/home/wau/.cache/ms-playwright/chromium-1217/chrome-linux64/chrome",
-    "/home/wau/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome",
-    "/home/wau/.cache/ms-playwright/chromium-1181/chrome-linux/chrome",
-  ]) {
-    if (fs.existsSync(candidate)) return candidate;
   }
   return "";
 }

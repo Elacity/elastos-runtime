@@ -3,7 +3,7 @@ set -euo pipefail
 
 SERVER_URL="${ELASTOS_CHAT_ROOM_SERVER_URL:-http://127.0.0.1:8090}"
 MAC_URL="${ELASTOS_CHAT_ROOM_MAC_URL:-http://localhost:61180}"
-MAC_SSH="${ELASTOS_CHAT_ROOM_MAC_SSH:-elastos-mac-staging}"
+MAC_SSH="${ELASTOS_CHAT_ROOM_MAC_SSH:-}"
 EXPECTED_DIDS="${ELASTOS_CHAT_ROOM_EXPECTED_DIDS:-}"
 
 usage() {
@@ -14,7 +14,7 @@ Usage:
 Environment:
   ELASTOS_CHAT_ROOM_SERVER_URL       Linux/public gateway URL. Default: http://127.0.0.1:8090
   ELASTOS_CHAT_ROOM_MAC_URL          Mac staging gateway URL as seen from the Mac. Default: http://localhost:61180
-  ELASTOS_CHAT_ROOM_MAC_SSH          SSH host used to fetch Mac summary. Default: elastos-mac-staging
+  ELASTOS_CHAT_ROOM_MAC_SSH          SSH host used to fetch Mac summary. Default: empty, skip Mac.
                                      Set empty to skip Mac.
   ELASTOS_CHAT_ROOM_EXPECTED_DIDS    Optional comma-separated member DIDs expected in room_control on every checked runtime.
 

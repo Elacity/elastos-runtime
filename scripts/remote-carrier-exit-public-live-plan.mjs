@@ -8,7 +8,6 @@ import { fileURLToPath } from "node:url";
 
 import { analyzeRemoteCarrierExitArtifacts } from "./remote-carrier-exit-artifact-readiness.mjs";
 
-const DEFAULT_LIVE_ROOT = "/home/wau/.local/share/elastos-public-gateway-live";
 const PUBLIC_LIVE_TARGET = {
   os: "linux",
   arch: "x86_64",
@@ -22,9 +21,9 @@ function usage() {
     [--candidate-exit-provider-bin capsules/exit-provider/target/release/exit-provider] \\
     [--installed-artifact-readiness /tmp/installed-readiness.json] \\
     [--commit <sha>] \\
-    [--ssh-host elastos-server] \\
-    [--live-root /home/wau/.local/share/elastos-public-gateway-live] \\
-    [--data-root /home/wau/.local/share/elastos-public-gateway-live/xdg-data/elastos]
+    --ssh-host <public-live-ssh-host> \\
+    --live-root <public-live-home> \\
+    [--data-root <public-live-data-root>]
 
 Creates a dry-run public-live update plan for the remote Carrier Browser Exit
 artifacts. It never deploys, pushes, restarts, or edits live data. It fails
@@ -48,8 +47,8 @@ function parseArgs(argv) {
     candidateExitProviderBin: path.join(root, "capsules/exit-provider/target/release/exit-provider"),
     installedArtifactReadiness: "",
     commit: "",
-    sshHost: "elastos-server",
-    liveRoot: DEFAULT_LIVE_ROOT,
+    sshHost: process.env.ELASTOS_PUBLIC_LIVE_SSH_HOST || "",
+    liveRoot: process.env.ELASTOS_PUBLIC_LIVE_HOME || "",
     dataRoot: "",
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -84,6 +83,9 @@ function parseArgs(argv) {
   }
   if (!args.dataRoot) {
     args.dataRoot = path.join(args.liveRoot, "xdg-data/elastos");
+  }
+  if (!args.sshHost || !args.liveRoot) {
+    throw new Error("--ssh-host and --live-root are required, or set ELASTOS_PUBLIC_LIVE_SSH_HOST and ELASTOS_PUBLIC_LIVE_HOME");
   }
   return args;
 }

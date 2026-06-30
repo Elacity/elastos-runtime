@@ -20,12 +20,9 @@ trap cleanup EXIT
 
 cd "$repo_root"
 
-service_home="${ELASTOS_BROWSER_SERVICE_HOME:-/home/wau/.local/share/elastos-public-gateway-live}"
+service_home="${ELASTOS_BROWSER_SERVICE_HOME:-$tmp_dir/service-home}"
 service_xdg_data_home="${ELASTOS_BROWSER_SERVICE_XDG_DATA_HOME:-$service_home/xdg-data}"
 browser_program="${ELASTOS_BROWSER_SELKIES_BROWSER_PROGRAM:-}"
-if [[ -z "$browser_program" && -x /home/wau/.cache/ms-playwright/chromium-1217/chrome-linux64/chrome ]]; then
-  browser_program="/home/wau/.cache/ms-playwright/chromium-1217/chrome-linux64/chrome"
-fi
 if [[ -z "$browser_program" || ! -x "$browser_program" ]]; then
   echo "ELASTOS_BROWSER_SELKIES_BROWSER_PROGRAM must point at an executable Chromium binary" >&2
   exit 2

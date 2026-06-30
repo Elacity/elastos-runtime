@@ -828,10 +828,6 @@ const operatorControl = read(
   "elastos/crates/elastos-server/src/operator_control.rs",
 );
 const agentsContract = read("AGENTS.md");
-const release050Gate = read("scripts/release-050-reconciliation-gate.sh");
-const reconciliationSnapshotAudit = read(
-  "scripts/reconciliation-snapshot-audit.sh",
-);
 const linuxSourceHomeRestart = read("scripts/linux-source-home-restart.sh");
 const linuxSourceHomeRestartSmoke = read(
   "scripts/linux-source-home-restart-smoke.sh",
@@ -1100,14 +1096,6 @@ const browserMacVmAuthProfileSetupSmoke = read(
 const macSourceHomeRestart = read("scripts/mac-source-home-restart.sh");
 const macSourceHomeRestartSmoke = read("scripts/mac-source-home-restart-smoke.sh");
 const browserExperimentCleanup = read("scripts/browser-experiment-cleanup.mjs");
-const futureWorkReviewGate = read("scripts/future-work-review-gate.mjs");
-const futureWorkReviewGateSmoke = read("scripts/future-work-review-gate-smoke.sh");
-const runtimeGoalCompletionAudit = read(
-  "scripts/runtime-goal-completion-audit.mjs",
-);
-const runtimeGoalCompletionAuditSmoke = read(
-  "scripts/runtime-goal-completion-audit-smoke.sh",
-);
 const currentState = read("state.md");
 const browserSelkiesControlService = read(
   "scripts/browser-selkies-control-service.mjs",
@@ -1214,68 +1202,6 @@ assert(
     agentsContract.includes("explicit user approval before the mutation") &&
     agentsContract.includes("WebRTC remote display"),
   "Root AGENTS.md must preserve the operator contract headings, active branch role, public-live approval rule, and Browser claim discipline",
-);
-assert(
-  !release050Gate.includes("DEFAULT_SNAPSHOT_DIR") &&
-    !release050Gate.includes("/home/wau/reconcile-0.5.0-snapshots/20260621T211115Z") &&
-    release050Gate.includes("latest_snapshot_dir()") &&
-    release050Gate.includes('local base="$HOME/reconcile-0.5.0-snapshots"') &&
-    release050Gate.includes('[ -d "$candidate/mac" ]') &&
-    release050Gate.includes('[ -d "$candidate/server" ]') &&
-    release050Gate.includes('[ -d "$candidate/jetson" ]') &&
-    reconciliationSnapshotAudit.includes("latest_snapshot_dir()") &&
-    reconciliationSnapshotAudit.includes('[ -d "$candidate/mac" ]') &&
-    reconciliationSnapshotAudit.includes('[ -d "$candidate/server" ]') &&
-    reconciliationSnapshotAudit.includes('[ -d "$candidate/jetson" ]') &&
-    reconciliationSnapshotAudit.includes('grep -Eq -- "$pattern" "$file"') &&
-    reconciliationSnapshotAudit.includes("capsules/home-cli/src/main.rs)") &&
-    reconciliationSnapshotAudit.includes(
-      "Home CLI must not duplicate the localhost envelope token in request bodies",
-    ) &&
-    reconciliationSnapshotAudit.includes(
-      "carrier_invoke_localhost_uses_envelope_token_and_redacts_body_token",
-    ) &&
-    reconciliationSnapshotAudit.includes("docs/CARRIER.md)") &&
-    reconciliationSnapshotAudit.includes(
-      "For the product Browser settings path",
-    ) &&
-    reconciliationSnapshotAudit.includes("--keep-local-backends") &&
-    reconciliationSnapshotAudit.includes(
-      "Room trusted-source bootstrap must be classified as a Runtime-owned Carrier exception",
-    ) &&
-    reconciliationSnapshotAudit.includes(
-      "elastos/crates/elastos-server/src/api/gateway_browser_wallet.rs)",
-    ) &&
-    reconciliationSnapshotAudit.includes(
-      "BROWSER_PENDING_TRANSACTION_BROADCAST_SCHEMA",
-    ) &&
-    reconciliationSnapshotAudit.includes("recovered_pending_broadcast") &&
-    reconciliationSnapshotAudit.includes("without rebroadcasting") &&
-    reconciliationSnapshotAudit.includes(
-      "test_browser_transaction_broadcast_record_failure_does_not_rebroadcast_on_retry",
-    ) &&
-    reconciliationSnapshotAudit.includes(
-      "elastos/tools/browser-local-exit/src/main.rs)",
-    ) &&
-    reconciliationSnapshotAudit.includes(
-      "wildcard_can_allow_exact_runtime_gateway_private_target_only",
-    ) &&
-    reconciliationSnapshotAudit.includes(
-      "relay_open_log_preserves_principal_attribution",
-    ) &&
-    reconciliationSnapshotAudit.includes(
-      "local Exit relay-open did not preserve the launch principal_id",
-    ) &&
-    release050Gate.includes("resolve_snapshot_dir()") &&
-    release050Gate.includes("pass --snapshot DIR or set ELASTOS_RECONCILE_SNAPSHOT_DIR") &&
-    release050Gate.includes('echo "[release-050-gate] snapshot: $SNAPSHOT_DIR"') &&
-    read("scripts/README.md").includes(
-      "uses the latest complete\n`$HOME/reconcile-0.5.0-snapshots/*` snapshot",
-    ) &&
-    read("docs/INSTALL.md").includes(
-      "auto-resolves the latest complete\n`$HOME/reconcile-0.5.0-snapshots/*` snapshot",
-    ),
-  "0.5.0 release gate must auto-resolve reviewer-local snapshots and reject hard-coded server snapshot defaults",
 );
 assert(
   linuxSourceHomeRestart.includes("process_matches_gateway_listener") &&
@@ -6711,43 +6637,16 @@ assert(
   "Browser manual UX evidence must have a template/validator with machine artifact hashing, shared hosted WebRTC audio checks, Mac VM evidence checks, a fail-closed Mac VM acceptance audit, and stay wired into the completion gate docs",
 );
 assert(
-  runtimeGoalCompletionAudit.includes(
-    "elastos.runtime-goal-completion-audit/v1",
-  ) &&
-    runtimeGoalCompletionAudit.includes("inspector_act_dispatch") &&
-    runtimeGoalCompletionAudit.includes("carrier_only_enforcement") &&
-    runtimeGoalCompletionAudit.includes("remote_exit_installed_artifacts_ready") &&
-    runtimeGoalCompletionAudit.includes("publicLiveCommandContextsReady") &&
-    runtimeGoalCompletionAudit.includes("remote_exit_route_readiness") &&
-    runtimeGoalCompletionAudit.includes("isSha256(remoteReadiness.source?.config_sha256)") &&
-    runtimeGoalCompletionAudit.includes("isSha256(remoteReadiness.exit?.config_sha256)") &&
-    runtimeGoalCompletionAudit.includes("remote_exit_operator_evidence") &&
-    runtimeGoalCompletionAudit.includes("REQUIRED_REMOTE_OPERATOR_CHECKS") &&
-    runtimeGoalCompletionAudit.includes("route_readiness_observed") &&
-    runtimeGoalCompletionAudit.includes("REQUIRED_REMOTE_OPERATOR_ARTIFACTS") &&
-    runtimeGoalCompletionAudit.includes("route_readiness") &&
-    runtimeGoalCompletionAudit.includes("remoteOperator.errors.length === 0") &&
-    runtimeGoalCompletionAudit.includes("mac_browser_machine_ready") &&
-    runtimeGoalCompletionAudit.includes("ela_city_edit_profile_modal") &&
-    runtimeGoalCompletionAudit.includes("mac_manual_video_input_performance") &&
-    runtimeGoalCompletionAudit.includes("performance_zoom_stability") &&
-    runtimeGoalCompletionAudit.includes("reviewable_commits_clean") &&
-    runtimeGoalCompletionAuditSmoke.includes("incomplete_evidence_rejected") &&
-    runtimeGoalCompletionAuditSmoke.includes("missing_public_live_command_context_rejected") &&
-    runtimeGoalCompletionAuditSmoke.includes("stale_operator_validation_rejected") &&
-    runtimeGoalCompletionAuditSmoke.includes("complete_fixture_accepted") &&
-    runtimeGoalCompletionAuditSmoke.includes("remote-readiness") &&
-    runtimeGoalCompletionAuditSmoke.includes("config_sha256") &&
-    remoteCarrierExitReadiness.includes("config_sha256") &&
+  remoteCarrierExitReadiness.includes("config_sha256") &&
     remoteCarrierExitReadiness.includes("sha256File(args.sourceConfig)") &&
     remoteCarrierExitReadinessSmoke.includes("hash-bound to source and exit configs") &&
     remoteCarrierExitSourceConfig.includes("source_config_sha256") &&
     remoteCarrierExitSourceConfig.includes("exit_config_sha256") &&
     remoteCarrierExitSourceConfigSmoke.includes("readiness hashes must match") &&
-    currentState.includes("scripts/runtime-goal-completion-audit.mjs") &&
     currentState.includes("hash-bound remote route readiness") &&
-    read("TASKS.md").includes("runtime-goal-completion-audit.mjs"),
-  "Runtime goal completion audit must compose Inspector, Carrier, remote exit, Mac Browser, ela.city, manual UX, performance/zoom, and clean-worktree proof before full-goal claims",
+    read("TASKS.md").includes("Compose Inspector, Carrier-only authority") &&
+    read("TASKS.md").includes("route-readiness, operator evidence, Browser handoff"),
+  "Remote Carrier Exit readiness must remain hash-bound without requiring private goal-completion meta tooling",
 );
 assert(
   browserExperimentCleanup.includes("elastos.browser.experiment-cleanup/v1") &&
@@ -8496,7 +8395,7 @@ assert(
     installDoc.includes("scripts/public-install-home-frontdoor-smoke.sh") &&
     installDoc.includes("Final public install path after publishing 0.5.0") &&
     installDoc.includes("ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1") &&
-    installDoc.includes("ELASTOS_050_JETSON_MIN_ACTIVE_CROSVM_SECONDS=3600") &&
+    installDoc.includes("--min-active-crosvm-seconds 3600") &&
     installDoc.includes("manual installed-device check is still separate") &&
     installDoc.includes("Source-home and seed-node proofs do not replace this") &&
     installDoc.includes("installed-path check") &&
@@ -8511,7 +8410,7 @@ assert(
     runtimeChecklist.includes("scripts/public-install-home-frontdoor-smoke.sh") &&
     runtimeChecklist.includes("Final public install path after publishing 0.5.0") &&
     runtimeChecklist.includes("ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1") &&
-    runtimeChecklist.includes("ELASTOS_050_JETSON_MIN_ACTIVE_CROSVM_SECONDS=3600") &&
+    runtimeChecklist.includes("--min-active-crosvm-seconds 3600") &&
     runtimeChecklist.includes("Do not") &&
     runtimeChecklist.includes("count source-home or seed-node proof as installed-host acceptance") &&
     scriptsReadme.includes("ELASTOS_BIN_OVERRIDE=<path-to-branch-elastos>") &&
@@ -8592,21 +8491,6 @@ assert(
     !tasks.includes("configured external storage-market admission") &&
     !tasks.includes("configured external repair-fleet dispatch"),
   "TASKS.md must not re-list completed branch-local availability/storage proof slices as open work",
-);
-assert(
-  futureWorkReviewGate.includes("elastos.future-work-review-plan/v1") &&
-    futureWorkReviewGate.includes("smallest_shippable_slice") &&
-    futureWorkReviewGate.includes("affected_quadrants") &&
-    futureWorkReviewGate.includes("capsule_authority_boundary") &&
-    futureWorkReviewGate.includes("verification_commands") &&
-    futureWorkReviewGate.includes("entropy_risk_avoided") &&
-    futureWorkReviewGate.includes("underlying_contract") &&
-    futureWorkReviewGateSmoke.includes("template_rejected") &&
-    futureWorkReviewGateSmoke.includes("risky_surface_without_contract_rejected") &&
-    futureWorkReviewGateSmoke.includes("risky_surface_with_contract_accepted") &&
-    currentState.includes("scripts/future-work-review-gate-smoke.sh") &&
-    !tasks.includes("Add a future-work review gate before implementation"),
-  "Future-work review gate must be implemented as a fail-closed validator, documented as proven state, and removed from open TASKS",
 );
 assert(
   contentAvailabilityDoc.includes("This is") &&

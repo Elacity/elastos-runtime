@@ -46,9 +46,12 @@ lint:
 fmt:
     cd elastos && cargo fmt --all
 
-# Pre-commit gate: alignment, smoke tests, fmt/lint/test
+# Pre-commit gate: alignment, entropy, smoke tests, fmt/lint/test
 verify:
+    git diff --check
     just alignment-check
+    node scripts/home-entropy-check.mjs
+    node scripts/browser-entropy-check.mjs
     just local-carrier-setup-smoke
     ./scripts/command-smoke.sh
     just candidate-command-audit

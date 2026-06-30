@@ -8,7 +8,7 @@ import { spawn, spawnSync } from "node:child_process";
 
 const OPEN_REQUEST_ENV = "ELASTOS_BROWSER_VM_OPEN_REQUEST";
 
-const sshHost = process.env.ELASTOS_BROWSER_REMOTE_VZ_SSH || "elastos-mac-staging";
+const sshHost = process.env.ELASTOS_BROWSER_REMOTE_VZ_SSH || "";
 const sshBin = process.env.ELASTOS_BROWSER_REMOTE_VZ_SSH_BIN || "ssh";
 const localRoot = process.env.ELASTOS_BROWSER_REMOTE_VZ_LOCAL_ROOT || "/tmp/evzl";
 const remoteRoot = process.env.ELASTOS_BROWSER_REMOTE_VZ_ROOT || "/tmp/evzs";
@@ -1088,6 +1088,9 @@ async function cleanupAndExit(signal) {
 }
 
 async function main() {
+  if (!sshHost || /[\r\n\0]/.test(sshHost)) {
+    throw new Error("ELASTOS_BROWSER_REMOTE_VZ_SSH must name the configured remote macOS Browser Engine SSH target");
+  }
   validateAbsolutePath(localRoot, "ELASTOS_BROWSER_REMOTE_VZ_LOCAL_ROOT");
   validateAbsolutePath(remoteRoot, "ELASTOS_BROWSER_REMOTE_VZ_ROOT");
   validateAbsolutePath(remoteRelayRoot, "ELASTOS_BROWSER_REMOTE_VZ_RELAY_ROOT");

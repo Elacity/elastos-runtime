@@ -294,7 +294,7 @@ missing_profile_reset_sha="$("$node_bin" -e 'const fs = require("node:fs"); cons
   const proof = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
   proof.profile_reset.receipt.profile.profile_key = "profile-secret";
   proof.profile_reset.receipt.profile.principal_id = "person:local:secret";
-  proof.profile_reset.receipt.profile.disk_path = "/Users/anders/elastos/Users/0123456789ab/BrowserProfiles/default/profile.ext4";
+  proof.profile_reset.receipt.profile.disk_path = "/Users/operator/elastos/Users/0123456789ab/BrowserProfiles/default/profile.ext4";
   fs.writeFileSync(process.argv[2], `${JSON.stringify(proof, null, 2)}\n`);
 ' "$tmp_dir/mac-valid.json" "$tmp_dir/mac-leaky-profile-reset.json"
 leaky_profile_reset_sha="$("$node_bin" -e 'const fs = require("node:fs"); const crypto = require("node:crypto"); process.stdout.write(crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"));' "$tmp_dir/mac-leaky-profile-reset.json")"

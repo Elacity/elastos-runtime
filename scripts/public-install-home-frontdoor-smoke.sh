@@ -3,8 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/runtime-cleanup.sh"
+source "${SCRIPT_DIR}/lib/public-install-guards.sh"
 
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
+FORCE_RELAY_ONLY="${ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY:-0}"
 HOME_DIR="$(mktemp -d /tmp/elastos-public-home-XXXXXX)"
 
 cleanup() {
@@ -23,6 +25,7 @@ bash -lc 'curl -fsSL "${ELASTOS_PUBLISHER_GATEWAY%/}/install.sh" | bash' \
 INSTALLED_BIN="$HOME_DIR/.local/bin/elastos"
 RUN_BIN="${ELASTOS_BIN_OVERRIDE:-$INSTALLED_BIN}"
 SOURCES_PATH="$HOME_DIR/xdg-data/elastos/sources.json"
+INSTALLED_COMPONENTS_MANIFEST="$HOME_DIR/xdg-data/elastos/components.json"
 if [[ ! -x "$INSTALLED_BIN" ]]; then
     echo "[public-home-frontdoor] installed binary missing: $INSTALLED_BIN" >&2
     exit 1
@@ -48,8 +51,9 @@ if grep -q "Node ID:   none" <<<"$SOURCE_OUTPUT"; then
     exit 1
 fi
 
-echo "[public-home-frontdoor] remove gateway override and direct addrs to force relay-only Carrier setup"
-SOURCES_PATH="$SOURCES_PATH" python3 - <<'PY'
+if [[ "$FORCE_RELAY_ONLY" == "1" ]]; then
+    echo "[public-home-frontdoor] remove gateway override and direct addrs to force relay-only Carrier setup"
+    SOURCES_PATH="$SOURCES_PATH" python3 - <<'PY'
 import json
 import os
 import pathlib
@@ -73,14 +77,19 @@ for source in data.get("sources", []):
         )
 path.write_text(json.dumps(data, indent=2) + "\n")
 PY
+else
+    echo "[public-home-frontdoor] use stamped trusted-source transports"
+fi
 
-echo "[public-home-frontdoor] setup home profile"
+echo "[public-home-frontdoor] setup default Home profile"
+guard_branch_binary_requires_checksummed_public_manifest "$INSTALLED_COMPONENTS_MANIFEST" "[public-home-frontdoor]"
 HOME="$HOME_DIR" \
 XDG_DATA_HOME="$HOME_DIR/xdg-data" \
-"$RUN_BIN" setup --profile home >/tmp/elastos-public-home-setup.log
+ELASTOS_COMPONENTS_MANIFEST="$INSTALLED_COMPONENTS_MANIFEST" \
+"$RUN_BIN" setup >/tmp/elastos-public-home-setup.log
 
 echo "[public-home-frontdoor] prove installed elastos -> home -> chat -> home/quit/esc -> home"
-HOME_DIR="$HOME_DIR" RUN_BIN="$RUN_BIN" python3 - <<'PY'
+HOME_DIR="$HOME_DIR" RUN_BIN="$RUN_BIN" ELASTOS_COMPONENTS_MANIFEST="$INSTALLED_COMPONENTS_MANIFEST" python3 - <<'PY'
 import os
 import pty
 import select

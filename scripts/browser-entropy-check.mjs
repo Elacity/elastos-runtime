@@ -993,6 +993,8 @@ assert(
 
 assert(
   browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_REMOTE_VZ_SSH") &&
+    browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_REMOTE_VZ_SSH must name") &&
+    !browserVmRemoteVzLauncher.includes(["elastos", "mac", "staging"].join("-")) &&
     browserVmRemoteVzLauncher.includes("-R") &&
     !browserVmRemoteVzLauncher.includes("control-forward") &&
     !browserVmRemoteVzLauncher.includes("waitForLocalTcpPort") &&
