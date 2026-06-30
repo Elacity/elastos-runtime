@@ -478,32 +478,44 @@ impl IntentProofSummary {
     }
 }
 
-/// Count intent-proof ISSUES for one capsule from a stream of audit events: an
-/// `IntentDenied` ⇒ `denied`; an `IntentReconciled` whose status is `diverged` /
-/// `undelivered` ⇒ the matching counter (a `matched` verdict is NOT an issue, and
-/// `IntentDeclared` is the routine precursor, not counted). Events for other capsules are
-/// ignored. Pure — `AuditLog::intent_proof_summary` walks its buffer through this.
+/// Count intent-proof issues for one capsule from a stream of audit events, PRESENCE-aware.
+///
+/// Returns `None` when the capsule has NO intent activity at all in the stream — i.e. it
+/// never went through the intent gate, so it is ABSENT (not "clean"): projecting it as
+/// clean would be false reassurance. Returns `Some(summary)` when the capsule has any
+/// intent event (`IntentDeclared` / `IntentDenied` / `IntentReconciled`); the counts are
+/// the ISSUES — an `IntentDenied` ⇒ `denied`; an `IntentReconciled` whose status is
+/// `diverged` / `undelivered` ⇒ the matching counter (a `matched` verdict / a bare
+/// declaration is activity but NOT an issue). Events for other capsules are ignored. Pure.
 pub fn count_intent_proof<'a>(
     events: impl IntoIterator<Item = &'a AuditEvent>,
     capsule_id: &str,
-) -> IntentProofSummary {
+) -> Option<IntentProofSummary> {
     let mut s = IntentProofSummary::default();
+    let mut seen = false;
     for ev in events {
         match ev {
-            AuditEvent::IntentDenied { capsule_id: c, .. } if c == capsule_id => s.denied += 1,
+            AuditEvent::IntentDeclared { capsule_id: c, .. } if c == capsule_id => seen = true,
+            AuditEvent::IntentDenied { capsule_id: c, .. } if c == capsule_id => {
+                seen = true;
+                s.denied += 1;
+            }
             AuditEvent::IntentReconciled {
                 capsule_id: c,
                 status,
                 ..
-            } if c == capsule_id => match status.as_str() {
-                "diverged" => s.diverged += 1,
-                "undelivered" => s.undelivered += 1,
-                _ => {}
-            },
+            } if c == capsule_id => {
+                seen = true;
+                match status.as_str() {
+                    "diverged" => s.diverged += 1,
+                    "undelivered" => s.undelivered += 1,
+                    _ => {}
+                }
+            }
             _ => {}
         }
     }
-    s
+    seen.then_some(s)
 }
 
 // ─────────────────────────── The enforcement gate (chunk 4) ───────────────────
@@ -1148,18 +1160,36 @@ mod tests {
             EnvelopeDenial::Revoked,
         );
 
-        let events = [denied, diverged, undelivered, matched, declared, other];
-        let s = count_intent_proof(events.iter(), "vm-agent");
+        // A capsule with intent activity but NO issues (only a declaration) is clean.
+        let clean_decl = intent_declared_event(&an_intent_for(&sk, "vm-clean", "send", "h"));
+        let events = [
+            denied,
+            diverged,
+            undelivered,
+            matched,
+            declared,
+            other,
+            clean_decl,
+        ];
+
+        let s =
+            count_intent_proof(events.iter(), "vm-agent").expect("vm-agent has intent activity");
         assert_eq!(s.denied, 1);
         assert_eq!(s.diverged, 1);
         assert_eq!(s.undelivered, 1);
         assert_eq!(s.flagged(), 3);
         assert!(!s.is_clean());
 
-        // A capsule with no issues is clean (the empty tally).
-        let clean = count_intent_proof(events.iter(), "vm-nobody");
+        // Present + no issues ⇒ CLEAN (all-zero), distinct from absent.
+        let clean = count_intent_proof(events.iter(), "vm-clean").expect("a declaration ⇒ present");
         assert!(clean.is_clean());
         assert_eq!(clean.flagged(), 0);
+
+        // NO intent activity ⇒ ABSENT (None), never falsely clean.
+        assert!(
+            count_intent_proof(events.iter(), "vm-nobody").is_none(),
+            "no intent activity ⇒ absent, not clean"
+        );
     }
 
     #[test]
@@ -1195,11 +1225,13 @@ mod tests {
         ))
         .unwrap();
 
-        let s = log.intent_proof_summary("vm-agent");
+        let s = log
+            .intent_proof_summary("vm-agent")
+            .expect("vm-agent has intent activity");
         assert_eq!(s.denied, 1);
         assert_eq!(s.diverged, 1);
         assert_eq!(s.undelivered, 0);
-        // An unrelated capsule has a clean (empty) tally — never fabricated.
-        assert!(log.intent_proof_summary("vm-elsewhere").is_clean());
+        // An unrelated capsule with no intent activity is ABSENT (None), never fabricated.
+        assert!(log.intent_proof_summary("vm-elsewhere").is_none());
     }
 }
