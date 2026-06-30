@@ -26,6 +26,21 @@ All four should pass. (Server lib ~876 tests, runtime ~345, common ~95.)
 
 ## 1. W1b — the real egress firewall  ← highest leverage
 
+**STATUS (in-cloud-gated, NOT hardware-proven):** the default-deny spine is built and
+in-cloud-gated. C0 `EgressDenied` event + C1 per-TAP nft rule-gen (`egress_firewall.rs`,
+default-drop + rate-limited NFLOG + counter) + C2 lifecycle (install fail-closed-before-boot,
+teardown at all four TAP sites) + C3-core hostile-input-hardened NFLOG parser
+(`egress_audit.rs` in crosvm) + **C3-glue** (`elastos-server/src/egress_audit.rs`: the
+`TapRegistry` TAP→`vm-{name}` map, the per-drop → signed `EgressDenied` reader thread wired
+in `serve_cmd` → `Supervisor::start_egress_audit_reader`). All Linux `--lib` gated.
+**PENDING ON THE BOX:** (i) the `suppressed=delta` reconciliation WIRING (the pure delta
+`reconcile_suppressed` + the nft `counter` exist; the periodic + final-read-before-teardown
+loop needs the live `nft` counter to validate); (ii) **C4** — the hardware exercise (guest
+provably blocked from a denied host; `EgressDenied` per-drop + a `suppressed` marker under a
+synthetic flood land on the durable chain + survive verify-on-open; `nft list ruleset` clean
+after teardown). NOTE F2: this spine is **host-only containment** (no NAT) — the `Allowlisted`
+internet-egress positive is a deliberate, separate architecture decision, intentionally NOT built.
+
 **Design:** `docs/W1B_EGRESS_FIREWALL.md` (complete — read it first).
 **Why it matters:** converts the reach *model* (already built + tested) into
 packet-level *enforcement* — the literal "we can prove the agent stayed in its

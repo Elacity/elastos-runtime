@@ -438,6 +438,9 @@ pub async fn run_serve(
             // Unify the serve gateway's audit sink onto the shared runtime custody chain
             // (adopted only when durable — never a durable→memory downgrade).
             s.set_shared_audit_log(Some(infra.audit_log.clone()));
+            // W1b/C3: start the NFLOG egress-audit reader so kernel egress drops become signed
+            // EgressDenied events on the shared chain (Linux-only; no-op otherwise; best-effort).
+            s.start_egress_audit_reader();
             // AUD-1: seed the author-signature launch gate from config `trusted_keys`.
             // Empty by default (gate inert, launches byte-for-byte unchanged); a
             // malformed hex key aborts serve startup LOUDLY (fail-closed at boot) rather

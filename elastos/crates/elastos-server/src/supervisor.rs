@@ -232,6 +232,10 @@ pub struct Supervisor {
     /// keeps its own file sink. Only adopted by the gateway when durable (see
     /// [`crate::api::gateway::seed_gateway_audit_log`]) — never a durable→memory downgrade.
     shared_audit_log: Option<Arc<elastos_runtime::primitives::audit::AuditLog>>,
+    /// W1b/C3: TAP→`vm-{name}` map so a kernel egress drop (logged on a TAP) becomes an
+    /// `EgressDenied` keyed on the canonical capsule identity. Populated at firewall-install;
+    /// shared with the NFLOG audit-reader thread.
+    tap_registry: crate::egress_audit::TapRegistry,
     /// Author-signature verifier for the launch gate (AUD-1). Default is empty (no
     /// trusted keys), in which case the gate skips and launches are byte-for-byte
     /// today's behavior; seeded from config `trusted_keys` at serve time to activate.
@@ -486,6 +490,7 @@ impl Supervisor {
             pending_store: None,
             spend_policy: None,
             shared_audit_log: None,
+            tap_registry: crate::egress_audit::TapRegistry::new(),
             signature_verifier: SignatureVerifier::new(),
             gateway: Arc::new(RwLock::new(None)),
         }
@@ -554,6 +559,20 @@ impl Supervisor {
         shared_audit_log: Option<Arc<elastos_runtime::primitives::audit::AuditLog>>,
     ) {
         self.shared_audit_log = shared_audit_log;
+    }
+
+    /// W1b/C3: start the single process-wide NFLOG egress-audit reader, which turns kernel egress
+    /// drops into signed `EgressDenied` events on the shared custody chain (keyed on `vm-{name}`
+    /// via [`tap_registry`](Self::tap_registry)). No-op without a shared audit log. Best-effort and
+    /// enforcement-independent: a reader that can't bind never affects the in-kernel DROP. Call
+    /// once at serve time, AFTER [`set_shared_audit_log`](Self::set_shared_audit_log).
+    pub fn start_egress_audit_reader(&self) {
+        if let Some(audit_log) = &self.shared_audit_log {
+            crate::egress_audit::spawn_egress_audit_reader(
+                audit_log.clone(),
+                self.tap_registry.clone(),
+            );
+        }
     }
 
     /// Seed the author-signature launch gate with trusted keys (AUD-1). Called at
@@ -1323,6 +1342,10 @@ impl Supervisor {
                 EGRESS_LOG_RATE_PER_SEC,
             )
             .map_err(|e| anyhow::anyhow!("egress firewall build failed for '{}': {}", name, e))?;
+            // W1b/C3: map this TAP to the canonical vm-{name} so a kernel drop logged on it
+            // becomes an EgressDenied keyed on the same identity as the spend/grant chain.
+            // Overwrite-on-record handles TAP reuse (re-label before any of the new VM's drops).
+            self.tap_registry.record(&tap_name, &format!("vm-{name}"));
             vm.set_egress_firewall(Some(firewall));
         }
 
