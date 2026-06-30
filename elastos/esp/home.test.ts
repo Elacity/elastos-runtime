@@ -17,7 +17,9 @@ import {
   homeView,
   capsuleNeedsAttention,
   homeCapsules,
+  homeFleetScope,
   isHomeCapsule,
+  isInstalled,
   type CapsuleFleetEntry,
 } from "./home.js";
 
@@ -112,6 +114,29 @@ describe("homeView (Home fleet composition)", () => {
     assert.equal(isHomeCapsule("provider"), false);
     assert.equal(isHomeCapsule("content"), false);
     assert.equal(isHomeCapsule("some-future-role"), false, "unknown role is not Home (fail-honest)");
+  });
+
+  it("homeFleetScope = user-facing AND installed (the live fleet, not the library)", () => {
+    const catalog = [
+      // installed user-facing app — the live fleet
+      { name: "vm-act", title: "Act", trust_state: "cid-without-manifest-signature", role: "app", installed: true },
+      // bundled (not installed) user-facing apps — library, NOT the fleet
+      { name: "vm-agent", title: "Agent", trust_state: "local-dev", role: "app", installed: false },
+      { name: "vm-owned", title: "Owned Video", trust_state: "local-dev", role: "viewer", installed: false },
+      // installed INFRA provider — dropped by the role gate even though installed
+      { name: "ai-provider", title: "Ai Provider", trust_state: "local-dev", role: "provider", installed: true },
+    ];
+    assert.equal(isInstalled({ installed: true }), true);
+    assert.equal(isInstalled({ installed: false }), false);
+    assert.equal(isInstalled({}), false, "missing install flag is not installed (fail-honest)");
+    // homeCapsules (role only) keeps the 3 user-facing entries; homeFleetScope further
+    // requires installed, leaving only the live app.
+    assert.deepEqual(homeCapsules(catalog).map((c) => c.name), ["vm-act", "vm-agent", "vm-owned"]);
+    assert.deepEqual(
+      homeFleetScope(catalog).map((c) => c.name),
+      ["vm-act"],
+      "the running fleet is just the installed user-facing capsule",
+    );
   });
 
   it("a single wrong sub-state is enough — attention is OR over the three", () => {

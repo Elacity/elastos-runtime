@@ -65,6 +65,29 @@ export function homeCapsules<T extends { role: string }>(capsules: ReadonlyArray
 }
 
 /**
+ * Whether a capsule is INSTALLED on this node (catalog `installed: true`), as opposed to
+ * merely runtime-bundled/available. Mirrors the catalog's `state: "installed" | "bundled"`.
+ */
+export function isInstalled(capsule: { installed?: boolean }): boolean {
+  return capsule.installed === true;
+}
+
+/**
+ * The recommended Home scope: user-facing AND installed — "the fleet you actually run".
+ * Composes [`homeCapsules`] (drops infra providers/content) with the install-state filter
+ * (drops bundled-but-not-installed apps), so the Home + its attention count reflect the
+ * live fleet under custody, not the whole installable library. Input order preserved.
+ *
+ * Apply this for the lean fleet view; apply only `homeCapsules` for the "apps available"
+ * library view. Both are honest — they answer different questions.
+ */
+export function homeFleetScope<T extends { role: string; installed?: boolean }>(
+  capsules: ReadonlyArray<T>,
+): T[] {
+  return homeCapsules(capsules).filter(isInstalled);
+}
+
+/**
  * Whether a capsule is in an unambiguously-wrong custody/trust state that an auditor
  * should be drawn to. This is a pure DISPLAY policy (like `SPEND_WARNING_FRACTION`):
  * it flags only the three states that mean "something is wrong or unprovable" —
