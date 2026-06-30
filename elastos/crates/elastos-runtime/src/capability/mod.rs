@@ -17,9 +17,10 @@ pub mod token;
 pub use evaluator::PolicyEvaluator;
 #[allow(unused_imports)]
 pub use intent::{
-    check_intent_within_envelope, reconcile, run_intent_gate, EnvelopeCheck, EnvelopeDenial,
-    IntentDeclarationV1, IntentGateOutcome, IntentReconciliationV1, ReconciliationStatus,
-    StandingGrantEnvelope, INTENT_DECLARATION_SCHEMA_V1, INTENT_RECONCILIATION_SCHEMA_V1,
+    check_intent_within_envelope, count_intent_proof, reconcile, run_intent_gate, EnvelopeCheck,
+    EnvelopeDenial, IntentDeclarationV1, IntentGateOutcome, IntentProofSummary,
+    IntentReconciliationV1, ReconciliationStatus, StandingGrantEnvelope,
+    INTENT_DECLARATION_SCHEMA_V1, INTENT_RECONCILIATION_SCHEMA_V1,
 };
 #[allow(unused_imports)]
 pub use manager::CapabilityManager;

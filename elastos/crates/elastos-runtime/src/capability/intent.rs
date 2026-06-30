@@ -452,6 +452,60 @@ pub fn intent_reconciled_event(
     }
 }
 
+// ─────────────────────────── Per-capsule intent-proof tally (chunk 5b) ────────
+
+/// Per-capsule tally of intent-proof issues, for the custody projection. Mirrors the ESP
+/// `IntentProofSummaryV1` shape. All-zero ⇒ clean; any non-zero ⇒ a flagged custody alarm.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IntentProofSummary {
+    /// Intents denied because they fell outside their envelope (`intent ⊄ envelope`).
+    pub denied: u64,
+    /// Reconciliations whose act diverged from the declared intent.
+    pub diverged: u64,
+    /// Intents declared but never completed (no receipt).
+    pub undelivered: u64,
+}
+
+impl IntentProofSummary {
+    /// No issues recorded.
+    pub fn is_clean(&self) -> bool {
+        self.denied == 0 && self.diverged == 0 && self.undelivered == 0
+    }
+
+    /// Total flagged = denied + diverged + undelivered.
+    pub fn flagged(&self) -> u64 {
+        self.denied + self.diverged + self.undelivered
+    }
+}
+
+/// Count intent-proof ISSUES for one capsule from a stream of audit events: an
+/// `IntentDenied` ⇒ `denied`; an `IntentReconciled` whose status is `diverged` /
+/// `undelivered` ⇒ the matching counter (a `matched` verdict is NOT an issue, and
+/// `IntentDeclared` is the routine precursor, not counted). Events for other capsules are
+/// ignored. Pure — `AuditLog::intent_proof_summary` walks its buffer through this.
+pub fn count_intent_proof<'a>(
+    events: impl IntoIterator<Item = &'a AuditEvent>,
+    capsule_id: &str,
+) -> IntentProofSummary {
+    let mut s = IntentProofSummary::default();
+    for ev in events {
+        match ev {
+            AuditEvent::IntentDenied { capsule_id: c, .. } if c == capsule_id => s.denied += 1,
+            AuditEvent::IntentReconciled {
+                capsule_id: c,
+                status,
+                ..
+            } if c == capsule_id => match status.as_str() {
+                "diverged" => s.diverged += 1,
+                "undelivered" => s.undelivered += 1,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    s
+}
+
 // ─────────────────────────── The enforcement gate (chunk 4) ───────────────────
 // The orchestrator that RUNS the loop: declare → verify → [abort | act → reconcile],
 // fail-closed. This is the reusable enforcement unit a STANDING-GRANT dispatch mode calls
@@ -533,11 +587,20 @@ mod tests {
     }
 
     fn an_intent(sk: &SigningKey, method: &str, args_hash: &str) -> IntentDeclarationV1 {
+        an_intent_for(sk, "vm-agent", method, args_hash)
+    }
+
+    fn an_intent_for(
+        sk: &SigningKey,
+        capsule: &str,
+        method: &str,
+        args_hash: &str,
+    ) -> IntentDeclarationV1 {
         IntentDeclarationV1::issue(
             sk,
             sk.verifying_key().to_bytes(),
             "intent-1",
-            "vm-agent",
+            capsule,
             method,
             args_hash,
             "elastos://mail/send",
@@ -1036,5 +1099,107 @@ mod tests {
             att.records, 3,
             "all three intent custody records are on-chain"
         );
+    }
+
+    // ── Chunk 5b: per-capsule intent-proof tally ───────────────────────────────
+
+    #[test]
+    fn count_intent_proof_tallies_issues_and_ignores_matched_and_other_capsules() {
+        let sk = key();
+        let mine = an_intent(&sk, "send", "h"); // capsule = vm-agent
+        let denied = intent_denied_event(&mine, EnvelopeDenial::MethodNotInEnvelope);
+        let diverged = intent_reconciled_event(
+            &IntentReconciliationV1::issue(
+                &sk,
+                sk.verifying_key().to_bytes(),
+                "i1",
+                "t1",
+                ReconciliationStatus::Diverged,
+                "diverged fields: input_hash",
+            ),
+            "vm-agent",
+        );
+        let undelivered = intent_reconciled_event(
+            &IntentReconciliationV1::issue(
+                &sk,
+                sk.verifying_key().to_bytes(),
+                "i2",
+                "",
+                ReconciliationStatus::Undelivered,
+                "no receipt",
+            ),
+            "vm-agent",
+        );
+        // Not issues: a matched verdict, a declaration, and an issue for ANOTHER capsule.
+        let matched = intent_reconciled_event(
+            &IntentReconciliationV1::issue(
+                &sk,
+                sk.verifying_key().to_bytes(),
+                "i3",
+                "t3",
+                ReconciliationStatus::Matched,
+                "",
+            ),
+            "vm-agent",
+        );
+        let declared = intent_declared_event(&mine);
+        let other = intent_denied_event(
+            &an_intent_for(&sk, "vm-other", "send", "h"),
+            EnvelopeDenial::Revoked,
+        );
+
+        let events = [denied, diverged, undelivered, matched, declared, other];
+        let s = count_intent_proof(events.iter(), "vm-agent");
+        assert_eq!(s.denied, 1);
+        assert_eq!(s.diverged, 1);
+        assert_eq!(s.undelivered, 1);
+        assert_eq!(s.flagged(), 3);
+        assert!(!s.is_clean());
+
+        // A capsule with no issues is clean (the empty tally).
+        let clean = count_intent_proof(events.iter(), "vm-nobody");
+        assert!(clean.is_clean());
+        assert_eq!(clean.flagged(), 0);
+    }
+
+    #[test]
+    fn audit_log_intent_proof_summary_counts_over_the_buffer() {
+        let (_dir, log) = gate_log();
+        let sk = key();
+        let intent = an_intent(&sk, "send", "h");
+        // Record a denial + a diverged reconciliation + a matched one (not an issue).
+        log.emit(intent_denied_event(&intent, EnvelopeDenial::WrongResource))
+            .unwrap();
+        log.emit(intent_reconciled_event(
+            &IntentReconciliationV1::issue(
+                &sk,
+                sk.verifying_key().to_bytes(),
+                "i1",
+                "t1",
+                ReconciliationStatus::Diverged,
+                "diverged fields: action",
+            ),
+            "vm-agent",
+        ))
+        .unwrap();
+        log.emit(intent_reconciled_event(
+            &IntentReconciliationV1::issue(
+                &sk,
+                sk.verifying_key().to_bytes(),
+                "i2",
+                "t2",
+                ReconciliationStatus::Matched,
+                "",
+            ),
+            "vm-agent",
+        ))
+        .unwrap();
+
+        let s = log.intent_proof_summary("vm-agent");
+        assert_eq!(s.denied, 1);
+        assert_eq!(s.diverged, 1);
+        assert_eq!(s.undelivered, 0);
+        // An unrelated capsule has a clean (empty) tally — never fabricated.
+        assert!(log.intent_proof_summary("vm-elsewhere").is_clean());
     }
 }

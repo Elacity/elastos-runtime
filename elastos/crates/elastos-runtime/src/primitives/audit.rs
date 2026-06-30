@@ -819,6 +819,23 @@ impl AuditLog {
         }
     }
 
+    /// Tally the intent-proof issues (denied / diverged / undelivered) recorded for
+    /// `capsule_id` over the IN-MEMORY audit buffer — the recent window the log retains.
+    /// This is the cheap live signal the inspector projects as the intent-proof custody
+    /// channel; full-history counts would need a durable walk. A poisoned lock degrades to
+    /// an empty (clean-looking) tally — but absence of buffered issues is honest "none
+    /// observed in the window", and the projection renders a present-but-zero tally as
+    /// CLEAN only because the summary was produced, never fabricated.
+    pub fn intent_proof_summary(
+        &self,
+        capsule_id: &str,
+    ) -> crate::capability::intent::IntentProofSummary {
+        match self.memory_buffer.read() {
+            Ok(buf) => crate::capability::intent::count_intent_proof(buf.iter(), capsule_id),
+            Err(_) => crate::capability::intent::IntentProofSummary::default(),
+        }
+    }
+
     /// Emit the GAP-8 CONTENT-OPEN custody record and REQUIRE it to be durably committed.
     ///
     /// Returns `Err` if the record could not be hash-chained + signed + `fsync`ed. The dDRM open
