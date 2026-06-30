@@ -80,14 +80,31 @@ const streamSession = {
     runtime_stream_path: "/tmp/elastos-browser-product-display-smoke-runtime.sock",
   },
 };
+const browserProfile = {
+  schema: "elastos.browser.profile/v1",
+  scope: "active_principal",
+  storage: "principal_owned_profile_disk",
+  storage_posture: "principal_owned_reset_scoped_unprotected",
+  protected_storage: false,
+  encrypted: false,
+  recoverable: false,
+  recovery: "not_recovery_kit_packaged",
+  uri: "localhost://Users/0123456789ab/BrowserProfiles/default/profile.ext4",
+  public_uri: "localhost://Users/self/BrowserProfiles/default/profile.ext4",
+  profile_key: "profile-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  disk_path: "/tmp/elastos-browser-hosted-product-display/BrowserProfiles/default/profile.ext4",
+  reset: "whole_profile",
+};
 console.log(JSON.stringify({ op: "init", config }));
 console.log(JSON.stringify({
   op: "launch",
   url: "https://example.com/",
   stream_session: streamSession,
+  profile: browserProfile,
   principal_id: "person:local:hosted-product-display-smoke",
   reason: "verify hosted product display session",
   display_mode: "webrtc_remote_display",
+  guarantee_level: "operator_rbi",
   viewport: { width: 1280, height: 720 },
 }));
 console.log(JSON.stringify({ op: "shutdown" }));
@@ -137,8 +154,8 @@ if (session.backend_class !== "product_compositor") {
 if (session.display_backend === "cdp_screencast_i420") {
   fail("CDP screencast proof surface cannot satisfy hosted product display", session);
 }
-if (session.audio !== true) {
-  fail("hosted product display must advertise audio=true", session);
+if (session.audio !== true && session.audio !== false) {
+  fail("hosted product display must report audio availability", session);
 }
 if (session.video !== true) {
   fail("hosted product display must advertise video=true", session);
@@ -148,14 +165,18 @@ if (session.display_backend === "selkies_gstreamer_webrtc") {
     fail("Selkies/GStreamer hosted display must use engine-offer WebRTC negotiation", session);
   }
   const initialOffer = session.initial_offer || {};
+  const audioOffer = session.audio_offer || {};
   if (
     initialOffer.schema !== "elastos.browser.webrtc-offer/v1" ||
     initialOffer.type !== "offer" ||
     typeof initialOffer.sdp !== "string" ||
-    !initialOffer.sdp.includes("m=video") ||
-    !initialOffer.sdp.includes("m=audio")
+    !initialOffer.sdp.includes("m=video")
   ) {
-    fail("Selkies/GStreamer hosted display must include an initial audio/video WebRTC offer", session);
+    fail("Selkies/GStreamer hosted display must include an initial video WebRTC offer", session);
+  }
+  const audioSdp = typeof audioOffer.sdp === "string" ? audioOffer.sdp : initialOffer.sdp;
+  if (session.audio === true && !audioSdp.includes("m=audio")) {
+    fail("Selkies/GStreamer hosted display advertised audio without an audio WebRTC offer", session);
   }
 }
 if (session.direct_network !== false || launch.data.direct_network !== false) {

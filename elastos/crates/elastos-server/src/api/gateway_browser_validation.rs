@@ -9,13 +9,29 @@ pub(in crate::api::gateway) fn browser_request_origin(headers: &HeaderMap) -> Op
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
+    let default_proto = if browser_origin_host_is_loopback(host) {
+        "http"
+    } else {
+        "https"
+    };
     let proto = headers
         .get("x-forwarded-proto")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| *value == "http" || *value == "https")
-        .unwrap_or("https");
+        .unwrap_or(default_proto);
     Some(format!("{proto}://{host}"))
+}
+
+fn browser_origin_host_is_loopback(host: &str) -> bool {
+    let trimmed = host.trim();
+    let host = if let Some(rest) = trimmed.strip_prefix('[') {
+        rest.split(']').next().unwrap_or_default()
+    } else {
+        trimmed.split(':').next().unwrap_or_default()
+    }
+    .to_ascii_lowercase();
+    matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1")
 }
 
 pub(in crate::api::gateway) fn browser_url_to_stream_target(
@@ -76,6 +92,38 @@ pub(in crate::api::gateway) fn browser_viewport_value(
         "width": viewport.width,
         "height": viewport.height,
     }))
+}
+
+pub(in crate::api::gateway) fn validate_browser_launch_contract(
+    display_mode: BrowserDisplayMode,
+    guarantee_level: BrowserGuaranteeLevel,
+) -> anyhow::Result<()> {
+    match guarantee_level {
+        BrowserGuaranteeLevel::MechanismMicrovm => {
+            if display_mode == BrowserDisplayMode::WebrtcRemoteDisplay {
+                Ok(())
+            } else {
+                anyhow::bail!("mechanism_microvm Browser launches require webrtc_remote_display")
+            }
+        }
+        BrowserGuaranteeLevel::OperatorRbi => {
+            if display_mode == BrowserDisplayMode::WebrtcRemoteDisplay {
+                Ok(())
+            } else {
+                anyhow::bail!("operator_rbi Browser launches require webrtc_remote_display")
+            }
+        }
+        BrowserGuaranteeLevel::PolicyWebview => {
+            if display_mode == BrowserDisplayMode::NativeSurface {
+                Ok(())
+            } else {
+                anyhow::bail!("policy_webview Browser launches require native_surface")
+            }
+        }
+        BrowserGuaranteeLevel::Diagnostic => {
+            anyhow::bail!("diagnostic Browser frame launches are not supported")
+        }
+    }
 }
 
 pub(in crate::api::gateway) fn browser_webrtc_signal_value(
@@ -226,27 +274,6 @@ fn validate_browser_webrtc_answer(data: serde_json::Value) -> anyhow::Result<ser
     Ok(data)
 }
 
-pub(in crate::api::gateway) fn browser_screenshot_bytes(
-    data: serde_json::Value,
-) -> anyhow::Result<(&'static str, Bytes)> {
-    if data.get("schema").and_then(|value| value.as_str()) != Some("elastos.browser.screenshot/v1")
-    {
-        anyhow::bail!("browser-engine provider returned an invalid screenshot response");
-    }
-    let content_type = match data.get("content_type").and_then(|value| value.as_str()) {
-        Some("image/png") => "image/png",
-        _ => anyhow::bail!("browser-engine screenshot content type is unsupported"),
-    };
-    let encoded = data
-        .get("base64")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| anyhow::anyhow!("browser-engine screenshot response missing image"))?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(|err| anyhow::anyhow!("browser-engine screenshot is invalid base64: {err}"))?;
-    Ok((content_type, Bytes::from(bytes)))
-}
-
 pub(in crate::api::gateway) fn is_safe_runtime_id(value: &str) -> bool {
     !value.is_empty()
         && value
@@ -257,6 +284,7 @@ pub(in crate::api::gateway) fn is_safe_runtime_id(value: &str) -> bool {
 pub(in crate::api::gateway) fn validate_browser_engine_page(
     page: serde_json::Value,
     expected_display_mode: BrowserDisplayMode,
+    expected_guarantee_level: BrowserGuaranteeLevel,
 ) -> anyhow::Result<serde_json::Value> {
     if page.get("schema").and_then(|value| value.as_str()) != Some("elastos.browser.engine.page/v1")
     {
@@ -301,27 +329,17 @@ pub(in crate::api::gateway) fn validate_browser_engine_page(
     {
         anyhow::bail!("browser-engine display session attempted to report direct network");
     }
+    let view = page
+        .get("view")
+        .ok_or_else(|| anyhow::anyhow!("browser-engine provider omitted view geometry"))?;
+    if view.get("schema").and_then(|value| value.as_str()) != Some("elastos.browser.view/v1") {
+        anyhow::bail!("browser-engine provider returned an invalid view geometry");
+    }
+    let view_width = browser_display_dimension(view, "width", "view")?;
+    let view_height = browser_display_dimension(view, "height", "view")?;
+    let session_width = browser_display_dimension(display_session, "width", "display_session")?;
+    let session_height = browser_display_dimension(display_session, "height", "display_session")?;
     match expected_display_mode {
-        BrowserDisplayMode::DiagnosticFrame => {
-            if display_session
-                .get("input")
-                .and_then(|value| value.as_str())
-                != Some("runtime_route")
-            {
-                anyhow::bail!("diagnostic Browser display must use runtime_route input");
-            }
-            if display_session
-                .get("audio")
-                .and_then(|value| value.as_bool())
-                == Some(true)
-                || display_session
-                    .get("video")
-                    .and_then(|value| value.as_bool())
-                    == Some(true)
-            {
-                anyhow::bail!("diagnostic Browser display cannot claim audio/video media");
-            }
-        }
         BrowserDisplayMode::WebrtcRemoteDisplay => {
             let backend_class = display_session
                 .get("backend_class")
@@ -329,6 +347,11 @@ pub(in crate::api::gateway) fn validate_browser_engine_page(
             let display_backend = display_session
                 .get("display_backend")
                 .and_then(|value| value.as_str());
+            if !same_display_ratio(session_width, session_height, view_width, view_height) {
+                anyhow::bail!(
+                    "webrtc_remote_display stream dimensions must preserve the Runtime view aspect ratio"
+                );
+            }
             if display_session
                 .get("audio")
                 .and_then(|value| value.as_bool())
@@ -345,5 +368,417 @@ pub(in crate::api::gateway) fn validate_browser_engine_page(
             }
         }
     }
-    Ok(page)
+    validate_browser_engine_guarantee(&page, expected_guarantee_level)?;
+    Ok(browser_visible_engine_page(&page))
+}
+
+fn browser_visible_engine_page(page: &serde_json::Value) -> serde_json::Value {
+    let mut visible = serde_json::Map::new();
+    for key in [
+        "schema",
+        "page_id",
+        "adapter",
+        "engine",
+        "url",
+        "actual_url",
+        "title",
+        "stream_id",
+        "network_mode",
+        "direct_network",
+        "wallet_injection",
+        "display_mode",
+    ] {
+        copy_browser_visible_field(&mut visible, page, key);
+    }
+    if let Some(display_session) = page.get("display_session") {
+        visible.insert(
+            "display_session".to_string(),
+            browser_visible_object_fields(
+                display_session,
+                &[
+                    "schema",
+                    "session_id",
+                    "mode",
+                    "width",
+                    "height",
+                    "network_mode",
+                    "direct_network",
+                    "input",
+                    "input_protocol",
+                    "display_backend",
+                    "backend_class",
+                    "media_transport",
+                    "audio",
+                    "video",
+                    "ice_servers",
+                    "offerer",
+                    "initial_offer",
+                    "audio_offer",
+                    "signaling_url",
+                    "surface_id",
+                ],
+            ),
+        );
+    }
+    if let Some(view) = page.get("view") {
+        visible.insert(
+            "view".to_string(),
+            browser_visible_object_fields(view, &["schema", "mode", "width", "height"]),
+        );
+    }
+    if let Some(wallet_bridge) = page.get("wallet_bridge") {
+        visible.insert(
+            "wallet_bridge".to_string(),
+            browser_visible_object_fields(
+                wallet_bridge,
+                &[
+                    "schema",
+                    "mode",
+                    "accounts",
+                    "default_chain_namespace",
+                    "signing",
+                ],
+            ),
+        );
+    }
+    serde_json::Value::Object(visible)
+}
+
+fn browser_visible_object_fields(value: &serde_json::Value, fields: &[&str]) -> serde_json::Value {
+    let mut visible = serde_json::Map::new();
+    for key in fields {
+        copy_browser_visible_field(&mut visible, value, key);
+    }
+    serde_json::Value::Object(visible)
+}
+
+fn copy_browser_visible_field(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    source: &serde_json::Value,
+    key: &str,
+) {
+    if let Some(value) = source.get(key) {
+        target.insert(key.to_string(), value.clone());
+    }
+}
+
+fn browser_display_dimension(
+    value: &serde_json::Value,
+    field: &str,
+    label: &str,
+) -> anyhow::Result<u64> {
+    let dimension = value
+        .get(field)
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("browser-engine {label}.{field} is required"))?;
+    if (field == "width" && !(320..=3840).contains(&dimension))
+        || (field == "height" && !(240..=2160).contains(&dimension))
+    {
+        anyhow::bail!("browser-engine {label}.{field} is outside the supported viewport range");
+    }
+    Ok(dimension)
+}
+
+fn same_display_ratio(
+    left_width: u64,
+    left_height: u64,
+    right_width: u64,
+    right_height: u64,
+) -> bool {
+    let left = (left_width as u128) * (right_height as u128);
+    let right = (right_width as u128) * (left_height as u128);
+    left.abs_diff(right) <= 2
+}
+
+fn validate_browser_engine_guarantee(
+    page: &serde_json::Value,
+    expected_guarantee_level: BrowserGuaranteeLevel,
+) -> anyhow::Result<()> {
+    let engine = page
+        .get("engine")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let isolation_kind = page
+        .pointer("/isolation/kind")
+        .and_then(|value| value.as_str());
+    let display_backend_class = page
+        .pointer("/display_session/backend_class")
+        .and_then(|value| value.as_str());
+    match expected_guarantee_level {
+        BrowserGuaranteeLevel::MechanismMicrovm => {
+            if engine != "chromium_microvm" || isolation_kind != Some("per_launch_vm_target") {
+                anyhow::bail!("Browser launch requested mechanism_microvm but provider did not return a per-launch Chromium microVM");
+            }
+            if page
+                .pointer("/display_session/mode")
+                .and_then(|value| value.as_str())
+                == Some("webrtc_remote_display")
+            {
+                let audio = page
+                    .pointer("/display_session/audio")
+                    .and_then(|value| value.as_bool());
+                let video = page
+                    .pointer("/display_session/video")
+                    .and_then(|value| value.as_bool());
+                if display_backend_class != Some("product_compositor")
+                    || audio != Some(true)
+                    || video != Some(true)
+                {
+                    anyhow::bail!("Browser launch requested mechanism_microvm but provider did not return an audio/video product compositor");
+                }
+                if page
+                    .pointer("/display_session/media_transport")
+                    .and_then(|value| value.as_str())
+                    != Some("runtime_relay")
+                {
+                    anyhow::bail!(
+                        "Browser VM WebRTC display must use runtime_relay media transport"
+                    );
+                }
+            }
+        }
+        BrowserGuaranteeLevel::OperatorRbi => {
+            if !matches!(engine, "selkies_gstreamer" | "hosted_remote_browser")
+                || display_backend_class != Some("product_compositor")
+            {
+                anyhow::bail!("Browser launch requested operator_rbi but provider did not return an operator remote-browser product compositor");
+            }
+        }
+        BrowserGuaranteeLevel::PolicyWebview => {
+            if !matches!(engine, "cef" | "webview2" | "geckoview" | "wkwebview") {
+                anyhow::bail!("Browser launch requested policy_webview but provider did not return a policy WebView engine");
+            }
+        }
+        BrowserGuaranteeLevel::Diagnostic => {}
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn page(
+        display_mode: &str,
+        view: serde_json::Value,
+        display_session: serde_json::Value,
+    ) -> serde_json::Value {
+        json!({
+            "schema": "elastos.browser.engine.page/v1",
+            "page_id": "page:test",
+            "adapter": "test-adapter",
+            "engine": "contract_proof",
+            "network_mode": "runtime_net_only",
+            "direct_network": false,
+            "wallet_injection": false,
+            "display_session": display_session,
+            "view": view,
+            "display_mode": display_mode
+        })
+    }
+
+    fn browser_view(width: u64, height: u64) -> serde_json::Value {
+        json!({
+            "schema": "elastos.browser.view/v1",
+            "mode": "webrtc_remote_display",
+            "width": width,
+            "height": height
+        })
+    }
+
+    fn webrtc_display(width: u64, height: u64) -> serde_json::Value {
+        json!({
+            "schema": "elastos.browser.display-session/v1",
+            "session_id": "display:test",
+            "mode": "webrtc_remote_display",
+            "width": width,
+            "height": height,
+            "input": "datachannel",
+            "input_protocol": "selkies_v1",
+            "audio": false,
+            "video": true,
+            "display_backend": "selkies_gstreamer_webrtc",
+            "backend_class": "product_compositor",
+            "network_mode": "runtime_net_only",
+            "direct_network": false
+        })
+    }
+
+    #[test]
+    fn diagnostic_launch_contract_is_not_supported() {
+        let err = validate_browser_launch_contract(
+            BrowserDisplayMode::WebrtcRemoteDisplay,
+            BrowserGuaranteeLevel::Diagnostic,
+        )
+        .expect_err("diagnostic frame launches must fail closed");
+        assert!(err
+            .to_string()
+            .contains("diagnostic Browser frame launches are not supported"));
+    }
+
+    #[test]
+    fn display_session_dimensions_are_required() {
+        let mut display = webrtc_display(900, 520);
+        display.as_object_mut().unwrap().remove("width");
+        let bad = page("webrtc_remote_display", browser_view(900, 520), display);
+        let err = validate_browser_engine_page(
+            bad,
+            BrowserDisplayMode::WebrtcRemoteDisplay,
+            BrowserGuaranteeLevel::OperatorRbi,
+        )
+        .expect_err("display sessions without dimensions must fail closed");
+        assert!(err
+            .to_string()
+            .contains("browser-engine display_session.width is required"));
+    }
+
+    #[test]
+    fn webrtc_stream_must_preserve_runtime_view_ratio() {
+        let bad = page(
+            "webrtc_remote_display",
+            browser_view(1000, 700),
+            webrtc_display(1920, 1080),
+        );
+        let err = validate_browser_engine_page(
+            bad,
+            BrowserDisplayMode::WebrtcRemoteDisplay,
+            BrowserGuaranteeLevel::OperatorRbi,
+        )
+        .expect_err("stretched WebRTC display geometry must fail closed");
+        assert!(err
+            .to_string()
+            .contains("stream dimensions must preserve the Runtime view aspect ratio"));
+    }
+
+    #[test]
+    fn fixed_stream_webrtc_accepts_matching_view_ratio() {
+        let mut ok = page(
+            "webrtc_remote_display",
+            browser_view(1280, 720),
+            webrtc_display(1920, 1080),
+        );
+        ok["engine"] = serde_json::Value::String("selkies_gstreamer".to_string());
+        validate_browser_engine_page(
+            ok,
+            BrowserDisplayMode::WebrtcRemoteDisplay,
+            BrowserGuaranteeLevel::OperatorRbi,
+        )
+        .expect("fixed WebRTC stream may differ in size when the aspect ratio matches");
+    }
+
+    #[test]
+    fn engine_page_validation_returns_browser_visible_receipt() {
+        let mut display = webrtc_display(1280, 720);
+        display["signaling_url"] =
+            serde_json::Value::String("/api/apps/browser/pages/page%3Atest/webrtc".to_string());
+        display["ice_servers"] = json!([{
+            "urls": ["turn:relay.invalid:3478"],
+            "username": "session-user",
+            "credential": "session-credential"
+        }]);
+        display["control_socket_path"] = serde_json::Value::String("/tmp/private.sock".to_string());
+        display["profile"] = json!({ "disk_path": "/private/profile" });
+
+        let mut ok = page("webrtc_remote_display", browser_view(1280, 720), display);
+        ok["engine"] = serde_json::Value::String("selkies_gstreamer".to_string());
+        ok["actual_url"] = serde_json::Value::String("https://example.org/".to_string());
+        ok["control_socket_path"] = serde_json::Value::String("/tmp/private.sock".to_string());
+        ok["adapter_ipc"] = json!({ "path": "/tmp/adapter.sock" });
+        ok["relay_ipc"] = json!({ "path": "/tmp/relay.sock" });
+        ok["principal_id"] = serde_json::Value::String("person:local:secret".to_string());
+        ok["profile"] = json!({ "disk_path": "/private/profile" });
+        ok["isolation"] = json!({ "session_dir": "/private/session" });
+        ok["view"]["control_socket_path"] =
+            serde_json::Value::String("/tmp/private-view.sock".to_string());
+        ok["wallet_bridge"] = json!({
+            "schema": "elastos.browser.wallet-bridge/v1",
+            "mode": "runtime_mediated_eip1193",
+            "accounts": 1,
+            "default_chain_namespace": "eip155:20",
+            "signing": "approval_required",
+            "home_token": "secret-token",
+            "principal_id": "person:local:secret"
+        });
+
+        let visible = validate_browser_engine_page(
+            ok,
+            BrowserDisplayMode::WebrtcRemoteDisplay,
+            BrowserGuaranteeLevel::OperatorRbi,
+        )
+        .expect("valid engine page should return a sanitized visible receipt");
+
+        assert_eq!(visible["schema"], "elastos.browser.engine.page/v1");
+        assert_eq!(visible["actual_url"], "https://example.org/");
+        assert_eq!(
+            visible["display_session"]["signaling_url"],
+            "/api/apps/browser/pages/page%3Atest/webrtc"
+        );
+        assert_eq!(
+            visible["display_session"]["ice_servers"][0]["credential"],
+            "session-credential"
+        );
+        assert_eq!(visible["wallet_bridge"]["mode"], "runtime_mediated_eip1193");
+        assert!(visible.get("control_socket_path").is_none());
+        assert!(visible.get("adapter_ipc").is_none());
+        assert!(visible.get("relay_ipc").is_none());
+        assert!(visible.get("principal_id").is_none());
+        assert!(visible.get("profile").is_none());
+        assert!(visible.get("isolation").is_none());
+        assert!(visible
+            .pointer("/display_session/control_socket_path")
+            .is_none());
+        assert!(visible.pointer("/display_session/profile").is_none());
+        assert!(visible.pointer("/view/control_socket_path").is_none());
+        assert!(visible.pointer("/wallet_bridge/home_token").is_none());
+        assert!(visible.pointer("/wallet_bridge/principal_id").is_none());
+    }
+
+    #[test]
+    fn mechanism_microvm_webrtc_requires_audio_video_product_display() {
+        let mut display = webrtc_display(1920, 1080);
+        display["display_backend"] =
+            serde_json::Value::String("vm_selkies_gstreamer_webrtc".to_string());
+        display["media_transport"] = serde_json::Value::String("runtime_relay".to_string());
+        display["audio"] = serde_json::Value::Bool(false);
+        let mut bad = page("webrtc_remote_display", browser_view(1280, 720), display);
+        bad["engine"] = serde_json::Value::String("chromium_microvm".to_string());
+        bad["isolation"] = json!({
+            "schema": "elastos.browser.engine.isolation/v1",
+            "kind": "per_launch_vm_target",
+            "session_dir": "/tmp/elastos-browser-vm-sessions/test"
+        });
+
+        let err = validate_browser_engine_page(
+            bad,
+            BrowserDisplayMode::WebrtcRemoteDisplay,
+            BrowserGuaranteeLevel::MechanismMicrovm,
+        )
+        .expect_err("video-only VM product display must fail closed");
+        assert!(err.to_string().contains("audio/video product compositor"));
+    }
+
+    #[test]
+    fn mechanism_microvm_webrtc_requires_video_product_display() {
+        let mut display = webrtc_display(1920, 1080);
+        display["display_backend"] =
+            serde_json::Value::String("vm_selkies_gstreamer_webrtc".to_string());
+        display["media_transport"] = serde_json::Value::String("runtime_relay".to_string());
+        display["video"] = serde_json::Value::Bool(false);
+        let mut bad = page("webrtc_remote_display", browser_view(1280, 720), display);
+        bad["engine"] = serde_json::Value::String("chromium_microvm".to_string());
+        bad["isolation"] = json!({
+            "schema": "elastos.browser.engine.isolation/v1",
+            "kind": "per_launch_vm_target",
+            "session_dir": "/tmp/elastos-browser-vm-sessions/test"
+        });
+
+        let err = validate_browser_engine_page(
+            bad,
+            BrowserDisplayMode::WebrtcRemoteDisplay,
+            BrowserGuaranteeLevel::MechanismMicrovm,
+        )
+        .expect_err("video-less VM product display must fail closed");
+        assert!(err.to_string().contains("audio/video product compositor"));
+    }
 }

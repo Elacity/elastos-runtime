@@ -2,6 +2,8 @@
 import { spawnSync } from "node:child_process";
 import process from "node:process";
 
+const nodeBinary = process.execPath;
+
 function usage() {
   console.error(`Usage:
   node scripts/browser-provider-runbook.mjs \\
@@ -65,8 +67,12 @@ function parseArgs(argv) {
 function run(command, args) {
   const result = spawnSync(command, args, {
     encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
   });
+  if (result.error) {
+    throw result.error;
+  }
   return {
     status: result.status,
     stdout: result.stdout,
@@ -76,7 +82,7 @@ function run(command, args) {
 
 function loadDecisionReport(args) {
   if (args.decisionReport) {
-    const result = run("node", ["-e", `const fs=require("fs"); process.stdout.write(fs.readFileSync(process.argv[1],"utf8"))`, args.decisionReport]);
+    const result = run(nodeBinary, ["-e", `const fs=require("fs"); process.stdout.write(fs.readFileSync(process.argv[1],"utf8"))`, args.decisionReport]);
     if (result.status !== 0) {
       throw new Error(result.stderr.trim() || `failed to read decision report: ${args.decisionReport}`);
     }
@@ -86,7 +92,7 @@ function loadDecisionReport(args) {
   if (args.hostedBakeoff) decisionArgs.push("--hosted-bakeoff", args.hostedBakeoff);
   if (args.nativePreflight) decisionArgs.push("--native-preflight", args.nativePreflight);
   if (args.manualUx) decisionArgs.push("--manual-ux", args.manualUx);
-  const result = run("node", decisionArgs);
+  const result = run(nodeBinary, decisionArgs);
   const parsed = parseFirstJson(result.stdout);
   if (!parsed) {
     throw new Error(result.stderr.trim() || "browser-provider-decision-report.mjs did not produce JSON");
@@ -205,7 +211,11 @@ function currentHostStopConditionBlock(report) {
   if (action?.id) {
     lines.push(`- Current next action is \`${action.id}\`, owned by \`${action.owner || "unknown"}\`, status \`${action.status || "unknown"}\`.`);
   }
-  if (report.live_adapter?.control_status?.single_session === true && Number(report.live_adapter?.control_status?.active_pages || 0) > 0) {
+  if (
+    report.live_adapter?.control_status?.single_session === true &&
+    report.live_adapter?.control_status?.single_vm_session !== true &&
+    Number(report.live_adapter?.control_status?.active_pages || 0) > 0
+  ) {
     lines.push("- The live Selkies target is single-session and busy; close the active page only by operator choice, or provision a separate provider instance for bake-offs.");
     const pageIds = activePageIds(report);
     if (pageIds.length > 0) {
@@ -229,7 +239,9 @@ function activePageIds(report) {
 
 function markdown(report) {
   const activePages = Number(report.live_adapter?.control_status?.active_pages || 0);
-  const singleSession = report.live_adapter?.control_status?.single_session === true;
+  const singleSession =
+    report.live_adapter?.control_status?.single_session === true &&
+    report.live_adapter?.control_status?.single_vm_session !== true;
   const pageIds = activePageIds(report);
   return `# Browser Provider Operator Runbook
 

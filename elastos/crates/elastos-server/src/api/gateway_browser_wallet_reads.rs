@@ -56,7 +56,6 @@ async fn browser_wallet_read_inner(
     input: &BrowserWalletReadRequest,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     let method = input.method.trim();
-    let _origin = input.origin.as_deref();
     let params = input.params.as_array().ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
@@ -461,6 +460,14 @@ async fn browser_wallet_read_inner(
             )?;
             let response = browser_provider_resource_response(state, call).await?;
             provider_response_data_or_bad_request(&response)?
+                .get("transaction")
+                .cloned()
+                .ok_or_else(|| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "chain provider transaction response is missing transaction".to_string(),
+                    )
+                })?
         }
         "eth_getTransactionReceipt" => {
             let hash = params
@@ -483,6 +490,14 @@ async fn browser_wallet_read_inner(
             )?;
             let response = browser_provider_resource_response(state, call).await?;
             provider_response_data_or_bad_request(&response)?
+                .get("receipt")
+                .cloned()
+                .ok_or_else(|| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "chain provider receipt response is missing receipt".to_string(),
+                    )
+                })?
         }
         _ => {
             return Err((

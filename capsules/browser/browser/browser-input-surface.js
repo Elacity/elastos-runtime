@@ -3,13 +3,11 @@ const WHEEL_FLUSH_MS = 80;
 export function bindBrowserInputSurface({
   copyRemoteClipboardToHost,
   friendlyOpenError,
-  getCurrentDisplayMode,
   getCurrentPage,
   getCurrentView,
   keyboardCapture,
   pasteHostClipboardIntoRemote,
   remoteVideo,
-  renderImage,
   renderPanel,
   sendBrowserInput,
   showStatus,
@@ -37,6 +35,10 @@ export function bindBrowserInputSurface({
     return Boolean(
       target &&
         (target.closest?.("#browser-form") ||
+          target.closest?.("#browser-settings-panel") ||
+          target.id === "browser-settings" ||
+          target.id === "browser-exit" ||
+          target.classList?.contains("browser-exit-select") ||
           target.id === "browser-url" ||
           target.classList?.contains("browser-address")),
     );
@@ -94,24 +96,14 @@ export function bindBrowserInputSurface({
   }
 
   function browserPointFromEvent(event) {
-    const target =
-      getCurrentDisplayMode() === "webrtc_remote_display"
-        ? remoteVideo
-        : renderImage;
+    const target = remoteVideo;
     if (!target || target.hidden) {
       return null;
     }
     const rect = target.getBoundingClientRect();
-    const width = Number(
-      getCurrentDisplayMode() === "webrtc_remote_display"
-        ? target.videoWidth || getCurrentView()?.width || rect.width
-        : target.naturalWidth || getCurrentView()?.width || rect.width,
-    );
-    const height = Number(
-      getCurrentDisplayMode() === "webrtc_remote_display"
-        ? target.videoHeight || getCurrentView()?.height || rect.height
-        : target.naturalHeight || getCurrentView()?.height || rect.height,
-    );
+    const view = getCurrentView() || {};
+    const width = Number(target.videoWidth || view.width || rect.width);
+    const height = Number(target.videoHeight || view.height || rect.height);
     const contentRect = browserMediaContentRect(target, width, height);
     if (!contentRect) {
       return null;
@@ -192,6 +184,7 @@ export function bindBrowserInputSurface({
     if (!point) {
       return;
     }
+    event.preventDefault();
     focusKeyboardCapture();
     sendBrowserInput(
       { type: "click", x: point.x, y: point.y },
@@ -199,6 +192,14 @@ export function bindBrowserInputSurface({
     ).catch((error) => {
       showStatus(friendlyOpenError(error), { sticky: true });
     });
+  }
+
+  function isMediaClickTarget(target) {
+    return Boolean(
+      target &&
+        remoteVideo &&
+        (target === remoteVideo || remoteVideo.contains?.(target)),
+    );
   }
 
   function queueWheelInput(point, deltaX, deltaY) {
@@ -223,17 +224,21 @@ export function bindBrowserInputSurface({
     }, WHEEL_FLUSH_MS);
   }
 
-  renderImage.addEventListener("click", (event) => {
+  remoteVideo.addEventListener("click", (event) => {
     if (Date.now() < suppressSyntheticClickUntil) {
       event.preventDefault();
       return;
     }
+    event.stopPropagation();
     sendClickFromEvent(event);
   });
 
-  remoteVideo.addEventListener("click", (event) => {
+  renderPanel.addEventListener("click", (event) => {
     if (Date.now() < suppressSyntheticClickUntil) {
       event.preventDefault();
+      return;
+    }
+    if (isMediaClickTarget(event.target)) {
       return;
     }
     sendClickFromEvent(event);
@@ -350,6 +355,16 @@ export function bindBrowserInputSurface({
     if (event.ctrlKey || event.metaKey || event.altKey) {
       return;
     }
+    if (typeof event.key === "string" && [...event.key].length === 1) {
+      event.preventDefault();
+      sendBrowserInput(
+        { type: "paste_text", text: event.key },
+        { history: "replace" },
+      ).catch((error) => {
+        showStatus(friendlyOpenError(error), { sticky: true });
+      });
+      return;
+    }
     const allowed =
       event.key === "Enter" ||
       event.key === "Backspace" ||
@@ -363,9 +378,7 @@ export function bindBrowserInputSurface({
       event.key === "Home" ||
       event.key === "End" ||
       event.key === "PageUp" ||
-      event.key === "PageDown" ||
-      event.key === " " ||
-      event.key.length === 1;
+      event.key === "PageDown";
     if (!allowed) {
       return;
     }

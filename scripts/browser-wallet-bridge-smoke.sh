@@ -123,7 +123,8 @@ console.log(JSON.stringify({
   engine: "chromium",
   stream_id: "stream:browser-wallet-bridge-smoke",
   url: "http://127.0.0.1:$site_port/",
-  display_mode: "diagnostic_frame",
+  display_mode: "webrtc_remote_display",
+  guarantee_level: "operator_rbi",
   network_mode: "runtime_net_only",
   direct_network: false,
   wallet_injection: false,
@@ -192,27 +193,34 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function pageTitle() {
+  const media = await control(`/pages/${encodeURIComponent(result.page_id)}/media`);
+  const summaries = Array.isArray(media.frame_summaries) ? media.frame_summaries : [];
+  const titled = summaries.find((summary) => typeof summary.title === "string" && summary.title.startsWith("wallet-"));
+  return titled?.title || summaries[0]?.title || "";
+}
+
 (async () => {
   assert(result.schema === "elastos.browser.engine.supervisor-result/v1", "unexpected launch result schema");
   assert(result.network_mode === "runtime_net_only", "launch did not stay runtime_net_only");
   assert(result.direct_network === false, "launch reported direct network access");
   assert(result.wallet_bridge?.mode === "runtime_mediated_eip1193", "wallet bridge was not runtime mediated");
   assert(result.wallet_bridge?.accounts === 2, "wallet bridge did not expose the fixture accounts");
-  let frame = null;
+  let title = "";
   for (let attempt = 0; attempt < 30; attempt += 1) {
-    frame = await control(`/pages/${encodeURIComponent(result.page_id)}/frame?wait_ms=250`);
-    if (typeof frame.title === "string" && frame.title.startsWith("wallet-")) {
+    title = await pageTitle();
+    if (title.startsWith("wallet-")) {
       break;
     }
     await sleep(250);
   }
-  assert(frame && typeof frame.title === "string", "wallet smoke did not produce a page title");
-  if (frame.title.startsWith("wallet-error:")) {
-    const error = JSON.parse(Buffer.from(frame.title.slice("wallet-error:".length), "base64").toString("utf8"));
+  assert(typeof title === "string" && title.length > 0, "wallet smoke did not produce a page title");
+  if (title.startsWith("wallet-error:")) {
+    const error = JSON.parse(Buffer.from(title.slice("wallet-error:".length), "base64").toString("utf8"));
     throw new Error(`wallet bridge page failed: ${JSON.stringify(error)}`);
   }
-  assert(frame.title.startsWith("wallet-ok:"), `wallet smoke did not complete: ${frame.title}`);
-  const payload = JSON.parse(Buffer.from(frame.title.slice("wallet-ok:".length), "base64").toString("utf8"));
+  assert(title.startsWith("wallet-ok:"), `wallet smoke did not complete: ${title}`);
+  const payload = JSON.parse(Buffer.from(title.slice("wallet-ok:".length), "base64").toString("utf8"));
   assert(payload.initialChain === "0x14", `expected ESC initial chain 0x14, got ${payload.initialChain}`);
   assert(payload.initialNet === "20", `expected ESC net_version 20, got ${payload.initialNet}`);
   assert(payload.initialAccounts?.[0] === "0x1111111111111111111111111111111111111111", "initial account mismatch");

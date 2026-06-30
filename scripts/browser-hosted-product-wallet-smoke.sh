@@ -141,6 +141,24 @@ function streamSessionFor(targetUrl) {
   };
 }
 
+function browserProfile() {
+  return {
+    schema: "elastos.browser.profile/v1",
+    scope: "active_principal",
+    storage: "principal_owned_profile_disk",
+    storage_posture: "principal_owned_reset_scoped_unprotected",
+    protected_storage: false,
+    encrypted: false,
+    recoverable: false,
+    recovery: "not_recovery_kit_packaged",
+    uri: "localhost://Users/0123456789ab/BrowserProfiles/default/profile.ext4",
+    public_uri: "localhost://Users/self/BrowserProfiles/default/profile.ext4",
+    profile_key: "profile-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    disk_path: "/tmp/elastos-browser-hosted-product-wallet/BrowserProfiles/default/profile.ext4",
+    reset: "whole_profile",
+  };
+}
+
 const adapter = new AdapterClient();
 let pageId = "";
 try {
@@ -151,9 +169,11 @@ try {
       op: "launch",
       url: process.env.TARGET_URL,
       stream_session: streamSessionFor(process.env.TARGET_URL),
+      profile: browserProfile(),
       principal_id: "person:local:hosted-product-wallet-smoke",
       reason: "verify hosted product wallet bridge",
       display_mode: "webrtc_remote_display",
+      guarantee_level: "operator_rbi",
       viewport: { width: 1280, height: 720 },
       wallet: {
         accounts: [

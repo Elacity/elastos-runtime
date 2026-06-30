@@ -191,6 +191,7 @@ print(json.dumps({
         "stream_id": "stream:native-supervisor-proxy-smoke",
     },
     "display_mode": "native_surface",
+    "guarantee_level": "policy_webview",
     "wallet": {},
     "viewport": {"width": 1280, "height": 720},
 }))

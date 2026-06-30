@@ -2,15 +2,39 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+find_node() {
+  if [[ -n "${ELASTOS_NODE_BIN:-}" && -x "${ELASTOS_NODE_BIN}" ]]; then
+    printf '%s\n' "${ELASTOS_NODE_BIN}"
+    return 0
+  fi
+  if command -v node >/dev/null 2>&1; then
+    command -v node
+    return 0
+  fi
+  local bundled="${HOME}/.elastos/node/node-v22.13.1-darwin-arm64/bin/node"
+  if [[ -x "$bundled" ]]; then
+    printf '%s\n' "$bundled"
+    return 0
+  fi
+  return 1
+}
+
+node_bin="$(find_node || true)"
+if [[ -z "$node_bin" ]]; then
+  echo "node not found. Install Node or set ELASTOS_NODE_BIN to an executable node binary." >&2
+  exit 2
+fi
+
 tmp_dir="$(mktemp -d /tmp/elastos-browser-objective-audit-smoke-XXXXXX)"
 cleanup() {
   rm -rf "$tmp_dir"
 }
 trap cleanup EXIT
 
-node "$repo_root/scripts/browser-objective-audit.mjs" --help >"$tmp_dir/help.txt" 2>&1 || true
+"$node_bin" "$repo_root/scripts/browser-objective-audit.mjs" --help >"$tmp_dir/help.txt" 2>&1 || true
 
-node -e '
+"$node_bin" -e '
   const fs = require("node:fs");
   const text = fs.readFileSync(process.argv[1], "utf8");
   const required = [
@@ -69,7 +93,7 @@ cat >"$tmp_dir/manual-passed.json" <<'JSON'
 JSON
 
 set +e
-node "$repo_root/scripts/browser-objective-audit.mjs" \
+"$node_bin" "$repo_root/scripts/browser-objective-audit.mjs" \
   --native-preflight "$tmp_dir/native-declared-only.json" \
   --manual-ux "$tmp_dir/manual-passed.json" \
   >"$tmp_dir/audit.json" \
@@ -83,7 +107,7 @@ if [[ "$status" -eq 0 ]]; then
   exit 1
 fi
 
-node -e '
+"$node_bin" -e '
   const fs = require("node:fs");
   const audit = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
   if (!audit.objective || !String(audit.objective.restatement || "").includes("enable/prove audio")) {
@@ -203,7 +227,7 @@ cat >"$tmp_dir/hosted-shallow-ok.json" <<'JSON'
 JSON
 
 set +e
-node "$repo_root/scripts/browser-objective-audit.mjs" \
+"$node_bin" "$repo_root/scripts/browser-objective-audit.mjs" \
   --hosted-bakeoff "$tmp_dir/hosted-shallow-ok.json" \
   --manual-ux "$tmp_dir/manual-passed.json" \
   >"$tmp_dir/hosted-shallow-audit.json" \
@@ -217,7 +241,7 @@ if [[ "$hosted_shallow_status" -eq 0 ]]; then
   exit 1
 fi
 
-node -e '
+"$node_bin" -e '
   const fs = require("node:fs");
   const audit = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
   const hostedCriterion = audit.criteria.find((item) => item.id === "hosted_provider_product_accepted");
@@ -281,7 +305,7 @@ cat >"$tmp_dir/hosted-skipped-youtube.json" <<'JSON'
 JSON
 
 set +e
-node "$repo_root/scripts/browser-objective-audit.mjs" \
+"$node_bin" "$repo_root/scripts/browser-objective-audit.mjs" \
   --hosted-bakeoff "$tmp_dir/hosted-skipped-youtube.json" \
   --manual-ux "$tmp_dir/manual-passed.json" \
   >"$tmp_dir/hosted-skipped-youtube-audit.json" \
@@ -375,7 +399,7 @@ cat >"$tmp_dir/hosted-valid.json" <<'JSON'
 }
 JSON
 
-node -e '
+"$node_bin" -e '
   const fs = require("node:fs");
   const artifact = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
   delete artifact.candidate_gate.result.resize_gate;
@@ -384,7 +408,7 @@ node -e '
 ' "$tmp_dir/hosted-valid.json" "$tmp_dir/hosted-missing-resize.json"
 
 set +e
-node "$repo_root/scripts/browser-objective-audit.mjs" \
+"$node_bin" "$repo_root/scripts/browser-objective-audit.mjs" \
   --hosted-bakeoff "$tmp_dir/hosted-missing-resize.json" \
   --manual-ux "$tmp_dir/manual-passed.json" \
   >"$tmp_dir/hosted-missing-resize-audit.json" \
@@ -398,7 +422,7 @@ if [[ "$hosted_missing_resize_status" -eq 0 ]]; then
   exit 1
 fi
 
-node -e '
+"$node_bin" -e '
   const fs = require("node:fs");
   const audit = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
   const hostedCriterion = audit.criteria.find((item) => item.id === "hosted_provider_product_accepted");
@@ -413,11 +437,11 @@ node -e '
 ' "$tmp_dir/hosted-missing-resize-audit.json"
 
 hosted_valid_sha="$(sha256sum "$tmp_dir/hosted-valid.json" | awk '{print $1}')"
-node "$repo_root/scripts/browser-manual-ux-report.mjs" \
+"$node_bin" "$repo_root/scripts/browser-manual-ux-report.mjs" \
   --template \
   --machine-artifact "$tmp_dir/hosted-valid.json" \
   >"$tmp_dir/manual-template-hosted.json"
-node -e '
+"$node_bin" -e '
   const fs = require("node:fs");
   const template = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
   const expectedSha = process.argv[2];
@@ -496,7 +520,7 @@ cat >"$tmp_dir/manual-hosted-detached.json" <<JSON
 JSON
 
 set +e
-node "$repo_root/scripts/browser-manual-ux-report.mjs" \
+"$node_bin" "$repo_root/scripts/browser-manual-ux-report.mjs" \
   --input "$tmp_dir/manual-hosted-detached.json" \
   >"$tmp_dir/manual-detached-validation.json" \
   2>"$tmp_dir/manual-detached-validation.err"
@@ -509,7 +533,7 @@ if [[ "$manual_detached_validation_status" -eq 0 ]]; then
   exit 1
 fi
 
-node -e '
+"$node_bin" -e '
   const fs = require("node:fs");
   const validation = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
   if (!Array.isArray(validation.errors) || !validation.errors.includes("machine_artifact.sha256 must match machine_artifact.path")) {
@@ -554,7 +578,7 @@ cat >"$tmp_dir/manual-hosted-schema-mismatch.json" <<JSON
 JSON
 
 set +e
-node "$repo_root/scripts/browser-manual-ux-report.mjs" \
+"$node_bin" "$repo_root/scripts/browser-manual-ux-report.mjs" \
   --input "$tmp_dir/manual-hosted-schema-mismatch.json" \
   >"$tmp_dir/manual-schema-mismatch-validation.json" \
   2>"$tmp_dir/manual-schema-mismatch-validation.err"
@@ -567,7 +591,7 @@ if [[ "$manual_schema_mismatch_status" -eq 0 ]]; then
   exit 1
 fi
 
-node -e '
+"$node_bin" -e '
   const fs = require("node:fs");
   const validation = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
   if (!Array.isArray(validation.errors) || !validation.errors.includes("machine_artifact.schema must match machine_artifact.path")) {
@@ -612,10 +636,10 @@ cat >"$tmp_dir/manual-hosted-copy-path.json" <<JSON
 }
 JSON
 
-node "$repo_root/scripts/browser-manual-ux-report.mjs" --input "$tmp_dir/manual-hosted-copy-path.json" >/dev/null
+"$node_bin" "$repo_root/scripts/browser-manual-ux-report.mjs" --input "$tmp_dir/manual-hosted-copy-path.json" >/dev/null
 
 set +e
-node "$repo_root/scripts/browser-objective-audit.mjs" \
+"$node_bin" "$repo_root/scripts/browser-objective-audit.mjs" \
   --hosted-bakeoff "$tmp_dir/hosted-valid.json" \
   --manual-ux "$tmp_dir/manual-hosted-copy-path.json" \
   >"$tmp_dir/manual-copy-path-audit.json" \
@@ -630,7 +654,7 @@ if [[ "$manual_copy_path_status" -eq 0 ]]; then
 fi
 
 set +e
-node "$repo_root/scripts/browser-objective-audit.mjs" \
+"$node_bin" "$repo_root/scripts/browser-objective-audit.mjs" \
   --hosted-bakeoff "$tmp_dir/hosted-valid.json" \
   --manual-ux "$tmp_dir/manual-hosted-detached.json" \
   >"$tmp_dir/manual-detached-audit.json" \
@@ -670,7 +694,7 @@ cat >"$tmp_dir/manual-hosted-missing-audio-unlock.json" <<JSON
 JSON
 
 set +e
-node "$repo_root/scripts/browser-manual-ux-report.mjs" \
+"$node_bin" "$repo_root/scripts/browser-manual-ux-report.mjs" \
   --input "$tmp_dir/manual-hosted-missing-audio-unlock.json" \
   >"$tmp_dir/manual-missing-audio-unlock-validation.json" \
   2>"$tmp_dir/manual-missing-audio-unlock-validation.err"
@@ -683,7 +707,7 @@ if [[ "$manual_missing_audio_unlock_status" -eq 0 ]]; then
   exit 1
 fi
 
-node -e '
+"$node_bin" -e '
   const fs = require("node:fs");
   const validation = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
   const required = [
@@ -730,7 +754,7 @@ cat >"$tmp_dir/manual-hosted-missing-audio-evidence.json" <<JSON
 JSON
 
 set +e
-node "$repo_root/scripts/browser-objective-audit.mjs" \
+"$node_bin" "$repo_root/scripts/browser-objective-audit.mjs" \
   --hosted-bakeoff "$tmp_dir/hosted-valid.json" \
   --manual-ux "$tmp_dir/manual-hosted-missing-audio-evidence.json" \
   >"$tmp_dir/manual-missing-audio-evidence-audit.json" \
@@ -782,7 +806,7 @@ cat >"$tmp_dir/manual-hosted-stale-check.json" <<JSON
 JSON
 
 set +e
-node "$repo_root/scripts/browser-manual-ux-report.mjs" \
+"$node_bin" "$repo_root/scripts/browser-manual-ux-report.mjs" \
   --input "$tmp_dir/manual-hosted-stale-check.json" \
   >"$tmp_dir/manual-stale-check-validation.json" \
   2>"$tmp_dir/manual-stale-check-validation.err"
@@ -795,7 +819,7 @@ if [[ "$manual_stale_check_status" -eq 0 ]]; then
   exit 1
 fi
 
-node -e '
+"$node_bin" -e '
   const fs = require("node:fs");
   const validation = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
   const required = [
@@ -811,7 +835,7 @@ node -e '
 ' "$tmp_dir/manual-stale-check-validation.json"
 
 set +e
-node "$repo_root/scripts/browser-objective-audit.mjs" \
+"$node_bin" "$repo_root/scripts/browser-objective-audit.mjs" \
   --hosted-bakeoff "$tmp_dir/hosted-valid.json" \
   --manual-ux "$tmp_dir/manual-hosted-stale-check.json" \
   >"$tmp_dir/manual-stale-check-audit.json" \
@@ -860,13 +884,13 @@ cat >"$tmp_dir/manual-hosted-matched.json" <<JSON
 }
 JSON
 
-node "$repo_root/scripts/browser-manual-ux-report.mjs" --input "$tmp_dir/manual-hosted-matched.json" >/dev/null
-node "$repo_root/scripts/browser-objective-audit.mjs" \
+"$node_bin" "$repo_root/scripts/browser-manual-ux-report.mjs" --input "$tmp_dir/manual-hosted-matched.json" >/dev/null
+"$node_bin" "$repo_root/scripts/browser-objective-audit.mjs" \
   --hosted-bakeoff "$tmp_dir/hosted-valid.json" \
   --manual-ux "$tmp_dir/manual-hosted-matched.json" \
   >"$tmp_dir/manual-matched-audit.json"
 
-node -e '
+"$node_bin" -e '
   const fs = require("node:fs");
   const audit = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
   if (audit.ok !== true || audit.product_provider_accepted !== true) {

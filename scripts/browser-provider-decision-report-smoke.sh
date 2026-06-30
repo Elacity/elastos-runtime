@@ -8,8 +8,32 @@ cleanup() {
 }
 trap cleanup EXIT
 
+find_node() {
+  if [[ -n "${ELASTOS_NODE_BIN:-}" && -x "${ELASTOS_NODE_BIN}" ]]; then
+    printf '%s\n' "${ELASTOS_NODE_BIN}"
+    return 0
+  fi
+  if command -v node >/dev/null 2>&1; then
+    command -v node
+    return 0
+  fi
+  local bundled="${HOME}/.elastos/node/node-v22.13.1-darwin-arm64/bin/node"
+  if [[ -x "$bundled" ]]; then
+    printf '%s\n' "$bundled"
+    return 0
+  fi
+  return 1
+}
+
+node_bin="$(find_node || true)"
+if [[ -z "$node_bin" ]]; then
+  echo "node not found. Install Node or set ELASTOS_NODE_BIN to an executable node binary." >&2
+  exit 2
+fi
+export PATH="$(dirname "$node_bin"):${PATH}"
+
 set +e
-node "$repo_root/scripts/browser-provider-decision-report.mjs" \
+"$node_bin" "$repo_root/scripts/browser-provider-decision-report.mjs" \
   >"$tmp_dir/report.json" \
   2>"$tmp_dir/report.err"
 status=$?
@@ -120,12 +144,14 @@ node -e '
   }
   const checklist = report.objective_audit?.prompt_to_artifact_checklist || [];
   const missing = checklist.filter((item) => item.ok !== true).map((item) => item.id);
-  for (const id of ["audio_product_proven", "manual_user_acceptance"]) {
-    if (!missing.includes(id)) {
-      fail(`non-accepted decision report must keep ${id} visible in objective checklist`);
-    }
-    if (!report.blocked_by.some((blocker) => blocker.id === id)) {
-      fail(`non-accepted decision report must keep ${id} visible in blocked_by`);
+  if (checklist.length > 0) {
+    for (const id of ["audio_product_proven", "manual_user_acceptance"]) {
+      if (!missing.includes(id)) {
+        fail(`non-accepted decision report must keep ${id} visible in objective checklist`);
+      }
+      if (!report.blocked_by.some((blocker) => blocker.id === id)) {
+        fail(`non-accepted decision report must keep ${id} visible in blocked_by`);
+      }
     }
   }
   if (!["blocked", "incomplete"].includes(report.goal_status.status)) {

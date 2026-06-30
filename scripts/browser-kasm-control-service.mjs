@@ -87,6 +87,9 @@ function validateOpenRequest(body) {
   if (launch.display_mode !== "webrtc_remote_display") {
     throw new Error("Kasm control service requires webrtc_remote_display");
   }
+  if (launch.guarantee_level !== "operator_rbi") {
+    throw new Error("Kasm control service requires guarantee_level=operator_rbi");
+  }
   if (launch.network_mode !== "runtime_net_only" || launch.direct_network !== false) {
     throw new Error("Kasm control service requires runtime_net_only and direct_network=false");
   }

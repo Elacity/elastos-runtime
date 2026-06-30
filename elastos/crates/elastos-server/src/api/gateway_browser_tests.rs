@@ -1,5 +1,6 @@
 use super::gateway_browser::{
-    browser_provider_resource_call, provider_response_data, provider_response_error_message,
+    browser_close_reconciled_receipt, browser_provider_resource_call, provider_response_data,
+    provider_response_error_message,
 };
 use super::BROWSER_CAPSULE_ID;
 use serde_json::json;
@@ -40,6 +41,40 @@ fn test_provider_response_error_message_unwraps_nested_provider_errors() {
 }
 
 #[test]
+fn test_browser_close_reconciles_missing_page_control_session() {
+    let receipt = browser_close_reconciled_receipt(
+        "page:already-gone",
+        "engine_process_unavailable: Browser page has no page-scoped engine control session",
+    )
+    .expect("missing page-scoped control should be reconciled for close");
+
+    assert_eq!(receipt["schema"], "elastos.browser.close-result/v1");
+    assert_eq!(receipt["page_id"], "page:already-gone");
+    assert_eq!(receipt["closed"], true);
+    assert_eq!(receipt["already_closed"], true);
+    assert_eq!(receipt["reconciled"], true);
+    assert_eq!(
+        receipt["cleanup"]["schema"],
+        "elastos.browser.runtime-session-cleanup/v1"
+    );
+    assert_eq!(receipt["cleanup"]["ok"], true);
+}
+
+#[test]
+fn test_browser_close_reconciliation_rejects_unrelated_engine_errors() {
+    assert!(browser_close_reconciled_receipt(
+        "page:still-unknown",
+        "engine_process_unavailable: timed out waiting for browser control response",
+    )
+    .is_none());
+    assert!(browser_close_reconciled_receipt(
+        "page:still-unknown",
+        "display_session_unavailable: webrtc_remote_display is unavailable",
+    )
+    .is_none());
+}
+
+#[test]
 fn test_browser_provider_resource_call_separates_carrier_call_from_effect_resource() {
     let call = browser_provider_resource_call(
         "wallet",
@@ -70,6 +105,33 @@ fn test_browser_provider_resource_call_separates_carrier_call_from_effect_resour
         call.request["resource"],
         "elastos://chain/esc-mainnet/broadcast_transaction"
     );
+}
+
+#[test]
+fn test_browser_provider_resource_call_rejects_predeclared_runtime_metadata() {
+    for reserved in [
+        "_runtime_invocation",
+        "_runtime_transfer",
+        "connect_ticket",
+        "carrier_route",
+        "carrier",
+    ] {
+        let err = match browser_provider_resource_call(
+            "browser-engine",
+            "page_status",
+            "elastos://browser-engine/page/status".to_string(),
+            json!({
+                "page_id": "page:test",
+                reserved: { "schema": "spoofed" }
+            }),
+        ) {
+            Ok(_) => panic!("Browser provider call should reject Runtime-owned metadata"),
+            Err(err) => err,
+        };
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("must not predeclare Runtime metadata field"));
+        assert!(err.1.contains(reserved));
+    }
 }
 
 #[test]
@@ -113,10 +175,26 @@ fn test_browser_provider_resource_call_covers_net_exit_and_engine_open_chain() {
                 "stream_id": "stream:test",
                 "target": "tls://glidefinance.io:443"
             },
+            "profile": {
+                "schema": "elastos.browser.profile/v1",
+                "scope": "active_principal",
+                "storage": "principal_owned_profile_disk",
+                "storage_posture": "principal_owned_reset_scoped_unprotected",
+                "protected_storage": false,
+                "encrypted": false,
+                "recoverable": false,
+                "recovery": "not_recovery_kit_packaged",
+                "uri": "localhost://Users/0123456789ab/BrowserProfiles/default/profile.ext4",
+                "public_uri": "localhost://Users/self/BrowserProfiles/default/profile.ext4",
+                "profile_key": "profile-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "disk_path": "/tmp/elastos-browser-profile-test/BrowserProfiles/default/profile.ext4",
+                "reset": "whole_profile"
+            },
             "principal_id": "person:local:alice",
             "reason": "open browser page",
             "wallet": {},
-            "display_mode": "webrtc_remote_display"
+            "display_mode": "webrtc_remote_display",
+            "guarantee_level": "operator_rbi"
         }),
     )
     .expect("browser engine launch call should be resource-shaped");
@@ -128,8 +206,7 @@ fn test_browser_provider_resource_call_covers_net_exit_and_engine_open_chain() {
 fn test_browser_provider_resource_call_covers_engine_page_operations() {
     let cases = [
         ("page_status", "elastos://browser-engine/page/status"),
-        ("frame", "elastos://browser-engine/page/frame"),
-        ("screenshot", "elastos://browser-engine/page/screenshot"),
+        ("diagnostics", "elastos://browser-engine/page/diagnostics"),
         ("input", "elastos://browser-engine/page/input"),
         ("close_page", "elastos://browser-engine/close_page"),
         (
