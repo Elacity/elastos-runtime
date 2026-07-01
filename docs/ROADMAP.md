@@ -153,6 +153,28 @@ halo a *computed* fact) → **W1** (egress-as-capability) → W3 → W4 → … 
 ---
 
 ## 🗂️ DEFERRED / TRACKED (do not forget)
+
+### 🖥️ SHELL / UI — built vs MOUNTED vs future (the honest integration gap)
+The ESP projection layer (`elastos/esp/`) is built + tested (unit + SSR + one live browser render
+via a Cursor glue harness) but is **NOT referenced by any shipped capsule** — a `just home-demo-local`
+run today shows the *existing* shell, not these. Mounting them is the "make it visible in the product"
+work, and the honest bar before a UI-facing PR.
+- **Agent lens (W5b Svelte)** — `<Home>` / `<CapsuleDetail>` / `<CapsuleCustodyPanel>` + the
+  view-models (`homeCustodyView`, `intentProofView`, `fleet_source`, `homeFleetScope`): 🟡 **built &
+  tested, NOT mounted** into the `home` / `capsule-inspector` capsule frontends. *Next integration chunk.*
+- **Shell toggle / shell-picker (W3a/W6)** — the mechanism is real (de-hardcoded shell,
+  `set_active_shell`, `shell_token_eligible`, `shell_picker.ts`), but the **clickable switch is not
+  mounted** in the shipped UI. 🟡
+- **Bespoke third-party shells (any language)** — ⬜ future / enabled-by-design (ESP makes it possible);
+  none built yet. Correctly a roadmap item, not a claim.
+- **Intent-proof loop live surface** — `docs/INTENT_PROOF_LOOP.md`: **5b-inspector** (project the live
+  `intent_proof` summary through the `AuditSource` trait + ESP data path — latent/absent until the gate
+  is live) and **4b** (the standing-grant dispatch mode — the net-new product surface that routes
+  self-declared agent acts through `run_intent_gate`). ⬜
+- **dKMS / dDRM** — ⚠️ NOT this branch. `dkms-*` capsules exist but decentralized key mgmt / production
+  dDRM/decrypt-render are a separate line; do not represent as done in a shell/architecture slide.
+
+### Other tracked
 - **Adoption wedges 3-5 (original Astrid leg):** #3 NL→intent capsule + #4 dual-scope meter → the
   deferred **AI-backend track** ([[project_runtime-ai-backend-strategy]] — Venice/Bittensor, the
   agent's brain; the meter bounds AI spend). #5 COW workspace + manifest hardening → later (design-fit).

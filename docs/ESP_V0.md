@@ -1,5 +1,10 @@
 # ESP v0 — the ElastOS Shell Protocol
 
+> **Naming / branding.** **ESP = ElastOS Shell Protocol** — the read-only projection contract between
+> the trusted Rust core and any shell (UI). ⚠️ Acronym collision: this is **unrelated** to IPsec's
+> "Encapsulating Security Payload" (a networking/VPN term). With a technical audience, spell it out on
+> first use — "ESP, our ElastOS Shell Protocol" — then abbreviate.
+
 > **Status: v0, extracted from shipped state.** ESP is the read-only projection
 > contract between the ElastOS runtime (the trusted core that *proves* and
 > *gates*) and any shell that renders it. Every fact in ESP is a projection of
