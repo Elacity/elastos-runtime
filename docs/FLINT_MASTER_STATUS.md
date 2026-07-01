@@ -50,9 +50,13 @@ pass), ESP `npm test` **green** (89), `cargo build --workspace` clean (**0 warni
 1. ✅ **RESTORED** (`65b4691`) — WASM/carrier **spend-metering act-path wiring**. The real
    `spend_policy` now threads into both `BridgeContext` sites via `wasm_bridge_context()`, with a
    fail-closed regression test. WASM acts debit the shared budget again.
-2. 0.5's **approved-provider dispatch registry support** (`inspect_provider::with_registry` is a
-   passthrough); the `inspect/request_act` HTTP surface is wired and functional (plan+pending record),
-   but registry-backed act execution is not yet re-grafted. *(remaining)*
+2. ✅ **RESTORED** (`02613d7` + wiring) — 0.5's **approved-provider dispatch**. The custody
+   `InspectProvider` now retains a `Weak<ProviderRegistry>` and exposes the `dispatch_approved`
+   execution op (routes an operator-approved act through `registry.invoke_provider(source:
+   "inspect")`), fail-closed on unwired-registry / undeclared-op / hidden-runtime-metadata. Grafted
+   **additively** — every flint custody projection (intent_proof / spend_budget / audit_attestation
+   / W7 export) is intact, proven by a no-regression test. Production registrations (gateway +
+   serve) pass a real `Arc::downgrade(registry)`; tests stay unwired (fail-closed).
 3. ✅ **RESTORED** — re-added flint's `verified_signer_tests` module (5 tests). The other two
    suspected-dropped tests (carrier_bridge read-token-write-denial `preaudit3`, library mime bucket)
    were verified **present** — they survived the merge; the earlier list over-counted.

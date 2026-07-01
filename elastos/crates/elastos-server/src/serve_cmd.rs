@@ -218,11 +218,12 @@ pub async fn run_serve(
                     let audit = Arc::new(ip::CompositeAuditSource::new(activity, grants));
                     provider_registry
                         .register(Arc::new(
-                            ip::InspectProvider::new(source)
-                                .with_audit(audit)
-                                .with_spend_meter(
-                                    infra.spend_policy.as_ref().map(|p| p.meter.clone()),
-                                ),
+                            ip::InspectProvider::with_registry(
+                                source,
+                                Arc::downgrade(&provider_registry),
+                            )
+                            .with_audit(audit)
+                            .with_spend_meter(infra.spend_policy.as_ref().map(|p| p.meter.clone())),
                         ))
                         .await;
                 }
@@ -352,9 +353,12 @@ pub async fn run_serve(
         infra
             .provider_registry
             .register(Arc::new(
-                ip::InspectProvider::new(source)
-                    .with_audit(audit)
-                    .with_spend_meter(infra.spend_policy.as_ref().map(|p| p.meter.clone())),
+                ip::InspectProvider::with_registry(
+                    source,
+                    Arc::downgrade(&infra.provider_registry),
+                )
+                .with_audit(audit)
+                .with_spend_meter(infra.spend_policy.as_ref().map(|p| p.meter.clone())),
             ))
             .await;
     }
@@ -582,9 +586,12 @@ pub async fn run_mcp_serve() -> anyhow::Result<()> {
         infra
             .provider_registry
             .register(Arc::new(
-                ip::InspectProvider::new(source)
-                    .with_audit(audit)
-                    .with_spend_meter(infra.spend_policy.as_ref().map(|p| p.meter.clone())),
+                ip::InspectProvider::with_registry(
+                    source,
+                    Arc::downgrade(&infra.provider_registry),
+                )
+                .with_audit(audit)
+                .with_spend_meter(infra.spend_policy.as_ref().map(|p| p.meter.clone())),
             ))
             .await;
     }
