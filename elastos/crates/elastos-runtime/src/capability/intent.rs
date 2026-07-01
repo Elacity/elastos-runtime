@@ -1602,4 +1602,119 @@ mod tests {
             .expect("the declared intent makes vm-agent PRESENT on the intent channel");
         assert_eq!(summary.denied, 1, "a missing-grant refusal is a denial");
     }
+
+    // ── Chunk 2c-3: end-to-end from a REAL capability token ────────────────────
+
+    #[test]
+    fn end_to_end_a_real_token_runs_the_agent_then_revocation_shuts_it_down() {
+        use crate::capability::token::{Action, CapabilityToken, ResourceId};
+
+        let (_dir, log) = gate_log();
+        let sk = key();
+        let store = StandingGrantStore::new();
+
+        // 1. A REAL issued capability token is the root of authority for the standing grant.
+        let token = CapabilityToken::new(
+            "vm-agent".to_string(),
+            [0u8; 32],
+            ResourceId::new("elastos://mail/send"),
+            Action::Execute,
+            Default::default(),
+            SecureTimestamp::now(),
+            Some(SecureTimestamp::after_secs(3600)),
+        );
+        let grant_id = token.id().to_string();
+
+        // 2. Derive the standing envelope FROM the token (the honest seam: the token supplies
+        //    capsule/resource/action/expiry; the method set + revocation are layered on) and issue it.
+        let envelope = StandingGrantEnvelope::from_token(
+            &token,
+            ["send"].iter().map(|m| m.to_string()).collect(),
+            false,
+        );
+        store.issue(envelope);
+
+        // A fresh, correctly-signed intent for THIS token's grant, invoking an in-envelope method.
+        let declare = |args: &str| {
+            IntentDeclarationV1::issue(
+                &sk,
+                sk.verifying_key().to_bytes(),
+                "intent-e2e",
+                "vm-agent",
+                "send",
+                args,
+                "elastos://mail/send",
+                "execute",
+                &grant_id,
+            )
+        };
+
+        // 3. Unsupervised dispatch under the LIVE grant: the act runs past the gate and reconciles matched.
+        let outcome = dispatch_standing_act(
+            &store,
+            &log,
+            &sk,
+            sk.verifying_key().to_bytes(),
+            &declare("args-1"),
+            || {
+                Some(a_receipt(
+                    &sk,
+                    "vm-agent",
+                    "send",
+                    "args-1",
+                    "elastos://mail/send",
+                    "execute",
+                ))
+            },
+        );
+        assert!(
+            matches!(outcome, IntentGateOutcome::Acted(rec) if rec.status == ReconciliationStatus::Matched),
+            "an intent within a live token-derived grant runs and reconciles matched"
+        );
+
+        // 4. Revoke the standing grant by the TOKEN's id — the SAME dispatch is now denied,
+        //    fail-closed, and the act never runs. This is the kill switch on an autonomous agent.
+        assert!(store.revoke(&grant_id), "revoke the token's standing grant");
+        let ran = std::cell::Cell::new(false);
+        let after = dispatch_standing_act(
+            &store,
+            &log,
+            &sk,
+            sk.verifying_key().to_bytes(),
+            &declare("args-2"),
+            || {
+                ran.set(true);
+                Some(a_receipt(
+                    &sk,
+                    "vm-agent",
+                    "send",
+                    "args-2",
+                    "elastos://mail/send",
+                    "execute",
+                ))
+            },
+        );
+        assert!(matches!(
+            after,
+            IntentGateOutcome::Denied(EnvelopeDenial::Revoked)
+        ));
+        assert!(
+            !ran.get(),
+            "a revoked standing grant shuts the agent down — the act never runs"
+        );
+
+        // 5. The whole story is on the signed chain and shows on the intent channel: the
+        //    reconciled act + the post-revocation denial, and the chain verifies end to end.
+        let att = log.chain_attestation().unwrap();
+        assert!(att.verified, "the intent-proof chain self-verifies");
+        let summary = log
+            .intent_proof_summary("vm-agent")
+            .expect("the agent is PRESENT on the intent channel");
+        assert_eq!(
+            summary.denied, 1,
+            "the post-revocation attempt is one denial"
+        );
+        assert_eq!(summary.diverged, 0);
+        assert_eq!(summary.undelivered, 0);
+    }
 }

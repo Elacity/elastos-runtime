@@ -44,10 +44,12 @@ containment audit.
 - ✅ **2b — intent channel LIVE** — `intent_proof_summary` exposed through the `AuditSource` trait (fail-honest `None`
   default), a top-level `intent_proof` field projected on the capsule detail (keyed `vm-{name}`), threaded into
   `homeCustodyView`'s 3rd arg. Absent/clean/flagged all paint honestly. (Receipt: `2b` commit; gated server 908/908.)
-- 🔵 **2c — 4b standing-grant dispatch (the milestone):** issue/revoke standing capability envelopes and route
-  self-declared agent acts through `run_intent_gate` — "an agent runs unsupervised under the loop." **← NEXT**
+- ✅ **2c — standing-grant dispatch (the milestone) LANDED** — `StandingGrantStore` (fail-closed issue/revoke) +
+  `dispatch_standing_act` routes a self-declared agent act through `run_intent_gate`. Proven end-to-end from a real
+  `CapabilityToken`: derive → issue → dispatch (runs, matched) → **revoke → same dispatch denied, act never runs**
+  (the autonomy kill switch). Gated `cargo test -p elastos-runtime --lib capability::intent` → 29/29. (Commits `fe9211f`, `19e3e9e`, + this.)
 - ⬜ Then: confirm the inspector shows **live** runtime custody (DID / trust / manifest / required-vs-granted-vs-denied
-  caps / audit chain), not sample-data.
+  caps / audit chain), not sample-data — the last piece is Cursor's live-on-Mac confirm.
 
 ## Tier 3 — product backlog (TASKS.md is canonical, §Now = strict priority)
 - **Auth/identity:** proof-bound non-delegatable sessions, principal roots replacing `Users/self`, passkey recovery/
@@ -60,14 +62,14 @@ containment audit.
 ## Intent-proof loop ledger (`INTENT_PROOF_LOOP.md`)
 - ✅ **ch1–5 + 5b-runtime** — signed records, fail-closed verifier matrix, on-chain emit, `from_token`, `run_intent_gate`,
   ESP `intentProofView`, presence-aware `AuditLog::intent_proof_summary`. All gated.
-- ✅ **5b-inspector (= Tier 2b)** — intent channel LIVE end-to-end · ⬜ **4b (= Tier 2c)**.
+- ✅ **5b-inspector (= Tier 2b)** — intent channel LIVE end-to-end · ✅ **4b (= Tier 2c)** — standing-grant dispatch, kill switch proven.
 
 ## Current focus
-**Tier 2c (the milestone)** — standing-grant dispatch: issue/revoke standing capability envelopes and route a
-self-declared agent act through `run_intent_gate` (already built, ch4) so an agent can run UNSUPERVISED under the
-loop — declare → verify `intent ⊆ envelope` (fail-closed) → act → reconcile. This is the first end-to-end use of the
-prover/verifier loop as an enforcement path, and it makes the now-LIVE intent channel show real denials/divergences.
-> **2a + 2b done:** custody panel mounted (`fd1336a`) AND the intent channel is LIVE end-to-end (spend + audit +
-> intent all paint from the runtime projection; absent/clean/flagged honest). Both shells share the tested
-> `custodyDisplayRows` contract (drift-guarded copy). Server-side gated 908/908; ESP 89/89.
-> **Awaiting Cursor's live confirm on the Mac** (reload shell → open inspector → screenshot the three-channel Custody card).
+**Tier 2 is COMPLETE (2a + 2b + 2c all landed & gated).** The remaining Tier-2 item is not code — it's **Cursor's
+live-on-Mac confirm**: reload the shell → open the inspector → screenshot the three-channel Custody card showing LIVE
+runtime custody (not sample data). After that, **open the flint→main PR** (step 1; nothing blocks it now).
+> **2a** custody panel mounted (`fd1336a`) · **2b** intent channel LIVE end-to-end (`98d6eea`) · **2c** standing-grant
+> dispatch + kill switch (`fe9211f`, `19e3e9e`, + this). The runtime enforcement loop is now closed: an agent can run
+> unsupervised under a standing grant AND be shut down mid-flight by revoking its token. Gated: elastos-runtime
+> intent 29/29, elastos-server 908/908, ESP 89/89. Next build track (optional, post-PR): a gateway verb to
+> issue/revoke standing grants + surface the dispatch on an API route (wire the in-process dispatcher to a shell action).

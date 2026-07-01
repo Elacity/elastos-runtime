@@ -192,8 +192,8 @@ Fail-closed branch matrix (Kent Beck — each row is a test):
 ## Implementation status (as built on `flint`)
 
 The verifiable core is built, gated, and on-chain — `capability/intent.rs` + the `AuditEvent`
-intent variants + the ESP `intentProofView`. What is NOT yet built is the live dispatch mode that
-*calls* the gate.
+intent variants + the ESP `intentProofView` — AND the live dispatch mode that *calls* the gate now
+exists (`dispatch_standing_act` against `StandingGrantStore`), proven end-to-end from a real token.
 
 - ✅ **ch1** — `IntentDeclarationV1` / `IntentReconciliationV1` (ed25519-signed) + the fail-closed
   verifier matrix (`check_intent_within_envelope`, `reconcile`).
@@ -208,13 +208,16 @@ intent variants + the ESP `intentProofView`. What is NOT yet built is the live d
   INDEPENDENT custody channel (absent / clean / flagged), never masked by a green chain/meter.
 - ✅ **ch5b (runtime)** — `count_intent_proof` + `AuditLog::intent_proof_summary`, PRESENCE-aware
   (a non-gated capsule is ABSENT, not falsely "clean").
-- ⬜ **ch5b (inspector)** — expose `intent_proof_summary` through the `AuditSource` trait, project an
-  `intent_proof` field, thread it through the ESP data path. Latent: every capsule reads ABSENT until
-  the gate is live.
-- ⬜ **ch4b** — the standing-grant dispatch mode: issue/revoke standing envelopes and route
-  self-declared agent acts through `run_intent_gate`. The net-new product surface (unsupervised-
-  autonomy UX) that turns the built gate into a live path. **This is the gate to "an agent runs
-  unsupervised under this loop."**
+- ✅ **ch5b (inspector) = Tier 2b** — `intent_proof_summary` exposed through the `AuditSource` trait
+  (fail-honest `None` default), an `intent_proof` field projected on the capsule detail (keyed
+  `vm-{name}`), threaded through the ESP data path. The intent channel is LIVE (absent / clean /
+  flagged), no longer latently ABSENT.
+- ✅ **ch4b = Tier 2c** — the standing-grant dispatch mode: `StandingGrantStore` (fail-closed
+  issue/revoke registry) + `dispatch_standing_act`, which routes a self-declared agent act through
+  `run_intent_gate` against a stored standing grant. Proven end-to-end from a real `CapabilityToken`:
+  derive the envelope via `from_token` → issue → dispatch (act runs, reconciles matched) → **revoke
+  by token id → the same dispatch is denied and the act never runs** (the autonomy kill switch).
+  **This is "an agent runs unsupervised under this loop" — and can be shut down mid-flight.**
 
 NOTE: the gate is deliberately NOT wired into the existing per-act carrier path — that path already
 enforces via validate-and-consume (single-use consent), so re-checking an envelope derived from the
