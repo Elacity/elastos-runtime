@@ -132,6 +132,24 @@ impl IntentDeclarationV1 {
     pub fn verify(&self, verifying_key: &VerifyingKey) -> bool {
         verify_b64_sig(&self.signature, &self.signable_digest(), verifying_key)
     }
+
+    /// Verify the declaration against the signer key it NAMES (`self.signer`, hex-encoded). True iff
+    /// the signature is valid for that key. This proves internal authenticity — the declaration was
+    /// signed by the key it claims — which is what an untrusted transport (e.g. the HTTP boundary)
+    /// must check before trusting an intent it did not construct. Fails closed on any malformed
+    /// signer/signature. (Binding that key to a capsule's DID identity is a separate, later check.)
+    pub fn verify_self(&self) -> bool {
+        let Ok(bytes) = hex::decode(&self.signer) else {
+            return false;
+        };
+        let Ok(arr): Result<[u8; 32], _> = bytes.try_into() else {
+            return false;
+        };
+        let Ok(vk) = VerifyingKey::from_bytes(&arr) else {
+            return false;
+        };
+        self.verify(&vk)
+    }
 }
 
 // ─────────────────────────── The standing authorization envelope ─────────────
@@ -794,6 +812,29 @@ impl StandingGrantService {
             intent,
             act,
         )
+    }
+
+    /// Preview whether an intent WOULD be allowed under its standing grant — pure containment, the
+    /// READ-ONLY half of [`dispatch`](Self::dispatch): it records NOTHING and runs no act, so it is
+    /// side-effect-free (safe for dashboards / dry-runs). A grant that was never issued is a
+    /// fail-closed `Denied(NoGrant)`. Does NOT authenticate the intent — see
+    /// [`authenticated_preview`](Self::authenticated_preview) for the transport-facing entry.
+    pub fn preview(&self, intent: &IntentDeclarationV1) -> EnvelopeCheck {
+        match self.store.get(&intent.standing_grant_id) {
+            Some(envelope) => check_intent_within_envelope(intent, &envelope),
+            None => EnvelopeCheck::Denied(EnvelopeDenial::NoGrant),
+        }
+    }
+
+    /// Authenticate an intent, then preview its verdict — the entry an untrusted transport (the HTTP
+    /// boundary) uses. Returns `None` when the declaration is not authentic (its signature does not
+    /// verify against the key it names), so a forged or malformed intent is rejected fail-closed
+    /// BEFORE any grant lookup; otherwise the containment verdict. Still side-effect-free.
+    pub fn authenticated_preview(&self, intent: &IntentDeclarationV1) -> Option<EnvelopeCheck> {
+        if !intent.verify_self() {
+            return None;
+        }
+        Some(self.preview(intent))
     }
 }
 
@@ -1891,5 +1932,94 @@ mod tests {
             IntentGateOutcome::Denied(EnvelopeDenial::NoGrant)
         ));
         assert!(!ran.get());
+    }
+
+    // ── Chunk 2c-gw-C: signed-intent authenticity + read-only preview ──────────
+
+    #[test]
+    fn verify_self_accepts_authentic_and_rejects_tampered() {
+        let sk = key();
+        let intent = an_intent(&sk, "send", "h1");
+        assert!(
+            intent.verify_self(),
+            "a freshly issued intent verifies against its own signer"
+        );
+
+        // Tamper with a signed field: the signature no longer matches the digest.
+        let mut edited = intent.clone();
+        edited.method_id = "delete".to_string();
+        assert!(
+            !edited.verify_self(),
+            "a mutated field breaks self-verification"
+        );
+
+        // Swap in a DIFFERENT signer key (that did not sign this): rejected.
+        let mut wrong_signer = intent.clone();
+        wrong_signer.signer = hex::encode(key().verifying_key().to_bytes());
+        assert!(
+            !wrong_signer.verify_self(),
+            "a mismatched signer key fails closed"
+        );
+
+        // A structurally malformed signer is rejected, not panicked on.
+        let mut junk = intent.clone();
+        junk.signer = "not-hex".to_string();
+        assert!(!junk.verify_self());
+    }
+
+    #[test]
+    fn service_preview_is_side_effect_free_and_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = std::sync::Arc::new(
+            crate::primitives::audit::AuditLog::with_file(dir.path().join("a.log")).unwrap(),
+        );
+        let sk = key();
+        let svc = StandingGrantService::new(audit.clone(), sk.clone());
+
+        // No grant issued yet ⇒ fail-closed NoGrant, and NOTHING is recorded (preview never writes).
+        let intent = an_intent(&sk, "send", "h1");
+        assert!(matches!(
+            svc.preview(&intent),
+            EnvelopeCheck::Denied(EnvelopeDenial::NoGrant)
+        ));
+        assert!(
+            audit.intent_proof_summary("vm-agent").is_none(),
+            "preview must record nothing — the capsule stays ABSENT on the intent channel"
+        );
+
+        // Issue a grant, then preview both an in-envelope and an out-of-envelope intent.
+        svc.store.issue(an_envelope(&["send"]));
+        assert_eq!(svc.preview(&intent), EnvelopeCheck::Allowed);
+        let out = an_intent(&sk, "delete", "h1"); // method not in the envelope
+        assert!(matches!(
+            svc.preview(&out),
+            EnvelopeCheck::Denied(EnvelopeDenial::MethodNotInEnvelope)
+        ));
+        // Still nothing recorded after several previews.
+        assert!(audit.intent_proof_summary("vm-agent").is_none());
+    }
+
+    #[test]
+    fn authenticated_preview_rejects_a_forged_intent_before_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = std::sync::Arc::new(
+            crate::primitives::audit::AuditLog::with_file(dir.path().join("a.log")).unwrap(),
+        );
+        let sk = key();
+        let svc = StandingGrantService::new(audit, sk.clone());
+        svc.store.issue(an_envelope(&["send"]));
+
+        // Authentic intent ⇒ Some(verdict).
+        let intent = an_intent(&sk, "send", "h1");
+        assert_eq!(
+            svc.authenticated_preview(&intent),
+            Some(EnvelopeCheck::Allowed)
+        );
+
+        // Forge it (mutate a signed field so the signature no longer verifies) ⇒ None, fail-closed,
+        // rejected on authenticity BEFORE any containment answer is given.
+        let mut forged = intent.clone();
+        forged.action = "admin".to_string();
+        assert_eq!(svc.authenticated_preview(&forged), None);
     }
 }

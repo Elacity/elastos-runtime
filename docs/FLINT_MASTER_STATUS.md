@@ -76,5 +76,8 @@ runtime custody (not sample data). After that, **open the flint→main PR** (ste
 >
 > **Standing-grant API (post-2c, in progress):** ✅ `StandingGrantService` (the store+audit+key seam, signed by the
 > manager's own key) · ✅ shell-only `POST /api/standing-grants/issue` (mints a real token → derives the standing
-> envelope) and `/revoke` (the kill switch), fail-closed, behind the same shell-only middleware as grant/deny · ⬜ the
-> dispatch route (how an agent's declared intent reaches the server) — the natural next slice, held for a design call.
+> envelope) and `/revoke` (the kill switch), fail-closed, behind the same shell-only middleware as grant/deny · ✅
+> shell-only `POST /api/standing-grants/preview` — a SIDE-EFFECT-FREE dry-run: authenticate a signed
+> `IntentDeclarationV1` (`verify_self`) then report the envelope verdict, recording nothing and running no act ·
+> ⬜ the side-effecting **dispatch/act route** (an agent actually running an act over HTTP — needs the
+> affordance-invocation wiring decision) — held for a design call. Gated: server 911/911, runtime intent 34/34.

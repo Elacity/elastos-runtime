@@ -18,8 +18,9 @@ use elastos_runtime::approval::{self, ApprovalDecision};
 use elastos_runtime::capability::manager::ValidationError;
 use elastos_runtime::capability::{
     pending::{AffordanceBinding, PendingRequestStore},
-    Action, AffordanceGrantReceiptV1, CapabilityManager, CapabilityToken, GrantDuration,
-    PolicyEvaluator, PolicyOutcome, ResourceId, StandingGrantService, TokenConstraints,
+    Action, AffordanceGrantReceiptV1, CapabilityManager, CapabilityToken, EnvelopeCheck,
+    GrantDuration, IntentDeclarationV1, PolicyEvaluator, PolicyOutcome, ResourceId,
+    StandingGrantService, TokenConstraints,
 };
 use elastos_runtime::session::Session;
 
@@ -1141,6 +1142,47 @@ pub async fn revoke_standing_grant(
     Ok(Json(RevokeStandingGrantOutput { revoked }))
 }
 
+#[derive(Debug, Serialize)]
+pub struct PreviewStandingGrantOutput {
+    /// "allowed" | "denied" — whether the declared intent WOULD pass its standing grant.
+    pub verdict: String,
+    /// The fail-closed denial reason (snake_case) when denied; `null` when allowed.
+    pub reason: Option<String>,
+}
+
+/// POST /api/standing-grants/preview  (shell-only)
+///
+/// DRY-RUN the intent gate for a SIGNED [`IntentDeclarationV1`]: authenticate the declaration
+/// (its signature must verify against the key it names), then report whether it falls within its
+/// standing grant. This is the READ-ONLY half of dispatch — it records NOTHING and runs NO act, so
+/// it is side-effect-free (safe for dashboards / debugging an agent's authority). Fail-closed: a
+/// forged or malformed declaration is rejected (400) before any grant is consulted; a missing grant
+/// is a `denied` verdict with reason `no_standing_grant`.
+pub async fn preview_standing_grant(
+    State(state): State<CapabilityState>,
+    Json(intent): Json<IntentDeclarationV1>,
+) -> Result<Json<PreviewStandingGrantOutput>, (StatusCode, String)> {
+    // Authenticate first: the gateway did not construct this declaration, so it must prove the
+    // intent was signed by the key it claims before speaking to whether it is authorized.
+    let out = match state.standing_service.authenticated_preview(&intent) {
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "intent declaration signature did not verify".to_string(),
+            ));
+        }
+        Some(EnvelopeCheck::Allowed) => PreviewStandingGrantOutput {
+            verdict: "allowed".to_string(),
+            reason: None,
+        },
+        Some(EnvelopeCheck::Denied(reason)) => PreviewStandingGrantOutput {
+            verdict: "denied".to_string(),
+            reason: Some(reason.as_str().to_string()),
+        },
+    };
+    Ok(Json(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1319,6 +1361,67 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err2.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn preview_standing_grant_verdicts_and_rejects_forgery() {
+        let state = test_state();
+        // Issue a grant that authorizes only the "send" method.
+        let grant_id = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: "elastos://mail/send".to_string(),
+                action: "execute".to_string(),
+                methods: vec!["send".to_string()],
+                ttl_secs: Some(3600),
+            }),
+        )
+        .await
+        .expect("issue ok")
+        .0
+        .grant_id;
+
+        // The agent signs its own intent declaration.
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let declare = |method: &str| {
+            IntentDeclarationV1::issue(
+                &sk,
+                sk.verifying_key().to_bytes(),
+                "i-preview",
+                "vm-agent",
+                method,
+                "h1",
+                "elastos://mail/send",
+                "execute",
+                &grant_id,
+            )
+        };
+
+        // In-envelope, authentic ⇒ allowed.
+        let ok = preview_standing_grant(State(state.clone()), Json(declare("send")))
+            .await
+            .expect("preview ok")
+            .0;
+        assert_eq!(ok.verdict, "allowed");
+        assert!(ok.reason.is_none());
+
+        // Out-of-envelope method, authentic ⇒ denied with the honest reason (no side effects).
+        let denied = preview_standing_grant(State(state.clone()), Json(declare("delete")))
+            .await
+            .expect("preview ok")
+            .0;
+        assert_eq!(denied.verdict, "denied");
+        assert_eq!(denied.reason.as_deref(), Some("method_not_in_envelope"));
+
+        // Forged: tamper a signed field AFTER signing so the signature no longer verifies ⇒ 400,
+        // rejected on authenticity before any verdict is given.
+        let mut forged = declare("send");
+        forged.action = "admin".to_string();
+        let err = preview_standing_grant(State(state), Json(forged))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

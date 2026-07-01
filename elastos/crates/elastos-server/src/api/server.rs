@@ -271,6 +271,11 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
             "/api/standing-grants/revoke",
             post(handlers::revoke_standing_grant),
         )
+        // Read-only dry-run: does a SIGNED intent fall within its standing grant? Records nothing.
+        .route(
+            "/api/standing-grants/preview",
+            post(handlers::preview_standing_grant),
+        )
         // Revoke endpoints
         .route("/api/capability/:id", delete(handlers::revoke_capability))
         .route(
