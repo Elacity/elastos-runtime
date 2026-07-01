@@ -39,9 +39,10 @@ containment audit.
 - 🟡 Managed-runtime / host-lock ergonomics (restart-on-fingerprint / one-host-per-data-dir) — smoother.
 
 ## Tier 2 — surface THIS branch's work into the shell (the real gap)
-- 🔵 **2a — Mount `CapsuleCustodyPanel` into `capsule-inspector`** (spend + audit paint LIVE; intent reads `absent`). **← IN PROGRESS**
-- ⬜ **2b — 5b-inspector:** expose `intent_proof_summary` through the `AuditSource` trait + project an `intent_proof`
-  field + ESP data path → the intent channel goes from `absent` to LIVE.
+- ✅ **2a — Custody panel MOUNTED into `capsule-inspector`** (spend + audit paint LIVE; intent reads `absent`).
+  Shared `custodyDisplayRows` contract; drift-guarded projection copy; gated 89/89 + headless render. (Receipt: `fd1336a`.)
+- 🔵 **2b — 5b-inspector:** expose `intent_proof_summary` through the `AuditSource` trait + project an `intent_proof`
+  field + ESP data path → the intent channel goes from `absent` to LIVE. **← NEXT**
 - ⬜ **2c — 4b standing-grant dispatch (the milestone):** issue/revoke standing capability envelopes and route
   self-declared agent acts through `run_intent_gate` — "an agent runs unsupervised under the loop."
 - ⬜ Then: confirm the inspector shows **live** runtime custody (DID / trust / manifest / required-vs-granted-vs-denied
@@ -61,7 +62,9 @@ containment audit.
 - ⬜ **5b-inspector (= Tier 2b)** · ⬜ **4b (= Tier 2c)**.
 
 ## Current focus
-**Tier 2a** — mount the custody panel into `capsule-inspector`. Cursor scoped it: **vanilla-JS port of the paint +
-the already-compiled ESP projection** (`homeCustodyView`), no Svelte in the capsule, no server change (spend+audit
-already projected; intent stays `absent` until 2b). Prerequisite discovered: the inspector frontend must move
-`inspector/ → browser/` so `/apps/capsule-inspector/` resolves. Cloud lane implements + gates; Cursor confirms live on the Mac.
+**Tier 2b** — take the intent channel from `absent` to LIVE: expose `AuditLog::intent_proof_summary` through the
+`AuditSource` trait, project an `intent_proof` field on the inspector detail, and thread it into the ESP
+`homeCustodyView`. The panel + display contract already render it (2a); this is the runtime data path behind it.
+> **2a done (`fd1336a`):** custody panel mounted in `capsule-inspector` — spend + audit paint LIVE from the runtime
+> projection, intent reads `absent`; both shells share the tested `custodyDisplayRows` contract (drift-guarded copy).
+> **Awaiting Cursor's live confirm on the Mac** (reload shell → open inspector → screenshot the Custody card).
