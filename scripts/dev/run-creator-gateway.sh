@@ -102,17 +102,22 @@ build_capsule dkms-keygen
 # Without it the gateway boots but Library object operations fail closed.
 build_capsule object-provider
 
-# v0.4.0 browser app capsules need compiled wasm entrypoints (gitignored like home.wasm).
-# Opening Library/Marketplace/etc. from Home spawns a managed runtime that loads <name>.wasm.
-echo "building v0.4.0 app capsule wasm (wasm32-wasip1) ..."
-for c in library documents inbox system marketplace archive-manager wallet wallet-metamask wallet-unisat wallet-walletconnect; do
-  cj="${CAPSULES}/${c}/capsule.json"
-  [[ -f "$cj" ]] || continue
+# App capsules need compiled wasm entrypoints (gitignored like home.wasm). Opening a tile from
+# Home spawns a managed runtime that loads <name>.wasm. DISCOVER every wasm-guest capsule
+# (capsule.json entrypoint ends in .wasm AND a Rust crate is present) rather than hardcode a
+# list — a stale list is exactly what left Browser/Inspector/GBA 404ing on a fresh clone. A
+# capsule that fails to build fails-closed (its tile won't open) instead of aborting the launch.
+echo "building app capsule wasm (wasm32-wasip1) ..."
+for cj in "${CAPSULES}"/*/capsule.json; do
+  c="$(basename "$(dirname "$cj")")"
+  [[ -f "${CAPSULES}/${c}/Cargo.toml" ]] || continue
   entry=$(grep -oE '"entrypoint"[^,]*' "$cj" | sed -E 's/.*"entrypoint"[^"]*"([^"]+)".*/\1/')
-  [[ -n "$entry" ]] || continue
+  case "$entry" in *.wasm) ;; *) continue ;; esac
   echo "  ${c} -> ${entry}"
-  cargo build --quiet --manifest-path "${CAPSULES}/${c}/Cargo.toml" --target wasm32-wasip1 --release \
-    || { echo "FAIL: could not build ${c} wasm" >&2; exit 1; }
+  if ! cargo build --quiet --manifest-path "${CAPSULES}/${c}/Cargo.toml" --target wasm32-wasip1 --release; then
+    echo "  WARN: could not build ${c} wasm — its tile will fail-closed" >&2
+    continue
+  fi
   out=$(find "${CAPSULES}/${c}/target/wasm32-wasip1/release" -maxdepth 1 -name '*.wasm' 2>/dev/null | head -1)
   [[ -n "$out" ]] && cp "$out" "${CAPSULES}/${c}/${entry}"
 done

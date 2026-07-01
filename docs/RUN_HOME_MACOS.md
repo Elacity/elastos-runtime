@@ -7,9 +7,14 @@ Follow this and you will not hit "invalid domain" or "another ElastOS host alrea
 again.
 
 > Scope: this gets the **Home UI + passkey login + desktop** working on macOS today.
-> Library / WebSpaces / IPFS-backed features still fail closed on this branch because their
-> providers have no `unknown-arm64` build — that is the Apple Virtualization.framework work
-> on `sash/local-test-v030` / `docs/vz-backend`, not covered here.
+>
+> **Library / DDRM / Connect wallet / Create also work on macOS/arm64** — they do **not**
+> need the Apple Virtualization backend. Their providers run as **native subprocesses**;
+> they only failed closed here because the binaries weren't built and the arm64 release
+> manifest has no platform entry. Build + wire + launch everything (including the live dKMS
+> quorum for opening your protected assets) with **one command**:
+> `ELASTOS_DKMS_CARRIER=1 scripts/dev/run-creator-gateway.sh` — full guide in
+> [DEV_BOOTSTRAP.md](DEV_BOOTSTRAP.md). Real-KVM microVM paths (W1b egress firewall) remain Linux-only.
 
 ---
 
