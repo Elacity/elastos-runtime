@@ -90,6 +90,29 @@ far).
 | Deny | `POST /api/capability/deny` | **shell-only** | denied (fail-closed) | `deny_request` |
 | Validate-and-consume (redeem) | `POST /api/capability/validate-and-consume` | session | `consumed` + signed `AffordanceGrantReceiptV1` | `validate_and_consume` |
 | Invoke affordance | `POST /api/capsules/interfaces/invoke` | home-launch token | `202` consent-pending (1st call) → redeem+dispatch (retry w/ `consent_token`) | `capsule_interface_invoke` |
+| Issue standing grant | `POST /api/standing-grants/issue` | **shell-only** | mints a real signed token → derives + stores the standing envelope → `{grant_id}` (400 on bad action / empty methods) | `issue_standing_grant` |
+| Revoke standing grant | `POST /api/standing-grants/revoke` | **shell-only** | `{revoked}` — the autonomy kill switch (fail-closed) | `revoke_standing_grant` |
+| Preview standing-grant intent | `POST /api/standing-grants/preview` | **shell-only** | dry-run: verify a signed `IntentDeclarationV1` then `{verdict, reason}` — records nothing, runs no act (400 on bad signature) | `preview_standing_grant` |
+
+### 5.1 Standing grants — unsupervised-agent authority (Tier 2c)
+
+A standing grant authorizes an agent to declare-and-act **repeatedly** on a
+`(resource, action)` for a set of methods, without a human in the loop per act —
+the net-new dispatch mode of the intent-proof loop
+([`INTENT_PROOF_LOOP.md`](INTENT_PROOF_LOOP.md)). The three verbs above are
+**shell-only** (behind the same `consent_broker_only_middleware` as approve/deny —
+issuing authority is privileged; an ordinary capsule session can never reach them)
+and **fail-closed** (a missing grant, a revoked/expired envelope, an out-of-envelope
+method, or a signature that does not verify all deny). `issue` roots every grant in
+a **real signed capability token**; `revoke` re-reads on each dispatch, so it denies
+every not-yet-started act; `preview` is a side-effect-free dry-run for dashboards.
+The signed declared-vs-done reconciliation each dispatch writes is what the inspector
+paints as the **intent custody channel** (Tier 2b).
+
+> **Honest scope:** the side-effecting **dispatch/act route** (an agent actually
+> invoking an affordance over HTTP under its grant) is **not yet served** — it needs
+> the affordance-invocation wiring decision. In-process dispatch (`dispatch_standing_act`
+> / `StandingGrantService::dispatch`) is built, gated, and available to the runtime today.
 
 **The consent journey (W2):** invoke (consent-gated) → `202` consent-pending →
 approve → retry invoke with the granted token → `validate-and-consume` re-checks
