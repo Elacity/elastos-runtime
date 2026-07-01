@@ -473,6 +473,14 @@ const RESERVED_SUB_NAMES: &[&str] = &[
     "inspect",
     "availability",
     "block-graph",
+    // dDRM producer spine (Create portal) — server_infra registers all three at boot; they MUST
+    // stay reserved or their `register_sub_provider` calls fail closed and the mint path goes dark.
+    // `encrypt` holds in-boundary CEK escrow + on-chain mint assembly; `publish` assembles the
+    // on-chain mint; `media` does ffmpeg transcode -> DASH fragmentation (PLAINTEXT segments, NO
+    // key material — CENC + escrow stay in `encrypt`).
+    "encrypt",
+    "publish",
+    "media",
 ];
 
 /// Registry of providers
@@ -2169,6 +2177,22 @@ mod tests {
         // Unregister removes the route (case-insensitive)
         registry.unregister_sub_provider("DiD").await;
         assert!(registry.get_sub_provider("did").await.is_none());
+    }
+
+    // Regression guard: server_infra registers the dDRM producer spine (encrypt/publish/media) at
+    // boot. If any is dropped from RESERVED_SUB_NAMES its registration fails closed (swallowed as a
+    // warn!) and the Create-portal mint path silently goes dark — a live-only capability loss that
+    // no other unit test exercises (provider wiring runs only on a real boot).
+    #[tokio::test]
+    async fn test_ddrm_producer_spine_sub_providers_are_reserved() {
+        let registry = ProviderRegistry::new();
+        for name in ["encrypt", "publish", "media"] {
+            registry
+                .register_sub_provider(name, Arc::new(MockProvider::new()))
+                .await
+                .unwrap_or_else(|e| panic!("dDRM producer-spine scheme '{name}' must be reserved so server_infra can register it at boot: {e}"));
+            assert!(registry.get_sub_provider(name).await.is_some());
+        }
     }
 
     #[tokio::test]
