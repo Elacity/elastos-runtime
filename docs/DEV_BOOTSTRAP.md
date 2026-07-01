@@ -51,6 +51,35 @@ Override with `ELASTOS_DDRM_RIGHTS=chain|dev|chain-mock`.
 
 ---
 
+## Access model — how any user opens (there is no per-user allow-list)
+
+The whole point of the dKMS quorum: **anyone can call it; no one gets a key unless their wallet
+holds the asset's access token on-chain.** The gate is the smart contract, not an operator list.
+
+Concretely, the node's trustless gate (`capsules/dkms-authority/src/node_chain.rs::authorize_access`):
+1. **Any** caller connects (anonymous — the "millions-of-sovereign-runtimes" posture).
+2. The caller presents a **wallet-signed `AccessGrantV1`**.
+3. **Each node verifies the wallet signature itself and reads `hasAccessByContentId` from the
+   contract itself**, then releases its 2-of-3 share. No enrollment, no trusted receipt.
+
+So onboarding a new user/node needs **no per-user secret and no manual node step**:
+
+| What the new user needs | Secret? | Where it comes from |
+|---|---|---|
+| App + one command | no | this repo |
+| Quorum **descriptor** (node endpoints/pubkeys) | **no — public** | shipped/fetched/handed over (`dkms-authority.carrier.json`) |
+| A caller identity (transport session key) | their own | generated locally (the local path already does `/dev/urandom`) — **not** shared |
+| Access to the asset | — | **their own wallet holding the token on-chain** (the real gate) |
+
+> **`DKMS_AUTHORITY_ALLOWED_CALLERS` is NOT the security boundary.** Since W3/D4 it is a *soft,
+> optional* DoS/handshake knob. Left set, it refuses a *session* to unrecognized caller keys —
+> which would force manual per-user enrollment and defeats the model. For the sovereign-runtime
+> posture it must be **empty/unset** on the nodes; the wallet-signed grant + on-chain token then
+> decide everything. Dropping it is explicitly safe (an anonymous caller can never forge
+> `allowed:true` — recover always requires a valid grant). If your live nodes still have it set,
+> that's a legacy holdover to clear (one env change + `systemctl restart dkms-authority` per node,
+> done one at a time to keep 2-of-3 live).
+
 ## What the command builds
 
 - **All wasm-guest capsule backends** (`wasm32-wasip1`) — auto-discovered from each
