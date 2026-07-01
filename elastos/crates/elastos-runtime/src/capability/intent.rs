@@ -7,11 +7,13 @@
 //! act the declared-vs-done delta is recorded as a signed custody fact
 //! ([`IntentReconciliationV1`] built from [`reconcile`]).
 //!
-//! This chunk is the crypto + pure logic only — the records sign/verify like
-//! [`crate::capability::receipt::AffordanceGrantReceiptV1`], and the verifier is a pure
-//! function with the full fail-closed branch matrix under test. EMISSION onto the audit
-//! chain (new `AuditEvent` variants) and WIRING into the live dispatch path are the next
-//! chunks; nothing here touches the act path yet.
+//! The records sign/verify like [`crate::capability::receipt::AffordanceGrantReceiptV1`], and
+//! the verifier is a pure function with the full fail-closed branch matrix under test. On top of
+//! that this module also carries the STANDING-GRANT machinery: [`StandingGrantStore`] (the
+//! fail-closed issue/revoke registry) and [`dispatch_standing_act`] (the net-new dispatch path
+//! that runs a self-declared agent act through [`run_intent_gate`] against a standing grant, so an
+//! agent can run unsupervised under the loop). This standing-grant dispatch is deliberately SEPARATE
+//! from the live per-act carrier path, which already enforces via single-use consent.
 //!
 //! Scope boundary (carried from the design): this verifies CONTAINMENT + CUSTODY — that an
 //! intent is within the authorized envelope, and a tamper-evident record of declared vs
@@ -201,6 +203,10 @@ pub enum EnvelopeDenial {
     MethodNotInEnvelope,
     WrongResource,
     WrongAction,
+    /// No standing grant was ever issued for the intent's `standing_grant_id`. Produced by the
+    /// standing-grant dispatcher (never by `check_intent_within_envelope`, which needs an
+    /// envelope to check): a fail-closed refusal when there is no authority to check against.
+    NoGrant,
 }
 
 impl EnvelopeDenial {
@@ -213,6 +219,7 @@ impl EnvelopeDenial {
             EnvelopeDenial::MethodNotInEnvelope => "method_not_in_envelope",
             EnvelopeDenial::WrongResource => "wrong_resource",
             EnvelopeDenial::WrongAction => "wrong_action",
+            EnvelopeDenial::NoGrant => "no_standing_grant",
         }
     }
 }
@@ -666,6 +673,52 @@ impl StandingGrantStore {
                 .map(StandingGrantEnvelope::is_active)
                 .unwrap_or(false),
             Err(_) => false,
+        }
+    }
+}
+
+// ─────────────────────────── The standing-grant dispatcher (chunk 2c-2) ───────
+// The entry point that RUNS an agent unsupervised under the loop: given a self-declared
+// intent, resolve the standing grant it claims, and drive it through the fail-closed
+// `run_intent_gate`. This is the net-new dispatch path the design reserved for standing
+// grants — it is NOT the live per-act carrier path (that already enforces via single-use
+// consent), so nothing here re-checks a token that already authorized an act.
+
+/// Dispatch a self-declared agent act against the standing-grant registry, fail-closed.
+///
+/// Resolves the intent's `standing_grant_id` in `store` and drives it through
+/// [`run_intent_gate`] (declare → verify `intent ⊆ envelope` → act → reconcile). A grant that
+/// was never issued is a fail-closed refusal: the declaration is still recorded (custody is
+/// mandatory), a `NoGrant` denial is recorded on-chain, and the `act` closure is NEVER invoked —
+/// so a missing authority looks identical, on the intent channel, to any other denial. The return
+/// is a uniform [`IntentGateOutcome`]: `Denied(NoGrant)` when unauthorized, otherwise exactly what
+/// the gate decided (`BlockedNoCustody` / `Denied` / `Acted`).
+pub fn dispatch_standing_act<F>(
+    store: &StandingGrantStore,
+    audit: &AuditLog,
+    signing_key: &SigningKey,
+    signer_pubkey: [u8; 32],
+    intent: &IntentDeclarationV1,
+    act: F,
+) -> IntentGateOutcome
+where
+    F: FnOnce() -> Option<AffordanceGrantReceiptV1>,
+{
+    match store.get(&intent.standing_grant_id) {
+        // A grant exists (active or not) — the gate makes the fail-closed decision, denying a
+        // revoked/expired/out-of-envelope intent with its true reason and recording it.
+        Some(envelope) => {
+            run_intent_gate(audit, signing_key, signer_pubkey, intent, &envelope, act)
+        }
+        // No standing authority to check against. Record custody FIRST (mandatory — no recorded
+        // declaration ⇒ no act), then the NoGrant denial, in the same order `run_intent_gate`
+        // uses, so the refusal is on-chain and shows on the intent channel. `act` never runs.
+        None => {
+            if let Err(e) = audit.emit(intent_declared_event(intent)) {
+                return IntentGateOutcome::BlockedNoCustody(e);
+            }
+            audit.emit_best_effort(intent_denied_event(intent, EnvelopeDenial::NoGrant));
+            IntentGateOutcome::Denied(EnvelopeDenial::NoGrant)
         }
     }
 }
@@ -1383,5 +1436,170 @@ mod tests {
         );
         // ...but it is still retrievable, so the gate can deny it with an honest `Expired` reason.
         assert!(store.get("g2").is_some());
+    }
+
+    // ── dispatch_standing_act (chunk 2c-2): unsupervised dispatch through the gate ──
+
+    /// Issue `an_envelope(methods)` (grant_id "grant-1") into a fresh store.
+    fn store_with(methods: &[&str]) -> StandingGrantStore {
+        let store = StandingGrantStore::new();
+        store.issue(an_envelope(methods));
+        store
+    }
+
+    #[test]
+    fn dispatch_runs_the_act_under_an_active_grant_and_reconciles_matched() {
+        let (_dir, log) = gate_log();
+        let sk = key();
+        let store = store_with(&["send"]);
+        let intent = an_intent(&sk, "send", "args-abc"); // standing_grant_id == "grant-1"
+        let ran = std::cell::Cell::new(false);
+        let outcome = dispatch_standing_act(
+            &store,
+            &log,
+            &sk,
+            sk.verifying_key().to_bytes(),
+            &intent,
+            || {
+                ran.set(true);
+                Some(a_receipt(
+                    &sk,
+                    "vm-agent",
+                    "send",
+                    "args-abc",
+                    "elastos://mail/send",
+                    "execute",
+                ))
+            },
+        );
+        assert!(ran.get(), "an intent within an active grant runs the act");
+        match outcome {
+            IntentGateOutcome::Acted(rec) => assert_eq!(rec.status, ReconciliationStatus::Matched),
+            other => panic!("expected Acted(matched), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_catches_divergence_after_the_act() {
+        let (_dir, log) = gate_log();
+        let sk = key();
+        let store = store_with(&["send"]);
+        let intent = an_intent(&sk, "send", "args-declared");
+        // The act runs within the envelope but delivers a DIFFERENT input_hash than declared.
+        let outcome = dispatch_standing_act(
+            &store,
+            &log,
+            &sk,
+            sk.verifying_key().to_bytes(),
+            &intent,
+            || {
+                Some(a_receipt(
+                    &sk,
+                    "vm-agent",
+                    "send",
+                    "args-DIFFERENT",
+                    "elastos://mail/send",
+                    "execute",
+                ))
+            },
+        );
+        match outcome {
+            IntentGateOutcome::Acted(rec) => {
+                assert_eq!(rec.status, ReconciliationStatus::Diverged);
+                assert!(rec.divergence_detail.contains("input_hash"));
+            }
+            other => panic!("expected Acted(diverged), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_denies_out_of_envelope_before_the_act() {
+        let (_dir, log) = gate_log();
+        let sk = key();
+        let store = store_with(&["send"]); // "delete" is NOT in the envelope
+        let intent = an_intent(&sk, "delete", "h");
+        let ran = std::cell::Cell::new(false);
+        let outcome = dispatch_standing_act(
+            &store,
+            &log,
+            &sk,
+            sk.verifying_key().to_bytes(),
+            &intent,
+            || {
+                ran.set(true);
+                None
+            },
+        );
+        assert!(matches!(
+            outcome,
+            IntentGateOutcome::Denied(EnvelopeDenial::MethodNotInEnvelope)
+        ));
+        assert!(
+            !ran.get(),
+            "a denied intent never runs the act (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn dispatch_denies_a_revoked_grant() {
+        let (_dir, log) = gate_log();
+        let sk = key();
+        let store = store_with(&["send"]);
+        assert!(store.revoke("grant-1"), "revoke the standing grant");
+        let intent = an_intent(&sk, "send", "args-abc");
+        let ran = std::cell::Cell::new(false);
+        let outcome = dispatch_standing_act(
+            &store,
+            &log,
+            &sk,
+            sk.verifying_key().to_bytes(),
+            &intent,
+            || {
+                ran.set(true);
+                None
+            },
+        );
+        assert!(matches!(
+            outcome,
+            IntentGateOutcome::Denied(EnvelopeDenial::Revoked)
+        ));
+        assert!(!ran.get(), "a revoked grant authorizes nothing");
+    }
+
+    #[test]
+    fn dispatch_denies_and_records_when_no_grant_was_issued() {
+        let (_dir, log) = gate_log();
+        let sk = key();
+        let store = StandingGrantStore::new(); // empty — no grant for "grant-1"
+        let intent = an_intent(&sk, "send", "args-abc");
+        let ran = std::cell::Cell::new(false);
+        let outcome = dispatch_standing_act(
+            &store,
+            &log,
+            &sk,
+            sk.verifying_key().to_bytes(),
+            &intent,
+            || {
+                ran.set(true);
+                None
+            },
+        );
+        assert!(matches!(
+            outcome,
+            IntentGateOutcome::Denied(EnvelopeDenial::NoGrant)
+        ));
+        assert!(
+            !ran.get(),
+            "a missing grant authorizes nothing (fail-closed)"
+        );
+        // The refusal is on-chain: declaration + denial recorded, chain verifies, and the
+        // intent channel counts it as a denial (never a silent drop).
+        let att = log.chain_attestation().unwrap();
+        assert!(att.verified);
+        assert_eq!(att.records, 2, "declared + denied, no act");
+        let summary = log
+            .intent_proof_summary("vm-agent")
+            .expect("the declared intent makes vm-agent PRESENT on the intent channel");
+        assert_eq!(summary.denied, 1, "a missing-grant refusal is a denial");
     }
 }
