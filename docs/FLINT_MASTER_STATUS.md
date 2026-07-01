@@ -47,13 +47,15 @@ pass), ESP `npm test` **green** (89), `cargo build --workspace` clean (**0 warni
 - The room-service permission-injection test now skips under `euid==0` (root bypasses `0o500`).
 
 **Tracked degradations (deferred, honestly not hidden — follow-up chunks on this base):**
-1. WASM/carrier **spend-metering act-path wiring** (`spend_policy: None` at the two `BridgeContext`
-   sites in `runtime.rs`). The `SpendMeter` primitive + inspector projection are intact.
+1. ✅ **RESTORED** (`65b4691`) — WASM/carrier **spend-metering act-path wiring**. The real
+   `spend_policy` now threads into both `BridgeContext` sites via `wasm_bridge_context()`, with a
+   fail-closed regression test. WASM acts debit the shared budget again.
 2. 0.5's **approved-provider dispatch registry support** (`inspect_provider::with_registry` is a
    passthrough); the `inspect/request_act` HTTP surface is wired and functional (plan+pending record),
-   but registry-backed act execution is not yet re-grafted.
-3. Dropped-in-merge tests to re-add: carrier_bridge read-token-write-denial preaudit, library mime,
-   our `verified_signer` unit tests.
+   but registry-backed act execution is not yet re-grafted. *(remaining)*
+3. ✅ **RESTORED** — re-added flint's `verified_signer_tests` module (5 tests). The other two
+   suspected-dropped tests (carrier_bridge read-token-write-denial `preaudit3`, library mime bucket)
+   were verified **present** — they survived the merge; the earlier list over-counted.
 
 ## Tier 1 — the macOS shell (CORRECTED — functional today)
 - ✅ **macOS shell WORKS today** — providers run as **native arm64 subprocesses** via `ELASTOS_<NAME>_BIN`;
