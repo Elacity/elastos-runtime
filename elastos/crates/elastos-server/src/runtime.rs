@@ -59,6 +59,33 @@ pub struct Runtime {
     wasm_provider: Option<Arc<WasmProvider>>,
 }
 
+/// Assemble the WASM Carrier bridge context, threading the shared spend policy so WASM/carrier acts
+/// are metered under the same budget as the serve/microVM paths.
+///
+/// Extracted from the two bridge closures in [`Runtime::set_provider_registry`] so the spend-policy
+/// data-flow is unit-testable: it is a fail-closed regression guard that a configured budget stays
+/// `Some` all the way to the bridge, and never silently drops to `None` again.
+#[allow(clippy::too_many_arguments)]
+fn wasm_bridge_context(
+    provider_registry: Arc<ProviderRegistry>,
+    capability_manager: Arc<elastos_runtime::capability::CapabilityManager>,
+    pending_store: Arc<elastos_runtime::capability::pending::PendingRequestStore>,
+    capsule_id: String,
+    principal_id: Option<String>,
+    data_dir: std::path::PathBuf,
+    spend_policy: Option<crate::carrier_bridge::SpendPolicy>,
+) -> crate::carrier_bridge::BridgeContext {
+    crate::carrier_bridge::BridgeContext {
+        provider_registry,
+        capability_manager,
+        pending_store,
+        capsule_id,
+        principal_id,
+        data_dir: Some(data_dir),
+        spend_policy,
+    }
+}
+
 impl Runtime {
     /// Create a new runtime with a single compute provider (backward compatible)
     pub fn new(storage: Arc<dyn StorageProvider>, compute: Arc<dyn ComputeProvider>) -> Self {
@@ -104,28 +131,26 @@ impl Runtime {
         data_dir: std::path::PathBuf,
         spend_policy: Option<crate::carrier_bridge::SpendPolicy>,
     ) {
-        // Accepted to keep the call-site API stable while WASM-path spend metering is re-wired
-        // onto the 0.5 base (tracked follow-up). The BridgeContext sites below still pass `None`;
-        // when the wiring lands, thread this value through instead of dropping it here.
-        let _ = &spend_policy;
         // Configure WASM bridge if we have a concrete WasmProvider reference
         if let Some(ref wasm) = self.wasm_provider {
             let reg = registry.clone();
             let cap_mgr = capability_manager.clone();
             let pending = pending_store.clone();
             let bridge_data_dir = data_dir.clone();
+            // WASM capsule acts are metered under the same shared budget as the serve/microVM
+            // paths. Each closure keeps its own clone (the policy's `Arc<SpendMeter>` is shared,
+            // so all paths debit the one budget) and re-clones per invocation.
+            let spawn_spend_policy = spend_policy.clone();
             wasm.set_bridge_spawner(Arc::new(move |pipes| {
-                let ctx = crate::carrier_bridge::BridgeContext {
-                    provider_registry: reg.clone(),
-                    capability_manager: cap_mgr.clone(),
-                    pending_store: pending.clone(),
-                    capsule_id: pipes.capsule_id.clone(),
-                    principal_id: pipes.principal_id.clone(),
-                    data_dir: Some(bridge_data_dir.clone()),
-                    // WASM-path spend metering is deferred on the 0.5 base (tracked follow-up); the
-                    // SpendMeter primitive + inspector projection are intact, this wiring is not yet re-applied.
-                    spend_policy: None,
-                };
+                let ctx = wasm_bridge_context(
+                    reg.clone(),
+                    cap_mgr.clone(),
+                    pending.clone(),
+                    pipes.capsule_id.clone(),
+                    pipes.principal_id.clone(),
+                    bridge_data_dir.clone(),
+                    spawn_spend_policy.clone(),
+                );
                 crate::carrier_bridge::spawn_wasm_carrier_bridge(pipes, ctx);
             }));
 
@@ -134,16 +159,17 @@ impl Runtime {
             let host_pending = pending_store.clone();
             let host_data_dir = data_dir.clone();
             let host_handle = tokio::runtime::Handle::current();
+            let host_spend_policy = spend_policy.clone();
             wasm.set_bridge_hostcall(Arc::new(move |line, capsule_id, principal_id| {
-                let ctx = crate::carrier_bridge::BridgeContext {
-                    provider_registry: host_reg.clone(),
-                    capability_manager: host_cap_mgr.clone(),
-                    pending_store: host_pending.clone(),
-                    capsule_id: capsule_id.to_string(),
-                    principal_id: principal_id.map(ToOwned::to_owned),
-                    data_dir: Some(host_data_dir.clone()),
-                    spend_policy: None,
-                };
+                let ctx = wasm_bridge_context(
+                    host_reg.clone(),
+                    host_cap_mgr.clone(),
+                    host_pending.clone(),
+                    capsule_id.to_string(),
+                    principal_id.map(ToOwned::to_owned),
+                    host_data_dir.clone(),
+                    host_spend_policy.clone(),
+                );
                 let response = host_handle
                     .block_on(crate::carrier_bridge::handle_request(line, &Some(ctx)))
                     .map_err(|err| err.to_string())?;
@@ -587,6 +613,62 @@ mod tests {
         );
         let compute = Arc::new(NoopComputeProvider);
         (Runtime::new(storage, compute), temp_dir)
+    }
+
+    /// Fail-closed regression guard for the WASM/carrier spend-metering act path: a configured
+    /// budget must thread all the way to the bridge context as `Some` (the 0.5 merge had silently
+    /// dropped it to `None`, disabling metering), and an unconfigured budget stays `None`.
+    #[test]
+    fn wasm_bridge_context_threads_the_configured_spend_policy() {
+        use elastos_runtime::primitives::spend::SpendMeter;
+
+        let audit_log = Arc::new(elastos_runtime::primitives::audit::AuditLog::new());
+        let store = Arc::new(elastos_runtime::capability::CapabilityStore::new());
+        let metrics = Arc::new(elastos_runtime::primitives::metrics::MetricsManager::new());
+        let capability_manager = Arc::new(elastos_runtime::capability::CapabilityManager::new(
+            store,
+            audit_log.clone(),
+            metrics,
+        ));
+        let registry = Arc::new(elastos_runtime::provider::ProviderRegistry::new());
+        let pending =
+            Arc::new(elastos_runtime::capability::pending::PendingRequestStore::new(audit_log));
+
+        let metered = wasm_bridge_context(
+            registry.clone(),
+            capability_manager.clone(),
+            pending.clone(),
+            "vm-test".to_string(),
+            Some("person:local:alice".to_string()),
+            std::path::PathBuf::from("/tmp/elastos-test"),
+            Some(crate::carrier_bridge::SpendPolicy {
+                meter: Arc::new(SpendMeter::new()),
+                default_budget: 7,
+            }),
+        );
+        assert_eq!(metered.capsule_id, "vm-test");
+        assert_eq!(
+            metered.data_dir,
+            Some(std::path::PathBuf::from("/tmp/elastos-test"))
+        );
+        let threaded = metered
+            .spend_policy
+            .expect("configured spend policy must reach the WASM bridge, not be dropped to None");
+        assert_eq!(threaded.default_budget, 7);
+
+        let unmetered = wasm_bridge_context(
+            registry,
+            capability_manager,
+            pending,
+            "vm-test".to_string(),
+            None,
+            std::path::PathBuf::from("/tmp/elastos-test"),
+            None,
+        );
+        assert!(
+            unmetered.spend_policy.is_none(),
+            "an unconfigured budget must stay unmetered (None)"
+        );
     }
 
     fn unsigned_manifest() -> CapsuleManifest {
