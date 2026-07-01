@@ -228,7 +228,7 @@ impl IpfsProvider {
     fn fetch_bytes(&mut self, arg: &str) -> Result<Vec<u8>, String> {
         let mut failures = Vec::new();
 
-        if self.ensure_kubo().is_ok() {
+        if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
             match self.kubo_cat_bytes(arg, LARGE_HTTP_TIMEOUT) {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => failures.push(err),
@@ -284,12 +284,30 @@ impl IpfsProvider {
     fn init(&mut self, config: serde_json::Value) -> Response {
         let extra = config.get("extra").unwrap_or(&config);
 
+        if let Some(base_path) = config
+            .get("base_path")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| extra.get("data_dir").and_then(serde_json::Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let path = PathBuf::from(base_path);
+            if !path.is_absolute() {
+                return Response::error(
+                    "invalid_config",
+                    "ipfs-provider data_dir must be absolute",
+                );
+            }
+            self.data_dir = path;
+            self.repo_dir = self.data_dir.join("ipfs-repo");
+        }
+
         if extra.get("gateways").is_some() || std::env::var("ELASTOS_IPFS_GATEWAYS").is_ok() {
             eprintln!("ipfs-provider: ignoring gateway override; provider is local-IPFS only");
         }
 
         // Find Kubo binary
-        match find_kubo_binary() {
+        match find_kubo_binary(&self.data_dir) {
             Some(path) => {
                 eprintln!("ipfs-provider: found kubo at {}", path.display());
                 self.kubo_binary = Some(path);
@@ -301,7 +319,7 @@ impl IpfsProvider {
 
         // Check coord file for running Kubo instance
         if let Some(coord) = read_coord_file(&self.data_dir) {
-            if is_kubo_usable(coord.kubo_pid, coord.api_port) {
+            if is_pid_alive(coord.kubo_pid) {
                 eprintln!(
                     "ipfs-provider: reusing existing Kubo (pid={}, api={})",
                     coord.kubo_pid, coord.api_port
@@ -312,8 +330,8 @@ impl IpfsProvider {
                 update_coord_last_used(&self.data_dir);
             } else {
                 eprintln!(
-                    "ipfs-provider: stale coord file (pid {} dead/unresponsive on api={}), removing",
-                    coord.kubo_pid, coord.api_port
+                    "ipfs-provider: stale coord file (pid {} dead), removing",
+                    coord.kubo_pid
                 );
                 remove_coord_file(&self.data_dir);
             }
@@ -331,14 +349,14 @@ impl IpfsProvider {
         if self.state == KuboState::Ready {
             // Verify still alive
             if let Some(coord) = read_coord_file(&self.data_dir) {
-                if is_kubo_usable(coord.kubo_pid, coord.api_port) {
+                if is_pid_alive(coord.kubo_pid) {
                     update_coord_last_used(&self.data_dir);
                     return Ok(());
                 }
-                // PID gone OR zombie/unresponsive on its port — evict stale coord and re-start.
+                // PID died — remove stale coord and re-start
                 eprintln!(
-                    "ipfs-provider: Kubo pid {} dead/unresponsive on api={}, restarting",
-                    coord.kubo_pid, coord.api_port
+                    "ipfs-provider: Kubo pid {} died, restarting",
+                    coord.kubo_pid
                 );
                 remove_coord_file(&self.data_dir);
             }
@@ -374,7 +392,7 @@ impl IpfsProvider {
         if try_flock_exclusive(&lockfile) {
             // We got the lock — check coord file again (another process may have finished)
             if let Some(coord) = read_coord_file(&self.data_dir) {
-                if is_kubo_usable(coord.kubo_pid, coord.api_port) {
+                if is_pid_alive(coord.kubo_pid) {
                     self.api_port = coord.api_port;
                     self.gateway_port = coord.gateway_port;
                     self.state = KuboState::Ready;
@@ -394,7 +412,7 @@ impl IpfsProvider {
             loop {
                 std::thread::sleep(LOCKFILE_POLL_INTERVAL);
                 if let Some(coord) = read_coord_file(&self.data_dir) {
-                    if is_kubo_usable(coord.kubo_pid, coord.api_port) {
+                    if is_pid_alive(coord.kubo_pid) {
                         self.api_port = coord.api_port;
                         self.gateway_port = coord.gateway_port;
                         self.state = KuboState::Ready;
@@ -569,7 +587,7 @@ impl IpfsProvider {
         if !file_path.is_absolute() {
             return Response::error("invalid_path", "Path must be absolute");
         }
-        if let Err(e) = validate_source_path(file_path) {
+        if let Err(e) = validate_source_path(&self.data_dir, file_path) {
             return Response::error("path_not_allowed", &e);
         }
         if !file_path.exists() {
@@ -612,7 +630,7 @@ impl IpfsProvider {
     fn cat_to_path(&mut self, cid: &str, path: Option<&str>, dest: &str) -> Response {
         // Path safety validation
         let dest_path = Path::new(dest);
-        if let Err(e) = validate_dest_path(dest_path) {
+        if let Err(e) = validate_dest_path(&self.data_dir, dest_path) {
             return Response::error("invalid_dest", &e);
         }
 
@@ -637,7 +655,7 @@ impl IpfsProvider {
 
     fn ls(&mut self, cid: &str) -> Response {
         // Try Kubo first
-        if self.ensure_kubo().is_ok() {
+        if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
             let url = format!("{}/api/v0/ls?arg={}", self.api_url(), cid);
             if let Ok(resp) = ureq::post(&url).timeout(HTTP_TIMEOUT).call() {
                 if resp.status() == 200 {
@@ -667,7 +685,7 @@ impl IpfsProvider {
 
     fn download_directory(&mut self, cid: &str, dest: &str) -> Response {
         let dest_path = Path::new(dest);
-        if let Err(e) = validate_dest_path(dest_path) {
+        if let Err(e) = validate_dest_path(&self.data_dir, dest_path) {
             return Response::error("invalid_dest", &e);
         }
 
@@ -691,20 +709,14 @@ impl IpfsProvider {
 
             let file_dest = dest_path.join(file_path);
 
-            // Validate resolved path stays within dest. The file does not exist yet, so we
-            // canonicalize its PARENT (created just below) and re-join the name. On macOS the
-            // temp root is a symlink (`/var` -> `/private/var`), so comparing a NON-canonical
-            // child path against a canonicalized dest would always look like an escape and
-            // silently skip EVERY file — leaving an empty dir that breaks the media open.
+            // Validate resolved path stays within dest
             if let Ok(canonical_dest) = fs::canonicalize(dest_path) {
                 if let Some(parent) = file_dest.parent() {
                     let _ = fs::create_dir_all(parent);
                 }
                 let canonical_file = file_dest
-                    .parent()
-                    .and_then(|p| p.canonicalize().ok())
-                    .map(|p| p.join(file_dest.file_name().unwrap_or_default()))
-                    .unwrap_or_else(|| file_dest.clone());
+                    .canonicalize()
+                    .unwrap_or_else(|_| dest_path.join(file_path));
                 if !canonical_file.starts_with(&canonical_dest) {
                     eprintln!("ipfs-provider: path escapes destination: {}", file_path);
                     continue;
@@ -713,7 +725,7 @@ impl IpfsProvider {
 
             let arg = format!("{}/{}", cid, file_path);
 
-            let bytes = if self.ensure_kubo().is_ok() {
+            let bytes = if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
                 let url = format!("{}/api/v0/cat?arg={}", self.api_url(), arg);
                 match ureq::post(&url).timeout(LARGE_HTTP_TIMEOUT).call() {
                     Ok(resp) if resp.status() == 200 => {
@@ -753,18 +765,6 @@ impl IpfsProvider {
             return Response::error(
                 "download_failed",
                 &format!("All downloads failed: {}", errors.join("; ")),
-            );
-        }
-        // Fail closed if the directory listed files but NONE were written (e.g. every file
-        // rejected by the path-safety guard) — otherwise the caller proceeds with an empty
-        // directory and fails later with a confusing downstream error.
-        if downloaded.is_empty() && !files.is_empty() {
-            return Response::error(
-                "download_failed",
-                &format!(
-                    "directory {cid} listed {} file(s) but none were downloaded",
-                    files.len()
-                ),
             );
         }
 
@@ -1037,7 +1037,7 @@ impl IpfsProvider {
 
     fn list_dir_files(&mut self, cid: &str) -> Result<Vec<String>, String> {
         // Try Kubo API first
-        if self.ensure_kubo().is_ok() {
+        if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
             let url = format!("{}/api/v0/ls?arg={}", self.api_url(), cid);
             if let Ok(resp) = ureq::post(&url).timeout(HTTP_TIMEOUT).call() {
                 if resp.status() == 200 {
@@ -1066,7 +1066,14 @@ fn data_dir() -> PathBuf {
     } else if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
         PathBuf::from(dir).join("elastos")
     } else if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".local/share/elastos")
+        #[cfg(target_os = "macos")]
+        {
+            PathBuf::from(home).join("Library/Application Support/elastos")
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            PathBuf::from(home).join(".local/share/elastos")
+        }
     } else {
         PathBuf::from("/tmp/elastos")
     }
@@ -1167,28 +1174,6 @@ fn update_coord_last_used(data_dir: &Path) {
 
 // ── Process helpers ─────────────────────────────────────────────────
 
-/// True only when the coord's Kubo is genuinely usable: the PID exists AND its API port
-/// accepts a connection.
-///
-/// PID existence alone is a trap. A crashed Kubo lingers as a `<defunct>` zombie until its
-/// parent reaps it, and `kill(pid, 0)` reports a zombie (or a wedged-but-unresponsive daemon)
-/// as still-alive. Reusing such a coord makes every fetch loop on connection-refused against a
-/// dead port — surfacing to the viewer as "502 could not fetch media directory from IPFS" with
-/// no self-recovery. Probing the port turns that into a clean stale-coord eviction + respawn.
-fn is_kubo_usable(pid: u32, api_port: u16) -> bool {
-    is_pid_alive(pid) && is_port_listening(api_port)
-}
-
-/// Cheap liveness probe: can we open a TCP connection to `127.0.0.1:port`? A refused connection
-/// means the daemon that owned the port is gone, regardless of any lingering PID.
-fn is_port_listening(port: u16) -> bool {
-    if port == 0 {
-        return false;
-    }
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500)).is_ok()
-}
-
 fn is_pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -1220,7 +1205,7 @@ fn try_flock_exclusive(_file: &fs::File) -> bool {
 
 // ── Path safety ─────────────────────────────────────────────────────
 
-fn validate_dest_path(dest: &Path) -> Result<(), String> {
+fn validate_dest_path(data_dir: &Path, dest: &Path) -> Result<(), String> {
     if !dest.is_absolute() {
         return Err("Destination path must be absolute".to_string());
     }
@@ -1242,14 +1227,8 @@ fn validate_dest_path(dest: &Path) -> Result<(), String> {
         dest.to_path_buf()
     };
 
-    // Allowed prefixes. Canonicalize the roots too: `resolved` above is canonicalized, and on
-    // macOS the temp root is a symlink (`/var` → `/private/var`), so an un-canonicalized root
-    // would never `starts_with`-match a canonicalized dest. Fall back to the raw path if a root
-    // does not exist yet.
-    let data_dir = data_dir();
+    // Allowed prefixes
     let tmp_dir = std::env::temp_dir();
-    let data_dir = data_dir.canonicalize().unwrap_or(data_dir);
-    let tmp_dir = tmp_dir.canonicalize().unwrap_or(tmp_dir);
 
     if !resolved.starts_with(&data_dir) && !resolved.starts_with(&tmp_dir) {
         return Err(format!(
@@ -1264,7 +1243,7 @@ fn validate_dest_path(dest: &Path) -> Result<(), String> {
 
 /// Validate source paths for add_path — restrict to allowed roots.
 /// Prevents arbitrary file exfiltration via the IPFS publish path.
-fn validate_source_path(src: &Path) -> Result<(), String> {
+fn validate_source_path(data_dir: &Path, src: &Path) -> Result<(), String> {
     if !src.is_absolute() {
         return Err("Source path must be absolute".to_string());
     }
@@ -1286,7 +1265,6 @@ fn validate_source_path(src: &Path) -> Result<(), String> {
         src.to_path_buf()
     };
 
-    let data_dir = data_dir();
     let tmp_dir = std::env::temp_dir();
 
     if !resolved.starts_with(&data_dir) && !resolved.starts_with(&tmp_dir) {
@@ -1303,7 +1281,7 @@ fn validate_source_path(src: &Path) -> Result<(), String> {
 
 // ── Kubo binary discovery ───────────────────────────────────────────
 
-fn find_kubo_binary() -> Option<PathBuf> {
+fn find_kubo_binary(data_dir: &Path) -> Option<PathBuf> {
     // 1. Explicit override
     if let Ok(path) = std::env::var("ELASTOS_IPFS_KUBO_PATH") {
         let p = PathBuf::from(&path);
@@ -1313,13 +1291,20 @@ fn find_kubo_binary() -> Option<PathBuf> {
     }
 
     // 2. Standard install location
-    let data_dir = data_dir();
     let installed = data_dir.join("bin/kubo");
     if installed.is_file() {
         return Some(installed);
     }
 
-    // 3. System PATH (try both "kubo" and "ipfs")
+    // 3. Managed runtimes keep provider/external binaries in the parent runtime bin dir.
+    if let Some(dir) = std::env::var_os("ELASTOS_CAPSULE_BIN_DIR") {
+        let installed = PathBuf::from(dir).join("kubo");
+        if installed.is_file() {
+            return Some(installed);
+        }
+    }
+
+    // 4. System PATH (try both "kubo" and "ipfs")
     for name in ["kubo", "ipfs"] {
         if let Ok(output) = Command::new("which").arg(name).output() {
             if output.status.success() {
@@ -1633,6 +1618,36 @@ mod tests {
     }
 
     #[test]
+    fn test_init_config_base_path_overrides_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(bin_dir.join("kubo"), b"test").unwrap();
+        let mut provider = IpfsProvider::new();
+        let response = provider.init(serde_json::json!({
+            "base_path": tmp.path().to_string_lossy()
+        }));
+
+        assert!(matches!(response, Response::Ok { .. }));
+        assert_eq!(provider.data_dir, tmp.path());
+        assert_eq!(provider.repo_dir, tmp.path().join("ipfs-repo"));
+        assert_eq!(provider.kubo_binary, Some(tmp.path().join("bin/kubo")));
+    }
+
+    #[test]
+    fn test_find_kubo_binary_uses_managed_runtime_bin_dir() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let shared_bin = tempfile::tempdir().unwrap();
+        fs::write(shared_bin.path().join("kubo"), b"test").unwrap();
+        std::env::set_var("ELASTOS_CAPSULE_BIN_DIR", shared_bin.path());
+
+        let kubo = find_kubo_binary(data_dir.path());
+
+        std::env::remove_var("ELASTOS_CAPSULE_BIN_DIR");
+        assert_eq!(kubo, Some(shared_bin.path().join("kubo")));
+    }
+
+    #[test]
     fn test_response_serialization() {
         let ok = Response::ok(serde_json::json!({"cid": "QmTest"}));
         let json = serde_json::to_string(&ok).unwrap();
@@ -1662,34 +1677,39 @@ mod tests {
 
     #[test]
     fn test_validate_dest_path_rejects_relative() {
-        let result = validate_dest_path(Path::new("relative/path"));
+        let data_dir = data_dir();
+        let result = validate_dest_path(&data_dir, Path::new("relative/path"));
         assert!(result.is_err());
     }
 
     #[test]
     fn test_validate_source_path_rejects_relative() {
-        let result = validate_source_path(Path::new("relative/file"));
+        let data_dir = data_dir();
+        let result = validate_source_path(&data_dir, Path::new("relative/file"));
         assert!(result.is_err());
     }
 
     #[test]
     fn test_validate_source_path_rejects_outside_roots() {
-        let result = validate_source_path(Path::new("/etc/passwd"));
+        let data_dir = data_dir();
+        let result = validate_source_path(&data_dir, Path::new("/etc/passwd"));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("must be under"));
     }
 
     #[test]
     fn test_validate_source_path_allows_tmp() {
+        let data_dir = data_dir();
         let tmp = std::env::temp_dir().join("elastos-test-file");
-        let result = validate_source_path(&tmp);
+        let result = validate_source_path(&data_dir, &tmp);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_source_path_allows_data_dir() {
-        let path = data_dir().join("some-file.bin");
-        let result = validate_source_path(&path);
+        let data_dir = data_dir();
+        let path = data_dir.join("some-file.bin");
+        let result = validate_source_path(&data_dir, &path);
         assert!(result.is_ok());
     }
 

@@ -723,6 +723,17 @@ impl InspectProvider {
         }
     }
 
+    /// Construct with a provider registry handle (0.5 API compatibility). This inspector is a
+    /// read-only projection and does not dispatch through the registry — 0.5's "approved provider
+    /// dispatch / request_act" surface is a tracked follow-up graft — so the registry is accepted
+    /// for call-site compatibility and intentionally not retained.
+    pub fn with_registry(
+        source: Arc<dyn InspectSource>,
+        _registry: std::sync::Weak<ProviderRegistry>,
+    ) -> Self {
+        Self::new(source)
+    }
+
     /// Attach a per-capsule audit source so detail views show live activity.
     pub fn with_audit(mut self, audit: Arc<dyn AuditSource>) -> Self {
         self.audit = Some(audit);

@@ -87,6 +87,9 @@ pub struct ResponseEnvelope {
 /// Detected automatically based on the environment.
 #[cfg(feature = "serde")]
 enum CarrierChannel {
+    /// Runtime-provided host import for WASM capsules.
+    #[cfg(target_os = "wasi")]
+    HostCall,
     /// stdin/stdout — explicit standalone host-process mode when no bridge is configured
     Stdio,
     /// Dedicated full-duplex serial device for microVM capsules.
@@ -100,6 +103,19 @@ enum CarrierChannel {
     /// HTTP API to a running runtime (attached mode).
     /// WASM capsules running locally use this to reach the runtime's Carrier.
     Http { api_url: String, token: String },
+}
+
+#[cfg(all(feature = "serde", target_os = "wasi"))]
+#[link(wasm_import_module = "elastos")]
+unsafe extern "C" {
+    #[link_name = "carrier_call"]
+    fn elastos_carrier_call(
+        request_ptr: *const u8,
+        request_len: usize,
+        response_ptr: *mut u8,
+        response_cap: usize,
+        response_len_ptr: *mut usize,
+    ) -> i32;
 }
 
 /// Runtime client for capsules.
@@ -125,7 +141,8 @@ impl RuntimeClient {
     /// This checks only the boot contract. It does not prove that the runtime
     /// will grant any capability.
     pub fn is_bridge_configured() -> bool {
-        if std::env::var_os("ELASTOS_CARRIER_FIFOS").is_some()
+        if std::env::var_os("ELASTOS_CARRIER_HOSTCALL").is_some()
+            || std::env::var_os("ELASTOS_CARRIER_FIFOS").is_some()
             || std::env::var_os("ELASTOS_CARRIER_PATH").is_some()
         {
             return true;
@@ -145,7 +162,16 @@ impl RuntimeClient {
     /// 3. `ELASTOS_API` + `ELASTOS_TOKEN` → HTTP API to running runtime (attached mode)
     /// 4. Otherwise → stdin/stdout (standalone host-process mode)
     pub fn new() -> Self {
-        let channel = if std::env::var_os("ELASTOS_CARRIER_FIFOS").is_some() {
+        let channel = if std::env::var_os("ELASTOS_CARRIER_HOSTCALL").is_some() {
+            #[cfg(target_os = "wasi")]
+            {
+                CarrierChannel::HostCall
+            }
+            #[cfg(not(target_os = "wasi"))]
+            {
+                panic!("ELASTOS_CARRIER_HOSTCALL is only supported inside WASI capsules")
+            }
+        } else if std::env::var_os("ELASTOS_CARRIER_FIFOS").is_some() {
             Self::channel_from_fifos()
                 .unwrap_or_else(|e| panic!("ELASTOS_CARRIER_FIFOS is set but invalid: {e}"))
         } else if let Ok(path) = std::env::var("ELASTOS_CARRIER_PATH") {
@@ -506,6 +532,55 @@ impl RuntimeClient {
         }
     }
 
+    #[cfg(target_os = "wasi")]
+    fn call_hostcall(json: &str) -> io::Result<String> {
+        const MAX_RESPONSE_BYTES: usize = 1_048_576;
+        let mut response = vec![0_u8; MAX_RESPONSE_BYTES];
+        let mut response_len: usize = 0;
+        let code = unsafe {
+            elastos_carrier_call(
+                json.as_ptr(),
+                json.len(),
+                response.as_mut_ptr(),
+                response.len(),
+                &mut response_len as *mut usize,
+            )
+        };
+
+        match code {
+            0 => {
+                if response_len > response.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "carrier hostcall returned an invalid response length",
+                    ));
+                }
+                String::from_utf8(response[..response_len].to_vec()).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("carrier hostcall utf8: {e}"),
+                    )
+                })
+            }
+            1 => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "carrier hostcall rejected guest memory",
+            )),
+            2 => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "carrier hostcall request was not UTF-8",
+            )),
+            3 => Err(io::Error::other("carrier hostcall failed")),
+            4 => Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "carrier hostcall response exceeded guest buffer",
+            )),
+            other => Err(io::Error::other(format!(
+                "carrier hostcall returned unknown status {other}"
+            ))),
+        }
+    }
+
     /// Try to open a Carrier channel from ELASTOS_CARRIER_FIFOS env var.
     ///
     /// Format: `"reader_path,writer_path"` — sandbox-relative paths (e.g.,
@@ -606,6 +681,8 @@ impl RuntimeClient {
 
         // Send request and read response via the detected channel
         let line = match &mut self.channel {
+            #[cfg(target_os = "wasi")]
+            CarrierChannel::HostCall => Self::call_hostcall(&json)?,
             CarrierChannel::Stdio => {
                 let mut stdout = io::stdout().lock();
                 writeln!(stdout, "{}", json)?;
@@ -622,11 +699,17 @@ impl RuntimeClient {
                 Self::read_unbuffered_line(file)?
             }
             CarrierChannel::FilePair { reader, writer } => {
-                writeln!(writer, "{}", json)?;
-                writer.flush()?;
+                writeln!(writer, "{}", json).map_err(|e| {
+                    io::Error::new(e.kind(), format!("carrier fifo write failed: {e}"))
+                })?;
+                writer.flush().map_err(|e| {
+                    io::Error::new(e.kind(), format!("carrier fifo flush failed: {e}"))
+                })?;
 
                 let mut line = String::new();
-                reader.read_line(&mut line)?;
+                reader.read_line(&mut line).map_err(|e| {
+                    io::Error::new(e.kind(), format!("carrier fifo read failed: {e}"))
+                })?;
                 line
             }
             CarrierChannel::Http { api_url, token } => {
@@ -680,7 +763,9 @@ impl RuntimeClient {
             | CarrierChannel::FilePair { .. }
             | CarrierChannel::Http { .. } => unreachable!(),
             #[cfg(target_os = "wasi")]
-            CarrierChannel::FilePair { .. } | CarrierChannel::Http { .. } => unreachable!(),
+            CarrierChannel::HostCall
+            | CarrierChannel::FilePair { .. }
+            | CarrierChannel::Http { .. } => unreachable!(),
         }
 
         // Read response with timeout — spawn a reader thread

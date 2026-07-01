@@ -20,17 +20,18 @@ import {
   shouldIgnoreDesktopKeydown,
   shellInteractionActive,
   targetById,
-} from "./shell-core.js?v=home-20260615b";
+} from "./shell-core.js?v=home-20260627a";
 import {
   syncIdentity,
   clearIdentitySurface,
   updateClock,
-} from "./shell-chrome.js?v=home-20260615b";
+} from "./shell-chrome.js?v=home-20260627a";
 import {
   renderDesktop,
   renderTaskbar,
   renderLauncher,
   renderInboxBadge,
+  maybeShowWalletApprovalToast,
   refreshLauncherIfVisible,
   updateTaskbarState,
   toggleLauncher,
@@ -45,7 +46,7 @@ import {
   openDesktopContextMenu,
   hideDesktopContextMenu,
   handleContextAction,
-} from "./shell-surface.js?v=home-20260615b";
+} from "./shell-surface.js?v=home-20260627a";
 import {
   configureWindowHooks,
   renderBootError,
@@ -56,7 +57,8 @@ import {
   restoreShellSession,
   cleanupBeforeUnload,
   handleShellResize,
-} from "./shell-windows.js?v=home-20260615b";
+  refreshHomeInternalWindows,
+} from "./shell-windows.js?v=home-20260627a";
 import {
   bindHomeUnlock,
   hideHomeUnlock,
@@ -64,7 +66,7 @@ import {
   refreshHomeSession,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260615b";
+} from "./shell-auth.js?v=home-20260627a";
 
 configureWindowHooks({
   clearIdentitySurface,
@@ -85,24 +87,20 @@ const HOME_EVENTS_STREAM_URL = "/api/apps/home/events/stream";
 const SESSION_REFRESH_MS = 10 * 60 * 1000;
 const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   "archive-manager": new Set(["library"]),
+  browser: new Set(["library"]),
   "chat-room": new Set(["library"]),
   inbox: "visible-target",
-  library: new Set([
-    "archive-manager",
-    "documents",
-    "library",
-    // Protected owned-asset viewers: opening a minted dKMS `.ddrm` (object) or a protected
-    // media asset routes the owned URI through POST /api/viewers/open (quorum recover/decrypt).
-    "ddrm-viewer",
-    "elacity-player",
-  ]),
+  library: new Set(["archive-manager", "documents", "library"]),
   marketplace: "runtime-target",
+  services: new Set(["browser", "chat-room"]),
   system: "visible-target",
   "wallet": new Set(["wallet-metamask", "wallet-unisat"]),
 });
 const SHELL_MESSAGE_OPEN_URI_SOURCES = new Set(["documents", "chat-room"]);
 const SHELL_MESSAGE_DELIVER_TARGET_SOURCES = Object.freeze({
-  library: new Set(["archive-manager", "chat-room"]),
+  "chat-room": new Set(["documents"]),
+  documents: new Set(["chat-room"]),
+  library: new Set(["archive-manager", "browser", "chat-room"]),
 });
 
 function fullscreenElement() {
@@ -143,7 +141,17 @@ function toggleShellFullscreen() {
 function registerHomeServiceWorker() {
   // Home is network-first during active Runtime development. A stale service
   // worker can strand the shell on an old module graph while provider APIs are
-  // live, so service-worker registration is intentionally disabled for now.
+  // live, so clear any registration left by older builds.
+  if (!("serviceWorker" in navigator)) {
+    return;
+  }
+  navigator.serviceWorker.getRegistrations()
+    .then((registrations) => Promise.all(
+      registrations.map((registration) => registration.unregister()),
+    ))
+    .catch((error) => {
+      console.warn("home service worker cleanup failed", error);
+    });
 }
 
 function trackPointerDown(event) {
@@ -406,6 +414,22 @@ window.addEventListener("message", (event) => {
     }
     return;
   }
+  if (data.type === "home:open-target-with-payload") {
+    const target = typeof data.target === "string" ? data.target.trim() : "";
+    if (!target || !canDeliverTargetFromHomeMessage(context, target)) {
+      console.warn("home ignored unauthorized open-target-with-payload message", context.targetId, target);
+      return;
+    }
+    const payload = data.payload && typeof data.payload === "object" ? data.payload : null;
+    if (!payload || typeof payload.type !== "string") {
+      console.warn("home ignored malformed open-target-with-payload payload", context.targetId, target);
+      return;
+    }
+    if (!openTargetWithPayload(target, payload)) {
+      console.warn("home could not open target with payload", target);
+    }
+    return;
+  }
   if (data.type === "home:close-self") {
     if (context.kind !== "app-frame" || !context.windowId) {
       console.warn("home ignored unauthorized close-self message", context.targetId);
@@ -515,7 +539,7 @@ function canDeliverTargetFromHomeMessage(context, target) {
   return !!policy && policy.has(target);
 }
 
-function deliverMessageToTargetFrame(target, payload) {
+function deliverMessageToTargetFrame(target, payload, options = null) {
   const entries = [...shellState.windows.values()]
     .filter((entry) => entry.kind === "browser" && entry.targetId === target)
     .sort((left, right) => Number(right.serial || 0) - Number(left.serial || 0));
@@ -525,7 +549,31 @@ function deliverMessageToTargetFrame(target, payload) {
     return false;
   }
   frame.contentWindow.postMessage(payload, window.location.origin);
-  focusWindow(entry.id);
+  if (options?.focus === true) {
+    focusWindow(entry.id);
+  }
+  return true;
+}
+
+function openTargetWithPayload(target, payload) {
+  let deliveredCount = 0;
+  if (deliverMessageToTargetFrame(target, payload, { focus: true })) {
+    deliveredCount += 1;
+  } else if (targetById(shellState.currentSummary, target)) {
+    openTarget(target);
+  } else {
+    return false;
+  }
+  let attempts = 0;
+  const retry = window.setInterval(() => {
+    attempts += 1;
+    if (deliverMessageToTargetFrame(target, payload, { focus: true })) {
+      deliveredCount += 1;
+    }
+    if (deliveredCount >= 4 || attempts >= 40) {
+      window.clearInterval(retry);
+    }
+  }, 150);
   return true;
 }
 
@@ -533,6 +581,10 @@ function resolveOpenUri(data) {
   const uri = typeof data.uri === "string" ? data.uri.trim() : "";
   if (!uri.startsWith("elastos://")) {
     return null;
+  }
+  const peerInvite = resolvePeerInviteUri(uri);
+  if (peerInvite) {
+    return peerInvite;
   }
   const cid = uri.slice("elastos://".length).split(/[/?#]/)[0].trim();
   if (!cid) {
@@ -548,6 +600,23 @@ function resolveOpenUri(data) {
         view: "read",
       },
     };
+  }
+  return null;
+}
+
+function resolvePeerInviteUri(uri) {
+  try {
+    const parsed = new URL(uri);
+    const path = parsed.pathname.replace(/^\/+/, "");
+    const isPeerInvite = parsed.hostname === "peer" && path === "invite";
+    if (parsed.protocol === "elastos:" && isPeerInvite && parsed.searchParams.get("token")) {
+      return {
+        target: "chat-room",
+        query: { invite: uri },
+      };
+    }
+  } catch (_error) {
+    return null;
   }
   return null;
 }
@@ -577,9 +646,10 @@ async function boot() {
     });
   document.body.dataset.homeStatus = "ready";
   hideHomeUnlock();
-  restoreShellSession().catch((error) => {
-    console.error("home session restore failed", error);
-  });
+  restoreShellSession()
+    .catch((error) => {
+      console.error("home session restore failed", error);
+    });
   runtimeReady.then(() => refreshShellSummary()).catch((error) => {
     console.error("home summary refresh failed after runtime ensure", error);
   });
@@ -644,8 +714,16 @@ function homeSummarySignedIn(summary) {
   return summary?.authority?.signed_in === true;
 }
 
+function homeSummaryHasProofBoundSession(summary) {
+  return (
+    homeSummarySignedIn(summary) &&
+    typeof summary?.authority?.proof_binding_id === "string" &&
+    summary.authority.proof_binding_id.trim() !== ""
+  );
+}
+
 function refreshSignedHomeSession() {
-  if (!homeSummarySignedIn(shellState.currentSummary)) {
+  if (!homeSummaryHasProofBoundSession(shellState.currentSummary)) {
     return Promise.resolve(null);
   }
   return refreshHomeSession()
@@ -678,6 +756,8 @@ async function refreshShellSummary({ initialize = false } = {}) {
   syncIdentity(summary);
   syncAppearance(summary);
   renderInboxBadge(summary);
+  maybeShowWalletApprovalToast(previous, summary);
+  refreshHomeInternalWindows(summary);
   if (homeSummarySignedIn(summary)) {
     ensureHomeEventChannel();
   } else {
@@ -819,9 +899,11 @@ function homeEventsRequireShellSummary(events) {
       scope === "home" ||
       scope === "inbox" ||
       scope === "wallet" ||
+      scope === "people" ||
       kind === "home.summary.changed" ||
       kind === "inbox.changed" ||
       kind === "wallet.requests.changed" ||
+      kind === "people.changed" ||
       kind === "home.desktop.changed"
     );
   });

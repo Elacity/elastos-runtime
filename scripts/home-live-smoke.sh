@@ -5,7 +5,7 @@ GATEWAY_URL="${ELASTOS_GATEWAY_URL:-https://elastos.elacitylabs.com}"
 GATEWAY_URL="${GATEWAY_URL%/}"
 HOME_COOKIE="${ELASTOS_HOME_COOKIE:-${ELASTOS_COOKIE:-}}"
 HOME_COOKIE_JAR="${ELASTOS_HOME_COOKIE_JAR:-${ELASTOS_COOKIE_JAR:-}}"
-HOME_VERSION="${ELASTOS_HOME_ASSET_VERSION:-home-20260607c}"
+HOME_VERSION="${ELASTOS_HOME_ASSET_VERSION:-}"
 CURL_HOME_AUTH_ARGS=()
 
 need_cmd() {
@@ -61,9 +61,17 @@ assert_not_contains() {
 
 need_cmd curl
 need_cmd grep
+need_cmd sed
 
 echo "[home-live-smoke] fetch live Home shell"
 home_html="$(get "/apps/home/")"
+if [[ -z "$HOME_VERSION" ]]; then
+    HOME_VERSION="$(grep -oE 'shell\.js\?v=[^"]+' <<<"$home_html" | sed 's/^shell\.js?v=//' | head -n1)"
+    if [[ -z "$HOME_VERSION" ]]; then
+        echo "[home-live-smoke] could not discover Home asset version from shell.js tag" >&2
+        exit 1
+    fi
+fi
 assert_contains "Home HTML" "$home_html" "shell.js?v=${HOME_VERSION}"
 assert_contains "Home HTML" "$home_html" "style.css?v=${HOME_VERSION}"
 assert_contains "Home HTML" "$home_html" "manifest.webmanifest?v=${HOME_VERSION}"
@@ -74,9 +82,12 @@ echo "[home-live-smoke] verify live Home module graph"
 shell_js="$(get "/apps/home/shell.js?v=${HOME_VERSION}")"
 assert_contains "Home shell.js" "$shell_js" "shell-core.js?v=${HOME_VERSION}"
 assert_contains "Home shell.js" "$shell_js" "shell-auth.js?v=${HOME_VERSION}"
-assert_contains "Home shell.js" "$shell_js" "registration is intentionally disabled for now"
 assert_not_contains "Home shell.js" "$shell_js" "navigator.serviceWorker.register"
 assert_not_contains "Home shell.js" "$shell_js" "home-20260603a"
+
+shell_auth_js="$(get "/apps/home/shell-auth.js?v=${HOME_VERSION}")"
+assert_contains "Home shell-auth.js" "$shell_auth_js" "guest_registration_enabled"
+assert_contains "Home shell-auth.js" "$shell_auth_js" "guestRegistrationEnabled"
 
 echo "[home-live-smoke] verify cleanup service worker"
 service_worker="$(get "/apps/home/service-worker.js")"

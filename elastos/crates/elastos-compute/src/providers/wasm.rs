@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use wasmtime::*;
 use wasmtime_wasi::preview1::{self, WasiP1Ctx};
@@ -23,22 +23,54 @@ use crate::{CapsuleHandle, CapsuleInfo, ComputeProvider};
 /// host functions read/write through.
 struct WasiState {
     wasi: WasiP1Ctx,
-    /// Per-execution resource caps (memory/table/instances). Enforces the capsule's DECLARED
-    /// per-capsule memory budget (`manifest.resources.memory_mb`, clamped to a host ceiling) so a
-    /// capsule cannot exhaust host memory — PRINCIPLE 7 ("resource boundaries should apply", explicit
-    /// not ambient) + PRINCIPLE 11 (fail closed). Consistent with the crosvm provider, which already
-    /// honors `memory_mb`. See `capsule_store_limits` / `effective_memory_bytes`.
+    bridge_hostcall: Option<BridgeHostcall>,
+    capsule_id: String,
+    principal_id: Option<String>,
     limits: StoreLimits,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WasmExecutionLimits {
+    fuel: u64,
+    memory_size: usize,
+    table_elements: usize,
+    instances: usize,
+    tables: usize,
+    memories: usize,
+    wall_clock_timeout: Duration,
+}
+
+impl WasmExecutionLimits {
+    fn store_limits(self) -> StoreLimits {
+        StoreLimitsBuilder::new()
+            .memory_size(self.memory_size)
+            .table_elements(self.table_elements)
+            .instances(self.instances)
+            .tables(self.tables)
+            .memories(self.memories)
+            .trap_on_grow_failure(true)
+            .build()
+    }
+}
+
+impl Default for WasmExecutionLimits {
+    fn default() -> Self {
+        Self {
+            fuel: 100_000_000,
+            memory_size: 128 * 1024 * 1024,
+            table_elements: 100_000,
+            instances: 16,
+            tables: 32,
+            memories: 4,
+            wall_clock_timeout: Duration::from_secs(30),
+        }
+    }
 }
 
 /// A running WASM instance
 struct RunningInstance {
     engine: Engine,
     module: Module,
-    /// Set by `stop()` to terminate an in-flight execution. The execution's epoch-deadline callback
-    /// checks it and traps when set — the only way to stop a runaway, since the WASM runs in a
-    /// `spawn_blocking` task that cannot be cancelled.
-    should_stop: Arc<AtomicBool>,
     status: CapsuleStatus,
     manifest: CapsuleManifest,
     /// Data directory for this capsule (if storage permissions granted)
@@ -83,6 +115,10 @@ pub struct BridgePipes {
 /// The callback should spawn a bridge thread/task and return immediately.
 pub type BridgeSpawner = Arc<dyn Fn(BridgePipes) + Send + Sync>;
 
+/// Synchronous request/response bridge exposed to WASM capsules as a host import.
+pub type BridgeHostcall =
+    Arc<dyn Fn(&str, &str, Option<&str>) -> std::result::Result<String, String> + Send + Sync>;
+
 /// Return type of [`WasmProvider::build_wasi_context`]: the configured WASI
 /// context plus optional host-side handles for the data-dir preopen, the
 /// carrier-bridge pipes, and the carrier-dir path (for cleanup on exit).
@@ -112,45 +148,8 @@ pub enum BridgeTransport {
     Fifos,
 }
 
-/// Host-protective CEILING (MiB) on a capsule's declared memory budget — override with
-/// `ELASTOS_WASM_MEMORY_CEILING_MB`. A capsule's enforced cap is `min(manifest.resources.memory_mb,
-/// ceiling)`: it gets the per-capsule budget it DECLARED (PRINCIPLE 7 — explicit/granted, consistent
-/// with the crosvm provider which already honors `memory_mb`), but cannot declare an absurd value to
-/// OOM the host. The VM gets this for free (an over-sized VM just fails to launch); in-process WASM
-/// must clamp. 8 GiB is generous headroom for game/AI capsules while still bounding the host.
-const WASM_MEMORY_CEILING_DEFAULT_MB: u32 = 8192;
-/// Max table elements per capsule — bounds a table-growth bomb.
-const WASM_TABLE_ELEMENTS_LIMIT: usize = 1_000_000;
-
-fn wasm_memory_ceiling_mb() -> u32 {
-    std::env::var("ELASTOS_WASM_MEMORY_CEILING_MB")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(WASM_MEMORY_CEILING_DEFAULT_MB)
-}
-
-/// Bytes a capsule may use: its DECLARED `memory_mb` clamped to the host ceiling.
-fn effective_memory_bytes(declared_mb: u32) -> usize {
-    (declared_mb.min(wasm_memory_ceiling_mb()) as usize).saturating_mul(1024 * 1024)
-}
-
-/// Per-`Store` resource caps for a capsule with the given declared memory budget. A capsule that
-/// exceeds them fails closed (the grow / instantiation is denied) instead of exhausting the host.
-fn capsule_store_limits(declared_mb: u32) -> StoreLimits {
-    StoreLimitsBuilder::new()
-        .memory_size(effective_memory_bytes(declared_mb))
-        .table_elements(WASM_TABLE_ELEMENTS_LIMIT)
-        .instances(1)
-        .build()
-}
-
-/// WASM compute provider using wasmtime with WASI support.
+/// WASM compute provider using wasmtime with WASI support
 pub struct WasmProvider {
-    /// One wasmtime `Engine` shared across all capsules (it holds the JIT/compile context + config,
-    /// NOT any tenant heap — per-tenant data lives in each execution's `Store`). Sharing avoids
-    /// building an `Engine` per capsule (recommended wasmtime pattern).
-    engine: Engine,
     instances: Arc<RwLock<HashMap<CapsuleId, RunningInstance>>>,
     /// Base directory for capsule data
     data_base_dir: PathBuf,
@@ -158,11 +157,13 @@ pub struct WasmProvider {
     /// instead of inherited, and this callback is invoked to handle the
     /// bridge (e.g., dispatching SDK requests to the provider registry).
     bridge_spawner: std::sync::RwLock<Option<BridgeSpawner>>,
+    bridge_hostcall: std::sync::RwLock<Option<BridgeHostcall>>,
     bridge_principals: Arc<RwLock<HashMap<CapsuleId, Option<String>>>>,
     /// Carrier bridge transport. Only [`BridgeTransport::Fifos`] is supported
     /// on wasmtime-wasi 24+; kept as a `RwLock<BridgeTransport>` for symmetry
     /// with the existing setter/getter API and future transport variants.
     transport: std::sync::RwLock<BridgeTransport>,
+    execution_limits: WasmExecutionLimits,
 }
 
 impl WasmProvider {
@@ -177,18 +178,13 @@ impl WasmProvider {
     /// Create a new WASM provider with a custom data directory
     pub fn with_data_dir(data_dir: impl Into<PathBuf>) -> Self {
         Self {
-            engine: {
-                let mut config = Config::new();
-                // Enable epoch-based interruption so a runaway capsule can be trapped on demand
-                // (see `stop()` + `execute_wasm`). Cheap — just a load+compare at loop backedges.
-                config.epoch_interruption(true);
-                Engine::new(&config).expect("default wasmtime config is always valid")
-            },
             instances: Arc::new(RwLock::new(HashMap::new())),
             data_base_dir: data_dir.into(),
             bridge_spawner: std::sync::RwLock::new(None),
+            bridge_hostcall: std::sync::RwLock::new(None),
             bridge_principals: Arc::new(RwLock::new(HashMap::new())),
             transport: std::sync::RwLock::new(BridgeTransport::default()),
+            execution_limits: WasmExecutionLimits::default(),
         }
     }
 
@@ -200,6 +196,11 @@ impl WasmProvider {
     pub fn set_bridge_spawner(&self, spawner: BridgeSpawner) {
         let mut guard = self.bridge_spawner.write().unwrap();
         *guard = Some(spawner);
+    }
+
+    pub fn set_bridge_hostcall(&self, hostcall: BridgeHostcall) {
+        let mut guard = self.bridge_hostcall.write().unwrap();
+        *guard = Some(hostcall);
     }
 
     pub async fn set_bridge_principal(&self, capsule_id: &CapsuleId, principal_id: Option<String>) {
@@ -222,6 +223,13 @@ impl WasmProvider {
     /// Read the currently selected carrier bridge transport.
     pub fn bridge_transport(&self) -> BridgeTransport {
         *self.transport.read().unwrap()
+    }
+
+    fn engine() -> Result<Engine> {
+        let mut config = Config::new();
+        config.consume_fuel(true);
+        Engine::new(&config)
+            .map_err(|e| ElastosError::Compute(format!("Failed to configure WASM engine: {}", e)))
     }
 
     /// Get or create the data directory for a capsule
@@ -365,6 +373,7 @@ impl WasmProvider {
         capsule_id: &str,
         args: &[String],
         use_bridge: bool,
+        use_hostcall: bool,
         principal_id: Option<&str>,
     ) -> Result<WasiContextWithBridge> {
         let mut builder = WasiCtxBuilder::new();
@@ -386,7 +395,12 @@ impl WasmProvider {
         builder.env("ELASTOS_CAPSULE_NAME", &manifest.name);
         builder.env("ELASTOS_CAPSULE_ID", capsule_id);
 
-        // Tell the SDK where the carrier FIFOs live inside the sandbox.
+        // Tell the SDK which carrier bridge transport the runtime attached.
+        if use_hostcall {
+            builder.env("ELASTOS_CARRIER_HOSTCALL", "1");
+        }
+
+        // FIFO remains as a compatibility fallback for older guest SDKs.
         if use_bridge {
             builder.env(
                 "ELASTOS_CARRIER_FIFOS",
@@ -466,7 +480,7 @@ impl WasmProvider {
                 .preopened_dir(
                     &carrier_dir,
                     Self::CARRIER_GUEST_DIR,
-                    DirPerms::READ,
+                    DirPerms::READ | DirPerms::MUTATE,
                     FilePerms::READ | FilePerms::WRITE,
                 )
                 .map_err(|e| {
@@ -508,44 +522,115 @@ impl WasmProvider {
         (dir_perms, file_perms)
     }
 
+    fn register_carrier_hostcall(linker: &mut Linker<WasiState>) -> Result<()> {
+        linker
+            .func_wrap(
+                "elastos",
+                "carrier_call",
+                |mut caller: Caller<'_, WasiState>,
+                 request_ptr: u32,
+                 request_len: u32,
+                 response_ptr: u32,
+                 response_cap: u32,
+                 response_len_ptr: u32|
+                 -> i32 {
+                    let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory())
+                    else {
+                        return 1;
+                    };
+
+                    let request_start = request_ptr as usize;
+                    let request_len = request_len as usize;
+                    let response_start = response_ptr as usize;
+                    let response_cap = response_cap as usize;
+                    let response_len_start = response_len_ptr as usize;
+
+                    let data = memory.data(&caller);
+                    let Some(request_end) = request_start.checked_add(request_len) else {
+                        return 1;
+                    };
+                    if request_end > data.len() {
+                        return 1;
+                    }
+                    let request = match std::str::from_utf8(&data[request_start..request_end]) {
+                        Ok(value) => value,
+                        Err(_) => return 2,
+                    };
+
+                    let (hostcall, capsule_id, principal_id) = {
+                        let state = caller.data();
+                        (
+                            state.bridge_hostcall.clone(),
+                            state.capsule_id.clone(),
+                            state.principal_id.clone(),
+                        )
+                    };
+                    let Some(hostcall) = hostcall else {
+                        return 3;
+                    };
+
+                    let response = match hostcall(request, &capsule_id, principal_id.as_deref()) {
+                        Ok(response) => response,
+                        Err(_) => return 3,
+                    };
+                    let response_bytes = response.as_bytes();
+                    if response_bytes.len() > response_cap {
+                        return 4;
+                    }
+
+                    let Some(response_end) = response_start.checked_add(response_bytes.len())
+                    else {
+                        return 1;
+                    };
+                    let Some(response_len_end) =
+                        response_len_start.checked_add(std::mem::size_of::<u32>())
+                    else {
+                        return 1;
+                    };
+                    let data = memory.data_mut(&mut caller);
+                    if response_end > data.len() || response_len_end > data.len() {
+                        return 1;
+                    }
+                    data[response_start..response_end].copy_from_slice(response_bytes);
+                    data[response_len_start..response_len_end]
+                        .copy_from_slice(&(response_bytes.len() as u32).to_le_bytes());
+                    0
+                },
+            )
+            .map_err(|e| {
+                ElastosError::Compute(format!("Failed to link carrier hostcall: {}", e))
+            })?;
+        Ok(())
+    }
+
     /// Execute a WASM module with WASI preview1.
     fn execute_wasm(
         engine: &Engine,
         module: &Module,
         wasi: WasiP1Ctx,
-        declared_memory_mb: u32,
-        should_stop: Arc<AtomicBool>,
+        bridge_hostcall: Option<BridgeHostcall>,
+        capsule_id: String,
+        principal_id: Option<String>,
+        limits: WasmExecutionLimits,
     ) -> Result<()> {
         let mut store = Store::new(
             engine,
             WasiState {
                 wasi,
-                limits: capsule_store_limits(declared_memory_mb),
+                bridge_hostcall,
+                capsule_id,
+                principal_id,
+                limits: limits.store_limits(),
             },
         );
-        // Enforce the per-capsule resource budget: a capsule that tries to exceed its memory / table
-        // / instance caps fails closed (the allocation is denied) instead of exhausting the host —
-        // PRINCIPLE 7 (resource boundaries) + PRINCIPLE 11 (fail closed).
-        store.limiter(|state: &mut WasiState| &mut state.limits);
+        store.limiter(|state| &mut state.limits);
+        store
+            .set_fuel(limits.fuel)
+            .map_err(|e| ElastosError::Compute(format!("Failed to set WASM fuel: {}", e)))?;
 
-        // Terminability: arm an epoch deadline whose callback traps the capsule when `stop()` has set
-        // `should_stop` (and bumped the engine epoch). With no stop signal the deadline simply keeps
-        // extending, so a legitimate (even long-running) capsule runs untouched. This is the only way
-        // to halt a runaway, since the execution runs in a `spawn_blocking` task that can't be
-        // cancelled. The epoch check is a cheap load+compare at loop backedges.
-        store.set_epoch_deadline(1);
-        store.epoch_deadline_callback(move |_| {
-            if should_stop.load(Ordering::Relaxed) {
-                Err(wasmtime::Error::msg("capsule terminated by stop request"))
-            } else {
-                Ok(wasmtime::UpdateDeadline::Continue(1))
-            }
-        });
-
-        // Create linker and bind WASI preview1 host functions. wasmtime-wasi
-        // 24 split `add_to_linker` into preview1/preview2 variants; the
-        // synchronous preview1 binding lives at `preview1::add_to_linker_sync`.
+        // Create linker and bind WASI preview1 host functions.
         let mut linker = Linker::new(engine);
+        Self::register_carrier_hostcall(&mut linker)?;
         preview1::add_to_linker_sync(&mut linker, |state: &mut WasiState| &mut state.wasi)
             .map_err(|e| ElastosError::Compute(format!("Failed to link WASI: {}", e)))?;
 
@@ -606,21 +691,21 @@ impl ComputeProvider for WasmProvider {
             )));
         }
 
-        // Compile the module against the provider's SHARED engine (one engine across all capsules;
-        // it holds the compile context, never tenant heap — per-tenant data lives in each
-        // execution's Store, dropped per run, so multi-tenant clearing is unaffected).
-        let module = Module::from_file(&self.engine, &wasm_path)
+        let engine = Self::engine()?;
+
+        // Compile the module
+        let module = Module::from_file(&engine, &wasm_path)
             .map_err(|e| ElastosError::Compute(format!("Failed to compile WASM: {}", e)))?;
 
         let id = CapsuleId::new(format!("wasm-{}", uuid::Uuid::new_v4()));
 
         // Build WASI context to validate permissions early (no bridge for validation)
-        let (_, data_dir, _, _) = self.build_wasi_context(&manifest, &id.0, &[], false, None)?;
+        let (_, data_dir, _, _) =
+            self.build_wasi_context(&manifest, &id.0, &[], false, false, None)?;
 
         let instance = RunningInstance {
-            engine: self.engine.clone(),
+            engine,
             module,
-            should_stop: Arc::new(AtomicBool::new(false)),
             status: CapsuleStatus::Loading,
             manifest: manifest.clone(),
             _data_dir: data_dir,
@@ -640,7 +725,7 @@ impl ComputeProvider for WasmProvider {
 
     async fn start(&self, handle: &CapsuleHandle) -> Result<()> {
         // Get instance data
-        let (engine, module, manifest, should_stop) = {
+        let (engine, module, manifest, limits) = {
             let instances = self.instances.read().await;
             let instance = instances
                 .get(&handle.id)
@@ -650,7 +735,7 @@ impl ComputeProvider for WasmProvider {
                 instance.engine.clone(),
                 instance.module.clone(),
                 instance.manifest.clone(),
-                instance.should_stop.clone(),
+                self.execution_limits,
             )
         };
 
@@ -666,7 +751,9 @@ impl ComputeProvider for WasmProvider {
 
         // Check if bridge is configured
         let bridge_spawner = self.bridge_spawner.read().unwrap().clone();
-        let use_bridge = bridge_spawner.is_some();
+        let bridge_hostcall = self.bridge_hostcall.read().unwrap().clone();
+        let use_hostcall = bridge_hostcall.is_some();
+        let use_bridge = bridge_spawner.is_some() && !use_hostcall;
 
         // Build fresh WASI context for this execution (with args from handle)
         let args = handle.args.clone();
@@ -682,6 +769,7 @@ impl ComputeProvider for WasmProvider {
             &handle.id.0,
             &args,
             use_bridge,
+            use_hostcall,
             principal_id.as_deref(),
         )?;
 
@@ -700,16 +788,28 @@ impl ComputeProvider for WasmProvider {
             spawner(pipes);
         }
 
-        // The capsule's DECLARED memory budget (manifest `resources.memory_mb`) — honored here just
-        // as the crosvm provider already honors it, clamped to the host ceiling inside execute_wasm.
-        let declared_memory_mb = manifest.resources.memory_mb;
-
         // Execute in a blocking task since wasmtime execution is synchronous
+        let capsule_id = handle.id.0.clone();
         let result = tokio::task::spawn_blocking(move || {
-            Self::execute_wasm(&engine, &module, wasi, declared_memory_mb, should_stop)
-        })
-        .await
-        .map_err(|e| ElastosError::Compute(format!("Task join error: {}", e)))?;
+            Self::execute_wasm(
+                &engine,
+                &module,
+                wasi,
+                bridge_hostcall,
+                capsule_id,
+                principal_id,
+                limits,
+            )
+        });
+        let result = tokio::time::timeout(limits.wall_clock_timeout, result)
+            .await
+            .map_err(|_| {
+                ElastosError::Compute(format!(
+                    "WASM execution exceeded {}s deadline",
+                    limits.wall_clock_timeout.as_secs()
+                ))
+            })?
+            .map_err(|e| ElastosError::Compute(format!("Task join error: {}", e)))?;
 
         // Update status based on result
         {
@@ -730,16 +830,9 @@ impl ComputeProvider for WasmProvider {
         let mut instances = self.instances.write().await;
 
         if let Some(instance) = instances.remove(&handle.id) {
-            // Signal any in-flight execution to terminate: set the flag the capsule's epoch-deadline
-            // callback checks, then bump the engine epoch so a spinning capsule hits its next epoch
-            // check and traps. `instance` is the removed (owned) value, but its `should_stop` is an
-            // Arc shared with the running task, so the signal reaches it.
-            instance.should_stop.store(true, Ordering::Relaxed);
-            self.engine.increment_epoch();
-            // Dropping the RunningInstance releases THIS capsule's Module (its compiled code). The
-            // per-tenant WASM heap lived in the per-execution Store, already dropped when
-            // execute_wasm returned — so no residual tenant heap survives. The shared Engine
-            // persists (it holds no tenant data, only the JIT/compile context).
+            // Dropping the RunningInstance releases the wasmtime Engine, Module,
+            // and any compiled code buffers.  This is the primary memory-clearing
+            // step for multi-tenant safety — no residual WASM heap survives.
             tracing::info!("Stopped and cleared capsule '{}'", instance.manifest.name);
         }
 
@@ -788,103 +881,6 @@ mod tests {
         assert!(!provider.supports(&CapsuleType::Oci));
     }
 
-    /// PRINCIPLE 7 + 11: a capsule that exceeds its memory BUDGET must fail closed (the allocation is
-    /// denied) rather than exhaust the host. Proves the `StoreLimits` mechanism the provider wires
-    /// into every execution — a module wanting more linear memory than the cap cannot instantiate,
-    /// and the host survives (this test process keeps running).
-    #[test]
-    fn over_budget_capsule_fails_closed_not_host_exhaustion() {
-        let engine = Engine::default();
-        // A module declaring 4 pages (256 KiB) of initial linear memory.
-        let module = Module::new(&engine, r#"(module (memory 4))"#).expect("compile wat");
-        // A Store budgeted to ONE page (64 KiB) must REFUSE to instantiate it.
-        let limits = StoreLimitsBuilder::new().memory_size(64 * 1024).build();
-        let mut store = Store::new(
-            &engine,
-            WasiState {
-                wasi: WasiCtxBuilder::new().build_p1(),
-                limits,
-            },
-        );
-        store.limiter(|s: &mut WasiState| &mut s.limits);
-        let linker: Linker<WasiState> = Linker::new(&engine);
-        assert!(
-            linker.instantiate(&mut store, &module).is_err(),
-            "a capsule exceeding its memory budget must fail closed, not allocate"
-        );
-    }
-
-    /// The cap never penalizes legitimate use: a capsule WITHIN its budget instantiates normally.
-    #[test]
-    fn within_budget_capsule_instantiates() {
-        let engine = Engine::default();
-        let module = Module::new(&engine, r#"(module (memory 1))"#).expect("compile wat");
-        let limits = StoreLimitsBuilder::new().memory_size(1024 * 1024).build(); // 1 MiB budget
-        let mut store = Store::new(
-            &engine,
-            WasiState {
-                wasi: WasiCtxBuilder::new().build_p1(),
-                limits,
-            },
-        );
-        store.limiter(|s: &mut WasiState| &mut s.limits);
-        let linker: Linker<WasiState> = Linker::new(&engine);
-        assert!(linker.instantiate(&mut store, &module).is_ok());
-    }
-
-    /// B1: a capsule's DECLARED `memory_mb` is honored exactly (Principle 7 — granted, explicit), and
-    /// an absurd declaration is clamped to the host ceiling so it can never OOM the host.
-    #[test]
-    fn declared_memory_is_honored_and_clamped_to_ceiling() {
-        let mib = 1024 * 1024usize;
-        // The real capsules declare 16–128 MiB — honored exactly.
-        assert_eq!(effective_memory_bytes(128), 128 * mib);
-        assert_eq!(effective_memory_bytes(16), 16 * mib);
-        // An absurd declaration is clamped to the ceiling and never exceeds it.
-        let ceiling = wasm_memory_ceiling_mb() as usize;
-        assert_eq!(effective_memory_bytes(u32::MAX), ceiling * mib);
-        assert!(effective_memory_bytes(u32::MAX) <= ceiling * mib);
-    }
-
-    /// B2a: a runaway capsule MUST be terminable. With no stop signal the deadline keeps extending
-    /// (legitimate capsules run free); when `stop()` sets the flag and bumps the epoch, the capsule
-    /// traps on its next backedge. We run a busy-loop capsule, signal stop, and assert it terminates
-    /// promptly instead of running forever. The loop is finite (a CI-hang backstop): if termination
-    /// were broken, the `recv_timeout` fails the test in 5 s and the thread still ends on its own.
-    #[test]
-    fn runaway_capsule_is_terminable_via_stop_signal() {
-        let mut config = Config::new();
-        config.epoch_interruption(true);
-        let engine = Engine::new(&config).expect("config");
-        let module = Module::new(
-            &engine,
-            r#"(module (func (export "_start")
-                (local $i i64) (local.set $i (i64.const 2000000000))
-                (loop $l
-                    (local.set $i (i64.sub (local.get $i) (i64.const 1)))
-                    (br_if $l (i64.ne (local.get $i) (i64.const 0))))))"#,
-        )
-        .expect("compile wat");
-        let should_stop = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = std::sync::mpsc::channel();
-        let (ss, eng) = (should_stop.clone(), engine.clone());
-        std::thread::spawn(move || {
-            let r =
-                WasmProvider::execute_wasm(&eng, &module, WasiCtxBuilder::new().build_p1(), 64, ss);
-            let _ = tx.send(r.is_err());
-        });
-        std::thread::sleep(std::time::Duration::from_millis(50)); // let it start spinning
-        should_stop.store(true, Ordering::Relaxed);
-        engine.increment_epoch();
-        let trapped = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("a stopped runaway must terminate within 5s, not run forever");
-        assert!(
-            trapped,
-            "a stopped runaway must trap (Err), not complete normally"
-        );
-    }
-
     #[tokio::test]
     async fn test_bridge_spawner_piped_context() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -921,6 +917,82 @@ mod tests {
         // The setter still round-trips (idempotent self-assignment).
         provider.set_bridge_transport(BridgeTransport::Fifos);
         assert_eq!(provider.bridge_transport(), BridgeTransport::Fifos);
+    }
+
+    #[test]
+    fn test_wasm_engine_enables_fuel_accounting() {
+        let engine = WasmProvider::engine().expect("engine");
+        let mut store = Store::new(&engine, ());
+        store.set_fuel(1).expect("fuel must be enabled");
+    }
+
+    #[test]
+    fn test_execute_wasm_busy_loop_exhausts_fuel() {
+        let engine = WasmProvider::engine().expect("engine");
+        let module = Module::new(
+            &engine,
+            r#"
+            (module
+              (func (export "_start")
+                (loop $again
+                  br $again)))
+            "#,
+        )
+        .expect("busy-loop module");
+        let limits = WasmExecutionLimits {
+            fuel: 10_000,
+            ..WasmExecutionLimits::default()
+        };
+
+        let err = WasmProvider::execute_wasm(
+            &engine,
+            &module,
+            WasiCtxBuilder::new().build_p1(),
+            None,
+            "fuel-test".to_string(),
+            None,
+            limits,
+        )
+        .expect_err("busy-loop capsule must exhaust fuel");
+
+        assert!(
+            err.to_string().contains("fuel") || err.to_string().contains("WASM execution failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_execute_wasm_rejects_memory_above_limit() {
+        let engine = WasmProvider::engine().expect("engine");
+        let module = Module::new(
+            &engine,
+            r#"
+            (module
+              (memory 2)
+              (func (export "_start")))
+            "#,
+        )
+        .expect("memory module");
+        let limits = WasmExecutionLimits {
+            memory_size: 64 * 1024,
+            ..WasmExecutionLimits::default()
+        };
+
+        let err = WasmProvider::execute_wasm(
+            &engine,
+            &module,
+            WasiCtxBuilder::new().build_p1(),
+            None,
+            "memory-limit-test".to_string(),
+            None,
+            limits,
+        )
+        .expect_err("capsule memory must be limited");
+
+        assert!(
+            err.to_string().contains("instantiate") || err.to_string().contains("memory"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1106,7 +1178,6 @@ mod tests {
             let _instance = RunningInstance {
                 engine,
                 module,
-                should_stop: Arc::new(AtomicBool::new(false)),
                 status: CapsuleStatus::Stopped,
                 manifest: dummy_manifest,
                 _data_dir: None,

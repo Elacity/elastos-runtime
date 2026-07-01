@@ -8,6 +8,9 @@ Not for production or important workloads.
 
 ## Install
 
+The public installer is the current Linux `x86_64`/`aarch64` preview. macOS uses
+source-home staging for now; see [docs/MAC.md](docs/MAC.md).
+
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 # Core Home front door only
@@ -96,7 +99,7 @@ elastos room show
 elastos room pending
 elastos room approve
 elastos room open --addr 0.0.0.0:8090
-# then open http://127.0.0.1:8090/apps/chat-room/
+# then open http://localhost:8090/apps/chat-room/
 
 # Operator peer control
 elastos node info
@@ -128,6 +131,10 @@ Important:
 Direct `share`/`open` are current content-plane commands backed by `ipfs-provider` and `kubo`. They are not part of the default Carrier-only Home profile; the app-facing contract is `elastos://content/*`.
 
 Power-user paths such as `elastos run` require an explicit runtime and the correct working directory. See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for source builds, capsule development, and explicit runtime workflows.
+
+Current Apple silicon Mac staging is a source-home path, not the final public
+Mac installer. See [docs/MAC.md](docs/MAC.md) for the verified Mac setup from
+source checkout to `http://localhost:61180/apps/home/` and passkey sign-in.
 
 The interactive product contract is narrower than the full command surface:
 
@@ -208,7 +215,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
 
 Important Browser status: the Browser ABI and hosted proof path are real, but
 the final product browser is not complete. Stable arbitrary-site media, accepted
-provider selection, principal-scoped Browser profile persistence, and
+provider selection, protected/recoverable Browser profile storage, and
 cross-platform native/microVM adapters remain open. See
 [docs/BROWSER_CAPSULE.md](docs/BROWSER_CAPSULE.md)
 and [docs/BROWSER_PROVIDER_BAKEOFF.md](docs/BROWSER_PROVIDER_BAKEOFF.md).
@@ -247,10 +254,10 @@ Rust tests live in the `elastos/` workspace. Product and release proof scripts
 live under `scripts/`; they are listed in [scripts/README.md](scripts/README.md)
 and the release-facing checklist.
 
-For 0.3.0 branch review, do not treat a green workspace test as sufficient by
-itself. Use the relevant narrow provider/UI smokes from `TASKS.md` for the slice
-being reviewed, especially Wallet, System, Browser ABI/provider, Browser proof
-tools, and release/docs slices.
+For branch review, do not treat a green workspace test as sufficient by itself.
+Use the relevant narrow provider/UI smokes from `TASKS.md` for the slice being
+reviewed, especially Wallet, System, Browser ABI/provider, Browser proof tools,
+and release/docs slices.
 
 ## Documentation
 

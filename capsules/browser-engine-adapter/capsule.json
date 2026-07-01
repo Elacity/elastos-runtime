@@ -14,7 +14,7 @@
       {
         "resource": "elastos://browser-engine/*",
         "actions": ["read"],
-        "operations": ["status", "page_status", "screenshot", "frame"]
+        "operations": ["status", "page_status", "diagnostics"]
       },
       {
         "resource": "elastos://browser-engine/*",
@@ -26,6 +26,7 @@
       "browser_engine.status",
       "browser_engine.launch.denied",
       "browser_engine.stream.attach.denied",
+      "browser_engine.page.diagnostics",
       "browser_engine.page.close",
       "browser_engine.webrtc.signal"
     ]

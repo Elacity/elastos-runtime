@@ -15,8 +15,8 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, RawQuery, State};
 use axum::http::{
     header::{
-        ACCEPT_RANGES, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
-        CONTENT_TYPE, COOKIE, RANGE, SET_COOKIE,
+        ACCEPT_RANGES, AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH,
+        CONTENT_RANGE, CONTENT_TYPE, COOKIE, RANGE, SET_COOKIE,
     },
     HeaderMap, HeaderValue, StatusCode,
 };
@@ -27,7 +27,6 @@ use axum::response::{
 use axum::routing::{delete, get, post, put};
 use axum::Json;
 use axum::Router;
-use base64::Engine as _;
 use elastos_common::localhost::{
     edge_binding_path, edge_site_head_path, my_website_root_path, publisher_artifacts_path,
     publisher_install_script_path, publisher_release_head_path, publisher_release_manifest_path,
@@ -53,6 +52,8 @@ mod gateway_home_system;
 mod gateway_home_token;
 #[path = "gateway_inbox.rs"]
 mod gateway_inbox;
+#[path = "gateway_inspect_actions.rs"]
+mod gateway_inspect_actions;
 #[path = "gateway_marketplace.rs"]
 mod gateway_marketplace;
 #[path = "gateway_provider_proxy.rs"]
@@ -73,7 +74,7 @@ use gateway_home_runtime::*;
 pub(super) use gateway_home_runtime::{viewer_object_shell_description, viewer_object_shell_title};
 use gateway_home_system::*;
 pub(super) use gateway_home_token::{
-    home_launch_token_header, home_session_clear_cookie_header,
+    home_launch_auth_data_dir, home_launch_token_header, home_session_clear_cookie_header,
     home_session_cookie_header_for_token, issue_home_launch_token_for_auth_grant,
     issue_home_launch_token_with_context, require_fresh_passkey_home_token,
     require_home_launch_token, require_home_launch_token_context,
@@ -86,6 +87,7 @@ use gateway_home_token::{
     issue_home_launch_token, local_home_launch_token_context, uuid_like_token,
 };
 use gateway_inbox::*;
+use gateway_inspect_actions::*;
 use gateway_marketplace::*;
 use gateway_provider_proxy::*;
 use gateway_room::*;
@@ -102,6 +104,8 @@ use gateway_wallet::*;
 /// Maximum size for a single file fetched through the gateway (100 MB).
 const MAX_GATEWAY_FILE_SIZE: usize = 100 * 1024 * 1024;
 const LIBRARY_UPLOAD_CHUNK_MAX_BYTES: usize = 768 * 1024;
+const BROWSER_FILE_UPLOAD_BYTES: usize = 16 * 1024 * 1024;
+const BROWSER_INPUT_BODY_MAX_BYTES: usize = (BROWSER_FILE_UPLOAD_BYTES.div_ceil(3) * 4) + 64 * 1024;
 const GATEWAY_VERSION: &str = env!("ELASTOS_VERSION");
 const MANAGED_WALLET_CHAIN_NAMESPACES: &[&str] = &[
     "eip155:20",
@@ -118,6 +122,10 @@ const WALLET_PRICE_POLICY_FILE: &str = "price-policy.json";
 const WALLET_PRICE_HTTP_REQUEST_ID: &str = "wallet-prices";
 const WALLET_PRICE_HTTP_APPROVE_ACTION_ID: &str = "wallet-price-http-approve:coingecko";
 const WALLET_PRICE_HTTP_DENY_ACTION_PREFIX: &str = "wallet-price-http-deny:";
+pub(crate) const HOME_LAUNCH_TRUSTED_SIGNER_DID_ENV: &str =
+    "ELASTOS_HOME_LAUNCH_TRUSTED_SIGNER_DID";
+pub(crate) const HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV: &str =
+    "ELASTOS_HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR";
 const WALLET_PRICE_IDS: &[(&str, &str)] = &[
     ("BTC", "bitcoin"),
     ("ETH", "ethereum"),
@@ -138,6 +146,7 @@ const LIBRARY_CAPSULE_ID: &str = "library";
 const MARKETPLACE_CAPSULE_ID: &str = "marketplace";
 const INBOX_CAPSULE_ID: &str = "inbox";
 pub(crate) const BROWSER_CAPSULE_ID: &str = "browser";
+const SERVICES_CAPSULE_ID: &str = "services";
 pub(crate) const SYSTEM_CAPSULE_ID: &str = "system";
 const SYSTEM_ROUTE: &str = "/apps/system/";
 const CHAT_ROOM_CAPSULE_ID: &str = "chat-room";
@@ -432,11 +441,20 @@ pub fn gateway_router(state: GatewayState) -> Router {
             "/.well-known/elastos/site-head.json",
             get(serve_site_head_document),
         )
+        .route(
+            "/.well-known/elastos/carrier-bootstrap.json",
+            get(gateway_carrier_bootstrap),
+        )
+        .route("/api/carrier/bootstrap", get(gateway_carrier_bootstrap))
         .route("/artifacts/*path", get(serve_artifact_file))
         .route("/api/apps/system/summary", get(system_summary))
         .route(
             "/api/apps/system/identity/handle",
             post(system_handle_update),
+        )
+        .route(
+            "/api/apps/system/identity/profile-card",
+            post(system_profile_card_update),
         )
         .route(
             "/api/apps/system/appearance/background-image",
@@ -526,24 +544,29 @@ pub fn gateway_router(state: GatewayState) -> Router {
             post(gateway_browser::browser_app_open),
         )
         .route(
+            "/api/apps/browser/open/:open_id",
+            get(gateway_browser::browser_app_open_status),
+        )
+        .route(
+            "/api/apps/browser/profile/reset",
+            post(gateway_browser::browser_app_profile_reset),
+        )
+        .route(
             "/api/apps/browser/pages/:page_id/status",
             get(gateway_browser::browser_app_page_status),
+        )
+        .route(
+            "/api/apps/browser/pages/:page_id/diagnostics",
+            get(gateway_browser::browser_app_page_diagnostics),
         )
         .route(
             "/api/apps/browser/pages/:page_id/heartbeat",
             post(gateway_browser::browser_app_page_heartbeat),
         )
         .route(
-            "/api/apps/browser/pages/:page_id/screenshot",
-            get(gateway_browser::browser_app_page_screenshot),
-        )
-        .route(
-            "/api/apps/browser/pages/:page_id/frame",
-            get(gateway_browser::browser_app_page_frame),
-        )
-        .route(
             "/api/apps/browser/pages/:page_id/input",
-            post(gateway_browser::browser_app_page_input),
+            post(gateway_browser::browser_app_page_input)
+                .layer(DefaultBodyLimit::max(BROWSER_INPUT_BODY_MAX_BYTES)),
         )
         .route(
             "/api/apps/browser/pages/:page_id/close",
@@ -623,8 +646,39 @@ pub fn gateway_router(state: GatewayState) -> Router {
             post(capsule_interface_invoke),
         )
         .route("/api/apps/marketplace/catalog", get(marketplace_catalog))
+        .route("/api/apps/services/summary", get(services_summary))
+        .route("/api/apps/services/offers", post(services_offer_update))
         .route("/api/apps/inbox/summary", get(inbox_summary))
         .route("/api/apps/inbox/actions", post(inbox_action))
+        .route(
+            "/api/apps/people/invites/create",
+            post(people_invite_create),
+        )
+        .route(
+            "/api/apps/people/profile-card",
+            post(people_profile_card_update),
+        )
+        .route("/api/apps/people/discovery", post(people_discovery_update))
+        .route(
+            "/api/apps/people/discovery/refresh",
+            post(people_discovery_refresh),
+        )
+        .route(
+            "/api/apps/people/discovery/requests",
+            post(people_discovery_request_create),
+        )
+        .route(
+            "/api/apps/people/discovery/requests/:request_id/accept",
+            post(people_discovery_request_accept),
+        )
+        .route(
+            "/api/apps/people/discovery/requests/:request_id/join",
+            post(people_discovery_request_join),
+        )
+        .route(
+            "/api/apps/people/contacts/remove",
+            post(people_contact_remove),
+        )
         .route("/api/apps/chat-room/summary", get(chat_room_summary))
         .route(
             "/api/apps/chat-room/requests/:request_id/approve",
@@ -653,6 +707,22 @@ pub fn gateway_router(state: GatewayState) -> Router {
         .route(
             "/api/apps/chat-room/invites/revoke",
             post(chat_room_invite_revoke),
+        )
+        .route(
+            "/api/apps/chat-room/invites/create-link",
+            post(chat_room_join_invite_create),
+        )
+        .route(
+            "/api/apps/chat-room/invites/claim",
+            post(chat_room_join_invite_claim),
+        )
+        .route(
+            "/api/apps/chat-room/invites/acceptance",
+            post(chat_room_join_invite_acceptance),
+        )
+        .route(
+            "/api/apps/chat-room/invites/join",
+            post(chat_room_join_invite_join),
         )
         .route(
             "/api/apps/chat-room/session/start",
@@ -972,6 +1042,16 @@ async fn landing_page() -> Html<String> {
 include!("gateway_models.rs");
 
 fn load_existing_gateway_runtime_did(data_dir: &std::path::Path) -> Option<String> {
+    // Operator override first (0.5): an explicit trusted-signer DID via env wins, so a
+    // managed/remote runtime can pin WHO the trusted signer is without a local device key.
+    if let Some(did) = std::env::var_os(HOME_LAUNCH_TRUSTED_SIGNER_DID_ENV)
+        .and_then(|value| value.into_string().ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(did);
+    }
+
     // The gateway DID is deterministically derived from the on-disk device key
     // (SHA-256 over a fixed label || device_key) and is therefore boot-stable.
     // Per-request token verification calls this on every protected-asset fetch, so
@@ -1032,6 +1112,11 @@ fn gateway_internal_error(err: anyhow::Error) -> (StatusCode, Json<serde_json::V
 }
 
 fn gateway_provider_error_response(scheme: &str, err: anyhow::Error) -> Response {
+    let (status, text) = gateway_provider_error_tuple(scheme, err);
+    (status, text).into_response()
+}
+
+fn gateway_provider_error_tuple(scheme: &str, err: anyhow::Error) -> (StatusCode, String) {
     let text = err.to_string();
     let unavailable = format!("{scheme} provider unavailable");
     let forbidden = text.contains("home launch token")
@@ -1056,14 +1141,27 @@ fn gateway_provider_error_response(scheme: &str, err: anyhow::Error) -> Response
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     };
-    (status, text).into_response()
+    (status, text)
 }
 
 fn inbox_error_response(err: anyhow::Error) -> Response {
     let text = err.to_string();
-    let status = if text.contains("home launch token") || text.contains("fresh passkey") {
+    let status = if text.contains("home launch token")
+        || text.contains("fresh passkey")
+        || text.contains("auth session is not active")
+        || text.contains("auth session not found")
+        || text.contains("belongs to a different principal")
+    {
         StatusCode::FORBIDDEN
-    } else if text.contains("unknown inbox action") || text.contains("Open Wallet") {
+    } else if text.contains("service access request delivery failed") {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else if text.contains("unknown inbox action")
+        || text.contains("Open Wallet")
+        || text.contains("is not pending")
+        || text.contains("is no longer pending")
+        || text.contains("changed before Inbox approval")
+        || text.contains("service access request")
+    {
         StatusCode::BAD_REQUEST
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
@@ -1098,6 +1196,20 @@ fn home_error_response(err: anyhow::Error) -> Response {
     let text = err.to_string();
     let status = if text.contains("home launch token") || text.contains("gateway identity") {
         StatusCode::FORBIDDEN
+    } else if text.contains("service access request delivery failed: service offer")
+        || text.contains("service access request delivery failed: only Browser Exit")
+    {
+        StatusCode::BAD_REQUEST
+    } else if text.contains("people discovery delivery failed")
+        || text.contains("service access request delivery failed")
+    {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else if text.contains("service access request")
+        || text.contains("service offer")
+        || text.contains("provider grant")
+        || text.contains("configured remote Exit grants")
+    {
+        StatusCode::BAD_REQUEST
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     };

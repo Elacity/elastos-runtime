@@ -14,7 +14,7 @@
       {
         "resource": "elastos://exit/*",
         "actions": ["read"],
-        "operations": ["status"]
+        "operations": ["status", "discover_remote_carrier_exits"]
       },
       {
         "resource": "elastos://exit/*",
@@ -24,6 +24,7 @@
     ],
     "audit_events": [
       "exit.status",
+      "exit.remote_carrier.discovered",
       "exit.quote",
       "exit.open.denied",
       "exit.stream.reserved",

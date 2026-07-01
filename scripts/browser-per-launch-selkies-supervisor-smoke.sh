@@ -20,12 +20,9 @@ trap cleanup EXIT
 
 cd "$repo_root"
 
-service_home="${ELASTOS_BROWSER_SERVICE_HOME:-/home/wau/.local/share/elastos-public-gateway-live}"
+service_home="${ELASTOS_BROWSER_SERVICE_HOME:-$tmp_dir/service-home}"
 service_xdg_data_home="${ELASTOS_BROWSER_SERVICE_XDG_DATA_HOME:-$service_home/xdg-data}"
 browser_program="${ELASTOS_BROWSER_SELKIES_BROWSER_PROGRAM:-}"
-if [[ -z "$browser_program" && -x /home/wau/.cache/ms-playwright/chromium-1217/chrome-linux64/chrome ]]; then
-  browser_program="/home/wau/.cache/ms-playwright/chromium-1217/chrome-linux64/chrome"
-fi
 if [[ -z "$browser_program" || ! -x "$browser_program" ]]; then
   echo "ELASTOS_BROWSER_SELKIES_BROWSER_PROGRAM must point at an executable Chromium binary" >&2
   exit 2
@@ -38,14 +35,17 @@ CARGO_TARGET_DIR="$cargo_target_dir" cargo build --quiet --manifest-path elastos
 make_request() {
   local stream_id="$1"
   local url="$2"
-  node - "$stream_id" "$url" <<'NODE'
-const [streamId, url] = process.argv.slice(2);
+  local principal_id="$3"
+  node - "$stream_id" "$url" "$principal_id" <<'NODE'
+const [streamId, url, principalId] = process.argv.slice(2);
 console.log(JSON.stringify({
   schema: "elastos.browser.engine.launch-request/v1",
   adapter: "hosted-product",
   stream_id: streamId,
+  principal_id: principalId,
   engine: "selkies_gstreamer",
   display_mode: "webrtc_remote_display",
+  guarantee_level: "operator_rbi",
   network_mode: "runtime_net_only",
   direct_network: false,
   wallet_injection: false,
@@ -58,12 +58,14 @@ launch_session() {
   local name="$1"
   local stream_id="$2"
   local url="$3"
+  local principal_id="$4"
   local stdout_path="$tmp_dir/$name.stdout.json"
   local stderr_path="$tmp_dir/$name.stderr.log"
   (
     HOME="$service_home" \
     XDG_DATA_HOME="$service_xdg_data_home" \
-    ELASTOS_BROWSER_ENGINE_REQUEST="$(make_request "$stream_id" "$url")" \
+    ELASTOS_BROWSER_ENGINE_REQUEST="$(make_request "$stream_id" "$url" "$principal_id")" \
+    ELASTOS_BROWSER_PROFILE_ROOT="$tmp_dir/profiles" \
     ELASTOS_BROWSER_SELKIES_BROWSER_PROGRAM="$browser_program" \
     ELASTOS_BROWSER_SELKIES_CARGO_TARGET_DIR="$cargo_target_dir" \
     ELASTOS_BROWSER_SELKIES_TARGET_IMAGE="${ELASTOS_BROWSER_SELKIES_TARGET_IMAGE:-elastos/browser-selkies-runtime-target:dev}" \
@@ -74,15 +76,15 @@ launch_session() {
     ELASTOS_BROWSER_SELKIES_VIDEO_BITRATE="${ELASTOS_BROWSER_SELKIES_VIDEO_BITRATE:-16}" \
     ELASTOS_BROWSER_SELKIES_H264_CRF="${ELASTOS_BROWSER_SELKIES_H264_CRF:-23}" \
     ELASTOS_BROWSER_SELKIES_RESOLUTION_MODE="${ELASTOS_BROWSER_SELKIES_RESOLUTION_MODE:-dynamic}" \
-    ELASTOS_BROWSER_PER_LAUNCH_STARTUP_TIMEOUT_MS="${ELASTOS_BROWSER_PER_LAUNCH_STARTUP_TIMEOUT_MS:-240000}" \
+    ELASTOS_BROWSER_PER_LAUNCH_STARTUP_TIMEOUT_MS="${ELASTOS_BROWSER_PER_LAUNCH_STARTUP_TIMEOUT_MS:-90000}" \
     node scripts/browser-per-launch-selkies-supervisor.mjs
   ) >"$stdout_path" 2>"$stderr_path" &
   last_pid="$!"
 }
 
-launch_session a "stream:per-launch-smoke:a" "https://example.com/"
+launch_session a "stream:per-launch-smoke:a" "https://example.com/" "person:local:per-launch-smoke-a"
 pid_a="$last_pid"
-launch_session b "stream:per-launch-smoke:b" "https://example.org/"
+launch_session b "stream:per-launch-smoke:b" "https://example.org/" "person:local:per-launch-smoke-b"
 pid_b="$last_pid"
 
 wait "$pid_a" || {
@@ -101,12 +103,20 @@ pid_b=""
 node - "$tmp_dir/a.stdout.json" "$tmp_dir/b.stdout.json" <<'NODE'
 const fs = require("node:fs");
 const http = require("node:http");
+const path = require("node:path");
 const [aPath, bPath] = process.argv.slice(2);
 
 function readResult(file) {
   const raw = fs.readFileSync(file, "utf8").trim();
   if (!raw) throw new Error(`${file} is empty`);
   const line = raw.split(/\n/).filter(Boolean).at(-1);
+  return JSON.parse(line);
+}
+
+function readTargetReceipt(sessionDir) {
+  const raw = fs.readFileSync(`${sessionDir}/target.stdout.log`, "utf8").trim();
+  const line = raw.split(/\n/).filter(Boolean).findLast((entry) => entry.includes("elastos.browser.selkies-runtime-exit-target/v1"));
+  if (!line) throw new Error(`${sessionDir}/target.stdout.log did not include target receipt`);
   return JSON.parse(line);
 }
 
@@ -187,6 +197,14 @@ async function validateSession(result, expectedUrl) {
   assert(a.page_id !== b.page_id, "per-launch smoke returned duplicate page ids");
   assert(a.control_socket_path !== b.control_socket_path, "per-launch smoke reused a control socket");
   assert(a.isolation?.session_dir !== b.isolation?.session_dir, "per-launch smoke reused an isolation directory");
+  const targetA = readTargetReceipt(a.isolation.session_dir);
+  const targetB = readTargetReceipt(b.isolation.session_dir);
+  assert(targetA.profile_persistent === true, "first target did not report persistent profile");
+  assert(targetB.profile_persistent === true, "second target did not report persistent profile");
+  assert(targetA.profile_dir.startsWith(`${process.env.TMPDIR || "/tmp"}`) || targetA.profile_dir.includes("/profiles/"), "first target profile dir is not under smoke profile root");
+  assert(/^profile-[0-9a-f]{64}$/.test(path.basename(targetA.profile_dir)), "first target profile dir must use a full non-reversible profile key");
+  assert(/^profile-[0-9a-f]{64}$/.test(path.basename(targetB.profile_dir)), "second target profile dir must use a full non-reversible profile key");
+  assert(targetA.profile_dir !== targetB.profile_dir, "distinct smoke principals reused one Browser profile directory");
 
   await validateSession(a, "https://example.com/");
   await validateSession(b, "https://example.org/");

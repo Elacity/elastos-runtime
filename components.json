@@ -227,6 +227,13 @@
           "size": 0,
           "release_path": "shell-linux-arm64",
           "install_path": "bin/shell"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "sha256:dc364259e67025eec040cf8bccb59e80b687abfbe2f4f8ece1d6cd0fcac57c6d",
+          "size": 0,
+          "release_path": "shell-darwin-arm64",
+          "install_path": "bin/shell"
         }
       }
     },
@@ -246,6 +253,13 @@
           "checksum": "",
           "size": 0,
           "release_path": "localhost-provider-linux-arm64",
+          "install_path": "bin/localhost-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "sha256:3a1954c87c8f319700a4d995ea1c9ceb60062d953dc96329537c9c03d8f0bd64",
+          "size": 0,
+          "release_path": "localhost-provider-darwin-arm64",
           "install_path": "bin/localhost-provider"
         }
       }
@@ -267,6 +281,13 @@
           "size": 0,
           "release_path": "did-provider-linux-arm64",
           "install_path": "bin/did-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "sha256:2694472707f52f2aa4ef3d082a6e8542ec272b2efeed094a9fa074d2e94f9184",
+          "size": 721440,
+          "release_path": "did-provider-darwin-arm64",
+          "install_path": "bin/did-provider"
         }
       }
     },
@@ -286,6 +307,13 @@
           "checksum": "",
           "size": 0,
           "release_path": "chain-provider-linux-arm64",
+          "install_path": "bin/chain-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "chain-provider-darwin-arm64",
           "install_path": "bin/chain-provider"
         }
       }
@@ -307,6 +335,13 @@
           "size": 0,
           "release_path": "net-provider-linux-arm64",
           "install_path": "bin/net-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "net-provider-darwin-arm64",
+          "install_path": "bin/net-provider"
         }
       }
     },
@@ -327,6 +362,13 @@
           "size": 0,
           "release_path": "exit-provider-linux-arm64",
           "install_path": "bin/exit-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "exit-provider-darwin-arm64",
+          "install_path": "bin/exit-provider"
         }
       }
     },
@@ -336,8 +378,8 @@
       "platforms": {
         "linux-amd64": {
           "cid": "",
-          "checksum": "sha256:015cffd1c5d7f2ea2ec1dccfb1bfd6f59bcb376989dab014210998339ebda102",
-          "size": 901184,
+          "checksum": "sha256:935783283a55f4c09bdbd01b12ae24cef0fd4c710ba3cf859ab4e3262f900bde",
+          "size": 936792,
           "release_path": "browser-engine-adapter-linux-amd64",
           "install_path": "bin/browser-engine-adapter"
         },
@@ -346,6 +388,13 @@
           "checksum": "",
           "size": 0,
           "release_path": "browser-engine-adapter-linux-arm64",
+          "install_path": "bin/browser-engine-adapter"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "browser-engine-adapter-darwin-arm64",
           "install_path": "bin/browser-engine-adapter"
         }
       }
@@ -412,7 +461,7 @@
     },
     "browser-local-exit": {
       "install_path": "bin/browser-local-exit",
-      "description": "Linux Browser local Exit relay that dials allowlisted public TCP targets behind Runtime-owned Browser streams",
+      "description": "Browser local Exit relay that dials allowlisted public TCP targets behind Runtime-owned Browser streams",
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -427,6 +476,13 @@
           "size": 0,
           "release_path": "browser-local-exit-linux-arm64",
           "install_path": "bin/browser-local-exit"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "browser-local-exit-darwin-arm64",
+          "install_path": "bin/browser-local-exit"
         }
       }
     },
@@ -436,8 +492,8 @@
       "platforms": {
         "linux-amd64": {
           "cid": "",
-          "checksum": "sha256:c4171501996c2fa137b21569bdc19a85c18f72b80ddbca92d837ff5c80c9c05f",
-          "size": 2702312,
+          "checksum": "sha256:ae4e2f7815b78e0bf26f6263d0639f62f014b3be8154bbb84ca6865559b2c799",
+          "size": 2702344,
           "release_path": "wallet-provider-linux-amd64",
           "install_path": "bin/wallet-provider"
         },
@@ -446,6 +502,13 @@
           "checksum": "",
           "size": 0,
           "release_path": "wallet-provider-linux-arm64",
+          "install_path": "bin/wallet-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "sha256:fc2a851a17f2348b46ef2148b402f5a12eae871326c980d8145c4162e2077b5d",
+          "size": 2541472,
+          "release_path": "wallet-provider-darwin-arm64",
           "install_path": "bin/wallet-provider"
         }
       }
@@ -467,6 +530,13 @@
           "size": 0,
           "release_path": "object-provider-linux-arm64",
           "install_path": "bin/object-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "object-provider-darwin-arm64",
+          "install_path": "bin/object-provider"
         }
       }
     },
@@ -486,6 +556,13 @@
           "checksum": "",
           "size": 0,
           "release_path": "content-block-graph-provider-linux-arm64",
+          "install_path": "bin/content-block-graph-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "content-block-graph-provider-darwin-arm64",
           "install_path": "bin/content-block-graph-provider"
         }
       }
@@ -587,6 +664,13 @@
           "size": 0,
           "release_path": "webspace-provider-linux-arm64",
           "install_path": "bin/webspace-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "webspace-provider-darwin-arm64",
+          "install_path": "bin/webspace-provider"
         }
       }
     },
@@ -649,6 +733,20 @@
           "release_path": "system.tar.gz",
           "extract_path": "system",
           "install_path": "capsules/system"
+        }
+      }
+    },
+    "services": {
+      "install_path": "capsules/services",
+      "description": "Services capsule for runtime service offers and Browser Exit management",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "services.tar.gz",
+          "extract_path": "services",
+          "install_path": "capsules/services"
         }
       }
     },
@@ -775,6 +873,13 @@
           "size": 0,
           "release_path": "ipfs-provider-linux-arm64",
           "install_path": "bin/ipfs-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "ipfs-provider-darwin-arm64",
+          "install_path": "bin/ipfs-provider"
         }
       }
     },
@@ -877,6 +982,20 @@
           "release_path": "marketplace.tar.gz",
           "extract_path": "marketplace",
           "install_path": "capsules/marketplace"
+        }
+      }
+    },
+    "archive-manager": {
+      "install_path": "capsules/archive-manager",
+      "description": "Archive capsule for opening and creating ZIP archives from Library",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "archive-manager.tar.gz",
+          "extract_path": "archive-manager",
+          "install_path": "capsules/archive-manager"
         }
       }
     },
@@ -984,6 +1103,12 @@
           "checksum": "sha512:07a52fb63c37ac687ad41bc949f60e16856387d5d33ecf452771b5d992fa4fe2e659f383d267de69cd9755aa5751847aab66247b5cdeeaad7a06b780ece51cb7",
           "extract_path": "kubo/ipfs",
           "install_path": "bin/kubo"
+        },
+        "darwin-arm64": {
+          "url": "https://dist.ipfs.tech/kubo/v0.40.1/kubo_v0.40.1_darwin-arm64.tar.gz",
+          "checksum": "sha512:13b6d5dc04e661bfde6b8ba469bcf5b19d9d0062fe8ed50c7aadd8a078f500d0bceee4be7c9bfa476b48c4eb84c246ba083605ed1ed24d16b98e6cd0f09140bb",
+          "extract_path": "kubo/ipfs",
+          "install_path": "bin/kubo"
         }
       }
     },
@@ -1063,6 +1188,7 @@
         "shell",
         "localhost-provider",
         "did-provider",
+        "chain-provider",
         "net-provider",
         "exit-provider",
         "browser-engine-adapter",
@@ -1071,10 +1197,11 @@
         "browser-stream-bridge",
         "browser-local-exit",
         "webspace-provider",
-        "object-provider",
+        "wallet-provider",
         "home-cli",
         "home",
         "system",
+        "services",
         "wallet-metamask",
         "wallet-unisat",
         "wallet-walletconnect",
@@ -1085,6 +1212,7 @@
         "documents",
         "library",
         "marketplace",
+        "archive-manager",
         "inbox"
       ]
     },
@@ -1094,6 +1222,7 @@
         "shell",
         "localhost-provider",
         "did-provider",
+        "chain-provider",
         "net-provider",
         "exit-provider",
         "browser-engine-adapter",
@@ -1102,10 +1231,11 @@
         "browser-stream-bridge",
         "browser-local-exit",
         "webspace-provider",
-        "object-provider",
+        "wallet-provider",
         "home-cli",
         "home",
         "system",
+        "services",
         "wallet-metamask",
         "wallet-unisat",
         "wallet-walletconnect",
@@ -1126,6 +1256,7 @@
         "documents",
         "library",
         "marketplace",
+        "archive-manager",
         "inbox"
       ]
     },
@@ -1168,6 +1299,7 @@
         "shell",
         "localhost-provider",
         "did-provider",
+        "chain-provider",
         "net-provider",
         "exit-provider",
         "browser-engine-adapter",
@@ -1176,10 +1308,11 @@
         "browser-stream-bridge",
         "browser-local-exit",
         "webspace-provider",
-        "object-provider",
+        "wallet-provider",
         "home-cli",
         "home",
         "system",
+        "services",
         "wallet-metamask",
         "wallet-unisat",
         "wallet-walletconnect",
@@ -1192,6 +1325,7 @@
         "documents",
         "library",
         "marketplace",
+        "archive-manager",
         "inbox",
         "llama-server",
         "model-qwen3.5-0.8b"
@@ -1213,10 +1347,10 @@
         "browser-stream-bridge",
         "browser-local-exit",
         "wallet-provider",
-        "object-provider",
         "home-cli",
         "home",
         "system",
+        "services",
         "wallet-metamask",
         "wallet-unisat",
         "wallet-walletconnect",
@@ -1232,6 +1366,7 @@
         "documents",
         "library",
         "marketplace",
+        "archive-manager",
         "inbox",
         "cloudflared"
       ]
@@ -1258,10 +1393,10 @@
         "rights-provider",
         "key-provider",
         "decrypt-provider",
-        "object-provider",
         "home-cli",
         "home",
         "system",
+        "services",
         "wallet-metamask",
         "wallet-unisat",
         "wallet-walletconnect",
@@ -1279,6 +1414,7 @@
         "documents",
         "library",
         "marketplace",
+        "archive-manager",
         "inbox",
         "crosvm",
         "vmlinux",

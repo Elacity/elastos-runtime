@@ -1347,7 +1347,7 @@ pub(crate) fn encode_bridge_capability_token(
     token.to_base64().unwrap_or_default()
 }
 
-async fn handle_remote_request(
+pub async fn handle_remote_request(
     line: &str,
     api_url: &str,
     client_token: &str,

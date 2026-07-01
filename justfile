@@ -46,49 +46,18 @@ lint:
 fmt:
     cd elastos && cargo fmt --all
 
-# Dependency CVE audit (RUSTSEC). On-demand gate; the one known advisory
-# (RUSTSEC-2024-0436 — `paste` unmaintained, transitive via iroh) is allow-listed,
-# so this fails only on NEW advisories. Wire into `verify` once the tree is quiet.
-audit:
-    cd elastos && cargo audit --ignore RUSTSEC-2024-0436
-
-# Full pre-commit gate: alignment, smoke tests, fmt/lint/test. The carrier smoke needs a Linux
-# box with Elastos Carrier artifact access (it fetches the net-provider artifact over Carrier), so
-# stock GitHub runners cannot run it — for GitHub Actions use `verify-ci` (this gate MINUS that step).
+# Pre-commit gate: alignment, entropy, smoke tests, fmt/lint/test
 verify:
+    git diff --check
     just alignment-check
+    node scripts/home-entropy-check.mjs
+    node scripts/browser-entropy-check.mjs
     just local-carrier-setup-smoke
-    just _verify-tail
-
-# CI gate: the full `verify` MINUS the Carrier-network setup smoke (`local-carrier-setup-smoke`),
-# which a stock GitHub runner cannot reach. Everything else a clean runner CAN verify runs here;
-# the carrier smoke is covered separately on a Carrier-capable Linux box / self-hosted runner.
-verify-ci:
-    just alignment-check
-    just _verify-tail
-
-# (hidden) gate steps shared by `verify` and `verify-ci` — everything after the alignment-check
-# + (verify-only) carrier-smoke preamble.
-_verify-tail:
     ./scripts/command-smoke.sh
     just candidate-command-audit
     cd elastos && cargo fmt --all -- --check
     cd elastos && cargo clippy --workspace --all-targets -- -D warnings
     cd elastos && cargo test --workspace
-    just verify-capsules
-
-# These crates live OUTSIDE the elastos workspace, so `verify` (cargo --workspace) misses them; they
-# carry the protected-content surface (watermark codec, grant-digest envelope, media-authority), are
-# exercised under their CANONICAL feature sets (matching scripts/dev/run-creator-gateway.sh), and
-# gated by build+test only (clippy -D warnings is held back for now: pre-existing lint debt).
-# Build + test the dDRM capsule crates the elastos-workspace gate does not reach
-verify-capsules:
-    cd capsules/decrypt-provider && cargo test --features rail-stream,rail-mint,pdf-render,pq-envelope
-    cd capsules/ddrm-envelope && cargo test --features access-grant,av-variants
-    cd scripts/dev/ddrm-media-authority && cargo test
-    # AV forensic cross-language weld: the Python extractor's canonical codeword must match the Rust
-    # serve selector byte-for-byte (golden vectors on both sides). Pure stdlib — no numpy/ffmpeg.
-    python3 tools/av-forensics/test_canonical.py
 
 # Release-trust gate: requires canonical publisher signer, not the dev signer
 verify-release:

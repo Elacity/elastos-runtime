@@ -29,6 +29,32 @@ containment audit.
 - Known **non-regressions** to allowlist for reviewers: 6 Mac `SUN_LEN` (PR #3), ~3 macOS-arch checksum, ENV-1 aarch64 clippy.
 - Review bar (from PR #3): Linux CI green · hunk-level review of `carrier_bridge.rs`/`supervisor.rs`/`vm_provider.rs` · reviewer Anders.
 
+## 0.5 integration (branch `flint-0.5`) — 2026-07-01
+Merged the teammate's **0.5.0** release (People/Services/Browser-VM/WebRTC; `2b220be`) into our
+`flint` foundation (intent-proof loop, standing grants, spend meter, ESP). 39 conflicts resolved;
+full-workspace `cargo test --workspace --lib` **green** (runtime 382 · server 1022 · others all
+pass), ESP `npm test` **green** (89), `cargo build --workspace` clean (**0 warnings**).
+
+**Test-gate reconciliations (all root-caused, not silenced):**
+- `browser_engine_resource` gained the 0.5 `diagnostics` op; provider-proxy re-grafts 0.5's
+  runtime-metadata guard + the `net/stream → 410 Gone` and `inspect/request_act` branches.
+- `required_action_for` classifies the new `diagnostics`/`discover_remote_carrier_exits` reads;
+  the `browser-engine-adapter` + `exit-provider` manifests are restored to the flint `read`/`execute`
+  capability split (0.5 had flattened them to `read/write`, breaking the preview==enforce honesty
+  ledger and downgrading actuation/egress ops).
+- Catalog affordance test made hermetic (it had assumed `DEV_CAPSULES_ROOT` declares no interfaces;
+  our dev capsules legitimately do).
+- The room-service permission-injection test now skips under `euid==0` (root bypasses `0o500`).
+
+**Tracked degradations (deferred, honestly not hidden — follow-up chunks on this base):**
+1. WASM/carrier **spend-metering act-path wiring** (`spend_policy: None` at the two `BridgeContext`
+   sites in `runtime.rs`). The `SpendMeter` primitive + inspector projection are intact.
+2. 0.5's **approved-provider dispatch registry support** (`inspect_provider::with_registry` is a
+   passthrough); the `inspect/request_act` HTTP surface is wired and functional (plan+pending record),
+   but registry-backed act execution is not yet re-grafted.
+3. Dropped-in-merge tests to re-add: carrier_bridge read-token-write-denial preaudit, library mime,
+   our `verified_signer` unit tests.
+
 ## Tier 1 — the macOS shell (CORRECTED — functional today)
 - ✅ **macOS shell WORKS today** — providers run as **native arm64 subprocesses** via `ELASTOS_<NAME>_BIN`;
   one command: `ELASTOS_DKMS_CARRIER=1 scripts/dev/run-creator-gateway.sh`. **No VZ, no Linux box.** (Receipt: `5eb3dee`.)

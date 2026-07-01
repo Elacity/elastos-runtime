@@ -262,6 +262,9 @@ fn map_validation_error(err: &ValidationError) -> (StatusCode, String) {
         ValidationError::ClassificationExceeded { .. } => {
             (StatusCode::FORBIDDEN, "token_classification_insufficient")
         }
+        ValidationError::ClassificationUnavailable { .. } => {
+            (StatusCode::FORBIDDEN, "token_classification_unavailable")
+        }
         ValidationError::DelegationNotAllowed => {
             (StatusCode::FORBIDDEN, "token_delegation_not_allowed")
         }

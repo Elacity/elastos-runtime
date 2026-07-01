@@ -86,6 +86,9 @@ pub fn required_action_for(op: &str) -> Action {
         | "export_graph"
         | "prepare_publish"
         | "health"
+        // 0.5 browser-engine + exit-provider observation ops (manifest declares `read`):
+        | "diagnostics"
+        | "discover_remote_carrier_exits"
         | "list_models" => Action::Read,
         // ---- Write: creates/changes state but does not destroy --------------------------------
         "write"
@@ -345,6 +348,7 @@ fn browser_engine_resource(op: &str) -> Result<String, String> {
         "attach_stream" => Ok("elastos://browser-engine/attach_stream".to_string()),
         "close_page" => Ok("elastos://browser-engine/close_page".to_string()),
         "page_status" => Ok("elastos://browser-engine/page/status".to_string()),
+        "diagnostics" => Ok("elastos://browser-engine/page/diagnostics".to_string()),
         "frame" => Ok("elastos://browser-engine/page/frame".to_string()),
         "screenshot" => Ok("elastos://browser-engine/page/screenshot".to_string()),
         "input" => Ok("elastos://browser-engine/page/input".to_string()),

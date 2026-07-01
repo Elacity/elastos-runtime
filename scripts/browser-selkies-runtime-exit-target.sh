@@ -34,6 +34,7 @@ Options:
   --target-image <image>                   Prebuilt Selkies Runtime target image
   --local-exit-bin /path/to/browser-local-exit
   --native-proxy-bin /path/to/browser-native-proxy-engine
+  --profile-dir /path/to/profile           Persistent Chromium profile directory
   --verify-url <url>                       Default: https://example.com/
   --verify                                Verify page load + product display, then keep running
   --cleanup-after-verify                  With --verify, stop everything after successful verification
@@ -67,6 +68,7 @@ selkies_display="${ELASTOS_BROWSER_SELKIES_DISPLAY:-:$((40 + ($$ % 50)))}"
 target_image=""
 local_exit_bin="${ELASTOS_BROWSER_LOCAL_EXIT_BIN:-}"
 native_proxy_bin="${ELASTOS_BROWSER_NATIVE_PROXY_BIN:-}"
+profile_dir=""
 verify_url="https://example.com/"
 verify=0
 cleanup_after_verify=0
@@ -156,6 +158,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --native-proxy-bin)
       native_proxy_bin="${2:-}"
+      shift 2
+      ;;
+    --profile-dir)
+      profile_dir="${2:-}"
       shift 2
       ;;
     --verify-url)
@@ -290,6 +296,21 @@ fi
 selkies_display_number="${selkies_display#:}"
 
 out_dir="$(mkdir -p "$out_dir" && cd "$out_dir" && pwd)"
+if [[ -z "$profile_dir" ]]; then
+  profile_dir="$out_dir/chromium-profile"
+fi
+if [[ "$profile_dir" != /* || "$profile_dir" =~ [$'\r\n\0'] ]]; then
+  echo "--profile-dir must be an absolute path without control characters" >&2
+  exit 2
+fi
+profile_dir="$(mkdir -p "$profile_dir" && cd "$profile_dir" && pwd)"
+chmod 700 "$profile_dir" >/dev/null 2>&1 || true
+profile_lock_file="$profile_dir/.elastos-profile.lock"
+exec 8>"$profile_lock_file"
+if ! flock -n 8; then
+  echo "Browser profile is already active in another Runtime Browser session: $profile_dir" >&2
+  exit 1
+fi
 lock_file="$out_dir/.target.lock"
 exec 9>"$lock_file"
 if ! flock -n 9; then
@@ -299,30 +320,43 @@ fi
 cargo_target_dir="${ELASTOS_BROWSER_SELKIES_CARGO_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/elastos/browser-selkies-cargo-target}"
 mkdir -p "$cargo_target_dir"
 if [[ -z "$local_exit_bin" ]]; then
-  local_exit_bin="$cargo_target_dir/debug/browser-local-exit"
+  if [[ -x "$repo_root/bin/browser-local-exit" ]]; then
+    local_exit_bin="$repo_root/bin/browser-local-exit"
+  else
+    local_exit_bin="$cargo_target_dir/debug/browser-local-exit"
+  fi
 fi
 if [[ -z "$native_proxy_bin" ]]; then
-  native_proxy_bin="$cargo_target_dir/debug/browser-native-proxy-engine"
+  if [[ -x "$repo_root/bin/browser-native-proxy-engine" ]]; then
+    native_proxy_bin="$repo_root/bin/browser-native-proxy-engine"
+  else
+    native_proxy_bin="$cargo_target_dir/debug/browser-native-proxy-engine"
+  fi
 fi
 relay_socket="$out_dir/local-exit.sock"
 control_socket="$out_dir/selkies-control.sock"
 local_exit_log="$out_dir/local-exit.out"
 local_exit_err="$out_dir/local-exit.err"
 control_log="$out_dir/selkies-control.log"
+container_profile_dir="/var/lib/elastos-browser-profile"
 container_name="elastos-selkies-runtime-exit-target-$$"
 wheel_container=""
 local_exit_pid=""
 control_pid=""
 terminating=0
 
+dump_diagnostics() {
+  echo "Selkies Runtime Exit target diagnostics follow" >&2
+  docker ps --filter name="$container_name" >&2 || true
+  docker logs --tail 120 "$container_name" >&2 || true
+  docker exec "$container_name" bash -lc 'tail -220 /tmp/selkies-current.log /tmp/native-proxy-engine.log /tmp/chromium-current.log /tmp/Xvfb-current.log /tmp/pipewire-current.log /tmp/pipewire-pulse-current.log /tmp/wireplumber-current.log /tmp/selkies-install.log 2>/dev/null || true' >&2 || true
+  sed -n '1,180p' "$local_exit_log" "$local_exit_err" "$control_log" 2>/dev/null >&2 || true
+}
+
 cleanup() {
   local status="$?"
   if [[ "$status" != "0" && "$terminating" != "1" ]]; then
-    echo "Selkies Runtime Exit target failed; diagnostics follow" >&2
-    docker ps --filter name="$container_name" >&2 || true
-    docker logs --tail 120 "$container_name" >&2 || true
-    docker exec "$container_name" bash -lc 'tail -220 /tmp/selkies-current.log /tmp/native-proxy-engine.log /tmp/chromium-current.log /tmp/Xvfb-current.log /tmp/pipewire-current.log /tmp/pipewire-pulse-current.log /tmp/wireplumber-current.log /tmp/selkies-install.log 2>/dev/null || true' >&2 || true
-    sed -n '1,180p' "$local_exit_log" "$local_exit_err" "$control_log" 2>/dev/null >&2 || true
+    dump_diagnostics
   fi
   if [[ -n "$control_pid" ]]; then
     kill "$control_pid" >/dev/null 2>&1 || true
@@ -336,7 +370,7 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
-trap 'terminating=1; exit 143' TERM INT
+trap 'if [[ "${ELASTOS_BROWSER_DUMP_DIAGNOSTICS_ON_TERM:-0}" == "1" ]]; then dump_diagnostics; fi; terminating=1; exit 143' TERM INT
 
 if [[ ! -x "$local_exit_bin" || ! -x "$native_proxy_bin" ]]; then
   cargo_bin="${CARGO:-}"
@@ -423,6 +457,7 @@ docker run --rm -d \
   "${wheel_mount_args[@]}" \
   -v "$browser_dir:/opt/elastos-chromium:ro" \
   -v "$native_proxy_bin:/opt/elastos-browser-native-proxy-engine:ro" \
+  -v "$profile_dir:$container_profile_dir" \
   --entrypoint bash \
   "$docker_image" \
   -lc "
@@ -434,7 +469,7 @@ export PIPEWIRE_RUNTIME_DIR=\$XDG_RUNTIME_DIR
 export PULSE_RUNTIME_PATH=\$XDG_RUNTIME_DIR/pulse
 export PULSE_SERVER=unix:\$PULSE_RUNTIME_PATH/native
 export ELASTOS_SELKIES_INITIAL_RESOLUTION=${selkies_width}x${selkies_height}
-mkdir -p \"\$XDG_RUNTIME_DIR\" \"\$PULSE_RUNTIME_PATH\" /tmp/chromium-profile
+mkdir -p \"\$XDG_RUNTIME_DIR\" \"\$PULSE_RUNTIME_PATH\" \"$container_profile_dir\"
 mkdir -p /tmp/.X11-unix
 chmod 1777 /tmp/.X11-unix
 rm -f /tmp/.X11-unix/X$selkies_display_number /tmp/.X$selkies_display_number-lock
@@ -477,7 +512,7 @@ ELASTOS_BROWSER_NATIVE_PROXY_ENGINE_CONFIG='{
     \"--window-size=$selkies_width,$selkies_height\",
     \"--force-device-scale-factor=1.5\",
     \"--app=about:blank\",
-    \"--user-data-dir=/tmp/chromium-profile\",
+    \"--user-data-dir=$container_profile_dir\",
     \"--remote-debugging-address=127.0.0.1\",
     \"--remote-debugging-port=$cdp_port\"
   ]
@@ -645,6 +680,7 @@ NODE
     --url "$verify_url" >/dev/null
 fi
 
+profile_dir_json="$(node -e 'process.stdout.write(JSON.stringify(process.argv[1]))' "$profile_dir")"
 node - <<NODE
 console.log(JSON.stringify({
   ok: true,
@@ -663,6 +699,8 @@ console.log(JSON.stringify({
   video: true,
   direct_network: false,
   runtime_exit: true,
+  profile_persistent: true,
+  profile_dir: $profile_dir_json,
   ice_servers_configured: Boolean($([[ ${#ice_servers[@]} -gt 0 ]] && echo true || echo false)),
   selkies_encoder: "$selkies_encoder",
   selkies_framerate: Number("$selkies_framerate"),

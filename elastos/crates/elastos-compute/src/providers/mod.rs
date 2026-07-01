@@ -2,4 +2,4 @@
 
 mod wasm;
 
-pub use wasm::{BridgePipes, BridgeSpawner, WasmProvider};
+pub use wasm::{BridgeHostcall, BridgePipes, BridgeSpawner, WasmProvider};

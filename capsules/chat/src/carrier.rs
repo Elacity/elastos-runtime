@@ -62,7 +62,6 @@ pub fn save_json<T: Serialize>(storage_token: &str, path: &str, value: &T) -> Re
     let rooted_uri = rooted_chat_uri(path);
     let body = serde_json::json!({
         "path": rooted_uri,
-        "token": storage_token,
         "content": json.as_bytes(),
         "append": false,
     });
@@ -73,7 +72,7 @@ pub fn save_json<T: Serialize>(storage_token: &str, path: &str, value: &T) -> Re
 /// Load a JSON value from storage.
 pub fn load_json<T: DeserializeOwned>(storage_token: &str, path: &str) -> Result<Option<T>> {
     let rooted_uri = rooted_chat_uri(path);
-    let body = serde_json::json!({ "path": rooted_uri, "token": storage_token });
+    let body = serde_json::json!({ "path": rooted_uri });
     let result = carrier_invoke(storage_token, &rooted_uri, "read", &body)?;
 
     if let Some(data) = result.get("data").and_then(|d| d.get("data")) {

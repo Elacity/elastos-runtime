@@ -20,6 +20,28 @@ principal/session/object/action fields, an allowed
 principal/session/object/action, supported schemes, and PQ-hybrid algorithm
 metadata, then refuses backend work until an ElastOS dKMS adapter exists.
 
+## Decrypt Handoff
+
+`key-provider` owns key-release validation and dKMS authority, but app and viewer
+capsules must never receive raw CEKs. The next live decrypt integration should
+seal decrypt material to a one-time public key generated for the decrypt
+session:
+
+- `decrypt-provider` supplies a one-time decrypt-session public key.
+- `key-provider` or the dKMS release backend seals the CEK/material to that key
+  using the approved PQ-hybrid envelope profile.
+- the release receipt remains a receipt; it is not a key carrier.
+- the sealed material is handed to the decrypt session and can only be unwrapped
+  inside that decrypt sandbox.
+
+Prefer direct dKMS sealing to the decrypt-session key. A key-provider re-seal is
+acceptable only as a migration step if it remains provider-internal, signed,
+auditable, and short-lived. Lit/Chipotle can be one compatibility backend behind
+this provider, but it must not define the Runtime contract or become the only
+key-release dependency. The independent target is an ElastOS-native PQ-hybrid
+threshold dKMS that can produce the same backend-neutral sealed material
+handoff.
+
 ## Capability Schema
 
 | Scope | Resource |

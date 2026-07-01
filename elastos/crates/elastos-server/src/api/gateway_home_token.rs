@@ -301,6 +301,33 @@ fn require_home_launch_token_for_any_from(
     allowed_apps: &[&str],
     cookie_name: Option<&str>,
 ) -> anyhow::Result<RequiredHomeLaunchToken> {
+    if home_launch_token_header(headers)
+        .or_else(|| cookie_name.and_then(|name| cookie_value_from_headers(headers, name)))
+        .is_none()
+    {
+        anyhow::bail!("missing home launch token");
+    }
+    let expected_did = load_existing_gateway_runtime_did(data_dir)
+        .ok_or_else(|| anyhow::anyhow!("gateway identity is unavailable"))?;
+    let auth_data_dir = home_launch_auth_data_dir(data_dir);
+    require_home_launch_token_for_any_from_expected_did(
+        data_dir,
+        headers,
+        allowed_apps,
+        cookie_name,
+        expected_did,
+        &auth_data_dir,
+    )
+}
+
+fn require_home_launch_token_for_any_from_expected_did(
+    _data_dir: &std::path::Path,
+    headers: &HeaderMap,
+    allowed_apps: &[&str],
+    cookie_name: Option<&str>,
+    expected_did: String,
+    auth_data_dir: &std::path::Path,
+) -> anyhow::Result<RequiredHomeLaunchToken> {
     let token = home_launch_token_header(headers)
         .or_else(|| cookie_name.and_then(|name| cookie_value_from_headers(headers, name)))
         .ok_or_else(|| anyhow::anyhow!("missing home launch token"))?;
@@ -312,9 +339,7 @@ fn require_home_launch_token_for_any_from(
     if envelope.payload.schema != "elastos.home.launch-token/v2" {
         anyhow::bail!("unsupported home launch token schema");
     }
-    let local_did = load_existing_gateway_runtime_did(data_dir)
-        .ok_or_else(|| anyhow::anyhow!("gateway identity is unavailable"))?;
-    let expected_dids = vec![local_did];
+    let expected_dids = vec![expected_did];
     crate::crypto::verify_signed_json_envelope_against_dids(
         &bytes,
         HOME_LAUNCH_TOKEN_DOMAIN,
@@ -337,7 +362,11 @@ fn require_home_launch_token_for_any_from(
         anyhow::bail!("home launch token is missing authority context");
     }
     if envelope.payload.proof_binding_id.is_some()
-        && !crate::auth::is_auth_session_active(data_dir, &envelope.payload.session_id, now_ts())?
+        && !crate::auth::is_auth_session_active(
+            auth_data_dir,
+            &envelope.payload.session_id,
+            now_ts(),
+        )?
     {
         anyhow::bail!("home launch token auth session is not active");
     }
@@ -350,4 +379,131 @@ fn require_home_launch_token_for_any_from(
             grant_id: envelope.payload.grant_id,
         },
     })
+}
+
+pub(crate) fn home_launch_auth_data_dir(data_dir: &std::path::Path) -> PathBuf {
+    std::env::var_os(HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV)
+        .and_then(|value| {
+            let value = value.into_string().ok()?;
+            let value = value.trim();
+            if value.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(value))
+            }
+        })
+        .unwrap_or_else(|| data_dir.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_grant_accepts_explicit_parent_gateway_signer() {
+        let parent = tempfile::tempdir().unwrap();
+        let child = tempfile::tempdir().unwrap();
+        let (_parent_key, parent_did) =
+            elastos_identity::load_or_create_did(parent.path()).unwrap();
+        let (_child_key, child_did) = elastos_identity::load_or_create_did(child.path()).unwrap();
+        assert_ne!(parent_did, child_did);
+
+        let context = HomeLaunchTokenContext {
+            principal_id: "person:local:alice".to_string(),
+            session_id: "session:alice".to_string(),
+            proof_binding_id: None,
+            grant_id: "grant:alice".to_string(),
+        };
+        let token =
+            issue_home_launch_token_with_context(parent.path(), "marketplace", &context).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-elastos-home-token", token.parse().unwrap());
+
+        let child_result = require_home_launch_token_for_any_from_expected_did(
+            child.path(),
+            &headers,
+            &["marketplace"],
+            None,
+            child_did,
+            child.path(),
+        );
+        match child_result {
+            Ok(_) => panic!("child runtime DID should not verify parent gateway grant"),
+            Err(err) => assert!(err.to_string().contains("Signer DID mismatch")),
+        }
+
+        let parent_result = require_home_launch_token_for_any_from_expected_did(
+            child.path(),
+            &headers,
+            &["marketplace"],
+            None,
+            parent_did,
+            child.path(),
+        )
+        .unwrap();
+        assert_eq!(parent_result.context.principal_id, "person:local:alice");
+    }
+
+    #[test]
+    fn launch_grant_checks_parent_auth_sessions_for_child_runtime() {
+        let parent = tempfile::tempdir().unwrap();
+        let child = tempfile::tempdir().unwrap();
+        let (_parent_key, parent_did) =
+            elastos_identity::load_or_create_did(parent.path()).unwrap();
+        let (_child_key, child_did) = elastos_identity::load_or_create_did(child.path()).unwrap();
+        assert_ne!(parent_did, child_did);
+
+        let now = now_ts();
+        let context = HomeLaunchTokenContext {
+            principal_id: "person:local:alice".to_string(),
+            session_id: "auth:alice".to_string(),
+            proof_binding_id: Some("proof:passkey:alice".to_string()),
+            grant_id: "grant:alice".to_string(),
+        };
+        crate::auth::store_session_grant(
+            parent.path(),
+            elastos_runtime::auth::AuthSessionGrantV1 {
+                schema: elastos_runtime::auth::AuthSessionGrantV1::SCHEMA.to_string(),
+                grant_id: context.grant_id.clone(),
+                session_id: context.session_id.clone(),
+                principal_id: context.principal_id.clone(),
+                proof_binding_id: context.proof_binding_id.clone().unwrap(),
+                issued_at: now,
+                expires_at: now + HOME_LAUNCH_TOKEN_TTL_SECS,
+                apps: vec!["home".to_string(), "marketplace".to_string()],
+            },
+        )
+        .unwrap();
+
+        let token =
+            issue_home_launch_token_with_context(parent.path(), "marketplace", &context).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-elastos-home-token", token.parse().unwrap());
+
+        let child_result = require_home_launch_token_for_any_from_expected_did(
+            child.path(),
+            &headers,
+            &["marketplace"],
+            None,
+            parent_did.clone(),
+            child.path(),
+        );
+        match child_result {
+            Ok(_) => panic!("child runtime must not use its own auth state for parent grants"),
+            Err(err) => assert!(err
+                .to_string()
+                .contains("home launch token auth session is not active")),
+        }
+
+        let parent_auth_result = require_home_launch_token_for_any_from_expected_did(
+            child.path(),
+            &headers,
+            &["marketplace"],
+            None,
+            parent_did,
+            parent.path(),
+        )
+        .unwrap();
+        assert_eq!(parent_auth_result.context.session_id, "auth:alice");
+    }
 }

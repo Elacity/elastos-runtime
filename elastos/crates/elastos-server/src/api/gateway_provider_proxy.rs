@@ -1406,7 +1406,12 @@ pub(super) async fn gateway_provider_proxy(
             // installed set (the cross-capsule capability map), so it is a System-
             // operator surface, pinned here exactly like capsules/plan/intent and
             // NEVER added to the `self` arm below.
-            "capsules" | "capsule" | "plan" | "intent" | "discover" => &[SYSTEM_CAPSULE_ID],
+            // `request_act` opens a pending, plan-bound provider action for
+            // operator approval (0.5 approved-provider-dispatch). It is a System-
+            // operator surface exactly like capsules/plan/intent/discover.
+            "capsules" | "capsule" | "plan" | "intent" | "discover" | "request_act" => {
+                &[SYSTEM_CAPSULE_ID]
+            }
             // Self-tier: an app/browser principal may inspect ONLY its own record.
             // Gated to the browser/app principal set (NOT System); the provider's
             // self branch forces target = the authenticated principal.
@@ -1452,6 +1457,13 @@ pub(super) async fn gateway_provider_proxy(
             Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
         }
     };
+    if let Some(field) = provider_proxy_runtime_metadata_field(&request) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("provider request must not predeclare Runtime metadata field {field}"),
+        )
+            .into_response();
+    }
     request["op"] = serde_json::Value::String(op.clone());
     if scheme == "documents"
         || scheme == "object"
@@ -1488,8 +1500,19 @@ pub(super) async fn gateway_provider_proxy(
     if scheme == "net" && op == "http" {
         return gateway_browser::gateway_browser_net_http(registry.as_ref(), &request).await;
     }
+    // The older `net/stream` browser path was removed in 0.5 (Browser is WebRTC-only now; the
+    // screenshot/polling stream fallback is gone). The route is retained ONLY to return an explicit
+    // 410 Gone that points callers at the WebRTC open path, rather than falling through to a generic
+    // provider dispatch (which surfaced a misleading 503).
     if scheme == "net" && op == "stream" {
-        return gateway_browser::gateway_browser_net_stream(registry.as_ref(), &request).await;
+        return (
+            StatusCode::GONE,
+            "legacy /api/provider/net/stream is disabled; Browser streams must be opened through /api/apps/browser/open",
+        )
+            .into_response();
+    }
+    if scheme == "inspect" && op == "request_act" {
+        return gateway_inspect_action_request(&state, &context, &request).await;
     }
 
     let chain_lifecycle_audit = chain_lifecycle_effect_audit(&scheme, &op, &request);
@@ -1637,6 +1660,19 @@ pub(super) async fn gateway_provider_proxy(
     }
 
     Json(response).into_response()
+}
+
+/// The first `_runtime*`/carrier-routing metadata key on a provider request, if any (0.5). Used by
+/// the inspect-action + browser-response paths to detect runtime-routing metadata on a request.
+pub(super) fn provider_proxy_runtime_metadata_field(request: &serde_json::Value) -> Option<&str> {
+    request
+        .as_object()?
+        .keys()
+        .find(|key| {
+            key.starts_with("_runtime")
+                || matches!(key.as_str(), "connect_ticket" | "carrier_route" | "carrier")
+        })
+        .map(String::as_str)
 }
 
 fn library_operation_emits_events(op: &str) -> bool {

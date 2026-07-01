@@ -93,16 +93,16 @@ async fn run_show(data_dir: &Path, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("Room:       {}", summary.room_control.title);
+    println!("Chat:       {}", summary.room_control.title);
     println!("Slug:       {}", summary.room_slug);
     println!("Root:       {}", room_root_uri());
     if let Some(role) = summary.local_runtime_role.as_ref() {
         println!("Role:       {}", role_label(role));
     } else {
-        println!("Role:       local runtime is not a room member");
+        println!("Access:     this device is not connected to this conversation");
     }
     println!(
-        "Runtime:    {}",
+        "ElastOS:    {}",
         summary
             .local_runtime_did
             .as_deref()
@@ -111,39 +111,39 @@ async fn run_show(data_dir: &Path, json: bool) -> anyhow::Result<()> {
     println!(
         "Guests:     {}",
         if summary.room_control.access_policy.allow_guest_invites {
-            "hosted guest invites enabled"
+            "public join requests enabled"
         } else {
-            "hosted guest invites disabled"
+            "public join requests disabled"
         }
     );
     println!(
-        "Members:    {}",
+        "ElastOS:    {}",
         if summary.room_control.access_policy.allow_member_invites {
-            "sovereign member invites enabled"
+            "user invites enabled"
         } else {
-            "sovereign member invites disabled"
+            "user invites disabled"
         }
     );
     println!(
-        "Hosting:    {}",
+        "Approvals:  {}",
         if summary
             .room_control
             .access_policy
             .allow_members_to_host_guests
         {
-            "members may host browser guests"
+            "trusted users may approve web guests"
         } else {
-            "only owners and admins may host browser guests"
+            "conversation managers approve web guests"
         }
     );
     if let Some(url) = summary.canonical_hosted_guest_url.as_deref() {
-        println!("Hosted URL: {}", url);
+        println!("Public URL: {}", url);
     }
     if let Some(url) = summary.ephemeral_hosted_guest_url.as_deref() {
         println!("Quick URL:  {}", url);
     }
     println!(
-        "Members:    {} total, {} active, {} admin",
+        "People:     {} trusted, {} active, {} manager",
         summary.room_control.member_count,
         summary.room_control.active_member_count,
         summary.room_control.admin_count
@@ -419,19 +419,19 @@ async fn run_approve(
             device_label,
             expires_at,
         }) => {
-            println!("Approved room browser access.");
+            println!("Approved Chat web guest request.");
             println!("Request:    {}", request_id);
-            println!("Browser:    {} on {}", display_name, device_label);
+            println!("Web guest:  {} on {}", display_name, device_label);
             println!("Expires:    {}", expires_at);
         }
         None => {
             if let Some(request_id) = request_id {
                 println!(
-                    "That room browser request is no longer pending: {}",
+                    "That Chat web guest request is no longer pending: {}",
                     request_id
                 );
             } else {
-                println!("No pending room browser requests.");
+                println!("No pending Chat web guest requests.");
             }
         }
     }
@@ -465,19 +465,19 @@ async fn run_deny(
             device_label,
             reason,
         }) => {
-            println!("Denied room browser access.");
+            println!("Denied Chat web guest request.");
             println!("Request:    {}", request_id);
-            println!("Browser:    {} on {}", display_name, device_label);
+            println!("Web guest:  {} on {}", display_name, device_label);
             println!("Reason:     {}", reason);
         }
         None => {
             if let Some(request_id) = request_id {
                 println!(
-                    "That room browser request is no longer pending: {}",
+                    "That Chat web guest request is no longer pending: {}",
                     request_id
                 );
             } else {
-                println!("No pending room browser requests.");
+                println!("No pending Chat web guest requests.");
             }
         }
     }

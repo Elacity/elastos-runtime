@@ -1,6 +1,14 @@
 #!/usr/bin/env node
 
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
@@ -15,10 +23,13 @@ const HEADLESS = process.env.HOME_VIRTUAL_AUTH_HEADED !== "1";
 const PRESERVE_PROFILE = process.env.HOME_VIRTUAL_AUTH_PRESERVE_PROFILE === "1";
 const CLEANUP_PASSKEY = process.env.HOME_VIRTUAL_AUTH_CLEANUP !== "0";
 const INCLUDE_BROWSER = process.env.HOME_VIRTUAL_AUTH_BROWSER === "1";
+const CHECK_APP_MATRIX = process.env.HOME_VIRTUAL_AUTH_APP_MATRIX === "1";
 const CHECK_BROWSER_SUMMARY =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_SUMMARY === "1" ||
   process.env.HOME_VIRTUAL_AUTH_BROWSER_OPEN === "1";
 const OPEN_BROWSER = process.env.HOME_VIRTUAL_AUTH_BROWSER_OPEN === "1";
+const CHECK_BROWSER_PROFILE_RESET =
+  process.env.HOME_VIRTUAL_AUTH_BROWSER_PROFILE_RESET === "1";
 const BROWSER_OPEN_CONCURRENT = parseBoundedIntegerEnv(
   "HOME_VIRTUAL_AUTH_BROWSER_OPEN_CONCURRENT",
   1,
@@ -31,10 +42,157 @@ const BROWSER_OPEN_HOLD_MS = parseBoundedIntegerEnv(
   0,
   300_000,
 );
+const EXPECT_BROWSER_CAPACITY_REJECTION =
+  process.env.HOME_VIRTUAL_AUTH_BROWSER_EXPECT_CAPACITY_REJECTION === "1";
+const BROWSER_OPEN_DISPLAY_MODE = parseBrowserDisplayMode(
+  process.env.HOME_VIRTUAL_AUTH_BROWSER_OPEN_DISPLAY_MODE || "webrtc_remote_display",
+);
+const BROWSER_OPEN_GUARANTEE_LEVEL =
+  process.env.HOME_VIRTUAL_AUTH_BROWSER_OPEN_GUARANTEE_LEVEL || "";
+const CHECK_BROWSER_FRAME = process.env.HOME_VIRTUAL_AUTH_BROWSER_FRAME !== "0";
+const CHECK_BROWSER_INPUT = process.env.HOME_VIRTUAL_AUTH_BROWSER_INPUT === "1";
+const CHECK_BROWSER_DIAGNOSTICS =
+  process.env.HOME_VIRTUAL_AUTH_BROWSER_DIAGNOSTICS === "1";
+const BROWSER_DIAGNOSTIC_CLICK_TEXT_RE =
+  process.env.HOME_VIRTUAL_AUTH_BROWSER_DIAGNOSTIC_CLICK_TEXT_RE || "";
+const BROWSER_DIAGNOSTIC_CLICK_EXPECT_TEXT_RE =
+  process.env.HOME_VIRTUAL_AUTH_BROWSER_DIAGNOSTIC_CLICK_EXPECT_TEXT_RE || "";
+const BROWSER_DIAGNOSTIC_CLICK_OPTIONAL =
+  process.env.HOME_VIRTUAL_AUTH_BROWSER_DIAGNOSTIC_CLICK_OPTIONAL === "1";
+const BROWSER_DIAGNOSTIC_CLICK_WAIT_MS = parseBoundedIntegerEnv(
+  "HOME_VIRTUAL_AUTH_BROWSER_DIAGNOSTIC_CLICK_WAIT_MS",
+  1500,
+  0,
+  30_000,
+);
+const BROWSER_INPUT_CLICK_X = parseBoundedIntegerEnv(
+  "HOME_VIRTUAL_AUTH_BROWSER_INPUT_CLICK_X",
+  640,
+  0,
+  4096,
+);
+const BROWSER_INPUT_CLICK_Y = parseBoundedIntegerEnv(
+  "HOME_VIRTUAL_AUTH_BROWSER_INPUT_CLICK_Y",
+  350,
+  0,
+  4096,
+);
+const BROWSER_INPUT_MAX_MS = parseBoundedIntegerEnv(
+  "HOME_VIRTUAL_AUTH_BROWSER_INPUT_MAX_MS",
+  2500,
+  1,
+  60_000,
+);
+const BROWSER_INPUT_EXPECT_URL_RE = process.env.HOME_VIRTUAL_AUTH_BROWSER_INPUT_EXPECT_URL_RE || "";
+const BROWSER_OPEN_VIEWPORT_WIDTH = parseBoundedIntegerEnv(
+  "HOME_VIRTUAL_AUTH_BROWSER_OPEN_VIEWPORT_WIDTH",
+  1280,
+  320,
+  3840,
+);
+const BROWSER_OPEN_VIEWPORT_HEIGHT = parseBoundedIntegerEnv(
+  "HOME_VIRTUAL_AUTH_BROWSER_OPEN_VIEWPORT_HEIGHT",
+  720,
+  240,
+  2160,
+);
+const CHECK_BROWSER_UI_INPUT = process.env.HOME_VIRTUAL_AUTH_BROWSER_UI_INPUT === "1";
+const CHECK_BROWSER_UI_SETUP = process.env.HOME_VIRTUAL_AUTH_BROWSER_UI_SETUP === "1";
+const BROWSER_UI_PAGE_ID_TIMEOUT_MS = parseBoundedIntegerEnv(
+  "HOME_VIRTUAL_AUTH_BROWSER_UI_PAGE_ID_TIMEOUT_MS",
+  180_000,
+  1_000,
+  300_000,
+);
+const BROWSER_REMOTE_VIDEO_TIMEOUT_MS = parseBoundedIntegerEnv(
+  "HOME_VIRTUAL_AUTH_BROWSER_REMOTE_VIDEO_TIMEOUT_MS",
+  180_000,
+  1_000,
+  300_000,
+);
+const BROWSER_UI_CLICK_EXPECT_URL_RE =
+  process.env.HOME_VIRTUAL_AUTH_BROWSER_UI_CLICK_EXPECT_URL_RE || "";
+const BROWSER_UI_CLICK_HREF_RE =
+  process.env.HOME_VIRTUAL_AUTH_BROWSER_UI_CLICK_HREF_RE || "";
+const BROWSER_UI_CLICK_NAV_TIMEOUT_MS = parseBoundedIntegerEnv(
+  "HOME_VIRTUAL_AUTH_BROWSER_UI_CLICK_NAV_TIMEOUT_MS",
+  30_000,
+  1_000,
+  120_000,
+);
+const BROWSER_UI_CLICK_TARGET_TIMEOUT_MS = parseBoundedIntegerEnv(
+  "HOME_VIRTUAL_AUTH_BROWSER_UI_CLICK_TARGET_TIMEOUT_MS",
+  90_000,
+  1_000,
+  300_000,
+);
+const CHECK_BROWSER_EMBEDDED_UI_INPUT =
+  process.env.HOME_VIRTUAL_AUTH_BROWSER_EMBEDDED_UI_INPUT === "1";
+const CHECK_BROWSER_EMBEDDED_RECOVERY =
+  process.env.HOME_VIRTUAL_AUTH_BROWSER_EMBEDDED_RECOVERY === "1";
 const BROWSER_OPEN_URLS = parseBrowserOpenUrls(process.env.HOME_VIRTUAL_AUTH_BROWSER_OPEN_URLS);
+const BROWSER_UI_NAV_URL = parseOptionalBrowserUrl(
+  process.env.HOME_VIRTUAL_AUTH_BROWSER_UI_NAV_URL ||
+    BROWSER_OPEN_URLS[1] ||
+    "https://example.com/?elastos-browser-ui-nav-smoke=1",
+  "HOME_VIRTUAL_AUTH_BROWSER_UI_NAV_URL",
+);
+const APP_MATRIX_TARGETS = parseAppMatrixTargets(process.env.HOME_VIRTUAL_AUTH_APP_MATRIX_TARGETS);
 const ALLOW_REMOTE = process.env.HOME_VIRTUAL_AUTH_ALLOW_REMOTE === "1";
 const PROFILE_DIR = process.env.HOME_VIRTUAL_AUTH_PROFILE
   || mkdtempSync(join(tmpdir(), "elastos-home-passkey-smoke-"));
+const VIRTUAL_AUTH_CREDENTIAL_STORE = join(
+  PROFILE_DIR,
+  "elastos-virtual-authenticator-credentials.json",
+);
+
+function readVirtualAuthenticatorCredentialStore() {
+  if (!existsSync(VIRTUAL_AUTH_CREDENTIAL_STORE)) {
+    return [];
+  }
+  const parsed = JSON.parse(readFileSync(VIRTUAL_AUTH_CREDENTIAL_STORE, "utf8"));
+  if (parsed?.schema !== "elastos.home.virtual-authenticator-credentials/v1") {
+    throw new Error("virtual authenticator credential store has an unsupported schema");
+  }
+  if (!Array.isArray(parsed.credentials)) {
+    throw new Error("virtual authenticator credential store is missing credentials");
+  }
+  return parsed.credentials;
+}
+
+function hasVirtualAuthenticatorCredentialStore() {
+  return existsSync(VIRTUAL_AUTH_CREDENTIAL_STORE);
+}
+
+async function restoreVirtualAuthenticatorCredentials(cdp, authenticatorId) {
+  for (const credential of readVirtualAuthenticatorCredentialStore()) {
+    await cdp.send("WebAuthn.addCredential", {
+      authenticatorId,
+      credential,
+    });
+  }
+}
+
+async function persistVirtualAuthenticatorCredentials(authenticator) {
+  if (!authenticator) {
+    return { skipped: true };
+  }
+  const { credentials } = await authenticator.cdp.send("WebAuthn.getCredentials", {
+    authenticatorId: authenticator.authenticatorId,
+  });
+  mkdirSync(PROFILE_DIR, { recursive: true });
+  writeFileSync(
+    VIRTUAL_AUTH_CREDENTIAL_STORE,
+    `${JSON.stringify({
+      schema: "elastos.home.virtual-authenticator-credentials/v1",
+      generated_at: new Date().toISOString(),
+      credentials,
+    }, null, 2)}\n`,
+    { mode: 0o600 },
+  );
+  chmodSync(VIRTUAL_AUTH_CREDENTIAL_STORE, 0o600);
+  return { saved: true, credential_count: credentials.length };
+}
 
 function parseBoundedIntegerEnv(name, defaultValue, min, max) {
   const raw = process.env[name];
@@ -74,12 +232,283 @@ function parseBrowserOpenUrls(raw) {
   return urls;
 }
 
+function parseOptionalBrowserUrl(raw, name) {
+  const value = String(raw || "").trim();
+  if (!value) {
+    return "";
+  }
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`${name} must be an http(s) URL`);
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error(`${name} must be an http(s) URL`);
+  }
+  return parsed.toString();
+}
+
+function hasTurnIceServer(iceServers) {
+  if (!Array.isArray(iceServers)) {
+    return false;
+  }
+  return iceServers.some((server) => {
+    const urls = Array.isArray(server?.urls) ? server.urls : [server?.urls];
+    return urls.some((url) => /^turns?:/i.test(String(url || "").trim()));
+  });
+}
+
+function hasCredentialedTurnIceServer(iceServers) {
+  if (!Array.isArray(iceServers)) {
+    return false;
+  }
+  return iceServers.some((server) => {
+    const urls = Array.isArray(server?.urls) ? server.urls : [server?.urls];
+    const hasTurn = urls.some((url) => /^turns?:/i.test(String(url || "").trim()));
+    const usernamePresent =
+      (typeof server?.username === "string" && server.username.trim() !== "") ||
+      server?.username_present === true;
+    const credentialPresent =
+      (typeof server?.credential === "string" && server.credential !== "") ||
+      server?.credential_present === true ||
+      Number(server?.credential_length || 0) > 0;
+    return hasTurn &&
+      usernamePresent &&
+      credentialPresent;
+  });
+}
+
+function summarizeDisplaySession(displaySession) {
+  const iceServers = Array.isArray(displaySession?.ice_servers)
+    ? displaySession.ice_servers
+    : [];
+  return {
+    schema: displaySession?.schema || null,
+    mode: displaySession?.mode || null,
+    media_transport: displaySession?.media_transport || null,
+    display_backend: displaySession?.display_backend || null,
+    backend_class: displaySession?.backend_class || null,
+    offerer: displaySession?.offerer || null,
+    ice_servers: iceServers.map((server) => ({
+      urls: Array.isArray(server?.urls) ? server.urls : [server?.urls].filter(Boolean),
+      username_present: (typeof server?.username === "string" && server.username.trim() !== "") ||
+        server?.username_present === true,
+      credential_present: (typeof server?.credential === "string" && server.credential !== "") ||
+        server?.credential_present === true ||
+        Number(server?.credential_length || 0) > 0,
+      credential_length: typeof server?.credential === "string"
+        ? server.credential.length
+        : Number(server?.credential_length || 0),
+    })),
+  };
+}
+
+function summarizeSdp(sdp) {
+  const text = String(sdp || "");
+  const lines = text.split(/\r?\n/).filter(Boolean);
+  return {
+    bytes: text.length,
+    media: lines.filter((line) => line.startsWith("m=")).slice(0, 8),
+    directions: lines.filter((line) =>
+      ["a=sendrecv", "a=recvonly", "a=sendonly", "a=inactive"].includes(line)
+    ).slice(0, 8),
+    candidate_lines: lines.filter((line) => line.startsWith("a=candidate:")).length,
+    end_of_candidates: lines.includes("a=end-of-candidates"),
+    ice_ufrag_present: lines.some((line) => line.startsWith("a=ice-ufrag:")),
+    ice_pwd_present: lines.some((line) => line.startsWith("a=ice-pwd:")),
+  };
+}
+
+function summarizeWebrtcCandidate(candidate) {
+  const line = String(candidate?.candidate || "");
+  const tokens = line.trim().split(/\s+/);
+  let type = "";
+  for (let index = 0; index < tokens.length - 1; index += 1) {
+    if (tokens[index].toLowerCase() === "typ") {
+      type = tokens[index + 1];
+      break;
+    }
+  }
+  return {
+    present: Boolean(line.trim()),
+    type,
+    protocol: tokens[2] || "",
+    address: tokens[4] || "",
+    port_present: Boolean(tokens[5]),
+    sdp_mid: typeof candidate?.sdpMid === "string" ? candidate.sdpMid : null,
+    sdp_mline_index: Number.isInteger(candidate?.sdpMLineIndex) ? candidate.sdpMLineIndex : null,
+    bytes: line.length,
+  };
+}
+
+function summarizeWebrtcMessage(body) {
+  if (!body || typeof body !== "object") {
+    return { body_type: typeof body };
+  }
+  return {
+    schema: body.schema || null,
+    type: body.type || null,
+    channel: body.channel || null,
+    accepted: body.accepted,
+    reason: body.reason || null,
+    sdp: body.sdp ? summarizeSdp(body.sdp) : null,
+    candidate: body.candidate ? summarizeWebrtcCandidate(body.candidate) : null,
+    candidates: Array.isArray(body.candidates)
+      ? body.candidates.slice(0, 8).map(summarizeWebrtcCandidate)
+      : null,
+    candidate_count: Array.isArray(body.candidates) ? body.candidates.length : null,
+    end_of_candidates: body.end_of_candidates,
+  };
+}
+
+function attachWebrtcSignalCapture(page) {
+  const signals = [];
+  page.on("response", async (response) => {
+    const request = response.request();
+    if (request.method() !== "POST" || !response.url().includes("/webrtc")) {
+      return;
+    }
+    let requestBody = null;
+    try {
+      requestBody = JSON.parse(request.postData() || "null");
+    } catch {
+      requestBody = request.postData() || "";
+    }
+    let responseBody = null;
+    try {
+      responseBody = await response.json();
+    } catch {
+      responseBody = await response.text().catch(() => "");
+    }
+    signals.push({
+      url: response.url(),
+      status: response.status(),
+      request: summarizeWebrtcMessage(requestBody),
+      response: summarizeWebrtcMessage(responseBody),
+    });
+  });
+  return signals;
+}
+
+function parseBrowserDisplayMode(value) {
+  if (value === "webrtc_remote_display") {
+    return value;
+  }
+  throw new Error(
+    "HOME_VIRTUAL_AUTH_BROWSER_OPEN_DISPLAY_MODE must be webrtc_remote_display",
+  );
+}
+
+function parseBrowserGuaranteeLevel(value) {
+  if (
+    value === "mechanism_microvm" ||
+    value === "operator_rbi" ||
+    value === "policy_webview" ||
+    value === "diagnostic"
+  ) {
+    return value;
+  }
+  throw new Error(
+    "HOME_VIRTUAL_AUTH_BROWSER_OPEN_GUARANTEE_LEVEL must be mechanism_microvm, operator_rbi, policy_webview, or diagnostic",
+  );
+}
+
+function browserOpenGuaranteeLevel(engineAdapter) {
+  if (BROWSER_OPEN_GUARANTEE_LEVEL) {
+    return parseBrowserGuaranteeLevel(BROWSER_OPEN_GUARANTEE_LEVEL);
+  }
+  const levels = Array.isArray(engineAdapter?.supported_guarantee_levels)
+    ? engineAdapter.supported_guarantee_levels
+    : [];
+  if (levels.includes("mechanism_microvm")) {
+    return "mechanism_microvm";
+  }
+  if (
+    BROWSER_OPEN_DISPLAY_MODE === "webrtc_remote_display" &&
+    levels.includes("operator_rbi")
+  ) {
+    return "operator_rbi";
+  }
+  return "mechanism_microvm";
+}
+
+function publicBrowserStreamSession(session) {
+  if (!session || typeof session !== "object") {
+    return null;
+  }
+  const carrier = session.carrier && typeof session.carrier === "object"
+    ? session.carrier
+    : {};
+  return {
+    schema: session.schema || null,
+    byte_transport: session.byte_transport || null,
+    grant_id: session.grant_id || null,
+    stream_id: session.stream_id || null,
+    target: session.target || null,
+    carrier_service: session.carrier_service || carrier.carrier_service || null,
+    carrier_schema: carrier.schema || null,
+    carrier_peer_did: carrier.peer_did || null,
+    carrier_connect_ticket_exposed: carrier.connect_ticket != null,
+    adapter_ipc_exposed: session.adapter_ipc != null,
+    relay_ipc_exposed: session.relay_ipc != null,
+    accounting: session.accounting ? {
+      max_active_streams: session.accounting.max_active_streams ?? null,
+      active_streams: session.accounting.active_streams ?? null,
+      max_active_streams_per_principal: session.accounting.max_active_streams_per_principal ?? null,
+      principal_active_streams: session.accounting.principal_active_streams ?? null,
+      principal_active_streams_remaining: session.accounting.principal_active_streams_remaining ?? null,
+    } : null,
+  };
+}
+
+function parseAppMatrixTargets(raw) {
+  const defaults = [
+    "system",
+    "chat-room",
+    "wallet",
+    "library",
+    "archive-manager",
+    "marketplace",
+    "browser",
+    "documents",
+    "inbox",
+    "gba-ucity",
+  ];
+  const values = raw == null || raw.trim() === ""
+    ? defaults
+    : raw
+      .split(/[\n,]/)
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+  const seen = new Set();
+  return values.filter((value) => {
+    if (seen.has(value)) {
+      return false;
+    }
+    seen.add(value);
+    return true;
+  });
+}
+
 function assert(condition, message, details = null) {
   if (!condition) {
     const error = new Error(message);
     error.details = details;
     throw error;
   }
+}
+
+function browserCloseAlreadyInactive(response) {
+  if (!response || response.ok === true || response.status !== 404) {
+    return false;
+  }
+  const text = JSON.stringify(response.body || response.error || "");
+  return text.includes("browser session is not active");
+}
+
+function assertBrowserCloseOkOrInactive(response, message) {
+  assert(response.ok || browserCloseAlreadyInactive(response), message, response);
 }
 
 function isLoopbackUrl(value) {
@@ -128,7 +557,7 @@ async function waitForSignedHome(page, timeoutMs = 30_000) {
 async function setupVirtualAuthenticator(context, page) {
   const cdp = await context.newCDPSession(page);
   await cdp.send("WebAuthn.enable");
-  await cdp.send("WebAuthn.addVirtualAuthenticator", {
+  const { authenticatorId } = await cdp.send("WebAuthn.addVirtualAuthenticator", {
     options: {
       protocol: "ctap2",
       transport: "internal",
@@ -138,7 +567,8 @@ async function setupVirtualAuthenticator(context, page) {
       automaticPresenceSimulation: true,
     },
   });
-  return cdp;
+  await restoreVirtualAuthenticatorCredentials(cdp, authenticatorId);
+  return { cdp, authenticatorId };
 }
 
 function captureNextPasskeyToken(page, timeoutMs = 30_000) {
@@ -192,6 +622,1527 @@ async function browserApi(page, token, path, { method = "GET", body = null } = {
   }, { token, path, method, body });
 }
 
+async function waitForBrowserStatus(page, browserToken, pageId) {
+  let lastStatus = null;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const status = await browserApi(
+      page,
+      browserToken,
+      `/api/apps/browser/pages/${encodeURIComponent(pageId)}/status`,
+    );
+    assert(status.ok, `Browser status request failed for ${pageId}`, status);
+    assert(
+      status.body?.schema === "elastos.browser.page-status/v1",
+      "Browser status returned wrong schema",
+      status,
+    );
+    lastStatus = status.body;
+    if (lastStatus.display_session?.mode === "webrtc_remote_display") {
+      assert(lastStatus.direct_network === false, "Browser status reported direct network", lastStatus);
+      return {
+        actual_url: lastStatus.actual_url,
+        display_backend: lastStatus.display_session?.display_backend,
+        display_mode: lastStatus.display_session?.mode,
+        media_transport: lastStatus.display_session?.media_transport,
+        webrtc_connection_state: lastStatus.webrtc_connection_state,
+      };
+    }
+    await delay(250);
+  }
+  throw Object.assign(new Error(`Browser status did not report a WebRTC display for ${pageId}`), {
+    details: lastStatus,
+  });
+}
+
+async function checkBrowserRuntimeInput(page, browserToken, pageId) {
+  const started = Date.now();
+  const input = await browserApi(
+    page,
+    browserToken,
+    `/api/apps/browser/pages/${encodeURIComponent(pageId)}/input`,
+    {
+      method: "POST",
+      body: {
+        event: {
+          type: "click",
+          x: BROWSER_INPUT_CLICK_X,
+          y: BROWSER_INPUT_CLICK_Y,
+        },
+      },
+    },
+  );
+  const durationMs = Date.now() - started;
+  assert(input.ok, `Browser input request failed for ${pageId}`, input);
+  assert(input.body?.schema === "elastos.browser.input-result/v1", "Browser input returned wrong schema", input);
+  assert(input.body.accepted === true, "Browser input was not accepted", input);
+  assert(input.body.direct_network === false, "Browser input reported direct network", input.body);
+  assert(
+    durationMs <= BROWSER_INPUT_MAX_MS,
+    "Browser input exceeded latency budget",
+    { duration_ms: durationMs, max_ms: BROWSER_INPUT_MAX_MS, input: input.body },
+  );
+  const status = await waitForBrowserStatus(page, browserToken, pageId);
+  if (BROWSER_INPUT_EXPECT_URL_RE) {
+    const pattern = new RegExp(BROWSER_INPUT_EXPECT_URL_RE);
+    assert(
+      pattern.test(String(status.actual_url || "")),
+      "Browser input did not produce the expected URL",
+      { expected: BROWSER_INPUT_EXPECT_URL_RE, status },
+    );
+  }
+  return {
+    accepted: input.body.accepted,
+    duration_ms: durationMs,
+    click: { x: BROWSER_INPUT_CLICK_X, y: BROWSER_INPUT_CLICK_Y },
+    seq: input.body.seq,
+    actual_url: input.body.actual_url,
+    title: input.body.title,
+    status,
+  };
+}
+
+async function checkBrowserPageStatus(page, browserToken, pageId) {
+  const status = await browserApi(
+    page,
+    browserToken,
+    `/api/apps/browser/pages/${encodeURIComponent(pageId)}/status`,
+  );
+  assert(status.ok, `Browser status request failed for ${pageId}`, status);
+  assert(
+    status.body?.schema === "elastos.browser.page-status/v1",
+    "Browser status returned wrong schema",
+    status,
+  );
+  assert(status.body.direct_network === false, "Browser status reported direct network", status.body);
+  return {
+    actual_url: status.body.actual_url,
+    title: status.body.title,
+    can_go_back: status.body.can_go_back,
+    can_go_forward: status.body.can_go_forward,
+    display_backend: status.body.display_backend,
+    backend_class: status.body.backend_class,
+    display_session: summarizeDisplaySession(status.body.display_session),
+    engine_identity: status.body.engine_identity || null,
+    input_protocol: status.body.input_protocol,
+    audio: status.body.audio,
+    video: status.body.video,
+    frame_count: status.body.frame_count,
+    last_frame_width: status.body.last_frame_width,
+    last_frame_height: status.body.last_frame_height,
+    webrtc_connection_state: status.body.webrtc_connection_state,
+    webrtc_signaling: status.body.webrtc_signaling || null,
+  };
+}
+
+async function waitForBrowserPageStatus(page, browserToken, pageId, predicate, label, timeoutMs = 60_000) {
+  const started = Date.now();
+  let last = null;
+  while (Date.now() - started <= timeoutMs) {
+    last = await checkBrowserPageStatus(page, browserToken, pageId);
+    if (predicate(last)) {
+      return last;
+    }
+    await delay(500);
+  }
+  throw Object.assign(new Error(`Timed out waiting for Browser status: ${label}`), {
+    details: last,
+  });
+}
+
+async function checkBrowserPageDiagnostics(page, browserToken, pageId) {
+  const diagnostics = await browserApi(
+    page,
+    browserToken,
+    `/api/apps/browser/pages/${encodeURIComponent(pageId)}/diagnostics`,
+  );
+  assert(diagnostics.ok, `Browser diagnostics request failed for ${pageId}`, diagnostics);
+  assert(
+    diagnostics.body?.schema === "elastos.browser.page-diagnostics/v1",
+    "Browser diagnostics returned wrong schema",
+    diagnostics,
+  );
+  assert(
+    diagnostics.body.direct_network === false,
+    "Browser diagnostics reported direct network",
+    diagnostics.body,
+  );
+  return {
+    url: diagnostics.body.url,
+    title: diagnostics.body.title,
+    ready_state: diagnostics.body.ready_state,
+    viewport_width: diagnostics.body.viewport_width,
+    viewport_height: diagnostics.body.viewport_height,
+    device_pixel_ratio: diagnostics.body.device_pixel_ratio,
+    body_text: diagnostics.body.body_text,
+    body_html: diagnostics.body.body_html,
+    body_child_count: diagnostics.body.body_child_count,
+    root_child_count: diagnostics.body.root_child_count,
+    root_html: diagnostics.body.root_html,
+    root_outer_html: diagnostics.body.root_outer_html,
+    cdp_events: Array.isArray(diagnostics.body.cdp_events)
+      ? diagnostics.body.cdp_events.slice(0, 40)
+      : [],
+    image_count: diagnostics.body.image_count,
+    visible_image_count: diagnostics.body.visible_image_count,
+    broken_image_count: diagnostics.body.broken_image_count,
+    pending_image_count: diagnostics.body.pending_image_count,
+    pending_ipfs_image_count: diagnostics.body.pending_ipfs_image_count,
+    visible_broken_image_count: diagnostics.body.visible_broken_image_count,
+    visible_pending_image_count: diagnostics.body.visible_pending_image_count,
+    visible_pending_ipfs_image_count: diagnostics.body.visible_pending_ipfs_image_count,
+    resource_count: diagnostics.body.resource_count,
+    resources: Array.isArray(diagnostics.body.resources)
+      ? diagnostics.body.resources.slice(0, 80)
+      : [],
+    ipfs_resources: Array.isArray(diagnostics.body.ipfs_resources)
+      ? diagnostics.body.ipfs_resources.slice(0, 80)
+      : [],
+    clickable_count: diagnostics.body.clickable_count,
+    clickable_elements: Array.isArray(diagnostics.body.clickable_elements)
+      ? diagnostics.body.clickable_elements.slice(0, 80)
+      : [],
+    visible_text_sample_count: diagnostics.body.visible_text_sample_count,
+    visible_text_samples: Array.isArray(diagnostics.body.visible_text_samples)
+      ? diagnostics.body.visible_text_samples.slice(0, 80)
+      : [],
+    dialog_count: diagnostics.body.dialog_count,
+    dialog_elements: Array.isArray(diagnostics.body.dialog_elements)
+      ? diagnostics.body.dialog_elements.slice(0, 20)
+      : [],
+    images: Array.isArray(diagnostics.body.images)
+      ? diagnostics.body.images.slice(0, 80)
+      : [],
+    navigation: diagnostics.body.navigation || null,
+  };
+}
+
+function diagnosticClickPatterns() {
+  return String(BROWSER_DIAGNOSTIC_CLICK_TEXT_RE || "")
+    .split(/\s*=>\s*/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((source) => ({ source, regex: new RegExp(source, "i") }));
+}
+
+function diagnosticElementText(element) {
+  return [
+    element?.text,
+    element?.aria_label,
+    element?.title,
+    element?.test_id,
+    element?.role,
+    element?.tag,
+    element?.href,
+    element?.top_element?.action_text,
+    element?.top_element?.action_href,
+  ].filter(Boolean).join("\n");
+}
+
+function diagnosticTextCorpus(diagnostics) {
+  return [
+    diagnostics?.body_text,
+    ...(Array.isArray(diagnostics?.visible_text_samples)
+      ? diagnostics.visible_text_samples.flatMap((item) => [
+          item.text,
+          item.aria_label,
+          item.title,
+          item.test_id,
+        ])
+      : []),
+    ...(Array.isArray(diagnostics?.dialog_elements)
+      ? diagnostics.dialog_elements.flatMap((item) => [
+          item.text,
+          item.aria_label,
+          item.title,
+          item.test_id,
+        ])
+      : []),
+    ...(Array.isArray(diagnostics?.clickable_elements)
+      ? diagnostics.clickable_elements.map(diagnosticElementText)
+      : []),
+  ].filter(Boolean).join("\n");
+}
+
+function summarizeDiagnosticClickTarget(element) {
+  return {
+    text: element?.text || "",
+    aria_label: element?.aria_label || "",
+    title: element?.title || "",
+    role: element?.role || "",
+    tag: element?.tag || "",
+    test_id: element?.test_id || "",
+    href: element?.href || "",
+    rect: element?.rect || null,
+  };
+}
+
+function findBrowserHrefClickTarget(diagnostics, pattern) {
+  return (diagnostics?.clickable_elements || []).find((element) =>
+    element?.visible !== false &&
+      Number(element?.rect?.width || 0) > 0 &&
+      Number(element?.rect?.height || 0) > 0 &&
+      pattern.test(String(element.href || "")) &&
+      pattern.test(String(element.top_element?.action_href || element.href || "")),
+  );
+}
+
+async function waitForBrowserHrefClickTarget(
+  page,
+  browserToken,
+  pageId,
+  hrefPatternSource,
+  timeoutMs = BROWSER_UI_CLICK_TARGET_TIMEOUT_MS,
+) {
+  const pattern = new RegExp(hrefPatternSource);
+  const started = Date.now();
+  let diagnostics = null;
+  while (Date.now() - started <= timeoutMs) {
+    diagnostics = await checkBrowserPageDiagnostics(page, browserToken, pageId);
+    const target = findBrowserHrefClickTarget(diagnostics, pattern);
+    if (target) {
+      return {
+        target,
+        diagnostics,
+        waited_ms: Date.now() - started,
+      };
+    }
+    await delay(1000);
+  }
+  throw Object.assign(new Error("Browser UI click target was not found in page diagnostics"), {
+    details: {
+      expected_href_re: hrefPatternSource,
+      timeout_ms: timeoutMs,
+      diagnostics,
+    },
+  });
+}
+
+async function runBrowserDiagnosticClickSequence(page, browserToken, pageId, initialDiagnostics) {
+  const patterns = diagnosticClickPatterns();
+  if (patterns.length === 0) {
+    return [];
+  }
+  const actions = [];
+  let diagnostics = initialDiagnostics;
+  for (const pattern of patterns) {
+    const target = (diagnostics.clickable_elements || []).find((element) =>
+      element?.visible !== false &&
+        Number(element?.rect?.width || 0) > 0 &&
+        Number(element?.rect?.height || 0) > 0 &&
+        pattern.regex.test(diagnosticElementText(element)),
+    );
+    if (!target && BROWSER_DIAGNOSTIC_CLICK_OPTIONAL) {
+      actions.push({
+        ok: false,
+        error: "target_not_found",
+        expected_text_re: pattern.source,
+        diagnostics,
+      });
+      return actions;
+    }
+    assert(target, "Browser diagnostics click target was not found", {
+      page_id: pageId,
+      expected_text_re: pattern.source,
+      visible_text_samples: diagnostics.visible_text_samples,
+      clickable_elements: diagnostics.clickable_elements,
+      dialog_elements: diagnostics.dialog_elements,
+    });
+    const click = {
+      x: Math.round(Number(target.rect.x || 0) + Number(target.rect.width || 0) / 2),
+      y: Math.round(Number(target.rect.y || 0) + Number(target.rect.height || 0) / 2),
+    };
+    const response = await browserApi(
+      page,
+      browserToken,
+      `/api/apps/browser/pages/${encodeURIComponent(pageId)}/input`,
+      { method: "POST", body: { event: { type: "click", ...click } } },
+    );
+    assert(response.ok, "Browser diagnostics click input failed", {
+      pattern: pattern.source,
+      click,
+      response,
+    });
+    assert(
+      response.body?.schema === "elastos.browser.input-result/v1" &&
+        response.body?.accepted === true &&
+        response.body?.direct_network === false,
+      "Browser diagnostics click input returned an invalid receipt",
+      response.body,
+    );
+    if (BROWSER_DIAGNOSTIC_CLICK_WAIT_MS > 0) {
+      await delay(BROWSER_DIAGNOSTIC_CLICK_WAIT_MS);
+    }
+    diagnostics = await checkBrowserPageDiagnostics(page, browserToken, pageId);
+    actions.push({
+      ok: true,
+      expected_text_re: pattern.source,
+      click,
+      target: summarizeDiagnosticClickTarget(target),
+      input: {
+        accepted: response.body.accepted,
+        actual_url: response.body.actual_url || null,
+        title: response.body.title || null,
+      },
+      diagnostics,
+    });
+  }
+  if (BROWSER_DIAGNOSTIC_CLICK_EXPECT_TEXT_RE) {
+    const expected = new RegExp(BROWSER_DIAGNOSTIC_CLICK_EXPECT_TEXT_RE, "i");
+    if (!expected.test(diagnosticTextCorpus(diagnostics)) && BROWSER_DIAGNOSTIC_CLICK_OPTIONAL) {
+      actions.push({
+        ok: false,
+        error: "expected_text_not_found",
+        expected_text_re: BROWSER_DIAGNOSTIC_CLICK_EXPECT_TEXT_RE,
+        diagnostics,
+      });
+      return actions;
+    }
+    assert(expected.test(diagnosticTextCorpus(diagnostics)), "Browser diagnostics post-click expected text was not found", {
+      expected_text_re: BROWSER_DIAGNOSTIC_CLICK_EXPECT_TEXT_RE,
+      diagnostics,
+    });
+  }
+  return actions;
+}
+
+async function browserRemoteVideoMetrics(appPage) {
+  return appPage.evaluate(() => {
+    const video = document.querySelector("#browser-remote-display");
+    if (!video) {
+      return { present: false };
+    }
+    const rect = video.getBoundingClientRect();
+    return {
+      present: true,
+      hidden: video.hidden,
+      ready_state: video.readyState,
+      paused: video.paused,
+      current_time: Number(video.currentTime || 0),
+      video_width: Number(video.videoWidth || 0),
+      video_height: Number(video.videoHeight || 0),
+      decoded_frames: Number(video.webkitDecodedFrameCount || 0),
+      dropped_frames: Number(video.webkitDroppedFrameCount || 0),
+      client_width: Math.round(rect.width || 0),
+      client_height: Math.round(rect.height || 0),
+    };
+  });
+}
+
+async function waitForBrowserUiAddressMatch(appPage, expectedUrlRe, timeoutMs) {
+  const pattern = new RegExp(expectedUrlRe);
+  const started = Date.now();
+  let lastAddressValue = "";
+  while (Date.now() - started <= timeoutMs) {
+    lastAddressValue = await appPage.locator("#browser-url").inputValue().catch(() => "");
+    if (pattern.test(lastAddressValue)) {
+      return {
+        address_value: lastAddressValue,
+        duration_ms: Date.now() - started,
+      };
+    }
+    await delay(500);
+  }
+  throw Object.assign(new Error("Browser UI address did not track remote navigation"), {
+    details: {
+      expected_url_re: expectedUrlRe,
+      address_value: lastAddressValue,
+      timeout_ms: timeoutMs,
+    },
+  });
+}
+
+function normalizeRemoteDisplayClickInputEvidence(input, status, addressMatch) {
+  if (input?.ok === true) {
+    return input;
+  }
+  const statusUrl = String(status?.actual_url || "");
+  const addressValue = String(addressMatch?.address_value || "");
+  const selkiesDatachannel =
+    status?.display_backend === "selkies_gstreamer_webrtc" &&
+    status?.input_protocol === "selkies_v1";
+  if (!selkiesDatachannel || !statusUrl || statusUrl !== addressValue) {
+    return input;
+  }
+  return {
+    ok: true,
+    accepted: true,
+    transport: "datachannel",
+    protocol: "selkies_v1",
+    evidence: "browser_address_status_url_sync",
+    actual_url: statusUrl,
+    previous_http_probe: input?.ok === false ? input : null,
+  };
+}
+
+async function remoteVideoClickPositionForPagePoint(appPage, point) {
+  return appPage.evaluate(({ x, y }) => {
+    const video = document.querySelector("#browser-remote-display");
+    if (!video) {
+      return null;
+    }
+    const rect = video.getBoundingClientRect();
+    const mediaWidth = Number(video.videoWidth || rect.width || 0);
+    const mediaHeight = Number(video.videoHeight || rect.height || 0);
+    if (rect.width <= 0 || rect.height <= 0 || mediaWidth <= 0 || mediaHeight <= 0) {
+      return null;
+    }
+    const objectFit = getComputedStyle(video).objectFit || "";
+    let content = {
+      left: rect.left,
+      top: rect.top,
+      width: rect.width,
+      height: rect.height,
+    };
+    if (objectFit !== "fill") {
+      const elementRatio = rect.width / rect.height;
+      const mediaRatio = mediaWidth / mediaHeight;
+      if (Math.abs(elementRatio - mediaRatio) >= 0.001) {
+        if (elementRatio > mediaRatio) {
+          const width = rect.height * mediaRatio;
+          content = {
+            left: rect.left + (rect.width - width) / 2,
+            top: rect.top,
+            width,
+            height: rect.height,
+          };
+        } else {
+          const height = rect.width / mediaRatio;
+          content = {
+            left: rect.left,
+            top: rect.top + (rect.height - height) / 2,
+            width: rect.width,
+            height,
+          };
+        }
+      }
+    }
+    return {
+      x: content.left - rect.left + (x / mediaWidth) * content.width,
+      y: content.top - rect.top + (y / mediaHeight) * content.height,
+      media_width: mediaWidth,
+      media_height: mediaHeight,
+      video_width: rect.width,
+      video_height: rect.height,
+    };
+  }, point);
+}
+
+async function waitForBrowserRemoteVideo(
+  appPage,
+  { browserToken = "", pageId = "", displaySession = null, timeoutMs = 180_000 } = {},
+) {
+  const started = Date.now();
+  let last = null;
+  let lastRuntimeStatus = null;
+  let videoVisible = false;
+  try {
+    await appPage.locator("#browser-remote-display").waitFor({
+      state: "visible",
+      timeout: timeoutMs,
+    });
+    videoVisible = true;
+  } catch {
+    last = await browserRemoteVideoMetrics(appPage).catch(() => null);
+  }
+  while (videoVisible && Date.now() - started <= timeoutMs) {
+    last = await browserRemoteVideoMetrics(appPage);
+    if (browserToken && pageId) {
+      lastRuntimeStatus = await checkBrowserPageStatus(appPage, browserToken, pageId)
+        .catch((error) => ({
+          error: error.message || String(error),
+          details: error.details || null,
+        }));
+    }
+    if (
+      last.present &&
+      !last.hidden &&
+      Number(last.video_width || 0) > 0 &&
+      Number(last.video_height || 0) > 0 &&
+      (Number(last.current_time || 0) > 0 || Number(last.ready_state || 0) >= 2)
+    ) {
+      return {
+        ...last,
+        ready_duration_ms: Date.now() - started,
+      };
+    }
+    await delay(500);
+  }
+  const statusText = await appPage.locator("#browser-status").innerText().catch(() => "");
+  const domState = await appPage.evaluate(() => ({
+    href: window.location.href,
+    title: document.title,
+    body_loading: document.body?.dataset?.loading || "",
+    current_page_id: window.__elastosBrowserCurrentPageId || "",
+    status: document.querySelector("#browser-status")?.textContent?.trim() || "",
+    address: document.querySelector("#browser-url")?.value || "",
+  })).catch(() => null);
+  const runtimeStatus = browserToken && pageId
+    ? await checkBrowserPageStatus(appPage, browserToken, pageId).catch((error) => ({
+        error: error.message || String(error),
+        details: error.details || null,
+      }))
+    : null;
+  const runtimeDiagnostics = browserToken && pageId
+    ? await checkBrowserPageDiagnostics(appPage, browserToken, pageId).catch((error) => ({
+        error: error.message || String(error),
+        details: error.details || null,
+      }))
+    : null;
+  throw Object.assign(new Error("Browser remote video did not become renderable"), {
+    details: {
+      duration_ms: Date.now() - started,
+      video_visible: videoVisible,
+      video: last,
+      status: statusText,
+      dom: domState,
+      display_session: summarizeDisplaySession(displaySession),
+      runtime_status: runtimeStatus,
+      last_runtime_status_before_failure: lastRuntimeStatus,
+      runtime_diagnostics: runtimeDiagnostics,
+    },
+  });
+}
+
+async function embeddedBrowserGeometry(windowLocator, appFrame) {
+  const shell = await windowLocator.evaluate((node) => {
+    const rect = node.getBoundingClientRect();
+    const frame = node.querySelector(".window-frame");
+    const frameRect = frame?.getBoundingClientRect();
+    const restoreWidth = Number.parseFloat(node.dataset.restoreWidth || "");
+    const restoreHeight = Number.parseFloat(node.dataset.restoreHeight || "");
+    return {
+      active: node.classList.contains("window-active"),
+      hidden: node.classList.contains("hidden"),
+      aria_hidden: node.getAttribute("aria-hidden") || "",
+      width: Math.round(rect.width || 0),
+      height: Math.round(rect.height || 0),
+      restore_width: Number.isFinite(restoreWidth) ? Math.round(restoreWidth) : null,
+      restore_height: Number.isFinite(restoreHeight) ? Math.round(restoreHeight) : null,
+      frame_pointer_events: frame ? getComputedStyle(frame).pointerEvents : "",
+      frame_width: Math.round(frameRect?.width || 0),
+      frame_height: Math.round(frameRect?.height || 0),
+    };
+  });
+  const panel = await appFrame.locator("#browser-render-panel")
+    .boundingBox()
+    .then((box) => box ? {
+      width: Math.round(box.width || 0),
+      height: Math.round(box.height || 0),
+    } : null)
+    .catch(() => null);
+  const video = await appFrame.locator("#browser-remote-display")
+    .boundingBox()
+    .then((box) => box ? {
+      width: Math.round(box.width || 0),
+      height: Math.round(box.height || 0),
+    } : null)
+    .catch(() => null);
+  return { shell, panel, video };
+}
+
+async function embeddedBrowserDebugState(windowLocator, appFrame) {
+  const geometry = await embeddedBrowserGeometry(windowLocator, appFrame).catch((error) => ({
+    error: error instanceof Error ? error.message : String(error),
+  }));
+  const frame = await appFrame.evaluate(() => {
+    const text = (selector) => document.querySelector(selector)?.textContent?.trim() || "";
+    const value = (selector) => document.querySelector(selector)?.value || "";
+    const has = (selector) => Boolean(document.querySelector(selector));
+    return {
+      ready_state: document.readyState,
+      href: window.location.href,
+      title: document.title,
+      current_page_id: window.__elastosBrowserCurrentPageId || "",
+      status: text("#browser-status"),
+      url_value: value("#browser-url"),
+      has_render_panel: has("#browser-render-panel"),
+      has_remote_display: has("#browser-remote-display"),
+      has_remote_video: has("#browser-remote-display"),
+      body_text: (document.body?.innerText || "").slice(0, 2000),
+    };
+  }).catch((error) => ({
+    error: error instanceof Error ? error.message : String(error),
+  }));
+  return { geometry, frame };
+}
+
+function assertEmbeddedBrowserAspect(geometry) {
+  const panel = geometry?.panel;
+  assert(
+    panel && panel.width > 0 && panel.height > 0,
+    "Embedded Browser geometry did not expose a render panel",
+    geometry,
+  );
+  const ratio = panel.width / panel.height;
+  assert(
+    Math.abs(ratio - (16 / 9)) <= 0.04,
+    "Embedded Browser render panel is not fitted to the 16:9 remote display aspect",
+    { ratio, geometry },
+  );
+}
+
+async function checkBrowserUiInput(context, browserToken, route) {
+  const appPage = await context.newPage();
+  let pageId = "";
+  let openedPageId = "";
+  let openResult = null;
+  let closed = null;
+  try {
+    const appUrl = new URL(route, HOME_URL);
+    appUrl.searchParams.set("url", BROWSER_OPEN_URLS[0] || "https://example.com/");
+    appUrl.searchParams.set("display", BROWSER_OPEN_DISPLAY_MODE);
+    const openResultPromise = appPage.waitForResponse(
+      (response) => {
+        const request = response.request();
+        return request.method() === "POST" && response.url().endsWith("/api/apps/browser/open");
+      },
+      { timeout: BROWSER_UI_PAGE_ID_TIMEOUT_MS },
+    ).then(async (response) => {
+      const body = await response.json().catch(() => ({}));
+      openedPageId = String(body?.engine_page?.page_id || "");
+      return {
+        ok: response.ok(),
+        status: response.status(),
+        body,
+      };
+    }).catch((error) => ({
+      ok: false,
+      error: error.message || String(error),
+    }));
+    await appPage.goto(appUrl.toString(), { waitUntil: "domcontentloaded" });
+    await appPage.evaluate(() => {
+      window.__elastosBrowserSmokeClicks = [];
+      const panel = document.querySelector("#browser-render-panel");
+      panel?.addEventListener("click", (event) => {
+        window.__elastosBrowserSmokeClicks.push({
+          target: event.target?.id || event.target?.tagName || "",
+          currentTarget: event.currentTarget?.id || "",
+          clientX: event.clientX,
+          clientY: event.clientY,
+        });
+      }, { capture: true });
+    });
+    try {
+      pageId = await appPage.waitForFunction(
+        () => window.__elastosBrowserCurrentPageId || "",
+        null,
+        { timeout: BROWSER_UI_PAGE_ID_TIMEOUT_MS },
+      ).then((handle) => handle.jsonValue());
+    } catch (error) {
+      openResult = await openResultPromise;
+      const domState = await appPage.evaluate(() => ({
+        href: window.location.href,
+        title: document.title,
+        body_loading: document.body?.dataset?.loading || "",
+        current_page_id: window.__elastosBrowserCurrentPageId || "",
+        status: document.querySelector("#browser-status")?.textContent?.trim() || "",
+        address: document.querySelector("#browser-url")?.value || "",
+      })).catch(() => null);
+      throw Object.assign(new Error("Browser UI did not publish the current page id"), {
+        details: { error: error.message || String(error), open_result: openResult, dom: domState },
+      });
+    }
+    openResult = await openResultPromise;
+    assert(pageId, "Browser UI did not publish the current page id", openResult);
+    assert(openResult.ok, "Browser UI open request failed", openResult);
+    const panel = appPage.locator("#browser-render-panel");
+    const box = await panel.boundingBox();
+    assert(box && box.width > 0 && box.height > 0, "Browser render panel has no clickable box", box);
+    if (BROWSER_OPEN_DISPLAY_MODE === "webrtc_remote_display") {
+      const displaySession = openResult.body?.engine_page?.display_session || {};
+      assert(
+        displaySession.media_transport === "runtime_relay",
+        "Browser WebRTC UI did not use Runtime relay media transport",
+        displaySession,
+      );
+      assert(
+        hasTurnIceServer(displaySession.ice_servers),
+        "Browser WebRTC UI Runtime relay is missing a TURN ICE server",
+        displaySession,
+      );
+      assert(
+        hasCredentialedTurnIceServer(displaySession.ice_servers),
+        "Browser WebRTC UI Runtime relay TURN server is missing credentials",
+        summarizeDisplaySession(displaySession),
+      );
+      const videoReady = await waitForBrowserRemoteVideo(appPage, {
+        browserToken,
+        pageId,
+        displaySession,
+        timeoutMs: BROWSER_REMOTE_VIDEO_TIMEOUT_MS,
+      });
+      let clickTarget = null;
+      let clickX = Math.max(1, Math.min(box.width - 1, BROWSER_INPUT_CLICK_X));
+      let clickY = Math.max(1, Math.min(box.height - 1, BROWSER_INPUT_CLICK_Y));
+      if (BROWSER_UI_CLICK_HREF_RE) {
+        const targetProof = await waitForBrowserHrefClickTarget(
+          appPage,
+          browserToken,
+          pageId,
+          BROWSER_UI_CLICK_HREF_RE,
+        );
+        clickTarget = targetProof.target;
+        const targetPoint = {
+          x: clickTarget.rect.x + clickTarget.rect.width / 2,
+          y: clickTarget.rect.y + clickTarget.rect.height / 2,
+        };
+        const mappedPoint = await remoteVideoClickPositionForPagePoint(appPage, targetPoint);
+        const videoBox = await appPage.locator("#browser-remote-display").boundingBox();
+        assert(mappedPoint && videoBox, "Browser UI could not map page click target into video", {
+          target: clickTarget,
+          mapped: mappedPoint,
+          video_box: videoBox,
+        });
+        clickX = Math.max(1, Math.min(videoBox.width - 1, Math.round(mappedPoint.x)));
+        clickY = Math.max(1, Math.min(videoBox.height - 1, Math.round(mappedPoint.y)));
+      }
+      const beforeClickVideo = await browserRemoteVideoMetrics(appPage);
+      let clickInput = null;
+      const clickInputResponsePromise = BROWSER_UI_CLICK_EXPECT_URL_RE || BROWSER_UI_CLICK_HREF_RE
+        ? appPage.waitForResponse(
+            (response) => {
+              const request = response.request();
+              return request.method() === "POST" &&
+                response.url().includes(`/api/apps/browser/pages/${encodeURIComponent(pageId)}/input`);
+            },
+            { timeout: 2500 },
+          ).then(async (response) => ({
+            ok: response.ok(),
+            status: response.status(),
+            body: await response.json().catch(() => ({})),
+          })).catch((error) => ({
+            ok: false,
+            error: error.message || String(error),
+          }))
+        : null;
+      await appPage.locator("#browser-remote-display").click({ position: { x: clickX, y: clickY } });
+      clickInput = clickInputResponsePromise ? await clickInputResponsePromise : null;
+      await delay(750);
+      const afterClickVideo = await browserRemoteVideoMetrics(appPage);
+      const statusTextAfterClick = await appPage.locator("#browser-status").innerText().catch(() => "");
+      assert(
+        !/input channel is not open|failed closed|Browser remote display .*failed/i.test(statusTextAfterClick),
+        "Browser WebRTC UI click left an input/display error",
+        { status: statusTextAfterClick },
+      );
+      let clickNavigation = null;
+      if (BROWSER_UI_CLICK_EXPECT_URL_RE) {
+        const addressMatch = await waitForBrowserUiAddressMatch(
+          appPage,
+          BROWSER_UI_CLICK_EXPECT_URL_RE,
+          BROWSER_UI_CLICK_NAV_TIMEOUT_MS,
+        ).catch(async (error) => {
+          const runtimeStatus = await checkBrowserPageStatus(
+            appPage,
+            browserToken,
+            pageId,
+          ).catch((statusError) => ({
+            error: statusError.message || String(statusError),
+            details: statusError.details || null,
+          }));
+          error.details = {
+            ...(error.details || {}),
+            click: { x: clickX, y: clickY, target: clickTarget },
+            click_input: clickInput,
+            runtime_status: runtimeStatus,
+          };
+          throw error;
+        });
+        const status = await checkBrowserPageStatus(appPage, browserToken, pageId);
+        clickInput = normalizeRemoteDisplayClickInputEvidence(
+          clickInput,
+          status,
+          addressMatch,
+        );
+        clickNavigation = {
+          expected_url_re: BROWSER_UI_CLICK_EXPECT_URL_RE,
+          ...addressMatch,
+          input: clickInput,
+          status,
+        };
+      }
+      const navStarted = Date.now();
+      const inputResponsePromise = appPage.waitForResponse(
+        (response) => {
+          const request = response.request();
+          return request.method() === "POST" &&
+            response.url().includes(`/api/apps/browser/pages/${encodeURIComponent(pageId)}/input`);
+        },
+        { timeout: 60_000 },
+      );
+      await appPage.locator("#browser-url").fill(BROWSER_UI_NAV_URL);
+      await appPage.locator("#browser-url").press("Enter");
+      const inputResponse = await inputResponsePromise;
+      const inputResponseMs = Date.now() - navStarted;
+      const inputBody = await inputResponse.json();
+      assert(inputResponse.ok(), "Browser WebRTC UI navigation request failed", {
+        status: inputResponse.status(),
+        body: inputBody,
+      });
+      assert(inputBody?.schema === "elastos.browser.input-result/v1", "Browser WebRTC UI navigation returned wrong schema", inputBody);
+      assert(inputBody.accepted === true, "Browser WebRTC UI navigation was not accepted", inputBody);
+      assert(inputBody.direct_network === false, "Browser WebRTC UI navigation reported direct network", inputBody);
+      const navStatus = await waitForBrowserPageStatus(
+        appPage,
+        browserToken,
+        pageId,
+        (status) => status.actual_url === BROWSER_UI_NAV_URL,
+        `actual_url=${BROWSER_UI_NAV_URL}`,
+        60_000,
+      );
+      const statusMatchMs = Date.now() - navStarted;
+      await appPage.waitForFunction(
+        (expected) => document.querySelector("#browser-url")?.value === expected,
+        navStatus.actual_url,
+        { timeout: 15_000 },
+      );
+      const addressMatchMs = Date.now() - navStarted;
+      const addressValue = await appPage.locator("#browser-url").inputValue();
+      const clicks = await appPage.evaluate(() => window.__elastosBrowserSmokeClicks || []);
+      assert(clicks.length > 0, "Browser WebRTC UI click did not reach the render panel");
+      return {
+        page_id: pageId,
+        url: appUrl.searchParams.get("url"),
+        display_mode: BROWSER_OPEN_DISPLAY_MODE,
+        video: {
+          ready: videoReady,
+          before_click: beforeClickVideo,
+          after_click: afterClickVideo,
+        },
+        click: { x: clickX, y: clickY, target: clickTarget },
+        click_navigation: clickNavigation,
+        navigation: {
+          requested_url: BROWSER_UI_NAV_URL,
+          duration_ms: Date.now() - navStarted,
+          input_response_ms: inputResponseMs,
+          status_match_ms: statusMatchMs,
+          address_match_ms: addressMatchMs,
+          input: {
+            accepted: inputBody.accepted,
+            actual_url: inputBody.actual_url,
+            title: inputBody.title,
+          },
+          status: navStatus,
+          address_value: addressValue,
+        },
+        dom_clicks: clicks.slice(-3),
+      };
+    }
+    await appPage.locator("#browser-remote-display").waitFor({ state: "visible", timeout: 180_000 });
+    const remoteDisplay = appPage.locator("#browser-remote-display");
+    const inputResponsePromise = appPage.waitForResponse(
+      (response) => {
+        const request = response.request();
+        return request.method() === "POST" &&
+          response.url().includes(`/api/apps/browser/pages/${encodeURIComponent(pageId)}/input`);
+      },
+      { timeout: BROWSER_INPUT_MAX_MS },
+    );
+    const clickX = Math.max(1, Math.min(box.width - 1, BROWSER_INPUT_CLICK_X));
+    const clickY = Math.max(1, Math.min(box.height - 1, BROWSER_INPUT_CLICK_Y));
+    const started = Date.now();
+    await remoteDisplay.click({ position: { x: clickX, y: clickY } });
+    const inputResponse = await inputResponsePromise;
+    const durationMs = Date.now() - started;
+    const inputBody = await inputResponse.json();
+    assert(inputResponse.ok(), "Browser UI input request failed", {
+      status: inputResponse.status(),
+      body: inputBody,
+    });
+    assert(inputBody?.schema === "elastos.browser.input-result/v1", "Browser UI input returned wrong schema", inputBody);
+    assert(inputBody.accepted === true, "Browser UI input was not accepted", inputBody);
+    assert(inputBody.direct_network === false, "Browser UI input reported direct network", inputBody);
+    assert(
+      durationMs <= BROWSER_INPUT_MAX_MS,
+      "Browser UI input exceeded latency budget",
+      { duration_ms: durationMs, max_ms: BROWSER_INPUT_MAX_MS, input: inputBody },
+    );
+    const clicks = await appPage.evaluate(() => window.__elastosBrowserSmokeClicks || []);
+    assert(clicks.length > 0, "Browser UI click did not reach the render panel");
+    return {
+      page_id: pageId,
+      url: appUrl.searchParams.get("url"),
+      display_mode: BROWSER_OPEN_DISPLAY_MODE,
+      click: { x: clickX, y: clickY },
+      input: {
+        accepted: inputBody.accepted,
+        duration_ms: durationMs,
+        actual_url: inputBody.actual_url,
+        title: inputBody.title,
+      },
+      dom_clicks: clicks.slice(-3),
+    };
+  } finally {
+    const closePageId = pageId || openedPageId;
+    if (closePageId) {
+      closed = await browserApi(
+        appPage,
+        browserToken,
+        `/api/apps/browser/pages/${encodeURIComponent(closePageId)}/close`,
+        { method: "POST", body: {} },
+      ).catch((error) => ({ ok: false, error: error.message }));
+      assertBrowserCloseOkOrInactive(
+        closed,
+        `Browser UI smoke could not close Runtime Browser page ${closePageId}`,
+      );
+    }
+    await appPage.close().catch(() => {});
+  }
+}
+
+async function holdBrowserUiForSetup(context, browserToken, route) {
+  const appPage = await context.newPage();
+  const webrtcSignals = attachWebrtcSignalCapture(appPage);
+  let pageId = "";
+  let openedPageId = "";
+  let openResult = null;
+  let closed = null;
+  try {
+    const appUrl = new URL(route, HOME_URL);
+    appUrl.searchParams.set("url", BROWSER_OPEN_URLS[0] || "https://example.com/");
+    appUrl.searchParams.set("display", BROWSER_OPEN_DISPLAY_MODE);
+    const openResultPromise = appPage.waitForResponse(
+      (response) => {
+        const request = response.request();
+        return request.method() === "POST" && response.url().endsWith("/api/apps/browser/open");
+      },
+      { timeout: BROWSER_UI_PAGE_ID_TIMEOUT_MS },
+    ).then(async (response) => {
+      const body = await response.json().catch(() => ({}));
+      openedPageId = String(body?.engine_page?.page_id || "");
+      return {
+        ok: response.ok(),
+        status: response.status(),
+        body,
+      };
+    }).catch((error) => ({
+      ok: false,
+      error: error.message || String(error),
+    }));
+    await appPage.goto(appUrl.toString(), { waitUntil: "domcontentloaded" });
+    try {
+      pageId = await appPage.waitForFunction(
+        () => window.__elastosBrowserCurrentPageId || "",
+        null,
+        { timeout: BROWSER_UI_PAGE_ID_TIMEOUT_MS },
+      ).then((handle) => handle.jsonValue());
+    } catch (error) {
+      openResult = await openResultPromise;
+      const domState = await appPage.evaluate(() => ({
+        href: window.location.href,
+        title: document.title,
+        body_loading: document.body?.dataset?.loading || "",
+        current_page_id: window.__elastosBrowserCurrentPageId || "",
+        status: document.querySelector("#browser-status")?.textContent?.trim() || "",
+        address: document.querySelector("#browser-url")?.value || "",
+      })).catch(() => null);
+      throw Object.assign(new Error("Browser setup UI did not publish the current page id"), {
+        details: { error: error.message || String(error), open_result: openResult, dom: domState },
+      });
+    }
+    openResult = await openResultPromise;
+    assert(pageId, "Browser setup UI did not publish the current page id", openResult);
+    assert(openResult.ok, "Browser setup UI open request failed", openResult);
+    const panel = appPage.locator("#browser-render-panel");
+    const box = await panel.boundingBox();
+    assert(box && box.width > 0 && box.height > 0, "Browser setup render panel has no visible box", box);
+    const displaySession = openResult.body?.engine_page?.display_session || {};
+    let videoReady = null;
+    if (BROWSER_OPEN_DISPLAY_MODE === "webrtc_remote_display") {
+      assert(
+        displaySession.media_transport === "runtime_relay",
+        "Browser setup UI did not use Runtime relay media transport",
+        displaySession,
+      );
+      assert(
+        hasCredentialedTurnIceServer(displaySession.ice_servers),
+        "Browser setup UI Runtime relay TURN server is missing credentials",
+        summarizeDisplaySession(displaySession),
+      );
+      try {
+        videoReady = await waitForBrowserRemoteVideo(appPage, {
+          browserToken,
+          pageId,
+          displaySession,
+          timeoutMs: BROWSER_REMOTE_VIDEO_TIMEOUT_MS,
+        });
+      } catch (error) {
+        error.details = {
+          ...(error.details || {}),
+          webrtc_signals: webrtcSignals,
+        };
+        throw error;
+      }
+    }
+    const holdStartedAt = Date.now();
+    while (Date.now() - holdStartedAt < BROWSER_OPEN_HOLD_MS) {
+      await delay(Math.min(5000, Math.max(250, BROWSER_OPEN_HOLD_MS - (Date.now() - holdStartedAt))));
+      const response = await browserApi(
+        appPage,
+        browserToken,
+        `/api/apps/browser/pages/${encodeURIComponent(pageId)}/heartbeat`,
+        { method: "POST" },
+      );
+      assert(response.ok, "Browser setup heartbeat failed", response);
+    }
+    const status = await checkBrowserPageStatus(appPage, browserToken, pageId);
+    const diagnostics = CHECK_BROWSER_DIAGNOSTICS
+      ? await checkBrowserPageDiagnostics(appPage, browserToken, pageId)
+      : null;
+    return {
+      page_id: pageId,
+      url: appUrl.searchParams.get("url"),
+      display_mode: BROWSER_OPEN_DISPLAY_MODE,
+      hold_ms: BROWSER_OPEN_HOLD_MS,
+      video_ready: videoReady,
+      status,
+      diagnostics,
+      webrtc_signals: webrtcSignals,
+    };
+  } finally {
+    const closePageId = pageId || openedPageId;
+    if (closePageId) {
+      closed = await browserApi(
+        appPage,
+        browserToken,
+        `/api/apps/browser/pages/${encodeURIComponent(closePageId)}/close`,
+        { method: "POST", body: {} },
+      ).catch((error) => ({ ok: false, error: error.message }));
+      assertBrowserCloseOkOrInactive(
+        closed,
+        `Browser setup UI could not close Runtime Browser page ${closePageId}`,
+      );
+    }
+    await appPage.close().catch(() => {});
+  }
+}
+
+async function checkBrowserEmbeddedUiInput(page) {
+  const webrtcSignals = [];
+  const captureWebrtcResponse = async (response) => {
+    const request = response.request();
+    if (request.method() !== "POST" || !response.url().includes("/webrtc")) {
+      return;
+    }
+    let requestBody = null;
+    try {
+      requestBody = JSON.parse(request.postData() || "null");
+    } catch {
+      requestBody = request.postData() || "";
+    }
+    let responseBody = null;
+    try {
+      responseBody = await response.json();
+    } catch {
+      responseBody = await response.text().catch(() => "");
+    }
+    webrtcSignals.push({
+      url: response.url(),
+      status: response.status(),
+      request: requestBody,
+      response: responseBody,
+    });
+  };
+  page.on("response", captureWebrtcResponse);
+  await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
+  await waitForSignedHome(page);
+  await page.evaluate(({ url, displayMode }) => {
+    window.postMessage({
+      type: "home:open-target",
+      target: "browser",
+      query: {
+        url,
+        display: displayMode,
+      },
+    }, window.location.origin);
+  }, {
+    url: BROWSER_OPEN_URLS[0] || "https://example.com/",
+    displayMode: BROWSER_OPEN_DISPLAY_MODE,
+  });
+
+  const windowLocator = page.locator('.window[data-target="browser"]:not(.hidden)').first();
+  await windowLocator.waitFor({ state: "visible", timeout: 30_000 });
+  await page.waitForFunction(() => {
+    const node = [...document.querySelectorAll('.window[data-target="browser"]')]
+      .find((candidate) => !candidate.classList.contains("hidden"));
+    return node?.classList.contains("window-active") &&
+      getComputedStyle(node.querySelector(".window-frame")).pointerEvents === "auto";
+  }, null, { timeout: 10_000 });
+  const frameHandle = await windowLocator.locator("iframe.window-frame").elementHandle();
+  assert(frameHandle, "Home Browser window did not contain an iframe");
+  const route = await frameHandle.getAttribute("src") || "";
+  const browserToken = new URL(route, HOME_URL).searchParams.get("home_token") || "";
+  assert(browserToken, "Embedded Browser iframe did not include a Browser app token", { route });
+  const appFrame = await frameHandle.contentFrame();
+  assert(appFrame, "Embedded Browser iframe did not expose a content frame");
+
+  let pageId = "";
+  try {
+    await appFrame.evaluate(() => {
+      window.__elastosBrowserSmokeClicks = [];
+      const panel = document.querySelector("#browser-render-panel");
+      panel?.addEventListener("click", (event) => {
+        window.__elastosBrowserSmokeClicks.push({
+          target: event.target?.id || event.target?.tagName || "",
+          currentTarget: event.currentTarget?.id || "",
+          clientX: event.clientX,
+          clientY: event.clientY,
+        });
+      }, { capture: true });
+    });
+    pageId = await appFrame.waitForFunction(
+      () => window.__elastosBrowserCurrentPageId || "",
+      null,
+      { timeout: BROWSER_UI_PAGE_ID_TIMEOUT_MS },
+    ).then((handle) => handle.jsonValue()).catch(async (error) => {
+      throw Object.assign(new Error("Embedded Browser UI did not publish the current page id before timeout"), {
+        details: await embeddedBrowserDebugState(windowLocator, appFrame),
+        cause: error,
+      });
+    });
+    assert(pageId, "Embedded Browser UI did not publish the current page id");
+    const panelBox = await appFrame.locator("#browser-render-panel").boundingBox();
+    assert(panelBox && panelBox.width > 0 && panelBox.height > 0, "Embedded Browser render panel has no clickable box", panelBox);
+    const clickX = Math.max(1, Math.min(panelBox.width - 1, BROWSER_INPUT_CLICK_X));
+    const clickY = Math.max(1, Math.min(panelBox.height - 1, BROWSER_INPUT_CLICK_Y));
+    const initialGeometry = await embeddedBrowserGeometry(windowLocator, appFrame);
+    assertEmbeddedBrowserAspect(initialGeometry);
+    if (BROWSER_OPEN_DISPLAY_MODE === "webrtc_remote_display") {
+      const initialStatus = await checkBrowserPageStatus(page, browserToken, pageId);
+      const displaySession = initialStatus.display_session || {};
+      assert(
+        displaySession.media_transport === "runtime_relay",
+        "Embedded Browser WebRTC UI did not use Runtime relay media transport",
+        displaySession,
+      );
+      assert(
+        hasTurnIceServer(displaySession.ice_servers),
+        "Embedded Browser WebRTC UI Runtime relay is missing a TURN ICE server",
+        displaySession,
+      );
+      assert(
+        hasCredentialedTurnIceServer(displaySession.ice_servers),
+        "Embedded Browser WebRTC UI Runtime relay TURN server is missing credentials",
+        displaySession,
+      );
+      const videoReady = await waitForBrowserRemoteVideo(appFrame, {
+        browserToken,
+        pageId,
+        displaySession,
+        timeoutMs: BROWSER_REMOTE_VIDEO_TIMEOUT_MS,
+        webrtcSignals,
+      }).catch((error) => {
+        error.details = {
+          ...(error.details || {}),
+          webrtc_signals: webrtcSignals,
+        };
+        throw error;
+      });
+      const beforeClickVideo = await browserRemoteVideoMetrics(appFrame);
+      const videoBox = await appFrame.locator("#browser-remote-display").boundingBox();
+      assert(videoBox && videoBox.width > 0 && videoBox.height > 0, "Embedded Browser WebRTC video has no clickable box", {
+        video_box: videoBox,
+        geometry: initialGeometry,
+      });
+      let clickTarget = null;
+      let videoClickX = Math.max(1, Math.min(videoBox.width - 1, BROWSER_INPUT_CLICK_X));
+      let videoClickY = Math.max(1, Math.min(videoBox.height - 1, BROWSER_INPUT_CLICK_Y));
+      if (BROWSER_UI_CLICK_HREF_RE) {
+        const targetProof = await waitForBrowserHrefClickTarget(
+          page,
+          browserToken,
+          pageId,
+          BROWSER_UI_CLICK_HREF_RE,
+        );
+        clickTarget = targetProof.target;
+        const targetPoint = {
+          x: clickTarget.rect.x + clickTarget.rect.width / 2,
+          y: clickTarget.rect.y + clickTarget.rect.height / 2,
+        };
+        const mappedPoint = await remoteVideoClickPositionForPagePoint(appFrame, targetPoint);
+        assert(mappedPoint, "Embedded Browser UI could not map page click target into video", {
+          target: clickTarget,
+          mapped: mappedPoint,
+          video_box: videoBox,
+        });
+        videoClickX = Math.max(1, Math.min(videoBox.width - 1, Math.round(mappedPoint.x)));
+        videoClickY = Math.max(1, Math.min(videoBox.height - 1, Math.round(mappedPoint.y)));
+      }
+      const clickInputResponsePromise = BROWSER_UI_CLICK_EXPECT_URL_RE || BROWSER_UI_CLICK_HREF_RE
+        ? page.waitForResponse(
+            (response) => {
+              const request = response.request();
+              return request.method() === "POST" &&
+                response.url().includes(`/api/apps/browser/pages/${encodeURIComponent(pageId)}/input`);
+            },
+            { timeout: 2500 },
+          ).then(async (response) => ({
+            ok: response.ok(),
+            status: response.status(),
+            body: await response.json().catch(() => ({})),
+          })).catch((error) => ({
+            ok: false,
+            error: error.message || String(error),
+          }))
+        : null;
+      await appFrame.locator("#browser-remote-display").click({ position: { x: videoClickX, y: videoClickY } });
+      let clickInput = clickInputResponsePromise ? await clickInputResponsePromise : null;
+      await delay(750);
+      const afterClickVideo = await browserRemoteVideoMetrics(appFrame);
+      const statusTextAfterClick = await appFrame.locator("#browser-status").innerText().catch(() => "");
+      assert(
+        !/input channel is not open|failed closed|Browser remote display .*failed/i.test(statusTextAfterClick),
+        "Embedded Browser WebRTC click left an input/display error",
+        { status: statusTextAfterClick },
+      );
+      let clickNavigation = null;
+      if (BROWSER_UI_CLICK_EXPECT_URL_RE) {
+        const addressMatch = await waitForBrowserUiAddressMatch(
+          appFrame,
+          BROWSER_UI_CLICK_EXPECT_URL_RE,
+          BROWSER_UI_CLICK_NAV_TIMEOUT_MS,
+        ).catch(async (error) => {
+          const runtimeStatus = await checkBrowserPageStatus(
+            page,
+            browserToken,
+            pageId,
+          ).catch((statusError) => ({
+            error: statusError.message || String(statusError),
+            details: statusError.details || null,
+          }));
+          error.details = {
+            ...(error.details || {}),
+            click: { x: Math.round(videoClickX), y: Math.round(videoClickY), target: clickTarget },
+            click_input: clickInput,
+            runtime_status: runtimeStatus,
+          };
+          throw error;
+        });
+        const status = await checkBrowserPageStatus(page, browserToken, pageId);
+        clickInput = normalizeRemoteDisplayClickInputEvidence(
+          clickInput,
+          status,
+          addressMatch,
+        );
+        clickNavigation = {
+          expected_url_re: BROWSER_UI_CLICK_EXPECT_URL_RE,
+          ...addressMatch,
+          input: clickInput,
+          status,
+        };
+      }
+      const navStarted = Date.now();
+      const inputResponsePromise = page.waitForResponse(
+        (response) => {
+          const request = response.request();
+          return request.method() === "POST" &&
+            response.url().includes(`/api/apps/browser/pages/${encodeURIComponent(pageId)}/input`);
+        },
+        { timeout: 60_000 },
+      );
+      await appFrame.locator("#browser-url").fill(BROWSER_UI_NAV_URL);
+      await appFrame.locator("#browser-url").press("Enter");
+      const inputResponse = await inputResponsePromise;
+      const inputResponseMs = Date.now() - navStarted;
+      const inputBody = await inputResponse.json();
+      assert(inputResponse.ok(), "Embedded Browser WebRTC navigation request failed", {
+        status: inputResponse.status(),
+        body: inputBody,
+      });
+      assert(inputBody?.schema === "elastos.browser.input-result/v1", "Embedded Browser WebRTC navigation returned wrong schema", inputBody);
+      assert(inputBody.accepted === true, "Embedded Browser WebRTC navigation was not accepted", inputBody);
+      assert(inputBody.direct_network === false, "Embedded Browser WebRTC navigation reported direct network", inputBody);
+      const navStatus = await waitForBrowserPageStatus(
+        page,
+        browserToken,
+        pageId,
+        (status) => status.actual_url === BROWSER_UI_NAV_URL,
+        `actual_url=${BROWSER_UI_NAV_URL}`,
+        60_000,
+      );
+      const statusMatchMs = Date.now() - navStarted;
+      await appFrame.waitForFunction(
+        (expected) => document.querySelector("#browser-url")?.value === expected,
+        navStatus.actual_url,
+        { timeout: 15_000 },
+      );
+      const addressMatchMs = Date.now() - navStarted;
+      const addressValue = await appFrame.locator("#browser-url").inputValue();
+      const clicks = await appFrame.evaluate(() => window.__elastosBrowserSmokeClicks || []);
+      assert(clicks.length > 0, "Embedded Browser WebRTC click did not reach the render panel");
+      return {
+        page_id: pageId,
+        route_prefix: route.split("?")[0],
+        display_mode: BROWSER_OPEN_DISPLAY_MODE,
+        display_session: summarizeDisplaySession(displaySession),
+        geometry: {
+          initial: initialGeometry,
+          after_navigation: await embeddedBrowserGeometry(windowLocator, appFrame),
+        },
+        video: {
+          ready: videoReady,
+          before_click: beforeClickVideo,
+          after_click: afterClickVideo,
+        },
+        click: { x: Math.round(videoClickX), y: Math.round(videoClickY) },
+        click_navigation: clickNavigation,
+        navigation: {
+          requested_url: BROWSER_UI_NAV_URL,
+          duration_ms: Date.now() - navStarted,
+          input_response_ms: inputResponseMs,
+          status_match_ms: statusMatchMs,
+          address_match_ms: addressMatchMs,
+          input: {
+            accepted: inputBody.accepted,
+            actual_url: inputBody.actual_url,
+            title: inputBody.title,
+          },
+          status: navStatus,
+          address_value: addressValue,
+        },
+        window_active: await windowLocator.evaluate((node) => node.classList.contains("window-active")),
+        frame_pointer_events: await windowLocator.evaluate((node) =>
+          getComputedStyle(node.querySelector(".window-frame")).pointerEvents,
+        ),
+        dom_clicks: clicks.slice(-3),
+      };
+    }
+    await appFrame.locator("#browser-remote-display").waitFor({ state: "visible", timeout: 180_000 });
+    if (CHECK_BROWSER_EMBEDDED_RECOVERY) {
+      const oldPageId = pageId;
+      const closed = await browserApi(
+        page,
+        browserToken,
+        `/api/apps/browser/pages/${encodeURIComponent(oldPageId)}/close`,
+        { method: "POST", body: {} },
+      );
+      assert(closed.ok, `Embedded Browser recovery smoke could not close Runtime Browser page ${oldPageId}`, closed);
+      pageId = "";
+      const matchesBrowserOpen = (requestOrResponse) => {
+        const request = requestOrResponse.request?.() || requestOrResponse;
+        return request.method() === "POST" && request.url().endsWith("/api/apps/browser/open");
+      };
+      const openRequestPromise = page.waitForRequest(matchesBrowserOpen, {
+        timeout: 5_000,
+      });
+      const openResponsePromise = page.waitForResponse(
+        (response) => {
+          return matchesBrowserOpen(response);
+        },
+        { timeout: 160_000 },
+      );
+      const started = Date.now();
+      await appFrame.locator("#browser-render-panel").click({ position: { x: clickX, y: clickY } });
+      await openRequestPromise;
+      const requestDurationMs = Date.now() - started;
+      const openResponse = await openResponsePromise;
+      const durationMs = Date.now() - started;
+      assert(openResponse.ok(), "Embedded Browser recovery open request failed", {
+        status: openResponse.status(),
+        body: await openResponse.text(),
+      });
+      pageId = await appFrame.waitForFunction(
+        (previous) => {
+          const next = window.__elastosBrowserCurrentPageId || "";
+          return next && next !== previous ? next : "";
+        },
+        oldPageId,
+        { timeout: 20_000 },
+      ).then((handle) => handle.jsonValue());
+      assert(pageId, "Embedded Browser recovery did not publish a replacement page id");
+      await appFrame.locator("#browser-remote-display").waitFor({ state: "visible", timeout: 30_000 });
+      const clicks = await appFrame.evaluate(() => window.__elastosBrowserSmokeClicks || []);
+      return {
+        page_id: pageId,
+        route_prefix: route.split("?")[0],
+        display_mode: BROWSER_OPEN_DISPLAY_MODE,
+        geometry: {
+          initial: initialGeometry,
+          after_recovery: await embeddedBrowserGeometry(windowLocator, appFrame),
+        },
+        window_active: await windowLocator.evaluate((node) => node.classList.contains("window-active")),
+        frame_pointer_events: await windowLocator.evaluate((node) =>
+          getComputedStyle(node.querySelector(".window-frame")).pointerEvents,
+        ),
+        click: { x: clickX, y: clickY },
+        recovery: {
+          old_page_id: oldPageId,
+          new_page_id: pageId,
+          request_duration_ms: requestDurationMs,
+          duration_ms: durationMs,
+        },
+        dom_clicks: clicks.slice(-3),
+      };
+    }
+    const inputResponsePromise = page.waitForResponse(
+      (response) => {
+        const request = response.request();
+        return request.method() === "POST" &&
+          response.url().includes(`/api/apps/browser/pages/${encodeURIComponent(pageId)}/input`);
+      },
+      { timeout: BROWSER_INPUT_MAX_MS },
+    );
+    const started = Date.now();
+    await appFrame.locator("#browser-render-panel").click({ position: { x: clickX, y: clickY } });
+    const inputResponse = await inputResponsePromise;
+    const durationMs = Date.now() - started;
+    const inputBody = await inputResponse.json();
+    assert(inputResponse.ok(), "Embedded Browser UI input request failed", {
+      status: inputResponse.status(),
+      body: inputBody,
+    });
+    assert(inputBody?.schema === "elastos.browser.input-result/v1", "Embedded Browser UI input returned wrong schema", inputBody);
+    assert(inputBody.accepted === true, "Embedded Browser UI input was not accepted", inputBody);
+    assert(inputBody.direct_network === false, "Embedded Browser UI input reported direct network", inputBody);
+    assert(
+      durationMs <= BROWSER_INPUT_MAX_MS,
+      "Embedded Browser UI input exceeded latency budget",
+      { duration_ms: durationMs, max_ms: BROWSER_INPUT_MAX_MS, input: inputBody },
+    );
+    const clicks = await appFrame.evaluate(() => window.__elastosBrowserSmokeClicks || []);
+    assert(clicks.length > 0, "Embedded Browser UI click did not reach the render panel");
+    return {
+      page_id: pageId,
+      route_prefix: route.split("?")[0],
+      display_mode: BROWSER_OPEN_DISPLAY_MODE,
+      geometry: {
+        initial: initialGeometry,
+        after_input: await embeddedBrowserGeometry(windowLocator, appFrame),
+      },
+      window_active: await windowLocator.evaluate((node) => node.classList.contains("window-active")),
+      frame_pointer_events: await windowLocator.evaluate((node) =>
+        getComputedStyle(node.querySelector(".window-frame")).pointerEvents,
+      ),
+      click: { x: clickX, y: clickY },
+      input: {
+        accepted: inputBody.accepted,
+        duration_ms: durationMs,
+        actual_url: inputBody.actual_url,
+        title: inputBody.title,
+      },
+      dom_clicks: clicks.slice(-3),
+    };
+  } finally {
+    page.off("response", captureWebrtcResponse);
+    if (pageId && browserToken) {
+      const closed = await browserApi(
+        page,
+        browserToken,
+        `/api/apps/browser/pages/${encodeURIComponent(pageId)}/close`,
+        { method: "POST", body: {} },
+      ).catch((error) => ({ ok: false, error: error.message }));
+      const inactiveCleanup =
+        closed.status === 404 &&
+        /browser session is not active/i.test(String(closed.body?.raw || ""));
+      assert(
+        closed.ok || inactiveCleanup,
+        `Embedded Browser UI smoke could not close Runtime Browser page ${pageId}`,
+        closed,
+      );
+    }
+  }
+}
+
 function settleTokenWithin(promise, timeoutMs) {
   return Promise.race([
     promise.catch(() => null),
@@ -231,7 +2182,16 @@ async function ensureSignedWithVirtualPasskey(page) {
   await waitForHomeReady(page);
   let state = await homeState(page);
   if (state.authority === "signed") {
-    return { created: false, mode: "existing-session" };
+    await signOut(page);
+    try {
+      const homeToken = await signBackIn(page);
+      return { created: false, mode: "existing-session", homeToken };
+    } catch (error) {
+      state = await homeState(page);
+      if (!state.unlockVisible) {
+        throw error;
+      }
+    }
   }
 
   const status = await statusFromServer(page);
@@ -242,6 +2202,16 @@ async function ensureSignedWithVirtualPasskey(page) {
   if (!registered) {
     const created = await createPasskeyFromCurrentUnlock(page, "admin");
     return { created: true, ...created };
+  }
+
+  if (hasVirtualAuthenticatorCredentialStore()) {
+    try {
+      const homeToken = await signBackIn(page);
+      return { created: false, mode: "existing-passkey", homeToken };
+    } catch {
+      await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
+      await waitForHomeReady(page);
+    }
   }
 
   if (!guestRegistrationEnabled) {
@@ -284,16 +2254,60 @@ async function currentPasskey(page, homeToken) {
   }, homeToken);
 }
 
-async function signOut(page) {
-  await page.evaluate(async (token) => {
-    const response = await fetch("/api/auth/sessions/sign-out", {
+async function refreshCurrentHomeToken(page) {
+  return page.evaluate(async () => {
+    const response = await fetch("/api/auth/sessions/refresh", {
       method: "POST",
       credentials: "same-origin",
     });
-    if (!response.ok && response.status !== 401 && response.status !== 403) {
-      throw new Error(`POST /api/auth/sessions/sign-out -> ${response.status}`);
+    const text = await response.text();
+    let body = {};
+    try {
+      body = text ? JSON.parse(text) : {};
+    } catch {
+      body = { raw: text };
     }
+    return {
+      ok: response.ok,
+      status: response.status,
+      body,
+      homeToken: typeof body.home_token === "string" ? body.home_token : "",
+    };
   });
+}
+
+async function signOut(page, homeToken = "") {
+  const refreshed = homeToken ? null : await refreshCurrentHomeToken(page);
+  const activeHomeToken = homeToken || refreshed?.homeToken || "";
+  const signedOut = await page.evaluate(async (token) => {
+    const headers = { "content-type": "application/json" };
+    if (token) {
+      headers["x-elastos-home-token"] = token;
+    }
+    const response = await fetch("/api/auth/sessions/sign-out", {
+      method: "POST",
+      credentials: "same-origin",
+      headers,
+    });
+    const text = await response.text();
+    let body = {};
+    try {
+      body = text ? JSON.parse(text) : {};
+    } catch {
+      body = { raw: text };
+    }
+    return {
+      ok: response.ok,
+      status: response.status,
+      body,
+    };
+  }, activeHomeToken);
+  assert(signedOut.ok, "Home sign-out request failed", {
+    refreshed,
+    signed_out: signedOut,
+    token_present: activeHomeToken.length > 0,
+  });
+  await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
 }
 
 async function signBackIn(page) {
@@ -346,18 +2360,25 @@ async function launchSystem(page, homeToken) {
   }, homeToken);
   assert(route.includes("home_token="), "System launch did not mint an app-scoped token", { route });
   await page.goto(new URL(route, HOME_URL).toString(), { waitUntil: "domcontentloaded" });
-  await page.locator(".system-shell").waitFor({ state: "visible", timeout: 20_000 });
+  await page.locator(".settings-container").waitFor({ state: "visible", timeout: 20_000 });
   const system = await page.evaluate(() => ({
     title: document.title,
-    panels: [...document.querySelectorAll(".system-panel h2")].map((node) => node.textContent?.trim() || ""),
-    fields: [...document.querySelectorAll(".system-field dt")].map((node) => node.textContent?.trim() || ""),
+    tabs: [...document.querySelectorAll(".settings-sidebar-text")].map((node) => node.textContent?.trim() || ""),
+    sections: [...document.querySelectorAll(".pc2-section-title")].map((node) => node.textContent?.trim() || ""),
+    fields: [...document.querySelectorAll(".system-fields dt")].map((node) => node.textContent?.trim() || ""),
     walletControlsRemoved: !document.querySelector("#wallet-create")
       && !document.querySelector("#wallet-approvals")
       && !document.querySelector("#wallet-accounts"),
     errorText: document.querySelector(".system-error:not([hidden])")?.textContent?.trim() || "",
   }));
   assert(system.title === "System · ElastOS", "System title mismatch after signed launch", system);
-  assert(system.panels.includes("Account") && system.panels.includes("Advanced"), "System panels did not render", system);
+  assert(
+    system.tabs.includes("About") &&
+      system.sections.includes("Appearance") &&
+      system.sections.includes("This Device"),
+    "System sections did not render",
+    system,
+  );
   assert(system.fields.includes("Accounts") && system.fields.includes("Recovery"), "System signed account fields did not render", system);
   assert(!system.fields.includes("Wallet"), "System should not duplicate Wallet controls", system);
   assert(system.walletControlsRemoved, "System should not include wallet account or approval controls", system);
@@ -367,8 +2388,6 @@ async function launchSystem(page, homeToken) {
 
 async function checkBrowserLaunchGrant(page, homeToken) {
   assert(homeToken, "checkBrowserLaunchGrant requires a passkey-issued Home token");
-  await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
-  await waitForSignedHome(page);
   const launched = await page.evaluate(async (token) => {
     const response = await fetch("/api/apps/home/launch", {
       method: "POST",
@@ -392,6 +2411,19 @@ async function checkBrowserLaunchGrant(page, homeToken) {
   assert(launched.body?.target === "browser", "Browser launch did not resolve the Browser capsule", launched);
   const route = String(launched.body?.route || "");
   assert(route.includes("home_token="), "Browser launch did not mint an app token", launched);
+  if (CHECK_BROWSER_UI_SETUP) {
+    const browserToken = new URL(route, HOME_URL).searchParams.get("home_token") || "";
+    assert(browserToken, "Browser launch route did not contain a Browser app token", launched);
+    launched.body.browser_ui_setup = await holdBrowserUiForSetup(page.context(), browserToken, route);
+  }
+  if (CHECK_BROWSER_UI_INPUT) {
+    const browserToken = new URL(route, HOME_URL).searchParams.get("home_token") || "";
+    assert(browserToken, "Browser launch route did not contain a Browser app token", launched);
+    launched.body.browser_ui_input = await checkBrowserUiInput(page.context(), browserToken, route);
+  }
+  if (CHECK_BROWSER_EMBEDDED_UI_INPUT) {
+    launched.body.browser_embedded_ui_input = await checkBrowserEmbeddedUiInput(page);
+  }
   if (OPEN_BROWSER) {
     const browserToken = new URL(route, HOME_URL).searchParams.get("home_token") || "";
     assert(browserToken, "Browser launch route did not contain a Browser app token", launched);
@@ -417,19 +2449,22 @@ async function checkBrowserLaunchGrant(page, homeToken) {
         net: summaryBefore.body.net,
       };
     }
+    const guaranteeLevel = browserOpenGuaranteeLevel(summaryBefore?.body?.engine_adapter);
     const urls = BROWSER_OPEN_URLS;
     const pages = [];
     const closeResults = [];
+    let capacityRejection = null;
     try {
-      const openedPages = await Promise.all(
+      const openAttempts = await Promise.allSettled(
         Array.from({ length: BROWSER_OPEN_CONCURRENT }, async (_, index) => {
           const opened = await browserApi(page, browserToken, "/api/apps/browser/open", {
             method: "POST",
             body: {
               url: urls[index],
               reason: `virtual passkey Browser open smoke ${index + 1}`,
-              viewport: { width: 1280, height: 720 },
-              display_mode: "webrtc_remote_display",
+              viewport: { width: BROWSER_OPEN_VIEWPORT_WIDTH, height: BROWSER_OPEN_VIEWPORT_HEIGHT },
+              display_mode: BROWSER_OPEN_DISPLAY_MODE,
+              guarantee_level: guaranteeLevel,
             },
           });
           assert(opened.ok, `Browser app token could not open Runtime Browser page ${index + 1}`, opened);
@@ -437,22 +2472,44 @@ async function checkBrowserLaunchGrant(page, homeToken) {
           assert(opened.body?.schema === "elastos.browser.open-result/v1", "Browser open returned wrong schema", opened);
           assert(opened.body?.engine_page?.schema === "elastos.browser.engine.page/v1", "Browser open returned wrong engine page schema", opened);
           assert(opened.body.engine_page.direct_network === false, "Browser open reported direct network", opened.body.engine_page);
-          assert(opened.body.engine_page.engine_control === "page_scoped", "Browser open did not return page-scoped control", opened.body.engine_page);
-          assert(opened.body.engine_page.isolated_engine_session === true, "Browser open did not isolate the engine session", opened.body.engine_page);
-          assert(opened.body.engine_page.display_session?.mode === "webrtc_remote_display", "Browser open did not return WebRTC display", opened.body.engine_page);
-          return {
+          assert(pageId, "Browser open did not return a page id", opened.body.engine_page);
+          assert(
+            String(opened.body.engine_page.display_session?.signaling_url || "").includes(encodeURIComponent(pageId)),
+            "Browser open did not return a page-scoped signaling route",
+            opened.body.engine_page,
+          );
+          assert(
+            opened.body.engine_page.display_session?.mode === BROWSER_OPEN_DISPLAY_MODE,
+            "Browser open returned the wrong display mode",
+            opened.body.engine_page,
+          );
+          const entry = {
             page_id: pageId,
             url: urls[index],
+            stream_session: publicBrowserStreamSession(opened.body?.stream_session),
             display_backend: opened.body.engine_page.display_session.display_backend,
             display_mode: opened.body.engine_page.display_session.mode,
-            engine_control: opened.body.engine_page.engine_control,
-            isolated_engine_session: opened.body.engine_page.isolated_engine_session,
+            control_scope: "page_route",
+            isolated_engine_session: true,
             direct_network: opened.body.engine_page.direct_network,
             actual_url: opened.body.engine_page.actual_url,
+            input: null,
+            status: null,
+            diagnostics: null,
           };
+          pages.push(entry);
+          entry.status = CHECK_BROWSER_FRAME
+            ? await waitForBrowserStatus(page, browserToken, pageId)
+            : null;
+          entry.input = CHECK_BROWSER_INPUT
+            ? await checkBrowserRuntimeInput(page, browserToken, pageId)
+            : null;
         }),
       );
-      pages.push(...openedPages);
+      const failedOpen = openAttempts.find((attempt) => attempt.status === "rejected");
+      if (failedOpen) {
+        throw failedOpen.reason;
+      }
       const uniquePageIds = new Set(pages.map((entry) => entry.page_id));
       assert(uniquePageIds.size === pages.length, "Browser concurrent open returned duplicate page IDs", pages);
 
@@ -464,6 +2521,34 @@ async function checkBrowserLaunchGrant(page, homeToken) {
         "Browser session-capacity receipt did not account for opened pages",
         { before: summaryBefore?.body?.sessions, after: summaryAfterOpen.body?.sessions, pages },
       );
+      if (EXPECT_BROWSER_CAPACITY_REJECTION) {
+        const rejected = await browserApi(page, browserToken, "/api/apps/browser/open", {
+          method: "POST",
+          body: {
+            url: urls[pages.length] || urls[0],
+            reason: "virtual passkey Browser capacity rejection smoke",
+            viewport: { width: BROWSER_OPEN_VIEWPORT_WIDTH, height: BROWSER_OPEN_VIEWPORT_HEIGHT },
+            display_mode: BROWSER_OPEN_DISPLAY_MODE,
+            guarantee_level: guaranteeLevel,
+          },
+        });
+        assert(!rejected.ok, "Browser capacity rejection smoke unexpectedly opened an extra page", rejected);
+        assert(
+          rejected.status === 503,
+          "Browser capacity rejection must use HTTP 503 Service Unavailable",
+          rejected,
+        );
+        assert(
+          rejected.body?.code === "browser_capacity_unavailable",
+          "Browser capacity rejection did not preserve the provider error code",
+          rejected,
+        );
+        capacityRejection = {
+          status: rejected.status,
+          code: rejected.body.code,
+          message: rejected.body.message || "",
+        };
+      }
 
       const heartbeat = async () => {
         await Promise.all(pages.map(async (entry) => {
@@ -483,6 +2568,19 @@ async function checkBrowserLaunchGrant(page, homeToken) {
         await delay(Math.min(5000, Math.max(250, BROWSER_OPEN_HOLD_MS - (Date.now() - holdStartedAt))));
         await heartbeat();
       }
+      await Promise.all(pages.map(async (entry) => {
+        entry.status = await checkBrowserPageStatus(page, browserToken, entry.page_id);
+        entry.actual_url = entry.status.actual_url || entry.actual_url;
+        if (CHECK_BROWSER_DIAGNOSTICS) {
+          entry.diagnostics = await checkBrowserPageDiagnostics(page, browserToken, entry.page_id);
+          entry.diagnostic_click_actions = await runBrowserDiagnosticClickSequence(
+            page,
+            browserToken,
+            entry.page_id,
+            entry.diagnostics,
+          );
+        }
+      }));
     } finally {
       await Promise.all(pages.map(async (entry) => {
         const closed = await browserApi(
@@ -503,13 +2601,16 @@ async function checkBrowserLaunchGrant(page, homeToken) {
           closed,
         );
         if (entry.isolated_engine_session) {
+          const reconciledAlreadyClosed =
+            closed.body?.reconciled === true &&
+            closed.body?.already_closed === true &&
+            closed.body?.cleanup?.schema === "elastos.browser.runtime-session-cleanup/v1" &&
+            closed.body?.cleanup?.ok === true;
+          const isolatedShutdown =
+            closed.body?.isolated_session === true &&
+            (closed.body?.shutdown?.ok === true || closed.body?.cleanup?.ok === true);
           assert(
-            closed.body?.isolated_session === true,
-            `Browser close for ${entry.page_id} did not report isolated_session=true`,
-            closed,
-          );
-          assert(
-            closed.body?.shutdown?.ok === true || closed.body?.cleanup?.ok === true,
+            isolatedShutdown || reconciledAlreadyClosed,
             `Browser close for ${entry.page_id} did not shutdown or cleanup the isolated session`,
             closed,
           );
@@ -522,13 +2623,21 @@ async function checkBrowserLaunchGrant(page, homeToken) {
     assert(
       Number(summaryAfterClose.body?.sessions?.principal_sessions || 0) <= baselinePrincipalSessions,
       "Browser session-capacity receipt still counted closed smoke pages",
-      { before: summaryBefore?.body?.sessions, after: summaryAfterClose.body?.sessions, pages },
+      {
+        before: summaryBefore?.body?.sessions,
+        after: summaryAfterClose.body?.sessions,
+        pages,
+        close_results: closeResults,
+      },
     );
     launched.body.browser_open = {
       concurrent_pages: pages.length,
+      display_mode: BROWSER_OPEN_DISPLAY_MODE,
+      guarantee_level: guaranteeLevel,
       hold_ms: BROWSER_OPEN_HOLD_MS,
       baseline_principal_sessions: baselinePrincipalSessions,
       final_principal_sessions: Number(summaryAfterClose.body?.sessions?.principal_sessions || 0),
+      capacity_rejection: capacityRejection,
       pages,
       close_results: closeResults,
     };
@@ -548,7 +2657,117 @@ async function checkBrowserLaunchGrant(page, homeToken) {
       net: summary.body.net,
     };
   }
+  if (CHECK_BROWSER_PROFILE_RESET) {
+    const browserToken = new URL(route, HOME_URL).searchParams.get("home_token") || "";
+    assert(browserToken, "Browser launch route did not contain a Browser app token", launched);
+    const reset = await browserApi(page, browserToken, "/api/apps/browser/profile/reset", {
+      method: "POST",
+    });
+    assert(reset.ok, "Browser profile reset failed", reset);
+    assert(
+      reset.body?.schema === "elastos.browser.profile-reset/v1" &&
+        reset.body?.profile?.scope === "active_principal" &&
+        reset.body?.profile?.storage === "principal_owned_profile_disk" &&
+        reset.body?.profile?.storage_posture === "principal_owned_reset_scoped_unprotected" &&
+        reset.body?.profile?.protected_storage === false &&
+        reset.body?.profile?.encrypted === false &&
+        reset.body?.profile?.recoverable === false &&
+        reset.body?.profile?.recovery === "not_recovery_kit_packaged" &&
+        reset.body?.profile?.reset === "whole_profile" &&
+        reset.body?.profile?.profile_key == null &&
+        reset.body?.profile?.principal_id == null,
+      "Browser profile reset returned an unsafe receipt",
+      reset.body,
+    );
+    launched.body.browser_profile_reset = {
+      schema: reset.body.schema,
+      status: reset.body.status,
+      profile: reset.body.profile,
+      removed_profile_disk: reset.body.removed_profile_disk === true,
+    };
+  }
   return launched.body;
+}
+
+async function checkAppLaunchMatrix(page, homeToken) {
+  assert(homeToken, "checkAppLaunchMatrix requires a passkey-issued Home token");
+  await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
+  await waitForSignedHome(page);
+  const summary = await browserApi(page, homeToken, "/api/apps/home/summary");
+  assert(summary.ok, "Home summary failed before app matrix", summary);
+  const targets = Array.isArray(summary.body?.targets) ? summary.body.targets : [];
+  const advertised = new Map(
+    targets
+      .filter((target) => typeof target?.target === "string")
+      .map((target) => [target.target, target]),
+  );
+  const results = [];
+  for (const target of APP_MATRIX_TARGETS) {
+    const summaryTarget = advertised.get(target);
+    if (!summaryTarget) {
+      results.push({ target, skipped: "not-advertised" });
+      continue;
+    }
+    const launched = await page.evaluate(async ({ token, appTarget }) => {
+      const response = await fetch("/api/apps/home/launch", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-elastos-home-token": token },
+        body: JSON.stringify({ target: appTarget }),
+      });
+      const text = await response.text();
+      let body = {};
+      try {
+        body = text ? JSON.parse(text) : {};
+      } catch {
+        body = { raw: text };
+      }
+      return {
+        ok: response.ok,
+        status: response.status,
+        body,
+      };
+    }, { token: homeToken, appTarget: target });
+    assert(launched.ok, `Home launch failed for ${target}`, launched);
+    assert(launched.body?.target === target, `Home launch resolved the wrong target for ${target}`, launched);
+    const route = String(launched.body?.route || "");
+    assert(route.includes("home_token="), `Home launch did not mint an app token for ${target}`, launched);
+    const appPage = await page.context().newPage();
+    try {
+      const response = await appPage.goto(new URL(route, HOME_URL).toString(), {
+        waitUntil: "domcontentloaded",
+        timeout: 25_000,
+      });
+      assert(response?.ok(), `App route did not load successfully for ${target}`, {
+        target,
+        status: response?.status(),
+        route,
+      });
+      const appState = await appPage.evaluate(() => ({
+        title: document.title,
+        bodyStatus: document.body?.dataset?.status || document.body?.dataset?.appStatus || "",
+        visibleError: [...document.querySelectorAll("[role='alert'], .error, .system-error")]
+          .map((node) => node.textContent?.trim() || "")
+          .filter(Boolean)
+          .slice(0, 3),
+      }));
+      assert(
+        !appState.visibleError.some((text) => /failed to open|access denied|invalid home launch token/i.test(text)),
+        `App route rendered an authority error for ${target}`,
+        { target, route, appState },
+      );
+      results.push({
+        target,
+        title: summaryTarget.title || "",
+        route_prefix: route.split("home_token=")[0],
+        status: response.status(),
+        document_title: appState.title,
+        body_status: appState.bodyStatus,
+      });
+    } finally {
+      await appPage.close().catch(() => {});
+    }
+  }
+  return results;
 }
 
 async function revokeCurrentPasskey(page, proofBindingId, homeToken) {
@@ -601,6 +2820,7 @@ async function main() {
   let cleanupResult = null;
   let homeToken = "";
   let cleanupAttempted = false;
+  let virtualAuthenticator = null;
   async function cleanupCreatedPasskey() {
     if (
       cleanupAttempted
@@ -616,7 +2836,7 @@ async function main() {
     return cleanupResult;
   }
   try {
-    await setupVirtualAuthenticator(context, page);
+    virtualAuthenticator = await setupVirtualAuthenticator(context, page);
     await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
     created = await ensureSignedWithVirtualPasskey(page);
     homeToken = created.homeToken;
@@ -631,9 +2851,13 @@ async function main() {
       "virtual passkey sign-in did not restore the same proof binding",
       { before: passkey, after: afterSignIn },
     );
+    const credentialStore = (!created.created || !CLEANUP_PASSKEY)
+      ? await persistVirtualAuthenticatorCredentials(virtualAuthenticator)
+      : { skipped: true, reason: "created credential will be cleaned up" };
 
     const system = await launchSystem(page, homeToken);
     const browserLaunch = INCLUDE_BROWSER ? await checkBrowserLaunchGrant(page, homeToken) : null;
+    const appMatrix = CHECK_APP_MATRIX ? await checkAppLaunchMatrix(page, homeToken) : null;
 
     if (created.created && CLEANUP_PASSKEY) {
       cleanupResult = await cleanupCreatedPasskey();
@@ -649,10 +2873,17 @@ async function main() {
       proof_binding_id: passkey.proof_binding_id,
       principal_id: passkey.principal_id,
       role: passkey.role,
+      virtual_authenticator_credentials: credentialStore,
       system_fields: system.fields,
       browser_launch_checked: Boolean(browserLaunch),
+      browser_ui_setup: browserLaunch?.browser_ui_setup || null,
+      browser_ui_input: browserLaunch?.browser_ui_input || null,
+      browser_embedded_ui_input: browserLaunch?.browser_embedded_ui_input || null,
+      browser_profile_reset: browserLaunch?.browser_profile_reset || null,
       browser_open_checked: Boolean(browserLaunch?.browser_open),
       browser_open: browserLaunch?.browser_open || null,
+      app_matrix_checked: Boolean(appMatrix),
+      app_matrix: appMatrix,
       cleanup: cleanupResult || { skipped: !created.created || !CLEANUP_PASSKEY },
     }, null, 2));
   } catch (error) {

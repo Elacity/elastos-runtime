@@ -25,6 +25,12 @@ pub(in crate::api::gateway) fn browser_provider_resource_call(
     expected_resource: String,
     mut request: serde_json::Value,
 ) -> Result<BrowserProviderResourceCall, (StatusCode, String)> {
+    if let Some(field) = provider_proxy_runtime_metadata_field(&request) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("provider request must not predeclare Runtime metadata field {field}"),
+        ));
+    }
     let resource = build_capability_resource(scheme, operation, &request).map_err(|err| {
         (
             StatusCode::BAD_REQUEST,

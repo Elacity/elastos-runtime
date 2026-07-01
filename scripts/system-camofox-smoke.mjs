@@ -92,7 +92,7 @@ async function createTab() {
   });
   const tabId = created.tabId;
   if (SYSTEM_URL) {
-    await waitForSelector(tabId, ".system-shell", 20_000);
+    await waitForSelector(tabId, ".settings-container", 20_000);
     const rendered = await waitFor(async () => {
       const state = await systemState(tabId);
       return state.fieldLabels.includes("Device identity") && !state.errorText;
@@ -113,7 +113,7 @@ async function createTab() {
   const route = new URL(launched.route, HOST_ORIGIN).toString();
   assert(route.includes("home_token="), "System launch did not mint an app token", launched);
   await evaluate(tabId, `(() => { window.location.href = ${JSON.stringify(route)}; return true; })()`);
-  await waitForSelector(tabId, ".system-shell", 20_000);
+  await waitForSelector(tabId, ".settings-container", 20_000);
   const rendered = await waitFor(async () => {
     const state = await systemState(tabId);
     return state.fieldLabels.includes("Device identity") && !state.errorText;
@@ -131,15 +131,15 @@ async function assertSystemWindowLayout(tabId) {
   await waitForSelector(tabId, '.window[data-target="system"] iframe.window-frame', 20_000);
   await delay(1_500);
   const state = await systemWindowState(tabId);
-  assert(state.panelLabels.includes("Account"), "System window is missing Account", state);
+  assert(state.panelLabels.includes("Profile"), "System window is missing Profile", state);
   assert(state.panelLabels.includes("Appearance"), "System window is missing Appearance", state);
-  assert(state.panelLabels.includes("Advanced"), "System window is missing Advanced", state);
-  assert(!state.panelLabels.includes("Profile"), "System window still has the old Profile card", state);
+  assert(state.panelLabels.includes("Recovery"), "System window is missing Recovery", state);
+  assert(state.panelLabels.includes("Capsules"), "System window is missing Capsule Inspector", state);
+  assert(state.panelLabels.includes("This Device"), "System window is missing About device details", state);
+  assert(!state.panelLabels.includes("Account"), "System window still hides profile under Account", state);
   assert(!state.panelLabels.includes("Local state"), "System window still has the old Local state card", state);
-  assert(!state.panelLabels.includes("Access"), "System window still has the old Access card", state);
   assert(!state.panelLabels.includes("Networks"), "System window still has the old Networks card", state);
   assert(!state.panelLabels.includes("Runtime"), "System window still has the old Runtime card", state);
-  assert(!state.panelLabels.includes("Storage"), "System window still has the old Storage card", state);
   assert(state.overflowing.length === 0, "System window has horizontally overflowing controls", state);
   assert(state.bodyScrollHeight <= state.rootClientHeight + 16, "System window needs avoidable internal vertical scroll", state);
 }
@@ -216,9 +216,9 @@ async function systemState(tabId) {
     tabId,
     `(() => ({
       title: document.title,
-      shellLabel: document.querySelector(".system-shell")?.getAttribute("aria-label") || "",
-      panelLabels: [...document.querySelectorAll(".system-panel h2")].map((node) => node.textContent?.trim() || ""),
-      fieldLabels: [...document.querySelectorAll(".system-field dt")].map((node) => node.textContent?.trim() || ""),
+      shellLabel: document.querySelector(".settings-container")?.getAttribute("aria-label") || "",
+      panelLabels: [...document.querySelectorAll(".pc2-section-title")].map((node) => node.textContent?.trim() || ""),
+      fieldLabels: [...document.querySelectorAll(".system-fields dt")].map((node) => node.textContent?.trim() || ""),
       walletControlsRemoved: !document.querySelector("#wallet-create") && !document.querySelector("#wallet-approvals"),
       handleValue: document.querySelector("#handle-input")?.value || "",
       runtimeStatus: document.querySelector('[data-field="runtime-status"]')?.textContent?.trim() || "",
@@ -231,6 +231,7 @@ async function systemState(tabId) {
       recoveryDownloadLabel: document.querySelector('#recovery-download')?.textContent?.trim() || '',
       recoveryImportPresent: !!document.querySelector('#recovery-import'),
       recoveryImportLabel: document.querySelector('label[for="recovery-import"]')?.textContent?.trim() || '',
+      inspectorPresent: !!document.querySelector('#inspect-list') && !!document.querySelector('#inspect-detail'),
       runtimeEventsPresent: !!document.querySelector('[data-field="runtime-events"]'),
       handleInputDisabled: document.querySelector('#handle-input')?.disabled ?? null,
       handleSaveDisabled: document.querySelector('#handle-save')?.disabled ?? null,
@@ -252,7 +253,7 @@ async function systemWindowState(tabId) {
       }
       const root = doc.documentElement;
       const body = doc.body;
-      const overflowing = [...doc.querySelectorAll('.system-panel, .system-value code, .system-value-text, .system-input, .account-table, .account-table td, .account-name-wrap')]
+      const overflowing = [...doc.querySelectorAll('.pc2-group, .pc2-card-value, .pc2-input, .system-code, .account-table, .account-table td, .account-name-wrap, .webspace-list, .inspect-grid, .inspect-detail, .inspect-row, .inspect-plan-output')]
         .filter((node) => node.scrollWidth > node.clientWidth + 2)
         .map((node) => ({
           tag: node.tagName.toLowerCase(),
@@ -262,7 +263,7 @@ async function systemWindowState(tabId) {
           clientWidth: node.clientWidth,
         }));
       return {
-        panelLabels: [...doc.querySelectorAll('.system-panel h2')].map((node) => node.textContent?.trim() || ''),
+        panelLabels: [...doc.querySelectorAll('.pc2-section-title')].map((node) => node.textContent?.trim() || ''),
         bodyScrollHeight: body?.scrollHeight || 0,
         rootClientHeight: root?.clientHeight || 0,
         overflowing,
@@ -279,11 +280,11 @@ async function main() {
     const state = await systemState(tabId);
     assert(state.title === "System · ElastOS", "System page title mismatch", state);
     assert(state.shellLabel === "System", "System shell label mismatch", state);
-    assert(state.panelLabels.includes("Account"), "System page is missing the Account panel", state);
+    assert(state.panelLabels.includes("Profile"), "System page is missing the Profile panel", state);
     assert(state.panelLabels.includes("Appearance"), "System page is missing the Appearance panel", state);
-    assert(state.panelLabels.includes("Advanced"), "System page is missing the Advanced panel", state);
+    assert(state.panelLabels.includes("Recovery"), "System page is missing the Recovery panel", state);
     assert(state.fieldLabels.includes("Device identity"), "System page is missing the Device identity field", state);
-    assert(state.fieldLabels.includes("Name"), "System page is missing the Name field", state);
+    assert(state.fieldLabels.includes("Display name"), "System page is missing the Display name field", state);
     assert(state.fieldLabels.includes("Version"), "System page is missing the Version field", state);
     assert(state.fieldLabels.includes("Documents"), "System page is missing the Documents field", state);
     assert(state.fieldLabels.includes("Accounts"), "System page is missing the Accounts field", state);
@@ -292,6 +293,7 @@ async function main() {
     assert(!state.fieldLabels.includes("Wallet"), "System page should not duplicate Wallet controls", state);
     assert(state.walletControlsRemoved, "System page should not include wallet account or approval controls", state);
     assert(state.fieldLabels.includes("Network status"), "System page is missing the Network status field", state);
+    assert(state.fieldLabels.includes("Inspector"), "System page is missing the Inspector field", state);
     assert(state.errorText.length === 0, "System should not render an access error after Home launch", state);
     assert(state.handleInputDisabled === false && state.handleSaveDisabled === false, "Home-launched System should allow handle editing", state);
     assert(state.runtimeStatus.length > 0, "System runtime version should be present", state);
@@ -304,6 +306,7 @@ async function main() {
     assert(state.recoveryDownloadLabel.toLowerCase().includes("recovery kit"), "System page must expose Recovery Kit download", state);
     assert(state.recoveryImportPresent === true, "System page must expose Recovery Kit import", state);
     assert(state.recoveryImportLabel === "Import Recovery Kit", "Recovery Kit import label drifted", state);
+    assert(state.inspectorPresent === true, "System page must expose Capsule Inspector", state);
     assert(state.runtimeEventsPresent === false, "System should not render an untrusted runtime activity panel", state);
     assert(!state.bodyText.includes("Last Launch"), "System still renders the old launch block", state);
     assert(!state.bodyText.includes("launch did not produce a capsule id"), "System still renders stale launch-failure copy", state);

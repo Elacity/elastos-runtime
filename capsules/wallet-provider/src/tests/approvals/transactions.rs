@@ -18,7 +18,9 @@ fn managed_account_signs_eip155_transaction_intent_after_runtime_approval() {
         ),
         other => panic!("expected managed account, got {other:?}"),
     };
-    let payload = transaction_intent_payload(&address);
+    let mut payload = transaction_intent_payload(&address);
+    payload["page_url"] = json!("https://ela.city/cinema/view/test");
+    payload["origin"] = json!("https://ela.city");
     let (request_id, payload_hash) = match provider.handle(Request::Signature {
         principal_id: principal_id.into(),
         account_id: Some(account_id),
@@ -82,6 +84,14 @@ fn managed_account_signs_eip155_transaction_intent_after_runtime_approval() {
             assert_eq!(
                 data["approval_request"]["signed_result"]["transaction_hash"],
                 broadcast_hash
+            );
+            assert_eq!(
+                data["approval_request"]["signed_result"]["page_url"],
+                "https://ela.city/cinema/view/test"
+            );
+            assert_eq!(
+                data["approval_request"]["signed_result"]["origin"],
+                "https://ela.city"
             );
         }
         other => panic!("expected recorded transaction hash, got {other:?}"),
@@ -155,6 +165,9 @@ fn transaction_intent_validates_payload_and_allows_external_handoff() {
         }),
         Response::Ok { .. }
     ));
+    let mut external_payload = transaction_intent_payload(external_address);
+    external_payload["page_url"] = json!("https://ela.city/cinema/view/test");
+    external_payload["origin"] = json!("https://ela.city");
     let (request_id, payload_hash) = match provider.handle(Request::Signature {
         principal_id: principal_id.into(),
         account_id: Some(external_account_id.clone()),
@@ -163,7 +176,7 @@ fn transaction_intent_validates_payload_and_allows_external_handoff() {
         capsule_id: "system".into(),
         resource: "elastos://chain/esc-mainnet/broadcast_transaction".into(),
         reason: "Send EVM transaction".into(),
-        payload: transaction_intent_payload(external_address),
+        payload: external_payload,
         expires_at: None,
     }) {
         Response::Ok { data: Some(data) } => {
@@ -237,6 +250,14 @@ fn transaction_intent_validates_payload_and_allows_external_handoff() {
             assert_eq!(
                 data["approval_request"]["signed_result"]["transaction_hash"],
                 transaction_hash
+            );
+            assert_eq!(
+                data["approval_request"]["signed_result"]["page_url"],
+                "https://ela.city/cinema/view/test"
+            );
+            assert_eq!(
+                data["approval_request"]["signed_result"]["origin"],
+                "https://ela.city"
             );
         }
         other => panic!("expected external transaction completion, got {other:?}"),

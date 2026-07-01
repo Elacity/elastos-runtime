@@ -21,6 +21,7 @@ Top-level directly-invoked entrypoints stay at the root:
 - `home-demo-local.sh` — prepare and launch the local source-based Home demo in a clean temp home
 - `publish-release.sh` — low-level release publisher
 - `setup-crosvm.sh` — install runtime VM prerequisites
+- `setup-source-home.sh` — build/provision the source-home runtime and generated helper scripts
 - `share-demo.sh` — share project docs/content
 
 If a script is something a human is expected to type from docs, it belongs here.
@@ -48,12 +49,36 @@ Proof, smoke, and audit helpers also currently live at the root. Common examples
 - `public-install-home-frontdoor-smoke.sh`
 - `protected-content-provider-contract-smoke.sh`
 - `recovery-kit-live-smoke.sh`
+- `people-conversations-local-smoke.sh`
+- `browser-vm-target-refresh.sh`
+- `linux-source-home-restart.sh`
 
 These are review and release helpers, not automatically part of the stable
 end-user command contract. The `public-install-*.sh` helpers can target a
-published candidate gateway by setting `ELASTOS_PUBLISHER_GATEWAY=<url>`.
+published candidate gateway by setting `ELASTOS_PUBLISHER_GATEWAY=<url>`. They
+use the stamped trusted-source transports by default. During 0.5.0 candidate
+review, `ELASTOS_BIN_OVERRIDE=<path-to-branch-elastos>` swaps in the current
+branch binary only when the selected gateway serves a 0.5.0-compatible manifest
+with the current `home` setup profile and checksummed artifacts. The helpers pin
+the installer-selected components manifest so source checkout metadata cannot
+leak into the installed-path smoke. Use `scripts/local-carrier-setup-smoke.sh`
+for source/local Carrier setup proof before a candidate gateway exists. Set
+`ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1` when you intentionally want to
+turn the public install proof into a stricter publisher relay-health check.
 `recovery-kit-live-smoke.sh` requires `ELASTOS_HOME_TOKEN` from a signed
 browser session and is non-mutating unless create/import flags are set.
+`people-conversations-local-smoke.sh` is a local review wrapper for the People
+and Chat conversation slice. It composes the Home entropy guard with the narrow
+Rust/WASM tests for join-object creation, launch-query preservation, profile
+cards, People contact projection, and Chat invite-query decoding.
+`browser-vm-target-refresh.sh` is the renewable drift-repair path for
+already-provisioned Browser VM targets. It refreshes installed helper scripts
+and guest script artifacts from the reviewed source checkout without pretending
+those helpers are standalone `components.json` release components.
+`linux-source-home-restart.sh` is the Linux source-home gateway restart/proof
+path for targets such as Jetson. Run it after full source-home setup replaces
+the gateway binary so the live front door comes back with a hash-bound Home and
+Services receipt.
 `auth-wallet-focus-smoke.sh` runs the current passkey, Recovery Kit,
 capsule-bridge principal storage, principal-launch, System managed-wallet route,
 wallet approval, managed-wallet, BTC, typed chain proof/prepare/broadcast,
@@ -72,6 +97,7 @@ include:
 - `browser-glide-wallet-smoke.sh`
 - `browser-per-launch-selkies-supervisor-smoke.sh`
 - `browser-session-capacity-smoke.sh`
+- `browser-vm-engine-supervisor-autostart-smoke.sh`
 - `browser-home-session-smoke.sh`
 - `browser-ela-city-protected-content-open-smoke.sh`
 - `HOME_URL=http://localhost:8090/apps/home/ HOME_VIRTUAL_AUTH_BROWSER=1 HOME_VIRTUAL_AUTH_BROWSER_OPEN=1 node scripts/home-passkey-virtual-auth-smoke.mjs`
@@ -100,9 +126,17 @@ Use `HOME_VIRTUAL_AUTH_BROWSER_OPEN_CONCURRENT=2` and
 `HOME_VIRTUAL_AUTH_BROWSER_OPEN_HOLD_MS=30000` with the same smoke to prove
 multiple Runtime Browser pages can stay alive, receive heartbeats, appear in
 the Browser session-capacity receipt, and close without leaving capacity behind.
-Use `scripts/browser-session-capacity-smoke.sh` first when you only need to
-verify that a running gateway exposes `elastos.browser.session-capacity/v1`
-without opening a heavyweight Browser engine session.
+Use `HOME_VIRTUAL_AUTH_BROWSER_OPEN=0 HOME_VIRTUAL_AUTH_BROWSER_SUMMARY=1` on
+`home-passkey-virtual-auth-smoke.mjs` when you only need to verify that a
+running gateway exposes `elastos.browser.session-capacity/v1` without opening a
+heavyweight Browser engine session.
+Use `scripts/browser-session-capacity-smoke.sh` to prove the active Browser
+capacity path. By default it opens one Browser page, holds heartbeats for
+30 seconds, verifies an additional open fails closed with structured
+`browser_capacity_unavailable`, then closes the page and checks the Browser
+session-capacity receipt returns to baseline. Override
+`HOME_VIRTUAL_AUTH_BROWSER_OPEN_CONCURRENT` only for a provider that truthfully
+supports more active pages than the current Mac VM single-page substrate.
 `scripts/browser-home-session-smoke.sh` is the named release gate wrapper for
 that proof. Override `HOME_URL`, `HOME_VIRTUAL_AUTH_BROWSER_OPEN_CONCURRENT`,
 and `HOME_VIRTUAL_AUTH_BROWSER_OPEN_HOLD_MS` when testing another runtime.
@@ -114,6 +148,11 @@ live Runtime Browser can open the known `ela.city` protected-content page
 through a disposable Home passkey and close the page cleanly. This is a Browser
 reachability and session-cleanup proof only; it does not prove purchase,
 license, key release, or dDRM playback success.
+
+Internal target-maintenance wrappers that depend on private SSH aliases,
+reverse tunnels, local usernames, or host-specific data roots should not live in
+the public repo. Keep those commands in local operator notes and leave reusable
+repo scripts parameterized through explicit environment variables or CLI flags.
 
 ## Support Subdirectories
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# ElastOS Installer — explicit web bootstrap, then Carrier-backed updates/setup
+# ElastOS Installer — Linux preview web bootstrap, then Carrier-backed updates/setup
 #
 # Usage:
-#   curl -fsSL https://<publisher-origin>/install.sh | bash
+#   curl -fsSL https://<publisher-origin>/install.sh | bash   # Linux x86_64/aarch64 preview
 #
 #   ELASTOS_HEAD_CID=QmXyz ELASTOS_MAINTAINER_DID=did:key:z6Mk... \
 #     curl -fsSL https://<explicit-gateway>/ipfs/<installer-cid>/install.sh | bash
@@ -65,6 +65,10 @@ SOURCE_CONNECT_TICKET_PLACEHOLDER="__SOURCE""_CONNECT_TICKET__"
 if [[ "$SOURCE_CONNECT_TICKET" == "$SOURCE_CONNECT_TICKET_PLACEHOLDER" ]]; then
     SOURCE_CONNECT_TICKET=""
 fi
+SOURCE_CONNECT_TICKET_EXPLICIT=false
+if [[ -n "${ELASTOS_SOURCE_CONNECT_TICKET:-}" && -n "$SOURCE_CONNECT_TICKET" ]]; then
+    SOURCE_CONNECT_TICKET_EXPLICIT=true
+fi
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-__PUBLISHER_GATEWAY__}"
 PUBLISHER_GATEWAY_PLACEHOLDER="__PUBLISHER""_GATEWAY__"
 if [[ "$PUBLISHER_GATEWAY" == "$PUBLISHER_GATEWAY_PLACEHOLDER" ]]; then
@@ -74,6 +78,10 @@ PUBLISHER_NODE_ID="${ELASTOS_PUBLISHER_NODE_ID:-__PUBLISHER_NODE_ID__}"
 PUBLISHER_NODE_ID_PLACEHOLDER="__PUBLISHER""_NODE_ID__"
 if [[ "$PUBLISHER_NODE_ID" == "$PUBLISHER_NODE_ID_PLACEHOLDER" ]]; then
     PUBLISHER_NODE_ID=""
+fi
+PUBLISHER_NODE_ID_EXPLICIT=false
+if [[ -n "${ELASTOS_PUBLISHER_NODE_ID:-}" && -n "$PUBLISHER_NODE_ID" ]]; then
+    PUBLISHER_NODE_ID_EXPLICIT=true
 fi
 IPNS_NAME="${ELASTOS_IPNS_NAME:-__IPNS_NAME__}"
 IPNS_NAME_PLACEHOLDER="__IPNS""_NAME__"
@@ -110,9 +118,11 @@ NC='\033[0m'
 show_help() {
     echo ""
     echo -e "${BOLD}ElastOS Installer${NC}"
+    echo "  Current public install preview: Linux x86_64/aarch64."
+    echo "  macOS uses source-home staging for now; see docs/MAC.md."
     echo ""
     echo -e "${BOLD}Usage:${NC}"
-    echo "  curl -fsSL https://<publisher-origin>/install.sh | bash"
+    echo "  curl -fsSL https://<publisher-origin>/install.sh | bash   # Linux x86_64/aarch64 preview"
     echo "  curl -fsSL https://<explicit-gateway>/ipfs/<installer-cid>/install.sh | bash   # operator/debug only"
     echo "  ./scripts/install.sh [options]"
     echo ""
@@ -151,6 +161,75 @@ show_help() {
 die()  { echo -e "${RED}Error:${NC} $*" >&2; exit 1; }
 info() { echo -e "  ${GREEN}▶${NC} $*"; }
 warn() { echo -e "  ${YELLOW}!${NC} $*"; }
+
+detect_platform() {
+    OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+    ARCH=$(uname -m)
+
+    case "${ARCH}" in
+        x86_64)  ARCH="x86_64" ;;
+        aarch64) ARCH="aarch64" ;;
+        arm64)   ARCH="aarch64" ;;
+        *) die "Unsupported architecture: ${ARCH}" ;;
+    esac
+
+    case "${OS}" in
+        linux)  PLATFORM="${ARCH}-linux" ;;
+        *) die "Unsupported OS: ${OS}. Current public install preview is Linux-only." ;;
+    esac
+}
+
+validate_explicit_source_bootstrap_pair() {
+    if [[ "$SOURCE_CONNECT_TICKET_EXPLICIT" == true && "$PUBLISHER_NODE_ID_EXPLICIT" != true ]] ||
+       [[ "$SOURCE_CONNECT_TICKET_EXPLICIT" != true && "$PUBLISHER_NODE_ID_EXPLICIT" == true ]]; then
+        die "trusted-source Carrier bootstrap overrides are atomic; set both ELASTOS_SOURCE_CONNECT_TICKET and ELASTOS_PUBLISHER_NODE_ID, or neither"
+    fi
+}
+
+refresh_source_bootstrap_from_publisher() {
+    [[ -n "$PUBLISHER_GATEWAY" ]] || return 0
+    if [[ "$SOURCE_CONNECT_TICKET_EXPLICIT" == true && "$PUBLISHER_NODE_ID_EXPLICIT" == true ]]; then
+        return 0
+    fi
+
+    local bootstrap_url parsed
+    bootstrap_url="${PUBLISHER_GATEWAY%/}/.well-known/elastos/carrier-bootstrap.json?role=publisher"
+    if ! parsed=$(curl -fsSL --max-time 10 "$bootstrap_url" | python3 -c '
+import json
+import sys
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+
+if data.get("schema") != "elastos.carrier.bootstrap/v1":
+    raise SystemExit(1)
+if data.get("role") != "publisher":
+    raise SystemExit(1)
+ticket = (data.get("ticket") or "").strip()
+node_id = (data.get("node_id") or "").strip()
+if not ticket or not node_id:
+    raise SystemExit(1)
+print(ticket)
+print(node_id)
+'); then
+        warn "Could not refresh trusted-source Carrier bootstrap from ${bootstrap_url}; using stamped source route"
+        return 0
+    fi
+
+    local refreshed=()
+    mapfile -t refreshed <<<"$parsed"
+    if [[ "${SOURCE_CONNECT_TICKET_EXPLICIT}" != true ]]; then
+        SOURCE_CONNECT_TICKET="${refreshed[0]:-}"
+    fi
+    if [[ "${PUBLISHER_NODE_ID_EXPLICIT}" != true ]]; then
+        PUBLISHER_NODE_ID="${refreshed[1]:-}"
+    fi
+    if [[ -n "$SOURCE_CONNECT_TICKET" && -n "$PUBLISHER_NODE_ID" ]]; then
+        info "Refreshed trusted-source Carrier bootstrap from publisher gateway"
+    fi
+}
 
 is_allowed_channel() {
     local needle="$1"
@@ -496,7 +575,7 @@ while [[ $# -gt 0 ]]; do
             PUBLISHER_GATEWAY="${2%/}"; shift 2 ;;
         --publisher-node-id)
             [[ -z "${2:-}" ]] && die "Usage: --publisher-node-id <node-id>"
-            PUBLISHER_NODE_ID="$2"; shift 2 ;;
+            PUBLISHER_NODE_ID="$2"; PUBLISHER_NODE_ID_EXPLICIT=true; shift 2 ;;
         --allow-unsigned) ALLOW_UNSIGNED=true; shift ;;
         --install-dir)
             [[ -z "${2:-}" ]] && die "Usage: --install-dir PATH"
@@ -504,6 +583,11 @@ while [[ $# -gt 0 ]]; do
         *) die "Unknown option: $1. Run --help for usage." ;;
     esac
 done
+
+detect_platform
+info "Platform: ${PLATFORM}"
+
+validate_explicit_source_bootstrap_pair
 
 if [[ ${#CLI_GATEWAYS[@]} -gt 0 ]]; then
     GATEWAYS=("${CLI_GATEWAYS[@]}")
@@ -520,7 +604,11 @@ fi
 
 # Prepend bootstrap publisher URL if available (it also serves /ipfs/<cid>/)
 if [[ -n "$PUBLISHER_GATEWAY" ]]; then
-    GATEWAYS=("${PUBLISHER_GATEWAY%/}" "${GATEWAYS[@]}")
+    if [[ ${#GATEWAYS[@]} -gt 0 ]]; then
+        GATEWAYS=("${PUBLISHER_GATEWAY%/}" "${GATEWAYS[@]}")
+    else
+        GATEWAYS=("${PUBLISHER_GATEWAY%/}")
+    fi
 fi
 
 if [[ -z "$PUBLISHER_GATEWAY" && ${#GATEWAYS[@]} -eq 0 ]]; then
@@ -556,25 +644,6 @@ fi
 echo ""
 echo -e "${BOLD}ElastOS Installer${NC}"
 echo ""
-
-# ── Detect platform ──────────────────────────────────────────────────
-
-OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-ARCH=$(uname -m)
-
-case "${ARCH}" in
-    x86_64)  ARCH="x86_64" ;;
-    aarch64) ARCH="aarch64" ;;
-    arm64)   ARCH="aarch64" ;;
-    *) die "Unsupported architecture: ${ARCH}" ;;
-esac
-
-case "${OS}" in
-    linux)  PLATFORM="${ARCH}-linux" ;;
-    *) die "Unsupported OS: ${OS}. Current public install preview is Linux-only." ;;
-esac
-
-info "Platform: ${PLATFORM}"
 
 # ── Fetch + verify release head ──────────────────────────────────────
 
@@ -735,6 +804,8 @@ stop_stale_installed_elastos_processes "Room gateway" "${BINARY_SHA256}" room op
 stop_stale_installed_elastos_processes "gateway" "${BINARY_SHA256}" gateway
 
 # ── Save Carrier contact + release metadata for `elastos upgrade` ────
+
+refresh_source_bootstrap_from_publisher
 
 SIGNER_DID=$(json_get "${TMPDIR}/release-head.json" 'd["signer_did"]')
 

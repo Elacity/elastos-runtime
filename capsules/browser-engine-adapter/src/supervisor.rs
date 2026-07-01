@@ -17,6 +17,7 @@ pub(super) fn run_supervisor_launch(
         "stream_id": &context.stream_session.stream_id,
         "target": &context.stream_session.target,
         "principal_id": &context.principal_id,
+        "profile": &context.profile,
         "network_mode": adapter.network_mode,
         "direct_network": false,
         "wallet_injection": false,
@@ -25,10 +26,12 @@ pub(super) fn run_supervisor_launch(
         "wallet": &context.wallet,
         "viewport": context.viewport,
         "display_mode": context.display_mode,
+        "guarantee_level": context.guarantee_level,
     });
     let mut child = Command::new(&supervisor.program)
         .args(&supervisor.args)
         .envs(&supervisor.env)
+        .env_remove("ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE")
         .env("ELASTOS_BROWSER_ENGINE_REQUEST", request.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -65,6 +68,56 @@ pub(super) fn run_supervisor_launch(
     }
     let result = serde_json::from_str::<SupervisorLaunchResult>(stdout.trim())
         .map_err(|err| format!("invalid browser engine supervisor output: {err}"))?;
+    Ok(result)
+}
+
+pub(super) fn run_supervisor_prewarm(supervisor: &EngineSupervisorConfig) -> Result<Value, String> {
+    let mut child = Command::new(&supervisor.program)
+        .args(&supervisor.args)
+        .envs(&supervisor.env)
+        .env("ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| err.to_string())?;
+    let deadline = Instant::now() + Duration::from_millis(supervisor.timeout_ms.min(30_000));
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("browser engine supervisor prewarm timed out".to_string());
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(err) => return Err(err.to_string()),
+        }
+    };
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    if !status.success() {
+        return Err(format!(
+            "browser engine supervisor prewarm exited with status {}; {}",
+            status,
+            stderr.trim()
+        ));
+    }
+    let result = serde_json::from_str::<Value>(stdout.trim())
+        .map_err(|err| format!("invalid browser engine supervisor prewarm output: {err}"))?;
+    if result.get("schema").and_then(Value::as_str) != Some("elastos.browser.vm-engine-prewarm/v1")
+        || result.get("ok").and_then(Value::as_bool) != Some(true)
+        || result.get("network_mode").and_then(Value::as_str) != Some("runtime_net_only")
+        || result.get("direct_network").and_then(Value::as_bool) != Some(false)
+    {
+        return Err("browser engine supervisor prewarm returned invalid readiness".to_string());
+    }
     Ok(result)
 }
 
@@ -105,6 +158,13 @@ pub(super) fn cleanup_isolated_session(session: &PageControlSession) -> Result<V
         .isolation_session_dir
         .as_deref()
         .ok_or_else(|| "isolated browser session did not report a session directory".to_string())?;
+    if session.isolation_kind.as_deref() == Some("per_launch_vm_target") {
+        return cleanup_vm_engine_session(session_dir);
+    }
+    cleanup_selkies_session(session_dir, &session.socket_path)
+}
+
+fn cleanup_selkies_session(session_dir: &str, socket_path: &str) -> Result<Value, String> {
     validate_isolated_session_dir(session_dir)?;
 
     let mut actions = Vec::new();
@@ -137,7 +197,7 @@ pub(super) fn cleanup_isolated_session(session: &PageControlSession) -> Result<V
         "ok": kill_status.as_ref().map(|status| status.success()).unwrap_or(false),
     }));
 
-    let _ = fs::remove_file(&session.socket_path);
+    let _ = fs::remove_file(socket_path);
 
     Ok(json!({
         "schema": "elastos.browser.isolated-session-cleanup/v1",
@@ -155,6 +215,25 @@ fn validate_isolated_session_dir(session_dir: &str) -> Result<(), String> {
         return Err("invalid isolated browser session directory".to_string());
     }
     Ok(())
+}
+
+fn cleanup_vm_engine_session(session_dir: &str) -> Result<Value, String> {
+    if !(session_dir.starts_with("/tmp/elastos-browser-vm-sessions/")
+        || session_dir.starts_with("/tmp/evzl/"))
+        || session_dir.contains(['\0', '\r', '\n'])
+        || session_dir.contains("/../")
+        || session_dir.ends_with("/..")
+    {
+        return Err("invalid Browser VM session directory".to_string());
+    }
+    Ok(json!({
+        "schema": "elastos.browser.isolated-session-cleanup/v1",
+        "session_dir": session_dir,
+        "actions": [{
+            "action": "vm_session_cleanup_delegated_to_control_shutdown",
+            "ok": true,
+        }],
+    }))
 }
 
 fn read_target_container_name(session_dir: &str) -> Result<Option<String>, String> {
@@ -246,7 +325,10 @@ pub(super) fn validate_supervisor_result(
     }
     if let Some(isolation) = &result.isolation {
         if isolation.schema != "elastos.browser.engine.isolation/v1"
-            || isolation.kind != "per_launch_selkies_target"
+            || !matches!(
+                isolation.kind.as_str(),
+                "per_launch_selkies_target" | "per_launch_vm_target"
+            )
             || !isolation.session_dir.starts_with('/')
             || isolation.session_dir.contains(['\0', '\r', '\n'])
         {
@@ -254,7 +336,83 @@ pub(super) fn validate_supervisor_result(
                 "browser engine supervisor returned invalid isolation metadata".to_string(),
             );
         }
+        if isolation.kind == "per_launch_vm_target" {
+            if result
+                .display_session
+                .get("media_transport")
+                .and_then(|value| value.as_str())
+                != Some("runtime_relay")
+            {
+                return Err(
+                    "Browser VM display sessions must report media_transport=runtime_relay"
+                        .to_string(),
+                );
+            }
+            if expected_display_mode == BrowserDisplayMode::WebrtcRemoteDisplay
+                && (result
+                    .display_session
+                    .get("audio")
+                    .and_then(|value| value.as_bool())
+                    != Some(true)
+                    || result
+                        .display_session
+                        .get("video")
+                        .and_then(|value| value.as_bool())
+                        != Some(true))
+            {
+                return Err(
+                    "Browser VM product display sessions must advertise audio=true and video=true"
+                        .to_string(),
+                );
+            }
+        }
     }
     validate_display_session(&result.display_session, expected_display_mode)?;
+    if expected_display_mode == BrowserDisplayMode::NativeSurface {
+        validate_native_surface_geometry(result)?;
+    }
     Ok(())
+}
+
+fn validate_native_surface_geometry(result: &SupervisorLaunchResult) -> Result<(), String> {
+    let view = result
+        .view
+        .as_ref()
+        .ok_or_else(|| "native_surface supervisor result omitted view geometry".to_string())?;
+    if view.get("schema").and_then(|value| value.as_str()) != Some("elastos.browser.view/v1")
+        || view.get("mode").and_then(|value| value.as_str()) != Some("native_surface")
+    {
+        return Err("native_surface supervisor result returned invalid view geometry".to_string());
+    }
+
+    let view_width = native_surface_dimension(view, "width", "view")?;
+    let view_height = native_surface_dimension(view, "height", "view")?;
+    let display_width =
+        native_surface_dimension(&result.display_session, "width", "display_session")?;
+    let display_height =
+        native_surface_dimension(&result.display_session, "height", "display_session")?;
+    if view_width != display_width || view_height != display_height {
+        return Err(
+            "native_surface display dimensions must match Runtime view geometry".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn native_surface_dimension(value: &Value, field: &str, label: &str) -> Result<u64, String> {
+    let dimension = value
+        .get(field)
+        .and_then(|entry| entry.as_u64())
+        .ok_or_else(|| format!("native_surface supervisor result {label}.{field} is required"))?;
+    let valid = match field {
+        "width" => (320..=3840).contains(&dimension),
+        "height" => (240..=2160).contains(&dimension),
+        _ => false,
+    };
+    if !valid {
+        return Err(format!(
+            "native_surface supervisor result {label}.{field} is outside the supported viewport range"
+        ));
+    }
+    Ok(dimension)
 }

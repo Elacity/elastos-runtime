@@ -2,7 +2,7 @@
   "schema": "elastos.capsule/v1",
   "name": "system",
   "version": "0.1.0",
-  "description": "Runtime-launched System settings for access, appearance, and diagnostics",
+  "description": "Runtime-launched System controls for access, appearance, and diagnostics",
   "author": "elastos",
   "role": "app",
   "type": "wasm",

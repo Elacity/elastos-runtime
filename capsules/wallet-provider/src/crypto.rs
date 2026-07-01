@@ -174,6 +174,8 @@ pub(super) fn managed_signed_result(
             "signer": request.address,
             "chain_namespace": request.chain_namespace,
             "payload_hash": request.payload_hash,
+            "page_url": request.payload.get("page_url").cloned().unwrap_or(Value::Null),
+            "origin": request.payload.get("origin").cloned().unwrap_or(Value::Null),
         }));
     }
     None

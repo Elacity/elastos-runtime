@@ -6,14 +6,18 @@
 //! Browser capsules, Browser Engine adapters, and web pages never see this
 //! socket or direct host networking.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
-use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::io::{self, ErrorKind, Read, Write};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::Duration;
 use url::Url;
@@ -35,6 +39,8 @@ struct LocalExitConfig {
     #[serde(default)]
     allow_private_targets: bool,
     #[serde(default)]
+    allowed_private_targets: Vec<PrivateTargetConfig>,
+    #[serde(default)]
     replace_existing_socket: bool,
     #[serde(default = "default_connect_timeout_ms")]
     connect_timeout_ms: u64,
@@ -44,6 +50,15 @@ struct LocalExitConfig {
     address_family: AddressFamilyPolicy,
     #[serde(default)]
     upstream_http_proxy: Option<UpstreamHttpProxyConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PrivateTargetConfig {
+    host: String,
+    ports: Vec<u16>,
+    #[serde(default)]
+    schemes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -113,6 +128,7 @@ fn run_server(config: LocalExitConfig, stdout: &mut dyn Write) -> Result<(), Str
             "allowed_hosts": config.allowed_hosts,
             "allowed_schemes": config.allowed_schemes,
             "allowed_ports": config.allowed_ports,
+            "allowed_private_targets": config.allowed_private_targets,
             "address_family": address_family_label(config.address_family),
             "network_mode": "runtime_net_only",
             "direct_network": false,
@@ -137,6 +153,7 @@ fn handle_session(mut runtime_stream: UnixStream, config: &LocalExitConfig) -> R
     validate_config(config)?;
     let open = read_relay_open(&mut runtime_stream)?;
     let target = validate_relay_open(&open, config)?;
+    eprintln!("{}", relay_open_log(&open, &target));
     let remote = connect_target(&target, config)?;
     forward_pair(runtime_stream, remote, config.buffer_bytes)
 }
@@ -186,9 +203,6 @@ fn validate_relay_open(open: &RelayOpen, config: &LocalExitConfig) -> Result<Url
     let port = target
         .port_or_known_default()
         .ok_or_else(|| "relay target requires a port".to_string())?;
-    if !config.allowed_ports.contains(&port) {
-        return Err(format!("port is not allowlisted for local exit: {port}"));
-    }
     if let Some(host_hint) = open.host.as_deref() {
         if host_hint != host {
             return Err("relay host hint does not match target".to_string());
@@ -199,13 +213,32 @@ fn validate_relay_open(open: &RelayOpen, config: &LocalExitConfig) -> Result<Url
             return Err("relay scheme hint does not match target".to_string());
         }
     }
-    if !host_allowed(host, &config.allowed_hosts) {
-        return Err(format!("host is not allowlisted for local exit: {host}"));
+    if !private_target_allowed(host, target.scheme(), port, &config.allowed_private_targets) {
+        if !config.allowed_ports.contains(&port) {
+            return Err(format!("port is not allowlisted for local exit: {port}"));
+        }
+        if !host_allowed(host, &config.allowed_hosts) {
+            return Err(format!("host is not allowlisted for local exit: {host}"));
+        }
+        validate_public_host(host, config.allow_private_targets)?;
     }
-    validate_public_host(host, config.allow_private_targets)?;
     let _ = &open.principal_id;
     let _ = &open.reason;
     Ok(target)
+}
+
+fn relay_open_log(open: &RelayOpen, target: &Url) -> serde_json::Value {
+    json!({
+        "schema": "elastos.browser.local-exit.relay-open/v1",
+        "stream_id": open.stream_id,
+        "target": target.as_str(),
+        "host": target.host_str(),
+        "scheme": target.scheme(),
+        "principal_id": open.principal_id.as_deref(),
+        "reason": open.reason.as_deref(),
+        "network_mode": "runtime_net_only",
+        "direct_network": false,
+    })
 }
 
 fn connect_target(target: &Url, config: &LocalExitConfig) -> Result<TcpStream, String> {
@@ -224,8 +257,18 @@ fn connect_target(target: &Url, config: &LocalExitConfig) -> Result<TcpStream, S
     let addrs = ordered_socket_addrs(addrs, config.address_family);
     let timeout = Duration::from_millis(config.connect_timeout_ms);
     let mut last_error = None;
+    let private_allowed = target
+        .host_str()
+        .and_then(|host| {
+            target.port_or_known_default().map(|port| {
+                private_target_allowed(host, target.scheme(), port, &config.allowed_private_targets)
+            })
+        })
+        .unwrap_or(false);
     for addr in addrs {
-        if let Err(err) = validate_public_socket_addr(addr, config.allow_private_targets) {
+        if let Err(err) =
+            validate_public_socket_addr(addr, config.allow_private_targets || private_allowed)
+        {
             last_error = Some(err);
             continue;
         }
@@ -360,6 +403,9 @@ fn validate_config(config: &LocalExitConfig) -> Result<(), String> {
             return Err("allowed_ports must contain TCP ports between 1 and 65535".to_string());
         }
     }
+    for target in &config.allowed_private_targets {
+        validate_private_target(target)?;
+    }
     if config.connect_timeout_ms == 0 || config.connect_timeout_ms > 30_000 {
         return Err("connect_timeout_ms must be between 1 and 30000".to_string());
     }
@@ -456,6 +502,31 @@ fn validate_allowed_host(host: &str) -> Result<(), String> {
     validate_public_host_shape(host)
 }
 
+fn validate_private_target(target: &PrivateTargetConfig) -> Result<(), String> {
+    let host = target.host.trim();
+    if host.is_empty() || host == "*" || host.starts_with("*.") {
+        return Err("allowed_private_targets host must be an exact host".to_string());
+    }
+    validate_host_shape(host)?;
+    if target.ports.is_empty() {
+        return Err("allowed_private_targets ports must not be empty".to_string());
+    }
+    for port in &target.ports {
+        if *port == 0 {
+            return Err(
+                "allowed_private_targets ports must contain TCP ports between 1 and 65535"
+                    .to_string(),
+            );
+        }
+    }
+    for scheme in &target.schemes {
+        if !matches!(scheme.as_str(), "tcp" | "tls") {
+            return Err("allowed_private_targets schemes may contain only tcp or tls".to_string());
+        }
+    }
+    Ok(())
+}
+
 fn validate_public_host(host: &str, allow_private: bool) -> Result<(), String> {
     validate_public_host_shape(host)?;
     if allow_private {
@@ -468,6 +539,16 @@ fn validate_public_host(host: &str, allow_private: bool) -> Result<(), String> {
 }
 
 fn validate_public_host_shape(host: &str) -> Result<(), String> {
+    validate_host_shape(host)?;
+    let host = host.trim().trim_matches(['[', ']']);
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
+        return Err(format!("private host blocked: {host}"));
+    }
+    Ok(())
+}
+
+fn validate_host_shape(host: &str) -> Result<(), String> {
     let host = host.trim().trim_matches(['[', ']']);
     if host.is_empty() {
         return Err("host must not be empty".to_string());
@@ -477,10 +558,6 @@ fn validate_public_host_shape(host: &str) -> Result<(), String> {
         .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'\\' | b'\0'))
     {
         return Err(format!("invalid host: {host}"));
-    }
-    let lower = host.to_ascii_lowercase();
-    if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
-        return Err(format!("private host blocked: {host}"));
     }
     Ok(())
 }
@@ -535,6 +612,23 @@ fn host_allowed(host: &str, allowed_hosts: &[String]) -> bool {
     })
 }
 
+fn private_target_allowed(
+    host: &str,
+    scheme: &str,
+    port: u16,
+    private_targets: &[PrivateTargetConfig],
+) -> bool {
+    let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    private_targets.iter().any(|target| {
+        target
+            .host
+            .trim_matches(['[', ']'])
+            .eq_ignore_ascii_case(&host)
+            && target.ports.contains(&port)
+            && (target.schemes.is_empty() || target.schemes.iter().any(|item| item == scheme))
+    })
+}
+
 fn prepare_socket_path(path: &Path, replace_existing_socket: bool) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
@@ -556,40 +650,63 @@ fn forward_pair(runtime: UnixStream, remote: TcpStream, buffer_bytes: usize) -> 
     let mut remote_to_runtime_out = runtime;
     let mut remote_to_runtime_in = remote.try_clone().map_err(|err| err.to_string())?;
     let mut runtime_to_remote_out = remote;
+    runtime_to_remote_in
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .map_err(|err| err.to_string())?;
+    remote_to_runtime_in
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .map_err(|err| err.to_string())?;
+    let done = Arc::new(AtomicBool::new(false));
+    let done_to_remote = Arc::clone(&done);
 
     let forward_to_remote = thread::spawn(move || {
-        copy_stream(
+        let result = copy_stream_until_done(
             &mut runtime_to_remote_in,
             &mut runtime_to_remote_out,
             buffer_bytes,
-        )
+            &done_to_remote,
+        );
+        done_to_remote.store(true, Ordering::Relaxed);
+        let _ = runtime_to_remote_out.shutdown(Shutdown::Write);
+        result
     });
-    let forward_to_runtime = copy_stream(
+    let forward_to_runtime = copy_stream_until_done(
         &mut remote_to_runtime_in,
         &mut remote_to_runtime_out,
         buffer_bytes,
+        &done,
     );
+    done.store(true, Ordering::Relaxed);
+    let _ = remote_to_runtime_out.shutdown(Shutdown::Both);
     let forward_to_remote = forward_to_remote
         .join()
         .map_err(|_| "browser local exit worker panicked".to_string())?;
     forward_to_runtime.and(forward_to_remote)
 }
 
-fn copy_stream<R: Read, W: Write>(
+fn copy_stream_until_done<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
     buffer_bytes: usize,
+    done: &AtomicBool,
 ) -> Result<(), String> {
     let mut buffer = vec![0_u8; buffer_bytes];
     loop {
-        let read = reader.read(&mut buffer).map_err(|err| err.to_string())?;
-        if read == 0 {
-            return Ok(());
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(read) => {
+                writer
+                    .write_all(&buffer[..read])
+                    .map_err(|err| err.to_string())?;
+                writer.flush().map_err(|err| err.to_string())?;
+            }
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if done.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+            }
+            Err(err) => return Err(err.to_string()),
         }
-        writer
-            .write_all(&buffer[..read])
-            .map_err(|err| err.to_string())?;
-        writer.flush().map_err(|err| err.to_string())?;
     }
 }
 
@@ -642,6 +759,7 @@ impl Drop for SocketFileGuard {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::sync::mpsc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_socket_path(name: &str) -> PathBuf {
@@ -665,6 +783,7 @@ mod tests {
             allowed_schemes: default_allowed_schemes(),
             allowed_ports: default_allowed_ports(),
             allow_private_targets: false,
+            allowed_private_targets: Vec::new(),
             replace_existing_socket: false,
             connect_timeout_ms: 500,
             buffer_bytes: 1024,
@@ -689,6 +808,29 @@ mod tests {
         })
         .to_string()
             + "\n"
+    }
+
+    #[test]
+    fn relay_open_log_preserves_principal_attribution() {
+        let open: RelayOpen =
+            serde_json::from_str(relay_open("tcp://example.com:443", "example.com").trim())
+                .unwrap();
+        let target = Url::parse("tcp://example.com:443").unwrap();
+        let log = relay_open_log(&open, &target);
+
+        assert_eq!(
+            log.get("schema").and_then(|value| value.as_str()),
+            Some("elastos.browser.local-exit.relay-open/v1")
+        );
+        assert_eq!(
+            log.get("principal_id").and_then(|value| value.as_str()),
+            Some("person:local:test")
+        );
+        assert_eq!(
+            log.get("reason").and_then(|value| value.as_str()),
+            Some("test local exit")
+        );
+        assert_eq!(log.get("direct_network"), Some(&json!(false)));
     }
 
     #[test]
@@ -734,6 +876,29 @@ mod tests {
         let private: RelayOpen =
             serde_json::from_str(relay_open("tcp://127.0.0.1:80", "127.0.0.1").trim()).unwrap();
         assert!(validate_relay_open(&private, &config)
+            .unwrap_err()
+            .contains("private"));
+    }
+
+    #[test]
+    fn wildcard_can_allow_exact_runtime_gateway_private_target_only() {
+        let mut config = config(
+            temp_socket_path("relay.sock").to_string_lossy().to_string(),
+            vec!["*".to_string()],
+        );
+        config.allowed_private_targets = vec![PrivateTargetConfig {
+            host: "localhost".to_string(),
+            ports: vec![61180],
+            schemes: vec!["tcp".to_string()],
+        }];
+
+        let gateway: RelayOpen =
+            serde_json::from_str(relay_open("tcp://localhost:61180", "localhost").trim()).unwrap();
+        validate_relay_open(&gateway, &config).unwrap();
+
+        let blocked_port: RelayOpen =
+            serde_json::from_str(relay_open("tcp://localhost:80", "localhost").trim()).unwrap();
+        assert!(validate_relay_open(&blocked_port, &config)
             .unwrap_err()
             .contains("private"));
     }
@@ -823,6 +988,53 @@ mod tests {
         let mut response = [0_u8; 4];
         client.read_exact(&mut response).unwrap();
         assert_eq!(&response, b"pong");
+        drop(client);
+
+        exit_task.join().unwrap().unwrap();
+        tcp_task.join().unwrap();
+    }
+
+    #[test]
+    fn remote_eof_is_propagated_to_runtime_client() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tcp_task = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").unwrap();
+        });
+
+        let mut config = config(
+            temp_socket_path("relay.sock").to_string_lossy().to_string(),
+            vec!["127.0.0.1".to_string()],
+        );
+        config.allow_private_targets = true;
+        config.allowed_ports = vec![addr.port()];
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let exit_task = thread::spawn(move || {
+            let result = handle_session(server, &config);
+            done_tx.send(()).unwrap();
+            result
+        });
+
+        client
+            .write_all(relay_open(&format!("tcp://{addr}"), "127.0.0.1").as_bytes())
+            .unwrap();
+        client.write_all(b"ping").unwrap();
+        let mut response = [0_u8; 4];
+        client.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"pong");
+        let mut eof = [0_u8; 1];
+        assert_eq!(client.read(&mut eof).unwrap(), 0);
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("local exit session should close after remote EOF");
         drop(client);
 
         exit_task.join().unwrap().unwrap();

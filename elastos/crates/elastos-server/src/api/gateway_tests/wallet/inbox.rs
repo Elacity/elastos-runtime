@@ -1,7 +1,7 @@
 use super::super::*;
 
 #[tokio::test]
-async fn test_inbox_reviews_wallet_approvals_but_routes_signing_to_wallet() {
+async fn test_inbox_approves_wallet_requests_through_runtime_wallet_signing() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
@@ -58,12 +58,13 @@ async fn test_inbox_reviews_wallet_approvals_but_routes_signing_to_wallet() {
         "documents"
     );
 
-    let direct_approval = app
+    let missing_fresh_token = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/inbox/actions")
-                .header("x-elastos-home-token", token)
+                .header("x-elastos-home-token", token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"action_id":"wallet-approve-request:wallet-approval:test"}"#,
@@ -72,12 +73,47 @@ async fn test_inbox_reviews_wallet_approvals_but_routes_signing_to_wallet() {
         )
         .await
         .unwrap();
-    assert_eq!(direct_approval.status(), StatusCode::BAD_REQUEST);
-    let body = axum::body::to_bytes(direct_approval.into_body(), usize::MAX)
+    assert_eq!(missing_fresh_token.status(), StatusCode::FORBIDDEN);
+    let missing_body = axum::body::to_bytes(missing_fresh_token.into_body(), usize::MAX)
         .await
         .unwrap();
-    let text = String::from_utf8(body.to_vec()).unwrap();
-    assert!(text.contains("Open Wallet"));
+    let missing_text = String::from_utf8(missing_body.to_vec()).unwrap();
+    assert!(missing_text.contains("fresh passkey verification is required"));
+
+    let approved = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/inbox/actions")
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"action_id":"wallet-approve-request:wallet-approval:test","home_token":"{}"}}"#,
+                    authority.home_token
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(approved.status(), StatusCode::OK);
+    let approved_body = axum::body::to_bytes(approved.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let approved_json: serde_json::Value = serde_json::from_slice(&approved_body).unwrap();
+    assert_eq!(
+        approved_json["message"].as_str().unwrap(),
+        "Approved and signed by built-in wallet."
+    );
+    let auth_state = crate::auth::load_auth_state(dir.path()).unwrap();
+    let event = auth_state
+        .audit
+        .iter()
+        .find(|event| {
+            event.event_type == "wallet.approval.completed"
+                && event.challenge_id.as_deref() == Some("wallet-approval:test")
+        })
+        .expect("wallet approval completion audit event");
+    assert_eq!(event.capsule_id.as_deref(), Some(INBOX_CAPSULE_ID));
 }
 
 #[test]

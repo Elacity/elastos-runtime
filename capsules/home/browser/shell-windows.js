@@ -2,6 +2,7 @@ import {
   desktop,
   windowTemplate,
   windowErrorTemplate,
+  PEOPLE_TARGET_ID,
   SYSTEM_APP_ID,
   shellState,
   fetchJson,
@@ -19,19 +20,25 @@ import {
   clearShellSessionState,
   ignoreRepeatedAction,
   targetById,
-} from "./shell-core.js?v=home-20260615b";
+} from "./shell-core.js?v=home-20260627a";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
+  fitWindowToLargestBrowserAspect,
   applyWindowPlacement,
   rememberWindowRestoreBounds,
   restoreWindowFromSpecialState,
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260615b";
+} from "./shell-window-geometry.js?v=home-20260627a";
 
 let windowHooks = null;
+const PEOPLE_DISCOVERY_AUTO_REFRESH_INITIAL_MS = 1_500;
+const PEOPLE_DISCOVERY_AUTO_REFRESH_FAST_MS = 3_000;
+const PEOPLE_DISCOVERY_AUTO_REFRESH_STABLE_MS = 15_000;
+const PEOPLE_DISCOVERY_AUTO_REFRESH_IDLE_MS = 30_000;
+const PEOPLE_DISCOVERY_AUTO_REFRESH_MAX_MS = 60_000;
 const REQUIRED_WINDOW_HOOKS = [
   "clearIdentitySurface",
   "hideLauncher",
@@ -44,8 +51,9 @@ const WINDOW_CONTROL_GUARD_MS = 400;
 const WINDOW_MAXIMIZE_CLOSE_GUARD_MS = 360;
 const WINDOW_OPEN_CLOSE_GHOST_GUARD_MS = 2600;
 const WINDOW_CLOSE_GUARD_MOVE_PX = 18;
+const BROWSER_DESKTOP_OPEN_GUARD_MS = 700;
 const MAX_SESSION_WINDOWS = 24;
-const SINGLE_SESSION_TARGETS = new Set(["browser"]);
+const SINGLE_SESSION_TARGETS = new Set([PEOPLE_TARGET_ID, "inbox", "wallet"]);
 const COMMON_IFRAME_SANDBOX = [
   "allow-downloads",
   "allow-forms",
@@ -68,7 +76,9 @@ const SYSTEM_IFRAME_SANDBOX_EXTRAS = [
 ];
 const COMMON_IFRAME_ALLOW = ["autoplay", "fullscreen"];
 const BROWSER_IFRAME_ALLOW_EXTRAS = ["clipboard-read", "clipboard-write"];
-const WEBAUTHN_IFRAME_ALLOW_TARGETS = new Set(["wallet"]);
+const WEBAUTHN_IFRAME_ALLOW_TARGETS = new Set(["inbox", "wallet"]);
+const pendingWindowLaunches = new Set();
+const peopleDiscoveryRefreshTimers = new WeakMap();
 
 function iframeSandboxForLaunch(launched) {
   const tokens = [...COMMON_IFRAME_SANDBOX];
@@ -139,7 +149,9 @@ function currentWindowRestoreBounds(node) {
 }
 
 function persistedBrowserSessionEntries() {
-  return sortWindowEntriesByZOrder(browserWindowEntries())
+  return sortWindowEntriesByZOrder(
+    browserWindowEntries(),
+  )
     .reverse()
     .slice(0, MAX_SESSION_WINDOWS)
     .map((entry) => {
@@ -149,7 +161,9 @@ function persistedBrowserSessionEntries() {
         target: entry.targetId,
         hidden: entry.node.classList.contains("hidden"),
         active: shellState.activeWindowId === entry.id,
-        maximized: entry.node.dataset.maximized === "true",
+        maximized:
+          entry.node.dataset.maximized === "true" ||
+          entry.node.dataset.browserMaximized === "true",
         snap: entry.node.dataset.snap || "",
         x: bounds.x,
         y: bounds.y,
@@ -159,6 +173,7 @@ function persistedBrowserSessionEntries() {
         restoreY: restoreBounds.y,
         restoreWidth: restoreBounds.width,
         restoreHeight: restoreBounds.height,
+        query: normalizedLaunchQuery(entry.launchQuery),
       };
     });
 }
@@ -175,22 +190,29 @@ function persistBrowserSession() {
   saveShellSessionState({ windows });
 }
 
-function normalizeRestorableSession(summary, storedSession) {
+export function normalizeRestorableSession(summary, storedSession) {
   const storedWindows = Array.isArray(storedSession?.windows) ? storedSession.windows : [];
   const seenTargets = new Set();
   const normalized = [];
   for (const item of storedWindows) {
     const targetId = typeof item?.target === "string" ? item.target : "";
-    if (!targetId || seenTargets.has(targetId) || !targetById(summary, targetId)) {
+    if (
+      !targetId ||
+      (SINGLE_SESSION_TARGETS.has(targetId) && seenTargets.has(targetId)) ||
+      !targetById(summary, targetId)
+    ) {
       continue;
     }
-    seenTargets.add(targetId);
+    if (SINGLE_SESSION_TARGETS.has(targetId)) {
+      seenTargets.add(targetId);
+    }
     normalized.push({
       target: targetId,
       hidden: item?.hidden === true,
       active: item?.active === true,
       maximized: item?.maximized === true,
       snap: typeof item?.snap === "string" ? item.snap : "",
+      query: restorableLaunchQuery(targetId, item),
       x: Number.isFinite(item?.x) ? item.x : 48,
       y: Number.isFinite(item?.y) ? item.y : 60,
       width: Number.isFinite(item?.width) ? item.width : 560,
@@ -205,6 +227,14 @@ function normalizeRestorableSession(summary, storedSession) {
     }
   }
   return normalized;
+}
+
+function restorableLaunchQuery(targetId, item) {
+  const query = normalizedLaunchQuery(item?.query);
+  if (targetId === "browser" && !query.browser_instance) {
+    query.browser_instance = nextBrowserInstanceId();
+  }
+  return query;
 }
 
 function renderWindowTaskbar() {
@@ -410,6 +440,7 @@ function removeWindowEntries(entries) {
   for (const entry of entries) {
     releaseFrameRuntimePage(entry.node);
     cleanupFrameAutoFit(entry.node);
+    cleanupPeopleDiscoveryAutoRefresh(entry.node);
     shellState.windows.delete(entry.id);
     entry.node.remove();
   }
@@ -516,11 +547,12 @@ function renderTargetLaunchError(targetId, error) {
   });
 }
 
-function createWindow({ id, title, x, y, width, height, tone }) {
+function createWindow({ id, title, x, y, width, height, tone, glyphTarget }) {
   const bounds = fitWindowBounds({ x, y, width, height });
   const node = windowTemplate.content.firstElementChild.cloneNode(true);
   node.dataset.windowId = id;
   node.dataset.maximized = "false";
+  node.dataset.browserMaximized = "false";
   node.dataset.snap = "";
   node.setAttribute("aria-label", title);
   node.setAttribute("aria-hidden", "false");
@@ -530,7 +562,7 @@ function createWindow({ id, title, x, y, width, height, tone }) {
   node.style.width = `${bounds.width}px`;
   node.style.height = `${bounds.height}px`;
   node.querySelector(".window-head-title").textContent = title;
-  mountGlyph(node.querySelector(".window-head-icon"), id, tone);
+  mountGlyph(node.querySelector(".window-head-icon"), glyphTarget || id, tone);
 
   node.addEventListener("pointerdown", () => {
     focusWindow(id);
@@ -597,70 +629,695 @@ function launchActionKey(targetId, query) {
 }
 
 export function openTarget(targetId, options = {}) {
-  // The dDRM viewers open in one of two modes:
-  //   • bound to a REAL owned object (Library passes objectUri/uri) — the gateway
-  //     seals THAT file through the local key-authority and picks the viewer itself;
-  //   • standalone from the launcher (no object) — a sample asset demo.
-  // Either way the CEK stays in the decrypt boundary; the browser only ever sees
-  // already-decrypted bytes.
-  if (targetId === "elacity-player" || targetId === "ddrm-viewer") {
-    const ownedUri = libraryUriFromQuery(options.query);
-    const openKey = launchActionKey(targetId, options.query);
-    // A protected open can take several seconds (wallet sign + 2-of-3 geo-quorum recover +
-    // decrypt). The 350ms repeat-guard is far too short for that, so a second double-click
-    // would start a DUPLICATE recover. If one is already in flight, just focus its window.
-    const inflightId = inFlightOwnedOpens.get(openKey);
-    if (inflightId && shellState.windows.has(inflightId)) {
-      focusWindow(inflightId);
-      return;
-    }
-    const loading = openLoadingWindow(
-      targetId,
-      "Opening protected asset…",
-      "Verifying your on-chain access and recovering keys from the dKMS quorum…",
-      OWNED_OPEN_STAGES,
-    );
-    inFlightOwnedOpens.set(openKey, loading.id);
-    const launch = ownedUri
-      ? () => launchOwnedFromLibrary(ownedUri, options, loading)
-      : targetId === "elacity-player"
-        ? () => launchOwnedMediaWindow(options, loading)
-        : () => launchOwnedObjectWindow(options, loading);
-    launch()
-      .catch((error) => {
-        const status = Number(error && error.status);
-        if (status === 401 || status === 403) {
-          closeWindow(loading.id);
-          requireWindowHooks().requestHomeUnlock?.();
-          return;
-        }
-        console.error("failed to open owned asset", error);
-        renderLoadingWindowError(loading, error);
-      })
-      .finally(() => {
-        inFlightOwnedOpens.delete(openKey);
-      });
-    return;
-  }
   if (SINGLE_SESSION_TARGETS.has(targetId) && browserWindowCount(targetId) > 0) {
     activateTargetGroup(targetId);
     return;
   }
-  const launchOptions = targetId === "browser"
-    ? withBrowserInstanceQuery(options)
-    : options;
-  if (ignoreRepeatedAction(launchActionKey(targetId, launchOptions.query))) {
+  if (targetId === PEOPLE_TARGET_ID) {
+    openPeopleWindow(options);
     return;
   }
-  launchBrowserTargetWindow(targetId, launchOptions).catch((error) => {
-    const status = Number(error && error.status);
-    if (status === 401 || status === 403) {
-      requireWindowHooks().requestHomeUnlock?.();
+  const baseQuery = normalizedLaunchQuery(options.query);
+  let guardedByBrowserActivation = false;
+  if (targetId === "browser" && !baseQuery.browser_instance) {
+    if (ignoreRepeatedAction("open-target:browser", BROWSER_DESKTOP_OPEN_GUARD_MS)) {
       return;
     }
-    console.error(`failed to open ${targetId}`, error);
-    renderTargetLaunchError(targetId, error);
+    guardedByBrowserActivation = true;
+  }
+  const launchOptions = targetId === "browser"
+    ? withBrowserInstanceQuery({ ...options, query: baseQuery })
+    : { ...options, query: baseQuery };
+  const pendingLaunchKey = guardedByBrowserActivation
+    ? "open-target:browser:desktop"
+    : launchActionKey(targetId, launchOptions.query);
+  if (pendingWindowLaunches.has(pendingLaunchKey)) {
+    return;
+  }
+  if (!guardedByBrowserActivation && ignoreRepeatedAction(pendingLaunchKey)) {
+    return;
+  }
+  pendingWindowLaunches.add(pendingLaunchKey);
+  launchBrowserTargetWindow(targetId, launchOptions)
+    .catch((error) => {
+      const status = Number(error && error.status);
+      if (status === 401 || status === 403) {
+        requireWindowHooks().requestHomeUnlock?.();
+        return;
+      }
+      console.error(`failed to open ${targetId}`, error);
+      renderTargetLaunchError(targetId, error);
+    })
+    .finally(() => {
+      pendingWindowLaunches.delete(pendingLaunchKey);
+    });
+}
+
+function openPeopleWindow(options = {}) {
+  const summary = shellState.currentSummary;
+  if (!summary) {
+    return null;
+  }
+  const restoredPlacement = options.restoredPlacement || null;
+  const offset = browserWindowEntries().length;
+  const windowSpec = restoredPlacement || peopleWindowSpec(offset);
+  const windowId = nextBrowserWindowId(PEOPLE_TARGET_ID);
+  const node = createWindow({
+    id: windowId,
+    title: "People",
+    x: windowSpec.x,
+    y: windowSpec.y,
+    width: windowSpec.width,
+    height: windowSpec.height,
+    tone: glyphTone(PEOPLE_TARGET_ID),
+    glyphTarget: PEOPLE_TARGET_ID,
   });
+  armWindowControlGuard(node, { closeMs: WINDOW_OPEN_CLOSE_GHOST_GUARD_MS });
+  node.dataset.target = PEOPLE_TARGET_ID;
+  const entry = {
+    id: windowId,
+    targetId: PEOPLE_TARGET_ID,
+    serial: shellState.browserWindowSerial,
+    node,
+    kind: "browser",
+    title: "People",
+  };
+  shellState.windows.set(windowId, entry);
+  renderPeopleWindowBody(entry, summary);
+  desktop.appendChild(node);
+  if (restoredPlacement) {
+    applyWindowPlacement(node, restoredPlacement);
+  }
+  renderWindowTaskbar();
+  focusWindow(windowId);
+  if (restoredPlacement?.hidden) {
+    entry.node.classList.add("hidden");
+    entry.node.classList.remove("window-active");
+    entry.node.setAttribute("aria-hidden", "true");
+  }
+  if (!shellState.restoringSession) {
+    persistBrowserSession();
+  }
+  return entry;
+}
+
+export function refreshHomeInternalWindows(summary) {
+  for (const entry of shellState.windows.values()) {
+    if (entry.targetId === PEOPLE_TARGET_ID) {
+      renderPeopleWindowBody(entry, summary || shellState.currentSummary);
+    }
+  }
+}
+
+function renderPeopleWindowBody(entry, summary) {
+  if (!entry || !summary) {
+    return;
+  }
+  const people = summary.people && typeof summary.people === "object" ? summary.people : {};
+  const identity = summary.identity && typeof summary.identity === "object" ? summary.identity : {};
+  const contacts = Array.isArray(people.contacts) ? people.contacts : [];
+  const discovery = people.discovery && typeof people.discovery === "object" ? people.discovery : {};
+  const discoveredPeers = filterDiscoveredPeople(
+    Array.isArray(discovery.discovered_peers) ? discovery.discovered_peers : [],
+    contacts,
+  );
+  const discoveryRequests = Array.isArray(discovery.requests)
+    ? discovery.requests.filter(peopleDiscoveryRequestIsVisible)
+    : [];
+  const body = entry.node.querySelector(".window-body");
+  body.classList.remove("window-body-frame");
+  body.classList.add("home-people-body");
+  const profileMarkup = peopleProfileMarkup(identity);
+  const peopleMarkup = contacts.length === 0
+    ? `
+      <div class="home-people-empty">
+        <h3>No people yet</h3>
+        <p>Turn on Discovery to find another ElastOS home and send a request.</p>
+      </div>
+    `
+    : contacts.map(peopleListCardMarkup).join("");
+  body.innerHTML = `
+    <section class="home-people-shell" aria-label="People">
+      <aside class="home-people-sidebar" aria-label="People sections">
+        <button class="home-people-sidebar-item active" type="button" data-people-jump="people">
+          <span class="home-people-sidebar-icon home-people-sidebar-icon-people" aria-hidden="true"></span>
+          <span class="home-people-sidebar-text">People</span>
+        </button>
+        <button class="home-people-sidebar-item" type="button" data-people-jump="discovery">
+          <span class="home-people-sidebar-icon home-people-sidebar-icon-discovery" aria-hidden="true"></span>
+          <span class="home-people-sidebar-text">Discovery</span>
+        </button>
+      </aside>
+      <main class="home-people-main-panel">
+        <div class="home-people-status" role="status" hidden></div>
+        <div class="home-people-content">
+          <section class="home-people-section" data-people-section="people" aria-label="People">
+            ${profileMarkup}
+            <div class="home-people-list">${peopleMarkup}</div>
+          </section>
+          <section class="home-people-section" data-people-section="discovery" aria-label="Discovery">
+            ${peopleDiscoveryMarkup(discovery, discoveredPeers, discoveryRequests)}
+          </section>
+        </div>
+      </main>
+    </section>
+  `;
+  bindPeopleWindowActions(body);
+  schedulePeopleDiscoveryAutoRefresh(body, discovery);
+}
+
+function peopleProfileMarkup(identity) {
+  const displayName = peopleProfileDisplayName(identity);
+  return `
+    <section class="home-people-profile-card" aria-labelledby="home-people-profile-title">
+      <div class="home-people-profile-copy">
+        <h3 id="home-people-profile-title">My Profile</h3>
+        <p>Shown to people you connect with.</p>
+      </div>
+      <form class="home-people-profile-form" data-people-profile-form>
+        <label class="home-people-profile-label" for="home-people-profile-name">Display name</label>
+        <input id="home-people-profile-name" class="home-people-profile-input" type="text" maxlength="32" autocomplete="nickname" placeholder="Your name" value="${escapeHtml(displayName)}" data-people-profile-input>
+        <button class="home-people-action" type="submit" data-people-profile-save>Save</button>
+      </form>
+    </section>
+  `;
+}
+
+function peopleDiscoveryMarkup(discovery, peers, requests) {
+  const visibleRequests = requests.filter(peopleDiscoveryRequestIsVisible);
+  const remainingSeconds = peopleDiscoveryRemainingSeconds(discovery);
+  const enabled = discovery.enabled === true && remainingSeconds > 0;
+  const remainingLabel = peopleDiscoveryRemainingText(remainingSeconds);
+  const peerMarkup = peers.length
+    ? peers.map(peopleDiscoveryPeerMarkup).join("")
+    : `<div class="home-people-empty"><h3>No visible people yet</h3><p>Turn on discovery for 10 minutes while another ElastOS home is discoverable. People will appear automatically.</p></div>`;
+  const requestMarkup = visibleRequests.length
+    ? visibleRequests.map(peopleDiscoveryRequestMarkup).join("")
+    : `<div class="home-people-empty"><h3>No requests</h3><p>Requests to add people will appear here.</p></div>`;
+  return `
+    <div class="home-people-discovery-grid">
+      <div class="home-people-discovery-column">
+        <div class="home-people-discovery-header">
+          <h4>Visible People</h4>
+          <div class="home-people-discovery-actions" aria-label="Discovery controls">
+            ${enabled ? `<span class="home-people-discovery-countdown" data-people-discovery-countdown>Discoverable for ${remainingLabel}</span>` : ""}
+            <button class="home-people-action" type="button" data-people-action="toggle-discovery" data-discovery-enabled="${enabled ? "false" : "true"}">${enabled ? "Stop" : "Turn On"}</button>
+            <button class="home-people-action" type="button" data-people-action="refresh-discovery">Refresh</button>
+          </div>
+        </div>
+        <div class="home-people-list">${peerMarkup}</div>
+      </div>
+      <div class="home-people-discovery-column">
+        <h4>Requests</h4>
+        <div class="home-people-list">${requestMarkup}</div>
+      </div>
+    </div>
+  `;
+}
+
+function peopleDiscoveryRemainingSeconds(discovery) {
+  const value = Number(discovery?.remaining_seconds || 0);
+  return Number.isFinite(value) && value > 0 ? Math.ceil(value) : 0;
+}
+
+function peopleDiscoveryRemainingText(seconds) {
+  if (seconds <= 0) {
+    return "0 sec";
+  }
+  if (seconds >= 60) {
+    const minutes = Math.ceil(seconds / 60);
+    return `${minutes} min`;
+  }
+  return `${seconds} sec`;
+}
+
+function peopleDiscoveryPeerMarkup(peer) {
+  const peerId = normalizePeopleText(peer?.peer_id, "");
+  const rawDisplayName = peopleDisplayName(peer, "Visible person");
+  const displayName = escapeHtml(rawDisplayName);
+  const handle = normalizePeopleText(peer?.handle, "");
+  const status = escapeHtml(normalizePeopleText(peer?.status, "visible"));
+  const handleCopy = handle && handle !== rawDisplayName ? handle : "Discoverable";
+  return `
+    <article class="home-people-card">
+      <div class="home-people-avatar" aria-hidden="true">${displayName.slice(0, 1).toUpperCase() || "E"}</div>
+      <div class="home-people-card-copy">
+        <h3>${displayName}</h3>
+        <p><span>${escapeHtml(handleCopy)}</span><span>${status}</span></p>
+      </div>
+      <div class="home-people-card-actions">
+        <button class="home-people-action" type="button" data-people-action="request-peer" data-peer-id="${escapeHtml(peerId)}" ${peerId ? "" : "disabled"}>Request</button>
+      </div>
+    </article>
+  `;
+}
+
+function peopleDiscoveryRequestMarkup(request) {
+  const requestId = escapeHtml(normalizePeopleText(request?.request_id, ""));
+  const rawDisplayName = peopleDisplayName(request, "Person");
+  const displayName = escapeHtml(rawDisplayName);
+  const status = escapeHtml(normalizePeopleText(request?.status, "requested"));
+  const rawStatus = normalizePeopleText(request?.status, "requested");
+  const actionMarkup = rawStatus === "incoming"
+    ? `<button class="home-people-action" type="button" data-people-action="accept-request" data-request-id="${requestId}" ${requestId ? "" : "disabled"}>Accept</button>`
+    : rawStatus === "requested"
+      ? `<span class="home-people-badge">Requested</span>`
+      : "";
+  return `
+    <article class="home-people-card">
+      <div class="home-people-avatar" aria-hidden="true">${displayName.slice(0, 1).toUpperCase() || "E"}</div>
+      <div class="home-people-card-copy">
+        <h3>${displayName}</h3>
+        <p><span>${status}</span></p>
+      </div>
+      ${actionMarkup ? `<div class="home-people-card-actions">${actionMarkup}</div>` : ""}
+    </article>
+  `;
+}
+
+function peopleListCardMarkup(contact) {
+  const rawDisplayName = peopleDisplayName(contact, "Person");
+  const displayName = escapeHtml(rawDisplayName);
+  const relationship = escapeHtml(normalizePeopleText(contact?.relationship, "connected"));
+  const handle = normalizePeopleText(contact?.handle, "");
+  const device = normalizePeopleText(contact?.device_label, "");
+  const handleLine = handle && handle !== rawDisplayName ? `<span>${escapeHtml(handle)}</span>` : "";
+  const deviceLine = device && device !== rawDisplayName ? `<span>${escapeHtml(device)}</span>` : "";
+  const contactId = escapeHtml(normalizePeopleText(contact?.contact_id, ""));
+  const route = normalizePeopleText(contact?.route, "");
+  const chatAction = contact?.can_message === true && route
+    ? `<button class="home-people-action" type="button" data-people-action="chat" data-contact-route="${escapeHtml(route)}">Chat</button>`
+    : "";
+  return `
+    <article class="home-people-card">
+      <div class="home-people-avatar" aria-hidden="true">${escapeHtml(rawDisplayName.slice(0, 1).toUpperCase() || "E")}</div>
+      <div class="home-people-card-copy">
+        <h3>${displayName}</h3>
+        <p><span>${relationship}</span>${handleLine}${deviceLine}</p>
+      </div>
+      <div class="home-people-card-actions">
+        ${chatAction}
+        <button class="home-people-action home-people-action-danger" type="button" data-people-action="remove" data-contact-id="${contactId}">Remove</button>
+      </div>
+    </article>
+  `;
+}
+
+function bindPeopleWindowActions(body) {
+  body.querySelector("[data-people-profile-form]")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    savePeopleProfile(body, event.currentTarget).catch((error) => {
+      setPeopleStatus(body, error.message || "Could not save profile.", "error");
+    });
+  });
+  for (const button of body.querySelectorAll("[data-people-jump]")) {
+    button.addEventListener("click", (event) => {
+      const sectionId = event.currentTarget?.dataset?.peopleJump || "";
+      const section = body.querySelector(`[data-people-section="${sectionId}"]`);
+      if (section) {
+        section.scrollIntoView({ block: "start", behavior: "smooth" });
+      }
+      for (const item of body.querySelectorAll("[data-people-jump]")) {
+        item.classList.toggle("active", item === event.currentTarget);
+      }
+    });
+  }
+  body.querySelector("[data-people-action='toggle-discovery']")?.addEventListener("click", (event) => {
+    togglePeopleDiscovery(body, event.currentTarget).catch((error) => {
+      setPeopleStatus(body, error.message || "Could not update discovery.", "error");
+    });
+  });
+  body.querySelector("[data-people-action='refresh-discovery']")?.addEventListener("click", () => {
+    refreshPeopleDiscovery(body).catch((error) => {
+      setPeopleStatus(body, error.message || "Could not refresh discovery.", "error");
+    });
+  });
+  for (const button of body.querySelectorAll("[data-people-action='request-peer']")) {
+    button.addEventListener("click", (event) => {
+      requestPeopleDiscoveryPeer(body, event.currentTarget).catch((error) => {
+        setPeopleStatus(body, error.message || "Could not request this person.", "error");
+      });
+    });
+  }
+  for (const button of body.querySelectorAll("[data-people-action='accept-request']")) {
+    button.addEventListener("click", (event) => {
+      acceptPeopleDiscoveryRequest(body, event.currentTarget).catch((error) => {
+        setPeopleStatus(body, error.message || "Could not accept this request.", "error");
+      });
+    });
+  }
+  for (const button of body.querySelectorAll("[data-people-action='chat']")) {
+    button.addEventListener("click", (event) => {
+      try {
+        openPersonChat(body, event.currentTarget);
+      } catch (error) {
+        setPeopleStatus(body, error.message || "Could not open chat.", "error");
+      }
+    });
+  }
+  for (const button of body.querySelectorAll("[data-people-action='remove']")) {
+    button.addEventListener("click", (event) => {
+      removePersonFromPeople(body, event.currentTarget).catch((error) => {
+        setPeopleStatus(body, error.message || "Could not remove person.", "error");
+      });
+    });
+  }
+}
+
+function peopleDiscoveryRequestIsVisible(request) {
+  const status = normalizePeopleText(request?.status, "requested");
+  return status === "incoming" || status === "requested";
+}
+
+function filterDiscoveredPeople(peers, contacts) {
+  const existingPeerIds = new Set();
+  for (const contact of contacts) {
+    const deviceLabel = normalizePeopleText(contact?.device_label, "");
+    if (deviceLabel) {
+      existingPeerIds.add(deviceLabel);
+    }
+    const route = normalizePeopleText(contact?.route, "");
+    if (route.startsWith("elastos://peer/")) {
+      const peerId = route.slice("elastos://peer/".length).trim();
+      if (peerId) {
+        existingPeerIds.add(peerId);
+      }
+    }
+  }
+  return peers.filter((peer) => {
+    const peerId = normalizePeopleText(peer?.peer_id, "");
+    return !peerId || !existingPeerIds.has(peerId);
+  });
+}
+
+function peopleDisplayName(person, fallback) {
+  const profileCard = person?.profile_card && typeof person.profile_card === "object" ? person.profile_card : {};
+  const displayName =
+    normalizePeopleText(profileCard.display_name, "") ||
+    normalizePeopleText(person?.display_name, "");
+  const handle =
+    normalizePeopleText(profileCard.handle, "") ||
+    normalizePeopleText(person?.handle, "");
+  const peer = normalizePeopleText(person?.device_label || person?.peer_id, "");
+  if (displayName && displayName !== "ElastOS user") {
+    return displayName;
+  }
+  return handle || peer || fallback;
+}
+
+function peopleProfileDisplayName(identity) {
+  const profileCard = identity?.profile_card && typeof identity.profile_card === "object" ? identity.profile_card : {};
+  return normalizePeopleText(profileCard.display_name, "") || normalizePeopleText(identity?.handle, "");
+}
+
+async function savePeopleProfile(body, form) {
+  const input = form?.querySelector("[data-people-profile-input]");
+  const button = form?.querySelector("[data-people-profile-save]");
+  if (!(input instanceof HTMLInputElement)) {
+    throw new Error("Profile name field is missing.");
+  }
+  const handle = input.value.trim();
+  input.disabled = true;
+  setPeopleBusy(button, true);
+  try {
+    await fetchJson("/api/apps/people/profile-card", {
+      method: "POST",
+      body: JSON.stringify({ handle }),
+    });
+    setPeopleStatus(body, "Profile saved.", "ok");
+    await shellState.requestSummaryRefresh?.();
+  } finally {
+    input.disabled = false;
+    setPeopleBusy(button, false);
+  }
+}
+
+async function togglePeopleDiscovery(body, button) {
+  const enabled = button?.dataset?.discoveryEnabled === "true";
+  setPeopleBusy(button, true);
+  try {
+    const discovery = await fetchJson("/api/apps/people/discovery", {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    });
+    const remainingText = peopleDiscoveryRemainingText(peopleDiscoveryRemainingSeconds(discovery));
+    setPeopleStatus(body, enabled ? `Discoverable for ${remainingText}.` : "Discovery is off.", "ok");
+    if (!enabled) {
+      cleanupPeopleDiscoveryAutoRefresh(body);
+    }
+    await shellState.requestSummaryRefresh?.();
+  } finally {
+    setPeopleBusy(button, false);
+  }
+}
+
+async function refreshPeopleDiscovery(body, options = {}) {
+  const discovery = await fetchJson("/api/apps/people/discovery/refresh", { method: "POST" });
+  if (!options.silent) {
+    setPeopleStatus(body, "Discovery refreshed.", "ok");
+  }
+  if (options.updateSummary !== false) {
+    await shellState.requestSummaryRefresh?.();
+  }
+  return discovery;
+}
+
+function schedulePeopleDiscoveryAutoRefresh(body, discovery) {
+  if (!body || discovery.enabled !== true) {
+    cleanupPeopleDiscoveryAutoRefresh(body);
+    return;
+  }
+  let state = peopleDiscoveryRefreshTimers.get(body);
+  if (state) {
+    state.lastFingerprint = peopleDiscoveryFingerprint(discovery) || state.lastFingerprint;
+    if (!state.timer) {
+      queuePeopleDiscoveryAutoRefresh(body, state, PEOPLE_DISCOVERY_AUTO_REFRESH_INITIAL_MS);
+    }
+    return;
+  }
+  state = {
+    inFlight: false,
+    timer: 0,
+    emptyTicks: 0,
+    lastFingerprint: peopleDiscoveryFingerprint(discovery),
+  };
+  peopleDiscoveryRefreshTimers.set(body, state);
+  queuePeopleDiscoveryAutoRefresh(body, state, PEOPLE_DISCOVERY_AUTO_REFRESH_INITIAL_MS);
+}
+
+function queuePeopleDiscoveryAutoRefresh(body, state, delayMs) {
+  window.clearTimeout(state.timer);
+  state.timer = window.setTimeout(() => {
+    runPeopleDiscoveryAutoRefresh(body, state);
+  }, clampPeopleDiscoveryRefreshDelay(delayMs));
+}
+
+async function runPeopleDiscoveryAutoRefresh(body, state) {
+  state.timer = 0;
+  if (!body.isConnected) {
+    cleanupPeopleDiscoveryAutoRefresh(body);
+    return;
+  }
+  const windowNode = body.closest(".window");
+  if (windowNode?.classList.contains("hidden")) {
+    queuePeopleDiscoveryAutoRefresh(body, state, PEOPLE_DISCOVERY_AUTO_REFRESH_STABLE_MS);
+    return;
+  }
+  if (state.inFlight) {
+    queuePeopleDiscoveryAutoRefresh(body, state, PEOPLE_DISCOVERY_AUTO_REFRESH_FAST_MS);
+    return;
+  }
+  state.inFlight = true;
+  try {
+    const discovery = await refreshPeopleDiscovery(body, { silent: true, updateSummary: false });
+    const fingerprint = peopleDiscoveryFingerprint(discovery);
+    const changed = discovery?.changed === true || (fingerprint && state.lastFingerprint && fingerprint !== state.lastFingerprint);
+    state.lastFingerprint = fingerprint || state.lastFingerprint;
+    if (changed || discovery?.enabled === false) {
+      await shellState.requestSummaryRefresh?.();
+    } else {
+      updatePeopleDiscoveryCountdown(body, discovery);
+    }
+    if (discovery?.enabled === true) {
+      queuePeopleDiscoveryAutoRefresh(body, state, peopleDiscoveryNextAutoRefreshDelay(discovery, state, changed));
+    } else {
+      cleanupPeopleDiscoveryAutoRefresh(body);
+    }
+  } catch {
+    // Manual Refresh still reports errors; background discovery should stay quiet.
+    queuePeopleDiscoveryAutoRefresh(body, state, PEOPLE_DISCOVERY_AUTO_REFRESH_STABLE_MS);
+  } finally {
+    state.inFlight = false;
+  }
+}
+
+function peopleDiscoveryNextAutoRefreshDelay(discovery, state, changed) {
+  if (changed) {
+    state.emptyTicks = 0;
+    return PEOPLE_DISCOVERY_AUTO_REFRESH_FAST_MS;
+  }
+  const hasVisibleWork = Number(discovery?.discovered_count || 0) > 0 || Number(discovery?.request_count || 0) > 0;
+  if (hasVisibleWork) {
+    state.emptyTicks = 0;
+    return Math.max(Number(discovery?.next_refresh_after_ms || 0), PEOPLE_DISCOVERY_AUTO_REFRESH_IDLE_MS);
+  }
+  state.emptyTicks += 1;
+  if (state.emptyTicks <= 3) {
+    return PEOPLE_DISCOVERY_AUTO_REFRESH_FAST_MS;
+  }
+  return Math.max(Number(discovery?.next_refresh_after_ms || 0), PEOPLE_DISCOVERY_AUTO_REFRESH_STABLE_MS);
+}
+
+function peopleDiscoveryFingerprint(discovery) {
+  if (typeof discovery?.refresh_fingerprint === "string" && discovery.refresh_fingerprint.trim() !== "") {
+    return discovery.refresh_fingerprint;
+  }
+  const peers = Array.isArray(discovery?.discovered_peers)
+    ? discovery.discovered_peers.map((peer) => `${peer.peer_id || ""}:${peer.last_seen_at || 0}:${peer.status || ""}`).sort()
+    : [];
+  const requests = Array.isArray(discovery?.requests)
+    ? discovery.requests.map((request) => `${request.request_id || ""}:${request.status || ""}:${request.created_at || 0}`).sort()
+    : [];
+  return JSON.stringify({
+    enabled: discovery?.enabled === true,
+    status: discovery?.status || "",
+    local_peer_id: discovery?.local_peer_id || "",
+    peers,
+    requests,
+  });
+}
+
+function clampPeopleDiscoveryRefreshDelay(value) {
+  const delay = Number(value || 0);
+  if (!Number.isFinite(delay) || delay <= 0) {
+    return PEOPLE_DISCOVERY_AUTO_REFRESH_STABLE_MS;
+  }
+  return Math.min(Math.max(delay, PEOPLE_DISCOVERY_AUTO_REFRESH_INITIAL_MS), PEOPLE_DISCOVERY_AUTO_REFRESH_MAX_MS);
+}
+
+function updatePeopleDiscoveryCountdown(body, discovery) {
+  const countdown = body.querySelector("[data-people-discovery-countdown]");
+  if (!countdown) {
+    return;
+  }
+  const remainingSeconds = peopleDiscoveryRemainingSeconds(discovery);
+  countdown.textContent = `Discoverable for ${peopleDiscoveryRemainingText(remainingSeconds)}`;
+}
+
+function cleanupPeopleDiscoveryAutoRefresh(nodeOrBody) {
+  const body = nodeOrBody?.classList?.contains("window-body")
+    ? nodeOrBody
+    : nodeOrBody?.querySelector?.(".window-body");
+  if (!body) {
+    return;
+  }
+  const state = peopleDiscoveryRefreshTimers.get(body);
+  if (!state) {
+    return;
+  }
+  window.clearTimeout(state.timer);
+  peopleDiscoveryRefreshTimers.delete(body);
+}
+
+async function requestPeopleDiscoveryPeer(body, button) {
+  const peerId = typeof button?.dataset?.peerId === "string" ? button.dataset.peerId : "";
+  if (!peerId) {
+    throw new Error("Discovery peer id is missing.");
+  }
+  setPeopleBusy(button, true);
+  try {
+    await fetchJson("/api/apps/people/discovery/requests", {
+      method: "POST",
+      body: JSON.stringify({ peer_id: peerId }),
+    });
+    setPeopleStatus(body, "Request sent.", "ok");
+    await shellState.requestSummaryRefresh?.();
+  } finally {
+    setPeopleBusy(button, false);
+  }
+}
+
+async function acceptPeopleDiscoveryRequest(body, button) {
+  const requestId = typeof button?.dataset?.requestId === "string" ? button.dataset.requestId : "";
+  if (!requestId) {
+    throw new Error("Discovery request id is missing.");
+  }
+  setPeopleBusy(button, true);
+  try {
+    await fetchJson(`/api/apps/people/discovery/requests/${encodeURIComponent(requestId)}/accept`, {
+      method: "POST",
+    });
+    setPeopleStatus(body, "Request accepted. This person is now in People.", "ok");
+    await shellState.requestSummaryRefresh?.();
+  } finally {
+    setPeopleBusy(button, false);
+  }
+}
+
+async function removePersonFromPeople(body, button) {
+  const contactId = typeof button?.dataset?.contactId === "string" ? button.dataset.contactId : "";
+  if (!contactId) {
+    throw new Error("Person id is missing.");
+  }
+  const card = button.closest(".home-people-card");
+  const label = card?.querySelector(".home-people-card-copy h3")?.textContent?.trim() || "this person";
+  if (!window.confirm(`Remove ${label} from People?`)) {
+    return;
+  }
+  setPeopleBusy(button, true);
+  try {
+    await fetchJson("/api/apps/people/contacts/remove", {
+      method: "POST",
+      body: JSON.stringify({ contact_id: contactId }),
+    });
+    setPeopleStatus(body, "Removed from People.", "ok");
+    await shellState.requestSummaryRefresh?.();
+  } finally {
+    setPeopleBusy(button, false);
+  }
+}
+
+function openPersonChat(body, button) {
+  const route = normalizePeopleText(button?.dataset?.contactRoute, "");
+  const targetId = homeTargetFromRoute(route);
+  if (targetId !== "chat-room") {
+    throw new Error("Chat is not available for this person yet.");
+  }
+  setPeopleStatus(body, "Opening chat.", "ok");
+  openTarget(targetId);
+}
+
+function homeTargetFromRoute(route) {
+  if (!route) {
+    return "";
+  }
+  try {
+    const url = new URL(route, window.location.origin);
+    const match = url.pathname.match(/^\/apps\/([^/]+)\/?$/);
+    return match ? decodeURIComponent(match[1]) : "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+function setPeopleBusy(button, busy) {
+  if (button instanceof HTMLButtonElement) {
+    button.disabled = busy;
+  }
+}
+
+function setPeopleStatus(body, text, tone = "muted") {
+  const node = body.querySelector(".home-people-status");
+  if (!node) {
+    return;
+  }
+  node.textContent = text;
+  node.dataset.tone = tone;
+  node.hidden = !text;
+}
+
+function normalizePeopleText(value, fallback) {
+  return typeof value === "string" && value.trim() ? value.trim() : fallback;
 }
 
 function withBrowserInstanceQuery(options) {
@@ -715,11 +1372,14 @@ export function handleTaskbarTargetClick(targetId) {
 }
 
 async function launchBrowserTargetWindow(targetId, options = {}) {
+  const launchQuery = targetId === "browser"
+    ? withBrowserInstanceQuery({ query: options.query }).query
+    : normalizedLaunchQuery(options.query);
   const launched = await fetchJson("/api/apps/home/launch", {
     method: "POST",
     body: JSON.stringify({
       target: targetId,
-      query: normalizedLaunchQuery(options.query),
+      query: launchQuery,
     }),
   });
   launched.title = canonicalTargetTitle(launched.target, launched.title);
@@ -734,157 +1394,6 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
     );
   }
 
-  return openLaunchedWindow(launched, options);
-}
-
-// Owned/protected opens in flight, keyed by launch action. A dKMS open takes seconds
-// (wallet sign + 2-of-3 geo-quorum recover + decrypt), so a second double-click would
-// otherwise kick off a DUPLICATE recover. We track the loading window and re-focus it.
-const inFlightOwnedOpens = new Map();
-
-// The ordered phases a protected (dKMS quorum) open passes through, shown as a live checklist
-// so the user sees WHERE the open is. These are the genuine, sequential phases the client drives
-// + the gateway runs; the quorum recover (phase 1) is the long, variable pole (cold geo round-trip).
-const OWNED_OPEN_STAGES = [
-  "Preparing secure session",
-  "Verifying access & recovering keys (2-of-3 quorum)",
-  "Decrypting & preparing playback",
-];
-
-function loadingStagesHtml(stages) {
-  return `<ul class="window-loading-stages" aria-hidden="false">${stages
-    .map(
-      (label, i) =>
-        `<li data-stage="${i}" class="${i === 0 ? "is-active" : "is-pending"}">` +
-        `<span class="stage-mark" aria-hidden="true"></span>` +
-        `<span class="stage-label">${escapeHtml(label)}</span></li>`,
-    )
-    .join("")}</ul>`;
-}
-
-function loadingBodyHtml(title, detail, stages) {
-  if (Array.isArray(stages) && stages.length) {
-    return `
-    <div class="window-loading" role="status" aria-live="polite">
-      <div class="window-loading-title">${escapeHtml(title || "Opening…")}</div>
-      ${loadingStagesHtml(stages)}
-    </div>
-  `;
-  }
-  return `
-    <div class="window-loading" role="status" aria-live="polite">
-      <div class="window-loading-spinner" aria-hidden="true"></div>
-      <div class="window-loading-title">${escapeHtml(title || "Opening…")}</div>
-      <div class="window-loading-detail">${escapeHtml(detail || "")}</div>
-    </div>
-  `;
-}
-
-// Advance the staged checklist: every phase before `activeIndex` is done (✓), `activeIndex` is the
-// live one (spinner), the rest stay pending. No-op for windows without stages (legacy spinner).
-function setLoadingStage(entry, activeIndex) {
-  if (!entry || !entry.node) return;
-  const items = entry.node.querySelectorAll(".window-loading-stages li");
-  items.forEach((li, i) => {
-    li.classList.toggle("is-done", i < activeIndex);
-    li.classList.toggle("is-active", i === activeIndex);
-    li.classList.toggle("is-pending", i > activeIndex);
-  });
-}
-
-
-// Open a window with an immediate loading state. The real iframe is swapped in by
-// `navigateLoadingWindow` once the (slow) open resolves; failures are surfaced in-place
-// by `renderLoadingWindowError` instead of leaving a dead spinner.
-function openLoadingWindow(targetId, title, detail, stages) {
-  const offset = browserWindowEntries().length;
-  const windowSpec = browserWindowSpec({ target: targetId }, offset);
-  const windowId = nextBrowserWindowId(targetId);
-  const node = createWindow({
-    id: windowId,
-    title,
-    x: windowSpec.x,
-    y: windowSpec.y,
-    width: windowSpec.width,
-    height: windowSpec.height,
-    tone: glyphTone(targetId),
-  });
-  armWindowControlGuard(node, { closeMs: WINDOW_OPEN_CLOSE_GHOST_GUARD_MS });
-  node.dataset.target = targetId;
-  const body = node.querySelector(".window-body");
-  body.classList.add("window-body-frame");
-  body.innerHTML = loadingBodyHtml(title, detail, stages);
-
-  desktop.appendChild(node);
-  const entry = {
-    id: windowId,
-    targetId,
-    serial: shellState.browserWindowSerial,
-    node,
-    kind: "browser",
-    title,
-    loading: true,
-  };
-  shellState.windows.set(windowId, entry);
-  renderWindowTaskbar();
-  focusWindow(windowId);
-  return entry;
-}
-
-// Swap a loading window over to the resolved iframe route.
-function navigateLoadingWindow(entry, launched) {
-  entry.loading = false;
-  entry.title = launched.title;
-  const node = entry.node;
-  node.querySelector(".window-head-title").textContent = launched.title;
-  node.setAttribute("aria-label", launched.title);
-  const body = node.querySelector(".window-body");
-  body.classList.add("window-body-frame");
-  body.innerHTML = `
-    <iframe
-      class="window-frame"
-      title="${escapeHtml(launched.title)}"
-      allow="${iframeAllowForLaunch(launched)}"
-      sandbox="${iframeSandboxForLaunch(launched)}"
-    ></iframe>
-  `;
-  syncBrowserWindow(entry, launched);
-  renderWindowTaskbar();
-}
-
-// Surface a failed slow-open INSIDE its loading window so the user sees why playback
-// didn't start (rather than a dead spinner or a window that silently never appears).
-function renderLoadingWindowError(entry, error) {
-  if (!entry || !shellState.windows.has(entry.id)) {
-    return;
-  }
-  entry.loading = false;
-  const body = entry.node.querySelector(".window-body");
-  if (!body) {
-    return;
-  }
-  const detail = String((error && error.message) || error || "The open did not complete.");
-  body.innerHTML = `
-    <div class="window-loading is-error" role="alert">
-      <div class="window-loading-title">Couldn’t open this asset</div>
-      <div class="window-loading-detail">${escapeHtml(detail)}</div>
-    </div>
-  `;
-}
-
-// Either navigate an already-open loading window to the resolved route, or open a fresh
-// window when there's no loading window (keeps non-owned callers working unchanged).
-function placeLaunched(launched, options, loading) {
-  if (loading && shellState.windows.has(loading.id)) {
-    navigateLoadingWindow(loading, launched);
-    return loading;
-  }
-  return openLaunchedWindow(launched, options);
-}
-
-// Open a window for an already-resolved launch descriptor (route + title +
-// attach_kind). Shared by the generic Home launch and the owned-media launch.
-function openLaunchedWindow(launched, options = {}) {
   const offset = browserWindowEntries().length;
   const restoredPlacement = options.restoredPlacement || null;
   const windowSpec = restoredPlacement || browserWindowSpec(launched, offset);
@@ -897,6 +1406,7 @@ function openLaunchedWindow(launched, options = {}) {
     width: windowSpec.width,
     height: windowSpec.height,
     tone: glyphTone(launched.target),
+    glyphTarget: launched.target,
   });
   armWindowControlGuard(node, { closeMs: WINDOW_OPEN_CLOSE_GHOST_GUARD_MS });
   node.dataset.target = launched.target;
@@ -914,6 +1424,10 @@ function openLaunchedWindow(launched, options = {}) {
   desktop.appendChild(node);
   if (restoredPlacement) {
     applyWindowPlacement(node, restoredPlacement);
+  } else if (launched.target === "browser" && node.dataset.maximized === "true") {
+    node.dataset.maximized = "false";
+    node.dataset.browserMaximized = "true";
+    fitWindowToLargestBrowserAspect(node);
   }
   const entry = {
     id: windowId,
@@ -922,216 +1436,25 @@ function openLaunchedWindow(launched, options = {}) {
     node,
     kind: "browser",
     title: launched.title,
+    launchQuery,
   };
   shellState.windows.set(windowId, entry);
   syncBrowserWindow(entry, launched);
-  renderWindowTaskbar();
-  focusWindow(windowId);
+  if (entry.targetId === "browser") {
+    fitLaunchedWindow(entry);
+  }
   if (restoredPlacement?.hidden) {
     entry.node.classList.add("hidden");
     entry.node.classList.remove("window-active");
     entry.node.setAttribute("aria-hidden", "true");
+  } else {
+    focusWindow(windowId);
   }
+  renderWindowTaskbar();
   if (!shellState.restoringSession) {
     persistBrowserSession();
   }
   return entry;
-}
-
-// Owned-media: ask the gateway to stand up a decrypt session through the local
-// key-authority + a SEPARATE decrypt-provider boundary, then open elacity-player
-// at the returned play URL (session + scoped launch token baked in). The CEK
-// never reaches the browser — only already-decrypted segment bytes are loaded.
-async function launchOwnedMediaWindow(options = {}, loading = null) {
-  // Single server call does the recover + decrypt, so jump the checklist to the recover phase.
-  setLoadingStage(loading, 1);
-  const opened = await fetchJson("/api/viewers/elacity-player/media/open", {
-    method: "POST",
-  });
-  if (typeof opened.play_url !== "string" || opened.play_url === "") {
-    throw new Error("media open did not return a play URL");
-  }
-  setLoadingStage(loading, 2);
-  const launched = {
-    target: "elacity-player",
-    title: "Owned video",
-    route: opened.play_url,
-    attach_kind: "iframe",
-    launch_status: "launched",
-  };
-  return placeLaunched(launched, options, loading);
-}
-
-// The Library object URI an open carries, if any. Library hands us `objectUri`
-// (preferred) or `uri` when a user opens an item with one of the dDRM viewers.
-function libraryUriFromQuery(query) {
-  const q = normalizedLaunchQuery(query);
-  const uri = q.objectUri || q.uri || "";
-  return typeof uri === "string" && uri.trim() ? uri.trim() : null;
-}
-
-// Owned object bound to a REAL Library file: ask the gateway to seal THAT object
-// through the local key-authority + a SEPARATE decrypt-provider boundary. The gateway
-// resolves the URI inside the principal's own root (ownership gate), reads the
-// plaintext, picks the viewer by content type, and returns { viewer, play_url }. The
-// CEK never reaches the browser — only already-decrypted bytes are loaded.
-async function launchOwnedFromLibrary(uri, options = {}, loading = null) {
-  let opened;
-  try {
-    opened = await openOwnedRequest(uri, loading);
-  } catch (error) {
-    // A rights-denied open (no access token yet) is recoverable: buy the access token,
-    // then retry the open ONCE. Auth failures (no wallet / locked) are not retried here.
-    if (isRightsDeniedError(error)) {
-      await fetchJson("/api/market/buy", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ uri }),
-      });
-      opened = await openOwnedRequest(uri, loading);
-    } else {
-      throw error;
-    }
-  }
-  if (typeof opened.play_url !== "string" || opened.play_url === "") {
-    throw new Error("owned open did not return a view URL");
-  }
-  // Keys recovered + decrypted server-side; the window is about to swap to the player.
-  setLoadingStage(loading, 2);
-  const target = typeof opened.viewer === "string" && opened.viewer ? opened.viewer : "ddrm-viewer";
-  const launched = {
-    target,
-    title: typeof opened.title === "string" && opened.title ? opened.title : "Owned asset",
-    route: opened.play_url,
-    attach_kind: "iframe",
-    launch_status: "launched",
-  };
-  return placeLaunched(launched, options, loading);
-}
-
-// TRUSTLESS open: a protected dKMS asset is opened by handing the quorum a WALLET-SIGNED grant the
-// nodes verify themselves (no server-side trust). Phase 1 asks the gateway to bind a fresh session
-// key to (this asset's on-chain contentId, this quorum's node-set, the user's wallet) and return
-// the canonical delegation; the user signs it ONCE with their wallet (EIP-191 personal_sign);
-// phase 2 submits the signature so the gateway assembles + forwards the grant.
-//
-// Falls back to the plain open (legacy enrolled-caller path) when the asset is not a quorum capsule
-// (prepare-grant 400) or no injected wallet is available — so non-protected opens are unchanged.
-async function openOwnedRequest(uri, loading = null) {
-  setLoadingStage(loading, 0);
-  let prepared = null;
-  try {
-    prepared = await fetchJson("/api/viewers/prepare-grant", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ uri }),
-    });
-  } catch (error) {
-    // 400 => not a dKMS quorum capsule (no wallet grant needed). Anything else (e.g. 403 no wallet)
-    // we surface by falling through to the plain open, which returns the precise gateway error.
-    if (Number(error && error.status) !== 400) {
-      // A non-400 prepare failure still lets the legacy open produce the authoritative error.
-    }
-    prepared = null;
-  }
-
-  const body = { uri };
-  if (prepared && prepared.already_delegated) {
-    // PC2 secure-view session: the wallet already signed a delegation for this asset earlier in the
-    // window — open with just { uri } and the gateway assembles a fresh grant from the cached
-    // delegation (no MetaMask popup). The live on-chain check still gates this open.
-  } else if (prepared && typeof prepared.delegation_canonical === "string" && prepared.grant_handle) {
-    const sig = await walletPersonalSign(prepared.delegation_canonical, prepared.owner_address);
-    if (sig) {
-      body.grant_handle = prepared.grant_handle;
-      body.delegation_sig_hex = sig;
-    }
-    // If signing was declined / unavailable, fall through with just { uri } — the node then decides
-    // via the legacy path (enrolled caller), or fails closed if it has no allow-list.
-  }
-
-  // Session ready (delegation prepared/signed or reused) — the open call now runs the live on-chain
-  // check + the 2-of-3 quorum recover, the long pole. Advance the checklist to that phase.
-  setLoadingStage(loading, 1);
-  return fetchJson("/api/viewers/open", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-}
-
-// Ask the user's injected EVM wallet (MetaMask, etc.) to EIP-191 `personal_sign` the canonical
-// delegation. Ensures the signing account matches the delegation owner the gateway bound (so the
-// node recovers the expected address). Returns the 0x-hex signature, or null if no wallet / declined
-// (the caller then falls back to the legacy path).
-async function walletPersonalSign(canonical, ownerAddress) {
-  const eth = typeof window !== "undefined" ? window.ethereum : null;
-  if (!eth || typeof eth.request !== "function") {
-    return null;
-  }
-  try {
-    const accounts = await eth.request({ method: "eth_requestAccounts" });
-    const want = String(ownerAddress || "").toLowerCase();
-    let from = Array.isArray(accounts) && accounts.length ? String(accounts[0]) : "";
-    if (want) {
-      const match = (accounts || []).find((a) => String(a).toLowerCase() === want);
-      if (match) {
-        from = match;
-      } else {
-        throw new Error(
-          "the connected wallet (" + from + ") is not the account linked to this content (" + ownerAddress + ")"
-        );
-      }
-    }
-    // personal_sign params are [message, address]; the wallet applies the EIP-191 prefix the gateway
-    // and the dKMS nodes recompute. We sign the canonical UTF-8 string verbatim.
-    const sig = await eth.request({ method: "personal_sign", params: [canonical, from] });
-    return typeof sig === "string" && sig ? sig : null;
-  } catch (error) {
-    // A user rejection or a missing wallet is not fatal here — surface it for visibility and let the
-    // open fall back. A wrong-account error is rethrown so the user sees why it cannot proceed.
-    if (error && /not the account linked/.test(String(error.message || ""))) {
-      throw error;
-    }
-    console.warn("wallet personal_sign unavailable or declined:", error);
-    return null;
-  }
-}
-
-// A 403 whose body is the rights-provider's denial (no access token yet) — distinct
-// from an auth/lock 403, which we leave to the unlock prompt. The buy-and-retry loop
-// only triggers on the former.
-function isRightsDeniedError(error) {
-  const status = Number(error && error.status);
-  if (status !== 403) {
-    return false;
-  }
-  const message = String((error && error.message) || "");
-  return message.includes("rights provider denied") || message.includes("no valid access token");
-}
-
-// Owned non-media: ask the gateway to stand up an OBJECT decrypt session through the
-// local key-authority + a SEPARATE decrypt-provider boundary, then open ddrm-viewer
-// at the returned view URL (session + scoped launch token baked in). The CEK never
-// reaches the browser — only the already-decrypted object bytes are loaded.
-async function launchOwnedObjectWindow(options = {}, loading = null) {
-  // Single server call does the recover + decrypt, so jump the checklist to the recover phase.
-  setLoadingStage(loading, 1);
-  const opened = await fetchJson("/api/viewers/ddrm-viewer/object/open", {
-    method: "POST",
-  });
-  if (typeof opened.play_url !== "string" || opened.play_url === "") {
-    throw new Error("object open did not return a view URL");
-  }
-  setLoadingStage(loading, 2);
-  const launched = {
-    target: "ddrm-viewer",
-    title: "Owned asset",
-    route: opened.play_url,
-    attach_kind: "iframe",
-    launch_status: "launched",
-  };
-  return placeLaunched(launched, options, loading);
 }
 
 function launchDidFail(launched) {
@@ -1171,6 +1494,7 @@ function fitLaunchedWindow(entry) {
   }
   if (entry.targetId === "browser") {
     fitWindowToBrowserAspect(entry.node);
+    rememberWindowRestoreBounds(entry.node);
     return;
   }
   fitWindowToFrame(entry.node, entry.node.querySelector(".window-frame"));
@@ -1333,6 +1657,15 @@ function browserWindowSpec(launched, offset) {
   };
 }
 
+function peopleWindowSpec(offset) {
+  return {
+    x: 72 + offset * 18,
+    y: 72 + offset * 18,
+    width: 680,
+    height: 520,
+  };
+}
+
 function fitWindowToFrame(node, frame) {
   if (!node || !frame || node.dataset.maximized === "true" || node.dataset.snap) {
     return;
@@ -1421,7 +1754,10 @@ function toggleWindowMaximize(id) {
   }
   const node = entry.node;
   armWindowControlGuard(node, { closeMs: WINDOW_MAXIMIZE_CLOSE_GUARD_MS });
-  if (node.dataset.maximized === "true") {
+  if (
+    node.dataset.maximized === "true" ||
+    node.dataset.browserMaximized === "true"
+  ) {
     restoreWindowFromSpecialState(node);
     fitLaunchedWindow(entry);
     focusWindow(id);
@@ -1430,6 +1766,15 @@ function toggleWindowMaximize(id) {
   }
   rememberWindowRestoreBounds(node);
   node.dataset.snap = "";
+  if (entry.targetId === "browser") {
+    node.dataset.maximized = "false";
+    node.dataset.browserMaximized = "true";
+    fitWindowToLargestBrowserAspect(node);
+    focusWindow(id);
+    persistBrowserSession();
+    return;
+  }
+  node.dataset.browserMaximized = "false";
   node.dataset.maximized = "true";
   focusWindow(id);
   persistBrowserSession();
@@ -1459,9 +1804,12 @@ export async function restoreShellSession() {
       restoredSingleSessionTargets.add(restoredWindow.target);
     }
     try {
-      const entry = await launchBrowserTargetWindow(restoredWindow.target, {
-        restoredPlacement: restoredWindow,
-      });
+      const entry = restoredWindow.target === PEOPLE_TARGET_ID
+        ? openPeopleWindow({ restoredPlacement: restoredWindow })
+        : await launchBrowserTargetWindow(restoredWindow.target, {
+          restoredPlacement: restoredWindow,
+          query: restoredWindow.query,
+        });
       if (entry) {
         restoredEntries.push({ entry, restoredWindow });
       }
@@ -1494,6 +1842,7 @@ export function cleanupBeforeUnload() {
   for (const entry of shellState.windows.values()) {
     releaseFrameRuntimePage(entry.node);
     cleanupFrameAutoFit(entry.node);
+    cleanupPeopleDiscoveryAutoRefresh(entry.node);
   }
 }
 

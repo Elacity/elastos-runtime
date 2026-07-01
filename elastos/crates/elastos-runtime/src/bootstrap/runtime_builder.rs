@@ -61,7 +61,7 @@ impl Default for RuntimeConfig {
             version: RUNTIME_VERSION.to_string(),
             shell: ShellConfig::default(),
             trusted_keys: Vec::new(),
-            dev_mode: false,
+            dev_mode: true,
         }
     }
 }
@@ -69,7 +69,7 @@ impl Default for RuntimeConfig {
 /// On-disk config file representation (`config.toml`).
 ///
 /// All fields are optional — absent fields fall back to [`RuntimeConfig`] defaults.
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ConfigFile {
     #[serde(default)]
     pub data_dir: Option<String>,
@@ -87,6 +87,21 @@ pub struct ConfigFile {
     pub trusted_keys: Option<Vec<String>>,
     #[serde(default)]
     pub dev_mode: Option<bool>,
+}
+
+impl Default for ConfigFile {
+    fn default() -> Self {
+        Self {
+            data_dir: None,
+            enable_audit: None,
+            audit_log_path: None,
+            ipfs_gateways: None,
+            enable_cache: None,
+            max_content_size_mb: None,
+            trusted_keys: Some(Vec::new()),
+            dev_mode: Some(true),
+        }
+    }
 }
 
 impl RuntimeConfig {
@@ -621,8 +636,14 @@ mod tests {
         assert!(first_run, "should be first run");
         assert_eq!(config.data_dir, dir.path());
         assert!(config.ipfs_gateways.is_empty());
+        assert!(
+            config.dev_mode,
+            "first-run source runtime config must make unsigned dev mode explicit"
+        );
         // Config file should have been created
-        assert!(dir.path().join("config.toml").exists());
+        let config_toml = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(config_toml.contains("dev_mode = true"));
+        assert!(config_toml.contains("trusted_keys = []"));
     }
 
     #[test]

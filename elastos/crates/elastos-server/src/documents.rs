@@ -64,6 +64,15 @@ pub struct DocumentsSaveAsRequest {
     pub body: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct DocumentsImportChatAttachmentRequest {
+    pub attachment_id: String,
+    pub file_name: String,
+    #[serde(default)]
+    pub mime: Option<String>,
+    pub body: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentsPublishRecord {
     pub cid: String,
@@ -116,6 +125,17 @@ struct DocumentsMetadata {
     pub latest_published_cid: Option<String>,
     #[serde(default)]
     pub publish_history: Vec<DocumentsPublishRecord>,
+    #[serde(default)]
+    pub source: Option<DocumentsSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DocumentsSource {
+    pub app: String,
+    pub kind: String,
+    pub id: String,
+    #[serde(default)]
+    pub mime: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,6 +166,14 @@ enum DocumentsProviderRequest {
         title: Option<String>,
         #[serde(default)]
         file_name: Option<String>,
+        body: String,
+    },
+    ImportChatAttachment {
+        principal_id: String,
+        attachment_id: String,
+        file_name: String,
+        #[serde(default)]
+        mime: Option<String>,
         body: String,
     },
     Delete {
@@ -459,6 +487,24 @@ fn handle_provider_request_inner(
                 &body,
             )?,
         })),
+        DocumentsProviderRequest::ImportChatAttachment {
+            principal_id,
+            attachment_id,
+            file_name,
+            mime,
+            body,
+        } => Ok(json!({
+            "document": documents_import_chat_attachment_local(
+                data_dir,
+                &principal_id,
+                DocumentsImportChatAttachmentRequest {
+                    attachment_id,
+                    file_name,
+                    mime,
+                    body,
+                },
+            )?,
+        })),
         DocumentsProviderRequest::Delete {
             principal_id,
             doc_did,
@@ -767,6 +813,26 @@ fn documents_validate_file_name(file_name: &str) -> anyhow::Result<String> {
     Ok(normalized)
 }
 
+fn documents_validate_import_file_name(file_name: &str) -> anyhow::Result<String> {
+    let trimmed = file_name.trim();
+    if trimmed.is_empty() {
+        bail!("file name must not be empty");
+    }
+    if trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.chars().any(|ch| ch.is_ascii_control())
+    {
+        bail!("invalid document file name");
+    }
+    if trimmed.contains('.') {
+        Ok(trimmed.to_string())
+    } else {
+        documents_validate_file_name(trimmed)
+    }
+}
+
 fn documents_reserve_file_name(
     docs_root: &Path,
     requested: &str,
@@ -788,6 +854,31 @@ fn documents_reserve_file_name(
         }
         counter += 1;
         candidate = format!("{stem}-{counter}.md");
+    }
+}
+
+fn documents_reserve_import_file_name(
+    docs_root: &Path,
+    requested: &str,
+    exclude_name: Option<&str>,
+) -> anyhow::Result<String> {
+    let requested = documents_validate_import_file_name(requested)?;
+    let (stem, suffix) = requested
+        .rsplit_once('.')
+        .filter(|(stem, ext)| !stem.is_empty() && !ext.is_empty())
+        .map(|(stem, ext)| (stem.to_string(), format!(".{ext}")))
+        .unwrap_or_else(|| (requested.clone(), String::new()));
+    let mut counter = 1usize;
+    let mut candidate = requested;
+    loop {
+        let is_same = exclude_name
+            .map(|value| value.eq_ignore_ascii_case(&candidate))
+            .unwrap_or(false);
+        if is_same || !docs_root.join(&candidate).exists() {
+            return Ok(candidate);
+        }
+        counter += 1;
+        candidate = format!("{stem}-{counter}{suffix}");
     }
 }
 
@@ -994,6 +1085,7 @@ fn documents_create_local(
         updated_at: ts,
         latest_published_cid: None,
         publish_history: Vec::new(),
+        source: None,
     };
     documents_save_metadata(data_dir, &metadata)?;
     Ok(documents_view(&metadata, body))
@@ -1046,9 +1138,84 @@ pub fn documents_save_as_local(
         updated_at: ts,
         latest_published_cid: None,
         publish_history: Vec::new(),
+        source: None,
     };
     documents_save_metadata(data_dir, &metadata)?;
     Ok(documents_view(&metadata, body.to_string()))
+}
+
+pub fn documents_import_chat_attachment_local(
+    data_dir: &Path,
+    principal_id: &str,
+    request: DocumentsImportChatAttachmentRequest,
+) -> anyhow::Result<DocumentsDocumentView> {
+    documents_validate_principal_id(principal_id)?;
+    let attachment_id = request.attachment_id.trim();
+    if attachment_id.is_empty()
+        || attachment_id.contains('/')
+        || attachment_id.contains('\\')
+        || attachment_id
+            .chars()
+            .any(|ch| ch.is_ascii_control() || ch.is_ascii_whitespace())
+    {
+        bail!("invalid chat attachment id");
+    }
+    if let Some(existing) =
+        documents_find_chat_attachment_import(data_dir, principal_id, attachment_id)?
+    {
+        let body = documents_load_body(data_dir, principal_id, &existing)?;
+        return Ok(documents_view(&existing, body));
+    }
+
+    let docs_root = documents_root(data_dir, principal_id)?;
+    std::fs::create_dir_all(&docs_root)?;
+    let owner_did = elastos_identity::load_or_create_did(data_dir)?.1;
+    let title = documents_normalize_title(Some(&request.file_name), "Chat attachment");
+    let desired_name = documents_validate_import_file_name(&request.file_name)
+        .unwrap_or_else(|_| documents_slugify_file_name(&title));
+    let file_name = documents_reserve_import_file_name(&docs_root, &desired_name, None)?;
+    documents_write_body(data_dir, principal_id, &file_name, &request.body)?;
+    let ts = now_ts();
+    let metadata = DocumentsMetadata {
+        schema: DOCUMENTS_SCHEMA.to_string(),
+        doc_did: documents_generate_did(),
+        principal_id: principal_id.to_string(),
+        owner_did,
+        title,
+        file_name: file_name.clone(),
+        working_copy_uri: documents_working_copy_uri(principal_id, &file_name)?,
+        created_at: ts,
+        updated_at: ts,
+        latest_published_cid: None,
+        publish_history: Vec::new(),
+        source: Some(DocumentsSource {
+            app: "chat-room".to_string(),
+            kind: "attachment".to_string(),
+            id: attachment_id.to_string(),
+            mime: request
+                .mime
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+        }),
+    };
+    documents_save_metadata(data_dir, &metadata)?;
+    Ok(documents_view(&metadata, request.body))
+}
+
+fn documents_find_chat_attachment_import(
+    data_dir: &Path,
+    principal_id: &str,
+    attachment_id: &str,
+) -> anyhow::Result<Option<DocumentsMetadata>> {
+    Ok(documents_load_metadata_index(data_dir, principal_id)?
+        .into_iter()
+        .find(|metadata| {
+            metadata.source.as_ref().is_some_and(|source| {
+                source.app == "chat-room"
+                    && source.kind == "attachment"
+                    && source.id == attachment_id
+            })
+        }))
 }
 
 pub fn documents_delete_local(
@@ -1267,6 +1434,60 @@ mod tests {
             documents_object_uri(&document.doc_did)
         );
         assert_eq!(summary[0].title, "Project Plan");
+    }
+
+    #[test]
+    fn documents_import_chat_attachment_is_idempotent_local_object() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let imported = documents_import_chat_attachment_local(
+            dir.path(),
+            TEST_PRINCIPAL,
+            DocumentsImportChatAttachmentRequest {
+                attachment_id: "attachment-123".to_string(),
+                file_name: "Shared Note.txt".to_string(),
+                mime: Some("text/plain".to_string()),
+                body: "from chat".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(imported.title, "Shared Note.txt");
+        assert_eq!(imported.body, "from chat");
+        let root = crate::auth::principal_localhost_root(TEST_PRINCIPAL);
+        assert_eq!(
+            imported.working_copy_uri,
+            format!("{root}/Documents/Shared Note.txt")
+        );
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].doc_did, imported.doc_did);
+
+        documents_save_local(
+            dir.path(),
+            TEST_PRINCIPAL,
+            &imported.doc_did,
+            "Shared Note",
+            "edited locally",
+        )
+        .unwrap();
+
+        let reopened = documents_import_chat_attachment_local(
+            dir.path(),
+            TEST_PRINCIPAL,
+            DocumentsImportChatAttachmentRequest {
+                attachment_id: "attachment-123".to_string(),
+                file_name: "Shared Note.txt".to_string(),
+                mime: Some("text/plain".to_string()),
+                body: "stale original bytes".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(reopened.doc_did, imported.doc_did);
+        assert_eq!(reopened.body, "edited locally");
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
+        assert_eq!(summary.len(), 1);
     }
 
     #[test]
@@ -1558,6 +1779,96 @@ mod tests {
 
         let loaded = client.get(&document.doc_did).await.unwrap();
         assert_eq!(loaded.latest_published_cid, None);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ELASTOS_LIVE_IPFS_PROVIDER_BIN and ELASTOS_LIVE_IPFS_DATA_DIR"]
+    async fn documents_live_ipfs_publish_provider_route_smoke() {
+        let Ok(ipfs_provider_bin) = std::env::var("ELASTOS_LIVE_IPFS_PROVIDER_BIN") else {
+            eprintln!(
+                "skipping live Documents publish smoke: ELASTOS_LIVE_IPFS_PROVIDER_BIN unset"
+            );
+            return;
+        };
+        let Ok(ipfs_data_dir) = std::env::var("ELASTOS_LIVE_IPFS_DATA_DIR") else {
+            eprintln!("skipping live Documents publish smoke: ELASTOS_LIVE_IPFS_DATA_DIR unset");
+            return;
+        };
+        let ipfs_provider_bin = PathBuf::from(ipfs_provider_bin);
+        let ipfs_data_dir = PathBuf::from(ipfs_data_dir);
+        assert!(
+            ipfs_provider_bin.is_file(),
+            "ipfs-provider missing: {}",
+            ipfs_provider_bin.display()
+        );
+        assert!(
+            ipfs_data_dir.is_dir(),
+            "IPFS data dir missing: {}",
+            ipfs_data_dir.display()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        install_test_documents_viewer(dir.path());
+        let registry = Arc::new(ProviderRegistry::new());
+        let ipfs_config = elastos_runtime::provider::BridgeProviderConfig {
+            base_path: ipfs_data_dir.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let bridge = Arc::new(
+            elastos_runtime::provider::ProviderBridge::spawn(&ipfs_provider_bin, ipfs_config)
+                .await
+                .expect("spawn live ipfs-provider"),
+        );
+        let ipfs_provider: Arc<dyn Provider> = Arc::new(
+            elastos_runtime::provider::CapsuleProvider::with_scheme(Arc::clone(&bridge), "ipfs"),
+        );
+        registry
+            .register_sub_provider("ipfs", ipfs_provider)
+            .await
+            .unwrap();
+        let content_provider = Arc::new(crate::content::ContentProvider::new(
+            dir.path().to_path_buf(),
+            Arc::downgrade(&registry),
+        ));
+        registry.register(content_provider.clone()).await;
+        registry
+            .register_sub_provider("content", content_provider)
+            .await
+            .unwrap();
+        registry
+            .register(Arc::new(DocumentsProvider::new(
+                dir.path().to_path_buf(),
+                Arc::downgrade(&registry),
+            )))
+            .await;
+
+        let client = DocumentsClient::for_principal(registry, TEST_PRINCIPAL);
+        let document = client.create(Some("Live Provider Plane")).await.unwrap();
+        client
+            .save(
+                &document.doc_did,
+                "Live Provider Plane",
+                "# Live Provider Plane\n\nRuntime-owned publish through Kubo.\n",
+            )
+            .await
+            .unwrap();
+
+        let published = client.publish(&document.doc_did).await.unwrap();
+        assert!(!published.cid.trim().is_empty());
+        assert_eq!(published.uri, format!("elastos://{}", published.cid));
+        assert_eq!(published.route, format!("/s/{}/", published.cid));
+
+        let loaded = client.get(&document.doc_did).await.unwrap();
+        assert_eq!(
+            loaded.latest_published_cid.as_deref(),
+            Some(published.cid.as_str())
+        );
+
+        bridge
+            .shutdown()
+            .await
+            .expect("shutdown live ipfs-provider");
+        println!("documents live IPFS provider route cid={}", published.cid);
     }
 
     #[tokio::test]

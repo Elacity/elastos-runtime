@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>ElastOS Browser</title>
-    <link rel="stylesheet" href="./style.css?v=browser-20260524d" />
+    <link rel="stylesheet" href="./style.css?v=browser-20260626a" />
   </head>
   <body data-shell-window-fit="fixed">
     <main class="browser-shell">
@@ -30,6 +30,30 @@
             value="https://ela.city/"
           />
         </form>
+        <button id="browser-settings" class="browser-nav-button" type="button" aria-label="Browser settings" title="Browser settings" aria-controls="browser-settings-panel" aria-expanded="false">
+          &#9881;
+        </button>
+      </section>
+      <section id="browser-settings-panel" class="browser-settings-panel" aria-label="Browser settings" hidden>
+        <div class="browser-settings-head">
+          <strong>Settings</strong>
+          <button id="browser-settings-close" class="browser-settings-close" type="button" aria-label="Close Browser settings">
+            &times;
+          </button>
+        </div>
+        <label class="browser-settings-label" for="browser-engine">Browser engine</label>
+        <select id="browser-engine" class="browser-select" aria-label="Browser engine" title="Browser engine">
+          <option value="">Automatic</option>
+        </select>
+        <p id="browser-engine-summary" class="browser-settings-hint">Use the best Browser Engine available.</p>
+        <label class="browser-settings-label browser-settings-label-spaced" for="browser-exit">Exit node</label>
+        <select id="browser-exit" class="browser-exit-select" aria-label="Browser exit node" title="Browser exit node">
+          <option value="">This device</option>
+        </select>
+        <p id="browser-exit-summary" class="browser-settings-hint">Use this device's Exit Node for Browser traffic.</p>
+        <button id="browser-profile-reset" class="browser-settings-action browser-settings-danger" type="button" aria-label="Reset Browser profile" title="Reset Browser profile">
+          Reset profile
+        </button>
       </section>
 
       <section class="browser-stage" aria-label="Web page">
@@ -51,13 +75,12 @@
             muted
             hidden
           ></video>
-          <img id="browser-render" class="browser-render" alt="Rendered browser page" hidden />
         </div>
         <div id="browser-metrics" class="browser-metrics" hidden></div>
         <div id="browser-status" class="browser-status" role="status"></div>
       </section>
     </main>
 
-    <script type="module" src="./browser.js?v=browser-20260524d"></script>
+    <script type="module" src="./browser.js?v=browser-20260629b"></script>
   </body>
 </html>

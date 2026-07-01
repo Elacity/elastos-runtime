@@ -6,10 +6,8 @@
 //! capsules). MicroVM launch already fails closed via the `/dev/kvm` check in
 //! `vm.rs::start()`; this stub keeps the rest of the crate buildable.
 //!
-//! Per `state.md`:
-//!
-//! > The default Home path must remain a KVM-independent browser-hosted adapter
-//! > so macOS and Windows stay in scope without pretending to offer Linux parity.
+//! The default Home path remains KVM-independent so macOS and Windows stay
+//! in scope without pretending to offer Linux microVM parity.
 
 use std::sync::atomic::AtomicI32;
 

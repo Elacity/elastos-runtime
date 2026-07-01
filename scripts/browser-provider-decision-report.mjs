@@ -6,14 +6,20 @@ import { spawnSync } from "node:child_process";
 import process from "node:process";
 
 const selkiesBaselineConfig = "/tmp/elastos-browser-selkies-live/browser-engine-adapter.json";
-const gatewayLiveConfig = "/home/wau/.local/share/elastos-public-gateway-live/xdg-data/elastos/config/browser-engine-adapter.json";
+const userDataHomeConfig = path.join(os.homedir(), "Library/Application Support/elastos/config/browser-engine-adapter.json");
+const nodeBinary = process.execPath;
 
 function defaultLiveConfig() {
   if (process.env.ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG) {
     return process.env.ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG;
   }
-  if (fs.existsSync(gatewayLiveConfig)) {
-    return gatewayLiveConfig;
+  for (const candidate of [
+    userDataHomeConfig,
+    selkiesBaselineConfig,
+  ]) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
   }
   return selkiesBaselineConfig;
 }
@@ -90,6 +96,11 @@ function readJson(file) {
   }
 }
 
+function firstAdapter(adapterConfigPath) {
+  const config = readJson(adapterConfigPath);
+  return Array.isArray(config?.adapters) ? config.adapters[0] : null;
+}
+
 function isSocket(path) {
   if (!path) return false;
   try {
@@ -105,9 +116,9 @@ function run(command, args) {
     stdio: ["ignore", "pipe", "pipe"],
   });
   return {
-    status: result.status,
-    stdout: result.stdout,
-    stderr: result.stderr,
+    status: typeof result.status === "number" ? result.status : 127,
+    stdout: result.stdout || "",
+    stderr: result.stderr || result.error?.message || "",
   };
 }
 
@@ -122,19 +133,11 @@ function discoverNativeBrowserProgram(explicitProgram) {
     const found = commandPath(command);
     if (found) return found;
   }
-  for (const candidate of [
-    "/home/wau/.cache/ms-playwright/chromium-1217/chrome-linux64/chrome",
-    "/home/wau/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome",
-    "/home/wau/.cache/ms-playwright/chromium-1181/chrome-linux/chrome",
-  ]) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
   return "";
 }
 
 function adapterSummary(adapterConfigPath) {
-  const config = readJson(adapterConfigPath);
-  const adapter = Array.isArray(config?.adapters) ? config.adapters[0] : null;
+  const adapter = firstAdapter(adapterConfigPath);
   const controlSocket = adapter?.supervisor?.control_socket_path || "";
   const supervisorProgram = adapter?.supervisor?.program || "";
   return {
@@ -210,7 +213,7 @@ function objectiveAudit(args) {
   if (args.hostedBakeoff) auditArgs.push("--hosted-bakeoff", args.hostedBakeoff);
   if (args.nativePreflight) auditArgs.push("--native-preflight", args.nativePreflight);
   if (args.manualUx) auditArgs.push("--manual-ux", args.manualUx);
-  const result = run("node", auditArgs);
+  const result = run(nodeBinary, auditArgs);
   return {
     status: result.status,
     result: parseLastJson(result.stdout),
@@ -297,7 +300,7 @@ function nativeHostCapability(args) {
       blockers: ["no native browser program found; set --native-browser-program or ELASTOS_BROWSER_NATIVE_BROWSER_PROGRAM"],
     };
   }
-  const result = run("node", [
+  const result = run(nodeBinary, [
     "scripts/browser-native-host-capability.mjs",
     "--browser-program",
     browserProgram,
@@ -337,7 +340,7 @@ function hostedPreflight(candidate, configPath) {
       blockers: prepared.blockers,
     };
   }
-  const result = run("node", [
+  const result = run(nodeBinary, [
     "scripts/browser-hosted-provider-preflight.mjs",
     "--candidate",
     candidate,
@@ -396,7 +399,7 @@ function generateCandidateConfig(candidate) {
   const outDir = fs.mkdtempSync(path.join(os.tmpdir(), `elastos-browser-${safeCandidate}-`));
   const controlSocket = path.join(outDir, `${safeCandidate}.sock`);
   const supervisor = path.resolve("scripts/browser-hosted-product-supervisor.mjs");
-  const result = run("node", [
+  const result = run(nodeBinary, [
     "scripts/browser-hosted-product-operator-config.mjs",
     "--candidate",
     candidate,
@@ -440,8 +443,19 @@ function preflightBlockers(parsed, options = {}) {
 }
 
 function candidateReadiness(args) {
+  const selkiesConfig = selkiesCandidateConfig(args.adapterConfig);
   const readiness = [
-    hostedPreflight("selkies", args.adapterConfig),
+    selkiesConfig
+      ? hostedPreflight("selkies", selkiesConfig)
+      : {
+          candidate: "selkies",
+          ok: false,
+          ready_for_bakeoff: false,
+          skipped: true,
+          adapter_config: null,
+          generated_config: false,
+          blockers: ["no Selkies baseline adapter config is configured for this host"],
+        },
     hostedPreflight("kasm-workspaces", args.kasmWorkspacesConfig),
     hostedPreflight("browserbox", args.browserboxConfig),
     hostedPreflight("kasmvnc", args.kasmvncConfig),
@@ -449,8 +463,21 @@ function candidateReadiness(args) {
   return readiness;
 }
 
+function selkiesCandidateConfig(liveAdapterConfig) {
+  if (firstAdapter(liveAdapterConfig)?.kind === "selkies_gstreamer") {
+    return liveAdapterConfig;
+  }
+  if (fs.existsSync(selkiesBaselineConfig) && firstAdapter(selkiesBaselineConfig)?.kind === "selkies_gstreamer") {
+    return selkiesBaselineConfig;
+  }
+  return "";
+}
+
 function singleSessionBusy(adapter) {
-  return Number(adapter?.control_status?.active_pages || 0) > 0 && adapter?.control_status?.single_session === true;
+  const status = adapter?.control_status || {};
+  return Number(status.active_pages || 0) > 0 &&
+    status.single_session === true &&
+    status.single_vm_session !== true;
 }
 
 function activePageIds(adapter) {
@@ -764,9 +791,9 @@ function main() {
     recommendation: recommendation(audit, readiness, adapter, nativeHost),
     next_action: nextAction(audit, readiness, adapter, nativeHost),
   };
-  console.log(JSON.stringify(report, null, 2));
+  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   if (!report.ok) {
-    process.exit(1);
+    process.exitCode = 1;
   }
 }
 

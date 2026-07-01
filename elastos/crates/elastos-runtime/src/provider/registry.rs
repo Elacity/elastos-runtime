@@ -111,25 +111,11 @@ pub enum ProviderError {
     Provider(String),
     /// No provider for scheme
     NoProvider(String),
-    /// The provider REJECTED the request before performing any side effect — a
-    /// precondition/validation failure (missing field, bad shape, unknown op)
-    /// that provably left no observable state change.
-    ///
-    /// Ocap contract (load-bearing): a provider may return this ONLY when a refund
-    /// of the single-use capability is safe — which requires BOTH that nothing was
-    /// mutated/emitted/spent at the point of rejection, AND that a REPLAY of the
-    /// same request is a GUARANTEED no-op (the rejection is a property of the
-    /// REQUEST — a missing/invalid/unsupported field — or of a STABLE state, not a
-    /// TRANSIENT condition). In particular, a transient capacity/quota/rate
-    /// rejection (e.g. `too_many_topics`) is NOT `DidNotAct`: a replay could ACT
-    /// once capacity frees, so refunding would let one consent drive an effect on
-    /// retry — keep it a structured error and let the holder re-request. Any
-    /// failure that MIGHT have partially acted must use `Provider`/`Io`/`NotFound`
-    /// instead (BUG-4: refunding a partial effect would enable a second execution).
-    /// When in doubt, do NOT use this variant.
-    DidNotAct(String),
     /// IO error
     Io(std::io::Error),
+    /// The provider accepted the request but performed NO effect (BUG-4 discipline): a
+    /// single-use/consent token spent on it must be REFUNDED, not consumed. Carries a reason.
+    DidNotAct(String),
 }
 
 /// Provider-to-provider invocation transfer contract.
@@ -423,10 +409,8 @@ impl std::fmt::Display for ProviderError {
             ProviderError::InvalidUri(uri) => write!(f, "invalid URI: {}", uri),
             ProviderError::Provider(msg) => write!(f, "provider error: {}", msg),
             ProviderError::NoProvider(scheme) => write!(f, "no provider for scheme: {}", scheme),
-            ProviderError::DidNotAct(msg) => {
-                write!(f, "request rejected before any effect: {}", msg)
-            }
             ProviderError::Io(e) => write!(f, "IO error: {}", e),
+            ProviderError::DidNotAct(reason) => write!(f, "provider did not act: {}", reason),
         }
     }
 }
@@ -486,14 +470,9 @@ const RESERVED_SUB_NAMES: &[&str] = &[
     "rights",
     "key",
     "decrypt",
+    "inspect",
     "availability",
     "block-graph",
-    // dDRM producer spine (Create portal): in-boundary CEK escrow + on-chain mint assembly.
-    "encrypt",
-    "publish",
-    // Media packaging (Create portal, video/audio): ffmpeg transcode -> DASH-fragment ->
-    // PLAINTEXT segments + metadata. Holds NO key material (CENC + escrow stay in `encrypt`).
-    "media",
 ];
 
 /// Registry of providers
@@ -718,12 +697,10 @@ impl ProviderRegistry {
         providers.keys().cloned().collect()
     }
 
-    /// List all registered `elastos://` sub-provider schemes (e.g. `did`,
-    /// `key`, `peer`). These are dispatched hierarchically and are not included
-    /// in [`schemes`](Self::schemes), which lists only top-level providers.
+    /// List all registered `elastos://` sub-provider schemes.
     pub async fn sub_provider_schemes(&self) -> Vec<String> {
-        let sub = self.sub_providers.read().await;
-        sub.keys().cloned().collect()
+        let sub_providers = self.sub_providers.read().await;
+        sub_providers.keys().cloned().collect()
     }
 
     /// Check if a scheme has a registered provider

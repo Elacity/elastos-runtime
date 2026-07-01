@@ -32,6 +32,11 @@ jobs:
       - name: cargo fmt
         working-directory: elastos
         run: cargo fmt --all -- --check
+      - name: architecture entropy checks
+        run: |
+          bash scripts/check-wci-alignment.sh
+          node scripts/home-entropy-check.mjs
+          node scripts/browser-entropy-check.mjs
       - name: cargo clippy
         working-directory: elastos
         run: cargo clippy --workspace --all-targets -- -D warnings

@@ -12,6 +12,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 use url::Url;
@@ -21,6 +22,8 @@ const URL_ENV: &str = "ELASTOS_BROWSER_ENGINE_URL";
 const STREAM_ID_ENV: &str = "ELASTOS_BROWSER_ENGINE_STREAM_ID";
 const RELAY_IPC_ENV: &str = "ELASTOS_BROWSER_ENGINE_RELAY_IPC";
 const MAX_HEADER_BYTES: usize = 64 * 1024;
+const DEFAULT_BUFFER_BYTES: usize = 256 * 1024;
+static NEXT_PROXY_STREAM_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,7 +91,7 @@ fn run(stdout: &mut dyn Write) -> Result<(), String> {
         .env("https_proxy", &proxy_url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .map_err(|err| format!("native browser launch failed: {err}"))?;
 
@@ -197,7 +200,9 @@ fn start_proxy(config: ProxyConfig) -> Result<String, String> {
                 Ok(stream) => {
                     let config = config.clone();
                     thread::spawn(move || {
-                        let _ = handle_proxy_connection(stream, &config);
+                        if let Err(err) = handle_proxy_connection(stream, &config) {
+                            eprintln!("native proxy request failed: {err}");
+                        }
                     });
                 }
                 Err(_) => break,
@@ -210,11 +215,15 @@ fn start_proxy(config: ProxyConfig) -> Result<String, String> {
 fn handle_proxy_connection(mut client: TcpStream, config: &ProxyConfig) -> Result<(), String> {
     let head = read_http_head(&mut client)?;
     let request = parse_proxy_request(&head)?;
+    eprintln!(
+        "native proxy request target={} scheme={} host={}",
+        request.target, request.scheme, request.host
+    );
     let mut relay = UnixStream::connect(Path::new(&config.relay_ipc_path))
         .map_err(|err| format!("Runtime Exit relay unavailable: {err}"))?;
     let mut open = serde_json::to_vec(&json!({
         "schema": "elastos.exit.relay-open/v1",
-        "stream_id": format!("stream:native-proxy:{}", stable_hash(&request.target)),
+        "stream_id": next_proxy_stream_id(&request.target),
         "target": request.target,
         "scheme": request.scheme,
         "host": request.host,
@@ -366,7 +375,7 @@ fn forward_pair(client: TcpStream, relay: UnixStream, buffer_bytes: usize) -> Re
         &mut relay_to_client_out,
         buffer_bytes,
     );
-    let _ = relay_to_client_out.shutdown(Shutdown::Write);
+    let _ = relay_to_client_out.shutdown(Shutdown::Both);
     to_client.and(
         to_relay
             .join()
@@ -388,7 +397,6 @@ fn copy_stream<R: Read, W: Write>(
         writer
             .write_all(&buffer[..read])
             .map_err(|err| err.to_string())?;
-        writer.flush().map_err(|err| err.to_string())?;
     }
 }
 
@@ -401,12 +409,17 @@ fn stable_hash(value: &str) -> String {
     format!("{hash:016x}")
 }
 
+fn next_proxy_stream_id(target: &str) -> String {
+    let sequence = NEXT_PROXY_STREAM_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("stream:native-proxy:{}:{sequence}", stable_hash(target))
+}
+
 fn default_startup_grace_ms() -> u64 {
     500
 }
 
 fn default_buffer_bytes() -> usize {
-    64 * 1024
+    DEFAULT_BUFFER_BYTES
 }
 
 #[cfg(test)]
@@ -418,7 +431,12 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_socket_path(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        let root = if cfg!(unix) {
+            PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let dir = root.join(format!(
             "elastos-native-proxy-engine-{}-{}",
             std::process::id(),
             SystemTime::now()
@@ -453,6 +471,18 @@ mod tests {
         assert!(head.starts_with("GET /path?q=1 HTTP/1.1\r\n"));
         assert!(head.contains("Host: example.com\r\n"));
         assert!(!head.to_ascii_lowercase().contains("proxy-connection"));
+    }
+
+    #[test]
+    fn proxy_stream_ids_are_unique_per_connection() {
+        let first = next_proxy_stream_id("tls://ipfs.ela.city:443");
+        let second = next_proxy_stream_id("tls://ipfs.ela.city:443");
+
+        assert_ne!(first, second);
+        assert!(first.starts_with("stream:native-proxy:"));
+        assert!(first
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_')));
     }
 
     #[test]

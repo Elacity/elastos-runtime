@@ -33,7 +33,8 @@ pub enum ProviderRequest {
     /// Read file contents
     Read {
         path: String,
-        token: String,
+        #[serde(default)]
+        token: Option<String>,
         offset: Option<u64>,
         length: Option<u64>,
     },
@@ -41,33 +42,48 @@ pub enum ProviderRequest {
     /// Write file contents
     Write {
         path: String,
-        token: String,
+        #[serde(default)]
+        token: Option<String>,
         content: Vec<u8>,
         append: bool,
     },
 
     /// List directory contents
-    List { path: String, token: String },
+    List {
+        path: String,
+        #[serde(default)]
+        token: Option<String>,
+    },
 
     /// Delete file or directory
     Delete {
         path: String,
-        token: String,
+        #[serde(default)]
+        token: Option<String>,
         recursive: bool,
     },
 
     /// Get file/directory metadata
-    Stat { path: String, token: String },
+    Stat {
+        path: String,
+        #[serde(default)]
+        token: Option<String>,
+    },
 
     /// Create directory
     Mkdir {
         path: String,
-        token: String,
+        #[serde(default)]
+        token: Option<String>,
         parents: bool,
     },
 
     /// Check if path exists
-    Exists { path: String, token: String },
+    Exists {
+        path: String,
+        #[serde(default)]
+        token: Option<String>,
+    },
 
     /// Shutdown the provider
     Shutdown,
@@ -666,7 +682,7 @@ impl LocalProvider {
                 token,
                 offset,
                 length,
-            } => match self.read_file(&path, &token, offset, length) {
+            } => match self.read_file(&path, token.as_deref().unwrap_or(""), offset, length) {
                 Ok(data) => ProviderResponse::Ok {
                     data: Some(serde_json::json!({
                         "content": data,
@@ -684,7 +700,7 @@ impl LocalProvider {
                 token,
                 content,
                 append,
-            } => match self.write_file(&path, &token, &content, append) {
+            } => match self.write_file(&path, token.as_deref().unwrap_or(""), &content, append) {
                 Ok(written) => ProviderResponse::Ok {
                     data: Some(serde_json::json!({
                         "bytes_written": written,
@@ -696,21 +712,23 @@ impl LocalProvider {
                 },
             },
 
-            ProviderRequest::List { path, token } => match self.list_dir(&path, &token) {
-                Ok(entries) => ProviderResponse::Ok {
-                    data: Some(serde_json::to_value(entries).unwrap()),
-                },
-                Err(e) => ProviderResponse::Error {
-                    code: "list_failed".to_string(),
-                    message: e.to_string(),
-                },
-            },
+            ProviderRequest::List { path, token } => {
+                match self.list_dir(&path, token.as_deref().unwrap_or("")) {
+                    Ok(entries) => ProviderResponse::Ok {
+                        data: Some(serde_json::to_value(entries).unwrap()),
+                    },
+                    Err(e) => ProviderResponse::Error {
+                        code: "list_failed".to_string(),
+                        message: e.to_string(),
+                    },
+                }
+            }
 
             ProviderRequest::Delete {
                 path,
                 token,
                 recursive,
-            } => match self.delete(&path, &token, recursive) {
+            } => match self.delete(&path, token.as_deref().unwrap_or(""), recursive) {
                 Ok(()) => ProviderResponse::Ok { data: None },
                 Err(e) => ProviderResponse::Error {
                     code: "delete_failed".to_string(),
@@ -718,21 +736,23 @@ impl LocalProvider {
                 },
             },
 
-            ProviderRequest::Stat { path, token } => match self.stat(&path, &token) {
-                Ok(stat) => ProviderResponse::Ok {
-                    data: Some(serde_json::to_value(stat).unwrap()),
-                },
-                Err(e) => ProviderResponse::Error {
-                    code: "stat_failed".to_string(),
-                    message: e.to_string(),
-                },
-            },
+            ProviderRequest::Stat { path, token } => {
+                match self.stat(&path, token.as_deref().unwrap_or("")) {
+                    Ok(stat) => ProviderResponse::Ok {
+                        data: Some(serde_json::to_value(stat).unwrap()),
+                    },
+                    Err(e) => ProviderResponse::Error {
+                        code: "stat_failed".to_string(),
+                        message: e.to_string(),
+                    },
+                }
+            }
 
             ProviderRequest::Mkdir {
                 path,
                 token,
                 parents,
-            } => match self.mkdir(&path, &token, parents) {
+            } => match self.mkdir(&path, token.as_deref().unwrap_or(""), parents) {
                 Ok(()) => ProviderResponse::Ok { data: None },
                 Err(e) => ProviderResponse::Error {
                     code: "mkdir_failed".to_string(),
@@ -740,15 +760,17 @@ impl LocalProvider {
                 },
             },
 
-            ProviderRequest::Exists { path, token } => match self.exists(&path, &token) {
-                Ok(exists) => ProviderResponse::Ok {
-                    data: Some(serde_json::json!({ "exists": exists })),
-                },
-                Err(e) => ProviderResponse::Error {
-                    code: "exists_failed".to_string(),
-                    message: e.to_string(),
-                },
-            },
+            ProviderRequest::Exists { path, token } => {
+                match self.exists(&path, token.as_deref().unwrap_or("")) {
+                    Ok(exists) => ProviderResponse::Ok {
+                        data: Some(serde_json::json!({ "exists": exists })),
+                    },
+                    Err(e) => ProviderResponse::Error {
+                        code: "exists_failed".to_string(),
+                        message: e.to_string(),
+                    },
+                }
+            }
 
             ProviderRequest::Shutdown => ProviderResponse::Ok {
                 data: Some(serde_json::json!({ "message": "Provider shutting down" })),
@@ -859,6 +881,46 @@ mod tests {
             encryption_key: hex::encode(key),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn test_storage_request_body_token_is_optional() {
+        let dir = setup_test_dir();
+        let config = ProviderConfig {
+            base_path: dir.path().to_string_lossy().to_string(),
+            allowed_paths: vec!["*".to_string()],
+            read_only: false,
+            encryption_key: String::new(),
+        };
+        let mut provider = LocalProvider::new(config).unwrap();
+
+        let read: ProviderRequest =
+            serde_json::from_value(serde_json::json!({"op": "read", "path": "test.txt"})).unwrap();
+        match &read {
+            ProviderRequest::Read { token, .. } => assert!(token.is_none()),
+            _ => panic!("expected read request"),
+        }
+        assert!(matches!(
+            provider.handle_request(read),
+            ProviderResponse::Ok { .. }
+        ));
+
+        let write: ProviderRequest = serde_json::from_value(serde_json::json!({
+            "op": "write",
+            "path": "new.txt",
+            "content": [104, 105],
+            "append": false
+        }))
+        .unwrap();
+        match &write {
+            ProviderRequest::Write { token, .. } => assert!(token.is_none()),
+            _ => panic!("expected write request"),
+        }
+        assert!(matches!(
+            provider.handle_request(write),
+            ProviderResponse::Ok { .. }
+        ));
+        assert_eq!(fs::read(dir.path().join("new.txt")).unwrap(), b"hi");
     }
 
     #[test]

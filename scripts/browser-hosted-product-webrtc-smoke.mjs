@@ -9,6 +9,7 @@ function usage() {
   scripts/browser-hosted-product-webrtc-smoke.mjs \\
     --adapter-config /path/to/browser-engine-adapter.json \\
     [--adapter-bin capsules/browser-engine-adapter/target/debug/browser-engine-adapter] \\
+    [--relay-ipc-path /tmp/elastos-browser-local-exit.sock] \\
     [--hold-ms 0] \\
     [--min-video-width 1280] \\
     [--min-video-height 720] \\
@@ -30,6 +31,7 @@ function parseArgs(argv) {
     minVideoFps: 24,
     minVideoHeight: 720,
     minVideoWidth: 1280,
+    relayIpcPath: "",
     requireMedia: false,
     resizeHeight: 0,
     resizeWidth: 0,
@@ -42,6 +44,8 @@ function parseArgs(argv) {
       args.adapterBin = argv[++index] || "";
     } else if (arg === "--adapter-config") {
       args.adapterConfig = argv[++index] || "";
+    } else if (arg === "--relay-ipc-path") {
+      args.relayIpcPath = argv[++index] || "";
     } else if (arg === "--cdp-endpoint") {
       args.cdpEndpoint = argv[++index] || "";
     } else if (arg === "--hold-ms") {
@@ -73,6 +77,9 @@ function parseArgs(argv) {
   }
   if (!args.adapterConfig) {
     throw new Error("--adapter-config is required");
+  }
+  if (args.relayIpcPath && !args.relayIpcPath.startsWith("/")) {
+    throw new Error("--relay-ipc-path must be absolute when provided");
   }
   if (!Number.isInteger(args.timeoutMs) || args.timeoutMs < 5_000 || args.timeoutMs > 120_000) {
     throw new Error("--timeout-ms must be 5000..120000");
@@ -235,11 +242,11 @@ function expectOk(response, label) {
   return response.data || {};
 }
 
-function streamSessionFor(url) {
+function streamSessionFor(url, relayIpcPath = "") {
   const target = new URL(url);
   const port = target.port || (target.protocol === "https:" ? "443" : "80");
   const scheme = target.protocol === "https:" ? "tls" : "tcp";
-  return {
+  const session = {
     schema: "elastos.exit.stream-session/v1",
     stream_id: "stream:hosted-product-webrtc-smoke",
     target: `${scheme}://${target.hostname}:${port}`,
@@ -251,6 +258,33 @@ function streamSessionFor(url) {
       stream_id: "stream:hosted-product-webrtc-smoke",
       runtime_stream_path: "/tmp/elastos-browser-product-webrtc-smoke-runtime.sock",
     },
+  };
+  if (relayIpcPath) {
+    session.relay_ipc = {
+      schema: "elastos.exit.relay-ipc/v1",
+      kind: "unix_socket",
+      path: relayIpcPath,
+      stream_id: session.stream_id,
+    };
+  }
+  return session;
+}
+
+function browserProfile() {
+  return {
+    schema: "elastos.browser.profile/v1",
+    scope: "active_principal",
+    storage: "principal_owned_profile_disk",
+    storage_posture: "principal_owned_reset_scoped_unprotected",
+    protected_storage: false,
+    encrypted: false,
+    recoverable: false,
+    recovery: "not_recovery_kit_packaged",
+    uri: "localhost://Users/0123456789ab/BrowserProfiles/default/profile.ext4",
+    public_uri: "localhost://Users/self/BrowserProfiles/default/profile.ext4",
+    profile_key: "profile-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    disk_path: "/tmp/elastos-browser-hosted-product-webrtc/BrowserProfiles/default/profile.ext4",
+    reset: "whole_profile",
   };
 }
 
@@ -546,15 +580,21 @@ async function main() {
 
   try {
     expectOk(await adapter.request({ op: "init", config }), "init");
+    const launchViewport = {
+      width: args.resizeWidth > 0 ? args.resizeWidth : 1280,
+      height: args.resizeHeight > 0 ? args.resizeHeight : 720,
+    };
     const launchedPage = expectOk(
       await adapter.request({
         op: "launch",
         url: args.url,
-        stream_session: streamSessionFor(args.url),
+        stream_session: streamSessionFor(args.url, args.relayIpcPath),
+        profile: browserProfile(),
         principal_id: "person:local:hosted-product-webrtc-smoke",
         reason: "verify hosted product WebRTC media",
         display_mode: "webrtc_remote_display",
-        viewport: { width: 1280, height: 720 },
+        guarantee_level: "operator_rbi",
+        viewport: launchViewport,
       }),
       "launch",
     );
@@ -564,7 +604,6 @@ async function main() {
       session.schema !== "elastos.browser.display-session/v1" ||
       session.mode !== "webrtc_remote_display" ||
       session.backend_class !== "product_compositor" ||
-      session.audio !== true ||
       session.video !== true ||
       session.offerer !== "engine" ||
       session.input !== "datachannel" ||
@@ -580,6 +619,15 @@ async function main() {
     ) {
       throw new Error("hosted display session missing engine WebRTC offer");
     }
+    const initialOfferHasAudio = /\r?\nm=audio\s/.test(initialOffer.sdp);
+    const audioOffer = session.audio_offer || {};
+    const sessionHasAudioOffer = /\r?\nm=audio\s/.test(String(audioOffer.sdp || initialOffer.sdp));
+    if (session.audio === true && !sessionHasAudioOffer) {
+      throw new Error(`hosted display session advertised audio without an audio offer: ${JSON.stringify(session)}`);
+    }
+    if (session.audio === false && sessionHasAudioOffer) {
+      throw new Error(`hosted display session included audio offer while advertising audio=false: ${JSON.stringify(session)}`);
+    }
 
     const { chromium } = playwright;
     browser = await chromium.launch({
@@ -588,7 +636,7 @@ async function main() {
     });
     page = await browser.newPage();
     await page.goto("about:blank");
-    const answerSdp = await page.evaluate(async ({ sdp, iceServers }) => {
+    const answerSdp = await page.evaluate(async ({ sdp, iceServers, mediaTransport }) => {
       const state = {
         tracks: [],
         dataChannelOpen: false,
@@ -599,6 +647,7 @@ async function main() {
       globalThis.__elastosWebrtcState = state;
       const peer = new RTCPeerConnection({
         iceServers,
+        iceTransportPolicy: mediaTransport === "runtime_relay" ? "relay" : "all",
         bundlePolicy: "max-bundle",
         rtcpMuxPolicy: "require",
       });
@@ -660,6 +709,7 @@ async function main() {
     }, {
       sdp: initialOffer.sdp,
       iceServers: session.ice_servers || [],
+      mediaTransport: session.media_transport || "",
     });
 
     await signal({
@@ -690,13 +740,15 @@ async function main() {
         const state = await page.evaluate(() => ({ ...globalThis.__elastosWebrtcState }));
         return (
           state.tracks.includes("video") &&
-          state.tracks.includes("audio") &&
+          (!initialOfferHasAudio || state.tracks.includes("audio")) &&
           state.dataChannelOpen &&
           ["connected", "completed"].includes(state.iceConnectionState)
         );
       },
       args.timeoutMs,
-      "audio/video tracks, datachannel input, and connected ICE",
+      initialOfferHasAudio
+        ? "audio/video tracks, datachannel input, and connected ICE"
+        : "video track, datachannel input, and connected ICE",
     );
     await Promise.all([...signalPromises]);
     const state = await page.evaluate(() => ({ ...globalThis.__elastosWebrtcState }));
@@ -780,6 +832,9 @@ async function main() {
       page_id: pageId,
       display_backend: session.display_backend,
       backend_class: session.backend_class,
+      audio_expected: initialOfferHasAudio,
+      audio_session: session.audio,
+      audio_offer: sessionHasAudioOffer,
       audio_track: state.tracks.includes("audio"),
       video_track: state.tracks.includes("video"),
       datachannel_input: state.dataChannelOpen,

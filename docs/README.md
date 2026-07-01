@@ -7,6 +7,7 @@ Reference documentation that used to live at the repo root now lives here.
 These are the main active docs for outside readers and contributors.
 
 - [../README.md](../README.md) — repo front door
+- [../PRINCIPLES.md](../PRINCIPLES.md) — proof discipline and runtime authority constraints
 - [state.md](../state.md) — factual current-state summary
 - [GETTING_STARTED.md](GETTING_STARTED.md) — developer build/run path
 - [RUN_HOME_MACOS.md](RUN_HOME_MACOS.md) — repeatable runbook for the browser Home shell + passkey login on macOS (host lock + WebAuthn gotchas)

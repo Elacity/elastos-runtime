@@ -67,6 +67,17 @@ fn write_test_browser_capsule(
     .unwrap();
 }
 
+fn write_test_wasm_entrypoint(data_dir: &std::path::Path, name: &str) {
+    std::fs::write(
+        data_dir
+            .join("capsules")
+            .join(name)
+            .join(format!("{name}.wasm")),
+        b"\0asm",
+    )
+    .unwrap();
+}
+
 fn write_test_static_capsule(
     data_dir: &std::path::Path,
     name: &str,
@@ -119,6 +130,15 @@ fn seed_test_browser_capsules(data_dir: &std::path::Path) {
         "Test System capsule",
         Some("<!doctype html><title>System</title>"),
     );
+    write_test_wasm_entrypoint(data_dir, SYSTEM_CAPSULE_ID);
+    write_test_browser_capsule(
+        data_dir,
+        SERVICES_CAPSULE_ID,
+        "app",
+        "Test Services capsule",
+        Some("<!doctype html><title>Services</title>"),
+    );
+    write_test_wasm_entrypoint(data_dir, SERVICES_CAPSULE_ID);
     write_test_static_capsule(
         data_dir,
         DOCUMENTS_CAPSULE_ID,
@@ -144,9 +164,10 @@ fn seed_test_browser_capsules(data_dir: &std::path::Path) {
         data_dir,
         CHAT_ROOM_CAPSULE_ID,
         "app",
-        "Test Chat Room capsule",
-        Some("<!doctype html><title>Chat Room</title>Chat Room"),
+        "Test Chat capsule",
+        Some("<!doctype html><title>Chat</title>Chat"),
     );
+    write_test_wasm_entrypoint(data_dir, CHAT_ROOM_CAPSULE_ID);
     std::fs::write(
         data_dir
             .join("capsules")
@@ -164,6 +185,7 @@ fn seed_test_browser_capsules(data_dir: &std::path::Path) {
         "Test GBA emulator capsule",
         Some("<!doctype html><title>GBA Emulator</title>"),
     );
+    write_test_wasm_entrypoint(data_dir, GBA_EMULATOR_CAPSULE_ID);
     write_test_viewer_capsule(
         data_dir,
         "gba-ucity",
@@ -393,6 +415,9 @@ struct FakePeerBus {
     topic_members: HashMap<String, BTreeSet<String>>,
     topic_messages: HashMap<String, Vec<serde_json::Value>>,
     cursors: HashMap<(String, String, String), usize>,
+    fail_message_substrings: Vec<String>,
+    drop_remote_message_substrings: Vec<String>,
+    local_only_message_substrings: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -404,12 +429,16 @@ struct FakeRuntimeState {
     bus: Arc<TokioMutex<FakePeerBus>>,
     audit_events: Arc<TokioMutex<Vec<elastos_runtime::primitives::audit::AuditEvent>>>,
     launch_requests: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    provider_requests: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    pending_capabilities: Arc<TokioMutex<HashMap<String, String>>>,
+    capabilities_start_pending: bool,
 }
 
 struct FakeRuntimeHandle {
     api_url: String,
     _task: tokio::task::JoinHandle<()>,
     launch_requests: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    provider_requests: Arc<TokioMutex<Vec<serde_json::Value>>>,
 }
 
 fn verifying_key_from_did(did: &str) -> Option<ed25519_dalek::VerifyingKey> {
@@ -427,8 +456,36 @@ async fn start_fake_runtime(
     bus: Arc<TokioMutex<FakePeerBus>>,
     peer_id: &str,
 ) -> FakeRuntimeHandle {
-    let (signing_key, did) = elastos_identity::load_or_create_did(data_dir).unwrap();
+    start_fake_runtime_configured(data_dir, data_dir, bus, peer_id, false).await
+}
+
+async fn start_fake_runtime_with_pending_capabilities(
+    data_dir: &std::path::Path,
+    bus: Arc<TokioMutex<FakePeerBus>>,
+    peer_id: &str,
+) -> FakeRuntimeHandle {
+    start_fake_runtime_configured(data_dir, data_dir, bus, peer_id, true).await
+}
+
+async fn start_fake_runtime_with_identity_dir(
+    data_dir: &std::path::Path,
+    identity_dir: &std::path::Path,
+    bus: Arc<TokioMutex<FakePeerBus>>,
+    peer_id: &str,
+) -> FakeRuntimeHandle {
+    start_fake_runtime_configured(data_dir, identity_dir, bus, peer_id, false).await
+}
+
+async fn start_fake_runtime_configured(
+    data_dir: &std::path::Path,
+    identity_dir: &std::path::Path,
+    bus: Arc<TokioMutex<FakePeerBus>>,
+    peer_id: &str,
+    capabilities_start_pending: bool,
+) -> FakeRuntimeHandle {
+    let (signing_key, did) = elastos_identity::load_or_create_did(identity_dir).unwrap();
     let launch_requests = Arc::new(TokioMutex::new(Vec::new()));
+    let provider_requests = Arc::new(TokioMutex::new(Vec::new()));
     let state = FakeRuntimeState {
         did,
         signing_key,
@@ -442,6 +499,9 @@ async fn start_fake_runtime(
             },
         ])),
         launch_requests: launch_requests.clone(),
+        provider_requests: provider_requests.clone(),
+        pending_capabilities: Arc::new(TokioMutex::new(HashMap::new())),
+        capabilities_start_pending,
     };
     let app = Router::new()
         .route("/api/auth/attach", post(fake_runtime_attach))
@@ -449,6 +509,10 @@ async fn start_fake_runtime(
         .route(
             "/api/capability/request",
             post(fake_runtime_capability_request),
+        )
+        .route(
+            "/api/capability/request/:request_id",
+            get(fake_runtime_capability_request_status),
         )
         .route(
             "/api/capsules",
@@ -480,6 +544,7 @@ async fn start_fake_runtime(
         api_url,
         _task: task,
         launch_requests,
+        provider_requests,
     }
 }
 
@@ -593,7 +658,36 @@ async fn fake_runtime_capability_request(
     } else {
         format!("cap-{}", state.peer_id)
     };
+    if state.capabilities_start_pending {
+        let mut pending = state.pending_capabilities.lock().await;
+        let request_id = format!("fake-capability-{}-{}", state.peer_id, pending.len() + 1);
+        pending.insert(request_id.clone(), token);
+        return AxumJson(json!({
+            "status": "pending",
+            "request_id": request_id,
+        }))
+        .into_response();
+    }
     AxumJson(json!({ "token": token })).into_response()
+}
+
+async fn fake_runtime_capability_request_status(
+    AxumPath(request_id): AxumPath<String>,
+    AxumState(state): AxumState<FakeRuntimeState>,
+) -> Response {
+    let pending = state.pending_capabilities.lock().await;
+    if let Some(token) = pending.get(&request_id) {
+        return AxumJson(json!({
+            "status": "granted",
+            "token": token,
+        }))
+        .into_response();
+    }
+    AxumJson(json!({
+        "status": "expired",
+        "reason": "unknown fake capability request",
+    }))
+    .into_response()
 }
 
 async fn fake_runtime_provider(
@@ -601,6 +695,11 @@ async fn fake_runtime_provider(
     AxumState(state): AxumState<FakeRuntimeState>,
     AxumJson(body): AxumJson<serde_json::Value>,
 ) -> Response {
+    state.provider_requests.lock().await.push(json!({
+        "scheme": scheme.clone(),
+        "op": op.clone(),
+        "body": body.clone(),
+    }));
     match (scheme.as_str(), op.as_str()) {
         ("did", "get_did") => AxumJson(json!({
             "status": "ok",
@@ -663,16 +762,72 @@ async fn fake_runtime_provider(
             }))
             .into_response()
         }
+        ("peer", "get_ticket") => AxumJson(json!({
+            "status": "ok",
+            "data": {
+                "ticket": format!("fake-ticket-{}", state.peer_id),
+                "node_id": state.peer_id,
+            }
+        }))
+        .into_response(),
         ("peer", "gossip_join") => {
             let topic = body
                 .get("topic")
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
             let mut bus = state.bus.lock().await;
-            bus.topic_members
-                .entry(topic.to_string())
-                .or_default()
-                .insert(state.peer_id.clone());
+            let members = bus.topic_members.entry(topic.to_string()).or_default();
+            if members.contains(&state.peer_id) {
+                return AxumJson(json!({
+                    "status": "error",
+                    "code": "already_joined",
+                    "message": "already joined"
+                }))
+                .into_response();
+            }
+            members.insert(state.peer_id.clone());
+            AxumJson(json!({
+                "status": "ok",
+                "data": { "topic": topic }
+            }))
+            .into_response()
+        }
+        ("peer", "connect") | ("peer", "remember_peer") => {
+            let ticket = body
+                .get("ticket")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let peer = if ticket.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec!["trusted-source-peer".to_string()]
+            };
+            AxumJson(json!({
+                "status": "ok",
+                "data": {
+                    "added": peer,
+                    "connected": []
+                }
+            }))
+            .into_response()
+        }
+        ("peer", "gossip_join_peers") => {
+            let topic = body
+                .get("topic")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let peers = body
+                .get("peers")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut bus = state.bus.lock().await;
+            let members = bus.topic_members.entry(topic.to_string()).or_default();
+            for peer in peers {
+                if let Some(peer) = peer.as_str().map(str::trim).filter(|peer| !peer.is_empty()) {
+                    members.insert(peer.to_string());
+                }
+            }
             AxumJson(json!({
                 "status": "ok",
                 "data": { "topic": topic }
@@ -706,18 +861,53 @@ async fn fake_runtime_provider(
                 .unwrap_or("");
             let mut bus = state.bus.lock().await;
             let peers = bus.topic_members.get(topic).cloned().unwrap_or_default();
-            bus.topic_messages
-                .entry(topic.to_string())
-                .or_default()
-                .push(json!({
-                    "sender_id": body.get("sender_id").cloned().unwrap_or(serde_json::Value::Null),
-                    "sender_nick": body.get("sender").cloned().unwrap_or(serde_json::Value::Null),
-                    "content": body.get("message").cloned().unwrap_or(serde_json::Value::Null),
-                    "ts": body.get("ts").cloned().unwrap_or(serde_json::Value::from(0u64)),
-                    "signature": body.get("signature").cloned().unwrap_or(serde_json::Value::Null),
-                }));
-            let mut response = json!({ "status": "ok" });
-            if peers.iter().filter(|peer| *peer != &state.peer_id).count() == 0 {
+            let remote_peer_count = peers.iter().filter(|peer| *peer != &state.peer_id).count();
+            let message = body.get("message").and_then(|value| value.as_str()).unwrap_or("");
+            let fail_index = bus
+                .fail_message_substrings
+                .iter()
+                .position(|needle| message.contains(needle));
+            if let Some(index) = fail_index {
+                bus.fail_message_substrings.remove(index);
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    AxumJson(json!({
+                        "status": "error",
+                        "message": "fake Carrier gossip_send failed"
+                    })),
+                )
+                    .into_response();
+            }
+            let local_only = bus
+                .local_only_message_substrings
+                .iter()
+                .any(|needle| message.contains(needle));
+            let drop_index = (remote_peer_count > 0)
+                .then(|| {
+                    bus.drop_remote_message_substrings
+                        .iter()
+                        .position(|needle| message.contains(needle))
+                })
+                .flatten();
+            if let Some(index) = drop_index {
+                bus.drop_remote_message_substrings.remove(index);
+            } else if !local_only {
+                bus.topic_messages
+                    .entry(topic.to_string())
+                    .or_default()
+                    .push(json!({
+                        "sender_id": body.get("sender_id").cloned().unwrap_or(serde_json::Value::Null),
+                        "sender_nick": body.get("sender").cloned().unwrap_or(serde_json::Value::Null),
+                        "content": body.get("message").cloned().unwrap_or(serde_json::Value::Null),
+                        "ts": body.get("ts").cloned().unwrap_or(serde_json::Value::from(0u64)),
+                        "signature": body.get("signature").cloned().unwrap_or(serde_json::Value::Null),
+                    }));
+            }
+            let mut response = json!({
+                "status": "ok",
+                "data": { "remote_peer_count": remote_peer_count }
+            });
+            if remote_peer_count == 0 || local_only {
                 response["broadcast"] = serde_json::Value::String("local_only".to_string());
             }
             AxumJson(response).into_response()
@@ -761,10 +951,16 @@ async fn fake_runtime_provider(
                             != skip_sender_id
                 })
                 .collect::<Vec<_>>();
-            bus.cursors.insert(cursor_key, start + count);
+            let next_cursor = start + count;
+            bus.cursors.insert(cursor_key, next_cursor);
             AxumJson(json!({
                 "status": "ok",
-                "data": { "messages": selected }
+                "data": {
+                    "messages": selected,
+                    "scanned": count,
+                    "limit": limit,
+                    "next_cursor": next_cursor
+                }
             }))
             .into_response()
         }

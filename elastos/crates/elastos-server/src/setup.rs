@@ -334,7 +334,13 @@ pub async fn run(
 
 // ── Manifest loading ────────────────────────────────────────────────
 
+const COMPONENTS_MANIFEST_ENV: &str = "ELASTOS_COMPONENTS_MANIFEST";
+
 fn load_manifest() -> anyhow::Result<ComponentsManifest> {
+    if let Some(path) = explicit_components_manifest_path() {
+        return load_manifest_from_path(&path);
+    }
+
     let exe_path = std::env::current_exe().ok();
     let manifest_paths = [
         // Source checkout layout: <repo>/elastos/target/{debug,release}/elastos.
@@ -350,14 +356,33 @@ fn load_manifest() -> anyhow::Result<ComponentsManifest> {
 
     for path in manifest_paths.iter().flatten() {
         if let Ok(content) = fs::read_to_string(path) {
-            let manifest: ComponentsManifest = serde_json::from_str(&content).map_err(|e| {
-                anyhow::anyhow!("Invalid components.json at {}: {}", path.display(), e)
-            })?;
-            return Ok(manifest);
+            return parse_manifest_at(path, &content);
         }
     }
 
     anyhow::bail!("{}", missing_manifest_message())
+}
+
+fn explicit_components_manifest_path() -> Option<PathBuf> {
+    std::env::var_os(COMPONENTS_MANIFEST_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn load_manifest_from_path(path: &Path) -> anyhow::Result<ComponentsManifest> {
+    let content = fs::read_to_string(path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to read components.json at {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+    parse_manifest_at(path, &content)
+}
+
+fn parse_manifest_at(path: &Path, content: &str) -> anyhow::Result<ComponentsManifest> {
+    serde_json::from_str(content)
+        .map_err(|e| anyhow::anyhow!("Invalid components.json at {}: {}", path.display(), e))
 }
 
 fn data_dir() -> anyhow::Result<PathBuf> {
@@ -393,11 +418,13 @@ fn source_checkout_manifest_path(exe_path: &Path) -> Option<PathBuf> {
 
 fn missing_manifest_message() -> String {
     "components.json not found. Searched:\n  \
+     $ELASTOS_COMPONENTS_MANIFEST when set\n  \
      ~/.local/share/elastos/components.json\n  \
      <exe-dir>/components.json\n  \
      <source-checkout>/components.json\n\n\
      Source-built binaries are not self-contained installs.\n\
      Use the published installer, run the binary from the repo checkout,\n\
+     set ELASTOS_COMPONENTS_MANIFEST to a generated manifest,\n\
      or place components.json next to the binary or in ~/.local/share/elastos/."
         .to_string()
 }
@@ -430,6 +457,8 @@ fn set_local_copy_permissions(source: &Path, dest: &Path) {
 pub fn detect_platform() -> String {
     let os = if cfg!(target_os = "linux") {
         "linux"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
     } else {
         "unknown"
     };
@@ -608,14 +637,6 @@ pub(crate) async fn ensure_capsule_component_for_home_launch(
             detail: Some("not a setup-managed capsule component".to_string()),
         });
     };
-    let Some(capsule_entry) = manifest.capsules.get(name) else {
-        return Ok(CapsuleComponentEnsure {
-            name: name.to_string(),
-            status: "skipped".to_string(),
-            detail: Some("component has no verified app registry entry".to_string()),
-        });
-    };
-
     let platform = detect_platform();
     let platform_info = resolve_platform_info(component, &platform).ok_or_else(|| {
         anyhow::anyhow!("capsule component '{name}' is not available for {platform}")
@@ -634,7 +655,7 @@ pub(crate) async fn ensure_capsule_component_for_home_launch(
         });
     }
 
-    validate_capsule_package_identity(name, capsule_entry, platform_info)?;
+    validate_capsule_package_identity(name, manifest.capsules.get(name), platform_info)?;
     if platform_info.strategy.as_deref() == Some("source-build") {
         anyhow::bail!(
             "capsule component '{name}' requires a source build and cannot be JIT materialized"
@@ -692,30 +713,30 @@ pub(crate) async fn ensure_capsule_component_for_home_launch(
 
 fn validate_capsule_package_identity(
     name: &str,
-    entry: &CapsuleEntry,
+    entry: Option<&CapsuleEntry>,
     platform_info: &PlatformInfo,
 ) -> anyhow::Result<()> {
-    let cid = entry.cid.trim();
+    let registry_cid = entry.map(|entry| entry.cid.trim()).unwrap_or_default();
+    let platform_cid = platform_info
+        .cid
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    let cid = if platform_cid.is_empty() {
+        registry_cid
+    } else {
+        platform_cid
+    };
     if cid.is_empty() {
         anyhow::bail!("capsule component '{name}' is missing package CID");
     }
     if cid::Cid::try_from(cid).is_err() {
         anyhow::bail!("capsule component '{name}' has invalid package CID");
     }
-    if let Some(platform_cid) = platform_info
-        .cid
-        .as_deref()
-        .map(str::trim)
-        .filter(|platform_cid| !platform_cid.is_empty())
-    {
-        if platform_cid != cid {
-            anyhow::bail!(
-                "capsule component '{name}' platform package CID does not match registry CID"
-            );
-        }
-    }
-    if entry.sha256.trim().is_empty() {
-        anyhow::bail!("capsule component '{name}' is missing package archive sha256");
+    if !registry_cid.is_empty() && !platform_cid.is_empty() && platform_cid != registry_cid {
+        anyhow::bail!(
+            "capsule component '{name}' platform package CID does not match registry CID"
+        );
     }
     let platform_checksum = platform_info
         .checksum
@@ -728,17 +749,59 @@ fn validate_capsule_package_identity(
     let Some(platform_sha256) = platform_checksum.strip_prefix("sha256:") else {
         anyhow::bail!("capsule component '{name}' platform archive checksum must be sha256");
     };
-    let registry_sha256 = entry
-        .sha256
-        .trim()
-        .strip_prefix("sha256:")
-        .unwrap_or_else(|| entry.sha256.trim());
-    if registry_sha256 != platform_sha256 {
-        anyhow::bail!(
-            "capsule component '{name}' package sha256 does not match platform archive checksum"
-        );
+    if let Some(entry) = entry {
+        if entry.sha256.trim().is_empty() {
+            anyhow::bail!("capsule component '{name}' is missing package archive sha256");
+        }
+        let registry_sha256 = entry
+            .sha256
+            .trim()
+            .strip_prefix("sha256:")
+            .unwrap_or_else(|| entry.sha256.trim());
+        if registry_sha256 != platform_sha256 {
+            anyhow::bail!(
+                "capsule component '{name}' package sha256 does not match platform archive checksum"
+            );
+        }
     }
     Ok(())
+}
+
+pub(crate) fn capsule_component_has_release_identity(data_dir: &Path, name: &str) -> bool {
+    let Ok(manifest_bytes) = fs::read(data_dir.join("components.json")) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_slice::<ComponentsManifest>(&manifest_bytes) else {
+        return false;
+    };
+    let Some(component) = manifest.external.get(name) else {
+        return false;
+    };
+    let platform = detect_platform();
+    let Some(platform_info) = resolve_platform_info(component, &platform) else {
+        return false;
+    };
+    package_identity_is_present(manifest.capsules.get(name), platform_info)
+}
+
+fn package_identity_is_present(entry: Option<&CapsuleEntry>, platform_info: &PlatformInfo) -> bool {
+    let cid_present = platform_info
+        .cid
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+        || entry
+            .map(|entry| !entry.cid.trim().is_empty())
+            .unwrap_or(false);
+    let checksum_present = platform_info
+        .checksum
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+        || entry
+            .map(|entry| !entry.sha256.trim().is_empty())
+            .unwrap_or(false);
+    cid_present && checksum_present
 }
 
 fn validate_capsule_component_install_path(name: &str, install_path: &str) -> anyhow::Result<()> {
@@ -778,10 +841,6 @@ fn component_install_state_for_name(
         return base;
     }
 
-    let Some(entry) = manifest.capsules.get(name) else {
-        return base;
-    };
-
     let Some(path) = resolve_install_path(component, platform_info) else {
         return base;
     };
@@ -792,6 +851,13 @@ fn component_install_state_for_name(
     if !install_root.join("capsule.json").is_file() {
         return InstallState::Stale("capsule metadata missing from installed bundle".to_string());
     }
+    if let Some(reason) = installed_capsule_bundle_stale_reason(name, &install_root) {
+        return InstallState::Stale(reason);
+    }
+
+    let Some(entry) = manifest.capsules.get(name) else {
+        return base;
+    };
 
     let cached_cid = fs::read_to_string(install_root.join(CACHED_CID_FILE))
         .ok()
@@ -814,6 +880,34 @@ fn component_install_state_for_name(
     }
 
     base
+}
+
+fn installed_capsule_bundle_stale_reason(name: &str, install_root: &Path) -> Option<String> {
+    let manifest_bytes = fs::read(install_root.join("capsule.json")).ok()?;
+    let manifest: elastos_common::CapsuleManifest = match serde_json::from_slice(&manifest_bytes) {
+        Ok(manifest) => manifest,
+        Err(err) => return Some(format!("capsule metadata is invalid: {err}")),
+    };
+    if let Err(err) = manifest.validate() {
+        return Some(format!("capsule metadata failed validation: {err}"));
+    }
+    if manifest.name != name {
+        return Some(format!(
+            "capsule metadata name mismatch: expected '{}', found '{}'",
+            name, manifest.name
+        ));
+    }
+    if matches!(
+        manifest.capsule_type,
+        elastos_common::CapsuleType::Wasm | elastos_common::CapsuleType::Data
+    ) && !install_root.join(&manifest.entrypoint).is_file()
+    {
+        return Some(format!(
+            "capsule entrypoint missing from installed bundle: {}",
+            manifest.entrypoint
+        ));
+    }
+    None
 }
 
 fn maybe_write_component_cache_metadata(
@@ -1059,6 +1153,8 @@ fn platform_aliases(platform: &str) -> impl Iterator<Item = &'static str> {
         "aarch64-linux" => &["linux-arm64"],
         "linux-amd64" => &["x86_64-linux"],
         "linux-arm64" => &["aarch64-linux"],
+        "aarch64-darwin" => &["darwin-arm64"],
+        "darwin-arm64" => &["aarch64-darwin"],
         _ => &[],
     };
     aliases.iter().copied()
@@ -1375,6 +1471,55 @@ fn resolve_component_download_url(platform_info: &PlatformInfo) -> Option<String
         .or_else(|| platform_info.url.clone())
 }
 
+fn requires_release_artifact_checksum(platform_info: &PlatformInfo) -> bool {
+    if matches!(
+        platform_info.strategy.as_deref(),
+        Some("source-build" | "local-copy")
+    ) {
+        return false;
+    }
+    platform_info
+        .release_path
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+        || platform_info
+            .cid
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        || platform_info
+            .url
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+}
+
+fn required_release_artifact_checksum<'a>(
+    name: &str,
+    platform_info: &'a PlatformInfo,
+) -> anyhow::Result<Option<&'a str>> {
+    let checksum = platform_info
+        .checksum
+        .as_deref()
+        .filter(|checksum| !checksum.is_empty());
+    if !requires_release_artifact_checksum(platform_info) {
+        return Ok(checksum);
+    }
+    let checksum = checksum.ok_or_else(|| {
+        anyhow::anyhow!(
+            "component '{}' release artifact is missing checksum; expected sha256:... or sha512:...",
+            name
+        )
+    })?;
+    if checksum.starts_with("sha256:") || checksum.starts_with("sha512:") {
+        Ok(Some(checksum))
+    } else {
+        anyhow::bail!(
+            "Unknown checksum format for {}: {}. Expected sha256:... or sha512:...",
+            name,
+            checksum
+        );
+    }
+}
+
 pub async fn refresh_installed_components_for_update(
     data_dir: &Path,
     old_components: Option<&[u8]>,
@@ -1550,6 +1695,7 @@ async fn download_component(
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
+    required_release_artifact_checksum(name, platform_info)?;
 
     let is_model = dest.extension().map(|e| e == "gguf").unwrap_or(false);
     let is_tarball =
@@ -1673,14 +1819,13 @@ async fn download_streaming(
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
 
+    let expected_checksum = required_release_artifact_checksum(name, platform_info)?;
     let tmp_path = dest.with_extension("tmp");
     let mut file = tokio::fs::File::create(&tmp_path).await?;
 
     // Set up the right hasher based on expected checksum format
-    let use_sha512 = platform_info
-        .checksum
-        .as_ref()
-        .map(|c| c.starts_with("sha512:"))
+    let use_sha512 = expected_checksum
+        .map(|checksum| checksum.starts_with("sha512:"))
         .unwrap_or(false);
     let mut hasher_256 = sha2::Sha256::new();
     let mut hasher_512 = sha2::Sha512::new();
@@ -1723,11 +1868,7 @@ async fn download_streaming(
     }
 
     // Verify checksum
-    if let Some(expected) = platform_info
-        .checksum
-        .as_deref()
-        .filter(|checksum| !checksum.is_empty())
-    {
+    if let Some(expected) = expected_checksum {
         let (actual, algo) = if expected.starts_with("sha512:") {
             (
                 format!("sha512:{}", hex::encode(hasher_512.finalize())),
@@ -1760,11 +1901,7 @@ async fn download_streaming(
 }
 
 fn verify_checksum(name: &str, data: &[u8], platform_info: &PlatformInfo) -> anyhow::Result<()> {
-    let expected = match platform_info
-        .checksum
-        .as_deref()
-        .filter(|checksum| !checksum.is_empty())
-    {
+    let expected = match required_release_artifact_checksum(name, platform_info)? {
         Some(c) => c,
         None => return Ok(()),
     };
@@ -1944,12 +2081,15 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::sources::{save_trusted_sources, TrustedSource, TrustedSourcesConfig};
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_detect_platform() {
         let p = detect_platform();
         assert!(
-            p.contains("linux") || p.contains("unknown"),
+            p.contains("linux") || p.contains("darwin") || p.contains("unknown"),
             "Platform should contain os: {}",
             p
         );
@@ -1962,6 +2102,7 @@ mod tests {
 
     #[test]
     fn test_load_manifest_finds_current_manifest() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let xdg_data_home = temp.path().join("xdg-data");
         let data_dir = xdg_data_home.join("elastos");
@@ -1972,16 +2113,91 @@ mod tests {
         )
         .unwrap();
 
+        std::env::remove_var(COMPONENTS_MANIFEST_ENV);
         std::env::set_var("XDG_DATA_HOME", &xdg_data_home);
         let manifest = load_manifest().unwrap();
         std::env::remove_var("XDG_DATA_HOME");
 
         assert!(manifest.external.contains_key("kubo"));
+        assert!(manifest.external.contains_key("archive-manager"));
+        for provider in [
+            "net-provider",
+            "exit-provider",
+            "browser-engine-adapter",
+            "object-provider",
+            "webspace-provider",
+            "content-block-graph-provider",
+            "ipfs-provider",
+            "wallet-provider",
+        ] {
+            assert!(
+                manifest.external[provider]
+                    .platforms
+                    .contains_key("darwin-arm64"),
+                "{provider} should be source-buildable on Apple Silicon"
+            );
+        }
         assert!(manifest.profiles.contains_key("home"));
+        assert!(manifest.profiles["home"]
+            .components
+            .iter()
+            .any(|component| component == "archive-manager"));
+        for profile_name in ["home", "demo", "agent-local-ai", "public-gateway", "full"] {
+            let profile = manifest
+                .profiles
+                .get(profile_name)
+                .unwrap_or_else(|| panic!("{profile_name} profile is missing"));
+            let has_wallet_or_browser_surface = profile.components.iter().any(|component| {
+                matches!(
+                    component.as_str(),
+                    "wallet"
+                        | "wallet-metamask"
+                        | "wallet-unisat"
+                        | "wallet-walletconnect"
+                        | "browser"
+                        | "inbox"
+                )
+            });
+            if has_wallet_or_browser_surface {
+                for provider in ["chain-provider", "wallet-provider"] {
+                    assert!(
+                        profile.components.iter().any(|component| component == provider),
+                        "{profile_name} profile installs Wallet/Browser surfaces without {provider}"
+                    );
+                }
+            }
+        }
         assert!(manifest.profiles.contains_key("chat"));
         assert!(manifest.profiles.contains_key("blockchain"));
         assert!(manifest.profiles.contains_key("operator"));
         assert!(manifest.profiles.contains_key("full"));
+    }
+
+    #[test]
+    fn test_load_manifest_uses_explicit_manifest_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let source_manifest =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../components.json");
+        let override_manifest = temp.path().join("components.json");
+        let mut manifest_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&source_manifest).unwrap()).unwrap();
+        manifest_json["external"]
+            .as_object_mut()
+            .unwrap()
+            .remove("kubo");
+        fs::write(
+            &override_manifest,
+            serde_json::to_vec_pretty(&manifest_json).unwrap(),
+        )
+        .unwrap();
+
+        std::env::set_var(COMPONENTS_MANIFEST_ENV, &override_manifest);
+        let manifest = load_manifest().unwrap();
+        std::env::remove_var(COMPONENTS_MANIFEST_ENV);
+
+        assert!(!manifest.external.contains_key("kubo"));
+        assert!(manifest.external.contains_key("archive-manager"));
     }
 
     #[test]
@@ -2013,6 +2229,7 @@ mod tests {
     #[test]
     fn test_missing_manifest_message_mentions_source_checkout() {
         let message = missing_manifest_message();
+        assert!(message.contains("ELASTOS_COMPONENTS_MANIFEST"));
         assert!(message.contains("<source-checkout>/components.json"));
         assert!(message.contains("Source-built binaries are not self-contained installs."));
     }
@@ -2033,6 +2250,10 @@ mod tests {
                 "linux-arm64": {
                     "cid": "QmAlias",
                     "checksum": "sha256:deadbeef"
+                },
+                "darwin-arm64": {
+                    "cid": "QmDarwinAlias",
+                    "checksum": "sha256:feedface"
                 }
             }
         }))
@@ -2040,6 +2261,9 @@ mod tests {
 
         let info = resolve_platform_info(&comp, "aarch64-linux").unwrap();
         assert_eq!(info.cid.as_deref(), Some("QmAlias"));
+
+        let info = resolve_platform_info(&comp, "aarch64-darwin").unwrap();
+        assert_eq!(info.cid.as_deref(), Some("QmDarwinAlias"));
     }
 
     #[test]
@@ -2379,6 +2603,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        fs::write(install_root.join("marketplace.wasm"), b"\0asm").unwrap();
         fs::write(
             tmp.path().join("components.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -2410,6 +2635,125 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ensure.status, "installed");
+    }
+
+    #[test]
+    fn component_install_state_detects_installed_capsule_missing_runtime_entrypoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_root = tmp.path().join("capsules/marketplace");
+        fs::create_dir_all(&install_root).unwrap();
+        fs::write(
+            install_root.join("capsule.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": "elastos.capsule/v1",
+                "name": "marketplace",
+                "version": "0.1.0",
+                "description": "Marketplace",
+                "author": "elastos",
+                "role": "app",
+                "type": "wasm",
+                "entrypoint": "marketplace.wasm"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut platforms = HashMap::new();
+        platforms.insert(
+            "*".to_string(),
+            PlatformInfo {
+                url: None,
+                cid: None,
+                release_path: Some("marketplace.tar.gz".to_string()),
+                checksum: None,
+                extract_path: Some("marketplace".to_string()),
+                install_path: Some("capsules/marketplace".to_string()),
+                strategy: None,
+                source: None,
+                note: None,
+                size: None,
+            },
+        );
+        let component = Component {
+            version: None,
+            install_path: Some("capsules/marketplace".to_string()),
+            source_path: None,
+            repository: None,
+            size_mb: None,
+            description: None,
+            platforms,
+        };
+        let manifest = ComponentsManifest {
+            external: HashMap::new(),
+            capsules: HashMap::new(),
+            profiles: HashMap::new(),
+        };
+
+        assert_eq!(
+            component_install_state_for_name(
+                &manifest,
+                tmp.path(),
+                "marketplace",
+                &component,
+                component.platforms.get("*"),
+            ),
+            InstallState::Stale(
+                "capsule entrypoint missing from installed bundle: marketplace.wasm".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn capsule_component_release_identity_accepts_direct_asset_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("components.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "external": {
+                    "marketplace": {
+                        "install_path": "capsules/marketplace",
+                        "platforms": {
+                            "*": {
+                                "cid": "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+                                "release_path": "marketplace.tar.gz",
+                                "extract_path": "marketplace",
+                                "install_path": "capsules/marketplace",
+                                "checksum": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                            }
+                        }
+                    }
+                },
+                "capsules": {},
+                "profiles": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(capsule_component_has_release_identity(
+            tmp.path(),
+            "marketplace"
+        ));
+    }
+
+    #[test]
+    fn validate_capsule_package_identity_accepts_direct_asset_metadata() {
+        let platform_info = PlatformInfo {
+            url: None,
+            cid: Some("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi".to_string()),
+            release_path: Some("marketplace.tar.gz".to_string()),
+            checksum: Some(
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                    .to_string(),
+            ),
+            extract_path: Some("marketplace".to_string()),
+            install_path: Some("capsules/marketplace".to_string()),
+            strategy: None,
+            source: None,
+            note: None,
+            size: None,
+        };
+
+        validate_capsule_package_identity("marketplace", None, &platform_info).unwrap();
     }
 
     #[test]
@@ -2521,27 +2865,29 @@ mod tests {
     fn test_verify_installed_component_binary_requires_checksum() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
+        let platform = detect_platform();
         let bin_dir = data_dir.join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
         let install_path = bin_dir.join("shell");
         fs::write(&install_path, b"shell-binary").unwrap();
         fs::write(
             data_dir.join("components.json"),
-            r#"{
-  "external": {
-    "shell": {
-      "install_path": "bin/shell",
-      "platforms": {
-        "linux-amd64": {
-          "checksum": "",
-          "url": "https://example.invalid/shell"
-        }
-      }
-    }
-  },
-  "capsules": {},
-  "profiles": {}
-}"#,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "external": {
+                    "shell": {
+                        "install_path": "bin/shell",
+                        "platforms": {
+                            platform: {
+                                "checksum": "",
+                                "url": "https://example.invalid/shell"
+                            }
+                        }
+                    }
+                },
+                "capsules": {},
+                "profiles": {}
+            }))
+            .unwrap(),
         )
         .unwrap();
 
@@ -2555,6 +2901,7 @@ mod tests {
     fn test_verify_installed_component_binary_verifies_checksum() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
+        let platform = detect_platform();
         let bin_dir = data_dir.join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
         let install_path = bin_dir.join("shell");
@@ -2563,24 +2910,22 @@ mod tests {
         let checksum = format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)));
         fs::write(
             data_dir.join("components.json"),
-            format!(
-                r#"{{
-  "external": {{
-    "shell": {{
-      "install_path": "bin/shell",
-      "platforms": {{
-        "linux-amd64": {{
-          "checksum": "{}",
-          "url": "https://example.invalid/shell"
-        }}
-      }}
-    }}
-  }},
-  "capsules": {{}},
-  "profiles": {{}}
-}}"#,
-                checksum
-            ),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "external": {
+                    "shell": {
+                        "install_path": "bin/shell",
+                        "platforms": {
+                            platform.clone(): {
+                                "checksum": checksum.clone(),
+                                "url": "https://example.invalid/shell"
+                            }
+                        }
+                    }
+                },
+                "capsules": {},
+                "profiles": {}
+            }))
+            .unwrap(),
         )
         .unwrap();
 
@@ -2592,6 +2937,7 @@ mod tests {
     fn test_write_installed_manifest_stamps_local_copy_checksum() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
+        let platform = detect_platform();
         let bin_dir = data_dir.join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
 
@@ -2605,7 +2951,7 @@ mod tests {
                 "vmlinux": {
                     "install_path": "bin/vmlinux",
                     "platforms": {
-                        "linux-amd64": {
+                        platform.clone(): {
                             "strategy": "local-copy",
                             "source": source_path.to_string_lossy(),
                             "install_path": "bin/vmlinux"
@@ -2618,7 +2964,7 @@ mod tests {
         }))
         .unwrap();
 
-        let stamped = write_installed_manifest(data_dir, &manifest, "linux-amd64").unwrap();
+        let stamped = write_installed_manifest(data_dir, &manifest, &platform).unwrap();
         assert_eq!(stamped, vec!["vmlinux".to_string()]);
 
         let result = verify_installed_component_binary(data_dir, "vmlinux", &install_path).unwrap();
@@ -2707,6 +3053,97 @@ mod tests {
             resolve_component_download_url(&info).as_deref(),
             Some("elastos://QmCanonical")
         );
+    }
+
+    #[test]
+    fn verify_checksum_requires_release_artifact_checksum() {
+        let info = PlatformInfo {
+            url: None,
+            cid: None,
+            release_path: Some("shell-linux-amd64".to_string()),
+            checksum: None,
+            extract_path: None,
+            install_path: Some("bin/shell".to_string()),
+            strategy: None,
+            source: None,
+            note: None,
+            size: None,
+        };
+
+        let err = verify_checksum("shell", b"shell-bytes", &info).unwrap_err();
+        assert!(err.to_string().contains("missing checksum"));
+    }
+
+    #[test]
+    fn verify_checksum_accepts_stamped_release_artifact_checksum() {
+        let bytes = b"shell-bytes";
+        let info = PlatformInfo {
+            url: None,
+            cid: None,
+            release_path: Some("shell-linux-amd64".to_string()),
+            checksum: Some(format!(
+                "sha256:{}",
+                hex::encode(sha2::Sha256::digest(bytes))
+            )),
+            extract_path: None,
+            install_path: Some("bin/shell".to_string()),
+            strategy: None,
+            source: None,
+            note: None,
+            size: None,
+        };
+
+        verify_checksum("shell", bytes, &info).unwrap();
+    }
+
+    #[test]
+    fn release_artifact_checksum_requirement_keeps_dev_escape_hatches() {
+        for strategy in ["source-build", "local-copy"] {
+            let info = PlatformInfo {
+                url: None,
+                cid: None,
+                release_path: Some("shell-linux-amd64".to_string()),
+                checksum: None,
+                extract_path: None,
+                install_path: Some("bin/shell".to_string()),
+                strategy: Some(strategy.to_string()),
+                source: None,
+                note: None,
+                size: None,
+            };
+            assert!(required_release_artifact_checksum("shell", &info)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn download_component_rejects_unstamped_release_artifact_before_fetch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = PlatformInfo {
+            url: None,
+            cid: None,
+            release_path: Some("shell-linux-amd64".to_string()),
+            checksum: None,
+            extract_path: None,
+            install_path: Some("bin/shell".to_string()),
+            strategy: None,
+            source: None,
+            note: None,
+            size: None,
+        };
+
+        let err = download_component(
+            tmp.path(),
+            "shell",
+            "elastos://artifact/shell-linux-amd64",
+            &info,
+            &tmp.path().join("bin/shell"),
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("missing checksum"));
     }
 
     #[tokio::test]

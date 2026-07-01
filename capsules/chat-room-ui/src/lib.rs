@@ -5,14 +5,14 @@ use std::rc::Rc;
 
 use gloo_net::http::Request;
 use gloo_timers::future::TimeoutFuture;
-use js_sys::{Array, Function, Object as JsObject, Reflect};
+use js_sys::{Array, Function, Object as JsObject, Promise, Reflect, Uint8Array};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::spawn_local;
+use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{
-    window, Document, Element, Event, HtmlButtonElement, HtmlElement, HtmlFormElement,
+    window, Blob, Document, Element, Event, HtmlButtonElement, HtmlElement, HtmlFormElement,
     HtmlInputElement, MessageEvent, RequestCredentials, Storage,
 };
 
@@ -20,7 +20,7 @@ const BROWSER_SESSION_API_BASE: &str = "/api/browser/session";
 const BROWSER_SESSION_REQUEST_STORAGE_KEY: &str = "elastos.browser_session.request_id";
 const CHAT_ROOM_API_BASE: &str = "/api/apps/chat-room";
 const ROOM_ACCESS_CAPABILITIES: [&str; 1] = ["room.access"];
-const SHELL_EVENT_SAFETY_POLL_INTERVAL_MS: u32 = 30_000;
+const SHELL_ROOM_POLL_INTERVAL_MS: u32 = 1_000;
 const GATEWAY_POLL_INTERVAL_MS: u32 = 3_000;
 const AUTO_SCROLL_THRESHOLD_PX: i32 = 48;
 const HOME_TOKEN_HEADER: &str = "x-elastos-home-token";
@@ -28,7 +28,7 @@ const DISPLAY_NAME_REQUIRED_ERROR: &str = "Enter your name.";
 const APPROVAL_REQUESTED_BADGE: &str = "Waiting";
 const APPROVAL_REQUESTED_DETAIL: &str = "Waiting for approval.";
 const SHELL_ACCESS_UNAVAILABLE_DETAIL: &str =
-    "This runtime is not an active member of the room yet. Join or import the room on this device first.";
+    "This device is not part of this conversation yet. Join from an invite or connect it first.";
 const EMOJI_BUTTON_IDS: [(&str, &str); 6] = [
     ("emoji-wave", "👋"),
     ("emoji-fire", "🔥"),
@@ -48,6 +48,7 @@ enum AccessMode {
 struct AppConfig {
     access_mode: AccessMode,
     home_token: Option<String>,
+    initial_join_invite: Option<String>,
     browser_session_request_storage_key: String,
 }
 
@@ -74,6 +75,7 @@ struct AppState {
     room_control: SummaryRoomControlView,
     local_runtime_did: Option<String>,
     attachment_urls: BTreeMap<String, String>,
+    join_invite_url: Option<String>,
 }
 
 struct App {
@@ -104,6 +106,14 @@ struct App {
     browser_access_list: HtmlElement,
     room_access_section: HtmlElement,
     room_policy_list: HtmlElement,
+    conversation_join_section: HtmlElement,
+    conversation_join_form: HtmlFormElement,
+    conversation_join_input: HtmlInputElement,
+    conversation_join_submit: HtmlButtonElement,
+    conversation_invite_create: HtmlButtonElement,
+    conversation_invite_output_row: HtmlElement,
+    conversation_invite_output: HtmlInputElement,
+    conversation_invite_copy: HtmlButtonElement,
     node_invite_form: HtmlFormElement,
     node_did_input: HtmlInputElement,
     node_invite_submit: HtmlButtonElement,
@@ -311,6 +321,13 @@ struct RoomMemberView {
     role: String,
     added_at: u64,
     added_by: String,
+    #[serde(default)]
+    profile_card: Option<RoomProfileCardView>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct RoomProfileCardView {
+    display_name: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -341,6 +358,19 @@ struct SendMessageInput<'a> {
 }
 
 #[derive(Debug, Serialize)]
+struct AttachmentUploadStartInput<'a> {
+    file_name: &'a str,
+    mime_type: &'a str,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct AttachmentUploadStartResponse {
+    upload_id: String,
+    chunk_size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
 struct RoomAccessPolicyInput {
     allow_guest_invites: bool,
     allow_member_invites: bool,
@@ -360,6 +390,44 @@ struct RoomMemberRemoveInput<'a> {
 #[derive(Debug, Serialize)]
 struct RoomInviteRevokeInput<'a> {
     invite_id: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct ConversationJoinInviteCreateInput {
+    issuer_gateway: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConversationJoinInviteView {
+    invite_url: String,
+    #[allow(dead_code)]
+    token: String,
+    #[allow(dead_code)]
+    issuer_gateway: String,
+    #[allow(dead_code)]
+    room_title: String,
+    #[allow(dead_code)]
+    invited_by: String,
+    #[allow(dead_code)]
+    expires_at: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ConversationJoinInviteJoinInput<'a> {
+    invite: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConversationJoinInviteJoinResponse {
+    #[allow(dead_code)]
+    status: String,
+    room_title: String,
+    #[allow(dead_code)]
+    issuer_gateway: String,
+    #[allow(dead_code)]
+    member_did: String,
+    #[allow(dead_code)]
+    invite_id: String,
 }
 
 #[wasm_bindgen(start)]
@@ -421,6 +489,14 @@ pub fn start() -> Result<(), JsValue> {
         browser_access_list: element_by_id(&document, "browser-access-list")?,
         room_access_section: element_by_id(&document, "room-access-section")?,
         room_policy_list: element_by_id(&document, "room-policy-list")?,
+        conversation_join_section: element_by_id(&document, "conversation-join-section")?,
+        conversation_join_form: form_by_id(&document, "conversation-join-form")?,
+        conversation_join_input: input_by_id(&document, "conversation-join-input")?,
+        conversation_join_submit: button_by_id(&document, "conversation-join-submit")?,
+        conversation_invite_create: button_by_id(&document, "conversation-invite-create")?,
+        conversation_invite_output_row: element_by_id(&document, "conversation-invite-output-row")?,
+        conversation_invite_output: input_by_id(&document, "conversation-invite-output")?,
+        conversation_invite_copy: button_by_id(&document, "conversation-invite-copy")?,
         node_invite_form: form_by_id(&document, "node-invite-form")?,
         node_did_input: input_by_id(&document, "node-did-input")?,
         node_invite_submit: button_by_id(&document, "node-invite-submit")?,
@@ -459,7 +535,7 @@ impl App {
 
     fn poll_interval_ms(&self) -> u32 {
         if self.is_shell_mode() {
-            SHELL_EVENT_SAFETY_POLL_INTERVAL_MS
+            SHELL_ROOM_POLL_INTERVAL_MS
         } else {
             GATEWAY_POLL_INTERVAL_MS
         }
@@ -556,13 +632,15 @@ impl App {
                     state.status_detail = trim_sentence(&reason);
                 }
             } else if !state.browser_access_allowed {
-                state.status_badge = "Room locked".to_string();
+                state.status_badge = "Conversation locked".to_string();
                 let reason = state
                     .browser_access_block_reason
                     .clone()
-                    .unwrap_or_else(|| "This runtime is not in this room yet.".to_string());
+                    .unwrap_or_else(|| {
+                        "This device is not part of this conversation yet.".to_string()
+                    });
                 state.status_detail = format!(
-                    "{} Open the room on this device first, then try again.",
+                    "{} Open the conversation from Home first, then try again.",
                     trim_sentence(&reason)
                 );
             } else {
@@ -791,6 +869,64 @@ impl App {
         )?;
         browser_access_click.forget();
 
+        let join_invite_app = Rc::clone(self);
+        let join_invite_submit =
+            Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
+                event.prevent_default();
+                let app = Rc::clone(&join_invite_app);
+                spawn_local(async move {
+                    app.clear_error();
+                    if let Err(err) = app.join_conversation_from_invite().await {
+                        app.set_error(Some(err));
+                    }
+                    let _ = app.render();
+                });
+            }));
+        self.conversation_join_form
+            .add_event_listener_with_callback(
+                "submit",
+                join_invite_submit.as_ref().unchecked_ref(),
+            )?;
+        join_invite_submit.forget();
+
+        let create_invite_app = Rc::clone(self);
+        let create_invite_click =
+            Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
+                let app = Rc::clone(&create_invite_app);
+                spawn_local(async move {
+                    app.clear_error();
+                    if let Err(err) = app.create_conversation_join_invite().await {
+                        app.set_error(Some(err));
+                    }
+                    let _ = app.render();
+                });
+            }));
+        self.conversation_invite_create
+            .add_event_listener_with_callback(
+                "click",
+                create_invite_click.as_ref().unchecked_ref(),
+            )?;
+        create_invite_click.forget();
+
+        let copy_invite_app = Rc::clone(self);
+        let copy_invite_click =
+            Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
+                let app = Rc::clone(&copy_invite_app);
+                spawn_local(async move {
+                    app.clear_error();
+                    if let Err(err) = app.copy_conversation_join_invite().await {
+                        app.set_error(Some(err));
+                    }
+                    let _ = app.render();
+                });
+            }));
+        self.conversation_invite_copy
+            .add_event_listener_with_callback(
+                "click",
+                copy_invite_click.as_ref().unchecked_ref(),
+            )?;
+        copy_invite_click.forget();
+
         let node_invite_app = Rc::clone(self);
         let node_invite_submit =
             Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
@@ -859,7 +995,9 @@ impl App {
                     app.clear_error();
                     let result = match action.as_str() {
                         "remove" => {
-                            match member_did.ok_or_else(|| "missing runtime DID".to_string()) {
+                            match member_did
+                                .ok_or_else(|| "missing advanced profile identifier".to_string())
+                            {
                                 Ok(did) => app.remove_runtime_node(&did).await,
                                 Err(err) => Err(err),
                             }
@@ -911,6 +1049,27 @@ impl App {
             else {
                 return;
             };
+            if let Some(button) = target.closest("[data-open-attachment]").ok().flatten() {
+                let Some(attachment_id) = button.get_attribute("data-open-attachment") else {
+                    return;
+                };
+                match link_app.open_attachment_in_documents(&attachment_id) {
+                    Ok(true) => {
+                        event.prevent_default();
+                        link_app.set_status(
+                            "Opening",
+                            "Opening attachment in Documents inside ElastOS.",
+                        );
+                        let _ = link_app.render();
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        link_app.set_error(Some(js_error(error)));
+                        let _ = link_app.render();
+                    }
+                }
+                return;
+            }
             let Some(anchor) = target.closest("[data-open-uri]").ok().flatten() else {
                 return;
             };
@@ -948,13 +1107,25 @@ impl App {
                 {
                     return;
                 }
-                let Some(uri) = js_string_field(&data, "uri") else {
+                let blob = js_blob_field(&data, "blob");
+                if blob.is_none() {
                     return;
-                };
+                }
+                let file_name = js_string_field(&data, "fileName")
+                    .or_else(|| js_string_field(&data, "title"))
+                    .unwrap_or_else(|| "Library item".to_string());
+                let mime_type = js_string_field(&data, "mimeType")
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
                 let app = Rc::clone(&library_attach_app);
                 spawn_local(async move {
                     app.clear_error();
-                    if let Err(err) = app.send_library_item(&uri).await {
+                    let result = if let Some(blob) = blob {
+                        app.send_library_attachment(&file_name, &mime_type, blob)
+                            .await
+                    } else {
+                        Err("Library attachment is missing file bytes.".to_string())
+                    };
+                    if let Err(err) = result {
                         app.set_error(Some(err));
                     }
                     let _ = app.render();
@@ -964,6 +1135,50 @@ impl App {
             .ok_or_else(|| JsValue::from_str("window unavailable"))?
             .add_event_listener_with_callback("message", library_attach.as_ref().unchecked_ref())?;
         library_attach.forget();
+
+        let attachment_result_app = Rc::clone(self);
+        let attachment_result =
+            Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(move |event: MessageEvent| {
+                let Some(window) = window() else {
+                    return;
+                };
+                let Ok(origin) = window.location().origin() else {
+                    return;
+                };
+                if event.origin() != origin {
+                    return;
+                }
+                let data = event.data();
+                if js_string_field(&data, "type").as_deref()
+                    != Some("chat-room:attachment-open-result")
+                {
+                    return;
+                }
+                let ok = Reflect::get(&data, &JsValue::from_str("ok"))
+                    .ok()
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                let message = js_string_field(&data, "message").unwrap_or_else(|| {
+                    if ok {
+                        "Opened attachment in Documents.".to_string()
+                    } else {
+                        "Documents could not open the attachment.".to_string()
+                    }
+                });
+                if ok {
+                    attachment_result_app.set_status("Documents", &message);
+                } else {
+                    attachment_result_app.set_error(Some(message));
+                }
+                let _ = attachment_result_app.render();
+            }));
+        window()
+            .ok_or_else(|| JsValue::from_str("window unavailable"))?
+            .add_event_listener_with_callback(
+                "message",
+                attachment_result.as_ref().unchecked_ref(),
+            )?;
+        attachment_result.forget();
 
         if self.is_shell_mode() {
             let runtime_events_app = Rc::clone(self);
@@ -1025,6 +1240,14 @@ impl App {
         state.error_transient = false;
     }
 
+    fn set_status(&self, badge: &str, detail: &str) {
+        let mut state = self.state.borrow_mut();
+        state.status_badge = badge.to_string();
+        state.status_detail = detail.to_string();
+        state.error_text = None;
+        state.error_transient = false;
+    }
+
     fn set_transient_error(&self, error: Option<String>) {
         let mut state = self.state.borrow_mut();
         state.error_text = error;
@@ -1033,9 +1256,9 @@ impl App {
 
     fn session_loss_detail(&self) -> &'static str {
         if self.is_shell_mode() {
-            "The local room session ended. Open the room again to reconnect."
+            "The local conversation session ended. Open Chat again to reconnect."
         } else {
-            "This browser was removed from the room."
+            "This browser was removed from the conversation."
         }
     }
 
@@ -1211,7 +1434,12 @@ impl App {
             };
             let _ = app.apply_summary(&summary);
             if app.is_shell_mode() {
-                if let Err(err) = app.ensure_shell_session().await {
+                if let Some(invite) = app.config.initial_join_invite.as_deref() {
+                    app.conversation_join_input.set_value(invite);
+                    if let Err(err) = app.join_conversation_from_invite().await {
+                        app.set_error(Some(err));
+                    }
+                } else if let Err(err) = app.ensure_shell_session().await {
                     app.set_error(Some(err));
                 }
             }
@@ -1259,7 +1487,8 @@ impl App {
                     .browser_access_block_reason
                     .clone()
                     .unwrap_or_else(|| {
-                        "This runtime cannot grant browser access to this room.".to_string()
+                        "This device cannot approve web guest access to this conversation."
+                            .to_string()
                     }));
             }
         }
@@ -1314,7 +1543,7 @@ impl App {
                 .unwrap_or_else(|| SHELL_ACCESS_UNAVAILABLE_DETAIL.to_string());
             self.set_error(Some(detail.clone()));
             let mut state = self.state.borrow_mut();
-            state.status_badge = "Room unavailable".to_string();
+            state.status_badge = "Conversation unavailable".to_string();
             state.status_detail = trim_sentence(&detail);
             return Ok(());
         }
@@ -1340,7 +1569,7 @@ impl App {
 
     async fn approve_browser_access_request(&self, request_id: &str) -> Result<(), String> {
         if !self.is_shell_mode() {
-            return Err("browser access approval is only available in shell mode".to_string());
+            return Err("web guest approval is only available from Home".to_string());
         }
         let _: serde_json::Value = api_post_empty_json_with_headers(
             &self.room_api_url(&format!("/requests/{request_id}/approve")),
@@ -1353,7 +1582,7 @@ impl App {
 
     async fn deny_browser_access_request(&self, request_id: &str) -> Result<(), String> {
         if !self.is_shell_mode() {
-            return Err("browser access denial is only available in shell mode".to_string());
+            return Err("web guest denial is only available from Home".to_string());
         }
         let _: serde_json::Value = api_post_empty_json_with_headers(
             &self.room_api_url(&format!("/requests/{request_id}/deny")),
@@ -1366,7 +1595,7 @@ impl App {
 
     async fn kick_guest_session(&self, session_id: &str) -> Result<(), String> {
         if !self.is_shell_mode() {
-            return Err("guest removal is only available in shell mode".to_string());
+            return Err("web guest removal is only available from Home".to_string());
         }
         let _: serde_json::Value = api_post_empty_json_with_headers(
             &self.room_api_url(&format!("/guests/{session_id}/kick")),
@@ -1379,7 +1608,7 @@ impl App {
 
     async fn update_room_policy(&self, policy: &str, enabled: bool) -> Result<(), String> {
         if !self.is_shell_mode() {
-            return Err("room access controls are only available in shell mode".to_string());
+            return Err("conversation access controls are only available from Home".to_string());
         }
         let current = {
             let state = self.state.borrow();
@@ -1412,13 +1641,72 @@ impl App {
         Ok(())
     }
 
+    async fn create_conversation_join_invite(&self) -> Result<(), String> {
+        if !self.is_shell_mode() {
+            return Err("conversation links are only available from Home".to_string());
+        }
+        let invite: ConversationJoinInviteView = api_post_json_with_headers(
+            &self.room_api_url("/invites/create-link"),
+            &ConversationJoinInviteCreateInput {
+                issuer_gateway: None,
+            },
+            &self.home_token_headers(),
+        )
+        .await?;
+        {
+            let mut state = self.state.borrow_mut();
+            state.join_invite_url = Some(invite.invite_url);
+        }
+        self.set_status(
+            "Invite ready",
+            "Share this link with another ElastOS device.",
+        );
+        Ok(())
+    }
+
+    async fn copy_conversation_join_invite(&self) -> Result<(), String> {
+        let invite_url = {
+            let state = self.state.borrow();
+            state
+                .join_invite_url
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+        }
+        .ok_or_else(|| "Create a join link first.".to_string())?;
+        copy_text_to_clipboard(&invite_url).await?;
+        self.set_status("Copied", "Conversation join link copied.");
+        Ok(())
+    }
+
+    async fn join_conversation_from_invite(&self) -> Result<(), String> {
+        if !self.is_shell_mode() {
+            return Err("conversation links must be opened from Home".to_string());
+        }
+        let invite = self.conversation_join_input.value().trim().to_string();
+        if invite.is_empty() {
+            return Err("Paste a conversation invite code or link.".to_string());
+        }
+        self.set_status("Joining", "Claiming the invite and connecting this device.");
+        let joined: ConversationJoinInviteJoinResponse = api_post_json_with_headers(
+            &self.room_api_url("/invites/join"),
+            &ConversationJoinInviteJoinInput { invite: &invite },
+            &self.home_token_headers(),
+        )
+        .await?;
+        self.conversation_join_input.set_value("");
+        let _ = self.refresh_shell_summary().await?;
+        self.ensure_shell_session().await?;
+        self.set_status("Joined", &format!("Joined {}.", joined.room_title));
+        Ok(())
+    }
+
     async fn invite_runtime_node(&self) -> Result<(), String> {
         if !self.is_shell_mode() {
-            return Err("runtime node invites are only available in shell mode".to_string());
+            return Err("ElastOS user invites are only available from Home".to_string());
         }
         let member_did = self.node_did_input.value().trim().to_string();
         if member_did.is_empty() {
-            return Err("Enter a runtime DID.".to_string());
+            return Err("Enter an advanced profile identifier.".to_string());
         }
         let _: serde_json::Value = api_post_json_with_headers(
             &self.room_api_url("/members/invite"),
@@ -1435,7 +1723,7 @@ impl App {
 
     async fn remove_runtime_node(&self, member_did: &str) -> Result<(), String> {
         if !self.is_shell_mode() {
-            return Err("runtime node removal is only available in shell mode".to_string());
+            return Err("ElastOS user removal is only available from Home".to_string());
         }
         let _: serde_json::Value = api_post_json_with_headers(
             &self.room_api_url("/members/remove"),
@@ -1449,7 +1737,7 @@ impl App {
 
     async fn revoke_runtime_invite(&self, invite_id: &str) -> Result<(), String> {
         if !self.is_shell_mode() {
-            return Err("runtime invite revocation is only available in shell mode".to_string());
+            return Err("ElastOS invite cancellation is only available from Home".to_string());
         }
         let _: serde_json::Value = api_post_json_with_headers(
             &self.room_api_url("/invites/revoke"),
@@ -1475,12 +1763,68 @@ impl App {
         Ok(())
     }
 
-    async fn send_library_item(&self, uri: &str) -> Result<(), String> {
-        let clean_uri = uri.trim();
-        if !clean_uri.starts_with("elastos://") {
-            return Err("Library item is not published.".to_string());
+    async fn send_library_attachment(
+        &self,
+        file_name: &str,
+        mime_type: &str,
+        blob: Blob,
+    ) -> Result<(), String> {
+        let bytes = blob_to_bytes(blob).await?;
+        if bytes.is_empty() {
+            return Err("Library item is empty.".to_string());
         }
-        self.send_room_text(clean_uri).await
+        self.send_attachment_bytes(file_name, mime_type, &bytes)
+            .await
+    }
+
+    async fn send_attachment_bytes(
+        &self,
+        file_name: &str,
+        mime_type: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        if !self.state.borrow().session_active {
+            return Ok(());
+        }
+        let headers = self.room_request_headers();
+        let start: AttachmentUploadStartResponse = api_post_session_json(
+            &self.room_api_url("/upload/start"),
+            &AttachmentUploadStartInput {
+                file_name,
+                mime_type,
+                size_bytes: bytes.len() as u64,
+            },
+            &headers,
+        )
+        .await?;
+        let chunk_size = usize::try_from(start.chunk_size_bytes)
+            .ok()
+            .filter(|value| *value > 0)
+            .unwrap_or(256 * 1024);
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let end = (offset + chunk_size).min(bytes.len());
+            let mut chunk_headers = headers.clone();
+            chunk_headers.push(("x-elastos-upload-offset", offset.to_string()));
+            let _: serde_json::Value = api_post_session_bytes(
+                &self.room_api_url(&format!("/upload/{}/chunk", start.upload_id)),
+                &bytes[offset..end],
+                &chunk_headers,
+            )
+            .await?;
+            offset = end;
+        }
+        let sent: ConversationObjectView = api_post_empty_json_with_headers(
+            &self.room_api_url(&format!("/upload/{}/finish", start.upload_id)),
+            &headers,
+        )
+        .await?;
+
+        let mut state = self.state.borrow_mut();
+        state.latest_seq = sent.seq;
+        state.objects.push(sent);
+        state.force_message_follow = true;
+        Ok(())
     }
 
     async fn send_room_text(&self, body: &str) -> Result<(), String> {
@@ -1542,6 +1886,102 @@ impl App {
             &JsValue::from_str("preferredViewer"),
             &JsValue::from_str("documents"),
         )?;
+        Reflect::set(
+            &message,
+            &JsValue::from_str("homeToken"),
+            &JsValue::from_str(home_token),
+        )?;
+        parent.post_message(&message.into(), &window.location().origin()?)?;
+        Ok(true)
+    }
+
+    fn open_attachment_in_documents(&self, attachment_id: &str) -> Result<bool, JsValue> {
+        let clean_attachment_id = attachment_id.trim();
+        let Some(home_token) = self.config.home_token.as_deref() else {
+            return Err(JsValue::from_str(
+                "Open Chat from Home to open attachments in Documents.",
+            ));
+        };
+        if !self.is_shell_mode() {
+            return Err(JsValue::from_str(
+                "Open Chat from Home to open attachments in Documents.",
+            ));
+        }
+        if clean_attachment_id.is_empty() {
+            return Err(JsValue::from_str("Attachment id is missing."));
+        }
+        let (attachment, data_url) = {
+            let state = self.state.borrow();
+            let attachment = state
+                .objects
+                .iter()
+                .filter_map(|object| object.attachment.as_ref())
+                .find(|attachment| attachment.attachment_id == clean_attachment_id)
+                .cloned()
+                .ok_or_else(|| JsValue::from_str("Attachment not found."))?;
+            let data_url = state
+                .attachment_urls
+                .get(clean_attachment_id)
+                .cloned()
+                .ok_or_else(|| JsValue::from_str("Attachment bytes are still loading."))?;
+            (attachment, data_url)
+        };
+        let Some(window) = window() else {
+            return Err(JsValue::from_str("Browser window is unavailable."));
+        };
+        let Some(parent) = window.parent()? else {
+            return Err(JsValue::from_str("Home shell is unavailable."));
+        };
+        if JsObject::is(parent.as_ref(), window.as_ref()) {
+            return Err(JsValue::from_str(
+                "Open Chat from Home to open attachments in Documents.",
+            ));
+        }
+
+        let payload = JsObject::new();
+        Reflect::set(
+            &payload,
+            &JsValue::from_str("type"),
+            &JsValue::from_str("documents:open-chat-attachment"),
+        )?;
+        Reflect::set(
+            &payload,
+            &JsValue::from_str("attachmentId"),
+            &JsValue::from_str(&attachment.attachment_id),
+        )?;
+        Reflect::set(
+            &payload,
+            &JsValue::from_str("fileName"),
+            &JsValue::from_str(&attachment.file_name),
+        )?;
+        Reflect::set(
+            &payload,
+            &JsValue::from_str("mimeType"),
+            &JsValue::from_str(&attachment.mime_type),
+        )?;
+        Reflect::set(
+            &payload,
+            &JsValue::from_str("sizeBytes"),
+            &JsValue::from_f64(attachment.size_bytes as f64),
+        )?;
+        Reflect::set(
+            &payload,
+            &JsValue::from_str("dataUrl"),
+            &JsValue::from_str(&data_url),
+        )?;
+
+        let message = JsObject::new();
+        Reflect::set(
+            &message,
+            &JsValue::from_str("type"),
+            &JsValue::from_str("home:open-target-with-payload"),
+        )?;
+        Reflect::set(
+            &message,
+            &JsValue::from_str("target"),
+            &JsValue::from_str("documents"),
+        )?;
+        Reflect::set(&message, &JsValue::from_str("payload"), &payload)?;
         Reflect::set(
             &message,
             &JsValue::from_str("homeToken"),
@@ -1666,7 +2106,7 @@ impl App {
                 state.session_active = true;
                 state.status_badge = "Joining".to_string();
                 let _ = status.expires_at;
-                state.status_detail = "Approved. Opening room.".to_string();
+                state.status_detail = "Approved. Opening conversation.".to_string();
                 return Ok(
                     previous_badge != state.status_badge || previous_detail != state.status_detail
                 );
@@ -1762,7 +2202,7 @@ impl App {
         let session_active = state.session_active;
         let loading_room = self.is_shell_mode() && !session_active;
         let participant_count = if loading_room {
-            "Opening room".to_string()
+            "Opening conversation".to_string()
         } else {
             format_participant_count(state.participants.len())
         };
@@ -1835,7 +2275,7 @@ impl App {
                                 | "Expired"
                                 | "Join again"
                                 | "Unavailable"
-                                | "Room locked"
+                                | "Conversation locked"
                                 | "Unknown"
                         ));
             set_hidden(&gateway_ui.browser_access_stage, session_active)?;
@@ -1871,6 +2311,22 @@ impl App {
             &self.room_access_section,
             !(self.is_shell_mode() && session_active && state.show_access_controls),
         )?;
+        set_hidden(
+            &self.conversation_join_section,
+            !(self.is_shell_mode() && !session_active),
+        )?;
+        self.conversation_join_submit
+            .set_disabled(!self.is_shell_mode());
+        let invite_url = state.join_invite_url.as_deref().unwrap_or_default();
+        self.conversation_invite_output.set_value(invite_url);
+        set_hidden(
+            &self.conversation_invite_output_row,
+            invite_url.trim().is_empty(),
+        )?;
+        self.conversation_invite_create
+            .set_disabled(!self.is_shell_mode() || !session_active);
+        self.conversation_invite_copy
+            .set_disabled(!self.is_shell_mode() || !session_active || invite_url.trim().is_empty());
         self.node_did_input
             .set_disabled(!self.is_shell_mode() || !session_active);
         self.node_invite_submit
@@ -1966,7 +2422,7 @@ impl App {
             let badge_text = if is_local {
                 Some("You".to_string())
             } else if let Some(role) = participant.role.as_deref() {
-                Some(title_case(role))
+                Some(participant_role_badge(role))
             } else if participant.local_session_count > 0 {
                 Some("Guest".to_string())
             } else {
@@ -2063,20 +2519,20 @@ impl App {
         let policy = &state.room_control.access_policy;
         self.append_policy_row(
             "guest",
-            "Guest requests",
-            "Browsers must still be approved.",
+            "Web guest requests",
+            "People joining from the public link still need approval.",
             policy.allow_guest_invites,
         )?;
         self.append_policy_row(
             "member",
-            "Node invites",
-            "Allow adding trusted runtimes by DID.",
+            "ElastOS user invites",
+            "Invite another trusted ElastOS profile by DID.",
             policy.allow_member_invites,
         )?;
         self.append_policy_row(
             "host",
-            "Guest hosting",
-            "Members may approve guests.",
+            "Guest approvals",
+            "Trusted ElastOS users may approve web guests.",
             policy.allow_members_to_host_guests,
         )?;
 
@@ -2098,7 +2554,7 @@ impl App {
 
             let detail = self.document.create_element("div")?;
             detail.set_class_name("node-row-detail");
-            detail.set_text_content(Some("Guest browser"));
+            detail.set_text_content(Some("Web guest"));
 
             head.append_child(&name)?;
             head.append_child(&detail)?;
@@ -2127,11 +2583,11 @@ impl App {
 
             let name = self.document.create_element("div")?;
             name.set_class_name("node-row-name");
-            name.set_text_content(Some(&short_did(&member.member_did)));
+            name.set_text_content(Some(&member_display_name(member)));
 
             let detail = self.document.create_element("div")?;
             detail.set_class_name("node-row-detail");
-            detail.set_text_content(Some(&title_case(&member.role)));
+            detail.set_text_content(Some(&conversation_role_label(&member.role)));
 
             head.append_child(&name)?;
             head.append_child(&detail)?;
@@ -2168,7 +2624,7 @@ impl App {
 
             let detail = self.document.create_element("div")?;
             detail.set_class_name("node-row-detail");
-            detail.set_text_content(Some("Pending node invite"));
+            detail.set_text_content(Some("Pending ElastOS invite"));
 
             head.append_child(&name)?;
             head.append_child(&detail)?;
@@ -2358,13 +2814,12 @@ impl App {
 
                         card.append_child(&name)?;
                         card.append_child(&detail)?;
-                        if let Some(url) = attachment_urls.get(&attachment.attachment_id) {
-                            let open = self.document.create_element("a")?;
+                        if attachment_urls.contains_key(&attachment.attachment_id) {
+                            let open = self.document.create_element("button")?;
                             open.set_class_name("attachment-open");
-                            open.set_attribute("href", url)?;
-                            open.set_attribute("target", "_blank")?;
-                            open.set_attribute("rel", "noopener noreferrer")?;
-                            open.set_text_content(Some("Open"));
+                            open.set_attribute("type", "button")?;
+                            open.set_attribute("data-open-attachment", &attachment.attachment_id)?;
+                            open.set_text_content(Some("Open in Documents"));
                             card.append_child(&open)?;
                         }
                         body.append_child(&card)?;
@@ -2385,15 +2840,20 @@ fn load_config(document: &Document) -> Result<AppConfig, JsValue> {
     document
         .body()
         .ok_or_else(|| JsValue::from_str("document body unavailable"))?;
-    let home_token = extract_query_param(&document.url().unwrap_or_default(), "home_token");
+    let url = document.url().unwrap_or_default();
+    let home_token = extract_query_param(&url, "home_token");
     let access_mode = if home_token.is_some() {
         AccessMode::Shell
     } else {
         AccessMode::Gateway
     };
+    let initial_join_invite = ["invite", "join", "join_invite"]
+        .into_iter()
+        .find_map(|key| extract_query_param(&url, key));
     Ok(AppConfig {
         access_mode,
         home_token,
+        initial_join_invite,
         browser_session_request_storage_key: BROWSER_SESSION_REQUEST_STORAGE_KEY.to_string(),
     })
 }
@@ -2427,6 +2887,7 @@ fn load_state(session_storage: &Storage, config: &AppConfig) -> AppState {
         room_control: SummaryRoomControlView::default(),
         local_runtime_did: None,
         attachment_urls: BTreeMap::new(),
+        join_invite_url: None,
         error_text: None,
     }
 }
@@ -2435,11 +2896,66 @@ fn extract_query_param(url: &str, key: &str) -> Option<String> {
     let (_, query) = url.split_once('?')?;
     for pair in query.split('&') {
         let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
-        if name == key && !value.trim().is_empty() {
-            return Some(value.to_string());
+        if name == key {
+            let decoded = decode_query_value(value);
+            if !decoded.trim().is_empty() {
+                return Some(decoded);
+            }
         }
     }
     None
+}
+
+fn decode_query_value(value: &str) -> String {
+    let mut bytes = Vec::with_capacity(value.len());
+    let raw = value.as_bytes();
+    let mut index = 0usize;
+    while index < raw.len() {
+        let byte = raw[index];
+        if byte == b'+' {
+            bytes.push(b' ');
+            index += 1;
+            continue;
+        }
+        if byte == b'%' && index + 2 < raw.len() {
+            if let (Some(high), Some(low)) = (hex_value(raw[index + 1]), hex_value(raw[index + 2]))
+            {
+                bytes.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+        bytes.push(byte);
+        index += 1;
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| value.to_string())
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_query_value;
+
+    #[test]
+    fn decodes_query_value_for_invite_urls() {
+        assert_eq!(
+            decode_query_value("elastos%3A%2F%2Fpeer%2Finvite%3Ftoken%3Dabc-123"),
+            "elastos://peer/invite?token=abc-123"
+        );
+    }
+
+    #[test]
+    fn preserves_invalid_percent_escapes() {
+        assert_eq!(decode_query_value("abc%ZZ%2"), "abc%ZZ%2");
+    }
 }
 
 fn default_status_badge_for_mode(access_mode: AccessMode) -> String {
@@ -2452,9 +2968,7 @@ fn default_status_badge_for_mode(access_mode: AccessMode) -> String {
 fn default_status_detail_for_mode(access_mode: AccessMode) -> String {
     match access_mode {
         AccessMode::Shell => String::new(),
-        AccessMode::Gateway => {
-            "Enter your name to ask the room to let this browser in.".to_string()
-        }
+        AccessMode::Gateway => "Enter your name to ask to join this conversation.".to_string(),
     }
 }
 
@@ -2518,7 +3032,7 @@ fn is_session_error(err: &str) -> bool {
 fn live_status_detail(transport: &RoomTransportView) -> String {
     if transport.connected_peer_count > 0 {
         return format!(
-            "Connected to {} runtime{}.",
+            "Connected to {} ElastOS peer{}.",
             transport.connected_peer_count,
             if transport.connected_peer_count == 1 {
                 ""
@@ -2527,7 +3041,7 @@ fn live_status_detail(transport: &RoomTransportView) -> String {
             }
         );
     }
-    "Room live.".to_string()
+    "Conversation live.".to_string()
 }
 
 fn format_participant_count(count: usize) -> String {
@@ -2553,6 +3067,31 @@ fn format_participant_toggle_label(count: usize, open: bool) -> String {
     }
 }
 
+fn participant_role_badge(role: &str) -> String {
+    match role {
+        "owner" | "admin" | "member" => "ElastOS".to_string(),
+        _ => title_case(role),
+    }
+}
+
+fn conversation_role_label(role: &str) -> String {
+    match role {
+        "owner" | "admin" => "Conversation manager".to_string(),
+        "member" => "Trusted participant".to_string(),
+        _ => title_case(role),
+    }
+}
+
+fn member_display_name(member: &RoomMemberView) -> String {
+    member
+        .profile_card
+        .as_ref()
+        .map(|profile| profile.display_name.trim())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| short_did(&member.member_did))
+}
+
 fn participant_detail(participant: &ParticipantView, is_local: bool, shell_mode: bool) -> String {
     let mut parts = Vec::new();
     let local_runtime_participant =
@@ -2574,7 +3113,7 @@ fn participant_detail(participant: &ParticipantView, is_local: bool, shell_mode:
     } else if participant.role.is_some() {
         parts.push("active now".to_string());
     } else if participant.local_session_count > 0 {
-        parts.push("guest browser".to_string());
+        parts.push("web guest".to_string());
     }
     if participant.last_seen_at > 0 && !is_local && !local_runtime_participant && !shell_mode {
         parts.push(format!("seen {}", format_time(participant.last_seen_at)));
@@ -2654,6 +3193,22 @@ fn set_hidden(element: &HtmlElement, hidden: bool) -> Result<(), JsValue> {
     }
 }
 
+async fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
+    let window = window().ok_or_else(|| "window unavailable".to_string())?;
+    let clipboard = Reflect::get(window.navigator().as_ref(), &JsValue::from_str("clipboard"))
+        .map_err(js_error)?;
+    let write_text = Reflect::get(&clipboard, &JsValue::from_str("writeText"))
+        .and_then(|value| value.dyn_into::<Function>())
+        .map_err(js_error)?;
+    let promise = write_text
+        .call1(&clipboard, &JsValue::from_str(text))
+        .map_err(js_error)?;
+    JsFuture::from(Promise::from(promise))
+        .await
+        .map_err(js_error)?;
+    Ok(())
+}
+
 async fn api_post_json<TReq: Serialize, TResp: DeserializeOwned>(
     path: &str,
     body: &TReq,
@@ -2700,6 +3255,34 @@ async fn api_get_session_bytes(
         return Err(format!("request failed: {} {}", response.status(), body));
     }
     response.binary().await.map_err(|err| err.to_string())
+}
+
+async fn api_post_session_bytes<TResp: DeserializeOwned>(
+    path: &str,
+    bytes: &[u8],
+    extra_headers: &[(&str, String)],
+) -> Result<TResp, String> {
+    let mut request = Request::post(path).credentials(RequestCredentials::SameOrigin);
+    for (name, value) in extra_headers {
+        request = request.header(name, value);
+    }
+    request = request.header("content-type", "application/octet-stream");
+    let body = Uint8Array::new_with_length(bytes.len() as u32);
+    body.copy_from(bytes);
+    let response = request
+        .body(body)
+        .map_err(|err| err.to_string())?
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+    if !response.ok() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("request failed: {} {}", response.status(), body));
+    }
+    response
+        .json::<TResp>()
+        .await
+        .map_err(|err| err.to_string())
 }
 
 async fn api_get_json_with_headers<T: DeserializeOwned>(
@@ -2855,6 +3438,23 @@ fn js_string_field(data: &JsValue, key: &str) -> Option<String> {
         .and_then(|value| value.as_string())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn js_blob_field(data: &JsValue, key: &str) -> Option<Blob> {
+    Reflect::get(data, &JsValue::from_str(key))
+        .ok()
+        .filter(|value| !value.is_null() && !value.is_undefined())
+        .and_then(|value| value.dyn_into::<Blob>().ok())
+}
+
+async fn blob_to_bytes(blob: Blob) -> Result<Vec<u8>, String> {
+    let buffer = JsFuture::from(blob.array_buffer())
+        .await
+        .map_err(js_error)?;
+    let array = Uint8Array::new(&buffer);
+    let mut bytes = vec![0; array.length() as usize];
+    array.copy_to(&mut bytes);
+    Ok(bytes)
 }
 
 fn runtime_event_is_chat_room(event: &MessageEvent) -> bool {
