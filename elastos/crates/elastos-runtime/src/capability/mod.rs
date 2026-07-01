@@ -20,7 +20,8 @@ pub use intent::{
     check_intent_within_envelope, count_intent_proof, dispatch_standing_act, reconcile,
     run_intent_gate, EnvelopeCheck, EnvelopeDenial, IntentDeclarationV1, IntentGateOutcome,
     IntentProofSummary, IntentReconciliationV1, ReconciliationStatus, StandingGrantEnvelope,
-    StandingGrantStore, INTENT_DECLARATION_SCHEMA_V1, INTENT_RECONCILIATION_SCHEMA_V1,
+    StandingGrantService, StandingGrantStore, INTENT_DECLARATION_SCHEMA_V1,
+    INTENT_RECONCILIATION_SCHEMA_V1,
 };
 #[allow(unused_imports)]
 pub use manager::CapabilityManager;

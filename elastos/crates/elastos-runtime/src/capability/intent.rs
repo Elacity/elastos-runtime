@@ -20,7 +20,7 @@
 //! done — NOT the correctness/wisdom of the act.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -720,6 +720,80 @@ where
             audit.emit_best_effort(intent_denied_event(intent, EnvelopeDenial::NoGrant));
             IntentGateOutcome::Denied(EnvelopeDenial::NoGrant)
         }
+    }
+}
+
+// ─────────────────────────── The standing-grant service (chunk 2c-gw-A) ───────
+// One object that bundles the fail-closed registry with the audit log and issuer key the
+// dispatcher needs — the seam a caller (e.g. a shell-only gateway handler) holds in state to
+// issue/revoke standing grants and run agent acts under them. It only WIRES the pieces
+// together; it adds no new authority and no bypass — every decision still runs through the
+// fail-closed gate.
+
+/// A ready-to-use standing-grant service over a shared [`AuditLog`] and an issuer signing key.
+/// The natural unit of state for a standing-grant API: `issue_from_token` to grant, `revoke` to
+/// kill, `dispatch` to run one agent act under the loop. Cloneable-friendly (wrap in `Arc` to
+/// share); the inner [`StandingGrantStore`] is itself interior-mutable and thread-safe.
+pub struct StandingGrantService {
+    store: StandingGrantStore,
+    audit: Arc<AuditLog>,
+    signing_key: SigningKey,
+    signer_pubkey: [u8; 32],
+}
+
+impl StandingGrantService {
+    /// Build a service over a shared audit log and the issuer signing key (its public half is
+    /// derived once, for the reconciliation signatures the dispatcher writes).
+    pub fn new(audit: Arc<AuditLog>, signing_key: SigningKey) -> Self {
+        let signer_pubkey = signing_key.verifying_key().to_bytes();
+        Self {
+            store: StandingGrantStore::new(),
+            audit,
+            signing_key,
+            signer_pubkey,
+        }
+    }
+
+    /// Issue a standing grant derived from a REAL issued [`CapabilityToken`] (the cryptographic
+    /// root): the token supplies capsule/resource/action/expiry, the caller supplies the authorized
+    /// method set. Returns the `grant_id` (the token's id) to revoke or dispatch against later.
+    pub fn issue_from_token(
+        &self,
+        token: &CapabilityToken,
+        allowed_methods: BTreeSet<String>,
+    ) -> String {
+        let envelope = StandingGrantEnvelope::from_token(token, allowed_methods, false);
+        let grant_id = envelope.grant_id.clone();
+        self.store.issue(envelope);
+        grant_id
+    }
+
+    /// Revoke a standing grant by id, fail-closed. Returns `true` iff a live grant was revoked by
+    /// this call (double-revoke / unknown id → `false`).
+    pub fn revoke(&self, grant_id: &str) -> bool {
+        self.store.revoke(grant_id)
+    }
+
+    /// True iff an ACTIVE (issued, not revoked, not expired) grant exists for `grant_id`.
+    pub fn is_active(&self, grant_id: &str) -> bool {
+        self.store.is_active(grant_id)
+    }
+
+    /// Dispatch a self-declared agent act under its standing grant, fail-closed — the full loop
+    /// (declare → verify `intent ⊆ envelope` → act → reconcile). Thin wrapper over
+    /// [`dispatch_standing_act`] with the service's own store/audit/key.
+    pub fn dispatch<F>(&self, intent: &IntentDeclarationV1, act: F) -> IntentGateOutcome
+    where
+        F: FnOnce() -> Option<AffordanceGrantReceiptV1>,
+    {
+        dispatch_standing_act(
+            &self.store,
+            self.audit.as_ref(),
+            &self.signing_key,
+            self.signer_pubkey,
+            intent,
+            act,
+        )
     }
 }
 
@@ -1716,5 +1790,106 @@ mod tests {
         );
         assert_eq!(summary.diverged, 0);
         assert_eq!(summary.undelivered, 0);
+    }
+
+    // ── Chunk 2c-gw-A: StandingGrantService (the API-facing seam) ──────────────
+
+    #[test]
+    fn service_issues_from_a_token_dispatches_then_revocation_denies() {
+        use crate::capability::token::{Action, CapabilityToken, ResourceId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let audit = std::sync::Arc::new(
+            crate::primitives::audit::AuditLog::with_file(dir.path().join("a.log")).unwrap(),
+        );
+        let sk = key();
+        let svc = StandingGrantService::new(audit.clone(), sk.clone());
+
+        // Issue a standing grant from a real token; the returned grant_id is the token's id.
+        let token = CapabilityToken::new(
+            "vm-agent".to_string(),
+            [0u8; 32],
+            ResourceId::new("elastos://mail/send"),
+            Action::Execute,
+            Default::default(),
+            SecureTimestamp::now(),
+            Some(SecureTimestamp::after_secs(3600)),
+        );
+        let grant_id =
+            svc.issue_from_token(&token, ["send"].iter().map(|m| m.to_string()).collect());
+        assert_eq!(grant_id, token.id().to_string());
+        assert!(svc.is_active(&grant_id), "a freshly issued grant is active");
+
+        let declare = |args: &str| {
+            IntentDeclarationV1::issue(
+                &sk,
+                sk.verifying_key().to_bytes(),
+                "svc-intent",
+                "vm-agent",
+                "send",
+                args,
+                "elastos://mail/send",
+                "execute",
+                &grant_id,
+            )
+        };
+
+        // Dispatch through the service: the act runs and reconciles matched.
+        let outcome = svc.dispatch(&declare("a1"), || {
+            Some(a_receipt(
+                &sk,
+                "vm-agent",
+                "send",
+                "a1",
+                "elastos://mail/send",
+                "execute",
+            ))
+        });
+        assert!(
+            matches!(outcome, IntentGateOutcome::Acted(rec) if rec.status == ReconciliationStatus::Matched)
+        );
+
+        // Revoke through the service: the grant goes inactive and the next dispatch is denied.
+        assert!(svc.revoke(&grant_id));
+        assert!(!svc.is_active(&grant_id));
+        let ran = std::cell::Cell::new(false);
+        let after = svc.dispatch(&declare("a2"), || {
+            ran.set(true);
+            None
+        });
+        assert!(matches!(
+            after,
+            IntentGateOutcome::Denied(EnvelopeDenial::Revoked)
+        ));
+        assert!(
+            !ran.get(),
+            "a revoked grant denies the act through the service too"
+        );
+
+        // The service wrote to the SHARED audit log: the story is queryable on the intent channel.
+        let summary = audit.intent_proof_summary("vm-agent").expect("present");
+        assert_eq!(summary.denied, 1);
+    }
+
+    #[test]
+    fn service_dispatch_with_no_issued_grant_is_denied_no_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = std::sync::Arc::new(
+            crate::primitives::audit::AuditLog::with_file(dir.path().join("a.log")).unwrap(),
+        );
+        let sk = key();
+        let svc = StandingGrantService::new(audit, sk.clone());
+        // Never issued anything ⇒ any dispatch is a fail-closed NoGrant denial.
+        let intent = an_intent(&sk, "send", "a1");
+        let ran = std::cell::Cell::new(false);
+        let outcome = svc.dispatch(&intent, || {
+            ran.set(true);
+            None
+        });
+        assert!(matches!(
+            outcome,
+            IntentGateOutcome::Denied(EnvelopeDenial::NoGrant)
+        ));
+        assert!(!ran.get());
     }
 }
