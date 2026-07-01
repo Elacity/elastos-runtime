@@ -17,7 +17,8 @@
 //! intent is within the authorized envelope, and a tamper-evident record of declared vs
 //! done — NOT the correctness/wisdom of the act.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::RwLock;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -588,6 +589,85 @@ where
     );
     audit.emit_best_effort(intent_reconciled_event(&rec, &intent.capsule));
     IntentGateOutcome::Acted(rec)
+}
+
+// ─────────────────────────── The standing-grant registry (chunk 2c-1) ─────────
+// The stateful home for the envelopes a standing-grant dispatcher runs against. The
+// envelope's own doc names this: the cryptographic token gives resource/action, but
+// REVOCATION and the method mapping are EXTERNAL state — held here, the way the
+// CapabilityManager owns token revocation. Kept deliberately small and fail-closed so an
+// agent can only ever run under a grant that was issued and is still live.
+
+/// A fail-closed registry of [`StandingGrantEnvelope`]s for unsupervised agent dispatch,
+/// keyed by `grant_id`. Every mutation is a single locked statement, so the map is never
+/// observed half-updated. Fail-closed by construction:
+///   - a grant that was never issued is ABSENT (`get` → `None`) — the dispatcher denies;
+///   - [`revoke`](Self::revoke) flips the stored envelope's `revoked` flag and KEEPS the
+///     record, so a revoked grant stays queryable as revoked (honest, recorded denial +
+///     audit) rather than vanishing into an ambiguous "no such grant";
+///   - a revoked or expired envelope authorizes NOTHING — enforced by the gate's own
+///     [`check_intent_within_envelope`], not re-implemented here.
+#[derive(Default)]
+pub struct StandingGrantStore {
+    grants: RwLock<HashMap<String, StandingGrantEnvelope>>,
+}
+
+impl StandingGrantStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Issue (or replace) a standing grant, keyed by its `grant_id`. Issuing an envelope whose
+    /// `revoked` flag is already set stores it as revoked (authorizes nothing) — issuing never
+    /// silently un-revokes a grant.
+    pub fn issue(&self, envelope: StandingGrantEnvelope) {
+        let mut grants = match self.grants.write() {
+            Ok(g) => g,
+            // A poisoned lock can only mean a prior panic; every write is one statement, so the
+            // map is structurally intact — recover the guard rather than drop the issuance.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        grants.insert(envelope.grant_id.clone(), envelope);
+    }
+
+    /// Revoke a standing grant by id, fail-closed. Returns `true` iff a live (not-already-revoked)
+    /// grant was revoked by THIS call — so a double-revoke or an unknown id returns `false`. The
+    /// record is retained with `revoked = true` so the grant stays queryable as revoked.
+    pub fn revoke(&self, grant_id: &str) -> bool {
+        let mut grants = match self.grants.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match grants.get_mut(grant_id) {
+            Some(env) if !env.revoked => {
+                env.revoked = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The standing grant for `grant_id`, if one was ever issued (revoked or not). The dispatcher
+    /// runs it through the fail-closed gate, which denies a revoked/expired envelope — so returning
+    /// a revoked envelope yields an honest, recorded `Revoked`/`Expired` denial, never a silent pass.
+    /// A poisoned lock degrades to `None` (absent), never a fabricated grant.
+    pub fn get(&self, grant_id: &str) -> Option<StandingGrantEnvelope> {
+        let grants = self.grants.read().ok()?;
+        grants.get(grant_id).cloned()
+    }
+
+    /// True iff an ACTIVE (issued, not revoked, not expired) grant exists for `grant_id`. A read-only
+    /// probe for surfaces that want the live count; the dispatch decision itself always goes through
+    /// the gate, never this shortcut.
+    pub fn is_active(&self, grant_id: &str) -> bool {
+        match self.grants.read() {
+            Ok(g) => g
+                .get(grant_id)
+                .map(StandingGrantEnvelope::is_active)
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1233,5 +1313,75 @@ mod tests {
         assert_eq!(s.undelivered, 0);
         // An unrelated capsule with no intent activity is ABSENT (None), never fabricated.
         assert!(log.intent_proof_summary("vm-elsewhere").is_none());
+    }
+
+    // ── StandingGrantStore (chunk 2c-1): fail-closed issue/revoke registry ──
+
+    /// An envelope with a specific grant_id + expiry, for store tests.
+    fn envelope_with(grant_id: &str, expires_at: Option<SecureTimestamp>) -> StandingGrantEnvelope {
+        StandingGrantEnvelope {
+            grant_id: grant_id.to_string(),
+            capsule: "vm-agent".to_string(),
+            allowed_methods: ["send"].iter().map(|m| m.to_string()).collect(),
+            resource: "elastos://mail/send".to_string(),
+            action: "execute".to_string(),
+            expires_at,
+            revoked: false,
+        }
+    }
+
+    #[test]
+    fn store_issue_then_get_returns_the_envelope() {
+        let store = StandingGrantStore::new();
+        assert!(store.get("g1").is_none(), "an unissued grant is absent");
+        assert!(!store.is_active("g1"), "an unissued grant is not active");
+
+        store.issue(envelope_with("g1", Some(SecureTimestamp::after_secs(3600))));
+        let got = store.get("g1").expect("issued grant is retrievable");
+        assert_eq!(got.grant_id, "g1");
+        assert!(!got.revoked);
+        assert!(store.is_active("g1"), "a fresh, unexpired grant is active");
+    }
+
+    #[test]
+    fn store_revoke_flips_the_flag_keeps_the_record_and_is_idempotent() {
+        let store = StandingGrantStore::new();
+        store.issue(envelope_with("g1", None)); // None expiry ⇒ never expires until revoked.
+        assert!(store.is_active("g1"));
+
+        assert!(store.revoke("g1"), "revoking a live grant returns true");
+        // The record is KEPT, now marked revoked — queryable as revoked for honest denial.
+        let got = store.get("g1").expect("a revoked grant is still queryable");
+        assert!(got.revoked, "the stored envelope is marked revoked");
+        assert!(!store.is_active("g1"), "a revoked grant is not active");
+
+        // Idempotent: a second revoke (already revoked) returns false — no live grant was revoked.
+        assert!(!store.revoke("g1"), "double-revoke returns false");
+        // Revoking an unknown id is a fail-closed no-op, never a panic.
+        assert!(!store.revoke("does-not-exist"));
+    }
+
+    #[test]
+    fn store_never_un_revokes_and_expiry_deactivates_without_revocation() {
+        let store = StandingGrantStore::new();
+
+        // Issuing an already-revoked envelope stores it as revoked — issue never un-revokes.
+        let mut revoked_env = envelope_with("g1", None);
+        revoked_env.revoked = true;
+        store.issue(revoked_env);
+        assert!(
+            !store.is_active("g1"),
+            "an issued-revoked grant is not active"
+        );
+        assert!(store.get("g1").unwrap().revoked);
+
+        // A past expiry deactivates a grant even though it was never revoked (fail-closed on time).
+        store.issue(envelope_with("g2", Some(SecureTimestamp::after_secs(0))));
+        assert!(
+            !store.is_active("g2"),
+            "an expired grant is inactive without any revocation"
+        );
+        // ...but it is still retrievable, so the gate can deny it with an honest `Expired` reason.
+        assert!(store.get("g2").is_some());
     }
 }
