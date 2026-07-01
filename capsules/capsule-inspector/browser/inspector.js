@@ -370,9 +370,13 @@ const CUSTODY_STATE_CLASS = {
 
 function renderCustody(c) {
   const wrap = el("div", { "data-testid": "capsule-custody-panel" });
-  // spend_budget: {limit,spent,remaining}|null · audit.chain: ChainAttestation|null.
-  // Intent stays absent until the intent-proof summary is threaded (Tier 2b / 5b-inspector).
-  const view = homeCustodyView(c.spend_budget, (c.audit && c.audit.chain) || null);
+  // spend_budget: {limit,spent,remaining}|null · audit.chain: ChainAttestation|null ·
+  // intent_proof: {denied,diverged,undelivered}|null (Tier 2b — null ⇒ absent, never a clean pass).
+  const view = homeCustodyView(
+    c.spend_budget,
+    (c.audit && c.audit.chain) || null,
+    c.intent_proof || null,
+  );
   for (const r of custodyDisplayRows(view)) {
     wrap.appendChild(el("div", {
       class: "row custody-row",
@@ -543,7 +547,9 @@ const SAMPLE_DATA = [
     storage_namespaces: ["localhost://WebSpaces/wallet/"],
     carrier: { enabled: false, endpoints: [], peers: 0 },
     provenance: { signed_by: "gateway-did", version: "0.1.0", installed_at: 1781731200, cid: "bafywallet..." },
-    // Custody sample: unmetered (no budget ⇒ "Unmetered", never a satisfied 0/0) + a durable, verified chain.
+    // Custody sample: unmetered (no budget ⇒ "Unmetered", never a satisfied 0/0) + a durable, verified
+    // chain + an intent tally that is PRESENT and all-zero ⇒ CLEAN ("Intents within grant").
+    intent_proof: { denied: 0, diverged: 0, undelivered: 0 },
     audit: { counts: { total: 7, total_today: 7, user_approved: 3, denied: 0, attested: 2 },
       chain: { verified: true, records: 7, signer: "e3b0c44298fc1c14", error: null }, recent: [
       { ts: 1781989000, event: "capability.use", detail: "wallet/* read accounts", success: true, signed: true, signer: "did:elastos:gateway" },
@@ -564,9 +570,11 @@ const SAMPLE_DATA = [
     storage_namespaces: [],
     carrier: { enabled: false, endpoints: [], peers: 0 },
     provenance: { signed_by: "gateway-did", version: "0.1.0", installed_at: 1781990000, cid: "bafyinspector..." },
-    // Custody sample: a hard-stop budget (exhausted) beside a TAMPERED chain — both alarms
-    // must surface side by side; neither channel may soften the other (no green-over-bad).
+    // Custody sample: a hard-stop budget (exhausted) beside a TAMPERED chain AND a FLAGGED
+    // intent tally — all three alarms must surface side by side; no channel may soften another
+    // (no green-over-bad, and the intent verdict is independent of spend + audit).
     spend_budget: { limit: 5, spent: 5, remaining: 0 },
+    intent_proof: { denied: 1, diverged: 0, undelivered: 1 },
     audit: { counts: { total_today: 3, user_approved: 0, denied: 0 },
       chain: { verified: false, records: 0, signer: null, error: "audit tamper at seq 2: record_hash mismatch" }, recent: [
       { ts: 1781990200, event: "capability.use", detail: "inspect/* capsules", success: true },

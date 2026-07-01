@@ -125,10 +125,14 @@ UI (sample mode is enough for all of these):
 - [ ] **Custody panel** shows three independent channels: **Spend** (Unmetered /
       Within budget / Near limit / Budget exhausted), **Audit chain** (No durable
       chain / Chain verified / Chain tampered), and **Agent intents** (No
-      agent-intent custody — `absent` until Tier 2b). A verified chain sitting
-      beside an exhausted budget must show BOTH honestly (no green-over-bad); e.g.
-      in sample mode the `capsule-inspector` row shows `Budget exhausted` +
-      `Chain tampered` side by side.
+      agent-intent custody / Intents within grant / Intents flagged — now LIVE from
+      the runtime's per-capsule intent-proof tally, Tier 2b). A verified chain sitting
+      beside an exhausted budget and a flagged intent must show ALL THREE honestly
+      (no green-over-bad, and each channel is independent); e.g. in sample mode the
+      `capsule-inspector` row shows `Budget exhausted` + `Chain tampered` +
+      `Intents flagged` (1 denied · 0 diverged · 1 undelivered) side by side, while
+      `wallet-provider` shows a present-and-clean `Intents within grant` and
+      `chat-room` shows `No agent-intent custody` (absent — never a false clean).
 - [ ] **No** raw signature, bearer token, or mutation handle appears anywhere in
       the UI (Principle #16).
 

@@ -41,10 +41,11 @@ containment audit.
 ## Tier 2 — surface THIS branch's work into the shell (the real gap)
 - ✅ **2a — Custody panel MOUNTED into `capsule-inspector`** (spend + audit paint LIVE; intent reads `absent`).
   Shared `custodyDisplayRows` contract; drift-guarded projection copy; gated 89/89 + headless render. (Receipt: `fd1336a`.)
-- 🔵 **2b — 5b-inspector:** expose `intent_proof_summary` through the `AuditSource` trait + project an `intent_proof`
-  field + ESP data path → the intent channel goes from `absent` to LIVE. **← NEXT**
-- ⬜ **2c — 4b standing-grant dispatch (the milestone):** issue/revoke standing capability envelopes and route
-  self-declared agent acts through `run_intent_gate` — "an agent runs unsupervised under the loop."
+- ✅ **2b — intent channel LIVE** — `intent_proof_summary` exposed through the `AuditSource` trait (fail-honest `None`
+  default), a top-level `intent_proof` field projected on the capsule detail (keyed `vm-{name}`), threaded into
+  `homeCustodyView`'s 3rd arg. Absent/clean/flagged all paint honestly. (Receipt: `2b` commit; gated server 908/908.)
+- 🔵 **2c — 4b standing-grant dispatch (the milestone):** issue/revoke standing capability envelopes and route
+  self-declared agent acts through `run_intent_gate` — "an agent runs unsupervised under the loop." **← NEXT**
 - ⬜ Then: confirm the inspector shows **live** runtime custody (DID / trust / manifest / required-vs-granted-vs-denied
   caps / audit chain), not sample-data.
 
@@ -59,12 +60,14 @@ containment audit.
 ## Intent-proof loop ledger (`INTENT_PROOF_LOOP.md`)
 - ✅ **ch1–5 + 5b-runtime** — signed records, fail-closed verifier matrix, on-chain emit, `from_token`, `run_intent_gate`,
   ESP `intentProofView`, presence-aware `AuditLog::intent_proof_summary`. All gated.
-- ⬜ **5b-inspector (= Tier 2b)** · ⬜ **4b (= Tier 2c)**.
+- ✅ **5b-inspector (= Tier 2b)** — intent channel LIVE end-to-end · ⬜ **4b (= Tier 2c)**.
 
 ## Current focus
-**Tier 2b** — take the intent channel from `absent` to LIVE: expose `AuditLog::intent_proof_summary` through the
-`AuditSource` trait, project an `intent_proof` field on the inspector detail, and thread it into the ESP
-`homeCustodyView`. The panel + display contract already render it (2a); this is the runtime data path behind it.
-> **2a done (`fd1336a`):** custody panel mounted in `capsule-inspector` — spend + audit paint LIVE from the runtime
-> projection, intent reads `absent`; both shells share the tested `custodyDisplayRows` contract (drift-guarded copy).
-> **Awaiting Cursor's live confirm on the Mac** (reload shell → open inspector → screenshot the Custody card).
+**Tier 2c (the milestone)** — standing-grant dispatch: issue/revoke standing capability envelopes and route a
+self-declared agent act through `run_intent_gate` (already built, ch4) so an agent can run UNSUPERVISED under the
+loop — declare → verify `intent ⊆ envelope` (fail-closed) → act → reconcile. This is the first end-to-end use of the
+prover/verifier loop as an enforcement path, and it makes the now-LIVE intent channel show real denials/divergences.
+> **2a + 2b done:** custody panel mounted (`fd1336a`) AND the intent channel is LIVE end-to-end (spend + audit +
+> intent all paint from the runtime projection; absent/clean/flagged honest). Both shells share the tested
+> `custodyDisplayRows` contract (drift-guarded copy). Server-side gated 908/908; ESP 89/89.
+> **Awaiting Cursor's live confirm on the Mac** (reload shell → open inspector → screenshot the three-channel Custody card).

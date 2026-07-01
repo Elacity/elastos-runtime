@@ -182,6 +182,18 @@ pub trait AuditSource: Send + Sync {
     ) -> Option<elastos_runtime::primitives::audit::ChainAttestation> {
         None
     }
+
+    /// The per-capsule intent-proof tally (denied / diverged / undelivered) for `capsule_key`, when
+    /// this source's plane records intent activity. PRESENCE-aware: `None` is ABSENT — the capsule
+    /// never went through the intent gate, which is NOT the same as "clean" (all-zero); the panel
+    /// renders absence as absence. Default `None`: a source without intent-proof custody honestly
+    /// reports nothing rather than fabricating a zeroed pass.
+    async fn intent_proof_summary(
+        &self,
+        _capsule_key: &str,
+    ) -> Option<elastos_runtime::capability::intent::IntentProofSummary> {
+        None
+    }
 }
 
 /// Composes signed activity (one source) with observed grants (another) so the
@@ -223,6 +235,15 @@ impl AuditSource for CompositeAuditSource {
         &self,
     ) -> Option<elastos_runtime::primitives::audit::ChainAttestation> {
         self.grants.chain_attestation().await
+    }
+
+    // Intent-proof events land on the runtime AuditLog too, so the tally comes from the
+    // same grants source that owns it — not the auth-state activity source.
+    async fn intent_proof_summary(
+        &self,
+        capsule_key: &str,
+    ) -> Option<elastos_runtime::capability::intent::IntentProofSummary> {
+        self.grants.intent_proof_summary(capsule_key).await
     }
 }
 
@@ -360,6 +381,15 @@ impl AuditSource for RuntimeAuditLogGrantSource {
         &self,
     ) -> Option<elastos_runtime::primitives::audit::ChainAttestation> {
         self.audit_log.chain_attestation()
+    }
+
+    // The AuditLog owns the intent-proof events, so the presence-aware per-capsule tally
+    // (keyed on the acting vm-{name}) comes straight from it — None ⇒ absent, never faked.
+    async fn intent_proof_summary(
+        &self,
+        capsule_key: &str,
+    ) -> Option<elastos_runtime::capability::intent::IntentProofSummary> {
+        self.audit_log.intent_proof_summary(capsule_key)
     }
 
     async fn granted_for_capsule(
@@ -719,6 +749,28 @@ impl InspectProvider {
             .unwrap_or(Value::Null)
     }
 
+    /// Read-only projection of a capsule's intent-proof custody tally (keyed on the acting
+    /// `vm-{name}`, the identity intent events record under). PRESENCE-aware: `Null` when there is
+    /// no audit source OR the capsule has no buffered intent activity (ABSENT — it never went
+    /// through the gate, which is NOT "clean"). A present tally projects `{denied, diverged,
+    /// undelivered}` — the exact `IntentProofSummaryV1` shape the ESP `homeCustodyView` consumes.
+    async fn intent_proof_value(&self, entry: &InspectEntry) -> Value {
+        let Some(audit) = &self.audit else {
+            return Value::Null;
+        };
+        match audit
+            .intent_proof_summary(&format!("vm-{}", entry.name))
+            .await
+        {
+            Some(s) => json!({
+                "denied": s.denied,
+                "diverged": s.diverged,
+                "undelivered": s.undelivered,
+            }),
+            None => Value::Null,
+        }
+    }
+
     fn scope_label(scope: InspectScope) -> &'static str {
         match scope {
             InspectScope::System => "system",
@@ -729,7 +781,13 @@ impl InspectProvider {
     /// Project a capsule into the inspector wire contract (see
     /// docs/CAPSULE_INSPECTOR.md). Read-only; unknown fields are null rather
     /// than fabricated, and no bearer token / raw signature is ever included.
-    fn project(entry: &InspectEntry, audit: Value, granted: Value, spend_budget: Value) -> Value {
+    fn project(
+        entry: &InspectEntry,
+        audit: Value,
+        granted: Value,
+        spend_budget: Value,
+        intent_proof: Value,
+    ) -> Value {
         fn field(v: &Value, key: &str) -> Value {
             v.get(key).cloned().unwrap_or(Value::Null)
         }
@@ -851,6 +909,10 @@ impl InspectProvider {
             // Live per-capsule spend budget {limit, spent, remaining}, keyed on vm-{name} — a
             // read-only projection of the meter the act paths debit. Null when unmetered/unprovisioned.
             "spend_budget": spend_budget,
+            // Live per-capsule intent-proof tally {denied, diverged, undelivered}, keyed on vm-{name} —
+            // the prover/verifier custody channel. Null when ABSENT (no intent activity through the
+            // gate); present-and-all-zero is CLEAN, any non-zero is a flagged custody alarm.
+            "intent_proof": intent_proof,
             "storage_namespaces": manifest
                 .pointer("/permissions/storage")
                 .cloned()
@@ -984,7 +1046,8 @@ impl InspectProvider {
                         let audit = self.audit_value(&entry).await;
                         let granted = self.granted_value(&entry).await;
                         let spend_budget = self.spend_budget_value(&entry);
-                        json!({ "status": "ok", "data": Self::project(&entry, audit, granted, spend_budget) })
+                        let intent_proof = self.intent_proof_value(&entry).await;
+                        json!({ "status": "ok", "data": Self::project(&entry, audit, granted, spend_budget, intent_proof) })
                     }
                     None => provider_error("not_found", "no such capsule"),
                 },
@@ -1013,7 +1076,8 @@ impl InspectProvider {
                         let audit = self.audit_value(&entry).await;
                         let granted_v = self.granted_value(&entry).await;
                         let spend_budget = self.spend_budget_value(&entry);
-                        json!({ "status": "ok", "data": Self::project(&entry, audit, granted_v, spend_budget) })
+                        let intent_proof = self.intent_proof_value(&entry).await;
+                        json!({ "status": "ok", "data": Self::project(&entry, audit, granted_v, spend_budget, intent_proof) })
                     }
                     None => provider_error("not_found", "no such capsule"),
                 }
@@ -2322,6 +2386,56 @@ mod tests {
         assert_eq!(
             resp["data"]["audit"]["recent"][0]["signer"],
             "did:elastos:gateway"
+        );
+    }
+
+    #[tokio::test]
+    async fn capsule_detail_projects_intent_proof_present_absent_and_flagged() {
+        use elastos_runtime::capability::intent::IntentProofSummary;
+
+        // A source that returns a FLAGGED tally for the acting vm-{name}, and absent otherwise.
+        struct IntentMock;
+        #[async_trait]
+        impl AuditSource for IntentMock {
+            async fn for_capsule(&self, _key: &str, _limit: usize) -> CapsuleAudit {
+                CapsuleAudit::default()
+            }
+            async fn intent_proof_summary(&self, key: &str) -> Option<IntentProofSummary> {
+                // Intent events are keyed on the acting vm-{name}, never the bare capsule name.
+                if key == "vm-probe" {
+                    Some(IntentProofSummary {
+                        denied: 2,
+                        diverged: 1,
+                        undelivered: 0,
+                    })
+                } else {
+                    None
+                }
+            }
+        }
+
+        let provider = InspectProvider::new(Arc::new(MockSource {
+            entries: vec![probe_entry()],
+        }))
+        .with_audit(Arc::new(IntentMock));
+        let resp = provider
+            .send_raw(&json!({ "op": "capsule", "id": "cap_probe_1" }))
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "ok");
+        // Present + non-zero ⇒ the exact IntentProofSummaryV1 shape, projected honestly.
+        assert_eq!(resp["data"]["intent_proof"]["denied"], 2, "{resp}");
+        assert_eq!(resp["data"]["intent_proof"]["diverged"], 1);
+        assert_eq!(resp["data"]["intent_proof"]["undelivered"], 0);
+
+        // No audit source attached ⇒ ABSENT (null), never a fabricated zeroed/clean tally.
+        let bare = provider_with_probe()
+            .send_raw(&json!({ "op": "capsule", "id": "cap_probe_1" }))
+            .await
+            .unwrap();
+        assert!(
+            bare["data"]["intent_proof"].is_null(),
+            "a capsule with no intent-proof custody must project null (absent), not a clean 0/0/0: {bare}"
         );
     }
 
