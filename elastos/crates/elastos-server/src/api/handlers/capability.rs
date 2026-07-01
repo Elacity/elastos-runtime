@@ -19,7 +19,7 @@ use elastos_runtime::capability::manager::ValidationError;
 use elastos_runtime::capability::{
     pending::{AffordanceBinding, PendingRequestStore},
     Action, AffordanceGrantReceiptV1, CapabilityManager, CapabilityToken, GrantDuration,
-    PolicyEvaluator, PolicyOutcome, ResourceId, TokenConstraints,
+    PolicyEvaluator, PolicyOutcome, ResourceId, StandingGrantService, TokenConstraints,
 };
 use elastos_runtime::session::Session;
 
@@ -29,6 +29,9 @@ pub struct CapabilityState {
     pub pending_store: Arc<PendingRequestStore>,
     pub capability_manager: Arc<CapabilityManager>,
     pub policy_evaluator: Arc<PolicyEvaluator>,
+    /// The standing-grant service (issue/revoke/dispatch for unsupervised agent acts), backed by the
+    /// manager's own key + audit log. Shared so every shell-only verb hits the same grant registry.
+    pub standing_service: Arc<StandingGrantService>,
 }
 
 // === Request Capability ===
@@ -1033,6 +1036,111 @@ pub async fn get_audit_event_types(
     })
 }
 
+// === Standing grants (shell-only): the unsupervised-agent authority verbs ===
+//
+// A standing grant lets an agent act repeatedly under the intent-proof loop without a
+// per-act human prompt. Issuing/revoking is AUTHORITY, so these live behind the shell-only
+// router (consent_broker_only_middleware) exactly like grant/deny — an ordinary capsule
+// session can never reach them. `issue` mints a REAL signed capability token (the
+// cryptographic root) and derives the standing envelope from it; `revoke` is the kill switch.
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssueStandingGrantInput {
+    /// The acting capsule identity the grant authorizes (e.g. "vm-agent").
+    pub capsule: String,
+    /// The resource the grant covers (e.g. "elastos://mail/send").
+    pub resource: String,
+    /// The action (read | write | execute | delete | message | admin).
+    pub action: String,
+    /// The affordance method ids the agent may invoke under this grant (non-empty).
+    pub methods: Vec<String>,
+    /// Optional time-to-live in seconds; omitted ⇒ no expiry (until revoked).
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IssueStandingGrantOutput {
+    /// The standing grant id (the backing token's id) — revoke or dispatch against this.
+    pub grant_id: String,
+}
+
+/// POST /api/standing-grants/issue  (shell-only)
+///
+/// Issue a standing grant for unsupervised agent dispatch. Mints a real signed capability token
+/// for (capsule, resource, action, ttl) — the cryptographic root — then derives and stores the
+/// standing envelope with the authorized method set. Fail-closed on an unknown action or empty
+/// method set.
+pub async fn issue_standing_grant(
+    State(state): State<CapabilityState>,
+    Json(input): Json<IssueStandingGrantInput>,
+) -> Result<Json<IssueStandingGrantOutput>, (StatusCode, String)> {
+    let action = match input.action.to_lowercase().as_str() {
+        "read" => Action::Read,
+        "write" => Action::Write,
+        "execute" => Action::Execute,
+        "delete" => Action::Delete,
+        "message" => Action::Message,
+        "admin" => Action::Admin,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Invalid action: {}. Expected: read, write, execute, delete, message, admin",
+                    input.action
+                ),
+            ));
+        }
+    };
+    if input.methods.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a standing grant must authorize at least one method".to_string(),
+        ));
+    }
+    let expiry = input
+        .ttl_secs
+        .map(elastos_common::SecureTimestamp::after_secs);
+    // Mint a real signed token (the cryptographic root), then elevate it to a standing grant.
+    let token = state.capability_manager.grant(
+        &input.capsule,
+        ResourceId::new(input.resource),
+        action,
+        TokenConstraints::default(),
+        expiry,
+    );
+    let methods: std::collections::BTreeSet<String> = input.methods.into_iter().collect();
+    let grant_id = state.standing_service.issue_from_token(&token, methods);
+    Ok(Json(IssueStandingGrantOutput { grant_id }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevokeStandingGrantInput {
+    /// The grant id returned by issue.
+    pub grant_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RevokeStandingGrantOutput {
+    /// True iff a live grant was revoked by this call (already-revoked / unknown ⇒ false).
+    pub revoked: bool,
+}
+
+/// POST /api/standing-grants/revoke  (shell-only) — the autonomy kill switch.
+///
+/// Revoke a standing grant by id, fail-closed. After this, every not-yet-started act under the
+/// grant is denied (the dispatcher re-reads the grant each time). Returns whether a live grant
+/// was revoked by this call.
+pub async fn revoke_standing_grant(
+    State(state): State<CapabilityState>,
+    Json(input): Json<RevokeStandingGrantInput>,
+) -> Result<Json<RevokeStandingGrantOutput>, (StatusCode, String)> {
+    let revoked = state.standing_service.revoke(&input.grant_id);
+    Ok(Json(RevokeStandingGrantOutput { revoked }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1120,6 +1228,7 @@ mod tests {
             std::sync::Arc::new(elastos_runtime::primitives::metrics::MetricsManager::new());
         let capability_manager =
             std::sync::Arc::new(CapabilityManager::new(store, audit_log.clone(), metrics));
+        let standing_service = std::sync::Arc::new(capability_manager.standing_grant_service());
 
         CapabilityState {
             pending_store: std::sync::Arc::new(PendingRequestStore::new(audit_log.clone())),
@@ -1128,7 +1237,88 @@ mod tests {
                 Box::new(elastos_runtime::capability::evaluator::ShellPassthroughVerifier),
                 audit_log,
             )),
+            standing_service,
         }
+    }
+
+    #[tokio::test]
+    async fn issue_then_revoke_standing_grant_over_the_handlers() {
+        let state = test_state();
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: "elastos://mail/send".to_string(),
+                action: "execute".to_string(),
+                methods: vec!["send".to_string()],
+                ttl_secs: Some(3600),
+            }),
+        )
+        .await
+        .expect("issue ok")
+        .0;
+        assert!(!out.grant_id.is_empty(), "issue returns a grant id");
+        assert!(
+            state.standing_service.is_active(&out.grant_id),
+            "the issued grant is active in the shared service"
+        );
+
+        // Revoke → true; the grant goes inactive; a second revoke → false (idempotent kill switch).
+        let rev = revoke_standing_grant(
+            State(state.clone()),
+            Json(RevokeStandingGrantInput {
+                grant_id: out.grant_id.clone(),
+            }),
+        )
+        .await
+        .expect("revoke ok")
+        .0;
+        assert!(rev.revoked, "revoking a live grant returns true");
+        assert!(!state.standing_service.is_active(&out.grant_id));
+        let rev2 = revoke_standing_grant(
+            State(state.clone()),
+            Json(RevokeStandingGrantInput {
+                grant_id: out.grant_id.clone(),
+            }),
+        )
+        .await
+        .expect("ok")
+        .0;
+        assert!(!rev2.revoked, "double-revoke returns false");
+    }
+
+    #[tokio::test]
+    async fn issue_standing_grant_is_fail_closed_on_bad_input() {
+        let state = test_state();
+        // Unknown action ⇒ 400, no grant issued.
+        let err = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: "elastos://mail/send".to_string(),
+                action: "frobnicate".to_string(),
+                methods: vec!["send".to_string()],
+                ttl_secs: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        // Empty method set ⇒ 400 (a grant that authorizes nothing is refused).
+        let err2 = issue_standing_grant(
+            State(state),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: "elastos://mail/send".to_string(),
+                action: "execute".to_string(),
+                methods: vec![],
+                ttl_secs: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err2.0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

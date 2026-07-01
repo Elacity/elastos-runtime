@@ -195,6 +195,9 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         pending_store: pending_store.clone(),
         capability_manager: capability_manager.clone(),
         policy_evaluator,
+        // One shared standing-grant service, signed by the manager's own key + audit log, so every
+        // shell-only standing-grant verb hits the same fail-closed registry.
+        standing_service: Arc::new(capability_manager.standing_grant_service()),
     };
     let capsule_audit_log = audit_log
         .clone()
@@ -258,6 +261,16 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         .route("/api/capability/pending", get(handlers::list_pending))
         .route("/api/capability/grant", post(handlers::grant_request))
         .route("/api/capability/deny", post(handlers::deny_request))
+        // Standing grants (unsupervised-agent authority): issue mints a real token + stores the
+        // standing envelope; revoke is the kill switch. Shell-only, like grant/deny.
+        .route(
+            "/api/standing-grants/issue",
+            post(handlers::issue_standing_grant),
+        )
+        .route(
+            "/api/standing-grants/revoke",
+            post(handlers::revoke_standing_grant),
+        )
         // Revoke endpoints
         .route("/api/capability/:id", delete(handlers::revoke_capability))
         .route(

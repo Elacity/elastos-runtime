@@ -3323,6 +3323,7 @@ mod tests {
                 Box::new(elastos_runtime::capability::evaluator::ShellPassthroughVerifier),
                 audit.clone(),
             )),
+            standing_service: Arc::new(capability_manager.standing_grant_service()),
         };
 
         // ONE capsule session carrying its real identity (vm_id). Post-flip the mint

@@ -260,6 +260,18 @@ impl CapabilityManager {
         self.verifying_key.to_bytes()
     }
 
+    /// Build a [`StandingGrantService`](crate::capability::intent::StandingGrantService) backed by
+    /// THIS manager's own signing key and audit log — so a standing grant's reconciliation records
+    /// are signed by the same runtime key that mints its backing token, and land on the same audit
+    /// chain the manager already writes to. The key never leaves the manager as a raw getter.
+    /// Construct ONCE and share (wrap in `Arc`); each call makes a fresh, empty grant registry.
+    pub fn standing_grant_service(&self) -> crate::capability::intent::StandingGrantService {
+        crate::capability::intent::StandingGrantService::new(
+            self.audit_log.clone(),
+            self.signing_key.clone(),
+        )
+    }
+
     /// Grant a new capability token
     pub fn grant(
         &self,

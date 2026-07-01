@@ -72,5 +72,9 @@ runtime custody (not sample data). After that, **open the flint→main PR** (ste
 > dispatch + kill switch (`fe9211f`, `19e3e9e`, + this). The runtime enforcement loop is now closed: an agent can run
 > unsupervised under a standing grant AND be halted by revoking its token (the gate re-reads the grant each dispatch,
 > so revocation denies every not-yet-started act). Gated: elastos-runtime
-> intent 29/29, elastos-server 908/908, ESP 89/89. Next build track (optional, post-PR): a gateway verb to
-> issue/revoke standing grants + surface the dispatch on an API route (wire the in-process dispatcher to a shell action).
+> intent 29/29, elastos-server 908/908, ESP 89/89.
+>
+> **Standing-grant API (post-2c, in progress):** ✅ `StandingGrantService` (the store+audit+key seam, signed by the
+> manager's own key) · ✅ shell-only `POST /api/standing-grants/issue` (mints a real token → derives the standing
+> envelope) and `/revoke` (the kill switch), fail-closed, behind the same shell-only middleware as grant/deny · ⬜ the
+> dispatch route (how an agent's declared intent reaches the server) — the natural next slice, held for a design call.
