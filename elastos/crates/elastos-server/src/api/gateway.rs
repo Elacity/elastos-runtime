@@ -126,6 +126,65 @@ pub(crate) const HOME_LAUNCH_TRUSTED_SIGNER_DID_ENV: &str =
     "ELASTOS_HOME_LAUNCH_TRUSTED_SIGNER_DID";
 pub(crate) const HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV: &str =
     "ELASTOS_HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR";
+
+// Test-only serialization for the process-global trusted-auth-data-dir env var. In production the
+// var is set per-child-process at spawn (never mutated mid-process), but a handful of unit tests
+// mutate the shared test process to exercise the override path — and any auth-gated reader running
+// concurrently would otherwise observe the half-set value and fail closed (403). Mutating tests
+// hold the WRITE guard for their duration; the two read funnels (`home_launch_auth_data_dir`,
+// `room_transport_identity_data_dir`) take a brief READ guard so no *other* thread observes a
+// partial mutation. The mutating thread is tracked so its own funnel reads skip the (non-reentrant)
+// read lock — the mutation is theirs to see. Poison is ignored — the guarded unit carries no state.
+#[cfg(test)]
+fn trusted_auth_env_rwlock() -> &'static std::sync::RwLock<()> {
+    static LOCK: std::sync::OnceLock<std::sync::RwLock<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::RwLock::new(()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TRUSTED_AUTH_ENV_OWNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Exclusive guard for a test that mutates the trusted-auth-data-dir env var. Marks this thread as
+/// the owner so the read funnels here don't self-deadlock, and blocks other threads' funnel reads
+/// until the mutation is restored.
+#[cfg(test)]
+pub(crate) struct TrustedAuthEnvWriteGuard {
+    _inner: std::sync::RwLockWriteGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for TrustedAuthEnvWriteGuard {
+    fn drop(&mut self) {
+        TRUSTED_AUTH_ENV_OWNED.with(|owned| owned.set(false));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn trusted_auth_env_write_guard() -> TrustedAuthEnvWriteGuard {
+    let inner = trusted_auth_env_rwlock()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    TRUSTED_AUTH_ENV_OWNED.with(|owned| owned.set(true));
+    TrustedAuthEnvWriteGuard { _inner: inner }
+}
+
+/// Read guard for the trusted-auth-env read funnels: `None` on the mutating thread (its own change
+/// is safe to read), else a shared guard that blocks only while another thread is mid-mutation.
+#[cfg(test)]
+pub(crate) fn trusted_auth_env_read_guard() -> Option<std::sync::RwLockReadGuard<'static, ()>> {
+    if TRUSTED_AUTH_ENV_OWNED.with(|owned| owned.get()) {
+        None
+    } else {
+        Some(
+            trusted_auth_env_rwlock()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
 const WALLET_PRICE_IDS: &[(&str, &str)] = &[
     ("BTC", "bitcoin"),
     ("ETH", "ethereum"),

@@ -382,6 +382,8 @@ fn require_home_launch_token_for_any_from_expected_did(
 }
 
 pub(crate) fn home_launch_auth_data_dir(data_dir: &std::path::Path) -> PathBuf {
+    #[cfg(test)]
+    let _env_read_guard = crate::api::gateway::trusted_auth_env_read_guard();
     std::env::var_os(HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV)
         .and_then(|value| {
             let value = value.into_string().ok()?;

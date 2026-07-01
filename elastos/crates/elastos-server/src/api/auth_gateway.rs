@@ -2959,11 +2959,13 @@ mod tests {
     use axum::http::HeaderValue;
     use elastos_runtime::provider::{Provider, ProviderError, ResourceRequest, ResourceResponse};
     use std::ffi::OsString;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::Arc;
 
-    fn trusted_auth_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    fn trusted_auth_env_lock() -> super::super::gateway::TrustedAuthEnvWriteGuard {
+        // Exclusive against the two read funnels' test-only read guards, so a reader test on
+        // another thread never observes this test's in-flight mutation of the trusted-auth-dir env
+        // var (this thread's own funnel reads intentionally skip the lock — the change is ours).
+        super::super::gateway::trusted_auth_env_write_guard()
     }
 
     struct EnvVarRestore {
