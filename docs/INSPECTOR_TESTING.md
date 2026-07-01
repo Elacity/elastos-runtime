@@ -81,14 +81,17 @@ The UI is static. Serve the folder and open it; the live API call fails and it
 falls back to sample data (expected — badge shows `sample data`).
 
 ```bash
-cd capsules/capsule-inspector/inspector
+cd capsules/capsule-inspector/browser
 python3 -m http.server 8099
 # open http://127.0.0.1:8099/
 ```
 
-This exercises the entire UI/UX: list, detail glass box, provenance card, and the
-"preview gate" buttons (which compute the gate locally from the sample
-authority).
+This exercises the entire UI/UX: list, detail glass box, provenance card, the
+**Custody** panel (spend + audit + intent, painted from the shared ESP projection),
+and the "preview gate" buttons (which compute the gate locally from the sample
+authority). The frontend now lives in `browser/` (matching the `browser` capsule
+convention) and loads `inspector.js` as an ES module, so it must be served over
+HTTP — opening `index.html` via `file://` will not load the module.
 
 ### B. Live mode — runtime + System token
 
@@ -119,6 +122,13 @@ UI (sample mode is enough for all of these):
 - [ ] A provider capsule (one that declares `authority`) shows its powers, each
       with a **"preview gate"** button. Clicking it reveals the required
       **resources + actions + audit events** — and nothing executes.
+- [ ] **Custody panel** shows three independent channels: **Spend** (Unmetered /
+      Within budget / Near limit / Budget exhausted), **Audit chain** (No durable
+      chain / Chain verified / Chain tampered), and **Agent intents** (No
+      agent-intent custody — `absent` until Tier 2b). A verified chain sitting
+      beside an exhausted budget must show BOTH honestly (no green-over-bad); e.g.
+      in sample mode the `capsule-inspector` row shows `Budget exhausted` +
+      `Chain tampered` side by side.
 - [ ] **No** raw signature, bearer token, or mutation handle appears anywhere in
       the UI (Principle #16).
 

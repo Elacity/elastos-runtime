@@ -127,6 +127,20 @@ html, body {
 .pill-ok { color: var(--ok); }
 .pill-deny { color: var(--deny); }
 
+/* Custody panel — three independent fail-honest channels (spend · audit · intent).
+   Each channel colours ONLY its own honest state; there is no roll-up verdict, so a
+   green channel can never soften an alarm beside it (no green-over-bad). */
+.custody-row .custody-label { color: var(--muted); font-size: 12.5px; }
+.custody-value {
+  font-size: 12px; padding: 1px 8px; border-radius: 6px;
+  border: 1px solid var(--line);
+}
+.custody-ok { color: var(--ok); border-color: #1f4a33; }
+.custody-warn { color: var(--warn); border-color: #4a3a1f; }
+.custody-bad { color: var(--deny); border-color: #4a1f1f; }
+.custody-none { color: var(--muted); }
+.custody-detail { color: var(--muted); }
+
 .audit-line { display: grid; grid-template-columns: 84px 150px 1fr auto; gap: 10px; padding: 4px 0; font-size: 12.5px; }
 /* Attestation variant: optional 5th cell for the signer pill. */
 .audit-line-attest { display: flex; flex-wrap: wrap; align-items: center; }

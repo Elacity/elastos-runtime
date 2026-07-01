@@ -8,6 +8,12 @@
 
 "use strict";
 
+// The ONE custody display contract (ESP projection), shared byte-for-byte with the
+// Svelte Home panel so both shells paint the three channels identically (no per-shell
+// label drift). Pure, key-less, browser-safe — see esp/spend_audit.js (a build artifact
+// of elastos/esp/spend_audit.ts, drift-guarded by an .mjs test).
+import { homeCustodyView, custodyDisplayRows } from "./esp/spend_audit.js?v=inspector-20260701";
+
 // ---------------------------------------------------------------------------
 // Host adapter for the inspect surface.
 //
@@ -346,6 +352,41 @@ function renderProcesses(procs) {
   return wrap;
 }
 
+// Custody panel — the three INDEPENDENT custody channels (spend · audit · intent),
+// each painted from its own fail-honest ESP projection. A verified chain can never
+// mask an exhausted budget or a flagged intent (the moat: no green-over-bad). The
+// states/labels come entirely from `custodyDisplayRows`; this only picks a colour class
+// per honest state and never invents a roll-up verdict.
+const CUSTODY_STATE_CLASS = {
+  // green — a genuinely satisfied channel
+  ok: "custody-ok", verified: "custody-ok", clean: "custody-ok",
+  // amber — a live warning
+  warning: "custody-warn",
+  // red — an alarm the panel must never soften
+  exhausted: "custody-bad", broken: "custody-bad", flagged: "custody-bad",
+  // neutral — absence/unmetered is rendered as absence, never as a pass
+  unmetered: "custody-none", absent: "custody-none",
+};
+
+function renderCustody(c) {
+  const wrap = el("div", { "data-testid": "capsule-custody-panel" });
+  // spend_budget: {limit,spent,remaining}|null · audit.chain: ChainAttestation|null.
+  // Intent stays absent until the intent-proof summary is threaded (Tier 2b / 5b-inspector).
+  const view = homeCustodyView(c.spend_budget, (c.audit && c.audit.chain) || null);
+  for (const r of custodyDisplayRows(view)) {
+    wrap.appendChild(el("div", {
+      class: "row custody-row",
+      "data-channel": r.channel,
+      "data-state": r.state,
+    }, [
+      el("span", { class: "custody-label grow", text: r.label }),
+      el("span", { class: "custody-value " + (CUSTODY_STATE_CLASS[r.state] || ""), text: r.value }),
+      ...(r.detail ? [el("span", { class: "tag mono custody-detail", text: r.detail })] : []),
+    ]));
+  }
+  return wrap;
+}
+
 function renderDetail(c) {
   const detail = document.getElementById("detail");
   detail.innerHTML = "";
@@ -412,6 +453,9 @@ function renderDetail(c) {
     ["installed", fmtTime(prov.installed_at)], ["CID", prov.cid],
   ])));
 
+  // Custody — spend + audit + intent, three independent fail-honest channels.
+  detail.appendChild(card("Custody", renderCustody(c)));
+
   // 9 audit + processes
   detail.appendChild(card("Audit log", renderAudit(c.audit)));
   detail.appendChild(card("Running processes", renderProcesses(c.processes)));
@@ -435,7 +479,13 @@ async function boot() {
   else renderDetail(null);
 }
 
-document.addEventListener("DOMContentLoaded", boot);
+// `type="module"` scripts are deferred, so DOMContentLoaded may have already fired
+// by the time this runs — guard on readyState so boot() is never silently missed.
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", boot);
+} else {
+  boot();
+}
 
 // ---------------------------------------------------------------------------
 // Sample data — mirrors the elastos://inspect/* contract (docs/CAPSULE_INSPECTOR.md).
@@ -460,7 +510,9 @@ const SAMPLE_DATA = [
     storage_namespaces: ["localhost://WebSpaces/chat-room/"],
     carrier: { enabled: true, endpoints: ["gossip://iroh/abcd…"], peers: 1 },
     provenance: { signed_by: "gateway-did", version: "0.1.0", installed_at: 1781817600, cid: "bafychatroom..." },
-    audit: { counts: { total_today: 14, user_approved: 2, denied: 1 }, recent: [
+    // Custody sample: metered + within budget, but memory-only plane ⇒ no durable chain (absent, not a pass).
+    spend_budget: { limit: 100, spent: 30, remaining: 70 },
+    audit: { counts: { total_today: 14, user_approved: 2, denied: 1 }, chain: null, recent: [
       { ts: 1781990100, event: "capability.use", detail: "carrier/* message", success: true },
       { ts: 1781990060, event: "capability.use", detail: "storage/chat write", success: true },
       { ts: 1781990050, event: "capability.denied", detail: "did/* read", success: false },
@@ -491,7 +543,9 @@ const SAMPLE_DATA = [
     storage_namespaces: ["localhost://WebSpaces/wallet/"],
     carrier: { enabled: false, endpoints: [], peers: 0 },
     provenance: { signed_by: "gateway-did", version: "0.1.0", installed_at: 1781731200, cid: "bafywallet..." },
-    audit: { counts: { total: 7, total_today: 7, user_approved: 3, denied: 0, attested: 2 }, recent: [
+    // Custody sample: unmetered (no budget ⇒ "Unmetered", never a satisfied 0/0) + a durable, verified chain.
+    audit: { counts: { total: 7, total_today: 7, user_approved: 3, denied: 0, attested: 2 },
+      chain: { verified: true, records: 7, signer: "e3b0c44298fc1c14", error: null }, recent: [
       { ts: 1781989000, event: "capability.use", detail: "wallet/* read accounts", success: true, signed: true, signer: "did:elastos:gateway" },
       { ts: 1781988500, event: "affordance.sign", detail: "sign tx (user approved)", success: true, signed: true, signer: "did:elastos:gateway" },
     ] },
@@ -510,7 +564,11 @@ const SAMPLE_DATA = [
     storage_namespaces: [],
     carrier: { enabled: false, endpoints: [], peers: 0 },
     provenance: { signed_by: "gateway-did", version: "0.1.0", installed_at: 1781990000, cid: "bafyinspector..." },
-    audit: { counts: { total_today: 3, user_approved: 0, denied: 0 }, recent: [
+    // Custody sample: a hard-stop budget (exhausted) beside a TAMPERED chain — both alarms
+    // must surface side by side; neither channel may soften the other (no green-over-bad).
+    spend_budget: { limit: 5, spent: 5, remaining: 0 },
+    audit: { counts: { total_today: 3, user_approved: 0, denied: 0 },
+      chain: { verified: false, records: 0, signer: null, error: "audit tamper at seq 2: record_hash mismatch" }, recent: [
       { ts: 1781990200, event: "capability.use", detail: "inspect/* capsules", success: true },
     ] },
     processes: [{ kind: "wasm", instance: "#1", memory_mb: 9, uptime_s: 200 }],
