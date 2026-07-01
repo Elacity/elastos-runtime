@@ -206,3 +206,74 @@ export function homeCustodyView(
     intent: intentProofView(intentProof),
   };
 }
+
+// ─────────────────────────── The custody-panel DISPLAY contract ───────────────
+// One tested source of truth for how the three custody channels render — so the Svelte
+// `<CapsuleCustodyPanel>` and the vanilla-JS inspector paint IDENTICALLY (no per-shell
+// label drift). Each row maps an already-decided honest state to a label + optional detail;
+// it adds NO logic (the states come from `homeCustodyView`). There is no "all good" row —
+// a channel can only ever show its own honest sub-state.
+
+/** Honest display labels, one per fail-honest state. Absence is never dressed up as a pass. */
+export const CUSTODY_SPEND_LABEL: Record<SpendState, string> = {
+  unmetered: "Unmetered",
+  ok: "Within budget",
+  warning: "Near budget limit",
+  exhausted: "Budget exhausted",
+};
+export const CUSTODY_AUDIT_LABEL: Record<AuditChainState, string> = {
+  absent: "No durable chain",
+  verified: "Chain verified",
+  broken: "Chain tampered",
+};
+export const CUSTODY_INTENT_LABEL: Record<IntentProofState, string> = {
+  absent: "No agent-intent custody",
+  clean: "Intents within grant",
+  flagged: "Intents flagged",
+};
+
+/** One render-ready custody channel row: channel key, honest state, label, and an optional detail. */
+export interface CustodyRow {
+  channel: "spend" | "audit" | "intent";
+  label: string;
+  state: SpendState | AuditChainState | IntentProofState;
+  value: string;
+  /** The detail line (spent/limit · records · denied·diverged·undelivered), or `null` when none. */
+  detail: string | null;
+}
+
+/**
+ * The three custody rows for a [`HomeCustodyView`], in fixed order (spend, audit, intent).
+ * The single display contract both the Svelte panel and the vanilla inspector consume — so a
+ * verified chain sitting beside an exhausted budget or a flagged intent is never masked, in
+ * ANY shell. Detail rows appear only when meaningful (metered spend / present chain / flagged intent).
+ */
+export function custodyDisplayRows(view: HomeCustodyView): CustodyRow[] {
+  const { spend, audit, intent } = view;
+  return [
+    {
+      channel: "spend",
+      label: "Spend",
+      state: spend.state,
+      value: CUSTODY_SPEND_LABEL[spend.state],
+      detail: spend.metered ? `${spend.spent} / ${spend.limit}` : null,
+    },
+    {
+      channel: "audit",
+      label: "Audit chain",
+      state: audit.state,
+      value: CUSTODY_AUDIT_LABEL[audit.state],
+      detail: audit.present ? `${audit.records} records` : null,
+    },
+    {
+      channel: "intent",
+      label: "Agent intents",
+      state: intent.state,
+      value: CUSTODY_INTENT_LABEL[intent.state],
+      detail:
+        intent.flagged > 0
+          ? `${intent.denied} denied · ${intent.diverged} diverged · ${intent.undelivered} undelivered`
+          : null,
+    },
+  ];
+}

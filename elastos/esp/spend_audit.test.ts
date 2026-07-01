@@ -15,6 +15,7 @@ import type { ChainAttestation } from "./ai_act_audit.js";
 import {
   SPEND_WARNING_FRACTION,
   auditChainView,
+  custodyDisplayRows,
   homeCustodyView,
   intentProofView,
   spendBudgetView,
@@ -210,5 +211,48 @@ describe("homeCustodyView (the Home capsule-detail custody panel)", () => {
     assert.equal(v.audit.state, "verified");
     assert.equal(v.intent.state, "flagged", "a flagged intent verdict is never masked by green spend/audit");
     assert.equal(v.intent.flagged, 3);
+  });
+});
+
+describe("custodyDisplayRows (the one display contract for every shell)", () => {
+  const verified: ChainAttestation = { verified: true, records: 42, signer: "k", error: null };
+  const broken: ChainAttestation = { verified: false, records: 0, signer: "k", error: "tamper" };
+
+  it("returns the three channels in fixed order with honest labels", () => {
+    const rows = custodyDisplayRows(homeCustodyView(null, null));
+    assert.deepEqual(rows.map((r) => r.channel), ["spend", "audit", "intent"]);
+    // Absence renders as absence — never a green/pass affordance.
+    assert.deepEqual(
+      rows.map((r) => r.value),
+      ["Unmetered", "No durable chain", "No agent-intent custody"],
+    );
+    assert.deepEqual(rows.map((r) => r.detail), [null, null, null], "no detail rows when nothing to show");
+  });
+
+  it("keeps the channels INDEPENDENT — a verified chain never masks an exhausted budget or flagged intent", () => {
+    const rows = custodyDisplayRows(
+      homeCustodyView({ limit: 5, spent: 5, remaining: 0 }, verified, { denied: 2, diverged: 1, undelivered: 0 }),
+    );
+    const by = Object.fromEntries(rows.map((r) => [r.channel, r]));
+    assert.equal(by.spend.state, "exhausted");
+    assert.equal(by.spend.value, "Budget exhausted");
+    assert.equal(by.spend.detail, "5 / 5", "metered detail is surfaced");
+    assert.equal(by.audit.state, "verified"); // green chain...
+    assert.equal(by.audit.detail, "42 records");
+    // ...does NOT soften the flagged intent beside it.
+    assert.equal(by.intent.state, "flagged");
+    assert.equal(by.intent.value, "Intents flagged");
+    assert.equal(by.intent.detail, "2 denied · 1 diverged · 0 undelivered");
+  });
+
+  it("a broken chain reads tampered (never verified) and a clean intent reads clean only when present", () => {
+    const rows = custodyDisplayRows(
+      homeCustodyView({ limit: 100, spent: 1, remaining: 99 }, broken, { denied: 0, diverged: 0, undelivered: 0 }),
+    );
+    const by = Object.fromEntries(rows.map((r) => [r.channel, r]));
+    assert.equal(by.audit.value, "Chain tampered");
+    assert.equal(by.spend.value, "Within budget");
+    assert.equal(by.intent.value, "Intents within grant", "present + no issues = clean");
+    assert.equal(by.intent.detail, null, "clean has no flagged-count detail");
   });
 });
