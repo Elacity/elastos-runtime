@@ -216,8 +216,12 @@ exists (`dispatch_standing_act` against `StandingGrantStore`), proven end-to-end
   issue/revoke registry) + `dispatch_standing_act`, which routes a self-declared agent act through
   `run_intent_gate` against a stored standing grant. Proven end-to-end from a real `CapabilityToken`:
   derive the envelope via `from_token` → issue → dispatch (act runs, reconciles matched) → **revoke
-  by token id → the same dispatch is denied and the act never runs** (the autonomy kill switch).
-  **This is "an agent runs unsupervised under this loop" — and can be shut down mid-flight.**
+  by token id → the next dispatch is denied and its act never runs** (the autonomy kill switch).
+  **This is "an agent runs unsupervised under this loop" — and revoking its grant halts its run.**
+  Revocation semantics (honest): the gate re-reads the grant at the START of each dispatch, so a
+  revoke denies every act that has not yet passed the gate. It does NOT interrupt a single act
+  already past the gate and executing (the usual check-then-act window) — it stops the agent's run
+  at the next act, not the one in mid-execution.
 
 NOTE: the gate is deliberately NOT wired into the existing per-act carrier path — that path already
 enforces via validate-and-consume (single-use consent), so re-checking an envelope derived from the

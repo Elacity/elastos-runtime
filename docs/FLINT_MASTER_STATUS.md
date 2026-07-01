@@ -70,6 +70,7 @@ live-on-Mac confirm**: reload the shell → open the inspector → screenshot th
 runtime custody (not sample data). After that, **open the flint→main PR** (step 1; nothing blocks it now).
 > **2a** custody panel mounted (`fd1336a`) · **2b** intent channel LIVE end-to-end (`98d6eea`) · **2c** standing-grant
 > dispatch + kill switch (`fe9211f`, `19e3e9e`, + this). The runtime enforcement loop is now closed: an agent can run
-> unsupervised under a standing grant AND be shut down mid-flight by revoking its token. Gated: elastos-runtime
+> unsupervised under a standing grant AND be halted by revoking its token (the gate re-reads the grant each dispatch,
+> so revocation denies every not-yet-started act). Gated: elastos-runtime
 > intent 29/29, elastos-server 908/908, ESP 89/89. Next build track (optional, post-PR): a gateway verb to
 > issue/revoke standing grants + surface the dispatch on an API route (wire the in-process dispatcher to a shell action).
