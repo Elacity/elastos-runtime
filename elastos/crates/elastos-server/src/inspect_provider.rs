@@ -31,7 +31,8 @@ use elastos_runtime::inspect::InspectScope;
 use elastos_runtime::intent;
 use elastos_runtime::invoke::{self, InvokeError};
 use elastos_runtime::provider::{
-    Provider, ProviderError, ProviderRegistry, ResourceRequest, ResourceResponse,
+    Provider, ProviderError, ProviderInvocation, ProviderInvocationTransport, ProviderRegistry,
+    ProviderTransfer, ResourceRequest, ResourceResponse,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -712,6 +713,11 @@ pub struct InspectProvider {
     source: Arc<dyn InspectSource>,
     audit: Option<Arc<dyn AuditSource>>,
     spend_meter: Option<Arc<elastos_runtime::primitives::spend::SpendMeter>>,
+    /// Weak handle to the shared provider registry, used ONLY by the `dispatch_approved`
+    /// execution op to route an operator-approved provider act. `Weak::new()` (unwired) ⇒
+    /// dispatch fails closed with `runtime_unavailable`; the read-only projection ops never
+    /// touch it. Weak so the inspector (registered ON the registry) does not create a cycle.
+    registry: std::sync::Weak<ProviderRegistry>,
 }
 
 impl InspectProvider {
@@ -720,18 +726,23 @@ impl InspectProvider {
             source,
             audit: None,
             spend_meter: None,
+            registry: std::sync::Weak::new(),
         }
     }
 
-    /// Construct with a provider registry handle (0.5 API compatibility). This inspector is a
-    /// read-only projection and does not dispatch through the registry — 0.5's "approved provider
-    /// dispatch / request_act" surface is a tracked follow-up graft — so the registry is accepted
-    /// for call-site compatibility and intentionally not retained.
+    /// Construct with a handle to the shared provider registry so the `dispatch_approved` op can
+    /// route an operator-approved provider act back through the registry (0.5 approved-provider
+    /// dispatch). The registry is retained as a `Weak` (the inspector is itself registered on the
+    /// registry); all read-only projection ops ignore it, and an unwired handle fails dispatch
+    /// closed rather than acting.
     pub fn with_registry(
         source: Arc<dyn InspectSource>,
-        _registry: std::sync::Weak<ProviderRegistry>,
+        registry: std::sync::Weak<ProviderRegistry>,
     ) -> Self {
-        Self::new(source)
+        Self {
+            registry,
+            ..Self::new(source)
+        }
     }
 
     /// Attach a per-capsule audit source so detail views show live activity.
@@ -1006,6 +1017,152 @@ impl InspectProvider {
         )
     }
 
+    /// The execution-policy descriptor a `dispatch_approved` result advertises: this inspector CAN
+    /// dispatch and mutate through an operator approval (the inbox), unlike the read-only
+    /// projection ops. Static contract, surfaced so a caller can see the surface it is driving.
+    fn approved_execution_policy() -> Value {
+        json!({
+            "schema": "elastos.inspect.execution-policy/v1",
+            "mode": "approved_dispatch",
+            "can_dispatch": true,
+            "can_mutate": true,
+            "approval_surface": "inbox",
+        })
+    }
+
+    /// The provider scheme a capsule serves, parsed from `provides` (e.g. `elastos://wallet/*` →
+    /// `wallet`). Local to the dispatch path so it does not depend on the source-adapter helpers.
+    fn provided_scheme(manifest: &CapsuleManifest) -> Option<String> {
+        manifest
+            .provides
+            .as_ref()?
+            .strip_prefix("elastos://")
+            .and_then(|rest| rest.split('/').next())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Dispatch an operator-APPROVED provider act back through the shared registry (0.5
+    /// approved-provider dispatch — the execution half of the `request_act` intake loop).
+    ///
+    /// Fail-closed throughout: the target must be manifest-backed with provider authority; the
+    /// operation must be DECLARED by that authority (`plan_provider_operation`, not the token
+    /// against itself); the caller-supplied `request` must not predeclare Runtime routing metadata;
+    /// and an unwired registry yields `runtime_unavailable` rather than a silent no-op. Only after
+    /// those gates is the act invoked, tagged `source: "inspect"` so the provider plane can audit
+    /// its origin.
+    async fn dispatch_approved(&self, request: &Value) -> Value {
+        let id = request
+            .get("id")
+            .or_else(|| request.get("capsule_id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if id.is_empty() {
+            return provider_error("invalid_request", "inspect dispatch requires id");
+        }
+        let operation = request
+            .get("operation")
+            .or_else(|| request.get("provider_operation"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if operation.is_empty() {
+            return provider_error("invalid_request", "inspect dispatch requires operation");
+        }
+        let Some(entry) = self.source.inspect_get(id).await else {
+            return provider_error("not_found", "inspect target not found");
+        };
+        let Some(manifest) = entry.manifest.as_ref() else {
+            return provider_error(
+                "invalid_target",
+                "inspect dispatch target is not manifest-backed",
+            );
+        };
+        let Some(authority) = manifest.authority.as_ref() else {
+            return provider_error(
+                "no_authority",
+                "inspect target has no provider authority metadata",
+            );
+        };
+        let Some(target) = Self::provided_scheme(manifest) else {
+            return provider_error(
+                "invalid_target",
+                "inspect dispatch target has no provider scheme",
+            );
+        };
+        let plan = match invoke::plan_provider_operation(authority, operation) {
+            Ok(plan) => plan,
+            Err(InvokeError::UnknownOperation(_)) => {
+                return provider_error(
+                    "unknown_operation",
+                    "operation is not declared by target authority",
+                )
+            }
+            Err(InvokeError::UnknownDeclaredAction(action)) => {
+                return provider_error(
+                    "invalid_authority",
+                    &format!("unknown declared action: {action}"),
+                )
+            }
+            Err(_) => return provider_error("invalid_authority", "invalid authority metadata"),
+        };
+        let mut provider_request = request.get("request").cloned().unwrap_or_else(|| json!({}));
+        if let Some(field) = inspect_hidden_runtime_metadata_field(&provider_request) {
+            return provider_error(
+                "invalid_request",
+                &format!(
+                    "inspect dispatch request must not predeclare Runtime metadata field {field}"
+                ),
+            );
+        }
+        let Some(provider_object) = provider_request.as_object_mut() else {
+            return provider_error(
+                "invalid_request",
+                "inspect dispatch request must be a JSON object",
+            );
+        };
+        provider_object.insert("op".to_string(), Value::String(operation.to_string()));
+
+        let Some(registry) = self.registry.upgrade() else {
+            return provider_error(
+                "runtime_unavailable",
+                "inspect dispatch registry unavailable",
+            );
+        };
+        match registry
+            .invoke_provider(ProviderInvocation {
+                source: "inspect".to_string(),
+                target: target.clone(),
+                op: operation.to_string(),
+                request: provider_request,
+                transfer: ProviderTransfer::Json,
+                range: None,
+                progress: None,
+                transport: ProviderInvocationTransport::Local,
+            })
+            .await
+        {
+            Ok(provider_response) => json!({
+                "status": "ok",
+                "data": {
+                    "schema": "elastos.inspect.dispatch-result/v1",
+                    "mode": "provider_authority",
+                    "id": entry.id,
+                    "provider": entry.name,
+                    "target": target,
+                    "operation": operation,
+                    "capabilities": plan.resources.iter().map(|resource| json!({
+                        "resource": resource,
+                        "actions": plan.actions.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
+                    "audit_events": plan.audit_events,
+                    "execution": Self::approved_execution_policy(),
+                    "provider_response": provider_response,
+                }
+            }),
+            Err(err) => provider_error("dispatch_failed", &err.to_string()),
+        }
+    }
+
     async fn handle_op(&self, request: &Value) -> Value {
         match request.get("op").and_then(Value::as_str).unwrap_or("") {
             // System-scope list. Upstream (gateway allow-list / capability
@@ -1110,6 +1267,11 @@ impl InspectProvider {
             // inspect_op_required_action), so a routine inspect/* Read token cannot
             // reach the cross-capsule capability map. Dispatches nothing.
             "discover" => self.handle_discover(request).await,
+            // Approved-provider DISPATCH (execution): route an operator-approved provider act
+            // through the registry (0.5). Fail-closed — unwired registry / undeclared op / hidden
+            // runtime metadata are all refused before any effect. Distinct from the read-only
+            // `plan`/`intent` previews above, which dispatch nothing.
+            "dispatch_approved" => self.dispatch_approved(request).await,
             other => provider_error("unknown_op", &format!("unknown inspect op: {other}")),
         }
     }
@@ -1381,6 +1543,20 @@ impl Provider for InspectProvider {
 
 fn provider_error(code: &str, message: &str) -> Value {
     json!({ "status": "error", "code": code, "message": message })
+}
+
+/// The first Runtime-routing metadata key a caller must NOT predeclare on an inspect dispatch
+/// request (`_runtime*` invocation/transfer envelopes, or carrier routing). Mirrors the gateway
+/// proxy's guard so an approved dispatch cannot smuggle its own transport/routing intent.
+fn inspect_hidden_runtime_metadata_field(request: &Value) -> Option<&str> {
+    request
+        .as_object()?
+        .keys()
+        .find(|key| {
+            key.starts_with("_runtime")
+                || matches!(key.as_str(), "connect_ticket" | "carrier_route" | "carrier")
+        })
+        .map(String::as_str)
 }
 
 #[cfg(test)]
@@ -2787,5 +2963,130 @@ mod tests {
             !audit_event_is_attested(&attacker_signed, &did, &vk),
             "a signature by a non-runtime DID must be rejected"
         );
+    }
+
+    // ── #2 approved-provider dispatch (`dispatch_approved`) — additive 0.5 graft ──────────
+
+    fn provider_authority_manifest() -> CapsuleManifest {
+        serde_json::from_value(json!({
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "exit-provider",
+            "role": "provider",
+            "type": "wasm",
+            "entrypoint": "exit-provider.wasm",
+            "provides": "elastos://exit/*",
+            "authority": {
+                "reason": "Runtime-owned exit provider",
+                "capabilities": [
+                    { "resource": "elastos://exit/*", "actions": ["read"], "operations": ["status"] },
+                    { "resource": "elastos://exit/*", "actions": ["execute"], "operations": ["open_stream"] }
+                ],
+                "audit_events": ["exit.status", "exit.open.denied"]
+            },
+            "capabilities": []
+        }))
+        .expect("provider authority manifest deserializes")
+    }
+
+    fn provider_authority_entry() -> InspectEntry {
+        InspectEntry {
+            id: "capsule:exit-provider".to_string(),
+            name: "exit-provider".to_string(),
+            status: "running".to_string(),
+            capsule_type: "wasm".to_string(),
+            manifest: Some(provider_authority_manifest()),
+            cid: None,
+            verified_signer: None,
+        }
+    }
+
+    fn provider_with_authority() -> InspectProvider {
+        InspectProvider::new(Arc::new(MockSource {
+            entries: vec![provider_authority_entry()],
+        }))
+    }
+
+    #[tokio::test]
+    async fn dispatch_approved_rejects_capsule_supplied_runtime_metadata() {
+        // A capsule may not smuggle Runtime transport/routing intent into an approved dispatch.
+        let provider = provider_with_authority();
+        for field in [
+            "_runtime_invocation",
+            "_runtime_transfer",
+            "_runtime_probe",
+            "connect_ticket",
+            "carrier_route",
+            "carrier",
+        ] {
+            let resp = provider
+                .send_raw(&json!({
+                    "op": "dispatch_approved",
+                    "id": "capsule:exit-provider",
+                    "operation": "status",
+                    "request": { field: true }
+                }))
+                .await
+                .unwrap();
+            assert_eq!(resp["status"], "error", "{resp}");
+            assert_eq!(resp["code"], "invalid_request");
+            assert!(resp["message"].as_str().unwrap().contains(field), "{resp}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_approved_fails_closed_without_a_registry() {
+        // `new()` leaves the registry unwired (`Weak::new()`). Even a fully-valid, DECLARED op must
+        // refuse to act — `runtime_unavailable`, never a silent dispatch.
+        let provider = provider_with_authority();
+        let resp = provider
+            .send_raw(&json!({
+                "op": "dispatch_approved",
+                "id": "capsule:exit-provider",
+                "operation": "status",
+                "request": {}
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "error", "{resp}");
+        assert_eq!(resp["code"], "runtime_unavailable");
+    }
+
+    #[tokio::test]
+    async fn dispatch_approved_rejects_operation_not_declared_by_authority() {
+        // The op is planned against the target's DECLARED authority, not the token against itself —
+        // an undeclared op is refused before any dispatch (and before the registry is even needed).
+        let provider = provider_with_authority();
+        let resp = provider
+            .send_raw(&json!({
+                "op": "dispatch_approved",
+                "id": "capsule:exit-provider",
+                "operation": "launch",
+                "request": {}
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "error", "{resp}");
+        assert_eq!(resp["code"], "unknown_operation");
+    }
+
+    #[tokio::test]
+    async fn read_only_ops_are_unaffected_by_the_dispatch_graft() {
+        // No-regression guard: adding the registry field + `dispatch_approved` must not disturb the
+        // read-only projection ops. An unwired-registry inspector still lists and details capsules.
+        let provider = provider_with_authority();
+        let listed = provider
+            .send_raw(&json!({ "op": "capsules" }))
+            .await
+            .unwrap();
+        assert_eq!(listed["status"], "ok");
+        assert_eq!(listed["data"]["scope"], "system");
+        assert_eq!(listed["data"]["capsules"][0]["id"], "capsule:exit-provider");
+
+        let detail = provider
+            .send_raw(&json!({ "op": "capsule", "id": "capsule:exit-provider" }))
+            .await
+            .unwrap();
+        assert_eq!(detail["status"], "ok");
     }
 }
