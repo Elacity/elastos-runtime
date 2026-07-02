@@ -35,6 +35,7 @@
 //!   modifications to `elastos-crosvm/`, `elastos-runtime/`,
 //!   `elastos-common/`, or `elastos-compute/` unless the shared Runtime contract
 //!   is intentionally changed.
+//!
 //! [p10]: ../../../PRINCIPLES.md
 //! [p11]: ../../../PRINCIPLES.md
 //!

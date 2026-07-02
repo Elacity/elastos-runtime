@@ -409,10 +409,9 @@ impl RunningVm {
     pub fn supports_hibernation(&self) -> bool {
         #[cfg(target_os = "macos")]
         {
-            return self
-                .handle
+            self.handle
                 .as_ref()
-                .is_some_and(|handle| handle.supports_save_restore());
+                .is_some_and(|handle| handle.supports_save_restore())
         }
         #[cfg(not(target_os = "macos"))]
         {
