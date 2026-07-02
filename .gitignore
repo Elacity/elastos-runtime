@@ -53,8 +53,9 @@ credentials.json
 # Cache
 .elastos/
 
-# Claude Code (user-specific settings)
-.claude/
+# Claude Code (user-specific settings; shared skills are tracked)
+.claude/*
+!.claude/skills/
 
 # External dependencies
 puter-upstream/

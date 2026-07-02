@@ -1,0 +1,17 @@
+---
+description: Branching strategy — apply when creating a new branch or git worktree for a feature, bugfix, or experiment, before choosing a base branch or running git checkout -b, git switch -c, or git worktree add
+globs:
+alwaysApply: false
+---
+
+# Branching Strategy
+
+New work branches start from an `upstream/XX-dev` integration branch (e.g. `upstream/0.6-dev`) — never silently from `main` or from whatever branch is checked out. The user chooses the base; never pick it yourself.
+
+1. `git fetch origin --prune`, then list `upstream/*-dev` lines and active `feat/*`/`fix/*` branches.
+2. Ask the user which base to start from, offering each `upstream/XX-dev` (newest recommended) plus "an existing working branch" for work that depends on another in-flight branch. Ask even when only one dev line exists.
+3. Create the branch as `feat/<slug>` or `fix/<slug>` from the chosen base.
+4. If the base is a working branch rather than `upstream/XX-dev`, warn immediately: it must merge back only after (or together with) its parent, merging into `upstream/XX-dev` may conflict with the parent's changes, and it needs a rebase if the parent moves. Repeat the warning at merge time.
+5. Do not push or set upstream tracking until asked.
+
+Canonical workflow: @.claude/skills/branching-strategy/SKILL.md
