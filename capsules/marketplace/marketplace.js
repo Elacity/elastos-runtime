@@ -295,7 +295,9 @@
   }
 
   function isPopular(name, role, launchable) {
-    return launchable || ["provider", "viewer"].includes(role) || ["object-provider", "content-provider"].includes(name);
+    // Catalog classification by NAME shape only — the marketplace never invokes
+    // provider authority; it just badges runtime-owned provider listings.
+    return launchable || ["provider", "viewer"].includes(role) || name.endsWith("-provider");
   }
 
   function appSortKey(app) {

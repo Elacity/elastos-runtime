@@ -2,7 +2,7 @@
   "schema": "elastos.capsule/v1",
   "name": "creator",
   "version": "0.1.0",
-  "description": "Create portal: a de-privileged app frame that mints a dDRM asset on PQ custody. Drives encrypt-provider (seal_inline_threshold), publish-provider (prepare_publish), wallet (sign), and chain-provider (broadcast) through host-mediated capabilities. Swaps the Lit CEK system for the dKMS threshold escrow (cenc:elastos-pq-hybrid-threshold-v0); holds no keys, no chain RPC, no wallet.",
+  "description": "Create portal: a de-privileged app frame that mints a dDRM asset on PQ custody. Drives encrypt-provider (seal_inline_threshold), publish-provider (prepare_publish), and the host-mediated wallet-sign and chain-broadcast capabilities. Swaps the Lit CEK system for the dKMS threshold escrow (cenc:elastos-pq-hybrid-threshold-v0); holds no keys, no chain RPC, no wallet.",
   "role": "app",
   "type": "data",
   "author": "elastos",

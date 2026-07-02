@@ -1,11 +1,11 @@
 // ddrm-viewer — protected NON-MEDIA viewer (satisfies elastos.viewer/document@1).
 //
-// Containment contract (mirrors elacity-player + the runtime decrypt boundary):
+// Containment contract (mirrors the protected media player + the runtime decrypt boundary):
 // this capsule renders an owned, protected asset (image / PDF / text / code / 3D)
 // by fetching the ALREADY-DECRYPTED object bytes through an opaque per-open SESSION
 // handle and the runtime's scoped object route. It never sees — and never asks for
 // — the CEK, the IV, the key-release receipt, or any KMS/wallet/chain material. The
-// decrypt happens in the decrypt-provider sandbox; only the cleartext object crosses
+// decrypt happens in the runtime decrypt sandbox; only the cleartext object crosses
 // to the viewer. We additionally assert the manifest carries no key fields and fail
 // closed if it does.
 //

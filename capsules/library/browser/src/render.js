@@ -158,7 +158,7 @@ export function createLibraryRenderer({
     const tag = getTag(object.uri);
     const tagHex = tag ? tagColor(tag)?.hex || "#9aa0a6" : "";
     // List view keeps the right-aligned badge dot (a separate cell). Grid view uses an inline dot
-    // placed just left of the centered filename — like Finder — so it never displaces the icon.
+    // placed just left of the centered filename — desktop file-manager style — so it never displaces the icon.
     const tagMarkup = tag
       ? `<span class="item-tag" style="--tag-color:${escapeHtml(tagHex)}" title="Tag: ${escapeHtml(tag)}" aria-label="Tag: ${escapeHtml(tag)}"></span>`
       : "";

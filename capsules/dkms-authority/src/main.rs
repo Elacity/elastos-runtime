@@ -173,7 +173,7 @@ fn replay_guard() -> &'static std::sync::Mutex<ddrm_envelope::access::ReplayGuar
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 // The `recover` variant is intentionally wide (it carries the full recover bundle); these are
 // short-lived protocol messages, so the size asymmetry across variants is not worth boxing.
 #[allow(clippy::large_enum_variant)]

@@ -14,8 +14,8 @@
 // THE SPINE THE HOST ROUTE DRIVES (already-proven providers):
 //   encrypt-provider seal_inline_threshold  -> escrow CEK shares to the 2-of-3 quorum
 //   publish-provider  prepare_publish        -> unsigned mint (contentId == bytes16 KID)
-//   wallet            sign                    -> sign the mint
-//   chain-provider    broadcast_transaction   -> broadcast to the chosen channel
+//   wallet (host)     sign                    -> sign the mint
+//   chain (host)      broadcast_transaction   -> broadcast to the chosen channel
 // The CEK custody block is the dKMS escrow descriptor (cenc:elastos-pq-hybrid-threshold-v0),
 // swapped in where PC2's creator wrote Lit (litCiphertext / litBackend:'chipotle').
 
@@ -249,7 +249,7 @@ function classifyMedia(mime) {
 // Extension → MIME for types browsers report unreliably (often "" or octet-stream). The MIME we
 // persist drives the viewer routing (EPUB→html-lock reader, CBZ→comic pager, 3D→model viewer,
 // PDF/image/text→pixel-lock), so a correct type here is what makes each asset open in the right
-// viewer. Mirrors PC2's creator (elacity-creator app.js) so the on-chain metadata stays aligned.
+// viewer. Mirrors PC2's legacy creator app so the on-chain metadata stays aligned.
 const EXT_MIME = {
   epub: "application/epub+zip",
   cbz: "application/vnd.comicbook+zip",
@@ -633,7 +633,7 @@ async function preflight() {
 }
 
 // ── cover thumbnail generation (browser-side; the frame already holds the bytes) ─────────────
-// Mirrors PC2's `elacity-creator` cascade (app.js:4265): a degraded, public teaser derived from
+// Mirrors PC2's legacy creator cascade: a degraded, public teaser derived from
 // the asset. Custom upload wins; otherwise a low-res BLURRED still for images, a frame for video,
 // a synthetic waveform for audio, a canvas teaser for text, and a generative gradient template
 // for anything else. The host pins whatever bytes come back and sets `metadata.image`.
@@ -985,8 +985,9 @@ async function mint() {
     setStep("encrypt", "done");
     setStep("publish", "done");
     // The runtime prepared everything AND queued a wallet approval for the mint
-    // transaction. The user completes it in the Wallet app (eth_sendTransaction),
-    // so the OWNER is msg.sender / the on-chain creator. The runtime never signs.
+    // transaction. The user completes it in the Wallet app (a send-transaction
+    // approval), so the OWNER is msg.sender / the on-chain creator. The runtime
+    // never signs.
     const id = result.content_id || result.kid || "";
     // Pin every subsequent confirm/approve check to THIS asset's KID.
     currentMintContentId = id;

@@ -768,7 +768,7 @@ import { createLibraryUploads } from "./uploads.js";
       scheduleContentRender();
     }
 
-    // A Finder-style colour-tag row: seven dots + Clear. A dot already on every selected item is
+    // A file-manager-style colour-tag row: seven dots + Clear. A dot already on every selected item is
     // shown active; clicking it toggles it off. Returns a custom menu entry that builds its own DOM.
     function tagsMenuRow(objects) {
       const uris = objects.map((object) => object.uri).filter(Boolean);

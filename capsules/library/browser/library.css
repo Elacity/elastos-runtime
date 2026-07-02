@@ -991,7 +991,7 @@
       color: rgba(255, 255, 255, 0.74);
     }
 
-    /* Finder-style colour-tag row in the context menu: seven dots + a clear button. */
+    /* file-manager-style colour-tag row in the context menu: seven dots + a clear button. */
     .menu-tags-row {
       display: flex;
       align-items: center;
@@ -1062,7 +1062,7 @@
     }
 
     /* Grid view: the right-aligned badge dot is an explicit grid cell, which displaced the
-       auto-placed icon. Hide it in grid and use the inline dot inside the name instead (Finder
+       auto-placed icon. Hide it in grid and use the inline dot inside the name instead (file-manager
        style — sits just left of the centered filename, never moving the icon). */
     .content[data-view="grid"] .item-tag {
       display: none;

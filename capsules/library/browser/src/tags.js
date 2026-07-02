@@ -1,7 +1,7 @@
-// Finder-style colour tags for library items. Stored LOCALLY (this browser, via localStorage)
+// File-manager-style colour tags for library items. Stored LOCALLY (this browser, via localStorage)
 // keyed by object URI — instant and backend-free, an organisation/testing aid that never touches
 // the trusted runtime. A single colour per item (clicking a colour toggles it; "Clear" removes).
-// The seven colours mirror macOS Finder's tag palette.
+// The seven colours use a familiar desktop tag palette.
 
 const STORAGE_KEY = "elastos.library.tags.v1";
 
