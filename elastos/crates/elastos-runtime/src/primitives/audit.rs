@@ -759,22 +759,47 @@ impl AuditLog {
                     rec.seq
                 ));
             }
-            // Signature (when the record claims one and a verifying key was supplied).
-            if rec.alg == AUDIT_SIG_ALG_ED25519 {
-                let vk = verifying_key.ok_or_else(|| {
-                    format!(
-                        "seq {}: record is ed25519-signed but no verifying key was supplied",
-                        rec.seq
-                    )
-                })?;
-                let sig_bytes = BASE64
-                    .decode(&rec.sig)
-                    .map_err(|e| format!("seq {}: bad signature base64: {e}", rec.seq))?;
-                let signature = Signature::from_slice(&sig_bytes)
-                    .map_err(|e| format!("seq {}: malformed signature: {e}", rec.seq))?;
-                vk.verify(&computed, &signature).map_err(|_| {
-                    format!("audit tamper at seq {}: signature does not verify", rec.seq)
-                })?;
+            // Signature check. SECURITY (audit T4 — signature-downgrade): the
+            // `alg` field is NOT part of the hashed preimage (see
+            // `compute_record_hash`), so an offline editor with NO signing key
+            // could otherwise rewrite events, recompute the (public) record_hash,
+            // relink the chain, set `alg="none"`, drop `sig`, and pass — forging
+            // a "verified" chain still advertising the real signer. Defeat that
+            // by making the decision to check the signature independent of the
+            // forgeable `alg`: whenever a verifying key is supplied (custody /
+            // tamper-evidence mode), EVERY record MUST be ed25519-signed and
+            // verify. A non-`ed25519` alg in a signed chain is a downgrade, not
+            // an "unsigned record to skip".
+            match verifying_key {
+                Some(vk) => {
+                    if rec.alg != AUDIT_SIG_ALG_ED25519 {
+                        return Err(format!(
+                            "audit tamper at seq {}: record is not ed25519-signed (alg={:?}) \
+                             in a signed chain — signature downgrade refused",
+                            rec.seq, rec.alg
+                        ));
+                    }
+                    let sig_bytes = BASE64
+                        .decode(&rec.sig)
+                        .map_err(|e| format!("seq {}: bad signature base64: {e}", rec.seq))?;
+                    let signature = Signature::from_slice(&sig_bytes)
+                        .map_err(|e| format!("seq {}: malformed signature: {e}", rec.seq))?;
+                    vk.verify(&computed, &signature).map_err(|_| {
+                        format!("audit tamper at seq {}: signature does not verify", rec.seq)
+                    })?;
+                }
+                None => {
+                    // No key to verify against (unsigned / memory-only mode). We
+                    // cannot validate a claimed signature, so refuse to report a
+                    // signed chain as "verified" without its key rather than
+                    // silently skipping — preserves the prior fail-closed stance.
+                    if rec.alg == AUDIT_SIG_ALG_ED25519 {
+                        return Err(format!(
+                            "seq {}: record is ed25519-signed but no verifying key was supplied",
+                            rec.seq
+                        ));
+                    }
+                }
             }
             expected_prev = computed;
             expected_seq += 1;
@@ -1600,6 +1625,61 @@ mod tests {
         assert!(
             err.contains("tamper"),
             "a content edit must be detected: {err}"
+        );
+    }
+
+    /// Audit T4: an offline attacker with NO signing key rewrites the event
+    /// history, recomputes every (public) record_hash so the chain still links,
+    /// then STRIPS the signatures (alg="none", sig=""). Because alg/sig are not
+    /// in the hash preimage, pre-T4 this forged chain verified clean under the
+    /// real signer. After T4, a verifying key means every record MUST be
+    /// ed25519-signed, so the downgrade is refused fail-closed.
+    #[test]
+    fn signature_downgrade_forgery_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let log = AuditLog::with_file(&path).unwrap();
+        log.content_open(
+            "s",
+            "person:local:alice",
+            "elastos://c/1",
+            "view",
+            "opened",
+            "src",
+            None,
+        )
+        .unwrap();
+        log.runtime_stop();
+        let vk = read_verifying_key(&log);
+        assert!(log.verify_chain(Some(&vk)).is_ok(), "baseline signed chain verifies");
+
+        // Forge: edit the custody record, recompute record_hash + relink, strip sig.
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut prev = genesis_prev_hash();
+        let mut forged = Vec::new();
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            let mut rec: ChainedRecord = serde_json::from_str(line).unwrap();
+            let event_json = serde_json::to_string(&rec.event)
+                .unwrap()
+                .replacen("person:local:alice", "person:local:mallory", 1);
+            rec.event = serde_json::from_str(&event_json).unwrap();
+            let re_event = serde_json::to_string(&rec.event).unwrap();
+            let h = compute_record_hash(rec.seq, &prev, re_event.as_bytes());
+            rec.prev_hash = hex::encode(prev);
+            rec.record_hash = hex::encode(h);
+            rec.alg = "none".to_string();
+            rec.sig = String::new();
+            prev = h;
+            forged.push(serde_json::to_string(&rec).unwrap());
+        }
+        std::fs::write(&path, format!("{}\n", forged.join("\n"))).unwrap();
+
+        // The hash-chain itself is internally consistent (attacker recomputed it),
+        // so ONLY the mandatory-signature rule catches the forgery.
+        let err = log.verify_chain(Some(&vk)).unwrap_err();
+        assert!(
+            err.contains("downgrade") || err.contains("not ed25519-signed"),
+            "an alg-downgrade forgery must be refused: {err}"
         );
     }
 
