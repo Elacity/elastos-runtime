@@ -97,6 +97,12 @@ const OPERATOR_VK_ENV: &str = "DKMS_AUTHORITY_OPERATOR_VK";
 /// credential, the analogue of PC2's session TTL (`mediaSessionManager` lifetime).
 const SESSION_TTL_SECONDS: u64 = 300;
 
+/// Per-connection read timeout (ELACITY-2282 Defect A insurance). Bounds an idle/stalled read so a
+/// leaked or abandoned client connection can never camp its serving thread forever; the read then
+/// errors and the connection thread ends. Applied on BOTH the Unix and TCP serve loops. A live
+/// pooled client re-establishes on the next release if it idled past this window.
+const CONNECTION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A node-issued, node-signed SESSION TOKEN: it binds the client's handshake `challenge` AND the
 /// caller's ephemeral PUBLIC key (`caller_pub_b64`) to an `expires_at`, and the node SIGNS
 /// `(challenge, caller_pub, expires_at)` with its master-derived key. The node REQUIRES one on every
@@ -2078,11 +2084,30 @@ fn serve_socket(path: &str) {
     if operator_vk.is_some() {
         eprintln!("dkms-authority: operator identity pinned (lifecycle ops enabled)");
     }
-    let mut revoked_callers: Vec<Vec<u8>> = Vec::new();
     eprintln!("dkms-authority: listening on {path}");
+    serve_unix_listener(listener, allowed_callers, operator_vk);
+}
+
+/// The Unix accept loop, factored out of [`serve_socket`] so it can be driven over a test-owned
+/// listener. Each accepted connection is served on its OWN thread so a single idle/slow/leaked
+/// client can never head-of-line-block the others (ELACITY-2282): the daemon always returns to
+/// `accept`. Revocations are daemon-lifetime state shared across the connection threads.
+#[cfg(unix)]
+fn serve_unix_listener(
+    listener: std::os::unix::net::UnixListener,
+    allowed_callers: Option<Vec<Vec<u8>>>,
+    operator_vk: Option<Vec<u8>>,
+) {
+    use std::sync::{Arc, Mutex};
+    let allowed_callers = Arc::new(allowed_callers);
+    let operator_vk = Arc::new(operator_vk);
+    let revoked_callers: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                // Insurance (ELACITY-2282 Defect A): bound reads so a stalled/abandoned client can't
+                // camp its connection thread forever — read_frame then errors and the thread ends.
+                let _ = stream.set_read_timeout(Some(CONNECTION_READ_TIMEOUT));
                 let reader = match stream.try_clone() {
                     Ok(s) => io::BufReader::new(s),
                     Err(err) => {
@@ -2090,13 +2115,51 @@ fn serve_socket(path: &str) {
                         continue;
                     }
                 };
+                let allowed = Arc::clone(&allowed_callers);
+                let operator = Arc::clone(&operator_vk);
+                let revoked = Arc::clone(&revoked_callers);
                 // The Unix transport is host-local (filesystem-permissioned), so the encrypted
                 // channel is OPTIONAL here — a client that offers a channel key still gets one.
-                serve_connection_io(reader, stream, &allowed_callers, &operator_vk, &mut revoked_callers, false);
+                std::thread::spawn(move || {
+                    serve_connection_threaded(reader, stream, &allowed, &operator, &revoked, false);
+                });
             }
             Err(err) => {
                 eprintln!("dkms-authority: accept error: {err}");
                 continue;
+            }
+        }
+    }
+}
+
+/// Per-connection wrapper (ELACITY-2282): snapshot the daemon-lifetime revoked-caller set under the
+/// lock, serve the connection, then union any revocations this connection performed back into the
+/// shared set (revocations are additive + idempotent, so a union is safe under concurrency and a
+/// caller revoked on one connection stays revoked for every future one).
+fn serve_connection_threaded<R: io::Read, W: io::Write>(
+    reader: R,
+    writer: W,
+    allowed_callers: &Option<Vec<Vec<u8>>>,
+    operator_vk: &Option<Vec<u8>>,
+    revoked_callers: &std::sync::Mutex<Vec<Vec<u8>>>,
+    require_channel: bool,
+) {
+    let mut local = revoked_callers
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    serve_connection_io(
+        reader,
+        writer,
+        allowed_callers,
+        operator_vk,
+        &mut local,
+        require_channel,
+    );
+    if let Ok(mut guard) = revoked_callers.lock() {
+        for vk in local {
+            if !guard.iter().any(|existing| existing == &vk) {
+                guard.push(vk);
             }
         }
     }
@@ -2127,14 +2190,29 @@ fn serve_tcp(addr: &str) {
     if operator_vk.is_some() {
         eprintln!("dkms-authority: operator identity pinned (lifecycle ops enabled)");
     }
-    let mut revoked_callers: Vec<Vec<u8>> = Vec::new();
     eprintln!("dkms-authority: listening on tcp:{addr}");
+    serve_tcp_listener(listener, allowed_callers, operator_vk);
+}
+
+/// The TCP accept loop, factored out of [`serve_tcp`]. Like the Unix loop, each accepted connection
+/// is served on its OWN thread (ELACITY-2282) so a stalled remote peer can never wedge the daemon;
+/// every recover on this hostile transport still REQUIRES the encrypted, mutually-authenticated
+/// channel (`require_channel = true`).
+#[cfg(unix)]
+fn serve_tcp_listener(
+    listener: std::net::TcpListener,
+    allowed_callers: Option<Vec<Vec<u8>>>,
+    operator_vk: Option<Vec<u8>>,
+) {
+    use std::sync::{Arc, Mutex};
+    let allowed_callers = Arc::new(allowed_callers);
+    let operator_vk = Arc::new(operator_vk);
+    let revoked_callers: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                // NETWORK-FAULT SEMANTICS: a stalled remote peer must not wedge the sequential
-                // daemon — bound every read so the listener always gets back to `accept`.
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+                // NETWORK-FAULT SEMANTICS: bound every read so a stalled peer can't camp its thread.
+                let _ = stream.set_read_timeout(Some(CONNECTION_READ_TIMEOUT));
                 let reader = match stream.try_clone() {
                     Ok(s) => io::BufReader::new(s),
                     Err(err) => {
@@ -2142,7 +2220,12 @@ fn serve_tcp(addr: &str) {
                         continue;
                     }
                 };
-                serve_connection_io(reader, stream, &allowed_callers, &operator_vk, &mut revoked_callers, true);
+                let allowed = Arc::clone(&allowed_callers);
+                let operator = Arc::clone(&operator_vk);
+                let revoked = Arc::clone(&revoked_callers);
+                std::thread::spawn(move || {
+                    serve_connection_threaded(reader, stream, &allowed, &operator, &revoked, true);
+                });
             }
             Err(err) => {
                 eprintln!("dkms-authority: accept error: {err}");
@@ -2413,6 +2496,54 @@ mod tests {
             .join(format!("dkms-node-{tag}-{}-{nanos}.json", std::process::id()))
             .to_string_lossy()
             .into_owned()
+    }
+
+    /// A SHORT temp Unix-socket path — macOS `sun_path` is only 104 bytes and `temp_dir()` is long,
+    /// so bind under `/tmp` to stay well under the limit.
+    #[cfg(unix)]
+    fn unique_socket_path(tag: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("/tmp/dkms-{tag}-{}-{nanos}.sock", std::process::id())
+    }
+
+    /// ELACITY-2282 (regression): a single idle client must NOT head-of-line-block the accept loop.
+    /// Drive the real Unix accept loop (`serve_unix_listener`) with connection A held idle — it never
+    /// sends a frame, so its serving read blocks — and assert a SECOND client B is still served
+    /// promptly. Before the thread-per-connection fix, A wedged the sequential loop and B starved in
+    /// the kernel backlog until the client's hard cap → fail-closed quorum.
+    #[test]
+    #[cfg(unix)]
+    fn idle_connection_does_not_block_other_clients() {
+        use ddrm_envelope::frame::{read_frame, write_frame};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::time::Duration;
+
+        let path = unique_socket_path("hol");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        // Anonymous (no allow-list), no operator — `status` is a public message that answers here.
+        std::thread::spawn(move || serve_unix_listener(listener, None, None));
+
+        // Client A connects and stays IDLE (sends nothing): its serving thread blocks in read_frame.
+        let idle = UnixStream::connect(&path).unwrap();
+        std::thread::sleep(Duration::from_millis(150)); // let A be accepted + block
+
+        // Client B must still be served promptly while A is idle.
+        let mut b = UnixStream::connect(&path).unwrap();
+        b.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        write_frame(&mut b, &serde_json::to_vec(&json!({ "op": "status" })).unwrap()).unwrap();
+        let resp = read_frame(&mut b)
+            .expect("client B must be served while A is idle (no head-of-line block)")
+            .expect("a framed response");
+        let resp: Value = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(resp["status"].as_str().unwrap(), "ok");
+        assert_eq!(resp["data"]["provider"].as_str().unwrap(), "dkms-authority");
+
+        drop(idle);
+        let _ = std::fs::remove_file(&path);
     }
 
     const CONTENT: &str = "bafybeigdyrcontent";

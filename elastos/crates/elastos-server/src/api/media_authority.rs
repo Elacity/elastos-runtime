@@ -109,6 +109,45 @@ struct ProcIo {
     stdout: BufReader<ChildStdout>,
 }
 
+/// Kills + reaps its child on drop unless `disarm`ed. A helper is spawned and then several fallible
+/// steps read its one-line descriptor BEFORE it's wrapped in a (Drop-reaping) `MediaAuthorityProc`;
+/// on any of those error paths the raw `Child` would otherwise leak — Rust's `Child::drop` neither
+/// kills nor waits, so it lingers as a running proc OR an unreaped zombie ("exited before publishing
+/// a session"), and the 3-attempt open retry loop piles these up (ELACITY-2282 Defect B). This guard
+/// closes that gap: on success `disarm()` hands the child to the proc; on any early return it's reaped.
+struct ChildReaper(Option<Child>);
+
+impl ChildReaper {
+    fn arm(child: Child) -> Self {
+        Self(Some(child))
+    }
+    fn take_stdin(&mut self) -> Result<ChildStdin, String> {
+        self.0
+            .as_mut()
+            .and_then(|c| c.stdin.take())
+            .ok_or_else(|| "no stdin".to_string())
+    }
+    fn take_stdout(&mut self) -> Result<ChildStdout, String> {
+        self.0
+            .as_mut()
+            .and_then(|c| c.stdout.take())
+            .ok_or_else(|| "no stdout".to_string())
+    }
+    /// Success path: transfer the child out to the caller, disarming the reaper.
+    fn disarm(mut self) -> Child {
+        self.0.take().expect("child present until disarm")
+    }
+}
+
+impl Drop for ChildReaper {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 impl MediaAuthorityProc {
     /// Spawn the helper, read its one-line session descriptor, and return a handle.
     /// `object_cid`, when set, binds the decrypt transcript to the real owned object's
@@ -132,14 +171,15 @@ impl MediaAuthorityProc {
         if let Some(binding) = rights_binding {
             cmd.args(["--rights-binding", binding]);
         }
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| format!("spawn media-authority ({helper_bin}): {e}"))?;
-        let stdin = child.stdin.take().ok_or("no stdin")?;
-        let mut stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?);
+        let mut reaper = ChildReaper::arm(
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .map_err(|e| format!("spawn media-authority ({helper_bin}): {e}"))?,
+        );
+        let stdin = reaper.take_stdin()?;
+        let mut stdout = BufReader::new(reaper.take_stdout()?);
 
         let mut line = String::new();
         let n = stdout
@@ -175,7 +215,7 @@ impl MediaAuthorityProc {
             .unwrap_or_default();
 
         Ok(Self {
-            child,
+            child: reaper.disarm(),
             io: Mutex::new(ProcIo { stdin, stdout }),
             mime,
             segment_count,
@@ -231,14 +271,15 @@ impl MediaAuthorityProc {
         if let Some(grant) = access_grant_b64.filter(|s| !s.trim().is_empty()) {
             cmd.args(["--access-grant", grant]);
         }
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| format!("spawn quorum media-authority ({helper_bin}): {e}"))?;
-        let stdin = child.stdin.take().ok_or("no stdin")?;
-        let mut stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?);
+        let mut reaper = ChildReaper::arm(
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .map_err(|e| format!("spawn quorum media-authority ({helper_bin}): {e}"))?,
+        );
+        let stdin = reaper.take_stdin()?;
+        let mut stdout = BufReader::new(reaper.take_stdout()?);
 
         let mut line = String::new();
         let n = stdout
@@ -309,7 +350,7 @@ impl MediaAuthorityProc {
         };
 
         Ok(Self {
-            child,
+            child: reaper.disarm(),
             io: Mutex::new(ProcIo { stdin, stdout }),
             mime,
             segment_count,
