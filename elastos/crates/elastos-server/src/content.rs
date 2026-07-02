@@ -1804,22 +1804,14 @@ impl ContentExternalRepairFleetEndpoint {
 }
 
 fn validate_operator_alert_sink_url(raw: &str) -> Result<(), String> {
-    let url = url::Url::parse(raw).map_err(|err| format!("invalid operator alert URL: {err}"))?;
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("operator alert URL must not contain inline credentials".to_string());
-    }
-    match url.scheme() {
-        "https" => Ok(()),
-        "http" if matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1")) => Ok(()),
-        _ => Err("operator alert URL must use https or local loopback http".to_string()),
-    }
+    crate::net_validation::validate_outbound_endpoint_url(raw, "operator alert")
 }
 
 fn validate_operator_alert_header_value(value: &str) -> Result<(), String> {
-    if value.bytes().any(|byte| matches!(byte, b'\r' | b'\n')) {
-        return Err("operator alert authorization header contains invalid newline".to_string());
-    }
-    Ok(())
+    crate::net_validation::validate_outbound_header_value(
+        value,
+        "operator alert authorization header",
+    )
 }
 
 fn federated_operator_alert_exchange_request(alert: &Value, emitted_at: u64) -> Value {
@@ -8083,21 +8075,7 @@ fn is_valid_cid(value: &str) -> bool {
 }
 
 fn validate_content_path(path: &str) -> Result<(), String> {
-    if path.is_empty() {
-        return Ok(());
-    }
-    if path.starts_with('/') || path.starts_with('\\') {
-        return Err("content fetch path must be relative".to_string());
-    }
-    if path.contains('\\') || path.contains('\0') {
-        return Err("content fetch path contains invalid characters".to_string());
-    }
-    for segment in path.split('/') {
-        if segment.is_empty() || segment == "." || segment == ".." {
-            return Err("content fetch path contains an invalid segment".to_string());
-        }
-    }
-    Ok(())
+    crate::net_validation::validate_content_path(path)
 }
 
 fn with_directory_object_manifest(
