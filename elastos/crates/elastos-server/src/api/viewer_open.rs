@@ -497,16 +497,44 @@ pub async fn open_owned_in_viewer(
                 .into_response();
         }
     };
-    if let Err(e) = audit.content_open(
-        &session_id,
-        &context.principal_id,
-        &object_cid,
-        "open",
-        "opened",
-        &rights.source,
-        grant_digest.as_deref(),
-    ) {
-        tracing::error!("AUDIT content_open(opened) append failed; refusing the open: {e}");
+    // `content_open` -> `emit` does a synchronous fsync; run it on a blocking
+    // thread so the dDRM open path does not park a tokio worker on disk I/O.
+    // The fail-closed contract is unchanged: the open proceeds ONLY on
+    // Ok(Ok(())); an emit failure OR a join failure (Err(_)) refuses the open —
+    // content whose open cannot be durably, tamper-evidently recorded does not
+    // happen.
+    let content_open_result = {
+        let audit = audit.clone();
+        let session_id = session_id.clone();
+        let principal_id = context.principal_id.clone();
+        let object_cid = object_cid.clone();
+        let source = rights.source.clone();
+        let grant_digest = grant_digest.clone();
+        tokio::task::spawn_blocking(move || {
+            audit.content_open(
+                &session_id,
+                &principal_id,
+                &object_cid,
+                "open",
+                "opened",
+                &source,
+                grant_digest.as_deref(),
+            )
+        })
+        .await
+    };
+    if !matches!(content_open_result, Ok(Ok(()))) {
+        match content_open_result {
+            Ok(Err(e)) => {
+                tracing::error!("AUDIT content_open(opened) append failed; refusing the open: {e}")
+            }
+            Err(join_err) => {
+                tracing::error!(
+                    "AUDIT content_open(opened) task failed; refusing the open: {join_err}"
+                )
+            }
+            Ok(Ok(())) => unreachable!(),
+        }
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "audit log unavailable; refusing to open without a custody record",
