@@ -67,6 +67,152 @@ const KDF_LABEL: &[u8] = b"elastos-pq-hybrid-threshold-v0/cek-wrap/v1";
 /// The decrypt-material suite tag this envelope implements.
 pub const SUITE_PQ_HYBRID: &str = "elastos-pq-hybrid-threshold-v0";
 
+/// MPEG Common Encryption (CENC, ISO/IEC 23001-7) Protection System Specific Header (`pssh`) box
+/// construction + parsing for the Elacity PQ-hybrid-threshold scheme. Lives HERE (shared) so the
+/// producer (gateway mint), the runtime decrypt read-path, and both playback clients agree on ONE
+/// wire form and can never drift (Principle 12). The PSSH `Data` payload carries the scheme's
+/// `.asset.protections` slot as JSON — the same envelope the media-player license handlers consume
+/// — so emitting it has the same outcome as `mp4dash --pssh <systemId>:pssh.json`.
+///
+/// `build_pssh`/`parse_pssh` use only std (no optional deps) so any consumer gets them in the
+/// default feature set without opting into `access-grant`.
+pub mod pssh {
+    /// Registered DRM System ID for `cenc:elastos-pq-hybrid-threshold-v0`.
+    /// UUID `b6e254ef-0dc5-47fe-94e7-0e72ed1dc7b0` · PSSH base64 `tuJU7w3FR/6U5w5y7R3HsA==`.
+    pub const ELASTOS_PQ_SYSTEM_ID: [u8; 16] = [
+        0xb6, 0xe2, 0x54, 0xef, 0x0d, 0xc5, 0x47, 0xfe, 0x94, 0xe7, 0x0e, 0x72, 0xed, 0x1d, 0xc7,
+        0xb0,
+    ];
+
+    /// A parsed `pssh` box (version 0 or 1).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct PsshBox {
+        pub system_id: [u8; 16],
+        pub kids: Vec<[u8; 16]>,
+        pub data: Vec<u8>,
+    }
+
+    /// Build a **version-1** `pssh` box (ISO/IEC 23001-7 §8.1) for `system_id`, listing `kids` as
+    /// the embedded default-KID set and carrying `data` as the opaque key-acquisition payload.
+    /// Version 1 is used so CENC players that key on the in-box KID list can resolve the asset.
+    ///
+    /// Layout: `size:u32be ‖ "pssh" ‖ version=1:u8 ‖ flags:[0;3] ‖ system_id:16 ‖ kid_count:u32be ‖
+    /// kids:(16·n) ‖ data_size:u32be ‖ data`.
+    pub fn build_pssh(system_id: &[u8; 16], kids: &[[u8; 16]], data: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(1u8); // version
+        body.extend_from_slice(&[0u8, 0, 0]); // flags
+        body.extend_from_slice(system_id);
+        body.extend_from_slice(&(kids.len() as u32).to_be_bytes());
+        for kid in kids {
+            body.extend_from_slice(kid);
+        }
+        body.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        body.extend_from_slice(data);
+
+        let total = 8 + body.len(); // 4 (size) + 4 ("pssh")
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(&(total as u32).to_be_bytes());
+        out.extend_from_slice(b"pssh");
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// Parse a single `pssh` box (version 0 = no KID list, version 1 = KID list). Returns `None` on
+    /// malformed input. Tolerant of trailing bytes after the box (e.g. when handed a slice of a
+    /// larger `moov`): the declared `size` bounds the read.
+    pub fn parse_pssh(bytes: &[u8]) -> Option<PsshBox> {
+        if bytes.len() < 12 || &bytes[4..8] != b"pssh" {
+            return None;
+        }
+        let size = u32::from_be_bytes(bytes[0..4].try_into().ok()?) as usize;
+        // size == 0 is not used for pssh here; otherwise the box is exactly `size` bytes.
+        let end = if size == 0 {
+            bytes.len()
+        } else {
+            size.min(bytes.len())
+        };
+        let buf = &bytes[..end];
+        let version = *buf.get(8)?;
+        // buf[9..12] = flags (ignored)
+        let mut off = 12usize;
+        let system_id: [u8; 16] = buf.get(off..off + 16)?.try_into().ok()?;
+        off += 16;
+        let mut kids = Vec::new();
+        if version >= 1 {
+            let kid_count = u32::from_be_bytes(buf.get(off..off + 4)?.try_into().ok()?) as usize;
+            off += 4;
+            for _ in 0..kid_count {
+                let kid: [u8; 16] = buf.get(off..off + 16)?.try_into().ok()?;
+                off += 16;
+                kids.push(kid);
+            }
+        }
+        let data_len = u32::from_be_bytes(buf.get(off..off + 4)?.try_into().ok()?) as usize;
+        off += 4;
+        let data = buf.get(off..off + data_len)?.to_vec();
+        Some(PsshBox {
+            system_id,
+            kids,
+            data,
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn system_id_is_the_assigned_uuid() {
+            // b6e254ef-0dc5-47fe-94e7-0e72ed1dc7b0 (base64 tuJU7w3FR/6U5w5y7R3HsA==).
+            assert_eq!(
+                ELASTOS_PQ_SYSTEM_ID,
+                [
+                    0xb6, 0xe2, 0x54, 0xef, 0x0d, 0xc5, 0x47, 0xfe, 0x94, 0xe7, 0x0e, 0x72, 0xed,
+                    0x1d, 0xc7, 0xb0
+                ]
+            );
+        }
+
+        #[test]
+        fn build_then_parse_roundtrips() {
+            let kid = [0xabu8; 16];
+            let data = br#"{"protectionType":"cenc:elastos-pq-hybrid-threshold-v0"}"#;
+            let boxed = build_pssh(&ELASTOS_PQ_SYSTEM_ID, &[kid], data);
+
+            // header sanity: size matches, type is "pssh", version 1.
+            assert_eq!(&boxed[4..8], b"pssh");
+            assert_eq!(boxed[8], 1);
+            assert_eq!(
+                u32::from_be_bytes(boxed[0..4].try_into().unwrap()) as usize,
+                boxed.len()
+            );
+
+            let parsed = parse_pssh(&boxed).expect("parse");
+            assert_eq!(parsed.system_id, ELASTOS_PQ_SYSTEM_ID);
+            assert_eq!(parsed.kids, vec![kid]);
+            assert_eq!(parsed.data, data);
+        }
+
+        #[test]
+        fn parse_rejects_short_and_wrong_type() {
+            assert!(parse_pssh(b"short").is_none());
+            let mut b = build_pssh(&ELASTOS_PQ_SYSTEM_ID, &[], b"x");
+            b[4] = b'm'; // "pssh" -> "mssh"
+            assert!(parse_pssh(&b).is_none());
+        }
+
+        #[test]
+        fn parse_tolerates_trailing_moov_bytes() {
+            let mut b = build_pssh(&ELASTOS_PQ_SYSTEM_ID, &[[1u8; 16]], b"payload");
+            b.extend_from_slice(b"TRAILING-MOOV-BYTES");
+            let parsed = parse_pssh(&b).expect("parse");
+            assert_eq!(parsed.data, b"payload");
+            assert_eq!(parsed.kids, vec![[1u8; 16]]);
+        }
+    }
+}
+
 /// Forensic-watermark anchor: the 16-byte SHA-256 prefix over a grant's EIP-191 delegation
 /// signature hex. The invisible pixel-lock watermark embeds this digest (not the raw wallet) so the
 /// mark is **authenticated by the buyer's own signature** — to plant it against a victim wallet an

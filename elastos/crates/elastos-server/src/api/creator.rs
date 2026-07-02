@@ -49,6 +49,11 @@ const CREATOR_APP: &str = "creator";
 const THRESHOLD_PROTECTION_TYPE: &str = "cenc:elastos-pq-hybrid-threshold-v0";
 const THRESHOLD_SCHEME: &str = "elastos-pq-hybrid-threshold-v0";
 
+/// The registered MPEG-DASH/CENC DRM SystemID (UUID form) for the threshold scheme — used in the
+/// MPD per-system `<ContentProtection schemeIdUri="urn:uuid:...">`. Matches
+/// `ddrm_envelope::pssh::ELASTOS_PQ_SYSTEM_ID` (base64 `tuJU7w3FR/6U5w5y7R3HsA==`).
+const ELASTOS_PQ_SYSTEM_UUID: &str = "b6e254ef-0dc5-47fe-94e7-0e72ed1dc7b0";
+
 /// The canonical DASH manifest filename inside the published media directory. PC2 (and
 /// base.ela.city) fetch `{dirCid}/stream.mpd` (`pc2-node/src/services/media/dashPackager.ts`,
 /// `src/api/media.ts`), so runtime-minted media MUST use this exact name to index + play there.
@@ -1931,6 +1936,56 @@ async fn run_prepare_mint_media(
         return Err(stage_err("encrypt", "encrypted segment count mismatch"));
     }
 
+    // 2c) MPEG-DASH/CENC (ISO/IEC 23001-7) compliance — the standard for every media (DASH) mint.
+    //     CENC-signal each per-track init (encv/enca + sinf + tenc(default_KID) + the Elacity pssh)
+    //     and patch the MPD ContentProtection, so the published asset is a first-class CENC
+    //     protection system (Bento4/PC2 wire format). This is ADDITIVE: the server-decrypt rail
+    //     strips the signaling back for the runtime's own player, so existing playback is unchanged.
+    let (init_files, manifest) = {
+        let protections_slot = dkms_protection(&node_set_id_b64, &producer_vk_b64, &shares);
+        let pssh_envelope = build_pssh_envelope(&protections_slot, mint_chain_id());
+        let pssh_data_b64 = b64.encode(
+            serde_json::to_vec(&pssh_envelope).map_err(|e| stage_err("encrypt", e.to_string()))?,
+        );
+        let signal_req = json!({
+            "op": "cenc_signal_inits",
+            "inits": init_files
+                .iter()
+                .map(|(p, b)| json!({ "path": p, "b64": b }))
+                .collect::<Vec<_>>(),
+            "kid_hex": kid_hex,
+            "iv_size": 8,
+            "pssh_data_b64": pssh_data_b64,
+        });
+        let signaled = provider_data(registry, "encrypt", &signal_req)
+            .await
+            .map_err(|e| stage_err("encrypt", e))?;
+        let signaled_inits = signaled
+            .get("inits")
+            .and_then(Value::as_array)
+            .ok_or_else(|| stage_err("encrypt", "cenc_signal_inits returned no inits"))?;
+        let new_inits: Vec<(String, String)> = signaled_inits
+            .iter()
+            .filter_map(|v| {
+                Some((
+                    v.get("path")?.as_str()?.to_string(),
+                    v.get("b64")?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        if new_inits.len() != init_files.len() {
+            return Err(stage_err(
+                "encrypt",
+                "cenc_signal_inits returned wrong init count",
+            ));
+        }
+        let pssh_b64 = signaled
+            .get("pssh_b64")
+            .and_then(Value::as_str)
+            .ok_or_else(|| stage_err("encrypt", "cenc_signal_inits returned no pssh_b64"))?;
+        (new_inits, patch_mpd_content_protection(&manifest, &kid_hex, pssh_b64))
+    };
+
     // 3) assemble the DASH directory: plaintext per-track inits + ENCRYPTED segments (at their
     //    MPD paths) + the manifest. Inits are NOT encrypted (CENC encrypts media fragments only).
     let mut files: Vec<Value> = Vec::with_capacity(init_files.len() + enc_segments.len() + 1);
@@ -2373,6 +2428,73 @@ fn dkms_protection(node_set_id_b64: &str, producer_vk_b64: &str, shares: &Value)
         // quorum, under rights) can unwrap. The dKMS analogue of PC2's public `litCiphertext`.
         "shares": shares.clone(),
     })
+}
+
+/// Wrap the asset's protections slot into the PSSH `Data` JSON envelope the clients consume
+/// (PC2 / media-player shape: `protocolVersion` / `protectionType` / `variant` / `data`).
+/// Single-sourced from [`dkms_protection`] so the PSSH payload and metadata.json protections can
+/// never drift (Principle 12): `data` is the slot minus the hoisted `protectionType`, plus `chainId`.
+fn build_pssh_envelope(protections_slot: &Value, chain_id: u64) -> Value {
+    let mut data = protections_slot.clone();
+    if let Some(obj) = data.as_object_mut() {
+        obj.remove("protectionType");
+        obj.insert("chainId".to_string(), json!(chain_id));
+    }
+    json!({
+        "protocolVersion": "3.0",
+        "protectionType": THRESHOLD_PROTECTION_TYPE,
+        "variant": "eth.web3.clearkey",
+        "data": data,
+    })
+}
+
+/// Format a 32-hex `default_KID` as the dashed UUID form CENC `cenc:default_KID` expects.
+fn format_kid_uuid(kid_hex: &str) -> String {
+    let s = kid_hex.strip_prefix("0x").unwrap_or(kid_hex);
+    if s.len() != 32 {
+        return s.to_string();
+    }
+    format!(
+        "{}-{}-{}-{}-{}",
+        &s[0..8],
+        &s[8..12],
+        &s[12..16],
+        &s[16..20],
+        &s[20..32]
+    )
+}
+
+/// Inject MPEG-DASH/CENC `<ContentProtection>` into every `<AdaptationSet>` of `mpd`: the common
+/// `urn:mpeg:dash:mp4protection:2011` (value `cenc`, `cenc:default_KID`) plus the per-system Elacity
+/// descriptor carrying the base64 `pssh`. Adds the `cenc` namespace to `<MPD>`. String-level insert
+/// (the media-provider MPD is ffmpeg-generated, plain `<AdaptationSet …>` elements).
+fn patch_mpd_content_protection(mpd: &str, kid_hex: &str, pssh_box_b64: &str) -> String {
+    let default_kid = format_kid_uuid(kid_hex);
+    let block = format!(
+        "<ContentProtection schemeIdUri=\"urn:mpeg:dash:mp4protection:2011\" value=\"cenc\" cenc:default_KID=\"{default_kid}\"/>\
+<ContentProtection schemeIdUri=\"urn:uuid:{ELASTOS_PQ_SYSTEM_UUID}\" value=\"{THRESHOLD_PROTECTION_TYPE}\"><cenc:pssh>{pssh_box_b64}</cenc:pssh></ContentProtection>"
+    );
+    // Ensure the cenc namespace on <MPD ...>.
+    let out = if mpd.contains("xmlns:cenc=") {
+        mpd.to_string()
+    } else {
+        mpd.replacen("<MPD ", "<MPD xmlns:cenc=\"urn:mpeg:cenc:2013\" ", 1)
+    };
+    // Insert the block right after each <AdaptationSet ...> open tag.
+    let mut result = String::with_capacity(out.len() + block.len() * 2);
+    let mut cursor = 0usize;
+    while let Some(rel) = out[cursor..].find("<AdaptationSet") {
+        let tag_start = cursor + rel;
+        let Some(close_rel) = out[tag_start..].find('>') else {
+            break;
+        };
+        let insert_at = tag_start + close_rel + 1;
+        result.push_str(&out[cursor..insert_at]);
+        result.push_str(&block);
+        cursor = insert_at;
+    }
+    result.push_str(&out[cursor..]);
+    result
 }
 
 /// The non-empty effective MIME (`application/octet-stream` when the frame sent none).
@@ -3124,6 +3246,50 @@ fn staged_error(status: StatusCode, stage: &str, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_kid_uuid_dashes_a_32_hex_kid() {
+        assert_eq!(
+            format_kid_uuid("ecc00fbfe967bf0e091532f2492bbd09"),
+            "ecc00fbf-e967-bf0e-0915-32f2492bbd09"
+        );
+        // 0x prefix tolerated; non-32-hex returned as-is.
+        assert_eq!(
+            format_kid_uuid("0xecc00fbfe967bf0e091532f2492bbd09"),
+            "ecc00fbf-e967-bf0e-0915-32f2492bbd09"
+        );
+        assert_eq!(format_kid_uuid("short"), "short");
+    }
+
+    #[test]
+    fn build_pssh_envelope_hoists_protection_type_and_adds_chain_id() {
+        let slot = dkms_protection("nodeset", "prodvk", &json!([{"x": 1}]));
+        let env = build_pssh_envelope(&slot, 8453);
+        assert_eq!(env["protectionType"], THRESHOLD_PROTECTION_TYPE);
+        assert_eq!(env["variant"], "eth.web3.clearkey");
+        assert_eq!(env["protocolVersion"], "3.0");
+        // data carries the slot fields + chainId, WITHOUT the hoisted protectionType.
+        assert_eq!(env["data"]["chainId"], 8453);
+        assert_eq!(env["data"]["scheme"], THRESHOLD_SCHEME);
+        assert_eq!(env["data"]["node_set_id_b64"], "nodeset");
+        assert!(env["data"].get("protectionType").is_none());
+    }
+
+    #[test]
+    fn patch_mpd_injects_content_protection_per_adaptationset() {
+        let mpd = r#"<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011"><Period><AdaptationSet mimeType="video/mp4"><Representation id="v"/></AdaptationSet><AdaptationSet mimeType="audio/mp4"><Representation id="a"/></AdaptationSet></Period></MPD>"#;
+        let out = patch_mpd_content_protection(mpd, "ecc00fbfe967bf0e091532f2492bbd09", "UFNTSC1CT1g=");
+        // cenc namespace added once.
+        assert_eq!(out.matches("xmlns:cenc=").count(), 1);
+        // common mp4protection + per-system descriptor injected into BOTH AdaptationSets.
+        assert_eq!(out.matches("urn:mpeg:dash:mp4protection:2011").count(), 2);
+        assert_eq!(
+            out.matches(&format!("urn:uuid:{ELASTOS_PQ_SYSTEM_UUID}")).count(),
+            2
+        );
+        assert!(out.contains("cenc:default_KID=\"ecc00fbf-e967-bf0e-0915-32f2492bbd09\""));
+        assert!(out.contains("<cenc:pssh>UFNTSC1CT1g=</cenc:pssh>"));
+    }
 
     fn descriptor(node_count: usize, with_seed: bool) -> Vec<u8> {
         let mut nodes = Vec::new();
