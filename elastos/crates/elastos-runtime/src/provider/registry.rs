@@ -499,6 +499,18 @@ pub fn is_reserved_sub_name(name: &str) -> bool {
     RESERVED_SUB_NAMES.contains(&name)
 }
 
+/// Security-critical sub-providers pinned FIRST-WRITER-WINS: once one of these is bound (at boot, by
+/// `server_infra`), a later `register_sub_provider` for the SAME name is refused rather than
+/// silently overwriting it (the map is otherwise last-write-wins). Without this, a launched capsule
+/// whose manifest declares e.g. `provides: elastos://encrypt/*` would seize the CEK-escrow /
+/// key / signing route from the trusted boot provider — ambient authority via registration order
+/// (Principle 3), and a break of the mediated key/decrypt plane (Principle 15). The escrow + keys +
+/// signing + mint spine. `unregister_sub_provider` frees the slot, so a genuine teardown→restart of
+/// the SAME provider re-mounts cleanly; only an overwrite of a still-live pinned slot is refused.
+const PINNED_SUB_NAMES: &[&str] = &[
+    "encrypt", "publish", "media", "key", "decrypt", "drm", "rights", "wallet", "chain",
+];
+
 /// Registry of providers
 pub struct ProviderRegistry {
     /// Map of scheme -> provider
@@ -565,9 +577,21 @@ impl ProviderRegistry {
         provider: Arc<dyn Provider>,
     ) -> Result<(), ProviderError> {
         let name = name.to_lowercase();
-        if !RESERVED_SUB_NAMES.contains(&name.as_str()) {
+        if !is_reserved_sub_name(&name) {
             return Err(ProviderError::Provider(format!(
                 "sub-provider '{}' is not a reserved name",
+                name
+            )));
+        }
+        let mut sub_providers = self.sub_providers.write().await;
+        // First-writer-wins for the security-critical spine: refuse to overwrite a still-live pinned
+        // slot (Principle 3 — no ambient authority via registration order). Checked under the write
+        // lock so it is race-free. A teardown (`unregister_sub_provider`) frees the slot first, so a
+        // genuine restart of the same provider re-mounts.
+        if PINNED_SUB_NAMES.contains(&name.as_str()) && sub_providers.contains_key(&name) {
+            return Err(ProviderError::Provider(format!(
+                "sub-provider '{}' is pinned and already bound; refusing to overwrite the \
+                 security-critical provider (unregister it first to rebind)",
                 name
             )));
         }
@@ -576,7 +600,7 @@ impl ProviderRegistry {
             provider.name(),
             name
         );
-        self.sub_providers.write().await.insert(name, provider);
+        sub_providers.insert(name, provider);
         Ok(())
     }
 
@@ -2265,6 +2289,49 @@ mod tests {
              their launch-time registration will fail closed and the provider will silently go \
              dark. Add each to RESERVED_SUB_NAMES: {unreserved:?}"
         );
+    }
+
+    // Pinned first-writer-wins: a boot-registered security-critical sub-provider (e.g. `encrypt` =
+    // CEK escrow) cannot be silently overwritten by a later registration (a launched capsule
+    // declaring `provides: elastos://encrypt/*`). The overwrite is refused structurally (Err), the
+    // original stays bound, and a genuine unregister→re-register (restart) still works.
+    #[tokio::test]
+    async fn test_pinned_sub_provider_is_first_writer_wins() {
+        let registry = ProviderRegistry::new();
+        registry
+            .register_sub_provider("encrypt", Arc::new(MockProvider::new()))
+            .await
+            .expect("boot registration of the pinned provider succeeds");
+
+        // A second registration of the still-live pinned slot is refused, not silently applied.
+        let overwrite = registry
+            .register_sub_provider("encrypt", Arc::new(MockProvider::new()))
+            .await;
+        assert!(
+            overwrite.is_err(),
+            "overwriting a still-live pinned sub-provider must fail closed"
+        );
+        assert!(
+            registry.get_sub_provider("encrypt").await.is_some(),
+            "the original pinned provider must remain bound after a refused overwrite"
+        );
+
+        // Teardown frees the slot, so a legitimate restart of the same provider re-mounts.
+        registry.unregister_sub_provider("encrypt").await;
+        registry
+            .register_sub_provider("encrypt", Arc::new(MockProvider::new()))
+            .await
+            .expect("re-registration after unregister (restart) must succeed");
+
+        // Non-pinned reserved names keep last-write-wins (hot-reload / test double-registration).
+        registry
+            .register_sub_provider("inspect", Arc::new(MockProvider::new()))
+            .await
+            .expect("first non-pinned registration succeeds");
+        registry
+            .register_sub_provider("inspect", Arc::new(MockProvider::new()))
+            .await
+            .expect("non-pinned re-registration is still allowed (last-write-wins)");
     }
 
     #[tokio::test]
