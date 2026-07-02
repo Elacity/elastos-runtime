@@ -481,7 +481,23 @@ const RESERVED_SUB_NAMES: &[&str] = &[
     "encrypt",
     "publish",
     "media",
+    // First-party capsule providers whose manifests declare `provides: elastos://<name>/*` and are
+    // registered at capsule launch (supervisor `register_provider_route`). A name missing here makes
+    // that route fail `register_sub_provider` (warn-swallowed) and the provider silently goes dark:
+    // `market` (content-market storefront) has no boot fallback; `object` (Library object authority)
+    // and `operator-drive-adapter` also register a boot main-provider but lose their VM sub-route.
+    "market",
+    "object",
+    "operator-drive-adapter",
 ];
+
+/// Whether `name` is a reserved `elastos://` sub-provider scheme. The reserved set is the single
+/// source of truth for which sub-provider names the runtime may register; a boot- or launch-time
+/// registration of an unreserved name fails closed. Exposed so a conformance test can assert the
+/// invariant "every name the runtime registers is reserved" without booting.
+pub fn is_reserved_sub_name(name: &str) -> bool {
+    RESERVED_SUB_NAMES.contains(&name)
+}
 
 /// Registry of providers
 pub struct ProviderRegistry {
@@ -2193,6 +2209,62 @@ mod tests {
                 .unwrap_or_else(|e| panic!("dDRM producer-spine scheme '{name}' must be reserved so server_infra can register it at boot: {e}"));
             assert!(registry.get_sub_provider(name).await.is_some());
         }
+    }
+
+    // The general invariant behind the dDRM-spine guard above: EVERY first-party capsule that
+    // declares `provides: elastos://<sub>/*` is registered at capsule launch, so <sub> MUST be
+    // reserved or that route fails closed (warn-swallowed) and the provider silently goes dark.
+    // Scans the shipped manifests directly (no boot needed) so a newly-added provider capsule with
+    // an unreserved scheme reds this test instead of dying only in production. This is the test that
+    // would have caught market/object/operator-drive-adapter.
+    #[test]
+    fn test_all_capsule_provided_sub_schemes_are_reserved() {
+        let capsules_dir =
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../capsules"));
+        let entries = std::fs::read_dir(capsules_dir).expect("capsules dir exists");
+        let mut checked = 0usize;
+        let mut unreserved: Vec<(String, String)> = Vec::new();
+        for entry in entries {
+            let dir = entry.expect("dir entry").path();
+            let manifest_path = dir.join("capsule.json");
+            if !manifest_path.exists() {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&manifest_path).expect("read manifest");
+            let manifest: serde_json::Value = match serde_json::from_str(&raw) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let Some(provides) = manifest.get("provides").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(sub) = provides
+                .strip_prefix("elastos://")
+                .and_then(|rest| rest.split('/').next())
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            checked += 1;
+            if !is_reserved_sub_name(sub) {
+                let name = dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?")
+                    .to_string();
+                unreserved.push((name, sub.to_string()));
+            }
+        }
+        assert!(
+            checked >= 15,
+            "expected to scan many provider manifests, only saw {checked}"
+        );
+        assert!(
+            unreserved.is_empty(),
+            "capsule manifests declare `provides` sub-schemes missing from RESERVED_SUB_NAMES; \
+             their launch-time registration will fail closed and the provider will silently go \
+             dark. Add each to RESERVED_SUB_NAMES: {unreserved:?}"
+        );
     }
 
     #[tokio::test]
