@@ -327,10 +327,10 @@ pass; suitable for CI). This upgrades the evidence from "compiles to wasm" to
 
 | Provider | Contract + validation | Fail-closed | Host tests | wasm32-wasip1 | WASI smoke |
 | --- | --- | --- | --- | --- | --- |
-| `drm-provider` (orchestrator) | yes (validates sealed object; declares canonical open sequence) | yes | 12 | builds | `scripts/wasm-smoke.sh` |
-| `rights-provider` | yes (typed questions; wire-rejects hidden chain/wallet/key fields) | yes | 9 | builds | `scripts/wasm-smoke.sh` |
-| `key-provider` | yes (+ rights-receipt binding: allowed + principal/session/object/right must match) | yes | 9 | builds | `scripts/wasm-smoke.sh` |
-| `decrypt-provider` | yes (+ tested decrypt-step core seam) | yes | 17 | builds | `scripts/wasm-smoke.sh` |
+| `drm-provider` (orchestrator) | yes (validates sealed object; declares canonical open sequence) | yes | 12 | builds | `capsules/drm-provider/scripts/wasm-smoke.sh` |
+| `rights-provider` | yes (typed questions; wire-rejects hidden chain/wallet/key fields) | yes | 9 | builds | `capsules/rights-provider/scripts/wasm-smoke.sh` |
+| `key-provider` | yes (+ rights-receipt binding: allowed + principal/session/object/right must match) | yes | 9 | builds | `capsules/key-provider/scripts/wasm-smoke.sh` |
+| `decrypt-provider` | yes (+ tested decrypt-step core seam) | yes | 17 | builds | `capsules/decrypt-provider/scripts/wasm-smoke.sh` |
 
 `drm-provider` is the `drm/open` front door: it validates the `SealedObjectV1`,
 declares the canonical sequence (`content -> rights -> key -> decrypt -> render ->

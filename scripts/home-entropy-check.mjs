@@ -286,6 +286,9 @@ function assertUsersSelfReferencesAreApproved() {
     "elastos/crates/elastos-server/src/carrier_bridge.rs",
     "elastos/crates/elastos-server/src/notifications.rs",
     "elastos/crates/elastos-server/src/runtime_control.rs",
+    // Docs: explains the microVM fixture targets Public/, NOT Users/self (mentions the alias
+    // only to say why it is out of scope).
+    "capsules/act-emitter/README.md",
   ]);
   const files = [
     ...listTextFiles(resolve(repoRootPath, "capsules")),
@@ -1218,7 +1221,7 @@ assert(
 );
 const debugPolicy = read("DEBUG.md");
 const gbaScript = read("scripts/gba.sh");
-const homeAssetVersion = "home-20260627a";
+const homeAssetVersion = "home-20260701c";
 assertUsersSelfReferencesAreApproved();
 assert(
   shellIndex.includes('role="listbox"'),
@@ -1384,8 +1387,12 @@ assert(
   "Home must allow Browser to route file chooser requests into Library through an explicit source gate",
 );
 assert(
-  shellJs.includes('library: new Set(["archive-manager", "documents", "library"])'),
-  "Home must allow Library to open Archive for archive files while keeping the source-gated policy explicit",
+  ["archive-manager", "documents", "library", "ddrm-viewer", "elacity-player"].every((target) =>
+    new RegExp(
+      `library: new Set\\(\\[[^\\]]*"${target}"[^\\]]*\\]\\)`,
+    ).test(shellJs),
+  ),
+  "Home must allow Library to open Archive/Documents AND the owned-asset viewers (ddrm-viewer, elacity-player) while keeping the source-gated policy explicit",
 );
 assert(
   shellIndex.includes(`shell.js?v=${homeAssetVersion}`),
@@ -3947,7 +3954,10 @@ assert(
     serverInfra.includes("InspectProvider::with_registry") &&
     serverInfra.includes('register_sub_provider("inspect"') &&
     gatewayProviderProxy.includes('"inspect" => match op.as_str()') &&
-    gatewayProviderProxy.includes('"capsules" | "capsule" | "self" | "plan" | "request_act" => &[SYSTEM_CAPSULE_ID]') &&
+    // Post-merge routing (deliberate): System-operator ops pin to SYSTEM; `self` is a
+    // separate browser-tier arm whose provider branch forces target = the caller.
+    /"capsules" \| "capsule" \| "plan" \| "intent" \| "discover" \| "request_act" => \{\s*&\[SYSTEM_CAPSULE_ID\]/.test(gatewayProviderProxy) &&
+    gatewayProviderProxy.includes('"self" => &[BROWSER_CAPSULE_ID]') &&
     gatewayProviderProxy.includes('if scheme == "inspect" && op == "request_act"') &&
     !gatewayProviderProxy.includes('"dispatch_approved" => &[SYSTEM_CAPSULE_ID]') &&
     !gatewayProviderProxy.includes('"revoke" => &[SYSTEM_CAPSULE_ID]') &&

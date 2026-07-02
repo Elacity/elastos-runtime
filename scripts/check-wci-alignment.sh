@@ -475,6 +475,8 @@ if rg_search $'fetch[[:space:]]*\\([[:space:]]*["\\\'`]https?://|\\.open[[:space
   echo
   failed=1
 fi
+# ddrm-envelope (library crate, no capsule.json) IMPLEMENTS EIP-191 personal_sign
+# canonicalisation/recovery for the access-delegation format — it holds no wallet.
 if rg_search 'WalletConnect|walletconnect|MetaMask|metamask|UniSat|unisat|window\.ethereum|window\.unisat|ethereum\.request|personal_sign|eth_requestAccounts|eth_sendTransaction|wallet_switchEthereumChain|signMessage' capsules \
   --glob '!capsules/home/browser/*' \
   --glob '!capsules/system/browser/*' \
@@ -485,6 +487,7 @@ if rg_search 'WalletConnect|walletconnect|MetaMask|metamask|UniSat|unisat|window
   --glob '!capsules/wallet-walletconnect/*' \
   --glob '!capsules/*-provider/**' \
   --glob '!elastos/capsules/*-provider/**' \
+  --glob '!capsules/ddrm-envelope/**' \
   --glob '!**/capsule.json' \
   --glob '!**/tests/**' \
   --glob '!**/*test*' \
@@ -495,6 +498,13 @@ if rg_search 'WalletConnect|walletconnect|MetaMask|metamask|UniSat|unisat|window
   echo
   failed=1
 fi
+# Chain-authority scan targets ORDINARY APP capsules. Exempt (not app authority):
+# - content-market: role=provider (dir name lacks the -provider suffix the glob keys on);
+#   pure enrichment that NAMES chain-provider in its contract, holds no RPC.
+# - ddrm-envelope: library crate (no capsule.json); envelope/access documentation
+#   describes the eth_call the NODE performs, the crate performs none.
+# - dkms-authority: runtime-owned quorum authority (no capsule.json); chain ownership
+#   reads over multi-RPC are its designed function, mirroring chain-provider discipline.
 if rg_search 'elastos://chain|/api/provider/chain|chain-provider|blockchain provider|rpc_url|RPC_URL|JSON-RPC|jsonrpc|eth_call|eth_chainId|bitcoin-cli|bitcoind|Bitcoin Core RPC' capsules \
   --glob '!capsules/*-provider/**' \
   --glob '!elastos/capsules/*-provider/**' \
@@ -503,6 +513,9 @@ if rg_search 'elastos://chain|/api/provider/chain|chain-provider|blockchain prov
   --glob '!capsules/wallet-unisat/*' \
   --glob '!capsules/wallet/*' \
   --glob '!capsules/wallet-walletconnect/*' \
+  --glob '!capsules/content-market/**' \
+  --glob '!capsules/ddrm-envelope/**' \
+  --glob '!capsules/dkms-authority/**' \
   --glob '!**/capsule.json' \
   --glob '!**/tests/**' \
   --glob '!**/*test*' \
@@ -513,11 +526,14 @@ if rg_search 'elastos://chain|/api/provider/chain|chain-provider|blockchain prov
   echo
   failed=1
 fi
+# ddrm-envelope is a library crate whose docs name wallet-provider as the SIGNER the
+# node consults — the crate itself signs nothing (see chain-scan exemptions above).
 if rg_search 'elastos://wallet|/api/provider/wallet|wallet-provider' capsules \
   --glob '!capsules/system/browser/*' \
   --glob '!capsules/browser/*' \
   --glob '!capsules/*-provider/**' \
   --glob '!elastos/capsules/*-provider/**' \
+  --glob '!capsules/ddrm-envelope/**' \
   --glob '!**/capsule.json' \
   --glob '!**/tests/**' \
   --glob '!**/*test*' \
@@ -753,7 +769,10 @@ for path in manifest_paths:
             "/api/provider/wallet": "direct wallet provider route",
             "ipfs-cluster": "raw IPFS Cluster backend",
             "elacity-sdk": "raw Elacity SDK backend",
-            "elacity": "raw Elacity backend",
+            # Match the backend scheme, not the bare word: `elacity-player` is a
+            # capsule id that legitimately appears in its own source.
+            "elastos://elacity": "raw Elacity backend",
+            "ela.city": "raw Elacity backend host",
             "/api/provider/ipfs": "direct IPFS provider route",
             "WalletConnect": "direct browser wallet adapter authority",
             "walletconnect": "direct browser wallet adapter authority",

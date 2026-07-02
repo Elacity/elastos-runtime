@@ -4,7 +4,7 @@
 > **roadmap item, not shipped behaviour.** For what is shipped today (rasterizable
 > types) see [PROTECTED_CONTENT.md](PROTECTED_CONTENT.md); for the tier model see
 > [ASSET_TIERS.md](ASSET_TIERS.md). For *how* we land non-trivial work see
-> [../CLAUDE.md](../CLAUDE.md); for *what is correct* see [../PRINCIPLES.md](../PRINCIPLES.md).
+> `CLAUDE.md` (untracked local operating contract); for *what is correct* see [../PRINCIPLES.md](../PRINCIPLES.md).
 
 ---
 
@@ -171,7 +171,7 @@ Boundary discipline (must hold — see §7):
 
 ## 5. Phasing (each chunk has a one-sentence pass/fail check)
 
-> Per [CLAUDE.md](../CLAUDE.md): smallest independently-verifiable steps. These are
+> Per `CLAUDE.md` (the local operating contract): smallest independently-verifiable steps. These are
 > roadmap chunks; each becomes its own approved plan + tests before code.
 
 ### Phase 0 — feasibility study (DONE, off-tree throwaway harness)

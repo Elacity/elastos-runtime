@@ -21,6 +21,20 @@ printf '# installed-command-audit\n' > "$TMP_ROOT/share.txt"
 
 FAILURES=0
 
+# Portable timeout: stock macOS ships no GNU `timeout`; fall back to gtimeout
+# (coreutils) or a perl alarm wrapper so the fail-fast cases stay bounded.
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${seconds}s" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "${seconds}s" "$@"
+  else
+    perl -e 'alarm shift; exec @ARGV or die "exec failed: $!"' "$seconds" "$@"
+  fi
+}
+
 run_case() {
   local kind="$1"
   local name="$2"
@@ -64,7 +78,7 @@ run_case() {
         FAILURES=$((FAILURES + 1))
         return
       fi
-      if [[ $rc -eq 124 ]]; then
+      if [[ $rc -eq 124 || $rc -eq 142 ]]; then
         echo "[installed-command-audit] FAIL ($name): command hung" >&2
         cat "$out" >&2 || true
         cat "$err" >&2 || true
@@ -108,7 +122,7 @@ run_case fail-fast \
 run_case fail-fast \
   "open without extras fails clearly" \
   "ipfs-provider not found|elastos setup --with kubo --with ipfs-provider" \
-  timeout 15s "$ELASTOS_BIN" open elastos://QmU8x9HMWetGzfnXLe4CriiocGuzvSLr9NJ1RwDp6MaWX6
+  run_with_timeout 15 "$ELASTOS_BIN" open elastos://QmU8x9HMWetGzfnXLe4CriiocGuzvSLr9NJ1RwDp6MaWX6
 
 if [[ $FAILURES -ne 0 ]]; then
   echo "[installed-command-audit] FAIL ($FAILURES cases)" >&2

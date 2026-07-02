@@ -7,6 +7,16 @@ ELASTOS_CMD=(cargo run -q -p elastos-server --manifest-path "$SERVER_MANIFEST" -
 TMP_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TMP_ROOT"' EXIT
 export XDG_DATA_HOME="$TMP_ROOT/xdg-data"
+# macOS resolves the runtime data dir via `dirs::data_dir()` (~/Library/Application
+# Support), which ignores XDG_DATA_HOME — so redirect HOME itself to keep the smoke
+# hermetic, while pinning the toolchain caches to the real home so nothing re-downloads.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  REAL_HOME="$HOME"
+  export CARGO_HOME="${CARGO_HOME:-$REAL_HOME/.cargo}"
+  export RUSTUP_HOME="${RUSTUP_HOME:-$REAL_HOME/.rustup}"
+  export HOME="$TMP_ROOT/home"
+  mkdir -p "$HOME"
+fi
 
 run_ok() {
   local name="$1"
@@ -52,12 +62,27 @@ run_expect_failure_output() {
   fi
 }
 
+# Portable timeout: stock macOS ships no GNU `timeout`; fall back to gtimeout
+# (coreutils) or a perl alarm wrapper so fail-fast checks stay bounded (and cannot
+# pass vacuously on `timeout: command not found`).
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${seconds}s" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "${seconds}s" "$@"
+  else
+    perl -e 'alarm shift; exec @ARGV or die "exec failed: $!"' "$seconds" "$@"
+  fi
+}
+
 run_fail_fast() {
   local name="$1"
   shift
   echo "[command-smoke] $name"
   set +e
-  timeout 15s "$@" >/tmp/command-smoke.out 2>/tmp/command-smoke.err
+  run_with_timeout 15 "$@" >/tmp/command-smoke.out 2>/tmp/command-smoke.err
   local rc=$?
   set -e
   if [[ $rc -eq 0 ]]; then
@@ -66,7 +91,7 @@ run_fail_fast() {
     cat /tmp/command-smoke.err >&2 || true
     exit 1
   fi
-  if [[ $rc -eq 124 ]]; then
+  if [[ $rc -eq 124 || $rc -eq 142 ]]; then
     echo "[command-smoke] command hung for $name" >&2
     cat /tmp/command-smoke.out >&2 || true
     cat /tmp/command-smoke.err >&2 || true

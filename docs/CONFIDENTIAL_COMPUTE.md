@@ -194,7 +194,7 @@ Sequencing: **1 → (D) → 3 → 2 → 4/5.** Each step reuses the prior step's
 
 ## 5. Build plan (phased — each phase independently verifiable, gated by `just verify`)
 
-Per [CLAUDE.md](../CLAUDE.md): smallest independently-verifiable steps, each with a one-sentence
+Per `CLAUDE.md` (the local operating contract): smallest independently-verifiable steps, each with a one-sentence
 check, plan approved before code, new gates start non-blocking.
 
 - **Phase 0 — spike (no product code).** Stand up a SEV-SNP *or* TDX confidential VM on capable
