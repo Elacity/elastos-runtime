@@ -242,8 +242,9 @@ pub fn build_capability_resource(
         "did" | "peer" => Ok(format!("elastos://{scheme}/*")),
         // Read-only Capsule Inspector. Use the concrete requested resource so it
         // validates against an `elastos://inspect/*` capability the same way the
-        // gateway/handler path does (consistent across both transports).
-        "inspect" => Ok(format!("elastos://inspect/{op}")),
+        // gateway/handler path does (consistent across both transports). Fail
+        // closed on ops outside the canonical inspect contract.
+        "inspect" => inspect_resource(op),
         _ => Ok(format!("{scheme}://*")),
     }
 }
@@ -327,6 +328,13 @@ fn content_resource(op: &str) -> Result<String, String> {
         "repair" => Ok("elastos://content/repair".to_string()),
         "unpublish" => Ok("elastos://content/unpublish".to_string()),
         _ => Err(format!("Unsupported content provider operation: {op}")),
+    }
+}
+
+fn inspect_resource(op: &str) -> Result<String, String> {
+    match inspect_op_required_action(op) {
+        Some(_) => Ok(format!("elastos://inspect/{op}")),
+        None => Err(format!("Unsupported inspect provider operation: {op}")),
     }
 }
 
@@ -449,6 +457,33 @@ fn decrypt_resource(op: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inspect_resource_and_actions_are_canonical() {
+        let request = serde_json::json!({});
+        assert_eq!(
+            build_capability_resource("inspect", "capsules", &request).unwrap(),
+            "elastos://inspect/capsules"
+        );
+        assert_eq!(
+            build_capability_resource("inspect", "plan", &request).unwrap(),
+            "elastos://inspect/plan"
+        );
+        assert_eq!(
+            inspect_op_required_action("capsules"),
+            Some(elastos_runtime::capability::token::Action::Read)
+        );
+        assert_eq!(
+            inspect_op_required_action("plan"),
+            Some(elastos_runtime::capability::token::Action::Read)
+        );
+        assert_eq!(
+            inspect_op_required_action("revoke"),
+            Some(elastos_runtime::capability::token::Action::Write)
+        );
+        // Ops outside the canonical inspect contract fail closed at resource build.
+        assert!(build_capability_resource("inspect", "raw", &request).is_err());
+    }
 
     #[test]
     fn required_action_classifies_operations_and_fails_closed() {

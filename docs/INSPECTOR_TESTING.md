@@ -73,6 +73,16 @@ Relevant tests to confirm green:
   `carrier_inspect_ops_match_canonical_action_contract`, and
   `api/gateway_tests/inspect.rs` (token required, System-only, `revoke` 404).
 
+Runtime scope-rule expectations (`cargo test -p elastos-runtime inspect`):
+
+- no grant fails closed
+- pure SelfOnly can view only self
+- System scope can view all
+
+Current product routing still keeps `/api/provider/inspect/self` System-only.
+Do not treat the pure SelfOnly test as proof that ordinary capsules have a live
+caller-bound Inspector route.
+
 ## Two ways to test
 
 ### A. Fast UI smoke test — sample mode (no runtime, no token)

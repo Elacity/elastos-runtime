@@ -122,6 +122,39 @@ handler MUST call `authorize_view` before returning any per-capsule detail.
 - **Least privilege.** The full-view product surface (this Inspector) requests
   `elastos://inspect/*`, which only the System surface can grant — it is a
   System-trusted surface, not a freely distributable app.
+- **Self scope is not yet a product route.** `elastos://inspect/self` is the
+  pure SelfOnly scope rule and cannot cross capsule boundaries.
+  Current product routing keeps `/api/provider/inspect/self` System-only until a
+  caller-bound ordinary-capsule SelfOnly route is explicitly wired and tested.
+
+### Act path (`request_act` → Inbox approval → dispatch)
+
+`request_act` is the only System-callable act entrypoint. It creates an Inbox
+approval request and stores a pending record with the requesting principal and
+session, target id and operation, provider request body, original gate preview,
+canonical request binding hash, and pending status. The Inbox notification is
+generated from that stored pending record and includes a
+concise gate-preview summary (capability resource, actions, audit events,
+request hash), so approval stays tied to the same reflected authority System
+previewed.
+
+Approval happens through Inbox, not through System: a System launch token can
+create the action request but cannot call the Inbox action endpoint to approve
+it. Inbox approval must also include a fresh same-principal passkey Home token,
+matching the Wallet signing approval boundary. On approval, Runtime:
+
+1. Loads the pending Inspector action record.
+2. Verifies the fresh passkey Home token belongs to the same principal.
+3. Confirms the approver is the same principal.
+4. Recomputes the request binding and rejects tampering.
+5. Recomputes the authority plan and rejects stale authority.
+6. Calls `dispatch_approved` on the internal Inspect provider.
+7. Dispatches to the target provider through `ProviderRegistry`.
+8. Stores completed or failed status and appends signed audit
+   (`inspect.action.completed` / `inspect.action.failed`).
+
+Denied requests are marked denied and never dispatch. Duplicate requests remain
+distinct because request ids include a nonce.
 
 ## Phasing
 

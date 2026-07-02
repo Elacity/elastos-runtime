@@ -1017,6 +1017,18 @@ impl InspectProvider {
         )
     }
 
+    /// The execution-policy descriptor the read-only previews advertise: nothing dispatches,
+    /// nothing mutates, and there is no approval surface — a preview is only a mirror.
+    fn preview_execution_policy() -> Value {
+        json!({
+            "schema": "elastos.inspect.execution-policy/v1",
+            "mode": "preview_only",
+            "can_dispatch": false,
+            "can_mutate": false,
+            "approval_surface": Value::Null,
+        })
+    }
+
     /// The execution-policy descriptor a `dispatch_approved` result advertises: this inspector CAN
     /// dispatch and mutate through an operator approval (the inbox), unlike the read-only
     /// projection ops. Static contract, surfaced so a caller can see the surface it is driving.
@@ -1272,6 +1284,11 @@ impl InspectProvider {
             // runtime metadata are all refused before any effect. Distinct from the read-only
             // `plan`/`intent` previews above, which dispatch nothing.
             "dispatch_approved" => self.dispatch_approved(request).await,
+            // The one write op stays deliberately unimplemented: mutation never rides
+            // the inspector mirror (revocation lives on the capability-gated admin path).
+            "revoke" => {
+                provider_error("unsupported_operation", "inspect revoke is not implemented")
+            }
             other => provider_error("unknown_op", &format!("unknown inspect op: {other}")),
         }
     }
@@ -1477,8 +1494,10 @@ impl InspectProvider {
             Ok(plan) => json!({
                 "status": "ok",
                 "data": {
+                    "schema": "elastos.inspect.gate-preview/v1",
                     "valid": true,
                     "kind": "operation",
+                    "mode": "provider_authority",
                     // Union of every resource the op touches across all matching
                     // authority blocks — never just the first (fail-closed).
                     "resources": plan.resources,
@@ -1488,7 +1507,15 @@ impl InspectProvider {
                         .iter()
                         .map(|a| a.to_string())
                         .collect::<Vec<_>>(),
+                    // 0.5 gate-preview projection: the same tuple as resource→actions
+                    // pairs, consumed by the Inbox approval gate summary.
+                    "capabilities": plan.resources.iter().map(|resource| json!({
+                        "resource": resource,
+                        "actions": plan.actions.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
                     "audit_events": plan.audit_events,
+                    "execution": Self::preview_execution_policy(),
+                    "dispatch": false,
                 }
             }),
             Err(InvokeError::UnknownOperation(op)) => json!({
@@ -1617,6 +1644,94 @@ mod tests {
         InspectProvider::new(Arc::new(MockSource {
             entries: vec![probe_entry()],
         }))
+    }
+
+    /// Catalog-backed provider over a single on-disk manifest (restored from the
+    /// 0.5 source branch with the gate-preview/redaction tests below).
+    async fn provider_for_manifest(manifest: Value) -> (tempfile::TempDir, InspectProvider) {
+        let tmp = tempfile::tempdir().unwrap();
+        let capsules_dir = tmp.path().join("capsules");
+        let capsule_dir = capsules_dir.join("exit-provider");
+        std::fs::create_dir_all(&capsule_dir).unwrap();
+        std::fs::write(
+            capsule_dir.join("capsule.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let source: Arc<dyn InspectSource> = Arc::new(CatalogInspectSource::new(
+            capsules_dir,
+            Arc::downgrade(&registry),
+        ));
+        (tmp, InspectProvider::new(source))
+    }
+
+    fn exit_manifest() -> Value {
+        json!({
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "exit-provider",
+            "role": "provider",
+            "type": "wasm",
+            "entrypoint": "exit-provider.wasm",
+            "provides": "elastos://exit/*",
+            "authority": {
+                "reason": "Runtime-owned exit provider",
+                "capabilities": [
+                    { "resource": "elastos://exit/*", "actions": ["execute"], "operations": ["open_stream"] },
+                    { "resource": "elastos://exit/*", "actions": ["read"], "operations": ["status"] }
+                ],
+                "audit_events": ["exit.open_stream.requested", "exit.open_stream.denied"]
+            },
+            "capabilities": [],
+            "signature": "do-not-echo"
+        })
+    }
+
+    #[tokio::test]
+    async fn plan_reflects_provider_authority_without_dispatch() {
+        let (_tmp, provider) = provider_for_manifest(exit_manifest()).await;
+        let response = provider
+            .send_raw(&json!({
+                "op": "plan",
+                "id": "capsule:exit-provider",
+                "operation": "open_stream"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["status"], "ok");
+        let data = &response["data"];
+        assert_eq!(data["schema"], "elastos.inspect.gate-preview/v1");
+        assert_eq!(data["dispatch"], false);
+        assert_eq!(data["mode"], "provider_authority");
+        assert_eq!(
+            data["execution"]["schema"],
+            "elastos.inspect.execution-policy/v1"
+        );
+        assert_eq!(data["execution"]["mode"], "preview_only");
+        assert_eq!(data["execution"]["can_dispatch"], false);
+        assert_eq!(data["execution"]["can_mutate"], false);
+        assert!(data["execution"]["approval_surface"].is_null());
+        assert_eq!(data["capabilities"][0]["resource"], "elastos://exit/*");
+        assert_eq!(data["capabilities"][0]["actions"][0], "execute");
+        assert_eq!(data["audit_events"][0], "exit.open_stream.requested");
+    }
+
+    #[tokio::test]
+    async fn projection_redacts_raw_signature_but_keeps_fingerprint() {
+        let (_tmp, provider) = provider_for_manifest(exit_manifest()).await;
+        let response = provider
+            .send_raw(&json!({
+                "op": "capsule",
+                "id": "capsule:exit-provider"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["status"], "ok");
+        let text = response.to_string();
+        assert!(!text.contains("do-not-echo"));
+        assert_eq!(response["data"]["provenance"]["signature_present"], true);
+        assert!(response["data"]["provenance"]["signature_fingerprint"].is_string());
     }
 
     #[tokio::test]
@@ -2406,11 +2521,21 @@ mod tests {
     #[tokio::test]
     async fn unknown_op_is_rejected() {
         let resp = provider_with_probe()
-            .send_raw(&json!({ "op": "revoke" }))
+            .send_raw(&json!({ "op": "definitely-not-an-op" }))
             .await
             .unwrap();
         assert_eq!(resp["status"], "error");
         assert_eq!(resp["code"], "unknown_op");
+    }
+
+    #[tokio::test]
+    async fn revoke_is_explicitly_unimplemented() {
+        let resp = provider_with_probe()
+            .send_raw(&json!({ "op": "revoke" }))
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "error");
+        assert_eq!(resp["code"], "unsupported_operation");
     }
 
     #[tokio::test]
