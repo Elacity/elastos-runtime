@@ -59,10 +59,15 @@ routing, audit) holds full app and service implementations whose capsules alread
   `capsules/chat-room` and `capsules/chat-room-ui` exist.
 - `elastos/crates/elastos-server/src/library.rs` (**6,904**) and `documents.rs` — app CRUD
   for surfaces that have `capsules/library` and `capsules/documents`.
-- `elastos/crates/elastos-runtime/src/provider/registry.rs:448-476` — `RESERVED_SUB_NAMES`
+- `elastos/crates/elastos-runtime/src/provider/registry.rs` — `RESERVED_SUB_NAMES`
   hardcodes a closed allowlist of specific app/service names (`wallet`, `drm`, `library`,
   `media`, `browser-engine`…); every new provider edits the trusted core. Replace with
   manifest/capability-declared registration so the taxonomy lives outside the core.
+  **DESIGN gap only now — the acute risks are build-guarded:** a name-drop that would silently
+  dark a provider is caught pre-boot by `test_all_capsule_provided_sub_schemes_are_reserved`
+  (`1fc2a14`, scans every shipped `capsule.json` `provides` sub-scheme), and a launched capsule
+  can no longer overwrite a boot-registered security-critical sub-provider
+  (`encrypt`/`key`/`decrypt`/`wallet`/…) — that slot is pinned first-writer-wins (`8b688fc`).
 
 Largest core files by size pressure (mixed-concern candidates to move out, in order):
 `content.rs` 13,062 · `carrier.rs` 8,263 · `library.rs` 6,904 · `room_service.rs` 5,441 ·
