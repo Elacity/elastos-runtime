@@ -654,12 +654,20 @@ async fn setup_server_infrastructure_impl(
                     let encrypt_provider: Arc<dyn provider::Provider> = Arc::new(
                         provider::CapsuleProvider::with_scheme(Arc::new(bridge), "encrypt"),
                     );
-                    if let Err(e) = provider_registry
+                    // AUD-6: `encrypt` (CEK escrow) is boot-critical. A spawned-but-unregisterable
+                    // provider is an INVARIANT violation (a dark mint path), not an optional-absent
+                    // binary — fail the boot LOUD rather than warn-and-continue. (Absent binary is
+                    // still the outer `else` warn: genuinely optional in a build without it.)
+                    provider_registry
                         .register_sub_provider("encrypt", encrypt_provider)
                         .await
-                    {
-                        tracing::warn!("Failed to register elastos://encrypt sub-provider: {}", e);
-                    }
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "boot-critical sub-provider 'encrypt' (CEK escrow) spawned but \
+                                 failed to register: {e} (AUD-6: refusing to boot with a dark \
+                                 mint path)"
+                            )
+                        })?;
                     tracing::info!("encrypt-provider capsule from {}", path.display());
                 }
                 Err(e) => tracing::warn!("Failed to spawn encrypt-provider: {}", e),
@@ -1479,6 +1487,33 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    // AUD-6 ratchet (build-visible; #[ignore]d = fails today, non-blocking): every boot-critical
+    // sub-provider must PROPAGATE a register_sub_provider failure (a spawned-but-unregisterable
+    // escrow/keys/signing/mint provider is an invariant violation = a dark path), NOT warn-and-
+    // continue. `encrypt` (CEK escrow) is rewired to fail loud; the rest still warn-swallow, so this
+    // is ignored until they are classified + rewired. Close the gap = remove the warn lines for the
+    // set below, delete `#[ignore]`, the test goes green, and AUD-6 moves to Closed.
+    // (Absent-binary stays a warn — genuinely optional — and is NOT scanned here.)
+    #[test]
+    #[ignore = "AUD-6: only `encrypt` fails loud so far; flip when the rest of the boot-critical spine propagates registration failures"]
+    fn aud6_boot_critical_sub_provider_registration_fails_loud() {
+        let src = include_str!("server_infra.rs");
+        let mut still_swallowing = Vec::new();
+        for critical in [
+            "encrypt", "publish", "media", "key", "decrypt", "drm", "rights", "wallet", "chain",
+        ] {
+            let warn = format!("Failed to register elastos://{critical} sub-provider");
+            if src.contains(&warn) {
+                still_swallowing.push(critical);
+            }
+        }
+        assert!(
+            still_swallowing.is_empty(),
+            "boot-critical sub-providers still warn-swallow their registration failure (AUD-6, \
+             invariant violation should fail boot loud): {still_swallowing:?}"
+        );
+    }
 
     struct EnvGuard {
         keys: &'static [&'static str],
