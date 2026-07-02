@@ -198,8 +198,12 @@ fn default_iv_size() -> u8 {
 #[cfg(feature = "escrow")]
 fn decode_kid16(kid_hex: &str) -> Result<[u8; 16], String> {
     let s = kid_hex.strip_prefix("0x").unwrap_or(kid_hex);
-    if s.len() != 32 {
-        return Err(format!("kid must be 32 hex chars, got {}", s.len()));
+    // Validate BOTH length and charset in BYTES before any byte-offset slicing below: `str::len()`
+    // counts bytes, so a 32-byte string containing multibyte UTF-8 would pass a bare length gate yet
+    // split a char boundary in `&s[i * 2..i * 2 + 2]` and PANIC (crashing the capsule on a malformed
+    // request). Requiring ASCII hex digits keeps every char exactly one byte, so the slices are safe.
+    if s.len() != 32 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("kid must be 32 ASCII hex chars".to_string());
     }
     let mut out = [0u8; 16];
     for (i, byte) in out.iter_mut().enumerate() {
@@ -1606,6 +1610,33 @@ fn main() {
 mod tests {
     use super::*;
     use base64::Engine;
+
+    /// Regression: a `kid_hex` that is 32 BYTES but contains multibyte UTF-8 must be REJECTED, not
+    /// panic. Before the fix the byte-length gate `s.len() == 32` passed while the byte-offset slice
+    /// `&s[i*2..i*2+2]` split a char boundary, crashing the capsule process on a malformed request
+    /// instead of returning an error like every other validation path.
+    #[test]
+    #[cfg(feature = "escrow")]
+    fn decode_kid16_rejects_multibyte_input_without_panicking() {
+        // "a" + 15×'é' (2 bytes each) + "b" = 32 bytes but only 17 chars.
+        let mut kid = String::from("a");
+        for _ in 0..15 {
+            kid.push('é');
+        }
+        kid.push('b');
+        assert_eq!(kid.len(), 32, "the input must hit the 32-byte length gate");
+        assert!(
+            decode_kid16(&kid).is_err(),
+            "a 32-byte multibyte kid must be rejected, not panic"
+        );
+
+        // Genuine 32-hex kids still decode (with or without the 0x prefix).
+        assert!(decode_kid16("00112233445566778899aabbccddeeff").is_ok());
+        assert!(decode_kid16("0x00112233445566778899aabbccddeeff").is_ok());
+        // Wrong length and non-hex ASCII are rejected cleanly (no panic).
+        assert!(decode_kid16("00112233").is_err());
+        assert!(decode_kid16("zz112233445566778899aabbccddeeff").is_err());
+    }
     use zeroize::Zeroize;
 
     fn seal_request_json() -> Value {

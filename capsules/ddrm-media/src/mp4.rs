@@ -371,14 +371,47 @@ pub fn strip_senc(frag: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Wrap arbitrary bytes as a single-sample fragmented-MP4 fragment so a NON-MEDIA
-/// Audio sample-entry 4CCs — everything else is treated as video. Used to pick the
-/// protected entry type (`enca` vs `encv`) per ISO/IEC 23001-7 §4.
+/// True for known AUDIO sample-entry 4CCs. This is the FALLBACK for the `enca`-vs-`encv` choice per
+/// ISO/IEC 23001-7 §4 when a track's authoritative `hdlr` handler type is unavailable — the handler
+/// type ('soun'/'vide') is the primary signal (see [`is_audio_sample_entry`]). The list covers the
+/// codecs a DASH/CMAF audio track realistically carries so an uncommon-but-valid audio codec is not
+/// mis-signaled as video (which would make a non-compliant init AND missize the strip fixed fields).
+/// This is also the single source of truth for [`parse_codec_string`]'s audio/video split.
 fn is_audio_fourcc(fourcc: &[u8; 4]) -> bool {
     matches!(
         fourcc,
-        b"mp4a" | b"Opus" | b"opus" | b"fLaC" | b"flac" | b"ac-3" | b"ec-3" | b"enca"
+        b"mp4a"
+            | b"Opus"
+            | b"opus"
+            | b"fLaC"
+            | b"flac"
+            | b"ac-3"
+            | b"ec-3"
+            | b"ac-4"
+            | b"alac"
+            | b"dtsc"
+            | b"dtse"
+            | b"dtsh"
+            | b"dtsl"
+            | b"mha1"
+            | b"mhm1"
+            | b".mp3"
+            | b"enca"
     )
+}
+
+/// Choose AUDIO vs VIDEO for the CENC protected sample entry (`enca` vs `encv`). The track's `hdlr`
+/// handler type is AUTHORITATIVE — 'soun' = audio, 'vide' = video — because it is set per ISO-BMFF
+/// independent of the codec. Only when the handler type is absent/unknown (zeroed) do we fall back to
+/// the codec-4CC allowlist [`is_audio_fourcc`]. This keeps an uncommon audio codec from being
+/// mis-signaled as `encv` (a non-compliant init that also makes [`strip_cenc_signal`] pick the wrong
+/// fixed-field size).
+fn is_audio_sample_entry(handler_type: &[u8; 4], fourcc: &[u8; 4]) -> bool {
+    match handler_type {
+        b"soun" => true,
+        b"vide" => false,
+        _ => is_audio_fourcc(fourcc),
+    }
 }
 
 /// Rebuild `container` (located at `container_off`) with the single child at
@@ -413,6 +446,9 @@ struct StsdPath {
     stbl: (usize, BoxHeader),
     stsd: (usize, BoxHeader),
     entry: (usize, BoxHeader),
+    /// The track's `mdia > hdlr` handler type ('soun'/'vide'); zeroed if no `hdlr` is present. The
+    /// authoritative audio/video signal for the `enca`/`encv` choice (see [`is_audio_sample_entry`]).
+    handler_type: [u8; 4],
 }
 
 fn locate_stsd_path(init: &[u8]) -> Result<StsdPath, String> {
@@ -427,6 +463,16 @@ fn locate_stsd_path(init: &[u8]) -> Result<StsdPath, String> {
     let (mdia_off, mdia_h) = find_box(init, trak_off + trak_h.header_size, trak_end, b"mdia")
         .ok_or("trak has no mdia")?;
     let mdia_end = mdia_off + mdia_h.size;
+    // The AUTHORITATIVE track kind for the enca/encv choice: the mdia>hdlr handler_type. Zeroed when
+    // no hdlr is present, in which case the caller falls back to the codec-4CC allowlist.
+    let mut handler_type = [0u8; 4];
+    if let Some((hdlr_off, hdlr_h)) = find_box(init, mdia_off + mdia_h.header_size, mdia_end, b"hdlr")
+    {
+        let h_at = hdlr_off + hdlr_h.header_size + 8;
+        if let Some(slice) = init.get(h_at..h_at + 4) {
+            handler_type.copy_from_slice(slice);
+        }
+    }
     let (minf_off, minf_h) = find_box(init, mdia_off + mdia_h.header_size, mdia_end, b"minf")
         .ok_or("mdia has no minf")?;
     let minf_end = minf_off + minf_h.size;
@@ -450,6 +496,7 @@ fn locate_stsd_path(init: &[u8]) -> Result<StsdPath, String> {
         stbl: (stbl_off, stbl_h),
         stsd: (stsd_off, stsd_h),
         entry: (entry_off, entry_h),
+        handler_type,
     })
 }
 
@@ -500,7 +547,7 @@ pub fn cenc_signal_init(
     if &orig_fourcc == b"encv" || &orig_fourcc == b"enca" {
         return Err("init is already CENC-signaled (encv/enca present)".into());
     }
-    let prot_fourcc: &[u8; 4] = if is_audio_fourcc(&orig_fourcc) {
+    let prot_fourcc: &[u8; 4] = if is_audio_sample_entry(&p.handler_type, &orig_fourcc) {
         b"enca"
     } else {
         b"encv"
@@ -987,7 +1034,9 @@ fn parse_codec_string(data: &[u8], stsd_off: usize, stsd_size: usize) -> String 
         return "unknown".to_string();
     };
     let fourcc = entry.box_type;
-    let is_audio_entry = matches!(&fourcc, b"mp4a" | b"Opus" | b"fLaC" | b"enca");
+    // One source of truth for the audio/video split (was a divergent inline list that misclassified
+    // ac-3/ec-3/etc. as video and thus computed the wrong child-box offset).
+    let is_audio_entry = is_audio_fourcc(&fourcc);
     let child_start = content_start
         + entry.header_size
         + if is_audio_entry {
@@ -1465,6 +1514,90 @@ mod meta_tests {
         init.extend_from_slice(&ftyp);
         init.extend_from_slice(&moov);
         init
+    }
+
+    /// Like [`minimal_init`] but the `mdia` also carries an `hdlr` box with `handler_type`, so the
+    /// authoritative audio/video signal (not just the codec 4CC) is exercised.
+    fn minimal_init_hdlr(
+        entry_fourcc: &[u8; 4],
+        fixed_bytes: usize,
+        codec_child: &[u8],
+        handler_type: &[u8; 4],
+    ) -> Vec<u8> {
+        let mut entry_content = vec![0u8; fixed_bytes];
+        entry_content.extend_from_slice(codec_child);
+        let entry = make_box(entry_fourcc, &entry_content);
+        let mut stsd_content = vec![0, 0, 0, 0, 0, 0, 0, 1];
+        stsd_content.extend_from_slice(&entry);
+        let stsd = make_box(b"stsd", &stsd_content);
+        let stbl = make_box(b"stbl", &stsd);
+        let minf = make_box(b"minf", &stbl);
+        // hdlr: FullBox(4) + pre_defined(4) + handler_type(4) + reserved(12) + name("\0").
+        let mut hdlr_content = vec![0u8; 8];
+        hdlr_content.extend_from_slice(handler_type);
+        hdlr_content.extend_from_slice(&[0u8; 13]);
+        let hdlr = make_box(b"hdlr", &hdlr_content);
+        let mut mdia_content = Vec::new();
+        mdia_content.extend_from_slice(&hdlr);
+        mdia_content.extend_from_slice(&minf);
+        let mdia = make_box(b"mdia", &mdia_content);
+        let trak = make_box(b"trak", &mdia);
+        let mvhd = make_box(b"mvhd", &[0u8; 8]);
+        let mut moov_content = Vec::new();
+        moov_content.extend_from_slice(&mvhd);
+        moov_content.extend_from_slice(&trak);
+        let moov = make_box(b"moov", &moov_content);
+        let ftyp = make_box(b"ftyp", b"isom\0\0\0\0isomiso2");
+        let mut init = Vec::new();
+        init.extend_from_slice(&ftyp);
+        init.extend_from_slice(&moov);
+        init
+    }
+
+    /// Regression (ELACITY-2283): the `enca`/`encv` choice must follow the track's `hdlr` handler
+    /// type, NOT a codec-4CC guess. An audio track (`hdlr='soun'`) whose sample-entry 4CC is not in
+    /// the audio allowlist (here a deliberately unlisted `ipcm`) must still be signaled `enca` and
+    /// round-trip — before the fix it became `encv`, yielding a non-compliant init that `strip` then
+    /// missized (78-byte visual fixed fields over a 28-byte audio entry).
+    #[test]
+    fn cenc_signal_chooses_enca_from_the_hdlr_handler_type() {
+        let init = minimal_init_hdlr(
+            b"ipcm",
+            AUDIO_SAMPLE_ENTRY_FIXED_BYTES,
+            &make_box(b"pcmC", &[0u8; 6]),
+            b"soun",
+        );
+        let signaled =
+            cenc_signal_init(&init, &[0x33u8; 16], 8, &make_box(b"pssh", b"x")).expect("signal");
+        let p = locate_stsd_path(&signaled).expect("locate");
+        assert_eq!(
+            &p.entry.1.box_type, b"enca",
+            "hdlr='soun' must force enca regardless of the sample-entry 4CC"
+        );
+        assert_eq!(
+            strip_cenc_signal(&signaled).expect("strip"),
+            init,
+            "an authoritatively-audio entry must round-trip via the audio fixed-field size"
+        );
+    }
+
+    /// Regression (ELACITY-2283): with no `hdlr` to consult, the codec-4CC fallback must recognize
+    /// the common audio codecs the old list omitted (here `ac-3`) as `enca`, not video.
+    #[test]
+    fn cenc_signal_classifies_ac3_audio_as_enca_via_fallback() {
+        let init = minimal_init(
+            b"ac-3",
+            AUDIO_SAMPLE_ENTRY_FIXED_BYTES,
+            &make_box(b"dac3", &[0u8; 3]),
+        );
+        let signaled =
+            cenc_signal_init(&init, &[0x44u8; 16], 8, &make_box(b"pssh", b"x")).expect("signal");
+        assert_eq!(
+            &locate_stsd_path(&signaled).expect("locate").entry.1.box_type,
+            b"enca",
+            "ac-3 must be recognized as audio by the expanded fallback allowlist"
+        );
+        assert_eq!(strip_cenc_signal(&signaled).expect("strip"), init);
     }
 
     #[test]
