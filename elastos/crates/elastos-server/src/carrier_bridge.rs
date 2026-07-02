@@ -565,6 +565,19 @@ fn carrier_invoke_dispatch(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "carrier_invoke missing operation".to_string())?
         .to_string();
+    // Fail-closed containment (audit T6): `operation` is interpolated into the
+    // provider URL path (`/api/provider/{scheme}/{operation}`), and `Url::join`
+    // normalizes `..` segments — an operation like `x/../../capability/request`
+    // would escape the provider gate and reach arbitrary local-API endpoints as
+    // the capsule's own token. Restrict it to a single safe path segment.
+    if !operation
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return Err(format!(
+            "carrier_invoke operation must be a single [A-Za-z0-9_-] segment, got {operation:?}"
+        ));
+    }
 
     let scheme = provider_scheme_for_carrier_uri(&uri)?;
     let mut body = request
@@ -2731,6 +2744,45 @@ mod tests {
             error,
             "localhost://Users/self requires a principal-scoped launch context"
         );
+    }
+
+    /// Audit T6: a carrier `operation` carrying path-traversal (`..`, `/`) must
+    /// be refused, so it cannot escape `/api/provider/{scheme}/{op}` via
+    /// `Url::join` normalization and reach arbitrary local-API endpoints.
+    #[test]
+    fn carrier_invoke_dispatch_rejects_path_traversal_operation() {
+        for op in [
+            "x/../../capability/request",
+            "read/../grant",
+            "a/b",
+            "with.dot",
+            "pct%2e",
+        ] {
+            let result = carrier_invoke_dispatch(
+                &serde_json::json!({
+                    "type": "carrier_invoke",
+                    "uri": "elastos://content",
+                    "operation": op,
+                    "body": {}
+                }),
+                None,
+            );
+            assert!(
+                result.is_err(),
+                "operation {op:?} must be refused as a non-segment"
+            );
+        }
+        // A normal underscore/alnum op still parses.
+        assert!(carrier_invoke_dispatch(
+            &serde_json::json!({
+                "type": "carrier_invoke",
+                "uri": "localhost://Local/SharedByLocalUsersAndBots/Home/a.md",
+                "operation": "has_access_by_content_id",
+                "body": {}
+            }),
+            None,
+        )
+        .is_ok());
     }
 
     #[test]

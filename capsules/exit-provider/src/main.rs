@@ -1614,7 +1614,17 @@ fn public_dns_resolver(netloc: &str) -> io::Result<Vec<SocketAddr>> {
 }
 
 fn http_agent(timeout_secs: u64, allow_private_targets: bool) -> ureq::Agent {
-    let builder = ureq::AgentBuilder::new().timeout(Duration::from_secs(timeout_secs));
+    // Fail-closed egress (audit T5): NEVER auto-follow redirects. ureq's default
+    // (5 redirects) would let an allowlisted host `302` the fetch to any other
+    // host — the private agent has no IP-validating resolver on redirect hops,
+    // and the backend host allowlist is only checked against the INITIAL URL —
+    // so a redirect could reach cloud metadata / a non-allowlisted host. With
+    // `redirects(0)` the mediator returns the 3xx to the caller instead of
+    // following; the capsule must re-issue `http_fetch` for the new URL, which
+    // re-runs the full URL + host + allowlist + resolver validation per hop.
+    let builder = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(timeout_secs))
+        .redirects(0);
     if allow_private_targets {
         builder.build()
     } else {
