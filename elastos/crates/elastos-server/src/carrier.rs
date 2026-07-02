@@ -1392,6 +1392,24 @@ async fn carrier_provider_invoke_registry(
             "error": "Carrier provider invocation must target an ElastOS service provider, not a raw backend",
         }));
     }
+    // Fail-closed containment gate (audit T1): `handle_file_connection` accepts
+    // every inbound peer with NO authentication, and the envelope check below is
+    // self-referential (it validates caller-supplied fields against each other,
+    // not against a runtime-issued capability), so anything reachable here is
+    // reachable by any anonymous remote peer. Restrict the anonymous plane to
+    // non-mutating reads only — writes and all key/decrypt/drm/rights ops are
+    // refused until authenticated peer sessions land.
+    if !carrier_provider_plane_allows_unauthenticated(target, operation) {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "code": "unauthorized_provider_operation",
+            "error": format!(
+                "operation {target}:{operation} is not permitted on the unauthenticated \
+                 carrier provider plane (read-only; writes and key/decrypt/drm/rights \
+                 require an authenticated peer session)"
+            ),
+        }));
+    }
     if let Err(message) =
         validate_carrier_provider_invocation(source, target, operation, transfer, &request)
     {
@@ -1419,6 +1437,34 @@ fn carrier_provider_target_allowed(target: &str) -> bool {
     matches!(
         target,
         "content" | "availability" | "rights" | "key" | "decrypt" | "drm"
+    )
+}
+
+/// The ONLY `(target, operation)` pairs an *unauthenticated* inbound Carrier peer
+/// may invoke over the provider_invoke plane. This is a strict default-DENY
+/// allowlist of *non-mutating reads*, per the KEEP containment principle
+/// (fail-closed, capability-mediated):
+///
+///   - `content:fetch` — pull already-published bytes (pull replication),
+///   - `content:status` — read publish/availability status,
+///   - `content:admission` — a storage-quota *decision* ("would you store this?") that computes and returns a verdict without writing.
+///
+/// Everything else is refused on the anonymous plane, deliberately:
+///   - content **writes** (`publish`/`import_exact`/`import_object`/`ensure`/
+///     `unpublish`/`repair`): an unauthenticated remote could otherwise pin
+///     arbitrary bytes into this node's store under a *caller-supplied*
+///     `principal_id` (unauthorized write + quota-attribution abuse);
+///   - **all** `key`/`decrypt`/`drm`/`rights`/`availability` operations: these
+///     can release or gate key material / DRM rights and must never be reachable
+///     without an authenticated peer session.
+///
+/// Authenticated push-replication and cross-node key/rights flows are re-enabled
+/// once real Carrier peer authentication lands (tracked in KNOWN_GAPS as the
+/// carrier peer-auth gap). Widening this set without peer auth reopens T1.
+fn carrier_provider_plane_allows_unauthenticated(target: &str, operation: &str) -> bool {
+    matches!(
+        (target, operation),
+        ("content", "fetch") | ("content", "status") | ("content", "admission")
     )
 }
 
@@ -7473,6 +7519,80 @@ mod tests {
 
         assert_eq!(response["ok"], false);
         assert_eq!(response["code"], "unauthorized_provider_target");
+    }
+
+    /// Audit T1 / carrier peer-auth gap: a WRITE op (content:publish) on the
+    /// unauthenticated provider_invoke plane must be refused *before* it ever
+    /// reaches the provider, so a remote peer cannot pin bytes under a
+    /// caller-supplied principal. Refusal happens ahead of `send_raw`, so an
+    /// empty registry (no content provider) still proves the gate fired.
+    #[tokio::test]
+    async fn test_carrier_provider_invoke_refuses_write_op_on_anonymous_plane() {
+        let registry = ProviderRegistry::new();
+        let request = serde_json::json!({
+            "source": "carrier-availability",
+            "target": "content",
+            "operation": "publish",
+            "transfer": "json",
+            "request": {
+                "op": "publish",
+                "principal_id": "did:key:zAttacker",
+                "_runtime_invocation": {
+                    "schema": "elastos.provider.invocation/v1",
+                    "source": "carrier-availability",
+                    "target": "content",
+                    "op": "publish",
+                    "capability": "provider:carrier-availability->content:publish",
+                    "transport": "carrier-provider-plane",
+                    "carrier": { "route": "connect_ticket" },
+                    "transfer": "json"
+                }
+            }
+        });
+
+        let response = carrier_provider_invoke_registry(&registry, &request)
+            .await
+            .unwrap();
+
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["code"], "unauthorized_provider_operation");
+    }
+
+    /// Audit T1 (critical caveat): key/decrypt/drm are reachable targets, but no
+    /// key-material op may be invoked without an authenticated peer session.
+    /// Every key/decrypt/drm operation is refused on the anonymous plane.
+    #[tokio::test]
+    async fn test_carrier_provider_invoke_refuses_key_material_ops_on_anonymous_plane() {
+        let registry = ProviderRegistry::new();
+        for (target, op) in [("key", "unwrap"), ("decrypt", "decrypt"), ("drm", "license")] {
+            let request = serde_json::json!({
+                "source": "carrier-availability",
+                "target": target,
+                "operation": op,
+                "transfer": "json",
+                "request": {
+                    "op": op,
+                    "_runtime_invocation": {
+                        "schema": "elastos.provider.invocation/v1",
+                        "source": "carrier-availability",
+                        "target": target,
+                        "op": op,
+                        "capability": format!("provider:carrier-availability->{target}:{op}"),
+                        "transport": "carrier-provider-plane",
+                        "carrier": { "route": "connect_ticket" },
+                        "transfer": "json"
+                    }
+                }
+            });
+            let response = carrier_provider_invoke_registry(&registry, &request)
+                .await
+                .unwrap();
+            assert_eq!(response["ok"], false, "{target}:{op} must be refused");
+            assert_eq!(
+                response["code"], "unauthorized_provider_operation",
+                "{target}:{op} must be refused as an unauthorized operation"
+            );
+        }
     }
 
     #[tokio::test]
