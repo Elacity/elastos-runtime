@@ -810,11 +810,18 @@ fn read_dash_file(dir: &std::path::Path, rel: &str) -> Result<Vec<u8>, String> {
 /// Read a DASH **init** segment from the dir and down-convert it for the server-decrypt rail:
 /// strip any MPEG-DASH/CENC signaling (`encv`/`enca` -> original, drop `sinf`/`tenc`/`pssh`) so it
 /// matches the PLAINTEXT init the mint sealed (the seal binds `first_init` BEFORE PSSH injection)
-/// AND the clear, `senc`-stripped segments this rail serves. No-op on unsignaled inits (demo /
-/// pre-compliance assets); best-effort — a malformed init falls back to the raw bytes.
+/// AND the clear, `senc`-stripped segments this rail serves.
+///
+/// `strip_cenc_signal` returns the init UNCHANGED for unsignaled inits (demo / pre-compliance
+/// assets), so an `Err` here means the init is malformed or only partially CENC-signaled — exactly
+/// the case where silently falling back to the raw signaled bytes would bind a NON-canonical init
+/// (breaking the seal's plaintext-`first_init` match) and surface downstream as an opaque
+/// decrypt/quorum failure. We propagate the precise strip error instead of swallowing it, so the
+/// producer-side format fault is diagnosed at the right layer rather than misattributed to the CEK.
 fn read_dash_init(dir: &std::path::Path, rel: &str) -> Result<Vec<u8>, String> {
     let raw = read_dash_file(dir, rel)?;
-    Ok(ddrm_media::mp4::strip_cenc_signal(&raw).unwrap_or(raw))
+    ddrm_media::mp4::strip_cenc_signal(&raw)
+        .map_err(|e| format!("strip CENC signaling from init {rel:?}: {e}"))
 }
 
 /// A warm quorum open: the CEK is recovered + sealed into the live decrypt boundary. Drives
@@ -1470,6 +1477,45 @@ fn serve_pixel_lock(open: &mut QuorumOpen, args: &QuorumArgs) -> Result<(), Stri
 fn reply(out: &mut impl Write, value: &Value) -> Result<(), String> {
     writeln!(out, "{value}").map_err(|e| format!("write reply: {e}"))?;
     out.flush().map_err(|e| format!("flush reply: {e}"))
+}
+
+#[cfg(test)]
+mod init_read_tests {
+    use super::*;
+
+    /// Regression (ELACITY-2282/2283): a malformed or partially-CENC-signaled init makes
+    /// `strip_cenc_signal` fail; `read_dash_init` must PROPAGATE that error rather than silently
+    /// falling back to the raw bytes (the old `unwrap_or(raw)`), which would bind a NON-canonical
+    /// init into the transcript and surface downstream as an opaque decrypt/quorum failure instead of
+    /// the precise producer-side format fault.
+    #[test]
+    fn read_dash_init_propagates_strip_errors_instead_of_swallowing() {
+        let dir = std::env::temp_dir().join(format!(
+            "ddrm-init-read-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A well-formed `ftyp` box but NO `moov` → strip_cenc_signal errs ("init has no moov"),
+        // which the old `unwrap_or(raw)` would have silently swallowed back to the raw bytes.
+        let mut init = vec![0u8, 0, 0, 12];
+        init.extend_from_slice(b"ftyp");
+        init.extend_from_slice(b"isom");
+        std::fs::write(dir.join("init.mp4"), &init).unwrap();
+
+        let err =
+            read_dash_init(&dir, "init.mp4").expect_err("a malformed init must not be swallowed");
+        assert!(
+            err.contains("strip CENC signaling"),
+            "the strip error must be surfaced precisely, got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

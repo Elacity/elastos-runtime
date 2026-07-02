@@ -692,6 +692,35 @@ fn collect_quorum_shares(
     (results, served)
 }
 
+/// The outcome of a delegated recover on one node connection. Distinguishes a TRANSPORT fault (the
+/// socket/framing failed — typically a warm pooled connection the node's idle timeout closed while
+/// our session token was still live by TTL, ELACITY-2282) from a node REJECTION (the recover reached
+/// the node and it refused: revoked caller, bad proof, expired token). Only a transport fault is
+/// safe to retry on a fresh session; a rejection MUST fail closed and must never be retried, so a
+/// real denial is never masked and the nodes are never hammered.
+#[cfg(all(feature = "key-authority-ref", unix))]
+#[derive(Debug)]
+enum NodeRecoverError {
+    Transport(String),
+    Rejected(String),
+}
+
+#[cfg(all(feature = "key-authority-ref", unix))]
+impl NodeRecoverError {
+    /// The human-readable, fail-closed error string this outcome surfaces to the release path.
+    fn message(self) -> String {
+        match self {
+            NodeRecoverError::Transport(m) | NodeRecoverError::Rejected(m) => m,
+        }
+    }
+
+    /// True only for a transport fault: retry ONCE on a freshly-established session is safe. A node
+    /// rejection returns false — it is a genuine denial that must fail closed without a retry.
+    fn is_retryable_on_fresh_session(&self) -> bool {
+        matches!(self, NodeRecoverError::Transport(_))
+    }
+}
+
 /// OPEN the long-lived node connection + establish the handshake session ONCE: spawn the granted
 /// `endpoint`, `init` it (the node resolves its OWN master store), then run the identity handshake —
 /// send a fresh challenge, require a signature over it under the descriptor-PINNED verifying key
@@ -1842,7 +1871,8 @@ impl KeyProvider {
     /// validate the node's reply. Shared by both the cold (fresh-establish) and warm (pooled) quorum
     /// paths so the per-node security gates — session token echo + monotonic `recover_seq` + caller
     /// possession proof — are byte-identical regardless of whether the session was just opened or
-    /// reused. Returns the node's re-sealed material `data`, or a fail-closed error string.
+    /// reused. Returns the node's re-sealed material `data`, or a [`NodeRecoverError`] that tells the
+    /// caller whether the failure is safe to retry on a fresh session.
     #[cfg(all(feature = "key-authority-ref", unix))]
     fn run_recover_on_conn(
         conn: &mut DkmsNodeConn,
@@ -1852,7 +1882,7 @@ impl KeyProvider {
         decrypt_session_pub_b64: &str,
         content_id: &str,
         now: Option<u64>,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, NodeRecoverError> {
         let t_rec = std::time::Instant::now();
         let recover_seq = conn.next_recover_seq();
         let recover =
@@ -1873,19 +1903,28 @@ impl KeyProvider {
             client_endpoint,
             t_rec.elapsed().as_millis()
         );
-        let recover = recover.map_err(|err| format!("dkms node transport failed: {err}"))?;
+        // A TRANSPORT fault (socket/framing) on a warm pooled connection is the node's idle timeout
+        // closing a socket our token still considers live — safe to retry ONCE on a fresh session.
+        let recover = recover.map_err(|err| {
+            NodeRecoverError::Transport(format!("dkms node transport failed: {err}"))
+        })?;
+        // The recover REACHED the node and it refused (revoked caller / bad proof / expired token):
+        // a genuine denial that must fail closed and must NEVER be retried (retrying would hammer the
+        // node and could mask a real revocation).
         if recover.get("status").and_then(|v| v.as_str()) != Some("ok") {
-            return Err(format!(
+            return Err(NodeRecoverError::Rejected(format!(
                 "dkms node recover failed: {}",
                 recover
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("recover rejected")
-            ));
+            )));
         }
         match recover.get("data") {
             Some(data) => Ok(data.clone()),
-            None => Err("dkms node recover returned no material".to_string()),
+            None => Err(NodeRecoverError::Rejected(
+                "dkms node recover returned no material".to_string(),
+            )),
         }
     }
 
@@ -1909,7 +1948,9 @@ impl KeyProvider {
     ) -> Result<Value, String> {
         // CHECK OUT: take this node's warm connection if present + still live; otherwise establish a
         // fresh one. We hold the pool lock only across the cheap map op, never across the slow recover.
-        let mut conn = {
+        // `reused` tracks whether we took a WARM connection — the only case a transport fault is worth
+        // retrying (a freshly-established connection that transport-fails is a genuine node fault).
+        let (mut conn, reused) = {
             let mut guard = pool
                 .lock()
                 .map_err(|_| "dkms pool lock poisoned".to_string())?;
@@ -1919,7 +1960,7 @@ impl KeyProvider {
                         "key-provider timing: reuse warm session ({})",
                         client.endpoint
                     );
-                    c
+                    (c, true)
                 }
                 _ => {
                     drop(guard);
@@ -1930,27 +1971,55 @@ impl KeyProvider {
                         client.endpoint,
                         t_sess.elapsed().as_millis()
                     );
-                    c
+                    (c, false)
                 }
             }
         };
-        let result = Self::run_recover_on_conn(
-            &mut conn,
-            &client.endpoint,
-            recover_req,
-            kid_hex,
-            decrypt_session_pub_b64,
-            content_id,
-            now,
-        );
-        // CHECK IN on success so the next open reuses the advanced session; DROP on error so a broken
-        // or rejected connection is never reused (the next open re-establishes from cold, fail-closed).
-        if result.is_ok() {
-            if let Ok(mut guard) = pool.lock() {
-                guard.insert(client.endpoint.clone(), conn);
+        let recover_on = |conn: &mut DkmsNodeConn| {
+            Self::run_recover_on_conn(
+                conn,
+                &client.endpoint,
+                recover_req,
+                kid_hex,
+                decrypt_session_pub_b64,
+                content_id,
+                now,
+            )
+        };
+        match recover_on(&mut conn) {
+            // CHECK IN on success so the next open reuses the advanced session.
+            Ok(value) => {
+                if let Ok(mut guard) = pool.lock() {
+                    guard.insert(client.endpoint.clone(), conn);
+                }
+                Ok(value)
             }
+            // WARM-CONNECTION TRANSPORT FAULT (ELACITY-2282): the node's 30s idle read-timeout closed
+            // the pooled socket while our token was still live by its 300s TTL, so the reused write
+            // hit a dead socket. The old `conn` is already dropped (fail-closed). Re-establish a FRESH
+            // session and retry the recover ONCE — the first open after any >30s idle gap now succeeds
+            // instead of failing closed below quorum. A genuine node outage fails the fresh attempt
+            // too and then fails closed.
+            Err(outcome) if reused && outcome.is_retryable_on_fresh_session() => {
+                eprintln!(
+                    "key-provider: warm dkms session transport-failed ({}); re-establishing once",
+                    client.endpoint
+                );
+                let mut fresh = establish_dkms_session(client, now)?;
+                match recover_on(&mut fresh) {
+                    Ok(value) => {
+                        if let Ok(mut guard) = pool.lock() {
+                            guard.insert(client.endpoint.clone(), fresh);
+                        }
+                        Ok(value)
+                    }
+                    Err(retry_outcome) => Err(retry_outcome.message()),
+                }
+            }
+            // A node REJECTION, or a transport fault on a just-established (cold) connection: fail
+            // closed with no retry (the connection is already dropped).
+            Err(outcome) => Err(outcome.message()),
         }
-        result
     }
 
     /// 2-of-3 QUORUM release (Day 113–116): dial + handshake + recover ALL THREE secret-holding
@@ -4175,6 +4244,31 @@ mod tests {
             assert!(!dkms_session_live(expires_at, Some(1_001)));
             // No clock → cannot prove liveness → fail closed (re-establish).
             assert!(!dkms_session_live(expires_at, None));
+        }
+
+        /// ELACITY-2282 (regression): the warm-connection retry decision. A TRANSPORT fault on a
+        /// reused pooled connection (the node's 30s idle read-timeout closed a socket our token still
+        /// considered live by its 300s TTL) is retryable on a fresh session — the fix that keeps the
+        /// first open after a >30s idle gap from failing closed below quorum. A node REJECTION
+        /// (revoked caller / bad proof / expired token) reached the node and is a genuine denial: it
+        /// must NOT be retried, or a real revocation could be masked and the nodes hammered.
+        #[test]
+        fn transport_fault_is_retryable_but_a_node_rejection_fails_closed() {
+            assert!(
+                NodeRecoverError::Transport("dkms node transport failed: broken pipe".to_string())
+                    .is_retryable_on_fresh_session(),
+                "a warm-socket transport fault must retry once on a fresh session",
+            );
+            assert!(
+                !NodeRecoverError::Rejected("dkms node recover failed: caller_revoked".to_string())
+                    .is_retryable_on_fresh_session(),
+                "a node rejection must fail closed with no retry",
+            );
+            // The surfaced message is preserved regardless of variant (fail-closed diagnostics).
+            assert_eq!(
+                NodeRecoverError::Rejected("caller_revoked".to_string()).message(),
+                "caller_revoked"
+            );
         }
 
         fn reference_provider() -> KeyProvider {
