@@ -1840,19 +1840,10 @@ fn room_transport_identity(
 }
 
 fn room_transport_identity_data_dir(data_dir: &std::path::Path) -> PathBuf {
-    #[cfg(test)]
-    let _env_read_guard = crate::api::gateway::trusted_auth_env_read_guard();
-    std::env::var_os(HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV)
-        .and_then(|value| {
-            let value = value.into_string().ok()?;
-            let value = value.trim();
-            if value.is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(value))
-            }
-        })
-        .unwrap_or_else(|| data_dir.to_path_buf())
+    // One authority root, one resolution path (Principle 10): delegate to the canonical
+    // `home_launch_auth_data_dir` rather than keep a byte-identical second copy of the env-var read
+    // + its test-serialization guard, so the two funnels can never drift.
+    crate::api::gateway::gateway_home_token::home_launch_auth_data_dir(data_dir)
 }
 
 fn peer_provider_request_blocking(

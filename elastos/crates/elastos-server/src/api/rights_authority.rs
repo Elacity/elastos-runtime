@@ -660,7 +660,6 @@ mod tests {
     use super::*;
 
     // Serialize the process-global env mutation across tests in this module.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     const SUBJECT: &str = "0x00000000000000000000000000000000000000bb";
 
@@ -673,7 +672,7 @@ mod tests {
     #[test]
     #[ignore]
     fn chain_mock_gate_allows_owned_and_denies_not_owned() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::api::ddrm_env_lock();
         std::env::set_var("ELASTOS_DDRM_RIGHTS", "chain-mock");
 
         std::env::remove_var("ELASTOS_DDRM_CHAIN_ACCESS");
@@ -744,7 +743,7 @@ mod tests {
     /// Chain mode with no wallet subject and no override must fail closed (not open).
     #[test]
     fn chain_mode_without_wallet_fails_closed() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::api::ddrm_env_lock();
         std::env::set_var("ELASTOS_DDRM_RIGHTS", "chain");
         let result = decide_owned_access(
             "did:test:nowallet",
@@ -770,7 +769,7 @@ mod tests {
     #[test]
     #[cfg(not(feature = "dev-modes"))]
     fn release_build_defaults_to_chain_and_refuses_dev_rights_modes() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::api::ddrm_env_lock();
 
         std::env::remove_var("ELASTOS_DDRM_RIGHTS");
         assert_eq!(
@@ -809,7 +808,7 @@ mod tests {
     #[test]
     #[cfg(feature = "dev-modes")]
     fn dev_build_allows_dev_rights_modes() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::api::ddrm_env_lock();
         std::env::set_var("ELASTOS_DDRM_RIGHTS", "dev");
         assert_eq!(rights_mode(), RightsMode::Dev);
         assert!(

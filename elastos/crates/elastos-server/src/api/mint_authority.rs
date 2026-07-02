@@ -228,9 +228,6 @@ fn synthetic_hash(to: &str, content_id: &str, now_unix: u64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// A free-mint MintAssembly (the simplest real mint: opRawData = abi.encode(bytes16),
     /// no sale terms). content_id is a 16-byte KID, hex-prefixed.
@@ -281,7 +278,7 @@ mod tests {
     #[test]
     #[ignore]
     fn chain_mock_mint_signs_and_broadcasts_real_tx() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::api::ddrm_env_lock();
         let dir = std::env::temp_dir().join(format!("mint-wallet-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("ELASTOS_DDRM_WALLET_BASE", dir.join("wallet"));

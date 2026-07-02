@@ -431,8 +431,6 @@ fn dev_subject(principal_id: &str, subject: &str) -> String {
 mod tests {
     use super::*;
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     const SUBJECT: &str = "0x00000000000000000000000000000000000000bb";
 
     // The dev buy loop (free ownership ledger, no on-chain payment) is a `dev-modes`-only path
@@ -441,7 +439,7 @@ mod tests {
     #[test]
     #[cfg(feature = "dev-modes")]
     fn dev_buy_records_ownership_and_returns_hash() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::api::ddrm_env_lock();
         let dir = std::env::temp_dir().join(format!("buy-dev-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("ELASTOS_DDRM_OWNED_LEDGER", dir.join("owned.json"));
@@ -458,7 +456,7 @@ mod tests {
 
     #[test]
     fn mock_intent_is_well_formed_for_the_wallet_capsule() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::api::ddrm_env_lock();
         // No pinned overrides -> `to` defaults to the real AuthorityGateway and the
         // calldata uses the real ERC-20 `buyAccess` selector (USDC default).
         for k in [
@@ -497,7 +495,7 @@ mod tests {
 
     #[test]
     fn chain_buy_without_wallet_fails_closed() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::api::ddrm_env_lock();
         std::env::set_var("ELASTOS_DDRM_RIGHTS", "chain");
         let result = buy_access("did:test:nowallet", "bafyX", "", 1_700_000_000);
         std::env::remove_var("ELASTOS_DDRM_RIGHTS");
@@ -513,7 +511,7 @@ mod tests {
     #[test]
     #[ignore]
     fn chain_mock_buy_records_then_ledger_reads_owned() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::api::ddrm_env_lock();
         let dir = std::env::temp_dir().join(format!("buy-mock-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("ELASTOS_DDRM_OWNED_LEDGER", dir.join("owned.json"));
@@ -541,7 +539,7 @@ mod tests {
     #[test]
     #[ignore]
     fn buy_then_open_loop_flips_rights_from_denied_to_allowed() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::api::ddrm_env_lock();
         let dir = std::env::temp_dir().join(format!("buy-loop-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("ELASTOS_DDRM_OWNED_LEDGER", dir.join("owned.json"));
@@ -593,7 +591,7 @@ mod tests {
     #[test]
     #[ignore]
     fn chain_mock_wallet_signs_and_broadcasts_real_tx() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::api::ddrm_env_lock();
         let dir = std::env::temp_dir().join(format!("buy-wallet-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("ELASTOS_DDRM_OWNED_LEDGER", dir.join("owned.json"));

@@ -28,3 +28,18 @@ pub mod viewer_media;
 pub mod viewer_object;
 pub mod viewer_open;
 pub mod wallet_signer;
+
+// One process-wide lock serializing tests that mutate the shared `ELASTOS_DDRM_*` environment
+// (rights/buy/mint/owned-ledger authority modules). These vars are process-global, so per-module
+// locks only serialize a module against ITSELF — a reader in one module could still observe another
+// module's mid-test mutation and fail closed. A single shared lock closes that cross-module race
+// (the same nondeterministic class the trusted-auth-env guard fixed). Poison is ignored: the
+// guarded unit is `()` with no invariant state.
+#[cfg(test)]
+pub(crate) fn ddrm_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static DDRM_ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    DDRM_ENV_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}

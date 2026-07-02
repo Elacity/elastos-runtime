@@ -102,11 +102,9 @@ pub fn record(content_id: &str, subject: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn record_then_contains_roundtrips_case_insensitively() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::api::ddrm_env_lock();
         let dir = std::env::temp_dir().join(format!("ledger-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("owned.json");
