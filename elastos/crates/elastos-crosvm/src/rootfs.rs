@@ -56,9 +56,11 @@ impl RootfsManager {
             base_rootfs.display()
         );
 
-        // For simplicity, create a copy of the rootfs
-        // This is inefficient but works for development
-        tokio::fs::copy(base_rootfs, &overlay_path)
+        // Create a writable copy of the base rootfs. Uses a reflink (CoW) clone
+        // when the cache filesystem supports it — an O(1) metadata op instead of
+        // a full byte copy of the (hundreds-of-MB) image — and transparently
+        // falls back to a full copy otherwise.
+        reflink_or_copy(base_rootfs, &overlay_path)
             .await
             .map_err(|e| {
                 ElastosError::Storage(format!(
@@ -161,10 +163,58 @@ impl RootfsManager {
     }
 }
 
+/// Create `dst` as a writable, fully-independent copy of `src`.
+///
+/// Attempts a reflink (copy-on-write) clone first via `cp --reflink=always`,
+/// which is an O(1) metadata operation on CoW filesystems (btrfs, xfs, zfs,
+/// bcachefs). On any failure — a non-CoW filesystem, a cross-device
+/// destination, or `cp` being unavailable — it falls back to a full byte copy.
+/// Either path yields an independent writable file with identical contents, so
+/// the caller's semantics are unchanged; only the cost differs. Used for VM
+/// rootfs overlays, which are ~hundreds of MB copied on every launch.
+pub async fn reflink_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let reflinked = tokio::process::Command::new("cp")
+        .arg("--reflink=always")
+        .arg("-f")
+        .arg("--")
+        .arg(src)
+        .arg(dst)
+        .output()
+        .await
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if reflinked {
+        return Ok(());
+    }
+    // Reflink unavailable/failed: remove any partial file the clone may have
+    // left, then fall back to a guaranteed full byte copy.
+    let _ = tokio::fs::remove_file(dst).await;
+    tokio::fs::copy(src, dst).await.map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn reflink_or_copy_produces_independent_identical_file() {
+        // Exercises whichever path the host filesystem supports (reflink or the
+        // byte-copy fallback); both must yield an independent file with
+        // identical contents, and mutating the copy must not touch the source.
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("base.bin");
+        let dst = temp.path().join("overlay.bin");
+        let payload = vec![0xABu8; 1024 * 64];
+        tokio::fs::write(&src, &payload).await.unwrap();
+
+        reflink_or_copy(&src, &dst).await.unwrap();
+
+        assert_eq!(tokio::fs::read(&dst).await.unwrap(), payload);
+        // Independence: writing the destination leaves the source unchanged.
+        tokio::fs::write(&dst, vec![0x00u8; 32]).await.unwrap();
+        assert_eq!(tokio::fs::read(&src).await.unwrap(), payload);
+    }
 
     #[tokio::test]
     async fn test_rootfs_manager_init() {

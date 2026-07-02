@@ -51,6 +51,7 @@ pub use egress_firewall::{
 pub use network::NetworkConfig;
 pub use provider::CrosvmProvider;
 pub use proxy::TcpProxy;
+pub use rootfs::reflink_or_copy;
 pub use vm::RunningVm;
 
 /// Check if the system supports crosvm (has KVM).

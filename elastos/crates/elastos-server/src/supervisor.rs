@@ -21,8 +21,8 @@ use crate::vm_provider::VmCapsuleProvider;
 
 use elastos_common::CapsuleRole;
 use elastos_crosvm::{
-    CrosvmConfig, EgressFirewall, NetworkConfig, RunningVm, VmConfig, EGRESS_LOG_RATE_PER_SEC,
-    EGRESS_NFLOG_GROUP,
+    reflink_or_copy, CrosvmConfig, EgressFirewall, NetworkConfig, RunningVm, VmConfig,
+    EGRESS_LOG_RATE_PER_SEC, EGRESS_NFLOG_GROUP,
 };
 use elastos_runtime::provider::ProviderRegistry;
 
@@ -1415,7 +1415,10 @@ impl Supervisor {
             let _ = tokio::fs::remove_file(&overlay_path).await;
             // Track BEFORE the fallible copy so a partial overlay is cleaned too.
             cleanup.overlay_path = Some(overlay_path.clone());
-            tokio::fs::copy(&rootfs_base, &overlay_path).await?;
+            // Reflink (CoW) clone when the cache filesystem supports it — O(1)
+            // instead of a full byte copy of the rootfs image — falling back to
+            // a full copy otherwise.
+            reflink_or_copy(&rootfs_base, &overlay_path).await?;
             vm_config.rootfs_path = overlay_path;
         }
 
