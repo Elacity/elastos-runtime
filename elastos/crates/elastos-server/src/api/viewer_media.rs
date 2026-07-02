@@ -280,9 +280,23 @@ pub(crate) async fn fetch_public_cover_bytes(
     if cid.is_empty() || cid.contains('/') || cid.contains(':') {
         return Err((StatusCode::NOT_FOUND, "this asset has no cover art"));
     }
-    let resp = registry
-        .send_raw("ipfs", &json!({ "op": "cat", "cid": cid }))
-        .await;
+    // Cover art is interactive chrome, not content: bound the fetch tightly. `timeout_ms` caps
+    // the provider's own network steps; the outer tokio timeout also frees THIS request (and the
+    // browser connection it holds — 6 per origin) even when the serial provider is busy. An
+    // unresolvable cover CID must degrade to "no thumbnail", never wedge the Library UI.
+    const COVER_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let resp = match tokio::time::timeout(
+        COVER_FETCH_TIMEOUT,
+        registry.send_raw(
+            "ipfs",
+            &json!({ "op": "cat", "cid": cid, "timeout_ms": 8_000 }),
+        ),
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(_) => return Err((StatusCode::NOT_FOUND, "cover art unavailable (timeout)")),
+    };
     match resp {
         Ok(v) if v.get("status").and_then(Value::as_str) != Some("error") => {
             // The ipfs provider wraps the payload as `{status:ok, data:{data:<base64>}}`, so the

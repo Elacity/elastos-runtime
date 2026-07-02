@@ -53,6 +53,11 @@ On macOS your data dir is:
 ~/Library/Application Support/elastos
 ```
 
+> Upgrading from a pre-0.5 checkout? The data dir used to be `~/.local/share/elastos`, and the
+> IPFS repo (your pinned assets + dDRM cover art) does **not** migrate itself — missing covers
+> can wedge the whole shell UI. One-time migration steps:
+> [DEV_BOOTSTRAP.md → Where your data lives](DEV_BOOTSTRAP.md#where-your-data-lives-and-the-05-macos-move).
+
 The **ElastOS.app desktop** spawns a managed-home `serve` against that same dir and holds
 the lock. To run the browser gateway you must release it first:
 

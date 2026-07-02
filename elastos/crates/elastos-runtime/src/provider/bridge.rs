@@ -180,6 +180,7 @@ struct ProviderIo {
 pub struct ProviderBridge {
     io: Arc<Mutex<ProviderIo>>,
     child: Mutex<Option<Child>>,
+    label: String,
 }
 
 impl ProviderBridge {
@@ -203,12 +204,18 @@ impl ProviderBridge {
             BridgeError::InitFailed("spawned provider missing piped stdout".to_string())
         })?;
 
+        let label = binary_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("provider")
+            .to_string();
         let bridge = Self {
             io: Arc::new(Mutex::new(ProviderIo {
                 writer: Box::new(stdin),
                 reader: Box::new(tokio::io::BufReader::new(stdout)),
             })),
             child: Mutex::new(Some(child)),
+            label,
         };
 
         // Send Init request
@@ -237,6 +244,7 @@ impl ProviderBridge {
                 reader: Box::new(reader),
             })),
             child: Mutex::new(None),
+            label: "io".to_string(),
         }
     }
 
@@ -274,8 +282,11 @@ impl ProviderBridge {
         T: Serialize + Send + 'static,
     {
         let io = Arc::clone(&self.io);
+        let label = self.label.clone();
         tokio::spawn(async move {
+            let t0 = std::time::Instant::now();
             let mut io = io.lock().await;
+            let lock_wait = t0.elapsed();
 
             // Serialize and write request
             let json = serde_json::to_string(&request).map_err(BridgeError::Serde)?;
@@ -293,6 +304,18 @@ impl ProviderBridge {
                 .read_line(&mut line)
                 .await
                 .map_err(BridgeError::Io)?;
+
+            let proc_time = t0.elapsed().saturating_sub(lock_wait);
+            if lock_wait.as_millis() >= 150 || proc_time.as_millis() >= 150 {
+                tracing::warn!(
+                    target: "elastos::provider::latency",
+                    "PROVIDER-LATENCY provider={} lock_wait_ms={} proc_ms={} total_ms={}",
+                    label,
+                    lock_wait.as_millis(),
+                    proc_time.as_millis(),
+                    t0.elapsed().as_millis(),
+                );
+            }
 
             if n == 0 {
                 return Err(BridgeError::ProcessExited);

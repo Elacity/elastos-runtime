@@ -1399,9 +1399,24 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let temp = path.with_extension("tmp");
+    // Unique temp per write. The Home shell fires many overlapping state saves (e.g.
+    // browser-state on every window move/open). A fixed `.tmp` name lets concurrent
+    // writers clobber one another: one rename wins and the other finds the temp already
+    // gone -> ENOENT (surfaced to the client as a 500), while interleaved writes to the
+    // shared temp leave trailing bytes that corrupt the JSON. A per-write temp keeps
+    // each rename atomic and last-writer-wins clean.
+    static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("principal-root-object");
+    let temp = path.with_file_name(format!(".{file_name}.tmp-{}-{seq}", std::process::id()));
     std::fs::write(&temp, bytes)?;
-    std::fs::rename(temp, path)?;
+    if let Err(err) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(err.into());
+    }
     Ok(())
 }
 

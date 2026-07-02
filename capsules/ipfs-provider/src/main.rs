@@ -60,6 +60,11 @@ enum Request {
         cid: String,
         #[serde(default)]
         path: Option<String>,
+        // Optional per-request bound (ms) on the fetch. The provider is SERIAL: one cat for a
+        // CID nobody provides otherwise holds the pipe for LARGE_HTTP_TIMEOUT twice (~10 min),
+        // starving every other caller. Small/interactive fetches (cover art) pass a tight bound.
+        #[serde(default)]
+        timeout_ms: Option<u64>,
         #[serde(default, rename = "_runtime_invocation")]
         _runtime_invocation: Option<serde_json::Value>,
     },
@@ -226,25 +231,44 @@ impl IpfsProvider {
     }
 
     fn fetch_bytes(&mut self, arg: &str) -> Result<Vec<u8>, String> {
+        self.fetch_bytes_with_timeout(arg, None)
+    }
+
+    /// Bounded variant: when the caller passes a budget, each network step gets half of it and
+    /// the slow DHT prefetch (pin/add) is skipped entirely — an interactive caller (cover art)
+    /// would rather fail fast than hold this SERIAL provider for minutes on an unresolvable CID.
+    fn fetch_bytes_with_timeout(
+        &mut self,
+        arg: &str,
+        timeout_ms: Option<u64>,
+    ) -> Result<Vec<u8>, String> {
         let mut failures = Vec::new();
+        let step_timeout = match timeout_ms {
+            Some(ms) => {
+                Duration::from_millis((ms / 2).clamp(500, LARGE_HTTP_TIMEOUT.as_millis() as u64))
+            }
+            None => LARGE_HTTP_TIMEOUT,
+        };
 
         if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
-            match self.kubo_cat_bytes(arg, LARGE_HTTP_TIMEOUT) {
+            match self.kubo_cat_bytes(arg, step_timeout) {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => failures.push(err),
             }
 
-            let root_cid = Self::root_cid(arg);
-            match self.kubo_prefetch_cid(root_cid) {
-                Ok(()) => match self.kubo_cat_bytes(arg, LARGE_HTTP_TIMEOUT) {
-                    Ok(bytes) => return Ok(bytes),
+            if timeout_ms.is_none() {
+                let root_cid = Self::root_cid(arg);
+                match self.kubo_prefetch_cid(root_cid) {
+                    Ok(()) => match self.kubo_cat_bytes(arg, LARGE_HTTP_TIMEOUT) {
+                        Ok(bytes) => return Ok(bytes),
+                        Err(err) => failures.push(err),
+                    },
                     Err(err) => failures.push(err),
-                },
-                Err(err) => failures.push(err),
+                }
             }
         }
 
-        match self.fetch_from_local_gateway_with_timeout(arg, LARGE_HTTP_TIMEOUT) {
+        match self.fetch_from_local_gateway_with_timeout(arg, step_timeout) {
             Ok(bytes) => Ok(bytes),
             Err(err) => {
                 failures.push(err);
@@ -264,11 +288,16 @@ impl IpfsProvider {
             } => self.add_bytes(&data, &filename, pin),
             Request::AddPath { path, pin } => self.add_path(&path, pin),
             Request::AddDirectory { files, pin, .. } => self.add_directory(files, pin),
-            Request::Cat { cid, path, .. } => self.cat(&cid, path.as_deref()),
+            Request::Cat {
+                cid,
+                path,
+                timeout_ms,
+                ..
+            } => self.cat(&cid, path.as_deref(), timeout_ms),
             Request::CatToPath { cid, path, dest } => {
                 self.cat_to_path(&cid, path.as_deref(), &dest)
             }
-            Request::GetBytes { cid, path } => self.cat(&cid, path.as_deref()),
+            Request::GetBytes { cid, path } => self.cat(&cid, path.as_deref(), None),
             Request::Ls { cid } => self.ls(&cid),
             Request::DownloadDirectory { cid, dest } => self.download_directory(&cid, &dest),
             Request::Pin { cid, .. } => self.pin(&cid),
@@ -613,13 +642,13 @@ impl IpfsProvider {
 
     // ── Read ops ────────────────────────────────────────────────────
 
-    fn cat(&mut self, cid: &str, path: Option<&str>) -> Response {
+    fn cat(&mut self, cid: &str, path: Option<&str>, timeout_ms: Option<u64>) -> Response {
         let arg = match path {
             Some(p) if !p.is_empty() => format!("{}/{}", cid, p.trim_start_matches('/')),
             _ => cid.to_string(),
         };
 
-        match self.fetch_bytes(&arg) {
+        match self.fetch_bytes_with_timeout(&arg, timeout_ms) {
             Ok(bytes) => Response::ok(serde_json::json!({
                 "data": BASE64.encode(&bytes)
             })),
@@ -1227,8 +1256,15 @@ fn validate_dest_path(data_dir: &Path, dest: &Path) -> Result<(), String> {
         dest.to_path_buf()
     };
 
-    // Allowed prefixes
+    // Allowed prefixes. Canonicalize the roots too: `resolved` above is canonicalized, and on
+    // macOS the temp root is a symlink (`/var` → `/private/var`), so an un-canonicalized root
+    // would never `starts_with`-match a canonicalized dest. Fall back to the raw path if a root
+    // does not exist yet. (Restored from flint — dropped by the 0.5 merge.)
     let tmp_dir = std::env::temp_dir();
+    let data_dir = data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| data_dir.to_path_buf());
+    let tmp_dir = tmp_dir.canonicalize().unwrap_or(tmp_dir);
 
     if !resolved.starts_with(&data_dir) && !resolved.starts_with(&tmp_dir) {
         return Err(format!(
@@ -1265,7 +1301,12 @@ fn validate_source_path(data_dir: &Path, src: &Path) -> Result<(), String> {
         src.to_path_buf()
     };
 
+    // Canonicalize the roots (macOS `/var` → `/private/var`; see validate_dest_path).
     let tmp_dir = std::env::temp_dir();
+    let data_dir = data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| data_dir.to_path_buf());
+    let tmp_dir = tmp_dir.canonicalize().unwrap_or(tmp_dir);
 
     if !resolved.starts_with(&data_dir) && !resolved.starts_with(&tmp_dir) {
         return Err(format!(

@@ -36,6 +36,20 @@ quorum** and the **rights gate**:
 assets are escrowed to your **live geo nodes** — the throwaway *local* quorum can never open them
 (you'll see `0 of 3 … foreign/tampered escrow`). Use `ELASTOS_DKMS_CARRIER=1`.
 
+### Build profile: use `release` for daily driving
+
+```bash
+ELASTOS_BUILD_PROFILE=release ELASTOS_DKMS_CARRIER=1 scripts/dev/run-creator-gateway.sh
+```
+
+Default is `debug` (fast compiles, slow binaries). Every provider speaks a **serial**
+stdin/stdout pipe — one request at a time — so a 10–30× slower debug provider is felt directly
+as UI latency (Library section switches, object reads, covers). For a session you actually *use*
+rather than recompile, pass `ELASTOS_BUILD_PROFILE=release`. First release build is slow
+(~10 min); afterwards it's incremental. Note: in release the local `dkms-authority` builds
+**without** `dev-modes` (the daemon refuses dev features in release builds by design); the
+Carrier/live mode is unaffected.
+
 Live-mode credentials must exist (they already do on this machine):
 `~/.elastos-dkms/dkms-authority.carrier.json` and `~/.elastos-dkms/secrets/caller.seed`.
 
@@ -97,6 +111,33 @@ External tools it expects on `PATH` (WARN-only): `ffmpeg`/`ffprobe` (media), `ip
 
 ---
 
+## Where your data lives (and the 0.5 macOS move)
+
+The data dir holds your identity, library objects, capsule state, **and the IPFS repo with every
+pinned asset/cover you minted**:
+
+| Platform | Data dir (0.5+) |
+|---|---|
+| macOS | `~/Library/Application Support/elastos` |
+| Linux | `~/.local/share/elastos` (or `$XDG_DATA_HOME/elastos`) |
+
+**Upgrading from pre-0.5 on macOS:** the data dir used to be `~/.local/share/elastos`. The move
+does **not** migrate the IPFS repo — a fresh empty repo is created and every previously pinned
+CID (dDRM cover art, published assets) becomes unresolvable. The failure mode is nasty and
+*indirect*: thumbnails never load, and (before the cover fail-fast) each missing cover held a
+browser connection for minutes, wedging the whole shell — "sections stuck in loading", windows
+that only render after closing the Library. Migrate once:
+
+```bash
+# stop the gateway stack first (Ctrl-C the launcher), then:
+NEW="$HOME/Library/Application Support/elastos"
+cp -R "$HOME/.local/share/elastos/ipfs-repo" "$NEW/ipfs-repo"
+rm -f "$NEW/ipfs-repo/api" "$NEW/ipfs-repo/repo.lock" "$NEW/ipfs-coords.json" "$NEW/ipfs-startup.lock"
+# relaunch; verify:  IPFS_PATH="$NEW/ipfs-repo" ipfs --offline pin ls --type recursive | wc -l
+```
+
+---
+
 ## Why a fresh clone needs this
 
 The runtime resolves backends **from disk at launch**. A fresh clone ships almost none built,
@@ -124,6 +165,8 @@ exactly those overrides. Providers whose `capsule.json` says `"type": "microvm"`
 | `502 could not open owned asset from the dKMS quorum` | quorum recover failed | read the node reason in the gateway log (usually one of the two rows above) |
 | `another ElastOS host already owns this data dir` | single host lock (one host per data dir) | quit ElastOS.app and/or `lsof -ti tcp:8090 \| xargs kill`, then rerun |
 | WebAuthn "invalid domain" on login | passkeys reject IP RP-IDs | open `http://localhost:8090`, not `127.0.0.1` |
+| dDRM cover thumbnails never load / `cover art unavailable (timeout)` | cover CIDs not in the local IPFS repo (typically the pre-0.5 → 0.5 data-dir move left the repo behind) | migrate the IPFS repo (see [Where your data lives](#where-your-data-lives-and-the-05-macos-move)) |
+| Shell feels wedged: Library sections "stuck in loading", new windows blank until another window closes | browser's ~6-connections-per-origin pool exhausted by slow/held requests (2 are event streams); usually secondary to the row above, or debug-build provider latency | migrate the IPFS repo; run with `ELASTOS_BUILD_PROFILE=release`; check the gateway log for `PROVIDER-LATENCY` lines naming the slow provider |
 
 The launcher runs the gateway in the foreground and reaps the dKMS daemons/sidecar on exit
 (`Ctrl-C`). To stop a backgrounded run: `pkill -f "elastos gateway"; pkill -f dkms-carrier-client`.

@@ -42,6 +42,16 @@ default_data_dir() {
 }
 [[ -z "$DATA_DIR" ]] && DATA_DIR="$(default_data_dir)"
 
+# Build profile: default `debug` (unchanged behavior). Set ELASTOS_BUILD_PROFILE=release to
+# build every provider + the gateway optimized (release providers are ~10-30x faster than debug,
+# which matters because the provider bridge is serial — one slow debug provider stalls the rest).
+PROFILE="${ELASTOS_BUILD_PROFILE:-debug}"
+if [[ "$PROFILE" == "release" ]]; then
+  PROFILE_ARGS=(--release); PROFILE_DIR="release"
+else
+  PROFILE_ARGS=(); PROFILE_DIR="debug"
+fi
+
 echo "=============================================================="
 echo " ElastOS Create-portal gateway — build + provision + launch"
 echo "=============================================================="
@@ -66,8 +76,8 @@ echo
 # ── 2. build the provider binaries + the gateway ──────────────────────────────
 build_capsule() {
   local pkg="$1"; shift
-  echo "building ${pkg} $* ..."
-  if ! cargo build --quiet --manifest-path "${CAPSULES}/${pkg}/Cargo.toml" "$@"; then
+  echo "building ${pkg} ($PROFILE) $* ..."
+  if ! cargo build --quiet --manifest-path "${CAPSULES}/${pkg}/Cargo.toml" "${PROFILE_ARGS[@]}" "$@"; then
     echo "FAIL: could not build ${pkg}" >&2
     exit 1
   fi
@@ -96,7 +106,14 @@ build_capsule decrypt-provider --features rail-stream,rail-mint,pdf-render
 # path is compiled while the forgeable `reference` backend stays fenced out at selection, so the
 # local gateway exercises the SAME secure key-release posture the production build ships.
 build_capsule key-provider --features key-authority-ref
-build_capsule dkms-authority --features dev-modes
+# dkms-authority hard-forbids `dev-modes` in a release build (the node daemon must ship
+# production-posture); dev-modes is only for the LOCAL debug quorum. In release, build it
+# production (in CARRIER/REMOTE mode the local daemons aren't started anyway).
+if [[ "$PROFILE" == "release" ]]; then
+  build_capsule dkms-authority
+else
+  build_capsule dkms-authority --features dev-modes
+fi
 build_capsule dkms-keygen
 # Library object plane (v0.4.0): the provider-backed object model the new Library/Home use.
 # Without it the gateway boots but Library object operations fail closed.
@@ -123,7 +140,7 @@ for cj in "${CAPSULES}"/*/capsule.json; do
 done
 
 echo "building media-authority helper ..."
-cargo build --quiet --manifest-path "${REPO_ROOT}/scripts/dev/ddrm-media-authority/Cargo.toml" \
+cargo build --quiet --manifest-path "${REPO_ROOT}/scripts/dev/ddrm-media-authority/Cargo.toml" "${PROFILE_ARGS[@]}" \
   || echo "WARN: media-authority helper build failed (owned-video playback seam) — mint still works"
 
 echo "building the gateway (elastos-server) ..."
@@ -131,11 +148,11 @@ echo "building the gateway (elastos-server) ..."
 # (Dev/ChainMock for offline tests) without the fail-closed startup guard refusing to boot. The
 # user's `ELASTOS_DDRM_RIGHTS=chain` happy path works the same; a PRODUCTION gateway builds
 # WITHOUT `dev-modes` (then `chain` is the only selectable rights mode — the guard enforces it).
-if ! cargo build --quiet --manifest-path "${REPO_ROOT}/elastos/Cargo.toml" -p elastos-server --features dev-modes; then
+if ! cargo build --quiet --manifest-path "${REPO_ROOT}/elastos/Cargo.toml" -p elastos-server --features dev-modes "${PROFILE_ARGS[@]}"; then
   echo "FAIL: could not build elastos-server" >&2
   exit 1
 fi
-GATEWAY_BIN="${REPO_ROOT}/elastos/target/debug/elastos"
+GATEWAY_BIN="${REPO_ROOT}/elastos/target/${PROFILE_DIR}/elastos"
 [[ -x "$GATEWAY_BIN" ]] || { echo "FAIL: gateway binary missing at ${GATEWAY_BIN}" >&2; exit 1; }
 echo
 
@@ -159,7 +176,7 @@ REMOTE="${ELASTOS_DKMS_REMOTE:-0}"
 # (The zero-config default below is LOCAL — a self-contained 2-of-3 quorum on this box, no remote
 # files needed; set ELASTOS_DKMS_CARRIER=1 to validate end-to-end against the live nodes.)
 CARRIER="${ELASTOS_DKMS_CARRIER:-0}"
-CARRIER_CLIENT_BIN="${REPO_ROOT}/scripts/dev/dkms-carrier-client/target/debug/dkms-carrier-client"
+CARRIER_CLIENT_BIN="${REPO_ROOT}/scripts/dev/dkms-carrier-client/target/${PROFILE_DIR}/dkms-carrier-client"
 CARRIER_CLIENT_ADDR="${DKMS_CARRIER_CLIENT_ADDR:-127.0.0.1:9444}"
 CARRIER_PID=""
 [[ "$CARRIER" == "1" ]] && REMOTE=1
@@ -167,7 +184,7 @@ QUORUM_DIR="${DATA_DIR}/dkms"
 QUORUM_JSON="${QUORUM_DIR}/quorum.json"
 QUORUM_NODES="${QUORUM_DIR}/quorum-nodes.json"
 OPEN_DESCRIPTOR="${QUORUM_DIR}/quorum-open.json"
-KEY_PROVIDER_BIN="${CAPSULES}/key-provider/target/debug/key-provider"
+KEY_PROVIDER_BIN="${CAPSULES}/key-provider/target/${PROFILE_DIR}/key-provider"
 DKMS_PIDS=()
 QUORUM_OPEN_READY=0
 
@@ -201,7 +218,7 @@ PY
     # Bring up the local Carrier sidecar: key-provider dials each node's did:key through it
     # (relay/hole-punch, zero VPN). No dkms0 mesh required.
     echo "building dkms-carrier-client sidecar ..."
-    if ! cargo build --quiet --manifest-path "${REPO_ROOT}/scripts/dev/dkms-carrier-client/Cargo.toml"; then
+    if ! cargo build --quiet --manifest-path "${REPO_ROOT}/scripts/dev/dkms-carrier-client/Cargo.toml" "${PROFILE_ARGS[@]}"; then
       echo "FAIL: could not build dkms-carrier-client" >&2; exit 1
     fi
     [[ -x "$CARRIER_CLIENT_BIN" ]] || { echo "FAIL: dkms-carrier-client missing at ${CARRIER_CLIENT_BIN}" >&2; exit 1; }
@@ -252,9 +269,9 @@ fi
 # (LOCAL mode only — in REMOTE mode the live geo nodes are already running and the
 #  OPEN descriptor + caller seed were resolved above.)
 if [[ "$REMOTE" != "1" ]]; then
-NODE_BIN="${CAPSULES}/dkms-authority/target/debug/dkms-authority"
-KEYGEN_BIN="${CAPSULES}/dkms-keygen/target/debug/dkms-keygen"
-KEY_PROVIDER_BIN="${CAPSULES}/key-provider/target/debug/key-provider"
+NODE_BIN="${CAPSULES}/dkms-authority/target/${PROFILE_DIR}/dkms-authority"
+KEYGEN_BIN="${CAPSULES}/dkms-keygen/target/${PROFILE_DIR}/dkms-keygen"
+KEY_PROVIDER_BIN="${CAPSULES}/key-provider/target/${PROFILE_DIR}/key-provider"
 OPEN_DESCRIPTOR="${QUORUM_DIR}/quorum-open.json"
 DKMS_PIDS=()
 QUORUM_OPEN_READY=0
@@ -360,7 +377,7 @@ echo
 # ── 4. dev overrides: point the gateway at the locally-built capsules ─────────
 # find_installed_provider_binary checks ELASTOS_<NAME>_BIN first, and verify_provider_binary
 # bypasses the signed-manifest check when that env points at the exact path (explicit dev trust).
-cap_bin() { echo "${CAPSULES}/$1/target/debug/$1"; }
+cap_bin() { echo "${CAPSULES}/$1/target/${PROFILE_DIR}/$1"; }
 export ELASTOS_ENCRYPT_PROVIDER_BIN="$(cap_bin encrypt-provider)"
 export ELASTOS_MEDIA_PROVIDER_BIN="$(cap_bin media-provider)"
 # media-provider transcodes -> DASH (video/audio mint AND owned audio/video playback) and needs
@@ -402,7 +419,7 @@ done
 # via verify_component_binary (same unknown-arm64 manifest miss). Point ELASTOS_SHELL_BIN
 # at the installed Mach-O arm64 shell so the dev-override bypass trusts it.
 [[ -x "${INSTALLED_BIN}/shell" ]] && export ELASTOS_SHELL_BIN="${INSTALLED_BIN}/shell"
-MEDIA_AUTH_BIN="${REPO_ROOT}/scripts/dev/ddrm-media-authority/target/debug/ddrm-media-authority"
+MEDIA_AUTH_BIN="${REPO_ROOT}/scripts/dev/ddrm-media-authority/target/${PROFILE_DIR}/ddrm-media-authority"
 [[ -x "$MEDIA_AUTH_BIN" ]] && export ELASTOS_DDRM_MEDIA_AUTHORITY_BIN="$MEDIA_AUTH_BIN"
 
 # ── AV forensic watermarking (dDRM AV Phase 5) ────────────────────────────────
