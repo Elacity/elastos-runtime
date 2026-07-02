@@ -182,7 +182,11 @@ enum Request {
         #[serde(default)]
         config: Value,
     },
-    Status,
+    // Empty STRUCT variant (not unit): serde's container `deny_unknown_fields` does NOT apply to
+    // unit variants of an internally-tagged enum, so `{"op":"status","x":1}` would silently parse.
+    // As a struct variant, an unknown field is rejected — the quorum authority's untrusted protocol
+    // surface fails closed on unexpected input (Principle 11).
+    Status {},
     /// IDENTITY HANDSHAKE (Day 89–90): a client pins the node's published verifying key, sends a
     /// fresh random challenge, and the node returns a signature over it proving it holds the
     /// master-derived signing key BEHIND that vk — so the client can refuse an impersonated node
@@ -387,7 +391,8 @@ enum Request {
         /// The sub-shares this member received from the dealers (one per dealer, distinct dealers).
         contributions: Vec<DkgContribution>,
     },
-    Shutdown,
+    // Empty struct variant (see `Status`): rejects unknown fields under `deny_unknown_fields`.
+    Shutdown {},
 }
 
 /// One sub-share a DEALER routed to a MEMBER during a DKG ceremony: the dealer's coordinate `x_i`
@@ -598,7 +603,7 @@ impl DkmsAuthorityNode {
     fn handle(&mut self, request: Request) -> Response {
         match request {
             Request::Init { config } => self.init(config),
-            Request::Status => self.status(),
+            Request::Status {} => self.status(),
             Request::Hello { challenge_b64, caller_pub_b64, now_unix, channel_pub_b64 } => {
                 self.hello(&challenge_b64, &caller_pub_b64, now_unix, channel_pub_b64.as_deref())
             }
@@ -753,7 +758,7 @@ impl DkmsAuthorityNode {
                 scheme,
                 contributions,
             }),
-            Request::Shutdown => Response::empty_ok(),
+            Request::Shutdown {} => Response::empty_ok(),
         }
     }
 
@@ -2033,7 +2038,7 @@ fn serve_stdio() {
                 continue;
             }
         };
-        let is_shutdown = matches!(request, Request::Shutdown);
+        let is_shutdown = matches!(request, Request::Shutdown {});
         let response = node.handle(request);
         writeln!(stdout, "{}", serde_json::to_string(&response).unwrap()).unwrap();
         stdout.flush().unwrap();
@@ -2314,7 +2319,7 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
             }
             _ => None,
         };
-        let is_shutdown = matches!(request, Request::Shutdown);
+        let is_shutdown = matches!(request, Request::Shutdown {});
         let response = node.handle(request);
         let accepted = matches!(response, Response::Ok { .. });
         if respond(&mut writer, &mut channel, &node, &response).is_err() {
@@ -2976,6 +2981,25 @@ mod tests {
         assert!(
             serde_json::from_value::<Request>(no_proof).is_err(),
             "recover without caller_sig_b64 must not deserialize"
+        );
+    }
+
+    /// Fail-closed protocol surface (Principle 11): the empty variants must REJECT unknown fields.
+    /// serde's container `deny_unknown_fields` does NOT cover UNIT variants of an internally-tagged
+    /// enum, so `Status`/`Shutdown` are empty STRUCT variants precisely so a smuggled field is
+    /// refused rather than silently ignored on the quorum authority's untrusted input.
+    #[test]
+    fn empty_variants_reject_unknown_fields() {
+        assert!(serde_json::from_value::<Request>(json!({ "op": "status" })).is_ok());
+        assert!(serde_json::from_value::<Request>(json!({ "op": "shutdown" })).is_ok());
+        assert!(
+            serde_json::from_value::<Request>(json!({ "op": "status", "smuggled": true })).is_err(),
+            "status must reject an unknown field, not silently ignore it"
+        );
+        assert!(
+            serde_json::from_value::<Request>(json!({ "op": "shutdown", "smuggled": true }))
+                .is_err(),
+            "shutdown must reject an unknown field, not silently ignore it"
         );
     }
 
