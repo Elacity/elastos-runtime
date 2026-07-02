@@ -1651,7 +1651,10 @@ mod tests {
         .unwrap();
         log.runtime_stop();
         let vk = read_verifying_key(&log);
-        assert!(log.verify_chain(Some(&vk)).is_ok(), "baseline signed chain verifies");
+        assert!(
+            log.verify_chain(Some(&vk)).is_ok(),
+            "baseline signed chain verifies"
+        );
 
         // Forge: edit the custody record, recompute record_hash + relink, strip sig.
         let content = std::fs::read_to_string(&path).unwrap();
@@ -1659,9 +1662,11 @@ mod tests {
         let mut forged = Vec::new();
         for line in content.lines().filter(|l| !l.trim().is_empty()) {
             let mut rec: ChainedRecord = serde_json::from_str(line).unwrap();
-            let event_json = serde_json::to_string(&rec.event)
-                .unwrap()
-                .replacen("person:local:alice", "person:local:mallory", 1);
+            let event_json = serde_json::to_string(&rec.event).unwrap().replacen(
+                "person:local:alice",
+                "person:local:mallory",
+                1,
+            );
             rec.event = serde_json::from_str(&event_json).unwrap();
             let re_event = serde_json::to_string(&rec.event).unwrap();
             let h = compute_record_hash(rec.seq, &prev, re_event.as_bytes());

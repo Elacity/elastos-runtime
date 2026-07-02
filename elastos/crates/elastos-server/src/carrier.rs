@@ -6017,7 +6017,9 @@ mod tests {
     #[tokio::test]
     async fn read_bounded_carrier_line_reads_normal_line() {
         use tokio::io::BufReader;
-        let mut reader = BufReader::new(std::io::Cursor::new(b"{\"op\":\"release_head\"}\r\n".to_vec()));
+        let mut reader = BufReader::new(std::io::Cursor::new(
+            b"{\"op\":\"release_head\"}\r\n".to_vec(),
+        ));
         let line = read_bounded_carrier_line(&mut reader, "test stream")
             .await
             .expect("a normal line must read back");
@@ -7564,7 +7566,11 @@ mod tests {
     #[tokio::test]
     async fn test_carrier_provider_invoke_refuses_key_material_ops_on_anonymous_plane() {
         let registry = ProviderRegistry::new();
-        for (target, op) in [("key", "unwrap"), ("decrypt", "decrypt"), ("drm", "license")] {
+        for (target, op) in [
+            ("key", "unwrap"),
+            ("decrypt", "decrypt"),
+            ("drm", "license"),
+        ] {
             let request = serde_json::json!({
                 "source": "carrier-availability",
                 "target": target,
