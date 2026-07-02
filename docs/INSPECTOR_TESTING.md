@@ -71,7 +71,8 @@ Relevant tests to confirm green:
 - `elastos-server`: `inspect_provider::tests::*` (projection, no-leak, provenance,
   attestation, gate preview), `carrier_bridge` inspect e2e + the merge tripwire
   `carrier_inspect_ops_match_canonical_action_contract`, and
-  `api/gateway_tests/inspect.rs` (token required, System-only, `revoke` 404).
+  `api/gateway_tests/inspect.rs` (token required; System-scoped ops + fail-closed
+  caller-bound `self`; `revoke` 404).
 
 Runtime scope-rule expectations (`cargo test -p elastos-runtime inspect`):
 
@@ -79,9 +80,14 @@ Runtime scope-rule expectations (`cargo test -p elastos-runtime inspect`):
 - pure SelfOnly can view only self
 - System scope can view all
 
-Current product routing still keeps `/api/provider/inspect/self` System-only.
-Do not treat the pure SelfOnly test as proof that ordinary capsules have a live
-caller-bound Inspector route.
+`/api/provider/inspect/self` is a live, caller-bound app/browser-tier route
+(`"self" => &[BROWSER_CAPSULE_ID]`): fail-closed SelfOnly — the gateway injects
+the authenticated `principal_id`, client-supplied `id` is ignored, and
+`authorize_view` enforces caller == target, so a capsule reads only its own
+record. Verified by `inspect_self_returns_own_record_and_ignores_client_id` and
+`inspect_self_token_cannot_reach_system_capsule_op`. The other inspect ops
+(`capsules`/`capsule`/`plan`/`intent`/`discover`/`request_act`) remain
+System-only.
 
 ## Two ways to test
 

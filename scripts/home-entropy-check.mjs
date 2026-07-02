@@ -3990,9 +3990,10 @@ assert(
     capsuleInspectorDocs.includes("System launch token can") &&
     capsuleInspectorDocs.includes("cannot call the Inbox action endpoint") &&
     capsuleInspectorDocs.includes("fresh same-principal passkey Home token") &&
-    capsuleInspectorDocs.includes("Current product routing keeps `/api/provider/inspect/self` System-only") &&
+    capsuleInspectorDocs.includes("Self scope is a live, fail-closed route") &&
+    capsuleInspectorDocs.includes("any client-supplied `id` is ignored") &&
     inspectorTestingDocs.includes("pure SelfOnly can view only self") &&
-    inspectorTestingDocs.includes("Do not treat the pure SelfOnly test as proof") &&
+    inspectorTestingDocs.includes("live, caller-bound app/browser-tier route") &&
     inspectorProvider.includes("signature_fingerprint") &&
     inspectorProvider.includes("signature_present") &&
     !inspectorProvider.includes('"signed_by": manifest') &&

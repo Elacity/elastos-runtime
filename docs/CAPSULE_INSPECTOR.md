@@ -122,10 +122,18 @@ handler MUST call `authorize_view` before returning any per-capsule detail.
 - **Least privilege.** The full-view product surface (this Inspector) requests
   `elastos://inspect/*`, which only the System surface can grant — it is a
   System-trusted surface, not a freely distributable app.
-- **Self scope is not yet a product route.** `elastos://inspect/self` is the
+- **Self scope is a live, fail-closed route.** `elastos://inspect/self` is the
   pure SelfOnly scope rule and cannot cross capsule boundaries.
-  Current product routing keeps `/api/provider/inspect/self` System-only until a
-  caller-bound ordinary-capsule SelfOnly route is explicitly wired and tested.
+  `/api/provider/inspect/self` is served to the app/browser tier
+  (`"self" => &[BROWSER_CAPSULE_ID]` in `gateway_provider_proxy.rs`), NOT the
+  System tier — but it is caller-bound and fail-closed: the gateway injects the
+  authenticated `principal_id`, any client-supplied `id` is ignored, and the
+  provider routes through `inspect::authorize_view` under `InspectScope::SelfOnly`
+  (caller == target), so a capsule can read ONLY its own record and never
+  another's. Covered by `inspect_self_returns_own_record_and_ignores_client_id`
+  and `inspect_self_token_cannot_reach_system_capsule_op`
+  (`api/gateway_tests/inspect.rs`); the routing is pinned by
+  `home-entropy-check.mjs`.
 
 ### Act path (`request_act` → Inbox approval → dispatch)
 
