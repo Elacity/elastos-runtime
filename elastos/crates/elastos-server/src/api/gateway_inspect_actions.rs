@@ -414,6 +414,23 @@ async fn create_inspect_action_request(
                 .unwrap_or("inspect action planning failed")
         );
     }
+    // Fail closed on a plan that resolved but is NOT a real authority preview. The inspector's
+    // `plan` returns `{status:"ok", data:{valid:false, error:...}}` for an operation the target's
+    // authority never declared (e.g. unknown_operation). Admitting that would create a PENDING
+    // inbox approval whose gate summary shows NO capabilities/audit events — prompting the operator
+    // to approve an act with zero visible authority. Consent requires visibility: reject at intake
+    // so no such request is ever recorded (the act would fail closed at dispatch anyway).
+    let plan_data = &plan["data"];
+    if plan_data.get("valid").and_then(serde_json::Value::as_bool) != Some(true) {
+        anyhow::bail!(
+            "inspect action rejected: operation '{operation}' is not a valid provider-authority \
+             action for '{id}' ({})",
+            plan_data
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("no authority preview")
+        );
+    }
     let now = now_ts();
     let nonce = inspect_action_request_nonce();
     let request_id = inspect_action_request_id(id, operation, now, &nonce);

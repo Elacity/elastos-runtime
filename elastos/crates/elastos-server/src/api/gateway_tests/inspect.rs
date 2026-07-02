@@ -872,3 +872,538 @@ async fn mint_system_home_token_for_existing_data_dir() {
         .expect("mint SYSTEM home-launch token against the runtime DID");
     println!("ELASTOS_SYSTEM_TOKEN={token}");
 }
+
+#[tokio::test]
+async fn inspect_action_rejects_stale_authority_plan_before_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, calls) = inspect_act_test_state(dir.path()).await;
+    let app = gateway_router(state);
+
+    let authority = passkey_authority_with_name(dir.path(), Some("requester"));
+    let system_token = authority.system_token.clone();
+    let requested = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/inspect/request_act")
+                .header("x-elastos-home-token", system_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"id":"capsule:exit-provider","operation":"status","request":{"probe":true}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(requested.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(requested.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let request_payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let request_id = request_payload["request_id"].as_str().unwrap();
+    assert_eq!(
+        request_payload["plan"]["capabilities"][0]["actions"][0],
+        "read"
+    );
+
+    std::fs::write(
+        dir.path()
+            .join("capsules")
+            .join("exit-provider")
+            .join("capsule.json"),
+        serde_json::to_vec(&json!({
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "exit-provider",
+            "role": "provider",
+            "type": "wasm",
+            "entrypoint": "exit-provider.wasm",
+            "provides": "elastos://exit/*",
+            "authority": {
+                "reason": "Runtime-owned Exit provider",
+                "capabilities": [
+                    { "resource": "elastos://exit/*", "actions": ["execute"], "operations": ["status"] }
+                ],
+                "audit_events": ["exit.status.requested"]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+    let stale = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/inbox/actions")
+                .header("x-elastos-home-token", inbox_token.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"action_id":"inspect-approve-request:{request_id}","home_token":"{}"}}"#,
+                    authority.home_token.as_str()
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(stale.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let message = String::from_utf8(body.to_vec()).unwrap();
+    assert!(message.contains("authority plan changed"));
+    assert!(calls.lock().await.is_empty());
+
+    let inbox = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/apps/inbox/summary")
+                .header("x-elastos-home-token", inbox_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inbox.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(inbox.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let inbox_payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let still_pending = inbox_payload["notifications"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| {
+            entry["kind"] == "inspect_action_request"
+                && entry["action_ref"]["action_id"]
+                    == format!("inspect-approve-request:{request_id}")
+        });
+    assert!(!still_pending);
+}
+
+#[tokio::test]
+async fn inspect_action_rejects_changed_request_binding_before_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, calls) = inspect_act_test_state(dir.path()).await;
+    let app = gateway_router(state);
+
+    let authority = passkey_authority_with_name(dir.path(), Some("requester"));
+    let system_token = authority.system_token.clone();
+    let requested = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/inspect/request_act")
+                .header("x-elastos-home-token", system_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"id":"capsule:exit-provider","operation":"status","request":{"probe":true}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(requested.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(requested.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let request_payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let request_id = request_payload["request_id"].as_str().unwrap();
+
+    let record_path = dir
+        .path()
+        .join("inspect-actions")
+        .join(format!("{request_id}.json"));
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    record["request"] = json!({ "probe": false });
+    std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+    let changed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/inbox/actions")
+                .header("x-elastos-home-token", inbox_token.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"action_id":"inspect-approve-request:{request_id}","home_token":"{}"}}"#,
+                    authority.home_token.as_str()
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(changed.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(changed.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let message = String::from_utf8(body.to_vec()).unwrap();
+    assert!(message.contains("request body changed"));
+    assert!(calls.lock().await.is_empty());
+
+    let inbox = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/apps/inbox/summary")
+                .header("x-elastos-home-token", inbox_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inbox.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(inbox.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let inbox_payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let still_pending = inbox_payload["notifications"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| {
+            entry["kind"] == "inspect_action_request"
+                && entry["action_ref"]["action_id"]
+                    == format!("inspect-approve-request:{request_id}")
+        });
+    assert!(!still_pending);
+}
+
+#[tokio::test]
+async fn inspect_action_audits_approved_dispatch_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, calls) = inspect_act_test_state(dir.path()).await;
+    let app = gateway_router(state);
+
+    let authority = passkey_authority_with_name(dir.path(), Some("requester"));
+    let system_token = authority.system_token.clone();
+    let requested = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/inspect/request_act")
+                .header("x-elastos-home-token", system_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"id":"capsule:exit-provider","operation":"status","request":{"fail_dispatch":true}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(requested.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(requested.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let request_payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let request_id = request_payload["request_id"].as_str().unwrap();
+
+    let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+    let failed = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/inbox/actions")
+                .header("x-elastos-home-token", inbox_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"action_id":"inspect-approve-request:{request_id}","home_token":"{}"}}"#,
+                    authority.home_token.as_str()
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = axum::body::to_bytes(failed.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let message = String::from_utf8(body.to_vec()).unwrap();
+    assert!(message.contains("mock dispatch failed"));
+
+    let call_records = calls.lock().await;
+    assert_eq!(call_records.len(), 1);
+    assert_eq!(call_records[0]["fail_dispatch"], true);
+    drop(call_records);
+
+    let record_path = dir
+        .path()
+        .join("inspect-actions")
+        .join(format!("{request_id}.json"));
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(record["status"], "failed");
+    assert_eq!(record["error"], "provider error: mock dispatch failed");
+    assert_eq!(record["result"]["code"], "dispatch_failed");
+
+    let auth_state = crate::auth::load_auth_state(dir.path()).unwrap();
+    let audit = auth_state
+        .audit
+        .iter()
+        .find(|event| {
+            event.event_type == "inspect.action.failed"
+                && event.challenge_id.as_deref() == Some(request_id)
+        })
+        .expect("approved dispatch failure audit event");
+    assert_eq!(audit.result, "failed");
+    assert_eq!(audit.capsule_id.as_deref(), Some(INBOX_CAPSULE_ID));
+    assert_eq!(
+        audit.reason,
+        "Approved Inspector action dispatch failed through Inbox"
+    );
+}
+
+#[tokio::test]
+async fn inspect_action_rejects_runtime_metadata_before_inbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, calls) = inspect_act_test_state(dir.path()).await;
+    let app = gateway_router(state);
+
+    let system_token = issue_home_launch_token(dir.path(), SYSTEM_CAPSULE_ID).unwrap();
+    let rejected = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/inspect/request_act")
+                .header("x-elastos-home-token", system_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"id":"capsule:exit-provider","operation":"status","request":{"_runtime_invocation":{"source":"fake"}}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(rejected.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let message = String::from_utf8(body.to_vec()).unwrap();
+    assert!(message.contains("must not predeclare runtime metadata"));
+    assert!(calls.lock().await.is_empty());
+
+    let inbox_token = issue_home_launch_token(dir.path(), INBOX_CAPSULE_ID).unwrap();
+    let inbox = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/apps/inbox/summary")
+                .header("x-elastos-home-token", inbox_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inbox.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(inbox.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let inbox_payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let has_inspect_action = inbox_payload["notifications"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["kind"] == "inspect_action_request");
+    assert!(!has_inspect_action);
+}
+
+#[tokio::test]
+async fn inspect_action_rejects_raw_carrier_route_metadata_before_inbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, calls) = inspect_act_test_state(dir.path()).await;
+    let app = gateway_router(state);
+
+    let system_token = issue_home_launch_token(dir.path(), SYSTEM_CAPSULE_ID).unwrap();
+    for reserved in ["connect_ticket", "carrier_route", "carrier"] {
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/provider/inspect/request_act")
+                    .header("x-elastos-home-token", system_token.clone())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "id": "capsule:exit-provider",
+                            "operation": "status",
+                            "request": {
+                                reserved: "capsule-supplied-route-secret"
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(rejected.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let message = String::from_utf8(body.to_vec()).unwrap();
+        assert!(message.contains("must not predeclare Runtime metadata field"));
+        assert!(message.contains(reserved));
+    }
+    assert!(calls.lock().await.is_empty());
+
+    let inbox_token = issue_home_launch_token(dir.path(), INBOX_CAPSULE_ID).unwrap();
+    let inbox = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/apps/inbox/summary")
+                .header("x-elastos-home-token", inbox_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inbox.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(inbox.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let inbox_payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let has_inspect_action = inbox_payload["notifications"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["kind"] == "inspect_action_request");
+    assert!(!has_inspect_action);
+}
+
+#[tokio::test]
+async fn inspect_action_duplicate_requests_keep_distinct_pending_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, calls) = inspect_act_test_state(dir.path()).await;
+    let app = gateway_router(state);
+
+    let system_token = issue_home_launch_token(dir.path(), SYSTEM_CAPSULE_ID).unwrap();
+    let mut request_ids = Vec::new();
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/provider/inspect/request_act")
+                    .header("x-elastos-home-token", system_token.clone())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"id":"capsule:exit-provider","operation":"status","request":{"probe":true}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        request_ids.push(payload["request_id"].as_str().unwrap().to_string());
+    }
+    assert_ne!(request_ids[0], request_ids[1]);
+    assert!(calls.lock().await.is_empty());
+
+    let inbox_token = issue_home_launch_token(dir.path(), INBOX_CAPSULE_ID).unwrap();
+    let inbox = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/apps/inbox/summary")
+                .header("x-elastos-home-token", inbox_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inbox.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(inbox.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let inbox_payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let inspect_actions = inbox_payload["notifications"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["kind"] == "inspect_action_request")
+        .collect::<Vec<_>>();
+    assert_eq!(inspect_actions.len(), 2);
+}
+
+// Fail-closed intake guard (Ravi P16/P11/G3): request_act for an operation the target authority
+// does NOT declare must be rejected at intake — no pending record, no approvable Inbox row — so a
+// human is never prompted to approve an act whose authority is invisible/undeclared.
+#[tokio::test]
+async fn inspect_action_rejects_undeclared_operation_before_inbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, calls) = inspect_act_test_state(dir.path()).await;
+    let app = gateway_router(state);
+
+    let system_token = issue_home_launch_token(dir.path(), SYSTEM_CAPSULE_ID).unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/inspect/request_act")
+                .header("x-elastos-home-token", system_token)
+                .header(CONTENT_TYPE, "application/json")
+                // `wipe_everything` is not in exit-provider's declared authority.
+                .body(Body::from(
+                    r#"{"id":"capsule:exit-provider","operation":"wipe_everything","request":{}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        response.status(),
+        StatusCode::OK,
+        "an undeclared operation must be rejected at intake, not accepted as pending"
+    );
+
+    // Nothing dispatched, and crucially the Inbox holds NO approvable inspect-action row.
+    assert!(calls.lock().await.is_empty());
+    let inbox_token = issue_home_launch_token(dir.path(), INBOX_CAPSULE_ID).unwrap();
+    let inbox = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/apps/inbox/summary")
+                .header("x-elastos-home-token", inbox_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inbox.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(inbox.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let inbox_payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let inspect_actions = inbox_payload["notifications"]["entries"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|entry| entry["kind"] == "inspect_action_request")
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        inspect_actions, 0,
+        "a rejected undeclared-op request_act must leave no approvable Inbox row"
+    );
+}
