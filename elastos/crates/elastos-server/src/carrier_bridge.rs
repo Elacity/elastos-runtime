@@ -40,14 +40,14 @@ const CAPABILITY_APPROVAL_MAX_POLLS: usize = 300;
 /// could OOM the host before the check ran (BUG-6). The bounded readers below
 /// cap the allocation while reading, then drain to the next newline so the
 /// stream realigns to the following request.
-const MAX_LINE_BYTES: usize = 1_048_576; // 1 MB
+pub(crate) const MAX_LINE_BYTES: usize = 1_048_576; // 1 MB
 /// Chunk size for draining an oversized line back to stream alignment — bounded
 /// so the drain itself never reintroduces the OOM it is preventing.
 const DRAIN_CHUNK_BYTES: u64 = 64 * 1024;
 
 /// Outcome of reading one bounded, newline-delimited request line.
 #[derive(Debug)]
-enum BoundedLine {
+pub(crate) enum BoundedLine {
     /// A complete request line (trailing `\n`/`\r\n` stripped). May be empty.
     Line(String),
     /// Clean EOF — the peer closed with no pending bytes.
@@ -68,7 +68,7 @@ fn oversized_request_error() -> serde_json::Value {
 /// `MAX_LINE_BYTES` (+1) bytes — the fail-closed inverse of an unbounded
 /// `read_line`. On overflow it drains to the next newline and reports
 /// [`BoundedLine::TooLarge`] rather than allocating the whole oversized line.
-async fn read_bounded_line<R>(reader: &mut R) -> std::io::Result<BoundedLine>
+pub(crate) async fn read_bounded_line<R>(reader: &mut R) -> std::io::Result<BoundedLine>
 where
     R: AsyncBufRead + Unpin,
 {

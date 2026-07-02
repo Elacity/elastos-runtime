@@ -38,7 +38,7 @@ use futures_lite::StreamExt;
 use iroh_gossip::net::Gossip;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
-use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{self, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
@@ -767,6 +767,32 @@ impl ProtocolHandler for FileHandler {
     }
 }
 
+/// Read one newline-delimited JSON control line from a Carrier stream without
+/// ever buffering more than `MAX_LINE_BYTES`. Every Carrier read path — the
+/// unauthenticated inbound handler *and* the client-side response readers —
+/// funnels through here so an untrusted remote peer (inbound) or a malicious
+/// source we dialed (response) cannot OOM the node with a newline-less flood.
+/// Fail-closed: an oversized or truncated line is an error, not a giant alloc.
+/// This is the same 1 MB bound BUG-6 applied to the WASM/microVM bridges,
+/// extended to the primary request path. Carrier bulk bytes ride the separate
+/// length-prefixed path (`read_carrier_len_prefixed_bytes`), not this reader,
+/// so the 1 MB cap only ever bounds small JSON control lines.
+pub(crate) async fn read_bounded_carrier_line<R>(reader: &mut R, context: &str) -> Result<String>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use crate::carrier_bridge::{read_bounded_line, BoundedLine, MAX_LINE_BYTES};
+    match read_bounded_line(reader).await? {
+        BoundedLine::Line(line) => Ok(line),
+        BoundedLine::Eof => {
+            anyhow::bail!("{context}: connection closed before a complete line was received")
+        }
+        BoundedLine::TooLarge => {
+            anyhow::bail!("{context}: line exceeded the {MAX_LINE_BYTES}-byte bound")
+        }
+    }
+}
+
 async fn handle_file_connection(
     conn: iroh::endpoint::Connection,
     data_dir: &std::path::Path,
@@ -801,8 +827,7 @@ async fn handle_file_stream(
     gossip_state: Arc<Mutex<GossipState>>,
 ) -> Result<()> {
     let mut reader = BufReader::new(recv);
-    let mut line = String::new();
-    reader.read_line(&mut line).await?;
+    let line = read_bounded_carrier_line(&mut reader, "carrier file stream").await?;
 
     let msg: CarrierMessage = serde_json::from_str(line.trim())?;
 
@@ -5644,8 +5669,7 @@ impl CarrierClient {
         send.write_all(&bytes).await?;
         send.finish()?;
         let mut reader = BufReader::new(recv);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        let line = read_bounded_carrier_line(&mut reader, "carrier release_head response").await?;
         let resp: serde_json::Value = serde_json::from_str(line.trim())?;
         if resp["ok"].as_bool() == Some(true) {
             Ok(Some(resp["release"].clone()))
@@ -5709,8 +5733,8 @@ impl CarrierClient {
         send.finish()?;
 
         let mut reader = BufReader::new(recv);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        let line =
+            read_bounded_carrier_line(&mut reader, "carrier provider_invoke response").await?;
         let response: serde_json::Value = serde_json::from_str(line.trim())?;
         if response.get("ok").and_then(|value| value.as_bool()) == Some(true) {
             return Ok(response
@@ -5758,8 +5782,7 @@ impl CarrierClient {
         send.finish()?;
 
         let mut reader = BufReader::new(recv);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        let line = read_bounded_carrier_line(&mut reader, "carrier gossip_push response").await?;
         let response: serde_json::Value = serde_json::from_str(line.trim())?;
         if response.get("ok").and_then(|value| value.as_bool()) == Some(true) {
             return Ok(());
@@ -5792,8 +5815,7 @@ impl CarrierClient {
         send.finish()?;
 
         let mut reader = BufReader::new(recv);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        let line = read_bounded_carrier_line(&mut reader, "carrier gossip_pull response").await?;
         let response: serde_json::Value = serde_json::from_str(line.trim())?;
         if response.get("ok").and_then(|value| value.as_bool()) != Some(true) {
             let message = response
@@ -5924,6 +5946,37 @@ pub async fn try_p2p_discovery(
 mod tests {
     use super::*;
     use std::sync::{Mutex as StdMutex, OnceLock};
+
+    /// The unauthenticated inbound Carrier reader (and every client-side response
+    /// reader) must bound a newline-less flood instead of buffering it whole —
+    /// otherwise a remote peer OOMs the node pre-auth (the BUG-6 class, extended
+    /// to the primary request path). A line just over the 1 MB cap with no
+    /// newline is refused, not allocated.
+    #[tokio::test]
+    async fn read_bounded_carrier_line_refuses_oversized_flood() {
+        use tokio::io::BufReader;
+        let flood = vec![b'a'; crate::carrier_bridge::MAX_LINE_BYTES + 4096];
+        let mut reader = BufReader::new(std::io::Cursor::new(flood));
+        let err = read_bounded_carrier_line(&mut reader, "test stream")
+            .await
+            .expect_err("an oversized newline-less line must be refused, not buffered");
+        assert!(
+            err.to_string().contains("bound"),
+            "error should name the byte bound, got: {err}"
+        );
+    }
+
+    /// A well-formed line under the cap round-trips unchanged (CRLF stripped),
+    /// so bounding the read does not break legitimate control traffic.
+    #[tokio::test]
+    async fn read_bounded_carrier_line_reads_normal_line() {
+        use tokio::io::BufReader;
+        let mut reader = BufReader::new(std::io::Cursor::new(b"{\"op\":\"release_head\"}\r\n".to_vec()));
+        let line = read_bounded_carrier_line(&mut reader, "test stream")
+            .await
+            .expect("a normal line must read back");
+        assert_eq!(line, "{\"op\":\"release_head\"}");
+    }
 
     fn env_lock() -> &'static StdMutex<()> {
         static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();

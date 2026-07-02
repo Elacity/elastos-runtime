@@ -11,10 +11,10 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, SecretKey, Watcher};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::sync::Mutex;
 
-use crate::carrier::decode_ticket_endpoints;
+use crate::carrier::{decode_ticket_endpoints, read_bounded_carrier_line};
 use crate::crypto::{
     domain_separated_sign, verify_release_envelope, verify_release_envelope_against_dids,
 };
@@ -1025,8 +1025,7 @@ async fn handle_operator_stream(
     ctx: &OperatorRuntimeContext,
 ) -> Result<()> {
     let mut reader = BufReader::new(recv);
-    let mut line = String::new();
-    reader.read_line(&mut line).await?;
+    let line = read_bounded_carrier_line(&mut reader, "operator control stream").await?;
 
     let request_meta = extract_request_meta(line.as_bytes());
     let request_id = request_meta
@@ -1617,8 +1616,7 @@ impl OperatorClient {
         send.finish()?;
 
         let mut reader = BufReader::new(recv);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        let line = read_bounded_carrier_line(&mut reader, "operator peer response").await?;
         if line.trim().is_empty() {
             anyhow::bail!("operator peer returned an empty response");
         }
