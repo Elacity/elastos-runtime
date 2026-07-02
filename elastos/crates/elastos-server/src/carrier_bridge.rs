@@ -348,6 +348,9 @@ fn carrier_invoke_dispatch(
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     if scheme == "localhost" {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("token");
+        }
         let path = match body.get("path").and_then(|value| value.as_str()) {
             Some(path) => scope_current_user_alias(path, principal_id)?,
             None => uri.to_string(),
@@ -641,6 +644,14 @@ fn wallet_signature_parts_from_uri(uri: &str) -> Option<(String, String)> {
         return None;
     }
     Some((chain_namespace.to_string(), intent.to_string()))
+}
+
+/// Handle a single request from a WASM capsule host call.
+pub(crate) async fn handle_wasm_carrier_request(
+    line: &str,
+    ctx: BridgeContext,
+) -> Result<serde_json::Value> {
+    handle_request(line, &Some(ctx)).await
 }
 
 /// Handle a single request from the guest capsule.
@@ -967,7 +978,7 @@ fn encode_bridge_capability_token(
     token.to_base64().unwrap_or_default()
 }
 
-async fn handle_remote_request(
+pub async fn handle_remote_request(
     line: &str,
     api_url: &str,
     client_token: &str,
@@ -1181,8 +1192,54 @@ mod tests {
     use elastos_runtime::{
         capability::token::{Action, CapabilityToken, ResourceId, TokenConstraints},
         primitives::time::SecureTimestamp,
+        provider::{Provider, ProviderError, ResourceRequest, ResourceResponse},
     };
     use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    #[derive(Default)]
+    struct CapturingProvider {
+        requests: Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl CapturingProvider {
+        async fn requests(&self) -> Vec<serde_json::Value> {
+            self.requests.lock().await.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CapturingProvider {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider(
+                "raw provider fixture does not implement ResourceRequest".to_string(),
+            ))
+        }
+
+        fn schemes(&self) -> Vec<&'static str> {
+            vec!["localhost"]
+        }
+
+        fn name(&self) -> &'static str {
+            "capturing-localhost"
+        }
+
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> Result<serde_json::Value, ProviderError> {
+            self.requests.lock().await.push(request.clone());
+            Ok(serde_json::json!({
+                "status": "ok",
+                "data": {
+                    "ok": true
+                }
+            }))
+        }
+    }
 
     fn bridge_context() -> BridgeContext {
         let audit_log = Arc::new(elastos_runtime::primitives::audit::AuditLog::new());
@@ -1776,6 +1833,91 @@ mod tests {
         assert_eq!(
             ok["response"]["type"], "carrier_result",
             "matching action opens: {ok}"
+        );
+    }
+
+    #[tokio::test]
+    async fn carrier_invoke_localhost_uses_envelope_token_and_redacts_body_token() {
+        let ctx = bridge_context();
+        let provider = Arc::new(CapturingProvider::default());
+        ctx.provider_registry.register(provider.clone()).await;
+        let uri = "localhost://Local/SharedByLocalUsersAndBots/Home/a.md";
+        let preview = carrier_invoke_dispatch(
+            &serde_json::json!({
+                "type": "carrier_invoke",
+                "uri": uri,
+                "operation": "read",
+                "body": {
+                    "path": uri,
+                    "token": "body-token-must-not-reach-provider"
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        let token = bridge_token(&ctx, &preview.resource, Action::Read);
+        let line = serde_json::json!({
+            "id": 31,
+            "request": {
+                "type": "carrier_invoke",
+                "uri": uri,
+                "operation": "read",
+                "token": token,
+                "body": {
+                    "path": uri,
+                    "token": "body-token-must-not-reach-provider"
+                }
+            }
+        })
+        .to_string();
+
+        let response = handle_request(&line, &Some(ctx))
+            .await
+            .expect("carrier invoke should dispatch through provider");
+
+        assert_eq!(response["id"], 31);
+        assert_eq!(response["response"]["type"], "carrier_result");
+        assert_eq!(response["response"]["result"]["status"], "ok");
+        let requests = provider.requests().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["op"], "read");
+        assert_eq!(requests[0]["path"], uri);
+        assert!(
+            requests[0].get("token").is_none(),
+            "localhost provider body token must be redacted before provider dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn carrier_invoke_localhost_rejects_missing_envelope_token_even_with_body_token() {
+        let ctx = bridge_context();
+        let provider = Arc::new(CapturingProvider::default());
+        ctx.provider_registry.register(provider.clone()).await;
+        let uri = "localhost://Local/SharedByLocalUsersAndBots/Home/a.md";
+        let line = serde_json::json!({
+            "id": 32,
+            "request": {
+                "type": "carrier_invoke",
+                "uri": uri,
+                "operation": "read",
+                "body": {
+                    "path": uri,
+                    "token": "body-token-must-not-authorize"
+                }
+            }
+        })
+        .to_string();
+
+        let response = handle_request(&line, &Some(ctx))
+            .await
+            .expect("carrier invoke should reject missing envelope token");
+
+        assert_eq!(response["id"], 32);
+        assert_eq!(response["response"]["type"], "error");
+        assert_eq!(response["response"]["code"], "missing_token");
+        assert!(
+            provider.requests().await.is_empty(),
+            "body token must not reach provider when the envelope token is missing"
         );
     }
 

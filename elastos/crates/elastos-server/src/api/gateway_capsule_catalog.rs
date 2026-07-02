@@ -264,19 +264,18 @@ pub(super) fn capsule_interface_registry_summary(
         }
     }
 
-    let mut counts = CapsuleInterfaceRegistryCounts {
+    let counts = CapsuleInterfaceRegistryCounts {
         capsules: interfaces
             .iter()
             .map(|interface| interface.capsule.as_str())
             .collect::<BTreeSet<_>>()
             .len(),
-        ..Default::default()
+        interfaces: interfaces.len(),
+        methods: interfaces
+            .iter()
+            .map(|summary| summary.interface.methods.len())
+            .sum(),
     };
-    counts.interfaces = interfaces.len();
-    counts.methods = interfaces
-        .iter()
-        .map(|summary| summary.interface.methods.len())
-        .sum();
 
     CapsuleInterfaceRegistryResponse {
         schema: CAPSULE_INTERFACE_REGISTRY_SCHEMA.to_string(),

@@ -7,30 +7,47 @@ import { createBrowserLocationController } from "./browser-location.js?v=browser
 import {
   DEFAULT_URL,
   createRuntimeApi,
+  isBrowserErrorUrl,
   normalizeUrl,
-  streamTargetForUrl,
-} from "./browser-runtime-api.js?v=browser-20260520e";
+  sameBrowserStreamTarget,
+  visibleAddressForUrl,
+} from "./browser-runtime-api.js?v=browser-20260627b";
 import { createBrowserClipboardBridge } from "./browser-clipboard.js?v=browser-20260524d";
 import {
   selkiesMessagesForInput,
   utf8FromBase64,
 } from "./browser-input.js?v=browser-20260520e";
-import { bindBrowserInputSurface } from "./browser-input-surface.js?v=browser-20260524d";
+import { bindBrowserInputSurface } from "./browser-input-surface.js?v=browser-20260620d";
 import {
   browserMetricsText,
   friendlyOpenError,
   isAuthoritySessionError,
   isMissingRuntimePageError,
   requestedDisplayMode,
-} from "./browser-status.js?v=browser-20260520e";
-import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260523c";
+} from "./browser-status.js?v=browser-20260626e";
+import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260629a";
 
 const STATUS_TTL_MS = 4200;
-const FRAME_WAIT_MS = 1200;
-const RESIZE_FLUSH_MS = 180;
-const PAGE_STATUS_INTERVAL_MS = 60_000;
+const PAGE_STATUS_INTERVAL_MS = 2_500;
 const PAGE_STATUS_FIRST_POLL_MS = 1200;
+const PAGE_STATUS_AFTER_INPUT_DELAY_MS = 650;
+const PAGE_STATUS_AFTER_SCROLL_DELAY_MS = 1200;
+const PAGE_STATUS_AFTER_INPUT_FOLLOWUP_DELAYS_MS = [650, 1800, 3500, 6500];
 const PAGE_HEARTBEAT_INTERVAL_MS = 60_000;
+const BROWSER_OPEN_POLL_INTERVAL_MS = 1_200;
+const BROWSER_OPEN_POLL_TIMEOUT_MS = 5 * 60_000;
+const REMOTE_DISPLAY_RECOVERY_MAX_ATTEMPTS = 1;
+const LIBRARY_FILE_PICKER_MAX_BYTES = 16 * 1024 * 1024;
+const PRODUCT_DISPLAY_MODE = "webrtc_remote_display";
+const PRODUCT_DISPLAY_ASPECT_WIDTH = 16;
+const PRODUCT_DISPLAY_ASPECT_HEIGHT = 9;
+const GUARANTEE_MECHANISM_MICROVM = "mechanism_microvm";
+const GUARANTEE_OPERATOR_RBI = "operator_rbi";
+const GUARANTEE_POLICY_WEBVIEW = "policy_webview";
+const LOCAL_EXIT_LABEL = "This device";
+const LOCAL_EXIT_SUMMARY = "Use this device's Exit Node for Browser traffic.";
+const DEFAULT_ENGINE_LABEL = "Automatic";
+const DEFAULT_ENGINE_SUMMARY = "Use the best Browser Engine available.";
 const params = new URLSearchParams(window.location.search);
 const launchToken = params.get("home_token") || "";
 const debugMetrics =
@@ -45,9 +62,16 @@ const addressInput = document.querySelector("#browser-url");
 const backButton = document.querySelector("#browser-back");
 const forwardButton = document.querySelector("#browser-forward");
 const refreshButton = document.querySelector("#browser-refresh");
+const profileResetButton = document.querySelector("#browser-profile-reset");
+const settingsButton = document.querySelector("#browser-settings");
+const settingsPanel = document.querySelector("#browser-settings-panel");
+const settingsCloseButton = document.querySelector("#browser-settings-close");
+const engineSelect = document.querySelector("#browser-engine");
+const engineSummaryNode = document.querySelector("#browser-engine-summary");
+const exitSelect = document.querySelector("#browser-exit");
+const exitSummaryNode = document.querySelector("#browser-exit-summary");
 const statusNode = document.querySelector("#browser-status");
 const renderPanel = document.querySelector("#browser-render-panel");
-const renderImage = document.querySelector("#browser-render");
 const remoteVideo = document.querySelector("#browser-remote-display");
 const keyboardCapture = document.querySelector("#browser-keyboard-capture");
 const renderEmpty = document.querySelector("#browser-render-empty");
@@ -58,15 +82,12 @@ let currentView = null;
 let currentDisplayMode = "";
 let currentDisplayInput = "runtime_route";
 let currentDisplayInputProtocol = "elastos_json";
-let renderObjectUrl = "";
 let statusTimer = 0;
-let frameLoopSerial = 0;
-let frameSeq = 0;
-let resizeTimer = 0;
 let lastViewport = null;
 let canGoBack = false;
 let canGoForward = false;
 let pageStatusTimer = 0;
+let pageStatusRefreshTimers = [];
 let pageHeartbeatTimer = 0;
 let lastPageStatus = null;
 let unloadCleanupStarted = false;
@@ -76,6 +97,21 @@ let remoteReconnectTimer = 0;
 let remoteReconnectInFlight = false;
 let remoteReconnectAttempt = 0;
 let lastRequestedUrl = DEFAULT_URL;
+let lastLibraryFilePickerRequestId = "";
+let browserSummary = null;
+let browserSummaryPromise = null;
+let selectedBrowserEngineId = params.get("browser_engine_id") || params.get("adapter_id") || "";
+let currentBrowserEngineId = "";
+let selectedRemoteExitId = params.get("remote_exit_id") || "";
+let currentRemoteExitId = "";
+
+function setSettingsOpen(open) {
+  if (!settingsPanel || !settingsButton) {
+    return;
+  }
+  settingsPanel.hidden = !open;
+  settingsButton.setAttribute("aria-expanded", open ? "true" : "false");
+}
 
 function focusRemoteInput() {
   const target = keyboardCapture || renderPanel;
@@ -160,6 +196,15 @@ function requestHomeRelaunch(reason) {
 function setLoading(loading) {
   document.body.dataset.loading = loading ? "true" : "false";
   addressInput.disabled = loading;
+  if (engineSelect) {
+    engineSelect.disabled = loading;
+  }
+  if (exitSelect) {
+    exitSelect.disabled = loading;
+  }
+  if (profileResetButton) {
+    profileResetButton.disabled = loading;
+  }
   renderEmpty.hidden = true;
   refreshButton.disabled = loading || !currentPage;
   updateNavState();
@@ -168,6 +213,14 @@ function setLoading(loading) {
 function stopPageStatusPolling() {
   window.clearTimeout(pageStatusTimer);
   pageStatusTimer = 0;
+  stopPageStatusRefresh();
+}
+
+function stopPageStatusRefresh() {
+  for (const timer of pageStatusRefreshTimers) {
+    window.clearTimeout(timer);
+  }
+  pageStatusRefreshTimers = [];
 }
 
 function stopPageHeartbeat() {
@@ -211,8 +264,27 @@ function remoteReconnectUrl() {
   );
 }
 
-function scheduleRemoteReconnect(message) {
+function scheduleRemoteReconnect(message, { retry = true } = {}) {
   if (unloadCleanupStarted || relaunchRequested) {
+    return;
+  }
+  if (!retry || remoteReconnectAttempt >= REMOTE_DISPLAY_RECOVERY_MAX_ATTEMPTS) {
+    const failedPage = currentPage;
+    const mediaRouteUnavailable = /no secure display relay candidate|shared secure display route/i.test(message);
+    currentPage = null;
+    currentBrowserEngineId = "";
+    currentRemoteExitId = "";
+    publishRuntimePageForHost(null);
+    stopPageStatusPolling();
+    stopPageHeartbeat();
+    closeRemoteDisplay();
+    closeRuntimePage(failedPage).catch(() => {});
+    showStatus(
+      mediaRouteUnavailable
+        ? `${message} The stuck Browser session was closed. No automatic retry was attempted.`
+        : `${message} The Browser Engine started, but video did not become ready. The stuck Browser session was closed; refresh Browser to retry.`,
+      { sticky: true },
+    );
     return;
   }
   if (remoteReconnectInFlight || remoteReconnectTimer) {
@@ -221,7 +293,7 @@ function scheduleRemoteReconnect(message) {
   const nextUrl = remoteReconnectUrl();
   const delay = Math.min(30_000, 1_000 * (2 ** Math.min(remoteReconnectAttempt, 5)));
   showStatus(
-    `${message} Retrying ${nextUrl} through Runtime${delay > 1000 ? ` in ${Math.round(delay / 1000)}s` : ""}.`,
+    `${message} Reconnecting ${nextUrl}${delay > 1000 ? ` in ${Math.round(delay / 1000)}s` : ""}.`,
     { sticky: true },
   );
   remoteReconnectTimer = window.setTimeout(async () => {
@@ -235,18 +307,41 @@ function scheduleRemoteReconnect(message) {
       if (relaunchRequested) {
         return;
       }
-      remoteReconnectAttempt = 0;
-      showStatus("Remote display reconnected through Runtime.");
+      if (remoteDisplay.isTrackReady()) {
+        remoteReconnectAttempt = 0;
+        showStatus("Browser session reconnected.");
+      } else {
+        remoteReconnectAttempt += 1;
+        showStatus(
+          "Browser session reopened, but video is still waiting. One recovery attempt has been used.",
+          { sticky: true },
+        );
+      }
     } catch (error) {
       if (!isAuthoritySessionError(error)) {
         remoteReconnectAttempt += 1;
         remoteReconnectInFlight = false;
-        scheduleRemoteReconnect(friendlyOpenError(error));
+        if (remoteReconnectAttempt >= REMOTE_DISPLAY_RECOVERY_MAX_ATTEMPTS) {
+          showStatus(
+            `${friendlyOpenError(error)} Browser display recovery stopped after one attempt.`,
+            { sticky: true },
+          );
+        } else {
+          scheduleRemoteReconnect(friendlyOpenError(error));
+        }
       }
     } finally {
       remoteReconnectInFlight = false;
     }
   }, delay);
+}
+
+function recoverMissingRuntimePage(error, message) {
+  if (!isMissingRuntimePageError(error)) {
+    return false;
+  }
+  scheduleRemoteReconnect(message);
+  return true;
 }
 
 function releaseRuntimePageForUnload() {
@@ -263,7 +358,6 @@ function releaseRuntimePageForUnload() {
     }).catch(() => {});
   }
   publishRuntimePageForHost(null);
-  frameLoopSerial += 1;
   stopPageStatusPolling();
   stopPageHeartbeat();
   closeRemoteDisplay();
@@ -285,12 +379,17 @@ function updateMetricsNode(status) {
   metricsNode.hidden = false;
 }
 
-async function fetchPageStatus() {
+async function fetchPageStatus({
+  history = "replace",
+  forceAddress = false,
+  fast = false,
+} = {}) {
   if (!currentPage?.page_id) {
     return null;
   }
+  const query = fast ? "?fast=1" : "";
   const status = await fetchJson(
-    `/api/apps/browser/pages/${encodeURIComponent(currentPage.page_id)}/status`,
+    `/api/apps/browser/pages/${encodeURIComponent(currentPage.page_id)}/status${query}`,
     { method: "GET" },
   );
   if (status?.schema !== "elastos.browser.page-status/v1") {
@@ -303,16 +402,143 @@ async function fetchPageStatus() {
   }
   lastPageStatus = status;
   syncViewFromResponse(status);
+  handleFileChooserFromStatus(status);
   if (status.actual_url) {
     currentPage = {
       ...currentPage,
       actual_url: status.actual_url,
       title: status.title || currentPage?.title,
     };
-    syncBrowserLocation(status.actual_url, "", "replace");
+    syncBrowserLocation(status.actual_url, status.title || "", history, {
+      forceAddress,
+    });
   }
   updateMetricsNode(status);
   return status;
+}
+
+function handleFileChooserFromStatus(status) {
+  const chooser = status?.file_chooser;
+  if (chooser?.pending !== true || !chooser.request_id) {
+    return;
+  }
+  if (chooser.request_id === lastLibraryFilePickerRequestId) {
+    return;
+  }
+  lastLibraryFilePickerRequestId = chooser.request_id;
+  showStatus("Choose a Library item for Browser.");
+  openLibraryFilePicker();
+}
+
+function openLibraryFilePicker() {
+  if (!window.parent || window.parent === window) {
+    showStatus("Open Library from Home to choose a Browser file.", {
+      sticky: true,
+    });
+    return false;
+  }
+  window.parent.postMessage(
+    {
+      type: "home:open-target",
+      homeToken: launchToken,
+      target: "library",
+      query: {
+        mode: "attach",
+        returnTarget: "browser",
+      },
+    },
+    window.location.origin,
+  );
+  return true;
+}
+
+function fileNameFromLibraryPayload(payload) {
+  const name = String(payload?.fileName || payload?.title || "Library item")
+    .replace(/[\0\r\n]/g, "")
+    .split(/[\\/]/)
+    .pop()
+    .trim();
+  return name || "Library item";
+}
+
+async function base64FromBlob(blob) {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return btoa(binary);
+}
+
+async function handleLibraryFilePickerSelection(payload) {
+  if (!payload?.blob || typeof payload.blob.arrayBuffer !== "function") {
+    showStatus("Library did not return file bytes for Browser.", { sticky: true });
+    return;
+  }
+  if (payload.blob.size > LIBRARY_FILE_PICKER_MAX_BYTES) {
+    showStatus("Browser file picker accepts Library items up to 16 MiB.", {
+      sticky: true,
+    });
+    return;
+  }
+  const fileName = fileNameFromLibraryPayload(payload);
+  showStatus(`Inserting ${fileName}...`);
+  await sendBrowserInput(
+    {
+      type: "file_upload",
+      file_name: fileName,
+      mime_type:
+        typeof payload.mimeType === "string" && payload.mimeType
+          ? payload.mimeType
+          : payload.blob.type || "application/octet-stream",
+      content_base64: await base64FromBlob(payload.blob),
+      object_uri: typeof payload.objectUri === "string" ? payload.objectUri : "",
+    },
+    { history: "replace" },
+  );
+  lastLibraryFilePickerRequestId = "";
+  showStatus(`Inserted ${fileName}.`);
+}
+
+function schedulePageStatusRefresh({
+  history = "replace",
+  delay = PAGE_STATUS_AFTER_INPUT_DELAY_MS,
+  forceAddress = false,
+} = {}) {
+  const delays = [
+    delay,
+    ...PAGE_STATUS_AFTER_INPUT_FOLLOWUP_DELAYS_MS.filter(
+      (value) => value > delay,
+    ),
+  ];
+  stopPageStatusRefresh();
+  pageStatusRefreshTimers = delays.map((nextDelay) => {
+    const timer = window.setTimeout(async () => {
+      pageStatusRefreshTimers = pageStatusRefreshTimers.filter(
+        (candidate) => candidate !== timer,
+      );
+      if (
+        !currentPage ||
+        document.hidden ||
+        (!forceAddress && isAddressEditing())
+      ) {
+        return;
+      }
+      try {
+        await fetchPageStatus({ history, forceAddress });
+      } catch (error) {
+        if (isMissingRuntimePageError(error)) {
+          scheduleRemoteReconnect("Browser session was released.");
+          return;
+        }
+        if (debugMetrics) {
+          showStatus(friendlyOpenError(error), { sticky: true });
+        }
+      }
+    }, nextDelay);
+    return timer;
+  });
 }
 
 function startPageStatusPolling() {
@@ -330,10 +556,10 @@ function startPageStatusPolling() {
       return;
     }
     try {
-      await fetchPageStatus();
+      await fetchPageStatus({ fast: true });
     } catch (error) {
       if (isMissingRuntimePageError(error)) {
-        scheduleRemoteReconnect("Browser Runtime page was released.");
+        scheduleRemoteReconnect("Browser session was released.");
         return;
       }
       if (debugMetrics) {
@@ -361,7 +587,7 @@ function startPageHeartbeat() {
       );
     } catch (error) {
       if (isMissingRuntimePageError(error)) {
-        scheduleRemoteReconnect("Browser Runtime page heartbeat was lost.");
+        scheduleRemoteReconnect("Browser session heartbeat was lost.");
         return;
       }
       if (debugMetrics) {
@@ -389,66 +615,27 @@ function browserViewport() {
   const rect = renderPanel.getBoundingClientRect();
   const width = Math.max(320, Math.min(3840, Math.round(rect.width || 1280)));
   const height = Math.max(240, Math.min(2160, Math.round(rect.height || 720)));
-  return { width, height };
+  return aspectPreservingProductViewport(width, height);
 }
 
-function setRenderBlob(
-  blob,
-  { focus = false, preserveRemoteStream = false } = {},
-) {
-  if (renderObjectUrl) {
-    URL.revokeObjectURL(renderObjectUrl);
-  }
-  renderObjectUrl = URL.createObjectURL(blob);
-  remoteVideo.hidden = true;
-  if (!preserveRemoteStream) {
-    remoteVideo.srcObject = null;
-  }
-  renderImage.src = renderObjectUrl;
-  renderImage.hidden = false;
-  renderEmpty.hidden = true;
-  document.body.dataset.browserPage = "active";
-  if (focus) {
-    focusRemoteInput();
-  }
-}
-
-function renderBase64Image(
-  base64,
-  contentType = "image/png",
-  { focus = false } = {},
-) {
-  const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
-  setRenderBlob(new Blob([bytes], { type: contentType }), { focus });
-}
-
-async function fetchBrowserFrame({ focus = false } = {}) {
-  if (!currentPage?.page_id) {
-    return false;
-  }
-  const response = await fetchJson(
-    `/api/apps/browser/pages/${encodeURIComponent(currentPage.page_id)}/frame?since=${encodeURIComponent(
-      frameSeq,
-    )}&wait_ms=${FRAME_WAIT_MS}`,
-    {
-      method: "GET",
-    },
+function aspectPreservingProductViewport(width, height) {
+  const minScale = Math.max(
+    Math.ceil(320 / PRODUCT_DISPLAY_ASPECT_WIDTH),
+    Math.ceil(240 / PRODUCT_DISPLAY_ASPECT_HEIGHT),
   );
-  if (Number.isFinite(Number(response?.seq))) {
-    frameSeq = Number(response.seq);
-  }
-  syncViewFromResponse(response || {});
-  syncBrowserLocation(response?.actual_url, response?.title, "replace");
-  if (response?.changed === false) {
-    return false;
-  }
-  if (response?.base64) {
-    renderBase64Image(response.base64, response.content_type || "image/png", {
-      focus,
-    });
-    return true;
-  }
-  return false;
+  const maxScale = Math.min(
+    Math.floor(3840 / PRODUCT_DISPLAY_ASPECT_WIDTH),
+    Math.floor(2160 / PRODUCT_DISPLAY_ASPECT_HEIGHT),
+  );
+  const requestedScale = Math.min(
+    Math.floor(width / PRODUCT_DISPLAY_ASPECT_WIDTH),
+    Math.floor(height / PRODUCT_DISPLAY_ASPECT_HEIGHT),
+  );
+  const scale = Math.max(minScale, Math.min(maxScale, requestedScale));
+  return {
+    width: PRODUCT_DISPLAY_ASPECT_WIDTH * scale,
+    height: PRODUCT_DISPLAY_ASPECT_HEIGHT * scale,
+  };
 }
 
 function syncViewFromResponse(response) {
@@ -472,6 +659,27 @@ function syncViewFromResponse(response) {
   updateNavState();
 }
 
+function syncDisplayInputFromSession(displaySession) {
+  currentDisplayInput =
+    displaySession?.input === "datachannel" ? "datachannel" : "runtime_route";
+  currentDisplayInputProtocol =
+    displaySession?.input_protocol === "selkies_v1"
+      ? "selkies_v1"
+      : "elastos_json";
+}
+
+function currentInputTransport() {
+  return currentPage?.display_session?.input === "datachannel"
+    ? "datachannel"
+    : currentDisplayInput;
+}
+
+function currentInputProtocol() {
+  return currentPage?.display_session?.input_protocol === "selkies_v1"
+    ? "selkies_v1"
+    : currentDisplayInputProtocol;
+}
+
 function viewFromDisplaySession(displaySession) {
   if (
     displaySession?.schema !== "elastos.browser.display-session/v1" ||
@@ -489,7 +697,7 @@ function viewFromDisplaySession(displaySession) {
 }
 
 function encodeDatachannelInput(event) {
-  if (currentDisplayInputProtocol === "selkies_v1") {
+  if (currentInputProtocol() === "selkies_v1") {
     return selkiesMessagesForInput(event, currentView);
   }
   return [
@@ -512,66 +720,59 @@ async function sendBrowserInput(
     event?.type === "browser_command" ||
     event?.type === "resize" ||
     event?.type === "paste_text" ||
+    event?.type === "file_upload" ||
     event?.type === "clipboard_write";
   if (
     currentDisplayMode === "webrtc_remote_display" &&
-    currentDisplayInput === "datachannel" &&
+    currentInputTransport() === "datachannel" &&
     !requiresRuntimeRoute
   ) {
     if (!remoteDisplay?.inputChannelOpen()) {
       throw new Error("Browser remote-display input channel is not open.");
     }
     remoteDisplay.sendInputMessages(encodeDatachannelInput(event));
+    schedulePageStatusRefresh({
+      history,
+      forceAddress: true,
+      delay:
+        event?.type === "wheel"
+          ? PAGE_STATUS_AFTER_SCROLL_DELAY_MS
+          : PAGE_STATUS_AFTER_INPUT_DELAY_MS,
+    });
     if (focus) {
       focusRemoteInput();
     }
   } else {
-    const response = await fetchJson(
-      `/api/apps/browser/pages/${encodeURIComponent(currentPage.page_id)}/input`,
-      {
-        method: "POST",
-        body: { event },
-      },
-    );
-    if (Number.isFinite(Number(response?.seq))) {
-      frameSeq = Number(response.seq);
-    }
-    if (currentDisplayMode === "webrtc_remote_display") {
-      syncViewFromResponse(response);
-      if (response.actual_url) {
-        currentPage = {
-          ...currentPage,
-          actual_url: response.actual_url,
-          title: response.title || currentPage?.title,
-        };
-      }
-      syncBrowserLocation(response.actual_url, response.title, history);
-      if (focus) {
-        focusRemoteInput();
-      }
-      return;
-    }
-    if (response?.screenshot) {
-      renderBase64Image(
-        response.screenshot,
-        response.content_type || "image/png",
+    let response;
+    try {
+      response = await fetchJson(
+        `/api/apps/browser/pages/${encodeURIComponent(currentPage.page_id)}/input`,
         {
-          focus,
+          method: "POST",
+          body: { event },
         },
       );
-      syncViewFromResponse(response);
-      if (response.actual_url) {
-        currentPage = {
-          ...currentPage,
-          actual_url: response.actual_url,
-          title: response.title || currentPage?.title,
-        };
+    } catch (error) {
+      if (recoverMissingRuntimePage(error, "Browser session was released.")) {
+        return;
       }
+      throw error;
+    }
+    handleFileChooserFromStatus(response);
+    syncViewFromResponse(response);
+    if (response.actual_url) {
+      currentPage = {
+        ...currentPage,
+        actual_url: response.actual_url,
+        title: response.title || currentPage?.title,
+      };
       syncBrowserLocation(response.actual_url, response.title, history);
-    } else {
-      throw new Error(
-        "Browser Engine Adapter returned input without an explicit rendered frame.",
-      );
+    }
+    if (focus) {
+      focusRemoteInput();
+    }
+    if (response?.accepted !== true && !response?.actual_url && !response?.file_chooser) {
+      throw new Error("Browser Engine Adapter did not accept input.");
     }
   }
 }
@@ -588,6 +789,19 @@ const {
   utf8FromBase64,
 });
 
+window.addEventListener("message", (event) => {
+  if (event.origin !== window.location.origin || event.source !== window.parent) {
+    return;
+  }
+  const payload = event.data && typeof event.data === "object" ? event.data : null;
+  if (payload?.type !== "browser:file-picker-selection") {
+    return;
+  }
+  handleLibraryFilePickerSelection(payload).catch((error) => {
+    showStatus(friendlyOpenError(error), { sticky: true });
+  });
+});
+
 remoteDisplay = createBrowserRemoteDisplay({
   debugMetrics,
   fetchJson,
@@ -595,13 +809,9 @@ remoteDisplay = createBrowserRemoteDisplay({
   getCurrentDisplayMode: () => currentDisplayMode,
   getLastPageStatus: () => lastPageStatus,
   handleRemoteInputChannelMessage,
-  incrementFrameLoopSerial: () => {
-    frameLoopSerial += 1;
-  },
   onRecoveryRequired: scheduleRemoteReconnect,
   remoteVideo,
   renderEmpty,
-  renderImage,
   renderPanel,
   resetPageStatus: () => {
     lastPageStatus = null;
@@ -618,29 +828,6 @@ remoteDisplay = createBrowserRemoteDisplay({
   updateMetrics: updateMetricsNode,
 });
 
-function startFrameStream() {
-  const serial = ++frameLoopSerial;
-  const loop = async () => {
-    while (serial === frameLoopSerial) {
-      if (
-        !currentPage ||
-        document.hidden ||
-        document.body.dataset.loading === "true"
-      ) {
-        await new Promise((resolve) => window.setTimeout(resolve, 450));
-        continue;
-      }
-      try {
-        await fetchBrowserFrame();
-      } catch (error) {
-        showStatus(friendlyOpenError(error), { sticky: true });
-        await new Promise((resolve) => window.setTimeout(resolve, 1500));
-      }
-    }
-  };
-  loop();
-}
-
 function closeRemoteDisplay() {
   remoteDisplay?.close();
 }
@@ -653,10 +840,327 @@ function unlockRemoteAudioFromGesture() {
   remoteDisplay?.unlockAudioFromGesture();
 }
 
+function visibleRemoteCarrierExits(summary) {
+  const exits = summary?.net?.exit_provider?.remote_carrier_exits;
+  return Array.isArray(exits)
+    ? exits.filter((exit) =>
+        typeof exit?.id === "string" &&
+        exit.id &&
+        exit.allowed_for_principal !== false &&
+        exit.state !== "expired")
+    : [];
+}
+
+function visibleBrowserEngines(summary) {
+  const engines = summary?.engine_adapter?.adapters;
+  return Array.isArray(engines)
+    ? engines.filter((engine) =>
+        typeof engine?.id === "string" &&
+        engine.id &&
+        engine.direct_network === false &&
+        engine.wallet_injection === false)
+    : [];
+}
+
+function selectedBrowserEngine(summary = browserSummary) {
+  return visibleBrowserEngines(summary).find((engine) => engine.id === selectedBrowserEngineId) || null;
+}
+
+function defaultBrowserEngine(summary = browserSummary) {
+  const engines = visibleBrowserEngines(summary);
+  return engines.find((engine) => engine.default === true) || engines[0] || null;
+}
+
+function browserEngineKindLabel(engine) {
+  const substrate = String(engine?.backing_substrate || "").toLowerCase();
+  if (substrate === "remote_operator_vm") {
+    return "Mac Browser Engine";
+  }
+  if (substrate === "local_microvm") {
+    const marker = `${engine?.id || ""} ${engine?.engine || ""}`.toLowerCase();
+    return marker.includes("jetson") || marker.includes("crosvm")
+      ? "Jetson Browser Engine"
+      : "MicroVM Browser Engine";
+  }
+  if (substrate === "host_policy_webview") {
+    return "Device Browser Engine";
+  }
+  if (substrate === "operator_rbi") {
+    return "Remote Browser Engine";
+  }
+  const marker = `${engine?.id || ""} ${engine?.engine || ""}`.toLowerCase();
+  if (marker.includes("jetson") || marker.includes("crosvm")) {
+    return "Jetson Browser Engine";
+  }
+  if (marker.includes("mac") || marker.includes("vz") || marker.includes("darwin")) {
+    return "Mac Browser Engine";
+  }
+  if (marker.includes("microvm") || marker.includes("chromium")) {
+    return "MicroVM Browser Engine";
+  }
+  if (marker.includes("hosted") || marker.includes("remote")) {
+    return "Remote Browser Engine";
+  }
+  return "Browser Engine";
+}
+
+function browserEngineLabel(adapterId = selectedBrowserEngineId) {
+  if (!adapterId) {
+    const engine = defaultBrowserEngine();
+    return engine
+      ? `${DEFAULT_ENGINE_LABEL} (${browserEngineKindLabel(engine)})`
+      : DEFAULT_ENGINE_LABEL;
+  }
+  const engine = visibleBrowserEngines(browserSummary).find(
+    (candidate) => candidate.id === adapterId,
+  );
+  return engine ? `${browserEngineKindLabel(engine)}: ${engine.id}` : `Browser Engine: ${adapterId}`;
+}
+
+function browserEngineSummary(engine) {
+  if (!engine) {
+    const defaultEngine = defaultBrowserEngine();
+    return defaultEngine
+      ? `${browserEngineLabel("")}. Browser will use this engine unless you choose another one.`
+      : DEFAULT_ENGINE_SUMMARY;
+  }
+  return `${browserEngineLabel(engine.id)}. Runs the page in an isolated Browser Engine; network access uses the selected Exit Node.`;
+}
+
+function updateSettingsTitle() {
+  if (!settingsButton) {
+    return;
+  }
+  const engineText = engineSummaryNode?.textContent || DEFAULT_ENGINE_SUMMARY;
+  const exitText = exitSummaryNode?.textContent || LOCAL_EXIT_SUMMARY;
+  settingsButton.title = `Browser settings: ${engineText} ${exitText}`;
+}
+
+function remoteCarrierExitLabel(exit) {
+  const id = String(exit?.id || "").trim();
+  const grant = String(exit?.grant_id || "").trim();
+  const peer = String(exit?.peer_did || exit?.carrier?.peer_did || "").trim();
+  const displayName = String(exit?.display_name || exit?.label || "").trim();
+  const label = displayName || id || grant || peer || "shared Exit Node";
+  const marker = `${id} ${grant} ${peer}`.toLowerCase();
+  const kind = marker.includes("seed") ? "Seed Exit Node" : "Shared Exit Node";
+  return `${kind}: ${label}`;
+}
+
+function remoteCarrierExitSummary(exit) {
+  const label = remoteCarrierExitLabel(exit);
+  const remaining = Number(exit?.accounting?.active_streams_remaining);
+  const quota =
+    Number.isFinite(remaining) && remaining >= 0
+      ? ` ${remaining} stream${remaining === 1 ? "" : "s"} available.`
+      : "";
+  return `${label}.${quota}`;
+}
+
+function browserExitLabel(remoteExitId = selectedRemoteExitId) {
+  if (!remoteExitId) {
+    return LOCAL_EXIT_LABEL;
+  }
+  const exit = visibleRemoteCarrierExits(browserSummary).find(
+    (candidate) => candidate.id === remoteExitId,
+  );
+  return exit ? remoteCarrierExitLabel(exit) : `Shared Exit Node: ${remoteExitId}`;
+}
+
+function syncExitSelect(summary) {
+  if (!exitSelect) {
+    return;
+  }
+  const exits = visibleRemoteCarrierExits(summary);
+  const previous = selectedRemoteExitId;
+  exitSelect.replaceChildren(new Option(LOCAL_EXIT_LABEL, ""));
+  for (const exit of exits) {
+    exitSelect.add(new Option(remoteCarrierExitLabel(exit), exit.id));
+  }
+  selectedRemoteExitId = exits.some((exit) => exit.id === previous)
+    ? previous
+    : "";
+  exitSelect.value = selectedRemoteExitId;
+  const selectedExit = exits.find((exit) => exit.id === selectedRemoteExitId);
+  const summaryText = selectedExit
+    ? remoteCarrierExitSummary(selectedExit)
+    : LOCAL_EXIT_SUMMARY;
+  if (exitSummaryNode) {
+    exitSummaryNode.textContent = summaryText;
+  }
+  updateSettingsTitle();
+}
+
+function syncEngineSelect(summary) {
+  if (!engineSelect) {
+    return;
+  }
+  const engines = visibleBrowserEngines(summary);
+  const previous = selectedBrowserEngineId;
+  const defaultEngine = defaultBrowserEngine(summary);
+  engineSelect.replaceChildren(new Option(
+    defaultEngine
+      ? `${DEFAULT_ENGINE_LABEL} (${browserEngineKindLabel(defaultEngine)})`
+      : DEFAULT_ENGINE_LABEL,
+    "",
+  ));
+  for (const engine of engines) {
+    engineSelect.add(new Option(`${browserEngineKindLabel(engine)}: ${engine.id}`, engine.id));
+  }
+  selectedBrowserEngineId = engines.some((engine) => engine.id === previous)
+    ? previous
+    : "";
+  engineSelect.value = selectedBrowserEngineId;
+  if (engineSummaryNode) {
+    engineSummaryNode.textContent = browserEngineSummary(selectedBrowserEngine(summary));
+  }
+  updateSettingsTitle();
+}
+
+async function fetchBrowserSummary() {
+  if (browserSummaryPromise) {
+    return browserSummaryPromise;
+  }
+  browserSummaryPromise = fetchJson("/api/apps/browser/summary", { method: "GET" })
+    .then((summary) => {
+      browserSummary = summary;
+      syncEngineSelect(summary);
+      syncExitSelect(summary);
+      return summary;
+    })
+    .catch(() => {
+      browserSummary = null;
+      syncEngineSelect(null);
+      syncExitSelect(null);
+      return null;
+    })
+    .finally(() => {
+      browserSummaryPromise = null;
+    });
+  return browserSummaryPromise;
+}
+
+function explicitDisplayModeParam() {
+  return params.get("display_mode") || params.get("display") || "";
+}
+
+function explicitGuaranteeLevelParam() {
+  return params.get("guarantee_level") || params.get("guarantee") || "";
+}
+
+function guaranteeLevelForOpen(displayMode, summary) {
+  const explicit = explicitGuaranteeLevelParam();
+  if (explicit) {
+    return explicit;
+  }
+  const engine = selectedBrowserEngine(summary);
+  const levels = Array.isArray(engine?.supported_guarantee_levels)
+    ? engine.supported_guarantee_levels
+    : Array.isArray(summary?.engine_adapter?.supported_guarantee_levels)
+    ? summary.engine_adapter.supported_guarantee_levels
+    : [];
+  if (levels.includes(GUARANTEE_MECHANISM_MICROVM)) {
+    return GUARANTEE_MECHANISM_MICROVM;
+  }
+  if (levels.includes(GUARANTEE_OPERATOR_RBI)) {
+    return GUARANTEE_OPERATOR_RBI;
+  }
+  if (levels.includes(GUARANTEE_POLICY_WEBVIEW)) {
+    return GUARANTEE_POLICY_WEBVIEW;
+  }
+  return GUARANTEE_MECHANISM_MICROVM;
+}
+
+async function launchContractForOpen() {
+  if (explicitDisplayModeParam()) {
+    const displayMode = requestedDisplayMode(params, debugMetrics);
+    const summary = explicitGuaranteeLevelParam()
+      ? null
+      : await fetchBrowserSummary();
+    return {
+      displayMode,
+      guaranteeLevel: guaranteeLevelForOpen(displayMode, summary),
+    };
+  }
+  const summary = await fetchBrowserSummary();
+  const engine = selectedBrowserEngine(summary);
+  const supportedModes = Array.isArray(engine?.supported_display_modes)
+    ? engine.supported_display_modes
+    : Array.isArray(summary?.engine_adapter?.supported_display_modes)
+    ? summary.engine_adapter.supported_display_modes
+    : [];
+  const displayMode = supportedModes.includes(PRODUCT_DISPLAY_MODE)
+    ? PRODUCT_DISPLAY_MODE
+    : requestedDisplayMode(params, debugMetrics);
+  return {
+    displayMode,
+    guaranteeLevel: guaranteeLevelForOpen(displayMode, summary),
+  };
+}
+
+function wait(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+function browserOpenJobError(status) {
+  const error = status?.error || {};
+  const message =
+    error.message ||
+    error.error ||
+    "Browser Engine failed to start cleanly. Refresh Browser, or choose another Browser Engine.";
+  const next = new Error(message);
+  next.status = error.http_status || 500;
+  next.payload = error;
+  return next;
+}
+
+async function waitForRuntimeOpen(response, { engineLabel, exitLabel }) {
+  if (response?.schema === "elastos.browser.open-result/v1") {
+    return response;
+  }
+  if (
+    response?.schema !== "elastos.browser.open-accepted/v1" ||
+    !response.status_url
+  ) {
+    return response;
+  }
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < BROWSER_OPEN_POLL_TIMEOUT_MS) {
+    const elapsedSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+    showStatus(
+      `Opening ${engineLabel} with ${exitLabel}... ${elapsedSeconds}s`,
+      { sticky: true },
+    );
+    await wait(BROWSER_OPEN_POLL_INTERVAL_MS);
+    const status = await fetchJson(response.status_url, { method: "GET" });
+    if (status?.schema !== "elastos.browser.open-status/v1") {
+      throw new Error("Browser Engine returned an invalid startup status.");
+    }
+    if (status.status === "completed") {
+      return status.result;
+    }
+    if (status.status === "failed") {
+      throw browserOpenJobError(status);
+    }
+  }
+  throw new Error(
+    "Browser Engine startup is still pending. Refresh Browser, or choose another Browser Engine.",
+  );
+}
+
 async function requestRuntimeOpen(value, { history = "push", reconnect = false } = {}) {
   const nextUrl = normalizeUrl(value);
-  const streamTarget = streamTargetForUrl(nextUrl);
-  const displayMode = requestedDisplayMode(params, debugMetrics);
+  const visibleAddress = visibleAddressForUrl(nextUrl);
+  const browserEngineId = selectedBrowserEngineId;
+  const engineLabel = browserEngineLabel(browserEngineId);
+  const remoteExitId = selectedRemoteExitId;
+  const exitLabel = browserExitLabel(remoteExitId);
+  const isExitSwitch =
+    Boolean(currentPage?.page_id) && remoteExitId !== currentRemoteExitId;
+  const isEngineSwitch =
+    Boolean(currentPage?.page_id) && browserEngineId !== currentBrowserEngineId;
   if (!reconnect) {
     stopRemoteReconnect();
     remoteReconnectAttempt = 0;
@@ -668,27 +1172,52 @@ async function requestRuntimeOpen(value, { history = "push", reconnect = false }
   clearAddressDraft();
   setCurrentUrl(nextUrl, { blur: true });
   setLoading(true);
-  showStatus(`Opening ${streamTarget} through Runtime...`, { sticky: true });
+  showStatus(`Opening ${visibleAddress} using ${engineLabel} and ${exitLabel}...`, {
+    sticky: true,
+  });
   try {
+    const { displayMode, guaranteeLevel } = await launchContractForOpen();
     const previousPage = currentPage;
     const stalePage = previousPage ? null : rememberedRuntimePage();
     closeRemoteDisplay();
     stopPageStatusPolling();
     stopPageHeartbeat();
-    frameLoopSerial += 1;
     currentPage = null;
     publishRuntimePageForHost(null);
+    if (previousPage?.page_id || stalePage?.page_id) {
+      showStatus(
+        isExitSwitch
+          ? "Closing current Browser session before switching Exit Node..."
+          : isEngineSwitch
+            ? "Closing current Browser session before switching Browser Engine..."
+          : "Closing previous Browser page...",
+        { sticky: true },
+      );
+    }
     await closeRuntimePage(previousPage);
     await closeRuntimePage(stalePage);
-    const response = await fetchJson("/api/apps/browser/open", {
-      method: "POST",
-      body: {
-        url: nextUrl,
-        reason: "open browser page",
-        viewport: browserViewport(),
-        display_mode: displayMode,
-      },
+    showStatus(`Opening ${engineLabel} with ${exitLabel}...`, {
+      sticky: true,
     });
+    const body = {
+      url: nextUrl,
+      reason: "open browser page",
+      viewport: browserViewport(),
+      display_mode: displayMode,
+      guarantee_level: guaranteeLevel,
+      async_open: true,
+    };
+    if (remoteExitId) {
+      body.remote_exit_id = remoteExitId;
+    }
+    if (browserEngineId) {
+      body.adapter_id = browserEngineId;
+    }
+    const accepted = await fetchJson("/api/apps/browser/open", {
+      method: "POST",
+      body,
+    });
+    const response = await waitForRuntimeOpen(accepted, { engineLabel, exitLabel });
     const page = response?.engine_page;
     if (
       response?.schema !== "elastos.browser.open-result/v1" ||
@@ -696,37 +1225,37 @@ async function requestRuntimeOpen(value, { history = "push", reconnect = false }
     ) {
       throw new Error("Browser Engine Adapter returned an invalid page.");
     }
+    if (remoteExitId && response?.stream_session?.backend !== remoteExitId) {
+      throw new Error("Browser could not use the selected Exit Node.");
+    }
     currentPage = page;
+    currentBrowserEngineId = browserEngineId;
+    currentRemoteExitId = remoteExitId;
     publishRuntimePageForHost(page);
     currentDisplayMode = page.display_session?.mode || "";
-    currentDisplayInput = page.display_session?.input || "runtime_route";
+    syncDisplayInputFromSession(page.display_session);
     currentView = page.view || viewFromDisplaySession(page.display_session);
     canGoBack = false;
     canGoForward = false;
-    frameSeq = 0;
     updateMetricsNode(null);
+    showStatus("Browser session ready. Connecting display...", {
+      sticky: true,
+    });
     const actualUrl = page.actual_url || page.url || nextUrl;
     syncViewFromResponse(currentView || {});
     syncBrowserLocation(actualUrl, page.title, history, { forceAddress: true });
-    if (currentDisplayMode === "webrtc_remote_display") {
-      await connectRemoteDisplay(page.display_session);
-      startPageStatusPolling();
-      startPageHeartbeat();
-      if (!remoteDisplay.isTrackReady()) {
-        showStatus("Remote display negotiated. Waiting for video...", {
-          sticky: true,
-        });
-      }
-    } else if (currentDisplayMode === "diagnostic_frame") {
-      await fetchBrowserFrame({ focus: true });
-      startFrameStream();
-      startPageStatusPolling();
-      startPageHeartbeat();
-      showStatus("Diagnostic frame connected through Runtime.");
-    } else {
+    if (currentDisplayMode !== "webrtc_remote_display") {
       throw new Error(
         `Browser display mode ${currentDisplayMode || "none"} is not supported by this host.`,
       );
+    }
+    await connectRemoteDisplay(page.display_session);
+    startPageStatusPolling();
+    startPageHeartbeat();
+    if (!remoteDisplay.isTrackReady()) {
+      showStatus("Remote display negotiated. Waiting for video...", {
+        sticky: true,
+      });
     }
   } catch (error) {
     if (isAuthoritySessionError(error) && requestHomeRelaunch(friendlyOpenError(error))) {
@@ -741,14 +1270,28 @@ async function requestRuntimeOpen(value, { history = "push", reconnect = false }
 
 async function navigateAddress(value) {
   const nextUrl = normalizeUrl(value);
+  const currentUrl = remoteReconnectUrl();
+  const crossStreamTarget = !sameBrowserStreamTarget(currentUrl, nextUrl);
   clearAddressDraft();
-  if (!currentPage?.page_id || currentDisplayMode !== "webrtc_remote_display") {
+  if (!currentPage?.page_id) {
+    return requestRuntimeOpen(nextUrl);
+  }
+  if (selectedBrowserEngineId !== currentBrowserEngineId) {
+    return requestRuntimeOpen(nextUrl);
+  }
+  if (selectedRemoteExitId !== currentRemoteExitId) {
+    return requestRuntimeOpen(nextUrl);
+  }
+  if (isBrowserErrorUrl(currentUrl)) {
+    showStatus(`Recovering ${visibleAddressForUrl(nextUrl)} in a fresh Browser session...`, {
+      sticky: true,
+    });
     return requestRuntimeOpen(nextUrl);
   }
   addressInput.value = nextUrl;
   addressInput.blur();
   setLoading(true);
-  showStatus(`Opening ${nextUrl} through Runtime...`, { sticky: true });
+  showStatus(`Opening ${visibleAddressForUrl(nextUrl)}...`, { sticky: true });
   try {
     await sendBrowserInput(
       { type: "browser_command", command: "navigate", url: nextUrl },
@@ -756,6 +1299,12 @@ async function navigateAddress(value) {
     );
     startPageStatusPolling();
   } catch (error) {
+    if (crossStreamTarget) {
+      showStatus(`Reopening ${visibleAddressForUrl(nextUrl)} in a fresh Browser session...`, {
+        sticky: true,
+      });
+      return requestRuntimeOpen(nextUrl);
+    }
     showStatus(friendlyOpenError(error), { sticky: true });
     throw error;
   } finally {
@@ -789,6 +1338,66 @@ form.addEventListener("submit", (event) => {
 
 addressInput.addEventListener("input", markAddressDraftEdited);
 
+engineSelect?.addEventListener("change", () => {
+  selectedBrowserEngineId = engineSelect.value || "";
+  syncEngineSelect(browserSummary);
+  if (currentPage?.page_id && selectedBrowserEngineId !== currentBrowserEngineId) {
+    const nextUrl = remoteReconnectUrl();
+    requestRuntimeOpen(nextUrl, { history: "replace" }).catch((error) => {
+      selectedBrowserEngineId = currentBrowserEngineId;
+      syncEngineSelect(browserSummary);
+      showStatus(friendlyOpenError(error), { sticky: true });
+    });
+  }
+});
+
+exitSelect?.addEventListener("change", () => {
+  selectedRemoteExitId = exitSelect.value || "";
+  syncExitSelect(browserSummary);
+  if (currentPage?.page_id && selectedRemoteExitId !== currentRemoteExitId) {
+    const nextUrl = remoteReconnectUrl();
+    requestRuntimeOpen(nextUrl, { history: "replace" }).catch((error) => {
+      selectedRemoteExitId = currentRemoteExitId;
+      syncExitSelect(browserSummary);
+      showStatus(friendlyOpenError(error), { sticky: true });
+    });
+  }
+});
+
+settingsButton?.addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  const willOpen = Boolean(settingsPanel?.hidden);
+  setSettingsOpen(willOpen);
+  if (willOpen) {
+    void fetchBrowserSummary();
+  }
+});
+
+settingsCloseButton?.addEventListener("click", (event) => {
+  event.preventDefault();
+  setSettingsOpen(false);
+  settingsButton?.focus({ preventScroll: true });
+});
+
+document.addEventListener("click", (event) => {
+  if (
+    settingsPanel?.hidden ||
+    settingsPanel?.contains(event.target) ||
+    settingsButton?.contains(event.target)
+  ) {
+    return;
+  }
+  setSettingsOpen(false);
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !settingsPanel?.hidden) {
+    setSettingsOpen(false);
+    settingsButton?.focus({ preventScroll: true });
+  }
+});
+
 addressInput.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") {
     return;
@@ -819,48 +1428,76 @@ refreshButton.addEventListener("click", () => {
   });
 });
 
+async function resetBrowserProfile() {
+  if (!launchToken) {
+    showStatus("Browser profile reset requires a Browser launch token.", { sticky: true });
+    return;
+  }
+  if (!window.confirm("Reset Browser cookies, local storage, history, and cache for this account?")) {
+    return;
+  }
+  const activePage = currentPage;
+  const rememberedPage = rememberedRuntimePage();
+  const stalePage =
+    rememberedPage?.page_id && rememberedPage.page_id !== activePage?.page_id
+      ? rememberedPage
+      : null;
+  setLoading(true);
+  showStatus("Closing Browser page before profile reset...", { sticky: true });
+  closeRemoteDisplay();
+  stopRemoteReconnect();
+  stopPageStatusPolling();
+  stopPageHeartbeat();
+  currentPage = null;
+  currentBrowserEngineId = "";
+  currentRemoteExitId = "";
+  publishRuntimePageForHost(null);
+  updateNavState();
+  try {
+    await closeRuntimePage(activePage);
+    await closeRuntimePage(stalePage);
+    const response = await fetchJson("/api/apps/browser/profile/reset", {
+      method: "POST",
+    });
+    showStatus(
+      response?.removed_profile_disk
+        ? "Browser profile reset. Open the address again."
+        : "Browser profile was already clear.",
+      { sticky: true },
+    );
+  } catch (error) {
+    showStatus(friendlyOpenError(error), { sticky: true });
+  } finally {
+    setLoading(false);
+  }
+}
+
+profileResetButton?.addEventListener("click", () => {
+  resetBrowserProfile().catch((error) => {
+    showStatus(friendlyOpenError(error), { sticky: true });
+  });
+});
+
 bindBrowserInputSurface({
   copyRemoteClipboardToHost,
   friendlyOpenError,
-  getCurrentDisplayMode: () => currentDisplayMode,
   getCurrentPage: () => currentPage,
   getCurrentView: () => currentView,
   keyboardCapture,
   pasteHostClipboardIntoRemote,
   remoteVideo,
-  renderImage,
   renderPanel,
   sendBrowserInput,
   showStatus,
   unlockRemoteAudioFromGesture,
 });
 
-function scheduleViewportResize({ force = false } = {}) {
+function scheduleViewportResize() {
   if (!currentPage) {
     return;
   }
   const viewport = browserViewport();
-  if (currentDisplayMode === "webrtc_remote_display") {
-    lastViewport = viewport;
-    return;
-  }
-  if (
-    !force &&
-    lastViewport &&
-    lastViewport.width === viewport.width &&
-    lastViewport.height === viewport.height
-  ) {
-    return;
-  }
-  window.clearTimeout(resizeTimer);
-  resizeTimer = window.setTimeout(() => {
-    sendBrowserInput(
-      { type: "resize", viewport },
-      { focus: false, history: "replace" },
-    ).catch((error) => {
-      showStatus(friendlyOpenError(error), { sticky: true });
-    });
-  }, RESIZE_FLUSH_MS);
+  lastViewport = viewport;
 }
 
 const resizeObserver = new ResizeObserver(scheduleViewportResize);
@@ -872,11 +1509,12 @@ window.addEventListener("beforeunload", () => {
 
 window.addEventListener("pagehide", releaseRuntimePageForUnload);
 window.__elastosBrowserReleaseRuntimePage = releaseRuntimePageForUnload;
-publishRuntimePageForHost(null);
 
-addressInput.value = DEFAULT_URL;
+const initialUrl = params.get("url") || DEFAULT_URL;
+addressInput.value = initialUrl;
 updateNavState();
-requestRuntimeOpen(DEFAULT_URL, { history: "replace" }).catch((error) => {
+void fetchBrowserSummary();
+requestRuntimeOpen(initialUrl, { history: "replace" }).catch((error) => {
   if (isAuthoritySessionError(error) && requestHomeRelaunch(friendlyOpenError(error))) {
     return;
   }

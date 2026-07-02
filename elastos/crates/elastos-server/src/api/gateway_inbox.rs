@@ -10,13 +10,26 @@ pub(super) async fn inbox_summary(
             Err(err) => return inbox_error_response(err),
         };
 
+    let data_dir = state.data_dir.clone();
+    let sync_context = context.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        home_services_sync_access_requests(&data_dir, &sync_context)
+    })
+    .await;
+
     let home_state = home_state(&state.data_dir);
     let mut notifications = home_state.notifications;
+    append_home_service_access_notifications(&state.data_dir, &context, &mut notifications);
     let wallet_approvals =
         system_wallet_approvals_summary(&state, &context.principal_id, false).await;
     append_wallet_approval_notifications(&mut notifications, wallet_approvals.approval_requests);
     if let Ok(capability_requests) = runtime_capability_pending_requests(&state.data_dir).await {
         append_runtime_capability_notifications(&mut notifications, capability_requests);
+    }
+    if let Ok(inspect_requests) =
+        pending_inspect_action_requests(&state.data_dir, &context.principal_id)
+    {
+        append_inspect_action_notifications(&mut notifications, inspect_requests);
     }
     Json(InboxSummaryResponse {
         app: HomeCapsuleIdentity {
@@ -171,7 +184,10 @@ fn parse_inbox_action_request(
             .find_map(|(key, value)| (key == "action_id").then(|| value.into_owned()))
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| "missing action_id".to_string())?;
-        Ok(InboxActionRequest { action_id })
+        Ok(InboxActionRequest {
+            action_id,
+            home_token: None,
+        })
     } else {
         Err("unsupported inbox action content type".to_string())
     }
@@ -203,10 +219,10 @@ async fn dispatch_inbox_action(
     if let Some(request_id) = action_id.strip_prefix("room-approve-request:") {
         let message = match crate::room_service::approve_request(data_dir, request_id)? {
             Some(outcome) => format!(
-                "Approved Chat Room browser access for {} on {}.",
+                "Approved Chat web guest request for {} on {}.",
                 outcome.display_name, outcome.device_label
             ),
-            None => "That browser access request is no longer pending.".to_string(),
+            None => "That web guest request is no longer pending.".to_string(),
         };
         let summary = crate::room_service::load_summary(data_dir)?;
         let _ = crate::notifications::sync_room_notifications(data_dir, &summary);
@@ -217,10 +233,10 @@ async fn dispatch_inbox_action(
         let message =
             match crate::room_service::deny_request(data_dir, request_id, "Denied from Inbox.")? {
                 Some(outcome) => format!(
-                    "Denied Chat Room browser access for {} on {}.",
+                    "Denied Chat web guest request for {} on {}.",
                     outcome.display_name, outcome.device_label
                 ),
-                None => "That browser access request is no longer pending.".to_string(),
+                None => "That web guest request is no longer pending.".to_string(),
             };
         let summary = crate::room_service::load_summary(data_dir)?;
         let _ = crate::notifications::sync_room_notifications(data_dir, &summary);
@@ -228,8 +244,22 @@ async fn dispatch_inbox_action(
         return Ok(message);
     }
     if let Some(request_id) = action_id.strip_prefix("wallet-approve-request:") {
-        let _ = request_id;
-        anyhow::bail!("Open Wallet to approve built-in wallet requests");
+        let Some(home_token) = action.home_token.as_deref() else {
+            anyhow::bail!("fresh passkey verification is required to sign with a built-in wallet");
+        };
+        require_fresh_passkey_home_token(data_dir, home_token, context, 180)?;
+        let outcome = approve_managed_wallet_request(
+            state,
+            data_dir,
+            &context.principal_id,
+            &context.session_id,
+            request_id,
+            "Approved in Inbox",
+            INBOX_CAPSULE_ID,
+        )
+        .await?;
+        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        return Ok(outcome.message);
     }
     if let Some(request_id) = action_id.strip_prefix("wallet-reject-request:") {
         crate::api::auth_gateway::wallet_provider_data(
@@ -261,6 +291,36 @@ async fn dispatch_inbox_action(
     }
     if let Some(request_id) = action_id.strip_prefix("capability-deny-request:") {
         return deny_runtime_capability_request(data_dir, request_id).await;
+    }
+    if let Some(request_id) = action_id.strip_prefix("service-approve-request:") {
+        let data_dir = data_dir.clone();
+        let context = context.clone();
+        let request_id = request_id.to_string();
+        return tokio::task::spawn_blocking(move || {
+            approve_home_service_access_request(&data_dir, &context, &request_id)
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!(err))?;
+    }
+    if let Some(request_id) = action_id.strip_prefix("service-deny-request:") {
+        let data_dir = data_dir.clone();
+        let context = context.clone();
+        let request_id = request_id.to_string();
+        return tokio::task::spawn_blocking(move || {
+            deny_home_service_access_request(&data_dir, &context, &request_id)
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!(err))?;
+    }
+    if let Some(request_id) = action_id.strip_prefix("inspect-approve-request:") {
+        let Some(home_token) = action.home_token.as_deref() else {
+            anyhow::bail!("fresh passkey verification is required to approve an Inspector action");
+        };
+        require_fresh_passkey_home_token(data_dir, home_token, context, 180)?;
+        return approve_inspect_action_request(state, context, request_id).await;
+    }
+    if let Some(request_id) = action_id.strip_prefix("inspect-deny-request:") {
+        return deny_inspect_action_request(state, context, request_id);
     }
     if action_id == WALLET_PRICE_HTTP_APPROVE_ACTION_ID {
         ensure_admin_context(data_dir, context)?;

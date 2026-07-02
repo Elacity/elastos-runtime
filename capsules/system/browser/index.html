@@ -1,89 +1,88 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>System · ElastOS</title>
-<link rel="stylesheet" href="./style.css?v=system-20260525a">
+<link rel="stylesheet" href="./style.css?v=system-20260625a">
 </head>
 <body>
-  <main class="system-shell" aria-label="System">
-    <section class="system-layout" aria-label="System settings">
-      <div class="system-column system-column-main">
-        <section class="system-panel" aria-labelledby="account-title">
-          <h2 id="account-title">Account</h2>
-          <dl class="system-fields">
-            <div class="system-field">
-              <dt>Name</dt>
-              <dd class="system-control">
-                <form id="handle-form" class="system-inline-form">
-                  <label class="visually-hidden" for="handle-input">Name</label>
-                  <div class="system-inline-row">
-                    <input id="handle-input" class="system-input" type="text" maxlength="32" autocomplete="nickname" placeholder="Your name">
-                    <button id="handle-save" class="system-button" type="submit">Save</button>
+  <main class="settings-container" aria-label="System">
+    <div class="settings window-settings">
+      <button class="sidebar-toggle hidden-lg hidden-xl hidden-md" type="button" aria-label="Toggle settings sections">
+        <span class="sidebar-toggle-button" aria-hidden="true"><span></span><span></span><span></span></span>
+      </button>
+
+      <aside class="settings-sidebar disable-user-select disable-context-menu" aria-label="System sections">
+        <div class="settings-sidebar-burger disable-context-menu disable-user-select" aria-hidden="true"></div>
+        <button class="settings-sidebar-item disable-context-menu disable-user-select active" type="button" data-settings="account">
+          <span class="settings-sidebar-icon settings-sidebar-icon-account" aria-hidden="true"></span>
+          <span class="settings-sidebar-text">Account</span>
+        </button>
+        <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-settings="personalization">
+          <span class="settings-sidebar-icon settings-sidebar-icon-personalization" aria-hidden="true"></span>
+          <span class="settings-sidebar-text">Personalization</span>
+        </button>
+        <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-settings="security">
+          <span class="settings-sidebar-icon settings-sidebar-icon-security" aria-hidden="true"></span>
+          <span class="settings-sidebar-text">Security</span>
+        </button>
+        <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-settings="storage">
+          <span class="settings-sidebar-icon settings-sidebar-icon-storage" aria-hidden="true"></span>
+          <span class="settings-sidebar-text">Storage</span>
+        </button>
+        <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-settings="inspector">
+          <span class="settings-sidebar-icon settings-sidebar-icon-inspector" aria-hidden="true"></span>
+          <span class="settings-sidebar-text">Inspector</span>
+        </button>
+        <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-settings="about">
+          <span class="settings-sidebar-icon settings-sidebar-icon-about" aria-hidden="true"></span>
+          <span class="settings-sidebar-text">About</span>
+        </button>
+      </aside>
+
+      <div class="settings-content-container">
+        <section class="settings-content active" data-settings="account" aria-labelledby="account-title">
+          <h1 id="account-title">Account</h1>
+
+          <section class="pc2-section" aria-labelledby="accounts-title">
+            <h2 id="accounts-title" class="pc2-section-title">Accounts</h2>
+            <div class="pc2-group">
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Passkeys</div>
+                    <div class="pc2-card-sublabel">Local browser credentials for this Home account.</div>
                   </div>
-                </form>
-              </dd>
-              <dd class="system-note system-status" data-field="handle-status" hidden></dd>
-            </div>
-            <div class="system-field">
-              <dt>Accounts</dt>
-              <dd class="system-control">
-                <span class="system-value-text system-value-muted" data-field="passkey-status" hidden></span>
-                <div id="account-list" class="account-list" aria-live="polite"></div>
-              </dd>
-            </div>
-            <div class="system-field">
-              <dt>Recovery</dt>
-              <dd class="system-control">
-                <div class="system-inline-row">
-                  <label class="visually-hidden" for="recovery-password">Recovery Kit password</label>
-                  <input id="recovery-password" class="system-input" type="password" autocomplete="new-password" placeholder="Optional password">
-                  <button id="recovery-download" class="system-button" type="button">Download Recovery Kit</button>
-                  <label class="system-button system-button-secondary system-file-button" for="recovery-import">Import Recovery Kit</label>
-                  <input id="recovery-import" class="visually-hidden" type="file" accept="application/json,.json" aria-label="Import Recovery Kit">
-                  <span class="system-value-text system-value-muted" data-field="recovery-status">Not set</span>
+                  <span class="pc2-card-value system-value-muted" data-field="passkey-status" hidden></span>
                 </div>
-              </dd>
-              <dd class="system-note">Downloads everything recoverable for this account: Home data root plus built-in Wallet account keys. Use a password when saving funds; external wallet private keys stay in their own wallets.</dd>
-              <dd class="system-note system-status" data-field="recovery-note" hidden></dd>
-              <dd id="recovery-pending" class="recovery-pending" hidden>
-                <span class="recovery-pending-text" data-field="recovery-pending-text"></span>
-                <span class="recovery-pending-actions">
-                  <button id="recovery-attach" class="system-button" type="button">Recover account</button>
-                  <button id="recovery-cancel" class="system-button system-button-secondary" type="button">Cancel</button>
-                </span>
-              </dd>
+                <div id="account-list" class="account-list" aria-live="polite"></div>
+                <dl class="system-fields compact-proof">
+                  <div><dt>Accounts</dt><dd></dd></div>
+                </dl>
+              </div>
             </div>
-            <div class="system-field">
-              <dt>Guest access</dt>
-              <dd class="system-control">
-                <label class="system-switch">
-                  <input id="guest-registration" type="checkbox" aria-label="Allow new guest accounts">
-                  <span class="system-switch-track" aria-hidden="true"></span>
-                  <span class="system-switch-text">Allow new guests</span>
-                </label>
-              </dd>
-              <dd class="system-note">Lets new people create their own guest account from Home. Existing guests are not revoked.</dd>
-              <dd class="system-note system-status" data-field="guest-registration-status" hidden></dd>
-            </div>
-          </dl>
+          </section>
         </section>
 
-      </div>
+        <section class="settings-content" data-settings="personalization" aria-labelledby="personalization-title">
+          <h1 id="personalization-title">Personalization</h1>
 
-      <div class="system-column system-column-main">
-        <section class="system-panel" aria-labelledby="appearance-title">
-          <h2 id="appearance-title">Appearance</h2>
-          <dl class="system-fields">
-            <div class="system-field">
-              <dt>Background</dt>
-              <dd class="system-control background-control">
+          <section class="pc2-section" aria-labelledby="appearance-title">
+            <h2 id="appearance-title" class="pc2-section-title">Appearance</h2>
+            <div class="pc2-group">
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Background</div>
+                    <div class="pc2-card-sublabel">Home wallpaper and contrast overlay.</div>
+                  </div>
+                </div>
                 <div id="background-preview" class="background-preview" aria-hidden="true"></div>
                 <div class="system-inline-row background-actions">
-                  <label class="system-button system-file-button" for="background-input">Choose image</label>
+                  <label class="pc2-btn system-file-button" for="background-input">Choose image</label>
                   <input id="background-input" class="visually-hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif" aria-label="Choose background image">
-                  <button id="background-reset" class="system-button system-button-secondary" type="button">Reset</button>
+                  <button id="background-reset" class="pc2-btn pc2-btn-secondary" type="button">Reset</button>
                 </div>
                 <div class="background-overlay-panel">
                   <label class="system-switch">
@@ -99,60 +98,193 @@
                     <input id="background-overlay-opacity" class="system-range-input" type="range" min="0" max="80" step="5" value="55" aria-label="Overlay strength">
                   </div>
                 </div>
-              </dd>
-              <dd class="system-note system-status" data-field="background-status" hidden></dd>
-              <dd class="system-note system-status" data-field="overlay-status" hidden></dd>
+                <div class="pc2-card-value system-status" data-field="background-status" hidden></div>
+                <div class="pc2-card-value system-status" data-field="overlay-status" hidden></div>
+                <dl class="system-fields compact-proof">
+                  <div><dt>Background</dt><dd></dd></div>
+                </dl>
+              </div>
             </div>
-          </dl>
+          </section>
         </section>
 
-      </div>
+        <section class="settings-content" data-settings="security" aria-labelledby="security-title">
+          <h1 id="security-title">Security</h1>
 
-      <section class="system-panel system-panel-advanced" aria-labelledby="advanced-title">
-        <h2 id="advanced-title">Advanced</h2>
-        <div class="system-advanced-body">
-          <dl class="system-fields system-fields-split">
-            <div class="system-field system-field-advanced-top">
-              <dt>Device identity</dt>
-              <dd class="system-value">
-                <code data-field="device-did"></code>
-              </dd>
+          <section class="pc2-section" aria-labelledby="recovery-title">
+            <h2 id="recovery-title" class="pc2-section-title">Recovery</h2>
+            <div class="pc2-group">
+              <div class="pc2-group-row">
+                <div class="pc2-card-row pc2-card-row-stack">
+                  <div>
+                    <div class="pc2-card-label">Recovery Kit</div>
+                    <div class="pc2-card-sublabel">Downloads everything recoverable for this account: Home data root plus built-in Wallet account keys. Add a password when saving funds.</div>
+                  </div>
+                  <span class="pc2-card-value system-value-muted" data-field="recovery-status">Not set</span>
+                </div>
+                <div class="system-inline-row recovery-actions">
+                  <label class="visually-hidden" for="recovery-password">Recovery Kit password</label>
+                  <input id="recovery-password" class="pc2-input" type="password" autocomplete="new-password" placeholder="Optional password">
+                  <button id="recovery-download" class="pc2-btn" type="button">Download Recovery Kit</button>
+                  <label class="pc2-btn pc2-btn-secondary system-file-button" for="recovery-import">Import Recovery Kit</label>
+                  <input id="recovery-import" class="visually-hidden" type="file" accept="application/json,.json" aria-label="Import Recovery Kit">
+                </div>
+                <div class="pc2-card-value system-status" data-field="recovery-note" hidden></div>
+                <div id="recovery-pending" class="recovery-pending" hidden>
+                  <span class="recovery-pending-text" data-field="recovery-pending-text"></span>
+                  <span class="recovery-pending-actions">
+                    <button id="recovery-attach" class="pc2-btn" type="button">Recover account</button>
+                    <button id="recovery-cancel" class="pc2-btn pc2-btn-secondary" type="button">Cancel</button>
+                  </span>
+                </div>
+                <dl class="system-fields compact-proof">
+                  <div><dt>Recovery</dt><dd></dd></div>
+                </dl>
+              </div>
             </div>
-            <div class="system-field system-field-advanced-top">
-              <dt>Documents</dt>
-              <dd class="system-value">
-                <span class="system-value-text" data-field="storage-status" hidden></span>
-              </dd>
-              <dd class="system-note" data-field="storage-note" hidden></dd>
+          </section>
+
+          <section class="pc2-section" aria-labelledby="access-title">
+            <h2 id="access-title" class="pc2-section-title">Access</h2>
+            <div class="pc2-group">
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Guest access</div>
+                    <div class="pc2-card-sublabel">Lets new people create their own guest account from Home.</div>
+                  </div>
+                  <label class="system-switch">
+                    <input id="guest-registration" type="checkbox" aria-label="Allow new guest accounts">
+                    <span class="system-switch-track" aria-hidden="true"></span>
+                  </label>
+                </div>
+                <div class="pc2-card-value system-status" data-field="guest-registration-status" hidden></div>
+                <dl class="system-fields compact-proof">
+                  <div><dt>Guest access</dt><dd></dd></div>
+                </dl>
+              </div>
             </div>
-            <div class="system-field system-field-advanced-top">
-              <dt>Version</dt>
-              <dd class="system-value">
-                <span class="system-value-text" data-field="runtime-status" hidden></span>
-              </dd>
+          </section>
+        </section>
+
+        <section class="settings-content" data-settings="storage" aria-labelledby="storage-title">
+          <h1 id="storage-title">Storage</h1>
+
+          <section class="pc2-section" aria-labelledby="documents-title">
+            <h2 id="documents-title" class="pc2-section-title">Local Objects</h2>
+            <div class="pc2-group">
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Documents</div>
+                    <div class="pc2-card-sublabel" data-field="storage-note" hidden></div>
+                  </div>
+                  <span class="pc2-card-value" data-field="storage-status" hidden></span>
+                </div>
+                <dl class="system-fields compact-proof">
+                  <div><dt>Documents</dt><dd></dd></div>
+                </dl>
+              </div>
             </div>
-            <div class="system-field system-field-webspace">
-              <dt>Elastos webspace</dt>
-              <dd class="system-control">
+          </section>
+
+          <section class="pc2-section" aria-labelledby="webspace-title">
+            <h2 id="webspace-title" class="pc2-section-title">Elastos Webspace</h2>
+            <div class="pc2-group">
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Capsules and providers</div>
+                    <div class="pc2-card-sublabel">Capability-scoped object surfaces behind ElastOS URIs.</div>
+                  </div>
+                </div>
                 <div id="webspace-list" class="webspace-list" aria-live="polite"></div>
-              </dd>
-              <dd class="system-note">Capsules request scoped Runtime capabilities. Provider capsules own concrete backends behind their declared <code>elastos://</code> or <code>localhost://</code> URI.</dd>
+                <dl class="system-fields compact-proof">
+                  <div><dt>Elastos webspace</dt><dd></dd></div>
+                </dl>
+              </div>
             </div>
-            <div class="system-field system-field-network">
-              <dt>Network status</dt>
-              <dd class="system-control">
+          </section>
+        </section>
+
+        <section class="settings-content" data-settings="inspector" aria-labelledby="inspector-title">
+          <h1 id="inspector-title">Inspector</h1>
+
+          <section class="pc2-section" aria-labelledby="capsule-inspector-title">
+            <h2 id="capsule-inspector-title" class="pc2-section-title">Capsules</h2>
+            <div class="pc2-group">
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Live objects</div>
+                    <div class="pc2-card-sublabel">Permissioned Runtime mirror for capsule identity, authority, provenance, and gate previews.</div>
+                  </div>
+                  <button id="inspect-refresh" class="pc2-btn pc2-btn-secondary" type="button">Refresh</button>
+                </div>
+                <div id="inspect-status" class="pc2-card-value system-status" hidden></div>
+                <div class="inspect-grid">
+                  <div id="inspect-list" class="inspect-list" aria-live="polite"></div>
+                  <div id="inspect-detail" class="inspect-detail" aria-live="polite"></div>
+                </div>
+                <dl class="system-fields compact-proof">
+                  <div><dt>Inspector</dt><dd></dd></div>
+                </dl>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <section class="settings-content" data-settings="about" aria-labelledby="about-panel-title">
+          <h1 id="about-panel-title">About</h1>
+
+          <section class="pc2-section" aria-labelledby="device-title">
+            <h2 id="device-title" class="pc2-section-title">This Device</h2>
+            <div class="pc2-group">
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Device identity</div>
+                    <div class="pc2-card-sublabel">Local identity for this device.</div>
+                  </div>
+                  <code class="pc2-card-value system-code" data-field="device-did"></code>
+                </div>
+                <dl class="system-fields compact-proof">
+                  <div><dt>Device identity</dt><dd></dd></div>
+                </dl>
+              </div>
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Version</div>
+                  </div>
+                  <span class="pc2-card-value" data-field="runtime-status" hidden></span>
+                </div>
+                <dl class="system-fields compact-proof">
+                  <div><dt>Version</dt><dd></dd></div>
+                </dl>
+              </div>
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Network status</div>
+                    <div class="pc2-card-sublabel">Configured chain providers and reachability.</div>
+                  </div>
+                </div>
                 <div class="network-table-card">
                   <div id="chain-table" class="network-table" aria-live="polite"></div>
                 </div>
-              </dd>
+                <dl class="system-fields compact-proof">
+                  <div><dt>Network status</dt><dd></dd></div>
+                </dl>
+              </div>
             </div>
-          </dl>
-        </div>
-      </section>
-    </section>
+          </section>
+        </section>
+      </div>
+    </div>
 
     <p class="system-error" hidden></p>
   </main>
-  <script type="module" src="./system.js?v=system-20260525a"></script>
+  <script type="module" src="./system.js?v=system-20260625a"></script>
 </body>
 </html>

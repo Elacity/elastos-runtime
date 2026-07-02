@@ -284,12 +284,30 @@ impl IpfsProvider {
     fn init(&mut self, config: serde_json::Value) -> Response {
         let extra = config.get("extra").unwrap_or(&config);
 
+        if let Some(base_path) = config
+            .get("base_path")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| extra.get("data_dir").and_then(serde_json::Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let path = PathBuf::from(base_path);
+            if !path.is_absolute() {
+                return Response::error(
+                    "invalid_config",
+                    "ipfs-provider data_dir must be absolute",
+                );
+            }
+            self.data_dir = path;
+            self.repo_dir = self.data_dir.join("ipfs-repo");
+        }
+
         if extra.get("gateways").is_some() || std::env::var("ELASTOS_IPFS_GATEWAYS").is_ok() {
             eprintln!("ipfs-provider: ignoring gateway override; provider is local-IPFS only");
         }
 
         // Find Kubo binary
-        match find_kubo_binary() {
+        match find_kubo_binary(&self.data_dir) {
             Some(path) => {
                 eprintln!("ipfs-provider: found kubo at {}", path.display());
                 self.kubo_binary = Some(path);
@@ -569,7 +587,7 @@ impl IpfsProvider {
         if !file_path.is_absolute() {
             return Response::error("invalid_path", "Path must be absolute");
         }
-        if let Err(e) = validate_source_path(file_path) {
+        if let Err(e) = validate_source_path(&self.data_dir, file_path) {
             return Response::error("path_not_allowed", &e);
         }
         if !file_path.exists() {
@@ -612,7 +630,7 @@ impl IpfsProvider {
     fn cat_to_path(&mut self, cid: &str, path: Option<&str>, dest: &str) -> Response {
         // Path safety validation
         let dest_path = Path::new(dest);
-        if let Err(e) = validate_dest_path(dest_path) {
+        if let Err(e) = validate_dest_path(&self.data_dir, dest_path) {
             return Response::error("invalid_dest", &e);
         }
 
@@ -667,7 +685,7 @@ impl IpfsProvider {
 
     fn download_directory(&mut self, cid: &str, dest: &str) -> Response {
         let dest_path = Path::new(dest);
-        if let Err(e) = validate_dest_path(dest_path) {
+        if let Err(e) = validate_dest_path(&self.data_dir, dest_path) {
             return Response::error("invalid_dest", &e);
         }
 
@@ -1066,7 +1084,14 @@ fn data_dir() -> PathBuf {
     } else if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
         PathBuf::from(dir).join("elastos")
     } else if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".local/share/elastos")
+        #[cfg(target_os = "macos")]
+        {
+            PathBuf::from(home).join("Library/Application Support/elastos")
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            PathBuf::from(home).join(".local/share/elastos")
+        }
     } else {
         PathBuf::from("/tmp/elastos")
     }
@@ -1220,7 +1245,7 @@ fn try_flock_exclusive(_file: &fs::File) -> bool {
 
 // ── Path safety ─────────────────────────────────────────────────────
 
-fn validate_dest_path(dest: &Path) -> Result<(), String> {
+fn validate_dest_path(data_dir: &Path, dest: &Path) -> Result<(), String> {
     if !dest.is_absolute() {
         return Err("Destination path must be absolute".to_string());
     }
@@ -1245,8 +1270,9 @@ fn validate_dest_path(dest: &Path) -> Result<(), String> {
     // Allowed prefixes. Canonicalize the roots too: `resolved` above is canonicalized, and on
     // macOS the temp root is a symlink (`/var` → `/private/var`), so an un-canonicalized root
     // would never `starts_with`-match a canonicalized dest. Fall back to the raw path if a root
-    // does not exist yet.
-    let data_dir = data_dir();
+    // does not exist yet. `data_dir` is the caller-supplied root (`&Path`); own it so the
+    // canonicalization below type-checks.
+    let data_dir = data_dir.to_path_buf();
     let tmp_dir = std::env::temp_dir();
     let data_dir = data_dir.canonicalize().unwrap_or(data_dir);
     let tmp_dir = tmp_dir.canonicalize().unwrap_or(tmp_dir);
@@ -1264,7 +1290,7 @@ fn validate_dest_path(dest: &Path) -> Result<(), String> {
 
 /// Validate source paths for add_path — restrict to allowed roots.
 /// Prevents arbitrary file exfiltration via the IPFS publish path.
-fn validate_source_path(src: &Path) -> Result<(), String> {
+fn validate_source_path(data_dir: &Path, src: &Path) -> Result<(), String> {
     if !src.is_absolute() {
         return Err("Source path must be absolute".to_string());
     }
@@ -1286,8 +1312,12 @@ fn validate_source_path(src: &Path) -> Result<(), String> {
         src.to_path_buf()
     };
 
-    let data_dir = data_dir();
     let tmp_dir = std::env::temp_dir();
+    // Canonicalize the roots too: `resolved` above is canonicalized, and on macOS the temp root is a
+    // symlink (`/var` → `/private/var`), so an un-canonicalized root would never `starts_with`-match
+    // a canonicalized source. Fall back to the raw path if a root does not exist.
+    let data_dir = data_dir.canonicalize().unwrap_or_else(|_| data_dir.to_path_buf());
+    let tmp_dir = tmp_dir.canonicalize().unwrap_or(tmp_dir);
 
     if !resolved.starts_with(&data_dir) && !resolved.starts_with(&tmp_dir) {
         return Err(format!(
@@ -1303,7 +1333,7 @@ fn validate_source_path(src: &Path) -> Result<(), String> {
 
 // ── Kubo binary discovery ───────────────────────────────────────────
 
-fn find_kubo_binary() -> Option<PathBuf> {
+fn find_kubo_binary(data_dir: &Path) -> Option<PathBuf> {
     // 1. Explicit override
     if let Ok(path) = std::env::var("ELASTOS_IPFS_KUBO_PATH") {
         let p = PathBuf::from(&path);
@@ -1313,13 +1343,20 @@ fn find_kubo_binary() -> Option<PathBuf> {
     }
 
     // 2. Standard install location
-    let data_dir = data_dir();
     let installed = data_dir.join("bin/kubo");
     if installed.is_file() {
         return Some(installed);
     }
 
-    // 3. System PATH (try both "kubo" and "ipfs")
+    // 3. Managed runtimes keep provider/external binaries in the parent runtime bin dir.
+    if let Some(dir) = std::env::var_os("ELASTOS_CAPSULE_BIN_DIR") {
+        let installed = PathBuf::from(dir).join("kubo");
+        if installed.is_file() {
+            return Some(installed);
+        }
+    }
+
+    // 4. System PATH (try both "kubo" and "ipfs")
     for name in ["kubo", "ipfs"] {
         if let Ok(output) = Command::new("which").arg(name).output() {
             if output.status.success() {
@@ -1633,6 +1670,36 @@ mod tests {
     }
 
     #[test]
+    fn test_init_config_base_path_overrides_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(bin_dir.join("kubo"), b"test").unwrap();
+        let mut provider = IpfsProvider::new();
+        let response = provider.init(serde_json::json!({
+            "base_path": tmp.path().to_string_lossy()
+        }));
+
+        assert!(matches!(response, Response::Ok { .. }));
+        assert_eq!(provider.data_dir, tmp.path());
+        assert_eq!(provider.repo_dir, tmp.path().join("ipfs-repo"));
+        assert_eq!(provider.kubo_binary, Some(tmp.path().join("bin/kubo")));
+    }
+
+    #[test]
+    fn test_find_kubo_binary_uses_managed_runtime_bin_dir() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let shared_bin = tempfile::tempdir().unwrap();
+        fs::write(shared_bin.path().join("kubo"), b"test").unwrap();
+        std::env::set_var("ELASTOS_CAPSULE_BIN_DIR", shared_bin.path());
+
+        let kubo = find_kubo_binary(data_dir.path());
+
+        std::env::remove_var("ELASTOS_CAPSULE_BIN_DIR");
+        assert_eq!(kubo, Some(shared_bin.path().join("kubo")));
+    }
+
+    #[test]
     fn test_response_serialization() {
         let ok = Response::ok(serde_json::json!({"cid": "QmTest"}));
         let json = serde_json::to_string(&ok).unwrap();
@@ -1662,34 +1729,39 @@ mod tests {
 
     #[test]
     fn test_validate_dest_path_rejects_relative() {
-        let result = validate_dest_path(Path::new("relative/path"));
+        let data_dir = data_dir();
+        let result = validate_dest_path(&data_dir, Path::new("relative/path"));
         assert!(result.is_err());
     }
 
     #[test]
     fn test_validate_source_path_rejects_relative() {
-        let result = validate_source_path(Path::new("relative/file"));
+        let data_dir = data_dir();
+        let result = validate_source_path(&data_dir, Path::new("relative/file"));
         assert!(result.is_err());
     }
 
     #[test]
     fn test_validate_source_path_rejects_outside_roots() {
-        let result = validate_source_path(Path::new("/etc/passwd"));
+        let data_dir = data_dir();
+        let result = validate_source_path(&data_dir, Path::new("/etc/passwd"));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("must be under"));
     }
 
     #[test]
     fn test_validate_source_path_allows_tmp() {
+        let data_dir = data_dir();
         let tmp = std::env::temp_dir().join("elastos-test-file");
-        let result = validate_source_path(&tmp);
+        let result = validate_source_path(&data_dir, &tmp);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_source_path_allows_data_dir() {
-        let path = data_dir().join("some-file.bin");
-        let result = validate_source_path(&path);
+        let data_dir = data_dir();
+        let path = data_dir.join("some-file.bin");
+        let result = validate_source_path(&data_dir, &path);
         assert!(result.is_ok());
     }
 

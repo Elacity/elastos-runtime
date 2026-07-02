@@ -1,6 +1,6 @@
 # PC2 Convergence Notes
 
-> Last verified from public PC2 `main`: 2026-05-29
+> Last verified from public PC2 `main`: 2026-06-09
 > (`a0a910158bd67666a6d3ea2a775ce09005ba7ae7` via `git ls-remote`).
 > This commit is tagged `v1.3.0` in PC2 and is the current migration baseline.
 >
@@ -44,10 +44,14 @@ Concrete files checked on PC2 `main`:
   `pc2-node/src/services/ContentIndexerService.ts`,
   `pc2-node/src/services/clusterPin.ts`, and
   `pc2-node/wasm-apps/ipfs-assemble/*`.
-- AI Chat: `pc2-node/src/api/ai.ts`,
+- AI Chat / Assistant: `src/gui/src/UI/UIWindowAIChat.js`,
+  `src/gui/src/UI/AI/UIAIChat.js`, `src/gui/src/UI/UIAgentSelector.js`,
+  `src/gui/src/services/AIToolService.js`, `pc2-node/src/api/other.ts`,
+  `pc2-node/src/api/ai.ts`,
   `pc2-node/src/services/ai/AIChatService.ts`,
+  `pc2-node/src/services/ai/providers/*`,
   `pc2-node/src/services/ai/tools/ToolExecutor.ts`, and
-  `pc2-node/src/services/ai/tools/MonetisationAgentTools.ts`.
+  `pc2-node/src/services/ai/tools/*`.
 - Wallet bridge/capability vocabulary:
   `pc2-node/src/wallet-bridge/pc2-wallet-bridge.js`,
   `pc2-node/src/wallet-bridge/pc2-wallet-provider.js`, and
@@ -63,6 +67,14 @@ Concrete files checked on PC2 `main`:
 Entropy finding from the PC2 code study: the useful logic is real, but much of
 it is route/app/iframe-shaped and broad-session-shaped. Runtime should lift the
 protocol boundaries and acceptance fixtures, not transplant the monoliths.
+
+For dDRM specifically, PC2's Lit/Chipotle path is source evidence, not Runtime
+product truth. Runtime should copy the containment invariant: decrypt sessions
+own their private key, CEK material is sealed to that session, CEK unwrap happens
+inside the decrypt boundary, and callers receive only scoped output or opaque
+handles. Lit/Chipotle may remain a compatibility backend behind `key-provider`,
+but the Runtime contract must stay backend-neutral and must support an
+ElastOS-native PQ-hybrid dKMS backend.
 
 ## What To Reuse
 
@@ -110,16 +122,44 @@ protocol boundaries and acceptance fixtures, not transplant the monoliths.
 | Runtime health | `pc2.heartbeat.v1` | Use schema-versioned, fail-closed health state for future launcher/supervisor contracts. |
 | Capsule registry | PC2 app registry and signing ideas | Reuse only after Runtime package identity, interface descriptors, and install/update receipts exist. |
 
+## AI Assistant And Agent Mode Translation
+
+PC2 AI Chat is not only a standalone app. The current `main` code integrates a
+desktop chat window, conversation history, agent selection, model routing, voice,
+attachments, app/tool discovery, filesystem tools, wallet tools, settings tools,
+memory/RAG, and external channel agents.
+
+Runtime should keep the useful user journey but split authority into provider
+contracts:
+
+| PC2 function area | Runtime translation | Rule |
+|---|---|---|
+| `UIWindowAIChat.js` / `UIAIChat.js` | Home Assistant app capsule | WASM UI only: messages, profile selector, backend status, attachments, voice controls. |
+| `UIAgentSelector.js` and `selectedAgentId` | Agent Mode profile/session context | A selected agent changes approved persona/model/budget fields. It does not grant ambient tools. |
+| `/drivers/call` with `puter-chat-completion` | Runtime invocation to `elastos://ai/*` | App code calls Runtime/Carrier, not provider HTTP endpoints or hosted model APIs. |
+| `AIChatService` provider routing | `ai-provider` / `llama-provider` / hosted provider adapters | Model keys and backend routing stay provider-owned. |
+| `AIToolService` iframe/app tool collection | signed interface/affordance registry | Tools are declared, typed, risk-classed, granted, and audited by Runtime. They are not scraped from open iframes. |
+| `ToolExecutor` filesystem/wallet/settings/canvas/agent tools | provider affordances such as object, wallet, settings, canvas, and agent methods | Each tool family becomes a provider boundary with explicit capability checks. |
+| memory/RAG classes | scoped memory provider | Memory is namespaced by principal, session, agent, and WebSpace policy. |
+| voice routes | voice provider | Speech-to-text and text-to-speech are separate affordances from chat completion. |
+| Gateway agents / external channels | channel provider plus agent provider | External chat channels use configured providers and scoped agent principals. |
+
+The product target is **Assistant surface plus Agent Mode**, not a broad
+`ai-chat` app with ambient authority. `operator` remains an execution lane for
+explicit developer/operator commands; it is not a capsule manifest role. Future
+autonomous agents should use first-class `agent:*` / `did:key` principals with
+short-lived scoped sessions and human approval for high-risk scopes.
+
 ## Near-Term Action Items
 
 1. Start with Explorer / Library / WebSpace browsing as the first PC2
    product migration slice. Use PC2's file-manager and content UX as reference,
    but implement it through Home/Library, principal-root storage,
    `elastos://content/*`, WebSpace mounts, and availability receipts.
-2. Bring AI Chat over as a provider-backed capsule. The chat UI is a normal app
-   capsule; model execution, hosted-model credentials, embeddings, and local
-   context access stay in `ai-provider` / `llama-provider` / explicit hosted
-   provider contracts.
+2. Bring the Assistant surface over as a Home-facing WASM app capsule with
+   Agent Mode. Model execution, hosted-model credentials, embeddings, local
+   context access, tools, voice, memory, and external channels stay behind typed
+   provider affordances.
 3. Stage dDRM and Elacity Marketplace behind protected-content providers before
    porting Marketplace/Creator/Player/Viewer UX. The provider sequence is
    `elastos://drm/open -> content status/fetch -> rights-provider ->
@@ -166,15 +206,15 @@ Do not keep from PC2:
 - socket/global-state assumptions that bypass Runtime capabilities or audit
 
 Implementation rule: add the typed object provider contract first, prove
-principal isolation and protected-root writes, then build the PC2-style UI on top
-of that contract.
+principal isolation and protected-root writes, then build the familiar object
+browser UI on top of that contract.
 
 ## First Migration Slices
 
 | Slice | User-facing target | Runtime contract | PC2 reference input | Acceptance gate |
 |---|---|---|---|---|
 | Explorer / Library / WebSpace | Browse, upload, download, open, rename, publish, and share files/objects from Home | Home/Library app capsule, typed object provider, principal-root storage, WebSpace mounts, `elastos://content/*`, `availability-provider` | PC2 file manager UX, IPFS/content UX, Kubo/IPFS Cluster/supernode availability work | One file can be uploaded, opened, renamed, published, shared, and proven unavailable to another principal unless shared; app cannot bypass the provider plane |
-| AI Chat | Open Chat, ask a question, optionally attach a local object/document | Chat app capsule plus `ai-provider` / `llama-provider` / hosted model provider; context by object capability | PC2 AI Chat UX and provider lessons | Prompt succeeds through provider capability; missing provider fails closed; no raw model key, host HTTP credential, or filesystem path reaches app code |
+| Assistant / Agent Mode | Open Assistant, ask a question, select an agent profile, optionally attach a local object/document | Assistant app capsule plus `ai-provider` / `llama-provider` / hosted model provider, agent profile/session context, and typed affordance registry; context by object capability | PC2 AI Chat UX, agent selector, provider routing, voice, memory, and tool lessons | Prompt succeeds through provider capability; missing provider fails closed; selected agent changes only approved persona/model/budget fields; no raw model key, host HTTP credential, app-discovered tool, or filesystem path reaches app code |
 | Protected content / Elacity | Browse protected content and open only when access is proven | `elastos://drm/open`, `rights-provider`, `key-provider`, `decrypt-provider`, `chain-provider`, Wallet/Inbox approvals | PC2 dDRM contracts, WASM decrypt/render/media crates, Elacity Marketplace/Creator/Player/Viewer | One pinned fixture opens for the rightful account and fails closed for another account; apps never receive raw CEKs, chain RPC, wallet RPC, Kubo/IPFS, or Elacity SDK authority |
 
 ## Verification Rule

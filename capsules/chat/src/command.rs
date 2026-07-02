@@ -202,5 +202,4 @@ mod tests {
         assert!(help.contains("/home            Exit chat to terminal"));
         assert!(help.contains("/quit            Exit chat to terminal"));
     }
-
 }

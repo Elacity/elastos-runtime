@@ -9,10 +9,12 @@ import { fileURLToPath } from "node:url";
 
 const REQUEST_ENV = "ELASTOS_BROWSER_ENGINE_REQUEST";
 const ROOT_ENV = "ELASTOS_BROWSER_PER_LAUNCH_ROOT";
+const PROFILE_ROOT_ENV = "ELASTOS_BROWSER_PROFILE_ROOT";
 const TARGET_IMAGE_ENV = "ELASTOS_BROWSER_SELKIES_TARGET_IMAGE";
 const BROWSER_PROGRAM_ENV = "ELASTOS_BROWSER_SELKIES_BROWSER_PROGRAM";
 const ICE_SERVER_ENV = "ELASTOS_BROWSER_SELKIES_ICE_SERVER";
 const ICE_SERVERS_JSON_ENV = "ELASTOS_BROWSER_SELKIES_ICE_SERVERS_JSON";
+const DEFAULT_STARTUP_TIMEOUT_MS = 90000;
 
 function fail(message) {
   console.error(message);
@@ -37,6 +39,17 @@ function safeId(value) {
 
 function safePathSegment(value) {
   return String(value || "session").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80);
+}
+
+function readAbsoluteDirectoryEnv(name) {
+  const value = process.env[name];
+  if (!value) {
+    return "";
+  }
+  if (!path.isAbsolute(value) || /[\r\n\0]/.test(value)) {
+    fail(`${name} must be an absolute path without control characters`);
+  }
+  return value;
 }
 
 function validateLaunchRequest(request) {
@@ -114,6 +127,71 @@ function readBrowserProgram() {
     fail(`${BROWSER_PROGRAM_ENV} is not executable: ${value}`);
   }
   return value;
+}
+
+function defaultProfileRoot({ repoRoot, scriptPath }) {
+  const configured = readAbsoluteDirectoryEnv(PROFILE_ROOT_ENV);
+  if (configured) {
+    return configured;
+  }
+  if (path.basename(path.dirname(scriptPath)) === "bin") {
+    return path.join(repoRoot, "browser-profiles");
+  }
+  if (process.env.XDG_DATA_HOME) {
+    return path.join(process.env.XDG_DATA_HOME, "elastos", "browser-profiles");
+  }
+  if (process.env.HOME) {
+    return path.join(process.env.HOME, ".local", "share", "elastos", "browser-profiles");
+  }
+  return "/tmp/elastos-browser-profiles";
+}
+
+function profileDirForRequest(profileRoot, request) {
+  const profileSubject = typeof request.principal_id === "string" && request.principal_id.trim()
+    ? request.principal_id.trim()
+    : request.stream_id;
+  const digest = crypto.createHash("sha256").update(profileSubject).digest("hex");
+  const profileDir = path.join(profileRoot, `profile-${digest}`);
+  fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+  return profileDir;
+}
+
+function tailText(file, maxBytes = 12000) {
+  try {
+    const stats = fs.statSync(file);
+    const start = Math.max(0, stats.size - maxBytes);
+    const fd = fs.openSync(file, "r");
+    try {
+      const buffer = Buffer.alloc(stats.size - start);
+      fs.readSync(fd, buffer, 0, buffer.length, start);
+      return buffer.toString("utf8").trim();
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return "";
+  }
+}
+
+function readinessDiagnostics(outDir) {
+  const files = [
+    "target.stderr.log",
+    "target.stdout.log",
+    "local-exit.err",
+    "local-exit.out",
+    "selkies-control.log",
+  ];
+  const parts = [`Browser target session: ${outDir}`];
+  try {
+    parts.push(`Session files: ${fs.readdirSync(outDir).sort().join(", ")}`);
+  } catch {}
+  for (const file of files) {
+    const text = tailText(path.join(outDir, file));
+    if (text) {
+      parts.push(`--- ${file} ---\n${text}`);
+    }
+  }
+  return parts.join("\n");
 }
 
 function sleep(ms) {
@@ -226,6 +304,7 @@ async function main() {
   const sessionName = `${safePathSegment(request.stream_id)}-${crypto.randomBytes(6).toString("hex")}`;
   const outDir = path.join(root, sessionName);
   fs.mkdirSync(outDir, { recursive: true });
+  const profileDir = profileDirForRequest(defaultProfileRoot({ repoRoot, scriptPath }), request);
 
   const stdoutFd = fs.openSync(path.join(outDir, "target.stdout.log"), "a");
   const stderrFd = fs.openSync(path.join(outDir, "target.stderr.log"), "a");
@@ -249,6 +328,8 @@ async function main() {
     process.env.ELASTOS_BROWSER_SELKIES_RESOLUTION_MODE || "dynamic",
     "--timeout-seconds",
     process.env.ELASTOS_BROWSER_SELKIES_TIMEOUT_SECONDS || "300",
+    "--profile-dir",
+    profileDir,
   ];
   if (process.env[TARGET_IMAGE_ENV]) {
     targetArgs.push("--target-image", process.env[TARGET_IMAGE_ENV]);
@@ -265,13 +346,16 @@ async function main() {
     cwd: repoRoot,
     detached: true,
     stdio: ["ignore", stdoutFd, stderrFd],
-    env: process.env,
+    env: {
+      ...process.env,
+      ELASTOS_BROWSER_DUMP_DIAGNOSTICS_ON_TERM: "1",
+    },
   });
   target.unref();
 
   const controlSocket = path.join(outDir, "selkies-control.sock");
   try {
-    const startupTimeoutMs = Number(process.env.ELASTOS_BROWSER_PER_LAUNCH_STARTUP_TIMEOUT_MS || "240000");
+    const startupTimeoutMs = Number(process.env.ELASTOS_BROWSER_PER_LAUNCH_STARTUP_TIMEOUT_MS || String(DEFAULT_STARTUP_TIMEOUT_MS));
     await waitForReady({ outDir, controlSocket, child: target, timeoutMs: startupTimeoutMs });
     const result = await runHostedSupervisor({
       repoRoot,
@@ -289,7 +373,9 @@ async function main() {
     process.stdout.write(`${JSON.stringify(result)}\n`);
   } catch (error) {
     killProcessGroup(target);
-    fail(error instanceof Error ? error.message : String(error));
+    await sleep(750);
+    const diagnostics = readinessDiagnostics(outDir);
+    fail(`${error instanceof Error ? error.message : String(error)}\n${diagnostics}`);
   } finally {
     fs.closeSync(stdoutFd);
     fs.closeSync(stderrFd);

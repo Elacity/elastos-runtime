@@ -9,6 +9,8 @@ struct HomeSummaryResponse {
     runtime: HomeRuntimeSummary,
     site: HomeSiteSummary,
     room: HomeRoomSummary,
+    people: HomePeopleSummary,
+    services: HomeServicesSummary,
     notifications: HomeNotificationsSummary,
     desktop_objects: HomeDesktopObjectsSummary,
     targets: Vec<HomeTargetSummary>,
@@ -24,6 +26,218 @@ struct HomeRouteInfo {
 struct HomeIdentitySummary {
     device_did: Option<String>,
     handle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile_card: Option<HomeProfileCardSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct HomeProfileCardSummary {
+    schema: String,
+    profile_id: String,
+    display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handle: Option<String>,
+    updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HomePeopleSummary {
+    schema: String,
+    contact_count: usize,
+    #[serde(default)]
+    contacts: Vec<HomePeopleContactSummary>,
+    service_offer_count: usize,
+    #[serde(default)]
+    service_offers: Vec<HomeServiceOfferSummary>,
+    discovery: HomePeopleDiscoverySummary,
+}
+
+impl Default for HomePeopleSummary {
+    fn default() -> Self {
+        Self {
+            schema: "elastos.people.contacts/v1".to_string(),
+            contact_count: 0,
+            contacts: Vec::new(),
+            service_offer_count: 0,
+            service_offers: Vec::new(),
+            discovery: HomePeopleDiscoverySummary::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HomePeopleDiscoverySummary {
+    schema: String,
+    enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remaining_seconds: Option<u64>,
+    visibility: String,
+    status: String,
+    status_message: String,
+    topic: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_peer_id: Option<String>,
+    discovered_count: usize,
+    #[serde(default)]
+    discovered_peers: Vec<HomePeopleDiscoveryPeerSummary>,
+    request_count: usize,
+    #[serde(default)]
+    requests: Vec<HomePeopleDiscoveryRequestSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    changed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_refresh_after_ms: Option<u64>,
+}
+
+impl Default for HomePeopleDiscoverySummary {
+    fn default() -> Self {
+        Self {
+            schema: "elastos.people.discovery/v1".to_string(),
+            enabled: false,
+            expires_at: None,
+            remaining_seconds: None,
+            visibility: "off".to_string(),
+            status: "off".to_string(),
+            status_message: "Discovery is off.".to_string(),
+            topic: "__elastos_internal/people-discovery-v1".to_string(),
+            local_peer_id: None,
+            discovered_count: 0,
+            discovered_peers: Vec::new(),
+            request_count: 0,
+            requests: Vec::new(),
+            changed: None,
+            refresh_fingerprint: None,
+            next_refresh_after_ms: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct HomePeopleDiscoveryPeerSummary {
+    peer_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    did: Option<String>,
+    display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handle: Option<String>,
+    last_seen_at: u64,
+    status: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct HomePeopleDiscoveryRequestSummary {
+    request_id: String,
+    peer_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    did: Option<String>,
+    display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handle: Option<String>,
+    created_at: u64,
+    status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    invite_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HomePeopleContactSummary {
+    contact_id: String,
+    #[serde(skip)]
+    added_at: u64,
+    display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handle: Option<String>,
+    relationship: String,
+    route: String,
+    can_message: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile_card: Option<HomeProfileCardSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_seen_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HomeServiceOfferSummary {
+    schema: String,
+    offer_id: String,
+    service_uri: String,
+    service_kind: String,
+    display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_uri: Option<String>,
+    provider_label: String,
+    policy_summary: String,
+    status: String,
+    enabled: bool,
+    grant_required: bool,
+    grant_scope: String,
+    capsule_contract: String,
+    source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_contract: Option<HomeServiceRuntimeContractSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    contact_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capsule_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    route: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HomeServiceRuntimeContractSummary {
+    schema: String,
+    backing_substrate: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    supported_display_modes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    supported_guarantee_levels: Vec<String>,
+    direct_network: bool,
+    wallet_injection: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HomeServicesSummary {
+    schema: String,
+    local_offer_count: usize,
+    remote_offer_count: usize,
+    available_local_offer_count: usize,
+    available_remote_offer_count: usize,
+    #[serde(default)]
+    local_offers: Vec<HomeServiceOfferSummary>,
+    #[serde(default)]
+    remote_offers: Vec<HomeServiceOfferSummary>,
+    #[serde(default)]
+    available_local_offers: Vec<HomeServiceOfferSummary>,
+    #[serde(default)]
+    available_remote_offers: Vec<HomeServiceOfferSummary>,
+    grant_model: String,
+    carrier_contract: String,
+    capsule_contract: String,
+}
+
+impl Default for HomeServicesSummary {
+    fn default() -> Self {
+        Self {
+            schema: "elastos.runtime.services/v1".to_string(),
+            local_offer_count: 0,
+            remote_offer_count: 0,
+            available_local_offer_count: 0,
+            available_remote_offer_count: 0,
+            local_offers: Vec::new(),
+            remote_offers: Vec::new(),
+            available_local_offers: Vec::new(),
+            available_remote_offers: Vec::new(),
+            grant_model: "principal_scoped_provider_grant".to_string(),
+            carrier_contract: "People discovers trusted offers; Carrier carries signed offer envelopes; providers enforce grants.".to_string(),
+            capsule_contract: "capsule -> runtime capability -> provider grant -> service".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -574,6 +788,8 @@ struct HomeNotificationActionSummary {
 struct HomeState {
     site: HomeSiteSummary,
     room: HomeRoomSummary,
+    people: HomePeopleSummary,
+    services: HomeServicesSummary,
     notifications: HomeNotificationsSummary,
 }
 
@@ -600,11 +816,19 @@ struct HomeLaunchRequest {
 #[serde(deny_unknown_fields)]
 struct InboxActionRequest {
     action_id: String,
+    #[serde(default)]
+    home_token: Option<String>,
 }
 
 #[derive(Serialize)]
 struct InboxActionResponse {
     message: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeopleContactRemoveRequest {
+    contact_id: String,
 }
 
 #[derive(Clone, Copy, Serialize)]

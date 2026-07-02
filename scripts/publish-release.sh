@@ -39,23 +39,29 @@ DIM='\033[2m'
 NC='\033[0m'
 
 # Default publish scope: runtime core + first-party Home app surface.
-# ipfs-provider, availability-provider, wallet-provider, object-provider,
-# content-block-graph-provider, drm-provider, rights-provider, key-provider,
-# decrypt-provider, and tunnel-provider are supported direct command assets.
-# They are not part of the managed user runtime, but fresh installs must
-# provision them for share/open/public-share.
+# Wallet/Browser surfaces require chain-provider and wallet-provider authority.
+# Demo-only capsules such as chat-room and GBA are published by passing an
+# explicit --capsules list or through the Rust `demo` publish profile.
+# ipfs-provider, availability-provider, drm-provider, rights-provider,
+# key-provider, decrypt-provider, and tunnel-provider are supported direct
+# command assets. They are not part of the default managed user runtime, but
+# fresh installs must provision them for share/open/public-share where needed.
 DEFAULT_CAPSULES=(
     shell
     localhost-provider
     did-provider
+    chain-provider
     net-provider
     exit-provider
     browser-engine-adapter
     webspace-provider
+    wallet-provider
     object-provider
+    content-block-graph-provider
     home-cli
     home
     system
+    services
     wallet-metamask
     wallet-unisat
     wallet-walletconnect
@@ -64,27 +70,26 @@ DEFAULT_CAPSULES=(
     documents
     library
     marketplace
+    archive-manager
     inbox
-    chat
-    chat-wasm
-    gba-emulator
-    gba-ucity
-    chat-room
-    tunnel-provider
 )
 CAPSULES=("${DEFAULT_CAPSULES[@]}")
 REQUIRED_SUPPORTED_CAPSULES=(
     shell
     localhost-provider
     did-provider
+    chain-provider
     net-provider
     exit-provider
     browser-engine-adapter
     webspace-provider
+    wallet-provider
     object-provider
+    content-block-graph-provider
     home-cli
     home
     system
+    services
     wallet-metamask
     wallet-unisat
     wallet-walletconnect
@@ -93,6 +98,7 @@ REQUIRED_SUPPORTED_CAPSULES=(
     documents
     library
     marketplace
+    archive-manager
     inbox
 )
 SUPPORT_BINARY_ASSETS=(
@@ -149,7 +155,7 @@ show_help() {
     echo "  --channel NAME     Release channel (stable | canary | jetson-test; default: stable)"
     echo "  --skip-build       Skip building binaries (use existing artifacts)"
     echo "  --skip-rootfs      Skip rootfs building (reuse existing .capsule.tar.gz and skip capsule rebuilds)"
-    echo "  --capsules CSV     Override publish capsule list (default: demo capsule set)"
+    echo "  --capsules CSV     Override publish capsule list (default: Home capsule set)"
     echo "  --no-public-url    Skip auto-starting gateway+tunnel and URL emission"
     echo "  --public-with-sudo Start auto-public gateway+tunnel via sudo"
     echo "  --allow-signer-rotation  Allow signer DID to differ from the current canonical publisher signer"
@@ -214,7 +220,6 @@ if not coords_path.exists():
 try:
     coords = json.loads(coords_path.read_text())
     api = coords["api_url"].rstrip("/")
-    secret = coords["attach_secret"]
 except Exception:
     print("{}")
     raise SystemExit(0)
@@ -227,37 +232,24 @@ try:
 except Exception:
     version = ""
 
-def attach(scope: str) -> str:
-    req = urllib.request.Request(
-        api + "/api/auth/attach",
-        data=json.dumps({"secret": secret, "scope": scope}).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=5) as resp:
-        body = json.loads(resp.read().decode())
-    return body.get("token", "")
-
 try:
-    shell_token = attach("shell")
-    if not shell_token:
+    with urllib.request.urlopen(api + "/.well-known/elastos/carrier-bootstrap.json?role=publisher", timeout=5) as resp:
+        bootstrap = json.loads(resp.read().decode())
+    if bootstrap.get("schema") != "elastos.carrier.bootstrap/v1":
         print("{}")
         raise SystemExit(0)
-    req = urllib.request.Request(
-        api + "/api/provider/peer/get_ticket",
-        data=b"{}",
-        headers={
-            "Authorization": "Bearer " + shell_token,
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=5) as resp:
-        body = json.loads(resp.read().decode())
-    data = body.get("data") or {}
+    if bootstrap.get("role") != "publisher":
+        print("{}")
+        raise SystemExit(0)
+    ticket = (bootstrap.get("ticket") or "").strip()
+    node_id = (bootstrap.get("node_id") or "").strip()
+    if not ticket or not node_id:
+        print("{}")
+        raise SystemExit(0)
     print(json.dumps({
-        "ticket": data.get("ticket", ""),
-        "node_id": data.get("node_id", ""),
+        "ticket": ticket,
+        "node_id": node_id,
+        "role": "publisher",
         "version": version,
     }))
 except Exception:
@@ -792,7 +784,9 @@ build_platform_independent_direct_assets() {
         documents \
         library \
         marketplace \
+        archive-manager \
         inbox \
+        services \
         chat-wasm \
         gba-emulator \
         gba-ucity \
@@ -1581,10 +1575,19 @@ generate_components_json() {
         '{schema: $schema, capsules: $capsules, external: ($external * $direct.external), profiles: $profiles}'
 }
 
+validate_generated_components_json() {
+    local manifest="$1"
+    local setup_platform="$2"
+    python3 scripts/components-release-integrity-check.py \
+        --manifest "$manifest" \
+        --platform "$setup_platform"
+}
+
 info "Generating components.json..."
 COMPONENTS_JSON=$(generate_components_json "$CAPSULE_ENTRIES" "$HOST_DIRECT_ASSETS")
 
 echo "$COMPONENTS_JSON" > "${TMPDIR}/components.json"
+validate_generated_components_json "${TMPDIR}/components.json" "$SETUP_PLATFORM"
 
 COMPONENTS_SHA256=$(sha256 "${TMPDIR}/components.json")
 COMPONENTS_SIZE=$(file_size "${TMPDIR}/components.json")
@@ -1605,6 +1608,7 @@ if [[ -n "$CROSS_ARCH" && "$CROSS_CAPSULE_ENTRIES" != "{}" ]]; then
     info "Generating components.json for ${CROSS_PLATFORM}..."
     CROSS_COMPONENTS_JSON=$(generate_components_json "$CROSS_CAPSULE_ENTRIES" "$CROSS_DIRECT_ASSETS")
     echo "$CROSS_COMPONENTS_JSON" > "${TMPDIR}/components-${CROSS_ARCH}.json"
+    validate_generated_components_json "${TMPDIR}/components-${CROSS_ARCH}.json" "$CROSS_SETUP_PLATFORM"
     CROSS_COMPONENTS_SHA256=$(sha256 "${TMPDIR}/components-${CROSS_ARCH}.json")
     CROSS_COMPONENTS_SIZE=$(file_size "${TMPDIR}/components-${CROSS_ARCH}.json")
 
@@ -1918,9 +1922,22 @@ info "Publishing installer bundle (install.sh) to IPFS..."
 # Bake trust anchors into install.sh so users can just: curl ... | bash
 STAMPED_INSTALL="${TMPDIR}/install.sh"
 STAMPED_SOURCE_CONNECT_TICKET="${ELASTOS_SOURCE_CONNECT_TICKET:-}"
+SOURCE_CONNECT_TICKET_EXPLICIT=false
+if [[ -n "${ELASTOS_SOURCE_CONNECT_TICKET:-}" ]]; then
+    SOURCE_CONNECT_TICKET_EXPLICIT=true
+fi
 STAMPED_PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-}"
+STAMPED_PUBLISHER_NODE_ID="${ELASTOS_PUBLISHER_NODE_ID:-}"
+PUBLISHER_NODE_ID_EXPLICIT=false
+if [[ -n "${ELASTOS_PUBLISHER_NODE_ID:-}" ]]; then
+    PUBLISHER_NODE_ID_EXPLICIT=true
+fi
 CANONICAL_PUBLISHER_GATEWAY="${ELASTOS_CANONICAL_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
 ALLOW_NO_BOOTSTRAP="${ELASTOS_ALLOW_NO_BOOTSTRAP:-}"
+if [[ "$SOURCE_CONNECT_TICKET_EXPLICIT" == true && "$PUBLISHER_NODE_ID_EXPLICIT" != true ]] ||
+   [[ "$SOURCE_CONNECT_TICKET_EXPLICIT" != true && "$PUBLISHER_NODE_ID_EXPLICIT" == true ]]; then
+    die "trusted-source Carrier bootstrap requires both ELASTOS_SOURCE_CONNECT_TICKET and ELASTOS_PUBLISHER_NODE_ID, or neither"
+fi
 BOOTSTRAP_JSON="$(discover_source_bootstrap_json)"
 BOOTSTRAP_VERSION="$(printf '%s' "$BOOTSTRAP_JSON" | jq -r '.version // empty' 2>/dev/null || true)"
 if [[ -n "${VERSION:-}" ]]; then
@@ -1934,19 +1951,18 @@ fi
 if [[ -z "$STAMPED_SOURCE_CONNECT_TICKET" ]]; then
     STAMPED_SOURCE_CONNECT_TICKET="$(printf '%s' "$BOOTSTRAP_JSON" | jq -r '.ticket // empty' 2>/dev/null || true)"
 fi
-# Get publisher's stable node ID for durable P2P connections
-STAMPED_PUBLISHER_NODE_ID="${ELASTOS_PUBLISHER_NODE_ID:-}"
 if [[ -z "$STAMPED_PUBLISHER_NODE_ID" ]]; then
     STAMPED_PUBLISHER_NODE_ID="$(printf '%s' "$BOOTSTRAP_JSON" | jq -r '.node_id // empty' 2>/dev/null || true)"
-fi
-if [[ -z "$STAMPED_PUBLISHER_NODE_ID" ]]; then
-    STAMPED_PUBLISHER_NODE_ID=$("$ELASTOS" keys node-id 2>/dev/null || true)
 fi
 if [[ -n "$STAMPED_PUBLISHER_NODE_ID" ]]; then
     info "Publisher node ID: ${STAMPED_PUBLISHER_NODE_ID}"
 fi
+if [[ -n "$STAMPED_SOURCE_CONNECT_TICKET" && -z "$STAMPED_PUBLISHER_NODE_ID" ]] ||
+   [[ -z "$STAMPED_SOURCE_CONNECT_TICKET" && -n "$STAMPED_PUBLISHER_NODE_ID" ]]; then
+    die "trusted-source Carrier bootstrap requires ticket and publisher node id from one publisher-scoped response"
+fi
 if [[ -z "$STAMPED_SOURCE_CONNECT_TICKET" && "$ALLOW_NO_BOOTSTRAP" != "1" ]]; then
-    die "publish-release requires a live trusted-source Carrier ticket. Start or refresh a local ElastOS runtime first, or set ELASTOS_ALLOW_NO_BOOTSTRAP=1 only for local-only testing."
+    die "publish-release requires a live trusted-source Publisher Carrier ticket/node pair. Start or refresh a local ElastOS runtime first, or set ELASTOS_ALLOW_NO_BOOTSTRAP=1 only for local-only testing."
 fi
 if [[ -n "$STAMPED_SOURCE_CONNECT_TICKET" ]]; then
     info "Stamping trusted-source Carrier bootstrap ticket"

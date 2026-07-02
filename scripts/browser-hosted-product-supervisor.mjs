@@ -48,6 +48,9 @@ function validateLaunchRequest(request) {
   if (request.display_mode !== "webrtc_remote_display") {
     fail("hosted product supervisor requires webrtc_remote_display");
   }
+  if (request.guarantee_level !== "operator_rbi") {
+    fail("hosted product supervisor requires guarantee_level=operator_rbi");
+  }
   if (request.network_mode !== "runtime_net_only" || request.direct_network !== false) {
     fail("hosted product supervisor requires runtime_net_only and direct_network=false");
   }
@@ -137,8 +140,11 @@ function validateSupervisorResult(result, request) {
   if (expectedDisplayBackend && session.display_backend !== expectedDisplayBackend) {
     fail(`hosted product display session expected ${expectedDisplayBackend}, got ${session.display_backend || "none"}`);
   }
-  if (session.audio !== true || session.video !== true) {
-    fail("hosted product display session must advertise audio=true and video=true");
+  if (session.video !== true) {
+    fail("hosted product display session must advertise video=true");
+  }
+  if (session.audio !== true && session.audio !== false) {
+    fail("hosted product display session must report audio availability");
   }
   if (
     !Number.isInteger(session.width) ||
@@ -158,8 +164,12 @@ function validateSupervisorResult(result, request) {
     if (initialOffer.schema !== "elastos.browser.webrtc-offer/v1" || initialOffer.type !== "offer" || typeof initialOffer.sdp !== "string") {
       fail("engine-offer hosted product display sessions must include an initial WebRTC offer");
     }
-    if (!initialOffer.sdp.includes("m=video") || !initialOffer.sdp.includes("m=audio")) {
-      fail("hosted product initial offer must include video and audio media sections");
+    if (!initialOffer.sdp.includes("m=video")) {
+      fail("hosted product initial offer must include a video media section");
+    }
+    const audioSdp = session.audio_offer?.sdp || initialOffer.sdp;
+    if (session.audio === true && !audioSdp.includes("m=audio")) {
+      fail("hosted product audio sessions must include an audio media section");
     }
   }
   if (typeof session.signaling_url !== "string" || !session.signaling_url.startsWith("/api/apps/browser/pages/")) {
@@ -181,8 +191,8 @@ async function main() {
       launch_request: request,
       requirements: {
         display_mode: "webrtc_remote_display",
+        guarantee_level: "operator_rbi",
         backend_class: "product_compositor",
-        audio: true,
         video: true,
         network_mode: "runtime_net_only",
         direct_network: false,

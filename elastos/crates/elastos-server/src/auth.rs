@@ -1,9 +1,13 @@
 //! Runtime-owned authentication state for proof-bound sessions.
 
 use std::{
+    fs::{File, OpenOptions},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 use aes_gcm::{
     aead::{Aead, Payload},
@@ -38,10 +42,10 @@ const PRINCIPAL_ROOT_OBJECT_AAD_DOMAIN: &str = "elastos.principal-root.object.v1
 const RECOVERY_KIT_PACKAGE_AAD_DOMAIN: &str = "elastos.recovery-kit.package.v1";
 const RECOVERY_KIT_PACKAGE_KDF_PARAMS: &str = "m=19456,t=2,p=1,len=32";
 
-static AUTH_AUDIT_APPEND_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static AUTH_STATE_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-fn auth_audit_append_lock() -> &'static Mutex<()> {
-    AUTH_AUDIT_APPEND_LOCK.get_or_init(|| Mutex::new(()))
+fn auth_state_mutation_lock() -> &'static Mutex<()> {
+    AUTH_STATE_MUTATION_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +141,75 @@ pub fn auth_state_path(data_dir: &Path) -> anyhow::Result<PathBuf> {
         .map(|root| root.join(AUTH_STATE_FILE))
 }
 
+fn auth_state_lock_path(data_dir: &Path) -> anyhow::Result<PathBuf> {
+    auth_state_path(data_dir).map(|path| path.with_file_name(format!("{AUTH_STATE_FILE}.lock")))
+}
+
+fn open_auth_state_lock(data_dir: &Path) -> anyhow::Result<File> {
+    let path = auth_state_lock_path(data_dir)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("failed to open auth state lock {path:?}"))
+}
+
+fn lock_auth_state_file(file: &File) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("failed to lock auth state");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+    }
+    Ok(())
+}
+
+fn unlock_auth_state_file(file: &File) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("failed to unlock auth state");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+    }
+    Ok(())
+}
+
+fn mutate_auth_state<T>(
+    data_dir: &Path,
+    mutation: impl FnOnce(&mut AuthState) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let _guard = auth_state_mutation_lock()
+        .lock()
+        .map_err(|_| anyhow!("auth state mutation lock poisoned"))?;
+    let lock_file = open_auth_state_lock(data_dir)?;
+    lock_auth_state_file(&lock_file)?;
+    let result = (|| {
+        let mut state = load_auth_state(data_dir)?;
+        let value = mutation(&mut state)?;
+        save_auth_state(data_dir, &state)?;
+        Ok(value)
+    })();
+    let unlock = unlock_auth_state_file(&lock_file);
+    match (result, unlock) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
+    }
+}
+
 pub fn load_or_create_recovery_archive_key(data_dir: &Path) -> anyhow::Result<[u8; 32]> {
     let path = rooted_localhost_fs_path(data_dir, AUTH_STATE_ROOT)
         .ok_or_else(|| anyhow!("invalid auth state root"))?
@@ -192,7 +265,7 @@ pub fn load_auth_state(data_dir: &Path) -> anyhow::Result<AuthState> {
     Ok(state)
 }
 
-pub fn save_auth_state(data_dir: &Path, state: &AuthState) -> anyhow::Result<()> {
+pub(crate) fn save_auth_state(data_dir: &Path, state: &AuthState) -> anyhow::Result<()> {
     let path = auth_state_path(data_dir)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -212,17 +285,18 @@ pub fn save_auth_state(data_dir: &Path, state: &AuthState) -> anyhow::Result<()>
 }
 
 pub fn store_challenge(data_dir: &Path, challenge: AuthChallengeV1) -> anyhow::Result<()> {
-    let mut state = load_auth_state(data_dir)?;
-    let now = now_ts();
-    prune_auth_state(&mut state, now);
-    state
-        .challenges
-        .retain(|stored| stored.challenge.challenge_id != challenge.challenge_id);
-    state.challenges.push(StoredAuthChallenge {
-        challenge,
-        consumed_at: None,
-    });
-    save_auth_state(data_dir, &state)
+    mutate_auth_state(data_dir, |state| {
+        let now = now_ts();
+        prune_auth_state(state, now);
+        state
+            .challenges
+            .retain(|stored| stored.challenge.challenge_id != challenge.challenge_id);
+        state.challenges.push(StoredAuthChallenge {
+            challenge,
+            consumed_at: None,
+        });
+        Ok(())
+    })
 }
 
 pub fn load_challenge(data_dir: &Path, challenge_id: &str) -> anyhow::Result<AuthChallengeV1> {
@@ -243,17 +317,18 @@ pub fn consume_challenge(
     challenge_id: &str,
     consumed_at: u64,
 ) -> anyhow::Result<()> {
-    let mut state = load_auth_state(data_dir)?;
-    let stored = state
-        .challenges
-        .iter_mut()
-        .find(|stored| stored.challenge.challenge_id == challenge_id)
-        .ok_or_else(|| anyhow!("auth challenge not found"))?;
-    if stored.consumed_at.is_some() {
-        anyhow::bail!("auth challenge already consumed");
-    }
-    stored.consumed_at = Some(consumed_at);
-    save_auth_state(data_dir, &state)
+    mutate_auth_state(data_dir, |state| {
+        let stored = state
+            .challenges
+            .iter_mut()
+            .find(|stored| stored.challenge.challenge_id == challenge_id)
+            .ok_or_else(|| anyhow!("auth challenge not found"))?;
+        if stored.consumed_at.is_some() {
+            anyhow::bail!("auth challenge already consumed");
+        }
+        stored.consumed_at = Some(consumed_at);
+        Ok(())
+    })
 }
 
 pub fn upsert_principal_for_binding(
@@ -307,41 +382,39 @@ pub fn upsert_principal_for_binding_as_role_named(
         anyhow::bail!("invalid principal id");
     }
     let display_name = clean_principal_display_name(display_name)?;
-    let mut state = load_auth_state(data_dir)?;
-    normalize_principal_records(&mut state);
-    let proof_binding_id = binding.id();
-    let localhost_root = principal_localhost_root(&principal_id);
-    if let Some(existing) = state
-        .principals
-        .iter_mut()
-        .find(|principal| principal.proof_binding_id == proof_binding_id)
-    {
-        preserve_passkey_binding_metadata(&mut binding, &existing.proof_binding);
-        existing.principal_id = principal_id;
-        existing.proof_binding = binding;
-        if let Some(display_name) = display_name {
-            existing.display_name = display_name;
+    mutate_auth_state(data_dir, |state| {
+        normalize_principal_records(state);
+        let proof_binding_id = binding.id();
+        let localhost_root = principal_localhost_root(&principal_id);
+        if let Some(existing) = state
+            .principals
+            .iter_mut()
+            .find(|principal| principal.proof_binding_id == proof_binding_id)
+        {
+            preserve_passkey_binding_metadata(&mut binding, &existing.proof_binding);
+            existing.principal_id = principal_id;
+            existing.proof_binding = binding;
+            if let Some(display_name) = display_name {
+                existing.display_name = display_name;
+            }
+            existing.localhost_root = localhost_root;
+            existing.updated_at = now;
+            return Ok(existing.clone());
         }
-        existing.localhost_root = localhost_root;
-        existing.updated_at = now;
-        let record = existing.clone();
-        save_auth_state(data_dir, &state)?;
-        return Ok(record);
-    }
 
-    let record = PrincipalRecord {
-        principal_id,
-        proof_binding_id,
-        proof_binding: binding,
-        display_name: display_name.unwrap_or_default(),
-        role,
-        localhost_root,
-        created_at: now,
-        updated_at: now,
-    };
-    state.principals.push(record.clone());
-    save_auth_state(data_dir, &state)?;
-    Ok(record)
+        let record = PrincipalRecord {
+            principal_id,
+            proof_binding_id,
+            proof_binding: binding,
+            display_name: display_name.unwrap_or_default(),
+            role,
+            localhost_root,
+            created_at: now,
+            updated_at: now,
+        };
+        state.principals.push(record.clone());
+        Ok(record)
+    })
 }
 
 fn normalize_principal_records(state: &mut AuthState) {
@@ -388,29 +461,29 @@ pub fn set_principal_display_name(
 ) -> anyhow::Result<PrincipalRecord> {
     let display_name = clean_principal_display_name(Some(display_name))?
         .ok_or_else(|| anyhow!("principal display name must not be empty"))?;
-    let mut state = load_auth_state(data_dir)?;
-    let principal = state
-        .principals
-        .iter_mut()
-        .find(|principal| principal.proof_binding_id == proof_binding_id)
-        .ok_or_else(|| anyhow!("proof binding not found"))?;
-    principal.display_name = display_name;
-    principal.updated_at = updated_at;
-    let record = principal.clone();
-    save_auth_state(data_dir, &state)?;
-    Ok(record)
+    mutate_auth_state(data_dir, |state| {
+        let principal = state
+            .principals
+            .iter_mut()
+            .find(|principal| principal.proof_binding_id == proof_binding_id)
+            .ok_or_else(|| anyhow!("proof binding not found"))?;
+        principal.display_name = display_name;
+        principal.updated_at = updated_at;
+        Ok(principal.clone())
+    })
 }
 
 pub fn store_session_grant(data_dir: &Path, grant: AuthSessionGrantV1) -> anyhow::Result<()> {
-    let mut state = load_auth_state(data_dir)?;
-    state
-        .sessions
-        .retain(|stored| stored.grant.session_id != grant.session_id);
-    state.sessions.push(StoredAuthSession {
-        grant,
-        revoked_at: None,
-    });
-    save_auth_state(data_dir, &state)
+    mutate_auth_state(data_dir, |state| {
+        state
+            .sessions
+            .retain(|stored| stored.grant.session_id != grant.session_id);
+        state.sessions.push(StoredAuthSession {
+            grant,
+            revoked_at: None,
+        });
+        Ok(())
+    })
 }
 
 pub fn revoke_session_grant(
@@ -418,14 +491,15 @@ pub fn revoke_session_grant(
     session_id: &str,
     revoked_at: u64,
 ) -> anyhow::Result<()> {
-    let mut state = load_auth_state(data_dir)?;
-    let stored = state
-        .sessions
-        .iter_mut()
-        .find(|stored| stored.grant.session_id == session_id)
-        .ok_or_else(|| anyhow!("auth session not found"))?;
-    stored.revoked_at = Some(revoked_at);
-    save_auth_state(data_dir, &state)
+    mutate_auth_state(data_dir, |state| {
+        let stored = state
+            .sessions
+            .iter_mut()
+            .find(|stored| stored.grant.session_id == session_id)
+            .ok_or_else(|| anyhow!("auth session not found"))?;
+        stored.revoked_at = Some(revoked_at);
+        Ok(())
+    })
 }
 
 pub fn load_active_session_grant(
@@ -459,13 +533,14 @@ pub fn store_principal_root_protection(
     protection: PrincipalRootProtectionV1,
 ) -> anyhow::Result<()> {
     validate_principal_root_protection(&protection).map_err(anyhow::Error::msg)?;
-    let mut state = load_auth_state(data_dir)?;
-    state.principal_root_protections.retain(|stored| {
-        stored.principal_id != protection.principal_id
-            || stored.localhost_root != protection.localhost_root
-    });
-    state.principal_root_protections.push(protection);
-    save_auth_state(data_dir, &state)
+    mutate_auth_state(data_dir, |state| {
+        state.principal_root_protections.retain(|stored| {
+            stored.principal_id != protection.principal_id
+                || stored.localhost_root != protection.localhost_root
+        });
+        state.principal_root_protections.push(protection);
+        Ok(())
+    })
 }
 
 pub fn load_principal_root_protection(
@@ -866,8 +941,6 @@ pub fn set_guest_registration_enabled(
     enabled: bool,
     updated_at: u64,
 ) -> anyhow::Result<bool> {
-    let mut state = load_auth_state(data_dir)?;
-    state.guest_registration_enabled = enabled;
     let reason = if enabled {
         "guest passkey registration enabled"
     } else {
@@ -894,9 +967,11 @@ pub fn set_guest_registration_enabled(
             signature: None,
         },
     )?;
-    push_audit_event(&mut state, event);
-    save_auth_state(data_dir, &state)?;
-    Ok(enabled)
+    mutate_auth_state(data_dir, |state| {
+        state.guest_registration_enabled = enabled;
+        push_audit_event(state, event);
+        Ok(enabled)
+    })
 }
 
 pub fn is_admin(record: &PrincipalRecord) -> bool {
@@ -933,25 +1008,25 @@ pub fn revoke_passkey_binding(
     proof_binding_id: &str,
     revoked_at: u64,
 ) -> anyhow::Result<PrincipalRecord> {
-    let mut state = load_auth_state(data_dir)?;
-    let principal = state
-        .principals
-        .iter_mut()
-        .find(|principal| principal.proof_binding_id == proof_binding_id)
-        .ok_or_else(|| anyhow!("passkey proof binding not found"))?;
-    let Some(passkey) = principal.proof_binding.passkey.as_mut() else {
-        anyhow::bail!("proof binding is not a passkey");
-    };
-    passkey.revoked_at = Some(revoked_at);
-    principal.updated_at = revoked_at;
-    let record = principal.clone();
-    for stored in &mut state.sessions {
-        if stored.grant.proof_binding_id == proof_binding_id {
-            stored.revoked_at = Some(revoked_at);
+    mutate_auth_state(data_dir, |state| {
+        let principal = state
+            .principals
+            .iter_mut()
+            .find(|principal| principal.proof_binding_id == proof_binding_id)
+            .ok_or_else(|| anyhow!("passkey proof binding not found"))?;
+        let Some(passkey) = principal.proof_binding.passkey.as_mut() else {
+            anyhow::bail!("proof binding is not a passkey");
+        };
+        passkey.revoked_at = Some(revoked_at);
+        principal.updated_at = revoked_at;
+        let record = principal.clone();
+        for stored in &mut state.sessions {
+            if stored.grant.proof_binding_id == proof_binding_id {
+                stored.revoked_at = Some(revoked_at);
+            }
         }
-    }
-    save_auth_state(data_dir, &state)?;
-    Ok(record)
+        Ok(record)
+    })
 }
 
 pub fn promote_passkey_to_admin(
@@ -959,24 +1034,23 @@ pub fn promote_passkey_to_admin(
     proof_binding_id: &str,
     updated_at: u64,
 ) -> anyhow::Result<PrincipalRecord> {
-    let mut state = load_auth_state(data_dir)?;
-    let principal = state
-        .principals
-        .iter_mut()
-        .find(|principal| principal.proof_binding_id == proof_binding_id)
-        .ok_or_else(|| anyhow!("passkey proof binding not found"))?;
-    ensure_proof_binding_not_revoked(principal)?;
-    if principal.proof_binding.passkey.is_none() {
-        anyhow::bail!("proof binding is not a passkey");
-    }
-    if principal.role == RuntimePrincipalRole::Admin {
-        anyhow::bail!("passkey is already admin");
-    }
-    principal.role = RuntimePrincipalRole::Admin;
-    principal.updated_at = updated_at;
-    let record = principal.clone();
-    save_auth_state(data_dir, &state)?;
-    Ok(record)
+    mutate_auth_state(data_dir, |state| {
+        let principal = state
+            .principals
+            .iter_mut()
+            .find(|principal| principal.proof_binding_id == proof_binding_id)
+            .ok_or_else(|| anyhow!("passkey proof binding not found"))?;
+        ensure_proof_binding_not_revoked(principal)?;
+        if principal.proof_binding.passkey.is_none() {
+            anyhow::bail!("proof binding is not a passkey");
+        }
+        if principal.role == RuntimePrincipalRole::Admin {
+            anyhow::bail!("passkey is already admin");
+        }
+        principal.role = RuntimePrincipalRole::Admin;
+        principal.updated_at = updated_at;
+        Ok(principal.clone())
+    })
 }
 
 pub fn demote_passkey_to_guest(
@@ -984,41 +1058,40 @@ pub fn demote_passkey_to_guest(
     proof_binding_id: &str,
     updated_at: u64,
 ) -> anyhow::Result<PrincipalRecord> {
-    let mut state = load_auth_state(data_dir)?;
-    let index = state
-        .principals
-        .iter()
-        .position(|principal| principal.proof_binding_id == proof_binding_id)
-        .ok_or_else(|| anyhow!("passkey proof binding not found"))?;
-    let target = &state.principals[index];
-    ensure_proof_binding_not_revoked(target)?;
-    if target.proof_binding.passkey.is_none() {
-        anyhow::bail!("proof binding is not a passkey");
-    }
-    if target.role != RuntimePrincipalRole::Admin {
-        anyhow::bail!("passkey is already guest");
-    }
-    let active_admin_count = state
-        .principals
-        .iter()
-        .filter(|principal| {
-            principal.role == RuntimePrincipalRole::Admin
-                && principal
-                    .proof_binding
-                    .passkey
-                    .as_ref()
-                    .is_some_and(|passkey| passkey.revoked_at.is_none())
-        })
-        .count();
-    if active_admin_count <= 1 {
-        anyhow::bail!("last admin passkey cannot be demoted");
-    }
-    let principal = &mut state.principals[index];
-    principal.role = RuntimePrincipalRole::Guest;
-    principal.updated_at = updated_at;
-    let record = principal.clone();
-    save_auth_state(data_dir, &state)?;
-    Ok(record)
+    mutate_auth_state(data_dir, |state| {
+        let index = state
+            .principals
+            .iter()
+            .position(|principal| principal.proof_binding_id == proof_binding_id)
+            .ok_or_else(|| anyhow!("passkey proof binding not found"))?;
+        let target = &state.principals[index];
+        ensure_proof_binding_not_revoked(target)?;
+        if target.proof_binding.passkey.is_none() {
+            anyhow::bail!("proof binding is not a passkey");
+        }
+        if target.role != RuntimePrincipalRole::Admin {
+            anyhow::bail!("passkey is already guest");
+        }
+        let active_admin_count = state
+            .principals
+            .iter()
+            .filter(|principal| {
+                principal.role == RuntimePrincipalRole::Admin
+                    && principal
+                        .proof_binding
+                        .passkey
+                        .as_ref()
+                        .is_some_and(|passkey| passkey.revoked_at.is_none())
+            })
+            .count();
+        if active_admin_count <= 1 {
+            anyhow::bail!("last admin passkey cannot be demoted");
+        }
+        let principal = &mut state.principals[index];
+        principal.role = RuntimePrincipalRole::Guest;
+        principal.updated_at = updated_at;
+        Ok(principal.clone())
+    })
 }
 
 pub fn ensure_recovered_root_reassignable(
@@ -1045,50 +1118,50 @@ pub fn reassign_passkey_binding_to_recovered_root(
     recovered_localhost_root: &str,
     updated_at: u64,
 ) -> anyhow::Result<PrincipalRecord> {
-    let mut state = load_auth_state(data_dir)?;
-    normalize_principal_records(&mut state);
-    ensure_recovered_root_reassignable_in_state(
-        &state,
-        proof_binding_id,
-        recovered_principal_id,
-        recovered_localhost_root,
-    )?;
+    mutate_auth_state(data_dir, |state| {
+        normalize_principal_records(state);
+        ensure_recovered_root_reassignable_in_state(
+            state,
+            proof_binding_id,
+            recovered_principal_id,
+            recovered_localhost_root,
+        )?;
 
-    let removed_proof_binding_ids = state
-        .principals
-        .iter()
-        .filter(|principal| {
-            principal.proof_binding_id != proof_binding_id
-                && (principal.principal_id == recovered_principal_id
-                    || principal.localhost_root == recovered_localhost_root)
-        })
-        .map(|principal| principal.proof_binding_id.clone())
-        .collect::<Vec<_>>();
-    state.principals.retain(|principal| {
-        principal.proof_binding_id == proof_binding_id
-            || (principal.principal_id != recovered_principal_id
-                && principal.localhost_root != recovered_localhost_root)
-    });
-    let principal = state
-        .principals
-        .iter_mut()
-        .find(|principal| principal.proof_binding_id == proof_binding_id)
-        .ok_or_else(|| anyhow!("passkey proof binding not found after reassignment cleanup"))?;
-    principal.principal_id = recovered_principal_id.to_string();
-    principal.localhost_root = recovered_localhost_root.to_string();
-    principal.updated_at = updated_at;
-    let record = principal.clone();
-    for stored in &mut state.sessions {
-        if stored.grant.proof_binding_id == proof_binding_id
-            || removed_proof_binding_ids
-                .iter()
-                .any(|removed| removed == &stored.grant.proof_binding_id)
-        {
-            stored.revoked_at = Some(updated_at);
+        let removed_proof_binding_ids = state
+            .principals
+            .iter()
+            .filter(|principal| {
+                principal.proof_binding_id != proof_binding_id
+                    && (principal.principal_id == recovered_principal_id
+                        || principal.localhost_root == recovered_localhost_root)
+            })
+            .map(|principal| principal.proof_binding_id.clone())
+            .collect::<Vec<_>>();
+        state.principals.retain(|principal| {
+            principal.proof_binding_id == proof_binding_id
+                || (principal.principal_id != recovered_principal_id
+                    && principal.localhost_root != recovered_localhost_root)
+        });
+        let principal = state
+            .principals
+            .iter_mut()
+            .find(|principal| principal.proof_binding_id == proof_binding_id)
+            .ok_or_else(|| anyhow!("passkey proof binding not found after reassignment cleanup"))?;
+        principal.principal_id = recovered_principal_id.to_string();
+        principal.localhost_root = recovered_localhost_root.to_string();
+        principal.updated_at = updated_at;
+        let record = principal.clone();
+        for stored in &mut state.sessions {
+            if stored.grant.proof_binding_id == proof_binding_id
+                || removed_proof_binding_ids
+                    .iter()
+                    .any(|removed| removed == &stored.grant.proof_binding_id)
+            {
+                stored.revoked_at = Some(updated_at);
+            }
         }
-    }
-    save_auth_state(data_dir, &state)?;
-    Ok(record)
+        Ok(record)
+    })
 }
 
 fn ensure_recovered_root_reassignable_in_state(
@@ -1111,12 +1184,10 @@ fn ensure_recovered_root_reassignable_in_state(
 
 pub fn append_audit_event(data_dir: &Path, event: RuntimeAuditEventV1) -> anyhow::Result<()> {
     let event = sign_audit_event(data_dir, event)?;
-    let _guard = auth_audit_append_lock()
-        .lock()
-        .map_err(|_| anyhow!("auth audit append lock poisoned"))?;
-    let mut state = load_auth_state(data_dir)?;
-    push_audit_event(&mut state, event);
-    save_auth_state(data_dir, &state)
+    mutate_auth_state(data_dir, |state| {
+        push_audit_event(state, event);
+        Ok(())
+    })
 }
 
 pub fn sign_audit_event(
@@ -1660,6 +1731,53 @@ mod tests {
             .filter(|event| event.event_type == "browser.chain_read.completed")
             .count();
         assert_eq!(read_events, 24);
+    }
+
+    #[test]
+    fn concurrent_session_grants_do_not_lose_tokens() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let now = now_ts();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(24));
+        let mut handles = Vec::new();
+
+        for index in 0..24 {
+            let data_dir = data_dir.path().to_path_buf();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                store_session_grant(
+                    &data_dir,
+                    AuthSessionGrantV1 {
+                        schema: AuthSessionGrantV1::SCHEMA.to_string(),
+                        grant_id: format!("grant:{index}"),
+                        session_id: format!("auth:{index}"),
+                        principal_id: "person:local:test".to_string(),
+                        proof_binding_id: "proof:passkey:test".to_string(),
+                        issued_at: now,
+                        expires_at: now + 1_000,
+                        apps: vec!["home".to_string(), "system".to_string()],
+                    },
+                )
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        let state = load_auth_state(data_dir.path()).unwrap();
+        for index in 0..24 {
+            let session_id = format!("auth:{index}");
+            assert!(
+                state
+                    .sessions
+                    .iter()
+                    .any(|stored| stored.grant.session_id == session_id
+                        && stored.revoked_at.is_none()),
+                "missing active session {session_id}",
+            );
+        }
+        assert_eq!(state.sessions.len(), 24);
     }
 
     #[test]

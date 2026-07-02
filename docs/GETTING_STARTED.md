@@ -7,7 +7,8 @@ This guide has two paths:
 
 ## Binary Install
 
-The canonical public install path is:
+The canonical public install path is the current Linux `x86_64`/`aarch64`
+preview. macOS uses source-home staging for now; see [MAC.md](MAC.md).
 
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
@@ -15,9 +16,10 @@ elastos setup
 elastos
 ```
 
-After setup, `elastos` opens Home. From there you can open System, Documents,
-Library, and Inbox, and inspect your rooted localhost world. No separate
-`elastos serve` terminal is needed for the normal user path.
+After setup, `elastos` opens Home. The default Home profile includes System,
+People, Services, Browser, Wallet, Documents, Library, Marketplace, Archive, and
+Inbox, plus access to your rooted localhost world. No separate `elastos serve`
+terminal is needed for the normal user path.
 
 ### Choose One Lane Per Home
 
@@ -44,7 +46,9 @@ What this gives you today:
 - a local Home surface
 - one-terminal native chat
 - signed `elastos update`
-- first-party Carrier-backed setup for the default Home core profile
+- first-party Carrier-backed setup for the default Home profile, including
+  System, People, Services, Browser, Wallet, Documents, Library, Marketplace,
+  Archive, and Inbox
 
 Useful next commands after plain `elastos setup`:
 
@@ -77,7 +81,8 @@ Important boundary:
 
 - `chat` is the only standalone managed user-runtime command
 - `setup` stays first-party and Carrier-only by default
-- direct share/open/site/public-edge tooling is explicit extra setup, not part of the default Home core profile
+- direct share/open/site/public-edge IPFS tooling is explicit extra setup, not
+  part of the default Home profile
 - `agent`, `capsule`, WASM/microVM `run`, and `room open` remain explicit operator-runtime surfaces
 
 See [INTERACTIVE_RUNTIME_CONTRACT.md](INTERACTIVE_RUNTIME_CONTRACT.md) for the blessed interactive contract and [COMMAND_MATRIX.md](COMMAND_MATRIX.md) for the full command/runtime table.
@@ -229,6 +234,29 @@ The built binary is not a self-contained install.
 
 Copying a raw source-built binary into `~/.local/bin` is not the canonical source-developer path.
 
+### Mac source-home staging
+
+For the current Apple silicon Mac path, use [MAC.md](MAC.md). The short version
+is:
+
+```bash
+rustup target add wasm32-wasip1
+export MAC_TEST_HOME="$HOME/elastos-mac-test-home"
+export USER_HOME="$HOME"
+
+HOME="$MAC_TEST_HOME" \
+CARGO_HOME="$USER_HOME/.cargo" \
+RUSTUP_HOME="$USER_HOME/.rustup" \
+PATH="$USER_HOME/.cargo/bin:/opt/homebrew/bin:$PATH" \
+scripts/setup-source-home.sh
+```
+
+Then start Home at `http://localhost:61180/apps/home/`. Browser VM setup also
+requires reviewed Linux guest artifacts (`vmlinux`, `initrd`, `rootfs.ext4`,
+and `browser-vm-rootfs-manifest.json`) installed into the Mac source-home data
+dir; `setup-source-home.sh` refreshes existing VM artifacts but does not create
+that bootable Linux guest image on macOS.
+
 ### Source-built trusted source example
 
 If you already control a trusted source runtime, add it explicitly before running `setup`:
@@ -291,7 +319,7 @@ Hosted room note:
 
 - `elastos room open` needs the explicit operator runtime from `setup --profile operator`.
 - The browser-hosted adapter it exposes comes from `setup --profile demo`.
-- The canonical local route is `http://127.0.0.1:8090/apps/chat-room/`.
+- The canonical local route is `http://localhost:8090/apps/chat-room/`.
 
 Rule:
 

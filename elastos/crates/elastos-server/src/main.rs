@@ -33,7 +33,7 @@ use std::sync::Arc;
 use trust_cmd::KeysCommand;
 
 pub(crate) use chat_cmd::request_attached_capability;
-use elastos_runtime::{provider, session};
+use elastos_runtime::{bootstrap, provider, session};
 #[cfg(test)]
 pub(crate) use elastos_server::binaries::verify_component_binary_with_data_dir;
 pub(crate) use elastos_server::binaries::{
@@ -168,7 +168,7 @@ enum Commands {
         channel: String,
 
         /// Publish profile name (used when --capsules is not set)
-        #[arg(long, default_value = "demo")]
+        #[arg(long, default_value = "home")]
         profile: String,
 
         /// Skip rebuilding binaries
@@ -381,7 +381,7 @@ enum Commands {
     #[command(subcommand)]
     Webspace(WebspaceCommand),
 
-    /// Manage room membership and browser access
+    /// Manage Chat conversation access
     #[command(subcommand)]
     Room(RoomCommand),
 
@@ -553,12 +553,12 @@ pub(crate) enum NodeCommand {
     /// Manage known operator peers and local allowlists
     #[command(subcommand)]
     Peer(NodePeerCommand),
-    /// Read or drive explicit remote room operations on an operator peer
+    /// Read or drive explicit remote Chat operations on an operator peer
     #[command(subcommand)]
     Room(NodeRoomCommand),
     /// Read safe remote node status from an allowed peer
     Status {
-        /// Target runtime DID
+        /// Target ElastOS DID
         #[arg(long)]
         peer: String,
         /// Emit machine-readable JSON
@@ -567,7 +567,7 @@ pub(crate) enum NodeCommand {
     },
     /// Check or apply a trusted-source update on an allowed peer
     Update {
-        /// Target runtime DID
+        /// Target ElastOS DID
         #[arg(long)]
         peer: String,
         /// Only check for updates, never apply them
@@ -589,7 +589,7 @@ pub(crate) enum NodeCommand {
 pub(crate) enum NodePeerCommand {
     /// Add or update a known operator peer
     Add {
-        /// Peer runtime DID
+        /// Peer ElastOS DID
         #[arg(long)]
         did: String,
         /// Optional human label
@@ -613,7 +613,7 @@ pub(crate) enum NodePeerCommand {
     },
     /// Remove a known operator peer and revoke all operator permissions
     Remove {
-        /// Peer runtime DID
+        /// Peer ElastOS DID
         #[arg(long)]
         did: String,
         /// Emit machine-readable JSON
@@ -624,27 +624,27 @@ pub(crate) enum NodePeerCommand {
 
 #[derive(Subcommand)]
 pub(crate) enum NodeRoomCommand {
-    /// Show sovereign room state from an allowed peer
+    /// Show Chat state from an allowed peer
     Show {
-        /// Target runtime DID
+        /// Target ElastOS DID
         #[arg(long)]
         peer: String,
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
     },
-    /// List pending browser access requests from an allowed peer
+    /// List pending Chat web guest requests from an allowed peer
     Pending {
-        /// Target runtime DID
+        /// Target ElastOS DID
         #[arg(long)]
         peer: String,
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
     },
-    /// Approve a pending browser access request on an allowed peer
+    /// Approve a pending Chat web guest request on an allowed peer
     Approve {
-        /// Target runtime DID
+        /// Target ElastOS DID
         #[arg(long)]
         peer: String,
         /// Pending request ID. Omit to approve the oldest pending request.
@@ -653,26 +653,26 @@ pub(crate) enum NodeRoomCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Deny a pending browser access request on an allowed peer
+    /// Deny a pending Chat web guest request on an allowed peer
     Deny {
-        /// Target runtime DID
+        /// Target ElastOS DID
         #[arg(long)]
         peer: String,
         /// Pending request ID. Omit to deny the oldest pending request.
         request_id: Option<String>,
-        /// Optional denial reason for the browser session
+        /// Optional denial reason for the web guest session
         #[arg(long)]
         reason: Option<String>,
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
     },
-    /// Start or reuse the remote runtime gateway and print room URLs
+    /// Start or reuse the remote ElastOS gateway and print Chat URLs
     Open {
-        /// Target runtime DID
+        /// Target ElastOS DID
         #[arg(long)]
         peer: String,
-        /// Address to bind the room gateway to
+        /// Address to bind the Chat gateway to
         #[arg(short, long, default_value = "0.0.0.0:8090")]
         addr: String,
         /// Emit machine-readable JSON
@@ -1006,44 +1006,44 @@ pub(crate) enum RoomCommand {
         #[arg(long)]
         json: bool,
     },
-    /// List pending browser access requests for this room
+    /// List pending Chat web guest requests
     Pending {
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
     },
-    /// Seed the local runtime as the room owner
+    /// Seed the local ElastOS identity as the Chat manager
     Seed {
         /// Room title to store in control state
-        #[arg(long, default_value = "Room")]
+        #[arg(long, default_value = "Chat")]
         title: String,
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
     },
-    /// Create a sovereign member invite for another DID
+    /// Create an ElastOS user invite for another DID
     Invite {
-        /// DID to invite into the room
+        /// DID to invite into Chat
         did: String,
-        /// Role to grant to the invited runtime
+        /// Access role to grant to the invited ElastOS identity
         #[arg(long, value_enum, default_value_t = room_cmd::RoomInviteRoleArg::Member)]
         role: room_cmd::RoomInviteRoleArg,
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
     },
-    /// Create and sign a deliverable sovereign member invite envelope
+    /// Create and sign a deliverable ElastOS user invite envelope
     InviteExport {
-        /// DID to invite into the room
+        /// DID to invite into Chat
         did: String,
-        /// Role to grant to the invited runtime
+        /// Access role to grant to the invited ElastOS identity
         #[arg(long, value_enum, default_value_t = room_cmd::RoomInviteRoleArg::Member)]
         role: room_cmd::RoomInviteRoleArg,
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
     },
-    /// Import a signed sovereign member invite envelope from another runtime
+    /// Import a signed ElastOS user invite envelope from another runtime
     InviteImport {
         /// Path to invite envelope JSON, or omit/read '-' for stdin
         path: Option<PathBuf>,
@@ -1051,7 +1051,7 @@ pub(crate) enum RoomCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Accept a pending sovereign member invite on this runtime
+    /// Accept a pending ElastOS user invite on this runtime
     Accept {
         /// Pending invite ID
         invite_id: String,
@@ -1059,7 +1059,7 @@ pub(crate) enum RoomCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Export a signed room acceptance envelope after local invite acceptance
+    /// Export a signed Chat acceptance envelope after local invite acceptance
     AcceptExport {
         /// Accepted invite ID
         invite_id: String,
@@ -1067,7 +1067,7 @@ pub(crate) enum RoomCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Import a signed room acceptance envelope on the owner runtime
+    /// Import a signed Chat acceptance envelope on the managing runtime
     AcceptImport {
         /// Path to acceptance envelope JSON, or omit/read '-' for stdin
         path: Option<PathBuf>,
@@ -1075,7 +1075,7 @@ pub(crate) enum RoomCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Approve a pending browser access request
+    /// Approve a pending Chat web guest request
     Approve {
         /// Pending request ID. Omit to approve the oldest pending request.
         request_id: Option<String>,
@@ -1083,7 +1083,7 @@ pub(crate) enum RoomCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Deny a pending browser access request
+    /// Deny a pending Chat web guest request
     Deny {
         /// Pending request ID. Omit to deny the oldest pending request.
         request_id: Option<String>,
@@ -2123,11 +2123,16 @@ pub(crate) async fn create_runtime(
         }
     }
 
-    Ok(Runtime::with_providers(
-        storage,
-        compute_providers,
-        Some(wasm_provider),
-    ))
+    let (runtime_config, _) = bootstrap::RuntimeConfig::load(&default_data_dir());
+    let runtime = Runtime::with_providers(storage, compute_providers, Some(wasm_provider));
+    runtime
+        .configure_signature_verification(
+            &runtime_config.effective_trusted_keys(),
+            runtime_config.dev_mode,
+        )
+        .await?;
+
+    Ok(runtime)
 }
 
 // Tests for extracted modules are in their respective module files:
@@ -2154,6 +2159,7 @@ mod tests {
     #[test]
     fn verify_component_binary_with_data_dir_verifies_installed_agent_binary() {
         let data_dir = tempfile::tempdir().unwrap();
+        let platform = elastos_server::setup::detect_platform();
         let bin_dir = data_dir.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
 
@@ -2161,32 +2167,28 @@ mod tests {
         let bytes = b"agent-binary";
         fs::write(&install_path, bytes).unwrap();
 
-        fs::write(data_dir.path().join("components.json"), {
-            let checksum = format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)));
-            // Key the platform entry by the host's resolved platform so this test is
-            // host-independent (passes on linux-amd64, linux-arm64, and macOS unknown-arm64),
-            // exercising the checksum verify rather than only matching a Linux x86_64 gate.
-            let platform = crate::setup::detect_platform();
-            format!(
-                r#"{{
-  "schema": "elastos.components/v1",
-  "version": "0.1.0",
-  "capsules": {{}},
-  "external": {{
-    "agent": {{
-      "install_path": "bin/agent",
-      "platforms": {{
-        "{platform}": {{
-          "checksum": "{checksum}",
-          "url": "https://example.invalid/agent"
-        }}
-      }}
-    }}
-  }},
-  "profiles": {{}}
-}}"#
-            )
-        })
+        let checksum = format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)));
+        let manifest = serde_json::json!({
+            "schema": "elastos.components/v1",
+            "version": "0.1.0",
+            "capsules": {},
+            "external": {
+                "agent": {
+                    "install_path": "bin/agent",
+                    "platforms": {
+                        platform: {
+                            "checksum": checksum,
+                            "url": "https://example.invalid/agent"
+                        }
+                    }
+                }
+            },
+            "profiles": {}
+        });
+        fs::write(
+            data_dir.path().join("components.json"),
+            manifest.to_string(),
+        )
         .unwrap();
 
         verify_component_binary_with_data_dir(data_dir.path(), "agent", &install_path).unwrap();

@@ -126,24 +126,29 @@ pub(in crate::api::gateway) async fn browser_wallet_bridge_payload(
     };
     let default_chain_namespace = browser_default_chain_namespace(&browser_summary);
     let default_account_id = browser_default_account_id(&browser_summary);
-    let approval_url = approval_origin
-        .map(|origin| format!("{origin}/api/apps/browser/wallet/request-signature"))
-        .unwrap_or_else(|| "/api/apps/browser/wallet/request-signature".to_string());
-    let transaction_url = approval_origin
-        .map(|origin| format!("{origin}/api/apps/browser/wallet/request-transaction"))
-        .unwrap_or_else(|| "/api/apps/browser/wallet/request-transaction".to_string());
-    let read_url = approval_origin
-        .map(|origin| format!("{origin}/api/apps/browser/wallet/read"))
-        .unwrap_or_else(|| "/api/apps/browser/wallet/read".to_string());
-    let transaction_broadcast_url = approval_origin
-        .map(|origin| format!("{origin}/api/apps/browser/wallet/broadcast-transaction"))
-        .unwrap_or_else(|| "/api/apps/browser/wallet/broadcast-transaction".to_string());
-    let approval_status_url = approval_origin
-        .map(|origin| format!("{origin}/api/apps/browser/wallet/approvals"))
-        .unwrap_or_else(|| "/api/apps/browser/wallet/approvals".to_string());
-    let bridge_url = approval_origin
-        .map(|origin| format!("{origin}/api/apps/browser/wallet/bridge"))
-        .unwrap_or_else(|| "/api/apps/browser/wallet/bridge".to_string());
+    let approval_origin = browser_wallet_bridge_origin(approval_origin);
+    let approval_url = browser_wallet_bridge_url(
+        approval_origin.as_deref(),
+        "/api/apps/browser/wallet/request-signature",
+    );
+    let transaction_url = browser_wallet_bridge_url(
+        approval_origin.as_deref(),
+        "/api/apps/browser/wallet/request-transaction",
+    );
+    let read_url =
+        browser_wallet_bridge_url(approval_origin.as_deref(), "/api/apps/browser/wallet/read");
+    let transaction_broadcast_url = browser_wallet_bridge_url(
+        approval_origin.as_deref(),
+        "/api/apps/browser/wallet/broadcast-transaction",
+    );
+    let approval_status_url = browser_wallet_bridge_url(
+        approval_origin.as_deref(),
+        "/api/apps/browser/wallet/approvals",
+    );
+    let bridge_url = browser_wallet_bridge_url(
+        approval_origin.as_deref(),
+        "/api/apps/browser/wallet/bridge",
+    );
     serde_json::json!({
         "schema": "elastos.browser.wallet-bridge/v1",
         "principal_id": context.principal_id,
@@ -161,6 +166,28 @@ pub(in crate::api::gateway) async fn browser_wallet_bridge_payload(
         "home_token": launch_token,
         "authority": "runtime_mediated",
     })
+}
+
+fn browser_wallet_bridge_url(origin: Option<&str>, path: &str) -> String {
+    origin
+        .map(|origin| format!("{origin}{path}"))
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn browser_wallet_bridge_origin(origin: Option<&str>) -> Option<String> {
+    let origin = origin?.trim().trim_end_matches('/');
+    let parsed = url::Url::parse(origin).ok()?;
+    let host = parsed.host_str()?;
+    let port = parsed.port_or_known_default()?;
+    if browser_wallet_bridge_host_is_loopback(host) {
+        return Some(format!("http://localhost:{port}"));
+    }
+    Some(origin.to_string())
+}
+
+fn browser_wallet_bridge_host_is_loopback(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1")
 }
 
 #[cfg(test)]
@@ -222,6 +249,22 @@ mod browser_wallet_bridge_tests {
         assert_eq!(
             browser_default_chain_namespace(&summary).as_deref(),
             Some("eip155:8453")
+        );
+    }
+
+    #[test]
+    fn browser_wallet_bridge_origin_rewrites_localhost_for_runtime_exit() {
+        assert_eq!(
+            browser_wallet_bridge_origin(Some("https://localhost:61180")).as_deref(),
+            Some("http://localhost:61180")
+        );
+        assert_eq!(
+            browser_wallet_bridge_origin(Some("http://127.0.0.1:8090")).as_deref(),
+            Some("http://localhost:8090")
+        );
+        assert_eq!(
+            browser_wallet_bridge_origin(Some("https://elastos.elacitylabs.com")).as_deref(),
+            Some("https://elastos.elacitylabs.com")
         );
     }
 

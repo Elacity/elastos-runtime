@@ -9,6 +9,11 @@ import {
   launcherToggleButton,
   toolbarInboxButton,
   toolbarInboxCount,
+  homeNotificationToast,
+  homeNotificationTitle,
+  homeNotificationBody,
+  homeNotificationAction,
+  homeNotificationDismiss,
   taskbarTargets,
   shortcutTemplate,
   launcherItemTemplate,
@@ -40,7 +45,7 @@ import {
   desktopObjectEntryId,
   desktopObjectByEntryId,
   desktopEntryExists,
-} from "./shell-core.js?v=home-20260615b";
+} from "./shell-core.js?v=home-20260627a";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -54,10 +59,13 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260615b";
+} from "./shell-windows.js?v=home-20260627a";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
+const HOME_NOTIFICATION_TOAST_MS = 12000;
+let homeNotificationToastTimer = null;
+let lastHomeNotificationToastId = "";
 
 export function renderDesktop(summary) {
   desktopShortcuts.replaceChildren();
@@ -1458,4 +1466,77 @@ export function renderInboxBadge(summary) {
     "aria-label",
     badgeCount === 0 ? "Open Inbox" : `Open Inbox. ${badgeCount} pending items.`,
   );
+}
+
+export function maybeShowWalletApprovalToast(previousSummary, summary) {
+  if (!previousSummary || !targetById(summary, "inbox")) {
+    return;
+  }
+  const previousIds = new Set(walletApprovalEntries(previousSummary).map(walletApprovalKey));
+  const entry = walletApprovalEntries(summary)
+    .find((item) => {
+      const key = walletApprovalKey(item);
+      return key && key !== lastHomeNotificationToastId && !previousIds.has(key);
+    });
+  if (!entry) {
+    return;
+  }
+  showHomeNotificationToast(entry);
+}
+
+function walletApprovalEntries(summary) {
+  const entries = Array.isArray(summary?.notifications?.entries)
+    ? summary.notifications.entries
+    : [];
+  return entries.filter((entry) => {
+    const actionId = entry?.action_ref?.action_id;
+    return entry?.kind === "wallet_approval_request"
+      && typeof actionId === "string"
+      && actionId.startsWith("wallet-approve-request:");
+  });
+}
+
+function walletApprovalKey(entry) {
+  return String(entry?.id || entry?.action_ref?.action_id || "");
+}
+
+function showHomeNotificationToast(entry) {
+  if (
+    !homeNotificationToast ||
+    !homeNotificationTitle ||
+    !homeNotificationBody ||
+    !homeNotificationAction ||
+    !homeNotificationDismiss
+  ) {
+    return;
+  }
+  bindHomeNotificationToast();
+  lastHomeNotificationToastId = walletApprovalKey(entry);
+  homeNotificationTitle.textContent = entry.title || "Wallet approval request";
+  homeNotificationBody.textContent = entry.body || "A capsule requests wallet approval.";
+  homeNotificationToast.hidden = false;
+  homeNotificationToast.setAttribute("aria-hidden", "false");
+  window.clearTimeout(homeNotificationToastTimer);
+  homeNotificationToastTimer = window.setTimeout(hideHomeNotificationToast, HOME_NOTIFICATION_TOAST_MS);
+}
+
+function bindHomeNotificationToast() {
+  if (!homeNotificationToast || homeNotificationToast.dataset.bound === "true") {
+    return;
+  }
+  homeNotificationToast.dataset.bound = "true";
+  homeNotificationAction.addEventListener("click", () => {
+    hideHomeNotificationToast();
+    openTarget("inbox");
+  });
+  homeNotificationDismiss.addEventListener("click", hideHomeNotificationToast);
+}
+
+function hideHomeNotificationToast() {
+  if (!homeNotificationToast) {
+    return;
+  }
+  window.clearTimeout(homeNotificationToastTimer);
+  homeNotificationToast.setAttribute("aria-hidden", "true");
+  homeNotificationToast.hidden = true;
 }

@@ -2,7 +2,7 @@
 name = "chat-room"
 version = "0.1.0"
 edition = "2021"
-description = "ElastOS Chat Room capsule"
+description = "ElastOS Chat capsule"
 license = "MIT"
 
 [dependencies]

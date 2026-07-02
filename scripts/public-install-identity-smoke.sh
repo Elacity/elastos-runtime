@@ -2,7 +2,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${REPO_ROOT}/scripts/lib/public-install-guards.sh"
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
+FORCE_RELAY_ONLY="${ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY:-0}"
 HOME_DIR="$(mktemp -d /tmp/elastos-public-identity-XXXXXX)"
 trap 'rm -rf "$HOME_DIR"' EXIT
 
@@ -16,6 +18,7 @@ bash -lc 'mkdir -p "$HOME" "$XDG_DATA_HOME" && curl -fsSL "${ELASTOS_PUBLISHER_G
 INSTALLED_BIN="${HOME_DIR}/.local/bin/elastos"
 RUN_BIN="${ELASTOS_BIN_OVERRIDE:-${INSTALLED_BIN}}"
 DATA_DIR="${HOME_DIR}/xdg-data/elastos"
+INSTALLED_COMPONENTS_MANIFEST="${DATA_DIR}/components.json"
 SOURCES_PATH="${DATA_DIR}/sources.json"
 
 if [[ ! -x "${INSTALLED_BIN}" ]]; then
@@ -43,8 +46,9 @@ if grep -q "Node ID:   none" <<<"${SOURCE_OUTPUT}"; then
     exit 1
 fi
 
-echo "[public-identity] remove gateway override and direct addrs to force relay-only Carrier setup"
-SOURCES_PATH="${SOURCES_PATH}" python3 - <<'PY'
+if [[ "${FORCE_RELAY_ONLY}" == "1" ]]; then
+    echo "[public-identity] remove gateway override and direct addrs to force relay-only Carrier setup"
+    SOURCES_PATH="${SOURCES_PATH}" python3 - <<'PY'
 import json
 import os
 import pathlib
@@ -68,13 +72,19 @@ for source in data.get("sources", []):
         )
 path.write_text(json.dumps(data, indent=2) + "\n")
 PY
+else
+    echo "[public-identity] use stamped trusted-source transports"
+fi
 
-echo "[public-identity] run Carrier-only setup --profile home"
+echo "[public-identity] run default setup"
+guard_branch_binary_requires_checksummed_public_manifest "${INSTALLED_COMPONENTS_MANIFEST}" "[public-identity]"
 HOME="${HOME_DIR}" \
 XDG_DATA_HOME="${HOME_DIR}/xdg-data" \
-"${RUN_BIN}" setup --profile home >/tmp/elastos-public-identity-setup.log
+ELASTOS_COMPONENTS_MANIFEST="${INSTALLED_COMPONENTS_MANIFEST}" \
+"${RUN_BIN}" setup >/tmp/elastos-public-identity-setup.log
 
 echo "[public-identity] prove DID-backed identity contract"
+ELASTOS_COMPONENTS_MANIFEST="${INSTALLED_COMPONENTS_MANIFEST}" \
 ELASTOS_BIN="${RUN_BIN}" \
 ELASTOS_IDENTITY_HOME="${HOME_DIR}" \
 ELASTOS_IDENTITY_XDG_DATA_HOME="${HOME_DIR}/xdg-data" \

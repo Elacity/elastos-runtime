@@ -95,18 +95,29 @@ echo "[local-carrier-setup] building current binary and first-party Home core as
 (cd "${REPO_ROOT}/elastos/capsules/shell" && cargo build --release)
 (cd "${REPO_ROOT}/elastos/capsules/localhost-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/did-provider" && cargo build --release)
+(cd "${REPO_ROOT}/capsules/chain-provider" && cargo build --release)
+(cd "${REPO_ROOT}/capsules/net-provider" && cargo build --release)
+(cd "${REPO_ROOT}/capsules/exit-provider" && cargo build --release)
+(cd "${REPO_ROOT}/capsules/browser-engine-adapter" && cargo build --release)
+(cd "${REPO_ROOT}/elastos/tools/browser-engine-supervisor" && cargo build --release)
+(cd "${REPO_ROOT}/elastos/tools/browser-native-proxy-engine" && cargo build --release)
+(cd "${REPO_ROOT}/elastos/tools/browser-stream-bridge" && cargo build --release)
+(cd "${REPO_ROOT}/elastos/tools/browser-local-exit" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/webspace-provider" && cargo build --release)
+(cd "${REPO_ROOT}/capsules/wallet-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/object-provider" && cargo build --release)
+(cd "${REPO_ROOT}/capsules/content-block-graph-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/home-cli" && cargo build --target wasm32-wasip1 --release)
 for capsule in \
     home \
     system \
+    services \
     browser \
     documents \
-    gba-emulator \
     inbox \
     library \
     marketplace \
+    archive-manager \
     wallet \
     wallet-metamask \
     wallet-unisat \
@@ -133,16 +144,27 @@ SETUP_PLATFORM="${SETUP_PLATFORM}" \
 SHELL_BIN="${REPO_ROOT}/elastos/target/release/shell" \
 LOCALHOST_PROVIDER_BIN="${REPO_ROOT}/elastos/target/release/localhost-provider" \
 DID_PROVIDER_BIN="${REPO_ROOT}/capsules/did-provider/target/release/did-provider" \
+CHAIN_PROVIDER_BIN="${REPO_ROOT}/capsules/chain-provider/target/release/chain-provider" \
+NET_PROVIDER_BIN="${REPO_ROOT}/capsules/net-provider/target/release/net-provider" \
+EXIT_PROVIDER_BIN="${REPO_ROOT}/capsules/exit-provider/target/release/exit-provider" \
+BROWSER_ENGINE_ADAPTER_BIN="${REPO_ROOT}/capsules/browser-engine-adapter/target/release/browser-engine-adapter" \
+BROWSER_ENGINE_SUPERVISOR_BIN="${REPO_ROOT}/elastos/tools/browser-engine-supervisor/target/release/browser-engine-supervisor" \
+BROWSER_NATIVE_PROXY_ENGINE_BIN="${REPO_ROOT}/elastos/tools/browser-native-proxy-engine/target/release/browser-native-proxy-engine" \
+BROWSER_STREAM_BRIDGE_BIN="${REPO_ROOT}/elastos/tools/browser-stream-bridge/target/release/browser-stream-bridge" \
+BROWSER_LOCAL_EXIT_BIN="${REPO_ROOT}/elastos/tools/browser-local-exit/target/release/browser-local-exit" \
 WEBSPACE_PROVIDER_BIN="${REPO_ROOT}/capsules/webspace-provider/target/release/webspace-provider" \
+WALLET_PROVIDER_BIN="${REPO_ROOT}/capsules/wallet-provider/target/release/wallet-provider" \
 OBJECT_PROVIDER_BIN="${REPO_ROOT}/capsules/object-provider/target/release/object-provider" \
+CONTENT_BLOCK_GRAPH_PROVIDER_BIN="${REPO_ROOT}/capsules/content-block-graph-provider/target/release/content-block-graph-provider" \
 HOME_CLI_DIR="${REPO_ROOT}/capsules/home-cli" \
 HOME_CAPSULE_DIR="${REPO_ROOT}/capsules/home" \
 SYSTEM_CAPSULE_DIR="${REPO_ROOT}/capsules/system" \
+SERVICES_CAPSULE_DIR="${REPO_ROOT}/capsules/services" \
 BROWSER_CAPSULE_DIR="${REPO_ROOT}/capsules/browser" \
 DOCUMENTS_CAPSULE_DIR="${REPO_ROOT}/capsules/documents" \
-GBA_EMULATOR_CAPSULE_DIR="${REPO_ROOT}/capsules/gba-emulator" \
 LIBRARY_CAPSULE_DIR="${REPO_ROOT}/capsules/library" \
 MARKETPLACE_CAPSULE_DIR="${REPO_ROOT}/capsules/marketplace" \
+ARCHIVE_MANAGER_CAPSULE_DIR="${REPO_ROOT}/capsules/archive-manager" \
 INBOX_CAPSULE_DIR="${REPO_ROOT}/capsules/inbox" \
 WALLET_CAPSULE_DIR="${REPO_ROOT}/capsules/wallet" \
 WALLET_METAMASK_CAPSULE_DIR="${REPO_ROOT}/capsules/wallet-metamask" \
@@ -177,8 +199,18 @@ mapping = {
     "shell": pathlib.Path(os.environ["SHELL_BIN"]),
     "localhost-provider": pathlib.Path(os.environ["LOCALHOST_PROVIDER_BIN"]),
     "did-provider": pathlib.Path(os.environ["DID_PROVIDER_BIN"]),
+    "chain-provider": pathlib.Path(os.environ["CHAIN_PROVIDER_BIN"]),
+    "net-provider": pathlib.Path(os.environ["NET_PROVIDER_BIN"]),
+    "exit-provider": pathlib.Path(os.environ["EXIT_PROVIDER_BIN"]),
+    "browser-engine-adapter": pathlib.Path(os.environ["BROWSER_ENGINE_ADAPTER_BIN"]),
+    "browser-engine-supervisor": pathlib.Path(os.environ["BROWSER_ENGINE_SUPERVISOR_BIN"]),
+    "browser-native-proxy-engine": pathlib.Path(os.environ["BROWSER_NATIVE_PROXY_ENGINE_BIN"]),
+    "browser-stream-bridge": pathlib.Path(os.environ["BROWSER_STREAM_BRIDGE_BIN"]),
+    "browser-local-exit": pathlib.Path(os.environ["BROWSER_LOCAL_EXIT_BIN"]),
     "webspace-provider": pathlib.Path(os.environ["WEBSPACE_PROVIDER_BIN"]),
+    "wallet-provider": pathlib.Path(os.environ["WALLET_PROVIDER_BIN"]),
     "object-provider": pathlib.Path(os.environ["OBJECT_PROVIDER_BIN"]),
+    "content-block-graph-provider": pathlib.Path(os.environ["CONTENT_BLOCK_GRAPH_PROVIDER_BIN"]),
 }
 
 for name, src in mapping.items():
@@ -213,12 +245,13 @@ home_cli_manifest["size"] = len(home_cli_data)
 browser_capsules = {
     "home": pathlib.Path(os.environ["HOME_CAPSULE_DIR"]),
     "system": pathlib.Path(os.environ["SYSTEM_CAPSULE_DIR"]),
+    "services": pathlib.Path(os.environ["SERVICES_CAPSULE_DIR"]),
     "browser": pathlib.Path(os.environ["BROWSER_CAPSULE_DIR"]),
     "documents": pathlib.Path(os.environ["DOCUMENTS_CAPSULE_DIR"]),
-    "gba-emulator": pathlib.Path(os.environ["GBA_EMULATOR_CAPSULE_DIR"]),
     "inbox": pathlib.Path(os.environ["INBOX_CAPSULE_DIR"]),
     "library": pathlib.Path(os.environ["LIBRARY_CAPSULE_DIR"]),
     "marketplace": pathlib.Path(os.environ["MARKETPLACE_CAPSULE_DIR"]),
+    "archive-manager": pathlib.Path(os.environ["ARCHIVE_MANAGER_CAPSULE_DIR"]),
     "wallet": pathlib.Path(os.environ["WALLET_CAPSULE_DIR"]),
     "wallet-metamask": pathlib.Path(os.environ["WALLET_METAMASK_CAPSULE_DIR"]),
     "wallet-unisat": pathlib.Path(os.environ["WALLET_UNISAT_CAPSULE_DIR"]),
@@ -392,6 +425,7 @@ echo "[local-carrier-setup] running Carrier-only setup smoke"
 (
     cd "${ELASTOS_ROOT}"
     XDG_DATA_HOME="${XDG_DATA_HOME}" \
+    ELASTOS_COMPONENTS_MANIFEST="${DATA_DIR}/components.json" \
     "${ELASTOS_BIN}" setup
 )
 
@@ -401,20 +435,30 @@ for installed in \
     "${DATA_DIR}/bin/shell" \
     "${DATA_DIR}/bin/localhost-provider" \
     "${DATA_DIR}/bin/did-provider" \
+    "${DATA_DIR}/bin/chain-provider" \
+    "${DATA_DIR}/bin/net-provider" \
+    "${DATA_DIR}/bin/exit-provider" \
+    "${DATA_DIR}/bin/browser-engine-adapter" \
+    "${DATA_DIR}/bin/browser-engine-supervisor" \
+    "${DATA_DIR}/bin/browser-native-proxy-engine" \
+    "${DATA_DIR}/bin/browser-stream-bridge" \
+    "${DATA_DIR}/bin/browser-local-exit" \
     "${DATA_DIR}/bin/webspace-provider" \
+    "${DATA_DIR}/bin/wallet-provider" \
     "${DATA_DIR}/bin/object-provider" \
+    "${DATA_DIR}/bin/content-block-graph-provider" \
     "${DATA_DIR}/capsules/home-cli/home-cli.wasm" \
     "${DATA_DIR}/capsules/home-cli/capsule.json" \
     "${DATA_DIR}/capsules/home/home.wasm" \
     "${DATA_DIR}/capsules/home/browser/index.html" \
     "${DATA_DIR}/capsules/system/system.wasm" \
     "${DATA_DIR}/capsules/system/browser/index.html" \
+    "${DATA_DIR}/capsules/services/services.wasm" \
+    "${DATA_DIR}/capsules/services/browser/index.html" \
     "${DATA_DIR}/capsules/browser/browser.wasm" \
     "${DATA_DIR}/capsules/browser/browser/index.html" \
     "${DATA_DIR}/capsules/documents/documents.wasm" \
     "${DATA_DIR}/capsules/documents/browser/index.html" \
-    "${DATA_DIR}/capsules/gba-emulator/gba-emulator.wasm" \
-    "${DATA_DIR}/capsules/gba-emulator/browser/index.html" \
     "${DATA_DIR}/capsules/inbox/inbox.wasm" \
     "${DATA_DIR}/capsules/inbox/browser/index.html" \
     "${DATA_DIR}/capsules/library/library.wasm" \
@@ -426,6 +470,8 @@ for installed in \
     "${DATA_DIR}/capsules/marketplace/browser/index.html" \
     "${DATA_DIR}/capsules/marketplace/browser/marketplace.css" \
     "${DATA_DIR}/capsules/marketplace/browser/marketplace.js" \
+    "${DATA_DIR}/capsules/archive-manager/archive-manager.wasm" \
+    "${DATA_DIR}/capsules/archive-manager/browser/index.html" \
     "${DATA_DIR}/capsules/wallet/wallet.wasm" \
     "${DATA_DIR}/capsules/wallet/browser/index.html" \
     "${DATA_DIR}/capsules/wallet-metamask/wallet-metamask.wasm" \

@@ -263,7 +263,6 @@ pub fn list_peers(peer_token: &str) -> Result<Vec<String>> {
         .unwrap_or_default())
 }
 
-
 pub fn send_gossip(
     peer_token: &str,
     topic: &str,
@@ -371,8 +370,7 @@ pub fn recv_presence_announcements(
             if !verified {
                 eprintln!(
                     "Dropping unverified presence from {} ({})",
-                    presence.nick,
-                    presence.did
+                    presence.nick, presence.did
                 );
                 return None;
             }

@@ -128,6 +128,21 @@ pub(in crate::api::gateway) struct BrowserWalletBroadcastRequest {
     pub(in crate::api::gateway) request_id: String,
 }
 
+const BROWSER_PENDING_TRANSACTION_BROADCAST_SCHEMA: &str =
+    "elastos.browser.pending-transaction-broadcast/v1";
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+struct BrowserPendingTransactionBroadcast {
+    schema: String,
+    principal_id: String,
+    request_id: String,
+    chain_namespace: String,
+    network: String,
+    transaction_hash: String,
+    receipt: serde_json::Value,
+    created_at: u64,
+}
+
 pub(in crate::api::gateway) async fn browser_app_wallet_request_signature(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -268,7 +283,6 @@ async fn create_browser_wallet_transaction_request(
     let chain_namespace = input.chain_namespace.clone();
     let address = input.address.clone();
     let page_url = input.page_url.clone();
-    let _origin = input.origin.as_deref();
     let method = input.method.trim().to_string();
     if method != "eth_sendTransaction" {
         return Err((
@@ -371,7 +385,7 @@ async fn create_browser_wallet_transaction_request(
     if let Some(message) = provider_response_error_message(&prepare_response) {
         return Err((StatusCode::BAD_REQUEST, message));
     }
-    let intent = provider_response_data(&prepare_response).ok_or_else(|| {
+    let mut intent = provider_response_data(&prepare_response).ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             "chain provider returned an invalid transaction intent".to_string(),
@@ -384,6 +398,22 @@ async fn create_browser_wallet_transaction_request(
             StatusCode::SERVICE_UNAVAILABLE,
             "chain provider returned an unsupported transaction intent".to_string(),
         ));
+    }
+    if let Some(intent_object) = intent.as_object_mut() {
+        intent_object.insert("method".to_string(), serde_json::json!(method.clone()));
+        intent_object.insert("page_url".to_string(), serde_json::json!(page_url));
+        intent_object.insert(
+            "origin".to_string(),
+            serde_json::json!(input.origin.clone()),
+        );
+        intent_object.insert(
+            "principal_id".to_string(),
+            serde_json::json!(context.principal_id.clone()),
+        );
+        intent_object.insert(
+            "session_id".to_string(),
+            serde_json::json!(context.session_id.clone()),
+        );
     }
     let wallet_sign_resource = format!(
         "elastos://wallet/{}/sign/transaction_intent",
@@ -806,16 +836,22 @@ async fn browser_wallet_approval_status(
         } else if request.get("intent").and_then(|value| value.as_str())
             == Some("transaction_intent")
         {
-            if let Some(signed_transaction) = result
+            let has_signed_transaction = if let Some(signed_transaction) = result
                 .get("signed_transaction")
                 .and_then(|value| value.as_str())
                 .filter(|value| !value.trim().is_empty())
             {
                 payload["signed_transaction"] =
                     serde_json::Value::String(signed_transaction.to_string());
-            }
+                true
+            } else {
+                false
+            };
+            let broadcast_recorded = result.get("broadcast_recorded_at").is_some();
             if let Some(hash) = result.get("transaction_hash").cloned() {
-                payload["transaction_hash"] = hash;
+                if !has_signed_transaction || broadcast_recorded {
+                    payload["transaction_hash"] = hash;
+                }
             }
             if payload.get("signed_transaction").is_none()
                 && payload.get("transaction_hash").is_none()
@@ -829,6 +865,169 @@ async fn browser_wallet_approval_status(
         payload["signed_result"] = result.clone();
     }
     Ok(payload)
+}
+
+fn browser_pending_transaction_broadcast_uri(
+    context: &HomeLaunchTokenContext,
+    request_id: &str,
+) -> String {
+    format!(
+        "{}/.AppData/ElastOS/Browser/pending-transaction-broadcasts/{request_id}.json",
+        crate::auth::principal_localhost_root(&context.principal_id)
+    )
+}
+
+fn browser_pending_transaction_broadcast_path(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+    request_id: &str,
+) -> Result<(String, std::path::PathBuf), (StatusCode, String)> {
+    let uri = browser_pending_transaction_broadcast_uri(context, request_id);
+    let path = rooted_localhost_fs_path(&state.data_dir, &uri).ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid Browser pending broadcast storage path".to_string(),
+        )
+    })?;
+    Ok((uri, path))
+}
+
+fn browser_pending_transaction_missing(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+fn read_browser_pending_transaction_broadcast(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+    request_id: &str,
+) -> Result<Option<BrowserPendingTransactionBroadcast>, (StatusCode, String)> {
+    let (uri, path) = browser_pending_transaction_broadcast_path(state, context, request_id)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let localhost_root = crate::auth::principal_localhost_root(&context.principal_id);
+    let bytes = match crate::auth::read_principal_root_object(
+        &state.data_dir,
+        &context.principal_id,
+        &localhost_root,
+        &uri,
+        &path,
+    ) {
+        Ok(bytes) => bytes,
+        Err(err) if browser_pending_transaction_missing(&err) => return Ok(None),
+        Err(err) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to read Browser pending transaction broadcast: {err}"),
+            ));
+        }
+    };
+    let pending: BrowserPendingTransactionBroadcast =
+        serde_json::from_slice(&bytes).map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("invalid Browser pending transaction broadcast: {err}"),
+            )
+        })?;
+    if pending.schema != BROWSER_PENDING_TRANSACTION_BROADCAST_SCHEMA
+        || pending.principal_id != context.principal_id
+        || pending.request_id != request_id
+        || pending.transaction_hash.trim().is_empty()
+    {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Browser pending transaction broadcast failed validation".to_string(),
+        ));
+    }
+    Ok(Some(pending))
+}
+
+fn write_browser_pending_transaction_broadcast(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+    pending: &BrowserPendingTransactionBroadcast,
+) -> Result<(), (StatusCode, String)> {
+    let (uri, path) =
+        browser_pending_transaction_broadcast_path(state, context, &pending.request_id)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to create Browser pending broadcast storage: {err}"),
+            )
+        })?;
+    }
+    let localhost_root = crate::auth::principal_localhost_root(&context.principal_id);
+    let bytes = serde_json::to_vec_pretty(pending).map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to encode Browser pending transaction broadcast: {err}"),
+        )
+    })?;
+    crate::auth::write_principal_root_object(
+        &state.data_dir,
+        &context.principal_id,
+        &localhost_root,
+        &uri,
+        &path,
+        &bytes,
+    )
+    .map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to save Browser pending transaction broadcast: {err}"),
+        )
+    })
+}
+
+fn remove_browser_pending_transaction_broadcast(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+    request_id: &str,
+) {
+    let Ok((_uri, path)) = browser_pending_transaction_broadcast_path(state, context, request_id)
+    else {
+        return;
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "failed to remove Browser pending transaction broadcast"
+        ),
+    }
+}
+
+async fn record_browser_transaction_hash(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+    request_id: &str,
+    transaction_hash: &str,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    auth_gateway::wallet_provider_data(
+        state,
+        serde_json::json!({
+            "op": "record_transaction_hash",
+            "principal_id": context.principal_id,
+            "request_id": request_id,
+            "transaction_hash": transaction_hash,
+        }),
+    )
+    .await
+    .map_err(|err| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "chain broadcast succeeded but wallet-provider could not record transaction hash {transaction_hash}; retry Browser broadcast to record without rebroadcasting: {err}"
+            ),
+        )
+    })
 }
 
 async fn browser_wallet_broadcast_transaction(
@@ -848,11 +1047,40 @@ async fn browser_wallet_broadcast_transaction(
         .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty())
     {
+        remove_browser_pending_transaction_broadcast(state, context, request_id);
         return Ok(serde_json::json!({
             "schema": "elastos.browser.transaction-broadcast/v1",
             "request_id": request_id,
             "transaction_hash": transaction_hash,
             "already_recorded": true,
+        }));
+    }
+    if let Some(pending) = read_browser_pending_transaction_broadcast(state, context, request_id)? {
+        if let Some(status_chain_namespace) = status
+            .get("signed_result")
+            .and_then(|value| value.get("chain_namespace"))
+            .and_then(|value| value.as_str())
+        {
+            if status_chain_namespace != pending.chain_namespace {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "Browser pending transaction broadcast does not match approval chain"
+                        .to_string(),
+                ));
+            }
+        }
+        let recorded =
+            record_browser_transaction_hash(state, context, request_id, &pending.transaction_hash)
+                .await?;
+        remove_browser_pending_transaction_broadcast(state, context, request_id);
+        return Ok(serde_json::json!({
+            "schema": "elastos.browser.transaction-broadcast/v1",
+            "request_id": request_id,
+            "transaction_hash": pending.transaction_hash,
+            "recorded": true,
+            "recovered_pending_broadcast": true,
+            "receipt": pending.receipt,
+            "approval_request": recorded.get("approval_request").cloned(),
         }));
     }
     let signed_transaction = status
@@ -910,22 +1138,26 @@ async fn browser_wallet_broadcast_transaction(
                 "chain provider broadcast receipt is missing transaction hash".to_string(),
             )
         })?;
-    let recorded = auth_gateway::wallet_provider_data(
-        state,
-        serde_json::json!({
-            "op": "record_transaction_hash",
-            "principal_id": context.principal_id,
-            "request_id": request_id,
-            "transaction_hash": transaction_hash,
-        }),
-    )
-    .await
-    .is_ok();
+    let pending = BrowserPendingTransactionBroadcast {
+        schema: BROWSER_PENDING_TRANSACTION_BROADCAST_SCHEMA.to_string(),
+        principal_id: context.principal_id.clone(),
+        request_id: request_id.to_string(),
+        chain_namespace: chain_namespace.to_string(),
+        network: network.to_string(),
+        transaction_hash: transaction_hash.to_string(),
+        receipt: receipt.clone(),
+        created_at: crate::auth::now_ts(),
+    };
+    write_browser_pending_transaction_broadcast(state, context, &pending)?;
+    let recorded =
+        record_browser_transaction_hash(state, context, request_id, transaction_hash).await?;
+    remove_browser_pending_transaction_broadcast(state, context, request_id);
     Ok(serde_json::json!({
         "schema": "elastos.browser.transaction-broadcast/v1",
         "request_id": request_id,
         "transaction_hash": transaction_hash,
-        "recorded": recorded,
+        "recorded": true,
         "receipt": receipt,
+        "approval_request": recorded.get("approval_request").cloned(),
     }))
 }

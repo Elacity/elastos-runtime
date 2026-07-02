@@ -3,7 +3,7 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { templateManualChecksForSchema } from "./browser-manual-ux-checks.mjs";
-import { sha256File, validateManualUxReport } from "./browser-manual-ux-validation.mjs";
+import { MACHINE_ARTIFACT_SCHEMAS, sha256File, validateManualUxReport } from "./browser-manual-ux-validation.mjs";
 
 function usage() {
   console.error(`Usage:
@@ -11,9 +11,9 @@ function usage() {
   node scripts/browser-manual-ux-report.mjs --template --machine-artifact /path/to/accepted-proof.json
   node scripts/browser-manual-ux-report.mjs --input /path/to/manual-ux.json
 
-Creates or validates the manual UX evidence consumed by
-scripts/browser-objective-audit.mjs. This is not a test substitute; it records
-the human review gate after a real hosted or native browser provider is tested.
+Creates or validates the manual UX evidence consumed by Browser completion
+gates. This is not a test substitute; it records the human review gate after a
+real hosted provider, native provider, or Mac Browser VM proof is tested.
 `);
 }
 
@@ -67,21 +67,20 @@ function machineArtifactReference(file) {
     };
   }
   const artifact = JSON.parse(fs.readFileSync(file, "utf8"));
-  if (
-    ![
-      "elastos.browser.hosted-provider-bakeoff/v1",
-      "elastos.browser.native-target-preflight/v1",
-    ].includes(artifact.schema)
-  ) {
-    throw new Error("--machine-artifact must be an accepted hosted bake-off or native preflight artifact");
+  if (!MACHINE_ARTIFACT_SCHEMAS.includes(artifact.schema)) {
+    throw new Error("--machine-artifact must be an accepted hosted bake-off, native preflight, or Mac VM proof artifact");
   }
   const provider =
     artifact.schema === "elastos.browser.hosted-provider-bakeoff/v1"
       ? String(artifact.candidate || artifact.candidate_gate?.result?.display_backend || "")
+      : artifact.schema === "elastos.browser.mac-vm-proof/v1"
+        ? "mac-vm"
       : String(artifact.browser_program || "");
   const target =
     artifact.schema === "elastos.browser.hosted-provider-bakeoff/v1"
       ? String(artifact.youtube_stress?.result?.display_backend || artifact.candidate_gate?.result?.display_backend || artifact.candidate || "")
+      : artifact.schema === "elastos.browser.mac-vm-proof/v1"
+        ? String(artifact.target || artifact.home?.url || "")
       : String(artifact.out_dir || artifact.browser_program || "");
   return {
     machineArtifact: {
@@ -105,10 +104,13 @@ function template(reference) {
     machine_artifact: reference.machineArtifact,
     checks: Object.fromEntries(templateManualChecksForSchema(reference.machineArtifact.schema).map((name) => [name, false])),
     evidence: Object.fromEntries(templateManualChecksForSchema(reference.machineArtifact.schema).map((name) => [name, ""])),
+    review_artifacts: [],
     notes: [
-      "Set ok=true only after every check is true on a real hosted or native Browser provider.",
+      "Set ok=true only after every check is true on a real hosted, native, or Mac VM Browser provider.",
       "For hosted WebRTC providers, fill evidence.display_session_audio_advertised, evidence.audio_unlock_gesture, evidence.remote_audio_unmuted_status, and evidence.received_audio_evidence separately from YouTube audible playback.",
-      "machine_artifact.sha256 must be the SHA-256 of the accepted hosted bake-off or native preflight JSON you reviewed.",
+      "For Mac VM acceptance, add at least one hash-bound review_artifacts entry with kind=screen_recording and redacted=true for the reviewed Mac VM pass.",
+      "machine_artifact.sha256 must be the SHA-256 of the accepted hosted bake-off, native preflight, or Mac VM proof JSON you reviewed.",
+      "reviewed_at must be at or after machine_artifact.generated_at when the machine artifact records a generation timestamp.",
       "Do not use this file to bypass machine gates.",
     ],
   };

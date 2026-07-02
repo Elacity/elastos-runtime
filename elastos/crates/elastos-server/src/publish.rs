@@ -8,18 +8,22 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DEFAULT_PUBLISH_CAPSULES: &[&str] = &[
+const HOME_PUBLISH_CAPSULES: &[&str] = &[
     "shell",
     "localhost-provider",
     "did-provider",
+    "chain-provider",
     "net-provider",
     "exit-provider",
     "browser-engine-adapter",
     "webspace-provider",
+    "wallet-provider",
     "object-provider",
+    "content-block-graph-provider",
     "home-cli",
     "home",
     "system",
+    "services",
     "wallet-metamask",
     "wallet-unisat",
     "wallet-walletconnect",
@@ -28,26 +32,35 @@ const DEFAULT_PUBLISH_CAPSULES: &[&str] = &[
     "documents",
     "library",
     "marketplace",
+    "archive-manager",
     "inbox",
+];
+const DEFAULT_PUBLISH_CAPSULES: &[&str] = HOME_PUBLISH_CAPSULES;
+const DEMO_PUBLISH_CAPSULES: &[&str] = &[
     "chat",
     "chat-wasm",
     "gba-emulator",
     "gba-ucity",
     "chat-room",
+    "ipfs-provider",
     "tunnel-provider",
 ];
 const REQUIRED_SUPPORTED_PUBLISH_CAPSULES: &[&str] = &[
     "shell",
     "localhost-provider",
     "did-provider",
+    "chain-provider",
     "net-provider",
     "exit-provider",
     "browser-engine-adapter",
     "webspace-provider",
+    "wallet-provider",
     "object-provider",
+    "content-block-graph-provider",
     "home-cli",
     "home",
     "system",
+    "services",
     "wallet-metamask",
     "wallet-unisat",
     "wallet-walletconnect",
@@ -56,6 +69,7 @@ const REQUIRED_SUPPORTED_PUBLISH_CAPSULES: &[&str] = &[
     "documents",
     "library",
     "marketplace",
+    "archive-manager",
     "inbox",
 ];
 const ALLOWED_RELEASE_CHANNELS: &[&str] = &["stable", "canary", "jetson-test"];
@@ -707,28 +721,37 @@ fn discover_available_capsules(workspace_root: &Path) -> anyhow::Result<Vec<Stri
 
 fn publish_profile_capsules(profile: &str, available: &[String]) -> anyhow::Result<Vec<String>> {
     let mut selected = match profile {
-        "demo" => DEFAULT_PUBLISH_CAPSULES
+        "home" => DEFAULT_PUBLISH_CAPSULES
             .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>(),
+        "demo" => HOME_PUBLISH_CAPSULES
+            .iter()
+            .chain(DEMO_PUBLISH_CAPSULES.iter())
             .map(|name| name.to_string())
             .collect::<Vec<_>>(),
         "providers" => vec![
             "availability-provider".to_string(),
             "chain-provider".to_string(),
+            "content-block-graph-provider".to_string(),
             "decrypt-provider".to_string(),
             "did-provider".to_string(),
             "drm-provider".to_string(),
+            "exit-provider".to_string(),
             "ipfs-provider".to_string(),
             "key-provider".to_string(),
+            "net-provider".to_string(),
             "object-provider".to_string(),
             "localhost-provider".to_string(),
             "rights-provider".to_string(),
             "tunnel-provider".to_string(),
             "wallet-provider".to_string(),
+            "webspace-provider".to_string(),
         ],
         "full" => available.to_vec(),
         other => {
             anyhow::bail!(
-                "Unknown publish profile '{}'. Available profiles: demo, providers, full",
+                "Unknown publish profile '{}'. Available profiles: home, demo, providers, full",
                 other
             );
         }
@@ -1497,7 +1520,7 @@ mod tests {
         discover_available_capsules, load_publish_state, operator_release_notes,
         publish_profile_capsules, release_discovery_topics, save_publish_state, select_capsules,
         source_discovery_uri, validate_publish_inputs, PublishReleaseOptions, PublishState,
-        ReleaseLedgerEntry, ReleaseLedgerPlatform, DEFAULT_PUBLISH_CAPSULES,
+        ReleaseLedgerEntry, ReleaseLedgerPlatform, DEFAULT_PUBLISH_CAPSULES, DEMO_PUBLISH_CAPSULES,
     };
     use elastos_common::{
         CapsuleManifest, CapsuleType, MicroVmConfig, Permissions, RequirementKind, ResourceLimits,
@@ -1543,19 +1566,45 @@ mod tests {
     }
 
     #[test]
-    fn test_select_capsules_defaults_to_public_publish_set() {
+    fn test_select_capsules_defaults_to_home_publish_set() {
         let entries = DEFAULT_PUBLISH_CAPSULES
             .iter()
             .map(|name| (*name, &[][..]))
             .collect::<Vec<(&str, &[&str])>>();
         let manifests = test_manifests(&entries);
-        let selected = select_capsules("demo", &[], &manifests).unwrap();
+        let selected = select_capsules("home", &[], &manifests).unwrap();
         let mut expected = DEFAULT_PUBLISH_CAPSULES
             .iter()
             .map(|name| name.to_string())
             .collect::<Vec<_>>();
         expected.sort();
         assert_eq!(selected, expected);
+        assert!(selected.contains(&"archive-manager".to_string()));
+        assert!(selected.contains(&"services".to_string()));
+        assert!(selected.contains(&"content-block-graph-provider".to_string()));
+        assert!(selected.contains(&"chain-provider".to_string()));
+        assert!(selected.contains(&"wallet-provider".to_string()));
+        assert!(!selected.contains(&"chat-room".to_string()));
+        assert!(!selected.contains(&"gba-emulator".to_string()));
+    }
+
+    #[test]
+    fn test_publish_profile_demo_extends_home_with_demo_capsules() {
+        let mut entries = DEFAULT_PUBLISH_CAPSULES
+            .iter()
+            .chain(DEMO_PUBLISH_CAPSULES.iter())
+            .map(|name| (*name, &[][..]))
+            .collect::<Vec<(&str, &[&str])>>();
+        entries.sort_by_key(|(name, _)| *name);
+        entries.dedup_by_key(|(name, _)| *name);
+        let manifests = test_manifests(&entries);
+        let selected = select_capsules("demo", &[], &manifests).unwrap();
+
+        assert!(selected.contains(&"services".to_string()));
+        assert!(selected.contains(&"content-block-graph-provider".to_string()));
+        assert!(selected.contains(&"chat-room".to_string()));
+        assert!(selected.contains(&"gba-emulator".to_string()));
+        assert!(selected.contains(&"ipfs-provider".to_string()));
     }
 
     #[test]
@@ -1617,8 +1666,12 @@ mod tests {
         let selected = publish_profile_capsules("providers", &[]).unwrap();
 
         assert!(selected.contains(&"chain-provider".to_string()));
+        assert!(selected.contains(&"content-block-graph-provider".to_string()));
+        assert!(selected.contains(&"net-provider".to_string()));
+        assert!(selected.contains(&"exit-provider".to_string()));
         assert!(selected.contains(&"wallet-provider".to_string()));
         assert!(selected.contains(&"object-provider".to_string()));
+        assert!(selected.contains(&"webspace-provider".to_string()));
         assert!(selected.contains(&"drm-provider".to_string()));
         assert!(selected.contains(&"rights-provider".to_string()));
         assert!(selected.contains(&"key-provider".to_string()));

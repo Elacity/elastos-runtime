@@ -20,6 +20,7 @@ cd "$repo_root"
 
 smoke_url="${BROWSER_SMOKE_URL:-https://example.com/}"
 smoke_allowed_hosts="${BROWSER_SMOKE_ALLOWED_HOSTS:-}"
+smoke_principal_id="${BROWSER_SMOKE_PRINCIPAL_ID:-person:local:browser-runtime-proxy-smoke}"
 smoke_host="$(SMOKE_URL="$smoke_url" node - <<'NODE'
 const value = process.env.SMOKE_URL;
 const parsed = new URL(value);
@@ -95,14 +96,16 @@ console.log(JSON.stringify({
 }));
 NODE
 
-launch_request="$(node - <<'NODE'
+launch_request="$(BROWSER_SMOKE_PRINCIPAL_ID="$smoke_principal_id" node - <<'NODE'
 const request = {
   schema: "elastos.browser.engine.launch-request/v1",
   adapter: "playwright-smoke",
   engine: "chromium",
   stream_id: "stream:browser-runtime-proxy-smoke",
+  principal_id: process.env.BROWSER_SMOKE_PRINCIPAL_ID,
   url: process.env.BROWSER_SMOKE_URL || "https://example.com/",
   display_mode: "webrtc_remote_display",
+  guarantee_level: "diagnostic",
   network_mode: "runtime_net_only",
   direct_network: false,
   wallet_injection: false,
@@ -119,18 +122,35 @@ result_json="$(ELASTOS_BROWSER_PLAYWRIGHT_ENGINE_CONFIG="$(cat "$engine_config")
   ELASTOS_BROWSER_ENGINE_REQUEST="$launch_request" \
   node elastos/tools/browser-playwright-engine/src/supervisor.mjs)"
 
-RESULT_JSON="$result_json" CONTROL_SOCKET="$control_socket" BROWSER_SMOKE_EXPECTED_URL="$smoke_expected_url" BROWSER_SMOKE_REQUIRE_MEDIA="${BROWSER_SMOKE_REQUIRE_MEDIA:-0}" node - <<'NODE'
+RESULT_JSON="$result_json" CONTROL_SOCKET="$control_socket" LOCAL_EXIT_ERR="$tmp_dir/local-exit.err" BROWSER_SMOKE_EXPECTED_URL="$smoke_expected_url" BROWSER_SMOKE_PRINCIPAL_ID="$smoke_principal_id" BROWSER_SMOKE_REQUIRE_MEDIA="${BROWSER_SMOKE_REQUIRE_MEDIA:-0}" node - <<'NODE'
+const fs = require("node:fs");
 const http = require("node:http");
 
 const result = JSON.parse(process.env.RESULT_JSON);
 const controlSocket = process.env.CONTROL_SOCKET;
+const localExitErr = process.env.LOCAL_EXIT_ERR;
 const expectedUrl = new URL(process.env.BROWSER_SMOKE_EXPECTED_URL).toString();
+const expectedPrincipalId = process.env.BROWSER_SMOKE_PRINCIPAL_ID;
 const requireMedia = process.env.BROWSER_SMOKE_REQUIRE_MEDIA === "1";
 
 function assert(condition, message) {
   if (!condition) {
     throw new Error(message);
   }
+}
+
+function localExitRelayOpenLogs() {
+  return fs.readFileSync(localExitErr, "utf8")
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter((entry) => entry?.schema === "elastos.browser.local-exit.relay-open/v1");
 }
 
 function control(path) {
@@ -276,6 +296,10 @@ async function assertMediaPlayback(pageId) {
   assert(typeof page.can_go_back === "boolean", "page status must expose engine back-navigation state");
   assert(typeof page.can_go_forward === "boolean", "page status must expose engine forward-navigation state");
 
+  const relayOpenLogs = localExitRelayOpenLogs();
+  assert(relayOpenLogs.some((entry) => entry.principal_id === expectedPrincipalId), "local Exit relay-open did not preserve the launch principal_id");
+  assert(relayOpenLogs.every((entry) => entry.direct_network === false), "local Exit relay-open log must stay runtime_net_only");
+
   const reload = await controlPost(`/pages/${encodeURIComponent(result.page_id)}/input`, {
     schema: "elastos.browser.input-event/v1",
     event: { type: "browser_command", command: "reload" },
@@ -294,6 +318,7 @@ async function assertMediaPlayback(pageId) {
     display_backend: page.display_backend,
     audio: result.display_session.audio,
     runtime_proxy: status.runtime_proxy.mode,
+    principal_id: expectedPrincipalId,
     media
   }));
 

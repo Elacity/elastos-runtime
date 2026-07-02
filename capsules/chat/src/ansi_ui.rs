@@ -178,7 +178,12 @@ fn format_message_lines(msg: &Message, width: usize) -> Vec<String> {
             None => ".",
         };
         let _color_idx = nick_color(&msg.sender_nick);
-        format!("[{}] {} <{}> ", format_time(display_ts), badge, msg.sender_nick)
+        format!(
+            "[{}] {} <{}> ",
+            format_time(display_ts),
+            badge,
+            msg.sender_nick
+        )
     };
 
     wrap_prefixed(&prefix, &msg.content, width)

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Chat Room</title>
+  <title>Chat</title>
   <link rel="stylesheet" href="./style.css" />
 </head>
 <body data-room-session-active="false">
@@ -24,8 +24,8 @@
             <span id="status-detail" class="detail"></span>
           </div>
           <div class="browser-access-copy">
-            <h2>Join Chat Room</h2>
-            <p class="copy">Enter your name to ask the room to let this browser in.</p>
+            <h2>Join Conversation</h2>
+            <p class="copy">Enter your name to ask to join this conversation.</p>
           </div>
           <form id="browser-access-form" class="stack browser-access-form">
             <label>
@@ -39,6 +39,16 @@
           </form>
         </section>
         <p id="error-text" class="error" hidden></p>
+        <section id="conversation-join-section" class="conversation-join" hidden>
+          <div class="conversation-join-copy">
+            <h2>Join a Conversation</h2>
+            <p>Paste a join code or link from another ElastOS user to connect this device.</p>
+          </div>
+          <form id="conversation-join-form" class="conversation-join-form">
+            <input id="conversation-join-input" type="text" autocomplete="off" placeholder="Paste invite code or link" aria-label="Invite code or link" />
+            <button id="conversation-join-submit" type="submit">Join</button>
+          </form>
+        </section>
         <ol id="message-list" class="messages"></ol>
         <div class="emoji-strip" aria-label="Quick emoji">
           <button id="emoji-wave" type="button" class="emoji-chip" aria-label="Wave" disabled>👋</button>
@@ -58,7 +68,7 @@
       </section>
       <section class="presence-card">
         <div class="roster-head">
-          <h3 id="participant-count" class="roster-title">Opening room</h3>
+          <h3 id="participant-count" class="roster-title">Opening conversation</h3>
           <div class="roster-actions">
             <button id="room-access-toggle" type="button" class="secondary room-access-toggle" aria-label="Access settings" title="Access settings" hidden>⚙</button>
             <button id="participant-close" type="button" class="secondary roster-close" hidden>Close</button>
@@ -76,8 +86,19 @@
             <h3 class="room-access-title">Access</h3>
           </div>
           <div id="room-policy-list" class="room-policy-list"></div>
-          <form id="node-invite-form" class="node-invite-form">
-            <input id="node-did-input" type="text" autocomplete="off" placeholder="Runtime DID" aria-label="Runtime DID" />
+          <section class="join-link-card">
+            <div class="join-link-copy">
+              <h4>Invite another device</h4>
+              <p>Create a short-lived link that lets another ElastOS profile join this conversation.</p>
+            </div>
+            <button id="conversation-invite-create" type="button">Create join link</button>
+            <div id="conversation-invite-output-row" class="join-link-output" hidden>
+              <input id="conversation-invite-output" type="text" readonly aria-label="Conversation join link" />
+              <button id="conversation-invite-copy" type="button" class="secondary">Copy</button>
+            </div>
+          </section>
+          <form id="node-invite-form" class="node-invite-form" hidden>
+            <input id="node-did-input" type="text" autocomplete="off" placeholder="Advanced DID invite" aria-label="Advanced DID invite" />
             <button id="node-invite-submit" type="submit">Add</button>
           </form>
           <ol id="node-list" class="node-list"></ol>
@@ -86,8 +107,8 @@
     </section>
   </main>
   <script type="module">
-    import init from "./chat_room_ui.js?v=chat-room-ui-20260523a";
-    init(new URL("./chat_room_ui_bg.wasm?v=chat-room-ui-20260523a", import.meta.url));
+    import init from "./chat_room_ui.js?v=chat-room-ui-20260612c";
+    init(new URL("./chat_room_ui_bg.wasm?v=chat-room-ui-20260612c", import.meta.url));
   </script>
 </body>
 </html>

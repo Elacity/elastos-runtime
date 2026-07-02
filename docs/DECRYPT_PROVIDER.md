@@ -40,6 +40,38 @@ Unsupported operations fail closed and do not create broad provider wildcards.
 The current provider accepts only documented protected-content actions and
 outputs: `rendered`, `stream`, and `working_copy`.
 
+## Key Material Rail
+
+`ReleaseReceiptV1` is an authorization receipt, not key material. It proves that
+the key-provider accepted the rights-bound release request for the same
+principal/session/object/action, but it does not contain a CEK.
+
+When the real decrypt backend is wired, the recommended normal path is:
+
+- `decrypt-provider` creates a per-session one-time public key for the decrypt
+  sandbox.
+- `key-provider` or the dKMS release backend seals decrypt material to that
+  public key.
+- `DecryptSessionRequestV1` is extended with a sealed decrypt material envelope,
+  bound to the same principal/session/object/action and release receipt.
+- The decrypt sandbox unwraps inside the boundary, decrypts/renders, zeroizes
+  the live CEK, and returns only scoped output.
+- `decrypt-provider` must not be granted outbound key-fetch authority as the
+  normal path.
+
+This preserves the provider-to-provider chain without letting the component that
+briefly sees the live CEK call out to other providers or raw backends.
+
+The alternatives are intentionally narrower:
+
+- outbound key-fetch from `decrypt-provider` is only acceptable for an explicit
+  adapter with a scoped, audited capability, not as the default rail.
+- a combined key/decrypt provider is acceptable for tests but not for the target
+  trust boundary because it merges dKMS authority with decrypt/render authority.
+- Lit/Chipotle-style CEK envelopes are compatibility inputs only. The decrypt
+  contract must validate a backend-neutral sealed material envelope so an
+  ElastOS-native dKMS backend can replace vendor key release.
+
 ## Current State
 
 The provider is intentionally not configured for real decrypt/render work yet.
@@ -49,6 +81,7 @@ It only proves the Runtime/provider boundary:
 - object IDs are treated as opaque identifiers
 - raw CEK and raw plaintext paths are absent
 - `open_session` and `render` return `not_configured`
+- the sealed decrypt material envelope is not implemented yet
 
 ## Verification
 

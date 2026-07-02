@@ -26,6 +26,65 @@ Rules:
 - Installed arm64 host:
   - installed target-machine proof
 
+## 0.5.0 Handoff Order
+
+Use this order for the reconciliation branch so source proof, public install
+proof, and target-device proof do not get mixed together:
+
+```bash
+# 1. Current branch, source/review proof
+git diff --check
+node scripts/home-entropy-check.mjs
+node scripts/browser-entropy-check.mjs
+bash scripts/check-wci-alignment.sh
+
+# 2. Current branch, installed-style command surface
+just candidate-command-audit
+
+# 3. Current 0.5.0 candidate through the canonical public installer/source path.
+# Requires a staged or published 0.5.0-compatible manifest with the current
+# home profile and checksummed artifacts.
+ELASTOS_PUBLISHER_GATEWAY=<candidate-url> \
+ELASTOS_BIN_OVERRIDE="$PWD/elastos/target/release/elastos" \
+  bash scripts/public-install-identity-smoke.sh
+ELASTOS_PUBLISHER_GATEWAY=<candidate-url> \
+ELASTOS_BIN_OVERRIDE="$PWD/elastos/target/release/elastos" \
+  bash scripts/public-install-home-frontdoor-smoke.sh
+
+# Source/local Carrier setup proof before a candidate gateway exists
+scripts/local-carrier-setup-smoke.sh
+
+# Final public install path after publishing 0.5.0
+bash scripts/public-install-identity-smoke.sh
+bash scripts/public-install-home-frontdoor-smoke.sh
+
+# Optional stricter publisher relay check
+ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1 bash scripts/public-install-home-frontdoor-smoke.sh
+
+# 4. Candidate gateway after staging a 0.5.0 artifact set
+ELASTOS_PUBLISHER_GATEWAY=<candidate-url> bash scripts/public-install-home-frontdoor-smoke.sh
+
+# 5. Target closeout while a Home-authorized Browser page is open
+scripts/jetson-browser-runtime-audit.mjs \
+  --host <target-host> \
+  --user <target-user> \
+  --data-dir <target-elastos-data-dir> \
+  --source-dir <target-source-checkout> \
+  --require-parity \
+  --min-active-crosvm-seconds 3600
+```
+
+Then do the manual installed-device pass on each target host: `elastos setup`,
+`elastos`, System, Documents, Library, Inbox, People, Services, at least one
+app launch/close, and return Home cleanly.
+Do not count source-home or seed-node proof as installed-host acceptance.
+
+Browser product readiness is a separate acceptance gate. If it is in scope,
+`scripts/browser-objective-audit.mjs` must pass with accepted hosted/native
+media proof plus hash-bound manual UX evidence. If it remains red, release
+notes must describe Browser as reconciled architecture/proof path, not a
+complete product Browser.
+
 ## Release-Critical Stories
 
 | ID | Story | Automatic proof | Seed node manual | Installed x86_64 manual | Installed arm64 manual |
@@ -43,7 +102,7 @@ Rules:
 | RS-10 | Updates surface is honest | `scripts/public-install-operator-smoke.sh`; after publish, rerun it with `ELASTOS_PUBLISHER_GATEWAY=<url>` | `elastos update --check`, verify source/runtime state | CLI update status is truthful; compare any surfaced Home/System update action only if visible | same as installed x86_64 |
 | RS-11 | Sovereign room sync works | exact local cross-runtime room gateway tests | seed room, pair both runtimes, verify join/leave before and after chat, then exchange a room message and one attachment | same with one other installed runtime | same as installed x86_64 |
 | RS-12 | Operator remote control works | `scripts/public-install-operator-smoke.sh` and exact local operator two-node test | allow the controller DID on the target, then run remote `node status`, `node room`, and `node update --check` | act as controller or target | same as installed x86_64 |
-| RS-13 | Protected-content provider boundary is testable | `scripts/protected-content-provider-contract-smoke.sh` | verify DRM/rights/key/decrypt providers expose blocked authority, reject invalid requests, and fail closed until backends exist | n/a until protected-content UI is shipped | n/a until protected-content UI is shipped |
+| RS-13 | Protected-content provider boundary is testable | `scripts/protected-content-provider-contract-smoke.sh` | verify DRM/rights/key/decrypt providers expose blocked authority, reject invalid requests, and fail closed until backends exist | Library protected-content rail is visible only as disabled/read-only readiness/status; encrypted-recipient sharing stays disabled | same as installed x86_64 |
 
 ## Story Details
 
@@ -357,7 +416,8 @@ Manual on seed node:
 Pass when:
 - DRM, rights, key, and decrypt provider contract checks pass
 - raw authority remains blocked from normal capsules
-- no protected-content UI is shipped ahead of provider/capability proof
+- any visible Library protected-content rail stays disabled/read-only until
+  provider/capability proof covers production encrypted-recipient sharing
 
 ## Minimum Publish Bar
 

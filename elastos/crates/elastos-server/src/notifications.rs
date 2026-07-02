@@ -165,9 +165,9 @@ pub fn sync_room_notifications(data_dir: &Path, summary: &RoomSummary) -> anyhow
         let id = room_access_request_notification_id(&request.request_id);
         let expires_at = Some(request.requested_at + ROOM_ACCESS_REQUEST_TTL_SECS);
         if let Some(existing) = store.entries.iter_mut().find(|entry| entry.id == id) {
-            existing.title = format!("{} requests room access", request.display_name);
+            existing.title = format!("{} wants to join Chat", request.display_name);
             existing.body = format!(
-                "{} on {} requests browser access to {}.",
+                "{} on {} wants to join {}.",
                 request.display_name, request.device_label, room_title
             );
             existing.action_ref = Some(NotificationActionRef {
@@ -184,9 +184,9 @@ pub fn sync_room_notifications(data_dir: &Path, summary: &RoomSummary) -> anyhow
             id: id.clone(),
             source_app: summary.room_slug.clone(),
             kind: ROOM_ACCESS_REQUEST_KIND.to_string(),
-            title: format!("{} requests room access", request.display_name),
+            title: format!("{} wants to join Chat", request.display_name),
             body: format!(
-                "{} on {} requests browser access to {}.",
+                "{} on {} wants to join {}.",
                 request.display_name, request.device_label, room_title
             ),
             action_ref: Some(NotificationActionRef {
@@ -207,9 +207,9 @@ pub fn sync_room_notifications(data_dir: &Path, summary: &RoomSummary) -> anyhow
                     id: format!("appeared:{id}"),
                     notification_id: id.clone(),
                     source_app: summary.room_slug.clone(),
-                    title: format!("{} requests room access", request.display_name),
+                    title: format!("{} wants to join Chat", request.display_name),
                     body: format!(
-                        "{} on {} requests browser access to {}.",
+                        "{} on {} wants to join {}.",
                         request.display_name, request.device_label, room_title
                     ),
                     action_ref: Some(NotificationActionRef {

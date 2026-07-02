@@ -46,6 +46,8 @@ platform_alias() {
     case "$1" in
         linux-amd64) echo "x86_64-linux" ;;
         linux-arm64) echo "aarch64-linux" ;;
+        macos-arm64) echo "darwin-arm64" ;;
+        darwin-arm64) echo "macos-arm64" ;;
         x86_64-linux) echo "linux-amd64" ;;
         aarch64-linux) echo "linux-arm64" ;;
         *) echo "" ;;
@@ -69,7 +71,8 @@ checksum_for_file() {
 verify_component() {
     local name="$1"
     local explicit="$2"
-    local info install_path checksum binary actual
+    local info install_path checksum extract_path strategy source binary actual
+    VERIFY_COMPONENT_VERDICT="skipped"
 
     info="$(
         jq -cer \
@@ -82,8 +85,11 @@ verify_component() {
                   ($component.platforms[$platform] // $component.platforms[$alias] // $component.platforms["*"] // {}) as $platform_info
                   | {
                       install_path: ($platform_info.install_path // $component.install_path // ""),
-                      checksum: ($platform_info.checksum // "")
-                    }
+                      checksum: ($platform_info.checksum // ""),
+                      extract_path: ($platform_info.extract_path // ""),
+                      strategy: ($platform_info.strategy // ""),
+                      source: ($platform_info.source // "")
+                  }
                 end
             ' "$COMPONENTS_JSON" 2>/dev/null || true
     )"
@@ -95,6 +101,9 @@ verify_component() {
 
     install_path="$(jq -r '.install_path' <<<"$info")"
     checksum="$(jq -r '.checksum' <<<"$info")"
+    extract_path="$(jq -r '.extract_path' <<<"$info")"
+    strategy="$(jq -r '.strategy' <<<"$info")"
+    source="$(jq -r '.source' <<<"$info")"
 
     if [[ -z "$install_path" ]]; then
         if [[ "$explicit" == "1" ]]; then
@@ -114,12 +123,24 @@ verify_component() {
     fi
 
     if [[ -z "$checksum" ]]; then
+        if [[ "$strategy" == "local-copy" ]]; then
+            echo "[installed-provider-verify] skip: $name uses local-copy without manifest checksum (${source:-unknown source})"
+            return 0
+        fi
         echo "[installed-provider-verify] missing checksum for installed $name in $COMPONENTS_JSON" >&2
         return 1
     fi
 
+    if [[ -n "$extract_path" ]]; then
+        echo "[installed-provider-verify] skip: $name uses archive checksum before extraction ($checksum)"
+        return 0
+    fi
+
     actual="$(checksum_for_file "$binary" "$checksum")"
-    if [[ "${actual,,}" != "${checksum,,}" ]]; then
+    local actual_lower checksum_lower
+    actual_lower="$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')"
+    checksum_lower="$(printf '%s' "$checksum" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$actual_lower" != "$checksum_lower" ]]; then
         echo "[installed-provider-verify] checksum mismatch for $name" >&2
         echo "  binary:   $binary" >&2
         echo "  expected: $checksum" >&2
@@ -128,6 +149,7 @@ verify_component() {
     fi
 
     echo "[installed-provider-verify] ok: $name ($checksum)"
+    VERIFY_COMPONENT_VERDICT="verified"
 }
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -155,9 +177,8 @@ if [[ "$#" -gt 0 ]]; then
         verify_component "$component" "1"
     done
 else
-    mapfile -t components < <(jq -r '.external | keys[]' "$COMPONENTS_JSON")
     verified=0
-    for component in "${components[@]}"; do
+    while IFS= read -r component; do
         if verify_component "$component" "0"; then
             binary_path="$(
                 jq -r \
@@ -169,12 +190,12 @@ else
                      | ($platform_info.install_path // $component.install_path // "")' \
                     "$COMPONENTS_JSON"
             )"
-            if [[ -n "$binary_path" && -f "$DATA_DIR/$binary_path" ]]; then
+            if [[ "$VERIFY_COMPONENT_VERDICT" == "verified" && -n "$binary_path" && -f "$DATA_DIR/$binary_path" ]]; then
                 verified=$((verified + 1))
             fi
         else
             exit 1
         fi
-    done
+    done < <(jq -r '.external | keys[]' "$COMPONENTS_JSON")
     echo "[installed-provider-verify] verified $verified installed component(s)"
 fi

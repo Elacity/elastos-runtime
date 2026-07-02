@@ -304,7 +304,10 @@ import { createLibraryUploads } from "./uploads.js";
     }));
 
     function isAttachMode() {
-      return state.mode === "attach" && state.returnTarget === "chat-room";
+      return (
+        state.mode === "attach" &&
+        (state.returnTarget === "chat-room" || state.returnTarget === "browser")
+      );
     }
 
     function isArchiveOpenMode() {
@@ -319,9 +322,19 @@ import { createLibraryUploads } from "./uploads.js";
       return isArchiveOpenMode() || isArchiveCreateMode();
     }
 
+    function isPickerActionMode() {
+      return isAttachMode() || isArchivePickerMode();
+    }
+
     function setStatus(text) {
       elements.statusText.textContent = text;
       elements.statusText.classList.toggle("hidden", !text);
+    }
+
+    function attachStatusText() {
+      return state.returnTarget === "browser"
+        ? "Choose an object for Browser."
+        : "Choose an object for Chat Room.";
     }
 
     async function providerApi(op, payload) {
@@ -361,13 +374,19 @@ import { createLibraryUploads } from "./uploads.js";
         setStatus("");
         return;
       }
+      if (isAttachMode()) {
+        setStatus(attachStatusText());
+        return;
+      }
       setStatus(text);
     }
 
     function syncModeChrome() {
-      elements.pickerActionButton.classList.toggle("hidden", !isArchivePickerMode());
+      elements.pickerActionButton.classList.toggle("hidden", !isPickerActionMode());
       if (isAttachMode()) {
-        setStatus("Choose a published object for Chat Room.");
+        elements.pickerActionButton.textContent =
+          state.returnTarget === "browser" ? "Select for Browser" : "Attach to Chat";
+        setStatus(attachStatusText());
         elements.uploadButton.textContent = "Upload";
         return;
       }
@@ -382,6 +401,20 @@ import { createLibraryUploads } from "./uploads.js";
         return;
       }
       setStatus("Ready.");
+    }
+
+    async function completeAttachPicker() {
+      if (!isAttachMode()) return;
+      const selection = selectedObjects();
+      if (selection.length !== 1) {
+        setStatus(
+          state.returnTarget === "browser"
+            ? "Select one Library item for Browser."
+            : "Select one Library item for Chat Room.",
+        );
+        return;
+      }
+      await openObject(selection[0]);
     }
 
     async function completeArchivePicker() {
@@ -800,9 +833,14 @@ import { createLibraryUploads } from "./uploads.js";
           actions.push(menuAction("Open in New Window", () => openTarget("library", { uri: object.uri })));
         }
       } else {
-        actions.push(menuAction("Open", () => openObject(object)));
+        actions.push(menuAction(
+          isAttachMode()
+            ? (state.returnTarget === "browser" ? "Select for Browser" : "Attach to Chat")
+            : "Open",
+          () => openObject(object),
+        ));
         const viewers = viewerOptions(object);
-        if (viewers.length) {
+        if (!isAttachMode() && viewers.length) {
           actions.push(menuAction("Open With", null, {
             children: viewers.map((viewer) => menuAction(viewer.label || viewer.id, () => openWithViewer(object, viewer.id))),
           }));
@@ -1024,7 +1062,10 @@ import { createLibraryUploads } from "./uploads.js";
     }
 
     function bindEvents() {
-      elements.pickerActionButton.addEventListener("click", () => completeArchivePicker().catch(showError));
+      elements.pickerActionButton.addEventListener("click", () => {
+        const action = isAttachMode() ? completeAttachPicker : completeArchivePicker;
+        action().catch(showError);
+      });
       bindLibraryEvents({
         bindDialogEvents,
         clearSelection,

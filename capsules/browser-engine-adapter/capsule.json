@@ -14,13 +14,14 @@
       {
         "resource": "elastos://browser-engine/*",
         "actions": ["read", "write"],
-        "operations": ["status", "launch", "attach_stream", "close_page", "page_status", "screenshot", "frame", "input", "webrtc_signal"]
+        "operations": ["status", "launch", "attach_stream", "close_page", "page_status", "diagnostics", "input", "webrtc_signal"]
       }
     ],
     "audit_events": [
       "browser_engine.status",
       "browser_engine.launch.denied",
       "browser_engine.stream.attach.denied",
+      "browser_engine.page.diagnostics",
       "browser_engine.page.close",
       "browser_engine.webrtc.signal"
     ]

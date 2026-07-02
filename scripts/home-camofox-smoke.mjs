@@ -647,7 +647,8 @@ async function main() {
         title: doc.title || "",
         heading: doc.querySelector("h1")?.textContent?.trim() || "",
         panelLabels: [...doc.querySelectorAll(".system-panel h2")].map((node) => node.textContent?.trim() || ""),
-        fieldLabels: [...doc.querySelectorAll(".system-field dt")].map((node) => node.textContent?.trim() || ""),
+        fieldLabels: [...doc.querySelectorAll(".system-fields dt")].map((node) => node.textContent?.trim() || ""),
+        aboutFieldLabels: [...doc.querySelectorAll('[data-settings="about"] .system-fields dt')].map((node) => node.textContent?.trim() || ""),
         walletControlsRemoved: !doc.querySelector("#wallet-create") && !doc.querySelector("#wallet-approvals"),
         handleLabel: doc.querySelector('label[for="handle-input"]')?.textContent?.trim() || "",
         handleInputDisabled: doc.querySelector('#handle-input')?.disabled ?? null,
@@ -684,7 +685,7 @@ async function main() {
         overlayIsInsideBackgroundField: (() => {
           const preview = doc.querySelector("#background-preview");
           const overlay = doc.querySelector("#background-overlay");
-          return !!preview && !!overlay && preview.closest(".system-field") === overlay.closest(".system-field");
+          return !!preview && !!overlay && preview.closest(".pc2-group-row") === overlay.closest(".pc2-group-row");
         })(),
         backgroundActionsSameRow: (() => {
           const choose = doc.querySelector('label[for="background-input"]')?.getBoundingClientRect();
@@ -695,19 +696,22 @@ async function main() {
       assert(system.ok, "System frame was not reachable", system);
       assert(system.title === "System · ElastOS", "System frame title mismatch", system);
       assert(system.heading === "", "System frame should not duplicate the window title", system);
-      assert(system.panelLabels.includes("Account"), "System frame is missing Account", system);
+      assert(system.panelLabels.includes("Profile"), "System frame is missing Profile", system);
       assert(system.panelLabels.includes("Appearance"), "System frame is missing Appearance", system);
       assert(system.panelLabels.includes("Advanced"), "System frame is missing Advanced", system);
       assert(system.fieldLabels.includes("Device identity"), "System frame is missing the Device identity section", system);
       assert(system.fieldLabels.includes("Version"), "System frame is missing the runtime version", system);
       assert(system.fieldLabels.includes("Documents"), "System frame is missing the storage summary", system);
+      assert(system.aboutFieldLabels.includes("Version"), "System About is missing the runtime version", system);
+      assert(!system.aboutFieldLabels.includes("Documents"), "System About should not include Documents", system);
       assert(system.fieldLabels.includes("Accounts"), "System frame is missing account management", system);
       assert(system.fieldLabels.includes("Recovery"), "System frame is missing Recovery Kit controls", system);
       assert(system.fieldLabels.includes("Guest access"), "System frame is missing guest access control", system);
       assert(!system.fieldLabels.includes("Wallet"), "System frame should not duplicate Wallet controls", system);
       assert(system.walletControlsRemoved, "System frame should not include wallet account or approval controls", system);
       assert(system.fieldLabels.includes("Network status"), "System frame is missing network status diagnostics", system);
-      assert(system.handleLabel === "Name", "System frame name label drifted", system);
+      assert(system.fieldLabels.includes("Display name"), "System frame is missing the display-name field", system);
+      assert(system.handleLabel === "Display name", "System frame display-name label drifted", system);
       assert(system.handleInputDisabled === false, "Home-launched System should allow handle edits", system);
       assert(system.handleSaveDisabled === false, "Home-launched System should allow handle saves", system);
       assert(system.recoveryPasswordPresent, "System frame did not expose Recovery Kit password protection", system);

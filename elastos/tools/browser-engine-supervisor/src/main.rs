@@ -17,6 +17,8 @@ use std::time::Duration;
 
 const REQUEST_ENV: &str = "ELASTOS_BROWSER_ENGINE_REQUEST";
 const CONFIG_ENV: &str = "ELASTOS_BROWSER_ENGINE_SUPERVISOR_CONFIG";
+const DEFAULT_VIEWPORT_WIDTH: u32 = 1280;
+const DEFAULT_VIEWPORT_HEIGHT: u32 = 720;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -177,6 +179,10 @@ fn supervisor_result(
     stream_bridge_pid: Option<u32>,
 ) -> serde_json::Value {
     let surface_id = stable_surface_id(&request.url, &request.stream_id);
+    let viewport = request.viewport.unwrap_or(ViewportRequest {
+        width: DEFAULT_VIEWPORT_WIDTH,
+        height: DEFAULT_VIEWPORT_HEIGHT,
+    });
     json!({
         "schema": "elastos.browser.engine.supervisor-result/v1",
         "page_id": stable_page_id(&request.url, &request.stream_id),
@@ -199,8 +205,16 @@ fn supervisor_result(
             "network_mode": "runtime_net_only",
             "direct_network": false,
             "input": "native_ipc",
+            "width": viewport.width,
+            "height": viewport.height,
             "audio": config.display_capabilities.audio,
             "video": config.display_capabilities.video
+        },
+        "view": {
+            "schema": "elastos.browser.view/v1",
+            "mode": "native_surface",
+            "width": viewport.width,
+            "height": viewport.height
         }
     })
 }
@@ -805,8 +819,14 @@ mod tests {
         assert_eq!(result["display_session"]["mode"], "native_surface");
         assert_eq!(result["display_session"]["input"], "native_ipc");
         assert_eq!(result["display_session"]["direct_network"], false);
+        assert_eq!(result["display_session"]["width"], 1280);
+        assert_eq!(result["display_session"]["height"], 720);
         assert_eq!(result["display_session"]["audio"], true);
         assert_eq!(result["display_session"]["video"], true);
+        assert_eq!(result["view"]["schema"], "elastos.browser.view/v1");
+        assert_eq!(result["view"]["mode"], "native_surface");
+        assert_eq!(result["view"]["width"], 1280);
+        assert_eq!(result["view"]["height"], 720);
         assert_eq!(result["process"]["pid"], 42);
         assert_eq!(result["process"]["stream_bridge_pid"], 7);
     }

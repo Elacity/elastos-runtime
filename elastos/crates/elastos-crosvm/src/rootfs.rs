@@ -184,6 +184,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_data_disk_creation() {
+        if std::process::Command::new("mkfs.ext4")
+            .arg("-V")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping data disk creation test: mkfs.ext4 unavailable");
+            return;
+        }
         let temp = tempdir().unwrap();
         let manager = RootfsManager::new(temp.path().join("cache"));
         manager.init().await.unwrap();

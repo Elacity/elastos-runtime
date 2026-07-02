@@ -70,7 +70,7 @@ pub async fn browser_session_request_status(
     {
         return (
             StatusCode::FORBIDDEN,
-            "browser access request is not bound to this browser",
+            "web guest request is not bound to this browser",
         )
             .into_response();
     }
@@ -106,7 +106,9 @@ fn browser_session_error_response(err: anyhow::Error) -> Response {
         StatusCode::NOT_FOUND
     } else if text.contains("not an active member")
         || text.contains("no active room member DID")
+        || text.contains("not part of this conversation")
         || text.contains("browser access is not allowed")
+        || text.contains("web guest access is not allowed")
     {
         StatusCode::FORBIDDEN
     } else if text.contains("invalid or expired session") {

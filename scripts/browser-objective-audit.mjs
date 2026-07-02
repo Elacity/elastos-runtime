@@ -313,7 +313,7 @@ function promptToArtifactChecklist({ criteria, hostedBakeoff, nativePreflight, m
         "docs/BROWSER_CAPSULE.md",
         "scripts/browser-kasm-control-service.mjs",
       ],
-      "Keep diagnostic_frame debug-only, proof-surface audio rejected, native media false by default, and Kasm URL-only sessions rejected.",
+      "Keep product Browser display WebRTC-only, proof-surface audio rejected, native media false by default, and Kasm URL-only sessions rejected.",
     ),
     checklistItem(
       "planned_and_iterated",

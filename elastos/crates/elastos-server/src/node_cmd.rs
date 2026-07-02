@@ -417,9 +417,9 @@ fn print_peer_summary(prefix: &str, peer: &OperatorPeer) {
 }
 
 fn print_remote_room_summary(peer_did: &str, summary: &RoomSummary) {
-    println!("Remote room");
+    println!("Remote Chat");
     println!("Peer DID:       {}", peer_did);
-    println!("Room:           {}", summary.room_control.title);
+    println!("Chat:           {}", summary.room_control.title);
     println!("Slug:           {}", summary.room_slug);
     println!(
         "Root:           {}",
@@ -428,31 +428,28 @@ fn print_remote_room_summary(peer_did: &str, summary: &RoomSummary) {
     if let Some(role) = summary.local_runtime_role.as_ref() {
         println!("Role:           {}", role_label(role));
     } else {
-        println!("Role:           remote runtime is not a room member");
+        println!("Access:         remote device is not connected to this conversation");
     }
     println!(
-        "Runtime DID:    {}",
+        "ElastOS DID:    {}",
         summary
             .local_runtime_did
             .as_deref()
             .unwrap_or("(local DID unavailable)")
     );
     println!(
-        "Members:        {} total, {} active, {} admin",
+        "People:         {} trusted, {} active, {} manager",
         summary.room_control.member_count,
         summary.room_control.active_member_count,
         summary.room_control.admin_count
     );
     println!(
-        "Participants:   {} in room",
+        "Participants:   {} in Chat",
         summary.active_participants.len()
     );
-    println!(
-        "Pairing:        {} pending request(s)",
-        summary.pending_requests.len()
-    );
+    println!("Join requests:  {} pending", summary.pending_requests.len());
     if let Some(url) = summary.canonical_hosted_guest_url.as_deref() {
-        println!("Hosted URL:     {}", url);
+        println!("Public URL:     {}", url);
     }
     if let Some(url) = summary.ephemeral_hosted_guest_url.as_deref() {
         println!("Quick URL:      {}", url);
@@ -464,11 +461,11 @@ fn print_remote_room_summary(peer_did: &str, summary: &RoomSummary) {
 
 fn print_remote_room_pending(peer_did: &str, summary: &RoomSummary) {
     if summary.pending_requests.is_empty() {
-        println!("No pending room browser requests on {}.", peer_did);
+        println!("No pending Chat web guest requests on {}.", peer_did);
         return;
     }
     println!(
-        "Pending room browser requests on {}: {}",
+        "Pending Chat web guest requests on {}: {}",
         peer_did,
         summary.pending_requests.len()
     );
@@ -487,11 +484,11 @@ fn print_remote_room_approve(
 ) {
     match outcome {
         Some(outcome) => {
-            println!("Approved remote room browser access.");
+            println!("Approved remote Chat web guest request.");
             println!("Peer DID:       {}", peer_did);
             println!("Request:        {}", outcome.request_id);
             println!(
-                "Browser:        {} on {}",
+                "Web guest:      {} on {}",
                 outcome.display_name, outcome.device_label
             );
             println!("Expires:        {}", outcome.expires_at);
@@ -499,11 +496,11 @@ fn print_remote_room_approve(
         None => {
             if let Some(request_id) = requested_id {
                 println!(
-                    "That remote room browser request is no longer pending: {}",
+                    "That remote Chat web guest request is no longer pending: {}",
                     request_id
                 );
             } else {
-                println!("No pending remote room browser requests.");
+                println!("No pending remote Chat web guest requests.");
             }
         }
     }
@@ -516,11 +513,11 @@ fn print_remote_room_deny(
 ) {
     match outcome {
         Some(outcome) => {
-            println!("Denied remote room browser access.");
+            println!("Denied remote Chat web guest request.");
             println!("Peer DID:       {}", peer_did);
             println!("Request:        {}", outcome.request_id);
             println!(
-                "Browser:        {} on {}",
+                "Web guest:      {} on {}",
                 outcome.display_name, outcome.device_label
             );
             println!("Reason:         {}", outcome.reason);
@@ -528,11 +525,11 @@ fn print_remote_room_deny(
         None => {
             if let Some(request_id) = requested_id {
                 println!(
-                    "That remote room browser request is no longer pending: {}",
+                    "That remote Chat web guest request is no longer pending: {}",
                     request_id
                 );
             } else {
-                println!("No pending remote room browser requests.");
+                println!("No pending remote Chat web guest requests.");
             }
         }
     }

@@ -1154,6 +1154,7 @@ const state = {
   sidebarCollapsed: false,
   filterQuery: "",
   pendingConfirmation: null,
+  pendingChatAttachmentId: "",
 };
 
 const elements = {
@@ -1359,6 +1360,69 @@ function baseName(uri) {
   } catch (_error) {
     return name;
   }
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return "0 B";
+  }
+  const units = ["B", "KB", "MB", "GB"];
+  let amount = value;
+  let unitIndex = 0;
+  while (amount >= 1024 && unitIndex < units.length - 1) {
+    amount /= 1024;
+    unitIndex += 1;
+  }
+  return (unitIndex === 0 ? String(amount) : amount.toFixed(amount >= 10 ? 1 : 2)) + " " + units[unitIndex];
+}
+
+function looksLikeTextContent(contentType, buffer) {
+  const lower = String(contentType || "").toLowerCase();
+  if (
+    lower.startsWith("text/") ||
+    lower.includes("json") ||
+    lower.includes("markdown") ||
+    lower.includes("xml") ||
+    lower.includes("javascript")
+  ) {
+    return true;
+  }
+  const bytes = new Uint8Array(buffer);
+  if (bytes.length === 0) {
+    return true;
+  }
+  const sample = bytes.subarray(0, Math.min(bytes.length, 4096));
+  if (sample.includes(0)) {
+    return false;
+  }
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(sample);
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function isTextMimeType(mime) {
+  const lower = String(mime || "").toLowerCase();
+  return lower.startsWith("text/") ||
+    lower.includes("json") ||
+    lower.includes("markdown") ||
+    lower.includes("xml") ||
+    lower.includes("javascript");
+}
+
+function dataUrlToUtf8(dataUrl) {
+  const value = String(dataUrl || "");
+  const match = /^data:([^;,]*)(;base64)?,([\s\S]*)$/i.exec(value);
+  if (!match) {
+    throw new Error("Chat attachment payload is not a data URL.");
+  }
+  if (match[2]) {
+    return base64ToUtf8(match[3] || "");
+  }
+  return decodeURIComponent(match[3] || "");
 }
 
 function isLibraryFileProjection(document) {
@@ -1765,6 +1829,11 @@ async function loadSummary() {
     state.initialDocDid = "";
     return;
   }
+  if (state.current) {
+    renderDocumentsList();
+    renderCurrentDocument();
+    return;
+  }
   startDraftDocument({ focusTitle: true });
 }
 
@@ -1790,6 +1859,75 @@ async function loadLibraryObject(uri) {
   renderDocumentsList();
   renderCurrentDocument();
   setStatus("Opened from Library.");
+}
+
+async function openChatAttachment(payload) {
+  const attachmentId = String(payload && payload.attachmentId ? payload.attachmentId : "").trim();
+  if (attachmentId && state.pendingChatAttachmentId === attachmentId) {
+    return false;
+  }
+  state.pendingChatAttachmentId = attachmentId;
+  try {
+    if (state.current && state.dirty) {
+      const confirmed = await confirmInCapsule({
+        title: "Discard changes?",
+        message: "Open this Chat attachment without saving the current draft?",
+        confirmLabel: "Discard",
+      });
+      if (!confirmed) {
+        throw new Error("Opening cancelled in Documents.");
+      }
+    }
+    const mime = String(payload && payload.mimeType ? payload.mimeType : "application/octet-stream");
+    if (!isTextMimeType(mime)) {
+      throw new Error("Documents can open text attachments only.");
+    }
+    const fileName = String(payload && payload.fileName ? payload.fileName : "Chat attachment").trim() || "Chat attachment";
+    const body = dataUrlToUtf8(payload && payload.dataUrl);
+    const response = await documentsProviderApi("import_chat_attachment", {
+      attachment_id: attachmentId,
+      file_name: fileName,
+      mime,
+      body,
+    });
+    const document = response.document;
+    if (!document || !document.doc_did) {
+      throw new Error("Documents import did not return an object.");
+    }
+    if (state.current && state.current.doc_did === document.doc_did && !state.dirty) {
+      return true;
+    }
+    state.mode = "shell";
+    elements.shareShell.classList.add("hidden");
+    elements.documentsShell.classList.remove("hidden");
+    state.current = document;
+    upsertDocumentListItem(document);
+    renderDocumentsList();
+    renderCurrentDocument();
+    setWorkspaceView("read");
+    setStatus("Opened Chat attachment as a local Documents object.");
+    return true;
+  } finally {
+    state.pendingChatAttachmentId = "";
+  }
+}
+
+function sendChatAttachmentOpenResult({ attachmentId, ok, message }) {
+  if (!state.homeToken || window.parent === window) {
+    return;
+  }
+  const payload = {
+    type: "chat-room:attachment-open-result",
+    attachmentId: String(attachmentId || ""),
+    ok: ok === true,
+    message: String(message || ""),
+  };
+  window.parent.postMessage({
+    type: "home:deliver-to-target",
+    target: "chat-room",
+    homeToken: state.homeToken,
+    payload,
+  }, window.location.origin);
 }
 
 async function selectDocument(docDid, options) {
@@ -2085,6 +2223,37 @@ function wireShellEvents() {
       closeConfirmModal(false);
     }
   });
+  window.addEventListener("message", (event) => {
+    if (event.origin !== window.location.origin) {
+      return;
+    }
+    const data = event.data;
+    if (!data || typeof data !== "object" || data.type !== "documents:open-chat-attachment") {
+      return;
+    }
+    (async () => {
+      try {
+        const opened = await openChatAttachment(data);
+        if (opened === false) {
+          return;
+        }
+        sendChatAttachmentOpenResult({
+          attachmentId: data.attachmentId,
+          ok: true,
+          message: "Opened attachment in Documents.",
+        });
+      } catch (error) {
+        console.error("documents open chat attachment failed", error);
+        const message = readableDocumentsError(error, "Could not open Chat attachment.");
+        setStatus(message, "warning");
+        sendChatAttachmentOpenResult({
+          attachmentId: data.attachmentId,
+          ok: false,
+          message,
+        });
+      }
+    })();
+  });
   elements.saveAsForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     const title = elements.saveAsTitleInput.value.trim();
@@ -2170,6 +2339,8 @@ function setSharePreview(title, markdown, subtitle, pills) {
 async function loadShareBundle(options) {
   const basePath = options && options.basePath ? options.basePath : "";
   const sourceUri = options && options.sourceUri ? options.sourceUri : "";
+  const rawCid = options && options.rawCid ? String(options.rawCid || "").trim() : "";
+  const allowRawCidFallback = !!(options && options.allowRawCidFallback && rawCid);
   state.mode = "share";
   elements.shareShell.classList.remove("hidden");
 
@@ -2217,8 +2388,66 @@ async function loadShareBundle(options) {
     setSharePreview(title, markdown, "Immutable shared revision.", pills);
     return;
   } catch (error) {
+    if (allowRawCidFallback) {
+      try {
+        await loadRawCidMode(rawCid, sourceUri);
+        return;
+      } catch (fallbackError) {
+        elements.sharePreview.innerHTML = '<div class="error-state">' + escapeHtml(fallbackError.message || error.message || "Could not load shared content.") + "</div>";
+        return;
+      }
+    }
     elements.sharePreview.innerHTML = '<div class="error-state">' + escapeHtml(error.message || "Could not load shared revision.") + "</div>";
   }
+}
+
+async function loadRawCidMode(cid, sourceUri) {
+  const cleanCid = String(cid || "").trim();
+  if (!cleanCid) {
+    throw new Error("Missing content CID.");
+  }
+  state.mode = "share";
+  elements.shareShell.classList.remove("hidden");
+  elements.shareSidebar.classList.add("hidden");
+  elements.shareSidebarMeta.textContent = "";
+  elements.shareDocList.innerHTML = "";
+
+  const contentPath = "/content/" + encodeURIComponent(cleanCid);
+  const response = await fetch(contentPath, { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error("Could not load " + contentPath);
+  }
+  const contentType = response.headers.get("content-type") || "application/octet-stream";
+  const buffer = await response.arrayBuffer();
+  const pills = [
+    { label: "Content", value: sourceUri || "elastos://" + cleanCid },
+    { label: "Type", value: contentType },
+    { label: "Size", value: formatBytes(buffer.byteLength) },
+  ];
+  if (looksLikeTextContent(contentType, buffer)) {
+    const markdown = new TextDecoder("utf-8").decode(buffer);
+    const title = markdown.match(/^#\s+(.+)$/m)?.[1]?.trim() || shortCid(cleanCid);
+    setSharePreview(title, markdown, "Raw content object.", pills);
+    return;
+  }
+
+  document.title = shortCid(cleanCid) + " · Documents";
+  elements.shareTitle.textContent = shortCid(cleanCid);
+  elements.shareSubtitle.textContent = "Raw binary content object.";
+  elements.shareTopline.innerHTML = "";
+  pills.forEach((pill) => {
+    const span = document.createElement("span");
+    span.className = "share-token";
+    span.innerHTML = "<strong>" + escapeHtml(pill.label) + "</strong><span>" + escapeHtml(pill.value) + "</span>";
+    elements.shareTopline.appendChild(span);
+  });
+  const download = document.createElement("a");
+  download.className = "action-primary";
+  download.href = contentPath;
+  download.download = cleanCid;
+  download.textContent = "Download content";
+  elements.sharePreview.innerHTML = '<div class="empty-document"><h2>Binary content</h2><p>This CID is available as raw content, not a Documents share bundle.</p></div>';
+  elements.sharePreview.querySelector(".empty-document").appendChild(download);
 }
 
 async function loadShareMode() {
@@ -2233,6 +2462,8 @@ async function loadPublishedRevisionMode(cid) {
   await loadShareBundle({
     basePath: "/s/" + encodeURIComponent(cleanCid) + "/",
     sourceUri: "elastos://" + cleanCid,
+    rawCid: cleanCid,
+    allowRawCidFallback: true,
   });
 }
 

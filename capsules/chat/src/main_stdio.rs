@@ -205,7 +205,10 @@ fn main() -> Result<()> {
 
     app.system_message_to(
         "#general",
-        &format!("Welcome to ElastOS Chat v{}! Type /help for commands.", CHAT_VERSION),
+        &format!(
+            "Welcome to ElastOS Chat v{}! Type /help for commands.",
+            CHAT_VERSION
+        ),
     );
 
     if !app.peer_token.is_empty() {
@@ -792,7 +795,10 @@ fn poll_presence(app: &mut App) {
                         app.direct_peer_mode = true;
                         app.attached_room_peers.insert(key.clone());
                         app.attach_retry_after.remove(&key);
-                        app.system_message(&format!("{} reached {} via Carrier", presence.nick, room));
+                        app.system_message(&format!(
+                            "{} reached {} via Carrier",
+                            presence.nick, room
+                        ));
                         if let Ok(peers) = session::list_peers(&app.peer_token) {
                             app.peer_count = peers.len();
                         }

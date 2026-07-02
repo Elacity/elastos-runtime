@@ -7,11 +7,14 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, Read, Write};
-use std::net::IpAddr;
-use std::time::Duration;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
+const DEFAULT_REMOTE_CARRIER_EXIT_SERVICE: &str = "elastos://exit/open_stream";
+const MAX_CARRIER_CONNECT_TICKET_BYTES: usize = 8192;
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
     None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
@@ -28,12 +31,20 @@ enum Request {
         #[serde(default)]
         principal_id: Option<String>,
     },
+    DiscoverRemoteCarrierExits {
+        #[serde(default)]
+        principal_id: Option<String>,
+        #[serde(default)]
+        target: Option<String>,
+    },
     Quote {
         target: String,
         #[serde(default)]
         principal_id: Option<String>,
         #[serde(default)]
         reason: Option<String>,
+        #[serde(default)]
+        remote_exit_id: Option<String>,
     },
     OpenStream {
         target: String,
@@ -41,6 +52,10 @@ enum Request {
         principal_id: Option<String>,
         #[serde(default)]
         reason: Option<String>,
+        #[serde(default)]
+        stream_nonce: Option<String>,
+        #[serde(default)]
+        remote_exit_id: Option<String>,
     },
     CloseStream {
         stream_id: String,
@@ -91,14 +106,22 @@ impl Response {
 
 struct ExitProvider {
     backends: Vec<ExitBackendConfig>,
-    agent: ureq::Agent,
+    remote_carrier_exits: Vec<RemoteCarrierExitConfig>,
+    remote_active_streams: BTreeMap<String, RemoteActiveStream>,
+    remote_reserved_streams: BTreeMap<String, u64>,
+    public_agent: ureq::Agent,
+    private_agent: ureq::Agent,
 }
 
 impl ExitProvider {
     fn new() -> Self {
         Self {
             backends: Vec::new(),
-            agent: http_agent(default_timeout_secs()),
+            remote_carrier_exits: Vec::new(),
+            remote_active_streams: BTreeMap::new(),
+            remote_reserved_streams: BTreeMap::new(),
+            public_agent: http_agent(default_timeout_secs(), false),
+            private_agent: http_agent(default_timeout_secs(), true),
         }
     }
 
@@ -106,16 +129,52 @@ impl ExitProvider {
         match request {
             Request::Init { config } => self.init(config),
             Request::Status { principal_id } => self.status(principal_id),
+            Request::DiscoverRemoteCarrierExits {
+                principal_id,
+                target,
+            } => self.discover_remote_carrier_exits(principal_id, target),
             Request::Quote {
                 target,
                 principal_id,
                 reason,
-            } => self.quote(&target, principal_id, reason),
+                remote_exit_id,
+            } => {
+                if remote_exit_id
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
+                    self.quote_with_selection(&target, principal_id, reason, remote_exit_id)
+                } else {
+                    self.quote(&target, principal_id, reason)
+                }
+            }
             Request::OpenStream {
                 target,
                 principal_id,
                 reason,
-            } => self.open_stream(&target, principal_id, reason),
+                stream_nonce,
+                remote_exit_id,
+            } => {
+                if remote_exit_id
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
+                    self.open_stream_with_selection(
+                        &target,
+                        principal_id,
+                        reason,
+                        stream_nonce,
+                        remote_exit_id,
+                    )
+                } else if stream_nonce
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
+                    self.open_stream_with_nonce(&target, principal_id, reason, stream_nonce)
+                } else {
+                    self.open_stream(&target, principal_id, reason)
+                }
+            }
             Request::CloseStream {
                 stream_id,
                 principal_id,
@@ -135,25 +194,126 @@ impl ExitProvider {
             Ok(config) => config,
             Err(err) => return Response::error("invalid_config", err),
         };
-        self.agent = http_agent(config.timeout_secs);
+        self.public_agent = http_agent(config.timeout_secs, false);
+        self.private_agent = http_agent(config.timeout_secs, true);
         self.backends = config.backends;
+        self.remote_carrier_exits = config.remote_carrier_exits;
+        self.remote_active_streams.clear();
+        self.remote_reserved_streams.clear();
         Response::ok(json!({
             "provider": "exit-provider",
             "protocol_version": "1.0",
             "backend_count": self.backends.len(),
+            "remote_carrier_exit_count": self.remote_carrier_exits.len(),
             "direct_network": false,
         }))
     }
 
     fn status(&self, principal_id: Option<String>) -> Response {
+        let principal = principal_id.as_deref();
+        let now = current_unix_seconds();
+        let remote_carrier_exits = self
+            .remote_carrier_exits
+            .iter()
+            .filter(|exit| match principal {
+                Some(principal) => exit.allows_principal(Some(principal)),
+                None => true,
+            })
+            .map(|exit| {
+                json!({
+                    "id": exit.id,
+                    "grant_id": exit.grant_id,
+                    "peer_did": exit.peer_did,
+                    "carrier_service": exit.carrier_service,
+                    "transport": "carrier_stream",
+                    "state": exit.state(now),
+                    "allowed_for_principal": exit.allows_principal(principal),
+                    "policy": {
+                        "grant_id": exit.grant_id,
+                        "allowed_hosts": exit.allowed_hosts,
+                        "allowed_schemes": exit.allowed_schemes,
+                        "allowed_ports": exit.allowed_ports,
+                        "expires_at": exit.expires_at,
+                    },
+                    "accounting": self.remote_accounting(exit, principal),
+                })
+            })
+            .collect::<Vec<_>>();
+        let remote_carrier_exit_count = remote_carrier_exits.len();
         Response::ok(json!({
             "provider": "exit-provider",
             "protocol_version": "1.0",
-            "status": if self.backends.is_empty() { "fail_closed" } else { "backend_configured" },
+            "status": if self.backends.is_empty() && self.remote_carrier_exits.is_empty() { "fail_closed" } else { "backend_configured" },
             "principal_id": principal_id,
             "backend_count": self.backends.len(),
+            "remote_carrier_exit_count": remote_carrier_exit_count,
+            "remote_carrier_exits": remote_carrier_exits,
             "direct_network": false,
-            "operations": ["quote", "open_stream", "close_stream", "http_fetch"],
+            "operations": ["discover_remote_carrier_exits", "quote", "open_stream", "close_stream", "http_fetch"],
+        }))
+    }
+
+    fn discover_remote_carrier_exits(
+        &self,
+        principal_id: Option<String>,
+        target: Option<String>,
+    ) -> Response {
+        let Some(principal_id) = principal_id else {
+            return Response::error(
+                "exit_permission_denied",
+                "Remote Carrier Exit discovery requires a principal_id",
+            );
+        };
+        let parsed_target = match target.as_deref() {
+            Some(target) => {
+                let parsed = match validate_target(target) {
+                    Ok(parsed) => parsed,
+                    Err(err) => return Response::error("invalid_request", err),
+                };
+                if let Some(host) = parsed.host_str() {
+                    if let Err(err) = validate_public_host(host) {
+                        return Response::error("private_network_blocked", err);
+                    }
+                }
+                Some(parsed)
+            }
+            None => None,
+        };
+        let now = current_unix_seconds();
+        let exits = self
+            .remote_carrier_exits
+            .iter()
+            .filter(|exit| !exit.is_expired(now))
+            .filter(|exit| exit.allows_principal(Some(&principal_id)))
+            .filter(|exit| {
+                parsed_target
+                    .as_ref()
+                    .map(|target| exit.allows_target(target))
+                    .unwrap_or(true)
+            })
+            .map(|exit| {
+                json!({
+                    "id": exit.id,
+                    "grant_id": exit.grant_id,
+                    "byte_transport": "carrier_stream",
+                    "carrier": remote_carrier_public_descriptor(exit),
+                    "policy": {
+                        "grant_id": exit.grant_id,
+                        "allowed_hosts": exit.allowed_hosts,
+                        "allowed_schemes": exit.allowed_schemes,
+                        "allowed_ports": exit.allowed_ports,
+                        "expires_at": exit.expires_at,
+                    },
+                    "accounting": self.remote_accounting(exit, Some(&principal_id)),
+                })
+            })
+            .collect::<Vec<_>>();
+        Response::ok(json!({
+            "schema": "elastos.exit.remote-carrier.discovery/v1",
+            "principal_id": principal_id,
+            "target": parsed_target.map(|target| target.to_string()),
+            "remote_carrier_exits": exits,
+            "direct_network": false,
         }))
     }
 
@@ -163,14 +323,72 @@ impl ExitProvider {
         principal_id: Option<String>,
         reason: Option<String>,
     ) -> Response {
+        self.quote_with_selection(target, principal_id, reason, None)
+    }
+
+    fn quote_with_selection(
+        &self,
+        target: &str,
+        principal_id: Option<String>,
+        reason: Option<String>,
+        remote_exit_id: Option<String>,
+    ) -> Response {
         let parsed = match validate_target(target) {
             Ok(parsed) => parsed,
+            Err(err) => return Response::error("invalid_request", err),
+        };
+        let remote_exit_id = match validate_remote_exit_selection(remote_exit_id.as_deref()) {
+            Ok(value) => value,
             Err(err) => return Response::error("invalid_request", err),
         };
         if let Some(host) = parsed.host_str() {
             if let Err(err) = validate_public_host(host) {
                 return Response::error("private_network_blocked", err);
             }
+        }
+        match self.remote_exit_for_target(&parsed, principal_id.as_deref(), remote_exit_id) {
+            Ok(index) => {
+                let exit = &self.remote_carrier_exits[index];
+                return Response::ok(json!({
+                    "schema": "elastos.exit.remote-carrier.quote/v1",
+                    "backend": exit.id,
+                    "grant_id": exit.grant_id,
+                    "grant_expires_at": exit.expires_at,
+                    "target": parsed.as_str(),
+                    "scheme": parsed.scheme(),
+                    "host": parsed.host_str(),
+                    "principal_id": principal_id,
+                    "reason": reason,
+                    "byte_transport": "carrier_stream",
+                    "carrier": remote_carrier_public_descriptor(exit),
+                    "accounting": self.remote_accounting(exit, principal_id.as_deref()),
+                }));
+            }
+            Err(RemoteExitReject::NoPolicyMatch) => {}
+            Err(RemoteExitReject::PermissionDenied) => {
+                return Response::error(
+                    "exit_permission_denied",
+                    "Remote Carrier Exit is not permitted for this principal",
+                );
+            }
+            Err(RemoteExitReject::QuotaExceeded) => {
+                return Response::error(
+                    "exit_quota_exceeded",
+                    "Remote Carrier Exit active stream quota is exhausted",
+                );
+            }
+            Err(RemoteExitReject::Expired) => {
+                return Response::error(
+                    "exit_permission_denied",
+                    "Remote Carrier Exit grant is expired",
+                );
+            }
+        }
+        if !self.backends.is_empty() || !self.remote_carrier_exits.is_empty() {
+            return Response::error(
+                "exit_policy_blocked",
+                "No Browser Exit backend allows this target; exit-provider refuses direct host networking",
+            );
         }
         self.exit_unavailable(
             "quote",
@@ -183,26 +401,125 @@ impl ExitProvider {
     }
 
     fn open_stream(
-        &self,
+        &mut self,
         target: &str,
         principal_id: Option<String>,
         reason: Option<String>,
+    ) -> Response {
+        self.open_stream_with_nonce(target, principal_id, reason, None)
+    }
+
+    fn open_stream_with_nonce(
+        &mut self,
+        target: &str,
+        principal_id: Option<String>,
+        reason: Option<String>,
+        stream_nonce: Option<String>,
+    ) -> Response {
+        self.open_stream_with_selection(target, principal_id, reason, stream_nonce, None)
+    }
+
+    fn open_stream_with_selection(
+        &mut self,
+        target: &str,
+        principal_id: Option<String>,
+        reason: Option<String>,
+        stream_nonce: Option<String>,
+        remote_exit_id: Option<String>,
     ) -> Response {
         let parsed = match validate_target(target) {
             Ok(parsed) => parsed,
             Err(err) => return Response::error("invalid_request", err),
         };
+        let remote_exit_id = match validate_remote_exit_selection(remote_exit_id.as_deref()) {
+            Ok(value) => value,
+            Err(err) => return Response::error("invalid_request", err),
+        };
         let Some(host) = parsed.host_str() else {
             return Response::error("invalid_request", "stream target requires a host");
         };
+        if remote_exit_id.is_some() {
+            if let Err(err) = validate_public_host(host) {
+                return Response::error("private_network_blocked", err);
+            }
+            match self.remote_exit_for_target(&parsed, principal_id.as_deref(), remote_exit_id) {
+                Ok(index) => {
+                    let exit = self.remote_carrier_exits[index].clone();
+                    return self.reserve_remote_carrier_stream(
+                        &exit,
+                        &parsed,
+                        principal_id,
+                        reason,
+                        stream_nonce,
+                    );
+                }
+                Err(RemoteExitReject::NoPolicyMatch) => {
+                    return Response::error(
+                        "exit_policy_blocked",
+                        format!("Selected Browser Exit node does not allow host {host}; exit-provider refuses direct host networking"),
+                    );
+                }
+                Err(RemoteExitReject::PermissionDenied) => {
+                    return Response::error(
+                        "exit_permission_denied",
+                        "Remote Carrier Exit is not permitted for this principal",
+                    );
+                }
+                Err(RemoteExitReject::QuotaExceeded) => {
+                    return Response::error(
+                        "exit_quota_exceeded",
+                        "Remote Carrier Exit active stream quota is exhausted",
+                    );
+                }
+                Err(RemoteExitReject::Expired) => {
+                    return Response::error(
+                        "exit_permission_denied",
+                        "Remote Carrier Exit grant is expired",
+                    );
+                }
+            }
+        }
         let backend = self.backend_for_stream(&parsed);
         if let Err(err) = validate_public_host(host) {
-            if !backend.is_some_and(|backend| backend.allow_private_targets) {
+            if !backend.is_some_and(|backend| {
+                backend.allow_private_targets || backend.allows_private_target(&parsed)
+            }) {
                 return Response::error("private_network_blocked", err);
             }
         }
         let Some(backend) = backend else {
-            if self.backends.is_empty() {
+            match self.remote_exit_for_target(&parsed, principal_id.as_deref(), remote_exit_id) {
+                Ok(index) => {
+                    let exit = self.remote_carrier_exits[index].clone();
+                    return self.reserve_remote_carrier_stream(
+                        &exit,
+                        &parsed,
+                        principal_id,
+                        reason,
+                        stream_nonce,
+                    );
+                }
+                Err(RemoteExitReject::NoPolicyMatch) => {}
+                Err(RemoteExitReject::PermissionDenied) => {
+                    return Response::error(
+                        "exit_permission_denied",
+                        "Remote Carrier Exit is not permitted for this principal",
+                    );
+                }
+                Err(RemoteExitReject::QuotaExceeded) => {
+                    return Response::error(
+                        "exit_quota_exceeded",
+                        "Remote Carrier Exit active stream quota is exhausted",
+                    );
+                }
+                Err(RemoteExitReject::Expired) => {
+                    return Response::error(
+                        "exit_permission_denied",
+                        "Remote Carrier Exit grant is expired",
+                    );
+                }
+            }
+            if self.backends.is_empty() && self.remote_carrier_exits.is_empty() {
                 return self.exit_unavailable(
                     "open_stream",
                     json!({
@@ -217,10 +534,18 @@ impl ExitProvider {
                 format!("No Browser Exit backend allows host {host}; exit-provider refuses direct host networking"),
             );
         };
+        let stream_nonce = match validate_stream_nonce(stream_nonce.as_deref()) {
+            Ok(value) => value.map(str::to_string),
+            Err(err) => return Response::error("invalid_request", err),
+        };
         let stream_id = format!(
             "stream:{}:{}",
             backend.id,
-            stable_stream_suffix(parsed.as_str(), principal_id.as_deref())
+            stable_stream_suffix(
+                parsed.as_str(),
+                principal_id.as_deref(),
+                stream_nonce.as_deref(),
+            )
         );
         let adapter_ipc = backend.adapter_ipc.as_ref().map(|ipc| {
             json!({
@@ -247,6 +572,7 @@ impl ExitProvider {
             "host": host,
             "principal_id": principal_id,
             "reason": reason,
+            "stream_nonce": stream_nonce,
             "engine_owns_tls": matches!(parsed.scheme(), "tls" | "https"),
             "state": "reserved",
             "byte_transport": if adapter_ipc.is_some() { "adapter_ipc" } else { "not_attached" },
@@ -255,9 +581,33 @@ impl ExitProvider {
         }))
     }
 
-    fn close_stream(&self, stream_id: &str, principal_id: Option<String>) -> Response {
+    fn close_stream(&mut self, stream_id: &str, principal_id: Option<String>) -> Response {
         if !is_safe_id(stream_id) {
             return Response::error("invalid_request", "close_stream requires a safe stream_id");
+        }
+        if let Some(active) = self.remote_active_streams.get(stream_id) {
+            if principal_id.as_deref() != Some(active.principal_id.as_str()) {
+                return Response::error(
+                    "exit_permission_denied",
+                    "close_stream principal does not own this Remote Carrier Exit stream",
+                );
+            }
+        }
+        if let Some(active) = self.remote_active_streams.remove(stream_id) {
+            let backend = active.exit_id;
+            let grant_id = self
+                .remote_carrier_exits
+                .iter()
+                .find(|exit| exit.id == backend)
+                .map(|exit| exit.grant_id.clone());
+            return Response::ok(json!({
+                "closed": true,
+                "stream_id": stream_id,
+                "backend": backend,
+                "grant_id": grant_id,
+                "principal_id": principal_id,
+                "byte_transport": "carrier_stream"
+            }));
         }
         Response::ok(json!({
             "closed": false,
@@ -286,7 +636,9 @@ impl ExitProvider {
         };
         let backend = self.backend_for_http_fetch(&parsed);
         if let Err(err) = validate_public_host(host) {
-            if !backend.is_some_and(|backend| backend.allow_private_targets) {
+            if !backend.is_some_and(|backend| {
+                backend.allow_private_targets || backend.allows_private_target(&parsed)
+            }) {
                 return Response::error("private_network_blocked", err);
             }
         }
@@ -326,6 +678,162 @@ impl ExitProvider {
         })
     }
 
+    fn remote_exit_for_target(
+        &self,
+        target: &Url,
+        principal_id: Option<&str>,
+        remote_exit_id: Option<&str>,
+    ) -> Result<usize, RemoteExitReject> {
+        let mut permission_denied = false;
+        let mut quota_exceeded = false;
+        let mut expired = false;
+        let now = current_unix_seconds();
+        for (index, exit) in self.remote_carrier_exits.iter().enumerate() {
+            if remote_exit_id.is_some_and(|selected| exit.id != selected) {
+                continue;
+            }
+            if !exit.allows_target(target) {
+                continue;
+            }
+            if !exit.allows_principal(principal_id) {
+                permission_denied = true;
+                continue;
+            }
+            if exit.is_expired(now) {
+                expired = true;
+                continue;
+            }
+            if self.remote_active_count(&exit.id) >= exit.max_active_streams {
+                quota_exceeded = true;
+                continue;
+            }
+            if let Some(principal_id) = principal_id {
+                if self.remote_principal_active_count(&exit.id, principal_id)
+                    >= exit.max_active_streams_per_principal()
+                {
+                    quota_exceeded = true;
+                    continue;
+                }
+            }
+            return Ok(index);
+        }
+        if permission_denied {
+            Err(RemoteExitReject::PermissionDenied)
+        } else if quota_exceeded {
+            Err(RemoteExitReject::QuotaExceeded)
+        } else if expired {
+            Err(RemoteExitReject::Expired)
+        } else {
+            Err(RemoteExitReject::NoPolicyMatch)
+        }
+    }
+
+    fn reserve_remote_carrier_stream(
+        &mut self,
+        exit: &RemoteCarrierExitConfig,
+        target: &Url,
+        principal_id: Option<String>,
+        reason: Option<String>,
+        stream_nonce: Option<String>,
+    ) -> Response {
+        let Some(host) = target.host_str() else {
+            return Response::error("invalid_request", "stream target requires a host");
+        };
+        let Some(active_principal_id) = principal_id.clone() else {
+            return Response::error(
+                "exit_permission_denied",
+                "Remote Carrier Exit stream reservation requires a principal_id",
+            );
+        };
+        let stream_nonce = match validate_stream_nonce(stream_nonce.as_deref()) {
+            Ok(value) => value.map(str::to_string),
+            Err(err) => return Response::error("invalid_request", err),
+        };
+        let reserved = self
+            .remote_reserved_streams
+            .get(&exit.id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.remote_reserved_streams
+            .insert(exit.id.clone(), reserved);
+        let stream_id = format!(
+            "remote-carrier:{}:{}:{reserved}",
+            exit.id,
+            stable_stream_suffix(
+                target.as_str(),
+                principal_id.as_deref(),
+                stream_nonce.as_deref(),
+            )
+        );
+        self.remote_active_streams.insert(
+            stream_id.clone(),
+            RemoteActiveStream {
+                exit_id: exit.id.clone(),
+                principal_id: active_principal_id,
+            },
+        );
+        let accounting = self.remote_accounting(exit, principal_id.as_deref());
+        Response::ok(json!({
+            "schema": "elastos.exit.remote-carrier-session/v1",
+            "backend": exit.id,
+            "grant_id": exit.grant_id,
+            "grant_expires_at": exit.expires_at,
+            "stream_id": stream_id,
+            "target": target.as_str(),
+            "scheme": target.scheme(),
+            "host": host,
+            "principal_id": principal_id,
+            "reason": reason,
+            "stream_nonce": stream_nonce,
+            "engine_owns_tls": matches!(target.scheme(), "tls" | "https"),
+            "state": "reserved",
+            "byte_transport": "carrier_stream",
+            "carrier": remote_carrier_private_descriptor(exit),
+            "accounting": accounting,
+        }))
+    }
+
+    fn remote_accounting(
+        &self,
+        exit: &RemoteCarrierExitConfig,
+        principal_id: Option<&str>,
+    ) -> Value {
+        let active_streams = self.remote_active_count(&exit.id);
+        let principal_active_streams = principal_id
+            .map(|principal_id| self.remote_principal_active_count(&exit.id, principal_id));
+        let principal_active_streams_remaining = principal_active_streams.map(|count| {
+            exit.max_active_streams_per_principal()
+                .saturating_sub(count)
+        });
+        json!({
+            "grant_id": exit.grant_id,
+            "grant_expires_at": exit.expires_at,
+            "active_streams": active_streams,
+            "reserved_streams": self.remote_reserved_streams.get(&exit.id).copied().unwrap_or(0),
+            "max_active_streams": exit.max_active_streams,
+            "active_streams_remaining": exit.max_active_streams.saturating_sub(active_streams),
+            "max_active_streams_per_principal": exit.max_active_streams_per_principal(),
+            "principal_id": principal_id,
+            "principal_active_streams": principal_active_streams,
+            "principal_active_streams_remaining": principal_active_streams_remaining,
+        })
+    }
+
+    fn remote_active_count(&self, exit_id: &str) -> u64 {
+        self.remote_active_streams
+            .values()
+            .filter(|active| active.exit_id == exit_id)
+            .count() as u64
+    }
+
+    fn remote_principal_active_count(&self, exit_id: &str, principal_id: &str) -> u64 {
+        self.remote_active_streams
+            .values()
+            .filter(|active| active.exit_id == exit_id && active.principal_id == principal_id)
+            .count() as u64
+    }
+
     fn http_fetch_with_backend(
         &self,
         backend: &ExitBackendConfig,
@@ -334,9 +842,14 @@ impl ExitProvider {
         principal_id: Option<String>,
         reason: Option<String>,
     ) -> Response {
+        let agent = if backend.allow_private_targets {
+            &self.private_agent
+        } else {
+            &self.public_agent
+        };
         let request = match method {
-            "HEAD" => self.agent.head(url.as_str()),
-            _ => self.agent.get(url.as_str()),
+            "HEAD" => agent.head(url.as_str()),
+            _ => agent.get(url.as_str()),
         }
         .set("User-Agent", "ElastOS-exit-provider/0.1");
 
@@ -379,6 +892,8 @@ impl ExitProvider {
 struct ExitConfig {
     #[serde(default)]
     backends: Vec<ExitBackendConfig>,
+    #[serde(default)]
+    remote_carrier_exits: Vec<RemoteCarrierExitConfig>,
     #[serde(default = "default_timeout_secs")]
     timeout_secs: u64,
 }
@@ -395,6 +910,8 @@ struct ExitBackendConfig {
     allowed_ports: Vec<u16>,
     #[serde(default)]
     allow_private_targets: bool,
+    #[serde(default)]
+    allowed_private_targets: Vec<PrivateTargetConfig>,
     #[serde(default = "default_max_body_bytes")]
     max_body_bytes: usize,
     #[serde(default)]
@@ -403,8 +920,123 @@ struct ExitBackendConfig {
     relay_ipc: Option<RelayIpcConfig>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PrivateTargetConfig {
+    host: String,
+    ports: Vec<u16>,
+    #[serde(default)]
+    schemes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteCarrierExitConfig {
+    id: String,
+    grant_id: String,
+    peer_did: String,
+    #[serde(default = "default_remote_carrier_service")]
+    carrier_service: String,
+    allowed_principals: Vec<String>,
+    allowed_hosts: Vec<String>,
+    #[serde(default)]
+    allowed_schemes: Vec<String>,
+    #[serde(default)]
+    allowed_ports: Vec<u16>,
+    #[serde(default = "default_max_active_remote_streams")]
+    max_active_streams: u64,
+    #[serde(default)]
+    max_active_streams_per_principal: Option<u64>,
+    #[serde(default)]
+    expires_at: Option<u64>,
+    #[serde(default)]
+    connect_ticket: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteActiveStream {
+    exit_id: String,
+    principal_id: String,
+}
+
+impl RemoteCarrierExitConfig {
+    fn allows_target(&self, target: &Url) -> bool {
+        let Some(host) = target.host_str() else {
+            return false;
+        };
+        let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+        let host_allowed = self.allowed_hosts.iter().any(|allowed| {
+            let allowed = allowed.to_ascii_lowercase();
+            if allowed == "*" {
+                return true;
+            }
+            if let Some(suffix) = allowed.strip_prefix("*.") {
+                host.ends_with(&format!(".{suffix}"))
+            } else {
+                host == allowed
+            }
+        });
+        host_allowed
+            && self.allows_scheme(target.scheme())
+            && self.allows_port(target.port_or_known_default())
+    }
+
+    fn allows_scheme(&self, scheme: &str) -> bool {
+        if self.allowed_schemes.is_empty() {
+            return matches!(scheme, "tcp" | "tls");
+        }
+        self.allowed_schemes.iter().any(|allowed| allowed == scheme)
+    }
+
+    fn allows_port(&self, port: Option<u16>) -> bool {
+        let Some(port) = port else {
+            return false;
+        };
+        self.allowed_ports.is_empty() || self.allowed_ports.contains(&port)
+    }
+
+    fn allows_principal(&self, principal_id: Option<&str>) -> bool {
+        let Some(principal_id) = principal_id else {
+            return false;
+        };
+        self.allowed_principals
+            .iter()
+            .any(|allowed| allowed == "*" || allowed == principal_id)
+    }
+
+    fn is_expired(&self, now: u64) -> bool {
+        self.expires_at
+            .map(|expires_at| expires_at <= now)
+            .unwrap_or(false)
+    }
+
+    fn state(&self, now: u64) -> &'static str {
+        if self.is_expired(now) {
+            "expired"
+        } else {
+            "active"
+        }
+    }
+
+    fn max_active_streams_per_principal(&self) -> u64 {
+        self.max_active_streams_per_principal
+            .unwrap_or(self.max_active_streams)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteExitReject {
+    NoPolicyMatch,
+    PermissionDenied,
+    QuotaExceeded,
+    Expired,
+}
+
 impl ExitBackendConfig {
     fn allows_target(&self, target: &Url) -> bool {
+        if self.allows_private_target(target) {
+            return true;
+        }
         let Some(host) = target.host_str() else {
             return false;
         };
@@ -440,6 +1072,28 @@ impl ExitBackendConfig {
             return false;
         };
         self.allowed_ports.is_empty() || self.allowed_ports.contains(&port)
+    }
+
+    fn allows_private_target(&self, target: &Url) -> bool {
+        let Some(host) = target.host_str() else {
+            return false;
+        };
+        let Some(port) = target.port_or_known_default() else {
+            return false;
+        };
+        let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+        self.allowed_private_targets.iter().any(|private| {
+            private
+                .host
+                .trim_matches(['[', ']'])
+                .eq_ignore_ascii_case(&host)
+                && private.ports.contains(&port)
+                && (private.schemes.is_empty()
+                    || private
+                        .schemes
+                        .iter()
+                        .any(|scheme| scheme == target.scheme()))
+        })
     }
 }
 
@@ -489,6 +1143,9 @@ fn parse_config(config: Value) -> Result<ExitConfig, String> {
     }
     for backend in &config.backends {
         validate_backend(backend)?;
+    }
+    for exit in &config.remote_carrier_exits {
+        validate_remote_carrier_exit(exit)?;
     }
     Ok(config)
 }
@@ -562,6 +1219,110 @@ fn validate_backend(backend: &ExitBackendConfig) -> Result<(), String> {
             ));
         }
     }
+    for target in &backend.allowed_private_targets {
+        validate_private_target(&backend.id, backend.kind, target)?;
+    }
+    Ok(())
+}
+
+fn validate_private_target(
+    backend_id: &str,
+    backend_kind: ExitBackendKind,
+    target: &PrivateTargetConfig,
+) -> Result<(), String> {
+    let host = target.host.trim();
+    if host.is_empty() || host == "*" || host.starts_with("*.") {
+        return Err(format!(
+            "exit backend '{backend_id}' allowed_private_targets host must be an exact host"
+        ));
+    }
+    validate_host_shape(host)?;
+    if target.ports.is_empty() {
+        return Err(format!(
+            "exit backend '{backend_id}' allowed_private_targets ports must not be empty"
+        ));
+    }
+    for port in &target.ports {
+        if *port == 0 {
+            return Err(format!(
+                "exit backend '{backend_id}' allowed_private_targets ports must contain TCP ports between 1 and 65535"
+            ));
+        }
+    }
+    for scheme in &target.schemes {
+        validate_allowed_scheme(backend_kind, scheme)?;
+    }
+    Ok(())
+}
+
+fn validate_remote_carrier_exit(exit: &RemoteCarrierExitConfig) -> Result<(), String> {
+    if !is_safe_id(&exit.id) {
+        return Err("remote Carrier Exit id must be a safe identifier".to_string());
+    }
+    if !is_safe_id(&exit.grant_id) {
+        return Err("remote Carrier Exit grant_id must be a safe identifier".to_string());
+    }
+    validate_plain_token("remote Carrier Exit peer_did", &exit.peer_did)?;
+    validate_carrier_service(&exit.carrier_service)?;
+    if exit.allowed_principals.is_empty() {
+        return Err(format!(
+            "remote Carrier Exit '{}' must declare at least one allowed principal",
+            exit.id
+        ));
+    }
+    for principal in &exit.allowed_principals {
+        if principal != "*" {
+            validate_plain_token("remote Carrier Exit allowed_principals", principal)?;
+        }
+    }
+    if exit.allowed_hosts.is_empty() {
+        return Err(format!(
+            "remote Carrier Exit '{}' must declare at least one allowed host",
+            exit.id
+        ));
+    }
+    for host in &exit.allowed_hosts {
+        validate_allowed_host(host)?;
+    }
+    for scheme in &exit.allowed_schemes {
+        validate_allowed_scheme(ExitBackendKind::StreamRelay, scheme)?;
+    }
+    for port in &exit.allowed_ports {
+        if *port == 0 {
+            return Err(format!(
+                "remote Carrier Exit '{}' allowed_ports must contain TCP ports between 1 and 65535",
+                exit.id
+            ));
+        }
+    }
+    if exit.max_active_streams == 0 || exit.max_active_streams > 1024 {
+        return Err(format!(
+            "remote Carrier Exit '{}' max_active_streams must be between 1 and 1024",
+            exit.id
+        ));
+    }
+    let max_active_streams_per_principal = exit.max_active_streams_per_principal();
+    if max_active_streams_per_principal == 0
+        || max_active_streams_per_principal > exit.max_active_streams
+    {
+        return Err(format!(
+            "remote Carrier Exit '{}' max_active_streams_per_principal must be between 1 and max_active_streams",
+            exit.id
+        ));
+    }
+    if exit.expires_at == Some(0) {
+        return Err(format!(
+            "remote Carrier Exit '{}' expires_at must be a positive Unix timestamp",
+            exit.id
+        ));
+    }
+    let Some(connect_ticket) = &exit.connect_ticket else {
+        return Err(format!(
+            "remote Carrier Exit '{}' must declare connect_ticket for Browser Carrier stream dial",
+            exit.id
+        ));
+    };
+    validate_carrier_connect_ticket(connect_ticket)?;
     Ok(())
 }
 
@@ -577,6 +1338,47 @@ fn validate_allowed_scheme(kind: ExitBackendKind, scheme: &str) -> Result<(), St
             "{kind:?} backend allowed_schemes may not contain '{scheme}'"
         ))
     }
+}
+
+fn validate_plain_token(label: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() || value.trim() != value {
+        return Err(format!("{label} must not be empty or padded"));
+    }
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_whitespace() || byte == b'\0')
+    {
+        return Err(format!("{label} must not contain whitespace or NUL"));
+    }
+    Ok(())
+}
+
+fn validate_carrier_service(service: &str) -> Result<(), String> {
+    validate_plain_token("remote Carrier Exit carrier_service", service)?;
+    if !service.starts_with("elastos://") {
+        return Err("remote Carrier Exit carrier_service must use elastos://".to_string());
+    }
+    Ok(())
+}
+
+fn validate_carrier_connect_ticket(ticket: &str) -> Result<(), String> {
+    validate_plain_token("remote Carrier Exit connect_ticket", ticket)?;
+    if ticket.len() > MAX_CARRIER_CONNECT_TICKET_BYTES {
+        return Err(format!(
+            "remote Carrier Exit connect_ticket must be at most {MAX_CARRIER_CONNECT_TICKET_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_remote_exit_selection(value: Option<&str>) -> Result<Option<&str>, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.len() > 128 || !is_safe_id(value) {
+        return Err("remote_exit_id must be a safe identifier up to 128 bytes".to_string());
+    }
+    Ok(Some(value))
 }
 
 fn validate_adapter_ipc(adapter_ipc: &AdapterIpcConfig) -> Result<(), String> {
@@ -623,7 +1425,7 @@ fn validate_target(raw: &str) -> Result<Url, String> {
     let Some(host) = parsed.host_str() else {
         return Err("exit target requires a host".to_string());
     };
-    validate_public_host_shape(host)?;
+    validate_host_shape(host)?;
     Ok(parsed)
 }
 
@@ -651,6 +1453,15 @@ fn validate_public_host(host: &str) -> Result<(), String> {
 }
 
 fn validate_public_host_shape(host: &str) -> Result<(), String> {
+    validate_host_shape(host)?;
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
+        return Err(format!("private host blocked: {host}"));
+    }
+    Ok(())
+}
+
+fn validate_host_shape(host: &str) -> Result<(), String> {
     if host.is_empty() {
         return Err("host must not be empty".to_string());
     }
@@ -659,10 +1470,6 @@ fn validate_public_host_shape(host: &str) -> Result<(), String> {
         .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'\\' | b'\0'))
     {
         return Err(format!("invalid host: {host}"));
-    }
-    let lower = host.to_ascii_lowercase();
-    if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
-        return Err(format!("private host blocked: {host}"));
     }
     Ok(())
 }
@@ -702,9 +1509,27 @@ fn is_safe_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_'))
 }
 
-fn stable_stream_suffix(target: &str, principal_id: Option<&str>) -> String {
+fn validate_stream_nonce(value: Option<&str>) -> Result<Option<&str>, &'static str> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.len() > 128 || !is_safe_id(value) {
+        return Err("stream_nonce must be a safe identifier up to 128 bytes");
+    }
+    Ok(Some(value))
+}
+
+fn stable_stream_suffix(
+    target: &str,
+    principal_id: Option<&str>,
+    stream_nonce: Option<&str>,
+) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
-    for byte in target.bytes().chain(principal_id.unwrap_or("").bytes()) {
+    for byte in target
+        .bytes()
+        .chain(principal_id.unwrap_or("").bytes())
+        .chain(stream_nonce.unwrap_or("").bytes())
+    {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
@@ -723,10 +1548,63 @@ fn default_max_body_bytes() -> usize {
     64 * 1024
 }
 
-fn http_agent(timeout_secs: u64) -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(timeout_secs))
-        .build()
+fn default_max_active_remote_streams() -> u64 {
+    8
+}
+
+fn default_remote_carrier_service() -> String {
+    DEFAULT_REMOTE_CARRIER_EXIT_SERVICE.to_string()
+}
+
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn remote_carrier_public_descriptor(exit: &RemoteCarrierExitConfig) -> Value {
+    json!({
+        "schema": "elastos.exit.remote-carrier/v1",
+        "peer_did": exit.peer_did,
+        "carrier_service": exit.carrier_service,
+        "grant_id": exit.grant_id,
+        "transport": "carrier_stream",
+    })
+}
+
+fn remote_carrier_private_descriptor(exit: &RemoteCarrierExitConfig) -> Value {
+    let mut descriptor = remote_carrier_public_descriptor(exit);
+    if let Some(connect_ticket) = &exit.connect_ticket {
+        if let Some(object) = descriptor.as_object_mut() {
+            object.insert("connect_ticket".to_string(), json!(connect_ticket));
+        }
+    }
+    descriptor
+}
+
+fn public_dns_resolver(netloc: &str) -> io::Result<Vec<SocketAddr>> {
+    let addrs = netloc
+        .to_socket_addrs()
+        .map(|iter| iter.collect::<Vec<_>>())?;
+    for addr in &addrs {
+        if validate_public_ip(addr.ip()).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("resolved private IP blocked: {}", addr.ip()),
+            ));
+        }
+    }
+    Ok(addrs)
+}
+
+fn http_agent(timeout_secs: u64, allow_private_targets: bool) -> ureq::Agent {
+    let builder = ureq::AgentBuilder::new().timeout(Duration::from_secs(timeout_secs));
+    if allow_private_targets {
+        builder.build()
+    } else {
+        builder.resolver(public_dns_resolver).build()
+    }
 }
 
 fn main() {
@@ -808,7 +1686,7 @@ mod tests {
 
     #[test]
     fn public_stream_target_fails_closed_until_backend_exists() {
-        let provider = ExitProvider::new();
+        let mut provider = ExitProvider::new();
         let response = provider.open_stream(
             "tls://glidefinance.io:443",
             Some("person:local:test".to_string()),
@@ -845,6 +1723,40 @@ mod tests {
         assert_eq!(response["data"]["byte_transport"], "not_attached");
         assert_eq!(response["data"]["adapter_ipc"], serde_json::Value::Null);
         assert_eq!(response["data"]["relay_ipc"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn configured_stream_backend_uses_stream_nonce_for_page_scoped_sessions() {
+        let mut provider = ExitProvider::new();
+        let init = provider.init(json!({
+            "backends": [{
+                "id": "stream-proof",
+                "kind": "stream_relay",
+                "allowed_hosts": ["glidefinance.io"]
+            }]
+        }));
+        assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+
+        let first = serde_json::to_value(provider.open_stream_with_nonce(
+            "tls://glidefinance.io:443",
+            Some("person:local:test".to_string()),
+            Some("first browser window".to_string()),
+            Some("open-first".to_string()),
+        ))
+        .unwrap();
+        let second = serde_json::to_value(provider.open_stream_with_nonce(
+            "tls://glidefinance.io:443",
+            Some("person:local:test".to_string()),
+            Some("second browser window".to_string()),
+            Some("open-second".to_string()),
+        ))
+        .unwrap();
+
+        assert_eq!(first["status"], "ok");
+        assert_eq!(second["status"], "ok");
+        assert_eq!(first["data"]["stream_nonce"], "open-first");
+        assert_eq!(second["data"]["stream_nonce"], "open-second");
+        assert_ne!(first["data"]["stream_id"], second["data"]["stream_id"]);
     }
 
     #[test]
@@ -946,6 +1858,20 @@ mod tests {
                 "private_network_blocked"
             );
         }
+    }
+
+    #[test]
+    fn public_dns_resolver_rejects_private_resolved_addresses() {
+        let err = public_dns_resolver("127.0.0.1:80").expect_err("private literal must fail");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("resolved private IP blocked"));
+    }
+
+    #[test]
+    fn public_dns_resolver_allows_public_resolved_addresses() {
+        let addrs = public_dns_resolver("93.184.216.34:80").expect("public literal must resolve");
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].ip().to_string(), "93.184.216.34");
     }
 
     #[test]
@@ -1128,6 +2054,749 @@ mod tests {
         assert_eq!(
             error_code(provider.open_stream("tcp://127.0.0.1:80", None, None)),
             "private_network_blocked"
+        );
+    }
+
+    #[test]
+    fn stream_backend_can_allow_exact_runtime_gateway_private_target_only() {
+        let mut provider = ExitProvider::new();
+        let init = provider.init(json!({
+            "backends": [{
+                "id": "public-web-with-runtime-gateway",
+                "kind": "stream_relay",
+                "allowed_hosts": ["*"],
+                "allowed_private_targets": [{
+                    "host": "localhost",
+                    "schemes": ["tcp"],
+                    "ports": [61180]
+                }],
+                "adapter_ipc": {
+                    "kind": "unix_socket",
+                    "path": "/tmp/elastos-browser-stream.sock"
+                }
+            }]
+        }));
+        assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+
+        let allowed = serde_json::to_value(provider.open_stream(
+            "tcp://localhost:61180",
+            Some("person:local:test".to_string()),
+            Some("browser wallet bridge".to_string()),
+        ))
+        .unwrap();
+        assert_eq!(allowed["status"], "ok");
+
+        assert_eq!(
+            error_code(provider.open_stream("tcp://localhost:80", None, None)),
+            "private_network_blocked"
+        );
+    }
+
+    #[test]
+    fn remote_carrier_exit_requires_allowed_principal() {
+        let mut provider = ExitProvider::new();
+        let init = provider.init(json!({
+            "remote_carrier_exits": [{
+                "id": "server-exit",
+                "grant_id": "operator-grant:server-exit:alice",
+                "peer_did": "did:elastos:server",
+                "connect_ticket": "carrier-ticket-server-exit-alice",
+                "allowed_principals": ["person:local:alice"],
+                "allowed_hosts": ["*"],
+                "max_active_streams": 2
+            }]
+        }));
+        assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+
+        assert_eq!(
+            error_code(provider.quote("tls://example.com:443", None, None)),
+            "exit_permission_denied"
+        );
+        assert_eq!(
+            error_code(provider.open_stream(
+                "tls://example.com:443",
+                Some("person:local:bob".to_string()),
+                None,
+            )),
+            "exit_permission_denied"
+        );
+    }
+
+    #[test]
+    fn remote_carrier_exit_returns_quote_and_session_without_socket_descriptors() {
+        let mut provider = ExitProvider::new();
+        let init = provider.init(json!({
+            "remote_carrier_exits": [{
+                "id": "server-exit",
+                "grant_id": "operator-grant:server-exit:alice",
+                "peer_did": "did:elastos:server",
+                "carrier_service": "elastos://exit/open_stream",
+                "connect_ticket": "carrier-ticket-server-exit-alice",
+                "allowed_principals": ["person:local:alice"],
+                "allowed_hosts": ["*.example.com"],
+                "allowed_schemes": ["tls"],
+                "allowed_ports": [443],
+                "max_active_streams": 2
+            }]
+        }));
+        assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+
+        let status =
+            serde_json::to_value(provider.status(Some("person:local:alice".to_string()))).unwrap();
+        assert_eq!(status["data"]["remote_carrier_exit_count"], 1);
+        assert_eq!(
+            status["data"]["remote_carrier_exits"][0]["grant_id"],
+            "operator-grant:server-exit:alice"
+        );
+        assert_eq!(
+            status["data"]["remote_carrier_exits"][0]["allowed_for_principal"],
+            true
+        );
+        assert_eq!(
+            status["data"]["remote_carrier_exits"][0]["allowed_principals"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            status["data"]["remote_carrier_exits"][0].get("connect_ticket"),
+            None
+        );
+
+        let quote = serde_json::to_value(provider.quote(
+            "tls://www.example.com:443",
+            Some("person:local:alice".to_string()),
+            Some("browse through server exit".to_string()),
+        ))
+        .unwrap();
+        assert_eq!(quote["status"], "ok");
+        assert_eq!(
+            quote["data"]["schema"],
+            "elastos.exit.remote-carrier.quote/v1"
+        );
+        assert_eq!(
+            quote["data"]["grant_id"],
+            "operator-grant:server-exit:alice"
+        );
+        assert_eq!(quote["data"]["byte_transport"], "carrier_stream");
+        assert_eq!(
+            quote["data"]["carrier"]["schema"],
+            "elastos.exit.remote-carrier/v1"
+        );
+        assert_eq!(
+            quote["data"]["carrier"].get("connect_ticket"),
+            None,
+            "quote is a preview surface and must not expose route secrets"
+        );
+        assert_eq!(
+            quote["data"]["accounting"]["grant_id"],
+            "operator-grant:server-exit:alice"
+        );
+        assert_eq!(quote["data"]["accounting"]["active_streams"], 0);
+
+        let session = serde_json::to_value(provider.open_stream(
+            "tls://www.example.com:443",
+            Some("person:local:alice".to_string()),
+            Some("browse through server exit".to_string()),
+        ))
+        .unwrap();
+        assert_eq!(session["status"], "ok");
+        assert_eq!(
+            session["data"]["schema"],
+            "elastos.exit.remote-carrier-session/v1"
+        );
+        assert_eq!(
+            session["data"]["grant_id"],
+            "operator-grant:server-exit:alice"
+        );
+        assert_eq!(session["data"]["byte_transport"], "carrier_stream");
+        assert_eq!(session["data"]["adapter_ipc"], serde_json::Value::Null);
+        assert_eq!(session["data"]["relay_ipc"], serde_json::Value::Null);
+        assert_eq!(
+            session["data"]["carrier"]["connect_ticket"],
+            "carrier-ticket-server-exit-alice"
+        );
+        assert_eq!(
+            session["data"]["accounting"]["grant_id"],
+            "operator-grant:server-exit:alice"
+        );
+        assert_eq!(session["data"]["accounting"]["active_streams"], 1);
+        assert_eq!(session["data"]["accounting"]["reserved_streams"], 1);
+
+        let stream_id = session["data"]["stream_id"].as_str().unwrap();
+        let close = serde_json::to_value(
+            provider.close_stream(stream_id, Some("person:local:alice".to_string())),
+        )
+        .unwrap();
+        assert_eq!(close["status"], "ok");
+        assert_eq!(
+            close["data"]["grant_id"],
+            "operator-grant:server-exit:alice"
+        );
+    }
+
+    #[test]
+    fn remote_carrier_exit_selection_is_explicit_and_policy_checked() {
+        let mut provider = ExitProvider::new();
+        let init = provider.init(json!({
+            "backends": [{
+                "id": "local-exit",
+                "kind": "stream_relay",
+                "allowed_hosts": ["*"],
+                "allowed_schemes": ["tls"],
+                "allowed_ports": [443],
+                "adapter_ipc": {
+                    "kind": "unix_socket",
+                    "path": "/tmp/elastos-browser-local-exit-adapter.sock"
+                },
+                "relay_ipc": {
+                    "kind": "unix_socket",
+                    "path": "/tmp/elastos-browser-local-exit-relay.sock"
+                }
+            }],
+            "remote_carrier_exits": [
+                {
+                    "id": "server-exit-a",
+                    "grant_id": "operator-grant:server-exit:a",
+                    "peer_did": "did:elastos:server-a",
+                    "connect_ticket": "carrier-ticket-server-exit-a",
+                    "allowed_principals": ["person:local:alice"],
+                    "allowed_hosts": ["example.com"],
+                    "allowed_schemes": ["tls"],
+                    "allowed_ports": [443],
+                    "max_active_streams": 2
+                },
+                {
+                    "id": "server-exit-b",
+                    "grant_id": "operator-grant:server-exit:b",
+                    "peer_did": "did:elastos:server-b",
+                    "connect_ticket": "carrier-ticket-server-exit-b",
+                    "allowed_principals": ["person:local:alice"],
+                    "allowed_hosts": ["example.com"],
+                    "allowed_schemes": ["tls"],
+                    "allowed_ports": [443],
+                    "max_active_streams": 2
+                }
+            ]
+        }));
+        assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+
+        let session = serde_json::to_value(provider.handle(Request::OpenStream {
+            target: "tls://example.com:443".to_string(),
+            principal_id: Some("person:local:alice".to_string()),
+            reason: Some("choose server exit".to_string()),
+            stream_nonce: None,
+            remote_exit_id: Some("server-exit-b".to_string()),
+        }))
+        .unwrap();
+        assert_eq!(session["status"], "ok");
+        assert_eq!(session["data"]["backend"], "server-exit-b");
+        assert_eq!(session["data"]["grant_id"], "operator-grant:server-exit:b");
+        assert_eq!(
+            session["data"]["carrier"]["connect_ticket"],
+            "carrier-ticket-server-exit-b"
+        );
+
+        let blocked = provider.handle(Request::OpenStream {
+            target: "tls://example.com:443".to_string(),
+            principal_id: Some("person:local:alice".to_string()),
+            reason: None,
+            stream_nonce: None,
+            remote_exit_id: Some("../server-exit-b".to_string()),
+        });
+        assert_eq!(error_code(blocked), "invalid_request");
+    }
+
+    #[test]
+    fn remote_carrier_exit_discovery_is_principal_scoped_and_policy_filtered() {
+        let mut provider = ExitProvider::new();
+        let init = provider.init(json!({
+            "remote_carrier_exits": [{
+                "id": "server-exit",
+                "grant_id": "operator-grant:server-exit:alice",
+                "peer_did": "did:elastos:server",
+                "connect_ticket": "carrier-ticket-server-exit-alice",
+                "allowed_principals": ["person:local:alice"],
+                "allowed_hosts": ["*.example.com"],
+                "allowed_schemes": ["tls"],
+                "allowed_ports": [443],
+                "max_active_streams": 2
+            }, {
+                "id": "friend-exit",
+                "grant_id": "operator-grant:friend-exit:bob",
+                "peer_did": "did:elastos:friend",
+                "connect_ticket": "carrier-ticket-friend-exit-bob",
+                "allowed_principals": ["person:local:bob"],
+                "allowed_hosts": ["example.net"],
+                "allowed_schemes": ["tls"],
+                "allowed_ports": [443],
+                "max_active_streams": 1
+            }]
+        }));
+        assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+
+        assert_eq!(
+            error_code(provider.handle(Request::DiscoverRemoteCarrierExits {
+                principal_id: None,
+                target: None,
+            })),
+            "exit_permission_denied"
+        );
+
+        let discovery =
+            serde_json::to_value(provider.handle(Request::DiscoverRemoteCarrierExits {
+                principal_id: Some("person:local:alice".to_string()),
+                target: Some("tls://www.example.com:443".to_string()),
+            }))
+            .unwrap();
+        assert_eq!(discovery["status"], "ok");
+        assert_eq!(
+            discovery["data"]["schema"],
+            "elastos.exit.remote-carrier.discovery/v1"
+        );
+        let exits = discovery["data"]["remote_carrier_exits"]
+            .as_array()
+            .unwrap();
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0]["id"], "server-exit");
+        assert_eq!(exits[0]["grant_id"], "operator-grant:server-exit:alice");
+        assert_eq!(exits[0]["byte_transport"], "carrier_stream");
+        assert_eq!(exits[0]["carrier"]["peer_did"], "did:elastos:server");
+        assert_eq!(
+            exits[0]["carrier"].get("connect_ticket"),
+            None,
+            "discovery must not expose private Carrier route tickets"
+        );
+        assert_eq!(
+            exits[0]["accounting"]["grant_id"],
+            "operator-grant:server-exit:alice"
+        );
+        assert_eq!(exits[0]["accounting"]["max_active_streams"], 2);
+        assert_eq!(exits[0]["allowed_principals"], serde_json::Value::Null);
+        assert_eq!(discovery["data"]["direct_network"], false);
+
+        let status =
+            serde_json::to_value(provider.status(Some("person:local:alice".to_string()))).unwrap();
+        let status_exits = status["data"]["remote_carrier_exits"].as_array().unwrap();
+        assert_eq!(status_exits.len(), 1);
+        assert_eq!(status_exits[0]["id"], "server-exit");
+        assert_eq!(status_exits[0].get("connect_ticket"), None);
+        assert_eq!(
+            status_exits[0]["allowed_principals"],
+            serde_json::Value::Null
+        );
+
+        let filtered = serde_json::to_value(provider.handle(Request::DiscoverRemoteCarrierExits {
+            principal_id: Some("person:local:alice".to_string()),
+            target: Some("tls://example.net:443".to_string()),
+        }))
+        .unwrap();
+        assert_eq!(
+            filtered["data"]["remote_carrier_exits"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn remote_carrier_exit_expired_grant_is_diagnosable_but_not_usable() {
+        let mut provider = ExitProvider::new();
+        let init = provider.init(json!({
+            "remote_carrier_exits": [{
+                "id": "server-exit",
+                "grant_id": "operator-grant:server-exit:alice",
+                "peer_did": "did:elastos:server",
+                "connect_ticket": "carrier-ticket-server-exit-alice",
+                "allowed_principals": ["person:local:alice"],
+                "allowed_hosts": ["example.com"],
+                "allowed_schemes": ["tls"],
+                "allowed_ports": [443],
+                "max_active_streams": 2,
+                "expires_at": 1
+            }]
+        }));
+        assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+
+        let status =
+            serde_json::to_value(provider.status(Some("person:local:alice".to_string()))).unwrap();
+        let exit = &status["data"]["remote_carrier_exits"][0];
+        assert_eq!(exit["state"], "expired");
+        assert_eq!(exit["policy"]["expires_at"], 1);
+        assert_eq!(exit["accounting"]["grant_expires_at"], 1);
+
+        let discovery =
+            serde_json::to_value(provider.handle(Request::DiscoverRemoteCarrierExits {
+                principal_id: Some("person:local:alice".to_string()),
+                target: Some("tls://example.com:443".to_string()),
+            }))
+            .unwrap();
+        assert_eq!(discovery["status"], "ok");
+        assert_eq!(
+            discovery["data"]["remote_carrier_exits"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        assert_eq!(
+            error_code(provider.quote(
+                "tls://example.com:443",
+                Some("person:local:alice".to_string()),
+                None,
+            )),
+            "exit_permission_denied"
+        );
+        assert_eq!(
+            error_code(provider.open_stream(
+                "tls://example.com:443",
+                Some("person:local:alice".to_string()),
+                None,
+            )),
+            "exit_permission_denied"
+        );
+    }
+
+    #[test]
+    fn remote_carrier_exit_enforces_active_stream_quota() {
+        let mut provider = ExitProvider::new();
+        let init = provider.init(json!({
+            "remote_carrier_exits": [{
+                "id": "server-exit",
+                "grant_id": "operator-grant:server-exit:alice",
+                "peer_did": "did:elastos:server",
+                "connect_ticket": "carrier-ticket-server-exit-alice",
+                "allowed_principals": ["person:local:alice"],
+                "allowed_hosts": ["example.com"],
+                "max_active_streams": 1
+            }]
+        }));
+        assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+
+        let first = serde_json::to_value(provider.open_stream(
+            "tls://example.com:443",
+            Some("person:local:alice".to_string()),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(first["status"], "ok");
+        assert_eq!(
+            error_code(provider.open_stream(
+                "tls://example.com:443",
+                Some("person:local:alice".to_string()),
+                None,
+            )),
+            "exit_quota_exceeded"
+        );
+
+        let stream_id = first["data"]["stream_id"].as_str().unwrap();
+        let close = serde_json::to_value(
+            provider.close_stream(stream_id, Some("person:local:alice".to_string())),
+        )
+        .unwrap();
+        assert_eq!(close["status"], "ok");
+        assert_eq!(close["data"]["closed"], true);
+        assert_eq!(
+            close["data"]["grant_id"],
+            "operator-grant:server-exit:alice"
+        );
+
+        let second = serde_json::to_value(provider.open_stream(
+            "tls://example.com:443",
+            Some("person:local:alice".to_string()),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(second["status"], "ok");
+        assert_eq!(second["data"]["accounting"]["active_streams"], 1);
+        assert_eq!(second["data"]["accounting"]["reserved_streams"], 2);
+    }
+
+    #[test]
+    fn remote_carrier_exit_enforces_principal_stream_quota_on_shared_grant() {
+        let mut provider = ExitProvider::new();
+        let init = provider.init(json!({
+            "remote_carrier_exits": [{
+                "id": "server-exit",
+                "grant_id": "operator-grant:server-exit:shared",
+                "peer_did": "did:elastos:server",
+                "connect_ticket": "carrier-ticket-server-exit-shared",
+                "allowed_principals": ["person:local:alice", "person:local:bob"],
+                "allowed_hosts": ["example.com"],
+                "max_active_streams": 2,
+                "max_active_streams_per_principal": 1
+            }]
+        }));
+        assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+
+        let alice = serde_json::to_value(provider.open_stream(
+            "tls://example.com:443",
+            Some("person:local:alice".to_string()),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(alice["status"], "ok");
+        assert_eq!(
+            alice["data"]["accounting"]["max_active_streams_per_principal"],
+            1
+        );
+        assert_eq!(
+            alice["data"]["accounting"]["principal_active_streams_remaining"],
+            0
+        );
+        assert_eq!(
+            error_code(provider.open_stream(
+                "tls://example.com:443",
+                Some("person:local:alice".to_string()),
+                None,
+            )),
+            "exit_quota_exceeded"
+        );
+        assert_eq!(
+            error_code(provider.quote(
+                "tls://example.com:443",
+                Some("person:local:alice".to_string()),
+                None,
+            )),
+            "exit_quota_exceeded"
+        );
+
+        let bob = serde_json::to_value(provider.open_stream(
+            "tls://example.com:443",
+            Some("person:local:bob".to_string()),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(bob["status"], "ok");
+        assert_eq!(bob["data"]["accounting"]["active_streams"], 2);
+        assert_eq!(bob["data"]["accounting"]["active_streams_remaining"], 0);
+        assert_eq!(
+            bob["data"]["accounting"]["principal_active_streams_remaining"],
+            0
+        );
+    }
+
+    #[test]
+    fn remote_carrier_exit_close_requires_stream_owner() {
+        let mut provider = ExitProvider::new();
+        let init = provider.init(json!({
+            "remote_carrier_exits": [{
+                "id": "server-exit",
+                "grant_id": "operator-grant:server-exit:shared",
+                "peer_did": "did:elastos:server",
+                "connect_ticket": "carrier-ticket-server-exit-shared",
+                "allowed_principals": ["person:local:alice", "person:local:bob"],
+                "allowed_hosts": ["example.com"],
+                "max_active_streams": 1
+            }]
+        }));
+        assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+
+        let session = serde_json::to_value(provider.open_stream(
+            "tls://example.com:443",
+            Some("person:local:alice".to_string()),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(session["status"], "ok");
+
+        let stream_id = session["data"]["stream_id"].as_str().unwrap();
+        assert_eq!(
+            error_code(provider.close_stream(stream_id, Some("person:local:bob".to_string()))),
+            "exit_permission_denied"
+        );
+        assert_eq!(
+            error_code(provider.open_stream(
+                "tls://example.com:443",
+                Some("person:local:bob".to_string()),
+                None,
+            )),
+            "exit_quota_exceeded"
+        );
+
+        let close = serde_json::to_value(
+            provider.close_stream(stream_id, Some("person:local:alice".to_string())),
+        )
+        .unwrap();
+        assert_eq!(close["status"], "ok");
+        assert_eq!(close["data"]["closed"], true);
+
+        let reopened = serde_json::to_value(provider.open_stream(
+            "tls://example.com:443",
+            Some("person:local:bob".to_string()),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(reopened["status"], "ok");
+    }
+
+    #[test]
+    fn remote_carrier_exit_accounting_is_principal_scoped() {
+        let mut provider = ExitProvider::new();
+        let init = provider.init(json!({
+            "remote_carrier_exits": [{
+                "id": "server-exit",
+                "grant_id": "operator-grant:server-exit:shared",
+                "peer_did": "did:elastos:server",
+                "connect_ticket": "carrier-ticket-server-exit-shared",
+                "allowed_principals": ["person:local:alice", "person:local:bob"],
+                "allowed_hosts": ["example.com"],
+                "max_active_streams": 3
+            }]
+        }));
+        assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+
+        let alice = serde_json::to_value(provider.open_stream(
+            "tls://example.com:443",
+            Some("person:local:alice".to_string()),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(alice["status"], "ok");
+        let bob = serde_json::to_value(provider.open_stream(
+            "tls://example.com:443",
+            Some("person:local:bob".to_string()),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(bob["status"], "ok");
+
+        let status =
+            serde_json::to_value(provider.status(Some("person:local:alice".to_string()))).unwrap();
+        let accounting = &status["data"]["remote_carrier_exits"][0]["accounting"];
+        assert_eq!(accounting["active_streams"], 2);
+        assert_eq!(accounting["principal_id"], "person:local:alice");
+        assert_eq!(accounting["principal_active_streams"], 1);
+
+        let discovery =
+            serde_json::to_value(provider.handle(Request::DiscoverRemoteCarrierExits {
+                principal_id: Some("person:local:alice".to_string()),
+                target: Some("tls://example.com:443".to_string()),
+            }))
+            .unwrap();
+        let discovery_accounting = &discovery["data"]["remote_carrier_exits"][0]["accounting"];
+        assert_eq!(discovery_accounting["active_streams"], 2);
+        assert_eq!(discovery_accounting["principal_id"], "person:local:alice");
+        assert_eq!(discovery_accounting["principal_active_streams"], 1);
+
+        let alice_stream_id = alice["data"]["stream_id"].as_str().unwrap();
+        let close = serde_json::to_value(
+            provider.close_stream(alice_stream_id, Some("person:local:alice".to_string())),
+        )
+        .unwrap();
+        assert_eq!(close["status"], "ok");
+
+        let status =
+            serde_json::to_value(provider.status(Some("person:local:alice".to_string()))).unwrap();
+        let accounting = &status["data"]["remote_carrier_exits"][0]["accounting"];
+        assert_eq!(accounting["active_streams"], 1);
+        assert_eq!(accounting["principal_active_streams"], 0);
+    }
+
+    #[test]
+    fn remote_carrier_exit_config_rejects_missing_permission_and_hidden_fields() {
+        let mut provider = ExitProvider::new();
+        assert_eq!(
+            error_code(provider.init(json!({
+                "remote_carrier_exits": [{
+                    "id": "server-exit",
+                    "peer_did": "did:elastos:server",
+                    "allowed_principals": ["person:local:alice"],
+                    "allowed_hosts": ["example.com"]
+                }]
+            }))),
+            "invalid_config"
+        );
+        assert_eq!(
+            error_code(provider.init(json!({
+                "remote_carrier_exits": [{
+                    "id": "server-exit",
+                    "grant_id": "operator-grant:server-exit:alice",
+                    "peer_did": "did:elastos:server",
+                    "allowed_hosts": ["example.com"]
+                }]
+            }))),
+            "invalid_config"
+        );
+        assert_eq!(
+            error_code(provider.init(json!({
+                "remote_carrier_exits": [{
+                    "id": "server-exit",
+                    "grant_id": "operator-grant:server-exit:alice",
+                    "peer_did": "did:elastos:server",
+                    "allowed_principals": ["person:local:alice"],
+                    "allowed_hosts": ["example.com"]
+                }]
+            }))),
+            "invalid_config"
+        );
+        assert_eq!(
+            error_code(provider.init(json!({
+                "remote_carrier_exits": [{
+                    "id": "server-exit",
+                    "grant_id": "operator-grant:server-exit:alice",
+                    "peer_did": "did:elastos:server",
+                    "connect_ticket": "carrier-ticket-server-exit-alice",
+                    "allowed_principals": ["person:local:alice"],
+                    "allowed_hosts": ["example.com"],
+                    "raw_socket": true
+                }]
+            }))),
+            "invalid_config"
+        );
+        assert_eq!(
+            error_code(provider.init(json!({
+                "remote_carrier_exits": [{
+                    "id": "server-exit",
+                    "grant_id": "operator-grant:server-exit:alice",
+                    "peer_did": "did:elastos:server",
+                    "allowed_principals": ["person:local:alice"],
+                    "allowed_hosts": ["example.com"],
+                    "connect_ticket": " ticket-with-padding"
+                }]
+            }))),
+            "invalid_config"
+        );
+        assert_eq!(
+            error_code(provider.init(json!({
+                "remote_carrier_exits": [{
+                    "id": "server-exit",
+                    "grant_id": "operator-grant:server-exit:alice",
+                    "peer_did": "did:elastos:server",
+                    "allowed_principals": ["person:local:alice"],
+                    "allowed_hosts": ["example.com"],
+                    "max_active_streams": 2,
+                    "max_active_streams_per_principal": 0
+                }]
+            }))),
+            "invalid_config"
+        );
+        assert_eq!(
+            error_code(provider.init(json!({
+                "remote_carrier_exits": [{
+                    "id": "server-exit",
+                    "grant_id": "operator-grant:server-exit:alice",
+                    "peer_did": "did:elastos:server",
+                    "allowed_principals": ["person:local:alice"],
+                    "allowed_hosts": ["example.com"],
+                    "max_active_streams": 2,
+                    "max_active_streams_per_principal": 3
+                }]
+            }))),
+            "invalid_config"
+        );
+        assert_eq!(
+            error_code(provider.init(json!({
+                "remote_carrier_exits": [{
+                    "id": "server-exit",
+                    "grant_id": "operator-grant:server-exit:alice",
+                    "peer_did": "did:elastos:server",
+                    "allowed_principals": ["person:local:alice"],
+                    "allowed_hosts": ["example.com"],
+                    "expires_at": 0
+                }]
+            }))),
+            "invalid_config"
         );
     }
 

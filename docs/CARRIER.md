@@ -24,6 +24,20 @@ same-runtime call may be routed in-process, over stdio, over a browser adapter,
 or through loopback HTTP, but that is adapter plumbing below the capsule kernel.
 The capsule contract is still Carrier-shaped: signed capability envelope,
 target object/service, action, payload, response, subscription, and audit.
+Carrier must remain location-explicit message passing, not transparent remote
+objects. Typed interface descriptors may describe a provider method, but Runtime
+capabilities still authorize the call and remote failures must stay visible to
+the caller.
+
+### Trusted-Source Room Bootstrap
+
+Chat Room sync normally uses the Runtime peer provider. The install/update
+trusted-source path has one reviewed exception: the Runtime-owned
+trusted-source Room bootstrap exception may read the configured publisher
+Carrier ticket and use it to seed the internal Room gossip topic. This is a
+Runtime transport bootstrap, not a capsule capability. The raw trusted-source
+ticket, decoded endpoints, and direct Carrier socket authority must not appear
+in Home/Room summaries, ordinary capsule payloads, or user-facing receipts.
 
 ```
 ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
@@ -179,6 +193,174 @@ Configured stream backends can return two private Unix-socket descriptors:
 `elastos.adapter-ipc/v1` for the engine-side bridge and
 `elastos.exit.relay-ipc/v1` for an operator/Carrier Exit daemon. Runtime owns
 the socket between them.
+Remote Carrier exits are the cross-runtime form of the same internal Exit
+handoff. They are configured on `exit-provider` as `remote_carrier_exits` with a
+remote Runtime DID/service, private `connect_ticket`, stable operator
+`grant_id`, allowlisted principals, allowlisted public hosts/schemes/ports, an
+optional `expires_at` Unix timestamp, a global active-stream quota, and an
+optional per-principal active-stream quota.
+Expired grants remain diagnosable as `state=expired` in provider status, but
+are excluded from discovery and rejected by `quote` / `open_stream`. The returned
+`elastos.exit.remote-carrier.discovery/v1` response is principal-scoped and lists
+only permitted Carrier stream exits, with the grant id, policy, and accounting
+but no allowed-principal list, host socket, relay socket, or direct TCP
+authority. `quote` is also a preview surface and does not expose private route
+metadata. The `elastos.exit.remote-carrier-session/v1` receipt carries
+`byte_transport=carrier_stream`, the grant id, and a Carrier peer/service
+descriptor with the private `connect_ticket` consumed by the Runtime-owned
+Carrier stream bridge. Browser capsules and Browser summary responses never
+receive the ticket, a host socket, a relay socket, or direct TCP authority.
+The local Browser engine still receives only a Runtime-owned Unix stream socket.
+Runtime opens the remote byte path with the Carrier `browser_exit_stream`
+operation, and the remote runtime must delegate to its own `exit-provider`
+`open_stream` policy. Bytes flow only after that remote provider returns a
+private `elastos.exit.relay-ipc/v1` descriptor; otherwise the Carrier stream
+fails closed.
+Before collecting operator evidence, check that the installed source and exit
+configs are in the remote-only shape for the reviewed route:
+
+```bash
+node scripts/remote-carrier-exit-readiness.mjs \
+  --source-config /path/to/source/exit-provider.json \
+  --exit-config /path/to/remote/exit-provider.json \
+  --principal person:local:alice \
+  --grant-id operator-grant:server-exit:alice \
+  --target tls://example.com:443 \
+  --exit-did did:elastos:server
+```
+
+Also check the installed gateway and `exit-provider` artifacts for the Browser
+Carrier stream operation and remote Carrier Exit provider contracts. Config
+readiness is not enough if the running binaries are stale:
+
+```bash
+node scripts/remote-carrier-exit-artifact-readiness.mjs \
+  --gateway-bin /path/to/elastos \
+  --exit-provider-bin /path/to/exit-provider
+```
+
+For public live, prepare the artifact replacement as a dry-run update plan before
+touching the server. The plan reuses the same artifact-readiness guard, records
+candidate hashes, names the live backup/stage/install/verify/rollback commands,
+copies candidates to a server-side staging directory before install, labels
+which commands run on the operator workstation versus the public server, rejects
+non-Linux or non-`x86_64` candidates such as local macOS Mach-O builds, and
+keeps `mutation_allowed=false` until an operator explicitly approves deployment.
+For the current public server, candidates must be Linux x86_64 ELF binaries:
+
+```bash
+node scripts/remote-carrier-exit-public-live-plan.mjs \
+  --candidate-gateway-bin elastos/target/release/elastos \
+  --candidate-exit-provider-bin capsules/exit-provider/target/release/exit-provider \
+  --installed-artifact-readiness /tmp/elastos-public-live-installed-readiness.json
+```
+
+The plan is not acceptance evidence by itself. After approval and restart, rerun
+installed artifact readiness against the public-live paths, then collect route
+readiness, Browser machine proof, and operator evidence for the reviewed remote
+Carrier exit lane.
+
+To create the source-side candidate config from an exit runtime ticket without
+printing the private ticket, write the ticket to a local owner-only file, or
+save the exit runtime's `elastos.carrier.bootstrap/v1` JSON directly, and
+generate a candidate first:
+
+```bash
+node scripts/remote-carrier-exit-source-config.mjs \
+  --source-config /path/to/source/exit-provider.json \
+  --exit-config /path/to/remote/exit-provider.json \
+  --exit-ticket-file /path/to/private-exit-ticket.txt-or-bootstrap.json \
+  --exit-peer-did did:elastos:server \
+  --principal person:local:alice \
+  --grant-id operator-grant:server-exit:alice \
+  --target tls://example.com:443 \
+  --candidate-config /tmp/source-exit-provider.remote.json \
+  --receipt-out /tmp/source-exit-provider.remote-receipt.json
+```
+
+The generated receipt is redacted and readiness-bound; it records that a ticket
+exists and the ticket digest, but not the ticket itself. Only rerun with
+`--install` after reviewing the candidate, because installing replaces the
+source `exit-provider.json` with the remote-only config and backs up the old
+local-exit config beside it. Restart the source runtime/gateway after install
+so `exit-provider` reloads the config.
+
+For the product Browser settings path, where the user must choose between a
+local exit and a seed-node exit, keep the local backend and add the remote grant
+instead of using the remote-only acceptance shape:
+
+```bash
+node scripts/remote-carrier-exit-source-config.mjs \
+  --source-config /path/to/source/exit-provider.json \
+  --exit-config /path/to/remote/exit-provider.json \
+  --exit-ticket-file /path/to/private-exit-ticket.txt-or-bootstrap.json \
+  --exit-peer-did did:elastos:server \
+  --principal person:local:alice \
+  --grant-id operator-grant:server-exit:alice \
+  --remote-exit-id seed-node \
+  --target tls://ela.city:443 \
+  --allowed-scheme tcp \
+  --allowed-scheme tls \
+  --allowed-port 80 \
+  --allowed-port 443 \
+  --candidate-config /tmp/source-exit-provider.with-seed.json \
+  --receipt-out /tmp/source-exit-provider.with-seed-receipt.json \
+  --keep-local-backends
+```
+
+Review the candidate, then rerun with `--install --keep-local-backends` and
+restart the source runtime. Browser settings will show `Local Runtime exit` plus
+the remote seed option for principals covered by the grant. This selectable
+product mode is not the strict remote-only acceptance lane; use the default
+remote-only mode when collecting proof that no local fallback exists.
+
+The readiness report must pass before acceptance evidence is meaningful. It
+fails if the Browser source still has a local Exit backend fallback, if the
+selected `remote_carrier_exits` grant is missing, expired, not permitted for the
+reviewed principal or target, lacks a private route ticket, or points at the
+wrong exit DID. It also fails if the remote exit runtime lacks a target-matching
+`stream_relay` backend with private `adapter_ipc` and `relay_ipc` descriptors.
+The report hash-binds the source and exit config files with `config_sha256`,
+records only whether private route material exists, and never prints the
+`connect_ticket` or IPC paths from private descriptors.
+Before claiming real operator-to-operator Browser Exit acceptance, record
+operator evidence with:
+
+```bash
+node scripts/remote-carrier-exit-operator-report.mjs --template \
+  > /tmp/elastos-remote-carrier-exit-operator-evidence.json
+node scripts/remote-carrier-exit-operator-report.mjs \
+  --input /tmp/elastos-remote-carrier-exit-operator-evidence.json
+```
+
+The report must describe two distinct runtimes with fixed source/exit roles and
+distinct endpoint evidence, `carrier_stream` byte transport, the
+`browser_exit_stream` operation, remote `exit-provider` relay handoff, redacted
+ticket handling, no raw socket/DNS authority to the Browser capsule, target
+allowlist enforcement, accounting/quota or close evidence, cleanup, and the
+hash-bound redacted artifact references for the local Carrier authority check,
+installed artifact readiness report, route-readiness report, source gateway log,
+exit gateway log, and Browser machine proof. Each artifact reference carries a redacted local or
+remote path plus the SHA-256 digest of the reviewed redacted artifact; a path
+without a digest is not acceptance evidence.
+The route section must name the reviewed principal, grant id, and target.
+Two-runtime evidence must cite the exact source/exit runtime DIDs and endpoint
+evidence. Discovery, policy, accounting, quota/close, stream transport, and
+cleanup evidence must cite the exact route nouns instead of relying on generic
+operator prose.
+When the redacted artifact path is available locally, the validator checks the
+digest against the file and scans the reviewed artifact for private route
+material before accepting the report. A local Browser machine-proof artifact
+must also cite the reviewed route target or target host before acceptance;
+local installed artifact readiness artifacts must be
+`elastos.remote-carrier-exit.artifact-readiness/v1` reports with `ok=true`;
+local route-readiness artifacts must be
+`elastos.remote-carrier-exit.readiness/v1` reports with `ok=true`, matching
+route principal/grant/target, and source/exit `config_sha256` values;
+remote-only paths still need the operator-provided digest and review trail.
+The validator rejects unreviewed templates and any evidence that includes
+private route material such as `connect_ticket`, `relay_ipc`, `adapter_ipc`,
+`runtime_stream_path`, or ticket secrets.
 The internal `browser-engine-adapter` provider is the matching engine boundary:
 it reports adapter status and refuses page launch unless the stream session has
 attached `adapter_ipc` byte transport. This keeps CEF/Chromium/WebView work

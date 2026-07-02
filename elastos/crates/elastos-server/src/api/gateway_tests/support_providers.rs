@@ -1,5 +1,21 @@
 struct MockChainProvider;
 
+fn mock_chain_broadcast_counts() -> &'static std::sync::Mutex<HashMap<String, usize>> {
+    static COUNTS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    COUNTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn reset_mock_chain_broadcast_count(signed_transaction: &str) {
+    let mut counts = mock_chain_broadcast_counts().lock().unwrap();
+    counts.remove(signed_transaction);
+}
+
+fn mock_chain_broadcast_count(signed_transaction: &str) -> usize {
+    let counts = mock_chain_broadcast_counts().lock().unwrap();
+    counts.get(signed_transaction).copied().unwrap_or(0)
+}
+
 #[async_trait::async_trait]
 impl Provider for MockChainProvider {
     async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
@@ -232,6 +248,45 @@ impl Provider for MockChainProvider {
                     }]
                 }
             })),
+            Some("transaction") => {
+                let hash = required_test_str(request, "hash")?;
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "network": request
+                            .get("network")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("esc-mainnet"),
+                        "hash": hash,
+                        "transaction": {
+                            "hash": hash,
+                            "from": "0x1111111111111111111111111111111111111111",
+                            "to": "0x2222222222222222222222222222222222222222",
+                            "value": "0x1",
+                            "blockNumber": "0x2a"
+                        }
+                    }
+                }))
+            }
+            Some("receipt") => {
+                let hash = required_test_str(request, "hash")?;
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "network": request
+                            .get("network")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("esc-mainnet"),
+                        "hash": hash,
+                        "receipt": {
+                            "transactionHash": hash,
+                            "status": "0x1",
+                            "blockNumber": "0x2a",
+                            "logs": []
+                        }
+                    }
+                }))
+            }
             Some("prepare_transaction") => {
                 let network = required_test_str(request, "network")?;
                 let chain_id = if network == "base-mainnet" { 8453 } else { 20 };
@@ -262,14 +317,19 @@ impl Provider for MockChainProvider {
                     }
                 }))
             }
-            Some("broadcast_transaction") => Ok(json!({
-                "status": "ok",
-                "data": {
-                    "schema": "elastos.chain.broadcast_receipt/v1",
-                    "network": required_test_str(request, "network")?,
-                    "transaction_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                }
-            })),
+            Some("broadcast_transaction") => {
+                let signed_transaction = required_test_str(request, "signed_transaction")?;
+                let mut counts = mock_chain_broadcast_counts().lock().unwrap();
+                *counts.entry(signed_transaction.to_string()).or_insert(0) += 1;
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.chain.broadcast_receipt/v1",
+                        "network": required_test_str(request, "network")?,
+                        "transaction_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }
+                }))
+            }
             Some("erc1271_is_valid_signature") => {
                 let signature = required_test_str(request, "signature")?;
                 let signature_bytes = hex::decode(signature.trim_start_matches("0x"))
@@ -1745,6 +1805,22 @@ impl Provider for MockMalformedNetProvider {
 
 struct MockExitProvider;
 struct MockMalformedExitProvider;
+struct MockRemoteCarrierExitProvider {
+    close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    close_failures_remaining: Arc<TokioMutex<usize>>,
+}
+
+impl MockRemoteCarrierExitProvider {
+    fn with_close_failures(
+        close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+        failures: usize,
+    ) -> Self {
+        Self {
+            close_calls,
+            close_failures_remaining: Arc::new(TokioMutex::new(failures)),
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl Provider for MockExitProvider {
@@ -1848,6 +1924,139 @@ impl Provider for MockMalformedExitProvider {
     }
 }
 
+#[async_trait::async_trait]
+impl Provider for MockRemoteCarrierExitProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "mock remote-carrier exit provider only supports raw requests".to_string(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["exit"]
+    }
+
+    fn name(&self) -> &'static str {
+        "mock-remote-carrier-exit"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let principal_id = request
+            .get("principal_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("did:elastos:test");
+        if request.get("op").and_then(|value| value.as_str()) == Some("close_stream") {
+            self.close_calls.lock().await.push(request.clone());
+            let mut failures_remaining = self.close_failures_remaining.lock().await;
+            if *failures_remaining > 0 {
+                *failures_remaining -= 1;
+                return Ok(json!({
+                    "status": "error",
+                    "code": "close_stream_failed",
+                    "message": "simulated remote Carrier Exit close_stream failure"
+                }));
+            }
+            return Ok(json!({
+                "status": "ok",
+                "data": {
+                    "schema": "elastos.exit.close-stream/v1",
+                    "closed": true,
+                    "stream_id": request.get("stream_id").cloned().unwrap_or_else(|| json!("")),
+                    "principal_id": request.get("principal_id").cloned().unwrap_or(serde_json::Value::Null),
+                    "byte_transport": "carrier_stream"
+                }
+            }));
+        }
+        if request.get("op").and_then(|value| value.as_str()) == Some("open_stream") {
+            if request
+                .get("remote_exit_id")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value != "mock-remote-carrier-exit")
+            {
+                return Ok(json!({
+                    "status": "error",
+                    "code": "exit_policy_blocked",
+                    "message": "selected mock Remote Carrier Exit is not available"
+                }));
+            }
+            let stream_id = request
+                .get("stream_nonce")
+                .and_then(|value| value.as_str())
+                .filter(|value| {
+                    !value.is_empty()
+                        && value.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_')
+                        })
+                })
+                .map(|nonce| format!("remote-carrier:mock:test:{nonce}"))
+                .unwrap_or_else(|| "remote-carrier:mock:test".to_string());
+            return Ok(json!({
+                "status": "ok",
+                "data": {
+                    "schema": "elastos.exit.remote-carrier-session/v1",
+                    "backend": "mock-remote-carrier-exit",
+                    "grant_id": "operator-grant:mock-remote-carrier-exit:test",
+                    "stream_id": stream_id,
+                    "target": request.get("target").cloned().unwrap_or_else(|| json!("")),
+                    "principal_id": principal_id,
+                    "reason": request.get("reason").cloned().unwrap_or(serde_json::Value::Null),
+                    "scheme": "tls",
+                    "host": "glidefinance.io",
+                    "engine_owns_tls": true,
+                    "state": "reserved",
+                    "byte_transport": "carrier_stream",
+                    "carrier": {
+                        "schema": "elastos.exit.remote-carrier/v1",
+                        "peer_did": "did:elastos:remote-exit",
+                        "carrier_service": "elastos://exit/open_stream",
+                        "grant_id": "operator-grant:mock-remote-carrier-exit:test",
+                        "transport": "carrier_stream",
+                        "connect_ticket": "mock-private-carrier-connect-ticket"
+                    },
+                    "accounting": {
+                        "grant_id": "operator-grant:mock-remote-carrier-exit:test",
+                        "principal_id": principal_id,
+                        "active_streams": 1,
+                        "max_concurrent_streams": 2,
+                        "egress_bytes": 0,
+                        "ingress_bytes": 0
+                    }
+                }
+            }));
+        }
+        Ok(json!({
+            "status": "ok",
+            "data": {
+                "provider": "exit-provider",
+                "status": "backend_configured",
+                "direct_network": false,
+                "operations": ["discover_remote_carrier_exits", "quote", "open_stream", "close_stream"],
+                "backend_count": 0,
+                "remote_carrier_exit_count": 1,
+                "remote_carrier_exits": [{
+                    "id": "mock-remote-carrier-exit",
+                    "grant_id": "operator-grant:mock-remote-carrier-exit:test",
+                    "peer_did": "did:elastos:remote-exit",
+                    "carrier_service": "elastos://exit/open_stream",
+                    "carrier": {
+                        "schema": "elastos.exit.remote-carrier/v1",
+                        "peer_did": "did:elastos:remote-exit",
+                        "carrier_service": "elastos://exit/open_stream",
+                        "grant_id": "operator-grant:mock-remote-carrier-exit:test",
+                        "transport": "carrier_stream",
+                        "connect_ticket": "mock-private-carrier-connect-ticket"
+                    },
+                    "allowed_for_principal": true,
+                    "transport": "carrier_stream"
+                }]
+            }
+        }))
+    }
+}
+
 struct MockAttachedExitProvider {
     relay_ipc_path: Option<String>,
     stream_id: String,
@@ -1912,7 +2121,17 @@ impl Provider for MockAttachedExitProvider {
             .and_then(|value| value.as_str())
             .is_some());
         if request.get("op").and_then(|value| value.as_str()) == Some("open_stream") {
-            let stream_id = self.stream_id.clone();
+            let stream_id = request
+                .get("stream_nonce")
+                .and_then(|value| value.as_str())
+                .filter(|value| {
+                    !value.is_empty()
+                        && value.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_')
+                        })
+                })
+                .map(|nonce| format!("{}:{nonce}", self.stream_id))
+                .unwrap_or_else(|| self.stream_id.clone());
             let relay_stream_id = stream_id.clone();
             let relay_ipc = self.relay_ipc_path.as_ref().map(|path| {
                 json!({
@@ -1963,6 +2182,7 @@ fn mock_attached_stream_id(cache_dir: &std::path::Path) -> String {
 }
 
 struct MockBrowserEngineProvider;
+struct MockRejectingBrowserEngineProvider;
 struct MockMalformedBrowserEngineProvider;
 
 fn mock_browser_launch_page_id(request: &serde_json::Value) -> String {
@@ -1977,6 +2197,9 @@ fn mock_browser_launch_page_id(request: &serde_json::Value) -> String {
     if url.is_empty() && reason.is_empty() {
         return "page:mock-browser-engine".to_string();
     }
+    if reason.contains("simulate close failure") {
+        return "page:mock-browser-close-fails".to_string();
+    }
     let digest = sha2::Sha256::digest(format!("{url}:{reason}").as_bytes());
     format!("page:mock-browser-engine-{}", hex::encode(&digest[..4]))
 }
@@ -1987,13 +2210,6 @@ fn mock_browser_requested_page_id(request: &serde_json::Value) -> String {
         .and_then(|value| value.as_str())
         .unwrap_or("page:mock-browser-engine")
         .to_string()
-}
-
-fn mock_browser_frame_url(page_id: &str) -> String {
-    format!(
-        "/api/apps/browser/pages/{}/frame",
-        page_id.replace(':', "%3A")
-    )
 }
 
 #[async_trait::async_trait]
@@ -2021,10 +2237,74 @@ impl Provider for MockBrowserEngineProvider {
             .and_then(|value| value.as_str())
             .is_some());
         if request.get("op").and_then(|value| value.as_str()) == Some("launch") {
+            let profile = request
+                .get("profile")
+                .and_then(|value| value.as_object())
+                .expect("Browser launch must include a profile descriptor");
+            assert_eq!(
+                profile.get("schema").and_then(|value| value.as_str()),
+                Some("elastos.browser.profile/v1")
+            );
+            assert_eq!(
+                profile.get("scope").and_then(|value| value.as_str()),
+                Some("active_principal")
+            );
+            assert_eq!(
+                profile.get("storage").and_then(|value| value.as_str()),
+                Some("principal_owned_profile_disk")
+            );
+            assert_eq!(
+                profile
+                    .get("storage_posture")
+                    .and_then(|value| value.as_str()),
+                Some("principal_owned_reset_scoped_unprotected")
+            );
+            assert_eq!(
+                profile.get("protected_storage").and_then(|value| value.as_bool()),
+                Some(false)
+            );
+            assert_eq!(
+                profile.get("encrypted").and_then(|value| value.as_bool()),
+                Some(false)
+            );
+            assert_eq!(
+                profile.get("recoverable").and_then(|value| value.as_bool()),
+                Some(false)
+            );
+            assert_eq!(
+                profile.get("recovery").and_then(|value| value.as_str()),
+                Some("not_recovery_kit_packaged")
+            );
+            assert_eq!(
+                profile.get("public_uri").and_then(|value| value.as_str()),
+                Some("localhost://Users/self/BrowserProfiles/default/profile.ext4")
+            );
+            assert!(profile
+                .get("uri")
+                .and_then(|value| value.as_str())
+                .is_some_and(|uri| {
+                    uri.starts_with("localhost://Users/")
+                        && uri.ends_with("/BrowserProfiles/default/profile.ext4")
+                }));
+            assert!(profile
+                .get("profile_key")
+                .and_then(|value| value.as_str())
+                .is_some_and(|key| key.starts_with("profile-") && key.len() == 72));
+            assert!(profile
+                .get("disk_path")
+                .and_then(|value| value.as_str())
+                .is_some_and(|path| {
+                    path.starts_with('/')
+                        && path.ends_with("/BrowserProfiles/default/profile.ext4")
+                }));
             let stream_session = request
                 .get("stream_session")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            assert_eq!(
+                stream_session.get("schema").and_then(|value| value.as_str()),
+                Some("elastos.exit.stream-session/v1")
+            );
             if stream_session
                 .get("byte_transport")
                 .and_then(|value| value.as_str())
@@ -2063,32 +2343,62 @@ impl Provider for MockBrowserEngineProvider {
                 .and_then(|value| value.get("runtime_stream_path"))
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
+            let adapter_ipc_path = stream_session
+                .get("adapter_ipc")
+                .and_then(|value| value.get("path"))
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            assert!(adapter_ipc_path.starts_with('/'));
+            assert!(adapter_ipc_path.ends_with(".sock"));
             assert!(runtime_stream_path.contains("elastos-browser-streams"));
             assert!(runtime_stream_path.ends_with(".sock"));
+            assert_ne!(adapter_ipc_path, runtime_stream_path);
             let viewport = request
                 .get("viewport")
+                .filter(|value| value.is_object())
                 .cloned()
                 .unwrap_or_else(|| json!({"width": 1280, "height": 720}));
             let display_mode = request
                 .get("display_mode")
                 .and_then(|value| value.as_str())
                 .unwrap_or("webrtc_remote_display");
-            if display_mode != "diagnostic_frame" {
+            if display_mode != "webrtc_remote_display" {
                 return Ok(json!({
                     "status": "error",
                     "code": "display_session_unavailable",
                     "message": format!("{display_mode} display sessions are unavailable in the mock browser engine")
                 }));
             }
+            if request
+                .get("url")
+                .and_then(|value| value.as_str())
+                .is_some_and(|url| url.contains("slow-open.invalid"))
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            if request
+                .get("url")
+                .and_then(|value| value.as_str())
+                .is_some_and(|url| url.contains("capacity-unavailable.invalid"))
+            {
+                return Ok(json!({
+                    "status": "error",
+                    "code": "browser_capacity_unavailable",
+                    "message": "Browser Engine Adapter has reached its active session limit (1)"
+                }));
+            }
             let page_id = mock_browser_launch_page_id(request);
-            let frame_url = mock_browser_frame_url(&page_id);
+            let adapter = request
+                .get("adapter_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("mock-browser-engine");
             return Ok(json!({
                 "status": "ok",
                 "data": {
                     "schema": "elastos.browser.engine.page/v1",
                     "page_id": page_id,
-                    "adapter": "mock-browser-engine",
-                    "engine": "contract_proof",
+                    "adapter": adapter,
+                    "engine": "selkies_gstreamer",
                     "url": request.get("url").cloned().unwrap_or_else(|| json!("")),
                     "stream_id": stream_session.get("stream_id").cloned().unwrap_or_else(|| json!("")),
                     "network_mode": "runtime_net_only",
@@ -2097,32 +2407,31 @@ impl Provider for MockBrowserEngineProvider {
                     "display_session": {
                         "schema": "elastos.browser.display-session/v1",
                         "session_id": "display:mock-browser-engine",
-                        "mode": "diagnostic_frame",
+                        "mode": "webrtc_remote_display",
+                        "width": viewport["width"],
+                        "height": viewport["height"],
                         "network_mode": "runtime_net_only",
                         "direct_network": false,
-                        "input": "runtime_route",
-                        "audio": false,
-                        "video": false
+                        "input": "datachannel",
+                        "input_protocol": "selkies_v1",
+                        "display_backend": "selkies_gstreamer_webrtc",
+                        "backend_class": "product_compositor",
+                        "media_transport": "runtime_relay",
+                        "audio": true,
+                        "video": true,
+                        "ice_servers": [{
+                            "urls": ["turn:127.0.0.1:3478"],
+                            "username_present": true,
+                            "credential_present": true,
+                            "credential_length": 16
+                        }]
                     },
                     "view": {
                         "schema": "elastos.browser.view/v1",
-                        "mode": "runtime_frame",
+                        "mode": "webrtc_remote_display",
                         "width": viewport["width"],
-                        "height": viewport["height"],
-                        "frame_url": frame_url
+                        "height": viewport["height"]
                     }
-                }
-            }));
-        }
-        if request.get("op").and_then(|value| value.as_str()) == Some("screenshot") {
-            let page_id = mock_browser_requested_page_id(request);
-            return Ok(json!({
-                "status": "ok",
-                "data": {
-                    "schema": "elastos.browser.screenshot/v1",
-                    "page_id": page_id,
-                    "content_type": "image/png",
-                    "base64": base64::engine::general_purpose::STANDARD.encode(b"mock-png")
                 }
             }));
         }
@@ -2134,14 +2443,29 @@ impl Provider for MockBrowserEngineProvider {
                     "schema": "elastos.browser.page-status/v1",
                     "page_id": page_id,
                     "display_mode": "webrtc_remote_display",
+                    "display_session": {
+                        "schema": "elastos.browser.display-session/v1",
+                        "session_id": "display:mock-browser-engine",
+                        "mode": "webrtc_remote_display",
+                        "width": 1280,
+                        "height": 720,
+                        "network_mode": "runtime_net_only",
+                        "direct_network": false,
+                        "input": "datachannel",
+                        "input_protocol": "selkies_v1",
+                        "display_backend": "selkies_gstreamer_webrtc",
+                        "backend_class": "product_compositor",
+                        "media_transport": "runtime_relay",
+                        "audio": true,
+                        "video": true,
+                        "ice_servers": [{
+                            "urls": ["turn:127.0.0.1:3478"],
+                            "username_present": true,
+                            "credential_present": true,
+                            "credential_length": 16
+                        }]
+                    },
                     "actual_url": "https://glidefinance.io/",
-                    "frame_seq": 7,
-                    "frame_count": 42,
-                    "dropped_frames": 3,
-                    "last_frame_age_ms": 25,
-                    "last_frame_decode_ms": 6,
-                    "last_frame_width": 1280,
-                    "last_frame_height": 720,
                     "webrtc_connection_state": "connected",
                     "ice_connection_state": "connected",
                     "ice_gathering_state": "complete",
@@ -2149,29 +2473,34 @@ impl Provider for MockBrowserEngineProvider {
                 }
             }));
         }
-        if request.get("op").and_then(|value| value.as_str()) == Some("frame") {
+        if request.get("op").and_then(|value| value.as_str()) == Some("diagnostics") {
             let page_id = mock_browser_requested_page_id(request);
-            assert_eq!(
-                request.get("since").and_then(|value| value.as_u64()),
-                Some(1)
-            );
-            assert_eq!(
-                request.get("wait_ms").and_then(|value| value.as_u64()),
-                Some(25)
-            );
             return Ok(json!({
                 "status": "ok",
                 "data": {
-                    "schema": "elastos.browser.frame/v1",
+                    "schema": "elastos.browser.page-diagnostics/v1",
                     "page_id": page_id,
-                    "seq": 2,
-                    "changed": true,
-                    "content_type": "image/png",
-                    "base64": base64::engine::general_purpose::STANDARD.encode(b"mock-png-frame"),
-                    "width": 900,
-                    "height": 520,
-                    "actual_url": "https://glidefinance.io/",
-                    "title": "Glide"
+                    "url": "https://glidefinance.io/",
+                    "title": "Glide",
+                    "ready_state": "complete",
+                    "viewport_width": 1280,
+                    "viewport_height": 720,
+                    "clickable_count": 1,
+                    "clickable_elements": [{
+                        "tag": "a",
+                        "text": "Directory",
+                        "aria_label": "",
+                        "role": "",
+                        "href": "https://glidefinance.io/directory",
+                        "disabled": false,
+                        "visible": true,
+                        "rect": { "x": 48, "y": 96, "width": 120, "height": 32 }
+                    }],
+                    "image_count": 3,
+                    "broken_image_count": 1,
+                    "pending_image_count": 0,
+                    "resource_count": 12,
+                    "direct_network": false
                 }
             }));
         }
@@ -2183,13 +2512,19 @@ impl Provider for MockBrowserEngineProvider {
                 "data": {
                     "schema": "elastos.browser.input-result/v1",
                     "page_id": page_id,
-                    "content_type": "image/png",
-                    "screenshot": base64::engine::general_purpose::STANDARD.encode(b"mock-png-after-input")
+                    "accepted": true
                 }
             }));
         }
         if request.get("op").and_then(|value| value.as_str()) == Some("close_page") {
             let page_id = mock_browser_requested_page_id(request);
+            if page_id == "page:mock-browser-close-fails" {
+                return Ok(json!({
+                    "status": "error",
+                    "code": "engine_process_unavailable",
+                    "message": "simulated unreconciled close failure"
+                }));
+            }
             return Ok(json!({
                 "status": "ok",
                 "data": {
@@ -2261,15 +2596,78 @@ impl Provider for MockBrowserEngineProvider {
                 "provider": "browser-engine-adapter",
                 "status": "configured",
                 "adapter_count": 1,
+                "adapters": [{
+                    "id": "mock-browser-engine",
+                    "engine": "selkies_gstreamer",
+                    "default": true,
+                    "backing_substrate": "operator_rbi",
+                    "supported_display_modes": ["webrtc_remote_display"],
+                    "supported_guarantee_levels": ["operator_rbi"],
+                    "network_mode": "runtime_net_only",
+                    "direct_network": false,
+                    "wallet_injection": false
+                }],
                 "direct_network": false,
                 "wallet_injection": false,
                 "stream_session_schema": "elastos.exit.stream-session/v1",
                 "required_byte_transport": "adapter_ipc",
                 "display_session_schema": "elastos.browser.display-session/v1",
-                "supported_display_modes": ["diagnostic_frame"],
-                "operations": ["status", "launch", "attach_stream", "page_status", "screenshot", "frame", "input", "webrtc_signal", "close_page"]
+                "supported_display_modes": ["webrtc_remote_display"],
+                "supported_guarantee_levels": ["operator_rbi"],
+                "operations": ["status", "launch", "attach_stream", "page_status", "diagnostics", "input", "webrtc_signal", "close_page"]
             }
         }))
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for MockRejectingBrowserEngineProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "mock rejecting browser engine only supports raw requests".to_string(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["browser-engine"]
+    }
+
+    fn name(&self) -> &'static str {
+        "mock-rejecting-browser-engine"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        match request.get("op").and_then(|value| value.as_str()) {
+            Some("launch") => Ok(json!({
+                "status": "error",
+                "code": "display_session_unavailable",
+                "message": "Browser Engine Adapter rejected launch after stream reservation"
+            })),
+            Some("status") => Ok(json!({
+                "status": "ok",
+                "data": {
+                    "provider": "browser-engine-adapter",
+                    "status": "configured",
+                    "adapter_count": 1,
+                    "direct_network": false,
+                    "wallet_injection": false,
+                    "stream_session_schema": "elastos.exit.stream-session/v1",
+                    "required_byte_transport": "adapter_ipc",
+                    "display_session_schema": "elastos.browser.display-session/v1",
+                    "supported_display_modes": ["webrtc_remote_display"],
+                    "supported_guarantee_levels": ["operator_rbi"],
+                    "operations": ["status", "launch"]
+                }
+            })),
+            _ => Ok(json!({
+                "status": "error",
+                "code": "unsupported_operation",
+                "message": "mock rejecting browser engine only supports status and launch"
+            })),
+        }
     }
 }
 
@@ -3039,6 +3437,7 @@ impl Provider for MockWalletProvider {
                     "proof_type": account.get("proof_type").cloned().unwrap_or(json!("siwe")),
                     "connector_id": account.get("connector_id").cloned().unwrap_or(json!(null)),
                     "payload_hash": payload_hash,
+                    "payload": payload,
                     "principal_id": principal_id,
                     "created_at": crate::auth::now_ts(),
                     "expires_at": crate::auth::now_ts() + 600
@@ -3275,6 +3674,13 @@ impl Provider for MockWalletProvider {
                 let principal_id = required_test_str(request, "principal_id")?;
                 let request_id = required_test_str(request, "request_id")?;
                 let transaction_hash = required_test_str(request, "transaction_hash")?;
+                if request_id.contains("record-fails") {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "record_failed",
+                        "message": "simulated wallet transaction hash recording failure"
+                    }));
+                }
                 let mut approvals = self.approvals.lock().await;
                 let Some(approval) = approvals.iter_mut().find(|approval| {
                     approval

@@ -103,7 +103,7 @@ pids+=("$!")
 wait_for_file "$kasm_api_info"
 kasm_base_url="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).url)' "$kasm_api_info")"
 
-launch_request='{"schema":"elastos.browser.hosted-product.open/v1","launch_request":{"schema":"elastos.browser.engine.launch-request/v1","adapter":"kasm-workspaces-product","engine":"hosted_remote_browser","stream_id":"stream:kasm:smoke","display_mode":"webrtc_remote_display","network_mode":"runtime_net_only","direct_network":false,"wallet_injection":false,"url":"https://example.com/","viewport":{"width":1280,"height":720}},"requirements":{"display_mode":"webrtc_remote_display","backend_class":"product_compositor","audio":true,"video":true,"network_mode":"runtime_net_only","direct_network":false}}'
+launch_request='{"schema":"elastos.browser.hosted-product.open/v1","launch_request":{"schema":"elastos.browser.engine.launch-request/v1","adapter":"kasm-workspaces-product","engine":"hosted_remote_browser","stream_id":"stream:kasm:smoke","display_mode":"webrtc_remote_display","guarantee_level":"operator_rbi","network_mode":"runtime_net_only","direct_network":false,"wallet_injection":false,"url":"https://example.com/","viewport":{"width":1280,"height":720}},"requirements":{"display_mode":"webrtc_remote_display","guarantee_level":"operator_rbi","backend_class":"product_compositor","audio":true,"video":true,"network_mode":"runtime_net_only","direct_network":false}}'
 
 control_no_bridge="$tmp_dir/kasm-no-bridge.sock"
 ELASTOS_BROWSER_KASM_CONTROL_CONFIG="$(node -e '

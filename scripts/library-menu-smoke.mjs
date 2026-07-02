@@ -7,6 +7,7 @@ import { createRequire } from "node:module";
 
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
+const multiSelectModifier = process.platform === "darwin" ? "Meta" : "Control";
 
 function browserAssetRoot(capsuleName) {
   const capsuleRoot = path.resolve("capsules", capsuleName);
@@ -1093,6 +1094,12 @@ function createServer() {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
       res.end(`<!doctype html>
 <html>
+<head>
+  <style>
+    html, body { margin: 0; width: 100%; height: 100%; }
+    #library-frame { border: 0; width: 100vw; height: 100vh; display: block; }
+  </style>
+</head>
 <body>
   <iframe id="library-frame" src="/apps/library/?home_token=${encodeURIComponent(token)}"></iframe>
   <script>
@@ -1385,7 +1392,8 @@ async function submenuRows(page, parentLabel) {
 }
 
 async function openItemMenu(page, name) {
-  await page.keyboard.press("Escape");
+  const keyboard = page.keyboard || page.page?.().keyboard;
+  await keyboard.press("Escape");
   await page.waitForFunction(() => !document.querySelector("#context-menu:not(.hidden)"));
   return openItemMenuWithoutClearingSelection(page, name);
 }
@@ -1783,7 +1791,7 @@ async function run() {
     includesAll(await menuRows(page), ["Open", "Download", "Rename", "Properties"], "Shift-F10 selected file menu");
     await page.keyboard.press("Escape");
     await page.locator(".item").filter({ hasText: "Readme.md" }).first().click();
-    await page.locator(".item").filter({ hasText: "Published.md" }).first().click({ modifiers: ["Control"] });
+    await page.locator(".item").filter({ hasText: "Published.md" }).first().click({ modifiers: [multiSelectModifier] });
     assert(await page.locator(".item[data-selected='true']").count() === 2, "Two files must stay selected before multi-Enter open");
     const readsBeforeMultiEnterReadme = ops.filter((entry) => entry.op === "read" && entry.payload.uri.endsWith("/Readme.md")).length;
     const readsBeforeMultiEnterPublished = ops.filter((entry) => entry.op === "read" && entry.payload.uri.endsWith("/Published.md")).length;
@@ -1900,7 +1908,7 @@ async function run() {
     );
 
     await page.locator(".item").filter({ hasText: "Readme.md" }).first().click();
-    await page.locator(".item").filter({ hasText: "Projects" }).first().click({ modifiers: ["Control"] });
+    await page.locator(".item").filter({ hasText: "Projects" }).first().click({ modifiers: [multiSelectModifier] });
     includesAll(await openItemMenuWithoutClearingSelection(page, "Projects"), ["Download Selected", "Download Selected as ZIP", "Compress Selected to ZIP", "Cut", "Copy", "Delete"], "multi-select menu");
     const selectedDownloadPromise = page.waitForEvent("download");
     await clickMenu(page, "Download Selected");
@@ -2375,6 +2383,27 @@ async function run() {
       ops.filter((entry) => entry.op === "read" && entry.payload.uri.endsWith("/Viewer.md")).length === readsBeforeViewerOpen,
       "Double-click with an installed viewer must not fall back to preview/read",
     );
+
+    await page.evaluate(() => {
+      window.__shellMessages = [];
+    });
+    await libraryFrame.goto(`http://127.0.0.1:${port}/apps/library/?home_token=${encodeURIComponent(token)}&mode=attach&returnTarget=browser`);
+    await libraryFrame.locator("#picker-action-button").filter({ hasText: "Select for Browser" }).first().waitFor();
+    await libraryFrame.locator("#status-text").filter({ hasText: "Choose an object for Browser." }).first().waitFor();
+    const browserAttachRows = await openItemMenu(libraryFrame, "Viewer.md");
+    includesAll(browserAttachRows, ["Select for Browser", "Download", "Properties"], "Browser attach file menu");
+    excludesAll(browserAttachRows, ["Open With"], "Browser attach file menu");
+    await libraryFrame.locator(".item").filter({ hasText: "Viewer.md" }).first().click();
+    await libraryFrame.locator("#picker-action-button").filter({ hasText: "Select for Browser" }).first().click();
+    await page.waitForFunction(() =>
+      window.__shellMessages?.some((message) =>
+        message?.type === "home:deliver-to-target" &&
+        message?.target === "browser" &&
+        message?.payload?.type === "browser:file-picker-selection" &&
+        message?.payload?.fileName === "Viewer.md" &&
+        message?.payload?.sizeBytes > 0),
+    );
+
     await page.evaluate(() => {
       window.__shellMessages = [];
     });

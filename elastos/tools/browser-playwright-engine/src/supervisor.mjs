@@ -230,7 +230,7 @@ function validateLaunchRequest(request) {
   if (request.network_mode !== "runtime_net_only" || request.direct_network !== false) {
     throw new Error("browser engine requires runtime_net_only without direct network");
   }
-  if (!["diagnostic_frame", "webrtc_remote_display"].includes(request.display_mode)) {
+  if (request.display_mode !== "webrtc_remote_display") {
     throw new Error(`${request.display_mode || "missing"} display mode is not supported by this Browser Engine`);
   }
   const parsed = new URL(request.url);
@@ -330,8 +330,8 @@ async function handleControlRequest(state, req, res) {
       ),
       pid: process.pid,
       config_fingerprint: configFingerprint(state.config),
-      supported_display_modes: ["diagnostic_frame", "webrtc_remote_display"],
-      operations: ["launch", "status", "screenshot", "frame", "input", "webrtc", "media", "close"],
+      supported_display_modes: ["webrtc_remote_display"],
+      operations: ["launch", "status", "input", "webrtc", "media", "close"],
       direct_network: false,
       runtime_proxy: publicRuntimeProxyStatus(state.runtimeProxy),
     });
@@ -343,7 +343,7 @@ async function handleControlRequest(state, req, res) {
     sendJson(res, 200, result);
     return;
   }
-  const match = pathname.match(/^\/pages\/([^/]+)\/(status|screenshot|frame|input|webrtc|media|close)$/);
+  const match = pathname.match(/^\/pages\/([^/]+)\/(status|input|webrtc|media|close)$/);
   if (!match) {
     sendJson(res, 404, { error: "unknown browser engine route" });
     return;
@@ -359,65 +359,16 @@ async function handleControlRequest(state, req, res) {
     sendJson(res, 200, await publicPageStatus(pageId, pageState));
     return;
   }
-  if (req.method === "GET" && op === "screenshot") {
-    const image = await pageState.page.screenshot({ type: "png", fullPage: false });
-    sendJson(res, 200, {
-      schema: "elastos.browser.screenshot/v1",
-      page_id: pageId,
-      content_type: "image/png",
-      base64: image.toString("base64"),
-      width: pageState.viewport.width,
-      height: pageState.viewport.height,
-    });
-    return;
-  }
-  if (req.method === "GET" && op === "frame") {
-    const since = Number(requestUrl.searchParams.get("since") || 0);
-    const waitMs = Math.max(0, Math.min(5000, Number(requestUrl.searchParams.get("wait_ms") || 1200)));
-    if (Number.isFinite(since) && since >= pageState.frameSeq && waitMs > 0) {
-      await waitForFrameChange(pageState, waitMs);
-    }
-    if (Number.isFinite(since) && since >= pageState.frameSeq) {
-      sendJson(res, 200, {
-        schema: "elastos.browser.frame/v1",
-        page_id: pageId,
-        seq: pageState.frameSeq,
-        changed: false,
-        width: pageState.viewport.width,
-        height: pageState.viewport.height,
-        actual_url: pageState.page.url(),
-        title: await pageState.page.title().catch(() => ""),
-      });
-      return;
-    }
-    const image = await pageState.page.screenshot({ type: "png", fullPage: false });
-    sendJson(res, 200, {
-      schema: "elastos.browser.frame/v1",
-      page_id: pageId,
-      seq: pageState.frameSeq,
-      changed: true,
-      content_type: "image/png",
-      base64: image.toString("base64"),
-      width: pageState.viewport.width,
-      height: pageState.viewport.height,
-      actual_url: pageState.page.url(),
-      title: await pageState.page.title().catch(() => ""),
-    });
-    return;
-  }
   if (req.method === "POST" && op === "input") {
     const body = await readJsonBody(req);
     await applyInputEvent(pageState, body.event || {});
     markFrameChanged(pageState);
-    const image = await pageState.page.screenshot({ type: "png", fullPage: false });
     const title = await pageState.page.title().catch(() => "");
     const navigation = await navigationState(pageState);
     sendJson(res, 200, {
       schema: "elastos.browser.input-result/v1",
       page_id: pageId,
       seq: pageState.frameSeq,
-      screenshot: image.toString("base64"),
-      content_type: "image/png",
       width: pageState.viewport.width,
       height: pageState.viewport.height,
       actual_url: pageState.page.url(),
@@ -452,6 +403,9 @@ async function handleControlRequest(state, req, res) {
 
 async function launchPage(state, request) {
   validateLaunchRequest(request);
+  if (state.runtimeProxy) {
+    state.runtimeProxy.activePrincipalId = normalizePrincipalId(request.principal_id);
+  }
   const browser = await ensureBrowser(state);
   const viewport = normalizeViewport(request.viewport, state.config.viewport);
   const context = await browser.newContext({
@@ -469,8 +423,8 @@ async function launchPage(state, request) {
     request,
     viewport,
     frameSeq: 0,
-    frameWaiters: [],
     webrtc: null,
+    displaySession: null,
     metrics: newPageMetrics(request.display_mode),
   };
 
@@ -502,34 +456,21 @@ async function launchPage(state, request) {
     await previous.context.close().catch(() => {});
   }
   state.pages.set(pageId, pageState);
-  const isWebrtc = request.display_mode === "webrtc_remote_display";
-  const displaySession = isWebrtc
-    ? {
-        schema: "elastos.browser.display-session/v1",
-        session_id: `display:${request.stream_id}`,
-        mode: "webrtc_remote_display",
-        display_backend: DISPLAY_BACKEND,
-        backend_class: DISPLAY_BACKEND_CLASS,
-        network_mode: "runtime_net_only",
-        direct_network: false,
-        input: "datachannel",
-        audio: false,
-        video: true,
-        signaling_url: `/api/apps/browser/pages/${encodeURIComponent(pageId)}/webrtc`,
-        ice_servers: state.config.ice_servers,
-      }
-    : {
-        schema: "elastos.browser.display-session/v1",
-        session_id: `display:${request.stream_id}`,
-        mode: "diagnostic_frame",
-        display_backend: "diagnostic_frame",
-        backend_class: "diagnostic",
-        network_mode: "runtime_net_only",
-        direct_network: false,
-        input: "runtime_route",
-        audio: false,
-        video: false,
-      };
+  const displaySession = {
+    schema: "elastos.browser.display-session/v1",
+    session_id: `display:${request.stream_id}`,
+    mode: "webrtc_remote_display",
+    display_backend: DISPLAY_BACKEND,
+    backend_class: DISPLAY_BACKEND_CLASS,
+    network_mode: "runtime_net_only",
+    direct_network: false,
+    input: "datachannel",
+    audio: false,
+    video: true,
+    signaling_url: `/api/apps/browser/pages/${encodeURIComponent(pageId)}/webrtc`,
+    ice_servers: state.config.ice_servers,
+  };
+  pageState.displaySession = displaySession;
   return {
     schema: "elastos.browser.engine.supervisor-result/v1",
     page_id: pageId,
@@ -542,16 +483,7 @@ async function launchPage(state, request) {
     direct_network: false,
     wallet_injection: false,
     display_session: displaySession,
-    view: isWebrtc
-      ? null
-      : {
-          schema: "elastos.browser.view/v1",
-          mode: "runtime_frame",
-          frame_url: `/api/apps/browser/pages/${encodeURIComponent(pageId)}/frame`,
-          input_url: `/api/apps/browser/pages/${encodeURIComponent(pageId)}/input`,
-          width: viewport.width,
-          height: viewport.height,
-        },
+    view: null,
     wallet_bridge: {
       schema: "elastos.browser.wallet-bridge/v1",
       mode: "runtime_mediated_eip1193",
@@ -1046,32 +978,14 @@ function normalizeViewport(value, defaultViewport) {
 
 function markFrameChanged(pageState) {
   pageState.frameSeq = Number(pageState.frameSeq || 0) + 1;
-  const waiters = pageState.frameWaiters.splice(0);
-  for (const resolve of waiters) {
-    resolve(true);
-  }
-}
-
-async function waitForFrameChange(pageState, waitMs) {
-  await new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      pageState.frameWaiters = pageState.frameWaiters.filter((item) => item !== done);
-      resolve(false);
-    }, waitMs);
-    const done = () => {
-      clearTimeout(timer);
-      resolve(true);
-    };
-    pageState.frameWaiters.push(done);
-  });
 }
 
 function newPageMetrics(displayMode) {
   return {
     schema: "elastos.browser.page-metrics/v1",
     display_mode: displayMode,
-    display_backend: displayMode === "webrtc_remote_display" ? DISPLAY_BACKEND : "diagnostic_frame",
-    backend_class: displayMode === "webrtc_remote_display" ? DISPLAY_BACKEND_CLASS : "diagnostic",
+    display_backend: DISPLAY_BACKEND,
+    backend_class: DISPLAY_BACKEND_CLASS,
     started_at_ms: Date.now(),
     frame_count: 0,
     dropped_frames: 0,
@@ -1085,6 +999,34 @@ function newPageMetrics(displayMode) {
   };
 }
 
+function publicDisplaySession(displaySession) {
+  const iceServers = Array.isArray(displaySession?.ice_servers)
+    ? displaySession.ice_servers
+    : [];
+  return {
+    schema: displaySession?.schema || null,
+    session_id: displaySession?.session_id || null,
+    mode: displaySession?.mode || null,
+    width: displaySession?.width || null,
+    height: displaySession?.height || null,
+    input: displaySession?.input || null,
+    input_protocol: displaySession?.input_protocol || null,
+    display_backend: displaySession?.display_backend || null,
+    backend_class: displaySession?.backend_class || null,
+    audio: displaySession?.audio === true,
+    video: displaySession?.video === true,
+    network_mode: displaySession?.network_mode || null,
+    direct_network: displaySession?.direct_network === true,
+    signaling_url: displaySession?.signaling_url || null,
+    ice_servers: iceServers.map((server) => ({
+      urls: Array.isArray(server?.urls) ? server.urls : [server?.urls].filter(Boolean),
+      username_present: typeof server?.username === "string" && server.username.trim() !== "",
+      credential_present: typeof server?.credential === "string" && server.credential !== "",
+      credential_length: typeof server?.credential === "string" ? server.credential.length : 0,
+    })),
+  };
+}
+
 async function publicPageStatus(pageId, pageState) {
   const metrics = pageState.metrics || newPageMetrics(pageState.request?.display_mode || "unknown");
   const lastFrameAgeMs = metrics.last_frame_at_ms ? Date.now() - metrics.last_frame_at_ms : null;
@@ -1095,6 +1037,7 @@ async function publicPageStatus(pageId, pageState) {
     display_mode: metrics.display_mode,
     display_backend: metrics.display_backend,
     backend_class: metrics.backend_class,
+    display_session: publicDisplaySession(pageState.displaySession),
     proof_surface: metrics.backend_class === DISPLAY_BACKEND_CLASS,
     actual_url: pageState.page.url(),
     frame_seq: pageState.frameSeq,
@@ -1735,18 +1678,25 @@ function walletInitScript(wallet) {
 }
 
 async function startRuntimeProxy(config) {
+  const runtimeProxy = {
+    server: null,
+    host: "127.0.0.1",
+    port: null,
+    url: null,
+    activePrincipalId: null,
+  };
   const server = http.createServer((req, res) => {
-    handleProxyHttpRequest(config, req, res).catch((error) => {
+    handleProxyHttpRequest(config, runtimeProxy, req, res).catch((error) => {
       failProxyResponse(res, 502, error.message || "browser proxy request failed");
     });
   });
   server.on("connect", (req, clientSocket, head) => {
-    handleProxyConnect(config, req, clientSocket, head).catch((error) => {
+    handleProxyConnect(config, runtimeProxy, req, clientSocket, head).catch((error) => {
       failProxySocket(clientSocket, 502, error.message || "browser proxy tunnel failed");
     });
   });
   server.on("upgrade", (req, clientSocket, head) => {
-    handleProxyUpgrade(config, req, clientSocket, head).catch((error) => {
+    handleProxyUpgrade(config, runtimeProxy, req, clientSocket, head).catch((error) => {
       failProxySocket(clientSocket, 502, error.message || "browser proxy upgrade failed");
     });
   });
@@ -1758,12 +1708,10 @@ async function startRuntimeProxy(config) {
   if (!address || typeof address !== "object" || !Number.isInteger(address.port)) {
     throw new Error("browser runtime proxy did not bind a TCP port");
   }
-  return {
-    server,
-    host: "127.0.0.1",
-    port: address.port,
-    url: `http://127.0.0.1:${address.port}`,
-  };
+  runtimeProxy.server = server;
+  runtimeProxy.port = address.port;
+  runtimeProxy.url = `http://127.0.0.1:${address.port}`;
+  return runtimeProxy;
 }
 
 async function listenLocalhost(server) {
@@ -1798,12 +1746,12 @@ function publicRuntimeProxyStatus(runtimeProxy) {
   };
 }
 
-async function handleProxyConnect(config, req, clientSocket, head) {
+async function handleProxyConnect(config, runtimeProxy, req, clientSocket, head) {
   if (!config.allowed_protocols.includes("https")) {
     throw new Error("https is not allowlisted for browser exit");
   }
   const target = parseProxyAuthority(req.url, 443);
-  const remote = await openExitRelay(config, {
+  const remote = await openExitRelay(config, runtimeProxy, {
     ...target,
     streamId: `browser:connect:${hash64(req.url || "")}`,
     reason: "browser HTTPS tunnel",
@@ -1815,12 +1763,12 @@ async function handleProxyConnect(config, req, clientSocket, head) {
   pipeSocketPair(clientSocket, remote);
 }
 
-async function handleProxyUpgrade(config, req, clientSocket, head) {
+async function handleProxyUpgrade(config, runtimeProxy, req, clientSocket, head) {
   if (!config.allowed_protocols.includes("http")) {
     throw new Error("http is not allowlisted for browser exit");
   }
   const target = parseProxyRequestTarget(req, true);
-  const remote = await openExitRelay(config, {
+  const remote = await openExitRelay(config, runtimeProxy, {
     host: target.host,
     port: target.port,
     streamId: `browser:upgrade:${hash64(`${req.method}:${req.url || ""}`)}`,
@@ -1833,7 +1781,7 @@ async function handleProxyUpgrade(config, req, clientSocket, head) {
   pipeSocketPair(clientSocket, remote);
 }
 
-async function handleProxyHttpRequest(config, req, res) {
+async function handleProxyHttpRequest(config, runtimeProxy, req, res) {
   if (!config.allowed_protocols.includes("http")) {
     throw new Error("http is not allowlisted for browser exit");
   }
@@ -1847,7 +1795,7 @@ async function handleProxyHttpRequest(config, req, res) {
       headers: sanitizeRequestHeaders(req.headers),
       timeout: 30000,
       createConnection: (_options, callback) => {
-        openExitRelay(config, {
+        openExitRelay(config, runtimeProxy, {
           host: target.host,
           port: target.port,
           streamId: `browser:http:${hash64(`${req.method}:${req.url || ""}`)}`,
@@ -1869,7 +1817,7 @@ async function handleProxyHttpRequest(config, req, res) {
   req.pipe(proxyReq);
 }
 
-async function openExitRelay(config, target) {
+async function openExitRelay(config, runtimeProxy, target) {
   if (!config.allowed_ports.includes(Number(target.port))) {
     throw new Error(`port is not allowlisted for browser exit: ${target.port}`);
   }
@@ -1885,11 +1833,22 @@ async function openExitRelay(config, target) {
       target: `tcp://${target.host}:${target.port}`,
       host: target.host,
       scheme: "tcp",
-      principal_id: null,
+      principal_id: normalizePrincipalId(runtimeProxy?.activePrincipalId),
       reason: target.reason,
     })}\n`,
   );
   return raw;
+}
+
+function normalizePrincipalId(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed || /[\r\n\0]/.test(trimmed)) {
+    return null;
+  }
+  return trimmed;
 }
 
 function parseProxyAuthority(authority, defaultPort) {

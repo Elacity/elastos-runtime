@@ -1,0 +1,1230 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  scripts/setup-source-home.sh
+
+Builds and installs source-based runtime providers into the Home data directory
+resolved from HOME/XDG_DATA_HOME.
+
+Configure tool paths with:
+  ELASTOS_CARGO_BIN
+  ELASTOS_NODE_BIN
+  ELASTOS_DEBUGFS_BIN
+  ELASTOS_BROWSER_NATIVE_PROXY_BIN
+  ELASTOS_BROWSER_VM_ARTIFACT_DATA_DIR
+
+To target a non-default runtime root, set HOME or XDG_DATA_HOME before running.
+ELASTOS_DATA_DIR is intentionally not accepted as a gateway data-root override.
+EOF
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    usage
+    exit 0
+fi
+
+if [[ "$#" -gt 0 ]]; then
+    echo "unknown argument: $1" >&2
+    usage >&2
+    exit 2
+fi
+
+detect_platform() {
+    case "$(uname -s)-$(uname -m)" in
+        Linux-x86_64) printf '%s\n' "linux-amd64" ;;
+        Linux-aarch64|Linux-arm64) printf '%s\n' "linux-arm64" ;;
+        Darwin-arm64) printf '%s\n' "darwin-arm64" ;;
+        *)
+            echo "Unsupported source-home platform: $(uname -s)-$(uname -m)" >&2
+            exit 1
+            ;;
+    esac
+}
+
+default_data_dir() {
+    case "$(uname -s)" in
+        Darwin) printf '%s\n' "${HOME}/Library/Application Support/elastos" ;;
+        Linux) printf '%s\n' "${XDG_DATA_HOME:-${HOME}/.local/share}/elastos" ;;
+        *)
+            echo "Unsupported OS: $(uname -s)" >&2
+            exit 1
+            ;;
+    esac
+}
+
+find_cargo() {
+    if [[ -n "${ELASTOS_CARGO_BIN:-}" && -x "${ELASTOS_CARGO_BIN}" ]]; then
+        printf '%s\n' "${ELASTOS_CARGO_BIN}"
+        return
+    fi
+    if command -v cargo >/dev/null 2>&1; then
+        command -v cargo
+        return
+    fi
+    if [[ -x "${HOME}/.cargo/bin/cargo" ]]; then
+        printf '%s\n' "${HOME}/.cargo/bin/cargo"
+        return
+    fi
+    local candidate
+    candidate="$(find "${HOME}/.rustup/toolchains" -path '*/bin/cargo' -type f 2>/dev/null | sort | tail -n 1 || true)"
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return
+    fi
+    echo "cargo not found. Install Rust or add cargo to PATH." >&2
+    exit 1
+}
+
+find_node() {
+    if [[ -n "${ELASTOS_NODE_BIN:-}" && -x "${ELASTOS_NODE_BIN}" ]]; then
+        printf '%s\n' "${ELASTOS_NODE_BIN}"
+        return
+    fi
+    if command -v node >/dev/null 2>&1; then
+        command -v node
+        return
+    fi
+    for candidate in \
+        /opt/homebrew/bin/node \
+        /usr/local/bin/node
+    do
+        if [[ -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return
+        fi
+    done
+    local candidate
+    candidate="$(find "${HOME}/.elastos/node" -path '*/bin/node' -type f 2>/dev/null | sort | tail -n 1 || true)"
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return
+    fi
+    candidate="$(find "${HOME}/.nvm/versions/node" -path '*/bin/node' -type f 2>/dev/null | sort | tail -n 1 || true)"
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return
+    fi
+    echo "node not found. Install Node or set ELASTOS_NODE_BIN to an executable node binary." >&2
+    exit 1
+}
+
+find_debugfs() {
+    if [[ -n "${ELASTOS_DEBUGFS_BIN:-}" && -x "${ELASTOS_DEBUGFS_BIN}" ]]; then
+        printf '%s\n' "${ELASTOS_DEBUGFS_BIN}"
+        return
+    fi
+    if command -v debugfs >/dev/null 2>&1; then
+        command -v debugfs
+        return
+    fi
+    for candidate in \
+        /opt/homebrew/opt/e2fsprogs/sbin/debugfs \
+        /usr/local/opt/e2fsprogs/sbin/debugfs \
+        /usr/sbin/debugfs \
+        /sbin/debugfs
+    do
+        if [[ -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return
+        fi
+    done
+}
+
+find_turnserver() {
+    if [[ -n "${ELASTOS_BROWSER_VM_TURNSERVER_BIN:-}" && -x "${ELASTOS_BROWSER_VM_TURNSERVER_BIN}" ]]; then
+        printf '%s\n' "${ELASTOS_BROWSER_VM_TURNSERVER_BIN}"
+        return
+    fi
+    if [[ -n "${ELASTOS_TURNSERVER_BIN:-}" && -x "${ELASTOS_TURNSERVER_BIN}" ]]; then
+        printf '%s\n' "${ELASTOS_TURNSERVER_BIN}"
+        return
+    fi
+    if command -v turnserver >/dev/null 2>&1; then
+        command -v turnserver
+        return
+    fi
+    for candidate in \
+        /usr/bin/turnserver \
+        /usr/local/bin/turnserver \
+        /opt/homebrew/bin/turnserver
+    do
+        if [[ -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return
+        fi
+    done
+    return 1
+}
+
+browser_vm_target_platform() {
+    case "$(uname -s)-$(uname -m)" in
+        Linux-x86_64) printf '%s\n' "linux-amd64" ;;
+        Linux-aarch64|Linux-arm64|Darwin-arm64) printf '%s\n' "linux-arm64" ;;
+        *) return 1 ;;
+    esac
+}
+
+resolve_browser_vm_native_proxy_source() {
+    local target_platform="$1"
+    local candidate
+
+    if [[ -n "${ELASTOS_BROWSER_NATIVE_PROXY_BIN:-}" ]]; then
+        if [[ ! -x "${ELASTOS_BROWSER_NATIVE_PROXY_BIN}" ]]; then
+            echo "ELASTOS_BROWSER_NATIVE_PROXY_BIN is not executable: ${ELASTOS_BROWSER_NATIVE_PROXY_BIN}" >&2
+            return 2
+        fi
+        printf '%s\n' "${ELASTOS_BROWSER_NATIVE_PROXY_BIN}"
+        return
+    fi
+
+    case "$target_platform" in
+        linux-arm64)
+            for candidate in \
+                "${ROOT}/elastos/tools/browser-native-proxy-engine/target/aarch64-unknown-linux-musl/release/browser-native-proxy-engine" \
+                "${ROOT}/elastos/tools/browser-native-proxy-engine/target/aarch64-unknown-linux-gnu/release/browser-native-proxy-engine"
+            do
+                if [[ -x "$candidate" ]]; then
+                    printf '%s\n' "$candidate"
+                    return
+                fi
+            done
+            ;;
+        linux-amd64)
+            for candidate in \
+                "${ROOT}/elastos/tools/browser-native-proxy-engine/target/x86_64-unknown-linux-musl/release/browser-native-proxy-engine" \
+                "${ROOT}/elastos/tools/browser-native-proxy-engine/target/x86_64-unknown-linux-gnu/release/browser-native-proxy-engine"
+            do
+                if [[ -x "$candidate" ]]; then
+                    printf '%s\n' "$candidate"
+                    return
+                fi
+            done
+            ;;
+    esac
+    return 1
+}
+
+validate_linux_guest_binary() {
+    local label="$1"
+    local path="$2"
+    local target_platform="$3"
+    python3 - "$label" "$path" "$target_platform" <<'PY'
+import pathlib
+import struct
+import sys
+
+label, path, target_platform = sys.argv[1:]
+data = pathlib.Path(path).read_bytes()[:20]
+if len(data) < 20 or data[:4] != b"\x7fELF":
+    raise SystemExit(f"{label} must be a Linux ELF guest binary for {target_platform}")
+if data[5] == 1:
+    endian = "<"
+elif data[5] == 2:
+    endian = ">"
+else:
+    raise SystemExit(f"{label} has an invalid ELF data encoding")
+machine = struct.unpack(endian + "H", data[18:20])[0]
+expected = {
+    "linux-amd64": 62,
+    "linux-arm64": 183,
+}[target_platform]
+if machine != expected:
+    names = {62: "x86_64", 183: "aarch64"}
+    got = names.get(machine, f"e_machine={machine}")
+    want = names[expected]
+    raise SystemExit(f"{label} must be {want} for {target_platform}, got {got}")
+PY
+}
+
+configure_rust_toolchain_env() {
+    local cargo_bin="$1"
+    local cargo_home_guess
+    local home_guess
+
+    if [[ -z "${CARGO_HOME:-}" && "$cargo_bin" == */.cargo/bin/cargo ]]; then
+        cargo_home_guess="${cargo_bin%/.cargo/bin/cargo}/.cargo"
+        if [[ -d "$cargo_home_guess" ]]; then
+            export CARGO_HOME="$cargo_home_guess"
+        fi
+    fi
+
+    if [[ -z "${RUSTUP_HOME:-}" && -n "${CARGO_HOME:-}" && "$(basename "$CARGO_HOME")" == ".cargo" ]]; then
+        home_guess="$(dirname "$CARGO_HOME")"
+        if [[ -d "${home_guess}/.rustup" ]]; then
+            export RUSTUP_HOME="${home_guess}/.rustup"
+        fi
+    fi
+}
+
+clone_or_copy_file() {
+    local source="$1"
+    local dest="$2"
+    cp -c "$source" "$dest" 2>/dev/null ||
+        cp --reflink=auto -p "$source" "$dest" 2>/dev/null ||
+        cp -p "$source" "$dest"
+}
+
+DEFAULT_DATA_DIR="$(default_data_dir)"
+if [[ -n "${ELASTOS_DATA_DIR:-}" && "${ELASTOS_DATA_DIR}" != "${DEFAULT_DATA_DIR}" ]]; then
+    echo "ELASTOS_DATA_DIR is not a gateway data-root override." >&2
+    echo "Set HOME or XDG_DATA_HOME before running this script so dirs::data_dir resolves to the intended runtime root." >&2
+    echo "Expected data dir from current environment: ${DEFAULT_DATA_DIR}" >&2
+    exit 1
+fi
+DATA_DIR="${DEFAULT_DATA_DIR}"
+PLATFORM="$(detect_platform)"
+CARGO_BIN="$(find_cargo)"
+NODE_BIN="$(find_node)"
+configure_rust_toolchain_env "$CARGO_BIN"
+export PATH="$(dirname "$CARGO_BIN"):$(dirname "$NODE_BIN"):${PATH}"
+
+provider_names() {
+    printf '%s\n' \
+        did-provider \
+        net-provider \
+        exit-provider \
+        browser-engine-adapter \
+        browser-local-exit \
+        wallet-provider \
+        chain-provider
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        printf '%s\n' \
+            browser-engine-supervisor \
+            browser-native-proxy-engine \
+            browser-stream-bridge
+    fi
+    printf '%s\n' \
+        webspace-provider \
+        object-provider \
+        content-block-graph-provider \
+        ipfs-provider
+}
+
+PROVIDER_NAMES_JSON="$(provider_names | python3 -c 'import json,sys; print(json.dumps([line.strip() for line in sys.stdin if line.strip()]))')"
+
+APP_CAPSULES=(
+    home-cli
+    home
+    system
+    services
+    browser
+    documents
+    library
+    marketplace
+    archive-manager
+    inbox
+    wallet
+    wallet-metamask
+    wallet-unisat
+    wallet-walletconnect
+    gba-emulator
+    chat-room
+)
+
+capsule_entrypoint() {
+    local manifest="$1"
+    python3 - "$manifest" <<'PY'
+import json
+import pathlib
+import sys
+
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
+entrypoint = manifest.get("entrypoint")
+if not entrypoint:
+    raise SystemExit(f"{sys.argv[1]} missing entrypoint")
+print(entrypoint)
+PY
+}
+
+copy_capsule_tree() {
+    local src="$1"
+    local dest="$2"
+
+    mkdir -p "$(dirname "$dest")"
+    if command -v rsync >/dev/null 2>&1; then
+        rsync -a --delete --exclude target "$src/" "$dest/"
+        return
+    fi
+
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    (cd "$src" && tar --exclude './target' -cf - .) | (cd "$dest" && tar -xf -)
+}
+
+install_app_capsules() {
+    local capsule src dest entrypoint built_entrypoint
+
+    mkdir -p "${DATA_DIR}/capsules"
+    for capsule in "${APP_CAPSULES[@]}"; do
+        src="${ROOT}/capsules/${capsule}"
+        dest="${DATA_DIR}/capsules/${capsule}"
+        entrypoint="$(capsule_entrypoint "${src}/capsule.json")"
+        built_entrypoint="${src}/target/wasm32-wasip1/release/${entrypoint}"
+
+        if [[ ! -f "$built_entrypoint" ]]; then
+            echo "${capsule} wasm entrypoint missing after build: ${built_entrypoint}" >&2
+            exit 1
+        fi
+
+        copy_capsule_tree "$src" "$dest"
+        mkdir -p "${dest}/$(dirname "$entrypoint")"
+        install -m 644 "$built_entrypoint" "${dest}/${entrypoint}"
+    done
+}
+
+sign_browser_vz_supervisor() {
+    local binary="$1"
+
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        return
+    fi
+    "${ROOT}/scripts/dev/sign-elastos-vz/sign.sh" "$binary"
+}
+
+refresh_browser_vm_rootfs_file() {
+    local rootfs="$1"
+    local source="$2"
+    local guest_path="$3"
+    local mode="$4"
+    local label="$5"
+    local debugfs="$6"
+    local current_copy
+    local staged_source
+    local updated_copy
+    local commands_file
+    current_copy="$(mktemp)"
+    staged_source="$(mktemp)"
+    updated_copy="$(mktemp)"
+    commands_file="$(mktemp)"
+    cp "$source" "$staged_source"
+
+    if "$debugfs" -R "cat ${guest_path}" "$rootfs" > "$current_copy" 2>/dev/null &&
+        cmp -s "$source" "$current_copy"; then
+        rm -f "$current_copy" "$staged_source" "$updated_copy" "$commands_file"
+        return
+    fi
+
+    local backup="${rootfs}.before-${label}-$(date -u +%Y%m%dT%H%M%SZ)"
+    clone_or_copy_file "$rootfs" "$backup"
+
+    cat > "$commands_file" <<EOF
+rm ${guest_path}
+write $staged_source ${guest_path}
+set_inode_field ${guest_path} mode ${mode}
+EOF
+    "$debugfs" -w -f "$commands_file" "$rootfs" >/dev/null
+    "$debugfs" -R "cat ${guest_path}" "$rootfs" > "$updated_copy" 2>/dev/null
+    if ! cmp -s "$source" "$updated_copy"; then
+        echo "Browser VM rootfs ${label} refresh did not verify; backup kept at ${backup}" >&2
+        exit 1
+    fi
+    rm -f "$current_copy" "$staged_source" "$updated_copy" "$commands_file"
+    echo "[setup-source-home] refreshed Browser VM rootfs ${label}: ${rootfs}"
+}
+
+extract_browser_vm_selkies_start() {
+    local target="$1"
+    python3 - "${ROOT}/scripts/build/stage-browser-vm-target.sh" "$target" <<'PY'
+import pathlib
+import sys
+
+stage_script = pathlib.Path(sys.argv[1])
+target = pathlib.Path(sys.argv[2])
+text = stage_script.read_text()
+start_marker = 'cat > "$staging_dir/opt/elastos/bin/browser-vm-selkies-start" <<\'SH\'\n'
+end_marker = '\nSH\nchmod 755 "$staging_dir/opt/elastos/bin/browser-vm-selkies-start"'
+try:
+    start = text.index(start_marker) + len(start_marker)
+    end = text.index(end_marker, start)
+except ValueError as exc:
+    raise SystemExit(f"could not extract browser-vm-selkies-start from stage script: {exc}")
+target.write_text(text[start:end])
+PY
+}
+
+extract_browser_vm_init() {
+    local target="$1"
+    python3 - "${ROOT}/scripts/build/stage-browser-vm-target.sh" "$target" <<'PY'
+import pathlib
+import sys
+
+stage_script = pathlib.Path(sys.argv[1])
+target = pathlib.Path(sys.argv[2])
+text = stage_script.read_text()
+start_marker = 'cat > "$staging_dir/opt/elastos/bin/browser-vm-init" <<\'SH\'\n'
+end_marker = '\nSH\nchmod 755 "$staging_dir/opt/elastos/bin/browser-vm-init"'
+try:
+    start = text.index(start_marker) + len(start_marker)
+    end = text.index(end_marker, start)
+except ValueError as exc:
+    raise SystemExit(f"could not extract browser-vm-init from stage script: {exc}")
+target.write_text(text[start:end])
+PY
+}
+
+patch_browser_vm_selkies_app_source() {
+    local target="$1"
+    python3 - "$target" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+marker = '        self.webrtcbin.set_property("latency", 0)\n'
+relay_patch = '''        elastos_ice_transport_policy = os.environ.get("ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY", "").strip().lower()
+        if elastos_ice_transport_policy:
+            if elastos_ice_transport_policy not in ("all", "relay"):
+                raise GSTWebRTCAppError("ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY must be all or relay")
+            try:
+                policy_value = getattr(GstWebRTC.WebRTCICETransportPolicy, elastos_ice_transport_policy.upper())
+            except AttributeError:
+                policy_value = elastos_ice_transport_policy
+            self.webrtcbin.set_property("ice-transport-policy", policy_value)
+            logger.info("using ICE transport policy: %s", elastos_ice_transport_policy)
+'''
+turn_marker = '''        if self.turn_servers:
+            for i, turn_server in enumerate(self.turn_servers):
+                logger.info("updating TURN server")
+                if i == 0:
+                    self.webrtcbin.set_property("turn-server", turn_server)
+                else:
+                    self.webrtcbin.emit("add-turn-server", turn_server)
+'''
+turn_relay_patch = '''        if elastos_ice_transport_policy:
+            self.webrtcbin.set_property("ice-transport-policy", policy_value)
+            logger.info("confirmed ICE transport policy after TURN setup: %s", elastos_ice_transport_policy)
+'''
+if "elastos_ice_transport_policy" not in text:
+    if marker not in text:
+        raise SystemExit("Selkies relay policy patch target not found")
+    text = text.replace(marker, marker + relay_patch, 1)
+if "confirmed ICE transport policy after TURN setup" not in text:
+    if turn_marker not in text:
+        raise SystemExit("Selkies TURN relay policy patch target not found")
+    text = text.replace(turn_marker, turn_marker + turn_relay_patch, 1)
+if "confirmed ICE transport policy after TURN setup" not in text:
+    raise SystemExit("Selkies relay policy patch incomplete")
+ice_log_marker = '        logger.debug("received ICE candidate: %d %s", mlineindex, candidate)\n'
+ice_log_patch = '        logger.info("emitting ICE candidate: %d %s", mlineindex, candidate)\n'
+if ice_log_patch not in text:
+    if ice_log_marker not in text:
+        raise SystemExit("Selkies ICE candidate log patch target not found")
+    text = text.replace(ice_log_marker, ice_log_patch, 1)
+rtp_extensions_marker = '''        rtp_id_iteration = 0
+        return_result = True
+'''
+previous_rtp_extensions_patch = '''        # Selkies 1.6.1 RTP header extensions are unstable in the ElastOS
+        # combined audio/video product session. Runtime TURN plus NACK/FIR keeps
+        # the media path reliable without mutating RTP extension caps here.
+        return True
+'''
+if previous_rtp_extensions_patch in text:
+    text = text.replace(previous_rtp_extensions_patch, rtp_extensions_marker, 1)
+elif rtp_extensions_marker not in text:
+    raise SystemExit("Selkies RTP extension patch removal target not found")
+opusenc_member_marker = "        self.rtpgccbwe = None\n"
+opusenc_member_patch = "        self.rtpgccbwe = None\n        self.opusenc = None\n"
+if opusenc_member_patch not in text:
+    if opusenc_member_marker not in text:
+        raise SystemExit("Selkies opusenc member patch target not found")
+    text = text.replace(opusenc_member_marker, opusenc_member_patch, 1)
+video_only_start = """        if audio_only:
+            self.build_audio_pipeline()
+        else:
+            self.build_video_pipeline()
+"""
+audio_video_start = """        if audio_only:
+            self.build_audio_pipeline()
+        else:
+            self.build_video_pipeline()
+            self.build_audio_pipeline()
+"""
+audio_video_pattern = (
+    r"        if audio_only:\n"
+    r"            self\.build_audio_pipeline\(\)\n"
+    r"        else:\n"
+    r"            self\.build_video_pipeline\(\)\n"
+    r"(?:            self\.build_audio_pipeline\(\)\n)+"
+)
+text, pipeline_replacements = re.subn(audio_video_pattern, video_only_start, text, count=1)
+if pipeline_replacements == 0 and video_only_start not in text:
+    raise SystemExit("Selkies video/audio split pipeline patch target not found")
+audio_extension_block = """        # Add WebRTC RTP extensions
+        extensions_return = self.rtp_add_extensions(rtpopuspay, audio=True)
+        if not extensions_return:
+            logger.warning("WebRTC RTP extension configuration failed with audio, this may lead to suboptimal performance")
+"""
+previous_audio_extension_patch = """        # Selkies 1.6.1 can corrupt combined audio/video SDP when audio RTP
+        # header extensions are attached. Keep the product session audio track
+        # simple and let WebRTC/NACK handle media recovery through Runtime TURN.
+        extensions_return = True
+"""
+audio_extension_patch = """        # Selkies 1.6.1 audio RTP header extensions are fragile in the split
+        # product audio peer. Keep the audio track
+        # simple and let WebRTC/NACK handle media recovery through Runtime TURN.
+        extensions_return = True
+"""
+if audio_extension_block in text:
+    text = text.replace(audio_extension_block, audio_extension_patch, 1)
+elif previous_audio_extension_patch in text:
+    text = text.replace(previous_audio_extension_patch, audio_extension_patch, 1)
+elif "Selkies 1.6.1 audio RTP header extensions are fragile" not in text:
+    raise SystemExit("Selkies audio RTP extension patch target not found")
+pulsesrc_named = '        pulsesrc = Gst.ElementFactory.make("pulsesrc", "pulsesrc")\n'
+pulsesrc_unnamed = '        pulsesrc = Gst.ElementFactory.make("pulsesrc")\n'
+if pulsesrc_named in text:
+    text = text.replace(pulsesrc_named, pulsesrc_unnamed, 1)
+elif pulsesrc_unnamed not in text:
+    raise SystemExit("Selkies pulsesrc patch target not found")
+opusenc_named = '        opusenc = Gst.ElementFactory.make("opusenc", "opusenc")\n'
+opusenc_unnamed = '        opusenc = Gst.ElementFactory.make("opusenc")\n'
+if opusenc_named in text:
+    text = text.replace(opusenc_named, opusenc_unnamed, 1)
+elif opusenc_unnamed not in text:
+    raise SystemExit("Selkies opusenc patch target not found")
+opusenc_bitrate_marker = '        opusenc.set_property("bitrate", self.audio_bitrate)\n'
+opusenc_bitrate_patch = '        opusenc.set_property("bitrate", self.audio_bitrate)\n        self.opusenc = opusenc\n'
+if opusenc_bitrate_patch not in text:
+    if opusenc_bitrate_marker not in text:
+        raise SystemExit("Selkies opusenc reference patch target not found")
+    text = text.replace(opusenc_bitrate_marker, opusenc_bitrate_patch, 1)
+opusenc_update_block = """            element = Gst.Bin.get_by_name(self.pipeline, "opusenc")
+            element.set_property("bitrate", bitrate)
+"""
+opusenc_update_patch = """            element = self.opusenc or Gst.Bin.get_by_name(self.pipeline, "opusenc")
+            if element is None:
+                raise GSTWebRTCAppError("Audio encoder is unavailable")
+            element.set_property("bitrate", bitrate)
+"""
+if opusenc_update_block in text:
+    text = text.replace(opusenc_update_block, opusenc_update_patch, 1)
+elif opusenc_update_patch not in text:
+    raise SystemExit("Selkies audio bitrate update patch target not found")
+audio_queue_named = '        rtpopuspay_queue = Gst.ElementFactory.make("queue", "rtpopuspay_queue")\n'
+audio_queue_unnamed = '        rtpopuspay_queue = Gst.ElementFactory.make("queue")\n'
+if audio_queue_named in text:
+    text = text.replace(audio_queue_named, audio_queue_unnamed, 1)
+elif audio_queue_unnamed not in text:
+    raise SystemExit("Selkies audio queue patch target not found")
+audio_add_block = """        # Add all elements to the pipeline.
+        pipeline_elements = [pulsesrc, pulsesrc_capsfilter, opusenc, rtpopuspay, rtpopuspay_queue, rtpopuspay_capsfilter]
+
+        for pipeline_element in pipeline_elements:
+            self.pipeline.add(pipeline_element)
+"""
+audio_add_strict_block = """        # Add all elements to the pipeline.
+        pipeline_elements = [pulsesrc, pulsesrc_capsfilter, opusenc, rtpopuspay, rtpopuspay_queue, rtpopuspay_capsfilter]
+
+        for pipeline_element in pipeline_elements:
+            if pipeline_element is None:
+                raise GSTWebRTCAppError("Audio pipeline element is unavailable")
+            if not self.pipeline.add(pipeline_element):
+                raise GSTWebRTCAppError("Failed to add {} to pipeline".format(pipeline_element.get_name()))
+"""
+audio_add_patch = """        # Add all elements to the pipeline.
+        pipeline_elements = [pulsesrc, pulsesrc_capsfilter, opusenc, rtpopuspay, rtpopuspay_queue, rtpopuspay_capsfilter]
+
+        for pipeline_element in pipeline_elements:
+            if pipeline_element is None:
+                raise GSTWebRTCAppError("Audio pipeline element is unavailable")
+            self.pipeline.add(pipeline_element)
+"""
+if audio_add_strict_block in text:
+    text = text.replace(audio_add_strict_block, audio_add_patch, 1)
+elif audio_add_block in text:
+    text = text.replace(audio_add_block, audio_add_patch, 1)
+elif audio_add_patch not in text:
+    raise SystemExit("Selkies audio pipeline add patch target not found")
+audio_offer_marker = '        logger.info("{} pipeline started".format("audio" if audio_only else "video"))\n'
+audio_offer_patch = """        logger.info("{} pipeline started".format("audio" if audio_only else "video"))
+        if audio_only:
+            logger.info("forcing audio SDP offer for split product audio peer")
+            self.__on_negotiation_needed(self.webrtcbin)
+"""
+if audio_offer_patch not in text:
+    if audio_offer_marker not in text:
+        raise SystemExit("Selkies split audio offer patch target not found")
+    text = text.replace(audio_offer_marker, audio_offer_patch, 1)
+if "Failed to add {} to pipeline" in text:
+    raise SystemExit("Selkies audio pipeline still contains the obsolete strict add check")
+if "emitting ICE candidate" not in text:
+    raise SystemExit("Selkies must log outbound ICE candidates at info level")
+path.write_text(text)
+PY
+}
+
+extract_browser_vm_selkies_app() {
+    local rootfs="$1"
+    local target="$2"
+    local debugfs="$3"
+    local guest_path="/usr/local/lib/python3.11/dist-packages/selkies_gstreamer/gstwebrtc_app.py"
+
+    if ! "$debugfs" -R "cat ${guest_path}" "$rootfs" > "$target" 2>/dev/null; then
+        echo "Browser VM rootfs Selkies gstwebrtc_app.py was not found: ${rootfs}" >&2
+        exit 1
+    fi
+    patch_browser_vm_selkies_app_source "$target"
+}
+
+write_browser_vm_target_manifest() {
+    local target="$1"
+    cat > "$target" <<'JSON'
+{
+  "schema": "elastos.browser.vm-target/v1",
+  "engine": "chromium_microvm",
+  "network_mode": "runtime_net_only",
+  "direct_network": false,
+  "wallet_injection": false,
+  "media_transport": "runtime_relay",
+  "display_mode": "webrtc_remote_display",
+  "guarantee_level": "mechanism_microvm",
+  "display_backend": "vm_selkies_gstreamer_webrtc",
+  "runtime_exit_transport": "vsock_relay",
+  "control_transport": "vsock_relay",
+  "control_port": 19092
+}
+JSON
+}
+
+refresh_browser_vm_rootfs_files() {
+    local rootfs="${ELASTOS_BROWSER_VM_ROOTFS:-${DATA_DIR}/browser-vm/rootfs.ext4}"
+    local control_source="${ROOT}/scripts/browser-selkies-control-service.mjs"
+
+    if [[ ! -f "$rootfs" ]]; then
+        return
+    fi
+
+    local debugfs
+    debugfs="$(find_debugfs || true)"
+    if [[ -z "$debugfs" ]]; then
+        echo "Browser VM rootfs exists but debugfs was not found; install e2fsprogs or set ELASTOS_DEBUGFS_BIN so setup-source-home can refresh VM guest files." >&2
+        exit 1
+    fi
+
+    local target_platform
+    local native_proxy_source=""
+    target_platform="$(browser_vm_target_platform || true)"
+    if [[ -n "$target_platform" ]]; then
+        if ! native_proxy_source="$(resolve_browser_vm_native_proxy_source "$target_platform")"; then
+            if [[ -n "${ELASTOS_BROWSER_NATIVE_PROXY_BIN:-}" ]]; then
+                exit 1
+            fi
+            native_proxy_source=""
+        fi
+    fi
+
+    local init_source
+    local selkies_start_source
+    local selkies_app_source
+    local manifest_source
+    init_source="$(mktemp)"
+    selkies_start_source="$(mktemp)"
+    selkies_app_source="$(mktemp)"
+    manifest_source="$(mktemp)"
+    extract_browser_vm_init "$init_source"
+    extract_browser_vm_selkies_start "$selkies_start_source"
+    extract_browser_vm_selkies_app "$rootfs" "$selkies_app_source" "$debugfs"
+    write_browser_vm_target_manifest "$manifest_source"
+    refresh_browser_vm_rootfs_file "$rootfs" "$manifest_source" \
+        "/etc/elastos/browser-vm-target.json" "0100644" \
+        "target-manifest" "$debugfs"
+    refresh_browser_vm_rootfs_file "$rootfs" "$control_source" \
+        "/opt/elastos/bin/browser-selkies-control-service.mjs" "0100644" \
+        "control-service" "$debugfs"
+    refresh_browser_vm_rootfs_file "$rootfs" "$init_source" \
+        "/opt/elastos/bin/browser-vm-init" "0100755" \
+        "vm-init" "$debugfs"
+    refresh_browser_vm_rootfs_file "$rootfs" "$selkies_app_source" \
+        "/usr/local/lib/python3.11/dist-packages/selkies_gstreamer/gstwebrtc_app.py" "0100644" \
+        "selkies-gstwebrtc-app" "$debugfs"
+    "$debugfs" -w -R "rm /usr/local/lib/python3.11/dist-packages/selkies_gstreamer/__pycache__/gstwebrtc_app.cpython-311.pyc" \
+        "$rootfs" >/dev/null 2>&1 || true
+    refresh_browser_vm_rootfs_file "$rootfs" "$selkies_start_source" \
+        "/opt/elastos/bin/browser-vm-selkies-start" "0100755" \
+        "selkies-start" "$debugfs"
+    if [[ -n "$native_proxy_source" ]]; then
+        validate_linux_guest_binary "browser-native-proxy-engine" \
+            "$native_proxy_source" "$target_platform"
+        refresh_browser_vm_rootfs_file "$rootfs" "$native_proxy_source" \
+            "/opt/elastos/bin/browser-native-proxy-engine" "0100755" \
+            "native-proxy" "$debugfs"
+    fi
+    rm -f "$init_source" "$selkies_start_source" "$selkies_app_source" "$manifest_source"
+}
+
+resolve_existing_symlink_target() {
+    local path="$1"
+    local target
+    if [[ ! -L "$path" ]]; then
+        printf '%s\n' "$path"
+        return
+    fi
+    target="$(readlink "$path")"
+    if [[ "$target" == /* ]]; then
+        printf '%s\n' "$target"
+    else
+        printf '%s/%s\n' "$(cd "$(dirname "$path")" && pwd -P)" "$target"
+    fi
+}
+
+refresh_browser_vm_initrd_path() {
+    local requested_initrd="$1"
+    local initrd
+    local source="${ROOT}/scripts/browser-selkies-control-service.mjs"
+
+    if [[ ! -f "$requested_initrd" ]]; then
+        return
+    fi
+    initrd="$(resolve_existing_symlink_target "$requested_initrd")"
+    if ! command -v cpio >/dev/null 2>&1; then
+        echo "Browser VM initrd exists but cpio was not found; install cpio so setup-source-home can refresh browser-selkies-control-service.mjs." >&2
+        exit 1
+    fi
+    if ! command -v gzip >/dev/null 2>&1; then
+        echo "Browser VM initrd exists but gzip was not found; install gzip so setup-source-home can refresh browser-selkies-control-service.mjs." >&2
+        exit 1
+    fi
+
+    local work_dir
+    work_dir="$(mktemp -d)"
+    gzip -dc "$initrd" | (cd "$work_dir" && cpio -id --quiet)
+    mkdir -p "$work_dir/bin"
+
+    if [[ -f "$work_dir/bin/browser-selkies-control-service.mjs" ]] &&
+        cmp -s "$source" "$work_dir/bin/browser-selkies-control-service.mjs"; then
+        rm -rf "$work_dir"
+        return
+    fi
+
+    install -m 644 "$source" "$work_dir/bin/browser-selkies-control-service.mjs"
+    local backup="${initrd}.before-selkies-control-$(date -u +%Y%m%dT%H%M%SZ)"
+    clone_or_copy_file "$initrd" "$backup"
+    (cd "$work_dir" && find . -print0 | cpio --null -o --format=newc 2>/dev/null | gzip -9) > "${initrd}.new"
+    mv "${initrd}.new" "$initrd"
+
+    local verify_dir
+    verify_dir="$(mktemp -d)"
+    gzip -dc "$initrd" | (cd "$verify_dir" && cpio -id --quiet)
+    if ! cmp -s "$source" "$verify_dir/bin/browser-selkies-control-service.mjs"; then
+        echo "Browser VM initrd control-service refresh did not verify; backup kept at ${backup}" >&2
+        exit 1
+    fi
+    rm -rf "$work_dir" "$verify_dir"
+    if [[ "$requested_initrd" != "$initrd" ]]; then
+        echo "[setup-source-home] refreshed Browser VM initrd control service: ${requested_initrd} -> ${initrd}"
+    else
+        echo "[setup-source-home] refreshed Browser VM initrd control service: ${initrd}"
+    fi
+}
+
+refresh_browser_vm_initrd_control_service() {
+    local initrds=()
+
+    if [[ -n "${ELASTOS_BROWSER_VM_INITRD:-}" ]]; then
+        initrds+=("${ELASTOS_BROWSER_VM_INITRD}")
+    fi
+    if [[ -n "${ELASTOS_BROWSER_VM_INITRAMFS:-}" ]]; then
+        initrds+=("${ELASTOS_BROWSER_VM_INITRAMFS}")
+    fi
+    if [[ "${#initrds[@]}" -eq 0 ]]; then
+        initrds+=("${DATA_DIR}/browser-vm/initrd" "${DATA_DIR}/bin/initrd")
+    fi
+
+    local seen=":"
+    local initrd
+    for initrd in "${initrds[@]}"; do
+        if [[ "$seen" == *":${initrd}:"* ]]; then
+            continue
+        fi
+        seen="${seen}${initrd}:"
+        refresh_browser_vm_initrd_path "$initrd"
+    done
+}
+
+install_browser_runtime_helpers() {
+    echo "[setup-source-home] install Browser runtime helper scripts"
+    mkdir -p "${DATA_DIR}/bin" "${DATA_DIR}/scripts"
+    install -m 644 "${ROOT}/scripts/browser-selkies-control-service.mjs" \
+        "${DATA_DIR}/scripts/browser-selkies-control-service.mjs"
+    install -m 755 "${ROOT}/scripts/browser-source-home-config.mjs" \
+        "${DATA_DIR}/scripts/browser-source-home-config.mjs"
+    install -m 755 "${ROOT}/scripts/browser-runtime-turn.mjs" \
+        "${DATA_DIR}/scripts/browser-runtime-turn.mjs"
+    install -m 755 "${ROOT}/scripts/setup-source-home-browser-artifacts.sh" \
+        "${DATA_DIR}/scripts/setup-source-home-browser-artifacts.sh"
+    install -m 755 "${ROOT}/scripts/browser-vm-engine-supervisor.mjs" \
+        "${DATA_DIR}/bin/browser-vm-engine-supervisor.mjs"
+    install -m 755 "${ROOT}/scripts/browser-vm-control-service.mjs" \
+        "${DATA_DIR}/bin/browser-vm-control-service.mjs"
+    install -m 755 "${ROOT}/scripts/browser-vm-remote-vz-launcher.mjs" \
+        "${DATA_DIR}/bin/browser-vm-remote-vz-launcher.mjs"
+    install -m 755 "${ROOT}/scripts/browser-vm-local-crosvm-launcher.mjs" \
+        "${DATA_DIR}/bin/browser-vm-local-crosvm-launcher.mjs"
+    install -m 755 "${ROOT}/scripts/browser-vm-prepare-rootfs-pool.mjs" \
+        "${DATA_DIR}/scripts/browser-vm-prepare-rootfs-pool.mjs"
+    install -m 755 "${ROOT}/scripts/browser-vm-engine-preflight.sh" \
+        "${DATA_DIR}/scripts/browser-vm-engine-preflight.sh"
+    install -m 755 "${ROOT}/scripts/browser-vm-artifact-preflight.sh" \
+        "${DATA_DIR}/scripts/browser-vm-artifact-preflight.sh"
+    install -m 755 "${ROOT}/scripts/browser-vm-target-preflight.sh" \
+        "${DATA_DIR}/scripts/browser-vm-target-preflight.sh"
+    cat > "${DATA_DIR}/bin/browser-vm-engine-supervisor" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec "${NODE_BIN}" "${DATA_DIR}/bin/browser-vm-engine-supervisor.mjs" "\$@"
+EOF
+    chmod 755 "${DATA_DIR}/bin/browser-vm-engine-supervisor"
+    cat > "${DATA_DIR}/bin/browser-vm-control-service" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec "${NODE_BIN}" "${DATA_DIR}/bin/browser-vm-control-service.mjs" "\$@"
+EOF
+    chmod 755 "${DATA_DIR}/bin/browser-vm-control-service"
+    cat > "${DATA_DIR}/bin/browser-vm-remote-vz-launcher" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec "${NODE_BIN}" "${DATA_DIR}/bin/browser-vm-remote-vz-launcher.mjs" "\$@"
+EOF
+    chmod 755 "${DATA_DIR}/bin/browser-vm-remote-vz-launcher"
+    cat > "${DATA_DIR}/bin/browser-vm-local-crosvm-launcher" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec "${NODE_BIN}" "${DATA_DIR}/bin/browser-vm-local-crosvm-launcher.mjs" "\$@"
+EOF
+    chmod 755 "${DATA_DIR}/bin/browser-vm-local-crosvm-launcher"
+    cat > "${DATA_DIR}/bin/browser-vm-prepare-rootfs-pool" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec "${NODE_BIN}" "${DATA_DIR}/scripts/browser-vm-prepare-rootfs-pool.mjs" "\$@"
+EOF
+    chmod 755 "${DATA_DIR}/bin/browser-vm-prepare-rootfs-pool"
+
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        local vz_supervisor="${DATA_DIR}/bin/browser-vz-engine-supervisor"
+        if [[ -x "${ROOT}/elastos/target/release/browser-vz-engine-supervisor" ]]; then
+            install -m 755 "${ROOT}/elastos/target/release/browser-vz-engine-supervisor" \
+                "${vz_supervisor}"
+        elif [[ -x "${ROOT}/elastos/target/debug/browser-vz-engine-supervisor" ]]; then
+            install -m 755 "${ROOT}/elastos/target/debug/browser-vz-engine-supervisor" \
+                "${vz_supervisor}"
+        fi
+        if [[ -x "${vz_supervisor}" ]]; then
+            sign_browser_vz_supervisor "${vz_supervisor}"
+        fi
+    fi
+    "${ROOT}/scripts/setup-source-home-browser-artifacts.sh" \
+        --data-dir "${DATA_DIR}" \
+        --platform "${PLATFORM}"
+    refresh_browser_vm_initrd_control_service
+    refresh_browser_vm_rootfs_files
+}
+
+start_browser_runtime_turn() {
+    local mode="${SETUP_SOURCE_HOME_RUNTIME_TURN:-auto}"
+    if [[ "$mode" == "0" ]]; then
+        echo "[setup-source-home] skip Browser runtime TURN: SETUP_SOURCE_HOME_RUNTIME_TURN=0"
+        return
+    fi
+    if [[ "$mode" != "auto" && "$mode" != "1" ]]; then
+        echo "SETUP_SOURCE_HOME_RUNTIME_TURN must be auto, 1, or 0" >&2
+        exit 2
+    fi
+    if has_remote_browser_vm_control_config; then
+        echo "[setup-source-home] skip Browser runtime TURN relay: remote Browser VM control is preserved"
+        return
+    fi
+    if [[ -n "${ELASTOS_BROWSER_VM_ICE_SERVER:-}" || -n "${ELASTOS_BROWSER_VM_ICE_SERVERS_JSON:-}" ]]; then
+        return
+    fi
+    local default_runtime_turn_env="${DATA_DIR}/runtime-turn/turn-credentials.env"
+    if [[ -n "${ELASTOS_BROWSER_RUNTIME_TURN_ENV:-}" && "${ELASTOS_BROWSER_RUNTIME_TURN_ENV}" != "${default_runtime_turn_env}" ]]; then
+        if [[ ! -f "${ELASTOS_BROWSER_RUNTIME_TURN_ENV}" ]]; then
+            echo "ELASTOS_BROWSER_RUNTIME_TURN_ENV does not exist: ${ELASTOS_BROWSER_RUNTIME_TURN_ENV}" >&2
+            exit 2
+        fi
+        echo "[setup-source-home] use existing Browser runtime TURN env: ${ELASTOS_BROWSER_RUNTIME_TURN_ENV}"
+        return
+    fi
+    if [[ "$PLATFORM" != linux-* && "$PLATFORM" != "darwin-arm64" ]]; then
+        return
+    fi
+    local turnserver_bin
+    turnserver_bin="$(find_turnserver || true)"
+    if [[ -z "$turnserver_bin" ]]; then
+        if [[ "$mode" == "1" ]]; then
+            echo "turnserver was not found; install coturn, set ELASTOS_BROWSER_VM_TURNSERVER_BIN, or set SETUP_SOURCE_HOME_RUNTIME_TURN=0 to skip Browser VM TURN setup." >&2
+            exit 1
+        fi
+        echo "[setup-source-home] skip Browser runtime TURN relay: turnserver not found"
+        return
+    fi
+    export ELASTOS_BROWSER_VM_TURNSERVER_BIN="$turnserver_bin"
+    echo "[setup-source-home] start Browser runtime TURN relay"
+    "${NODE_BIN}" "${ROOT}/scripts/browser-runtime-turn.mjs" \
+        --turnserver "$turnserver_bin" \
+        --data-dir "${DATA_DIR}"
+    export ELASTOS_BROWSER_RUNTIME_TURN_ENV="${DATA_DIR}/runtime-turn/turn-credentials.env"
+}
+
+existing_remote_browser_vm_config() {
+    local config="${DATA_DIR}/config/browser-engine-adapter.json"
+    if [[ ! -f "$config" ]]; then
+        return
+    fi
+    python3 - "$config" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+config = pathlib.Path(sys.argv[1])
+try:
+    data = json.loads(config.read_text())
+except Exception:
+    raise SystemExit(0)
+
+adapters = data.get("adapters")
+if not isinstance(adapters, list):
+    raise SystemExit(0)
+
+adapter = next((entry for entry in adapters if entry.get("id") == "browser-vm-product"), None)
+if not isinstance(adapter, dict):
+    raise SystemExit(0)
+supervisor = adapter.get("supervisor")
+if not isinstance(supervisor, dict):
+    raise SystemExit(0)
+env = supervisor.get("env")
+if not isinstance(env, dict):
+    env = {}
+
+launcher = str(env.get("ELASTOS_BROWSER_VM_CONTROL_LAUNCHER") or "")
+if not os.path.basename(launcher).startswith("browser-vm-remote-vz-launcher"):
+    raise SystemExit(0)
+
+values = {
+    "control_socket": supervisor.get("control_socket_path") or env.get("ELASTOS_BROWSER_VM_CONTROL_SOCKET"),
+    "control_launcher": launcher,
+    "remote_vz_data_dir": env.get("ELASTOS_BROWSER_REMOTE_VZ_DATA_DIR"),
+    "status_probe_timeout_ms": env.get("ELASTOS_BROWSER_VM_CONTROL_STATUS_PROBE_TIMEOUT_MS"),
+    "debug_hold_on_open_error_ms": env.get("ELASTOS_BROWSER_VM_DEBUG_HOLD_ON_OPEN_ERROR_MS"),
+}
+for key, value in values.items():
+    if not isinstance(value, str) or not value:
+        continue
+    if any(ch in value for ch in "\t\r\n\0"):
+        continue
+    print(f"{key}\t{value}")
+PY
+}
+
+has_remote_browser_vm_control_config() {
+    local launcher="${ELASTOS_BROWSER_VM_CONTROL_LAUNCHER:-}"
+    if [[ -n "$launcher" && "$(basename "$launcher")" == browser-vm-remote-vz-launcher* ]]; then
+        return 0
+    fi
+    local key value
+    while IFS=$'\t' read -r key value; do
+        if [[ "$key" == "control_launcher" ]]; then
+            return 0
+        fi
+    done < <(existing_remote_browser_vm_config)
+    return 1
+}
+
+install_browser_source_home_config() {
+    echo "[setup-source-home] write Browser source-home provider config"
+    local preserved_control_socket=""
+    local preserved_control_launcher=""
+    local preserved_remote_vz_data_dir=""
+    local preserved_status_probe_timeout_ms=""
+    local preserved_debug_hold_on_open_error_ms=""
+    local key value
+    if [[ -z "${ELASTOS_BROWSER_VM_CONTROL_SOCKET:-}" && -z "${ELASTOS_BROWSER_VM_CONTROL_LAUNCHER:-}" ]]; then
+        while IFS=$'\t' read -r key value; do
+            case "$key" in
+                control_socket) preserved_control_socket="$value" ;;
+                control_launcher) preserved_control_launcher="$value" ;;
+                remote_vz_data_dir) preserved_remote_vz_data_dir="$value" ;;
+                status_probe_timeout_ms) preserved_status_probe_timeout_ms="$value" ;;
+                debug_hold_on_open_error_ms) preserved_debug_hold_on_open_error_ms="$value" ;;
+            esac
+        done < <(existing_remote_browser_vm_config)
+        if [[ -n "$preserved_control_socket" && -n "$preserved_control_launcher" ]]; then
+            echo "[setup-source-home] preserve existing remote Browser VM control config"
+        fi
+    fi
+    local control_socket="${ELASTOS_BROWSER_VM_CONTROL_SOCKET:-$preserved_control_socket}"
+    local control_launcher="${ELASTOS_BROWSER_VM_CONTROL_LAUNCHER:-$preserved_control_launcher}"
+    local args=(
+        "${NODE_BIN}" "${ROOT}/scripts/browser-source-home-config.mjs"
+        --data-dir "${DATA_DIR}"
+        --platform "${PLATFORM}"
+    )
+    args+=(--vm-supervisor "${DATA_DIR}/bin/browser-vm-engine-supervisor")
+    if [[ -n "$control_socket" ]]; then
+        args+=(--vm-control-socket "$control_socket")
+    fi
+    if [[ -n "$control_launcher" ]]; then
+        args+=(--vm-control-launcher "$control_launcher")
+    fi
+    if [[ -n "${ELASTOS_BROWSER_VM_ROOTFS:-}" ]]; then
+        args+=(--vm-rootfs "${ELASTOS_BROWSER_VM_ROOTFS}")
+    fi
+    local env_args=()
+    if [[ -n "$preserved_status_probe_timeout_ms" && -z "${ELASTOS_BROWSER_VM_CONTROL_STATUS_PROBE_TIMEOUT_MS:-}" ]]; then
+        env_args+=("ELASTOS_BROWSER_VM_CONTROL_STATUS_PROBE_TIMEOUT_MS=$preserved_status_probe_timeout_ms")
+    fi
+    if [[ -n "$preserved_debug_hold_on_open_error_ms" && -z "${ELASTOS_BROWSER_VM_DEBUG_HOLD_ON_OPEN_ERROR_MS:-}" ]]; then
+        env_args+=("ELASTOS_BROWSER_VM_DEBUG_HOLD_ON_OPEN_ERROR_MS=$preserved_debug_hold_on_open_error_ms")
+    fi
+    if [[ -n "$preserved_remote_vz_data_dir" && -z "${ELASTOS_BROWSER_REMOTE_VZ_DATA_DIR:-}" ]]; then
+        env_args+=("ELASTOS_BROWSER_REMOTE_VZ_DATA_DIR=$preserved_remote_vz_data_dir")
+    fi
+    if [[ "${#env_args[@]}" -gt 0 ]]; then
+        env "${env_args[@]}" "${args[@]}"
+    else
+        "${args[@]}"
+    fi
+}
+
+stamp_source_home_components_manifest() {
+    COMPONENTS_SRC="${ROOT}/components.json" \
+    COMPONENTS_DEST="${DATA_DIR}/components.json" \
+    DATA_DIR="${DATA_DIR}" \
+    SETUP_PLATFORM="${PLATFORM}" \
+    PROVIDER_NAMES_JSON="${PROVIDER_NAMES_JSON}" \
+    python3 - <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+
+components_src = pathlib.Path(os.environ["COMPONENTS_SRC"])
+components_dest = pathlib.Path(os.environ["COMPONENTS_DEST"])
+data_dir = pathlib.Path(os.environ["DATA_DIR"])
+platform = os.environ["SETUP_PLATFORM"]
+
+manifest = json.loads(components_src.read_text())
+host_components = [
+    "shell",
+    "localhost-provider",
+    *json.loads(os.environ["PROVIDER_NAMES_JSON"]),
+]
+
+for name in host_components:
+    platforms = manifest["external"][name].setdefault("platforms", {})
+    info = platforms.get(platform)
+    if info is None:
+        raise SystemExit(f"{name} has no {platform} platform entry in components.json")
+    binary = data_dir / "bin" / name
+    data = binary.read_bytes()
+    info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
+    info["size"] = len(data)
+    info["install_path"] = f"bin/{name}"
+    info.setdefault("release_path", f"{name}-{platform}")
+
+components_dest.parent.mkdir(parents=True, exist_ok=True)
+components_dest.write_text(json.dumps(manifest, indent=2) + "\n")
+PY
+}
+
+install_content_publish_backend() {
+    local mode="${SETUP_SOURCE_HOME_INSTALL_KUBO:-auto}"
+
+    if [[ "$mode" == "0" ]]; then
+        echo "[setup-source-home] skip Kubo install: SETUP_SOURCE_HOME_INSTALL_KUBO=0"
+        return
+    fi
+    if [[ "$mode" != "1" && "$PLATFORM" != "darwin-arm64" ]]; then
+        return
+    fi
+
+    echo "[setup-source-home] install Kubo for Library/Documents publish"
+    HOME="${HOME}" \
+    ELASTOS_COMPONENTS_MANIFEST="${DATA_DIR}/components.json" \
+        "${ROOT}/elastos/target/release/elastos" setup --with kubo
+}
+
+echo "[setup-source-home] repo: ${ROOT}"
+echo "[setup-source-home] data dir: ${DATA_DIR}"
+echo "[setup-source-home] platform: ${PLATFORM}"
+echo "[setup-source-home] cargo: ${CARGO_BIN}"
+echo "[setup-source-home] node: ${NODE_BIN}"
+echo "[setup-source-home] cargo home: ${CARGO_HOME:-<default>}"
+echo "[setup-source-home] rustup home: ${RUSTUP_HOME:-<default>}"
+
+mkdir -p "${DATA_DIR}"
+if [[ "${SETUP_SOURCE_HOME_CONFIG_ONLY:-0}" == "1" ]]; then
+    install_browser_source_home_config
+    echo "[setup-source-home] config-only ready"
+    exit 0
+fi
+
+CONFIG_TOML="${DATA_DIR}/config.toml"
+touch "${CONFIG_TOML}"
+if ! grep -Eq '^[[:space:]]*dev_mode[[:space:]]*=' "${CONFIG_TOML}"; then
+    printf '\ndev_mode = true\n' >> "${CONFIG_TOML}"
+fi
+if ! grep -Eq '^[[:space:]]*trusted_keys[[:space:]]*=' "${CONFIG_TOML}"; then
+    printf 'trusted_keys = []\n' >> "${CONFIG_TOML}"
+fi
+
+echo "[setup-source-home] build runtime server"
+"$CARGO_BIN" build --manifest-path "${ROOT}/elastos/Cargo.toml" --release -p elastos-server
+if [[ "$PLATFORM" == "darwin-arm64" ]]; then
+    echo "[setup-source-home] build Browser VZ engine supervisor"
+    "$CARGO_BIN" build --manifest-path "${ROOT}/elastos/Cargo.toml" --release -p elastos-vz --bin browser-vz-engine-supervisor
+fi
+
+echo "[setup-source-home] build native provider binaries"
+"$CARGO_BIN" build --manifest-path "${ROOT}/elastos/capsules/shell/Cargo.toml" --release
+"$CARGO_BIN" build --manifest-path "${ROOT}/elastos/capsules/localhost-provider/Cargo.toml" --release
+provider_names | while IFS= read -r provider; do
+    if [[ -f "${ROOT}/capsules/${provider}/Cargo.toml" ]]; then
+        "$CARGO_BIN" build --manifest-path "${ROOT}/capsules/${provider}/Cargo.toml" --release
+    else
+        "$CARGO_BIN" build --manifest-path "${ROOT}/elastos/tools/${provider}/Cargo.toml" --release
+    fi
+done
+
+echo "[setup-source-home] build app WASM capsules"
+for capsule in "${APP_CAPSULES[@]}"; do
+    "$CARGO_BIN" build --manifest-path "${ROOT}/capsules/${capsule}/Cargo.toml" --target wasm32-wasip1 --release
+done
+
+echo "[setup-source-home] install native providers and stamp manifest"
+mkdir -p "${DATA_DIR}/bin"
+install -m 755 "${ROOT}/elastos/target/release/shell" "${DATA_DIR}/bin/shell"
+install -m 755 "${ROOT}/elastos/target/release/localhost-provider" "${DATA_DIR}/bin/localhost-provider"
+provider_names | while IFS= read -r provider; do
+    if [[ -x "${ROOT}/capsules/${provider}/target/release/${provider}" ]]; then
+        install -m 755 "${ROOT}/capsules/${provider}/target/release/${provider}" "${DATA_DIR}/bin/${provider}"
+    else
+        install -m 755 "${ROOT}/elastos/tools/${provider}/target/release/${provider}" "${DATA_DIR}/bin/${provider}"
+    fi
+done
+stamp_source_home_components_manifest
+
+echo "[setup-source-home] install app capsules and WASM entrypoints"
+install_app_capsules
+install_browser_runtime_helpers
+start_browser_runtime_turn
+install_browser_source_home_config
+
+install_content_publish_backend
+
+cat <<EOF
+[setup-source-home] ready
+
+Start the Mac/Linux source gateway with:
+  HOME="${HOME}" "${ROOT}/elastos/target/release/elastos" gateway --addr localhost:45542
+
+Open:
+  http://localhost:45542/apps/home/
+EOF

@@ -102,6 +102,32 @@ async fn setup_server_infrastructure_impl(
             Arc::downgrade(&provider_registry),
         )))
         .await;
+    let inspect_source: Arc<dyn elastos_server::inspect_provider::InspectSource> = Arc::new(
+        elastos_server::inspect_provider::AggregateInspectSource::new(vec![
+            Arc::new(elastos_server::inspect_provider::CatalogInspectSource::new(
+                data_dir.join("capsules"),
+                Arc::downgrade(&provider_registry),
+            )),
+            Arc::new(
+                elastos_server::inspect_provider::RegistryInspectSource::new(Arc::downgrade(
+                    &provider_registry,
+                )),
+            ),
+        ]),
+    );
+    let inspect_provider: Arc<dyn provider::Provider> = Arc::new(
+        elastos_server::inspect_provider::InspectProvider::with_registry(
+            inspect_source,
+            Arc::downgrade(&provider_registry),
+        ),
+    );
+    provider_registry.register(inspect_provider.clone()).await;
+    if let Err(err) = provider_registry
+        .register_sub_provider("inspect", inspect_provider)
+        .await
+    {
+        tracing::warn!("Failed to register elastos://inspect sub-provider: {}", err);
+    }
     let device_key = elastos_identity::load_or_create_device_key(&data_dir)?;
     let device_key_hex = hex::encode(device_key.as_ref());
     let mut provider_cid = "sha256:unavailable".to_string();
@@ -1559,7 +1585,7 @@ mod tests {
         let _guard = EnvGuard::new(&["ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG"]);
         std::env::set_var(
             "ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG",
-            r#"{"adapters":[{"id":"linux-proof","kind":"contract_proof","display_modes":["diagnostic_frame"]}]}"#,
+            r#"{"adapters":[{"id":"linux-proof","kind":"contract_proof","display_modes":["webrtc_remote_display"]}]}"#,
         );
 
         let data_dir = crate::sources::default_data_dir();
@@ -1568,7 +1594,7 @@ mod tests {
         assert_eq!(config["adapters"][0]["kind"], "contract_proof");
         assert_eq!(
             config["adapters"][0]["display_modes"][0],
-            "diagnostic_frame"
+            "webrtc_remote_display"
         );
     }
 

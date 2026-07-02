@@ -1,11 +1,5 @@
 export function requestedDisplayMode(paramsArg = params, debugMetricsArg = debugMetrics) {
   const value = paramsArg.get("display_mode") || paramsArg.get("display") || "webrtc_remote_display";
-  if (value === "diagnostic" || value === "diagnostic_frame") {
-    if (!debugMetricsArg) {
-      throw new Error("Diagnostic Browser display mode requires debug=1 or metrics=1.");
-    }
-    return "diagnostic_frame";
-  }
   if (["webrtc_remote_display", "native_surface"].includes(value)) {
     return value;
   }
@@ -26,10 +20,33 @@ export function isAuthoritySessionError(error) {
   );
 }
 
+function sanitizedErrorText(error) {
+  const text = String(error?.message || "Browser request failed");
+  return text
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim()
+    .slice(0, 420);
+}
+
+function browserLaunchFailureSummary(text) {
+  if (
+    /browser engine supervisor exited|Browser VM persistent launcher exited|browser-vz-engine-supervisor|remote VZ supervisor/i.test(text)
+  ) {
+    return "Browser Engine failed to start cleanly. The failed session was closed; refresh Browser, or choose another Browser Engine.";
+  }
+  return "";
+}
+
 export function friendlyOpenError(error) {
-  const text = error.message || "Browser request failed";
+  const text = sanitizedErrorText(error);
   if (isAuthoritySessionError(error)) {
     return "Browser authority expired. Relaunching through Home...";
+  }
+  const launchFailure = browserLaunchFailureSummary(text);
+  if (launchFailure) {
+    return launchFailure;
   }
   if (error.status === 403) {
     return `Blocked by Browser Exit policy: ${text}`;

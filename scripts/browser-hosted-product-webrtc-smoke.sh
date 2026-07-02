@@ -9,6 +9,7 @@ Usage:
   scripts/browser-hosted-product-webrtc-smoke.sh \
     --adapter-config /path/to/browser-engine-adapter.json \
     [--cdp-endpoint http://127.0.0.1:PORT] \
+    [--relay-ipc-path /tmp/elastos-browser-local-exit.sock] \
     [--hold-ms 0] \
     [--resize-width 0 --resize-height 0] \
     [--require-media] \
@@ -24,6 +25,7 @@ USAGE
 
 adapter_config=""
 cdp_endpoint=""
+relay_ipc_path=""
 require_media=0
 url="https://example.com/"
 timeout_ms="30000"
@@ -39,6 +41,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --cdp-endpoint)
       cdp_endpoint="${2:-}"
+      shift 2
+      ;;
+    --relay-ipc-path)
+      relay_ipc_path="${2:-}"
       shift 2
       ;;
     --require-media)
@@ -95,6 +101,9 @@ args=(
   --resize-width "$resize_width"
   --resize-height "$resize_height"
 )
+if [[ -n "$relay_ipc_path" ]]; then
+  args+=(--relay-ipc-path "$relay_ipc_path")
+fi
 if [[ "$require_media" == "1" ]]; then
   args+=(--require-media --cdp-endpoint "$cdp_endpoint")
 fi
