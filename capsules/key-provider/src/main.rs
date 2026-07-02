@@ -801,6 +801,16 @@ fn establish_dkms_session(
                 client.endpoint
             )
         })?;
+        // FAULT SEMANTICS (ELACITY-2282): bound a stalled node read on the LOCAL Unix transport too
+        // (the tcp/carrier branches already do) — a wedged or slow node fails the recover read within
+        // a bounded window, fail-closed with no partial material, never a hung release. This only
+        // fires during an active recover (the client reads only after sending a request), so it does
+        // not disturb idle pooled connections.
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(
+                DKMS_TCP_READ_TIMEOUT_MS,
+            )))
+            .map_err(|e| format!("dkms unix read timeout could not be set: {e}"))?;
         let reader = std::io::BufReader::new(
             stream
                 .try_clone()

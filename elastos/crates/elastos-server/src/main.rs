@@ -2163,6 +2163,10 @@ mod tests {
 
         fs::write(data_dir.path().join("components.json"), {
             let checksum = format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)));
+            // Key the platform entry by the host's resolved platform so this test is
+            // host-independent (passes on linux-amd64, linux-arm64, and macOS unknown-arm64),
+            // exercising the checksum verify rather than only matching a Linux x86_64 gate.
+            let platform = crate::setup::detect_platform();
             format!(
                 r#"{{
   "schema": "elastos.components/v1",
@@ -2172,16 +2176,15 @@ mod tests {
     "agent": {{
       "install_path": "bin/agent",
       "platforms": {{
-        "linux-amd64": {{
-          "checksum": "{}",
+        "{platform}": {{
+          "checksum": "{checksum}",
           "url": "https://example.invalid/agent"
         }}
       }}
     }}
   }},
   "profiles": {{}}
-}}"#,
-                checksum
+}}"#
             )
         })
         .unwrap();

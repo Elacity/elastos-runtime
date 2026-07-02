@@ -2525,23 +2525,29 @@ mod tests {
         fs::create_dir_all(&bin_dir).unwrap();
         let install_path = bin_dir.join("shell");
         fs::write(&install_path, b"shell-binary").unwrap();
+        // Key the platform entry by the host's resolved platform (detect_platform) so this test is
+        // host-independent: it exercises the checksum logic on linux-amd64, linux-arm64, and
+        // unknown-arm64 (macOS) alike, instead of only matching on a Linux x86_64 gate.
+        let platform = detect_platform();
         fs::write(
             data_dir.join("components.json"),
-            r#"{
-  "external": {
-    "shell": {
+            format!(
+                r#"{{
+  "external": {{
+    "shell": {{
       "install_path": "bin/shell",
-      "platforms": {
-        "linux-amd64": {
+      "platforms": {{
+        "{platform}": {{
           "checksum": "",
           "url": "https://example.invalid/shell"
-        }
-      }
-    }
-  },
-  "capsules": {},
-  "profiles": {}
-}"#,
+        }}
+      }}
+    }}
+  }},
+  "capsules": {{}},
+  "profiles": {{}}
+}}"#
+            ),
         )
         .unwrap();
 
@@ -2561,6 +2567,9 @@ mod tests {
         let bytes = b"shell-binary";
         fs::write(&install_path, bytes).unwrap();
         let checksum = format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)));
+        // Host-independent: key the platform entry by the resolved host platform (see the
+        // requires_checksum test) so the checksum verify runs on any build host.
+        let platform = detect_platform();
         fs::write(
             data_dir.join("components.json"),
             format!(
@@ -2569,8 +2578,8 @@ mod tests {
     "shell": {{
       "install_path": "bin/shell",
       "platforms": {{
-        "linux-amd64": {{
-          "checksum": "{}",
+        "{platform}": {{
+          "checksum": "{checksum}",
           "url": "https://example.invalid/shell"
         }}
       }}
@@ -2578,8 +2587,7 @@ mod tests {
   }},
   "capsules": {{}},
   "profiles": {{}}
-}}"#,
-                checksum
+}}"#
             ),
         )
         .unwrap();
@@ -2600,17 +2608,23 @@ mod tests {
         fs::write(&source_path, b"arm64-kernel").unwrap();
         fs::write(&install_path, b"arm64-kernel").unwrap();
 
+        // Host-independent: stamp + verify under the resolved host platform, not a fixed
+        // linux-amd64 (json! needs a literal key, so build the platforms map dynamically).
+        let platform = detect_platform();
+        let mut platforms = serde_json::Map::new();
+        platforms.insert(
+            platform.clone(),
+            serde_json::json!({
+                "strategy": "local-copy",
+                "source": source_path.to_string_lossy(),
+                "install_path": "bin/vmlinux"
+            }),
+        );
         let manifest: ComponentsManifest = serde_json::from_value(serde_json::json!({
             "external": {
                 "vmlinux": {
                     "install_path": "bin/vmlinux",
-                    "platforms": {
-                        "linux-amd64": {
-                            "strategy": "local-copy",
-                            "source": source_path.to_string_lossy(),
-                            "install_path": "bin/vmlinux"
-                        }
-                    }
+                    "platforms": platforms
                 }
             },
             "capsules": {},
@@ -2618,7 +2632,7 @@ mod tests {
         }))
         .unwrap();
 
-        let stamped = write_installed_manifest(data_dir, &manifest, "linux-amd64").unwrap();
+        let stamped = write_installed_manifest(data_dir, &manifest, &platform).unwrap();
         assert_eq!(stamped, vec!["vmlinux".to_string()]);
 
         let result = verify_installed_component_binary(data_dir, "vmlinux", &install_path).unwrap();

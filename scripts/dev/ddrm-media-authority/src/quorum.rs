@@ -120,6 +120,18 @@ impl Capsule {
     }
 }
 
+impl Drop for Capsule {
+    fn drop(&mut self) {
+        // Safety net (ELACITY-2282 Defect B): Rust's `Child::drop` does NOT kill the process, so a
+        // Capsule dropped WITHOUT an explicit `shutdown()` — any `?`/early-return/panic path — would
+        // ORPHAN its key-provider/decrypt-provider child (the lingering procs that pile up across
+        // retry attempts). Best-effort kill + reap so these never accumulate. Idempotent after a
+        // graceful `shutdown()` (the child has already exited; kill/wait on it are harmless no-ops).
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Run the dKMS `release` (2-of-3 recover + re-seal to the per-open decrypt session) against the WARM
 /// key-provider daemon over its Unix socket when the gateway wired one up (Phase A — node handshake
 /// sessions reused across opens, no per-open process spawn or init+hello), falling back to spawning a

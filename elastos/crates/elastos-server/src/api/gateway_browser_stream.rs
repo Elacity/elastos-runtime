@@ -455,10 +455,17 @@ pub(in crate::api::gateway) fn browser_runtime_stream_socket_path(
     }
     let digest = Sha256::digest(stream_id.as_bytes());
     let socket_name = format!("{}.sock", hex::encode(&digest[..16]));
-    // Unix socket paths have a small platform limit. Keep Browser stream sockets
-    // in a short runtime temp directory and expose only the opaque descriptor to
-    // the internal Browser Engine Adapter.
-    let stream_dir = std::env::temp_dir().join(BROWSER_RUNTIME_STREAM_TMP_DIR);
+    // Unix socket paths have a small platform limit (`sun_path` is 104 bytes on macOS,
+    // 108 on Linux). Keep Browser stream sockets in a short runtime temp directory and
+    // expose only the opaque descriptor to the internal Browser Engine Adapter. macOS's
+    // `$TMPDIR` (`/var/folders/.../T/`) is long enough that the default temp base can
+    // overflow `sun_path` (bind → "AF_UNIX path too long"), so fall back to a short base
+    // (`/tmp`) when the computed path would not fit. Conservative bound; macOS hard limit is 104.
+    const SUN_PATH_SAFE_MAX: usize = 100;
+    let mut stream_dir = std::env::temp_dir().join(BROWSER_RUNTIME_STREAM_TMP_DIR);
+    if stream_dir.join(&socket_name).as_os_str().len() > SUN_PATH_SAFE_MAX {
+        stream_dir = PathBuf::from("/tmp").join(BROWSER_RUNTIME_STREAM_TMP_DIR);
+    }
     std::fs::create_dir_all(&stream_dir)?;
     Ok(stream_dir.join(socket_name))
 }
