@@ -651,7 +651,7 @@ fn compute_open_payload(capsule: &Value, args: &QuorumArgs) -> Result<OpenPayloa
         let init_bytes = if init_path.is_empty() {
             Vec::new()
         } else {
-            read_dash_file(dir, init_path)?
+            read_dash_init(dir, init_path)?
         };
         // Weld the ordered segment set into the transcript AAD ONLY when there is more than one
         // segment — this MUST match the decrypt boundary, which computes `segment_digests` iff
@@ -739,7 +739,7 @@ fn build_media_tracks(
             let init = if init_path.is_empty() {
                 Vec::new()
             } else {
-                read_dash_file(dir, init_path)?
+                read_dash_init(dir, init_path)?
             };
             let seg_list = t
                 .get("segment_paths")
@@ -793,6 +793,16 @@ fn read_dash_file(dir: &std::path::Path, rel: &str) -> Result<Vec<u8>, String> {
     }
     let path = dir.join(rel);
     std::fs::read(&path).map_err(|e| format!("read DASH file {}: {e}", path.display()))
+}
+
+/// Read a DASH **init** segment from the dir and down-convert it for the server-decrypt rail:
+/// strip any MPEG-DASH/CENC signaling (`encv`/`enca` -> original, drop `sinf`/`tenc`/`pssh`) so it
+/// matches the PLAINTEXT init the mint sealed (the seal binds `first_init` BEFORE PSSH injection)
+/// AND the clear, `senc`-stripped segments this rail serves. No-op on unsignaled inits (demo /
+/// pre-compliance assets); best-effort — a malformed init falls back to the raw bytes.
+fn read_dash_init(dir: &std::path::Path, rel: &str) -> Result<Vec<u8>, String> {
+    let raw = read_dash_file(dir, rel)?;
+    Ok(ddrm_media::mp4::strip_cenc_signal(&raw).unwrap_or(raw))
 }
 
 /// A warm quorum open: the CEK is recovered + sealed into the live decrypt boundary. Drives
