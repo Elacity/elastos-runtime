@@ -102,6 +102,10 @@ const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   ]),
   marketplace: "runtime-target",
   services: new Set(["browser", "chat-room"]),
+  // The dDRM marketplace reveals a downloaded asset in the File Explorer (library) and opens it in its
+  // protected viewer — exactly the two viewers the library itself may open. Narrowly scoped (no ambient
+  // launch authority, P7/P16): it can only ask Home to open these three targets, nothing else.
+  "marketplace-content": new Set(["library", "ddrm-viewer", "elacity-player"]),
   system: "visible-target",
   "wallet": new Set(["wallet-metamask", "wallet-unisat"]),
 });
