@@ -1,262 +1,215 @@
-# North Star for Flint
+# North Star — Flint
 
-*Audited by a cross-industry 0.01% panel — local-AI, agentic-product, creator-economy,
-tokenized-markets, securities/IP law, and sovereign-systems — each instructed to push
-back with a better answer, not applaud; then re-audited on the Fable model as an
-independent logic check, which deepened the bedrock, sharpened the one-liner, and
-found four blind spots in the panel's own reasoning (folded in below, tagged "Fable
-sharpening"). This is the vision laid back, corrected, and grounded in first
-principles.*
+*The production strategy. Audited to convergence by a cross-industry 0.01% board —
+category founder, vertical-SaaS unicorn operator, AI-rights dealmaker, marketplace
+economist, sovereign-systems architect, securities/IP counsel, and a contrarian VC
+whose only job was to steelman the pass. Grounded in first principles and 5-Whys.
+This version reflects the board's convergence and the objections that survived it.*
 
-## The one sentence
+---
+
+## One sentence
 
 **Give your AI a mandate, not your keys.**
 
-Flint is the **mandate machine**: hand an agent real authority over what you own —
-scoped, capped, receipted, revocable — and sell that same kind of authority over
-your assets to everyone else's agents. One primitive, both directions (delegate
-out, license in); it subsumes the twin, the lock, the marketplace, and the mesh
-without over-claiming any of them. A broker that works *for* you — not a twin that
-*is* you; sell the seal, not the sorcery.
+Flint is the **accountability layer for AI agents that act** — the runtime where an
+agent's authority is *physically bounded* (scoped, capped, revocable) and *every
+action produces admissible, tamper-evident proof*: authorization before, signed
+record after. A broker that works *for* you under authority you can watch and
+revoke — not a twin that *is* you.
 
-*(Prior framing "trust layer for agentic commerce" retired as too passive — nobody
-buys a layer; people buy the ability to delegate and to license, safely.)*
+## The wedge (where we enter)
 
-## The fundamental goal (5-Whys to bedrock)
+**Agent PAM — privileged-access management for AI agents in regulated enterprises.**
 
-The stated goal — *"turn data into capital for everyone; let no one be left behind."*
-Run it down:
+Every agent company hits the same wall: the moment an agent touches money or
+credentials, the CISO, auditor, or insurer says *no* — because today "give the agent
+access" means handing over unscoped, irrevocable, unauditable keys. Flint replaces
+those keys with a **mandate**: a signed, scoped, spend-limited, revocable grant the
+runtime *cannot exceed* (in-guest limits, signed refusals), plus a tamper-evident
+audit chain that proves exactly what was authorized and what happened.
 
-1. *Why Flint?* → so a person can turn what they own into income and action without
-   being robbed of the keys, the rights, or the margin.
-2. *Why can't they today?* → platforms that hold the keys take the rights and the
-   margin; agents that could act run on ambient tokens no one can scope or revoke.
-3. *Why does it matter now?* → AI cloning made loss-of-control existential (your
-   voice/face used without consent), and 2025–26 law made *enforcement* mandatory,
-   not optional.
-4. *Why is this the only place it's solvable?* → because the asset only ever opens
-   inside a containment boundary bound to an on-chain, **revocable** right —
-   enforcement, not a takedown prayer.
-5. *Why does that generalize to "not left behind"?* → because one primitive — a
-   revocable, enforced, receipted key over an owned asset — is the unit that lets a
-   non-technical person safely sell access, license training, or delegate to an
-   agent, under authority they can *see and revoke*.
+This is not new budget — it is the **existing non-human-identity / PAM line
+(CyberArk-class money) relabeled "AI agent security,"** owned by the CISO and funded
+this fiscal year. We are **unblocking a committed spend**, not creating demand. The
+buyer already has a board-promised ROI number that is stuck behind one sentence: *"the
+agent holds credentials we can't scope, revoke, or prove anything about."*
 
-**Corrected bedrock (owner-side):** the goal is **not** "everyone's data becomes
-capital" (most *individual* data is worth ~$0 — value comes from *demand*, not from
-protection). It is: give people enforceable control over what they own in the AI
-economy, so those whose assets have value keep control and capture it.
+**Why this and not the marketplace/DRM wedge:** the board killed "lead with data/
+likeness licensing." A revocable key protects *future access* to bytes; but AI
+training is a **one-shot extraction** — the transaction's whole point is to let the
+content enter a model, and once ingested it cannot be revoked. Selling enforcement of
+a boundary the use-case requires crossing is a losing physics. So DRM is **act two**
+(assets licensed *into* the agent's boundary), never the entry.
 
-**Truer bedrock (symmetric — the Fable audit's sharpening):** the scarce commodity
-in an agent economy is not compute, models, or data (all abundant or rented) but
-**checkable accountability — provable authorization *before* an act, provable record
-*after* it.** This is symmetric and that's the point: the **owner** needs capped,
-revocable authority; the **counterparty** needs a *verifiable mandate*; the
-**regulator** needs the record. All three consume the same primitive, and this
-runtime already manufactures it (fail-closed capability enforcement, signed
-tamper-evident audit chains verified on read, hardware-proven spend metering with
-signed refusals). "Control" is the marketing surface; **checkable accountability is
-the bedrock, because it's the only thing both sides of every transaction must buy.**
-The pitch it licenses: **delegation without abdication.** Sell the *lock* first; the
-store, the twin, and the market are upside stacked on that one non-negotiable.
+## Bedrock (5-Whys)
 
-## The two shells (this part holds)
+Why do enterprises pay? Because agents are blocked. → Why blocked? Security can't
+scope or revoke what an agent with keys can do. → Why does that matter? An unbounded
+agent is unbounded liability. → Why does Flint fix it? A mandate bounds the action
+*ex-ante*; the audit chain proves it *ex-post*. → **The irreducible why: they are not
+buying security — they are buying *admissible evidence* that converts unbounded
+liability into a signed, bounded, provable one, which unlocks headcount-scale savings
+from agent labor.** The scarce commodity in an agent economy is not compute, models,
+or data (all abundant or rented) — it is **checkable accountability: provable
+authorization before an act, provable record after.** That is *delegation without
+abdication*, and it is symmetric: the owner needs capped authority, the counterparty
+needs a verifiable mandate, the regulator needs the record. All three buy the same
+primitive, and this runtime already manufactures it.
 
-- **ElastOS** — free, open-source, classic desktop OS shell on the runtime.
-- **Flint** — a paid (~$20, dDRM-owned) capsule you flip to: the agentic environment,
-  same runtime underneath. The ESP protocol makes shells pluggable — which opens a
-  **shell marketplace** (Flint is the first paid one, not the last).
+## The interface — a Knowledge Navigator for owned action
 
-This is sound: dDRM is already the metering rail, so "own a $20 shell" and "sell
-access to a service" are the *same* entitlement primitive. **Caveat (funding):** a
-one-time $20 fee cannot fund continuous inference or a mesh others subscribe to —
-price the *agent's* ongoing work (usage/subscription), not just the shell license.
+Apple's 1987 Knowledge Navigator is remembered for predicting the iPad and Siri. It
+actually predicted the one thing Big Tech still hasn't shipped: **one intelligent
+interface that collapses apps, search, files, meetings and context into intent.**
+Flint ships that missing half — not the assistant that *understands*, but the
+assistant you can *constitutionally empower*.
 
-## What Flint IS — and is NOT (yet)
+**What the user sees:** one surface. A **conversation** on the left, a **living
+canvas** on the right. No apps, no file manager, no settings pages.
 
-**IS:** an **intent composer/broker** grounded in reachable capabilities — your own
-`docs/FLINT_SHELL_VISION.md` already nailed it: *"an intent STREAM, not a chatbot…
-a command COMPOSER that cannot propose a hallucinated action."* Keep that. Plus a
-marketplace **terminal** (browse/buy/subscribe/download) and a **local runner**
-(assets open in a window, sandboxed).
+- **Intent → Mandate.** You speak intent ("renew our SaaS licenses this quarter, cap
+  $4,200, cancel anything unused 60 days"). Flint's first render is not an answer — it
+  is a **mandate card** on the canvas: scope, cap, duration, a revoke button. You sign
+  it with one gesture. *That is the entire permissions dialog for your digital life.*
+- **Action → Receipt.** As the agent works, the canvas becomes a timeline of **receipt
+  tiles** — each shows its authorization above and its signed record below. Refusals
+  render in-line: *"declined: would exceed cap — here is the signed refusal."*
+- **The audit chain IS the Finder.** Search, files, and history collapse into one
+  thing: your past is a browsable ledger of intents fulfilled. Any tile can be pulled,
+  disputed, or handed to an auditor.
+- **Assets appear as keys.** A dataset, a colleague's agent-skill, a licensed voice
+  show up as keys the agent checks out and returns — the bytes never leaving
+  containment. (This is where act-two licensing lives, inside the same surface.)
 
-**IS NOT (yet), and don't pitch as if it is:**
-- a **chatbot twin that *is* you** and that strangers subscribe to — a trust/liability
-  tarpit and the least-built part;
-- a **frontier model running at home** — frontier is defined by max compute; home
-  will always trail;
-- a **public yield market** — that's an unregistered security until gated.
+The loop *is* the UI: **intent → mandate → action → receipt.** ElastOS remains the
+free, classic desktop shell underneath; Flint is the intent surface you flip to. Same
+runtime under both, so switching is instant.
 
-## The five corrections (pushback → better answer)
+## Why a company, not a feature — and the moat
 
-1. **"Run frontier AI at home" → "Frontier is rented; YOUR model is owned."** A 2026
-   home box runs a strong quantized 20–70B, not GPT-5-class. The "digital twin" is
-   **RAG over your DRM-licensed catalog + a light LoRA/voice adapter + long-lived
-   memory**, and hard tasks **hybrid-route to a frontier API *through the DRM
-   boundary*** so raw data never leaves. Local wins on **sovereignty, privacy, and
-   the marginal cost of *your* tokens — never on raw capability.** Sell that.
-   **Fable sharpening:** "route through the boundary" quietly reintroduces the leak —
-   the prompt+context crossing to a rented model *is* the data leaving. So it must not
-   be a router but a **declassification gate**: every remote route is itself a
-   capability request that emits a *signed egress record* ("what left, to whom, under
-   what license"). That turns the architecture's weakness into the one thing this
-   runtime uniquely enforces.
+The mandate + receipt is a **two-sided protocol with Visa-shaped network effects**:
+every counterparty (bank, vendor, auditor, insurer) that accepts a Flint receipt makes
+every future mandate more valuable, and every delegated dollar becomes a natively
+tollable event. Models commoditize; the trust rail *underneath* delegated action does
+not.
 
-2. **"A twin that IS you, negotiating, subscribed-to" → a capability broker + a
-   revocable power-of-attorney.** Lead with *"say what you want; it assembles a
-   scoped, revocable, receipted plan; you seal it once at the gate; it runs locally
-   and hands you a signed receipt."* Each autonomous negotiation is itself a scoped
-   capability with a spending cap and an audit log — opt-in, per-deal, shipped later.
-   **Sell the seal, not the sorcery.**
+**The moat vs the obvious competitors (Okta / Entra Agent ID / MCP permissioning):**
+identity systems issue and scope credentials — they answer *who*. They **cannot prove
+an agent didn't exceed its authority at execution time, and cannot produce a
+tamper-evident receipt.** Flint enforces at the **runtime/execution layer** (the agent
+*physically cannot* exceed the mandate; refusals are signed; metering is
+hardware-proven) and emits an **admissible record.** Identity says *who could*; Flint
+proves *what actually happened.* The defensible seam is **enforcement + admissible
+evidence**, not the credential — and the durable moat is to make *"signed mandate +
+signed record"* the thing auditors and examiners ask for **by name**, i.e. a
+compliance standard a platform bundle can't casually replicate.
 
-3. **"Data→capital for everyone / LimeWire" → "Stripe for your likeness," aimed at
-   the already-cloned.** Target creators with *provable existing demand and an active
-   theft problem* — mid-tier **voice actors / VO artists / narrators / VTubers**,
-   cloned today, technically literate, organized in guilds. Message: *"stop others
-   turning your likeness into their capital — then license it on your terms."* Drop
-   "LimeWire" (it signals piracy and unpaid work to the pros you're courting).
-   **Sell a lock before a store.** **Fable sharpenings:** (a) the channel to "the
-   already-cloned" is **unions, agencies, studios** — sell the *enforcement backend*
-   to the intermediary, not a $20 desktop app to individual actors ("Stripe for your
-   likeness" implies exactly this — B2B2C). (b) The ~$0 objection applies to *lone*
-   data; **pooled, rights-clean, consented corpora** command real prices from AI labs,
-   and consent+audit machinery is precisely what makes a pool rights-clean — so
-   "data→capital" survives honestly as **collective licensing** (capital from
-   aggregation, not from anyone's solo exhaust).
+## The honest pass, answered (the contrarian's objections)
 
-4. **"Non-correlated royalty hedge, sold to funds" → it's a *derivative of GMV*.** A
-   new creator's on-chain royalty is 100% dependent on *your* marketplace's traffic —
-   *perfectly correlated with your own DAU*, the opposite of a hedge. Build it **after
-   ~12 months of real metered revenue**, and then sell **diversified index tokens**
-   (top-N by trailing on-chain revenue) with a designated market-maker — **not 10,000
-   illiquid dust tokens.** Seed liquidity from creators financing themselves + one
-   anchor crypto-native fund. Not first. **Fable sharpenings:** (a) **issuer-is-oracle
-   conflict** — your marketplace is *also the reporting oracle* for the very cash flows
-   it sells claims on; disqualifying unless the revenue feed is independently
-   attestable (a real reason the on-chain metered receipt matters). (b) **Ledger now,
-   market later** — royalty *accounting* (splits, receipts, statements) must exist from
-   the *first sale* or the 12 months of GMV produce no auditable underlying; only the
-   *exchange* waits.
+A top-tier VC steelmanned the pass. The objections that survived, and the counters:
 
-5. **"Sovereign 24/7 nodes others subscribe to" → blocked on two keystones, not on
-   Tier-3.** Isolation is real (wasmtime + crosvm, hardware-verified) and Carrier
-   transport is real (iroh/pkarr). But (a) the Carrier inbound plane has **no peer
-   auth** (`G-CARRIER-PEER`) so it's locked *read-only* — it **cannot carry
-   "subscribe to my agent"** today; and (b) **"buy a model and run it, weights never
-   leave" needs a TEE that is entirely a design doc** (plain crosvm has no attestation).
-   **"Sovereign" today honestly means self-hosted, single-trust-domain, unattested.**
+1. **"Consent/liability is handled by contracts + insurance, not cryptography."** True
+   for the *data-licensing* wedge — which is exactly why we don't lead with it. For the
+   *agent* wedge, the buyer is not indemnifying a data claim; they are trying to
+   *deploy agent labor at all*, and the blocker is technical (can't scope/revoke/prove),
+   so the fix must be technical.
+2. **"The DRM boundary is voided by the very transaction it enables."** Conceded — for
+   training data. Agent accountability does not require the data to cross a boundary; it
+   requires the *action* to be bounded and proven. Different physics.
+3. **"Differentiated claims are unbuilt; built claims are undifferentiated; the
+   'decentralized' quorum is one trust domain and a red team will find it."** The most
+   important operational truth in the deck: **lead only with what ships** (fail-closed
+   mandates, signed refusals, the audit chain — hardware-verified), state the
+   trust-domain boundary *honestly before* diligence finds it, and drop "decentralized/
+   post-quantum" from the enterprise pitch entirely — sell *"bounded, provable agent
+   authority,"* not crypto vocabulary.
+4. **"Distribution: the mandate layer lives where the agent lives; hyperscalers bundle
+   good-enough governance."** The real war, and named as our #1 risk. The counter is
+   speed to a **standard**: be in the frameworks and on the auditors' checklists within
+   ~24 months, because *"provably could not exceed the mandate"* is not a system-prompt
+   feature a bundle replicates.
 
-## What the panel itself missed (the Fable meta-audit)
+**The single flip condition (pass → conviction):** one production deal where a
+counterparty's *risk owner* — an auditor, an insurer, or a bank's control function —
+formally **accepts a Flint receipt as evidence** (a priced reduction in audit cost, an
+insurance discount, or an examiner's sign-off), i.e. a deployment that demonstrably
+could not have shipped on OAuth-scopes-plus-a-virtual-card alone. That one artifact
+converts "logged" into "admissible" and the company from "runtime with a narrative"
+into "the instrument that unlocks agent labor in regulated work."
 
-The six-seat panel corrected the *vision*; Fable then found four gaps in the
-*panel's own logic*:
+## First customer, and why now
 
-1. **No demand side.** All five corrections are supply/architecture — nobody named
-   the *first buyer*. A trust layer with no counterparties is a notary in an empty
-   town. **The first buyer is likely an AI lab / agency that needs rights-clean,
-   consented, licensed access** — pursue it as a first-class motion, not an
-   afterthought. ("Sell a lock before a store" *defers* the two-sided cold start; it
-   doesn't solve it.)
-2. **No dependency ordering.** The corrections aren't parallel: the broker's mandate
-   (2) and the creator's subscription lock (3) both **dead-end without peer auth (5)** —
-   a mandate/subscription no counterparty can verify off-box is a diary. That is why
-   **Carrier peer auth moves to the front of the build.**
-3. **The business model was left unaudited.** A one-time **$20 shrink-wrap** survived
-   from the old vision while everything beneath it was rebuilt into a *fiduciary-grade
-   service* (custody of mandates, caps, receipts, revocation). Fiduciary services are
-   **recurring / take-rate** — price the *agent's ongoing work and the licensing
-   throughput*, keep $20 only as the shell-ownership on-ramp.
-4. **Regulation is a wedge, not just a constraint.** Flint literally ships an EU AI
-   Act export path — it is **evidence infrastructure** (a compliance moat and a
-   subpoena/liability locus). Treat "provable authorization + provable record" as a
-   *sellable* enterprise product, not only a limit on the royalty market.
+**First customer:** an **outsourced finance-ops / AP firm** (a mid-size accounting or
+bookkeeping shop, ~50 seats) whose agents pay vendor invoices — they touch client
+money daily, their auditors already demand evidence trails, and they buy today at
+$500+/seat/month. They are the exact node that turns receipt-acceptance from theory
+into precedent. **Beachhead-adjacent:** a regulated enterprise's agent-platform team
+(bank/insurer/fintech) with ops agents (claims, KYC, reconciliation, treasury) stuck
+in security review.
 
-## The honest capability ladder (say this at each step)
+**Why now (2026):** agent pilots are hitting production in regulated shops this year;
+EU AI Act and model-risk scrutiny land now; every buyer has a committed ROI blocked by
+the credential problem. We meet the moment; we don't manufacture it.
 
-- **Now:** a **local 20–70B agent** doing RAG over your DRM-licensed catalog, tool-use,
-  and packaging/minting — private, owned, personalized; hard tasks routed to frontier
-  through the boundary. Never say "frontier" or "trained your own model."
-- **~18mo:** overnight **LoRA "twin adapter"**; agent-to-agent negotiation between
-  users' local agents; **RAG-gated subscription access** to your curated catalog.
-- **~3yr:** local crosses the *2024-frontier* line; genuine (small) 24/7 serving —
-  *only* once the mesh does failover so no single home box is the SLA, and only once
-  nodes are **attested**.
+## The compounding path ($10M → $100M → $1B)
 
-## What must be true to be legitimate (build the gate, don't bolt it on)
+- **$10M — Agent PAM (SaaS).** 40–60 regulated enterprises at $150–250K ACV for
+  mandate issuance + revocation + audit-chain retention. Okta-shaped: security budget,
+  annual contract, compliance checkbox.
+- **$100M — Metered authority (usage).** As fleets go 10 → 10,000 agents, turn on the
+  built metering: per-mandate / per-action pricing with in-guest limits and signed
+  refusals, plus compliance-reporting SaaS on the audit chain (the regulator-facing
+  artifact is itself a product). Twilio/Auth0 economics.
+- **$1B — The clearing layer (take-rate).** Two natively tollable events: (1) bps on
+  agent-authorized spend — *interchange for agent commerce*; (2) per-open key-release
+  toll on assets licensed *into* the boundary (data, models, premium content sold to
+  agents with cryptographic proof the bytes never escaped). Visa-shaped: both
+  authority-out and assets-in clear through you.
 
-*Substance beats form: you can't tokenize out of a security or contract out of a
-personality right.*
+**Monetize first:** flat per-agent SaaS + audit retention (CISO-approvable, no
+usage-pricing procurement allergy on a new category). Instrument every metering and
+key-release event from day one; **do not toll until volume exists.**
 
-1. Royalty tokens = **accredited/institutional only**, real exemption (Reg D 506(c) /
-   Reg S), **on-chain transfer restrictions** (permissioned tokens), KYC/AML — a
-   non-verified wallet is *technically* impossible, not just forbidden by T&Cs.
-2. Bundles via **SPV + registered/exempt adviser**; the platform is *infrastructure*,
-   never the pool manager or yield-promoter. Kill retail "buy yield" framing.
-3. Train-rights = **default-FALSE, purpose-scoped, revocable, identity-verified**;
-   block minor/coerced/estate-invalid grants; retain GDPR/BIPA-grade consent records.
-   *(This grant is the single strongest thing already designed — keep it granular.)*
-4. **Revocation propagates downstream** — withdrawal disables live twin/agent instances
-   and quarantines derived models, with an audit trail proving it. *(You can revoke a
-   license on-chain but you cannot un-train a model — close this or "enforceable
-   revocation" is cosmetic.)*
-5. Likeness/voice twins carry **separate, specific, NO-FAKES-compliant written
-   consent** — never a generic ToS click.
-6. **Three business lines kept legally separate** (content marketplace / royalty
-   securities / data-&-agent services) so a securities problem can't collapse the
-   runtime; geofence by jurisdiction.
+## Where the earlier vision re-enters (honestly sequenced)
 
-## Blind spots we are tracking
+- **Act one (now):** the accountable agent — authority *out*.
+- **Act two:** licensing *in* — datasets/models/voices as revocable, metered keys the
+  agent consumes inside the boundary. Positioned as a **royalty rail + liability
+  shield** (Spotify made licensed access cheaper than theft and took a cut), never as a
+  lock; concede the analog hole and one-shot extraction. Supply-first via one marquee
+  rights-holder. The default-FALSE, purpose-scoped, revocable **training-rights grant**
+  is the strongest primitive here — keep it.
+- **Act three (after ~12+ months of real GMV):** the marketplace and the **royalty
+  market** — and only as *indices* underwritten on realized on-chain revenue, sold to
+  accredited/institutional buyers under a real securities wrapper (Reg D/Reg S,
+  KYC-enforced, transfer-restricted at the contract level, bundles via SPV+adviser).
+  Royalty *accounting* (splits, receipts, statements) ships from the first sale; the
+  *exchange* comes much later. Note the **issuer-is-oracle** conflict — the metered
+  on-chain receipt is what makes the revenue feed independently attestable.
 
-- **Demand has no motion.** The vision is 90% supply-side; buyers won't just appear.
-  → *Concierge the first 100 transactions by hand; seed demand from the legal-clearing
-  side (brands/AI labs that must source consented likeness).*
-- **24/7 residential-node economics + liveness.** An always-on box holding a 70B to
-  serve near-zero requests is a bad cost structure, and a home node dark half the day
-  is a settlement record, not a service. → *Model watts × utilization × price before
-  promising it; lean on the mesh for failover.*
-- **Revocation ≠ un-training** (above).
-- **One-time $20 can't fund continuous inference** → price the agent's ongoing work.
-- **Royalty token as a public security** → the gate above, or an enforcement action.
+## What we are deliberately NOT doing
 
-## Revised build sequence (the one change from the prior plan)
+- **Not** leading with a consumer creator marketplace (two-sided cold start, no urgent
+  budget, 25 years of consumer-DRM corpses).
+- **Not** promising "everyone's data becomes capital" (individual data ≈ $0; value is
+  demand, not protection — it survives only as *pooled, consented* collective
+  licensing).
+- **Not** promising "frontier AI at home" (frontier is rented; *your* model is owned —
+  sovereignty, privacy, and the marginal cost of your tokens, personalized via RAG +
+  a LoRA adapter + memory, hard tasks routed through a **signed declassification
+  gate**).
+- **Not** claiming "decentralized/sovereign" until the quorum leaves one trust domain
+  and the peer plane is authenticated; **not** claiming tamper-*proof* — we ship
+  tamper-*evident*.
 
-The prior roadmap parked **Carrier peer authentication** at "LATER (item 11)." The
-panel's strongest structural finding: it's a **keystone, not a cleanup** — the literal
-precondition for *both* the agent-subscription economy *and* attested permissionless
-nodes. **Promote it.**
+## The one strategic bet
 
-1. **Close one receipt-backed likeness/voice sale** on the built loop (the gate is
-   buy-UI, not crypto) + **hide the plumbing** in the buy sheet.  *[the first metric]*
-2. **Carrier peer authentication (G-CARRIER-PEER)** — verify the iroh node-id against
-   an allowlist + signed request envelope + inject a verified principal. *Unlocks the
-   whole mesh pillar.*  *(promoted from 11 → 2)*
-3. **Ship the Tier-3 "runnable model, weights never leave" demo** — the category bet.
-4. **Wire the reach/act enforcement** — makes "enforce, not log" true.
-5. **Pin the PQ crates** (`ml-dsa`/`ml-kem`); **unify the design system**.
-6. **TEE attestation** for permissionless nodes; **diversify the dKMS quorum** out of
-   one trust domain — the two things that make "sovereign" *true*.
-7. Royalty index market — **only after ~12 months of real GMV**, fully compliance-gated.
-8. Pay down the trusted-core inversion (ADR-0001) — restore "small enough to trust."
-
-## The one strategic bet (Fable's sharpening)
-
-The prior bet — *close one receipt-backed likeness sale, then authenticate the mesh
-and build Tier-3* — is right but sequential. Fable's higher-conviction move collapses
-it into **one demo that instantiates corrections 2, 3, and 5 in a single
-transaction:**
-
-> **Ship Carrier peer auth + a counterparty-verifiable signed mandate, and demo ONE
-> paid end-to-end flow: an *outside* agent buys authenticated, metered, revocable
-> access to an asset on your node — signed receipts on both sides.**
-
-That single transaction proves the broker (a mandate a counterparty can verify), the
-creator lock (revocable, metered access others pay for), and the mesh (an
-authenticated inbound plane) *at once* — and it's the smallest thing that
-demonstrates **"give your AI a mandate, not your keys"** as a working economy, not a
-slogan. Protection first, then the mandate economy, then — much later, gated — the
-market.
-
-**Where the panel was miscalibrated (keep honest):** too *timid* on the business
-model (left $20 shrink-wrap + the Bloomberg-terminal UI unchallenged under a
-fiduciary service), and too *aggressive* killing "data→capital" (it survives as
-pooled, consented collective licensing).
+**Ship Carrier peer authentication + a counterparty-verifiable signed mandate, and
+land ONE deal where a real risk owner (auditor / insurer / bank control function)
+accepts a Flint receipt as evidence for a money-touching agent.** That single
+transaction proves the mandate (authority a counterparty can verify), the enforcement
+(the agent physically couldn't exceed it), and the admissible record (the receipt) —
+"give your AI a mandate, not your keys," as a working economy, not a slogan. Everything
+else — the licensing rail, the marketplace, the royalty market, the sovereign mesh — is
+an expansion of that one proven primitive.
