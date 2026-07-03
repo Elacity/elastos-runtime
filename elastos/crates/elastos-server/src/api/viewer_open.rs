@@ -925,18 +925,16 @@ pub async fn mint_create_asset(
         )
             .into_response(),
         Ok(Err(err)) => {
-            // A malformed mint is the caller's fault (400); a missing capsule binary or a
-            // broadcast failure is an upstream/outage condition (502).
-            if err.contains("invalid_mint")
-                || err.contains("JSON object")
-                || err.contains("must not be empty")
-                || err.contains("MintAssembly")
-            {
+            // The error CARRIES its class (no prose matching): a malformed mint is the caller's
+            // fault (400, reason surfaced); a missing capsule binary / signing / broadcast failure
+            // is an upstream/outage condition (502, detail kept server-side).
+            if err.is_client_error() {
                 tracing::info!("mint rejected (bad request): {err}");
-                return (StatusCode::BAD_REQUEST, err).into_response();
+                (StatusCode::BAD_REQUEST, err.client_message()).into_response()
+            } else {
+                tracing::warn!("mint failed: {err}");
+                (StatusCode::BAD_GATEWAY, err.client_message()).into_response()
             }
-            tracing::warn!("mint failed: {err}");
-            (StatusCode::BAD_GATEWAY, "could not complete mint").into_response()
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "mint task panicked").into_response(),
     }

@@ -51,11 +51,65 @@ pub struct MintOutcome {
     pub assembled: Value,
 }
 
+/// A typed mint failure that CARRIES its own class, so the HTTP layer never has to substring-match
+/// error prose to decide 400-vs-502 (the old fragile dispatch, where editing a message silently
+/// flipped a bad-request into a bad-gateway on a money path). Deliberately HTTP-agnostic — the
+/// gateway maps `is_client_error()` to a status — so this module stays decoupled from axum.
+#[derive(Debug)]
+pub enum MintError {
+    /// The caller's mint request was malformed — the pure assemble/validation step rejected it.
+    /// The gateway maps this to 400 and MAY surface the reason to the caller (it is their fault).
+    Invalid(String),
+    /// An upstream/infra condition — missing capsule binary, capsule spawn/init failure, managed
+    /// signing, RPC prepare, or broadcast failure. The gateway maps this to 502 and MUST NOT leak
+    /// the detail to the caller (kept for server logs only).
+    Upstream(String),
+}
+
+impl MintError {
+    /// True iff the caller's request was malformed (HTTP 4xx); false for upstream/infra (5xx).
+    pub fn is_client_error(&self) -> bool {
+        matches!(self, MintError::Invalid(_))
+    }
+
+    /// The reason to return to the caller: the real message for an `Invalid` (their fault), a
+    /// generic string for `Upstream` (never leak infra detail across the trust boundary).
+    pub fn client_message(&self) -> String {
+        match self {
+            MintError::Invalid(reason) => reason.clone(),
+            MintError::Upstream(_) => "could not complete mint".to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for MintError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MintError::Invalid(reason) => write!(f, "invalid mint: {reason}"),
+            MintError::Upstream(detail) => write!(f, "mint upstream failure: {detail}"),
+        }
+    }
+}
+
+/// Classify a `run_chain_capsule` error for the mint path. `assemble_mint` is a PURE validation
+/// step, so a returned op-failure is the caller's malformed mint (400 `Invalid`); every other
+/// run_chain_capsule error — spawn / init / IO / missing-data — is an infra/outage condition (502
+/// `Upstream`). Keyed on `run_chain_capsule`'s stable error-message prefixes (see
+/// `rights_authority::run_chain_capsule`); the `classify_*` unit test ratchets that contract so a
+/// prefix change breaks the build rather than silently mis-classifying a money-path response.
+fn classify_assemble_error(err: String) -> MintError {
+    if err.starts_with("chain-provider op failed") {
+        MintError::Invalid(err)
+    } else {
+        MintError::Upstream(err)
+    }
+}
+
 /// Mint a dDRM content asset. `mint` is a publish-provider `UnsignedMintV1` shaped as the
 /// chain-provider `MintAssembly` (`to`, `token_uri`, `op_type_code`, `content_id`,
 /// optional `value_wei` / `op_raw` / `sell`); the mint `selector` is pinned here when the
 /// caller didn't supply one. `principal_id` owns the managed minting account.
-pub fn mint_asset(principal_id: &str, mint: Value, now_unix: u64) -> Result<MintOutcome, String> {
+pub fn mint_asset(principal_id: &str, mint: Value, now_unix: u64) -> Result<MintOutcome, MintError> {
     let mode = super::rights_authority::rights_mode();
 
     // Assemble the real mint calldata first (pure step, all modes). This also validates the
@@ -103,9 +157,11 @@ pub fn mint_asset(principal_id: &str, mint: Value, now_unix: u64) -> Result<Mint
                     let intent = mock_transaction_intent(from, &to, &value, &data, chain_id);
                     intent_seen = intent.clone();
                     Ok(intent)
-                })?;
+                })
+                .map_err(MintError::Upstream)?;
             let tx_hash =
-                super::chain_tx::broadcast_signed_mock(&intent_seen, &sig.signed_transaction)?;
+                super::chain_tx::broadcast_signed_mock(&intent_seen, &sig.signed_transaction)
+                    .map_err(MintError::Upstream)?;
             Ok(MintOutcome {
                 tx_hash,
                 mode: "chain-mock+wallet".to_string(),
@@ -126,8 +182,10 @@ pub fn mint_asset(principal_id: &str, mint: Value, now_unix: u64) -> Result<Mint
                     let intent = super::chain_tx::prepare_intent_live(from, &to, &value, &data)?;
                     intent_seen = intent.clone();
                     Ok(intent)
-                })?;
-            let tx_hash = super::chain_tx::broadcast_signed_live(&sig.signed_transaction)?;
+                })
+                .map_err(MintError::Upstream)?;
+            let tx_hash = super::chain_tx::broadcast_signed_live(&sig.signed_transaction)
+                .map_err(MintError::Upstream)?;
             Ok(MintOutcome {
                 tx_hash,
                 mode: "chain+wallet".to_string(),
@@ -143,9 +201,11 @@ pub fn mint_asset(principal_id: &str, mint: Value, now_unix: u64) -> Result<Mint
 /// Assemble the real mint calldata via the REAL `chain-provider.assemble_mint` (pure: no
 /// RPC, no keys). Pins the configured mint selector when the caller didn't supply one.
 /// Returns the `{ to, data, value, content_id, … }` the signer/broadcaster consume.
-fn assemble_calldata(mut mint: Value) -> Result<Value, String> {
+fn assemble_calldata(mut mint: Value) -> Result<Value, MintError> {
     if !mint.is_object() {
-        return Err("mint must be a JSON object (chain-provider MintAssembly shape)".to_string());
+        return Err(MintError::Invalid(
+            "mint must be a JSON object (chain-provider MintAssembly shape)".to_string(),
+        ));
     }
     let has_selector = mint
         .get("selector")
@@ -160,16 +220,18 @@ fn assemble_calldata(mut mint: Value) -> Result<Value, String> {
 
     let chain_bin = resolve_chain_bin();
     if !std::path::Path::new(&chain_bin).is_file() {
-        return Err(format!(
+        // Infra: the operator hasn't built/configured the chain-provider — not the caller's fault.
+        return Err(MintError::Upstream(format!(
             "chain-provider not found at {chain_bin}; build it with \
              `cargo build --manifest-path capsules/chain-provider/Cargo.toml` \
              or set ELASTOS_CHAIN_PROVIDER_BIN"
-        ));
+        )));
     }
     // `assemble_mint` is pure and touches no network, so an empty init keeps the defaults.
     let init = json!({ "op": "init", "config": {} });
     let op = json!({ "op": "assemble_mint", "mint": mint });
-    run_chain_capsule(&chain_bin, &init, &op)
+    // A capsule op-failure here is the caller's malformed mint (400); spawn/init/IO is infra (502).
+    run_chain_capsule(&chain_bin, &init, &op).map_err(classify_assemble_error)
 }
 
 /// The EVM chain id for the mint (default Base mainnet); overridable for other deployments.
@@ -265,7 +327,12 @@ mod tests {
     #[test]
     fn mint_rejects_a_non_object_assembly() {
         let err = assemble_calldata(json!("not-an-object")).expect_err("must reject");
-        assert!(err.contains("JSON object"), "unexpected error: {err}");
+        // A malformed shape is the caller's fault: a client error (400), reason surfaced.
+        assert!(err.is_client_error(), "non-object must classify as a client error: {err}");
+        assert!(
+            err.client_message().contains("JSON object"),
+            "unexpected error: {err}"
+        );
     }
 
     /// DEV INTEGRATION (opt-in): proves the REAL mint signing rail offline — the wallet
@@ -303,5 +370,27 @@ mod tests {
         std::env::remove_var("ELASTOS_DDRM_RIGHTS");
         std::env::remove_var("ELASTOS_DDRM_WALLET_BASE");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Ratchets the `run_chain_capsule` error-prefix contract that `classify_assemble_error` keys on,
+    // so a money-path 400-vs-502 classification can never silently drift with a message edit.
+    #[test]
+    fn assemble_error_classification_maps_capsule_op_failure_to_client_error() {
+        // A capsule op-failure = the caller's malformed mint => client error (400).
+        let op_rejected =
+            classify_assemble_error("chain-provider op failed: invalid_mint bad content_id".into());
+        assert!(op_rejected.is_client_error());
+        assert!(op_rejected.client_message().contains("invalid_mint"));
+
+        // Spawn / init / IO / missing-data = infra => upstream (502), and the reason is NOT leaked.
+        for infra in [
+            "spawn chain-provider (/x/chain): No such file",
+            "chain-provider init failed: boom",
+            "chain-provider ok response missing data",
+        ] {
+            let e = classify_assemble_error(infra.to_string());
+            assert!(!e.is_client_error(), "infra must be upstream: {infra}");
+            assert_eq!(e.client_message(), "could not complete mint");
+        }
     }
 }
