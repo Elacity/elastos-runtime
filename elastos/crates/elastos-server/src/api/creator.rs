@@ -49,6 +49,11 @@ const CREATOR_APP: &str = "creator";
 const THRESHOLD_PROTECTION_TYPE: &str = "cenc:elastos-pq-hybrid-threshold-v0";
 const THRESHOLD_SCHEME: &str = "elastos-pq-hybrid-threshold-v0";
 
+/// The registered MPEG-DASH/CENC DRM SystemID (UUID form) for the threshold scheme — used in the
+/// MPD per-system `<ContentProtection schemeIdUri="urn:uuid:...">`. Matches
+/// `ddrm_envelope::pssh::ELASTOS_PQ_SYSTEM_ID` (base64 `tuJU7w3FR/6U5w5y7R3HsA==`).
+const ELASTOS_PQ_SYSTEM_UUID: &str = "b6e254ef-0dc5-47fe-94e7-0e72ed1dc7b0";
+
 /// The canonical DASH manifest filename inside the published media directory. PC2 (and
 /// base.ela.city) fetch `{dirCid}/stream.mpd` (`pc2-node/src/services/media/dashPackager.ts`,
 /// `src/api/media.ts`), so runtime-minted media MUST use this exact name to index + play there.
@@ -344,6 +349,7 @@ pub struct PrepareMintRequest {
 pub mod mint_progress {
     use serde_json::{json, Value};
     use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -354,6 +360,10 @@ pub mod mint_progress {
         done: bool,
         error: Option<String>,
         updated: u64,
+        // Caller-granted sink the media provider writes measured transcode % to (Improvement A).
+        // Read lazily at UI-poll cadence and merged onto the active `package` stage — no extra
+        // host task. Absent ⇒ the stage carries no pct and the UI stays indeterminate.
+        pkg_progress_path: Option<PathBuf>,
     }
 
     fn now() -> u64 {
@@ -383,8 +393,19 @@ pub mod mint_progress {
                 done: false,
                 error: None,
                 updated: now(),
+                pkg_progress_path: None,
             },
         );
+    }
+
+    /// Register the caller-granted transcode progress sink for a job (no-op without an id).
+    pub fn set_pkg_progress_path(job_id: Option<&str>, path: &Path) {
+        let Some(id) = job_id else { return };
+        let mut g = store().lock().expect("mint progress store poisoned");
+        if let Some(job) = g.get_mut(id) {
+            job.pkg_progress_path = Some(path.to_path_buf());
+            job.updated = now();
+        }
     }
 
     /// Mark `stage` active and every earlier stage done (no-op without a job id).
@@ -436,18 +457,51 @@ pub mod mint_progress {
 
     /// JSON snapshot for the status route (`None` ⇒ unknown/expired job).
     pub fn snapshot(job_id: &str) -> Option<Value> {
-        let g = store().lock().expect("mint progress store poisoned");
-        g.get(job_id).map(|job| {
-            json!({
-                "schema": "elastos.creator.progress/v1",
-                "done": job.done,
-                "error": job.error,
-                "stages": job.stages.iter().map(|(name, status)| json!({
-                    "name": name,
-                    "status": status,
-                })).collect::<Vec<_>>(),
-            })
-        })
+        // Copy the small state out under the lock, then do any file I/O lock-free.
+        let (stages, done, error, pkg_path) = {
+            let g = store().lock().expect("mint progress store poisoned");
+            let job = g.get(job_id)?;
+            (
+                job.stages.clone(),
+                job.done,
+                job.error.clone(),
+                job.pkg_progress_path.clone(),
+            )
+        };
+
+        // Lazily read the measured transcode % only while `package` is active — exactly when
+        // the UI is polling. Best-effort: a missing/torn/garbage file just omits pct.
+        let pkg_pct = if stages
+            .iter()
+            .any(|(name, status)| name == "package" && status == "active")
+        {
+            pkg_path.as_deref().and_then(read_pkg_pct)
+        } else {
+            None
+        };
+
+        Some(json!({
+            "schema": "elastos.creator.progress/v1",
+            "done": done,
+            "error": error,
+            "stages": stages.iter().map(|(name, status)| {
+                let mut row = json!({ "name": name, "status": status });
+                if name == "package" {
+                    if let Some(p) = pkg_pct {
+                        row["pct"] = json!(p);
+                    }
+                }
+                row
+            }).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// Read `{"stage":"transcode","pct":N}` from the provider's sink, returning a clamped 0..=99.
+    fn read_pkg_pct(path: &Path) -> Option<u8> {
+        let body = std::fs::read_to_string(path).ok()?;
+        let v: Value = serde_json::from_str(&body).ok()?;
+        let pct = v.get("pct").and_then(Value::as_i64)?;
+        Some(pct.clamp(0, 99) as u8)
     }
 }
 
@@ -1687,6 +1741,22 @@ async fn finalize_mint(
     }))
 }
 
+/// A unique, host-owned temp path for the media provider's transcode-progress sink. The nonce
+/// is host-generated (process id + clock + a counter) — never derived from the client job id —
+/// so there is no path-injection surface from request input.
+fn pkg_progress_sink_path() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join("elastos-creator-progress");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(format!("pkg-{}-{}-{}.json", std::process::id(), nonce, seq))
+}
+
 /// The MEDIA producer spine: DASH-package (per-track inits + plaintext segments + MPD) ->
 /// CENC every fragment under ONE asset CEK (single default_KID) + escrow to the quorum ->
 /// publish the DASH directory (plaintext inits + ENCRYPTED segments + manifest.mpd) -> media
@@ -1706,15 +1776,27 @@ async fn run_prepare_mint_media(
     // 1) DASH-package the source: per-track standalone inits + PLAINTEXT segments + manifest.
     // This is the long pole (transcode + fragment); the UI shows "package" active throughout.
     mint_progress::advance(job_id, "package");
+    // Measured transcode progress (Improvement A): grant the media provider a single host-owned
+    // sink (capability passing — it writes ONLY here) and surface its % on /prepare-progress.
+    // Host-owned temp path with a random nonce: never derived from the client job id, so there
+    // is no path-injection surface. Best-effort throughout — never blocks the mint.
+    let progress_sink = job_id.map(|_| pkg_progress_sink_path());
+    if let Some(path) = progress_sink.as_deref() {
+        mint_progress::set_pkg_progress_path(job_id, path);
+    }
     let pkg_req = json!({
         "op": "package_dash",
         "content_b64": b64.encode(file_bytes),
         "filename": meta.file_name,
         "preview_duration": meta.preview_duration.unwrap_or(0),
+        "progress_path": progress_sink.as_ref().map(|p| p.to_string_lossy().into_owned()),
     });
-    let pkg = provider_data(registry, "media", &pkg_req)
-        .await
-        .map_err(|e| stage_err("encrypt", e))?;
+    let pkg = provider_data(registry, "media", &pkg_req).await;
+    // The transcode is done (or failed): the sink is no longer read — clean it up.
+    if let Some(path) = progress_sink.as_deref() {
+        let _ = std::fs::remove_file(path);
+    }
+    let pkg = pkg.map_err(|e| stage_err("encrypt", e))?;
     let manifest = pkg
         .get("mpd")
         .and_then(Value::as_str)
@@ -1853,6 +1935,59 @@ async fn run_prepare_mint_media(
     if enc_segments.len() != all_segments.len() {
         return Err(stage_err("encrypt", "encrypted segment count mismatch"));
     }
+
+    // 2c) MPEG-DASH/CENC (ISO/IEC 23001-7) compliance — the standard for every media (DASH) mint.
+    //     CENC-signal each per-track init (encv/enca + sinf + tenc(default_KID) + the Elacity pssh)
+    //     and patch the MPD ContentProtection, so the published asset is a first-class CENC
+    //     protection system (Bento4/PC2 wire format). This is ADDITIVE: the server-decrypt rail
+    //     strips the signaling back for the runtime's own player, so existing playback is unchanged.
+    let (init_files, manifest) = {
+        let protections_slot = dkms_protection(&node_set_id_b64, &producer_vk_b64, &shares);
+        let pssh_envelope = build_pssh_envelope(&protections_slot, mint_chain_id());
+        let pssh_data_b64 = b64.encode(
+            serde_json::to_vec(&pssh_envelope).map_err(|e| stage_err("encrypt", e.to_string()))?,
+        );
+        let signal_req = json!({
+            "op": "cenc_signal_inits",
+            "inits": init_files
+                .iter()
+                .map(|(p, b)| json!({ "path": p, "b64": b }))
+                .collect::<Vec<_>>(),
+            "kid_hex": kid_hex,
+            "iv_size": 8,
+            "pssh_data_b64": pssh_data_b64,
+        });
+        let signaled = provider_data(registry, "encrypt", &signal_req)
+            .await
+            .map_err(|e| stage_err("encrypt", e))?;
+        let signaled_inits = signaled
+            .get("inits")
+            .and_then(Value::as_array)
+            .ok_or_else(|| stage_err("encrypt", "cenc_signal_inits returned no inits"))?;
+        let new_inits: Vec<(String, String)> = signaled_inits
+            .iter()
+            .filter_map(|v| {
+                Some((
+                    v.get("path")?.as_str()?.to_string(),
+                    v.get("b64")?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        if new_inits.len() != init_files.len() {
+            return Err(stage_err(
+                "encrypt",
+                "cenc_signal_inits returned wrong init count",
+            ));
+        }
+        let pssh_b64 = signaled
+            .get("pssh_b64")
+            .and_then(Value::as_str)
+            .ok_or_else(|| stage_err("encrypt", "cenc_signal_inits returned no pssh_b64"))?;
+        (
+            new_inits,
+            patch_mpd_content_protection(&manifest, &kid_hex, pssh_b64),
+        )
+    };
 
     // 3) assemble the DASH directory: plaintext per-track inits + ENCRYPTED segments (at their
     //    MPD paths) + the manifest. Inits are NOT encrypted (CENC encrypts media fragments only).
@@ -2296,6 +2431,73 @@ fn dkms_protection(node_set_id_b64: &str, producer_vk_b64: &str, shares: &Value)
         // quorum, under rights) can unwrap. The dKMS analogue of PC2's public `litCiphertext`.
         "shares": shares.clone(),
     })
+}
+
+/// Wrap the asset's protections slot into the PSSH `Data` JSON envelope the clients consume
+/// (PC2 / media-player shape: `protocolVersion` / `protectionType` / `variant` / `data`).
+/// Single-sourced from [`dkms_protection`] so the PSSH payload and metadata.json protections can
+/// never drift (Principle 12): `data` is the slot minus the hoisted `protectionType`, plus `chainId`.
+fn build_pssh_envelope(protections_slot: &Value, chain_id: u64) -> Value {
+    let mut data = protections_slot.clone();
+    if let Some(obj) = data.as_object_mut() {
+        obj.remove("protectionType");
+        obj.insert("chainId".to_string(), json!(chain_id));
+    }
+    json!({
+        "protocolVersion": "3.0",
+        "protectionType": THRESHOLD_PROTECTION_TYPE,
+        "variant": "eth.web3.clearkey",
+        "data": data,
+    })
+}
+
+/// Format a 32-hex `default_KID` as the dashed UUID form CENC `cenc:default_KID` expects.
+fn format_kid_uuid(kid_hex: &str) -> String {
+    let s = kid_hex.strip_prefix("0x").unwrap_or(kid_hex);
+    if s.len() != 32 {
+        return s.to_string();
+    }
+    format!(
+        "{}-{}-{}-{}-{}",
+        &s[0..8],
+        &s[8..12],
+        &s[12..16],
+        &s[16..20],
+        &s[20..32]
+    )
+}
+
+/// Inject MPEG-DASH/CENC `<ContentProtection>` into every `<AdaptationSet>` of `mpd`: the common
+/// `urn:mpeg:dash:mp4protection:2011` (value `cenc`, `cenc:default_KID`) plus the per-system Elacity
+/// descriptor carrying the base64 `pssh`. Adds the `cenc` namespace to `<MPD>`. String-level insert
+/// (the media-provider MPD is ffmpeg-generated, plain `<AdaptationSet …>` elements).
+fn patch_mpd_content_protection(mpd: &str, kid_hex: &str, pssh_box_b64: &str) -> String {
+    let default_kid = format_kid_uuid(kid_hex);
+    let block = format!(
+        "<ContentProtection schemeIdUri=\"urn:mpeg:dash:mp4protection:2011\" value=\"cenc\" cenc:default_KID=\"{default_kid}\"/>\
+<ContentProtection schemeIdUri=\"urn:uuid:{ELASTOS_PQ_SYSTEM_UUID}\" value=\"{THRESHOLD_PROTECTION_TYPE}\"><cenc:pssh>{pssh_box_b64}</cenc:pssh></ContentProtection>"
+    );
+    // Ensure the cenc namespace on <MPD ...>.
+    let out = if mpd.contains("xmlns:cenc=") {
+        mpd.to_string()
+    } else {
+        mpd.replacen("<MPD ", "<MPD xmlns:cenc=\"urn:mpeg:cenc:2013\" ", 1)
+    };
+    // Insert the block right after each <AdaptationSet ...> open tag.
+    let mut result = String::with_capacity(out.len() + block.len() * 2);
+    let mut cursor = 0usize;
+    while let Some(rel) = out[cursor..].find("<AdaptationSet") {
+        let tag_start = cursor + rel;
+        let Some(close_rel) = out[tag_start..].find('>') else {
+            break;
+        };
+        let insert_at = tag_start + close_rel + 1;
+        result.push_str(&out[cursor..insert_at]);
+        result.push_str(&block);
+        cursor = insert_at;
+    }
+    result.push_str(&out[cursor..]);
+    result
 }
 
 /// The non-empty effective MIME (`application/octet-stream` when the frame sent none).
@@ -3048,6 +3250,52 @@ fn staged_error(status: StatusCode, stage: &str, message: &str) -> Response {
 mod tests {
     use super::*;
 
+    #[test]
+    fn format_kid_uuid_dashes_a_32_hex_kid() {
+        assert_eq!(
+            format_kid_uuid("ecc00fbfe967bf0e091532f2492bbd09"),
+            "ecc00fbf-e967-bf0e-0915-32f2492bbd09"
+        );
+        // 0x prefix tolerated; non-32-hex returned as-is.
+        assert_eq!(
+            format_kid_uuid("0xecc00fbfe967bf0e091532f2492bbd09"),
+            "ecc00fbf-e967-bf0e-0915-32f2492bbd09"
+        );
+        assert_eq!(format_kid_uuid("short"), "short");
+    }
+
+    #[test]
+    fn build_pssh_envelope_hoists_protection_type_and_adds_chain_id() {
+        let slot = dkms_protection("nodeset", "prodvk", &json!([{"x": 1}]));
+        let env = build_pssh_envelope(&slot, 8453);
+        assert_eq!(env["protectionType"], THRESHOLD_PROTECTION_TYPE);
+        assert_eq!(env["variant"], "eth.web3.clearkey");
+        assert_eq!(env["protocolVersion"], "3.0");
+        // data carries the slot fields + chainId, WITHOUT the hoisted protectionType.
+        assert_eq!(env["data"]["chainId"], 8453);
+        assert_eq!(env["data"]["scheme"], THRESHOLD_SCHEME);
+        assert_eq!(env["data"]["node_set_id_b64"], "nodeset");
+        assert!(env["data"].get("protectionType").is_none());
+    }
+
+    #[test]
+    fn patch_mpd_injects_content_protection_per_adaptationset() {
+        let mpd = r#"<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011"><Period><AdaptationSet mimeType="video/mp4"><Representation id="v"/></AdaptationSet><AdaptationSet mimeType="audio/mp4"><Representation id="a"/></AdaptationSet></Period></MPD>"#;
+        let out =
+            patch_mpd_content_protection(mpd, "ecc00fbfe967bf0e091532f2492bbd09", "UFNTSC1CT1g=");
+        // cenc namespace added once.
+        assert_eq!(out.matches("xmlns:cenc=").count(), 1);
+        // common mp4protection + per-system descriptor injected into BOTH AdaptationSets.
+        assert_eq!(out.matches("urn:mpeg:dash:mp4protection:2011").count(), 2);
+        assert_eq!(
+            out.matches(&format!("urn:uuid:{ELASTOS_PQ_SYSTEM_UUID}"))
+                .count(),
+            2
+        );
+        assert!(out.contains("cenc:default_KID=\"ecc00fbf-e967-bf0e-0915-32f2492bbd09\""));
+        assert!(out.contains("<cenc:pssh>UFNTSC1CT1g=</cenc:pssh>"));
+    }
+
     fn descriptor(node_count: usize, with_seed: bool) -> Vec<u8> {
         let mut nodes = Vec::new();
         for i in 0..node_count {
@@ -3075,6 +3323,42 @@ mod tests {
     fn refuses_a_descriptor_carrying_secret_material() {
         let err = parse_quorum_descriptor(&descriptor(3, true)).unwrap_err();
         assert!(err.contains("PUBLIC-ONLY"), "got: {err}");
+    }
+
+    #[test]
+    fn progress_snapshot_surfaces_measured_pct_only_while_package_active() {
+        let job = format!("test-prog-{}", std::process::id());
+        mint_progress::start(&job, &["analyze", "package", "encrypt"]);
+
+        // A granted sink with a measured value, but `package` not yet active ⇒ no pct leaks.
+        let sink = pkg_progress_sink_path();
+        std::fs::write(&sink, b"{\"stage\":\"transcode\",\"pct\":42}").unwrap();
+        mint_progress::set_pkg_progress_path(Some(&job), &sink);
+        mint_progress::advance(Some(&job), "analyze");
+        let snap = mint_progress::snapshot(&job).unwrap();
+        let pkg = snap["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "package")
+            .unwrap();
+        assert!(
+            pkg.get("pct").is_none(),
+            "pct must not show before package is active"
+        );
+
+        // Once `package` is active, the measured % is merged onto that stage.
+        mint_progress::advance(Some(&job), "package");
+        let snap = mint_progress::snapshot(&job).unwrap();
+        let pkg = snap["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "package")
+            .unwrap();
+        assert_eq!(pkg["pct"], json!(42));
+
+        let _ = std::fs::remove_file(&sink);
     }
 
     #[test]

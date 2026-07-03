@@ -707,6 +707,23 @@ pub fn gateway_router(state: GatewayState) -> Router {
         .route("/api/apps/marketplace/catalog", get(marketplace_catalog))
         .route("/api/apps/services/summary", get(services_summary))
         .route("/api/apps/services/offers", post(services_offer_update))
+        .route("/api/market/search", get(market_search))
+        .route("/api/market/sections", get(market_sections))
+        .route("/api/market/get", get(market_get))
+        .route("/api/market/history", get(market_history))
+        .route("/api/market/preview/plan", get(market_preview_plan))
+        .route(
+            "/api/market/preview/file/:cid/*path",
+            get(market_preview_file),
+        )
+        .route("/api/market/vault", get(market_vault))
+        .route("/api/market/listed", get(market_listed))
+        .route("/api/market/me", get(market_me))
+        .route("/api/market/acquire", post(market_acquire))
+        .route("/api/market/acquire-status", get(market_acquire_status))
+        .route("/api/market/order/sell", post(market_order_sell))
+        .route("/api/market/order/withdraw", post(market_order_withdraw))
+        .route("/api/market/order/approve", post(market_order_approve))
         .route("/api/apps/inbox/summary", get(inbox_summary))
         .route("/api/apps/inbox/actions", post(inbox_action))
         .route(

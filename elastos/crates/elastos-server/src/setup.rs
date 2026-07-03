@@ -2995,17 +2995,22 @@ mod tests {
         fs::write(&source_path, b"arm64-kernel").unwrap();
         fs::write(&install_path, b"arm64-kernel").unwrap();
 
+        // Host-independent: stamp + verify under the resolved host platform, not a fixed
+        // linux-amd64 (json! needs a literal key, so build the platforms map dynamically).
+        let mut platforms = serde_json::Map::new();
+        platforms.insert(
+            platform.clone(),
+            serde_json::json!({
+                "strategy": "local-copy",
+                "source": source_path.to_string_lossy(),
+                "install_path": "bin/vmlinux"
+            }),
+        );
         let manifest: ComponentsManifest = serde_json::from_value(serde_json::json!({
             "external": {
                 "vmlinux": {
                     "install_path": "bin/vmlinux",
-                    "platforms": {
-                        platform.clone(): {
-                            "strategy": "local-copy",
-                            "source": source_path.to_string_lossy(),
-                            "install_path": "bin/vmlinux"
-                        }
-                    }
+                    "platforms": platforms
                 }
             },
             "capsules": {},

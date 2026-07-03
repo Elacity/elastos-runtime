@@ -120,6 +120,18 @@ impl Capsule {
     }
 }
 
+impl Drop for Capsule {
+    fn drop(&mut self) {
+        // Safety net (ELACITY-2282 Defect B): Rust's `Child::drop` does NOT kill the process, so a
+        // Capsule dropped WITHOUT an explicit `shutdown()` — any `?`/early-return/panic path — would
+        // ORPHAN its key-provider/decrypt-provider child (the lingering procs that pile up across
+        // retry attempts). Best-effort kill + reap so these never accumulate. Idempotent after a
+        // graceful `shutdown()` (the child has already exited; kill/wait on it are harmless no-ops).
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Run the dKMS `release` (2-of-3 recover + re-seal to the per-open decrypt session) against the WARM
 /// key-provider daemon over its Unix socket when the gateway wired one up (Phase A — node handshake
 /// sessions reused across opens, no per-open process spawn or init+hello), falling back to spawning a
@@ -651,7 +663,7 @@ fn compute_open_payload(capsule: &Value, args: &QuorumArgs) -> Result<OpenPayloa
         let init_bytes = if init_path.is_empty() {
             Vec::new()
         } else {
-            read_dash_file(dir, init_path)?
+            read_dash_init(dir, init_path)?
         };
         // Weld the ordered segment set into the transcript AAD ONLY when there is more than one
         // segment — this MUST match the decrypt boundary, which computes `segment_digests` iff
@@ -739,7 +751,7 @@ fn build_media_tracks(
             let init = if init_path.is_empty() {
                 Vec::new()
             } else {
-                read_dash_file(dir, init_path)?
+                read_dash_init(dir, init_path)?
             };
             let seg_list = t
                 .get("segment_paths")
@@ -793,6 +805,23 @@ fn read_dash_file(dir: &std::path::Path, rel: &str) -> Result<Vec<u8>, String> {
     }
     let path = dir.join(rel);
     std::fs::read(&path).map_err(|e| format!("read DASH file {}: {e}", path.display()))
+}
+
+/// Read a DASH **init** segment from the dir and down-convert it for the server-decrypt rail:
+/// strip any MPEG-DASH/CENC signaling (`encv`/`enca` -> original, drop `sinf`/`tenc`/`pssh`) so it
+/// matches the PLAINTEXT init the mint sealed (the seal binds `first_init` BEFORE PSSH injection)
+/// AND the clear, `senc`-stripped segments this rail serves.
+///
+/// `strip_cenc_signal` returns the init UNCHANGED for unsignaled inits (demo / pre-compliance
+/// assets), so an `Err` here means the init is malformed or only partially CENC-signaled — exactly
+/// the case where silently falling back to the raw signaled bytes would bind a NON-canonical init
+/// (breaking the seal's plaintext-`first_init` match) and surface downstream as an opaque
+/// decrypt/quorum failure. We propagate the precise strip error instead of swallowing it, so the
+/// producer-side format fault is diagnosed at the right layer rather than misattributed to the CEK.
+fn read_dash_init(dir: &std::path::Path, rel: &str) -> Result<Vec<u8>, String> {
+    let raw = read_dash_file(dir, rel)?;
+    ddrm_media::mp4::strip_cenc_signal(&raw)
+        .map_err(|e| format!("strip CENC signaling from init {rel:?}: {e}"))
 }
 
 /// A warm quorum open: the CEK is recovered + sealed into the live decrypt boundary. Drives
@@ -1448,6 +1477,45 @@ fn serve_pixel_lock(open: &mut QuorumOpen, args: &QuorumArgs) -> Result<(), Stri
 fn reply(out: &mut impl Write, value: &Value) -> Result<(), String> {
     writeln!(out, "{value}").map_err(|e| format!("write reply: {e}"))?;
     out.flush().map_err(|e| format!("flush reply: {e}"))
+}
+
+#[cfg(test)]
+mod init_read_tests {
+    use super::*;
+
+    /// Regression (ELACITY-2282/2283): a malformed or partially-CENC-signaled init makes
+    /// `strip_cenc_signal` fail; `read_dash_init` must PROPAGATE that error rather than silently
+    /// falling back to the raw bytes (the old `unwrap_or(raw)`), which would bind a NON-canonical
+    /// init into the transcript and surface downstream as an opaque decrypt/quorum failure instead of
+    /// the precise producer-side format fault.
+    #[test]
+    fn read_dash_init_propagates_strip_errors_instead_of_swallowing() {
+        let dir = std::env::temp_dir().join(format!(
+            "ddrm-init-read-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A well-formed `ftyp` box but NO `moov` → strip_cenc_signal errs ("init has no moov"),
+        // which the old `unwrap_or(raw)` would have silently swallowed back to the raw bytes.
+        let mut init = vec![0u8, 0, 0, 12];
+        init.extend_from_slice(b"ftyp");
+        init.extend_from_slice(b"isom");
+        std::fs::write(dir.join("init.mp4"), &init).unwrap();
+
+        let err =
+            read_dash_init(&dir, "init.mp4").expect_err("a malformed init must not be swallowed");
+        assert!(
+            err.contains("strip CENC signaling"),
+            "the strip error must be surfaced precisely, got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

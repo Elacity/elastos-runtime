@@ -371,7 +371,315 @@ pub fn strip_senc(frag: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Wrap arbitrary bytes as a single-sample fragmented-MP4 fragment so a NON-MEDIA
+/// True for known AUDIO sample-entry 4CCs. This is the FALLBACK for the `enca`-vs-`encv` choice per
+/// ISO/IEC 23001-7 §4 when a track's authoritative `hdlr` handler type is unavailable — the handler
+/// type ('soun'/'vide') is the primary signal (see [`is_audio_sample_entry`]). The list covers the
+/// codecs a DASH/CMAF audio track realistically carries so an uncommon-but-valid audio codec is not
+/// mis-signaled as video (which would make a non-compliant init AND missize the strip fixed fields).
+/// This is also the single source of truth for [`parse_codec_string`]'s audio/video split.
+fn is_audio_fourcc(fourcc: &[u8; 4]) -> bool {
+    matches!(
+        fourcc,
+        b"mp4a"
+            | b"Opus"
+            | b"opus"
+            | b"fLaC"
+            | b"flac"
+            | b"ac-3"
+            | b"ec-3"
+            | b"ac-4"
+            | b"alac"
+            | b"dtsc"
+            | b"dtse"
+            | b"dtsh"
+            | b"dtsl"
+            | b"mha1"
+            | b"mhm1"
+            | b".mp3"
+            | b"enca"
+    )
+}
+
+/// Choose AUDIO vs VIDEO for the CENC protected sample entry (`enca` vs `encv`). The track's `hdlr`
+/// handler type is AUTHORITATIVE — 'soun' = audio, 'vide' = video — because it is set per ISO-BMFF
+/// independent of the codec. Only when the handler type is absent/unknown (zeroed) do we fall back to
+/// the codec-4CC allowlist [`is_audio_fourcc`]. This keeps an uncommon audio codec from being
+/// mis-signaled as `encv` (a non-compliant init that also makes [`strip_cenc_signal`] pick the wrong
+/// fixed-field size).
+fn is_audio_sample_entry(handler_type: &[u8; 4], fourcc: &[u8; 4]) -> bool {
+    match handler_type {
+        b"soun" => true,
+        b"vide" => false,
+        _ => is_audio_fourcc(fourcc),
+    }
+}
+
+/// Rebuild `container` (located at `container_off`) with the single child at
+/// `child_off` (of `child_old_size` bytes) replaced by `new_child`, fixing the
+/// container's size. Assumes a 32-bit box header (true for moov/trak/.../stsd).
+fn splice_child(
+    data: &[u8],
+    container_off: usize,
+    container_h: BoxHeader,
+    child_off: usize,
+    child_old_size: usize,
+    new_child: &[u8],
+) -> Vec<u8> {
+    let content_start = container_off + container_h.header_size;
+    let content_end = container_off + container_h.size;
+    let mut content = Vec::with_capacity(content_end - content_start + new_child.len());
+    content.extend_from_slice(&data[content_start..child_off]);
+    content.extend_from_slice(new_child);
+    content.extend_from_slice(&data[child_off + child_old_size..content_end]);
+    make_box(&container_h.box_type, &content)
+}
+
+/// Walk `data[moov_off..]` down `moov > trak > mdia > minf > stbl > stsd` and return
+/// `(offset, header)` for each box on the path plus the first sample entry in `stsd`.
+/// The producer emits one `trak` per standalone init (PC2 `demux_tracks`), so the
+/// first `trak` is the track.
+struct StsdPath {
+    moov: (usize, BoxHeader),
+    trak: (usize, BoxHeader),
+    mdia: (usize, BoxHeader),
+    minf: (usize, BoxHeader),
+    stbl: (usize, BoxHeader),
+    stsd: (usize, BoxHeader),
+    entry: (usize, BoxHeader),
+    /// The track's `mdia > hdlr` handler type ('soun'/'vide'); zeroed if no `hdlr` is present. The
+    /// authoritative audio/video signal for the `enca`/`encv` choice (see [`is_audio_sample_entry`]).
+    handler_type: [u8; 4],
+}
+
+fn locate_stsd_path(init: &[u8]) -> Result<StsdPath, String> {
+    let (moov_off, moov_h) = top_level_boxes(init)?
+        .into_iter()
+        .find(|(_, h)| &h.box_type == b"moov")
+        .ok_or("init has no moov")?;
+    let moov_end = moov_off + moov_h.size;
+    let (trak_off, trak_h) = find_box(init, moov_off + moov_h.header_size, moov_end, b"trak")
+        .ok_or("moov has no trak")?;
+    let trak_end = trak_off + trak_h.size;
+    let (mdia_off, mdia_h) = find_box(init, trak_off + trak_h.header_size, trak_end, b"mdia")
+        .ok_or("trak has no mdia")?;
+    let mdia_end = mdia_off + mdia_h.size;
+    // The AUTHORITATIVE track kind for the enca/encv choice: the mdia>hdlr handler_type. Zeroed when
+    // no hdlr is present, in which case the caller falls back to the codec-4CC allowlist.
+    let mut handler_type = [0u8; 4];
+    if let Some((hdlr_off, hdlr_h)) = find_box(init, mdia_off + mdia_h.header_size, mdia_end, b"hdlr")
+    {
+        let h_at = hdlr_off + hdlr_h.header_size + 8;
+        if let Some(slice) = init.get(h_at..h_at + 4) {
+            handler_type.copy_from_slice(slice);
+        }
+    }
+    let (minf_off, minf_h) = find_box(init, mdia_off + mdia_h.header_size, mdia_end, b"minf")
+        .ok_or("mdia has no minf")?;
+    let minf_end = minf_off + minf_h.size;
+    let (stbl_off, stbl_h) = find_box(init, minf_off + minf_h.header_size, minf_end, b"stbl")
+        .ok_or("minf has no stbl")?;
+    let stbl_end = stbl_off + stbl_h.size;
+    let (stsd_off, stsd_h) = find_box(init, stbl_off + stbl_h.header_size, stbl_end, b"stsd")
+        .ok_or("stbl has no stsd")?;
+    let stsd_end = stsd_off + stsd_h.size;
+    // stsd content: FullBox header (4) + entry_count (4) + entries.
+    let entry_off = stsd_off + stsd_h.header_size + 8;
+    let entry_h = read_box_header(init, entry_off).ok_or("stsd has no sample entry")?;
+    if entry_h.size < 8 || entry_off + entry_h.size > stsd_end {
+        return Err("sample entry overruns stsd".into());
+    }
+    Ok(StsdPath {
+        moov: (moov_off, moov_h),
+        trak: (trak_off, trak_h),
+        mdia: (mdia_off, mdia_h),
+        minf: (minf_off, minf_h),
+        stbl: (stbl_off, stbl_h),
+        stsd: (stsd_off, stsd_h),
+        entry: (entry_off, entry_h),
+        handler_type,
+    })
+}
+
+/// Build a CENC `sinf` (Protection Scheme Information) for `orig_fourcc`, declaring the
+/// `cenc` scheme and a `tenc` (TrackEncryptionBox v0) with `default_kid` + `iv_size`-byte
+/// per-sample IVs (full-sample CTR encryption, matching [`encrypt_fragment`]).
+fn build_sinf(orig_fourcc: &[u8; 4], default_kid: &[u8; 16], iv_size: u8) -> Vec<u8> {
+    let frma = make_box(b"frma", orig_fourcc);
+    // schm (FullBox v0, flags 0): scheme_type 'cenc', scheme_version 0x00010000.
+    let mut schm = vec![0u8, 0, 0, 0];
+    schm.extend_from_slice(b"cenc");
+    schm.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+    let schm = make_box(b"schm", &schm);
+    // tenc (FullBox v0): reserved, reserved(v0), default_isProtected=1, IV size, default_KID.
+    let mut tenc = vec![0u8, 0, 0, 0];
+    tenc.push(0); // reserved
+    tenc.push(0); // reserved (v0)
+    tenc.push(1); // default_isProtected
+    tenc.push(iv_size); // default_Per_Sample_IV_Size
+    tenc.extend_from_slice(default_kid);
+    let schi = make_box(b"schi", &make_box(b"tenc", &tenc));
+    let mut sinf = Vec::new();
+    sinf.extend_from_slice(&frma);
+    sinf.extend_from_slice(&schm);
+    sinf.extend_from_slice(&schi);
+    make_box(b"sinf", &sinf)
+}
+
+/// CENC-signal a (single-track) fMP4 **init** segment for MPEG-DASH/CENC (ISO/IEC
+/// 23001-7) compliance: wrap the sample entry as `encv`/`enca` carrying a `sinf`
+/// (`frma` + `schm` 'cenc' + `tenc` with `default_kid`), and inject `pssh_box` as a
+/// child of `moov`. `iv_size` MUST match the per-sample IV size the fragments use
+/// (8 here, see [`encrypt_fragment`]). The inverse is [`strip_cenc_signal`].
+///
+/// This is the producer half of the "one compliant asset" model: the published init
+/// is standards-compliant (a stock CENC player / FFmpeg keys decryption off `tenc`),
+/// and the server-side decrypt rail calls [`strip_cenc_signal`] to hand its own
+/// player an unencrypted-looking init.
+pub fn cenc_signal_init(
+    init: &[u8],
+    default_kid: &[u8; 16],
+    iv_size: u8,
+    pssh_box: &[u8],
+) -> Result<Vec<u8>, String> {
+    let p = locate_stsd_path(init)?;
+    let (entry_off, entry_h) = p.entry;
+    let orig_fourcc = entry_h.box_type;
+    if &orig_fourcc == b"encv" || &orig_fourcc == b"enca" {
+        return Err("init is already CENC-signaled (encv/enca present)".into());
+    }
+    let prot_fourcc: &[u8; 4] = if is_audio_sample_entry(&p.handler_type, &orig_fourcc) {
+        b"enca"
+    } else {
+        b"encv"
+    };
+
+    // New sample entry: same fixed fields + child boxes, type swapped, sinf appended.
+    let sinf = build_sinf(&orig_fourcc, default_kid, iv_size);
+    let entry_content_start = entry_off + entry_h.header_size;
+    let entry_content_end = entry_off + entry_h.size;
+    let mut new_entry_content = init[entry_content_start..entry_content_end].to_vec();
+    new_entry_content.extend_from_slice(&sinf);
+    let new_entry = make_box(prot_fourcc, &new_entry_content);
+
+    // Rebuild the path bottom-up (stsd entry -> stsd -> stbl -> minf -> mdia -> trak).
+    let (stsd_off, stsd_h) = p.stsd;
+    let new_stsd = splice_child(init, stsd_off, stsd_h, entry_off, entry_h.size, &new_entry);
+    let (stbl_off, stbl_h) = p.stbl;
+    let new_stbl = splice_child(init, stbl_off, stbl_h, stsd_off, stsd_h.size, &new_stsd);
+    let (minf_off, minf_h) = p.minf;
+    let new_minf = splice_child(init, minf_off, minf_h, stbl_off, stbl_h.size, &new_stbl);
+    let (mdia_off, mdia_h) = p.mdia;
+    let new_mdia = splice_child(init, mdia_off, mdia_h, minf_off, minf_h.size, &new_minf);
+    let (trak_off, trak_h) = p.trak;
+    let new_trak = splice_child(init, trak_off, trak_h, mdia_off, mdia_h.size, &new_mdia);
+
+    // Rebuild moov: replace the trak and append the pssh box as a moov child.
+    let (moov_off, moov_h) = p.moov;
+    let moov_end = moov_off + moov_h.size;
+    let moov_content_start = moov_off + moov_h.header_size;
+    let mut new_moov_content = Vec::new();
+    new_moov_content.extend_from_slice(&init[moov_content_start..trak_off]);
+    new_moov_content.extend_from_slice(&new_trak);
+    new_moov_content.extend_from_slice(&init[trak_off + trak_h.size..moov_end]);
+    new_moov_content.extend_from_slice(pssh_box);
+    let new_moov = make_box(b"moov", &new_moov_content);
+
+    let mut out = Vec::with_capacity(init.len() + sinf.len() + pssh_box.len() + 16);
+    out.extend_from_slice(&init[..moov_off]);
+    out.extend_from_slice(&new_moov);
+    out.extend_from_slice(&init[moov_end..]);
+    Ok(out)
+}
+
+/// Inverse of [`cenc_signal_init`]: restore the original `avc1`/`mp4a`/... sample entry
+/// (from the `sinf`'s `frma`), drop the `sinf`, and remove every `pssh` child from
+/// `moov` — yielding the "unencrypted-looking" init the server-side decrypt rail serves
+/// its own player. No-op-ish if the init is not CENC-signaled (returns it unchanged).
+pub fn strip_cenc_signal(init: &[u8]) -> Result<Vec<u8>, String> {
+    let p = locate_stsd_path(init)?;
+    let (entry_off, entry_h) = p.entry;
+    if &entry_h.box_type != b"encv" && &entry_h.box_type != b"enca" {
+        return Ok(init.to_vec()); // not CENC-signaled
+    }
+    let entry_content_start = entry_off + entry_h.header_size;
+    let entry_content_end = entry_off + entry_h.size;
+    // Child boxes start after the fixed sample-entry fields (both include the 8-byte
+    // SampleEntry preamble); the protected entry keeps the original entry's field layout.
+    let fixed = if &entry_h.box_type == b"encv" {
+        VISUAL_SAMPLE_ENTRY_FIXED_BYTES
+    } else {
+        AUDIO_SAMPLE_ENTRY_FIXED_BYTES
+    };
+    let children_start = entry_content_start + fixed;
+    if children_start > entry_content_end {
+        return Err("protected sample entry shorter than its fixed fields".into());
+    }
+    // Walk the entry's child boxes; pull the original 4CC out of sinf>frma and drop sinf.
+    let mut orig_fourcc: Option<[u8; 4]> = None;
+    let mut kept_children = Vec::new();
+    let mut off = children_start;
+    while off + 8 <= entry_content_end {
+        let h = read_box_header(init, off).ok_or("malformed child box in sample entry")?;
+        if h.size < 8 || off + h.size > entry_content_end {
+            return Err("child box overruns sample entry".into());
+        }
+        if &h.box_type == b"sinf" {
+            let sinf_end = off + h.size;
+            let (frma_off, frma_h) = find_box(init, off + h.header_size, sinf_end, b"frma")
+                .ok_or("sinf has no frma")?;
+            let fc = init
+                .get(frma_off + frma_h.header_size..frma_off + frma_h.header_size + 4)
+                .ok_or("frma too short")?;
+            orig_fourcc = Some([fc[0], fc[1], fc[2], fc[3]]);
+        } else {
+            kept_children.extend_from_slice(&init[off..off + h.size]);
+        }
+        off += h.size;
+    }
+    let orig_fourcc = orig_fourcc.ok_or("CENC-signaled entry has no sinf/frma")?;
+
+    let mut new_entry_content = init[entry_content_start..children_start].to_vec();
+    new_entry_content.extend_from_slice(&kept_children);
+    let new_entry = make_box(&orig_fourcc, &new_entry_content);
+
+    let (stsd_off, stsd_h) = p.stsd;
+    let new_stsd = splice_child(init, stsd_off, stsd_h, entry_off, entry_h.size, &new_entry);
+    let (stbl_off, stbl_h) = p.stbl;
+    let new_stbl = splice_child(init, stbl_off, stbl_h, stsd_off, stsd_h.size, &new_stsd);
+    let (minf_off, minf_h) = p.minf;
+    let new_minf = splice_child(init, minf_off, minf_h, stbl_off, stbl_h.size, &new_stbl);
+    let (mdia_off, mdia_h) = p.mdia;
+    let new_mdia = splice_child(init, mdia_off, mdia_h, minf_off, minf_h.size, &new_minf);
+    let (trak_off, trak_h) = p.trak;
+    let new_trak = splice_child(init, trak_off, trak_h, mdia_off, mdia_h.size, &new_mdia);
+
+    // Rebuild moov: replace the trak, dropping any pssh children.
+    let (moov_off, moov_h) = p.moov;
+    let moov_end = moov_off + moov_h.size;
+    let moov_content_start = moov_off + moov_h.header_size;
+    let mut new_moov_content = Vec::new();
+    let mut moff = moov_content_start;
+    while moff + 8 <= moov_end {
+        let h = read_box_header(init, moff).ok_or("malformed moov child")?;
+        if h.size < 8 || moff + h.size > moov_end {
+            return Err("moov child overruns moov".into());
+        }
+        if moff == trak_off {
+            new_moov_content.extend_from_slice(&new_trak);
+        } else if &h.box_type != b"pssh" {
+            new_moov_content.extend_from_slice(&init[moff..moff + h.size]);
+        }
+        moff += h.size;
+    }
+    let new_moov = make_box(b"moov", &new_moov_content);
+
+    let mut out = Vec::with_capacity(init.len());
+    out.extend_from_slice(&init[..moov_off]);
+    out.extend_from_slice(&new_moov);
+    out.extend_from_slice(&init[moov_end..]);
+    Ok(out)
+}
+
 /// object can ride the exact same CENC rail as media. The blob becomes one sample
 /// inside `mdat`; the synthesized `moof/traf/trun` carry the one flag set
 /// [`encrypt_fragment`] requires: `data_offset` (0x1) + per-sample `size` (0x200),
@@ -726,7 +1034,9 @@ fn parse_codec_string(data: &[u8], stsd_off: usize, stsd_size: usize) -> String 
         return "unknown".to_string();
     };
     let fourcc = entry.box_type;
-    let is_audio_entry = matches!(&fourcc, b"mp4a" | b"Opus" | b"fLaC" | b"enca");
+    // One source of truth for the audio/video split (was a divergent inline list that misclassified
+    // ac-3/ec-3/etc. as video and thus computed the wrong child-box offset).
+    let is_audio_entry = is_audio_fourcc(&fourcc);
     let child_start = content_start
         + entry.header_size
         + if is_audio_entry {
@@ -1175,6 +1485,188 @@ mod meta_tests {
             read_placeholder_variant(&clean_b),
             Some(1),
             "the served variant symbol must survive back to the clean fragment"
+        );
+    }
+
+    // ── CENC init signaling (cenc_signal_init / strip_cenc_signal) ──────────────────
+
+    /// Build a minimal single-track init: `ftyp` + `moov { mvhd, trak { mdia { minf {
+    /// stbl { stsd { <entry> } } } } } }`. `mvhd` is a sibling before `trak` so the
+    /// roundtrip also proves non-trak moov children survive.
+    fn minimal_init(entry_fourcc: &[u8; 4], fixed_bytes: usize, codec_child: &[u8]) -> Vec<u8> {
+        let mut entry_content = vec![0u8; fixed_bytes];
+        entry_content.extend_from_slice(codec_child);
+        let entry = make_box(entry_fourcc, &entry_content);
+        let mut stsd_content = vec![0, 0, 0, 0, 0, 0, 0, 1]; // version/flags + entry_count=1
+        stsd_content.extend_from_slice(&entry);
+        let stsd = make_box(b"stsd", &stsd_content);
+        let stbl = make_box(b"stbl", &stsd);
+        let minf = make_box(b"minf", &stbl);
+        let mdia = make_box(b"mdia", &minf);
+        let trak = make_box(b"trak", &mdia);
+        let mvhd = make_box(b"mvhd", &[0u8; 8]);
+        let mut moov_content = Vec::new();
+        moov_content.extend_from_slice(&mvhd);
+        moov_content.extend_from_slice(&trak);
+        let moov = make_box(b"moov", &moov_content);
+        let ftyp = make_box(b"ftyp", b"isom\0\0\0\0isomiso2");
+        let mut init = Vec::new();
+        init.extend_from_slice(&ftyp);
+        init.extend_from_slice(&moov);
+        init
+    }
+
+    /// Like [`minimal_init`] but the `mdia` also carries an `hdlr` box with `handler_type`, so the
+    /// authoritative audio/video signal (not just the codec 4CC) is exercised.
+    fn minimal_init_hdlr(
+        entry_fourcc: &[u8; 4],
+        fixed_bytes: usize,
+        codec_child: &[u8],
+        handler_type: &[u8; 4],
+    ) -> Vec<u8> {
+        let mut entry_content = vec![0u8; fixed_bytes];
+        entry_content.extend_from_slice(codec_child);
+        let entry = make_box(entry_fourcc, &entry_content);
+        let mut stsd_content = vec![0, 0, 0, 0, 0, 0, 0, 1];
+        stsd_content.extend_from_slice(&entry);
+        let stsd = make_box(b"stsd", &stsd_content);
+        let stbl = make_box(b"stbl", &stsd);
+        let minf = make_box(b"minf", &stbl);
+        // hdlr: FullBox(4) + pre_defined(4) + handler_type(4) + reserved(12) + name("\0").
+        let mut hdlr_content = vec![0u8; 8];
+        hdlr_content.extend_from_slice(handler_type);
+        hdlr_content.extend_from_slice(&[0u8; 13]);
+        let hdlr = make_box(b"hdlr", &hdlr_content);
+        let mut mdia_content = Vec::new();
+        mdia_content.extend_from_slice(&hdlr);
+        mdia_content.extend_from_slice(&minf);
+        let mdia = make_box(b"mdia", &mdia_content);
+        let trak = make_box(b"trak", &mdia);
+        let mvhd = make_box(b"mvhd", &[0u8; 8]);
+        let mut moov_content = Vec::new();
+        moov_content.extend_from_slice(&mvhd);
+        moov_content.extend_from_slice(&trak);
+        let moov = make_box(b"moov", &moov_content);
+        let ftyp = make_box(b"ftyp", b"isom\0\0\0\0isomiso2");
+        let mut init = Vec::new();
+        init.extend_from_slice(&ftyp);
+        init.extend_from_slice(&moov);
+        init
+    }
+
+    /// Regression (ELACITY-2283): the `enca`/`encv` choice must follow the track's `hdlr` handler
+    /// type, NOT a codec-4CC guess. An audio track (`hdlr='soun'`) whose sample-entry 4CC is not in
+    /// the audio allowlist (here a deliberately unlisted `ipcm`) must still be signaled `enca` and
+    /// round-trip — before the fix it became `encv`, yielding a non-compliant init that `strip` then
+    /// missized (78-byte visual fixed fields over a 28-byte audio entry).
+    #[test]
+    fn cenc_signal_chooses_enca_from_the_hdlr_handler_type() {
+        let init = minimal_init_hdlr(
+            b"ipcm",
+            AUDIO_SAMPLE_ENTRY_FIXED_BYTES,
+            &make_box(b"pcmC", &[0u8; 6]),
+            b"soun",
+        );
+        let signaled =
+            cenc_signal_init(&init, &[0x33u8; 16], 8, &make_box(b"pssh", b"x")).expect("signal");
+        let p = locate_stsd_path(&signaled).expect("locate");
+        assert_eq!(
+            &p.entry.1.box_type, b"enca",
+            "hdlr='soun' must force enca regardless of the sample-entry 4CC"
+        );
+        assert_eq!(
+            strip_cenc_signal(&signaled).expect("strip"),
+            init,
+            "an authoritatively-audio entry must round-trip via the audio fixed-field size"
+        );
+    }
+
+    /// Regression (ELACITY-2283): with no `hdlr` to consult, the codec-4CC fallback must recognize
+    /// the common audio codecs the old list omitted (here `ac-3`) as `enca`, not video.
+    #[test]
+    fn cenc_signal_classifies_ac3_audio_as_enca_via_fallback() {
+        let init = minimal_init(
+            b"ac-3",
+            AUDIO_SAMPLE_ENTRY_FIXED_BYTES,
+            &make_box(b"dac3", &[0u8; 3]),
+        );
+        let signaled =
+            cenc_signal_init(&init, &[0x44u8; 16], 8, &make_box(b"pssh", b"x")).expect("signal");
+        assert_eq!(
+            &locate_stsd_path(&signaled).expect("locate").entry.1.box_type,
+            b"enca",
+            "ac-3 must be recognized as audio by the expanded fallback allowlist"
+        );
+        assert_eq!(strip_cenc_signal(&signaled).expect("strip"), init);
+    }
+
+    #[test]
+    fn cenc_signal_init_roundtrips_video() {
+        let init = minimal_init(
+            b"avc1",
+            VISUAL_SAMPLE_ENTRY_FIXED_BYTES,
+            &make_box(b"avcC", &[0x01, 0x64, 0x00, 0x28]),
+        );
+        let kid = [0x11u8; 16];
+        let pssh = make_box(b"pssh", b"PSSH-PAYLOAD-BYTES");
+
+        let signaled = cenc_signal_init(&init, &kid, 8, &pssh).expect("signal");
+        // Structure: sample entry is now `encv`, a `tenc` carrying the KID is present,
+        // and the `pssh` payload was injected.
+        let p = locate_stsd_path(&signaled).expect("locate");
+        assert_eq!(&p.entry.1.box_type, b"encv");
+        assert!(
+            signaled.windows(pssh.len()).any(|w| w == pssh.as_slice()),
+            "pssh box must be injected into moov"
+        );
+        assert!(
+            signaled.windows(16).any(|w| w == kid),
+            "tenc must carry the default_KID"
+        );
+        // Inverse restores the original init byte-for-byte.
+        let stripped = strip_cenc_signal(&signaled).expect("strip");
+        assert_eq!(stripped, init, "strip_cenc_signal must invert cenc_signal_init");
+    }
+
+    #[test]
+    fn cenc_signal_init_roundtrips_audio() {
+        let init = minimal_init(
+            b"mp4a",
+            AUDIO_SAMPLE_ENTRY_FIXED_BYTES,
+            &make_box(b"esds", &[0u8; 4]),
+        );
+        let kid = [0x22u8; 16];
+        let pssh = make_box(b"pssh", b"AUDIO-PSSH");
+
+        let signaled = cenc_signal_init(&init, &kid, 8, &pssh).expect("signal");
+        let p = locate_stsd_path(&signaled).expect("locate");
+        assert_eq!(&p.entry.1.box_type, b"enca", "audio entry must become enca");
+
+        let stripped = strip_cenc_signal(&signaled).expect("strip");
+        assert_eq!(stripped, init);
+    }
+
+    #[test]
+    fn strip_cenc_signal_is_noop_on_unsignaled_init() {
+        let init = minimal_init(
+            b"avc1",
+            VISUAL_SAMPLE_ENTRY_FIXED_BYTES,
+            &make_box(b"avcC", &[0x01, 0x42, 0x00, 0x1e]),
+        );
+        assert_eq!(strip_cenc_signal(&init).expect("strip"), init);
+    }
+
+    #[test]
+    fn cenc_signal_init_rejects_already_signaled() {
+        let init = minimal_init(
+            b"avc1",
+            VISUAL_SAMPLE_ENTRY_FIXED_BYTES,
+            &make_box(b"avcC", &[0x01, 0x64, 0x00, 0x28]),
+        );
+        let signaled = cenc_signal_init(&init, &[0u8; 16], 8, &make_box(b"pssh", b"x")).unwrap();
+        assert!(
+            cenc_signal_init(&signaled, &[0u8; 16], 8, &make_box(b"pssh", b"y")).is_err(),
+            "double-signaling must fail closed"
         );
     }
 }

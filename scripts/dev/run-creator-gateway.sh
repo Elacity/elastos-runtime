@@ -122,7 +122,8 @@ build_capsule object-provider
 # App capsules need compiled wasm entrypoints (gitignored like home.wasm). Opening a tile from
 # Home spawns a managed runtime that loads <name>.wasm. DISCOVER every wasm-guest capsule
 # (capsule.json entrypoint ends in .wasm AND a Rust crate is present) rather than hardcode a
-# list — a stale list is exactly what left Browser/Inspector/GBA 404ing on a fresh clone. A
+# list — a stale list is exactly what left Browser/Inspector/GBA 404ing on a fresh clone. This
+# dynamic scan also picks up marketplace-content automatically (no hardcoded list to update). A
 # capsule that fails to build fails-closed (its tile won't open) instead of aborting the launch.
 echo "building app capsule wasm (wasm32-wasip1) ..."
 for cj in "${CAPSULES}"/*/capsule.json; do

@@ -157,7 +157,60 @@ enum Request {
         #[serde(default)]
         av_variants: bool,
     },
+    /// MEDIA producer op (feature `escrow`): MPEG-DASH/CENC (ISO/IEC 23001-7) PSSH injection +
+    /// CENC init signaling. PURE PUBLIC box surgery — no CEK or secret is involved. The runtime
+    /// builds the PSSH JSON envelope (the asset's `.asset.protections` slot, single-sourced by
+    /// `dkms_protection`) and passes it here; this op wraps it in a `pssh` box (Elacity PQ
+    /// systemId) and rewrites EACH per-track DASH init to be CENC-compliant (encv/enca + sinf +
+    /// tenc(default_KID) + the pssh box, placed as the last `moov` child), so the published asset
+    /// matches the Bento4/PC2 CENC wire format. The matching segment `senc` already comes from
+    /// `seal_segments_threshold`; the decrypt rail strips this signaling back for its own player.
+    #[cfg(feature = "escrow")]
+    CencSignalInits {
+        /// Per-track DASH init segments (base64), each tagged with its publish path.
+        inits: Vec<InitSegment>,
+        /// The asset's `default_KID` (32-hex) == the on-chain `bytes16` contentId.
+        kid_hex: String,
+        /// Per-sample IV size the fragments use (8, matching `encrypt_fragment`).
+        #[serde(default = "default_iv_size")]
+        iv_size: u8,
+        /// The PSSH `Data` payload: base64 of the UTF-8 JSON envelope the runtime built.
+        pssh_data_b64: String,
+    },
     Shutdown,
+}
+
+/// One per-track DASH init segment to CENC-signal (feature `escrow`).
+#[cfg(feature = "escrow")]
+#[derive(Debug, Deserialize)]
+struct InitSegment {
+    path: String,
+    b64: String,
+}
+
+/// Default per-sample IV size (bytes) — matches `ddrm_media::mp4::encrypt_fragment`.
+#[cfg(feature = "escrow")]
+fn default_iv_size() -> u8 {
+    8
+}
+
+/// Decode a 32-hex `default_KID` (optionally `0x`-prefixed) to 16 bytes.
+#[cfg(feature = "escrow")]
+fn decode_kid16(kid_hex: &str) -> Result<[u8; 16], String> {
+    let s = kid_hex.strip_prefix("0x").unwrap_or(kid_hex);
+    // Validate BOTH length and charset in BYTES before any byte-offset slicing below: `str::len()`
+    // counts bytes, so a 32-byte string containing multibyte UTF-8 would pass a bare length gate yet
+    // split a char boundary in `&s[i * 2..i * 2 + 2]` and PANIC (crashing the capsule on a malformed
+    // request). Requiring ASCII hex digits keeps every char exactly one byte, so the slices are safe.
+    if s.len() != 32 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("kid must be 32 ASCII hex chars".to_string());
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+            .map_err(|_| "kid is not valid hex".to_string())?;
+    }
+    Ok(out)
 }
 
 /// One node of the threshold quorum a producer escrows to (feature `escrow`): the public
@@ -249,6 +302,13 @@ impl EncryptProvider {
                 &nodes,
                 av_variants,
             ),
+            #[cfg(feature = "escrow")]
+            Request::CencSignalInits {
+                inits,
+                kid_hex,
+                iv_size,
+                pssh_data_b64,
+            } => self.cenc_signal_inits(&inits, &kid_hex, iv_size, &pssh_data_b64),
             Request::Shutdown => Response::empty_ok(),
         }
     }
@@ -773,6 +833,64 @@ impl EncryptProvider {
             }
         }
         Response::ok(body)
+    }
+
+    /// CENC-signal each per-track DASH init + inject the Elacity PQ `pssh` (feature `escrow`).
+    /// PURE PUBLIC box surgery: it touches no CEK/secret. `pssh_data_b64` is the runtime-built
+    /// PSSH JSON envelope (the `.asset.protections` slot); it is wrapped in a `pssh` box under
+    /// `ELASTOS_PQ_SYSTEM_ID` and each init is rewritten to encv/enca + sinf + tenc(default_KID).
+    #[cfg(feature = "escrow")]
+    fn cenc_signal_inits(
+        &self,
+        inits: &[InitSegment],
+        kid_hex: &str,
+        iv_size: u8,
+        pssh_data_b64: &str,
+    ) -> Response {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let kid = match decode_kid16(kid_hex) {
+            Ok(k) => k,
+            Err(e) => return Response::error("invalid_request", e),
+        };
+        let pssh_data = match b64.decode(pssh_data_b64) {
+            Ok(d) => d,
+            Err(_) => return Response::error("invalid_request", "pssh_data_b64 is not valid base64"),
+        };
+        let pssh_box = ddrm_envelope::pssh::build_pssh(
+            &ddrm_envelope::pssh::ELASTOS_PQ_SYSTEM_ID,
+            &[kid],
+            &pssh_data,
+        );
+        let mut out = Vec::with_capacity(inits.len());
+        for it in inits {
+            let init = match b64.decode(&it.b64) {
+                Ok(b) => b,
+                Err(_) => {
+                    return Response::error(
+                        "invalid_request",
+                        format!("init '{}' is not valid base64", it.path),
+                    )
+                }
+            };
+            let signaled = match ddrm_media::mp4::cenc_signal_init(&init, &kid, iv_size, &pssh_box) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Response::error(
+                        "invalid_request",
+                        format!("CENC-signal init '{}': {e}", it.path),
+                    )
+                }
+            };
+            out.push(json!({ "path": it.path, "b64": b64.encode(&signaled) }));
+        }
+        Response::ok(json!({
+            "inits": out,
+            "scheme": SUPPORTED_SCHEMES[0],
+            // The full pssh box (base64) — the runtime embeds this verbatim in the MPD
+            // <cenc:pssh> ContentProtection element (same bytes injected into each init).
+            "pssh_b64": b64.encode(&pssh_box),
+        }))
     }
 
     /// The in-boundary MEDIA threshold pipeline (feature `escrow`): mint ONE CEK+KID, CENC each
@@ -1492,6 +1610,33 @@ fn main() {
 mod tests {
     use super::*;
     use base64::Engine;
+
+    /// Regression: a `kid_hex` that is 32 BYTES but contains multibyte UTF-8 must be REJECTED, not
+    /// panic. Before the fix the byte-length gate `s.len() == 32` passed while the byte-offset slice
+    /// `&s[i*2..i*2+2]` split a char boundary, crashing the capsule process on a malformed request
+    /// instead of returning an error like every other validation path.
+    #[test]
+    #[cfg(feature = "escrow")]
+    fn decode_kid16_rejects_multibyte_input_without_panicking() {
+        // "a" + 15×'é' (2 bytes each) + "b" = 32 bytes but only 17 chars.
+        let mut kid = String::from("a");
+        for _ in 0..15 {
+            kid.push('é');
+        }
+        kid.push('b');
+        assert_eq!(kid.len(), 32, "the input must hit the 32-byte length gate");
+        assert!(
+            decode_kid16(&kid).is_err(),
+            "a 32-byte multibyte kid must be rejected, not panic"
+        );
+
+        // Genuine 32-hex kids still decode (with or without the 0x prefix).
+        assert!(decode_kid16("00112233445566778899aabbccddeeff").is_ok());
+        assert!(decode_kid16("0x00112233445566778899aabbccddeeff").is_ok());
+        // Wrong length and non-hex ASCII are rejected cleanly (no panic).
+        assert!(decode_kid16("00112233").is_err());
+        assert!(decode_kid16("zz112233445566778899aabbccddeeff").is_err());
+    }
     use zeroize::Zeroize;
 
     fn seal_request_json() -> Value {

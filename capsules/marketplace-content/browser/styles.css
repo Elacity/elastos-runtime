@@ -1,0 +1,289 @@
+/* marketplace-content — design system. Token-driven craft, motion, and accessibility.
+ * Owner: Design Director + Design-Systems/Motion + Accessibility leads.
+ * Class contract is stable (index.html + app.js depend on it); this pass elevates feel & look.
+ * Follow-up (design-systems): replace emoji glyphs with a real inline-SVG icon set. */
+
+/* ---------- TOKENS ---------- */
+:root{
+  /* color — semantic, dark default */
+  --bg:#0a0c0f; --bg-elev:#0e1116; --panel:#14171d; --panel-2:#1a1e26; --panel-3:#20252e;
+  --line:#252b34; --line-2:#2f3640; --ink:#eef2f7; --ink-2:#c5ccd6; --mut:#8b94a1; --mut-2:#828b98;
+  /* brand: elacity turquoise + gold (design-tokens.json; from elacity-web feature/ui-polish-2026). turquoise
+     is a LIGHT fill, so on-accent text is DARK (matches elacity-web primary.contrastText #0a0a0a). */
+  --acc:#5edad9; --acc-press:#3fc7c5; --acc-soft:#0f2a28; --acc2:#daa520; --on-acc:#04211f;
+  --gold:#daa520; --vivid:#fdecb6; --brand-ink:#131a22; --ok:#34d399; --warn:#fbbf24; --bad:#f87171;
+  --chip:#16213e; --chip-ink:#bcd0ff; --chip-line:#2b3a5e;
+  /* type ramp (1.20 minor third) */
+  --f:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;
+  --fxs:11.5px; --fsm:12.5px; --fbase:14.5px; --flg:16px; --fxl:19px; --f2xl:23px; --f3xl:31px;
+  --lh:1.55; --lh-tight:1.25;
+  /* space scale (4pt) */
+  --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:20px; --s6:24px; --s7:32px; --s8:44px;
+  /* radius + elevation */
+  --r-sm:9px; --r:13px; --r-lg:18px; --r-pill:999px;
+  --e1:0 1px 0 rgba(255,255,255,.03),0 1px 2px rgba(0,0,0,.3);
+  --e2:0 1px 0 rgba(255,255,255,.04),0 6px 18px rgba(0,0,0,.32);
+  --e3:0 1px 0 rgba(255,255,255,.05),0 18px 44px rgba(0,0,0,.46);
+  /* shadow-as-border depth (elacity-web ui-polish-2026 shadowBorder) — dark collapses to one translucent ring */
+  --depth:0 0 0 1px rgba(255,255,255,.08); --depth-hover:0 0 0 1px rgba(255,255,255,.13);
+  --ring:0 0 0 2px var(--bg),0 0 0 4px var(--acc);
+  --t-fast:.12s cubic-bezier(.2,.6,.2,1); --t:.2s cubic-bezier(.2,.6,.2,1); --t-slow:.32s cubic-bezier(.2,.6,.2,1);
+}
+[data-theme=light]{
+  --bg:#f7f8fa; --bg-elev:#fff; --panel:#fff; --panel-2:#f1f3f6; --panel-3:#e9edf2;
+  --line:#e4e8ee; --line-2:#d7dde5; --ink:#0e131a; --ink-2:#2c3340; --mut:#5b6573; --mut-2:#838c98;
+  /* light: turquoise is too light to read as text/fill on a light bg, so the accent deepens to a teal that
+     stays AA both as accent-text and as a white-text fill (dark theme keeps the vivid turquoise). */
+  --acc:#0a7370; --acc-press:#086460; --on-acc:#fff; --acc-soft:#e0f5f4; --chip:#e0f5f4; --chip-ink:#0a6360; --chip-line:#bfe9e7;
+  --e1:0 1px 2px rgba(20,30,50,.05); --e2:0 1px 2px rgba(20,30,50,.06),0 8px 22px rgba(20,30,50,.08);
+  --e3:0 2px 6px rgba(20,30,50,.08),0 18px 44px rgba(20,30,50,.12); --ring:0 0 0 2px var(--bg),0 0 0 4px var(--acc);
+  --depth:0 0 0 1px rgba(0,0,0,.06),0 1px 2px -1px rgba(0,0,0,.06),0 2px 4px rgba(0,0,0,.04); --depth-hover:0 0 0 1px rgba(0,0,0,.08),0 1px 2px -1px rgba(0,0,0,.08),0 2px 4px rgba(0,0,0,.06);
+}
+
+/* ---------- BASE ---------- */
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font:var(--fbase)/var(--lh) var(--f);
+  -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;font-optical-sizing:auto;text-rendering:optimizeLegibility}
+.wrap{max-width:1240px;margin:0 auto;padding:0 var(--s6)} .row{display:flex;align-items:center;gap:var(--s4)}
+.muted{color:var(--mut)} .small{font-size:var(--fsm)} .spacer{flex:1} a{color:inherit;text-decoration:none}
+:focus-visible{outline:none;box-shadow:var(--ring);border-radius:8px}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+/* ---------- PRIMITIVES ---------- */
+.lockchip{display:inline-flex;align-items:center;gap:5px;background:var(--chip);color:var(--chip-ink);
+  border:1px solid var(--chip-line);border-radius:var(--r-pill);padding:3px 10px;font-size:var(--fxs);font-weight:600;letter-spacing:.2px}
+.pill{display:inline-flex;align-items:center;gap:6px;background:var(--panel-2);border:1px solid var(--line);
+  border-radius:var(--r-pill);padding:6px 12px;font-size:var(--fsm);color:var(--ink-2)}
+.btn{appearance:none;background:linear-gradient(180deg,var(--acc),var(--acc-press));color:var(--on-acc);border:0;
+  border-radius:11px;padding:11px 17px;font:600 var(--fbase)/1 var(--f);cursor:pointer;
+  transition:transform var(--t-fast),box-shadow var(--t-fast),filter var(--t-fast);box-shadow:var(--e1)}
+.btn:hover{filter:brightness(1.06);box-shadow:var(--e2)} .btn:active:not(:disabled){transform:scale(.96)}
+.btn.block{width:100%} .btn.ghost{background:var(--panel-2);border:1px solid var(--line);color:var(--ink);box-shadow:none}
+.btn.ghost:hover{background:var(--panel-3);filter:none} .btn:disabled{opacity:.45;cursor:not-allowed;filter:none;transform:none}
+.glyph{width:36px;height:36px;display:inline-grid;place-items:center;border-radius:var(--r-sm);background:var(--panel-2);
+  border:1px solid var(--line);font-size:15px;cursor:pointer;color:var(--ink);transition:background var(--t-fast),transform var(--t-fast)}
+.glyph:hover{background:var(--panel-3)} .glyph:active{transform:scale(.96)}
+.badge{font-size:var(--fxs);color:var(--ok);border:1px solid #1f4d3a;background:#0f2a20;border-radius:7px;padding:2px 7px;font-weight:600}
+[data-theme=light] .badge{background:#e7f8f0;border-color:#bfe9d6;color:#0a7a52}
+
+/* ---------- NAV ---------- */
+.nav{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--bg) 78%,transparent);
+  backdrop-filter:saturate(140%) blur(12px);border-bottom:1px solid var(--line)}
+.nav .row{height:62px} .logo{font-weight:800;font-size:var(--flg);letter-spacing:-.2px} .logo b{color:var(--acc)}
+.search{flex:1;max-width:540px;display:flex;align-items:center;gap:9px;background:var(--panel);border:1px solid var(--line);
+  border-radius:11px;padding:0 13px;transition:border-color var(--t-fast),box-shadow var(--t-fast)}
+.search:focus-within{border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-soft)}
+.search .kbd{color:var(--mut-2);font-size:var(--fsm);font-variant-numeric:tabular-nums}
+.search input{flex:1;background:none;border:0;outline:none;color:var(--ink);padding:11px 0;font:var(--fbase) var(--f)}
+.search input::placeholder{color:var(--mut-2)}
+
+/* ---------- SHELL ---------- */
+.shell{display:grid;grid-template-columns:218px minmax(0,1fr);gap:var(--s7);padding:var(--s6) 0}
+.rail{position:sticky;top:78px;align-self:start}
+.rail a{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:10px;font-weight:600;cursor:pointer;
+  color:var(--ink-2);transition:background var(--t-fast),color var(--t-fast)}
+.rail a:hover{background:var(--panel);color:var(--ink)}
+.rail a.active{background:var(--panel);border:1px solid var(--line);color:var(--ink);box-shadow:var(--e1)}
+.rail .lbl{margin:var(--s5) 0 var(--s2);color:var(--mut-2);font-size:var(--fxs);text-transform:uppercase;letter-spacing:.9px}
+.facets{display:flex;flex-direction:column;gap:2px}
+.facets button{text-align:left;background:none;border:0;color:var(--mut);font:var(--fsm) var(--f);padding:7px 12px;
+  border-radius:9px;cursor:pointer;transition:background var(--t-fast),color var(--t-fast)}
+.facets button:hover{color:var(--ink);background:var(--panel)}
+.facets button.on{color:var(--ink);background:var(--acc-soft);border:1px solid var(--chip-line);font-weight:600}
+
+/* ---------- VIEW MOTION ---------- */
+#view{animation:viewin var(--t-slow)} @keyframes viewin{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+
+/* ---------- HERO ---------- */
+.hero{position:relative;border-radius:var(--r-lg);overflow:hidden;border:1px solid var(--line);padding:var(--s7);
+  background:radial-gradient(130% 130% at 92% 8%,rgba(124,91,255,.38),transparent 55%),
+    radial-gradient(130% 130% at 8% 92%,rgba(91,140,255,.32),transparent 52%),var(--panel);box-shadow:var(--e2)}
+.hero h1{margin:.18em 0;font-size:var(--f3xl);line-height:var(--lh-tight);letter-spacing:-.5px}
+.hero p{max-width:580px;color:var(--ink-2)}
+
+/* ---------- SHELVES + CARDS ---------- */
+.shelf{margin:var(--s7) 0 var(--s2);display:flex;align-items:baseline;justify-content:space-between}
+.shelf h3{margin:0;font-size:var(--fxl);letter-spacing:-.2px}
+.shelf .more{color:var(--acc);font-size:var(--fsm);cursor:pointer;font-weight:600;background:none;border:0;font-family:inherit;padding:0}
+/* Card grid + card = elacity CapsuleCard parity: transparent card (no border/bg/shadow/hover-lift), a
+   rounded 16:9 thumbnail floating above text. Thumb radius = elacity theme.shape.borderRadius (12px). */
+.cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--s5)}
+.card{min-width:0;background:transparent;border:0;border-radius:8px;overflow:visible;cursor:pointer;display:block;color:inherit;text-decoration:none}
+.thumb{aspect-ratio:16/9;position:relative;display:grid;place-items:center;color:#fff;font-size:30px;
+  border-radius:12px;overflow:hidden;background-size:cover;background-position:center}
+.card:hover .t{color:var(--acc)}
+.g-watch{background:linear-gradient(135deg,#3b2f63,#5b8cff)} .g-listen{background:linear-gradient(135deg,#143b2e,#34d399)}
+.g-read{background:linear-gradient(135deg,#3a2740,#c084fc)} .g-view{background:linear-gradient(135deg,#3a2a18,#fbbf24)}
+.g-explore{background:linear-gradient(135deg,#10243f,#38bdf8)}
+/* overlay chips on the thumbnail (elacity TokenMeta: paper pill, 11.5px/500, radius 4px, 6px insets) */
+.tm{position:absolute;z-index:2;display:inline-flex;align-items:center;gap:5px;background:var(--panel);color:var(--ink);
+  font-size:11.5px;font-weight:500;line-height:1.45;padding:2px 8px;border-radius:4px;box-shadow:var(--e1)}
+.tm .ico{width:13px;height:13px}
+.tm-listings{top:6px;left:6px} .tm-duration{bottom:6px;right:6px}
+.tm-resell{position:absolute;top:6px;right:6px;z-index:2;display:flex;flex-direction:column;align-items:flex-end;gap:5px}
+.tm-resell .tm{position:static}
+.tm-xl{font-size:13px;padding:3px 6px}
+.tm-off{background:var(--bad);color:#fff}
+/* below the thumbnail: avatar + 2-line title + owner | price (right). Padding 8/8/12 (elacity CardContent) */
+.meta{padding:8px 8px 12px}
+.meta .head{display:flex;align-items:flex-start;gap:8px}
+.ava{flex:none;width:40px;height:40px;border-radius:50%;display:grid;place-items:center;color:#fff;font-weight:700;font-size:15px}
+.meta .who{min-width:0;flex:1;overflow:hidden}
+.meta .t{font-weight:500;font-size:15.5px;line-height:1.15;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
+  overflow:hidden;overflow-wrap:break-word;transition:color var(--t-fast)}
+.meta .owner{color:var(--mut);font-size:12.5px;line-height:1.2;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.meta .pricebtn{flex:none;font-weight:600;font-size:15px;white-space:nowrap;color:var(--ink);padding-left:8px}
+.meta .pricebtn.free{color:var(--ok)} .meta .pricebtn.muted{color:var(--mut);font-weight:500}
+.more-rail{margin-top:var(--s7)}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.chip{display:inline-flex;align-items:center;font-size:12.5px;line-height:1;color:var(--mut);background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:6px 10px}
+a.chip-cat{cursor:pointer;transition:background .15s,color .15s}
+a.chip-cat:hover{color:var(--ink);background:var(--panel-2)}
+.catbar{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 var(--s5)}
+.catchip{font:inherit;font-size:13px;line-height:1;color:var(--mut);background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:8px 14px;cursor:pointer;transition:background .15s,color .15s,border-color .15s}
+.catchip:hover{color:var(--ink);background:var(--panel-2)}
+.catchip.on{color:var(--bg);background:var(--ink);border-color:var(--ink);font-weight:600}
+.chip-cat{color:var(--ink);border-color:transparent;background:var(--panel-3);font-weight:500}
+.prevplay{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:inline-flex;align-items:center;gap:8px;
+  background:rgba(0,0,0,.6);color:#fff;border:0;border-radius:999px;padding:11px 20px;font:inherit;font-size:15px;font-weight:600;
+  cursor:pointer;backdrop-filter:blur(4px);transition:background .15s,transform .15s}
+.prevplay:hover{background:rgba(0,0,0,.78);transform:translate(-50%,-50%) scale(1.04)}
+.prevplay .ico{width:18px;height:18px}
+.cover .previewvid{position:absolute;inset:0;width:100%;height:100%;background:#000;object-fit:contain;border-radius:inherit}
+.cover .prevmsg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:16px;text-align:center;color:var(--mut);font-size:var(--fsm)}
+.histrow{display:flex;align-items:center;gap:12px}
+.histrow .glyph{display:grid;place-items:center;width:32px;height:32px;border-radius:9px;background:color-mix(in srgb,var(--mut) 14%,transparent);color:var(--mut);flex:none}
+.histrow .cid{text-decoration:none} .histrow .cid:hover{color:var(--ink)}
+.price{font-weight:800;font-variant-numeric:tabular-nums}
+
+/* ---------- ASSET DETAIL ---------- */
+.detail{display:grid;grid-template-columns:1fr 380px;gap:var(--s7);margin-top:var(--s1)}
+.back{display:inline-flex;gap:7px;color:var(--mut);cursor:pointer;margin:var(--s1) 0 var(--s4);font-size:var(--fsm);
+  transition:color var(--t-fast)} .back:hover{color:var(--ink)}
+.stage{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);overflow:hidden;box-shadow:var(--e2)}
+.cover{aspect-ratio:16/9;position:relative;display:grid;place-items:center;font-size:54px;color:#fff}
+.cover::after{content:"";position:absolute;inset:0;background:linear-gradient(180deg,transparent 62%,rgba(0,0,0,.30))}
+.covertag{position:absolute;left:var(--s4);bottom:var(--s3);font-size:var(--fsm);color:#e7edf5;text-transform:capitalize;z-index:1;background:rgba(0,0,0,.35);padding:3px 10px;border-radius:999px;-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px)}
+.stagehead{padding:var(--s5);border-top:1px solid var(--line)}
+.stagehead h2{margin:0 0 var(--s1);font-size:var(--f2xl);letter-spacing:-.3px}
+.verified{display:inline-flex;align-items:center;gap:6px;color:var(--ok);font-size:var(--fsm);margin-top:var(--s2)}
+.cid{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--mut);font-size:12px}
+.cardx{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);padding:var(--s5);margin-bottom:var(--s4);box-shadow:var(--e1)}
+.cardx h4{margin:0 0 var(--s3);font-size:var(--fxs);color:var(--mut);text-transform:uppercase;letter-spacing:.8px}
+.kv{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin:8px 0;font-size:var(--fbase)}
+.kv .k{color:var(--mut);flex:none} .kv>span:last-child{min-width:0;text-align:right;overflow-wrap:anywhere}
+.bigprice{font-size:var(--f2xl);font-weight:800;margin:2px 0;letter-spacing:-.4px;font-variant-numeric:tabular-nums}
+.fiat{margin:-2px 0 6px;font-variant-numeric:tabular-nums}
+details.acc>summary{list-style:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:12px}
+details.acc>summary::-webkit-details-marker{display:none}
+details.acc>summary h4{margin:0}
+details.acc>summary::after{content:"";width:8px;height:8px;flex:none;margin-right:2px;border-right:2px solid var(--mut);border-bottom:2px solid var(--mut);transform:rotate(-45deg);transition:transform .18s}
+details.acc[open]>summary::after{transform:rotate(45deg)}
+.accbody{margin-top:14px}
+.stepper{display:flex;align-items:center;gap:10px;margin:var(--s3) 0}
+.stepper button{width:36px;height:36px;border-radius:var(--r-sm);background:var(--panel-2);border:1px solid var(--line);
+  color:var(--ink);font-size:18px;cursor:pointer;transition:background var(--t-fast),transform var(--t-fast)}
+.stepper button:hover{background:var(--panel-3)} .stepper button:active:not(:disabled){transform:scale(.96)}
+.note{color:var(--mut);font-size:var(--fsm);margin-top:var(--s3);text-align:center}
+.splits{display:flex;height:13px;border-radius:7px;overflow:hidden;margin:var(--s2) 0 var(--s3);border:1px solid var(--line)}
+.splits i{display:block;transition:width var(--t-slow)} .s1{background:var(--acc)} .s2{background:var(--acc2)} .s3{background:var(--ok)} .s4{background:#475569}
+.legend{display:flex;flex-wrap:wrap;gap:var(--s3);font-size:12px;color:var(--mut)} .legend b{color:var(--ink)}
+.dot{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:5px;vertical-align:middle}
+
+/* ---------- VAULT / FORMS / GENERIC ---------- */
+.gridv{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:var(--s4);margin-top:var(--s4)}
+.tabs{display:flex;gap:var(--s2);margin:var(--s4) 0}
+.tabs button{background:var(--panel-2);border:1px solid var(--line);color:var(--mut);border-radius:9px;padding:8px 14px;
+  cursor:pointer;font:var(--fbase) var(--f);transition:background var(--t-fast),color var(--t-fast)}
+.tabs button:hover{color:var(--ink)} .tabs button.on{color:var(--ink);background:var(--panel);font-weight:700;box-shadow:var(--e1)}
+.field{display:flex;flex-direction:column;gap:6px;margin:var(--s3) 0}
+.field input,.field select,.field textarea{background:var(--panel-2);border:1px solid var(--line);border-radius:10px;
+  color:var(--ink);padding:11px 13px;font:var(--fbase) var(--f);transition:border-color var(--t-fast),box-shadow var(--t-fast)}
+.field input:focus,.field select:focus,.field textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-soft)}
+.facets button[disabled]{opacity:.5;cursor:default}
+.empty{border:1px dashed var(--line-2);border-radius:var(--r-lg);padding:var(--s8);text-align:center;color:var(--mut)}
+
+/* ---------- MODAL + TOAST ---------- */
+#modal-root .overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(3px);display:grid;
+  place-items:center;z-index:20;padding:var(--s5);animation:fade var(--t)}
+@keyframes fade{from{opacity:0}to{opacity:1}}
+.sheet{background:var(--bg-elev);border:1px solid var(--line-2);border-radius:var(--r-lg);max-width:460px;width:100%;
+  padding:var(--s6);box-shadow:var(--e3);animation:pop var(--t-slow)}
+@keyframes pop{from{opacity:0;transform:translateY(10px) scale(.98)}to{opacity:1;transform:none}}
+/* Subtle EXIT (skill: softer than the enter — short ease-in, small translateY). The .closing class is added
+   by closeModal() ~150ms before the DOM is cleared; reduced-motion disables it (the clear still fires). */
+#modal-root .overlay.closing{animation:fade-out .15s ease-in forwards}
+#modal-root .overlay.closing .sheet{animation:pop-out .15s ease-in forwards}
+@keyframes fade-out{to{opacity:0}}
+@keyframes pop-out{to{opacity:0;transform:translateY(-8px) scale(.99)}}
+.sheet h3{margin:0 0 var(--s1);font-size:var(--fxl)} .sheet .x{float:right;cursor:pointer;color:var(--mut);font-size:18px;background:none;border:0;font-family:inherit;line-height:1;padding:4px}
+.sheet .x:hover{color:var(--ink)}
+.code{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var(--panel-2);border:1px solid var(--line);
+  border-radius:10px;padding:var(--s3);white-space:pre-wrap;word-break:break-all;color:var(--mut);max-height:170px;overflow:auto}
+.toast{position:fixed;left:50%;bottom:var(--s6);transform:translateX(-50%);background:var(--bg-elev);border:1px solid var(--line-2);
+  border-radius:11px;padding:12px 17px;box-shadow:var(--e3);z-index:30;animation:toastin var(--t)}
+@keyframes toastin{from{opacity:0;transform:translate(-50%,10px)}to{opacity:1;transform:translate(-50%,0)}}
+.skeleton{background:linear-gradient(90deg,var(--panel) 25%,var(--panel-2) 37%,var(--panel) 63%);background-size:400% 100%;
+  animation:sh 1.4s ease-in-out infinite;border-radius:12px;aspect-ratio:16/9}
+@keyframes sh{0%{background-position:100% 0}100%{background-position:-100% 0}}
+
+/* ---------- RESPONSIVE ---------- */
+@media(max-width:1080px){.detail{grid-template-columns:1fr 340px}}
+@media(max-width:980px){.shell{grid-template-columns:minmax(0,1fr)}.rail{display:none}.cards{grid-template-columns:repeat(2,minmax(0,1fr))}.detail{grid-template-columns:1fr}}
+@media(max-width:560px){.cards{grid-template-columns:minmax(0,1fr)}.hero h1{font-size:var(--f2xl)}.search{display:none}}
+
+/* ---------- FEEL POLISH (make-interfaces-feel-better — the principles not already in the system) ---------- */
+/* Balanced headings (no orphan words / lopsided wraps); pretty body wrapping (no single-word last lines). */
+.hero h1,.shelf h3,.stagehead h2,.sheet h3,.cardx h4{text-wrap:balance}
+.hero p,.note,.meta .c,.legend,.empty,.kv,.small{text-wrap:pretty}
+/* Tabular numerals on EVERY value that can change (incl. the live result count + wallet pill), so a
+   price/qty/supply/count update never shifts layout. */
+.kv,.stepper,.legend,.bigprice,.price,.covertag,.cid,.shelf h3,.pill{font-variant-numeric:tabular-nums}
+/* Inset outline on media covers — PURE neutrals only (skill non-negotiable: a tinted ring reads as dirt on
+   the poster edge): pure white in dark, pure black in light. */
+.thumb,.cover{box-shadow:inset 0 0 0 1px rgba(255,255,255,.1)}
+[data-theme=light] .thumb,[data-theme=light] .cover{box-shadow:inset 0 0 0 1px rgba(0,0,0,.1)}
+
+/* ---------- INLINE ICONS (lucide-style stroke, inherits currentColor — no emoji) ---------- */
+.ico{width:16px;height:16px;flex:none}                 /* default inline size (rail/facets/pills) */
+.facets button{display:flex;align-items:center;gap:9px} /* icon + label, left-aligned with a gap */
+.badge{display:inline-flex;align-items:center;gap:4px}
+.lockchip .ico,.badge .ico{width:13px;height:13px}
+.glyph .ico{width:18px;height:18px}
+.ico-cover{width:34px;height:34px;opacity:.95}          /* the card thumb glyph */
+.cover .ico-cover{width:56px;height:56px}               /* the detail-stage cover glyph */
+
+/* ---------- SKELETON BAR + THEME CROSS-FADE ---------- */
+/* loading placeholder bars (no aspect-ratio, unlike .skeleton) — reuse the sh shimmer */
+.sk{background:linear-gradient(90deg,var(--panel) 25%,var(--panel-2) 37%,var(--panel) 63%);background-size:400% 100%;animation:sh 1.4s ease-in-out infinite;border-radius:8px}
+/* theme toggle: cross-fade sun<->moon (skill icon-animation: scale .25->1, opacity 0->1, blur 4->0). The
+   reduced-motion guard disables the transition; the [data-theme] state still swaps instantly. */
+.theme{position:relative}
+.theme .ico{position:absolute;top:50%;left:50%;width:18px;height:18px;margin:-9px 0 0 -9px;
+  transition:opacity .3s cubic-bezier(.2,0,0,1),transform .3s cubic-bezier(.2,0,0,1),filter .3s cubic-bezier(.2,0,0,1)}
+.theme .ico-sun{opacity:0;transform:scale(.25);filter:blur(4px)}
+.theme .ico-moon{opacity:1;transform:scale(1);filter:blur(0)}
+[data-theme=light] .theme .ico-sun{opacity:1;transform:scale(1);filter:blur(0)}
+[data-theme=light] .theme .ico-moon{opacity:0;transform:scale(.25);filter:blur(4px)}
+
+/* ---------- BRAND (elacity turquoise->gold; transplanted from elacity-web, values-only — no MUI) ---------- */
+/* Signature gradient text. @supports-guarded: only goes transparent where background-clip:text works, else
+   falls back to the solid accent so the wordmark never disappears in an older webview. */
+.grad-text{color:var(--acc)}
+.glassy{background:color-mix(in srgb,var(--bg-elev) 72%,transparent);
+  backdrop-filter:blur(9px) saturate(1.3);-webkit-backdrop-filter:blur(9px) saturate(1.3);border:1px solid var(--line)}
+@supports ((-webkit-background-clip:text) or (background-clip:text)){
+  .grad-text,.logo{background:linear-gradient(92deg,var(--acc),var(--gold));
+    -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;color:transparent}
+  .logo b{-webkit-text-fill-color:transparent}
+}
+
+/* Owned-asset actions on the detail card: Download + Reveal side by side, with an honest status line. */
+.ownedrow{display:flex;gap:8px;margin-top:10px}
+.ownedrow .btn{flex:1;display:flex;align-items:center;justify-content:center;gap:7px;padding-inline:10px}
+.dlstatus{margin-top:10px;line-height:1.45}
+.dlstatus.err{color:var(--warn)}
+/* Vault "Downloaded / On-chain only" facet row — horizontal pills (overrides the sidebar .facets column). */
+.vault-facets{flex-direction:row;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+.vault-facets button{border:1px solid var(--line);border-radius:999px;padding:6px 13px}

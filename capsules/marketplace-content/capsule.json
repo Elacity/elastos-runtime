@@ -1,0 +1,14 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "marketplace-content",
+  "version": "0.1.0",
+  "description": "The marketplace: discover, buy, trade, list, and withdraw dDRM assets (content today; apps & games later, same storefront). A pure UI shell — reads listings from elastos://market/* (re-derivable index over content-market's chain-truth decode), requests UNSIGNED orders, and routes all signing to the wallet. On buy it TRIGGERS a pin of the encrypted asset into the local Library; opening is handed off to the runtime player (POST /api/viewers/open) and minting to the creator app. Mints nothing, plays/renders nothing, holds NO signer, token, CEK, chain RPC, or mutation handle (Principle 16).",
+  "role": "app",
+  "type": "wasm",
+  "author": "elastos",
+  "entrypoint": "marketplace-content.wasm",
+  "resources": {
+    "memory_mb": 24,
+    "gpu": false
+  }
+}

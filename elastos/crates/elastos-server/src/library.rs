@@ -293,6 +293,22 @@ enum ObjectProviderRequest {
         #[serde(default)]
         protected_content_fixture: bool,
     },
+    /// Buy -> pin: materialize a bought, ENCRYPTED IPFS asset into the buyer's Library and pin its CID.
+    /// `content_cid` is the encrypted asset's IPFS CID; `uri` optionally overrides the destination
+    /// (defaults to `<buyer-root>/<folder>/<name>`); `metadata` carries `{name?, mime?, folder?, capsule?}`.
+    /// `folder` routes the file to the type-correct Library folder (Videos/Music/Pictures/Documents);
+    /// `capsule` is the reconstructed dKMS descriptor that makes the asset OPENABLE via the quorum path
+    /// (materialized in place of the opaque blob). The entitlement (did this principal actually buy it?) is
+    /// gated UPSTREAM by the marketplace/buy api caller — the object-provider only pins what it is told to,
+    /// exactly like Publish. Holds no keys (P4/P15).
+    Acquire {
+        principal_id: String,
+        content_cid: String,
+        #[serde(default)]
+        uri: Option<String>,
+        #[serde(default)]
+        metadata: Option<Value>,
+    },
     Unpublish {
         principal_id: String,
         uri: String,
@@ -408,6 +424,28 @@ impl Provider for ObjectProvider {
                 };
                 library_repair(&data_dir, registry, &principal_id, &uri).await
             }
+            ObjectProviderRequest::Acquire {
+                principal_id,
+                content_cid,
+                uri,
+                metadata,
+            } => {
+                let Some(registry) = self.registry.upgrade() else {
+                    return Ok(provider_error(
+                        "library_error",
+                        "object provider registry unavailable",
+                    ));
+                };
+                library_acquire(
+                    &data_dir,
+                    registry,
+                    &principal_id,
+                    &content_cid,
+                    uri.as_deref(),
+                    metadata.as_ref(),
+                )
+                .await
+            }
             request @ (ObjectProviderRequest::Status { .. }
             | ObjectProviderRequest::Share { .. }
             | ObjectProviderRequest::SharedAccess { .. }) => {
@@ -448,7 +486,8 @@ pub fn handle_object_provider_raw_request(data_dir: &Path, request: &Value) -> V
     let result = match request {
         ObjectProviderRequest::Publish { .. }
         | ObjectProviderRequest::Unpublish { .. }
-        | ObjectProviderRequest::Repair { .. } => Err(anyhow!(
+        | ObjectProviderRequest::Repair { .. }
+        | ObjectProviderRequest::Acquire { .. } => Err(anyhow!(
             "library content operation requires Runtime content coordinator"
         )),
         request => handle_library_request(data_dir, request),
@@ -636,6 +675,22 @@ pub async fn handle_object_provider_runtime_request(
                 &uri,
                 if_revision.as_deref(),
                 protected_content_fixture,
+            )
+            .await
+        }
+        ObjectProviderRequest::Acquire {
+            principal_id,
+            content_cid,
+            uri,
+            metadata,
+        } => {
+            library_acquire(
+                &data_dir,
+                registry,
+                &principal_id,
+                &content_cid,
+                uri.as_deref(),
+                metadata.as_ref(),
             )
             .await
         }
@@ -1742,8 +1797,9 @@ fn handle_library_request(
         }
         ObjectProviderRequest::Publish { .. }
         | ObjectProviderRequest::Unpublish { .. }
-        | ObjectProviderRequest::Repair { .. } => {
-            unreachable!("publish/unpublish/repair handled asynchronously")
+        | ObjectProviderRequest::Repair { .. }
+        | ObjectProviderRequest::Acquire { .. } => {
+            unreachable!("publish/unpublish/repair/acquire handled asynchronously")
         }
     }
 }
@@ -1891,6 +1947,200 @@ async fn library_publish(
         "availability": record.availability,
         "content_security": record.content_security,
         "published_at": record.published_at,
+    }))
+}
+
+/// Sanitize a candidate filename to a single safe path segment: only `[A-Za-z0-9._-]`, capped at 96
+/// chars, never `.`/`..` (defense-in-depth — `library_target` independently rejects traversal too).
+fn sanitize_acquire_name(raw: &str) -> String {
+    let name: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(96)
+        .collect();
+    if name.is_empty() || name == "." || name == ".." {
+        String::new()
+    } else {
+        name
+    }
+}
+
+/// Fetch the encrypted asset bytes keylessly via the `content/*` plane (P4 — never raw ipfs), failing closed
+/// on empty/oversize. Shared by the legacy raw-materialize path and the single-file capsule inline so both
+/// honor the same bound (`ELASTOS_DDRM_ACQUIRE_MAX_BYTES`, default 2 GiB).
+async fn fetch_acquire_bytes(
+    registry: &ProviderRegistry,
+    content_cid: &str,
+    max_bytes: u64,
+) -> anyhow::Result<Vec<u8>> {
+    let bytes = crate::content::fetch_bytes_via_provider(registry, content_cid, None)
+        .await
+        .map_err(|err| anyhow!("acquire fetch failed for {content_cid}: {err}"))?;
+    if bytes.is_empty() {
+        bail!("acquire fetch returned no bytes for {content_cid} (fail closed)");
+    }
+    if bytes.len() as u64 > max_bytes {
+        bail!(
+            "acquire fetch for {content_cid} is {} bytes, over the {max_bytes}-byte cap — refused (fail closed)",
+            bytes.len()
+        );
+    }
+    Ok(bytes)
+}
+
+/// Buy -> pin: materialize a bought, ENCRYPTED IPFS asset into the buyer's Library and pin its CID for
+/// availability, so the existing player can open it. Mirrors `library_publish`'s discipline in reverse:
+/// fetch keylessly via the `content/*` plane (P4 — never raw ipfs), pin via `content/ensure`, and write
+/// the OPAQUE ciphertext under the buyer's own root (P16; encrypt-at-rest if the root is protected). It
+/// NEVER decrypts and holds no keys (P15) — keys stay gated at open by the rights/key path. Entitlement
+/// (did this principal buy `content_cid`?) is enforced UPSTREAM by the marketplace/buy api caller before
+/// dispatch, exactly as the api layer gates Publish; the registry-less stdio path is rejected (P11).
+async fn library_acquire(
+    data_dir: &Path,
+    registry: Arc<ProviderRegistry>,
+    principal_id: &str,
+    content_cid: &str,
+    uri: Option<&str>,
+    metadata: Option<&Value>,
+) -> anyhow::Result<Value> {
+    if content_cid.trim().is_empty() {
+        bail!("acquire requires a content_cid (fail closed)");
+    }
+    // 1. Destination under the BUYER root only (P16). `library_target` re-validates under-root + no
+    //    traversal, so a buyer can never pin into another principal's space. When the caller supplies the
+    //    reconstructed dKMS capsule, the asset is filed exactly like a MINTED one: a `.ddrm` capsule under
+    //    the type-correct folder (`library_folder_for_mime` keyed on the asset mime — Videos/Music/Pictures/
+    //    Documents), so the File Explorer shows it where the user expects and routes it to the dDRM viewer.
+    //    The legacy (no-capsule) path keeps the opaque blob in `Acquired/`.
+    let has_capsule = metadata
+        .and_then(|m| m.get("capsule"))
+        .map(|c| c.is_object())
+        .unwrap_or(false);
+    let dest = match uri {
+        Some(u) if !u.trim().is_empty() => u.trim().to_string(),
+        _ => {
+            let root = crate::auth::principal_localhost_root(principal_id);
+            let name = metadata
+                .and_then(|m| m.get("name"))
+                .and_then(Value::as_str)
+                .map(sanitize_acquire_name)
+                .filter(|n| !n.is_empty());
+            if has_capsule {
+                let mime = metadata
+                    .and_then(|m| m.get("mime"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("application/octet-stream");
+                let folder = library_folder_for_mime(mime);
+                let base = name.unwrap_or_else(|| "asset".to_string());
+                let candidate = if base.to_ascii_lowercase().ends_with(".ddrm") {
+                    base
+                } else {
+                    format!("{base}.ddrm")
+                };
+                format!("{root}/{folder}/{candidate}")
+            } else {
+                let candidate = name.unwrap_or_else(|| {
+                    let cid = sanitize_acquire_name(content_cid);
+                    if cid.is_empty() {
+                        "asset".to_string()
+                    } else {
+                        format!("{cid}.ddrm")
+                    }
+                });
+                format!("{root}/Acquired/{candidate}")
+            }
+        }
+    };
+    let target = library_target(data_dir, principal_id, &dest)?;
+
+    // 2. Decide the artifact to MATERIALIZE. When the caller supplies a reconstructed dKMS capsule (the
+    //    OPENABLE descriptor: schema + content_id/KID + protections + media|ciphertext), we materialize THAT
+    //    so the acquired asset opens via the SAME quorum path as a minted asset (P10 — one canonical open),
+    //    instead of an opaque blob the open path cannot authorize. A MEDIA capsule needs no inline bytes (the
+    //    DASH directory is fetched at open from `asset_cid`, pinned below); a SINGLE-FILE capsule inlines the
+    //    (capped) encrypted bytes as `ciphertext_b64`. Absent a capsule we keep the legacy behavior
+    //    (materialize the opaque ciphertext) — bounded, unchanged. The api caller gates entitlement on the
+    //    bytes16 KID UPSTREAM and binds `content_cid` from the asset metadata before dispatch.
+    const DEFAULT_ACQUIRE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+    let max_bytes = std::env::var("ELASTOS_DDRM_ACQUIRE_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_ACQUIRE_MAX_BYTES);
+    let material: Vec<u8> = match metadata
+        .and_then(|m| m.get("capsule"))
+        .filter(|c| c.is_object())
+        .cloned()
+    {
+        Some(mut capsule) => {
+            let is_media = capsule.get("media").map(|m| !m.is_null()).unwrap_or(false)
+                && capsule
+                    .get("asset_cid")
+                    .and_then(Value::as_str)
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+            if !is_media {
+                let bytes = fetch_acquire_bytes(&registry, content_cid, max_bytes).await?;
+                capsule["ciphertext_b64"] =
+                    json!(base64::engine::general_purpose::STANDARD.encode(&bytes));
+            }
+            serde_json::to_vec(&capsule).context("serialize reconstructed dKMS capsule")?
+        }
+        None => fetch_acquire_bytes(&registry, content_cid, max_bytes).await?,
+    };
+
+    // 3. Pin the CID for local availability via content/* ensure (P4 — never raw ipfs). Best-effort:
+    //    the materialized file (step 4) is the durable local copy; a transient pin miss must not deny
+    //    the buyer the asset they paid for.
+    let availability = match registry
+        .send_raw(
+            "content",
+            &json!({
+                "op": "ensure",
+                "cid": content_cid,
+                "object_did": target.uri,
+                "publisher_did": principal_id,
+            }),
+        )
+        .await
+    {
+        Ok(resp) if resp.get("status").and_then(Value::as_str) != Some("error") => resp
+            .get("data")
+            .and_then(|d| d.get("availability"))
+            .cloned()
+            .unwrap_or_else(|| json!({ "status": "unknown" })),
+        _ => json!({ "status": "unpinned" }),
+    };
+
+    // 4. Materialize the artifact under the buyer root (encrypt-at-rest if the root is protected) with the
+    //    asset's REAL mime so the Library routes it to the right protected viewer instead of "no viewer".
+    let mime = metadata.and_then(|m| m.get("mime")).and_then(Value::as_str);
+    let object =
+        write_library_file_bytes(data_dir, principal_id, &target.uri, mime, None, &material)?;
+
+    // 5. Stamp the acquire event (mirrors library_publish's "publish" event).
+    append_library_event(
+        data_dir,
+        principal_id,
+        "acquire",
+        &target.uri,
+        json!({
+            "content_cid": content_cid,
+            "availability": availability,
+            "object": object.clone(),
+        }),
+    )?;
+
+    Ok(json!({
+        "object": object,
+        "uri": target.uri,
+        "content_cid": content_cid,
+        "availability": availability,
     }))
 }
 
@@ -3104,7 +3354,8 @@ fn library_request_touches_webspace(request: &ObjectProviderRequest) -> bool {
         ObjectProviderRequest::Roots { .. }
         | ObjectProviderRequest::List { uri: None, .. }
         | ObjectProviderRequest::EmptyTrash { .. }
-        | ObjectProviderRequest::Events { .. } => false,
+        | ObjectProviderRequest::Events { .. }
+        | ObjectProviderRequest::Acquire { .. } => false,
     }
 }
 
@@ -3119,6 +3370,11 @@ struct DdrmCapsuleHints {
     content_size: Option<u64>,
     #[serde(default)]
     thumbnail: Option<String>,
+    /// The asset's canonical encrypted-content CID (the IPFS dir/object the capsule protects). For a dDRM
+    /// asset THIS — not the on-disk capsule-file hash — is the content identity the marketplace matches on
+    /// (vault "downloaded" + acquire-status), so the Library surfaces it as the object's `content_cid`.
+    #[serde(default)]
+    asset_cid: Option<String>,
 }
 
 impl DdrmCapsuleHints {
@@ -3273,6 +3529,9 @@ fn file_listing_facts(
             // capsules minted before `content_size` existed.
             let mut display_size = bytes.len() as u64;
             let mut thumbnail_uri = None;
+            // For a `.ddrm` capsule the marketplace identity is the asset's CONTENT cid (what it protects on
+            // IPFS), not the on-disk capsule hash — surface it so vault/acquire-status match the listing.
+            let mut content_cid = content_cid;
             if name.to_ascii_lowercase().ends_with(".ddrm") {
                 if let Some(hints) = parse_ddrm_capsule_hints(&bytes) {
                     if let Some(content_size) = hints.content_size {
@@ -3280,6 +3539,14 @@ fn file_listing_facts(
                     }
                     if hints.has_thumbnail() {
                         thumbnail_uri = Some(library_cover_endpoint(&target.uri));
+                    }
+                    if let Some(asset_cid) = hints
+                        .asset_cid
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|c| !c.is_empty())
+                    {
+                        content_cid = asset_cid.to_string();
                     }
                 }
             }
@@ -7176,6 +7443,50 @@ fn provider_error(code: &str, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_acquire_name_strips_unsafe_segments() {
+        assert_eq!(sanitize_acquire_name("alice.epub"), "alice.epub");
+        assert_eq!(sanitize_acquire_name("a b/c\\d"), "a_b_c_d"); // space + separators -> _
+        assert_eq!(sanitize_acquire_name(".."), ""); // traversal -> empty (caller falls back)
+        assert_eq!(sanitize_acquire_name("."), "");
+        assert_eq!(sanitize_acquire_name(""), "");
+        assert_eq!(sanitize_acquire_name(&"x".repeat(200)).len(), 96); // length-capped
+        assert!(!sanitize_acquire_name("../../etc/passwd").contains('/')); // no separator survives
+    }
+
+    #[test]
+    fn acquire_request_deserializes_and_rejects_unknown_keys() {
+        let req: ObjectProviderRequest = serde_json::from_value(json!({
+            "op": "acquire",
+            "principal_id": "p1",
+            "content_cid": "bafyEncrypted",
+        }))
+        .expect("acquire deserializes");
+        match req {
+            ObjectProviderRequest::Acquire {
+                principal_id,
+                content_cid,
+                uri,
+                metadata,
+            } => {
+                assert_eq!(principal_id, "p1");
+                assert_eq!(content_cid, "bafyEncrypted");
+                assert!(uri.is_none() && metadata.is_none());
+            }
+            _ => panic!("expected Acquire"),
+        }
+        // deny_unknown_fields: a junk key fails closed.
+        assert!(serde_json::from_value::<ObjectProviderRequest>(json!({
+            "op": "acquire", "principal_id": "p1", "content_cid": "c", "junk": 1
+        }))
+        .is_err());
+        // a missing required field fails closed.
+        assert!(serde_json::from_value::<ObjectProviderRequest>(json!({
+            "op": "acquire", "principal_id": "p1"
+        }))
+        .is_err());
+    }
 
     /// The List hot path now hashes each file once and derives both the `revision` token and the
     /// `content_cid` from that single digest. Pin that this is byte-identical to the previous
