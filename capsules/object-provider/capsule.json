@@ -14,7 +14,7 @@
       {
         "resource": "elastos://object/*",
         "actions": ["read", "write", "delete"],
-        "operations": ["roots", "list", "stat", "read", "download", "write", "mkdir", "rename", "move", "copy", "trash", "restore", "delete_permanently", "empty_trash", "status", "events", "publish", "unpublish", "repair", "share"]
+        "operations": ["roots", "list", "stat", "read", "download", "write", "mkdir", "rename", "move", "copy", "trash", "restore", "delete_permanently", "empty_trash", "status", "events", "publish", "unpublish", "repair", "acquire", "share"]
       }
     ],
     "audit_events": ["object.provider.requested", "object.provider.completed", "object.provider.failed"]

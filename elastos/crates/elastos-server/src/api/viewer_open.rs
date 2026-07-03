@@ -92,6 +92,31 @@ pub struct OpenOwnedRequest {
     /// delegation `prepare-grant` returned. Paired with `grant_handle`.
     #[serde(default)]
     pub delegation_sig_hex: Option<String>,
+    /// MARKETPLACE buy (storefront, not-yet-owned): the asset KID/content-id to buy. When present the
+    /// buy skips the owned-root resolve (the object isn't in the Library yet — `acquire` pins it after).
+    /// Absent => the legacy uri-based re-buy for an object already owned.
+    #[serde(default)]
+    pub content_id: Option<String>,
+    /// MARKETPLACE buy: the asset's on-chain identity from the discovery listing / `/api/market/get`,
+    /// used to source live terms (`sellersOf`/`listings` at id=1) with no `ELASTOS_DDRM_BUY_*` pins.
+    #[serde(default)]
+    pub operative: Option<String>,
+    #[serde(default)]
+    pub token_id: Option<String>,
+    #[serde(default)]
+    pub ledger: Option<String>,
+    #[serde(default)]
+    pub quantity: Option<String>,
+    /// MARKETPLACE buy: the chosen listing seller (the storefront shows the lowest-priced one). Omit to
+    /// let the gateway pick the lowest active seller live.
+    #[serde(default)]
+    pub seller: Option<String>,
+    /// MARKETPLACE buy: the price/pay-token the buyer saw in the UI. When present they arm abort-on-drift
+    /// (the live re-read at buy time must match).
+    #[serde(default)]
+    pub expected_price: Option<String>,
+    #[serde(default)]
+    pub expected_pay_token: Option<String>,
 }
 
 /// Phase-1 request: which owned object the user wants to open (so the gateway can bind the
@@ -768,43 +793,60 @@ pub async fn buy_owned_access(
     };
     let principal_id = context.principal_id.clone();
 
-    // Resolve the object inside the principal's OWN root (the same ownership gate the
-    // open uses) so we buy access for an object they can actually address.
-    let data_dir = state.data_dir.clone();
-    let uri = req.uri.clone();
-    let pid = principal_id.clone();
-    let owned = match tokio::task::spawn_blocking(move || {
-        crate::library::read_owned_object_for_viewer(&data_dir, &pid, &uri)
-    })
-    .await
-    {
-        Ok(Ok(owned)) => owned,
-        Ok(Err(err)) => {
-            tracing::warn!("buy: owned object resolve refused: {err}");
-            return (StatusCode::NOT_FOUND, "owned object not found").into_response();
-        }
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "owned object read panicked",
-            )
-                .into_response()
-        }
+    // MARKETPLACE buy (storefront): the asset isn't in the Library yet, so the request carries the KID
+    // (`content_id`) directly — skip the owned-root resolve (that's the legacy re-buy path for an object
+    // already owned). `acquire` pins it into the Library after the buy confirms.
+    let content_id = if let Some(cid) = req.content_id.clone().filter(|s| !s.trim().is_empty()) {
+        cid
+    } else {
+        // Legacy: resolve the object inside the principal's OWN root (same ownership gate the open uses).
+        let data_dir = state.data_dir.clone();
+        let uri = req.uri.clone();
+        let pid = principal_id.clone();
+        let owned = match tokio::task::spawn_blocking(move || {
+            crate::library::read_owned_object_for_viewer(&data_dir, &pid, &uri)
+        })
+        .await
+        {
+            Ok(Ok(owned)) => owned,
+            Ok(Err(err)) => {
+                tracing::warn!("buy: owned object resolve refused: {err}");
+                return (StatusCode::NOT_FOUND, "owned object not found").into_response();
+            }
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "owned object read panicked",
+                )
+                    .into_response()
+            }
+        };
+        owned
+            .content_cid
+            .clone()
+            .unwrap_or_else(|| format!("owned:{}", owned.name))
     };
-
-    let content_id = owned
-        .content_cid
-        .clone()
-        .unwrap_or_else(|| format!("owned:{}", owned.name));
     let subject = resolve_subject_address(&state, &principal_id).await;
     let now = now_unix();
+
+    // The storefront supplies the asset's on-chain identity + buyer-agreed terms; the live `chain` path
+    // sources seller/price/payToken from these with no `ELASTOS_DDRM_BUY_*` pins.
+    let target = super::buy_authority::BuyTarget {
+        operative: req.operative.clone(),
+        token_id: req.token_id.clone(),
+        ledger: req.ledger.clone(),
+        quantity: req.quantity.clone(),
+        seller: req.seller.clone(),
+        expected_price: req.expected_price.clone(),
+        expected_pay_token: req.expected_pay_token.clone(),
+    };
 
     let bought = {
         let principal_id = principal_id.clone();
         let content_id = content_id.clone();
         let subject = subject.clone();
         tokio::task::spawn_blocking(move || {
-            super::buy_authority::buy_access(&principal_id, &content_id, &subject, now)
+            super::buy_authority::buy_access(&principal_id, &content_id, &subject, now, &target)
         })
         .await
     };
@@ -1592,7 +1634,7 @@ fn now_unix() -> u64 {
 /// otherwise the wallet-provider is asked for the principal's accounts and the first
 /// `eip155:` address is used. Returns empty if none is linked (dev mode derives a
 /// placeholder; chain mode fails closed).
-async fn resolve_subject_address(state: &GatewayState, principal_id: &str) -> String {
+pub(crate) async fn resolve_subject_address(state: &GatewayState, principal_id: &str) -> String {
     if let Ok(pinned) = std::env::var("ELASTOS_DDRM_SUBJECT") {
         if !pinned.trim().is_empty() {
             return pinned;

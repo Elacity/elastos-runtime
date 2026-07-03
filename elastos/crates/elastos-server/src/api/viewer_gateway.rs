@@ -390,7 +390,7 @@ async fn viewer_library_object(
     viewer_object_provider_request(state, context, op, payload).await
 }
 
-async fn viewer_object_provider_request(
+pub(crate) async fn viewer_object_provider_request(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
     op: &str,
