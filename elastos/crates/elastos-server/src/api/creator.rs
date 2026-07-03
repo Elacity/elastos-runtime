@@ -349,6 +349,7 @@ pub struct PrepareMintRequest {
 pub mod mint_progress {
     use serde_json::{json, Value};
     use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -359,6 +360,10 @@ pub mod mint_progress {
         done: bool,
         error: Option<String>,
         updated: u64,
+        // Caller-granted sink the media provider writes measured transcode % to (Improvement A).
+        // Read lazily at UI-poll cadence and merged onto the active `package` stage — no extra
+        // host task. Absent ⇒ the stage carries no pct and the UI stays indeterminate.
+        pkg_progress_path: Option<PathBuf>,
     }
 
     fn now() -> u64 {
@@ -388,8 +393,19 @@ pub mod mint_progress {
                 done: false,
                 error: None,
                 updated: now(),
+                pkg_progress_path: None,
             },
         );
+    }
+
+    /// Register the caller-granted transcode progress sink for a job (no-op without an id).
+    pub fn set_pkg_progress_path(job_id: Option<&str>, path: &Path) {
+        let Some(id) = job_id else { return };
+        let mut g = store().lock().expect("mint progress store poisoned");
+        if let Some(job) = g.get_mut(id) {
+            job.pkg_progress_path = Some(path.to_path_buf());
+            job.updated = now();
+        }
     }
 
     /// Mark `stage` active and every earlier stage done (no-op without a job id).
@@ -441,18 +457,51 @@ pub mod mint_progress {
 
     /// JSON snapshot for the status route (`None` ⇒ unknown/expired job).
     pub fn snapshot(job_id: &str) -> Option<Value> {
-        let g = store().lock().expect("mint progress store poisoned");
-        g.get(job_id).map(|job| {
-            json!({
-                "schema": "elastos.creator.progress/v1",
-                "done": job.done,
-                "error": job.error,
-                "stages": job.stages.iter().map(|(name, status)| json!({
-                    "name": name,
-                    "status": status,
-                })).collect::<Vec<_>>(),
-            })
-        })
+        // Copy the small state out under the lock, then do any file I/O lock-free.
+        let (stages, done, error, pkg_path) = {
+            let g = store().lock().expect("mint progress store poisoned");
+            let job = g.get(job_id)?;
+            (
+                job.stages.clone(),
+                job.done,
+                job.error.clone(),
+                job.pkg_progress_path.clone(),
+            )
+        };
+
+        // Lazily read the measured transcode % only while `package` is active — exactly when
+        // the UI is polling. Best-effort: a missing/torn/garbage file just omits pct.
+        let pkg_pct = if stages
+            .iter()
+            .any(|(name, status)| name == "package" && status == "active")
+        {
+            pkg_path.as_deref().and_then(read_pkg_pct)
+        } else {
+            None
+        };
+
+        Some(json!({
+            "schema": "elastos.creator.progress/v1",
+            "done": done,
+            "error": error,
+            "stages": stages.iter().map(|(name, status)| {
+                let mut row = json!({ "name": name, "status": status });
+                if name == "package" {
+                    if let Some(p) = pkg_pct {
+                        row["pct"] = json!(p);
+                    }
+                }
+                row
+            }).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// Read `{"stage":"transcode","pct":N}` from the provider's sink, returning a clamped 0..=99.
+    fn read_pkg_pct(path: &Path) -> Option<u8> {
+        let body = std::fs::read_to_string(path).ok()?;
+        let v: Value = serde_json::from_str(&body).ok()?;
+        let pct = v.get("pct").and_then(Value::as_i64)?;
+        Some(pct.clamp(0, 99) as u8)
     }
 }
 
@@ -1692,6 +1741,22 @@ async fn finalize_mint(
     }))
 }
 
+/// A unique, host-owned temp path for the media provider's transcode-progress sink. The nonce
+/// is host-generated (process id + clock + a counter) — never derived from the client job id —
+/// so there is no path-injection surface from request input.
+fn pkg_progress_sink_path() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join("elastos-creator-progress");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(format!("pkg-{}-{}-{}.json", std::process::id(), nonce, seq))
+}
+
 /// The MEDIA producer spine: DASH-package (per-track inits + plaintext segments + MPD) ->
 /// CENC every fragment under ONE asset CEK (single default_KID) + escrow to the quorum ->
 /// publish the DASH directory (plaintext inits + ENCRYPTED segments + manifest.mpd) -> media
@@ -1711,15 +1776,27 @@ async fn run_prepare_mint_media(
     // 1) DASH-package the source: per-track standalone inits + PLAINTEXT segments + manifest.
     // This is the long pole (transcode + fragment); the UI shows "package" active throughout.
     mint_progress::advance(job_id, "package");
+    // Measured transcode progress (Improvement A): grant the media provider a single host-owned
+    // sink (capability passing — it writes ONLY here) and surface its % on /prepare-progress.
+    // Host-owned temp path with a random nonce: never derived from the client job id, so there
+    // is no path-injection surface. Best-effort throughout — never blocks the mint.
+    let progress_sink = job_id.map(|_| pkg_progress_sink_path());
+    if let Some(path) = progress_sink.as_deref() {
+        mint_progress::set_pkg_progress_path(job_id, path);
+    }
     let pkg_req = json!({
         "op": "package_dash",
         "content_b64": b64.encode(file_bytes),
         "filename": meta.file_name,
         "preview_duration": meta.preview_duration.unwrap_or(0),
+        "progress_path": progress_sink.as_ref().map(|p| p.to_string_lossy().into_owned()),
     });
-    let pkg = provider_data(registry, "media", &pkg_req)
-        .await
-        .map_err(|e| stage_err("encrypt", e))?;
+    let pkg = provider_data(registry, "media", &pkg_req).await;
+    // The transcode is done (or failed): the sink is no longer read — clean it up.
+    if let Some(path) = progress_sink.as_deref() {
+        let _ = std::fs::remove_file(path);
+    }
+    let pkg = pkg.map_err(|e| stage_err("encrypt", e))?;
     let manifest = pkg
         .get("mpd")
         .and_then(Value::as_str)
@@ -3246,6 +3323,42 @@ mod tests {
     fn refuses_a_descriptor_carrying_secret_material() {
         let err = parse_quorum_descriptor(&descriptor(3, true)).unwrap_err();
         assert!(err.contains("PUBLIC-ONLY"), "got: {err}");
+    }
+
+    #[test]
+    fn progress_snapshot_surfaces_measured_pct_only_while_package_active() {
+        let job = format!("test-prog-{}", std::process::id());
+        mint_progress::start(&job, &["analyze", "package", "encrypt"]);
+
+        // A granted sink with a measured value, but `package` not yet active ⇒ no pct leaks.
+        let sink = pkg_progress_sink_path();
+        std::fs::write(&sink, b"{\"stage\":\"transcode\",\"pct\":42}").unwrap();
+        mint_progress::set_pkg_progress_path(Some(&job), &sink);
+        mint_progress::advance(Some(&job), "analyze");
+        let snap = mint_progress::snapshot(&job).unwrap();
+        let pkg = snap["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "package")
+            .unwrap();
+        assert!(
+            pkg.get("pct").is_none(),
+            "pct must not show before package is active"
+        );
+
+        // Once `package` is active, the measured % is merged onto that stage.
+        mint_progress::advance(Some(&job), "package");
+        let snap = mint_progress::snapshot(&job).unwrap();
+        let pkg = snap["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "package")
+            .unwrap();
+        assert_eq!(pkg["pct"], json!(42));
+
+        let _ = std::fs::remove_file(&sink);
     }
 
     #[test]

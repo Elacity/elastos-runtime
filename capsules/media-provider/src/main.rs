@@ -15,8 +15,12 @@
 //! No ambient authority (PRINCIPLE #3): the only external tool is ffmpeg/ffprobe —
 //! the same dependency PC2 has — and its path + a scratch directory are supplied by
 //! a narrow operator config (`ELASTOS_MEDIA_PROVIDER_CONFIG`). No network. Confined
-//! to the scratch dir. Unconfigured ⇒ explicit `not_configured` error, never a
-//! silent skip (PRINCIPLE #11 — fail closed).
+//! to the scratch dir, plus one optional, caller-granted write capability: when the
+//! `package_dash` request carries `progress_path`, the provider writes ONLY transcode
+//! progress (`{stage,pct}`) to that single path the host explicitly handed in for the
+//! call — capability passing, not path discovery. Absent the field, nothing is written.
+//! Unconfigured ⇒ explicit `not_configured` error, never a silent skip (PRINCIPLE #11 —
+//! fail closed); a progress-write failure is non-fatal and never blocks the mint.
 //!
 //! Parity anchors (from PC2 source):
 //!   transcode: AV1 ladder (`av1_nvenc` GPU → `libsvtav1` CPU → `libx264` fallback,
@@ -30,11 +34,11 @@
 use ddrm_media::{mp4, mpd};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
@@ -284,6 +288,12 @@ enum Request {
         /// `media.ts:1753`). Capped at 60s. The clip never carries the CEK — it's a teaser.
         #[serde(default)]
         preview_duration: Option<u64>,
+        /// Optional, caller-granted progress sink: an absolute path the host owns and polls.
+        /// When present the provider writes `{"stage":"transcode","pct":N}` here as ffmpeg
+        /// advances (measured against the ffprobe duration). Capability passing — the provider
+        /// writes ONLY here, only this. Absent ⇒ no progress is reported (UI stays indeterminate).
+        #[serde(default)]
+        progress_path: Option<String>,
     },
     Shutdown,
 }
@@ -334,10 +344,12 @@ impl MediaProvider {
                 content_b64,
                 filename,
                 preview_duration,
+                progress_path,
             } => self.package_dash(
                 &content_b64,
                 filename.as_deref(),
                 preview_duration.unwrap_or(0),
+                progress_path.as_deref(),
             ),
             Request::Shutdown => Response::empty_ok(),
         }
@@ -477,7 +489,7 @@ impl MediaProvider {
         r: &Rendition,
         probe: &ProbeResult,
     ) -> Result<Value, String> {
-        let frag_bytes = self.fragment_rendition(tools, workdir, input, r, probe)?;
+        let frag_bytes = self.fragment_rendition(tools, workdir, input, r, probe, None)?;
         let split = mp4::split_fragmented(&frag_bytes)?;
         let meta = mp4::parse_fragment_metadata(&frag_bytes)?;
 
@@ -504,6 +516,7 @@ impl MediaProvider {
         input: &Path,
         r: &Rendition,
         probe: &ProbeResult,
+        progress: Option<&Path>,
     ) -> Result<Vec<u8>, String> {
         let transcoded = workdir.join(format!("t-{}.mp4", r.id));
         let fragmented = workdir.join(format!("f-{}.mp4", r.id));
@@ -577,8 +590,23 @@ impl MediaProvider {
                 .arg("-b:a")
                 .arg(&r.audio_bitrate);
         }
+        // Measured transcode progress (the long pole): when the caller granted a progress
+        // sink AND we know the source duration, stream ffmpeg's `-progress` and report
+        // out_time ÷ duration. Otherwise run the plain blocking form (UI stays indeterminate).
+        let want_progress = progress.is_some() && probe.duration > 0.0;
+        if want_progress {
+            tx.arg("-progress").arg("pipe:1").arg("-nostats");
+        }
         tx.arg(&transcoded);
-        run_ffmpeg(&mut tx, &format!("transcode {}", r.id))?;
+        match (want_progress, progress) {
+            (true, Some(sink)) => run_ffmpeg_with_progress(
+                &mut tx,
+                &format!("transcode {}", r.id),
+                probe.duration,
+                sink,
+            )?,
+            _ => run_ffmpeg(&mut tx, &format!("transcode {}", r.id))?,
+        }
 
         // Step 2 — fragment: copy streams into a fragmented MP4.
         let mut fr = Command::new(&tools.ffmpeg);
@@ -606,6 +634,7 @@ impl MediaProvider {
         content_b64: &str,
         filename: Option<&str>,
         preview_duration: u64,
+        progress_path: Option<&str>,
     ) -> Response {
         let tools = match self.config.resolve() {
             Ok(t) => t,
@@ -620,7 +649,15 @@ impl MediaProvider {
             Ok(d) => d,
             Err(e) => return Response::error("scratch_error", e),
         };
-        let result = self.package_dash_in(&tools, &workdir, &bytes, filename, preview_duration);
+        let progress = progress_path.map(Path::new);
+        let result = self.package_dash_in(
+            &tools,
+            &workdir,
+            &bytes,
+            filename,
+            preview_duration,
+            progress,
+        );
         let _ = std::fs::remove_dir_all(&workdir);
         match result {
             Ok(data) => Response::ok(data),
@@ -635,6 +672,7 @@ impl MediaProvider {
         bytes: &[u8],
         filename: Option<&str>,
         preview_duration: u64,
+        progress: Option<&Path>,
     ) -> Result<Value, String> {
         let ext = filename
             .and_then(|f| Path::new(f).extension())
@@ -679,7 +717,7 @@ impl MediaProvider {
             None
         };
 
-        let frag_bytes = self.fragment_rendition(tools, workdir, &input, &top, &probe)?;
+        let frag_bytes = self.fragment_rendition(tools, workdir, &input, &top, &probe, progress)?;
         let streams = mp4::demux_tracks(&frag_bytes)?;
         let meta = mp4::parse_fragment_metadata(&frag_bytes)?;
 
@@ -874,6 +912,93 @@ fn run_ffmpeg(cmd: &mut Command, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Run ffmpeg with `-progress pipe:1` and stream measured progress to the caller-granted
+/// `progress_path`. `cmd` must already carry `-progress pipe:1`. stderr is drained on a
+/// side thread (so a full pipe can't deadlock the encode) and only its tail is surfaced on
+/// failure. Progress writes are throttled and best-effort: a write error never fails the run.
+fn run_ffmpeg_with_progress(
+    cmd: &mut Command,
+    label: &str,
+    duration_secs: f64,
+    progress_path: &Path,
+) -> Result<(), String> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("ffmpeg spawn failed ({label}): {e}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("ffmpeg {label}: no progress pipe"))?;
+    // Drain stderr concurrently to avoid a pipe-buffer deadlock on long encodes.
+    let stderr = child.stderr.take();
+    let err_handle = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(se) = stderr {
+            let _ = BufReader::new(se).read_to_string(&mut buf);
+        }
+        buf
+    });
+
+    let total_us = (duration_secs * 1_000_000.0).max(1.0);
+    let mut last_pct: i32 = -1;
+    let mut last_write = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    for line in BufReader::new(stdout).lines() {
+        let Ok(line) = line else { break };
+        if let Some(us) = parse_out_time_us(&line) {
+            let pct = pct_from_us(us, total_us);
+            if pct > last_pct && last_write.elapsed() >= Duration::from_millis(250) {
+                last_pct = pct;
+                last_write = Instant::now();
+                write_transcode_progress(progress_path, pct);
+            }
+        }
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("ffmpeg wait failed ({label}): {e}"))?;
+    let stderr_buf = err_handle.join().unwrap_or_default();
+    if !status.success() {
+        let tail: String = stderr_buf
+            .lines()
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        return Err(format!("ffmpeg {label} exited {status}: {tail}"));
+    }
+    Ok(())
+}
+
+/// Parse the microsecond timestamp from an ffmpeg `-progress` line, tolerating the
+/// `out_time_us` (preferred) and legacy `out_time_ms` (actually µs in ffmpeg) keys.
+fn parse_out_time_us(line: &str) -> Option<f64> {
+    let v = line
+        .strip_prefix("out_time_us=")
+        .or_else(|| line.strip_prefix("out_time_ms="))?;
+    let parsed = v.trim().parse::<f64>().ok()?;
+    (parsed >= 0.0).then_some(parsed)
+}
+
+/// Clamp progress to 0..=99 while encoding (100 is reserved for server-confirmed completion).
+fn pct_from_us(out_time_us: f64, total_us: f64) -> i32 {
+    ((out_time_us / total_us) * 100.0).clamp(0.0, 99.0) as i32
+}
+
+/// Atomically publish `{stage,pct}` to the caller's sink (temp + rename so the host never
+/// reads a torn write). Best-effort: any failure is swallowed — progress is non-critical.
+fn write_transcode_progress(path: &Path, pct: i32) {
+    let tmp = path.with_extension("tmp");
+    let body = format!("{{\"stage\":\"transcode\",\"pct\":{pct}}}");
+    if std::fs::write(&tmp, body.as_bytes()).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // base64 (engine::general_purpose::STANDARD) — small wrappers for readability.
 // ---------------------------------------------------------------------------
@@ -996,6 +1121,39 @@ mod tests {
             json!({ "op": "package", "content_b64": "!!!notb64!!!" }),
         );
         assert_eq!(err_code(resp), "invalid_request");
+    }
+
+    #[test]
+    fn out_time_parsing_and_pct_are_monotonic_and_clamped() {
+        // Recognised keys (us preferred, legacy ms key is actually µs in ffmpeg).
+        assert_eq!(parse_out_time_us("out_time_us=1500000"), Some(1_500_000.0));
+        assert_eq!(parse_out_time_us("out_time_ms=2500000"), Some(2_500_000.0));
+        // Irrelevant / malformed lines are ignored.
+        assert_eq!(parse_out_time_us("frame=42"), None);
+        assert_eq!(parse_out_time_us("out_time_us=N/A"), None);
+
+        // 10s source: % rises with out_time and never reports 100 mid-encode.
+        let total_us = 10_000_000.0;
+        assert_eq!(pct_from_us(0.0, total_us), 0);
+        assert_eq!(pct_from_us(5_000_000.0, total_us), 50);
+        assert_eq!(pct_from_us(9_900_000.0, total_us), 99);
+        assert_eq!(pct_from_us(10_000_000.0, total_us), 99); // clamped below 100
+        assert_eq!(pct_from_us(50_000_000.0, total_us), 99); // overshoot clamped
+    }
+
+    #[test]
+    fn write_transcode_progress_publishes_atomically() {
+        let dir = std::env::temp_dir().join(format!("mp-prog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.json");
+        write_transcode_progress(&path, 37);
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body, "{\"stage\":\"transcode\",\"pct\":37}");
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "temp file left behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
