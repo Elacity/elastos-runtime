@@ -936,7 +936,7 @@ mod tests {
 
     #[test]
     fn native_value_is_price_times_quantity() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::api::ddrm_env_lock();
         clear_buy_env();
         std::env::set_var("ELASTOS_DDRM_BUY_PRICE", "100");
         std::env::set_var("ELASTOS_DDRM_BUY_QUANTITY", "3");
@@ -950,7 +950,7 @@ mod tests {
 
     #[test]
     fn erc20_path_emits_approve_to_payment_processor() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::api::ddrm_env_lock();
         clear_buy_env();
         let processor = "0x1111111111111111111111111111111111111111";
         std::env::set_var("ELASTOS_DDRM_BUY_PRICE", "1000000"); // 1 USDC (6 dp)
@@ -968,7 +968,7 @@ mod tests {
 
     #[test]
     fn chain_buy_without_resolved_tokenid_fails_closed() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::api::ddrm_env_lock();
         clear_buy_env();
         std::env::set_var("ELASTOS_DDRM_RIGHTS", "chain");
         std::env::set_var("ELASTOS_DDRM_BUY_SIGN", "wallet"); // pass the top wallet-linked check
@@ -1068,7 +1068,7 @@ mod tests {
 
     #[test]
     fn assemble_from_live_terms_needs_no_env_and_binds_terms() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::api::ddrm_env_lock();
         clear_buy_env(); // the live path assembles from explicit terms — NO ELASTOS_DDRM_BUY_* required.
         let terms = BuyTerms {
             gateway: BASE_AUTHORITY_GATEWAY.to_string(),
@@ -1102,7 +1102,7 @@ mod tests {
 
     #[test]
     fn source_buy_terms_fails_closed_without_channel_ledger() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::api::ddrm_env_lock();
         clear_buy_env(); // no target, no env -> the very first gate (channel/ledger) fails closed.
         let err = source_buy_terms("bafyX", &BuyTarget::default())
             .expect_err("a live buy with no channel/ledger must fail closed");

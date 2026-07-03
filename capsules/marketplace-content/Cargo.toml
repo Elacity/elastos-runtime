@@ -1,0 +1,19 @@
+[package]
+name = "marketplace-content"
+version = "0.1.0"
+edition = "2021"
+description = "Marketplace content storefront capsule (discover / buy / trade dDRM assets)"
+license = "MIT"
+
+[[bin]]
+name = "marketplace-content"
+path = "wasm/main.rs"
+
+[dependencies]
+elastos-guest = { path = "../../elastos/crates/elastos-guest" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

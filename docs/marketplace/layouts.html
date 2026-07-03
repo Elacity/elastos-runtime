@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Marketplace-in-Runtime — Layout Mock (SCOPE SUPERSEDED — see SCOPE.md)</title>
+<!-- ⚠️ SCOPE SUPERSEDED: this static mock predates the scope correction (it shows a "Studio" nav and an
+     in-app "secure stage / source never delivered / no download". The marketplace is buy/trade ONLY — mints
+     nothing, plays nothing; on buy the encrypted file pins to your Library and opens in the existing player.
+     The runnable, browser-verified shell at ../../capsules/marketplace-content/browser/ + docs SCOPE.md govern. -->
+<style>
+:root{
+  --bg:#0b0d10; --panel:#14171c; --panel2:#1b1f26; --line:#272c34; --ink:#e9edf2; --mut:#8a93a0;
+  --acc:#5b8cff; --acc2:#7c5bff; --ok:#34d399; --warn:#fbbf24; --chip:#1f2a44; --radius:14px;
+  --shadow:0 1px 0 rgba(255,255,255,.03),0 12px 30px rgba(0,0,0,.35);
+}
+*{box-sizing:border-box} html,body{margin:0}
+body{background:var(--bg);color:var(--ink);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif}
+.wrap{max-width:1240px;margin:0 auto;padding:0 22px}
+.muted{color:var(--mut)} .small{font-size:12.5px}
+.lockchip{display:inline-flex;align-items:center;gap:5px;background:var(--chip);color:#bcd0ff;border:1px solid #2b3a5e;border-radius:999px;padding:2px 9px;font-size:11.5px;font-weight:600}
+.pill{display:inline-flex;align-items:center;gap:6px;background:var(--panel2);border:1px solid var(--line);border-radius:999px;padding:5px 11px;font-size:12.5px}
+.btn{background:linear-gradient(180deg,var(--acc),#3f6fe6);color:#fff;border:0;border-radius:11px;padding:11px 16px;font-weight:700;cursor:pointer;width:100%;font-size:14.5px}
+.btn.ghost{background:var(--panel2);border:1px solid var(--line);color:var(--ink)}
+.glyph{width:22px;height:22px;display:inline-grid;place-items:center;border-radius:7px;background:var(--panel2);border:1px solid var(--line);font-size:13px}
+/* top nav */
+.nav{position:sticky;top:0;z-index:5;background:rgba(11,13,16,.82);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+.nav .row{display:flex;align-items:center;gap:14px;height:60px}
+.logo{font-weight:800;letter-spacing:.2px} .logo b{color:var(--acc)}
+.search{flex:1;max-width:520px;display:flex;align-items:center;gap:9px;background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:9px 13px;color:var(--mut)}
+.spacer{flex:1}
+/* layout grid */
+.shell{display:grid;grid-template-columns:212px 1fr;gap:26px;padding:24px 0}
+.rail a{display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:10px;color:var(--ink);text-decoration:none;font-weight:600}
+.rail a.active{background:var(--panel);border:1px solid var(--line)} .rail a:hover{background:var(--panel)}
+.rail .lbl{margin:16px 0 7px;color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.8px}
+.rail .facet{display:flex;align-items:center;gap:8px;padding:6px 11px;color:var(--mut);font-size:13.5px;border-radius:9px} .rail .facet:hover{color:var(--ink)}
+/* hero */
+.hero{position:relative;border-radius:18px;overflow:hidden;border:1px solid var(--line);padding:30px;background:
+  radial-gradient(120% 120% at 90% 10%,rgba(124,91,255,.35),transparent 55%),
+  radial-gradient(120% 120% at 10% 90%,rgba(91,140,255,.30),transparent 50%),var(--panel)}
+.hero h1{margin:.2em 0;font-size:30px;letter-spacing:-.3px} .hero p{max-width:560px;color:var(--mut)}
+/* shelves + cards */
+.shelf{margin:30px 0 6px;display:flex;align-items:baseline;justify-content:space-between}
+.shelf h3{margin:0;font-size:17px} .shelf .more{color:var(--acc);font-size:13px;cursor:pointer}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow);cursor:pointer;transition:transform .12s}
+.card:hover{transform:translateY(-2px)}
+.thumb{aspect-ratio:16/11;position:relative;display:grid;place-items:center;color:#fff;font-size:30px}
+.thumb .wm{position:absolute;inset:0;display:grid;place-items:center;color:rgba(255,255,255,.10);font-weight:800;font-size:13px;transform:rotate(-20deg);letter-spacing:2px;pointer-events:none}
+.thumb .tl{position:absolute;top:9px;left:9px} .thumb .tr{position:absolute;top:9px;right:9px}
+.g1{background:linear-gradient(135deg,#3b2f63,#5b8cff)} .g2{background:linear-gradient(135deg,#143b2e,#34d399)}
+.g3{background:linear-gradient(135deg,#3a2740,#c084fc)} .g4{background:linear-gradient(135deg,#3a2a18,#fbbf24)}
+.g5{background:linear-gradient(135deg,#10243f,#38bdf8)}
+.meta{padding:11px 13px} .meta .t{font-weight:700} .meta .c{color:var(--mut);font-size:12.5px}
+.meta .b{display:flex;align-items:center;justify-content:space-between;margin-top:9px}
+.price{font-weight:800} .badge{font-size:11px;color:var(--ok);border:1px solid #1f4d3a;background:#0f2a20;border-radius:7px;padding:1px 7px}
+/* section divider for the mock */
+.divider{margin:54px 0 0;border-top:1px dashed var(--line);padding-top:10px;color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:1px}
+/* asset detail */
+.detail{display:grid;grid-template-columns:1fr 372px;gap:26px;margin-top:18px}
+.stage{background:var(--panel);border:1px solid var(--line);border-radius:18px;overflow:hidden}
+.stagehead{padding:16px 18px;border-bottom:1px solid var(--line)}
+.stagehead h2{margin:0 0 4px;font-size:21px}
+.verified{display:inline-flex;align-items:center;gap:6px;color:var(--ok);font-size:12.5px;margin-top:6px}
+.cid{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--mut);font-size:12px}
+.preview{aspect-ratio:16/9;position:relative;display:grid;place-items:center;font-size:50px;color:#fff}
+.preview .scrim{position:absolute;inset:0;background:linear-gradient(180deg,transparent 55%,rgba(0,0,0,.55))}
+.preview .wmbig{position:absolute;inset:0;display:grid;place-items:center;color:rgba(255,255,255,.13);font-weight:800;font-size:26px;transform:rotate(-18deg);letter-spacing:3px}
+.preview .pv{position:absolute;left:14px;bottom:12px;font-size:12px;color:#dfe6ef}
+.preview .lock{position:absolute;right:14px;bottom:12px}
+.side .cardx{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:16px;margin-bottom:14px}
+.cardx h4{margin:0 0 10px;font-size:13px;color:var(--mut);text-transform:uppercase;letter-spacing:.7px}
+.kv{display:flex;justify-content:space-between;margin:7px 0;font-size:14px} .kv .k{color:var(--mut)}
+.bigprice{font-size:26px;font-weight:800;margin:2px 0 2px}
+.stepper{display:flex;align-items:center;gap:10px;margin:12px 0}
+.stepper button{width:34px;height:34px;border-radius:9px;background:var(--panel2);border:1px solid var(--line);color:var(--ink);font-size:18px;cursor:pointer}
+.note{color:var(--mut);font-size:12.5px;margin-top:9px;text-align:center}
+.splits{display:flex;height:12px;border-radius:7px;overflow:hidden;margin:6px 0 10px;border:1px solid var(--line)}
+.splits i{display:block} .s1{background:var(--acc)} .s2{background:var(--acc2)} .s3{background:var(--ok)} .s4{background:#475569}
+.legend{display:flex;flex-wrap:wrap;gap:10px;font-size:12px;color:var(--mut)}
+.legend b{color:var(--ink)} .dot{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:5px;vertical-align:middle}
+@media(max-width:980px){.shell{grid-template-columns:1fr}.cards{grid-template-columns:repeat(2,1fr)}.detail{grid-template-columns:1fr}}
+</style></head>
+<body>
+
+<div class="nav"><div class="wrap row">
+  <div class="logo">elacity<b>·</b>market</div>
+  <div class="search">⌘K&nbsp; Search assets, creators, collections…</div>
+  <div class="spacer"></div>
+  <span class="pill">⛓ Base</span><span class="pill">◎ 1.24 ELA</span><span class="pill">🗝 Vault · 7</span>
+  <span class="glyph">😊</span>
+</div></div>
+
+<div class="wrap shell">
+  <!-- LEFT RAIL -->
+  <nav class="rail">
+    <a class="active">🧭 &nbsp;Discover</a>
+    <a>🗝 &nbsp;Vault</a>
+    <a>🎬 &nbsp;Studio</a>
+    <a>🔔 &nbsp;Activity</a>
+    <div class="lbl">Medium</div>
+    <div class="facet">📺 Watch</div><div class="facet">🎧 Listen</div><div class="facet">📖 Read</div>
+    <div class="facet">🖼 View</div><div class="facet">🧊 Explore (3D)</div>
+    <div class="lbl">Rights</div>
+    <div class="facet">🆓 Free to open</div><div class="facet">🛒 Buy once</div><div class="facet">♻️ Resellable</div>
+  </nav>
+
+  <!-- MAIN -->
+  <main>
+    <!-- DISCOVER -->
+    <section class="hero">
+      <span class="lockchip">🗝 You buy access — not the file</span>
+      <h1>Own the right to open it.</h1>
+      <p class="muted">Every asset is dDRM-protected: discover from the chain, preview securely, buy a scoped access right. Keys are used, never owned.</p>
+      <div style="margin-top:16px"><button class="btn" style="width:auto;display:inline-block">Explore the catalog →</button></div>
+    </section>
+
+    <div class="shelf"><h3>🔥 Trending</h3><span class="more">See all</span></div>
+    <div class="cards">
+      <div class="card"><div class="thumb g1">📺<span class="lockchip tr">🗝</span><span class="wm">PREVIEW</span></div>
+        <div class="meta"><div class="t">Aerials — Ep.1</div><div class="c">by 0x4f…a2 · Watch</div>
+          <div class="b"><span class="price">From 4.0 ELA</span><span class="badge">♻ resell</span></div></div></div>
+      <div class="card"><div class="thumb g2">🎧<span class="lockchip tr">🗝</span><span class="wm">PREVIEW</span></div>
+        <div class="meta"><div class="t">Nocturne (LP)</div><div class="c">by lumen · Listen</div>
+          <div class="b"><span class="price">2.5 ELA</span></div></div></div>
+      <div class="card"><div class="thumb g3">📖<span class="lockchip tr">🗝</span><span class="wm">PREVIEW</span></div>
+        <div class="meta"><div class="t">The Long Field (PDF)</div><div class="c">by hatch · Read</div>
+          <div class="b"><span class="price">Free</span></div></div></div>
+      <div class="card"><div class="thumb g5">🧊<span class="lockchip tr">🗝</span><span class="wm">PREVIEW</span></div>
+        <div class="meta"><div class="t">Relic — scan #12</div><div class="c">by atlas · Explore</div>
+          <div class="b"><span class="price">From 9.0 ELA</span><span class="badge">♻ resell</span></div></div></div>
+    </div>
+
+    <div class="shelf"><h3>✨ New mints</h3><span class="more">See all</span></div>
+    <div class="cards">
+      <div class="card"><div class="thumb g4">🖼<span class="lockchip tr">🗝</span><span class="wm">PREVIEW</span></div>
+        <div class="meta"><div class="t">Solar / 03</div><div class="c">by mira · View</div><div class="b"><span class="price">1.2 ELA</span></div></div></div>
+      <div class="card"><div class="thumb g3">📖<span class="lockchip tr">🗝</span><span class="wm">PREVIEW</span></div>
+        <div class="meta"><div class="t">Field Notes (comic)</div><div class="c">by koto · Read</div><div class="b"><span class="price">3.3 ELA</span></div></div></div>
+      <div class="card"><div class="thumb g1">📺<span class="lockchip tr">🗝</span><span class="wm">PREVIEW</span></div>
+        <div class="meta"><div class="t">Drift — short</div><div class="c">by 0x91…7c · Watch</div><div class="b"><span class="price">Free</span></div></div></div>
+      <div class="card"><div class="thumb g2">🎧<span class="lockchip tr">🗝</span><span class="wm">PREVIEW</span></div>
+        <div class="meta"><div class="t">Loops vol.2</div><div class="c">by ember · Listen</div><div class="b"><span class="price">From 0.8 ELA</span><span class="badge">♻ resell</span></div></div></div>
+    </div>
+
+    <!-- ASSET DETAIL -->
+    <div class="divider">↓ Asset detail — “secure stage + commerce / trust sidebar”</div>
+    <div class="detail">
+      <div class="stage">
+        <div class="preview g1">📺
+          <div class="wmbig">PREVIEW · 0x9c2a…</div><div class="scrim"></div>
+          <div class="pv">▶ 0:23 / preview clip · watermarked</div>
+          <div class="lock"><span class="lockchip">🔒 Secure view — source never delivered</span></div>
+        </div>
+        <div class="stagehead">
+          <h2>Aerials — Episode 1</h2>
+          <div class="muted small">by 0x4f…a2 · Watch · 4K · 18:42</div>
+          <div class="verified">✓ Identity verified &nbsp;<span class="cid">contentId 0x9c2a…e1 (== KID)</span></div>
+        </div>
+      </div>
+
+      <div class="side">
+        <div class="cardx">
+          <h4>Access</h4>
+          <div class="bigprice">4.0 ELA <span class="muted small">· cheapest of 3 listings</span></div>
+          <div class="kv"><span class="k">Pay token</span><span>ELA</span></div>
+          <div class="kv"><span class="k">Copies left</span><span>112 / 500</span></div>
+          <div class="kv"><span class="k">Seller</span><span>Primary ▾</span></div>
+          <div class="stepper"><button>−</button><b>1</b><button>+</button><span class="muted small">max 112</span></div>
+          <button class="btn">Buy access · resellable</button>
+          <div class="note">You’re buying a scoped right to open this — not the file.</div>
+        </div>
+        <div class="cardx">
+          <h4>Royalty &amp; splits <span class="muted">· contract-enforced</span></h4>
+          <div class="splits"><i class="s1" style="width:55%"></i><i class="s2" style="width:20%"></i><i class="s3" style="width:15%"></i><i class="s4" style="width:10%"></i></div>
+          <div class="legend"><span><span class="dot s1"></span>Creator <b>55%</b></span><span><span class="dot s2"></span>Publisher <b>20%</b></span><span><span class="dot s3"></span>Reseller <b>15%</b></span><span><span class="dot s4"></span>Platform <b>10%</b></span></div>
+        </div>
+        <div class="cardx">
+          <h4>About</h4>
+          <div class="muted small">A short aerial film. ISCC fingerprinted. Tier-1 (MSE/DASH). Opens in the secure player — <b>no download</b>, ever.</div>
+        </div>
+        <div class="cardx">
+          <h4>Provenance</h4>
+          <div class="kv"><span class="k">Mint</span><span class="small">AssetCreated · block 12,840,221</span></div>
+          <div class="kv"><span class="k">Chain</span><span>Base</span></div>
+          <div class="kv"><span class="k">Holders</span><span>388</span></div>
+        </div>
+      </div>
+    </div>
+    <p class="muted small" style="margin:22px 0 50px">Mock only — static HTML, no data. Conveys IA + layout: medium-based sections, the access-right chip everywhere, secure watermarked previews, and the asset-detail secure-stage + commerce/trust sidebar. Real data comes from <code>content-index</code> (re-derivable cache) over <code>content-market</code>’s chain-truth decode; the buy box drives the Phase-1 re-verified-listing buy path.</p>
+  </main>
+</div>
+</body></html>
