@@ -1341,23 +1341,28 @@ impl ChainProvider {
             Err(response) => return response,
         };
         let window = Self::max_log_range().max(1);
-        // Newest-first: an asset is minted before it can be listed, so walking down from the tip
-        // surfaces the match quickly and bounds RPC for the common (recent) case.
+        // MKT-1 fail-closed GLOBAL uniqueness: accumulate EVERY distinct (operative, tokenId) that
+        // binds the KID across the WHOLE channel range — we do NOT return on the first window — and
+        // bind ONLY if exactly one exists. A hostile co-channel mint that re-uses the victim's public
+        // KID (in the same OR a newer window) produces a second distinct binder, so the resolve fails
+        // closed rather than mis-charge the buyer. The channel-topic filter keeps the scan bounded to
+        // one channel's mints; the early-exit below caps the griefing/ambiguous path.
+        let mut found: std::collections::BTreeMap<(String, String), u64> =
+            std::collections::BTreeMap::new();
         let mut to = latest;
         loop {
             let from = to.saturating_sub(window - 1).max(deploy_block);
             match self.scan_asset_created_window_for_kid(&network, &channel_topic, &want, from, to) {
-                Ok(Some((operative, token_id, block))) => {
-                    return Response::ok(json!({
-                        "content_id": format!("0x{want}"),
-                        "token_id": token_id,
-                        "operative": operative,
-                        "ledger": ledger,
-                        "block": block,
-                        "chain": network.id,
-                    }));
+                Ok(hits) => {
+                    for (operative, token_id, block) in hits {
+                        found.entry((operative, token_id)).or_insert(block);
+                    }
+                    // Once two DISTINCT binders exist, more scanning cannot make the binding unique —
+                    // fail closed now (also bounds RPC on the ambiguous/griefing path).
+                    if found.len() >= 2 {
+                        break;
+                    }
                 }
-                Ok(None) => {}
                 Err(response) => return response,
             }
             if from <= deploy_block {
@@ -1365,18 +1370,37 @@ impl ChainProvider {
             }
             to = from.saturating_sub(1);
         }
-        Response::error(
-            "token_id_not_found",
-            &format!(
-                "no AssetCreated on ledger {ledger} whose mint binds KID 0x{want} in [{deploy_block}, {latest}]"
+        match found.len() {
+            1 => {
+                let ((operative, token_id), block) = found.into_iter().next().unwrap();
+                Response::ok(json!({
+                    "content_id": format!("0x{want}"),
+                    "token_id": token_id,
+                    "operative": operative,
+                    "ledger": ledger,
+                    "block": block,
+                    "chain": network.id,
+                }))
+            }
+            0 => Response::error(
+                "token_id_not_found",
+                &format!(
+                    "no AssetCreated on ledger {ledger} whose mint binds KID 0x{want} in [{deploy_block}, {latest}]"
+                ),
             ),
-        )
+            _ => Response::error(
+                "ambiguous_kid_binding",
+                &format!(
+                    "KID 0x{want} on ledger {ledger} binds >1 distinct (operative, tokenId) — refusing to bind a possibly-hostile token (buy blocked, fail-closed)"
+                ),
+            ),
+        }
     }
 
     /// Scan one window of the channel's `AssetCreated` logs (any creator), fetch each candidate mint
     /// tx's calldata, and return the `(operative, token_id, block)` whose mint binds the KID. Split-and-
     /// retry on a range-limit error (mirrors `fetch_asset_created_logs`); the pure bind is
-    /// `pick_asset_created_binding_kid`.
+    /// `collect_kid_bindings` (union of both bind methods; the caller requires global uniqueness).
     fn scan_asset_created_window_for_kid(
         &self,
         network: &ChainNetwork,
@@ -1384,7 +1408,7 @@ impl ChainProvider {
         want_kid: &str,
         from: u64,
         to: u64,
-    ) -> Result<Option<(String, String, u64)>, Response> {
+    ) -> Result<Vec<(String, String, u64)>, Response> {
         let filter = json!({
             "fromBlock": format!("0x{from:x}"),
             "toBlock": format!("0x{to:x}"),
@@ -1395,13 +1419,15 @@ impl ChainProvider {
             Err(response) => {
                 if Self::is_range_limit_error(&response) && to.saturating_sub(from) >= MIN_LOG_RANGE {
                     let mid = from + (to - from) / 2;
-                    if let Some(hit) = self
-                        .scan_asset_created_window_for_kid(network, channel_topic, want_kid, mid + 1, to)?
-                    {
-                        return Ok(Some(hit));
-                    }
-                    return self
-                        .scan_asset_created_window_for_kid(network, channel_topic, want_kid, from, mid);
+                    // Concatenate BOTH halves — MKT-1 global uniqueness needs every binder, so a
+                    // split-retry must never drop the lower half after a hit in the upper half.
+                    let mut hits = self.scan_asset_created_window_for_kid(
+                        network, channel_topic, want_kid, mid + 1, to,
+                    )?;
+                    hits.extend(self.scan_asset_created_window_for_kid(
+                        network, channel_topic, want_kid, from, mid,
+                    )?);
+                    return Ok(hits);
                 }
                 return Err(response);
             }
@@ -1423,22 +1449,40 @@ impl ChainProvider {
         // Fetch each candidate's mint calldata (live), then bind the KID purely.
         let mut inputs = std::collections::HashMap::new();
         for (_, _, _, _, tx_hash) in &decoded {
-            if !inputs.contains_key(tx_hash) {
-                if let Some(input) = self.tx_input(network, tx_hash)? {
+            if inputs.contains_key(tx_hash) {
+                continue;
+            }
+            match self.tx_input(network, tx_hash)? {
+                Some(input) => {
                     inputs.insert(tx_hash.clone(), input);
+                }
+                // MKT-1 fail-closed-by-omission hardening: if a candidate mint's calldata cannot be
+                // fetched we CANNOT evaluate whether it binds the KID — silently skipping it could
+                // drop the legit binder and leave a hostile singleton (mis-bind). Abort the whole
+                // resolve rather than decide on a partial candidate set.
+                None => {
+                    return Err(Response::error(
+                        "candidate_input_unavailable",
+                        &format!(
+                            "mint calldata for candidate tx {tx_hash} is unavailable; refusing to resolve on a partial candidate set (fail-closed)"
+                        ),
+                    ));
                 }
             }
         }
-        let Some((operative, token_id)) = pick_asset_created_binding_kid(&decoded, &inputs, want_kid)
-        else {
-            return Ok(None);
-        };
-        let block = decoded
-            .iter()
-            .find(|entry| entry.1 == token_id && entry.0 == operative)
-            .map(|entry| entry.2)
-            .unwrap_or(from);
-        Ok(Some((operative, token_id, block)))
+        // Return ALL distinct binders in this window (with a representative block) — the caller folds
+        // them across windows and requires GLOBAL uniqueness (MKT-1 fail-closed).
+        let bindings = collect_kid_bindings(&decoded, &inputs, want_kid);
+        let mut hits = Vec::with_capacity(bindings.len());
+        for (operative, token_id) in bindings {
+            let block = decoded
+                .iter()
+                .find(|entry| entry.1 == token_id && entry.0 == operative)
+                .map(|entry| entry.2)
+                .unwrap_or(from);
+            hits.push((operative, token_id, block));
+        }
+        Ok(hits)
     }
 
     /// Discover a creator's dDRM channels via a PERSISTED, RESUMABLE factory scan. Mirrors

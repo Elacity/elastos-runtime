@@ -394,44 +394,41 @@ pub(super) fn decode_asset_created_log(entry: &Value) -> Option<(String, String,
 /// (a precise canonical `decode_mint_content_id`, else the relayer-safe `mint_input_binds_content_id`
 /// substring match). FAIL-CLOSED: `None` if no candidate binds the KID. Pure (no RPC) so it is
 /// unit-testable; the caller scans the `AssetCreated` logs + fetches each candidate's input live.
-pub(super) fn pick_asset_created_binding_kid(
+pub(super) fn collect_kid_bindings(
     decoded: &[(String, String, u64, u64, String)],
     inputs: &std::collections::HashMap<String, String>,
     want_content_id: &str,
-) -> Option<(String, String)> {
-    // Gather every candidate whose mint calldata binds the KID, split by strength: PRECISE = the
-    // canonical `mint` decode yields exactly this contentId; SUBSTRING = the relayer-safe fallback
-    // (the 16 content-derived KID bytes appear in the calldata). A unique asset has a unique KID, so
-    // in normal operation exactly ONE candidate binds. The AssetCreated scan is NOT creator-constrained
-    // (topic[1] is null), so a hostile co-channel minter could embed the victim's KID in their OWN mint
-    // calldata; we require a UNIQUE binding and FAIL CLOSED on ambiguity (>1 distinct (operative,tokenId)
-    // binding the same KID) rather than bind the wrong tokenId and mis-charge the buyer. Preferring the
-    // canonical decode means a substring-only hostile candidate cannot displace the precise legit one.
-    // (Creator-constraining the scan would also let us RESOLVE the legit asset under such griefing — the
-    // follow-on documented in protocol.rs; this pass fails closed, which protects funds.)
-    let mut precise: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
-    let mut substring: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+) -> std::collections::BTreeSet<(String, String)> {
+    // Return the UNION of every distinct (operative, tokenId) whose mint calldata BINDS the KID —
+    // by EITHER the canonical `decode_mint_content_id` (PRECISE) OR the relayer-safe
+    // `mint_input_binds_content_id` (SUBSTRING: the 16 content-derived KID bytes appear in the
+    // calldata). A unique asset has a unique KID, so in normal operation exactly ONE (operative,
+    // tokenId) binds. The AssetCreated scan is channel-scoped but NOT creator-constrained within the
+    // channel (topic[1] is null), so a hostile CO-CHANNEL minter can embed the victim's public KID in
+    // their OWN mint calldata.
+    //
+    // MKT-1 fix: we take the UNION of both methods and DO NOT prefer PRECISE over SUBSTRING. The old
+    // "prefer precise" rule let a hostile CANONICAL mint (precise) silently displace a legit RELAYED
+    // mint (which decodes only as substring) — binding the buyer to the attacker's tokenId. Surfacing
+    // BOTH binders lets the caller FAIL CLOSED on any resulting ambiguity (>1 distinct pair, here or
+    // across windows) rather than mis-charge the buyer. This trades availability (a griefer can block a
+    // resolve by minting a collision) for safety (funds are never bound to the wrong token) — the
+    // correct default on a money path. Pure (no RPC), unit-testable; the caller unions across ALL
+    // windows and requires GLOBAL uniqueness.
+    let mut bindings: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
     for (operative, token_id, _block, _log, tx_hash) in decoded {
         let Some(input) = inputs.get(tx_hash) else {
             continue;
         };
-        let is_precise = decode_mint_content_id(input)
+        let precise = decode_mint_content_id(input)
             .and_then(|cid| normalize_content_id_bytes16(&cid))
             .as_deref()
             == Some(want_content_id);
-        if is_precise {
-            precise.insert((operative.clone(), token_id.clone()));
-        } else if mint_input_binds_content_id(input, want_content_id) {
-            substring.insert((operative.clone(), token_id.clone()));
+        if precise || mint_input_binds_content_id(input, want_content_id) {
+            bindings.insert((operative.clone(), token_id.clone()));
         }
     }
-    // Prefer the canonical decode; fall back to the substring binder only when no precise binder exists.
-    // In either tier a UNIQUE binding is required — otherwise fail closed.
-    let chosen = if precise.is_empty() { &substring } else { &precise };
-    match chosen.len() {
-        1 => chosen.iter().next().cloned(),
-        _ => None, // 0 binders, or an ambiguous KID binding -> fail closed (the buy must not proceed)
-    }
+    bindings
 }
 
 /// Decode the leading `bytes16` contentId (KID) from a `mint(string,uint16,bytes,bytes)`
@@ -679,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn pick_asset_created_binding_kid_matches_via_mint_calldata() {
+    fn collect_kid_bindings_binds_the_unique_asset() {
         use std::collections::HashMap;
         let kid = "9c2a000000000000000000000000e1a1";
         let other = "00112233445566778899aabbccddeeff";
@@ -697,27 +694,25 @@ mod tests {
         let mut inputs = HashMap::new();
         inputs.insert("0xaa".to_string(), mint_a);
         inputs.insert("0xbb".to_string(), mint_b.clone());
-        // Hit: the KID resolves to candidate A's (operative, tokenId), proven by the mint calldata.
-        assert_eq!(
-            pick_asset_created_binding_kid(&decoded, &inputs, kid),
-            Some(("0xopA".to_string(), "0x07".to_string())),
-        );
-        // Miss: an unknown KID -> None (fail closed; the buy must not proceed).
-        assert!(pick_asset_created_binding_kid(&decoded, &inputs, "deadbeefdeadbeefdeadbeefdeadbeef").is_none());
+        // The KID binds exactly candidate A's (operative, tokenId) — a unique binding.
+        let b = collect_kid_bindings(&decoded, &inputs, kid);
+        assert_eq!(b.len(), 1);
+        assert!(b.contains(&("0xopA".to_string(), "0x07".to_string())));
+        // Miss: an unknown KID -> empty (fail closed; the buy must not proceed).
+        assert!(collect_kid_bindings(&decoded, &inputs, "deadbeefdeadbeefdeadbeefdeadbeef").is_empty());
         // Fail-closed: if the matching candidate's input is missing, it is skipped (no false bind).
         let mut partial = HashMap::new();
         partial.insert("0xbb".to_string(), mint_b);
-        assert!(pick_asset_created_binding_kid(&decoded, &partial, kid).is_none());
+        assert!(collect_kid_bindings(&decoded, &partial, kid).is_empty());
     }
 
     #[test]
-    fn pick_asset_created_binding_kid_fails_closed_on_ambiguous_binding() {
+    fn collect_kid_bindings_surfaces_both_binders_in_one_window_so_caller_fails_closed() {
         use std::collections::HashMap;
         let kid = "9c2a000000000000000000000000e1a1";
-        // Two AssetCreated candidates on the (creator-unconstrained) channel BOTH bind the same KID
-        // with DIFFERENT tokenIds — the legit asset (tokenId 7) and a hostile co-channel mint that
-        // re-uses the victim's KID (tokenId 0x66, newest). Binding either would mis-charge the buyer,
-        // so the resolver must FAIL CLOSED (None) rather than pick the newest candidate.
+        // Two AssetCreated candidates in ONE window BOTH bind the same KID with DIFFERENT tokenIds —
+        // the legit asset (tokenId 7) and a hostile co-channel mint re-using the victim's KID (0x66,
+        // newest). Both must SURFACE (set size 2) so the caller fails closed rather than pick newest.
         let legit =
             encode_mint_calldata("0x47cbeeb4", "ipfs://legit", 0, &encode_op_raw_free(kid).unwrap(), &[])
                 .unwrap();
@@ -731,9 +726,43 @@ mod tests {
         let mut inputs = HashMap::new();
         inputs.insert("0xaa".to_string(), legit);
         inputs.insert("0xhh".to_string(), hostile);
-        assert!(
-            pick_asset_created_binding_kid(&decoded, &inputs, kid).is_none(),
-            "ambiguous KID binding must fail closed, not bind the newest (hostile) tokenId",
+        let b = collect_kid_bindings(&decoded, &inputs, kid);
+        assert_eq!(b.len(), 2, "both binders must surface so the caller fails closed");
+    }
+
+    // MKT-1 ratchet: the cross-window attack. A hostile mint in a NEWER window and the legit mint in
+    // an OLDER window each bind the victim's KID. The resolver accumulates bindings across ALL windows
+    // (never returns on the first) and requires GLOBAL uniqueness — so the union across windows has >1
+    // distinct (operative, tokenId) and the buy FAILS CLOSED instead of binding the newer (hostile)
+    // token. This models `resolve_token_id`'s global fold with the pure per-window primitive.
+    #[test]
+    fn kid_bindings_across_windows_fail_closed_on_cross_window_collision() {
+        use std::collections::BTreeSet;
+        use std::collections::HashMap;
+        let kid = "9c2a000000000000000000000000e1a1";
+        let legit =
+            encode_mint_calldata("0x47cbeeb4", "ipfs://legit", 0, &encode_op_raw_free(kid).unwrap(), &[])
+                .unwrap();
+        let hostile =
+            encode_mint_calldata("0x47cbeeb4", "ipfs://hostile", 0, &encode_op_raw_free(kid).unwrap(), &[])
+                .unwrap();
+        // NEWER window (scanned first): the hostile mint, tokenId 0x66.
+        let newer_decoded = vec![("0xopH".to_string(), "0x66".to_string(), 900u64, 0u64, "0xhh".to_string())];
+        let mut newer_inputs = HashMap::new();
+        newer_inputs.insert("0xhh".to_string(), hostile);
+        // OLDER window (scanned second): the legit mint, tokenId 0x07.
+        let older_decoded = vec![("0xopA".to_string(), "0x07".to_string(), 100u64, 0u64, "0xaa".to_string())];
+        let mut older_inputs = HashMap::new();
+        older_inputs.insert("0xaa".to_string(), legit);
+
+        // The global fold = union of per-window binding sets (what resolve_token_id accumulates).
+        let mut global: BTreeSet<(String, String)> = BTreeSet::new();
+        global.extend(collect_kid_bindings(&newer_decoded, &newer_inputs, kid));
+        global.extend(collect_kid_bindings(&older_decoded, &older_inputs, kid));
+        assert_eq!(
+            global.len(),
+            2,
+            "a cross-window KID collision must fail closed globally, never bind the newer (hostile) token",
         );
     }
 }
