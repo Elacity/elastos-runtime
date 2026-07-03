@@ -387,6 +387,53 @@ pub(super) fn decode_asset_created_log(entry: &Value) -> Option<(String, String,
     Some((operative, token_id, block_number, log_index))
 }
 
+/// From decoded `AssetCreated` candidates — each `(operative, token_id, block, log_index, tx_hash)`,
+/// newest-first — plus a `tx_hash -> mint calldata input` map, return the `(operative, token_id)` of the
+/// first candidate whose mint calldata BINDS the target `bytes16` KID. `AssetCreated` is the only mint
+/// event that emits on Base, and it carries NO contentId — so identity is proven by the mint `opRawData`
+/// (a precise canonical `decode_mint_content_id`, else the relayer-safe `mint_input_binds_content_id`
+/// substring match). FAIL-CLOSED: `None` if no candidate binds the KID. Pure (no RPC) so it is
+/// unit-testable; the caller scans the `AssetCreated` logs + fetches each candidate's input live.
+pub(super) fn pick_asset_created_binding_kid(
+    decoded: &[(String, String, u64, u64, String)],
+    inputs: &std::collections::HashMap<String, String>,
+    want_content_id: &str,
+) -> Option<(String, String)> {
+    // Gather every candidate whose mint calldata binds the KID, split by strength: PRECISE = the
+    // canonical `mint` decode yields exactly this contentId; SUBSTRING = the relayer-safe fallback
+    // (the 16 content-derived KID bytes appear in the calldata). A unique asset has a unique KID, so
+    // in normal operation exactly ONE candidate binds. The AssetCreated scan is NOT creator-constrained
+    // (topic[1] is null), so a hostile co-channel minter could embed the victim's KID in their OWN mint
+    // calldata; we require a UNIQUE binding and FAIL CLOSED on ambiguity (>1 distinct (operative,tokenId)
+    // binding the same KID) rather than bind the wrong tokenId and mis-charge the buyer. Preferring the
+    // canonical decode means a substring-only hostile candidate cannot displace the precise legit one.
+    // (Creator-constraining the scan would also let us RESOLVE the legit asset under such griefing — the
+    // follow-on documented in protocol.rs; this pass fails closed, which protects funds.)
+    let mut precise: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    let mut substring: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    for (operative, token_id, _block, _log, tx_hash) in decoded {
+        let Some(input) = inputs.get(tx_hash) else {
+            continue;
+        };
+        let is_precise = decode_mint_content_id(input)
+            .and_then(|cid| normalize_content_id_bytes16(&cid))
+            .as_deref()
+            == Some(want_content_id);
+        if is_precise {
+            precise.insert((operative.clone(), token_id.clone()));
+        } else if mint_input_binds_content_id(input, want_content_id) {
+            substring.insert((operative.clone(), token_id.clone()));
+        }
+    }
+    // Prefer the canonical decode; fall back to the substring binder only when no precise binder exists.
+    // In either tier a UNIQUE binding is required — otherwise fail closed.
+    let chosen = if precise.is_empty() { &substring } else { &precise };
+    match chosen.len() {
+        1 => chosen.iter().next().cloned(),
+        _ => None, // 0 binders, or an ambiguous KID binding -> fail closed (the buy must not proceed)
+    }
+}
+
 /// Decode the leading `bytes16` contentId (KID) from a `mint(string,uint16,bytes,bytes)`
 /// calldata. `opRawData` is argument #2 (a dynamic `bytes`); its payload always begins with
 /// the abi-encoded `bytes16 contentId` (left-aligned in the first word), so the first 16 bytes
@@ -629,5 +676,64 @@ mod tests {
         // Fail-closed: garbage inputs.
         assert!(!mint_input_binds_content_id("not-hex", kid));
         assert!(!mint_input_binds_content_id(&relayed_hex, "deadbeef"));
+    }
+
+    #[test]
+    fn pick_asset_created_binding_kid_matches_via_mint_calldata() {
+        use std::collections::HashMap;
+        let kid = "9c2a000000000000000000000000e1a1";
+        let other = "00112233445566778899aabbccddeeff";
+        // candidate A (tokenId 7, tx 0xaa): canonical mint binds `kid`. candidate B (tokenId 9, tx 0xbb): binds `other`.
+        let mint_a =
+            encode_mint_calldata("0x47cbeeb4", "ipfs://a", 0, &encode_op_raw_free(kid).unwrap(), &[])
+                .unwrap();
+        let mint_b =
+            encode_mint_calldata("0x47cbeeb4", "ipfs://b", 0, &encode_op_raw_free(other).unwrap(), &[])
+                .unwrap();
+        let decoded = vec![
+            ("0xopA".to_string(), "0x07".to_string(), 21u64, 0u64, "0xaa".to_string()),
+            ("0xopB".to_string(), "0x09".to_string(), 20u64, 0u64, "0xbb".to_string()),
+        ];
+        let mut inputs = HashMap::new();
+        inputs.insert("0xaa".to_string(), mint_a);
+        inputs.insert("0xbb".to_string(), mint_b.clone());
+        // Hit: the KID resolves to candidate A's (operative, tokenId), proven by the mint calldata.
+        assert_eq!(
+            pick_asset_created_binding_kid(&decoded, &inputs, kid),
+            Some(("0xopA".to_string(), "0x07".to_string())),
+        );
+        // Miss: an unknown KID -> None (fail closed; the buy must not proceed).
+        assert!(pick_asset_created_binding_kid(&decoded, &inputs, "deadbeefdeadbeefdeadbeefdeadbeef").is_none());
+        // Fail-closed: if the matching candidate's input is missing, it is skipped (no false bind).
+        let mut partial = HashMap::new();
+        partial.insert("0xbb".to_string(), mint_b);
+        assert!(pick_asset_created_binding_kid(&decoded, &partial, kid).is_none());
+    }
+
+    #[test]
+    fn pick_asset_created_binding_kid_fails_closed_on_ambiguous_binding() {
+        use std::collections::HashMap;
+        let kid = "9c2a000000000000000000000000e1a1";
+        // Two AssetCreated candidates on the (creator-unconstrained) channel BOTH bind the same KID
+        // with DIFFERENT tokenIds — the legit asset (tokenId 7) and a hostile co-channel mint that
+        // re-uses the victim's KID (tokenId 0x66, newest). Binding either would mis-charge the buyer,
+        // so the resolver must FAIL CLOSED (None) rather than pick the newest candidate.
+        let legit =
+            encode_mint_calldata("0x47cbeeb4", "ipfs://legit", 0, &encode_op_raw_free(kid).unwrap(), &[])
+                .unwrap();
+        let hostile =
+            encode_mint_calldata("0x47cbeeb4", "ipfs://hostile", 0, &encode_op_raw_free(kid).unwrap(), &[])
+                .unwrap();
+        let decoded = vec![
+            ("0xopH".to_string(), "0x66".to_string(), 22u64, 0u64, "0xhh".to_string()),
+            ("0xopA".to_string(), "0x07".to_string(), 21u64, 0u64, "0xaa".to_string()),
+        ];
+        let mut inputs = HashMap::new();
+        inputs.insert("0xaa".to_string(), legit);
+        inputs.insert("0xhh".to_string(), hostile);
+        assert!(
+            pick_asset_created_binding_kid(&decoded, &inputs, kid).is_none(),
+            "ambiguous KID binding must fail closed, not bind the newest (hostile) tokenId",
+        );
     }
 }

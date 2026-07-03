@@ -259,6 +259,12 @@ impl ChainProvider {
                 &creator,
                 from_block.as_deref(),
             ),
+            Request::ResolveTokenId {
+                network,
+                ledger,
+                content_id,
+                from_block,
+            } => self.resolve_token_id(&network, &ledger, &content_id, from_block.as_deref()),
             Request::AssembleCreateChannel { channel } => self.assemble_create_channel(*channel),
             Request::AssembleTradeApproval {
                 network,
@@ -1294,6 +1300,145 @@ impl ChainProvider {
             found += 1;
         }
         Ok(found)
+    }
+
+    /// Resolve the real ledger `tokenId` for a `bytes16` KID by scanning the channel/ledger's
+    /// `AssetCreated` logs (the only mint event that emits on Base) and binding the KID via each
+    /// candidate's mint calldata (`opRawData`) — newest-first, split-and-retry. READ-ONLY
+    /// (`eth_getLogs` + `eth_getTransactionByHash`); no keys. The Phase-1 buy binds THIS, never a hash
+    /// of the content id. Fails closed if no `AssetCreated` on the ledger binds the KID.
+    fn resolve_token_id(
+        &mut self,
+        network_id: &str,
+        ledger: &str,
+        content_id: &str,
+        from_block: Option<&str>,
+    ) -> Response {
+        let network = match self.evm_network(network_id) {
+            Ok(network) => network.clone(),
+            Err(response) => return response,
+        };
+        if let Err(err) = validate_evm_address(ledger) {
+            return Response::error("invalid_ledger", &err);
+        }
+        let want = match normalize_content_id_bytes16(content_id) {
+            Some(kid) => kid,
+            None => return Response::error("invalid_content_id", "content_id is not a bytes16 KID"),
+        };
+        let channel_topic = match address_topic(ledger) {
+            Ok(topic) => topic,
+            Err(err) => return Response::error("invalid_ledger", &err),
+        };
+        let deploy_block = match from_block {
+            Some(value) => match parse_hex_u64(value.trim()) {
+                Ok(value) => value,
+                Err(err) => return Response::error("invalid_from_block", &err),
+            },
+            None => DEFAULT_CHANNEL_FROM_BLOCK,
+        };
+        let latest = match self.evm_latest_block(&network) {
+            Ok(latest) => latest,
+            Err(response) => return response,
+        };
+        let window = Self::max_log_range().max(1);
+        // Newest-first: an asset is minted before it can be listed, so walking down from the tip
+        // surfaces the match quickly and bounds RPC for the common (recent) case.
+        let mut to = latest;
+        loop {
+            let from = to.saturating_sub(window - 1).max(deploy_block);
+            match self.scan_asset_created_window_for_kid(&network, &channel_topic, &want, from, to) {
+                Ok(Some((operative, token_id, block))) => {
+                    return Response::ok(json!({
+                        "content_id": format!("0x{want}"),
+                        "token_id": token_id,
+                        "operative": operative,
+                        "ledger": ledger,
+                        "block": block,
+                        "chain": network.id,
+                    }));
+                }
+                Ok(None) => {}
+                Err(response) => return response,
+            }
+            if from <= deploy_block {
+                break;
+            }
+            to = from.saturating_sub(1);
+        }
+        Response::error(
+            "token_id_not_found",
+            &format!(
+                "no AssetCreated on ledger {ledger} whose mint binds KID 0x{want} in [{deploy_block}, {latest}]"
+            ),
+        )
+    }
+
+    /// Scan one window of the channel's `AssetCreated` logs (any creator), fetch each candidate mint
+    /// tx's calldata, and return the `(operative, token_id, block)` whose mint binds the KID. Split-and-
+    /// retry on a range-limit error (mirrors `fetch_asset_created_logs`); the pure bind is
+    /// `pick_asset_created_binding_kid`.
+    fn scan_asset_created_window_for_kid(
+        &self,
+        network: &ChainNetwork,
+        channel_topic: &str,
+        want_kid: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Option<(String, String, u64)>, Response> {
+        let filter = json!({
+            "fromBlock": format!("0x{from:x}"),
+            "toBlock": format!("0x{to:x}"),
+            "topics": [ASSET_CREATED_TOPIC0, Value::Null, channel_topic],
+        });
+        let logs = match self.evm_rpc_logs(network, filter) {
+            Ok(logs) => logs,
+            Err(response) => {
+                if Self::is_range_limit_error(&response) && to.saturating_sub(from) >= MIN_LOG_RANGE {
+                    let mid = from + (to - from) / 2;
+                    if let Some(hit) = self
+                        .scan_asset_created_window_for_kid(network, channel_topic, want_kid, mid + 1, to)?
+                    {
+                        return Ok(Some(hit));
+                    }
+                    return self
+                        .scan_asset_created_window_for_kid(network, channel_topic, want_kid, from, mid);
+                }
+                return Err(response);
+            }
+        };
+        let entries = logs.as_array().ok_or_else(|| {
+            Response::error("upstream_invalid_logs", "eth_getLogs result was not an array")
+        })?;
+        let mut decoded: Vec<(String, String, u64, u64, String)> = Vec::new();
+        for log in entries {
+            let Some((operative, token_id, block, log_index)) = decode_asset_created_log(log) else {
+                continue;
+            };
+            let Some(tx_hash) = log.get("transactionHash").and_then(Value::as_str) else {
+                continue;
+            };
+            decoded.push((operative, token_id, block, log_index, tx_hash.to_string()));
+        }
+        decoded.sort_by(|a, b| (b.2, b.3).cmp(&(a.2, a.3))); // newest-first
+        // Fetch each candidate's mint calldata (live), then bind the KID purely.
+        let mut inputs = std::collections::HashMap::new();
+        for (_, _, _, _, tx_hash) in &decoded {
+            if !inputs.contains_key(tx_hash) {
+                if let Some(input) = self.tx_input(network, tx_hash)? {
+                    inputs.insert(tx_hash.clone(), input);
+                }
+            }
+        }
+        let Some((operative, token_id)) = pick_asset_created_binding_kid(&decoded, &inputs, want_kid)
+        else {
+            return Ok(None);
+        };
+        let block = decoded
+            .iter()
+            .find(|entry| entry.1 == token_id && entry.0 == operative)
+            .map(|entry| entry.2)
+            .unwrap_or(from);
+        Ok(Some((operative, token_id, block)))
     }
 
     /// Discover a creator's dDRM channels via a PERSISTED, RESUMABLE factory scan. Mirrors

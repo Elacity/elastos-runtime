@@ -216,6 +216,24 @@ pub(super) enum Request {
         #[serde(default)]
         from_block: Option<String>,
     },
+    /// Resolve the REAL on-chain ledger `tokenId` for a `bytes16` content id (KID) by scanning the
+    /// channel's `AssetCreated` logs (the only mint event that emits on Base; it carries NO contentId)
+    /// and binding the KID through each candidate's mint `opRawData` calldata — preferring the canonical
+    /// `mint(string,uint16,bytes,bytes)` decode over the relayer-safe substring match. READ-ONLY
+    /// (`eth_getLogs` + per-candidate `eth_getTransactionByHash`); no keys. The Phase-1 buy MUST bind
+    /// this, never `word_from_id(content_id)`. FAILS CLOSED on no match OR an AMBIGUOUS binding (>1
+    /// distinct tokenId binds the KID) — the scan is not yet creator-constrained, so ambiguity is
+    /// treated as a hostile co-channel mint and the buy is refused. `ledger` is the channel ERC-1155
+    /// (`metadata.properties.ledger`). Follow-on: creator-constrain the scan to also RESOLVE the legit
+    /// asset under such griefing (and/or use `DigitalAssetRegistered` on the channel/factory contract,
+    /// which carries the indexed tokenId + bytes16 contentId but does NOT emit on EventHub).
+    ResolveTokenId {
+        network: String,
+        ledger: String,
+        content_id: String,
+        #[serde(default)]
+        from_block: Option<String>,
+    },
     /// Assemble the `createChannel(uint8,uint8,string,string,bytes)` calldata (PURE: no RPC,
     /// no keys) — the `{ to, data, value }` an external signer (wallet-provider) signs and
     /// `broadcast_transaction` sends to deploy a new channel. Mirrors `AssembleMint`.
