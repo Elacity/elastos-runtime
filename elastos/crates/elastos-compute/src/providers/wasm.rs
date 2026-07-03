@@ -613,6 +613,7 @@ impl WasmProvider {
     }
 
     /// Execute a WASM module with WASI preview1.
+    #[allow(clippy::too_many_arguments)]
     fn execute_wasm(
         engine: &Engine,
         module: &Module,

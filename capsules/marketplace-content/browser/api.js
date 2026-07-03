@@ -227,7 +227,8 @@ window.API = (function () {
       return liveMode() ? [] : window.MOCK.owned;
     },
     // Hand off to the EXISTING runtime open path (POST /api/viewers/open). The marketplace renders nothing;
-    // the runtime gates rights, recovers the CEK in decrypt-provider, and opens the player.
+    // the runtime gates rights, recovers the CEK inside its protected-content decrypt boundary, and opens
+    // the player.
     async open(uri) {
       if (!uri) return null;
       const r = await fetch("/api/viewers/open", {

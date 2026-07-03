@@ -461,7 +461,8 @@
 
   // Hand off to the EXISTING runtime open path — the marketplace renders NOTHING. In the runtime this emits
   // a Library "open" launch (or POST /api/viewers/open { uri }); the runtime gates rights, recovers the CEK
-  // inside decrypt-provider, and opens elacity-player/ddrm-viewer (chosen by mime). Standalone: mock the handoff.
+  // inside its protected-content decrypt boundary, and opens elacity-player/ddrm-viewer (chosen by mime).
+  // Standalone: mock the handoff.
   // Resolve an owned asset's Library URI: from the listing, then the Vault (by content CID), then — if it's
   // held on-chain but not yet downloaded locally — by ACQUIRING it now. Acquire re-checks
   // hasAccessByContentId server-side and holds no keys (P15); it fails closed if you don't actually own it.
