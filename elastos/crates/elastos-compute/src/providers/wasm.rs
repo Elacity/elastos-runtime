@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -78,6 +79,11 @@ struct RunningInstance {
     /// Per-launch carrier directory (only set when bridge ran via FIFO transport).
     /// Cleaned up on `Drop` so dropped instances don't leak FIFOs into /tmp.
     carrier_dir: Option<PathBuf>,
+    /// Set by `stop()` to terminate an in-flight execution. The execution's epoch-deadline
+    /// callback checks this flag and traps the capsule — the only way to halt a runaway,
+    /// since execution runs in a `spawn_blocking` task that cannot be cancelled. Fuel and
+    /// the wall-clock deadline bound a runaway passively; this is the operator's on-demand kill.
+    should_stop: Arc<AtomicBool>,
 }
 
 impl Drop for RunningInstance {
@@ -228,6 +234,9 @@ impl WasmProvider {
     fn engine() -> Result<Engine> {
         let mut config = Config::new();
         config.consume_fuel(true);
+        // Epoch-based interruption so a runaway capsule can be trapped on demand by `stop()`
+        // (fuel and the wall-clock deadline only bound it passively, after the fact).
+        config.epoch_interruption(true);
         Engine::new(&config)
             .map_err(|e| ElastosError::Compute(format!("Failed to configure WASM engine: {}", e)))
     }
@@ -612,6 +621,7 @@ impl WasmProvider {
         capsule_id: String,
         principal_id: Option<String>,
         limits: WasmExecutionLimits,
+        should_stop: Arc<AtomicBool>,
     ) -> Result<()> {
         let mut store = Store::new(
             engine,
@@ -627,6 +637,19 @@ impl WasmProvider {
         store
             .set_fuel(limits.fuel)
             .map_err(|e| ElastosError::Compute(format!("Failed to set WASM fuel: {}", e)))?;
+
+        // Terminability: arm an epoch deadline whose callback traps the capsule when `stop()` has
+        // set `should_stop` (and bumped the engine epoch). With no stop signal the deadline simply
+        // keeps extending, so a legitimate (even long-running) capsule runs untouched. The epoch
+        // check is a cheap load+compare at loop backedges; fuel/wall-clock still bound the run.
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_callback(move |_| {
+            if should_stop.load(Ordering::Relaxed) {
+                Err(wasmtime::Error::msg("capsule terminated by stop request"))
+            } else {
+                Ok(wasmtime::UpdateDeadline::Continue(1))
+            }
+        });
 
         // Create linker and bind WASI preview1 host functions.
         let mut linker = Linker::new(engine);
@@ -710,6 +733,7 @@ impl ComputeProvider for WasmProvider {
             manifest: manifest.clone(),
             _data_dir: data_dir,
             carrier_dir: None,
+            should_stop: Arc::new(AtomicBool::new(false)),
         };
 
         self.instances.write().await.insert(id.clone(), instance);
@@ -725,7 +749,7 @@ impl ComputeProvider for WasmProvider {
 
     async fn start(&self, handle: &CapsuleHandle) -> Result<()> {
         // Get instance data
-        let (engine, module, manifest, limits) = {
+        let (engine, module, manifest, limits, should_stop) = {
             let instances = self.instances.read().await;
             let instance = instances
                 .get(&handle.id)
@@ -736,8 +760,11 @@ impl ComputeProvider for WasmProvider {
                 instance.module.clone(),
                 instance.manifest.clone(),
                 self.execution_limits,
+                instance.should_stop.clone(),
             )
         };
+        // A fresh run must not inherit a stale stop signal.
+        should_stop.store(false, Ordering::Relaxed);
 
         // Mark as running before execution
         {
@@ -790,6 +817,7 @@ impl ComputeProvider for WasmProvider {
 
         // Execute in a blocking task since wasmtime execution is synchronous
         let capsule_id = handle.id.0.clone();
+        let exec_stop = should_stop.clone();
         let result = tokio::task::spawn_blocking(move || {
             Self::execute_wasm(
                 &engine,
@@ -799,6 +827,7 @@ impl ComputeProvider for WasmProvider {
                 capsule_id,
                 principal_id,
                 limits,
+                exec_stop,
             )
         });
         let result = tokio::time::timeout(limits.wall_clock_timeout, result)
@@ -830,6 +859,13 @@ impl ComputeProvider for WasmProvider {
         let mut instances = self.instances.write().await;
 
         if let Some(instance) = instances.remove(&handle.id) {
+            // Signal any in-flight execution to terminate: set the flag the capsule's
+            // epoch-deadline callback checks, then bump this capsule's engine epoch so a
+            // spinning capsule hits its next epoch check and traps. `instance` is the removed
+            // (owned) value, but its `should_stop` and `engine` are shared with the running
+            // task (Arc / cloned Engine), so the signal reaches it.
+            instance.should_stop.store(true, Ordering::Relaxed);
+            instance.engine.increment_epoch();
             // Dropping the RunningInstance releases the wasmtime Engine, Module,
             // and any compiled code buffers.  This is the primary memory-clearing
             // step for multi-tenant safety — no residual WASM heap survives.
@@ -952,12 +988,64 @@ mod tests {
             "fuel-test".to_string(),
             None,
             limits,
+            Arc::new(AtomicBool::new(false)),
         )
         .expect_err("busy-loop capsule must exhaust fuel");
 
         assert!(
             err.to_string().contains("fuel") || err.to_string().contains("WASM execution failed"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// B2a (restored from the ddrm-hardening line): a runaway capsule MUST be terminable on
+    /// demand. With no stop signal the epoch deadline keeps extending (legitimate capsules run
+    /// free); when `stop()` sets the flag and bumps the epoch, the capsule traps on its next
+    /// backedge. Fuel is set effectively-unbounded here so the trap can ONLY come from the stop
+    /// signal — this proves the operator kill, not passive fuel exhaustion. The loop is finite
+    /// (a CI-hang backstop): if termination were broken, `recv_timeout` fails the test in 5 s
+    /// and the thread still ends on its own.
+    #[test]
+    fn runaway_capsule_is_terminable_via_stop_signal() {
+        let engine = WasmProvider::engine().expect("engine");
+        let module = Module::new(
+            &engine,
+            r#"(module (func (export "_start")
+                (local $i i64) (local.set $i (i64.const 2000000000))
+                (loop $l
+                    (local.set $i (i64.sub (local.get $i) (i64.const 1)))
+                    (br_if $l (i64.ne (local.get $i) (i64.const 0))))))"#,
+        )
+        .expect("compile wat");
+        let limits = WasmExecutionLimits {
+            fuel: u64::MAX,
+            ..WasmExecutionLimits::default()
+        };
+        let should_stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (ss, eng, module2) = (should_stop.clone(), engine.clone(), module.clone());
+        std::thread::spawn(move || {
+            let r = WasmProvider::execute_wasm(
+                &eng,
+                &module2,
+                WasiCtxBuilder::new().build_p1(),
+                None,
+                "runaway-test".to_string(),
+                None,
+                limits,
+                ss,
+            );
+            let _ = tx.send(r.is_err());
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50)); // let it start spinning
+        should_stop.store(true, Ordering::Relaxed);
+        engine.increment_epoch();
+        let trapped = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a stopped runaway must terminate within 5s, not run forever");
+        assert!(
+            trapped,
+            "a stopped runaway must trap (Err), not complete normally"
         );
     }
 
@@ -986,6 +1074,7 @@ mod tests {
             "memory-limit-test".to_string(),
             None,
             limits,
+            Arc::new(AtomicBool::new(false)),
         )
         .expect_err("capsule memory must be limited");
 
@@ -1182,6 +1271,7 @@ mod tests {
                 manifest: dummy_manifest,
                 _data_dir: None,
                 carrier_dir: Some(dir.clone()),
+                should_stop: Arc::new(AtomicBool::new(false)),
             };
             assert!(dir.exists(), "dir must still exist while instance is alive");
         }
