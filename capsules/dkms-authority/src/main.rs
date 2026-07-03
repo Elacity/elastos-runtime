@@ -97,6 +97,32 @@ const OPERATOR_VK_ENV: &str = "DKMS_AUTHORITY_OPERATOR_VK";
 /// credential, the analogue of PC2's session TTL (`mediaSessionManager` lifetime).
 const SESSION_TTL_SECONDS: u64 = 300;
 
+/// Per-connection read timeout (ELACITY-2282 Defect A insurance). Bounds an idle/stalled read so a
+/// leaked or abandoned client connection can never camp its serving thread forever; the read then
+/// errors and the connection thread ends. Applied on BOTH the Unix and TCP serve loops. A live
+/// pooled client re-establishes on the next release if it idled past this window.
+const CONNECTION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Cap on concurrently-served connection threads (ELACITY-2282 hardening). Each accepted connection
+/// is served on its OWN thread; without a bound, a hostile peer that opens many connections and
+/// trickles a byte slower than [`CONNECTION_READ_TIMEOUT`] to keep each alive would spawn an
+/// UNBOUNDED number of threads and exhaust the node's threads/memory — and taking 2-of-3 quorum
+/// nodes down drops every release below threshold. Once this many connections are in flight, further
+/// accepts are dropped (the socket is closed) until a slot frees, so a slow-loris peer can occupy at
+/// most this many slots rather than crash the daemon. Sized generously so legitimate pooled clients
+/// are never turned away in practice.
+const MAX_ACTIVE_CONNECTIONS: usize = 512;
+
+/// The daemon-lifetime REVOKED-caller set (Day 109–112), shared LIVE across every connection thread
+/// via one `Arc`. A revocation performed on ANY connection is visible IMMEDIATELY to every other
+/// connection's gates, so "revocation outranks a live session" holds across concurrency — not only
+/// after the revoking connection closes (the ELACITY-2282 thread-per-connection follow-up: the old
+/// per-connection snapshot merged additions back only on close, leaving a revoked caller with a warm
+/// pooled connection served until the revoker disconnected). A node restart clears it, at which point
+/// the operator's allow-list is the standing gate. A poisoned lock is recovered (`into_inner`): a
+/// peer panic never corrupts the set, and the gate must still read it (fail-closed, never fail-open).
+type RevokedSet = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<Vec<u8>>>>;
+
 /// A node-issued, node-signed SESSION TOKEN: it binds the client's handshake `challenge` AND the
 /// caller's ephemeral PUBLIC key (`caller_pub_b64`) to an `expires_at`, and the node SIGNS
 /// `(challenge, caller_pub, expires_at)` with its master-derived key. The node REQUIRES one on every
@@ -591,12 +617,15 @@ struct DkmsAuthorityNode {
     /// signatures authorize `rotate_share` + `revoke_caller`. Set by the OPERATOR at daemon start
     /// (env), never by the connecting client. `None` = lifecycle ops fail closed.
     operator_vk: Option<Vec<u8>>,
-    /// Callers REVOKED at runtime (Day 109–112): their `hello` is refused and a `recover` under a
-    /// still-live session token is refused (revocation outranks a live session). Daemon-lifetime
-    /// state shared across connections (a revoked caller stays revoked on the next connection).
-    /// In-memory like PC2's `revokedDelegations` map (`utils/secureViewSession.ts:374`) — a node
-    /// restart clears it, at which point the operator's allow-list is the standing gate.
-    revoked_callers: Vec<Vec<u8>>,
+    /// Callers REVOKED at runtime (Day 109–112) — see [`RevokedSet`]. Their `hello` is refused and a
+    /// `recover` under a still-live session token is refused (revocation outranks a live session).
+    /// Shared LIVE across all connection threads (the same `Arc` every thread holds), so a revocation
+    /// is enforced the instant the operator's `revoke_caller` lands — on every already-open connection,
+    /// not just future ones. In-memory like PC2's `revokedDelegations` map
+    /// (`utils/secureViewSession.ts:374`) — a node restart clears it, at which point the operator's
+    /// allow-list is the standing gate. `#[derive(Default)]` gives a freshly-constructed node its OWN
+    /// empty set; the serve loop wires every connection to ONE shared set instead.
+    revoked_callers: RevokedSet,
 }
 
 impl DkmsAuthorityNode {
@@ -813,7 +842,7 @@ impl DkmsAuthorityNode {
         }
         // REVOCATION GATE (Day 109–112): a caller the operator revoked at runtime is refused at the
         // handshake even though it is still on the allow-list — no new session is ever minted for it.
-        if self.revoked_callers.iter().any(|vk| vk.as_slice() == caller_pub.as_slice()) {
+        if self.is_caller_revoked(caller_pub.as_slice()) {
             return Response::error(
                 "caller_revoked",
                 "caller identity has been revoked by the operator — this node no longer serves it",
@@ -963,7 +992,7 @@ impl DkmsAuthorityNode {
         // delegation nonce is read back per request BEFORE the session view is resurrected,
         // `secureViewSession.ts:104`–`:112`.)
         if let Ok(token_caller) = b64().decode(&args.session_token.caller_pub_b64) {
-            if self.revoked_callers.iter().any(|vk| vk.as_slice() == token_caller.as_slice()) {
+            if self.is_caller_revoked(token_caller.as_slice()) {
                 return Response::error(
                     "caller_revoked",
                     "caller identity has been revoked by the operator — a live session does not outrank a revocation",
@@ -1265,10 +1294,23 @@ impl DkmsAuthorityNode {
                 "revocation refused: the signature does not verify under the pinned operator identity",
             );
         }
-        if !self.revoked_callers.iter().any(|vk| vk.as_slice() == caller_pub.as_slice()) {
-            self.revoked_callers.push(caller_pub);
-        }
+        // Insert into the SHARED live set: the revocation binds every other open connection's gates
+        // at once (HashSet insertion is idempotent, so a repeat revoke is a no-op).
+        self.revoked_callers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(caller_pub);
         Response::ok(json!({ "revoked": true }))
+    }
+
+    /// True iff `vk` is in the shared daemon-lifetime revocation set, read LIVE (a revocation on any
+    /// connection is visible here immediately). Recovers the guard if a peer thread poisoned the lock
+    /// — the set's data survives a panic and the gate must never fail open.
+    fn is_caller_revoked(&self, vk: &[u8]) -> bool {
+        self.revoked_callers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(vk)
     }
 
     /// QUORUM RECONFIGURATION — CONTRIBUTE (Day 121–125). This OLD quorum member re-shares its share
@@ -2078,28 +2120,128 @@ fn serve_socket(path: &str) {
     if operator_vk.is_some() {
         eprintln!("dkms-authority: operator identity pinned (lifecycle ops enabled)");
     }
-    let mut revoked_callers: Vec<Vec<u8>> = Vec::new();
     eprintln!("dkms-authority: listening on {path}");
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let reader = match stream.try_clone() {
-                    Ok(s) => io::BufReader::new(s),
-                    Err(err) => {
-                        eprintln!("dkms-authority: connection clone failed: {err}");
-                        continue;
-                    }
-                };
-                // The Unix transport is host-local (filesystem-permissioned), so the encrypted
-                // channel is OPTIONAL here — a client that offers a channel key still gets one.
-                serve_connection_io(reader, stream, &allowed_callers, &operator_vk, &mut revoked_callers, false);
-            }
+    serve_unix_listener(listener, allowed_callers, operator_vk);
+}
+
+/// A transport an accepted connection can be served over (Unix or TCP). Abstracts the two
+/// otherwise-identical accept loops behind one generic [`serve_accept_loop`], so the per-connection
+/// lifecycle — read-timeout arming, reader split, concurrency cap, thread spawn — lives in EXACTLY
+/// one place and can never diverge between the host-local and hostile-network transports.
+#[cfg(unix)]
+trait AcceptedConn: io::Write + Send + Sized + 'static {
+    /// An independent, buffered read handle over the same connection.
+    type Reader: io::Read + Send + 'static;
+    /// Bound every read on this connection (idle/stall insurance, ELACITY-2282 Defect A).
+    fn arm_read_timeout(&self);
+    /// A buffered reader over a clone of this connection (the write half stays on `self`).
+    fn split_reader(&self) -> io::Result<Self::Reader>;
+}
+
+#[cfg(unix)]
+impl AcceptedConn for std::os::unix::net::UnixStream {
+    type Reader = io::BufReader<std::os::unix::net::UnixStream>;
+    fn arm_read_timeout(&self) {
+        let _ = self.set_read_timeout(Some(CONNECTION_READ_TIMEOUT));
+    }
+    fn split_reader(&self) -> io::Result<Self::Reader> {
+        Ok(io::BufReader::new(self.try_clone()?))
+    }
+}
+
+#[cfg(unix)]
+impl AcceptedConn for std::net::TcpStream {
+    type Reader = io::BufReader<std::net::TcpStream>;
+    fn arm_read_timeout(&self) {
+        let _ = self.set_read_timeout(Some(CONNECTION_READ_TIMEOUT));
+    }
+    fn split_reader(&self) -> io::Result<Self::Reader> {
+        Ok(io::BufReader::new(self.try_clone()?))
+    }
+}
+
+/// RAII guard for one slot in the [`MAX_ACTIVE_CONNECTIONS`] budget: decrements the active-connection
+/// counter when a served connection ends — normal return OR panic — so the cap can never leak slots.
+#[cfg(unix)]
+struct ActiveSlot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+#[cfg(unix)]
+impl Drop for ActiveSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// The shared accept loop for BOTH transports (ELACITY-2282). Each accepted connection is served on
+/// its OWN thread so a single idle/slow/leaked client can never head-of-line-block the others — the
+/// daemon always returns to `accept`. The daemon-lifetime revoked-caller set is shared LIVE across
+/// every connection thread (one `Arc`, see [`RevokedSet`]), so a revocation binds every open
+/// connection immediately. Concurrency is bounded by [`MAX_ACTIVE_CONNECTIONS`]: past the cap, a new
+/// connection is dropped rather than spawning an unbounded thread, so a slow-loris peer cannot
+/// exhaust the node. `require_channel` distinguishes the hostile-network TCP transport (a plaintext
+/// recover is refused) from the host-local Unix transport.
+#[cfg(unix)]
+fn serve_accept_loop<S, I>(
+    incoming: I,
+    allowed_callers: Option<Vec<Vec<u8>>>,
+    operator_vk: Option<Vec<u8>>,
+    require_channel: bool,
+) where
+    S: AcceptedConn,
+    I: IntoIterator<Item = io::Result<S>>,
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let allowed_callers = Arc::new(allowed_callers);
+    let operator_vk = Arc::new(operator_vk);
+    let revoked_callers: RevokedSet = RevokedSet::default();
+    let active = Arc::new(AtomicUsize::new(0));
+    for stream in incoming {
+        let stream = match stream {
+            Ok(stream) => stream,
             Err(err) => {
                 eprintln!("dkms-authority: accept error: {err}");
                 continue;
             }
+        };
+        stream.arm_read_timeout();
+        let reader = match stream.split_reader() {
+            Ok(reader) => reader,
+            Err(err) => {
+                eprintln!("dkms-authority: connection clone failed: {err}");
+                continue;
+            }
+        };
+        // CONCURRENCY CAP (ELACITY-2282 hardening): claim a slot atomically. At the cap, roll the
+        // claim back and DROP this connection (the reader + stream close on scope exit) rather than
+        // spawn an unbounded thread — a slow-loris peer can hold at most the cap, not exhaust us.
+        if active.fetch_add(1, Ordering::AcqRel) >= MAX_ACTIVE_CONNECTIONS {
+            active.fetch_sub(1, Ordering::AcqRel);
+            eprintln!(
+                "dkms-authority: connection cap reached ({MAX_ACTIVE_CONNECTIONS}) — dropping connection"
+            );
+            continue;
         }
+        let slot = ActiveSlot(Arc::clone(&active));
+        let allowed = Arc::clone(&allowed_callers);
+        let operator = Arc::clone(&operator_vk);
+        let revoked = revoked_callers.clone();
+        std::thread::spawn(move || {
+            let _slot = slot; // released (counter decremented) when this connection thread ends
+            serve_connection_io(reader, stream, &allowed, &operator, &revoked, require_channel);
+        });
     }
+}
+
+/// The Unix accept loop, factored out of [`serve_socket`] so it can be driven over a test-owned
+/// listener. The Unix transport is host-local (filesystem-permissioned), so the encrypted channel is
+/// OPTIONAL (`require_channel = false`): a client that offers a channel key still gets one.
+#[cfg(unix)]
+fn serve_unix_listener(
+    listener: std::os::unix::net::UnixListener,
+    allowed_callers: Option<Vec<Vec<u8>>>,
+    operator_vk: Option<Vec<u8>>,
+) {
+    serve_accept_loop(listener.incoming(), allowed_callers, operator_vk, false);
 }
 
 /// TCP serve mode (Day 105–108): the node taken OFF localhost — a REAL network listener with the
@@ -2127,29 +2269,20 @@ fn serve_tcp(addr: &str) {
     if operator_vk.is_some() {
         eprintln!("dkms-authority: operator identity pinned (lifecycle ops enabled)");
     }
-    let mut revoked_callers: Vec<Vec<u8>> = Vec::new();
     eprintln!("dkms-authority: listening on tcp:{addr}");
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                // NETWORK-FAULT SEMANTICS: a stalled remote peer must not wedge the sequential
-                // daemon — bound every read so the listener always gets back to `accept`.
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-                let reader = match stream.try_clone() {
-                    Ok(s) => io::BufReader::new(s),
-                    Err(err) => {
-                        eprintln!("dkms-authority: connection clone failed: {err}");
-                        continue;
-                    }
-                };
-                serve_connection_io(reader, stream, &allowed_callers, &operator_vk, &mut revoked_callers, true);
-            }
-            Err(err) => {
-                eprintln!("dkms-authority: accept error: {err}");
-                continue;
-            }
-        }
-    }
+    serve_tcp_listener(listener, allowed_callers, operator_vk);
+}
+
+/// The TCP accept loop, factored out of [`serve_tcp`]. Like the Unix loop it serves each connection
+/// on its OWN thread (ELACITY-2282); every recover on this hostile transport still REQUIRES the
+/// encrypted, mutually-authenticated channel (`require_channel = true`).
+#[cfg(unix)]
+fn serve_tcp_listener(
+    listener: std::net::TcpListener,
+    allowed_callers: Option<Vec<Vec<u8>>>,
+    operator_vk: Option<Vec<u8>>,
+) {
+    serve_accept_loop(listener.incoming(), allowed_callers, operator_vk, true);
 }
 
 /// Parse the OPERATOR's KNOWN-caller allow-list from `ALLOWED_CALLERS_ENV`: a comma-separated list
@@ -2212,15 +2345,16 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
     mut writer: W,
     allowed_callers: &Option<Vec<Vec<u8>>>,
     operator_vk: &Option<Vec<u8>>,
-    revoked_callers: &mut Vec<Vec<u8>>,
+    revoked_callers: &RevokedSet,
     require_channel: bool,
 ) {
     use ddrm_envelope::frame::{read_frame, write_frame};
     let mut node = DkmsAuthorityNode {
         allowed_callers: allowed_callers.clone(),
         operator_vk: operator_vk.clone(),
-        // Seed this connection with the daemon-lifetime revoked set (a caller revoked on an
-        // earlier connection stays revoked here); write any additions back when we're done.
+        // Share the ONE daemon-lifetime revoked set (an `Arc` clone, not a snapshot): revocations
+        // this connection performs are visible to every other open connection immediately, and
+        // revocations they perform are visible here immediately.
         revoked_callers: revoked_callers.clone(),
         ..DkmsAuthorityNode::default()
     };
@@ -2348,9 +2482,8 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
             break;
         }
     }
-    // Persist any revocations this connection performed into the daemon-lifetime set, so they bind
-    // every FUTURE connection too (a revoked caller cannot just reconnect).
-    *revoked_callers = node.revoked_callers;
+    // No write-back needed: `node.revoked_callers` IS the shared daemon-lifetime set (an `Arc`
+    // clone), so every revocation was already published to all connections the instant it landed.
 }
 
 /// Write one response frame: SEALED to the client's channel key (+ signed by the node, AAD-bound to
@@ -2413,6 +2546,134 @@ mod tests {
             .join(format!("dkms-node-{tag}-{}-{nanos}.json", std::process::id()))
             .to_string_lossy()
             .into_owned()
+    }
+
+    /// A SHORT temp Unix-socket path — macOS `sun_path` is only 104 bytes and `temp_dir()` is long,
+    /// so bind under `/tmp` to stay well under the limit.
+    #[cfg(unix)]
+    fn unique_socket_path(tag: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("/tmp/dkms-{tag}-{}-{nanos}.sock", std::process::id())
+    }
+
+    /// ELACITY-2282 (regression): a single idle client must NOT head-of-line-block the accept loop.
+    /// Drive the real Unix accept loop (`serve_unix_listener`) with connection A held idle — it never
+    /// sends a frame, so its serving read blocks — and assert a SECOND client B is still served
+    /// promptly. Before the thread-per-connection fix, A wedged the sequential loop and B starved in
+    /// the kernel backlog until the client's hard cap → fail-closed quorum.
+    #[test]
+    #[cfg(unix)]
+    fn idle_connection_does_not_block_other_clients() {
+        use ddrm_envelope::frame::{read_frame, write_frame};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::time::Duration;
+
+        let path = unique_socket_path("hol");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        // Anonymous (no allow-list), no operator — `status` is a public message that answers here.
+        std::thread::spawn(move || serve_unix_listener(listener, None, None));
+
+        // Client A connects and stays IDLE (sends nothing): its serving thread blocks in read_frame.
+        let idle = UnixStream::connect(&path).unwrap();
+        std::thread::sleep(Duration::from_millis(150)); // let A be accepted + block
+
+        // Client B must still be served promptly while A is idle.
+        let mut b = UnixStream::connect(&path).unwrap();
+        b.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        write_frame(&mut b, &serde_json::to_vec(&json!({ "op": "status" })).unwrap()).unwrap();
+        let resp = read_frame(&mut b)
+            .expect("client B must be served while A is idle (no head-of-line block)")
+            .expect("a framed response");
+        let resp: Value = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(resp["status"].as_str().unwrap(), "ok");
+        assert_eq!(resp["data"]["provider"].as_str().unwrap(), "dkms-authority");
+
+        drop(idle);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ELACITY-2282 (regression, shared-live revocation): a revoke performed on ONE connection must
+    /// bind every OTHER already-open connection IMMEDIATELY — not only after the revoking connection
+    /// closes. Two `DkmsAuthorityNode`s sharing the daemon-lifetime revoked set model two concurrent
+    /// connections exactly as `serve_accept_loop` wires them (one shared `Arc`). Before the fix each
+    /// connection held a private snapshot merged back only on close, so a revoked caller holding a
+    /// warm pooled connection kept being served until the operator's connection disconnected.
+    #[test]
+    #[cfg(unix)]
+    fn revocation_binds_other_open_connections_immediately() {
+        let shared: RevokedSet = RevokedSet::default();
+        let (operator, operator_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x6Fu8; 32]);
+        let (_caller_signer, caller_vk) = caller_keypair();
+        let caller_vk_b64 = b64().encode(&caller_vk);
+
+        // Connection B: the caller's own connection — initialized and serving its `hello`.
+        let store = unique_store("revoke-shared-b");
+        let mut conn_b = DkmsAuthorityNode { revoked_callers: shared.clone(), ..Default::default() };
+        conn_b.init(json!({ "authority_key_store": store.clone() }));
+        let challenge = b64().encode([0xA1u8; 32]);
+        assert!(
+            matches!(conn_b.hello(&challenge, &caller_vk_b64, Some(NOW), None), Response::Ok { .. }),
+            "before revocation the caller is served",
+        );
+
+        // Connection A: the operator's admin connection — revokes the caller while B stays OPEN.
+        let mut conn_a = DkmsAuthorityNode {
+            operator_vk: Some(operator_vk),
+            revoked_callers: shared.clone(),
+            ..Default::default()
+        };
+        let sig = b64().encode(ddrm_envelope::sign_revocation(&operator, &caller_vk));
+        assert!(
+            matches!(conn_a.revoke_caller(&caller_vk_b64, &sig), Response::Ok { .. }),
+            "the pinned operator's genuine revocation is accepted",
+        );
+
+        // Connection B — never closed — must refuse the caller's next `hello` at once.
+        assert_eq!(
+            error_code(&conn_b.hello(&challenge, &caller_vk_b64, Some(NOW), None)),
+            "caller_revoked",
+            "a revoke on connection A must bind the still-open connection B immediately",
+        );
+
+        let _ = std::fs::remove_file(&store);
+    }
+
+    /// ELACITY-2282 (regression, connection-cap leak-safety): the [`ActiveSlot`] guard that bounds
+    /// concurrent connection threads via [`MAX_ACTIVE_CONNECTIONS`] must decrement the counter when a
+    /// connection ends — on a normal return AND when the serving thread panics — or the cap would
+    /// leak slots and eventually refuse every client (a self-inflicted outage). Without the RAII
+    /// guard a panicking connection would permanently consume a slot.
+    #[test]
+    #[cfg(unix)]
+    fn active_slot_releases_on_drop_and_on_panic() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let active = Arc::new(AtomicUsize::new(0));
+
+        active.fetch_add(1, Ordering::AcqRel);
+        {
+            let _slot = ActiveSlot(Arc::clone(&active));
+            assert_eq!(active.load(Ordering::Acquire), 1);
+        }
+        assert_eq!(active.load(Ordering::Acquire), 0, "slot released on normal drop");
+
+        active.fetch_add(1, Ordering::AcqRel);
+        let claimed = Arc::clone(&active);
+        let joined = std::thread::spawn(move || {
+            let _slot = ActiveSlot(claimed);
+            panic!("connection thread panicked mid-serve");
+        })
+        .join();
+        assert!(joined.is_err(), "the worker thread panicked as set up");
+        assert_eq!(
+            active.load(Ordering::Acquire),
+            0,
+            "slot must release even when the connection thread panics",
+        );
     }
 
     const CONTENT: &str = "bafybeigdyrcontent";
@@ -3057,7 +3318,7 @@ mod tests {
         let (mut client, server) = UnixStream::pair().unwrap();
         let handle = std::thread::spawn(move || {
             let reader = io::BufReader::new(server.try_clone().unwrap());
-            serve_connection_io(reader, server, &allowed, &None, &mut Vec::new(), false)
+            serve_connection_io(reader, server, &allowed, &None, &RevokedSet::default(), false)
         });
 
         let call = |client: &mut UnixStream, req: Value| -> Value {
@@ -3125,7 +3386,7 @@ mod tests {
         let (mut bad, server2) = UnixStream::pair().unwrap();
         let handle2 = std::thread::spawn(move || {
             let reader = io::BufReader::new(server2.try_clone().unwrap());
-            serve_connection_io(reader, server2, &None, &None, &mut Vec::new(), false)
+            serve_connection_io(reader, server2, &None, &None, &RevokedSet::default(), false)
         });
         // A header promising 64 bytes followed by only 3, then half-close.
         use std::io::Write as _;
@@ -3213,7 +3474,7 @@ mod tests {
         let (mut client, server) = UnixStream::pair().unwrap();
         let handle = std::thread::spawn(move || {
             let reader = io::BufReader::new(server.try_clone().unwrap());
-            serve_connection_io(reader, server, &None, &None, &mut Vec::new(), true)
+            serve_connection_io(reader, server, &None, &None, &RevokedSet::default(), true)
         });
         let call_plain = |client: &mut UnixStream, req: Value| -> Value {
             write_frame(client, &serde_json::to_vec(&req).unwrap()).unwrap();

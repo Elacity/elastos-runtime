@@ -813,7 +813,11 @@ async fn test_browser_open_launches_engine_with_attached_stream_receipt() {
     let runtime_stream_path = browser_runtime_stream_socket_path(dir.path(), stream_id).unwrap();
     #[cfg(unix)]
     {
-        assert!(runtime_stream_path.starts_with("/tmp/elastos-browser-streams"));
+        // String prefix, not Path::starts_with: the socket dir is euid-scoped
+        // (`/tmp/elastos-browser-streams-<euid>`), which component-wise matching would reject.
+        assert!(runtime_stream_path
+            .to_string_lossy()
+            .starts_with("/tmp/elastos-browser-streams"));
         assert!(
             runtime_stream_path.to_string_lossy().len() < 100,
             "runtime stream socket path must fit conservative Unix sun_path budget: {}",

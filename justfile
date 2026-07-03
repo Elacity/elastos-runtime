@@ -64,6 +64,35 @@ verify-release:
     just verify
     just home-frontdoor-smoke
 
+# CI gate: the full `verify` MINUS the Carrier-network setup smoke (`local-carrier-setup-smoke`),
+# which a stock GitHub runner cannot reach. Everything else a clean runner CAN verify runs here;
+# the carrier smoke is covered separately on a Carrier-capable Linux box / self-hosted runner.
+verify-ci:
+    just alignment-check
+    just _verify-tail
+
+# (hidden) gate steps shared by `verify` and `verify-ci` — everything after the alignment-check
+# + (verify-only) carrier-smoke preamble.
+_verify-tail:
+    ./scripts/command-smoke.sh
+    just candidate-command-audit
+    cd elastos && cargo fmt --all -- --check
+    cd elastos && cargo clippy --workspace --all-targets -- -D warnings
+    cd elastos && cargo test --workspace
+    just verify-capsules
+
+# Build + test the dDRM capsule crates the elastos-workspace gate does not reach. These crates
+# carry the protected-content surface (watermark codec, grant-digest envelope, media-authority), are
+# exercised under their CANONICAL feature sets (matching scripts/dev/run-creator-gateway.sh), and
+# gated by build+test only (clippy -D warnings is held back for now: pre-existing lint debt).
+verify-capsules:
+    cd capsules/decrypt-provider && cargo test --features rail-stream,rail-mint,pdf-render,pq-envelope
+    cd capsules/ddrm-envelope && cargo test --features access-grant,av-variants
+    cd scripts/dev/ddrm-media-authority && cargo test
+    # AV forensic cross-language weld: the Python extractor's canonical codeword must match the Rust
+    # serve selector byte-for-byte (golden vectors on both sides). Pure stdlib — no numpy/ffmpeg.
+    python3 tools/av-forensics/test_canonical.py
+
 # Fail-closed check for rooted-localhost and Home-first contract drift
 alignment-check:
     ./scripts/check-wci-alignment.sh
