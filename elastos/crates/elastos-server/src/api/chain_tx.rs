@@ -45,6 +45,40 @@ pub(crate) fn live_chain_init() -> Result<(String, Value), String> {
     let chain_id: i64 = env_nonempty("ELASTOS_DDRM_CHAIN_ID")
         .and_then(|s| s.parse().ok())
         .unwrap_or(8453);
+    // Public Base endpoints the chain-provider ROTATES to when the primary rate-limits (HTTP 429 /
+    // JSON-RPC -32016). Without these the single-endpoint config has nothing to fail over to, so a burst
+    // (discovery getLogs sweep + a detail view's sellersOf/listings/royalty reads) drains one bucket and
+    // every read fails — surfacing as a false "not listed". Mirrors the chain-provider's own PC2 pool.
+    // `eth_call` fallbacks are broad (any keyless endpoint serves a call); the log pool is RANGE-CAPABLE
+    // ONLY (publicnode silently truncates getLogs, so it must never serve a discovery scan). Override via
+    // ELASTOS_CHAIN_BASE_RPC_FALLBACKS / _LOG_RPCS (comma-separated).
+    let split = |s: String| -> Vec<String> {
+        s.split(',')
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty() && *u != rpc_url)
+            .collect()
+    };
+    let call_fallbacks = env_nonempty("ELASTOS_CHAIN_BASE_RPC_FALLBACKS")
+        .map(split)
+        .unwrap_or_else(|| {
+            [
+                "https://base-rpc.publicnode.com",
+                "https://base.drpc.org",
+                "https://base.meowrpc.com",
+                "https://1rpc.io/base",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .filter(|u| *u != rpc_url)
+            .collect()
+        });
+    let log_rpcs = env_nonempty("ELASTOS_CHAIN_BASE_LOG_RPCS")
+        .map(split)
+        .unwrap_or_else(|| {
+            std::iter::once(rpc_url.clone())
+                .chain(["https://base.gateway.tenderly.co".to_string()])
+                .collect()
+        });
     let init = json!({
         "op": "init",
         "config": { "networks": [{
@@ -57,6 +91,8 @@ pub(crate) fn live_chain_init() -> Result<(String, Value), String> {
             "mainnet": true,
             "explorer_url": null,
             "rpc_url": rpc_url,
+            "rpc_fallback_urls": call_fallbacks,
+            "log_query_rpc_urls": log_rpcs,
         }]}
     });
     Ok((network, init))
@@ -82,6 +118,83 @@ pub(crate) fn prepare_intent_live(
     });
     let chain_bin = resolve_chain_bin();
     run_chain_capsule(&chain_bin, &init, &prepare)
+}
+
+/// Resolve the REAL on-chain ledger `tokenId` for a `bytes16` KID via the REAL chain-provider
+/// `resolve_token_id` op (scans `AssetCreated` on the channel/`ledger` + binds the KID through the
+/// mint calldata). READ-ONLY (`eth_getLogs` + `eth_getTransactionByHash`); no keys. Returns the
+/// `0x…` tokenId, or an error if unresolved — the live buy then fails closed (P11). This is the
+/// Phase-1 fix: the buy binds THIS, never `word_from_id(content_id)`.
+pub(crate) fn resolve_token_id_live(
+    content_id: &str,
+    ledger: &str,
+) -> Result<(String, String), String> {
+    let (network, init) = live_chain_init()?;
+    let mut request = json!({
+        "op": "resolve_token_id",
+        "network": network,
+        "ledger": ledger,
+        "content_id": content_id,
+    });
+    if let Some(from_block) = env_nonempty("ELASTOS_DDRM_BUY_FROM_BLOCK") {
+        request["from_block"] = json!(from_block);
+    }
+    let chain_bin = resolve_chain_bin();
+    let resp = run_chain_capsule(&chain_bin, &init, &request)?;
+    let token_id = resp
+        .get("token_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("chain-provider resolve_token_id returned no token_id: {resp}"))?;
+    // The operative (the per-asset ERC-1155) is needed to re-read the listing terms before broadcast.
+    let operative = resp
+        .get("operative")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Ok((token_id, operative))
+}
+
+/// A read-only `eth_call` through the REAL chain-provider `contract_call` op (live Base RPC); returns
+/// the raw `0x…` return data. No keys (P3). Used by the buy's pre-broadcast listing re-read (abort-on-drift).
+pub(crate) fn contract_call_live(to: &str, data: &str) -> Result<String, String> {
+    let (network, init) = live_chain_init()?;
+    let request = json!({ "op": "contract_call", "network": network, "to": to, "data": data });
+    let chain_bin = resolve_chain_bin();
+    let resp = run_chain_capsule(&chain_bin, &init, &request)?;
+    resp.get("result")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("chain-provider contract_call returned no result: {resp}"))
+}
+
+/// Read the latest block number via the REAL chain-provider `block_number` op (live Base RPC).
+pub(crate) fn block_number_live() -> Result<u64, String> {
+    let (network, init) = live_chain_init()?;
+    let request = json!({ "op": "block_number", "network": network });
+    let chain_bin = resolve_chain_bin();
+    let resp = run_chain_capsule(&chain_bin, &init, &request)?;
+    let bn = resp.get("block_number");
+    if let Some(s) = bn.and_then(Value::as_str) {
+        return u64::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|e| e.to_string());
+    }
+    bn.and_then(Value::as_u64)
+        .ok_or_else(|| format!("chain-provider block_number returned no usable value: {resp}"))
+}
+
+/// Fetch `eth_getLogs` entries via the REAL chain-provider `logs` op (one window; the caller bounds
+/// the range). READ-ONLY; no keys (P3). Returns the raw log array (empty on no matches).
+pub(crate) fn get_logs_live(filter: Value) -> Result<Vec<Value>, String> {
+    let (network, init) = live_chain_init()?;
+    let request = json!({ "op": "logs", "network": network, "filter": filter });
+    let chain_bin = resolve_chain_bin();
+    let resp = run_chain_capsule(&chain_bin, &init, &request)?;
+    Ok(resp
+        .get("logs")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
 }
 
 /// Broadcast a signed tx through the REAL chain-provider against an in-process JSON-RPC
