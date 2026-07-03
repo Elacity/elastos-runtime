@@ -2597,6 +2597,13 @@ mod tests {
             // -- object-provider `share` STAYS: grants access — security-touching,
             //    held for a dedicated review (Miller).
             ("object-provider", "share"),
+            // -- object-provider `acquire` (buy→pin) STAYS Admin: a money-path write
+            //    that moves a bought encrypted asset into the Library. Enforced at
+            //    Admin (the `_ => Admin` fallthrough) = STRICTER than any manifest
+            //    preview → fail-closed (previewed-but-denied), never an escalation.
+            //    Loosening to Write needs a dedicated marketplace security review,
+            //    not a migration-time default (G3b: the dangerous tail stays tracked).
+            ("object-provider", "acquire"),
             // -- class C: EXECUTE / actuator. net/exit egress + browser-actuator
             //    drained (now declare `execute`); drm `open` remains (protected-
             //    content session — held for a content-protection review).

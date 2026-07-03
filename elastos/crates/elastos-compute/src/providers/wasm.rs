@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use wasmtime::*;
@@ -639,9 +639,9 @@ impl WasmProvider {
             .map_err(|e| ElastosError::Compute(format!("Failed to set WASM fuel: {}", e)))?;
 
         // Terminability: arm an epoch deadline whose callback traps the capsule when `stop()` has
-        // set `should_stop` (and bumped the engine epoch). With no stop signal the deadline simply
-        // keeps extending, so a legitimate (even long-running) capsule runs untouched. The epoch
-        // check is a cheap load+compare at loop backedges; fuel/wall-clock still bound the run.
+        // set `should_stop`. With no stop signal the deadline simply keeps extending, so a
+        // legitimate (even long-running) capsule runs untouched. The epoch check is a cheap
+        // load+compare at loop backedges; fuel/wall-clock still bound the run independently.
         store.set_epoch_deadline(1);
         store.epoch_deadline_callback(move |_| {
             if should_stop.load(Ordering::Relaxed) {
@@ -650,6 +650,51 @@ impl WasmProvider {
                 Ok(wasmtime::UpdateDeadline::Continue(1))
             }
         });
+
+        // Epoch watchdog: advance THIS engine's epoch on a fixed cadence so the deadline callback
+        // above fires regularly and observes `should_stop` within one tick — race-free regardless
+        // of when stop() sets the flag relative to this store arming its deadline. (A single
+        // increment-on-stop, as the original had, can be consumed before the store arms, silently
+        // dropping the kill until wall-clock; a continuous ticker closes that startup window.) The
+        // thread is signalled to exit the instant execution finishes, so it adds no latency to a
+        // normal return, and the RAII guard joins it on EVERY exit path (including the `?` returns
+        // below), so no watchdog is ever leaked.
+        let watchdog_signal = Arc::new((Mutex::new(false), Condvar::new()));
+        let watchdog = {
+            let signal = watchdog_signal.clone();
+            let engine = engine.clone();
+            std::thread::spawn(move || {
+                let (lock, cvar) = &*signal;
+                let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
+                while !*done {
+                    let (guard, wait) = cvar
+                        .wait_timeout(done, Duration::from_millis(50))
+                        .unwrap_or_else(|e| e.into_inner());
+                    done = guard;
+                    if wait.timed_out() {
+                        engine.increment_epoch();
+                    }
+                }
+            })
+        };
+        struct WatchdogGuard {
+            signal: Arc<(Mutex<bool>, Condvar)>,
+            handle: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for WatchdogGuard {
+            fn drop(&mut self) {
+                let (lock, cvar) = &*self.signal;
+                *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                cvar.notify_all();
+                if let Some(h) = self.handle.take() {
+                    let _ = h.join();
+                }
+            }
+        }
+        let _watchdog_guard = WatchdogGuard {
+            signal: watchdog_signal,
+            handle: Some(watchdog),
+        };
 
         // Create linker and bind WASI preview1 host functions.
         let mut linker = Linker::new(engine);
@@ -763,8 +808,9 @@ impl ComputeProvider for WasmProvider {
                 instance.should_stop.clone(),
             )
         };
-        // A fresh run must not inherit a stale stop signal.
-        should_stop.store(false, Ordering::Relaxed);
+        // No reset here on purpose: should_stop starts false at load() and only ever goes true
+        // via stop() — which ALSO removes the instance, so a stopped capsule can't be restarted.
+        // Resetting it in start() would let a start() racing a concurrent stop() clobber the kill.
 
         // Mark as running before execution
         {
@@ -999,12 +1045,13 @@ mod tests {
     }
 
     /// B2a (restored from the ddrm-hardening line): a runaway capsule MUST be terminable on
-    /// demand. With no stop signal the epoch deadline keeps extending (legitimate capsules run
-    /// free); when `stop()` sets the flag and bumps the epoch, the capsule traps on its next
-    /// backedge. Fuel is set effectively-unbounded here so the trap can ONLY come from the stop
-    /// signal — this proves the operator kill, not passive fuel exhaustion. The loop is finite
-    /// (a CI-hang backstop): if termination were broken, `recv_timeout` fails the test in 5 s
-    /// and the thread still ends on its own.
+    /// demand. Fuel is set effectively-unbounded here so the trap can ONLY come from the stop
+    /// signal — this proves the operator kill, not passive fuel exhaustion. Setting `should_stop`
+    /// is the ONLY action taken (no manual epoch bump): the in-`execute_wasm` watchdog advances
+    /// the epoch on its own cadence, so this also pins the race-free property — the kill does not
+    /// depend on any external epoch increment being timed against the store arming its deadline.
+    /// The loop is finite (a CI-hang backstop): if termination were broken, `recv_timeout` fails
+    /// the test in 5 s and the thread still ends on its own.
     #[test]
     fn runaway_capsule_is_terminable_via_stop_signal() {
         let engine = WasmProvider::engine().expect("engine");
@@ -1038,8 +1085,7 @@ mod tests {
             let _ = tx.send(r.is_err());
         });
         std::thread::sleep(std::time::Duration::from_millis(50)); // let it start spinning
-        should_stop.store(true, Ordering::Relaxed);
-        engine.increment_epoch();
+        should_stop.store(true, Ordering::Relaxed); // the watchdog does the rest — no manual bump
         let trapped = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("a stopped runaway must terminate within 5s, not run forever");
