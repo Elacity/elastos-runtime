@@ -75,24 +75,20 @@ for open work:
 
 ## Mandate lifecycle (Sprint 3) — tracked latent gaps (guardian F1/F3 + red-team, 2026-07-04)
 
-The grant → revoke → prove loop shipped with these HONEST bounds, each of which detonates only
-when the intent-channel dispatch endpoint is wired (it has ZERO non-test call sites today):
+The grant → revoke → prove loop shipped with these HONEST bounds:
 
-- **G-M1 (dispatch must consult token revocation + epoch).** `dispatch_standing_act` /
-  `check_intent_within_envelope` (`capability/intent.rs`) enforce revocation ONLY via the in-memory
-  `envelope.revoked` flag — never `store.is_token_revoked`, never the epoch. Consequences when a
-  `/dispatch` route lands: (a) the revoke handler's token-revoke→envelope-kill window becomes a real
-  act-under-revoked-token race; (b) `revoke_all` (epoch advance) kills every token but leaves every
-  standing envelope live — an intent-channel agent would survive the mass kill switch. FIX AT WIRE
-  TIME: dispatch must check `is_token_revoked` + epoch in addition to the envelope. (Restart is
-  fail-closed by construction: the envelope registry is in-memory, so a reboot denies with NoGrant.)
-- **G-M2 (receipt must carry intent-channel acts).** `AuditEvent::capability_token_id()` keys the
-  per-mandate receipt on `CapabilityGrant/Use/Revoke` only. All CURRENT act paths redeem via
-  `CapabilityManager::validate`, which emits token-keyed `CapabilityUse` — so "grant + every
-  use/revoke" is accurate today. The intent dispatcher emits intent-keyed records
-  (`IntentDeclared/Reconciled`), which the receipt would silently omit. FIX AT WIRE TIME: dispatch
-  emits a token-keyed `CapabilityUse` (or the exporter learns to include intent events whose
-  `standing_grant_id` == the token id).
+- **G-M1 CLOSED (Sprint 5, at wire time as prescribed).** The dispatch endpoint
+  (`POST /api/standing-grants/dispatch`, `dispatch_standing_intent`) consults the manager's
+  individual token-revocation store before the envelope gate and SELF-HEALS the envelope to
+  revoked (honest `revoked` denial, sticky), so a backing token killed by ANY path denies
+  dispatch. The epoch case was already closed in Sprint 4 (`revoke_all` kills every envelope).
+  Ratchet: `dispatch_denies_when_the_backing_token_is_dead_by_any_path` (manager-side kill while
+  the envelope still believes it is live ⇒ denied/revoked + envelope healed).
+- **G-M2 CLOSED (Sprint 5).** Dispatch records a token-keyed `CapabilityUse` (success mirrors the
+  outcome) alongside the intent-keyed records, so `export_mandate_receipt_for_capability` carries
+  every intent-channel act AND every denied attempt. Ratchet:
+  `dispatch_acts_under_the_mandate_and_the_receipt_carries_the_act` (receipt shows
+  uses = [acted:true, denied:false] and still authenticates).
 - **G-M3 (same-uid trust boundary, documented not defective).** The loopback control plane's
   authority reduces to "can read the 0600 coords/attach-secret files" — i.e. the operator uid. Any
   same-uid process inherits full mandate authority. This is the declared trust boundary of a

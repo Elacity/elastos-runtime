@@ -269,6 +269,12 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         )
         // The operator's mandate list (revoked included, flagged) + the runtime's signer pin.
         .route("/api/standing-grants", get(handlers::list_standing_grants))
+        // The ACT leg: run one authenticated agent intent under its standing mandate,
+        // fail-closed (declaration recorded before the act; token-keyed use recorded after).
+        .route(
+            "/api/standing-grants/dispatch",
+            post(handlers::dispatch_standing_intent),
+        )
         .route(
             "/api/standing-grants/revoke",
             post(handlers::revoke_standing_grant),
