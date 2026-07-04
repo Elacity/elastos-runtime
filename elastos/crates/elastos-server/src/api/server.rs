@@ -267,6 +267,8 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
             "/api/standing-grants/issue",
             post(handlers::issue_standing_grant),
         )
+        // The operator's mandate list (revoked included, flagged) + the runtime's signer pin.
+        .route("/api/standing-grants", get(handlers::list_standing_grants))
         .route(
             "/api/standing-grants/revoke",
             post(handlers::revoke_standing_grant),

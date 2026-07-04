@@ -1217,6 +1217,64 @@ pub async fn preview_standing_grant(
     Ok(Json(out))
 }
 
+/// One mandate as the operator surface renders it — the "mandate card" data shape.
+#[derive(Debug, Serialize)]
+pub struct MandateCard {
+    /// The mandate's token id (keys the receipt + revoke).
+    pub token_id: String,
+    /// The acting capsule identity the mandate authorizes.
+    pub capsule: String,
+    /// Resource scope.
+    pub resource: String,
+    /// Action scope.
+    pub action: String,
+    /// Affordance methods the agent may invoke.
+    pub methods: Vec<String>,
+    /// Expiry (None = until revoked).
+    pub expires_at: Option<elastos_common::SecureTimestamp>,
+    /// Explicitly revoked?
+    pub revoked: bool,
+    /// Live right now (issued, not revoked, not expired)?
+    pub active: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListMandatesOutput {
+    /// Every standing mandate issued this runtime lifetime, revoked ones included (an operator
+    /// surface shows what was killed, it does not erase it), sorted by token id.
+    pub mandates: Vec<MandateCard>,
+    /// The runtime audit chain's signer key (hex), fetched over the AUTHENTICATED loopback control
+    /// plane — the operator-trust pin for `elastos verify-receipt --signer`. `None` for an
+    /// unsigned/memory-only log. This is the runtime asserting its own key over a channel the
+    /// operator already trusts (the attach secret), NOT a receipt vouching for itself.
+    pub signer_public_key_hex: Option<String>,
+}
+
+/// GET /api/standing-grants  (shell-only) — the operator's mandate list.
+pub async fn list_standing_grants(
+    State(state): State<CapabilityState>,
+) -> Json<ListMandatesOutput> {
+    let mandates = state
+        .standing_service
+        .list()
+        .into_iter()
+        .map(|env| MandateCard {
+            active: env.is_active(),
+            token_id: env.grant_id,
+            capsule: env.capsule,
+            resource: env.resource,
+            action: env.action,
+            methods: env.allowed_methods.into_iter().collect(),
+            expires_at: env.expires_at,
+            revoked: env.revoked,
+        })
+        .collect();
+    Json(ListMandatesOutput {
+        mandates,
+        signer_public_key_hex: state.capability_manager.audit_log().verifying_key_hex(),
+    })
+}
+
 /// GET /api/mandate/:token_id/receipt  (shell-only)
 ///
 /// Export the PORTABLE per-mandate receipt for one capability token: the signed, set-bound bundle
@@ -1495,6 +1553,46 @@ mod tests {
         // A malformed token id is a 400, before any chain read.
         let bad = mandate_receipt(State(state), Path("not-hex".to_string())).await;
         assert!(matches!(bad, Err((StatusCode::BAD_REQUEST, _))));
+    }
+
+    /// The operator's mandate list renders honest card states: a live mandate is ACTIVE, a revoked
+    /// one stays LISTED (flagged, never erased), and the response carries the runtime's signer pin.
+    #[tokio::test]
+    async fn mandate_list_shows_live_and_revoked_cards_with_signer_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_durable_audit(dir.path());
+        let issue = |resource: &str| IssueStandingGrantInput {
+            capsule: "vm-agent".to_string(),
+            resource: resource.to_string(),
+            action: "write".to_string(),
+            methods: vec!["pay.invoke".to_string()],
+            ttl_secs: Some(3600),
+        };
+        let a = issue_standing_grant(State(state.clone()), Json(issue("elastos://pay/a")))
+            .await
+            .unwrap()
+            .0;
+        let b = issue_standing_grant(State(state.clone()), Json(issue("elastos://pay/b")))
+            .await
+            .unwrap()
+            .0;
+        let _ = revoke_standing_grant(
+            State(state.clone()),
+            Json(RevokeStandingGrantInput { grant_id: b.grant_id.clone() }),
+        )
+        .await
+        .unwrap();
+
+        let out = list_standing_grants(State(state.clone())).await.0;
+        assert_eq!(out.mandates.len(), 2, "revoked mandates stay listed");
+        let card = |id: &str| out.mandates.iter().find(|m| m.token_id == id).unwrap();
+        assert!(card(&a.token_id).active && !card(&a.token_id).revoked);
+        assert!(!card(&b.token_id).active && card(&b.token_id).revoked);
+        // The signer pin comes over the authenticated channel and matches the audit log's key.
+        assert_eq!(
+            out.signer_public_key_hex,
+            state.capability_manager.audit_log().verifying_key_hex()
+        );
     }
 
     /// Regression (red-team): `hex::decode` accepts UPPERCASE but the envelope registry is keyed

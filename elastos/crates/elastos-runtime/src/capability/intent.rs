@@ -681,6 +681,18 @@ impl StandingGrantStore {
         grants.get(grant_id).cloned()
     }
 
+    /// Every standing grant ever issued this runtime lifetime (revoked ones INCLUDED, flagged —
+    /// an operator surface must show what was killed, not erase it), sorted by `grant_id` for a
+    /// stable listing. Read-only. A poisoned lock degrades to empty (absent), never fabricated.
+    pub fn list(&self) -> Vec<StandingGrantEnvelope> {
+        let Ok(grants) = self.grants.read() else {
+            return Vec::new();
+        };
+        let mut all: Vec<StandingGrantEnvelope> = grants.values().cloned().collect();
+        all.sort_by(|a, b| a.grant_id.cmp(&b.grant_id));
+        all
+    }
+
     /// True iff an ACTIVE (issued, not revoked, not expired) grant exists for `grant_id`. A read-only
     /// probe for surfaces that want the live count; the dispatch decision itself always goes through
     /// the gate, never this shortcut.
@@ -795,6 +807,12 @@ impl StandingGrantService {
     /// True iff an ACTIVE (issued, not revoked, not expired) grant exists for `grant_id`.
     pub fn is_active(&self, grant_id: &str) -> bool {
         self.store.is_active(grant_id)
+    }
+
+    /// Every standing grant issued this runtime lifetime (revoked included, flagged), sorted by
+    /// id — the operator's mandate list. Read-only; see [`StandingGrantStore::list`].
+    pub fn list(&self) -> Vec<StandingGrantEnvelope> {
+        self.store.list()
     }
 
     /// Dispatch a self-declared agent act under its standing grant, fail-closed — the full loop

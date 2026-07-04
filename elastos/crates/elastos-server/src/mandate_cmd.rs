@@ -56,6 +56,12 @@ pub(crate) enum MandateCommand {
         #[arg(short, long)]
         output: Option<std::path::PathBuf>,
     },
+
+    /// List every standing mandate (live and revoked) with its scope and state
+    List,
+
+    /// Run the whole loop once against the live runtime: grant → list → revoke → receipt → verify
+    Demo,
 }
 
 /// Attach to the RUNNING operator runtime and return (api_url, shell_token). The mandate
@@ -208,5 +214,142 @@ pub(crate) async fn run_mandate(cmd: MandateCommand) -> Result<()> {
             }
             Ok(())
         }
+
+        MandateCommand::List => {
+            let (api_url, shell_token) = attach_shell().await?;
+            let list = fetch_mandate_list(&api_url, &shell_token).await?;
+            print_mandate_list(&list);
+            Ok(())
+        }
+
+        MandateCommand::Demo => run_demo().await,
     }
+}
+
+async fn fetch_mandate_list(api_url: &str, shell_token: &str) -> Result<serde_json::Value> {
+    let resp = client()?
+        .get(format!("{api_url}/api/standing-grants"))
+        .header("Authorization", format!("Bearer {shell_token}"))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(error_for(resp, "mandate list").await);
+    }
+    Ok(resp.json().await?)
+}
+
+fn print_mandate_list(list: &serde_json::Value) {
+    let mandates = list
+        .get("mandates")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if mandates.is_empty() {
+        println!("No standing mandates this runtime lifetime.");
+        return;
+    }
+    println!("{} standing mandate(s):", mandates.len());
+    for m in &mandates {
+        let s = |k: &str| m.get(k).and_then(|v| v.as_str()).unwrap_or("?").to_string();
+        let active = m.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+        let revoked = m.get("revoked").and_then(|v| v.as_bool()).unwrap_or(false);
+        let state = if active {
+            "LIVE"
+        } else if revoked {
+            "REVOKED"
+        } else {
+            "EXPIRED"
+        };
+        let methods = m
+            .get("methods")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        println!("\n  [{}] {}", state, s("token_id"));
+        println!("    capsule: {}", s("capsule"));
+        println!("    scope:   {} on {}", s("action"), s("resource"));
+        println!("    methods: {methods}");
+    }
+}
+
+/// The whole Flint loop, once, against the live runtime — nothing simulated, nothing fabricated:
+/// a REAL mandate is granted (and left revoked at the end), every record lands on the REAL audit
+/// chain, and the receipt is verified in-process with the signer pinned over the AUTHENTICATED
+/// loopback control plane (the operator's trust in their own runtime — not the receipt vouching
+/// for itself).
+async fn run_demo() -> Result<()> {
+    let (api_url, shell_token) = attach_shell().await?;
+    let http = client()?;
+
+    println!("── 1. GRANT — a scoped, expiring, revocable mandate (not your keys) ──");
+    let resp = http
+        .post(format!("{api_url}/api/standing-grants/issue"))
+        .header("Authorization", format!("Bearer {shell_token}"))
+        .json(&serde_json::json!({
+            "capsule": "vm-demo-agent",
+            "resource": "elastos://pay/demo-vendor",
+            "action": "write",
+            "methods": ["pay.invoke"],
+            "ttl_secs": 3600,
+        }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(error_for(resp, "demo grant").await);
+    }
+    let out: serde_json::Value = resp.json().await?;
+    let token_id = out
+        .get("token_id")
+        .and_then(|v| v.as_str())
+        .context("no token id")?
+        .to_string();
+    println!("granted mandate {token_id}: vm-demo-agent may write elastos://pay/demo-vendor via pay.invoke, 1h TTL\n");
+
+    println!("── 2. LIST — the mandate is LIVE on the operator surface ──");
+    let list = fetch_mandate_list(&api_url, &shell_token).await?;
+    print_mandate_list(&list);
+    // The signer pin for step 5, obtained over the authenticated channel.
+    let pinned_signer = list
+        .get("signer_public_key_hex")
+        .and_then(|v| v.as_str())
+        .context("runtime did not report its audit signer (memory-only log?)")?
+        .to_string();
+
+    println!("\n── 3. REVOKE — the kill switch, durably attested before it mutates ──");
+    let resp = http
+        .post(format!("{api_url}/api/standing-grants/revoke"))
+        .header("Authorization", format!("Bearer {shell_token}"))
+        .json(&serde_json::json!({ "grant_id": token_id }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(error_for(resp, "demo revoke").await);
+    }
+    println!("revoked {token_id}: signed CapabilityRevoke on the chain, envelope killed\n");
+
+    println!("── 4. RECEIPT — the portable, set-bound proof of the whole mandate ──");
+    let resp = http
+        .get(format!("{api_url}/api/mandate/{token_id}/receipt"))
+        .header("Authorization", format!("Bearer {shell_token}"))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(error_for(resp, "demo receipt").await);
+    }
+    let receipt: elastos_runtime::primitives::MandateReceipt = resp.json().await?;
+    println!("exported: {} records (grant … revoke), signed by {}\n", receipt.records.len(), receipt.signer_public_key_hex);
+
+    println!("── 5. VERIFY — independently, pinned to the runtime key YOU trust ──");
+    let verdict =
+        elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&pinned_signer));
+    println!("  structurally valid: {}", verdict.structurally_valid);
+    println!("  set binding:        {}", verdict.set_binding_ok);
+    println!("  scope rule:         {}", verdict.scope_ok);
+    println!("  AUTHENTICATED:      {}", verdict.authenticated);
+    if !verdict.authenticated {
+        bail!("demo receipt failed verification: {verdict:?}");
+    }
+    println!("\nThe loop is closed: authority granted, exercised scope visible, killed, and PROVEN —");
+    println!("hand receipt + `elastos verify-receipt` to anyone; they need no runtime and no trust in this box.");
+    Ok(())
 }
