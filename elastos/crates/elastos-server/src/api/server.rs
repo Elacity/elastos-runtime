@@ -198,9 +198,9 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         // One shared standing-grant service, signed by the manager's own key + audit log, so every
         // shell-only standing-grant verb hits the same fail-closed registry.
         standing_service: Arc::new(capability_manager.standing_grant_service()),
-        intent_executor: Arc::new(
-            crate::intent_executor::MethodRegistryExecutor::production(),
-        ),
+        intent_executor: Arc::new(crate::intent_executor::MethodRegistryExecutor::production(
+            capability_manager.audit_log().clone(),
+        )),
     };
     let capsule_audit_log = audit_log
         .clone()

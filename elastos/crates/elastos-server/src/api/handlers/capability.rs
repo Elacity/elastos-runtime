@@ -1364,8 +1364,8 @@ pub struct DispatchIntentOutput {
 ///
 /// Honest scope: reconciliation attests report-fidelity (report == declaration), not reality
 /// (effect == declaration) — that rests on the trusted-core executor's truthfulness. The production
-/// executor set is currently empty, so every method is `authorized_not_performed` until a real
-/// affordance is wired (G-M6).
+/// executor set currently registers ONE real affordance (`runtime.audit_verify`, a side-effect-free
+/// signature-verified chain read); every other method is `authorized_not_performed` until wired (G-M6).
 pub async fn dispatch_standing_intent(
     State(state): State<CapabilityState>,
     Json(intent): Json<IntentDeclarationV1>,
@@ -1639,6 +1639,9 @@ mod tests {
         let capability_manager =
             std::sync::Arc::new(CapabilityManager::new(store, audit_log.clone(), metrics));
         let standing_service = std::sync::Arc::new(capability_manager.standing_grant_service());
+        let intent_executor = std::sync::Arc::new(
+            crate::intent_executor::MethodRegistryExecutor::production(audit_log.clone()),
+        );
 
         CapabilityState {
             pending_store: std::sync::Arc::new(PendingRequestStore::new(audit_log.clone())),
@@ -1648,9 +1651,7 @@ mod tests {
                 audit_log,
             )),
             standing_service,
-            intent_executor: std::sync::Arc::new(
-                crate::intent_executor::MethodRegistryExecutor::production(),
-            ),
+            intent_executor,
         }
     }
 
@@ -1714,6 +1715,9 @@ mod tests {
         let capability_manager =
             std::sync::Arc::new(CapabilityManager::new(store, audit_log.clone(), metrics));
         let standing_service = std::sync::Arc::new(capability_manager.standing_grant_service());
+        let intent_executor = std::sync::Arc::new(
+            crate::intent_executor::MethodRegistryExecutor::production(audit_log.clone()),
+        );
         CapabilityState {
             pending_store: std::sync::Arc::new(PendingRequestStore::new(audit_log.clone())),
             capability_manager,
@@ -1722,9 +1726,7 @@ mod tests {
                 audit_log,
             )),
             standing_service,
-            intent_executor: std::sync::Arc::new(
-                crate::intent_executor::MethodRegistryExecutor::production(),
-            ),
+            intent_executor,
         }
     }
 
@@ -1988,6 +1990,109 @@ mod tests {
             })
             .collect();
         assert_eq!(uses, vec![false, false], "neither unperformed nor diverged is a success");
+    }
+
+    /// Sprint 7: the FIRST real affordance performs end to end through the PRODUCTION executor (no
+    /// test stand-in). `runtime.audit_verify` genuinely re-verifies the runtime's own tamper-evident
+    /// chain — a side-effect-free read — so a `read` mandate reconciles `performed` and the receipt
+    /// records a real `success=true` use that authenticates.
+    #[tokio::test]
+    async fn dispatch_really_performs_the_wired_audit_verify_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_durable_audit(dir.path()); // real production executor, no override
+        let agent = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let agent_hex = hex::encode(agent.verifying_key().to_bytes());
+        let audit_resource = crate::intent_executor::AUDIT_CHAIN_RESOURCE;
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: audit_resource.to_string(),
+                action: "read".to_string(),
+                methods: vec!["runtime.audit_verify".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: Some(agent_hex),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let intent = IntentDeclarationV1::issue(
+            &agent,
+            agent.verifying_key().to_bytes(),
+            "intent-audit-1",
+            "vm-agent",
+            "runtime.audit_verify",
+            "", // no arguments — audit_verify consumes none
+            audit_resource,
+            "read",
+            &out.token_id,
+        );
+        let resp = dispatch_standing_intent(State(state.clone()), Json(intent))
+            .await
+            .expect("dispatch ok")
+            .0;
+        assert_eq!(resp.outcome, "performed", "the runtime really re-verified its audit chain");
+        assert_eq!(
+            resp.reconciliation.unwrap().status,
+            elastos_runtime::capability::ReconciliationStatus::Matched
+        );
+
+        let receipt = mandate_receipt(State(state.clone()), Path(out.token_id.clone()))
+            .await
+            .unwrap()
+            .0;
+        use elastos_runtime::primitives::audit::AuditEvent;
+        let uses: Vec<bool> = receipt
+            .records
+            .iter()
+            .filter_map(|r| match &r.event {
+                AuditEvent::CapabilityUse { success, .. } => Some(*success),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(uses, vec![true], "a real performed read is receipted success=true");
+        let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();
+        let verdict = elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer));
+        assert!(verdict.authenticated, "the performed-act receipt authenticates: {verdict:?}");
+    }
+
+    /// Guardian honesty: audit_verify reads the audit CHAIN regardless of the declared resource, so
+    /// a mandate MIS-SCOPED to an unrelated resource reconciles `Diverged` (the runtime read the
+    /// chain, not what was declared), never a misleading `Matched`.
+    #[tokio::test]
+    async fn audit_verify_under_a_misscoped_mandate_diverges() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_durable_audit(dir.path());
+        let agent = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: "elastos://pay/vendor".to_string(), // NOT the audit chain
+                action: "read".to_string(),
+                methods: vec!["runtime.audit_verify".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: Some(hex::encode(agent.verifying_key().to_bytes())),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let intent = IntentDeclarationV1::issue(
+            &agent,
+            agent.verifying_key().to_bytes(),
+            "intent-misscope",
+            "vm-agent",
+            "runtime.audit_verify",
+            "",
+            "elastos://pay/vendor",
+            "read",
+            &out.token_id,
+        );
+        let resp = dispatch_standing_intent(State(state), Json(intent)).await.unwrap().0;
+        assert_eq!(resp.outcome, "diverged", "declared read of pay/vendor, actually read the chain");
     }
 
     /// G-M1 regression: a backing token killed DIRECTLY through the manager (a path the envelope

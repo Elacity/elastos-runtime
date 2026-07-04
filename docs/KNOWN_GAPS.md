@@ -109,25 +109,41 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   `dispatch_refuses_a_replayed_intent`. The seen-set is in-memory, so a replay after a RESTART is not
   yet caught; and there is no `declared_at` freshness window. Persist the seen-set (or add a signed
   freshness window) before exposing the endpoint beyond the single trusted operator.
-- **G-M6 — the reconciliation seam is closed; production performs nothing yet (honest).** Dispatch
-  now invokes a real [`IntentExecutor`] (`intent_executor.rs`) INSIDE the gate's act closure (so a
+- **G-M6 — the reconciliation seam is closed; ONE real affordance wired (honest).** Dispatch
+  invokes a real [`IntentExecutor`] (`intent_executor.rs`) INSIDE the gate's act closure (so a
   denied/revoked intent never executes) and mints the affordance receipt from what the executor
   REPORTS, never from the declaration. The over-claim is retired: a method with no executor (or one
   that declines) is `Undelivered` — outcome `authorized_not_performed`, receipt use `success=false` —
-  instead of a fabricated match; an executor that acts on a different field is `Diverged`; only a
-  faithful performance is `Matched` (`performed`, `success=true`). Crucially the PRODUCTION executor
-  set is DELIBERATELY EMPTY (`MethodRegistryExecutor::production()`): shipping a no-op that echoed the
-  declaration would re-introduce a `success=true` "write" for a method that performed no write. So
-  every production method is currently `authorized_not_performed`. Ratchets (with test executors):
+  instead of a fabricated match; an executor that reports a field other than declared is `Diverged`;
+  only a faithful performance is `Matched` (`performed`, `success=true`). The PRODUCTION executor set
+  registers exactly ONE method today (`runtime.audit_verify`, below) — every other method is
+  `authorized_not_performed`; a no-op that echoed the declaration is deliberately NOT shipped (it
+  would re-introduce a `success=true` "write" for a method that performed no write). Ratchets:
   `dispatch_acts_under_the_mandate_and_the_receipt_carries_the_act` (faithful → performed),
-  `dispatch_reconciles_unperformed_and_diverged_acts_honestly` (empty registry → Undelivered; a
+  `dispatch_reconciles_unperformed_and_diverged_acts_honestly` (unwired method → Undelivered; a
   shifting executor → Diverged; both `success=false`).
   BOUNDS (documented, not defects): (a) the seam is independent for the Undelivered/Diverged legs; a
   faithful executor is Matched-by-construction, so `Matched` proves report-fidelity (report ==
   declaration), NOT reality (effect == declaration) — that rests on the trusted-core executor's
-  truthfulness. (b) Real side-effecting affordances (mail/payment/storage) are registered here as
-  wired, each behind its own capability gate, at which point `performed` becomes literal — and their
-  executors MUST hash ACTUAL inputs and report the action they REALLY did.
+  truthfulness. (b) Side-effecting affordances (mail/payment/storage) are registered as wired, each
+  behind its own capability gate, and their executors MUST hash ACTUAL inputs and report the action
+  they REALLY did.
+  FIRST REAL AFFORDANCE WIRED (Sprint 7): `runtime.audit_verify` — a genuine, SIDE-EFFECT-FREE read
+  that re-verifies the runtime's own tamper-evident chain (hash links + ed25519 sigs) and
+  `Performed`s iff it actually verifies. It reports the fields it TRULY acted on — resource =
+  `elastos://runtime/audit-chain` (the whole chain, NOT the declared resource), action = `read`,
+  input_hash = empty (no arguments) — so a mandate mis-scoped to another resource, or a non-read
+  action, reconciles `Diverged` rather than a misleading `Matched`
+  (`dispatch_really_performs_the_wired_audit_verify_read`, `audit_verify_under_a_misscoped_mandate_diverges`).
+  It DECLINES (⇒ Undelivered) when the log is unsigned/memory-only (`vk` = None): `verify_chain(None)`
+  is a hash-only walk over a public algorithm, so a `performed` must mean SIGNATURE-verified, not
+  merely self-consistent (`audit_verify_declines_on_a_memory_only_chain`). So `performed` is now
+  LITERAL for one method — the outcome tracks real signed-chain state, not the declaration.
+  RESIDUALS (documented, not defects): `verify_chain` re-reads the whole log per call (O(chain) — a
+  deliberate, gated, on-demand op; DoS-bounded by the shell-only + agent-key-bound + replay-guarded
+  mandate, medium); the verified count is observed but not surfaced in the reconciliation fields
+  (which bind capsule/method/resource/action/input_hash only); and a torn last log line from a
+  concurrent write yields a spurious `Declined` (fail-closed, never a false `Matched`).
 
 Closed at review time (Sprint 3, before merge): the revoke id-casing desync (UPPERCASE hex
 revoked the token but missed the lowercase-keyed envelope — now canonicalized + regression test

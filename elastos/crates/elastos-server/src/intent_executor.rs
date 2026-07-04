@@ -15,6 +15,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use elastos_runtime::capability::IntentDeclarationV1;
+use elastos_runtime::primitives::audit::AuditLog;
+
+/// The canonical resource `runtime.audit_verify` actually reads: the runtime's whole audit chain.
+/// The executor reports THIS (not the declared resource), so a mandate mis-scoped to some unrelated
+/// resource reconciles `Diverged` (the runtime read the chain, not what was declared) instead of a
+/// misleading `Matched` — the receipt names what was truly read.
+pub const AUDIT_CHAIN_RESOURCE: &str = "elastos://runtime/audit-chain";
 
 /// The INDEPENDENT result of performing a declared intent. It MUST describe what the executor
 /// actually did — never be copied from the declaration by the caller — because the gate reconciles
@@ -54,15 +61,60 @@ impl MethodRegistryExecutor {
         Self::default()
     }
 
-    /// The executor set the production runtime ships with. It is DELIBERATELY EMPTY: no real
-    /// side-effecting affordance (mail, payment, storage) is wired yet, and shipping a no-op that
-    /// echoed the declaration back would re-introduce the exact over-claim this seam exists to
-    /// retire (a durable `success=true` "write" for a method that performed no write). So every
-    /// dispatched method currently DECLINES ⇒ `Undelivered` ⇒ outcome `authorized_not_performed` —
-    /// the honest state of the system. Real affordances are registered here (each behind its own
-    /// capability gate) as they are wired, at which point their methods become genuinely `performed`.
-    pub fn production() -> Self {
-        Self::new()
+    /// The executor set the production runtime ships with. Real affordances are registered here —
+    /// each a genuine operation that PERFORMS and reports the action it REALLY did — and only these
+    /// methods can reconcile `performed`; every other method DECLINES ⇒ `Undelivered` ⇒
+    /// `authorized_not_performed`, the honest state. Registered today:
+    ///
+    /// - `runtime.audit_verify` — the first real, SIDE-EFFECT-FREE affordance. It re-verifies the
+    ///   runtime's own tamper-evident audit chain end to end (hash links + ed25519 signatures) — a
+    ///   pure read — and `Performed`s iff the chain actually verifies, `Declined`s otherwise. So the
+    ///   outcome tracks REAL chain state, not the declaration: a corrupt or memory-only log is
+    ///   honestly `Undelivered`. It reports `action = "read"` (what it truly did), so it is usable
+    ///   only under a `read` mandate.
+    pub fn production(audit_log: Arc<AuditLog>) -> Self {
+        let mut registry = Self::new();
+        registry.register(
+            "runtime.audit_verify",
+            Arc::new(move |intent: &IntentDeclarationV1| {
+                // Require a SIGNING KEY: `verify_chain(None)` is a hash-links-only walk, and
+                // `record_hash` is a public algorithm — an offline editor could rewrite an unsigned
+                // chain and pass. So a `performed` audit_verify must mean SIGNATURE-verified: with no
+                // key (memory-only/unsigned log) we Decline rather than over-claim tamper-evidence.
+                let verifying_key = audit_log
+                    .verifying_key_hex()
+                    .and_then(|hex_key| hex::decode(hex_key).ok())
+                    .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+                    .and_then(|arr| ed25519_dalek::VerifyingKey::from_bytes(&arr).ok());
+                let Some(verifying_key) = verifying_key else {
+                    return IntentExecution::Declined {
+                        reason: "audit chain is unsigned; cannot attest a signature-verified read"
+                            .to_string(),
+                    };
+                };
+                match audit_log.verify_chain(Some(&verifying_key)) {
+                    Ok(_verified_count) => IntentExecution::Performed {
+                        // capsule + method_id are the bound identity the executor acted as/under
+                        // (the gate already tied them to the mandate); the fields below are what the
+                        // runtime REALLY did, reported independently of the declaration:
+                        capsule: intent.capsule.clone(),
+                        method_id: intent.method_id.clone(),
+                        // audit_verify consumes NO arguments, so the honest args-hash is empty. An
+                        // intent that declared some other input_hash reconciles `Diverged`.
+                        input_hash: String::new(),
+                        // The resource actually read (the whole chain) and the action actually
+                        // performed (read) — a mandate scoped elsewhere, or a non-read action,
+                        // therefore reconciles `Diverged`, never a misleading `Matched`.
+                        resource: AUDIT_CHAIN_RESOURCE.to_string(),
+                        action: "read".to_string(),
+                    },
+                    Err(reason) => IntentExecution::Declined {
+                        reason: format!("audit chain did not verify: {reason}"),
+                    },
+                }
+            }),
+        );
+        registry
     }
 
     pub fn register(&mut self, method_id: &str, executor: MethodFn) {
@@ -123,16 +175,34 @@ mod tests {
     }
 
     #[test]
-    fn production_registry_is_empty_so_every_method_declines() {
-        // The honest default: no real executor is wired, so nothing is "performed" — every method
-        // Declines (⇒ Undelivered), never a fabricated match.
-        let reg = MethodRegistryExecutor::production();
+    fn production_declines_unwired_methods_and_performs_the_real_audit_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(AuditLog::with_file(dir.path().join("audit.log")).unwrap());
+        log.emit(elastos_runtime::primitives::audit::AuditEvent::RuntimeStart {
+            timestamp: elastos_common::SecureTimestamp::now(),
+            version: "t".to_string(),
+        })
+        .unwrap();
+        let reg = MethodRegistryExecutor::production(log);
+        // Unwired methods decline (⇒ Undelivered), never a fabricated match.
         assert!(matches!(
             reg.execute(&intent("pay.invoke")),
             IntentExecution::Declined { .. }
         ));
+        // The real affordance PERFORMS against a signed, verifiable chain and reports action=read.
+        match reg.execute(&intent("runtime.audit_verify")) {
+            IntentExecution::Performed { action, .. } => assert_eq!(action, "read"),
+            other => panic!("expected Performed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audit_verify_declines_on_a_memory_only_chain() {
+        // Real state drives the outcome: a memory-only log has nothing durable to verify ⇒ Declined,
+        // never a fabricated "performed".
+        let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()));
         assert!(matches!(
-            reg.execute(&intent("runtime.echo")),
+            reg.execute(&intent("runtime.audit_verify")),
             IntentExecution::Declined { .. }
         ));
     }
