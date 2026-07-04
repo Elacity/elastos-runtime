@@ -227,16 +227,16 @@
     mandates: [
       { token_id:"3b6a27bcceb6a42d62a3a8d02a6f0d73", capsule:"vm-demo-agent",
         resource:"elastos://runtime/audit-chain", action:"read",
-        methods:["runtime.audit_verify"], expires_at:{secs:1720}, revoked:true, active:false },
+        methods:["runtime.audit_verify"], expires_at:{unix_secs:1720,monotonic_seq:0}, revoked:true, active:false },
       { token_id:"a1f3c5d7e9b0a2c4d6e8f0a1b3c5d7e9", capsule:"vm-mail-agent",
         resource:"elastos://runtime/content-access/QmVault7", action:"read",
-        methods:["runtime.content_seen"], expires_at:{secs:3600}, revoked:false, active:true },
+        methods:["runtime.content_seen"], expires_at:{unix_secs:3600,monotonic_seq:0}, revoked:false, active:true },
       { token_id:"77de243a63ac048a18b59da2915771de", capsule:"vm-ledger-agent",
         resource:"elastos://runtime/audit-chain", action:"read",
         methods:["runtime.audit_verify"], expires_at:null, revoked:false, active:true },
       { token_id:"0c83e5b1f0a9d6c4e2b8a1f3c5d7e9b0", capsule:"vm-index-agent",
         resource:"elastos://runtime/content-access/QmOld3", action:"read",
-        methods:["runtime.content_seen"], expires_at:{secs:0}, revoked:false, active:false }
+        methods:["runtime.content_seen"], expires_at:{unix_secs:0,monotonic_seq:0}, revoked:false, active:false }
     ]
   };
   // A representative receipt (grant -> performed read -> revoke -> denied attempt), matching the demo.
@@ -255,14 +255,7 @@
 
   function state(m){ return m.active ? "live" : (m.revoked ? "rev" : "exp"); }
   function stateLabel(s){ return s==="live"?"Live":(s==="rev"?"Revoked":"Expired"); }
-  function shortId(id){ return id.length>18 ? id.slice(0,10)+"…"+id.slice(-6) : id; }
-  function expiry(m){
-    if(m.revoked) return "revoked";
-    if(m.expires_at==null) return "no expiry — until revoked";
-    var s = m.expires_at.secs!=null ? m.expires_at.secs : m.expires_at;
-    if(typeof s==="number"){ if(s<=0) return "expired"; if(s<3600) return "expires in "+Math.round(s/60)+"m"; return "expires in "+(s/3600).toFixed(s%3600?1:0)+"h"; }
-    return String(s);
-  }
+  function shortId(id){ id=String(id||""); return id.length>18 ? id.slice(0,10)+"…"+id.slice(-6) : id; }
 
   function renderStats(d){
     var live=0,rev=0,exp=0;
@@ -320,39 +313,51 @@
     $("#scrim").classList.add("on");
     $("#drawer").classList.add("on");
     $("#drawer").setAttribute("aria-hidden","false");
-    // Live in-runtime: read the portable receipt for THIS mandate; fall back to a representative one.
-    if (typeof fetch === "function" && !PREVIEW){
-      fetch("/api/mandate/"+encodeURIComponent(m.token_id)+"/receipt", {headers:{Accept:"application/json"}})
-        .then(function(r){ if(!r.ok) throw 0; return r.json(); })
-        .then(function(j){ paintReceipt(j, signer); })
-        .catch(function(){ paintReceipt(SAMPLE_RECEIPT, signer); });
-    } else {
-      paintReceipt(SAMPLE_RECEIPT, signer);
+    if (PREVIEW){
+      // No runtime reachable — this mandate is itself representative, so its receipt is too (labeled).
+      paintReceipt(SAMPLE_RECEIPT, signer, true);
+      return;
     }
+    // Live in-runtime: read the portable receipt for THIS mandate. On failure show an ERROR — NEVER
+    // a fabricated sample under a real token id.
+    fetch("/api/mandate/"+encodeURIComponent(m.token_id)+"/receipt", {headers:{Accept:"application/json"}})
+      .then(function(r){ if(!r.ok) throw new Error("http "+r.status); return r.json(); })
+      .then(function(j){ paintReceipt(j, signer, false); })
+      .catch(function(err){
+        $("#dbody").innerHTML = '<div class="verifybox"><div class="vt">Receipt unavailable</div>'
+          + '<p>Could not load this mandate’s receipt ('+esc(String(err&&err.message||err))+'). '
+          + 'It may have no durable records yet, or the runtime is unreachable.</p></div>';
+      });
   }
-  function paintReceipt(r, signer){
+  function paintReceipt(r, signer, isPreview){
     var evs = (r.records||[]).map(function(e){
       return '<div class="ev '+evClass(e)+'"><span class="node"></span>'
         + '<div class="k">'+evTitle(e)+'</div>'
         + (evDetail(e)?'<div class="d">'+evDetail(e)+'</div>':'')
-        + '<div class="h">seq '+e.seq+' · '+esc(shortId(e.record_hash))+'</div></div>';
+        + '<div class="h">seq '+esc(e.seq)+' · '+esc(shortId(e.record_hash||""))+'</div></div>';
     }).join("");
-    var pin = signer || r.signer_public_key_hex;
+    var setBound = r.set_binding
+      ? '<span class="badge ok">'+check()+' Set-bound</span>'
+      : '<span class="badge neutral">Not set-bound</span>';
+    var previewTag = isPreview
+      ? '<div class="preview" style="margin:0 0 14px">'+
+        '<b>Preview receipt.</b> Representative data — not a receipt from a live runtime.</div>'
+      : '';
     $("#dbody").innerHTML =
-      '<div class="metarow">'
-      + '<span class="badge ok">'+check()+' Set-bound</span>'
+      previewTag
+      + '<div class="metarow">'
+      + setBound
       + '<span class="badge neutral">Scope: capability</span>'
       + '<span class="badge neutral">'+(r.records||[]).length+' records</span>'
       + '</div>'
       + '<div class="tl">'+evs+'</div>'
       + '<div class="verifybox"><div class="vt">'+shield()+' Verify independently, off-box</div>'
-      + '<p>This receipt is portable and set-bound. A counterparty verifies it on their own machine, pinning the issuer key they trust out-of-band — not this dashboard.</p>'
-      + '<div class="cmd">elastos verify-receipt receipt.json <span class="fl">--signer</span> '+esc(shortId(pin))+'</div>'
-      + '<div class="caveat">This dashboard shows the runtime’s self-asserted signer; it is not an independent authentication. A <b>performed</b> act attests the runtime did what was declared, bounded by trust in the issuing key.</div>'
+      + '<p>This receipt is portable. A counterparty verifies it on their own machine, pinning the issuer key they trust out-of-band — not this dashboard.</p>'
+      + '<div class="cmd">elastos verify-receipt receipt.json <span class="fl">--signer</span> &lt;the issuer key you trust&gt;</div>'
+      + '<div class="caveat">This dashboard shows the runtime’s self-asserted signer ('
+      + esc(shortId((signer||r.signer_public_key_hex||"unsigned")))
+      + '); it is not an independent authentication — pin the key you trust out-of-band, do not pin the receipt’s own signer. A <b>performed</b> act attests the runtime did what was declared, bounded by trust in the issuing key.</div>'
       + '</div>';
-    $("#scrim").classList.add("on");
-    $("#drawer").classList.add("on");
-    $("#drawer").setAttribute("aria-hidden","false");
   }
   function closeReceipt(){
     $("#scrim").classList.remove("on");
