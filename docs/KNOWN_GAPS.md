@@ -183,9 +183,20 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   reads its live data ONLY when launched in-shell (the signed `home_token` rides in the launch URL →
   `x-elastos-home-token` header); opened standalone it falls back to an explicitly LABELLED "sample",
   and an in-shell fetch failure shows an honest "unavailable" banner, never sample data under the live
-  view. Ratchets: `gateway_mandates::tests::{list_route_requires_home_launch_token,
+  view. THE KILL SWITCH (Sprint 13): the app's ONE mutation is `POST
+  /api/apps/mandates/standing-grants/revoke` — same home-token gate, delegating to the SAME shared
+  kill path the API server uses (`handlers::capability::revoke_mandate`: signed `CapabilityRevoke`
+  durably attested BEFORE the envelope dies; an unattestable revoke ABORTS loudly, per AUD-3), so the
+  fail-closed revoke order cannot drift between surfaces. Revoke only REMOVES authority — the worst a
+  stolen mandates launch token does on this surface is kill an agent's autonomy early (fail-safe
+  direction). In the drawer it is two-step (arm → confirm), shown only in-shell on a LIVE mandate;
+  a transport failure is reported with honest uncertainty (the list is refreshed and the card state
+  is authoritative — the runtime attests before replying). Ratchets:
+  `gateway_mandates::tests::{list_route_requires_home_launch_token,
   list_route_reflects_the_shared_registry, list_route_marks_epoch_killed_mandate_dead,
-  receipt_route_requires_home_launch_token, receipt_route_reports_absence_as_404}` +
+  receipt_route_requires_home_launch_token, receipt_route_reports_absence_as_404,
+  revoke_route_requires_home_launch_token_and_kills_nothing,
+  revoke_route_kills_the_mandate_and_is_idempotent, revoke_route_rejects_malformed_id}` +
   `browser_capsules::mandates_ships_as_a_launchable_browser_app`.
 
 Closed at review time (Sprint 3, before merge): the revoke id-casing desync (UPPERCASE hex

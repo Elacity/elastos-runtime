@@ -12,10 +12,17 @@
 //! shell reads exactly the registry the API server issues mandates into. The router is merged into
 //! the gateway only when both handles are present (see [`super::gateway_server::start_gateway_server`]).
 //!
-//! Both routes are strictly READ-ONLY (they mint nothing, mutate nothing) and gated by the same
-//! home-launch token as every other shell app — the mandates app must be the launched capsule.
-//! The liveness (`active`) bit and the receipt export reuse the API server's own handler logic
-//! verbatim (P12: one honest source of truth; a revoked mandate never renders "Live").
+//! Every route is gated by the same home-launch token as every other shell app — the mandates app
+//! must be the launched capsule. The two GET routes are strictly read-only (they mint nothing,
+//! mutate nothing). The ONE mutation this surface carries is REVOKE — the operator's kill switch —
+//! and it only ever REMOVES authority, never grants it: the worst a stolen mandates launch token
+//! can do here is kill an agent's autonomy early (fail-safe direction, P11/P16). Both the card
+//! projection and the kill path are the API server's own shared helpers
+//! ([`mandate_cards`](crate::api::handlers::capability::mandate_cards),
+//! [`revoke_mandate`](crate::api::handlers::capability::revoke_mandate)) so neither the liveness
+//! invariant nor the fail-closed revoke order can drift between surfaces (P12: one honest source
+//! of truth; a revoked mandate never renders "Live"; a revoke that cannot be durably attested does
+//! not happen).
 
 use super::*;
 
@@ -89,19 +96,59 @@ async fn mandate_receipt(
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevokeBody {
+    /// The mandate's token id (the same id the card carries).
+    grant_id: String,
+}
+
+/// POST /api/apps/mandates/standing-grants/revoke — the operator's kill switch, from the shell.
+///
+/// Delegates to [`crate::api::handlers::capability::revoke_mandate`] — the SAME fail-closed kill
+/// path the API server uses (signed `CapabilityRevoke` durably attested BEFORE the envelope dies;
+/// an unattestable revoke ABORTS loudly). Returns `{revoked: bool}`: `true` iff a live envelope was
+/// killed by THIS call (idempotent — an already-dead or unknown mandate reads `false`, honestly).
+/// This is the surface's only mutation, and it exclusively REMOVES authority.
+async fn mandate_revoke(
+    State(state): State<MandateApiState>,
+    headers: HeaderMap,
+    Json(body): Json<RevokeBody>,
+) -> axum::response::Response {
+    if let Err(err) = super::require_home_launch_token(&state.data_dir, &headers, MANDATES_CAPSULE_ID)
+    {
+        return mandate_auth_error(err);
+    }
+    match crate::api::handlers::capability::revoke_mandate(
+        &state.standing_service,
+        &state.capability_manager,
+        &body.grant_id,
+        "standing grant revoked via shell mandates app",
+    )
+    .await
+    {
+        Ok(revoked) => Json(serde_json::json!({ "revoked": revoked })).into_response(),
+        Err((status, msg)) => (status, msg).into_response(),
+    }
+}
+
 /// A failed home-token gate reads as `401` — the app was not launched through the shell.
 fn mandate_auth_error(err: anyhow::Error) -> axum::response::Response {
     (StatusCode::UNAUTHORIZED, err.to_string()).into_response()
 }
 
-/// Build the read-only mandates sub-router, erased over its own state so the gateway can
-/// `.merge()` it without disturbing `GatewayState`.
+/// Build the mandates sub-router (read + the revoke kill switch), erased over its own state so the
+/// gateway can `.merge()` it without disturbing `GatewayState`.
 pub(crate) fn mandate_router(state: MandateApiState) -> Router {
     Router::new()
         .route("/api/apps/mandates/standing-grants", get(mandates_list))
         .route(
             "/api/apps/mandates/mandate/:token_id/receipt",
             get(mandate_receipt),
+        )
+        .route(
+            "/api/apps/mandates/standing-grants/revoke",
+            post(mandate_revoke),
         )
         .with_state(state)
 }
@@ -273,6 +320,136 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The KILL SWITCH is gated like the reads: no home-launch token ⇒ 401 AND the mandate stays
+    /// live — an unauthenticated caller cannot kill (or probe) anything.
+    #[tokio::test]
+    async fn revoke_route_requires_home_launch_token_and_kills_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_for(dir.path());
+        let token = state.capability_manager.grant(
+            "vm-agent",
+            ResourceId::new("elastos://mail/send".to_string()),
+            Action::Execute,
+            TokenConstraints::default(),
+            None,
+        );
+        let mut methods = std::collections::BTreeSet::new();
+        methods.insert("send".to_string());
+        let grant_id = state
+            .standing_service
+            .issue_from_token(&token, methods, None);
+
+        let app = mandate_router(state.clone());
+        let denied = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mandates/standing-grants/revoke")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!("{{\"grant_id\":\"{grant_id}\"}}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            state.standing_service.is_active(&grant_id),
+            "an unauthenticated revoke must not kill the mandate"
+        );
+    }
+
+    /// The in-shell kill switch: revoke over the route kills the mandate (it reads dead in the
+    /// shared registry AND on the list), and a second pull reads `revoked:false` — idempotent,
+    /// honestly reported.
+    #[tokio::test]
+    async fn revoke_route_kills_the_mandate_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_for(dir.path());
+        let token = state.capability_manager.grant(
+            "vm-agent",
+            ResourceId::new("elastos://mail/send".to_string()),
+            Action::Execute,
+            TokenConstraints::default(),
+            None,
+        );
+        let mut methods = std::collections::BTreeSet::new();
+        methods.insert("send".to_string());
+        let grant_id = state
+            .standing_service
+            .issue_from_token(&token, methods, None);
+        assert!(state.standing_service.is_active(&grant_id));
+
+        let app = mandate_router(state.clone());
+        let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        let revoke = |hdr: String, gid: String| {
+            let app = app.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/apps/mandates/standing-grants/revoke")
+                            .header(HOME_TOKEN_HEADER, hdr)
+                            .header("content-type", "application/json")
+                            .body(Body::from(format!("{{\"grant_id\":\"{gid}\"}}")))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+            }
+        };
+
+        // First pull: kills a live mandate.
+        let first = revoke(token_hdr.clone(), grant_id.clone()).await;
+        assert_eq!(first["revoked"], true, "a live mandate is killed by this call");
+        assert!(
+            !state.standing_service.is_active(&grant_id),
+            "the envelope is dead in the SHARED registry"
+        );
+
+        // The list surface agrees — never renders the killed mandate Live.
+        let cards = crate::api::handlers::capability::mandate_cards(
+            &state.standing_service,
+            &state.capability_manager,
+        )
+        .await;
+        let card = cards
+            .mandates
+            .iter()
+            .find(|c| c.token_id == grant_id)
+            .expect("still listed (an operator surface shows what was killed)");
+        assert!(!card.active, "killed mandate never renders Live");
+        assert!(card.revoked);
+
+        // Second pull: idempotent, honestly `false` (nothing live was killed).
+        let second = revoke(token_hdr, grant_id).await;
+        assert_eq!(second["revoked"], false, "double-revoke reads false");
+    }
+
+    /// A malformed grant id is rejected 400 BEFORE any kill path runs (fail-closed canonicalization).
+    #[tokio::test]
+    async fn revoke_route_rejects_malformed_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = mandate_router(state_for(dir.path()));
+        let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mandates/standing-grants/revoke")
+                    .header(HOME_TOKEN_HEADER, token_hdr)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"grant_id":"not-hex"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     /// Honest absence: a well-formed token with no durable records ⇒ 404, never a fabricated receipt.

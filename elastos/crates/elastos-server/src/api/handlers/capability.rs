@@ -1178,20 +1178,25 @@ pub struct RevokeStandingGrantOutput {
     pub revoked: bool,
 }
 
-/// POST /api/standing-grants/revoke  (shell-only) — the autonomy kill switch.
+/// Revoke a mandate — the ONE shared kill path, used by the API server's [`revoke_standing_grant`]
+/// and the gateway's mandates shell app (`api::gateway::gateway_mandates`), so the fail-closed
+/// ORDER of the kill can never drift between surfaces.
 ///
-/// Revoke a standing grant by id, fail-closed AND durably attested. The grant id IS the backing
-/// capability token's id, and killing only the in-memory envelope would leave the mandate's audit
-/// trail showing it live forever — so this first revokes the BACKING TOKEN through the manager
-/// (which emits the signed `CapabilityRevoke` record BEFORE mutating, per AUD-3: if the durable
-/// write fails, the revoke ABORTS and the error surfaces rather than a revoke existing with no
-/// record), then kills the standing envelope so the dispatcher denies every not-yet-started act.
-/// The mandate's receipt (`export_mandate_receipt_for_capability`) thereafter carries the revoke.
-pub async fn revoke_standing_grant(
-    State(state): State<CapabilityState>,
-    Json(input): Json<RevokeStandingGrantInput>,
-) -> Result<Json<RevokeStandingGrantOutput>, (StatusCode, String)> {
-    let token_id = TokenId::from_hex(input.grant_id.trim()).map_err(|e| {
+/// Fail-closed AND durably attested. The grant id IS the backing capability token's id, and killing
+/// only the in-memory envelope would leave the mandate's audit trail showing it live forever — so
+/// this first revokes the BACKING TOKEN through the manager (which emits the signed
+/// `CapabilityRevoke` record BEFORE mutating, per AUD-3: if the durable write fails, the revoke
+/// ABORTS and the error surfaces rather than a revoke existing with no record), then kills the
+/// standing envelope so the dispatcher denies every not-yet-started act. The mandate's receipt
+/// (`export_mandate_receipt_for_capability`) thereafter carries the revoke. `reason` names the
+/// surface that pulled the switch — it lands verbatim in the signed audit record.
+pub async fn revoke_mandate(
+    standing_service: &StandingGrantService,
+    capability_manager: &CapabilityManager,
+    grant_id: &str,
+    reason: &str,
+) -> Result<bool, (StatusCode, String)> {
+    let token_id = TokenId::from_hex(grant_id.trim()).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             format!("grant_id is not a valid token id: {e}"),
@@ -1200,20 +1205,33 @@ pub async fn revoke_standing_grant(
     // Durable custody first (emit-before-mutate): a revoke that cannot be signed onto the audit
     // chain does not happen — mirroring revoke_capability. The envelope stays live so the failure
     // is loud and re-runnable, never a silent half-revoke the receipt can't prove.
-    state
-        .capability_manager
-        .revoke(token_id, "standing grant revoked via API")
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("revoke could not be durably attested: {e}"),
-            )
-        })?;
+    capability_manager.revoke(token_id, reason).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("revoke could not be durably attested: {e}"),
+        )
+    })?;
     // Kill the envelope by the CANONICAL id (the parsed token's lowercase-hex Display form — the
     // exact key the registry stores). Keying off the caller's raw string would let an UPPERCASE
     // spelling revoke the token yet miss the envelope, leaving the dispatch path live.
-    let revoked = state.standing_service.revoke(&token_id.to_string());
+    Ok(standing_service.revoke(&token_id.to_string()))
+}
+
+/// POST /api/standing-grants/revoke  (shell-only) — the autonomy kill switch.
+///
+/// See [`revoke_mandate`] for the fail-closed semantics (durably attest FIRST, then kill the
+/// envelope).
+pub async fn revoke_standing_grant(
+    State(state): State<CapabilityState>,
+    Json(input): Json<RevokeStandingGrantInput>,
+) -> Result<Json<RevokeStandingGrantOutput>, (StatusCode, String)> {
+    let revoked = revoke_mandate(
+        &state.standing_service,
+        &state.capability_manager,
+        &input.grant_id,
+        "standing grant revoked via API",
+    )
+    .await?;
     Ok(Json(RevokeStandingGrantOutput { revoked }))
 }
 
