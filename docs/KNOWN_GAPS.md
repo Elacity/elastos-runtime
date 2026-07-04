@@ -144,6 +144,19 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   mandate, medium); the verified count is observed but not surfaced in the reconciliation fields
   (which bind capsule/method/resource/action/input_hash only); and a torn last log line from a
   concurrent write yields a spurious `Declined` (fail-closed, never a false `Matched`).
+  SECOND AFFORDANCE — STATE-DEPENDENT (Sprint 9): `runtime.content_seen` — did the mandate's OWN
+  capsule successfully OPEN a content id? The mandate is scoped to a content-access-CHECK resource
+  `elastos://runtime/content-access/<id>` (NOT the bare content id), so the receipt's `CapabilityUse`
+  (which carries resource + action but not the method) honestly reads as a read of the access-CHECK,
+  never as a read of the content bytes. `Performed`s iff yes, `Declined`s (⇒ `authorized_not_performed`)
+  iff not — the SAME agent + method + declaration reconciles differently by REAL state, not the
+  declaration (`dispatch_content_seen_outcome_tracks_real_state`,
+  `content_seen_tracks_real_state_not_the_declaration`). Folded in from review:
+  PRINCIPAL-SCOPED (`AuditLog::principal_opened_content` matches only `ContentOpen` with the caller's
+  own `principal_id` — NOT a cross-principal existence oracle; `ContentFetch` is not counted as it
+  carries no principal); and SIGNATURE-VERIFIED (the executor requires the log signed + `verify_chain`
+  Ok before the scan, the same evidentiary bar as `audit_verify`, so a matched record can't be a
+  forged offline append). Same O(n) gated-read DoS profile as audit_verify.
 
 Closed at review time (Sprint 3, before merge): the revoke id-casing desync (UPPERCASE hex
 revoked the token but missed the lowercase-keyed envelope — now canonicalized + regression test

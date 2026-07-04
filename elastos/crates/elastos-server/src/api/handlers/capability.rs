@@ -1992,6 +1992,69 @@ mod tests {
         assert_eq!(uses, vec![false, false], "neither unperformed nor diverged is a success");
     }
 
+    /// Sprint 9: a STATE-DEPENDENT affordance through the real handler. The SAME agent + method +
+    /// declaration reconciles `performed` or `authorized_not_performed` depending on whether the
+    /// runtime's audit history actually records access to the mandate's content id — the outcome
+    /// tracks real state, not the declaration.
+    #[tokio::test]
+    async fn dispatch_content_seen_outcome_tracks_real_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_durable_audit(dir.path());
+        // Record that capsule "vm-agent" really OPENED one content id (state).
+        state
+            .capability_manager
+            .audit_log()
+            .content_open("s", "vm-agent", "QmSEEN", "view", "opened", "p", None)
+            .unwrap();
+        let check = |content_id: &str| {
+            format!("{}{content_id}", crate::intent_executor::CONTENT_ACCESS_CHECK_PREFIX)
+        };
+
+        let dispatch_seen = |resource: String, intent_id: &'static str| {
+            let agent = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+            let value = state.clone();
+            async move {
+                let out = issue_standing_grant(
+                    State(value.clone()),
+                    Json(IssueStandingGrantInput {
+                        capsule: "vm-agent".to_string(),
+                        resource: resource.clone(),
+                        action: "read".to_string(),
+                        methods: vec!["runtime.content_seen".to_string()],
+                        ttl_secs: Some(3600),
+                        agent_pubkey: Some(hex::encode(agent.verifying_key().to_bytes())),
+                    }),
+                )
+                .await
+                .unwrap()
+                .0;
+                let intent = IntentDeclarationV1::issue(
+                    &agent,
+                    agent.verifying_key().to_bytes(),
+                    intent_id,
+                    "vm-agent",
+                    "runtime.content_seen",
+                    "",
+                    &resource,
+                    "read",
+                    &out.token_id,
+                );
+                dispatch_standing_intent(State(value), Json(intent)).await.unwrap().0.outcome
+            }
+        };
+
+        assert_eq!(
+            dispatch_seen(check("QmSEEN"), "seen-1").await,
+            "performed",
+            "a content id this capsule really opened ⇒ performed"
+        );
+        assert_eq!(
+            dispatch_seen(check("QmNEVER"), "never-1").await,
+            "authorized_not_performed",
+            "an unopened content id ⇒ authorized but not performed (Undelivered)"
+        );
+    }
+
     /// Sprint 7: the FIRST real affordance performs end to end through the PRODUCTION executor (no
     /// test stand-in). `runtime.audit_verify` genuinely re-verifies the runtime's own tamper-evident
     /// chain — a side-effect-free read — so a `read` mandate reconciles `performed` and the receipt

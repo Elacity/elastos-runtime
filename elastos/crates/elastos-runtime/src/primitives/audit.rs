@@ -1618,6 +1618,43 @@ impl AuditLog {
         self.recent_events(limit)
     }
 
+    /// Whether the audit history records that `principal_id` SUCCESSFULLY OPENED `content_id` — a
+    /// `ContentOpen` with matching `principal_id` and `decision == "opened"`. PRINCIPAL-SCOPED: it
+    /// answers "did THIS principal access X", never "did anyone" — so it cannot be a cross-principal
+    /// existence oracle. (`ContentFetch` is deliberately NOT counted: it carries no principal, so it
+    /// cannot be attributed.) A state-dependent, side-effect-free read whose answer varies with what
+    /// the principal actually did. Streams the durable log and EARLY-RETURNS on the first match (O(1)
+    /// memory); falls back to the in-memory buffer for an unsigned/memory-only log. A `false` over a
+    /// file-backed log is authoritative for the DURABLE history.
+    pub fn principal_opened_content(&self, principal_id: &str, content_id: &str) -> bool {
+        fn matches(event: &AuditEvent, principal: &str, id: &str) -> bool {
+            matches!(
+                event,
+                AuditEvent::ContentOpen { content_id, principal_id, decision, .. }
+                    if content_id == id && principal_id == principal && decision == "opened"
+            )
+        }
+        if let Some(path) = &self.log_path {
+            if let Ok(file) = File::open(path) {
+                for line in BufReader::new(file).lines().map_while(Result::ok) {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    if let Ok(rec) = serde_json::from_str::<ChainedRecord>(&line) {
+                        if matches(&rec.event, principal_id, content_id) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+        }
+        self.memory_buffer
+            .read()
+            .map(|buf| buf.iter().any(|e| matches(e, principal_id, content_id)))
+            .unwrap_or(false)
+    }
+
     /// Get total event count in memory buffer
     pub fn event_count(&self) -> usize {
         if let Ok(buffer) = self.memory_buffer.read() {

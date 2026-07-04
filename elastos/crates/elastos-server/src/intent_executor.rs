@@ -23,6 +23,14 @@ use elastos_runtime::primitives::audit::AuditLog;
 /// misleading `Matched` — the receipt names what was truly read.
 pub const AUDIT_CHAIN_RESOURCE: &str = "elastos://runtime/audit-chain";
 
+/// The resource namespace `runtime.content_seen` operates on: a content-ACCESS-CHECK reference of
+/// the form `elastos://runtime/content-access/<content-id>`. A `content_seen` mandate is scoped to
+/// THIS (not the bare content id), so the receipt's `CapabilityUse` — which carries the resource but
+/// not the method — honestly reads as "a read of the access-CHECK for <id>", never as "a read of the
+/// content itself". The executor answers a RUNTIME-level question (does the audit history record ANY
+/// successful access to <id>), which the operator authorizes by granting the check mandate.
+pub const CONTENT_ACCESS_CHECK_PREFIX: &str = "elastos://runtime/content-access/";
+
 /// The INDEPENDENT result of performing a declared intent. It MUST describe what the executor
 /// actually did — never be copied from the declaration by the caller — because the gate reconciles
 /// it field-for-field against the declaration to decide `Matched`/`Diverged`/`Undelivered`.
@@ -72,8 +80,64 @@ impl MethodRegistryExecutor {
     ///   outcome tracks REAL chain state, not the declaration: a corrupt or memory-only log is
     ///   honestly `Undelivered`. It reports `action = "read"` (what it truly did), so it is usable
     ///   only under a `read` mandate.
+    /// - `runtime.content_seen` — a state-DEPENDENT read: does the audit history record a successful
+    ///   access (ContentFetch/ContentOpen) to the mandate's `resource` (a content id)? `Performed`s
+    ///   iff yes, `Declined`s iff not — so the SAME intent reconciles `performed` or
+    ///   `authorized_not_performed` depending on real runtime state, not the declaration. Unlike
+    ///   audit_verify the operation is PARAMETERIZED by the declared resource (it searches for that
+    ///   id), so echoing it is honest. Reports `action = "read"`.
     pub fn production(audit_log: Arc<AuditLog>) -> Self {
         let mut registry = Self::new();
+        let content_log = audit_log.clone();
+        registry.register(
+            "runtime.content_seen",
+            Arc::new(move |intent: &IntentDeclarationV1| {
+                // The mandate is scoped to a content-ACCESS-CHECK resource; the content id is the
+                // suffix. A resource outside this namespace is not a content_seen target ⇒ Decline.
+                let Some(content_id) = intent.resource.strip_prefix(CONTENT_ACCESS_CHECK_PREFIX)
+                else {
+                    return IntentExecution::Declined {
+                        reason: format!(
+                            "content_seen resource must be {CONTENT_ACCESS_CHECK_PREFIX}<content-id>"
+                        ),
+                    };
+                };
+                // Same evidentiary bar as audit_verify: the log must be SIGNED and the chain must
+                // VERIFY, so a matched ContentOpen is a signature-attested record an offline editor
+                // could not have forged. Then answer PRINCIPAL-SCOPED: did THIS capsule open it?
+                let verifying_key = content_log
+                    .verifying_key_hex()
+                    .and_then(|hex_key| hex::decode(hex_key).ok())
+                    .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+                    .and_then(|arr| ed25519_dalek::VerifyingKey::from_bytes(&arr).ok());
+                let Some(verifying_key) = verifying_key else {
+                    return IntentExecution::Declined {
+                        reason: "audit chain is unsigned; cannot attest a verified access".to_string(),
+                    };
+                };
+                if content_log.verify_chain(Some(&verifying_key)).is_err() {
+                    return IntentExecution::Declined {
+                        reason: "audit chain did not verify".to_string(),
+                    };
+                }
+                if content_log.principal_opened_content(&intent.capsule, content_id) {
+                    IntentExecution::Performed {
+                        capsule: intent.capsule.clone(),
+                        method_id: intent.method_id.clone(),
+                        input_hash: String::new(), // the search key IS the resource; no other args
+                        // The access-CHECK resource actually searched (== declared: parameterized by
+                        // it), and the action performed (a read of the audit history). The receipt
+                        // therefore names a read of the CHECK, never of the content bytes.
+                        resource: intent.resource.clone(),
+                        action: "read".to_string(),
+                    }
+                } else {
+                    IntentExecution::Declined {
+                        reason: format!("{} did not open {content_id}", intent.capsule),
+                    }
+                }
+            }),
+        );
         registry.register(
             "runtime.audit_verify",
             Arc::new(move |intent: &IntentDeclarationV1| {
@@ -205,5 +269,55 @@ mod tests {
             reg.execute(&intent("runtime.audit_verify")),
             IntentExecution::Declined { .. }
         ));
+    }
+
+    #[test]
+    fn content_seen_tracks_real_state_not_the_declaration() {
+        use elastos_runtime::capability::IntentDeclarationV1;
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(AuditLog::with_file(dir.path().join("audit.log")).unwrap());
+        // Record that principal "vm-agent" SUCCESSFULLY OPENED one content id.
+        log.content_open("sess", "vm-agent", "QmSEEN", "view", "opened", "prov", None)
+            .unwrap();
+        let reg = MethodRegistryExecutor::production(log);
+
+        // Intent resource is a content-access-CHECK ref: prefix + content id.
+        let check = |content_id: &str| format!("{CONTENT_ACCESS_CHECK_PREFIX}{content_id}");
+        let intent_for = |resource: String, capsule: &str| {
+            let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+            IntentDeclarationV1::issue(
+                &sk,
+                sk.verifying_key().to_bytes(),
+                "i",
+                capsule,
+                "runtime.content_seen",
+                "",
+                &resource,
+                "read",
+                "grant-1",
+            )
+        };
+        // The SAME method + declaration shape reconciles differently based on REAL state:
+        match reg.execute(&intent_for(check("QmSEEN"), "vm-agent")) {
+            IntentExecution::Performed { resource, action, .. } => {
+                assert_eq!(resource, check("QmSEEN")); // the CHECK resource, honestly echoed
+                assert_eq!(action, "read");
+            }
+            other => panic!("expected Performed for a seen content id, got {other:?}"),
+        }
+        // Never-opened id ⇒ Declined.
+        assert!(matches!(
+            reg.execute(&intent_for(check("QmNEVER"), "vm-agent")),
+            IntentExecution::Declined { .. }
+        ));
+        // PRINCIPAL-SCOPED: a DIFFERENT capsule asking about the same id gets Declined — no
+        // cross-principal existence oracle.
+        assert!(
+            matches!(
+                reg.execute(&intent_for(check("QmSEEN"), "vm-other")),
+                IntentExecution::Declined { .. }
+            ),
+            "content_seen must not reveal another principal's access"
+        );
     }
 }
