@@ -162,7 +162,24 @@ impl IntentDeclarationV1 {
 /// repeatedly with different arguments within the envelope (the whole point of
 /// unsupervised autonomy). Wiring this from a real issued `CapabilityToken` / grant is a
 /// later chunk; here it is the value the pure check consumes.
+/// Presence-required `Option` deserializer: the KEY must exist (serde's implicit
+/// missing-`Option`-means-`None` is disabled by using `deserialize_with` without a default), and
+/// an explicit `null` is an honest `None`. Guards the snapshot's two narrowing fields: a
+/// hand-repaired file that DROPS `agent_pubkey` must not silently UNBIND an agent-bound mandate,
+/// and one that drops `expires_at` must not immortalize it — the boot error invites the operator
+/// to repair the file, so the repair path must be widen-proof, not just the happy path.
+fn de_present_option<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d)
+}
+
+// `deny_unknown_fields` so a snapshot carrying fields this binary does not understand refuses to
+// load (loud, fail-closed) instead of silently dropping semantics on a version rollback.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StandingGrantEnvelope {
     pub grant_id: String,
     pub capsule: String,
@@ -171,12 +188,16 @@ pub struct StandingGrantEnvelope {
     pub resource: String,
     pub action: String,
     /// Expiry; `None` = never expires (until revoked), mirroring `CapabilityToken::expiry`.
+    /// Presence-required on load: a snapshot missing the KEY is corrupt, never "never expires".
+    #[serde(deserialize_with = "de_present_option")]
     pub expires_at: Option<SecureTimestamp>,
     pub revoked: bool,
     /// The AUTHORIZED AGENT's ed25519 verifying key (hex), if the grant bound one. When set, the
     /// gate requires the intent to be signed by THIS key — so the mandate authorizes a specific
     /// agent, and the audit attribution is the real actor, not "some self-signed key". `None` =
     /// capsule-string-only authorization (weaker attribution; see KNOWN_GAPS G-M4).
+    /// Presence-required on load: a snapshot missing the KEY is corrupt, never an unbound mandate.
+    #[serde(deserialize_with = "de_present_option")]
     pub agent_pubkey: Option<String>,
     /// The backing token's revocation epoch, captured at issue. A grant is dead once the runtime's
     /// current epoch passes it (key rotation / revoke-all advance the epoch), so the dispatcher can
@@ -677,8 +698,14 @@ pub struct StandingGrantStore {
 /// The on-disk snapshot of the standing-grant registry, version-pinned. Same-disk custody caveat
 /// as the audit log's head-anchor: this defends against loss/corruption (strict parse, fail-closed
 /// boot), not against a root attacker rewriting the file — that adversary already owns the runtime
-/// key material on the same disk.
+/// key material on the same disk. Honest bound on "strict": the parse catches STRUCTURAL damage
+/// (truncation, wrong version, unknown fields via `deny_unknown_fields`); a semantically-valid
+/// same-disk edit that DROPS an `Option` field (e.g. deleting `agent_pubkey` to unbind an
+/// agent-bound mandate — serde defaults a missing `Option` to `None`) is inside the same-disk
+/// caveat, not caught here. Making well-formed edits detectable needs a keyed MAC (roadmap, same
+/// custody class as the head-anchor co-signing).
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StandingGrantSnapshotV1 {
     version: u32,
     grants: Vec<StandingGrantEnvelope>,
@@ -776,7 +803,19 @@ impl StandingGrantStore {
             // Durable BEFORE visible: the rename must never publish bytes still in the page cache.
             tmp.sync_all()?;
         }
-        std::fs::rename(&tmp_path, path)
+        std::fs::rename(&tmp_path, path)?;
+        // DURABLE rename (red-team F1): without fsyncing the parent directory, a power cut after
+        // the rename can revert the directory entry to the OLD snapshot — atomic but not yet
+        // durable. For the replay guard that revert IS a replay window (a captured signed intent
+        // acts twice), so the fsync is part of the write, not a nicety. If THIS fsync fails the
+        // rename has already landed: the caller still rolls back memory and surfaces the error —
+        // disk then holds the newer snapshot, which reconciles at the next successful mutation or
+        // restart, and the disk-ahead direction never loses a revoke or a seen intent.
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
     }
 
     /// Issue (or replace) a standing grant, keyed by its `grant_id`, durable-before-visible.
@@ -2378,6 +2417,44 @@ mod tests {
             .err()
             .expect("unknown version must refuse to boot");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// Widen-proof reload (guardian F3): a snapshot edit that DROPS a narrowing `Option` key must
+    /// refuse to load, never silently widen — a missing `agent_pubkey` would UNBIND an agent-bound
+    /// mandate, a missing `expires_at` would immortalize it. An explicit `null` (what the runtime
+    /// itself writes for None) still loads. Unknown fields also refuse (version-rollback safety).
+    #[test]
+    fn reload_refuses_dropped_option_keys_and_unknown_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("standing_grants.json");
+        let base = |fields: &str| {
+            format!(
+                r#"{{"version":1,"grants":[{{"grant_id":"g1","capsule":"vm-agent",
+                     "allowed_methods":["send"],"resource":"elastos://mail/send",
+                     "action":"execute",{fields}"revoked":false,"token_epoch":0}}],
+                     "seen_intents":[]}}"#
+            )
+        };
+        // Both keys present (explicit null) — loads, honestly None.
+        std::fs::write(&path, base(r#""expires_at":null,"agent_pubkey":null,"#)).unwrap();
+        let store = StandingGrantStore::with_persistence(&path).unwrap();
+        assert!(store.is_active("g1"));
+
+        // agent_pubkey KEY dropped — refuses (would unbind an agent-bound mandate).
+        std::fs::write(&path, base(r#""expires_at":null,"#)).unwrap();
+        assert!(StandingGrantStore::with_persistence(&path).is_err());
+
+        // expires_at KEY dropped — refuses (would immortalize the mandate).
+        std::fs::write(&path, base(r#""agent_pubkey":null,"#)).unwrap();
+        assert!(StandingGrantStore::with_persistence(&path).is_err());
+
+        // An unknown field — refuses (a binary rollback must not silently drop semantics).
+        std::fs::write(
+            &path,
+            base(r#""expires_at":null,"agent_pubkey":null,"future_narrowing_field":true,"#),
+        )
+        .unwrap();
+        assert!(StandingGrantStore::with_persistence(&path).is_err());
     }
 
     /// Durable-before-visible: when the snapshot write FAILS, the mutation rolls back and the

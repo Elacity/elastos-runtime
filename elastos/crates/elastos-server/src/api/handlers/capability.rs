@@ -896,18 +896,21 @@ pub async fn revoke_all_capabilities(
 ) -> Result<Json<RevokeAllOutput>, (StatusCode, String)> {
     let new_epoch = state.capability_manager.revoke_all(&input.reason);
 
-    // The envelope side of the mass kill: the epoch advance killed every backing TOKEN, but the
+    // The envelope side of the mass kill: the epoch advance kills every backing TOKEN, but the
     // standing-grant registry knows nothing of epochs — without this, an epoch-dead mandate keeps
     // rendering (and, once dispatch is wired, dispatching) as LIVE. A registry persistence failure
-    // surfaces (the epoch advance above already durably killed every token, so nothing can ACT —
-    // but a mass kill whose envelopes may resurrect as "Live" cards on restart must not report
-    // clean success).
+    // surfaces, and the error claims only what is established (guardian F2): `advance_epoch` is
+    // itself best-effort-persisted and returns the OLD epoch on failure without signaling the
+    // handler — so under a correlated disk failure "all tokens dead" would be a guess, not a fact.
+    // A mass kill whose envelopes may resurrect as "Live" cards on restart must not report clean
+    // success either way.
     state.standing_service.revoke_all().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
-                "epoch advanced (all tokens dead) but the mandate registry could not record the \
-                 envelope revokes — retry: {e}"
+                "epoch advance requested (epoch now {new_epoch}) but the mandate registry could \
+                 not record the envelope revokes — retry, and verify the epoch actually \
+                 advanced: {e}"
             ),
         )
     })?;
@@ -1234,15 +1237,19 @@ pub async fn revoke_mandate(
     // Kill the envelope by the CANONICAL id (the parsed token's lowercase-hex Display form — the
     // exact key the registry stores). Keying off the caller's raw string would let an UPPERCASE
     // spelling revoke the token yet miss the envelope, leaving the dispatch path live. A registry
-    // persistence failure surfaces loudly: the BACKING TOKEN is already durably revoked above (so
-    // the mandate cannot act — dispatch consults token revocation, G-M1), but the envelope flag
-    // did not stick; the caller retries rather than trusting a revoke the registry may forget.
+    // persistence failure surfaces loudly; the error claims exactly what the manager guarantees
+    // (guardian F1): the signed CapabilityRevoke RECORD is durable (emit-before-mutate) and the
+    // token is revoked in THIS runtime, but the token-state persist itself is best-effort
+    // (`persist_revoked_tokens` logs, never errors) — so under a failing disk the honest claim is
+    // "attested + revoked here", not "durably revoked". The caller retries (idempotent) rather
+    // than trusting a revoke the registry may forget.
     standing_service.revoke(&token_id.to_string()).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
-                "backing token durably revoked, but the mandate registry could not record the \
-                 envelope revoke — retry: {e}"
+                "revoke durably attested (signed audit record) and token revoked in this \
+                 runtime, but the mandate registry could not record the envelope revoke — \
+                 retry: {e}"
             ),
         )
     })
@@ -1451,7 +1458,9 @@ pub async fn dispatch_standing_intent(
         Ok(false) => {
             return Err((
                 StatusCode::CONFLICT,
-                format!("intent {} was already dispatched (replay refused)", intent.intent_id),
+                // "consumed", not "dispatched" (guardian F5): the id burns when REGISTERED — a
+                // prior attempt may have been refused after registration and never acted.
+                format!("intent {} was already consumed (replay refused)", intent.intent_id),
             ));
         }
         Err(e) => {

@@ -202,9 +202,17 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         policy_evaluator,
         // The shared runtime mandate registry when provided (so the Home gateway's Mandates app
         // sees the same grants); otherwise this server's own. All shell-only standing-grant verbs
-        // hit this one fail-closed registry.
-        standing_service: standing_service
-            .unwrap_or_else(|| Arc::new(capability_manager.standing_grant_service())),
+        // hit this one fail-closed registry. The fallback is LOUD (guardian F6): a memory-only
+        // registry loses mandates AND the intent replay guard on restart (G-M5 durability) — every
+        // production constructor passes the shared persistent service, so hitting this warns of a
+        // mis-wired caller, not a normal path.
+        standing_service: standing_service.unwrap_or_else(|| {
+            tracing::warn!(
+                "no shared mandate registry provided — falling back to a MEMORY-ONLY registry: \
+                 mandates and the intent replay guard will NOT survive restart"
+            );
+            Arc::new(capability_manager.standing_grant_service())
+        }),
         intent_executor: Arc::new(crate::intent_executor::MethodRegistryExecutor::production(
             capability_manager.audit_log().clone(),
         )),

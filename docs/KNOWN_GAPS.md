@@ -115,12 +115,23 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   G-M1 heal cannot be recorded, and the mass kill reports failure rather than a clean success whose
   envelopes could resurrect as "Live" cards. Boot is fail-closed: a present-but-corrupt (or wrong-
   version) snapshot REFUSES to start (a skipped record could resurrect a revoked mandate or reopen
-  a replay window); a missing file is a clean first boot. Same-disk custody caveat as the audit
-  log's head-anchor: this defends against loss/corruption, not a root attacker who already owns the
-  key material. The carrier_bridge's own registry stays memory-only by design (separate instance;
-  two services over one path would clobber snapshots). Residual (small): no `declared_at` freshness
-  window on intents, and the seen-set grows monotonically (O(n) snapshot rewrite per dispatch) —
-  add a windowed/compacting guard before exposing dispatch beyond the single trusted operator.
+  a replay window); a missing file is a clean first boot. POWER-LOSS durable, not just
+  process-restart durable (red-team F1): the snapshot write fsyncs the temp file AND (unix) the
+  parent directory after the rename — without the directory fsync a power cut could revert the
+  rename to the OLD snapshot, and for the replay guard that revert IS a replay window (a captured
+  signed intent acting twice; unlike a reverted revoke, which the durable token-revocation check
+  still backstops at dispatch, a lost seen-intent has no second line). Same-disk custody caveat as
+  the audit log's head-anchor: this defends against loss/corruption, not a root attacker who
+  already owns the key material — and honestly bounded (red-team F2): the strict parse +
+  `deny_unknown_fields` catch STRUCTURAL damage and unknown-field skew, but a semantically-valid
+  same-disk edit that DROPS an `Option` field (deleting `agent_pubkey` unbinds an agent-bound
+  mandate — serde defaults missing `Option`s to `None`) is inside that caveat; making well-formed
+  edits detectable needs a keyed MAC (roadmap, same class as head-anchor co-signing). The
+  carrier_bridge's own registry stays memory-only by design (separate instance; two services over
+  one path would clobber snapshots). Residual (small): no `declared_at` freshness window on
+  intents, and the seen-set grows monotonically (O(n) snapshot rewrite per dispatch, shell-only
+  reachable) — add a windowed/compacting guard before exposing dispatch beyond the single trusted
+  operator.
   Ratchets: `intent::tests::{persistent_store_survives_reopen_live_dead_and_replay,
   persistent_store_refuses_corrupt_state_at_boot, persist_failure_rolls_back_and_surfaces}` +
   `capability::tests::mandates_survive_restart_over_the_handlers`.
