@@ -11,7 +11,7 @@ pub mod time;
 #[allow(unused_imports)]
 pub use audit::{
     verify_mandate_receipt, AuditEvent, AuditLog, ChainAttestation, MandateReceipt,
-    MandateReceiptVerdict,
+    MandateReceiptScope, MandateReceiptVerdict,
 };
 #[allow(unused_imports)]
 pub use metrics::CapsuleMetrics;

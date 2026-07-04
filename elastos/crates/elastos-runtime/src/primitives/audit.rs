@@ -61,6 +61,41 @@ fn compute_record_hash(seq: u64, prev_hash: &[u8; 32], event_json: &[u8]) -> [u8
     h.finalize().into()
 }
 
+/// Domain separator for the mandate-receipt SET binding — distinct from [`AUDIT_RECORD_DOMAIN`] so a
+/// set-binding signature can never be confused for (or replayed as) a per-record signature.
+const MANDATE_RECEIPT_BINDING_DOMAIN: &[u8] = b"elastos.runtime/mandate-receipt-set/v1";
+
+/// The canonical bytes an issuing runtime signs to BIND the exact ordered record set of a receipt:
+/// the scope, the record count, and every `record_hash` in order. Recomputable by any verifier from
+/// the receipt alone, so a signature over it makes the SET tamper-evident — adding, dropping, or
+/// reordering any record changes these bytes. This closes the keyless "a holder trims a use in
+/// transit" gap that a per-record filter cannot: each `record_hash` already commits to its record's
+/// `(seq, prev_hash, event)`, so binding the ordered hash list fixes the whole membership. It does
+/// NOT bind against the key-holding issuer itself (which can sign any set) — the same tamper-evident,
+/// not tamper-proof, bound the chain's signing key carries everywhere.
+fn mandate_receipt_binding_message(
+    scope: &MandateReceiptScope,
+    records: &[ChainedRecord],
+) -> Vec<u8> {
+    let mut msg =
+        Vec::with_capacity(MANDATE_RECEIPT_BINDING_DOMAIN.len() + 32 + records.len() * 64);
+    msg.extend_from_slice(MANDATE_RECEIPT_BINDING_DOMAIN);
+    match scope {
+        MandateReceiptScope::Contiguous => msg.push(0u8),
+        MandateReceiptScope::Capability { token_id } => {
+            msg.push(1u8);
+            msg.extend_from_slice(&(token_id.len() as u64).to_be_bytes());
+            msg.extend_from_slice(token_id.as_bytes());
+        }
+    }
+    msg.extend_from_slice(&(records.len() as u64).to_be_bytes());
+    for record in records {
+        // `record_hash` is a fixed-width hex string (64 chars); position + count fix the order.
+        msg.extend_from_slice(record.record_hash.as_bytes());
+    }
+    msg
+}
+
 /// One tamper-evident, hash-chained, signed audit record as persisted to disk (one JSON object per
 /// line). The on-disk format; the in-memory ring buffer keeps bare [`AuditEvent`]s for fast reads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,14 +117,40 @@ pub struct ChainedRecord {
 /// Schema tag for [`MandateReceipt`]; the verifier fail-closes on any other value.
 pub const MANDATE_RECEIPT_SCHEMA: &str = "elastos.mandate_receipt/v1";
 
+/// What a [`MandateReceipt`] covers — which determines how it is verified.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MandateReceiptScope {
+    /// A CONTIGUOUS run of the chain (whole chain or a `seq` range). Verified with the contiguity
+    /// check: each record links the prior and `seq` increments by 1, so nothing INTERIOR was dropped.
+    Contiguous,
+    /// EVERY record this runtime holds for ONE capability `token_id` — a FILTERED, non-contiguous
+    /// view (a delegation's records are interleaved with others in the chain, so contiguity does NOT
+    /// apply). Verified instead by requiring that every record carries this `token_id`, exactly one
+    /// is the `CapabilityGrant` (the mandate itself), and the records are in strictly ascending
+    /// `seq` (no duplicate or reorder). This is the per-delegation receipt shape.
+    ///
+    /// COMPLETENESS is bounded, and the bound differs by WHO the adversary is:
+    /// - Against any HOLDER in transit (relay, custodian, the audited party): the issuer's
+    ///   [`MandateReceipt::set_binding`] signature fixes the exact record set, so dropping,
+    ///   adding, or reordering a use/revoke is DETECTED (`set_binding_ok` fails).
+    /// - Against the key-holding ISSUER itself: NOT provable — a compromised runtime can sign a
+    ///   selective set. This is the same tamper-evident-not-tamper-proof bound the chain's signing
+    ///   key carries everywhere; unlike a `Contiguous` receipt (whose linkage would break on an
+    ///   interior drop), a `Capability` receipt does not prove the issuer omitted nothing at export.
+    Capability { token_id: String },
+}
+
 /// A PORTABLE, self-contained proof that a set of audit records were authorized and recorded under
 /// one signer — verifiable by a THIRD PARTY (an auditor, insurer, counterparty) with NO runtime, NO
 /// `AuditLog`, and NO disk access: just this JSON document and [`verify_mandate_receipt`]. This is
 /// the "admissible receipt" product primitive for Flint — it turns the tamper-evident chain from an
 /// internal integrity feature into an artifact you can hand someone off-box. By convention
 /// `records[0]` is the authorization (the mandate) and the rest are the actions taken under it, in
-/// ascending `seq`; the verifier proves each record is individually signed + untampered AND that
-/// they form a contiguous, un-reordered, un-dropped run.
+/// ascending `seq`. The verifier proves each record is individually signed + untampered, that the
+/// set satisfies its [`scope`](MandateReceipt::scope) rule (contiguity for `Contiguous`; token
+/// binding + single grant + strict order for `Capability`), and — via
+/// [`set_binding`](MandateReceipt::set_binding) — that no HOLDER altered the record set in transit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MandateReceipt {
     /// Schema tag; always `elastos.mandate_receipt/v1`.
@@ -107,8 +168,24 @@ pub struct MandateReceipt {
     /// runtime holds the signing key and can sign a fabricated receipt. Tamper-EVIDENT, not
     /// tamper-proof.
     pub signer_public_key_hex: String,
+    /// What this receipt covers — selects the verification model (contiguity vs per-capability).
+    #[serde(default = "default_receipt_scope")]
+    pub scope: MandateReceiptScope,
     /// The signed, hash-chained records, ascending `seq`. `records[0]` = mandate, rest = actions.
     pub records: Vec<ChainedRecord>,
+    /// Ed25519 signature (base64) by the issuing runtime over
+    /// [`mandate_receipt_binding_message`] — it BINDS the exact ordered record set (scope + count +
+    /// each `record_hash`), so no HOLDER in transit can add, drop, or reorder a record undetectably.
+    /// REQUIRED for `Capability` scope (whose membership is otherwise a keyless filter a holder could
+    /// trim); optional for legacy `Contiguous` receipts, where linkage already fixes the interior.
+    /// `None` only for a memory-only/unsigned log. This stops HOLDERS, not the key-holding issuer:
+    /// a compromised runtime can still sign a selective set (tamper-evident, not tamper-proof).
+    #[serde(default)]
+    pub set_binding: Option<String>,
+}
+
+fn default_receipt_scope() -> MandateReceiptScope {
+    MandateReceiptScope::Contiguous
 }
 
 /// The result of independently verifying a [`MandateReceipt`]. Every boolean is a distinct failure
@@ -132,6 +209,9 @@ pub struct MandateReceiptVerdict {
     /// True iff `records[0]` is the genesis-anchored start of the chain (`seq == 1`, `prev_hash` all
     /// zero) — so the receipt proves the run FROM THE BEGINNING. (Front-truncation is otherwise
     /// undetectable; END-truncation still needs an external head anchor — see [`MandateReceipt`].)
+    /// N/A for `Capability` scope: a mandate's grant sits mid-chain after unrelated events, so this
+    /// is expected to be `false` for a legitimate per-capability receipt — do not treat it as a
+    /// completeness or suspicion signal there (use `scope_ok` + `set_binding_ok` instead).
     pub starts_at_genesis: bool,
     /// How many records were checked.
     pub records: usize,
@@ -142,7 +222,20 @@ pub struct MandateReceiptVerdict {
     /// Every record is ed25519-signed and verifies against the signer key over its `record_hash`.
     pub signatures_ok: bool,
     /// The records form a contiguous run: `seq` increments by 1 and each `prev_hash` links the prior.
+    /// (Reported for every receipt; only REQUIRED for a `Contiguous`-scope receipt.)
     pub chain_linkage_ok: bool,
+    /// The scope's structural rule holds. For `Contiguous` this is `chain_linkage_ok` (a completeness
+    /// statement: nothing interior was dropped). For `Capability` it is BINDING + shape, NOT
+    /// completeness: every record carries the target `token_id`, exactly one is the grant, and the
+    /// records are in strictly ascending `seq`. A `Capability` `scope_ok == true` does NOT assert no
+    /// use was omitted at export by the issuer — see [`MandateReceiptScope::Capability`]; holder-side
+    /// omission is caught separately by `set_binding_ok`.
+    pub scope_ok: bool,
+    /// The issuer's [`MandateReceipt::set_binding`] signature verifies over the exact ordered record
+    /// set — so no HOLDER added, dropped, or reordered a record in transit. REQUIRED (must be `true`)
+    /// for `Capability` scope; for `Contiguous` it is `true` when absent (linkage already binds the
+    /// interior) and verified when present. Does not bind against the key-holding issuer itself.
+    pub set_binding_ok: bool,
     /// The first structural failure (bad schema/hex, wrong key length, empty receipt), if any.
     pub error: Option<String>,
 }
@@ -159,6 +252,8 @@ impl MandateReceiptVerdict {
             hashes_ok: false,
             signatures_ok: false,
             chain_linkage_ok: false,
+            scope_ok: false,
+            set_binding_ok: false,
             error: Some(error.into()),
         }
     }
@@ -174,9 +269,12 @@ impl MandateReceiptVerdict {
 /// ONLY when the receipt is structurally sound AND its embedded signer equals that pinned key. Pass
 /// `None` only when you deliberately want a STRUCTURAL check for display (never a trust decision):
 /// an attacker can self-sign a fabricated receipt that is `structurally_valid` under its own key, so
-/// `authenticated` is `false` without a pin. Also note (carried from the chain): the receipt proves
-/// its records are a contiguous run, not that they are COMPLETE — end-truncation needs an external
-/// head anchor (`starts_at_genesis` covers only the front) — and verification currently re-serializes
+/// `authenticated` is `false` without a pin. The record SET is also bound by the issuer's
+/// `set_binding` signature (`set_binding_ok`), so a HOLDER cannot add/drop/reorder a record in
+/// transit — REQUIRED for `Capability` scope. Residual caveats (carried from the chain): a
+/// `Contiguous` receipt proves its records are a contiguous run but end-truncation still needs an
+/// external head anchor (`starts_at_genesis` covers only the front); a `Capability` receipt's
+/// completeness holds only against holders, not the key-holding issuer; and verification re-serializes
 /// events with this crate's serde, so a third party must use a byte-compatible encoder.
 pub fn verify_mandate_receipt(
     receipt: &MandateReceipt,
@@ -261,7 +359,48 @@ pub fn verify_mandate_receipt(
         }
     }
 
-    let structurally_valid = hashes_ok && signatures_ok && chain_linkage_ok;
+    // The scope's completeness/binding rule. Contiguous ⇒ nothing interior dropped (linkage);
+    // Capability ⇒ every record is bound to the target token_id and exactly one is the grant, so a
+    // record from a DIFFERENT delegation can't be smuggled in and the mandate itself is present.
+    let scope_ok = match &receipt.scope {
+        MandateReceiptScope::Contiguous => chain_linkage_ok,
+        MandateReceiptScope::Capability { token_id } => {
+            let all_bound = receipt
+                .records
+                .iter()
+                .all(|record| record.event.capability_token_id() == Some(token_id.as_str()));
+            let grant_count = receipt
+                .records
+                .iter()
+                .filter(|record| record.event.is_capability_grant())
+                .count();
+            // Strictly ascending, unique `seq`: a bundle-only guard against a duplicated or
+            // reordered record inflating/misrepresenting the action set.
+            let strictly_ordered =
+                receipt.records.windows(2).all(|pair| pair[1].seq > pair[0].seq);
+            all_bound && grant_count == 1 && strictly_ordered
+        }
+    };
+    // SET BINDING: the issuer's signature over the ordered record set (scope + count + record
+    // hashes). It makes membership tamper-EVIDENT against any HOLDER — a dropped/added/reordered
+    // record changes the signed message. REQUIRED for `Capability`; for `Contiguous` the linkage
+    // already fixes the interior, so a binding is optional but MUST verify when present.
+    let set_binding_ok = match &receipt.set_binding {
+        Some(sig_b64) => BASE64
+            .decode(sig_b64.trim())
+            .ok()
+            .and_then(|bytes| Signature::from_slice(&bytes).ok())
+            .map(|signature| {
+                vk.verify(
+                    &mandate_receipt_binding_message(&receipt.scope, &receipt.records),
+                    &signature,
+                )
+                .is_ok()
+            })
+            .unwrap_or(false),
+        None => matches!(receipt.scope, MandateReceiptScope::Contiguous),
+    };
+    let structurally_valid = hashes_ok && signatures_ok && scope_ok && set_binding_ok;
     // Authenticity requires the caller's out-of-band pin: the embedded signer must equal a key the
     // consumer already trusts. Without a pin we CANNOT authenticate — an attacker self-signs too.
     let signer_matches_expected = expected_signer_hex
@@ -284,6 +423,8 @@ pub fn verify_mandate_receipt(
         hashes_ok,
         signatures_ok,
         chain_linkage_ok,
+        scope_ok,
+        set_binding_ok,
         error: None,
     }
 }
@@ -1043,6 +1184,18 @@ impl AuditLog {
         })
     }
 
+    /// Sign the exact ordered record SET of a receipt with this log's key (base64 ed25519 over
+    /// [`mandate_receipt_binding_message`]). The self-contained binding a verifier re-checks to
+    /// detect any holder-side add/drop/reorder. `None` for an unsigned log.
+    fn sign_receipt_set(
+        &self,
+        scope: &MandateReceiptScope,
+        records: &[ChainedRecord],
+    ) -> Option<String> {
+        let signer = self.signer.as_ref()?;
+        Some(BASE64.encode(signer.sign(&mandate_receipt_binding_message(scope, records)).to_bytes()))
+    }
+
     /// Export the durable chain as a PORTABLE [`MandateReceipt`] a third party can verify off-box
     /// with [`verify_mandate_receipt`] and NO runtime. `None` for a memory-only or unsigned log
     /// (nothing durable + signed to hand out).
@@ -1076,10 +1229,56 @@ impl AuditLog {
         if records.is_empty() {
             return None;
         }
+        let scope = MandateReceiptScope::Contiguous;
+        let set_binding = self.sign_receipt_set(&scope, &records);
         Some(MandateReceipt {
             schema: MANDATE_RECEIPT_SCHEMA.to_string(),
+            scope,
             signer_public_key_hex,
             records,
+            set_binding,
+        })
+    }
+
+    /// Export a PER-MANDATE receipt: EVERY durable record bound to one capability `token_id` — the
+    /// grant (the mandate) plus every use / revoke under it — regardless of where they sit in the
+    /// interleaved chain. This is the delegation-shaped artifact you hand an auditor: "here is the
+    /// authorization, and here are the actions taken under it." `None` for a memory-only/unsigned
+    /// log or a `token_id` with no records. Verified with [`MandateReceiptScope::Capability`].
+    ///
+    /// COMPLETENESS is bounded (see that scope's docs): the `set_binding` signature makes the record
+    /// set tamper-evident against any HOLDER in transit, but a compromised key-holding issuer could
+    /// still sign a selective set. Unlike a `Contiguous` receipt, this does NOT prove the issuer
+    /// omitted no action at export — the bundle carries no such attestation, and none is implied.
+    pub fn export_mandate_receipt_for_capability(&self, token_id: &str) -> Option<MandateReceipt> {
+        let path = self.log_path.as_ref()?;
+        let signer_public_key_hex = self.verifying_key_hex()?;
+        let file = File::open(path).ok()?;
+        let reader = BufReader::new(file);
+        let mut records = Vec::new();
+        for line in reader.lines() {
+            let line = line.ok()?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: ChainedRecord = serde_json::from_str(&line).ok()?;
+            if record.event.capability_token_id() == Some(token_id) {
+                records.push(record);
+            }
+        }
+        if records.is_empty() {
+            return None;
+        }
+        let scope = MandateReceiptScope::Capability {
+            token_id: token_id.to_string(),
+        };
+        let set_binding = self.sign_receipt_set(&scope, &records);
+        Some(MandateReceipt {
+            schema: MANDATE_RECEIPT_SCHEMA.to_string(),
+            scope,
+            signer_public_key_hex,
+            records,
+            set_binding,
         })
     }
 
@@ -1465,6 +1664,24 @@ impl AuditEvent {
             AuditEvent::PolicyDivergence { .. } => "policy_divergence",
             AuditEvent::Custom { .. } => "custom",
         }
+    }
+
+    /// The capability `token_id` this event pertains to — the identifier that binds a mandate
+    /// (`CapabilityGrant`) to the actions taken under it (`CapabilityUse`) and its revocation
+    /// (`CapabilityRevoke`). `None` for events that are not scoped to a single capability token.
+    /// Used to filter the chain into a per-mandate receipt.
+    pub fn capability_token_id(&self) -> Option<&str> {
+        match self {
+            AuditEvent::CapabilityGrant { token_id, .. }
+            | AuditEvent::CapabilityRevoke { token_id, .. }
+            | AuditEvent::CapabilityUse { token_id, .. } => Some(token_id.as_str()),
+            _ => None,
+        }
+    }
+
+    /// True iff this event is the authorization (the mandate itself) — a `CapabilityGrant`.
+    pub fn is_capability_grant(&self) -> bool {
+        matches!(self, AuditEvent::CapabilityGrant { .. })
     }
 }
 
@@ -1867,11 +2084,134 @@ mod tests {
         // And an empty receipt fails closed.
         let empty = MandateReceipt {
             schema: MANDATE_RECEIPT_SCHEMA.to_string(),
+            scope: MandateReceiptScope::Contiguous,
             signer_public_key_hex: String::new(),
             records: vec![],
+            set_binding: None,
         };
         let verdict = verify_mandate_receipt(&empty, None);
         assert!(!verdict.structurally_valid && !verdict.authenticated);
+    }
+
+    // Emit a mandate (grant) + two uses under it, INTERLEAVED with unrelated events, then export the
+    // per-capability receipt. Returns (dir, receipt, signer_hex, token_id).
+    fn emit_and_export_capability_receipt() -> (tempfile::TempDir, MandateReceipt, String, String) {
+        use crate::capability::token::{Action, ResourceId, TokenId};
+        let dir = tempfile::tempdir().unwrap();
+        let log = AuditLog::with_file(dir.path().join("audit.log")).unwrap();
+        let token = TokenId::new();
+        let token_id = token.to_string();
+        let vendor = ResourceId::new("elastos://pay/vendor");
+        // Unrelated noise before + between the mandate's records (interleaving is the whole point).
+        log.emit(AuditEvent::RuntimeStart {
+            timestamp: SecureTimestamp::now(),
+            version: "noise".to_string(),
+        })
+        .unwrap();
+        log.capability_grant(&token, "vm-agent", &vendor, Action::Write, None);
+        log.emit(AuditEvent::RuntimeStart {
+            timestamp: SecureTimestamp::now(),
+            version: "noise-2".to_string(),
+        })
+        .unwrap();
+        log.capability_use(&token, "vm-agent", &vendor, Action::Write, true);
+        log.capability_use(&token, "vm-agent", &vendor, Action::Write, true);
+        let signer = log.verifying_key_hex().unwrap();
+        let receipt = log
+            .export_mandate_receipt_for_capability(&token_id)
+            .expect("per-capability receipt");
+        (dir, receipt, signer, token_id)
+    }
+
+    #[test]
+    fn per_capability_receipt_binds_the_mandate_and_its_actions_and_authenticates() {
+        let (_dir, receipt, signer, _token) = emit_and_export_capability_receipt();
+        // Exactly the grant + its two uses — the interleaved noise is excluded.
+        assert_eq!(receipt.records.len(), 3, "grant + 2 uses, noise excluded");
+        assert!(matches!(receipt.scope, MandateReceiptScope::Capability { .. }));
+        // Round-trips as a portable document and authenticates when pinned to the real signer.
+        let wire = serde_json::to_string(&receipt).unwrap();
+        let received: MandateReceipt = serde_json::from_str(&wire).unwrap();
+        let verdict = verify_mandate_receipt(&received, Some(&signer));
+        assert!(verdict.structurally_valid, "scoped receipt is sound: {verdict:?}");
+        assert!(verdict.scope_ok, "all records bound to the token + exactly one grant");
+        assert!(verdict.set_binding_ok, "issuer's set-binding signature verifies");
+        assert!(verdict.authenticated, "pinned to the true signer ⇒ authenticated");
+        // `starts_at_genesis` is N/A here: the grant sits mid-chain after noise, so it is false and
+        // MUST NOT be read as a completeness/suspicion signal for a Capability receipt.
+        assert!(!verdict.starts_at_genesis, "grant is mid-chain ⇒ genesis anchor N/A");
+    }
+
+    #[test]
+    fn per_capability_set_binding_detects_a_keyless_dropped_use() {
+        // The completeness attack both reviewers flagged: a HOLDER (no signing key) trims an
+        // inconvenient use from the JSON. Every remaining record still hashes, signs, and is bound to
+        // the token (scope_ok stays true), so ONLY the issuer's set-binding signature can catch it.
+        let (_dir, mut receipt, signer, _token) = emit_and_export_capability_receipt();
+        // Drop one USE (keep the grant): the filtered scope rule is still satisfied by what remains.
+        let victim = receipt
+            .records
+            .iter()
+            .position(|r| !r.event.is_capability_grant())
+            .expect("a use to drop");
+        receipt.records.remove(victim);
+        let verdict = verify_mandate_receipt(&receipt, Some(&signer));
+        assert!(verdict.scope_ok, "the trimmed set still passes the filter rule — that is the trap");
+        assert!(!verdict.set_binding_ok, "the issuer's set binding no longer matches the trimmed set");
+        assert!(!verdict.structurally_valid, "a holder-trimmed set must not verify");
+        assert!(!verdict.authenticated, "and it must not authenticate");
+    }
+
+    #[test]
+    fn per_capability_receipt_rejects_a_duplicated_record() {
+        // Duplicate a signed use to inflate/misrepresent activity. Strict-seq breaks scope_ok and the
+        // changed set breaks the binding — belt and suspenders.
+        let (_dir, mut receipt, signer, _token) = emit_and_export_capability_receipt();
+        let clone = receipt.records.last().unwrap().clone();
+        receipt.records.push(clone);
+        let verdict = verify_mandate_receipt(&receipt, Some(&signer));
+        assert!(!verdict.scope_ok, "duplicate seq breaks strict ordering");
+        assert!(!verdict.set_binding_ok, "a duplicated record changes the bound set");
+        assert!(!verdict.structurally_valid);
+    }
+
+    #[test]
+    fn per_capability_receipt_rejects_a_smuggled_foreign_record() {
+        let (_dir, mut receipt, signer, _token) = emit_and_export_capability_receipt();
+        // Splice in a record from a DIFFERENT delegation. It is individually AUTHENTIC (really
+        // signed), but it is NOT bound to this mandate's token_id → scope_ok must fail.
+        let dir2 = tempfile::tempdir().unwrap();
+        let log2 = AuditLog::with_file(dir2.path().join("other.log")).unwrap();
+        use crate::capability::token::{Action, ResourceId, TokenId};
+        log2.capability_use(
+            &TokenId::new(),
+            "vm-agent",
+            &ResourceId::new("elastos://pay/vendor"),
+            Action::Write,
+            true,
+        );
+        // Re-sign it under THE SAME signer so signatures still verify (only the token differs).
+        // (Simplest: pull a real foreign record from log2's file.)
+        let other_line = std::fs::read_to_string(dir2.path().join("other.log")).unwrap();
+        let foreign: ChainedRecord = serde_json::from_str(other_line.lines().next().unwrap()).unwrap();
+        receipt.records.push(foreign);
+        // Verify against the receipt's OWN signer (structural), not the cross-log signer — the point
+        // is the SCOPE check, which must reject the foreign token regardless of signature origin.
+        let verdict = verify_mandate_receipt(&receipt, Some(&signer));
+        assert!(!verdict.scope_ok, "a foreign-token record must break scope_ok");
+        assert!(!verdict.structurally_valid, "scope failure ⇒ not structurally valid");
+        let _ = signer;
+    }
+
+    #[test]
+    fn per_capability_receipt_requires_the_grant_to_be_present() {
+        let (_dir, mut receipt, signer, _token) = emit_and_export_capability_receipt();
+        // Drop the mandate itself (the grant), leaving only uses: a receipt of actions with no
+        // authorization must not pass its scope rule (exactly one grant required).
+        receipt.records.retain(|r| !r.event.is_capability_grant());
+        assert!(!receipt.records.is_empty());
+        let verdict = verify_mandate_receipt(&receipt, Some(&signer));
+        assert!(!verdict.scope_ok, "no grant ⇒ scope_ok false (actions without a mandate)");
     }
 
     #[test]
