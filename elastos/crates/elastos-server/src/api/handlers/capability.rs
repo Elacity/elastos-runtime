@@ -1150,7 +1150,7 @@ pub async fn revoke_standing_grant(
     State(state): State<CapabilityState>,
     Json(input): Json<RevokeStandingGrantInput>,
 ) -> Result<Json<RevokeStandingGrantOutput>, (StatusCode, String)> {
-    let token_id = TokenId::from_hex(&input.grant_id).map_err(|e| {
+    let token_id = TokenId::from_hex(input.grant_id.trim()).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             format!("grant_id is not a valid token id: {e}"),
@@ -1169,7 +1169,10 @@ pub async fn revoke_standing_grant(
                 format!("revoke could not be durably attested: {e}"),
             )
         })?;
-    let revoked = state.standing_service.revoke(&input.grant_id);
+    // Kill the envelope by the CANONICAL id (the parsed token's lowercase-hex Display form — the
+    // exact key the registry stores). Keying off the caller's raw string would let an UPPERCASE
+    // spelling revoke the token yet miss the envelope, leaving the dispatch path live.
+    let revoked = state.standing_service.revoke(&token_id.to_string());
     Ok(Json(RevokeStandingGrantOutput { revoked }))
 }
 
@@ -1439,7 +1442,12 @@ mod tests {
         .0;
         assert_eq!(out.token_id, out.grant_id, "the grant id IS the mandate's token id");
 
-        // The agent acts under the mandate (in production the validate path records this).
+        // The agent acts under the mandate. This injects the CapabilityUse the way
+        // CapabilityManager::validate emits it on every token redemption (manager.rs, check #8
+        // path) — the production act path that exists today. NOTE the intent-channel dispatcher
+        // (StandingGrantService::dispatch) is not yet wired to any endpoint and emits
+        // intent-keyed (not token-keyed) records; when it lands, its acts must ALSO reach this
+        // receipt or the loop under-reports — tracked in docs/KNOWN_GAPS.md.
         let token_id = TokenId::from_hex(&out.token_id).expect("token id round-trips");
         state.capability_manager.audit_log().capability_use(
             &token_id,
@@ -1487,6 +1495,41 @@ mod tests {
         // A malformed token id is a 400, before any chain read.
         let bad = mandate_receipt(State(state), Path("not-hex".to_string())).await;
         assert!(matches!(bad, Err((StatusCode::BAD_REQUEST, _))));
+    }
+
+    /// Regression (red-team): `hex::decode` accepts UPPERCASE but the envelope registry is keyed
+    /// by the token's lowercase Display form. Keying the envelope kill off the caller's raw string
+    /// would revoke the TOKEN yet leave the ENVELOPE live — the dispatch path's only check. The
+    /// handler must canonicalize before both kills.
+    #[tokio::test]
+    async fn revoke_with_uppercase_id_still_kills_the_standing_envelope() {
+        let state = test_state();
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: "elastos://mail/send".to_string(),
+                action: "execute".to_string(),
+                methods: vec!["send".to_string()],
+                ttl_secs: None,
+            }),
+        )
+        .await
+        .expect("issue ok")
+        .0;
+        assert!(state.standing_service.is_active(&out.grant_id));
+
+        let rev = revoke_standing_grant(
+            State(state.clone()),
+            Json(RevokeStandingGrantInput {
+                grant_id: out.grant_id.to_uppercase(),
+            }),
+        )
+        .await
+        .expect("revoke ok")
+        .0;
+        assert!(rev.revoked, "an UPPERCASE spelling of the id must still kill the envelope");
+        assert!(!state.standing_service.is_active(&out.grant_id));
     }
 
     #[tokio::test]

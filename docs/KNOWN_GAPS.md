@@ -73,6 +73,37 @@ for open work:
 - **Boot-critical sub-providers are pinned first-writer-wins** — `8b688fc`: `register_sub_provider` refuses (structural `Err`, checked under the write lock) to overwrite a still-live pinned slot (`encrypt`/`publish`/`media`/`key`/`decrypt`/`drm`/`rights`/`wallet`/`chain`), so a launched capsule declaring `provides: elastos://encrypt/*` cannot seize the CEK-escrow route (Principle 3/15); `unregister_sub_provider` frees the slot so a genuine restart re-mounts. Proven by `test_pinned_sub_provider_is_first_writer_wins`; non-pinned names keep last-write-wins.
 - **`request_act` inbox intake fails closed on an undeclared op (consent needs visibility)** — `d9bf5cc`: `create_inspect_action_request` rejects when the plan reports `data.valid != true` BEFORE persisting, so an operation the target authority never declared writes no pending record / no approvable Inbox row (it would otherwise prompt an approval with an empty gate preview). Proven by `gateway_tests::inspect::inspect_action_rejects_undeclared_operation_before_inbox` (+ the 6 restored inbox-approval regression tests). This is the fail-closed intake feeding the G3/G4 dispatch/approval loop.
 
+## Mandate lifecycle (Sprint 3) — tracked latent gaps (guardian F1/F3 + red-team, 2026-07-04)
+
+The grant → revoke → prove loop shipped with these HONEST bounds, each of which detonates only
+when the intent-channel dispatch endpoint is wired (it has ZERO non-test call sites today):
+
+- **G-M1 (dispatch must consult token revocation + epoch).** `dispatch_standing_act` /
+  `check_intent_within_envelope` (`capability/intent.rs`) enforce revocation ONLY via the in-memory
+  `envelope.revoked` flag — never `store.is_token_revoked`, never the epoch. Consequences when a
+  `/dispatch` route lands: (a) the revoke handler's token-revoke→envelope-kill window becomes a real
+  act-under-revoked-token race; (b) `revoke_all` (epoch advance) kills every token but leaves every
+  standing envelope live — an intent-channel agent would survive the mass kill switch. FIX AT WIRE
+  TIME: dispatch must check `is_token_revoked` + epoch in addition to the envelope. (Restart is
+  fail-closed by construction: the envelope registry is in-memory, so a reboot denies with NoGrant.)
+- **G-M2 (receipt must carry intent-channel acts).** `AuditEvent::capability_token_id()` keys the
+  per-mandate receipt on `CapabilityGrant/Use/Revoke` only. All CURRENT act paths redeem via
+  `CapabilityManager::validate`, which emits token-keyed `CapabilityUse` — so "grant + every
+  use/revoke" is accurate today. The intent dispatcher emits intent-keyed records
+  (`IntentDeclared/Reconciled`), which the receipt would silently omit. FIX AT WIRE TIME: dispatch
+  emits a token-keyed `CapabilityUse` (or the exporter learns to include intent events whose
+  `standing_grant_id` == the token id).
+- **G-M3 (same-uid trust boundary, documented not defective).** The loopback control plane's
+  authority reduces to "can read the 0600 coords/attach-secret files" — i.e. the operator uid. Any
+  same-uid process inherits full mandate authority. This is the declared trust boundary of a
+  single-operator runtime; revisit if multi-tenant hosts land.
+
+Closed at review time (same sprint, before merge): the revoke id-casing desync (UPPERCASE hex
+revoked the token but missed the lowercase-keyed envelope — now canonicalized + regression test
+`revoke_with_uppercase_id_still_kills_the_standing_envelope`), and non-durable revocation
+enforcement (production `CapabilityStore` now built `with_persistence`, so revocations + epoch
+survive restart; fail-closed at boot if persistence is unavailable).
+
 ## How to use this file
 - A new gap → add a row + an `#[ignore]`d ratchet test (or note "pending scaffold" if no API exists yet).
 - Closing a gap → wire it, delete the `#[ignore]`, confirm the test is green, move the row to a "Closed" section (or delete it — this is memory, not an archive).

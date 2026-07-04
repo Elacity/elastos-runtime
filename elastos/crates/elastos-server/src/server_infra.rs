@@ -129,7 +129,15 @@ async fn setup_server_infrastructure_impl(
         .set_default_owner(local_session_owner(&data_dir)?)
         .await;
     let metrics = Arc::new(primitives::metrics::MetricsManager::new());
-    let capability_store = Arc::new(capability::CapabilityStore::new());
+    // PERSISTENT store: token revocations and the epoch must survive a restart, or every
+    // individually-revoked (still unexpired) token would validate again after a reboot — a revoke
+    // that is durably ATTESTED on the audit chain must also be durably ENFORCED. Fail-closed: if
+    // the store cannot persist, the server does not start with silently-amnesiac revocation.
+    let capability_store = Arc::new(
+        capability::CapabilityStore::with_persistence(data_dir.join("capability_store"))
+            .await
+            .map_err(|e| anyhow::anyhow!("capability store persistence unavailable: {e}"))?,
+    );
     let capability_manager = Arc::new(capability::CapabilityManager::load_or_generate(
         &data_dir,
         capability_store,

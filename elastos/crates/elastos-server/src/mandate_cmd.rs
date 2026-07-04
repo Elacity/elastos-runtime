@@ -150,12 +150,21 @@ pub(crate) async fn run_mandate(cmd: MandateCommand) -> Result<()> {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             // The durable CapabilityRevoke is attested by the runtime BEFORE this returns success
-            // (emit-before-mutate), so reaching here means the revoke is on the chain.
-            println!("Mandate {token_id} revoked and durably attested on the audit chain.");
-            if !envelope_was_live {
-                println!(
-                    "  note: no LIVE standing grant was found for this id (already revoked, or \
-                     granted outside the standing-grant flow); the token itself is now revoked."
+            // (emit-before-mutate), so reaching here means the revoke record is on the chain and
+            // the token is dead in the runtime's persistent revocation store.
+            println!("Token {token_id} revoked: signed CapabilityRevoke attested on the audit chain.");
+            if envelope_was_live {
+                println!("Its live standing mandate is killed; further dispatch is denied.");
+            } else {
+                // The kill switch's one job is "after this, the mandate is dead" — a mistyped
+                // (but well-formed) id would revoke a token that never existed while the REAL
+                // mandate stays live. Make that impossible to miss.
+                eprintln!(
+                    "WARNING: no LIVE standing mandate matched this id. If you expected to kill a \
+                     live mandate, re-check the token id (`elastos mandate grant` printed it) — a \
+                     mistyped id attests a revoke for a token that never existed while the real \
+                     mandate STAYS LIVE. (This is expected if the mandate was already revoked or \
+                     the token was granted outside the standing-mandate flow.)"
                 );
             }
             println!("Prove it: elastos mandate receipt {token_id} -o receipt.json");
@@ -184,11 +193,15 @@ pub(crate) async fn run_mandate(cmd: MandateCommand) -> Result<()> {
                     std::fs::write(&path, &pretty)
                         .with_context(|| format!("writing {}", path.display()))?;
                     println!("Receipt written to {}", path.display());
+                    // Deliberately NOT inlining the receipt's own embedded signer into the verify
+                    // command: pinning the key a document carries about itself is circular — a
+                    // wholesale forgery would "authenticate" against its own key. The pin must
+                    // come from the verifier's out-of-band trust in the issuing runtime.
+                    println!("  receipt's embedded signer (informational): {signer}");
                     println!(
-                        "Verify off-box (pin the signer you trust out-of-band):\n  \
-                         elastos verify-receipt {} --signer {}",
-                        path.display(),
-                        signer
+                        "Verify off-box, pinning the issuer key YOU trust out-of-band:\n  \
+                         elastos verify-receipt {} --signer <did:key-or-hex-you-trust>",
+                        path.display()
                     );
                 }
                 None => println!("{pretty}"),
