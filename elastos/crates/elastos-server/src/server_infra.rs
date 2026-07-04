@@ -17,6 +17,9 @@ pub(crate) struct ServerInfrastructure {
     pub(crate) audit_log: Arc<primitives::audit::AuditLog>,
     pub(crate) session_registry: Arc<session::SessionRegistry>,
     pub(crate) capability_manager: Arc<capability::CapabilityManager>,
+    /// The ONE standing-grant (mandate) registry for this runtime, shared so the API server and the
+    /// Home gateway see the SAME mandates — created once here rather than per-`CapabilityState`.
+    pub(crate) standing_service: Arc<capability::intent::StandingGrantService>,
     pub(crate) pending_store: Arc<capability::pending::PendingRequestStore>,
     pub(crate) provider_registry: Arc<provider::ProviderRegistry>,
     pub(crate) namespace_store: Arc<namespace::NamespaceStore>,
@@ -144,6 +147,10 @@ async fn setup_server_infrastructure_impl(
         audit_log.clone(),
         metrics.clone(),
     ));
+    // ONE mandate registry for the whole runtime, created here and shared into both the API server
+    // (where mandates are issued) and the Home gateway (where the Mandates app reads them), so the
+    // shell sees exactly the mandates the CLI/API issued.
+    let standing_service = Arc::new(capability_manager.standing_grant_service());
     let pending_store = Arc::new(capability::pending::PendingRequestStore::new(
         audit_log.clone(),
     ));
@@ -1091,6 +1098,7 @@ async fn setup_server_infrastructure_impl(
         audit_log,
         session_registry,
         capability_manager,
+        standing_service,
         pending_store,
         provider_registry,
         namespace_store,

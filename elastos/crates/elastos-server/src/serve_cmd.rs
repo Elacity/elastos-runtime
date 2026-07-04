@@ -239,6 +239,7 @@ pub async fn run_serve(
                                 runtime,
                                 session_registry,
                                 capability_manager,
+                                standing_service: Some(infra.standing_service.clone()),
                                 pending_store,
                                 namespace_store: Some(namespace_store),
                                 provider_registry: Some(provider_registry),
@@ -444,6 +445,9 @@ pub async fn run_serve(
             );
             s.set_provider_registry(infra.provider_registry.clone());
             s.set_capability_manager(infra.capability_manager.clone());
+            // Share the SAME standing-grant registry the API server issues into, so the mandates
+            // shell app served by this gateway reads live mandate data (Sprint 12).
+            s.set_standing_service(infra.standing_service.clone());
             s.set_pending_store(infra.pending_store.clone());
             s.set_spend_policy(infra.spend_policy.clone());
             // Unify the serve gateway's audit sink onto the shared runtime custody chain
@@ -527,6 +531,7 @@ pub async fn run_serve(
             runtime,
             session_registry: infra.session_registry,
             capability_manager: infra.capability_manager,
+            standing_service: Some(infra.standing_service.clone()),
             pending_store: infra.pending_store,
             namespace_store: Some(infra.namespace_store),
             provider_registry: Some(infra.provider_registry),

@@ -1293,18 +1293,27 @@ pub struct ListMandatesOutput {
     pub signer_public_key_hex: Option<String>,
 }
 
-/// GET /api/standing-grants  (shell-only) — the operator's mandate list.
-pub async fn list_standing_grants(
-    State(state): State<CapabilityState>,
-) -> Json<ListMandatesOutput> {
+/// Build the operator's mandate list — the ONE source of truth for the "mandate card" projection,
+/// shared by the API server's [`list_standing_grants`] and the gateway's read-only mandates app
+/// (`api::gateway::gateway_mandates`), so the liveness invariant can never drift between the two
+/// surfaces (a revoked/expired mandate rendering "Live" on one but not the other).
+///
+/// The card's LIVE bit must consult ALL kill paths, because the envelope's own `revoked` flag sees
+/// only standing/`revoke_all` revocation — a backing token can also die by (a) an individual token
+/// revoke through the manager's revocation store, or (b) a key-rotation EPOCH advance (captured in
+/// the envelope at issue). A mandate killed by any of these must never render live. An unparseable
+/// id is fail-closed inactive.
+pub async fn mandate_cards(
+    standing_service: &StandingGrantService,
+    capability_manager: &CapabilityManager,
+) -> ListMandatesOutput {
     let mut mandates = Vec::new();
-    for env in state.standing_service.list() {
-        // The card's LIVE bit must consult BOTH kill paths: the envelope flag (standing revoke,
-        // mass revoke_all) AND the manager's individual token-revocation store — a mandate whose
-        // backing token was killed by any other route must never render live. An unparseable id
-        // is fail-closed inactive.
+    for env in standing_service.list() {
         let token_dead = match TokenId::from_hex(&env.grant_id) {
-            Ok(id) => state.capability_manager.is_token_revoked(&id).await,
+            Ok(id) => {
+                capability_manager.is_token_revoked(&id).await
+                    || !capability_manager.is_epoch_valid(env.token_epoch)
+            }
             Err(_) => true,
         };
         mandates.push(MandateCard {
@@ -1318,10 +1327,17 @@ pub async fn list_standing_grants(
             revoked: env.revoked || token_dead,
         });
     }
-    Json(ListMandatesOutput {
+    ListMandatesOutput {
         mandates,
-        signer_public_key_hex: state.capability_manager.audit_log().verifying_key_hex(),
-    })
+        signer_public_key_hex: capability_manager.audit_log().verifying_key_hex(),
+    }
+}
+
+/// GET /api/standing-grants  (shell-only) — the operator's mandate list.
+pub async fn list_standing_grants(
+    State(state): State<CapabilityState>,
+) -> Json<ListMandatesOutput> {
+    Json(mandate_cards(&state.standing_service, &state.capability_manager).await)
 }
 
 #[derive(Debug, Serialize)]

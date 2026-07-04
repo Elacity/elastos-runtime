@@ -288,6 +288,10 @@ pub struct Supervisor {
     provider_registry: Option<Arc<ProviderRegistry>>,
     /// Capability manager for minting real tokens in the microVM Carrier bridge.
     capability_manager: Option<Arc<elastos_runtime::capability::CapabilityManager>>,
+    /// Shared standing-grant (mandate) registry, threaded to the serve gateway so the
+    /// mandates shell app reads the SAME registry the API server issues into. `None` ⇒
+    /// the gateway serves no live mandate data.
+    standing_service: Option<Arc<elastos_runtime::capability::intent::StandingGrantService>>,
     /// Pending capability request store for shell-mediated approval.
     pending_store: Option<Arc<elastos_runtime::capability::pending::PendingRequestStore>>,
     /// Per-act spend policy for the microVM Carrier act path; `None` ⇒ unmetered.
@@ -555,6 +559,7 @@ impl Supervisor {
             session_registry: None,
             provider_registry: None,
             capability_manager: None,
+            standing_service: None,
             pending_store: None,
             spend_policy: None,
             shared_audit_log: None,
@@ -603,6 +608,15 @@ impl Supervisor {
         capability_manager: Arc<elastos_runtime::capability::CapabilityManager>,
     ) {
         self.capability_manager = Some(capability_manager);
+    }
+
+    /// Attach the shared standing-grant (mandate) registry so the serve gateway's
+    /// mandates app reads the SAME registry the API server issues mandates into.
+    pub fn set_standing_service(
+        &mut self,
+        standing_service: Arc<elastos_runtime::capability::intent::StandingGrantService>,
+    ) {
+        self.standing_service = Some(standing_service);
     }
 
     /// Attach pending request store for shell-mediated capability approval.
@@ -1885,6 +1899,10 @@ impl Supervisor {
             let spend_policy = self.spend_policy.clone();
             // Unify the gateway audit sink onto the shared runtime custody chain (when durable).
             let shared_audit_log = self.shared_audit_log.clone();
+            // Share the mandate registry + capability manager so the mandates shell app
+            // reads live data from the SAME registry the API server issues into.
+            let standing_service = self.standing_service.clone();
+            let capability_manager = self.capability_manager.clone();
             async move {
                 if let Err(e) = crate::api::gateway::start_gateway_server(
                     &listen_addr,
@@ -1893,6 +1911,8 @@ impl Supervisor {
                     data_dir,
                     spend_policy,
                     shared_audit_log,
+                    standing_service,
+                    capability_manager,
                 )
                 .await
                 {

@@ -8,6 +8,7 @@ use tokio::net::TcpListener;
 
 use super::{gateway_router, GatewayState, GATEWAY_VERSION};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_gateway_server(
     addr: &str,
     provider_registry: Option<Arc<ProviderRegistry>>,
@@ -15,7 +16,10 @@ pub async fn start_gateway_server(
     data_dir: PathBuf,
     spend_policy: Option<crate::carrier_bridge::SpendPolicy>,
     shared_audit_log: Option<Arc<elastos_runtime::primitives::audit::AuditLog>>,
+    standing_service: Option<Arc<elastos_runtime::capability::intent::StandingGrantService>>,
+    capability_manager: Option<Arc<elastos_runtime::capability::CapabilityManager>>,
 ) -> anyhow::Result<()> {
+    let data_dir_for_mandates = data_dir.clone();
     let state = GatewayState {
         provider_registry,
         identity_manager: Arc::new(OnceLock::new()),
@@ -26,7 +30,24 @@ pub async fn start_gateway_server(
         audit_log: super::seed_gateway_audit_log(shared_audit_log),
         spend_policy,
     };
-    let app = gateway_router(state);
+    let mut app = gateway_router(state);
+    // Merge the read-only mandates sub-router only when BOTH the shared registry and the
+    // capability manager are present — the manager owns the durable audit chain the receipt
+    // export and the token-revocation liveness check both read. Without it the app would be
+    // crippled, so we fail closed to "no live mandate data" rather than half-wire it. The
+    // sub-router carries its own state, so the ~40 GatewayState construction sites are left
+    // untouched.
+    if let (Some(standing_service), Some(capability_manager)) =
+        (standing_service, capability_manager)
+    {
+        app = app.merge(super::gateway_mandates::mandate_router(
+            super::gateway_mandates::MandateApiState {
+                standing_service,
+                capability_manager,
+                data_dir: data_dir_for_mandates,
+            },
+        ));
+    }
     let listener = TcpListener::bind(addr).await?;
     let advertised = advertised_gateway_urls(addr);
     println!("ElastOS Gateway v{}", GATEWAY_VERSION);

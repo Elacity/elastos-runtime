@@ -54,6 +54,8 @@ mod gateway_home_token;
 mod gateway_inbox;
 #[path = "gateway_inspect_actions.rs"]
 mod gateway_inspect_actions;
+#[path = "gateway_mandates.rs"]
+mod gateway_mandates;
 #[path = "gateway_marketplace.rs"]
 mod gateway_marketplace;
 #[path = "gateway_provider_proxy.rs"]

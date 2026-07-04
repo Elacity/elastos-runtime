@@ -158,6 +158,36 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   Ok before the scan, the same evidentiary bar as `audit_verify`, so a matched record can't be a
   forged offline append). Same O(n) gated-read DoS profile as audit_verify.
 
+- **OPERATOR SURFACE — the mandate list ships as a launchable ElastOS shell app, on LIVE data
+  (Sprints 10→12).** The operator sees (and proves) their agents' autonomy through the `mandates`
+  capsule (`capsules/mandates/`, `role:app` + `entrypoint:index.html`) — auto-listed by the home
+  shell and opened as an ordinary app window, NOT a bespoke route and NOT a new shell (ElastOS is the
+  workbench; Flint's ADE shell is the future destination that inherits this). Sprint 12 wired it to
+  LIVE runtime data: a read-only sub-router (`api/gateway_mandates.rs`) on the home gateway serves
+  `GET /api/apps/mandates/standing-grants` (the mandate list + audit signer key) and
+  `GET /api/apps/mandates/mandate/:token_id/receipt` (the portable per-mandate receipt), BOTH gated by
+  the same `require_home_launch_token(..,"mandates")` home-launch token every shell app uses (a token
+  minted for a different capsule is rejected — the app binding is enforced), and BOTH strictly
+  read-only (no mint, no mutation). It reads the SAME `StandingGrantService` registry the API server
+  issues mandates into (ONE handle hoisted into `ServerInfrastructure`, threaded to both the API
+  server and — via the supervisor — the gateway), so the shell never shows stale data; the merge only
+  happens when both the registry and the capability manager are present (control-plane gateway =
+  no mandate routes, fail-closed). Both surfaces (API server + gateway app) render the card through
+  ONE shared projection `handlers::capability::mandate_cards`, so the liveness invariant cannot drift
+  between them: the `active` bit consults ALL three kill paths — envelope flag, individual token
+  revocation, AND `is_epoch_valid` (a key-rotation / `revoke_all` epoch advance) — fail-closed
+  inactive on an unparseable id, so a revoked/expired/epoch-killed mandate NEVER renders "Live" (P12).
+  (Folding the epoch check into the LIST view — not just the dispatch path — closed a guardian+red-team
+  finding that both list surfaces previously over-reported epoch-killed mandates as Live.) The receipt
+  path reports honest absence as `404`, never a fabricated sample under a real token id. The capsule
+  reads its live data ONLY when launched in-shell (the signed `home_token` rides in the launch URL →
+  `x-elastos-home-token` header); opened standalone it falls back to an explicitly LABELLED "sample",
+  and an in-shell fetch failure shows an honest "unavailable" banner, never sample data under the live
+  view. Ratchets: `gateway_mandates::tests::{list_route_requires_home_launch_token,
+  list_route_reflects_the_shared_registry, list_route_marks_epoch_killed_mandate_dead,
+  receipt_route_requires_home_launch_token, receipt_route_reports_absence_as_404}` +
+  `browser_capsules::mandates_ships_as_a_launchable_browser_app`.
+
 Closed at review time (Sprint 3, before merge): the revoke id-casing desync (UPPERCASE hex
 revoked the token but missed the lowercase-keyed envelope — now canonicalized + regression test
 `revoke_with_uppercase_id_still_kills_the_standing_envelope`), and non-durable revocation

@@ -1853,6 +1853,7 @@ async fn serve_web_capsule(
         runtime,
         session_registry: infra.session_registry,
         capability_manager: infra.capability_manager,
+        standing_service: Some(infra.standing_service.clone()),
         pending_store: infra.pending_store,
         namespace_store: Some(infra.namespace_store),
         provider_registry: Some(infra.provider_registry),

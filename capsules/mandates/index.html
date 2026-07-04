@@ -185,7 +185,7 @@
   </header>
 
   <div class="preview" id="preview" hidden>
-    <b>Preview data.</b> A representative dashboard — <b>not</b> live mandates from this runtime. Live cards arrive when the mandate app’s data route is wired; nothing here reflects real grants yet.
+    <b>Preview data.</b> A representative dashboard — <b>not</b> live mandates from this runtime. You’re seeing this because the page was opened outside the ElastOS shell; launch it from the shell to read your real mandates.
   </div>
 
   <div class="stats" id="stats"></div>
@@ -219,6 +219,19 @@
   "use strict";
   var $ = function(s,r){return (r||document).querySelector(s)};
   var PREVIEW = false; // true when no runtime is reachable (showing representative data)
+
+  // The Home shell launches this app with a signed, app-bound launch token in the URL
+  // (`?home_token=…`), exactly like every other shell app. It rides the `x-elastos-home-token`
+  // header; the gateway's mandates routes reject anything without it (fail-closed 401). Its
+  // PRESENCE also tells us we were launched in-shell (live mode) vs opened standalone (preview).
+  function query(name){ try { return new URL(window.location.href).searchParams.get(name); } catch(_){ return null; } }
+  var HOME_TOKEN = query("home_token");
+  var IN_SHELL = !!HOME_TOKEN;
+  function launchHeaders(){
+    var h = {Accept:"application/json"};
+    if (HOME_TOKEN) h["x-elastos-home-token"] = HOME_TOKEN;
+    return h;
+  }
 
   // ---- Representative data, faithful to the backend shapes (used when no runtime is reachable) ----
   var SAMPLE_SIGNER = "9f2c6b1e7a4d0c83e5b1f0a9d6c4e2b8a1f3c5d7e9b0a2c4d6e8f0a1b3c5d7e9";
@@ -320,7 +333,7 @@
     }
     // Live in-runtime: read the portable receipt for THIS mandate. On failure show an ERROR — NEVER
     // a fabricated sample under a real token id.
-    fetch("/api/mandate/"+encodeURIComponent(m.token_id)+"/receipt", {headers:{Accept:"application/json"}})
+    fetch("/api/apps/mandates/mandate/"+encodeURIComponent(m.token_id)+"/receipt", {headers:launchHeaders()})
       .then(function(r){ if(!r.ok) throw new Error("http "+r.status); return r.json(); })
       .then(function(j){ paintReceipt(j, signer, false); })
       .catch(function(err){
@@ -377,16 +390,28 @@
     renderStats(d); renderGrid(d);
   }
 
-  // Try the live endpoint (works once the mandate app's gateway data route is wired, same-origin);
-  // until then, fall back to clearly-labeled representative preview data so the page stands alone.
+  // In-shell (launched with a home_token) an "unreachable runtime" is an honest ERROR, never
+  // representative sample data under the live banner — the operator must not mistake a failed
+  // fetch for "no mandates" or for real cards.
+  function showUnreachable(msg){
+    PREVIEW = false;
+    $("#preview").hidden = true;
+    $("#signer").textContent = "unavailable";
+    $("#stats").innerHTML = "";
+    $("#grid").innerHTML = '<div class="verifybox"><div class="vt">'+shield()+' Live mandates unavailable</div>'
+      + '<p>'+esc(msg)+' No sample data is shown in the shell — this reflects the runtime, not a mock.</p></div>';
+  }
+
+  // Launched in the shell → read LIVE mandates over the home-token gate (fail-closed to an error
+  // banner on any failure). Opened standalone (no home_token) → clearly-labeled sample so the page
+  // still stands alone offline.
   function load(){
-    if (typeof fetch !== "function"){ paint(SAMPLE, true); return; }
-    var done=false, t=setTimeout(function(){ if(!done){done=true; paint(SAMPLE,true);} }, 1200);
-    fetch("/api/standing-grants", {headers:{Accept:"application/json"}})
-      .then(function(r){ if(!r.ok) throw 0; return r.json(); })
-      .then(function(j){ if(done)return; done=true; clearTimeout(t);
-        paint({mandates:j.mandates||[], signer_public_key_hex:j.signer_public_key_hex}, false); })
-      .catch(function(){ if(done)return; done=true; clearTimeout(t); paint(SAMPLE, true); });
+    if (!IN_SHELL){ paint(SAMPLE, true); return; }
+    if (typeof fetch !== "function"){ showUnreachable("This browser cannot reach the runtime."); return; }
+    fetch("/api/apps/mandates/standing-grants", {headers:launchHeaders()})
+      .then(function(r){ if(!r.ok) throw new Error("http "+r.status); return r.json(); })
+      .then(function(j){ paint({mandates:j.mandates||[], signer_public_key_hex:j.signer_public_key_hex}, false); })
+      .catch(function(err){ showUnreachable("Could not load mandates from the runtime ("+esc(String(err&&err.message||err))+").");});
   }
 
   // theme toggle

@@ -80,6 +80,10 @@ pub struct ServerConfig {
     pub runtime: Arc<Runtime>,
     pub session_registry: Arc<SessionRegistry>,
     pub capability_manager: Arc<CapabilityManager>,
+    /// The shared runtime mandate registry (so the Home gateway's Mandates app sees the SAME
+    /// standing grants this API server issues). `None` ⇒ this server creates its own (isolated) —
+    /// used by serve paths without a Home gateway.
+    pub standing_service: Option<Arc<elastos_runtime::capability::intent::StandingGrantService>>,
     pub pending_store: Arc<PendingRequestStore>,
     pub namespace_store: Option<Arc<NamespaceStore>>,
     pub provider_registry: Option<Arc<ProviderRegistry>>,
@@ -132,6 +136,7 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         runtime,
         session_registry,
         capability_manager,
+        standing_service,
         pending_store,
         namespace_store,
         provider_registry,
@@ -195,9 +200,11 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         pending_store: pending_store.clone(),
         capability_manager: capability_manager.clone(),
         policy_evaluator,
-        // One shared standing-grant service, signed by the manager's own key + audit log, so every
-        // shell-only standing-grant verb hits the same fail-closed registry.
-        standing_service: Arc::new(capability_manager.standing_grant_service()),
+        // The shared runtime mandate registry when provided (so the Home gateway's Mandates app
+        // sees the same grants); otherwise this server's own. All shell-only standing-grant verbs
+        // hit this one fail-closed registry.
+        standing_service: standing_service
+            .unwrap_or_else(|| Arc::new(capability_manager.standing_grant_service())),
         intent_executor: Arc::new(crate::intent_executor::MethodRegistryExecutor::production(
             capability_manager.audit_log().clone(),
         )),
