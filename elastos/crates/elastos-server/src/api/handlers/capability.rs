@@ -2095,6 +2095,86 @@ mod tests {
         assert_eq!(resp.outcome, "diverged", "declared read of pay/vendor, actually read the chain");
     }
 
+    /// Mirrors `elastos mandate demo` exactly, through the real handlers + production executor:
+    /// grant a read mandate bound to ONE agent key → the agent performs a real audit_verify →
+    /// revoke → the SAME agent is now DENIED → the receipt carries the whole story and authenticates.
+    #[tokio::test]
+    async fn full_demo_sequence_grant_perform_revoke_deny_prove() {
+        use elastos_runtime::primitives::audit::AuditEvent;
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_durable_audit(dir.path());
+        let agent = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let audit_resource = crate::intent_executor::AUDIT_CHAIN_RESOURCE;
+
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-demo-agent".to_string(),
+                resource: audit_resource.to_string(),
+                action: "read".to_string(),
+                methods: vec!["runtime.audit_verify".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: Some(hex::encode(agent.verifying_key().to_bytes())),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let act = |intent_id: &'static str| {
+            let intent = IntentDeclarationV1::issue(
+                &agent,
+                agent.verifying_key().to_bytes(),
+                intent_id,
+                "vm-demo-agent",
+                "runtime.audit_verify",
+                "",
+                audit_resource,
+                "read",
+                &out.token_id,
+            );
+            dispatch_standing_intent(State(state.clone()), Json(intent))
+        };
+
+        // ACT: performed.
+        assert_eq!(act("demo-act-1").await.unwrap().0.outcome, "performed");
+
+        // REVOKE.
+        let _ = revoke_standing_grant(
+            State(state.clone()),
+            Json(RevokeStandingGrantInput { grant_id: out.grant_id.clone() }),
+        )
+        .await
+        .unwrap();
+
+        // ACT AGAIN: the same agent is denied SPECIFICALLY because the mandate was revoked.
+        let denied = act("demo-act-2").await.unwrap().0;
+        assert_eq!(denied.outcome, "denied");
+        assert_eq!(denied.reason.as_deref(), Some("revoked"), "denied for the right reason");
+
+        // RECEIPT: grant → performed use → revoke → denied attempt.
+        let receipt = mandate_receipt(State(state.clone()), Path(out.token_id.clone()))
+            .await
+            .unwrap()
+            .0;
+        let kinds: Vec<&str> = receipt
+            .records
+            .iter()
+            .map(|r| match &r.event {
+                AuditEvent::CapabilityGrant { .. } => "grant",
+                AuditEvent::CapabilityUse { success: true, .. } => "use_ok",
+                AuditEvent::CapabilityUse { success: false, .. } => "use_denied",
+                AuditEvent::CapabilityRevoke { .. } => "revoke",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["grant", "use_ok", "revoke", "use_denied"]);
+        let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();
+        assert!(
+            elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer)).authenticated
+        );
+    }
+
     /// G-M1 regression: a backing token killed DIRECTLY through the manager (a path the envelope
     /// registry cannot see) must deny dispatch — the handler consults the revocation store and
     /// self-heals the envelope, so the denial carries the honest `revoked` reason.
