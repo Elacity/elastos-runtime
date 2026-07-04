@@ -79,6 +79,215 @@ pub struct ChainedRecord {
     pub sig: String,
 }
 
+/// Schema tag for [`MandateReceipt`]; the verifier fail-closes on any other value.
+pub const MANDATE_RECEIPT_SCHEMA: &str = "elastos.mandate_receipt/v1";
+
+/// A PORTABLE, self-contained proof that a set of audit records were authorized and recorded under
+/// one signer — verifiable by a THIRD PARTY (an auditor, insurer, counterparty) with NO runtime, NO
+/// `AuditLog`, and NO disk access: just this JSON document and [`verify_mandate_receipt`]. This is
+/// the "admissible receipt" product primitive for Flint — it turns the tamper-evident chain from an
+/// internal integrity feature into an artifact you can hand someone off-box. By convention
+/// `records[0]` is the authorization (the mandate) and the rest are the actions taken under it, in
+/// ascending `seq`; the verifier proves each record is individually signed + untampered AND that
+/// they form a contiguous, un-reordered, un-dropped run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MandateReceipt {
+    /// Schema tag; always `elastos.mandate_receipt/v1`.
+    pub schema: String,
+    /// Hex of the ed25519 verifying key the records are signed under (the issuing runtime's DID key).
+    ///
+    /// SELF-ASSERTED — READ THIS: a `verified == true` verdict authenticates the records against
+    /// THIS key only. It does NOT prove the key is who you think it is: anyone can mint a keypair,
+    /// fabricate a "mandate + actions" chain, sign it, and produce a receipt that verifies against
+    /// its own key. A consumer MUST pin the expected signer out-of-band (pass `expected_signer_hex`
+    /// to [`verify_mandate_receipt`], or compare this field to a DID key it trusts). Two further
+    /// caveats travel with this artifact (same as the chain it comes from): (a) records dropped off
+    /// the END of the exported range are undetectable without an external anchor — the receipt
+    /// proves what it contains is a contiguous run, not that it is COMPLETE; (b) a live-compromised
+    /// runtime holds the signing key and can sign a fabricated receipt. Tamper-EVIDENT, not
+    /// tamper-proof.
+    pub signer_public_key_hex: String,
+    /// The signed, hash-chained records, ascending `seq`. `records[0]` = mandate, rest = actions.
+    pub records: Vec<ChainedRecord>,
+}
+
+/// The result of independently verifying a [`MandateReceipt`]. Every boolean is a distinct failure
+/// mode so a consumer can see WHY: a tampered event breaks `hashes_ok`, a forged/wrong-key signature
+/// breaks `signatures_ok`, a dropped/reordered record breaks `chain_linkage_ok`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateReceiptVerdict {
+    /// AUTHENTIC — the single bit an auditor acts on. True ONLY when the receipt is
+    /// `structurally_valid` AND its embedded signer matches the caller-PINNED expected signer.
+    /// `false` whenever no expected signer was pinned: you CANNOT authenticate a self-asserted
+    /// receipt without an out-of-band trust anchor (an attacker's self-signed receipt is
+    /// structurally valid too — see [`MandateReceipt`]).
+    pub authenticated: bool,
+    /// Structurally valid under the receipt's OWN embedded key: every hash recomputes, every
+    /// signature verifies, records are contiguous. This is NOT authenticity — use it only for
+    /// display ("signed by <signer>"), never as the trust decision. Prefer [`authenticated`].
+    pub structurally_valid: bool,
+    /// Whether the receipt's embedded signer equals the caller-pinned expected signer. `None` when
+    /// the caller pinned no expected signer (so authenticity could not be decided).
+    pub signer_matches_expected: Option<bool>,
+    /// True iff `records[0]` is the genesis-anchored start of the chain (`seq == 1`, `prev_hash` all
+    /// zero) — so the receipt proves the run FROM THE BEGINNING. (Front-truncation is otherwise
+    /// undetectable; END-truncation still needs an external head anchor — see [`MandateReceipt`].)
+    pub starts_at_genesis: bool,
+    /// How many records were checked.
+    pub records: usize,
+    /// The signer the receipt claims to be signed under (echoed so a consumer can pin it).
+    pub signer_public_key_hex: String,
+    /// Every record's `record_hash` recomputes from its own contents (no event was edited).
+    pub hashes_ok: bool,
+    /// Every record is ed25519-signed and verifies against the signer key over its `record_hash`.
+    pub signatures_ok: bool,
+    /// The records form a contiguous run: `seq` increments by 1 and each `prev_hash` links the prior.
+    pub chain_linkage_ok: bool,
+    /// The first structural failure (bad schema/hex, wrong key length, empty receipt), if any.
+    pub error: Option<String>,
+}
+
+impl MandateReceiptVerdict {
+    fn failed(signer_public_key_hex: String, error: impl Into<String>) -> Self {
+        MandateReceiptVerdict {
+            authenticated: false,
+            structurally_valid: false,
+            signer_matches_expected: None,
+            starts_at_genesis: false,
+            records: 0,
+            signer_public_key_hex,
+            hashes_ok: false,
+            signatures_ok: false,
+            chain_linkage_ok: false,
+            error: Some(error.into()),
+        }
+    }
+}
+
+/// STANDALONE verification of a [`MandateReceipt`] — pure, no `self`, no I/O, no runtime. Re-derives
+/// each `record_hash` exactly as the chain did (`compute_record_hash`), checks the ed25519 signature
+/// over it against the receipt's own signer key, and checks contiguity. Mirrors
+/// [`AuditLog::verify_chain`]'s recipe byte-for-byte, minus the disk.
+///
+/// AUTHENTICITY REQUIRES PINNING. `expected_signer_hex` is the caller's out-of-band trust anchor —
+/// the DID key it already trusts for the issuing runtime. The result's `authenticated` bit is true
+/// ONLY when the receipt is structurally sound AND its embedded signer equals that pinned key. Pass
+/// `None` only when you deliberately want a STRUCTURAL check for display (never a trust decision):
+/// an attacker can self-sign a fabricated receipt that is `structurally_valid` under its own key, so
+/// `authenticated` is `false` without a pin. Also note (carried from the chain): the receipt proves
+/// its records are a contiguous run, not that they are COMPLETE — end-truncation needs an external
+/// head anchor (`starts_at_genesis` covers only the front) — and verification currently re-serializes
+/// events with this crate's serde, so a third party must use a byte-compatible encoder.
+pub fn verify_mandate_receipt(
+    receipt: &MandateReceipt,
+    expected_signer_hex: Option<&str>,
+) -> MandateReceiptVerdict {
+    let signer = receipt.signer_public_key_hex.clone();
+    if receipt.schema != MANDATE_RECEIPT_SCHEMA {
+        return MandateReceiptVerdict::failed(
+            signer,
+            format!("unexpected schema {:?} (want {MANDATE_RECEIPT_SCHEMA})", receipt.schema),
+        );
+    }
+    if receipt.records.is_empty() {
+        return MandateReceiptVerdict::failed(signer, "receipt has no records");
+    }
+    // Decode the self-contained signer key — the only key material the verifier needs.
+    let vk_bytes = match hex::decode(receipt.signer_public_key_hex.trim()) {
+        Ok(bytes) => bytes,
+        Err(e) => return MandateReceiptVerdict::failed(signer, format!("bad signer key hex: {e}")),
+    };
+    let vk_array: [u8; 32] = match vk_bytes.as_slice().try_into() {
+        Ok(array) => array,
+        Err(_) => return MandateReceiptVerdict::failed(signer, "signer key is not 32 bytes"),
+    };
+    let vk = match VerifyingKey::from_bytes(&vk_array) {
+        Ok(key) => key,
+        Err(e) => return MandateReceiptVerdict::failed(signer, format!("invalid signer key: {e}")),
+    };
+
+    let mut hashes_ok = true;
+    let mut signatures_ok = true;
+    let mut chain_linkage_ok = true;
+
+    for (index, record) in receipt.records.iter().enumerate() {
+        // Contiguity: each record after the first must link the prior by hash AND increment seq by 1.
+        if index > 0 {
+            let prior = &receipt.records[index - 1];
+            if record.prev_hash != prior.record_hash || record.seq != prior.seq.saturating_add(1) {
+                chain_linkage_ok = false;
+            }
+        }
+        // Internal integrity: recompute the record hash from the record's OWN contents.
+        let event_json = match serde_json::to_string(&record.event) {
+            Ok(json) => json,
+            Err(e) => {
+                return MandateReceiptVerdict::failed(
+                    signer,
+                    format!("seq {}: re-serialize event: {e}", record.seq),
+                )
+            }
+        };
+        let prev_hash: [u8; 32] = match hex::decode(&record.prev_hash)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+        {
+            Some(array) => array,
+            None => {
+                hashes_ok = false;
+                signatures_ok = false;
+                continue;
+            }
+        };
+        let computed = compute_record_hash(record.seq, &prev_hash, event_json.as_bytes());
+        match hex::decode(&record.record_hash) {
+            Ok(claimed) if claimed.as_slice() == computed.as_slice() => {}
+            _ => hashes_ok = false,
+        }
+        // Signature: a mandate receipt MUST be ed25519-signed (never `alg="none"`), verifying over
+        // the recomputed hash against the receipt's own signer key.
+        if record.alg != AUDIT_SIG_ALG_ED25519 {
+            signatures_ok = false;
+            continue;
+        }
+        let sig_ok = BASE64
+            .decode(record.sig.trim())
+            .ok()
+            .and_then(|bytes| Signature::from_slice(&bytes).ok())
+            .map(|signature| vk.verify(&computed, &signature).is_ok())
+            .unwrap_or(false);
+        if !sig_ok {
+            signatures_ok = false;
+        }
+    }
+
+    let structurally_valid = hashes_ok && signatures_ok && chain_linkage_ok;
+    // Authenticity requires the caller's out-of-band pin: the embedded signer must equal a key the
+    // consumer already trusts. Without a pin we CANNOT authenticate — an attacker self-signs too.
+    let signer_matches_expected = expected_signer_hex
+        .map(|expected| expected.trim().eq_ignore_ascii_case(receipt.signer_public_key_hex.trim()));
+    let authenticated = structurally_valid && signer_matches_expected == Some(true);
+    // Genesis anchor: records[0] is the true start of the chain (front-truncation guard).
+    let first = &receipt.records[0];
+    let starts_at_genesis = first.seq == 1
+        && hex::decode(&first.prev_hash)
+            .map(|bytes| bytes.len() == 32 && bytes.iter().all(|byte| *byte == 0))
+            .unwrap_or(false);
+
+    MandateReceiptVerdict {
+        authenticated,
+        structurally_valid,
+        signer_matches_expected,
+        starts_at_genesis,
+        records: receipt.records.len(),
+        signer_public_key_hex: signer,
+        hashes_ok,
+        signatures_ok,
+        chain_linkage_ok,
+        error: None,
+    }
+}
+
 /// Errors from [`AuditLog::emit`]. A custody-relevant caller MUST fail its operation closed on any
 /// of these (the record could not be durably committed to the tamper-evident log).
 #[derive(Debug)]
@@ -834,6 +1043,46 @@ impl AuditLog {
         })
     }
 
+    /// Export the durable chain as a PORTABLE [`MandateReceipt`] a third party can verify off-box
+    /// with [`verify_mandate_receipt`] and NO runtime. `None` for a memory-only or unsigned log
+    /// (nothing durable + signed to hand out).
+    pub fn export_mandate_receipt(&self) -> Option<MandateReceipt> {
+        self.export_mandate_receipt_range(1, u64::MAX)
+    }
+
+    /// As [`export_mandate_receipt`](Self::export_mandate_receipt), scoped to a `seq` range so a
+    /// receipt can carry just ONE mandate + the actions taken under it (`[from_seq, to_seq]`,
+    /// inclusive) rather than the whole history — the shape an auditor is handed per delegation.
+    pub fn export_mandate_receipt_range(
+        &self,
+        from_seq: u64,
+        to_seq: u64,
+    ) -> Option<MandateReceipt> {
+        let path = self.log_path.as_ref()?;
+        let signer_public_key_hex = self.verifying_key_hex()?; // unsigned ⇒ no verifiable receipt
+        let file = File::open(path).ok()?;
+        let reader = BufReader::new(file);
+        let mut records = Vec::new();
+        for line in reader.lines() {
+            let line = line.ok()?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: ChainedRecord = serde_json::from_str(&line).ok()?;
+            if record.seq >= from_seq && record.seq <= to_seq {
+                records.push(record);
+            }
+        }
+        if records.is_empty() {
+            return None;
+        }
+        Some(MandateReceipt {
+            schema: MANDATE_RECEIPT_SCHEMA.to_string(),
+            signer_public_key_hex,
+            records,
+        })
+    }
+
     /// Best-effort emit for NON-custody events (capsule lifecycle, capability use, etc.): logs
     /// loudly at `error!` on failure but never propagates. This is the "fail-loud but don't block"
     /// half of the split — custody callers ([`content_open`](Self::content_open) and direct
@@ -1460,6 +1709,169 @@ mod tests {
             .expect("a file-backed log must be signed");
         let bytes: [u8; 32] = hex::decode(&hex).unwrap().try_into().unwrap();
         VerifyingKey::from_bytes(&bytes).unwrap()
+    }
+
+    // ---- Portable mandate receipt (Sprint 1, Item 2) ----------------------------------------
+    // Emit a small chain to a signed, file-backed log and return an exported receipt.
+    fn emit_and_export_receipt() -> (tempfile::TempDir, MandateReceipt) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let log = AuditLog::with_file(&path).unwrap();
+        log.emit(AuditEvent::RuntimeStart {
+            timestamp: SecureTimestamp::now(),
+            version: "mandate".to_string(),
+        })
+        .expect("emit mandate");
+        log.content_open(
+            "sess-1",
+            "person:local:alice",
+            "elastos://content/abc",
+            "view",
+            "opened",
+            "chain-provider",
+            None,
+        )
+        .expect("emit action");
+        let receipt = log
+            .export_mandate_receipt()
+            .expect("a signed file-backed log exports a receipt");
+        (dir, receipt)
+    }
+
+    #[test]
+    fn mandate_receipt_verifies_standalone_over_the_wire() {
+        let (_dir, receipt) = emit_and_export_receipt();
+        let pin = receipt.signer_public_key_hex.clone();
+        // Round-trip through JSON to prove it is a PORTABLE document, then verify with ONLY the
+        // receipt — no AuditLog, no disk, no runtime. This is the "an auditor can check it" primitive.
+        let wire = serde_json::to_string(&receipt).unwrap();
+        let received: MandateReceipt = serde_json::from_str(&wire).unwrap();
+
+        // Structural check (no pin): sound, but NOT authenticity.
+        let structural = verify_mandate_receipt(&received, None);
+        assert!(structural.structurally_valid, "clean receipt is structurally valid: {structural:?}");
+        assert!(!structural.authenticated, "no pin ⇒ not authenticated");
+        assert_eq!(structural.signer_matches_expected, None);
+        assert!(structural.hashes_ok && structural.signatures_ok && structural.chain_linkage_ok);
+        assert_eq!(structural.records, 2);
+        assert!(structural.starts_at_genesis, "the export begins at seq 1 / genesis");
+
+        // Pinned to the real signer: AUTHENTIC (the bit an auditor acts on).
+        let authentic = verify_mandate_receipt(&received, Some(&pin));
+        assert!(authentic.authenticated, "pinned to the true signer ⇒ authenticated: {authentic:?}");
+        assert_eq!(authentic.signer_matches_expected, Some(true));
+    }
+
+    /// The security property both reviewers demanded: a receipt an ATTACKER self-signed is
+    /// structurally valid under its own key, but is NEVER `authenticated` without an out-of-band pin,
+    /// and fails authentication when pinned to the real (different) signer.
+    #[test]
+    fn mandate_receipt_requires_signer_pinning_for_authenticity() {
+        let (_dir, real) = emit_and_export_receipt();
+        let real_signer = real.signer_public_key_hex.clone();
+
+        // Attacker fabricates their OWN chain, signs it with their OWN key, and ships a receipt.
+        let dir = tempfile::tempdir().unwrap();
+        let log = AuditLog::with_file(dir.path().join("evil.log")).unwrap();
+        log.emit(AuditEvent::RuntimeStart {
+            timestamp: SecureTimestamp::now(),
+            version: "fabricated".to_string(),
+        })
+        .unwrap();
+        let forged = log.export_mandate_receipt().unwrap();
+
+        // It is structurally valid under its OWN key...
+        let structural = verify_mandate_receipt(&forged, None);
+        assert!(structural.structurally_valid);
+        assert!(!structural.authenticated, "self-signed is not authentic without a pin");
+
+        // ...but pinning to the REAL runtime's signer exposes it: not the expected signer.
+        let against_real = verify_mandate_receipt(&forged, Some(&real_signer));
+        assert!(!against_real.authenticated, "forged receipt must fail against the pinned real signer");
+        assert_eq!(against_real.signer_matches_expected, Some(false));
+    }
+
+    #[test]
+    fn mandate_receipt_detects_event_tamper() {
+        let (_dir, mut receipt) = emit_and_export_receipt();
+        // Edit a recorded event AFTER export: the record_hash no longer recomputes.
+        if let AuditEvent::RuntimeStart { version, .. } = &mut receipt.records[0].event {
+            *version = "tampered".to_string();
+        } else {
+            panic!("expected RuntimeStart at records[0]");
+        }
+        let verdict = verify_mandate_receipt(&receipt, None);
+        assert!(!verdict.structurally_valid, "an edited event must fail");
+        assert!(!verdict.hashes_ok, "record_hash must not recompute after an edit");
+    }
+
+    #[test]
+    fn mandate_receipt_detects_signature_forgery() {
+        let (_dir, mut receipt) = emit_and_export_receipt();
+        // Corrupt a signature: a valid base64 blob that is not the real signature.
+        receipt.records[1].sig = BASE64.encode([0u8; 64]);
+        let verdict = verify_mandate_receipt(&receipt, None);
+        assert!(!verdict.structurally_valid);
+        assert!(!verdict.signatures_ok, "a forged signature must not verify");
+    }
+
+    #[test]
+    fn mandate_receipt_detects_dropped_record() {
+        // Emit three records so we can drop the MIDDLE one and break contiguity.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let log = AuditLog::with_file(&path).unwrap();
+        for v in ["a", "b", "c"] {
+            log.emit(AuditEvent::RuntimeStart {
+                timestamp: SecureTimestamp::now(),
+                version: v.to_string(),
+            })
+            .unwrap();
+        }
+        let mut three = log.export_mandate_receipt().unwrap();
+        assert_eq!(three.records.len(), 3);
+        three.records.remove(1); // drop the middle record
+        let verdict = verify_mandate_receipt(&three, None);
+        assert!(!verdict.structurally_valid);
+        assert!(!verdict.chain_linkage_ok, "a dropped record must break linkage");
+    }
+
+    #[test]
+    fn mandate_receipt_rejects_a_wrong_signer_key() {
+        let (_dir, mut receipt) = emit_and_export_receipt();
+        // A different (valid) ed25519 key — the records were not signed under it.
+        let other: [u8; 32] = [
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64,
+            0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68,
+            0xf7, 0x07, 0x51, 0x1a,
+        ];
+        receipt.signer_public_key_hex = hex::encode(other);
+        let verdict = verify_mandate_receipt(&receipt, None);
+        assert!(!verdict.structurally_valid);
+        assert!(!verdict.signatures_ok, "records must not verify under a foreign key");
+    }
+
+    #[test]
+    fn mandate_receipt_rejects_a_wrong_schema() {
+        let (_dir, mut receipt) = emit_and_export_receipt();
+        receipt.schema = "elastos.evil/v9".to_string();
+        let verdict = verify_mandate_receipt(&receipt, None);
+        assert!(!verdict.structurally_valid && !verdict.authenticated);
+        assert!(verdict.error.is_some(), "wrong schema must fail closed with a reason");
+    }
+
+    #[test]
+    fn mandate_receipt_is_none_for_a_memory_only_log() {
+        // A memory-only log has no durable, signed chain to hand out — no receipt.
+        assert!(AuditLog::new().export_mandate_receipt().is_none());
+        // And an empty receipt fails closed.
+        let empty = MandateReceipt {
+            schema: MANDATE_RECEIPT_SCHEMA.to_string(),
+            signer_public_key_hex: String::new(),
+            records: vec![],
+        };
+        let verdict = verify_mandate_receipt(&empty, None);
+        assert!(!verdict.structurally_valid && !verdict.authenticated);
     }
 
     #[test]
