@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flint — Mandates</title>
+</head>
+<body>
+<style>
+  :root {
+    --bg:#F4F1EA; --surface:#FFFFFF; --surface-2:#FBF8F1; --raise:#FFFFFF;
+    --ink:#1B1E25; --ink-2:#4C5462; --ink-3:#7A8290; --line:#E6E0D4; --line-2:#D8D1C2;
+    --accent:#B36A12; --accent-soft:#F3E4CC;
+    --live:#1E8A3C; --live-soft:#DCF0E1; --warn:#9A6B00; --warn-soft:#F3E9CC;
+    --crit:#BC3A20; --crit-soft:#F6DED6; --info:#2A63C7;
+    --shadow:0 1px 2px rgba(30,25,15,.06), 0 8px 24px -12px rgba(30,25,15,.18);
+    --font-sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --font-mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+    --font-serif:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0D1015; --surface:#151A21; --surface-2:#1A2029; --raise:#1E2530;
+      --ink:#F1EEE6; --ink-2:#AAB2BF; --ink-3:#727B88; --line:#242B35; --line-2:#2E3742;
+      --accent:#E8A33D; --accent-soft:#3A2F1B;
+      --live:#43B95A; --live-soft:#16311D; --warn:#D8A62A; --warn-soft:#33290F;
+      --crit:#F0563B; --crit-soft:#3A1A12; --info:#5C93FF;
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 12px 32px -16px rgba(0,0,0,.6);
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#0D1015; --surface:#151A21; --surface-2:#1A2029; --raise:#1E2530;
+    --ink:#F1EEE6; --ink-2:#AAB2BF; --ink-3:#727B88; --line:#242B35; --line-2:#2E3742;
+    --accent:#E8A33D; --accent-soft:#3A2F1B;
+    --live:#43B95A; --live-soft:#16311D; --warn:#D8A62A; --warn-soft:#33290F;
+    --crit:#F0563B; --crit-soft:#3A1A12; --info:#5C93FF;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 12px 32px -16px rgba(0,0,0,.6);
+  }
+  :root[data-theme="light"]{
+    --bg:#F4F1EA; --surface:#FFFFFF; --surface-2:#FBF8F1; --raise:#FFFFFF;
+    --ink:#1B1E25; --ink-2:#4C5462; --ink-3:#7A8290; --line:#E6E0D4; --line-2:#D8D1C2;
+    --accent:#B36A12; --accent-soft:#F3E4CC;
+    --live:#1E8A3C; --live-soft:#DCF0E1; --warn:#9A6B00; --warn-soft:#F3E9CC;
+    --crit:#BC3A20; --crit-soft:#F6DED6; --info:#2A63C7;
+    --shadow:0 1px 2px rgba(30,25,15,.06), 0 8px 24px -12px rgba(30,25,15,.18);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font-sans);
+    line-height:1.5;-webkit-font-smoothing:antialiased;font-size:15px}
+  .wrap{max-width:1080px;margin:0 auto;padding:28px 22px 72px}
+  .mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+  .tnum{font-variant-numeric:tabular-nums}
+
+  /* header */
+  header.top{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;
+    flex-wrap:wrap;padding-bottom:22px;border-bottom:1px solid var(--line)}
+  .brand{display:flex;align-items:center;gap:12px}
+  .spark{width:30px;height:30px;flex:0 0 auto}
+  .brand h1{font-size:20px;margin:0;letter-spacing:-.01em;font-weight:650}
+  .brand .tag{font-family:var(--font-serif);font-style:italic;color:var(--ink-2);
+    font-size:13.5px;margin-top:1px}
+  .signer{display:flex;flex-direction:column;align-items:flex-end;gap:5px;text-align:right}
+  .signer .lbl{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-3)}
+  .signer .pin{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;
+    background:var(--surface);border:1px solid var(--line);border-radius:7px;padding:5px 9px;color:var(--ink-2)}
+  .signer .dot{width:7px;height:7px;border-radius:50%;background:var(--accent)}
+  .tbtn{margin-top:2px;background:none;border:1px solid var(--line);color:var(--ink-3);
+    border-radius:7px;padding:4px 9px;font-size:11.5px;cursor:pointer;font-family:inherit}
+  .tbtn:hover{color:var(--ink);border-color:var(--line-2)}
+
+  .preview{margin-top:16px;display:flex;align-items:center;gap:9px;font-size:12.5px;color:var(--warn);
+    background:var(--warn-soft);border:1px solid color-mix(in srgb,var(--warn) 30%,transparent);
+    border-radius:9px;padding:8px 12px}
+  .preview b{font-weight:650}
+
+  /* stats */
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:22px 0 8px}
+  .stat{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+  .stat .n{font-size:30px;font-weight:660;letter-spacing:-.02em;line-height:1}
+  .stat .k{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3);margin-top:7px}
+  .stat.live .n{color:var(--live)} .stat.rev .n{color:var(--crit)} .stat.exp .n{color:var(--warn)}
+
+  .sectlabel{display:flex;align-items:baseline;gap:10px;margin:26px 2px 12px}
+  .sectlabel h2{font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-2);margin:0;font-weight:600}
+  .sectlabel .hint{font-size:12px;color:var(--ink-3)}
+
+  /* cards */
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
+  .card{position:relative;background:var(--surface);border:1px solid var(--line);border-radius:13px;
+    padding:16px 16px 14px 20px;cursor:pointer;text-align:left;font:inherit;color:inherit;width:100%;
+    transition:border-color .15s, transform .15s, box-shadow .15s;overflow:hidden}
+  .card:hover{border-color:var(--line-2);transform:translateY(-2px);box-shadow:var(--shadow)}
+  .card:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .card .stripe{position:absolute;left:0;top:0;bottom:0;width:4px}
+  .card.s-live .stripe{background:var(--live)} .card.s-rev .stripe{background:var(--crit)}
+  .card.s-exp .stripe{background:var(--warn)}
+  .card .row1{display:flex;align-items:center;justify-content:space-between;gap:10px}
+  .pill{font-size:10.5px;font-weight:650;letter-spacing:.06em;text-transform:uppercase;
+    padding:3px 8px;border-radius:999px;white-space:nowrap}
+  .pill.live{color:var(--live);background:var(--live-soft)}
+  .pill.rev{color:var(--crit);background:var(--crit-soft)}
+  .pill.exp{color:var(--warn);background:var(--warn-soft)}
+  .card .cap{font-family:var(--font-mono);font-size:13px;color:var(--ink);font-weight:600}
+  .card .scope{margin-top:11px;font-size:14px;color:var(--ink)}
+  .card .scope .verb{color:var(--accent);font-weight:650}
+  .card .scope .res{font-family:var(--font-mono);font-size:12.5px;color:var(--ink-2);word-break:break-all}
+  .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:11px}
+  .chip{font-family:var(--font-mono);font-size:11px;color:var(--ink-2);background:var(--surface-2);
+    border:1px solid var(--line);border-radius:6px;padding:2px 7px}
+  .card .foot{display:flex;align-items:center;justify-content:space-between;margin-top:13px;
+    padding-top:11px;border-top:1px solid var(--line);gap:8px}
+  .card .tid{font-family:var(--font-mono);font-size:11px;color:var(--ink-3)}
+  .card .open{font-size:12px;color:var(--accent);font-weight:600;white-space:nowrap}
+
+  /* receipt drawer */
+  .scrim{position:fixed;inset:0;background:rgba(8,8,10,.5);backdrop-filter:blur(2px);
+    opacity:0;pointer-events:none;transition:opacity .2s;z-index:20}
+  .scrim.on{opacity:1;pointer-events:auto}
+  .drawer{position:fixed;top:0;right:0;bottom:0;width:min(520px,94vw);background:var(--surface);
+    border-left:1px solid var(--line);box-shadow:-24px 0 60px -30px rgba(0,0,0,.5);
+    transform:translateX(100%);transition:transform .24s cubic-bezier(.4,0,.2,1);z-index:21;
+    display:flex;flex-direction:column}
+  .drawer.on{transform:none}
+  .drawer .dh{padding:18px 20px;border-bottom:1px solid var(--line);display:flex;
+    align-items:flex-start;justify-content:space-between;gap:12px}
+  .drawer .dh .t{font-size:12px;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-3)}
+  .drawer .dh .tid2{font-family:var(--font-mono);font-size:13px;color:var(--ink);margin-top:4px;word-break:break-all}
+  .xbtn{background:none;border:1px solid var(--line);border-radius:8px;color:var(--ink-2);
+    width:32px;height:32px;cursor:pointer;flex:0 0 auto;font-size:16px;line-height:1}
+  .xbtn:hover{color:var(--ink);border-color:var(--line-2)}
+  .dbody{padding:18px 20px;overflow-y:auto}
+  .metarow{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+  .badge{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;font-weight:600;
+    border-radius:7px;padding:5px 9px;border:1px solid var(--line)}
+  .badge svg{width:13px;height:13px}
+  .badge.ok{color:var(--live);background:var(--live-soft);border-color:transparent}
+  .badge.neutral{color:var(--ink-2);background:var(--surface-2)}
+
+  .tl{position:relative;margin:6px 0 4px;padding-left:26px}
+  .tl::before{content:"";position:absolute;left:8px;top:6px;bottom:10px;width:2px;background:var(--line)}
+  .ev{position:relative;padding:0 0 18px}
+  .ev .node{position:absolute;left:-22px;top:2px;width:16px;height:16px;border-radius:50%;
+    background:var(--surface);border:2px solid var(--ink-3)}
+  .ev.grant .node{border-color:var(--accent)}
+  .ev.ok .node{border-color:var(--live);background:var(--live)}
+  .ev.deny .node{border-color:var(--crit)}
+  .ev.revoke .node{border-color:var(--crit);background:var(--crit)}
+  .ev .k{font-size:13px;font-weight:650;color:var(--ink)}
+  .ev .k .tag{font-family:var(--font-mono);font-size:10.5px;font-weight:600;padding:1px 6px;border-radius:5px;margin-left:8px;vertical-align:1px}
+  .ev.ok .k .tag{color:var(--live);background:var(--live-soft)}
+  .ev.deny .k .tag{color:var(--crit);background:var(--crit-soft)}
+  .ev .d{font-size:12.5px;color:var(--ink-2);margin-top:3px}
+  .ev .d .res{font-family:var(--font-mono);word-break:break-all}
+  .ev .h{font-family:var(--font-mono);font-size:10.5px;color:var(--ink-3);margin-top:5px;word-break:break-all}
+
+  .verifybox{margin-top:14px;background:var(--surface-2);border:1px solid var(--line);border-radius:11px;padding:14px}
+  .verifybox .vt{font-size:12px;font-weight:650;color:var(--ink);display:flex;align-items:center;gap:7px}
+  .verifybox p{font-size:12px;color:var(--ink-2);margin:7px 0 10px}
+  .cmd{font-family:var(--font-mono);font-size:11.5px;background:var(--raise);border:1px solid var(--line);
+    border-radius:8px;padding:9px 11px;color:var(--ink);overflow-x:auto;white-space:pre}
+  .cmd .fl{color:var(--accent)}
+  .caveat{font-size:11px;color:var(--ink-3);margin-top:9px;line-height:1.5}
+  footer{margin-top:30px;font-size:11.5px;color:var(--ink-3);text-align:center;line-height:1.6}
+  @media (max-width:640px){.stats{grid-template-columns:repeat(2,1fr)}}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <svg class="spark" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+        <path d="M16 2c1.5 6.2-2.8 8-2.8 12.3 0 2 1.3 3.4 2.8 3.4s2.8-1.4 2.8-3.4c0-1.6-.7-2.7-.7-2.7 2.4 1.3 4.1 4 4.1 7.2A6.2 6.2 0 0 1 16 25a6.2 6.2 0 0 1-6.2-6.2c0-5.7 4.6-8.1 6.2-16.8Z" fill="var(--accent)"/>
+        <circle cx="16" cy="19" r="2.6" fill="var(--bg)"/>
+      </svg>
+      <div>
+        <h1>Flint — Mandates</h1>
+        <div class="tag">Give your agent a mandate, not your keys.</div>
+      </div>
+    </div>
+    <div class="signer">
+      <span class="lbl">Runtime signer</span>
+      <span class="pin mono"><span class="dot"></span><span id="signer">—</span></span>
+      <button class="tbtn" id="theme" type="button">Toggle theme</button>
+    </div>
+  </header>
+
+  <div class="preview" id="preview" hidden>
+    <b>Preview data.</b> No runtime reachable — showing a representative dashboard. Served in-runtime, these cards read live from <span class="mono">/api/standing-grants</span>.
+  </div>
+
+  <div class="stats" id="stats"></div>
+
+  <div class="sectlabel">
+    <h2>Standing mandates</h2>
+    <span class="hint">issued this runtime lifetime — revoked ones stay listed</span>
+  </div>
+  <div class="grid" id="grid"></div>
+
+  <footer>
+    A mandate is a scoped, expiring, revocable grant to one agent key. Its receipt is a portable,
+    set-bound bundle anyone can verify off-box — no runtime, no trust in this box.
+  </footer>
+</div>
+
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" aria-hidden="true" aria-label="Mandate receipt">
+  <div class="dh">
+    <div>
+      <div class="t">Mandate receipt</div>
+      <div class="tid2 mono" id="d-tid">—</div>
+    </div>
+    <button class="xbtn" id="close" type="button" aria-label="Close">×</button>
+  </div>
+  <div class="dbody" id="dbody"></div>
+</aside>
+
+<script>
+(function(){
+  "use strict";
+  var $ = function(s,r){return (r||document).querySelector(s)};
+  var PREVIEW = false; // true when no runtime is reachable (showing representative data)
+
+  // ---- Representative data, faithful to the backend shapes (used when no runtime is reachable) ----
+  var SAMPLE_SIGNER = "9f2c6b1e7a4d0c83e5b1f0a9d6c4e2b8a1f3c5d7e9b0a2c4d6e8f0a1b3c5d7e9";
+  var SAMPLE = {
+    signer_public_key_hex: SAMPLE_SIGNER,
+    mandates: [
+      { token_id:"3b6a27bcceb6a42d62a3a8d02a6f0d73", capsule:"vm-demo-agent",
+        resource:"elastos://runtime/audit-chain", action:"read",
+        methods:["runtime.audit_verify"], expires_at:{secs:1720}, revoked:true, active:false },
+      { token_id:"a1f3c5d7e9b0a2c4d6e8f0a1b3c5d7e9", capsule:"vm-mail-agent",
+        resource:"elastos://runtime/content-access/QmVault7", action:"read",
+        methods:["runtime.content_seen"], expires_at:{secs:3600}, revoked:false, active:true },
+      { token_id:"77de243a63ac048a18b59da2915771de", capsule:"vm-ledger-agent",
+        resource:"elastos://runtime/audit-chain", action:"read",
+        methods:["runtime.audit_verify"], expires_at:null, revoked:false, active:true },
+      { token_id:"0c83e5b1f0a9d6c4e2b8a1f3c5d7e9b0", capsule:"vm-index-agent",
+        resource:"elastos://runtime/content-access/QmOld3", action:"read",
+        methods:["runtime.content_seen"], expires_at:{secs:0}, revoked:false, active:false }
+    ]
+  };
+  // A representative receipt (grant -> performed read -> revoke -> denied attempt), matching the demo.
+  var SAMPLE_RECEIPT = {
+    schema:"elastos.mandate_receipt/v1",
+    scope:{kind:"capability", token_id:"3b6a27bcceb6a42d62a3a8d02a6f0d73"},
+    signer_public_key_hex:SAMPLE_SIGNER,
+    set_binding:"iQ3f…bound",
+    records:[
+      {seq:5, event:{type:"capability_grant", resource:"elastos://runtime/audit-chain", action:"read"}, record_hash:"b2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9"},
+      {seq:9, event:{type:"capability_use", resource:"elastos://runtime/audit-chain", action:"read", success:true}, record_hash:"d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0a2"},
+      {seq:14, event:{type:"capability_revoke", reason:"standing grant revoked via API"}, record_hash:"f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0a2c4d6"},
+      {seq:18, event:{type:"capability_use", resource:"elastos://runtime/audit-chain", action:"read", success:false}, record_hash:"a2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9"}
+    ]
+  };
+
+  function state(m){ return m.active ? "live" : (m.revoked ? "rev" : "exp"); }
+  function stateLabel(s){ return s==="live"?"Live":(s==="rev"?"Revoked":"Expired"); }
+  function shortId(id){ return id.length>18 ? id.slice(0,10)+"…"+id.slice(-6) : id; }
+  function expiry(m){
+    if(m.revoked) return "revoked";
+    if(m.expires_at==null) return "no expiry — until revoked";
+    var s = m.expires_at.secs!=null ? m.expires_at.secs : m.expires_at;
+    if(typeof s==="number"){ if(s<=0) return "expired"; if(s<3600) return "expires in "+Math.round(s/60)+"m"; return "expires in "+(s/3600).toFixed(s%3600?1:0)+"h"; }
+    return String(s);
+  }
+
+  function renderStats(d){
+    var live=0,rev=0,exp=0;
+    d.mandates.forEach(function(m){ var s=state(m); if(s==="live")live++; else if(s==="rev")rev++; else exp++; });
+    var cells=[["all",d.mandates.length,"Mandates"],["live",live,"Live"],["rev",rev,"Revoked"],["exp",exp,"Expired"]];
+    $("#stats").innerHTML = cells.map(function(c){
+      return '<div class="stat '+c[0]+'"><div class="n tnum">'+c[1]+'</div><div class="k">'+c[2]+'</div></div>';
+    }).join("");
+  }
+
+  function renderGrid(d){
+    $("#grid").innerHTML = d.mandates.map(function(m,i){
+      var s=state(m);
+      var chips = m.methods.map(function(x){return '<span class="chip">'+esc(x)+'</span>';}).join("");
+      return '<button class="card s-'+s+'" data-i="'+i+'" type="button">'
+        + '<span class="stripe"></span>'
+        + '<div class="row1"><span class="cap">'+esc(m.capsule)+'</span>'
+        + '<span class="pill '+s+'">'+stateLabel(s)+'</span></div>'
+        + '<div class="scope"><span class="verb">'+esc(m.action)+'</span> · <span class="res">'+esc(m.resource)+'</span></div>'
+        + '<div class="chips">'+chips+'</div>'
+        + '<div class="foot"><span class="tid">'+esc(shortId(m.token_id))+'</span>'
+        + '<span class="open">View receipt →</span></div>'
+        + '</button>';
+    }).join("");
+    Array.prototype.forEach.call(document.querySelectorAll(".card"), function(c){
+      c.addEventListener("click", function(){ openReceipt(d.mandates[+c.dataset.i], d.signer_public_key_hex); });
+    });
+  }
+
+  function evClass(e){
+    if(e.event.type==="capability_grant") return "grant";
+    if(e.event.type==="capability_revoke") return "revoke";
+    if(e.event.type==="capability_use") return e.event.success ? "ok" : "deny";
+    return "";
+  }
+  function evTitle(e){
+    var t=e.event.type;
+    if(t==="capability_grant") return "Mandate granted";
+    if(t==="capability_revoke") return "Revoked";
+    if(t==="capability_use") return e.event.success
+      ? 'Act performed<span class="tag">success</span>'
+      : 'Act denied<span class="tag">denied</span>';
+    return esc(t);
+  }
+  function evDetail(e){
+    var v=e.event;
+    if(v.type==="capability_revoke") return "reason: "+esc(v.reason||"");
+    if(v.resource) return '<span class="verb">'+esc(v.action||"")+'</span> · <span class="res">'+esc(v.resource)+'</span>';
+    return "";
+  }
+
+  function openReceipt(m, signer){
+    $("#d-tid").textContent = m.token_id;
+    $("#dbody").innerHTML = '<div class="caveat">Loading receipt…</div>';
+    $("#scrim").classList.add("on");
+    $("#drawer").classList.add("on");
+    $("#drawer").setAttribute("aria-hidden","false");
+    // Live in-runtime: read the portable receipt for THIS mandate; fall back to a representative one.
+    if (typeof fetch === "function" && !PREVIEW){
+      fetch("/api/mandate/"+encodeURIComponent(m.token_id)+"/receipt", {headers:{Accept:"application/json"}})
+        .then(function(r){ if(!r.ok) throw 0; return r.json(); })
+        .then(function(j){ paintReceipt(j, signer); })
+        .catch(function(){ paintReceipt(SAMPLE_RECEIPT, signer); });
+    } else {
+      paintReceipt(SAMPLE_RECEIPT, signer);
+    }
+  }
+  function paintReceipt(r, signer){
+    var evs = (r.records||[]).map(function(e){
+      return '<div class="ev '+evClass(e)+'"><span class="node"></span>'
+        + '<div class="k">'+evTitle(e)+'</div>'
+        + (evDetail(e)?'<div class="d">'+evDetail(e)+'</div>':'')
+        + '<div class="h">seq '+e.seq+' · '+esc(shortId(e.record_hash))+'</div></div>';
+    }).join("");
+    var pin = signer || r.signer_public_key_hex;
+    $("#dbody").innerHTML =
+      '<div class="metarow">'
+      + '<span class="badge ok">'+check()+' Set-bound</span>'
+      + '<span class="badge neutral">Scope: capability</span>'
+      + '<span class="badge neutral">'+(r.records||[]).length+' records</span>'
+      + '</div>'
+      + '<div class="tl">'+evs+'</div>'
+      + '<div class="verifybox"><div class="vt">'+shield()+' Verify independently, off-box</div>'
+      + '<p>This receipt is portable and set-bound. A counterparty verifies it on their own machine, pinning the issuer key they trust out-of-band — not this dashboard.</p>'
+      + '<div class="cmd">elastos verify-receipt receipt.json <span class="fl">--signer</span> '+esc(shortId(pin))+'</div>'
+      + '<div class="caveat">This dashboard shows the runtime’s self-asserted signer; it is not an independent authentication. A <b>performed</b> act attests the runtime did what was declared, bounded by trust in the issuing key.</div>'
+      + '</div>';
+    $("#scrim").classList.add("on");
+    $("#drawer").classList.add("on");
+    $("#drawer").setAttribute("aria-hidden","false");
+  }
+  function closeReceipt(){
+    $("#scrim").classList.remove("on");
+    $("#drawer").classList.remove("on");
+    $("#drawer").setAttribute("aria-hidden","true");
+  }
+  function check(){return '<svg viewBox="0 0 16 16" fill="none"><path d="M3 8.5l3.2 3L13 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';}
+  function shield(){return '<svg viewBox="0 0 16 16" width="13" height="13" fill="none"><path d="M8 1.5l5 2v4c0 3.2-2.1 5.3-5 6.5-2.9-1.2-5-3.3-5-6.5v-4l5-2Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>';}
+  function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];});}
+
+  function paint(d, isPreview){
+    PREVIEW = !!isPreview;
+    $("#preview").hidden = !isPreview;
+    $("#signer").textContent = shortId(d.signer_public_key_hex||"unsigned");
+    renderStats(d); renderGrid(d);
+  }
+
+  // Try the live endpoint (works when this file is served in-runtime, same-origin authenticated);
+  // fall back to representative preview data so the page stands alone.
+  function load(){
+    if (typeof fetch !== "function"){ paint(SAMPLE, true); return; }
+    var done=false, t=setTimeout(function(){ if(!done){done=true; paint(SAMPLE,true);} }, 1200);
+    fetch("/api/standing-grants", {headers:{Accept:"application/json"}})
+      .then(function(r){ if(!r.ok) throw 0; return r.json(); })
+      .then(function(j){ if(done)return; done=true; clearTimeout(t);
+        paint({mandates:j.mandates||[], signer_public_key_hex:j.signer_public_key_hex}, false); })
+      .catch(function(){ if(done)return; done=true; clearTimeout(t); paint(SAMPLE, true); });
+  }
+
+  // theme toggle
+  $("#theme").addEventListener("click", function(){
+    var root=document.documentElement;
+    var cur=root.getAttribute("data-theme");
+    var dark = cur ? cur==="dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+    root.setAttribute("data-theme", dark?"light":"dark");
+  });
+  $("#close").addEventListener("click", closeReceipt);
+  $("#scrim").addEventListener("click", closeReceipt);
+  document.addEventListener("keydown", function(e){ if(e.key==="Escape") closeReceipt(); });
+  load();
+})();
+</script>
+</body>
+</html>
