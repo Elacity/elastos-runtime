@@ -149,8 +149,15 @@ async fn setup_server_infrastructure_impl(
     ));
     // ONE mandate registry for the whole runtime, created here and shared into both the API server
     // (where mandates are issued) and the Home gateway (where the Mandates app reads them), so the
-    // shell sees exactly the mandates the CLI/API issued.
-    let standing_service = Arc::new(capability_manager.standing_grant_service());
+    // shell sees exactly the mandates the CLI/API issued. PERSISTENT (G-M5): mandates and the
+    // intent replay guard survive restart, snapshot-backed next to the capability store. Fail-
+    // closed: the server does not start over corrupt mandate state (a skipped record could
+    // resurrect a revoked mandate or reopen a replay window).
+    let standing_service = Arc::new(
+        capability_manager
+            .standing_grant_service_with_persistence(data_dir.join("standing_grants.json"))
+            .map_err(|e| anyhow::anyhow!("mandate registry persistence unavailable: {e}"))?,
+    );
     let pending_store = Arc::new(capability::pending::PendingRequestStore::new(
         audit_log.clone(),
     ));

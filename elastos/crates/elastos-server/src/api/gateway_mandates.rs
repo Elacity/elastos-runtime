@@ -222,7 +222,8 @@ mod tests {
         methods.insert("send".to_string());
         let grant_id = state
             .standing_service
-            .issue_from_token(&token, methods, None);
+            .issue_from_token(&token, methods, None)
+            .unwrap();
 
         let app = mandate_router(state);
         let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
@@ -268,7 +269,8 @@ mod tests {
         methods.insert("send".to_string());
         let grant_id = state
             .standing_service
-            .issue_from_token(&token, methods, None);
+            .issue_from_token(&token, methods, None)
+            .unwrap();
         // Kill the whole epoch WITHOUT individually revoking the token or touching the envelope.
         state.capability_manager.revoke_all("key rotation");
         // Sanity: the individual-revocation path is NOT what killed it — only the epoch advanced.
@@ -339,7 +341,8 @@ mod tests {
         methods.insert("send".to_string());
         let grant_id = state
             .standing_service
-            .issue_from_token(&token, methods, None);
+            .issue_from_token(&token, methods, None)
+            .unwrap();
 
         let app = mandate_router(state.clone());
         let denied = app
@@ -378,7 +381,8 @@ mod tests {
         methods.insert("send".to_string());
         let grant_id = state
             .standing_service
-            .issue_from_token(&token, methods, None);
+            .issue_from_token(&token, methods, None)
+            .unwrap();
         assert!(state.standing_service.is_active(&grant_id));
 
         let app = mandate_router(state.clone());

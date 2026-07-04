@@ -104,11 +104,26 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   capsule-string-only: within the current shell-only endpoint that is contained (the shell can issue
   any mandate anyway, G-M3), but it carries weaker attribution. FUTURE: make binding the default /
   required when the endpoint is exposed to agents directly, and surface bound-vs-unbound on the card.
-- **G-M5 (replay guard — closed in-process, not cross-restart).** Each `intent_id` acts at most once
-  per runtime lifetime (`record_fresh_intent`; a replay is refused 409) — proven by
-  `dispatch_refuses_a_replayed_intent`. The seen-set is in-memory, so a replay after a RESTART is not
-  yet caught; and there is no `declared_at` freshness window. Persist the seen-set (or add a signed
-  freshness window) before exposing the endpoint beyond the single trusted operator.
+- **G-M5 CLOSED (Sprint 14) — durable mandates: the registry AND the replay guard survive restart.**
+  The serve-path `StandingGrantService` is now snapshot-backed (`standing_grants.json` next to the
+  capability store; version-pinned, atomic temp+fsync+rename mirroring `CapabilityStore`), so a
+  granted mandate is still LIVE after a reboot, a revoked one STAYS dead (never crash-revived), and
+  a dispatched `intent_id` is still refused (the replay guard persists). Ordering is durable-before-
+  visible with rollback on EVERY mutation (issue / revoke / revoke_all / record_fresh_intent): a
+  write that cannot be persisted is rolled back in memory and the error SURFACES — the issue handler
+  refuses to mint (500, "not issued"), dispatch refuses the intent when the replay guard or the
+  G-M1 heal cannot be recorded, and the mass kill reports failure rather than a clean success whose
+  envelopes could resurrect as "Live" cards. Boot is fail-closed: a present-but-corrupt (or wrong-
+  version) snapshot REFUSES to start (a skipped record could resurrect a revoked mandate or reopen
+  a replay window); a missing file is a clean first boot. Same-disk custody caveat as the audit
+  log's head-anchor: this defends against loss/corruption, not a root attacker who already owns the
+  key material. The carrier_bridge's own registry stays memory-only by design (separate instance;
+  two services over one path would clobber snapshots). Residual (small): no `declared_at` freshness
+  window on intents, and the seen-set grows monotonically (O(n) snapshot rewrite per dispatch) —
+  add a windowed/compacting guard before exposing dispatch beyond the single trusted operator.
+  Ratchets: `intent::tests::{persistent_store_survives_reopen_live_dead_and_replay,
+  persistent_store_refuses_corrupt_state_at_boot, persist_failure_rolls_back_and_surfaces}` +
+  `capability::tests::mandates_survive_restart_over_the_handlers`.
 - **G-M6 — the reconciliation seam is closed; ONE real affordance wired (honest).** Dispatch
   invokes a real [`IntentExecutor`] (`intent_executor.rs`) INSIDE the gate's act closure (so a
   denied/revoked intent never executes) and mints the affordance receipt from what the executor

@@ -898,8 +898,19 @@ pub async fn revoke_all_capabilities(
 
     // The envelope side of the mass kill: the epoch advance killed every backing TOKEN, but the
     // standing-grant registry knows nothing of epochs — without this, an epoch-dead mandate keeps
-    // rendering (and, once dispatch is wired, dispatching) as LIVE.
-    let _ = state.standing_service.revoke_all();
+    // rendering (and, once dispatch is wired, dispatching) as LIVE. A registry persistence failure
+    // surfaces (the epoch advance above already durably killed every token, so nothing can ACT —
+    // but a mass kill whose envelopes may resurrect as "Live" cards on restart must not report
+    // clean success).
+    state.standing_service.revoke_all().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "epoch advanced (all tokens dead) but the mandate registry could not record the \
+                 envelope revokes — retry: {e}"
+            ),
+        )
+    })?;
 
     // Mark all granted requests as revoked, fail-closed on the audit records (AUD-3):
     // the epoch increment above already invalidated the tokens, but an incomplete
@@ -1158,9 +1169,18 @@ pub async fn issue_standing_grant(
         expiry,
     );
     let methods: std::collections::BTreeSet<String> = input.methods.into_iter().collect();
+    // Durable-before-visible (G-M5): a mandate that cannot be recorded to the persistent registry
+    // is NOT issued — the operator retries into a working store rather than holding a grant that
+    // silently evaporates on the next restart.
     let grant_id = state
         .standing_service
-        .issue_from_token(&token, methods, agent_pubkey);
+        .issue_from_token(&token, methods, agent_pubkey)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("mandate could not be durably recorded — not issued: {e}"),
+            )
+        })?;
     let token_id = token.id().to_string();
     Ok(Json(IssueStandingGrantOutput { grant_id, token_id }))
 }
@@ -1213,8 +1233,19 @@ pub async fn revoke_mandate(
     })?;
     // Kill the envelope by the CANONICAL id (the parsed token's lowercase-hex Display form — the
     // exact key the registry stores). Keying off the caller's raw string would let an UPPERCASE
-    // spelling revoke the token yet miss the envelope, leaving the dispatch path live.
-    Ok(standing_service.revoke(&token_id.to_string()))
+    // spelling revoke the token yet miss the envelope, leaving the dispatch path live. A registry
+    // persistence failure surfaces loudly: the BACKING TOKEN is already durably revoked above (so
+    // the mandate cannot act — dispatch consults token revocation, G-M1), but the envelope flag
+    // did not stick; the caller retries rather than trusting a revoke the registry may forget.
+    standing_service.revoke(&token_id.to_string()).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "backing token durably revoked, but the mandate registry could not record the \
+                 envelope revoke — retry: {e}"
+            ),
+        )
+    })
 }
 
 /// POST /api/standing-grants/revoke  (shell-only) — the autonomy kill switch.
@@ -1410,14 +1441,25 @@ pub async fn dispatch_standing_intent(
             "intent declaration signature did not verify".to_string(),
         ));
     }
-    // Replay guard (G-M5): register the intent id BEFORE anything acts. A duplicate is refused with
-    // no record and no act. Register only AFTER authenticity (above) so a forged blob cannot burn a
-    // future-legitimate id.
-    if !state.standing_service.record_fresh_intent(&intent.intent_id) {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("intent {} was already dispatched (replay refused)", intent.intent_id),
-        ));
+    // Replay guard (G-M5): register the intent id BEFORE anything acts — durably, so the guard
+    // survives restart. A duplicate is refused with no record and no act. Register only AFTER
+    // authenticity (above) so a forged blob cannot burn a future-legitimate id. A guard that
+    // cannot be durably recorded REFUSES the act (fail-closed) with its true reason — an intent
+    // that acts without a surviving replay record could act again after a reboot.
+    match state.standing_service.record_fresh_intent(&intent.intent_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("intent {} was already dispatched (replay refused)", intent.intent_id),
+            ));
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("replay guard could not be durably recorded — intent refused: {e}"),
+            ));
+        }
     }
     let action = match intent.action.to_lowercase().as_str() {
         "read" => Action::Read,
@@ -1446,7 +1488,19 @@ pub async fn dispatch_standing_intent(
             .map(|env| !state.capability_manager.is_epoch_valid(env.token_epoch))
             .unwrap_or(false);
         if revoked || epoch_dead {
-            let _ = state.standing_service.revoke(&token_id.to_string());
+            // The heal must STICK before dispatch proceeds: if the registry cannot record the
+            // envelope revoke, refuse the intent rather than let the gate read a live envelope
+            // whose backing token is dead. (The gate itself would still deny via the token check,
+            // but a fail-open heal here would leave disk claiming LIVE across a restart.)
+            if let Err(e) = state.standing_service.revoke(&token_id.to_string()) {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "mandate is token-dead but the registry could not record the envelope \
+                         revoke — intent refused: {e}"
+                    ),
+                ));
+            }
         }
     }
     let manager = state.capability_manager.clone();
@@ -1734,6 +1788,85 @@ mod tests {
         .expect("ok")
         .0;
         assert!(!rev2.revoked, "double-revoke returns false");
+    }
+
+    /// G-M5 over the REAL handlers: a mandate issued through `issue_standing_grant` is still live
+    /// after a registry "reboot" (a fresh service over the same snapshot file), and one revoked
+    /// through `revoke_standing_grant` STAYS dead — never crash-revived.
+    #[tokio::test]
+    async fn mandates_survive_restart_over_the_handlers() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry_path = dir.path().join("standing_grants.json");
+        let audit_log = std::sync::Arc::new(elastos_runtime::primitives::audit::AuditLog::new());
+        let store = std::sync::Arc::new(elastos_runtime::capability::CapabilityStore::new());
+        let metrics =
+            std::sync::Arc::new(elastos_runtime::primitives::metrics::MetricsManager::new());
+        let capability_manager =
+            std::sync::Arc::new(CapabilityManager::new(store, audit_log.clone(), metrics));
+        let standing_service = std::sync::Arc::new(
+            capability_manager
+                .standing_grant_service_with_persistence(&registry_path)
+                .unwrap(),
+        );
+        let state = CapabilityState {
+            pending_store: std::sync::Arc::new(PendingRequestStore::new(audit_log.clone())),
+            capability_manager: capability_manager.clone(),
+            policy_evaluator: std::sync::Arc::new(PolicyEvaluator::new(
+                Box::new(elastos_runtime::capability::evaluator::ShellPassthroughVerifier),
+                audit_log.clone(),
+            )),
+            standing_service,
+            intent_executor: std::sync::Arc::new(
+                crate::intent_executor::MethodRegistryExecutor::production(audit_log),
+            ),
+        };
+
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: "elastos://mail/send".to_string(),
+                action: "execute".to_string(),
+                methods: vec!["send".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: None,
+            }),
+        )
+        .await
+        .expect("issue ok")
+        .0;
+
+        // "Reboot" #1: a fresh service over the SAME snapshot — the mandate survives, live.
+        let rebooted = capability_manager
+            .standing_grant_service_with_persistence(&registry_path)
+            .unwrap();
+        assert!(
+            rebooted.is_active(&out.grant_id),
+            "an issued mandate survives restart LIVE"
+        );
+
+        // Kill it through the real handler, then "reboot" #2: it STAYS dead.
+        let rev = revoke_standing_grant(
+            State(state.clone()),
+            Json(RevokeStandingGrantInput {
+                grant_id: out.grant_id.clone(),
+            }),
+        )
+        .await
+        .expect("revoke ok")
+        .0;
+        assert!(rev.revoked);
+        let rebooted = capability_manager
+            .standing_grant_service_with_persistence(&registry_path)
+            .unwrap();
+        assert!(
+            !rebooted.is_active(&out.grant_id),
+            "a revoked mandate is NEVER crash-revived"
+        );
+        assert!(
+            rebooted.get(&out.grant_id).expect("still queryable").revoked,
+            "the reloaded record is honestly marked revoked"
+        );
     }
 
     /// Like [`test_state`] but with a DURABLE (file-backed, signed) audit log, so the mandate's

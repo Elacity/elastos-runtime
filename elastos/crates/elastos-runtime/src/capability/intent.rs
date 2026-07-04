@@ -162,7 +162,7 @@ impl IntentDeclarationV1 {
 /// repeatedly with different arguments within the envelope (the whole point of
 /// unsupervised autonomy). Wiring this from a real issued `CapabilityToken` / grant is a
 /// later chunk; here it is the value the pure check consumes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StandingGrantEnvelope {
     pub grant_id: String,
     pub capsule: String,
@@ -661,45 +661,180 @@ where
 #[derive(Default)]
 pub struct StandingGrantStore {
     grants: RwLock<HashMap<String, StandingGrantEnvelope>>,
-    /// Intent ids already dispatched this runtime lifetime — the replay guard. A standing mandate
-    /// is deliberately multi-use (the agent may act repeatedly with DIFFERENT intents), but the
-    /// SAME signed declaration must act at most once, or a captured/retried blob is a double-act.
+    /// Intent ids already dispatched — the replay guard. A standing mandate is deliberately
+    /// multi-use (the agent may act repeatedly with DIFFERENT intents), but the SAME signed
+    /// declaration must act at most once, or a captured/retried blob is a double-act. With a
+    /// persistent store the set survives restart (G-M5 closed); memory-only it is per-lifetime.
     seen_intents: RwLock<HashSet<String>>,
+    /// Snapshot file for a PERSISTENT registry (`None` = memory-only). Every mutation writes the
+    /// full snapshot atomically (temp + fsync + rename, mirroring `CapabilityStore`) BEFORE the
+    /// change becomes visible — on a write failure the mutation is rolled back and the error
+    /// surfaces, so disk and memory can never diverge (no crash-revived mandate, no crash-forgotten
+    /// revoke, no crash-forgotten replay guard).
+    storage_path: Option<std::path::PathBuf>,
 }
+
+/// The on-disk snapshot of the standing-grant registry, version-pinned. Same-disk custody caveat
+/// as the audit log's head-anchor: this defends against loss/corruption (strict parse, fail-closed
+/// boot), not against a root attacker rewriting the file — that adversary already owns the runtime
+/// key material on the same disk.
+#[derive(Serialize, Deserialize)]
+struct StandingGrantSnapshotV1 {
+    version: u32,
+    grants: Vec<StandingGrantEnvelope>,
+    seen_intents: Vec<String>,
+}
+
+const STANDING_GRANT_SNAPSHOT_VERSION: u32 = 1;
 
 impl StandingGrantStore {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Issue (or replace) a standing grant, keyed by its `grant_id`. Issuing an envelope whose
-    /// `revoked` flag is already set stores it as revoked (authorizes nothing) — issuing never
-    /// silently un-revokes a grant.
-    pub fn issue(&self, envelope: StandingGrantEnvelope) {
+    /// Open (or create) a PERSISTENT registry backed by a snapshot file — mandates and the replay
+    /// guard survive restart. STRICT load, fail-closed at boot: a present-but-unparseable (or
+    /// wrong-version) file is an error, never silently skipped — a skipped record could resurrect
+    /// a revoked mandate or forget a dispatched intent (a replay window). A missing file is a
+    /// clean first boot.
+    pub fn with_persistence(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let store = Self {
+            storage_path: Some(path.clone()),
+            ..Self::default()
+        };
+        if path.exists() {
+            let content = std::fs::read_to_string(&path)?;
+            let snapshot: StandingGrantSnapshotV1 =
+                serde_json::from_str(&content).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "standing-grant registry at {} is unreadable ({e}); refusing to boot \
+                             over corrupt mandate state — repair or remove the file explicitly",
+                            path.display()
+                        ),
+                    )
+                })?;
+            if snapshot.version != STANDING_GRANT_SNAPSHOT_VERSION {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "standing-grant registry at {} has unsupported version {} (expected {})",
+                        path.display(),
+                        snapshot.version,
+                        STANDING_GRANT_SNAPSHOT_VERSION
+                    ),
+                ));
+            }
+            let mut grants = match store.grants.write() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for env in snapshot.grants {
+                grants.insert(env.grant_id.clone(), env);
+            }
+            drop(grants);
+            let mut seen = match store.seen_intents.write() {
+                Ok(s) => s,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            seen.extend(snapshot.seen_intents);
+        }
+        Ok(store)
+    }
+
+    /// Write the full snapshot atomically (temp + fsync + rename). Called with BOTH write guards
+    /// held so the serialized state is exactly the state that becomes visible. Memory-only ⇒ no-op.
+    fn persist_locked(
+        &self,
+        grants: &HashMap<String, StandingGrantEnvelope>,
+        seen: &HashSet<String>,
+    ) -> std::io::Result<()> {
+        let Some(path) = &self.storage_path else {
+            return Ok(());
+        };
+        let mut grant_list: Vec<StandingGrantEnvelope> = grants.values().cloned().collect();
+        grant_list.sort_by(|a, b| a.grant_id.cmp(&b.grant_id));
+        let mut seen_list: Vec<String> = seen.iter().cloned().collect();
+        seen_list.sort();
+        let snapshot = StandingGrantSnapshotV1 {
+            version: STANDING_GRANT_SNAPSHOT_VERSION,
+            grants: grant_list,
+            seen_intents: seen_list,
+        };
+        let content = serde_json::to_vec(&snapshot)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp_path = path.with_extension("tmp");
+        {
+            use std::io::Write as _;
+            let mut tmp = std::fs::File::create(&tmp_path)?;
+            tmp.write_all(&content)?;
+            // Durable BEFORE visible: the rename must never publish bytes still in the page cache.
+            tmp.sync_all()?;
+        }
+        std::fs::rename(&tmp_path, path)
+    }
+
+    /// Issue (or replace) a standing grant, keyed by its `grant_id`, durable-before-visible.
+    /// Issuing an envelope whose `revoked` flag is already set stores it as revoked (authorizes
+    /// nothing) — issuing never silently un-revokes a grant. On a persistence failure the issuance
+    /// is rolled back and the error surfaces: a mandate that cannot survive a restart is not
+    /// issued at all (fail-closed, mirroring the manager's emit-before-mutate revoke).
+    pub fn issue(&self, envelope: StandingGrantEnvelope) -> std::io::Result<()> {
         let mut grants = match self.grants.write() {
             Ok(g) => g,
             // A poisoned lock can only mean a prior panic; every write is one statement, so the
             // map is structurally intact — recover the guard rather than drop the issuance.
             Err(poisoned) => poisoned.into_inner(),
         };
-        grants.insert(envelope.grant_id.clone(), envelope);
+        let seen = match self.seen_intents.write() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let grant_id = envelope.grant_id.clone();
+        let previous = grants.insert(grant_id.clone(), envelope);
+        if let Err(e) = self.persist_locked(&grants, &seen) {
+            // Roll back: disk is the durable truth; memory must not run ahead of it.
+            match previous {
+                Some(prev) => grants.insert(grant_id, prev),
+                None => grants.remove(&grant_id),
+            };
+            return Err(e);
+        }
+        Ok(())
     }
 
-    /// Revoke a standing grant by id, fail-closed. Returns `true` iff a live (not-already-revoked)
-    /// grant was revoked by THIS call — so a double-revoke or an unknown id returns `false`. The
-    /// record is retained with `revoked = true` so the grant stays queryable as revoked.
-    pub fn revoke(&self, grant_id: &str) -> bool {
+    /// Revoke a standing grant by id, fail-closed AND durable-before-visible. Returns `true` iff a
+    /// live (not-already-revoked) grant was revoked by THIS call — a double-revoke or an unknown id
+    /// returns `false`. The record is retained with `revoked = true` so the grant stays queryable
+    /// as revoked. On a persistence failure the flag is rolled back and the error surfaces — a
+    /// revoke that would crash-revive on restart does not report success.
+    pub fn revoke(&self, grant_id: &str) -> std::io::Result<bool> {
         let mut grants = match self.grants.write() {
             Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let seen = match self.seen_intents.write() {
+            Ok(s) => s,
             Err(poisoned) => poisoned.into_inner(),
         };
         match grants.get_mut(grant_id) {
             Some(env) if !env.revoked => {
                 env.revoked = true;
-                true
             }
-            _ => false,
+            _ => return Ok(false),
         }
+        if let Err(e) = self.persist_locked(&grants, &seen) {
+            if let Some(env) = grants.get_mut(grant_id) {
+                env.revoked = false;
+            }
+            return Err(e);
+        }
+        Ok(true)
     }
 
     /// The standing grant for `grant_id`, if one was ever issued (revoked or not). The dispatcher
@@ -726,36 +861,66 @@ impl StandingGrantStore {
         all
     }
 
-    /// Register an intent id as dispatched, returning `true` iff it was FRESH (not seen before this
-    /// runtime lifetime). The replay guard: the caller acts only on `true`, so a re-POSTed signed
-    /// declaration is refused. A poisoned lock recovers via `into_inner()` (single-statement
-    /// invariant) rather than silently admitting a replay. NOTE: in-memory ⇒ per-lifetime; cross-
-    /// restart replay protection is tracked in KNOWN_GAPS G-M5.
-    pub fn record_fresh_intent(&self, intent_id: &str) -> bool {
+    /// Register an intent id as dispatched, returning `true` iff it was FRESH. The replay guard:
+    /// the caller acts only on `Ok(true)`, so a re-POSTed signed declaration is refused. With a
+    /// persistent store the registration is durable-before-visible — on a persistence failure the
+    /// id is rolled back and the error surfaces, and the caller must REFUSE the act (an intent
+    /// whose replay guard cannot survive a restart must not act; G-M5). A poisoned lock recovers
+    /// via `into_inner()` (single-statement invariant) rather than silently admitting a replay.
+    pub fn record_fresh_intent(&self, intent_id: &str) -> std::io::Result<bool> {
+        let grants = match self.grants.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let mut seen = match self.seen_intents.write() {
             Ok(s) => s,
             Err(poisoned) => poisoned.into_inner(),
         };
-        seen.insert(intent_id.to_string())
+        if !seen.insert(intent_id.to_string()) {
+            return Ok(false);
+        }
+        if let Err(e) = self.persist_locked(&grants, &seen) {
+            seen.remove(intent_id);
+            return Err(e);
+        }
+        Ok(true)
     }
 
-    /// Revoke EVERY standing grant — the envelope side of the mass kill switch. Called alongside
-    /// an epoch advance (`revoke_all`), which kills every backing token but knows nothing of the
-    /// envelope registry; without this, an epoch-dead mandate would keep rendering (and, once
-    /// dispatch is wired, dispatching) as LIVE. Returns how many live envelopes this call killed.
-    pub fn revoke_all(&self) -> usize {
+    /// Revoke EVERY standing grant — the envelope side of the mass kill switch, durable-before-
+    /// visible. Called alongside an epoch advance (`revoke_all`), which kills every backing token
+    /// but knows nothing of the envelope registry; without this, an epoch-dead mandate would keep
+    /// rendering (and, once dispatch is wired, dispatching) as LIVE. Returns how many live
+    /// envelopes this call killed; on a persistence failure every flag is rolled back and the
+    /// error surfaces (all-or-nothing — a partially-persisted mass kill is worse than a loud
+    /// failure, because it looks complete).
+    pub fn revoke_all(&self) -> std::io::Result<usize> {
         let mut grants = match self.grants.write() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let mut killed = 0;
+        let seen = match self.seen_intents.write() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut killed_ids = Vec::new();
         for env in grants.values_mut() {
             if !env.revoked {
                 env.revoked = true;
-                killed += 1;
+                killed_ids.push(env.grant_id.clone());
             }
         }
-        killed
+        if killed_ids.is_empty() {
+            return Ok(0);
+        }
+        if let Err(e) = self.persist_locked(&grants, &seen) {
+            for id in &killed_ids {
+                if let Some(env) = grants.get_mut(id) {
+                    env.revoked = false;
+                }
+            }
+            return Err(e);
+        }
+        Ok(killed_ids.len())
     }
 
     /// True iff an ACTIVE (issued, not revoked, not expired) grant exists for `grant_id`. A read-only
@@ -849,20 +1014,39 @@ impl StandingGrantService {
         }
     }
 
+    /// Like [`new`](Self::new) but over a PERSISTENT registry (see
+    /// [`StandingGrantStore::with_persistence`]): mandates and the replay guard survive restart.
+    /// Fail-closed at boot — corrupt on-disk state is an error, never silently skipped.
+    pub fn with_persistence(
+        audit: Arc<AuditLog>,
+        signing_key: SigningKey,
+        path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<Self> {
+        let signer_pubkey = signing_key.verifying_key().to_bytes();
+        Ok(Self {
+            store: StandingGrantStore::with_persistence(path)?,
+            audit,
+            signing_key,
+            signer_pubkey,
+        })
+    }
+
     /// Issue a standing grant derived from a REAL issued [`CapabilityToken`] (the cryptographic
     /// root): the token supplies capsule/resource/action/expiry, the caller supplies the authorized
     /// method set. Returns the `grant_id` (the token's id) to revoke or dispatch against later.
+    /// With a persistent registry, a mandate that cannot be durably recorded is NOT issued
+    /// (fail-closed) — the error surfaces instead.
     pub fn issue_from_token(
         &self,
         token: &CapabilityToken,
         allowed_methods: BTreeSet<String>,
         agent_pubkey: Option<String>,
-    ) -> String {
+    ) -> std::io::Result<String> {
         let envelope =
             StandingGrantEnvelope::from_token(token, allowed_methods, false, agent_pubkey);
         let grant_id = envelope.grant_id.clone();
-        self.store.issue(envelope);
-        grant_id
+        self.store.issue(envelope)?;
+        Ok(grant_id)
     }
 
     /// The standing grant envelope for `grant_id` (revoked or not), if ever issued. Read-only;
@@ -871,15 +1055,16 @@ impl StandingGrantService {
         self.store.get(grant_id)
     }
 
-    /// Register an intent id as dispatched; `true` iff FRESH. The replay guard — see
-    /// [`StandingGrantStore::record_fresh_intent`].
-    pub fn record_fresh_intent(&self, intent_id: &str) -> bool {
+    /// Register an intent id as dispatched; `Ok(true)` iff FRESH. The replay guard — see
+    /// [`StandingGrantStore::record_fresh_intent`]. On `Err` the caller must REFUSE the act.
+    pub fn record_fresh_intent(&self, intent_id: &str) -> std::io::Result<bool> {
         self.store.record_fresh_intent(intent_id)
     }
 
-    /// Revoke a standing grant by id, fail-closed. Returns `true` iff a live grant was revoked by
-    /// this call (double-revoke / unknown id → `false`).
-    pub fn revoke(&self, grant_id: &str) -> bool {
+    /// Revoke a standing grant by id, fail-closed and durable-before-visible. `Ok(true)` iff a
+    /// live grant was revoked by this call (double-revoke / unknown id → `Ok(false)`); a
+    /// persistence failure rolls back and surfaces.
+    pub fn revoke(&self, grant_id: &str) -> std::io::Result<bool> {
         self.store.revoke(grant_id)
     }
 
@@ -895,8 +1080,9 @@ impl StandingGrantService {
     }
 
     /// Revoke EVERY standing grant (the envelope side of the mass kill switch — pair with the
-    /// manager's epoch advance). Returns how many live envelopes were killed by this call.
-    pub fn revoke_all(&self) -> usize {
+    /// manager's epoch advance). Returns how many live envelopes were killed by this call;
+    /// all-or-nothing under a persistent registry.
+    pub fn revoke_all(&self) -> std::io::Result<usize> {
         self.store.revoke_all()
     }
 
@@ -1611,7 +1797,7 @@ mod tests {
         assert!(store.get("g1").is_none(), "an unissued grant is absent");
         assert!(!store.is_active("g1"), "an unissued grant is not active");
 
-        store.issue(envelope_with("g1", Some(SecureTimestamp::after_secs(3600))));
+        store.issue(envelope_with("g1", Some(SecureTimestamp::after_secs(3600)))).unwrap();
         let got = store.get("g1").expect("issued grant is retrievable");
         assert_eq!(got.grant_id, "g1");
         assert!(!got.revoked);
@@ -1621,19 +1807,19 @@ mod tests {
     #[test]
     fn store_revoke_flips_the_flag_keeps_the_record_and_is_idempotent() {
         let store = StandingGrantStore::new();
-        store.issue(envelope_with("g1", None)); // None expiry ⇒ never expires until revoked.
+        store.issue(envelope_with("g1", None)).unwrap(); // None expiry ⇒ never expires until revoked.
         assert!(store.is_active("g1"));
 
-        assert!(store.revoke("g1"), "revoking a live grant returns true");
+        assert!(store.revoke("g1").unwrap(), "revoking a live grant returns true");
         // The record is KEPT, now marked revoked — queryable as revoked for honest denial.
         let got = store.get("g1").expect("a revoked grant is still queryable");
         assert!(got.revoked, "the stored envelope is marked revoked");
         assert!(!store.is_active("g1"), "a revoked grant is not active");
 
         // Idempotent: a second revoke (already revoked) returns false — no live grant was revoked.
-        assert!(!store.revoke("g1"), "double-revoke returns false");
+        assert!(!store.revoke("g1").unwrap(), "double-revoke returns false");
         // Revoking an unknown id is a fail-closed no-op, never a panic.
-        assert!(!store.revoke("does-not-exist"));
+        assert!(!store.revoke("does-not-exist").unwrap());
     }
 
     #[test]
@@ -1643,7 +1829,7 @@ mod tests {
         // Issuing an already-revoked envelope stores it as revoked — issue never un-revokes.
         let mut revoked_env = envelope_with("g1", None);
         revoked_env.revoked = true;
-        store.issue(revoked_env);
+        store.issue(revoked_env).unwrap();
         assert!(
             !store.is_active("g1"),
             "an issued-revoked grant is not active"
@@ -1651,7 +1837,7 @@ mod tests {
         assert!(store.get("g1").unwrap().revoked);
 
         // A past expiry deactivates a grant even though it was never revoked (fail-closed on time).
-        store.issue(envelope_with("g2", Some(SecureTimestamp::after_secs(0))));
+        store.issue(envelope_with("g2", Some(SecureTimestamp::after_secs(0)))).unwrap();
         assert!(
             !store.is_active("g2"),
             "an expired grant is inactive without any revocation"
@@ -1665,7 +1851,7 @@ mod tests {
     /// Issue `an_envelope(methods)` (grant_id "grant-1") into a fresh store.
     fn store_with(methods: &[&str]) -> StandingGrantStore {
         let store = StandingGrantStore::new();
-        store.issue(an_envelope(methods));
+        store.issue(an_envelope(methods)).unwrap();
         store
     }
 
@@ -1767,7 +1953,7 @@ mod tests {
         let (_dir, log) = gate_log();
         let sk = key();
         let store = store_with(&["send"]);
-        assert!(store.revoke("grant-1"), "revoke the standing grant");
+        assert!(store.revoke("grant-1").unwrap(), "revoke the standing grant");
         let intent = an_intent(&sk, "send", "args-abc");
         let ran = std::cell::Cell::new(false);
         let outcome = dispatch_standing_act(
@@ -1855,7 +2041,7 @@ mod tests {
             false,
             None,
         );
-        store.issue(envelope);
+        store.issue(envelope).unwrap();
 
         // A fresh, correctly-signed intent for THIS token's grant, invoking an in-envelope method.
         let declare = |args: &str| {
@@ -1897,7 +2083,7 @@ mod tests {
 
         // 4. Revoke the standing grant by the TOKEN's id — the SAME dispatch is now denied,
         //    fail-closed, and the act never runs. This is the kill switch on an autonomous agent.
-        assert!(store.revoke(&grant_id), "revoke the token's standing grant");
+        assert!(store.revoke(&grant_id).unwrap(), "revoke the token's standing grant");
         let ran = std::cell::Cell::new(false);
         let after = dispatch_standing_act(
             &store,
@@ -1965,7 +2151,7 @@ mod tests {
             Some(SecureTimestamp::after_secs(3600)),
         );
         let grant_id =
-            svc.issue_from_token(&token, ["send"].iter().map(|m| m.to_string()).collect(), None);
+            svc.issue_from_token(&token, ["send"].iter().map(|m| m.to_string()).collect(), None).unwrap();
         assert_eq!(grant_id, token.id().to_string());
         assert!(svc.is_active(&grant_id), "a freshly issued grant is active");
 
@@ -1999,7 +2185,7 @@ mod tests {
         );
 
         // Revoke through the service: the grant goes inactive and the next dispatch is denied.
-        assert!(svc.revoke(&grant_id));
+        assert!(svc.revoke(&grant_id).unwrap());
         assert!(!svc.is_active(&grant_id));
         let ran = std::cell::Cell::new(false);
         let after = svc.dispatch(&declare("a2"), || {
@@ -2096,7 +2282,7 @@ mod tests {
         );
 
         // Issue a grant, then preview both an in-envelope and an out-of-envelope intent.
-        svc.store.issue(an_envelope(&["send"]));
+        svc.store.issue(an_envelope(&["send"])).unwrap();
         assert_eq!(svc.preview(&intent), EnvelopeCheck::Allowed);
         let out = an_intent(&sk, "delete", "h1"); // method not in the envelope
         assert!(matches!(
@@ -2115,7 +2301,7 @@ mod tests {
         );
         let sk = key();
         let svc = StandingGrantService::new(audit, sk.clone());
-        svc.store.issue(an_envelope(&["send"]));
+        svc.store.issue(an_envelope(&["send"])).unwrap();
 
         // Authentic intent ⇒ Some(verdict).
         let intent = an_intent(&sk, "send", "h1");
@@ -2129,5 +2315,97 @@ mod tests {
         let mut forged = intent.clone();
         forged.action = "admin".to_string();
         assert_eq!(svc.authenticated_preview(&forged), None);
+    }
+
+    // ── Durable mandates (G-M5): the registry + replay guard survive restart ──
+
+    /// The core reboot invariant, all four legs on ONE store file: after a reopen, a LIVE mandate
+    /// stays live, a REVOKED mandate stays dead (never crash-revived), an EXPIRED mandate reads
+    /// inactive, and a dispatched intent id is STILL refused (the replay guard survives — G-M5).
+    #[test]
+    fn persistent_store_survives_reopen_live_dead_and_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("standing_grants.json");
+        {
+            let store = StandingGrantStore::with_persistence(&path).unwrap();
+            store
+                .issue(envelope_with("live-1", Some(SecureTimestamp::after_secs(3600))))
+                .unwrap();
+            store.issue(envelope_with("dead-1", None)).unwrap();
+            assert!(store.revoke("dead-1").unwrap());
+            store
+                .issue(envelope_with("exp-1", Some(SecureTimestamp::after_secs(0))))
+                .unwrap();
+            assert!(store.record_fresh_intent("intent-once").unwrap());
+        } // drop = the "restart"
+        let store = StandingGrantStore::with_persistence(&path).unwrap();
+        assert!(store.is_active("live-1"), "a live mandate survives reboot LIVE");
+        assert!(
+            !store.is_active("dead-1"),
+            "a revoked mandate stays DEAD after reboot — never crash-revived"
+        );
+        assert!(
+            store.get("dead-1").expect("still queryable").revoked,
+            "the revoked record is retained as revoked, not vanished"
+        );
+        assert!(!store.is_active("exp-1"), "an expired mandate reloads inactive");
+        assert!(
+            !store.record_fresh_intent("intent-once").unwrap(),
+            "the replay guard survives reboot: the same intent id is refused (G-M5)"
+        );
+        assert!(
+            store.record_fresh_intent("intent-new").unwrap(),
+            "fresh intents still register after reload"
+        );
+        assert_eq!(store.list().len(), 3, "every issued mandate is still listed");
+    }
+
+    /// Fail-closed boot: a present-but-corrupt registry file is a loud error, never silently
+    /// skipped (a skipped record could resurrect a revoked mandate or reopen a replay window).
+    #[test]
+    fn persistent_store_refuses_corrupt_state_at_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("standing_grants.json");
+        std::fs::write(&path, "{not json").unwrap();
+        let err = StandingGrantStore::with_persistence(&path)
+            .err()
+            .expect("corrupt mandate state must refuse to boot");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // Same for a future/unknown snapshot version — never guess at semantics.
+        std::fs::write(&path, r#"{"version":99,"grants":[],"seen_intents":[]}"#).unwrap();
+        let err = StandingGrantStore::with_persistence(&path)
+            .err()
+            .expect("unknown version must refuse to boot");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// Durable-before-visible: when the snapshot write FAILS, the mutation rolls back and the
+    /// error surfaces — memory never runs ahead of disk. (Seam: a DIRECTORY squatting on the
+    /// snapshot's temp path makes `File::create` fail — works even when the test runs as root,
+    /// which ignores permission bits.)
+    #[test]
+    fn persist_failure_rolls_back_and_surfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("standing_grants.json");
+        let store = StandingGrantStore::with_persistence(&path).unwrap();
+        store.issue(envelope_with("g1", None)).unwrap();
+
+        // Squat a directory on the temp path so the NEXT snapshot write fails.
+        let tmp_path = path.with_extension("tmp");
+        std::fs::create_dir(&tmp_path).unwrap();
+
+        assert!(store.issue(envelope_with("g2", None)).is_err(), "issue surfaces the failure");
+        assert!(store.get("g2").is_none(), "the unpersistable mandate was NOT issued");
+        assert!(store.revoke("g1").is_err(), "revoke surfaces the failure");
+        assert!(store.is_active("g1"), "the unpersistable revoke did not half-apply");
+        assert!(store.record_fresh_intent("i1").is_err(), "replay-guard write surfaces");
+        // Clear the failure and verify the store still works (loud failure, re-runnable).
+        std::fs::remove_dir(&tmp_path).unwrap();
+        assert!(store.revoke("g1").unwrap(), "after the failure clears, the revoke lands");
+        assert!(
+            store.record_fresh_intent("i1").unwrap(),
+            "the rolled-back intent id was not half-registered"
+        );
     }
 }

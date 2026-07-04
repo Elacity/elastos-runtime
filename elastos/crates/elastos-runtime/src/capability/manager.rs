@@ -282,6 +282,22 @@ impl CapabilityManager {
         )
     }
 
+    /// Like [`standing_grant_service`](Self::standing_grant_service) but PERSISTENT: the mandate
+    /// registry and its replay guard are snapshot-backed at `path` and survive restart (G-M5).
+    /// Fail-closed at boot — corrupt on-disk mandate state is an error, never silently skipped.
+    /// Construct ONCE and share; two services over the same path would clobber each other's
+    /// snapshots.
+    pub fn standing_grant_service_with_persistence(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<crate::capability::intent::StandingGrantService> {
+        crate::capability::intent::StandingGrantService::with_persistence(
+            self.audit_log.clone(),
+            self.signing_key.clone(),
+            path,
+        )
+    }
+
     /// Grant a new capability token
     pub fn grant(
         &self,
