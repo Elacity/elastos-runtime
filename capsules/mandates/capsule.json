@@ -1,0 +1,14 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "mandates",
+  "version": "0.1.0",
+  "description": "See the mandates you have granted to AI agents — scoped, expiring, revocable authority — and open a portable, independently-verifiable receipt of exactly what each agent did. Give your agent a mandate, not your keys.",
+  "role": "app",
+  "type": "data",
+  "author": "elastos",
+  "entrypoint": "index.html",
+  "resources": {
+    "memory_mb": 32,
+    "gpu": false
+  }
+}
