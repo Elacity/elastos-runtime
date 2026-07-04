@@ -12,9 +12,9 @@ pub mod storage;
 
 pub use capability::{
     deny_request, get_audit_event_types, get_audit_log, grant_request, issue_standing_grant,
-    list_capabilities, list_pending, preview_standing_grant, request_capability, request_status,
-    revoke_all_capabilities, revoke_capability, revoke_standing_grant, session_info,
-    validate_and_consume, CapabilityState,
+    list_capabilities, list_pending, mandate_receipt, preview_standing_grant, request_capability,
+    request_status, revoke_all_capabilities, revoke_capability, revoke_standing_grant,
+    session_info, validate_and_consume, CapabilityState,
 };
 
 pub use namespace::{

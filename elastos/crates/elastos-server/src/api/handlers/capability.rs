@@ -18,6 +18,7 @@ use elastos_runtime::approval::{self, ApprovalDecision};
 use elastos_runtime::capability::manager::ValidationError;
 use elastos_runtime::capability::{
     pending::{AffordanceBinding, PendingRequestStore},
+    token::TokenId,
     Action, AffordanceGrantReceiptV1, CapabilityManager, CapabilityToken, EnvelopeCheck,
     GrantDuration, IntentDeclarationV1, PolicyEvaluator, PolicyOutcome, ResourceId,
     StandingGrantService, TokenConstraints,
@@ -1068,6 +1069,9 @@ pub struct IssueStandingGrantInput {
 pub struct IssueStandingGrantOutput {
     /// The standing grant id (the backing token's id) — revoke or dispatch against this.
     pub grant_id: String,
+    /// The backing capability token's id — identical to `grant_id`, surfaced explicitly because it
+    /// is the key for the mandate's audit trail (`export_mandate_receipt_for_capability`).
+    pub token_id: String,
 }
 
 /// POST /api/standing-grants/issue  (shell-only)
@@ -1116,7 +1120,8 @@ pub async fn issue_standing_grant(
     );
     let methods: std::collections::BTreeSet<String> = input.methods.into_iter().collect();
     let grant_id = state.standing_service.issue_from_token(&token, methods);
-    Ok(Json(IssueStandingGrantOutput { grant_id }))
+    let token_id = token.id().to_string();
+    Ok(Json(IssueStandingGrantOutput { grant_id, token_id }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1134,13 +1139,36 @@ pub struct RevokeStandingGrantOutput {
 
 /// POST /api/standing-grants/revoke  (shell-only) — the autonomy kill switch.
 ///
-/// Revoke a standing grant by id, fail-closed. After this, every not-yet-started act under the
-/// grant is denied (the dispatcher re-reads the grant each time). Returns whether a live grant
-/// was revoked by this call.
+/// Revoke a standing grant by id, fail-closed AND durably attested. The grant id IS the backing
+/// capability token's id, and killing only the in-memory envelope would leave the mandate's audit
+/// trail showing it live forever — so this first revokes the BACKING TOKEN through the manager
+/// (which emits the signed `CapabilityRevoke` record BEFORE mutating, per AUD-3: if the durable
+/// write fails, the revoke ABORTS and the error surfaces rather than a revoke existing with no
+/// record), then kills the standing envelope so the dispatcher denies every not-yet-started act.
+/// The mandate's receipt (`export_mandate_receipt_for_capability`) thereafter carries the revoke.
 pub async fn revoke_standing_grant(
     State(state): State<CapabilityState>,
     Json(input): Json<RevokeStandingGrantInput>,
 ) -> Result<Json<RevokeStandingGrantOutput>, (StatusCode, String)> {
+    let token_id = TokenId::from_hex(&input.grant_id).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("grant_id is not a valid token id: {e}"),
+        )
+    })?;
+    // Durable custody first (emit-before-mutate): a revoke that cannot be signed onto the audit
+    // chain does not happen — mirroring revoke_capability. The envelope stays live so the failure
+    // is loud and re-runnable, never a silent half-revoke the receipt can't prove.
+    state
+        .capability_manager
+        .revoke(token_id, "standing grant revoked via API")
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("revoke could not be durably attested: {e}"),
+            )
+        })?;
     let revoked = state.standing_service.revoke(&input.grant_id);
     Ok(Json(RevokeStandingGrantOutput { revoked }))
 }
@@ -1184,6 +1212,35 @@ pub async fn preview_standing_grant(
         },
     };
     Ok(Json(out))
+}
+
+/// GET /api/mandate/:token_id/receipt  (shell-only)
+///
+/// Export the PORTABLE per-mandate receipt for one capability token: the signed, set-bound bundle
+/// of its grant + every use/revoke, straight from the runtime's durable audit chain — the artifact
+/// an operator hands an auditor, verified off-box with `elastos verify-receipt`. Read-only over
+/// the chain; mints nothing, mutates nothing. `404` when the token has no durable records (unknown
+/// id, or a memory-only/unsigned log — absence is reported, never fabricated).
+pub async fn mandate_receipt(
+    State(state): State<CapabilityState>,
+    Path(token_id): Path<String>, // Shell check done by middleware
+) -> Result<Json<elastos_runtime::primitives::MandateReceipt>, (StatusCode, String)> {
+    // Canonicalize: only a well-formed token id can key a mandate (and its Display form is the
+    // exact string the audit records carry).
+    let token_id = TokenId::from_hex(token_id.trim())
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid token id: {e}")))?
+        .to_string();
+    let receipt = state
+        .capability_manager
+        .audit_log()
+        .export_mandate_receipt_for_capability(&token_id)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("no durable audit records for mandate {token_id}"),
+            )
+        })?;
+    Ok(Json(receipt))
 }
 
 #[cfg(test)]
@@ -1330,6 +1387,106 @@ mod tests {
         .expect("ok")
         .0;
         assert!(!rev2.revoked, "double-revoke returns false");
+    }
+
+    /// Like [`test_state`] but with a DURABLE (file-backed, signed) audit log, so the mandate's
+    /// grant/use/revoke land on a real chain a receipt can be exported from.
+    fn test_state_with_durable_audit(dir: &std::path::Path) -> CapabilityState {
+        let audit_log = std::sync::Arc::new(
+            elastos_runtime::primitives::audit::AuditLog::with_file(dir.join("audit.log"))
+                .expect("file-backed audit log"),
+        );
+        let store = std::sync::Arc::new(elastos_runtime::capability::CapabilityStore::new());
+        let metrics =
+            std::sync::Arc::new(elastos_runtime::primitives::metrics::MetricsManager::new());
+        let capability_manager =
+            std::sync::Arc::new(CapabilityManager::new(store, audit_log.clone(), metrics));
+        let standing_service = std::sync::Arc::new(capability_manager.standing_grant_service());
+        CapabilityState {
+            pending_store: std::sync::Arc::new(PendingRequestStore::new(audit_log.clone())),
+            capability_manager,
+            policy_evaluator: std::sync::Arc::new(PolicyEvaluator::new(
+                Box::new(elastos_runtime::capability::evaluator::ShellPassthroughVerifier),
+                audit_log,
+            )),
+            standing_service,
+        }
+    }
+
+    /// The whole Flint loop over the real handlers: GRANT a mandate, the agent ACTS under it,
+    /// REVOKE it (durably attested — the ratchet this sprint adds), then export the RECEIPT and
+    /// verify it off-box: it must carry the grant + the use + the revoke and authenticate against
+    /// the runtime's pinned signer. A receipt that showed a revoked mandate as live would be the
+    /// exact dishonesty this loop exists to prevent.
+    #[tokio::test]
+    async fn mandate_lifecycle_grant_use_revoke_exports_a_verifiable_receipt() {
+        use elastos_runtime::primitives::audit::AuditEvent;
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_durable_audit(dir.path());
+
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: "elastos://pay/vendor".to_string(),
+                action: "write".to_string(),
+                methods: vec!["pay.invoke".to_string()],
+                ttl_secs: Some(3600),
+            }),
+        )
+        .await
+        .expect("issue ok")
+        .0;
+        assert_eq!(out.token_id, out.grant_id, "the grant id IS the mandate's token id");
+
+        // The agent acts under the mandate (in production the validate path records this).
+        let token_id = TokenId::from_hex(&out.token_id).expect("token id round-trips");
+        state.capability_manager.audit_log().capability_use(
+            &token_id,
+            "vm-agent",
+            &ResourceId::new("elastos://pay/vendor"),
+            Action::Write,
+            true,
+        );
+
+        let rev = revoke_standing_grant(
+            State(state.clone()),
+            Json(RevokeStandingGrantInput {
+                grant_id: out.grant_id.clone(),
+            }),
+        )
+        .await
+        .expect("revoke ok")
+        .0;
+        assert!(rev.revoked);
+
+        let receipt = mandate_receipt(State(state.clone()), Path(out.token_id.clone()))
+            .await
+            .expect("receipt exists")
+            .0;
+        assert_eq!(receipt.records.len(), 3, "grant + use + revoke");
+        assert!(
+            receipt
+                .records
+                .iter()
+                .any(|r| matches!(r.event, AuditEvent::CapabilityRevoke { .. })),
+            "the REVOKE is durably attested in the mandate's receipt"
+        );
+        let signer = state
+            .capability_manager
+            .audit_log()
+            .verifying_key_hex()
+            .expect("signed log");
+        let verdict = elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer));
+        assert!(verdict.authenticated, "receipt authenticates when pinned: {verdict:?}");
+        assert!(verdict.set_binding_ok && verdict.scope_ok);
+
+        // An unknown mandate is ABSENT (404), never an empty "clean" receipt.
+        let missing = mandate_receipt(State(state.clone()), Path(TokenId::new().to_string())).await;
+        assert!(matches!(missing, Err((StatusCode::NOT_FOUND, _))));
+        // A malformed token id is a 400, before any chain read.
+        let bad = mandate_receipt(State(state), Path("not-hex".to_string())).await;
+        assert!(matches!(bad, Err((StatusCode::BAD_REQUEST, _))));
     }
 
     #[tokio::test]

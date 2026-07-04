@@ -276,6 +276,12 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
             "/api/standing-grants/preview",
             post(handlers::preview_standing_grant),
         )
+        // Per-mandate receipt: the portable, set-bound audit bundle for ONE capability token —
+        // read-only over the durable chain, verified off-box with `elastos verify-receipt`.
+        .route(
+            "/api/mandate/:token_id/receipt",
+            get(handlers::mandate_receipt),
+        )
         // Revoke endpoints
         .route("/api/capability/:id", delete(handlers::revoke_capability))
         .route(

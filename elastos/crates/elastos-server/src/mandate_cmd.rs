@@ -1,0 +1,199 @@
+//! `elastos mandate` — the operator's mandate lifecycle: grant → revoke → prove.
+//!
+//! This is the Flint loop from the human side: hand an agent a SCOPED, EXPIRING, REVOCABLE
+//! mandate instead of your keys (`grant`), kill it at any moment (`revoke`), and export the
+//! portable, independently-verifiable proof of everything done under it (`receipt`, checked
+//! off-box with `elastos verify-receipt`).
+//!
+//! The CLI holds NO authority of its own: every subcommand attaches to the RUNNING operator
+//! runtime over the loopback control plane (the same attach-secret exchange the shell uses) and
+//! calls the existing shell-scoped endpoints. The runtime remains the single writer of the audit
+//! chain and the only holder of the signing key.
+
+use anyhow::{bail, Context, Result};
+use clap::Subcommand;
+
+use crate::runtime_control;
+use elastos_server::sources::default_data_dir;
+
+#[derive(Subcommand)]
+pub(crate) enum MandateCommand {
+    /// Grant an agent a scoped, expiring, revocable mandate (mints a real capability token)
+    Grant {
+        /// The acting capsule identity the mandate authorizes (e.g. "vm-agent")
+        #[arg(long)]
+        capsule: String,
+
+        /// The resource the mandate covers (e.g. "elastos://pay/vendor")
+        #[arg(long)]
+        resource: String,
+
+        /// The action: read | write | execute | delete | message | admin
+        #[arg(long)]
+        action: String,
+
+        /// Affordance method the agent may invoke under this mandate (repeatable, at least one)
+        #[arg(long = "method", required = true)]
+        methods: Vec<String>,
+
+        /// Time-to-live in seconds; omitted = until revoked
+        #[arg(long)]
+        ttl_secs: Option<u64>,
+    },
+
+    /// Revoke a mandate NOW — durably attested on the audit chain, then enforced fail-closed
+    Revoke {
+        /// The mandate's token id (printed by `mandate grant`)
+        token_id: String,
+    },
+
+    /// Export the mandate's portable receipt (grant + every use/revoke) for off-box verification
+    Receipt {
+        /// The mandate's token id (printed by `mandate grant`)
+        token_id: String,
+
+        /// Write the receipt JSON here instead of stdout
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+    },
+}
+
+/// Attach to the RUNNING operator runtime and return (api_url, shell_token). The mandate
+/// lifecycle is a control-plane operation, so it requires the runtime that enforces it.
+async fn attach_shell() -> Result<(String, String)> {
+    let data_dir = default_data_dir();
+    let coords_path = runtime_control::runtime_coord_path(&data_dir);
+    let coords = runtime_control::read_operator_runtime_coords(&coords_path)
+        .await
+        .ok_or_else(|| anyhow::anyhow!(runtime_control::OPERATOR_RUNTIME_REQUIRED_MESSAGE))?;
+    if let Some(reason) = runtime_control::operator_runtime_staleness_reason(&coords).await? {
+        bail!("{reason}");
+    }
+    let tokens = runtime_control::attach_to_runtime(&coords).await?;
+    Ok((coords.api_url.clone(), tokens.shell_token))
+}
+
+fn client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("building HTTP client")
+}
+
+/// Surface a non-2xx response as the server's own error text (it is precise about why).
+async fn error_for(resp: reqwest::Response, doing: &str) -> anyhow::Error {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    anyhow::anyhow!("{doing} failed ({status}): {body}")
+}
+
+pub(crate) async fn run_mandate(cmd: MandateCommand) -> Result<()> {
+    match cmd {
+        MandateCommand::Grant {
+            capsule,
+            resource,
+            action,
+            methods,
+            ttl_secs,
+        } => {
+            let (api_url, shell_token) = attach_shell().await?;
+            let resp = client()?
+                .post(format!("{api_url}/api/standing-grants/issue"))
+                .header("Authorization", format!("Bearer {shell_token}"))
+                .json(&serde_json::json!({
+                    "capsule": capsule,
+                    "resource": resource,
+                    "action": action,
+                    "methods": methods,
+                    "ttl_secs": ttl_secs,
+                }))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                return Err(error_for(resp, "mandate grant").await);
+            }
+            let out: serde_json::Value = resp.json().await?;
+            let token_id = out
+                .get("token_id")
+                .or_else(|| out.get("grant_id"))
+                .and_then(|v| v.as_str())
+                .context("runtime did not return a token id")?
+                .to_string();
+            println!("Mandate granted.");
+            println!("  token id: {token_id}");
+            println!("  capsule:  {capsule}");
+            println!("  scope:    {action} on {resource}");
+            println!("  methods:  {}", methods.join(", "));
+            match ttl_secs {
+                Some(secs) => println!("  expires:  in {secs}s"),
+                None => println!("  expires:  never (until revoked)"),
+            }
+            println!("\nRevoke:  elastos mandate revoke {token_id}");
+            println!("Prove:   elastos mandate receipt {token_id} -o receipt.json");
+            Ok(())
+        }
+
+        MandateCommand::Revoke { token_id } => {
+            let (api_url, shell_token) = attach_shell().await?;
+            let resp = client()?
+                .post(format!("{api_url}/api/standing-grants/revoke"))
+                .header("Authorization", format!("Bearer {shell_token}"))
+                .json(&serde_json::json!({ "grant_id": token_id }))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                return Err(error_for(resp, "mandate revoke").await);
+            }
+            let out: serde_json::Value = resp.json().await?;
+            let envelope_was_live = out
+                .get("revoked")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // The durable CapabilityRevoke is attested by the runtime BEFORE this returns success
+            // (emit-before-mutate), so reaching here means the revoke is on the chain.
+            println!("Mandate {token_id} revoked and durably attested on the audit chain.");
+            if !envelope_was_live {
+                println!(
+                    "  note: no LIVE standing grant was found for this id (already revoked, or \
+                     granted outside the standing-grant flow); the token itself is now revoked."
+                );
+            }
+            println!("Prove it: elastos mandate receipt {token_id} -o receipt.json");
+            Ok(())
+        }
+
+        MandateCommand::Receipt { token_id, output } => {
+            let (api_url, shell_token) = attach_shell().await?;
+            let resp = client()?
+                .get(format!("{api_url}/api/mandate/{token_id}/receipt"))
+                .header("Authorization", format!("Bearer {shell_token}"))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                return Err(error_for(resp, "mandate receipt export").await);
+            }
+            let receipt: serde_json::Value = resp.json().await?;
+            let pretty = serde_json::to_string_pretty(&receipt)?;
+            let signer = receipt
+                .get("signer_public_key_hex")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unknown>")
+                .to_string();
+            match output {
+                Some(path) => {
+                    std::fs::write(&path, &pretty)
+                        .with_context(|| format!("writing {}", path.display()))?;
+                    println!("Receipt written to {}", path.display());
+                    println!(
+                        "Verify off-box (pin the signer you trust out-of-band):\n  \
+                         elastos verify-receipt {} --signer {}",
+                        path.display(),
+                        signer
+                    );
+                }
+                None => println!("{pretty}"),
+            }
+            Ok(())
+        }
+    }
+}

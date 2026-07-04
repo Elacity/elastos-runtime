@@ -10,6 +10,7 @@ mod gateway_entry;
 mod home_cmd;
 mod identity_cmd;
 mod init_cmd;
+mod mandate_cmd;
 mod node_cmd;
 mod publish;
 mod release_cmd;
@@ -162,6 +163,10 @@ enum Commands {
         #[arg(long, requires = "cid")]
         provenance: Option<String>,
     },
+
+    /// Mandate lifecycle: grant an agent scoped authority, revoke it, export its receipt
+    #[command(subcommand)]
+    Mandate(mandate_cmd::MandateCommand),
 
     /// Independently verify a portable mandate receipt (JSON) off-box
     #[command(name = "verify-receipt")]
@@ -1312,6 +1317,10 @@ async fn main() -> anyhow::Result<()> {
             provenance,
         } => {
             return trust_cmd::run_verify(path, public_key, cid, provenance).await;
+        }
+
+        Commands::Mandate(cmd) => {
+            return mandate_cmd::run_mandate(cmd).await;
         }
 
         Commands::VerifyReceipt { path, signer, json } => {
