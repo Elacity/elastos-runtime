@@ -109,12 +109,25 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   `dispatch_refuses_a_replayed_intent`. The seen-set is in-memory, so a replay after a RESTART is not
   yet caught; and there is no `declared_at` freshness window. Persist the seen-set (or add a signed
   freshness window) before exposing the endpoint beyond the single trusted operator.
-- **G-M6 (the "act" is attestation, not a real side effect).** The dispatch act mints a signed
-  affordance receipt from the declared fields; NO external executor is invoked, so the reconciliation
-  is structurally `matched` (its "done" is the declaration echoed). The outcome is honestly named
-  `authorized` (not "acted"/"performed"), and the receipt attests authorization + custody, not an
-  observed effect. Wiring a real executor whose independent result feeds the reconciliation (so it
-  can genuinely Match/Diverge/Undeliver) is the follow-up that makes "act" literal.
+- **G-M6 — the reconciliation seam is closed; production performs nothing yet (honest).** Dispatch
+  now invokes a real [`IntentExecutor`] (`intent_executor.rs`) INSIDE the gate's act closure (so a
+  denied/revoked intent never executes) and mints the affordance receipt from what the executor
+  REPORTS, never from the declaration. The over-claim is retired: a method with no executor (or one
+  that declines) is `Undelivered` — outcome `authorized_not_performed`, receipt use `success=false` —
+  instead of a fabricated match; an executor that acts on a different field is `Diverged`; only a
+  faithful performance is `Matched` (`performed`, `success=true`). Crucially the PRODUCTION executor
+  set is DELIBERATELY EMPTY (`MethodRegistryExecutor::production()`): shipping a no-op that echoed the
+  declaration would re-introduce a `success=true` "write" for a method that performed no write. So
+  every production method is currently `authorized_not_performed`. Ratchets (with test executors):
+  `dispatch_acts_under_the_mandate_and_the_receipt_carries_the_act` (faithful → performed),
+  `dispatch_reconciles_unperformed_and_diverged_acts_honestly` (empty registry → Undelivered; a
+  shifting executor → Diverged; both `success=false`).
+  BOUNDS (documented, not defects): (a) the seam is independent for the Undelivered/Diverged legs; a
+  faithful executor is Matched-by-construction, so `Matched` proves report-fidelity (report ==
+  declaration), NOT reality (effect == declaration) — that rests on the trusted-core executor's
+  truthfulness. (b) Real side-effecting affordances (mail/payment/storage) are registered here as
+  wired, each behind its own capability gate, at which point `performed` becomes literal — and their
+  executors MUST hash ACTUAL inputs and report the action they REALLY did.
 
 Closed at review time (Sprint 3, before merge): the revoke id-casing desync (UPPERCASE hex
 revoked the token but missed the lowercase-keyed envelope — now canonicalized + regression test

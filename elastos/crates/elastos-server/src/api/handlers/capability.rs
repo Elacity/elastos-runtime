@@ -34,6 +34,10 @@ pub struct CapabilityState {
     /// The standing-grant service (issue/revoke/dispatch for unsupervised agent acts), backed by the
     /// manager's own key + audit log. Shared so every shell-only verb hits the same grant registry.
     pub standing_service: Arc<StandingGrantService>,
+    /// Performs a dispatched intent and reports what was ACTUALLY done — the independent "done" the
+    /// reconciliation checks against the declaration. An unregistered method declines (⇒
+    /// `Undelivered`), so an authorized-but-unperformed intent is never a fabricated `Matched`.
+    pub intent_executor: Arc<dyn crate::intent_executor::IntentExecutor>,
 }
 
 // === Request Capability ===
@@ -1322,16 +1326,19 @@ pub async fn list_standing_grants(
 
 #[derive(Debug, Serialize)]
 pub struct DispatchIntentOutput {
-    /// "authorized" (the mandate authorized the declared act and the runtime attested it) or
-    /// "denied". NOTE: "authorized" is NOT "a real-world side effect occurred" — no external
-    /// executor is wired yet (see KNOWN_GAPS G-M6); it means the intent fell within a live mandate
-    /// and the declaration + attestation are on the audit chain.
+    /// The outcome, reflecting the gate AND the reconciliation:
+    /// - `denied` — the intent fell outside a live mandate (see `reason`); nothing performed.
+    /// - `performed` — authorized AND a real executor performed it as declared (`Matched`).
+    /// - `diverged` — authorized, but the executor did something other than declared (`Diverged`).
+    /// - `authorized_not_performed` — authorized, but no executor performed it (`Undelivered`).
+    ///
+    /// Only `performed` records a successful `CapabilityUse` in the mandate receipt.
     pub outcome: String,
-    /// The fail-closed denial reason (snake_case) when denied; `None` when authorized.
+    /// The fail-closed denial reason (snake_case) when denied; `None` otherwise.
     pub reason: Option<String>,
-    /// The signed reconciliation when authorized; `None` when denied. Until a real executor is
-    /// wired its "done" is the declaration echoed back, so `status` is structurally `matched` —
-    /// it attests authorization, not an independently-observed effect (G-M6).
+    /// The signed reconciliation when the intent was authorized (any of performed/diverged/
+    /// authorized_not_performed); `None` when denied. Its `status` is the independent verdict of
+    /// what the executor actually did vs. what was declared.
     pub reconciliation: Option<elastos_runtime::capability::IntentReconciliationV1>,
 }
 
@@ -1349,11 +1356,16 @@ pub struct DispatchIntentOutput {
 /// 4. run the intent gate: the declaration is recorded on-chain BEFORE the act (no custody ⇒ no
 ///    act), and the gate binds capsule + BOUND AGENT KEY (G-M4, when the mandate set one) + method
 ///    + resource + action, all exact;
-/// 5. record a token-keyed `CapabilityUse` (G-M2) whose `success` reflects the reconciliation
-///    STATUS (a real `matched` delivery), so the mandate's exported receipt carries the act.
+/// 5. run the intent gate: ONLY on authorization does the act closure invoke the real
+///    [`IntentExecutor`](crate::intent_executor::IntentExecutor) — so a denied/revoked intent never
+///    executes — and the receipt is minted from what the executor REPORTS it performed (G-M6);
+/// 6. record a token-keyed `CapabilityUse` (G-M2) whose `success` reflects the reconciliation
+///    STATUS (a real `matched` performance), so the mandate's exported receipt carries the act.
 ///
-/// Honest scope: the act mints a signed affordance receipt; it does not invoke a real executor, so
-/// "authorized" attests authorization + custody, not a side effect (G-M6).
+/// Honest scope: reconciliation attests report-fidelity (report == declaration), not reality
+/// (effect == declaration) — that rests on the trusted-core executor's truthfulness. The production
+/// executor set is currently empty, so every method is `authorized_not_performed` until a real
+/// affordance is wired (G-M6).
 pub async fn dispatch_standing_intent(
     State(state): State<CapabilityState>,
     Json(intent): Json<IntentDeclarationV1>,
@@ -1404,18 +1416,58 @@ pub async fn dispatch_standing_intent(
         }
     }
     let manager = state.capability_manager.clone();
-    let (i_token, i_capsule, i_method, i_hash, i_resource) = (
-        intent.standing_grant_id.clone(),
-        intent.capsule.clone(),
-        intent.method_id.clone(),
-        intent.input_hash.clone(),
-        intent.resource.clone(),
-    );
+    let executor = state.intent_executor.clone();
+    let token_str = intent.standing_grant_id.clone();
+    let intent_for_exec = intent.clone();
+    // If the executor PERFORMS but reports an action the runtime cannot represent, we must NOT
+    // silently record "authorized_not_performed" (that would HIDE a real effect); surface it.
+    let unrepresentable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let unrepresentable_w = unrepresentable.clone();
+    // The act runs ONLY when the gate authorizes (dispatch calls this closure solely on the Acted
+    // path), so a denied/revoked/wrong-agent intent never invokes the executor — "no authorization
+    // ⇒ no act". The receipt is minted from what the executor REPORTS it performed, never from the
+    // declaration, so reconcile compares performed-vs-declared honestly.
     let outcome = state.standing_service.dispatch(&intent, move || {
-        Some(manager.issue_affordance_receipt(
-            &i_token, &i_capsule, &i_method, &i_hash, &i_resource, action,
-        ))
+        match executor.execute(&intent_for_exec) {
+            crate::intent_executor::IntentExecution::Declined { .. } => None,
+            crate::intent_executor::IntentExecution::Performed {
+                capsule,
+                method_id,
+                input_hash,
+                resource,
+                action: performed_action,
+            } => {
+                let performed = match performed_action.to_lowercase().as_str() {
+                    "read" => Action::Read,
+                    "write" => Action::Write,
+                    "execute" => Action::Execute,
+                    "delete" => Action::Delete,
+                    "message" => Action::Message,
+                    "admin" => Action::Admin,
+                    _ => {
+                        unrepresentable_w.store(true, std::sync::atomic::Ordering::SeqCst);
+                        return None;
+                    }
+                };
+                Some(manager.issue_affordance_receipt(
+                    &token_str,
+                    &capsule,
+                    &method_id,
+                    &input_hash,
+                    &resource,
+                    performed,
+                ))
+            }
+        }
     });
+    if unrepresentable.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "executor reported an unrepresentable action; the act may have occurred but could not \
+             be reconciled — refusing to record it as either performed or not-performed"
+                .to_string(),
+        ));
+    }
     use elastos_runtime::capability::{IntentGateOutcome, ReconciliationStatus};
     let (out, acted) = match outcome {
         IntentGateOutcome::BlockedNoCustody(e) => {
@@ -1435,12 +1487,18 @@ pub async fn dispatch_standing_intent(
             false,
         ),
         IntentGateOutcome::Acted(rec) => {
-            // `success` reflects the reconciliation STATUS, not merely that the gate passed: only a
-            // `Matched` delivery is a true act; `Diverged`/`Undelivered` record success=false.
-            let matched = rec.status == ReconciliationStatus::Matched;
+            // The intent was AUTHORIZED (passed the gate); the reconciliation says whether it was
+            // actually PERFORMED. `success` (and the receipt's use) is true ONLY for a `Matched`
+            // performance — a `Diverged` act (executor did something else) or `Undelivered` one
+            // (nothing performed it) records success=false and says so honestly in the outcome.
+            let (label, matched) = match rec.status {
+                ReconciliationStatus::Matched => ("performed", true),
+                ReconciliationStatus::Diverged => ("diverged", false),
+                ReconciliationStatus::Undelivered => ("authorized_not_performed", false),
+            };
             (
                 DispatchIntentOutput {
-                    outcome: "authorized".to_string(),
+                    outcome: label.to_string(),
                     reason: None,
                     reconciliation: Some(rec),
                 },
@@ -1590,6 +1648,9 @@ mod tests {
                 audit_log,
             )),
             standing_service,
+            intent_executor: std::sync::Arc::new(
+                crate::intent_executor::MethodRegistryExecutor::production(),
+            ),
         }
     }
 
@@ -1661,6 +1722,9 @@ mod tests {
                 audit_log,
             )),
             standing_service,
+            intent_executor: std::sync::Arc::new(
+                crate::intent_executor::MethodRegistryExecutor::production(),
+            ),
         }
     }
 
@@ -1746,17 +1810,19 @@ mod tests {
         assert!(matches!(bad, Err((StatusCode::BAD_REQUEST, _))));
     }
 
-    /// Sign an intent under `sk` naming the mandate; `intent_id` is unique per method so the replay
-    /// guard does not collide across a test's calls.
+    /// Sign an intent under `sk` naming the mandate; `intent_id` is unique per (method, signer) so
+    /// distinct callers don't collide on the replay guard, while the SAME declaration re-submitted
+    /// keeps a stable id (a true replay).
     fn signed_intent_with(
         grant_id: &str,
         method: &str,
         sk: &ed25519_dalek::SigningKey,
     ) -> IntentDeclarationV1 {
+        let signer_fp = hex::encode(sk.verifying_key().to_bytes());
         IntentDeclarationV1::issue(
             sk,
             sk.verifying_key().to_bytes(),
-            &format!("intent-{method}"),
+            &format!("intent-{method}-{}", &signer_fp[..8]),
             "vm-agent",
             method,
             "cafe01",
@@ -1772,19 +1838,36 @@ mod tests {
         signed_intent_with(grant_id, method, &sk)
     }
 
-    /// The ACT leg closes G-M2: a dispatched act lands as a token-keyed CapabilityUse in the
-    /// mandate's exported receipt — grant + act + revoke, all in one verifiable artifact.
+    /// A test executor that faithfully performs the declared act (production ships NONE, so a test
+    /// that wants a `performed` outcome injects this to stand in for a real, truthful affordance).
+    struct FaithfulExecutor;
+    impl crate::intent_executor::IntentExecutor for FaithfulExecutor {
+        fn execute(&self, intent: &IntentDeclarationV1) -> crate::intent_executor::IntentExecution {
+            crate::intent_executor::IntentExecution::Performed {
+                capsule: intent.capsule.clone(),
+                method_id: intent.method_id.clone(),
+                input_hash: intent.input_hash.clone(),
+                resource: intent.resource.clone(),
+                action: intent.action.clone(),
+            }
+        }
+    }
+
+    /// The ACT leg closes G-M2: a REAL executor performs a dispatched act (the built-in
+    /// `runtime.echo`) and it lands as a `success=true` token-keyed CapabilityUse in the mandate's
+    /// receipt; a method OUTSIDE the envelope is denied and receipted `success=false`.
     #[tokio::test]
     async fn dispatch_acts_under_the_mandate_and_the_receipt_carries_the_act() {
         let dir = tempfile::tempdir().unwrap();
-        let state = test_state_with_durable_audit(dir.path());
+        let mut state = test_state_with_durable_audit(dir.path());
+        state.intent_executor = std::sync::Arc::new(FaithfulExecutor); // stand-in for a real affordance
         let out = issue_standing_grant(
             State(state.clone()),
             Json(IssueStandingGrantInput {
                 capsule: "vm-agent".to_string(),
                 resource: "elastos://pay/vendor".to_string(),
                 action: "write".to_string(),
-                methods: vec!["pay.invoke".to_string()],
+                methods: vec!["runtime.echo".to_string()],
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
             }),
@@ -1795,12 +1878,12 @@ mod tests {
 
         let resp = dispatch_standing_intent(
             State(state.clone()),
-            Json(signed_intent(&out.token_id, "pay.invoke")),
+            Json(signed_intent(&out.token_id, "runtime.echo")),
         )
         .await
         .expect("dispatch ok")
         .0;
-        assert_eq!(resp.outcome, "authorized");
+        assert_eq!(resp.outcome, "performed", "a registered executor performed it as declared");
         assert!(resp.reconciliation.is_some(), "signed reconciliation returned");
 
         // A method OUTSIDE the envelope is denied fail-closed — and the denial is receipted too.
@@ -1826,10 +1909,85 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(uses, vec![true, false], "the act AND the denied attempt are both receipted");
+        assert_eq!(uses, vec![true, false], "the performed act AND the denied attempt are receipted");
         let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();
         let verdict = elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer));
         assert!(verdict.authenticated, "receipt with acts still authenticates: {verdict:?}");
+    }
+
+    /// G-M6 closed: an authorized intent whose method has NO executor is `Undelivered`, NOT a
+    /// fabricated match — the reconciliation reflects that nothing performed it, and the receipt use
+    /// is `success=false`. A custom executor that reports a DIFFERENT field yields `Diverged`.
+    #[tokio::test]
+    async fn dispatch_reconciles_unperformed_and_diverged_acts_honestly() {
+        use crate::intent_executor::{IntentExecution, IntentExecutor};
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state_with_durable_audit(dir.path());
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: "elastos://pay/vendor".to_string(),
+                action: "write".to_string(),
+                methods: vec!["pay.invoke".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        // No executor for "pay.invoke" ⇒ authorized_not_performed (Undelivered).
+        let undel = dispatch_standing_intent(
+            State(state.clone()),
+            Json(signed_intent(&out.token_id, "pay.invoke")),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(undel.outcome, "authorized_not_performed");
+        assert_eq!(
+            undel.reconciliation.unwrap().status,
+            elastos_runtime::capability::ReconciliationStatus::Undelivered
+        );
+
+        // A custom executor that PERFORMS but on a different resource ⇒ diverged.
+        struct ShiftResourceExecutor;
+        impl IntentExecutor for ShiftResourceExecutor {
+            fn execute(&self, intent: &IntentDeclarationV1) -> IntentExecution {
+                IntentExecution::Performed {
+                    capsule: intent.capsule.clone(),
+                    method_id: intent.method_id.clone(),
+                    input_hash: intent.input_hash.clone(),
+                    resource: "elastos://pay/SOMEWHERE-ELSE".to_string(),
+                    action: intent.action.clone(),
+                }
+            }
+        }
+        state.intent_executor = std::sync::Arc::new(ShiftResourceExecutor);
+        let diverged = dispatch_standing_intent(
+            State(state.clone()),
+            Json(signed_intent(&out.token_id, "pay.invoke")),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(diverged.outcome, "diverged", "executor did something other than declared");
+
+        // Both are receipted success=false — the mandate receipt never claims an act that did not
+        // faithfully happen.
+        let receipt = mandate_receipt(State(state), Path(out.token_id.clone())).await.unwrap().0;
+        use elastos_runtime::primitives::audit::AuditEvent;
+        let uses: Vec<bool> = receipt
+            .records
+            .iter()
+            .filter_map(|r| match &r.event {
+                AuditEvent::CapabilityUse { success, .. } => Some(*success),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(uses, vec![false, false], "neither unperformed nor diverged is a success");
     }
 
     /// G-M1 regression: a backing token killed DIRECTLY through the manager (a path the envelope
@@ -1888,14 +2046,15 @@ mod tests {
     #[tokio::test]
     async fn dispatch_refuses_a_replayed_intent() {
         let dir = tempfile::tempdir().unwrap();
-        let state = test_state_with_durable_audit(dir.path());
+        let mut state = test_state_with_durable_audit(dir.path());
+        state.intent_executor = std::sync::Arc::new(FaithfulExecutor);
         let out = issue_standing_grant(
             State(state.clone()),
             Json(IssueStandingGrantInput {
                 capsule: "vm-agent".to_string(),
                 resource: "elastos://pay/vendor".to_string(),
                 action: "write".to_string(),
-                methods: vec!["pay.invoke".to_string()],
+                methods: vec!["runtime.echo".to_string()],
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
             }),
@@ -1903,12 +2062,12 @@ mod tests {
         .await
         .unwrap()
         .0;
-        let intent = signed_intent(&out.token_id, "pay.invoke");
+        let intent = signed_intent(&out.token_id, "runtime.echo");
         let first = dispatch_standing_intent(State(state.clone()), Json(intent.clone()))
             .await
             .unwrap()
             .0;
-        assert_eq!(first.outcome, "authorized");
+        assert_eq!(first.outcome, "performed");
         // Byte-for-byte the same signed declaration again ⇒ 409, refused.
         let replay = dispatch_standing_intent(State(state.clone()), Json(intent)).await;
         assert!(matches!(replay, Err((StatusCode::CONFLICT, _))), "replay must be refused");
@@ -1928,7 +2087,8 @@ mod tests {
     #[tokio::test]
     async fn dispatch_binds_the_authorized_agent_key() {
         let dir = tempfile::tempdir().unwrap();
-        let state = test_state_with_durable_audit(dir.path());
+        let mut state = test_state_with_durable_audit(dir.path());
+        state.intent_executor = std::sync::Arc::new(FaithfulExecutor);
         let agent = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
         let agent_hex = hex::encode(agent.verifying_key().to_bytes());
         let out = issue_standing_grant(
@@ -1937,7 +2097,7 @@ mod tests {
                 capsule: "vm-agent".to_string(),
                 resource: "elastos://pay/vendor".to_string(),
                 action: "write".to_string(),
-                methods: vec!["pay.invoke".to_string()],
+                methods: vec!["runtime.echo".to_string()],
                 ttl_secs: Some(3600),
                 agent_pubkey: Some(agent_hex),
             }),
@@ -1948,17 +2108,18 @@ mod tests {
         // The authorized agent acts.
         let ok = dispatch_standing_intent(
             State(state.clone()),
-            Json(signed_intent_with(&out.token_id, "pay.invoke", &agent)),
+            Json(signed_intent_with(&out.token_id, "runtime.echo", &agent)),
         )
         .await
         .unwrap()
         .0;
-        assert_eq!(ok.outcome, "authorized");
-        // A DIFFERENT (internally authentic) key naming the same mandate is denied wrong_agent.
+        assert_eq!(ok.outcome, "performed");
+        // A DIFFERENT (internally authentic) key naming the same mandate is denied wrong_agent
+        // (the agent check precedes the method check, so even an in-envelope method is refused).
         let impostor = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
         let denied = dispatch_standing_intent(
             State(state),
-            Json(signed_intent_with(&out.token_id, "pay.invoke2", &impostor)),
+            Json(signed_intent_with(&out.token_id, "runtime.echo", &impostor)),
         )
         .await
         .unwrap()

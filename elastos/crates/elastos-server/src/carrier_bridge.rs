@@ -3525,6 +3525,9 @@ mod tests {
                 audit.clone(),
             )),
             standing_service: Arc::new(capability_manager.standing_grant_service()),
+            intent_executor: Arc::new(
+                crate::intent_executor::MethodRegistryExecutor::production(),
+            ),
         };
 
         // ONE capsule session carrying its real identity (vm_id). Post-flip the mint
