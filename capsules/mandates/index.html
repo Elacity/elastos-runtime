@@ -314,7 +314,7 @@
     $("#drawer").classList.add("on");
     $("#drawer").setAttribute("aria-hidden","false");
     if (PREVIEW){
-      // No runtime reachable — this mandate is itself representative, so its receipt is too (labeled).
+      // Preview mode — this mandate is itself representative, so its receipt is too (labeled).
       paintReceipt(SAMPLE_RECEIPT, signer, true);
       return;
     }
@@ -371,12 +371,14 @@
   function paint(d, isPreview){
     PREVIEW = !!isPreview;
     $("#preview").hidden = !isPreview;
-    $("#signer").textContent = shortId(d.signer_public_key_hex||"unsigned");
+    // In preview the signer is a fabricated sample — mark it so the "Runtime signer" pin is never
+    // mistaken for this runtime's real key.
+    $("#signer").textContent = (isPreview ? "sample · " : "") + shortId(d.signer_public_key_hex||"unsigned");
     renderStats(d); renderGrid(d);
   }
 
-  // Try the live endpoint (works when this file is served in-runtime, same-origin authenticated);
-  // fall back to representative preview data so the page stands alone.
+  // Try the live endpoint (works once the mandate app's gateway data route is wired, same-origin);
+  // until then, fall back to clearly-labeled representative preview data so the page stands alone.
   function load(){
     if (typeof fetch !== "function"){ paint(SAMPLE, true); return; }
     var done=false, t=setTimeout(function(){ if(!done){done=true; paint(SAMPLE,true);} }, 1200);
