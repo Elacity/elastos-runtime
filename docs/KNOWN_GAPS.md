@@ -77,28 +77,52 @@ for open work:
 
 The grant → revoke → prove loop shipped with these HONEST bounds:
 
-- **G-M1 CLOSED (Sprint 5, at wire time as prescribed).** The dispatch endpoint
-  (`POST /api/standing-grants/dispatch`, `dispatch_standing_intent`) consults the manager's
-  individual token-revocation store before the envelope gate and SELF-HEALS the envelope to
-  revoked (honest `revoked` denial, sticky), so a backing token killed by ANY path denies
-  dispatch. The epoch case was already closed in Sprint 4 (`revoke_all` kills every envelope).
-  Ratchet: `dispatch_denies_when_the_backing_token_is_dead_by_any_path` (manager-side kill while
-  the envelope still believes it is live ⇒ denied/revoked + envelope healed).
-- **G-M2 CLOSED (Sprint 5).** Dispatch records a token-keyed `CapabilityUse` (success mirrors the
-  outcome) alongside the intent-keyed records, so `export_mandate_receipt_for_capability` carries
-  every intent-channel act AND every denied attempt. Ratchet:
-  `dispatch_acts_under_the_mandate_and_the_receipt_carries_the_act` (receipt shows
-  uses = [acted:true, denied:false] and still authenticates).
+- **G-M1 CLOSED (Sprint 5).** `dispatch_standing_intent` consults BOTH the manager's individual
+  token-revocation store AND epoch validity (via the token epoch captured in the envelope at issue)
+  before the gate, and self-heals the envelope to revoked — so a backing token killed by ANY path
+  (individual revoke, `revoke_all`, or a key-rotation epoch advance) denies dispatch with the honest
+  `revoked` reason. Ratchets: `dispatch_denies_when_the_backing_token_is_dead_by_any_path`,
+  `dispatch_denies_after_an_epoch_advance`.
+  RESIDUAL (narrow, documented): a manager-revoke landing between the probe and the gate's envelope
+  read lets one in-flight act complete — the authoritative liveness check is not yet atomic inside
+  the gate. Single-request window; the act is still fully receipted. Closing it means giving the
+  pure gate manager access (a deeper refactor).
+- **G-M2 CLOSED (Sprint 5).** Dispatch records a token-keyed `CapabilityUse` (success = a `Matched`
+  reconciliation, not merely gate-passed) alongside the intent-keyed records, so
+  `export_mandate_receipt_for_capability` carries every intent-channel act AND every denied attempt.
+  The use record is best-effort (like the validate path): a lost emit under-reports in the receipt,
+  but the intent-keyed declaration + reconciliation are already durable. Ratchet:
+  `dispatch_acts_under_the_mandate_and_the_receipt_carries_the_act`.
 - **G-M3 (same-uid trust boundary, documented not defective).** The loopback control plane's
   authority reduces to "can read the 0600 coords/attach-secret files" — i.e. the operator uid. Any
   same-uid process inherits full mandate authority. This is the declared trust boundary of a
   single-operator runtime; revisit if multi-tenant hosts land.
+- **G-M4 (agent-key binding — now first-class, default OPTIONAL).** A mandate MAY bind an authorized
+  agent ed25519 key (`issue --agent-key`), and when set the gate requires the intent to be signed by
+  THAT key (`EnvelopeDenial::WrongAgent`), so the audit attribution is the real agent — proven by
+  `dispatch_binds_the_authorized_agent_key`. An UNBOUND mandate (no `--agent-key`) remains
+  capsule-string-only: within the current shell-only endpoint that is contained (the shell can issue
+  any mandate anyway, G-M3), but it carries weaker attribution. FUTURE: make binding the default /
+  required when the endpoint is exposed to agents directly, and surface bound-vs-unbound on the card.
+- **G-M5 (replay guard — closed in-process, not cross-restart).** Each `intent_id` acts at most once
+  per runtime lifetime (`record_fresh_intent`; a replay is refused 409) — proven by
+  `dispatch_refuses_a_replayed_intent`. The seen-set is in-memory, so a replay after a RESTART is not
+  yet caught; and there is no `declared_at` freshness window. Persist the seen-set (or add a signed
+  freshness window) before exposing the endpoint beyond the single trusted operator.
+- **G-M6 (the "act" is attestation, not a real side effect).** The dispatch act mints a signed
+  affordance receipt from the declared fields; NO external executor is invoked, so the reconciliation
+  is structurally `matched` (its "done" is the declaration echoed). The outcome is honestly named
+  `authorized` (not "acted"/"performed"), and the receipt attests authorization + custody, not an
+  observed effect. Wiring a real executor whose independent result feeds the reconciliation (so it
+  can genuinely Match/Diverge/Undeliver) is the follow-up that makes "act" literal.
 
-Closed at review time (same sprint, before merge): the revoke id-casing desync (UPPERCASE hex
+Closed at review time (Sprint 3, before merge): the revoke id-casing desync (UPPERCASE hex
 revoked the token but missed the lowercase-keyed envelope — now canonicalized + regression test
 `revoke_with_uppercase_id_still_kills_the_standing_envelope`), and non-durable revocation
 enforcement (production `CapabilityStore` now built `with_persistence`, so revocations + epoch
-survive restart; fail-closed at boot if persistence is unavailable).
+survive restart; fail-closed at boot if persistence is unavailable). Sprint 5 also added
+`deny_unknown_fields` to `IntentDeclarationV1` and the `is_overbroad_grant_resource` guard at
+`issue_standing_grant` (defense-in-depth, mirroring `grant_request`).
 
 ## How to use this file
 - A new gap → add a row + an `#[ignore]`d ratchet test (or note "pending scaffold" if no API exists yet).

@@ -39,6 +39,11 @@ pub(crate) enum MandateCommand {
         /// Time-to-live in seconds; omitted = until revoked
         #[arg(long)]
         ttl_secs: Option<u64>,
+
+        /// Authorized agent's ed25519 public key (hex). When set, ONLY intents signed by this key
+        /// may act under the mandate — the audit attribution is the real agent. Recommended.
+        #[arg(long)]
+        agent_key: Option<String>,
     },
 
     /// Revoke a mandate NOW — durably attested on the audit chain, then enforced fail-closed
@@ -101,6 +106,7 @@ pub(crate) async fn run_mandate(cmd: MandateCommand) -> Result<()> {
             action,
             methods,
             ttl_secs,
+            agent_key,
         } => {
             let (api_url, shell_token) = attach_shell().await?;
             let resp = client()?
@@ -112,6 +118,7 @@ pub(crate) async fn run_mandate(cmd: MandateCommand) -> Result<()> {
                     "action": action,
                     "methods": methods,
                     "ttl_secs": ttl_secs,
+                    "agent_pubkey": agent_key,
                 }))
                 .send()
                 .await?;
@@ -133,6 +140,12 @@ pub(crate) async fn run_mandate(cmd: MandateCommand) -> Result<()> {
             match ttl_secs {
                 Some(secs) => println!("  expires:  in {secs}s"),
                 None => println!("  expires:  never (until revoked)"),
+            }
+            match &agent_key {
+                Some(k) => println!("  agent:    bound to {k}"),
+                None => println!(
+                    "  agent:    UNBOUND (any shell caller can act; pass --agent-key to bind)"
+                ),
             }
             println!("\nRevoke:  elastos mandate revoke {token_id}");
             println!("Prove:   elastos mandate receipt {token_id} -o receipt.json");

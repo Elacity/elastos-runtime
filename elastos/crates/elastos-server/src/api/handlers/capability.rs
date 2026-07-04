@@ -1068,6 +1068,11 @@ pub struct IssueStandingGrantInput {
     /// Optional time-to-live in seconds; omitted ⇒ no expiry (until revoked).
     #[serde(default)]
     pub ttl_secs: Option<u64>,
+    /// Optional AUTHORIZED AGENT ed25519 verifying key (hex). When set, ONLY intents signed by
+    /// this key may act under the mandate — the audit attribution is the real agent. Omitted ⇒
+    /// capsule-string-only authorization (weaker; see KNOWN_GAPS G-M4).
+    #[serde(default)]
+    pub agent_pubkey: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1112,6 +1117,31 @@ pub async fn issue_standing_grant(
             "a standing grant must authorize at least one method".to_string(),
         ));
     }
+    // AUD-5 defense-in-depth (mirrors grant_request): refuse to mint a bare scheme-level wildcard
+    // mandate — it would prefix-match every resource under the scheme.
+    if is_overbroad_grant_resource(&input.resource) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "scheme-level wildcard mandates are not permitted; scope to at least one path segment"
+                .to_string(),
+        ));
+    }
+    // Validate the optional agent key up front: a present-but-malformed key must fail closed, never
+    // silently degrade to an unbound (weaker) mandate.
+    let agent_pubkey = match input.agent_pubkey.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(hex_key) => {
+            let bytes = hex::decode(hex_key)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("agent_pubkey not hex: {e}")))?;
+            if bytes.len() != 32 {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("agent_pubkey must be 32 bytes (64 hex chars), got {}", bytes.len()),
+                ));
+            }
+            Some(hex::encode(bytes))
+        }
+    };
     let expiry = input
         .ttl_secs
         .map(elastos_common::SecureTimestamp::after_secs);
@@ -1124,7 +1154,9 @@ pub async fn issue_standing_grant(
         expiry,
     );
     let methods: std::collections::BTreeSet<String> = input.methods.into_iter().collect();
-    let grant_id = state.standing_service.issue_from_token(&token, methods);
+    let grant_id = state
+        .standing_service
+        .issue_from_token(&token, methods, agent_pubkey);
     let token_id = token.id().to_string();
     Ok(Json(IssueStandingGrantOutput { grant_id, token_id }))
 }
@@ -1290,25 +1322,38 @@ pub async fn list_standing_grants(
 
 #[derive(Debug, Serialize)]
 pub struct DispatchIntentOutput {
-    /// "acted" | "denied".
+    /// "authorized" (the mandate authorized the declared act and the runtime attested it) or
+    /// "denied". NOTE: "authorized" is NOT "a real-world side effect occurred" — no external
+    /// executor is wired yet (see KNOWN_GAPS G-M6); it means the intent fell within a live mandate
+    /// and the declaration + attestation are on the audit chain.
     pub outcome: String,
-    /// The fail-closed denial reason (snake_case) when denied; `None` when acted.
+    /// The fail-closed denial reason (snake_case) when denied; `None` when authorized.
     pub reason: Option<String>,
-    /// The signed declared-vs-done reconciliation when acted; `None` when denied.
+    /// The signed reconciliation when authorized; `None` when denied. Until a real executor is
+    /// wired its "done" is the declaration echoed back, so `status` is structurally `matched` —
+    /// it attests authorization, not an independently-observed effect (G-M6).
     pub reconciliation: Option<elastos_runtime::capability::IntentReconciliationV1>,
 }
 
 /// POST /api/standing-grants/dispatch  (shell-only) — the ACT leg of the mandate loop.
 ///
-/// Run ONE agent act under its standing mandate, fail-closed: authenticate the signed
-/// [`IntentDeclarationV1`] (a forged declaration is rejected before any grant lookup), close
-/// G-M1 (the envelope gate alone knows nothing of the manager's token-revocation store — if the
-/// backing token is individually dead, the envelope is marked revoked FIRST so the gate denies
-/// with the honest `Revoked` reason), then run the intent gate (declaration recorded on-chain
-/// BEFORE the act; no custody ⇒ no act). The act mints the signed affordance receipt — the same
-/// proof-of-act primitive the consent flow uses. Closes G-M2: the outcome is ALSO recorded as a
-/// token-keyed `CapabilityUse` (success mirrors the outcome), so the mandate's exported receipt
-/// carries every intent-channel act, not just validate-path redemptions.
+/// Run ONE agent act under its standing mandate, fail-closed. In order:
+/// 1. authenticate the signed [`IntentDeclarationV1`] (`verify_self`) — a forged declaration is
+///    rejected before any lookup or record;
+/// 2. REPLAY GUARD (G-M5): each `intent_id` acts at most once per runtime lifetime — a re-POSTed
+///    signed blob is refused `409`, so a captured/retried declaration cannot double-act;
+/// 3. LIVENESS (G-M1): consult the manager's token-revocation store AND epoch validity (the pure
+///    envelope gate can see neither) — if the backing token is dead by ANY path (individual
+///    revoke, `revoke_all`, or a key-rotation epoch advance) the envelope is healed to revoked so
+///    the gate denies with the true `revoked` reason;
+/// 4. run the intent gate: the declaration is recorded on-chain BEFORE the act (no custody ⇒ no
+///    act), and the gate binds capsule + BOUND AGENT KEY (G-M4, when the mandate set one) + method
+///    + resource + action, all exact;
+/// 5. record a token-keyed `CapabilityUse` (G-M2) whose `success` reflects the reconciliation
+///    STATUS (a real `matched` delivery), so the mandate's exported receipt carries the act.
+///
+/// Honest scope: the act mints a signed affordance receipt; it does not invoke a real executor, so
+/// "authorized" attests authorization + custody, not a side effect (G-M6).
 pub async fn dispatch_standing_intent(
     State(state): State<CapabilityState>,
     Json(intent): Json<IntentDeclarationV1>,
@@ -1317,6 +1362,15 @@ pub async fn dispatch_standing_intent(
         return Err((
             StatusCode::BAD_REQUEST,
             "intent declaration signature did not verify".to_string(),
+        ));
+    }
+    // Replay guard (G-M5): register the intent id BEFORE anything acts. A duplicate is refused with
+    // no record and no act. Register only AFTER authenticity (above) so a forged blob cannot burn a
+    // future-legitimate id.
+    if !state.standing_service.record_fresh_intent(&intent.intent_id) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("intent {} was already dispatched (replay refused)", intent.intent_id),
         ));
     }
     let action = match intent.action.to_lowercase().as_str() {
@@ -1333,11 +1387,19 @@ pub async fn dispatch_standing_intent(
             ));
         }
     };
-    // G-M1: consult the manager's individual token-revocation store, which the envelope gate
-    // cannot see. Self-heal the envelope so the denial carries the true `revoked` reason (and
-    // sticks for future dispatches). Unparseable grant ids fail closed at the gate (NoGrant).
+    // Liveness (G-M1): the envelope gate sees only its own `revoked` flag. A backing token can die
+    // by three other paths the gate cannot see — individual revoke, `revoke_all`, and a key-rotation
+    // epoch advance. Consult BOTH the revocation store and epoch validity (using the epoch captured
+    // in the envelope at issue), and heal the envelope to revoked so the gate denies with the true
+    // `revoked` reason and it sticks. Unparseable ids fail closed at the gate (NoGrant).
     if let Ok(token_id) = TokenId::from_hex(intent.standing_grant_id.trim()) {
-        if state.capability_manager.is_token_revoked(&token_id).await {
+        let revoked = state.capability_manager.is_token_revoked(&token_id).await;
+        let epoch_dead = state
+            .standing_service
+            .get(&token_id.to_string())
+            .map(|env| !state.capability_manager.is_epoch_valid(env.token_epoch))
+            .unwrap_or(false);
+        if revoked || epoch_dead {
             let _ = state.standing_service.revoke(&token_id.to_string());
         }
     }
@@ -1354,7 +1416,7 @@ pub async fn dispatch_standing_intent(
             &i_token, &i_capsule, &i_method, &i_hash, &i_resource, action,
         ))
     });
-    use elastos_runtime::capability::IntentGateOutcome;
+    use elastos_runtime::capability::{IntentGateOutcome, ReconciliationStatus};
     let (out, acted) = match outcome {
         IntentGateOutcome::BlockedNoCustody(e) => {
             // Custody is mandatory: the declaration could not land on the chain, so nothing ran
@@ -1372,17 +1434,24 @@ pub async fn dispatch_standing_intent(
             },
             false,
         ),
-        IntentGateOutcome::Acted(rec) => (
-            DispatchIntentOutput {
-                outcome: "acted".to_string(),
-                reason: None,
-                reconciliation: Some(rec),
-            },
-            true,
-        ),
+        IntentGateOutcome::Acted(rec) => {
+            // `success` reflects the reconciliation STATUS, not merely that the gate passed: only a
+            // `Matched` delivery is a true act; `Diverged`/`Undelivered` record success=false.
+            let matched = rec.status == ReconciliationStatus::Matched;
+            (
+                DispatchIntentOutput {
+                    outcome: "authorized".to_string(),
+                    reason: None,
+                    reconciliation: Some(rec),
+                },
+                matched,
+            )
+        }
     };
     // G-M2: token-keyed projection of the outcome, so export_mandate_receipt_for_capability
-    // carries the intent-channel act (or its denial) in the mandate's receipt.
+    // carries the intent-channel act (or its denial) in the mandate's receipt. Best-effort
+    // (like the validate-path use records): a lost emit under-reports in the receipt but the
+    // intent-keyed declaration + reconciliation are already durably on the chain.
     if let Ok(token_id) = TokenId::from_hex(intent.standing_grant_id.trim()) {
         state.capability_manager.audit_log().capability_use(
             &token_id,
@@ -1535,6 +1604,7 @@ mod tests {
                 action: "execute".to_string(),
                 methods: vec!["send".to_string()],
                 ttl_secs: Some(3600),
+                agent_pubkey: None,
             }),
         )
         .await
@@ -1613,6 +1683,7 @@ mod tests {
                 action: "write".to_string(),
                 methods: vec!["pay.invoke".to_string()],
                 ttl_secs: Some(3600),
+                agent_pubkey: None,
             }),
         )
         .await
@@ -1675,14 +1746,17 @@ mod tests {
         assert!(matches!(bad, Err((StatusCode::BAD_REQUEST, _))));
     }
 
-    /// Sign an intent under a fresh agent key naming the mandate. `verify_self` proves internal
-    /// authenticity (signed by the key it names), which is what the dispatch handler requires.
-    fn signed_intent(grant_id: &str, method: &str) -> IntentDeclarationV1 {
-        let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+    /// Sign an intent under `sk` naming the mandate; `intent_id` is unique per method so the replay
+    /// guard does not collide across a test's calls.
+    fn signed_intent_with(
+        grant_id: &str,
+        method: &str,
+        sk: &ed25519_dalek::SigningKey,
+    ) -> IntentDeclarationV1 {
         IntentDeclarationV1::issue(
-            &sk,
+            sk,
             sk.verifying_key().to_bytes(),
-            "intent-1",
+            &format!("intent-{method}"),
             "vm-agent",
             method,
             "cafe01",
@@ -1690,6 +1764,12 @@ mod tests {
             "write",
             grant_id,
         )
+    }
+
+    /// As [`signed_intent_with`] but under a fresh throwaway agent key.
+    fn signed_intent(grant_id: &str, method: &str) -> IntentDeclarationV1 {
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        signed_intent_with(grant_id, method, &sk)
     }
 
     /// The ACT leg closes G-M2: a dispatched act lands as a token-keyed CapabilityUse in the
@@ -1706,6 +1786,7 @@ mod tests {
                 action: "write".to_string(),
                 methods: vec!["pay.invoke".to_string()],
                 ttl_secs: Some(3600),
+                agent_pubkey: None,
             }),
         )
         .await
@@ -1719,8 +1800,8 @@ mod tests {
         .await
         .expect("dispatch ok")
         .0;
-        assert_eq!(resp.outcome, "acted");
-        assert!(resp.reconciliation.is_some(), "signed declared-vs-done reconciliation returned");
+        assert_eq!(resp.outcome, "authorized");
+        assert!(resp.reconciliation.is_some(), "signed reconciliation returned");
 
         // A method OUTSIDE the envelope is denied fail-closed — and the denial is receipted too.
         let denied = dispatch_standing_intent(
@@ -1766,6 +1847,7 @@ mod tests {
                 action: "write".to_string(),
                 methods: vec!["pay.invoke".to_string()],
                 ttl_secs: None,
+                agent_pubkey: None,
             }),
         )
         .await
@@ -1801,6 +1883,124 @@ mod tests {
         assert!(matches!(err, Err((StatusCode::BAD_REQUEST, _))));
     }
 
+    /// Red-team F5: the SAME signed declaration must act at most once — a replayed intent is
+    /// refused 409, no second act, no second receipt record.
+    #[tokio::test]
+    async fn dispatch_refuses_a_replayed_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_durable_audit(dir.path());
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: "elastos://pay/vendor".to_string(),
+                action: "write".to_string(),
+                methods: vec!["pay.invoke".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let intent = signed_intent(&out.token_id, "pay.invoke");
+        let first = dispatch_standing_intent(State(state.clone()), Json(intent.clone()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(first.outcome, "authorized");
+        // Byte-for-byte the same signed declaration again ⇒ 409, refused.
+        let replay = dispatch_standing_intent(State(state.clone()), Json(intent)).await;
+        assert!(matches!(replay, Err((StatusCode::CONFLICT, _))), "replay must be refused");
+        // Exactly ONE use is receipted (the replay never acted).
+        let receipt = mandate_receipt(State(state), Path(out.token_id.clone())).await.unwrap().0;
+        use elastos_runtime::primitives::audit::AuditEvent;
+        let uses = receipt
+            .records
+            .iter()
+            .filter(|r| matches!(r.event, AuditEvent::CapabilityUse { .. }))
+            .count();
+        assert_eq!(uses, 1, "the replay must not have produced a second use");
+    }
+
+    /// Red-team F2: a mandate bound to an agent key authorizes ONLY that key. An intent signed by a
+    /// different key — even one internally authentic (verify_self passes) — is denied `wrong_agent`.
+    #[tokio::test]
+    async fn dispatch_binds_the_authorized_agent_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_durable_audit(dir.path());
+        let agent = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let agent_hex = hex::encode(agent.verifying_key().to_bytes());
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: "elastos://pay/vendor".to_string(),
+                action: "write".to_string(),
+                methods: vec!["pay.invoke".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: Some(agent_hex),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        // The authorized agent acts.
+        let ok = dispatch_standing_intent(
+            State(state.clone()),
+            Json(signed_intent_with(&out.token_id, "pay.invoke", &agent)),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(ok.outcome, "authorized");
+        // A DIFFERENT (internally authentic) key naming the same mandate is denied wrong_agent.
+        let impostor = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let denied = dispatch_standing_intent(
+            State(state),
+            Json(signed_intent_with(&out.token_id, "pay.invoke2", &impostor)),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(denied.outcome, "denied");
+        assert_eq!(denied.reason.as_deref(), Some("wrong_agent"));
+    }
+
+    /// Guardian F1: the MASS/rotation kill (epoch advance) must deny dispatch even though it never
+    /// touches the individual revocation set — the handler consults epoch validity via the envelope.
+    #[tokio::test]
+    async fn dispatch_denies_after_an_epoch_advance() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_durable_audit(dir.path());
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: "elastos://pay/vendor".to_string(),
+                action: "write".to_string(),
+                methods: vec!["pay.invoke".to_string()],
+                ttl_secs: None,
+                agent_pubkey: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        // Advance the epoch WITHOUT touching the standing registry (mirrors key rotation, which
+        // does not call revoke_all on the service).
+        state.capability_manager.revoke_all("key rotation");
+        let resp = dispatch_standing_intent(
+            State(state),
+            Json(signed_intent(&out.token_id, "pay.invoke")),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.outcome, "denied");
+        assert_eq!(resp.reason.as_deref(), Some("revoked"), "epoch-dead mandate denies dispatch");
+    }
+
     /// The operator's mandate list renders honest card states: a live mandate is ACTIVE, a revoked
     /// one stays LISTED (flagged, never erased), and the response carries the runtime's signer pin.
     #[tokio::test]
@@ -1813,6 +2013,7 @@ mod tests {
             action: "write".to_string(),
             methods: vec!["pay.invoke".to_string()],
             ttl_secs: Some(3600),
+            agent_pubkey: None,
         };
         let a = issue_standing_grant(State(state.clone()), Json(issue("elastos://pay/a")))
             .await
@@ -1872,6 +2073,7 @@ mod tests {
                 action: "execute".to_string(),
                 methods: vec!["send".to_string()],
                 ttl_secs: None,
+                agent_pubkey: None,
             }),
         )
         .await
@@ -1904,6 +2106,7 @@ mod tests {
                 action: "frobnicate".to_string(),
                 methods: vec!["send".to_string()],
                 ttl_secs: None,
+                agent_pubkey: None,
             }),
         )
         .await
@@ -1919,6 +2122,7 @@ mod tests {
                 action: "execute".to_string(),
                 methods: vec![],
                 ttl_secs: None,
+                agent_pubkey: None,
             }),
         )
         .await
@@ -1938,6 +2142,7 @@ mod tests {
                 action: "execute".to_string(),
                 methods: vec!["send".to_string()],
                 ttl_secs: Some(3600),
+                agent_pubkey: None,
             }),
         )
         .await

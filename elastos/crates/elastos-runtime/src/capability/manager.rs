@@ -671,6 +671,13 @@ impl CapabilityManager {
         self.store.is_token_revoked(token_id).await
     }
 
+    /// Read-only probe: is a token minted at `token_epoch` still epoch-valid (not invalidated by a
+    /// later `revoke_all`/key-rotation epoch advance)? For dispatch liveness the pure envelope gate
+    /// cannot re-derive. Enforcement still goes through [`validate`](Self::validate).
+    pub fn is_epoch_valid(&self, token_epoch: u64) -> bool {
+        self.store.is_epoch_valid(token_epoch)
+    }
+
     /// Get reference to the audit log
     pub fn audit_log(&self) -> &Arc<AuditLog> {
         &self.audit_log

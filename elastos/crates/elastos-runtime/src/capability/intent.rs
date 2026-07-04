@@ -19,7 +19,7 @@
 //! intent is within the authorized envelope, and a tamper-evident record of declared vs
 //! done — NOT the correctness/wisdom of the act.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -49,6 +49,7 @@ const RECONCILE_SIG_DOMAIN: &[u8] = b"elastos.intent.reconciliation.v1\0";
 /// declared arguments (same hashing path as the W2 binding), so the later receipt can be
 /// compared field-for-field. Signed exactly like [`AffordanceGrantReceiptV1`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IntentDeclarationV1 {
     pub schema: String,
     /// Stable id for this declaration (the reconciliation references it).
@@ -172,6 +173,15 @@ pub struct StandingGrantEnvelope {
     /// Expiry; `None` = never expires (until revoked), mirroring `CapabilityToken::expiry`.
     pub expires_at: Option<SecureTimestamp>,
     pub revoked: bool,
+    /// The AUTHORIZED AGENT's ed25519 verifying key (hex), if the grant bound one. When set, the
+    /// gate requires the intent to be signed by THIS key — so the mandate authorizes a specific
+    /// agent, and the audit attribution is the real actor, not "some self-signed key". `None` =
+    /// capsule-string-only authorization (weaker attribution; see KNOWN_GAPS G-M4).
+    pub agent_pubkey: Option<String>,
+    /// The backing token's revocation epoch, captured at issue. A grant is dead once the runtime's
+    /// current epoch passes it (key rotation / revoke-all advance the epoch), so the dispatcher can
+    /// deny epoch-dead mandates without re-deriving the token.
+    pub token_epoch: u64,
 }
 
 impl StandingGrantEnvelope {
@@ -198,6 +208,7 @@ impl StandingGrantEnvelope {
         token: &CapabilityToken,
         allowed_methods: BTreeSet<String>,
         revoked: bool,
+        agent_pubkey: Option<String>,
     ) -> Self {
         StandingGrantEnvelope {
             grant_id: token.id().to_string(),
@@ -207,6 +218,8 @@ impl StandingGrantEnvelope {
             action: token.action().to_string(),
             expires_at: token.expiry().copied(),
             revoked,
+            agent_pubkey: agent_pubkey.map(|k| k.trim().to_lowercase()),
+            token_epoch: token.constraints().epoch(),
         }
     }
 }
@@ -218,6 +231,8 @@ pub enum EnvelopeDenial {
     Revoked,
     Expired,
     WrongCapsule,
+    /// The intent was signed by a key other than the mandate's bound agent key.
+    WrongAgent,
     MethodNotInEnvelope,
     WrongResource,
     WrongAction,
@@ -234,6 +249,7 @@ impl EnvelopeDenial {
             EnvelopeDenial::Revoked => "revoked",
             EnvelopeDenial::Expired => "expired",
             EnvelopeDenial::WrongCapsule => "wrong_capsule",
+            EnvelopeDenial::WrongAgent => "wrong_agent",
             EnvelopeDenial::MethodNotInEnvelope => "method_not_in_envelope",
             EnvelopeDenial::WrongResource => "wrong_resource",
             EnvelopeDenial::WrongAction => "wrong_action",
@@ -267,6 +283,16 @@ pub fn check_intent_within_envelope(
     }
     if intent.capsule != envelope.capsule {
         return EnvelopeCheck::Denied(EnvelopeDenial::WrongCapsule);
+    }
+    // Agent-key binding: if the mandate bound a specific agent key, ONLY that key may act under it.
+    // `verify_self` already proved the declaration was signed by the key it names (`intent.signer`);
+    // this proves that key is the AUTHORIZED agent, so the audit attribution is the real actor and
+    // a different self-signed key cannot borrow the mandate. A mandate with no bound key (`None`)
+    // stays capsule-string-only — weaker attribution, tracked in KNOWN_GAPS G-M4.
+    if let Some(agent) = &envelope.agent_pubkey {
+        if !intent.signer.trim().eq_ignore_ascii_case(agent) {
+            return EnvelopeCheck::Denied(EnvelopeDenial::WrongAgent);
+        }
     }
     if !envelope.allowed_methods.contains(&intent.method_id) {
         return EnvelopeCheck::Denied(EnvelopeDenial::MethodNotInEnvelope);
@@ -635,6 +661,10 @@ where
 #[derive(Default)]
 pub struct StandingGrantStore {
     grants: RwLock<HashMap<String, StandingGrantEnvelope>>,
+    /// Intent ids already dispatched this runtime lifetime — the replay guard. A standing mandate
+    /// is deliberately multi-use (the agent may act repeatedly with DIFFERENT intents), but the
+    /// SAME signed declaration must act at most once, or a captured/retried blob is a double-act.
+    seen_intents: RwLock<HashSet<String>>,
 }
 
 impl StandingGrantStore {
@@ -694,6 +724,19 @@ impl StandingGrantStore {
         let mut all: Vec<StandingGrantEnvelope> = grants.values().cloned().collect();
         all.sort_by(|a, b| a.grant_id.cmp(&b.grant_id));
         all
+    }
+
+    /// Register an intent id as dispatched, returning `true` iff it was FRESH (not seen before this
+    /// runtime lifetime). The replay guard: the caller acts only on `true`, so a re-POSTed signed
+    /// declaration is refused. A poisoned lock recovers via `into_inner()` (single-statement
+    /// invariant) rather than silently admitting a replay. NOTE: in-memory ⇒ per-lifetime; cross-
+    /// restart replay protection is tracked in KNOWN_GAPS G-M5.
+    pub fn record_fresh_intent(&self, intent_id: &str) -> bool {
+        let mut seen = match self.seen_intents.write() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        seen.insert(intent_id.to_string())
     }
 
     /// Revoke EVERY standing grant — the envelope side of the mass kill switch. Called alongside
@@ -813,11 +856,25 @@ impl StandingGrantService {
         &self,
         token: &CapabilityToken,
         allowed_methods: BTreeSet<String>,
+        agent_pubkey: Option<String>,
     ) -> String {
-        let envelope = StandingGrantEnvelope::from_token(token, allowed_methods, false);
+        let envelope =
+            StandingGrantEnvelope::from_token(token, allowed_methods, false, agent_pubkey);
         let grant_id = envelope.grant_id.clone();
         self.store.issue(envelope);
         grant_id
+    }
+
+    /// The standing grant envelope for `grant_id` (revoked or not), if ever issued. Read-only;
+    /// an operator/dispatch surface uses it to consult liveness the pure gate cannot re-derive.
+    pub fn get(&self, grant_id: &str) -> Option<StandingGrantEnvelope> {
+        self.store.get(grant_id)
+    }
+
+    /// Register an intent id as dispatched; `true` iff FRESH. The replay guard — see
+    /// [`StandingGrantStore::record_fresh_intent`].
+    pub fn record_fresh_intent(&self, intent_id: &str) -> bool {
+        self.store.record_fresh_intent(intent_id)
     }
 
     /// Revoke a standing grant by id, fail-closed. Returns `true` iff a live grant was revoked by
@@ -924,6 +981,8 @@ mod tests {
             action: "execute".to_string(),
             expires_at: Some(SecureTimestamp::after_secs(3600)),
             revoked: false,
+            agent_pubkey: None,
+            token_epoch: 0,
         }
     }
 
@@ -1098,7 +1157,7 @@ mod tests {
             Some(SecureTimestamp::after_secs(3600)),
         );
         let methods: BTreeSet<String> = ["send", "draft"].iter().map(|m| m.to_string()).collect();
-        let env = StandingGrantEnvelope::from_token(&token, methods, false);
+        let env = StandingGrantEnvelope::from_token(&token, methods, false, None);
 
         // The token supplies capsule/resource/action/expiry that were actually signed in.
         assert_eq!(env.capsule, "vm-agent");
@@ -1137,12 +1196,12 @@ mod tests {
             None,
         );
         let methods: BTreeSet<String> = ["send"].iter().map(|m| m.to_string()).collect();
-        let active = StandingGrantEnvelope::from_token(&token, methods.clone(), false);
+        let active = StandingGrantEnvelope::from_token(&token, methods.clone(), false, None);
         assert_eq!(active.expires_at, None);
         assert!(active.is_active(), "None expiry never expires");
 
         // The caller's external revocation check is honored, fail-closed.
-        let revoked = StandingGrantEnvelope::from_token(&token, methods, true);
+        let revoked = StandingGrantEnvelope::from_token(&token, methods, true, None);
         assert!(!revoked.is_active());
         let sk = key();
         assert_eq!(
@@ -1541,6 +1600,8 @@ mod tests {
             action: "execute".to_string(),
             expires_at,
             revoked: false,
+            agent_pubkey: None,
+            token_epoch: 0,
         }
     }
 
@@ -1792,6 +1853,7 @@ mod tests {
             &token,
             ["send"].iter().map(|m| m.to_string()).collect(),
             false,
+            None,
         );
         store.issue(envelope);
 
@@ -1903,7 +1965,7 @@ mod tests {
             Some(SecureTimestamp::after_secs(3600)),
         );
         let grant_id =
-            svc.issue_from_token(&token, ["send"].iter().map(|m| m.to_string()).collect());
+            svc.issue_from_token(&token, ["send"].iter().map(|m| m.to_string()).collect(), None);
         assert_eq!(grant_id, token.id().to_string());
         assert!(svc.is_active(&grant_id), "a freshly issued grant is active");
 
