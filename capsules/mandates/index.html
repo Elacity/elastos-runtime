@@ -328,7 +328,17 @@
     return "";
   }
 
+  // The token id whose receipt the drawer is CURRENTLY showing. Every async continuation that
+  // paints the drawer (receipt loads, kill-switch results) must check it still owns the drawer —
+  // otherwise a SLOW response for mandate A lands after the operator opened mandate B and paints
+  // A's receipt (and worse, A's KILL SWITCH) under B's header: a wrong-target revoke. Council
+  // finding, Sprint 13.
+  var OPEN_TID = null;
+
+  function receiptUrl(m){ return "/api/apps/mandates/mandate/"+encodeURIComponent(m.token_id)+"/receipt"; }
+
   function openReceipt(m, signer){
+    OPEN_TID = m.token_id;
     $("#d-tid").textContent = m.token_id;
     $("#dbody").innerHTML = '<div class="caveat">Loading receipt…</div>';
     $("#scrim").classList.add("on");
@@ -341,30 +351,35 @@
     }
     // Live in-runtime: read the portable receipt for THIS mandate. On failure show an ERROR — NEVER
     // a fabricated sample under a real token id.
-    fetch("/api/apps/mandates/mandate/"+encodeURIComponent(m.token_id)+"/receipt", {headers:launchHeaders()})
+    fetch(receiptUrl(m), {headers:launchHeaders()})
       .then(function(r){ if(!r.ok) throw new Error("http "+r.status); return r.json(); })
-      .then(function(j){ paintReceipt(j, signer, false); renderKillSwitch(m); })
+      .then(function(j){
+        if (OPEN_TID !== m.token_id) return; // stale response — another mandate owns the drawer now
+        paintReceipt(j, signer, false); renderKillSwitch(m, signer);
+      })
       .catch(function(err){
+        if (OPEN_TID !== m.token_id) return; // stale response — never paint under another header
         $("#dbody").innerHTML = '<div class="verifybox"><div class="vt">Receipt unavailable</div>'
           + '<p>Could not load this mandate’s receipt ('+esc(String(err&&err.message||err))+'). '
           + 'It may have no durable records yet, or the runtime is unreachable.</p></div>';
         // The receipt failing to load must not disable the KILL SWITCH — an operator may need to
         // revoke exactly when things look wrong.
-        renderKillSwitch(m);
+        renderKillSwitch(m, signer);
       });
   }
 
   // The kill switch: shown only in-shell (a real runtime behind us) and only on a LIVE mandate.
-  // Two-step (arm → confirm) so one stray click can't kill an agent's autonomy. The revoke rides
-  // the same home-token gate as the reads; the runtime durably attests it BEFORE the envelope dies,
-  // so a success here means the receipt now carries the revoke.
-  function renderKillSwitch(m){
+  // Two-step (arm → confirm) so one stray click can't kill an agent's autonomy, and the TARGET id
+  // is printed beside the button so what gets killed is always what the operator is reading. The
+  // revoke rides the same home-token gate as the reads; the runtime durably attests it BEFORE the
+  // envelope dies, so a success here means the receipt now carries the revoke.
+  function renderKillSwitch(m, signer){
     if (!IN_SHELL || !m.active) return;
     var box = document.createElement("div");
     box.className = "killbox";
     box.innerHTML = '<div class="vt">Kill switch</div>'
-      + '<p>Revoking is immediate and cannot be undone. It is signed onto the audit chain first — '
-      + 'then every not-yet-started act under this mandate is denied.</p>'
+      + '<p>Revoking <b class="mono">'+esc(shortId(m.token_id))+'</b> is immediate and cannot be undone. '
+      + 'It is signed onto the audit chain first — then every not-yet-started act under this mandate is denied.</p>'
       + '<button class="killbtn" type="button">Revoke this mandate</button>';
     var btn = box.querySelector(".killbtn");
     var note = document.createElement("p");
@@ -373,7 +388,7 @@
       if (!armed){
         armed = true;
         btn.classList.add("armed");
-        btn.textContent = "Confirm revoke — cannot be undone";
+        btn.textContent = "Confirm revoke "+shortId(m.token_id)+" — cannot be undone";
         return;
       }
       btn.disabled = true; btn.textContent = "Revoking…";
@@ -381,19 +396,36 @@
       fetch("/api/apps/mandates/standing-grants/revoke", {method:"POST", headers:h, body:JSON.stringify({grant_id:m.token_id})})
         .then(function(r){ if(!r.ok) throw new Error("http "+r.status); return r.json(); })
         .then(function(j){
-          box.innerHTML = '<div class="vt">'+(j.revoked ? "Mandate revoked" : "Nothing to revoke")+'</div>'
-            + '<p>'+(j.revoked
-              ? "The signed revoke is on the audit chain; this mandate’s receipt now carries it."
-              : "This mandate was already dead — no live grant was killed by this call.")+'</p>';
-          load(); // repaint the list so the card flips in front of the operator
+          // Prove-surface honesty: the timeline on screen was fetched BEFORE the revoke, so it does
+          // not yet carry it. Re-fetch the receipt and repaint so the visible evidence matches the
+          // claim; if the re-fetch fails, SAY the record isn't shown rather than implying it is.
+          return fetch(receiptUrl(m), {headers:launchHeaders()})
+            .then(function(r){ return r.ok ? r.json() : null; })
+            .catch(function(){ return null; })
+            .then(function(fresh){
+              if (OPEN_TID === m.token_id){
+                if (fresh) paintReceipt(fresh, signer, false);
+                box.remove(); // no-op if paintReceipt already replaced the drawer body
+                var sbox = document.createElement("div");
+                sbox.className = "killbox";
+                sbox.innerHTML = '<div class="vt">'+(j.revoked ? "Mandate revoked" : "Nothing to revoke")+'</div>'
+                  + '<p>'+(j.revoked
+                    ? (fresh
+                      ? "The signed revoke is on the audit chain — the receipt above now carries it."
+                      : "The signed revoke is on the audit chain. The refreshed receipt could not be loaded — reopen this mandate to see the revoke record.")
+                    : "This mandate was already dead — no live grant was killed by this call.")+'</p>';
+                $("#dbody").appendChild(sbox);
+              }
+              load(); // repaint the list so the card flips in front of the operator
+            });
         })
         .catch(function(err){
           // Honest uncertainty: a transport failure does NOT prove the revoke didn't land server-side
-          // (the runtime attests before replying). Refresh the list and let the card state speak.
+          // (the runtime attests before replying). Kick a list refresh and defer to the card state.
           btn.disabled = false; armed = false; btn.classList.remove("armed");
           btn.textContent = "Revoke this mandate";
           note.textContent = "Revoke did not complete ("+String(err&&err.message||err)+"). "
-            + "The list has been refreshed — trust the card’s state, and retry if it still reads Live.";
+            + "Refreshing the list — trust the card’s state once it reloads, and retry if it still reads Live.";
           box.appendChild(note);
           load();
         });
