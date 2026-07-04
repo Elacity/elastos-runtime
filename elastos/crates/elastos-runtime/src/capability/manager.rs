@@ -664,6 +664,13 @@ impl CapabilityManager {
         self.store.current_epoch()
     }
 
+    /// Read-only probe: has this token id been individually revoked? For operator surfaces that
+    /// must not render a killed mandate as live. The enforcement decision itself always goes
+    /// through [`validate`](Self::validate), never this shortcut.
+    pub async fn is_token_revoked(&self, token_id: &TokenId) -> bool {
+        self.store.is_token_revoked(token_id).await
+    }
+
     /// Get reference to the audit log
     pub fn audit_log(&self) -> &Arc<AuditLog> {
         &self.audit_log

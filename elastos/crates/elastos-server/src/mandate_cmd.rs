@@ -305,8 +305,39 @@ async fn run_demo() -> Result<()> {
         .to_string();
     println!("granted mandate {token_id}: vm-demo-agent may write elastos://pay/demo-vendor via pay.invoke, 1h TTL\n");
 
+    // From here a REAL 1h authority exists. If any later step fails, the mandate must not be
+    // stranded live — attempt the revoke as cleanup before surfacing the error.
+    match demo_after_grant(&http, &api_url, &shell_token, &token_id).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            eprintln!("demo step failed; revoking the demo mandate so no live authority is left behind…");
+            let cleanup = http
+                .post(format!("{api_url}/api/standing-grants/revoke"))
+                .header("Authorization", format!("Bearer {shell_token}"))
+                .json(&serde_json::json!({ "grant_id": token_id }))
+                .send()
+                .await;
+            match cleanup {
+                Ok(r) if r.status().is_success() => eprintln!("cleanup revoke succeeded."),
+                _ => eprintln!(
+                    "CLEANUP REVOKE FAILED — a live 1h demo mandate remains: run \
+                     `elastos mandate revoke {token_id}`"
+                ),
+            }
+            Err(e)
+        }
+    }
+}
+
+async fn demo_after_grant(
+    http: &reqwest::Client,
+    api_url: &str,
+    shell_token: &str,
+    token_id: &str,
+) -> Result<()> {
+
     println!("── 2. LIST — the mandate is LIVE on the operator surface ──");
-    let list = fetch_mandate_list(&api_url, &shell_token).await?;
+    let list = fetch_mandate_list(api_url, shell_token).await?;
     print_mandate_list(&list);
     // The signer pin for step 5, obtained over the authenticated channel.
     let pinned_signer = list
@@ -339,17 +370,23 @@ async fn run_demo() -> Result<()> {
     let receipt: elastos_runtime::primitives::MandateReceipt = resp.json().await?;
     println!("exported: {} records (grant … revoke), signed by {}\n", receipt.records.len(), receipt.signer_public_key_hex);
 
-    println!("── 5. VERIFY — independently, pinned to the runtime key YOU trust ──");
+    println!("── 5. VERIFY — the receipt against the pin from your runtime's control plane ──");
+    // Honest scope: within one demo run the pin and the receipt come from the SAME runtime over
+    // the SAME channel, so this demonstrates the pinning MECHANISM (and self-consistency), not
+    // independent third-party verification — a counterparty runs verify-receipt on their own box
+    // with a pin they obtained out-of-band.
     let verdict =
         elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&pinned_signer));
     println!("  structurally valid: {}", verdict.structurally_valid);
     println!("  set binding:        {}", verdict.set_binding_ok);
     println!("  scope rule:         {}", verdict.scope_ok);
-    println!("  AUTHENTICATED:      {}", verdict.authenticated);
+    println!("  pin matched:        {}", verdict.authenticated);
+    println!("  (pin provenance: this runtime's control plane — self-asserted; a counterparty");
+    println!("   pins the key they trust out-of-band and verifies on their own box)");
     if !verdict.authenticated {
         bail!("demo receipt failed verification: {verdict:?}");
     }
-    println!("\nThe loop is closed: authority granted, exercised scope visible, killed, and PROVEN —");
+    println!("\nThe loop is closed: authority granted, listed live, killed, and receipted —");
     println!("hand receipt + `elastos verify-receipt` to anyone; they need no runtime and no trust in this box.");
     Ok(())
 }

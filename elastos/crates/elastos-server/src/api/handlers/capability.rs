@@ -892,6 +892,11 @@ pub async fn revoke_all_capabilities(
 ) -> Result<Json<RevokeAllOutput>, (StatusCode, String)> {
     let new_epoch = state.capability_manager.revoke_all(&input.reason);
 
+    // The envelope side of the mass kill: the epoch advance killed every backing TOKEN, but the
+    // standing-grant registry knows nothing of epochs — without this, an epoch-dead mandate keeps
+    // rendering (and, once dispatch is wired, dispatching) as LIVE.
+    let _ = state.standing_service.revoke_all();
+
     // Mark all granted requests as revoked, fail-closed on the audit records (AUD-3):
     // the epoch increment above already invalidated the tokens, but an incomplete
     // attestation is surfaced rather than silently lost.
@@ -1243,10 +1248,12 @@ pub struct ListMandatesOutput {
     /// Every standing mandate issued this runtime lifetime, revoked ones included (an operator
     /// surface shows what was killed, it does not erase it), sorted by token id.
     pub mandates: Vec<MandateCard>,
-    /// The runtime audit chain's signer key (hex), fetched over the AUTHENTICATED loopback control
-    /// plane — the operator-trust pin for `elastos verify-receipt --signer`. `None` for an
-    /// unsigned/memory-only log. This is the runtime asserting its own key over a channel the
-    /// operator already trusts (the attach secret), NOT a receipt vouching for itself.
+    /// The runtime audit chain's signer key (hex) — the pin the operator passes to
+    /// `elastos verify-receipt --signer`. `None` for an unsigned/memory-only log. Honest bounds:
+    /// this key rides the loopback control plane, whose trust root is the operator's 0600
+    /// coords/attach-secret files — the attach exchange authenticates the CLIENT to the runtime;
+    /// runtime identity rests on that filesystem + loopback assumption, not on a cryptographic
+    /// server credential. It breaks receipt-SELF-pinning; it is not third-party attestation.
     pub signer_public_key_hex: Option<String>,
 }
 
@@ -1254,21 +1261,27 @@ pub struct ListMandatesOutput {
 pub async fn list_standing_grants(
     State(state): State<CapabilityState>,
 ) -> Json<ListMandatesOutput> {
-    let mandates = state
-        .standing_service
-        .list()
-        .into_iter()
-        .map(|env| MandateCard {
-            active: env.is_active(),
+    let mut mandates = Vec::new();
+    for env in state.standing_service.list() {
+        // The card's LIVE bit must consult BOTH kill paths: the envelope flag (standing revoke,
+        // mass revoke_all) AND the manager's individual token-revocation store — a mandate whose
+        // backing token was killed by any other route must never render live. An unparseable id
+        // is fail-closed inactive.
+        let token_dead = match TokenId::from_hex(&env.grant_id) {
+            Ok(id) => state.capability_manager.is_token_revoked(&id).await,
+            Err(_) => true,
+        };
+        mandates.push(MandateCard {
+            active: env.is_active() && !token_dead,
             token_id: env.grant_id,
             capsule: env.capsule,
             resource: env.resource,
             action: env.action,
             methods: env.allowed_methods.into_iter().collect(),
             expires_at: env.expires_at,
-            revoked: env.revoked,
-        })
-        .collect();
+            revoked: env.revoked || token_dead,
+        });
+    }
     Json(ListMandatesOutput {
         mandates,
         signer_public_key_hex: state.capability_manager.audit_log().verifying_key_hex(),
@@ -1592,6 +1605,22 @@ mod tests {
         assert_eq!(
             out.signer_public_key_hex,
             state.capability_manager.audit_log().verifying_key_hex()
+        );
+
+        // Red-team regression: the MASS kill switch (epoch advance) must not leave any card LIVE —
+        // the epoch kills every backing token, and the envelope registry is revoked alongside.
+        let _ = revoke_all_capabilities(
+            State(state.clone()),
+            Extension(Session::new(elastos_runtime::session::SessionType::Shell, None)),
+            Json(RevokeAllInput { reason: "incident".to_string() }),
+        )
+        .await
+        .expect("revoke-all ok");
+        let out = list_standing_grants(State(state)).await.0;
+        assert!(
+            out.mandates.iter().all(|m| !m.active && m.revoked),
+            "after revoke-all, no mandate may render LIVE: {:?}",
+            out.mandates
         );
     }
 

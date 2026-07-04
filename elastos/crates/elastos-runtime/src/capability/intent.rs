@@ -683,14 +683,36 @@ impl StandingGrantStore {
 
     /// Every standing grant ever issued this runtime lifetime (revoked ones INCLUDED, flagged —
     /// an operator surface must show what was killed, not erase it), sorted by `grant_id` for a
-    /// stable listing. Read-only. A poisoned lock degrades to empty (absent), never fabricated.
+    /// stable listing. Read-only. A poisoned lock recovers via `into_inner()` exactly like the
+    /// writes do (every write is one statement, so the map is structurally intact): the operator
+    /// surface must NEVER render a fabricated-clean "no mandates" over a map that has entries.
     pub fn list(&self) -> Vec<StandingGrantEnvelope> {
-        let Ok(grants) = self.grants.read() else {
-            return Vec::new();
+        let grants = match self.grants.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
         };
         let mut all: Vec<StandingGrantEnvelope> = grants.values().cloned().collect();
         all.sort_by(|a, b| a.grant_id.cmp(&b.grant_id));
         all
+    }
+
+    /// Revoke EVERY standing grant — the envelope side of the mass kill switch. Called alongside
+    /// an epoch advance (`revoke_all`), which kills every backing token but knows nothing of the
+    /// envelope registry; without this, an epoch-dead mandate would keep rendering (and, once
+    /// dispatch is wired, dispatching) as LIVE. Returns how many live envelopes this call killed.
+    pub fn revoke_all(&self) -> usize {
+        let mut grants = match self.grants.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut killed = 0;
+        for env in grants.values_mut() {
+            if !env.revoked {
+                env.revoked = true;
+                killed += 1;
+            }
+        }
+        killed
     }
 
     /// True iff an ACTIVE (issued, not revoked, not expired) grant exists for `grant_id`. A read-only
@@ -813,6 +835,12 @@ impl StandingGrantService {
     /// id — the operator's mandate list. Read-only; see [`StandingGrantStore::list`].
     pub fn list(&self) -> Vec<StandingGrantEnvelope> {
         self.store.list()
+    }
+
+    /// Revoke EVERY standing grant (the envelope side of the mass kill switch — pair with the
+    /// manager's epoch advance). Returns how many live envelopes were killed by this call.
+    pub fn revoke_all(&self) -> usize {
+        self.store.revoke_all()
     }
 
     /// Dispatch a self-declared agent act under its standing grant, fail-closed — the full loop
