@@ -22,6 +22,7 @@ mod share_cmd;
 mod shares_cmd;
 mod site_cmd;
 mod trust_cmd;
+mod verify_receipt_cmd;
 mod webspace_cmd;
 
 use clap::{Parser, Subcommand};
@@ -160,6 +161,22 @@ enum Commands {
         /// Provenance CID (if not in local catalog)
         #[arg(long, requires = "cid")]
         provenance: Option<String>,
+    },
+
+    /// Independently verify a portable mandate receipt (JSON) off-box
+    #[command(name = "verify-receipt")]
+    VerifyReceipt {
+        /// Path to the mandate receipt `.json` file
+        path: PathBuf,
+
+        /// Pin the expected issuer: a `did:key:z...` or the 64-char hex of its ed25519 key.
+        /// Required to reach an AUTHENTIC verdict (exit 0); without it the check is structural only.
+        #[arg(long)]
+        signer: Option<String>,
+
+        /// Emit the full verdict as JSON instead of a human-readable report
+        #[arg(long)]
+        json: bool,
     },
 
     /// Publish a capsule through the content availability provider
@@ -1295,6 +1312,10 @@ async fn main() -> anyhow::Result<()> {
             provenance,
         } => {
             return trust_cmd::run_verify(path, public_key, cid, provenance).await;
+        }
+
+        Commands::VerifyReceipt { path, signer, json } => {
+            return verify_receipt_cmd::run_verify_receipt(path, signer, json);
         }
 
         Commands::Publish { path } => {
