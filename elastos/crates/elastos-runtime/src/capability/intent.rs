@@ -783,6 +783,17 @@ pub struct StandingGrantStore {
     /// dispatch, so it is refused as a replay — clock-direction-independent, unlike the freshness
     /// window alone. Monotonic non-decreasing; guarded by the `seen_intents` write lock.
     max_evicted_declared_at: std::sync::atomic::AtomicU64,
+    /// Per-mandate dispatch RATE budget (G-M7): `grant_id → (window_start_secs, count_in_window)`.
+    /// Each mandate may perform at most [`MANDATE_DISPATCH_LIMIT`] acts per
+    /// [`MANDATE_DISPATCH_WINDOW_SECS`], so a mandate-holding agent cannot flood dispatch (each act
+    /// otherwise costs a durable snapshot write + fsync). In-memory: a restart refills the budget,
+    /// which is the safe/generous direction (never a spurious denial), and the agent cannot restart
+    /// the runtime. Bounded two ways: elapsed windows are pruned when the map grows, AND a HARD CAP
+    /// (`DISPATCH_RATE_SOFT_CAP`) refuses new keys once reached — so even a same-window flood of
+    /// distinct grant_ids cannot grow it without bound. In the dispatch path the handler also refuses
+    /// unknown grant_ids before this is ever reached, so only real, operator-issued grant_ids land
+    /// here at all.
+    dispatch_rate: RwLock<HashMap<String, (u64, u32)>>,
     /// Snapshot file for a PERSISTENT registry (`None` = memory-only). Every mutation writes the
     /// full snapshot atomically (temp + fsync + rename, mirroring `CapabilityStore`) BEFORE the
     /// change becomes visible — on a write failure the mutation is rolled back and the error
@@ -790,6 +801,17 @@ pub struct StandingGrantStore {
     /// revoke, no crash-forgotten replay guard).
     storage_path: Option<std::path::PathBuf>,
 }
+
+/// The most dispatch acts a single mandate may perform per [`MANDATE_DISPATCH_WINDOW_SECS`] — the
+/// per-mandate rate budget (G-M7). Generous for a real agent (1/sec average, burstable), but bounds
+/// a flood: an agent cannot make its mandate perform unbounded acts (each act is a durable write).
+pub const MANDATE_DISPATCH_LIMIT: u32 = 60;
+/// The rolling window (seconds) the per-mandate dispatch budget is measured over.
+pub const MANDATE_DISPATCH_WINDOW_SECS: u64 = 60;
+/// The dispatch-rate map's bound. When it exceeds this, elapsed windows are pruned; if it is still
+/// at/over the cap a NEW key is then refused (hard cap) — so an attacker spamming DISTINCT (even
+/// non-existent) grant_ids cannot grow it without bound, even within a single window.
+const DISPATCH_RATE_SOFT_CAP: usize = 4096;
 
 /// The on-disk snapshot of the standing-grant registry, version-pinned. Same-disk custody caveat
 /// as the audit log's head-anchor: this defends against loss/corruption (strict parse, fail-closed
@@ -1071,6 +1093,63 @@ impl StandingGrantStore {
         all
     }
 
+    /// Record a dispatch against the per-mandate RATE budget (G-M7): returns `true` iff this
+    /// mandate is WITHIN [`MANDATE_DISPATCH_LIMIT`] acts for the current
+    /// [`MANDATE_DISPATCH_WINDOW_SECS`] window (and counts this attempt), `false` if it is over
+    /// budget. The dispatcher calls this AFTER authenticity + freshness (so only well-formed fresh
+    /// intents count) and BEFORE the replay guard's durable write, so a flood is rejected before it
+    /// costs an fsync. In-memory + bounded: a stale window resets on access, the map is pruned of
+    /// elapsed windows when it grows past the soft cap, and a HARD CAP then refuses NEW keys while at
+    /// capacity — so even a same-window flood of distinct (even fake) grant_ids cannot grow it
+    /// without bound (an existing key is always still counted, so a real mandate is never denied by
+    /// the cap). A poisoned lock recovers via `into_inner()` (fail-safe: a recovered map is
+    /// structurally intact).
+    pub fn record_dispatch_within_budget(&self, grant_id: &str, now_secs: u64) -> bool {
+        let mut rate = match self.dispatch_rate.write() {
+            Ok(r) => r,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // Bound memory in two steps. First drop windows that have FULLY ELAPSED (they would reset
+        // on next access anyway) — this reclaims across-window entries.
+        if rate.len() > DISPATCH_RATE_SOFT_CAP {
+            rate.retain(|_, (window_start, _)| {
+                now_secs < window_start.saturating_add(MANDATE_DISPATCH_WINDOW_SECS)
+            });
+            // Then a HARD CAP for the within-a-single-window case the prune above cannot help:
+            // inside one window every entry is non-stale, so `retain` reclaims nothing and a
+            // distinct-grant_id flood would otherwise grow the map without bound. Once we are STILL
+            // at/over the cap after pruning, refuse a NEW (unseen) grant_id — return false, i.e.
+            // over-budget → 429. An EXISTING grant_id keeps its entry and is counted normally, so a
+            // real mandate is never denied by the cap; only never-before-seen keys are shed. The
+            // map is thus hard-bounded at ~DISPATCH_RATE_SOFT_CAP. Fail-closed. (In the dispatch
+            // path the handler's grant-existence check already ensures only real grant_ids arrive,
+            // so this is belt-and-suspenders that also makes this method bounded when called alone.)
+            if rate.len() >= DISPATCH_RATE_SOFT_CAP && !rate.contains_key(grant_id) {
+                return false;
+            }
+        }
+        let entry = rate.entry(grant_id.to_string()).or_insert((now_secs, 0));
+        if now_secs >= entry.0.saturating_add(MANDATE_DISPATCH_WINDOW_SECS) {
+            // A new window — reset and count this act.
+            *entry = (now_secs, 1);
+            return true;
+        }
+        if entry.1 < MANDATE_DISPATCH_LIMIT {
+            entry.1 += 1;
+            return true;
+        }
+        false
+    }
+
+    /// Whether ANY dispatch-rate entry exists. Test observability: proves a distinct-fake-grant_id
+    /// flood created no rate entries (the handler's existence check ran before the budget).
+    pub fn any_dispatch_rate_entries(&self) -> bool {
+        match self.dispatch_rate.read() {
+            Ok(r) => !r.is_empty(),
+            Err(poisoned) => !poisoned.into_inner().is_empty(),
+        }
+    }
+
     /// Register an intent id as dispatched, returning `true` iff it was FRESH. The replay guard:
     /// the caller acts only on `Ok(true)`, so a re-POSTed signed declaration is refused. The caller
     /// MUST have passed [`check_intent_freshness`] first (this stores `declared_at` and COMPACTS the
@@ -1308,6 +1387,19 @@ impl StandingGrantService {
     /// an operator/dispatch surface uses it to consult liveness the pure gate cannot re-derive.
     pub fn get(&self, grant_id: &str) -> Option<StandingGrantEnvelope> {
         self.store.get(grant_id)
+    }
+
+    /// Record a dispatch against the mandate's per-mandate RATE budget; `true` iff within budget.
+    /// See [`StandingGrantStore::record_dispatch_within_budget`]. `false` ⇒ the caller must REFUSE
+    /// the act (429). Call AFTER freshness, BEFORE the replay guard's durable write.
+    pub fn record_dispatch_within_budget(&self, grant_id: &str, now_secs: u64) -> bool {
+        self.store.record_dispatch_within_budget(grant_id, now_secs)
+    }
+
+    /// Whether any dispatch-rate entry exists (test observability). See
+    /// [`StandingGrantStore::any_dispatch_rate_entries`].
+    pub fn any_dispatch_rate_entries(&self) -> bool {
+        self.store.any_dispatch_rate_entries()
     }
 
     /// Register an intent id as dispatched; `Ok(true)` iff FRESH. The replay guard — see
@@ -2622,6 +2714,66 @@ mod tests {
             "fresh intents still register after reload"
         );
         assert_eq!(store.list().len(), 3, "every issued mandate is still listed");
+    }
+
+    /// The per-mandate RATE budget (G-M7): a mandate may perform up to the limit per window, then
+    /// is refused; a NEW window resets it; and the budget is PER grant_id (one mandate's flood does
+    /// not spend another's).
+    #[test]
+    fn dispatch_rate_budget_bounds_a_mandate_then_resets_next_window() {
+        let store = StandingGrantStore::new();
+        let t0 = 1_000_000u64;
+        // Up to the limit is allowed within the window...
+        for i in 0..MANDATE_DISPATCH_LIMIT {
+            assert!(
+                store.record_dispatch_within_budget("g1", t0),
+                "act {i} within budget"
+            );
+        }
+        // ...the next act in the same window is refused.
+        assert!(
+            !store.record_dispatch_within_budget("g1", t0),
+            "over budget in the same window"
+        );
+        // A DIFFERENT mandate has its own budget — not spent by g1's flood.
+        assert!(store.record_dispatch_within_budget("g2", t0), "g2 has its own budget");
+        // A new window (past the window end) resets g1.
+        let t1 = t0 + MANDATE_DISPATCH_WINDOW_SECS;
+        assert!(
+            store.record_dispatch_within_budget("g1", t1),
+            "the budget resets in the next window"
+        );
+    }
+
+    /// The rate map is BOUNDED even against a SAME-WINDOW flood of distinct grant_ids (the attack
+    /// the council flagged: the across-window prune reclaims nothing inside one window, so a hard
+    /// cap must refuse new keys at capacity). This is the ratchet reproducing that exact failure —
+    /// every id shares one window `t0`, so nothing is ever stale, yet the map must stay bounded.
+    #[test]
+    fn dispatch_rate_map_is_bounded_against_distinct_grant_spam() {
+        let store = StandingGrantStore::new();
+        let t0 = 1_000u64;
+        // Flood distinct grant_ids ALL WITHIN ONE WINDOW — none ever goes stale during the flood,
+        // so the across-window prune cannot help; only the hard cap can bound this.
+        for i in 0..(DISPATCH_RATE_SOFT_CAP * 4) {
+            store.record_dispatch_within_budget(&format!("flood-{i}"), t0);
+        }
+        let n = store.dispatch_rate.read().map(|m| m.len()).unwrap_or(usize::MAX);
+        assert!(
+            n <= DISPATCH_RATE_SOFT_CAP + 1,
+            "same-window distinct-grant_id flood is hard-capped at ~{DISPATCH_RATE_SOFT_CAP}, got {n}"
+        );
+        // The hard cap must NOT deny an ALREADY-SEEN grant_id (a real mandate keeps acting): a key
+        // that already has an entry is still counted even while the map is at capacity.
+        assert!(
+            store.record_dispatch_within_budget("flood-0", t0),
+            "an existing grant_id is still counted at capacity — a real mandate is never shed"
+        );
+        // A brand-new key at capacity IS refused (fail-closed memory bound).
+        assert!(
+            !store.record_dispatch_within_budget("brand-new-at-capacity", t0),
+            "a new grant_id is refused while the map is at its hard cap"
+        );
     }
 
     /// The freshness window (G-M7): a declaration expires (too old) and a future-dated one is

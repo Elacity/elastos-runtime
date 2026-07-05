@@ -1506,6 +1506,52 @@ pub async fn dispatch_standing_intent(
             format!("intent declaration outside the freshness window: {}", reason.as_str()),
         ));
     }
+    // GRANT EXISTENCE (G-M7, Sprint 21 council fix): the intent names a standing grant. Resolve it
+    // in memory HERE — after authenticity + freshness, but BEFORE the rate budget AND the durable
+    // replay write. An unparseable or UNKNOWN grant_id is refused cheaply now, so a flood of
+    // distinct FAKE grant_ids (each self-signed + fresh; `standing_grant_id` is attacker-chosen and
+    // is only bound to a real mandate LATER, at the gate) can neither (a) reach the durable
+    // replay-guard fsync nor (b) create a rate-map entry. This is what actually makes the rate
+    // budget bound the fsync flood and keeps the rate map bounded: only REAL, operator-issued
+    // grant_ids — a registry-bounded set — are ever counted or durably recorded. A never-issued
+    // grant yields the SAME `denied`/`no_standing_grant` verdict the gate would, without paying for
+    // it. (Real-but-revoked grants stay in the registry, so they pass here and are denied with the
+    // true `revoked` reason downstream.)
+    let grant_exists = TokenId::from_hex(intent.standing_grant_id.trim())
+        .ok()
+        .map(|t| state.standing_service.get(&t.to_string()).is_some())
+        .unwrap_or(false);
+    if !grant_exists {
+        return Ok(Json(DispatchIntentOutput {
+            outcome: "denied".to_string(),
+            reason: Some(
+                elastos_runtime::capability::EnvelopeDenial::NoGrant
+                    .as_str()
+                    .to_string(),
+            ),
+            reconciliation: None,
+        }));
+    }
+    // RATE BUDGET (G-M7): each mandate may perform at most MANDATE_DISPATCH_LIMIT acts per window.
+    // Checked AFTER authenticity + freshness + grant-existence (only well-formed fresh intents
+    // naming a REAL mandate count) and BEFORE the replay guard's durable write, so a mandate-holding
+    // agent flooding distinct intents is refused (429) before it costs an fsync + registry growth —
+    // bounding the durable-write flood the replay guard's compaction alone did not (Sprint 19
+    // bounded the SET; this bounds the RATE).
+    if !state
+        .standing_service
+        .record_dispatch_within_budget(&intent.standing_grant_id, now_secs)
+    {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "mandate {} exceeded its dispatch rate budget ({} acts per {}s)",
+                intent.standing_grant_id,
+                elastos_runtime::capability::MANDATE_DISPATCH_LIMIT,
+                elastos_runtime::capability::MANDATE_DISPATCH_WINDOW_SECS
+            ),
+        ));
+    }
     // Replay guard (G-M5): register the intent id BEFORE anything acts — durably, so the guard
     // survives restart. A duplicate is refused with no record and no act. Register only AFTER
     // authenticity + freshness (above) so a forged or stale blob cannot burn a future-legitimate
@@ -2191,6 +2237,117 @@ mod tests {
                 action: intent.action.clone(),
             }
         }
+    }
+
+    /// RATE BUDGET (G-M7, Sprint 21): a mandate flooding distinct fresh intents is refused with 429
+    /// once it exceeds its per-window budget — BEFORE the replay-guard durable write, so the flood
+    /// costs no fsync. The refusal does not burn the intent id (a later, in-budget dispatch of a
+    /// fresh id still works).
+    #[tokio::test]
+    async fn dispatch_over_rate_budget_is_refused_429() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state_with_durable_audit(dir.path());
+        state.intent_executor = std::sync::Arc::new(FaithfulExecutor);
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: "elastos://pay/vendor".to_string(),
+                action: "write".to_string(),
+                methods: vec!["runtime.echo".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        // Spend the whole per-window budget on distinct fresh intents (all performed).
+        let limit = elastos_runtime::capability::MANDATE_DISPATCH_LIMIT;
+        for i in 0..limit {
+            let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+            let intent = IntentDeclarationV1::issue(
+                &sk,
+                sk.verifying_key().to_bytes(),
+                &format!("rate-{i}"),
+                "vm-agent",
+                "runtime.echo",
+                "cafe01",
+                "elastos://pay/vendor",
+                "write",
+                &out.token_id,
+            );
+            let r = dispatch_standing_intent(State(state.clone()), Json(intent))
+                .await
+                .expect("within budget")
+                .0;
+            assert_eq!(r.outcome, "performed", "act {i} within budget performs");
+        }
+        // The next fresh intent under the SAME mandate is rate-refused (429).
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let over = IntentDeclarationV1::issue(
+            &sk,
+            sk.verifying_key().to_bytes(),
+            "rate-over",
+            "vm-agent",
+            "runtime.echo",
+            "cafe01",
+            "elastos://pay/vendor",
+            "write",
+            &out.token_id,
+        );
+        let refused = dispatch_standing_intent(State(state.clone()), Json(over)).await;
+        assert!(
+            matches!(refused, Err((StatusCode::TOO_MANY_REQUESTS, _))),
+            "over-budget dispatch is refused 429"
+        );
+    }
+
+    /// Council Sprint 21 ratchet (guardian F1 / red-team F1+F2): a flood of DISTINCT, never-issued
+    /// grant_ids must be turned away BEFORE it can create a rate-map entry or reach the durable
+    /// replay-guard write. `standing_grant_id` is attacker-chosen (self-signed), so without the
+    /// grant-existence check each fake id would pass the per-grant budget as a "new key" and still
+    /// pay the fsync. This reproduces that exact failure: many fake grant_ids are dispatched, each
+    /// must come back `denied`/`no_standing_grant`, and the rate map must stay EMPTY (no fake key
+    /// ever counted → no durable cost was paid for them).
+    #[tokio::test]
+    async fn distinct_fake_grant_ids_are_denied_before_any_rate_entry_or_durable_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state_with_durable_audit(dir.path());
+        state.intent_executor = std::sync::Arc::new(FaithfulExecutor);
+        for i in 0..200u32 {
+            let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+            // A syntactically-valid but NEVER-ISSUED grant_id (distinct per request).
+            let fake_grant = format!("{:064x}", 0xF1A0_0000_u64 + i as u64);
+            let intent = IntentDeclarationV1::issue(
+                &sk,
+                sk.verifying_key().to_bytes(),
+                &format!("fake-intent-{i}"),
+                "vm-agent",
+                "runtime.echo",
+                "cafe01",
+                "elastos://pay/vendor",
+                "write",
+                &fake_grant,
+            );
+            let r = dispatch_standing_intent(State(state.clone()), Json(intent))
+                .await
+                .expect("a fake grant is a `denied` verdict, not an error")
+                .0;
+            assert_eq!(r.outcome, "denied", "fake grant {i} is denied");
+            assert_eq!(
+                r.reason.as_deref(),
+                Some("no_standing_grant"),
+                "denied with the honest reason, before the gate"
+            );
+        }
+        // The KEY assertion: no fake grant_id ever created a rate entry — the existence check ran
+        // before the budget, so the flood cost neither a rate entry nor a durable write.
+        assert!(
+            !state.standing_service.any_dispatch_rate_entries(),
+            "a distinct-fake-grant_id flood created NO rate entries (and paid no durable write)"
+        );
     }
 
     /// The ACT leg closes G-M2: a REAL executor performs a dispatched act (the built-in

@@ -381,11 +381,40 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   only via the Home-shell-gated `home_launch` — reaches it; CSRF is closed: header-only token, no
   permissive gateway CORS; the AUD-5 guard is exact and shared). Residuals, all reachable only WITH
   a genuine shell token (the trusted operator, G-M3):
-  (a) **No rate limit + monotonic durable growth (red-team F1).** The gateway mutation routes carry
-  no `rate_limit_middleware` (that layer is API-server-only), and `standing_grants.json` never
-  prunes revoked/expired grants — a shell-token holder can flood issue and grow the file without a
-  ceiling. FIX (deferred): a per-token limiter on the gateway mutation routes + a live+revoked cap
-  / retention prune on the store.
+  (a) **Rate/flood bounding — DISPATCH now rate-budgeted + existence-gated (Sprint 21); mint
+  retention still open.** The sharpest, agent-facing half is CLOSED: each mandate now has a
+  per-mandate DISPATCH RATE budget (`MANDATE_DISPATCH_LIMIT` acts per `MANDATE_DISPATCH_WINDOW_SECS`,
+  default 60/60s). **Council fix (this is what makes the claim true):** the `standing_grant_id` is
+  attacker-chosen (self-signed into the declaration; bound to a real mandate only later, at the
+  gate), so a per-`grant_id` budget alone would NOT stop a flood of DISTINCT fake grant_ids — each
+  would pass the budget as a new key and still pay the durable replay-guard fsync, which runs before
+  the grant is ever looked up (guardian F1 / red-team F1+F2, both CONFIRMED). The handler therefore
+  now resolves grant EXISTENCE in memory FIRST — after authenticity + freshness, before the rate
+  budget and before the durable write — and refuses an unknown grant_id cheaply (`denied` /
+  `no_standing_grant`, no fsync, no rate entry). Only real, operator-issued grant_ids (a
+  registry-bounded set) are ever counted or durably recorded, so: a flooder rotating fake grant_ids
+  is turned away before any durable cost, and a mandate-holder flooding its OWN real grant is refused
+  `429` before the fsync once over budget (Sprint 19 bounded the replay SET; this bounds the RATE).
+  The rate map is HARD-CAPPED (`DISPATCH_RATE_SOFT_CAP`): elapsed windows are pruned, and at capacity
+  a new key is refused — so even a same-window distinct-key flood cannot grow it (an already-seen key
+  is always still counted, so a real mandate is never shed). The limiter is in-memory (a restart
+  refills the budget — safe/generous, and the agent cannot restart the runtime). Ratchets:
+  `intent::tests::{dispatch_rate_budget_bounds_a_mandate_then_resets_next_window,
+  dispatch_rate_map_is_bounded_against_distinct_grant_spam}` +
+  `capability::tests::dispatch_over_rate_budget_is_refused_429`. RESIDUALS (operator-gated today,
+  matter once dispatch is agent-facing): (i) **charge-on-attempt** — the budget is spent by a
+  well-formed fresh intent naming a REAL grant even if the act is later denied (revoked / out of
+  envelope), so someone who can name a victim's real grant_id could burn its 60/window and lock the
+  legit agent out (red-team F5); the fix is to key the limiter on the authenticated caller identity /
+  charge only an AUTHORIZED act — deferred with the agent-facing delegation that doesn't exist yet.
+  (ii) **fixed-window boundary** allows up to ~2× the limit across a window edge (60 at the tail of
+  W + 60 at the head of W+1); acceptable for a flood bound (still O(1)/window, ~1/s average), noted
+  not silent. STILL OPEN (operator-gated, lower priority): the gateway ISSUE/REVOKE routes carry no
+  request-rate limiter, and `standing_grants.json` never prunes revoked/expired grants — a
+  shell-token holder (the trusted operator) can still flood issue and grow the file. FIX (deferred):
+  a per-token limiter on the gateway mutation routes + a live+revoked cap / retention prune on the
+  store. Note: per-mandate-CONFIGURABLE dispatch budgets (a mandate issued with its own rate,
+  alongside scope/expiry/agent) are the natural next step.
   (b) **Unbound + arbitrary-`capsule` is now a one-click grant (red-team F2; the UI default is
   "unbound").** `capsule` is a free string (unvalidated) and an unbound mandate (`agent_pubkey`
   None) enforces capsule-STRING-only — any self-signed key declaring that string acts under it
