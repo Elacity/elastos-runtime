@@ -1461,12 +1461,31 @@ pub async fn dispatch_standing_intent(
             "intent declaration signature did not verify".to_string(),
         ));
     }
+    // FRESHNESS WINDOW (G-M7): a signed declaration EXPIRES — its `declared_at` must sit within
+    // `[now - MAX_INTENT_AGE, now + MAX_CLOCK_SKEW]`. This bounds how long a captured intent can be
+    // replayed AND lets the replay guard forget anything older than the window (so its seen-set is
+    // bounded, not monotonic). Checked AFTER authenticity (a forged declaration is rejected first)
+    // and BEFORE the replay guard registers the id, so a stale/future intent never burns an id.
+    let now_secs = elastos_common::SecureTimestamp::now().unix_secs;
+    if let Err(reason) = elastos_runtime::capability::check_intent_freshness(
+        intent.declared_at.unix_secs,
+        now_secs,
+    ) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("intent declaration outside the freshness window: {}", reason.as_str()),
+        ));
+    }
     // Replay guard (G-M5): register the intent id BEFORE anything acts — durably, so the guard
     // survives restart. A duplicate is refused with no record and no act. Register only AFTER
-    // authenticity (above) so a forged blob cannot burn a future-legitimate id. A guard that
-    // cannot be durably recorded REFUSES the act (fail-closed) with its true reason — an intent
-    // that acts without a surviving replay record could act again after a reboot.
-    match state.standing_service.record_fresh_intent(&intent.intent_id) {
+    // authenticity + freshness (above) so a forged or stale blob cannot burn a future-legitimate
+    // id. A guard that cannot be durably recorded REFUSES the act (fail-closed) with its true
+    // reason — an intent that acts without a surviving replay record could act again after a reboot.
+    match state.standing_service.record_fresh_intent(
+        &intent.intent_id,
+        intent.declared_at.unix_secs,
+        now_secs,
+    ) {
         Ok(true) => {}
         Ok(false) => {
             return Err((
@@ -2210,6 +2229,68 @@ mod tests {
         let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();
         let verdict = elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer));
         assert!(verdict.authenticated, "the receipt verifies off-box: {verdict:?}");
+    }
+
+    /// FRESHNESS WINDOW (G-M7): a stale or future-dated declaration is refused at dispatch BEFORE
+    /// the replay guard registers it (so it never burns an id) and BEFORE any act — a captured
+    /// declaration cannot be replayed indefinitely, and a fresh one under the same mandate still acts.
+    #[tokio::test]
+    async fn dispatch_rejects_stale_and_future_dated_intents() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state_with_durable_audit(dir.path());
+        state.intent_executor = std::sync::Arc::new(FaithfulExecutor);
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: "elastos://pay/vendor".to_string(),
+                action: "write".to_string(),
+                methods: vec!["runtime.echo".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let now = elastos_common::SecureTimestamp::now().unix_secs;
+        let at = |secs: u64, id: &str| {
+            let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+            IntentDeclarationV1::issue_at(
+                &sk,
+                sk.verifying_key().to_bytes(),
+                id,
+                "vm-agent",
+                "runtime.echo",
+                "cafe01",
+                "elastos://pay/vendor",
+                "write",
+                &out.token_id,
+                elastos_common::SecureTimestamp::at(secs),
+            )
+        };
+        // Stale: declared well past the age window → 400, refused.
+        let stale = dispatch_standing_intent(
+            State(state.clone()),
+            Json(at(now - elastos_runtime::capability::MAX_INTENT_AGE_SECS - 60, "stale-1")),
+        )
+        .await;
+        assert!(matches!(stale, Err((StatusCode::BAD_REQUEST, _))), "stale intent refused");
+        // Future-dated beyond skew → 400, refused.
+        let future = dispatch_standing_intent(
+            State(state.clone()),
+            Json(at(now + elastos_runtime::capability::MAX_CLOCK_SKEW_SECS + 60, "future-1")),
+        )
+        .await;
+        assert!(matches!(future, Err((StatusCode::BAD_REQUEST, _))), "future intent refused");
+        // The refused ids never burned: a FRESH intent reusing "stale-1" still acts (proof the
+        // freshness check runs BEFORE the replay guard).
+        let fresh = dispatch_standing_intent(State(state.clone()), Json(at(now, "stale-1")))
+            .await
+            .expect("fresh dispatch ok")
+            .0;
+        assert_eq!(fresh.outcome, "performed", "a fresh intent reusing the id still acts");
     }
 
     /// THE SECOND SIDE-EFFECTING AFFORDANCE, full loop (Sprint 17): grant a `write` mandate for one

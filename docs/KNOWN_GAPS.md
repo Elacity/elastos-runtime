@@ -128,13 +128,37 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   mandate — serde defaults missing `Option`s to `None`) is inside that caveat; making well-formed
   edits detectable needs a keyed MAC (roadmap, same class as head-anchor co-signing). The
   carrier_bridge's own registry stays memory-only by design (separate instance; two services over
-  one path would clobber snapshots). Residual (small): no `declared_at` freshness window on
-  intents, and the seen-set grows monotonically (O(n) snapshot rewrite per dispatch, shell-only
-  reachable) — add a windowed/compacting guard before exposing dispatch beyond the single trusted
-  operator.
-  Ratchets: `intent::tests::{persistent_store_survives_reopen_live_dead_and_replay,
-  persistent_store_refuses_corrupt_state_at_boot, persist_failure_rolls_back_and_surfaces}` +
-  `capability::tests::mandates_survive_restart_over_the_handlers`.
+  one path would clobber snapshots). **G-M5 residual CLOSED (Sprint 19) — the replay guard is now
+  time-WINDOWED and BOUNDED, not monotonic.** A `declared_at` freshness window
+  (`check_intent_freshness`: `[now - MAX_INTENT_AGE_SECS(3600), now + MAX_CLOCK_SKEW_SECS(300)]`) is
+  enforced at dispatch AFTER authenticity and BEFORE the replay guard, so a stale or future-dated
+  declaration is refused (400) without burning an id — a captured intent EXPIRES rather than being
+  replayable indefinitely. The seen-set now stores each id's `declared_at` and self-compacts against
+  the retention window on every write (dropping ids that can no longer pass freshness, so forgetting
+  opens no replay), making it bounded to ~one window of intents instead of growing forever. The
+  snapshot moved to v2 (`SeenIntentRecord{id, declared_at}`) with a fail-closed-preserving v1
+  MIGRATION (legacy bare ids re-stamped at load time so they age out one full window — never a
+  replay window; a v1 file is upgraded, never refused). BACKWARD-CLOCK replay hole CLOSED by an
+  ANTI-READMIT WATERMARK (red-team Finding 1, folded before ship): compaction forgets aged ids to
+  stay bounded, which alone would let a captured intent be REPLAYED after a two-step clock move
+  (evicted while the clock was high, then re-POSTed after a backward step back into its freshness
+  window). The store now keeps a persisted `max_evicted_declared_at` — the highest `declared_at`
+  ever compacted out — and refuses any intent with `declared_at <= max_evicted` as a replay. That is
+  monotonic non-decreasing and clock-DIRECTION-INDEPENDENT, so an evicted id can never be readmitted
+  regardless of NTP steps / VM resume / manual clock changes, and it survives restart (persisted in
+  the v2 snapshot). Residual CLOCK-TRUST caveat (guardian S2): the freshness window still ages
+  against the host `SystemTime::now()` (same custody class as the same-disk snapshot caveat), but a
+  bad clock now fails CLOSED in BOTH directions — the watermark stops replay under ANY clock, and a
+  backward jump can at worst spuriously REJECT valid intents (availability, never a double-act). The
+  `RETENTION = age + skew` margin remains load-bearing under a monotonic clock; the watermark is the
+  belt to that suspender under a non-monotonic one. Ratchets:
+  `intent::tests::{persistent_store_survives_reopen_live_dead_and_replay,
+  persistent_store_refuses_corrupt_state_at_boot, persist_failure_rolls_back_and_surfaces,
+  freshness_window_rejects_stale_and_future_dated,
+  seen_set_compacts_aged_ids_but_still_catches_in_window_replay,
+  v1_snapshot_migrates_preserving_mandates_and_replay_guard, backward_clock_step_cannot_readmit_an_evicted_intent, evicted_watermark_persists_across_restart, persist_failure_keeps_the_watermark_so_an_evicted_id_cannot_replay}` +
+  `capability::tests::{mandates_survive_restart_over_the_handlers,
+  dispatch_rejects_stale_and_future_dated_intents}`.
 - **G-M6 — the reconciliation seam is closed; ONE real affordance wired (honest).** Dispatch
   invokes a real [`IntentExecutor`] (`intent_executor.rs`) INSIDE the gate's act closure (so a
   denied/revoked intent never executes) and mints the affordance receipt from what the executor

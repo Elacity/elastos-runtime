@@ -19,7 +19,7 @@
 //! intent is within the authorized envelope, and a tamper-evident record of declared vs
 //! done — NOT the correctness/wisdom of the act.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -111,6 +111,36 @@ impl IntentDeclarationV1 {
         action: &str,
         standing_grant_id: &str,
     ) -> Self {
+        Self::issue_at(
+            signing_key,
+            signer_pubkey,
+            intent_id,
+            capsule,
+            method_id,
+            input_hash,
+            resource,
+            action,
+            standing_grant_id,
+            SecureTimestamp::now(),
+        )
+    }
+
+    /// As [`issue`](Self::issue) but with an explicit `declared_at` — the signature covers it, so a
+    /// stale/future-dated declaration is authentic AND caught by [`check_intent_freshness`] (rather
+    /// than looking like a forgery). The freshness-window paths need this to be exercised.
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_at(
+        signing_key: &SigningKey,
+        signer_pubkey: [u8; 32],
+        intent_id: &str,
+        capsule: &str,
+        method_id: &str,
+        input_hash: &str,
+        resource: &str,
+        action: &str,
+        standing_grant_id: &str,
+        declared_at: SecureTimestamp,
+    ) -> Self {
         let mut intent = Self {
             schema: INTENT_DECLARATION_SCHEMA_V1.to_string(),
             intent_id: intent_id.to_string(),
@@ -120,7 +150,7 @@ impl IntentDeclarationV1 {
             resource: resource.to_string(),
             action: action.to_string(),
             standing_grant_id: standing_grant_id.to_string(),
-            declared_at: SecureTimestamp::now(),
+            declared_at,
             signer: hex::encode(signer_pubkey),
             signature: String::new(),
         };
@@ -670,6 +700,57 @@ where
 // CapabilityManager owns token revocation. Kept deliberately small and fail-closed so an
 // agent can only ever run under a grant that was issued and is still live.
 
+/// The oldest a dispatched intent's `declared_at` may be and still act — a captured signed
+/// declaration EXPIRES after this, so it cannot be replayed indefinitely, and the replay guard
+/// only has to remember intents this recent (bounding its size; G-M7). NOTE (clock trust): the
+/// freshness window + compaction trust the host `SystemTime::now()` — the same custody class as the
+/// same-disk snapshot caveat. A bad clock fails CLOSED (rejects, never over-admits): a backward
+/// jump can spuriously reject valid intents, a forward jump compacts+rejects more, and neither
+/// enables a double-act (the first act's id sits in the seen-set, which a rewind does not compact).
+pub const MAX_INTENT_AGE_SECS: u64 = 3600; // 1 hour
+/// How far in the FUTURE an intent's `declared_at` may be (clock skew) before it is refused — a
+/// far-future date is either a badly-skewed clock or a forgery reaching for a longer replay life.
+pub const MAX_CLOCK_SKEW_SECS: u64 = 300; // 5 minutes
+/// The replay guard keeps a seen id until its `declared_at` ages past the whole acceptance window
+/// (age + skew): while an intent could still pass the freshness check it MUST stay remembered, and
+/// once it can no longer pass, forgetting it opens no replay (freshness rejects any re-POST). This
+/// margin — RETENTION strictly greater than the max accepted age by exactly the skew term — is
+/// load-bearing: it is why a compacted id is ALWAYS freshness-rejected on replay.
+pub const SEEN_INTENT_RETENTION_SECS: u64 = MAX_INTENT_AGE_SECS + MAX_CLOCK_SKEW_SECS;
+
+/// Why a dispatched intent failed the freshness window — the fail-closed reasons the dispatcher
+/// records/returns before consulting the replay guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshnessError {
+    /// `declared_at` is older than [`MAX_INTENT_AGE_SECS`] — the declaration has expired.
+    Stale,
+    /// `declared_at` is more than [`MAX_CLOCK_SKEW_SECS`] in the future.
+    FutureDated,
+}
+
+impl FreshnessError {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FreshnessError::Stale => "intent_declaration_expired",
+            FreshnessError::FutureDated => "intent_declaration_future_dated",
+        }
+    }
+}
+
+/// Fail-closed freshness gate for a dispatched intent: `declared_at` must sit within
+/// `[now - MAX_INTENT_AGE_SECS, now + MAX_CLOCK_SKEW_SECS]`. This bounds how long a captured
+/// declaration can be replayed AND lets the replay guard forget anything older than the window
+/// (G-M7). Pure over its two `u64` unix-second inputs, so it is trivially testable.
+pub fn check_intent_freshness(declared_at_secs: u64, now_secs: u64) -> Result<(), FreshnessError> {
+    if declared_at_secs > now_secs.saturating_add(MAX_CLOCK_SKEW_SECS) {
+        return Err(FreshnessError::FutureDated);
+    }
+    if declared_at_secs < now_secs.saturating_sub(MAX_INTENT_AGE_SECS) {
+        return Err(FreshnessError::Stale);
+    }
+    Ok(())
+}
+
 /// A fail-closed registry of [`StandingGrantEnvelope`]s for unsupervised agent dispatch,
 /// keyed by `grant_id`. Every mutation is a single locked statement, so the map is never
 /// observed half-updated. Fail-closed by construction:
@@ -682,11 +763,21 @@ where
 #[derive(Default)]
 pub struct StandingGrantStore {
     grants: RwLock<HashMap<String, StandingGrantEnvelope>>,
-    /// Intent ids already dispatched — the replay guard. A standing mandate is deliberately
-    /// multi-use (the agent may act repeatedly with DIFFERENT intents), but the SAME signed
-    /// declaration must act at most once, or a captured/retried blob is a double-act. With a
-    /// persistent store the set survives restart (G-M5 closed); memory-only it is per-lifetime.
-    seen_intents: RwLock<HashSet<String>>,
+    /// Intent ids already dispatched → their `declared_at` (unix secs) — the replay guard. A
+    /// standing mandate is deliberately multi-use (the agent may act repeatedly with DIFFERENT
+    /// intents), but the SAME signed declaration must act at most once, or a captured/retried blob
+    /// is a double-act. With a persistent store the map survives restart (G-M5); it is COMPACTED
+    /// against the freshness window on every write, so it is bounded, not monotonic (G-M7). The
+    /// stored `declared_at` is what compaction ages against.
+    seen_intents: RwLock<HashMap<String, u64>>,
+    /// The highest `declared_at` ever COMPACTED out of `seen_intents` — a persisted anti-readmit
+    /// watermark. Compaction forgets aged ids to stay bounded, which (red-team, Sprint 19) would
+    /// otherwise let a captured intent be REPLAYED after a BACKWARD wall-clock step (evicted while
+    /// the clock was high, then re-POSTed after the clock rewinds into its freshness window). An
+    /// intent whose `declared_at <= max_evicted` was, or is shadowed by, an already-forgotten
+    /// dispatch, so it is refused as a replay — clock-direction-independent, unlike the freshness
+    /// window alone. Monotonic non-decreasing; guarded by the `seen_intents` write lock.
+    max_evicted_declared_at: std::sync::atomic::AtomicU64,
     /// Snapshot file for a PERSISTENT registry (`None` = memory-only). Every mutation writes the
     /// full snapshot atomically (temp + fsync + rename, mirroring `CapabilityStore`) BEFORE the
     /// change becomes visible — on a write failure the mutation is rolled back and the error
@@ -704,15 +795,42 @@ pub struct StandingGrantStore {
 /// agent-bound mandate — serde defaults a missing `Option` to `None`) is inside the same-disk
 /// caveat, not caught here. Making well-formed edits detectable needs a keyed MAC (roadmap, same
 /// custody class as the head-anchor co-signing).
+/// One remembered intent id + the `declared_at` (unix secs) compaction ages it against.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SeenIntentRecord {
+    id: String,
+    declared_at: u64,
+}
+
+/// The current (v2) snapshot: the replay guard stores `declared_at` per id so the seen-set can be
+/// compacted against the freshness window (bounded, not monotonic — G-M7).
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StandingGrantSnapshotV2 {
+    version: u32,
+    grants: Vec<StandingGrantEnvelope>,
+    seen_intents: Vec<SeenIntentRecord>,
+    /// The anti-readmit watermark (see [`StandingGrantStore::max_evicted_declared_at`]). `default`
+    /// so a v2 file written before this field existed loads as 0 (no watermark yet — safe, the
+    /// remembered ids still guard replay until they age, at which point the watermark takes over).
+    #[serde(default)]
+    max_evicted_declared_at: u64,
+}
+
+/// The prior (v1) snapshot: seen intents were bare ids with no timestamp. Read for a one-time
+/// MIGRATION (never written): its ids are re-stamped `declared_at = load time` so they age out one
+/// full window after upgrade — conservative (remembered longer, never a replay window).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StandingGrantSnapshotV1 {
+    #[allow(dead_code)]
     version: u32,
     grants: Vec<StandingGrantEnvelope>,
     seen_intents: Vec<String>,
 }
 
-const STANDING_GRANT_SNAPSHOT_VERSION: u32 = 1;
+const STANDING_GRANT_SNAPSHOT_VERSION: u32 = 2;
 
 impl StandingGrantStore {
     pub fn new() -> Self {
@@ -735,33 +853,69 @@ impl StandingGrantStore {
         };
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
-            let snapshot: StandingGrantSnapshotV1 =
-                serde_json::from_str(&content).map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "standing-grant registry at {} is unreadable ({e}); refusing to boot \
-                             over corrupt mandate state — repair or remove the file explicitly",
-                            path.display()
-                        ),
-                    )
-                })?;
-            if snapshot.version != STANDING_GRANT_SNAPSHOT_VERSION {
-                return Err(std::io::Error::new(
+            let invalid = |e: String| {
+                std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
-                        "standing-grant registry at {} has unsupported version {} (expected {})",
-                        path.display(),
-                        snapshot.version,
-                        STANDING_GRANT_SNAPSHOT_VERSION
+                        "standing-grant registry at {} is unreadable ({e}); refusing to boot over \
+                         corrupt mandate state — repair or remove the file explicitly",
+                        path.display()
                     ),
-                ));
-            }
+                )
+            };
+            // Probe the version first so a v1 file can be MIGRATED rather than fail-closed-refused
+            // (refusing would drop every mandate + the replay guard on upgrade). Any other version
+            // is still refused, and structural corruption in EITHER shape is refused.
+            let version = serde_json::from_str::<serde_json::Value>(&content)
+                .ok()
+                .and_then(|v| v.get("version").and_then(|n| n.as_u64()))
+                .ok_or_else(|| invalid("missing/invalid version".to_string()))?;
+            #[allow(clippy::type_complexity)]
+            let (grants_in, seen_in, max_evicted): (
+                Vec<StandingGrantEnvelope>,
+                Vec<(String, u64)>,
+                u64,
+            ) = match version {
+                2 => {
+                    let s: StandingGrantSnapshotV2 =
+                        serde_json::from_str(&content).map_err(|e| invalid(e.to_string()))?;
+                    let seen = s
+                        .seen_intents
+                        .into_iter()
+                        .map(|r| (r.id, r.declared_at))
+                        .collect();
+                    (s.grants, seen, s.max_evicted_declared_at)
+                }
+                1 => {
+                    // MIGRATION: re-stamp legacy bare ids with the load time so they age out one
+                    // full window from now — never a replay window (a re-POST of an old intent is
+                    // caught while remembered, and rejected by freshness/watermark once forgotten).
+                    // No v1 watermark existed; 0 is safe (remembered ids guard until they age, then
+                    // the watermark starts tracking their eviction).
+                    let s: StandingGrantSnapshotV1 =
+                        serde_json::from_str(&content).map_err(|e| invalid(e.to_string()))?;
+                    let now = SecureTimestamp::now().unix_secs;
+                    let seen = s.seen_intents.into_iter().map(|id| (id, now)).collect();
+                    (s.grants, seen, 0)
+                }
+                other => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "standing-grant registry at {} has unsupported version {} \
+                             (expected {})",
+                            path.display(),
+                            other,
+                            STANDING_GRANT_SNAPSHOT_VERSION
+                        ),
+                    ));
+                }
+            };
             let mut grants = match store.grants.write() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            for env in snapshot.grants {
+            for env in grants_in {
                 grants.insert(env.grant_id.clone(), env);
             }
             drop(grants);
@@ -769,7 +923,10 @@ impl StandingGrantStore {
                 Ok(s) => s,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            seen.extend(snapshot.seen_intents);
+            seen.extend(seen_in);
+            store
+                .max_evicted_declared_at
+                .store(max_evicted, std::sync::atomic::Ordering::SeqCst);
         }
         Ok(store)
     }
@@ -779,19 +936,28 @@ impl StandingGrantStore {
     fn persist_locked(
         &self,
         grants: &HashMap<String, StandingGrantEnvelope>,
-        seen: &HashSet<String>,
+        seen: &HashMap<String, u64>,
     ) -> std::io::Result<()> {
         let Some(path) = &self.storage_path else {
             return Ok(());
         };
         let mut grant_list: Vec<StandingGrantEnvelope> = grants.values().cloned().collect();
         grant_list.sort_by(|a, b| a.grant_id.cmp(&b.grant_id));
-        let mut seen_list: Vec<String> = seen.iter().cloned().collect();
-        seen_list.sort();
-        let snapshot = StandingGrantSnapshotV1 {
+        let mut seen_list: Vec<SeenIntentRecord> = seen
+            .iter()
+            .map(|(id, declared_at)| SeenIntentRecord {
+                id: id.clone(),
+                declared_at: *declared_at,
+            })
+            .collect();
+        seen_list.sort_by(|a, b| a.id.cmp(&b.id));
+        let snapshot = StandingGrantSnapshotV2 {
             version: STANDING_GRANT_SNAPSHOT_VERSION,
             grants: grant_list,
             seen_intents: seen_list,
+            max_evicted_declared_at: self
+                .max_evicted_declared_at
+                .load(std::sync::atomic::Ordering::SeqCst),
         };
         let content = serde_json::to_vec(&snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -901,12 +1067,18 @@ impl StandingGrantStore {
     }
 
     /// Register an intent id as dispatched, returning `true` iff it was FRESH. The replay guard:
-    /// the caller acts only on `Ok(true)`, so a re-POSTed signed declaration is refused. With a
-    /// persistent store the registration is durable-before-visible — on a persistence failure the
-    /// id is rolled back and the error surfaces, and the caller must REFUSE the act (an intent
-    /// whose replay guard cannot survive a restart must not act; G-M5). A poisoned lock recovers
-    /// via `into_inner()` (single-statement invariant) rather than silently admitting a replay.
-    pub fn record_fresh_intent(&self, intent_id: &str) -> std::io::Result<bool> {
+    /// the caller acts only on `Ok(true)`, so a re-POSTed signed declaration is refused. The caller
+    /// MUST have passed [`check_intent_freshness`] first (this stores `declared_at` and COMPACTS the
+    /// map against the freshness window on every call, so it stays bounded — G-M7 — but it does NOT
+    /// itself reject a stale intent; that is the dispatcher's fail-closed gate). Durable-before-
+    /// visible: on a persistence failure the id is rolled back and the error surfaces, and the
+    /// caller must REFUSE the act (G-M5). A poisoned lock recovers via `into_inner()`.
+    pub fn record_fresh_intent(
+        &self,
+        intent_id: &str,
+        declared_at_secs: u64,
+        now_secs: u64,
+    ) -> std::io::Result<bool> {
         let grants = match self.grants.write() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -915,10 +1087,49 @@ impl StandingGrantStore {
             Ok(s) => s,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if !seen.insert(intent_id.to_string()) {
+        use std::sync::atomic::Ordering::SeqCst;
+        // Already seen ⇒ replay refused, BEFORE any compaction (never forget an id we are about to
+        // reject on).
+        if seen.contains_key(intent_id) {
             return Ok(false);
         }
+        // Anti-readmit watermark (red-team, Sprint 19): an id whose declared_at is at/below the
+        // highest already-EVICTED declared_at was, or is shadowed by, a forgotten dispatch — refuse
+        // it as a replay. This holds regardless of clock direction, closing the backward-clock-step
+        // readmission the freshness window alone cannot (freshness ages against a movable clock;
+        // this watermark never regresses).
+        let prev_watermark = self.max_evicted_declared_at.load(SeqCst);
+        if declared_at_secs <= prev_watermark {
+            return Ok(false);
+        }
+        // Compact: drop ids whose declared_at has aged past the whole acceptance window — a re-POST
+        // of one would be rejected by check_intent_freshness (monotonic clock) AND by the watermark
+        // (any clock), so forgetting opens no replay. This bounds the map to ~one window of intents
+        // (no longer monotonic). Compaction runs only here (the write path), so an idle store is not
+        // pruned — strictly SAFER (idle ⇒ remembered longer); boundedness holds under any traffic
+        // that reaches the cap. Every eviction raises the watermark to the evicted declared_at.
+        let cutoff = now_secs.saturating_sub(SEEN_INTENT_RETENTION_SECS);
+        let mut new_watermark = prev_watermark;
+        seen.retain(|_, declared_at| {
+            if *declared_at < cutoff {
+                new_watermark = new_watermark.max(*declared_at);
+                false
+            } else {
+                true
+            }
+        });
+        if new_watermark > prev_watermark {
+            self.max_evicted_declared_at.store(new_watermark, SeqCst);
+        }
+        seen.insert(intent_id.to_string(), declared_at_secs);
         if let Err(e) = self.persist_locked(&grants, &seen) {
+            // Roll back the INSERT (the just-added id must not survive a failed persist), but KEEP
+            // the bumped watermark: compaction already forgot the evicted ids from memory, and an
+            // evicted id can have declared_at ABOVE prev_watermark — restoring the LOWER prev would
+            // leave it caught by neither the set (forgotten) nor the watermark (too low), reopening
+            // the backward-clock replay under a persist failure. The watermark is monotonic and
+            // fail-closed (higher ⇒ rejects MORE); disk still holds the old (lower) watermark + the
+            // un-evicted entries, so a restart is also safe. (Re-verification of the F1 fix.)
             seen.remove(intent_id);
             return Err(e);
         }
@@ -1095,9 +1306,16 @@ impl StandingGrantService {
     }
 
     /// Register an intent id as dispatched; `Ok(true)` iff FRESH. The replay guard — see
-    /// [`StandingGrantStore::record_fresh_intent`]. On `Err` the caller must REFUSE the act.
-    pub fn record_fresh_intent(&self, intent_id: &str) -> std::io::Result<bool> {
-        self.store.record_fresh_intent(intent_id)
+    /// [`StandingGrantStore::record_fresh_intent`]. The caller must have passed
+    /// [`check_intent_freshness`] first. On `Err` the caller must REFUSE the act.
+    pub fn record_fresh_intent(
+        &self,
+        intent_id: &str,
+        declared_at_secs: u64,
+        now_secs: u64,
+    ) -> std::io::Result<bool> {
+        self.store
+            .record_fresh_intent(intent_id, declared_at_secs, now_secs)
     }
 
     /// Revoke a standing grant by id, fail-closed and durable-before-visible. `Ok(true)` iff a
@@ -2375,7 +2593,8 @@ mod tests {
             store
                 .issue(envelope_with("exp-1", Some(SecureTimestamp::after_secs(0))))
                 .unwrap();
-            assert!(store.record_fresh_intent("intent-once").unwrap());
+            let now = SecureTimestamp::now().unix_secs;
+            assert!(store.record_fresh_intent("intent-once", now, now).unwrap());
         } // drop = the "restart"
         let store = StandingGrantStore::with_persistence(&path).unwrap();
         assert!(store.is_active("live-1"), "a live mandate survives reboot LIVE");
@@ -2388,15 +2607,164 @@ mod tests {
             "the revoked record is retained as revoked, not vanished"
         );
         assert!(!store.is_active("exp-1"), "an expired mandate reloads inactive");
+        let now = SecureTimestamp::now().unix_secs;
         assert!(
-            !store.record_fresh_intent("intent-once").unwrap(),
+            !store.record_fresh_intent("intent-once", now, now).unwrap(),
             "the replay guard survives reboot: the same intent id is refused (G-M5)"
         );
         assert!(
-            store.record_fresh_intent("intent-new").unwrap(),
+            store.record_fresh_intent("intent-new", now, now).unwrap(),
             "fresh intents still register after reload"
         );
         assert_eq!(store.list().len(), 3, "every issued mandate is still listed");
+    }
+
+    /// The freshness window (G-M7): a declaration expires (too old) and a future-dated one is
+    /// refused; a just-declared one passes. Pure over unix seconds.
+    #[test]
+    fn freshness_window_rejects_stale_and_future_dated() {
+        let now = 1_000_000u64;
+        assert!(check_intent_freshness(now, now).is_ok(), "declared now → fresh");
+        assert!(check_intent_freshness(now - MAX_INTENT_AGE_SECS, now).is_ok(), "at the age edge → fresh");
+        assert_eq!(
+            check_intent_freshness(now - MAX_INTENT_AGE_SECS - 1, now),
+            Err(FreshnessError::Stale),
+            "one second past the age → stale"
+        );
+        assert!(check_intent_freshness(now + MAX_CLOCK_SKEW_SECS, now).is_ok(), "at the skew edge → fresh");
+        assert_eq!(
+            check_intent_freshness(now + MAX_CLOCK_SKEW_SECS + 1, now),
+            Err(FreshnessError::FutureDated),
+            "one second past the skew → future-dated"
+        );
+    }
+
+    /// The replay guard is BOUNDED, not monotonic (G-M7): recording a fresh intent COMPACTS ids
+    /// whose declared_at has aged past the window — but a replay of a STILL-remembered id is caught
+    /// BEFORE compaction, so bounding never opens a replay.
+    #[test]
+    fn seen_set_compacts_aged_ids_but_still_catches_in_window_replay() {
+        let store = StandingGrantStore::new(); // memory-only is enough for the guard logic
+        let base = 10_000_000u64;
+        // An OLD intent recorded when "now" was `base`.
+        assert!(store.record_fresh_intent("old", base, base).unwrap());
+        // Much later, a fresh intent — its recording compacts "old" (aged past retention).
+        let later = base + SEEN_INTENT_RETENTION_SECS + 10;
+        assert!(store.record_fresh_intent("recent", later, later).unwrap());
+        // "old" was forgotten (bounded), so re-recording it as if fresh-at-`later` succeeds — but in
+        // production `check_intent_freshness` would reject a re-POST carrying old's real declared_at.
+        assert!(
+            store.record_fresh_intent("old", later, later).unwrap(),
+            "an aged id is compacted out — the freshness gate is what stops its replay"
+        );
+        // A replay of a STILL-in-window id is refused (caught before compaction).
+        assert!(
+            !store.record_fresh_intent("recent", later, later).unwrap(),
+            "an in-window id is still remembered → replay refused"
+        );
+    }
+
+    /// The BACKWARD-CLOCK replay hole (red-team, Sprint 19) is CLOSED by the anti-readmit
+    /// watermark: an intent evicted while the clock was high cannot be replayed after the clock
+    /// rewinds into its freshness window. Reproduces the exact attack sequence.
+    #[test]
+    fn backward_clock_step_cannot_readmit_an_evicted_intent() {
+        let store = StandingGrantStore::new();
+        let d = 10_000_000u64; // captured intent X's declared_at
+        // 1. X dispatched legitimately at wall-time ≈ d — remembered.
+        assert!(store.record_fresh_intent("X", d, d).unwrap());
+        // 2. Clock advances past d + retention; another dispatch compacts X out (and raises the
+        //    watermark to ≥ d).
+        let high = d + SEEN_INTENT_RETENTION_SECS + 100;
+        assert!(store.record_fresh_intent("Y", high, high).unwrap());
+        // 3. Clock steps BACKWARD to ≈ d (t2 within X's freshness window). Freshness would ACCEPT
+        //    X here (that is the regression) — but the watermark refuses the readmit.
+        let t2 = d; // check_intent_freshness(d, t2) == Ok — the dangerous case
+        assert_eq!(check_intent_freshness(d, t2), Ok(()), "freshness alone would accept the replay");
+        assert!(
+            !store.record_fresh_intent("X", d, t2).unwrap(),
+            "the watermark refuses X's replay regardless of the clock rewind — no double-act"
+        );
+        // A genuinely NEW, newer intent still acts (the watermark only blocks at/below evicted).
+        assert!(store.record_fresh_intent("Z", high + 1, high + 1).unwrap());
+    }
+
+    /// The watermark survives restart (it is persisted), so the backward-clock hole stays closed
+    /// across a reboot too.
+    #[test]
+    fn evicted_watermark_persists_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("standing_grants.json");
+        let d = 20_000_000u64;
+        {
+            let store = StandingGrantStore::with_persistence(&path).unwrap();
+            store.record_fresh_intent("X", d, d).unwrap();
+            let high = d + SEEN_INTENT_RETENTION_SECS + 100;
+            store.record_fresh_intent("Y", high, high).unwrap(); // evicts X, persists watermark
+        } // restart
+        let store = StandingGrantStore::with_persistence(&path).unwrap();
+        assert!(
+            !store.record_fresh_intent("X", d, d).unwrap(),
+            "the persisted watermark still refuses X after a reboot"
+        );
+    }
+
+    /// Even when the compacting write FAILS to persist, the bumped watermark is KEPT (not rolled
+    /// back to the lower prev) — so an id evicted from memory during that failed call still cannot
+    /// be replayed (re-verification of the F1 fix: restoring the low watermark would have reopened
+    /// the hole under a persist failure). The evicted id is caught by the retained watermark before
+    /// any persist is attempted.
+    #[test]
+    fn persist_failure_keeps_the_watermark_so_an_evicted_id_cannot_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("standing_grants.json");
+        let d = 30_000_000u64;
+        let store = StandingGrantStore::with_persistence(&path).unwrap();
+        store.record_fresh_intent("X", d, d).unwrap();
+        // Squat the temp path so the NEXT (compacting) persist fails.
+        std::fs::create_dir(path.with_extension("tmp")).unwrap();
+        let high = d + SEEN_INTENT_RETENTION_SECS + 100;
+        assert!(
+            store.record_fresh_intent("Y", high, high).is_err(),
+            "the compacting write fails to persist"
+        );
+        // X was evicted in that failed call; a replay of X is refused by the RETAINED watermark
+        // (the check runs before any persist, so it succeeds even while the dir is squatted).
+        assert!(
+            !store.record_fresh_intent("X", d, d).unwrap(),
+            "the retained watermark still refuses the evicted id after a persist failure"
+        );
+    }
+
+    /// A v1 snapshot (bare-string seen ids, no timestamps) MIGRATES on load — mandates AND the
+    /// replay guard are preserved (never a fail-closed refusal that would drop them on upgrade).
+    #[test]
+    fn v1_snapshot_migrates_preserving_mandates_and_replay_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("standing_grants.json");
+        // A hand-written v1 file: one mandate + one seen intent, old bare-string format.
+        std::fs::write(
+            &path,
+            r#"{"version":1,"grants":[{"grant_id":"g1","capsule":"vm-agent",
+                "allowed_methods":["send"],"resource":"elastos://mail/send","action":"execute",
+                "expires_at":null,"agent_pubkey":null,"revoked":false,"token_epoch":0}],
+                "seen_intents":["legacy-intent"]}"#,
+        )
+        .unwrap();
+        let store = StandingGrantStore::with_persistence(&path).unwrap();
+        assert!(store.is_active("g1"), "the v1 mandate survives migration");
+        let now = SecureTimestamp::now().unix_secs;
+        assert!(
+            !store.record_fresh_intent("legacy-intent", now, now).unwrap(),
+            "the migrated replay guard still refuses the legacy intent id"
+        );
+        // And it is now written back as v2 (a fresh intent persists in the new format).
+        assert!(store.record_fresh_intent("new-intent", now, now).unwrap());
+        let reopened = StandingGrantStore::with_persistence(&path).unwrap();
+        assert!(
+            !reopened.record_fresh_intent("new-intent", now, now).unwrap(),
+            "the v2 rewrite round-trips the guard"
+        );
     }
 
     /// Fail-closed boot: a present-but-corrupt registry file is a loud error, never silently
@@ -2476,12 +2844,13 @@ mod tests {
         assert!(store.get("g2").is_none(), "the unpersistable mandate was NOT issued");
         assert!(store.revoke("g1").is_err(), "revoke surfaces the failure");
         assert!(store.is_active("g1"), "the unpersistable revoke did not half-apply");
-        assert!(store.record_fresh_intent("i1").is_err(), "replay-guard write surfaces");
+        let now = SecureTimestamp::now().unix_secs;
+        assert!(store.record_fresh_intent("i1", now, now).is_err(), "replay-guard write surfaces");
         // Clear the failure and verify the store still works (loud failure, re-runnable).
         std::fs::remove_dir(&tmp_path).unwrap();
         assert!(store.revoke("g1").unwrap(), "after the failure clears, the revoke lands");
         assert!(
-            store.record_fresh_intent("i1").unwrap(),
+            store.record_fresh_intent("i1", SecureTimestamp::now().unix_secs, SecureTimestamp::now().unix_secs).unwrap(),
             "the rolled-back intent id was not half-registered"
         );
     }
