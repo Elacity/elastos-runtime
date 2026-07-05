@@ -428,23 +428,28 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   revoke_stamps_revoked_at_roundtrips_and_issue_prunes_expired}`. HONEST BOUNDS (Sprint 23 council):
   (1) LIVE growth is NOT bounded — a shell-token holder minting no-TTL live mandates grows the
   registry without limit, BY DESIGN (a live mandate is real G-M3 authority, never shed); only DEAD
-  accumulation is reclaimed. (2) The "chain is the permanent record" now holds for MANDATES — CLOSED
-  Sprint 24: `CapabilityManager::grant_durable` emits the signed durable `CapabilityGrant` BEFORE
-  returning the token (emit-before-issue, mirroring `revoke`), and `issue_mandate` uses it — so a
-  mandate whose grant event cannot be recorded is never issued (500, no token), and a
-  retention-pruned mandate can never have existed without a provable grant on the chain. Proven by
+  accumulation is reclaimed. (2) The "chain is the permanent record" holds for MANDATES **under the
+  durable audit log** — CLOSED Sprint 24 (conditional): `CapabilityManager::grant_durable` emits the
+  signed durable `CapabilityGrant` BEFORE returning the token (emit-before-issue, mirroring
+  `revoke`), and `issue_mandate` uses it — so a mandate whose grant event cannot be recorded is never
+  issued (500, no token), and a retention-pruned mandate can never have existed without a provable
+  grant on the chain. Proven by
   `capability::manager::tests::grant_durable_fails_closed_when_audit_write_fails` + the existing
   issue→`export_mandate_receipt_for_capability` receipt tests (now routed through the fail-closed
-  mint). RESIDUAL: the GENERIC `grant()` (non-mandate ephemeral tokens, not in the standing registry
+  mint). DURABILITY BOUND (council S24 F1, the conditional): `grant_durable` is only as durable as
+  the audit log's backing. With the file-backed log (the EU-AI-Act custody mode,
+  `ELASTOS_AUDIT_LOG_PATH`) the grant is fsync'd before issue — fully closed. With the DEFAULT
+  memory-only log `emit` returns `Ok` without a disk write, while the standing registry IS persisted,
+  so a restart would restore the mandate without its grant record — the F1 gap via the audit door.
+  `issue_mandate` now WARNs loudly when minting into a memory-only log (a hard refusal would break the
+  legitimate ephemeral/dev mode); the fix for that mode is to run the durable audit. REVERSE-FAILURE
+  HONESTY (council S24 F2): if the grant lands but `issue_from_token` then fails (registry persist
+  error), `issue_mandate` emits a compensating best-effort `CapabilityRevoke` so the chain reads
+  "granted, then aborted" rather than an orphan grant a verifier would read as a live, never-revoked
+  mandate. RESIDUAL: the GENERIC `grant()` (non-mandate ephemeral tokens, not in the standing registry
   and not retention-pruned) keeps best-effort audit by design — its ~79 call sites across unrelated
   subsystems are out of scope for the mandate provability contract; converting them is the G8b
-  hot-path group-commit initiative, not this. DURABILITY BOUND (council S24 F4, pre-existing, shared
-  with fail-closed revoke): `grant_durable` is only as durable as the audit log's backing — with the
-  file-backed log (the EU-AI-Act durable mode, `ELASTOS_AUDIT_LOG_PATH`) the grant is fsync'd before
-  issue; with the DEFAULT memory-only log `emit` returns `Ok` without a disk write, so the guarantee
-  is in-process only (a crash before the registry persists loses both — no divergence, but not
-  cross-restart durable). Not new to S24; closed for real deployments running the durable audit.
-  (3) The 30-day operator-visibility
+  hot-path group-commit initiative, not this. (3) The 30-day operator-visibility
   promise is conditional: under cap pressure (>4096 live+dead) recently-dead grants can be evicted
   inside the window; the chain still has them. (4) Time-death is wall-clock: a >30-day FORWARD clock
   excursion could permanently prune a live-but-recently-expiring mandate — a bound shared with expiry

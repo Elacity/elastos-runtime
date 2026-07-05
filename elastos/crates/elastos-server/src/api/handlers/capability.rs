@@ -1208,6 +1208,20 @@ pub async fn issue_mandate(
     let expiry = input
         .ttl_secs
         .map(elastos_common::SecureTimestamp::after_secs);
+    // Provability floor (Sprint 24 council F1): grant_durable's "on the chain" is only as durable as
+    // the audit log's backing. A MEMORY-ONLY log makes emit() succeed with no disk write, while the
+    // standing registry IS persisted — so a restart would restore the mandate without its grant
+    // record (the F1 gap, via the audit door). Surface that misconfiguration loudly rather than
+    // silently mint an un-provable "durable" mandate. (A hard refusal would break the legitimate
+    // ephemeral/dev mode where nothing is cross-restart durable anyway; the durable-custody
+    // deployment sets ELASTOS_AUDIT_LOG_PATH and this never fires.)
+    if capability_manager.audit_log().log_path().is_none() {
+        tracing::warn!(
+            capsule = %input.capsule,
+            "minting a mandate into a MEMORY-ONLY audit log — its grant record is not cross-restart \
+             durable; set ELASTOS_AUDIT_LOG_PATH for provable custody (Sprint 24 F1)"
+        );
+    }
     // Mint a real signed token (the cryptographic root), then elevate it to a standing grant.
     // FAIL-CLOSED mint (Sprint 24, closes Sprint 23 council F1): the signed durable CapabilityGrant
     // must land on the audit chain BEFORE the mandate exists — so a mandate, whose registry entry is
@@ -1235,6 +1249,15 @@ pub async fn issue_mandate(
     let grant_id = standing_service
         .issue_from_token(&token, methods, agent_pubkey, input.dispatch_limit)
         .map_err(|e| {
+            // Reverse-failure honesty (Sprint 24 council F2): the CapabilityGrant already landed on
+            // the chain, but the mandate did NOT get issued. Emit a compensating (best-effort)
+            // revoke so the chain reads "granted, then aborted" — an honest completed lifecycle —
+            // rather than an orphan grant a receipt-verifier would read as a live, never-revoked
+            // mandate. Best-effort: the grant is already durable; this can only make the record more
+            // honest, never less.
+            capability_manager
+                .audit_log()
+                .capability_revoke(token.id(), "issuance aborted: standing-registry persist failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("mandate could not be durably recorded — not issued: {e}"),
@@ -2172,6 +2195,80 @@ mod tests {
             standing_service,
             intent_executor,
         }
+    }
+
+    /// Sprint 24 council F2 ratchet: on the reverse failure — the grant lands on the chain but the
+    /// standing-registry persist then FAILS — `issue_mandate` must emit a COMPENSATING revoke, so
+    /// the chain reads "granted, then aborted" and never an orphan live grant a verifier would trust
+    /// as a never-revoked mandate. Seam: a durable audit (so grant_durable's emit lands) + a
+    /// PERSISTENT registry whose atomic write is poisoned (a directory squats on the `.tmp` path, so
+    /// `File::create` fails) → issue_from_token errors after the grant is already durable.
+    #[tokio::test]
+    async fn aborted_issue_emits_a_compensating_revoke_never_an_orphan_grant() {
+        use elastos_runtime::primitives::audit::{AuditEvent, AuditLog};
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log =
+            std::sync::Arc::new(AuditLog::with_file(dir.path().join("audit.log")).unwrap());
+        let store = std::sync::Arc::new(elastos_runtime::capability::CapabilityStore::new());
+        let metrics =
+            std::sync::Arc::new(elastos_runtime::primitives::metrics::MetricsManager::new());
+        let capability_manager =
+            std::sync::Arc::new(CapabilityManager::new(store, audit_log.clone(), metrics));
+        // A PERSISTENT registry whose write will fail: squat a directory on the atomic temp path.
+        let registry_path = dir.path().join("standing_grants.json");
+        let standing_service = std::sync::Arc::new(
+            capability_manager
+                .standing_grant_service_with_persistence(&registry_path)
+                .unwrap(),
+        );
+        std::fs::create_dir(registry_path.with_extension("tmp")).unwrap();
+        let state = CapabilityState {
+            pending_store: std::sync::Arc::new(PendingRequestStore::new(audit_log.clone())),
+            capability_manager: capability_manager.clone(),
+            policy_evaluator: std::sync::Arc::new(PolicyEvaluator::new(
+                Box::new(elastos_runtime::capability::evaluator::ShellPassthroughVerifier),
+                audit_log.clone(),
+            )),
+            standing_service,
+            intent_executor: std::sync::Arc::new(
+                crate::intent_executor::MethodRegistryExecutor::production(audit_log.clone(), None),
+            ),
+        };
+
+        let res = issue_standing_grant(
+            State(state),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: "elastos://pay/vendor".to_string(),
+                action: "write".to_string(),
+                methods: vec!["pay.invoke".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: None,
+                dispatch_limit: None,
+            }),
+        )
+        .await;
+        assert!(res.is_err(), "a registry-persist failure aborts the mint (500), no mandate issued");
+
+        // The chain carries the grant AND a compensating revoke — not an orphan live grant.
+        let receipt = audit_log
+            .export_mandate_receipt()
+            .expect("the durable chain exports");
+        let grants = receipt
+            .records
+            .iter()
+            .filter(|r| matches!(r.event, AuditEvent::CapabilityGrant { .. }))
+            .count();
+        let aborted_revokes = receipt
+            .records
+            .iter()
+            .filter(|r| matches!(&r.event, AuditEvent::CapabilityRevoke { reason, .. } if reason.contains("issuance aborted")))
+            .count();
+        assert_eq!(grants, 1, "the grant did land on the chain (emit-before-issue)");
+        assert_eq!(
+            aborted_revokes, 1,
+            "and a compensating revoke followed it — the orphan grant is neutralized (F2)"
+        );
     }
 
     /// The whole Flint loop over the real handlers: GRANT a mandate, the agent ACTS under it,
