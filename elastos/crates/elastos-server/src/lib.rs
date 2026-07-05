@@ -4,6 +4,7 @@
 //! This crate provides the transport layer (HTTP) and binary entry point.
 //! The security-critical runtime logic lives in `elastos-runtime`.
 
+pub mod agent_store;
 pub mod api;
 pub mod auth;
 pub mod binaries;

@@ -222,6 +222,47 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   (grant → dispatch → REAL delivery visible to the Inbox app → revoke → same act denied with
   nothing delivered → the portable receipt carries the delivery AND the denial, verified off-box).
 
+  FOURTH AFFORDANCE — THE SECOND SIDE-EFFECTING ONE (Sprint 17): `runtime.state_put` — write a
+  durable, readable-back agent-state KEY (`elastos://runtime/store/<key>`, `action = write`),
+  proving the council-hardened side-effecting pattern generalizes from a one-shot notification to
+  real mutable data. Honesty carried over verbatim from the notify hardening: (a) PRINCIPAL-SCOPED —
+  an entry's identity is `(capsule, key)` where `capsule` is gate-bound to the mandate, so one agent
+  can never read or overwrite another's key (the same scoping `content_seen` uses); (b) the stored
+  value is the declaration's `input_hash` COMMITMENT, NOT a free-text payload — the intent carries
+  no bytes, only their hash, so the store records exactly what the mandate receipt already binds
+  (nothing an agent writes can smuggle content the signature does not cover); (c) the key is a slug
+  ([A-Za-z0-9._-], ≤64) and the value hex (≤64, or empty), bounded BEFORE the write; (d) last-write-
+  wins with a monotonic per-key `version` (attributed history depth without keeping every revision);
+  (e) a per-capsule key cap (256, oldest of THAT capsule evicted — never another's) bounds a flood;
+  (f) `Performed` iff the atomic write LANDED, else `Declined` with the true reason; (g) registered
+  ONLY with a data dir (carrier/tests pass None ⇒ honestly unwired). The write is a REAL durable
+  effect — the entry lands in `agent_state.json` and `agent_store::get_agent_state` reads it back
+  (principal-scoped) — so the effect is independently observable, not just claimed; a production
+  read SURFACE (operator route / read affordance) is a follow-up (today `get_agent_state` is
+  exercised by the ratchets, and nothing on a trusted decision path reads the store, so an agent
+  writing its own value cannot escalate — red-team F3). Scale watch-item (red-team F2, SUSPECTED
+  low, same shape as the notify inbox store): `put_agent_state` rewrites the whole store per write,
+  O(total entries) — bounded because capsule count is operator-gated (agents can't mint mandates)
+  and every field is length-bounded; per-capsule sharded files if it ever matters. Ratchets:
+  `agent_store::tests::{put_then_get_is_principal_scoped_and_versions_on_overwrite,
+  per_capsule_key_cap_evicts_only_that_capsule}` +
+  `intent_executor::tests::{state_put_writes_durable_readable_state_and_reports_write,
+  state_put_declines_bad_scopes_and_writes_nothing, state_put_is_unwired_without_a_data_dir,
+  state_put_declines_when_the_store_write_fails}` + the full loop
+  `capability::tests::dispatch_state_put_writes_durable_state_and_revoke_stops_it` (grant → write →
+  readback → overwrite/version → revoke → same write denied, value unchanged → receipt carries both
+  writes AND the denial, verified off-box). Residual (accepted, same class as notify's, LOW): the
+  agent-state store write is atomic (temp+rename) but not fsync'd — a crash-revert could drop a
+  write the receipt already recorded, a benign under-show (the accountability record is the receipt
+  on the fsync'd audit chain, not this convenience store); both side-effecting stores share the
+  accepted notify baseline (raise both to the standing-grant registry's fsync bar together if ever
+  promoted). Also carried over from the notify hardening (council pre-fold): the PERSISTED
+  `intent_id` is bounded to a slug like the key, so no unbounded/free-form field bloats durable
+  state or (once a read-back surface lands) reaches a human — ratchet
+  `intent_executor::tests::state_put_declines_an_unbounded_intent_id`, and the cap explicitly never
+  evicts the just-written key (`per_capsule_key_cap_evicts_only_that_capsule` asserts the last write
+  survives its own eviction under same-second timestamps).
+
 - **OPERATOR SURFACE — the mandate list ships as a launchable ElastOS shell app, on LIVE data
   (Sprints 10→12).** The operator sees (and proves) their agents' autonomy through the `mandates`
   capsule (`capsules/mandates/`, `role:app` + `entrypoint:index.html`) — auto-listed by the home

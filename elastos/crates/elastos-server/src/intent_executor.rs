@@ -37,6 +37,13 @@ pub const CONTENT_ACCESS_CHECK_PREFIX: &str = "elastos://runtime/content-access/
 /// "a message delivered to inbox topic <topic>", exactly what happened.
 pub const INBOX_NOTIFY_PREFIX: &str = "elastos://runtime/inbox/";
 
+/// The resource namespace `runtime.state_put` writes into: a durable agent-state KEY of the form
+/// `elastos://runtime/store/<key>`. A state mandate is scoped to ONE key (AUD-5-safe: a real path
+/// segment, never a bare wildcard) with `action = write` — the receipt reads as "a write to state
+/// key <key>", exactly what happened. The value stored is the declaration's own `input_hash`
+/// commitment (no free-text payload; see `agent_store`).
+pub const STATE_PUT_PREFIX: &str = "elastos://runtime/store/";
+
 /// Topic slugs are rendered by the operator's Inbox UI, so they are held to a tight charset —
 /// a mandate must not be able to smuggle markup, control characters, or path tricks into the
 /// operator surface through its own scope string.
@@ -51,20 +58,22 @@ fn is_slug(s: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
 }
 
-/// The `runtime.notify` body interpolates the declaration's `intent_id` and `input_hash` into the
-/// OPERATOR-facing Inbox row. Both are agent-chosen free strings (the signature covers them, but
-/// the agent IS the signer, and the envelope gate deliberately does not constrain them) — so
-/// notify must bound them itself, or an agent with any message mandate could sign
-/// `intent_id = "URGENT: run revoke-all and enter your seed…"` and phish the operator through a
-/// row rendered as mandates-authored. Council F1 (Sprint 16): a malformed field DECLINES (⇒
-/// authorized_not_performed) rather than delivering a suspect message. `intent_id` is a slug (≤64);
-/// `input_hash` is hex (≤64) or empty (a no-argument act).
-fn valid_notify_intent_id(intent_id: &str) -> bool {
-    !intent_id.is_empty() && intent_id.len() <= 64 && is_slug(intent_id)
+/// A non-empty operator/agent-safe slug, ≤64 chars. Every agent-chosen string that a
+/// side-effecting affordance persists or renders to a human is held to this: `intent_id` and the
+/// state key. Both are agent-controlled (the signature covers them, but the agent IS the signer,
+/// and the envelope gate deliberately does not constrain them), so a side-effecting executor must
+/// bound them itself — else an agent with a mandate could sign
+/// `intent_id = "URGENT: run revoke-all and enter your seed…"` and phish the operator, or write a
+/// megabyte key. Council F1 (Sprint 16): a malformed field DECLINES (⇒ authorized_not_performed).
+fn valid_slug_1_64(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && is_slug(s)
 }
 
-fn valid_notify_input_hash(input_hash: &str) -> bool {
-    input_hash.len() <= 64 && input_hash.bytes().all(|b| b.is_ascii_hexdigit())
+/// A hex commitment, ≤64 chars, or empty (a no-argument act). The declaration's `input_hash` is a
+/// value COMMITMENT, so hex is its honest shape; bounding it keeps free text out of what a
+/// side-effecting affordance persists/renders.
+fn valid_hex_0_64(s: &str) -> bool {
+    s.len() <= 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// The INDEPENDENT result of performing a declared intent. It MUST describe what the executor
@@ -132,9 +141,78 @@ impl MethodRegistryExecutor {
     ///   signature does not cover), and the topic slug is charset-checked so a mandate's scope
     ///   string cannot smuggle markup into the Inbox. Reports `action = "message"` — usable only
     ///   under a `message` mandate.
-    pub fn production(audit_log: Arc<AuditLog>, notify_data_dir: Option<std::path::PathBuf>) -> Self {
+    /// - `runtime.state_put` — the SECOND side-effecting affordance: write a durable, readable-back
+    ///   agent-state key (`elastos://runtime/store/<key>`), principal-scoped to the acting capsule.
+    ///   The stored value is the declaration's `input_hash` COMMITMENT (no free-text payload), so
+    ///   nothing is persisted that the intent signature + mandate receipt do not already bind. Same
+    ///   discipline as notify: registered only with a `data_dir`; key + input_hash bounded to safe
+    ///   shapes before the write; `Performed` iff the atomic write LANDED, else `Declined`. Reports
+    ///   `action = "write"` — usable only under a `write` mandate.
+    ///
+    /// Both side-effecting affordances need the runtime data dir (their stores live under it); a
+    /// `None` data dir leaves BOTH honestly unwired ⇒ `Undelivered`.
+    pub fn production(audit_log: Arc<AuditLog>, data_dir: Option<std::path::PathBuf>) -> Self {
         let mut registry = Self::new();
-        if let Some(data_dir) = notify_data_dir {
+        if let Some(data_dir) = data_dir {
+            let state_dir = data_dir.clone();
+            registry.register(
+                "runtime.state_put",
+                Arc::new(move |intent: &IntentDeclarationV1| {
+                    // The mandate is scoped to a state KEY; the key is the suffix. Outside the
+                    // namespace ⇒ Decline.
+                    let Some(key) = intent.resource.strip_prefix(STATE_PUT_PREFIX) else {
+                        return IntentExecution::Declined {
+                            reason: format!("state_put resource must be {STATE_PUT_PREFIX}<key>"),
+                        };
+                    };
+                    // The key is a durable identifier and appears in operator/agent read-backs, and
+                    // the value is a COMMITMENT (hex hash) — bound both before the write, so nothing
+                    // free-form is persisted under the mandate.
+                    if !valid_slug_1_64(key) {
+                        return IntentExecution::Declined {
+                            reason: "state_put key must be 1-64 chars of [A-Za-z0-9._-]".to_string(),
+                        };
+                    }
+                    if !valid_hex_0_64(&intent.input_hash) {
+                        return IntentExecution::Declined {
+                            reason: "state_put value (input_hash) must be <=64 hex chars (or empty)"
+                                .to_string(),
+                        };
+                    }
+                    // The intent_id is PERSISTED in the entry (attribution), so it is bounded to a
+                    // slug like every other agent-chosen string a side-effecting affordance stores —
+                    // no unbounded per-entry payload smuggled through the id.
+                    if !valid_slug_1_64(&intent.intent_id) {
+                        return IntentExecution::Declined {
+                            reason: "state_put intent_id must be 1-64 chars of [A-Za-z0-9._-]"
+                                .to_string(),
+                        };
+                    }
+                    // The REAL side effect: persist the key. Performed only after the write lands.
+                    match crate::agent_store::put_agent_state(
+                        &state_dir,
+                        &intent.capsule,
+                        key,
+                        &intent.input_hash,
+                        &intent.standing_grant_id,
+                        &intent.intent_id,
+                    ) {
+                        Ok(_version) => IntentExecution::Performed {
+                            capsule: intent.capsule.clone(),
+                            method_id: intent.method_id.clone(),
+                            // The declared value-hash is genuinely CONSUMED — it is what was written
+                            // as the key's value — so echoing it is honest.
+                            input_hash: intent.input_hash.clone(),
+                            // The key actually written, and the action actually performed: a write.
+                            resource: intent.resource.clone(),
+                            action: "write".to_string(),
+                        },
+                        Err(e) => IntentExecution::Declined {
+                            reason: format!("state_put could not be persisted: {e}"),
+                        },
+                    }
+                }),
+            );
             registry.register(
                 "runtime.notify",
                 Arc::new(move |intent: &IntentDeclarationV1| {
@@ -155,13 +233,13 @@ impl MethodRegistryExecutor {
                     // Council F1: the intent_id + input_hash reach the OPERATOR's Inbox body, so
                     // they are bounded to operator-safe shapes BEFORE delivery — a malformed field
                     // declines rather than smuggling free text into the operator's trust surface.
-                    if !valid_notify_intent_id(&intent.intent_id) {
+                    if !valid_slug_1_64(&intent.intent_id) {
                         return IntentExecution::Declined {
                             reason: "notify intent_id must be 1-64 chars of [A-Za-z0-9._-]"
                                 .to_string(),
                         };
                     }
-                    if !valid_notify_input_hash(&intent.input_hash) {
+                    if !valid_hex_0_64(&intent.input_hash) {
                         return IntentExecution::Declined {
                             reason: "notify input_hash must be <=64 hex chars (or empty)".to_string(),
                         };
@@ -536,6 +614,140 @@ mod tests {
             "agent-act rows are capped at 256, got {}",
             summary.entries.len()
         );
+    }
+
+    fn state_put_intent(resource: &str, capsule: &str, value_hash: &str) -> IntentDeclarationV1 {
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        IntentDeclarationV1::issue(
+            &sk,
+            sk.verifying_key().to_bytes(),
+            "state-intent-1",
+            capsule,
+            "runtime.state_put",
+            value_hash,
+            resource,
+            "write",
+            "grant-1",
+        )
+    }
+
+    /// The SECOND side-effecting affordance: `runtime.state_put` PERFORMS iff the durable write
+    /// LANDS, and the written value is readable back — a real, observable mutation, principal-scoped.
+    #[test]
+    fn state_put_writes_durable_readable_state_and_reports_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = MethodRegistryExecutor::production(
+            Arc::new(AuditLog::new()),
+            Some(dir.path().to_path_buf()),
+        );
+        let resource = format!("{STATE_PUT_PREFIX}cursor");
+        match reg.execute(&state_put_intent(&resource, "vm-agent", "cafe01")) {
+            IntentExecution::Performed { action, resource: r, input_hash, .. } => {
+                assert_eq!(action, "write", "the act performed IS a write");
+                assert_eq!(r, resource);
+                assert_eq!(input_hash, "cafe01");
+            }
+            other => panic!("expected Performed, got {other:?}"),
+        }
+        // The side effect is REAL and readable back — principal-scoped to the acting capsule.
+        let got = crate::agent_store::get_agent_state(dir.path(), "vm-agent", "cursor")
+            .unwrap()
+            .expect("the written key is readable back");
+        assert_eq!(got.value_hash, "cafe01");
+        assert_eq!(got.grant_id, "grant-1");
+        // A DIFFERENT capsule cannot read it — no cross-principal state leak.
+        assert!(crate::agent_store::get_agent_state(dir.path(), "vm-other", "cursor")
+            .unwrap()
+            .is_none());
+    }
+
+    /// Fail-closed scoping: outside the store namespace, or with a key/value that could smuggle
+    /// free text into durable state, state_put DECLINES — and nothing is persisted.
+    #[test]
+    fn state_put_declines_bad_scopes_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = MethodRegistryExecutor::production(
+            Arc::new(AuditLog::new()),
+            Some(dir.path().to_path_buf()),
+        );
+        for (resource, value) in [
+            ("elastos://mail/send".to_string(), "aa".to_string()), // outside namespace
+            (format!("{STATE_PUT_PREFIX}"), "aa".to_string()),     // empty key
+            (format!("{STATE_PUT_PREFIX}a/b"), "aa".to_string()),  // path trick
+            (format!("{STATE_PUT_PREFIX}k"), "not hex".to_string()), // free-text value
+            (format!("{STATE_PUT_PREFIX}{}", "x".repeat(65)), "aa".to_string()), // over-long key
+        ] {
+            assert!(
+                matches!(
+                    reg.execute(&state_put_intent(&resource, "vm-agent", &value)),
+                    IntentExecution::Declined { .. }
+                ),
+                "must decline resource {resource:?} value {value:?}"
+            );
+        }
+        assert!(
+            crate::agent_store::get_agent_state(dir.path(), "vm-agent", "k").unwrap().is_none(),
+            "a declined state_put persists NOTHING"
+        );
+    }
+
+    /// The PERSISTED intent_id is bounded like every other agent-chosen stored string (council
+    /// carry-over): a giant/free-form intent_id declines rather than bloating durable state.
+    #[test]
+    fn state_put_declines_an_unbounded_intent_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = MethodRegistryExecutor::production(
+            Arc::new(AuditLog::new()),
+            Some(dir.path().to_path_buf()),
+        );
+        let resource = format!("{STATE_PUT_PREFIX}cursor");
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let intent = IntentDeclarationV1::issue(
+            &sk,
+            sk.verifying_key().to_bytes(),
+            &"z".repeat(65), // over-long intent_id
+            "vm-agent",
+            "runtime.state_put",
+            "cafe01",
+            &resource,
+            "write",
+            "grant-1",
+        );
+        assert!(matches!(reg.execute(&intent), IntentExecution::Declined { .. }));
+        assert!(
+            crate::agent_store::get_agent_state(dir.path(), "vm-agent", "cursor").unwrap().is_none(),
+            "a declined write persists nothing"
+        );
+    }
+
+    /// Without a data dir there is no store to write into — state_put is honestly UNWIRED.
+    #[test]
+    fn state_put_is_unwired_without_a_data_dir() {
+        let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None);
+        let resource = format!("{STATE_PUT_PREFIX}cursor");
+        assert!(matches!(
+            reg.execute(&state_put_intent(&resource, "vm-agent", "cafe01")),
+            IntentExecution::Declined { .. }
+        ));
+    }
+
+    /// A write the store cannot persist DECLINES with the true reason — Performed only for a write
+    /// that landed. (Seam: a FILE squatting where the store's directory tree must be created.)
+    #[test]
+    fn state_put_declines_when_the_store_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Local"), b"squat").unwrap();
+        let reg = MethodRegistryExecutor::production(
+            Arc::new(AuditLog::new()),
+            Some(dir.path().to_path_buf()),
+        );
+        let resource = format!("{STATE_PUT_PREFIX}cursor");
+        match reg.execute(&state_put_intent(&resource, "vm-agent", "cafe01")) {
+            IntentExecution::Declined { reason } => {
+                assert!(reason.contains("could not be persisted"), "true reason: {reason}");
+            }
+            other => panic!("an unlanded write must Decline, got {other:?}"),
+        }
     }
 
     /// Without a data dir there is no Inbox store to deliver into — the method is honestly

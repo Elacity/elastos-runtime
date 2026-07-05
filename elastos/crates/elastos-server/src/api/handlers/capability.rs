@@ -2212,6 +2212,115 @@ mod tests {
         assert!(verdict.authenticated, "the receipt verifies off-box: {verdict:?}");
     }
 
+    /// THE SECOND SIDE-EFFECTING AFFORDANCE, full loop (Sprint 17): grant a `write` mandate for one
+    /// state key → the agent dispatches a signed intent → the runtime WRITES durable, readable-back
+    /// agent state → outcome `performed`, the write is observable, and a second intent OVERWRITES
+    /// (version deepens). Revoke, and the SAME write is denied — the stored value is unchanged.
+    #[tokio::test]
+    async fn dispatch_state_put_writes_durable_state_and_revoke_stops_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state_with_durable_audit(dir.path());
+        state.intent_executor = std::sync::Arc::new(
+            crate::intent_executor::MethodRegistryExecutor::production(
+                state.capability_manager.audit_log().clone(),
+                Some(dir.path().to_path_buf()),
+            ),
+        );
+        let key_resource = format!("{}cursor", crate::intent_executor::STATE_PUT_PREFIX);
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: key_resource.clone(),
+                action: "write".to_string(),
+                methods: vec!["runtime.state_put".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let write = |intent_id: &str, value: &str| {
+            let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+            IntentDeclarationV1::issue(
+                &sk,
+                sk.verifying_key().to_bytes(),
+                intent_id,
+                "vm-agent",
+                "runtime.state_put",
+                value,
+                &key_resource,
+                "write",
+                &out.token_id,
+            )
+        };
+
+        let r1 = dispatch_standing_intent(State(state.clone()), Json(write("sp-1", "cafe01")))
+            .await
+            .expect("dispatch ok")
+            .0;
+        assert_eq!(r1.outcome, "performed", "the write landed");
+        let got = crate::agent_store::get_agent_state(dir.path(), "vm-agent", "cursor")
+            .unwrap()
+            .expect("state readable back");
+        assert_eq!(got.value_hash, "cafe01");
+        assert_eq!(got.version, 1);
+
+        // A second write OVERWRITES — version deepens, last-write-wins, still attributed.
+        let r2 = dispatch_standing_intent(State(state.clone()), Json(write("sp-2", "beef02")))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(r2.outcome, "performed");
+        let got = crate::agent_store::get_agent_state(dir.path(), "vm-agent", "cursor")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.value_hash, "beef02");
+        assert_eq!(got.version, 2);
+
+        // Kill the mandate → the SAME write is denied, and the stored value is UNCHANGED.
+        let rev = revoke_standing_grant(
+            State(state.clone()),
+            Json(RevokeStandingGrantInput { grant_id: out.grant_id.clone() }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(rev.revoked);
+        let denied = dispatch_standing_intent(State(state.clone()), Json(write("sp-3", "dead03")))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(denied.outcome, "denied", "revoked mandate writes nothing");
+        let after = crate::agent_store::get_agent_state(dir.path(), "vm-agent", "cursor")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.value_hash, "beef02", "denied write left the value UNCHANGED");
+        assert_eq!(after.version, 2);
+
+        // The portable receipt carries the two writes (success=true) AND the denial (false).
+        let receipt = mandate_receipt(State(state.clone()), Path(out.token_id.clone()))
+            .await
+            .unwrap()
+            .0;
+        use elastos_runtime::primitives::audit::AuditEvent;
+        let uses: Vec<bool> = receipt
+            .records
+            .iter()
+            .filter_map(|r| match &r.event {
+                AuditEvent::CapabilityUse { success, .. } => Some(*success),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(uses, vec![true, true, false], "two writes and the denial, honestly receipted");
+        let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();
+        assert!(
+            elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer)).authenticated
+        );
+    }
+
     /// G-M6 closed: an authorized intent whose method has NO executor is `Undelivered`, NOT a
     /// fabricated match — the reconciliation reflects that nothing performed it, and the receipt use
     /// is `success=false`. A custom executor that reports a DIFFERENT field yields `Diverged`.
