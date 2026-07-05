@@ -1091,6 +1091,12 @@ pub struct IssueStandingGrantInput {
     /// capsule-string-only authorization (weaker; see KNOWN_GAPS G-M4).
     #[serde(default)]
     pub agent_pubkey: Option<String>,
+    /// Optional per-mandate dispatch-rate budget: acts per `MANDATE_DISPATCH_WINDOW_SECS` window
+    /// (Sprint 22 — rate is a first-class grant property, like scope/expiry/agent). Omitted ⇒ the
+    /// global default (`MANDATE_DISPATCH_LIMIT`). Zero is refused (a zero-rate mandate authorizes
+    /// nothing; revoke is the kill switch, not a budget).
+    #[serde(default)]
+    pub dispatch_limit: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1182,6 +1188,16 @@ pub async fn issue_mandate(
             Some(hex::encode(arr))
         }
     };
+    // A zero-rate mandate is refused, not minted (it could never act; a mandate that authorizes
+    // nothing is a footgun that LOOKS live on the card — revoke is the kill switch, not a budget).
+    if input.dispatch_limit == Some(0) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "dispatch_limit must be at least 1 act per window (omit it for the default); to stop \
+             a mandate acting, revoke it"
+                .to_string(),
+        ));
+    }
     let expiry = input
         .ttl_secs
         .map(elastos_common::SecureTimestamp::after_secs);
@@ -1198,7 +1214,7 @@ pub async fn issue_mandate(
     // is NOT issued — the operator retries into a working store rather than holding a grant that
     // silently evaporates on the next restart.
     let grant_id = standing_service
-        .issue_from_token(&token, methods, agent_pubkey)
+        .issue_from_token(&token, methods, agent_pubkey, input.dispatch_limit)
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1374,6 +1390,15 @@ pub struct MandateCard {
     /// The authorized agent's ed25519 verifying key (hex), when bound — the operator's own issued
     /// key, so exposing it here is not a leak (public key, operator surface). `None` when unbound.
     pub agent_pubkey: Option<String>,
+    /// The dispatch-rate budget ENFORCED for this mandate: acts per `dispatch_window_secs` window.
+    /// Always the effective number (the mandate's own limit when it set one, else the global
+    /// default) — the card shows what the gate does, not a config abstraction (P12).
+    pub dispatch_limit: u32,
+    /// Whether `dispatch_limit` was set on THIS mandate at grant time (`true`) or is the global
+    /// default (`false`) — so the operator can tell a deliberate dial from the baseline.
+    pub dispatch_limit_custom: bool,
+    /// The rate window (seconds) the budget is measured over.
+    pub dispatch_window_secs: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1424,6 +1449,11 @@ pub async fn mandate_cards(
             revoked: env.revoked || token_dead,
             agent_bound: env.agent_pubkey.is_some(),
             agent_pubkey: env.agent_pubkey,
+            dispatch_limit: env
+                .dispatch_limit
+                .unwrap_or(elastos_runtime::capability::MANDATE_DISPATCH_LIMIT),
+            dispatch_limit_custom: env.dispatch_limit.is_some(),
+            dispatch_window_secs: elastos_runtime::capability::MANDATE_DISPATCH_WINDOW_SECS,
         });
     }
     ListMandatesOutput {
@@ -1882,6 +1912,7 @@ mod tests {
                 methods: vec!["send".to_string()],
                 ttl_secs: Some(3600),
                 agent_pubkey: Some(agent.clone()),
+                dispatch_limit: None,
             }),
         )
         .await
@@ -1897,6 +1928,7 @@ mod tests {
                 methods: vec!["send".to_string()],
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
+                dispatch_limit: None,
             }),
         )
         .await
@@ -1933,6 +1965,7 @@ mod tests {
                     methods: vec!["send".to_string()],
                     ttl_secs: Some(3600),
                     agent_pubkey: Some(weak.to_string()),
+                    dispatch_limit: None,
                 }),
             )
             .await;
@@ -1954,6 +1987,7 @@ mod tests {
                 methods: vec!["send".to_string()],
                 ttl_secs: Some(3600),
                 agent_pubkey: Some(real),
+                dispatch_limit: None,
             }),
         )
         .await
@@ -1972,6 +2006,7 @@ mod tests {
                 methods: vec!["send".to_string()],
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
+                dispatch_limit: None,
             }),
         )
         .await
@@ -2047,6 +2082,7 @@ mod tests {
                 methods: vec!["send".to_string()],
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
+                dispatch_limit: None,
             }),
         )
         .await
@@ -2134,6 +2170,7 @@ mod tests {
                 methods: vec!["pay.invoke".to_string()],
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
+                dispatch_limit: None,
             }),
         )
         .await
@@ -2257,6 +2294,7 @@ mod tests {
                 methods: vec!["runtime.echo".to_string()],
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
+                dispatch_limit: None,
             }),
         )
         .await
@@ -2350,6 +2388,92 @@ mod tests {
         );
     }
 
+    /// Sprint 22 ratchet: rate is a FIRST-CLASS grant property. A mandate minted with its own
+    /// `dispatch_limit` is enforced at THAT budget end-to-end (2 acts perform, the 3rd is 429 —
+    /// far below the global default of 60), the card surfaces the dial honestly
+    /// (`dispatch_limit_custom`), and a zero-rate mint is refused 400 (revoke is the kill switch,
+    /// not a budget).
+    #[tokio::test]
+    async fn mandate_minted_with_its_own_rate_budget_enforces_and_surfaces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state_with_durable_audit(dir.path());
+        state.intent_executor = std::sync::Arc::new(FaithfulExecutor);
+        // A zero budget is refused at the mint, fail-closed with a clear reason.
+        let zero = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: "elastos://pay/vendor".to_string(),
+                action: "write".to_string(),
+                methods: vec!["runtime.echo".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: None,
+                dispatch_limit: Some(0),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(zero, Err((StatusCode::BAD_REQUEST, _))),
+            "a zero-rate mandate is refused at mint"
+        );
+        // Mint with a TIGHT custom budget: 2 acts per window.
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: "elastos://pay/vendor".to_string(),
+                action: "write".to_string(),
+                methods: vec!["runtime.echo".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: None,
+                dispatch_limit: Some(2),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        // The card shows the ENFORCED budget and that it was dialed on this mandate.
+        let cards = mandate_cards(&state.standing_service, &state.capability_manager).await;
+        let card = cards
+            .mandates
+            .iter()
+            .find(|c| c.token_id == out.token_id)
+            .expect("minted mandate is on a card");
+        assert_eq!(card.dispatch_limit, 2, "the card shows the mandate's own budget");
+        assert!(card.dispatch_limit_custom, "and marks it as dialed, not default");
+        assert_eq!(
+            card.dispatch_window_secs,
+            elastos_runtime::capability::MANDATE_DISPATCH_WINDOW_SECS
+        );
+        // Two acts perform; the third is refused 429 at the mandate's OWN limit.
+        let act = |i: u32| {
+            let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+            IntentDeclarationV1::issue(
+                &sk,
+                sk.verifying_key().to_bytes(),
+                &format!("dialed-{i}"),
+                "vm-agent",
+                "runtime.echo",
+                "cafe01",
+                "elastos://pay/vendor",
+                "write",
+                &out.token_id,
+            )
+        };
+        for i in 0..2 {
+            let r = dispatch_standing_intent(State(state.clone()), Json(act(i)))
+                .await
+                .expect("within the dialed budget")
+                .0;
+            assert_eq!(r.outcome, "performed", "act {i} within the dialed budget");
+        }
+        let refused = dispatch_standing_intent(State(state.clone()), Json(act(2))).await;
+        assert!(
+            matches!(refused, Err((StatusCode::TOO_MANY_REQUESTS, _))),
+            "the mandate's OWN limit (2) binds — not the global default (60)"
+        );
+    }
+
     /// The ACT leg closes G-M2: a REAL executor performs a dispatched act (the built-in
     /// `runtime.echo`) and it lands as a `success=true` token-keyed CapabilityUse in the mandate's
     /// receipt; a method OUTSIDE the envelope is denied and receipted `success=false`.
@@ -2367,6 +2491,7 @@ mod tests {
                 methods: vec!["runtime.echo".to_string()],
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
+                dispatch_limit: None,
             }),
         )
         .await
@@ -2439,6 +2564,7 @@ mod tests {
                 methods: vec!["runtime.notify".to_string()],
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
+                dispatch_limit: None,
             }),
         )
         .await
@@ -2535,6 +2661,7 @@ mod tests {
                 methods: vec!["runtime.echo".to_string()],
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
+                dispatch_limit: None,
             }),
         )
         .await
@@ -2604,6 +2731,7 @@ mod tests {
                 methods: vec!["runtime.state_put".to_string()],
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
+                dispatch_limit: None,
             }),
         )
         .await
@@ -2706,6 +2834,7 @@ mod tests {
                 methods: vec!["pay.invoke".to_string()],
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
+                dispatch_limit: None,
             }),
         )
         .await
@@ -2795,6 +2924,7 @@ mod tests {
                         methods: vec!["runtime.content_seen".to_string()],
                         ttl_secs: Some(3600),
                         agent_pubkey: Some(hex::encode(agent.verifying_key().to_bytes())),
+                        dispatch_limit: None,
                     }),
                 )
                 .await
@@ -2847,6 +2977,7 @@ mod tests {
                 methods: vec!["runtime.audit_verify".to_string()],
                 ttl_secs: Some(3600),
                 agent_pubkey: Some(agent_hex),
+                dispatch_limit: None,
             }),
         )
         .await
@@ -2910,6 +3041,7 @@ mod tests {
                 methods: vec!["runtime.audit_verify".to_string()],
                 ttl_secs: Some(3600),
                 agent_pubkey: Some(hex::encode(agent.verifying_key().to_bytes())),
+                dispatch_limit: None,
             }),
         )
         .await
@@ -2950,6 +3082,7 @@ mod tests {
                 methods: vec!["runtime.audit_verify".to_string()],
                 ttl_secs: Some(3600),
                 agent_pubkey: Some(hex::encode(agent.verifying_key().to_bytes())),
+                dispatch_limit: None,
             }),
         )
         .await
@@ -3026,6 +3159,7 @@ mod tests {
                 methods: vec!["pay.invoke".to_string()],
                 ttl_secs: None,
                 agent_pubkey: None,
+                dispatch_limit: None,
             }),
         )
         .await
@@ -3077,6 +3211,7 @@ mod tests {
                 methods: vec!["runtime.echo".to_string()],
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
+                dispatch_limit: None,
             }),
         )
         .await
@@ -3120,6 +3255,7 @@ mod tests {
                 methods: vec!["runtime.echo".to_string()],
                 ttl_secs: Some(3600),
                 agent_pubkey: Some(agent_hex),
+                dispatch_limit: None,
             }),
         )
         .await
@@ -3163,6 +3299,7 @@ mod tests {
                 methods: vec!["pay.invoke".to_string()],
                 ttl_secs: None,
                 agent_pubkey: None,
+                dispatch_limit: None,
             }),
         )
         .await
@@ -3195,6 +3332,7 @@ mod tests {
             methods: vec!["pay.invoke".to_string()],
             ttl_secs: Some(3600),
             agent_pubkey: None,
+            dispatch_limit: None,
         };
         let a = issue_standing_grant(State(state.clone()), Json(issue("elastos://pay/a")))
             .await
@@ -3255,6 +3393,7 @@ mod tests {
                 methods: vec!["send".to_string()],
                 ttl_secs: None,
                 agent_pubkey: None,
+                dispatch_limit: None,
             }),
         )
         .await
@@ -3288,6 +3427,7 @@ mod tests {
                 methods: vec!["send".to_string()],
                 ttl_secs: None,
                 agent_pubkey: None,
+                dispatch_limit: None,
             }),
         )
         .await
@@ -3304,6 +3444,7 @@ mod tests {
                 methods: vec![],
                 ttl_secs: None,
                 agent_pubkey: None,
+                dispatch_limit: None,
             }),
         )
         .await
@@ -3324,6 +3465,7 @@ mod tests {
                 methods: vec!["send".to_string()],
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
+                dispatch_limit: None,
             }),
         )
         .await

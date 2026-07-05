@@ -413,8 +413,17 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   request-rate limiter, and `standing_grants.json` never prunes revoked/expired grants — a
   shell-token holder (the trusted operator) can still flood issue and grow the file. FIX (deferred):
   a per-token limiter on the gateway mutation routes + a live+revoked cap / retention prune on the
-  store. Note: per-mandate-CONFIGURABLE dispatch budgets (a mandate issued with its own rate,
-  alongside scope/expiry/agent) are the natural next step.
+  store. SHIPPED (Sprint 22): per-mandate-CONFIGURABLE dispatch budgets — `dispatch_limit` is a
+  first-class grant property alongside scope/expiry/agent-binding, set at mint (API + shell form;
+  zero refused — revoke is the kill switch, not a budget), resolved by the STORE from the registry
+  at enforcement time (no caller can pass a wrong limit; a tampered zero denies every act,
+  fail-closed), persisted in the v3 registry snapshot (v1/v2 migrate to `None` = the global default
+  they were enforced under; a v3 envelope missing the KEY refuses to load — widen-proof, a same-disk
+  edit cannot silently reset an operator-tightened budget), and surfaced on the mandate card as the
+  ENFORCED number with a `custom` marker (P12: the card shows what the gate does). Ratchets:
+  `intent::tests::{per_mandate_dispatch_limit_overrides_the_default,
+  v2_snapshot_migrates_dispatch_limit_and_v3_roundtrips_it}` +
+  `capability::tests::mandate_minted_with_its_own_rate_budget_enforces_and_surfaces_it`.
   (b) **Unbound + arbitrary-`capsule` is now a one-click grant (red-team F2; the UI default is
   "unbound").** `capsule` is a free string (unvalidated) and an unbound mandate (`agent_pubkey`
   None) enforces capsule-STRING-only — any self-signed key declaring that string acts under it

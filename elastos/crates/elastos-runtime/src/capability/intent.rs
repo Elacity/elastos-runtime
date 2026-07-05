@@ -233,6 +233,14 @@ pub struct StandingGrantEnvelope {
     /// current epoch passes it (key rotation / revoke-all advance the epoch), so the dispatcher can
     /// deny epoch-dead mandates without re-deriving the token.
     pub token_epoch: u64,
+    /// This mandate's own dispatch-rate budget (acts per [`MANDATE_DISPATCH_WINDOW_SECS`] window),
+    /// a first-class grant property alongside scope/expiry/agent-binding (Sprint 22). `None` = the
+    /// global default ([`MANDATE_DISPATCH_LIMIT`]). Never `Some(0)` — the mint refuses it (a
+    /// zero-rate mandate authorizes nothing; revoke is the kill switch, not a budget).
+    /// Presence-required on load: a snapshot missing the KEY is corrupt, never "default rate" — a
+    /// same-disk edit must not silently widen an operator-tightened budget back to the default.
+    #[serde(deserialize_with = "de_present_option")]
+    pub dispatch_limit: Option<u32>,
 }
 
 impl StandingGrantEnvelope {
@@ -260,6 +268,7 @@ impl StandingGrantEnvelope {
         allowed_methods: BTreeSet<String>,
         revoked: bool,
         agent_pubkey: Option<String>,
+        dispatch_limit: Option<u32>,
     ) -> Self {
         StandingGrantEnvelope {
             grant_id: token.id().to_string(),
@@ -271,6 +280,7 @@ impl StandingGrantEnvelope {
             revoked,
             agent_pubkey: agent_pubkey.map(|k| k.trim().to_lowercase()),
             token_epoch: token.constraints().epoch(),
+            dispatch_limit,
         }
     }
 }
@@ -830,22 +840,73 @@ struct SeenIntentRecord {
     declared_at: u64,
 }
 
-/// The current (v2) snapshot: the replay guard stores `declared_at` per id so the seen-set can be
-/// compacted against the freshness window (bounded, not monotonic — G-M7).
+/// The current (v3) snapshot: envelopes carry the per-mandate `dispatch_limit`
+/// (presence-required — Sprint 22), and the replay guard stores `declared_at` per id so the
+/// seen-set can be compacted against the freshness window (bounded, not monotonic — G-M7).
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StandingGrantSnapshotV2 {
+struct StandingGrantSnapshotV3 {
     version: u32,
     grants: Vec<StandingGrantEnvelope>,
     seen_intents: Vec<SeenIntentRecord>,
     /// The anti-readmit watermark (see [`StandingGrantStore::max_evicted_declared_at`]). `default`
-    /// so a v2 file written before this field existed loads as 0 (no watermark yet — safe, the
+    /// so a file written before this field existed loads as 0 (no watermark yet — safe, the
     /// remembered ids still guard replay until they age, at which point the watermark takes over).
     #[serde(default)]
     max_evicted_declared_at: u64,
 }
 
-/// The prior (v1) snapshot: seen intents were bare ids with no timestamp. Read for a one-time
+/// The envelope shape persisted by snapshot v1/v2 — before per-mandate dispatch budgets existed.
+/// Read for a one-time MIGRATION only (never written): `dispatch_limit` becomes `None` (the global
+/// default), which is exactly the budget those mandates were enforced under when written — the
+/// migration neither widens nor tightens any grant.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyStandingGrantEnvelope {
+    grant_id: String,
+    capsule: String,
+    allowed_methods: BTreeSet<String>,
+    resource: String,
+    action: String,
+    #[serde(deserialize_with = "de_present_option")]
+    expires_at: Option<SecureTimestamp>,
+    revoked: bool,
+    #[serde(deserialize_with = "de_present_option")]
+    agent_pubkey: Option<String>,
+    token_epoch: u64,
+}
+
+impl From<LegacyStandingGrantEnvelope> for StandingGrantEnvelope {
+    fn from(l: LegacyStandingGrantEnvelope) -> Self {
+        StandingGrantEnvelope {
+            grant_id: l.grant_id,
+            capsule: l.capsule,
+            allowed_methods: l.allowed_methods,
+            resource: l.resource,
+            action: l.action,
+            expires_at: l.expires_at,
+            revoked: l.revoked,
+            agent_pubkey: l.agent_pubkey,
+            token_epoch: l.token_epoch,
+            dispatch_limit: None,
+        }
+    }
+}
+
+/// The prior (v2) snapshot: same shape as v3 but its envelopes predate `dispatch_limit`. Read for
+/// a one-time MIGRATION (never written).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StandingGrantSnapshotV2 {
+    #[allow(dead_code)]
+    version: u32,
+    grants: Vec<LegacyStandingGrantEnvelope>,
+    seen_intents: Vec<SeenIntentRecord>,
+    #[serde(default)]
+    max_evicted_declared_at: u64,
+}
+
+/// The oldest (v1) snapshot: seen intents were bare ids with no timestamp. Read for a one-time
 /// MIGRATION (never written): its ids are re-stamped `declared_at = load time` so they age out one
 /// full window after upgrade — conservative (remembered longer, never a replay window).
 #[derive(Deserialize)]
@@ -853,11 +914,11 @@ struct StandingGrantSnapshotV2 {
 struct StandingGrantSnapshotV1 {
     #[allow(dead_code)]
     version: u32,
-    grants: Vec<StandingGrantEnvelope>,
+    grants: Vec<LegacyStandingGrantEnvelope>,
     seen_intents: Vec<String>,
 }
 
-const STANDING_GRANT_SNAPSHOT_VERSION: u32 = 2;
+const STANDING_GRANT_SNAPSHOT_VERSION: u32 = 3;
 
 impl StandingGrantStore {
     pub fn new() -> Self {
@@ -903,8 +964,8 @@ impl StandingGrantStore {
                 Vec<(String, u64)>,
                 u64,
             ) = match version {
-                2 => {
-                    let s: StandingGrantSnapshotV2 =
+                3 => {
+                    let s: StandingGrantSnapshotV3 =
                         serde_json::from_str(&content).map_err(|e| invalid(e.to_string()))?;
                     let seen = s
                         .seen_intents
@@ -912,6 +973,19 @@ impl StandingGrantStore {
                         .map(|r| (r.id, r.declared_at))
                         .collect();
                     (s.grants, seen, s.max_evicted_declared_at)
+                }
+                2 => {
+                    // MIGRATION: v2 envelopes predate `dispatch_limit`; they load as `None` (the
+                    // global default) — the exact budget they were enforced under when written.
+                    let s: StandingGrantSnapshotV2 =
+                        serde_json::from_str(&content).map_err(|e| invalid(e.to_string()))?;
+                    let seen = s
+                        .seen_intents
+                        .into_iter()
+                        .map(|r| (r.id, r.declared_at))
+                        .collect();
+                    let grants = s.grants.into_iter().map(Into::into).collect();
+                    (grants, seen, s.max_evicted_declared_at)
                 }
                 1 => {
                     // MIGRATION: re-stamp legacy bare ids with the load time so they age out one
@@ -923,7 +997,8 @@ impl StandingGrantStore {
                         serde_json::from_str(&content).map_err(|e| invalid(e.to_string()))?;
                     let now = SecureTimestamp::now().unix_secs;
                     let seen = s.seen_intents.into_iter().map(|id| (id, now)).collect();
-                    (s.grants, seen, 0)
+                    let grants = s.grants.into_iter().map(Into::into).collect();
+                    (grants, seen, 0)
                 }
                 other => {
                     return Err(std::io::Error::new(
@@ -978,7 +1053,7 @@ impl StandingGrantStore {
             })
             .collect();
         seen_list.sort_by(|a, b| a.id.cmp(&b.id));
-        let snapshot = StandingGrantSnapshotV2 {
+        let snapshot = StandingGrantSnapshotV3 {
             version: STANDING_GRANT_SNAPSHOT_VERSION,
             grants: grant_list,
             seen_intents: seen_list,
@@ -1094,10 +1169,13 @@ impl StandingGrantStore {
     }
 
     /// Record a dispatch against the per-mandate RATE budget (G-M7): returns `true` iff this
-    /// mandate is WITHIN [`MANDATE_DISPATCH_LIMIT`] acts for the current
-    /// [`MANDATE_DISPATCH_WINDOW_SECS`] window (and counts this attempt), `false` if it is over
-    /// budget. The dispatcher calls this AFTER authenticity + freshness (so only well-formed fresh
-    /// intents count) and BEFORE the replay guard's durable write, so a flood is rejected before it
+    /// mandate is WITHIN its budget for the current [`MANDATE_DISPATCH_WINDOW_SECS`] window (and
+    /// counts this attempt), `false` if it is over budget. The limit is the mandate's OWN
+    /// `dispatch_limit` when the grant set one (Sprint 22 — rate is a first-class grant property,
+    /// resolved HERE from the registry so no caller can pass a wrong limit), else the global
+    /// [`MANDATE_DISPATCH_LIMIT`]. The dispatcher calls this AFTER authenticity + freshness (so
+    /// only well-formed fresh intents count) and BEFORE the replay guard's durable write, so a
+    /// flood is rejected before it
     /// costs an fsync. In-memory + bounded: a stale window resets on access, the map is pruned of
     /// elapsed windows when it grows past the soft cap, and a HARD CAP then refuses NEW keys while at
     /// capacity — so even a same-window flood of distinct (even fake) grant_ids cannot grow it
@@ -1105,6 +1183,25 @@ impl StandingGrantStore {
     /// the cap). A poisoned lock recovers via `into_inner()` (fail-safe: a recovered map is
     /// structurally intact).
     pub fn record_dispatch_within_budget(&self, grant_id: &str, now_secs: u64) -> bool {
+        // Resolve the mandate's own budget first (registry read lock released before the rate
+        // lock — no nesting). An unknown grant_id gets the global default: in the dispatch path
+        // the handler's existence check runs before this, so unknown ids never reach here; if one
+        // does (direct call), the default still bounds it.
+        let limit = {
+            let grants = match self.grants.read() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            grants
+                .get(grant_id)
+                .and_then(|env| env.dispatch_limit)
+                .unwrap_or(MANDATE_DISPATCH_LIMIT)
+        };
+        // The mint refuses `Some(0)`, so a zero here means a tampered/corrupt registry entry —
+        // fail closed (deny every act) rather than let the window-reset branch admit one per window.
+        if limit == 0 {
+            return false;
+        }
         let mut rate = match self.dispatch_rate.write() {
             Ok(r) => r,
             Err(poisoned) => poisoned.into_inner(),
@@ -1134,7 +1231,7 @@ impl StandingGrantStore {
             *entry = (now_secs, 1);
             return true;
         }
-        if entry.1 < MANDATE_DISPATCH_LIMIT {
+        if entry.1 < limit {
             entry.1 += 1;
             return true;
         }
@@ -1375,9 +1472,15 @@ impl StandingGrantService {
         token: &CapabilityToken,
         allowed_methods: BTreeSet<String>,
         agent_pubkey: Option<String>,
+        dispatch_limit: Option<u32>,
     ) -> std::io::Result<String> {
-        let envelope =
-            StandingGrantEnvelope::from_token(token, allowed_methods, false, agent_pubkey);
+        let envelope = StandingGrantEnvelope::from_token(
+            token,
+            allowed_methods,
+            false,
+            agent_pubkey,
+            dispatch_limit,
+        );
         let grant_id = envelope.grant_id.clone();
         self.store.issue(envelope)?;
         Ok(grant_id)
@@ -1523,6 +1626,7 @@ mod tests {
             revoked: false,
             agent_pubkey: None,
             token_epoch: 0,
+            dispatch_limit: None,
         }
     }
 
@@ -1697,7 +1801,7 @@ mod tests {
             Some(SecureTimestamp::after_secs(3600)),
         );
         let methods: BTreeSet<String> = ["send", "draft"].iter().map(|m| m.to_string()).collect();
-        let env = StandingGrantEnvelope::from_token(&token, methods, false, None);
+        let env = StandingGrantEnvelope::from_token(&token, methods, false, None, None);
 
         // The token supplies capsule/resource/action/expiry that were actually signed in.
         assert_eq!(env.capsule, "vm-agent");
@@ -1736,12 +1840,12 @@ mod tests {
             None,
         );
         let methods: BTreeSet<String> = ["send"].iter().map(|m| m.to_string()).collect();
-        let active = StandingGrantEnvelope::from_token(&token, methods.clone(), false, None);
+        let active = StandingGrantEnvelope::from_token(&token, methods.clone(), false, None, None);
         assert_eq!(active.expires_at, None);
         assert!(active.is_active(), "None expiry never expires");
 
         // The caller's external revocation check is honored, fail-closed.
-        let revoked = StandingGrantEnvelope::from_token(&token, methods, true, None);
+        let revoked = StandingGrantEnvelope::from_token(&token, methods, true, None, None);
         assert!(!revoked.is_active());
         let sk = key();
         assert_eq!(
@@ -2142,6 +2246,7 @@ mod tests {
             revoked: false,
             agent_pubkey: None,
             token_epoch: 0,
+            dispatch_limit: None,
         }
     }
 
@@ -2394,6 +2499,7 @@ mod tests {
             ["send"].iter().map(|m| m.to_string()).collect(),
             false,
             None,
+            None,
         );
         store.issue(envelope).unwrap();
 
@@ -2505,7 +2611,8 @@ mod tests {
             Some(SecureTimestamp::after_secs(3600)),
         );
         let grant_id =
-            svc.issue_from_token(&token, ["send"].iter().map(|m| m.to_string()).collect(), None).unwrap();
+            svc.issue_from_token(&token, ["send"].iter().map(|m| m.to_string()).collect(), None, None)
+                .unwrap();
         assert_eq!(grant_id, token.id().to_string());
         assert!(svc.is_active(&grant_id), "a freshly issued grant is active");
 
@@ -2773,6 +2880,93 @@ mod tests {
         assert!(
             !store.record_dispatch_within_budget("brand-new-at-capacity", t0),
             "a new grant_id is refused while the map is at its hard cap"
+        );
+    }
+
+    /// Rate is a FIRST-CLASS grant property (Sprint 22): a mandate issued with its own
+    /// `dispatch_limit` is enforced at THAT budget — resolved from the registry by the store
+    /// itself, so no caller can pass a wrong limit — while a mandate without one gets the global
+    /// default, and the custom budget still resets on a new window.
+    #[test]
+    fn per_mandate_dispatch_limit_overrides_the_default() {
+        let store = StandingGrantStore::new();
+        let mut tight = envelope_with("g-tight", None);
+        tight.dispatch_limit = Some(3);
+        store.issue(tight).unwrap();
+        store.issue(envelope_with("g-default", None)).unwrap();
+        let t0 = 1_000_000u64;
+        for i in 0..3 {
+            assert!(store.record_dispatch_within_budget("g-tight", t0), "act {i} within its own budget");
+        }
+        assert!(
+            !store.record_dispatch_within_budget("g-tight", t0),
+            "the mandate's OWN limit (3) binds, not the global default"
+        );
+        // The default-budget mandate is unaffected by the tight one's ceiling.
+        for i in 0..4 {
+            assert!(store.record_dispatch_within_budget("g-default", t0), "default act {i}");
+        }
+        // The custom budget resets on a new window like the default does.
+        let t1 = t0 + MANDATE_DISPATCH_WINDOW_SECS;
+        assert!(
+            store.record_dispatch_within_budget("g-tight", t1),
+            "the custom budget refills next window"
+        );
+        // A tampered zero-rate entry (the mint refuses Some(0)) denies EVERY act, fail-closed —
+        // never "one per window" via the reset branch.
+        let mut zeroed = envelope_with("g-zero", None);
+        zeroed.dispatch_limit = Some(0);
+        store.issue(zeroed).unwrap();
+        assert!(
+            !store.record_dispatch_within_budget("g-zero", t0),
+            "a zero limit denies every act (tamper fail-closed)"
+        );
+    }
+
+    /// Snapshot compatibility (Sprint 22): a v2 file (envelopes predate `dispatch_limit`) MIGRATES
+    /// on load — every mandate gets `None` (the global default, exactly the budget it was enforced
+    /// under when written) — and a v3 rewrite round-trips a custom limit durably. A v3 file with
+    /// the `dispatch_limit` KEY dropped refuses to load (widen-proof: a same-disk edit must not
+    /// silently reset an operator-tightened budget to the default).
+    #[test]
+    fn v2_snapshot_migrates_dispatch_limit_and_v3_roundtrips_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("standing_grants.json");
+        // A hand-written v2 file: one mandate, no dispatch_limit key anywhere (pre-Sprint-22).
+        std::fs::write(
+            &path,
+            r#"{"version":2,"grants":[{"grant_id":"g1","capsule":"vm-agent",
+                "allowed_methods":["send"],"resource":"elastos://mail/send","action":"execute",
+                "expires_at":null,"agent_pubkey":null,"revoked":false,"token_epoch":0}],
+                "seen_intents":[{"id":"seen-1","declared_at":100}],"max_evicted_declared_at":7}"#,
+        )
+        .unwrap();
+        let store = StandingGrantStore::with_persistence(&path).unwrap();
+        let g1 = store.get("g1").expect("the v2 mandate survives migration");
+        assert_eq!(g1.dispatch_limit, None, "migrated mandates run at the global default");
+        // Issue a custom-rate mandate; the store now writes v3 — reload must preserve the dial.
+        let mut dialed = envelope_with("g-dialed", None);
+        dialed.dispatch_limit = Some(5);
+        store.issue(dialed).unwrap();
+        let reopened = StandingGrantStore::with_persistence(&path).unwrap();
+        assert_eq!(
+            reopened.get("g-dialed").unwrap().dispatch_limit,
+            Some(5),
+            "a custom budget survives restart (v3 round-trip)"
+        );
+        assert_eq!(reopened.get("g1").unwrap().dispatch_limit, None);
+        // Widen-proof: a v3 file whose envelope DROPS the dispatch_limit key refuses to load.
+        std::fs::write(
+            &path,
+            r#"{"version":3,"grants":[{"grant_id":"g1","capsule":"vm-agent",
+                "allowed_methods":["send"],"resource":"elastos://mail/send","action":"execute",
+                "expires_at":null,"agent_pubkey":null,"revoked":false,"token_epoch":0}],
+                "seen_intents":[],"max_evicted_declared_at":0}"#,
+        )
+        .unwrap();
+        assert!(
+            StandingGrantStore::with_persistence(&path).is_err(),
+            "a v3 envelope missing the dispatch_limit KEY is corrupt, never 'default rate'"
         );
     }
 

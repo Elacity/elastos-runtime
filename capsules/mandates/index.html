@@ -125,6 +125,8 @@
   .bind{font-size:10.5px;font-weight:600;border-radius:6px;padding:2px 7px;border:1px solid transparent}
   .bind.bound{font-family:var(--font-mono);color:var(--live);background:var(--live-soft)}
   .bind.unbound{color:var(--warn);background:var(--warn-soft)}
+  .bind.rate{font-family:var(--font-mono);color:var(--ink-3);background:transparent;border-color:var(--line)}
+  .bind.rate.custom{color:var(--accent);border-color:currentColor}
   .card .foot{display:flex;align-items:center;justify-content:space-between;margin-top:13px;
     padding-top:11px;border-top:1px solid var(--line);gap:8px}
   .card .tid{font-family:var(--font-mono);font-size:11px;color:var(--ink-3)}
@@ -263,6 +265,8 @@
           <option value="">never (until revoked)</option>
         </select>
       </label>
+      <label>Rate budget <span class="opt">(acts per minute; blank = default 60)</span>
+        <input id="g-rate" type="number" min="1" step="1" class="gmono" placeholder="60" spellcheck="false"></label>
       <label>Agent key <span class="opt">(required — 64-hex ed25519; binds the mandate to ONE agent)</span>
         <input id="g-agent" type="text" class="gmono" placeholder="the agent's public key — unbound mandates are CLI-only" spellcheck="false"></label>
     </div>
@@ -333,19 +337,23 @@
       { token_id:"3b6a27bcceb6a42d62a3a8d02a6f0d73", capsule:"vm-demo-agent",
         resource:"elastos://runtime/audit-chain", action:"read",
         methods:["runtime.audit_verify"], expires_at:{unix_secs:1720,monotonic_seq:0}, revoked:true, active:false,
-        agent_bound:true, agent_pubkey:"e5b1f0a9d6c4e2b8a1f3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3" },
+        agent_bound:true, agent_pubkey:"e5b1f0a9d6c4e2b8a1f3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3",
+        dispatch_limit:60, dispatch_limit_custom:false, dispatch_window_secs:60 },
       { token_id:"a1f3c5d7e9b0a2c4d6e8f0a1b3c5d7e9", capsule:"vm-mail-agent",
         resource:"elastos://runtime/content-access/QmVault7", action:"read",
         methods:["runtime.content_seen"], expires_at:{unix_secs:3600,monotonic_seq:0}, revoked:false, active:true,
-        agent_bound:true, agent_pubkey:"b0a2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7" },
+        agent_bound:true, agent_pubkey:"b0a2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7",
+        dispatch_limit:10, dispatch_limit_custom:true, dispatch_window_secs:60 },
       { token_id:"77de243a63ac048a18b59da2915771de", capsule:"vm-ledger-agent",
         resource:"elastos://runtime/audit-chain", action:"read",
         methods:["runtime.audit_verify"], expires_at:null, revoked:false, active:true,
-        agent_bound:false, agent_pubkey:null },
+        agent_bound:false, agent_pubkey:null,
+        dispatch_limit:60, dispatch_limit_custom:false, dispatch_window_secs:60 },
       { token_id:"0c83e5b1f0a9d6c4e2b8a1f3c5d7e9b0", capsule:"vm-index-agent",
         resource:"elastos://runtime/content-access/QmOld3", action:"read",
         methods:["runtime.content_seen"], expires_at:{unix_secs:0,monotonic_seq:0}, revoked:false, active:false,
-        agent_bound:true, agent_pubkey:"d6c4e2b8a1f3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0" }
+        agent_bound:true, agent_pubkey:"d6c4e2b8a1f3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0",
+        dispatch_limit:60, dispatch_limit_custom:false, dispatch_window_secs:60 }
     ]
   };
   // A representative receipt (grant -> performed read -> revoke -> denied attempt), matching the demo.
@@ -382,12 +390,18 @@
       var bound = m.agent_bound
         ? '<span class="bind bound" title="'+esc(m.agent_pubkey||"")+'">bound '+esc(shortId(m.agent_pubkey||""))+'</span>'
         : '<span class="bind unbound" title="Any key acting as this capsule can act — weaker attribution">unbound</span>';
+      // The ENFORCED dispatch budget (server-computed; custom = dialed at grant time, else default).
+      var rate = (m.dispatch_limit != null)
+        ? '<span class="bind rate'+(m.dispatch_limit_custom?" custom":"")+'" title="'
+          + (m.dispatch_limit_custom?"Set on this mandate at grant time":"Global default budget")
+          + '">'+esc(String(m.dispatch_limit))+'/'+esc(String((m.dispatch_window_secs||60)))+'s</span>'
+        : '';
       return '<button class="card s-'+s+'" data-i="'+i+'" type="button">'
         + '<span class="stripe"></span>'
         + '<div class="row1"><span class="cap">'+esc(m.capsule)+'</span>'
         + '<span class="pill '+s+'">'+stateLabel(s)+'</span></div>'
         + '<div class="scope"><span class="verb">'+esc(m.action)+'</span> · <span class="res">'+esc(m.resource)+'</span></div>'
-        + '<div class="chips">'+chips+bound+'</div>'
+        + '<div class="chips">'+chips+bound+rate+'</div>'
         + '<div class="foot"><span class="tid">'+esc(shortId(m.token_id))+'</span>'
         + '<span class="open">View receipt →</span></div>'
         + '</button>';
@@ -668,6 +682,8 @@
         agent_pubkey: agent
       };
       if (ttlRaw !== "") body.ttl_secs = parseInt(ttlRaw, 10);
+      var rateRaw = $("#g-rate").value.trim();
+      if (rateRaw !== "") body.dispatch_limit = parseInt(rateRaw, 10); // server validates (>=1)
       btn.disabled = true;
       note.className = "gnote";
       note.textContent = "Granting…";
@@ -682,7 +698,7 @@
         .then(function(j){
           btn.disabled = false;
           note.textContent = "Mandate "+shortId(j.grant_id)+" granted — live below.";
-          $("#g-capsule").value = ""; $("#g-resource").value = ""; $("#g-methods").value = ""; $("#g-agent").value = "";
+          $("#g-capsule").value = ""; $("#g-resource").value = ""; $("#g-methods").value = ""; $("#g-agent").value = ""; $("#g-rate").value = "";
           load(); // the card comes from the server, never fabricated locally
         })
         .catch(function(err){
