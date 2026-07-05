@@ -423,7 +423,19 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   mandate holder — it REQUIRES a bound mandate + `intent.signer == agent_pubkey` BEFORE delegating to
   the pipeline, so a wrong-key intent never reaches the rate charge (charge-on-authorized). An
   attacker naming a victim's grant is refused 403 and charges NOTHING. Ratchet:
-  `capability::tests::agent_dispatch_charge_on_authorized_no_victim_lockout`.
+  `capability::tests::agent_dispatch_charge_on_authorized_no_victim_lockout`. PRECISE SCOPE
+  (Sprint 26 council): "closed" is against the GRANT-ID-KNOWLEDGE attacker (who only learns a
+  victim's grant_id). It is NOT closed against a stronger attacker who CAPTURES a fresh SIGNED intent
+  from the bound agent — that intent passes the binding, so replaying it first on the agent route
+  spends one budget unit and burns its intent_id (the agent's own retry then 409s). This is
+  rate-bounded, requires signed-material exfiltration, and pre-exists on the shell route; the deeper
+  fix is charge-only-on-gate-pass. Also inherent: a legit key-holder dispatching against its OWN
+  revoked/out-of-envelope mandate passes the wrapper (a revoked envelope is still returned) and
+  charges its budget before the gate's honest `revoked`/`wrong_*` denial — self-inflicted,
+  budget-bounded, and it buys the true denial reason. Anti-anonymous-DoS on the route rests on
+  `auth_middleware` + `rate_limit_middleware` (per session); the residual amplification is
+  session-issuance economics (pre-existing, unchanged by S26 — an attacker minting N sessions gets N
+  request buckets, but the per-mandate budget is untouched).
   (ii) **fixed-window boundary** allows up to ~2× the limit across a window edge (60 at the tail of
   W + 60 at the head of W+1); acceptable for a flood bound (still O(1)/window, ~1/s average), noted
   not silent. RETENTION now SHIPPED (Sprint 23 — closes the DEAD-accumulation half of G-M7): the
