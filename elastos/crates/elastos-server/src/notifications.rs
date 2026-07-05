@@ -345,6 +345,126 @@ pub fn dismiss_external_http_request(data_dir: &Path, request_id: &str) -> anyho
     dismiss(data_dir, &external_http_request_notification_id(request_id))
 }
 
+/// Notification kind for an agent act performed under a standing mandate (`runtime.notify`).
+pub const AGENT_ACT_KIND: &str = "agent_mandate_act";
+
+/// Agent-act rows are self-reclaiming: they carry a TTL so `load_summary`'s existing prune
+/// removes them, and are hard-capped so an agent flooding distinct intents under ONE mandate
+/// cannot grow the operator's Inbox store without bound (council F1 — the events store three
+/// functions down is capped the same way; this closes the omitted twin). Newest are kept.
+const AGENT_ACT_TTL_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
+const AGENT_ACT_MAX_ROWS: usize = 256;
+
+/// Deliver an agent's mandate-gated message into the operator's Inbox — the REAL side effect
+/// behind the `runtime.notify` affordance. The row's id is keyed on the intent id, so the SAME
+/// intent can never produce two rows (the dispatch replay guard already refuses a re-POST; this
+/// is the belt to that suspender). Content is a FIXED honest shape built from the signed
+/// declaration's own fields, and the caller (`runtime.notify` executor) bounds `intent_id` and
+/// `input_hash` to operator-safe shapes BEFORE calling — so nothing free-text reaches the operator
+/// surface (council F1). Severity `Info`: an authorized act is news, not an alarm.
+pub fn post_agent_act_notification(
+    data_dir: &Path,
+    intent_id: &str,
+    capsule: &str,
+    topic: &str,
+    input_hash: &str,
+    grant_id: &str,
+) -> anyhow::Result<()> {
+    let id = format!("agent-act:{intent_id}");
+    let path = notifications_path(data_dir)?;
+    let mut store = read_json_or_default::<NotificationStore>(&path)?;
+    if store.schema.trim().is_empty() {
+        store.schema = NOTIFICATIONS_SCHEMA.to_string();
+    }
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Idempotent ONLY on a LIVE prior row (council F4): a re-dispatch that finds a still-visible
+    // delivery is an honest Ok; but a dismissed/expired row is NOT an operator-visible delivery, so
+    // treating it as one would report Performed for a message the operator will never see. Under
+    // that (cross-store divergence) case we fall through and re-deliver, so the report stays honest.
+    if let Some(existing) = store.entries.iter().find(|entry| entry.id == id) {
+        let live = !existing.dismissed
+            && existing
+                .expires_at
+                .is_none_or(|expires_at| expires_at > created_at);
+        if live {
+            return Ok(());
+        }
+        store.entries.retain(|entry| entry.id != id);
+    }
+    let title = format!("Agent message: {topic}");
+    let input_note = if input_hash.is_empty() {
+        "no declared inputs".to_string()
+    } else {
+        format!("input hash {input_hash}")
+    };
+    let body = format!(
+        "{capsule} acted under mandate {grant_id} (intent {intent_id}, {input_note}). \
+         Open Mandates for the receipt."
+    );
+    let record = NotificationEntryRecord {
+        id: id.clone(),
+        source_app: "mandates".to_string(),
+        kind: AGENT_ACT_KIND.to_string(),
+        title: title.clone(),
+        body: body.clone(),
+        action_ref: None,
+        created_at,
+        // Self-reclaiming TTL so the operator's store never accretes agent-act rows forever.
+        expires_at: Some(created_at.saturating_add(AGENT_ACT_TTL_SECS)),
+        severity: NotificationSeverity::Info,
+        read: false,
+        acted: false,
+        dismissed: false,
+    };
+    store.entries.push(record);
+    // Hard cap the agent-act rows (newest kept), so a flood of distinct intents under one mandate
+    // cannot grow the store without bound between prunes — the room/external-http rows are left
+    // untouched (their own lifecycle governs them).
+    let agent_act_count = store
+        .entries
+        .iter()
+        .filter(|e| e.kind == AGENT_ACT_KIND)
+        .count();
+    if agent_act_count > AGENT_ACT_MAX_ROWS {
+        let mut to_drop = agent_act_count - AGENT_ACT_MAX_ROWS;
+        store.entries.retain(|e| {
+            if to_drop > 0 && e.kind == AGENT_ACT_KIND {
+                to_drop -= 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+    // Durable-before-event (council F3): the STORE write is the real side effect — land it first
+    // and let ITS result decide Performed/Declined. Its failure returns Err (⇒ the executor
+    // Declines, honestly). A failed store write never leaves a ghost "appeared" event for a row the
+    // operator never saw.
+    write_json_atomic(&path, &store)?;
+    // The event log is a secondary audit breadcrumb (no production reader today); a hiccup here must
+    // NOT flip a delivery that DID land into a Declined under-claim. Best-effort, logged not fatal.
+    if let Err(e) = record_event(
+        data_dir,
+        NotificationEventRecord {
+            id: format!("appeared:{id}"),
+            notification_id: id,
+            source_app: "mandates".to_string(),
+            title,
+            body,
+            action_ref: None,
+            created_at,
+            disposition: NotificationEventDisposition::Appeared,
+            resolution: None,
+        },
+    ) {
+        tracing::warn!("agent-act notification delivered but its appeared-event was not recorded: {e}");
+    }
+    Ok(())
+}
+
 fn external_http_request_notification_id(request_id: &str) -> String {
     format!("external-http-request:{request_id}")
 }

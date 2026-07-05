@@ -1750,7 +1750,7 @@ mod tests {
             std::sync::Arc::new(CapabilityManager::new(store, audit_log.clone(), metrics));
         let standing_service = std::sync::Arc::new(capability_manager.standing_grant_service());
         let intent_executor = std::sync::Arc::new(
-            crate::intent_executor::MethodRegistryExecutor::production(audit_log.clone()),
+            crate::intent_executor::MethodRegistryExecutor::production(audit_log.clone(), None),
         );
 
         CapabilityState {
@@ -1839,7 +1839,7 @@ mod tests {
             )),
             standing_service,
             intent_executor: std::sync::Arc::new(
-                crate::intent_executor::MethodRegistryExecutor::production(audit_log),
+                crate::intent_executor::MethodRegistryExecutor::production(audit_log, None),
             ),
         };
 
@@ -1905,7 +1905,7 @@ mod tests {
             std::sync::Arc::new(CapabilityManager::new(store, audit_log.clone(), metrics));
         let standing_service = std::sync::Arc::new(capability_manager.standing_grant_service());
         let intent_executor = std::sync::Arc::new(
-            crate::intent_executor::MethodRegistryExecutor::production(audit_log.clone()),
+            crate::intent_executor::MethodRegistryExecutor::production(audit_log.clone(), None),
         );
         CapabilityState {
             pending_store: std::sync::Arc::new(PendingRequestStore::new(audit_log.clone())),
@@ -2104,6 +2104,112 @@ mod tests {
         let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();
         let verdict = elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer));
         assert!(verdict.authenticated, "receipt with acts still authenticates: {verdict:?}");
+    }
+
+    /// THE FIRST SIDE-EFFECTING AFFORDANCE, full loop (Sprint 16): grant a `message` mandate for
+    /// one inbox topic → the agent dispatches a signed intent → the runtime DELIVERS a real
+    /// notification into the operator's Inbox store → outcome `performed`, and the mandate's
+    /// portable receipt carries the successful use. Revoke, and the SAME act is denied — with
+    /// NOTHING further delivered.
+    #[tokio::test]
+    async fn dispatch_notify_delivers_to_the_inbox_and_the_receipt_carries_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state_with_durable_audit(dir.path());
+        // The PRODUCTION executor set, wired to a real notify store (same tempdir).
+        state.intent_executor = std::sync::Arc::new(
+            crate::intent_executor::MethodRegistryExecutor::production(
+                state.capability_manager.audit_log().clone(),
+                Some(dir.path().to_path_buf()),
+            ),
+        );
+        let topic_resource =
+            format!("{}agent-status", crate::intent_executor::INBOX_NOTIFY_PREFIX);
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: topic_resource.clone(),
+                action: "message".to_string(),
+                methods: vec!["runtime.notify".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let intent = IntentDeclarationV1::issue(
+            &sk,
+            sk.verifying_key().to_bytes(),
+            "intent-notify-1",
+            "vm-agent",
+            "runtime.notify",
+            "cafe01",
+            &topic_resource,
+            "message",
+            &out.token_id,
+        );
+        let resp = dispatch_standing_intent(State(state.clone()), Json(intent))
+            .await
+            .expect("dispatch ok")
+            .0;
+        assert_eq!(resp.outcome, "performed", "the message was really delivered");
+
+        // The side effect is REAL and operator-visible: the Inbox store has the row.
+        let summary = crate::notifications::load_summary(dir.path()).unwrap();
+        assert_eq!(summary.unread_count, 1);
+        assert!(summary.entries[0].body.contains("vm-agent"));
+        assert!(summary.entries[0].body.contains(&out.token_id), "body names the mandate");
+
+        // Kill the mandate → the SAME act is denied, and nothing further lands in the Inbox.
+        let rev = revoke_standing_grant(
+            State(state.clone()),
+            Json(RevokeStandingGrantInput { grant_id: out.grant_id.clone() }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(rev.revoked);
+        let sk2 = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let denied_intent = IntentDeclarationV1::issue(
+            &sk2,
+            sk2.verifying_key().to_bytes(),
+            "intent-notify-2",
+            "vm-agent",
+            "runtime.notify",
+            "cafe02",
+            &topic_resource,
+            "message",
+            &out.token_id,
+        );
+        let denied = dispatch_standing_intent(State(state.clone()), Json(denied_intent))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(denied.outcome, "denied", "revoked mandate delivers nothing");
+        let after = crate::notifications::load_summary(dir.path()).unwrap();
+        assert_eq!(after.entries.len(), 1, "the denied act delivered NOTHING new");
+
+        // The portable receipt carries the delivered act (success=true) AND the denied one (false).
+        let receipt = mandate_receipt(State(state.clone()), Path(out.token_id.clone()))
+            .await
+            .unwrap()
+            .0;
+        use elastos_runtime::primitives::audit::AuditEvent;
+        let uses: Vec<bool> = receipt
+            .records
+            .iter()
+            .filter_map(|r| match &r.event {
+                AuditEvent::CapabilityUse { success, .. } => Some(*success),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(uses, vec![true, false], "delivery and denial both receipted, honestly");
+        let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();
+        let verdict = elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer));
+        assert!(verdict.authenticated, "the receipt verifies off-box: {verdict:?}");
     }
 
     /// G-M6 closed: an authorized intent whose method has NO executor is `Undelivered`, NOT a

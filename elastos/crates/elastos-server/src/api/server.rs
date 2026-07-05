@@ -213,8 +213,11 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
             );
             Arc::new(capability_manager.standing_grant_service())
         }),
+        // `runtime.notify` delivers into the operator's Inbox store under data_dir; without one
+        // (bare test/embedded configs) the method is honestly unwired => Undelivered.
         intent_executor: Arc::new(crate::intent_executor::MethodRegistryExecutor::production(
             capability_manager.audit_log().clone(),
+            data_dir.clone(),
         )),
     };
     let capsule_audit_log = audit_log

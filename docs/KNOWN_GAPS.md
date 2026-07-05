@@ -184,6 +184,44 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   Ok before the scan, the same evidentiary bar as `audit_verify`, so a matched record can't be a
   forged offline append). Same O(n) gated-read DoS profile as audit_verify.
 
+  THIRD AFFORDANCE — THE FIRST SIDE-EFFECTING ONE (Sprint 16): `runtime.notify` — deliver a message
+  about the act into the OPERATOR'S INBOX (the shell's Inbox app renders it). The mandate is scoped
+  to ONE inbox topic (`elastos://runtime/inbox/<topic>`, AUD-5-safe) with `action = message`, and
+  the executor reports `Performed` ONLY after the atomic Inbox-store write actually LANDED — a
+  failed write is `Declined` (⇒ `authorized_not_performed`) with the true reason, never a claimed
+  delivery. Honesty bounds, per the G-M6 rule that side-effecting executors hash ACTUAL inputs and
+  report what they REALLY did — HARDENED by the council (both reviewers; the XSS sink is closed —
+  the Inbox renders title+body via `textContent`, verified): (a) EVERY agent-controlled string that
+  reaches the operator body is charset/length-bounded BEFORE delivery, not just the topic — the
+  topic and `intent_id` are slugs ([A-Za-z0-9._-], ≤64) and `input_hash` is hex (≤64, or empty), so
+  a mandate cannot phish the operator with free text like `intent_id="URGENT: run revoke-all…"`
+  (council F1; a malformed field Declines, delivering nothing); (b) the declared `input_hash` is
+  written into the delivered body, so echoing it is honest; (c) source_app is hardcoded `mandates`
+  and action_ref is None — the agent cannot spoof another app or plant a deep-link; (d) the row id
+  is keyed on the intent id — the same intent can never produce two rows (belt to the replay
+  guard's suspender), and the idempotent short-circuit fires ONLY on a still-LIVE prior row so a
+  dismissed/expired row is re-delivered rather than falsely reported Performed (council F4);
+  (e) agent-act rows carry a 7-day TTL and are hard-capped at 256 (newest kept) so a flood of
+  distinct intents under ONE mandate cannot grow the operator's Inbox store without bound (council
+  F1-flood — the omitted twin of the events store's own cap); (f) the store write lands BEFORE the
+  secondary "appeared" event (best-effort) so a failed delivery leaves no ghost event and an
+  event-log hiccup never flips a real delivery to Declined (council F3); (g) registered ONLY when
+  the runtime has a data dir (the API server passes its own; carrier_bridge/test states pass None ⇒
+  honestly unwired). Residual (accepted, both reviewers, LOW): the notifications store write is
+  atomic (temp+rename) but not fsync'd, so a power cut between a minted receipt and the durable
+  rename could leave the receipt naming a delivery the Inbox no longer shows — accepted because the
+  notification is convenience state SUBORDINATE to the audit chain (the accountability record is the
+  receipt's `CapabilityUse`, which rides the fsync'd signed chain), and the direction is a benign
+  under-show, not a fabricated delivery. Ratchets:
+  `intent_executor::tests::{notify_delivers_a_real_inbox_notification_and_reports_message,
+  notify_declines_bad_scopes_and_delivers_nothing,
+  notify_declines_operator_unsafe_intent_fields_and_delivers_nothing,
+  notify_flood_is_bounded_by_the_agent_act_cap, notify_is_unwired_without_a_data_dir,
+  notify_declines_when_the_store_write_fails}` + the full loop
+  `capability::tests::dispatch_notify_delivers_to_the_inbox_and_the_receipt_carries_it`
+  (grant → dispatch → REAL delivery visible to the Inbox app → revoke → same act denied with
+  nothing delivered → the portable receipt carries the delivery AND the denial, verified off-box).
+
 - **OPERATOR SURFACE — the mandate list ships as a launchable ElastOS shell app, on LIVE data
   (Sprints 10→12).** The operator sees (and proves) their agents' autonomy through the `mandates`
   capsule (`capsules/mandates/`, `role:app` + `entrypoint:index.html`) — auto-listed by the home

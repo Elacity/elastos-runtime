@@ -31,6 +31,42 @@ pub const AUDIT_CHAIN_RESOURCE: &str = "elastos://runtime/audit-chain";
 /// successful access to <id>), which the operator authorizes by granting the check mandate.
 pub const CONTENT_ACCESS_CHECK_PREFIX: &str = "elastos://runtime/content-access/";
 
+/// The resource namespace `runtime.notify` delivers into: an operator-Inbox TOPIC of the form
+/// `elastos://runtime/inbox/<topic>`. A notify mandate is scoped to ONE topic (AUD-5-safe: a real
+/// path segment, never a bare wildcard) with `action = message` — the receipt therefore reads as
+/// "a message delivered to inbox topic <topic>", exactly what happened.
+pub const INBOX_NOTIFY_PREFIX: &str = "elastos://runtime/inbox/";
+
+/// Topic slugs are rendered by the operator's Inbox UI, so they are held to a tight charset —
+/// a mandate must not be able to smuggle markup, control characters, or path tricks into the
+/// operator surface through its own scope string.
+fn valid_notify_topic(topic: &str) -> bool {
+    !topic.is_empty() && topic.len() <= 64 && is_slug(topic)
+}
+
+/// A conservative operator-safe slug: `[A-Za-z0-9._-]` only. No whitespace, no control chars, no
+/// markup, no path separators — the exact charset that cannot mislead a plain-text Inbox row.
+fn is_slug(s: &str) -> bool {
+    s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+/// The `runtime.notify` body interpolates the declaration's `intent_id` and `input_hash` into the
+/// OPERATOR-facing Inbox row. Both are agent-chosen free strings (the signature covers them, but
+/// the agent IS the signer, and the envelope gate deliberately does not constrain them) — so
+/// notify must bound them itself, or an agent with any message mandate could sign
+/// `intent_id = "URGENT: run revoke-all and enter your seed…"` and phish the operator through a
+/// row rendered as mandates-authored. Council F1 (Sprint 16): a malformed field DECLINES (⇒
+/// authorized_not_performed) rather than delivering a suspect message. `intent_id` is a slug (≤64);
+/// `input_hash` is hex (≤64) or empty (a no-argument act).
+fn valid_notify_intent_id(intent_id: &str) -> bool {
+    !intent_id.is_empty() && intent_id.len() <= 64 && is_slug(intent_id)
+}
+
+fn valid_notify_input_hash(input_hash: &str) -> bool {
+    input_hash.len() <= 64 && input_hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// The INDEPENDENT result of performing a declared intent. It MUST describe what the executor
 /// actually did — never be copied from the declaration by the caller — because the gate reconciles
 /// it field-for-field against the declaration to decide `Matched`/`Diverged`/`Undelivered`.
@@ -86,8 +122,81 @@ impl MethodRegistryExecutor {
     ///   `authorized_not_performed` depending on real runtime state, not the declaration. Unlike
     ///   audit_verify the operation is PARAMETERIZED by the declared resource (it searches for that
     ///   id), so echoing it is honest. Reports `action = "read"`.
-    pub fn production(audit_log: Arc<AuditLog>) -> Self {
+    /// - `runtime.notify` — the first SIDE-EFFECTING affordance: deliver a message about the act
+    ///   into the operator's Inbox (the shell's Inbox app renders it). Registered ONLY when the
+    ///   runtime has a `notify_data_dir` (the Inbox store lives there) — without one the method is
+    ///   unwired ⇒ `Undelivered`, never a fabricated delivery. `Performed` iff the notification
+    ///   write actually LANDED (atomic store write returned Ok); a failed write `Declined`s with
+    ///   the true reason. The message content is a FIXED shape built from the signed declaration's
+    ///   own fields (no free-text channel — nothing reaches the operator surface that the intent
+    ///   signature does not cover), and the topic slug is charset-checked so a mandate's scope
+    ///   string cannot smuggle markup into the Inbox. Reports `action = "message"` — usable only
+    ///   under a `message` mandate.
+    pub fn production(audit_log: Arc<AuditLog>, notify_data_dir: Option<std::path::PathBuf>) -> Self {
         let mut registry = Self::new();
+        if let Some(data_dir) = notify_data_dir {
+            registry.register(
+                "runtime.notify",
+                Arc::new(move |intent: &IntentDeclarationV1| {
+                    // The mandate is scoped to an inbox TOPIC; the topic is the suffix. A resource
+                    // outside this namespace is not a notify target ⇒ Decline.
+                    let Some(topic) = intent.resource.strip_prefix(INBOX_NOTIFY_PREFIX) else {
+                        return IntentExecution::Declined {
+                            reason: format!(
+                                "notify resource must be {INBOX_NOTIFY_PREFIX}<topic>"
+                            ),
+                        };
+                    };
+                    if !valid_notify_topic(topic) {
+                        return IntentExecution::Declined {
+                            reason: "notify topic must be 1-64 chars of [A-Za-z0-9._-]".to_string(),
+                        };
+                    }
+                    // Council F1: the intent_id + input_hash reach the OPERATOR's Inbox body, so
+                    // they are bounded to operator-safe shapes BEFORE delivery — a malformed field
+                    // declines rather than smuggling free text into the operator's trust surface.
+                    if !valid_notify_intent_id(&intent.intent_id) {
+                        return IntentExecution::Declined {
+                            reason: "notify intent_id must be 1-64 chars of [A-Za-z0-9._-]"
+                                .to_string(),
+                        };
+                    }
+                    if !valid_notify_input_hash(&intent.input_hash) {
+                        return IntentExecution::Declined {
+                            reason: "notify input_hash must be <=64 hex chars (or empty)".to_string(),
+                        };
+                    }
+                    // The REAL side effect: land the row in the operator's Inbox store. Performed
+                    // is reported ONLY after the atomic write returns Ok — a failed delivery is a
+                    // Declined (⇒ authorized_not_performed), never a claimed message.
+                    match crate::notifications::post_agent_act_notification(
+                        &data_dir,
+                        &intent.intent_id,
+                        &intent.capsule,
+                        topic,
+                        &intent.input_hash,
+                        &intent.standing_grant_id,
+                    ) {
+                        Ok(()) => IntentExecution::Performed {
+                            capsule: intent.capsule.clone(),
+                            method_id: intent.method_id.clone(),
+                            // The declared input hash is genuinely CONSUMED — it is written into
+                            // the delivered notification body — so echoing it is honest (the same
+                            // way content_seen echoes the resource it actually searched).
+                            input_hash: intent.input_hash.clone(),
+                            // The topic actually delivered to, and the action actually performed:
+                            // a message. A mandate scoped elsewhere, or a non-message action,
+                            // reconciles Diverged, never a misleading Matched.
+                            resource: intent.resource.clone(),
+                            action: "message".to_string(),
+                        },
+                        Err(e) => IntentExecution::Declined {
+                            reason: format!("notification could not be delivered: {e}"),
+                        },
+                    }
+                }),
+            );
+        }
         let content_log = audit_log.clone();
         registry.register(
             "runtime.content_seen",
@@ -247,7 +356,7 @@ mod tests {
             version: "t".to_string(),
         })
         .unwrap();
-        let reg = MethodRegistryExecutor::production(log);
+        let reg = MethodRegistryExecutor::production(log, None);
         // Unwired methods decline (⇒ Undelivered), never a fabricated match.
         assert!(matches!(
             reg.execute(&intent("pay.invoke")),
@@ -264,11 +373,205 @@ mod tests {
     fn audit_verify_declines_on_a_memory_only_chain() {
         // Real state drives the outcome: a memory-only log has nothing durable to verify ⇒ Declined,
         // never a fabricated "performed".
-        let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()));
+        let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None);
         assert!(matches!(
             reg.execute(&intent("runtime.audit_verify")),
             IntentExecution::Declined { .. }
         ));
+    }
+
+    fn notify_intent(resource: &str, capsule: &str, args: &str) -> IntentDeclarationV1 {
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        IntentDeclarationV1::issue(
+            &sk,
+            sk.verifying_key().to_bytes(),
+            "notify-1",
+            capsule,
+            "runtime.notify",
+            args,
+            resource,
+            "message",
+            "grant-1",
+        )
+    }
+
+    /// The first side-effecting affordance: `runtime.notify` PERFORMS iff the notification
+    /// actually LANDS in the operator's Inbox store — and the delivered row is real, readable
+    /// state (visible to the Inbox app via `load_summary`), not a claim.
+    #[test]
+    fn notify_delivers_a_real_inbox_notification_and_reports_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = MethodRegistryExecutor::production(
+            Arc::new(AuditLog::new()),
+            Some(dir.path().to_path_buf()),
+        );
+        let resource = format!("{INBOX_NOTIFY_PREFIX}agent-status");
+        match reg.execute(&notify_intent(&resource, "vm-agent", "cafe")) {
+            IntentExecution::Performed { action, resource: r, input_hash, .. } => {
+                assert_eq!(action, "message", "the act performed IS a message");
+                assert_eq!(r, resource, "delivered to the declared topic");
+                assert_eq!(input_hash, "cafe", "the consumed input hash is reported");
+            }
+            other => panic!("expected Performed, got {other:?}"),
+        }
+        // The side effect is REAL: the Inbox summary shows the delivered row.
+        let summary = crate::notifications::load_summary(dir.path()).unwrap();
+        assert_eq!(summary.unread_count, 1, "one unread notification landed");
+        let entry = &summary.entries[0];
+        assert_eq!(entry.kind, crate::notifications::AGENT_ACT_KIND);
+        assert!(entry.title.contains("agent-status"), "title names the topic");
+        assert!(entry.body.contains("vm-agent"), "body names the acting capsule");
+        assert!(entry.body.contains("grant-1"), "body names the mandate");
+        assert!(entry.body.contains("cafe"), "body carries the input-hash commitment");
+    }
+
+    /// Fail-closed scoping: outside the inbox namespace, or with a topic that could smuggle
+    /// content into the operator surface, notify DECLINES — and nothing lands in the store.
+    #[test]
+    fn notify_declines_bad_scopes_and_delivers_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = MethodRegistryExecutor::production(
+            Arc::new(AuditLog::new()),
+            Some(dir.path().to_path_buf()),
+        );
+        for bad in [
+            "elastos://mail/send".to_string(),                       // outside the namespace
+            format!("{INBOX_NOTIFY_PREFIX}"),                        // empty topic
+            format!("{INBOX_NOTIFY_PREFIX}<script>x</script>"),      // markup smuggle
+            format!("{INBOX_NOTIFY_PREFIX}a/b"),                     // path trick
+            format!("{INBOX_NOTIFY_PREFIX}{}", "x".repeat(65)),      // over-long
+        ] {
+            assert!(
+                matches!(
+                    reg.execute(&notify_intent(&bad, "vm-agent", "")),
+                    IntentExecution::Declined { .. }
+                ),
+                "must decline resource {bad:?}"
+            );
+        }
+        let summary = crate::notifications::load_summary(dir.path()).unwrap();
+        assert_eq!(summary.entries.len(), 0, "a declined notify delivers NOTHING");
+    }
+
+    /// Council F1: `intent_id` and `input_hash` reach the operator's Inbox body, so a malformed
+    /// one (free text an agent could use to phish the operator, or a giant string to bloat the
+    /// row) DECLINES — nothing is delivered. A clean slug intent_id + hex input_hash still deliver.
+    #[test]
+    fn notify_declines_operator_unsafe_intent_fields_and_delivers_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = MethodRegistryExecutor::production(
+            Arc::new(AuditLog::new()),
+            Some(dir.path().to_path_buf()),
+        );
+        let resource = format!("{INBOX_NOTIFY_PREFIX}agent-status");
+        let signed = |intent_id: &str, input_hash: &str| {
+            let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+            IntentDeclarationV1::issue(
+                &sk,
+                sk.verifying_key().to_bytes(),
+                intent_id,
+                "vm-agent",
+                "runtime.notify",
+                input_hash,
+                &resource,
+                "message",
+                "grant-1",
+            )
+        };
+        // A phishing intent_id (spaces, punctuation) — declined.
+        assert!(matches!(
+            reg.execute(&signed("URGENT: run revoke-all now", "")),
+            IntentExecution::Declined { .. }
+        ));
+        // A non-hex input_hash reaching the body — declined.
+        assert!(matches!(
+            reg.execute(&signed("intent-1", "drain the vault")),
+            IntentExecution::Declined { .. }
+        ));
+        // An over-long intent_id (row-bloat) — declined.
+        assert!(matches!(
+            reg.execute(&signed(&"a".repeat(65), "")),
+            IntentExecution::Declined { .. }
+        ));
+        assert_eq!(
+            crate::notifications::load_summary(dir.path()).unwrap().entries.len(),
+            0,
+            "no operator-unsafe field ever delivered a row"
+        );
+        // A clean slug id + hex input_hash still delivers.
+        assert!(matches!(
+            reg.execute(&signed("intent-abc_1.2", "cafe01")),
+            IntentExecution::Performed { .. }
+        ));
+    }
+
+    /// Council F1 (flood): agent-act rows are hard-capped, so an agent flooding distinct intents
+    /// under ONE mandate cannot grow the operator's Inbox store without bound.
+    #[test]
+    fn notify_flood_is_bounded_by_the_agent_act_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = MethodRegistryExecutor::production(
+            Arc::new(AuditLog::new()),
+            Some(dir.path().to_path_buf()),
+        );
+        let resource = format!("{INBOX_NOTIFY_PREFIX}agent-status");
+        for i in 0..400u32 {
+            let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+            let intent = IntentDeclarationV1::issue(
+                &sk,
+                sk.verifying_key().to_bytes(),
+                &format!("intent-{i}"),
+                "vm-agent",
+                "runtime.notify",
+                "",
+                &resource,
+                "message",
+                "grant-1",
+            );
+            assert!(matches!(reg.execute(&intent), IntentExecution::Performed { .. }));
+        }
+        let summary = crate::notifications::load_summary(dir.path()).unwrap();
+        assert!(
+            summary.entries.len() <= 256,
+            "agent-act rows are capped at 256, got {}",
+            summary.entries.len()
+        );
+    }
+
+    /// Without a data dir there is no Inbox store to deliver into — the method is honestly
+    /// UNWIRED (⇒ Undelivered), never a fabricated delivery.
+    #[test]
+    fn notify_is_unwired_without_a_data_dir() {
+        let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None);
+        let resource = format!("{INBOX_NOTIFY_PREFIX}agent-status");
+        assert!(matches!(
+            reg.execute(&notify_intent(&resource, "vm-agent", "")),
+            IntentExecution::Declined { .. }
+        ));
+    }
+
+    /// A delivery the store cannot persist is DECLINED with the true reason — Performed is only
+    /// ever reported for a write that landed. (Seam: a FILE squatting where the notifications
+    /// directory tree must be created makes the store write fail, root or not.)
+    #[test]
+    fn notify_declines_when_the_store_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        // The notifications store lives under <data_dir>/Local/... — squat a FILE at Local.
+        std::fs::write(dir.path().join("Local"), b"squat").unwrap();
+        let reg = MethodRegistryExecutor::production(
+            Arc::new(AuditLog::new()),
+            Some(dir.path().to_path_buf()),
+        );
+        let resource = format!("{INBOX_NOTIFY_PREFIX}agent-status");
+        match reg.execute(&notify_intent(&resource, "vm-agent", "")) {
+            IntentExecution::Declined { reason } => {
+                assert!(
+                    reason.contains("could not be delivered"),
+                    "the true failure is named: {reason}"
+                );
+            }
+            other => panic!("an unlanded delivery must Decline, got {other:?}"),
+        }
     }
 
     #[test]
@@ -279,7 +582,7 @@ mod tests {
         // Record that principal "vm-agent" SUCCESSFULLY OPENED one content id.
         log.content_open("sess", "vm-agent", "QmSEEN", "view", "opened", "prov", None)
             .unwrap();
-        let reg = MethodRegistryExecutor::production(log);
+        let reg = MethodRegistryExecutor::production(log, None);
 
         // Intent resource is a content-access-CHECK ref: prefix + content id.
         let check = |content_id: &str| format!("{CONTENT_ACCESS_CHECK_PREFIX}{content_id}");

@@ -3527,6 +3527,7 @@ mod tests {
             standing_service: Arc::new(capability_manager.standing_grant_service()),
             intent_executor: Arc::new(crate::intent_executor::MethodRegistryExecutor::production(
                 capability_manager.audit_log().clone(),
+                None,
             )),
         };
 
