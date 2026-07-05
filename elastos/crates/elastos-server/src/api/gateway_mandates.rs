@@ -73,6 +73,32 @@ async fn mandates_list(
     .into_response()
 }
 
+/// GET /api/apps/mandates/agent-state — the operator's view of durable agent state (Sprint 18).
+///
+/// Read-only, OPERATOR-scoped: it spans every principal because the caller is the shell (the
+/// runtime's grant root, gated by the same home-launch token as the mandate list), the trust level
+/// that already sees every mandate. It is NOT an agent path — agents remain isolated by the
+/// per-principal `get_agent_state`; this only lets the OWNER watch what its agents have written
+/// under their mandates. The value shown is the `input_hash` COMMITMENT (labelled as such by the
+/// UI), never content bytes — the store holds no payload.
+async fn agent_state_list(
+    State(state): State<MandateApiState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Err(err) = super::require_home_launch_token(&state.data_dir, &headers, MANDATES_CAPSULE_ID)
+    {
+        return mandate_auth_error(err);
+    }
+    match crate::agent_store::list_agent_state(&state.data_dir) {
+        Ok(entries) => Json(serde_json::json!({ "entries": entries })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not read agent state: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 /// GET /api/apps/mandates/mandate/:token_id/receipt — the portable per-mandate receipt.
 ///
 /// Mirrors [`crate::api::handlers::capability::mandate_receipt`]: read-only over the durable chain;
@@ -190,6 +216,7 @@ fn mandate_auth_error(err: anyhow::Error) -> axum::response::Response {
 pub(crate) fn mandate_router(state: MandateApiState) -> Router {
     Router::new()
         .route("/api/apps/mandates/standing-grants", get(mandates_list))
+        .route("/api/apps/mandates/agent-state", get(agent_state_list))
         .route(
             "/api/apps/mandates/mandate/:token_id/receipt",
             get(mandate_receipt),
@@ -363,6 +390,55 @@ mod tests {
             state.standing_service.list().is_empty(),
             "every refused mint must mint NOTHING"
         );
+    }
+
+    /// The agent-state view is fail-closed: no home-launch token ⇒ 401, no state leaks.
+    #[tokio::test]
+    async fn agent_state_route_requires_home_launch_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = mandate_router(state_for(dir.path()));
+        let denied = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mandates/agent-state")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// With a valid token the operator sees ALL agents' durable state (spanning principals), as the
+    /// store holds it — the input_hash COMMITMENT, never content.
+    #[tokio::test]
+    async fn agent_state_route_reflects_the_store_across_principals() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two different agents write state directly into the store the route reads.
+        crate::agent_store::put_agent_state(dir.path(), "vm-a", "cursor", "cafe01", "g1", "i1").unwrap();
+        crate::agent_store::put_agent_state(dir.path(), "vm-b", "flag", "beef02", "g2", "i2").unwrap();
+        let app = mandate_router(state_for(dir.path()));
+        let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mandates/agent-state")
+                    .header(HOME_TOKEN_HEADER, token_hdr)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entries = json["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 2, "operator sees BOTH agents' state");
+        let a = entries.iter().find(|e| e["capsule"] == "vm-a").unwrap();
+        assert_eq!(a["key"], "cursor");
+        assert_eq!(a["value_hash"], "cafe01", "the commitment, verbatim from the store");
+        assert_eq!(a["grant_id"], "g1", "attributed to the mandate");
+        assert!(entries.iter().any(|e| e["capsule"] == "vm-b" && e["key"] == "flag"));
     }
 
     /// The list route is fail-closed: no home-launch token ⇒ 401, no data leaks.

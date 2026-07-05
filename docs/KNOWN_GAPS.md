@@ -237,10 +237,18 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   (f) `Performed` iff the atomic write LANDED, else `Declined` with the true reason; (g) registered
   ONLY with a data dir (carrier/tests pass None ⇒ honestly unwired). The write is a REAL durable
   effect — the entry lands in `agent_state.json` and `agent_store::get_agent_state` reads it back
-  (principal-scoped) — so the effect is independently observable, not just claimed; a production
-  read SURFACE (operator route / read affordance) is a follow-up (today `get_agent_state` is
-  exercised by the ratchets, and nothing on a trusted decision path reads the store, so an agent
-  writing its own value cannot escalate — red-team F3). Scale watch-item (red-team F2, SUSPECTED
+  (principal-scoped) — so the effect is independently observable, not just claimed. The operator
+  READ SURFACE landed (Sprint 18, closing the red-team F3 follow-up): `GET
+  /api/apps/mandates/agent-state` (home-token gated) + an "Agent state" panel in the Mandates shell
+  app show what every agent has written under its mandate — capsule, key, the commitment hash
+  (labelled as such, never content), version, attributing mandate, time. It is OPERATOR-scoped
+  (`agent_store::list_agent_state` spans all principals) because the caller is the shell / grant
+  root that already sees every mandate — NOT an agent path (agents stay isolated by the
+  per-principal `get_agent_state`; nothing on a trusted decision path reads the store, so an agent
+  writing its own value still cannot escalate). The panel renders every cell via `textContent` (the
+  council-hardened XSS discipline), so an agent's key/value/attribution can carry no markup. Read
+  ratchets: `gateway_mandates::tests::{agent_state_route_requires_home_launch_token,
+  agent_state_route_reflects_the_store_across_principals}`. Scale watch-item (red-team F2, SUSPECTED
   low, same shape as the notify inbox store): `put_agent_state` rewrites the whole store per write,
   O(total entries) — bounded because capsule count is operator-gated (agents can't mint mandates)
   and every field is length-bounded; per-capsule sharded files if it ever matters. Ratchets:

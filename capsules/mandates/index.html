@@ -88,6 +88,14 @@
 
   .sectlabel{display:flex;align-items:baseline;gap:10px;margin:26px 2px 12px}
   .sectlabel #newbtn{margin-left:auto}
+  .statewrap{background:var(--surface-2);border:1px solid var(--line);border-radius:11px;overflow-x:auto}
+  .statetable{width:100%;border-collapse:collapse;font-size:12px}
+  .statetable th{text-align:left;font-weight:600;color:var(--ink-3);padding:9px 12px;border-bottom:1px solid var(--line);white-space:nowrap}
+  .statetable td{padding:9px 12px;border-bottom:1px solid var(--line);color:var(--ink-2);vertical-align:top}
+  .statetable tr:last-child td{border-bottom:none}
+  .statetable .kmono{font-family:var(--font-mono);color:var(--ink)}
+  .statetable .vmono{font-family:var(--font-mono);color:var(--ink-2);word-break:break-all}
+  .stateempty{padding:14px;font-size:12px;color:var(--ink-3)}
   .sectlabel h2{font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-2);margin:0;font-weight:600}
   .sectlabel .hint{font-size:12px;color:var(--ink-3)}
 
@@ -262,6 +270,20 @@
   </div>
 
   <div class="grid" id="grid"></div>
+
+  <div class="sectlabel" id="statelabel" hidden>
+    <h2>Agent state</h2>
+    <span class="hint">what your agents have written under their mandates — the value is a commitment hash, not content</span>
+  </div>
+  <div class="statewrap" id="statewrap" hidden>
+    <table class="statetable">
+      <thead>
+        <tr><th>Agent</th><th>Key</th><th>Value (commitment)</th><th>Ver</th><th>Mandate</th><th>Written</th></tr>
+      </thead>
+      <tbody id="statebody"></tbody>
+    </table>
+    <div class="stateempty" id="stateempty" hidden>No agent has written state yet.</div>
+  </div>
 
   <footer>
     A mandate is a scoped, expiring, revocable grant to one agent key. Its receipt is a portable,
@@ -561,6 +583,46 @@
       .then(function(r){ if(!r.ok) throw new Error("http "+r.status); return r.json(); })
       .then(function(j){ paint({mandates:j.mandates||[], signer_public_key_hex:j.signer_public_key_hex}, false); })
       .catch(function(err){ showUnreachable("Could not load mandates from the runtime ("+esc(String(err&&err.message||err))+").");});
+    loadAgentState();
+  }
+
+  // Operator's view of durable agent state (Sprint 18) — in-shell only, read-only. Every cell is
+  // set via textContent (never innerHTML), so an agent's key/value/attribution can carry no markup.
+  // The value column is the input_hash COMMITMENT, labelled as such — the runtime stores no content.
+  function fmtWhen(secs){
+    var n = Number(secs); if(!n) return "—";
+    try { return new Date(n*1000).toISOString().slice(0,16).replace("T"," "); } catch(e){ return String(secs); }
+  }
+  function cell(row, text, cls){
+    var td = document.createElement("td");
+    if (cls) td.className = cls;
+    td.textContent = text;
+    row.appendChild(td);
+  }
+  function loadAgentState(){
+    if (!IN_SHELL) return;
+    fetch("/api/apps/mandates/agent-state", {headers:launchHeaders()})
+      .then(function(r){ if(!r.ok) throw new Error("http "+r.status); return r.json(); })
+      .then(function(j){ renderAgentState(Array.isArray(j.entries)?j.entries:[]); })
+      .catch(function(){ /* the state panel is auxiliary — a failure hides it, never blocks mandates */
+        $("#statelabel").hidden = true; $("#statewrap").hidden = true; });
+  }
+  function renderAgentState(entries){
+    $("#statelabel").hidden = false;
+    $("#statewrap").hidden = false;
+    var tbody = $("#statebody");
+    tbody.innerHTML = "";
+    $("#stateempty").hidden = entries.length > 0;
+    entries.forEach(function(e){
+      var tr = document.createElement("tr");
+      cell(tr, String(e.capsule||""));
+      cell(tr, String(e.key||""), "kmono");
+      cell(tr, e.value_hash ? shortId(String(e.value_hash)) : "(empty)", "vmono");
+      cell(tr, "v"+String(e.version||1));
+      cell(tr, shortId(String(e.grant_id||"")), "kmono");
+      cell(tr, fmtWhen(e.written_at));
+      tbody.appendChild(tr);
+    });
   }
 
   // Grant-from-the-shell (Sprint 15): the form exists ONLY in-shell — the mint rides the same

@@ -169,7 +169,8 @@ pub fn put_agent_state(
 }
 
 /// Read back an agent-state key, PRINCIPAL-SCOPED: only `capsule`'s own key is returned. A missing
-/// key (or a different capsule's key) is `None` — never another principal's state.
+/// key (or a different capsule's key) is `None` — never another principal's state. This is the
+/// AGENT-facing read (one principal, its own key); an agent must never reach across principals.
 pub fn get_agent_state(
     data_dir: &Path,
     capsule: &str,
@@ -181,6 +182,18 @@ pub fn get_agent_state(
         .entries
         .into_iter()
         .find(|e| e.capsule == capsule && e.key == key))
+}
+
+/// Every agent-state entry, sorted by `(capsule, key)` — the OPERATOR-facing read. This deliberately
+/// spans ALL principals because the caller is the operator/shell (the runtime's grant root, gated by
+/// the home-launch token), the same trust level that already sees every mandate. It is NOT an agent
+/// path: no agent reaches this — the per-principal isolation (`get_agent_state`) is what protects
+/// agents from each other; the operator, who owns the runtime, sees the whole picture.
+pub fn list_agent_state(data_dir: &Path) -> anyhow::Result<Vec<AgentStateEntry>> {
+    let path = agent_state_path(data_dir)?;
+    let mut entries = read_store(&path)?.entries;
+    entries.sort_by(|a, b| a.capsule.cmp(&b.capsule).then(a.key.cmp(&b.key)));
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -233,6 +246,12 @@ mod tests {
         let store = read_store(&agent_state_path(d).unwrap()).unwrap();
         let a_keys = store.entries.iter().filter(|e| e.capsule == "vm-a").count();
         assert!(a_keys <= MAX_KEYS_PER_CAPSULE, "A capped at {MAX_KEYS_PER_CAPSULE}, got {a_keys}");
+        // The operator-facing list spans all principals (sorted), unlike the per-agent read.
+        let all = list_agent_state(d).unwrap();
+        assert!(all.iter().any(|e| e.capsule == "vm-b" && e.key == "keep"));
+        assert!(all.iter().any(|e| e.capsule == "vm-a"));
+        assert!(all.windows(2).all(|w| (w[0].capsule.as_str(), w[0].key.as_str())
+            <= (w[1].capsule.as_str(), w[1].key.as_str())), "sorted by (capsule, key)");
         // B's key is never evicted by A's flood.
         assert!(get_agent_state(d, "vm-b", "keep").unwrap().is_some());
         // The LAST key written is always readable back — the cap never evicts the just-written key
