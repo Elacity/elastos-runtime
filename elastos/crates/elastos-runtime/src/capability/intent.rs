@@ -246,6 +246,16 @@ pub struct StandingGrantEnvelope {
     /// the keyed-MAC roadmap item), not a property this field claims.
     #[serde(deserialize_with = "de_present_option")]
     pub dispatch_limit: Option<u32>,
+    /// When this grant was revoked (unix secs), if it has been (Sprint 23). Set by `revoke` /
+    /// `revoke_all`; `None` while live. Powers time-based RETENTION: a grant dead (revoked or
+    /// expired) longer than [`GRANT_RETENTION_SECS`] is pruned from the working registry (the audit
+    /// CHAIN keeps the grant + revoke + uses forever — the receipt is the permanent record; the
+    /// registry is the working set). Unlike the narrowing fields above this is `serde(default)`, NOT
+    /// presence-required: a snapshot missing it loads as `None` = "unknown revoke time → never
+    /// time-prune → RETAIN", the fail-safe direction (a dropped key can only keep a grant longer,
+    /// never prune it early or widen authority), so it needs no version bump or migration.
+    #[serde(default)]
+    pub revoked_at: Option<u64>,
 }
 
 impl StandingGrantEnvelope {
@@ -259,6 +269,21 @@ impl StandingGrantEnvelope {
             Some(exp) => exp.is_future(),
             None => true,
         }
+    }
+
+    /// The unix time this grant became DEAD, for retention (Sprint 23). `None` = either still live,
+    /// OR revoked without a recorded timestamp (a legacy grant — untimeable, so never TIME-pruned;
+    /// the hard cap can still evict it). A revoke times it via `revoked_at`; an expiry times it via
+    /// `expires_at`. Revocation (the explicit kill) wins when both apply.
+    fn dead_since(&self) -> Option<u64> {
+        if self.is_active() {
+            return None;
+        }
+        if self.revoked {
+            return self.revoked_at;
+        }
+        // Inactive and not revoked ⇒ expired, so `expires_at` is necessarily `Some`.
+        self.expires_at.map(|e| e.unix_secs)
     }
 
     /// Derive a standing envelope from a real issued [`CapabilityToken`] (chunk 3): the
@@ -286,6 +311,7 @@ impl StandingGrantEnvelope {
             agent_pubkey: agent_pubkey.map(|k| k.trim().to_lowercase()),
             token_epoch: token.constraints().epoch(),
             dispatch_limit,
+            revoked_at: None,
         }
     }
 }
@@ -835,6 +861,18 @@ pub const MANDATE_DISPATCH_LIMIT_MAX: u32 = 3600;
 /// non-existent) grant_ids cannot grow it without bound, even within a single window.
 const DISPATCH_RATE_SOFT_CAP: usize = 4096;
 
+/// How long a DEAD (revoked or expired) mandate is retained in the working registry before it is
+/// pruned (Sprint 23, closes G-M7). Generous — 30 days — so an operator sees recently-killed
+/// mandates on the card long after the fact; the audit CHAIN keeps the grant/revoke/uses forever
+/// (the receipt is the permanent record), so pruning the working-set entry erases nothing provable.
+/// Only DEAD grants age out; a live mandate is never pruned by time.
+pub const GRANT_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
+/// The working registry's hard cap (Sprint 23). After the time-retention prune, if the map is still
+/// over this, the OLDEST-dead grants are evicted until at cap — never a live one. Bounds the
+/// accumulation G-M7 flagged (dead grants piling up); a live set larger than this is operator-real
+/// authority (bounded by real issuance, like any resource), never shed to satisfy the cap.
+const REGISTRY_HARD_CAP: usize = 4096;
+
 /// The on-disk snapshot of the standing-grant registry, version-pinned. Same-disk custody caveat
 /// as the audit log's head-anchor: this defends against loss/corruption (strict parse, fail-closed
 /// boot), not against a root attacker rewriting the file — that adversary already owns the runtime
@@ -901,6 +939,9 @@ impl From<LegacyStandingGrantEnvelope> for StandingGrantEnvelope {
             agent_pubkey: l.agent_pubkey,
             token_epoch: l.token_epoch,
             dispatch_limit: None,
+            // A legacy grant carries no revoke timestamp; None = never time-prune (retain). If it
+            // was revoked, it stays queryable-as-revoked and only the hard cap can ever shed it.
+            revoked_at: None,
         }
     }
 }
@@ -1041,8 +1082,76 @@ impl StandingGrantStore {
             store
                 .max_evicted_declared_at
                 .store(max_evicted, std::sync::atomic::Ordering::SeqCst);
+            drop(seen);
+            // Bound a file that grew under an OLDER binary (Sprint 23): prune dead-past-retention +
+            // over-cap grants on boot, then rewrite the shrunk snapshot. Best-effort — if the
+            // rewrite fails the pruned entries simply persist on disk and re-prune next mutation /
+            // boot (disk-holds-extra-dead is harmless, never a lost revoke or a revived mandate).
+            let now = SecureTimestamp::now().unix_secs;
+            let mut grants = match store.grants.write() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let pruned = Self::prune_registry_locked(&mut grants, now, "");
+            if !pruned.is_empty() {
+                let seen = match store.seen_intents.write() {
+                    Ok(s) => s,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let _ = store.persist_locked(&grants, &seen);
+            }
         }
         Ok(store)
+    }
+
+    /// Prune the working registry (Sprint 23, closes G-M7), returning the removed entries so the
+    /// caller can ROLL BACK on a persist failure. Runs under the grants write guard. Two stages,
+    /// both of which NEVER remove a live grant and never the `exempt` id (the one just issued):
+    /// 1. TIME RETENTION — drop grants dead (revoked/expired) longer than [`GRANT_RETENTION_SECS`].
+    /// 2. HARD CAP — if the map is STILL over [`REGISTRY_HARD_CAP`], evict the OLDEST-dead grants
+    ///    (revoked-untimeable ones first, keyed dead-time 0) until at cap. If everything over the
+    ///    cap is LIVE, the map stays over cap — a live mandate is operator-real authority, never
+    ///    shed to satisfy a bound; the cap exists to reclaim DEAD accumulation, the G-M7 vector.
+    ///
+    /// The audit CHAIN keeps every grant/revoke/use regardless — pruning the working set erases
+    /// nothing provable (the receipt is the permanent record; this is the working set).
+    fn prune_registry_locked(
+        grants: &mut HashMap<String, StandingGrantEnvelope>,
+        now_secs: u64,
+        exempt: &str,
+    ) -> Vec<(String, StandingGrantEnvelope)> {
+        let mut removed = Vec::new();
+        // Stage 1: time retention — a grant dead longer than the window ages out.
+        let aged: Vec<String> = grants
+            .iter()
+            .filter(|(id, _)| id.as_str() != exempt)
+            .filter_map(|(id, env)| {
+                env.dead_since()
+                    .filter(|t| now_secs >= t.saturating_add(GRANT_RETENTION_SECS))
+                    .map(|_| id.clone())
+            })
+            .collect();
+        for id in aged {
+            if let Some(env) = grants.remove(&id) {
+                removed.push((id, env));
+            }
+        }
+        // Stage 2: hard cap — shed the oldest DEAD grants (never a live one) until at cap.
+        if grants.len() > REGISTRY_HARD_CAP {
+            let mut dead: Vec<(u64, String)> = grants
+                .iter()
+                .filter(|(id, env)| id.as_str() != exempt && !env.is_active())
+                .map(|(id, env)| (env.dead_since().unwrap_or(0), id.clone()))
+                .collect();
+            dead.sort(); // oldest-dead (smallest dead-time, then id) first
+            let overflow = grants.len() - REGISTRY_HARD_CAP;
+            for (_, id) in dead.into_iter().take(overflow) {
+                if let Some(env) = grants.remove(&id) {
+                    removed.push((id, env));
+                }
+            }
+        }
+        removed
     }
 
     /// Write the full snapshot atomically (temp + fsync + rename). Called with BOTH write guards
@@ -1116,8 +1225,17 @@ impl StandingGrantStore {
         };
         let grant_id = envelope.grant_id.clone();
         let previous = grants.insert(grant_id.clone(), envelope);
+        // Bound the working registry AT the growth point (Sprint 23): the just-issued grant is
+        // exempt (never pruned, even if issued already-dead), so issuance always succeeds while
+        // dead accumulation is reclaimed. Persist ONCE with the pruned state.
+        let now = SecureTimestamp::now().unix_secs;
+        let pruned = Self::prune_registry_locked(&mut grants, now, &grant_id);
         if let Err(e) = self.persist_locked(&grants, &seen) {
-            // Roll back: disk is the durable truth; memory must not run ahead of it.
+            // Roll back: disk is the durable truth; memory must not run ahead of it. Restore the
+            // pruned entries AND undo the insert, so a failed write leaves the map exactly as it was.
+            for (id, env) in pruned {
+                grants.insert(id, env);
+            }
             match previous {
                 Some(prev) => grants.insert(grant_id, prev),
                 None => grants.remove(&grant_id),
@@ -1141,15 +1259,19 @@ impl StandingGrantStore {
             Ok(s) => s,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let now = SecureTimestamp::now().unix_secs;
         match grants.get_mut(grant_id) {
             Some(env) if !env.revoked => {
                 env.revoked = true;
+                // Stamp the revoke time so retention can age this dead grant out (Sprint 23).
+                env.revoked_at = Some(now);
             }
             _ => return Ok(false),
         }
         if let Err(e) = self.persist_locked(&grants, &seen) {
             if let Some(env) = grants.get_mut(grant_id) {
                 env.revoked = false;
+                env.revoked_at = None;
             }
             return Err(e);
         }
@@ -1351,10 +1473,12 @@ impl StandingGrantStore {
             Ok(s) => s,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let now = SecureTimestamp::now().unix_secs;
         let mut killed_ids = Vec::new();
         for env in grants.values_mut() {
             if !env.revoked {
                 env.revoked = true;
+                env.revoked_at = Some(now);
                 killed_ids.push(env.grant_id.clone());
             }
         }
@@ -1365,6 +1489,7 @@ impl StandingGrantStore {
             for id in &killed_ids {
                 if let Some(env) = grants.get_mut(id) {
                     env.revoked = false;
+                    env.revoked_at = None;
                 }
             }
             return Err(e);
@@ -1668,6 +1793,7 @@ mod tests {
             agent_pubkey: None,
             token_epoch: 0,
             dispatch_limit: None,
+            revoked_at: None,
         }
     }
 
@@ -2288,7 +2414,105 @@ mod tests {
             agent_pubkey: None,
             token_epoch: 0,
             dispatch_limit: None,
+            revoked_at: None,
         }
+    }
+
+    /// Retention semantics (Sprint 23, closes G-M7): the prune ages out grants DEAD past the
+    /// window, keeps the live and the recently-dead, and NEVER prunes a live grant or a
+    /// revoked-but-untimeable (legacy, `revoked_at: None`) one by time.
+    #[test]
+    fn retention_prune_ages_out_dead_grants_but_keeps_live_and_recent() {
+        let now = 1_000_000_000u64;
+        let old = now - GRANT_RETENTION_SECS - 1; // just past the window
+        let recent = now - 10; // well within the window
+        let mut grants: HashMap<String, StandingGrantEnvelope> = HashMap::new();
+        let mut put = |id: &str, f: &dyn Fn(&mut StandingGrantEnvelope)| {
+            let mut e = envelope_with(id, None);
+            f(&mut e);
+            grants.insert(id.to_string(), e);
+        };
+        // live (never expires) — keep.
+        put("live", &|_| {});
+        // live (future expiry) — keep.
+        put("live-exp", &|e| e.expires_at = Some(SecureTimestamp::at(now + 10_000)));
+        // revoked long ago — prune.
+        put("rev-old", &|e| {
+            e.revoked = true;
+            e.revoked_at = Some(old);
+        });
+        // revoked just now — keep (within retention).
+        put("rev-recent", &|e| {
+            e.revoked = true;
+            e.revoked_at = Some(recent);
+        });
+        // expired long ago (not revoked) — prune (times off `expires_at`).
+        put("exp-old", &|e| e.expires_at = Some(SecureTimestamp::at(old)));
+        // expired recently — keep.
+        put("exp-recent", &|e| e.expires_at = Some(SecureTimestamp::at(recent)));
+        // revoked with NO timestamp (legacy) — keep: untimeable, never time-pruned.
+        put("rev-legacy", &|e| {
+            e.revoked = true;
+            e.revoked_at = None;
+        });
+
+        let removed = StandingGrantStore::prune_registry_locked(&mut grants, now, "");
+        let gone: std::collections::BTreeSet<&str> =
+            removed.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            gone,
+            ["exp-old", "rev-old"].into_iter().collect(),
+            "only grants dead PAST the retention window age out"
+        );
+        for keep in ["live", "live-exp", "rev-recent", "exp-recent", "rev-legacy"] {
+            assert!(grants.contains_key(keep), "{keep} must be retained");
+        }
+    }
+
+    /// The hard cap (Sprint 23) reclaims DEAD accumulation without touching a live mandate: over
+    /// the cap, the oldest-dead grants are evicted first; a live grant is never shed to satisfy it.
+    #[test]
+    fn retention_hard_cap_evicts_oldest_dead_never_live() {
+        let now = 2_000_000_000u64;
+        let mut grants: HashMap<String, StandingGrantEnvelope> = HashMap::new();
+        // A handful of LIVE grants that must all survive even past the cap.
+        for i in 0..8 {
+            grants.insert(format!("live-{i}"), envelope_with(&format!("live-{i}"), None));
+        }
+        // Fill well past the cap with RECENTLY-revoked grants (within retention, so only the cap —
+        // not time-retention — can shed them), each stamped a distinct recent revoke time.
+        for i in 0..(REGISTRY_HARD_CAP + 500) {
+            let mut e = envelope_with(&format!("dead-{i:05}"), None);
+            e.revoked = true;
+            e.revoked_at = Some(now - 100 + (i as u64 % 50)); // all recent, varied
+            grants.insert(format!("dead-{i:05}"), e);
+        }
+        StandingGrantStore::prune_registry_locked(&mut grants, now, "");
+        assert!(
+            grants.len() <= REGISTRY_HARD_CAP,
+            "the registry is hard-bounded at {REGISTRY_HARD_CAP}, got {}",
+            grants.len()
+        );
+        for i in 0..8 {
+            assert!(
+                grants.contains_key(&format!("live-{i}")),
+                "every LIVE mandate survives the cap — never shed to satisfy a bound"
+            );
+        }
+    }
+
+    /// A live-set larger than the cap is NOT shed (Sprint 23): live mandates are operator-real
+    /// authority, bounded by real issuance, never evicted to satisfy the cap.
+    #[test]
+    fn retention_never_sheds_a_live_set_over_cap() {
+        let now = 2_000_000_000u64;
+        let mut grants: HashMap<String, StandingGrantEnvelope> = HashMap::new();
+        for i in 0..(REGISTRY_HARD_CAP + 20) {
+            grants.insert(format!("live-{i:05}"), envelope_with(&format!("live-{i:05}"), None));
+        }
+        let removed = StandingGrantStore::prune_registry_locked(&mut grants, now, "");
+        assert!(removed.is_empty(), "no live grant is ever pruned");
+        assert_eq!(grants.len(), REGISTRY_HARD_CAP + 20, "the live set is kept intact over cap");
     }
 
     #[test]
@@ -3050,6 +3274,50 @@ mod tests {
             StandingGrantStore::with_persistence(&path).is_err(),
             "a v3 envelope missing the dispatch_limit KEY is corrupt, never 'default rate'"
         );
+    }
+
+    /// Retention end-to-end (Sprint 23): `revoke` stamps `revoked_at` and it round-trips restart;
+    /// a pre-Sprint-23 v3 file with NO `revoked_at` key loads as `None` (serde-default, no version
+    /// bump / migration needed); and `issue` PRUNES a grant expired past the retention window.
+    #[test]
+    fn revoke_stamps_revoked_at_roundtrips_and_issue_prunes_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("standing_grants.json");
+        // A v3 file predating Sprint 23: envelope carries dispatch_limit but NO revoked_at key.
+        std::fs::write(
+            &path,
+            r#"{"version":3,"grants":[{"grant_id":"g-live","capsule":"vm-agent",
+                "allowed_methods":["send"],"resource":"elastos://mail/send","action":"execute",
+                "expires_at":null,"agent_pubkey":null,"revoked":false,"token_epoch":0,
+                "dispatch_limit":null}],
+                "seen_intents":[],"max_evicted_declared_at":0}"#,
+        )
+        .unwrap();
+        let store = StandingGrantStore::with_persistence(&path).unwrap();
+        let live = store.get("g-live").expect("a pre-Sprint-23 v3 file loads (revoked_at defaults)");
+        assert_eq!(live.revoked_at, None, "a missing revoked_at defaults to None — no migration");
+
+        // Revoke stamps a time; it survives restart.
+        assert!(store.revoke("g-live").unwrap());
+        let reopened = StandingGrantStore::with_persistence(&path).unwrap();
+        let revd = reopened.get("g-live").expect("still present, revoked");
+        assert!(revd.revoked, "the revoke round-trips");
+        assert!(revd.revoked_at.is_some(), "and the revoke TIME round-trips (Sprint 23)");
+
+        // A grant expired PAST the retention window is pruned the next time the registry grows.
+        let realnow = SecureTimestamp::now().unix_secs;
+        let mut ancient = envelope_with("g-ancient", None);
+        ancient.expires_at = Some(SecureTimestamp::at(realnow - GRANT_RETENTION_SECS - 100));
+        reopened.issue(ancient).unwrap(); // exempt on its own issue — still present here
+        assert!(reopened.get("g-ancient").is_some(), "the just-issued grant is exempt from its own prune");
+        // Issuing ANOTHER grant runs the prune with the ancient one no longer exempt → it ages out.
+        reopened.issue(envelope_with("g-new", None)).unwrap();
+        assert!(
+            reopened.get("g-ancient").is_none(),
+            "a grant dead past the retention window is pruned when the registry next grows"
+        );
+        assert!(reopened.get("g-new").is_some(), "the fresh grant is kept");
+        assert!(reopened.get("g-live").is_some(), "the recently-revoked grant is still within retention");
     }
 
     /// The freshness window (G-M7): a declaration expires (too old) and a future-dated one is

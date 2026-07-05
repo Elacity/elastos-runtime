@@ -412,11 +412,26 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   charge only an AUTHORIZED act — deferred with the agent-facing delegation that doesn't exist yet.
   (ii) **fixed-window boundary** allows up to ~2× the limit across a window edge (60 at the tail of
   W + 60 at the head of W+1); acceptable for a flood bound (still O(1)/window, ~1/s average), noted
-  not silent. STILL OPEN (operator-gated, lower priority): the gateway ISSUE/REVOKE routes carry no
-  request-rate limiter, and `standing_grants.json` never prunes revoked/expired grants — a
-  shell-token holder (the trusted operator) can still flood issue and grow the file. FIX (deferred):
-  a per-token limiter on the gateway mutation routes + a live+revoked cap / retention prune on the
-  store. SHIPPED (Sprint 22): per-mandate-CONFIGURABLE dispatch budgets — `dispatch_limit` is a
+  not silent. RETENTION now SHIPPED (Sprint 23 — closes the registry-growth half of G-M7): the
+  working registry is bounded on BOTH axes. Time: a DEAD grant (revoked past `revoked_at`, or
+  expired past `expires_at`) is pruned `GRANT_RETENTION_SECS` (30 days) after death — generous, so
+  the operator sees recently-killed mandates on the card long after, while stale accumulation ages
+  out. Space: a `REGISTRY_HARD_CAP` backstop evicts the OLDEST-dead grants first if still over cap,
+  and NEVER a live one (a live set over cap is operator-real authority, bounded by real issuance —
+  never shed to satisfy a bound). The prune runs at the growth point (`issue`, exempting the
+  just-issued grant) and on boot (to shrink a file grown under an older binary), durable-before-
+  visible with rollback on a persist failure. The principled resolution of the audit-visibility
+  tension: the audit CHAIN keeps every grant/revoke/use forever (the receipt is the permanent
+  record) — pruning the WORKING set erases nothing provable. `revoked_at` is a `serde(default)`
+  field (a missing value = "never time-prune" = RETAIN, the fail-safe direction), so it needs no
+  version bump — a dropped key can only keep a grant longer, never prune it early or widen. Ratchets:
+  `intent::tests::{retention_prune_ages_out_dead_grants_but_keeps_live_and_recent,
+  retention_hard_cap_evicts_oldest_dead_never_live, retention_never_sheds_a_live_set_over_cap,
+  revoke_stamps_revoked_at_roundtrips_and_issue_prunes_expired}`. STILL OPEN (operator-gated, lower
+  priority): the gateway ISSUE/REVOKE routes carry no request-RATE limiter — a shell-token holder
+  (the trusted operator) can still burst issue/revoke calls (the registry SIZE they grow is now
+  bounded, but the request rate is not). FIX (deferred): a per-token limiter on the gateway mutation
+  routes. SHIPPED (Sprint 22): per-mandate-CONFIGURABLE dispatch budgets — `dispatch_limit` is a
   first-class grant property (registry state, same trust level as agent-binding — not signed into
   the token or the receipt), set at mint (API + shell form; the CLI does not set it yet — a known
   follow-up, so the claim is scoped to API+form). The mint refuses `0` and anything over
