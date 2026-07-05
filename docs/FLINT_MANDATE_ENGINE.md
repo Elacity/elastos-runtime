@@ -56,12 +56,15 @@ reconciliation seam — receipts minted from what executors report).
 - **G-M4** — agent-key binding optional; promote to default before exposing dispatch to untrusted agents.
 - **G-M7** — operational hardening. *Paid down:* the replay guard is time-windowed + bounded +
   clock-attack-hardened (S19); dispatch is rate-budgeted + grant-existence-gated (S21) with a
-  per-mandate configurable budget (S22); and the working registry is now bounded on both axes —
-  time-retention + hard cap that never sheds a live mandate (S23). All durable state (replay set,
-  dispatch rate, grant registry) is now bounded. *Remaining:* a request-RATE limiter on the gateway
-  mint/revoke routes; and the principled fix for one-click broad grants is role-based capability
-  tiering (a `CapsuleRole::System`), a separate initiative deliberately NOT wedged in on a spoofable
-  capsule name.
+  per-mandate configurable budget (S22); and the working registry's DEAD accumulation is now bounded
+  on both axes — time-retention + hard cap that never sheds a live mandate (S23). Durable *dead*
+  state (replay set, dispatch rate, dead grants) is bounded; *live* mandate growth stays real
+  operator authority by design (never shed). *Remaining:* a request-RATE limiter on the gateway
+  mint/revoke routes; fail-closed mint audit (mint currently emits best-effort, so a mint whose
+  audit append failed has no chain trace — the tracked fix that makes the receipt a complete record
+  for every issued mandate); and the principled fix for one-click broad grants is role-based
+  capability tiering (a `CapsuleRole::System`), a separate initiative deliberately NOT wedged in on a
+  spoofable capsule name.
 
 ## The replay guard (security core)
 

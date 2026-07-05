@@ -248,12 +248,16 @@ pub struct StandingGrantEnvelope {
     pub dispatch_limit: Option<u32>,
     /// When this grant was revoked (unix secs), if it has been (Sprint 23). Set by `revoke` /
     /// `revoke_all`; `None` while live. Powers time-based RETENTION: a grant dead (revoked or
-    /// expired) longer than [`GRANT_RETENTION_SECS`] is pruned from the working registry (the audit
-    /// CHAIN keeps the grant + revoke + uses forever — the receipt is the permanent record; the
-    /// registry is the working set). Unlike the narrowing fields above this is `serde(default)`, NOT
-    /// presence-required: a snapshot missing it loads as `None` = "unknown revoke time → never
-    /// time-prune → RETAIN", the fail-safe direction (a dropped key can only keep a grant longer,
-    /// never prune it early or widen authority), so it needs no version bump or migration.
+    /// expired) longer than [`GRANT_RETENTION_SECS`] is pruned from the working registry — the audit
+    /// CHAIN keeps the grant/revoke/uses independently (the receipt is the permanent record; the
+    /// registry is only the working set), PROVIDED the mint's grant event landed on the chain (mint
+    /// audit is best-effort today — see KNOWN_GAPS G-M7). Unlike the narrowing fields above this is
+    /// `serde(default)`, NOT presence-required: a snapshot missing it loads as `None` = "unknown
+    /// revoke time → never TIME-prune → RETAIN", the fail-safe direction for the time stage (a
+    /// dropped key can only keep a grant longer against the CLOCK, never prune it early or widen
+    /// authority), so it needs no version bump or migration. (Under the hard CAP a `None` here keys
+    /// oldest-dead and is evicted first — but the cap only ever sheds already-DEAD grants, so this
+    /// changes eviction ORDER among the dead, never authority.)
     #[serde(default)]
     pub revoked_at: Option<u64>,
 }
@@ -1113,8 +1117,14 @@ impl StandingGrantStore {
     ///    cap is LIVE, the map stays over cap — a live mandate is operator-real authority, never
     ///    shed to satisfy a bound; the cap exists to reclaim DEAD accumulation, the G-M7 vector.
     ///
-    /// The audit CHAIN keeps every grant/revoke/use regardless — pruning the working set erases
-    /// nothing provable (the receipt is the permanent record; this is the working set).
+    /// The audit CHAIN keeps every grant/revoke/use — pruning the working set erases nothing
+    /// provable (the receipt is the permanent record; this is the working set), PROVIDED the mint's
+    /// grant event landed on the chain (mint audit is best-effort; a mint whose audit append failed
+    /// has no trace independent of the registry — KNOWN_GAPS G-M7, fail-closed mint is the tracked
+    /// fix). Time-death is WALL-CLOCK: a backward clock makes a grant look less-dead (retained —
+    /// safe); a forward excursion beyond the 30-day window could prune a live-but-recently-expiring
+    /// mandate — a bound shared with expiry itself (a clock-jumped mandate already denies), not
+    /// cleanly clampable without a trusted external clock we do not have.
     fn prune_registry_locked(
         grants: &mut HashMap<String, StandingGrantEnvelope>,
         now_secs: u64,

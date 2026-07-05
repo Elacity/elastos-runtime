@@ -412,25 +412,36 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   charge only an AUTHORIZED act — deferred with the agent-facing delegation that doesn't exist yet.
   (ii) **fixed-window boundary** allows up to ~2× the limit across a window edge (60 at the tail of
   W + 60 at the head of W+1); acceptable for a flood bound (still O(1)/window, ~1/s average), noted
-  not silent. RETENTION now SHIPPED (Sprint 23 — closes the registry-growth half of G-M7): the
-  working registry is bounded on BOTH axes. Time: a DEAD grant (revoked past `revoked_at`, or
-  expired past `expires_at`) is pruned `GRANT_RETENTION_SECS` (30 days) after death — generous, so
-  the operator sees recently-killed mandates on the card long after, while stale accumulation ages
-  out. Space: a `REGISTRY_HARD_CAP` backstop evicts the OLDEST-dead grants first if still over cap,
-  and NEVER a live one (a live set over cap is operator-real authority, bounded by real issuance —
-  never shed to satisfy a bound). The prune runs at the growth point (`issue`, exempting the
-  just-issued grant) and on boot (to shrink a file grown under an older binary), durable-before-
-  visible with rollback on a persist failure. The principled resolution of the audit-visibility
-  tension: the audit CHAIN keeps every grant/revoke/use forever (the receipt is the permanent
-  record) — pruning the WORKING set erases nothing provable. `revoked_at` is a `serde(default)`
-  field (a missing value = "never time-prune" = RETAIN, the fail-safe direction), so it needs no
-  version bump — a dropped key can only keep a grant longer, never prune it early or widen. Ratchets:
+  not silent. RETENTION now SHIPPED (Sprint 23 — closes the DEAD-accumulation half of G-M7): the
+  working registry's DEAD growth is bounded on BOTH axes. Time: a DEAD grant (revoked past
+  `revoked_at`, or expired past `expires_at`) is pruned `GRANT_RETENTION_SECS` (30 days) after death.
+  Space: a `REGISTRY_HARD_CAP` backstop evicts the OLDEST-dead grants first if still over cap, and
+  NEVER a live one (a live set over cap is operator-real authority, bounded by real issuance — never
+  shed to satisfy a bound). The prune runs at the growth point (`issue`, exempting the just-issued
+  grant) and on boot (to shrink a file grown under an older binary), durable-before-visible with
+  rollback on a persist failure. The audit CHAIN keeps every grant/revoke/use independently (the
+  receipt is the permanent record; the registry is only the working set) — pruning erases nothing
+  provable. `revoked_at` is a `serde(default)` field (a missing value = "never TIME-prune" = RETAIN,
+  the fail-safe direction for the clock stage), so it needs no version bump. Ratchets:
   `intent::tests::{retention_prune_ages_out_dead_grants_but_keeps_live_and_recent,
   retention_hard_cap_evicts_oldest_dead_never_live, retention_never_sheds_a_live_set_over_cap,
-  revoke_stamps_revoked_at_roundtrips_and_issue_prunes_expired}`. STILL OPEN (operator-gated, lower
-  priority): the gateway ISSUE/REVOKE routes carry no request-RATE limiter — a shell-token holder
-  (the trusted operator) can still burst issue/revoke calls (the registry SIZE they grow is now
-  bounded, but the request rate is not). FIX (deferred): a per-token limiter on the gateway mutation
+  revoke_stamps_revoked_at_roundtrips_and_issue_prunes_expired}`. HONEST BOUNDS (Sprint 23 council):
+  (1) LIVE growth is NOT bounded — a shell-token holder minting no-TTL live mandates grows the
+  registry without limit, BY DESIGN (a live mandate is real G-M3 authority, never shed); only DEAD
+  accumulation is reclaimed. (2) The "chain is the permanent record" holds only IF the mint's grant
+  event landed — mint audit is `emit_best_effort` (a pre-existing gap S23 did not introduce; it only
+  removed the registry entry's accidental role as a fallback record). A mint whose audit append
+  failed, once pruned, has no provable trace — FIX (tracked): make mint fail-closed emit-before-issue,
+  mirroring revoke (its own sprint; core `grant()` blast radius). (3) The 30-day operator-visibility
+  promise is conditional: under cap pressure (>4096 live+dead) recently-dead grants can be evicted
+  inside the window; the chain still has them. (4) Time-death is wall-clock: a >30-day FORWARD clock
+  excursion could permanently prune a live-but-recently-expiring mandate — a bound shared with expiry
+  itself (a clock-jumped mandate already denies), not cleanly clampable without a trusted external
+  clock. (5) Prunes emit no audit event: time-prunes are reconstructible from the chain (grant/revoke
+  times + the public constant), hard-cap evictions are not — noted for forensics, nothing provable is
+  lost. STILL OPEN (operator-gated, lower priority): the gateway ISSUE/REVOKE routes carry no
+  request-RATE limiter — a shell-token holder can still burst issue/revoke calls (registry SIZE is
+  bounded, the request rate is not). FIX (deferred): a per-token limiter on the gateway mutation
   routes. SHIPPED (Sprint 22): per-mandate-CONFIGURABLE dispatch budgets — `dispatch_limit` is a
   first-class grant property (registry state, same trust level as agent-binding — not signed into
   the token or the receipt), set at mint (API + shell form; the CLI does not set it yet — a known
