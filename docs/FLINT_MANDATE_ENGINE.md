@@ -61,7 +61,10 @@ reconciliation seam — receipts minted from what executors report).
   state (replay set, dispatch rate, dead grants) is bounded; *live* mandate growth stays real
   operator authority by design (never shed). Mandate mint is now FAIL-CLOSED (S24): `grant_durable`
   emits the signed `CapabilityGrant` before returning the token, so a mandate whose grant cannot be
-  recorded is never issued — the receipt is a complete record for every issued mandate. *Remaining:*
+  recorded is never issued — the receipt is a complete record of every issued mandate's GRANT and act
+  DECLARATION (reconciliation verdicts remain best-effort — the disclosed executor-report seam). This
+  holds as durably as the audit log's backing: fully under the file-backed EU-AI-Act mode, in-process
+  under the default memory-only log (the same bound as the fail-closed revoke). *Remaining:*
   a request-RATE limiter on the gateway mint/revoke routes; and the principled fix for one-click
   broad grants is role-based capability tiering (a `CapsuleRole::System`), a separate initiative
   deliberately NOT wedged in on a spoofable capsule name.
