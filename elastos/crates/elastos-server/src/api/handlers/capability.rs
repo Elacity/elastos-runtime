@@ -1102,16 +1102,18 @@ pub struct IssueStandingGrantOutput {
     pub token_id: String,
 }
 
-/// POST /api/standing-grants/issue  (shell-only)
+/// Issue a mandate — the ONE shared mint path, used by the API server's [`issue_standing_grant`]
+/// and the gateway's mandates shell app (`api::gateway::gateway_mandates`), so the fail-closed
+/// guards (action whitelist, non-empty methods, AUD-5 overbroad-wildcard refusal, agent-key
+/// validation, durable-before-visible issuance) can never drift between surfaces.
 ///
-/// Issue a standing grant for unsupervised agent dispatch. Mints a real signed capability token
-/// for (capsule, resource, action, ttl) — the cryptographic root — then derives and stores the
-/// standing envelope with the authorized method set. Fail-closed on an unknown action or empty
-/// method set.
-pub async fn issue_standing_grant(
-    State(state): State<CapabilityState>,
-    Json(input): Json<IssueStandingGrantInput>,
-) -> Result<Json<IssueStandingGrantOutput>, (StatusCode, String)> {
+/// Mints a real signed capability token for (capsule, resource, action, ttl) — the cryptographic
+/// root — then derives and stores the standing envelope with the authorized method set.
+pub async fn issue_mandate(
+    standing_service: &StandingGrantService,
+    capability_manager: &CapabilityManager,
+    input: IssueStandingGrantInput,
+) -> Result<IssueStandingGrantOutput, (StatusCode, String)> {
     let action = match input.action.to_lowercase().as_str() {
         "read" => Action::Read,
         "write" => Action::Write,
@@ -1164,7 +1166,7 @@ pub async fn issue_standing_grant(
         .ttl_secs
         .map(elastos_common::SecureTimestamp::after_secs);
     // Mint a real signed token (the cryptographic root), then elevate it to a standing grant.
-    let token = state.capability_manager.grant(
+    let token = capability_manager.grant(
         &input.capsule,
         ResourceId::new(input.resource),
         action,
@@ -1175,8 +1177,7 @@ pub async fn issue_standing_grant(
     // Durable-before-visible (G-M5): a mandate that cannot be recorded to the persistent registry
     // is NOT issued — the operator retries into a working store rather than holding a grant that
     // silently evaporates on the next restart.
-    let grant_id = state
-        .standing_service
+    let grant_id = standing_service
         .issue_from_token(&token, methods, agent_pubkey)
         .map_err(|e| {
             (
@@ -1185,7 +1186,19 @@ pub async fn issue_standing_grant(
             )
         })?;
     let token_id = token.id().to_string();
-    Ok(Json(IssueStandingGrantOutput { grant_id, token_id }))
+    Ok(IssueStandingGrantOutput { grant_id, token_id })
+}
+
+/// POST /api/standing-grants/issue  (shell-only)
+///
+/// Issue a standing grant for unsupervised agent dispatch — see [`issue_mandate`] for the shared
+/// fail-closed mint path.
+pub async fn issue_standing_grant(
+    State(state): State<CapabilityState>,
+    Json(input): Json<IssueStandingGrantInput>,
+) -> Result<Json<IssueStandingGrantOutput>, (StatusCode, String)> {
+    let out = issue_mandate(&state.standing_service, &state.capability_manager, input).await?;
+    Ok(Json(out))
 }
 
 #[derive(Debug, Deserialize)]

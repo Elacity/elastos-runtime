@@ -3,6 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Content-Security-Policy (Sprint 15 council, P16 defense-in-depth): this app now holds the
+     authority-GRANTING verb AND the in-URL home_token. It is fully self-contained (inline CSS+JS,
+     same-origin fetch only), so we lock it down: no remote script can be injected to mint mandates
+     or exfiltrate the token off-box, no <base>/object/frame tricks. 'unsafe-inline' is required by
+     the inline style/script; connect-src 'self' keeps every fetch same-origin. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'self'">
 <title>Flint — Mandates</title>
 </head>
 <body>
@@ -81,6 +87,7 @@
   .stat.live .n{color:var(--live)} .stat.rev .n{color:var(--crit)} .stat.exp .n{color:var(--warn)}
 
   .sectlabel{display:flex;align-items:baseline;gap:10px;margin:26px 2px 12px}
+  .sectlabel #newbtn{margin-left:auto}
   .sectlabel h2{font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-2);margin:0;font-weight:600}
   .sectlabel .hint{font-size:12px;color:var(--ink-3)}
 
@@ -161,6 +168,21 @@
   .cmd .fl{color:var(--accent)}
   .caveat{font-size:11px;color:var(--ink-3);margin-top:9px;line-height:1.5}
 
+  .grantbox{margin:0 0 18px;background:var(--surface-2);border:1px solid var(--line);border-radius:11px;padding:16px}
+  .grantbox .gt{font-size:12.5px;font-weight:650;color:var(--ink)}
+  .grantbox .gp{font-size:12px;color:var(--ink-2);margin:6px 0 12px;line-height:1.5}
+  .gform{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px 14px}
+  .gform label{display:flex;flex-direction:column;gap:4px;font-size:11px;font-weight:600;color:var(--ink-2)}
+  .gform .opt{font-weight:400;color:var(--ink-3)}
+  .gform input,.gform select{font:inherit;font-size:12.5px;color:var(--ink);background:var(--raise);
+    border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+  .gform input.gmono{font-family:var(--font-mono);font-size:11.5px}
+  .gactions{display:flex;align-items:center;gap:12px;margin-top:12px}
+  .grantbtn{font:inherit;font-size:12.5px;font-weight:650;color:#fff;background:var(--accent);border:none;
+    border-radius:8px;padding:9px 14px;cursor:pointer}
+  .grantbtn:disabled{opacity:.55;cursor:default}
+  .gnote{font-size:12px;color:var(--ink-2)}
+  .gnote.err{color:var(--crit)}
   .killbox{margin-top:14px;background:var(--crit-soft);border:1px solid var(--crit);border-radius:11px;padding:14px}
   .killbox .vt{font-size:12px;font-weight:650;color:var(--crit);display:flex;align-items:center;gap:7px}
   .killbox p{font-size:12px;color:var(--ink-2);margin:7px 0 10px}
@@ -200,8 +222,45 @@
 
   <div class="sectlabel">
     <h2>Standing mandates</h2>
-    <span class="hint">issued this runtime lifetime — revoked ones stay listed</span>
+    <span class="hint">durable across restarts — revoked ones stay listed</span>
+    <button class="tbtn" id="newbtn" type="button" hidden>+ Grant mandate</button>
   </div>
+
+  <div class="grantbox" id="grantbox" hidden>
+    <div class="gt">Grant a new mandate</div>
+    <p class="gp">Scoped, expiring, revocable authority for ONE agent. The runtime mints a real signed
+      capability token and records a durable, revocable mandate — its receipt starts here.
+      <span class="opt">(<code>admin</code> mandates are minted from the CLI, not this window.)</span></p>
+    <div class="gform">
+      <label>Capsule <input id="g-capsule" type="text" placeholder="vm-agent" spellcheck="false"></label>
+      <label>Resource <input id="g-resource" type="text" class="gmono" placeholder="elastos://mail/send" spellcheck="false"></label>
+      <label>Action
+        <select id="g-action">
+          <option value="read">read</option>
+          <option value="write">write</option>
+          <option value="execute" selected>execute</option>
+          <option value="delete">delete</option>
+          <option value="message">message</option>
+        </select>
+      </label>
+      <label>Methods <input id="g-methods" type="text" class="gmono" placeholder="send, draft (comma-separated)" spellcheck="false"></label>
+      <label>Expires
+        <select id="g-ttl">
+          <option value="3600">in 1 hour</option>
+          <option value="86400">in 24 hours</option>
+          <option value="604800" selected>in 7 days</option>
+          <option value="">never (until revoked)</option>
+        </select>
+      </label>
+      <label>Agent key <span class="opt">(optional, 64-hex ed25519 — binds the mandate to ONE agent)</span>
+        <input id="g-agent" type="text" class="gmono" placeholder="unbound — any key acting as the capsule" spellcheck="false"></label>
+    </div>
+    <div class="gactions">
+      <button class="grantbtn" id="g-submit" type="button">Grant mandate</button>
+      <span class="gnote" id="g-note"></span>
+    </div>
+  </div>
+
   <div class="grid" id="grid"></div>
 
   <footer>
@@ -502,6 +561,56 @@
       .then(function(r){ if(!r.ok) throw new Error("http "+r.status); return r.json(); })
       .then(function(j){ paint({mandates:j.mandates||[], signer_public_key_hex:j.signer_public_key_hex}, false); })
       .catch(function(err){ showUnreachable("Could not load mandates from the runtime ("+esc(String(err&&err.message||err))+").");});
+  }
+
+  // Grant-from-the-shell (Sprint 15): the form exists ONLY in-shell — the mint rides the same
+  // home-token gate as everything else, and the server re-validates every field (the client
+  // checks nothing authoritative). Success repaints the list FROM THE SERVER; the new card is
+  // whatever the runtime actually recorded, never a locally-fabricated row.
+  if (IN_SHELL){
+    $("#newbtn").hidden = false;
+    $("#newbtn").addEventListener("click", function(){
+      var box = $("#grantbox");
+      box.hidden = !box.hidden;
+      $("#newbtn").textContent = box.hidden ? "+ Grant mandate" : "Close";
+    });
+    $("#g-submit").addEventListener("click", function(){
+      var note = $("#g-note");
+      var btn = $("#g-submit");
+      var methods = $("#g-methods").value.split(",").map(function(s){return s.trim();}).filter(Boolean);
+      var ttlRaw = $("#g-ttl").value;
+      var agent = $("#g-agent").value.trim();
+      var body = {
+        capsule: $("#g-capsule").value.trim(),
+        resource: $("#g-resource").value.trim(),
+        action: $("#g-action").value,
+        methods: methods
+      };
+      if (ttlRaw !== "") body.ttl_secs = parseInt(ttlRaw, 10);
+      if (agent !== "") body.agent_pubkey = agent;
+      btn.disabled = true;
+      note.className = "gnote";
+      note.textContent = "Granting…";
+      var h = launchHeaders(); h["Content-Type"] = "application/json";
+      fetch("/api/apps/mandates/standing-grants/issue", {method:"POST", headers:h, body:JSON.stringify(body)})
+        .then(function(r){
+          return r.text().then(function(t){
+            if (!r.ok) throw new Error(t || ("http "+r.status));
+            return JSON.parse(t);
+          });
+        })
+        .then(function(j){
+          btn.disabled = false;
+          note.textContent = "Mandate "+shortId(j.grant_id)+" granted — live below.";
+          $("#g-capsule").value = ""; $("#g-resource").value = ""; $("#g-methods").value = ""; $("#g-agent").value = "";
+          load(); // the card comes from the server, never fabricated locally
+        })
+        .catch(function(err){
+          btn.disabled = false;
+          note.className = "gnote err";
+          note.textContent = "Not granted: "+String(err&&err.message||err);
+        });
+    });
   }
 
   // theme toggle

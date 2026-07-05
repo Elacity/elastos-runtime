@@ -209,7 +209,7 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   reads its live data ONLY when launched in-shell (the signed `home_token` rides in the launch URL →
   `x-elastos-home-token` header); opened standalone it falls back to an explicitly LABELLED "sample",
   and an in-shell fetch failure shows an honest "unavailable" banner, never sample data under the live
-  view. THE KILL SWITCH (Sprint 13): the app's ONE mutation is `POST
+  view. THE KILL SWITCH (Sprint 13): `POST
   /api/apps/mandates/standing-grants/revoke` — same home-token gate, delegating to the SAME shared
   kill path the API server uses (`handlers::capability::revoke_mandate`: signed `CapabilityRevoke`
   durably attested BEFORE the envelope dies; an unattestable revoke ABORTS loudly, per AUD-3), so the
@@ -217,13 +217,61 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   stolen mandates launch token does on this surface is kill an agent's autonomy early (fail-safe
   direction). In the drawer it is two-step (arm → confirm), shown only in-shell on a LIVE mandate;
   a transport failure is reported with honest uncertainty (the list is refreshed and the card state
-  is authoritative — the runtime attests before replying). Ratchets:
+  is authoritative — the runtime attests before replying). GRANT FROM THE SHELL (Sprint 15): `POST
+  /api/apps/mandates/standing-grants/issue` — the full lifecycle (see/grant/act/stop/prove) now
+  lives in the app. Issue is authority-GRANTING, so its trust argument is explicit: the home-launch
+  token is minted by the runtime's own key only when the SHELL launches the app, and the shell is
+  already the runtime's grant root (the API's issue endpoint sits behind the consent-broker gate
+  for the same reason; G-M3) — the gateway surface adds NO new authority tier, and delegates to the
+  ONE shared mint path (`handlers::capability::issue_mandate`) with every fail-closed guard intact
+  (action whitelist, non-empty methods, AUD-5 overbroad-wildcard refusal, agent-key validation,
+  durable-before-visible issuance). The form exists only in-shell and repaints the list FROM the
+  server — a granted card is what the runtime recorded, never a locally-fabricated row. Council
+  hardening (P16 defense-in-depth, since the granting verb now lives in a web iframe holding the
+  in-URL home_token): the capsule ships a strict CSP (`default-src 'none'`, same-origin
+  `connect-src`, `base-uri/form-action 'none'`) so no injected remote script can mint or exfiltrate
+  the token; and the gateway issue route REFUSES `admin` server-side (case-insensitive) — admin
+  mandates are minted from the CLI/consent-broker API only, so the web surface is deliberately
+  NARROWER than the raw API even against an XSS in the frame. Ratchets:
   `gateway_mandates::tests::{list_route_requires_home_launch_token,
   list_route_reflects_the_shared_registry, list_route_marks_epoch_killed_mandate_dead,
   receipt_route_requires_home_launch_token, receipt_route_reports_absence_as_404,
   revoke_route_requires_home_launch_token_and_kills_nothing,
-  revoke_route_kills_the_mandate_and_is_idempotent, revoke_route_rejects_malformed_id}` +
+  revoke_route_kills_the_mandate_and_is_idempotent, revoke_route_rejects_malformed_id,
+  issue_route_requires_home_launch_token_and_mints_nothing,
+  issue_route_mints_a_live_mandate_in_the_shared_registry, issue_route_enforces_the_shared_guards
+  (incl. server-side admin refusal)}` +
   `browser_capsules::mandates_ships_as_a_launchable_browser_app`.
+
+- **G-M7 (Sprint 15 council — the mint's OPERATIONAL residue; bounded to an authenticated shell-tier
+  caller, NOT a boundary break).** Both reviewers confirmed the issue route adds NO new authority
+  tier (only the runtime-signed, non-delegatable, `app=="mandates"` home-launch token — obtainable
+  only via the Home-shell-gated `home_launch` — reaches it; CSRF is closed: header-only token, no
+  permissive gateway CORS; the AUD-5 guard is exact and shared). Residuals, all reachable only WITH
+  a genuine shell token (the trusted operator, G-M3):
+  (a) **No rate limit + monotonic durable growth (red-team F1).** The gateway mutation routes carry
+  no `rate_limit_middleware` (that layer is API-server-only), and `standing_grants.json` never
+  prunes revoked/expired grants — a shell-token holder can flood issue and grow the file without a
+  ceiling. FIX (deferred): a per-token limiter on the gateway mutation routes + a live+revoked cap
+  / retention prune on the store.
+  (b) **Unbound + arbitrary-`capsule` is now a one-click grant (red-team F2; the UI default is
+  "unbound").** `capsule` is a free string (unvalidated) and an unbound mandate (`agent_pubkey`
+  None) enforces capsule-STRING-only — any self-signed key declaring that string acts under it
+  (G-M4). The mint TIER is unchanged (the shell could always do this via the API), but the form
+  makes `capsule:"system"`-attributed, agent-unbound authority a defaulted one click. NOT fixed by
+  a capsule allow-list ON PURPOSE: prior council reasoning (G-CIE) rejected trust-anchoring on a
+  spoofable capsule NAME; the principled fix is role-based capability tiering (a `CapsuleRole::System`
+  plumbed into the grant point) applied uniformly — a separate FUTURE initiative, not a Sprint-15
+  wedge. Interim mitigations already shipped: the web form is narrower than the API (admin refused
+  server-side) and CSP-locked. Consider defaulting the form to agent-BOUND when G-M4 is promoted.
+  (c) **Proof-unbound local-mode token can now MINT (red-team F4, extends G-AUTH-LOCAL).** Under the
+  accepted operator-key-on-disk local posture a proof-unbound `mandates` token skips the live-
+  session recheck; it could previously read/revoke, and now also issue. Same operator-authority
+  root (the on-disk key already mints via the CLI), but note the fail-safe asymmetry the shell app
+  leans on — revoke only removes authority — does NOT hold for issue. Decide before a multi-tenant
+  gateway (same trigger as the G-AUTH-LOCAL decision).
+  (d) FIXED here: `SecureTimestamp::after_secs` now saturates (red-team F5) — a `ttl_secs` near
+  `u64::MAX` no longer debug-panics / release-wraps-to-the-past.
 
 Closed at review time (Sprint 3, before merge): the revoke id-casing desync (UPPERCASE hex
 revoked the token but missed the lowercase-keyed envelope — now canonicalized + regression test

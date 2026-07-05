@@ -1,4 +1,4 @@
-//! Read-only mandates surface for the ElastOS home gateway.
+//! The mandates surface for the ElastOS home gateway: list, receipt, revoke, issue.
 //!
 //! The `mandates` capsule (see `capsules/mandates/`) opens as an app window in the existing
 //! shell. It needs LIVE mandate data, and the gateway is the surface the shell talks to. But the
@@ -13,16 +13,24 @@
 //! the gateway only when both handles are present (see [`super::gateway_server::start_gateway_server`]).
 //!
 //! Every route is gated by the same home-launch token as every other shell app — the mandates app
-//! must be the launched capsule. The two GET routes are strictly read-only (they mint nothing,
-//! mutate nothing). The ONE mutation this surface carries is REVOKE — the operator's kill switch —
-//! and it only ever REMOVES authority, never grants it: the worst a stolen mandates launch token
-//! can do here is kill an agent's autonomy early (fail-safe direction, P11/P16). Both the card
-//! projection and the kill path are the API server's own shared helpers
+//! must be the launched capsule. The two GET routes are strictly read-only. The surface carries
+//! two mutations. REVOKE is the kill switch, fail-safe: it only ever REMOVES authority (P11/P16).
+//! ISSUE (Sprint 15) mints a mandate — authority-GRANTING, so its trust argument is explicit: the
+//! home-launch token is minted by the runtime's own signing key when the SHELL launches the app,
+//! and the shell is already the runtime's grant root (the API server's issue endpoint sits behind
+//! the consent-broker/shell gate for the same reason; G-M3 — the shell can issue any mandate
+//! anyway). The gateway surface adds NO new authority tier; it re-homes the shell's own verb into
+//! the shell's own app window, and delegates to the SAME shared mint path with every fail-closed
+//! guard intact (action whitelist, non-empty methods, AUD-5 overbroad-wildcard refusal, agent-key
+//! validation, durable-before-visible issuance).
+//!
+//! All three verbs delegate to the API server's own shared helpers
 //! ([`mandate_cards`](crate::api::handlers::capability::mandate_cards),
-//! [`revoke_mandate`](crate::api::handlers::capability::revoke_mandate)) so neither the liveness
-//! invariant nor the fail-closed revoke order can drift between surfaces (P12: one honest source
-//! of truth; a revoked mandate never renders "Live"; a revoke that cannot be durably attested does
-//! not happen).
+//! [`revoke_mandate`](crate::api::handlers::capability::revoke_mandate),
+//! [`issue_mandate`](crate::api::handlers::capability::issue_mandate)) so neither the liveness
+//! invariant, the fail-closed revoke order, nor the mint guards can drift between surfaces (P12:
+//! one honest source of truth; a revoked mandate never renders "Live"; a mandate that cannot be
+//! durably recorded is not issued).
 
 use super::*;
 
@@ -132,6 +140,46 @@ async fn mandate_revoke(
     }
 }
 
+/// POST /api/apps/mandates/standing-grants/issue — grant a mandate from the shell app.
+///
+/// Delegates to [`crate::api::handlers::capability::issue_mandate`] — the SAME fail-closed mint
+/// path the API server uses (action whitelist, non-empty methods, AUD-5 overbroad-wildcard
+/// refusal, agent-key validation, durable-before-visible issuance) — so the guards cannot drift.
+/// Authority-granting, therefore shell-only twice over: the home-token gate here AND the launch
+/// token itself only exists because the shell (the runtime's grant root, G-M3) opened the app.
+async fn mandate_issue(
+    State(state): State<MandateApiState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::api::handlers::capability::IssueStandingGrantInput>,
+) -> axum::response::Response {
+    if let Err(err) = super::require_home_launch_token(&state.data_dir, &headers, MANDATES_CAPSULE_ID)
+    {
+        return mandate_auth_error(err);
+    }
+    // Least privilege (Sprint 15 council, P16): the web mint surface is DELIBERATELY narrower than
+    // the raw API — `admin` mandates are minted from the CLI/consent-broker API only, never from
+    // this iframe. Enforced server-side (not just hidden in the form) so an XSS in the frame that
+    // POSTs `action:"admin"` with the in-URL token is still refused. The shared helper keeps admin
+    // for the API/CLI path; this narrowing is the gateway surface's own.
+    if body.action.trim().eq_ignore_ascii_case("admin") {
+        return (
+            StatusCode::FORBIDDEN,
+            "admin mandates are minted from the CLI, not the shell app".to_string(),
+        )
+            .into_response();
+    }
+    match crate::api::handlers::capability::issue_mandate(
+        &state.standing_service,
+        &state.capability_manager,
+        body,
+    )
+    .await
+    {
+        Ok(out) => Json(out).into_response(),
+        Err((status, msg)) => (status, msg).into_response(),
+    }
+}
+
 /// A failed home-token gate reads as `401` — the app was not launched through the shell.
 fn mandate_auth_error(err: anyhow::Error) -> axum::response::Response {
     (StatusCode::UNAUTHORIZED, err.to_string()).into_response()
@@ -149,6 +197,10 @@ pub(crate) fn mandate_router(state: MandateApiState) -> Router {
         .route(
             "/api/apps/mandates/standing-grants/revoke",
             post(mandate_revoke),
+        )
+        .route(
+            "/api/apps/mandates/standing-grants/issue",
+            post(mandate_issue),
         )
         .with_state(state)
 }
@@ -185,6 +237,132 @@ mod tests {
             capability_manager,
             data_dir: dir.to_path_buf(),
         }
+    }
+
+    /// Helper: POST a JSON body to a route with optional home token, return the response.
+    async fn post_json(
+        app: Router,
+        uri: &str,
+        token: Option<String>,
+        body: &str,
+    ) -> axum::http::Response<Body> {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(t) = token {
+            req = req.header(HOME_TOKEN_HEADER, t);
+        }
+        app.oneshot(req.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// The MINT is gated like everything else: no home-launch token ⇒ 401 AND nothing is minted —
+    /// an unauthenticated caller can never grant an agent authority.
+    #[tokio::test]
+    async fn issue_route_requires_home_launch_token_and_mints_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_for(dir.path());
+        let app = mandate_router(state.clone());
+        let resp = post_json(
+            app,
+            "/api/apps/mandates/standing-grants/issue",
+            None,
+            r#"{"capsule":"vm-agent","resource":"elastos://mail/send","action":"execute","methods":["send"],"ttl_secs":3600}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            state.standing_service.list().is_empty(),
+            "an unauthenticated issue must mint NOTHING"
+        );
+    }
+
+    /// Grant from the shell: a valid issue over the route mints a LIVE mandate in the SHARED
+    /// registry, visible on the list surface, with the returned grant id.
+    #[tokio::test]
+    async fn issue_route_mints_a_live_mandate_in_the_shared_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_for(dir.path());
+        let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        let resp = post_json(
+            mandate_router(state.clone()),
+            "/api/apps/mandates/standing-grants/issue",
+            Some(token_hdr),
+            r#"{"capsule":"vm-agent","resource":"elastos://mail/send","action":"execute","methods":["send"],"ttl_secs":3600,"agent_pubkey":null}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let grant_id = out["grant_id"].as_str().expect("grant id returned");
+        assert_eq!(out["token_id"], grant_id, "grant id IS the backing token id");
+        assert!(
+            state.standing_service.is_active(grant_id),
+            "the minted mandate is LIVE in the shared registry"
+        );
+        let cards = crate::api::handlers::capability::mandate_cards(
+            &state.standing_service,
+            &state.capability_manager,
+        )
+        .await;
+        let card = cards
+            .mandates
+            .iter()
+            .find(|c| c.token_id == grant_id)
+            .expect("the minted mandate is listed");
+        assert!(card.active);
+        assert_eq!(card.capsule, "vm-agent");
+        assert_eq!(card.methods, vec!["send".to_string()]);
+    }
+
+    /// The gateway mint enforces the SAME fail-closed guards as the API server (shared helper):
+    /// unknown action 400, empty methods 400, AUD-5 bare scheme wildcard 403, malformed agent key
+    /// 400 — and NONE of them mint anything.
+    #[tokio::test]
+    async fn issue_route_enforces_the_shared_guards() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_for(dir.path());
+        let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        let cases: &[(&str, StatusCode)] = &[
+            (
+                r#"{"capsule":"a","resource":"elastos://mail/send","action":"launch","methods":["m"]}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                r#"{"capsule":"a","resource":"elastos://mail/send","action":"execute","methods":[]}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                r#"{"capsule":"a","resource":"elastos://*","action":"execute","methods":["m"]}"#,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                r#"{"capsule":"a","resource":"elastos://mail/send","action":"execute","methods":["m"],"agent_pubkey":"nothex"}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            // The web surface is narrower than the API: admin mints are refused server-side (P16),
+            // even case-shifted to dodge a naive string check.
+            (
+                r#"{"capsule":"a","resource":"elastos://mail/send","action":"Admin","methods":["m"]}"#,
+                StatusCode::FORBIDDEN,
+            ),
+        ];
+        for (body, expected) in cases {
+            let resp = post_json(
+                mandate_router(state.clone()),
+                "/api/apps/mandates/standing-grants/issue",
+                Some(token_hdr.clone()),
+                body,
+            )
+            .await;
+            assert_eq!(&resp.status(), expected, "guard for body {body}");
+        }
+        assert!(
+            state.standing_service.list().is_empty(),
+            "every refused mint must mint NOTHING"
+        );
     }
 
     /// The list route is fail-closed: no home-launch token ⇒ 401, no data leaks.
