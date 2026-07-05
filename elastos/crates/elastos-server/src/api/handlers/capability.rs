@@ -2946,6 +2946,115 @@ mod tests {
         );
     }
 
+    /// Sprint 25 end-to-end: an agent WRITES state under a write-mandate, then READS it back under a
+    /// separate read-mandate (`runtime.state_get`). A read declaring the CORRECT value reconciles
+    /// `performed` (an attested "K = V"); declaring the WRONG value reconciles `diverged` (the real
+    /// value is on the chain, so the agent learns the truth); revoking the read-mandate stops reads.
+    #[tokio::test]
+    async fn dispatch_state_get_reads_back_attested_and_revoke_stops_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state_with_durable_audit(dir.path());
+        state.intent_executor = std::sync::Arc::new(
+            crate::intent_executor::MethodRegistryExecutor::production(
+                state.capability_manager.audit_log().clone(),
+                Some(dir.path().to_path_buf()),
+            ),
+        );
+        let key_resource = format!("{}cursor", crate::intent_executor::STATE_PUT_PREFIX);
+
+        // Seed the store: a write-mandate + a state_put dispatch.
+        let w = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: key_resource.clone(),
+                action: "write".to_string(),
+                methods: vec!["runtime.state_put".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: None,
+                dispatch_limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let put = IntentDeclarationV1::issue(
+            &sk, sk.verifying_key().to_bytes(), "put-1", "vm-agent",
+            "runtime.state_put", "cafe01", &key_resource, "write", &w.token_id,
+        );
+        assert_eq!(
+            dispatch_standing_intent(State(state.clone()), Json(put)).await.unwrap().0.outcome,
+            "performed"
+        );
+
+        // A separate READ-mandate for state_get on the same key.
+        let r = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: key_resource.clone(),
+                action: "read".to_string(),
+                methods: vec!["runtime.state_get".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: None,
+                dispatch_limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let read = |intent_id: &str, expected: &str| {
+            let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+            IntentDeclarationV1::issue(
+                &sk, sk.verifying_key().to_bytes(), intent_id, "vm-agent",
+                "runtime.state_get", expected, &key_resource, "read", &r.token_id,
+            )
+        };
+
+        // Correct expected value → performed (attested K=V).
+        let hit = dispatch_standing_intent(State(state.clone()), Json(read("get-1", "cafe01")))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(hit.outcome, "performed", "a correct expected-value is an attested read");
+
+        // Wrong expected value → diverged (the chain carries the REAL value, cafe01).
+        let miss = dispatch_standing_intent(State(state.clone()), Json(read("get-2", "beef99")))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(miss.outcome, "diverged", "a wrong expected-value diverges, revealing the truth");
+
+        // Revoke the read-mandate → reads stop (denied), the write-mandate is untouched.
+        assert!(
+            revoke_standing_grant(
+                State(state.clone()),
+                Json(RevokeStandingGrantInput { grant_id: r.grant_id.clone() }),
+            )
+            .await
+            .unwrap()
+            .0
+            .revoked
+        );
+        let denied = dispatch_standing_intent(State(state.clone()), Json(read("get-3", "cafe01")))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(denied.outcome, "denied", "a revoked read-mandate reads nothing");
+
+        // The read-mandate's portable receipt carries the attested read + the divergence + denial.
+        let receipt = mandate_receipt(State(state.clone()), Path(r.token_id.clone()))
+            .await
+            .unwrap()
+            .0;
+        let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();
+        assert!(
+            elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer)).authenticated,
+            "the read-mandate's receipt verifies off-box"
+        );
+    }
+
     /// G-M6 closed: an authorized intent whose method has NO executor is `Undelivered`, NOT a
     /// fabricated match — the reconciliation reflects that nothing performed it, and the receipt use
     /// is `success=false`. A custom executor that reports a DIFFERENT field yields `Diverged`.

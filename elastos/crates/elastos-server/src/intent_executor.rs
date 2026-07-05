@@ -148,13 +148,21 @@ impl MethodRegistryExecutor {
     ///   discipline as notify: registered only with a `data_dir`; key + input_hash bounded to safe
     ///   shapes before the write; `Performed` iff the atomic write LANDED, else `Declined`. Reports
     ///   `action = "write"` — usable only under a `write` mandate.
+    /// - `runtime.state_get` — the READ side of that KV (the pair of state_put): a PRINCIPAL-SCOPED
+    ///   ATTESTED read of `elastos://runtime/store/<key>`. The declared `input_hash` is the value
+    ///   the agent EXPECTS; `Performed` echoes the ACTUAL stored value-hash, so the read reconciles
+    ///   `Matched` iff the key holds that value (a provable "K = V"), `Diverged` (with the real
+    ///   value in the receipt) if it holds a different one, and `Declined` (⇒ authorized_not_performed)
+    ///   if the key is absent. Keyed on the acting capsule ⇒ an agent reads only its OWN state.
+    ///   Reports `action = "read"` — usable only under a `read` mandate. Registered with a `data_dir`.
     ///
-    /// Both side-effecting affordances need the runtime data dir (their stores live under it); a
-    /// `None` data dir leaves BOTH honestly unwired ⇒ `Undelivered`.
+    /// The side-effecting affordances + state_get need the runtime data dir (their stores live under
+    /// it); a `None` data dir leaves them honestly unwired ⇒ `Undelivered`.
     pub fn production(audit_log: Arc<AuditLog>, data_dir: Option<std::path::PathBuf>) -> Self {
         let mut registry = Self::new();
         if let Some(data_dir) = data_dir {
             let state_dir = data_dir.clone();
+            let state_get_dir = data_dir.clone();
             registry.register(
                 "runtime.state_put",
                 Arc::new(move |intent: &IntentDeclarationV1| {
@@ -209,6 +217,56 @@ impl MethodRegistryExecutor {
                         },
                         Err(e) => IntentExecution::Declined {
                             reason: format!("state_put could not be persisted: {e}"),
+                        },
+                    }
+                }),
+            );
+            registry.register(
+                "runtime.state_get",
+                Arc::new(move |intent: &IntentDeclarationV1| {
+                    // The READ side of the agent-state KV (Sprint 25) — same store namespace as
+                    // state_put; the key is the suffix. Outside the namespace ⇒ Decline.
+                    let Some(key) = intent.resource.strip_prefix(STATE_PUT_PREFIX) else {
+                        return IntentExecution::Declined {
+                            reason: format!("state_get resource must be {STATE_PUT_PREFIX}<key>"),
+                        };
+                    };
+                    if !valid_slug_1_64(key) {
+                        return IntentExecution::Declined {
+                            reason: "state_get key must be 1-64 chars of [A-Za-z0-9._-]".to_string(),
+                        };
+                    }
+                    // An ATTESTED read (like content_seen's boolean check): the declared input_hash
+                    // is the value the agent EXPECTS the key to hold, bounded to the same commitment
+                    // shape state_put wrote. A read that reconciles Matched PROVES "key K holds V".
+                    if !valid_hex_0_64(&intent.input_hash) {
+                        return IntentExecution::Declined {
+                            reason: "state_get expected-value (input_hash) must be <=64 hex chars (or empty)"
+                                .to_string(),
+                        };
+                    }
+                    // PRINCIPAL-SCOPED: get_agent_state keys on the acting capsule, so an agent can
+                    // only ever read its OWN state — never another principal's (the per-capsule
+                    // isolation the operator-facing list deliberately does NOT have).
+                    match crate::agent_store::get_agent_state(&state_get_dir, &intent.capsule, key) {
+                        Ok(Some(entry)) => IntentExecution::Performed {
+                            capsule: intent.capsule.clone(),
+                            method_id: intent.method_id.clone(),
+                            // Echo the ACTUAL stored value-hash. Reconcile Matches iff the agent
+                            // declared it correctly (an attested "K = V"); otherwise Diverges AND
+                            // the receipt carries the real value — so the agent still LEARNS the
+                            // true value on a mismatch, honestly, never a misleading Matched.
+                            input_hash: entry.value_hash,
+                            resource: intent.resource.clone(),
+                            action: "read".to_string(),
+                        },
+                        // No such key for this principal ⇒ authorized-but-not-performed (honest:
+                        // there is nothing to read), never a fabricated empty value.
+                        Ok(None) => IntentExecution::Declined {
+                            reason: format!("no state for {}/{key}", intent.capsule),
+                        },
+                        Err(e) => IntentExecution::Declined {
+                            reason: format!("state_get could not read the store: {e}"),
                         },
                     }
                 }),
@@ -727,6 +785,108 @@ mod tests {
         let resource = format!("{STATE_PUT_PREFIX}cursor");
         assert!(matches!(
             reg.execute(&state_put_intent(&resource, "vm-agent", "cafe01")),
+            IntentExecution::Declined { .. }
+        ));
+    }
+
+    fn state_get_intent(resource: &str, capsule: &str, expected: &str) -> IntentDeclarationV1 {
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        IntentDeclarationV1::issue(
+            &sk,
+            sk.verifying_key().to_bytes(),
+            "state-get-1",
+            capsule,
+            "runtime.state_get",
+            expected, // the value the agent EXPECTS (input_hash)
+            resource,
+            "read",
+            "grant-1",
+        )
+    }
+
+    /// Sprint 25: `runtime.state_get` is the READ side of the KV. It echoes the ACTUAL stored
+    /// value-hash (so the read reconciles Matched only when the agent declared the right value — an
+    /// attested "K = V" — proven end-to-end in the handler tests), Declines an absent key, and is
+    /// PRINCIPAL-SCOPED (an agent reads only its own state).
+    #[test]
+    fn state_get_reads_back_own_state_attested_and_principal_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = MethodRegistryExecutor::production(
+            Arc::new(AuditLog::new()),
+            Some(dir.path().to_path_buf()),
+        );
+        let resource = format!("{STATE_PUT_PREFIX}cursor");
+        // Seed the store via the real state_put affordance.
+        assert!(matches!(
+            reg.execute(&state_put_intent(&resource, "vm-agent", "cafe01")),
+            IntentExecution::Performed { .. }
+        ));
+
+        // A read → Performed echoing the ACTUAL stored value, action "read" — regardless of what
+        // the agent declared, so reconcile can Match (declared==actual) or Diverge (declared!=actual).
+        for declared in ["cafe01", "beef99", ""] {
+            match reg.execute(&state_get_intent(&resource, "vm-agent", declared)) {
+                IntentExecution::Performed { action, resource: r, input_hash, .. } => {
+                    assert_eq!(action, "read", "the act performed IS a read");
+                    assert_eq!(r, resource);
+                    assert_eq!(
+                        input_hash, "cafe01",
+                        "echoes the REAL stored value-hash, not the agent's claim ({declared:?})"
+                    );
+                }
+                other => panic!("expected Performed for declared {declared:?}, got {other:?}"),
+            }
+        }
+
+        // A DIFFERENT principal reading the same key → Declined (no cross-principal state read).
+        assert!(
+            matches!(
+                reg.execute(&state_get_intent(&resource, "vm-other", "cafe01")),
+                IntentExecution::Declined { .. }
+            ),
+            "an agent can only read its OWN state — never another principal's"
+        );
+
+        // An ABSENT key for the acting principal → Declined (authorized_not_performed).
+        let absent = format!("{STATE_PUT_PREFIX}never-written");
+        assert!(matches!(
+            reg.execute(&state_get_intent(&absent, "vm-agent", "cafe01")),
+            IntentExecution::Declined { .. }
+        ));
+    }
+
+    /// Fail-closed scoping for the read: outside the store namespace, a bad key, or an unbounded
+    /// expected-value DECLINES — the read affordance is as strict about its inputs as the write.
+    #[test]
+    fn state_get_declines_bad_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = MethodRegistryExecutor::production(
+            Arc::new(AuditLog::new()),
+            Some(dir.path().to_path_buf()),
+        );
+        for (resource, expected) in [
+            ("elastos://mail/send".to_string(), "aa".to_string()), // outside namespace
+            (STATE_PUT_PREFIX.to_string(), "aa".to_string()),      // empty key
+            (format!("{STATE_PUT_PREFIX}a/b"), "aa".to_string()),  // path trick
+            (format!("{STATE_PUT_PREFIX}k"), "not hex".to_string()), // free-text expected value
+        ] {
+            assert!(
+                matches!(
+                    reg.execute(&state_get_intent(&resource, "vm-agent", &expected)),
+                    IntentExecution::Declined { .. }
+                ),
+                "must decline resource {resource:?} expected {expected:?}"
+            );
+        }
+    }
+
+    /// Without a data dir there is no store to read — state_get is honestly UNWIRED.
+    #[test]
+    fn state_get_is_unwired_without_a_data_dir() {
+        let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None);
+        let resource = format!("{STATE_PUT_PREFIX}cursor");
+        assert!(matches!(
+            reg.execute(&state_get_intent(&resource, "vm-agent", "cafe01")),
             IntentExecution::Declined { .. }
         ));
     }

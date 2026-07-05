@@ -18,7 +18,7 @@ record. Detailed per-gap history lives in `KNOWN_GAPS.md`; this is the summary.
 | **Revoke** | The kill switch — durably attested *before* the mandate dies | CLI + Mandates shell app |
 | **Prove** | Export a portable `MandateReceipt` and verify it off-box with no runtime and no trust in this box | `elastos verify-receipt` |
 
-## The four real affordances behind dispatch
+## The five real affordances behind dispatch
 
 An affordance is a genuine runtime operation an agent can invoke under a mandate. Each REPORTS what
 it actually did; the receipt is minted from that report, never from the declaration, so an
@@ -29,6 +29,7 @@ match (this is the G-M6 rule).
 |---|---|---|---|
 | `runtime.audit_verify` | read (side-effect-free) | `read` | Re-verifies the signed audit chain end to end; `performed` iff it truly verifies |
 | `runtime.content_seen` | state-dependent read | `read` | Did THIS principal open a content id? Principal-scoped, no cross-principal oracle |
+| `runtime.state_get` | attested read | `read` | Reads back the acting principal's OWN durable state (the read pair of state_put); the agent declares the value it expects, the executor echoes the ACTUAL — `matched` proves "K = V", `diverged` reveals the truth, `declined` if absent. Principal-scoped, exact-key |
 | `runtime.notify` | **side-effecting** | `message` | Delivers a message into the operator's Inbox; bounded fields, capped store, `performed` only after the write lands |
 | `runtime.state_put` | **side-effecting** | `write` | Writes durable, readable-back, principal-scoped agent state; last-write-wins with attributed versioning |
 
