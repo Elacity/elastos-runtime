@@ -1,0 +1,95 @@
+# Flint — The Mandate Engine
+
+**"Give your agent a mandate, not your keys."**
+
+The single reviewable map of the accountability engine delivered on this branch
+(`claude/git-proxy-auth-roadmap-c214hu`) for merge into `flint-0.5`. It is the layer that lets an
+operator hand an AI agent a *scoped, expiring, revocable* mandate instead of raw credentials, have
+the agent act under it unsupervised, and hold the whole thing to a tamper-evident, off-box-verifiable
+record. Detailed per-gap history lives in `KNOWN_GAPS.md`; this is the summary.
+
+## The lifecycle, in one place
+
+| Verb | What it is | Where |
+|---|---|---|
+| **Grant** | Mint a real signed capability token scoped to (capsule, resource, action, ttl) + an authorized method set, elevated to a standing mandate | CLI + Mandates shell app |
+| **Act** | An agent signs an `IntentDeclarationV1` and dispatches it; a fail-closed gate checks `intent ⊆ envelope` (capsule + agent-key + method + resource + action), runs a real executor, and reconciles declared-vs-done | `POST /api/standing-grants/dispatch` |
+| **Watch** | The operator sees mandates live, and what each agent has written/delivered under them | Mandates shell app (mandate cards, Agent State panel, Inbox) |
+| **Revoke** | The kill switch — durably attested *before* the mandate dies | CLI + Mandates shell app |
+| **Prove** | Export a portable `MandateReceipt` and verify it off-box with no runtime and no trust in this box | `elastos verify-receipt` |
+
+## The four real affordances behind dispatch
+
+An affordance is a genuine runtime operation an agent can invoke under a mandate. Each REPORTS what
+it actually did; the receipt is minted from that report, never from the declaration, so an
+authorized-but-unperformed act reconciles honestly (`authorized_not_performed`), never a fabricated
+match (this is the G-M6 rule).
+
+| Method | Kind | Reports | Notes |
+|---|---|---|---|
+| `runtime.audit_verify` | read (side-effect-free) | `read` | Re-verifies the signed audit chain end to end; `performed` iff it truly verifies |
+| `runtime.content_seen` | state-dependent read | `read` | Did THIS principal open a content id? Principal-scoped, no cross-principal oracle |
+| `runtime.notify` | **side-effecting** | `message` | Delivers a message into the operator's Inbox; bounded fields, capped store, `performed` only after the write lands |
+| `runtime.state_put` | **side-effecting** | `write` | Writes durable, readable-back, principal-scoped agent state; last-write-wins with attributed versioning |
+
+## The trust model (and its honest caveats)
+
+- **The runtime is the single audit writer.** Trust in a receipt derives from a signed `did:key`
+  pinned out-of-band; verification is fully off-box (`elastos verify-receipt --signer`).
+- **The shell is the grant root (G-M3).** Issuing/revoking authority lives behind the shell's
+  consent-broker gate (API) and the app-bound home-launch token (gateway) — the same trust tier. A
+  compromised shell can already mint anything, so shell-held mandate power is *contained*, not new.
+- **Agent-key binding is optional today (G-M4).** A mandate MAY bind one agent's ed25519 key
+  (strong attribution); unbound, it is capsule-string-only. Promoting binding to default is tracked.
+- **Same-disk / same-host caveats, stated not hidden:** durable stores are fail-closed on corrupt
+  boot but not defended against a root attacker who already owns the key material; the replay guard's
+  freshness window trusts the host clock (fail-closed both directions — see below).
+
+## Gaps closed vs open (mandate track)
+
+**Closed:** G-M1 (liveness consults every kill path), G-M2 (token-keyed `CapabilityUse` in the
+receipt), G-M5 (durable registry + replay guard survive restart and power loss), G-M6 (the
+reconciliation seam — receipts minted from what executors report).
+
+**Open / tracked (by design or roadmap):**
+- **G-M3** — shell is the grant root (accepted trust model).
+- **G-M4** — agent-key binding optional; promote to default before exposing dispatch to untrusted agents.
+- **G-M7** — operational hardening. *Paid down:* the replay guard is now time-windowed + bounded +
+  clock-attack-hardened (below). *Remaining:* rate-limit the mint/dispatch routes; the principled
+  fix for one-click broad grants is role-based capability tiering (a `CapsuleRole::System`), a
+  separate initiative deliberately NOT wedged in on a spoofable capsule name.
+
+## The replay guard (security core)
+
+Each signed intent acts at most once. The guard is **durable** (survives restart/power loss),
+**time-windowed** (a captured declaration expires after `MAX_INTENT_AGE_SECS`; future-dated ones are
+refused), **bounded** (the seen-set self-compacts against the retention window instead of growing
+forever), and **clock-attack-hardened** (a persisted, monotonic anti-readmit watermark refuses any
+intent at/below the highest evicted `declared_at`, so a backward clock step cannot readmit a
+compacted id — under any clock, across restart). `RETENTION = age + skew` is the load-bearing margin.
+
+## Review discipline
+
+Every sprint (13 mandate-engine sprints on this branch, on top of the receipt/CLI foundation) ran
+the same standard before commit: **gate** (build + clippy + full test suites) → **principles
+guardian** review → **red-team** review → fold findings → commit → push. Findings were folded with
+ratchets that reproduce the exact failure; nothing was dismissed as noise. Notable catches the
+council forced (all fixed): a cross-principal content oracle; a receipt over-claim; a wrong-target
+kill-switch race; an operator-Inbox phishing channel; and a backward-clock replay regression (plus
+its persist-failure sub-case) in this very guard.
+
+## Verification status at merge
+
+- `cargo clippy` clean across `elastos-runtime`, `elastos-server`, `elastos-common`.
+- Test suites green: **runtime 409 · server 1159 · common 96** (lib), plus the ESP/receipt tools.
+- No `todo!()`/`unimplemented!()` in the mandate path; every closed gap carries a ratchet, every open
+  gap a documented reason.
+
+## What a reviewer should look at first
+
+1. `elastos-runtime/src/capability/intent.rs` — the gate, the standing-grant store, the replay guard.
+2. `elastos-server/src/intent_executor.rs` — the four affordances + the reconciliation seam.
+3. `elastos-server/src/api/handlers/capability.rs` — issue/revoke/dispatch handlers + receipt export.
+4. `elastos-server/src/api/gateway_mandates.rs` — the shell app's read/grant/revoke surface.
+5. `capsules/mandates/index.html` — the operator UI (list, receipt drawer, grant form, kill switch, Agent State).
+6. `docs/KNOWN_GAPS.md` — the honest ledger of every gap, closed and open.
