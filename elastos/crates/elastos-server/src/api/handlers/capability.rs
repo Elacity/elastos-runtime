@@ -1209,13 +1209,25 @@ pub async fn issue_mandate(
         .ttl_secs
         .map(elastos_common::SecureTimestamp::after_secs);
     // Mint a real signed token (the cryptographic root), then elevate it to a standing grant.
-    let token = capability_manager.grant(
-        &input.capsule,
-        ResourceId::new(input.resource),
-        action,
-        TokenConstraints::default(),
-        expiry,
-    );
+    // FAIL-CLOSED mint (Sprint 24, closes Sprint 23 council F1): the signed durable CapabilityGrant
+    // must land on the audit chain BEFORE the mandate exists — so a mandate, whose registry entry is
+    // now retention-pruned (Sprint 23), can never exist without a provable grant event. If the audit
+    // write fails, no token is returned and no mandate is issued (symmetric with the fail-closed
+    // revoke). A best-effort mint could leave a since-pruned mandate with no trace anywhere.
+    let token = capability_manager
+        .grant_durable(
+            &input.capsule,
+            ResourceId::new(input.resource),
+            action,
+            TokenConstraints::default(),
+            expiry,
+        )
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("mandate grant could not be durably recorded on the audit chain — not issued: {e}"),
+            )
+        })?;
     let methods: std::collections::BTreeSet<String> = input.methods.into_iter().collect();
     // Durable-before-visible (G-M5): a mandate that cannot be recorded to the persistent registry
     // is NOT issued — the operator retries into a working store rather than holding a grant that

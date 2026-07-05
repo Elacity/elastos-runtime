@@ -428,11 +428,17 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   revoke_stamps_revoked_at_roundtrips_and_issue_prunes_expired}`. HONEST BOUNDS (Sprint 23 council):
   (1) LIVE growth is NOT bounded — a shell-token holder minting no-TTL live mandates grows the
   registry without limit, BY DESIGN (a live mandate is real G-M3 authority, never shed); only DEAD
-  accumulation is reclaimed. (2) The "chain is the permanent record" holds only IF the mint's grant
-  event landed — mint audit is `emit_best_effort` (a pre-existing gap S23 did not introduce; it only
-  removed the registry entry's accidental role as a fallback record). A mint whose audit append
-  failed, once pruned, has no provable trace — FIX (tracked): make mint fail-closed emit-before-issue,
-  mirroring revoke (its own sprint; core `grant()` blast radius). (3) The 30-day operator-visibility
+  accumulation is reclaimed. (2) The "chain is the permanent record" now holds for MANDATES — CLOSED
+  Sprint 24: `CapabilityManager::grant_durable` emits the signed durable `CapabilityGrant` BEFORE
+  returning the token (emit-before-issue, mirroring `revoke`), and `issue_mandate` uses it — so a
+  mandate whose grant event cannot be recorded is never issued (500, no token), and a
+  retention-pruned mandate can never have existed without a provable grant on the chain. Proven by
+  `capability::manager::tests::grant_durable_fails_closed_when_audit_write_fails` + the existing
+  issue→`export_mandate_receipt_for_capability` receipt tests (now routed through the fail-closed
+  mint). RESIDUAL: the GENERIC `grant()` (non-mandate ephemeral tokens, not in the standing registry
+  and not retention-pruned) keeps best-effort audit by design — its 79 call sites across unrelated
+  subsystems are out of scope for the mandate provability contract; converting them is the G8b
+  hot-path group-commit initiative, not this. (3) The 30-day operator-visibility
   promise is conditional: under cap pressure (>4096 live+dead) recently-dead grants can be evicted
   inside the window; the chain still has them. (4) Time-death is wall-clock: a >30-day FORWARD clock
   excursion could permanently prune a live-but-recently-expiring mandate — a bound shared with expiry

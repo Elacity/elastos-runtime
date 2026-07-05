@@ -298,23 +298,24 @@ impl CapabilityManager {
         )
     }
 
-    /// Grant a new capability token
-    pub fn grant(
+    /// Build + sign a capability token (the shared mint core for [`grant`](Self::grant) and
+    /// [`grant_durable`](Self::grant_durable)). Records the request metric. Does NOT audit — the
+    /// caller chooses the audit discipline (best-effort vs fail-closed), so the two mint surfaces
+    /// can never drift on how a token is minted, only on how its grant event is recorded.
+    fn mint_signed_token(
         &self,
         capsule_id: &str,
-        resource: ResourceId,
+        resource: &ResourceId,
         action: Action,
         constraints: TokenConstraints,
         expiry: Option<SecureTimestamp>,
     ) -> CapabilityToken {
         let issued_at = SecureTimestamp::now();
-
-        // Ensure token epoch is at least current epoch
+        // Ensure token epoch is at least current epoch.
         let mut constraints = constraints;
         if constraints.epoch < self.store.current_epoch() {
             constraints.epoch = self.store.current_epoch();
         }
-
         let mut token = CapabilityToken::new(
             capsule_id.to_string(),
             self.public_key_bytes(),
@@ -324,18 +325,59 @@ impl CapabilityManager {
             issued_at,
             expiry,
         );
-
-        // Sign the token
         token.sign(&self.signing_key);
-
-        // Record metrics
         self.metrics.record_capability_request(capsule_id);
+        token
+    }
 
-        // Audit log
+    /// Grant a new capability token. The grant event is audited BEST-EFFORT (a lost audit append
+    /// does not fail the grant) — the ephemeral hot path for tokens that are not the durable,
+    /// provable mandate primitive. For a mandate (whose portable receipt IS its record, and whose
+    /// registry entry is now retention-pruned — Sprint 23), use [`grant_durable`](Self::grant_durable)
+    /// so the grant event is guaranteed on the chain before the mandate exists.
+    pub fn grant(
+        &self,
+        capsule_id: &str,
+        resource: ResourceId,
+        action: Action,
+        constraints: TokenConstraints,
+        expiry: Option<SecureTimestamp>,
+    ) -> CapabilityToken {
+        let token = self.mint_signed_token(capsule_id, &resource, action, constraints, expiry);
+        // Audit log (best-effort).
         self.audit_log
             .capability_grant(&token.id, capsule_id, &resource, action, expiry);
-
         token
+    }
+
+    /// Grant a capability token FAIL-CLOSED: emit the signed durable `CapabilityGrant` record
+    /// BEFORE returning the token (emit-before-issue, mirroring [`revoke`](Self::revoke)'s
+    /// emit-before-mutate). If the audit write fails the grant ABORTS — the token is never returned,
+    /// so the caller never issues a mandate whose grant event is not on the chain. This is the mint
+    /// side of "the chain is the permanent record": a durable, retention-pruned mandate
+    /// (Sprint 23/24) can never exist without a provable grant event, closing the Sprint 23 council
+    /// F1 corner (a best-effort mint whose audit was lost, once pruned, had no trace). Accepted
+    /// tradeoff, symmetric with revoke: a mandate that cannot be recorded does not happen.
+    pub fn grant_durable(
+        &self,
+        capsule_id: &str,
+        resource: ResourceId,
+        action: Action,
+        constraints: TokenConstraints,
+        expiry: Option<SecureTimestamp>,
+    ) -> Result<CapabilityToken, AuditError> {
+        let token = self.mint_signed_token(capsule_id, &resource, action, constraints, expiry);
+        // Emit-before-issue: the durable signed grant record must land before the token is handed
+        // back. On failure the token is dropped here — never issued, never stored in any registry.
+        self.audit_log.emit(AuditEvent::CapabilityGrant {
+            timestamp: SecureTimestamp::now(),
+            token_id: token.id.to_string(),
+            capsule_id: capsule_id.to_string(),
+            resource: resource.to_string(),
+            action: action.to_string(),
+            expiry,
+        })?;
+        Ok(token)
     }
 
     /// Refund one consumed use of a token (saturating). The caller must only
@@ -898,6 +940,52 @@ mod tests {
         assert!(
             still_valid.is_ok(),
             "token stays valid when its revocation audit write fails (got {still_valid:?})"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn grant_durable_fails_closed_when_audit_write_fails() {
+        // Sprint 24 (closes Sprint 23 council F1): the fail-closed mint must ABORT when its durable
+        // signed CapabilityGrant cannot be written — no token returned, so no mandate is issued
+        // whose grant event is not on the chain. Symmetric with revoke_fails_closed above.
+        let path = std::env::temp_dir().join(format!("mgr-grant-ro-{}.log", std::process::id()));
+        std::fs::File::create(&path).unwrap();
+        let ro = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+        let manager = CapabilityManager::new(
+            Arc::new(CapabilityStore::new()),
+            Arc::new(AuditLog::with_file_handle(ro)),
+            Arc::new(MetricsManager::new()),
+        );
+
+        let res = manager.grant_durable(
+            "test-capsule",
+            ResourceId::new("localhost://Users/self/Documents/test.txt"),
+            Action::Read,
+            TokenConstraints::default(),
+            None,
+        );
+        assert!(
+            res.is_err(),
+            "grant_durable must fail closed when its durable audit write fails — no token issued"
+        );
+
+        // A manager with a WRITABLE audit mints successfully and hands back the signed token — the
+        // emit()? landed, so the grant is on the chain (provability is asserted end-to-end at the
+        // handler layer, where a durable+signed audit backs export_mandate_receipt_for_capability).
+        let ok_manager = create_test_manager();
+        let token = ok_manager
+            .grant_durable(
+                "test-capsule",
+                ResourceId::new("localhost://Users/self/Documents/test.txt"),
+                Action::Read,
+                TokenConstraints::default(),
+                None,
+            )
+            .expect("a durable mint succeeds when the audit write lands");
+        assert!(
+            token.signature.iter().any(|b| *b != 0),
+            "the durably-minted token is signed and was handed back"
         );
         let _ = std::fs::remove_file(&path);
     }

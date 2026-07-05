@@ -59,12 +59,12 @@ reconciliation seam — receipts minted from what executors report).
   per-mandate configurable budget (S22); and the working registry's DEAD accumulation is now bounded
   on both axes — time-retention + hard cap that never sheds a live mandate (S23). Durable *dead*
   state (replay set, dispatch rate, dead grants) is bounded; *live* mandate growth stays real
-  operator authority by design (never shed). *Remaining:* a request-RATE limiter on the gateway
-  mint/revoke routes; fail-closed mint audit (mint currently emits best-effort, so a mint whose
-  audit append failed has no chain trace — the tracked fix that makes the receipt a complete record
-  for every issued mandate); and the principled fix for one-click broad grants is role-based
-  capability tiering (a `CapsuleRole::System`), a separate initiative deliberately NOT wedged in on a
-  spoofable capsule name.
+  operator authority by design (never shed). Mandate mint is now FAIL-CLOSED (S24): `grant_durable`
+  emits the signed `CapabilityGrant` before returning the token, so a mandate whose grant cannot be
+  recorded is never issued — the receipt is a complete record for every issued mandate. *Remaining:*
+  a request-RATE limiter on the gateway mint/revoke routes; and the principled fix for one-click
+  broad grants is role-based capability tiering (a `CapsuleRole::System`), a separate initiative
+  deliberately NOT wedged in on a spoofable capsule name.
 
 ## The replay guard (security core)
 
