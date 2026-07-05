@@ -1188,15 +1188,22 @@ pub async fn issue_mandate(
             Some(hex::encode(arr))
         }
     };
-    // A zero-rate mandate is refused, not minted (it could never act; a mandate that authorizes
-    // nothing is a footgun that LOOKS live on the card — revoke is the kill switch, not a budget).
-    if input.dispatch_limit == Some(0) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "dispatch_limit must be at least 1 act per window (omit it for the default); to stop \
-             a mandate acting, revoke it"
-                .to_string(),
-        ));
+    // The dispatch budget must be in [1, MAX]. Zero would mint a mandate that LOOKS live on the
+    // card yet denies every act (revoke is the kill switch, not a budget); an unclamped limit would
+    // uncap the fsync-flood bound (council red-team F2 / guardian F3). This is the friendly 400;
+    // issue_from_token re-checks the same invariant at the service layer for any non-HTTP caller.
+    if let Some(n) = input.dispatch_limit {
+        if n == 0 || n > elastos_runtime::capability::MANDATE_DISPATCH_LIMIT_MAX {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "dispatch_limit must be between 1 and {} acts per window (got {}); omit it for \
+                     the default. To stop a mandate acting, revoke it.",
+                    elastos_runtime::capability::MANDATE_DISPATCH_LIMIT_MAX,
+                    n
+                ),
+            ));
+        }
     }
     let expiry = input
         .ttl_secs
@@ -1572,12 +1579,17 @@ pub async fn dispatch_standing_intent(
         .standing_service
         .record_dispatch_within_budget(&intent.standing_grant_id, now_secs)
     {
+        // Report THIS mandate's resolved budget, not the global default (council F1, P12): a
+        // mandate dialed to 2/min must not be told it exceeded "60 acts" — the message would
+        // contradict the gate. Re-resolve the enforced limit from the registry for the message.
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             format!(
                 "mandate {} exceeded its dispatch rate budget ({} acts per {}s)",
                 intent.standing_grant_id,
-                elastos_runtime::capability::MANDATE_DISPATCH_LIMIT,
+                state
+                    .standing_service
+                    .dispatch_limit_for(&intent.standing_grant_id),
                 elastos_runtime::capability::MANDATE_DISPATCH_WINDOW_SECS
             ),
         ));
@@ -2468,9 +2480,17 @@ mod tests {
             assert_eq!(r.outcome, "performed", "act {i} within the dialed budget");
         }
         let refused = dispatch_standing_intent(State(state.clone()), Json(act(2))).await;
+        // The 429 body must report THIS mandate's resolved budget (2), never the global default
+        // (60) — the message can't contradict what the gate enforced (council guardian F1, P12).
+        let (code, body) = refused.expect_err("over the dialed budget");
+        assert_eq!(code, StatusCode::TOO_MANY_REQUESTS, "the mandate's OWN limit (2) binds");
         assert!(
-            matches!(refused, Err((StatusCode::TOO_MANY_REQUESTS, _))),
-            "the mandate's OWN limit (2) binds — not the global default (60)"
+            body.contains("2 acts per 60s"),
+            "the 429 reports the mandate's resolved budget, not the default: {body}"
+        );
+        assert!(
+            !body.contains("60 acts"),
+            "the 429 must not misstate the default limit for a dialed mandate: {body}"
         );
     }
 

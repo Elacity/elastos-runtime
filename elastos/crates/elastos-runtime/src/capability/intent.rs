@@ -234,11 +234,16 @@ pub struct StandingGrantEnvelope {
     /// deny epoch-dead mandates without re-deriving the token.
     pub token_epoch: u64,
     /// This mandate's own dispatch-rate budget (acts per [`MANDATE_DISPATCH_WINDOW_SECS`] window),
-    /// a first-class grant property alongside scope/expiry/agent-binding (Sprint 22). `None` = the
-    /// global default ([`MANDATE_DISPATCH_LIMIT`]). Never `Some(0)` — the mint refuses it (a
-    /// zero-rate mandate authorizes nothing; revoke is the kill switch, not a budget).
-    /// Presence-required on load: a snapshot missing the KEY is corrupt, never "default rate" — a
-    /// same-disk edit must not silently widen an operator-tightened budget back to the default.
+    /// a first-class grant property (registry state, same trust level as `agent_pubkey` — not
+    /// signed into the token) added in Sprint 22. `None` = the global default
+    /// ([`MANDATE_DISPATCH_LIMIT`]); the mint refuses `Some(0)` and anything over
+    /// [`MANDATE_DISPATCH_LIMIT_MAX`]. Presence-required on load (like `agent_pubkey`/`expires_at`):
+    /// a v3 snapshot MISSING the key is refused, so an ACCIDENTAL key-drop / boot-repair cannot
+    /// silently reset an operator-tightened budget to the default. Honest bound: this does NOT stop
+    /// a same-disk attacker who rewrites the whole (unsigned) file — an explicit `"dispatch_limit":
+    /// null`, or a version-downgrade to v1/v2 (whose envelope legitimately has no such key), still
+    /// widens. That is the same same-disk caveat the snapshot carries throughout (closing it needs
+    /// the keyed-MAC roadmap item), not a property this field claims.
     #[serde(deserialize_with = "de_present_option")]
     pub dispatch_limit: Option<u32>,
 }
@@ -818,6 +823,13 @@ pub struct StandingGrantStore {
 pub const MANDATE_DISPATCH_LIMIT: u32 = 60;
 /// The rolling window (seconds) the per-mandate dispatch budget is measured over.
 pub const MANDATE_DISPATCH_WINDOW_SECS: u64 = 60;
+/// The largest per-mandate dispatch budget the mint will accept (Sprint 22 council, red-team F2 /
+/// guardian F3). A per-mandate `dispatch_limit` above this is refused — not a security boundary (a
+/// grant-root operator can already raise aggregate rate by minting more mandates, so this adds no
+/// authority class), but a footgun stop: without it a single mandate dialed to `u32::MAX` would
+/// linearly uncap the durable-write (fsync) flood the budget exists to bound. Generous for any real
+/// agent (many acts/second sustained), so a tighter operational limit stays an operator choice.
+pub const MANDATE_DISPATCH_LIMIT_MAX: u32 = 3600;
 /// The dispatch-rate map's bound. When it exceeds this, elapsed windows are pruned; if it is still
 /// at/over the cap a NEW key is then refused (hard cap) — so an attacker spamming DISTINCT (even
 /// non-existent) grant_ids cannot grow it without bound, even within a single window.
@@ -1168,6 +1180,22 @@ impl StandingGrantStore {
         all
     }
 
+    /// The dispatch-rate budget ENFORCED for `grant_id`: the mandate's own `dispatch_limit` when it
+    /// set one, else the global [`MANDATE_DISPATCH_LIMIT`]. Read from the registry (trusted state) —
+    /// the single resolver used by both enforcement and the over-budget message, so the number the
+    /// gate enforces and the number it reports can never diverge (council F1, P12). An unknown
+    /// grant_id resolves to the default (in the dispatch path the handler screens unknown ids first).
+    pub fn dispatch_limit_for(&self, grant_id: &str) -> u32 {
+        let grants = match self.grants.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        grants
+            .get(grant_id)
+            .and_then(|env| env.dispatch_limit)
+            .unwrap_or(MANDATE_DISPATCH_LIMIT)
+    }
+
     /// Record a dispatch against the per-mandate RATE budget (G-M7): returns `true` iff this
     /// mandate is WITHIN its budget for the current [`MANDATE_DISPATCH_WINDOW_SECS`] window (and
     /// counts this attempt), `false` if it is over budget. The limit is the mandate's OWN
@@ -1184,19 +1212,9 @@ impl StandingGrantStore {
     /// structurally intact).
     pub fn record_dispatch_within_budget(&self, grant_id: &str, now_secs: u64) -> bool {
         // Resolve the mandate's own budget first (registry read lock released before the rate
-        // lock — no nesting). An unknown grant_id gets the global default: in the dispatch path
-        // the handler's existence check runs before this, so unknown ids never reach here; if one
-        // does (direct call), the default still bounds it.
-        let limit = {
-            let grants = match self.grants.read() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            grants
-                .get(grant_id)
-                .and_then(|env| env.dispatch_limit)
-                .unwrap_or(MANDATE_DISPATCH_LIMIT)
-        };
+        // lock — no nesting). ONE resolver, shared with the 429 message, so what the gate enforces
+        // and what it REPORTS can never diverge (council F1, P12).
+        let limit = self.dispatch_limit_for(grant_id);
         // The mint refuses `Some(0)`, so a zero here means a tampered/corrupt registry entry —
         // fail closed (deny every act) rather than let the window-reset branch admit one per window.
         if limit == 0 {
@@ -1474,6 +1492,22 @@ impl StandingGrantService {
         agent_pubkey: Option<String>,
         dispatch_limit: Option<u32>,
     ) -> std::io::Result<String> {
+        // Enforce the budget invariant HERE, at the service choke point, not only at the HTTP
+        // boundary (council red-team F3 / guardian F7): 0 would mint a mandate that renders "Live"
+        // yet denies every act, and an unclamped limit would uncap the fsync-flood bound (F2). Every
+        // mint surface (API, gateway shell form) funnels through this, so the invariant holds even
+        // for a future direct caller — fail-closed at the type's home, not by convention.
+        if let Some(n) = dispatch_limit {
+            if n == 0 || n > MANDATE_DISPATCH_LIMIT_MAX {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "dispatch_limit must be between 1 and {MANDATE_DISPATCH_LIMIT_MAX} acts \
+                         per window (got {n}); omit it for the default"
+                    ),
+                ));
+            }
+        }
         let envelope = StandingGrantEnvelope::from_token(
             token,
             allowed_methods,
@@ -1497,6 +1531,13 @@ impl StandingGrantService {
     /// the act (429). Call AFTER freshness, BEFORE the replay guard's durable write.
     pub fn record_dispatch_within_budget(&self, grant_id: &str, now_secs: u64) -> bool {
         self.store.record_dispatch_within_budget(grant_id, now_secs)
+    }
+
+    /// The dispatch-rate budget ENFORCED for `grant_id` (own limit or the global default). See
+    /// [`StandingGrantStore::dispatch_limit_for`] — the shared resolver behind the over-budget
+    /// message so it can never misstate what the gate enforces.
+    pub fn dispatch_limit_for(&self, grant_id: &str) -> u32 {
+        self.store.dispatch_limit_for(grant_id)
     }
 
     /// Whether any dispatch-rate entry exists (test observability). See
@@ -2665,6 +2706,47 @@ mod tests {
         // The service wrote to the SHARED audit log: the story is queryable on the intent channel.
         let summary = audit.intent_proof_summary("vm-agent").expect("present");
         assert_eq!(summary.denied, 1);
+    }
+
+    /// The dispatch-budget invariant lives at the SERVICE layer, not only the HTTP boundary
+    /// (council red-team F3 / guardian F7): `issue_from_token` itself refuses a 0 budget (would
+    /// mint a Live-looking mandate that denies every act) and one over `MANDATE_DISPATCH_LIMIT_MAX`
+    /// (would uncap the fsync-flood bound — red-team F2), while a value inside [1, MAX] and `None`
+    /// mint fine. So even a future non-HTTP caller cannot store an out-of-range budget.
+    #[test]
+    fn issue_from_token_rejects_out_of_range_dispatch_limit() {
+        use crate::capability::token::{Action, CapabilityToken, ResourceId};
+        let dir = tempfile::tempdir().unwrap();
+        let audit = std::sync::Arc::new(
+            crate::primitives::audit::AuditLog::with_file(dir.path().join("a.log")).unwrap(),
+        );
+        let sk = key();
+        let svc = StandingGrantService::new(audit, sk);
+        let mk_token = || {
+            CapabilityToken::new(
+                "vm-agent".to_string(),
+                [0u8; 32],
+                ResourceId::new("elastos://mail/send"),
+                Action::Execute,
+                Default::default(),
+                SecureTimestamp::now(),
+                Some(SecureTimestamp::after_secs(3600)),
+            )
+        };
+        let methods = || ["send"].iter().map(|m| m.to_string()).collect::<BTreeSet<String>>();
+        // Zero and over-max are refused with InvalidInput — fail-closed, not stored.
+        for bad in [Some(0u32), Some(MANDATE_DISPATCH_LIMIT_MAX + 1)] {
+            let err = svc
+                .issue_from_token(&mk_token(), methods(), None, bad)
+                .expect_err("out-of-range dispatch_limit is refused at the service layer");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        // The boundary value MAX and a normal dial and None all mint fine.
+        assert!(svc
+            .issue_from_token(&mk_token(), methods(), None, Some(MANDATE_DISPATCH_LIMIT_MAX))
+            .is_ok());
+        assert!(svc.issue_from_token(&mk_token(), methods(), None, Some(5)).is_ok());
+        assert!(svc.issue_from_token(&mk_token(), methods(), None, None).is_ok());
     }
 
     #[test]

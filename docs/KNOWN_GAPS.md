@@ -404,8 +404,11 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   `capability::tests::dispatch_over_rate_budget_is_refused_429`. RESIDUALS (operator-gated today,
   matter once dispatch is agent-facing): (i) **charge-on-attempt** — the budget is spent by a
   well-formed fresh intent naming a REAL grant even if the act is later denied (revoked / out of
-  envelope), so someone who can name a victim's real grant_id could burn its 60/window and lock the
-  legit agent out (red-team F5); the fix is to key the limiter on the authenticated caller identity /
+  envelope), so someone who can name a victim's real grant_id could burn its window budget and lock
+  the legit agent out (red-team F5). Sprint 22 sharpens this: because the budget is now per-mandate
+  dialable, the lockout scales INVERSELY with the dial — a mandate tightened to 1/min is locked out
+  by a SINGLE well-formed self-signed intent naming its grant_id (the budget charges before the
+  gate's agent-key binding). The fix is to key the limiter on the authenticated caller identity /
   charge only an AUTHORIZED act — deferred with the agent-facing delegation that doesn't exist yet.
   (ii) **fixed-window boundary** allows up to ~2× the limit across a window edge (60 at the tail of
   W + 60 at the head of W+1); acceptable for a flood bound (still O(1)/window, ~1/s average), noted
@@ -414,16 +417,31 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   shell-token holder (the trusted operator) can still flood issue and grow the file. FIX (deferred):
   a per-token limiter on the gateway mutation routes + a live+revoked cap / retention prune on the
   store. SHIPPED (Sprint 22): per-mandate-CONFIGURABLE dispatch budgets — `dispatch_limit` is a
-  first-class grant property alongside scope/expiry/agent-binding, set at mint (API + shell form;
-  zero refused — revoke is the kill switch, not a budget), resolved by the STORE from the registry
-  at enforcement time (no caller can pass a wrong limit; a tampered zero denies every act,
-  fail-closed), persisted in the v3 registry snapshot (v1/v2 migrate to `None` = the global default
-  they were enforced under; a v3 envelope missing the KEY refuses to load — widen-proof, a same-disk
-  edit cannot silently reset an operator-tightened budget), and surfaced on the mandate card as the
-  ENFORCED number with a `custom` marker (P12: the card shows what the gate does). Ratchets:
+  first-class grant property (registry state, same trust level as agent-binding — not signed into
+  the token or the receipt), set at mint (API + shell form; the CLI does not set it yet — a known
+  follow-up, so the claim is scoped to API+form). The mint refuses `0` and anything over
+  `MANDATE_DISPATCH_LIMIT_MAX` (3600/window): 0 would mint a mandate that renders Live yet denies
+  every act, and an unclamped limit would linearly uncap the fsync-flood bound the budget exists to
+  enforce (council red-team F2 / guardian F3) — a footgun stop, not an authority boundary (a
+  grant-root operator can already raise aggregate rate by minting more mandates). Enforced from the
+  registry via ONE resolver (`dispatch_limit_for`) shared with the over-budget 429 message, so the
+  number the gate enforces and the number it reports can never diverge (council F1); no caller or
+  intent field can influence it; a tampered zero denies every act, fail-closed. The invariant is
+  re-checked at the service layer (`issue_from_token`), not only the HTTP boundary (council F3/F7),
+  so a future direct caller can't store an out-of-range budget. Persisted in the v3 registry
+  snapshot: v1/v2 files migrate to `None` (= the global default they were enforced under — neither
+  widened nor tightened); a v3 envelope MISSING the key is refused, so an ACCIDENTAL key-drop /
+  boot-repair cannot silently reset a tightened budget. HONEST BOUND (council F4): this does NOT
+  defend against a same-disk attacker rewriting the whole unsigned file — an explicit
+  `"dispatch_limit": null` or a version-downgrade to v1/v2 still widens; that is the same same-disk
+  caveat the snapshot carries throughout (closing it needs the keyed-MAC roadmap item). Surfaced on
+  the mandate card as the ENFORCED number with a `custom` marker (P12: the card shows what the gate
+  does, via the same resolver). Ratchets:
   `intent::tests::{per_mandate_dispatch_limit_overrides_the_default,
-  v2_snapshot_migrates_dispatch_limit_and_v3_roundtrips_it}` +
-  `capability::tests::mandate_minted_with_its_own_rate_budget_enforces_and_surfaces_it`.
+  v2_snapshot_migrates_dispatch_limit_and_v3_roundtrips_it,
+  issue_from_token_rejects_out_of_range_dispatch_limit}` +
+  `capability::tests::mandate_minted_with_its_own_rate_budget_enforces_and_surfaces_it` (which now
+  also asserts the over-budget 429 reports the mandate's OWN resolved limit, not the default — F1).
   (b) **Unbound + arbitrary-`capsule` is now a one-click grant (red-team F2; the UI default is
   "unbound").** `capsule` is a free string (unvalidated) and an unbound mandate (`agent_pubkey`
   None) enforces capsule-STRING-only — any self-signed key declaring that string acts under it
