@@ -1153,13 +1153,33 @@ pub async fn issue_mandate(
         Some(hex_key) => {
             let bytes = hex::decode(hex_key)
                 .map_err(|e| (StatusCode::BAD_REQUEST, format!("agent_pubkey not hex: {e}")))?;
-            if bytes.len() != 32 {
-                return Err((
+            let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                (
                     StatusCode::BAD_REQUEST,
                     format!("agent_pubkey must be 32 bytes (64 hex chars), got {}", bytes.len()),
+                )
+            })?;
+            // Reject a key that is not a real, non-weak ed25519 point (council, Sprint 20 red-team
+            // F1): the identity / low-order points parse as valid 32 bytes but a forged signature
+            // validates for them under any message — a mandate "bound" to such a key would be
+            // satisfiable by anyone, an effectively-UNBOUND mandate wearing a "bound" badge. A
+            // non-canonical or small-order key is refused here so a bound mandate always means a
+            // real, single-agent binding. (The dispatch gate also uses verify_strict as belt.)
+            let vk = ed25519_dalek::VerifyingKey::from_bytes(&arr).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "agent_pubkey is not a valid ed25519 public key".to_string(),
+                )
+            })?;
+            if vk.is_weak() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "agent_pubkey is a weak (small-order) ed25519 key — its binding would be \
+                     forgeable; use a real agent key"
+                        .to_string(),
                 ));
             }
-            Some(hex::encode(bytes))
+            Some(hex::encode(arr))
         }
     };
     let expiry = input
@@ -1346,6 +1366,14 @@ pub struct MandateCard {
     pub revoked: bool,
     /// Live right now (issued, not revoked, not expired)?
     pub active: bool,
+    /// Is the mandate BOUND to one authorized agent key? `true` ⇒ only intents signed by that key
+    /// may act (strong attribution). `false` ⇒ capsule-string-only authorization: ANY key acting as
+    /// the capsule passes (weaker; G-M4). Surfaced so the operator can SEE the attribution strength
+    /// of every mandate, not just trust it (P12).
+    pub agent_bound: bool,
+    /// The authorized agent's ed25519 verifying key (hex), when bound — the operator's own issued
+    /// key, so exposing it here is not a leak (public key, operator surface). `None` when unbound.
+    pub agent_pubkey: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1394,6 +1422,8 @@ pub async fn mandate_cards(
             methods: env.allowed_methods.into_iter().collect(),
             expires_at: env.expires_at,
             revoked: env.revoked || token_dead,
+            agent_bound: env.agent_pubkey.is_some(),
+            agent_pubkey: env.agent_pubkey,
         });
     }
     ListMandatesOutput {
@@ -1782,6 +1812,106 @@ mod tests {
             standing_service,
             intent_executor,
         }
+    }
+
+    /// G-M4 (Sprint 20): the mandate card SURFACES binding honestly (P12), and the API/CLI path
+    /// STILL allows an UNBOUND mandate for the trusted operator (G-M3) — only the web surface
+    /// requires binding. A bound mandate's card carries `agent_bound=true` + the key; an unbound
+    /// one carries `agent_bound=false`.
+    #[tokio::test]
+    async fn card_surfaces_agent_binding_and_api_still_allows_unbound() {
+        let state = test_state();
+        let agent = hex::encode(
+            ed25519_dalek::SigningKey::generate(&mut rand::thread_rng())
+                .verifying_key()
+                .to_bytes(),
+        );
+        // BOUND via the API — allowed, card shows it.
+        let bound = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: "elastos://mail/send".to_string(),
+                action: "execute".to_string(),
+                methods: vec!["send".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: Some(agent.clone()),
+            }),
+        )
+        .await
+        .expect("bound issue ok")
+        .0;
+        // UNBOUND via the API — STILL allowed (G-M3, the trusted operator/CLI path).
+        let unbound = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent2".to_string(),
+                resource: "elastos://mail/send".to_string(),
+                action: "execute".to_string(),
+                methods: vec!["send".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: None,
+            }),
+        )
+        .await
+        .expect("unbound issue STILL allowed on the API path (G-M3)")
+        .0;
+
+        let cards = mandate_cards(&state.standing_service, &state.capability_manager).await;
+        let bc = cards.mandates.iter().find(|c| c.token_id == bound.grant_id).unwrap();
+        assert!(bc.agent_bound, "bound mandate card shows agent_bound");
+        assert_eq!(bc.agent_pubkey.as_deref(), Some(agent.as_str()));
+        let uc = cards.mandates.iter().find(|c| c.token_id == unbound.grant_id).unwrap();
+        assert!(!uc.agent_bound, "unbound mandate card shows agent_bound=false");
+        assert!(uc.agent_pubkey.is_none());
+    }
+
+    /// Council red-team F1 (Sprint 20): a WEAK (small-order / identity) ed25519 key is refused at
+    /// issue — it parses as valid 32 bytes but a forged signature validates for it under any
+    /// message, so a mandate "bound" to it would be forgeable (effectively unbound wearing a bound
+    /// badge). A real key still binds.
+    #[tokio::test]
+    async fn issue_refuses_a_weak_agent_key() {
+        let state = test_state();
+        // The ed25519 identity point and all-zeros are small-order (weak).
+        for weak in [
+            "0100000000000000000000000000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ] {
+            let res = issue_standing_grant(
+                State(state.clone()),
+                Json(IssueStandingGrantInput {
+                    capsule: "vm-agent".to_string(),
+                    resource: "elastos://mail/send".to_string(),
+                    action: "execute".to_string(),
+                    methods: vec!["send".to_string()],
+                    ttl_secs: Some(3600),
+                    agent_pubkey: Some(weak.to_string()),
+                }),
+            )
+            .await;
+            assert!(matches!(res, Err((StatusCode::BAD_REQUEST, _))), "weak key {weak} refused");
+        }
+        assert!(state.standing_service.list().is_empty(), "no weak-bound mandate was minted");
+        // A REAL key still binds.
+        let real = hex::encode(
+            ed25519_dalek::SigningKey::generate(&mut rand::thread_rng())
+                .verifying_key()
+                .to_bytes(),
+        );
+        assert!(issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: "elastos://mail/send".to_string(),
+                action: "execute".to_string(),
+                methods: vec!["send".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: Some(real),
+            }),
+        )
+        .await
+        .is_ok());
     }
 
     #[tokio::test]

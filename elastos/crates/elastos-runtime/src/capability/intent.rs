@@ -23,7 +23,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -501,7 +501,12 @@ fn verify_b64_sig(signature_b64: &str, digest: &[u8; 32], verifying_key: &Verify
         Err(_) => return false,
     };
     let signature = Signature::from_bytes(&sig_arr);
-    verifying_key.verify(digest, &signature).is_ok()
+    // STRICT verification (council, Sprint 20 red-team F1): `verify` (non-strict) accepts low-order
+    // / identity verifying keys, for which a forged signature validates for ANY message. A mandate
+    // "bound" to such a key would be satisfiable by anyone — an effectively-UNBOUND mandate wearing
+    // a "bound" badge. `verify_strict` rejects small-order keys + non-canonical signatures, closing
+    // it at the gate everywhere (not just at mint), the security-correct default for authenticity.
+    verifying_key.verify_strict(digest, &signature).is_ok()
 }
 
 // ─────────────────────────── On-chain custody events (chunk 2) ────────────────

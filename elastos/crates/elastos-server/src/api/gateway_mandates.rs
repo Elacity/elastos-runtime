@@ -194,6 +194,27 @@ async fn mandate_issue(
         )
             .into_response();
     }
+    // G-M4 default-bound (Sprint 20): the web mint surface REQUIRES an agent key — an unbound
+    // (capsule-string-only) mandate lets ANY key acting as the capsule act, weak attribution that
+    // should be a deliberate operator choice, not a one-click default. Enforced server-side (not
+    // just prompted in the form) so the narrower posture holds even against an XSS in the frame.
+    // Unbound mandates remain available on the CLI/consent-broker API for the trusted operator
+    // (G-M3) — this narrowing, like the admin refusal above, is the gateway surface's own.
+    if body
+        .agent_pubkey
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .is_none()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "a mandate granted from the shell must bind an agent key (unbound mandates are \
+             CLI-only); paste the agent's 64-hex ed25519 public key"
+                .to_string(),
+        )
+            .into_response();
+    }
     match crate::api::handlers::capability::issue_mandate(
         &state.standing_service,
         &state.capability_manager,
@@ -313,11 +334,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = state_for(dir.path());
         let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        // The web surface grants BOUND mandates (G-M4) — pass a REAL, non-weak agent key.
+        let agent = hex::encode(
+            ed25519_dalek::SigningKey::generate(&mut rand::thread_rng())
+                .verifying_key()
+                .to_bytes(),
+        );
         let resp = post_json(
             mandate_router(state.clone()),
             "/api/apps/mandates/standing-grants/issue",
             Some(token_hdr),
-            r#"{"capsule":"vm-agent","resource":"elastos://mail/send","action":"execute","methods":["send"],"ttl_secs":3600,"agent_pubkey":null}"#,
+            &format!(
+                r#"{{"capsule":"vm-agent","resource":"elastos://mail/send","action":"execute","methods":["send"],"ttl_secs":3600,"agent_pubkey":"{agent}"}}"#
+            ),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -342,6 +371,9 @@ mod tests {
         assert!(card.active);
         assert_eq!(card.capsule, "vm-agent");
         assert_eq!(card.methods, vec!["send".to_string()]);
+        // The card SURFACES the binding (G-M4): bound = true, and the agent key round-trips.
+        assert!(card.agent_bound, "the card shows the mandate is agent-bound");
+        assert_eq!(card.agent_pubkey.as_deref(), Some(agent.as_str()));
     }
 
     /// The gateway mint enforces the SAME fail-closed guards as the API server (shared helper):
@@ -352,31 +384,44 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = state_for(dir.path());
         let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
-        let cases: &[(&str, StatusCode)] = &[
+        // A valid 64-hex agent key so downstream guards (wildcard, key-format) are the ones tested,
+        // not the new G-M4 bound-required check (which fires first when the key is absent).
+        let k = "\"agent_pubkey\":\"".to_string() + &"ab".repeat(32) + "\"";
+        let cases: Vec<(String, StatusCode)> = vec![
             (
-                r#"{"capsule":"a","resource":"elastos://mail/send","action":"launch","methods":["m"]}"#,
+                format!(r#"{{"capsule":"a","resource":"elastos://mail/send","action":"launch","methods":["m"],{k}}}"#),
                 StatusCode::BAD_REQUEST,
             ),
             (
-                r#"{"capsule":"a","resource":"elastos://mail/send","action":"execute","methods":[]}"#,
+                format!(r#"{{"capsule":"a","resource":"elastos://mail/send","action":"execute","methods":[],{k}}}"#),
                 StatusCode::BAD_REQUEST,
             ),
             (
-                r#"{"capsule":"a","resource":"elastos://*","action":"execute","methods":["m"]}"#,
+                format!(r#"{{"capsule":"a","resource":"elastos://*","action":"execute","methods":["m"],{k}}}"#),
                 StatusCode::FORBIDDEN,
             ),
             (
-                r#"{"capsule":"a","resource":"elastos://mail/send","action":"execute","methods":["m"],"agent_pubkey":"nothex"}"#,
+                r#"{"capsule":"a","resource":"elastos://mail/send","action":"execute","methods":["m"],"agent_pubkey":"nothex"}"#.to_string(),
                 StatusCode::BAD_REQUEST,
             ),
             // The web surface is narrower than the API: admin mints are refused server-side (P16),
             // even case-shifted to dodge a naive string check.
             (
-                r#"{"capsule":"a","resource":"elastos://mail/send","action":"Admin","methods":["m"]}"#,
+                format!(r#"{{"capsule":"a","resource":"elastos://mail/send","action":"Admin","methods":["m"],{k}}}"#),
                 StatusCode::FORBIDDEN,
             ),
+            // G-M4 (Sprint 20): an UNBOUND mandate (no agent key) is refused from the web surface —
+            // unbound is CLI-only. Server-side, not just the form.
+            (
+                r#"{"capsule":"a","resource":"elastos://mail/send","action":"execute","methods":["m"]}"#.to_string(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                r#"{"capsule":"a","resource":"elastos://mail/send","action":"execute","methods":["m"],"agent_pubkey":""}"#.to_string(),
+                StatusCode::BAD_REQUEST,
+            ),
         ];
-        for (body, expected) in cases {
+        for (body, expected) in &cases {
             let resp = post_json(
                 mandate_router(state.clone()),
                 "/api/apps/mandates/standing-grants/issue",

@@ -97,13 +97,34 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   authority reduces to "can read the 0600 coords/attach-secret files" — i.e. the operator uid. Any
   same-uid process inherits full mandate authority. This is the declared trust boundary of a
   single-operator runtime; revisit if multi-tenant hosts land.
-- **G-M4 (agent-key binding — now first-class, default OPTIONAL).** A mandate MAY bind an authorized
-  agent ed25519 key (`issue --agent-key`), and when set the gate requires the intent to be signed by
+- **G-M4 (agent-key binding — DEFAULT-BOUND on the web surface + SURFACED, Sprint 20).** A mandate
+  MAY bind an authorized agent ed25519 key, and when set the gate requires the intent to be signed by
   THAT key (`EnvelopeDenial::WrongAgent`), so the audit attribution is the real agent — proven by
-  `dispatch_binds_the_authorized_agent_key`. An UNBOUND mandate (no `--agent-key`) remains
-  capsule-string-only: within the current shell-only endpoint that is contained (the shell can issue
-  any mandate anyway, G-M3), but it carries weaker attribution. FUTURE: make binding the default /
-  required when the endpoint is exposed to agents directly, and surface bound-vs-unbound on the card.
+  `dispatch_binds_the_authorized_agent_key`. Sprint 20 promoted binding from optional to the DEFAULT
+  posture where it matters and made it VISIBLE:
+  (a) the SHELL grant surface (`gateway_mandates::mandate_issue`) now REQUIRES an agent key — an
+  unbound (capsule-string-only) mandate is refused server-side (BAD_REQUEST), not just discouraged in
+  the form, so the narrower posture holds even against an XSS in the frame (mirrors the Sprint-15
+  admin refusal). Unbound mandates remain available on the CLI/consent-broker API for the trusted
+  operator (G-M3) — a deliberate operator choice, never a one-click web default.
+  (b) the mandate CARD now carries `agent_bound` + `agent_pubkey`, and the shell renders a
+  bound/unbound badge, so the operator can SEE the attribution strength of every mandate (P12), not
+  just trust it. Ratchets: `capability::tests::card_surfaces_agent_binding_and_api_still_allows_unbound`
+  (card honesty both ways + API-path unbound still allowed), `gateway_mandates::tests::
+  issue_route_enforces_the_shared_guards` (web unbound + empty-key refused),
+  `issue_route_mints_a_live_mandate_in_the_shared_registry` (bound mandate mints + card shows it).
+  Council red-team F1 (HIGH, folded before ship): a WEAK (small-order / identity) ed25519 key parses
+  as a valid 32-byte "bound" key but a forged signature validates for it under any message — a
+  mandate bound to it would be forgeable by anyone (effectively unbound wearing a "bound" badge,
+  strictly worse than honest-unbound). Closed at BOTH layers: (i) `issue_mandate` now rejects a weak
+  key (`VerifyingKey::is_weak()`) at mint (BAD_REQUEST), so a bound mandate always means a real
+  single-agent binding; (ii) the signature gate uses `verify_strict` everywhere (`verify_b64_sig`),
+  rejecting small-order signer keys + non-canonical signatures at verification, not just at mint —
+  the security-correct default. Ratchets: `capability::tests::issue_refuses_a_weak_agent_key` (+ the
+  44 intent tests confirm strict verification does not reject legitimate signatures). RESIDUAL:
+  full-strength attribution still rests on the trusted-core executor's honesty and the same-host
+  trust model; a DID-anchored agent identity (binding the agent key to a verifiable identity, not
+  just a raw key) is the deeper follow-up.
 - **G-M5 CLOSED (Sprint 14) — durable mandates: the registry AND the replay guard survive restart.**
   The serve-path `StandingGrantService` is now snapshot-backed (`standing_grants.json` next to the
   capability store; version-pinned, atomic temp+fsync+rename mirroring `CapabilityStore`), so a
@@ -374,7 +395,8 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   spoofable capsule NAME; the principled fix is role-based capability tiering (a `CapsuleRole::System`
   plumbed into the grant point) applied uniformly — a separate FUTURE initiative, not a Sprint-15
   wedge. Interim mitigations already shipped: the web form is narrower than the API (admin refused
-  server-side) and CSP-locked. Consider defaulting the form to agent-BOUND when G-M4 is promoted.
+  server-side) and CSP-locked. UPDATE (Sprint 20): the web form now REQUIRES an agent key (G-M4
+  default-bound), so a one-click unbound broad grant is no longer possible from the shell.
   (c) **Proof-unbound local-mode token can now MINT (red-team F4, extends G-AUTH-LOCAL).** Under the
   accepted operator-key-on-disk local posture a proof-unbound `mandates` token skips the live-
   session recheck; it could previously read/revoke, and now also issue. Same operator-authority
