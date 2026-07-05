@@ -11,7 +11,8 @@ pub mod provider;
 pub mod storage;
 
 pub use capability::{
-    deny_request, dispatch_standing_intent, get_audit_event_types, get_audit_log, grant_request,
+    deny_request, dispatch_agent_intent, dispatch_standing_intent, get_audit_event_types,
+    get_audit_log, grant_request,
     issue_standing_grant, list_capabilities, list_pending, list_standing_grants, mandate_receipt,
     preview_standing_grant, request_capability,
     request_status, revoke_all_capabilities, revoke_capability, revoke_standing_grant,

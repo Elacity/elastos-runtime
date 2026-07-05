@@ -13,7 +13,7 @@ record. Detailed per-gap history lives in `KNOWN_GAPS.md`; this is the summary.
 | Verb | What it is | Where |
 |---|---|---|
 | **Grant** | Mint a real signed capability token scoped to (capsule, resource, action, ttl) + an authorized method set, elevated to a standing mandate | CLI + Mandates shell app |
-| **Act** | An agent signs an `IntentDeclarationV1` and dispatches it; a fail-closed gate checks `intent ⊆ envelope` (capsule + agent-key + method + resource + action), runs a real executor, and reconciles declared-vs-done | `POST /api/standing-grants/dispatch` |
+| **Act** | An agent signs an `IntentDeclarationV1` and dispatches it; a fail-closed gate checks `intent ⊆ envelope` (capsule + agent-key + method + resource + action), runs a real executor, and reconciles declared-vs-done | `POST /api/agent/dispatch` (agent-facing, S26) or `/api/standing-grants/dispatch` (operator) |
 | **Watch** | The operator sees mandates live, and what each agent has written/delivered under them | Mandates shell app (mandate cards, Agent State panel, Inbox) |
 | **Revoke** | The kill switch — durably attested *before* the mandate dies | CLI + Mandates shell app |
 | **Prove** | Export a portable `MandateReceipt` and verify it off-box with no runtime and no trust in this box | `elastos verify-receipt` |
@@ -52,9 +52,19 @@ match (this is the G-M6 rule).
 receipt), G-M5 (durable registry + replay guard survive restart and power loss), G-M6 (the
 reconciliation seam — receipts minted from what executors report).
 
+**Agent-facing dispatch shipped (S26):** the ACT leg is now reachable by the AGENT itself at
+`/api/agent/dispatch` — not only the operator shell. The agent authenticates AS the mandate holder
+(the signed intent proves key possession; the mandate's agent-key binding proves authorization), so
+NO operator session/keys are needed — the literal "a mandate, not your keys". The route requires a
+BOUND mandate (no ambient authority), refuses a wrong-key/unbound/absent mandate with a uniform 403,
+and checks the binding BEFORE the rate budget (charge-on-authorized — a wrong-key flood can't lock
+out a victim). The operator shell route remains for operator-driven dispatch and unbound mandates.
+
 **Open / tracked (by design or roadmap):**
 - **G-M3** — shell is the grant root (accepted trust model).
-- **G-M4** — agent-key binding optional; promote to default before exposing dispatch to untrusted agents.
+- **G-M4** — agent-key binding optional; REQUIRED on the agent-facing dispatch route + for state_get
+  mandates. Promoting binding to the universal default (every side-effecting/state affordance) is the
+  tracked endpoint.
 - **G-M7** — operational hardening. *Paid down:* the replay guard is time-windowed + bounded +
   clock-attack-hardened (S19); dispatch is rate-budgeted + grant-existence-gated (S21) with a
   per-mandate configurable budget (S22); and the working registry's DEAD accumulation is now bounded

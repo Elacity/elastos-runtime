@@ -1546,6 +1546,53 @@ pub struct DispatchIntentOutput {
     pub reconciliation: Option<elastos_runtime::capability::IntentReconciliationV1>,
 }
 
+/// POST /api/agent/dispatch  (AGENT-FACING — Sprint 26) — the same ACT leg, but reachable by the
+/// AGENT itself, not only the operator/shell. This is the North-Star move: "a mandate, not your
+/// keys". The route carries NO consent-broker (shell-role) gate; the agent authenticates AS the
+/// mandate holder — `verify_self` proves it holds a private key, and the mandate's agent-key binding
+/// (G-M4) proves that key is the authorized agent. No ambient authority (P3): an UNBOUND mandate is
+/// REFUSED here (only the operator's shell route may dispatch an unbound mandate), and a wrong-key
+/// intent is refused BEFORE any rate budget is charged or durable write is made — CHARGE-ON-AUTHORIZED,
+/// which closes the Sprint 21 victim-lockout residual (an attacker naming a victim's grant can no
+/// longer burn its budget, because it never clears this gate). The response is a uniform 403 for
+/// absent / unbound / wrong-key, so this less-trusted surface is not a grant-existence or binding
+/// oracle. Everything past the gate is the identical hardened pipeline (freshness → per-mandate rate
+/// → replay guard → liveness → gate → act → reconcile → receipt); the gate RE-checks the binding, so
+/// this wrapper only ADDS the agent authentication + the charge-on-authorized ordering.
+pub async fn dispatch_agent_intent(
+    State(state): State<CapabilityState>,
+    Json(intent): Json<IntentDeclarationV1>,
+) -> Result<Json<DispatchIntentOutput>, (StatusCode, String)> {
+    // 1. The intent must be validly self-signed before we trust `intent.signer`.
+    if !intent.verify_self() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "intent declaration signature did not verify".to_string(),
+        ));
+    }
+    // 2. Authenticate as the mandate holder: the named mandate must EXIST, be agent-BOUND, and its
+    //    bound key must be the intent's signer. Absent / unbound / wrong-key all fail-closed the
+    //    SAME way (no oracle). This runs BEFORE delegating, so the pipeline's rate budget + durable
+    //    replay write are only ever reached by an authorized caller (charge-on-authorized).
+    let authorized = TokenId::from_hex(intent.standing_grant_id.trim())
+        .ok()
+        .and_then(|t| state.standing_service.get(&t.to_string()))
+        .and_then(|grant| grant.agent_pubkey)
+        .map(|bound| intent.signer.trim().eq_ignore_ascii_case(bound.trim()))
+        .unwrap_or(false);
+    if !authorized {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "not authorized: agent dispatch requires an intent signed by the key your mandate is \
+             bound to (unbound mandates are dispatched only from the operator shell)"
+                .to_string(),
+        ));
+    }
+    // 3. Delegate to the ONE hardened pipeline — the single source of truth (it re-verifies the
+    //    signature and re-checks the binding in the gate). This wrapper adds only the agent auth.
+    dispatch_standing_intent(State(state), Json(intent)).await
+}
+
 /// POST /api/standing-grants/dispatch  (shell-only) — the ACT leg of the mandate loop.
 ///
 /// Run ONE agent act under its standing mandate, fail-closed. In order:
@@ -2412,6 +2459,155 @@ mod tests {
                 action: intent.action.clone(),
             }
         }
+    }
+
+    /// Sprint 26 — AGENT-FACING dispatch: an agent acts under a mandate BOUND to its key with NO
+    /// operator/shell session. The signed intent + the binding ARE the authorization ("a mandate,
+    /// not your keys").
+    #[tokio::test]
+    async fn agent_dispatch_acts_under_a_bound_mandate_without_operator_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state_with_durable_audit(dir.path());
+        state.intent_executor = std::sync::Arc::new(FaithfulExecutor);
+        let agent_sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let agent_pub = hex::encode(agent_sk.verifying_key().to_bytes());
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: "elastos://pay/vendor".to_string(),
+                action: "write".to_string(),
+                methods: vec!["runtime.echo".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: Some(agent_pub),
+                dispatch_limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let intent = IntentDeclarationV1::issue(
+            &agent_sk, agent_sk.verifying_key().to_bytes(), "agent-1", "vm-agent",
+            "runtime.echo", "cafe01", "elastos://pay/vendor", "write", &out.token_id,
+        );
+        let r = dispatch_agent_intent(State(state.clone()), Json(intent))
+            .await
+            .expect("the agent's own signed intent performs under its bound mandate")
+            .0;
+        assert_eq!(r.outcome, "performed", "the agent acted under its mandate — no operator session");
+    }
+
+    /// Sprint 26: the agent surface refuses — with a UNIFORM 403 (no existence/binding oracle) — a
+    /// wrong-key intent, an UNBOUND mandate (no ambient authority, P3), and an absent grant.
+    #[tokio::test]
+    async fn agent_dispatch_refuses_wrong_key_unbound_and_absent_uniformly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state_with_durable_audit(dir.path());
+        state.intent_executor = std::sync::Arc::new(FaithfulExecutor);
+        let agent_sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let agent_pub = hex::encode(agent_sk.verifying_key().to_bytes());
+        let mk = |agent: Option<String>| IssueStandingGrantInput {
+            capsule: "vm-agent".to_string(),
+            resource: "elastos://pay/vendor".to_string(),
+            action: "write".to_string(),
+            methods: vec!["runtime.echo".to_string()],
+            ttl_secs: Some(3600),
+            agent_pubkey: agent,
+            dispatch_limit: None,
+        };
+        let bound = issue_standing_grant(State(state.clone()), Json(mk(Some(agent_pub))))
+            .await
+            .unwrap()
+            .0;
+        let unbound = issue_standing_grant(State(state.clone()), Json(mk(None)))
+            .await
+            .unwrap()
+            .0;
+        let attacker = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let intent = |sk: &ed25519_dalek::SigningKey, grant: &str, id: &str| {
+            IntentDeclarationV1::issue(
+                sk, sk.verifying_key().to_bytes(), id, "vm-agent", "runtime.echo", "cafe01",
+                "elastos://pay/vendor", "write", grant,
+            )
+        };
+        // Wrong key on a bound mandate → 403.
+        assert!(
+            matches!(
+                dispatch_agent_intent(State(state.clone()), Json(intent(&attacker, &bound.token_id, "a1"))).await,
+                Err((StatusCode::FORBIDDEN, _))
+            ),
+            "an intent signed by a key the mandate is NOT bound to is refused"
+        );
+        // Unbound mandate → 403 (no ambient authority on the agent surface).
+        assert!(
+            matches!(
+                dispatch_agent_intent(State(state.clone()), Json(intent(&attacker, &unbound.token_id, "a2"))).await,
+                Err((StatusCode::FORBIDDEN, _))
+            ),
+            "an unbound mandate cannot be dispatched agent-facing"
+        );
+        // Absent grant → 403, same shape (no existence oracle).
+        let fake = format!("{:064x}", 0xdead_u64);
+        assert!(
+            matches!(
+                dispatch_agent_intent(State(state.clone()), Json(intent(&attacker, &fake, "a3"))).await,
+                Err((StatusCode::FORBIDDEN, _))
+            ),
+            "an absent grant is refused with the same 403"
+        );
+    }
+
+    /// Sprint 26 — CHARGE-ON-AUTHORIZED (closes the Sprint 21 victim-lockout residual): a flood of
+    /// wrong-key intents naming a victim's grant never clears the agent-auth gate, so it never charges
+    /// the victim's rate budget — the legit holder's budget is intact.
+    #[tokio::test]
+    async fn agent_dispatch_charge_on_authorized_no_victim_lockout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state_with_durable_audit(dir.path());
+        state.intent_executor = std::sync::Arc::new(FaithfulExecutor);
+        let agent_sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let agent_pub = hex::encode(agent_sk.verifying_key().to_bytes());
+        // A tightly-budgeted BOUND mandate: 1 act/window — a single wrongful charge would lock it out.
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-agent".to_string(),
+                resource: "elastos://pay/vendor".to_string(),
+                action: "write".to_string(),
+                methods: vec!["runtime.echo".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: Some(agent_pub),
+                dispatch_limit: Some(1),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let attacker = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        for i in 0..10 {
+            let bad = IntentDeclarationV1::issue(
+                &attacker, attacker.verifying_key().to_bytes(), &format!("bad-{i}"), "vm-agent",
+                "runtime.echo", "cafe01", "elastos://pay/vendor", "write", &out.token_id,
+            );
+            assert!(matches!(
+                dispatch_agent_intent(State(state.clone()), Json(bad)).await,
+                Err((StatusCode::FORBIDDEN, _))
+            ));
+        }
+        assert!(
+            !state.standing_service.any_dispatch_rate_entries(),
+            "no wrong-key attempt charged the mandate's budget (charge-on-authorized)"
+        );
+        // The legit holder still has its full 1-act budget.
+        let good = IntentDeclarationV1::issue(
+            &agent_sk, agent_sk.verifying_key().to_bytes(), "good-1", "vm-agent",
+            "runtime.echo", "cafe01", "elastos://pay/vendor", "write", &out.token_id,
+        );
+        assert_eq!(
+            dispatch_agent_intent(State(state.clone()), Json(good)).await.expect("still within budget").0.outcome,
+            "performed",
+            "the victim's budget was never burned by the attacker's flood"
+        );
     }
 
     /// RATE BUDGET (G-M7, Sprint 21): a mandate flooding distinct fresh intents is refused with 429

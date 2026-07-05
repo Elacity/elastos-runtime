@@ -327,6 +327,28 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         ))
         .with_state(capability_state.clone());
 
+    // Agent-facing dispatch (Sprint 26) — the ACT leg reachable by the AGENT, not only the operator
+    // shell. Deliberately NOT behind `consent_broker_only_middleware`: the agent authenticates AS the
+    // mandate holder (the signed intent + the mandate's agent-key binding, G-M4), so no shell role is
+    // needed. `auth_middleware` still requires a valid session (transport auth / anti-anonymous DoS),
+    // and the general rate limit bounds per-session request volume; the handler then requires a BOUND
+    // mandate + a matching signer before any act (charge-on-authorized). This is the "a mandate, not
+    // your keys" surface.
+    let agent_routes = Router::new()
+        .route(
+            "/api/agent/dispatch",
+            post(handlers::dispatch_agent_intent),
+        )
+        .layer(axum_middleware::from_fn_with_state(
+            general_rate_state.clone(),
+            rate_limit_middleware,
+        ))
+        .layer(axum_middleware::from_fn_with_state(
+            api_state.clone(),
+            auth_middleware,
+        ))
+        .with_state(capability_state.clone());
+
     // Orchestrator routes (shell-only — runtime coordination for attach flow)
     let orchestrator_state = handlers::orchestrator::OrchestratorState {
         session_registry: session_registry.clone(),
@@ -549,6 +571,7 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         .merge(attach_routes)
         .merge(auth_routes)
         .merge(shell_routes)
+        .merge(agent_routes)
         .merge(orchestrator_routes)
         .merge(supervisor_routes)
         .merge(namespace_routes)

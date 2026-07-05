@@ -414,15 +414,16 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   refills the budget — safe/generous, and the agent cannot restart the runtime). Ratchets:
   `intent::tests::{dispatch_rate_budget_bounds_a_mandate_then_resets_next_window,
   dispatch_rate_map_is_bounded_against_distinct_grant_spam}` +
-  `capability::tests::dispatch_over_rate_budget_is_refused_429`. RESIDUALS (operator-gated today,
-  matter once dispatch is agent-facing): (i) **charge-on-attempt** — the budget is spent by a
-  well-formed fresh intent naming a REAL grant even if the act is later denied (revoked / out of
-  envelope), so someone who can name a victim's real grant_id could burn its window budget and lock
-  the legit agent out (red-team F5). Sprint 22 sharpens this: because the budget is now per-mandate
-  dialable, the lockout scales INVERSELY with the dial — a mandate tightened to 1/min is locked out
-  by a SINGLE well-formed self-signed intent naming its grant_id (the budget charges before the
-  gate's agent-key binding). The fix is to key the limiter on the authenticated caller identity /
-  charge only an AUTHORIZED act — deferred with the agent-facing delegation that doesn't exist yet.
+  `capability::tests::dispatch_over_rate_budget_is_refused_429`. RESIDUALS: (i) **charge-on-attempt
+  — CLOSED for the AGENT surface (Sprint 26).** On the shell route the budget is charged for a
+  well-formed fresh intent naming a REAL grant even before the gate's agent-key check, so someone who
+  could name a victim's grant_id could burn its window budget (worse the tighter the S22 dial). That
+  route is operator-only (the operator locking out its own mandate is not an attack), so it stays as
+  is. The new AGENT-FACING route (`/api/agent/dispatch`, Sprint 26) authenticates the caller as the
+  mandate holder — it REQUIRES a bound mandate + `intent.signer == agent_pubkey` BEFORE delegating to
+  the pipeline, so a wrong-key intent never reaches the rate charge (charge-on-authorized). An
+  attacker naming a victim's grant is refused 403 and charges NOTHING. Ratchet:
+  `capability::tests::agent_dispatch_charge_on_authorized_no_victim_lockout`.
   (ii) **fixed-window boundary** allows up to ~2× the limit across a window edge (60 at the tail of
   W + 60 at the head of W+1); acceptable for a flood bound (still O(1)/window, ~1/s average), noted
   not silent. RETENTION now SHIPPED (Sprint 23 — closes the DEAD-accumulation half of G-M7): the
