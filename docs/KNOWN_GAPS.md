@@ -125,6 +125,19 @@ The grant → revoke → prove loop shipped with these HONEST bounds:
   full-strength attribution still rests on the trusted-core executor's honesty and the same-host
   trust model; a DID-anchored agent identity (binding the agent key to a verifiable identity, not
   just a raw key) is the deeper follow-up.
+  (c) **state-read binding — Sprint 25 council F2.** An UNBOUND mandate skips `WrongAgent`, so it is
+  gated only by token-id secrecy. Sprint 17's `state_put` exposed this as an INTEGRITY risk (anyone
+  with the token could overwrite the principal's state); Sprint 25's `state_get` extends it to
+  CONFIDENTIALITY (an existence + equality-guess ORACLE over the principal's stored value-hashes —
+  never a raw value disclosure, since the value is not surfaced, F1). CLOSED for the read:
+  `issue_mandate` now REFUSES an unbound mandate authorizing `runtime.state_get` (BAD_REQUEST) — a
+  state-read mandate must bind an agent key. Ratchet:
+  `capability::tests::unbound_state_get_mandate_is_refused_at_mint`. RESIDUAL (tracked, its own
+  sprint to avoid changing an accepted contract): `state_put`'s unbound INTEGRITY gap is unchanged —
+  a symmetric "require binding for `state_put`" would close it but retroactively narrows the
+  operator/CLI's accepted unbound-write posture; `runtime.notify` (unbound → inbox-spoof under a
+  capsule name) is the third of the same family. The principled endpoint is: every side-effecting or
+  state affordance requires agent binding.
 - **G-M5 CLOSED (Sprint 14) — durable mandates: the registry AND the replay guard survive restart.**
   The serve-path `StandingGrantService` is now snapshot-backed (`standing_grants.json` next to the
   capability store; version-pinned, atomic temp+fsync+rename mirroring `CapabilityStore`), so a

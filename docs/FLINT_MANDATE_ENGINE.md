@@ -29,7 +29,7 @@ match (this is the G-M6 rule).
 |---|---|---|---|
 | `runtime.audit_verify` | read (side-effect-free) | `read` | Re-verifies the signed audit chain end to end; `performed` iff it truly verifies |
 | `runtime.content_seen` | state-dependent read | `read` | Did THIS principal open a content id? Principal-scoped, no cross-principal oracle |
-| `runtime.state_get` | attested read | `read` | Reads back the acting principal's OWN durable state (the read pair of state_put); the agent declares the value it expects, the executor echoes the ACTUAL — `matched` proves "K = V", `diverged` reveals the truth, `declined` if absent. Principal-scoped, exact-key |
+| `runtime.state_get` | attested VERIFY read | `read` | Verifies the acting principal's OWN durable state (the read pair of state_put); the agent declares the value it expects — `matched` attests "K = V", `diverged` means the guess was wrong (ONE BIT — the actual value is NOT returned or on-chain), `declined` if absent. Principal-scoped, exact-key, agent-key BOUND (F2) |
 | `runtime.notify` | **side-effecting** | `message` | Delivers a message into the operator's Inbox; bounded fields, capped store, `performed` only after the write lands |
 | `runtime.state_put` | **side-effecting** | `write` | Writes durable, readable-back, principal-scoped agent state; last-write-wins with attributed versioning |
 

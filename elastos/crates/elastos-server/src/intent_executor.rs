@@ -149,12 +149,19 @@ impl MethodRegistryExecutor {
     ///   shapes before the write; `Performed` iff the atomic write LANDED, else `Declined`. Reports
     ///   `action = "write"` — usable only under a `write` mandate.
     /// - `runtime.state_get` — the READ side of that KV (the pair of state_put): a PRINCIPAL-SCOPED
-    ///   ATTESTED read of `elastos://runtime/store/<key>`. The declared `input_hash` is the value
-    ///   the agent EXPECTS; `Performed` echoes the ACTUAL stored value-hash, so the read reconciles
-    ///   `Matched` iff the key holds that value (a provable "K = V"), `Diverged` (with the real
-    ///   value in the receipt) if it holds a different one, and `Declined` (⇒ authorized_not_performed)
-    ///   if the key is absent. Keyed on the acting capsule ⇒ an agent reads only its OWN state.
-    ///   Reports `action = "read"` — usable only under a `read` mandate. Registered with a `data_dir`.
+    ///   ATTESTED VERIFY read of `elastos://runtime/store/<key>` (NOT a value fetch). The declared
+    ///   `input_hash` is the value the agent EXPECTS; `Performed` echoes the ACTUAL stored value-hash
+    ///   into the reconciliation's field comparison, so the read reconciles `Matched` iff the key
+    ///   holds that value, `Diverged` if it holds a DIFFERENT one, and `Declined`
+    ///   (⇒ authorized_not_performed) if the key is absent. Honest scope (council F1/F3): the agent
+    ///   learns ONE BIT (matched / diverged / absent) — the actual value is NOT returned to it and is
+    ///   NOT put on-chain (the declared value isn't either), so a `Matched` is a runtime-live-trust
+    ///   attestation of "K = V" (agent-signed declaration correlated with the runtime-signed
+    ///   reconciliation), not a `content_seen`-grade signature-attested proof, and a `Diverged`
+    ///   reveals only that the guess was wrong, never the truth. A state_get mandate must BIND an
+    ///   agent key (council F2 — an unbound state-read is a token-id-gated confidentiality oracle).
+    ///   Keyed on the acting capsule ⇒ an agent verifies only its OWN state. Reports `action = "read"`.
+    ///   Registered with a `data_dir`.
     ///
     /// The side-effecting affordances + state_get need the runtime data dir (their stores live under
     /// it); a `None` data dir leaves them honestly unwired ⇒ `Undelivered`.
@@ -252,10 +259,12 @@ impl MethodRegistryExecutor {
                         Ok(Some(entry)) => IntentExecution::Performed {
                             capsule: intent.capsule.clone(),
                             method_id: intent.method_id.clone(),
-                            // Echo the ACTUAL stored value-hash. Reconcile Matches iff the agent
-                            // declared it correctly (an attested "K = V"); otherwise Diverges AND
-                            // the receipt carries the real value — so the agent still LEARNS the
-                            // true value on a mismatch, honestly, never a misleading Matched.
+                            // Echo the ACTUAL stored value-hash for the reconciliation's field
+                            // comparison. Reconcile Matches iff the agent declared it correctly (an
+                            // attested "K = V"); otherwise Diverges. The gate keeps only the verdict
+                            // (the value is NOT surfaced to the agent nor put on-chain — council F1),
+                            // so a mismatch yields one bit ("wrong guess"), never a misleading
+                            // Matched and never a value leak.
                             input_hash: entry.value_hash,
                             resource: intent.resource.clone(),
                             action: "read".to_string(),

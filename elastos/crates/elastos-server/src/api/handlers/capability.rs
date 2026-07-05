@@ -1188,6 +1188,23 @@ pub async fn issue_mandate(
             Some(hex::encode(arr))
         }
     };
+    // Confidentiality binding (Sprint 25 council F2): a mandate authorizing `runtime.state_get` READS
+    // the principal's durable state. An UNBOUND mandate (agent_pubkey None) skips the gate's
+    // WrongAgent check, so it is protected only by token-id secrecy — anyone who learns the token
+    // could read the state under the capsule string. Require an agent key for a state_get mandate,
+    // fail-closed at the mint. (The gateway shell already binds every mint; this closes the
+    // raw-API/CLI path for the confidentiality-sensitive read. The write side `state_put` keeps its
+    // pre-existing accepted unbound contract — a symmetric tightening is tracked in KNOWN_GAPS G-M4.)
+    if agent_pubkey.is_none()
+        && input.methods.iter().any(|m| m == "runtime.state_get")
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a mandate authorizing runtime.state_get must bind an agent key — an unbound state-read \
+             mandate would expose the principal's durable state to anyone who learns its token id"
+                .to_string(),
+        ));
+    }
     // The dispatch budget must be in [1, MAX]. Zero would mint a mandate that LOOKS live on the
     // card yet denies every act (revoke is the kill switch, not a budget); an unclamped limit would
     // uncap the fsync-flood bound (council red-team F2 / guardian F3). This is the friendly 400;
@@ -2946,10 +2963,12 @@ mod tests {
         );
     }
 
-    /// Sprint 25 end-to-end: an agent WRITES state under a write-mandate, then READS it back under a
-    /// separate read-mandate (`runtime.state_get`). A read declaring the CORRECT value reconciles
-    /// `performed` (an attested "K = V"); declaring the WRONG value reconciles `diverged` (the real
-    /// value is on the chain, so the agent learns the truth); revoking the read-mandate stops reads.
+    /// Sprint 25 end-to-end: an agent WRITES state under a write-mandate, then VERIFIES it back under
+    /// a separate BOUND read-mandate (`runtime.state_get`, agent-key required — council F2). It is an
+    /// ATTESTED VERIFY read, not a fetch: declaring the CORRECT value reconciles `performed` (an
+    /// attested "K = V"); declaring the WRONG value reconciles `diverged` — the agent learns ONE BIT
+    /// (its guess was wrong), NOT the actual value (which is never returned — council F1). Revoking
+    /// the read-mandate stops reads.
     #[tokio::test]
     async fn dispatch_state_get_reads_back_attested_and_revoke_stops_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -2988,7 +3007,10 @@ mod tests {
             "performed"
         );
 
-        // A separate READ-mandate for state_get on the same key.
+        // A separate READ-mandate for state_get on the same key — BOUND to the agent's key (F2:
+        // a state_get mandate must bind). The read intents must be signed by THAT key.
+        let agent_sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let agent_pub = hex::encode(agent_sk.verifying_key().to_bytes());
         let r = issue_standing_grant(
             State(state.clone()),
             Json(IssueStandingGrantInput {
@@ -2997,7 +3019,7 @@ mod tests {
                 action: "read".to_string(),
                 methods: vec!["runtime.state_get".to_string()],
                 ttl_secs: Some(3600),
-                agent_pubkey: None,
+                agent_pubkey: Some(agent_pub),
                 dispatch_limit: None,
             }),
         )
@@ -3005,9 +3027,8 @@ mod tests {
         .unwrap()
         .0;
         let read = |intent_id: &str, expected: &str| {
-            let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
             IntentDeclarationV1::issue(
-                &sk, sk.verifying_key().to_bytes(), intent_id, "vm-agent",
+                &agent_sk, agent_sk.verifying_key().to_bytes(), intent_id, "vm-agent",
                 "runtime.state_get", expected, &key_resource, "read", &r.token_id,
             )
         };
@@ -3019,12 +3040,13 @@ mod tests {
             .0;
         assert_eq!(hit.outcome, "performed", "a correct expected-value is an attested read");
 
-        // Wrong expected value → diverged (the chain carries the REAL value, cafe01).
+        // Wrong expected value → diverged: the agent learns ONE BIT (its guess was wrong). The
+        // actual value is NOT returned — the reconciliation carries only the diverged-field name.
         let miss = dispatch_standing_intent(State(state.clone()), Json(read("get-2", "beef99")))
             .await
             .unwrap()
             .0;
-        assert_eq!(miss.outcome, "diverged", "a wrong expected-value diverges, revealing the truth");
+        assert_eq!(miss.outcome, "diverged", "a wrong expected-value diverges (one bit, no value leak)");
 
         // Revoke the read-mandate → reads stop (denied), the write-mandate is untouched.
         assert!(
@@ -3053,6 +3075,54 @@ mod tests {
             elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer)).authenticated,
             "the read-mandate's receipt verifies off-box"
         );
+    }
+
+    /// Sprint 25 council F2 ratchet: an UNBOUND (agent_pubkey None) mandate authorizing
+    /// `runtime.state_get` is REFUSED at the mint — a state-read mandate must bind an agent key, so
+    /// the principal's durable state can never be exposed to a mere token-id holder. A bound one, and
+    /// an unbound NON-state-get mandate, both still mint.
+    #[tokio::test]
+    async fn unbound_state_get_mandate_is_refused_at_mint() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_durable_audit(dir.path());
+        let mk = |methods: Vec<String>, agent: Option<String>| IssueStandingGrantInput {
+            capsule: "vm-agent".to_string(),
+            resource: format!("{}cursor", crate::intent_executor::STATE_PUT_PREFIX),
+            action: "read".to_string(),
+            methods,
+            ttl_secs: Some(3600),
+            agent_pubkey: agent,
+            dispatch_limit: None,
+        };
+        // Unbound state_get → 400.
+        let refused = issue_standing_grant(
+            State(state.clone()),
+            Json(mk(vec!["runtime.state_get".to_string()], None)),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((StatusCode::BAD_REQUEST, _))),
+            "an unbound state_get mandate is refused"
+        );
+        // Bound state_get → minted.
+        let agent = hex::encode(
+            ed25519_dalek::SigningKey::generate(&mut rand::thread_rng())
+                .verifying_key()
+                .to_bytes(),
+        );
+        assert!(issue_standing_grant(
+            State(state.clone()),
+            Json(mk(vec!["runtime.state_get".to_string()], Some(agent))),
+        )
+        .await
+        .is_ok());
+        // An unbound NON-state-get mandate is unaffected (audit_verify stays capsule-string-only).
+        assert!(issue_standing_grant(
+            State(state.clone()),
+            Json(mk(vec!["runtime.audit_verify".to_string()], None)),
+        )
+        .await
+        .is_ok());
     }
 
     /// G-M6 closed: an authorized intent whose method has NO executor is `Undelivered`, NOT a
