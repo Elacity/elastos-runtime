@@ -10,6 +10,7 @@ name = "elastos_runtime"
 path = "src/lib.rs"
 
 [dependencies]
+libc = "0.2"
 elastos-common = { path = "../elastos-common" }
 elastos-namespace = { path = "../elastos-namespace" }
 elastos-storage = { path = "../elastos-storage" }

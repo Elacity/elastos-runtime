@@ -218,66 +218,115 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         }),
         // `runtime.notify` delivers into the operator's Inbox store under data_dir; without one
         // (bare test/embedded configs) the method is honestly unwired => Undelivered.
-        // `runtime.pay` (Sprint 27) stays UNWIRED in production (council F2): shipping the MOCK rail
-        // live would mint signed receipts attesting payments that never moved money. It is wired ONLY
-        // when `ELASTOS_ALLOW_MOCK_PAYMENTS` is set (dev/demo), with a loud warning — a real
-        // PaymentProvider connector (Sprint 29) replaces this before real money moves. Fail-closed
-        // by default: no rail ⇒ no pay, and no meter ⇒ the provisioning surface refuses (503).
+        //
+        // `runtime.pay` rail selection (Sprint 29), fail-closed by default (no rail ⇒ no pay, and
+        // no meter ⇒ the provisioning surface refuses 503):
+        // 1. `ELASTOS_PAYMENT_ENDPOINT` (+ optional `ELASTOS_PAYMENT_TOKEN`) wires the REAL
+        //    HttpPaymentProvider — a DURABLE meter is REQUIRED (real money on a cap that refills
+        //    across restart is refused outright: no data_dir or an unopenable snapshot ⇒ unwired).
+        // 2. else `ELASTOS_ALLOW_MOCK_PAYMENTS` wires the Mock rail (dev/demo ONLY, loud warning —
+        //    council S27 F2: mock receipts attest simulated payments).
+        // 3. else pay is honestly UNWIRED.
         //
         // The spend meter (Sprint 28) is DURABLE under data_dir — a restart never refills the money
         // cap — and it is ONE instance shared between the executor's pay gate (enforcement) and the
         // shell-only /api/spend-budgets surface (provisioning), so they can never disagree. A meter
-        // whose snapshot is corrupt REFUSES to open; pay then stays honestly unwired (fail-closed)
-        // rather than booting over silently refilled caps.
+        // whose snapshot is corrupt (or already open elsewhere — single-opener flock, S29) REFUSES
+        // to open; pay then stays honestly unwired rather than booting over refilled/contended caps.
         intent_executor: {
             let base = crate::intent_executor::MethodRegistryExecutor::production(
                 capability_manager.audit_log().clone(),
                 data_dir.clone(),
             );
-            if std::env::var("ELASTOS_ALLOW_MOCK_PAYMENTS").is_ok() {
-                let meter = match &data_dir {
-                    Some(dir) => {
-                        match elastos_runtime::primitives::spend::SpendMeter::open_durable(
-                            dir.join("spend_meter.json"),
-                        ) {
-                            Ok(m) => Some(Arc::new(m)),
-                            Err(e) => {
-                                tracing::error!(
-                                    "spend meter snapshot could not be opened ({e}) — runtime.pay \
-                                     stays UNWIRED (fail-closed) rather than booting over a \
-                                     possibly-refilled money cap"
-                                );
-                                None
-                            }
-                        }
+            let real_endpoint = std::env::var("ELASTOS_PAYMENT_ENDPOINT").ok();
+            let mock_allowed = std::env::var("ELASTOS_ALLOW_MOCK_PAYMENTS").is_ok();
+            let open_durable_meter = || match &data_dir {
+                Some(dir) => match elastos_runtime::primitives::spend::SpendMeter::open_durable(
+                    dir.join("spend_meter.json"),
+                ) {
+                    Ok(m) => Some(Arc::new(m)),
+                    Err(e) => {
+                        tracing::error!(
+                            "spend meter snapshot could not be opened ({e}) — runtime.pay stays \
+                             UNWIRED (fail-closed) rather than booting over a possibly-refilled \
+                             or contended money cap"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            let rail: Option<(
+                Arc<elastos_runtime::primitives::spend::SpendMeter>,
+                Arc<dyn crate::intent_executor::PaymentProvider>,
+            )> = if let Some(endpoint) = real_endpoint {
+                if mock_allowed {
+                    tracing::warn!(
+                        "both ELASTOS_PAYMENT_ENDPOINT and ELASTOS_ALLOW_MOCK_PAYMENTS are set — \
+                         the REAL rail wins; the mock is ignored"
+                    );
+                }
+                match open_durable_meter() {
+                    Some(m) => {
+                        tracing::info!(
+                            "runtime.pay is wired to the REAL payment rail at {endpoint} \
+                             (durable spend meter; provision caps at POST /api/spend-budgets)"
+                        );
+                        Some((
+                            m,
+                            Arc::new(crate::intent_executor::HttpPaymentProvider::new(
+                                endpoint,
+                                std::env::var("ELASTOS_PAYMENT_TOKEN").ok(),
+                            )),
+                        ))
                     }
                     None => {
+                        tracing::error!(
+                            "ELASTOS_PAYMENT_ENDPOINT is set but no DURABLE spend meter is \
+                             available — real money on a non-durable cap is refused; runtime.pay \
+                             stays UNWIRED"
+                        );
+                        None
+                    }
+                }
+            } else if mock_allowed {
+                // With a data_dir, the durable meter is used (an unopenable snapshot leaves pay
+                // UNWIRED — never a silent fall-through to a fresh in-memory cap); only the bare
+                // no-data_dir test/embedded shape gets the in-memory meter.
+                let meter = match &data_dir {
+                    Some(_) => open_durable_meter(),
+                    None => {
                         tracing::warn!(
-                            "no data_dir — runtime.pay gets an IN-MEMORY spend meter (test/embedded \
-                             only); the provisioning surface will refuse money caps on it"
+                            "no data_dir — runtime.pay gets an IN-MEMORY spend meter \
+                             (test/embedded only); the provisioning surface will refuse money \
+                             caps on it"
                         );
                         Some(Arc::new(
                             elastos_runtime::primitives::spend::SpendMeter::new(),
                         ))
                     }
                 };
-                pay_meter = meter.clone();
-                match meter {
-                    Some(m) => {
-                        tracing::warn!(
-                            "runtime.pay is wired to the MOCK payment rail \
-                             (ELASTOS_ALLOW_MOCK_PAYMENTS) — receipts attest SIMULATED payments; \
-                             DEV/DEMO ONLY, never production"
-                        );
-                        Arc::new(base.with_payments(
-                            m,
-                            Arc::new(crate::intent_executor::MockPaymentProvider::default()),
-                        ))
-                    }
-                    None => Arc::new(base),
-                }
+                meter.map(|m| {
+                    tracing::warn!(
+                        "runtime.pay is wired to the MOCK payment rail \
+                         (ELASTOS_ALLOW_MOCK_PAYMENTS) — receipts attest SIMULATED payments; \
+                         DEV/DEMO ONLY, never production"
+                    );
+                    (
+                        m,
+                        Arc::new(crate::intent_executor::MockPaymentProvider::default())
+                            as Arc<dyn crate::intent_executor::PaymentProvider>,
+                    )
+                })
             } else {
-                Arc::new(base)
+                None
+            };
+            match rail {
+                Some((meter, provider)) => {
+                    pay_meter = Some(meter.clone());
+                    Arc::new(base.with_payments(meter, provider))
+                }
+                None => Arc::new(base),
             }
         },
         spend_meter: pay_meter.clone(),

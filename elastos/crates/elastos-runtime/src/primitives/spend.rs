@@ -73,6 +73,10 @@ pub enum SpendError {
     /// A durable meter could not persist the mutation. The mutation was ROLLED BACK — a reservation
     /// that would not survive a restart is never granted (in-memory mode never returns this).
     Persist,
+    /// The durable meter is POISONED: a prior persist failed AFTER the rename published the new
+    /// snapshot (council S28 F1), so a power cut could still revert what memory holds. All further
+    /// mutations refuse until the meter is reopened from disk (fail-closed; reads still project).
+    Poisoned,
 }
 
 impl std::fmt::Display for SpendError {
@@ -90,6 +94,11 @@ impl std::fmt::Display for SpendError {
             SpendError::Persist => write!(
                 f,
                 "spend meter could not durably record the mutation; it was rolled back"
+            ),
+            SpendError::Poisoned => write!(
+                f,
+                "spend meter is poisoned (a prior persist failed after publish); mutations \
+                 refuse until it is reopened from disk"
             ),
         }
     }
@@ -126,6 +135,16 @@ struct SpendSnapshotV1 {
 
 const SPEND_SNAPSHOT_VERSION: u32 = 1;
 
+/// How a durable persist failed — the distinction council S28 F1 demanded. Before the rename, the
+/// OLD snapshot is still the visible file, so rolling back memory restores exact agreement. After
+/// the rename the NEW snapshot is published; only the parent-dir fsync (power-cut protection) is
+/// missing, so memory must KEEP the mutation (it matches the visible disk) and the meter must
+/// POISON (a power cut could still revert the publish — no further mutation may stack on that).
+enum PersistFailure {
+    PrePublish,
+    PostPublish,
+}
+
 /// A per-key spend budget with atomic, fail-closed debit and a provably-no-op refund.
 ///
 /// All mutations take a single write lock and complete in one statement, so the balance map is never
@@ -137,19 +156,32 @@ const SPEND_SNAPSHOT_VERSION: u32 = 1;
 /// memory and surfaced ([`SpendError::Persist`]) — money never moves against a reservation only
 /// memory holds.
 ///
-/// HONEST BOUND (council S28 F1): `persist_locked` can fail AFTER the rename has published the new
-/// snapshot (the parent-dir fsync errors). The memory rollback then diverges from a disk that holds
-/// the mutation, and a restart makes the DISK state win. Per method that direction is: `try_debit` —
-/// disk more-spent (the refused payment's reservation survives; fail-closed, headroom recoverable by
-/// the operator raising the limit); `refund` — disk holds a refund for a provably-unperformed act
-/// (headroom that was owed, not free money); `set_budget` — disk holds the new limit the caller was
-/// told was rolled back, which the PROVISIONING surface must treat as "surface loudly, never
-/// discard" (it does). Poisoning the meter on a post-publish failure is the S29 hardening.
+/// POST-PUBLISH failures (council S28 F1, closed S29): when a persist fails AFTER the rename has
+/// published the new snapshot (only the parent-dir power-cut fsync missing), memory KEEPS the
+/// mutation — it matches the visible disk, so no divergence — and the meter POISONS: every further
+/// mutation refuses ([`SpendError::Poisoned`]) until reopened from disk, because stacking more
+/// mutations on a publish a power cut could revert would compound the revert window. `try_debit`
+/// still refuses the payment in that case (the reservation stays on disk — an orphaned-reservation
+/// shape the operator repairs by raising the limit); `try_refund` reports the refund in force
+/// (memory and visible disk agree; the only residual, a power-cut revert to the MORE-spent
+/// snapshot, is the fail-closed direction).
 #[derive(Default)]
 pub struct SpendMeter {
     balances: RwLock<HashMap<String, Balance>>,
     /// `Some` ⇒ durable mode: every mutation snapshots to this path before taking effect.
     storage_path: Option<PathBuf>,
+    /// Set when a persist failed AFTER publish (council S28 F1): memory matches the visible disk,
+    /// but a power cut could revert the publish — every further mutation refuses ([`SpendError::
+    /// Poisoned`]) until the meter is reopened from disk. Reads keep projecting.
+    poisoned: std::sync::atomic::AtomicBool,
+    /// Held for the meter's lifetime: an exclusive advisory flock on `<path>.lock` (council S28
+    /// F4), so single-opener no longer depends on the caller's host-lock discipline — a second
+    /// opener of the same snapshot fails at `open_durable`, never last-writer-wins clobbering.
+    _lock_file: Option<std::fs::File>,
+    /// TEST SEAM: force the next persists to fail post-publish (the parent-dir fsync erroring
+    /// after a successful rename — unreachable from outside without root-only permission games).
+    #[cfg(test)]
+    fail_parent_fsync: std::sync::atomic::AtomicBool,
 }
 
 impl SpendMeter {
@@ -164,13 +196,33 @@ impl SpendMeter {
     /// zeroed spend would let the cumulative cap be exceeded, exactly what durability exists to
     /// prevent.
     ///
-    /// STATED BOUNDS (council S28): the snapshot is NOT self-authenticating — unlike the signed
+    /// STATED BOUND (council S28): the snapshot is NOT self-authenticating — unlike the signed
     /// audit chain, anyone who can write `data_dir` can forge it (the same trust boundary as the
-    /// runtime's key material; a hostile disk already owns the box). And the meter takes no file
-    /// lock of its own: SINGLE-OPENER is the caller's contract — the serve/gateway paths hold an
-    /// exclusive host lock on `data_dir`, which is what prevents two processes from last-writer-wins
-    /// clobbering each other's `spent`.
+    /// runtime's key material; a hostile disk already owns the box). SINGLE-OPENER is enforced here
+    /// (S29, council F4): an exclusive advisory flock on `<path>.lock` is held for the meter's
+    /// lifetime, so a second opener fails fail-closed instead of last-writer-wins clobbering the
+    /// other's `spent` — independent of the serve/gateway host lock.
     pub fn open_durable(path: PathBuf) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        let lock_file = {
+            use std::os::unix::io::AsRawFd as _;
+            let lock_path = path.with_extension("lock");
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false) // the lock file carries no content; never disturb it
+                .write(true)
+                .open(&lock_path)?;
+            let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "spend meter snapshot is already open elsewhere (single-opener, fail-closed)",
+                ));
+            }
+            Some(f)
+        };
+        #[cfg(not(unix))]
+        let lock_file = None;
         let mut balances = HashMap::new();
         match std::fs::read(&path) {
             Ok(bytes) => {
@@ -216,7 +268,24 @@ impl SpendMeter {
         Ok(Self {
             balances: RwLock::new(balances),
             storage_path: Some(path),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
+            _lock_file: lock_file,
+            #[cfg(test)]
+            fail_parent_fsync: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// True once a persist has failed post-publish ([`SpendError::Poisoned`]) — mutations refuse;
+    /// reopen from disk to recover. Surfaces so a wiring/ops layer can alarm on it.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn refuse_if_poisoned(&self) -> Result<(), SpendError> {
+        if self.is_poisoned() {
+            return Err(SpendError::Poisoned);
+        }
+        Ok(())
     }
 
     /// True when this meter persists every mutation ([`open_durable`](Self::open_durable)) — the
@@ -229,7 +298,12 @@ impl SpendMeter {
     /// Write the full snapshot atomically (temp + fsync + rename + parent-dir fsync), mirroring
     /// `StandingGrantStore::persist_locked`. Called with the write guard held so the serialized
     /// state is exactly the state that becomes visible. Memory-only ⇒ no-op.
-    fn persist_locked(&self, balances: &HashMap<String, Balance>) -> std::io::Result<()> {
+    ///
+    /// The failure REPORTS which side of the rename it happened on (council S28 F1): `PrePublish`
+    /// means the old snapshot is still the visible file (caller rolls memory back — exact agreement
+    /// restored); `PostPublish` means the NEW snapshot is published and only the power-cut
+    /// protection (parent-dir fsync) is missing (caller keeps memory and POISONS the meter).
+    fn persist_locked(&self, balances: &HashMap<String, Balance>) -> Result<(), PersistFailure> {
         let Some(path) = &self.storage_path else {
             return Ok(());
         };
@@ -242,28 +316,51 @@ impl SpendMeter {
             })
             .collect();
         records.sort_by(|a, b| a.key.cmp(&b.key));
-        let content = serde_json::to_vec(&SpendSnapshotV1 {
+        let Ok(content) = serde_json::to_vec(&SpendSnapshotV1 {
             version: SPEND_SNAPSHOT_VERSION,
             balances: records,
-        })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        }) else {
+            return Err(PersistFailure::PrePublish);
+        };
         let tmp_path = path.with_extension("tmp");
-        {
+        let write_and_sync = || -> std::io::Result<()> {
             use std::io::Write as _;
             let mut tmp = std::fs::File::create(&tmp_path)?;
             tmp.write_all(&content)?;
             // Durable BEFORE visible: the rename must never publish bytes still in the page cache.
-            tmp.sync_all()?;
+            tmp.sync_all()
+        };
+        if write_and_sync().is_err() {
+            return Err(PersistFailure::PrePublish);
         }
-        std::fs::rename(&tmp_path, path)?;
-        // Without fsyncing the parent directory, a power cut after the rename can revert the entry
-        // to the OLD snapshot — for a money meter that revert is a refilled cap (an already-reserved
-        // spend disappears), so the fsync is part of the write, not a nicety.
+        if std::fs::rename(&tmp_path, path).is_err() {
+            return Err(PersistFailure::PrePublish);
+        }
+        // PUBLISHED from here on. Without fsyncing the parent directory, a power cut can revert the
+        // entry to the OLD snapshot — for a money meter that revert is a refilled cap (an
+        // already-reserved spend disappears), so the fsync is part of the write, not a nicety.
+        #[cfg(test)]
+        if self
+            .fail_parent_fsync
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(PersistFailure::PostPublish);
+        }
         #[cfg(unix)]
         if let Some(parent) = path.parent() {
-            std::fs::File::open(parent)?.sync_all()?;
+            let synced = std::fs::File::open(parent).and_then(|d| d.sync_all());
+            if synced.is_err() {
+                return Err(PersistFailure::PostPublish);
+            }
         }
         Ok(())
+    }
+
+    /// Shared post-publish handling: memory KEEPS the mutation (it matches the visible disk) and
+    /// the meter poisons — no further mutation may stack on a publish a power cut could revert.
+    fn poison(&self) {
+        self.poisoned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Provision (or re-set) a key's TOTAL budget. Raising the limit grants more headroom; lowering
@@ -280,6 +377,7 @@ impl SpendMeter {
         key: &str,
         limit: SpendUnits,
     ) -> Result<Option<SpendUnits>, SpendError> {
+        self.refuse_if_poisoned()?;
         let mut balances = match self.balances.write() {
             Ok(b) => b,
             // A poisoned lock here can only mean a prior panic; the map is structurally intact
@@ -291,18 +389,26 @@ impl SpendMeter {
             .entry(key.to_string())
             .and_modify(|b| b.limit = limit)
             .or_insert(Balance { limit, spent: 0 });
-        if self.persist_locked(&balances).is_err() {
-            match prior {
-                Some(bal) => {
-                    balances.insert(key.to_string(), bal);
+        match self.persist_locked(&balances) {
+            Ok(()) => Ok(prior.map(|b| b.limit)),
+            Err(PersistFailure::PrePublish) => {
+                match prior {
+                    Some(bal) => {
+                        balances.insert(key.to_string(), bal);
+                    }
+                    None => {
+                        balances.remove(key);
+                    }
                 }
-                None => {
-                    balances.remove(key);
-                }
+                Err(SpendError::Persist)
             }
-            return Err(SpendError::Persist);
+            Err(PersistFailure::PostPublish) => {
+                // The new limit IS the visible disk state — keep memory in agreement, poison, and
+                // refuse: the caller's loud double-failure path is the right surface for this.
+                self.poison();
+                Err(SpendError::Persist)
+            }
         }
-        Ok(prior.map(|b| b.limit))
     }
 
     /// Remove a key's budget entirely (durable, same rollback discipline): afterwards the key is
@@ -311,6 +417,7 @@ impl SpendMeter {
     /// failed first-time provision (council S28 F7: rolling an unprovisioned key "back" to limit 0
     /// leaves an enumerable provisioned-at-zero artifact the chain never granted).
     pub fn remove_budget(&self, key: &str) -> Result<bool, SpendError> {
+        self.refuse_if_poisoned()?;
         let mut balances = match self.balances.write() {
             Ok(b) => b,
             Err(poisoned) => poisoned.into_inner(),
@@ -318,11 +425,17 @@ impl SpendMeter {
         let Some(prior) = balances.remove(key) else {
             return Ok(false);
         };
-        if self.persist_locked(&balances).is_err() {
-            balances.insert(key.to_string(), prior);
-            return Err(SpendError::Persist);
+        match self.persist_locked(&balances) {
+            Ok(()) => Ok(true),
+            Err(PersistFailure::PrePublish) => {
+                balances.insert(key.to_string(), prior);
+                Err(SpendError::Persist)
+            }
+            Err(PersistFailure::PostPublish) => {
+                self.poison();
+                Err(SpendError::Persist)
+            }
         }
-        Ok(true)
     }
 
     /// Provision `key` with `limit` ONLY if it has no budget yet (idempotent first-touch). Unlike
@@ -331,6 +444,7 @@ impl SpendMeter {
     /// resetting accumulated spend. Durable mode: persists only when it actually inserted; a persist
     /// failure rolls the insert back (the key stays unprovisioned ⇒ fail-closed `NoBudget` on debit).
     pub fn ensure_budget(&self, key: &str, limit: SpendUnits) -> Result<(), SpendError> {
+        self.refuse_if_poisoned()?;
         let mut balances = match self.balances.write() {
             Ok(b) => b,
             Err(poisoned) => poisoned.into_inner(),
@@ -339,11 +453,17 @@ impl SpendMeter {
             return Ok(());
         }
         balances.insert(key.to_string(), Balance { limit, spent: 0 });
-        if self.persist_locked(&balances).is_err() {
-            balances.remove(key);
-            return Err(SpendError::Persist);
+        match self.persist_locked(&balances) {
+            Ok(()) => Ok(()),
+            Err(PersistFailure::PrePublish) => {
+                balances.remove(key);
+                Err(SpendError::Persist)
+            }
+            Err(PersistFailure::PostPublish) => {
+                self.poison();
+                Err(SpendError::Persist)
+            }
         }
-        Ok(())
     }
 
     /// Remaining budget for `key` (0 if unprovisioned).
@@ -375,6 +495,7 @@ impl SpendMeter {
     /// cap. A persist failure rolls the debit back and refuses ([`SpendError::Persist`]): money must
     /// not move on a reservation the disk does not hold.
     pub fn try_debit(&self, key: &str, cost: SpendUnits) -> Result<SpendUnits, SpendError> {
+        self.refuse_if_poisoned()?;
         let mut balances = self.balances.write().map_err(|_| SpendError::Lock)?;
         let bal = balances.get_mut(key).ok_or(SpendError::NoBudget)?;
         let remaining = bal.remaining();
@@ -387,13 +508,22 @@ impl SpendMeter {
         // cost <= remaining = limit - spent, so spent + cost <= limit: no overflow.
         bal.spent += cost;
         let after = bal.remaining();
-        if self.persist_locked(&balances).is_err() {
-            if let Some(bal) = balances.get_mut(key) {
-                bal.spent = bal.spent.saturating_sub(cost);
+        match self.persist_locked(&balances) {
+            Ok(()) => Ok(after),
+            Err(PersistFailure::PrePublish) => {
+                if let Some(bal) = balances.get_mut(key) {
+                    bal.spent = bal.spent.saturating_sub(cost);
+                }
+                Err(SpendError::Persist)
             }
-            return Err(SpendError::Persist);
+            Err(PersistFailure::PostPublish) => {
+                // The debit IS the visible disk state, but its power-cut protection is missing —
+                // refuse the payment (fail-closed; the reservation stays, an orphaned-reservation
+                // shape the operator can repair) and poison against further churn.
+                self.poison();
+                Err(SpendError::Persist)
+            }
         }
-        Ok(after)
     }
 
     /// Debit up to `amount`, draining no further than zero, and return the amount ACTUALLY debited
@@ -407,6 +537,9 @@ impl SpendMeter {
     /// catches up at the next successful mutation. The reservation path a MONEY act depends on is
     /// [`try_debit`], which is strictly durable-before-visible.
     pub fn debit_saturating(&self, key: &str, amount: SpendUnits) -> SpendUnits {
+        if self.is_poisoned() {
+            return 0;
+        }
         let mut balances = match self.balances.write() {
             Ok(b) => b,
             Err(_) => return 0,
@@ -419,7 +552,9 @@ impl SpendMeter {
             }
             None => return 0,
         };
-        let _ = self.persist_locked(&balances);
+        if let Err(PersistFailure::PostPublish) = self.persist_locked(&balances) {
+            self.poison();
+        }
         take
     }
 
@@ -446,6 +581,7 @@ impl SpendMeter {
     /// signed record derived from this call must only claim "refunded" on `Ok` (council S28 F3: the
     /// pay path's Declined reason said "spend refunded" even when the durable refund rolled back).
     pub fn try_refund(&self, key: &str, cost: SpendUnits) -> Result<SpendUnits, SpendError> {
+        self.refuse_if_poisoned()?;
         let mut balances = self.balances.write().map_err(|_| SpendError::Lock)?;
         let (refunded, remaining) = match balances.get_mut(key) {
             Some(bal) => {
@@ -455,13 +591,23 @@ impl SpendMeter {
             }
             None => return Err(SpendError::NoBudget),
         };
-        if self.persist_locked(&balances).is_err() {
-            if let Some(bal) = balances.get_mut(key) {
-                bal.spent += refunded;
+        match self.persist_locked(&balances) {
+            Ok(()) => Ok(remaining),
+            Err(PersistFailure::PrePublish) => {
+                if let Some(bal) = balances.get_mut(key) {
+                    bal.spent += refunded;
+                }
+                Err(SpendError::Persist)
             }
-            return Err(SpendError::Persist);
+            Err(PersistFailure::PostPublish) => {
+                // The refund IS in force (memory and the visible disk agree) — claiming otherwise
+                // would be false — but poison against stacking further mutations on an unfsynced
+                // publish. The only residual is a power-cut revert to the MORE-spent snapshot,
+                // which is the fail-closed direction.
+                self.poison();
+                Ok(remaining)
+            }
         }
-        Ok(remaining)
     }
 }
 
@@ -814,6 +960,68 @@ mod tests {
             meter.remaining("vm-ap-agent"),
             300,
             "the failed removal left the balance (limit AND spent) intact"
+        );
+    }
+
+    #[test]
+    fn post_publish_persist_failure_poisons_the_meter() {
+        // Council S28 F1 (closed S29): a persist that fails AFTER the rename published the new
+        // snapshot keeps memory in agreement with the visible disk and POISONS the meter — the
+        // payment is still refused, and every further mutation refuses until reopen. Reads project.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spend_meter.json");
+        let meter = SpendMeter::open_durable(path.clone()).unwrap();
+        meter.set_budget("vm-ap-agent", 500).unwrap();
+        meter
+            .fail_parent_fsync
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            meter.try_debit("vm-ap-agent", 200).unwrap_err(),
+            SpendError::Persist,
+            "the payment is refused — its power-cut protection is missing"
+        );
+        assert!(meter.is_poisoned());
+        assert_eq!(
+            meter.remaining("vm-ap-agent"),
+            300,
+            "memory keeps the published debit (it matches the visible disk) — no divergence"
+        );
+        assert_eq!(
+            meter.try_debit("vm-ap-agent", 1).unwrap_err(),
+            SpendError::Poisoned,
+            "further mutations refuse fail-closed"
+        );
+        assert_eq!(
+            meter.set_budget("vm-ap-agent", 900).unwrap_err(),
+            SpendError::Poisoned
+        );
+        assert_eq!(meter.debit_saturating("vm-ap-agent", 5), 0);
+        assert!(
+            meter.snapshot("vm-ap-agent").is_some(),
+            "reads still project while poisoned"
+        );
+        // Reopen from disk = the recovery path; the published debit is exactly what disk holds.
+        drop(meter);
+        let reopened = SpendMeter::open_durable(path).unwrap();
+        assert!(!reopened.is_poisoned());
+        assert_eq!(reopened.remaining("vm-ap-agent"), 300);
+    }
+
+    #[test]
+    fn second_opener_of_one_snapshot_is_refused() {
+        // Council S28 F4: single-opener is enforced by the meter itself (exclusive flock held for
+        // its lifetime) — two live meters on one snapshot would last-writer-wins clobber `spent`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spend_meter.json");
+        let first = SpendMeter::open_durable(path.clone()).unwrap();
+        assert!(
+            SpendMeter::open_durable(path.clone()).is_err(),
+            "a second opener fails fail-closed while the first is alive"
+        );
+        drop(first);
+        assert!(
+            SpendMeter::open_durable(path).is_ok(),
+            "the lock releases with the meter"
         );
     }
 

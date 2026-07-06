@@ -2802,11 +2802,23 @@ mod tests {
             .0;
         assert_eq!(r.outcome, "performed");
 
-        // RESTART: reopen the meter from disk. The 200 spent is still spent — the cap did NOT
-        // refill (THE Sprint 27 council F1 property) — and the projection surface shows it.
+        // RESTART: a REAL restart drops the first opener before the next one starts — the meter's
+        // single-opener flock (S29, council F4) enforces exactly that, so release every Arc that
+        // holds the first meter (the state's spend_meter and the executor's pay closure) first. A
+        // premature reopen while the first is alive is itself refused, ratcheting the flock here.
+        assert!(
+            elastos_runtime::primitives::spend::SpendMeter::open_durable(meter_path.clone())
+                .is_err(),
+            "a second opener is refused while the first meter is still alive (single-opener)"
+        );
+        let mut state = state; // take over the last owner to strip the meter-holding fields
+        state.spend_meter = None;
+        state.intent_executor = std::sync::Arc::new(FaithfulExecutor);
+        drop(meter);
         let reopened = std::sync::Arc::new(
             elastos_runtime::primitives::spend::SpendMeter::open_durable(meter_path).unwrap(),
         );
+        state.spend_meter = Some(reopened.clone()); // the post-restart state for later assertions
         let mut state2 = state.clone();
         state2.spend_meter = Some(reopened.clone());
         let snap = get_spend_budget(State(state2), Path("vm-ap-agent".to_string()))

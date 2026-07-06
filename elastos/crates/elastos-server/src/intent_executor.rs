@@ -110,24 +110,40 @@ pub trait IntentExecutor: Send + Sync {
     fn execute(&self, intent: &IntentDeclarationV1) -> IntentExecution;
 }
 
+/// Why a payment did not (verifiably) happen — the TWO-GENERALS distinction a real rail forces
+/// (Sprint 29). The runtime's action on each is different and money-critical:
+///
+/// - [`NotCharged`](PayError::NotCharged): the charge PROVABLY did not happen (refused before
+///   processing, connection never established, order rejected 4xx). The runtime REFUNDS the
+///   reserved cap — the `DidNotAct` discipline.
+/// - [`Indeterminate`](PayError::Indeterminate): the outcome is UNKNOWN (timeout after send, 5xx,
+///   crash mid-flight — the charge MAY have posted). The runtime KEEPS the reservation: refunding
+///   against money that may have moved would let real spend exceed the cap (the one unbreakable
+///   invariant). The reservation is resolved out-of-band (rail reconciliation via the idempotency
+///   key; the operator's lever is the budget).
+#[derive(Debug)]
+pub enum PayError {
+    NotCharged(String),
+    Indeterminate(String),
+}
+
 /// A RAIL-AGNOSTIC payment sink for the `runtime.pay` affordance (Sprint 27). The runtime enforces
 /// the CAP (via the [`SpendMeter`]) before ever calling this; the provider only moves the money on a
 /// rail — a virtual card, ACH, a Stripe charge, an on-chain transfer. It is CRYPTOGRAPHY that signs
 /// the mandate and the receipt, not CRYPTOCURRENCY: the rail is whatever the deployment wires here.
 ///
-/// CONTRACT — implementors MUST honor this, because the runtime REFUNDS the reserved cap on `Err`
-/// (council F2): return `Ok(rail_ref)` iff the money PROVABLY moved; return `Err` ONLY when the
-/// charge PROVABLY did NOT happen (the `DidNotAct` discipline — see [`SpendMeter::refund`]). An
-/// INDETERMINATE outcome (e.g. a network timeout after a card charge may have posted) MUST NOT be
-/// returned as `Err` — that would refund a cap against money that did move, letting real spend
-/// exceed the cap. An indeterminate connector must instead hold the reservation and reconcile the
-/// true outcome out-of-band (never guess "not charged").
+/// CONTRACT — implementors MUST classify honestly, because the runtime refunds ONLY on
+/// [`PayError::NotCharged`]: return `Ok(rail_ref)` iff the money PROVABLY moved;
+/// `Err(NotCharged)` ONLY when the charge PROVABLY did not happen; anything you cannot prove either
+/// way is `Err(Indeterminate)` — never guess "not charged". `idempotency_key` is unique per SIGNED
+/// intent (derived from its signature, so it cannot recycle even when an intent_id ages out of the
+/// replay window) — a rail-side dedupe key so retries/reconciliation can never double-move money.
 pub trait PaymentProvider: Send + Sync {
-    fn pay(&self, payee: &str, amount: u64) -> Result<String, String>;
+    fn pay(&self, payee: &str, amount: u64, idempotency_key: &str) -> Result<String, PayError>;
 }
 
 /// A test/demo payment sink: records every payment and always succeeds, returning a deterministic
-/// reference. Real deployments swap in a card/ACH/Stripe connector implementing [`PaymentProvider`];
+/// reference. Real deployments swap in [`HttpPaymentProvider`] (or any [`PaymentProvider`]);
 /// nothing else about the affordance changes (the cap + receipt live in the runtime, not the rail).
 #[derive(Default)]
 pub struct MockPaymentProvider {
@@ -135,13 +151,110 @@ pub struct MockPaymentProvider {
 }
 
 impl PaymentProvider for MockPaymentProvider {
-    fn pay(&self, payee: &str, amount: u64) -> Result<String, String> {
+    fn pay(&self, payee: &str, amount: u64, _idempotency_key: &str) -> Result<String, PayError> {
         let mut log = match self.payments.lock() {
             Ok(l) => l,
             Err(poisoned) => poisoned.into_inner(),
         };
         log.push((payee.to_string(), amount));
         Ok(format!("mock-txn:{payee}:{amount}"))
+    }
+}
+
+/// The REAL rail connector (Sprint 29): POSTs a payment order to a deployment-configured HTTPS
+/// endpoint (a payment service, or a thin adapter in front of Stripe/ACH/a treasury system) and
+/// classifies the outcome under the two-generals contract:
+///
+/// - `2xx` ⇒ `Ok(rail_ref)` — the endpoint CONFIRMED the charge (body is the rail reference).
+/// - `4xx` ⇒ `NotCharged` — the endpoint REJECTED the order before processing. This is a contract
+///   REQUIREMENT on the endpoint: it must never return 4xx for an order it (may have) processed.
+/// - connect/DNS failure (request never sent) ⇒ `NotCharged` — provably nothing reached the rail.
+/// - timeout, `5xx`, or any post-send ambiguity ⇒ `Indeterminate` — the charge may have posted;
+///   the runtime keeps the reservation and the idempotency key makes reconciliation/retry safe.
+///
+/// The order carries `{payee, amount, idempotency_key}` as JSON plus an `Idempotency-Key` header;
+/// auth is a static bearer token. The call runs on a dedicated OS thread (the executor runs inside
+/// async handlers; a blocking HTTP client must not run on, or panic in, a runtime worker).
+pub struct HttpPaymentProvider {
+    endpoint: String,
+    bearer_token: Option<String>,
+    timeout: std::time::Duration,
+}
+
+impl HttpPaymentProvider {
+    pub fn new(endpoint: String, bearer_token: Option<String>) -> Self {
+        Self {
+            endpoint,
+            bearer_token,
+            timeout: std::time::Duration::from_secs(30),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+}
+
+impl PaymentProvider for HttpPaymentProvider {
+    fn pay(&self, payee: &str, amount: u64, idempotency_key: &str) -> Result<String, PayError> {
+        let endpoint = self.endpoint.clone();
+        let token = self.bearer_token.clone();
+        let timeout = self.timeout;
+        let payee = payee.to_string();
+        let key = idempotency_key.to_string();
+        // A dedicated thread: reqwest's blocking client refuses to run on an async runtime worker,
+        // and a payment must never block one either. A JOIN failure (the thread panicked) is
+        // INDETERMINATE — the request may already have been sent.
+        let handle = std::thread::spawn(move || -> Result<String, PayError> {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(timeout)
+                .build()
+                .map_err(|e| PayError::NotCharged(format!("rail client not constructed: {e}")))?;
+            let mut req = client
+                .post(&endpoint)
+                .header("Idempotency-Key", &key)
+                .json(&serde_json::json!({
+                    "payee": payee,
+                    "amount": amount,
+                    "idempotency_key": key,
+                }));
+            if let Some(t) = &token {
+                req = req.bearer_auth(t);
+            }
+            let resp = match req.send() {
+                Ok(r) => r,
+                Err(e) if e.is_connect() => {
+                    // The connection was never established — nothing reached the rail.
+                    return Err(PayError::NotCharged(format!("rail unreachable: {e}")));
+                }
+                Err(e) => {
+                    // Timeout or any post-send failure: the order MAY have been processed.
+                    return Err(PayError::Indeterminate(format!("rail send ambiguous: {e}")));
+                }
+            };
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            let body_head: String = body.chars().take(256).collect();
+            if status.is_success() {
+                Ok(body_head)
+            } else if status.is_client_error() {
+                Err(PayError::NotCharged(format!(
+                    "rail rejected the order ({status}): {body_head}"
+                )))
+            } else {
+                Err(PayError::Indeterminate(format!(
+                    "rail returned {status} after receiving the order: {body_head}"
+                )))
+            }
+        });
+        match handle.join() {
+            Ok(result) => result,
+            Err(_) => Err(PayError::Indeterminate(
+                "rail call thread panicked; the order may have been sent".to_string(),
+            )),
+        }
     }
 }
 
@@ -492,8 +605,11 @@ impl MethodRegistryExecutor {
     ///    unprovisioned capsule ⇒ zero budget) it refuses and NOTHING is debited or paid: the act
     ///    Declines and the chain records it as `authorized_not_performed` (a SIGNED refusal that no
     ///    payment happened; the specific decline REASON is not yet on-chain — council F3, follow-on);
-    /// 3. only then does the rail-agnostic [`PaymentProvider`] move the money. If the RAIL fails (Err
-    ///    or panic), the reservation is REFUNDED (provably-no-op: no money moved) and the act Declines;
+    /// 3. only then does the rail-agnostic [`PaymentProvider`] move the money, under a
+    ///    signature-derived idempotency key. The outcome is handled two-generals-honestly (S29):
+    ///    provably-NOT-charged refunds the reservation; INDETERMINATE (timeout/5xx/panic — the
+    ///    charge may have posted) KEEPS it, because refunding against money that may have moved
+    ///    would let real spend exceed the cap;
     /// 4. on success the receipt reports `execute` of `<amount>` to `<payee>` — the reconciliation
     ///    Matches iff the executor charged exactly the declared amount (a non-canonical amount is
     ///    declined up front, F4).
@@ -555,11 +671,14 @@ impl MethodRegistryExecutor {
                         reason: format!("payment refused by spend cap: {e}"),
                     };
                 }
-                // The cap allowed it — NOW move the money on the rail. A rail PANIC (not just an
-                // Err) must also refund the reservation (council F4): catch it so a panicking
-                // connector cannot leave a phantom debit with no money moved.
+                // The cap allowed it — NOW move the money on the rail, under an idempotency key
+                // derived from the intent's SIGNATURE: unique per signed declaration (an intent_id
+                // can legitimately recycle once it ages out of the replay window; a signature
+                // cannot), so the rail can dedupe retries/reconciliation without ever double-moving
+                // money for one signed intent.
+                let idempotency_key = format!("flint-{}", intent.signature);
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    provider.pay(payee, amount)
+                    provider.pay(payee, amount, &idempotency_key)
                 }));
                 match outcome {
                     Ok(Ok(_rail_ref)) => IntentExecution::Performed {
@@ -571,34 +690,48 @@ impl MethodRegistryExecutor {
                         resource: intent.resource.clone(),
                         action: "execute".to_string(),
                     },
-                    Ok(Err(rail_err)) => {
-                        // The rail failed AFTER we reserved — REFUND (provably no money moved, per
-                        // the PaymentProvider contract) and Decline. The signed reason claims
-                        // "refunded" ONLY when the refund is durably in force (council S28 F3): a
-                        // durable refund that cannot persist is rolled back by try_refund, and the
-                        // honest record is that the cap remains debited (fail-closed — the operator
-                        // restores the headroom by raising the budget).
+                    Ok(Err(PayError::NotCharged(rail_err))) => {
+                        // PROVABLY not charged — REFUND the reservation and Decline. The signed
+                        // reason claims "refunded" ONLY when the refund is durably in force
+                        // (council S28 F3): a durable refund that cannot persist is rolled back by
+                        // try_refund, and the honest record is that the cap remains debited
+                        // (fail-closed — the operator restores headroom by raising the budget).
                         IntentExecution::Declined {
                             reason: match meter.try_refund(&intent.capsule, amount) {
-                                Ok(_) => format!("payment rail failed (spend refunded): {rail_err}"),
+                                Ok(_) => format!("payment rail refused (spend refunded): {rail_err}"),
                                 Err(e) => format!(
-                                    "payment rail failed and the refund could not be durably \
+                                    "payment rail refused and the refund could not be durably \
                                      recorded ({e}) — the cap remains debited: {rail_err}"
                                 ),
                             },
                         }
                     }
-                    Err(_panic) => {
-                        // The rail PANICKED — treat as provably-not-charged and refund, so the cap
-                        // is never consumed by a phantom payment. Same honest wording rule (F3).
+                    Ok(Err(PayError::Indeterminate(rail_err))) => {
+                        // The outcome is UNKNOWN — the charge may have posted. Refunding here would
+                        // let real spend exceed the cap (charge landed + headroom restored), the
+                        // one unbreakable invariant — so the reservation is KEPT and the chain
+                        // records, honestly, an act NOT attested as performed whose funds may have
+                        // moved, resolvable via the idempotency key. Fail-closed over-counting.
                         IntentExecution::Declined {
-                            reason: match meter.try_refund(&intent.capsule, amount) {
-                                Ok(_) => "payment rail panicked (spend refunded)".to_string(),
-                                Err(e) => format!(
-                                    "payment rail panicked and the refund could not be durably \
-                                     recorded ({e}) — the cap remains debited"
-                                ),
-                            },
+                            reason: format!(
+                                "payment outcome INDETERMINATE ({rail_err}) — not attested as \
+                                 performed; the reservation is KEPT (cap remains debited) pending \
+                                 rail reconciliation under idempotency key {idempotency_key}"
+                            ),
+                        }
+                    }
+                    Err(_panic) => {
+                        // The rail PANICKED mid-call. Sprint 27 refunded here (the mock rail never
+                        // charges); with a REAL rail that is UNSAFE — the panic may have happened
+                        // AFTER the charge posted, and refunding would let total real spend exceed
+                        // the cap. A panic is INDETERMINATE: keep the reservation (S29, supersedes
+                        // the S27 refund-on-panic fold for exactly the reason the trait doc gives).
+                        IntentExecution::Declined {
+                            reason: format!(
+                                "payment rail panicked — outcome INDETERMINATE; the reservation is \
+                                 KEPT (cap remains debited) pending rail reconciliation under \
+                                 idempotency key {idempotency_key}"
+                            ),
                         }
                     }
                 }
@@ -1075,11 +1208,12 @@ mod tests {
     // ── Sprint 27: the spend-capped `runtime.pay` affordance ──────────────────────────────────
     use elastos_runtime::primitives::spend::SpendMeter;
 
-    /// A payment rail that always FAILS — to prove the meter is REFUNDED when the rail errors.
+    /// A payment rail that always refuses PROVABLY-NOT-CHARGED — to prove the meter is REFUNDED
+    /// exactly (and only) on that classification.
     struct FailingProvider;
     impl PaymentProvider for FailingProvider {
-        fn pay(&self, _payee: &str, _amount: u64) -> Result<String, String> {
-            Err("rail unavailable".to_string())
+        fn pay(&self, _payee: &str, _amount: u64, _key: &str) -> Result<String, PayError> {
+            Err(PayError::NotCharged("rail unavailable".to_string()))
         }
     }
 
@@ -1175,13 +1309,14 @@ mod tests {
         );
     }
 
-    /// A rail that PANICS must also refund the reservation (council red-team F4) — a panicking
-    /// connector cannot leave a phantom debit with no money moved.
+    /// A rail that PANICS is INDETERMINATE (S29 — supersedes the S27 refund-on-panic fold): with a
+    /// REAL rail the panic may happen AFTER the charge posted, and a refund would let total real
+    /// spend exceed the cap (invariant a). The reservation is KEPT and the reason says so honestly.
     #[test]
-    fn pay_rail_panic_refunds_the_reservation() {
+    fn pay_rail_panic_keeps_the_reservation_as_indeterminate() {
         struct PanickingProvider;
         impl PaymentProvider for PanickingProvider {
-            fn pay(&self, _payee: &str, _amount: u64) -> Result<String, String> {
+            fn pay(&self, _payee: &str, _amount: u64, _key: &str) -> Result<String, PayError> {
                 panic!("rail exploded mid-charge")
             }
         }
@@ -1189,15 +1324,163 @@ mod tests {
         meter.set_budget("vm-agent", 100).unwrap();
         let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
             .with_payments(meter.clone(), Arc::new(PanickingProvider));
-        assert!(matches!(
-            reg.execute(&pay_intent("acme-vendor", "vm-agent", "40")),
-            IntentExecution::Declined { .. }
-        ));
+        match reg.execute(&pay_intent("acme-vendor", "vm-agent", "40")) {
+            IntentExecution::Declined { reason } => {
+                assert!(
+                    reason.contains("INDETERMINATE") && reason.contains("cap remains debited"),
+                    "the signed reason must state indeterminacy + kept reservation: {reason}"
+                );
+            }
+            other => panic!("expected Declined, got {other:?}"),
+        }
         assert_eq!(
             meter.remaining("vm-agent"),
-            100,
-            "a panicking rail refunds the reservation — no phantom debit"
+            60,
+            "the reservation is KEPT — a maybe-charged payment must not restore headroom"
         );
+    }
+
+    /// An INDETERMINATE rail outcome (timeout/5xx) keeps the reservation and names the idempotency
+    /// key for reconciliation — refunding against money that may have moved would break the cap.
+    #[test]
+    fn pay_indeterminate_outcome_keeps_the_reservation() {
+        struct IndeterminateProvider;
+        impl PaymentProvider for IndeterminateProvider {
+            fn pay(&self, _payee: &str, _amount: u64, _key: &str) -> Result<String, PayError> {
+                Err(PayError::Indeterminate("timeout after send".to_string()))
+            }
+        }
+        let meter = Arc::new(SpendMeter::new());
+        meter.set_budget("vm-agent", 100).unwrap();
+        let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
+            .with_payments(meter.clone(), Arc::new(IndeterminateProvider));
+        match reg.execute(&pay_intent("acme-vendor", "vm-agent", "40")) {
+            IntentExecution::Declined { reason } => {
+                assert!(
+                    reason.contains("INDETERMINATE")
+                        && reason.contains("idempotency key flint-"),
+                    "the reason names the indeterminacy and the reconciliation key: {reason}"
+                );
+                assert!(
+                    !reason.contains("refunded"),
+                    "an indeterminate outcome must never claim a refund: {reason}"
+                );
+            }
+            other => panic!("expected Declined, got {other:?}"),
+        }
+        assert_eq!(meter.remaining("vm-agent"), 60, "the reservation is kept");
+    }
+
+    /// The HTTP rail connector's two-generals classification, exercised against a REAL local HTTP
+    /// server: 2xx confirms, 4xx is provably-not-charged, 5xx is indeterminate, connection-refused
+    /// (nothing sent) is provably-not-charged, and a timeout after send is indeterminate. The
+    /// idempotency key must reach the wire as the Idempotency-Key header.
+    #[test]
+    fn http_rail_classifies_outcomes_two_generals_honestly() {
+        use std::io::{Read as _, Write as _};
+        // A one-shot local HTTP server: returns `status`, captures the request head.
+        fn serve_once(status: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+                let body = "rail-ref-123";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            });
+            (format!("http://{addr}/pay"), rx)
+        }
+
+        // 2xx → Ok, with the idempotency key on the wire.
+        let (url, rx) = serve_once("200 OK");
+        let ok = HttpPaymentProvider::new(url, Some("tok".into()))
+            .pay("acme-vendor", 200, "flint-abc123")
+            .expect("2xx confirms the charge");
+        assert_eq!(ok, "rail-ref-123", "the rail reference comes back");
+        let req = rx.recv().unwrap();
+        assert!(
+            req.contains("idempotency-key: flint-abc123")
+                || req.contains("Idempotency-Key: flint-abc123"),
+            "the idempotency key reaches the wire: {req}"
+        );
+        assert!(req.contains("\"payee\":\"acme-vendor\"") && req.contains("\"amount\":200"));
+
+        // 4xx → the order was REJECTED before processing: provably not charged.
+        let (url, _rx) = serve_once("422 Unprocessable Entity");
+        assert!(matches!(
+            HttpPaymentProvider::new(url, None).pay("acme-vendor", 200, "k"),
+            Err(PayError::NotCharged(_))
+        ));
+
+        // 5xx → the order REACHED the rail and then something broke: indeterminate.
+        let (url, _rx) = serve_once("500 Internal Server Error");
+        assert!(matches!(
+            HttpPaymentProvider::new(url, None).pay("acme-vendor", 200, "k"),
+            Err(PayError::Indeterminate(_))
+        ));
+
+        // Connection refused → nothing was ever sent: provably not charged.
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            format!("http://{a}/pay")
+        };
+        assert!(matches!(
+            HttpPaymentProvider::new(dead, None).pay("acme-vendor", 200, "k"),
+            Err(PayError::NotCharged(_))
+        ));
+
+        // Timeout after the request was sent → indeterminate (the charge may have posted).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            drop(stream); // accept, read nothing back, never respond
+        });
+        assert!(matches!(
+            HttpPaymentProvider::new(format!("http://{addr}/pay"), None)
+                .with_timeout(std::time::Duration::from_millis(300))
+                .pay("acme-vendor", 200, "k"),
+            Err(PayError::Indeterminate(_))
+        ));
+    }
+
+    /// The idempotency key is derived from the intent's SIGNATURE — unique per signed declaration
+    /// (an intent_id can recycle out of the replay window; a signature cannot), so the rail can
+    /// dedupe without ever double-moving money for one signed intent.
+    #[test]
+    fn pay_idempotency_key_is_signature_derived_and_unique_per_signed_intent() {
+        #[derive(Default)]
+        struct KeyRecordingProvider(std::sync::Mutex<Vec<String>>);
+        impl PaymentProvider for KeyRecordingProvider {
+            fn pay(&self, _payee: &str, _amount: u64, key: &str) -> Result<String, PayError> {
+                self.0.lock().unwrap().push(key.to_string());
+                Ok("ok".to_string())
+            }
+        }
+        let meter = Arc::new(SpendMeter::new());
+        meter.set_budget("vm-agent", 100).unwrap();
+        let provider = Arc::new(KeyRecordingProvider::default());
+        let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
+            .with_payments(meter, provider.clone());
+        let i1 = pay_intent("acme-vendor", "vm-agent", "10");
+        let i2 = pay_intent("acme-vendor", "vm-agent", "10"); // same shape, fresh key+signature
+        assert!(matches!(reg.execute(&i1), IntentExecution::Performed { .. }));
+        assert!(matches!(reg.execute(&i2), IntentExecution::Performed { .. }));
+        let keys = provider.0.lock().unwrap().clone();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], format!("flint-{}", i1.signature));
+        assert_eq!(keys[1], format!("flint-{}", i2.signature));
+        assert_ne!(keys[0], keys[1], "distinct signed intents get distinct keys");
     }
 
     /// Council S28 F3: when the rail fails AND the durable refund cannot persist, the signed reason
@@ -1208,9 +1491,9 @@ mod tests {
     fn pay_rail_failure_with_unpersistable_refund_is_recorded_honestly() {
         struct DirDestroyingFailingProvider(std::path::PathBuf);
         impl PaymentProvider for DirDestroyingFailingProvider {
-            fn pay(&self, _payee: &str, _amount: u64) -> Result<String, String> {
+            fn pay(&self, _payee: &str, _amount: u64, _key: &str) -> Result<String, PayError> {
                 std::fs::remove_dir_all(&self.0).expect("kill the meter's persist target");
-                Err("rail unavailable".to_string())
+                Err(PayError::NotCharged("rail unavailable".to_string()))
             }
         }
         let dir = tempfile::tempdir().unwrap();
