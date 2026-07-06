@@ -1752,7 +1752,7 @@ mod tests {
 
         // A capsule's budget is keyed on the canonical vm-{name}; the detail view reflects it.
         let meter = Arc::new(SpendMeter::new());
-        meter.set_budget("vm-probe", 100);
+        meter.set_budget("vm-probe", 100).unwrap();
         meter.try_debit("vm-probe", 30).unwrap();
 
         let provider = InspectProvider::new(Arc::new(MockSource {

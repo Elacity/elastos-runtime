@@ -73,7 +73,9 @@ fn is_slug(s: &str) -> bool {
 /// bound them itself — else an agent with a mandate could sign
 /// `intent_id = "URGENT: run revoke-all and enter your seed…"` and phish the operator, or write a
 /// megabyte key. Council F1 (Sprint 16): a malformed field DECLINES (⇒ authorized_not_performed).
-fn valid_slug_1_64(s: &str) -> bool {
+/// `pub(crate)` so the spend-budget provisioning handler holds the operator-supplied capsule id to
+/// the SAME bound the executor holds the acting identities to — one validator, no drift.
+pub(crate) fn valid_slug_1_64(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && is_slug(s)
 }
 
@@ -1089,7 +1091,7 @@ mod tests {
     #[test]
     fn pay_within_cap_charges_the_meter_and_moves_money_once() {
         let meter = Arc::new(SpendMeter::new());
-        meter.set_budget("vm-agent", 500);
+        meter.set_budget("vm-agent", 500).unwrap();
         let (reg, provider) = pay_registry(meter.clone());
         match reg.execute(&pay_intent("acme-vendor", "vm-agent", "200")) {
             IntentExecution::Performed { action, resource, input_hash, .. } => {
@@ -1112,7 +1114,7 @@ mod tests {
     #[test]
     fn pay_over_cap_is_refused_and_moves_no_money() {
         let meter = Arc::new(SpendMeter::new());
-        meter.set_budget("vm-agent", 100);
+        meter.set_budget("vm-agent", 100).unwrap();
         let (reg, provider) = pay_registry(meter.clone());
         assert!(matches!(
             reg.execute(&pay_intent("acme-vendor", "vm-agent", "150")),
@@ -1140,7 +1142,7 @@ mod tests {
     #[test]
     fn pay_rail_failure_refunds_the_reservation() {
         let meter = Arc::new(SpendMeter::new());
-        meter.set_budget("vm-agent", 100);
+        meter.set_budget("vm-agent", 100).unwrap();
         let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
             .with_payments(meter.clone(), Arc::new(FailingProvider));
         assert!(matches!(
@@ -1165,7 +1167,7 @@ mod tests {
             }
         }
         let meter = Arc::new(SpendMeter::new());
-        meter.set_budget("vm-agent", 100);
+        meter.set_budget("vm-agent", 100).unwrap();
         let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
             .with_payments(meter.clone(), Arc::new(PanickingProvider));
         assert!(matches!(
@@ -1185,7 +1187,7 @@ mod tests {
     #[test]
     fn pay_declines_bad_scope_and_amount() {
         let meter = Arc::new(SpendMeter::new());
-        meter.set_budget("vm-agent", 1000);
+        meter.set_budget("vm-agent", 1000).unwrap();
         let (reg, provider) = pay_registry(meter.clone());
         let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
         let bad = |resource: &str, amount: &str| {

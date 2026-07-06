@@ -38,6 +38,11 @@ pub struct CapabilityState {
     /// reconciliation checks against the declaration. An unregistered method declines (⇒
     /// `Undelivered`), so an authorized-but-unperformed intent is never a fabricated `Matched`.
     pub intent_executor: Arc<dyn crate::intent_executor::IntentExecutor>,
+    /// The spend meter backing `runtime.pay` — the SAME instance the executor's pay closure debits,
+    /// so the operator provisioning surface and the enforcement path can never disagree. `None` when
+    /// no payment rail is wired (the fail-closed default): provisioning is then refused honestly
+    /// (503) rather than accepting a budget nothing enforces.
+    pub spend_meter: Option<Arc<elastos_runtime::primitives::spend::SpendMeter>>,
 }
 
 // === Request Capability ===
@@ -1381,6 +1386,128 @@ pub async fn revoke_standing_grant(
     Ok(Json(RevokeStandingGrantOutput { revoked }))
 }
 
+// === Spend budgets (Sprint 28) — the operator provisioning surface for the runtime.pay cap ===
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetSpendBudgetInput {
+    /// The capsule (agent identity) whose money cap is being provisioned — the same string the pay
+    /// closure debits (`intent.capsule`), held to the same slug bound the executor enforces.
+    pub capsule: String,
+    /// The TOTAL budget (cumulative cap). Lowering below what is already spent clamps remaining to
+    /// zero — it never refunds silently.
+    pub limit: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SpendBudgetOutput {
+    pub capsule: String,
+    pub limit: u64,
+    pub spent: u64,
+    pub remaining: u64,
+}
+
+/// POST /api/spend-budgets  (shell-only) — provision (or re-set) a capsule's money cap.
+///
+/// This is real operator AUTHORITY, so it is held to the mandate discipline:
+/// - **Same-instance enforcement:** the meter here IS the one the executor's pay closure debits —
+///   what the operator sets is exactly what is enforced, by construction.
+/// - **Fail-closed without a rail:** no wired payment rail ⇒ no meter ⇒ 503. A budget nothing
+///   enforces is never accepted.
+/// - **Durable-only:** a money cap on a meter that refills across restart is a lie; a non-durable
+///   meter refuses provisioning (503) rather than accepting a cap it cannot keep.
+/// - **Attested:** the budget change lands on the signed audit chain as a `ConfigChange`
+///   (`spend_budget:{capsule}`, old → new). Apply-then-attest with rollback: the event is emitted
+///   only AFTER the budget is durably in force (the chain never claims a cap that isn't real), and
+///   if the emit fails the budget is rolled back (no unattested cap stays in force) — the same
+///   no-record-⇒-no-change discipline as the fail-closed revoke/mint.
+pub async fn set_spend_budget(
+    State(state): State<CapabilityState>,
+    Json(input): Json<SetSpendBudgetInput>,
+) -> Result<Json<SpendBudgetOutput>, (StatusCode, String)> {
+    let Some(meter) = &state.spend_meter else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no payment rail is wired — a spend budget nothing enforces is refused".to_string(),
+        ));
+    };
+    if !meter.is_durable() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the spend meter is not durable — a money cap that refills on restart is refused"
+                .to_string(),
+        ));
+    }
+    if !crate::intent_executor::valid_slug_1_64(&input.capsule) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "capsule must be a 1-64 char slug (the identity the pay gate debits)".to_string(),
+        ));
+    }
+    let old_value = meter
+        .snapshot(&input.capsule)
+        .map(|s| s.limit.to_string())
+        .unwrap_or_else(|| "unprovisioned".to_string());
+    let prior_limit = meter.snapshot(&input.capsule).map(|s| s.limit);
+    meter.set_budget(&input.capsule, input.limit).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("budget not applied (durable persist failed, rolled back): {e}"),
+        )
+    })?;
+    let attested = state.capability_manager.audit_log().emit(
+        elastos_runtime::primitives::audit::AuditEvent::ConfigChange {
+            timestamp: elastos_runtime::primitives::SecureTimestamp::now(),
+            setting: format!("spend_budget:{}", input.capsule),
+            old_value,
+            new_value: input.limit.to_string(),
+        },
+    );
+    if let Err(e) = attested {
+        // No unattested cap stays in force: roll back to the prior limit (or an unspendable zero if
+        // the key was unprovisioned — there is no un-provision, and zero is the fail-closed shape).
+        let _ = meter.set_budget(&input.capsule, prior_limit.unwrap_or(0));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("budget change could not be attested on the audit chain — rolled back: {e}"),
+        ));
+    }
+    let snap = meter.snapshot(&input.capsule).ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "budget vanished after set".to_string(),
+    ))?;
+    Ok(Json(SpendBudgetOutput {
+        capsule: input.capsule,
+        limit: snap.limit,
+        spent: snap.spent,
+        remaining: snap.remaining,
+    }))
+}
+
+/// GET /api/spend-budgets/:capsule  (shell-only) — the read-only projection of one capsule's money
+/// cap (limit / spent / remaining), straight off the enforcing meter. 404 when unprovisioned.
+pub async fn get_spend_budget(
+    State(state): State<CapabilityState>,
+    Path(capsule): Path<String>,
+) -> Result<Json<SpendBudgetOutput>, (StatusCode, String)> {
+    let Some(meter) = &state.spend_meter else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no payment rail is wired".to_string(),
+        ));
+    };
+    let snap = meter.snapshot(&capsule).ok_or((
+        StatusCode::NOT_FOUND,
+        "no spend budget provisioned for this capsule".to_string(),
+    ))?;
+    Ok(Json(SpendBudgetOutput {
+        capsule,
+        limit: snap.limit,
+        spent: snap.spent,
+        remaining: snap.remaining,
+    }))
+}
+
 #[derive(Debug, Serialize)]
 pub struct PreviewStandingGrantOutput {
     /// "allowed" | "denied" — whether the declared intent WOULD pass its standing grant.
@@ -1998,6 +2125,7 @@ mod tests {
             )),
             standing_service,
             intent_executor,
+            spend_meter: None,
         }
     }
 
@@ -2182,6 +2310,7 @@ mod tests {
             intent_executor: std::sync::Arc::new(
                 crate::intent_executor::MethodRegistryExecutor::production(audit_log, None),
             ),
+            spend_meter: None,
         };
 
         let out = issue_standing_grant(
@@ -2258,6 +2387,7 @@ mod tests {
             )),
             standing_service,
             intent_executor,
+            spend_meter: None,
         }
     }
 
@@ -2297,6 +2427,7 @@ mod tests {
             intent_executor: std::sync::Arc::new(
                 crate::intent_executor::MethodRegistryExecutor::production(audit_log.clone(), None),
             ),
+            spend_meter: None,
         };
 
         let res = issue_standing_grant(
@@ -2472,7 +2603,7 @@ mod tests {
         let mut state = test_state_with_durable_audit(dir.path());
         let meter = std::sync::Arc::new(elastos_runtime::primitives::spend::SpendMeter::new());
         let provider = std::sync::Arc::new(crate::intent_executor::MockPaymentProvider::default());
-        meter.set_budget("vm-ap-agent", 500); // the operator provisions the agent's weekly cap
+        meter.set_budget("vm-ap-agent", 500).unwrap(); // the operator provisions the agent's weekly cap
         state.intent_executor = std::sync::Arc::new(
             crate::intent_executor::MethodRegistryExecutor::production(
                 state.capability_manager.audit_log().clone(),
@@ -2556,6 +2687,142 @@ mod tests {
             elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer)).authenticated,
             "the pay-mandate's receipt verifies off-box"
         );
+    }
+
+    /// Sprint 28 end-to-end: the operator provisions a DURABLE money cap through the shell surface
+    /// (`POST /api/spend-budgets`), the change is ATTESTED on the signed audit chain, the agent
+    /// spends under it, and a RESTART (reopening the meter from disk) preserves the spend — the cap
+    /// never refills. The provisioning surface is fail-closed: no rail ⇒ 503, a non-durable meter ⇒
+    /// 503, a malformed capsule ⇒ 400.
+    #[tokio::test]
+    async fn operator_provisions_a_durable_money_cap_that_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let meter_path = dir.path().join("spend_meter.json");
+        let mut state = test_state_with_durable_audit(dir.path());
+        let meter = std::sync::Arc::new(
+            elastos_runtime::primitives::spend::SpendMeter::open_durable(meter_path.clone())
+                .unwrap(),
+        );
+        let provider = std::sync::Arc::new(crate::intent_executor::MockPaymentProvider::default());
+        state.intent_executor = std::sync::Arc::new(
+            crate::intent_executor::MethodRegistryExecutor::production(
+                state.capability_manager.audit_log().clone(),
+                Some(dir.path().to_path_buf()),
+            )
+            .with_payments(meter.clone(), provider.clone()),
+        );
+        state.spend_meter = Some(meter.clone());
+
+        // The OPERATOR provisions the cap through the surface — the same Arc the pay gate debits.
+        let set = set_spend_budget(
+            State(state.clone()),
+            Json(SetSpendBudgetInput {
+                capsule: "vm-ap-agent".to_string(),
+                limit: 500,
+            }),
+        )
+        .await
+        .expect("provisioning a durable meter succeeds")
+        .0;
+        assert_eq!((set.limit, set.spent, set.remaining), (500, 0, 500));
+        // ... and the change is attested on the audit chain (ConfigChange, old → new).
+        let attested = state
+            .capability_manager
+            .audit_log()
+            .recent_events(16)
+            .into_iter()
+            .any(|e| matches!(
+                e,
+                elastos_runtime::primitives::audit::AuditEvent::ConfigChange {
+                    ref setting, ref old_value, ref new_value, ..
+                } if setting == "spend_budget:vm-ap-agent"
+                    && old_value == "unprovisioned" && new_value == "500"
+            ));
+        assert!(attested, "the budget change landed on the signed chain");
+
+        // The agent pays 200 under a bound mandate — the operator-set cap is what gets debited.
+        let payee_resource = format!("{}acme-vendor", crate::intent_executor::PAY_PREFIX);
+        let agent_sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let agent_pub = hex::encode(agent_sk.verifying_key().to_bytes());
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-ap-agent".to_string(),
+                resource: payee_resource.clone(),
+                action: "execute".to_string(),
+                methods: vec!["runtime.pay".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: Some(agent_pub),
+                dispatch_limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let intent = IntentDeclarationV1::issue(
+            &agent_sk, agent_sk.verifying_key().to_bytes(), "inv-1", "vm-ap-agent",
+            "runtime.pay", "200", &payee_resource, "execute", &out.token_id,
+        );
+        let r = dispatch_agent_intent(State(state.clone()), Json(intent))
+            .await
+            .expect("within cap")
+            .0;
+        assert_eq!(r.outcome, "performed");
+
+        // RESTART: reopen the meter from disk. The 200 spent is still spent — the cap did NOT
+        // refill (THE Sprint 27 council F1 property) — and the projection surface shows it.
+        let reopened = std::sync::Arc::new(
+            elastos_runtime::primitives::spend::SpendMeter::open_durable(meter_path).unwrap(),
+        );
+        let mut state2 = state.clone();
+        state2.spend_meter = Some(reopened.clone());
+        let snap = get_spend_budget(State(state2), Path("vm-ap-agent".to_string()))
+            .await
+            .expect("the reopened meter projects the surviving balance")
+            .0;
+        assert_eq!(
+            (snap.limit, snap.spent, snap.remaining),
+            (500, 200, 300),
+            "a restart preserves spent — the money cap never refills"
+        );
+        assert!(
+            matches!(
+                reopened.try_debit("vm-ap-agent", 400),
+                Err(elastos_runtime::primitives::spend::SpendError::Exhausted { .. })
+            ),
+            "an over-remaining spend is still refused across the restart"
+        );
+
+        // Fail-closed provisioning: no wired rail ⇒ 503 (a budget nothing enforces is refused).
+        let mut no_rail = state.clone();
+        no_rail.spend_meter = None;
+        let e = set_spend_budget(
+            State(no_rail),
+            Json(SetSpendBudgetInput { capsule: "vm-x".into(), limit: 1 }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
+        // A NON-durable meter ⇒ 503 (a money cap that refills on restart is refused).
+        let mut volatile = state.clone();
+        volatile.spend_meter = Some(std::sync::Arc::new(
+            elastos_runtime::primitives::spend::SpendMeter::new(),
+        ));
+        let e = set_spend_budget(
+            State(volatile),
+            Json(SetSpendBudgetInput { capsule: "vm-x".into(), limit: 1 }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
+        // A malformed capsule id ⇒ 400 (same slug bound as the executor's identities).
+        let e = set_spend_budget(
+            State(state.clone()),
+            Json(SetSpendBudgetInput { capsule: "not a slug!".into(), limit: 1 }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
     }
 
     /// Sprint 26 — AGENT-FACING dispatch: an agent acts under a mandate BOUND to its key with NO

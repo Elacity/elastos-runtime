@@ -1002,7 +1002,9 @@ pub(crate) async fn handle_request(
             if let Some(policy) = &bridge_ctx.spend_policy {
                 // Lazily provision the per-capsule default on first sight (idempotent — never resets
                 // an existing balance). default_budget == 0 ⇒ fail-closed-zero (every act refused).
-                policy
+                // In-memory meter: ensure never fails. If a durable meter's ensure DID fail, the
+                // key stays unprovisioned and the try_debit below refuses fail-closed (NoBudget).
+                let _ = policy
                     .meter
                     .ensure_budget(&bridge_ctx.capsule_id, policy.default_budget);
                 match policy
@@ -3529,6 +3531,7 @@ mod tests {
                 capability_manager.audit_log().clone(),
                 None,
             )),
+            spend_meter: None,
         };
 
         // ONE capsule session carrying its real identity (vm_id). Post-flip the mint
