@@ -18,6 +18,7 @@ pub async fn start_gateway_server(
     shared_audit_log: Option<Arc<elastos_runtime::primitives::audit::AuditLog>>,
     standing_service: Option<Arc<elastos_runtime::capability::intent::StandingGrantService>>,
     capability_manager: Option<Arc<elastos_runtime::capability::CapabilityManager>>,
+    pay_rail: Option<crate::api::server::PayRail>,
 ) -> anyhow::Result<()> {
     let data_dir_for_mandates = data_dir.clone();
     let state = GatewayState {
@@ -45,6 +46,10 @@ pub async fn start_gateway_server(
                 standing_service,
                 capability_manager,
                 data_dir: data_dir_for_mandates,
+                // The SAME meter+ledger Arcs the executor's pay gate enforces with (the stores'
+                // single-opener flocks forbid a second opener by construction). `None` ⇒ the
+                // Money panel routes answer 503, honestly unwired.
+                pay_rail,
             },
         ));
     }

@@ -63,7 +63,8 @@ where
         // Control-plane gateway keeps its own durable file sink (no shared infra log here).
         None,
         // The control-plane gateway serves infrastructure capsules, not the operator's mandate
-        // surface, so it carries no shared standing-grant registry / capability manager.
+        // surface, so it carries no shared standing-grant registry / capability manager / pay rail.
+        None,
         None,
         None,
     )

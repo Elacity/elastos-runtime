@@ -30,6 +30,9 @@ pub(crate) struct ServerInfrastructure {
     pub(crate) host_helpers: Vec<api::server::HostHelperProcess>,
     /// Per-act spend metering for the act-over-MCP path; `None` ⇒ unmetered (default).
     pub(crate) spend_policy: Option<elastos_server::carrier_bridge::SpendPolicy>,
+    /// The ONE payment rail for this process (meter+provider+ledger, single-opener flocked) —
+    /// shared by the API server's pay/provision/reconcile surfaces and the gateway's Money panel.
+    pub(crate) pay_rail: Option<api::server::PayRail>,
 }
 
 /// Opt-in durable, verified-on-open audit log (the EU AI Act custody mode). Unset → in-memory.
@@ -158,6 +161,10 @@ async fn setup_server_infrastructure_impl(
             .standing_grant_service_with_persistence(data_dir.join("standing_grants.json"))
             .map_err(|e| anyhow::anyhow!("mandate registry persistence unavailable: {e}"))?,
     );
+    // The ONE payment rail (Sprint 31): built here — like the mandate registry above — so the API
+    // server and the Home gateway's Money panel hold the SAME meter/ledger Arcs (the stores'
+    // single-opener flocks make independent opens impossible by design).
+    let pay_rail = api::server::build_pay_rail(Some(&data_dir));
     let pending_store = Arc::new(capability::pending::PendingRequestStore::new(
         audit_log.clone(),
     ));
@@ -1106,6 +1113,7 @@ async fn setup_server_infrastructure_impl(
         session_registry,
         capability_manager,
         standing_service,
+        pay_rail,
         pending_store,
         provider_registry,
         namespace_store,

@@ -292,6 +292,9 @@ pub struct Supervisor {
     /// mandates shell app reads the SAME registry the API server issues into. `None` ⇒
     /// the gateway serves no live mandate data.
     standing_service: Option<Arc<elastos_runtime::capability::intent::StandingGrantService>>,
+    /// The shared payment rail's meter+ledger, threaded to the serve gateway so the Mandates
+    /// app's Money panel projects the SAME stores the pay gate enforces. `None` ⇒ no Money panel.
+    pay_rail: Option<crate::api::server::PayRail>,
     /// Pending capability request store for shell-mediated approval.
     pending_store: Option<Arc<elastos_runtime::capability::pending::PendingRequestStore>>,
     /// Per-act spend policy for the microVM Carrier act path; `None` ⇒ unmetered.
@@ -560,6 +563,7 @@ impl Supervisor {
             provider_registry: None,
             capability_manager: None,
             standing_service: None,
+            pay_rail: None,
             pending_store: None,
             spend_policy: None,
             shared_audit_log: None,
@@ -617,6 +621,13 @@ impl Supervisor {
         standing_service: Arc<elastos_runtime::capability::intent::StandingGrantService>,
     ) {
         self.standing_service = Some(standing_service);
+    }
+
+    /// Attach the shared payment rail (meter+ledger) so the serve gateway's Money panel projects
+    /// the SAME stores the executor's pay gate enforces — never a second opener (the flocks would
+    /// refuse one anyway).
+    pub fn set_pay_rail(&mut self, pay_rail: crate::api::server::PayRail) {
+        self.pay_rail = Some(pay_rail);
     }
 
     /// Attach pending request store for shell-mediated capability approval.
@@ -1903,6 +1914,7 @@ impl Supervisor {
             // reads live data from the SAME registry the API server issues into.
             let standing_service = self.standing_service.clone();
             let capability_manager = self.capability_manager.clone();
+            let pay_rail = self.pay_rail.clone();
             async move {
                 if let Err(e) = crate::api::gateway::start_gateway_server(
                     &listen_addr,
@@ -1913,6 +1925,7 @@ impl Supervisor {
                     shared_audit_log,
                     standing_service,
                     capability_manager,
+                    pay_rail,
                 )
                 .await
                 {

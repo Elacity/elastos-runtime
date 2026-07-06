@@ -47,6 +47,9 @@ pub(crate) struct MandateApiState {
     pub(crate) capability_manager: Arc<CapabilityManager>,
     /// Home-launch-token trust root (the operator's 0600 files under the data dir).
     pub(crate) data_dir: PathBuf,
+    /// The SAME meter+ledger the executor's pay gate enforces with (Sprint 31) — the Money
+    /// panel's read/provision/reconcile surface. `None` ⇒ pay unwired ⇒ those routes answer 503.
+    pub(crate) pay_rail: Option<crate::api::server::PayRail>,
 }
 
 /// The mandates capsule id — must match `capsules/mandates/capsule.json`'s `name`.
@@ -227,6 +230,99 @@ async fn mandate_issue(
     }
 }
 
+/// GET /api/apps/mandates/money — the Money panel's one-call read (Sprint 31): every provisioned
+/// budget (with held-unconfirmed `pending_units` distinct from confirmed spend), the
+/// reconciliation work list, and the poisoned flag — a READ-ONLY projection of the same meter and
+/// ledger the pay gate enforces with (delegating to the shared
+/// [`money_overview`](crate::api::handlers::capability::money_overview), so the two surfaces can
+/// never drift). 503 when pay is unwired — absence reported, never an empty fabrication.
+async fn money_view(
+    State(state): State<MandateApiState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Err(err) = super::require_home_launch_token(&state.data_dir, &headers, MANDATES_CAPSULE_ID)
+    {
+        return mandate_auth_error(err);
+    }
+    let Some(rail) = &state.pay_rail else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no payment rail is wired".to_string(),
+        )
+            .into_response();
+    };
+    Json(crate::api::handlers::capability::money_overview(
+        &rail.meter,
+        &rail.ledger,
+    ))
+    .into_response()
+}
+
+/// POST /api/apps/mandates/spend-budget — provision (or re-set) a capsule's money cap from the
+/// shell app. Authority-granting like `issue`, gated the same way (home-launch token = the shell
+/// grant root, G-M3), and delegating to the ONE shared provisioning path
+/// ([`set_spend_budget_core`](crate::api::handlers::capability::set_spend_budget_core)) so every
+/// fail-closed guard (durable-only, slug bound, apply-then-attest with true rollback, loud double
+/// failure) holds identically on both surfaces.
+async fn money_set_budget(
+    State(state): State<MandateApiState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::api::handlers::capability::SetSpendBudgetInput>,
+) -> axum::response::Response {
+    if let Err(err) = super::require_home_launch_token(&state.data_dir, &headers, MANDATES_CAPSULE_ID)
+    {
+        return mandate_auth_error(err);
+    }
+    let Some(rail) = &state.pay_rail else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no payment rail is wired — a spend budget nothing enforces is refused".to_string(),
+        )
+            .into_response();
+    };
+    match crate::api::handlers::capability::set_spend_budget_core(
+        &rail.meter,
+        Some(&rail.ledger),
+        state.capability_manager.audit_log(),
+        body,
+    ) {
+        Ok(out) => Json(out).into_response(),
+        Err((status, msg)) => (status, msg).into_response(),
+    }
+}
+
+/// POST /api/apps/mandates/payments/reconcile — resolve ONE indeterminate payment against the
+/// rail's verdict, from the shell app. Delegates to the ONE shared reconciliation path
+/// ([`reconcile_payment_core`](crate::api::handlers::capability::reconcile_payment_core)):
+/// exactly-once resolve, refund only on durable Ok, structured 404/409/503, chain attestation —
+/// identical on both surfaces by construction.
+async fn money_reconcile(
+    State(state): State<MandateApiState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::api::handlers::capability::ReconcilePaymentInput>,
+) -> axum::response::Response {
+    if let Err(err) = super::require_home_launch_token(&state.data_dir, &headers, MANDATES_CAPSULE_ID)
+    {
+        return mandate_auth_error(err);
+    }
+    let Some(rail) = &state.pay_rail else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no payment rail is wired".to_string(),
+        )
+            .into_response();
+    };
+    match crate::api::handlers::capability::reconcile_payment_core(
+        &rail.ledger,
+        &rail.meter,
+        state.capability_manager.audit_log(),
+        body,
+    ) {
+        Ok(out) => Json(out).into_response(),
+        Err((status, msg)) => (status, msg).into_response(),
+    }
+}
+
 /// A failed home-token gate reads as `401` — the app was not launched through the shell.
 fn mandate_auth_error(err: anyhow::Error) -> axum::response::Response {
     (StatusCode::UNAUTHORIZED, err.to_string()).into_response()
@@ -249,6 +345,14 @@ pub(crate) fn mandate_router(state: MandateApiState) -> Router {
         .route(
             "/api/apps/mandates/standing-grants/issue",
             post(mandate_issue),
+        )
+        // The Money panel (Sprint 31): read the budgets+work-list projection, provision a cap,
+        // resolve an indeterminate payment — all over the same home-launch-token gate.
+        .route("/api/apps/mandates/money", get(money_view))
+        .route("/api/apps/mandates/spend-budget", post(money_set_budget))
+        .route(
+            "/api/apps/mandates/payments/reconcile",
+            post(money_reconcile),
         )
         .with_state(state)
 }
@@ -284,6 +388,7 @@ mod tests {
             standing_service,
             capability_manager,
             data_dir: dir.to_path_buf(),
+            pay_rail: None,
         }
     }
 
@@ -753,6 +858,149 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The Money panel routes are fail-closed twice over (Sprint 31): no home-launch token ⇒ 401
+    /// (nothing leaks, nothing provisions); with a token but NO wired rail ⇒ 503 (absence
+    /// reported, never an empty fabrication).
+    #[tokio::test]
+    async fn money_routes_are_gated_and_honest_about_an_unwired_rail() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_for(dir.path()); // pay_rail: None
+        let app = mandate_router(state);
+        // No token ⇒ 401 on all three.
+        for (method, uri, body) in [
+            ("GET", "/api/apps/mandates/money", String::new()),
+            ("POST", "/api/apps/mandates/spend-budget", r#"{"capsule":"vm-a","limit":5}"#.into()),
+            (
+                "POST",
+                "/api/apps/mandates/payments/reconcile",
+                r#"{"idempotency_key":"flint-x","charged":false}"#.into(),
+            ),
+        ] {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {uri}");
+        }
+        // Token but unwired rail ⇒ 503.
+        let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mandates/money")
+                    .header(HOME_TOKEN_HEADER, token_hdr)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// End-to-end over the SHELL surface: provision a durable cap, see it (with pending
+    /// visibility) on the money view, and resolve an indeterminate payment not-charged — the
+    /// refund lands on the SAME meter the pay gate enforces with, exactly once.
+    #[tokio::test]
+    async fn money_panel_provisions_and_reconciles_over_the_shared_rail() {
+        let dir = tempfile::tempdir().unwrap();
+        let (capability_manager, standing_service) = manager_and_service();
+        let meter = Arc::new(
+            elastos_runtime::primitives::spend::SpendMeter::open_durable(
+                dir.path().join("spend_meter.json"),
+            )
+            .unwrap(),
+        );
+        let ledger = Arc::new(
+            crate::payment_ledger::PaymentLedger::open_durable(
+                dir.path().join("payment_ledger.json"),
+            )
+            .unwrap(),
+        );
+        let state = MandateApiState {
+            standing_service,
+            capability_manager,
+            data_dir: dir.path().to_path_buf(),
+            pay_rail: Some(crate::api::server::PayRail {
+                meter: meter.clone(),
+                provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
+                ledger: ledger.clone(),
+            }),
+        };
+        let app = mandate_router(state);
+        let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+
+        // Provision via the shell surface — the shared core applies + attests.
+        let resp = post_json(
+            app.clone(),
+            "/api/apps/mandates/spend-budget",
+            Some(token_hdr.clone()),
+            r#"{"capsule":"vm-ap-agent","limit":500}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(meter.remaining("vm-ap-agent"), 500, "the ENFORCING meter holds the cap");
+
+        // An indeterminate payment holds 200 and files a pending obligation (as the pay path
+        // would): reserve on the meter + record on the ledger.
+        meter.try_debit("vm-ap-agent", 200).unwrap();
+        assert!(ledger.record(
+            "flint-abc",
+            "vm-ap-agent",
+            "acme-vendor",
+            200,
+            crate::payment_ledger::PaymentStatus::Pending,
+            "timeout"
+        ));
+
+        // The money view projects both: the budget with pending visibility + the work list.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mandates/money")
+                    .header(HOME_TOKEN_HEADER, token_hdr.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let budget = &json["budgets"][0];
+        assert_eq!(budget["capsule"], "vm-ap-agent");
+        assert_eq!(budget["remaining"], 300);
+        assert_eq!(budget["pending_units"], 200, "held-unconfirmed is distinct");
+        assert_eq!(json["pending"][0]["idempotency_key"], "flint-abc");
+
+        // Reconcile not-charged over the shell surface: refund exactly once, 409 on retry.
+        let resp = post_json(
+            app.clone(),
+            "/api/apps/mandates/payments/reconcile",
+            Some(token_hdr.clone()),
+            r#"{"idempotency_key":"flint-abc","charged":false}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(out["refunded"], true);
+        assert_eq!(meter.remaining("vm-ap-agent"), 500, "the refund landed on the shared meter");
+        let retry = post_json(
+            app,
+            "/api/apps/mandates/payments/reconcile",
+            Some(token_hdr),
+            r#"{"idempotency_key":"flint-abc","charged":false}"#,
+        )
+        .await;
+        assert_eq!(retry.status(), StatusCode::CONFLICT, "resolves exactly once");
+        assert_eq!(meter.remaining("vm-ap-agent"), 500, "no double refund");
     }
 
     /// Honest absence: a well-formed token with no durable records ⇒ 404, never a fabricated receipt.

@@ -108,6 +108,172 @@ pub struct ServerConfig {
     pub attach_secret: Option<String>,
     /// Operator-approved host helpers that must live as long as this API server.
     pub host_helpers: Vec<HostHelperProcess>,
+    /// The wired payment rail (ONE meter+provider+ledger trio for the whole process — see
+    /// [`PayRail`]), built by [`build_pay_rail`] in the infrastructure layer so the gateway's
+    /// Mandates-app Money panel shares the SAME Arcs. `None` ⇒ pay honestly unwired.
+    pub pay_rail: Option<PayRail>,
+}
+
+/// The wired payment rail: ONE meter + provider + ledger trio shared by the executor's pay gate,
+/// the API server's provisioning/reconciliation surface, and the gateway's Mandates-app Money
+/// panel — the same-Arc rule that keeps enforcement and every projection from ever disagreeing.
+/// Built once per process by [`build_pay_rail`] (the meter and ledger hold single-opener flocks,
+/// so a second build in the same data_dir would refuse).
+#[derive(Clone)]
+pub struct PayRail {
+    pub meter: Arc<elastos_runtime::primitives::spend::SpendMeter>,
+    pub provider: Arc<dyn crate::intent_executor::PaymentProvider>,
+    pub ledger: Arc<crate::payment_ledger::PaymentLedger>,
+}
+
+/// Rail selection, fail-closed (Sprint 29/31; see the serve() doc block for the full rules):
+/// `ELASTOS_PAYMENT_ENDPOINT` (validated: https or loopback-http, well-formed) wires the REAL
+/// `HttpPaymentProvider` and REQUIRES the durable meter+ledger; else `ELASTOS_ALLOW_MOCK_PAYMENTS`
+/// wires the Mock (dev/demo; in-memory stores only in the bare no-data_dir shape); else `None` —
+/// pay honestly unwired.
+pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
+    let real_endpoint = std::env::var("ELASTOS_PAYMENT_ENDPOINT").ok();
+    let mock_allowed = std::env::var("ELASTOS_ALLOW_MOCK_PAYMENTS").is_ok();
+    let open_durable_meter = || match data_dir {
+        Some(dir) => match elastos_runtime::primitives::spend::SpendMeter::open_durable(
+            dir.join("spend_meter.json"),
+        ) {
+            Ok(m) => Some(Arc::new(m)),
+            Err(e) => {
+                tracing::error!(
+                    "spend meter snapshot could not be opened ({e}) — runtime.pay stays UNWIRED \
+                     (fail-closed) rather than booting over a possibly-refilled or contended \
+                     money cap"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let open_ledger = || match data_dir {
+        Some(dir) => match crate::payment_ledger::PaymentLedger::open_durable(
+            dir.join("payment_ledger.json"),
+        ) {
+            Ok(l) => Some(Arc::new(l)),
+            Err(e) => {
+                tracing::error!(
+                    "payment ledger could not be opened ({e}) — runtime.pay stays UNWIRED (a \
+                     lost pending set would orphan reconciliation obligations)"
+                );
+                None
+            }
+        },
+        None => Some(Arc::new(crate::payment_ledger::PaymentLedger::new())),
+    };
+    if let Some(endpoint) = real_endpoint {
+        if mock_allowed {
+            tracing::warn!(
+                "both ELASTOS_PAYMENT_ENDPOINT and ELASTOS_ALLOW_MOCK_PAYMENTS are set — the \
+                 REAL rail wins; the mock is ignored"
+            );
+        }
+        // Endpoint validation, fail-closed (council S29 red-team F1 / guardian F3-F4): a money
+        // order + bearer token must never transit plaintext, and a malformed value must refuse at
+        // BOOT (a builder error at pay time would strand reservations). https is REQUIRED;
+        // plaintext http is allowed ONLY to loopback (a same-box sidecar adapter — inside the
+        // host trust boundary).
+        let endpoint_ok = match url::Url::parse(&endpoint) {
+            Ok(u) => match u.scheme() {
+                "https" => true,
+                "http" => {
+                    let loopback = matches!(
+                        u.host(),
+                        Some(url::Host::Ipv4(ip)) if ip.is_loopback()
+                    ) || matches!(
+                        u.host(),
+                        Some(url::Host::Ipv6(ip)) if ip.is_loopback()
+                    ) || matches!(u.host_str(), Some("localhost"));
+                    if !loopback {
+                        tracing::error!(
+                            "ELASTOS_PAYMENT_ENDPOINT is plaintext http to a non-loopback host — \
+                             payment orders and the bearer token would transit cleartext (MITM \
+                             could forge Performed receipts); runtime.pay stays UNWIRED. Use https."
+                        );
+                    }
+                    loopback
+                }
+                other => {
+                    tracing::error!(
+                        "ELASTOS_PAYMENT_ENDPOINT has unsupported scheme {other:?} — runtime.pay \
+                         stays UNWIRED"
+                    );
+                    false
+                }
+            },
+            Err(e) => {
+                tracing::error!(
+                    "ELASTOS_PAYMENT_ENDPOINT is not a valid URL ({e}) — runtime.pay stays UNWIRED"
+                );
+                false
+            }
+        };
+        let token = std::env::var("ELASTOS_PAYMENT_TOKEN").ok();
+        if endpoint_ok && token.is_none() {
+            tracing::warn!(
+                "the REAL payment rail is wired WITHOUT a bearer token (ELASTOS_PAYMENT_TOKEN \
+                 unset) — the endpoint must authenticate callers some other way"
+            );
+        }
+        return match (endpoint_ok, open_durable_meter(), open_ledger()) {
+            (true, Some(meter), Some(ledger)) => {
+                tracing::info!(
+                    "runtime.pay is wired to the REAL payment rail at {endpoint} (durable spend \
+                     meter; provision caps at POST /api/spend-budgets)"
+                );
+                Some(PayRail {
+                    meter,
+                    provider: Arc::new(crate::intent_executor::HttpPaymentProvider::new(
+                        endpoint, token,
+                    )),
+                    ledger,
+                })
+            }
+            (true, _, _) => {
+                tracing::error!(
+                    "ELASTOS_PAYMENT_ENDPOINT is set but the DURABLE spend meter/ledger is \
+                     unavailable — real money on non-durable stores is refused; runtime.pay \
+                     stays UNWIRED"
+                );
+                None
+            }
+            (false, _, _) => None,
+        };
+    }
+    if mock_allowed {
+        // With a data_dir, the durable stores are used (an unopenable snapshot leaves pay
+        // UNWIRED — never a silent fall-through to fresh in-memory caps); only the bare
+        // no-data_dir test/embedded shape gets in-memory stores.
+        let stores = match data_dir {
+            Some(_) => open_durable_meter().zip(open_ledger()),
+            None => {
+                tracing::warn!(
+                    "no data_dir — runtime.pay gets an IN-MEMORY spend meter (test/embedded \
+                     only); the provisioning surface will refuse money caps on it"
+                );
+                Some((
+                    Arc::new(elastos_runtime::primitives::spend::SpendMeter::new()),
+                    Arc::new(crate::payment_ledger::PaymentLedger::new()),
+                ))
+            }
+        };
+        return stores.map(|(meter, ledger)| {
+            tracing::warn!(
+                "runtime.pay is wired to the MOCK payment rail (ELASTOS_ALLOW_MOCK_PAYMENTS) — \
+                 receipts attest SIMULATED payments; DEV/DEMO ONLY, never production"
+            );
+            PayRail {
+                meter,
+                provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
+                ledger,
+            }
+        });
+    }
+    None
 }
 
 pub struct HostHelperProcess {
@@ -152,6 +318,7 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         ready_tx,
         attach_secret,
         host_helpers,
+        pay_rail,
     } = config;
     let _host_helpers = host_helpers;
     // CORS: allow localhost origins for browser-based capsule UIs and
@@ -196,10 +363,6 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         )),
     };
 
-    // Set inside the intent_executor block below (field-init order: executor first), then shared
-    // with the provisioning surface via `spend_meter` — the SAME Arc, one source of truth.
-    let mut pay_meter: Option<Arc<elastos_runtime::primitives::spend::SpendMeter>> = None;
-    let mut pay_ledger: Option<Arc<crate::payment_ledger::PaymentLedger>> = None;
     let capability_state = CapabilityState {
         pending_store: pending_store.clone(),
         capability_manager: capability_manager.clone(),
@@ -239,178 +402,17 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
                 capability_manager.audit_log().clone(),
                 data_dir.clone(),
             );
-            let real_endpoint = std::env::var("ELASTOS_PAYMENT_ENDPOINT").ok();
-            let mock_allowed = std::env::var("ELASTOS_ALLOW_MOCK_PAYMENTS").is_ok();
-            let open_durable_meter = || match &data_dir {
-                Some(dir) => match elastos_runtime::primitives::spend::SpendMeter::open_durable(
-                    dir.join("spend_meter.json"),
-                ) {
-                    Ok(m) => Some(Arc::new(m)),
-                    Err(e) => {
-                        tracing::error!(
-                            "spend meter snapshot could not be opened ({e}) — runtime.pay stays \
-                             UNWIRED (fail-closed) rather than booting over a possibly-refilled \
-                             or contended money cap"
-                        );
-                        None
-                    }
-                },
-                None => None,
-            };
-            let rail: Option<(
-                Arc<elastos_runtime::primitives::spend::SpendMeter>,
-                Arc<dyn crate::intent_executor::PaymentProvider>,
-            )> = if let Some(endpoint) = real_endpoint {
-                if mock_allowed {
-                    tracing::warn!(
-                        "both ELASTOS_PAYMENT_ENDPOINT and ELASTOS_ALLOW_MOCK_PAYMENTS are set — \
-                         the REAL rail wins; the mock is ignored"
-                    );
-                }
-                // Endpoint validation, fail-closed (council S29 red-team F1 / guardian F3-F4): a
-                // money order + bearer token must never transit plaintext, and a malformed value
-                // must refuse at BOOT (a builder error at pay time would strand reservations).
-                // https is REQUIRED; plaintext http is allowed ONLY to loopback (a same-box
-                // sidecar adapter — inside the host trust boundary).
-                let endpoint_ok = match url::Url::parse(&endpoint) {
-                    Ok(u) => match u.scheme() {
-                        "https" => true,
-                        "http" => {
-                            let loopback = matches!(
-                                u.host(),
-                                Some(url::Host::Ipv4(ip)) if ip.is_loopback()
-                            ) || matches!(
-                                u.host(),
-                                Some(url::Host::Ipv6(ip)) if ip.is_loopback()
-                            ) || matches!(u.host_str(), Some("localhost"));
-                            if !loopback {
-                                tracing::error!(
-                                    "ELASTOS_PAYMENT_ENDPOINT is plaintext http to a non-loopback \
-                                     host — payment orders and the bearer token would transit \
-                                     cleartext (MITM could forge Performed receipts); runtime.pay \
-                                     stays UNWIRED. Use https."
-                                );
-                            }
-                            loopback
-                        }
-                        other => {
-                            tracing::error!(
-                                "ELASTOS_PAYMENT_ENDPOINT has unsupported scheme {other:?} — \
-                                 runtime.pay stays UNWIRED"
-                            );
-                            false
-                        }
-                    },
-                    Err(e) => {
-                        tracing::error!(
-                            "ELASTOS_PAYMENT_ENDPOINT is not a valid URL ({e}) — runtime.pay \
-                             stays UNWIRED"
-                        );
-                        false
-                    }
-                };
-                let token = std::env::var("ELASTOS_PAYMENT_TOKEN").ok();
-                if endpoint_ok && token.is_none() {
-                    tracing::warn!(
-                        "the REAL payment rail is wired WITHOUT a bearer token \
-                         (ELASTOS_PAYMENT_TOKEN unset) — the endpoint must authenticate callers \
-                         some other way"
-                    );
-                }
-                match (endpoint_ok, open_durable_meter()) {
-                    (true, Some(m)) => {
-                        tracing::info!(
-                            "runtime.pay is wired to the REAL payment rail at {endpoint} \
-                             (durable spend meter; provision caps at POST /api/spend-budgets)"
-                        );
-                        Some((
-                            m,
-                            Arc::new(crate::intent_executor::HttpPaymentProvider::new(
-                                endpoint, token,
-                            )),
-                        ))
-                    }
-                    (true, None) => {
-                        tracing::error!(
-                            "ELASTOS_PAYMENT_ENDPOINT is set but no DURABLE spend meter is \
-                             available — real money on a non-durable cap is refused; runtime.pay \
-                             stays UNWIRED"
-                        );
-                        None
-                    }
-                    (false, _) => None,
-                }
-            } else if mock_allowed {
-                // With a data_dir, the durable meter is used (an unopenable snapshot leaves pay
-                // UNWIRED — never a silent fall-through to a fresh in-memory cap); only the bare
-                // no-data_dir test/embedded shape gets the in-memory meter.
-                let meter = match &data_dir {
-                    Some(_) => open_durable_meter(),
-                    None => {
-                        tracing::warn!(
-                            "no data_dir — runtime.pay gets an IN-MEMORY spend meter \
-                             (test/embedded only); the provisioning surface will refuse money \
-                             caps on it"
-                        );
-                        Some(Arc::new(
-                            elastos_runtime::primitives::spend::SpendMeter::new(),
-                        ))
-                    }
-                };
-                meter.map(|m| {
-                    tracing::warn!(
-                        "runtime.pay is wired to the MOCK payment rail \
-                         (ELASTOS_ALLOW_MOCK_PAYMENTS) — receipts attest SIMULATED payments; \
-                         DEV/DEMO ONLY, never production"
-                    );
-                    (
-                        m,
-                        Arc::new(crate::intent_executor::MockPaymentProvider::default())
-                            as Arc<dyn crate::intent_executor::PaymentProvider>,
-                    )
-                })
-            } else {
-                None
-            };
-            match rail {
-                Some((meter, provider)) => {
-                    // The payment LEDGER (Sprint 30) — durable custody of every rail attempt and
-                    // the reconciliation work list for indeterminate outcomes. Same fail-closed
-                    // wiring rule as the meter: with a data_dir, an unopenable ledger leaves pay
-                    // UNWIRED (a lost pending set orphans reconciliation obligations); the bare
-                    // no-data_dir test shape gets an in-memory ledger.
-                    let ledger = match &data_dir {
-                        Some(dir) => {
-                            match crate::payment_ledger::PaymentLedger::open_durable(
-                                dir.join("payment_ledger.json"),
-                            ) {
-                                Ok(l) => Some(Arc::new(l)),
-                                Err(e) => {
-                                    tracing::error!(
-                                        "payment ledger could not be opened ({e}) — runtime.pay \
-                                         stays UNWIRED (a lost pending set would orphan \
-                                         reconciliation obligations)"
-                                    );
-                                    None
-                                }
-                            }
-                        }
-                        None => Some(Arc::new(crate::payment_ledger::PaymentLedger::new())),
-                    };
-                    match ledger {
-                        Some(l) => {
-                            pay_meter = Some(meter.clone());
-                            pay_ledger = Some(l.clone());
-                            Arc::new(base.with_payments(meter, provider, l))
-                        }
-                        None => Arc::new(base),
-                    }
-                }
+            match &pay_rail {
+                Some(rail) => Arc::new(base.with_payments(
+                    rail.meter.clone(),
+                    rail.provider.clone(),
+                    rail.ledger.clone(),
+                )),
                 None => Arc::new(base),
             }
         },
-        spend_meter: pay_meter.clone(),
-        payment_ledger: pay_ledger.clone(),
+        spend_meter: pay_rail.as_ref().map(|r| r.meter.clone()),
+        payment_ledger: pay_rail.as_ref().map(|r| r.ledger.clone()),
     };
     let capsule_audit_log = audit_log
         .clone()

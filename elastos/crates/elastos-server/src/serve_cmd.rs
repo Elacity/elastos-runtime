@@ -262,6 +262,7 @@ pub async fn run_serve(
                                 ready_tx: None,
                                 attach_secret: None,
                                 host_helpers,
+                                pay_rail: infra.pay_rail.clone(),
                             },
                         )
                         .await
@@ -448,6 +449,9 @@ pub async fn run_serve(
             // Share the SAME standing-grant registry the API server issues into, so the mandates
             // shell app served by this gateway reads live mandate data (Sprint 12).
             s.set_standing_service(infra.standing_service.clone());
+            if let Some(rail) = infra.pay_rail.clone() {
+                s.set_pay_rail(rail);
+            }
             s.set_pending_store(infra.pending_store.clone());
             s.set_spend_policy(infra.spend_policy.clone());
             // Unify the serve gateway's audit sink onto the shared runtime custody chain
@@ -547,6 +551,7 @@ pub async fn run_serve(
             ready_tx: None,
             attach_secret: Some(attach_secret),
             host_helpers: infra.host_helpers,
+            pay_rail: infra.pay_rail.clone(),
         },
     )
     .await?;

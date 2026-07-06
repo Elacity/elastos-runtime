@@ -1452,6 +1452,25 @@ pub async fn set_spend_budget(
             "no payment rail is wired — a spend budget nothing enforces is refused".to_string(),
         ));
     };
+    set_spend_budget_core(
+        meter,
+        state.payment_ledger.as_deref(),
+        state.capability_manager.audit_log(),
+        input,
+    )
+    .map(Json)
+}
+
+/// The ONE shared provisioning path (Sprint 31): the API server's shell route and the gateway's
+/// Mandates-app route both delegate here, so the fail-closed guards (durable-only, slug bound,
+/// apply-then-attest with true rollback, loud double-failure) can never drift between surfaces —
+/// the same one-source-of-truth rule as `issue_mandate`/`revoke_mandate`.
+pub fn set_spend_budget_core(
+    meter: &elastos_runtime::primitives::spend::SpendMeter,
+    ledger: Option<&crate::payment_ledger::PaymentLedger>,
+    audit_log: &elastos_runtime::primitives::audit::AuditLog,
+    input: SetSpendBudgetInput,
+) -> Result<SpendBudgetOutput, (StatusCode, String)> {
     if !meter.is_durable() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1483,7 +1502,7 @@ pub async fn set_spend_budget(
             .unwrap_or_else(|| "unprovisioned".to_string()),
         new_value: input.limit.to_string(),
     };
-    if let Err(e) = state.capability_manager.audit_log().emit(config_change()) {
+    if let Err(e) = audit_log.emit(config_change()) {
         // No unattested cap stays in force: restore the prior limit, or fully REMOVE a first-time
         // provision (never a provisioned-at-zero artifact the chain never granted — F7).
         let rollback = match prior_limit {
@@ -1501,10 +1520,7 @@ pub async fn set_spend_budget(
                 "spend budget applied but NOT attested, and the rollback could not persist \
                  ({rb}) — an unattested money cap may be in force; operator intervention required"
             );
-            state
-                .capability_manager
-                .audit_log()
-                .emit_best_effort(config_change());
+            audit_log.emit_best_effort(config_change());
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!(
@@ -1523,12 +1539,9 @@ pub async fn set_spend_budget(
         StatusCode::INTERNAL_SERVER_ERROR,
         "budget vanished after set".to_string(),
     ))?;
-    let (pending_units, pending_count) = state
-        .payment_ledger
-        .as_ref()
-        .map(|l| l.pending_for(&input.capsule))
-        .unwrap_or((0, 0));
-    Ok(Json(SpendBudgetOutput {
+    let (pending_units, pending_count) =
+        ledger.map(|l| l.pending_for(&input.capsule)).unwrap_or((0, 0));
+    Ok(SpendBudgetOutput {
         capsule: input.capsule,
         limit: snap.limit,
         spent: snap.spent,
@@ -1536,7 +1549,7 @@ pub async fn set_spend_budget(
         poisoned: meter.is_poisoned(),
         pending_units,
         pending_count: pending_count as u64,
-    }))
+    })
 }
 
 /// GET /api/spend-budgets/:capsule  (shell-only) — the read-only projection of one capsule's money
@@ -1647,6 +1660,18 @@ pub async fn reconcile_payment(
             "no payment rail is wired".to_string(),
         ));
     };
+    reconcile_payment_core(ledger, meter, state.capability_manager.audit_log(), input).map(Json)
+}
+
+/// The ONE shared reconciliation path (Sprint 31): both surfaces (API shell route, gateway
+/// Mandates-app route) delegate here so the exactly-once resolve, honest refund claim, structured
+/// error mapping, and chain attestation can never drift.
+pub fn reconcile_payment_core(
+    ledger: &crate::payment_ledger::PaymentLedger,
+    meter: &elastos_runtime::primitives::spend::SpendMeter,
+    audit_log: &elastos_runtime::primitives::audit::AuditLog,
+    input: ReconcilePaymentInput,
+) -> Result<ReconcilePaymentOutput, (StatusCode, String)> {
     let record = ledger
         .resolve(&input.idempotency_key, input.charged)
         .map_err(|e| {
@@ -1677,7 +1702,7 @@ pub async fn reconcile_payment(
             }
         }
     };
-    let attested = state.capability_manager.audit_log().emit(
+    let attested = audit_log.emit(
         elastos_runtime::primitives::audit::AuditEvent::Custom {
             event_type: "payment_reconciled".to_string(),
             details: serde_json::json!({
@@ -1704,14 +1729,52 @@ pub async fn reconcile_payment(
             None => note,
         });
     }
-    Ok(Json(ReconcilePaymentOutput {
+    Ok(ReconcilePaymentOutput {
         idempotency_key: record.idempotency_key,
         capsule: record.capsule,
         amount: record.amount,
         status: format!("{:?}", record.status),
         refunded,
         warning,
-    }))
+    })
+}
+
+/// The Money panel's one-call read (Sprint 31): every provisioned budget (with pending
+/// visibility) + the reconciliation work list + the poisoned flag — a read-only projection of the
+/// enforcing meter and ledger, shared by both surfaces.
+#[derive(Debug, Serialize)]
+pub struct MoneyOverview {
+    pub budgets: Vec<SpendBudgetOutput>,
+    pub pending: Vec<crate::payment_ledger::PaymentRecord>,
+    pub poisoned: bool,
+}
+
+pub fn money_overview(
+    meter: &elastos_runtime::primitives::spend::SpendMeter,
+    ledger: &crate::payment_ledger::PaymentLedger,
+) -> MoneyOverview {
+    let poisoned = meter.is_poisoned();
+    let budgets = meter
+        .snapshot_all()
+        .into_iter()
+        .map(|(capsule, snap)| {
+            let (pending_units, pending_count) = ledger.pending_for(&capsule);
+            SpendBudgetOutput {
+                capsule,
+                limit: snap.limit,
+                spent: snap.spent,
+                remaining: snap.remaining,
+                poisoned,
+                pending_units,
+                pending_count: pending_count as u64,
+            }
+        })
+        .collect();
+    MoneyOverview {
+        budgets,
+        pending: ledger.pending(),
+        poisoned,
+    }
 }
 
 #[derive(Debug, Serialize)]

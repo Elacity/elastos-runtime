@@ -1869,6 +1869,7 @@ async fn serve_web_capsule(
         ready_tx: None,
         attach_secret: None,
         host_helpers: infra.host_helpers,
+        pay_rail: infra.pay_rail.clone(),
     })
     .await;
 

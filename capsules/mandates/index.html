@@ -292,6 +292,51 @@
     <div class="stateempty" id="stateempty" hidden>No agent has written state yet.</div>
   </div>
 
+  <div class="sectlabel" id="moneylabel" hidden>
+    <h2>Money</h2>
+    <span class="hint">spend caps and payments under pay-mandates — every number is the enforcing meter and ledger, read-only</span>
+  </div>
+  <div class="statewrap" id="moneywrap" hidden>
+    <div class="stateempty" id="moneypoisoned" hidden style="color:var(--bad,#c2402f);font-weight:600">
+      The spend meter is POISONED (a persist failed after publish): every payment and provisioning
+      change is refusing fail-closed. Recovery: restart the runtime process.
+    </div>
+    <table class="statetable">
+      <thead>
+        <tr><th>Agent (capsule)</th><th>Cap</th><th>Spent</th><th>Remaining</th><th>Held (unconfirmed)</th></tr>
+      </thead>
+      <tbody id="moneybody"></tbody>
+    </table>
+    <div class="stateempty" id="moneyempty" hidden>No spend budgets provisioned.</div>
+    <div class="grow" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;padding:12px 14px;border-top:1px solid var(--line)">
+      <label style="font-size:12px">Capsule
+        <input id="m-capsule" type="text" class="gmono" placeholder="vm-ap-agent" spellcheck="false" style="display:block"></label>
+      <label style="font-size:12px">Cap (units)
+        <input id="m-limit" type="number" min="0" placeholder="500" style="display:block;width:110px"></label>
+      <button class="grantbtn" id="m-set" type="button">Set cap</button>
+      <span class="gnote" id="m-note"></span>
+    </div>
+    <div class="stateempty" id="m-raisewarn" hidden style="color:var(--warn,#a06a00)">
+      Payments below are held-unconfirmed: reconcile them against the rail FIRST — raising the cap
+      before reconciling can authorize real spend beyond your intent.
+    </div>
+  </div>
+
+  <div class="sectlabel" id="pendlabel" hidden>
+    <h2>Pending payments</h2>
+    <span class="hint">indeterminate rail outcomes — look each key up on your payment rail, then record the rail's verdict; each resolves exactly once</span>
+  </div>
+  <div class="statewrap" id="pendwrap" hidden>
+    <table class="statetable">
+      <thead>
+        <tr><th>Idempotency key</th><th>Agent</th><th>Payee</th><th>Amount</th><th>Rail note</th><th>Rail verdict</th></tr>
+      </thead>
+      <tbody id="pendbody"></tbody>
+    </table>
+    <div class="stateempty" id="pendempty" hidden>No payments awaiting reconciliation.</div>
+    <div class="stateempty" id="pendnote" hidden></div>
+  </div>
+
   <footer>
     A mandate is a scoped, expiring, revocable grant to one agent key. Its receipt is a portable,
     set-bound bundle anyone can verify off-box — no runtime, no trust in this box.
@@ -608,6 +653,7 @@
       .then(function(j){ paint({mandates:j.mandates||[], signer_public_key_hex:j.signer_public_key_hex}, false); })
       .catch(function(err){ showUnreachable("Could not load mandates from the runtime ("+esc(String(err&&err.message||err))+").");});
     loadAgentState();
+    loadMoney();
   }
 
   // Operator's view of durable agent state (Sprint 18) — in-shell only, read-only. Every cell is
@@ -646,6 +692,123 @@
       cell(tr, shortId(String(e.grant_id||"")), "kmono");
       cell(tr, fmtWhen(e.written_at));
       tbody.appendChild(tr);
+    });
+  }
+
+  // The Money panel (Sprint 31) — in-shell only. EVERY value cell is set via textContent (never
+  // innerHTML): the rail note is rail-controlled bytes (printable ASCII but NOT HTML-escaped by
+  // the server — escaping at render is THIS surface's stated obligation, council S30 G-F8), and
+  // capsule/payee, while server-validated slugs, get the same discipline. A 503 (pay unwired)
+  // hides the panel — absence, never a mock.
+  function loadMoney(){
+    if (!IN_SHELL) return;
+    fetch("/api/apps/mandates/money", {headers:launchHeaders()})
+      .then(function(r){ if(!r.ok) throw new Error("http "+r.status); return r.json(); })
+      .then(function(j){ renderMoney(j); })
+      .catch(function(){
+        $("#moneylabel").hidden = true; $("#moneywrap").hidden = true;
+        $("#pendlabel").hidden = true; $("#pendwrap").hidden = true;
+      });
+  }
+  function renderMoney(j){
+    var budgets = Array.isArray(j.budgets) ? j.budgets : [];
+    var pending = Array.isArray(j.pending) ? j.pending : [];
+    $("#moneylabel").hidden = false; $("#moneywrap").hidden = false;
+    $("#moneypoisoned").hidden = !j.poisoned;
+    var mb = $("#moneybody"); mb.innerHTML = "";
+    $("#moneyempty").hidden = budgets.length > 0;
+    var anyPending = false;
+    budgets.forEach(function(b){
+      var tr = document.createElement("tr");
+      cell(tr, String(b.capsule||""), "kmono");
+      cell(tr, String(b.limit));
+      cell(tr, String(b.spent));
+      cell(tr, String(b.remaining));
+      cell(tr, b.pending_units > 0 ? (String(b.pending_units)+" ("+String(b.pending_count)+" payment"+(b.pending_count===1?"":"s")+")") : "—",
+        b.pending_units > 0 ? "vmono" : "");
+      if (b.pending_units > 0) anyPending = true;
+      mb.appendChild(tr);
+    });
+    $("#m-raisewarn").hidden = !anyPending;
+    $("#pendlabel").hidden = pending.length === 0;
+    $("#pendwrap").hidden = pending.length === 0;
+    var pb = $("#pendbody"); pb.innerHTML = "";
+    $("#pendempty").hidden = pending.length > 0;
+    pending.forEach(function(rec){
+      var tr = document.createElement("tr");
+      // The FULL key, selectable, so the operator can copy it for the rail lookup.
+      var kd = document.createElement("td"); kd.className = "kmono";
+      kd.style.userSelect = "all"; kd.textContent = String(rec.idempotency_key||"");
+      tr.appendChild(kd);
+      cell(tr, String(rec.capsule||""), "kmono");
+      cell(tr, String(rec.payee||""), "kmono");
+      cell(tr, String(rec.amount));
+      cell(tr, String(rec.rail_note||"") || "—", "vmono"); // textContent = escaped at render
+      var act = document.createElement("td");
+      [["charged", true], ["not charged", false]].forEach(function(pair){
+        var btn = document.createElement("button");
+        btn.type = "button"; btn.className = "grantbtn"; btn.style.marginRight = "6px";
+        btn.textContent = pair[0];
+        btn.title = pair[1]
+          ? "The rail confirms this charge POSTED — the spend stands"
+          : "The rail confirms this charge did NOT post — the reservation is refunded";
+        btn.addEventListener("click", function(){ reconcile(rec.idempotency_key, pair[1], act); });
+        act.appendChild(btn);
+      });
+      tr.appendChild(act);
+      pb.appendChild(tr);
+    });
+  }
+  function reconcile(key, charged, rowCell){
+    Array.prototype.forEach.call(rowCell.querySelectorAll("button"), function(b){ b.disabled = true; });
+    var note = $("#pendnote"); note.hidden = false; note.textContent = "Recording the rail's verdict…";
+    var h = launchHeaders(); h["Content-Type"] = "application/json";
+    fetch("/api/apps/mandates/payments/reconcile", {method:"POST", headers:h,
+        body: JSON.stringify({idempotency_key:key, charged:charged})})
+      .then(function(r){ return r.text().then(function(t){ return {ok:r.ok, status:r.status, text:t}; }); })
+      .then(function(res){
+        if (res.ok){
+          var out = {}; try { out = JSON.parse(res.text); } catch(_){}
+          note.textContent = charged
+            ? "Recorded: charge posted — spend stands."
+            : (out.refunded ? "Recorded: not charged — reservation refunded." :
+               "Recorded, but the refund did not apply — see warning below.");
+          if (out.warning) note.textContent += " WARNING: " + String(out.warning);
+        } else if (res.status === 503) {
+          // The obligation is STILL LIVE (persist failed server-side) — say retry, verbatim.
+          note.textContent = "Not recorded (retry): " + String(res.text);
+        } else {
+          note.textContent = "Refused ("+res.status+"): " + String(res.text);
+        }
+        loadMoney(); // repaint FROM THE SERVER — the row is whatever the ledger actually holds
+      })
+      .catch(function(err){
+        note.textContent = "Network failure — the verdict may not have been recorded; reload before retrying. ("+String(err&&err.message||err)+")";
+      });
+  }
+  if (IN_SHELL){
+    $("#m-set").addEventListener("click", function(){
+      var note = $("#m-note");
+      var capsule = $("#m-capsule").value.trim();
+      var limit = parseInt($("#m-limit").value, 10);
+      if (!capsule || isNaN(limit) || limit < 0){
+        note.className = "gnote err"; note.textContent = "Capsule and a whole-number cap are required.";
+        return;
+      }
+      var h = launchHeaders(); h["Content-Type"] = "application/json";
+      note.className = "gnote"; note.textContent = "Setting…";
+      fetch("/api/apps/mandates/spend-budget", {method:"POST", headers:h,
+          body: JSON.stringify({capsule:capsule, limit:limit})})
+        .then(function(r){ return r.text().then(function(t){ if(!r.ok) throw new Error(t||("http "+r.status)); return JSON.parse(t); }); })
+        .then(function(out){
+          note.textContent = "Cap set: "+String(out.remaining)+" of "+String(out.limit)+" remaining.";
+          $("#m-capsule").value=""; $("#m-limit").value="";
+          loadMoney(); // the row comes from the enforcing meter, never fabricated locally
+        })
+        .catch(function(err){
+          note.className = "gnote err";
+          note.textContent = "Not set: "+String(err&&err.message||err);
+        });
     });
   }
 

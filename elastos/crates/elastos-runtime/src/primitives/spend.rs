@@ -482,6 +482,30 @@ impl SpendMeter {
         }
     }
 
+    /// Every provisioned key's [`BudgetSnapshot`], sorted by key — the list projection an operator
+    /// surface renders (the Money panel). OBSERVE-only, like [`snapshot`](Self::snapshot).
+    pub fn snapshot_all(&self) -> Vec<(String, BudgetSnapshot)> {
+        let balances = match self.balances.read() {
+            Ok(b) => b,
+            Err(_) => return Vec::new(),
+        };
+        let mut out: Vec<(String, BudgetSnapshot)> = balances
+            .iter()
+            .map(|(k, b)| {
+                (
+                    k.clone(),
+                    BudgetSnapshot {
+                        limit: b.limit,
+                        spent: b.spent,
+                        remaining: b.remaining(),
+                    },
+                )
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// A read-only [`BudgetSnapshot`] of `key` for projection (UI / inspector / API). `None` if the
     /// key has no provisioned budget. OBSERVE-only — it never mutates; the meter stays the single
     /// source of truth the projection reflects.
