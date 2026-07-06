@@ -46,6 +46,13 @@ pub(crate) enum MandateCommand {
         /// may act under the mandate — the audit attribution is the real agent. Recommended.
         #[arg(long)]
         agent_key: Option<String>,
+
+        /// Responsible entity: the operator/legal-entity DID accountable for the agent's acts under
+        /// this mandate (e.g. did:web:acme.example) — the EU-AI-Act liability binding, recorded in
+        /// the signed grant record and the portable receipt. Optional on the CLI; required on the
+        /// shell app.
+        #[arg(long)]
+        responsible_entity: Option<String>,
     },
 
     /// Revoke a mandate NOW — durably attested on the audit chain, then enforced fail-closed
@@ -109,6 +116,7 @@ pub(crate) async fn run_mandate(cmd: MandateCommand) -> Result<()> {
             methods,
             ttl_secs,
             agent_key,
+            responsible_entity,
         } => {
             let (api_url, shell_token) = attach_shell().await?;
             let resp = client()?
@@ -121,6 +129,7 @@ pub(crate) async fn run_mandate(cmd: MandateCommand) -> Result<()> {
                     "methods": methods,
                     "ttl_secs": ttl_secs,
                     "agent_pubkey": agent_key,
+                    "responsible_entity": responsible_entity,
                 }))
                 .send()
                 .await?;

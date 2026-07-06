@@ -498,6 +498,13 @@ pub enum AuditEvent {
         resource: String,
         action: String,
         expiry: Option<SecureTimestamp>,
+        /// The RESPONSIBLE ENTITY (Sprint 32): the operator/legal entity DID accountable for every
+        /// act under this grant — the EU-AI-Act liability binding, hash-linked and signed into the
+        /// chain (and therefore into the portable MandateReceipt). `skip_serializing_if` is
+        /// LOAD-BEARING: chain verification RE-SERIALIZES deserialized events, so a pre-S32 record
+        /// (no field ⇒ None) must re-serialize byte-identically or every old chain breaks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        responsible_entity: Option<String>,
     },
 
     /// Capability revoked
@@ -1396,6 +1403,9 @@ impl AuditLog {
             resource: resource.to_string(),
             action: action.to_string(),
             expiry,
+            // The legacy best-effort helper predates the liability binding; the durable mandate
+            // mint (`grant_durable`) is the path that records the responsible entity.
+            responsible_entity: None,
         });
     }
 
@@ -2785,5 +2795,48 @@ mod tests {
             shadow_rationale: "test".to_string(),
         };
         assert_eq!(event.event_type_name(), "policy_divergence");
+    }
+
+    /// Sprint 32: the responsible-entity binding rides the SIGNED CapabilityGrant record, so it is
+    /// in the receipt cryptographically. The load-bearing property is BACK-COMPAT: a pre-S32 grant
+    /// (no field) must re-serialize BYTE-IDENTICALLY — chain verification re-serializes deserialized
+    /// events to recompute each hash, so any drift silently breaks every old chain.
+    #[test]
+    fn responsible_entity_is_present_when_set_and_omitted_for_back_compat() {
+        // A pre-S32 record on disk: no `responsible_entity` key at all.
+        let legacy = r#"{"type":"capability_grant","timestamp":{"unix_secs":100,"monotonic_seq":0},"token_id":"abcd","capsule_id":"vm-a","resource":"elastos://x/y","action":"execute","expiry":null}"#;
+        let ev: AuditEvent = serde_json::from_str(legacy).unwrap();
+        match &ev {
+            AuditEvent::CapabilityGrant { responsible_entity, .. } => {
+                assert!(responsible_entity.is_none(), "absent field ⇒ None");
+            }
+            _ => panic!("wrong variant"),
+        }
+        // Re-serialization MUST be byte-identical to the signed original (skip_serializing_if).
+        assert_eq!(
+            serde_json::to_string(&ev).unwrap(),
+            legacy,
+            "a pre-S32 grant must re-serialize with NO responsible_entity key — else its chain hash \
+             changes and every old receipt fails to verify"
+        );
+
+        // An S32 grant carries the DID verbatim, and it round-trips.
+        let bound = AuditEvent::CapabilityGrant {
+            timestamp: SecureTimestamp { unix_secs: 100, monotonic_seq: 0 },
+            token_id: "abcd".to_string(),
+            capsule_id: "vm-a".to_string(),
+            resource: "elastos://x/y".to_string(),
+            action: "execute".to_string(),
+            expiry: None,
+            responsible_entity: Some("did:web:acme.example".to_string()),
+        };
+        let json = serde_json::to_string(&bound).unwrap();
+        assert!(
+            json.contains("\"responsible_entity\":\"did:web:acme.example\""),
+            "a bound grant carries the liability DID in its signed record: {json}"
+        );
+        // Round-trip (AuditEvent has no PartialEq — compare the canonical re-serialization).
+        let reparsed = serde_json::from_str::<AuditEvent>(&json).unwrap();
+        assert_eq!(serde_json::to_string(&reparsed).unwrap(), json);
     }
 }

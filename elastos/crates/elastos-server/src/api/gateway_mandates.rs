@@ -253,6 +253,26 @@ async fn mandate_issue(
         )
             .into_response();
     }
+    // Sprint 32 narrowing (same discipline as the agent-key requirement above): a mandate granted
+    // from the shell must NAME its responsible entity — the operator is right there, and the
+    // liability binding is the point of the web mint. Server-side, so an XSS in the frame cannot
+    // mint an accountability-less mandate. Unrecorded-entity mints remain a deliberate CLI act.
+    if body
+        .responsible_entity
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .is_none()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "a mandate granted from the shell must name its responsible entity — the operator/legal \
+             entity DID accountable for the agent's acts (e.g. did:web:acme.example); \
+             entity-less mandates are CLI-only"
+                .to_string(),
+        )
+            .into_response();
+    }
     match crate::api::handlers::capability::issue_mandate(
         &state.standing_service,
         &state.capability_manager,
@@ -501,7 +521,7 @@ mod tests {
             "/api/apps/mandates/standing-grants/issue",
             Some(token_hdr),
             &format!(
-                r#"{{"capsule":"vm-agent","resource":"elastos://mail/send","action":"execute","methods":["send"],"ttl_secs":3600,"agent_pubkey":"{agent}"}}"#
+                r#"{{"capsule":"vm-agent","resource":"elastos://mail/send","action":"execute","methods":["send"],"ttl_secs":3600,"agent_pubkey":"{agent}","responsible_entity":"did:web:acme.example"}}"#
             ),
         )
         .await;
@@ -530,6 +550,12 @@ mod tests {
         // The card SURFACES the binding (G-M4): bound = true, and the agent key round-trips.
         assert!(card.agent_bound, "the card shows the mandate is agent-bound");
         assert_eq!(card.agent_pubkey.as_deref(), Some(agent.as_str()));
+        // Sprint 32: the responsible-entity liability binding round-trips onto the card.
+        assert_eq!(
+            card.responsible_entity.as_deref(),
+            Some("did:web:acme.example"),
+            "the card surfaces WHO is accountable"
+        );
     }
 
     /// The gateway mint enforces the SAME fail-closed guards as the API server (shared helper):
@@ -542,7 +568,8 @@ mod tests {
         let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
         // A valid 64-hex agent key so downstream guards (wildcard, key-format) are the ones tested,
         // not the new G-M4 bound-required check (which fires first when the key is absent).
-        let k = "\"agent_pubkey\":\"".to_string() + &"ab".repeat(32) + "\"";
+        let k = "\"agent_pubkey\":\"".to_string() + &"ab".repeat(32)
+            + "\",\"responsible_entity\":\"did:web:acme.example\"";
         let cases: Vec<(String, StatusCode)> = vec![
             (
                 format!(r#"{{"capsule":"a","resource":"elastos://mail/send","action":"launch","methods":["m"],{k}}}"#),
@@ -570,6 +597,17 @@ mod tests {
             // unbound is CLI-only. Server-side, not just the form.
             (
                 r#"{"capsule":"a","resource":"elastos://mail/send","action":"execute","methods":["m"]}"#.to_string(),
+                StatusCode::BAD_REQUEST,
+            ),
+            // Sprint 32: a bound mandate with NO responsible entity is refused from the shell
+            // (entity-less mandates are CLI-only) — server-side, an XSS in the frame can't skip it.
+            (
+                format!(r#"{{"capsule":"a","resource":"elastos://mail/send","action":"execute","methods":["m"],"agent_pubkey":"{}"}}"#, "ab".repeat(32)),
+                StatusCode::BAD_REQUEST,
+            ),
+            // A malformed responsible entity (not a did: URI) fails closed at the shared core.
+            (
+                format!(r#"{{"capsule":"a","resource":"elastos://mail/send","action":"execute","methods":["m"],"agent_pubkey":"{}","responsible_entity":"acme corp"}}"#, "ab".repeat(32)),
                 StatusCode::BAD_REQUEST,
             ),
             (
@@ -677,7 +715,7 @@ mod tests {
         methods.insert("send".to_string());
         let grant_id = state
             .standing_service
-            .issue_from_token(&token, methods, None, None)
+            .issue_from_token(&token, methods, None, None, None)
             .unwrap();
 
         let app = mandate_router(state);
@@ -724,7 +762,7 @@ mod tests {
         methods.insert("send".to_string());
         let grant_id = state
             .standing_service
-            .issue_from_token(&token, methods, None, None)
+            .issue_from_token(&token, methods, None, None, None)
             .unwrap();
         // Kill the whole epoch WITHOUT individually revoking the token or touching the envelope.
         state.capability_manager.revoke_all("key rotation");
@@ -796,7 +834,7 @@ mod tests {
         methods.insert("send".to_string());
         let grant_id = state
             .standing_service
-            .issue_from_token(&token, methods, None, None)
+            .issue_from_token(&token, methods, None, None, None)
             .unwrap();
 
         let app = mandate_router(state.clone());
@@ -836,7 +874,7 @@ mod tests {
         methods.insert("send".to_string());
         let grant_id = state
             .standing_service
-            .issue_from_token(&token, methods, None, None)
+            .issue_from_token(&token, methods, None, None, None)
             .unwrap();
         assert!(state.standing_service.is_active(&grant_id));
 

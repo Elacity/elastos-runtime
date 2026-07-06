@@ -269,6 +269,8 @@
         <input id="g-rate" type="number" min="1" step="1" class="gmono" placeholder="60" spellcheck="false"></label>
       <label>Agent key <span class="opt">(required — 64-hex ed25519; binds the mandate to ONE agent)</span>
         <input id="g-agent" type="text" class="gmono" placeholder="the agent's public key — unbound mandates are CLI-only" spellcheck="false"></label>
+      <label>Responsible entity <span class="opt">(required — the DID accountable for this agent's acts, e.g. did:web:acme.example)</span>
+        <input id="g-entity" type="text" class="gmono" placeholder="did:web:acme.example — the liability binding on the signed receipt" spellcheck="false"></label>
     </div>
     <div class="gactions">
       <button class="grantbtn" id="g-submit" type="button">Grant mandate</button>
@@ -383,6 +385,7 @@
         resource:"elastos://runtime/audit-chain", action:"read",
         methods:["runtime.audit_verify"], expires_at:{unix_secs:1720,monotonic_seq:0}, revoked:true, active:false,
         agent_bound:true, agent_pubkey:"e5b1f0a9d6c4e2b8a1f3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3",
+        responsible_entity:"did:web:acme.example",
         dispatch_limit:60, dispatch_limit_custom:false, dispatch_window_secs:60 },
       { token_id:"a1f3c5d7e9b0a2c4d6e8f0a1b3c5d7e9", capsule:"vm-mail-agent",
         resource:"elastos://runtime/content-access/QmVault7", action:"read",
@@ -441,12 +444,19 @@
           + (m.dispatch_limit_custom?"Set on this mandate at grant time":"Global default budget")
           + '">'+esc(String(m.dispatch_limit))+'/'+esc(String((m.dispatch_window_secs||60)))+'s</span>'
         : '';
+      // The RESPONSIBLE ENTITY (Sprint 32) — WHO is accountable for this mandate's acts. Shown as
+      // a distinct chip; esc() escapes the operator-supplied DID text. Absent ⇒ no chip (honest:
+      // a pre-S32 / CLI-minted mandate may carry none).
+      var liable = m.responsible_entity
+        ? '<span class="bind liable" title="Responsible entity — accountable for this agent\'s acts">'
+          + esc(m.responsible_entity) + '</span>'
+        : '';
       return '<button class="card s-'+s+'" data-i="'+i+'" type="button">'
         + '<span class="stripe"></span>'
         + '<div class="row1"><span class="cap">'+esc(m.capsule)+'</span>'
         + '<span class="pill '+s+'">'+stateLabel(s)+'</span></div>'
         + '<div class="scope"><span class="verb">'+esc(m.action)+'</span> · <span class="res">'+esc(m.resource)+'</span></div>'
-        + '<div class="chips">'+chips+bound+rate+'</div>'
+        + '<div class="chips">'+chips+bound+rate+liable+'</div>'
         + '<div class="foot"><span class="tid">'+esc(shortId(m.token_id))+'</span>'
         + '<span class="open">View receipt →</span></div>'
         + '</button>';
@@ -878,12 +888,22 @@
           + "Unbound mandates are granted from the CLI.";
         return;
       }
+      // Sprint 32: the shell requires a responsible entity (the server enforces this too — this is
+      // a friendly pre-check, not the boundary). It is the liability binding on the receipt.
+      var entity = $("#g-entity").value.trim();
+      if (entity === "") {
+        note.className = "gnote err";
+        note.textContent = "A responsible entity is required — the DID accountable for this agent's "
+          + "acts (e.g. did:web:acme.example). Entity-less mandates are granted from the CLI.";
+        return;
+      }
       var body = {
         capsule: $("#g-capsule").value.trim(),
         resource: $("#g-resource").value.trim(),
         action: $("#g-action").value,
         methods: methods,
-        agent_pubkey: agent
+        agent_pubkey: agent,
+        responsible_entity: entity
       };
       if (ttlRaw !== "") body.ttl_secs = parseInt(ttlRaw, 10);
       var rateRaw = $("#g-rate").value.trim();
@@ -902,7 +922,7 @@
         .then(function(j){
           btn.disabled = false;
           note.textContent = "Mandate "+shortId(j.grant_id)+" granted — live below.";
-          $("#g-capsule").value = ""; $("#g-resource").value = ""; $("#g-methods").value = ""; $("#g-agent").value = ""; $("#g-rate").value = "";
+          $("#g-capsule").value = ""; $("#g-resource").value = ""; $("#g-methods").value = ""; $("#g-agent").value = ""; $("#g-rate").value = ""; $("#g-entity").value = "";
           load(); // the card comes from the server, never fabricated locally
         })
         .catch(function(err){

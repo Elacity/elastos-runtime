@@ -365,6 +365,7 @@ impl CapabilityManager {
         action: Action,
         constraints: TokenConstraints,
         expiry: Option<SecureTimestamp>,
+        responsible_entity: Option<String>,
     ) -> Result<CapabilityToken, AuditError> {
         let token = self.mint_signed_token(capsule_id, &resource, action, constraints, expiry);
         // Emit-before-issue: the durable signed grant record must land before the token is handed
@@ -376,6 +377,9 @@ impl CapabilityManager {
             resource: resource.to_string(),
             action: action.to_string(),
             expiry,
+            // Sprint 32: the liability binding rides the SIGNED grant record — who is accountable
+            // for every act under this mandate, provable in the exported receipt.
+            responsible_entity,
         })?;
         Ok(token)
     }
@@ -964,6 +968,7 @@ mod tests {
             Action::Read,
             TokenConstraints::default(),
             None,
+            None,
         );
         assert!(
             res.is_err(),
@@ -980,6 +985,7 @@ mod tests {
                 ResourceId::new("localhost://Users/self/Documents/test.txt"),
                 Action::Read,
                 TokenConstraints::default(),
+                None,
                 None,
             )
             .expect("a durable mint succeeds when the audit write lands");

@@ -233,6 +233,14 @@ pub struct StandingGrantEnvelope {
     /// current epoch passes it (key rotation / revoke-all advance the epoch), so the dispatcher can
     /// deny epoch-dead mandates without re-deriving the token.
     pub token_epoch: u64,
+    /// The RESPONSIBLE ENTITY (Sprint 32): the operator/legal-entity DID accountable for every act
+    /// under this mandate — the working-registry mirror of the SIGNED custody in the grant's
+    /// `CapabilityGrant` chain event (the receipt is the proof; this field is the projection the
+    /// operator surfaces render). `#[serde(default)]` deliberately (unlike the presence-required
+    /// fields above): a pre-S32 snapshot honestly loads as `None` = "unrecorded", which weakens
+    /// nothing — the chain custody, not this mirror, is the liability artifact.
+    #[serde(default)]
+    pub responsible_entity: Option<String>,
     /// This mandate's own dispatch-rate budget (acts per [`MANDATE_DISPATCH_WINDOW_SECS`] window),
     /// a first-class grant property (registry state, same trust level as `agent_pubkey` — not
     /// signed into the token) added in Sprint 22. `None` = the global default
@@ -303,6 +311,7 @@ impl StandingGrantEnvelope {
         revoked: bool,
         agent_pubkey: Option<String>,
         dispatch_limit: Option<u32>,
+        responsible_entity: Option<String>,
     ) -> Self {
         StandingGrantEnvelope {
             grant_id: token.id().to_string(),
@@ -316,6 +325,7 @@ impl StandingGrantEnvelope {
             token_epoch: token.constraints().epoch(),
             dispatch_limit,
             revoked_at: None,
+            responsible_entity,
         }
     }
 }
@@ -946,6 +956,8 @@ impl From<LegacyStandingGrantEnvelope> for StandingGrantEnvelope {
             agent_pubkey: l.agent_pubkey,
             token_epoch: l.token_epoch,
             dispatch_limit: None,
+            // A legacy (pre-S32) grant recorded no responsible entity — honest None, never guessed.
+            responsible_entity: None,
             // A legacy grant carries no revoke timestamp; None = never time-prune (retain). If it
             // was revoked, it stays queryable-as-revoked and only the hard cap can ever shed it.
             revoked_at: None,
@@ -1629,6 +1641,7 @@ impl StandingGrantService {
         allowed_methods: BTreeSet<String>,
         agent_pubkey: Option<String>,
         dispatch_limit: Option<u32>,
+        responsible_entity: Option<String>,
     ) -> std::io::Result<String> {
         // Enforce the budget invariant HERE, at the service choke point, not only at the HTTP
         // boundary (council red-team F3 / guardian F7): 0 would mint a mandate that renders "Live"
@@ -1652,6 +1665,7 @@ impl StandingGrantService {
             false,
             agent_pubkey,
             dispatch_limit,
+            responsible_entity,
         );
         let grant_id = envelope.grant_id.clone();
         self.store.issue(envelope)?;
@@ -1807,6 +1821,7 @@ mod tests {
             token_epoch: 0,
             dispatch_limit: None,
             revoked_at: None,
+            responsible_entity: None,
         }
     }
 
@@ -1981,7 +1996,7 @@ mod tests {
             Some(SecureTimestamp::after_secs(3600)),
         );
         let methods: BTreeSet<String> = ["send", "draft"].iter().map(|m| m.to_string()).collect();
-        let env = StandingGrantEnvelope::from_token(&token, methods, false, None, None);
+        let env = StandingGrantEnvelope::from_token(&token, methods, false, None, None, None);
 
         // The token supplies capsule/resource/action/expiry that were actually signed in.
         assert_eq!(env.capsule, "vm-agent");
@@ -2020,12 +2035,12 @@ mod tests {
             None,
         );
         let methods: BTreeSet<String> = ["send"].iter().map(|m| m.to_string()).collect();
-        let active = StandingGrantEnvelope::from_token(&token, methods.clone(), false, None, None);
+        let active = StandingGrantEnvelope::from_token(&token, methods.clone(), false, None, None, None);
         assert_eq!(active.expires_at, None);
         assert!(active.is_active(), "None expiry never expires");
 
         // The caller's external revocation check is honored, fail-closed.
-        let revoked = StandingGrantEnvelope::from_token(&token, methods, true, None, None);
+        let revoked = StandingGrantEnvelope::from_token(&token, methods, true, None, None, None);
         assert!(!revoked.is_active());
         let sk = key();
         assert_eq!(
@@ -2428,6 +2443,7 @@ mod tests {
             token_epoch: 0,
             dispatch_limit: None,
             revoked_at: None,
+            responsible_entity: None,
         }
     }
 
@@ -2778,6 +2794,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         store.issue(envelope).unwrap();
 
@@ -2889,7 +2906,7 @@ mod tests {
             Some(SecureTimestamp::after_secs(3600)),
         );
         let grant_id =
-            svc.issue_from_token(&token, ["send"].iter().map(|m| m.to_string()).collect(), None, None)
+            svc.issue_from_token(&token, ["send"].iter().map(|m| m.to_string()).collect(), None, None, None)
                 .unwrap();
         assert_eq!(grant_id, token.id().to_string());
         assert!(svc.is_active(&grant_id), "a freshly issued grant is active");
@@ -2974,16 +2991,16 @@ mod tests {
         // Zero and over-max are refused with InvalidInput — fail-closed, not stored.
         for bad in [Some(0u32), Some(MANDATE_DISPATCH_LIMIT_MAX + 1)] {
             let err = svc
-                .issue_from_token(&mk_token(), methods(), None, bad)
+                .issue_from_token(&mk_token(), methods(), None, bad, None)
                 .expect_err("out-of-range dispatch_limit is refused at the service layer");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         }
         // The boundary value MAX and a normal dial and None all mint fine.
         assert!(svc
-            .issue_from_token(&mk_token(), methods(), None, Some(MANDATE_DISPATCH_LIMIT_MAX))
+            .issue_from_token(&mk_token(), methods(), None, Some(MANDATE_DISPATCH_LIMIT_MAX), None)
             .is_ok());
-        assert!(svc.issue_from_token(&mk_token(), methods(), None, Some(5)).is_ok());
-        assert!(svc.issue_from_token(&mk_token(), methods(), None, None).is_ok());
+        assert!(svc.issue_from_token(&mk_token(), methods(), None, Some(5), None).is_ok());
+        assert!(svc.issue_from_token(&mk_token(), methods(), None, None, None).is_ok());
     }
 
     #[test]

@@ -1106,6 +1106,13 @@ pub struct IssueStandingGrantInput {
     /// nothing; revoke is the kill switch, not a budget).
     #[serde(default)]
     pub dispatch_limit: Option<u32>,
+    /// The RESPONSIBLE ENTITY (Sprint 32): the operator/legal-entity DID accountable for every act
+    /// under this mandate — the EU-AI-Act liability binding. Validated (`did:` URI, bounded) and
+    /// recorded in the SIGNED CapabilityGrant chain event, so the portable receipt proves not just
+    /// what the agent did but WHO was accountable for authorizing it. Optional on the raw API/CLI
+    /// (back-compat); the web mint surface REQUIRES it (gateway narrowing, like the agent key).
+    #[serde(default)]
+    pub responsible_entity: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1231,6 +1238,29 @@ pub async fn issue_mandate(
             ));
         }
     }
+    // Sprint 32: a present-but-malformed responsible entity fails CLOSED — a liability binding
+    // that silently recorded garbage would be worse than none. Shape: a `did:` URI (did:key,
+    // did:web, did:elastos, …), ≤256 chars, DID charset (method-chars + idstring incl. %-encoding,
+    // path/fragment excluded — this is an identifier, not a service URL).
+    let responsible_entity = match input.responsible_entity.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(did) => {
+            let valid = did.len() <= 256
+                && did.starts_with("did:")
+                && did.len() > "did:".len()
+                && did
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '-' | '_' | '%'));
+            if !valid {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "responsible_entity must be a did: URI (e.g. did:web:acme.example), ≤256                      chars, DID charset — the liability binding is recorded verbatim on the                      signed chain and must not be garbage"
+                        .to_string(),
+                ));
+            }
+            Some(did.to_string())
+        }
+    };
     let expiry = input
         .ttl_secs
         .map(elastos_common::SecureTimestamp::after_secs);
@@ -1261,6 +1291,7 @@ pub async fn issue_mandate(
             action,
             TokenConstraints::default(),
             expiry,
+            responsible_entity.clone(),
         )
         .map_err(|e| {
             (
@@ -1273,7 +1304,13 @@ pub async fn issue_mandate(
     // is NOT issued — the operator retries into a working store rather than holding a grant that
     // silently evaporates on the next restart.
     let grant_id = standing_service
-        .issue_from_token(&token, methods, agent_pubkey, input.dispatch_limit)
+        .issue_from_token(
+            &token,
+            methods,
+            agent_pubkey,
+            input.dispatch_limit,
+            responsible_entity,
+        )
         .map_err(|e| {
             // Reverse-failure honesty (Sprint 24 council F2): the CapabilityGrant already landed on
             // the chain, but the mandate did NOT get issued. Emit a compensating (best-effort)
@@ -1867,6 +1904,11 @@ pub struct MandateCard {
     pub dispatch_limit_custom: bool,
     /// The rate window (seconds) the budget is measured over.
     pub dispatch_window_secs: u64,
+    /// The RESPONSIBLE ENTITY (Sprint 32): the operator/legal-entity DID accountable for every act
+    /// under this mandate. `None` = unrecorded (a pre-S32 or CLI-minted mandate) — shown honestly,
+    /// never fabricated. The SIGNED custody is the grant's chain event (and so the receipt); this
+    /// is its card projection.
+    pub responsible_entity: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1922,6 +1964,7 @@ pub async fn mandate_cards(
                 .unwrap_or(elastos_runtime::capability::MANDATE_DISPATCH_LIMIT),
             dispatch_limit_custom: env.dispatch_limit.is_some(),
             dispatch_window_secs: elastos_runtime::capability::MANDATE_DISPATCH_WINDOW_SECS,
+            responsible_entity: env.responsible_entity,
         });
     }
     ListMandatesOutput {
@@ -2496,6 +2539,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: Some(agent.clone()),
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -2512,6 +2556,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -2549,6 +2594,7 @@ mod tests {
                     ttl_secs: Some(3600),
                     agent_pubkey: Some(weak.to_string()),
                     dispatch_limit: None,
+                    responsible_entity: None,
                 }),
             )
             .await;
@@ -2571,6 +2617,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: Some(real),
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -2590,6 +2637,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -2668,6 +2716,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -2737,6 +2786,84 @@ mod tests {
         }
     }
 
+    /// Sprint 32 end-to-end: the responsible-entity liability binding travels from the grant input,
+    /// through the SIGNED CapabilityGrant chain record, into the exported portable receipt — where
+    /// it verifies off-box against the pinned signer. This is the EU-AI-Act artifact: proof of not
+    /// just what the agent did, but WHO is accountable. A malformed DID fails closed at the mint.
+    #[tokio::test]
+    async fn responsible_entity_binds_into_the_grant_and_the_portable_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_durable_audit(dir.path());
+
+        // A malformed responsible entity is refused at the mint (nothing is issued).
+        let bad = issue_mandate(
+            &state.standing_service,
+            &state.capability_manager,
+            IssueStandingGrantInput {
+                capsule: "vm-ap-agent".into(),
+                resource: "elastos://runtime/pay/acme".into(),
+                action: "execute".into(),
+                methods: vec!["runtime.pay".into()],
+                ttl_secs: Some(3600),
+                agent_pubkey: None,
+                dispatch_limit: None,
+                responsible_entity: Some("acme corp (not a did)".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(bad.0, StatusCode::BAD_REQUEST);
+        assert!(state.standing_service.list().is_empty(), "a bad DID mints nothing");
+
+        // A valid entity mints, surfaces on the card, and rides the SIGNED grant record.
+        let out = issue_mandate(
+            &state.standing_service,
+            &state.capability_manager,
+            IssueStandingGrantInput {
+                capsule: "vm-ap-agent".into(),
+                resource: "elastos://runtime/pay/acme".into(),
+                action: "execute".into(),
+                methods: vec!["runtime.pay".into()],
+                ttl_secs: Some(3600),
+                agent_pubkey: None,
+                dispatch_limit: None,
+                responsible_entity: Some("did:web:acme.example".into()),
+            },
+        )
+        .await
+        .unwrap();
+        let cards =
+            mandate_cards(&state.standing_service, &state.capability_manager).await;
+        let card = cards.mandates.iter().find(|c| c.token_id == out.token_id).unwrap();
+        assert_eq!(card.responsible_entity.as_deref(), Some("did:web:acme.example"));
+
+        // Export the portable receipt and verify it off-box against the pinned signer — the
+        // liability DID is IN the signed grant record, so a verified receipt authenticates it.
+        let receipt = mandate_receipt(State(state.clone()), Path(out.token_id.clone()))
+            .await
+            .unwrap()
+            .0;
+        let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();
+        assert!(
+            elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer))
+                .authenticated,
+            "the receipt verifies off-box"
+        );
+        let grant_record = receipt
+            .records
+            .iter()
+            .find(|r| matches!(
+                r.event,
+                elastos_runtime::primitives::audit::AuditEvent::CapabilityGrant { .. }
+            ))
+            .expect("the receipt carries the grant record");
+        let event_json = serde_json::to_string(&grant_record.event).unwrap();
+        assert!(
+            event_json.contains("\"responsible_entity\":\"did:web:acme.example\""),
+            "the accountable entity is in the SIGNED, verifiable grant record: {event_json}"
+        );
+    }
+
     /// Sprint 24 council F2 ratchet: on the reverse failure — the grant lands on the chain but the
     /// standing-registry persist then FAILS — `issue_mandate` must emit a COMPENSATING revoke, so
     /// the chain reads "granted, then aborted" and never an orphan live grant a verifier would trust
@@ -2787,6 +2914,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await;
@@ -2834,6 +2962,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -2977,6 +3106,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: Some(agent_pub),
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -3117,6 +3247,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: Some(agent_pub),
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -3338,6 +3469,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: Some(agent_pub),
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -3528,6 +3660,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: Some(agent_pub),
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -3561,6 +3694,7 @@ mod tests {
             ttl_secs: Some(3600),
             agent_pubkey: agent,
             dispatch_limit: None,
+            responsible_entity: None,
         };
         let bound = issue_standing_grant(State(state.clone()), Json(mk(Some(agent_pub))))
             .await
@@ -3625,6 +3759,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: Some(agent_pub),
                 dispatch_limit: Some(1),
+                responsible_entity: None,
             }),
         )
         .await
@@ -3676,6 +3811,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -3790,6 +3926,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
                 dispatch_limit: Some(0),
+                responsible_entity: None,
             }),
         )
         .await;
@@ -3808,6 +3945,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
                 dispatch_limit: Some(2),
+                responsible_entity: None,
             }),
         )
         .await
@@ -3881,6 +4019,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -3954,6 +4093,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -4051,6 +4191,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -4121,6 +4262,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -4235,6 +4377,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -4264,6 +4407,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: Some(agent_pub),
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -4336,6 +4480,7 @@ mod tests {
             ttl_secs: Some(3600),
             agent_pubkey: agent,
             dispatch_limit: None,
+            responsible_entity: None,
         };
         // Unbound state_get → 400.
         let refused = issue_standing_grant(
@@ -4386,6 +4531,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -4476,6 +4622,7 @@ mod tests {
                         ttl_secs: Some(3600),
                         agent_pubkey: Some(hex::encode(agent.verifying_key().to_bytes())),
                         dispatch_limit: None,
+                        responsible_entity: None,
                     }),
                 )
                 .await
@@ -4529,6 +4676,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: Some(agent_hex),
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -4593,6 +4741,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: Some(hex::encode(agent.verifying_key().to_bytes())),
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -4634,6 +4783,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: Some(hex::encode(agent.verifying_key().to_bytes())),
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -4711,6 +4861,7 @@ mod tests {
                 ttl_secs: None,
                 agent_pubkey: None,
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -4763,6 +4914,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -4807,6 +4959,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: Some(agent_hex),
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -4851,6 +5004,7 @@ mod tests {
                 ttl_secs: None,
                 agent_pubkey: None,
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -4884,6 +5038,7 @@ mod tests {
             ttl_secs: Some(3600),
             agent_pubkey: None,
             dispatch_limit: None,
+            responsible_entity: None,
         };
         let a = issue_standing_grant(State(state.clone()), Json(issue("elastos://pay/a")))
             .await
@@ -4945,6 +5100,7 @@ mod tests {
                 ttl_secs: None,
                 agent_pubkey: None,
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -4979,6 +5135,7 @@ mod tests {
                 ttl_secs: None,
                 agent_pubkey: None,
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -4996,6 +5153,7 @@ mod tests {
                 ttl_secs: None,
                 agent_pubkey: None,
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
@@ -5017,6 +5175,7 @@ mod tests {
                 ttl_secs: Some(3600),
                 agent_pubkey: None,
                 dispatch_limit: None,
+                responsible_entity: None,
             }),
         )
         .await
