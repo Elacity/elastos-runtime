@@ -367,6 +367,20 @@ impl CapabilityManager {
         expiry: Option<SecureTimestamp>,
         responsible_entity: Option<String>,
     ) -> Result<CapabilityToken, AuditError> {
+        // Service-layer bound (council S32 F6): the responsible entity is written VERBATIM into the
+        // signed chain here, so the ≤256 + charset check is re-applied at this choke point — a
+        // non-HTTP caller cannot smuggle an unbounded/hostile blob onto the chain. Syntactic only.
+        if let Some(e) = responsible_entity.as_deref() {
+            if e.len() > 256
+                || !e
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '-' | '_' | '%'))
+            {
+                return Err(AuditError::Serialize(
+                    "responsible_entity must be ≤256 chars of DID charset".to_string(),
+                ));
+            }
+        }
         let token = self.mint_signed_token(capsule_id, &resource, action, constraints, expiry);
         // Emit-before-issue: the durable signed grant record must land before the token is handed
         // back. On failure the token is dropped here — never issued, never stored in any registry.

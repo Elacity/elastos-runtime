@@ -584,7 +584,7 @@ mod tests {
                 StatusCode::FORBIDDEN,
             ),
             (
-                r#"{"capsule":"a","resource":"elastos://mail/send","action":"execute","methods":["m"],"agent_pubkey":"nothex"}"#.to_string(),
+                r#"{"capsule":"a","resource":"elastos://mail/send","action":"execute","methods":["m"],"agent_pubkey":"nothex","responsible_entity":"did:web:acme.example"}"#.to_string(),
                 StatusCode::BAD_REQUEST,
             ),
             // The web surface is narrower than the API: admin mints are refused server-side (P16),

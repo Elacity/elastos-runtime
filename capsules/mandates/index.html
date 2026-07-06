@@ -269,7 +269,7 @@
         <input id="g-rate" type="number" min="1" step="1" class="gmono" placeholder="60" spellcheck="false"></label>
       <label>Agent key <span class="opt">(required — 64-hex ed25519; binds the mandate to ONE agent)</span>
         <input id="g-agent" type="text" class="gmono" placeholder="the agent's public key — unbound mandates are CLI-only" spellcheck="false"></label>
-      <label>Responsible entity <span class="opt">(required — the DID accountable for this agent's acts, e.g. did:web:acme.example)</span>
+      <label>Responsible entity <span class="opt">(required — the DID you DECLARE accountable for this agent's acts, e.g. did:web:acme.example; recorded verbatim, not verified)</span>
         <input id="g-entity" type="text" class="gmono" placeholder="did:web:acme.example — the liability binding on the signed receipt" spellcheck="false"></label>
     </div>
     <div class="gactions">
@@ -411,7 +411,7 @@
     signer_public_key_hex:SAMPLE_SIGNER,
     set_binding:"iQ3f…bound",
     records:[
-      {seq:5, event:{type:"capability_grant", resource:"elastos://runtime/audit-chain", action:"read"}, record_hash:"b2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9"},
+      {seq:5, event:{type:"capability_grant", resource:"elastos://runtime/audit-chain", action:"read", responsible_entity:"did:web:acme.example"}, record_hash:"b2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9"},
       {seq:9, event:{type:"capability_use", resource:"elastos://runtime/audit-chain", action:"read", success:true}, record_hash:"d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0a2"},
       {seq:14, event:{type:"capability_revoke", reason:"standing grant revoked via API"}, record_hash:"f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0a2c4d6"},
       {seq:18, event:{type:"capability_use", resource:"elastos://runtime/audit-chain", action:"read", success:false}, record_hash:"a2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9b0a2c4d6e8f0a1b3c5d7e9"}
@@ -448,7 +448,7 @@
       // a distinct chip; esc() escapes the operator-supplied DID text. Absent ⇒ no chip (honest:
       // a pre-S32 / CLI-minted mandate may carry none).
       var liable = m.responsible_entity
-        ? '<span class="bind liable" title="Responsible entity — accountable for this agent\'s acts">'
+        ? '<span class="bind liable" title="Responsible entity — declared by the operator at grant time (not counter-signed by the entity)">'
           + esc(m.responsible_entity) + '</span>'
         : '';
       return '<button class="card s-'+s+'" data-i="'+i+'" type="button">'
@@ -484,8 +484,14 @@
   function evDetail(e){
     var v=e.event;
     if(v.type==="capability_revoke") return "reason: "+esc(v.reason||"");
-    if(v.resource) return '<span class="verb">'+esc(v.action||"")+'</span> · <span class="res">'+esc(v.resource)+'</span>';
-    return "";
+    var out = "";
+    if(v.resource) out = '<span class="verb">'+esc(v.action||"")+'</span> · <span class="res">'+esc(v.resource)+'</span>';
+    // The liability attribution rides the SIGNED grant record (Sprint 32) — render it on the grant
+    // row, labelled as the operator's DECLARATION (not the entity's consent). esc() escapes the DID.
+    if(v.type==="capability_grant" && v.responsible_entity){
+      out += (out?' · ':'') + '<span class="res" title="Responsible entity (declared by the operator at grant time; not counter-signed)">responsible: '+esc(v.responsible_entity)+'</span>';
+    }
+    return out;
   }
 
   // The token id whose receipt the drawer is CURRENTLY showing. Every async continuation that

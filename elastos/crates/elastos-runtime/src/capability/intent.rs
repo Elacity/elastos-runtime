@@ -1659,6 +1659,22 @@ impl StandingGrantService {
                 ));
             }
         }
+        // Service-layer bound on the responsible entity (council S32 F6): the same ≤256 + charset
+        // discipline the HTTP surface applies, re-checked at the choke point so a non-HTTP caller
+        // can't smuggle an unbounded/hostile blob onto the signed chain. Syntactic only — never
+        // authentication.
+        if let Some(e) = responsible_entity.as_deref() {
+            if e.len() > 256
+                || !e
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '-' | '_' | '%'))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "responsible_entity must be ≤256 chars of DID charset",
+                ));
+            }
+        }
         let envelope = StandingGrantEnvelope::from_token(
             token,
             allowed_methods,

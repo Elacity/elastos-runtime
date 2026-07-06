@@ -1106,11 +1106,14 @@ pub struct IssueStandingGrantInput {
     /// nothing; revoke is the kill switch, not a budget).
     #[serde(default)]
     pub dispatch_limit: Option<u32>,
-    /// The RESPONSIBLE ENTITY (Sprint 32): the operator/legal-entity DID accountable for every act
-    /// under this mandate — the EU-AI-Act liability binding. Validated (`did:` URI, bounded) and
-    /// recorded in the SIGNED CapabilityGrant chain event, so the portable receipt proves not just
-    /// what the agent did but WHO was accountable for authorizing it. Optional on the raw API/CLI
-    /// (back-compat); the web mint surface REQUIRES it (gateway narrowing, like the agent key).
+    /// The RESPONSIBLE ENTITY (Sprint 32): the DID the OPERATOR DECLARES accountable for every act
+    /// under this mandate — the EU-AI-Act liability attribution. Validated (`did:` URI, bounded) and
+    /// recorded verbatim in the SIGNED CapabilityGrant chain event, so the portable receipt proves
+    /// WHICH entity the operator DECLARED accountable. OPERATOR-ASSERTED, NOT ATTESTED: the runtime
+    /// does not resolve the DID or obtain the named entity's counter-signature — a receipt is proof
+    /// of the operator's declaration, not the entity's consent (entity counter-signing is a tracked
+    /// gap). Optional on the raw API/CLI (back-compat); the web mint surface REQUIRES it (gateway
+    /// narrowing, like the agent key).
     #[serde(default)]
     pub responsible_entity: Option<String>,
 }
@@ -1122,6 +1125,49 @@ pub struct IssueStandingGrantOutput {
     /// The backing capability token's id — identical to `grant_id`, surfaced explicitly because it
     /// is the key for the mandate's audit trail (`export_mandate_receipt_for_capability`).
     pub token_id: String,
+}
+
+/// Validate the operator-asserted responsible-entity DID (Sprint 32, council F3/F6). SYNTACTIC
+/// only — anti-garbage, bounded, injection-safe; it does NOT authenticate or resolve the DID (that
+/// would falsely imply the entity consented — council F2). `None`/blank ⇒ `Ok(None)` (the field is
+/// optional on the API/CLI). Shape: `did:<lowercase-alnum-method>:<non-empty-msid>`, ≤256 ASCII
+/// chars, charset {alnum : . - _ %} (path/query/fragment excluded — an identifier, not a URL).
+pub(crate) fn validate_responsible_entity(raw: Option<&str>) -> Result<Option<String>, String> {
+    let did = match raw.map(str::trim) {
+        None | Some("") => return Ok(None),
+        Some(d) => d,
+    };
+    let bad = |m: &str| {
+        Err(format!(
+            "responsible_entity must be a did: URI (e.g. did:web:acme.example), \u{2264}256 chars, \
+             DID charset \u{2014} {m}. It is recorded verbatim on the signed chain and must not be \
+             garbage"
+        ))
+    };
+    if did.len() > 256 {
+        return bad("too long");
+    }
+    if !did
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '-' | '_' | '%'))
+    {
+        return bad("illegal character");
+    }
+    // did:<method>:<msid> — method is a non-empty run of lowercase ASCII alphanumerics; msid is
+    // non-empty. splitn(3) keeps any further colons inside the method-specific id.
+    let mut parts = did.splitn(3, ':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("did"), Some(method), Some(msid))
+            if !method.is_empty()
+                && method
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                && !msid.is_empty() =>
+        {
+            Ok(Some(did.to_string()))
+        }
+        _ => bad("expected did:<method>:<id> with a lowercase method and a non-empty id"),
+    }
 }
 
 /// Issue a mandate — the ONE shared mint path, used by the API server's [`issue_standing_grant`]
@@ -1238,29 +1284,13 @@ pub async fn issue_mandate(
             ));
         }
     }
-    // Sprint 32: a present-but-malformed responsible entity fails CLOSED — a liability binding
-    // that silently recorded garbage would be worse than none. Shape: a `did:` URI (did:key,
-    // did:web, did:elastos, …), ≤256 chars, DID charset (method-chars + idstring incl. %-encoding,
-    // path/fragment excluded — this is an identifier, not a service URL).
-    let responsible_entity = match input.responsible_entity.as_deref().map(str::trim) {
-        None | Some("") => None,
-        Some(did) => {
-            let valid = did.len() <= 256
-                && did.starts_with("did:")
-                && did.len() > "did:".len()
-                && did
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '-' | '_' | '%'));
-            if !valid {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "responsible_entity must be a did: URI (e.g. did:web:acme.example), ≤256                      chars, DID charset — the liability binding is recorded verbatim on the                      signed chain and must not be garbage"
-                        .to_string(),
-                ));
-            }
-            Some(did.to_string())
-        }
-    };
+    // Sprint 32: the liability attribution is recorded VERBATIM on the signed chain, so a
+    // present-but-malformed entity fails CLOSED (garbage is worse than none). SYNTACTIC
+    // anti-garbage + injection-safety ONLY — it does NOT authenticate the DID (that would falsely
+    // imply the entity consented — council F2). Re-validated at the service choke point too so a
+    // non-HTTP caller can't smuggle an unbounded blob onto the chain (council F6).
+    let responsible_entity = validate_responsible_entity(input.responsible_entity.as_deref())
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     let expiry = input
         .ttl_secs
         .map(elastos_common::SecureTimestamp::after_secs);
@@ -1904,10 +1934,12 @@ pub struct MandateCard {
     pub dispatch_limit_custom: bool,
     /// The rate window (seconds) the budget is measured over.
     pub dispatch_window_secs: u64,
-    /// The RESPONSIBLE ENTITY (Sprint 32): the operator/legal-entity DID accountable for every act
-    /// under this mandate. `None` = unrecorded (a pre-S32 or CLI-minted mandate) — shown honestly,
-    /// never fabricated. The SIGNED custody is the grant's chain event (and so the receipt); this
-    /// is its card projection.
+    /// The RESPONSIBLE ENTITY (Sprint 32): the DID the operator DECLARED accountable — the working
+    /// registry MIRROR of the signed grant record. `None` = not recorded in the registry (a pre-S32
+    /// or CLI-minted mandate, OR a hand-edited/repaired snapshot that dropped the unsigned field).
+    /// AUTHORITATIVE SOURCE IS THE RECEIPT: the signed grant record in `elastos verify-receipt` is
+    /// the ground truth; this card projection can be blanked/altered by a data_dir writer (the whole
+    /// registry snapshot is unsigned) without touching the receipt (council S32 F3/F4).
     pub responsible_entity: Option<String>,
 }
 
@@ -2786,10 +2818,35 @@ mod tests {
         }
     }
 
-    /// Sprint 32 end-to-end: the responsible-entity liability binding travels from the grant input,
+    /// Council S32 F3: the DID validator is syntactic anti-garbage — it accepts real DIDs and
+    /// rejects malformed ones (empty method, empty id, bad charset, over-long), and it NEVER
+    /// authenticates (a valid-shape DID for an entity that never consented still passes — that is
+    /// by design; the receipt records a DECLARATION, not consent).
+    #[test]
+    fn responsible_entity_validation_is_syntactic_and_fail_closed() {
+        // Accepted.
+        for ok in ["did:web:acme.example", "did:key:z6Mk...", "did:elastos:iabc123", "did:web:acme.example%3A8443"] {
+            assert!(validate_responsible_entity(Some(ok)).unwrap().is_some(), "should accept {ok}");
+        }
+        // None / blank ⇒ Ok(None) (optional field).
+        assert!(validate_responsible_entity(None).unwrap().is_none());
+        assert!(validate_responsible_entity(Some("   ")).unwrap().is_none());
+        // Rejected shapes (council F3): no method, no id, uppercase method, non-DID, bad char, long.
+        for bad in [
+            "did:", "did:web", "did::x", "did:WEB:x", "notadid", "did:web:a b",
+            "did:web:a/path", "did:web:a<script>",
+        ] {
+            assert!(validate_responsible_entity(Some(bad)).is_err(), "should reject {bad:?}");
+        }
+        let long = format!("did:web:{}", "a".repeat(300));
+        assert!(validate_responsible_entity(Some(&long)).is_err(), "over-long rejected");
+    }
+
+    /// Sprint 32 end-to-end: the responsible-entity attribution travels from the grant input,
     /// through the SIGNED CapabilityGrant chain record, into the exported portable receipt — where
-    /// it verifies off-box against the pinned signer. This is the EU-AI-Act artifact: proof of not
-    /// just what the agent did, but WHO is accountable. A malformed DID fails closed at the mint.
+    /// it verifies off-box against the pinned signer. The receipt proves WHICH entity the operator
+    /// DECLARED accountable (operator-asserted, not the entity's consent — council F2). A malformed
+    /// DID fails closed at the mint.
     #[tokio::test]
     async fn responsible_entity_binds_into_the_grant_and_the_portable_receipt() {
         let dir = tempfile::tempdir().unwrap();

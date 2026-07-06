@@ -12,11 +12,11 @@ record. Detailed per-gap history lives in `KNOWN_GAPS.md`; this is the summary.
 
 | Verb | What it is | Where |
 |---|---|---|
-| **Grant** | Mint a real signed capability token scoped to (capsule, resource, action, ttl) + an authorized method set + the **responsible entity** (the operator/legal-entity DID accountable for the agent's acts — the EU-AI-Act liability binding, signed into the grant record and the receipt; required on the shell app), elevated to a standing mandate | CLI + Mandates shell app |
+| **Grant** | Mint a real signed capability token scoped to (capsule, resource, action, ttl) + an authorized method set + the **responsible entity** (the DID the OPERATOR DECLARES accountable for the agent's acts — the EU-AI-Act liability *attribution*, signed into the grant record and the receipt; required on the shell app). **Operator-asserted, not attested:** the runtime records the DID verbatim; it does not resolve it or obtain the entity's counter-signature, so a receipt proves the operator's declaration, not the entity's consent (entity counter-signing is a tracked gap). | CLI + Mandates shell app |
 | **Act** | An agent signs an `IntentDeclarationV1` and dispatches it; a fail-closed gate checks `intent ⊆ envelope` (capsule + agent-key + method + resource + action), runs a real executor, and reconciles declared-vs-done | `POST /api/agent/dispatch` (agent-facing, S26) or `/api/standing-grants/dispatch` (operator) |
 | **Watch** | The operator sees mandates live, and what each agent has written/delivered under them | Mandates shell app (mandate cards, Agent State panel, Inbox) |
 | **Revoke** | The kill switch — durably attested *before* the mandate dies | CLI + Mandates shell app |
-| **Prove** | Export a portable `MandateReceipt` — proving not just WHAT the agent did but WHO was accountable (the responsible entity rides the signed grant record) — and verify it off-box with no runtime and no trust in this box | `elastos verify-receipt` |
+| **Prove** | Export a portable `MandateReceipt` — proving not just WHAT the agent did but WHICH entity the operator DECLARED accountable (the responsible entity rides the signed grant record; operator-asserted, see Grant) — and verify it off-box with no runtime and no trust in this box. **Verifier version floor (S32):** a pre-S32 `verify-receipt` binary drops the new grant field on re-serialize and will false-flag an S32 receipt as tampered — verify with an S32+ binary. | `elastos verify-receipt` |
 
 ## The real affordances behind dispatch
 

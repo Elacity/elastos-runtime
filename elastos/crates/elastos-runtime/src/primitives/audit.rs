@@ -2839,4 +2839,54 @@ mod tests {
         let reparsed = serde_json::from_str::<AuditEvent>(&json).unwrap();
         assert_eq!(serde_json::to_string(&reparsed).unwrap(), json);
     }
+
+    /// Council S32 F1 belt: a REAL signed chain that MIXES a grant without the field (the pre-S32
+    /// byte shape) and a grant with it (the S32 shape) verifies end-to-end against the signer — and
+    /// the field-less record's on-disk line carries NO responsible_entity key. This is the
+    /// whole-chain regression the pinned-literal event test complements: a field REORDER or an
+    /// omission-rule change breaks the recomputed hash and this fails.
+    #[test]
+    fn a_signed_chain_mixing_pre_and_post_s32_grants_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let log = AuditLog::with_file(&path).unwrap();
+        // A pre-S32-shaped grant: responsible_entity None ⇒ omitted from the signed bytes.
+        log.emit(AuditEvent::CapabilityGrant {
+            timestamp: SecureTimestamp::now(),
+            token_id: "aaaa".to_string(),
+            capsule_id: "vm-a".to_string(),
+            resource: "elastos://x/y".to_string(),
+            action: "execute".to_string(),
+            expiry: None,
+            responsible_entity: None,
+        })
+        .unwrap();
+        // An S32 grant: the DID is in the signed bytes.
+        log.emit(AuditEvent::CapabilityGrant {
+            timestamp: SecureTimestamp::now(),
+            token_id: "bbbb".to_string(),
+            capsule_id: "vm-b".to_string(),
+            resource: "elastos://x/z".to_string(),
+            action: "execute".to_string(),
+            expiry: None,
+            responsible_entity: Some("did:web:acme.example".to_string()),
+        })
+        .unwrap();
+        let vk = read_verifying_key(&log);
+        assert!(
+            log.verify_chain(Some(&vk)).is_ok(),
+            "a chain mixing pre- and post-S32 grant shapes verifies end-to-end"
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        let aaaa = content.lines().find(|l| l.contains("\"aaaa\"")).unwrap();
+        assert!(
+            !aaaa.contains("responsible_entity"),
+            "a None grant's SIGNED line omits the field (byte-shape identical to pre-S32): {aaaa}"
+        );
+        assert!(content
+            .lines()
+            .find(|l| l.contains("\"bbbb\""))
+            .unwrap()
+            .contains("\"responsible_entity\":\"did:web:acme.example\""));
+    }
 }
