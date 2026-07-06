@@ -378,7 +378,8 @@
     if (HOME_TOKEN) h["x-elastos-home-token"] = HOME_TOKEN;
     // Anti-CSRF marker (Sprint 33): the gateway refuses cookie-authorized WRITES without this
     // custom header — a cross-site page cannot set it without a CORS preflight the gateway
-    // never passes. Sent on every call; harmless on reads and header-token requests.
+    // never grants to a foreign origin. Sent on every call; harmless on reads and
+    // header-token requests.
     h["x-elastos-mandates-app"] = "1";
     return h;
   }

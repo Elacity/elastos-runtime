@@ -45,7 +45,8 @@
 //!    no longer leaks through history/logs/copy-paste. The gate still accepts the explicit
 //!    header (tests, tools, pre-S33 clients). Cookie-authorized WRITES must also carry
 //!    [`MANDATES_APP_MARKER_HEADER`] — a cookie is ambient browser state, and a cross-site page
-//!    cannot set a custom header without a CORS preflight this gateway never passes.
+//!    cannot set a custom header without a CORS preflight the gateway never grants to a
+//!    foreign origin (the mandates routes emit no ACAO — pinned by the S31 regression test).
 //! 2. **Money writes require a FRESH passkey verification, spent on use.** SPEND-BUDGET and
 //!    RECONCILE additionally demand a proof-bound Home token minted by a WebAuthn ceremony at
 //!    most [`MONEY_FRESH_WINDOW_SECS`] ago for the same principal (the wallet-send gate), and
@@ -110,7 +111,8 @@ pub(crate) const MANDATES_CAPSULE_ID: &str = "mandates";
 /// Anti-CSRF marker for COOKIE-authorized writes (Sprint 33). A cookie is an ambient credential
 /// — the browser attaches it to any same-site request regardless of who initiated it — so a
 /// write authorized by the cookie must ALSO carry this custom header: setting a custom header
-/// cross-origin forces a CORS preflight this gateway never passes (see the S31 F2 regression
+/// cross-origin forces a CORS preflight the gateway never grants to a foreign origin (no ACAO
+/// on these routes — see the S31 F2 regression
 /// test). Header-token writes don't need it — the token header itself is the unforgeable marker.
 pub(crate) const MANDATES_APP_MARKER_HEADER: &str = "x-elastos-mandates-app";
 
@@ -190,9 +192,9 @@ fn require_fresh_money_authorization(
     state: &MandateApiState,
     headers: &HeaderMap,
     fresh_passkey_token: &str,
-) -> Result<(), Box<axum::response::Response>> {
+) -> Result<SpentFreshVerification, Box<axum::response::Response>> {
     let context = require_mandates_surface(state, headers, true)?;
-    super::require_fresh_passkey_home_token(
+    let canonical_assertion = super::require_fresh_passkey_home_token(
         &state.data_dir,
         fresh_passkey_token,
         &context,
@@ -210,21 +212,49 @@ fn require_fresh_money_authorization(
                 .into_response(),
         )
     })?;
-    consume_fresh_money_token(state, fresh_passkey_token)
+    consume_fresh_money_token(state, &canonical_assertion)
 }
 
-/// Spend the fresh token: exactly ONE money write per verification. Keyed by the token's SHA-256
-/// (identical strings are the identical bearer credential — each real WebAuthn ceremony mints a
-/// unique grant/session id, so distinct ceremonies never collide). Entries are pruned once they
-/// out-age the freshness window (plus the same 60s issue-skew the verifier tolerates), so the
-/// map stays bounded by the number of REAL ceremonies inside a ~4-minute window; if it is
-/// somehow full, we refuse — fail closed, never drop replay protection to accept a write.
+/// A CONSUMED fresh verification: proof the single-use guard admitted this write, carrying the
+/// canonical key so the handler can RE-CREDIT it if the write is refused provably before any
+/// money effect (council S33 red-team F1 — see [`SpentFreshVerification::refund`]).
+struct SpentFreshVerification {
+    key: String,
+}
+
+impl SpentFreshVerification {
+    /// Re-credit the verification: the write it admitted was refused PROVABLY BEFORE any money
+    /// effect — the surface's own guards (rail unwired, cap ceiling) or the shared cores' 4xx
+    /// rejections (validation / unknown key / already-resolved, all pre-effect by the cores'
+    /// construction) — so the operator's ceremony is not burned on a no-op. Same contract as
+    /// the carrier's `DidNotAct` refunds (BUG-4): refund ONLY when a replay is a guaranteed
+    /// no-op because nothing acted; any 5xx from the cores stays SPENT — it may have acted
+    /// (indeterminate keeps the consumption, exactly like the pay path keeps its reservation).
+    fn refund(self, state: &MandateApiState) {
+        let mut spent = state
+            .spent_fresh_money_tokens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        spent.remove(&self.key);
+    }
+}
+
+/// Spend the fresh verification: exactly ONE money write per WebAuthn ceremony. Keyed by the
+/// SHA-256 of the CANONICAL payload the signature was verified over — NEVER the raw token
+/// string (council S33 guardian F1): the same assertion can be re-encoded into byte-different
+/// token strings that all still verify, so a raw-string key would see each re-encoding as
+/// unspent; the canonical form collapses every valid re-encoding onto one key, and altering any
+/// field to mint a new key breaks the signature. Each real ceremony mints unique grant/session
+/// ids, so distinct ceremonies never collide. Entries are pruned once they out-age the
+/// freshness window (plus the same 60s issue-skew the verifier tolerates), so the map stays
+/// bounded by the number of REAL ceremonies inside a ~4-minute window; if it is somehow full,
+/// we refuse — fail closed, never drop replay protection to accept a write.
 fn consume_fresh_money_token(
     state: &MandateApiState,
-    fresh_passkey_token: &str,
-) -> Result<(), Box<axum::response::Response>> {
+    canonical_assertion: &str,
+) -> Result<SpentFreshVerification, Box<axum::response::Response>> {
     use sha2::Digest as _;
-    let key = hex::encode(sha2::Sha256::digest(fresh_passkey_token.trim().as_bytes()));
+    let key = hex::encode(sha2::Sha256::digest(canonical_assertion.as_bytes()));
     let now = now_ts();
     let mut spent = state
         .spent_fresh_money_tokens
@@ -251,8 +281,8 @@ fn consume_fresh_money_token(
                 .into_response(),
         ));
     }
-    spent.insert(key, now + MONEY_FRESH_WINDOW_SECS + 60);
-    Ok(())
+    spent.insert(key.clone(), now + MONEY_FRESH_WINDOW_SECS + 60);
+    Ok(SpentFreshVerification { key })
 }
 
 /// A money WRITE body: the shared input plus the fresh passkey verification that authorizes this
@@ -499,12 +529,15 @@ async fn money_set_budget(
     headers: HeaderMap,
     Json(body): Json<FreshMoneyWrite<crate::api::handlers::capability::SetSpendBudgetInput>>,
 ) -> axum::response::Response {
-    if let Err(resp) = require_fresh_money_authorization(&state, &headers, &body.fresh_passkey_token)
+    let spent = match require_fresh_money_authorization(&state, &headers, &body.fresh_passkey_token)
     {
-        return *resp;
-    }
+        Ok(spent) => spent,
+        Err(resp) => return *resp,
+    };
     let body = body.input;
     let Some(rail) = &state.pay_rail else {
+        // Pre-effect refusal: nothing is wired, nothing acted — the ceremony is re-credited.
+        spent.refund(&state);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "no payment rail is wired — a spend budget nothing enforces is refused".to_string(),
@@ -516,6 +549,8 @@ async fn money_set_budget(
     // consent-broker API carries no ceiling — a larger cap is a deliberate operator act.
     let ceiling = web_max_spend_cap();
     if body.limit > ceiling {
+        // Pre-effect refusal: the core never ran — the ceremony is re-credited.
+        spent.refund(&state);
         return (
             StatusCode::FORBIDDEN,
             format!(
@@ -532,7 +567,15 @@ async fn money_set_budget(
         body,
     ) {
         Ok(out) => Json(out).into_response(),
-        Err((status, msg)) => (status, msg).into_response(),
+        Err((status, msg)) => {
+            // A 4xx from the shared core is a pre-effect rejection by construction (validation,
+            // slug bound) — re-credit. A 5xx may have partially acted (apply-then-attest) — the
+            // ceremony stays spent, mirroring the pay path's indeterminate-keeps-reservation.
+            if status.is_client_error() {
+                spent.refund(&state);
+            }
+            (status, msg).into_response()
+        }
     }
 }
 
@@ -548,12 +591,15 @@ async fn money_reconcile(
     headers: HeaderMap,
     Json(body): Json<FreshMoneyWrite<crate::api::handlers::capability::ReconcilePaymentInput>>,
 ) -> axum::response::Response {
-    if let Err(resp) = require_fresh_money_authorization(&state, &headers, &body.fresh_passkey_token)
+    let spent = match require_fresh_money_authorization(&state, &headers, &body.fresh_passkey_token)
     {
-        return *resp;
-    }
+        Ok(spent) => spent,
+        Err(resp) => return *resp,
+    };
     let body = body.input;
     let Some(rail) = &state.pay_rail else {
+        // Pre-effect refusal: nothing is wired, nothing acted — the ceremony is re-credited.
+        spent.refund(&state);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "no payment rail is wired".to_string(),
@@ -567,7 +613,14 @@ async fn money_reconcile(
         body,
     ) {
         Ok(out) => Json(out).into_response(),
-        Err((status, msg)) => (status, msg).into_response(),
+        Err((status, msg)) => {
+            // 404 (unknown key) / 409 (already resolved) are pre-effect lookups by the core's
+            // construction — re-credit. A 5xx may be indeterminate — the ceremony stays spent.
+            if status.is_client_error() {
+                spent.refund(&state);
+            }
+            (status, msg).into_response()
+        }
     }
 }
 
@@ -1603,6 +1656,138 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "the marker admits the same-origin write");
+    }
+
+    /// Council S33 guardian F1 (the fold's ship-blocker): the single-use guard keys on the
+    /// CANONICAL assertion the signature covers, never the raw token string. A spent fresh token
+    /// RE-ENCODED into a byte-different string (pretty-printed JSON, same envelope) still
+    /// VERIFIES as the same assertion — and must still read as SPENT. Before the fix the guard
+    /// hashed the raw string, so one WebAuthn ceremony re-encoded N ways authorized N money
+    /// writes. The 403 (not 401) on the replay is the proof the re-encoding passed verification
+    /// and the GUARD — not the signature check — is what refused it.
+    #[tokio::test]
+    async fn a_re_encoded_spent_verification_is_still_spent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (capability_manager, standing_service) = manager_and_service();
+        let meter = Arc::new(
+            elastos_runtime::primitives::spend::SpendMeter::open_durable(
+                dir.path().join("spend_meter.json"),
+            )
+            .unwrap(),
+        );
+        let state = MandateApiState {
+            standing_service,
+            capability_manager,
+            data_dir: dir.path().to_path_buf(),
+            pay_rail: Some(crate::api::server::PayRail {
+                meter: meter.clone(),
+                provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
+                ledger: Arc::new(crate::payment_ledger::PaymentLedger::new()),
+            }),
+            spent_fresh_money_tokens: Arc::default(),
+        };
+        let app = mandate_router(state);
+        let (standing, fresh) = money_write_tokens(dir.path(), 1);
+
+        // Spend the verification on a legitimate write.
+        let resp = post_json(
+            app.clone(),
+            "/api/apps/mandates/spend-budget",
+            Some(standing.clone()),
+            &money_body(&fresh[0], r#"{"capsule":"vm-malleate","limit":50}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(meter.remaining("vm-malleate"), 50);
+
+        // Re-encode the SAME token into a byte-different string: decode → parse → pretty-print
+        // → re-encode. The signature still verifies (it covers the canonical payload, which is
+        // unchanged); only the transport bytes differ.
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&fresh[0])
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let pretty = serde_json::to_vec_pretty(&value).unwrap();
+        assert_ne!(pretty, bytes, "the re-encoding must be byte-different");
+        let re_encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&pretty);
+        assert_ne!(re_encoded, fresh[0]);
+
+        let resp = post_json(
+            app,
+            "/api/apps/mandates/spend-budget",
+            Some(standing),
+            &money_body(&re_encoded, r#"{"capsule":"vm-malleate","limit":999}"#),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "the re-encoded replay must read SPENT (403), not unverified (401)"
+        );
+        assert_eq!(meter.remaining("vm-malleate"), 50, "the replay applied NOTHING");
+    }
+
+    /// Council S33 red-team F1: a refusal PROVABLY BEFORE any money effect (here the web
+    /// ceiling) re-credits the ceremony — the operator's one verification still buys their one
+    /// write — and the verification is spent only when a write actually reaches the core.
+    #[tokio::test]
+    async fn a_pre_effect_refusal_re_credits_the_fresh_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let (capability_manager, standing_service) = manager_and_service();
+        let meter = Arc::new(
+            elastos_runtime::primitives::spend::SpendMeter::open_durable(
+                dir.path().join("spend_meter.json"),
+            )
+            .unwrap(),
+        );
+        let state = MandateApiState {
+            standing_service,
+            capability_manager,
+            data_dir: dir.path().to_path_buf(),
+            pay_rail: Some(crate::api::server::PayRail {
+                meter: meter.clone(),
+                provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
+                ledger: Arc::new(crate::payment_ledger::PaymentLedger::new()),
+            }),
+            spent_fresh_money_tokens: Arc::default(),
+        };
+        let app = mandate_router(state);
+        let (standing, fresh) = money_write_tokens(dir.path(), 1);
+        let over = WEB_MAX_SPEND_CAP_DEFAULT + 1;
+
+        // Refused over the ceiling — pre-effect, so the ceremony is re-credited.
+        let resp = post_json(
+            app.clone(),
+            "/api/apps/mandates/spend-budget",
+            Some(standing.clone()),
+            &money_body(&fresh[0], &format!(r#"{{"capsule":"vm-cred","limit":{over}}}"#)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(meter.snapshot("vm-cred"), None, "nothing was provisioned");
+
+        // The SAME verification now authorizes the corrected write.
+        let resp = post_json(
+            app.clone(),
+            "/api/apps/mandates/spend-budget",
+            Some(standing.clone()),
+            &money_body(&fresh[0], r#"{"capsule":"vm-cred","limit":100}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "the re-credited verification still works");
+        assert_eq!(meter.remaining("vm-cred"), 100);
+
+        // …and having bought its one applied write, it is now spent for good.
+        let resp = post_json(
+            app,
+            "/api/apps/mandates/spend-budget",
+            Some(standing),
+            &money_body(&fresh[0], r#"{"capsule":"vm-cred","limit":101}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "one applied write, then spent");
+        assert_eq!(meter.remaining("vm-cred"), 100);
     }
 
     /// Honest absence: a well-formed token with no durable records ⇒ 404, never a fabricated receipt.

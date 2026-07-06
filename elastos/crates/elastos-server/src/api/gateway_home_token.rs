@@ -35,7 +35,8 @@ struct HomeLaunchTokenEnvelope {
 }
 
 /// How the launch token reached the gate. The CSRF analysis differs: a HEADER-borne token is
-/// unforgeable cross-origin (custom headers force a CORS preflight this gateway never passes),
+/// unforgeable cross-origin (custom headers force a CORS preflight the gateway never grants to
+/// a foreign origin — pinned by the S31 no-ACAO regression test),
 /// while a COOKIE-borne token rides ambient browser credentials — cookie-authorized WRITES must
 /// therefore also present the surface's custom marker header (see `gateway_mandates`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,12 +269,22 @@ pub(crate) fn require_home_launch_token_context_transport(
         .map(|required| (required.context, required.transport))
 }
 
+/// Validates a FRESH, proof-bound (passkey) Home token against the standing context and returns
+/// the CANONICAL payload JSON the signature was verified over — the assertion's identity.
+///
+/// Callers that must make the assertion SINGLE-USE (the money writes, council S33 F1) MUST key
+/// their spent-guard on this returned canonical form, never on the raw token string: signature
+/// verification re-parses the envelope and canonicalizes the payload, so the SAME assertion can
+/// be re-encoded into byte-different token strings (whitespace, field order) that all still
+/// verify — a raw-string key would see each re-encoding as unspent. The canonical payload is
+/// what the ed25519 signature actually covers, so every valid re-encoding collapses onto one
+/// key, and altering any field to get a new key breaks the signature.
 pub(crate) fn require_fresh_passkey_home_token(
     data_dir: &std::path::Path,
     token: &str,
     expected_context: &HomeLaunchTokenContext,
     max_age_secs: u64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let token = token.trim();
     if token.is_empty() {
         anyhow::bail!("missing fresh passkey token");
@@ -323,7 +334,10 @@ pub(crate) fn require_fresh_passkey_home_token(
     {
         anyhow::bail!("fresh passkey token authority context mismatch");
     }
-    Ok(())
+    // The canonical form the signature covers — the assertion's ONE identity across every
+    // possible re-encoding of the token string (see the doc-comment).
+    serde_json::to_string(&serde_json::to_value(&envelope.payload)?)
+        .map_err(|err| anyhow::anyhow!("could not canonicalize fresh passkey token: {err}"))
 }
 
 pub(crate) fn require_home_token(
