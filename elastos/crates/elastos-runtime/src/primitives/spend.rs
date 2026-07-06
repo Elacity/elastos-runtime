@@ -35,9 +35,9 @@
 //!   restart. A corrupt snapshot refuses to open (fail-closed) rather than booting with a silently
 //!   refilled cap.
 //!
-//! The pay affordance remains dev/demo-gated (`ELASTOS_ALLOW_MOCK_PAYMENTS`) until a REAL
-//! `PaymentProvider` rail connector replaces the mock (Sprint 29) — durability alone does not make
-//! the mock rail honest.
+//! The REAL rail connector exists as of Sprint 29 (`HttpPaymentProvider`, wired via
+//! `ELASTOS_PAYMENT_ENDPOINT` and REQUIRING this durable mode); the Mock rail remains dev/demo-gated
+//! (`ELASTOS_ALLOW_MOCK_PAYMENTS`).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -73,9 +73,13 @@ pub enum SpendError {
     /// A durable meter could not persist the mutation. The mutation was ROLLED BACK — a reservation
     /// that would not survive a restart is never granted (in-memory mode never returns this).
     Persist,
-    /// The durable meter is POISONED: a prior persist failed AFTER the rename published the new
-    /// snapshot (council S28 F1), so a power cut could still revert what memory holds. All further
-    /// mutations refuse until the meter is reopened from disk (fail-closed; reads still project).
+    /// The durable meter is POISONED: a persist failed AFTER the rename published the new snapshot
+    /// (council S28 F1). The mutation that poisoned IS in the visible snapshot and in memory (they
+    /// agree — see the module doc), but its power-cut protection is missing, so all further
+    /// mutations refuse until the meter is reopened from disk — in practice, a process restart
+    /// (the live meter's own single-opener flock forbids opening a replacement). Fail-closed;
+    /// reads still project. Returned BOTH by the mutation that poisoned and by every mutation
+    /// after it (council S29 F1: the poisoning call must not claim a rollback that didn't happen).
     Poisoned,
 }
 
@@ -97,8 +101,10 @@ impl std::fmt::Display for SpendError {
             ),
             SpendError::Poisoned => write!(
                 f,
-                "spend meter is poisoned (a prior persist failed after publish); mutations \
-                 refuse until it is reopened from disk"
+                "spend meter is poisoned: a persist failed after publishing the new snapshot — \
+                 the last mutation IS in the visible snapshot but its power-cut protection is \
+                 missing; mutations refuse until the meter is reopened from disk (in practice: \
+                 restart the process)"
             ),
         }
     }
@@ -404,9 +410,10 @@ impl SpendMeter {
             }
             Err(PersistFailure::PostPublish) => {
                 // The new limit IS the visible disk state — keep memory in agreement, poison, and
-                // refuse: the caller's loud double-failure path is the right surface for this.
+                // refuse with the HONEST variant (council S29 F1: `Persist` claims a rollback
+                // that did not happen here). The caller's loud double-failure path handles it.
                 self.poison();
-                Err(SpendError::Persist)
+                Err(SpendError::Poisoned)
             }
         }
     }
@@ -432,8 +439,9 @@ impl SpendMeter {
                 Err(SpendError::Persist)
             }
             Err(PersistFailure::PostPublish) => {
+                // The removal IS published; honest variant, same rule as set_budget (S29 F1).
                 self.poison();
-                Err(SpendError::Persist)
+                Err(SpendError::Poisoned)
             }
         }
     }
@@ -519,9 +527,10 @@ impl SpendMeter {
             Err(PersistFailure::PostPublish) => {
                 // The debit IS the visible disk state, but its power-cut protection is missing —
                 // refuse the payment (fail-closed; the reservation stays, an orphaned-reservation
-                // shape the operator can repair) and poison against further churn.
+                // shape the operator can repair) and poison against further churn. The HONEST
+                // variant (S29 F1): `Persist` would claim a rollback that did not happen.
                 self.poison();
-                Err(SpendError::Persist)
+                Err(SpendError::Poisoned)
             }
         }
     }
@@ -977,8 +986,9 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
             meter.try_debit("vm-ap-agent", 200).unwrap_err(),
-            SpendError::Persist,
-            "the payment is refused — its power-cut protection is missing"
+            SpendError::Poisoned,
+            "the payment is refused with the HONEST variant (S29 F1) — the debit IS in the \
+             visible snapshot, so `Persist` (\"rolled back\") would be a lie"
         );
         assert!(meter.is_poisoned());
         assert_eq!(

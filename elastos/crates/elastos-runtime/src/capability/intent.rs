@@ -413,8 +413,11 @@ pub enum ReconciliationStatus {
     /// A receipt exists but a bound field differs from the declared intent (the act fired
     /// within the envelope, but not as declared — flagged, never masked).
     Diverged,
-    /// The intent was declared but no receipt was produced (the act never completed).
-    /// Absence is recorded, never a silent pass.
+    /// The intent was declared but no receipt was produced. This is ABSENCE OF ATTESTATION, not
+    /// proof the act never happened (council S29 F5): for a side-effecting executor whose outcome
+    /// is INDETERMINATE (e.g. a payment rail timeout — the effect may have landed), this is the
+    /// deliberately honest verdict — nothing attests performance, so nothing claims it. Absence is
+    /// recorded, never a silent pass; the executor's decline reason carries the specifics.
     Undelivered,
 }
 

@@ -173,8 +173,15 @@ impl PaymentProvider for MockPaymentProvider {
 ///   the runtime keeps the reservation and the idempotency key makes reconciliation/retry safe.
 ///
 /// The order carries `{payee, amount, idempotency_key}` as JSON plus an `Idempotency-Key` header;
-/// auth is a static bearer token. The call runs on a dedicated OS thread (the executor runs inside
-/// async handlers; a blocking HTTP client must not run on, or panic in, a runtime worker).
+/// auth is a static bearer token. The call runs on a dedicated OS thread (isolating the blocking
+/// client and its panics; the caller still waits — the pay closure's in-flight bound is what
+/// protects the runtime). Redirects are never followed (3xx ⇒ indeterminate).
+///
+/// ENDPOINT CONTRACT edge cases an implementor must know (council S29 F11): ALL 2xx — including
+/// `202 Accepted` — read as CHARGED (do not return 202 for a queued-but-unconfirmed order); ALL
+/// 4xx — including `408`/`429` — read as NOT charged and REFUND the cap, so never answer 4xx for
+/// an order that may have been processed (answer 5xx, which is indeterminate and keeps the
+/// reservation).
 pub struct HttpPaymentProvider {
     endpoint: String,
     bearer_token: Option<String>,
@@ -204,12 +211,22 @@ impl PaymentProvider for HttpPaymentProvider {
         let timeout = self.timeout;
         let payee = payee.to_string();
         let key = idempotency_key.to_string();
-        // A dedicated thread: reqwest's blocking client refuses to run on an async runtime worker,
-        // and a payment must never block one either. A JOIN failure (the thread panicked) is
-        // INDETERMINATE — the request may already have been sent.
+        // A dedicated thread ISOLATES reqwest's blocking client (which refuses to run on an async
+        // runtime worker) and its panics — it does NOT free the caller: the join below still
+        // blocks the calling thread for up to `timeout` (council S29 F8), which is why the pay
+        // closure bounds concurrent in-flight payments fail-closed. A JOIN failure (the thread
+        // panicked) is INDETERMINATE — the request may already have been sent.
+        //
+        // Ambient-proxy trust, stated (council S29 F11): reqwest honors HTTPS_PROXY/HTTP_PROXY, so
+        // in a proxied deployment the payment order + bearer token transit the egress proxy — the
+        // same trust already extended for every other outbound call from this process.
         let handle = std::thread::spawn(move || -> Result<String, PayError> {
             let client = reqwest::blocking::Client::builder()
                 .timeout(timeout)
+                // NEVER follow redirects (council S29 F6): the default policy re-issues a 301/302
+                // as a GET whose 200 would read as "the endpoint CONFIRMED the charge" — a
+                // Performed receipt minted off a login page. A 3xx is classified below.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| PayError::NotCharged(format!("rail client not constructed: {e}")))?;
             let mut req = client
@@ -225,8 +242,10 @@ impl PaymentProvider for HttpPaymentProvider {
             }
             let resp = match req.send() {
                 Ok(r) => r,
-                Err(e) if e.is_connect() => {
-                    // The connection was never established — nothing reached the rail.
+                Err(e) if e.is_builder() || e.is_connect() => {
+                    // A malformed URL (builder) or a connection never established: the order
+                    // provably never left this process / reached the rail (council S29 F3 — a
+                    // misconfigured endpoint must not read as "the charge may have posted").
                     return Err(PayError::NotCharged(format!("rail unreachable: {e}")));
                 }
                 Err(e) => {
@@ -235,10 +254,22 @@ impl PaymentProvider for HttpPaymentProvider {
                 }
             };
             let status = resp.status();
-            let body = resp.text().unwrap_or_default();
+            // Bound the read BEFORE buffering (a misbehaving endpoint must not OOM the money
+            // path), then truncate to the reference length actually used.
+            let mut body = String::new();
+            {
+                use std::io::Read as _;
+                let _ = resp.take(64 * 1024).read_to_string(&mut body);
+            }
             let body_head: String = body.chars().take(256).collect();
             if status.is_success() {
                 Ok(body_head)
+            } else if status.is_redirection() {
+                // The order REACHED the endpoint and it answered with a redirect we refuse to
+                // follow — whether the real handler processed it is unknowable from here.
+                Err(PayError::Indeterminate(format!(
+                    "rail redirected ({status}) — refusing to follow for a money order"
+                )))
             } else if status.is_client_error() {
                 Err(PayError::NotCharged(format!(
                     "rail rejected the order ({status}): {body_head}"
@@ -622,13 +653,23 @@ impl MethodRegistryExecutor {
     /// in-memory meter remains available for tests/embedded and rate-limiting uses. A crash between
     /// the persisted reservation and the rail leaves an ORPHANED reservation: the intent id is
     /// burned (no replay) and no money moved, so the cap honestly over-counts — fail-closed; the
-    /// operator's recovery lever is raising the limit (rail reconciliation is the S29 repair).
-    /// `runtime.pay` stays dev/demo-gated until a REAL rail connector replaces the mock (S29).
+    /// operator's recovery lever is raising the limit — AFTER reconciling with the rail: an
+    /// indeterminate reservation may correspond to a charge that DID post, so a blind cap raise
+    /// can authorize real spend beyond the original intent (council S29 red-team F4).
+    /// The REAL rail is [`HttpPaymentProvider`] (`ELASTOS_PAYMENT_ENDPOINT`, https-enforced,
+    /// durable meter required); the Mock stays dev/demo-gated (`ELASTOS_ALLOW_MOCK_PAYMENTS`).
     pub fn with_payments(
         mut self,
         meter: Arc<elastos_runtime::primitives::spend::SpendMeter>,
         provider: Arc<dyn PaymentProvider>,
     ) -> Self {
+        // Bound on CONCURRENT in-flight payments (council S29 red-team F2): the rail call blocks
+        // the dispatching thread for up to its timeout, and the per-mandate rate budget bounds
+        // acts-per-window, not concurrency — without this cap a slow/hostile rail × parallel
+        // dispatches could wedge every async worker. Fail-closed: over the bound, the payment is
+        // REFUSED before any reservation (nothing debited, nothing sent), never queued.
+        const MAX_INFLIGHT_PAYMENTS: usize = 8;
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         self.register(
             "runtime.pay",
             Arc::new(move |intent: &IntentDeclarationV1| {
@@ -664,6 +705,30 @@ impl MethodRegistryExecutor {
                             .to_string(),
                     };
                 }
+                // Concurrency gate BEFORE the reservation: an over-bound payment is refused with
+                // nothing debited and nothing sent. The RAII guard releases the slot on EVERY
+                // exit path below, including a provider panic (caught by catch_unwind).
+                struct InFlightSlot(Arc<std::sync::atomic::AtomicUsize>);
+                impl Drop for InFlightSlot {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                let slot = {
+                    let prior = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let slot = InFlightSlot(in_flight.clone());
+                    if prior >= MAX_INFLIGHT_PAYMENTS {
+                        drop(slot);
+                        return IntentExecution::Declined {
+                            reason: format!(
+                                "payment refused: {MAX_INFLIGHT_PAYMENTS} payments already \
+                                 in-flight (fail-closed concurrency bound; retry later)"
+                            ),
+                        };
+                    }
+                    slot
+                };
+                let _slot = slot;
                 // RESERVE against the cap FIRST — atomic, fail-closed. Over budget (or an
                 // unprovisioned capsule ⇒ zero) refuses here; no money can move.
                 if let Err(e) = meter.try_debit(&intent.capsule, amount) {
@@ -681,15 +746,27 @@ impl MethodRegistryExecutor {
                     provider.pay(payee, amount, &idempotency_key)
                 }));
                 match outcome {
-                    Ok(Ok(_rail_ref)) => IntentExecution::Performed {
-                        capsule: intent.capsule.clone(),
-                        method_id: intent.method_id.clone(),
-                        // Echo the amount actually charged (== declared) so reconcile Matches; the
-                        // receipt's CapabilityUse names a payment of this amount to this payee.
-                        input_hash: amount.to_string(),
-                        resource: intent.resource.clone(),
-                        action: "execute".to_string(),
-                    },
+                    Ok(Ok(rail_ref)) => {
+                        // Operator-log the rail linkage (council S29 F7): the receipt itself does
+                        // not carry the rail reference (a receipt field is the tracked follow-on),
+                        // so this line is the audit bridge from a Performed pay to the rail's txn.
+                        tracing::info!(
+                            capsule = %intent.capsule,
+                            amount,
+                            idempotency_key = %idempotency_key,
+                            rail_ref = %rail_ref.chars().take(128).collect::<String>(),
+                            "payment performed on the rail"
+                        );
+                        IntentExecution::Performed {
+                            capsule: intent.capsule.clone(),
+                            method_id: intent.method_id.clone(),
+                            // Echo the amount actually charged (== declared) so reconcile Matches;
+                            // the receipt's CapabilityUse names a payment of this amount+payee.
+                            input_hash: amount.to_string(),
+                            resource: intent.resource.clone(),
+                            action: "execute".to_string(),
+                        }
+                    }
                     Ok(Err(PayError::NotCharged(rail_err))) => {
                         // PROVABLY not charged — REFUND the reservation and Decline. The signed
                         // reason claims "refunded" ONLY when the refund is durably in force
@@ -1451,6 +1528,89 @@ mod tests {
                 .with_timeout(std::time::Duration::from_millis(300))
                 .pay("acme-vendor", 200, "k"),
             Err(PayError::Indeterminate(_))
+        ));
+
+        // A REDIRECT is never followed (council S29 F6): the default policy would re-issue the
+        // POST as a GET whose 200 mints a Performed receipt off a login page. 3xx ⇒ indeterminate.
+        let (url, _rx) = serve_once("302 Found");
+        assert!(matches!(
+            HttpPaymentProvider::new(url, None).pay("acme-vendor", 200, "k"),
+            Err(PayError::Indeterminate(_))
+        ));
+
+        // A malformed endpoint (builder error — nothing ever left the process) is provably NOT
+        // charged (council S29 F3), never "the charge may have posted".
+        assert!(matches!(
+            HttpPaymentProvider::new("not a url at all".to_string(), None)
+                .pay("acme-vendor", 200, "k"),
+            Err(PayError::NotCharged(_))
+        ));
+    }
+
+    /// Council S29 red-team F2: concurrent in-flight payments are BOUNDED fail-closed — the 9th
+    /// while 8 block on the rail is REFUSED with nothing debited and nothing sent; slots release
+    /// when the rail returns.
+    #[test]
+    fn pay_in_flight_concurrency_is_bounded_fail_closed() {
+        struct BlockingProvider {
+            entered: std::sync::atomic::AtomicUsize,
+            rx: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl PaymentProvider for BlockingProvider {
+            fn pay(&self, _payee: &str, _amount: u64, _key: &str) -> Result<String, PayError> {
+                self.entered
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = self.rx.lock().unwrap().recv(); // hold the slot until released
+                Ok("ok".to_string())
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let provider = Arc::new(BlockingProvider {
+            entered: std::sync::atomic::AtomicUsize::new(0),
+            rx: std::sync::Mutex::new(rx),
+        });
+        let meter = Arc::new(SpendMeter::new());
+        meter.set_budget("vm-agent", 1000).unwrap();
+        let reg = Arc::new(
+            MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
+                .with_payments(meter.clone(), provider.clone()),
+        );
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let r = reg.clone();
+            handles.push(std::thread::spawn(move || {
+                r.execute(&pay_intent("acme-vendor", "vm-agent", "10"))
+            }));
+        }
+        // Wait until all 8 are genuinely in-flight (inside the rail call, slots held).
+        while provider.entered.load(std::sync::atomic::Ordering::SeqCst) < 8 {
+            std::thread::yield_now();
+        }
+        match reg.execute(&pay_intent("acme-vendor", "vm-agent", "10")) {
+            IntentExecution::Declined { reason } => {
+                assert!(
+                    reason.contains("in-flight"),
+                    "the 9th concurrent payment is refused by the bound: {reason}"
+                );
+            }
+            other => panic!("expected Declined, got {other:?}"),
+        }
+        assert_eq!(
+            meter.remaining("vm-agent"),
+            1000 - 80,
+            "the refused payment debited NOTHING (only the 8 in-flight reservations)"
+        );
+        for _ in 0..8 {
+            tx.send(()).unwrap();
+        }
+        for h in handles {
+            assert!(matches!(h.join().unwrap(), IntentExecution::Performed { .. }));
+        }
+        // Slots released: a new payment goes through again.
+        drop(tx);
+        assert!(matches!(
+            reg.execute(&pay_intent("acme-vendor", "vm-agent", "10")),
+            IntentExecution::Performed { .. }
         ));
     }
 

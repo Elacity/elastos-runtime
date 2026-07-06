@@ -266,8 +266,58 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
                          the REAL rail wins; the mock is ignored"
                     );
                 }
-                match open_durable_meter() {
-                    Some(m) => {
+                // Endpoint validation, fail-closed (council S29 red-team F1 / guardian F3-F4): a
+                // money order + bearer token must never transit plaintext, and a malformed value
+                // must refuse at BOOT (a builder error at pay time would strand reservations).
+                // https is REQUIRED; plaintext http is allowed ONLY to loopback (a same-box
+                // sidecar adapter — inside the host trust boundary).
+                let endpoint_ok = match url::Url::parse(&endpoint) {
+                    Ok(u) => match u.scheme() {
+                        "https" => true,
+                        "http" => {
+                            let loopback = matches!(
+                                u.host(),
+                                Some(url::Host::Ipv4(ip)) if ip.is_loopback()
+                            ) || matches!(
+                                u.host(),
+                                Some(url::Host::Ipv6(ip)) if ip.is_loopback()
+                            ) || matches!(u.host_str(), Some("localhost"));
+                            if !loopback {
+                                tracing::error!(
+                                    "ELASTOS_PAYMENT_ENDPOINT is plaintext http to a non-loopback \
+                                     host — payment orders and the bearer token would transit \
+                                     cleartext (MITM could forge Performed receipts); runtime.pay \
+                                     stays UNWIRED. Use https."
+                                );
+                            }
+                            loopback
+                        }
+                        other => {
+                            tracing::error!(
+                                "ELASTOS_PAYMENT_ENDPOINT has unsupported scheme {other:?} — \
+                                 runtime.pay stays UNWIRED"
+                            );
+                            false
+                        }
+                    },
+                    Err(e) => {
+                        tracing::error!(
+                            "ELASTOS_PAYMENT_ENDPOINT is not a valid URL ({e}) — runtime.pay \
+                             stays UNWIRED"
+                        );
+                        false
+                    }
+                };
+                let token = std::env::var("ELASTOS_PAYMENT_TOKEN").ok();
+                if endpoint_ok && token.is_none() {
+                    tracing::warn!(
+                        "the REAL payment rail is wired WITHOUT a bearer token \
+                         (ELASTOS_PAYMENT_TOKEN unset) — the endpoint must authenticate callers \
+                         some other way"
+                    );
+                }
+                match (endpoint_ok, open_durable_meter()) {
+                    (true, Some(m)) => {
                         tracing::info!(
                             "runtime.pay is wired to the REAL payment rail at {endpoint} \
                              (durable spend meter; provision caps at POST /api/spend-budgets)"
@@ -275,12 +325,11 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
                         Some((
                             m,
                             Arc::new(crate::intent_executor::HttpPaymentProvider::new(
-                                endpoint,
-                                std::env::var("ELASTOS_PAYMENT_TOKEN").ok(),
+                                endpoint, token,
                             )),
                         ))
                     }
-                    None => {
+                    (true, None) => {
                         tracing::error!(
                             "ELASTOS_PAYMENT_ENDPOINT is set but no DURABLE spend meter is \
                              available — real money on a non-durable cap is refused; runtime.pay \
@@ -288,6 +337,7 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
                         );
                         None
                     }
+                    (false, _) => None,
                 }
             } else if mock_allowed {
                 // With a data_dir, the durable meter is used (an unopenable snapshot leaves pay

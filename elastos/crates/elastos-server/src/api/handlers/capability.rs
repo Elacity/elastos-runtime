@@ -1405,6 +1405,10 @@ pub struct SpendBudgetOutput {
     pub limit: u64,
     pub spent: u64,
     pub remaining: u64,
+    /// True when the enforcing meter is POISONED (a persist failed post-publish): every payment
+    /// and every provisioning change is refusing fail-closed until the process is restarted
+    /// (council S29 F5/F10 — the ops surface for `SpendMeter::is_poisoned`).
+    pub poisoned: bool,
 }
 
 /// POST /api/spend-budgets  (shell-only) — provision (or re-set) a capsule's money cap.
@@ -1514,6 +1518,7 @@ pub async fn set_spend_budget(
         limit: snap.limit,
         spent: snap.spent,
         remaining: snap.remaining,
+        poisoned: meter.is_poisoned(),
     }))
 }
 
@@ -1538,6 +1543,7 @@ pub async fn get_spend_budget(
         limit: snap.limit,
         spent: snap.spent,
         remaining: snap.remaining,
+        poisoned: meter.is_poisoned(),
     }))
 }
 
@@ -1694,11 +1700,18 @@ pub struct DispatchIntentOutput {
     /// - `denied` — the intent fell outside a live mandate (see `reason`); nothing performed.
     /// - `performed` — authorized AND a real executor performed it as declared (`Matched`).
     /// - `diverged` — authorized, but the executor did something other than declared (`Diverged`).
-    /// - `authorized_not_performed` — authorized, but no executor performed it (`Undelivered`).
+    /// - `authorized_not_performed` — authorized, but NO RECEIPT ATTESTS performance
+    ///   (`Undelivered`). This is absence-of-attestation, not proof-of-absence: for a MONEY act
+    ///   the effect may still have occurred (an INDETERMINATE rail outcome — timeout/5xx/panic —
+    ///   deliberately reconciles here; council S29 F5). Check `reason` before treating it as
+    ///   "nothing happened".
     ///
     /// Only `performed` records a successful `CapabilityUse` in the mandate receipt.
     pub outcome: String,
-    /// The fail-closed denial reason (snake_case) when denied; `None` otherwise.
+    /// The fail-closed denial reason (snake_case) when `denied`; for an authorized-but-declined
+    /// act, the EXECUTOR's decline reason (S29 F2) — for money acts this distinguishes a
+    /// cap-refusal from an INDETERMINATE outcome and names the idempotency key to reconcile with
+    /// the rail. `None` when performed.
     pub reason: Option<String>,
     /// The signed reconciliation when the intent was authorized (any of performed/diverged/
     /// authorized_not_performed); `None` when denied. Its `status` is the independent verdict of
@@ -1929,13 +1942,31 @@ pub async fn dispatch_standing_intent(
     // silently record "authorized_not_performed" (that would HIDE a real effect); surface it.
     let unrepresentable = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let unrepresentable_w = unrepresentable.clone();
+    // The executor's DECLINE reason must reach the caller (council S29 F2): for a money act an
+    // INDETERMINATE outcome ("the charge may have posted; reconcile under this idempotency key")
+    // and a plain cap-refusal are indistinguishable without it — and the reason is the ONLY
+    // artifact naming the reconciliation key. Captured here, surfaced in the response `reason`
+    // and error-logged; putting it on-chain stays the tracked follow-on (S27 F3).
+    let decline_reason = Arc::new(std::sync::Mutex::new(None::<String>));
+    let decline_reason_w = decline_reason.clone();
     // The act runs ONLY when the gate authorizes (dispatch calls this closure solely on the Acted
     // path), so a denied/revoked/wrong-agent intent never invokes the executor — "no authorization
     // ⇒ no act". The receipt is minted from what the executor REPORTS it performed, never from the
     // declaration, so reconcile compares performed-vs-declared honestly.
     let outcome = state.standing_service.dispatch(&intent, move || {
         match executor.execute(&intent_for_exec) {
-            crate::intent_executor::IntentExecution::Declined { .. } => None,
+            crate::intent_executor::IntentExecution::Declined { reason } => {
+                if reason.contains("INDETERMINATE") {
+                    tracing::error!(
+                        capsule = %intent_for_exec.capsule,
+                        "indeterminate money outcome on dispatch: {reason}"
+                    );
+                }
+                if let Ok(mut slot) = decline_reason_w.lock() {
+                    *slot = Some(reason);
+                }
+                None
+            }
             crate::intent_executor::IntentExecution::Performed {
                 capsule,
                 method_id,
@@ -2005,7 +2036,10 @@ pub async fn dispatch_standing_intent(
             (
                 DispatchIntentOutput {
                     outcome: label.to_string(),
-                    reason: None,
+                    // The executor's decline reason (S29 F2): distinguishes a cap-refusal from an
+                    // INDETERMINATE money outcome, and carries the idempotency key the operator
+                    // reconciles with. `None` for a performed act or a non-executor decline.
+                    reason: decline_reason.lock().ok().and_then(|mut s| s.take()),
                     reconciliation: Some(rec),
                 },
                 matched,
@@ -2688,6 +2722,14 @@ mod tests {
         assert_eq!(
             r2.outcome, "authorized_not_performed",
             "the spend cap physically refused the over-limit payment (signed refusal)"
+        );
+        // Council S29 F2: the EXECUTOR's decline reason reaches the dispatch response — without
+        // it, a cap-refusal and an indeterminate money outcome are indistinguishable to the
+        // operator, and nothing surfaces the reconciliation idempotency key.
+        assert!(
+            r2.reason.as_deref().is_some_and(|r| r.contains("spend cap")),
+            "the dispatch response carries the executor's decline reason: {:?}",
+            r2.reason
         );
         assert_eq!(meter.remaining("vm-ap-agent"), 300, "the refused payment left the cap untouched");
         assert_eq!(provider.payments.lock().unwrap().len(), 1, "still only the one real payment");
