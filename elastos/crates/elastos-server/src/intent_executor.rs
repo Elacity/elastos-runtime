@@ -261,7 +261,9 @@ impl PaymentProvider for HttpPaymentProvider {
                 use std::io::Read as _;
                 let _ = resp.take(64 * 1024).read_to_string(&mut body);
             }
-            let body_head: String = body.chars().take(256).collect();
+            // Sanitize rail-controlled bytes AT SOURCE (council S29 RT-F7): printable ASCII,
+            // bounded — before they enter any reason, ledger record, or future signed field.
+            let body_head = crate::payment_ledger::sanitize_rail_note(&body);
             if status.is_success() {
                 Ok(body_head)
             } else if status.is_redirection() {
@@ -658,10 +660,15 @@ impl MethodRegistryExecutor {
     /// can authorize real spend beyond the original intent (council S29 red-team F4).
     /// The REAL rail is [`HttpPaymentProvider`] (`ELASTOS_PAYMENT_ENDPOINT`, https-enforced,
     /// durable meter required); the Mock stays dev/demo-gated (`ELASTOS_ALLOW_MOCK_PAYMENTS`).
+    /// `ledger` records every rail attempt (Sprint 30): performed (with the rail reference),
+    /// provably-not-charged, and PENDING for indeterminate outcomes — the operator's
+    /// reconciliation work list. The ledger never gates money (its failures are reported in the
+    /// reason, not enforced); pass `PaymentLedger::new()` where reconciliation isn't exercised.
     pub fn with_payments(
         mut self,
         meter: Arc<elastos_runtime::primitives::spend::SpendMeter>,
         provider: Arc<dyn PaymentProvider>,
+        ledger: Arc<crate::payment_ledger::PaymentLedger>,
     ) -> Self {
         // Bound on CONCURRENT in-flight payments (council S29 red-team F2): the rail call blocks
         // the dispatching thread for up to its timeout, and the per-mandate rate budget bounds
@@ -745,17 +752,42 @@ impl MethodRegistryExecutor {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     provider.pay(payee, amount, &idempotency_key)
                 }));
+                // Ledger custody of a PENDING (indeterminate) outcome is load-bearing for
+                // reconciliation — when it cannot be recorded, the reason must say so (the
+                // operator then reconciles from the error log; money semantics are unchanged).
+                let record_pending = |note: &str| -> &'static str {
+                    if ledger.record(
+                        &idempotency_key,
+                        &intent.capsule,
+                        payee,
+                        amount,
+                        crate::payment_ledger::PaymentStatus::Pending,
+                        note,
+                    ) {
+                        "recorded in the payment ledger"
+                    } else {
+                        "ledger entry UNRECORDED — reconcile from the error log"
+                    }
+                };
                 match outcome {
                     Ok(Ok(rail_ref)) => {
-                        // Operator-log the rail linkage (council S29 F7): the receipt itself does
-                        // not carry the rail reference (a receipt field is the tracked follow-on),
-                        // so this line is the audit bridge from a Performed pay to the rail's txn.
+                        // Operator-log + ledger-custody the rail linkage (council S29 F7): the
+                        // receipt itself does not carry the rail reference (a receipt field is the
+                        // tracked follow-on) — these are the audit bridge to the rail's txn.
                         tracing::info!(
                             capsule = %intent.capsule,
                             amount,
                             idempotency_key = %idempotency_key,
                             rail_ref = %rail_ref.chars().take(128).collect::<String>(),
                             "payment performed on the rail"
+                        );
+                        let _ = ledger.record(
+                            &idempotency_key,
+                            &intent.capsule,
+                            payee,
+                            amount,
+                            crate::payment_ledger::PaymentStatus::Performed,
+                            &rail_ref,
                         );
                         IntentExecution::Performed {
                             capsule: intent.capsule.clone(),
@@ -773,6 +805,14 @@ impl MethodRegistryExecutor {
                         // (council S28 F3): a durable refund that cannot persist is rolled back by
                         // try_refund, and the honest record is that the cap remains debited
                         // (fail-closed — the operator restores headroom by raising the budget).
+                        let _ = ledger.record(
+                            &idempotency_key,
+                            &intent.capsule,
+                            payee,
+                            amount,
+                            crate::payment_ledger::PaymentStatus::NotCharged,
+                            &rail_err,
+                        );
                         IntentExecution::Declined {
                             reason: match meter.try_refund(&intent.capsule, amount) {
                                 Ok(_) => format!("payment rail refused (spend refunded): {rail_err}"),
@@ -789,11 +829,13 @@ impl MethodRegistryExecutor {
                         // one unbreakable invariant — so the reservation is KEPT and the chain
                         // records, honestly, an act NOT attested as performed whose funds may have
                         // moved, resolvable via the idempotency key. Fail-closed over-counting.
+                        let ledgered = record_pending(&rail_err);
                         IntentExecution::Declined {
                             reason: format!(
                                 "payment outcome INDETERMINATE ({rail_err}) — not attested as \
                                  performed; the reservation is KEPT (cap remains debited) pending \
-                                 rail reconciliation under idempotency key {idempotency_key}"
+                                 rail reconciliation under idempotency key {idempotency_key} \
+                                 ({ledgered})"
                             ),
                         }
                     }
@@ -803,11 +845,12 @@ impl MethodRegistryExecutor {
                         // AFTER the charge posted, and refunding would let total real spend exceed
                         // the cap. A panic is INDETERMINATE: keep the reservation (S29, supersedes
                         // the S27 refund-on-panic fold for exactly the reason the trait doc gives).
+                        let ledgered = record_pending("rail panicked");
                         IntentExecution::Declined {
                             reason: format!(
                                 "payment rail panicked — outcome INDETERMINATE; the reservation is \
                                  KEPT (cap remains debited) pending rail reconciliation under \
-                                 idempotency key {idempotency_key}"
+                                 idempotency key {idempotency_key} ({ledgered})"
                             ),
                         }
                     }
@@ -1312,7 +1355,7 @@ mod tests {
     fn pay_registry(meter: Arc<SpendMeter>) -> (MethodRegistryExecutor, Arc<MockPaymentProvider>) {
         let provider = Arc::new(MockPaymentProvider::default());
         let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
-            .with_payments(meter, provider.clone());
+            .with_payments(meter, provider.clone(), Arc::new(crate::payment_ledger::PaymentLedger::new()));
         (reg, provider)
     }
 
@@ -1374,7 +1417,7 @@ mod tests {
         let meter = Arc::new(SpendMeter::new());
         meter.set_budget("vm-agent", 100).unwrap();
         let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
-            .with_payments(meter.clone(), Arc::new(FailingProvider));
+            .with_payments(meter.clone(), Arc::new(FailingProvider), Arc::new(crate::payment_ledger::PaymentLedger::new()));
         assert!(matches!(
             reg.execute(&pay_intent("acme-vendor", "vm-agent", "40")),
             IntentExecution::Declined { .. }
@@ -1400,7 +1443,7 @@ mod tests {
         let meter = Arc::new(SpendMeter::new());
         meter.set_budget("vm-agent", 100).unwrap();
         let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
-            .with_payments(meter.clone(), Arc::new(PanickingProvider));
+            .with_payments(meter.clone(), Arc::new(PanickingProvider), Arc::new(crate::payment_ledger::PaymentLedger::new()));
         match reg.execute(&pay_intent("acme-vendor", "vm-agent", "40")) {
             IntentExecution::Declined { reason } => {
                 assert!(
@@ -1430,7 +1473,7 @@ mod tests {
         let meter = Arc::new(SpendMeter::new());
         meter.set_budget("vm-agent", 100).unwrap();
         let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
-            .with_payments(meter.clone(), Arc::new(IndeterminateProvider));
+            .with_payments(meter.clone(), Arc::new(IndeterminateProvider), Arc::new(crate::payment_ledger::PaymentLedger::new()));
         match reg.execute(&pay_intent("acme-vendor", "vm-agent", "40")) {
             IntentExecution::Declined { reason } => {
                 assert!(
@@ -1573,7 +1616,7 @@ mod tests {
         meter.set_budget("vm-agent", 1000).unwrap();
         let reg = Arc::new(
             MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
-                .with_payments(meter.clone(), provider.clone()),
+                .with_payments(meter.clone(), provider.clone(), Arc::new(crate::payment_ledger::PaymentLedger::new())),
         );
         let mut handles = Vec::new();
         for _ in 0..8 {
@@ -1631,7 +1674,7 @@ mod tests {
         meter.set_budget("vm-agent", 100).unwrap();
         let provider = Arc::new(KeyRecordingProvider::default());
         let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
-            .with_payments(meter, provider.clone());
+            .with_payments(meter, provider.clone(), Arc::new(crate::payment_ledger::PaymentLedger::new()));
         let i1 = pay_intent("acme-vendor", "vm-agent", "10");
         let i2 = pay_intent("acme-vendor", "vm-agent", "10"); // same shape, fresh key+signature
         assert!(matches!(reg.execute(&i1), IntentExecution::Performed { .. }));
@@ -1667,7 +1710,7 @@ mod tests {
         );
         meter.set_budget("vm-agent", 100).unwrap();
         let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
-            .with_payments(meter.clone(), Arc::new(DirDestroyingFailingProvider(sub)));
+            .with_payments(meter.clone(), Arc::new(DirDestroyingFailingProvider(sub)), Arc::new(crate::payment_ledger::PaymentLedger::new()));
         match reg.execute(&pay_intent("acme-vendor", "vm-agent", "40")) {
             IntentExecution::Declined { reason } => {
                 assert!(

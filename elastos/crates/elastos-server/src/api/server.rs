@@ -199,6 +199,7 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
     // Set inside the intent_executor block below (field-init order: executor first), then shared
     // with the provisioning surface via `spend_meter` — the SAME Arc, one source of truth.
     let mut pay_meter: Option<Arc<elastos_runtime::primitives::spend::SpendMeter>> = None;
+    let mut pay_ledger: Option<Arc<crate::payment_ledger::PaymentLedger>> = None;
     let capability_state = CapabilityState {
         pending_store: pending_store.clone(),
         capability_manager: capability_manager.clone(),
@@ -373,13 +374,43 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
             };
             match rail {
                 Some((meter, provider)) => {
-                    pay_meter = Some(meter.clone());
-                    Arc::new(base.with_payments(meter, provider))
+                    // The payment LEDGER (Sprint 30) — durable custody of every rail attempt and
+                    // the reconciliation work list for indeterminate outcomes. Same fail-closed
+                    // wiring rule as the meter: with a data_dir, an unopenable ledger leaves pay
+                    // UNWIRED (a lost pending set orphans reconciliation obligations); the bare
+                    // no-data_dir test shape gets an in-memory ledger.
+                    let ledger = match &data_dir {
+                        Some(dir) => {
+                            match crate::payment_ledger::PaymentLedger::open_durable(
+                                dir.join("payment_ledger.json"),
+                            ) {
+                                Ok(l) => Some(Arc::new(l)),
+                                Err(e) => {
+                                    tracing::error!(
+                                        "payment ledger could not be opened ({e}) — runtime.pay \
+                                         stays UNWIRED (a lost pending set would orphan \
+                                         reconciliation obligations)"
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        None => Some(Arc::new(crate::payment_ledger::PaymentLedger::new())),
+                    };
+                    match ledger {
+                        Some(l) => {
+                            pay_meter = Some(meter.clone());
+                            pay_ledger = Some(l.clone());
+                            Arc::new(base.with_payments(meter, provider, l))
+                        }
+                        None => Arc::new(base),
+                    }
                 }
                 None => Arc::new(base),
             }
         },
         spend_meter: pay_meter.clone(),
+        payment_ledger: pay_ledger.clone(),
     };
     let capsule_audit_log = audit_log
         .clone()
@@ -480,6 +511,14 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
             "/api/spend-budgets/:capsule",
             get(handlers::get_spend_budget),
         )
+        // Payment reconciliation (Sprint 30): the operator resolves INDETERMINATE payments against
+        // the rail's verdict — the only path that releases an indeterminate reservation. Shell-only
+        // like the budget surface; each resolution is single-shot and attested on the chain.
+        .route(
+            "/api/payments/pending",
+            get(handlers::list_pending_payments),
+        )
+        .route("/api/payments/reconcile", post(handlers::reconcile_payment))
         // Revoke endpoints
         .route("/api/capability/:id", delete(handlers::revoke_capability))
         .route(

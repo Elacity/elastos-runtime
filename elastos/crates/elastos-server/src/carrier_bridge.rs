@@ -3532,6 +3532,7 @@ mod tests {
                 None,
             )),
             spend_meter: None,
+            payment_ledger: None,
         };
 
         // ONE capsule session carrying its real identity (vm_id). Post-flip the mint

@@ -14,7 +14,8 @@ pub use capability::{
     deny_request, dispatch_agent_intent, dispatch_standing_intent, get_audit_event_types,
     get_audit_log, grant_request,
     issue_standing_grant, list_capabilities, list_pending, list_standing_grants, mandate_receipt,
-    get_spend_budget, preview_standing_grant, request_capability,
+    get_spend_budget, list_pending_payments, preview_standing_grant, reconcile_payment,
+    request_capability,
     request_status, revoke_all_capabilities, revoke_capability, revoke_standing_grant,
     session_info, set_spend_budget, validate_and_consume, CapabilityState,
 };

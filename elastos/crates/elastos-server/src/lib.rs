@@ -14,6 +14,7 @@ pub mod carrier_bridge;
 pub mod carrier_service;
 pub mod content;
 pub mod intent_executor;
+pub mod payment_ledger;
 pub mod crypto;
 pub mod documents;
 pub mod egress_audit;

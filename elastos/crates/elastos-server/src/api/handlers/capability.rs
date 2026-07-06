@@ -43,6 +43,10 @@ pub struct CapabilityState {
     /// no payment rail is wired (the fail-closed default): provisioning is then refused honestly
     /// (503) rather than accepting a budget nothing enforces.
     pub spend_meter: Option<Arc<elastos_runtime::primitives::spend::SpendMeter>>,
+    /// The payment ledger (Sprint 30) — the SAME instance the pay closure records into: the
+    /// reconciliation surface reads/resolves exactly what enforcement wrote. `None` when pay is
+    /// unwired.
+    pub payment_ledger: Option<Arc<crate::payment_ledger::PaymentLedger>>,
 }
 
 // === Request Capability ===
@@ -1409,6 +1413,12 @@ pub struct SpendBudgetOutput {
     /// and every provisioning change is refusing fail-closed until the process is restarted
     /// (council S29 F5/F10 — the ops surface for `SpendMeter::is_poisoned`).
     pub poisoned: bool,
+    /// Units of this capsule's cap held by INDETERMINATE payments awaiting rail reconciliation
+    /// (Sprint 30, council S29 RT-F4): spend the operator must NOT treat as confirmed — and must
+    /// reconcile BEFORE raising the cap, or the raise can authorize real spend beyond intent.
+    pub pending_units: u64,
+    /// Count of this capsule's pending (indeterminate) payments.
+    pub pending_count: u64,
 }
 
 /// POST /api/spend-budgets  (shell-only) — provision (or re-set) a capsule's money cap.
@@ -1513,12 +1523,19 @@ pub async fn set_spend_budget(
         StatusCode::INTERNAL_SERVER_ERROR,
         "budget vanished after set".to_string(),
     ))?;
+    let (pending_units, pending_count) = state
+        .payment_ledger
+        .as_ref()
+        .map(|l| l.pending_for(&input.capsule))
+        .unwrap_or((0, 0));
     Ok(Json(SpendBudgetOutput {
         capsule: input.capsule,
         limit: snap.limit,
         spent: snap.spent,
         remaining: snap.remaining,
         poisoned: meter.is_poisoned(),
+        pending_units,
+        pending_count: pending_count as u64,
     }))
 }
 
@@ -1538,12 +1555,140 @@ pub async fn get_spend_budget(
         StatusCode::NOT_FOUND,
         "no spend budget provisioned for this capsule".to_string(),
     ))?;
+    let (pending_units, pending_count) = state
+        .payment_ledger
+        .as_ref()
+        .map(|l| l.pending_for(&capsule))
+        .unwrap_or((0, 0));
     Ok(Json(SpendBudgetOutput {
         capsule,
         limit: snap.limit,
         spent: snap.spent,
         remaining: snap.remaining,
         poisoned: meter.is_poisoned(),
+        pending_units,
+        pending_count: pending_count as u64,
+    }))
+}
+
+// === Payment reconciliation (Sprint 30) — resolving INDETERMINATE rail outcomes ===
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconcilePaymentInput {
+    /// The pending payment's idempotency key (from the decline reason / the pending list) — the
+    /// handle the operator looked up ON THE RAIL before calling this.
+    pub idempotency_key: String,
+    /// The rail's verdict: `true` = the charge DID post (spend stands); `false` = it did NOT
+    /// (the reservation is refunded).
+    pub charged: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReconcilePaymentOutput {
+    pub idempotency_key: String,
+    pub capsule: String,
+    pub amount: u64,
+    /// The terminal status the entry resolved to.
+    pub status: String,
+    /// True iff the reservation was refunded AND the refund is durably in force.
+    pub refunded: bool,
+    /// Honest caveats the operator must read (refund persist failure, attestation failure).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+/// GET /api/payments/pending  (shell-only) — the reconciliation work list: every INDETERMINATE
+/// payment (reservation held, outcome unknown), oldest first, with the idempotency key to look up
+/// on the rail. Read-only projection of the ledger the pay path writes.
+pub async fn list_pending_payments(
+    State(state): State<CapabilityState>,
+) -> Result<Json<Vec<crate::payment_ledger::PaymentRecord>>, (StatusCode, String)> {
+    let Some(ledger) = &state.payment_ledger else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no payment rail is wired".to_string(),
+        ));
+    };
+    Ok(Json(ledger.pending()))
+}
+
+/// POST /api/payments/reconcile  (shell-only) — resolve one INDETERMINATE payment against the
+/// rail's verdict. This is the ONLY path that releases an indeterminate reservation, and it is
+/// deliberately manual-first: the operator asserts what the RAIL says (looked up by idempotency
+/// key), never a guess.
+///
+/// Ordering, fail-closed against double-refund:
+/// 1. The ledger entry resolves EXACTLY once (durable-before-visible with rollback) — a second
+///    call, a retry, or a race gets "not pending" and can never refund twice.
+/// 2. Only then, and only for `charged=false`, the reservation is refunded via `try_refund` —
+///    "refunded" is claimed ONLY when durably in force; a refund persist failure is surfaced in
+///    `warning` (the entry stays resolved: the cap remains debited, recover by raising the limit).
+/// 3. The resolution is attested on the signed chain (`Custom` payment_reconciled event) with the
+///    ACTUAL outcomes; an attestation failure is surfaced in `warning`, never hidden (the ledger
+///    and meter are already consistent — un-resolving would reopen the double-refund window).
+pub async fn reconcile_payment(
+    State(state): State<CapabilityState>,
+    Json(input): Json<ReconcilePaymentInput>,
+) -> Result<Json<ReconcilePaymentOutput>, (StatusCode, String)> {
+    let (Some(ledger), Some(meter)) = (&state.payment_ledger, &state.spend_meter) else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no payment rail is wired".to_string(),
+        ));
+    };
+    let record = ledger
+        .resolve(&input.idempotency_key, input.charged)
+        .map_err(|e| (StatusCode::CONFLICT, format!("cannot reconcile: {e}")))?;
+    let mut warning = None;
+    let refunded = if input.charged {
+        false
+    } else {
+        match meter.try_refund(&record.capsule, record.amount) {
+            Ok(_) => true,
+            Err(e) => {
+                warning = Some(format!(
+                    "resolution recorded but the refund could not be durably applied ({e}) — \
+                     the cap remains debited; the operator's lever is raising the limit"
+                ));
+                false
+            }
+        }
+    };
+    let attested = state.capability_manager.audit_log().emit(
+        elastos_runtime::primitives::audit::AuditEvent::Custom {
+            event_type: "payment_reconciled".to_string(),
+            details: serde_json::json!({
+                "idempotency_key": record.idempotency_key,
+                "capsule": record.capsule,
+                "payee": record.payee,
+                "amount": record.amount,
+                "charged": input.charged,
+                "refunded": refunded,
+            }),
+        },
+    );
+    if let Err(e) = attested {
+        tracing::error!(
+            key = %record.idempotency_key,
+            "payment reconciliation could not be attested on the audit chain: {e}"
+        );
+        let note = format!(
+            "reconciliation applied but NOT attested on the audit chain ({e}) — the ledger and \
+             meter are consistent; the chain record is missing"
+        );
+        warning = Some(match warning {
+            Some(w) => format!("{w}; {note}"),
+            None => note,
+        });
+    }
+    Ok(Json(ReconcilePaymentOutput {
+        idempotency_key: record.idempotency_key,
+        capsule: record.capsule,
+        amount: record.amount,
+        status: format!("{:?}", record.status),
+        refunded,
+        warning,
     }))
 }
 
@@ -1953,7 +2098,15 @@ pub async fn dispatch_standing_intent(
     // path), so a denied/revoked/wrong-agent intent never invokes the executor — "no authorization
     // ⇒ no act". The receipt is minted from what the executor REPORTS it performed, never from the
     // declaration, so reconcile compares performed-vs-declared honestly.
-    let outcome = state.standing_service.dispatch(&intent, move || {
+    // spawn_blocking (council S29 G-F8/RT-F2 residual): the executor can block for up to the
+    // rail's timeout (the pay path joins its rail thread), and the gate itself does durable
+    // fsync work — neither belongs on an async worker. The whole authorize→act→reconcile
+    // pipeline runs on the blocking pool; the in-flight payment bound caps how many of these
+    // can hold blocking threads at once.
+    let dispatch_service = state.standing_service.clone();
+    let intent_for_gate = intent.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        dispatch_service.dispatch(&intent_for_gate, move || {
         match executor.execute(&intent_for_exec) {
             crate::intent_executor::IntentExecution::Declined { reason } => {
                 if reason.contains("INDETERMINATE") {
@@ -1996,7 +2149,15 @@ pub async fn dispatch_standing_intent(
                 ))
             }
         }
-    });
+        })
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("dispatch task failed: {e}"),
+        )
+    })?;
     if unrepresentable.load(std::sync::atomic::Ordering::SeqCst) {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2193,6 +2354,7 @@ mod tests {
             standing_service,
             intent_executor,
             spend_meter: None,
+            payment_ledger: None,
         }
     }
 
@@ -2378,6 +2540,7 @@ mod tests {
                 crate::intent_executor::MethodRegistryExecutor::production(audit_log, None),
             ),
             spend_meter: None,
+            payment_ledger: None,
         };
 
         let out = issue_standing_grant(
@@ -2455,6 +2618,7 @@ mod tests {
             standing_service,
             intent_executor,
             spend_meter: None,
+            payment_ledger: None,
         }
     }
 
@@ -2495,6 +2659,7 @@ mod tests {
                 crate::intent_executor::MethodRegistryExecutor::production(audit_log.clone(), None),
             ),
             spend_meter: None,
+            payment_ledger: None,
         };
 
         let res = issue_standing_grant(
@@ -2676,7 +2841,11 @@ mod tests {
                 state.capability_manager.audit_log().clone(),
                 Some(dir.path().to_path_buf()),
             )
-            .with_payments(meter.clone(), provider.clone()),
+            .with_payments(
+                meter.clone(),
+                provider.clone(),
+                std::sync::Arc::new(crate::payment_ledger::PaymentLedger::new()),
+            ),
         );
         let payee_resource = format!("{}acme-vendor", crate::intent_executor::PAY_PREFIX);
 
@@ -2784,7 +2953,11 @@ mod tests {
                 state.capability_manager.audit_log().clone(),
                 Some(dir.path().to_path_buf()),
             )
-            .with_payments(meter.clone(), provider.clone()),
+            .with_payments(
+                meter.clone(),
+                provider.clone(),
+                std::sync::Arc::new(crate::payment_ledger::PaymentLedger::new()),
+            ),
         );
         state.spend_meter = Some(meter.clone());
 
@@ -2952,6 +3125,7 @@ mod tests {
             standing_service,
             intent_executor: std::sync::Arc::new(FaithfulExecutor),
             spend_meter: Some(meter.clone()),
+            payment_ledger: None,
         };
 
         // FIRST-TIME provision: applied, unattestable, rolled back — fully unprovisioned again.
@@ -2989,6 +3163,178 @@ mod tests {
         assert_eq!(e.0, StatusCode::INTERNAL_SERVER_ERROR);
         let snap = meter.snapshot("vm-ap-agent").unwrap();
         assert_eq!(snap.limit, 100, "the unattestable raise was rolled back to the prior limit");
+    }
+
+    /// Sprint 30 end-to-end: an INDETERMINATE payment becomes a RECONCILABLE obligation. The
+    /// dispatch keeps the reservation and lands a PENDING ledger entry; the budget surface shows
+    /// held-unconfirmed units; the operator resolves it against the rail — "not charged" refunds
+    /// exactly once (a second resolution is refused), "charged" confirms with no refund — and the
+    /// resolution is attested on the signed chain.
+    #[tokio::test]
+    async fn indeterminate_payment_is_reconciled_against_the_rail() {
+        struct IndeterminateRail;
+        impl crate::intent_executor::PaymentProvider for IndeterminateRail {
+            fn pay(
+                &self,
+                _payee: &str,
+                _amount: u64,
+                _key: &str,
+            ) -> Result<String, crate::intent_executor::PayError> {
+                Err(crate::intent_executor::PayError::Indeterminate(
+                    "timeout after send".to_string(),
+                ))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state_with_durable_audit(dir.path());
+        let meter = std::sync::Arc::new(
+            elastos_runtime::primitives::spend::SpendMeter::open_durable(
+                dir.path().join("spend_meter.json"),
+            )
+            .unwrap(),
+        );
+        let ledger = std::sync::Arc::new(
+            crate::payment_ledger::PaymentLedger::open_durable(
+                dir.path().join("payment_ledger.json"),
+            )
+            .unwrap(),
+        );
+        state.intent_executor = std::sync::Arc::new(
+            crate::intent_executor::MethodRegistryExecutor::production(
+                state.capability_manager.audit_log().clone(),
+                Some(dir.path().to_path_buf()),
+            )
+            .with_payments(meter.clone(), std::sync::Arc::new(IndeterminateRail), ledger.clone()),
+        );
+        state.spend_meter = Some(meter.clone());
+        state.payment_ledger = Some(ledger.clone());
+        meter.set_budget("vm-ap-agent", 500).unwrap();
+
+        let payee_resource = format!("{}acme-vendor", crate::intent_executor::PAY_PREFIX);
+        let agent_sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let agent_pub = hex::encode(agent_sk.verifying_key().to_bytes());
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-ap-agent".to_string(),
+                resource: payee_resource.clone(),
+                action: "execute".to_string(),
+                methods: vec!["runtime.pay".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: Some(agent_pub),
+                dispatch_limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let intent = IntentDeclarationV1::issue(
+            &agent_sk, agent_sk.verifying_key().to_bytes(), "inv-1", "vm-ap-agent",
+            "runtime.pay", "200", &payee_resource, "execute", &out.token_id,
+        );
+        let expected_key = format!("flint-{}", intent.signature);
+        let r = dispatch_agent_intent(State(state.clone()), Json(intent))
+            .await
+            .expect("authorized; rail indeterminate")
+            .0;
+        assert_eq!(r.outcome, "authorized_not_performed");
+        assert!(
+            r.reason.as_deref().is_some_and(|x| x.contains("INDETERMINATE")
+                && x.contains(&expected_key)
+                && x.contains("recorded in the payment ledger")),
+            "the response reason names the indeterminacy, the key, and the ledger custody: {:?}",
+            r.reason
+        );
+        assert_eq!(meter.remaining("vm-ap-agent"), 300, "the reservation is HELD");
+
+        // The budget surface shows held-unconfirmed units distinct from confirmed spend (RT-F4).
+        let snap = get_spend_budget(State(state.clone()), Path("vm-ap-agent".to_string()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!((snap.pending_units, snap.pending_count), (200, 1));
+
+        // The work list carries the obligation with the rail-lookup handle.
+        let pending = list_pending_payments(State(state.clone())).await.unwrap().0;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].idempotency_key, expected_key);
+        assert_eq!((pending[0].amount, pending[0].payee.as_str()), (200, "acme-vendor"));
+
+        // Resolve against the rail: NOT charged ⇒ refund, exactly once.
+        let res = reconcile_payment(
+            State(state.clone()),
+            Json(ReconcilePaymentInput {
+                idempotency_key: expected_key.clone(),
+                charged: false,
+            }),
+        )
+        .await
+        .expect("first resolution succeeds")
+        .0;
+        assert!(res.refunded && res.warning.is_none(), "{res:?}");
+        assert_eq!(
+            meter.remaining("vm-ap-agent"),
+            500,
+            "the not-charged resolution refunded the reservation"
+        );
+        let again = reconcile_payment(
+            State(state.clone()),
+            Json(ReconcilePaymentInput {
+                idempotency_key: expected_key.clone(),
+                charged: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(again.0, StatusCode::CONFLICT, "a payment resolves EXACTLY once");
+        assert_eq!(meter.remaining("vm-ap-agent"), 500, "no double refund");
+
+        // ... and the resolution is attested on the signed chain.
+        let attested = state
+            .capability_manager
+            .audit_log()
+            .recent_events(16)
+            .into_iter()
+            .any(|e| matches!(
+                e,
+                elastos_runtime::primitives::audit::AuditEvent::Custom { ref event_type, ref details }
+                    if event_type == "payment_reconciled"
+                        && details["idempotency_key"] == expected_key.as_str()
+                        && details["charged"] == false
+                        && details["refunded"] == true
+            ));
+        assert!(attested, "the reconciliation landed on the signed chain");
+
+        // The CHARGED verdict: spend stands, nothing refunded.
+        let agent_sk2 = agent_sk; // same mandate, fresh signed intent
+        let intent2 = IntentDeclarationV1::issue(
+            &agent_sk2, agent_sk2.verifying_key().to_bytes(), "inv-2", "vm-ap-agent",
+            "runtime.pay", "150", &payee_resource, "execute", &out.token_id,
+        );
+        let key2 = format!("flint-{}", intent2.signature);
+        let r2 = dispatch_agent_intent(State(state.clone()), Json(intent2))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(r2.outcome, "authorized_not_performed");
+        assert_eq!(meter.remaining("vm-ap-agent"), 350);
+        let res2 = reconcile_payment(
+            State(state.clone()),
+            Json(ReconcilePaymentInput { idempotency_key: key2, charged: true }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(!res2.refunded);
+        assert_eq!(
+            meter.remaining("vm-ap-agent"),
+            350,
+            "a charged resolution confirms the spend — nothing is refunded"
+        );
+        assert!(
+            list_pending_payments(State(state)).await.unwrap().0.is_empty(),
+            "no obligations remain"
+        );
     }
 
     /// Sprint 26 — AGENT-FACING dispatch: an agent acts under a mandate BOUND to its key with NO
