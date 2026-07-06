@@ -44,6 +44,14 @@ pub const INBOX_NOTIFY_PREFIX: &str = "elastos://runtime/inbox/";
 /// commitment (no free-text payload; see `agent_store`).
 pub const STATE_PUT_PREFIX: &str = "elastos://runtime/store/";
 
+/// The resource namespace `runtime.pay` spends against: a PAYEE scope of the form
+/// `elastos://runtime/pay/<payee>`. A pay mandate is scoped to ONE payee (AUD-5-safe: a real path
+/// segment, never a bare wildcard) with `action = execute`. The per-payment AMOUNT rides in the
+/// declaration's signed `input_hash` (a decimal integer of spend units), so it cannot be tampered
+/// after signing; the cap is enforced separately by the [`SpendMeter`], keyed on the acting capsule.
+/// The receipt reads as "a payment of <amount> to <payee>", exactly what happened.
+pub const PAY_PREFIX: &str = "elastos://runtime/pay/";
+
 /// Topic slugs are rendered by the operator's Inbox UI, so they are held to a tight charset —
 /// a mandate must not be able to smuggle markup, control characters, or path tricks into the
 /// operator surface through its own scope string.
@@ -98,6 +106,35 @@ pub enum IntentExecution {
 /// trusted-core (registered at startup), never attacker-supplied.
 pub trait IntentExecutor: Send + Sync {
     fn execute(&self, intent: &IntentDeclarationV1) -> IntentExecution;
+}
+
+/// A RAIL-AGNOSTIC payment sink for the `runtime.pay` affordance (Sprint 27). The runtime enforces
+/// the CAP (via the [`SpendMeter`]) before ever calling this; the provider only moves the money on a
+/// rail — a virtual card, ACH, a Stripe charge, an on-chain transfer. It is CRYPTOGRAPHY that signs
+/// the mandate and the receipt, not CRYPTOCURRENCY: the rail is whatever the deployment wires here.
+/// Returns an opaque rail reference on success, or an error (which triggers a fail-closed meter
+/// REFUND — the debit is reversed because no money moved).
+pub trait PaymentProvider: Send + Sync {
+    fn pay(&self, payee: &str, amount: u64) -> Result<String, String>;
+}
+
+/// A test/demo payment sink: records every payment and always succeeds, returning a deterministic
+/// reference. Real deployments swap in a card/ACH/Stripe connector implementing [`PaymentProvider`];
+/// nothing else about the affordance changes (the cap + receipt live in the runtime, not the rail).
+#[derive(Default)]
+pub struct MockPaymentProvider {
+    pub payments: std::sync::Mutex<Vec<(String, u64)>>,
+}
+
+impl PaymentProvider for MockPaymentProvider {
+    fn pay(&self, payee: &str, amount: u64) -> Result<String, String> {
+        let mut log = match self.payments.lock() {
+            Ok(l) => l,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        log.push((payee.to_string(), amount));
+        Ok(format!("mock-txn:{payee}:{amount}"))
+    }
 }
 
 type MethodFn = Arc<dyn Fn(&IntentDeclarationV1) -> IntentExecution + Send + Sync>;
@@ -433,6 +470,84 @@ impl MethodRegistryExecutor {
             }),
         );
         registry
+    }
+
+    /// Register the `runtime.pay` affordance (Sprint 27) — a SPEND-CAPPED payment. Opt-in (a
+    /// chained builder, so the 20+ existing `production()` sites and every test that does not wire
+    /// a meter leave pay honestly UNWIRED ⇒ `Undelivered` ⇒ `authorized_not_performed`).
+    ///
+    /// The mandate scopes WHO may pay WHOM (capsule + `elastos://runtime/pay/<payee>` resource +
+    /// action `execute` + agent-key binding, all enforced by the gate BEFORE this runs); the
+    /// [`SpendMeter`] caps HOW MUCH, keyed on the acting capsule. Flow, fail-closed throughout:
+    /// 1. the payee comes from the resource, the AMOUNT from the signed `input_hash` (decimal units);
+    /// 2. `meter.try_debit(capsule, amount)` RESERVES the spend atomically — over the cap (or an
+    ///    unprovisioned capsule ⇒ zero budget) it refuses and NOTHING is debited or paid: the act
+    ///    Declines with the true reason (an authorized-but-refused act — a signed refusal on the
+    ///    chain, no money moved);
+    /// 3. only then does the rail-agnostic [`PaymentProvider`] move the money. If the RAIL fails, the
+    ///    reservation is REFUNDED (provably-no-op: no money moved) and the act Declines;
+    /// 4. on success the receipt reports `execute` of `<amount>` to `<payee>` — the reconciliation
+    ///    Matches iff the executor charged exactly the declared amount.
+    pub fn with_payments(
+        mut self,
+        meter: Arc<elastos_runtime::primitives::spend::SpendMeter>,
+        provider: Arc<dyn PaymentProvider>,
+    ) -> Self {
+        self.register(
+            "runtime.pay",
+            Arc::new(move |intent: &IntentDeclarationV1| {
+                // Scoped to a PAYEE; the payee is the suffix. Outside the namespace ⇒ Decline.
+                let Some(payee) = intent.resource.strip_prefix(PAY_PREFIX) else {
+                    return IntentExecution::Declined {
+                        reason: format!("pay resource must be {PAY_PREFIX}<payee>"),
+                    };
+                };
+                if !valid_slug_1_64(payee) {
+                    return IntentExecution::Declined {
+                        reason: "pay payee must be 1-64 chars of [A-Za-z0-9._-]".to_string(),
+                    };
+                }
+                // The AMOUNT rides in the signed `input_hash` as a decimal integer of spend units.
+                // A non-integer or zero amount is malformed ⇒ Decline (a payment must be positive).
+                let amount: u64 = match intent.input_hash.parse() {
+                    Ok(n) if n > 0 => n,
+                    _ => {
+                        return IntentExecution::Declined {
+                            reason: "pay amount (input_hash) must be a positive integer of spend units"
+                                .to_string(),
+                        };
+                    }
+                };
+                // RESERVE against the cap FIRST — atomic, fail-closed. Over budget (or an
+                // unprovisioned capsule ⇒ zero) refuses here; no money can move.
+                if let Err(e) = meter.try_debit(&intent.capsule, amount) {
+                    return IntentExecution::Declined {
+                        reason: format!("payment refused by spend cap: {e}"),
+                    };
+                }
+                // The cap allowed it — NOW move the money on the rail.
+                match provider.pay(payee, amount) {
+                    Ok(_rail_ref) => IntentExecution::Performed {
+                        capsule: intent.capsule.clone(),
+                        method_id: intent.method_id.clone(),
+                        // Echo the amount actually charged (== declared) so reconcile Matches; the
+                        // receipt's CapabilityUse names a payment of this amount to this payee.
+                        input_hash: amount.to_string(),
+                        resource: intent.resource.clone(),
+                        action: "execute".to_string(),
+                    },
+                    Err(rail_err) => {
+                        // The rail failed AFTER we reserved — REFUND (provably no money moved) and
+                        // Decline. The cap is made whole; the act is authorized_not_performed.
+                        meter.refund(&intent.capsule, amount);
+                        IntentExecution::Declined {
+                            reason: format!("payment rail failed (spend refunded): {rail_err}"),
+                        }
+                    }
+                }
+            }),
+        );
+        self
     }
 
     pub fn register(&mut self, method_id: &str, executor: MethodFn) {
@@ -896,6 +1011,149 @@ mod tests {
         let resource = format!("{STATE_PUT_PREFIX}cursor");
         assert!(matches!(
             reg.execute(&state_get_intent(&resource, "vm-agent", "cafe01")),
+            IntentExecution::Declined { .. }
+        ));
+    }
+
+    // ── Sprint 27: the spend-capped `runtime.pay` affordance ──────────────────────────────────
+    use elastos_runtime::primitives::spend::SpendMeter;
+
+    /// A payment rail that always FAILS — to prove the meter is REFUNDED when the rail errors.
+    struct FailingProvider;
+    impl PaymentProvider for FailingProvider {
+        fn pay(&self, _payee: &str, _amount: u64) -> Result<String, String> {
+            Err("rail unavailable".to_string())
+        }
+    }
+
+    fn pay_intent(payee: &str, capsule: &str, amount: &str) -> IntentDeclarationV1 {
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        IntentDeclarationV1::issue(
+            &sk,
+            sk.verifying_key().to_bytes(),
+            "pay-intent-1",
+            capsule,
+            "runtime.pay",
+            amount, // the AMOUNT rides in input_hash
+            &format!("{PAY_PREFIX}{payee}"),
+            "execute",
+            "grant-1",
+        )
+    }
+
+    fn pay_registry(meter: Arc<SpendMeter>) -> (MethodRegistryExecutor, Arc<MockPaymentProvider>) {
+        let provider = Arc::new(MockPaymentProvider::default());
+        let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
+            .with_payments(meter, provider.clone());
+        (reg, provider)
+    }
+
+    /// `runtime.pay` within the cap: the meter is debited and the rail moves the money once — the
+    /// receipt reports the exact amount + payee (Performed as `execute`).
+    #[test]
+    fn pay_within_cap_charges_the_meter_and_moves_money_once() {
+        let meter = Arc::new(SpendMeter::new());
+        meter.set_budget("vm-agent", 500);
+        let (reg, provider) = pay_registry(meter.clone());
+        match reg.execute(&pay_intent("acme-vendor", "vm-agent", "200")) {
+            IntentExecution::Performed { action, resource, input_hash, .. } => {
+                assert_eq!(action, "execute");
+                assert_eq!(resource, format!("{PAY_PREFIX}acme-vendor"));
+                assert_eq!(input_hash, "200", "the receipt names the amount actually paid");
+            }
+            other => panic!("expected Performed, got {other:?}"),
+        }
+        assert_eq!(meter.remaining("vm-agent"), 300, "the cap was debited by exactly the amount");
+        assert_eq!(
+            *provider.payments.lock().unwrap(),
+            vec![("acme-vendor".to_string(), 200)],
+            "the rail moved the money exactly once"
+        );
+    }
+
+    /// Over the cap: the payment is REFUSED, the meter is untouched, and NO money moves — a
+    /// fail-closed signed refusal, the whole point of the affordance.
+    #[test]
+    fn pay_over_cap_is_refused_and_moves_no_money() {
+        let meter = Arc::new(SpendMeter::new());
+        meter.set_budget("vm-agent", 100);
+        let (reg, provider) = pay_registry(meter.clone());
+        assert!(matches!(
+            reg.execute(&pay_intent("acme-vendor", "vm-agent", "150")),
+            IntentExecution::Declined { .. }
+        ));
+        assert_eq!(meter.remaining("vm-agent"), 100, "a refused payment does not touch the cap");
+        assert!(provider.payments.lock().unwrap().is_empty(), "no money moved over the cap");
+    }
+
+    /// An unprovisioned capsule has ZERO budget (fail-closed) — it cannot pay a cent until the
+    /// operator provisions a cap.
+    #[test]
+    fn pay_unprovisioned_capsule_is_fail_closed() {
+        let meter = Arc::new(SpendMeter::new());
+        let (reg, provider) = pay_registry(meter);
+        assert!(matches!(
+            reg.execute(&pay_intent("acme-vendor", "vm-nobudget", "1")),
+            IntentExecution::Declined { .. }
+        ));
+        assert!(provider.payments.lock().unwrap().is_empty());
+    }
+
+    /// If the RAIL fails after the reservation, the meter is REFUNDED (no money moved) so the budget
+    /// is made whole — a later in-budget payment still works.
+    #[test]
+    fn pay_rail_failure_refunds_the_reservation() {
+        let meter = Arc::new(SpendMeter::new());
+        meter.set_budget("vm-agent", 100);
+        let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
+            .with_payments(meter.clone(), Arc::new(FailingProvider));
+        assert!(matches!(
+            reg.execute(&pay_intent("acme-vendor", "vm-agent", "40")),
+            IntentExecution::Declined { .. }
+        ));
+        assert_eq!(
+            meter.remaining("vm-agent"),
+            100,
+            "a failed rail refunds the reservation — the cap is made whole, no phantom spend"
+        );
+    }
+
+    /// Fail-closed scoping: outside the pay namespace, a bad payee, a non-integer amount, or a zero
+    /// amount all DECLINE — and none of them debits the cap.
+    #[test]
+    fn pay_declines_bad_scope_and_amount() {
+        let meter = Arc::new(SpendMeter::new());
+        meter.set_budget("vm-agent", 1000);
+        let (reg, provider) = pay_registry(meter.clone());
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let bad = |resource: &str, amount: &str| {
+            IntentDeclarationV1::issue(
+                &sk, sk.verifying_key().to_bytes(), "pi", "vm-agent",
+                "runtime.pay", amount, resource, "execute", "grant-1",
+            )
+        };
+        for (resource, amount) in [
+            ("elastos://mail/send".to_string(), "10".to_string()), // outside namespace
+            (PAY_PREFIX.to_string(), "10".to_string()),            // empty payee
+            (format!("{PAY_PREFIX}a/b"), "10".to_string()),        // path trick in payee
+            (format!("{PAY_PREFIX}acme"), "not-a-number".to_string()), // non-integer amount
+            (format!("{PAY_PREFIX}acme"), "0".to_string()),        // zero amount
+        ] {
+            assert!(
+                matches!(reg.execute(&bad(&resource, &amount)), IntentExecution::Declined { .. }),
+                "must decline resource {resource:?} amount {amount:?}"
+            );
+        }
+        assert_eq!(meter.remaining("vm-agent"), 1000, "no declined pay ever touched the cap");
+        assert!(provider.payments.lock().unwrap().is_empty());
+    }
+
+    /// Without a wired meter/provider, `runtime.pay` is honestly UNWIRED ⇒ Declined ⇒ Undelivered.
+    #[test]
+    fn pay_is_unwired_without_with_payments() {
+        let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None);
+        assert!(matches!(
+            reg.execute(&pay_intent("acme-vendor", "vm-agent", "10")),
             IntentExecution::Declined { .. }
         ));
     }

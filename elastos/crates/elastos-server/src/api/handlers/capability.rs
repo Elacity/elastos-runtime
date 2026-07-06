@@ -2461,6 +2461,103 @@ mod tests {
         }
     }
 
+    /// Sprint 27 end-to-end: an agent, under a BOUND pay-mandate scoped to one payee, spends real
+    /// money through the full dispatch pipeline — capped by the spend meter. A within-cap payment
+    /// `performs` and the mandate receipt carries it; an over-cap payment reconciles
+    /// `authorized_not_performed` and moves NO money (the signed refusal); revoking the mandate
+    /// stops payments.
+    #[tokio::test]
+    async fn agent_pays_a_vendor_under_a_capped_bound_mandate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state_with_durable_audit(dir.path());
+        let meter = std::sync::Arc::new(elastos_runtime::primitives::spend::SpendMeter::new());
+        let provider = std::sync::Arc::new(crate::intent_executor::MockPaymentProvider::default());
+        meter.set_budget("vm-ap-agent", 500); // the operator provisions the agent's weekly cap
+        state.intent_executor = std::sync::Arc::new(
+            crate::intent_executor::MethodRegistryExecutor::production(
+                state.capability_manager.audit_log().clone(),
+                Some(dir.path().to_path_buf()),
+            )
+            .with_payments(meter.clone(), provider.clone()),
+        );
+        let payee_resource = format!("{}acme-vendor", crate::intent_executor::PAY_PREFIX);
+
+        // A BOUND pay-mandate: this agent may pay ACME under an `execute` action.
+        let agent_sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let agent_pub = hex::encode(agent_sk.verifying_key().to_bytes());
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-ap-agent".to_string(),
+                resource: payee_resource.clone(),
+                action: "execute".to_string(),
+                methods: vec!["runtime.pay".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: Some(agent_pub),
+                dispatch_limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let pay = |intent_id: &str, amount: &str| {
+            IntentDeclarationV1::issue(
+                &agent_sk, agent_sk.verifying_key().to_bytes(), intent_id, "vm-ap-agent",
+                "runtime.pay", amount, &payee_resource, "execute", &out.token_id,
+            )
+        };
+
+        // Within cap → performed; money moves once; the cap is debited.
+        let r1 = dispatch_agent_intent(State(state.clone()), Json(pay("inv-1", "200")))
+            .await
+            .expect("within cap")
+            .0;
+        assert_eq!(r1.outcome, "performed", "the agent paid the vendor under its mandate");
+        assert_eq!(meter.remaining("vm-ap-agent"), 300);
+        assert_eq!(*provider.payments.lock().unwrap(), vec![("acme-vendor".to_string(), 200)]);
+
+        // Over the remaining cap (300 left, ask 400) → authorized_not_performed; NO money moves.
+        let r2 = dispatch_agent_intent(State(state.clone()), Json(pay("inv-2", "400")))
+            .await
+            .expect("gate authorized, cap refused")
+            .0;
+        assert_eq!(
+            r2.outcome, "authorized_not_performed",
+            "the spend cap physically refused the over-limit payment (signed refusal)"
+        );
+        assert_eq!(meter.remaining("vm-ap-agent"), 300, "the refused payment left the cap untouched");
+        assert_eq!(provider.payments.lock().unwrap().len(), 1, "still only the one real payment");
+
+        // Revoke the mandate → the SAME payment is denied outright.
+        assert!(
+            revoke_standing_grant(
+                State(state.clone()),
+                Json(RevokeStandingGrantInput { grant_id: out.grant_id.clone() }),
+            )
+            .await
+            .unwrap()
+            .0
+            .revoked
+        );
+        let r3 = dispatch_agent_intent(State(state.clone()), Json(pay("inv-3", "50")))
+            .await
+            .expect("gate denies a revoked mandate")
+            .0;
+        assert_eq!(r3.outcome, "denied", "a revoked pay-mandate pays nothing");
+        assert_eq!(provider.payments.lock().unwrap().len(), 1);
+
+        // The portable receipt carries the real payment (a signed, verifiable record of the act).
+        let receipt = mandate_receipt(State(state.clone()), Path(out.token_id.clone()))
+            .await
+            .unwrap()
+            .0;
+        let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();
+        assert!(
+            elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer)).authenticated,
+            "the pay-mandate's receipt verifies off-box"
+        );
+    }
+
     /// Sprint 26 — AGENT-FACING dispatch: an agent acts under a mandate BOUND to its key with NO
     /// operator/shell session. The signed intent + the binding ARE the authorization ("a mandate,
     /// not your keys").
