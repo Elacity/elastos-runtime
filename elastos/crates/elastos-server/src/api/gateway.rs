@@ -80,6 +80,7 @@ pub(super) use gateway_home_token::{
     home_session_cookie_header_for_token, issue_home_launch_token_for_auth_grant,
     issue_home_launch_token_with_context, require_fresh_passkey_home_token,
     require_home_launch_token, require_home_launch_token_context,
+    require_home_launch_token_context_transport,
     require_home_launch_token_for_any, require_home_launch_token_for_any_app_context,
     require_home_launch_token_for_any_context, require_home_token, require_home_token_context,
     HomeLaunchTokenContext,
@@ -197,6 +198,12 @@ const WALLET_PRICE_IDS: &[(&str, &str)] = &[
 pub(crate) const ROOM_SESSION_COOKIE: &str = "room-session";
 pub(crate) const BROWSER_SESSION_COOKIE: &str = "browser-session";
 pub(crate) const HOME_SESSION_COOKIE: &str = "home-session";
+/// The mandates app's launch-token cookie (Sprint 33): HttpOnly, SameSite=Strict, and
+/// path-scoped to [`MANDATES_API_COOKIE_PATH`] so it rides ONLY the mandates API — the money
+/// surface's launch credential never appears in a URL.
+pub(crate) const MANDATES_SESSION_COOKIE: &str = "mandates-session";
+/// The path scope for [`MANDATES_SESSION_COOKIE`] — the mandates sub-router's API prefix.
+pub(crate) const MANDATES_API_COOKIE_PATH: &str = "/api/apps/mandates";
 const ROOM_SYNC_CONSUMER_ID: &str = "room-sync";
 const HOME_LAUNCH_TOKEN_DOMAIN: &str = "elastos.home.launch.v1";
 const HOME_LAUNCH_TOKEN_TTL_SECS: u64 = 12 * 60 * 60;

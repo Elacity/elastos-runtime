@@ -35,11 +35,33 @@
 //!   guards — the verdict is exactly as dangerous as the cap raise it substitutes for, and
 //!   ceiling-style bounds don't apply to a boolean.
 //!
-//! STATED RESIDUAL (council S31 red-team F1): the home-launch token is a 12h, replayable,
-//! URL-borne bearer credential; with money verbs on this surface, delivering it via an HttpOnly
-//! path-scoped cookie (the gate already accepts one) — or requiring a fresh-passkey binding on
-//! the money writes — is the tracked follow-on. Until then the ceiling + the app binding + the
-//! exactly-once resolve bound the blast radius.
+//! SPRINT 33 (folds council S31 red-team F1) — the money-authorization perimeter:
+//!
+//! 1. **The launch token is no longer URL-borne.** The shell launch response delivers it via an
+//!    HttpOnly, SameSite=Strict Set-Cookie path-scoped to this sub-router's API prefix
+//!    ([`MANDATES_SESSION_COOKIE`]); the launch URL carries only a non-secret `shell=1` marker.
+//!    Frame script can no longer READ the credential (an XSS can still ride it same-origin —
+//!    that is what the server-side narrowings above bound — but can never exfiltrate it), and it
+//!    no longer leaks through history/logs/copy-paste. The gate still accepts the explicit
+//!    header (tests, tools, pre-S33 clients). Cookie-authorized WRITES must also carry
+//!    [`MANDATES_APP_MARKER_HEADER`] — a cookie is ambient browser state, and a cross-site page
+//!    cannot set a custom header without a CORS preflight this gateway never passes.
+//! 2. **Money writes require a FRESH passkey verification, spent on use.** SPEND-BUDGET and
+//!    RECONCILE additionally demand a proof-bound Home token minted by a WebAuthn ceremony at
+//!    most [`MONEY_FRESH_WINDOW_SECS`] ago for the same principal (the wallet-send gate), and
+//!    each verification authorizes exactly ONE money write — single-use consumption; replaying
+//!    it on the same or the other money verb is refused. A leaked standing token or a ridden
+//!    session can no longer move money. The honest claim (P12) is exactly "THIS operator's
+//!    authenticator freshly approved ONE money write", nothing more. ISSUE and REVOKE keep the
+//!    S15/S13 posture deliberately: revoke only ever REMOVES authority and must stay
+//!    low-friction (it is the kill switch); issue's blast radius is bounded by the mint
+//!    narrowings; extending fresh-binding to issue is a tracked follow-on (KNOWN_GAPS G-M9),
+//!    not an oversight.
+//!
+//! RESIDUAL (KNOWN_GAPS G-M9): the spent-token guard is in-memory (a restart inside the ~3-min
+//! freshness window could admit one replay), and the operator/local no-passkey posture cannot
+//! make WEB money writes at all — the CLI/consent-broker API is that posture's money path
+//! (fail closed; the panel says so).
 //!
 //! ISSUE delegates to the SAME shared mint path with every fail-closed guard intact (action
 //! whitelist, non-empty methods, AUD-5 overbroad-wildcard refusal, agent-key validation,
@@ -72,10 +94,35 @@ pub(crate) struct MandateApiState {
     /// The SAME meter+ledger the executor's pay gate enforces with (Sprint 31) — the Money
     /// panel's read/provision/reconcile surface. `None` ⇒ pay unwired ⇒ those routes answer 503.
     pub(crate) pay_rail: Option<crate::api::server::PayRail>,
+    /// Sprint 33: fresh passkey tokens already SPENT on a money write, keyed by token digest with
+    /// a prune-by deadline. One fresh verification authorizes exactly ONE money write on this
+    /// surface — a second write with the same token is a replay and is refused. In-memory and
+    /// bounded (entries outlive the freshness window by only a skew margin; see
+    /// [`consume_fresh_money_token`]). RESIDUAL (documented in KNOWN_GAPS G-M9): a gateway
+    /// restart clears it, so a token younger than the freshness window could be replayed once
+    /// across a restart — the window is [`MONEY_FRESH_WINDOW_SECS`].
+    pub(crate) spent_fresh_money_tokens: Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
 }
 
 /// The mandates capsule id — must match `capsules/mandates/capsule.json`'s `name`.
-const MANDATES_CAPSULE_ID: &str = "mandates";
+pub(crate) const MANDATES_CAPSULE_ID: &str = "mandates";
+
+/// Anti-CSRF marker for COOKIE-authorized writes (Sprint 33). A cookie is an ambient credential
+/// — the browser attaches it to any same-site request regardless of who initiated it — so a
+/// write authorized by the cookie must ALSO carry this custom header: setting a custom header
+/// cross-origin forces a CORS preflight this gateway never passes (see the S31 F2 regression
+/// test). Header-token writes don't need it — the token header itself is the unforgeable marker.
+pub(crate) const MANDATES_APP_MARKER_HEADER: &str = "x-elastos-mandates-app";
+
+/// How fresh the money-write passkey verification must be, in seconds — the same window the
+/// wallet's send path uses (one shared operator expectation: "verify, then act, within ~3
+/// minutes").
+const MONEY_FRESH_WINDOW_SECS: u64 = 180;
+
+/// Hard cap on the spent-token guard map (defense in depth; each entry requires a REAL passkey
+/// ceremony to create, so an honest operator never approaches it). When full after pruning, money
+/// writes are REFUSED — fail closed, never fail open by dropping replay protection.
+const MONEY_SPENT_GUARD_MAX: usize = 4096;
 
 /// The WEB surface's spend-cap ceiling (council S31 G-F1/RT-F5): the shell app can provision caps
 /// up to this many units; anything larger is a deliberate CLI/consent-broker act. Server-side —
@@ -90,6 +137,136 @@ fn web_max_spend_cap() -> u64 {
         .unwrap_or(WEB_MAX_SPEND_CAP_DEFAULT)
 }
 
+/// The one launch-token gate every mandates route runs (Sprint 33): accepts the token from the
+/// `x-elastos-home-token` header (tests, tools, pre-S33 clients) OR from the HttpOnly
+/// path-scoped [`MANDATES_SESSION_COOKIE`] the shell launch response set. For WRITES authorized
+/// by the COOKIE, the request must also carry [`MANDATES_APP_MARKER_HEADER`] — a cookie is
+/// ambient browser state, and the custom header is what proves a same-origin script (not a
+/// cross-site form) built the request. Returns the token's authority context for the money
+/// routes' fresh-passkey check.
+fn require_mandates_surface(
+    state: &MandateApiState,
+    headers: &HeaderMap,
+    write: bool,
+) -> Result<super::gateway_home_token::HomeLaunchTokenContext, Box<axum::response::Response>> {
+    let (context, transport) = super::require_home_launch_token_context_transport(
+        &state.data_dir,
+        headers,
+        MANDATES_CAPSULE_ID,
+        MANDATES_SESSION_COOKIE,
+    )
+    .map_err(|err| Box::new(mandate_auth_error(err)))?;
+    if write
+        && transport == super::gateway_home_token::HomeTokenTransport::Cookie
+        && !headers.contains_key(MANDATES_APP_MARKER_HEADER)
+    {
+        return Err(Box::new(
+            (
+                StatusCode::FORBIDDEN,
+                format!(
+                    "cookie-authorized writes must carry the {MANDATES_APP_MARKER_HEADER} header \
+                     (cross-site request refused)"
+                ),
+            )
+                .into_response(),
+        ));
+    }
+    Ok(context)
+}
+
+/// The money-write authority gate (Sprint 33, council S31 F1): on top of the launch-token gate,
+/// a money WRITE requires a FRESH passkey verification — a proof-bound Home token minted by a
+/// WebAuthn ceremony at most [`MONEY_FRESH_WINDOW_SECS`] ago for the SAME principal the standing
+/// token names — and each such verification is SPENT on first use (one ceremony = one write;
+/// replaying the token on any money verb, same or different, is refused). What this proves is
+/// exactly and only: THIS operator's authenticator freshly approved ONE state-changing money
+/// operation. It does not scope WHICH write at mint time — single-use consumption is the
+/// mechanism that keeps one assertion from authorizing a second write.
+///
+/// The standing 12h launch token alone can no longer move money: before this sprint the exact
+/// failure was that a leaked launch URL (or a ridden session) could provision budgets and force
+/// reconciliations for 12 hours.
+fn require_fresh_money_authorization(
+    state: &MandateApiState,
+    headers: &HeaderMap,
+    fresh_passkey_token: &str,
+) -> Result<(), Box<axum::response::Response>> {
+    let context = require_mandates_surface(state, headers, true)?;
+    super::require_fresh_passkey_home_token(
+        &state.data_dir,
+        fresh_passkey_token,
+        &context,
+        MONEY_FRESH_WINDOW_SECS,
+    )
+    .map_err(|err| {
+        Box::new(
+            (
+                StatusCode::UNAUTHORIZED,
+                format!(
+                    "money writes require a fresh passkey verification (at most \
+                     {MONEY_FRESH_WINDOW_SECS}s old): {err}"
+                ),
+            )
+                .into_response(),
+        )
+    })?;
+    consume_fresh_money_token(state, fresh_passkey_token)
+}
+
+/// Spend the fresh token: exactly ONE money write per verification. Keyed by the token's SHA-256
+/// (identical strings are the identical bearer credential — each real WebAuthn ceremony mints a
+/// unique grant/session id, so distinct ceremonies never collide). Entries are pruned once they
+/// out-age the freshness window (plus the same 60s issue-skew the verifier tolerates), so the
+/// map stays bounded by the number of REAL ceremonies inside a ~4-minute window; if it is
+/// somehow full, we refuse — fail closed, never drop replay protection to accept a write.
+fn consume_fresh_money_token(
+    state: &MandateApiState,
+    fresh_passkey_token: &str,
+) -> Result<(), Box<axum::response::Response>> {
+    use sha2::Digest as _;
+    let key = hex::encode(sha2::Sha256::digest(fresh_passkey_token.trim().as_bytes()));
+    let now = now_ts();
+    let mut spent = state
+        .spent_fresh_money_tokens
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    spent.retain(|_, prune_at| *prune_at > now);
+    if spent.contains_key(&key) {
+        return Err(Box::new(
+            (
+                StatusCode::FORBIDDEN,
+                "this passkey verification was already spent on a money write — each money \
+                 write needs its own fresh verification"
+                    .to_string(),
+            )
+                .into_response(),
+        ));
+    }
+    if spent.len() >= MONEY_SPENT_GUARD_MAX {
+        return Err(Box::new(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "money-write replay guard is at capacity; retry shortly".to_string(),
+            )
+                .into_response(),
+        ));
+    }
+    spent.insert(key, now + MONEY_FRESH_WINDOW_SECS + 60);
+    Ok(())
+}
+
+/// A money WRITE body: the shared input plus the fresh passkey verification that authorizes this
+/// one write. The inner shape is byte-identical to the consent-broker API's — the fresh token is
+/// this WEB surface's own requirement (same narrowing discipline as the cap ceiling), so it
+/// wraps rather than forks the shared struct.
+#[derive(Debug, serde::Deserialize)]
+struct FreshMoneyWrite<T> {
+    /// A proof-bound Home token from `/api/auth/passkey/authenticate/complete`, at most
+    /// [`MONEY_FRESH_WINDOW_SECS`] old, spent by this call.
+    fresh_passkey_token: String,
+    input: T,
+}
+
 /// GET /api/apps/mandates/standing-grants — the shell app's live mandate list.
 ///
 /// Delegates to [`crate::api::handlers::capability::mandate_cards`] — the ONE shared projection the
@@ -99,9 +276,8 @@ async fn mandates_list(
     State(state): State<MandateApiState>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    if let Err(err) = super::require_home_launch_token(&state.data_dir, &headers, MANDATES_CAPSULE_ID)
-    {
-        return mandate_auth_error(err);
+    if let Err(resp) = require_mandates_surface(&state, &headers, false) {
+        return *resp;
     }
     Json(crate::api::handlers::capability::mandate_cards(
         &state.standing_service,
@@ -123,9 +299,8 @@ async fn agent_state_list(
     State(state): State<MandateApiState>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    if let Err(err) = super::require_home_launch_token(&state.data_dir, &headers, MANDATES_CAPSULE_ID)
-    {
-        return mandate_auth_error(err);
+    if let Err(resp) = require_mandates_surface(&state, &headers, false) {
+        return *resp;
     }
     match crate::agent_store::list_agent_state(&state.data_dir) {
         Ok(entries) => Json(serde_json::json!({ "entries": entries })).into_response(),
@@ -146,9 +321,8 @@ async fn mandate_receipt(
     Path(token_id): Path<String>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    if let Err(err) = super::require_home_launch_token(&state.data_dir, &headers, MANDATES_CAPSULE_ID)
-    {
-        return mandate_auth_error(err);
+    if let Err(resp) = require_mandates_surface(&state, &headers, false) {
+        return *resp;
     }
     let token_id = match TokenId::from_hex(token_id.trim()) {
         Ok(id) => id.to_string(),
@@ -187,9 +361,8 @@ async fn mandate_revoke(
     headers: HeaderMap,
     Json(body): Json<RevokeBody>,
 ) -> axum::response::Response {
-    if let Err(err) = super::require_home_launch_token(&state.data_dir, &headers, MANDATES_CAPSULE_ID)
-    {
-        return mandate_auth_error(err);
+    if let Err(resp) = require_mandates_surface(&state, &headers, true) {
+        return *resp;
     }
     match crate::api::handlers::capability::revoke_mandate(
         &state.standing_service,
@@ -216,9 +389,8 @@ async fn mandate_issue(
     headers: HeaderMap,
     Json(body): Json<crate::api::handlers::capability::IssueStandingGrantInput>,
 ) -> axum::response::Response {
-    if let Err(err) = super::require_home_launch_token(&state.data_dir, &headers, MANDATES_CAPSULE_ID)
-    {
-        return mandate_auth_error(err);
+    if let Err(resp) = require_mandates_surface(&state, &headers, true) {
+        return *resp;
     }
     // Least privilege (Sprint 15 council, P16): the web mint surface is DELIBERATELY narrower than
     // the raw API — `admin` mandates are minted from the CLI/consent-broker API only, never from
@@ -297,9 +469,8 @@ async fn money_view(
     State(state): State<MandateApiState>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    if let Err(err) = super::require_home_launch_token(&state.data_dir, &headers, MANDATES_CAPSULE_ID)
-    {
-        return mandate_auth_error(err);
+    if let Err(resp) = require_mandates_surface(&state, &headers, false) {
+        return *resp;
     }
     let Some(rail) = &state.pay_rail else {
         return (
@@ -316,20 +487,23 @@ async fn money_view(
 }
 
 /// POST /api/apps/mandates/spend-budget — provision (or re-set) a capsule's money cap from the
-/// shell app. Authority-granting like `issue`, gated the same way (home-launch token = the shell
-/// grant root, G-M3), and delegating to the ONE shared provisioning path
+/// shell app. Authority-granting like `issue` (home-launch token = the shell grant root, G-M3)
+/// AND, as a MONEY write (Sprint 33), requiring a fresh single-use passkey verification in the
+/// body (`fresh_passkey_token` — see [`require_fresh_money_authorization`]). Delegates to the
+/// ONE shared provisioning path
 /// ([`set_spend_budget_core`](crate::api::handlers::capability::set_spend_budget_core)) so every
 /// fail-closed guard (durable-only, slug bound, apply-then-attest with true rollback, loud double
 /// failure) holds identically on both surfaces.
 async fn money_set_budget(
     State(state): State<MandateApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::api::handlers::capability::SetSpendBudgetInput>,
+    Json(body): Json<FreshMoneyWrite<crate::api::handlers::capability::SetSpendBudgetInput>>,
 ) -> axum::response::Response {
-    if let Err(err) = super::require_home_launch_token(&state.data_dir, &headers, MANDATES_CAPSULE_ID)
+    if let Err(resp) = require_fresh_money_authorization(&state, &headers, &body.fresh_passkey_token)
     {
-        return mandate_auth_error(err);
+        return *resp;
     }
+    let body = body.input;
     let Some(rail) = &state.pay_rail else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -363,19 +537,22 @@ async fn money_set_budget(
 }
 
 /// POST /api/apps/mandates/payments/reconcile — resolve ONE indeterminate payment against the
-/// rail's verdict, from the shell app. Delegates to the ONE shared reconciliation path
+/// rail's verdict, from the shell app. A MONEY write (Sprint 33): requires its own fresh
+/// single-use passkey verification in the body (`fresh_passkey_token`), like `spend-budget` —
+/// one ceremony authorizes one write. Delegates to the ONE shared reconciliation path
 /// ([`reconcile_payment_core`](crate::api::handlers::capability::reconcile_payment_core)):
 /// exactly-once resolve, refund only on durable Ok, structured 404/409/503, chain attestation —
 /// identical on both surfaces by construction.
 async fn money_reconcile(
     State(state): State<MandateApiState>,
     headers: HeaderMap,
-    Json(body): Json<crate::api::handlers::capability::ReconcilePaymentInput>,
+    Json(body): Json<FreshMoneyWrite<crate::api::handlers::capability::ReconcilePaymentInput>>,
 ) -> axum::response::Response {
-    if let Err(err) = super::require_home_launch_token(&state.data_dir, &headers, MANDATES_CAPSULE_ID)
+    if let Err(resp) = require_fresh_money_authorization(&state, &headers, &body.fresh_passkey_token)
     {
-        return mandate_auth_error(err);
+        return *resp;
     }
+    let body = body.input;
     let Some(rail) = &state.pay_rail else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -460,7 +637,63 @@ mod tests {
             capability_manager,
             data_dir: dir.to_path_buf(),
             pay_rail: None,
+            spent_fresh_money_tokens: Arc::default(),
         }
+    }
+
+    /// Sprint 33 fixture: a standing mandates launch token plus `fresh` DISTINCT fresh-passkey
+    /// Home tokens for the SAME principal. Each fresh token is backed by its own active
+    /// proof-bound session grant with unique session/grant ids — exactly what each real WebAuthn
+    /// ceremony mints in production (so no two fixtures collapse to the same token string).
+    fn money_write_tokens(dir: &std::path::Path, fresh: usize) -> (String, Vec<String>) {
+        let principal = "person:local:money-op".to_string();
+        let standing_ctx = HomeLaunchTokenContext {
+            principal_id: principal.clone(),
+            session_id: "local:standing".to_string(),
+            proof_binding_id: None,
+            grant_id: "grant:standing".to_string(),
+        };
+        let standing = super::super::issue_home_launch_token_with_context(
+            dir,
+            MANDATES_CAPSULE_ID,
+            &standing_ctx,
+        )
+        .unwrap();
+        let now = now_ts();
+        let mut tokens = Vec::new();
+        for i in 0..fresh {
+            let ctx = HomeLaunchTokenContext {
+                principal_id: principal.clone(),
+                session_id: format!("auth:fresh-{i}"),
+                proof_binding_id: Some(format!("proof:passkey:money-{i}")),
+                grant_id: format!("grant:fresh-{i}"),
+            };
+            crate::auth::store_session_grant(
+                dir,
+                elastos_runtime::auth::AuthSessionGrantV1 {
+                    schema: elastos_runtime::auth::AuthSessionGrantV1::SCHEMA.to_string(),
+                    grant_id: ctx.grant_id.clone(),
+                    session_id: ctx.session_id.clone(),
+                    principal_id: ctx.principal_id.clone(),
+                    proof_binding_id: ctx.proof_binding_id.clone().unwrap(),
+                    issued_at: now,
+                    expires_at: now + 3600,
+                    apps: vec![HOME_CAPSULE_ID.to_string()],
+                },
+            )
+            .unwrap();
+            tokens.push(
+                super::super::issue_home_launch_token_with_context(dir, HOME_CAPSULE_ID, &ctx)
+                    .unwrap(),
+            );
+        }
+        (standing, tokens)
+    }
+
+    /// A money-write body in the Sprint 33 shape: the shared input wrapped with the fresh
+    /// verification that authorizes this one write.
+    fn money_body(fresh_token: &str, input: &str) -> String {
+        format!(r#"{{"fresh_passkey_token":{},"input":{input}}}"#, serde_json::json!(fresh_token))
     }
 
     /// Helper: POST a JSON body to a route with optional home token, return the response.
@@ -960,11 +1193,15 @@ mod tests {
         // No token ⇒ 401 on all three.
         for (method, uri, body) in [
             ("GET", "/api/apps/mandates/money", String::new()),
-            ("POST", "/api/apps/mandates/spend-budget", r#"{"capsule":"vm-a","limit":5}"#.into()),
+            (
+                "POST",
+                "/api/apps/mandates/spend-budget",
+                r#"{"fresh_passkey_token":"x","input":{"capsule":"vm-a","limit":5}}"#.into(),
+            ),
             (
                 "POST",
                 "/api/apps/mandates/payments/reconcile",
-                r#"{"idempotency_key":"flint-x","charged":false}"#.into(),
+                r#"{"fresh_passkey_token":"x","input":{"idempotency_key":"flint-x","charged":false}}"#.into(),
             ),
         ] {
             let req = Request::builder()
@@ -1020,16 +1257,18 @@ mod tests {
                 provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
                 ledger: ledger.clone(),
             }),
+            spent_fresh_money_tokens: Arc::default(),
         };
         let app = mandate_router(state);
-        let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        // Sprint 33: money writes each need their OWN fresh passkey verification.
+        let (token_hdr, fresh) = money_write_tokens(dir.path(), 3);
 
         // Provision via the shell surface — the shared core applies + attests.
         let resp = post_json(
             app.clone(),
             "/api/apps/mandates/spend-budget",
             Some(token_hdr.clone()),
-            r#"{"capsule":"vm-ap-agent","limit":500}"#,
+            &money_body(&fresh[0], r#"{"capsule":"vm-ap-agent","limit":500}"#),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1073,7 +1312,7 @@ mod tests {
             app.clone(),
             "/api/apps/mandates/payments/reconcile",
             Some(token_hdr.clone()),
-            r#"{"idempotency_key":"flint-abc","charged":false}"#,
+            &money_body(&fresh[1], r#"{"idempotency_key":"flint-abc","charged":false}"#),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1085,7 +1324,7 @@ mod tests {
             app,
             "/api/apps/mandates/payments/reconcile",
             Some(token_hdr),
-            r#"{"idempotency_key":"flint-abc","charged":false}"#,
+            &money_body(&fresh[2], r#"{"idempotency_key":"flint-abc","charged":false}"#),
         )
         .await;
         assert_eq!(retry.status(), StatusCode::CONFLICT, "resolves exactly once");
@@ -1114,15 +1353,16 @@ mod tests {
                 provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
                 ledger: Arc::new(crate::payment_ledger::PaymentLedger::new()),
             }),
+            spent_fresh_money_tokens: Arc::default(),
         };
         let app = mandate_router(state);
-        let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        let (token_hdr, fresh) = money_write_tokens(dir.path(), 2);
         let over = WEB_MAX_SPEND_CAP_DEFAULT + 1;
         let resp = post_json(
             app.clone(),
             "/api/apps/mandates/spend-budget",
             Some(token_hdr.clone()),
-            &format!(r#"{{"capsule":"vm-xss","limit":{over}}}"#),
+            &money_body(&fresh[0], &format!(r#"{{"capsule":"vm-xss","limit":{over}}}"#)),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "above the ceiling is refused");
@@ -1131,7 +1371,7 @@ mod tests {
             app,
             "/api/apps/mandates/spend-budget",
             Some(token_hdr),
-            &format!(r#"{{"capsule":"vm-ok","limit":{WEB_MAX_SPEND_CAP_DEFAULT}}}"#),
+            &money_body(&fresh[1], &format!(r#"{{"capsule":"vm-ok","limit":{WEB_MAX_SPEND_CAP_DEFAULT}}}"#)),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK, "at the ceiling still provisions");
@@ -1162,6 +1402,207 @@ mod tests {
             resp.headers().get("access-control-allow-origin").is_none(),
             "no ACAO for a foreign origin — the preflight must fail"
         );
+    }
+
+    /// Sprint 33 ratchet (a): the standing 12h launch token ALONE can no longer move money.
+    /// Before this sprint the exact failure was that a leaked launch URL could provision budgets
+    /// for its whole 12h life; now a money write without a fresh passkey verification — empty,
+    /// or a stale/unbound token — is refused and provisions NOTHING.
+    #[tokio::test]
+    async fn money_write_with_the_standing_token_alone_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (capability_manager, standing_service) = manager_and_service();
+        let meter = Arc::new(
+            elastos_runtime::primitives::spend::SpendMeter::open_durable(
+                dir.path().join("spend_meter.json"),
+            )
+            .unwrap(),
+        );
+        let state = MandateApiState {
+            standing_service,
+            capability_manager,
+            data_dir: dir.path().to_path_buf(),
+            pay_rail: Some(crate::api::server::PayRail {
+                meter: meter.clone(),
+                provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
+                ledger: Arc::new(crate::payment_ledger::PaymentLedger::new()),
+            }),
+            spent_fresh_money_tokens: Arc::default(),
+        };
+        let app = mandate_router(state);
+        let (standing, _) = money_write_tokens(dir.path(), 0);
+
+        // No fresh verification at all.
+        let resp = post_json(
+            app.clone(),
+            "/api/apps/mandates/spend-budget",
+            Some(standing.clone()),
+            &money_body("", r#"{"capsule":"vm-a","limit":5}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "empty fresh token refused");
+
+        // The standing token ITSELF is not a fresh verification (it is not proof-bound) — a
+        // session-rider replaying the credential they already hold gains nothing.
+        let resp = post_json(
+            app.clone(),
+            "/api/apps/mandates/spend-budget",
+            Some(standing.clone()),
+            &money_body(&standing, r#"{"capsule":"vm-a","limit":5}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "unbound token refused");
+        assert_eq!(meter.snapshot("vm-a"), None, "nothing was provisioned");
+
+        // Reads stay on the standing session alone — no regression, no passkey friction.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mandates/money")
+                    .header(HOME_TOKEN_HEADER, standing)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "reads need no fresh verification");
+    }
+
+    /// Sprint 33 ratchets (b)+(c): one fresh passkey verification authorizes exactly ONE money
+    /// write. Replaying it on the SAME verb is refused (b), and spending it on set-budget then
+    /// presenting it to reconcile is refused too (c) — single-use consumption subsumes cross-verb
+    /// binding: the assertion cannot authorize a second write of ANY kind.
+    #[tokio::test]
+    async fn fresh_passkey_verification_is_single_use_across_money_verbs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (capability_manager, standing_service) = manager_and_service();
+        let meter = Arc::new(
+            elastos_runtime::primitives::spend::SpendMeter::open_durable(
+                dir.path().join("spend_meter.json"),
+            )
+            .unwrap(),
+        );
+        let ledger = Arc::new(crate::payment_ledger::PaymentLedger::new());
+        let state = MandateApiState {
+            standing_service,
+            capability_manager,
+            data_dir: dir.path().to_path_buf(),
+            pay_rail: Some(crate::api::server::PayRail {
+                meter: meter.clone(),
+                provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
+                ledger: ledger.clone(),
+            }),
+            spent_fresh_money_tokens: Arc::default(),
+        };
+        let app = mandate_router(state);
+        let (standing, fresh) = money_write_tokens(dir.path(), 1);
+
+        // First write spends the verification.
+        let resp = post_json(
+            app.clone(),
+            "/api/apps/mandates/spend-budget",
+            Some(standing.clone()),
+            &money_body(&fresh[0], r#"{"capsule":"vm-once","limit":50}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "the first write is authorized");
+        assert_eq!(meter.remaining("vm-once"), 50);
+
+        // (b) Replay on the SAME verb: refused, and the cap is NOT re-set.
+        let resp = post_json(
+            app.clone(),
+            "/api/apps/mandates/spend-budget",
+            Some(standing.clone()),
+            &money_body(&fresh[0], r#"{"capsule":"vm-once","limit":999}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "replay on the same verb refused");
+        assert_eq!(meter.remaining("vm-once"), 50, "the replayed write applied NOTHING");
+
+        // (c) Cross-verb: the spent verification cannot authorize reconcile either. The refusal
+        // is at the authorization gate — before any ledger lookup.
+        meter.try_debit("vm-once", 10).unwrap();
+        assert!(ledger.record(
+            "flint-xv",
+            "vm-once",
+            "vendor",
+            10,
+            crate::payment_ledger::PaymentStatus::Pending,
+            "timeout"
+        ));
+        let resp = post_json(
+            app.clone(),
+            "/api/apps/mandates/payments/reconcile",
+            Some(standing),
+            &money_body(&fresh[0], r#"{"idempotency_key":"flint-xv","charged":false}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "cross-verb replay refused");
+        assert_eq!(meter.remaining("vm-once"), 40, "no refund was applied by the refused call");
+    }
+
+    /// Sprint 33 ratchet (cookie transport): the HttpOnly path-scoped cookie authorizes the
+    /// surface exactly like the header — reads work over it — but a cookie-authorized WRITE
+    /// must carry the anti-CSRF marker header (a cookie is ambient; the custom header is what a
+    /// cross-site page cannot send without a preflight this gateway refuses).
+    #[tokio::test]
+    async fn cookie_transport_reads_work_and_writes_demand_the_csrf_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = mandate_router(state_for(dir.path()));
+        let (standing, _) = money_write_tokens(dir.path(), 0);
+        let cookie = format!("{MANDATES_SESSION_COOKIE}={standing}");
+
+        // Read over the cookie alone: authorized.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mandates/standing-grants")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "cookie authorizes reads");
+
+        // Cookie-authorized WRITE without the marker: refused as potential CSRF.
+        let revoke_body = format!(r#"{{"grant_id":"{}"}}"#, "0".repeat(32));
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mandates/standing-grants/revoke")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(revoke_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a cookie-authorized write without the app marker is refused"
+        );
+
+        // Same write WITH the marker: passes the gate (the unknown mandate honestly reads
+        // `revoked:false` — the kill switch stays reachable over the cookie).
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mandates/standing-grants/revoke")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header(MANDATES_APP_MARKER_HEADER, "1")
+                    .body(Body::from(revoke_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "the marker admits the same-origin write");
     }
 
     /// Honest absence: a well-formed token with no durable records ⇒ 404, never a fabricated receipt.

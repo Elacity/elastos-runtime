@@ -101,8 +101,11 @@ pub(super) async fn capsule_interface_invoke(
         );
     }
 
+    let secure = request_uses_tls(&headers);
     let output = match enforce_affordance_invocation_policy(&resolved) {
-        Ok(()) => match dispatch_capsule_affordance(&state, &context, &resolved, &request).await {
+        Ok(()) => match dispatch_capsule_affordance(&state, &context, &resolved, &request, secure)
+            .await
+        {
             Ok(output) => output,
             Err((status, code, message)) => {
                 let _ = append_provider_effect_audit(
@@ -157,16 +160,24 @@ pub(super) async fn capsule_interface_invoke(
         );
     }
 
-    Json(CapsuleInterfaceInvokeResponse {
+    let mut response = Json(CapsuleInterfaceInvokeResponse {
         schema: CAPSULE_INTERFACE_INVOKE_RESULT_SCHEMA.to_string(),
         status: "ok".to_string(),
         capsule: resolved.capsule,
         interface: resolved.interface_id,
         method: resolved.method.id,
         request_id,
-        output,
+        output: output.value,
     })
-    .into_response()
+    .into_response();
+    // Cookie-delivered launch targets (the money surface, Sprint 33): the launch token rides an
+    // HttpOnly Set-Cookie on this response instead of the returned route.
+    if let Some(cookie) = output.set_cookie {
+        response
+            .headers_mut()
+            .append(axum::http::header::SET_COOKIE, cookie);
+    }
+    response
 }
 
 pub(super) fn require_capsule_catalog_token(
@@ -351,18 +362,37 @@ fn enforce_affordance_invocation_policy(
     Ok(())
 }
 
+/// An affordance's JSON output plus, for launch targets whose token is cookie-delivered (the
+/// money surface, Sprint 33), the Set-Cookie header the invoke RESPONSE must carry.
+struct CapsuleAffordanceOutput {
+    value: serde_json::Value,
+    set_cookie: Option<axum::http::HeaderValue>,
+}
+
+impl CapsuleAffordanceOutput {
+    fn value(value: serde_json::Value) -> Self {
+        Self {
+            value,
+            set_cookie: None,
+        }
+    }
+}
+
 async fn dispatch_capsule_affordance(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
     resolved: &ResolvedCapsuleAffordance,
     request: &CapsuleInterfaceInvokeRequest,
-) -> Result<serde_json::Value, (StatusCode, &'static str, String)> {
+    secure: bool,
+) -> Result<CapsuleAffordanceOutput, (StatusCode, &'static str, String)> {
     let resource = resolved.method.resource.as_deref().unwrap_or_default();
     let operation = resolved.method.operation.as_deref().unwrap_or_default();
     match (resource, operation) {
         ("elastos://capsules/*", "list") => {
             serde_json::to_value(capsule_catalog_summary(&state.data_dir))
-                .map(|catalog| serde_json::json!({ "catalog": catalog }))
+                .map(|catalog| {
+                    CapsuleAffordanceOutput::value(serde_json::json!({ "catalog": catalog }))
+                })
                 .map_err(|err| {
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -372,7 +402,7 @@ async fn dispatch_capsule_affordance(
                 })
         }
         ("elastos://capsules/*", "launch") => {
-            dispatch_capsule_launch_affordance(state, context, request).await
+            dispatch_capsule_launch_affordance(state, context, request, secure).await
         }
         _ => Err((
             StatusCode::NOT_IMPLEMENTED,
@@ -389,7 +419,8 @@ async fn dispatch_capsule_launch_affordance(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
     request: &CapsuleInterfaceInvokeRequest,
-) -> Result<serde_json::Value, (StatusCode, &'static str, String)> {
+    secure: bool,
+) -> Result<CapsuleAffordanceOutput, (StatusCode, &'static str, String)> {
     let target = request
         .input
         .get("target")
@@ -438,12 +469,13 @@ async fn dispatch_capsule_launch_affordance(
     let launch =
         launch_runtime_backed_home_target(&state.data_dir, target_summary.target.as_str(), context)
             .await;
-    let route = append_home_launch_token(
+    let delivery = append_home_launch_token(
         &state.data_dir,
         &target_summary.route,
         target_summary.target.as_str(),
         &BTreeMap::new(),
         context,
+        secure,
     )
     .map_err(|err| {
         (
@@ -453,17 +485,20 @@ async fn dispatch_capsule_launch_affordance(
         )
     })?;
 
-    Ok(serde_json::json!({
-        "target": target_summary.target,
-        "title": target_summary.title,
-        "route": route,
-        "attach_kind": target_summary.attach_kind,
-        "role": target_summary.role,
-        "target_kind": target_summary.target_kind,
-        "launch_status": launch.as_ref().map(|summary| summary.status.clone()),
-        "launch_detail": launch.as_ref().and_then(|summary| summary.detail.clone()),
-        "capsule_id": launch.and_then(|summary| summary.capsule_id),
-    }))
+    Ok(CapsuleAffordanceOutput {
+        value: serde_json::json!({
+            "target": target_summary.target,
+            "title": target_summary.title,
+            "route": delivery.route,
+            "attach_kind": target_summary.attach_kind,
+            "role": target_summary.role,
+            "target_kind": target_summary.target_kind,
+            "launch_status": launch.as_ref().map(|summary| summary.status.clone()),
+            "launch_detail": launch.as_ref().and_then(|summary| summary.detail.clone()),
+            "capsule_id": launch.and_then(|summary| summary.capsule_id),
+        }),
+        set_cookie: delivery.set_cookie,
+    })
 }
 
 fn capsule_invoke_error(

@@ -34,9 +34,20 @@ struct HomeLaunchTokenEnvelope {
     signer_did: String,
 }
 
+/// How the launch token reached the gate. The CSRF analysis differs: a HEADER-borne token is
+/// unforgeable cross-origin (custom headers force a CORS preflight this gateway never passes),
+/// while a COOKIE-borne token rides ambient browser credentials — cookie-authorized WRITES must
+/// therefore also present the surface's custom marker header (see `gateway_mandates`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HomeTokenTransport {
+    Header,
+    Cookie,
+}
+
 struct RequiredHomeLaunchToken {
     app: String,
     context: HomeLaunchTokenContext,
+    transport: HomeTokenTransport,
 }
 
 pub(crate) fn home_session_cookie_header_for_token(
@@ -70,12 +81,46 @@ fn home_launch_cookie_header(
     path: &str,
     secure: bool,
 ) -> anyhow::Result<HeaderValue> {
-    let mut value =
-        format!("{name}={token}; Max-Age={max_age_secs}; Path={path}; HttpOnly; SameSite=Lax");
+    home_launch_cookie_header_same_site(name, token, max_age_secs, path, secure, "Lax")
+}
+
+fn home_launch_cookie_header_same_site(
+    name: &str,
+    token: &str,
+    max_age_secs: u64,
+    path: &str,
+    secure: bool,
+    same_site: &str,
+) -> anyhow::Result<HeaderValue> {
+    let mut value = format!(
+        "{name}={token}; Max-Age={max_age_secs}; Path={path}; HttpOnly; SameSite={same_site}"
+    );
     if secure {
         value.push_str("; Secure");
     }
     HeaderValue::from_str(&value).map_err(|err| anyhow::anyhow!("invalid Set-Cookie header: {err}"))
+}
+
+/// The Set-Cookie header for an APP-scoped launch-token cookie (Sprint 33, the money surface):
+/// `HttpOnly` (an XSS in the frame can still ride it same-origin but can never EXFILTRATE it),
+/// `SameSite=Strict` (never sent on any cross-site request), and `Path`-scoped to the one app's
+/// API prefix so it rides nothing else. This replaces the URL-borne `?home_token=…` delivery for
+/// surfaces that carry money verbs — a launch URL is copyable, logged, and shoulder-surfable; an
+/// HttpOnly cookie is none of those.
+pub(crate) fn app_launch_cookie_header_for_token(
+    name: &str,
+    token: &str,
+    path: &str,
+    secure: bool,
+) -> anyhow::Result<HeaderValue> {
+    home_launch_cookie_header_same_site(
+        name,
+        token,
+        HOME_LAUNCH_TOKEN_TTL_SECS,
+        path,
+        secure,
+        "Strict",
+    )
 }
 
 #[cfg(test)]
@@ -208,6 +253,21 @@ pub(crate) fn require_home_launch_token_for_any_app_context(
         .map(|required| (required.app, required.context))
 }
 
+/// The cookie-accepting per-app gate (Sprint 33): validates exactly like
+/// [`require_home_launch_token_context`] but ALSO accepts the token from the named HttpOnly
+/// cookie, and reports WHICH transport carried it so write routes can demand the anti-CSRF
+/// marker header on cookie-authorized requests (a cookie is ambient; a custom header is not).
+/// The explicit header wins when both are present.
+pub(crate) fn require_home_launch_token_context_transport(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+    expected_app: &str,
+    cookie_name: &str,
+) -> anyhow::Result<(HomeLaunchTokenContext, HomeTokenTransport)> {
+    require_home_launch_token_for_any_from(data_dir, headers, &[expected_app], Some(cookie_name))
+        .map(|required| (required.context, required.transport))
+}
+
 pub(crate) fn require_fresh_passkey_home_token(
     data_dir: &std::path::Path,
     token: &str,
@@ -328,9 +388,13 @@ fn require_home_launch_token_for_any_from_expected_did(
     expected_did: String,
     auth_data_dir: &std::path::Path,
 ) -> anyhow::Result<RequiredHomeLaunchToken> {
-    let token = home_launch_token_header(headers)
-        .or_else(|| cookie_name.and_then(|name| cookie_value_from_headers(headers, name)))
-        .ok_or_else(|| anyhow::anyhow!("missing home launch token"))?;
+    let (token, transport) = match home_launch_token_header(headers) {
+        Some(token) => (token, HomeTokenTransport::Header),
+        None => cookie_name
+            .and_then(|name| cookie_value_from_headers(headers, name))
+            .map(|token| (token, HomeTokenTransport::Cookie))
+            .ok_or_else(|| anyhow::anyhow!("missing home launch token"))?,
+    };
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(token.as_str())
         .map_err(|_| anyhow::anyhow!("invalid home launch token encoding"))?;
@@ -378,6 +442,7 @@ fn require_home_launch_token_for_any_from_expected_did(
             proof_binding_id: envelope.payload.proof_binding_id,
             grant_id: envelope.payload.grant_id,
         },
+        transport,
     })
 }
 

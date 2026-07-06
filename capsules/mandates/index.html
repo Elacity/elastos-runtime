@@ -296,7 +296,7 @@
 
   <div class="sectlabel" id="moneylabel" hidden>
     <h2>Money</h2>
-    <span class="hint">spend caps and payments under pay-mandates — every number is the enforcing meter and ledger, read-only</span>
+    <span class="hint">spend caps and payments under pay-mandates — every number is the enforcing meter and ledger. Reading is free; setting a cap or recording a verdict each asks for a fresh passkey verification (one verification = one write). No passkey enrolled? Money writes are CLI-only.</span>
   </div>
   <div class="statewrap" id="moneywrap" hidden>
     <div class="stateempty" id="moneypoisoned" hidden style="color:var(--bad,#c2402f);font-weight:600">
@@ -315,7 +315,7 @@
         <input id="m-capsule" type="text" class="gmono" placeholder="vm-ap-agent" spellcheck="false" style="display:block"></label>
       <label style="font-size:12px">Cap (units)
         <input id="m-limit" type="number" min="0" placeholder="500" style="display:block;width:110px"></label>
-      <button class="grantbtn" id="m-set" type="button">Set cap</button>
+      <button class="grantbtn" id="m-set" type="button" title="Asks for a fresh passkey verification — it authorizes exactly this one cap change">Set cap (passkey)</button>
       <span class="gnote" id="m-note"></span>
     </div>
     <div class="stateempty" id="m-raisewarn" hidden style="color:var(--warn,#a06a00)">
@@ -363,17 +363,74 @@
   var $ = function(s,r){return (r||document).querySelector(s)};
   var PREVIEW = false; // true when no runtime is reachable (showing representative data)
 
-  // The Home shell launches this app with a signed, app-bound launch token in the URL
-  // (`?home_token=…`), exactly like every other shell app. It rides the `x-elastos-home-token`
-  // header; the gateway's mandates routes reject anything without it (fail-closed 401). Its
-  // PRESENCE also tells us we were launched in-shell (live mode) vs opened standalone (preview).
+  // Sprint 33: the Home shell launches this app with the signed, app-bound launch token in an
+  // HttpOnly, SameSite=Strict cookie scoped to /api/apps/mandates — set by the launch response,
+  // sent automatically on our same-origin API calls, and UNREADABLE from this script (by design:
+  // an XSS in this frame can no longer exfiltrate the credential). The URL carries only the
+  // non-secret `?shell=1` marker. A legacy `?home_token=…` launch (pre-S33 shells, tests) still
+  // rides the explicit header. The gateway's mandates routes reject anything without one of the
+  // two (fail-closed 401).
   function query(name){ try { return new URL(window.location.href).searchParams.get(name); } catch(_){ return null; } }
   var HOME_TOKEN = query("home_token");
-  var IN_SHELL = !!HOME_TOKEN;
+  var IN_SHELL = !!HOME_TOKEN || query("shell") === "1";
   function launchHeaders(){
     var h = {Accept:"application/json"};
     if (HOME_TOKEN) h["x-elastos-home-token"] = HOME_TOKEN;
+    // Anti-CSRF marker (Sprint 33): the gateway refuses cookie-authorized WRITES without this
+    // custom header — a cross-site page cannot set it without a CORS preflight the gateway
+    // never passes. Sent on every call; harmless on reads and header-token requests.
+    h["x-elastos-mandates-app"] = "1";
     return h;
+  }
+
+  // Sprint 33: money writes (set cap, reconcile) each require a FRESH passkey verification — a
+  // WebAuthn ceremony at most ~3 minutes old, SPENT on exactly one write. What it proves is
+  // exactly and only: this operator's authenticator freshly approved this one money operation.
+  // Reads never prompt. On runtimes with no passkey enrolled, money writes are CLI-only — the
+  // server refuses honestly and the message below surfaces it.
+  function b64uToBuf(s){
+    s = String(s).replace(/-/g,"+").replace(/_/g,"/"); while (s.length % 4) s += "=";
+    var bin = atob(s), buf = new Uint8Array(bin.length);
+    for (var i=0;i<bin.length;i++) buf[i] = bin.charCodeAt(i);
+    return buf.buffer;
+  }
+  function bufToB64u(b){
+    var bin = "", u = new Uint8Array(b);
+    for (var i=0;i<u.length;i++) bin += String.fromCharCode(u[i]);
+    return btoa(bin).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+  }
+  function freshPasskeyToken(){
+    if (!window.PublicKeyCredential){
+      return Promise.reject(new Error("Passkey verification is unavailable in this browser."));
+    }
+    var h = {"Content-Type":"application/json", Accept:"application/json"};
+    return fetch("/api/auth/passkey/authenticate/begin", {method:"POST", headers:h})
+      .then(function(r){ return r.text().then(function(t){ if(!r.ok) throw new Error(t||("http "+r.status)); return JSON.parse(t); }); })
+      .then(function(begin){
+        var pk = (begin.options && begin.options.publicKey) || {};
+        var req = {}; for (var k in pk) req[k] = pk[k];
+        req.challenge = b64uToBuf(pk.challenge);
+        req.allowCredentials = (pk.allowCredentials || []).map(function(c){
+          var d = {}; for (var k2 in c) d[k2] = c[k2]; d.id = b64uToBuf(c.id); return d;
+        });
+        return navigator.credentials.get({publicKey:req}).then(function(cred){
+          if (!cred) throw new Error("Passkey verification was cancelled.");
+          return fetch("/api/auth/passkey/authenticate/complete", {method:"POST", headers:h,
+            body: JSON.stringify({ceremony_id: begin.ceremony_id, response: {
+              id: cred.id, rawId: bufToB64u(cred.rawId), type: cred.type,
+              response: {
+                clientDataJson: bufToB64u(cred.response.clientDataJSON),
+                authenticatorData: bufToB64u(cred.response.authenticatorData),
+                signature: bufToB64u(cred.response.signature),
+                userHandle: cred.response.userHandle ? bufToB64u(cred.response.userHandle) : null
+              }}})});
+        });
+      })
+      .then(function(r){ return r.text().then(function(t){ if(!r.ok) throw new Error(t||("http "+r.status)); return JSON.parse(t); }); })
+      .then(function(out){
+        if (!out.home_token) throw new Error("Fresh passkey token was not issued.");
+        return out.home_token;
+      });
   }
 
   // ---- Representative data, faithful to the backend shapes (used when no runtime is reachable) ----
@@ -809,10 +866,24 @@
   }
   function reconcile(key, charged, rowCell){
     Array.prototype.forEach.call(rowCell.querySelectorAll("button"), function(b){ b.disabled = true; });
-    var note = $("#pendnote"); note.hidden = false; note.textContent = "Recording the rail's verdict…";
-    var h = launchHeaders(); h["Content-Type"] = "application/json";
-    fetch("/api/apps/mandates/payments/reconcile", {method:"POST", headers:h,
-        body: JSON.stringify({idempotency_key:key, charged:charged})})
+    var note = $("#pendnote"); note.hidden = false;
+    // Sprint 33: the verdict is a money write — verify freshly, then record. The verification
+    // is spent by this one write; a second verdict prompts again.
+    note.textContent = "Waiting for passkey verification — a verdict is a money write…";
+    freshPasskeyToken()
+      .catch(function(err){
+        // Failed/cancelled BEFORE any request was sent — nothing recorded, safe to repaint.
+        note.textContent = "Not recorded — passkey verification did not complete: "
+          + String(err && err.message || err);
+        loadMoney();
+        throw {handled:true};
+      })
+      .then(function(fresh){
+        note.textContent = "Recording the rail's verdict…";
+        var h = launchHeaders(); h["Content-Type"] = "application/json";
+        return fetch("/api/apps/mandates/payments/reconcile", {method:"POST", headers:h,
+            body: JSON.stringify({fresh_passkey_token:fresh, input:{idempotency_key:key, charged:charged}})});
+      })
       .then(function(r){ return r.text().then(function(t){ return {ok:r.ok, status:r.status, text:t}; }); })
       .then(function(res){
         if (res.ok){
@@ -831,6 +902,7 @@
         loadMoney(); // repaint FROM THE SERVER — the row is whatever the ledger actually holds
       })
       .catch(function(err){
+        if (err && err.handled) return; // verification-stage failure already reported above
         note.textContent = "Network failure — the verdict may not have been recorded; reload before retrying. ("+String(err&&err.message||err)+")";
       });
   }
@@ -852,10 +924,16 @@
         note.textContent = "Caps above 9007199254740991 are set from the CLI (this form cannot represent them exactly).";
         return;
       }
-      var h = launchHeaders(); h["Content-Type"] = "application/json";
-      note.className = "gnote"; note.textContent = "Setting…";
-      fetch("/api/apps/mandates/spend-budget", {method:"POST", headers:h,
-          body: JSON.stringify({capsule:capsule, limit:limit})})
+      // Sprint 33: a cap change is a money write — verify freshly, then set. The verification
+      // is spent by this one write.
+      note.className = "gnote"; note.textContent = "Waiting for passkey verification…";
+      freshPasskeyToken()
+        .then(function(fresh){
+          note.textContent = "Setting…";
+          var h = launchHeaders(); h["Content-Type"] = "application/json";
+          return fetch("/api/apps/mandates/spend-budget", {method:"POST", headers:h,
+              body: JSON.stringify({fresh_passkey_token:fresh, input:{capsule:capsule, limit:limit}})});
+        })
         .then(function(r){ return r.text().then(function(t){ if(!r.ok) throw new Error(t||("http "+r.status)); return JSON.parse(t); }); })
         .then(function(out){
           note.textContent = "Cap set: "+String(out.remaining)+" of "+String(out.limit)+" remaining.";

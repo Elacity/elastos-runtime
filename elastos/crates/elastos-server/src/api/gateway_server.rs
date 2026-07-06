@@ -50,6 +50,7 @@ pub async fn start_gateway_server(
                 // single-opener flocks forbid a second opener by construction). `None` ⇒ the
                 // Money panel routes answer 503, honestly unwired.
                 pay_rail,
+                spent_fresh_money_tokens: Arc::default(),
             },
         ));
     }

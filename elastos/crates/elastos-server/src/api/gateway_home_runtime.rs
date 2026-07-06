@@ -4,7 +4,7 @@ pub(super) async fn home_launch(
     State(state): State<GatewayState>,
     headers: HeaderMap,
     Json(req): Json<HomeLaunchRequest>,
-) -> Result<Json<HomeLaunchResponse>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
     let context = require_home_token_context(&state.data_dir, &headers).map_err(|err| {
         (
             StatusCode::FORBIDDEN,
@@ -46,26 +46,51 @@ pub(super) async fn home_launch(
         &context,
     )
     .await;
-    let route = append_home_launch_token(
+    let delivery = append_home_launch_token(
         &state.data_dir,
         &target_summary.route,
         target_summary.target.as_str(),
         &req.query,
         &context,
+        request_uses_tls(&headers),
     )
     .map_err(gateway_internal_error)?;
 
-    Ok(Json(HomeLaunchResponse {
+    let mut response = Json(HomeLaunchResponse {
         target: target_summary.target,
         title: target_summary.title,
-        route,
+        route: delivery.route,
         attach_kind: target_summary.attach_kind,
         role: target_summary.role,
         target_kind: target_summary.target_kind,
         launch_status: launch.as_ref().map(|summary| summary.status.clone()),
         launch_detail: launch.as_ref().and_then(|summary| summary.detail.clone()),
         capsule_id: launch.and_then(|summary| summary.capsule_id),
-    }))
+    })
+    .into_response();
+    // Cookie-delivered targets (the money surface): the launch token rides an HttpOnly Set-Cookie
+    // on THIS response — the same-origin shell fetch stores it in the browser jar, and the app's
+    // path-scoped API calls carry it from there. The URL above holds no credential.
+    if let Some(cookie) = delivery.set_cookie {
+        response.headers_mut().append(axum::http::header::SET_COOKIE, cookie);
+    }
+    Ok(response)
+}
+
+/// A launched app route plus, for cookie-delivered targets, the Set-Cookie header the launch
+/// RESPONSE must carry. For every ordinary app `set_cookie` is `None` and the token rides the
+/// URL exactly as before Sprint 33.
+pub(super) struct HomeLaunchRouteDelivery {
+    pub(super) route: String,
+    pub(super) set_cookie: Option<HeaderValue>,
+}
+
+/// True for targets whose launch token is COOKIE-delivered instead of URL-borne. Today that is
+/// exactly the mandates app — the surface carrying money verbs (Sprint 33, council S31 F1): its
+/// launch URL must never contain the bearer credential (URLs are logged, copyable, and readable
+/// by frame script; an HttpOnly cookie is none of those).
+pub(super) fn is_cookie_delivered_target(target: &str) -> bool {
+    target == super::gateway_mandates::MANDATES_CAPSULE_ID
 }
 
 pub(super) fn append_home_launch_token(
@@ -74,20 +99,41 @@ pub(super) fn append_home_launch_token(
     target: &str,
     query: &BTreeMap<String, String>,
     context: &HomeLaunchTokenContext,
-) -> anyhow::Result<String> {
+    secure: bool,
+) -> anyhow::Result<HomeLaunchRouteDelivery> {
     let token = issue_home_launch_token_with_context(data_dir, target, context)?;
+    let cookie_delivered = is_cookie_delivered_target(target);
     let mut serializer = form_urlencoded::Serializer::new(String::new());
-    serializer.append_pair("home_token", &token);
+    if cookie_delivered {
+        // No bearer credential in the URL — only the non-secret in-shell marker the app uses to
+        // distinguish "launched by the shell" from "opened standalone" (its sample mode).
+        serializer.append_pair("shell", "1");
+    } else {
+        serializer.append_pair("home_token", &token);
+    }
     for (key, value) in query {
         let key = key.trim();
-        if key.is_empty() || key == "home_token" {
+        if key.is_empty() || key == "home_token" || (cookie_delivered && key == "shell") {
             continue;
         }
         serializer.append_pair(key, value);
     }
     let encoded = serializer.finish();
     let separator = if route.contains('?') { '&' } else { '?' };
-    Ok(format!("{route}{separator}{encoded}"))
+    let set_cookie = if cookie_delivered {
+        Some(super::gateway_home_token::app_launch_cookie_header_for_token(
+            MANDATES_SESSION_COOKIE,
+            &token,
+            MANDATES_API_COOKIE_PATH,
+            secure,
+        )?)
+    } else {
+        None
+    };
+    Ok(HomeLaunchRouteDelivery {
+        route: format!("{route}{separator}{encoded}"),
+        set_cookie,
+    })
 }
 
 pub(super) fn home_targets(data_dir: &std::path::Path) -> Vec<HomeTargetSummary> {
@@ -1614,14 +1660,20 @@ mod tests {
         query.insert("home_token".to_string(), "attacker".to_string());
         query.insert("capsule".to_string(), "documents".to_string());
 
-        let route = append_home_launch_token(
+        let delivery = append_home_launch_token(
             dir.path(),
             "/apps/documents/",
             "documents",
             &query,
             &context,
+            false,
         )
         .unwrap();
+        assert!(
+            delivery.set_cookie.is_none(),
+            "ordinary apps keep URL delivery"
+        );
+        let route = delivery.route;
         let parsed = url::Url::parse(&format!("http://localhost{route}")).unwrap();
         let query_pairs = parsed.query_pairs().collect::<Vec<_>>();
         let home_tokens = query_pairs
@@ -1634,5 +1686,71 @@ mod tests {
         assert!(query_pairs
             .iter()
             .any(|(key, value)| key == "capsule" && value == "documents"));
+    }
+
+    /// Sprint 33 ratchet (council S31 F1): the MANDATES launch URL carries NO bearer credential —
+    /// the token rides an HttpOnly, SameSite=Strict, path-scoped Set-Cookie instead, and the URL
+    /// keeps only the non-secret `shell=1` in-shell marker. Before this sprint the exact failure
+    /// was `/apps/mandates/?home_token=<12h bearer token>` — copyable from history, logs, and
+    /// frame script.
+    #[test]
+    fn mandates_launch_url_carries_no_token_and_the_cookie_carries_it_instead() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = local_home_launch_token_context(dir.path()).unwrap();
+        let mut query = BTreeMap::new();
+        // A smuggled marker/token in the incoming query must not survive either.
+        query.insert("home_token".to_string(), "attacker".to_string());
+        query.insert("shell".to_string(), "attacker".to_string());
+
+        let delivery = append_home_launch_token(
+            dir.path(),
+            "/apps/mandates/",
+            super::super::gateway_mandates::MANDATES_CAPSULE_ID,
+            &query,
+            &context,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            !delivery.route.contains("home_token"),
+            "the money surface's launch URL must never carry the bearer token: {}",
+            delivery.route
+        );
+        let parsed = url::Url::parse(&format!("http://localhost{}", delivery.route)).unwrap();
+        let shell_markers: Vec<_> = parsed
+            .query_pairs()
+            .filter(|(key, _)| key == "shell")
+            .collect();
+        assert_eq!(shell_markers.len(), 1, "exactly one in-shell marker");
+        assert_eq!(shell_markers[0].1.as_ref(), "1", "the smuggled marker is dropped");
+
+        let cookie = delivery
+            .set_cookie
+            .expect("the launch response must deliver the token via Set-Cookie");
+        let cookie = cookie.to_str().unwrap();
+        assert!(cookie.starts_with(&format!("{MANDATES_SESSION_COOKIE}=")));
+        assert!(cookie.contains("HttpOnly"), "frame script must not read it: {cookie}");
+        assert!(cookie.contains("SameSite=Strict"), "never sent cross-site: {cookie}");
+        assert!(
+            cookie.contains(&format!("Path={MANDATES_API_COOKIE_PATH}")),
+            "scoped to the mandates API alone: {cookie}"
+        );
+        assert!(cookie.contains("Secure"), "TLS launches set Secure: {cookie}");
+        // The cookie value IS a valid launch token for the mandates app.
+        let token = cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .trim_start_matches(&format!("{MANDATES_SESSION_COOKIE}="))
+            .to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-elastos-home-token", token.parse().unwrap());
+        super::super::require_home_launch_token(
+            dir.path(),
+            &headers,
+            super::super::gateway_mandates::MANDATES_CAPSULE_ID,
+        )
+        .expect("the cookie-delivered token authorizes the mandates surface");
     }
 }
