@@ -112,8 +112,14 @@ pub trait IntentExecutor: Send + Sync {
 /// the CAP (via the [`SpendMeter`]) before ever calling this; the provider only moves the money on a
 /// rail — a virtual card, ACH, a Stripe charge, an on-chain transfer. It is CRYPTOGRAPHY that signs
 /// the mandate and the receipt, not CRYPTOCURRENCY: the rail is whatever the deployment wires here.
-/// Returns an opaque rail reference on success, or an error (which triggers a fail-closed meter
-/// REFUND — the debit is reversed because no money moved).
+///
+/// CONTRACT — implementors MUST honor this, because the runtime REFUNDS the reserved cap on `Err`
+/// (council F2): return `Ok(rail_ref)` iff the money PROVABLY moved; return `Err` ONLY when the
+/// charge PROVABLY did NOT happen (the `DidNotAct` discipline — see [`SpendMeter::refund`]). An
+/// INDETERMINATE outcome (e.g. a network timeout after a card charge may have posted) MUST NOT be
+/// returned as `Err` — that would refund a cap against money that did move, letting real spend
+/// exceed the cap. An indeterminate connector must instead hold the reservation and reconcile the
+/// true outcome out-of-band (never guess "not charged").
 pub trait PaymentProvider: Send + Sync {
     fn pay(&self, payee: &str, amount: u64) -> Result<String, String>;
 }
@@ -482,12 +488,19 @@ impl MethodRegistryExecutor {
     /// 1. the payee comes from the resource, the AMOUNT from the signed `input_hash` (decimal units);
     /// 2. `meter.try_debit(capsule, amount)` RESERVES the spend atomically — over the cap (or an
     ///    unprovisioned capsule ⇒ zero budget) it refuses and NOTHING is debited or paid: the act
-    ///    Declines with the true reason (an authorized-but-refused act — a signed refusal on the
-    ///    chain, no money moved);
-    /// 3. only then does the rail-agnostic [`PaymentProvider`] move the money. If the RAIL fails, the
-    ///    reservation is REFUNDED (provably-no-op: no money moved) and the act Declines;
+    ///    Declines and the chain records it as `authorized_not_performed` (a SIGNED refusal that no
+    ///    payment happened; the specific decline REASON is not yet on-chain — council F3, follow-on);
+    /// 3. only then does the rail-agnostic [`PaymentProvider`] move the money. If the RAIL fails (Err
+    ///    or panic), the reservation is REFUNDED (provably-no-op: no money moved) and the act Declines;
     /// 4. on success the receipt reports `execute` of `<amount>` to `<payee>` — the reconciliation
-    ///    Matches iff the executor charged exactly the declared amount.
+    ///    Matches iff the executor charged exactly the declared amount (a non-canonical amount is
+    ///    declined up front, F4).
+    ///
+    /// BOUNDS (council): the cap is PER-CAPSULE, not per-mandate (the right "cap this agent" bound;
+    /// per-mandate caps are a follow-on — key the meter on `grant_id`). The [`SpendMeter`] is
+    /// IN-MEMORY and NOT durable: a restart drops the `spent` tally, so a money cap is per-uptime,
+    /// not truly cumulative (council F1) — this MUST be made durable before any operator
+    /// budget-provisioning surface or real rail ships. Until then `runtime.pay` is dev/demo-gated.
     pub fn with_payments(
         mut self,
         meter: Arc<elastos_runtime::primitives::spend::SpendMeter>,
@@ -518,6 +531,16 @@ impl MethodRegistryExecutor {
                         };
                     }
                 };
+                // Canonical form (council F4): a Performed pay MUST reconcile Matched, so the declared
+                // amount must equal the canonical decimal of what we charge. Reject "0200"/"+200"/
+                // " 200" — they parse to 200 but the receipt would echo "200" and Diverge, recording
+                // real money moved under a success=false use. A non-canonical amount pays nothing.
+                if amount.to_string() != intent.input_hash {
+                    return IntentExecution::Declined {
+                        reason: "pay amount must be a canonical decimal (no leading zero, sign, or space)"
+                            .to_string(),
+                    };
+                }
                 // RESERVE against the cap FIRST — atomic, fail-closed. Over budget (or an
                 // unprovisioned capsule ⇒ zero) refuses here; no money can move.
                 if let Err(e) = meter.try_debit(&intent.capsule, amount) {
@@ -525,9 +548,14 @@ impl MethodRegistryExecutor {
                         reason: format!("payment refused by spend cap: {e}"),
                     };
                 }
-                // The cap allowed it — NOW move the money on the rail.
-                match provider.pay(payee, amount) {
-                    Ok(_rail_ref) => IntentExecution::Performed {
+                // The cap allowed it — NOW move the money on the rail. A rail PANIC (not just an
+                // Err) must also refund the reservation (council F4): catch it so a panicking
+                // connector cannot leave a phantom debit with no money moved.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    provider.pay(payee, amount)
+                }));
+                match outcome {
+                    Ok(Ok(_rail_ref)) => IntentExecution::Performed {
                         capsule: intent.capsule.clone(),
                         method_id: intent.method_id.clone(),
                         // Echo the amount actually charged (== declared) so reconcile Matches; the
@@ -536,12 +564,20 @@ impl MethodRegistryExecutor {
                         resource: intent.resource.clone(),
                         action: "execute".to_string(),
                     },
-                    Err(rail_err) => {
-                        // The rail failed AFTER we reserved — REFUND (provably no money moved) and
-                        // Decline. The cap is made whole; the act is authorized_not_performed.
+                    Ok(Err(rail_err)) => {
+                        // The rail failed AFTER we reserved — REFUND (provably no money moved, per
+                        // the PaymentProvider contract) and Decline. The cap is made whole.
                         meter.refund(&intent.capsule, amount);
                         IntentExecution::Declined {
                             reason: format!("payment rail failed (spend refunded): {rail_err}"),
+                        }
+                    }
+                    Err(_panic) => {
+                        // The rail PANICKED — treat as provably-not-charged and refund, so the cap
+                        // is never consumed by a phantom payment.
+                        meter.refund(&intent.capsule, amount);
+                        IntentExecution::Declined {
+                            reason: "payment rail panicked (spend refunded)".to_string(),
                         }
                     }
                 }
@@ -696,7 +732,7 @@ mod tests {
         );
         for bad in [
             "elastos://mail/send".to_string(),                       // outside the namespace
-            format!("{INBOX_NOTIFY_PREFIX}"),                        // empty topic
+            INBOX_NOTIFY_PREFIX.to_string(),                         // empty topic
             format!("{INBOX_NOTIFY_PREFIX}<script>x</script>"),      // markup smuggle
             format!("{INBOX_NOTIFY_PREFIX}a/b"),                     // path trick
             format!("{INBOX_NOTIFY_PREFIX}{}", "x".repeat(65)),      // over-long
@@ -854,7 +890,7 @@ mod tests {
         );
         for (resource, value) in [
             ("elastos://mail/send".to_string(), "aa".to_string()), // outside namespace
-            (format!("{STATE_PUT_PREFIX}"), "aa".to_string()),     // empty key
+            (STATE_PUT_PREFIX.to_string(), "aa".to_string()),      // empty key
             (format!("{STATE_PUT_PREFIX}a/b"), "aa".to_string()),  // path trick
             (format!("{STATE_PUT_PREFIX}k"), "not hex".to_string()), // free-text value
             (format!("{STATE_PUT_PREFIX}{}", "x".repeat(65)), "aa".to_string()), // over-long key
@@ -1118,8 +1154,34 @@ mod tests {
         );
     }
 
-    /// Fail-closed scoping: outside the pay namespace, a bad payee, a non-integer amount, or a zero
-    /// amount all DECLINE — and none of them debits the cap.
+    /// A rail that PANICS must also refund the reservation (council red-team F4) — a panicking
+    /// connector cannot leave a phantom debit with no money moved.
+    #[test]
+    fn pay_rail_panic_refunds_the_reservation() {
+        struct PanickingProvider;
+        impl PaymentProvider for PanickingProvider {
+            fn pay(&self, _payee: &str, _amount: u64) -> Result<String, String> {
+                panic!("rail exploded mid-charge")
+            }
+        }
+        let meter = Arc::new(SpendMeter::new());
+        meter.set_budget("vm-agent", 100);
+        let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
+            .with_payments(meter.clone(), Arc::new(PanickingProvider));
+        assert!(matches!(
+            reg.execute(&pay_intent("acme-vendor", "vm-agent", "40")),
+            IntentExecution::Declined { .. }
+        ));
+        assert_eq!(
+            meter.remaining("vm-agent"),
+            100,
+            "a panicking rail refunds the reservation — no phantom debit"
+        );
+    }
+
+    /// Fail-closed scoping: outside the pay namespace, a bad payee, a non-integer amount, a zero
+    /// amount, or a NON-CANONICAL amount (leading zero / sign / space — F4) all DECLINE, and none
+    /// debits the cap. (Canonical form is required so a Performed pay always reconciles Matched.)
     #[test]
     fn pay_declines_bad_scope_and_amount() {
         let meter = Arc::new(SpendMeter::new());
@@ -1138,6 +1200,9 @@ mod tests {
             (format!("{PAY_PREFIX}a/b"), "10".to_string()),        // path trick in payee
             (format!("{PAY_PREFIX}acme"), "not-a-number".to_string()), // non-integer amount
             (format!("{PAY_PREFIX}acme"), "0".to_string()),        // zero amount
+            (format!("{PAY_PREFIX}acme"), "0200".to_string()),     // non-canonical (leading zero) — F4
+            (format!("{PAY_PREFIX}acme"), "+200".to_string()),     // non-canonical (sign) — F4
+            (format!("{PAY_PREFIX}acme"), " 200".to_string()),     // non-canonical (space) — F4
         ] {
             assert!(
                 matches!(reg.execute(&bad(&resource, &amount)), IntentExecution::Declined { .. }),

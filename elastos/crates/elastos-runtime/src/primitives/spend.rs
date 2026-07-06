@@ -20,6 +20,14 @@
 //!
 //! FAIL-CLOSED DEFAULT: an unprovisioned key has ZERO budget, not unlimited — an unknown capsule
 //! cannot spend. Provisioning ([`SpendMeter::set_budget`]) is an explicit act.
+//!
+//! DURABILITY (council Sprint 27 F1): this meter is IN-MEMORY only — it does NOT persist the `spent`
+//! tally. A restart drops all budgets, and re-provisioning an absent key gives a FRESH full cap
+//! (spent=0). For a rate/credit limiter that refill is the safe/generous direction; for a MONEY cap
+//! it is NOT — a restart lets the intended cumulative limit be exceeded. Before the `runtime.pay`
+//! affordance is wired to a real payment rail with an operator-provisionable cap, this meter MUST be
+//! made durable (snapshot+fsync like `StandingGrantStore`, or reconstruct `spent` from the signed
+//! receipt chain on boot). Until then, money-pay is dev/demo-gated (`ELASTOS_ALLOW_MOCK_PAYMENTS`).
 
 use std::collections::HashMap;
 use std::sync::RwLock;

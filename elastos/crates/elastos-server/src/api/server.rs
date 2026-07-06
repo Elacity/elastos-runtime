@@ -215,22 +215,30 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         }),
         // `runtime.notify` delivers into the operator's Inbox store under data_dir; without one
         // (bare test/embedded configs) the method is honestly unwired => Undelivered.
-        // `runtime.pay` (Sprint 27) is wired with a fresh spend meter + a rail connector. The meter
-        // is FAIL-CLOSED by default: an unprovisioned capsule has zero budget, so an agent cannot
-        // spend until the operator explicitly provisions a cap (`SpendMeter::set_budget`). The rail
-        // is a MockPaymentProvider for now — a real card/ACH/Stripe connector swaps in here with no
-        // change to the affordance (the cap + receipt live in the runtime, not the rail). Follow-ons:
-        // an operator budget-provisioning surface + a production PaymentProvider connector.
-        intent_executor: Arc::new(
-            crate::intent_executor::MethodRegistryExecutor::production(
+        // `runtime.pay` (Sprint 27) stays UNWIRED in production (council F2): shipping the MOCK rail
+        // live would mint signed receipts attesting payments that never moved money. It is wired ONLY
+        // when `ELASTOS_ALLOW_MOCK_PAYMENTS` is set (dev/demo), with a loud warning — a real
+        // PaymentProvider connector (and a DURABLE spend meter, council F1) replace this before any
+        // operator budget-provisioning surface ships. Fail-closed by default: no rail ⇒ no pay.
+        intent_executor: {
+            let base = crate::intent_executor::MethodRegistryExecutor::production(
                 capability_manager.audit_log().clone(),
                 data_dir.clone(),
-            )
-            .with_payments(
-                Arc::new(elastos_runtime::primitives::spend::SpendMeter::new()),
-                Arc::new(crate::intent_executor::MockPaymentProvider::default()),
-            ),
-        ),
+            );
+            Arc::new(if std::env::var("ELASTOS_ALLOW_MOCK_PAYMENTS").is_ok() {
+                tracing::warn!(
+                    "runtime.pay is wired to the MOCK payment rail (ELASTOS_ALLOW_MOCK_PAYMENTS) — \
+                     receipts attest SIMULATED payments and the spend cap is NOT durable across \
+                     restart; DEV/DEMO ONLY, never production"
+                );
+                base.with_payments(
+                    Arc::new(elastos_runtime::primitives::spend::SpendMeter::new()),
+                    Arc::new(crate::intent_executor::MockPaymentProvider::default()),
+                )
+            } else {
+                base
+            })
+        },
     };
     let capsule_audit_log = audit_log
         .clone()
