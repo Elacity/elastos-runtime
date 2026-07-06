@@ -287,6 +287,15 @@ impl SpendMeter {
         self.poisoned.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// TEST SEAM (never production): force the poisoned state, so downstream crates' ratchets can
+    /// exercise poisoned-path behavior (e.g. the reconcile surface refusing a refund) without the
+    /// root-only filesystem games a real post-publish failure needs — the same precedent as
+    /// `AuditLog::with_file_handle`. Production code poisons ONLY via `persist_locked`.
+    #[doc(hidden)]
+    pub fn poison_for_tests(&self) {
+        self.poison();
+    }
+
     fn refuse_if_poisoned(&self) -> Result<(), SpendError> {
         if self.is_poisoned() {
             return Err(SpendError::Poisoned);
@@ -485,9 +494,12 @@ impl SpendMeter {
     /// Every provisioned key's [`BudgetSnapshot`], sorted by key — the list projection an operator
     /// surface renders (the Money panel). OBSERVE-only, like [`snapshot`](Self::snapshot).
     pub fn snapshot_all(&self) -> Vec<(String, BudgetSnapshot)> {
+        // A panic-poisoned lock still holds a structurally intact map (every write is one
+        // statement) — recover like the writers do, rather than fabricating "no budgets
+        // provisioned" on an operator money surface (council S31 G-F9).
         let balances = match self.balances.read() {
             Ok(b) => b,
-            Err(_) => return Vec::new(),
+            Err(poisoned) => poisoned.into_inner(),
         };
         let mut out: Vec<(String, BudgetSnapshot)> = balances
             .iter()

@@ -703,11 +703,24 @@
   function loadMoney(){
     if (!IN_SHELL) return;
     fetch("/api/apps/mandates/money", {headers:launchHeaders()})
-      .then(function(r){ if(!r.ok) throw new Error("http "+r.status); return r.json(); })
+      .then(function(r){
+        if (r.status === 503){ throw {unwired:true}; } // pay honestly unwired -> no panel
+        if (!r.ok) throw new Error("http "+r.status);
+        return r.json();
+      })
       .then(function(j){ renderMoney(j); })
-      .catch(function(){
-        $("#moneylabel").hidden = true; $("#moneywrap").hidden = true;
-        $("#pendlabel").hidden = true; $("#pendwrap").hidden = true;
+      .catch(function(err){
+        if (err && err.unwired){ // absence, not failure
+          $("#moneylabel").hidden = true; $("#moneywrap").hidden = true;
+          $("#pendlabel").hidden = true; $("#pendwrap").hidden = true;
+          return;
+        }
+        // A transient failure must NOT silently vanish an OBLIGATIONS work list (G-F7).
+        $("#moneylabel").hidden = false; $("#moneywrap").hidden = false;
+        $("#moneybody").innerHTML = ""; $("#moneyempty").hidden = false;
+        $("#moneyempty").textContent = "Money panel unreachable — spend caps and pending "
+          + "reconciliation obligations may exist but cannot be shown ("
+          + String(err && err.message || err) + ").";
       });
   }
   function renderMoney(j){
@@ -729,7 +742,9 @@
       if (b.pending_units > 0) anyPending = true;
       mb.appendChild(tr);
     });
-    $("#m-raisewarn").hidden = !anyPending;
+    // Over-warn safely: any held-unconfirmed units on a budget row OR any pending payment at all
+    // (a pending whose capsule lost its budget row must still warn — council S31 G-F4).
+    $("#m-raisewarn").hidden = !(anyPending || pending.length > 0);
     $("#pendlabel").hidden = pending.length === 0;
     $("#pendwrap").hidden = pending.length === 0;
     var pb = $("#pendbody"); pb.innerHTML = "";
@@ -752,7 +767,24 @@
         btn.title = pair[1]
           ? "The rail confirms this charge POSTED — the spend stands"
           : "The rail confirms this charge did NOT post — the reservation is refunded";
-        btn.addEventListener("click", function(){ reconcile(rec.idempotency_key, pair[1], act); });
+        // A refund cannot apply while the meter is poisoned, and resolving would burn the
+        // one-shot refund handle (the server refuses too — this mirrors it in the affordance).
+        if (!pair[1] && j.poisoned){
+          btn.disabled = true;
+          btn.title = "Restart the runtime, then reconcile — a refund cannot apply while the meter is poisoned";
+        }
+        // ARM -> CONFIRM, mirroring the kill switch: a verdict moves real money headroom and
+        // resolves exactly once — one stray click must not do that (council S31 RT-F4).
+        var armed = false;
+        btn.addEventListener("click", function(){
+          if (!armed){
+            armed = true;
+            btn.textContent = "confirm " + pair[0] + " — resolves once";
+            setTimeout(function(){ if(!btn.disabled){ armed = false; btn.textContent = pair[0]; } }, 5000);
+            return;
+          }
+          reconcile(rec.idempotency_key, pair[1], act);
+        });
         act.appendChild(btn);
       });
       tr.appendChild(act);
@@ -790,9 +822,18 @@
     $("#m-set").addEventListener("click", function(){
       var note = $("#m-note");
       var capsule = $("#m-capsule").value.trim();
-      var limit = parseInt($("#m-limit").value, 10);
-      if (!capsule || isNaN(limit) || limit < 0){
-        note.className = "gnote err"; note.textContent = "Capsule and a whole-number cap are required.";
+      // Precision-honest money input (council S31 G-F6): digits only (no floats, no exponent
+      // notation parseInt would silently truncate) and within JS safe-integer range so the
+      // number SENT is exactly the number TYPED. Larger caps are a CLI act.
+      var rawLimit = $("#m-limit").value.trim();
+      if (!capsule || !/^\d+$/.test(rawLimit)){
+        note.className = "gnote err"; note.textContent = "Capsule and a whole-number cap (digits only) are required.";
+        return;
+      }
+      var limit = Number(rawLimit);
+      if (!Number.isSafeInteger(limit)){
+        note.className = "gnote err";
+        note.textContent = "Caps above 9007199254740991 are set from the CLI (this form cannot represent them exactly).";
         return;
       }
       var h = launchHeaders(); h["Content-Type"] = "application/json";

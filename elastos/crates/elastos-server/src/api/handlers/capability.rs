@@ -1465,7 +1465,7 @@ pub async fn set_spend_budget(
 /// Mandates-app route both delegate here, so the fail-closed guards (durable-only, slug bound,
 /// apply-then-attest with true rollback, loud double-failure) can never drift between surfaces —
 /// the same one-source-of-truth rule as `issue_mandate`/`revoke_mandate`.
-pub fn set_spend_budget_core(
+pub(crate) fn set_spend_budget_core(
     meter: &elastos_runtime::primitives::spend::SpendMeter,
     ledger: Option<&crate::payment_ledger::PaymentLedger>,
     audit_log: &elastos_runtime::primitives::audit::AuditLog,
@@ -1666,12 +1666,25 @@ pub async fn reconcile_payment(
 /// The ONE shared reconciliation path (Sprint 31): both surfaces (API shell route, gateway
 /// Mandates-app route) delegate here so the exactly-once resolve, honest refund claim, structured
 /// error mapping, and chain attestation can never drift.
-pub fn reconcile_payment_core(
+pub(crate) fn reconcile_payment_core(
     ledger: &crate::payment_ledger::PaymentLedger,
     meter: &elastos_runtime::primitives::spend::SpendMeter,
     audit_log: &elastos_runtime::primitives::audit::AuditLog,
     input: ReconcilePaymentInput,
 ) -> Result<ReconcilePaymentOutput, (StatusCode, String)> {
+    // Council S31 G-F5: a not-charged resolution's REFUND cannot apply while the meter is
+    // poisoned — and the resolve is one-shot, so proceeding would burn the refund handle
+    // permanently. Refuse BEFORE touching the ledger (503: retryable after restart). A
+    // charged=true verdict touches no meter and stays allowed.
+    if !input.charged && meter.is_poisoned() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the spend meter is poisoned — a not-charged resolution's refund cannot apply; \
+             restart the runtime, then reconcile (resolving now would permanently burn the \
+             one-shot refund handle)"
+                .to_string(),
+        ));
+    }
     let record = ledger
         .resolve(&input.idempotency_key, input.charged)
         .map_err(|e| {
@@ -1749,7 +1762,7 @@ pub struct MoneyOverview {
     pub poisoned: bool,
 }
 
-pub fn money_overview(
+pub(crate) fn money_overview(
     meter: &elastos_runtime::primitives::spend::SpendMeter,
     ledger: &crate::payment_ledger::PaymentLedger,
 ) -> MoneyOverview {
@@ -3441,6 +3454,58 @@ mod tests {
             list_pending_payments(State(state)).await.unwrap().0.is_empty(),
             "no obligations remain"
         );
+    }
+
+    /// Council S31 G-F5: reconciling NOT-CHARGED while the meter is POISONED must refuse (503)
+    /// BEFORE touching the ledger — the refund cannot apply, and proceeding would burn the
+    /// one-shot resolve, permanently losing the refund handle. The entry stays PENDING.
+    #[tokio::test]
+    async fn poisoned_meter_refuses_not_charged_reconcile_before_burning_the_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_durable_audit(dir.path());
+        let meter = std::sync::Arc::new(
+            elastos_runtime::primitives::spend::SpendMeter::open_durable(
+                dir.path().join("spend_meter.json"),
+            )
+            .unwrap(),
+        );
+        let ledger = std::sync::Arc::new(crate::payment_ledger::PaymentLedger::new());
+        meter.set_budget("vm-ap", 500).unwrap();
+        meter.try_debit("vm-ap", 200).unwrap();
+        assert!(ledger.record(
+            "flint-k",
+            "vm-ap",
+            "acme",
+            200,
+            crate::payment_ledger::PaymentStatus::Pending,
+            ""
+        ));
+        // Poison via the documented test seam (simulating a post-publish persist failure).
+        meter.poison_for_tests();
+        assert!(meter.is_poisoned());
+        let err = reconcile_payment_core(
+            &ledger,
+            &meter,
+            state.capability_manager.audit_log(),
+            ReconcilePaymentInput { idempotency_key: "flint-k".into(), charged: false },
+        )
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(err.1.contains("poisoned"), "{}", err.1);
+        assert_eq!(
+            ledger.get("flint-k").unwrap().status,
+            crate::payment_ledger::PaymentStatus::Pending,
+            "the one-shot resolve was NOT burned — reconcilable after restart"
+        );
+        // charged=true touches no meter and stays allowed even while poisoned.
+        let ok = reconcile_payment_core(
+            &ledger,
+            &meter,
+            state.capability_manager.audit_log(),
+            ReconcilePaymentInput { idempotency_key: "flint-k".into(), charged: true },
+        )
+        .unwrap();
+        assert!(!ok.refunded);
     }
 
     /// Sprint 26 — AGENT-FACING dispatch: an agent acts under a mandate BOUND to its key with NO

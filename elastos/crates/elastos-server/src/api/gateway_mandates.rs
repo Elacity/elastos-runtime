@@ -13,16 +13,38 @@
 //! the gateway only when both handles are present (see [`super::gateway_server::start_gateway_server`]).
 //!
 //! Every route is gated by the same home-launch token as every other shell app — the mandates app
-//! must be the launched capsule. The two GET routes are strictly read-only. The surface carries
-//! two mutations. REVOKE is the kill switch, fail-safe: it only ever REMOVES authority (P11/P16).
-//! ISSUE (Sprint 15) mints a mandate — authority-GRANTING, so its trust argument is explicit: the
-//! home-launch token is minted by the runtime's own signing key when the SHELL launches the app,
-//! and the shell is already the runtime's grant root (the API server's issue endpoint sits behind
-//! the consent-broker/shell gate for the same reason; G-M3 — the shell can issue any mandate
-//! anyway). The gateway surface adds NO new authority tier; it re-homes the shell's own verb into
-//! the shell's own app window, and delegates to the SAME shared mint path with every fail-closed
-//! guard intact (action whitelist, non-empty methods, AUD-5 overbroad-wildcard refusal, agent-key
-//! validation, durable-before-visible issuance).
+//! must be the launched capsule. The four GET routes are strictly read-only. The surface carries
+//! FOUR mutations (Sprint 31 count — this enumeration is the surface's security story and must
+//! stay literally true, council S31 G-F2):
+//!
+//! - REVOKE — the kill switch, fail-safe: only ever REMOVES authority (P11/P16).
+//! - ISSUE (Sprint 15) — mints a mandate. Authority-GRANTING, so the trust argument is explicit:
+//!   the home-launch token is minted by the runtime's own signing key when the SHELL launches the
+//!   app, and the shell is already the runtime's grant root (G-M3 — the shell can issue any
+//!   mandate anyway). This surface deliberately NARROWS itself below the raw API, server-side
+//!   (no admin mints, bound-key required), because the residual threat is an XSS in the frame
+//!   holding the in-URL token.
+//! - SPEND-BUDGET (Sprint 31) — provisions a MONEY cap. Same G-M3 tier argument as issue, and the
+//!   SAME narrowing discipline: the web surface enforces a CAP CEILING server-side
+//!   ([`WEB_MAX_SPEND_CAP`], overridable via `ELASTOS_WEB_MAX_SPEND_CAP`) — an XSS in the frame
+//!   cannot provision an unbounded cap; larger caps are a deliberate CLI/consent-broker act.
+//! - PAYMENTS/RECONCILE (Sprint 31) — asserts the rail's verdict on ONE indeterminate payment.
+//!   Same tier: a false "not charged" is a shell-root-level act (the shell can already raise any
+//!   cap), single-shot by construction (the ledger resolves exactly once), chain-attested, and
+//!   bounded per entry by the entry's own amount. No web-own narrowing beyond the shared core's
+//!   guards — the verdict is exactly as dangerous as the cap raise it substitutes for, and
+//!   ceiling-style bounds don't apply to a boolean.
+//!
+//! STATED RESIDUAL (council S31 red-team F1): the home-launch token is a 12h, replayable,
+//! URL-borne bearer credential; with money verbs on this surface, delivering it via an HttpOnly
+//! path-scoped cookie (the gate already accepts one) — or requiring a fresh-passkey binding on
+//! the money writes — is the tracked follow-on. Until then the ceiling + the app binding + the
+//! exactly-once resolve bound the blast radius.
+//!
+//! ISSUE delegates to the SAME shared mint path with every fail-closed guard intact (action
+//! whitelist, non-empty methods, AUD-5 overbroad-wildcard refusal, agent-key validation,
+//! durable-before-visible issuance); the money verbs delegate to the shared
+//! `set_spend_budget_core` / `reconcile_payment_core` for the same no-drift reason.
 //!
 //! All three verbs delegate to the API server's own shared helpers
 //! ([`mandate_cards`](crate::api::handlers::capability::mandate_cards),
@@ -54,6 +76,19 @@ pub(crate) struct MandateApiState {
 
 /// The mandates capsule id — must match `capsules/mandates/capsule.json`'s `name`.
 const MANDATES_CAPSULE_ID: &str = "mandates";
+
+/// The WEB surface's spend-cap ceiling (council S31 G-F1/RT-F5): the shell app can provision caps
+/// up to this many units; anything larger is a deliberate CLI/consent-broker act. Server-side —
+/// an XSS in the frame holding the in-URL token cannot provision an unbounded cap. Overridable
+/// per deployment via `ELASTOS_WEB_MAX_SPEND_CAP` (the unit is the deployment's spend unit).
+const WEB_MAX_SPEND_CAP_DEFAULT: u64 = 1_000_000;
+
+fn web_max_spend_cap() -> u64 {
+    std::env::var("ELASTOS_WEB_MAX_SPEND_CAP")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(WEB_MAX_SPEND_CAP_DEFAULT)
+}
 
 /// GET /api/apps/mandates/standing-grants — the shell app's live mandate list.
 ///
@@ -232,7 +267,9 @@ async fn mandate_issue(
 
 /// GET /api/apps/mandates/money — the Money panel's one-call read (Sprint 31): every provisioned
 /// budget (with held-unconfirmed `pending_units` distinct from confirmed spend), the
-/// reconciliation work list, and the poisoned flag — a READ-ONLY projection of the same meter and
+/// reconciliation work list, and the poisoned flag. OPERATOR-scoped like the agent-state view: it
+/// spans every capsule because the caller is the shell (the runtime's grant root, gated by the
+/// same home-launch token), the trust level that already sees — and can raise — every cap — a READ-ONLY projection of the same meter and
 /// ledger the pay gate enforces with (delegating to the shared
 /// [`money_overview`](crate::api::handlers::capability::money_overview), so the two surfaces can
 /// never drift). 503 when pay is unwired — absence reported, never an empty fabrication.
@@ -280,6 +317,20 @@ async fn money_set_budget(
         )
             .into_response();
     };
+    // The web surface's own narrowing (module doc; mirrors the issue route's admin refusal):
+    // enforced HERE, server-side, so an XSS in the frame is still ceiling-bound. The raw
+    // consent-broker API carries no ceiling — a larger cap is a deliberate operator act.
+    let ceiling = web_max_spend_cap();
+    if body.limit > ceiling {
+        return (
+            StatusCode::FORBIDDEN,
+            format!(
+                "caps above {ceiling} units are set from the CLI/consent-broker API, not the \
+                 shell app (ELASTOS_WEB_MAX_SPEND_CAP raises this surface's ceiling)"
+            ),
+        )
+            .into_response();
+    }
     match crate::api::handlers::capability::set_spend_budget_core(
         &rail.meter,
         Some(&rail.ledger),
@@ -1001,6 +1052,78 @@ mod tests {
         .await;
         assert_eq!(retry.status(), StatusCode::CONFLICT, "resolves exactly once");
         assert_eq!(meter.remaining("vm-ap-agent"), 500, "no double refund");
+    }
+
+    /// Council S31 G-F1: the WEB surface's cap ceiling — a provision above it is refused 403
+    /// server-side (an XSS in the frame cannot provision an unbounded cap) and provisions NOTHING;
+    /// at-or-below the ceiling still works. The raw consent-broker API carries no ceiling.
+    #[tokio::test]
+    async fn web_spend_budget_is_ceiling_bound_server_side() {
+        let dir = tempfile::tempdir().unwrap();
+        let (capability_manager, standing_service) = manager_and_service();
+        let meter = Arc::new(
+            elastos_runtime::primitives::spend::SpendMeter::open_durable(
+                dir.path().join("spend_meter.json"),
+            )
+            .unwrap(),
+        );
+        let state = MandateApiState {
+            standing_service,
+            capability_manager,
+            data_dir: dir.path().to_path_buf(),
+            pay_rail: Some(crate::api::server::PayRail {
+                meter: meter.clone(),
+                provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
+                ledger: Arc::new(crate::payment_ledger::PaymentLedger::new()),
+            }),
+        };
+        let app = mandate_router(state);
+        let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        let over = WEB_MAX_SPEND_CAP_DEFAULT + 1;
+        let resp = post_json(
+            app.clone(),
+            "/api/apps/mandates/spend-budget",
+            Some(token_hdr.clone()),
+            &format!(r#"{{"capsule":"vm-xss","limit":{over}}}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "above the ceiling is refused");
+        assert_eq!(meter.snapshot("vm-xss"), None, "the refused provision set NOTHING");
+        let resp = post_json(
+            app,
+            "/api/apps/mandates/spend-budget",
+            Some(token_hdr),
+            &format!(r#"{{"capsule":"vm-ok","limit":{WEB_MAX_SPEND_CAP_DEFAULT}}}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "at the ceiling still provisions");
+    }
+
+    /// Council S31 red-team F2 regression: the gateway money routes must emit NO
+    /// Access-Control-Allow-Origin for a foreign Origin — a future refactor adding permissive
+    /// CORS here would hand cross-origin pages the preflight pass the CSRF analysis relies on
+    /// being absent.
+    #[tokio::test]
+    async fn money_routes_emit_no_cors_allowance_for_foreign_origins() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = mandate_router(state_for(dir.path()));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/apps/mandates/payments/reconcile")
+                    .header("origin", "https://evil.example")
+                    .header("access-control-request-method", "POST")
+                    .header("access-control-request-headers", "x-elastos-home-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "no ACAO for a foreign origin — the preflight must fail"
+        );
     }
 
     /// Honest absence: a well-formed token with no durable records ⇒ 404, never a fabricated receipt.

@@ -251,6 +251,9 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
         let stores = match data_dir {
             Some(_) => open_durable_meter().zip(open_ledger()),
             None => {
+                // No in-repo binary reaches this branch (every serve path builds the rail from
+                // the infrastructure layer's real data_dir — council S31 G-F3); it exists for
+                // embedders calling build_pay_rail(None) directly.
                 tracing::warn!(
                     "no data_dir — runtime.pay gets an IN-MEMORY spend meter (test/embedded \
                      only); the provisioning surface will refuse money caps on it"
@@ -383,20 +386,12 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         // `runtime.notify` delivers into the operator's Inbox store under data_dir; without one
         // (bare test/embedded configs) the method is honestly unwired => Undelivered.
         //
-        // `runtime.pay` rail selection (Sprint 29), fail-closed by default (no rail ⇒ no pay, and
-        // no meter ⇒ the provisioning surface refuses 503):
-        // 1. `ELASTOS_PAYMENT_ENDPOINT` (+ optional `ELASTOS_PAYMENT_TOKEN`) wires the REAL
-        //    HttpPaymentProvider — a DURABLE meter is REQUIRED (real money on a cap that refills
-        //    across restart is refused outright: no data_dir or an unopenable snapshot ⇒ unwired).
-        // 2. else `ELASTOS_ALLOW_MOCK_PAYMENTS` wires the Mock rail (dev/demo ONLY, loud warning —
-        //    council S27 F2: mock receipts attest simulated payments).
-        // 3. else pay is honestly UNWIRED.
-        //
-        // The spend meter (Sprint 28) is DURABLE under data_dir — a restart never refills the money
-        // cap — and it is ONE instance shared between the executor's pay gate (enforcement) and the
-        // shell-only /api/spend-budgets surface (provisioning), so they can never disagree. A meter
-        // whose snapshot is corrupt (or already open elsewhere — single-opener flock, S29) REFUSES
-        // to open; pay then stays honestly unwired rather than booting over refilled/contended caps.
+        // `runtime.pay` wiring (Sprint 31): the rail is SELECTED AND BUILT by [`build_pay_rail`]
+        // in the infrastructure layer (one PayRail per process, keyed off the infra's real
+        // data_dir — NOT this config's `data_dir` field), and arrives here via
+        // `ServerConfig.pay_rail`. `None` ⇒ pay honestly unwired and the provisioning/reconcile
+        // surfaces answer 503. See build_pay_rail's doc for the fail-closed selection rules
+        // (https-validated real endpoint > env-gated mock > unwired; durable stores required).
         intent_executor: {
             let base = crate::intent_executor::MethodRegistryExecutor::production(
                 capability_manager.audit_log().clone(),
@@ -863,6 +858,7 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::is_allowed_local_origin;
+    use super::build_pay_rail;
     use axum::http::HeaderValue;
 
     #[test]
@@ -886,5 +882,69 @@ mod tests {
         assert!(!is_allowed_local_origin(&HeaderValue::from_static(
             "https://example.com"
         )));
+    }
+
+    /// Council S31 G-F10: the boot rail selection was extractable and untested. One SEQUENTIAL
+    /// test (env vars are process-global) covering: unset ⇒ unwired; mock ⇒ durable stores;
+    /// second build in the same data_dir ⇒ flock-refused ⇒ unwired; plaintext non-loopback real
+    /// endpoint ⇒ refused; https real endpoint ⇒ wired; real wins over mock.
+    #[test]
+    fn build_pay_rail_selects_fail_closed() {
+        struct EnvGuard(Vec<(&'static str, Option<String>)>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (k, v) in &self.0 {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+        let keys = [
+            "ELASTOS_PAYMENT_ENDPOINT",
+            "ELASTOS_PAYMENT_TOKEN",
+            "ELASTOS_ALLOW_MOCK_PAYMENTS",
+        ];
+        let _guard = EnvGuard(keys.iter().map(|k| (*k, std::env::var(k).ok())).collect());
+        for k in keys {
+            std::env::remove_var(k);
+        }
+
+        // No envs ⇒ honestly unwired.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(build_pay_rail(Some(dir.path())).is_none());
+
+        // Mock env + data_dir ⇒ wired with DURABLE stores.
+        std::env::set_var("ELASTOS_ALLOW_MOCK_PAYMENTS", "1");
+        let rail = build_pay_rail(Some(dir.path())).expect("mock rail wires");
+        assert!(rail.meter.is_durable());
+
+        // A second build in the SAME data_dir while the first is alive ⇒ the stores' flocks
+        // refuse ⇒ unwired (fail-closed, never a second opener clobbering spent).
+        assert!(
+            build_pay_rail(Some(dir.path())).is_none(),
+            "double-build refuses via the single-opener flocks"
+        );
+        drop(rail);
+
+        // Plaintext http to a non-loopback host ⇒ refused at boot.
+        std::env::set_var("ELASTOS_PAYMENT_ENDPOINT", "http://pay.example.com/orders");
+        assert!(build_pay_rail(Some(dir.path())).is_none());
+        // Malformed ⇒ refused at boot.
+        std::env::set_var("ELASTOS_PAYMENT_ENDPOINT", "not a url");
+        assert!(build_pay_rail(Some(dir.path())).is_none());
+
+        // https ⇒ the REAL rail wires (and wins over the still-set mock env).
+        std::env::set_var("ELASTOS_PAYMENT_ENDPOINT", "https://pay.example.com/orders");
+        let rail = build_pay_rail(Some(dir.path())).expect("https real rail wires");
+        assert!(rail.meter.is_durable());
+        drop(rail);
+
+        // Real endpoint set but NO durable stores possible (no data_dir) ⇒ refused.
+        assert!(
+            build_pay_rail(None).is_none(),
+            "real money on non-durable stores is refused"
+        );
     }
 }
