@@ -1620,13 +1620,23 @@ pub async fn list_pending_payments(
 ///
 /// Ordering, fail-closed against double-refund:
 /// 1. The ledger entry resolves EXACTLY once (durable-before-visible with rollback) — a second
-///    call, a retry, or a race gets "not pending" and can never refund twice.
+///    call, a retry, or a race gets 409 and can never refund twice. Errors are STRUCTURED
+///    (council S30 G-F2) so automation never mistakes a retryable failure for a terminal one:
+///    404 = no entry; 409 = already terminal; 503 = the resolution could not persist and the
+///    entry is STILL PENDING — retry.
 /// 2. Only then, and only for `charged=false`, the reservation is refunded via `try_refund` —
 ///    "refunded" is claimed ONLY when durably in force; a refund persist failure is surfaced in
 ///    `warning` (the entry stays resolved: the cap remains debited, recover by raising the limit).
+///    An applied refund is marked on the ledger entry (`refund_applied`).
 /// 3. The resolution is attested on the signed chain (`Custom` payment_reconciled event) with the
 ///    ACTUAL outcomes; an attestation failure is surfaced in `warning`, never hidden (the ledger
 ///    and meter are already consistent — un-resolving would reopen the double-refund window).
+///
+/// CRASH WINDOW, stated (council S30 G-F3): a crash between step 1 and step 2 leaves the entry
+/// terminally `ResolvedNotCharged` with the refund never applied and no chain event — fail-closed
+/// (the cap stays debited; exactly-once holds). FORENSIC: a `resolved_not_charged` ledger entry
+/// with `refund_applied=false` and no matching `payment_reconciled` chain event means the refund
+/// was lost; the recovery lever is raising the limit.
 pub async fn reconcile_payment(
     State(state): State<CapabilityState>,
     Json(input): Json<ReconcilePaymentInput>,
@@ -1639,13 +1649,25 @@ pub async fn reconcile_payment(
     };
     let record = ledger
         .resolve(&input.idempotency_key, input.charged)
-        .map_err(|e| (StatusCode::CONFLICT, format!("cannot reconcile: {e}")))?;
+        .map_err(|e| {
+            let status = match e {
+                crate::payment_ledger::ResolveError::NotFound => StatusCode::NOT_FOUND,
+                crate::payment_ledger::ResolveError::NotPending(_) => StatusCode::CONFLICT,
+                // The obligation is STILL LIVE — automation must retry, never drop the work item.
+                crate::payment_ledger::ResolveError::Persist
+                | crate::payment_ledger::ResolveError::Lock => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            (status, format!("cannot reconcile: {e}"))
+        })?;
     let mut warning = None;
     let refunded = if input.charged {
         false
     } else {
         match meter.try_refund(&record.capsule, record.amount) {
-            Ok(_) => true,
+            Ok(_) => {
+                ledger.mark_refund_applied(&record.idempotency_key);
+                true
+            }
             Err(e) => {
                 warning = Some(format!(
                     "resolution recorded but the refund could not be durably applied ({e}) — \
@@ -2103,10 +2125,15 @@ pub async fn dispatch_standing_intent(
     // fsync work — neither belongs on an async worker. The whole authorize→act→reconcile
     // pipeline runs on the blocking pool; the in-flight payment bound caps how many of these
     // can hold blocking threads at once.
+    // The ENTIRE gate→act→reconcile→use-record pipeline lives inside ONE blocking task (council
+    // S30 G-F6): a client disconnect cancels only the awaiting future, never the started blocking
+    // task, so a performed act can no longer lose its G-M2 CapabilityUse projection to a
+    // cancellation between the act and the record.
     let dispatch_service = state.standing_service.clone();
+    let manager_for_use = state.capability_manager.clone();
     let intent_for_gate = intent.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        dispatch_service.dispatch(&intent_for_gate, move || {
+    let out = tokio::task::spawn_blocking(move || {
+        let outcome = dispatch_service.dispatch(&intent_for_gate, move || {
         match executor.execute(&intent_for_exec) {
             crate::intent_executor::IntentExecution::Declined { reason } => {
                 if reason.contains("INDETERMINATE") {
@@ -2149,77 +2176,89 @@ pub async fn dispatch_standing_intent(
                 ))
             }
         }
-        })
+        });
+        if unrepresentable.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "executor reported an unrepresentable action; the act may have occurred but \
+                 could not be reconciled — refusing to record it as either performed or \
+                 not-performed"
+                    .to_string(),
+            ));
+        }
+        use elastos_runtime::capability::{IntentGateOutcome, ReconciliationStatus};
+        let (out, acted) = match outcome {
+            IntentGateOutcome::BlockedNoCustody(e) => {
+                // Custody is mandatory: the declaration could not land on the chain, so nothing
+                // ran and nothing further is recordable — surface it, emit nothing else.
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("intent custody write failed; act not run: {e}"),
+                ));
+            }
+            IntentGateOutcome::Denied(reason) => (
+                DispatchIntentOutput {
+                    outcome: "denied".to_string(),
+                    reason: Some(reason.as_str().to_string()),
+                    reconciliation: None,
+                },
+                false,
+            ),
+            IntentGateOutcome::Acted(rec) => {
+                // The intent was AUTHORIZED (passed the gate); the reconciliation says whether it
+                // was actually PERFORMED. `success` (and the receipt's use) is true ONLY for a
+                // `Matched` performance — a `Diverged` act (executor did something else) or
+                // `Undelivered` one (nothing performed it) records success=false and says so
+                // honestly in the outcome.
+                let (label, matched) = match rec.status {
+                    ReconciliationStatus::Matched => ("performed", true),
+                    ReconciliationStatus::Diverged => ("diverged", false),
+                    ReconciliationStatus::Undelivered => ("authorized_not_performed", false),
+                };
+                (
+                    DispatchIntentOutput {
+                        outcome: label.to_string(),
+                        // The executor's decline reason (S29 F2): distinguishes a cap-refusal
+                        // from an INDETERMINATE money outcome, and carries the idempotency key
+                        // the operator reconciles with. `None` for a performed act or a
+                        // non-executor decline.
+                        reason: decline_reason.lock().ok().and_then(|mut s| s.take()),
+                        reconciliation: Some(rec),
+                    },
+                    matched,
+                )
+            }
+        };
+        // G-M2: token-keyed projection of the outcome, so export_mandate_receipt_for_capability
+        // carries the intent-channel act (or its denial) in the mandate's receipt. Best-effort
+        // (like the validate-path use records): a lost emit under-reports in the receipt but the
+        // intent-keyed declaration + reconciliation are already durably on the chain.
+        if let Ok(token_id) = TokenId::from_hex(intent_for_gate.standing_grant_id.trim()) {
+            manager_for_use.audit_log().capability_use(
+                &token_id,
+                &intent_for_gate.capsule,
+                &ResourceId::new(intent_for_gate.resource.clone()),
+                action,
+                acted,
+            );
+        }
+        Ok(out)
     })
     .await
     .map_err(|e| {
+        // JoinError = the blocking task PANICKED (blocking tasks are never cancelled once
+        // started). Honest bound (council S30 G-F5): the panic may have struck AFTER the act —
+        // the act may have been performed and not reported here. The declaration (and, if it
+        // ran, the reconciliation) is on the chain; a money act is in the payment ledger; a
+        // retry of the same intent is refused by the replay guard.
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("dispatch task failed: {e}"),
+            format!(
+                "dispatch task panicked — the act may have been performed and not reported; \
+                 consult the audit chain and payment ledger before acting ({e})"
+            ),
         )
-    })?;
-    if unrepresentable.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "executor reported an unrepresentable action; the act may have occurred but could not \
-             be reconciled — refusing to record it as either performed or not-performed"
-                .to_string(),
-        ));
-    }
-    use elastos_runtime::capability::{IntentGateOutcome, ReconciliationStatus};
-    let (out, acted) = match outcome {
-        IntentGateOutcome::BlockedNoCustody(e) => {
-            // Custody is mandatory: the declaration could not land on the chain, so nothing ran
-            // and nothing further is recordable — surface it, emit nothing else.
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("intent custody write failed; act not run: {e}"),
-            ));
-        }
-        IntentGateOutcome::Denied(reason) => (
-            DispatchIntentOutput {
-                outcome: "denied".to_string(),
-                reason: Some(reason.as_str().to_string()),
-                reconciliation: None,
-            },
-            false,
-        ),
-        IntentGateOutcome::Acted(rec) => {
-            // The intent was AUTHORIZED (passed the gate); the reconciliation says whether it was
-            // actually PERFORMED. `success` (and the receipt's use) is true ONLY for a `Matched`
-            // performance — a `Diverged` act (executor did something else) or `Undelivered` one
-            // (nothing performed it) records success=false and says so honestly in the outcome.
-            let (label, matched) = match rec.status {
-                ReconciliationStatus::Matched => ("performed", true),
-                ReconciliationStatus::Diverged => ("diverged", false),
-                ReconciliationStatus::Undelivered => ("authorized_not_performed", false),
-            };
-            (
-                DispatchIntentOutput {
-                    outcome: label.to_string(),
-                    // The executor's decline reason (S29 F2): distinguishes a cap-refusal from an
-                    // INDETERMINATE money outcome, and carries the idempotency key the operator
-                    // reconciles with. `None` for a performed act or a non-executor decline.
-                    reason: decline_reason.lock().ok().and_then(|mut s| s.take()),
-                    reconciliation: Some(rec),
-                },
-                matched,
-            )
-        }
-    };
-    // G-M2: token-keyed projection of the outcome, so export_mandate_receipt_for_capability
-    // carries the intent-channel act (or its denial) in the mandate's receipt. Best-effort
-    // (like the validate-path use records): a lost emit under-reports in the receipt but the
-    // intent-keyed declaration + reconciliation are already durably on the chain.
-    if let Ok(token_id) = TokenId::from_hex(intent.standing_grant_id.trim()) {
-        state.capability_manager.audit_log().capability_use(
-            &token_id,
-            &intent.capsule,
-            &ResourceId::new(intent.resource.clone()),
-            action,
-            acted,
-        );
-    }
+    })??;
     Ok(Json(out))
 }
 
@@ -3288,6 +3327,10 @@ mod tests {
         .unwrap_err();
         assert_eq!(again.0, StatusCode::CONFLICT, "a payment resolves EXACTLY once");
         assert_eq!(meter.remaining("vm-ap-agent"), 500, "no double refund");
+        assert!(
+            ledger.get(&expected_key).unwrap().refund_applied,
+            "the applied refund is marked on the entry (the crash-window forensic bit, G-F3)"
+        );
 
         // ... and the resolution is attested on the signed chain.
         let attested = state

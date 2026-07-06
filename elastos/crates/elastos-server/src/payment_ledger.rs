@@ -13,20 +13,31 @@
 //! the audit bridge from a Performed receipt to the rail's transaction — until a receipt field
 //! carries it (tracked follow-on).
 //!
-//! HONEST BOUNDS:
-//! - This ledger is OPERATIONAL custody, not the signed chain: entries are not signed, and the
-//!   signed record of the act remains the intent declaration + reconciliation on the audit chain.
-//!   A reconciliation RESOLUTION is attested on the signed chain (`Custom` event, emitted by the
-//!   handler) — the resolution's authority trail is the chain, this ledger is the working state.
-//! - Durability mirrors the spend meter (versioned snapshot, temp + fsync + rename + parent-dir
-//!   fsync, size-capped fail-closed open) but the ledger deliberately does NOT block money on its
-//!   own failures: a payment whose ledger write fails still completes with its fail-closed money
-//!   semantics, and the decline/performed reason says the entry is unrecorded (reconcile from the
-//!   error log). Money invariants live in the meter + replay guard, never here.
-//! - BOUNDED: terminal entries (performed / not-charged / resolved) are evicted oldest-first past
-//!   the cap; PENDING entries are never evicted (they are the reconciliation obligations), and a
-//!   pending set at the cap refuses NEW pending entries (recorded=false ⇒ the reason tells the
-//!   operator to reconcile from the log) rather than growing without bound.
+//! HONEST BOUNDS (council S30):
+//! - CUSTODY IS "EVERY RAIL ATTEMPT THE PROCESS LIVED TO RECORD", not literally every attempt: a
+//!   crash between the persisted reservation and the rail verdict leaves a durable reservation
+//!   with NO ledger entry (the S29 orphaned-reservation window) — recovery there is still
+//!   deriving `flint-<signature>` from the on-chain declaration. PENDING custody is
+//!   guaranteed-or-stated (an unrecordable pending is named in the decline reason); TERMINAL
+//!   records (performed / not-charged) are best-effort — a failed write drops the rail reference
+//!   to the runtime log only.
+//! - THE LEDGER GATES MONEY IN THE RELEASE DIRECTION (council S30 G-F1): it never gates the
+//!   CHARGE path (a payment completes with its fail-closed semantics whether or not its record
+//!   lands), but a resolved record's (capsule, amount) is the INPUT to a reconciliation refund —
+//!   so this file is money-trusted core on release and carries the meter's protections: same
+//!   snapshot discipline, same single-opener flock, same data_dir trust class (the snapshot is
+//!   not self-authenticating; a data_dir writer already owns the stronger attack on the meter
+//!   file itself).
+//! - This ledger is OPERATIONAL custody, not the signed chain: entries are not signed; the signed
+//!   record of the act remains the intent declaration + reconciliation on the audit chain, and a
+//!   RESOLUTION is attested there (`Custom` event, emitted by the handler).
+//! - BOUNDED, per capsule and globally: terminal entries are evicted oldest-first past the global
+//!   cap; PENDING entries are never evicted (they are the reconciliation obligations); a capsule
+//!   at its own pending cap — or a global map full of pendings — refuses NEW pending entries
+//!   (recorded=false ⇒ stated in the reason). The per-capsule bound (council S30 RT-F3) confines
+//!   the blinding to the misbehaving capsule: one agent flooding indeterminates cannot push a
+//!   VICTIM capsule's obligations out of the work list. A full pending set also stops best-effort
+//!   terminal custody — the stated consequence of the bound.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -68,6 +79,13 @@ pub struct PaymentRecord {
     pub rail_note: String,
     /// Monotonic insertion sequence (this ledger's own counter) — the eviction order.
     pub seq: u64,
+    /// For `ResolvedNotCharged`: whether the refund was durably applied to the meter (council S30
+    /// G-F3/RT-F2). `false` on a resolved-not-charged entry is the FORENSIC marker for a crash (or
+    /// persist failure) between resolution and refund: the refund was never applied, the cap
+    /// remains debited, and the recovery lever is raising the limit. Absent/false on all other
+    /// statuses.
+    #[serde(default)]
+    pub refund_applied: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -80,14 +98,54 @@ struct LedgerSnapshotV1 {
 const LEDGER_SNAPSHOT_VERSION: u32 = 1;
 /// Total record cap; terminal entries beyond it are evicted oldest-first.
 const LEDGER_CAP: usize = 4096;
+/// Per-capsule bound on PENDING entries (council S30 RT-F3): one capsule flooding indeterminates
+/// cannot exhaust the global map and blind a VICTIM capsule's reconciliation obligations.
+const PENDING_PER_CAPSULE_CAP: usize = 256;
 
-/// Hold rail-controlled bytes to a renderable discipline BEFORE they enter any reason, record, or
-/// surface (council S29 RT-F7): printable ASCII only (control chars and non-ASCII dropped), ≤256.
+/// Hold rail-controlled bytes to a printable discipline BEFORE they enter any reason, record, or
+/// surface (council S29 RT-F7): printable ASCII only (control chars — incl. CR/LF/ESC, killing
+/// log/ANSI injection — and non-ASCII dropped), ≤256. NOT HTML-escaped: `<>"'&` survive as inert
+/// ASCII — any HTML renderer of a `rail_note` MUST escape at render (council S30 F8).
 pub fn sanitize_rail_note(raw: &str) -> String {
     raw.chars()
         .filter(|c| (' '..='~').contains(c))
         .take(256)
         .collect()
+}
+
+/// Why a resolution was refused — structured so AUTOMATION can distinguish retry from terminal
+/// (council S30 G-F2: one 409 string made a transient persist failure read as "already resolved",
+/// abandoning a live refund obligation).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResolveError {
+    /// No entry for this key (404): never recorded, or an unrecorded pending — reconcile via the
+    /// operator's out-of-band levers, not this endpoint.
+    NotFound,
+    /// The entry is terminal (409): the payment already resolved (or never needed to) — a payment
+    /// resolves exactly once, retrying is wrong.
+    NotPending(PaymentStatus),
+    /// The resolution could not be durably recorded and was ROLLED BACK — the entry is STILL
+    /// pending and the obligation still live (503): RETRY.
+    Persist,
+    /// Lock poisoned (503): retry.
+    Lock,
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveError::NotFound => write!(f, "no ledger entry for this idempotency key"),
+            ResolveError::NotPending(st) => write!(
+                f,
+                "entry is not pending (status {st:?}) — a payment resolves exactly once"
+            ),
+            ResolveError::Persist => write!(
+                f,
+                "resolution could not be durably recorded; the entry stays pending (rolled back)                  — retry"
+            ),
+            ResolveError::Lock => write!(f, "ledger lock poisoned — retry"),
+        }
+    }
 }
 
 /// A durable, bounded ledger of rail attempts. All mutations persist snapshot-atomically before
@@ -97,6 +155,11 @@ pub struct PaymentLedger {
     records: RwLock<HashMap<String, PaymentRecord>>,
     next_seq: std::sync::atomic::AtomicU64,
     storage_path: Option<PathBuf>,
+    /// Exclusive advisory flock on `<path>.lock`, held for the ledger's lifetime (council S30
+    /// RT-F8/G-F1): the ledger gates money on release, so it carries the METER's single-opener
+    /// discipline — a second live instance could last-writer-wins RESURRECT a resolved entry to
+    /// pending and reopen refund-exactly-once across processes.
+    _lock_file: Option<std::fs::File>,
 }
 
 impl PaymentLedger {
@@ -106,12 +169,33 @@ impl PaymentLedger {
             records: RwLock::new(HashMap::new()),
             next_seq: std::sync::atomic::AtomicU64::new(0),
             storage_path: None,
+            _lock_file: None,
         }
     }
 
     /// Open the durable ledger. Missing file ⇒ fresh; corrupt/oversized/dup-key snapshot ⇒ REFUSE
     /// (fail-closed — booting over a lost pending set would orphan reconciliation obligations).
     pub fn open_durable(path: PathBuf) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        let lock_file = {
+            use std::os::unix::io::AsRawFd as _;
+            let lock_path = path.with_extension("lock");
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_path)?;
+            let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "payment ledger is already open elsewhere (single-opener, fail-closed)",
+                ));
+            }
+            Some(f)
+        };
+        #[cfg(not(unix))]
+        let lock_file = None;
         let mut records = HashMap::new();
         let mut next_seq = 0u64;
         match std::fs::read(&path) {
@@ -147,6 +231,7 @@ impl PaymentLedger {
             records: RwLock::new(records),
             next_seq: std::sync::atomic::AtomicU64::new(next_seq),
             storage_path: Some(path),
+            _lock_file: lock_file,
         })
     }
 
@@ -169,6 +254,17 @@ impl PaymentLedger {
             Err(_) => return false,
         };
         if records.contains_key(idempotency_key) {
+            return false;
+        }
+        // Per-capsule pending bound (RT-F3): a capsule at its cap refuses NEW pending entries —
+        // the blinding is confined to the misbehaving capsule, never a victim's work list.
+        if status == PaymentStatus::Pending
+            && records
+                .values()
+                .filter(|r| r.status == PaymentStatus::Pending && r.capsule == capsule)
+                .count()
+                >= PENDING_PER_CAPSULE_CAP
+        {
             return false;
         }
         // Bound the map: evict oldest TERMINAL entries; never a pending one. If everything at the
@@ -201,6 +297,7 @@ impl PaymentLedger {
                 status,
                 rail_note: sanitize_rail_note(rail_note),
                 seq,
+                refund_applied: false,
             },
         );
         if self.persist_locked(&records).is_err() {
@@ -213,19 +310,17 @@ impl PaymentLedger {
     /// Resolve a PENDING entry exactly once. Durable-before-visible with rollback: on success the
     /// entry is terminally `ResolvedCharged`/`ResolvedNotCharged` and can never resolve again
     /// (the double-refund guard the reconcile handler builds on). Errors are honest strings.
-    pub fn resolve(&self, idempotency_key: &str, charged: bool) -> Result<PaymentRecord, String> {
-        let mut records = match self.records.write() {
-            Ok(r) => r,
-            Err(_) => return Err("ledger lock poisoned".to_string()),
-        };
+    pub fn resolve(
+        &self,
+        idempotency_key: &str,
+        charged: bool,
+    ) -> Result<PaymentRecord, ResolveError> {
+        let mut records = self.records.write().map_err(|_| ResolveError::Lock)?;
         let rec = records
             .get_mut(idempotency_key)
-            .ok_or_else(|| "no ledger entry for this idempotency key".to_string())?;
+            .ok_or(ResolveError::NotFound)?;
         if rec.status != PaymentStatus::Pending {
-            return Err(format!(
-                "entry is not pending (status {:?}) — a payment resolves exactly once",
-                rec.status
-            ));
+            return Err(ResolveError::NotPending(rec.status));
         }
         rec.status = if charged {
             PaymentStatus::ResolvedCharged
@@ -237,12 +332,28 @@ impl PaymentLedger {
             if let Some(r) = records.get_mut(idempotency_key) {
                 r.status = PaymentStatus::Pending;
             }
-            return Err(
-                "resolution could not be durably recorded; the entry stays pending (rolled back)"
-                    .to_string(),
-            );
+            return Err(ResolveError::Persist);
         }
         Ok(resolved)
+    }
+
+    /// Mark a `ResolvedNotCharged` entry's refund as durably applied (called by the reconcile
+    /// handler AFTER `try_refund` returns Ok). Best-effort durable: a persist failure keeps the
+    /// in-memory mark (the refund DID apply; disk catches up at the next mutation) — the forensic
+    /// meaning of `refund_applied=false` on disk is "refund may be lost, check the chain event".
+    pub fn mark_refund_applied(&self, idempotency_key: &str) -> bool {
+        let mut records = match self.records.write() {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        match records.get_mut(idempotency_key) {
+            Some(r) if r.status == PaymentStatus::ResolvedNotCharged => {
+                r.refund_applied = true;
+            }
+            _ => return false,
+        }
+        let _ = self.persist_locked(&records);
+        true
     }
 
     /// All PENDING entries (the reconciliation work list), oldest first.
@@ -402,15 +513,85 @@ mod tests {
         assert!(ledger.record("t-new", "vm-ap", "acme", 1, PaymentStatus::Performed, ""));
         assert!(ledger.get("pend-1").is_some(), "pending is never evicted");
         assert!(ledger.get("t-0").is_none(), "oldest terminal was evicted");
-        // A cap full of ONLY pending refuses new inserts (bounded obligations).
+        // A cap full of ONLY pending refuses new inserts (bounded obligations). Spread across
+        // capsules so the GLOBAL bound is what trips, not the per-capsule one.
         let small = PaymentLedger::new();
-        for i in 0..LEDGER_CAP {
-            assert!(small.record(&format!("p-{i}"), "vm", "a", 1, PaymentStatus::Pending, ""));
+        let capsules = LEDGER_CAP / PENDING_PER_CAPSULE_CAP;
+        for c in 0..capsules {
+            for i in 0..PENDING_PER_CAPSULE_CAP {
+                assert!(small.record(
+                    &format!("p-{c}-{i}"),
+                    &format!("vm-{c}"),
+                    "a",
+                    1,
+                    PaymentStatus::Pending,
+                    ""
+                ));
+            }
         }
         assert!(
-            !small.record("one-more", "vm", "a", 1, PaymentStatus::Pending, ""),
+            !small.record("one-more", "vm-new", "a", 1, PaymentStatus::Pending, ""),
             "a pending set at the cap refuses new entries instead of growing unbounded"
         );
+    }
+
+    #[test]
+    fn one_capsule_cannot_blind_a_victims_obligations() {
+        // Council S30 RT-F3: the pending bound is PER CAPSULE — an attacker flooding
+        // indeterminates fills only its own quota; a victim's obligation still records.
+        let ledger = PaymentLedger::new();
+        for i in 0..PENDING_PER_CAPSULE_CAP {
+            assert!(ledger.record(
+                &format!("atk-{i}"),
+                "vm-attacker",
+                "a",
+                1,
+                PaymentStatus::Pending,
+                ""
+            ));
+        }
+        assert!(
+            !ledger.record("atk-more", "vm-attacker", "a", 1, PaymentStatus::Pending, ""),
+            "the attacker capsule is at its own pending cap"
+        );
+        assert!(
+            ledger.record("victim-1", "vm-victim", "b", 7, PaymentStatus::Pending, ""),
+            "a victim capsule's obligation still records — the blind is confined"
+        );
+        assert_eq!(ledger.pending_for("vm-victim"), (7, 1));
+    }
+
+    #[test]
+    fn second_ledger_opener_is_refused() {
+        // Council S30 RT-F8: the ledger gates money on release, so it carries the meter's
+        // single-opener flock — a second live instance could resurrect a resolved entry to
+        // pending and reopen refund-exactly-once across processes.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payments.json");
+        let first = PaymentLedger::open_durable(path.clone()).unwrap();
+        assert!(PaymentLedger::open_durable(path.clone()).is_err());
+        drop(first);
+        assert!(PaymentLedger::open_durable(path).is_ok());
+    }
+
+    #[test]
+    fn resolve_errors_are_structured_for_automation() {
+        // Council S30 G-F2: 404 (absent) vs 409 (terminal) vs 503 (retry) must be
+        // machine-distinguishable — a retryable failure must never read as "already resolved".
+        let ledger = PaymentLedger::new();
+        assert_eq!(ledger.resolve("ghost", false).unwrap_err(), ResolveError::NotFound);
+        assert!(ledger.record("k", "vm", "a", 5, PaymentStatus::NotCharged, ""));
+        assert_eq!(
+            ledger.resolve("k", false).unwrap_err(),
+            ResolveError::NotPending(PaymentStatus::NotCharged),
+            "a rail-refunded (terminal) payment can never ALSO be reconcile-refunded"
+        );
+        // refund_applied marks only a resolved-not-charged entry.
+        assert!(ledger.record("p", "vm", "a", 5, PaymentStatus::Pending, ""));
+        assert!(!ledger.mark_refund_applied("p"), "pending: not markable");
+        ledger.resolve("p", false).unwrap();
+        assert!(ledger.mark_refund_applied("p"));
+        assert!(ledger.get("p").unwrap().refund_applied);
     }
 
     #[test]
@@ -426,8 +607,11 @@ mod tests {
             "an unpersistable record reports unrecorded"
         );
         assert!(ledger.get("k2").is_none(), "rolled back — no phantom entry");
-        let err = ledger.resolve("k1", false).unwrap_err();
-        assert!(err.contains("stays pending"), "{err}");
+        assert_eq!(
+            ledger.resolve("k1", false).unwrap_err(),
+            ResolveError::Persist,
+            "a transient persist failure is DISTINGUISHABLE from terminal — automation retries"
+        );
         assert_eq!(
             ledger.get("k1").unwrap().status,
             PaymentStatus::Pending,

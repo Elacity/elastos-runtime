@@ -34,12 +34,13 @@ cap.
 
 | You answer | Flint concludes | Flint does |
 |---|---|---|
-| **2xx** (any, incl. `202`) | The charge **HAPPENED**. Body (≤64 KiB read, first 256 printable chars kept) = your transaction reference. | Mints a signed `performed` receipt; records your reference in the payment ledger. **Never return 2xx for an order you only queued but might reject.** |
+| **2xx** (any, incl. `202`) | The charge **HAPPENED**. Body (≤64 KiB read, first 256 printable chars kept) = your transaction reference. | Mints a signed `performed` receipt; records your reference in the payment ledger (best-effort — a full or failed ledger drops it to the runtime log). **Never return 2xx for an order you only queued but might reject.** |
 | **4xx** (any, incl. `408`, `429`) | The charge **PROVABLY DID NOT happen**. | **Refunds** the cap reservation. **Never return 4xx for an order you may have (or did) process** — that refund plus your real charge is a cap breach. If you must shed load, use `503`. |
 | **5xx** | **INDETERMINATE** — you received the order; the outcome is unknown. | **Holds** the reservation and files a pending entry the operator later reconciles against you by idempotency key. |
 | **3xx** | Indeterminate. Flint never follows redirects for money orders. | Holds the reservation. Don't redirect. |
 | (timeout / connection drop after send) | Indeterminate. | Holds the reservation. |
 | (connection refused / TLS failure before send) | Provably not sent. | Refunds. |
+| (timeout during the connect phase, or a `1xx`) | Classified **indeterminate** (fail-closed: the runtime cannot distinguish a connect-phase timeout from a post-send one). | Holds the reservation. |
 
 **The one rule that matters:** *only* say "not charged" (4xx) when you can prove it; *only* say
 "charged" (2xx) when it is true; everything else is 5xx. Flint keeps every unclear reservation and
