@@ -1419,8 +1419,15 @@ pub struct SpendBudgetOutput {
 /// - **Attested:** the budget change lands on the signed audit chain as a `ConfigChange`
 ///   (`spend_budget:{capsule}`, old → new). Apply-then-attest with rollback: the event is emitted
 ///   only AFTER the budget is durably in force (the chain never claims a cap that isn't real), and
-///   if the emit fails the budget is rolled back (no unattested cap stays in force) — the same
-///   no-record-⇒-no-change discipline as the fail-closed revoke/mint.
+///   if the emit fails the budget is rolled back — a first-time provision is fully REMOVED, never
+///   left as a provisioned-at-zero artifact (council S28 F7). Under a single failure no unattested
+///   cap stays in force. Residuals, stated honestly (council S28 F2/F5): if the ROLLBACK itself
+///   cannot persist (a correlated failure — audit chain and meter share `data_dir`), the cap the
+///   operator requested may remain durably in force UNATTESTED; that double failure is surfaced
+///   loudly (distinct 500 naming it, error log, best-effort attestation) — never silently
+///   discarded. And a pay racing the failed attestation may appear on-chain under a cap whose
+///   `ConfigChange` never landed (the payment's own receipt still lands; apply-then-attest is the
+///   honest ordering — the inverse would put a FALSE claim on the chain).
 pub async fn set_spend_budget(
     State(state): State<CapabilityState>,
     Json(input): Json<SetSpendBudgetInput>,
@@ -1444,29 +1451,55 @@ pub async fn set_spend_budget(
             "capsule must be a 1-64 char slug (the identity the pay gate debits)".to_string(),
         ));
     }
-    let old_value = meter
-        .snapshot(&input.capsule)
-        .map(|s| s.limit.to_string())
-        .unwrap_or_else(|| "unprovisioned".to_string());
-    let prior_limit = meter.snapshot(&input.capsule).map(|s| s.limit);
-    meter.set_budget(&input.capsule, input.limit).map_err(|e| {
+    // The PRIOR limit comes back from set_budget itself, read under the meter's write lock in the
+    // same critical section as the mutation (council S28 F6) — the one linearizable old-value the
+    // attestation and the rollback can both trust. Two lock-free snapshot() reads here would let
+    // concurrent provisions attest the same stale "old".
+    let prior_limit = meter.set_budget(&input.capsule, input.limit).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("budget not applied (durable persist failed, rolled back): {e}"),
         )
     })?;
-    let attested = state.capability_manager.audit_log().emit(
-        elastos_runtime::primitives::audit::AuditEvent::ConfigChange {
-            timestamp: elastos_runtime::primitives::SecureTimestamp::now(),
-            setting: format!("spend_budget:{}", input.capsule),
-            old_value,
-            new_value: input.limit.to_string(),
-        },
-    );
-    if let Err(e) = attested {
-        // No unattested cap stays in force: roll back to the prior limit (or an unspendable zero if
-        // the key was unprovisioned — there is no un-provision, and zero is the fail-closed shape).
-        let _ = meter.set_budget(&input.capsule, prior_limit.unwrap_or(0));
+    let config_change = || elastos_runtime::primitives::audit::AuditEvent::ConfigChange {
+        timestamp: elastos_runtime::primitives::SecureTimestamp::now(),
+        setting: format!("spend_budget:{}", input.capsule),
+        old_value: prior_limit
+            .map(|l| l.to_string())
+            .unwrap_or_else(|| "unprovisioned".to_string()),
+        new_value: input.limit.to_string(),
+    };
+    if let Err(e) = state.capability_manager.audit_log().emit(config_change()) {
+        // No unattested cap stays in force: restore the prior limit, or fully REMOVE a first-time
+        // provision (never a provisioned-at-zero artifact the chain never granted — F7).
+        let rollback = match prior_limit {
+            Some(limit) => meter.set_budget(&input.capsule, limit).map(|_| ()),
+            None => meter.remove_budget(&input.capsule).map(|_| ()),
+        };
+        if let Err(rb) = rollback {
+            // DOUBLE FAILURE (council S28 F2, correlated: chain and meter share data_dir): the cap
+            // the operator asked for is durably in force but its attestation never landed and the
+            // rollback could not persist. Surface it loudly and distinctly — the operator must
+            // intervene — and try the attestation once more best-effort (the chain may recover).
+            tracing::error!(
+                capsule = %input.capsule,
+                limit = input.limit,
+                "spend budget applied but NOT attested, and the rollback could not persist \
+                 ({rb}) — an unattested money cap may be in force; operator intervention required"
+            );
+            state
+                .capability_manager
+                .audit_log()
+                .emit_best_effort(config_change());
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "budget applied but could NOT be attested on the audit chain ({e}), and the \
+                     rollback could not persist ({rb}) — the cap may remain in force unattested; \
+                     operator intervention required"
+                ),
+            ));
+        }
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("budget change could not be attested on the audit chain — rolled back: {e}"),
@@ -2823,6 +2856,85 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(e.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// Council S28 F2/F7 ratchet: when the budget applies but its ATTESTATION fails, the rollback
+    /// must truly restore the prior state — a FIRST-TIME provision is fully removed (GET stays 404,
+    /// no provisioned-at-zero artifact the chain never granted), and a RE-provision restores the
+    /// prior limit. The response is a 500 naming the rollback.
+    #[tokio::test]
+    async fn unattestable_budget_change_is_rolled_back_without_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        // An audit log whose emit always FAILS (read-only file handle, mirroring the fail-closed
+        // mint ratchet) — apply-then-attest must then roll the budget back.
+        let audit_path = dir.path().join("audit-ro.log");
+        std::fs::File::create(&audit_path).unwrap();
+        let ro = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&audit_path)
+            .unwrap();
+        let audit_log = std::sync::Arc::new(
+            elastos_runtime::primitives::audit::AuditLog::with_file_handle(ro),
+        );
+        let store = std::sync::Arc::new(elastos_runtime::capability::CapabilityStore::new());
+        let metrics =
+            std::sync::Arc::new(elastos_runtime::primitives::metrics::MetricsManager::new());
+        let capability_manager =
+            std::sync::Arc::new(CapabilityManager::new(store, audit_log.clone(), metrics));
+        let standing_service = std::sync::Arc::new(capability_manager.standing_grant_service());
+        let meter = std::sync::Arc::new(
+            elastos_runtime::primitives::spend::SpendMeter::open_durable(
+                dir.path().join("spend_meter.json"),
+            )
+            .unwrap(),
+        );
+        let state = CapabilityState {
+            pending_store: std::sync::Arc::new(PendingRequestStore::new(audit_log.clone())),
+            capability_manager,
+            policy_evaluator: std::sync::Arc::new(PolicyEvaluator::new(
+                Box::new(elastos_runtime::capability::evaluator::ShellPassthroughVerifier),
+                audit_log,
+            )),
+            standing_service,
+            intent_executor: std::sync::Arc::new(FaithfulExecutor),
+            spend_meter: Some(meter.clone()),
+        };
+
+        // FIRST-TIME provision: applied, unattestable, rolled back — fully unprovisioned again.
+        let e = set_spend_budget(
+            State(state.clone()),
+            Json(SetSpendBudgetInput { capsule: "vm-ap-agent".into(), limit: 500 }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(e.1.contains("rolled back"), "the 500 names the rollback: {}", e.1);
+        let g = get_spend_budget(State(state.clone()), Path("vm-ap-agent".to_string()))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            g.0,
+            StatusCode::NOT_FOUND,
+            "no provisioned-at-zero artifact survives a failed first-time provision"
+        );
+        assert_eq!(
+            meter.snapshot("vm-ap-agent"),
+            None,
+            "the meter holds nothing the chain never granted"
+        );
+
+        // RE-provision: seed 100 directly on the meter (in force + persisted), then an
+        // unattestable raise to 900 must roll back to exactly 100.
+        meter.set_budget("vm-ap-agent", 100).unwrap();
+        let e = set_spend_budget(
+            State(state.clone()),
+            Json(SetSpendBudgetInput { capsule: "vm-ap-agent".into(), limit: 900 }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.0, StatusCode::INTERNAL_SERVER_ERROR);
+        let snap = meter.snapshot("vm-ap-agent").unwrap();
+        assert_eq!(snap.limit, 100, "the unattestable raise was rolled back to the prior limit");
     }
 
     /// Sprint 26 — AGENT-FACING dispatch: an agent acts under a mandate BOUND to its key with NO

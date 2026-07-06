@@ -133,9 +133,18 @@ const SPEND_SNAPSHOT_VERSION: u32 = 1;
 /// `tests::concurrent_debits_never_overspend`).
 ///
 /// In DURABLE mode ([`open_durable`](Self::open_durable)) every mutation is persisted under that
-/// same write lock, durable-before-visible: on a persist failure the mutation is rolled back and
-/// surfaced ([`SpendError::Persist`]) — the caller never observes (and money never moves against) a
-/// balance the disk does not hold.
+/// same write lock, durable-before-visible: on a persist failure the mutation is rolled back in
+/// memory and surfaced ([`SpendError::Persist`]) — money never moves against a reservation only
+/// memory holds.
+///
+/// HONEST BOUND (council S28 F1): `persist_locked` can fail AFTER the rename has published the new
+/// snapshot (the parent-dir fsync errors). The memory rollback then diverges from a disk that holds
+/// the mutation, and a restart makes the DISK state win. Per method that direction is: `try_debit` —
+/// disk more-spent (the refused payment's reservation survives; fail-closed, headroom recoverable by
+/// the operator raising the limit); `refund` — disk holds a refund for a provably-unperformed act
+/// (headroom that was owed, not free money); `set_budget` — disk holds the new limit the caller was
+/// told was rolled back, which the PROVISIONING surface must treat as "surface loudly, never
+/// discard" (it does). Poisoning the meter on a post-publish failure is the S29 hardening.
 #[derive(Default)]
 pub struct SpendMeter {
     balances: RwLock<HashMap<String, Balance>>,
@@ -150,13 +159,29 @@ impl SpendMeter {
 
     /// Open a DURABLE meter backed by `path` (the money mode). A missing file is a fresh, empty
     /// meter (every key fail-closed at zero until provisioned); an existing snapshot restores every
-    /// balance INCLUDING `spent` — a restart never refills a cap. A corrupt or unreadable snapshot
-    /// REFUSES to open (fail-closed): booting a money meter with silently zeroed spend would let the
-    /// cumulative cap be exceeded, exactly what durability exists to prevent.
+    /// balance INCLUDING `spent` — a restart never refills a cap. A corrupt, oversized, duplicated,
+    /// or unreadable snapshot REFUSES to open (fail-closed): booting a money meter with silently
+    /// zeroed spend would let the cumulative cap be exceeded, exactly what durability exists to
+    /// prevent.
+    ///
+    /// STATED BOUNDS (council S28): the snapshot is NOT self-authenticating — unlike the signed
+    /// audit chain, anyone who can write `data_dir` can forge it (the same trust boundary as the
+    /// runtime's key material; a hostile disk already owns the box). And the meter takes no file
+    /// lock of its own: SINGLE-OPENER is the caller's contract — the serve/gateway paths hold an
+    /// exclusive host lock on `data_dir`, which is what prevents two processes from last-writer-wins
+    /// clobbering each other's `spent`.
     pub fn open_durable(path: PathBuf) -> std::io::Result<Self> {
         let mut balances = HashMap::new();
         match std::fs::read(&path) {
             Ok(bytes) => {
+                // Size bound before parse: a money meter has at most a few thousand keys; a huge
+                // file is a forgery/corruption, not a balance set — refuse rather than OOM at boot.
+                if bytes.len() > 4 * 1024 * 1024 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "spend snapshot exceeds the 4 MiB bound",
+                    ));
+                }
                 let snapshot: SpendSnapshotV1 = serde_json::from_slice(&bytes)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
                 if snapshot.version != SPEND_SNAPSHOT_VERSION {
@@ -166,13 +191,23 @@ impl SpendMeter {
                     ));
                 }
                 for rec in snapshot.balances {
-                    balances.insert(
-                        rec.key,
-                        Balance {
-                            limit: rec.limit,
-                            spent: rec.spent,
-                        },
-                    );
+                    // A duplicate key would silently last-write-win a balance away — the writer
+                    // never produces one (it serializes a map), so a dup is tampering: refuse.
+                    if balances
+                        .insert(
+                            rec.key.clone(),
+                            Balance {
+                                limit: rec.limit,
+                                spent: rec.spent,
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("duplicate key {:?} in spend snapshot", rec.key),
+                        ));
+                    }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -235,7 +270,16 @@ impl SpendMeter {
     /// it below what is already spent simply clamps remaining to zero (never refunds silently).
     /// Durable mode: persisted before returning `Ok`; a persist failure rolls the limit back and
     /// returns [`SpendError::Persist`] (in-memory mode never fails).
-    pub fn set_budget(&self, key: &str, limit: SpendUnits) -> Result<(), SpendError> {
+    ///
+    /// Returns the PRIOR limit (`None` = the key was unprovisioned), read under the same write lock
+    /// as the mutation — the one linearizable old-value an attestation and a rollback can both trust
+    /// (council S28 F6: two lock-free `snapshot()` reads let concurrent provisions attest the same
+    /// stale "old").
+    pub fn set_budget(
+        &self,
+        key: &str,
+        limit: SpendUnits,
+    ) -> Result<Option<SpendUnits>, SpendError> {
         let mut balances = match self.balances.write() {
             Ok(b) => b,
             // A poisoned lock here can only mean a prior panic; the map is structurally intact
@@ -258,7 +302,27 @@ impl SpendMeter {
             }
             return Err(SpendError::Persist);
         }
-        Ok(())
+        Ok(prior.map(|b| b.limit))
+    }
+
+    /// Remove a key's budget entirely (durable, same rollback discipline): afterwards the key is
+    /// UNPROVISIONED — fail-closed `NoBudget`, `snapshot() == None` — exactly as if it had never
+    /// been set. Returns whether the key existed. Exists so a provisioning surface can truly undo a
+    /// failed first-time provision (council S28 F7: rolling an unprovisioned key "back" to limit 0
+    /// leaves an enumerable provisioned-at-zero artifact the chain never granted).
+    pub fn remove_budget(&self, key: &str) -> Result<bool, SpendError> {
+        let mut balances = match self.balances.write() {
+            Ok(b) => b,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(prior) = balances.remove(key) else {
+            return Ok(false);
+        };
+        if self.persist_locked(&balances).is_err() {
+            balances.insert(key.to_string(), prior);
+            return Err(SpendError::Persist);
+        }
+        Ok(true)
     }
 
     /// Provision `key` with `limit` ONLY if it has no budget yet (idempotent first-touch). Unlike
@@ -365,28 +429,39 @@ impl SpendMeter {
     ///
     /// Conservative under failure: an unknown key or a poisoned lock credits nothing back (a meter
     /// erring toward *more* spent / *less* available is the fail-closed direction for a budget).
-    /// Durable mode: a refund whose persist fails is ROLLED BACK (not granted) — memory never shows
-    /// headroom the disk would take away on restart; the same fail-closed direction.
+    /// Durable mode: a refund whose persist fails is ROLLED BACK in memory (not granted) — the
+    /// fail-closed direction. Callers that must RECORD whether the refund actually stuck (a money
+    /// path minting a signed reason) use [`try_refund`](Self::try_refund), which distinguishes the
+    /// rollback; this convenience face only reports the resulting remaining.
     pub fn refund(&self, key: &str, cost: SpendUnits) -> SpendUnits {
-        let mut balances = match self.balances.write() {
-            Ok(b) => b,
-            Err(_) => return 0,
-        };
+        match self.try_refund(key, cost) {
+            Ok(remaining) => remaining,
+            Err(_) => self.remaining(key),
+        }
+    }
+
+    /// [`refund`](Self::refund) with an honest failure channel: `Ok(remaining)` iff the refund is
+    /// IN FORCE (and, on a durable meter, persisted); `Err(Persist)` when it was rolled back
+    /// (the cap REMAINS DEBITED), `Err(NoBudget)`/`Err(Lock)` when nothing could be credited. A
+    /// signed record derived from this call must only claim "refunded" on `Ok` (council S28 F3: the
+    /// pay path's Declined reason said "spend refunded" even when the durable refund rolled back).
+    pub fn try_refund(&self, key: &str, cost: SpendUnits) -> Result<SpendUnits, SpendError> {
+        let mut balances = self.balances.write().map_err(|_| SpendError::Lock)?;
         let (refunded, remaining) = match balances.get_mut(key) {
             Some(bal) => {
                 let before = bal.spent;
                 bal.spent = bal.spent.saturating_sub(cost);
                 (before - bal.spent, bal.remaining())
             }
-            None => return 0,
+            None => return Err(SpendError::NoBudget),
         };
         if self.persist_locked(&balances).is_err() {
             if let Some(bal) = balances.get_mut(key) {
                 bal.spent += refunded;
-                return bal.remaining();
             }
+            return Err(SpendError::Persist);
         }
-        remaining
+        Ok(remaining)
     }
 }
 
@@ -656,9 +731,12 @@ mod tests {
     }
 
     #[test]
-    fn durable_refund_that_cannot_persist_is_not_granted() {
+    fn durable_refund_that_cannot_persist_is_rolled_back_in_memory() {
         // The refund mirror: headroom memory shows but disk would revoke on restart is a phantom
-        // refund — on a persist failure the refund is rolled back (fail-closed = LESS available).
+        // refund — on a persist failure the refund is rolled back IN MEMORY (fail-closed = LESS
+        // available), and try_refund SURFACES it so a signed record never claims "refunded" for a
+        // refund that is not in force (council S28 F3). Honest bound: this asserts the in-memory
+        // outcome; a post-PUBLISH persist failure can leave the refund on disk (module doc, F1).
         let dir = tempfile::tempdir().unwrap();
         let sub = dir.path().join("meter");
         std::fs::create_dir(&sub).unwrap();
@@ -667,10 +745,103 @@ mod tests {
         meter.try_debit("vm-ap-agent", 200).unwrap();
         std::fs::remove_dir_all(&sub).unwrap();
         assert_eq!(
+            meter.try_refund("vm-ap-agent", 200).unwrap_err(),
+            SpendError::Persist,
+            "the money path is TOLD the refund did not stick — the cap remains debited"
+        );
+        assert_eq!(
             meter.refund("vm-ap-agent", 200),
             300,
-            "the unpersistable refund is rolled back; remaining stays at the debited 300"
+            "the convenience face reports the unchanged remaining after the rollback"
         );
         assert_eq!(meter.remaining("vm-ap-agent"), 300);
+    }
+
+    #[test]
+    fn set_budget_returns_the_prior_limit_read_under_the_lock() {
+        // Council S28 F6: the attestation's old→new must be linearizable against the mutation, so
+        // the prior comes back from set_budget itself, not a separate racy read.
+        let meter = SpendMeter::new();
+        assert_eq!(
+            meter.set_budget("vm-alice", 100).unwrap(),
+            None,
+            "first provision: no prior"
+        );
+        assert_eq!(
+            meter.set_budget("vm-alice", 250).unwrap(),
+            Some(100),
+            "re-provision reports the limit it replaced"
+        );
+    }
+
+    #[test]
+    fn remove_budget_truly_unprovisions_durably() {
+        // Council S28 F7: the provisioning rollback must be able to UNDO a first-time provision
+        // completely — afterwards the key is indistinguishable from never-provisioned (NoBudget,
+        // no snapshot), including across a restart.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spend_meter.json");
+        {
+            let meter = SpendMeter::open_durable(path.clone()).unwrap();
+            meter.set_budget("vm-ap-agent", 500).unwrap();
+            assert!(meter.remove_budget("vm-ap-agent").unwrap(), "existed");
+            assert!(!meter.remove_budget("vm-ap-agent").unwrap(), "idempotent");
+            assert_eq!(meter.snapshot("vm-ap-agent"), None);
+            assert_eq!(
+                meter.try_debit("vm-ap-agent", 1).unwrap_err(),
+                SpendError::NoBudget
+            );
+        }
+        let reopened = SpendMeter::open_durable(path).unwrap();
+        assert_eq!(
+            reopened.snapshot("vm-ap-agent"),
+            None,
+            "the removal survives restart — no provisioned-at-zero artifact"
+        );
+        // And a removal that cannot persist is ROLLED BACK — the budget (and its spend) stay.
+        let dir2 = tempfile::tempdir().unwrap();
+        let sub = dir2.path().join("meter");
+        std::fs::create_dir(&sub).unwrap();
+        let meter = SpendMeter::open_durable(sub.join("spend_meter.json")).unwrap();
+        meter.set_budget("vm-ap-agent", 500).unwrap();
+        meter.try_debit("vm-ap-agent", 200).unwrap();
+        std::fs::remove_dir_all(&sub).unwrap();
+        assert_eq!(
+            meter.remove_budget("vm-ap-agent").unwrap_err(),
+            SpendError::Persist
+        );
+        assert_eq!(
+            meter.remaining("vm-ap-agent"),
+            300,
+            "the failed removal left the balance (limit AND spent) intact"
+        );
+    }
+
+    #[test]
+    fn durable_meter_refuses_a_tampered_snapshot_shape() {
+        // Council S28 hardening: the writer never produces duplicate keys (it serializes a map),
+        // so a duplicate is tampering — last-write-wins would silently swap a balance. And a huge
+        // file is a forgery/corruption, not a balance set — bound it before parsing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spend_meter.json");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"balances":[
+                {"key":"vm-a","limit":10,"spent":10},
+                {"key":"vm-a","limit":1000,"spent":0}
+            ]}"#,
+        )
+        .unwrap();
+        assert!(
+            SpendMeter::open_durable(path.clone()).is_err(),
+            "a duplicate key refuses to open"
+        );
+        let mut huge = Vec::from(&b"{\"version\":1,\"balances\":["[..]);
+        huge.resize(4 * 1024 * 1024 + 1, b' ');
+        std::fs::write(&path, huge).unwrap();
+        assert!(
+            SpendMeter::open_durable(path).is_err(),
+            "an oversized snapshot refuses to open"
+        );
     }
 }

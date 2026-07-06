@@ -947,13 +947,15 @@ impl AuditLog {
         self.echo_stdout = echo;
     }
 
-    /// Test-only: wrap an already-open file handle as a file-backed log, so a
-    /// test can force a durable-write failure (e.g. a read-only fd) and prove a
-    /// fail-closed caller (`emit` + `?`) aborts instead of silently completing
-    /// (G8a). Chain starts at genesis and is unsigned (`signer: None`) — this
-    /// seam exercises the write/IO failure path, not signature semantics.
-    #[cfg(test)]
-    pub(crate) fn with_file_handle(file: File) -> Self {
+    /// TEST SEAM (never a production constructor): wrap an already-open file
+    /// handle as a file-backed log, so a test can force a durable-write failure
+    /// (e.g. a read-only fd) and prove a fail-closed caller (`emit` + `?`)
+    /// aborts instead of silently completing (G8a). Chain starts at genesis and
+    /// is unsigned (`signer: None`) — this seam exercises the write/IO failure
+    /// path, not signature semantics. `pub` so downstream crates' ratchets
+    /// (e.g. the spend-budget attest-failure rollback, council S28 F2) can
+    /// inject the same failure; production wiring uses `with_file*` only.
+    pub fn with_file_handle(file: File) -> Self {
         Self {
             writer: Some(Mutex::new(BufWriter::new(file))),
             log_path: None,

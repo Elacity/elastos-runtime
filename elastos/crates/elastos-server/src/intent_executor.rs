@@ -499,10 +499,15 @@ impl MethodRegistryExecutor {
     ///    declined up front, F4).
     ///
     /// BOUNDS (council): the cap is PER-CAPSULE, not per-mandate (the right "cap this agent" bound;
-    /// per-mandate caps are a follow-on — key the meter on `grant_id`). The [`SpendMeter`] is
-    /// IN-MEMORY and NOT durable: a restart drops the `spent` tally, so a money cap is per-uptime,
-    /// not truly cumulative (council F1) — this MUST be made durable before any operator
-    /// budget-provisioning surface or real rail ships. Until then `runtime.pay` is dev/demo-gated.
+    /// per-mandate caps are a follow-on — key the meter on `grant_id`). The [`SpendMeter`] has two
+    /// modes (S28): serve() wires a DURABLE one (`open_durable` — the reservation persists BEFORE
+    /// money moves; a restart never refills the cap) and the operator provisioning surface
+    /// (`POST /api/spend-budgets`) refuses to put a money cap on a non-durable meter; a bare
+    /// in-memory meter remains available for tests/embedded and rate-limiting uses. A crash between
+    /// the persisted reservation and the rail leaves an ORPHANED reservation: the intent id is
+    /// burned (no replay) and no money moved, so the cap honestly over-counts — fail-closed; the
+    /// operator's recovery lever is raising the limit (rail reconciliation is the S29 repair).
+    /// `runtime.pay` stays dev/demo-gated until a REAL rail connector replaces the mock (S29).
     pub fn with_payments(
         mut self,
         meter: Arc<elastos_runtime::primitives::spend::SpendMeter>,
@@ -568,18 +573,32 @@ impl MethodRegistryExecutor {
                     },
                     Ok(Err(rail_err)) => {
                         // The rail failed AFTER we reserved — REFUND (provably no money moved, per
-                        // the PaymentProvider contract) and Decline. The cap is made whole.
-                        meter.refund(&intent.capsule, amount);
+                        // the PaymentProvider contract) and Decline. The signed reason claims
+                        // "refunded" ONLY when the refund is durably in force (council S28 F3): a
+                        // durable refund that cannot persist is rolled back by try_refund, and the
+                        // honest record is that the cap remains debited (fail-closed — the operator
+                        // restores the headroom by raising the budget).
                         IntentExecution::Declined {
-                            reason: format!("payment rail failed (spend refunded): {rail_err}"),
+                            reason: match meter.try_refund(&intent.capsule, amount) {
+                                Ok(_) => format!("payment rail failed (spend refunded): {rail_err}"),
+                                Err(e) => format!(
+                                    "payment rail failed and the refund could not be durably \
+                                     recorded ({e}) — the cap remains debited: {rail_err}"
+                                ),
+                            },
                         }
                     }
                     Err(_panic) => {
                         // The rail PANICKED — treat as provably-not-charged and refund, so the cap
-                        // is never consumed by a phantom payment.
-                        meter.refund(&intent.capsule, amount);
+                        // is never consumed by a phantom payment. Same honest wording rule (F3).
                         IntentExecution::Declined {
-                            reason: "payment rail panicked (spend refunded)".to_string(),
+                            reason: match meter.try_refund(&intent.capsule, amount) {
+                                Ok(_) => "payment rail panicked (spend refunded)".to_string(),
+                                Err(e) => format!(
+                                    "payment rail panicked and the refund could not be durably \
+                                     recorded ({e}) — the cap remains debited"
+                                ),
+                            },
                         }
                     }
                 }
@@ -1178,6 +1197,51 @@ mod tests {
             meter.remaining("vm-agent"),
             100,
             "a panicking rail refunds the reservation — no phantom debit"
+        );
+    }
+
+    /// Council S28 F3: when the rail fails AND the durable refund cannot persist, the signed reason
+    /// must NOT claim "spend refunded" — the honest record is that the cap remains debited. The
+    /// provider itself destroys the meter's directory mid-payment (between the persisted
+    /// reservation and the refund), the only real window this can happen in.
+    #[test]
+    fn pay_rail_failure_with_unpersistable_refund_is_recorded_honestly() {
+        struct DirDestroyingFailingProvider(std::path::PathBuf);
+        impl PaymentProvider for DirDestroyingFailingProvider {
+            fn pay(&self, _payee: &str, _amount: u64) -> Result<String, String> {
+                std::fs::remove_dir_all(&self.0).expect("kill the meter's persist target");
+                Err("rail unavailable".to_string())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("meter");
+        std::fs::create_dir(&sub).unwrap();
+        let meter = Arc::new(
+            elastos_runtime::primitives::spend::SpendMeter::open_durable(
+                sub.join("spend_meter.json"),
+            )
+            .unwrap(),
+        );
+        meter.set_budget("vm-agent", 100).unwrap();
+        let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
+            .with_payments(meter.clone(), Arc::new(DirDestroyingFailingProvider(sub)));
+        match reg.execute(&pay_intent("acme-vendor", "vm-agent", "40")) {
+            IntentExecution::Declined { reason } => {
+                assert!(
+                    reason.contains("the cap remains debited"),
+                    "the signed reason must say the cap remains debited, got: {reason}"
+                );
+                assert!(
+                    !reason.contains("spend refunded"),
+                    "the signed reason must NOT claim a refund that is not in force: {reason}"
+                );
+            }
+            other => panic!("expected Declined, got {other:?}"),
+        }
+        assert_eq!(
+            meter.remaining("vm-agent"),
+            60,
+            "the unpersistable refund was rolled back — the cap really does remain debited"
         );
     }
 
