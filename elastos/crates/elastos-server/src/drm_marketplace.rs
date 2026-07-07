@@ -23,15 +23,22 @@
 //!   MKT-1 discipline: bind only when exactly one `(operative, tokenId)` exists, else fail closed).
 //! - the buy provably never broadcast (rejected pre-send, wallet unlinked, listing sold out) ⇒
 //!   [`PayError::NotCharged`] — refund.
-//! - the buy path reported a BROADCAST-ACCEPTED tx ⇒ `Ok(rail_ref)` — recorded as charged on RAIL
-//!   TRUST with ZERO confirmations observed (council S34 guardian F1; KNOWN_GAPS MKT-DRM residual
-//!   2): `buy_access` returns `Ok` at `eth_sendRawTransaction` acceptance, not at inclusion, so a
-//!   dropped/reverted tx would mint a Performed receipt naming a settlement that never finalized.
-//!   The reference names the tx the rail reported. Re-reading the receipt + a confirmation-depth
-//!   floor before recording Performed is the tracked follow-on.
-//! - anything the settler cannot prove either way (broadcast then lost, RPC timeout) ⇒
-//!   [`PayError::Indeterminate`] — the reservation is KEPT (the charge may have posted), resolved
-//!   out of band via the idempotency key, exactly like the HTTP rail's post-send ambiguity.
+//! - the buy path reported a BROADCAST-ACCEPTED tx ⇒ [`PayError::Indeterminate`] carrying the
+//!   `rail_ref` — the reservation is KEPT and a PENDING ledger entry is filed (Sprint 35). A DRM
+//!   buy is NEVER recorded `Performed` at broadcast: `buy_access` returns at
+//!   `eth_sendRawTransaction` acceptance, not inclusion, so recording charged now would attest a
+//!   settlement that a dropped/reverted tx never finalized (council S34 guardian F1). The tx is
+//!   promoted to charged (and its `rail_ref` bound onto the mandate's receipt) ONLY once
+//!   [`reconcile_drm_confirmations`] reads the receipt and finds it mined + successful + at least
+//!   the required confirmation depth; a reverted tx refunds the cap; a not-yet-mined tx stays
+//!   Pending, never auto-charged.
+//! - anything the settler cannot prove reached the chain at all (RPC timeout with no tx handle) ⇒
+//!   [`PayError::Indeterminate`] with no tx — the reservation is KEPT, resolved out of band.
+//!
+//! ON-RAIL IDEMPOTENCY (Sprint 35): the durable ledger is the dedup — the pay path refuses to
+//! re-charge a signature-derived key that already carries a money-moved-or-may-have entry, so a
+//! re-dispatched identical signed intent (past the replay window) resolves to the SAME buy, never
+//! a second one (enforced in the `runtime.pay` closure, all rails).
 
 use std::sync::Arc;
 
@@ -147,8 +154,41 @@ impl PaymentProvider for DrmMarketplaceProvider {
                     PayError::Indeterminate(format!("DRM buy outcome indeterminate: {why}"))
                 }
             })?;
-        Ok(Self::rail_ref(&binding, &settlement))
+        // Sprint 35: a broadcast-accepted buy is NEVER recorded charged/Performed here — it is
+        // INDETERMINATE (Pending), the reservation held, the `rail_ref` carried as the reason so
+        // the pending ledger record holds the tx. `reconcile_drm_confirmations` promotes it to
+        // charged (and binds the receipt) only once the chain confirms it. Returning `Ok` would
+        // attest a settlement `buy_access` only reported as broadcast-accepted (zero confirmations).
+        Err(PayError::Indeterminate(Self::rail_ref(&binding, &settlement)))
     }
+}
+
+/// The confirmation verdict for a broadcast DRM buy (Sprint 35). Produced by a [`DrmConfirmer`]
+/// reading the tx receipt; consumed by [`reconcile_drm_confirmations`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrmConfirmation {
+    /// Mined, successful, and at least the required confirmation depth ⇒ promote to charged.
+    Confirmed,
+    /// Mined but reverted on-chain (the buy did not settle) ⇒ refund the reservation.
+    Reverted,
+    /// Not yet mined, below the depth floor, or the read failed ⇒ HOLD (stay Pending). Never
+    /// auto-promotes; carries a human-readable why for the reconciliation log.
+    Unconfirmed(String),
+}
+
+/// Read the on-chain confirmation state of a broadcast buy tx (Sprint 35). Production wraps
+/// `chain_tx::tx_confirmation_live` (receipt + depth floor); CI injects a scripted mock. FAIL-SAFE:
+/// an unreadable/not-yet-mined tx MUST return `Unconfirmed` so the reservation is never
+/// auto-charged.
+pub trait DrmConfirmer: Send + Sync {
+    fn confirm(&self, tx_hash: &str) -> DrmConfirmation;
+}
+
+/// Extract the tx hash from a DRM pending record's `rail_note` (the `rail_ref` the provider filed:
+/// `drm:tx=<hash>;op=<op>;tid=<tid>`). `None` for a non-DRM note (so the reconciler skips it).
+pub(crate) fn parse_drm_tx(rail_note: &str) -> Option<&str> {
+    let rest = rail_note.strip_prefix("drm:tx=")?;
+    Some(rest.split(';').next().unwrap_or(rest))
 }
 
 /// The PRODUCTION chain adapter — resolves via the MKT-1-hardened `chain_tx::resolve_token_id` and
@@ -250,6 +290,135 @@ impl DrmSettler for ChainDrmMarketplace {
     }
 }
 
+/// The default confirmation-depth floor for a live DRM buy (Sprint 35). Conservative — a Base
+/// reorg past a few blocks is very rare; the operator can raise it via `ELASTOS_DRM_MIN_CONFIRMATIONS`.
+const DEFAULT_MIN_CONFIRMATIONS: u64 = 3;
+
+fn drm_min_confirmations() -> u64 {
+    std::env::var("ELASTOS_DRM_MIN_CONFIRMATIONS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(DEFAULT_MIN_CONFIRMATIONS)
+}
+
+impl DrmConfirmer for ChainDrmMarketplace {
+    fn confirm(&self, tx_hash: &str) -> DrmConfirmation {
+        // Read the receipt + apply the depth floor. FAIL-SAFE: any read error ⇒ Unconfirmed (hold;
+        // never auto-charge a tx we could not verify). Live Base only — the operator runbook.
+        match crate::api::chain_tx::tx_confirmation_live(tx_hash, drm_min_confirmations()) {
+            Ok(crate::api::chain_tx::TxConfirmation::Confirmed) => DrmConfirmation::Confirmed,
+            Ok(crate::api::chain_tx::TxConfirmation::Reverted) => DrmConfirmation::Reverted,
+            Ok(crate::api::chain_tx::TxConfirmation::Pending(why)) => DrmConfirmation::Unconfirmed(why),
+            Err(e) => DrmConfirmation::Unconfirmed(format!("confirmation read failed: {e}")),
+        }
+    }
+}
+
+/// Poll every PENDING DRM buy in the ledger and resolve it against the chain (Sprint 35): a
+/// confirmed tx is promoted to charged AND its `rail_ref` is bound onto the mandate's receipt; a
+/// reverted tx refunds the reservation exactly once; a still-unconfirmed tx is left Pending. Reuses
+/// the S30 [`reconcile_payment_core`](crate::api::handlers::capability::reconcile_payment_core)
+/// spine for the money movement + attestation — this driver only supplies the chain's verdict (in
+/// place of the operator's) and, on a confirmation, the token-keyed receipt binding.
+///
+/// Returns the count of entries promoted / refunded / left pending. Never panics on one bad entry;
+/// a per-entry error is logged and the loop continues (the obligation stays Pending, retried next
+/// pass). Only entries whose `rail_note` is a DRM `rail_ref` AND that carry a `token_id` are
+/// considered — a non-DRM pending payment is left for the operator surface.
+pub fn reconcile_drm_confirmations(
+    ledger: &crate::payment_ledger::PaymentLedger,
+    meter: &elastos_runtime::primitives::spend::SpendMeter,
+    audit_log: &elastos_runtime::primitives::audit::AuditLog,
+    confirmer: &dyn DrmConfirmer,
+) -> DrmReconcileSummary {
+    use elastos_runtime::capability::token::TokenId;
+    use elastos_runtime::capability::ResourceId;
+
+    let mut summary = DrmReconcileSummary::default();
+    for record in ledger.pending() {
+        let Some(tx) = parse_drm_tx(&record.rail_note).map(str::to_string) else {
+            continue; // not a DRM pending entry — leave it for the operator surface
+        };
+        match confirmer.confirm(&tx) {
+            DrmConfirmation::Unconfirmed(_) => {
+                summary.left_pending += 1;
+            }
+            DrmConfirmation::Confirmed => {
+                let input = crate::api::handlers::capability::ReconcilePaymentInput {
+                    idempotency_key: record.idempotency_key.clone(),
+                    charged: true,
+                };
+                match crate::api::handlers::capability::reconcile_payment_core(
+                    ledger, meter, audit_log, input,
+                ) {
+                    Ok(_) => {
+                        summary.promoted += 1;
+                        // Bind the confirmed settlement onto the mandate's receipt: a token-keyed,
+                        // signed CapabilityUse carrying the DRM rail_ref (success=true). This is
+                        // the S35 half that makes the receipt reflect the CONFIRMED tx, not the
+                        // mere broadcast. Best-effort (mirrors the dispatch-path use record): a
+                        // lost emit under-reports in the receipt, but the payment_reconciled event
+                        // + the ledger already durably record the promotion.
+                        if let (Ok(token_id), true) = (
+                            TokenId::from_hex(record.token_id.as_deref().unwrap_or("").trim()),
+                            record.token_id.is_some(),
+                        ) {
+                            let resource =
+                                format!("{}{}", crate::intent_executor::PAY_PREFIX, record.payee);
+                            audit_log.capability_use_with_rail_ref(
+                                &token_id,
+                                &record.capsule,
+                                &ResourceId::new(resource),
+                                elastos_runtime::capability::Action::Execute,
+                                true,
+                                Some(record.rail_note.clone()),
+                            );
+                        }
+                    }
+                    Err((_, e)) => {
+                        tracing::error!(
+                            key = %record.idempotency_key,
+                            "DRM confirmation could not be reconciled (charged): {e}"
+                        );
+                        summary.left_pending += 1;
+                    }
+                }
+            }
+            DrmConfirmation::Reverted => {
+                let input = crate::api::handlers::capability::ReconcilePaymentInput {
+                    idempotency_key: record.idempotency_key.clone(),
+                    charged: false,
+                };
+                match crate::api::handlers::capability::reconcile_payment_core(
+                    ledger, meter, audit_log, input,
+                ) {
+                    Ok(_) => summary.refunded += 1,
+                    Err((_, e)) => {
+                        tracing::error!(
+                            key = %record.idempotency_key,
+                            "DRM revert could not be reconciled (refund): {e}"
+                        );
+                        summary.left_pending += 1;
+                    }
+                }
+            }
+        }
+    }
+    summary
+}
+
+/// What one [`reconcile_drm_confirmations`] pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DrmReconcileSummary {
+    /// Confirmed tx promoted to charged (+ receipt-bound).
+    pub promoted: usize,
+    /// Reverted tx refunded.
+    pub refunded: usize,
+    /// Still unconfirmed (or a reconcile error) — left Pending, retried next pass.
+    pub left_pending: usize,
+}
+
 /// Whether a `buy_access` error string PROVABLY describes a refusal BEFORE any broadcast — the ONLY
 /// case safe to classify NotCharged (refund the cap). Everything else — including every
 /// post-broadcast RPC error — stays Indeterminate (keep the reservation), because a broadcast may
@@ -334,15 +503,27 @@ mod tests {
     }
 
     #[test]
-    fn a_confirmed_buy_returns_a_rail_ref_naming_the_tx_and_binding() {
+    fn a_broadcast_accepted_buy_is_indeterminate_and_carries_the_rail_ref_not_charged() {
+        // Sprint 35: a broadcast-accepted buy is NEVER immediately charged — it is Indeterminate
+        // (Pending), the reservation held, the rail_ref carried as the reason so the pending
+        // ledger record holds the tx for later confirmation.
         let provider = DrmMarketplaceProvider::new(
             Arc::new(MockResolver(Ok(binding()))),
             Arc::new(MockSettler::new(Ok(DrmSettlement {
                 tx_hash: "0xdead".to_string(),
             }))),
         );
-        let rail_ref = provider.pay("QmAsset", 500, "flint-sig").unwrap();
-        assert_eq!(rail_ref, "drm:tx=0xdead;op=0xop;tid=42");
+        match provider.pay("QmAsset", 500, "flint-sig").unwrap_err() {
+            PayError::Indeterminate(rail_ref) => {
+                assert_eq!(rail_ref, "drm:tx=0xdead;op=0xop;tid=42");
+                assert_eq!(
+                    parse_drm_tx(&rail_ref),
+                    Some("0xdead"),
+                    "the pending record's tx is recoverable for confirmation"
+                );
+            }
+            other => panic!("a broadcast-accepted buy must be Indeterminate, got {other:?}"),
+        }
     }
 
     #[test]
@@ -465,5 +646,101 @@ mod tests {
         assert_eq!(rail_ref.matches(";tid=").count(), 1, "no forged tid segment: {rail_ref}");
         assert_eq!(rail_ref.matches(";op=").count(), 1, "no forged op segment: {rail_ref}");
         assert_eq!(rail_ref, "drm:tx=0xopfake;op=0xrealtid999;tid=42");
+    }
+
+    #[test]
+    fn parse_drm_tx_extracts_the_hash_and_ignores_non_drm_notes() {
+        assert_eq!(
+            parse_drm_tx("drm:tx=0xABC123;op=0xop;tid=7"),
+            Some("0xABC123")
+        );
+        // A tx-only note (no trailing segments) still parses.
+        assert_eq!(parse_drm_tx("drm:tx=0xABC"), Some("0xABC"));
+        // Non-DRM notes are skipped (the reconciler leaves them for the operator surface).
+        assert_eq!(parse_drm_tx("rail reference from an HTTP endpoint"), None);
+        assert_eq!(parse_drm_tx(""), None);
+    }
+
+    /// A scripted confirmer keyed by tx hash — deterministic per-tx verdicts for the reconciler.
+    struct MockConfirmer(std::collections::HashMap<String, DrmConfirmation>);
+    impl DrmConfirmer for MockConfirmer {
+        fn confirm(&self, tx_hash: &str) -> DrmConfirmation {
+            self.0
+                .get(tx_hash)
+                .cloned()
+                .unwrap_or_else(|| DrmConfirmation::Unconfirmed("no verdict scripted".to_string()))
+        }
+    }
+
+    /// Sprint 35: the reconciler promotes a CONFIRMED pending DRM buy (spend stands), REFUNDS a
+    /// REVERTED one exactly once, and LEAVES an unconfirmed one Pending — all through the shared
+    /// S30 reconcile spine, over the same meter + ledger.
+    #[test]
+    fn reconcile_drm_confirmations_promotes_refunds_and_holds() {
+        use crate::payment_ledger::{PaymentLedger, PaymentStatus};
+        use elastos_runtime::primitives::audit::AuditLog;
+        use elastos_runtime::primitives::spend::SpendMeter;
+
+        let ledger = PaymentLedger::new();
+        let meter = SpendMeter::new();
+        let audit = AuditLog::new();
+        meter.set_budget("vm-shop", 1000).unwrap();
+
+        // Three pending DRM buys, each reserved on the meter (as the pay path would).
+        for (key, tx, amount) in [
+            ("flint-confirmed", "0xC0", 100u64),
+            ("flint-reverted", "0xRE", 200),
+            ("flint-holding", "0xHO", 300),
+        ] {
+            meter.try_debit("vm-shop", amount).unwrap();
+            assert!(ledger.record_with_token(
+                key,
+                "vm-shop",
+                "QmAsset",
+                amount,
+                PaymentStatus::Pending,
+                &format!("drm:tx={tx};op=0xop;tid=7"),
+                Some("00000000000000000000000000000001"),
+            ));
+        }
+        assert_eq!(meter.remaining("vm-shop"), 400, "600 reserved across three pendings");
+
+        let mut verdicts = std::collections::HashMap::new();
+        verdicts.insert("0xC0".to_string(), DrmConfirmation::Confirmed);
+        verdicts.insert("0xRE".to_string(), DrmConfirmation::Reverted);
+        verdicts.insert("0xHO".to_string(), DrmConfirmation::Unconfirmed("mempool".to_string()));
+        let confirmer = MockConfirmer(verdicts);
+
+        let summary = reconcile_drm_confirmations(&ledger, &meter, &audit, &confirmer);
+        assert_eq!(summary.promoted, 1);
+        assert_eq!(summary.refunded, 1);
+        assert_eq!(summary.left_pending, 1);
+
+        // Confirmed: spend STANDS (no refund) ⇒ status ResolvedCharged.
+        assert_eq!(
+            ledger.get("flint-confirmed").unwrap().status,
+            PaymentStatus::ResolvedCharged
+        );
+        // Reverted: refunded exactly once ⇒ the 200 came back.
+        assert_eq!(
+            ledger.get("flint-reverted").unwrap().status,
+            PaymentStatus::ResolvedNotCharged
+        );
+        // Holding: still Pending.
+        assert_eq!(
+            ledger.get("flint-holding").unwrap().status,
+            PaymentStatus::Pending
+        );
+        // Net meter: started 1000, reserved 600, refunded 200 (reverted) ⇒ 600 remaining
+        // (confirmed 100 + holding 300 stay reserved).
+        assert_eq!(meter.remaining("vm-shop"), 600);
+
+        // A second pass is idempotent — the resolved entries are no longer Pending, only the
+        // holding one is re-polled (still unconfirmed).
+        let again = reconcile_drm_confirmations(&ledger, &meter, &audit, &confirmer);
+        assert_eq!(again.promoted, 0);
+        assert_eq!(again.refunded, 0, "no double refund");
+        assert_eq!(again.left_pending, 1);
+        assert_eq!(meter.remaining("vm-shop"), 600, "no double refund on the meter");
     }
 }

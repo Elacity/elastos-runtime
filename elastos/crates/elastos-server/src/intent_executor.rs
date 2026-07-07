@@ -747,6 +747,32 @@ impl MethodRegistryExecutor {
                     slot
                 };
                 let _slot = slot;
+                // The idempotency key: unique per SIGNED declaration (an intent_id can recycle
+                // once it ages out of the replay window; a signature cannot).
+                let idempotency_key = format!("flint-{}", intent.signature);
+                // DURABLE ON-RAIL IDEMPOTENCY (Sprint 35, closes the cross-window double-buy):
+                // the replay guard blocks a re-dispatched identical signed intent only WITHIN its
+                // window; once it ages out, the same signed intent would reach here again and,
+                // absent this check, buy/charge a SECOND time. The durable ledger is the dedup: if
+                // this key already carries a money-moved-or-may-have entry (Performed, Pending, or
+                // ResolvedCharged), the payment already happened — refuse fail-closed WITHOUT
+                // reserving or paying again (idempotent no-op). A prior NotCharged/ResolvedNotCharged
+                // (provably nothing moved) is allowed to retry. RESIDUAL (MKT-DRM): the ledger
+                // eviction cap means a very old terminal key can be evicted, reopening a retry —
+                // bounded, and pending/charged keys are never evicted.
+                if let Some(existing) = ledger.get(&idempotency_key) {
+                    use crate::payment_ledger::PaymentStatus::*;
+                    if matches!(existing.status, Performed | Pending | ResolvedCharged) {
+                        return IntentExecution::Declined {
+                            reason: format!(
+                                "payment already settled or pending under idempotency key \
+                                 {idempotency_key} (status {:?}) — not re-charged (idempotent); a \
+                                 re-dispatch of a signed intent never moves money twice",
+                                existing.status
+                            ),
+                        };
+                    }
+                }
                 // RESERVE against the cap FIRST — atomic, fail-closed. Over budget (or an
                 // unprovisioned capsule ⇒ zero) refuses here; no money can move.
                 if let Err(e) = meter.try_debit(&intent.capsule, amount) {
@@ -754,12 +780,8 @@ impl MethodRegistryExecutor {
                         reason: format!("payment refused by spend cap: {e}"),
                     };
                 }
-                // The cap allowed it — NOW move the money on the rail, under an idempotency key
-                // derived from the intent's SIGNATURE: unique per signed declaration (an intent_id
-                // can legitimately recycle once it ages out of the replay window; a signature
-                // cannot), so the rail can dedupe retries/reconciliation without ever double-moving
-                // money for one signed intent.
-                let idempotency_key = format!("flint-{}", intent.signature);
+                // The cap allowed it — NOW move the money on the rail. The rail dedupes retries/
+                // reconciliation under the same key without ever double-moving money.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     provider.pay(payee, amount, &idempotency_key)
                 }));
@@ -767,13 +789,16 @@ impl MethodRegistryExecutor {
                 // reconciliation — when it cannot be recorded, the reason must say so (the
                 // operator then reconciles from the error log; money semantics are unchanged).
                 let record_pending = |note: &str| -> &'static str {
-                    if ledger.record(
+                    if ledger.record_with_token(
                         &idempotency_key,
                         &intent.capsule,
                         payee,
                         amount,
                         crate::payment_ledger::PaymentStatus::Pending,
                         note,
+                        // Bind the mandate token so a later confirmation can key the settlement
+                        // back onto this mandate's receipt (Sprint 35).
+                        Some(intent.standing_grant_id.as_str()),
                     ) {
                         "recorded in the payment ledger"
                     } else {

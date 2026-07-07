@@ -86,6 +86,14 @@ pub struct PaymentRecord {
     /// statuses.
     #[serde(default)]
     pub refund_applied: bool,
+    /// The mandate token (`standing_grant_id`) this payment was made under (Sprint 35). Lets a
+    /// reconciliation bind the confirmed settlement back onto the mandate's receipt (a token-keyed
+    /// `CapabilityUse`). `None` for a payment recorded without a bound mandate, and for every
+    /// pre-S35 record on disk. BACK-COMPAT: appended last with `#[serde(default,
+    /// skip_serializing_if = "Option::is_none")]`, so a pre-S35 ledger snapshot round-trips
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -249,6 +257,23 @@ impl PaymentLedger {
         status: PaymentStatus,
         rail_note: &str,
     ) -> bool {
+        self.record_with_token(idempotency_key, capsule, payee, amount, status, rail_note, None)
+    }
+
+    /// Like [`record`](Self::record) but binds the mandate token (`standing_grant_id`) onto the
+    /// entry (Sprint 35) so a later reconciliation can key the confirmed settlement back onto the
+    /// mandate's receipt. `record` is exactly `record_with_token(.., None)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_with_token(
+        &self,
+        idempotency_key: &str,
+        capsule: &str,
+        payee: &str,
+        amount: u64,
+        status: PaymentStatus,
+        rail_note: &str,
+        token_id: Option<&str>,
+    ) -> bool {
         let mut records = match self.records.write() {
             Ok(r) => r,
             Err(_) => return false,
@@ -298,6 +323,7 @@ impl PaymentLedger {
                 rail_note: sanitize_rail_note(rail_note),
                 seq,
                 refund_applied: false,
+                token_id: token_id.map(str::to_string),
             },
         );
         if self.persist_locked(&records).is_err() {

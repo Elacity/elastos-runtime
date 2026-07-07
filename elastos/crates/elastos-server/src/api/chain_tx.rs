@@ -183,6 +183,73 @@ pub(crate) fn block_number_live() -> Result<u64, String> {
         .ok_or_else(|| format!("chain-provider block_number returned no usable value: {resp}"))
 }
 
+/// The confirmation state of a broadcast tx, read from its receipt + the chain tip (Sprint 35).
+/// The money-critical distinction: only `Confirmed` promotes a pending DRM buy to charged, only
+/// `Reverted` refunds it, and `Pending` (not yet mined, below the depth floor, or the RPC was
+/// unreachable) leaves the reservation held — NEVER auto-promoted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TxConfirmation {
+    /// The receipt is mined, `status == 0x1` (success), AND at least `min_confirmations` deep.
+    Confirmed,
+    /// The receipt is mined and `status == 0x0` (the tx reverted on-chain).
+    Reverted,
+    /// Not yet mined, below the depth floor, or the confirmation read failed — hold, do not
+    /// promote. Carries a human-readable why for the reconciliation log.
+    Pending(String),
+}
+
+/// Read a broadcast tx's confirmation state via the REAL chain-provider `receipt` op
+/// (`eth_getTransactionReceipt`) + the chain tip (`block_number`), applying a depth floor
+/// (Sprint 35). READ-ONLY, no keys (P3). Fail-SAFE: any read failure returns `Pending` (the
+/// reservation stays held; a not-yet-mined or unreachable tx is NEVER auto-charged). Live Base
+/// only — the operator runbook, never CI.
+pub(crate) fn tx_confirmation_live(
+    tx_hash: &str,
+    min_confirmations: u64,
+) -> Result<TxConfirmation, String> {
+    let (network, init) = live_chain_init()?;
+    let chain_bin = resolve_chain_bin();
+    let request = json!({ "op": "receipt", "network": network, "hash": tx_hash });
+    let resp = run_chain_capsule(&chain_bin, &init, &request)?;
+    let receipt = resp.get("receipt");
+    // A null receipt = the tx is not yet mined (still in the mempool) ⇒ Pending, hold.
+    if receipt.map(Value::is_null).unwrap_or(true) {
+        return Ok(TxConfirmation::Pending(
+            "tx not yet mined (no receipt)".to_string(),
+        ));
+    }
+    let receipt = receipt.unwrap();
+    // `status` 0x0 ⇒ the tx reverted on-chain (money did NOT settle) ⇒ Reverted (refund).
+    let status = receipt
+        .get("status")
+        .and_then(Value::as_str)
+        .map(|s| s.trim_start_matches("0x"))
+        .unwrap_or("");
+    if !status.is_empty() && status.chars().all(|c| c == '0') {
+        return Ok(TxConfirmation::Reverted);
+    }
+    // Mined + success: apply the confirmation-depth floor. blockNumber is a 0x-hex quantity.
+    let mined_block = receipt
+        .get("blockNumber")
+        .and_then(Value::as_str)
+        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+    let Some(mined_block) = mined_block else {
+        return Ok(TxConfirmation::Pending(
+            "receipt has no usable blockNumber".to_string(),
+        ));
+    };
+    let tip = block_number_live()?;
+    // depth = tip - mined + 1 (the mining block itself counts as one confirmation).
+    let depth = tip.saturating_sub(mined_block).saturating_add(1);
+    if depth >= min_confirmations {
+        Ok(TxConfirmation::Confirmed)
+    } else {
+        Ok(TxConfirmation::Pending(format!(
+            "confirmed to depth {depth} of {min_confirmations} required"
+        )))
+    }
+}
+
 /// Fetch `eth_getLogs` entries via the REAL chain-provider `logs` op (one window; the caller bounds
 /// the range). READ-ONLY; no keys (P3). Returns the raw log array (empty on no matches).
 pub(crate) fn get_logs_live(filter: Value) -> Result<Vec<Value>, String> {

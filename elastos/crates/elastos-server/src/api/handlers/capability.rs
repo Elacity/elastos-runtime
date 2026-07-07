@@ -3310,6 +3310,36 @@ mod tests {
         }
     }
 
+    /// A scripted DRM confirmer keyed by tx hash (Sprint 35) — the reconciler's chain verdict.
+    struct WedgeConfirmer(std::collections::HashMap<String, crate::drm_marketplace::DrmConfirmation>);
+    impl crate::drm_marketplace::DrmConfirmer for WedgeConfirmer {
+        fn confirm(&self, tx_hash: &str) -> crate::drm_marketplace::DrmConfirmation {
+            self.0.get(tx_hash).cloned().unwrap_or_else(|| {
+                crate::drm_marketplace::DrmConfirmation::Unconfirmed("no verdict".to_string())
+            })
+        }
+    }
+
+    /// A settler that counts how many times it actually broadcasts (Sprint 35 idempotency proof).
+    struct CountingSettler {
+        tx_hash: String,
+        count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl crate::drm_marketplace::DrmSettler for CountingSettler {
+        fn settle(
+            &self,
+            _b: &crate::drm_marketplace::DrmBinding,
+            _amount: u64,
+            _key: &str,
+        ) -> Result<crate::drm_marketplace::DrmSettlement, crate::drm_marketplace::DrmSettleError>
+        {
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::drm_marketplace::DrmSettlement {
+                tx_hash: self.tx_hash.clone(),
+            })
+        }
+    }
+
     /// Build a MethodRegistryExecutor whose `runtime.pay` rail is a DRM marketplace provider with
     /// the given scripted resolver/settler, sharing the SAME meter + ledger the assertions read.
     #[allow(clippy::type_complexity)]
@@ -3317,6 +3347,20 @@ mod tests {
         dir: &std::path::Path,
         resolver: std::sync::Arc<dyn crate::drm_marketplace::DrmResolver>,
         settler: std::sync::Arc<WedgeSettler>,
+    ) -> (
+        CapabilityState,
+        std::sync::Arc<elastos_runtime::primitives::spend::SpendMeter>,
+        std::sync::Arc<crate::payment_ledger::PaymentLedger>,
+    ) {
+        drm_state_with_settler(dir, resolver, settler)
+    }
+
+    /// Like [`drm_state`] but takes ANY `DrmSettler` (used by the idempotency ratchet's counter).
+    #[allow(clippy::type_complexity)]
+    fn drm_state_with_settler(
+        dir: &std::path::Path,
+        resolver: std::sync::Arc<dyn crate::drm_marketplace::DrmResolver>,
+        settler: std::sync::Arc<dyn crate::drm_marketplace::DrmSettler>,
     ) -> (
         CapabilityState,
         std::sync::Arc<elastos_runtime::primitives::spend::SpendMeter>,
@@ -3381,8 +3425,14 @@ mod tests {
     /// Ratchet (a): an agent dispatches a buy under a capped mandate; the DRM provider resolves +
     /// confirms; the meter debits ONCE; the ledger records the rail_ref; the portable receipt's
     /// CapabilityUse carries the on-chain reference; and the receipt verifies off-box.
+    ///
+    /// Sprint 35 (ratchets a + b): the buy is a TWO-PHASE settlement. Phase 1 — dispatch: the
+    /// broadcast-accepted tx records PENDING (not Performed), the reservation held, and the receipt
+    /// carries NO rail_ref yet. Phase 2 — confirmation: `reconcile_drm_confirmations` reads the tx
+    /// confirmed, promotes it to charged, and binds the rail_ref onto the mandate's receipt, which
+    /// then verifies off-box.
     #[tokio::test]
-    async fn agent_buys_a_drm_asset_under_a_capped_mandate_and_the_receipt_carries_the_rail_ref() {
+    async fn a_drm_buy_is_pending_until_confirmed_then_the_receipt_carries_the_rail_ref() {
         let dir = tempfile::tempdir().unwrap();
         let asset = "QmMovie7";
         let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3399,32 +3449,68 @@ mod tests {
         );
         meter.set_budget("vm-shopper", 500).unwrap();
         let (agent_sk, payee_resource, token_id) = drm_pay_mandate(&state, asset).await;
-        // Build the buy ONCE (the idempotency key is derived from THIS signature).
         let buy = IntentDeclarationV1::issue(
             &agent_sk, agent_sk.verifying_key().to_bytes(), "buy-1", "vm-shopper",
             "runtime.pay", "300", &payee_resource, "execute", &token_id,
         );
         let idem = format!("flint-{}", buy.signature);
 
+        // Phase 1 — dispatch: broadcast-accepted ⇒ authorized_not_performed, PENDING, held.
         let r1 = dispatch_agent_intent(State(state.clone()), Json(buy))
             .await
             .expect("within cap")
             .0;
-        assert_eq!(r1.outcome, "performed", "the agent bought the asset under its mandate");
-        assert_eq!(meter.remaining("vm-shopper"), 200, "the cap was debited exactly once");
-        assert!(ran.load(std::sync::atomic::Ordering::SeqCst), "the buy actually settled");
-
-        // The ledger's Performed record carries the DRM rail_ref (tx + operative:tokenId).
-        let rec = ledger.get(&idem).expect("a performed rail record exists");
-        assert_eq!(rec.status, crate::payment_ledger::PaymentStatus::Performed);
+        assert_eq!(
+            r1.outcome, "authorized_not_performed",
+            "a broadcast-accepted DRM buy is NOT attested performed until confirmed"
+        );
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst), "the buy broadcast");
+        assert_eq!(meter.remaining("vm-shopper"), 200, "the reservation is held (not refunded)");
+        let rec = ledger.get(&idem).expect("a pending rail record exists");
+        assert_eq!(rec.status, crate::payment_ledger::PaymentStatus::Pending);
         assert_eq!(rec.rail_note, "drm:tx=0xC0FFEE;op=0xopER;tid=42");
+        assert_eq!(rec.token_id.as_deref(), Some(token_id.as_str()), "bound to the mandate");
 
-        // The portable receipt's pay-use row carries the SAME on-chain reference.
+        // The receipt carries NO rail_ref yet (the tx is not confirmed).
+        use elastos_runtime::primitives::audit::AuditEvent;
         let receipt = mandate_receipt(State(state.clone()), Path(token_id.clone()))
             .await
             .unwrap()
             .0;
-        use elastos_runtime::primitives::audit::AuditEvent;
+        assert!(
+            !receipt.records.iter().any(|r| matches!(
+                &r.event,
+                AuditEvent::CapabilityUse { rail_ref: Some(_), .. }
+            )),
+            "no rail_ref on the receipt before confirmation"
+        );
+
+        // Phase 2 — confirmation: the tx confirms ⇒ promote to charged + bind the receipt.
+        let mut verdicts = std::collections::HashMap::new();
+        verdicts.insert(
+            "0xC0FFEE".to_string(),
+            crate::drm_marketplace::DrmConfirmation::Confirmed,
+        );
+        let confirmer = WedgeConfirmer(verdicts);
+        let summary = crate::drm_marketplace::reconcile_drm_confirmations(
+            &ledger,
+            &meter,
+            state.capability_manager.audit_log(),
+            &confirmer,
+        );
+        assert_eq!(summary.promoted, 1, "the confirmed buy was promoted");
+        assert_eq!(
+            ledger.get(&idem).unwrap().status,
+            crate::payment_ledger::PaymentStatus::ResolvedCharged,
+            "spend stands"
+        );
+        assert_eq!(meter.remaining("vm-shopper"), 200, "confirmation does not refund");
+
+        // The receipt now carries the confirmed settlement's rail_ref, and verifies off-box.
+        let receipt = mandate_receipt(State(state.clone()), Path(token_id.clone()))
+            .await
+            .unwrap()
+            .0;
         let use_rail_ref = receipt.records.iter().find_map(|r| match &r.event {
             AuditEvent::CapabilityUse { rail_ref, success: true, .. } => rail_ref.clone(),
             _ => None,
@@ -3432,13 +3518,68 @@ mod tests {
         assert_eq!(
             use_rail_ref.as_deref(),
             Some("drm:tx=0xC0FFEE;op=0xopER;tid=42"),
-            "the receipt's pay-use row carries the on-chain settlement reference"
+            "the confirmed receipt's pay-use row carries the on-chain settlement reference"
         );
         let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();
         assert!(
             elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer)).authenticated,
-            "the DRM-buy receipt verifies off-box"
+            "the confirmed DRM-buy receipt verifies off-box"
         );
+    }
+
+    /// Sprint 35 (ratchet d): a re-dispatched identical signed intent past the replay window
+    /// resolves to the SAME buy — the durable ledger dedup refuses to re-charge/re-settle.
+    #[tokio::test]
+    async fn a_redispatched_drm_buy_is_idempotent_and_never_settles_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let asset = "QmOnce";
+        let settle_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // A settler that counts how many times it actually ran.
+        let counting = std::sync::Arc::new(CountingSettler {
+            tx_hash: "0xAAA".to_string(),
+            count: settle_count.clone(),
+        });
+        let (state, meter, ledger) = drm_state_with_settler(
+            dir.path(),
+            std::sync::Arc::new(WedgeResolver(Ok(wedge_binding(asset)))),
+            counting,
+        );
+        meter.set_budget("vm-shopper", 500).unwrap();
+        let (agent_sk, payee_resource, token_id) = drm_pay_mandate(&state, asset).await;
+        let buy = IntentDeclarationV1::issue(
+            &agent_sk, agent_sk.verifying_key().to_bytes(), "buy-x", "vm-shopper",
+            "runtime.pay", "100", &payee_resource, "execute", &token_id,
+        );
+        // First dispatch: broadcast ⇒ pending, settler ran once, 100 reserved.
+        let r1 = dispatch_agent_intent(State(state.clone()), Json(buy.clone())).await.unwrap().0;
+        assert_eq!(r1.outcome, "authorized_not_performed");
+        assert_eq!(settle_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(meter.remaining("vm-shopper"), 400);
+
+        // Simulate the replay window having aged out by clearing the standing-grant replay guard's
+        // memory of this intent id — here we just re-dispatch the SAME signed intent. The durable
+        // ledger idempotency must refuse a second settle.
+        let idem = format!("flint-{}", buy.signature);
+        assert_eq!(ledger.get(&idem).unwrap().status, crate::payment_ledger::PaymentStatus::Pending);
+        // Re-dispatch through the executor directly (the pay closure's ledger guard is what we test;
+        // the replay guard is a separate, already-tested layer).
+        use crate::intent_executor::IntentExecutor as _;
+        let exec_out = state.intent_executor.execute(&buy);
+        match exec_out {
+            crate::intent_executor::IntentExecution::Declined { reason } => {
+                assert!(
+                    reason.contains("already settled or pending under idempotency key"),
+                    "the re-dispatch is an idempotent no-op: {reason}"
+                );
+            }
+            other => panic!("a re-dispatched settled intent must be Declined, got {other:?}"),
+        }
+        assert_eq!(
+            settle_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the settler NEVER ran a second time — no double buy"
+        );
+        assert_eq!(meter.remaining("vm-shopper"), 400, "no second reservation");
     }
 
     /// Ratchet (b): an AMBIGUOUS asset (MKT-1) is refused, the reservation refunded, and the buy
