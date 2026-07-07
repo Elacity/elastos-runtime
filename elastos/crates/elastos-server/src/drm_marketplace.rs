@@ -129,14 +129,26 @@ pub struct DrmMarketplaceProvider {
     /// before broadcast. The DRM rail refuses to wire without an explicit value (`build_pay_rail`),
     /// so a deployment must DECLARE the mapping rather than silently assume 1:1.
     spend_unit: u128,
+    /// The pay-token the `spend_unit` mapping is FOR (council S36 F3): the unit is meaningless
+    /// without knowing the token it denominates, and listings can quote heterogeneous tokens.
+    /// When set (REQUIRED on the live Chain rail), a buy whose on-chain listing quotes a DIFFERENT
+    /// pay-token is refused before broadcast — so the declared unit always applies to the declared
+    /// token and the ceiling stays literal. `None` (dev/chain-mock, free quote) skips the check.
+    expected_pay_token: Option<String>,
 }
 
 impl DrmMarketplaceProvider {
-    pub fn new(resolver: Arc<dyn DrmResolver>, settler: Arc<dyn DrmSettler>, spend_unit: u128) -> Self {
+    pub fn new(
+        resolver: Arc<dyn DrmResolver>,
+        settler: Arc<dyn DrmSettler>,
+        spend_unit: u128,
+        expected_pay_token: Option<String>,
+    ) -> Self {
         Self {
             resolver,
             settler,
             spend_unit: spend_unit.max(1),
+            expected_pay_token,
         }
     }
 
@@ -180,6 +192,19 @@ impl PaymentProvider for DrmMarketplaceProvider {
                 PayError::Indeterminate(format!("DRM quote indeterminate: {why}"))
             }
         })?;
+        // The declared unit maps ONE token (council S36 F3): if the listing quotes a DIFFERENT
+        // pay-token than the deployment declared the `spend_unit` FOR, the cap conversion would be
+        // meaningless — refuse before broadcast rather than gate against an unknown denomination.
+        if let Some(want) = &self.expected_pay_token {
+            if !quote.pay_token.trim().eq_ignore_ascii_case(want.trim()) {
+                return Err(PayError::NotCharged(format!(
+                    "DRM buy refused before broadcast: the listing quotes pay-token {} but the \
+                     declared spend-unit mapping is for {want} — the cap cannot be compared across \
+                     token denominations",
+                    quote.pay_token
+                )));
+            }
+        }
         // THE PRICE GATE (Sprint 36): the mandate's cap, converted to pay-token units via the
         // declared unit mapping, MUST cover the on-chain price — else refuse BEFORE broadcast
         // (NotCharged/refund), never buy at a price the mandate did not authorize. Fail-closed on
@@ -279,6 +304,29 @@ impl ChainDrmMarketplace {
             ledger,
         }
     }
+
+    /// The `BuyTarget` a settle broadcasts against — extracted so its money-critical invariants are
+    /// CI-testable without a live chain. Pins:
+    /// - `quantity = 1` (council S36 red-team F1): the gate compares the cap against the PER-UNIT
+    ///   price, but `buy_access` charges `price × quantity`; a `runtime.pay` buys ACCESS (one
+    ///   ACCESS_TOKEN), so quantity is pinned to 1 here — overriding any `ELASTOS_DDRM_BUY_QUANTITY`
+    ///   — so the per-unit gate is the total and a multi-unit env can never settle above the cap;
+    /// - `expected_price = quote.price` AND `expected_pay_token = quote.pay_token` (council S36 red-
+    ///   team F2): both arm the buy's own abort-on-drift, so a price OR pay-token flip between the
+    ///   quote-gate and the broadcast fails closed (the buy can never settle above, or in a
+    ///   different token than, what the mandate's cap was gated against);
+    /// - the pinned `operative`/`token_id` (never re-resolves — no re-opened ambiguity window).
+    fn buy_target(&self, binding: &DrmBinding, quote: &DrmQuote) -> crate::api::buy_authority::BuyTarget {
+        crate::api::buy_authority::BuyTarget {
+            operative: Some(binding.operative.clone()),
+            token_id: Some(binding.token_id.clone()),
+            ledger: Some(self.ledger.clone()),
+            quantity: Some("1".to_string()),
+            expected_price: Some(quote.price.clone()),
+            expected_pay_token: Some(quote.pay_token.clone()),
+            ..Default::default()
+        }
+    }
 }
 
 impl DrmResolver for ChainDrmMarketplace {
@@ -341,22 +389,11 @@ impl DrmSettler for ChainDrmMarketplace {
         quote: &DrmQuote,
         _idempotency_key: &str,
     ) -> Result<DrmSettlement, DrmSettleError> {
-        // Pass the already-resolved binding to the buy so it never re-resolves (pinned operative +
-        // tokenId). Sprint 36: bind the GATED price as the expected price, so the buy's own
-        // abort-on-drift (`ensure_no_drift`) fails closed if the live price changed between the
-        // quote-gate and the broadcast — the buy can never settle above the price the mandate's cap
-        // was gated against.
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let target = crate::api::buy_authority::BuyTarget {
-            operative: Some(binding.operative.clone()),
-            token_id: Some(binding.token_id.clone()),
-            ledger: Some(self.ledger.clone()),
-            expected_price: Some(quote.price.clone()),
-            ..Default::default()
-        };
+        let target = self.buy_target(binding, quote);
         match crate::api::buy_authority::buy_access(
             &self.principal_id,
             &binding.content_id,
@@ -622,6 +659,7 @@ mod tests {
                 tx_hash: "0xdead".to_string(),
             }))),
             1,
+            None,
         );
         match provider.pay("QmAsset", 500, "flint-sig").unwrap_err() {
             PayError::Indeterminate(rail_ref) => {
@@ -642,7 +680,7 @@ mod tests {
             tx_hash: "0xshouldnothappen".to_string(),
         })));
         let provider =
-            DrmMarketplaceProvider::new(Arc::new(MockResolver(Err("ambiguous"))), settler.clone(), 1);
+            DrmMarketplaceProvider::new(Arc::new(MockResolver(Err("ambiguous"))), settler.clone(), 1, None);
         let err = provider.pay("QmAsset", 500, "flint-sig").unwrap_err();
         match err {
             PayError::NotCharged(msg) => assert!(msg.contains("ambiguous")),
@@ -662,6 +700,7 @@ mod tests {
                 tx_hash: "x".to_string(),
             }))),
             1,
+            None,
         );
         assert!(matches!(
             provider.pay("QmGone", 1, "k").unwrap_err(),
@@ -675,6 +714,7 @@ mod tests {
             Arc::new(MockResolver(Ok(binding()))),
             Arc::new(MockSettler::new(Err("not_broadcast"))),
             1,
+            None,
         );
         assert!(matches!(
             not_broadcast.pay("QmAsset", 1, "k").unwrap_err(),
@@ -685,6 +725,7 @@ mod tests {
             Arc::new(MockResolver(Ok(binding()))),
             Arc::new(MockSettler::new(Err("indeterminate"))),
             1,
+            None,
         );
         assert!(matches!(
             indeterminate.pay("QmAsset", 1, "k").unwrap_err(),
@@ -706,6 +747,7 @@ mod tests {
             Arc::new(MockResolver(Ok(binding()))),
             settler.clone(),
             1,
+            None,
         );
         match provider.pay("QmAsset", 300, "k").unwrap_err() {
             PayError::NotCharged(msg) => {
@@ -734,6 +776,7 @@ mod tests {
             Arc::new(MockResolver(Ok(binding()))),
             settler.clone(),
             1_000_000,
+            None,
         );
         match provider.pay("QmAsset", 5, "k").unwrap_err() {
             PayError::Indeterminate(rail_ref) => {
@@ -751,11 +794,47 @@ mod tests {
                 "5000000",
             )),
             1_000_000,
+            None,
         );
         assert!(matches!(
             below.pay("QmAsset", 4, "k").unwrap_err(),
             PayError::NotCharged(_)
         ));
+    }
+
+    /// Sprint 36 council fold (red-team F1+F2): the DRM buy target PINS quantity=1 (so the
+    /// per-unit price gate is the total — a multi-unit env can never settle above the cap) and
+    /// arms abort-on-drift on BOTH the price and the pay-token (a flip of either between the
+    /// quote-gate and the broadcast fails closed).
+    #[test]
+    fn the_drm_buy_target_pins_quantity_and_arms_price_and_pay_token_drift() {
+        let mkt = ChainDrmMarketplace::new(
+            "person:op".to_string(),
+            String::new(),
+            "0xledger".to_string(),
+        );
+        let quote = DrmQuote {
+            price: "5000000".to_string(),
+            pay_token: "0xUSDC".to_string(),
+        };
+        let target = mkt.buy_target(&binding(), &quote);
+        assert_eq!(
+            target.quantity.as_deref(),
+            Some("1"),
+            "quantity is pinned to 1 — the per-unit gate is the total charge (red-team F1)"
+        );
+        assert_eq!(
+            target.expected_price.as_deref(),
+            Some("5000000"),
+            "the gated price arms abort-on-drift"
+        );
+        assert_eq!(
+            target.expected_pay_token.as_deref(),
+            Some("0xUSDC"),
+            "the pay-token arms abort-on-drift too (red-team F2)"
+        );
+        assert_eq!(target.operative.as_deref(), Some("0xop"));
+        assert_eq!(target.token_id.as_deref(), Some("42"));
     }
 
     /// Sprint 36: an unparseable on-chain price is fail-closed refused before broadcast.
@@ -766,12 +845,52 @@ mod tests {
             "not-a-number",
         ));
         let provider =
-            DrmMarketplaceProvider::new(Arc::new(MockResolver(Ok(binding()))), settler.clone(), 1);
+            DrmMarketplaceProvider::new(Arc::new(MockResolver(Ok(binding()))), settler.clone(), 1, None);
         assert!(matches!(
             provider.pay("QmAsset", 999, "k").unwrap_err(),
             PayError::NotCharged(_)
         ));
         assert!(!*settler.called.lock().unwrap(), "no settle on an unparseable price");
+    }
+
+    /// Sprint 36 council fold (F3): a listing quoting a DIFFERENT pay-token than the declared one
+    /// is refused before broadcast — the spend-unit mapping denominates exactly one token, so the
+    /// cap cannot be compared across token denominations.
+    #[test]
+    fn a_listing_in_a_different_pay_token_than_declared_is_refused() {
+        let settler = Arc::new(MockSettler::priced(
+            Ok(DrmSettlement { tx_hash: "0xNOPE".to_string() }),
+            "1",
+        ));
+        // The mock quotes pay_token "usdc"; the deployment declared the unit is for "0xWBTC".
+        let provider = DrmMarketplaceProvider::new(
+            Arc::new(MockResolver(Ok(binding()))),
+            settler.clone(),
+            1,
+            Some("0xWBTC".to_string()),
+        );
+        match provider.pay("QmAsset", 999, "k").unwrap_err() {
+            PayError::NotCharged(msg) => {
+                assert!(msg.contains("different") || msg.contains("token denominations"), "{msg}");
+            }
+            other => panic!("a wrong-token listing must be NotCharged, got {other:?}"),
+        }
+        assert!(!*settler.called.lock().unwrap(), "no settle on a wrong-token listing");
+
+        // The SAME token (case-insensitive) passes the token check.
+        let ok = DrmMarketplaceProvider::new(
+            Arc::new(MockResolver(Ok(binding()))),
+            Arc::new(MockSettler::priced(
+                Ok(DrmSettlement { tx_hash: "0xC0".to_string() }),
+                "1",
+            )),
+            1,
+            Some("USDC".to_string()),
+        );
+        assert!(matches!(
+            ok.pay("QmAsset", 999, "k").unwrap_err(),
+            PayError::Indeterminate(_)
+        ));
     }
 
     #[test]

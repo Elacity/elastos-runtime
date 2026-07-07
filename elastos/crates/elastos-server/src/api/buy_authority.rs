@@ -281,13 +281,13 @@ pub fn quote_buy(content_id: &str, target: &BuyTarget) -> Result<BuyQuote, Strin
                     "listing sold out (on-chain supply 0) — buy aborted (fail closed)".to_string(),
                 );
             }
+            // Return the RAW on-chain pay_token (a zero address for a native listing), NOT a
+            // display alias — the DRM settler binds it as the buy's expected_pay_token so
+            // abort-on-drift can cross-check a pay-token flip between quote and broadcast (council
+            // S36 red-team F2); a mapped "native" would mismatch the re-read zero address.
             Ok(BuyQuote {
                 price: sourced.live.price,
-                pay_token: if sourced.live.pay_token.eq_ignore_ascii_case(ZERO_ADDR) {
-                    "native".to_string()
-                } else {
-                    sourced.live.pay_token
-                },
+                pay_token: sourced.live.pay_token,
                 supply: sourced.supply,
             })
         }

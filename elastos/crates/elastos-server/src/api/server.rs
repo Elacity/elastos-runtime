@@ -226,6 +226,22 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
             }
             Err(_) => 1, // dev/chain-mock: the quote is free, so the gate is a no-op
         };
+        // The pay-token the unit mapping is FOR (council S36 F3). REQUIRED on the live Chain rail:
+        // the `spend_unit` denominates one token, and listings can quote heterogeneous tokens, so a
+        // buy in any other token is refused. Omitted in dev/chain-mock (free quote ⇒ no gate).
+        let expected_pay_token = match std::env::var("ELASTOS_DRM_PAY_TOKEN") {
+            Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
+            _ if is_chain_mode => {
+                tracing::error!(
+                    "ELASTOS_PAYMENT_RAIL=drm on the live Chain rail requires ELASTOS_DRM_PAY_TOKEN \
+                     (the pay-token address the spend-unit mapping denominates, e.g. the USDC \
+                     address) so the cap is a literal ceiling in ONE token — refusing to wire the \
+                     DRM rail without it (fail-closed)"
+                );
+                return None;
+            }
+            _ => None,
+        };
         let principal = std::env::var("ELASTOS_DRM_BUYER_PRINCIPAL").unwrap_or_default();
         let subject = std::env::var("ELASTOS_DRM_BUYER_SUBJECT").unwrap_or_default();
         let ledger = std::env::var("ELASTOS_DDRM_LEDGER").unwrap_or_default();
@@ -261,6 +277,7 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
                         marketplace.clone(),
                         marketplace,
                         spend_unit,
+                        expected_pay_token,
                     )),
                     ledger: payment_ledger,
                 })
@@ -1087,6 +1104,7 @@ mod tests {
             "ELASTOS_ALLOW_MOCK_PAYMENTS",
             "ELASTOS_DDRM_RIGHTS",
             "ELASTOS_DRM_SPEND_UNIT",
+            "ELASTOS_DRM_PAY_TOKEN",
         ];
         let _guard = EnvGuard(keys.iter().map(|k| (*k, std::env::var(k).ok())).collect());
         for k in keys {
@@ -1103,8 +1121,15 @@ mod tests {
             build_pay_rail(Some(dir0.path())).is_none(),
             "the live DRM rail refuses to wire without ELASTOS_DRM_SPEND_UNIT (fail-closed)"
         );
-        // With the unit declared ⇒ the DRM rail wires on the durable stores (no mock opt-in needed).
+        // Unit declared but STILL no pay-token ⇒ refuses (Sprint 36 F3 — the unit maps one token).
         std::env::set_var("ELASTOS_DRM_SPEND_UNIT", "1000000");
+        let dir1 = tempfile::tempdir().unwrap();
+        assert!(
+            build_pay_rail(Some(dir1.path())).is_none(),
+            "the live DRM rail refuses to wire without ELASTOS_DRM_PAY_TOKEN (fail-closed)"
+        );
+        // Both the unit AND the pay-token declared ⇒ the DRM rail wires on the durable stores.
+        std::env::set_var("ELASTOS_DRM_PAY_TOKEN", "0xUSDC");
         let dir = tempfile::tempdir().unwrap();
         let rail = build_pay_rail(Some(dir.path())).expect("DRM rail wires under Chain mode");
         assert!(rail.meter.is_durable());

@@ -31,14 +31,19 @@ ELASTOS_DRM_SPEND_UNIT=<u128>       # REQUIRED (live Chain rail): pay-token smal
                                     #   spend unit — e.g. 1000000 for USDC (6 decimals) ⇒ 1 spend
                                     #   unit == 1 USDC. The price gate uses this to compare the
                                     #   mandate cap against the on-chain price IN THE SAME UNIT.
+ELASTOS_DRM_PAY_TOKEN=<addr>        # REQUIRED (live Chain rail): the pay-token address the unit
+                                    #   above denominates — a listing quoting any other token is
+                                    #   refused before broadcast (the cap is one token's ceiling).
 ELASTOS_DRM_MIN_CONFIRMATIONS=<u64> # optional confirmation-depth floor (default 3)
 ```
 
 The DRM rail **requires the durable spend meter + ledger** (real money on non-durable stores is
 refused — `runtime.pay` stays UNWIRED, fail-closed) AND, on the live **Chain** rail, an explicit
 `ELASTOS_DRM_SPEND_UNIT` (Sprint 36): without a declared meter-unit⇄pay-token mapping the rail
-**refuses to wire** rather than silently assume 1 spend unit == 1 wei — so the cap is a LITERAL
-on-chain ceiling, not just intent. (Dev/chain-mock quote free, so the gate is a no-op there.) Provision caps exactly as for any rail:
+**refuses to wire** rather than silently assume 1 spend unit == 1 wei — so the cap is a literal
+on-chain ceiling **in the declared pay-token unit** (Honest bounds 1), not just intent. The live rail
+ALSO requires `ELASTOS_DRM_PAY_TOKEN` (the token the unit denominates): a listing quoting any other
+token is refused before broadcast. (Dev/chain-mock quote free, so the gate is a no-op there.) Provision caps exactly as for any rail:
 `POST /api/spend-budgets` (or the Mandates Money panel).
 
 The payee of a buy intent is the **DRM asset reference** (the KID / content id) — the suffix of the

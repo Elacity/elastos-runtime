@@ -3390,7 +3390,7 @@ mod tests {
         let meter = std::sync::Arc::new(elastos_runtime::primitives::spend::SpendMeter::new());
         let ledger = std::sync::Arc::new(crate::payment_ledger::PaymentLedger::new());
         let provider = std::sync::Arc::new(crate::drm_marketplace::DrmMarketplaceProvider::new(
-            resolver, settler, 1,
+            resolver, settler, 1, None,
         ));
         state.intent_executor = std::sync::Arc::new(
             crate::intent_executor::MethodRegistryExecutor::production(
