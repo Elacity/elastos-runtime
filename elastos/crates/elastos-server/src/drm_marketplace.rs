@@ -324,8 +324,16 @@ impl DrmConfirmer for ChainDrmMarketplace {
 ///
 /// Returns the count of entries promoted / refunded / left pending. Never panics on one bad entry;
 /// a per-entry error is logged and the loop continues (the obligation stays Pending, retried next
-/// pass). Only entries whose `rail_note` is a DRM `rail_ref` AND that carry a `token_id` are
-/// considered — a non-DRM pending payment is left for the operator surface.
+/// pass). Only entries whose `rail_note` is a DRM `rail_ref` are considered (a non-DRM pending
+/// payment is left for the operator surface); an entry that lacks a parseable `token_id` is still
+/// promoted/refunded but gets NO receipt binding (the token-keyed `CapabilityUse` is skipped).
+///
+/// RESIDUAL (council S35 red-team F5): the DRM discriminator is the `drm:tx=` note prefix. In a
+/// MIXED deployment (an HTTP rail alongside DRM), a malicious payment endpoint whose Indeterminate
+/// error body begins `drm:tx=…` could make this driver poll/resolve that HTTP pending against an
+/// attacker-named tx. The direction is fail-closed (it can only refund or hold — never move NEW
+/// money out), and it requires both a hostile endpoint and this driver running over HTTP pendings;
+/// a rail discriminator on the record is the tracked hardening.
 pub fn reconcile_drm_confirmations(
     ledger: &crate::payment_ledger::PaymentLedger,
     meter: &elastos_runtime::primitives::spend::SpendMeter,

@@ -4033,8 +4033,9 @@ mod tests {
         assert!(
             r.reason.as_deref().is_some_and(|x| x.contains("INDETERMINATE")
                 && x.contains(&expected_key)
-                && x.contains("recorded in the payment ledger")),
-            "the response reason names the indeterminacy, the key, and the ledger custody: {:?}",
+                && x.contains("reservation is KEPT")),
+            "the response reason names the indeterminacy, the key, and the kept reservation \
+             (S35: durable ledger custody is guaranteed BEFORE the broadcast via begin_attempt): {:?}",
             r.reason
         );
         assert_eq!(meter.remaining("vm-ap-agent"), 300, "the reservation is HELD");

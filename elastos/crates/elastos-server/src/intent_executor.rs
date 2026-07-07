@@ -780,38 +780,52 @@ impl MethodRegistryExecutor {
                         reason: format!("payment refused by spend cap: {e}"),
                     };
                 }
-                // The cap allowed it — NOW move the money on the rail. The rail dedupes retries/
-                // reconciliation under the same key without ever double-moving money.
+                // DURABLE CUSTODY BEFORE THE BROADCAST (council S35 red-team F1): record the
+                // idempotency key as Pending on the ledger BEFORE moving any money, so a
+                // re-dispatch can never find "no entry" for a buy whose funds moved. If the ledger
+                // cannot custody the attempt (per-capsule pending cap, ledger full of money-bearing
+                // keys, persist failure), REFUND and DECLINE without ever broadcasting — money
+                // never moves into an unrecordable state. A concurrent dispatch that already began
+                // this key is refused idempotently (its reservation is the live one; this one's is
+                // refunded).
+                use crate::payment_ledger::{BeginAttempt, PaymentStatus};
+                match ledger.begin_attempt(
+                    &idempotency_key,
+                    &intent.capsule,
+                    payee,
+                    amount,
+                    Some(intent.standing_grant_id.as_str()),
+                ) {
+                    BeginAttempt::Started => {}
+                    BeginAttempt::AlreadyActive(status) => {
+                        let _ = meter.try_refund(&intent.capsule, amount);
+                        return IntentExecution::Declined {
+                            reason: format!(
+                                "payment already in flight or settled under idempotency key \
+                                 {idempotency_key} (status {status:?}) — not moved again \
+                                 (idempotent); this attempt's reservation was released"
+                            ),
+                        };
+                    }
+                    BeginAttempt::CapacityRefused => {
+                        let _ = meter.try_refund(&intent.capsule, amount);
+                        return IntentExecution::Declined {
+                            reason: format!(
+                                "payment refused: the ledger cannot durably custody this attempt \
+                                 (key {idempotency_key}) — refusing to move money into an \
+                                 unrecordable state (fail-closed); retry after pending \
+                                 reconciliation frees capacity"
+                            ),
+                        };
+                    }
+                }
+                // The cap allowed it AND the attempt is durably custodied — NOW move the money on
+                // the rail, then FINALIZE the Pending placeholder to the outcome.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     provider.pay(payee, amount, &idempotency_key)
                 }));
-                // Ledger custody of a PENDING (indeterminate) outcome is load-bearing for
-                // reconciliation — when it cannot be recorded, the reason must say so (the
-                // operator then reconciles from the error log; money semantics are unchanged).
-                let record_pending = |note: &str| -> &'static str {
-                    if ledger.record_with_token(
-                        &idempotency_key,
-                        &intent.capsule,
-                        payee,
-                        amount,
-                        crate::payment_ledger::PaymentStatus::Pending,
-                        note,
-                        // Bind the mandate token so a later confirmation can key the settlement
-                        // back onto this mandate's receipt (Sprint 35).
-                        Some(intent.standing_grant_id.as_str()),
-                    ) {
-                        "recorded in the payment ledger"
-                    } else {
-                        "ledger entry UNRECORDED — reconcile from the error log"
-                    }
-                };
                 match outcome {
                     Ok(Ok(rail_ref)) => {
-                        // Operator-log + ledger-custody the rail linkage (council S29 F7). Sprint
-                        // 34: the reference is ALSO carried up on `Performed.rail_ref` so the
-                        // dispatch pipeline binds it onto the signed `CapabilityUse` and thus the
-                        // portable receipt — the on-chain truth (which tx settled), not only the
-                        // operator log and ledger.
                         tracing::info!(
                             capsule = %intent.capsule,
                             amount,
@@ -820,18 +834,10 @@ impl MethodRegistryExecutor {
                             "payment performed on the rail"
                         );
                         // Sanitize the rail-controlled reference to the same printable/bounded
-                        // discipline the ledger uses BEFORE it enters a signed audit field — a
-                        // rail (or a DRM chain adapter) must never inject control bytes into the
-                        // receipt.
+                        // discipline BEFORE it enters a signed audit field — a rail (or a DRM chain
+                        // adapter) must never inject control bytes into the receipt.
                         let rail_ref = crate::payment_ledger::sanitize_rail_note(&rail_ref);
-                        let _ = ledger.record(
-                            &idempotency_key,
-                            &intent.capsule,
-                            payee,
-                            amount,
-                            crate::payment_ledger::PaymentStatus::Performed,
-                            &rail_ref,
-                        );
+                        ledger.finalize(&idempotency_key, PaymentStatus::Performed, &rail_ref);
                         IntentExecution::Performed {
                             capsule: intent.capsule.clone(),
                             method_id: intent.method_id.clone(),
@@ -844,19 +850,11 @@ impl MethodRegistryExecutor {
                         }
                     }
                     Ok(Err(PayError::NotCharged(rail_err))) => {
-                        // PROVABLY not charged — REFUND the reservation and Decline. The signed
-                        // reason claims "refunded" ONLY when the refund is durably in force
-                        // (council S28 F3): a durable refund that cannot persist is rolled back by
-                        // try_refund, and the honest record is that the cap remains debited
-                        // (fail-closed — the operator restores headroom by raising the budget).
-                        let _ = ledger.record(
-                            &idempotency_key,
-                            &intent.capsule,
-                            payee,
-                            amount,
-                            crate::payment_ledger::PaymentStatus::NotCharged,
-                            &rail_err,
-                        );
+                        // PROVABLY not charged — finalize NotCharged and REFUND. The signed reason
+                        // claims "refunded" ONLY when the refund is durably in force (council S28
+                        // F3): a durable refund that cannot persist is rolled back by try_refund,
+                        // and the honest record is that the cap remains debited (fail-closed).
+                        ledger.finalize(&idempotency_key, PaymentStatus::NotCharged, &rail_err);
                         IntentExecution::Declined {
                             reason: match meter.try_refund(&intent.capsule, amount) {
                                 Ok(_) => format!("payment rail refused (spend refunded): {rail_err}"),
@@ -870,31 +868,28 @@ impl MethodRegistryExecutor {
                     Ok(Err(PayError::Indeterminate(rail_err))) => {
                         // The outcome is UNKNOWN — the charge may have posted. Refunding here would
                         // let real spend exceed the cap (charge landed + headroom restored), the
-                        // one unbreakable invariant — so the reservation is KEPT and the chain
-                        // records, honestly, an act NOT attested as performed whose funds may have
-                        // moved, resolvable via the idempotency key. Fail-closed over-counting.
-                        let ledgered = record_pending(&rail_err);
+                        // one unbreakable invariant — so the reservation is KEPT, the entry stays
+                        // Pending with the rail reference in its note, resolvable via the
+                        // idempotency key. Fail-closed over-counting.
+                        ledger.finalize(&idempotency_key, PaymentStatus::Pending, &rail_err);
                         IntentExecution::Declined {
                             reason: format!(
                                 "payment outcome INDETERMINATE ({rail_err}) — not attested as \
                                  performed; the reservation is KEPT (cap remains debited) pending \
-                                 rail reconciliation under idempotency key {idempotency_key} \
-                                 ({ledgered})"
+                                 rail reconciliation under idempotency key {idempotency_key}"
                             ),
                         }
                     }
                     Err(_panic) => {
-                        // The rail PANICKED mid-call. Sprint 27 refunded here (the mock rail never
-                        // charges); with a REAL rail that is UNSAFE — the panic may have happened
-                        // AFTER the charge posted, and refunding would let total real spend exceed
-                        // the cap. A panic is INDETERMINATE: keep the reservation (S29, supersedes
-                        // the S27 refund-on-panic fold for exactly the reason the trait doc gives).
-                        let ledgered = record_pending("rail panicked");
+                        // The rail PANICKED mid-call. With a REAL rail refunding is UNSAFE — the
+                        // panic may have happened AFTER the charge posted. INDETERMINATE: keep the
+                        // reservation, the entry stays Pending.
+                        ledger.finalize(&idempotency_key, PaymentStatus::Pending, "rail panicked");
                         IntentExecution::Declined {
                             reason: format!(
                                 "payment rail panicked — outcome INDETERMINATE; the reservation is \
                                  KEPT (cap remains debited) pending rail reconciliation under \
-                                 idempotency key {idempotency_key} ({ledgered})"
+                                 idempotency key {idempotency_key}"
                             ),
                         }
                     }

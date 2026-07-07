@@ -940,6 +940,11 @@ mod tests {
     use super::build_pay_rail;
     use axum::http::HeaderValue;
 
+    /// Both `build_pay_rail` tests mutate PROCESS-GLOBAL payment env vars (they overlap on
+    /// `ELASTOS_ALLOW_MOCK_PAYMENTS`), so they must run one-at-a-time — Rust runs tests in
+    /// parallel threads by default. This lock serializes them (`.lock()` at the top of each).
+    static PAY_RAIL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn allows_local_loopback_origins() {
         assert!(is_allowed_local_origin(&HeaderValue::from_static(
@@ -969,6 +974,7 @@ mod tests {
     /// endpoint ⇒ refused; https real endpoint ⇒ wired; real wins over mock.
     #[test]
     fn build_pay_rail_selects_fail_closed() {
+        let _serial = PAY_RAIL_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         struct EnvGuard(Vec<(&'static str, Option<String>)>);
         impl Drop for EnvGuard {
             fn drop(&mut self) {
@@ -1032,6 +1038,7 @@ mod tests {
     /// wires ONLY with the explicit `ELASTOS_ALLOW_MOCK_PAYMENTS` opt-in, else stays UNWIRED.
     #[test]
     fn drm_rail_obeys_the_mock_money_discipline() {
+        let _serial = PAY_RAIL_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         struct EnvGuard(Vec<(&'static str, Option<String>)>);
         impl Drop for EnvGuard {
             fn drop(&mut self) {

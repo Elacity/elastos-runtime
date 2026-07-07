@@ -212,41 +212,95 @@ pub(crate) fn tx_confirmation_live(
     let request = json!({ "op": "receipt", "network": network, "hash": tx_hash });
     let resp = run_chain_capsule(&chain_bin, &init, &request)?;
     let receipt = resp.get("receipt");
-    // A null receipt = the tx is not yet mined (still in the mempool) ⇒ Pending, hold.
+    // A null/absent receipt = the tx is not yet mined ⇒ Pending, hold (fail-safe).
     if receipt.map(Value::is_null).unwrap_or(true) {
         return Ok(TxConfirmation::Pending(
             "tx not yet mined (no receipt)".to_string(),
         ));
     }
-    let receipt = receipt.unwrap();
-    // `status` 0x0 ⇒ the tx reverted on-chain (money did NOT settle) ⇒ Reverted (refund).
-    let status = receipt
-        .get("status")
-        .and_then(Value::as_str)
-        .map(|s| s.trim_start_matches("0x"))
-        .unwrap_or("");
-    if !status.is_empty() && status.chars().all(|c| c == '0') {
-        return Ok(TxConfirmation::Reverted);
-    }
-    // Mined + success: apply the confirmation-depth floor. blockNumber is a 0x-hex quantity.
+    let tip = block_number_live()?;
+    Ok(classify_receipt(receipt.unwrap(), tip, min_confirmations))
+}
+
+/// The PURE, money-critical classification of a mined receipt against the chain tip + depth floor
+/// (Sprint 35). Extracted so the fail-closed rules (council S35 guardian F1/F2, red-team F3) are
+/// CI-testable without a live chain. Rules, in order:
+/// 1. no usable `blockNumber` ⇒ `Pending` (cannot compute depth);
+/// 2. depth (`tip - mined + 1`) below the floor ⇒ `Pending` — gates BOTH verdicts, so a shallow
+///    revert (which a reorg can re-include successfully) never refunds prematurely;
+/// 3. at/above the floor: `status` explicit `0` ⇒ `Reverted`; explicit non-zero ⇒ `Confirmed`;
+///    absent/empty/unparseable ⇒ `Pending` (a money gate defaults to HOLD, never "success").
+///    Accepts a hex STRING (`0x1`) or a JSON NUMBER.
+fn classify_receipt(receipt: &Value, tip: u64, min_confirmations: u64) -> TxConfirmation {
     let mined_block = receipt
         .get("blockNumber")
         .and_then(Value::as_str)
         .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
     let Some(mined_block) = mined_block else {
-        return Ok(TxConfirmation::Pending(
-            "receipt has no usable blockNumber".to_string(),
-        ));
+        return TxConfirmation::Pending("receipt has no usable blockNumber".to_string());
     };
-    let tip = block_number_live()?;
-    // depth = tip - mined + 1 (the mining block itself counts as one confirmation).
     let depth = tip.saturating_sub(mined_block).saturating_add(1);
-    if depth >= min_confirmations {
-        Ok(TxConfirmation::Confirmed)
-    } else {
-        Ok(TxConfirmation::Pending(format!(
-            "confirmed to depth {depth} of {min_confirmations} required"
-        )))
+    if depth < min_confirmations {
+        return TxConfirmation::Pending(format!(
+            "at depth {depth} of {min_confirmations} required"
+        ));
+    }
+    let status_val = receipt.get("status").and_then(|s| {
+        s.as_str()
+            .map(|h| h.trim_start_matches("0x").trim())
+            .and_then(|h| u64::from_str_radix(h, 16).ok())
+            .or_else(|| s.as_u64())
+    });
+    match status_val {
+        Some(0) => TxConfirmation::Reverted,
+        Some(_) => TxConfirmation::Confirmed,
+        None => TxConfirmation::Pending("receipt has no parseable success status".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod confirmation_tests {
+    use super::*;
+
+    #[test]
+    fn classify_receipt_is_fail_closed_on_status_and_depth() {
+        let mined = json!({"status": "0x1", "blockNumber": "0x64"}); // block 100
+        // Deep enough + success ⇒ Confirmed.
+        assert_eq!(classify_receipt(&mined, 102, 3), TxConfirmation::Confirmed);
+        // Below the depth floor ⇒ Pending (tip 100 == mined ⇒ depth 1 < 3).
+        assert!(matches!(
+            classify_receipt(&mined, 100, 3),
+            TxConfirmation::Pending(_)
+        ));
+        // Reverted, deep enough ⇒ Reverted (council S35 guardian F2: depth gates the revert too).
+        let reverted = json!({"status": "0x0", "blockNumber": "0x64"});
+        assert_eq!(classify_receipt(&reverted, 110, 3), TxConfirmation::Reverted);
+        // Reverted but SHALLOW ⇒ Pending, NOT an immediate refund.
+        assert!(matches!(
+            classify_receipt(&reverted, 100, 3),
+            TxConfirmation::Pending(_)
+        ));
+        // council S35 red-team F3 / guardian F1: a receipt with NO status but a deep block must
+        // NOT read as success — hold.
+        let no_status = json!({"blockNumber": "0x64"});
+        assert!(matches!(
+            classify_receipt(&no_status, 999, 3),
+            TxConfirmation::Pending(_)
+        ));
+        // A numeric status is accepted (0 ⇒ revert, 1 ⇒ success).
+        assert_eq!(
+            classify_receipt(&json!({"status": 1, "blockNumber": "0x64"}), 999, 3),
+            TxConfirmation::Confirmed
+        );
+        assert_eq!(
+            classify_receipt(&json!({"status": 0, "blockNumber": "0x64"}), 999, 3),
+            TxConfirmation::Reverted
+        );
+        // No blockNumber ⇒ cannot compute depth ⇒ Pending.
+        assert!(matches!(
+            classify_receipt(&json!({"status": "0x1"}), 999, 3),
+            TxConfirmation::Pending(_)
+        ));
     }
 }
 

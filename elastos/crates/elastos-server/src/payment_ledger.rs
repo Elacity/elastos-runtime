@@ -64,6 +64,35 @@ impl PaymentStatus {
     fn is_terminal(self) -> bool {
         !matches!(self, PaymentStatus::Pending)
     }
+
+    /// Whether an entry may move money (or already has) — the states the idempotency guard relies
+    /// on to refuse a re-charge (council S35 guardian F3 / red-team F1). These MUST NOT be evicted:
+    /// evicting a `Performed`/`ResolvedCharged` key would let a cross-window re-dispatch of the
+    /// same signed intent find no entry and buy again. Only the provably-nothing-moved terminals
+    /// (`NotCharged`/`ResolvedNotCharged`) are safe to evict.
+    fn is_money_bearing(self) -> bool {
+        matches!(
+            self,
+            PaymentStatus::Pending | PaymentStatus::Performed | PaymentStatus::ResolvedCharged
+        )
+    }
+}
+
+/// The result of [`PaymentLedger::begin_attempt`] — the durable custody handle the pay path takes
+/// BEFORE it broadcasts (council S35 red-team F1), so a re-dispatch can never find "no entry" for a
+/// buy whose money moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BeginAttempt {
+    /// A `Pending` placeholder is durably recorded; the caller may now move money and then
+    /// [`finalize`](PaymentLedger::finalize) the outcome.
+    Started,
+    /// The key already carries a money-bearing entry (a concurrent dispatch beat this one). The
+    /// caller must NOT move money again — decline idempotently and refund THIS attempt's reservation.
+    AlreadyActive(PaymentStatus),
+    /// The ledger could not durably custody the attempt (per-capsule pending cap, ledger full of
+    /// money-bearing entries, or a persist failure). The caller MUST NOT broadcast — refund and
+    /// decline fail-closed, so money never moves into an unrecordable state.
+    CapacityRefused,
 }
 
 /// One rail attempt. `rail_note` is the sanitized (printable, bounded) rail body/reference.
@@ -292,21 +321,23 @@ impl PaymentLedger {
         {
             return false;
         }
-        // Bound the map: evict oldest TERMINAL entries; never a pending one. If everything at the
-        // cap is pending, refuse a NEW pending (bounded obligations) but allow terminal records to
-        // temporarily exceed by eviction failure being impossible for them... keep it simple:
-        // refuse any insert that cannot make room.
+        // Bound the map by evicting the oldest EVICTABLE entry — a provably-nothing-moved terminal
+        // (`NotCharged`/`ResolvedNotCharged`) ONLY. Money-bearing keys (`Pending`/`Performed`/
+        // `ResolvedCharged`) are NEVER evicted (council S35 guardian F3): evicting a charged key
+        // would let a cross-window re-dispatch find no entry and re-buy. If the cap is full of
+        // money-bearing entries, a NEW insert is REFUSED fail-closed (the pay path then refuses to
+        // broadcast) rather than forgetting a key idempotency depends on.
         while records.len() >= LEDGER_CAP {
-            let oldest_terminal = records
+            let oldest_evictable = records
                 .values()
-                .filter(|r| r.status.is_terminal())
+                .filter(|r| r.status.is_terminal() && !r.status.is_money_bearing())
                 .min_by_key(|r| r.seq)
                 .map(|r| r.idempotency_key.clone());
-            match oldest_terminal {
+            match oldest_evictable {
                 Some(k) => {
                     records.remove(&k);
                 }
-                None => return false, // cap full of pending obligations — refuse, stay bounded
+                None => return false, // cap full of money-bearing entries — refuse, stay bounded
             }
         }
         let seq = self
@@ -330,6 +361,116 @@ impl PaymentLedger {
             records.remove(idempotency_key);
             return false;
         }
+        true
+    }
+
+    /// Durably custody a payment attempt as `Pending` BEFORE any money moves (council S35 red-team
+    /// F1). The pay path calls this AFTER reserving the cap and BEFORE broadcasting, so a
+    /// re-dispatch can never find "no entry" for a buy whose money moved:
+    /// - key absent ⇒ insert a `Pending` placeholder (subject to the per-capsule pending cap +
+    ///   the money-bearing-aware ledger bound) ⇒ `Started`, or `CapacityRefused` if it cannot be
+    ///   custodied;
+    /// - key present + money-bearing (`Pending`/`Performed`/`ResolvedCharged`) ⇒ `AlreadyActive`
+    ///   (a concurrent dispatch beat this one; the caller must not move money again);
+    /// - key present + provably-nothing-moved (`NotCharged`/`ResolvedNotCharged`) ⇒ REOPEN to
+    ///   `Pending` (a legitimate retry the guard allows) ⇒ `Started`.
+    ///
+    /// The caller then moves money and calls [`finalize`](Self::finalize) with the outcome.
+    pub fn begin_attempt(
+        &self,
+        idempotency_key: &str,
+        capsule: &str,
+        payee: &str,
+        amount: u64,
+        token_id: Option<&str>,
+    ) -> BeginAttempt {
+        let mut records = match self.records.write() {
+            Ok(r) => r,
+            Err(_) => return BeginAttempt::CapacityRefused,
+        };
+        if let Some(existing) = records.get(idempotency_key) {
+            if existing.status.is_money_bearing() {
+                return BeginAttempt::AlreadyActive(existing.status);
+            }
+            // A provably-nothing-moved terminal ⇒ reopen to Pending for the retry.
+            let prev = existing.status;
+            if let Some(r) = records.get_mut(idempotency_key) {
+                r.status = PaymentStatus::Pending;
+                r.rail_note = sanitize_rail_note("reserving");
+                r.refund_applied = false;
+            }
+            if self.persist_locked(&records).is_err() {
+                if let Some(r) = records.get_mut(idempotency_key) {
+                    r.status = prev; // roll back the reopen
+                }
+                return BeginAttempt::CapacityRefused;
+            }
+            return BeginAttempt::Started;
+        }
+        // New key: the same per-capsule pending cap + money-bearing-aware eviction as `record`.
+        if records
+            .values()
+            .filter(|r| r.status == PaymentStatus::Pending && r.capsule == capsule)
+            .count()
+            >= PENDING_PER_CAPSULE_CAP
+        {
+            return BeginAttempt::CapacityRefused;
+        }
+        while records.len() >= LEDGER_CAP {
+            let oldest_evictable = records
+                .values()
+                .filter(|r| r.status.is_terminal() && !r.status.is_money_bearing())
+                .min_by_key(|r| r.seq)
+                .map(|r| r.idempotency_key.clone());
+            match oldest_evictable {
+                Some(k) => {
+                    records.remove(&k);
+                }
+                None => return BeginAttempt::CapacityRefused,
+            }
+        }
+        let seq = self
+            .next_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        records.insert(
+            idempotency_key.to_string(),
+            PaymentRecord {
+                idempotency_key: idempotency_key.to_string(),
+                capsule: capsule.to_string(),
+                payee: payee.to_string(),
+                amount,
+                status: PaymentStatus::Pending,
+                rail_note: sanitize_rail_note("reserving"),
+                seq,
+                refund_applied: false,
+                token_id: token_id.map(str::to_string),
+            },
+        );
+        if self.persist_locked(&records).is_err() {
+            records.remove(idempotency_key);
+            return BeginAttempt::CapacityRefused;
+        }
+        BeginAttempt::Started
+    }
+
+    /// Record the OUTCOME of a `begin_attempt` custody, transitioning the `Pending` placeholder to
+    /// its final status + rail note (council S35 red-team F1). Only a `Pending` entry is updated
+    /// (never clobbers a resolved one); a `Pending` target status keeps it Pending with the tx in
+    /// the note (the DRM broadcast-accepted case). Best-effort persist — the in-memory state is
+    /// authoritative for the guard; a persist failure is logged by the caller.
+    pub fn finalize(&self, idempotency_key: &str, status: PaymentStatus, rail_note: &str) -> bool {
+        let mut records = match self.records.write() {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        match records.get_mut(idempotency_key) {
+            Some(r) if r.status == PaymentStatus::Pending => {
+                r.status = status;
+                r.rail_note = sanitize_rail_note(rail_note);
+            }
+            _ => return false,
+        }
+        let _ = self.persist_locked(&records);
         true
     }
 
@@ -523,7 +664,9 @@ mod tests {
     #[test]
     fn eviction_never_sheds_a_pending_obligation() {
         let ledger = PaymentLedger::new();
-        // Fill to the cap with terminal entries plus one early pending.
+        // Fill to the cap with EVICTABLE terminals (NotCharged = provably nothing moved) plus one
+        // early pending. Council S35 guardian F3: money-bearing terminals (Performed/
+        // ResolvedCharged) are NOT evictable, so only NotCharged/ResolvedNotCharged make room.
         assert!(ledger.record("pend-1", "vm-ap", "acme", 5, PaymentStatus::Pending, ""));
         for i in 0..(LEDGER_CAP - 1) {
             assert!(ledger.record(
@@ -531,14 +674,14 @@ mod tests {
                 "vm-ap",
                 "acme",
                 1,
-                PaymentStatus::Performed,
+                PaymentStatus::NotCharged,
                 ""
             ));
         }
-        // At cap: a new record evicts the OLDEST TERMINAL (t-0), never pend-1.
-        assert!(ledger.record("t-new", "vm-ap", "acme", 1, PaymentStatus::Performed, ""));
+        // At cap: a new record evicts the OLDEST EVICTABLE terminal (t-0), never pend-1.
+        assert!(ledger.record("t-new", "vm-ap", "acme", 1, PaymentStatus::NotCharged, ""));
         assert!(ledger.get("pend-1").is_some(), "pending is never evicted");
-        assert!(ledger.get("t-0").is_none(), "oldest terminal was evicted");
+        assert!(ledger.get("t-0").is_none(), "oldest evictable terminal was evicted");
         // A cap full of ONLY pending refuses new inserts (bounded obligations). Spread across
         // capsules so the GLOBAL bound is what trips, not the per-capsule one.
         let small = PaymentLedger::new();
@@ -558,6 +701,89 @@ mod tests {
         assert!(
             !small.record("one-more", "vm-new", "a", 1, PaymentStatus::Pending, ""),
             "a pending set at the cap refuses new entries instead of growing unbounded"
+        );
+    }
+
+    /// Council S35 guardian F3 / red-team F1: a money-bearing terminal (`Performed`/
+    /// `ResolvedCharged`) is NEVER evicted — evicting a charged key would let a cross-window
+    /// re-dispatch find no entry and re-buy. A cap FULL of money-bearing entries refuses a new
+    /// insert fail-closed (the pay path then refuses to broadcast), rather than forgetting a key
+    /// idempotency depends on.
+    #[test]
+    fn money_bearing_keys_are_never_evicted() {
+        let ledger = PaymentLedger::new();
+        for i in 0..LEDGER_CAP {
+            assert!(ledger.record(
+                &format!("charged-{i}"),
+                "vm-ap",
+                "acme",
+                1,
+                PaymentStatus::Performed,
+                "drm:tx=0x1;op=o;tid=1",
+            ));
+        }
+        // Cap full of Performed (money-bearing): a NEW insert is REFUSED, none evicted.
+        assert!(
+            !ledger.record("new-charged", "vm-ap", "acme", 1, PaymentStatus::Performed, ""),
+            "a cap full of money-bearing keys refuses new inserts (fail-closed)"
+        );
+        assert!(ledger.get("charged-0").is_some(), "the oldest charged key survives");
+        // begin_attempt refuses too — so the pay path declines WITHOUT broadcasting.
+        assert_eq!(
+            ledger.begin_attempt("brand-new", "vm-ap", "acme", 1, None),
+            BeginAttempt::CapacityRefused
+        );
+    }
+
+    /// Council S35 red-team F1: begin_attempt custodies a Pending placeholder BEFORE money moves,
+    /// reopens a provably-nothing-moved terminal for a retry, and refuses a money-bearing key.
+    #[test]
+    fn begin_attempt_custodies_reopens_and_refuses() {
+        let ledger = PaymentLedger::new();
+        // Fresh key ⇒ Started + a Pending placeholder is durably present.
+        assert_eq!(
+            ledger.begin_attempt("k", "vm-a", "acme", 100, Some("tok")),
+            BeginAttempt::Started
+        );
+        let rec = ledger.get("k").unwrap();
+        assert_eq!(rec.status, PaymentStatus::Pending);
+        assert_eq!(rec.token_id.as_deref(), Some("tok"));
+        // A money-bearing key ⇒ AlreadyActive (a concurrent dispatch must not move money again).
+        assert_eq!(
+            ledger.begin_attempt("k", "vm-a", "acme", 100, Some("tok")),
+            BeginAttempt::AlreadyActive(PaymentStatus::Pending)
+        );
+        // Finalize to a provably-nothing-moved terminal, then begin_attempt REOPENS for a retry.
+        assert!(ledger.finalize("k", PaymentStatus::NotCharged, "rail refused"));
+        assert_eq!(
+            ledger.begin_attempt("k", "vm-a", "acme", 100, Some("tok")),
+            BeginAttempt::Started
+        );
+        assert_eq!(ledger.get("k").unwrap().status, PaymentStatus::Pending);
+        // Finalize charged ⇒ money-bearing ⇒ a retry is refused (idempotent).
+        assert!(ledger.finalize("k", PaymentStatus::Performed, "drm:tx=0xabc;op=o;tid=1"));
+        assert_eq!(
+            ledger.begin_attempt("k", "vm-a", "acme", 100, Some("tok")),
+            BeginAttempt::AlreadyActive(PaymentStatus::Performed)
+        );
+    }
+
+    /// Council S35 guardian F4: a pre-S35 on-disk ledger snapshot (records with NO `token_id` key)
+    /// loads, and a legacy record re-persists with no `token_id` key — the field's back-compat is
+    /// byte-shape safe (skip_serializing_if + appended last), like the S32 audit pattern.
+    #[test]
+    fn pre_s35_ledger_snapshot_without_token_id_round_trips() {
+        // A record deserialized from a pre-S35 line: no token_id key at all.
+        let legacy = r#"{"idempotency_key":"flint-x","capsule":"vm-a","payee":"acme","amount":200,"status":"pending","rail_note":"drm:tx=0xC0;op=o;tid=7","seq":0}"#;
+        let rec: PaymentRecord = serde_json::from_str(legacy).unwrap();
+        assert!(rec.token_id.is_none(), "absent token_id ⇒ None");
+        assert!(!rec.refund_applied, "absent refund_applied ⇒ false");
+        // Re-serialization omits both defaulted-absent fields' keys where skip applies: token_id
+        // (skip_serializing_if) is omitted; the record is byte-shape compatible.
+        let round = serde_json::to_string(&rec).unwrap();
+        assert!(
+            !round.contains("token_id"),
+            "a legacy record re-serializes with NO token_id key: {round}"
         );
     }
 
