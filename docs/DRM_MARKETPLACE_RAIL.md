@@ -45,7 +45,7 @@ units, as always.
    refused** (`NotCharged` → the reserved cap is refunded), **never a fallback buy**.
 2. **Settle** the buy for the pinned binding via `buy_authority::buy_access`.
 3. **Classify** the outcome two-generals-honestly:
-   - tx confirmed ⇒ `Ok` — the money moved; the reference names the tx.
+   - the buy path reported a BROADCAST-ACCEPTED tx ⇒ `Ok` — recorded as charged on RAIL TRUST with ZERO confirmations observed (`buy_access` returns at `eth_sendRawTransaction` acceptance, not inclusion — see Honest bound 2); the reference names the tx the rail reported.
    - provably never broadcast (wallet unlinked, listing sold out, price-drift abort) ⇒ `NotCharged`
      — refund the cap.
    - broadcast then unconfirmed (RPC timeout, no confirmation) ⇒ `Indeterminate` — **keep the
@@ -82,7 +82,9 @@ On a box with the chain-provider configured for Base and a funded managed accoun
    listing's pay-token amount. The reconciliation is **not enforced** — set the meter unit to the
    pay-token unit (or add a conversion gate) before the cap is a literal spend ceiling. Today the
    cap bounds the operator's INTENT; the listing bounds the ACTUAL charge.
-2. **Tx re-verification depth.** A Performed DRM buy trusts the buy path's tx report; the runtime
-   does not yet re-read the receipt / enforce a confirmation-depth floor before recording Performed
-   (the same RAIL-TRUST caveat as a lying 2xx on the HTTP rail, now on-chain).
+2. **Broadcast-accepted, not confirmed.** A Performed DRM buy is recorded at `eth_sendRawTransaction`
+   ACCEPTANCE (zero confirmations read), not at inclusion — a dropped/reverted tx yields a Performed
+   receipt naming a settlement that never finalized, and a Performed record has no reconcile lever
+   (reconcile is Pending-only; recovery is a cap raise). Fail-closed for the cap, but the receipt
+   over-attests. Fix: re-read the receipt + a confirmation-depth floor before recording Performed.
 3. **Royalty splits** are the DRM protocol's invariant, not re-verified by Flint.

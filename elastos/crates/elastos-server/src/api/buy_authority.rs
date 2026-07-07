@@ -855,7 +855,14 @@ mod tests {
         std::env::set_var("ELASTOS_DDRM_OWNED_LEDGER", dir.join("owned.json"));
         std::env::remove_var("ELASTOS_DDRM_RIGHTS"); // dev
 
-        let out = buy_access("did:test:alice", "bafyDEV", SUBJECT, 1_700_000_000).expect("dev buy");
+        let out = buy_access(
+            "did:test:alice",
+            "bafyDEV",
+            SUBJECT,
+            1_700_000_000,
+            &BuyTarget::default(),
+        )
+        .expect("dev buy");
         assert!(out.owned_now);
         assert!(out.tx_hash.starts_with("0x"));
         assert!(super::super::owned_ledger::contains("bafyDEV", SUBJECT));

@@ -180,9 +180,42 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
                  marketplace rail wins; the HTTP endpoint is ignored"
             );
         }
+        // Mock-money discipline (council S34 guardian F4): the DRM rail settles through
+        // `buy_access`, whose DEV rights-mode fabricates a synthetic tx hash with NO chain — that
+        // is MOCK money, and the S29 rule is that mock money requires the explicit
+        // `ELASTOS_ALLOW_MOCK_PAYMENTS` opt-in. So a non-Chain rights mode (Dev/ChainMock) wires
+        // the DRM rail ONLY when mock payments are explicitly allowed; otherwise it stays UNWIRED,
+        // fail-closed. Release builds default to Chain and refuse dev modes at boot, so production
+        // is unaffected; this closes the dev-build asymmetry.
+        let mode = super::rights_authority::rights_mode();
+        if !matches!(mode, super::rights_authority::RightsMode::Chain) && !mock_allowed {
+            tracing::error!(
+                "ELASTOS_PAYMENT_RAIL=drm with a non-Chain rights mode ({mode:?}) fabricates \
+                 synthetic settlements — that is MOCK money and requires \
+                 ELASTOS_ALLOW_MOCK_PAYMENTS to be set explicitly; runtime.pay stays UNWIRED"
+            );
+            return None;
+        }
         let principal = std::env::var("ELASTOS_DRM_BUYER_PRINCIPAL").unwrap_or_default();
         let subject = std::env::var("ELASTOS_DRM_BUYER_SUBJECT").unwrap_or_default();
         let ledger = std::env::var("ELASTOS_DDRM_LEDGER").unwrap_or_default();
+        // Loud-at-boot on a misconfigured buyer (council S34 guardian F5): both are fail-closed at
+        // act time (an empty buyer ⇒ "wallet not linked" ⇒ refund; an empty ledger ⇒ resolve
+        // error ⇒ refund), but a silent misconfig should be visible at boot like the HTTP rail's
+        // refuse-on-malformed-endpoint. Wallet-signing mode legitimately runs with an empty
+        // subject (the managed account is authoritative), so subject is not warned.
+        if principal.trim().is_empty() {
+            tracing::warn!(
+                "ELASTOS_PAYMENT_RAIL=drm wired with an EMPTY ELASTOS_DRM_BUYER_PRINCIPAL — every \
+                 buy will fail closed (wallet not linked) until it is set"
+            );
+        }
+        if ledger.trim().is_empty() {
+            tracing::warn!(
+                "ELASTOS_PAYMENT_RAIL=drm wired with an EMPTY ELASTOS_DDRM_LEDGER — every KID \
+                 resolve will fail closed until it is set"
+            );
+        }
         return match (open_durable_meter(), open_ledger()) {
             (Some(meter), Some(payment_ledger)) => {
                 tracing::info!(
@@ -992,5 +1025,61 @@ mod tests {
             build_pay_rail(None).is_none(),
             "real money on non-durable stores is refused"
         );
+    }
+
+    /// Council S34 guardian F4: the DRM rail obeys the S29 mock-money discipline. Under the secure
+    /// `Chain` rights mode it wires on the durable stores; under a non-Chain (synthetic-tx) mode it
+    /// wires ONLY with the explicit `ELASTOS_ALLOW_MOCK_PAYMENTS` opt-in, else stays UNWIRED.
+    #[test]
+    fn drm_rail_obeys_the_mock_money_discipline() {
+        struct EnvGuard(Vec<(&'static str, Option<String>)>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (k, v) in &self.0 {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+        let keys = [
+            "ELASTOS_PAYMENT_RAIL",
+            "ELASTOS_PAYMENT_ENDPOINT",
+            "ELASTOS_ALLOW_MOCK_PAYMENTS",
+            "ELASTOS_DDRM_RIGHTS",
+        ];
+        let _guard = EnvGuard(keys.iter().map(|k| (*k, std::env::var(k).ok())).collect());
+        for k in keys {
+            std::env::remove_var(k);
+        }
+
+        std::env::set_var("ELASTOS_PAYMENT_RAIL", "drm");
+
+        // Secure Chain mode ⇒ the DRM rail wires on the durable stores (no mock opt-in needed).
+        std::env::set_var("ELASTOS_DDRM_RIGHTS", "chain");
+        let dir = tempfile::tempdir().unwrap();
+        let rail = build_pay_rail(Some(dir.path())).expect("DRM rail wires under Chain mode");
+        assert!(rail.meter.is_durable());
+        drop(rail);
+
+        // Under a non-Chain (synthetic-settlement) rights mode, wiring requires the explicit
+        // mock opt-in — otherwise UNWIRED, fail-closed. Reachable only in a dev-modes build (a
+        // release build cannot leave Chain), so the negative case is gated on the feature.
+        #[cfg(feature = "dev-modes")]
+        {
+            std::env::set_var("ELASTOS_DDRM_RIGHTS", "dev");
+            std::env::remove_var("ELASTOS_ALLOW_MOCK_PAYMENTS");
+            let dir2 = tempfile::tempdir().unwrap();
+            assert!(
+                build_pay_rail(Some(dir2.path())).is_none(),
+                "DRM rail under a synthetic mode without the mock opt-in stays UNWIRED"
+            );
+            std::env::set_var("ELASTOS_ALLOW_MOCK_PAYMENTS", "1");
+            let dir3 = tempfile::tempdir().unwrap();
+            let rail = build_pay_rail(Some(dir3.path()))
+                .expect("with the explicit mock opt-in, the dev DRM rail wires");
+            assert!(rail.meter.is_durable());
+        }
     }
 }

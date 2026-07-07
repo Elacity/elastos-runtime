@@ -2409,6 +2409,13 @@ pub async fn dispatch_standing_intent(
             } else {
                 None
             };
+            // Defense in depth at the SIGNING boundary (council S34 guardian F6): the pay closure
+            // already sanitizes, but re-sanitize here so the signed-field invariant (printable,
+            // bounded) is local to the emit site and holds for ANY future executor that sets
+            // Performed.rail_ref. Idempotent on an already-clean reference; empty ⇒ omitted.
+            let rail_ref = rail_ref
+                .map(|r| crate::payment_ledger::sanitize_rail_note(&r))
+                .filter(|r| !r.is_empty());
             manager_for_use.audit_log().capability_use_with_rail_ref(
                 &token_id,
                 &intent_for_gate.capsule,

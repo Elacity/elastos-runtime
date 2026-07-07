@@ -23,7 +23,12 @@
 //!   MKT-1 discipline: bind only when exactly one `(operative, tokenId)` exists, else fail closed).
 //! - the buy provably never broadcast (rejected pre-send, wallet unlinked, listing sold out) ⇒
 //!   [`PayError::NotCharged`] — refund.
-//! - the tx confirmed ⇒ `Ok(rail_ref)` — the money moved; the reference names the tx.
+//! - the buy path reported a BROADCAST-ACCEPTED tx ⇒ `Ok(rail_ref)` — recorded as charged on RAIL
+//!   TRUST with ZERO confirmations observed (council S34 guardian F1; KNOWN_GAPS MKT-DRM residual
+//!   2): `buy_access` returns `Ok` at `eth_sendRawTransaction` acceptance, not at inclusion, so a
+//!   dropped/reverted tx would mint a Performed receipt naming a settlement that never finalized.
+//!   The reference names the tx the rail reported. Re-reading the receipt + a confirmation-depth
+//!   floor before recording Performed is the tracked follow-on.
 //! - anything the settler cannot prove either way (broadcast then lost, RPC timeout) ⇒
 //!   [`PayError::Indeterminate`] — the reservation is KEPT (the charge may have posted), resolved
 //!   out of band via the idempotency key, exactly like the HTTP rail's post-send ambiguity.
@@ -60,10 +65,11 @@ pub trait DrmResolver: Send + Sync {
     fn resolve(&self, asset_ref: &str) -> Result<DrmBinding, DrmResolveError>;
 }
 
-/// The confirmed settlement of a DRM buy — the on-chain truth the receipt will carry.
+/// The BROADCAST-ACCEPTED settlement of a DRM buy — the tx the rail reported (zero confirmations
+/// observed; see the module doc). The on-chain truth the receipt will carry, on rail trust.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrmSettlement {
-    /// The buy transaction hash (`0x…`), as the chain/adapter reported it.
+    /// The buy transaction hash (`0x…`), as the chain/adapter reported it at broadcast acceptance.
     pub tx_hash: String,
 }
 
@@ -103,11 +109,16 @@ impl DrmMarketplaceProvider {
 
     /// The canonical `rail_ref` for a settled DRM buy: `drm:tx=<hash>;op=<operative>;tid=<tokenId>`.
     /// Compact, greppable, and (after the pay path's `sanitize_rail_note`) printable-bounded before
-    /// it enters the signed receipt.
+    /// it enters the signed receipt. The `;` and `=` DELIMITERS are stripped from each
+    /// chain-supplied component first (council S34 red-team F3): an `operative` containing a
+    /// literal `;tid=` must not be able to forge the parsed binding in the receipt.
     fn rail_ref(binding: &DrmBinding, settlement: &DrmSettlement) -> String {
+        let clean = |s: &str| s.replace([';', '='], "");
         format!(
             "drm:tx={};op={};tid={}",
-            settlement.tx_hash, binding.operative, binding.token_id
+            clean(&settlement.tx_hash),
+            clean(&binding.operative),
+            clean(&binding.token_id)
         )
     }
 }
@@ -164,19 +175,34 @@ impl ChainDrmMarketplace {
 
 impl DrmResolver for ChainDrmMarketplace {
     fn resolve(&self, asset_ref: &str) -> Result<DrmBinding, DrmResolveError> {
-        // The MKT-1-hardened live resolver: it accumulates every distinct (operative, tokenId)
-        // across the whole channel range and binds ONLY when exactly one exists, else returns an
-        // `ambiguous_kid_binding` error string — which we classify as Ambiguous (fail closed).
+        // The MKT-1-hardened live resolver accumulates every distinct (operative, tokenId) across
+        // the whole channel range and binds ONLY when exactly one exists, else fails closed. On an
+        // ambiguous KID the chain-provider answers with the code `ambiguous_kid_binding` and the
+        // message "KID … binds >1 distinct (operative, tokenId) … (buy blocked, fail-closed)".
+        // NOTE (council S34 guardian F3): `run_chain_capsule` surfaces only the MESSAGE (the code
+        // is dropped), so we classify Ambiguous on the distinctive message substring, NOT the word
+        // "ambiguous" (which the message does not contain) — else a genuine MKT-1 hostile
+        // co-mint would mislabel as mere absence. Both Ambiguous and Unresolvable are
+        // NotCharged/refund, so money is safe either way; this keeps the REASON honest.
         match crate::api::chain_tx::resolve_token_id_live(asset_ref, &self.ledger) {
-            Ok((token_id, operative)) if !token_id.is_empty() => Ok(DrmBinding {
-                content_id: asset_ref.to_string(),
-                operative,
-                token_id,
-            }),
+            // Both the tokenId AND the operative must be present (council S34 red-team F4): the
+            // operative is filled `unwrap_or_default()` upstream, so an empty one could pass the
+            // tokenId guard and then fail buy_access POST-price-read as an unclassifiable error
+            // (kept as Indeterminate rather than refunded). Refuse it here as Unresolvable — a
+            // provably pre-effect failure that refunds the cap.
+            Ok((token_id, operative)) if !token_id.is_empty() && !operative.trim().is_empty() => {
+                Ok(DrmBinding {
+                    content_id: asset_ref.to_string(),
+                    operative,
+                    token_id,
+                })
+            }
             Ok(_) => Err(DrmResolveError::Unresolvable(
-                "chain-provider returned an empty tokenId".to_string(),
+                "chain-provider returned an empty tokenId or operative".to_string(),
             )),
-            Err(e) if e.contains("ambiguous") => Err(DrmResolveError::Ambiguous(e)),
+            Err(e) if e.contains("binds >1 distinct") || e.contains("ambiguous") => {
+                Err(DrmResolveError::Ambiguous(e))
+            }
             Err(e) => Err(DrmResolveError::Unresolvable(e)),
         }
     }
@@ -224,22 +250,31 @@ impl DrmSettler for ChainDrmMarketplace {
     }
 }
 
-/// Whether a `buy_access` error string PROVABLY describes a refusal BEFORE any broadcast — the only
-/// case safe to classify NotCharged (refund). Everything else is indeterminate: a broadcast may
-/// have landed. These phrases are the buy path's own pre-send fail-closed guards (wallet linkage,
-/// listing resolution, sold-out, price-drift abort).
+/// Whether a `buy_access` error string PROVABLY describes a refusal BEFORE any broadcast — the ONLY
+/// case safe to classify NotCharged (refund the cap). Everything else — including every
+/// post-broadcast RPC error — stays Indeterminate (keep the reservation), because a broadcast may
+/// have landed and refunding against it would let the refund AND the on-chain purchase both stand
+/// (the one unbreakable invariant).
+///
+/// COUNCIL S34 red-team F1 (the ship-blocker): the earlier version matched bare generic tokens
+/// (`"ambiguous"`, `"unresolved"`, `"missing channel"`) as substrings. But `buy_access` in the
+/// pinned-binding settle path NEVER emits those words — the only place they can appear is inside a
+/// POST-send `broadcast_signed_live` error (`"chain-provider op failed: {opaque rpc message}"`),
+/// where an RPC/proxy string like "unresolved upstream" would have refunded a broadcast tx. So we
+/// now match ONLY the buy path's EXACT, distinctive pre-broadcast sentinels — each carries the
+/// `(fail closed)` / `— fail closed` marker the RPC error format does not reproduce, and each fires
+/// strictly BEFORE `broadcast_signed_live`. RESIDUAL (KNOWN_GAPS MKT-DRM): this still sniffs an
+/// opaque String; the real fix is a structured pre/post-broadcast error type out of `buy_access`.
 fn is_pre_broadcast_refusal(err: &str) -> bool {
-    const PRE_BROADCAST: &[&str] = &[
-        "wallet not linked",
-        "listing sold out",
-        "buy aborted (fail closed)",
-        "ambiguous",
-        "unresolved",
-        "no active listing",
-        "missing channel",
+    // Exact, anchored pre-broadcast sentinels emitted by `buy_authority::buy_access` strictly
+    // before any `eth_sendRawTransaction`. Case-sensitive (they are fixed literals), so an opaque
+    // lowercased RPC message cannot collide with the parenthetical/em-dash markers.
+    const PRE_BROADCAST_SENTINELS: &[&str] = &[
+        "wallet not linked: a buy needs the principal's EVM address",
+        "buy aborted (fail closed)", // sold-out, no-active-listing, and listing-drift all end here
+        "none resolved — fail closed", // operative missing before assembly
     ];
-    let lower = err.to_lowercase();
-    PRE_BROADCAST.iter().any(|p| lower.contains(p))
+    PRE_BROADCAST_SENTINELS.iter().any(|p| err.contains(p))
 }
 
 #[cfg(test)]
@@ -365,13 +400,70 @@ mod tests {
 
     #[test]
     fn pre_broadcast_refusal_classification_is_conservative() {
-        // Recognized pre-send guards ⇒ refundable.
-        assert!(is_pre_broadcast_refusal("wallet not linked: a buy needs the EVM address"));
+        // The EXACT buy_access pre-send sentinels ⇒ refundable (each fires before broadcast).
+        assert!(is_pre_broadcast_refusal(
+            "wallet not linked: a buy needs the principal's EVM address"
+        ));
         assert!(is_pre_broadcast_refusal(
             "listing sold out (on-chain supply 0) — buy aborted (fail closed)"
         ));
-        // An unclassifiable error must NOT be treated as pre-broadcast (stays indeterminate).
+        assert!(is_pre_broadcast_refusal(
+            "no active listing for this asset (sellersOf/listings empty at ACCESS_TOKEN id=1) — \
+             buy aborted (fail closed)"
+        ));
+        assert!(is_pre_broadcast_refusal(
+            "listing drift on price: bound 5 != re-read 9 — buy aborted (fail closed)"
+        ));
+        assert!(is_pre_broadcast_refusal(
+            "abort-on-drift requires the asset's operative; none resolved — fail closed"
+        ));
+        // Council S34 red-team F1: a POST-broadcast RPC error that COINCIDENTALLY contains a
+        // generic token the old classifier matched MUST NOT be treated as pre-broadcast — the tx
+        // may have landed, so it stays indeterminate (reservation kept, never refunded).
+        assert!(!is_pre_broadcast_refusal(
+            "chain-provider op failed: unresolved upstream host after send"
+        ));
+        assert!(!is_pre_broadcast_refusal(
+            "chain-provider op failed: ambiguous nonce state"
+        ));
         assert!(!is_pre_broadcast_refusal("rpc connection reset after send"));
         assert!(!is_pre_broadcast_refusal("nonce too low"));
+    }
+
+    #[test]
+    fn the_live_ambiguity_message_classifies_as_ambiguous_not_absence() {
+        // Council S34 guardian F3: the chain-provider's ambiguous-KID MESSAGE (the code is dropped
+        // by run_chain_capsule) contains "binds >1 distinct", NOT the word "ambiguous". A resolver
+        // classifier that keyed only on "ambiguous" would mislabel a genuine MKT-1 hostile co-mint
+        // as mere absence. This locks the message-substring classification. (Both Ambiguous and
+        // Unresolvable are NotCharged, so this guards the REASON honesty, not the money.)
+        let msg = "chain-provider op failed: KID 0xabc binds >1 distinct (operative, tokenId) — \
+                   refusing to bind a possibly-hostile token (buy blocked, fail-closed)";
+        assert!(
+            msg.contains("binds >1 distinct") && !msg.to_lowercase().contains("ambiguous"),
+            "the live message has the distinctive marker but not the word 'ambiguous'"
+        );
+        // The classifier arm keys on that marker (mirrors ChainDrmMarketplace::resolve).
+        let is_ambiguous = msg.contains("binds >1 distinct") || msg.contains("ambiguous");
+        assert!(is_ambiguous, "a hostile co-mint is classified Ambiguous, not Unresolvable");
+    }
+
+    #[test]
+    fn rail_ref_strips_delimiter_injection_from_chain_supplied_components() {
+        // Council S34 red-team F3: a compromised adapter returning an operative that embeds the
+        // format's own delimiters must not forge the parsed binding.
+        let hostile = DrmBinding {
+            content_id: "QmAsset".to_string(),
+            operative: "0xreal;tid=999".to_string(),
+            token_id: "42".to_string(),
+        };
+        let settlement = DrmSettlement {
+            tx_hash: "0x;op=fake".to_string(),
+        };
+        let rail_ref = DrmMarketplaceProvider::rail_ref(&hostile, &settlement);
+        // Exactly ONE of each delimiter key — the injected ones were stripped.
+        assert_eq!(rail_ref.matches(";tid=").count(), 1, "no forged tid segment: {rail_ref}");
+        assert_eq!(rail_ref.matches(";op=").count(), 1, "no forged op segment: {rail_ref}");
+        assert_eq!(rail_ref, "drm:tx=0xopfake;op=0xrealtid999;tid=42");
     }
 }
