@@ -124,6 +124,11 @@ pub struct PayRail {
     pub meter: Arc<elastos_runtime::primitives::spend::SpendMeter>,
     pub provider: Arc<dyn crate::intent_executor::PaymentProvider>,
     pub ledger: Arc<crate::payment_ledger::PaymentLedger>,
+    /// The chain-confirmation reader, present ONLY on the DRM rail (Sprint 37) — what the
+    /// in-runtime reconcile scheduler polls pending buys against. `None` on the HTTP/mock rails
+    /// (their pendings are operator-reconciled), which also keeps the scheduler structurally
+    /// un-armable there.
+    pub drm_confirmer: Option<Arc<dyn crate::drm_marketplace::DrmConfirmer>>,
 }
 
 /// Rail selection, fail-closed (Sprint 29/31; see the serve() doc block for the full rules):
@@ -275,11 +280,12 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
                     meter,
                     provider: Arc::new(crate::drm_marketplace::DrmMarketplaceProvider::new(
                         marketplace.clone(),
-                        marketplace,
+                        marketplace.clone(),
                         spend_unit,
                         expected_pay_token,
                     )),
                     ledger: payment_ledger,
+                    drm_confirmer: Some(marketplace),
                 })
             }
             _ => {
@@ -358,6 +364,7 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
                         endpoint, token,
                     )),
                     ledger,
+                    drm_confirmer: None,
                 })
             }
             (true, _, _) => {
@@ -400,10 +407,154 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
                 meter,
                 provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
                 ledger,
+                drm_confirmer: None,
             }
         });
     }
     None
+}
+
+/// The DRM confirmation scheduler's env-derived arming decision (Sprint 37 — closes KNOWN_GAPS
+/// MKT-DRM 2b). Extracted PURE-over-env so CI pins the fail-closed arming rules without a tokio
+/// runtime. Returns `Some((interval, per-tick batch cap))` iff the scheduler should run:
+///
+/// - OFF BY DEFAULT (P16 — no ambient background chain poller): arms ONLY when
+///   `ELASTOS_DRM_RECONCILE_INTERVAL_SECS` is set (u64 ≥ 1) AND the wired rail carries a DRM
+///   confirmer. An interval on a non-DRM rail warns and stays off (its pendings are
+///   operator-reconciled; there is no chain to poll).
+/// - FAIL-CLOSED on a malformed value: an unparseable interval or batch REFUSES to arm with an
+///   error log — a scheduler must never guess its own cadence or bound.
+/// - `ELASTOS_DRM_RECONCILE_BATCH` (usize ≥ 1, default 64) bounds one tick's work; the overflow
+///   is counted (`DrmReconcileSummary::skipped`) and picked up next tick, oldest-first.
+pub fn drm_reconcile_schedule_from_env(
+    rail_has_confirmer: bool,
+) -> Option<(std::time::Duration, usize)> {
+    let interval_raw = std::env::var("ELASTOS_DRM_RECONCILE_INTERVAL_SECS").ok()?;
+    let interval_secs = match interval_raw.trim().parse::<u64>() {
+        Ok(n) if n >= 1 => n,
+        _ => {
+            tracing::error!(
+                "ELASTOS_DRM_RECONCILE_INTERVAL_SECS={interval_raw:?} is not a positive integer \
+                 — the DRM confirmation scheduler stays OFF (fail-closed, no guessed cadence)"
+            );
+            return None;
+        }
+    };
+    if !rail_has_confirmer {
+        tracing::warn!(
+            "ELASTOS_DRM_RECONCILE_INTERVAL_SECS is set but the wired payment rail is not the \
+             DRM rail — the confirmation scheduler stays OFF (nothing on-chain to poll; HTTP/mock \
+             pendings are operator-reconciled)"
+        );
+        return None;
+    }
+    let batch = match std::env::var("ELASTOS_DRM_RECONCILE_BATCH") {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(n) if n >= 1 => n,
+            _ => {
+                tracing::error!(
+                    "ELASTOS_DRM_RECONCILE_BATCH={raw:?} is not a positive integer — the DRM \
+                     confirmation scheduler stays OFF (fail-closed, no guessed bound)"
+                );
+                return None;
+            }
+        },
+        Err(_) => DRM_RECONCILE_BATCH_DEFAULT,
+    };
+    Some((std::time::Duration::from_secs(interval_secs), batch))
+}
+
+/// Default per-tick cap on DRM pendings processed by the scheduler.
+const DRM_RECONCILE_BATCH_DEFAULT: usize = 64;
+
+/// Spawn the in-runtime DRM confirmation scheduler (Sprint 37): a thin `tokio` interval loop over
+/// [`crate::drm_marketplace::drm_reconcile_tick`] — the SAME reconciliation the manual
+/// `POST /api/payments/reconcile` path drives, so the scheduler adds ZERO new money-moving code.
+/// Ticks run on the blocking pool (the confirmer shells out to the chain-provider), so rail
+/// latency never starves the async workers. `None` when not armed (see
+/// [`drm_reconcile_schedule_from_env`] for the arming rules).
+///
+/// This wrapper is the only untested shim: the tick body, the arming decision, the bounding, the
+/// panic isolation, and the idempotency are all CI-driven directly with a mock confirmer.
+pub fn spawn_drm_reconcile_scheduler(
+    rail: Option<&PayRail>,
+    audit_log: Arc<AuditLog>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let rail = rail?;
+    let (interval, batch) = drm_reconcile_schedule_from_env(rail.drm_confirmer.is_some())?;
+    let confirmer = rail.drm_confirmer.clone()?; // present — the arming check requires it
+    let meter = rail.meter.clone();
+    let ledger = rail.ledger.clone();
+    tracing::info!(
+        "DRM confirmation scheduler ARMED: every {}s, up to {batch} pending buys per tick \
+         (promote at the confirmation floor / refund a revert / hold the rest)",
+        interval.as_secs()
+    );
+    Some(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // A stalled tick (slow RPC) must not cause a burst of catch-up ticks against the chain.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The rotating scan cursor (council S37 F1): each tick starts after the previous tick's
+        // last scanned seq, so a stuck-Unconfirmed prefix can never starve the entries behind it.
+        let mut cursor: Option<u64> = None;
+        // At most ONE tick in flight (council S37 guardian F2): the chain-provider read has no
+        // deadline today, so a hung RPC would otherwise either wedge the schedule (awaiting it)
+        // or stack a new blocked thread per interval (not awaiting it). Instead: if the previous
+        // tick is still running, LOG LOUDLY and skip — the schedule stays alive and observable,
+        // blocked threads stay bounded at one, and every entry stays safely Pending.
+        let mut in_flight: Option<
+            tokio::task::JoinHandle<crate::drm_marketplace::DrmReconcileSummary>,
+        > = None;
+        loop {
+            ticker.tick().await;
+            if let Some(handle) = in_flight.take() {
+                if !handle.is_finished() {
+                    tracing::error!(
+                        "a previous DRM confirmation tick is STILL RUNNING (hung chain RPC?) — \
+                         skipping this interval; pending buys stay held until it returns"
+                    );
+                    in_flight = Some(handle);
+                    continue;
+                }
+                match handle.await {
+                    Ok(summary) => {
+                        if summary.next_cursor.is_some() {
+                            cursor = summary.next_cursor;
+                        }
+                        if summary.scanned() > 0 || summary.skipped > 0 {
+                            tracing::info!(
+                                promoted = summary.promoted,
+                                refunded = summary.refunded,
+                                left_pending = summary.left_pending,
+                                skipped = summary.skipped,
+                                "DRM confirmation tick"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // The tick task itself died (per-entry panics are isolated inside).
+                        // Hold everything (entries stay Pending) and keep the schedule alive.
+                        tracing::error!("DRM confirmation tick aborted: {e} — retrying next tick");
+                    }
+                }
+            }
+            let meter = meter.clone();
+            let ledger = ledger.clone();
+            let audit_log = audit_log.clone();
+            let confirmer = confirmer.clone();
+            let start_after = cursor;
+            in_flight = Some(tokio::task::spawn_blocking(move || {
+                crate::drm_marketplace::drm_reconcile_tick(
+                    &ledger,
+                    &meter,
+                    &audit_log,
+                    confirmer.as_ref(),
+                    batch,
+                    start_after,
+                )
+            }));
+        }
+    }))
 }
 
 pub struct HostHelperProcess {
@@ -984,8 +1135,9 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
 
 #[cfg(test)]
 mod tests {
-    use super::is_allowed_local_origin;
     use super::build_pay_rail;
+    use super::drm_reconcile_schedule_from_env;
+    use super::is_allowed_local_origin;
     use axum::http::HeaderValue;
 
     /// Both `build_pay_rail` tests mutate PROCESS-GLOBAL payment env vars (they overlap on
@@ -1154,5 +1306,45 @@ mod tests {
                 .expect("with the explicit mock opt-in, the dev DRM rail wires");
             assert!(rail.meter.is_durable());
         }
+    }
+    /// Sprint 37 ratchet: the scheduler's fail-closed arming rules. OFF by default (no interval
+    /// env ⇒ None); a malformed interval or batch REFUSES to arm (never guesses); an interval on
+    /// a non-DRM rail stays off; armed only on interval + DRM confirmer, with batch defaulting
+    /// to 64.
+    #[test]
+    fn the_drm_scheduler_arms_only_with_an_interval_and_a_drm_rail() {
+        let _serial = PAY_RAIL_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::capture(&[
+            "ELASTOS_DRM_RECONCILE_INTERVAL_SECS",
+            "ELASTOS_DRM_RECONCILE_BATCH",
+        ]);
+
+        // OFF BY DEFAULT: no interval declared ⇒ never armed, DRM rail or not.
+        assert!(drm_reconcile_schedule_from_env(true).is_none());
+        assert!(drm_reconcile_schedule_from_env(false).is_none());
+
+        // Malformed interval ⇒ fail-closed OFF (no guessed cadence).
+        std::env::set_var("ELASTOS_DRM_RECONCILE_INTERVAL_SECS", "soon");
+        assert!(drm_reconcile_schedule_from_env(true).is_none());
+        std::env::set_var("ELASTOS_DRM_RECONCILE_INTERVAL_SECS", "0");
+        assert!(drm_reconcile_schedule_from_env(true).is_none());
+
+        // A valid interval on a NON-DRM rail ⇒ off (nothing on-chain to poll).
+        std::env::set_var("ELASTOS_DRM_RECONCILE_INTERVAL_SECS", "30");
+        assert!(drm_reconcile_schedule_from_env(false).is_none());
+
+        // Valid interval + DRM rail ⇒ armed, batch defaults to 64.
+        let (interval, batch) =
+            drm_reconcile_schedule_from_env(true).expect("interval + DRM rail arms");
+        assert_eq!(interval, std::time::Duration::from_secs(30));
+        assert_eq!(batch, 64, "the per-tick bound defaults");
+
+        // Explicit batch is honored; a malformed batch refuses to arm (no guessed bound).
+        std::env::set_var("ELASTOS_DRM_RECONCILE_BATCH", "5");
+        assert_eq!(drm_reconcile_schedule_from_env(true).unwrap().1, 5);
+        std::env::set_var("ELASTOS_DRM_RECONCILE_BATCH", "many");
+        assert!(drm_reconcile_schedule_from_env(true).is_none());
+        std::env::set_var("ELASTOS_DRM_RECONCILE_BATCH", "0");
+        assert!(drm_reconcile_schedule_from_env(true).is_none());
     }
 }

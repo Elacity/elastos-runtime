@@ -79,8 +79,9 @@ classification, and the signed receipt are byte-identical.
   ambiguity), read-only price quote, the price gate (`amount × ELASTOS_DRM_SPEND_UNIT` must cover
   the on-chain price, quantity pinned to 1, pay-token declared and drift-armed), broadcast ⇒
   PENDING, and promotion to charged only after the tx is mined + successful + past the
-  confirmation-depth floor. The full rail — wiring, runbook, honest bounds — is
-  `docs/DRM_MARKETPLACE_RAIL.md`.
+  confirmation-depth floor — driven unattended by the in-runtime confirmation scheduler when
+  `ELASTOS_DRM_RECONCILE_INTERVAL_SECS` is set (S37). The full rail — wiring, runbook, honest
+  bounds — is `docs/DRM_MARKETPLACE_RAIL.md`.
 - The Mock rail stays dev/demo-gated behind `ELASTOS_ALLOW_MOCK_PAYMENTS` (a real endpoint wins if
   both are set).
 
@@ -127,8 +128,8 @@ classification, and the signed receipt are byte-identical.
 - The snapshot files are trusted from `data_dir` (not self-authenticating, unlike the signed
   chain); the flock/parent-fsync protections are unix-only.
 - DRM-rail residuals are tracked as `MKT-DRM` in `KNOWN_GAPS.md` (the operator-declared spend-unit
-  mapping; the confirmation poll being operator/automation-driven until the in-runtime scheduler
-  lands).
+  mapping; the confirmation scheduler being opt-in — unset interval ⇒ back to the manual
+  reconcile loop).
 
 ## The trust model (and its honest caveats)
 

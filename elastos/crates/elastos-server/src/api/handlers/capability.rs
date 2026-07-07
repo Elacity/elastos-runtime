@@ -3503,6 +3503,8 @@ mod tests {
             &meter,
             state.capability_manager.audit_log(),
             &confirmer,
+            usize::MAX,
+            None,
         );
         assert_eq!(summary.promoted, 1, "the confirmed buy was promoted");
         assert_eq!(

@@ -1319,6 +1319,7 @@ mod tests {
                 meter: meter.clone(),
                 provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
                 ledger: ledger.clone(),
+                drm_confirmer: None,
             }),
             spent_fresh_money_tokens: Arc::default(),
         };
@@ -1415,6 +1416,7 @@ mod tests {
                 meter: meter.clone(),
                 provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
                 ledger: Arc::new(crate::payment_ledger::PaymentLedger::new()),
+                drm_confirmer: None,
             }),
             spent_fresh_money_tokens: Arc::default(),
         };
@@ -1489,6 +1491,7 @@ mod tests {
                 meter: meter.clone(),
                 provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
                 ledger: Arc::new(crate::payment_ledger::PaymentLedger::new()),
+                drm_confirmer: None,
             }),
             spent_fresh_money_tokens: Arc::default(),
         };
@@ -1554,6 +1557,7 @@ mod tests {
                 meter: meter.clone(),
                 provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
                 ledger: ledger.clone(),
+                drm_confirmer: None,
             }),
             spent_fresh_money_tokens: Arc::default(),
         };
@@ -1693,6 +1697,7 @@ mod tests {
                 meter: meter.clone(),
                 provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
                 ledger: Arc::new(crate::payment_ledger::PaymentLedger::new()),
+                drm_confirmer: None,
             }),
             spent_fresh_money_tokens: Arc::default(),
         };
@@ -1759,6 +1764,7 @@ mod tests {
                 meter: meter.clone(),
                 provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
                 ledger: Arc::new(crate::payment_ledger::PaymentLedger::new()),
+                drm_confirmer: None,
             }),
             spent_fresh_money_tokens: Arc::default(),
         };

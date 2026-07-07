@@ -40,6 +40,13 @@ ELASTOS_DRM_PAY_TOKEN=<addr>        # REQUIRED (live Chain rail): the pay-token 
                                     #   above denominates — a listing quoting any other token is
                                     #   refused before broadcast (the cap is one token's ceiling).
 ELASTOS_DRM_MIN_CONFIRMATIONS=<u64> # optional confirmation-depth floor (default 3)
+ELASTOS_DRM_RECONCILE_INTERVAL_SECS=<u64> # optional: ARM the in-runtime confirmation scheduler
+                                    #   (Sprint 37) — every N seconds, pending DRM buys are polled
+                                    #   and promoted/refunded/held. OFF when unset (no ambient
+                                    #   background chain poller); a malformed value refuses to arm.
+ELASTOS_DRM_RECONCILE_BATCH=<usize> # optional per-tick cap on pendings processed (default 64,
+                                    #   oldest-first; the overflow is counted and picked up next
+                                    #   tick). A malformed value refuses to arm.
 ```
 
 The DRM rail **requires the durable spend meter + ledger** (real money on non-durable stores is
@@ -92,7 +99,9 @@ units, as always.
      resolved out of band by the intent-signature idempotency key.
 5. **Confirm, then record the on-chain truth.** `reconcile_drm_confirmations` polls each pending DRM
    tx (`eth_getTransactionReceipt` + a confirmation-depth floor, `ELASTOS_DRM_MIN_CONFIRMATIONS`,
-   default 3): **mined + successful + deep enough** ⇒ promote to charged (spend stands) AND bind
+   default 3) — driven UNATTENDED by the in-runtime scheduler when
+   `ELASTOS_DRM_RECONCILE_INTERVAL_SECS` is set (Sprint 37), or manually via the reconcile
+   surface: **mined + successful + deep enough** ⇒ promote to charged (spend stands) AND bind
    `rail_ref = drm:tx=<hash>;op=<operative>;tid=<tokenId>;price=<price>;tok=<pay_token>` onto the
    signed `CapabilityUse` and thus
    the portable receipt; **reverted** ⇒ refund the reservation exactly once; **not-yet-mined / below
@@ -104,6 +113,41 @@ units, as always.
 re-charge a signature-derived key that already carries a money-moved-or-may-have entry
 (`Performed`/`Pending`/`ResolvedCharged`), so a re-dispatched identical signed intent past the
 replay window resolves to the SAME buy — never a second one.
+
+## The confirmation scheduler (Sprint 37 — unattended resolution)
+
+With `ELASTOS_DRM_RECONCILE_INTERVAL_SECS` set on a DRM-wired rail, the runtime itself drives
+pending buys to their terminal verdicts — no operator loop required. The scheduler is a thin
+timer over the SAME `reconcile_drm_confirmations` pass the manual path runs (zero new
+money-moving code; one spine), with these properties:
+
+- **Off by default.** No interval declared ⇒ no background chain poller, ever. An interval on a
+  non-DRM rail warns and stays off. A malformed interval or batch REFUSES to arm — the scheduler
+  never guesses its own cadence or bound.
+- **Fail-closed on every failure mode.** An unreachable RPC, an unscripted verdict, a reconcile
+  error, or a PANIC on one entry all resolve to the same outcome: that entry stays Pending and is
+  retried next tick. A tick can promote (at the depth floor), refund (a revert, exactly once), or
+  hold — nothing else.
+- **Bounded, rotating, and idempotent.** At most `ELASTOS_DRM_RECONCILE_BATCH` pendings per tick;
+  the overflow is counted, never silently dropped, and a ROTATING cursor starts each tick after
+  the previous tick's last entry (wrapping), so every pending is visited within
+  ceil(pending/batch) ticks — a stuck-unconfirmed prefix can never starve the entries behind it.
+  Re-polling an already-resolved entry is a no-op by the ledger's resolve-exactly-once rule;
+  overlapping or manual passes cannot double-resolve.
+- **Observable and provable.** A tick that SETTLED anything (promoted or refunded) appends a
+  `drm_reconcile_tick` event (promoted/refunded/left_pending/skipped) to the signed chain —
+  best-effort: a failed append is logged and never blocks the tick; the per-entry
+  `payment_reconciled` events remain the durable money attestation. A promoted entry carries the
+  same `rail_ref` a manual reconcile would bind — byte-identical, because it IS the same path.
+  Idle and held-only ticks are silent, so a stuck pending cannot grow the signed chain by one
+  event per tick.
+- **Never starves or wedges the runtime.** Ticks run on the blocking pool; a slow RPC delays the
+  next tick (no catch-up bursts), and at most ONE tick is ever in flight — if a tick is still
+  running when the next interval fires, the scheduler logs loudly and skips (a hung chain-provider
+  read cannot wedge the schedule or stack blocked threads; entries stay safely Pending).
+  RESIDUAL: the chain-provider read itself has no deadline yet — a permanently hung read parks
+  that one tick forever (the scheduler keeps skipping, loudly); the subprocess deadline is a
+  tracked follow-on.
 
 ## The test seam (why CI needs no chain)
 
@@ -136,10 +180,11 @@ On a box with the chain-provider configured for Base and a funded managed accoun
    expected price (abort-on-drift). RESIDUAL: the mapping is operator-declared (the runtime does not
    discover the pay-token's decimals on-chain) — a wrong declaration mis-scales the ceiling; a
    deployment must set it to match the listing's pay-token.
-2. **Confirmation depth — CLOSED (Sprint 35).** A DRM buy is now recorded `Pending` at broadcast
-   and promoted to charged (with the receipt binding) only after `reconcile_drm_confirmations` reads
-   the tx mined + successful + at least `ELASTOS_DRM_MIN_CONFIRMATIONS` deep; a reverted tx refunds.
-   RESIDUAL: the confirmation poll is the operator/automation loop calling
-   `reconcile_drm_confirmations` (or `POST /api/payments/reconcile` with the verdict the operator
-   read) — an in-runtime scheduler that runs it periodically is the follow-on.
+2. **Confirmation depth — CLOSED (Sprint 35); unattended resolution — CLOSED (Sprint 37).** A
+   DRM buy is recorded `Pending` at broadcast and promoted to charged (with the receipt binding)
+   only after `reconcile_drm_confirmations` reads the tx mined + successful + at least
+   `ELASTOS_DRM_MIN_CONFIRMATIONS` deep; a reverted tx refunds. The in-runtime scheduler
+   (`ELASTOS_DRM_RECONCILE_INTERVAL_SECS`) now drives that poll unattended. RESIDUAL: the
+   scheduler is opt-in — a deployment that never sets the interval is back to the manual loop
+   (deliberate: no ambient background chain poller).
 3. **Royalty splits** are the DRM protocol's invariant, not re-verified by Flint.

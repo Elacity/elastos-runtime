@@ -165,6 +165,12 @@ async fn setup_server_infrastructure_impl(
     // server and the Home gateway's Money panel hold the SAME meter/ledger Arcs (the stores'
     // single-opener flocks make independent opens impossible by design).
     let pay_rail = api::server::build_pay_rail(Some(&data_dir));
+    // The DRM confirmation scheduler (Sprint 37): pending DRM buys resolve themselves against the
+    // chain on a cadence — off by default, armed only by ELASTOS_DRM_RECONCILE_INTERVAL_SECS on a
+    // DRM-wired rail. Spawned HERE, next to the one rail build, so exactly one scheduler exists
+    // per process (the same one-spine rule as the rail itself). The handle is deliberately
+    // detached: the loop lives as long as the runtime.
+    let _ = api::server::spawn_drm_reconcile_scheduler(pay_rail.as_ref(), audit_log.clone());
     let pending_store = Arc::new(capability::pending::PendingRequestStore::new(
         audit_log.clone(),
     ));

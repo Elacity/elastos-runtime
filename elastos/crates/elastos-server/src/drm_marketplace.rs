@@ -447,11 +447,14 @@ impl DrmConfirmer for ChainDrmMarketplace {
 /// spine for the money movement + attestation — this driver only supplies the chain's verdict (in
 /// place of the operator's) and, on a confirmation, the token-keyed receipt binding.
 ///
-/// Returns the count of entries promoted / refunded / left pending. Never panics on one bad entry;
-/// a per-entry error is logged and the loop continues (the obligation stays Pending, retried next
-/// pass). Only entries whose `rail_note` is a DRM `rail_ref` are considered (a non-DRM pending
-/// payment is left for the operator surface); an entry that lacks a parseable `token_id` is still
-/// promoted/refunded but gets NO receipt binding (the token-keyed `CapabilityUse` is skipped).
+/// Returns the count of entries promoted / refunded / left pending / skipped. Never panics on one
+/// bad entry: a per-entry error OR PANIC is logged, that entry stays Pending, and the loop
+/// continues (retried next pass). At most `max_entries` DRM pendings are processed per pass
+/// (oldest-first — `pending()` is seq-ordered); the overflow is counted in `skipped`, never
+/// silently dropped (manual/one-shot callers pass `usize::MAX`). Only entries whose `rail_note`
+/// is a DRM `rail_ref` are considered (a non-DRM pending payment is left for the operator
+/// surface); an entry that lacks a parseable `token_id` is still promoted/refunded but gets NO
+/// receipt binding (the token-keyed `CapabilityUse` is skipped).
 ///
 /// RESIDUAL (council S35 red-team F5): the DRM discriminator is the `drm:tx=` note prefix. In a
 /// MIXED deployment (an HTTP rail alongside DRM), a malicious payment endpoint whose Indeterminate
@@ -464,67 +467,190 @@ pub fn reconcile_drm_confirmations(
     meter: &elastos_runtime::primitives::spend::SpendMeter,
     audit_log: &elastos_runtime::primitives::audit::AuditLog,
     confirmer: &dyn DrmConfirmer,
+    max_entries: usize,
+    start_after_seq: Option<u64>,
 ) -> DrmReconcileSummary {
+    let mut summary = DrmReconcileSummary::default();
+    // ROTATED scan order (council S37 F1 — head-of-line starvation): a bounded pass that always
+    // starts at the oldest entry lets a stuck-Unconfirmed prefix (never-mining txs held forever;
+    // money-bearing Pendings are never evicted) consume the whole batch every pass and STARVE
+    // every entry behind it — including reverted buys whose refunds would then never land. So a
+    // pass starts AFTER the caller's cursor (the previous pass's last scanned seq) and wraps,
+    // guaranteeing every pending is visited within ceil(pending/batch) passes. One-shot callers
+    // pass `start_after_seq = 0` (seq starts at 1, so 0 ⇒ plain oldest-first).
+    let drm_pendings: Vec<_> = ledger
+        .pending()
+        .into_iter()
+        .filter(|r| parse_drm_tx(&r.rail_note).is_some())
+        .collect();
+    let split = match start_after_seq {
+        Some(cursor) => drm_pendings.partition_point(|r| r.seq <= cursor),
+        None => 0,
+    };
+    let rotated = drm_pendings[split..].iter().chain(&drm_pendings[..split]);
+    for record in rotated {
+        // Per-tick bound (Sprint 37): the scheduler must never stall a process on an unbounded
+        // pending set. Entries beyond the cap are COUNTED as skipped (never silently dropped) —
+        // the rotation above guarantees the next pass reaches them.
+        if summary.scanned() >= max_entries {
+            summary.skipped += 1;
+            continue;
+        }
+        summary.next_cursor = Some(record.seq);
+        // Panic isolation (Sprint 37): one poisoned entry (a confirmer or reconcile panic) must
+        // hold THAT entry Pending and let the tick continue — a scheduler that dies on entry k
+        // silently abandons entries k+1.. until a restart. The money core inside is already
+        // rollback-disciplined; the catch only converts an abort into hold-and-continue.
+        let key = record.idempotency_key.clone();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reconcile_one_drm_pending(ledger, meter, audit_log, confirmer, record)
+        })) {
+            Ok(EntryOutcome::Promoted) => summary.promoted += 1,
+            Ok(EntryOutcome::Refunded) => summary.refunded += 1,
+            Ok(EntryOutcome::LeftPending) => summary.left_pending += 1,
+            // A panic mid-entry (council S37 red-team F3): the durable ledger is the truth about
+            // what actually landed before the abort — account by what it says, never by hope.
+            Err(_) => match ledger.get(&key).map(|r| r.status) {
+                Some(crate::payment_ledger::PaymentStatus::Pending) | None => {
+                    tracing::error!(
+                        key = %key,
+                        "DRM reconcile PANICKED on this entry — held Pending, tick continues"
+                    );
+                    summary.left_pending += 1;
+                }
+                Some(crate::payment_ledger::PaymentStatus::ResolvedCharged) => {
+                    // The resolve landed durably before the abort; the charge stands (the
+                    // receipt binding is best-effort anyway). Honest count: promoted.
+                    tracing::error!(
+                        key = %key,
+                        "DRM reconcile panicked AFTER the durable charge resolution — the \
+                         promotion stands; the receipt rail_ref binding may be missing"
+                    );
+                    summary.promoted += 1;
+                }
+                Some(status) => {
+                    // Resolved not-charged (or another terminal) before the abort — the refund
+                    // may or may not have applied. This is a MONEY-STATE DIVERGENCE alarm, not
+                    // a silent hold: the entry is no longer Pending, so no pass will retry it.
+                    tracing::error!(
+                        key = %key,
+                        ?status,
+                        "DRM reconcile panicked AFTER the durable resolution — verify the \
+                         refund on the meter (refund_applied forensics) — MONEY-STATE ALARM"
+                    );
+                    summary.refunded += 1;
+                }
+            },
+        }
+    }
+    summary
+}
+
+/// What one pending DRM entry resolved to in one pass.
+enum EntryOutcome {
+    Promoted,
+    Refunded,
+    LeftPending,
+}
+
+/// Resolve ONE pending DRM entry against the chain verdict — the per-entry body of
+/// [`reconcile_drm_confirmations`], extracted so the loop's bounding/panic-isolation policy stays
+/// separate from the money movement (which all flows through `reconcile_payment_core`).
+fn reconcile_one_drm_pending(
+    ledger: &crate::payment_ledger::PaymentLedger,
+    meter: &elastos_runtime::primitives::spend::SpendMeter,
+    audit_log: &elastos_runtime::primitives::audit::AuditLog,
+    confirmer: &dyn DrmConfirmer,
+    record: &crate::payment_ledger::PaymentRecord,
+) -> EntryOutcome {
     use elastos_runtime::capability::token::TokenId;
     use elastos_runtime::capability::ResourceId;
 
-    let mut summary = DrmReconcileSummary::default();
-    for record in ledger.pending() {
-        let Some(tx) = parse_drm_tx(&record.rail_note).map(str::to_string) else {
-            continue; // not a DRM pending entry — leave it for the operator surface
-        };
-        // Confirmed and Reverted share one reconcile spine — only `charged` and the receipt
-        // binding differ, so the arms stay a single code path that cannot drift apart.
-        let charged = match confirmer.confirm(&tx) {
-            DrmConfirmation::Unconfirmed(_) => {
-                summary.left_pending += 1;
-                continue;
-            }
-            DrmConfirmation::Confirmed => true,
-            DrmConfirmation::Reverted => false,
-        };
-        let input = crate::api::handlers::capability::ReconcilePaymentInput {
-            idempotency_key: record.idempotency_key.clone(),
-            charged,
-        };
-        match crate::api::handlers::capability::reconcile_payment_core(
-            ledger, meter, audit_log, input,
-        ) {
-            Ok(_) if charged => {
-                summary.promoted += 1;
-                // Bind the confirmed settlement onto the mandate's receipt: a token-keyed,
-                // signed CapabilityUse carrying the DRM rail_ref (success=true). This is
-                // the S35 half that makes the receipt reflect the CONFIRMED tx, not the
-                // mere broadcast. Best-effort (mirrors the dispatch-path use record): a
-                // lost emit under-reports in the receipt, but the payment_reconciled event
-                // + the ledger already durably record the promotion.
-                if let Some(token_id) = record
-                    .token_id
-                    .as_deref()
-                    .and_then(|h| TokenId::from_hex(h.trim()).ok())
-                {
-                    let resource =
-                        format!("{}{}", crate::intent_executor::PAY_PREFIX, record.payee);
-                    audit_log.capability_use_with_rail_ref(
-                        &token_id,
-                        &record.capsule,
-                        &ResourceId::new(resource),
-                        elastos_runtime::capability::Action::Execute,
-                        true,
-                        Some(record.rail_note.clone()),
-                    );
-                }
-            }
-            Ok(_) => summary.refunded += 1,
-            Err((_, e)) => {
-                tracing::error!(
-                    key = %record.idempotency_key,
-                    charged,
-                    "DRM verdict could not be reconciled: {e}"
+    let Some(tx) = parse_drm_tx(&record.rail_note).map(str::to_string) else {
+        return EntryOutcome::LeftPending; // caller filtered; defensive
+    };
+    // Confirmed and Reverted share one reconcile spine — only `charged` and the receipt
+    // binding differ, so the arms stay a single code path that cannot drift apart.
+    let charged = match confirmer.confirm(&tx) {
+        DrmConfirmation::Unconfirmed(_) => return EntryOutcome::LeftPending,
+        DrmConfirmation::Confirmed => true,
+        DrmConfirmation::Reverted => false,
+    };
+    let input = crate::api::handlers::capability::ReconcilePaymentInput {
+        idempotency_key: record.idempotency_key.clone(),
+        charged,
+    };
+    match crate::api::handlers::capability::reconcile_payment_core(ledger, meter, audit_log, input)
+    {
+        Ok(_) if charged => {
+            // Bind the confirmed settlement onto the mandate's receipt: a token-keyed,
+            // signed CapabilityUse carrying the DRM rail_ref (success=true). This is
+            // the S35 half that makes the receipt reflect the CONFIRMED tx, not the
+            // mere broadcast. Best-effort (mirrors the dispatch-path use record): a
+            // lost emit under-reports in the receipt, but the payment_reconciled event
+            // + the ledger already durably record the promotion.
+            if let Some(token_id) = record
+                .token_id
+                .as_deref()
+                .and_then(|h| TokenId::from_hex(h.trim()).ok())
+            {
+                let resource = format!("{}{}", crate::intent_executor::PAY_PREFIX, record.payee);
+                audit_log.capability_use_with_rail_ref(
+                    &token_id,
+                    &record.capsule,
+                    &ResourceId::new(resource),
+                    elastos_runtime::capability::Action::Execute,
+                    true,
+                    Some(record.rail_note.clone()),
                 );
-                summary.left_pending += 1;
             }
+            EntryOutcome::Promoted
         }
+        Ok(_) => EntryOutcome::Refunded,
+        Err((_, e)) => {
+            tracing::error!(
+                key = %record.idempotency_key,
+                charged,
+                "DRM verdict could not be reconciled: {e}"
+            );
+            EntryOutcome::LeftPending
+        }
+    }
+}
+
+/// One SCHEDULER tick (Sprint 37): the same reconciliation pass the manual path runs — zero new
+/// money-moving code — plus the tick's observability: when the pass SETTLED anything (promoted or
+/// refunded), a `Custom` `drm_reconcile_tick` event is appended BEST-EFFORT to the signed chain
+/// (a failed emit is logged and never blocks the tick; the per-entry `payment_reconciled` events
+/// remain the durable money attestation). Held-only re-polls stay off the chain (council S37
+/// red-team F2): a stuck pending re-polled every tick forever must not grow the signed, fsync'd
+/// chain by one event per tick — nothing attestable changed.
+pub fn drm_reconcile_tick(
+    ledger: &crate::payment_ledger::PaymentLedger,
+    meter: &elastos_runtime::primitives::spend::SpendMeter,
+    audit_log: &elastos_runtime::primitives::audit::AuditLog,
+    confirmer: &dyn DrmConfirmer,
+    max_entries: usize,
+    start_after_seq: Option<u64>,
+) -> DrmReconcileSummary {
+    let summary = reconcile_drm_confirmations(
+        ledger,
+        meter,
+        audit_log,
+        confirmer,
+        max_entries,
+        start_after_seq,
+    );
+    if summary.promoted > 0 || summary.refunded > 0 {
+        audit_log.emit_best_effort(elastos_runtime::primitives::audit::AuditEvent::Custom {
+            event_type: "drm_reconcile_tick".to_string(),
+            details: serde_json::json!({
+                "promoted": summary.promoted,
+                "refunded": summary.refunded,
+                "left_pending": summary.left_pending,
+                "skipped": summary.skipped,
+            }),
+        });
     }
     summary
 }
@@ -536,8 +662,22 @@ pub struct DrmReconcileSummary {
     pub promoted: usize,
     /// Reverted tx refunded.
     pub refunded: usize,
-    /// Still unconfirmed (or a reconcile error) — left Pending, retried next pass.
+    /// Still unconfirmed (or a reconcile error/panic) — left Pending, retried next pass.
     pub left_pending: usize,
+    /// DRM pendings beyond this pass's `max_entries` bound — untouched, next pass's work
+    /// (reached via the rotating cursor).
+    pub skipped: usize,
+    /// The `seq` of the LAST entry this pass scanned — the caller's next `start_after_seq`, so
+    /// successive bounded passes rotate over the whole pending set. `None` ⇒ nothing scanned
+    /// (keep the previous cursor).
+    pub next_cursor: Option<u64>,
+}
+
+impl DrmReconcileSummary {
+    /// How many DRM pendings this pass actually processed (everything but `skipped`).
+    pub fn scanned(&self) -> usize {
+        self.promoted + self.refunded + self.left_pending
+    }
 }
 
 /// Whether a `buy_access` error string PROVABLY describes a refusal BEFORE any broadcast — the ONLY
@@ -1025,7 +1165,7 @@ mod tests {
         verdicts.insert("0xHO".to_string(), DrmConfirmation::Unconfirmed("mempool".to_string()));
         let confirmer = MockConfirmer(verdicts);
 
-        let summary = reconcile_drm_confirmations(&ledger, &meter, &audit, &confirmer);
+        let summary = reconcile_drm_confirmations(&ledger, &meter, &audit, &confirmer, usize::MAX, None);
         assert_eq!(summary.promoted, 1);
         assert_eq!(summary.refunded, 1);
         assert_eq!(summary.left_pending, 1);
@@ -1051,10 +1191,206 @@ mod tests {
 
         // A second pass is idempotent — the resolved entries are no longer Pending, only the
         // holding one is re-polled (still unconfirmed).
-        let again = reconcile_drm_confirmations(&ledger, &meter, &audit, &confirmer);
+        let again = reconcile_drm_confirmations(&ledger, &meter, &audit, &confirmer, usize::MAX, None);
         assert_eq!(again.promoted, 0);
         assert_eq!(again.refunded, 0, "no double refund");
         assert_eq!(again.left_pending, 1);
         assert_eq!(meter.remaining("vm-shop"), 600, "no double refund on the meter");
+    }
+
+    /// Seed `n` pending DRM buys (`flint-b0..`, txs `0xB0..`), each with a reservation.
+    fn seed_pendings(
+        ledger: &crate::payment_ledger::PaymentLedger,
+        meter: &elastos_runtime::primitives::spend::SpendMeter,
+        n: usize,
+    ) {
+        use crate::payment_ledger::PaymentStatus;
+        for i in 0..n {
+            meter.try_debit("vm-shop", 10).unwrap();
+            assert!(ledger.record_with_token(
+                &format!("flint-b{i}"),
+                "vm-shop",
+                "QmAsset",
+                10,
+                PaymentStatus::Pending,
+                &format!("drm:tx=0xB{i};op=0xop;tid=7"),
+                Some("00000000000000000000000000000001"),
+            ));
+        }
+    }
+
+    /// Sprint 37 ratchet: one tick processes at most `max_entries` DRM pendings — OLDEST-FIRST —
+    /// and REPORTS the overflow as `skipped` (never silently dropped); successive ticks drain the
+    /// rest. The bound is availability protection, never a money decision.
+    #[test]
+    fn a_tick_is_bounded_oldest_first_and_reports_what_it_skipped() {
+        use crate::payment_ledger::{PaymentLedger, PaymentStatus};
+        use elastos_runtime::primitives::audit::AuditLog;
+        use elastos_runtime::primitives::spend::SpendMeter;
+
+        let ledger = PaymentLedger::new();
+        let meter = SpendMeter::new();
+        let audit = AuditLog::new();
+        meter.set_budget("vm-shop", 1000).unwrap();
+        seed_pendings(&ledger, &meter, 3);
+        let confirmer = MockConfirmer(
+            (0..3)
+                .map(|i| (format!("0xB{i}"), DrmConfirmation::Confirmed))
+                .collect(),
+        );
+
+        let first = drm_reconcile_tick(&ledger, &meter, &audit, &confirmer, 2, None);
+        assert_eq!(first.promoted, 2, "the tick promotes only up to the bound");
+        assert_eq!(first.skipped, 1, "the overflow is COUNTED, not silently dropped");
+        // Oldest-first: b0 and b1 (lowest seq) resolved; b2 still pending.
+        assert_eq!(ledger.get("flint-b0").unwrap().status, PaymentStatus::ResolvedCharged);
+        assert_eq!(ledger.get("flint-b1").unwrap().status, PaymentStatus::ResolvedCharged);
+        assert_eq!(ledger.get("flint-b2").unwrap().status, PaymentStatus::Pending);
+
+        let second = drm_reconcile_tick(&ledger, &meter, &audit, &confirmer, 2, None);
+        assert_eq!(second.promoted, 1, "the next tick drains the remainder");
+        assert_eq!(second.skipped, 0);
+        let third = drm_reconcile_tick(&ledger, &meter, &audit, &confirmer, 2, None);
+        assert_eq!(third, DrmReconcileSummary::default(), "a drained ledger is a silent tick");
+    }
+
+    /// A confirmer that PANICS on one scripted tx and confirms every other.
+    struct PanickingConfirmer {
+        panic_on: String,
+    }
+    impl DrmConfirmer for PanickingConfirmer {
+        fn confirm(&self, tx_hash: &str) -> DrmConfirmation {
+            assert!(tx_hash != self.panic_on, "scripted confirmer panic on {tx_hash}");
+            DrmConfirmation::Confirmed
+        }
+    }
+
+    /// Sprint 37 ratchet: a PANIC on one entry holds THAT entry Pending and the tick CONTINUES —
+    /// a poisoned entry can never blind the scheduler to everything behind it, and it can never
+    /// auto-charge or refund (hold is the only panic outcome).
+    #[test]
+    fn a_panicking_confirmer_holds_that_entry_and_the_tick_continues() {
+        use crate::payment_ledger::{PaymentLedger, PaymentStatus};
+        use elastos_runtime::primitives::audit::AuditLog;
+        use elastos_runtime::primitives::spend::SpendMeter;
+
+        let ledger = PaymentLedger::new();
+        let meter = SpendMeter::new();
+        let audit = AuditLog::new();
+        meter.set_budget("vm-shop", 1000).unwrap();
+        seed_pendings(&ledger, &meter, 3);
+        let confirmer = PanickingConfirmer {
+            panic_on: "0xB1".to_string(),
+        };
+        let reserved_before = meter.remaining("vm-shop");
+
+        let summary = drm_reconcile_tick(&ledger, &meter, &audit, &confirmer, usize::MAX, None);
+        assert_eq!(summary.promoted, 2, "the entries around the poisoned one still resolve");
+        assert_eq!(summary.left_pending, 1, "the poisoned entry is HELD, not decided");
+        assert_eq!(
+            ledger.get("flint-b1").unwrap().status,
+            PaymentStatus::Pending,
+            "a panic is a HOLD — never a charge, never a refund"
+        );
+        assert_eq!(
+            meter.remaining("vm-shop"),
+            reserved_before,
+            "no reservation moved for the poisoned entry (the promoted spends stand)"
+        );
+    }
+
+    /// Sprint 37 ratchet (emit rule refined by the council fold, red-team F2): a tick that
+    /// SETTLED anything (promoted/refunded) is attested on the chain; a held-only re-poll and an
+    /// idle tick are both silent — a stuck pending re-polled forever must not grow the signed,
+    /// fsync'd chain by one event per tick.
+    #[test]
+    fn only_a_settling_tick_is_attested_held_and_idle_ticks_are_silent() {
+        use crate::payment_ledger::PaymentLedger;
+        use elastos_runtime::primitives::audit::{AuditEvent, AuditLog};
+        use elastos_runtime::primitives::spend::SpendMeter;
+
+        let ledger = PaymentLedger::new();
+        let meter = SpendMeter::new();
+        let audit = AuditLog::new();
+        meter.set_budget("vm-shop", 1000).unwrap();
+
+        let count_tick_events = |audit: &AuditLog| {
+            audit
+                .recent_events(256)
+                .into_iter()
+                .filter(|e| {
+                    matches!(e, AuditEvent::Custom { event_type, .. }
+                        if event_type == "drm_reconcile_tick")
+                })
+                .count()
+        };
+
+        // Idle tick: nothing pending ⇒ no event.
+        let unscripted = MockConfirmer(std::collections::HashMap::new());
+        drm_reconcile_tick(&ledger, &meter, &audit, &unscripted, usize::MAX, None);
+        assert_eq!(count_tick_events(&audit), 0, "an idle tick emits nothing");
+
+        // Held-only ticks: one pending re-polled and HELD ⇒ still no event, however many times.
+        seed_pendings(&ledger, &meter, 1);
+        let held = drm_reconcile_tick(&ledger, &meter, &audit, &unscripted, usize::MAX, None);
+        assert_eq!(held.left_pending, 1, "unscripted verdict ⇒ held");
+        drm_reconcile_tick(&ledger, &meter, &audit, &unscripted, usize::MAX, None);
+        assert_eq!(count_tick_events(&audit), 0, "held-only re-polls stay off the chain");
+
+        // Settling tick: the entry confirms ⇒ exactly one summary event.
+        let confirming = MockConfirmer(
+            [("0xB0".to_string(), DrmConfirmation::Confirmed)]
+                .into_iter()
+                .collect(),
+        );
+        let settled = drm_reconcile_tick(&ledger, &meter, &audit, &confirming, usize::MAX, None);
+        assert_eq!(settled.promoted, 1);
+        assert_eq!(count_tick_events(&audit), 1, "a settling tick is attested");
+    }
+
+    /// Sprint 37 council fold (F1 — head-of-line starvation): with batch=1, a permanently
+    /// Unconfirmed OLDEST entry must not starve a confirmable entry behind it — the rotating
+    /// cursor reaches the second entry on the second tick and promotes it, then wraps.
+    #[test]
+    fn a_stuck_oldest_entry_cannot_starve_the_entries_behind_it() {
+        use crate::payment_ledger::{PaymentLedger, PaymentStatus};
+        use elastos_runtime::primitives::audit::AuditLog;
+        use elastos_runtime::primitives::spend::SpendMeter;
+
+        let ledger = PaymentLedger::new();
+        let meter = SpendMeter::new();
+        let audit = AuditLog::new();
+        meter.set_budget("vm-shop", 1000).unwrap();
+        seed_pendings(&ledger, &meter, 2); // b0 oldest (stuck forever), b1 behind it (confirmable)
+        let confirmer = MockConfirmer(
+            [("0xB1".to_string(), DrmConfirmation::Confirmed)]
+                .into_iter()
+                .collect(), // 0xB0 unscripted ⇒ Unconfirmed forever
+        );
+
+        // Tick 1 (cursor 0): the batch of 1 is consumed by the stuck oldest entry.
+        let first = drm_reconcile_tick(&ledger, &meter, &audit, &confirmer, 1, None);
+        assert_eq!(first.left_pending, 1, "the stuck entry is held");
+        assert_eq!(first.skipped, 1, "the confirmable entry waits — counted, not dropped");
+        let cursor = first.next_cursor.expect("the pass scanned something");
+
+        // Tick 2 (cursor after the stuck entry): rotation reaches b1 — no starvation.
+        let second = drm_reconcile_tick(&ledger, &meter, &audit, &confirmer, 1, Some(cursor));
+        assert_eq!(second.promoted, 1, "the entry BEHIND the stuck one is promoted");
+        assert_eq!(
+            ledger.get("flint-b1").unwrap().status,
+            PaymentStatus::ResolvedCharged
+        );
+        // Tick 3 wraps back to the stuck entry (still held) — the rotation covers everything.
+        let third = drm_reconcile_tick(
+            &ledger,
+            &meter,
+            &audit,
+            &confirmer,
+            1,
+            Some(second.next_cursor.unwrap()),
+        );
+        assert_eq!(third.left_pending, 1, "the wrap re-polls the stuck entry");
+        assert_eq!(ledger.get("flint-b0").unwrap().status, PaymentStatus::Pending);
     }
 }
