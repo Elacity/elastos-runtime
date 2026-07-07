@@ -8,14 +8,10 @@ pub mod metrics;
 pub mod spend;
 pub mod time;
 
-#[allow(unused_imports)]
 pub use audit::{
     verify_mandate_receipt, AuditEvent, AuditLog, ChainAttestation, MandateReceipt,
     MandateReceiptScope, MandateReceiptVerdict,
 };
-#[allow(unused_imports)]
 pub use metrics::CapsuleMetrics;
-#[allow(unused_imports)]
 pub use spend::{BudgetSnapshot, SpendError, SpendMeter, SpendUnits};
-#[allow(unused_imports)]
 pub use time::SecureTimestamp;

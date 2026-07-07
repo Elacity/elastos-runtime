@@ -458,8 +458,11 @@ impl SpendMeter {
     /// Provision `key` with `limit` ONLY if it has no budget yet (idempotent first-touch). Unlike
     /// [`set_budget`](Self::set_budget) this NEVER disturbs an existing budget's limit or spent — so
     /// it is safe to call on every act to lazily provision a per-capsule default without ever
-    /// resetting accumulated spend. Durable mode: persists only when it actually inserted; a persist
-    /// failure rolls the insert back (the key stays unprovisioned ⇒ fail-closed `NoBudget` on debit).
+    /// resetting accumulated spend. Durable mode: persists only when it actually inserted; a
+    /// PRE-publish persist failure rolls the insert back (the key stays unprovisioned ⇒ fail-closed
+    /// `NoBudget` on debit), while a POST-publish failure poisons the meter and reports `Poisoned`
+    /// — the insert IS published, so claiming a rollback would be a lie (same rule as
+    /// [`set_budget`](Self::set_budget), S29 F1).
     pub fn ensure_budget(&self, key: &str, limit: SpendUnits) -> Result<(), SpendError> {
         self.refuse_if_poisoned()?;
         let mut balances = match self.balances.write() {
@@ -477,8 +480,9 @@ impl SpendMeter {
                 Err(SpendError::Persist)
             }
             Err(PersistFailure::PostPublish) => {
+                // The insert IS published; `Persist` would falsely claim a rollback (S29 F1).
                 self.poison();
-                Err(SpendError::Persist)
+                Err(SpendError::Poisoned)
             }
         }
     }
@@ -1051,6 +1055,29 @@ mod tests {
         let reopened = SpendMeter::open_durable(path).unwrap();
         assert!(!reopened.is_poisoned());
         assert_eq!(reopened.remaining("vm-ap-agent"), 300);
+    }
+
+    #[test]
+    fn ensure_budget_post_publish_failure_reports_poisoned_not_persist() {
+        // The same S29 F1 honesty rule as set_budget/try_debit: a persist that fails AFTER the
+        // rename published the snapshot must not claim a rollback — the insert IS live in memory
+        // and on the visible disk, so the honest variant is `Poisoned`, never `Persist`.
+        let dir = tempfile::tempdir().unwrap();
+        let meter = SpendMeter::open_durable(dir.path().join("spend_meter.json")).unwrap();
+        meter
+            .fail_parent_fsync
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            meter.ensure_budget("vm-ap-agent", 500).unwrap_err(),
+            SpendError::Poisoned,
+            "the insert IS published — `Persist` (\"rolled back\") would be a lie"
+        );
+        assert!(meter.is_poisoned());
+        assert_eq!(
+            meter.remaining("vm-ap-agent"),
+            500,
+            "memory keeps the published insert — it matches the visible disk"
+        );
     }
 
     #[test]

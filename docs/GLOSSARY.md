@@ -203,3 +203,45 @@ remain provider authority, while Library/Home show the mounted WebSpace view.
 Mutable WebSpace mounts/forks can also materialize local provider-owned objects
 with explicit access-policy metadata; that local materialization is provider
 state, not a raw app-visible filesystem alias.
+
+## Flint
+
+The mandate/payment engine inside the ElastOS runtime — "give your agent a mandate, not your
+keys." Entry point: [FLINT_MANDATE_ENGINE.md](FLINT_MANDATE_ENGINE.md).
+
+## Mandate (Standing Grant)
+
+Scoped, expiring, revocable authority an operator grants an AI agent: a signed capability token
+plus an authorized method envelope (and optionally a bound agent key). "Mandate" is the product
+noun; the API says "standing grant"; the audit chain records `CapabilityGrant`/`CapabilityUse`.
+All three are the same object.
+
+## Responsible Entity
+
+The DID the operator DECLARES accountable for every act under a mandate, recorded verbatim on the
+signed grant record and carried into the receipt. Operator-asserted, not attested — it proves the
+operator's declaration, not the entity's consent.
+
+## Mandate Receipt
+
+A portable, self-contained export of a mandate's signed audit records (grant, acts, revocation),
+verifiable off-box with `elastos verify-receipt` — no runtime, no trust in the exporting box.
+
+## Spend Unit
+
+The abstract unit the spend meter caps in. On the DRM rail, `ELASTOS_DRM_SPEND_UNIT` declares how
+many pay-token smallest-units one spend unit equals, making the cap a literal on-chain ceiling.
+
+## Rail / rail_ref
+
+A payment rail is a `PaymentProvider` implementation (HTTPS adapter, DRM marketplace, dev mock).
+`rail_ref` is the rail's settlement reference — for a DRM buy,
+`drm:tx=<hash>;op=<operative>;tid=<tokenId>;price=<price>;tok=<pay_token>` — bound onto the signed
+`CapabilityUse` (and thus the receipt) once the settlement is CONFIRMED.
+
+## Pending / Indeterminate (payments)
+
+A rail outcome is *indeterminate* when the charge may or may not have posted (timeout, 5xx,
+broadcast-not-yet-confirmed); the reservation is KEPT and a *Pending* ledger entry custodies the
+obligation until it is resolved exactly once (refund or confirm). Fail-closed: money that may have
+moved is never refunded against.

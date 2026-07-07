@@ -75,6 +75,10 @@ pub struct IntentDeclarationV1 {
 }
 
 impl IntentDeclarationV1 {
+    /// The signature preimage. FROZEN: signer and verifier must hash identical bytes forever —
+    /// length-prefixed fields under a domain tag, then `declared_at` as its serde-JSON encoding.
+    /// That couples the preimage to [`SecureTimestamp`]'s JSON shape (field order/names in
+    /// `elastos-common`), which is therefore frozen too — a ratchet test pins the exact bytes.
     fn signable_digest(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(INTENT_SIG_DOMAIN);
@@ -92,7 +96,10 @@ impl IntentDeclarationV1 {
             hasher.update((field.len() as u64).to_le_bytes());
             hasher.update(field.as_bytes());
         }
-        let ts = serde_json::to_vec(&self.declared_at).unwrap_or_default();
+        // Serializing two u64 fields cannot fail; a silent empty-bytes fallback here would be a
+        // fail-OPEN idiom inside a signing path, so refuse loudly if the impossible happens.
+        let ts = serde_json::to_vec(&self.declared_at)
+            .expect("SecureTimestamp JSON encoding is infallible (two u64 fields)");
         hasher.update((ts.len() as u64).to_le_bytes());
         hasher.update(&ts);
         hasher.finalize().into()
@@ -499,6 +506,8 @@ pub struct IntentReconciliationV1 {
 }
 
 impl IntentReconciliationV1 {
+    /// FROZEN preimage — same rules (and the same `SecureTimestamp` JSON coupling) as
+    /// [`IntentDeclarationV1::signable_digest`].
     fn signable_digest(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(RECONCILE_SIG_DOMAIN);
@@ -513,7 +522,9 @@ impl IntentReconciliationV1 {
             hasher.update((field.len() as u64).to_le_bytes());
             hasher.update(field.as_bytes());
         }
-        let ts = serde_json::to_vec(&self.reconciled_at).unwrap_or_default();
+        // Infallible for two u64 fields; never silently hash empty bytes in a signing path.
+        let ts = serde_json::to_vec(&self.reconciled_at)
+            .expect("SecureTimestamp JSON encoding is infallible (two u64 fields)");
         hasher.update((ts.len() as u64).to_le_bytes());
         hasher.update(&ts);
         hasher.finalize().into()
@@ -1659,16 +1670,11 @@ impl StandingGrantService {
                 ));
             }
         }
-        // Service-layer bound on the responsible entity (council S32 F6): the same ≤256 + charset
-        // discipline the HTTP surface applies, re-checked at the choke point so a non-HTTP caller
-        // can't smuggle an unbounded/hostile blob onto the signed chain. Syntactic only — never
-        // authentication.
+        // Service-layer bound on the responsible entity (council S32 F6): the shared syntactic
+        // bound, re-checked at the choke point so a non-HTTP caller can't smuggle an
+        // unbounded/hostile blob onto the signed chain. Syntactic only — never authentication.
         if let Some(e) = responsible_entity.as_deref() {
-            if e.len() > 256
-                || !e
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '-' | '_' | '%'))
-            {
+            if !crate::capability::responsible_entity_syntax_ok(e) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "responsible_entity must be ≤256 chars of DID charset",
@@ -2256,19 +2262,48 @@ mod tests {
 
     #[test]
     fn every_denial_reason_has_a_stable_string() {
-        for (denial, expected) in [
-            (EnvelopeDenial::Revoked, "revoked"),
-            (EnvelopeDenial::Expired, "expired"),
-            (EnvelopeDenial::WrongCapsule, "wrong_capsule"),
-            (
-                EnvelopeDenial::MethodNotInEnvelope,
-                "method_not_in_envelope",
-            ),
-            (EnvelopeDenial::WrongResource, "wrong_resource"),
-            (EnvelopeDenial::WrongAction, "wrong_action"),
-        ] {
+        // EXHAUSTIVE by construction: the match below fails to compile when a variant is added,
+        // forcing its stable on-chain string to be pinned here too.
+        let all = [
+            EnvelopeDenial::Revoked,
+            EnvelopeDenial::Expired,
+            EnvelopeDenial::WrongCapsule,
+            EnvelopeDenial::WrongAgent,
+            EnvelopeDenial::MethodNotInEnvelope,
+            EnvelopeDenial::WrongResource,
+            EnvelopeDenial::WrongAction,
+            EnvelopeDenial::NoGrant,
+        ];
+        for denial in all {
+            let expected = match denial {
+                EnvelopeDenial::Revoked => "revoked",
+                EnvelopeDenial::Expired => "expired",
+                EnvelopeDenial::WrongCapsule => "wrong_capsule",
+                EnvelopeDenial::WrongAgent => "wrong_agent",
+                EnvelopeDenial::MethodNotInEnvelope => "method_not_in_envelope",
+                EnvelopeDenial::WrongResource => "wrong_resource",
+                EnvelopeDenial::WrongAction => "wrong_action",
+                EnvelopeDenial::NoGrant => "no_standing_grant",
+            };
             assert_eq!(denial.as_str(), expected);
         }
+    }
+
+    #[test]
+    fn the_signature_preimage_timestamp_encoding_is_frozen() {
+        // `signable_digest` hashes `declared_at`/`reconciled_at` as serde-JSON, so
+        // `SecureTimestamp`'s JSON shape (field names AND order, from elastos-common) is part of
+        // every existing signature's preimage: change it and every previously signed intent stops
+        // verifying. Pin the exact bytes.
+        let ts = SecureTimestamp {
+            unix_secs: 1_700_000_000,
+            monotonic_seq: 42,
+        };
+        assert_eq!(
+            serde_json::to_string(&ts).unwrap(),
+            r#"{"unix_secs":1700000000,"monotonic_seq":42}"#,
+            "SecureTimestamp's JSON encoding is FROZEN into the intent-signature preimage"
+        );
     }
 
     #[test]

@@ -1016,6 +1016,29 @@ mod tests {
         )));
     }
 
+    /// Save the named env vars, REMOVE them for the test, and restore the originals on drop —
+    /// the one shared guard for env-mutating pay-rail tests (hold the right lock(s) first).
+    struct EnvGuard(Vec<(&'static str, Option<String>)>);
+    impl EnvGuard {
+        fn capture(keys: &[&'static str]) -> Self {
+            let saved = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+            for k in keys {
+                std::env::remove_var(k);
+            }
+            Self(saved)
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
     /// Council S31 G-F10: the boot rail selection was extractable and untested. One SEQUENTIAL
     /// test (env vars are process-global) covering: unset ⇒ unwired; mock ⇒ durable stores;
     /// second build in the same data_dir ⇒ flock-refused ⇒ unwired; plaintext non-loopback real
@@ -1023,26 +1046,14 @@ mod tests {
     #[test]
     fn build_pay_rail_selects_fail_closed() {
         let _serial = PAY_RAIL_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        struct EnvGuard(Vec<(&'static str, Option<String>)>);
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                for (k, v) in &self.0 {
-                    match v {
-                        Some(v) => std::env::set_var(k, v),
-                        None => std::env::remove_var(k),
-                    }
-                }
-            }
-        }
-        let keys = [
+        // ELASTOS_PAYMENT_RAIL is guarded too: an inherited `=drm` from the shell would silently
+        // flip every assertion below into the DRM branch.
+        let _guard = EnvGuard::capture(&[
+            "ELASTOS_PAYMENT_RAIL",
             "ELASTOS_PAYMENT_ENDPOINT",
             "ELASTOS_PAYMENT_TOKEN",
             "ELASTOS_ALLOW_MOCK_PAYMENTS",
-        ];
-        let _guard = EnvGuard(keys.iter().map(|k| (*k, std::env::var(k).ok())).collect());
-        for k in keys {
-            std::env::remove_var(k);
-        }
+        ]);
 
         // No envs ⇒ honestly unwired.
         let dir = tempfile::tempdir().unwrap();
@@ -1086,30 +1097,20 @@ mod tests {
     /// wires ONLY with the explicit `ELASTOS_ALLOW_MOCK_PAYMENTS` opt-in, else stays UNWIRED.
     #[test]
     fn drm_rail_obeys_the_mock_money_discipline() {
+        // LOCK ORDER: the crate-wide ddrm env lock FIRST (this test mutates ELASTOS_DDRM_RIGHTS,
+        // a process-global the rights/mint/owned-ledger authority tests also guard with it —
+        // PAY_RAIL_ENV_LOCK alone only serializes this module against itself), then the pay-rail
+        // lock. Every test that takes both must take them in this order.
+        let _ddrm = crate::api::ddrm_env_lock();
         let _serial = PAY_RAIL_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        struct EnvGuard(Vec<(&'static str, Option<String>)>);
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                for (k, v) in &self.0 {
-                    match v {
-                        Some(v) => std::env::set_var(k, v),
-                        None => std::env::remove_var(k),
-                    }
-                }
-            }
-        }
-        let keys = [
+        let _guard = EnvGuard::capture(&[
             "ELASTOS_PAYMENT_RAIL",
             "ELASTOS_PAYMENT_ENDPOINT",
             "ELASTOS_ALLOW_MOCK_PAYMENTS",
             "ELASTOS_DDRM_RIGHTS",
             "ELASTOS_DRM_SPEND_UNIT",
             "ELASTOS_DRM_PAY_TOKEN",
-        ];
-        let _guard = EnvGuard(keys.iter().map(|k| (*k, std::env::var(k).ok())).collect());
-        for k in keys {
-            std::env::remove_var(k);
-        }
+        ]);
 
         std::env::set_var("ELASTOS_PAYMENT_RAIL", "drm");
 

@@ -178,11 +178,51 @@ impl std::fmt::Display for ResolveError {
             ),
             ResolveError::Persist => write!(
                 f,
-                "resolution could not be durably recorded; the entry stays pending (rolled back)                  — retry"
+                "resolution could not be durably recorded; the entry stays pending (rolled back) — retry"
             ),
             ResolveError::Lock => write!(f, "ledger lock poisoned — retry"),
         }
     }
+}
+
+/// Admission control for a NEW ledger key — the single home of the bounding invariant, shared by
+/// [`PaymentLedger::record_with_token`] and [`PaymentLedger::begin_attempt`]. Returns `false` when
+/// the entry cannot be admitted.
+///
+/// Two rules, in order:
+/// 1. Per-capsule pending bound (council S30 RT-F3): a capsule at its pending cap refuses NEW
+///    pending entries — the blinding is confined to the misbehaving capsule, never a victim's
+///    work list.
+/// 2. Global bound: evict the oldest EVICTABLE entry — a provably-nothing-moved terminal
+///    (`NotCharged`/`ResolvedNotCharged`) ONLY. Money-bearing keys (`Pending`/`Performed`/
+///    `ResolvedCharged`) are NEVER evicted (council S35 guardian F3): evicting a charged key
+///    would let a cross-window re-dispatch find no entry and re-buy. A cap full of money-bearing
+///    entries REFUSES the new insert fail-closed (the pay path then refuses to broadcast) rather
+///    than forgetting a key idempotency depends on.
+fn admit_new_key(records: &mut HashMap<String, PaymentRecord>, capsule: &str, pending: bool) -> bool {
+    if pending
+        && records
+            .values()
+            .filter(|r| r.status == PaymentStatus::Pending && r.capsule == capsule)
+            .count()
+            >= PENDING_PER_CAPSULE_CAP
+    {
+        return false;
+    }
+    while records.len() >= LEDGER_CAP {
+        let oldest_evictable = records
+            .values()
+            .filter(|r| r.status.is_terminal() && !r.status.is_money_bearing())
+            .min_by_key(|r| r.seq)
+            .map(|r| r.idempotency_key.clone());
+        match oldest_evictable {
+            Some(k) => {
+                records.remove(&k);
+            }
+            None => return false,
+        }
+    }
+    true
 }
 
 /// A durable, bounded ledger of rail attempts. All mutations persist snapshot-atomically before
@@ -275,8 +315,13 @@ impl PaymentLedger {
     /// Record one rail attempt. Returns `true` iff the entry is durably recorded — `false` means
     /// the caller's user-facing reason must say "unrecorded; reconcile from the error log"
     /// (a full pending set or a failed persist NEVER blocks the payment's own money semantics).
-    /// A key already present is left untouched (`false`): the first record wins — a replayed key
-    /// cannot rewrite history.
+    /// Insert an entry at a chosen status, without the begin/finalize custody protocol.
+    ///
+    /// TEST/SEEDING ONLY: the production pay path records attempts via
+    /// [`begin_attempt`](Self::begin_attempt) + [`finalize`](Self::finalize) (record-before-
+    /// broadcast), and reconciliation resolves via [`resolve`](Self::resolve). This direct insert
+    /// survives as the way tests seed a ledger into a known state. A key already present is left
+    /// untouched (`false`): the first record wins — a replayed key cannot rewrite history.
     pub fn record(
         &self,
         idempotency_key: &str,
@@ -289,9 +334,9 @@ impl PaymentLedger {
         self.record_with_token(idempotency_key, capsule, payee, amount, status, rail_note, None)
     }
 
-    /// Like [`record`](Self::record) but binds the mandate token (`standing_grant_id`) onto the
-    /// entry (Sprint 35) so a later reconciliation can key the confirmed settlement back onto the
-    /// mandate's receipt. `record` is exactly `record_with_token(.., None)`.
+    /// Like [`record`](Self::record) — TEST/SEEDING ONLY — but binds the mandate token
+    /// (`standing_grant_id`) onto the entry so a later reconciliation can key the confirmed
+    /// settlement back onto the mandate's receipt. `record` is exactly `record_with_token(.., None)`.
     #[allow(clippy::too_many_arguments)]
     pub fn record_with_token(
         &self,
@@ -310,35 +355,8 @@ impl PaymentLedger {
         if records.contains_key(idempotency_key) {
             return false;
         }
-        // Per-capsule pending bound (RT-F3): a capsule at its cap refuses NEW pending entries —
-        // the blinding is confined to the misbehaving capsule, never a victim's work list.
-        if status == PaymentStatus::Pending
-            && records
-                .values()
-                .filter(|r| r.status == PaymentStatus::Pending && r.capsule == capsule)
-                .count()
-                >= PENDING_PER_CAPSULE_CAP
-        {
+        if !admit_new_key(&mut records, capsule, status == PaymentStatus::Pending) {
             return false;
-        }
-        // Bound the map by evicting the oldest EVICTABLE entry — a provably-nothing-moved terminal
-        // (`NotCharged`/`ResolvedNotCharged`) ONLY. Money-bearing keys (`Pending`/`Performed`/
-        // `ResolvedCharged`) are NEVER evicted (council S35 guardian F3): evicting a charged key
-        // would let a cross-window re-dispatch find no entry and re-buy. If the cap is full of
-        // money-bearing entries, a NEW insert is REFUSED fail-closed (the pay path then refuses to
-        // broadcast) rather than forgetting a key idempotency depends on.
-        while records.len() >= LEDGER_CAP {
-            let oldest_evictable = records
-                .values()
-                .filter(|r| r.status.is_terminal() && !r.status.is_money_bearing())
-                .min_by_key(|r| r.seq)
-                .map(|r| r.idempotency_key.clone());
-            match oldest_evictable {
-                Some(k) => {
-                    records.remove(&k);
-                }
-                None => return false, // cap full of money-bearing entries — refuse, stay bounded
-            }
         }
         let seq = self
             .next_seq
@@ -392,42 +410,24 @@ impl PaymentLedger {
             if existing.status.is_money_bearing() {
                 return BeginAttempt::AlreadyActive(existing.status);
             }
-            // A provably-nothing-moved terminal ⇒ reopen to Pending for the retry.
-            let prev = existing.status;
+            // A provably-nothing-moved terminal ⇒ reopen to Pending for the retry. Snapshot the
+            // WHOLE prior record so a failed persist restores exact memory⇄disk agreement —
+            // including `rail_note` and the `refund_applied` forensics bit, not just the status.
+            let prev = existing.clone();
             if let Some(r) = records.get_mut(idempotency_key) {
                 r.status = PaymentStatus::Pending;
                 r.rail_note = sanitize_rail_note("reserving");
                 r.refund_applied = false;
             }
             if self.persist_locked(&records).is_err() {
-                if let Some(r) = records.get_mut(idempotency_key) {
-                    r.status = prev; // roll back the reopen
-                }
+                records.insert(idempotency_key.to_string(), prev); // roll back the reopen
                 return BeginAttempt::CapacityRefused;
             }
             return BeginAttempt::Started;
         }
         // New key: the same per-capsule pending cap + money-bearing-aware eviction as `record`.
-        if records
-            .values()
-            .filter(|r| r.status == PaymentStatus::Pending && r.capsule == capsule)
-            .count()
-            >= PENDING_PER_CAPSULE_CAP
-        {
+        if !admit_new_key(&mut records, capsule, true) {
             return BeginAttempt::CapacityRefused;
-        }
-        while records.len() >= LEDGER_CAP {
-            let oldest_evictable = records
-                .values()
-                .filter(|r| r.status.is_terminal() && !r.status.is_money_bearing())
-                .min_by_key(|r| r.seq)
-                .map(|r| r.idempotency_key.clone());
-            match oldest_evictable {
-                Some(k) => {
-                    records.remove(&k);
-                }
-                None => return BeginAttempt::CapacityRefused,
-            }
         }
         let seq = self
             .next_seq
@@ -868,6 +868,30 @@ mod tests {
             ledger.get("k1").unwrap().status,
             PaymentStatus::Pending,
             "an unpersistable resolution rolls back — the refund handle is not lost"
+        );
+    }
+
+    #[test]
+    fn a_failed_reopen_restores_the_whole_prior_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("ledger");
+        std::fs::create_dir(&sub).unwrap();
+        let ledger = PaymentLedger::open_durable(sub.join("payments.json")).unwrap();
+        assert!(ledger.record("k", "vm-ap", "acme", 10, PaymentStatus::Pending, "rail said no"));
+        ledger.resolve("k", false).unwrap();
+        assert!(ledger.mark_refund_applied("k"));
+        let before = ledger.get("k").unwrap();
+        std::fs::remove_dir_all(&sub).unwrap();
+        assert_eq!(
+            ledger.begin_attempt("k", "vm-ap", "acme", 10, None),
+            BeginAttempt::CapacityRefused,
+            "an unpersistable reopen is refused"
+        );
+        let after = ledger.get("k").unwrap();
+        assert_eq!(
+            after, before,
+            "a failed reopen restores the WHOLE prior record — status, rail_note, and the \
+             refund-applied forensics bit, not just the status"
         );
     }
 

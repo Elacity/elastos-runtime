@@ -133,10 +133,20 @@ const MONEY_SPENT_GUARD_MAX: usize = 4096;
 const WEB_MAX_SPEND_CAP_DEFAULT: u64 = 1_000_000;
 
 fn web_max_spend_cap() -> u64 {
-    std::env::var("ELASTOS_WEB_MAX_SPEND_CAP")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(WEB_MAX_SPEND_CAP_DEFAULT)
+    match std::env::var("ELASTOS_WEB_MAX_SPEND_CAP") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(cap) => cap,
+            // A typo'd override on a money ceiling must not fall back in silence.
+            Err(e) => {
+                tracing::warn!(
+                    "ELASTOS_WEB_MAX_SPEND_CAP {raw:?} is not a u64 ({e}) — using the default \
+                     ceiling {WEB_MAX_SPEND_CAP_DEFAULT}"
+                );
+                WEB_MAX_SPEND_CAP_DEFAULT
+            }
+        },
+        Err(_) => WEB_MAX_SPEND_CAP_DEFAULT,
+    }
 }
 
 /// The one launch-token gate every mandates route runs (Sprint 33): accepts the token from the

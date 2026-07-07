@@ -73,15 +73,17 @@ pub struct RequestCapabilityInput {
 
 #[derive(Debug, Serialize)]
 pub struct RequestCapabilityOutput {
-    /// Status: "pending", "granted", or "auto_denied"
+    /// Status: "pending" (queued for user approval) or "denied" (policy refusal). These strings
+    /// are the wire contract — clients branch on them.
     pub status: String,
     /// Request ID (if pending)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
-    /// Capability token (if auto-granted)
+    /// Reserved for an auto-grant path; the request endpoint never auto-grants today (every
+    /// grant goes through user approval), so this is currently always absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
-    /// Reason (if auto-denied)
+    /// Reason (if denied)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -89,9 +91,8 @@ pub struct RequestCapabilityOutput {
 /// POST /api/capability/request
 ///
 /// Request a capability token. Returns immediately with either:
-/// - status: "pending" + request_id (needs user approval)
-/// - status: "granted" + token (auto-granted)
-/// - status: "auto_denied" + reason (policy rejection)
+/// - status: "pending" + request_id (queued for user approval)
+/// - status: "denied" + reason (policy refusal — overbroad resource, system-only backend, ...)
 pub async fn request_capability(
     State(state): State<CapabilityState>,
     Extension(session): Extension<Session>,
@@ -1144,13 +1145,12 @@ pub(crate) fn validate_responsible_entity(raw: Option<&str>) -> Result<Option<St
              garbage"
         ))
     };
-    if did.len() > 256 {
+    if did.len() > elastos_runtime::capability::RESPONSIBLE_ENTITY_MAX_LEN {
         return bad("too long");
     }
-    if !did
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '-' | '_' | '%'))
-    {
+    // The same shared syntactic bound the service-layer choke points re-apply — one home for the
+    // charset, so the surfaces can never drift.
+    if !elastos_runtime::capability::responsible_entity_syntax_ok(did) {
         return bad("illegal character");
     }
     // did:<method>:<msid> — method is a non-empty run of lowercase ASCII alphanumerics; msid is
@@ -3366,20 +3366,6 @@ mod tests {
     fn drm_state(
         dir: &std::path::Path,
         resolver: std::sync::Arc<dyn crate::drm_marketplace::DrmResolver>,
-        settler: std::sync::Arc<WedgeSettler>,
-    ) -> (
-        CapabilityState,
-        std::sync::Arc<elastos_runtime::primitives::spend::SpendMeter>,
-        std::sync::Arc<crate::payment_ledger::PaymentLedger>,
-    ) {
-        drm_state_with_settler(dir, resolver, settler)
-    }
-
-    /// Like [`drm_state`] but takes ANY `DrmSettler` (used by the idempotency ratchet's counter).
-    #[allow(clippy::type_complexity)]
-    fn drm_state_with_settler(
-        dir: &std::path::Path,
-        resolver: std::sync::Arc<dyn crate::drm_marketplace::DrmResolver>,
         settler: std::sync::Arc<dyn crate::drm_marketplace::DrmSettler>,
     ) -> (
         CapabilityState,
@@ -3559,7 +3545,7 @@ mod tests {
             tx_hash: "0xAAA".to_string(),
             count: settle_count.clone(),
         });
-        let (state, meter, ledger) = drm_state_with_settler(
+        let (state, meter, ledger) = drm_state(
             dir.path(),
             std::sync::Arc::new(WedgeResolver(Ok(wedge_binding(asset)))),
             counting,
@@ -3583,7 +3569,6 @@ mod tests {
         assert_eq!(ledger.get(&idem).unwrap().status, crate::payment_ledger::PaymentStatus::Pending);
         // Re-dispatch through the executor directly (the pay closure's ledger guard is what we test;
         // the replay guard is a separate, already-tested layer).
-        use crate::intent_executor::IntentExecutor as _;
         let exec_out = state.intent_executor.execute(&buy);
         match exec_out {
             crate::intent_executor::IntentExecution::Declined { reason } => {

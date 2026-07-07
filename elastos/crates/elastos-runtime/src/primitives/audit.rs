@@ -61,6 +61,17 @@ fn compute_record_hash(seq: u64, prev_hash: &[u8; 32], event_json: &[u8]) -> [u8
     h.finalize().into()
 }
 
+/// THE one canonicalization recipe every verifier uses: re-serialize the deserialized event with
+/// this crate's serde and recompute the record hash over it. Shared by [`AuditLog::verify_chain`]
+/// and [`verify_mandate_receipt`] so the meaning of "verified" can never quietly fork between the
+/// on-disk walker and the portable-receipt walker (their LINKAGE policies differ by design — a
+/// chain walk is contiguous, a Capability-scoped receipt is a bound selection — but the bytes
+/// each record is hashed over must be identical). `Err` carries the raw serde error.
+fn recompute_record_hash(rec: &ChainedRecord, prev_hash: &[u8; 32]) -> Result<[u8; 32], String> {
+    let event_json = serde_json::to_string(&rec.event).map_err(|e| e.to_string())?;
+    Ok(compute_record_hash(rec.seq, prev_hash, event_json.as_bytes()))
+}
+
 /// Domain separator for the mandate-receipt SET binding — distinct from [`AUDIT_RECORD_DOMAIN`] so a
 /// set-binding signature can never be confused for (or replayed as) a per-record signature.
 const MANDATE_RECEIPT_BINDING_DOMAIN: &[u8] = b"elastos.runtime/mandate-receipt-set/v1";
@@ -98,6 +109,9 @@ fn mandate_receipt_binding_message(
 
 /// One tamper-evident, hash-chained, signed audit record as persisted to disk (one JSON object per
 /// line). The on-disk format; the in-memory ring buffer keeps bare [`AuditEvent`]s for fast reads.
+///
+/// FROZEN serialized shape — same rule as [`AuditEvent`]: verification re-serializes and
+/// re-hashes these records, so field order/names must never change for existing chains to verify.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainedRecord {
     /// Monotonic sequence number (first record = 1). A gap or repeat is tamper-evidence.
@@ -317,15 +331,6 @@ pub fn verify_mandate_receipt(
             }
         }
         // Internal integrity: recompute the record hash from the record's OWN contents.
-        let event_json = match serde_json::to_string(&record.event) {
-            Ok(json) => json,
-            Err(e) => {
-                return MandateReceiptVerdict::failed(
-                    signer,
-                    format!("seq {}: re-serialize event: {e}", record.seq),
-                )
-            }
-        };
         let prev_hash: [u8; 32] = match hex::decode(&record.prev_hash)
             .ok()
             .and_then(|bytes| bytes.try_into().ok())
@@ -337,7 +342,15 @@ pub fn verify_mandate_receipt(
                 continue;
             }
         };
-        let computed = compute_record_hash(record.seq, &prev_hash, event_json.as_bytes());
+        let computed = match recompute_record_hash(record, &prev_hash) {
+            Ok(hash) => hash,
+            Err(e) => {
+                return MandateReceiptVerdict::failed(
+                    signer,
+                    format!("seq {}: re-serialize event: {e}", record.seq),
+                )
+            }
+        };
         match hex::decode(&record.record_hash) {
             Ok(claimed) if claimed.as_slice() == computed.as_slice() => {}
             _ => hashes_ok = false,
@@ -461,7 +474,21 @@ struct ChainState {
     prev_hash: [u8; 32],
 }
 
-/// Audit event types
+/// Audit event types.
+///
+/// # The serialized shape of EVERY variant is FROZEN
+///
+/// Chain verification ([`AuditLog::verify_chain`], [`verify_mandate_receipt`]) RE-SERIALIZES each
+/// deserialized event and recomputes its hash, so the serialized bytes of every variant — field
+/// ORDER, field NAMES, omission rules — are load-bearing for every signed chain and every portable
+/// receipt already in the world. Reordering, renaming, or inserting a field in ANY variant silently
+/// breaks verification of all pre-existing records.
+///
+/// To extend a variant: append the new field LAST with
+/// `#[serde(default, skip_serializing_if = "Option::is_none")]` so a pre-existing record (no field
+/// ⇒ `None`) re-serializes byte-identically, and add a byte-identity ratchet test beside
+/// `rail_ref_is_present_when_set_and_omitted_for_back_compat`. The `responsible_entity`,
+/// `rail_ref`, and `grant_digest` fields below are the worked examples.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuditEvent {
@@ -1119,9 +1146,8 @@ impl AuditLog {
                     rec.seq
                 ));
             }
-            let event_json = serde_json::to_string(&rec.event)
+            let computed = recompute_record_hash(&rec, &expected_prev)
                 .map_err(|e| format!("seq {}: re-serialize event: {e}", rec.seq))?;
-            let computed = compute_record_hash(rec.seq, &expected_prev, event_json.as_bytes());
             let claimed = hex::decode(&rec.record_hash)
                 .map_err(|e| format!("seq {}: bad record_hash hex: {e}", rec.seq))?;
             if claimed.as_slice() != computed.as_slice() {
@@ -1872,10 +1898,19 @@ fn load_or_create_signer(log_path: &Path) -> std::io::Result<SigningKey> {
     let signing_key = SigningKey::generate(&mut rand::thread_rng());
     write_private(&key_path, &signing_key.to_bytes())?;
     let pub_path = sibling(log_path, "pubkey");
-    let _ = std::fs::write(
+    // Publishing the verifying key is best-effort (the signing key is already durably held and
+    // the chain stays verifiable via an out-of-band key copy) — but a silent failure would leave
+    // verifiers with no key file and no clue, so say it loudly.
+    if let Err(e) = std::fs::write(
         &pub_path,
         hex::encode(signing_key.verifying_key().to_bytes()),
-    );
+    ) {
+        tracing::error!(
+            "audit verifying key could not be published to {}: {e} — verifiers have no key file \
+             until it is written out of band",
+            pub_path.display()
+        );
+    }
     Ok(signing_key)
 }
 

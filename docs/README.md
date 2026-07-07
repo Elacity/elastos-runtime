@@ -37,6 +37,11 @@ Planning and truth surfaces outside `docs/`:
 - [ARCHIVE_POLICY.md](ARCHIVE_POLICY.md) — Archive dependency, release, and generic-family enablement policy
 - [PC2_CONVERGENCE.md](PC2_CONVERGENCE.md) — current translation of useful PC2 patterns into Runtime provider/capsule boundaries
 - [CHAIN_PROVIDER.md](CHAIN_PROVIDER.md) — typed chain-provider boundary and current blockchain-quadrant slice
+- [FLINT_MANDATE_ENGINE.md](FLINT_MANDATE_ENGINE.md) — Flint, the mandate engine: scoped/revocable agent authority, the spend-capped payment spine, portable signed receipts (entry point for the mandate/payment subsystem)
+- [DRM_MARKETPLACE_RAIL.md](DRM_MARKETPLACE_RAIL.md) — the DRM marketplace payment rail: wiring, operator runbook, honest bounds
+- [PAYMENT_ENDPOINT_CONTRACT.md](PAYMENT_ENDPOINT_CONTRACT.md) — the stated contract an HTTPS payment endpoint must honor
+- [KNOWN_GAPS.md](KNOWN_GAPS.md) — the build-visible gap registry (runtime-wide), the honest ledger every closed/open gap lands in
+- [CODE_QUALITY_LEDGER.md](CODE_QUALITY_LEDGER.md) — deferred structural cleanups from the standing quality audit
 - [WALLET_PROVIDER.md](WALLET_PROVIDER.md) — wallet proof, account-link, typed-signing, and transaction authority boundary
 - [BROWSER_CAPSULE.md](BROWSER_CAPSULE.md) — Browser/Net/Exit/Engine ABI, product rule, and current proof boundary
 - [BROWSER_PROVIDER_BAKEOFF.md](BROWSER_PROVIDER_BAKEOFF.md) — hosted/native browser-provider comparison and acceptance gates

@@ -212,6 +212,11 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
 - device DID, passkey principals, wallet proof bindings, and Recovery Kit
   foundations without making wallet addresses the Runtime identity root
 - agent capsule with signed gossip and verified-only AI responses
+- Flint mandates: grant an AI agent scoped, expiring, revocable authority (a mandate, not
+  your keys), watch and kill it from the Mandates shell app, let it spend real money under a
+  durable spend cap on a payment rail (HTTPS adapter or on-chain DRM marketplace), and export
+  a portable signed receipt verifiable off-box with `elastos verify-receipt` — see
+  [docs/FLINT_MANDATE_ENGINE.md](docs/FLINT_MANDATE_ENGINE.md)
 
 Important Browser status: the Browser ABI and hosted proof path are real, but
 the final product browser is not complete. Stable arbitrary-site media, accepted
@@ -273,6 +278,8 @@ and release/docs slices.
 | [docs/CONTENT_AVAILABILITY.md](docs/CONTENT_AVAILABILITY.md) | SmartWeb content availability, IPLD-compatible manifests, and provider boundary |
 | [docs/WALLET_PROVIDER.md](docs/WALLET_PROVIDER.md) | Wallet, account, approval, proof, and signer/provider boundary |
 | [docs/CHAIN_PROVIDER.md](docs/CHAIN_PROVIDER.md) | Typed blockchain provider boundary |
+| [docs/FLINT_MANDATE_ENGINE.md](docs/FLINT_MANDATE_ENGINE.md) | Flint — mandates for AI agents: scoped, revocable authority, spend-capped payments, portable signed receipts |
+| [docs/DRM_MARKETPLACE_RAIL.md](docs/DRM_MARKETPLACE_RAIL.md) | The DRM marketplace payment rail (on-chain settlement under a mandate) |
 | [docs/BROWSER_CAPSULE.md](docs/BROWSER_CAPSULE.md) | Browser/Net/Exit/Engine ABI and current proof boundary |
 | [docs/BROWSER_PROVIDER_BAKEOFF.md](docs/BROWSER_PROVIDER_BAKEOFF.md) | Browser provider comparison and acceptance gates |
 | [docs/SITES.md](docs/SITES.md) | Local site hosting and public exposure |

@@ -53,6 +53,22 @@ pub struct BuyOutcome {
     pub unsigned_tx: Value,
 }
 
+/// Pre-broadcast refusal sentinels — the EXACT strings the buy path produces when it PROVABLY
+/// never sent a transaction. `drm_marketplace::is_pre_broadcast_refusal` classifies refund-vs-hold
+/// by matching them, so they are MONEY-CLASSIFICATION-BEARING: rewording a producer without the
+/// classifier (or vice versa) would silently degrade a provable refund into an indeterminate hold.
+/// Producers and classifier both reference these consts; never inline a copy.
+pub(crate) const ERR_WALLET_NOT_LINKED: &str =
+    "wallet not linked: a buy needs the principal's EVM address";
+/// Suffix shared by every fail-closed abort before broadcast (sold-out, no-active-listing,
+/// listing-drift). [`ERR_SOLD_OUT`] must keep ending with this — a test pins it.
+pub(crate) const ERR_BUY_ABORTED_SUFFIX: &str = "buy aborted (fail closed)";
+/// The abort-on-drift guard's refusal when no operative resolved before assembly.
+pub(crate) const ERR_NONE_RESOLVED_SUFFIX: &str = "none resolved — fail closed";
+/// The sold-out refusal, shared by the buy and the read-only quote.
+pub(crate) const ERR_SOLD_OUT: &str =
+    "listing sold out (on-chain supply 0) — buy aborted (fail closed)";
+
 /// Real Base AuthorityGateway — `buyAccess` is sent here (from `~/.pc2` `wallet.js` /
 /// `abis.ts`), NOT to the operative directly. Default `to` for the buy; overridable.
 const BASE_AUTHORITY_GATEWAY: &str = "0x09dBe796f40ECEffEAccf243c3d758C4c1d8D87D";
@@ -132,7 +148,7 @@ pub fn buy_access(
         && subject.trim().is_empty()
         && !wallet_signing()
     {
-        return Err("wallet not linked: a buy needs the principal's EVM address".to_string());
+        return Err(ERR_WALLET_NOT_LINKED.to_string());
     }
 
     let unsigned_tx = assemble_buy_tx(content_id, subject, None);
@@ -196,9 +212,7 @@ pub fn buy_access(
             // tokenId, or no active listing. The CEK path is untouched (P15).
             let sourced = source_buy_terms(content_id, target)?;
             if sourced.supply == 0 {
-                return Err(
-                    "listing sold out (on-chain supply 0) — buy aborted (fail closed)".to_string(),
-                );
+                return Err(ERR_SOLD_OUT.to_string());
             }
             // Abort-on-drift (P11): if the buyer agreed to a price/pay-token in the UI, the live re-read
             // MUST match — else fail closed (the listing changed under them).
@@ -277,9 +291,7 @@ pub fn quote_buy(content_id: &str, target: &BuyTarget) -> Result<BuyQuote, Strin
         RightsMode::Chain => {
             let sourced = source_buy_terms(content_id, target)?;
             if sourced.supply == 0 {
-                return Err(
-                    "listing sold out (on-chain supply 0) — buy aborted (fail closed)".to_string(),
-                );
+                return Err(ERR_SOLD_OUT.to_string());
             }
             // Return the RAW on-chain pay_token (a zero address for a native listing), NOT a
             // display alias — the DRM settler binds it as the buy's expected_pay_token so
@@ -389,10 +401,9 @@ fn source_buy_terms(content_id: &str, target: &BuyTarget) -> Result<SourcedBuy, 
         },
     };
     if operative.trim().is_empty() {
-        return Err(
-            "abort-on-drift requires the asset's operative; none resolved — fail closed"
-                .to_string(),
-        );
+        return Err(format!(
+            "abort-on-drift requires the asset's operative; {ERR_NONE_RESOLVED_SUFFIX}"
+        ));
     }
     let token_id_word = token_id_to_word(&token_id);
 
@@ -683,8 +694,11 @@ fn word_from_id(id: &str) -> String {
     hex::encode(Sha256::digest(id.as_bytes()))
 }
 
-/// Left-pad a 20-byte EVM address to a 32-byte word. Tolerates a missing `0x` / short
-/// input by hashing (demo calldata is never sent to a real contract in mock/dev).
+/// Left-pad a 20-byte EVM address to a 32-byte word. This encoder IS on the live buy path
+/// (`assemble_buy_tx_core` runs on `RightsMode::Chain`); the hash fallback for a malformed
+/// address exists for dev/mock fixtures and is unreachable live, where every address is either
+/// sourced from the chain read itself or validated upstream (a live buy with a hashed
+/// address-word would fail on-chain, not silently misroute — the gateway checks its operands).
 fn word_from_address(addr: &str) -> String {
     let clean = addr.trim().trim_start_matches("0x");
     if clean.len() == 40 && clean.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -694,7 +708,10 @@ fn word_from_address(addr: &str) -> String {
     }
 }
 
-/// A decimal `uint` as a 32-byte word (saturates absurd inputs; demo encoding only).
+/// A decimal `uint` as a 32-byte word. Live-path caveat as [`word_from_address`]: the `1`
+/// fallback for an unparseable decimal (quantity semantics — "one unit", never zero/free) is
+/// only reachable from dev/fixture inputs; live quantities and prices are sourced on-chain and
+/// re-checked by abort-on-drift before broadcast.
 fn word_from_uint(dec: &str) -> String {
     let n: u128 = dec.trim().parse().unwrap_or(1);
     format!("{n:064x}")
@@ -770,7 +787,7 @@ pub(crate) fn ensure_no_drift(bound: &BoundTerms, reread: &BoundTerms) -> Result
     for (field, a, b) in checks {
         if !a.trim().eq_ignore_ascii_case(b.trim()) {
             return Err(format!(
-                "listing drift on {field}: bound {a:?} != re-read {b:?} — buy aborted (fail closed)"
+                "listing drift on {field}: bound {a:?} != re-read {b:?} — {ERR_BUY_ABORTED_SUFFIX}"
             ));
         }
     }
@@ -888,6 +905,16 @@ mod tests {
 
     const SUBJECT: &str = "0x00000000000000000000000000000000000000bb";
 
+    /// The sentinel consts are money-classification-bearing (see their doc): the DRM rail refunds
+    /// only on these exact strings. Pin the internal relationship a refactor could quietly break.
+    #[test]
+    fn pre_broadcast_sentinels_keep_their_classifier_anchors() {
+        assert!(
+            ERR_SOLD_OUT.ends_with(ERR_BUY_ABORTED_SUFFIX),
+            "the sold-out refusal must keep the abort suffix the DRM classifier matches on"
+        );
+    }
+
     // The dev buy loop (free ownership ledger, no on-chain payment) is a `dev-modes`-only path
     // now that rights_mode() defaults to Chain (DEV_MODE_GUARD_SPEC): without `dev-modes`, an
     // unset ELASTOS_DDRM_RIGHTS resolves to Chain, so this dev-ledger flow is unreachable.
@@ -895,8 +922,8 @@ mod tests {
     #[cfg(feature = "dev-modes")]
     fn dev_buy_records_ownership_and_returns_hash() {
         let _g = crate::api::ddrm_env_lock();
-        let dir = std::env::temp_dir().join(format!("buy-dev-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         std::env::set_var("ELASTOS_DDRM_OWNED_LEDGER", dir.join("owned.json"));
         std::env::remove_var("ELASTOS_DDRM_RIGHTS"); // dev
 
@@ -913,7 +940,6 @@ mod tests {
         assert!(super::super::owned_ledger::contains("bafyDEV", SUBJECT));
 
         std::env::remove_var("ELASTOS_DDRM_OWNED_LEDGER");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1171,8 +1197,8 @@ mod tests {
     #[ignore]
     fn chain_mock_buy_records_then_ledger_reads_owned() {
         let _g = crate::api::ddrm_env_lock();
-        let dir = std::env::temp_dir().join(format!("buy-mock-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         std::env::set_var("ELASTOS_DDRM_OWNED_LEDGER", dir.join("owned.json"));
         std::env::set_var("ELASTOS_DDRM_RIGHTS", "chain-mock");
 
@@ -1192,7 +1218,6 @@ mod tests {
 
         std::env::remove_var("ELASTOS_DDRM_RIGHTS");
         std::env::remove_var("ELASTOS_DDRM_OWNED_LEDGER");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// DEV INTEGRATION (opt-in): THE headline loop — in `chain-mock` + ledger-gated rights,
@@ -1205,8 +1230,8 @@ mod tests {
     #[ignore]
     fn buy_then_open_loop_flips_rights_from_denied_to_allowed() {
         let _g = crate::api::ddrm_env_lock();
-        let dir = std::env::temp_dir().join(format!("buy-loop-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         std::env::set_var("ELASTOS_DDRM_OWNED_LEDGER", dir.join("owned.json"));
         std::env::set_var("ELASTOS_DDRM_RIGHTS", "chain-mock");
         // The mock answers ownership from the local ledger (the buy-flow gate).
@@ -1249,7 +1274,6 @@ mod tests {
         std::env::remove_var("ELASTOS_DDRM_CHAIN_ACCESS");
         std::env::remove_var("ELASTOS_DDRM_RIGHTS");
         std::env::remove_var("ELASTOS_DDRM_OWNED_LEDGER");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// DEV INTEGRATION (opt-in): proves the REAL signing rail offline — the wallet capsule
@@ -1264,8 +1288,8 @@ mod tests {
     #[ignore]
     fn chain_mock_wallet_signs_and_broadcasts_real_tx() {
         let _g = crate::api::ddrm_env_lock();
-        let dir = std::env::temp_dir().join(format!("buy-wallet-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         std::env::set_var("ELASTOS_DDRM_OWNED_LEDGER", dir.join("owned.json"));
         std::env::set_var("ELASTOS_DDRM_WALLET_BASE", dir.join("wallet"));
         std::env::set_var("ELASTOS_DDRM_RIGHTS", "chain-mock");
@@ -1300,6 +1324,5 @@ mod tests {
         std::env::remove_var("ELASTOS_DDRM_RIGHTS");
         std::env::remove_var("ELASTOS_DDRM_WALLET_BASE");
         std::env::remove_var("ELASTOS_DDRM_OWNED_LEDGER");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

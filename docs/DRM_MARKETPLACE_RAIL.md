@@ -23,10 +23,15 @@ implements, so the meter, the ledger, the two-generals classification, and the s
 
 ```
 ELASTOS_PAYMENT_RAIL=drm            # select the DRM rail (wins over ELASTOS_PAYMENT_ENDPOINT)
-ELASTOS_DRM_BUYER_PRINCIPAL=<id>    # the buyer principal (its linked EVM wallet, or the managed
-                                    #   account in wallet-signing mode)
+ELASTOS_DRM_BUYER_PRINCIPAL=<id>    # REQUIRED in practice: the buyer principal (its linked EVM
+                                    #   wallet, or the managed account in wallet-signing mode).
+                                    #   The rail wires without it (boot warning) but every buy
+                                    #   then fails closed until it is set.
 ELASTOS_DRM_BUYER_SUBJECT=<addr>    # optional explicit EVM address; empty ⇒ managed account
-ELASTOS_DDRM_LEDGER=<addr>          # the ledger the KID→tokenId scan + buy consult
+ELASTOS_DDRM_LEDGER=<addr>          # REQUIRED in practice: the ledger the KID→tokenId scan + buy
+                                    #   consult. (Yes, `DDRM` — the historical dDRM prefix, same
+                                    #   family as the other ELASTOS_DDRM_* vars; NOT a typo of
+                                    #   "ELASTOS_DRM_LEDGER", which the code does not read.)
 ELASTOS_DRM_SPEND_UNIT=<u128>       # REQUIRED (live Chain rail): pay-token smallest-units per ONE
                                     #   spend unit — e.g. 1000000 for USDC (6 decimals) ⇒ 1 spend
                                     #   unit == 1 USDC. The price gate uses this to compare the
@@ -43,8 +48,21 @@ refused — `runtime.pay` stays UNWIRED, fail-closed) AND, on the live **Chain**
 **refuses to wire** rather than silently assume 1 spend unit == 1 wei — so the cap is a literal
 on-chain ceiling **in the declared pay-token unit** (Honest bounds 1), not just intent. The live rail
 ALSO requires `ELASTOS_DRM_PAY_TOKEN` (the token the unit denominates): a listing quoting any other
-token is refused before broadcast. (Dev/chain-mock quote free, so the gate is a no-op there.) Provision caps exactly as for any rail:
+token is refused before broadcast. (In the Dev/chain-mock rights modes the quote returns price 0,
+so the price gate never rejects there.) Provision caps exactly as for any rail:
 `POST /api/spend-budgets` (or the Mandates Money panel).
+
+## How a payment's state reads across the three surfaces
+
+The rail, the ledger, and the dispatch response each speak their own vocabulary for the same
+moment in a buy's life. The map:
+
+| Moment | Rail outcome | Ledger entry | Dispatch reports |
+|---|---|---|---|
+| Refused before broadcast (over cap, ambiguous KID, sold out, drift, wrong pay-token) | `NotCharged` (refund) | `NotCharged` (terminal) | `authorized_not_performed`, reason names the refusal |
+| Broadcast accepted, not yet confirmed | `Indeterminate` (reservation held) | `Pending` | `authorized_not_performed` — **a successful broadcast still reads as not-performed**, because performed is reserved for chain-confirmed truth |
+| Confirmed at the depth floor | (reconciliation) | `ResolvedCharged` + receipt `rail_ref` | the receipt's pay-use row now carries the confirmed tx |
+| Reverted on-chain | (reconciliation) | `ResolvedNotCharged`, reservation refunded once | — |
 
 The payee of a buy intent is the **DRM asset reference** (the KID / content id) — the suffix of the
 pay resource `elastos://runtime/pay/<asset>`. The signed `input_hash` carries the amount in spend

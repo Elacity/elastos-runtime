@@ -278,10 +278,10 @@ pub trait DrmConfirmer: Send + Sync {
 }
 
 /// Extract the tx hash from a DRM pending record's `rail_note` (the `rail_ref` the provider filed:
-/// `drm:tx=<hash>;op=<op>;tid=<tid>`). `None` for a non-DRM note (so the reconciler skips it).
+/// `drm:tx=<hash>;op=<op>;tid=<tid>;price=<price>;tok=<pay_token>`). `None` for a non-DRM note (so
+/// the reconciler skips it).
 pub(crate) fn parse_drm_tx(rail_note: &str) -> Option<&str> {
-    let rest = rail_note.strip_prefix("drm:tx=")?;
-    Some(rest.split(';').next().unwrap_or(rest))
+    rail_note.strip_prefix("drm:tx=")?.split(';').next()
 }
 
 /// The PRODUCTION chain adapter — resolves via the MKT-1-hardened `chain_tx::resolve_token_id` and
@@ -473,68 +473,56 @@ pub fn reconcile_drm_confirmations(
         let Some(tx) = parse_drm_tx(&record.rail_note).map(str::to_string) else {
             continue; // not a DRM pending entry — leave it for the operator surface
         };
-        match confirmer.confirm(&tx) {
+        // Confirmed and Reverted share one reconcile spine — only `charged` and the receipt
+        // binding differ, so the arms stay a single code path that cannot drift apart.
+        let charged = match confirmer.confirm(&tx) {
             DrmConfirmation::Unconfirmed(_) => {
                 summary.left_pending += 1;
+                continue;
             }
-            DrmConfirmation::Confirmed => {
-                let input = crate::api::handlers::capability::ReconcilePaymentInput {
-                    idempotency_key: record.idempotency_key.clone(),
-                    charged: true,
-                };
-                match crate::api::handlers::capability::reconcile_payment_core(
-                    ledger, meter, audit_log, input,
-                ) {
-                    Ok(_) => {
-                        summary.promoted += 1;
-                        // Bind the confirmed settlement onto the mandate's receipt: a token-keyed,
-                        // signed CapabilityUse carrying the DRM rail_ref (success=true). This is
-                        // the S35 half that makes the receipt reflect the CONFIRMED tx, not the
-                        // mere broadcast. Best-effort (mirrors the dispatch-path use record): a
-                        // lost emit under-reports in the receipt, but the payment_reconciled event
-                        // + the ledger already durably record the promotion.
-                        if let (Ok(token_id), true) = (
-                            TokenId::from_hex(record.token_id.as_deref().unwrap_or("").trim()),
-                            record.token_id.is_some(),
-                        ) {
-                            let resource =
-                                format!("{}{}", crate::intent_executor::PAY_PREFIX, record.payee);
-                            audit_log.capability_use_with_rail_ref(
-                                &token_id,
-                                &record.capsule,
-                                &ResourceId::new(resource),
-                                elastos_runtime::capability::Action::Execute,
-                                true,
-                                Some(record.rail_note.clone()),
-                            );
-                        }
-                    }
-                    Err((_, e)) => {
-                        tracing::error!(
-                            key = %record.idempotency_key,
-                            "DRM confirmation could not be reconciled (charged): {e}"
-                        );
-                        summary.left_pending += 1;
-                    }
+            DrmConfirmation::Confirmed => true,
+            DrmConfirmation::Reverted => false,
+        };
+        let input = crate::api::handlers::capability::ReconcilePaymentInput {
+            idempotency_key: record.idempotency_key.clone(),
+            charged,
+        };
+        match crate::api::handlers::capability::reconcile_payment_core(
+            ledger, meter, audit_log, input,
+        ) {
+            Ok(_) if charged => {
+                summary.promoted += 1;
+                // Bind the confirmed settlement onto the mandate's receipt: a token-keyed,
+                // signed CapabilityUse carrying the DRM rail_ref (success=true). This is
+                // the S35 half that makes the receipt reflect the CONFIRMED tx, not the
+                // mere broadcast. Best-effort (mirrors the dispatch-path use record): a
+                // lost emit under-reports in the receipt, but the payment_reconciled event
+                // + the ledger already durably record the promotion.
+                if let Some(token_id) = record
+                    .token_id
+                    .as_deref()
+                    .and_then(|h| TokenId::from_hex(h.trim()).ok())
+                {
+                    let resource =
+                        format!("{}{}", crate::intent_executor::PAY_PREFIX, record.payee);
+                    audit_log.capability_use_with_rail_ref(
+                        &token_id,
+                        &record.capsule,
+                        &ResourceId::new(resource),
+                        elastos_runtime::capability::Action::Execute,
+                        true,
+                        Some(record.rail_note.clone()),
+                    );
                 }
             }
-            DrmConfirmation::Reverted => {
-                let input = crate::api::handlers::capability::ReconcilePaymentInput {
-                    idempotency_key: record.idempotency_key.clone(),
-                    charged: false,
-                };
-                match crate::api::handlers::capability::reconcile_payment_core(
-                    ledger, meter, audit_log, input,
-                ) {
-                    Ok(_) => summary.refunded += 1,
-                    Err((_, e)) => {
-                        tracing::error!(
-                            key = %record.idempotency_key,
-                            "DRM revert could not be reconciled (refund): {e}"
-                        );
-                        summary.left_pending += 1;
-                    }
-                }
+            Ok(_) => summary.refunded += 1,
+            Err((_, e)) => {
+                tracing::error!(
+                    key = %record.idempotency_key,
+                    charged,
+                    "DRM verdict could not be reconciled: {e}"
+                );
+                summary.left_pending += 1;
             }
         }
     }
@@ -569,12 +557,15 @@ pub struct DrmReconcileSummary {
 /// opaque String; the real fix is a structured pre/post-broadcast error type out of `buy_access`.
 fn is_pre_broadcast_refusal(err: &str) -> bool {
     // Exact, anchored pre-broadcast sentinels emitted by `buy_authority::buy_access` strictly
-    // before any `eth_sendRawTransaction`. Case-sensitive (they are fixed literals), so an opaque
+    // before any `eth_sendRawTransaction` — the SAME consts the producers use, so a rewording
+    // cannot drift the two sides apart. Case-sensitive (they are fixed literals), so an opaque
     // lowercased RPC message cannot collide with the parenthetical/em-dash markers.
     const PRE_BROADCAST_SENTINELS: &[&str] = &[
-        "wallet not linked: a buy needs the principal's EVM address",
-        "buy aborted (fail closed)", // sold-out, no-active-listing, and listing-drift all end here
-        "none resolved — fail closed", // operative missing before assembly
+        crate::api::buy_authority::ERR_WALLET_NOT_LINKED,
+        // sold-out, no-active-listing, and listing-drift all end with this suffix
+        crate::api::buy_authority::ERR_BUY_ABORTED_SUFFIX,
+        // operative missing before assembly
+        crate::api::buy_authority::ERR_NONE_RESOLVED_SUFFIX,
     ];
     PRE_BROADCAST_SENTINELS.iter().any(|p| err.contains(p))
 }
@@ -649,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn a_broadcast_accepted_buy_is_indeterminate_and_carries_the_rail_ref_not_charged() {
+    fn a_broadcast_accepted_buy_is_indeterminate_not_charged_immediately_and_carries_the_rail_ref() {
         // Sprint 35: a broadcast-accepted buy is NEVER immediately charged — it is Indeterminate
         // (Pending), the reservation held, the rail_ref carried as the reason so the pending
         // ledger record holds the tx for later confirmation.

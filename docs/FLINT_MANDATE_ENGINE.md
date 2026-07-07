@@ -2,11 +2,16 @@
 
 **"Give your agent a mandate, not your keys."**
 
-The single reviewable map of the accountability engine delivered on this branch
-(`claude/git-proxy-auth-roadmap-c214hu`) for merge into `flint-0.5`. It is the layer that lets an
-operator hand an AI agent a *scoped, expiring, revocable* mandate instead of raw credentials, have
-the agent act under it unsupervised, and hold the whole thing to a tamper-evident, off-box-verifiable
-record. Detailed per-gap history lives in `KNOWN_GAPS.md`; this is the summary.
+Flint is the mandate/payment engine inside the ElastOS runtime: the layer that lets an operator
+hand an AI agent a *scoped, expiring, revocable* mandate instead of raw credentials, have the
+agent act under it unsupervised — including spending real money under a provable cap — and hold
+the whole thing to a tamper-evident, off-box-verifiable record. This document is the reviewable
+map; the detailed per-gap ledger lives in `KNOWN_GAPS.md`.
+
+**Vocabulary.** A *mandate* is a standing grant — a signed capability token plus its authorized
+method envelope. The API calls it a standing grant (`/api/standing-grants/dispatch`), the audit
+chain records it as `CapabilityGrant`/`CapabilityUse`, and the operator UI calls it a mandate;
+all three name the same object.
 
 ## The lifecycle, in one place
 
@@ -32,7 +37,98 @@ match (this is the G-M6 rule).
 | `runtime.state_get` | attested VERIFY read | `read` | Verifies the acting principal's OWN durable state (the read pair of state_put); the agent declares the value it expects — `matched` attests "K = V", `diverged` means the guess was wrong (ONE BIT — the actual value is NOT returned or on-chain), `declined` if absent. Principal-scoped, exact-key, agent-key BOUND (F2) |
 | `runtime.notify` | **side-effecting** | `message` | Delivers a message into the operator's Inbox; bounded fields, capped store, `performed` only after the write lands |
 | `runtime.state_put` | **side-effecting** | `write` | Writes durable, readable-back, principal-scoped agent state; last-write-wins with attributed versioning |
-| `runtime.pay` | **side-effecting, money** | `execute` | Spends real money to a mandate-scoped payee, capped by the spend meter (S27). The amount rides in the signed `input_hash` (canonical decimal); over the cap (or an unprovisioned capsule) the payment is REFUSED with no money moved (a signed `authorized_not_performed`); a PROVABLY-not-charged rail refusal refunds the reservation (indeterminate outcomes keep it — see S29). Rail-agnostic (`PaymentProvider` — card/ACH/Stripe, or a crypto rail; **cryptography, not cryptocurrency** — no rail is privileged). Opt-in via `with_payments`. **S28:** the cap is DURABLE (snapshot+fsync; the reservation persists BEFORE money moves; a restart never refills it; a corrupt/tampered-shape snapshot refuses to boot) and operator-provisionable at `POST /api/spend-budgets` (shell-only; refused without a wired rail or on a non-durable meter; attested on the signed chain as a `ConfigChange`, rolled back — a first-time provision fully removed — if the attestation fails; a correlated double persist failure is surfaced loudly, never hidden). **S29 — the REAL rail:** `ELASTOS_PAYMENT_ENDPOINT` (+ optional bearer `ELASTOS_PAYMENT_TOKEN`) wires `HttpPaymentProvider` (https enforced — plaintext only to loopback; malformed endpoints refuse at boot; redirects never followed — a 3xx is indeterminate, never "charged") — a payment order (`payee`, `amount`, signature-derived `Idempotency-Key`) POSTed to the deployment's payment service (a thin adapter fronts Stripe/ACH/treasury/a crypto rail), REQUIRING the durable meter. Outcomes are classified two-generals-honestly: 2xx = charged; 4xx/never-connected = provably-not-charged ⇒ the reservation is REFUNDED; timeout/5xx/panic = **INDETERMINATE** ⇒ the reservation is KEPT (refunding against money that may have moved would break the cap — the one unbreakable invariant) and the DECLINE REASON — surfaced in the dispatch response and error-logged (on-chain reasons are the tracked follow-on) — names the idempotency key for rail reconciliation; `authorized_not_performed` here means NOT-ATTESTED, not proven-absent. Concurrent in-flight payments are bounded fail-closed. The meter POISONS on a post-publish persist failure (mutations refuse until reopened; no divergence) and holds a single-opener flock on its snapshot. **Honest bounds (council):** the Mock rail stays dev/demo-gated (`ELASTOS_ALLOW_MOCK_PAYMENTS`; the real endpoint wins if both are set); the cap is PER-CAPSULE not per-mandate; an orphaned/indeterminate reservation over-counts the cap fail-closed (recovery: rail-side lookup by idempotency key FIRST, then the operator raising the limit — a blind cap raise after indeterminate drain can authorize real spend beyond the original intent; **S30:** the payment LEDGER durably custodies every rail attempt THE PROCESS LIVED TO RECORD (a crash between reservation and rail verdict still leaves the S29 orphaned reservation, recovered from the on-chain declaration; pending custody is guaranteed-or-stated in the reason, terminal records best-effort) — the performed payment's rail reference, and a PENDING entry per indeterminate outcome (per-capsule bounded, so one agent cannot blind a victim's obligations) — surfaced at `GET /api/payments/pending` and resolved EXACTLY ONCE at `POST /api/payments/reconcile` (shell-only; `charged=false` refunds the reservation, `charged=true` confirms it; each resolution attested on the signed chain); the budget surface shows `pending_units` held-unconfirmed distinct from confirmed spend, and dispatch runs on the blocking pool (rail latency never starves the async workers). The endpoint's obligations are the stated contract in `docs/PAYMENT_ENDPOINT_CONTRACT.md`; an AUTOMATED reconciliation loop is the tracked follow-on. **S31 — the Money panel:** budgets (cap/spent/remaining/held-unconfirmed, the poisoned banner) and the reconciliation work list live in the Mandates shell app, every pixel a read-only projection of the ONE enforcing meter+ledger (`build_pay_rail`, same-Arc by construction, flock-enforced); the web provisioning surface is CEILING-BOUND server-side (`ELASTOS_WEB_MAX_SPEND_CAP`, mirroring the issue route's narrowing — an XSS in the frame cannot provision an unbounded cap), verdict buttons are arm→confirm like the kill switch, a not-charged verdict is refused while the meter is poisoned (it would burn the one-shot refund handle), and the S31 residual (the 12h URL-borne launch token) is CLOSED by **S33 — the money-authorization perimeter**: the mandates launch token is delivered via an HttpOnly, SameSite=Strict cookie path-scoped to the mandates API (the launch URL carries no credential — only a non-secret `shell=1` marker), cookie-authorized writes require the anti-CSRF app-marker header, and the money writes (set-cap, reconcile) each require a FRESH passkey verification (a WebAuthn ceremony ≤180s old, proof-bound to the same principal) that is SPENT on exactly one applied write (keyed on the canonical signed payload, so re-encoding the token string does not mint a fresh spend; a provably pre-effect refusal re-credits the ceremony) — replaying it on the same or the other money verb is refused. What the fresh binding proves is exactly: THIS operator's authenticator freshly approved ONE money write — no more (it does not verb-scope at mint; single-use consumption is what stops a second write). Honest bounds: the spent-token guard is in-memory (a gateway restart inside the ~3-minute window could admit one replay), and a runtime with no passkey enrolled makes money writes CLI-only (stated in the panel) — both tracked as G-M9. The 4xx⇒not-charged rule is a stated CONTRACT on the payment endpoint; the snapshot file is trusted from `data_dir` (not self-authenticating, unlike the signed chain); the flock/parent-fsync protections are unix-only (elsewhere the serve/gateway host lock is the bound); a lying 2xx from a compromised endpoint mints receipts the runtime cannot independently check — a Performed pay is a RAIL-TRUST attestation, weaker than the runtime-verified affordances. **S34 — the DRM wedge (the rail IS the marketplace):** `ELASTOS_PAYMENT_RAIL=drm` wires `DrmMarketplaceProvider` behind the SAME `PaymentProvider` trait — a `runtime.pay` act whose payee names a DRM asset SETTLES ON-CHAIN via the Elacity `buy_authority` path instead of an HTTPS POST, with the meter, ledger, two-generals classification, and receipt byte-identical to the HTTP rail (one pay spine, never a fork). The KID→`(operative, tokenId)` binding goes through the MKT-1-hardened resolver, FAIL-CLOSED on ambiguity (an ambiguous or unresolvable asset is `NotCharged`/refunded — NEVER a fallback buy); a provably-not-broadcast buy refunds; a broadcast-then-unconfirmed outcome is INDETERMINATE (reservation kept, reconciled by the intent-signature idempotency key mapped to the tx). The settlement's on-chain truth — the tx hash + `operative:tokenId` — is carried on the signed `CapabilityUse` as `rail_ref` (S34; back-compat identical to S32: appended last, `skip_serializing_if`, byte-identical re-serialization of pre-S34 chains) and thus into the portable receipt, so `verify-receipt` shows WHICH tx the chain CONFIRMED for the mandate's payment. **S35 — confirmation-aware settlement:** a DRM buy is recorded PENDING at broadcast (never Performed at zero confirmations); `reconcile_drm_confirmations` promotes it to charged + binds the receipt rail_ref only once the tx is mined + successful + `ELASTOS_DRM_MIN_CONFIRMATIONS` deep, refunds a reverted tx exactly once, and holds a not-yet-mined one (never auto-charges). Cross-window double-buy is closed by durable-ledger idempotency (the pay path never re-charges a signed intent's key that already moved-or-may-have-moved money). Reuses the S30 reconcile spine; the live confirmation poll is the operator/automation loop (an in-runtime scheduler is the follow-on). The chain boundary is behind two small injected traits (`DrmResolver`/`DrmSettler`) — CI exercises every branch with mocks; the live Base path is an operator runbook step, never a CI call. Honest bounds (tracked MKT-DRM): the spend-meter cap is in SPEND UNITS while the on-chain price is the listing's token amount (the meter-unit ⇄ price reconciliation is not yet enforced — the cap bounds intent, the listing bounds the actual charge) (**S36 — the price gate** closes this: the DRM provider quotes the on-chain price read-only and refuses a buy whose mandate cap `amount × ELASTOS_DRM_SPEND_UNIT` does not cover it, binding the gated price as the buy's expected price; the live rail refuses to wire without BOTH the declared unit mapping AND the declared pay-token (a buy in any other token is refused; the DRM buy pins quantity=1 and arms abort-on-drift on price + pay-token), and the receipt names `price=;tok=`. Residual: the unit mapping is operator-DECLARED — a wrong declaration mis-scales the ceiling); a DRM buy is now chain-CONFIRMED before it is charged — recorded Pending at broadcast and promoted only at the depth floor, so it is NOT the rail-trust attestation an HTTP-rail 2xx Performed pay is; royalty-split correctness is the DRM protocol's, not re-verified here |
+| `runtime.pay` | **side-effecting, money** | `execute` | Spends real money to a mandate-scoped payee under a durable spend cap: the amount rides in the signed `input_hash`, over-cap or unprovisioned refuses with no money moved, and every outcome is classified two-generals-honestly. The full design — durability, rails, custody, reconciliation, the operator surfaces, and every honest bound — is in [The payment spine](#the-payment-spine-runtimepay) below |
+
+## The payment spine (runtime.pay)
+
+One pay spine, never a fork: whatever rail is wired, the meter, the ledger, the outcome
+classification, and the signed receipt are byte-identical.
+
+### The cap is enforced, durable, and operator-provisioned
+
+- The spend meter reserves against the per-capsule cap ATOMICALLY before any money moves; over the
+  cap (or an unprovisioned capsule ⇒ zero) the payment is REFUSED with a signed
+  `authorized_not_performed` — no money moved (S27).
+- The cap is DURABLE (snapshot + fsync; the reservation persists BEFORE money moves; a restart
+  never refills it; a corrupt or tampered-shape snapshot refuses to boot) and provisioned at
+  `POST /api/spend-budgets` or the Mandates Money panel. Each provision is attested on the signed
+  chain as a `ConfigChange` and rolled back if the attestation fails (S28).
+- The meter POISONS on a post-publish persist failure (mutations refuse until reopened from disk;
+  memory never diverges from the visible snapshot) and holds a single-opener flock.
+
+### Outcomes are classified two-generals-honestly
+
+- **Charged** — the rail confirmed it; the spend stands and the rail reference is custodied.
+- **Provably not charged** — refund the reservation.
+- **Indeterminate** (timeout / 5xx / panic / broadcast-unconfirmed) — KEEP the reservation:
+  refunding against money that may have moved would break the cap, the one unbreakable invariant.
+  The decline reason names the idempotency key for rail-side reconciliation, and
+  `authorized_not_performed` here means NOT-ATTESTED, not proven-absent.
+
+### The rails (one trait, two implementations)
+
+- **HTTP rail (S29):** `ELASTOS_PAYMENT_ENDPOINT` (+ optional bearer `ELASTOS_PAYMENT_TOKEN`)
+  wires `HttpPaymentProvider` — a payment order (`payee`, `amount`, signature-derived
+  `Idempotency-Key`) POSTed to the deployment's payment service (a thin adapter fronts
+  Stripe/ACH/treasury/a crypto rail). HTTPS enforced (plaintext only to loopback), malformed
+  endpoints refuse at boot, redirects are never followed (a 3xx is indeterminate, never
+  "charged"). Requires the durable meter. The endpoint's obligations are the stated contract in
+  `docs/PAYMENT_ENDPOINT_CONTRACT.md`.
+- **DRM marketplace rail (S34–S36):** `ELASTOS_PAYMENT_RAIL=drm` settles a buy ON-CHAIN via the
+  Elacity `buy_authority` path behind the SAME `PaymentProvider` trait — resolve (fail-closed on
+  ambiguity), read-only price quote, the price gate (`amount × ELASTOS_DRM_SPEND_UNIT` must cover
+  the on-chain price, quantity pinned to 1, pay-token declared and drift-armed), broadcast ⇒
+  PENDING, and promotion to charged only after the tx is mined + successful + past the
+  confirmation-depth floor. The full rail — wiring, runbook, honest bounds — is
+  `docs/DRM_MARKETPLACE_RAIL.md`.
+- The Mock rail stays dev/demo-gated behind `ELASTOS_ALLOW_MOCK_PAYMENTS` (a real endpoint wins if
+  both are set).
+
+### Custody and reconciliation (S30/S35)
+
+- The payment LEDGER durably custodies every rail attempt the process lived to record — the
+  performed payment's rail reference and a PENDING entry per indeterminate outcome (per-capsule
+  bounded, so one agent cannot blind a victim's obligations). Money-bearing keys are NEVER
+  evicted, and the durable ledger is the cross-window idempotency: a re-dispatched signed intent
+  whose key already moved-or-may-have-moved money is refused, never re-charged.
+- Pending entries surface at `GET /api/payments/pending` and resolve EXACTLY ONCE at
+  `POST /api/payments/reconcile` (`charged=false` refunds, `charged=true` confirms; each
+  resolution attested on the signed chain). DRM pendings are additionally resolvable against the
+  chain itself via `reconcile_drm_confirmations` (see the DRM doc).
+
+### The operator surface and its authorization perimeter (S31/S33)
+
+- The Money panel (budgets with cap/spent/remaining/held-unconfirmed, the poisoned banner, the
+  reconciliation work list) is a read-only projection of the ONE enforcing meter+ledger
+  (`build_pay_rail`, same-Arc by construction, flock-enforced).
+- Web provisioning is CEILING-BOUND server-side (`ELASTOS_WEB_MAX_SPEND_CAP`); verdict buttons are
+  arm→confirm; a not-charged verdict is refused while the meter is poisoned (it would burn the
+  one-shot refund handle).
+- The mandates launch token is an HttpOnly, SameSite=Strict cookie path-scoped to the mandates API;
+  cookie-authorized writes require the anti-CSRF app-marker header; and every money write requires
+  a FRESH passkey verification (a WebAuthn ceremony ≤180s old, proof-bound to the same principal)
+  SPENT on exactly one applied write.
+
+### Honest bounds, stated
+
+- The cap is PER-CAPSULE, not per-mandate; an orphaned/indeterminate reservation over-counts the
+  cap fail-closed (recovery: rail-side lookup by idempotency key FIRST, then a deliberate cap
+  raise).
+- A crash between the persisted reservation and the rail verdict leaves a durable reservation with
+  no ledger entry (recovered from the on-chain declaration); pending custody is
+  guaranteed-or-stated, terminal records best-effort.
+- The 4xx⇒not-charged rule is a stated CONTRACT on the payment endpoint; a lying 2xx from a
+  compromised endpoint mints receipts the runtime cannot independently check — an HTTP-rail
+  Performed pay is a RAIL-TRUST attestation, weaker than the runtime-verified affordances. (A DRM
+  buy is stronger: it is chain-CONFIRMED before it is charged.)
+- The spent-passkey guard is in-memory (a gateway restart inside the ~3-minute window could admit
+  one replay), and a runtime with no passkey enrolled makes money writes CLI-only — both tracked
+  as G-M9.
+- The snapshot files are trusted from `data_dir` (not self-authenticating, unlike the signed
+  chain); the flock/parent-fsync protections are unix-only.
+- DRM-rail residuals are tracked as `MKT-DRM` in `KNOWN_GAPS.md` (the operator-declared spend-unit
+  mapping; the confirmation poll being operator/automation-driven until the in-runtime scheduler
+  lands).
 
 ## The trust model (and its honest caveats)
 
@@ -92,25 +188,21 @@ compacted id — under any clock, across restart). `RETENTION = age + skew` is t
 
 ## Review discipline
 
-Every sprint (13 mandate-engine sprints on this branch, on top of the receipt/CLI foundation) ran
-the same standard before commit: **gate** (build + clippy + full test suites) → **principles
-guardian** review → **red-team** review → fold findings → commit → push. Findings were folded with
-ratchets that reproduce the exact failure; nothing was dismissed as noise. Notable catches the
-council forced (all fixed): a cross-principal content oracle; a receipt over-claim; a wrong-target
-kill-switch race; an operator-Inbox phishing channel; and a backward-clock replay regression (plus
-its persist-failure sub-case) in this very guard.
+Every increment ran the same standard before commit: gate (build + clippy + full test suites),
+then two independent adversarial reviews (a principles guardian and a red team), then every
+finding folded with a ratchet test that reproduces the exact failure — nothing dismissed as noise.
 
-## Verification status at merge
+## Verification status
 
-- `cargo clippy` clean across `elastos-runtime`, `elastos-server`, `elastos-common`.
-- Test suites green: **runtime 409 · server 1159 · common 96** (lib), plus the ESP/receipt tools.
+- `cargo clippy` clean across `elastos-runtime`, `elastos-server`, `elastos-common`; test suites
+  green (run `cd elastos && cargo test --workspace`, or `just test`).
 - No `todo!()`/`unimplemented!()` in the mandate path; every closed gap carries a ratchet, every open
   gap a documented reason.
 
 ## What a reviewer should look at first
 
 1. `elastos-runtime/src/capability/intent.rs` — the gate, the standing-grant store, the replay guard.
-2. `elastos-server/src/intent_executor.rs` — the four affordances + the reconciliation seam.
+2. `elastos-server/src/intent_executor.rs` — the affordances (including `runtime.pay`) + the reconciliation seam.
 3. `elastos-server/src/api/handlers/capability.rs` — issue/revoke/dispatch handlers + receipt export.
 4. `elastos-server/src/api/gateway_mandates.rs` — the shell app's read/grant/revoke surface.
 5. `capsules/mandates/index.html` — the operator UI (list, receipt drawer, grant form, kill switch, Agent State).

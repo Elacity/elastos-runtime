@@ -194,12 +194,18 @@ pub struct HttpPaymentProvider {
     timeout: std::time::Duration,
 }
 
+/// How long one rail call may block a dispatch worker. Sized against
+/// [`MAX_INFLIGHT_PAYMENTS`]: the worst-case wedge with every in-flight slot stuck is
+/// `MAX_INFLIGHT_PAYMENTS × RAIL_TIMEOUT` of blocked worker time, so raising either means
+/// re-checking the other.
+const RAIL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl HttpPaymentProvider {
     pub fn new(endpoint: String, bearer_token: Option<String>) -> Self {
         Self {
             endpoint,
             bearer_token,
-            timeout: std::time::Duration::from_secs(30),
+            timeout: RAIL_TIMEOUT,
         }
     }
 
@@ -732,21 +738,18 @@ impl MethodRegistryExecutor {
                         self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     }
                 }
-                let slot = {
-                    let prior = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let slot = InFlightSlot(in_flight.clone());
-                    if prior >= MAX_INFLIGHT_PAYMENTS {
-                        drop(slot);
-                        return IntentExecution::Declined {
-                            reason: format!(
-                                "payment refused: {MAX_INFLIGHT_PAYMENTS} payments already \
-                                 in-flight (fail-closed concurrency bound; retry later)"
-                            ),
-                        };
-                    }
-                    slot
-                };
-                let _slot = slot;
+                // Claim an in-flight slot; the RAII guard releases it on EVERY exit path
+                // (including the over-bound refusal below and a rail panic).
+                let prior = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _slot = InFlightSlot(in_flight.clone());
+                if prior >= MAX_INFLIGHT_PAYMENTS {
+                    return IntentExecution::Declined {
+                        reason: format!(
+                            "payment refused: {MAX_INFLIGHT_PAYMENTS} payments already \
+                             in-flight (fail-closed concurrency bound; retry later)"
+                        ),
+                    };
+                }
                 // The idempotency key: unique per SIGNED declaration (an intent_id can recycle
                 // once it ages out of the replay window; a signature cannot).
                 let idempotency_key = format!("flint-{}", intent.signature);
@@ -757,7 +760,10 @@ impl MethodRegistryExecutor {
                 // this key already carries a money-moved-or-may-have entry (Performed, Pending, or
                 // ResolvedCharged), the payment already happened — refuse fail-closed WITHOUT
                 // reserving or paying again (idempotent no-op). A prior NotCharged/ResolvedNotCharged
-                // (provably nothing moved) is allowed to retry. RESIDUAL (MKT-DRM): the ledger
+                // (provably nothing moved) is allowed to retry. This read is a FAST PATH: the same
+                // invariant is enforced atomically by `begin_attempt` → `AlreadyActive` below; the
+                // pre-check just refuses before the durable debit+refund round-trip.
+                // RESIDUAL (MKT-DRM): the ledger
                 // eviction cap means a very old terminal key can be evicted, reopening a retry —
                 // bounded, and pending/charged keys are never evicted.
                 if let Some(existing) = ledger.get(&idempotency_key) {
