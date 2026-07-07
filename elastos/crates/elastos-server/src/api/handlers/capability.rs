@@ -3293,10 +3293,21 @@ mod tests {
         ran: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
     impl crate::drm_marketplace::DrmSettler for WedgeSettler {
+        fn quote(
+            &self,
+            _b: &crate::drm_marketplace::DrmBinding,
+        ) -> Result<crate::drm_marketplace::DrmQuote, crate::drm_marketplace::DrmSettleError> {
+            // A FREE quote — the S36 price gate is a no-op for the S34/S35 e2e (they test the
+            // lifecycle, not the price gate, which has its own unit tests).
+            Ok(crate::drm_marketplace::DrmQuote {
+                price: "0".to_string(),
+                pay_token: "usdc".to_string(),
+            })
+        }
         fn settle(
             &self,
             _b: &crate::drm_marketplace::DrmBinding,
-            _amount: u64,
+            _q: &crate::drm_marketplace::DrmQuote,
             _key: &str,
         ) -> Result<crate::drm_marketplace::DrmSettlement, crate::drm_marketplace::DrmSettleError>
         {
@@ -3326,10 +3337,19 @@ mod tests {
         count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
     impl crate::drm_marketplace::DrmSettler for CountingSettler {
+        fn quote(
+            &self,
+            _b: &crate::drm_marketplace::DrmBinding,
+        ) -> Result<crate::drm_marketplace::DrmQuote, crate::drm_marketplace::DrmSettleError> {
+            Ok(crate::drm_marketplace::DrmQuote {
+                price: "0".to_string(),
+                pay_token: "usdc".to_string(),
+            })
+        }
         fn settle(
             &self,
             _b: &crate::drm_marketplace::DrmBinding,
-            _amount: u64,
+            _q: &crate::drm_marketplace::DrmQuote,
             _key: &str,
         ) -> Result<crate::drm_marketplace::DrmSettlement, crate::drm_marketplace::DrmSettleError>
         {
@@ -3370,7 +3390,7 @@ mod tests {
         let meter = std::sync::Arc::new(elastos_runtime::primitives::spend::SpendMeter::new());
         let ledger = std::sync::Arc::new(crate::payment_ledger::PaymentLedger::new());
         let provider = std::sync::Arc::new(crate::drm_marketplace::DrmMarketplaceProvider::new(
-            resolver, settler,
+            resolver, settler, 1,
         ));
         state.intent_executor = std::sync::Arc::new(
             crate::intent_executor::MethodRegistryExecutor::production(
@@ -3468,7 +3488,7 @@ mod tests {
         assert_eq!(meter.remaining("vm-shopper"), 200, "the reservation is held (not refunded)");
         let rec = ledger.get(&idem).expect("a pending rail record exists");
         assert_eq!(rec.status, crate::payment_ledger::PaymentStatus::Pending);
-        assert_eq!(rec.rail_note, "drm:tx=0xC0FFEE;op=0xopER;tid=42");
+        assert_eq!(rec.rail_note, "drm:tx=0xC0FFEE;op=0xopER;tid=42;price=0;tok=usdc");
         assert_eq!(rec.token_id.as_deref(), Some(token_id.as_str()), "bound to the mandate");
 
         // The receipt carries NO rail_ref yet (the tx is not confirmed).
@@ -3517,7 +3537,7 @@ mod tests {
         });
         assert_eq!(
             use_rail_ref.as_deref(),
-            Some("drm:tx=0xC0FFEE;op=0xopER;tid=42"),
+            Some("drm:tx=0xC0FFEE;op=0xopER;tid=42;price=0;tok=usdc"),
             "the confirmed receipt's pay-use row carries the on-chain settlement reference"
         );
         let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();

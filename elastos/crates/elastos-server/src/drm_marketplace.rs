@@ -91,41 +91,70 @@ pub enum DrmSettleError {
     Indeterminate(String),
 }
 
-/// Execute a buy for an already-resolved binding and classify the outcome two-generals-honestly.
-/// Production wraps `buy_authority::buy_access`; CI injects a mock that returns each branch.
+/// The on-chain price of a listing, READ-ONLY, sourced BEFORE the buy (Sprint 36 — the price gate).
+/// `price` is the pay-token's smallest-unit amount as a decimal string; `pay_token` is the ERC-20
+/// address or `"native"`. The pay gate compares the mandate's cap against `price` before any money
+/// moves, and the receipt names it — so the cap is a LITERAL on-chain ceiling, not just intent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrmQuote {
+    pub price: String,
+    pub pay_token: String,
+}
+
+/// Quote (read-only) and then execute a buy for an already-resolved binding, classifying the
+/// settle two-generals-honestly. Production wraps `buy_authority::{quote_buy, buy_access}`; CI
+/// injects a mock. `settle` receives the SAME quote the gate approved, so the adapter can bind it
+/// as the expected price (abort-on-drift fires if the live price changed before broadcast).
 pub trait DrmSettler: Send + Sync {
+    /// The on-chain cost of this binding, without broadcasting. `NotBroadcast` on a fail-closed
+    /// sourcing failure (no listing / sold out); `Indeterminate` if the price read itself was
+    /// ambiguous (rare — the gate then holds the reservation).
+    fn quote(&self, binding: &DrmBinding) -> Result<DrmQuote, DrmSettleError>;
     fn settle(
         &self,
         binding: &DrmBinding,
-        amount: u64,
+        quote: &DrmQuote,
         idempotency_key: &str,
     ) -> Result<DrmSettlement, DrmSettleError>;
 }
 
-/// A [`PaymentProvider`] whose rail is the DRM marketplace. Resolve (fail-closed) → settle
-/// (two-generals) → a `rail_ref` naming the tx + the bound `(operative, tokenId)`.
+/// A [`PaymentProvider`] whose rail is the DRM marketplace. Resolve (fail-closed) → quote →
+/// PRICE-GATE the mandate's cap against the on-chain price → settle (two-generals) → a `rail_ref`
+/// naming the tx, the bound `(operative, tokenId)`, and the pay-token price.
 pub struct DrmMarketplaceProvider {
     resolver: Arc<dyn DrmResolver>,
     settler: Arc<dyn DrmSettler>,
+    /// Pay-token smallest-units per ONE spend unit (Sprint 36 — the declared unit mapping). The
+    /// gate authorizes `amount * spend_unit` pay-token units; a buy priced above that is refused
+    /// before broadcast. The DRM rail refuses to wire without an explicit value (`build_pay_rail`),
+    /// so a deployment must DECLARE the mapping rather than silently assume 1:1.
+    spend_unit: u128,
 }
 
 impl DrmMarketplaceProvider {
-    pub fn new(resolver: Arc<dyn DrmResolver>, settler: Arc<dyn DrmSettler>) -> Self {
-        Self { resolver, settler }
+    pub fn new(resolver: Arc<dyn DrmResolver>, settler: Arc<dyn DrmSettler>, spend_unit: u128) -> Self {
+        Self {
+            resolver,
+            settler,
+            spend_unit: spend_unit.max(1),
+        }
     }
 
-    /// The canonical `rail_ref` for a settled DRM buy: `drm:tx=<hash>;op=<operative>;tid=<tokenId>`.
-    /// Compact, greppable, and (after the pay path's `sanitize_rail_note`) printable-bounded before
-    /// it enters the signed receipt. The `;` and `=` DELIMITERS are stripped from each
-    /// chain-supplied component first (council S34 red-team F3): an `operative` containing a
-    /// literal `;tid=` must not be able to forge the parsed binding in the receipt.
-    fn rail_ref(binding: &DrmBinding, settlement: &DrmSettlement) -> String {
+    /// The canonical `rail_ref` for a settled DRM buy:
+    /// `drm:tx=<hash>;op=<operative>;tid=<tokenId>;price=<price>;tok=<pay_token>`. Compact,
+    /// greppable, printable-bounded before it enters the signed receipt (P12: the receipt names the
+    /// pay-token price actually authorized). The `;`/`=` DELIMITERS are stripped from each
+    /// chain-supplied component (council S34 red-team F3) so a hostile field cannot forge the
+    /// parsed binding.
+    fn rail_ref(binding: &DrmBinding, quote: &DrmQuote, settlement: &DrmSettlement) -> String {
         let clean = |s: &str| s.replace([';', '='], "");
         format!(
-            "drm:tx={};op={};tid={}",
+            "drm:tx={};op={};tid={};price={};tok={}",
             clean(&settlement.tx_hash),
             clean(&binding.operative),
-            clean(&binding.token_id)
+            clean(&binding.token_id),
+            clean(&quote.price),
+            clean(&quote.pay_token),
         )
     }
 }
@@ -142,10 +171,46 @@ impl PaymentProvider for DrmMarketplaceProvider {
                 PayError::NotCharged(format!("DRM asset binding ambiguous (fail closed): {why}"))
             }
         })?;
-        // Settle. NotBroadcast ⇒ refund; Indeterminate ⇒ keep the reservation (the tx may confirm).
+        // Quote the on-chain price BEFORE broadcasting (read-only).
+        let quote = self.settler.quote(&binding).map_err(|e| match e {
+            DrmSettleError::NotBroadcast(why) => {
+                PayError::NotCharged(format!("DRM quote failed (nothing broadcast): {why}"))
+            }
+            DrmSettleError::Indeterminate(why) => {
+                PayError::Indeterminate(format!("DRM quote indeterminate: {why}"))
+            }
+        })?;
+        // THE PRICE GATE (Sprint 36): the mandate's cap, converted to pay-token units via the
+        // declared unit mapping, MUST cover the on-chain price — else refuse BEFORE broadcast
+        // (NotCharged/refund), never buy at a price the mandate did not authorize. Fail-closed on
+        // an unparseable price or a conversion overflow.
+        let price: u128 = quote.price.trim().parse().map_err(|_| {
+            PayError::NotCharged(format!(
+                "DRM on-chain price is not a parseable amount ({}) — refused before broadcast",
+                quote.price
+            ))
+        })?;
+        let authorized = (amount as u128).checked_mul(self.spend_unit).ok_or_else(|| {
+            PayError::NotCharged(
+                "DRM cap conversion overflowed (amount * spend_unit) — refused before broadcast"
+                    .to_string(),
+            )
+        })?;
+        if authorized < price {
+            return Err(PayError::NotCharged(format!(
+                "DRM buy refused before broadcast: the mandate authorizes {authorized} {tok} \
+                 units ({amount} spend units × {unit}) but the on-chain price is {price} {tok} — \
+                 raise the cap or lower the mandate amount",
+                tok = quote.pay_token,
+                unit = self.spend_unit,
+            )));
+        }
+        // Cap covers the price — settle. NotBroadcast ⇒ refund; Indeterminate ⇒ keep the
+        // reservation (the tx may confirm). `settle` binds this quote as the expected price, so a
+        // live price drift before broadcast aborts fail-closed.
         let settlement = self
             .settler
-            .settle(&binding, amount, idempotency_key)
+            .settle(&binding, &quote, idempotency_key)
             .map_err(|e| match e {
                 DrmSettleError::NotBroadcast(why) => {
                     PayError::NotCharged(format!("DRM buy not broadcast: {why}"))
@@ -156,10 +221,13 @@ impl PaymentProvider for DrmMarketplaceProvider {
             })?;
         // Sprint 35: a broadcast-accepted buy is NEVER recorded charged/Performed here — it is
         // INDETERMINATE (Pending), the reservation held, the `rail_ref` carried as the reason so
-        // the pending ledger record holds the tx. `reconcile_drm_confirmations` promotes it to
-        // charged (and binds the receipt) only once the chain confirms it. Returning `Ok` would
-        // attest a settlement `buy_access` only reported as broadcast-accepted (zero confirmations).
-        Err(PayError::Indeterminate(Self::rail_ref(&binding, &settlement)))
+        // the pending ledger record holds the tx + price. `reconcile_drm_confirmations` promotes it
+        // to charged (and binds the receipt) only once the chain confirms it.
+        Err(PayError::Indeterminate(Self::rail_ref(
+            &binding,
+            &quote,
+            &settlement,
+        )))
     }
 }
 
@@ -249,16 +317,35 @@ impl DrmResolver for ChainDrmMarketplace {
 }
 
 impl DrmSettler for ChainDrmMarketplace {
+    fn quote(&self, binding: &DrmBinding) -> Result<DrmQuote, DrmSettleError> {
+        // Read-only price source (Sprint 36) — NO broadcast. A sourcing failure (no listing / sold
+        // out) is a provable PRE-BROADCAST NotBroadcast (refund); it should never be Indeterminate.
+        let target = crate::api::buy_authority::BuyTarget {
+            operative: Some(binding.operative.clone()),
+            token_id: Some(binding.token_id.clone()),
+            ledger: Some(self.ledger.clone()),
+            ..Default::default()
+        };
+        match crate::api::buy_authority::quote_buy(&binding.content_id, &target) {
+            Ok(q) => Ok(DrmQuote {
+                price: q.price,
+                pay_token: q.pay_token,
+            }),
+            Err(e) => Err(DrmSettleError::NotBroadcast(e)),
+        }
+    }
+
     fn settle(
         &self,
         binding: &DrmBinding,
-        _amount: u64,
+        quote: &DrmQuote,
         _idempotency_key: &str,
     ) -> Result<DrmSettlement, DrmSettleError> {
-        // Pass the already-resolved binding to the buy so it never re-resolves (and never re-opens
-        // the ambiguity window): operative + tokenId are pinned. The on-chain price is sourced LIVE
-        // from the listing (the meter already capped the spend-unit budget; the meter-unit ⇄
-        // on-chain-price reconciliation is a stated residual — KNOWN_GAPS MKT-DRM).
+        // Pass the already-resolved binding to the buy so it never re-resolves (pinned operative +
+        // tokenId). Sprint 36: bind the GATED price as the expected price, so the buy's own
+        // abort-on-drift (`ensure_no_drift`) fails closed if the live price changed between the
+        // quote-gate and the broadcast — the buy can never settle above the price the mandate's cap
+        // was gated against.
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -267,6 +354,7 @@ impl DrmSettler for ChainDrmMarketplace {
             operative: Some(binding.operative.clone()),
             token_id: Some(binding.token_id.clone()),
             ledger: Some(self.ledger.clone()),
+            expected_price: Some(quote.price.clone()),
             ..Default::default()
         };
         match crate::api::buy_authority::buy_access(
@@ -283,7 +371,7 @@ impl DrmSettler for ChainDrmMarketplace {
             // that provably describe a PRE-BROADCAST refusal are NotBroadcast (refundable);
             // anything that might have reached the chain stays Indeterminate (keep the
             // reservation — the one unbreakable invariant). The recognized pre-broadcast phrases
-            // are the buy path's own fail-closed guards.
+            // are the buy path's own fail-closed guards (incl. price-drift abort).
             Err(e) if is_pre_broadcast_refusal(&e) => Err(DrmSettleError::NotBroadcast(e)),
             Err(e) => Err(DrmSettleError::Indeterminate(e)),
         }
@@ -473,24 +561,37 @@ mod tests {
         }
     }
 
-    /// A scripted settler that records whether it was called and returns a fixed outcome.
+    /// A scripted settler that records whether it was called, quotes a fixed price, and returns a
+    /// fixed settle outcome.
     struct MockSettler {
         outcome: Mutex<Option<Result<DrmSettlement, &'static str>>>,
         called: Mutex<bool>,
+        price: String,
     }
     impl MockSettler {
+        /// A FREE quote (price 0) — the price gate is a no-op; used by the non-gate tests.
         fn new(outcome: Result<DrmSettlement, &'static str>) -> Self {
+            Self::priced(outcome, "0")
+        }
+        fn priced(outcome: Result<DrmSettlement, &'static str>, price: &str) -> Self {
             Self {
                 outcome: Mutex::new(Some(outcome)),
                 called: Mutex::new(false),
+                price: price.to_string(),
             }
         }
     }
     impl DrmSettler for MockSettler {
+        fn quote(&self, _b: &DrmBinding) -> Result<DrmQuote, DrmSettleError> {
+            Ok(DrmQuote {
+                price: self.price.clone(),
+                pay_token: "usdc".to_string(),
+            })
+        }
         fn settle(
             &self,
             _b: &DrmBinding,
-            _a: u64,
+            _q: &DrmQuote,
             _k: &str,
         ) -> Result<DrmSettlement, DrmSettleError> {
             *self.called.lock().unwrap() = true;
@@ -520,10 +621,11 @@ mod tests {
             Arc::new(MockSettler::new(Ok(DrmSettlement {
                 tx_hash: "0xdead".to_string(),
             }))),
+            1,
         );
         match provider.pay("QmAsset", 500, "flint-sig").unwrap_err() {
             PayError::Indeterminate(rail_ref) => {
-                assert_eq!(rail_ref, "drm:tx=0xdead;op=0xop;tid=42");
+                assert_eq!(rail_ref, "drm:tx=0xdead;op=0xop;tid=42;price=0;tok=usdc");
                 assert_eq!(
                     parse_drm_tx(&rail_ref),
                     Some("0xdead"),
@@ -540,7 +642,7 @@ mod tests {
             tx_hash: "0xshouldnothappen".to_string(),
         })));
         let provider =
-            DrmMarketplaceProvider::new(Arc::new(MockResolver(Err("ambiguous"))), settler.clone());
+            DrmMarketplaceProvider::new(Arc::new(MockResolver(Err("ambiguous"))), settler.clone(), 1);
         let err = provider.pay("QmAsset", 500, "flint-sig").unwrap_err();
         match err {
             PayError::NotCharged(msg) => assert!(msg.contains("ambiguous")),
@@ -559,6 +661,7 @@ mod tests {
             Arc::new(MockSettler::new(Ok(DrmSettlement {
                 tx_hash: "x".to_string(),
             }))),
+            1,
         );
         assert!(matches!(
             provider.pay("QmGone", 1, "k").unwrap_err(),
@@ -571,6 +674,7 @@ mod tests {
         let not_broadcast = DrmMarketplaceProvider::new(
             Arc::new(MockResolver(Ok(binding()))),
             Arc::new(MockSettler::new(Err("not_broadcast"))),
+            1,
         );
         assert!(matches!(
             not_broadcast.pay("QmAsset", 1, "k").unwrap_err(),
@@ -580,11 +684,94 @@ mod tests {
         let indeterminate = DrmMarketplaceProvider::new(
             Arc::new(MockResolver(Ok(binding()))),
             Arc::new(MockSettler::new(Err("indeterminate"))),
+            1,
         );
         assert!(matches!(
             indeterminate.pay("QmAsset", 1, "k").unwrap_err(),
             PayError::Indeterminate(_)
         ));
+    }
+
+    /// Sprint 36 ratchet (a): a buy whose mandate cap (converted via the unit mapping) is BELOW the
+    /// on-chain price is refused before ANY broadcast — the settler is never called.
+    #[test]
+    fn a_buy_below_the_on_chain_price_is_refused_before_broadcast() {
+        // spend_unit = 1 (1 spend unit == 1 pay-token unit). Quote price 500; the mandate amount
+        // 300 authorizes only 300 — below the price ⇒ refuse, never settle.
+        let settler = Arc::new(MockSettler::priced(
+            Ok(DrmSettlement { tx_hash: "0xNOPE".to_string() }),
+            "500",
+        ));
+        let provider = DrmMarketplaceProvider::new(
+            Arc::new(MockResolver(Ok(binding()))),
+            settler.clone(),
+            1,
+        );
+        match provider.pay("QmAsset", 300, "k").unwrap_err() {
+            PayError::NotCharged(msg) => {
+                assert!(msg.contains("refused before broadcast"), "{msg}");
+                assert!(msg.contains("500"), "the message names the on-chain price: {msg}");
+            }
+            other => panic!("a below-price buy must be NotCharged, got {other:?}"),
+        }
+        assert!(
+            !*settler.called.lock().unwrap(),
+            "the settler must NEVER be called for a below-price buy — no broadcast"
+        );
+    }
+
+    /// Sprint 36 ratchet (b): an exact-match buy (converted cap == price) proceeds, and the
+    /// rail_ref names the pay-token price. The unit mapping scales the cap: spend_unit 1_000_000
+    /// (USDC 6-decimals) means a 5-spend-unit mandate authorizes 5_000_000 units, covering a
+    /// 5_000_000 price.
+    #[test]
+    fn an_exact_match_buy_proceeds_and_the_rail_ref_names_the_price() {
+        let settler = Arc::new(MockSettler::priced(
+            Ok(DrmSettlement { tx_hash: "0xC0FFEE".to_string() }),
+            "5000000",
+        ));
+        let provider = DrmMarketplaceProvider::new(
+            Arc::new(MockResolver(Ok(binding()))),
+            settler.clone(),
+            1_000_000,
+        );
+        match provider.pay("QmAsset", 5, "k").unwrap_err() {
+            PayError::Indeterminate(rail_ref) => {
+                assert_eq!(rail_ref, "drm:tx=0xC0FFEE;op=0xop;tid=42;price=5000000;tok=usdc");
+            }
+            other => panic!("an exact-match buy should broadcast (Indeterminate), got {other:?}"),
+        }
+        assert!(*settler.called.lock().unwrap(), "the buy settled");
+
+        // One unit SHORT of the price ⇒ refused (spend_unit 1_000_000, amount 4 ⇒ 4_000_000 < 5M).
+        let below = DrmMarketplaceProvider::new(
+            Arc::new(MockResolver(Ok(binding()))),
+            Arc::new(MockSettler::priced(
+                Ok(DrmSettlement { tx_hash: "0xNO".to_string() }),
+                "5000000",
+            )),
+            1_000_000,
+        );
+        assert!(matches!(
+            below.pay("QmAsset", 4, "k").unwrap_err(),
+            PayError::NotCharged(_)
+        ));
+    }
+
+    /// Sprint 36: an unparseable on-chain price is fail-closed refused before broadcast.
+    #[test]
+    fn an_unparseable_price_is_refused_before_broadcast() {
+        let settler = Arc::new(MockSettler::priced(
+            Ok(DrmSettlement { tx_hash: "0xNOPE".to_string() }),
+            "not-a-number",
+        ));
+        let provider =
+            DrmMarketplaceProvider::new(Arc::new(MockResolver(Ok(binding()))), settler.clone(), 1);
+        assert!(matches!(
+            provider.pay("QmAsset", 999, "k").unwrap_err(),
+            PayError::NotCharged(_)
+        ));
+        assert!(!*settler.called.lock().unwrap(), "no settle on an unparseable price");
     }
 
     #[test]
@@ -649,11 +836,20 @@ mod tests {
         let settlement = DrmSettlement {
             tx_hash: "0x;op=fake".to_string(),
         };
-        let rail_ref = DrmMarketplaceProvider::rail_ref(&hostile, &settlement);
-        // Exactly ONE of each delimiter key — the injected ones were stripped.
+        let quote = DrmQuote {
+            price: "1;tid=9".to_string(),
+            pay_token: "usdc;x".to_string(),
+        };
+        let rail_ref = DrmMarketplaceProvider::rail_ref(&hostile, &quote, &settlement);
+        // Exactly ONE of each delimiter key — the injected ones were stripped from every field.
         assert_eq!(rail_ref.matches(";tid=").count(), 1, "no forged tid segment: {rail_ref}");
         assert_eq!(rail_ref.matches(";op=").count(), 1, "no forged op segment: {rail_ref}");
-        assert_eq!(rail_ref, "drm:tx=0xopfake;op=0xrealtid999;tid=42");
+        assert_eq!(rail_ref.matches(";price=").count(), 1, "no forged price segment: {rail_ref}");
+        assert_eq!(rail_ref.matches(";tok=").count(), 1, "no forged tok segment: {rail_ref}");
+        assert_eq!(
+            rail_ref,
+            "drm:tx=0xopfake;op=0xrealtid999;tid=42;price=1tid9;tok=usdcx"
+        );
     }
 
     #[test]

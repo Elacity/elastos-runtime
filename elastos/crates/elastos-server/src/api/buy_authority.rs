@@ -255,6 +255,51 @@ pub fn buy_access(
     }
 }
 
+/// The on-chain price + pay-token of a DRM listing, READ-ONLY (Sprint 36 — the price gate). The
+/// price is the pay-token's smallest-unit amount as a decimal string (e.g. USDC 6-decimals);
+/// `pay_token` is the ERC-20 address, or `"native"` for a zero-address (ETH) listing. Sourced
+/// WITHOUT broadcasting so the pay gate can compare the mandate's cap against the real cost before
+/// any money moves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuyQuote {
+    pub price: String,
+    pub pay_token: String,
+    pub supply: u128,
+}
+
+/// Read-only quote of what `buy_access` WOULD charge for `content_id`, without broadcasting
+/// (Sprint 36). On the `chain` path it live-sources the lowest active listing's price + pay-token
+/// via [`source_buy_terms`] (fail-closed on no listing / sold out); on dev/chain-mock there is no
+/// real listing, so it returns a FREE quote (`price = "0"`, native) — the price gate is a no-op in
+/// those insecure modes, which already require the explicit mock opt-in to wire the DRM rail.
+pub fn quote_buy(content_id: &str, target: &BuyTarget) -> Result<BuyQuote, String> {
+    match super::rights_authority::rights_mode() {
+        RightsMode::Chain => {
+            let sourced = source_buy_terms(content_id, target)?;
+            if sourced.supply == 0 {
+                return Err(
+                    "listing sold out (on-chain supply 0) — buy aborted (fail closed)".to_string(),
+                );
+            }
+            Ok(BuyQuote {
+                price: sourced.live.price,
+                pay_token: if sourced.live.pay_token.eq_ignore_ascii_case(ZERO_ADDR) {
+                    "native".to_string()
+                } else {
+                    sourced.live.pay_token
+                },
+                supply: sourced.supply,
+            })
+        }
+        // Dev / ChainMock have no real listing to price — a FREE quote (the gate always passes).
+        _ => Ok(BuyQuote {
+            price: "0".to_string(),
+            pay_token: "native".to_string(),
+            supply: 1,
+        }),
+    }
+}
+
 /// The zero EVM address (a native/ETH listing's `payToken`).
 const ZERO_ADDR: &str = "0x0000000000000000000000000000000000000000";
 /// Cap the live seller scan when sourcing the lowest active listing (bounded RPC fan-out).

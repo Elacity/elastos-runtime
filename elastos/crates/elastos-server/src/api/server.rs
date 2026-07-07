@@ -196,6 +196,36 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
             );
             return None;
         }
+        // The declared meter-unit⇄pay-token mapping (Sprint 36 — the price gate). One spend unit
+        // authorizes this many pay-token SMALLEST units (e.g. USDC 6-decimals: `1000000` ⇒ 1
+        // spend unit == 1 USDC). REQUIRED and >= 1: a Chain-mode DRM rail refuses to wire without
+        // it, rather than silently assuming 1 spend unit == 1 wei — so the operator must DECLARE
+        // the unit and the cap becomes a literal on-chain ceiling. Dev/ChainMock (mock-opt-in) may
+        // omit it (a free quote makes the gate a no-op) ⇒ default 1.
+        let is_chain_mode =
+            matches!(mode, super::rights_authority::RightsMode::Chain);
+        let spend_unit = match std::env::var("ELASTOS_DRM_SPEND_UNIT") {
+            Ok(v) => match v.trim().parse::<u128>() {
+                Ok(n) if n >= 1 => n,
+                _ => {
+                    tracing::error!(
+                        "ELASTOS_DRM_SPEND_UNIT={v:?} is not a positive integer — the DRM price \
+                         gate cannot map spend units to the pay token; runtime.pay stays UNWIRED"
+                    );
+                    return None;
+                }
+            },
+            Err(_) if is_chain_mode => {
+                tracing::error!(
+                    "ELASTOS_PAYMENT_RAIL=drm on the live Chain rail requires \
+                     ELASTOS_DRM_SPEND_UNIT (pay-token smallest-units per spend unit, e.g. \
+                     1000000 for USDC) so the cap is a literal on-chain ceiling — refusing to \
+                     wire the DRM rail with an undeclared unit mapping (fail-closed)"
+                );
+                return None;
+            }
+            Err(_) => 1, // dev/chain-mock: the quote is free, so the gate is a no-op
+        };
         let principal = std::env::var("ELASTOS_DRM_BUYER_PRINCIPAL").unwrap_or_default();
         let subject = std::env::var("ELASTOS_DRM_BUYER_SUBJECT").unwrap_or_default();
         let ledger = std::env::var("ELASTOS_DDRM_LEDGER").unwrap_or_default();
@@ -230,6 +260,7 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
                     provider: Arc::new(crate::drm_marketplace::DrmMarketplaceProvider::new(
                         marketplace.clone(),
                         marketplace,
+                        spend_unit,
                     )),
                     ledger: payment_ledger,
                 })
@@ -1055,6 +1086,7 @@ mod tests {
             "ELASTOS_PAYMENT_ENDPOINT",
             "ELASTOS_ALLOW_MOCK_PAYMENTS",
             "ELASTOS_DDRM_RIGHTS",
+            "ELASTOS_DRM_SPEND_UNIT",
         ];
         let _guard = EnvGuard(keys.iter().map(|k| (*k, std::env::var(k).ok())).collect());
         for k in keys {
@@ -1063,8 +1095,16 @@ mod tests {
 
         std::env::set_var("ELASTOS_PAYMENT_RAIL", "drm");
 
-        // Secure Chain mode ⇒ the DRM rail wires on the durable stores (no mock opt-in needed).
+        // Secure Chain mode WITHOUT the declared unit mapping ⇒ refuses to wire (Sprint 36).
         std::env::set_var("ELASTOS_DDRM_RIGHTS", "chain");
+        std::env::remove_var("ELASTOS_DRM_SPEND_UNIT");
+        let dir0 = tempfile::tempdir().unwrap();
+        assert!(
+            build_pay_rail(Some(dir0.path())).is_none(),
+            "the live DRM rail refuses to wire without ELASTOS_DRM_SPEND_UNIT (fail-closed)"
+        );
+        // With the unit declared ⇒ the DRM rail wires on the durable stores (no mock opt-in needed).
+        std::env::set_var("ELASTOS_DRM_SPEND_UNIT", "1000000");
         let dir = tempfile::tempdir().unwrap();
         let rail = build_pay_rail(Some(dir.path())).expect("DRM rail wires under Chain mode");
         assert!(rail.meter.is_durable());
