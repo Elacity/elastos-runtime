@@ -165,6 +165,52 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
         },
         None => Some(Arc::new(crate::payment_ledger::PaymentLedger::new())),
     };
+    // The DRM marketplace rail (Sprint 34): `ELASTOS_PAYMENT_RAIL=drm` settles `runtime.pay`
+    // acts on the Elacity on-chain DRM marketplace instead of an HTTPS endpoint. Same spine — it
+    // REQUIRES the durable meter+ledger (real money on non-durable stores is refused), shares the
+    // exact two-generals classification and receipt path. The buyer principal/subject/ledger come
+    // from env; the live chain is exercised only by the operator runbook, never CI.
+    let drm_rail = std::env::var("ELASTOS_PAYMENT_RAIL")
+        .map(|v| v.trim().eq_ignore_ascii_case("drm"))
+        .unwrap_or(false);
+    if drm_rail {
+        if real_endpoint.is_some() {
+            tracing::warn!(
+                "both ELASTOS_PAYMENT_RAIL=drm and ELASTOS_PAYMENT_ENDPOINT are set — the DRM \
+                 marketplace rail wins; the HTTP endpoint is ignored"
+            );
+        }
+        let principal = std::env::var("ELASTOS_DRM_BUYER_PRINCIPAL").unwrap_or_default();
+        let subject = std::env::var("ELASTOS_DRM_BUYER_SUBJECT").unwrap_or_default();
+        let ledger = std::env::var("ELASTOS_DDRM_LEDGER").unwrap_or_default();
+        return match (open_durable_meter(), open_ledger()) {
+            (Some(meter), Some(payment_ledger)) => {
+                tracing::info!(
+                    "runtime.pay is wired to the DRM marketplace rail (durable spend meter; buys \
+                     settle on-chain via buy_authority; provision caps at POST /api/spend-budgets)"
+                );
+                let marketplace = Arc::new(crate::drm_marketplace::ChainDrmMarketplace::new(
+                    principal, subject, ledger,
+                ));
+                Some(PayRail {
+                    meter,
+                    provider: Arc::new(crate::drm_marketplace::DrmMarketplaceProvider::new(
+                        marketplace.clone(),
+                        marketplace,
+                    )),
+                    ledger: payment_ledger,
+                })
+            }
+            _ => {
+                tracing::error!(
+                    "ELASTOS_PAYMENT_RAIL=drm is set but the DURABLE spend meter/ledger is \
+                     unavailable — real money on non-durable stores is refused; runtime.pay \
+                     stays UNWIRED"
+                );
+                None
+            }
+        };
+    }
     if let Some(endpoint) = real_endpoint {
         if mock_allowed {
             tracing::warn!(

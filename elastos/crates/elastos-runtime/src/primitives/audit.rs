@@ -522,6 +522,18 @@ pub enum AuditEvent {
         resource: String,
         action: String,
         success: bool,
+        /// The rail's reference for an act that settled on an external rail (Sprint 34): for a
+        /// `runtime.pay` act it is the payment/on-chain reference (e.g. a DRM buy's tx hash +
+        /// `operative:tokenId`), sanitized and bounded. `None` for every non-rail act. This is
+        /// the on-chain truth the portable receipt carries — WHICH tx settled the mandate's
+        /// payment — beyond the amount already in `input_hash`.
+        ///
+        /// BACK-COMPAT IS LOAD-BEARING (mirrors S32 `responsible_entity`): appended LAST with
+        /// `#[serde(default, skip_serializing_if = "Option::is_none")]`, so a pre-S34
+        /// `CapabilityUse` (no field ⇒ None) re-serializes byte-identically and every pre-S34
+        /// signed chain still verifies.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rail_ref: Option<String>,
     },
 
     /// Content fetched via elastos://
@@ -1427,6 +1439,22 @@ impl AuditLog {
         action: Action,
         success: bool,
     ) {
+        self.capability_use_with_rail_ref(token_id, capsule_id, resource, action, success, None);
+    }
+
+    /// Emit a `CapabilityUse` carrying the rail reference for an act that settled on an external
+    /// rail (Sprint 34 — a `runtime.pay` DRM buy's tx hash + `operative:tokenId`). Passing `None`
+    /// is exactly [`capability_use`](Self::capability_use); the field is omitted from the signed
+    /// preimage, so a rail-less use stays byte-identical to a pre-S34 record.
+    pub fn capability_use_with_rail_ref(
+        &self,
+        token_id: &TokenId,
+        capsule_id: &str,
+        resource: &ResourceId,
+        action: Action,
+        success: bool,
+        rail_ref: Option<String>,
+    ) {
         self.emit_best_effort(AuditEvent::CapabilityUse {
             timestamp: SecureTimestamp::now(),
             token_id: token_id.to_string(),
@@ -1434,6 +1462,7 @@ impl AuditLog {
             resource: resource.to_string(),
             action: action.to_string(),
             success,
+            rail_ref,
         });
     }
 
@@ -2888,5 +2917,91 @@ mod tests {
             .find(|l| l.contains("\"bbbb\""))
             .unwrap()
             .contains("\"responsible_entity\":\"did:web:acme.example\""));
+    }
+
+    #[test]
+    fn rail_ref_is_present_when_set_and_omitted_for_back_compat() {
+        // A pre-S34 CapabilityUse on disk: no `rail_ref` key at all.
+        let legacy = r#"{"type":"capability_use","timestamp":{"unix_secs":100,"monotonic_seq":0},"token_id":"abcd","capsule_id":"vm-a","resource":"elastos://runtime/pay/acme","action":"execute","success":true}"#;
+        let ev: AuditEvent = serde_json::from_str(legacy).unwrap();
+        match &ev {
+            AuditEvent::CapabilityUse { rail_ref, .. } => {
+                assert!(rail_ref.is_none(), "absent field ⇒ None");
+            }
+            _ => panic!("wrong variant"),
+        }
+        // Re-serialization MUST be byte-identical (skip_serializing_if) — else every pre-S34 use
+        // record's chain hash changes and old receipts fail to verify.
+        assert_eq!(
+            serde_json::to_string(&ev).unwrap(),
+            legacy,
+            "a pre-S34 use must re-serialize with NO rail_ref key"
+        );
+
+        // An S34 use carries the reference verbatim, and it round-trips.
+        let settled = AuditEvent::CapabilityUse {
+            timestamp: SecureTimestamp { unix_secs: 100, monotonic_seq: 0 },
+            token_id: "abcd".to_string(),
+            capsule_id: "vm-a".to_string(),
+            resource: "elastos://runtime/pay/acme".to_string(),
+            action: "execute".to_string(),
+            success: true,
+            rail_ref: Some("drm:tx=0xdead;op=0xop;tid=42".to_string()),
+        };
+        let json = serde_json::to_string(&settled).unwrap();
+        assert!(
+            json.contains("\"rail_ref\":\"drm:tx=0xdead;op=0xop;tid=42\""),
+            "a settled use carries the rail reference in its signed record: {json}"
+        );
+        let reparsed = serde_json::from_str::<AuditEvent>(&json).unwrap();
+        assert_eq!(serde_json::to_string(&reparsed).unwrap(), json);
+    }
+
+    /// Sprint 34 belt (mirrors the S32 mixed-chain fixture): a REAL signed chain mixing a
+    /// pre-S34-shaped `CapabilityUse` (no rail_ref) and an S34 one (with it) verifies end-to-end,
+    /// and the field-less record's on-disk line carries NO rail_ref key.
+    #[test]
+    fn a_signed_chain_mixing_pre_and_post_s34_uses_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let log = AuditLog::with_file(&path).unwrap();
+        // A pre-S34-shaped use: rail_ref None ⇒ omitted from the signed bytes.
+        log.emit(AuditEvent::CapabilityUse {
+            timestamp: SecureTimestamp::now(),
+            token_id: "aaaa".to_string(),
+            capsule_id: "vm-a".to_string(),
+            resource: "elastos://runtime/audit-chain".to_string(),
+            action: "read".to_string(),
+            success: true,
+            rail_ref: None,
+        })
+        .unwrap();
+        // An S34 settled pay use: the tx reference is in the signed bytes.
+        log.emit(AuditEvent::CapabilityUse {
+            timestamp: SecureTimestamp::now(),
+            token_id: "bbbb".to_string(),
+            capsule_id: "vm-b".to_string(),
+            resource: "elastos://runtime/pay/acme".to_string(),
+            action: "execute".to_string(),
+            success: true,
+            rail_ref: Some("drm:tx=0xbeef;op=0xop;tid=7".to_string()),
+        })
+        .unwrap();
+        let vk = read_verifying_key(&log);
+        assert!(
+            log.verify_chain(Some(&vk)).is_ok(),
+            "a chain mixing pre- and post-S34 use shapes verifies end-to-end"
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        let aaaa = content.lines().find(|l| l.contains("\"aaaa\"")).unwrap();
+        assert!(
+            !aaaa.contains("rail_ref"),
+            "a None use's SIGNED line omits the field (byte-shape identical to pre-S34): {aaaa}"
+        );
+        assert!(content
+            .lines()
+            .find(|l| l.contains("\"bbbb\""))
+            .unwrap()
+            .contains("\"rail_ref\":\"drm:tx=0xbeef;op=0xop;tid=7\""));
     }
 }

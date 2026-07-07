@@ -98,6 +98,12 @@ pub enum IntentExecution {
         input_hash: String,
         resource: String,
         action: String,
+        /// The external-rail reference for an act that settled on a rail (Sprint 34): a
+        /// `runtime.pay` DRM buy reports the tx hash + `operative:tokenId` here so the dispatch
+        /// pipeline can bind it onto the signed `CapabilityUse` and thus the portable receipt.
+        /// `None` for every act with no rail settlement (all non-pay executors, and a pay whose
+        /// rail returned no reference).
+        rail_ref: Option<String>,
     },
     /// Nothing was performed (no executor for the method, a precondition failed, the target was
     /// absent). Reconciles as `Undelivered` — never a fabricated `Matched`.
@@ -412,6 +418,7 @@ impl MethodRegistryExecutor {
                             // The key actually written, and the action actually performed: a write.
                             resource: intent.resource.clone(),
                             action: "write".to_string(),
+                            rail_ref: None,
                         },
                         Err(e) => IntentExecution::Declined {
                             reason: format!("state_put could not be persisted: {e}"),
@@ -459,6 +466,7 @@ impl MethodRegistryExecutor {
                             input_hash: entry.value_hash,
                             resource: intent.resource.clone(),
                             action: "read".to_string(),
+                            rail_ref: None,
                         },
                         // No such key for this principal ⇒ authorized-but-not-performed (honest:
                         // there is nothing to read), never a fabricated empty value.
@@ -525,6 +533,7 @@ impl MethodRegistryExecutor {
                             // reconciles Diverged, never a misleading Matched.
                             resource: intent.resource.clone(),
                             action: "message".to_string(),
+                            rail_ref: None,
                         },
                         Err(e) => IntentExecution::Declined {
                             reason: format!("notification could not be delivered: {e}"),
@@ -575,6 +584,7 @@ impl MethodRegistryExecutor {
                         // therefore names a read of the CHECK, never of the content bytes.
                         resource: intent.resource.clone(),
                         action: "read".to_string(),
+                        rail_ref: None,
                     }
                 } else {
                     IntentExecution::Declined {
@@ -616,6 +626,7 @@ impl MethodRegistryExecutor {
                         // therefore reconciles `Diverged`, never a misleading `Matched`.
                         resource: AUDIT_CHAIN_RESOURCE.to_string(),
                         action: "read".to_string(),
+                        rail_ref: None,
                     },
                     Err(reason) => IntentExecution::Declined {
                         reason: format!("audit chain did not verify: {reason}"),
@@ -771,9 +782,11 @@ impl MethodRegistryExecutor {
                 };
                 match outcome {
                     Ok(Ok(rail_ref)) => {
-                        // Operator-log + ledger-custody the rail linkage (council S29 F7): the
-                        // receipt itself does not carry the rail reference (a receipt field is the
-                        // tracked follow-on) — these are the audit bridge to the rail's txn.
+                        // Operator-log + ledger-custody the rail linkage (council S29 F7). Sprint
+                        // 34: the reference is ALSO carried up on `Performed.rail_ref` so the
+                        // dispatch pipeline binds it onto the signed `CapabilityUse` and thus the
+                        // portable receipt — the on-chain truth (which tx settled), not only the
+                        // operator log and ledger.
                         tracing::info!(
                             capsule = %intent.capsule,
                             amount,
@@ -781,6 +794,11 @@ impl MethodRegistryExecutor {
                             rail_ref = %rail_ref.chars().take(128).collect::<String>(),
                             "payment performed on the rail"
                         );
+                        // Sanitize the rail-controlled reference to the same printable/bounded
+                        // discipline the ledger uses BEFORE it enters a signed audit field — a
+                        // rail (or a DRM chain adapter) must never inject control bytes into the
+                        // receipt.
+                        let rail_ref = crate::payment_ledger::sanitize_rail_note(&rail_ref);
                         let _ = ledger.record(
                             &idempotency_key,
                             &intent.capsule,
@@ -797,6 +815,7 @@ impl MethodRegistryExecutor {
                             input_hash: amount.to_string(),
                             resource: intent.resource.clone(),
                             action: "execute".to_string(),
+                            rail_ref: (!rail_ref.is_empty()).then_some(rail_ref),
                         }
                     }
                     Ok(Err(PayError::NotCharged(rail_err))) => {
@@ -906,6 +925,7 @@ mod tests {
                 input_hash: i.input_hash.clone(),
                 resource: i.resource.clone(),
                 action: i.action.clone(),
+                rail_ref: None,
             }),
         );
         match reg.execute(&intent("demo.read")) {

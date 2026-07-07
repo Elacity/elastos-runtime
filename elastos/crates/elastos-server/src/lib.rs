@@ -17,6 +17,7 @@ pub mod intent_executor;
 pub mod payment_ledger;
 pub mod crypto;
 pub mod documents;
+pub mod drm_marketplace;
 pub mod egress_audit;
 pub mod fetcher;
 pub mod gateway_cmd;

@@ -547,6 +547,7 @@ impl CapabilityManager {
                     resource: requested_resource.to_string(),
                     action: requested_action.to_string(),
                     success: true,
+                    rail_ref: None,
                 })
                 .map_err(|_| ValidationError::AuditWriteFailed)?;
         } else {

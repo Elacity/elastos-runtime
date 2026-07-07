@@ -2267,6 +2267,12 @@ pub async fn dispatch_standing_intent(
     // and error-logged; putting it on-chain stays the tracked follow-on (S27 F3).
     let decline_reason = Arc::new(std::sync::Mutex::new(None::<String>));
     let decline_reason_w = decline_reason.clone();
+    // The rail reference of a PERFORMED rail act (Sprint 34): captured out of the executor
+    // closure the same way as the decline reason, so the out-of-closure `CapabilityUse` emit can
+    // bind it onto the signed record (and thus the portable receipt). `None` for every non-rail
+    // act; only a `Matched` performance carries it onto the chain (see the emit below).
+    let rail_ref_slot = Arc::new(std::sync::Mutex::new(None::<String>));
+    let rail_ref_w = rail_ref_slot.clone();
     // The act runs ONLY when the gate authorizes (dispatch calls this closure solely on the Acted
     // path), so a denied/revoked/wrong-agent intent never invokes the executor — "no authorization
     // ⇒ no act". The receipt is minted from what the executor REPORTS it performed, never from the
@@ -2304,7 +2310,16 @@ pub async fn dispatch_standing_intent(
                 input_hash,
                 resource,
                 action: performed_action,
+                rail_ref,
             } => {
+                // Stash the rail reference for the out-of-closure use-record. Set only when the
+                // executor actually settled on a rail (a DRM/pay act); the emit binds it onto the
+                // chain ONLY on a Matched reconciliation.
+                if let Some(rail_ref) = rail_ref {
+                    if let Ok(mut slot) = rail_ref_w.lock() {
+                        *slot = Some(rail_ref);
+                    }
+                }
                 let performed = match performed_action.to_lowercase().as_str() {
                     "read" => Action::Read,
                     "write" => Action::Write,
@@ -2385,12 +2400,22 @@ pub async fn dispatch_standing_intent(
         // (like the validate-path use records): a lost emit under-reports in the receipt but the
         // intent-keyed declaration + reconciliation are already durably on the chain.
         if let Ok(token_id) = TokenId::from_hex(intent_for_gate.standing_grant_id.trim()) {
-            manager_for_use.audit_log().capability_use(
+            // Sprint 34: bind the rail reference onto the signed use record — but ONLY on a
+            // Matched performance (`acted`). A diverged/undelivered act records success=false and
+            // carries no rail_ref: a receipt row that names a settlement tx must correspond to a
+            // reconciled act, never an unperformed or divergent one.
+            let rail_ref = if acted {
+                rail_ref_slot.lock().ok().and_then(|mut s| s.take())
+            } else {
+                None
+            };
+            manager_for_use.audit_log().capability_use_with_rail_ref(
                 &token_id,
                 &intent_for_gate.capsule,
                 &ResourceId::new(intent_for_gate.resource.clone()),
                 action,
                 acted,
+                rail_ref,
             );
         }
         Ok(out)
@@ -3121,6 +3146,7 @@ mod tests {
                 input_hash: intent.input_hash.clone(),
                 resource: intent.resource.clone(),
                 action: intent.action.clone(),
+                rail_ref: None,
             }
         }
     }
@@ -3232,6 +3258,320 @@ mod tests {
         assert!(
             elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer)).authenticated,
             "the pay-mandate's receipt verifies off-box"
+        );
+    }
+
+    // ── Sprint 34: the Flint↔DRM wedge — an agent buys a DRM asset under a capped mandate ──
+
+    /// A scripted DRM resolver for the wedge e2e: a fixed binding, or a fixed resolve error.
+    struct WedgeResolver(Result<crate::drm_marketplace::DrmBinding, &'static str>);
+    impl crate::drm_marketplace::DrmResolver for WedgeResolver {
+        fn resolve(
+            &self,
+            _asset: &str,
+        ) -> Result<crate::drm_marketplace::DrmBinding, crate::drm_marketplace::DrmResolveError>
+        {
+            use crate::drm_marketplace::DrmResolveError;
+            match &self.0 {
+                Ok(b) => Ok(b.clone()),
+                Err("ambiguous") => Err(DrmResolveError::Ambiguous("two bindings".to_string())),
+                Err(_) => Err(DrmResolveError::Unresolvable("no channel".to_string())),
+            }
+        }
+    }
+
+    /// A scripted DRM settler that records whether it ran and returns a fixed outcome.
+    struct WedgeSettler {
+        outcome: std::sync::Mutex<Option<Result<crate::drm_marketplace::DrmSettlement, &'static str>>>,
+        ran: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl crate::drm_marketplace::DrmSettler for WedgeSettler {
+        fn settle(
+            &self,
+            _b: &crate::drm_marketplace::DrmBinding,
+            _amount: u64,
+            _key: &str,
+        ) -> Result<crate::drm_marketplace::DrmSettlement, crate::drm_marketplace::DrmSettleError>
+        {
+            use crate::drm_marketplace::DrmSettleError;
+            self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            match self.outcome.lock().unwrap().take().unwrap() {
+                Ok(s) => Ok(s),
+                Err("not_broadcast") => Err(DrmSettleError::NotBroadcast("sold out".to_string())),
+                Err(_) => Err(DrmSettleError::Indeterminate("rpc timeout".to_string())),
+            }
+        }
+    }
+
+    /// Build a MethodRegistryExecutor whose `runtime.pay` rail is a DRM marketplace provider with
+    /// the given scripted resolver/settler, sharing the SAME meter + ledger the assertions read.
+    #[allow(clippy::type_complexity)]
+    fn drm_state(
+        dir: &std::path::Path,
+        resolver: std::sync::Arc<dyn crate::drm_marketplace::DrmResolver>,
+        settler: std::sync::Arc<WedgeSettler>,
+    ) -> (
+        CapabilityState,
+        std::sync::Arc<elastos_runtime::primitives::spend::SpendMeter>,
+        std::sync::Arc<crate::payment_ledger::PaymentLedger>,
+    ) {
+        let mut state = test_state_with_durable_audit(dir);
+        let meter = std::sync::Arc::new(elastos_runtime::primitives::spend::SpendMeter::new());
+        let ledger = std::sync::Arc::new(crate::payment_ledger::PaymentLedger::new());
+        let provider = std::sync::Arc::new(crate::drm_marketplace::DrmMarketplaceProvider::new(
+            resolver, settler,
+        ));
+        state.intent_executor = std::sync::Arc::new(
+            crate::intent_executor::MethodRegistryExecutor::production(
+                state.capability_manager.audit_log().clone(),
+                Some(dir.to_path_buf()),
+            )
+            .with_payments(meter.clone(), provider, ledger.clone()),
+        );
+        (state, meter, ledger)
+    }
+
+    /// Issue a capped, bound pay-mandate whose payee (the pay resource suffix) names a DRM asset,
+    /// and return `(state, meter, ledger, sign-a-buy-intent closure, token_id)`.
+    async fn drm_pay_mandate(
+        state: &CapabilityState,
+        asset: &str,
+    ) -> (
+        ed25519_dalek::SigningKey,
+        String,
+        String,
+    ) {
+        let payee_resource = format!("{}{asset}", crate::intent_executor::PAY_PREFIX);
+        let agent_sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let agent_pub = hex::encode(agent_sk.verifying_key().to_bytes());
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-shopper".to_string(),
+                resource: payee_resource.clone(),
+                action: "execute".to_string(),
+                methods: vec!["runtime.pay".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: Some(agent_pub),
+                dispatch_limit: None,
+                responsible_entity: Some("did:web:studio.example".to_string()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        (agent_sk, payee_resource, out.token_id)
+    }
+
+    fn wedge_binding(asset: &str) -> crate::drm_marketplace::DrmBinding {
+        crate::drm_marketplace::DrmBinding {
+            content_id: asset.to_string(),
+            operative: "0xopER".to_string(),
+            token_id: "42".to_string(),
+        }
+    }
+
+    /// Ratchet (a): an agent dispatches a buy under a capped mandate; the DRM provider resolves +
+    /// confirms; the meter debits ONCE; the ledger records the rail_ref; the portable receipt's
+    /// CapabilityUse carries the on-chain reference; and the receipt verifies off-box.
+    #[tokio::test]
+    async fn agent_buys_a_drm_asset_under_a_capped_mandate_and_the_receipt_carries_the_rail_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let asset = "QmMovie7";
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let settler = std::sync::Arc::new(WedgeSettler {
+            outcome: std::sync::Mutex::new(Some(Ok(crate::drm_marketplace::DrmSettlement {
+                tx_hash: "0xC0FFEE".to_string(),
+            }))),
+            ran: ran.clone(),
+        });
+        let (state, meter, ledger) = drm_state(
+            dir.path(),
+            std::sync::Arc::new(WedgeResolver(Ok(wedge_binding(asset)))),
+            settler,
+        );
+        meter.set_budget("vm-shopper", 500).unwrap();
+        let (agent_sk, payee_resource, token_id) = drm_pay_mandate(&state, asset).await;
+        // Build the buy ONCE (the idempotency key is derived from THIS signature).
+        let buy = IntentDeclarationV1::issue(
+            &agent_sk, agent_sk.verifying_key().to_bytes(), "buy-1", "vm-shopper",
+            "runtime.pay", "300", &payee_resource, "execute", &token_id,
+        );
+        let idem = format!("flint-{}", buy.signature);
+
+        let r1 = dispatch_agent_intent(State(state.clone()), Json(buy))
+            .await
+            .expect("within cap")
+            .0;
+        assert_eq!(r1.outcome, "performed", "the agent bought the asset under its mandate");
+        assert_eq!(meter.remaining("vm-shopper"), 200, "the cap was debited exactly once");
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst), "the buy actually settled");
+
+        // The ledger's Performed record carries the DRM rail_ref (tx + operative:tokenId).
+        let rec = ledger.get(&idem).expect("a performed rail record exists");
+        assert_eq!(rec.status, crate::payment_ledger::PaymentStatus::Performed);
+        assert_eq!(rec.rail_note, "drm:tx=0xC0FFEE;op=0xopER;tid=42");
+
+        // The portable receipt's pay-use row carries the SAME on-chain reference.
+        let receipt = mandate_receipt(State(state.clone()), Path(token_id.clone()))
+            .await
+            .unwrap()
+            .0;
+        use elastos_runtime::primitives::audit::AuditEvent;
+        let use_rail_ref = receipt.records.iter().find_map(|r| match &r.event {
+            AuditEvent::CapabilityUse { rail_ref, success: true, .. } => rail_ref.clone(),
+            _ => None,
+        });
+        assert_eq!(
+            use_rail_ref.as_deref(),
+            Some("drm:tx=0xC0FFEE;op=0xopER;tid=42"),
+            "the receipt's pay-use row carries the on-chain settlement reference"
+        );
+        let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();
+        assert!(
+            elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer)).authenticated,
+            "the DRM-buy receipt verifies off-box"
+        );
+    }
+
+    /// Ratchet (b): an AMBIGUOUS asset (MKT-1) is refused, the reservation refunded, and the buy
+    /// is NEVER attempted — no fallback purchase.
+    #[tokio::test]
+    async fn an_ambiguous_drm_asset_is_refused_refunded_and_never_settles() {
+        let dir = tempfile::tempdir().unwrap();
+        let asset = "QmContested";
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let settler = std::sync::Arc::new(WedgeSettler {
+            outcome: std::sync::Mutex::new(Some(Ok(crate::drm_marketplace::DrmSettlement {
+                tx_hash: "0xSHOULDNOThappen".to_string(),
+            }))),
+            ran: ran.clone(),
+        });
+        let (state, meter, _ledger) = drm_state(
+            dir.path(),
+            std::sync::Arc::new(WedgeResolver(Err("ambiguous"))),
+            settler,
+        );
+        meter.set_budget("vm-shopper", 500).unwrap();
+        let (agent_sk, payee_resource, token_id) = drm_pay_mandate(&state, asset).await;
+        let buy = IntentDeclarationV1::issue(
+            &agent_sk, agent_sk.verifying_key().to_bytes(), "buy-amb", "vm-shopper",
+            "runtime.pay", "300", &payee_resource, "execute", &token_id,
+        );
+        let r = dispatch_agent_intent(State(state.clone()), Json(buy))
+            .await
+            .expect("gate authorized; rail refused")
+            .0;
+        assert_eq!(
+            r.outcome, "authorized_not_performed",
+            "an ambiguous binding is a fail-closed refusal, not a buy"
+        );
+        assert!(
+            r.reason.as_deref().is_some_and(|s| s.contains("ambiguous")),
+            "the refusal names the ambiguity: {:?}",
+            r.reason
+        );
+        assert_eq!(meter.remaining("vm-shopper"), 500, "the reservation was refunded (nothing bought)");
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "an ambiguous binding must NEVER reach the settler"
+        );
+    }
+
+    /// Ratchet (c): a buy over the remaining cap is refused BEFORE any chain interaction — the
+    /// resolver/settler are never reached.
+    #[tokio::test]
+    async fn an_over_cap_drm_buy_is_refused_before_any_chain_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let asset = "QmPricey";
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A resolver that PANICS if called — proves the over-cap refusal precedes resolution.
+        struct NeverResolver;
+        impl crate::drm_marketplace::DrmResolver for NeverResolver {
+            fn resolve(
+                &self,
+                _a: &str,
+            ) -> Result<crate::drm_marketplace::DrmBinding, crate::drm_marketplace::DrmResolveError>
+            {
+                panic!("the resolver must NOT run for an over-cap buy");
+            }
+        }
+        let settler = std::sync::Arc::new(WedgeSettler {
+            outcome: std::sync::Mutex::new(Some(Ok(crate::drm_marketplace::DrmSettlement {
+                tx_hash: "x".to_string(),
+            }))),
+            ran: ran.clone(),
+        });
+        let (state, meter, _ledger) =
+            drm_state(dir.path(), std::sync::Arc::new(NeverResolver), settler);
+        meter.set_budget("vm-shopper", 100).unwrap(); // cap BELOW the ask
+        let (agent_sk, payee_resource, token_id) = drm_pay_mandate(&state, asset).await;
+        let buy = IntentDeclarationV1::issue(
+            &agent_sk, agent_sk.verifying_key().to_bytes(), "buy-over", "vm-shopper",
+            "runtime.pay", "300", &payee_resource, "execute", &token_id,
+        );
+        let r = dispatch_agent_intent(State(state.clone()), Json(buy))
+            .await
+            .expect("gate authorized; cap refused")
+            .0;
+        assert_eq!(r.outcome, "authorized_not_performed", "the cap refused the buy");
+        assert!(
+            r.reason.as_deref().is_some_and(|s| s.contains("spend cap")),
+            "the refusal is the cap, before any chain call: {:?}",
+            r.reason
+        );
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "no settle happened — the cap gate precedes the rail"
+        );
+        assert_eq!(meter.remaining("vm-shopper"), 100, "nothing debited");
+    }
+
+    /// Ratchet (d): an INDETERMINATE settle keeps the reservation and files a PENDING ledger entry
+    /// keyed by the intent-signature idempotency key (the reconciliation handle mapped to the tx).
+    #[tokio::test]
+    async fn an_indeterminate_drm_buy_keeps_the_reservation_and_files_a_pending_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let asset = "QmMaybe";
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let settler = std::sync::Arc::new(WedgeSettler {
+            outcome: std::sync::Mutex::new(Some(Err("indeterminate"))),
+            ran: ran.clone(),
+        });
+        let (state, meter, ledger) = drm_state(
+            dir.path(),
+            std::sync::Arc::new(WedgeResolver(Ok(wedge_binding(asset)))),
+            settler,
+        );
+        meter.set_budget("vm-shopper", 500).unwrap();
+        let (agent_sk, payee_resource, token_id) = drm_pay_mandate(&state, asset).await;
+        let buy = IntentDeclarationV1::issue(
+            &agent_sk, agent_sk.verifying_key().to_bytes(), "buy-ind", "vm-shopper",
+            "runtime.pay", "300", &payee_resource, "execute", &token_id,
+        );
+        let r = dispatch_agent_intent(State(state.clone()), Json(buy.clone()))
+            .await
+            .expect("gate authorized; rail indeterminate")
+            .0;
+        assert_eq!(
+            r.outcome, "authorized_not_performed",
+            "an indeterminate outcome is not attested as performed"
+        );
+        assert!(
+            r.reason.as_deref().is_some_and(|s| s.to_uppercase().contains("INDETERMINATE")),
+            "the reason flags the indeterminate outcome + names the reconciliation key: {:?}",
+            r.reason
+        );
+        assert_eq!(
+            meter.remaining("vm-shopper"), 200,
+            "the reservation is KEPT — refunding against a maybe-charge would break the cap"
+        );
+        let idem = format!("flint-{}", buy.signature);
+        let pending = ledger.get(&idem).expect("a pending entry was filed");
+        assert_eq!(pending.status, crate::payment_ledger::PaymentStatus::Pending);
+        assert!(
+            ledger.pending().iter().any(|p| p.idempotency_key == idem),
+            "the pending entry appears on the reconciliation work list"
         );
     }
 
@@ -4619,6 +4959,7 @@ mod tests {
                     input_hash: intent.input_hash.clone(),
                     resource: "elastos://pay/SOMEWHERE-ELSE".to_string(),
                     action: intent.action.clone(),
+                    rail_ref: None,
                 }
             }
         }
