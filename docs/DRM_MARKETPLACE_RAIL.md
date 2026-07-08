@@ -167,8 +167,14 @@ money-moving code; one spine), with these properties:
   DENIES access (fail-closed). With this, every **chain-read, wallet-sign, and rights-decide**
   provider conversation the pay/access pipeline traverses is bounded — including the reap (an
   answered-then-lingering child is group-killed after a short grace, not parked on `wait()`).
-  Access-path *sidecar* helpers outside these three provider conversations (the protected-content
-  open/view descriptors) are not yet under this watchdog — see `KNOWN_GAPS.md`.
+  The access-path *sidecar* helpers outside these three provider conversations (the
+  protected-content open/view relays — the media/object authorities and the grant sidecar) are now
+  bounded too (Sprint 42 — same shared `capsule_watchdog`): a hung content-authority is
+  group-killed at the deadline and the open/view is DENIED (fail-closed, the mirror of the
+  rights-decide rule; never a money decision, since these sit on the open/view paths, not the pay
+  spine). Proven by `object_authority::a_hung_object_authority_is_killed_and_access_is_denied`,
+  `media_authority::a_hung_media_authority_is_killed_and_access_is_denied`, and
+  `access_grant::a_hung_grant_sidecar_is_killed_and_the_open_fails_closed`.
 
 ## Watching it (the Marketplace panel + the demo)
 

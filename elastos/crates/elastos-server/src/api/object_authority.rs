@@ -15,7 +15,7 @@
 //!     ddrm-viewer launch token, and returns a view URL:
 //!       /apps/ddrm-viewer/?session={id}&home_token={token}
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::path::Path as FsPath;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -108,24 +108,29 @@ impl ObjectAuthorityProc {
         if let Some(binding) = rights_binding {
             cmd.args(["--rights-binding", binding]);
         }
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| format!("spawn object-authority ({helper_bin}): {e}"))?;
-        let stdin = child.stdin.take().ok_or("no stdin")?;
-        let mut stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?);
+        // Guard the raw child so EVERY early return below reaps it (council S42 red-team F1): a
+        // hostile sidecar can force a bail via a well-formed-but-incomplete descriptor, and a bare
+        // `?` there would otherwise leak a live process. `disarm()` hands the child to the session
+        // only on the success path.
+        let mut guard = super::capsule_watchdog::ReapGuard::new(
+            super::capsule_watchdog::spawn_grouped(
+                cmd.stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit()),
+            )
+            .map_err(|e| format!("spawn object-authority ({helper_bin}): {e}"))?,
+        );
+        let stdin = guard.child_mut().stdin.take().ok_or("no stdin")?;
+        let mut stdout = BufReader::new(guard.child_mut().stdout.take().ok_or("no stdout")?);
 
-        let mut line = String::new();
-        let n = stdout
-            .read_line(&mut line)
-            .map_err(|e| format!("read descriptor: {e}"))?;
-        if n == 0 {
-            return Err("object-authority exited before publishing a session".to_string());
-        }
-        let descriptor: Value = serde_json::from_str(line.trim())
-            .map_err(|e| format!("parse descriptor: {e} ({line})"))?;
+        // Bound the OPEN read (Sprint 42) with the content-open deadline (the sidecar transcodes +
+        // seals before answering): a hung object-authority is group-killed and a fire DENIES
+        // (fail-closed). On any Err, `guard` reaps the (possibly-killed) child on drop — no zombie.
+        let descriptor = super::capsule_watchdog::read_open_deadlined(
+            guard.pid(),
+            &mut stdout,
+            "object-authority",
+        )?;
         let mime = descriptor
             .get("mime")
             .and_then(Value::as_str)
@@ -141,7 +146,7 @@ impl ObjectAuthorityProc {
             .ok_or("descriptor missing expires_at")?;
 
         Ok(Self {
-            child,
+            child: guard.disarm(),
             io: Mutex::new(ProcIo { stdin, stdout }),
             mime,
             byte_length,
@@ -195,24 +200,25 @@ impl ObjectAuthorityProc {
         if let Some(grant) = access_grant_b64.filter(|s| !s.trim().is_empty()) {
             cmd.args(["--access-grant", grant]);
         }
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| format!("spawn quorum-authority ({helper_bin}): {e}"))?;
-        let stdin = child.stdin.take().ok_or("no stdin")?;
-        let mut stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?);
+        // Guard the raw child so every early return reaps it (council S42 red-team F1).
+        let mut guard = super::capsule_watchdog::ReapGuard::new(
+            super::capsule_watchdog::spawn_grouped(
+                cmd.stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit()),
+            )
+            .map_err(|e| format!("spawn quorum-authority ({helper_bin}): {e}"))?,
+        );
+        let stdin = guard.child_mut().stdin.take().ok_or("no stdin")?;
+        let mut stdout = BufReader::new(guard.child_mut().stdout.take().ok_or("no stdout")?);
 
-        let mut line = String::new();
-        let n = stdout
-            .read_line(&mut line)
-            .map_err(|e| format!("read descriptor: {e}"))?;
-        if n == 0 {
-            return Err("quorum-authority exited before publishing a session".to_string());
-        }
-        let descriptor: Value = serde_json::from_str(line.trim())
-            .map_err(|e| format!("parse descriptor: {e} ({line})"))?;
+        // Bound the OPEN read (Sprint 42) with the content-open deadline; a fire DENIES fail-closed.
+        // On any Err below, `guard` reaps the (possibly-killed) child on drop — no zombie.
+        let descriptor = super::capsule_watchdog::read_open_deadlined(
+            guard.pid(),
+            &mut stdout,
+            "quorum-authority",
+        )?;
         let mime = descriptor
             .get("mime")
             .and_then(Value::as_str)
@@ -243,7 +249,7 @@ impl ObjectAuthorityProc {
             .to_string();
 
         Ok(Self {
-            child,
+            child: guard.disarm(),
             io: Mutex::new(ProcIo { stdin, stdout }),
             mime,
             byte_length,
@@ -264,16 +270,13 @@ impl ObjectAuthorityProc {
         writeln!(io.stdin, "{}", json!({ "op": "page", "n": n }))
             .map_err(|e| format!("write page request: {e}"))?;
         io.stdin.flush().map_err(|e| format!("flush: {e}"))?;
-        let mut line = String::new();
-        let read = io
-            .stdout
-            .read_line(&mut line)
-            .map_err(|e| format!("read page response: {e}"))?;
-        if read == 0 {
-            return Err("object-authority closed its stdout".to_string());
-        }
-        let resp: Value =
-            serde_json::from_str(line.trim()).map_err(|e| format!("parse response: {e}"))?;
+        // Bound the VIEW read (Sprint 42): a hung page relay is group-killed at the deadline so no
+        // request thread parks; a fire DENIES fail-closed. The child is reaped at Drop.
+        let resp = super::capsule_watchdog::read_line_deadlined(
+            self.child.id(),
+            &mut io.stdout,
+            "object-authority",
+        )?;
         if resp.get("status").and_then(Value::as_str) != Some("ok") {
             let message = resp
                 .get("message")
@@ -304,16 +307,13 @@ impl ObjectAuthorityProc {
         writeln!(io.stdin, "{}", json!({ "op": "object" }))
             .map_err(|e| format!("write object request: {e}"))?;
         io.stdin.flush().map_err(|e| format!("flush: {e}"))?;
-        let mut line = String::new();
-        let n = io
-            .stdout
-            .read_line(&mut line)
-            .map_err(|e| format!("read object response: {e}"))?;
-        if n == 0 {
-            return Err("object-authority closed its stdout".to_string());
-        }
-        let resp: Value =
-            serde_json::from_str(line.trim()).map_err(|e| format!("parse response: {e}"))?;
+        // Bound the VIEW read (Sprint 42): a hung object relay is group-killed at the deadline; a
+        // fire DENIES fail-closed. The child is reaped at Drop.
+        let resp = super::capsule_watchdog::read_line_deadlined(
+            self.child.id(),
+            &mut io.stdout,
+            "object-authority",
+        )?;
         if resp.get("status").and_then(Value::as_str) != Some("ok") {
             let message = resp
                 .get("message")
@@ -337,7 +337,9 @@ impl Drop for ObjectAuthorityProc {
             let _ = writeln!(io.stdin, "{}", json!({ "op": "shutdown" }));
             let _ = io.stdin.flush();
         }
-        let _ = self.child.wait();
+        // BOUNDED reap (Sprint 42): an authority that ignores shutdown/EOF must not park the
+        // dropping thread on an unbounded `wait()` — group-kill it after a short grace.
+        super::capsule_watchdog::reap_grouped(&mut self.child);
     }
 }
 
@@ -442,4 +444,118 @@ fn random_session_id() -> String {
     let mut bytes = [0u8; 18];
     rand::thread_rng().fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sprint 42 ratchet: a HUNG object-authority (the VIEW-path open) is killed at the deadline —
+    /// `launch` returns BOUNDED (never parks the open thread for the child's lifetime), the killed
+    /// child is reaped (no zombie), and the error carries the access marker + says access is
+    /// DENIED (fail-closed, the mirror of the rights-decide rule).
+    #[test]
+    #[cfg(unix)]
+    fn a_hung_object_authority_is_killed_and_access_is_denied() {
+        let _g = crate::api::ddrm_env_lock();
+        let prior = std::env::var("ELASTOS_CHAIN_READ_DEADLINE_SECS").ok();
+        let prior_open = std::env::var("ELASTOS_CONTENT_OPEN_DEADLINE_SECS").ok();
+        std::env::set_var("ELASTOS_CHAIN_READ_DEADLINE_SECS", "1");
+        // The OPEN descriptor read uses the content-open deadline (not the chain knob).
+        std::env::set_var("ELASTOS_CONTENT_OPEN_DEADLINE_SECS", "1");
+
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("hung-object-authority.sh");
+        std::fs::write(&stub, "#!/bin/sh\nsleep 300\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = match ObjectAuthorityProc::launch(
+            stub.to_str().unwrap(),
+            "unused-decrypt-bin",
+            "did:elastos:test-principal",
+            None,
+            None,
+            None,
+            None,
+        ) {
+            Ok(_) => panic!("expected the hung object-authority to be killed, not a live open"),
+            Err(e) => e,
+        };
+        match prior {
+            Some(v) => std::env::set_var("ELASTOS_CHAIN_READ_DEADLINE_SECS", v),
+            None => std::env::remove_var("ELASTOS_CHAIN_READ_DEADLINE_SECS"),
+        }
+        match prior_open {
+            Some(v) => std::env::set_var("ELASTOS_CONTENT_OPEN_DEADLINE_SECS", v),
+            None => std::env::remove_var("ELASTOS_CONTENT_OPEN_DEADLINE_SECS"),
+        }
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "the OPEN is BOUNDED by the deadline, not the child's 300s sleep"
+        );
+        assert!(
+            err.contains(crate::api::capsule_watchdog::ACCESS_DEADLINE_MARKER),
+            "the error carries the access-deadline marker: {err}"
+        );
+        assert!(
+            err.contains("DENIED"),
+            "a content-open timeout DENIES access (fail-closed): {err}"
+        );
+    }
+
+    /// Sprint 42 ratchet (the VIEW leg, distinct from the open): a sidecar that answers the
+    /// descriptor fast (so `launch` succeeds and the open watchdog is disarmed) but then HANGS on
+    /// the per-op `object` read is STILL bounded — the view read arms its own watchdog, the hung
+    /// relay is killed, and the read DENIES (fail-closed). Pins the "every later op is separately
+    /// bounded" property the persistent-session doc asserts.
+    #[test]
+    #[cfg(unix)]
+    fn a_hung_object_view_read_is_bounded_and_denied() {
+        let _g = crate::api::ddrm_env_lock();
+        let prior = std::env::var("ELASTOS_CHAIN_READ_DEADLINE_SECS").ok();
+        std::env::set_var("ELASTOS_CHAIN_READ_DEADLINE_SECS", "1");
+
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("answers-then-hangs.sh");
+        // Emit a valid one-line descriptor, THEN hang on the first op read.
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nprintf '{\"mime\":\"application/octet-stream\",\
+             \"byte_length\":3,\"expires_at\":9999999999}\\n'\nsleep 300\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let proc = ObjectAuthorityProc::launch(
+            stub.to_str().unwrap(),
+            "unused-decrypt-bin",
+            "did:elastos:test-principal",
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("the descriptor is answered, so the open itself succeeds");
+
+        let started = std::time::Instant::now();
+        let err = proc.object().unwrap_err();
+        match prior {
+            Some(v) => std::env::set_var("ELASTOS_CHAIN_READ_DEADLINE_SECS", v),
+            None => std::env::remove_var("ELASTOS_CHAIN_READ_DEADLINE_SECS"),
+        }
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "the VIEW read is BOUNDED by the deadline, not the child's 300s sleep"
+        );
+        assert!(
+            err.contains(crate::api::capsule_watchdog::ACCESS_DEADLINE_MARKER)
+                && err.contains("DENIED"),
+            "a hung per-op view read DENIES access (fail-closed): {err}"
+        );
+    }
 }

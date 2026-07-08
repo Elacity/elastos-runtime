@@ -18,7 +18,7 @@
 //! runtime relays only sealed material + scoped output; the CEK never reaches the
 //! gateway or the browser; the viewer gets decrypted segment bytes only.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::path::Path as FsPath;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -109,45 +109,6 @@ struct ProcIo {
     stdout: BufReader<ChildStdout>,
 }
 
-/// Kills + reaps its child on drop unless `disarm`ed. A helper is spawned and then several fallible
-/// steps read its one-line descriptor BEFORE it's wrapped in a (Drop-reaping) `MediaAuthorityProc`;
-/// on any of those error paths the raw `Child` would otherwise leak — Rust's `Child::drop` neither
-/// kills nor waits, so it lingers as a running proc OR an unreaped zombie ("exited before publishing
-/// a session"), and the 3-attempt open retry loop piles these up (ELACITY-2282 Defect B). This guard
-/// closes that gap: on success `disarm()` hands the child to the proc; on any early return it's reaped.
-struct ChildReaper(Option<Child>);
-
-impl ChildReaper {
-    fn arm(child: Child) -> Self {
-        Self(Some(child))
-    }
-    fn take_stdin(&mut self) -> Result<ChildStdin, String> {
-        self.0
-            .as_mut()
-            .and_then(|c| c.stdin.take())
-            .ok_or_else(|| "no stdin".to_string())
-    }
-    fn take_stdout(&mut self) -> Result<ChildStdout, String> {
-        self.0
-            .as_mut()
-            .and_then(|c| c.stdout.take())
-            .ok_or_else(|| "no stdout".to_string())
-    }
-    /// Success path: transfer the child out to the caller, disarming the reaper.
-    fn disarm(mut self) -> Child {
-        self.0.take().expect("child present until disarm")
-    }
-}
-
-impl Drop for ChildReaper {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
 impl MediaAuthorityProc {
     /// Spawn the helper, read its one-line session descriptor, and return a handle.
     /// `object_cid`, when set, binds the decrypt transcript to the real owned object's
@@ -171,25 +132,28 @@ impl MediaAuthorityProc {
         if let Some(binding) = rights_binding {
             cmd.args(["--rights-binding", binding]);
         }
-        let mut reaper = ChildReaper::arm(
-            cmd.stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .map_err(|e| format!("spawn media-authority ({helper_bin}): {e}"))?,
+        // Guard the raw child so EVERY early return below reaps it (the shared `ReapGuard`): a
+        // hostile sidecar can force a bail via a malformed/incomplete descriptor, and a bare `?`
+        // there would otherwise leak a live process (the ELACITY-2282 Defect B class).
+        let mut guard = super::capsule_watchdog::ReapGuard::new(
+            super::capsule_watchdog::spawn_grouped(
+                cmd.stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit()),
+            )
+            .map_err(|e| format!("spawn media-authority ({helper_bin}): {e}"))?,
         );
-        let stdin = reaper.take_stdin()?;
-        let mut stdout = BufReader::new(reaper.take_stdout()?);
+        let stdin = guard.child_mut().stdin.take().ok_or("no stdin")?;
+        let mut stdout = BufReader::new(guard.child_mut().stdout.take().ok_or("no stdout")?);
 
-        let mut line = String::new();
-        let n = stdout
-            .read_line(&mut line)
-            .map_err(|e| format!("read descriptor: {e}"))?;
-        if n == 0 {
-            return Err("media-authority exited before publishing a session".to_string());
-        }
-        let descriptor: Value = serde_json::from_str(line.trim())
-            .map_err(|e| format!("parse descriptor: {e} ({line})"))?;
+        // Bound the OPEN read (Sprint 42) with the content-open deadline (the helper runs ffmpeg +
+        // the seal handshake before answering): a hung media-authority is group-killed and a fire
+        // DENIES (fail-closed). On any Err, `guard` reaps the (possibly-killed) child — no zombie.
+        let descriptor = super::capsule_watchdog::read_open_deadlined(
+            guard.pid(),
+            &mut stdout,
+            "media-authority",
+        )?;
         let mime = descriptor
             .get("mime")
             .and_then(Value::as_str)
@@ -215,7 +179,7 @@ impl MediaAuthorityProc {
             .unwrap_or_default();
 
         Ok(Self {
-            child: reaper.disarm(),
+            child: guard.disarm(),
             io: Mutex::new(ProcIo { stdin, stdout }),
             mime,
             segment_count,
@@ -271,25 +235,25 @@ impl MediaAuthorityProc {
         if let Some(grant) = access_grant_b64.filter(|s| !s.trim().is_empty()) {
             cmd.args(["--access-grant", grant]);
         }
-        let mut reaper = ChildReaper::arm(
-            cmd.stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .map_err(|e| format!("spawn quorum media-authority ({helper_bin}): {e}"))?,
+        // Guard the raw child so every early return reaps it (the shared `ReapGuard`).
+        let mut guard = super::capsule_watchdog::ReapGuard::new(
+            super::capsule_watchdog::spawn_grouped(
+                cmd.stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit()),
+            )
+            .map_err(|e| format!("spawn quorum media-authority ({helper_bin}): {e}"))?,
         );
-        let stdin = reaper.take_stdin()?;
-        let mut stdout = BufReader::new(reaper.take_stdout()?);
+        let stdin = guard.child_mut().stdin.take().ok_or("no stdin")?;
+        let mut stdout = BufReader::new(guard.child_mut().stdout.take().ok_or("no stdout")?);
 
-        let mut line = String::new();
-        let n = stdout
-            .read_line(&mut line)
-            .map_err(|e| format!("read descriptor: {e}"))?;
-        if n == 0 {
-            return Err("quorum media-authority exited before publishing a session".to_string());
-        }
-        let descriptor: Value = serde_json::from_str(line.trim())
-            .map_err(|e| format!("parse descriptor: {e} ({line})"))?;
+        // Bound the OPEN read (Sprint 42) with the content-open deadline; a fire DENIES fail-closed.
+        // On any Err below, `guard` reaps the (possibly-killed) child — no zombie.
+        let descriptor = super::capsule_watchdog::read_open_deadlined(
+            guard.pid(),
+            &mut stdout,
+            "quorum media-authority",
+        )?;
         let expires_at = descriptor
             .get("expires_at")
             .and_then(Value::as_u64)
@@ -350,7 +314,7 @@ impl MediaAuthorityProc {
         };
 
         Ok(Self {
-            child: reaper.disarm(),
+            child: guard.disarm(),
             io: Mutex::new(ProcIo { stdin, stdout }),
             mime,
             segment_count,
@@ -378,16 +342,13 @@ impl MediaAuthorityProc {
             .map_err(|_| "media-authority mutex poisoned")?;
         writeln!(io.stdin, "{request}").map_err(|e| format!("write segment request: {e}"))?;
         io.stdin.flush().map_err(|e| format!("flush: {e}"))?;
-        let mut line = String::new();
-        let n = io
-            .stdout
-            .read_line(&mut line)
-            .map_err(|e| format!("read segment response: {e}"))?;
-        if n == 0 {
-            return Err("media-authority closed its stdout".to_string());
-        }
-        let resp: Value =
-            serde_json::from_str(line.trim()).map_err(|e| format!("parse response: {e}"))?;
+        // Bound the VIEW read (Sprint 42): a hung segment relay is group-killed at the deadline so
+        // no playback thread parks; a fire DENIES fail-closed. The child is reaped at Drop.
+        let resp = super::capsule_watchdog::read_line_deadlined(
+            self.child.id(),
+            &mut io.stdout,
+            "media-authority",
+        )?;
         if resp.get("status").and_then(Value::as_str) != Some("ok") {
             let message = resp
                 .get("message")
@@ -411,7 +372,9 @@ impl Drop for MediaAuthorityProc {
             let _ = writeln!(io.stdin, "{}", json!({ "op": "shutdown" }));
             let _ = io.stdin.flush();
         }
-        let _ = self.child.wait();
+        // BOUNDED reap (Sprint 42): an authority that ignores shutdown/EOF must not park the
+        // dropping thread on an unbounded `wait()` — group-kill it after a short grace.
+        super::capsule_watchdog::reap_grouped(&mut self.child);
     }
 }
 
@@ -511,4 +474,64 @@ fn random_session_id() -> String {
     let mut bytes = [0u8; 18];
     rand::thread_rng().fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sprint 42 ratchet: a HUNG media-authority (the streamed OPEN) is killed at the deadline —
+    /// `launch` returns BOUNDED (never parks the open thread for the child's lifetime), the killed
+    /// child is reaped by the `ChildReaper` guard (no zombie), and the error carries the access
+    /// marker + says access is DENIED (fail-closed).
+    #[test]
+    #[cfg(unix)]
+    fn a_hung_media_authority_is_killed_and_access_is_denied() {
+        let _g = crate::api::ddrm_env_lock();
+        let prior = std::env::var("ELASTOS_CHAIN_READ_DEADLINE_SECS").ok();
+        let prior_open = std::env::var("ELASTOS_CONTENT_OPEN_DEADLINE_SECS").ok();
+        std::env::set_var("ELASTOS_CHAIN_READ_DEADLINE_SECS", "1");
+        // The OPEN descriptor read uses the content-open deadline (not the chain knob).
+        std::env::set_var("ELASTOS_CONTENT_OPEN_DEADLINE_SECS", "1");
+
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("hung-media-authority.sh");
+        std::fs::write(&stub, "#!/bin/sh\nsleep 300\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = match MediaAuthorityProc::launch(
+            stub.to_str().unwrap(),
+            "unused-decrypt-bin",
+            "did:elastos:test-principal",
+            None,
+            None,
+            None,
+        ) {
+            Ok(_) => panic!("expected the hung media-authority to be killed, not a live open"),
+            Err(e) => e,
+        };
+        match prior {
+            Some(v) => std::env::set_var("ELASTOS_CHAIN_READ_DEADLINE_SECS", v),
+            None => std::env::remove_var("ELASTOS_CHAIN_READ_DEADLINE_SECS"),
+        }
+        match prior_open {
+            Some(v) => std::env::set_var("ELASTOS_CONTENT_OPEN_DEADLINE_SECS", v),
+            None => std::env::remove_var("ELASTOS_CONTENT_OPEN_DEADLINE_SECS"),
+        }
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "the OPEN is BOUNDED by the deadline, not the child's 300s sleep"
+        );
+        assert!(
+            err.contains(crate::api::capsule_watchdog::ACCESS_DEADLINE_MARKER),
+            "the error carries the access-deadline marker: {err}"
+        );
+        assert!(
+            err.contains("DENIED"),
+            "a content-open timeout DENIES access (fail-closed): {err}"
+        );
+    }
 }

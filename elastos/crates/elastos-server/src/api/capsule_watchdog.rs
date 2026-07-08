@@ -10,8 +10,8 @@
 //! UNIX-ONLY kill (like the flock protections): elsewhere the watchdog is a stated no-op and the
 //! old unbounded behavior remains.
 
-use std::io::BufRead;
-use std::process::{Child, Command};
+use std::io::{BufRead, Read};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -89,9 +89,20 @@ impl DeadlineWatchdog {
                     // error is never minted on a platform where nothing was killed (S40 G-F2).
                     #[cfg(unix)]
                     {
-                        fired.store(true, Ordering::SeqCst);
-                        unsafe {
-                            libc::kill(-(pid as i32), libc::SIGKILL);
+                        // A pid of 0 would make `kill(-0)` signal the CALLER's OWN process group —
+                        // runtime suicide dressed as an availability protection (council S42
+                        // guardian F2). No legitimate child has pid 0; refuse to kill on it (and do
+                        // not set `fired`, so no bogus deadline error is minted either).
+                        if pid != 0 {
+                            fired.store(true, Ordering::SeqCst);
+                            unsafe {
+                                libc::kill(-(pid as i32), libc::SIGKILL);
+                            }
+                        } else {
+                            tracing::error!(
+                                "DeadlineWatchdog armed on pid 0 — refusing kill(-0) (it would \
+                                 signal the runtime's own process group)"
+                            );
                         }
                     }
                     #[cfg(not(unix))]
@@ -146,14 +157,17 @@ impl Drop for DeadlineWatchdog {
 ///
 /// Off-unix there is no group kill (as stated module-wide): the grace lapses and the final `wait`
 /// is the old unbounded behavior.
-pub(crate) fn reap_grouped(child: &mut Child) {
+///
+/// Returns the child's [`ExitStatus`] when it could be collected (so a one-shot caller can fold a
+/// non-success exit into its error), or `None` if `try_wait` itself errored.
+pub(crate) fn reap_grouped(child: &mut Child) -> Option<ExitStatus> {
     const GRACE_TICKS: u32 = 20;
     const TICK: Duration = Duration::from_millis(50); // ~1s total grace for a clean exit
     for _ in 0..GRACE_TICKS {
         match child.try_wait() {
-            Ok(Some(_)) => return, // exited on its own — reaped, nothing to kill
+            Ok(Some(status)) => return Some(status), // exited on its own — reaped, nothing to kill
             Ok(None) => std::thread::sleep(TICK),
-            Err(_) => return, // cannot reap here; the caller's Drop kill()+wait() is the backstop
+            Err(_) => return None, // cannot reap here; the guard/session Drop reap is the backstop
         }
     }
     #[cfg(unix)]
@@ -164,7 +178,75 @@ pub(crate) fn reap_grouped(child: &mut Child) {
             libc::kill(-(child.id() as i32), libc::SIGKILL);
         }
     }
-    let _ = child.wait();
+    child.wait().ok()
+}
+
+/// A spawned capsule child that is BOUNDED-reaped on drop unless explicitly disarmed. Between spawn
+/// and the moment the child is handed to its long-lived owner, MANY fallible steps run (take
+/// stdin/stdout, read + parse a descriptor, extract fields) — every early return among them must
+/// reap the child, or a hostile sidecar that forces one (a well-formed-but-incomplete descriptor,
+/// an EPIPE on the first write, a self-exit) leaks a live process or a zombie (council S42 red-team
+/// F1/F2). `std::process::Child::drop` neither kills nor waits, so this guard closes that gap: on
+/// success `disarm()` transfers the child to the owner; on ANY early return the `Drop` reaps it via
+/// [`reap_grouped`] (group-kill after a grace). This is the ONE reap-guard the access sidecars
+/// share (P5) so the discipline cannot drift across copies.
+pub(crate) struct ReapGuard(Option<Child>);
+
+impl ReapGuard {
+    pub(crate) fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+    /// The armed child (present until [`disarm`](Self::disarm)); for taking stdin/stdout.
+    pub(crate) fn child_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("child present until disarm")
+    }
+    /// The armed child's pid (its own process group), for arming a read watchdog on it. Panics
+    /// rather than ever returning 0 — a `kill(-0)` would signal the GATEWAY's own group (council
+    /// S42 red-team F4). The child is present until disarm by construction.
+    pub(crate) fn pid(&self) -> u32 {
+        self.0
+            .as_ref()
+            .map(Child::id)
+            .expect("child present until disarm")
+    }
+    /// Success path: transfer the child out to its long-lived owner, disarming the guard.
+    pub(crate) fn disarm(mut self) -> Child {
+        self.0.take().expect("child present until disarm")
+    }
+}
+
+impl Drop for ReapGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            reap_grouped(&mut child);
+        }
+    }
+}
+
+/// How long a CONTENT-OPEN conversation (spawn → transcode/seal handshake → first descriptor line)
+/// may take before the sidecar is killed. SEPARATE from [`capsule_read_deadline`] because a media
+/// open runs ffmpeg + a seal handshake BEFORE it answers, so the RPC-tuned 30s would group-kill a
+/// legitimate slow transcode and DENY the honest open (council S42 red-team F3 — an availability
+/// cliff). `ELASTOS_CONTENT_OPEN_DEADLINE_SECS`, default 120; malformed/`< 1` ⇒ default with a
+/// loud warning (the deadline is an availability protection, not a money decision — a typo must not
+/// silently remove it). The per-op VIEW reads (segment/page/object) and the grant crypto keep the
+/// shorter [`capsule_read_deadline`] — they are quick relays, not a transcode.
+pub(crate) fn content_open_deadline() -> Duration {
+    const DEFAULT_SECS: u64 = 120;
+    let secs = match std::env::var("ELASTOS_CONTENT_OPEN_DEADLINE_SECS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(n) if n >= 1 => n,
+            _ => {
+                tracing::warn!(
+                    "ELASTOS_CONTENT_OPEN_DEADLINE_SECS={raw:?} is not a positive integer — \
+                     using the default {DEFAULT_SECS}s content-open deadline"
+                );
+                DEFAULT_SECS
+            }
+        },
+        Err(_) => DEFAULT_SECS,
+    };
+    Duration::from_secs(secs)
 }
 
 /// Read one newline-delimited JSON response line from a capsule's stdout, LENGTH-bounded to
@@ -186,6 +268,110 @@ pub(crate) fn read_capsule_line(reader: impl BufRead) -> Result<Value, String> {
         return Err("capsule response line exceeds the size cap (refused)".to_string());
     }
     serde_json::from_str(line.trim()).map_err(|e| format!("parse capsule response: {e}"))
+}
+
+/// The marker an ACCESS-path (content open/view) deadline carries (Sprint 42). ACCESS NOTE: a
+/// content-authority timeout is a DENY (fail-closed) — the exact mirror of the rights-decide rule
+/// (`RIGHTS_DEADLINE_MARKER`), never a money decision. The sidecars this bounds (the media/object
+/// authorities and the grant sidecar) sit on the OPEN and VIEW paths, not the pay spine, so a
+/// timeout simply refuses the open/read; there is no charge to classify.
+pub(crate) const ACCESS_DEADLINE_MARKER: &str = "content-authority read deadline exceeded";
+
+/// Read one capsule response line bounded by an explicit `deadline`: arm a watchdog on `child_pid`'s
+/// process group, read (length-capped), disarm. On a fire the child's group is SIGKILLed and this
+/// returns an [`ACCESS_DEADLINE_MARKER`] error so the caller DENIES (fail-closed) — no access thread
+/// parks forever on a hung content-authority sidecar. `what` names the sidecar for diagnostics.
+///
+/// This arms/disarms per read but does NOT reap — a persistent session reaps its child once at Drop
+/// (via [`reap_grouped`]), so the disarm-before-reap ordering holds by construction (every per-read
+/// disarm precedes the single Drop reap). After a fire the child is dead; the session's next read
+/// EOFs and denies again (fail-closed), and Drop reaps the corpse.
+///
+/// NOTE: only the READ is watchdog-bounded. The paired request WRITE (the caller's `writeln!` of a
+/// one-line JSON op) runs before this and is NOT bounded — it is safe because every op payload is a
+/// short JSON line far below the OS pipe buffer, so the kernel accepts it without blocking on the
+/// child draining. A future op with a payload approaching the pipe buffer would need its own bound.
+fn read_line_deadlined_with(
+    child_pid: u32,
+    reader: impl BufRead,
+    what: &str,
+    deadline: Duration,
+) -> Result<Value, String> {
+    let watchdog = DeadlineWatchdog::arm(child_pid, deadline);
+    let read = read_capsule_line(reader);
+    let fired = watchdog.disarm();
+    if fired {
+        // Fail closed whether or not a late response also landed: a response the watchdog had to
+        // kill for is by definition past the deadline, so denying it is the correct direction.
+        return Err(format!(
+            "{ACCESS_DEADLINE_MARKER}: no response within {}s — {what} killed; access DENIED \
+             (fail-closed)",
+            deadline.as_secs()
+        ));
+    }
+    read
+}
+
+/// Bound a per-op VIEW read (segment/page/object relay) with the shorter [`capsule_read_deadline`]
+/// — these are quick relays, not a transcode.
+pub(crate) fn read_line_deadlined(
+    child_pid: u32,
+    reader: impl BufRead,
+    what: &str,
+) -> Result<Value, String> {
+    read_line_deadlined_with(child_pid, reader, what, capsule_read_deadline())
+}
+
+/// Bound a content-OPEN descriptor read with the longer [`content_open_deadline`] — the sidecar
+/// runs ffmpeg + a seal handshake before it answers, so the RPC-tuned deadline would kill an honest
+/// slow open (council S42 red-team F3).
+pub(crate) fn read_open_deadlined(
+    child_pid: u32,
+    reader: impl BufRead,
+    what: &str,
+) -> Result<Value, String> {
+    read_line_deadlined_with(child_pid, reader, what, content_open_deadline())
+}
+
+/// Run a ONE-SHOT capsule read-to-EOF bounded by the shared [`capsule_read_deadline`]: arm a
+/// watchdog on `child`'s group, read ALL of `stdout` to EOF (length-capped to [`MAX_CAPSULE_LINE`],
+/// so a firehose sidecar is a bounded error not an OOM), disarm, then reap. Unlike the persistent
+/// per-line readers this OWNS the reap (the child is single-use), so the caller must NOT also reap
+/// — it hands the child in and this returns the parsed stdout (or a fail-closed error). On a fire
+/// the group is SIGKILLed and this returns an [`ACCESS_DEADLINE_MARKER`] error; a non-success exit
+/// status is folded into the error too (`what` names the sidecar). This is the ONE implementation
+/// of the one-shot ordering — a caller (the grant sidecar) must not hand-roll it (council S42
+/// guardian F3).
+pub(crate) fn read_to_eof_deadlined(
+    child: &mut Child,
+    mut stdout: impl Read,
+    what: &str,
+) -> Result<String, String> {
+    let deadline = capsule_read_deadline();
+    let watchdog = DeadlineWatchdog::arm(child.id(), deadline);
+    let mut buf = String::new();
+    let read = (&mut stdout)
+        .take(MAX_CAPSULE_LINE + 1)
+        .read_to_string(&mut buf);
+    let fired = watchdog.disarm();
+    let status = reap_grouped(child); // disarm-before-reap: watchdog already joined above
+    if fired {
+        return Err(format!(
+            "{ACCESS_DEADLINE_MARKER}: no response within {}s — {what} killed; access DENIED \
+             (fail-closed)",
+            deadline.as_secs()
+        ));
+    }
+    read.map_err(|e| format!("read {what} stdout: {e}"))?;
+    if buf.len() as u64 > MAX_CAPSULE_LINE {
+        return Err(format!("{what} output exceeds the size cap (refused)"));
+    }
+    if let Some(status) = status {
+        if !status.success() {
+            return Err(format!("{what} exited with {status} (open fails closed)"));
+        }
+    }
+    Ok(buf)
 }
 
 #[cfg(test)]

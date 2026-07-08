@@ -138,9 +138,10 @@ classification, and the signed receipt are byte-identical.
   as G-M9.
 - The snapshot files are trusted from `data_dir` (not self-authenticating, unlike the signed
   chain); the flock/parent-fsync protections are unix-only. Every provider subprocess a
-  money/access path traverses (chain, wallet-sign, rights-decide) is deadline-bounded (S40/S41,
-  one shared watchdog) — no runtime thread parks forever on a hung or hostile provider; the kill
-  is unix-only.
+  money/access path traverses (chain, wallet-sign, rights-decide) AND every access-path content
+  sidecar (the media/object authorities and the grant sidecar, S42) is deadline-bounded (S40–S42,
+  one shared watchdog) — no runtime thread parks forever on a hung or hostile provider, and the
+  bounded reap leaves no zombie; the kill is unix-only.
 - DRM-rail residuals are tracked as `MKT-DRM` in `KNOWN_GAPS.md` (the operator-declared spend-unit
   mapping; the confirmation scheduler being opt-in — unset interval ⇒ back to the manual
   reconcile loop).

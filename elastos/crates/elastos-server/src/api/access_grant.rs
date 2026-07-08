@@ -118,15 +118,22 @@ fn run_sidecar(mode: &str, input: &Value) -> Result<Value, String> {
             "grant sidecar not found at {bin}; build scripts/dev/ddrm-media-authority or set ELASTOS_DDRM_MEDIA_AUTHORITY_BIN"
         ));
     }
-    let mut child = Command::new(&bin)
-        .arg(mode)
+    let mut cmd = Command::new(&bin);
+    cmd.arg(mode)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|e| format!("spawn grant sidecar ({bin} {mode}): {e}"))?;
+        .stderr(Stdio::inherit());
+    // Guard the child so EVERY early return reaps it — including the stdin-write path a sidecar
+    // that exits immediately forces to EPIPE (council S42 red-team F2). `ReapGuard::drop` reaps via
+    // the bounded `reap_grouped`, so no path leaks a zombie.
+    let mut guard = crate::api::capsule_watchdog::ReapGuard::new(
+        crate::api::capsule_watchdog::spawn_grouped(&mut cmd)
+            .map_err(|e| format!("spawn grant sidecar ({bin} {mode}): {e}"))?,
+    );
     {
-        let mut stdin = child.stdin.take().ok_or("no stdin")?;
+        let mut stdin = guard.child_mut().stdin.take().ok_or("no stdin")?;
+        // The stdin WRITE is not watchdog-bounded, but the payload is a single small JSON object
+        // far below the OS pipe buffer, so the kernel accepts it without blocking on the child.
         stdin
             .write_all(
                 serde_json::to_vec(input)
@@ -136,14 +143,18 @@ fn run_sidecar(mode: &str, input: &Value) -> Result<Value, String> {
             .map_err(|e| format!("write sidecar stdin: {e}"))?;
         // stdin dropped here -> EOF, so the sidecar's read_to_string returns.
     }
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("wait sidecar: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("grant sidecar {mode} exited with {}", out.status));
-    }
-    let line = String::from_utf8_lossy(&out.stdout);
-    serde_json::from_str(line.trim()).map_err(|e| format!("parse sidecar output: {e}: {line}"))
+    // Hand the (single-use) child to the shared one-shot reader, which OWNS the arm → read-to-EOF →
+    // disarm → reap ordering + the length cap + the fire marker (council S42 guardian F3 — no
+    // hand-rolled fourth copy). The `guard` has already covered every pre-read error path (spawn,
+    // stdin take/write, stdout take); `disarm()` transfers the child to the reader for the reap.
+    let stdout = std::io::BufReader::new(guard.child_mut().stdout.take().ok_or("no stdout")?);
+    let mut child = guard.disarm();
+    let out = crate::api::capsule_watchdog::read_to_eof_deadlined(
+        &mut child,
+        stdout,
+        &format!("grant sidecar {mode}"),
+    )?;
+    serde_json::from_str(out.trim()).map_err(|e| format!("parse sidecar output: {e}: {out}"))
 }
 
 /// What `prepare` hands back to the browser.
@@ -428,5 +439,56 @@ mod attempt_tests {
     fn no_original_grant_stays_none() {
         let g = pick_grant_for_attempt(None, 2, || Some("FRESH".to_string()));
         assert_eq!(g, None);
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    /// Sprint 42 ratchet: a HUNG grant sidecar is killed at the deadline — `prepare` (the
+    /// trustless-open grant assembly) returns BOUNDED (never parks the open thread for the child's
+    /// lifetime) and the open fails CLOSED (no grant assembled). The grant sidecar is on the OPEN
+    /// path, so a timeout is a fail-closed refusal, never a money decision.
+    #[test]
+    #[cfg(unix)]
+    fn a_hung_grant_sidecar_is_killed_and_the_open_fails_closed() {
+        let _g = crate::api::ddrm_env_lock();
+        let prior_deadline = std::env::var("ELASTOS_CHAIN_READ_DEADLINE_SECS").ok();
+        let prior_bin = std::env::var("ELASTOS_DDRM_MEDIA_AUTHORITY_BIN").ok();
+        std::env::set_var("ELASTOS_CHAIN_READ_DEADLINE_SECS", "1");
+
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("hung-grant-sidecar.sh");
+        std::fs::write(&stub, "#!/bin/sh\nsleep 300\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("ELASTOS_DDRM_MEDIA_AUTHORITY_BIN", &stub);
+
+        let started = std::time::Instant::now();
+        let err = match prepare(8453, "abcd", "bm9kZXNldA==", "0xtestowner") {
+            Ok(_) => panic!("expected the hung grant sidecar to be killed, not a prepared grant"),
+            Err(e) => e,
+        };
+
+        match prior_deadline {
+            Some(v) => std::env::set_var("ELASTOS_CHAIN_READ_DEADLINE_SECS", v),
+            None => std::env::remove_var("ELASTOS_CHAIN_READ_DEADLINE_SECS"),
+        }
+        match prior_bin {
+            Some(v) => std::env::set_var("ELASTOS_DDRM_MEDIA_AUTHORITY_BIN", v),
+            None => std::env::remove_var("ELASTOS_DDRM_MEDIA_AUTHORITY_BIN"),
+        }
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "the grant assembly is BOUNDED by the deadline, not the child's 300s sleep"
+        );
+        assert!(
+            err.contains(crate::api::capsule_watchdog::ACCESS_DEADLINE_MARKER)
+                && err.contains("DENIED"),
+            "a hung grant sidecar fails the open CLOSED at the deadline, carrying the shared \
+             access marker: {err}"
+        );
     }
 }
