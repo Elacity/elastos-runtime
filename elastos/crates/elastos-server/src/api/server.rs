@@ -504,11 +504,12 @@ pub fn spawn_drm_reconcile_scheduler(
         // The rotating scan cursor (council S37 F1): each tick starts after the previous tick's
         // last scanned seq, so a stuck-Unconfirmed prefix can never starve the entries behind it.
         let mut cursor: Option<u64> = None;
-        // At most ONE tick in flight (council S37 guardian F2): the chain-provider read has no
-        // deadline today, so a hung RPC would otherwise either wedge the schedule (awaiting it)
-        // or stack a new blocked thread per interval (not awaiting it). Instead: if the previous
-        // tick is still running, LOG LOUDLY and skip — the schedule stays alive and observable,
-        // blocked threads stay bounded at one, and every entry stays safely Pending.
+        // At most ONE tick in flight (council S37 guardian F2, kept as defense-in-depth): the
+        // chain read now carries a hard deadline (S40 — run_chain_capsule kills a hung provider
+        // group), so a tick cannot park forever; this guard additionally ensures a slow-but-
+        // alive tick never overlaps the next one. If the previous tick is still running, LOG
+        // LOUDLY and skip — the schedule stays alive and observable, and every entry stays
+        // safely Pending.
         let mut in_flight: Option<
             tokio::task::JoinHandle<crate::drm_marketplace::DrmReconcileSummary>,
         > = None;

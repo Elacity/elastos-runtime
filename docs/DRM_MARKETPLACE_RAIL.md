@@ -47,6 +47,14 @@ ELASTOS_DRM_RECONCILE_INTERVAL_SECS=<u64> # optional: ARM the in-runtime confirm
 ELASTOS_DRM_RECONCILE_BATCH=<usize> # optional per-tick cap on pendings processed (default 64,
                                     #   oldest-first; the overflow is counted and picked up next
                                     #   tick). A malformed value refuses to arm.
+ELASTOS_CHAIN_READ_DEADLINE_SECS=<u64> # optional (Sprint 40, default 30): the hard deadline on
+                                    #   ONE chain-provider conversation — a hung provider is
+                                    #   killed (process group and all). Any value <1 (or a typo)
+                                    #   is treated as malformed => the default, loudly (the
+                                    #   protection never silently disappears). Set it ABOVE your
+                                    #   P99 RPC roundtrip: too low forces every live buy
+                                    #   Indeterminate (a self-inflicted availability cliff), the
+                                    #   safe money direction but a real outage.
 ```
 
 The DRM rail **requires the durable spend meter + ledger** (real money on non-durable stores is
@@ -145,9 +153,16 @@ money-moving code; one spine), with these properties:
   next tick (no catch-up bursts), and at most ONE tick is ever in flight — if a tick is still
   running when the next interval fires, the scheduler logs loudly and skips (a hung chain-provider
   read cannot wedge the schedule or stack blocked threads; entries stay safely Pending).
-  RESIDUAL: the chain-provider read itself has no deadline yet — a permanently hung read parks
-  that one tick forever (the scheduler keeps skipping, loudly); the subprocess deadline is a
-  tracked follow-on.
+  The chain-provider read itself carries a hard deadline (Sprint 40,
+  `ELASTOS_CHAIN_READ_DEADLINE_SECS`, default 30s): a hung provider is killed — process group and
+  all — so no thread ever parks past the deadline on any ONE chain-provider conversation (a full
+  op may traverse a few conversations, each separately bounded). A deadline on a SEND leg
+  classifies INDETERMINATE (the tx may have broadcast — hold, reconcile), never a refund;
+  deadlines on read legs (resolve/quote/receipt) are ordinary fail-closed refusals/holds.
+  RESIDUAL: the wallet-provider SIGN leg and the rights-provider DECIDE leg are separate
+  subprocesses that are NOT yet deadlined — a hung signer or rights capsule still parks that
+  thread (unix-only kill covers the chain provider; the sibling providers are the tracked
+  follow-on).
 
 ## Watching it (the Marketplace panel + the demo)
 

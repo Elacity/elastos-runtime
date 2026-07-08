@@ -725,11 +725,11 @@ impl MethodRegistryExecutor {
         quoter: Arc<dyn crate::market_quote::MarketQuoter>,
     ) -> Self {
         // Bound on CONCURRENT in-flight quote reads (council S39 red-team F1 — the same wedge
-        // class as MAX_INFLIGHT_PAYMENTS): the chain read blocks its dispatch thread and has no
-        // subprocess deadline yet (the S37-ledgered residual), and single-flight only dedups the
-        // SAME asset — K distinct assets against a hung RPC would otherwise park K blocking
-        // threads and starve the pay pipeline's own pool. Over the bound: refuse with retry,
-        // never queue.
+        // class as MAX_INFLIGHT_PAYMENTS): the chain read blocks its dispatch thread for up to
+        // a few chain conversations x the S40 read deadline, and single-flight only dedups the
+        // SAME asset — K distinct
+        // assets against a slow RPC would otherwise park K blocking threads at once and starve
+        // the pay pipeline's own pool. Over the bound: refuse with retry, never queue.
         const MAX_INFLIGHT_QUOTES: usize = 8;
         let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         self.register(

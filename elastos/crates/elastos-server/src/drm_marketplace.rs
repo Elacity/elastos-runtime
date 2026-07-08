@@ -696,6 +696,17 @@ impl DrmReconcileSummary {
 /// strictly BEFORE `broadcast_signed_live`. RESIDUAL (KNOWN_GAPS MKT-DRM): this still sniffs an
 /// opaque String; the real fix is a structured pre/post-broadcast error type out of `buy_access`.
 fn is_pre_broadcast_refusal(err: &str) -> bool {
+    // A `chain-provider op failed:`-prefixed error originates AT OR AFTER the broadcast op (that
+    // is the only place `run_chain_capsule` produces it) and carries the provider's OWN free
+    // text — which a HOSTILE provider controls byte-for-byte (council S40 red-team F3). Such a
+    // provider could broadcast the tx and then answer with a message CONTAINING a sentinel to
+    // trick this classifier into a refund while the purchase stands. The sentinels are emitted
+    // ONLY by `buy_access`'s own pre-broadcast guards, never inside a chain-provider op error —
+    // so anything the provider's op message could taint is post-broadcast by construction:
+    // refuse to read it as a pre-broadcast refusal (⇒ Indeterminate/hold, the safe direction).
+    if err.contains("chain-provider op failed") {
+        return false;
+    }
     // Exact, anchored pre-broadcast sentinels emitted by `buy_authority::buy_access` strictly
     // before any `eth_sendRawTransaction` — the SAME consts the producers use, so a rewording
     // cannot drift the two sides apart. Case-sensitive (they are fixed literals), so an opaque
@@ -1392,5 +1403,49 @@ mod tests {
         );
         assert_eq!(third.left_pending, 1, "the wrap re-polls the stuck entry");
         assert_eq!(ledger.get("flint-b0").unwrap().status, PaymentStatus::Pending);
+    }
+
+    /// Sprint 40 council fold (red-team F3): a HOSTILE chain-provider that broadcasts the tx and
+    /// then answers with an op error CONTAINING a pre-broadcast sentinel must NOT trick the
+    /// classifier into a refund — a `chain-provider op failed:` error is post-broadcast by
+    /// construction (only `run_chain_capsule` produces it, at/after the broadcast op), so it
+    /// classifies Indeterminate (hold) regardless of its provider-controlled free text.
+    #[test]
+    fn a_post_broadcast_op_error_is_never_read_as_a_pre_broadcast_refusal() {
+        let masquerade = format!(
+            "chain-provider op failed: {}",
+            crate::api::rights_authority::CHAIN_DEADLINE_MARKER
+        );
+        assert!(!is_pre_broadcast_refusal(&masquerade));
+        assert!(!is_pre_broadcast_refusal(
+            "chain-provider op failed: sold out - buy aborted (fail closed)"
+        ));
+        assert!(!is_pre_broadcast_refusal(
+            "chain-provider op failed: none resolved - fail closed"
+        ));
+        // A GENUINE pre-broadcast refusal (no op-failed prefix) still classifies as a refund.
+        assert!(is_pre_broadcast_refusal(
+            "listing sold out (on-chain supply 0) - buy aborted (fail closed)"
+        ));
+    }
+
+    /// Sprint 40 ratchet: the chain-deadline marker is NOT a pre-broadcast refusal sentinel —
+    /// a deadline on the SEND leg (the tx may have broadcast) classifies INDETERMINATE (hold),
+    /// never a refund. This is the money-critical line of the read-deadline: refund on a send
+    /// timeout would let the refund and the on-chain purchase both stand.
+    #[test]
+    fn a_chain_deadline_error_is_never_classified_as_a_refund() {
+        let marker = crate::api::rights_authority::CHAIN_DEADLINE_MARKER;
+        assert!(
+            !is_pre_broadcast_refusal(marker),
+            "the deadline marker must never match a refund sentinel"
+        );
+        assert!(
+            !is_pre_broadcast_refusal(&format!(
+                "{marker}: no response within 30s — chain-provider killed; the op's outcome \
+                 is UNRESOLVED (a send may have gone out)"
+            )),
+            "nor the full deadline error string"
+        );
     }
 }
