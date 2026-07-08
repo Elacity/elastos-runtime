@@ -104,6 +104,12 @@ pub enum IntentExecution {
         /// `None` for every act with no rail settlement (all non-pay executors, and a pay whose
         /// rail returned no reference).
         rail_ref: Option<String>,
+        /// Data the executor EXPLICITLY discloses to the dispatching agent in the response
+        /// (Sprint 39: `runtime.market_quote` returns the quoted terms here). `None` everywhere
+        /// else BY DESIGN — this opt-in keeps `state_get`'s one-bit discipline structural: an
+        /// affordance's report reaches the agent only when its executor says so, never because
+        /// the pipeline surfaced the receipt echo wholesale.
+        agent_visible_report: Option<String>,
     },
     /// Nothing was performed (no executor for the method, a precondition failed, the target was
     /// absent). Reconciles as `Undelivered` — never a fabricated `Matched`.
@@ -425,6 +431,7 @@ impl MethodRegistryExecutor {
                             resource: intent.resource.clone(),
                             action: "write".to_string(),
                             rail_ref: None,
+                            agent_visible_report: None,
                         },
                         Err(e) => IntentExecution::Declined {
                             reason: format!("state_put could not be persisted: {e}"),
@@ -473,6 +480,7 @@ impl MethodRegistryExecutor {
                             resource: intent.resource.clone(),
                             action: "read".to_string(),
                             rail_ref: None,
+                            agent_visible_report: None,
                         },
                         // No such key for this principal ⇒ authorized-but-not-performed (honest:
                         // there is nothing to read), never a fabricated empty value.
@@ -540,6 +548,7 @@ impl MethodRegistryExecutor {
                             resource: intent.resource.clone(),
                             action: "message".to_string(),
                             rail_ref: None,
+                            agent_visible_report: None,
                         },
                         Err(e) => IntentExecution::Declined {
                             reason: format!("notification could not be delivered: {e}"),
@@ -591,6 +600,7 @@ impl MethodRegistryExecutor {
                         resource: intent.resource.clone(),
                         action: "read".to_string(),
                         rail_ref: None,
+                        agent_visible_report: None,
                     }
                 } else {
                     IntentExecution::Declined {
@@ -633,6 +643,7 @@ impl MethodRegistryExecutor {
                         resource: AUDIT_CHAIN_RESOURCE.to_string(),
                         action: "read".to_string(),
                         rail_ref: None,
+                        agent_visible_report: None,
                     },
                     Err(reason) => IntentExecution::Declined {
                         reason: format!("audit chain did not verify: {reason}"),
@@ -681,6 +692,153 @@ impl MethodRegistryExecutor {
     /// provably-not-charged, and PENDING for indeterminate outcomes — the operator's
     /// reconciliation work list. The ledger never gates money (its failures are reported in the
     /// reason, not enforced); pass `PaymentLedger::new()` where reconciliation isn't exercised.
+    /// Register `runtime.market_quote` (Sprint 39) — the READ affordance that lets an agent shop
+    /// within its mandate: quote the live terms of exactly the asset its pay-mandate scopes.
+    ///
+    /// - MANDATE-SCOPED, no market-wide oracle: the resource is the SAME pay resource
+    ///   (`elastos://runtime/pay/<asset>`) the buy uses, so the envelope gate confines quoting to
+    ///   the assets the operator granted — an agent can never price-scan the marketplace for free.
+    /// - READ-ONLY through the ONE quote spine (`crate::market_quote`): the same single-flight,
+    ///   TTL-cached path the Marketplace panel reads — one live chain read per asset per window,
+    ///   whoever asks. No keys, no broadcast (P3).
+    /// - HONEST reconciliation, two modes on the declared `input_hash`:
+    ///   * `""` (discovery): the read performs as declared (`Matched` ⇒ `performed`) and the
+    ///     terms reach the agent via the response's explicit-disclosure channel.
+    ///   * the canonical terms string (attested): the executor echoes the ACTUAL terms, so
+    ///     `Matched` PROVES "the terms are what I believed" and a changed listing reconciles
+    ///     `Diverged` — never a fabricated match.
+    ///   A failed read (no listing, chain unreachable, sold out) DECLINES with the bounded error
+    ///   (⇒ `authorized_not_performed`) — a quote is `performed` only when it truly returned terms.
+    /// - The terms are ephemeral agent data: they ride the response, not the signed chain (the
+    ///   receipt records the quote ACT; no price data lands on-chain beyond what it already
+    ///   carries).
+    ///
+    /// HONEST BOUNDS: an attested `Matched` proves the terms as of the spine's LAST READ (at most
+    /// `MARKET_QUOTE_TTL_SECS` old) — a listing changed inside the cache window is caught on the
+    /// next re-read, not instantly. In the dev/chain-mock rights modes `quote_buy` returns a
+    /// synthetic FREE quote (as the Marketplace panel also states) — the disclosure carries those
+    /// synthetic terms; only the live Chain mode reads real listings. Quote dispatches consume
+    /// the per-mandate dispatch budget like any act.
+    pub fn with_market_quotes(
+        mut self,
+        cache: crate::market_quote::MarketQuoteCache,
+        quoter: Arc<dyn crate::market_quote::MarketQuoter>,
+    ) -> Self {
+        // Bound on CONCURRENT in-flight quote reads (council S39 red-team F1 — the same wedge
+        // class as MAX_INFLIGHT_PAYMENTS): the chain read blocks its dispatch thread and has no
+        // subprocess deadline yet (the S37-ledgered residual), and single-flight only dedups the
+        // SAME asset — K distinct assets against a hung RPC would otherwise park K blocking
+        // threads and starve the pay pipeline's own pool. Over the bound: refuse with retry,
+        // never queue.
+        const MAX_INFLIGHT_QUOTES: usize = 8;
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        self.register(
+            "runtime.market_quote",
+            Arc::new(move |intent: &IntentDeclarationV1| {
+                // Scoped to the pay namespace — the asset is the suffix, exactly as for the buy.
+                let Some(asset) = intent.resource.strip_prefix(PAY_PREFIX) else {
+                    return IntentExecution::Declined {
+                        reason: format!("market_quote resource must be {PAY_PREFIX}<asset>"),
+                    };
+                };
+                if !valid_slug_1_64(asset) {
+                    return IntentExecution::Declined {
+                        reason: "market_quote asset must be 1-64 chars of [A-Za-z0-9._-]"
+                            .to_string(),
+                    };
+                }
+                // The declared input_hash is either empty (discovery) or the expected canonical
+                // terms (attested). Bounded before any read: it lands on the signed chain.
+                let declared = intent.input_hash.trim();
+                if declared.len() > 160 || !declared.chars().all(|c| c.is_ascii_graphic()) {
+                    return IntentExecution::Declined {
+                        reason: "market_quote expected-terms (input_hash) must be <=160 \
+                                 printable ASCII chars (or empty for discovery)"
+                            .to_string(),
+                    };
+                }
+                // Claim an in-flight slot; the RAII guard releases it on EVERY exit path.
+                struct QuoteSlot(Arc<std::sync::atomic::AtomicUsize>);
+                impl Drop for QuoteSlot {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                let prior = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _slot = QuoteSlot(in_flight.clone());
+                if prior >= MAX_INFLIGHT_QUOTES {
+                    return IntentExecution::Declined {
+                        reason: format!(
+                            "market_quote refused: {MAX_INFLIGHT_QUOTES} quote reads already \
+                             in-flight (fail-closed concurrency bound; retry shortly)"
+                        ),
+                    };
+                }
+                match crate::market_quote::quote_single_flight(
+                    &cache,
+                    quoter.as_ref(),
+                    asset,
+                    crate::market_quote::now_unix(),
+                ) {
+                    Ok(quote) => match quote.canonical_terms() {
+                        // The echo lands on the SIGNED chain (attested mode) and in the agent
+                        // response: hold chain-sourced terms to the SAME bound as the agent's
+                        // declaration (council S39 red-team F2 — validate what we sign, not
+                        // only what we receive). Structurally unreachable via the real decode
+                        // (u128 decimal + fixed hex), so out-of-bound terms mean a broken or
+                        // hostile quote source ⇒ refuse.
+                        Some(terms)
+                            if terms.len() > 160
+                                || !terms.chars().all(|c| c.is_ascii_graphic()) =>
+                        {
+                            IntentExecution::Declined {
+                                reason: "market_quote refused: the quote source returned \
+                                         malformed terms (out of bound)"
+                                    .to_string(),
+                            }
+                        }
+                        Some(terms) => IntentExecution::Performed {
+                            capsule: intent.capsule.clone(),
+                            method_id: intent.method_id.clone(),
+                            // Discovery ("" declared): echo the declaration — the READ performed
+                            // exactly as declared, so it reconciles Matched and the terms travel
+                            // via the disclosure channel. Attested (terms declared): echo the
+                            // ACTUAL terms — Matched proves the belief; a changed listing
+                            // Diverges, never a fabricated match.
+                            input_hash: if declared.is_empty() {
+                                String::new()
+                            } else {
+                                terms.clone()
+                            },
+                            resource: intent.resource.clone(),
+                            action: "read".to_string(),
+                            rail_ref: None,
+                            // The EXPLICIT disclosure: a quote's whole point is that the agent
+                            // learns the terms (public listing data, not a secret — unlike
+                            // state_get's values, which stay one-bit).
+                            agent_visible_report: Some(terms),
+                        },
+                        // The read returned an error outcome (no listing / sold out / chain
+                        // unreachable) ⇒ authorized_not_performed, honestly reasoned.
+                        None => IntentExecution::Declined {
+                            reason: format!(
+                                "market_quote could not read the listing: {}",
+                                quote.error.as_deref().unwrap_or("no terms returned")
+                            ),
+                        },
+                    },
+                    // Another consumer's read for this asset is in flight — refuse to duplicate
+                    // it (the single-flight bound); the agent retries shortly.
+                    Err(()) => IntentExecution::Declined {
+                        reason: "market_quote in progress for this asset — retry shortly"
+                            .to_string(),
+                    },
+                }
+            }),
+        );
+        self
+    }
+
     pub fn with_payments(
         mut self,
         meter: Arc<elastos_runtime::primitives::spend::SpendMeter>,
@@ -853,6 +1011,7 @@ impl MethodRegistryExecutor {
                             resource: intent.resource.clone(),
                             action: "execute".to_string(),
                             rail_ref: (!rail_ref.is_empty()).then_some(rail_ref),
+                            agent_visible_report: None,
                         }
                     }
                     Ok(Err(PayError::NotCharged(rail_err))) => {
@@ -952,6 +1111,7 @@ mod tests {
                 resource: i.resource.clone(),
                 action: i.action.clone(),
                 rail_ref: None,
+                agent_visible_report: None,
             }),
         );
         match reg.execute(&intent("demo.read")) {
@@ -1924,5 +2084,284 @@ mod tests {
             ),
             "content_seen must not reveal another principal's access"
         );
+    }
+    // ─────────────────────── runtime.market_quote (Sprint 39) ───────────────────────
+
+    struct ScriptedQuoter(Result<crate::api::buy_authority::BuyQuote, String>);
+    impl crate::market_quote::MarketQuoter for ScriptedQuoter {
+        fn quote(&self, _: &str) -> Result<crate::api::buy_authority::BuyQuote, String> {
+            self.0.clone()
+        }
+    }
+
+    fn quote_intent(asset: &str, declared: &str) -> IntentDeclarationV1 {
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        IntentDeclarationV1::issue(
+            &sk,
+            sk.verifying_key().to_bytes(),
+            "quote-intent-1",
+            "vm-shopper",
+            "runtime.market_quote",
+            declared,
+            &format!("{PAY_PREFIX}{asset}"),
+            "read",
+            "grant-1",
+        )
+    }
+
+    fn quote_registry(
+        outcome: Result<crate::api::buy_authority::BuyQuote, String>,
+    ) -> MethodRegistryExecutor {
+        MethodRegistryExecutor::new().with_market_quotes(
+            Arc::default(),
+            Arc::new(ScriptedQuoter(outcome)),
+        )
+    }
+
+    fn terms_5_usdc() -> crate::api::buy_authority::BuyQuote {
+        crate::api::buy_authority::BuyQuote {
+            price: "5000000".to_string(),
+            pay_token: "0xUSDC".to_string(),
+            supply: 3,
+        }
+    }
+
+    /// Discovery mode ("" declared): the read performs AS DECLARED (input_hash echo "") so it
+    /// reconciles Matched, and the terms reach the agent ONLY via the explicit disclosure.
+    #[test]
+    fn market_quote_discovery_returns_terms_via_the_disclosure_channel() {
+        let exec = quote_registry(Ok(terms_5_usdc()));
+        match exec.execute(&quote_intent("QmMovie", "")) {
+            IntentExecution::Performed {
+                input_hash,
+                action,
+                agent_visible_report,
+                rail_ref,
+                ..
+            } => {
+                assert_eq!(input_hash, "", "discovery echoes the declaration — Matched");
+                assert_eq!(action, "read");
+                assert_eq!(
+                    agent_visible_report.as_deref(),
+                    Some("price=5000000;tok=0xUSDC;supply=3"),
+                    "the terms travel via the EXPLICIT disclosure channel"
+                );
+                assert!(rail_ref.is_none(), "a quote settles nothing — no rail_ref");
+            }
+            other => panic!("expected Performed, got {other:?}"),
+        }
+    }
+
+    /// Attested mode: declaring the CURRENT terms Matches (the echo equals the declaration);
+    /// declaring STALE terms gets the ACTUAL terms echoed — the reconciliation Diverges, never a
+    /// fabricated match.
+    #[test]
+    fn market_quote_attested_mode_echoes_actual_terms() {
+        let exec = quote_registry(Ok(terms_5_usdc()));
+        let current = "price=5000000;tok=0xUSDC;supply=3";
+        match exec.execute(&quote_intent("QmMovie", current)) {
+            IntentExecution::Performed { input_hash, .. } => {
+                assert_eq!(input_hash, current, "believed-correct terms reconcile Matched");
+            }
+            other => panic!("expected Performed, got {other:?}"),
+        }
+        match exec.execute(&quote_intent("QmMovie", "price=1;tok=0xUSDC;supply=3")) {
+            IntentExecution::Performed { input_hash, .. } => {
+                assert_eq!(
+                    input_hash, current,
+                    "stale belief: the ACTUAL terms are echoed — Diverged, never fabricated"
+                );
+            }
+            other => panic!("expected Performed, got {other:?}"),
+        }
+    }
+
+    /// A failed read (no listing / chain unreachable) DECLINES with the bounded error — a quote
+    /// is performed only when it truly returned terms. And the pay namespace is the boundary:
+    /// a non-pay resource declines before any read.
+    #[test]
+    fn market_quote_declines_on_read_failure_and_outside_the_pay_namespace() {
+        let exec = quote_registry(Err("no active listing".to_string()));
+        match exec.execute(&quote_intent("QmMovie", "")) {
+            IntentExecution::Declined { reason } => {
+                assert!(reason.contains("no active listing"), "honest reason: {reason}");
+            }
+            other => panic!("expected Declined, got {other:?}"),
+        }
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let outside = IntentDeclarationV1::issue(
+            &sk,
+            sk.verifying_key().to_bytes(),
+            "quote-intent-2",
+            "vm-shopper",
+            "runtime.market_quote",
+            "",
+            "elastos://runtime/state/secret-key",
+            "read",
+            "grant-1",
+        );
+        match quote_registry(Ok(terms_5_usdc())).execute(&outside) {
+            IntentExecution::Declined { reason } => {
+                assert!(reason.contains("must be"), "namespace-bounded: {reason}");
+            }
+            other => panic!("expected Declined, got {other:?}"),
+        }
+    }
+
+    /// The affordance rides the ONE quote spine: a cached quote is served with NO quoter call,
+    /// and a fresh in-flight claim by another consumer declines rather than duplicating the read.
+    #[test]
+    fn market_quote_shares_the_single_flight_cache() {
+        struct CountingQuoter(std::sync::atomic::AtomicUsize);
+        impl crate::market_quote::MarketQuoter for CountingQuoter {
+            fn quote(&self, _: &str) -> Result<crate::api::buy_authority::BuyQuote, String> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(crate::api::buy_authority::BuyQuote {
+                    price: "7".to_string(),
+                    pay_token: "native".to_string(),
+                    supply: 1,
+                })
+            }
+        }
+        let cache: crate::market_quote::MarketQuoteCache = Arc::default();
+        let quoter = Arc::new(CountingQuoter(std::sync::atomic::AtomicUsize::new(0)));
+        let exec = MethodRegistryExecutor::new()
+            .with_market_quotes(cache.clone(), quoter.clone());
+        assert!(matches!(
+            exec.execute(&quote_intent("QmA", "")),
+            IntentExecution::Performed { .. }
+        ));
+        assert!(matches!(
+            exec.execute(&quote_intent("QmA", "")),
+            IntentExecution::Performed { .. }
+        ));
+        assert_eq!(
+            quoter.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second quote is a cache hit — one live read per asset per window"
+        );
+        // Another consumer (the panel) holds the in-flight claim for QmB ⇒ the agent's quote
+        // declines with retry rather than duplicating the chain read.
+        crate::market_quote::claim_or_serve(&cache, "QmB", crate::market_quote::now_unix(), true);
+        match exec.execute(&quote_intent("QmB", "")) {
+            IntentExecution::Declined { reason } => {
+                assert!(reason.contains("in progress"), "single-flight respected: {reason}");
+            }
+            other => panic!("expected Declined, got {other:?}"),
+        }
+    }
+    /// Council S39 fold (red-team F2): terms the QUOTE SOURCE returns are held to the same bound
+    /// as the agent's declaration before they are signed/disclosed — out-of-bound terms refuse,
+    /// they never land on the chain or in the response.
+    #[test]
+    fn market_quote_refuses_malformed_terms_from_the_quote_source() {
+        let huge = quote_registry(Ok(crate::api::buy_authority::BuyQuote {
+            price: "9".repeat(500),
+            pay_token: "0xUSDC".to_string(),
+            supply: 1,
+        }));
+        match huge.execute(&quote_intent("QmMovie", "")) {
+            IntentExecution::Declined { reason } => {
+                assert!(reason.contains("malformed terms"), "bounded refusal: {reason}");
+            }
+            other => panic!("expected Declined on oversized terms, got {other:?}"),
+        }
+        let nonprintable = quote_registry(Ok(crate::api::buy_authority::BuyQuote {
+            price: "5\u{7}00".to_string(), // a control byte from a hostile quote source
+            pay_token: "0xUSDC".to_string(),
+            supply: 1,
+        }));
+        match nonprintable.execute(&quote_intent("QmMovie", "")) {
+            IntentExecution::Declined { reason } => {
+                assert!(reason.contains("malformed terms"), "charset refusal: {reason}");
+            }
+            other => panic!("expected Declined on non-printable terms, got {other:?}"),
+        }
+    }
+
+    /// Council S39 fold (red-team F1): concurrent quote reads are BOUNDED like payments — with
+    /// every slot parked on a hung read, the next quote refuses with retry instead of parking
+    /// another blocking thread; released slots admit again.
+    #[test]
+    fn market_quote_inflight_reads_are_bounded_fail_closed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+
+        /// A quoter that parks until released, counting entries.
+        struct ParkedQuoter {
+            entered: AtomicUsize,
+            release: std::sync::Mutex<mpsc::Receiver<()>>,
+        }
+        impl crate::market_quote::MarketQuoter for ParkedQuoter {
+            fn quote(&self, _: &str) -> Result<crate::api::buy_authority::BuyQuote, String> {
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                // Park until the test releases us (bounded by the recv timeout below).
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(30));
+                Ok(crate::api::buy_authority::BuyQuote {
+                    price: "1".to_string(),
+                    pay_token: "native".to_string(),
+                    supply: 1,
+                })
+            }
+        }
+        let (tx, rx) = mpsc::channel::<()>();
+        let quoter = Arc::new(ParkedQuoter {
+            entered: AtomicUsize::new(0),
+            release: std::sync::Mutex::new(rx),
+        });
+        let exec = Arc::new(
+            MethodRegistryExecutor::new().with_market_quotes(Arc::default(), quoter.clone()),
+        );
+
+        // Park 8 reads on 8 DISTINCT assets (single-flight dedups per asset, so distinct assets
+        // are what can stack threads — exactly the attack the bound closes).
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let exec = exec.clone();
+            handles.push(std::thread::spawn(move || {
+                exec.execute(&quote_intent(&format!("Qm{i}"), ""))
+            }));
+        }
+        // Wait until all 8 are genuinely inside the quoter (parked on the channel).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while quoter.entered.load(Ordering::SeqCst) < 8 {
+            assert!(std::time::Instant::now() < deadline, "parked readers never arrived");
+            std::thread::yield_now();
+        }
+
+        // The 9th DISTINCT asset: every slot is parked ⇒ refuse with retry, never a 9th thread.
+        match exec.execute(&quote_intent("Qm-ninth", "")) {
+            IntentExecution::Declined { reason } => {
+                assert!(
+                    reason.contains("already") && reason.contains("in-flight"),
+                    "the bound refuses, fail-closed: {reason}"
+                );
+            }
+            other => panic!("expected the in-flight bound to refuse, got {other:?}"),
+        }
+        assert_eq!(
+            quoter.entered.load(Ordering::SeqCst),
+            8,
+            "the 9th quote never reached the quote source"
+        );
+
+        // Release the parked readers; the slots free and a new quote is admitted again.
+        for _ in 0..8 {
+            let _ = tx.send(());
+        }
+        for h in handles {
+            let _ = h.join().unwrap();
+        }
+        // Disconnect the channel so the admitted after-quote returns immediately instead of
+        // parking out its full recv timeout.
+        drop(tx);
+        match exec.execute(&quote_intent("Qm-after", "")) {
+            IntentExecution::Performed { .. } => {}
+            other => panic!("released slots must admit again, got {other:?}"),
+        }
     }
 }

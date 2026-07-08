@@ -129,6 +129,10 @@ pub struct PayRail {
     /// (their pendings are operator-reconciled), which also keeps the scheduler structurally
     /// un-armable there.
     pub drm_confirmer: Option<Arc<dyn crate::drm_marketplace::DrmConfirmer>>,
+    /// The ONE market-quote cache (Sprint 39) — shared same-Arc between the Mandates app's
+    /// Marketplace panel and the agent-facing `runtime.market_quote` affordance, so both ride
+    /// the identical single-flight fan-out bound (see `crate::market_quote`).
+    pub quote_cache: crate::market_quote::MarketQuoteCache,
 }
 
 /// Rail selection, fail-closed (Sprint 29/31; see the serve() doc block for the full rules):
@@ -286,6 +290,7 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
                     )),
                     ledger: payment_ledger,
                     drm_confirmer: Some(marketplace),
+                    quote_cache: Arc::default(),
                 })
             }
             _ => {
@@ -365,6 +370,7 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
                     )),
                     ledger,
                     drm_confirmer: None,
+                    quote_cache: Arc::default(),
                 })
             }
             (true, _, _) => {
@@ -408,6 +414,7 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
                 provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
                 ledger,
                 drm_confirmer: None,
+                quote_cache: Arc::default(),
             }
         });
     }
@@ -676,11 +683,19 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
                 data_dir.clone(),
             );
             match &pay_rail {
-                Some(rail) => Arc::new(base.with_payments(
-                    rail.meter.clone(),
-                    rail.provider.clone(),
-                    rail.ledger.clone(),
-                )),
+                Some(rail) => Arc::new(
+                    base.with_payments(
+                        rail.meter.clone(),
+                        rail.provider.clone(),
+                        rail.ledger.clone(),
+                    )
+                    // Sprint 39: the agent-facing quote affordance rides the SAME cache Arc the
+                    // Marketplace panel reads — one quote spine, one fan-out bound.
+                    .with_market_quotes(
+                        rail.quote_cache.clone(),
+                        Arc::new(crate::market_quote::LiveMarketQuoter),
+                    ),
+                ),
                 None => Arc::new(base),
             }
         },

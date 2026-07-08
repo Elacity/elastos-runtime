@@ -159,10 +159,18 @@ state vocabulary of the table above. Outside the live Chain rights mode the pane
 free/synthetic rather than displaying them as on-chain prices. The panel has NO buy verb — buys
 happen only through an agent's signed intent.
 
+Agents shop the same way (Sprint 39): `runtime.market_quote` is a READ affordance behind the
+same dispatch gate — an agent granted a `read` quote-mandate on a pay resource may quote THAT
+asset's live terms (price/pay-token/supply) through the identical single-flight cache, and
+receives them in the dispatch response's explicit-disclosure field. One envelope carries one
+action, so quote (`read`) and buy (`execute`) are TWO grants on the same resource. No mandate,
+no quote — there is no market-wide price oracle for free.
+
 One-command demo against a running runtime with a wired rail:
-`elastos mandate market-demo <asset> [--amount N]` — provisions a cap, grants a single-asset
-pay-mandate bound to an ephemeral agent key, dispatches the agent's signed buy, revokes the
-mandate, and leaves the buy's ledger record for the panel to show.
+`elastos mandate market-demo <asset> [--amount N]` — provisions a cap, grants the two
+single-asset mandates (read quote + execute pay) bound to one ephemeral agent key, has the agent
+QUOTE the live terms and decide, dispatches the agent's signed buy, then revokes both mandates
+and clears the cap — leaving the buy's ledger record for the panel to show.
 
 ## The test seam (why CI needs no chain)
 

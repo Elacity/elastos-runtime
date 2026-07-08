@@ -27,6 +27,7 @@ pub mod inspect_provider;
 pub mod ipfs;
 pub mod library;
 pub mod local_http;
+pub mod market_quote;
 pub mod mcp_serve_cmd;
 pub mod net_validation;
 pub mod notifications;

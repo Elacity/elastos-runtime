@@ -2035,6 +2035,12 @@ pub struct DispatchIntentOutput {
     /// authorized_not_performed); `None` when denied. Its `status` is the independent verdict of
     /// what the executor actually did vs. what was declared.
     pub reconciliation: Option<elastos_runtime::capability::IntentReconciliationV1>,
+    /// Data the EXECUTOR explicitly disclosed to the agent (Sprint 39): `runtime.market_quote`
+    /// returns the quoted terms here (`price=…;tok=…;supply=…`). Absent for every other
+    /// affordance BY DESIGN — disclosure is per-executor opt-in, so `state_get`'s one-bit
+    /// discipline cannot be eroded by the pipeline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
 }
 
 /// POST /api/agent/dispatch  (AGENT-FACING — Sprint 26) — the same ACT leg, but reachable by the
@@ -2157,6 +2163,7 @@ pub async fn dispatch_standing_intent(
                     .to_string(),
             ),
             reconciliation: None,
+            report: None,
         }));
     }
     // RATE BUDGET (G-M7): each mandate may perform at most MANDATE_DISPATCH_LIMIT acts per window.
@@ -2273,6 +2280,10 @@ pub async fn dispatch_standing_intent(
     // act; only a `Matched` performance carries it onto the chain (see the emit below).
     let rail_ref_slot = Arc::new(std::sync::Mutex::new(None::<String>));
     let rail_ref_w = rail_ref_slot.clone();
+    // Sprint 39: the executor's EXPLICIT agent disclosure (market_quote's terms) — same
+    // side-channel pattern as rail_ref; only what an executor opts in ever reaches the response.
+    let report_slot = Arc::new(std::sync::Mutex::new(None::<String>));
+    let report_w = report_slot.clone();
     // The act runs ONLY when the gate authorizes (dispatch calls this closure solely on the Acted
     // path), so a denied/revoked/wrong-agent intent never invokes the executor — "no authorization
     // ⇒ no act". The receipt is minted from what the executor REPORTS it performed, never from the
@@ -2311,6 +2322,7 @@ pub async fn dispatch_standing_intent(
                 resource,
                 action: performed_action,
                 rail_ref,
+                agent_visible_report,
             } => {
                 // Stash the rail reference for the out-of-closure use-record. Set only when the
                 // executor actually settled on a rail (a DRM/pay act); the emit binds it onto the
@@ -2318,6 +2330,15 @@ pub async fn dispatch_standing_intent(
                 if let Some(rail_ref) = rail_ref {
                     if let Ok(mut slot) = rail_ref_w.lock() {
                         *slot = Some(rail_ref);
+                    }
+                }
+                // Stash the executor's EXPLICIT agent disclosure (Sprint 39 — market_quote's
+                // terms). Only what the executor opted in reaches the response; the pipeline
+                // never surfaces receipt echoes wholesale (state_get's one-bit rule stays
+                // structural).
+                if let Some(report) = agent_visible_report {
+                    if let Ok(mut slot) = report_w.lock() {
+                        *slot = Some(report);
                     }
                 }
                 let performed = match performed_action.to_lowercase().as_str() {
@@ -2367,6 +2388,7 @@ pub async fn dispatch_standing_intent(
                     outcome: "denied".to_string(),
                     reason: Some(reason.as_str().to_string()),
                     reconciliation: None,
+                    report: None,
                 },
                 false,
             ),
@@ -2390,6 +2412,21 @@ pub async fn dispatch_standing_intent(
                         // non-executor decline.
                         reason: decline_reason.lock().ok().and_then(|mut s| s.take()),
                         reconciliation: Some(rec),
+                        // The explicit disclosure, surfaced only when the act genuinely
+                        // PERFORMED as declared — a diverged/undelivered act discloses nothing.
+                        // Defense-in-depth at the boundary (mirrors rail_ref's emit-site
+                        // re-sanitization): bound + printable-filter for ANY future executor,
+                        // not just today's terms-shaped producer.
+                        report: if matched {
+                            report_slot.lock().ok().and_then(|mut s| s.take()).map(|r| {
+                                r.chars()
+                                    .filter(|c| c.is_ascii_graphic() || *c == ' ')
+                                    .take(256)
+                                    .collect()
+                            })
+                        } else {
+                            None
+                        },
                     },
                     matched,
                 )
@@ -3154,6 +3191,7 @@ mod tests {
                 resource: intent.resource.clone(),
                 action: intent.action.clone(),
                 rail_ref: None,
+                agent_visible_report: None,
             }
         }
     }
@@ -5116,6 +5154,7 @@ mod tests {
                     resource: "elastos://pay/SOMEWHERE-ELSE".to_string(),
                     action: intent.action.clone(),
                     rail_ref: None,
+                    agent_visible_report: None,
                 }
             }
         }
@@ -6296,5 +6335,109 @@ mod tests {
         assert_eq!(output.status, "pending");
         assert!(output.request_id.is_some());
         assert!(output.reason.is_none());
+    }
+    /// Sprint 39 e2e: under a quote-capable pay-mandate, an agent's `runtime.market_quote`
+    /// dispatch PERFORMS and the terms reach the agent via the response's explicit-disclosure
+    /// channel — while `runtime.state_get` (the one-bit attested read) discloses NOTHING through
+    /// the same pipeline. Disclosure is per-executor opt-in, structurally.
+    #[tokio::test]
+    async fn an_agent_quotes_its_asset_and_state_get_still_discloses_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state_with_durable_audit(dir.path());
+        struct FixedQuoter;
+        impl crate::market_quote::MarketQuoter for FixedQuoter {
+            fn quote(&self, _: &str) -> Result<crate::api::buy_authority::BuyQuote, String> {
+                Ok(crate::api::buy_authority::BuyQuote {
+                    price: "5000000".to_string(),
+                    pay_token: "0xUSDC".to_string(),
+                    supply: 3,
+                })
+            }
+        }
+        state.intent_executor = std::sync::Arc::new(
+            crate::intent_executor::MethodRegistryExecutor::production(
+                state.capability_manager.audit_log().clone(),
+                Some(dir.path().to_path_buf()),
+            )
+            .with_market_quotes(std::sync::Arc::default(), std::sync::Arc::new(FixedQuoter)),
+        );
+        let asset_resource = format!("{}QmMovie", crate::intent_executor::PAY_PREFIX);
+
+        let agent_sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let agent_pub = hex::encode(agent_sk.verifying_key().to_bytes());
+        let out = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-shopper".to_string(),
+                resource: asset_resource.clone(),
+                action: "read".to_string(),
+                methods: vec!["runtime.market_quote".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: Some(agent_pub.clone()),
+                dispatch_limit: None,
+                responsible_entity: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let quote = IntentDeclarationV1::issue(
+            &agent_sk, agent_sk.verifying_key().to_bytes(), "quote-1", "vm-shopper",
+            "runtime.market_quote", "", &asset_resource, "read", &out.token_id,
+        );
+        let r = dispatch_agent_intent(State(state.clone()), Json(quote))
+            .await
+            .expect("quote dispatch")
+            .0;
+        assert_eq!(r.outcome, "performed", "a discovery quote reconciles Matched: {:?}", r.reason);
+        assert_eq!(
+            r.report.as_deref(),
+            Some("price=5000000;tok=0xUSDC;supply=3"),
+            "the agent LEARNS the terms via the explicit disclosure channel"
+        );
+
+        // The negative control: a state_get through the SAME pipeline discloses nothing —
+        // its value never reaches the response, matched or not.
+        crate::agent_store::put_agent_state(
+            dir.path(),
+            "vm-reader",
+            "cursor",
+            "cafe01",
+            "grant-x",
+            "intent-x",
+        )
+        .expect("seed state");
+        let reader_sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let reader_pub = hex::encode(reader_sk.verifying_key().to_bytes());
+        let sg = issue_standing_grant(
+            State(state.clone()),
+            Json(IssueStandingGrantInput {
+                capsule: "vm-reader".to_string(),
+                resource: format!("{}cursor", crate::intent_executor::STATE_PUT_PREFIX),
+                action: "read".to_string(),
+                methods: vec!["runtime.state_get".to_string()],
+                ttl_secs: Some(3600),
+                agent_pubkey: Some(reader_pub),
+                dispatch_limit: None,
+                responsible_entity: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let guess = IntentDeclarationV1::issue(
+            &reader_sk, reader_sk.verifying_key().to_bytes(), "read-1", "vm-reader",
+            "runtime.state_get", "beef02", // a WRONG guess — diverges
+            &format!("{}cursor", crate::intent_executor::STATE_PUT_PREFIX), "read", &sg.token_id,
+        );
+        let r2 = dispatch_agent_intent(State(state.clone()), Json(guess))
+            .await
+            .expect("state_get dispatch")
+            .0;
+        assert_eq!(r2.outcome, "diverged", "a wrong guess is one bit");
+        assert!(
+            r2.report.is_none(),
+            "state_get NEVER discloses through the pipeline — the opt-in stays per-executor"
+        );
     }
 }

@@ -645,11 +645,11 @@ async fn money_reconcile(
 // GRANT (the issue route), agents ACT (the signed-intent dispatch routes on the API server);
 // this surface only shows what the mandates scope and what the ledger says happened.
 
-/// How long one asset's on-chain quote is served from cache before a re-read. Together with the
-/// in-flight sentinel below this makes the fan-out bound literal: at most one LIVE chain read per
-/// asset per window, however many concurrent views race (a miss claims the slot under the lock
-/// before any read starts; later misses see the claim and wait for the cache).
-const MARKET_QUOTE_TTL_SECS: u64 = 30;
+pub(crate) use crate::market_quote::{
+    claim_or_serve, quote_outcome, CachedQuote, MarketQuote, MarketQuoteCache,
+    MARKET_QUOTE_TTL_SECS,
+};
+
 /// At most this many FRESH chain reads per view. Cache hits are free (they cost no chain read and
 /// never consume a slot), so with the TTL this rotates quote coverage across refreshes instead of
 /// permanently starving the alphabetically-last assets: view 1 reads assets 1-8, view 2 finds
@@ -659,36 +659,6 @@ const MARKET_MAX_QUOTED_ASSETS: usize = 8;
 /// truncated — an operator watch surface must not let a flood of new terminals push a live
 /// obligation out of sight.
 const MARKET_BUYS_LIMIT: usize = 64;
-
-/// One asset's cached quote outcome (either the live terms or a length-bounded error string —
-/// rendered via textContent only; it is NOT sanitized server-side).
-#[derive(Clone, serde::Serialize)]
-pub(crate) struct MarketQuote {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub price: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pay_token: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub supply: Option<u128>,
-    /// Length-bounded read failure — the asset stays listed, honestly unquoted.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// One cache slot: `quote: None` is the IN-FLIGHT sentinel — a view has claimed this asset's
-/// chain read and not yet finished. The sentinel expires by the same TTL (a crashed fetch can
-/// never wedge an asset), and concurrent views that see a fresh sentinel serve "in progress"
-/// instead of spawning a duplicate read (single-flight).
-#[derive(Clone)]
-pub(crate) struct MarketQuoteSlot {
-    pub quoted_at: u64,
-    pub quote: Option<MarketQuote>,
-}
-
-/// The per-process quote cache: asset → slot. Pruned by TTL on every claim pass, so it stays
-/// bounded by the recently-viewed asset set.
-pub(crate) type MarketQuoteCache =
-    Arc<std::sync::Mutex<std::collections::HashMap<String, MarketQuoteSlot>>>;
 
 #[derive(serde::Serialize)]
 struct MarketAssetView {
@@ -834,88 +804,50 @@ async fn marketplace_view(
     //    view. So "at most one live chain read per asset per TTL window" is literal under any
     //    concurrency, and coverage ROTATES across refreshes instead of starving the tail.
     let now = now_ts();
+    crate::market_quote::prune(&state.marketplace_quote_cache, now); // once per view
     let mut assets = Vec::with_capacity(by_asset.len());
     let mut to_quote: Vec<String> = Vec::new();
-    {
-        let mut cache = match state.marketplace_quote_cache.lock() {
-            Ok(c) => c,
-            Err(poisoned) => poisoned.into_inner(),
+    for (asset, mandates) in by_asset {
+        // The SHARED single-flight claim pass (crate::market_quote — the same spine the
+        // runtime.market_quote affordance uses): serve fresh free, respect an in-flight claim,
+        // claim up to this view's fresh-read budget, and state the over-budget tail.
+        let may_claim = to_quote.len() < MARKET_MAX_QUOTED_ASSETS;
+        let (quote, over_cap) = match claim_or_serve(&state.marketplace_quote_cache, &asset, now, may_claim)
+        {
+            CachedQuote::Fresh(q) => (Some(q), false),
+            CachedQuote::InFlight => (None, false),
+            CachedQuote::Claimed => {
+                to_quote.push(asset.clone());
+                (None, false)
+            }
+            CachedQuote::NotClaimed => (None, true),
         };
-        // Prune by TTL on every claim pass — the cache stays bounded by recently-viewed assets.
-        cache.retain(|_, slot| now.saturating_sub(slot.quoted_at) < MARKET_QUOTE_TTL_SECS);
-        for (asset, mandates) in by_asset {
-            let (quote, over_cap) = match cache.get(&asset) {
-                // Fresh result (retain above dropped the stale ones) — served free.
-                Some(slot) if slot.quote.is_some() => (slot.quote.clone(), false),
-                // Fresh in-flight sentinel — another view is reading; show "in progress".
-                Some(_) => (None, false),
-                None if to_quote.len() < MARKET_MAX_QUOTED_ASSETS => {
-                    // Claim the read NOW, under the lock: concurrent misses coalesce on this
-                    // sentinel instead of each spawning a chain read.
-                    cache.insert(
-                        asset.clone(),
-                        MarketQuoteSlot {
-                            quoted_at: now,
-                            quote: None,
-                        },
-                    );
-                    to_quote.push(asset.clone());
-                    (None, false)
-                }
-                // No cache, no slot left this view — stated; the rotation reaches it next TTL.
-                None => (None, true),
-            };
-            assets.push(MarketAssetView {
-                asset,
-                mandates,
-                quote,
-                unquoted_over_cap: over_cap,
-            });
-        }
+        assets.push(MarketAssetView {
+            asset,
+            mandates,
+            quote,
+            unquoted_over_cap: over_cap,
+        });
     }
     if !to_quote.is_empty() {
         let fresh = tokio::task::spawn_blocking(move || {
             to_quote
                 .into_iter()
                 .map(|asset| {
-                    let quote = match crate::api::buy_authority::quote_buy(
+                    let quote = quote_outcome(crate::api::buy_authority::quote_buy(
                         &asset,
                         &crate::api::buy_authority::BuyTarget::default(),
-                    ) {
-                        Ok(q) => MarketQuote {
-                            price: Some(q.price),
-                            pay_token: Some(q.pay_token),
-                            supply: Some(q.supply),
-                            error: None,
-                        },
-                        Err(e) => MarketQuote {
-                            price: None,
-                            pay_token: None,
-                            supply: None,
-                            // Bounded: a chain error string must not balloon the panel payload.
-                            error: Some(e.chars().take(200).collect()),
-                        },
-                    };
+                    ));
                     (asset, quote)
                 })
                 .collect::<Vec<_>>()
         })
         .await
         .unwrap_or_default();
-        if let Ok(mut cache) = state.marketplace_quote_cache.lock() {
-            for (asset, quote) in &fresh {
-                // Stamped AFTER the read returned (council S38 red-team F4): a slow fetch must
-                // not be served as "fresh" for a full TTL past its actual read time.
-                cache.insert(
-                    asset.clone(),
-                    MarketQuoteSlot {
-                        quoted_at: now_ts(),
-                        quote: Some(quote.clone()),
-                    },
-                );
-            }
-        }
         for (asset, quote) in fresh {
+            // Stamped AFTER the read returned (council S38 red-team F4): a slow fetch must not
+            // be served as "fresh" for a full TTL past its actual read time.
+            crate::market_quote::fill(&state.marketplace_quote_cache, &asset, quote.clone(), now_ts());
             if let Some(view) = assets.iter_mut().find(|a| a.asset == asset) {
                 view.quote = Some(quote);
             }
@@ -1637,6 +1569,7 @@ mod tests {
                 provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
                 ledger: ledger.clone(),
                 drm_confirmer: None,
+                quote_cache: Arc::default(),
             }),
             spent_fresh_money_tokens: Arc::default(),
             marketplace_quote_cache: Arc::default(),
@@ -1735,6 +1668,7 @@ mod tests {
                 provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
                 ledger: Arc::new(crate::payment_ledger::PaymentLedger::new()),
                 drm_confirmer: None,
+                quote_cache: Arc::default(),
             }),
             spent_fresh_money_tokens: Arc::default(),
             marketplace_quote_cache: Arc::default(),
@@ -1811,6 +1745,7 @@ mod tests {
                 provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
                 ledger: Arc::new(crate::payment_ledger::PaymentLedger::new()),
                 drm_confirmer: None,
+                quote_cache: Arc::default(),
             }),
             spent_fresh_money_tokens: Arc::default(),
             marketplace_quote_cache: Arc::default(),
@@ -1878,6 +1813,7 @@ mod tests {
                 provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
                 ledger: ledger.clone(),
                 drm_confirmer: None,
+                quote_cache: Arc::default(),
             }),
             spent_fresh_money_tokens: Arc::default(),
             marketplace_quote_cache: Arc::default(),
@@ -2019,6 +1955,7 @@ mod tests {
                 provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
                 ledger: Arc::new(crate::payment_ledger::PaymentLedger::new()),
                 drm_confirmer: None,
+                quote_cache: Arc::default(),
             }),
             spent_fresh_money_tokens: Arc::default(),
             marketplace_quote_cache: Arc::default(),
@@ -2087,6 +2024,7 @@ mod tests {
                 provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
                 ledger: Arc::new(crate::payment_ledger::PaymentLedger::new()),
                 drm_confirmer: None,
+                quote_cache: Arc::default(),
             }),
             spent_fresh_money_tokens: Arc::default(),
             marketplace_quote_cache: Arc::default(),
@@ -2206,6 +2144,7 @@ mod tests {
             provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
             ledger: ledger.clone(),
             drm_confirmer: None,
+            quote_cache: Arc::default(),
         });
 
         // A pay-mandate for asset QmMovie…
@@ -2254,7 +2193,7 @@ mod tests {
         // Pre-populate the quote cache so the projection is fully deterministic (no chain).
         state.marketplace_quote_cache.lock().unwrap().insert(
             "QmMovie".to_string(),
-            MarketQuoteSlot {
+            crate::market_quote::MarketQuoteSlot {
                 quoted_at: now_ts(),
                 quote: Some(MarketQuote {
                     price: Some("5000000".to_string()),
@@ -2332,6 +2271,7 @@ mod tests {
             provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
             ledger: Arc::new(PaymentLedger::new()),
             drm_confirmer: None,
+            quote_cache: Arc::default(),
         });
         // MARKET_MAX_QUOTED_ASSETS + 2 assets, each behind an active pay-mandate.
         for i in 0..(MARKET_MAX_QUOTED_ASSETS + 2) {
@@ -2415,6 +2355,7 @@ mod tests {
             provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
             ledger: ledger.clone(),
             drm_confirmer: None,
+            quote_cache: Arc::default(),
         });
 
         // The OLDEST entry is a live pending obligation…
