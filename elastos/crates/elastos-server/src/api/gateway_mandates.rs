@@ -13,7 +13,7 @@
 //! the gateway only when both handles are present (see [`super::gateway_server::start_gateway_server`]).
 //!
 //! Every route is gated by the same home-launch token as every other shell app — the mandates app
-//! must be the launched capsule. The four GET routes are strictly read-only. The surface carries
+//! must be the launched capsule. The GET routes (list, agent-state, receipt, money, marketplace) are strictly read-only. The surface carries
 //! FOUR mutations (Sprint 31 count — this enumeration is the surface's security story and must
 //! stay literally true, council S31 G-F2):
 //!
@@ -103,6 +103,10 @@ pub(crate) struct MandateApiState {
     /// restart clears it, so a token younger than the freshness window could be replayed once
     /// across a restart — the window is [`MONEY_FRESH_WINDOW_SECS`].
     pub(crate) spent_fresh_money_tokens: Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+    /// Sprint 38: the Marketplace panel's per-asset quote cache (TTL-bounded; see
+    /// [`MARKET_QUOTE_TTL_SECS`]) — a browser refresh storm costs at most one chain read per
+    /// asset per window.
+    pub(crate) marketplace_quote_cache: MarketQuoteCache,
 }
 
 /// The mandates capsule id — must match `capsules/mandates/capsule.json`'s `name`.
@@ -634,6 +638,315 @@ async fn money_reconcile(
     }
 }
 
+// ─────────────────────────── The Marketplace panel (Sprint 38) ───────────────────────────
+//
+// STRICTLY READ-ONLY: every pixel is a projection of the one enforcing registry + meter + ledger
+// (same Arcs as the pay gate, by construction). The panel never gains a "buy" verb — operators
+// GRANT (the issue route), agents ACT (the signed-intent dispatch routes on the API server);
+// this surface only shows what the mandates scope and what the ledger says happened.
+
+/// How long one asset's on-chain quote is served from cache before a re-read. Together with the
+/// in-flight sentinel below this makes the fan-out bound literal: at most one LIVE chain read per
+/// asset per window, however many concurrent views race (a miss claims the slot under the lock
+/// before any read starts; later misses see the claim and wait for the cache).
+const MARKET_QUOTE_TTL_SECS: u64 = 30;
+/// At most this many FRESH chain reads per view. Cache hits are free (they cost no chain read and
+/// never consume a slot), so with the TTL this rotates quote coverage across refreshes instead of
+/// permanently starving the alphabetically-last assets: view 1 reads assets 1-8, view 2 finds
+/// them cached and reads 9-16, and so on.
+const MARKET_MAX_QUOTED_ASSETS: usize = 8;
+/// How many SETTLED (terminal) ledger entries the buys table projects. Pending buys are NEVER
+/// truncated — an operator watch surface must not let a flood of new terminals push a live
+/// obligation out of sight.
+const MARKET_BUYS_LIMIT: usize = 64;
+
+/// One asset's cached quote outcome (either the live terms or a length-bounded error string —
+/// rendered via textContent only; it is NOT sanitized server-side).
+#[derive(Clone, serde::Serialize)]
+pub(crate) struct MarketQuote {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pay_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supply: Option<u128>,
+    /// Length-bounded read failure — the asset stays listed, honestly unquoted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// One cache slot: `quote: None` is the IN-FLIGHT sentinel — a view has claimed this asset's
+/// chain read and not yet finished. The sentinel expires by the same TTL (a crashed fetch can
+/// never wedge an asset), and concurrent views that see a fresh sentinel serve "in progress"
+/// instead of spawning a duplicate read (single-flight).
+#[derive(Clone)]
+pub(crate) struct MarketQuoteSlot {
+    pub quoted_at: u64,
+    pub quote: Option<MarketQuote>,
+}
+
+/// The per-process quote cache: asset → slot. Pruned by TTL on every claim pass, so it stays
+/// bounded by the recently-viewed asset set.
+pub(crate) type MarketQuoteCache =
+    Arc<std::sync::Mutex<std::collections::HashMap<String, MarketQuoteSlot>>>;
+
+#[derive(serde::Serialize)]
+struct MarketAssetView {
+    /// The DRM asset reference (the pay resource's payee suffix — the KID / content id).
+    asset: String,
+    /// Token ids of the ACTIVE pay-mandates scoped to this asset.
+    mandates: Vec<String>,
+    /// The live on-chain terms (cached up to [`MARKET_QUOTE_TTL_SECS`]); absent iff unquoted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quote: Option<MarketQuote>,
+    /// True when this asset had no cached quote AND this view's fresh-read slots were already
+    /// taken — stated, not silently dropped; the TTL rotation reaches it on a later refresh.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    unquoted_over_cap: bool,
+}
+
+#[derive(serde::Serialize)]
+struct MarketBuyView {
+    /// The payee — the DRM asset reference the buy targeted.
+    asset: String,
+    /// The acting capsule (agent identity).
+    capsule: String,
+    /// Spend units authorized by the signed intent.
+    amount: u64,
+    /// Machine state: refused | pending | charged | confirmed | refunded.
+    state: String,
+    /// The honest operator wording for `state` (a broadcast is NEVER "purchased").
+    detail: String,
+    /// The broadcast tx hash, when the rail reference carries one (`drm:tx=…`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tx: Option<String>,
+    /// The mandate the buy acted under, when recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mandate: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct MarketplaceView {
+    /// The rights mode the quotes were read under — "chain" is live truth; "dev"/"chainmock"
+    /// quote FREE (price 0), and the panel must say so rather than display a fake price.
+    rights_mode: String,
+    assets: Vec<MarketAssetView>,
+    buys: Vec<MarketBuyView>,
+    /// How many entries the ledger holds in total — when it exceeds `buys.len()`, the table is
+    /// honestly a WINDOW (pending always included; only the terminal tail is capped).
+    buys_total: usize,
+    buys_limit: usize,
+    quote_ttl_secs: u64,
+}
+
+/// Map one ledger record to its honest display row. The wording rule (P12): a broadcast-accepted
+/// buy reads "awaiting chain confirmation" — `confirmed` is reserved for the chain's own verdict
+/// (or the operator's explicit reconcile), never the broadcast.
+fn market_buy_view(record: &crate::payment_ledger::PaymentRecord) -> MarketBuyView {
+    use crate::payment_ledger::PaymentStatus;
+    // Display-bounded: the rail note is rail-controlled bytes — a real tx hash is 66 chars, so
+    // an over-long "tx" is garbage that must not bloat the payload/DOM.
+    let tx = crate::drm_marketplace::parse_drm_tx(&record.rail_note)
+        .map(|t| t.chars().take(80).collect::<String>());
+    let (state, detail) = match record.status {
+        PaymentStatus::Pending => (
+            "pending",
+            if tx.is_some() {
+                "broadcast — awaiting chain confirmation"
+            } else {
+                "indeterminate — awaiting reconciliation"
+            },
+        ),
+        PaymentStatus::Performed => ("charged", "charged (rail-attested)"),
+        PaymentStatus::ResolvedCharged => (
+            "confirmed",
+            if tx.is_some() {
+                "confirmed on-chain"
+            } else {
+                "confirmed (reconciled against the rail)"
+            },
+        ),
+        PaymentStatus::NotCharged => ("refused", "refused — nothing charged"),
+        PaymentStatus::ResolvedNotCharged => ("refunded", "refunded — the reservation came back"),
+    };
+    MarketBuyView {
+        asset: record.payee.clone(),
+        capsule: record.capsule.clone(),
+        amount: record.amount,
+        state: state.to_string(),
+        detail: detail.to_string(),
+        tx,
+        mandate: record.token_id.clone(),
+    }
+}
+
+/// GET /api/apps/mandates/marketplace — the Marketplace panel's one read: the assets the ACTIVE
+/// pay-mandates scope (with live, cached, fan-out-bounded quotes) and the recent buys as the
+/// ledger records them. 503 without a wired rail (a marketplace with no money path is not a
+/// marketplace — same posture as the Money panel).
+async fn marketplace_view(
+    State(state): State<MandateApiState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Err(resp) = require_mandates_surface(&state, &headers, false) {
+        return *resp;
+    }
+    let Some(rail) = &state.pay_rail else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no payment rail is wired".to_string(),
+        )
+            .into_response();
+    };
+
+    // 1. The assets: every ACTIVE mandate whose envelope authorizes runtime.pay on a pay
+    //    resource, grouped by asset (deterministic order — BTreeMap).
+    let cards = crate::api::handlers::capability::mandate_cards(
+        &state.standing_service,
+        &state.capability_manager,
+    )
+    .await;
+    let mut by_asset: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for card in &cards.mandates {
+        if !card.active || !card.methods.iter().any(|m| m == "runtime.pay") {
+            continue;
+        }
+        let Some(asset) = card
+            .resource
+            .strip_prefix(crate::intent_executor::PAY_PREFIX)
+        else {
+            continue;
+        };
+        if asset.is_empty() {
+            continue;
+        }
+        by_asset
+            .entry(asset.to_string())
+            .or_default()
+            .push(card.token_id.clone());
+    }
+
+    // 2. The quotes. ONE claim pass under the cache lock decides everything (single-flight,
+    //    council S38 fold): a fresh cached quote is served free (a cache hit never consumes a
+    //    fresh-read slot); a fresh IN-FLIGHT sentinel means another view is already reading —
+    //    serve "in progress", never a duplicate read; a miss CLAIMS the slot (sentinel inserted
+    //    under the lock, before any read starts) up to MARKET_MAX_QUOTED_ASSETS fresh reads per
+    //    view. So "at most one live chain read per asset per TTL window" is literal under any
+    //    concurrency, and coverage ROTATES across refreshes instead of starving the tail.
+    let now = now_ts();
+    let mut assets = Vec::with_capacity(by_asset.len());
+    let mut to_quote: Vec<String> = Vec::new();
+    {
+        let mut cache = match state.marketplace_quote_cache.lock() {
+            Ok(c) => c,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // Prune by TTL on every claim pass — the cache stays bounded by recently-viewed assets.
+        cache.retain(|_, slot| now.saturating_sub(slot.quoted_at) < MARKET_QUOTE_TTL_SECS);
+        for (asset, mandates) in by_asset {
+            let (quote, over_cap) = match cache.get(&asset) {
+                // Fresh result (retain above dropped the stale ones) — served free.
+                Some(slot) if slot.quote.is_some() => (slot.quote.clone(), false),
+                // Fresh in-flight sentinel — another view is reading; show "in progress".
+                Some(_) => (None, false),
+                None if to_quote.len() < MARKET_MAX_QUOTED_ASSETS => {
+                    // Claim the read NOW, under the lock: concurrent misses coalesce on this
+                    // sentinel instead of each spawning a chain read.
+                    cache.insert(
+                        asset.clone(),
+                        MarketQuoteSlot {
+                            quoted_at: now,
+                            quote: None,
+                        },
+                    );
+                    to_quote.push(asset.clone());
+                    (None, false)
+                }
+                // No cache, no slot left this view — stated; the rotation reaches it next TTL.
+                None => (None, true),
+            };
+            assets.push(MarketAssetView {
+                asset,
+                mandates,
+                quote,
+                unquoted_over_cap: over_cap,
+            });
+        }
+    }
+    if !to_quote.is_empty() {
+        let fresh = tokio::task::spawn_blocking(move || {
+            to_quote
+                .into_iter()
+                .map(|asset| {
+                    let quote = match crate::api::buy_authority::quote_buy(
+                        &asset,
+                        &crate::api::buy_authority::BuyTarget::default(),
+                    ) {
+                        Ok(q) => MarketQuote {
+                            price: Some(q.price),
+                            pay_token: Some(q.pay_token),
+                            supply: Some(q.supply),
+                            error: None,
+                        },
+                        Err(e) => MarketQuote {
+                            price: None,
+                            pay_token: None,
+                            supply: None,
+                            // Bounded: a chain error string must not balloon the panel payload.
+                            error: Some(e.chars().take(200).collect()),
+                        },
+                    };
+                    (asset, quote)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        if let Ok(mut cache) = state.marketplace_quote_cache.lock() {
+            for (asset, quote) in &fresh {
+                // Stamped AFTER the read returned (council S38 red-team F4): a slow fetch must
+                // not be served as "fresh" for a full TTL past its actual read time.
+                cache.insert(
+                    asset.clone(),
+                    MarketQuoteSlot {
+                        quoted_at: now_ts(),
+                        quote: Some(quote.clone()),
+                    },
+                );
+            }
+        }
+        for (asset, quote) in fresh {
+            if let Some(view) = assets.iter_mut().find(|a| a.asset == asset) {
+                view.quote = Some(quote);
+            }
+        }
+    }
+
+    // 3. The buys: every PENDING entry (a live obligation is never pushed out of sight by a
+    //    flood of newer terminals — council S38 fold) plus the most recent settled tail, newest
+    //    first, with the window stated via buys_total/buys_limit.
+    let ledger = &rail.ledger;
+    let buys_total = ledger.len();
+    let mut records = ledger.pending();
+    for r in ledger.recent(MARKET_BUYS_LIMIT) {
+        if r.status != crate::payment_ledger::PaymentStatus::Pending {
+            records.push(r);
+        }
+    }
+    records.sort_by_key(|r| std::cmp::Reverse(r.seq));
+    let buys: Vec<MarketBuyView> = records.iter().map(market_buy_view).collect();
+
+    Json(MarketplaceView {
+        rights_mode: format!("{:?}", crate::api::rights_authority::rights_mode()).to_lowercase(),
+        assets,
+        buys,
+        buys_total,
+        buys_limit: MARKET_BUYS_LIMIT,
+        quote_ttl_secs: MARKET_QUOTE_TTL_SECS,
+    })
+    .into_response()
+}
+
 /// A failed home-token gate reads as `401` — the app was not launched through the shell.
 fn mandate_auth_error(err: anyhow::Error) -> axum::response::Response {
     (StatusCode::UNAUTHORIZED, err.to_string()).into_response()
@@ -665,6 +978,9 @@ pub(crate) fn mandate_router(state: MandateApiState) -> Router {
             "/api/apps/mandates/payments/reconcile",
             post(money_reconcile),
         )
+        // The Marketplace panel (Sprint 38): strictly read-only — assets scoped by pay-mandates
+        // with live (cached, fan-out-bounded) quotes, and the buys as the ledger records them.
+        .route("/api/apps/mandates/marketplace", get(marketplace_view))
         .with_state(state)
 }
 
@@ -701,6 +1017,7 @@ mod tests {
             data_dir: dir.to_path_buf(),
             pay_rail: None,
             spent_fresh_money_tokens: Arc::default(),
+            marketplace_quote_cache: Arc::default(),
         }
     }
 
@@ -1322,6 +1639,7 @@ mod tests {
                 drm_confirmer: None,
             }),
             spent_fresh_money_tokens: Arc::default(),
+            marketplace_quote_cache: Arc::default(),
         };
         let app = mandate_router(state);
         // Sprint 33: money writes each need their OWN fresh passkey verification.
@@ -1419,6 +1737,7 @@ mod tests {
                 drm_confirmer: None,
             }),
             spent_fresh_money_tokens: Arc::default(),
+            marketplace_quote_cache: Arc::default(),
         };
         let app = mandate_router(state);
         let (token_hdr, fresh) = money_write_tokens(dir.path(), 2);
@@ -1494,6 +1813,7 @@ mod tests {
                 drm_confirmer: None,
             }),
             spent_fresh_money_tokens: Arc::default(),
+            marketplace_quote_cache: Arc::default(),
         };
         let app = mandate_router(state);
         let (standing, _) = money_write_tokens(dir.path(), 0);
@@ -1560,6 +1880,7 @@ mod tests {
                 drm_confirmer: None,
             }),
             spent_fresh_money_tokens: Arc::default(),
+            marketplace_quote_cache: Arc::default(),
         };
         let app = mandate_router(state);
         let (standing, fresh) = money_write_tokens(dir.path(), 1);
@@ -1700,6 +2021,7 @@ mod tests {
                 drm_confirmer: None,
             }),
             spent_fresh_money_tokens: Arc::default(),
+            marketplace_quote_cache: Arc::default(),
         };
         let app = mandate_router(state);
         let (standing, fresh) = money_write_tokens(dir.path(), 1);
@@ -1767,6 +2089,7 @@ mod tests {
                 drm_confirmer: None,
             }),
             spent_fresh_money_tokens: Arc::default(),
+            marketplace_quote_cache: Arc::default(),
         };
         let app = mandate_router(state);
         let (standing, fresh) = money_write_tokens(dir.path(), 1);
@@ -1825,5 +2148,317 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+    // ────────────────────────── Marketplace panel (Sprint 38) ──────────────────────────
+
+    /// The marketplace read is gated exactly like every other route: no launch token ⇒ 401.
+    #[tokio::test]
+    async fn marketplace_route_requires_home_launch_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = mandate_router(state_for(dir.path()));
+        let denied = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mandates/marketplace")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// No rail wired ⇒ 503, honestly unwired — same posture as the Money panel.
+    #[tokio::test]
+    async fn marketplace_without_a_rail_reads_unwired() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = mandate_router(state_for(dir.path()));
+        let token_hdr =
+            super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mandates/marketplace")
+                    .header(HOME_TOKEN_HEADER, token_hdr)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The panel is a pure PROJECTION: pay-mandates scope the asset list (non-pay mandates never
+    /// appear), and the buys table renders the ledger's records with the HONEST wording — a
+    /// broadcast-accepted buy reads "awaiting chain confirmation", never anything like
+    /// "purchased"; a confirmed one carries its tx; a refusal reads refused.
+    #[tokio::test]
+    async fn marketplace_projects_pay_mandates_and_ledger_buys_with_honest_wording() {
+        use crate::payment_ledger::{PaymentLedger, PaymentStatus};
+        use elastos_runtime::primitives::spend::SpendMeter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state_for(dir.path());
+        let meter = Arc::new(SpendMeter::new());
+        let ledger = Arc::new(PaymentLedger::new());
+        state.pay_rail = Some(crate::api::server::PayRail {
+            meter,
+            provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
+            ledger: ledger.clone(),
+            drm_confirmer: None,
+        });
+
+        // A pay-mandate for asset QmMovie…
+        let pay_token = state.capability_manager.grant(
+            "vm-shopper",
+            ResourceId::new("elastos://runtime/pay/QmMovie".to_string()),
+            Action::Execute,
+            TokenConstraints::default(),
+            None,
+        );
+        let mut pay_methods = std::collections::BTreeSet::new();
+        pay_methods.insert("runtime.pay".to_string());
+        let pay_grant = state
+            .standing_service
+            .issue_from_token(&pay_token, pay_methods, None, None, None)
+            .unwrap();
+        // …and a NON-pay mandate that must never surface as a marketplace asset.
+        let mail_token = state.capability_manager.grant(
+            "vm-agent",
+            ResourceId::new("elastos://mail/send".to_string()),
+            Action::Execute,
+            TokenConstraints::default(),
+            None,
+        );
+        let mut mail_methods = std::collections::BTreeSet::new();
+        mail_methods.insert("send".to_string());
+        state
+            .standing_service
+            .issue_from_token(&mail_token, mail_methods, None, None, None)
+            .unwrap();
+
+        // Ledger truth: a broadcast-pending DRM buy, a chain-confirmed one, and a refusal.
+        assert!(ledger.record_with_token(
+            "flint-pending", "vm-shopper", "QmMovie", 5, PaymentStatus::Pending,
+            "drm:tx=0xAB;op=0xop;tid=7", Some(&pay_grant),
+        ));
+        assert!(ledger.record_with_token(
+            "flint-confirmed", "vm-shopper", "QmMovie", 5, PaymentStatus::ResolvedCharged,
+            "drm:tx=0xCD;op=0xop;tid=7", Some(&pay_grant),
+        ));
+        assert!(ledger.record(
+            "flint-refused", "vm-shopper", "QmMovie", 999, PaymentStatus::NotCharged,
+            "refused by spend cap",
+        ));
+
+        // Pre-populate the quote cache so the projection is fully deterministic (no chain).
+        state.marketplace_quote_cache.lock().unwrap().insert(
+            "QmMovie".to_string(),
+            MarketQuoteSlot {
+                quoted_at: now_ts(),
+                quote: Some(MarketQuote {
+                    price: Some("5000000".to_string()),
+                    pay_token: Some("0xUSDC".to_string()),
+                    supply: Some(3),
+                    error: None,
+                }),
+            },
+        );
+
+        let app = mandate_router(state);
+        let token_hdr =
+            super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mandates/marketplace")
+                    .header(HOME_TOKEN_HEADER, token_hdr)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Assets: exactly the pay-mandate's asset, quote served CACHE-FIRST (no chain read).
+        let assets = json["assets"].as_array().unwrap();
+        assert_eq!(assets.len(), 1, "only pay-mandates scope marketplace assets");
+        assert_eq!(assets[0]["asset"], "QmMovie");
+        assert_eq!(assets[0]["mandates"][0], pay_grant);
+        assert_eq!(
+            assets[0]["quote"]["price"], "5000000",
+            "the quote is served from the TTL cache — a panel refresh is not a chain read"
+        );
+
+        // Buys: honest wording per state, tx extracted from the DRM rail note.
+        let buys = json["buys"].as_array().unwrap();
+        assert_eq!(buys.len(), 3);
+        let by_state = |st: &str| {
+            buys.iter()
+                .find(|b| b["state"] == st)
+                .unwrap_or_else(|| panic!("no {st} row"))
+        };
+        let pending = by_state("pending");
+        assert_eq!(pending["detail"], "broadcast — awaiting chain confirmation");
+        assert_eq!(pending["tx"], "0xAB");
+        assert!(
+            !pending["detail"].as_str().unwrap().contains("purchas"),
+            "a broadcast is NEVER worded as a purchase"
+        );
+        let confirmed = by_state("confirmed");
+        assert_eq!(confirmed["detail"], "confirmed on-chain");
+        assert_eq!(confirmed["tx"], "0xCD");
+        assert_eq!(confirmed["mandate"], pay_grant);
+        let refused = by_state("refused");
+        assert_eq!(refused["detail"], "refused — nothing charged");
+        assert_eq!(refused["amount"], 999);
+        assert!(refused.get("tx").is_none(), "no tx on a never-broadcast refusal");
+    }
+    /// Council S38 fold (guardian F1 + red-team F1): quote coverage ROTATES — cache hits are
+    /// free (they never consume a fresh-read slot), so with more assets than the per-view
+    /// fresh-read cap, the first view reads the cap's worth and the SECOND view (finding those
+    /// cached) reads the rest: no asset is permanently starved of a quote.
+    #[tokio::test]
+    async fn quote_coverage_rotates_instead_of_starving_the_tail() {
+        use crate::payment_ledger::PaymentLedger;
+        use elastos_runtime::primitives::spend::SpendMeter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state_for(dir.path());
+        state.pay_rail = Some(crate::api::server::PayRail {
+            meter: Arc::new(SpendMeter::new()),
+            provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
+            ledger: Arc::new(PaymentLedger::new()),
+            drm_confirmer: None,
+        });
+        // MARKET_MAX_QUOTED_ASSETS + 2 assets, each behind an active pay-mandate.
+        for i in 0..(MARKET_MAX_QUOTED_ASSETS + 2) {
+            let token = state.capability_manager.grant(
+                "vm-shopper",
+                ResourceId::new(format!("elastos://runtime/pay/Qm{i:02}")),
+                Action::Execute,
+                TokenConstraints::default(),
+                None,
+            );
+            let mut methods = std::collections::BTreeSet::new();
+            methods.insert("runtime.pay".to_string());
+            state
+                .standing_service
+                .issue_from_token(&token, methods, None, None, None)
+                .unwrap();
+        }
+
+        let app = mandate_router(state.clone());
+        let token_hdr =
+            super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        let view = |app: Router, hdr: String| async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/apps/mandates/marketplace")
+                        .header(HOME_TOKEN_HEADER, hdr)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+
+        // View 1: the cap's worth of assets get fresh reads (in CI the chain read fails fast, so
+        // they land as bounded error quotes — still QUOTED outcomes); exactly 2 are over-cap.
+        let first = view(app.clone(), token_hdr.clone()).await;
+        let over_cap = |j: &serde_json::Value| {
+            j["assets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|a| a["unquoted_over_cap"] == true)
+                .count()
+        };
+        assert_eq!(over_cap(&first), 2, "the tail waits, stated — never silently dropped");
+
+        // View 2: the first batch is CACHED (free), so the tail gets the fresh-read slots.
+        let second = view(app, token_hdr).await;
+        assert_eq!(
+            over_cap(&second),
+            0,
+            "cache hits are free — the rotation reaches every asset by the second view"
+        );
+        assert!(
+            second["assets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|a| a["quote"].is_object()),
+            "every asset ends up with a quote outcome (live terms or a bounded error)"
+        );
+    }
+
+    /// Council S38 fold (red-team F2): a live PENDING buy can never be pushed out of the buys
+    /// table by a flood of newer settled entries — pending is always shown; only the settled
+    /// tail is windowed, and the window is STATED via buys_total.
+    #[tokio::test]
+    async fn a_pending_buy_is_never_truncated_by_a_flood_of_settled_entries() {
+        use crate::payment_ledger::{PaymentLedger, PaymentStatus};
+        use elastos_runtime::primitives::spend::SpendMeter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state_for(dir.path());
+        let ledger = Arc::new(PaymentLedger::new());
+        state.pay_rail = Some(crate::api::server::PayRail {
+            meter: Arc::new(SpendMeter::new()),
+            provider: Arc::new(crate::intent_executor::MockPaymentProvider::default()),
+            ledger: ledger.clone(),
+            drm_confirmer: None,
+        });
+
+        // The OLDEST entry is a live pending obligation…
+        assert!(ledger.record_with_token(
+            "flint-obligation", "vm-shopper", "QmMovie", 5, PaymentStatus::Pending,
+            "drm:tx=0xAB;op=0xop;tid=7", None,
+        ));
+        // …then a flood of newer settled entries, more than the window.
+        for i in 0..(MARKET_BUYS_LIMIT + 10) {
+            assert!(ledger.record(
+                &format!("flint-noise-{i}"), "vm-flooder", "QmOther", 1,
+                PaymentStatus::NotCharged, "refused",
+            ));
+        }
+
+        let app = mandate_router(state);
+        let token_hdr =
+            super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mandates/marketplace")
+                    .header(HOME_TOKEN_HEADER, token_hdr)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let buys = json["buys"].as_array().unwrap();
+        assert!(
+            buys.iter().any(|b| b["state"] == "pending" && b["asset"] == "QmMovie"),
+            "the live obligation is ALWAYS visible, however many settled entries arrive"
+        );
+        assert_eq!(
+            json["buys_total"].as_u64().unwrap() as usize,
+            MARKET_BUYS_LIMIT + 11,
+            "the window is stated, never silent"
+        );
+        assert!(
+            buys.len() <= MARKET_BUYS_LIMIT + 1,
+            "the settled tail stays windowed (pending rides on top of the cap)"
+        );
     }
 }

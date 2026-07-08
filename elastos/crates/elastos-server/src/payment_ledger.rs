@@ -558,6 +558,32 @@ impl PaymentLedger {
         self.records.read().ok()?.get(idempotency_key).cloned()
     }
 
+    /// How many entries the ledger holds (read-only projection; 0 on a poisoned lock, matching
+    /// `pending()`'s convention).
+    pub fn len(&self) -> usize {
+        self.records.read().map(|r| r.len()).unwrap_or(0)
+    }
+
+    /// True when the ledger holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The most recent `limit` entries across ALL statuses, newest first (read-only projection —
+    /// the Marketplace panel's buys table, which pairs it with `pending()` so a live obligation
+    /// is never truncated away). Bounded by the caller; the ledger itself is bounded by
+    /// `LEDGER_CAP`.
+    pub fn recent(&self, limit: usize) -> Vec<PaymentRecord> {
+        let records = match self.records.read() {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let mut out: Vec<PaymentRecord> = records.values().cloned().collect();
+        out.sort_by_key(|r| std::cmp::Reverse(r.seq));
+        out.truncate(limit);
+        out
+    }
+
     /// Snapshot write, mirroring the spend meter's discipline (temp + fsync + rename + parent-dir
     /// fsync). Memory-only ⇒ no-op. The ledger does not poison: it is operational custody, and its
     /// callers already treat a failed write as "unrecorded, say so" / "refuse the resolution".

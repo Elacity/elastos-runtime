@@ -339,6 +339,36 @@
     <div class="stateempty" id="pendnote" hidden></div>
   </div>
 
+  <div class="sectlabel" id="marketlabel" hidden>
+    <h2>Marketplace</h2>
+    <span class="hint">what your pay-mandates let agents buy, and what actually happened — assets come from the mandates, prices are live on-chain reads (cached, bounded), and every buy row is the enforcing ledger's record. Read-only: operators grant, agents act.</span>
+  </div>
+  <div class="statewrap" id="marketwrap" hidden>
+    <div class="stateempty" id="marketmode" hidden style="color:var(--warn,#a06a00)"></div>
+    <table class="statetable">
+      <thead>
+        <tr><th>Asset</th><th>Live price</th><th>Pay token</th><th>Supply</th><th>Mandates</th></tr>
+      </thead>
+      <tbody id="marketassets"></tbody>
+    </table>
+    <div class="stateempty" id="marketassetsempty" hidden>No active pay-mandates scope any marketplace asset.</div>
+  </div>
+
+  <div class="sectlabel" id="buyslabel" hidden>
+    <h2>Buys</h2>
+    <span class="hint">runtime.pay attempts as the ledger records them — pending buys always shown; settled ones are the most recent window (the count says so). A broadcast is "awaiting chain confirmation", never a purchase; confirmed means the chain (or an explicit reconcile) said so</span>
+  </div>
+  <div class="statewrap" id="buyswrap" hidden>
+    <table class="statetable">
+      <thead>
+        <tr><th>Asset</th><th>Agent</th><th>Amount</th><th>State</th><th>Tx</th><th>Mandate</th></tr>
+      </thead>
+      <tbody id="buysbody"></tbody>
+    </table>
+    <div class="stateempty" id="buysempty" hidden>No buys recorded yet.</div>
+    <div class="stateempty" id="buyswindow" hidden></div>
+  </div>
+
   <footer>
     A mandate is a scoped, expiring, revocable grant to one agent key. Its receipt is a portable,
     set-bound bundle anyone can verify off-box — no runtime, no trust in this box.
@@ -728,6 +758,7 @@
       .catch(function(err){ showUnreachable("Could not load mandates from the runtime ("+esc(String(err&&err.message||err))+").");});
     loadAgentState();
     loadMoney();
+    loadMarketplace();
   }
 
   // Operator's view of durable agent state (Sprint 18) — in-shell only, read-only. Every cell is
@@ -774,6 +805,94 @@
   // the server — escaping at render is THIS surface's stated obligation, council S30 G-F8), and
   // capsule/payee, while server-validated slugs, get the same discipline. A 503 (pay unwired)
   // hides the panel — absence, never a mock.
+
+  // The Marketplace panel (Sprint 38) — STRICTLY read-only projection: assets from the
+  // pay-mandates, prices from the (cached, fan-out-bounded) on-chain quote, buys from the
+  // enforcing ledger. Same textContent-only render discipline as Money (asset ids, error
+  // strings, and rail notes are external bytes). 503 (pay unwired) hides the panel — absence,
+  // never a mock.
+  function loadMarketplace(){
+    if (!IN_SHELL) return;
+    fetch("/api/apps/mandates/marketplace", {headers:launchHeaders()})
+      .then(function(r){
+        if (r.status === 503){ throw {unwired:true}; }
+        if (!r.ok) throw new Error("http "+r.status);
+        return r.json();
+      })
+      .then(function(j){ renderMarketplace(j); })
+      .catch(function(err){
+        if (err && err.unwired){
+          $("#marketlabel").hidden = true; $("#marketwrap").hidden = true;
+          $("#buyslabel").hidden = true; $("#buyswrap").hidden = true;
+          return;
+        }
+        $("#marketlabel").hidden = false; $("#marketwrap").hidden = false;
+        $("#marketassets").innerHTML = ""; $("#marketassetsempty").hidden = false;
+        $("#marketassetsempty").textContent = "Marketplace unreachable ("
+          + String(err && err.message || err) + ").";
+      });
+  }
+  function renderMarketplace(j){
+    var assets = Array.isArray(j.assets) ? j.assets : [];
+    var buys = Array.isArray(j.buys) ? j.buys : [];
+    $("#marketlabel").hidden = false; $("#marketwrap").hidden = false;
+    // Honesty banner: outside the live Chain mode, quotes are FREE by construction — say so
+    // rather than render a fake price as if it were an on-chain read.
+    var live = (j.rights_mode === "chain");
+    $("#marketmode").hidden = live;
+    if (!live){
+      $("#marketmode").textContent = "Rights mode is \"" + String(j.rights_mode||"?")
+        + "\" — quotes are free/synthetic in this mode, not live on-chain prices.";
+    }
+    var ab = $("#marketassets"); ab.innerHTML = "";
+    $("#marketassetsempty").hidden = assets.length > 0;
+    assets.forEach(function(a){
+      var tr = document.createElement("tr");
+      cell(tr, String(a.asset||""), "kmono");
+      var q = a.quote || null;
+      if (a.unquoted_over_cap){
+        cell(tr, "not quoted (per-view cap)"); cell(tr, "—"); cell(tr, "—");
+      } else if (q && q.error){
+        var e = document.createElement("td"); e.colSpan = 3;
+        e.textContent = "quote unavailable: " + String(q.error);
+        tr.appendChild(e);
+      } else if (q){
+        cell(tr, String(q.price), "vmono");
+        cell(tr, String(q.pay_token||"—"), "kmono");
+        cell(tr, q.supply === null || q.supply === undefined ? "—" : String(q.supply));
+      } else {
+        cell(tr, "quote in progress…"); cell(tr, "—"); cell(tr, "—");
+      }
+      cell(tr, String((a.mandates||[]).length));
+      ab.appendChild(tr);
+    });
+    // The Buys section stays visible once the marketplace loads: an empty ledger reads as the
+    // stated empty state, never as a silently absent section.
+    $("#buyslabel").hidden = false;
+    $("#buyswrap").hidden = false;
+    var bb = $("#buysbody"); bb.innerHTML = "";
+    $("#buysempty").hidden = buys.length > 0;
+    // The window, stated: pending is never truncated; the settled tail is capped.
+    var total = typeof j.buys_total === "number" ? j.buys_total : buys.length;
+    $("#buyswindow").hidden = total <= buys.length;
+    if (total > buys.length){
+      $("#buyswindow").textContent = "Showing " + buys.length + " of " + total
+        + " ledger entries (every pending buy is shown; older settled ones are windowed out).";
+    }
+    buys.forEach(function(b){
+      var tr = document.createElement("tr");
+      cell(tr, String(b.asset||""), "kmono");
+      cell(tr, String(b.capsule||""), "kmono");
+      cell(tr, String(b.amount));
+      cell(tr, String(b.detail||b.state||""));
+      var td = document.createElement("td"); td.className = "kmono";
+      td.style.userSelect = "all"; td.textContent = b.tx ? String(b.tx) : "—";
+      tr.appendChild(td);
+      cell(tr, b.mandate ? String(b.mandate).slice(0,12)+"…" : "—", "kmono");
+      bb.appendChild(tr);
+    });
+  }
+
   function loadMoney(){
     if (!IN_SHELL) return;
     fetch("/api/apps/mandates/money", {headers:launchHeaders()})

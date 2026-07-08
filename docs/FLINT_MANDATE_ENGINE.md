@@ -19,7 +19,7 @@ all three name the same object.
 |---|---|---|
 | **Grant** | Mint a real signed capability token scoped to (capsule, resource, action, ttl) + an authorized method set + the **responsible entity** (the DID the OPERATOR DECLARES accountable for the agent's acts — the EU-AI-Act liability *attribution*, signed into the grant record and the receipt; required on the shell app). **Operator-asserted, not attested:** the runtime records the DID verbatim; it does not resolve it or obtain the entity's counter-signature, so a receipt proves the operator's declaration, not the entity's consent (entity counter-signing is a tracked gap). | CLI + Mandates shell app |
 | **Act** | An agent signs an `IntentDeclarationV1` and dispatches it; a fail-closed gate checks `intent ⊆ envelope` (capsule + agent-key + method + resource + action), runs a real executor, and reconciles declared-vs-done | `POST /api/agent/dispatch` (agent-facing, S26) or `/api/standing-grants/dispatch` (operator) |
-| **Watch** | The operator sees mandates live, and what each agent has written/delivered under them | Mandates shell app (mandate cards, Agent State panel, Inbox) |
+| **Watch** | The operator sees mandates live, what each agent has written/delivered under them, and — for pay-mandates — the marketplace assets they scope (live on-chain quotes) and the buys as the ledger records them (pending always shown; settled ones windowed, stated) | Mandates shell app (mandate cards, Agent State panel, Inbox, Money + Marketplace panels) |
 | **Revoke** | The kill switch — durably attested *before* the mandate dies | CLI + Mandates shell app |
 | **Prove** | Export a portable `MandateReceipt` — proving not just WHAT the agent did but WHICH entity the operator DECLARED accountable (the responsible entity rides the signed grant record; operator-asserted, see Grant) — and verify it off-box with no runtime and no trust in this box. **Verifier version floor (S32):** a pre-S32 `verify-receipt` binary drops the new grant field on re-serialize and will false-flag an S32 receipt as tampered — verify with an S32+ binary. | `elastos verify-receipt` |
 
@@ -102,6 +102,16 @@ classification, and the signed receipt are byte-identical.
 - The Money panel (budgets with cap/spent/remaining/held-unconfirmed, the poisoned banner, the
   reconciliation work list) is a read-only projection of the ONE enforcing meter+ledger
   (`build_pay_rail`, same-Arc by construction, flock-enforced).
+- The Marketplace panel (S38) is the same discipline pointed at the marketplace: the assets the
+  ACTIVE pay-mandates scope (with live on-chain quotes — TTL-cached and fan-out-bounded, so a
+  browser refresh storm is not a chain-read storm — one live read per asset per window, enforced
+  single-flight) and the buys as the ledger records them — every PENDING buy always (a flood of
+  new settled entries can never push a live obligation out of sight), the settled tail windowed
+  with the window stated — worded honestly (a broadcast is "awaiting chain confirmation", never a
+  purchase). STRICTLY read-only:
+  the panel has no buy verb — operators grant, agents act through the signed-intent dispatch.
+  One-command walkthrough: `elastos mandate market-demo <asset>` (cap → pay-mandate → the
+  agent's signed buy → watch it resolve in the panel).
 - Web provisioning is CEILING-BOUND server-side (`ELASTOS_WEB_MAX_SPEND_CAP`); verdict buttons are
   arm→confirm; a not-charged verdict is refused while the meter is poisoned (it would burn the
   one-shot refund handle).

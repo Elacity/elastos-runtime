@@ -76,6 +76,19 @@ pub(crate) enum MandateCommand {
 
     /// Run the whole loop once against the live runtime: grant → list → revoke → receipt → verify
     Demo,
+
+    /// The marketplace loop once, end to end (Sprint 38): provision a cap, grant a pay-mandate
+    /// for one asset, let a scripted agent dispatch the buy under it, then watch the buy resolve
+    /// in the Mandates app's Marketplace panel. Requires a wired payment rail.
+    MarketDemo {
+        /// The DRM asset reference (KID / content id) — the payee of the pay resource
+        /// elastos://runtime/pay/<asset>
+        asset: String,
+
+        /// Spend units the mandate may spend on this buy (also the cap provisioned)
+        #[arg(long, default_value_t = 10)]
+        amount: u64,
+    },
 }
 
 /// Attach to the RUNNING operator runtime and return (api_url, shell_token). The mandate
@@ -247,6 +260,7 @@ pub(crate) async fn run_mandate(cmd: MandateCommand) -> Result<()> {
         }
 
         MandateCommand::Demo => run_demo().await,
+        MandateCommand::MarketDemo { asset, amount } => run_market_demo(&asset, amount).await,
     }
 }
 
@@ -301,6 +315,168 @@ fn print_mandate_list(list: &serde_json::Value) {
 /// chain, and the receipt is verified in-process with the signer pinned over the AUTHENTICATED
 /// loopback control plane (the operator's trust in their own runtime — not the receipt vouching
 /// for itself).
+/// The marketplace loop, end to end, against the live runtime (Sprint 38): cap → pay-mandate →
+/// the agent's signed buy intent → the ledger records the honest outcome. Everything here is the
+/// EXISTING machinery (`/api/spend-budgets`, the shared mint path, the standing-grant dispatch);
+/// this process merely plays the agent (it generates the key in-memory, as `demo` does). The
+/// mandate is revoked at the end — the demo leaves no live authority behind; the buy's ledger
+/// record REMAINS (that is the point: watch it in the Mandates app's Marketplace panel).
+async fn run_market_demo(asset: &str, amount: u64) -> Result<()> {
+    let asset = asset.trim();
+    if asset.is_empty() {
+        bail!("the asset reference (KID / content id) must be non-empty");
+    }
+    let (api_url, shell_token) = attach_shell().await?;
+    let http = client()?;
+    let capsule = "vm-market-demo-agent";
+    let resource = format!("elastos://runtime/pay/{asset}");
+
+    println!("── 1. CAP — provision {amount} spend units for {capsule} ──");
+    let resp = http
+        .post(format!("{api_url}/api/spend-budgets"))
+        .header("Authorization", format!("Bearer {shell_token}"))
+        .json(&serde_json::json!({ "capsule": capsule, "limit": amount }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let err = error_for(resp, "cap provisioning").await;
+        eprintln!(
+            "(a wired payment rail + durable stores are required — see \
+             docs/DRM_MARKETPLACE_RAIL.md for the env)"
+        );
+        return Err(err);
+    }
+    println!("cap set: {capsule} may spend up to {amount} units\n");
+
+    println!("── 2. GRANT — a pay-mandate scoped to exactly this asset, bound to one agent key ──");
+    let agent = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+    let agent_pub_hex = hex::encode(agent.verifying_key().to_bytes());
+    let resp = http
+        .post(format!("{api_url}/api/standing-grants/issue"))
+        .header("Authorization", format!("Bearer {shell_token}"))
+        .json(&serde_json::json!({
+            "capsule": capsule,
+            "resource": resource,
+            "action": "execute",
+            "methods": ["runtime.pay"],
+            "ttl_secs": 3600,
+            "agent_pubkey": agent_pub_hex,
+        }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(error_for(resp, "market-demo grant").await);
+    }
+    let token_id = resp
+        .json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|out| {
+            out.get("token_id")
+                .or_else(|| out.get("grant_id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+    // The grant SUCCEEDED (2xx) — a live PAY authority may exist from here. If its token id is
+    // unreadable we cannot target a cleanup revoke: warn LOUDLY (mirror `demo`) rather than
+    // return as though nothing was granted.
+    let token_id = match token_id {
+        Some(t) => t,
+        None => {
+            eprintln!(
+                "WARNING: the pay-mandate was granted but its token id could not be read — a \
+                 live 1h PAY-mandate for {capsule} may exist. Check `elastos mandate list` and \
+                 revoke it."
+            );
+            bail!("grant response did not carry a token id");
+        }
+    };
+    println!("granted pay-mandate {token_id}: agent {} may runtime.pay {resource}, 1h TTL\n", &agent_pub_hex[..16]);
+
+    // From here a live pay authority exists — revoke it on ANY exit.
+    let result = market_demo_buy(&http, &api_url, &shell_token, &agent, &token_id, asset, amount).await;
+    println!("── 4. REVOKE — the demo leaves no live authority behind ──");
+    let cleanup = http
+        .post(format!("{api_url}/api/standing-grants/revoke"))
+        .header("Authorization", format!("Bearer {shell_token}"))
+        .json(&serde_json::json!({ "grant_id": token_id }))
+        .send()
+        .await;
+    match cleanup {
+        Ok(r) if r.status().is_success() => println!("revoked {token_id}"),
+        _ => eprintln!(
+            "CLEANUP REVOKE FAILED — a live 1h pay-mandate remains: run \
+             `elastos mandate revoke {token_id}`"
+        ),
+    }
+    // Clear the demo cap too — a cap alone authorizes nothing (spending needs a live mandate +
+    // a signed intent), but the demo should not leave standing money-state behind either.
+    let cap_cleanup = http
+        .delete(format!("{api_url}/api/spend-budgets/{capsule}"))
+        .header("Authorization", format!("Bearer {shell_token}"))
+        .send()
+        .await;
+    match cap_cleanup {
+        Ok(r) if r.status().is_success() => println!("cleared the {capsule} spend cap\n"),
+        _ => println!(
+            "(the {amount}-unit spend cap for {capsule} remains provisioned — a cap alone \
+             authorizes nothing; clear it from the Money panel or the API)\n"
+        ),
+    }
+    result?;
+    println!(
+        "Open the Mandates app → Marketplace panel to watch the buy: a broadcast reads \
+         \"awaiting chain confirmation\" until the confirmation scheduler (or a manual \
+         reconcile) records the chain's verdict; a refusal reads refused with the reservation \
+         refunded. The row IS the enforcing ledger's record."
+    );
+    Ok(())
+}
+
+/// The agent's leg of the market demo: sign the buy intent for (asset, amount) and dispatch it.
+async fn market_demo_buy(
+    http: &reqwest::Client,
+    api_url: &str,
+    shell_token: &str,
+    agent: &ed25519_dalek::SigningKey,
+    token_id: &str,
+    asset: &str,
+    amount: u64,
+) -> Result<()> {
+    println!("── 3. BUY — the agent signs the pay intent and dispatches it ──");
+    let intent = IntentDeclarationV1::issue(
+        agent,
+        agent.verifying_key().to_bytes(),
+        &format!("market-demo-buy-{token_id}"),
+        "vm-market-demo-agent",
+        "runtime.pay",
+        &amount.to_string(), // the amount rides in the signed input_hash (canonical decimal)
+        &format!("elastos://runtime/pay/{asset}"),
+        "execute",
+        token_id,
+    );
+    let resp = http
+        .post(format!("{api_url}/api/standing-grants/dispatch"))
+        .header("Authorization", format!("Bearer {shell_token}"))
+        .json(&intent)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(error_for(resp, "market-demo dispatch").await);
+    }
+    let out: serde_json::Value = resp.json().await?;
+    let outcome = out.get("outcome").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let reason = out.get("reason").and_then(|v| v.as_str()).unwrap_or("-");
+    println!("dispatched runtime.pay {amount} → {asset}: outcome={outcome} ({reason})");
+    println!(
+        "(honest wording: a DRM buy is `authorized_not_performed` even on a SUCCESSFUL broadcast \
+         — performed is reserved for chain-confirmed truth)\n"
+    );
+    Ok(())
+}
+
+/// The whole Flint loop once against the live runtime: grant → list → the agent's real act →
+/// revoke → the same act denied → receipt exported and verified.
 async fn run_demo() -> Result<()> {
     let (api_url, shell_token) = attach_shell().await?;
     let http = client()?;

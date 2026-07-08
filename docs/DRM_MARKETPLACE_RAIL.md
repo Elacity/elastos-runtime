@@ -149,6 +149,21 @@ money-moving code; one spine), with these properties:
   that one tick forever (the scheduler keeps skipping, loudly); the subprocess deadline is a
   tracked follow-on.
 
+## Watching it (the Marketplace panel + the demo)
+
+The Mandates shell app's **Marketplace panel** (Sprint 38) shows this rail's state read-only: the
+assets your active pay-mandates scope (live price/pay-token/supply via the read-only quote path —
+TTL-cached per asset, single-flight, fan-out-bounded per view), and the buys as the ledger records
+them — every PENDING buy always shown, the settled tail windowed with the window stated — in the
+state vocabulary of the table above. Outside the live Chain rights mode the panel says quotes are
+free/synthetic rather than displaying them as on-chain prices. The panel has NO buy verb — buys
+happen only through an agent's signed intent.
+
+One-command demo against a running runtime with a wired rail:
+`elastos mandate market-demo <asset> [--amount N]` — provisions a cap, grants a single-asset
+pay-mandate bound to an ephemeral agent key, dispatches the agent's signed buy, revokes the
+mandate, and leaves the buy's ledger record for the panel to show.
+
 ## The test seam (why CI needs no chain)
 
 The provider depends on two small traits — `DrmResolver` (resolve, fail-closed) and `DrmSettler`
