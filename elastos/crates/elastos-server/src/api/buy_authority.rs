@@ -53,11 +53,55 @@ pub struct BuyOutcome {
     pub unsigned_tx: Value,
 }
 
-/// Pre-broadcast refusal sentinels — the EXACT strings the buy path produces when it PROVABLY
-/// never sent a transaction. `drm_marketplace::is_pre_broadcast_refusal` classifies refund-vs-hold
-/// by matching them, so they are MONEY-CLASSIFICATION-BEARING: rewording a producer without the
-/// classifier (or vice versa) would silently degrade a provable refund into an indeterminate hold.
-/// Producers and classifier both reference these consts; never inline a copy.
+/// The outcome-class of a `buy_access` failure, decided BY CONSTRUCTION — which code path produced
+/// it — NOT by sniffing the error string (Sprint 43, retiring `is_pre_broadcast_refusal`). This is
+/// what makes the DRM rail's refund-vs-hold decision immune to a HOSTILE provider's error text: a
+/// broadcast-op failure can ONLY be built as [`Indeterminate`](BuyError::Indeterminate) at its
+/// single call site (`broadcast_signed_*`/`broadcast_mock`), so no message content — not even a
+/// string that embeds a pre-broadcast sentinel — can turn a sent tx into a refund. The one
+/// unbreakable invariant (never refund a tx that may have landed) is now a TYPE property, not a
+/// substring match.
+#[derive(Debug)]
+pub enum BuyError {
+    /// The failure occurred strictly BEFORE any broadcast op ran — wallet-not-linked,
+    /// resolve/source/sold-out/drift, the wallet SIGN leg, the chain PREPARE (read) leg, or a
+    /// missing external signature. The tx was never sent, so the DRM rail may refund (NotCharged).
+    /// "Never sent" is provable modulo the TRUSTED-CORE assumption that the operator-pinned
+    /// `chain-provider`/`wallet-provider` binaries do not self-broadcast (the runtime owns the only
+    /// `broadcast_signed_*` call, and a release build never even reaches the managed-sign leg —
+    /// `wallet_signing()` is `false`); an env allowlist for spawned capsules is the P16 hardening
+    /// that would make it provable without the trust assumption (tracked, KNOWN_GAPS).
+    PreBroadcast(String),
+    /// The failure occurred AT or AFTER the broadcast op (`eth_sendRawTransaction`), or anywhere
+    /// its send status cannot be proven un-sent. The tx MAY have landed, so the DRM rail KEEPS the
+    /// reservation (Indeterminate) — never a refund.
+    Indeterminate(String),
+}
+
+impl BuyError {
+    /// The human-readable message, variant-independent — for HTTP/audit surfaces that only need
+    /// the text (the money classification is the variant, read separately).
+    pub fn message(&self) -> &str {
+        match self {
+            BuyError::PreBroadcast(m) | BuyError::Indeterminate(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for BuyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for BuyError {}
+
+/// Fail-closed refusal message text the buy path produces when it PROVABLY never sent a
+/// transaction. Since Sprint 43 these are NO LONGER money-classification-bearing (the DRM rail
+/// classifies by the [`BuyError`] VARIANT, not by matching these strings) — they are the
+/// user-facing message carried inside a [`BuyError::PreBroadcast`], and a couple are still matched
+/// by HTTP surfaces (`viewer_open`) to pick a status code. Kept as shared consts so producers and
+/// those surface checks cannot drift.
 pub(crate) const ERR_WALLET_NOT_LINKED: &str =
     "wallet not linked: a buy needs the principal's EVM address";
 /// Suffix shared by every fail-closed abort before broadcast (sold-out, no-active-listing,
@@ -137,7 +181,7 @@ pub fn buy_access(
     subject: &str,
     now_unix: u64,
     target: &BuyTarget,
-) -> Result<BuyOutcome, String> {
+) -> Result<BuyOutcome, BuyError> {
     let mode = super::rights_authority::rights_mode();
 
     // Chain modes are keyed on a real wallet — fail closed without one (same rule the
@@ -148,14 +192,16 @@ pub fn buy_access(
         && subject.trim().is_empty()
         && !wallet_signing()
     {
-        return Err(ERR_WALLET_NOT_LINKED.to_string());
+        return Err(BuyError::PreBroadcast(ERR_WALLET_NOT_LINKED.to_string()));
     }
 
     let unsigned_tx = assemble_buy_tx(content_id, subject, None);
 
     match mode {
         RightsMode::Dev => {
-            super::owned_ledger::record(content_id, &dev_subject(principal_id, subject))?;
+            // Dev never broadcasts (synthetic hash, local ledger) — any failure is pre-broadcast.
+            super::owned_ledger::record(content_id, &dev_subject(principal_id, subject))
+                .map_err(BuyError::PreBroadcast)?;
             Ok(BuyOutcome {
                 tx_hash: synthetic_hash(content_id, subject, now_unix),
                 owned_now: true,
@@ -172,6 +218,8 @@ pub fn buy_access(
                 // authoritative buyer, so ownership is recorded under its address.
                 let chain_id = chain_id_default();
                 let mut intent_seen = Value::Null;
+                // The SIGN leg runs strictly BEFORE broadcast — a failure here (incl. a wallet
+                // deadline) proves the tx was never sent ⇒ pre-broadcast refund.
                 let sig = super::wallet_signer::sign_with_managed_account(
                     principal_id,
                     chain_id,
@@ -180,10 +228,16 @@ pub fn buy_access(
                         intent_seen = intent.clone();
                         Ok(intent)
                     },
-                )?;
+                )
+                .map_err(BuyError::PreBroadcast)?;
+                // Broadcast op and everything after it is post-broadcast — the tx MAY be out, so a
+                // failure is Indeterminate regardless of the provider's message (the hostile-text
+                // immunity is this call site's typing, not a string match).
                 let tx_hash =
-                    super::chain_tx::broadcast_signed_mock(&intent_seen, &sig.signed_transaction)?;
-                super::owned_ledger::record(content_id, &sig.signer)?;
+                    super::chain_tx::broadcast_signed_mock(&intent_seen, &sig.signed_transaction)
+                        .map_err(BuyError::Indeterminate)?;
+                super::owned_ledger::record(content_id, &sig.signer)
+                    .map_err(BuyError::Indeterminate)?;
                 return Ok(BuyOutcome {
                     tx_hash,
                     owned_now: true,
@@ -192,11 +246,12 @@ pub fn buy_access(
                 });
             }
             // Run the REAL chain-provider broadcast op against an in-process RPC mock that
-            // returns a canned tx hash, so the production broadcast path is exercised.
-            let tx_hash = broadcast_mock(&unsigned_tx)?;
+            // returns a canned tx hash, so the production broadcast path is exercised. The op and
+            // everything after are post-broadcast ⇒ Indeterminate on failure.
+            let tx_hash = broadcast_mock(&unsigned_tx).map_err(BuyError::Indeterminate)?;
             // The mock chain has no token state, so record the purchase in the ledger the
             // chain-mock rights read (`ELASTOS_DDRM_CHAIN_ACCESS=ledger`) consults.
-            super::owned_ledger::record(content_id, subject)?;
+            super::owned_ledger::record(content_id, subject).map_err(BuyError::Indeterminate)?;
             Ok(BuyOutcome {
                 tx_hash,
                 owned_now: true,
@@ -210,14 +265,16 @@ pub fn buy_access(
             // seller/price/payToken LIVE from sellersOf/listings (id=1). No ELASTOS_DDRM_BUY_* pins
             // required; env still overrides for dev. Fails closed on a missing channel, an unresolved
             // tokenId, or no active listing. The CEK path is untouched (P15).
-            let sourced = source_buy_terms(content_id, target)?;
+            // All of source/sold-out/drift are READ-ONLY, strictly before any broadcast ⇒
+            // pre-broadcast refusals.
+            let sourced = source_buy_terms(content_id, target).map_err(BuyError::PreBroadcast)?;
             if sourced.supply == 0 {
-                return Err(ERR_SOLD_OUT.to_string());
+                return Err(BuyError::PreBroadcast(ERR_SOLD_OUT.to_string()));
             }
             // Abort-on-drift (P11): if the buyer agreed to a price/pay-token in the UI, the live re-read
             // MUST match — else fail closed (the listing changed under them).
             if let Some(expected) = sourced.expected.as_ref() {
-                ensure_no_drift(expected, &sourced.live)?;
+                ensure_no_drift(expected, &sourced.live).map_err(BuyError::PreBroadcast)?;
             }
             let unsigned = assemble_buy_tx_core(content_id, subject, &sourced.terms);
             if wallet_signing() {
@@ -226,6 +283,12 @@ pub fn buy_access(
                 // the signed bytes through the REAL chain-provider — the seam that makes `chain` live.
                 let chain_id = chain_id_default();
                 let mut intent_seen = Value::Null;
+                // SIGN leg (incl. the chain PREPARE read inside the closure) runs strictly BEFORE
+                // broadcast ⇒ a failure here is pre-broadcast (the tx was never sent). NOTE this is
+                // STRICTLY MORE PRECISE than the old string classifier: a chain deadline on the
+                // PREPARE (read) leg is now correctly a refund, while the same marker on the SEND
+                // leg below stays Indeterminate — a distinction the string could not make, because
+                // classification is now the CALL SITE, not the message.
                 let sig = super::wallet_signer::sign_with_managed_account(
                     principal_id,
                     chain_id,
@@ -234,8 +297,10 @@ pub fn buy_access(
                         intent_seen = intent.clone();
                         Ok(intent)
                     },
-                )?;
-                let tx_hash = super::chain_tx::broadcast_signed_live(&sig.signed_transaction)?;
+                )
+                .map_err(BuyError::PreBroadcast)?;
+                let tx_hash = super::chain_tx::broadcast_signed_live(&sig.signed_transaction)
+                    .map_err(BuyError::Indeterminate)?;
                 // Ownership is read back from `hasAccessByContentId` once the tx confirms,
                 // not from the local ledger; owned_now reflects "broadcast accepted".
                 return Ok(BuyOutcome {
@@ -248,14 +313,16 @@ pub fn buy_access(
             // Real chain, no runtime signing: broadcast an externally-signed tx if provided, else hand
             // back the live-assembled unsigned tx for the user's external wallet (the release path).
             let Some(signed) = env_nonempty("ELASTOS_DDRM_BUY_SIGNED_TX") else {
-                return Err(format!(
+                // No signature yet ⇒ nothing was broadcast (a precondition, pre-broadcast refund).
+                return Err(BuyError::PreBroadcast(format!(
                     "live buy needs a signature: either opt into runtime signing with \
                      ELASTOS_DDRM_BUY_SIGN=wallet (the wallet capsule signs with a managed \
                      key), or sign this assembled tx externally and resubmit via \
                      ELASTOS_DDRM_BUY_SIGNED_TX. unsigned_tx={unsigned}"
-                ));
+                )));
             };
-            let tx_hash = super::chain_tx::broadcast_signed_live(&signed)?;
+            let tx_hash =
+                super::chain_tx::broadcast_signed_live(&signed).map_err(BuyError::Indeterminate)?;
             // On real chain, ownership is read back from `hasAccessByContentId` once the
             // tx confirms — NOT from the local ledger. owned_now reflects "broadcast
             // accepted", not "confirmed"; the open re-reads the chain.
@@ -905,13 +972,14 @@ mod tests {
 
     const SUBJECT: &str = "0x00000000000000000000000000000000000000bb";
 
-    /// The sentinel consts are money-classification-bearing (see their doc): the DRM rail refunds
-    /// only on these exact strings. Pin the internal relationship a refactor could quietly break.
+    /// Since Sprint 43 the refusal consts are message text, NOT classifier anchors (the DRM rail
+    /// classifies by the `BuyError` variant, not by matching these). This just pins the internal
+    /// message-shape relationship so the two sold-out phrasings stay consistent for users.
     #[test]
-    fn pre_broadcast_sentinels_keep_their_classifier_anchors() {
+    fn the_sold_out_refusal_keeps_the_shared_abort_suffix() {
         assert!(
             ERR_SOLD_OUT.ends_with(ERR_BUY_ABORTED_SUFFIX),
-            "the sold-out refusal must keep the abort suffix the DRM classifier matches on"
+            "the sold-out refusal shares the fail-closed abort suffix"
         );
     }
 
@@ -994,7 +1062,16 @@ mod tests {
         );
         std::env::remove_var("ELASTOS_DDRM_RIGHTS");
         let err = result.expect_err("chain buy with no wallet must error");
-        assert!(err.contains("wallet not linked"), "unexpected error: {err}");
+        // Sprint 43: wallet-not-linked is refused strictly before any broadcast, so buy_access
+        // CONSTRUCTS a PreBroadcast (refundable) error — the DRM rail refunds it by variant.
+        assert!(
+            matches!(err, BuyError::PreBroadcast(_)),
+            "wallet-not-linked is a pre-broadcast refusal: {err:?}"
+        );
+        assert!(
+            err.message().contains("wallet not linked"),
+            "unexpected error: {err}"
+        );
     }
 
     fn clear_buy_env() {
@@ -1064,8 +1141,13 @@ mod tests {
             &BuyTarget::default(),
         )
         .expect_err("live buy without a resolved tokenId must fail closed");
+        // A sourcing failure is strictly pre-broadcast ⇒ a refundable PreBroadcast.
         assert!(
-            err.contains("resolved on-chain tokenId"),
+            matches!(err, BuyError::PreBroadcast(_)),
+            "a live sourcing failure is pre-broadcast: {err:?}"
+        );
+        assert!(
+            err.message().contains("resolved on-chain tokenId"),
             "unexpected error: {err}"
         );
         std::env::remove_var("ELASTOS_DDRM_RIGHTS");
@@ -1324,5 +1406,196 @@ mod tests {
         std::env::remove_var("ELASTOS_DDRM_RIGHTS");
         std::env::remove_var("ELASTOS_DDRM_WALLET_BASE");
         std::env::remove_var("ELASTOS_DDRM_OWNED_LEDGER");
+    }
+
+    /// Sprint 43 (the hostile-provider ratchet, END-TO-END): a chain-provider that FAILS the
+    /// broadcast op with a message embedding a pre-broadcast sentinel is typed `Indeterminate` by
+    /// CONSTRUCTION — the tx may have landed, so it keeps its reservation regardless of the
+    /// provider's bytes. This is the property the old string classifier had to defend with a
+    /// substring exclusion; now it is the type of the broadcast call site.
+    #[test]
+    #[cfg(all(unix, feature = "dev-modes"))]
+    fn a_broadcast_op_error_types_the_buy_as_indeterminate_even_with_a_sentinel() {
+        let _g = crate::api::ddrm_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // A hostile chain-provider: answers init OK, then FAILS the broadcast op with a message
+        // that embeds a pre-broadcast sentinel to try to provoke a refund.
+        let stub = dir.path().join("hostile-chain.sh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nread _init\nprintf '{\"status\":\"ok\"}\\n'\nread _op\n\
+             printf '{\"status\":\"error\",\"message\":\"broadcast rejected: buy aborted (fail \
+             closed)\"}\\n'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        std::env::set_var("ELASTOS_DDRM_RIGHTS", "chain-mock");
+        std::env::set_var("ELASTOS_CHAIN_PROVIDER_BIN", &stub);
+        std::env::set_var("ELASTOS_DDRM_OWNED_LEDGER", dir.path().join("owned.json"));
+        // No wallet signing → the plain chain-mock broadcast path (broadcast_mock).
+        std::env::remove_var("ELASTOS_DDRM_BUY_SIGN");
+
+        let err = buy_access(
+            "did:test:alice",
+            "bafyX",
+            SUBJECT,
+            1_700_000_000,
+            &BuyTarget::default(),
+        )
+        .expect_err("a failing broadcast op must error");
+
+        std::env::remove_var("ELASTOS_DDRM_RIGHTS");
+        std::env::remove_var("ELASTOS_CHAIN_PROVIDER_BIN");
+        std::env::remove_var("ELASTOS_DDRM_OWNED_LEDGER");
+
+        assert!(
+            matches!(err, BuyError::Indeterminate(_)),
+            "a broadcast-op failure is post-broadcast ⇒ Indeterminate/hold, NOT a refund: {err:?}"
+        );
+        assert!(
+            err.message().contains(ERR_BUY_ABORTED_SUFFIX),
+            "the sentinel IS present in the message but did NOT flip the classification: {err}"
+        );
+    }
+
+    /// Sprint 43 (replaces the wallet-sign marker classification test): the wallet SIGN leg runs
+    /// strictly before broadcast, so a hung signer is typed `PreBroadcast` by CONSTRUCTION — the tx
+    /// was never signed, so the DRM rail refunds. Proven end-to-end through `buy_access`.
+    #[test]
+    #[cfg(all(unix, feature = "dev-modes"))]
+    fn a_wallet_sign_timeout_types_the_buy_as_pre_broadcast() {
+        let _g = crate::api::ddrm_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("hung-wallet.sh");
+        std::fs::write(&stub, "#!/bin/sh\nsleep 300\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prior_deadline = std::env::var("ELASTOS_CHAIN_READ_DEADLINE_SECS").ok();
+        std::env::set_var("ELASTOS_DDRM_RIGHTS", "chain-mock");
+        std::env::set_var("ELASTOS_DDRM_BUY_SIGN", "wallet");
+        std::env::set_var("ELASTOS_WALLET_PROVIDER_BIN", &stub);
+        std::env::set_var("ELASTOS_DDRM_WALLET_BASE", dir.path().join("wallet"));
+        std::env::set_var("ELASTOS_CHAIN_READ_DEADLINE_SECS", "1");
+
+        let started = std::time::Instant::now();
+        let err = buy_access(
+            "did:test:alice",
+            "bafyX",
+            "",
+            1_700_000_000,
+            &BuyTarget::default(),
+        )
+        .expect_err("a hung wallet signer must error");
+
+        std::env::remove_var("ELASTOS_DDRM_RIGHTS");
+        std::env::remove_var("ELASTOS_DDRM_BUY_SIGN");
+        std::env::remove_var("ELASTOS_WALLET_PROVIDER_BIN");
+        std::env::remove_var("ELASTOS_DDRM_WALLET_BASE");
+        match prior_deadline {
+            Some(v) => std::env::set_var("ELASTOS_CHAIN_READ_DEADLINE_SECS", v),
+            None => std::env::remove_var("ELASTOS_CHAIN_READ_DEADLINE_SECS"),
+        }
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "the sign leg is bounded by the deadline, not the stub's 300s sleep"
+        );
+        assert!(
+            matches!(err, BuyError::PreBroadcast(_)),
+            "a sign-leg timeout is pre-broadcast ⇒ refund: {err:?}"
+        );
+        assert!(
+            err.message()
+                .contains(crate::api::wallet_signer::WALLET_SIGN_DEADLINE_MARKER),
+            "the pre-broadcast error carries the sign-deadline marker: {err}"
+        );
+    }
+
+    /// Sprint 43 council F3a: a Dev-mode buy NEVER broadcasts (synthetic hash, local ledger), so a
+    /// record failure is pre-broadcast ⇒ refundable. This is a behavior CHANGE the typing makes
+    /// correct — the old string classifier had no sentinel for it and stranded it as Indeterminate.
+    #[test]
+    #[cfg(feature = "dev-modes")]
+    fn a_dev_record_failure_types_the_buy_as_pre_broadcast() {
+        let _g = crate::api::ddrm_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // Make the ledger's parent a FILE so `owned_ledger::record`'s write fails (ENOTDIR).
+        std::fs::write(dir.path().join("blocker"), b"x").unwrap();
+        let prior = std::env::var("ELASTOS_DDRM_RIGHTS").ok();
+        std::env::remove_var("ELASTOS_DDRM_RIGHTS"); // dev
+        std::env::set_var(
+            "ELASTOS_DDRM_OWNED_LEDGER",
+            dir.path().join("blocker").join("owned.json"),
+        );
+
+        let err = buy_access(
+            "did:test:a",
+            "bafyDEV",
+            SUBJECT,
+            1_700_000_000,
+            &BuyTarget::default(),
+        )
+        .expect_err("an unwritable dev ledger must error");
+
+        std::env::remove_var("ELASTOS_DDRM_OWNED_LEDGER");
+        match prior {
+            Some(v) => std::env::set_var("ELASTOS_DDRM_RIGHTS", v),
+            None => std::env::remove_var("ELASTOS_DDRM_RIGHTS"),
+        }
+        assert!(
+            matches!(err, BuyError::PreBroadcast(_)),
+            "dev never broadcasts ⇒ a record failure is a pre-broadcast refund: {err:?}"
+        );
+    }
+
+    /// Sprint 43 council F3b: a record failure AFTER a SUCCESSFUL broadcast is `Indeterminate` — the
+    /// tx is out, so the reservation is kept, never refunded. Proves the post-broadcast `record`
+    /// call site's typing end-to-end (chain-mock broadcast succeeds; the ledger write then fails).
+    #[test]
+    #[cfg(all(unix, feature = "dev-modes"))]
+    fn a_post_broadcast_record_failure_types_the_buy_as_indeterminate() {
+        let _g = crate::api::ddrm_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // A chain-provider that SUCCEEDS the broadcast op with a valid tx hash.
+        let stub = dir.path().join("ok-broadcast.sh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nread _i\nprintf '{\"status\":\"ok\"}\\n'\nread _o\nprintf \
+             '{\"status\":\"ok\",\"data\":{\"transaction_hash\":\"0x00000000000000000000000000000\
+             00000000000000000000000000000000001\"}}\\n'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // ...but the ledger write (which runs AFTER the broadcast) fails.
+        std::fs::write(dir.path().join("blocker"), b"x").unwrap();
+
+        std::env::set_var("ELASTOS_DDRM_RIGHTS", "chain-mock");
+        std::env::set_var("ELASTOS_CHAIN_PROVIDER_BIN", &stub);
+        std::env::set_var(
+            "ELASTOS_DDRM_OWNED_LEDGER",
+            dir.path().join("blocker").join("owned.json"),
+        );
+        std::env::remove_var("ELASTOS_DDRM_BUY_SIGN");
+
+        let err = buy_access(
+            "did:test:a",
+            "bafyX",
+            SUBJECT,
+            1_700_000_000,
+            &BuyTarget::default(),
+        )
+        .expect_err("a post-broadcast record failure must error");
+
+        std::env::remove_var("ELASTOS_DDRM_RIGHTS");
+        std::env::remove_var("ELASTOS_CHAIN_PROVIDER_BIN");
+        std::env::remove_var("ELASTOS_DDRM_OWNED_LEDGER");
+        assert!(
+            matches!(err, BuyError::Indeterminate(_)),
+            "a record failure after a successful broadcast is Indeterminate (tx may be out): {err:?}"
+        );
     }
 }

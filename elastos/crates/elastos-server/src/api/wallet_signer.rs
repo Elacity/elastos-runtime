@@ -175,22 +175,22 @@ struct WalletSession {
     stdin: ChildStdin,
     reader: BufReader<std::process::ChildStdout>,
     /// Set once the deadline watchdog has fired on this session (council S41 guardian F5). A fire
-    /// leaves the child dead; even in the rare fired-but-read-Ok race the child is gone, so every
-    /// subsequent `exchange` must FAIL with the pre-broadcast marker rather than silently degrade
-    /// to an unmarked EPIPE (which `settle` would read as Indeterminate ⇒ a stranded reservation
-    /// for a tx that never signed). Once poisoned, the session mints the refund-classified marker.
+    /// leaves the child dead; poisoning makes every subsequent `exchange` FAIL fast rather than
+    /// spin on a dead child. Since Sprint 43 this is DIAGNOSTIC/UX, not money-load-bearing: the
+    /// whole wallet session runs strictly before broadcast, so `buy_access` types ANY sign-leg
+    /// error `BuyError::PreBroadcast` (⇒ refund) at its call site regardless of whether this
+    /// specific marker is present — an unmarked EPIPE from a dead signer refunds just the same.
     poisoned: bool,
 }
 
-/// The marker a wallet-provider deadline carries (Sprint 41). MONEY NOTE (the money-critical line
-/// of the sprint): the ENTIRE wallet session (init → create_account → request → approve → sign)
-/// runs strictly BEFORE `broadcast_signed_live`, so a deadline on ANY leg — the marker names the
-/// session's purpose (obtaining a signature), not one specific op — means the tx was never signed,
-/// so it never broadcast, so it is provably NOT charged. The DRM classifier
-/// (`drm_marketplace::is_pre_broadcast_refusal`) recognizes this marker as a PRE-broadcast
-/// refusal ⇒ NotCharged/refund, the exact mirror of the chain SEND-leg rule
-/// (`CHAIN_DEADLINE_MARKER` ⇒ Indeterminate/hold). Classifying a sign timeout as Indeterminate
-/// would strand a reservation for a tx that never existed.
+/// The marker a wallet-provider deadline carries (Sprint 41). The ENTIRE wallet session
+/// (init → create_account → request → approve → sign) runs strictly BEFORE any broadcast op, so a
+/// deadline on ANY leg means the tx was never signed and so never broadcast. Since Sprint 43 this
+/// marker is DIAGNOSTIC TEXT, not a classification key: `buy_access` maps the sign leg to
+/// `BuyError::PreBroadcast` by CONSTRUCTION (its call site), so a hung/failed signer refunds
+/// whether or not this exact string is present — the mirror of the chain SEND leg, which
+/// `buy_access` types `Indeterminate` at the `broadcast_signed_*` call site. The marker just names
+/// the session's purpose (obtaining a signature) in the error text.
 pub(crate) const WALLET_SIGN_DEADLINE_MARKER: &str = "wallet-provider sign deadline exceeded";
 
 impl WalletSession {
@@ -298,11 +298,11 @@ mod tests {
 
     /// Sprint 41 ratchet (the MONEY-CRITICAL leg): a HUNG wallet-provider is killed at the
     /// deadline — `sign_with_managed_account` returns BOUNDED (never parks the buy/mint thread for
-    /// the child's lifetime) and the error carries `WALLET_SIGN_DEADLINE_MARKER`, which the DRM
-    /// classifier reads as a PRE-broadcast refusal ⇒ NotCharged/refund (never a stranded hold).
-    /// This is the live-kill proof the sign leg previously lacked — the string-classification test
-    /// in `drm_marketplace` proved the marker is classified, this proves the marker is actually
-    /// minted by a real hung signer.
+    /// the child's lifetime) and the error carries `WALLET_SIGN_DEADLINE_MARKER`. This proves the
+    /// LIVE-KILL half (a real hung signer is killed and returns bounded); the money direction (a
+    /// sign-leg failure ⇒ PreBroadcast refund) is proven by construction in `buy_authority`
+    /// (`a_wallet_sign_timeout_types_the_buy_as_pre_broadcast`), where the sign leg is mapped to
+    /// `BuyError::PreBroadcast` at its call site — the marker itself is diagnostic text (S43).
     #[test]
     #[cfg(unix)]
     fn a_hung_wallet_provider_is_killed_and_classified_pre_broadcast() {
@@ -321,11 +321,9 @@ mod tests {
         std::env::set_var("ELASTOS_DDRM_WALLET_BASE", dir.path().join("store"));
 
         let started = std::time::Instant::now();
-        let err = sign_with_managed_account(
-            "did:elastos:test-principal",
-            8453,
-            |addr| Ok(json!({ "from": addr })),
-        )
+        let err = sign_with_managed_account("did:elastos:test-principal", 8453, |addr| {
+            Ok(json!({ "from": addr }))
+        })
         .unwrap_err();
 
         match prior_deadline {
@@ -347,18 +345,11 @@ mod tests {
         );
         assert!(
             err.contains(WALLET_SIGN_DEADLINE_MARKER),
-            "the error carries the pre-broadcast refund marker: {err}"
+            "the error carries the wallet sign-deadline marker: {err}"
         );
-        assert!(
-            drm_marketplace_reads_it_as_pre_broadcast(&err),
-            "the DRM classifier reads a hung-signer error as a PRE-broadcast refusal (refund): \
-             {err}"
-        );
-    }
-
-    /// Bridge to the classifier so this ratchet asserts the END-to-end money direction, not just
-    /// the string. Kept a thin wrapper so the intent is legible at the call site.
-    fn drm_marketplace_reads_it_as_pre_broadcast(err: &str) -> bool {
-        crate::drm_marketplace::is_pre_broadcast_refusal_for_test(err)
+        // The END-to-end money direction (a hung signer ⇒ pre-broadcast refund) is now proven by
+        // construction in `buy_authority`: the sign leg is mapped to `BuyError::PreBroadcast` at
+        // its call site, ratcheted by `a_wallet_sign_timeout_types_the_buy_as_pre_broadcast`. This
+        // test proves the other half — that a hung signer actually returns bounded with the marker.
     }
 }

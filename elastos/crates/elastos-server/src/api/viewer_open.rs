@@ -868,16 +868,22 @@ pub async fn buy_owned_access(
         )
             .into_response(),
         Ok(Err(err)) => {
-            if err.contains("wallet not linked") {
+            // The HTTP surface only needs the message text to pick a status code; the money
+            // classification (pre/post-broadcast) is the caller-side rail's concern, not this
+            // read-open handler's.
+            let msg = err.to_string();
+            if msg.contains("wallet not linked") {
                 return (StatusCode::FORBIDDEN, "link an EVM wallet to buy access").into_response();
             }
             // A live buy that needs an external signer is a precondition (409), not an
-            // outage — surface the assembled tx so the caller can sign it.
-            if err.contains("needs a signature") || err.contains("needs a signed transaction") {
-                tracing::info!("buy requires external signature: {err}");
-                return (StatusCode::CONFLICT, err).into_response();
+            // outage — surface the assembled tx so the caller can sign it. (Matches the exact
+            // producer phrase in `buy_authority`; the old dead `"needs a signed transaction"`
+            // alternative was removed — no producer emits it. Council S43 red-team INFO-2.)
+            if msg.contains("needs a signature") {
+                tracing::info!("buy requires external signature: {msg}");
+                return (StatusCode::CONFLICT, msg).into_response();
             }
-            tracing::warn!("buy failed: {err}");
+            tracing::warn!("buy failed: {msg}");
             (StatusCode::BAD_GATEWAY, "could not complete buy").into_response()
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "buy task panicked").into_response(),

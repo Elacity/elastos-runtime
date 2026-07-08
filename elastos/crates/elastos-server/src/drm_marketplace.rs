@@ -91,6 +91,21 @@ pub enum DrmSettleError {
     Indeterminate(String),
 }
 
+impl DrmSettleError {
+    /// Classify a `buy_access` failure by its TYPE — the whole point of Sprint 43. The refund-vs-
+    /// hold decision is now the [`BuyError`](crate::api::buy_authority::BuyError) VARIANT (decided
+    /// by which code path produced it), NOT a substring match on the message, so a hostile
+    /// provider's error text — even one embedding a pre-broadcast sentinel — can never flip a
+    /// possibly-sent tx into a refund. This preserves the one unbreakable invariant by construction.
+    pub(crate) fn from_buy_error(e: crate::api::buy_authority::BuyError) -> Self {
+        use crate::api::buy_authority::BuyError;
+        match e {
+            BuyError::PreBroadcast(m) => DrmSettleError::NotBroadcast(m),
+            BuyError::Indeterminate(m) => DrmSettleError::Indeterminate(m),
+        }
+    }
+}
+
 /// The on-chain price of a listing, READ-ONLY, sourced BEFORE the buy (Sprint 36 — the price gate).
 /// `price` is the pay-token's smallest-unit amount as a decimal string; `pay_token` is the ERC-20
 /// address or `"native"`. The pay gate compares the mandate's cap against `price` before any money
@@ -215,12 +230,14 @@ impl PaymentProvider for DrmMarketplaceProvider {
                 quote.price
             ))
         })?;
-        let authorized = (amount as u128).checked_mul(self.spend_unit).ok_or_else(|| {
-            PayError::NotCharged(
+        let authorized = (amount as u128)
+            .checked_mul(self.spend_unit)
+            .ok_or_else(|| {
+                PayError::NotCharged(
                 "DRM cap conversion overflowed (amount * spend_unit) — refused before broadcast"
                     .to_string(),
             )
-        })?;
+            })?;
         if authorized < price {
             return Err(PayError::NotCharged(format!(
                 "DRM buy refused before broadcast: the mandate authorizes {authorized} {tok} \
@@ -316,7 +333,11 @@ impl ChainDrmMarketplace {
     ///   quote-gate and the broadcast fails closed (the buy can never settle above, or in a
     ///   different token than, what the mandate's cap was gated against);
     /// - the pinned `operative`/`token_id` (never re-resolves — no re-opened ambiguity window).
-    fn buy_target(&self, binding: &DrmBinding, quote: &DrmQuote) -> crate::api::buy_authority::BuyTarget {
+    fn buy_target(
+        &self,
+        binding: &DrmBinding,
+        quote: &DrmQuote,
+    ) -> crate::api::buy_authority::BuyTarget {
         crate::api::buy_authority::BuyTarget {
             operative: Some(binding.operative.clone()),
             token_id: Some(binding.token_id.clone()),
@@ -404,13 +425,10 @@ impl DrmSettler for ChainDrmMarketplace {
             Ok(outcome) => Ok(DrmSettlement {
                 tx_hash: outcome.tx_hash,
             }),
-            // buy_access returns a plain error string. We classify CONSERVATIVELY: only errors
-            // that provably describe a PRE-BROADCAST refusal are NotBroadcast (refundable);
-            // anything that might have reached the chain stays Indeterminate (keep the
-            // reservation — the one unbreakable invariant). The recognized pre-broadcast phrases
-            // are the buy path's own fail-closed guards (incl. price-drift abort).
-            Err(e) if is_pre_broadcast_refusal(&e) => Err(DrmSettleError::NotBroadcast(e)),
-            Err(e) => Err(DrmSettleError::Indeterminate(e)),
+            // buy_access now returns a TYPED outcome-class (Sprint 43): the refund-vs-hold decision
+            // is the error's VARIANT, decided by which code path produced it, not by sniffing its
+            // string. A hostile provider's message can no longer flip a sent tx into a refund.
+            Err(e) => Err(DrmSettleError::from_buy_error(e)),
         }
     }
 }
@@ -434,7 +452,9 @@ impl DrmConfirmer for ChainDrmMarketplace {
         match crate::api::chain_tx::tx_confirmation_live(tx_hash, drm_min_confirmations()) {
             Ok(crate::api::chain_tx::TxConfirmation::Confirmed) => DrmConfirmation::Confirmed,
             Ok(crate::api::chain_tx::TxConfirmation::Reverted) => DrmConfirmation::Reverted,
-            Ok(crate::api::chain_tx::TxConfirmation::Pending(why)) => DrmConfirmation::Unconfirmed(why),
+            Ok(crate::api::chain_tx::TxConfirmation::Pending(why)) => {
+                DrmConfirmation::Unconfirmed(why)
+            }
             Err(e) => DrmConfirmation::Unconfirmed(format!("confirmation read failed: {e}")),
         }
     }
@@ -680,59 +700,6 @@ impl DrmReconcileSummary {
     }
 }
 
-/// Test-only bridge so a ratchet in another module (e.g. `wallet_signer`'s hung-signer proof) can
-/// assert the END-to-end money direction of a real error, not just its string shape.
-#[cfg(test)]
-pub(crate) fn is_pre_broadcast_refusal_for_test(err: &str) -> bool {
-    is_pre_broadcast_refusal(err)
-}
-
-/// Whether a `buy_access` error string PROVABLY describes a refusal BEFORE any broadcast — the ONLY
-/// case safe to classify NotCharged (refund the cap). Everything else — including every
-/// post-broadcast RPC error — stays Indeterminate (keep the reservation), because a broadcast may
-/// have landed and refunding against it would let the refund AND the on-chain purchase both stand
-/// (the one unbreakable invariant).
-///
-/// COUNCIL S34 red-team F1 (the ship-blocker): the earlier version matched bare generic tokens
-/// (`"ambiguous"`, `"unresolved"`, `"missing channel"`) as substrings. But `buy_access` in the
-/// pinned-binding settle path NEVER emits those words — the only place they can appear is inside a
-/// POST-send `broadcast_signed_live` error (`"chain-provider op failed: {opaque rpc message}"`),
-/// where an RPC/proxy string like "unresolved upstream" would have refunded a broadcast tx. So we
-/// now match ONLY the buy path's EXACT, distinctive pre-broadcast sentinels — each carries the
-/// `(fail closed)` / `— fail closed` marker the RPC error format does not reproduce, and each fires
-/// strictly BEFORE `broadcast_signed_live`. RESIDUAL (KNOWN_GAPS MKT-DRM): this still sniffs an
-/// opaque String; the real fix is a structured pre/post-broadcast error type out of `buy_access`.
-fn is_pre_broadcast_refusal(err: &str) -> bool {
-    // A `chain-provider op failed:`-prefixed error originates AT OR AFTER the broadcast op (that
-    // is the only place `run_chain_capsule` produces it) and carries the provider's OWN free
-    // text — which a HOSTILE provider controls byte-for-byte (council S40 red-team F3). Such a
-    // provider could broadcast the tx and then answer with a message CONTAINING a sentinel to
-    // trick this classifier into a refund while the purchase stands. The sentinels are emitted
-    // ONLY by `buy_access`'s own pre-broadcast guards, never inside a chain-provider op error —
-    // so anything the provider's op message could taint is post-broadcast by construction:
-    // refuse to read it as a pre-broadcast refusal (⇒ Indeterminate/hold, the safe direction).
-    if err.contains("chain-provider op failed") {
-        return false;
-    }
-    // Exact, anchored pre-broadcast sentinels emitted by `buy_authority::buy_access` strictly
-    // before any `eth_sendRawTransaction` — the SAME consts the producers use, so a rewording
-    // cannot drift the two sides apart. Case-sensitive (they are fixed literals), so an opaque
-    // lowercased RPC message cannot collide with the parenthetical/em-dash markers.
-    const PRE_BROADCAST_SENTINELS: &[&str] = &[
-        crate::api::buy_authority::ERR_WALLET_NOT_LINKED,
-        // sold-out, no-active-listing, and listing-drift all end with this suffix
-        crate::api::buy_authority::ERR_BUY_ABORTED_SUFFIX,
-        // operative missing before assembly
-        crate::api::buy_authority::ERR_NONE_RESOLVED_SUFFIX,
-        // A wallet-provider SIGN-leg deadline (Sprint 41): the wallet is used ONLY to sign,
-        // strictly BEFORE `broadcast_signed_live`, so a sign timeout PROVES the tx was never
-        // broadcast ⇒ refund. The mirror of the chain send-leg rule (whose CHAIN_DEADLINE_MARKER
-        // is deliberately NOT here — a chain deadline can be a send timeout that may have gone out).
-        crate::api::wallet_signer::WALLET_SIGN_DEADLINE_MARKER,
-    ];
-    PRE_BROADCAST_SENTINELS.iter().any(|p| err.contains(p))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -803,7 +770,8 @@ mod tests {
     }
 
     #[test]
-    fn a_broadcast_accepted_buy_is_indeterminate_not_charged_immediately_and_carries_the_rail_ref() {
+    fn a_broadcast_accepted_buy_is_indeterminate_not_charged_immediately_and_carries_the_rail_ref()
+    {
         // Sprint 35: a broadcast-accepted buy is NEVER immediately charged — it is Indeterminate
         // (Pending), the reservation held, the rail_ref carried as the reason so the pending
         // ledger record holds the tx for later confirmation.
@@ -833,8 +801,12 @@ mod tests {
         let settler = Arc::new(MockSettler::new(Ok(DrmSettlement {
             tx_hash: "0xshouldnothappen".to_string(),
         })));
-        let provider =
-            DrmMarketplaceProvider::new(Arc::new(MockResolver(Err("ambiguous"))), settler.clone(), 1, None);
+        let provider = DrmMarketplaceProvider::new(
+            Arc::new(MockResolver(Err("ambiguous"))),
+            settler.clone(),
+            1,
+            None,
+        );
         let err = provider.pay("QmAsset", 500, "flint-sig").unwrap_err();
         match err {
             PayError::NotCharged(msg) => assert!(msg.contains("ambiguous")),
@@ -894,7 +866,9 @@ mod tests {
         // spend_unit = 1 (1 spend unit == 1 pay-token unit). Quote price 500; the mandate amount
         // 300 authorizes only 300 — below the price ⇒ refuse, never settle.
         let settler = Arc::new(MockSettler::priced(
-            Ok(DrmSettlement { tx_hash: "0xNOPE".to_string() }),
+            Ok(DrmSettlement {
+                tx_hash: "0xNOPE".to_string(),
+            }),
             "500",
         ));
         let provider = DrmMarketplaceProvider::new(
@@ -906,7 +880,10 @@ mod tests {
         match provider.pay("QmAsset", 300, "k").unwrap_err() {
             PayError::NotCharged(msg) => {
                 assert!(msg.contains("refused before broadcast"), "{msg}");
-                assert!(msg.contains("500"), "the message names the on-chain price: {msg}");
+                assert!(
+                    msg.contains("500"),
+                    "the message names the on-chain price: {msg}"
+                );
             }
             other => panic!("a below-price buy must be NotCharged, got {other:?}"),
         }
@@ -923,7 +900,9 @@ mod tests {
     #[test]
     fn an_exact_match_buy_proceeds_and_the_rail_ref_names_the_price() {
         let settler = Arc::new(MockSettler::priced(
-            Ok(DrmSettlement { tx_hash: "0xC0FFEE".to_string() }),
+            Ok(DrmSettlement {
+                tx_hash: "0xC0FFEE".to_string(),
+            }),
             "5000000",
         ));
         let provider = DrmMarketplaceProvider::new(
@@ -934,7 +913,10 @@ mod tests {
         );
         match provider.pay("QmAsset", 5, "k").unwrap_err() {
             PayError::Indeterminate(rail_ref) => {
-                assert_eq!(rail_ref, "drm:tx=0xC0FFEE;op=0xop;tid=42;price=5000000;tok=usdc");
+                assert_eq!(
+                    rail_ref,
+                    "drm:tx=0xC0FFEE;op=0xop;tid=42;price=5000000;tok=usdc"
+                );
             }
             other => panic!("an exact-match buy should broadcast (Indeterminate), got {other:?}"),
         }
@@ -944,7 +926,9 @@ mod tests {
         let below = DrmMarketplaceProvider::new(
             Arc::new(MockResolver(Ok(binding()))),
             Arc::new(MockSettler::priced(
-                Ok(DrmSettlement { tx_hash: "0xNO".to_string() }),
+                Ok(DrmSettlement {
+                    tx_hash: "0xNO".to_string(),
+                }),
                 "5000000",
             )),
             1_000_000,
@@ -995,16 +979,25 @@ mod tests {
     #[test]
     fn an_unparseable_price_is_refused_before_broadcast() {
         let settler = Arc::new(MockSettler::priced(
-            Ok(DrmSettlement { tx_hash: "0xNOPE".to_string() }),
+            Ok(DrmSettlement {
+                tx_hash: "0xNOPE".to_string(),
+            }),
             "not-a-number",
         ));
-        let provider =
-            DrmMarketplaceProvider::new(Arc::new(MockResolver(Ok(binding()))), settler.clone(), 1, None);
+        let provider = DrmMarketplaceProvider::new(
+            Arc::new(MockResolver(Ok(binding()))),
+            settler.clone(),
+            1,
+            None,
+        );
         assert!(matches!(
             provider.pay("QmAsset", 999, "k").unwrap_err(),
             PayError::NotCharged(_)
         ));
-        assert!(!*settler.called.lock().unwrap(), "no settle on an unparseable price");
+        assert!(
+            !*settler.called.lock().unwrap(),
+            "no settle on an unparseable price"
+        );
     }
 
     /// Sprint 36 council fold (F3): a listing quoting a DIFFERENT pay-token than the declared one
@@ -1013,7 +1006,9 @@ mod tests {
     #[test]
     fn a_listing_in_a_different_pay_token_than_declared_is_refused() {
         let settler = Arc::new(MockSettler::priced(
-            Ok(DrmSettlement { tx_hash: "0xNOPE".to_string() }),
+            Ok(DrmSettlement {
+                tx_hash: "0xNOPE".to_string(),
+            }),
             "1",
         ));
         // The mock quotes pay_token "usdc"; the deployment declared the unit is for "0xWBTC".
@@ -1025,17 +1020,25 @@ mod tests {
         );
         match provider.pay("QmAsset", 999, "k").unwrap_err() {
             PayError::NotCharged(msg) => {
-                assert!(msg.contains("different") || msg.contains("token denominations"), "{msg}");
+                assert!(
+                    msg.contains("different") || msg.contains("token denominations"),
+                    "{msg}"
+                );
             }
             other => panic!("a wrong-token listing must be NotCharged, got {other:?}"),
         }
-        assert!(!*settler.called.lock().unwrap(), "no settle on a wrong-token listing");
+        assert!(
+            !*settler.called.lock().unwrap(),
+            "no settle on a wrong-token listing"
+        );
 
         // The SAME token (case-insensitive) passes the token check.
         let ok = DrmMarketplaceProvider::new(
             Arc::new(MockResolver(Ok(binding()))),
             Arc::new(MockSettler::priced(
-                Ok(DrmSettlement { tx_hash: "0xC0".to_string() }),
+                Ok(DrmSettlement {
+                    tx_hash: "0xC0".to_string(),
+                }),
                 "1",
             )),
             1,
@@ -1047,37 +1050,12 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn pre_broadcast_refusal_classification_is_conservative() {
-        // The EXACT buy_access pre-send sentinels ⇒ refundable (each fires before broadcast).
-        assert!(is_pre_broadcast_refusal(
-            "wallet not linked: a buy needs the principal's EVM address"
-        ));
-        assert!(is_pre_broadcast_refusal(
-            "listing sold out (on-chain supply 0) — buy aborted (fail closed)"
-        ));
-        assert!(is_pre_broadcast_refusal(
-            "no active listing for this asset (sellersOf/listings empty at ACCESS_TOKEN id=1) — \
-             buy aborted (fail closed)"
-        ));
-        assert!(is_pre_broadcast_refusal(
-            "listing drift on price: bound 5 != re-read 9 — buy aborted (fail closed)"
-        ));
-        assert!(is_pre_broadcast_refusal(
-            "abort-on-drift requires the asset's operative; none resolved — fail closed"
-        ));
-        // Council S34 red-team F1: a POST-broadcast RPC error that COINCIDENTALLY contains a
-        // generic token the old classifier matched MUST NOT be treated as pre-broadcast — the tx
-        // may have landed, so it stays indeterminate (reservation kept, never refunded).
-        assert!(!is_pre_broadcast_refusal(
-            "chain-provider op failed: unresolved upstream host after send"
-        ));
-        assert!(!is_pre_broadcast_refusal(
-            "chain-provider op failed: ambiguous nonce state"
-        ));
-        assert!(!is_pre_broadcast_refusal("rpc connection reset after send"));
-        assert!(!is_pre_broadcast_refusal("nonce too low"));
-    }
+    // (Sprint 43: the old `pre_broadcast_refusal_classification_is_conservative` string-classifier
+    // test was retired with `is_pre_broadcast_refusal`. Its intent is now covered by three stronger
+    // proofs: `from_buy_error_classifies_by_variant_not_by_string` (the variant mapping + hostile
+    // immunity), `a_not_broadcast_buy_is_not_charged_and_an_indeterminate_buy_keeps_the_reservation`
+    // (DrmSettleError → PayError), and the `buy_authority` ratchets that prove `buy_access` builds
+    // the correct variant at each pre/post-broadcast site.)
 
     #[test]
     fn the_live_ambiguity_message_classifies_as_ambiguous_not_absence() {
@@ -1094,7 +1072,10 @@ mod tests {
         );
         // The classifier arm keys on that marker (mirrors ChainDrmMarketplace::resolve).
         let is_ambiguous = msg.contains("binds >1 distinct") || msg.contains("ambiguous");
-        assert!(is_ambiguous, "a hostile co-mint is classified Ambiguous, not Unresolvable");
+        assert!(
+            is_ambiguous,
+            "a hostile co-mint is classified Ambiguous, not Unresolvable"
+        );
     }
 
     #[test]
@@ -1115,10 +1096,26 @@ mod tests {
         };
         let rail_ref = DrmMarketplaceProvider::rail_ref(&hostile, &quote, &settlement);
         // Exactly ONE of each delimiter key — the injected ones were stripped from every field.
-        assert_eq!(rail_ref.matches(";tid=").count(), 1, "no forged tid segment: {rail_ref}");
-        assert_eq!(rail_ref.matches(";op=").count(), 1, "no forged op segment: {rail_ref}");
-        assert_eq!(rail_ref.matches(";price=").count(), 1, "no forged price segment: {rail_ref}");
-        assert_eq!(rail_ref.matches(";tok=").count(), 1, "no forged tok segment: {rail_ref}");
+        assert_eq!(
+            rail_ref.matches(";tid=").count(),
+            1,
+            "no forged tid segment: {rail_ref}"
+        );
+        assert_eq!(
+            rail_ref.matches(";op=").count(),
+            1,
+            "no forged op segment: {rail_ref}"
+        );
+        assert_eq!(
+            rail_ref.matches(";price=").count(),
+            1,
+            "no forged price segment: {rail_ref}"
+        );
+        assert_eq!(
+            rail_ref.matches(";tok=").count(),
+            1,
+            "no forged tok segment: {rail_ref}"
+        );
         assert_eq!(
             rail_ref,
             "drm:tx=0xopfake;op=0xrealtid999;tid=42;price=1tid9;tok=usdcx"
@@ -1180,15 +1177,23 @@ mod tests {
                 Some("00000000000000000000000000000001"),
             ));
         }
-        assert_eq!(meter.remaining("vm-shop"), 400, "600 reserved across three pendings");
+        assert_eq!(
+            meter.remaining("vm-shop"),
+            400,
+            "600 reserved across three pendings"
+        );
 
         let mut verdicts = std::collections::HashMap::new();
         verdicts.insert("0xC0".to_string(), DrmConfirmation::Confirmed);
         verdicts.insert("0xRE".to_string(), DrmConfirmation::Reverted);
-        verdicts.insert("0xHO".to_string(), DrmConfirmation::Unconfirmed("mempool".to_string()));
+        verdicts.insert(
+            "0xHO".to_string(),
+            DrmConfirmation::Unconfirmed("mempool".to_string()),
+        );
         let confirmer = MockConfirmer(verdicts);
 
-        let summary = reconcile_drm_confirmations(&ledger, &meter, &audit, &confirmer, usize::MAX, None);
+        let summary =
+            reconcile_drm_confirmations(&ledger, &meter, &audit, &confirmer, usize::MAX, None);
         assert_eq!(summary.promoted, 1);
         assert_eq!(summary.refunded, 1);
         assert_eq!(summary.left_pending, 1);
@@ -1214,11 +1219,16 @@ mod tests {
 
         // A second pass is idempotent — the resolved entries are no longer Pending, only the
         // holding one is re-polled (still unconfirmed).
-        let again = reconcile_drm_confirmations(&ledger, &meter, &audit, &confirmer, usize::MAX, None);
+        let again =
+            reconcile_drm_confirmations(&ledger, &meter, &audit, &confirmer, usize::MAX, None);
         assert_eq!(again.promoted, 0);
         assert_eq!(again.refunded, 0, "no double refund");
         assert_eq!(again.left_pending, 1);
-        assert_eq!(meter.remaining("vm-shop"), 600, "no double refund on the meter");
+        assert_eq!(
+            meter.remaining("vm-shop"),
+            600,
+            "no double refund on the meter"
+        );
     }
 
     /// Seed `n` pending DRM buys (`flint-b0..`, txs `0xB0..`), each with a reservation.
@@ -1264,17 +1274,33 @@ mod tests {
 
         let first = drm_reconcile_tick(&ledger, &meter, &audit, &confirmer, 2, None);
         assert_eq!(first.promoted, 2, "the tick promotes only up to the bound");
-        assert_eq!(first.skipped, 1, "the overflow is COUNTED, not silently dropped");
+        assert_eq!(
+            first.skipped, 1,
+            "the overflow is COUNTED, not silently dropped"
+        );
         // Oldest-first: b0 and b1 (lowest seq) resolved; b2 still pending.
-        assert_eq!(ledger.get("flint-b0").unwrap().status, PaymentStatus::ResolvedCharged);
-        assert_eq!(ledger.get("flint-b1").unwrap().status, PaymentStatus::ResolvedCharged);
-        assert_eq!(ledger.get("flint-b2").unwrap().status, PaymentStatus::Pending);
+        assert_eq!(
+            ledger.get("flint-b0").unwrap().status,
+            PaymentStatus::ResolvedCharged
+        );
+        assert_eq!(
+            ledger.get("flint-b1").unwrap().status,
+            PaymentStatus::ResolvedCharged
+        );
+        assert_eq!(
+            ledger.get("flint-b2").unwrap().status,
+            PaymentStatus::Pending
+        );
 
         let second = drm_reconcile_tick(&ledger, &meter, &audit, &confirmer, 2, None);
         assert_eq!(second.promoted, 1, "the next tick drains the remainder");
         assert_eq!(second.skipped, 0);
         let third = drm_reconcile_tick(&ledger, &meter, &audit, &confirmer, 2, None);
-        assert_eq!(third, DrmReconcileSummary::default(), "a drained ledger is a silent tick");
+        assert_eq!(
+            third,
+            DrmReconcileSummary::default(),
+            "a drained ledger is a silent tick"
+        );
     }
 
     /// A confirmer that PANICS on one scripted tx and confirms every other.
@@ -1283,7 +1309,10 @@ mod tests {
     }
     impl DrmConfirmer for PanickingConfirmer {
         fn confirm(&self, tx_hash: &str) -> DrmConfirmation {
-            assert!(tx_hash != self.panic_on, "scripted confirmer panic on {tx_hash}");
+            assert!(
+                tx_hash != self.panic_on,
+                "scripted confirmer panic on {tx_hash}"
+            );
             DrmConfirmation::Confirmed
         }
     }
@@ -1308,8 +1337,14 @@ mod tests {
         let reserved_before = meter.remaining("vm-shop");
 
         let summary = drm_reconcile_tick(&ledger, &meter, &audit, &confirmer, usize::MAX, None);
-        assert_eq!(summary.promoted, 2, "the entries around the poisoned one still resolve");
-        assert_eq!(summary.left_pending, 1, "the poisoned entry is HELD, not decided");
+        assert_eq!(
+            summary.promoted, 2,
+            "the entries around the poisoned one still resolve"
+        );
+        assert_eq!(
+            summary.left_pending, 1,
+            "the poisoned entry is HELD, not decided"
+        );
         assert_eq!(
             ledger.get("flint-b1").unwrap().status,
             PaymentStatus::Pending,
@@ -1358,7 +1393,11 @@ mod tests {
         let held = drm_reconcile_tick(&ledger, &meter, &audit, &unscripted, usize::MAX, None);
         assert_eq!(held.left_pending, 1, "unscripted verdict ⇒ held");
         drm_reconcile_tick(&ledger, &meter, &audit, &unscripted, usize::MAX, None);
-        assert_eq!(count_tick_events(&audit), 0, "held-only re-polls stay off the chain");
+        assert_eq!(
+            count_tick_events(&audit),
+            0,
+            "held-only re-polls stay off the chain"
+        );
 
         // Settling tick: the entry confirms ⇒ exactly one summary event.
         let confirming = MockConfirmer(
@@ -1394,12 +1433,18 @@ mod tests {
         // Tick 1 (cursor 0): the batch of 1 is consumed by the stuck oldest entry.
         let first = drm_reconcile_tick(&ledger, &meter, &audit, &confirmer, 1, None);
         assert_eq!(first.left_pending, 1, "the stuck entry is held");
-        assert_eq!(first.skipped, 1, "the confirmable entry waits — counted, not dropped");
+        assert_eq!(
+            first.skipped, 1,
+            "the confirmable entry waits — counted, not dropped"
+        );
         let cursor = first.next_cursor.expect("the pass scanned something");
 
         // Tick 2 (cursor after the stuck entry): rotation reaches b1 — no starvation.
         let second = drm_reconcile_tick(&ledger, &meter, &audit, &confirmer, 1, Some(cursor));
-        assert_eq!(second.promoted, 1, "the entry BEHIND the stuck one is promoted");
+        assert_eq!(
+            second.promoted, 1,
+            "the entry BEHIND the stuck one is promoted"
+        );
         assert_eq!(
             ledger.get("flint-b1").unwrap().status,
             PaymentStatus::ResolvedCharged
@@ -1414,73 +1459,44 @@ mod tests {
             Some(second.next_cursor.unwrap()),
         );
         assert_eq!(third.left_pending, 1, "the wrap re-polls the stuck entry");
-        assert_eq!(ledger.get("flint-b0").unwrap().status, PaymentStatus::Pending);
-    }
-
-    /// Sprint 40 council fold (red-team F3): a HOSTILE chain-provider that broadcasts the tx and
-    /// then answers with an op error CONTAINING a pre-broadcast sentinel must NOT trick the
-    /// classifier into a refund — a `chain-provider op failed:` error is post-broadcast by
-    /// construction (only `run_chain_capsule` produces it, at/after the broadcast op), so it
-    /// classifies Indeterminate (hold) regardless of its provider-controlled free text.
-    #[test]
-    fn a_post_broadcast_op_error_is_never_read_as_a_pre_broadcast_refusal() {
-        let masquerade = format!(
-            "chain-provider op failed: {}",
-            crate::api::rights_authority::CHAIN_DEADLINE_MARKER
-        );
-        assert!(!is_pre_broadcast_refusal(&masquerade));
-        assert!(!is_pre_broadcast_refusal(
-            "chain-provider op failed: sold out - buy aborted (fail closed)"
-        ));
-        assert!(!is_pre_broadcast_refusal(
-            "chain-provider op failed: none resolved - fail closed"
-        ));
-        // A GENUINE pre-broadcast refusal (no op-failed prefix) still classifies as a refund.
-        assert!(is_pre_broadcast_refusal(
-            "listing sold out (on-chain supply 0) - buy aborted (fail closed)"
-        ));
-    }
-
-    /// Sprint 40 ratchet: the chain-deadline marker is NOT a pre-broadcast refusal sentinel —
-    /// a deadline on the SEND leg (the tx may have broadcast) classifies INDETERMINATE (hold),
-    /// never a refund. This is the money-critical line of the read-deadline: refund on a send
-    /// timeout would let the refund and the on-chain purchase both stand.
-    #[test]
-    fn a_chain_deadline_error_is_never_classified_as_a_refund() {
-        let marker = crate::api::rights_authority::CHAIN_DEADLINE_MARKER;
-        assert!(
-            !is_pre_broadcast_refusal(marker),
-            "the deadline marker must never match a refund sentinel"
-        );
-        assert!(
-            !is_pre_broadcast_refusal(&format!(
-                "{marker}: no response within 30s — chain-provider killed; the op's outcome \
-                 is UNRESOLVED (a send may have gone out)"
-            )),
-            "nor the full deadline error string"
+        assert_eq!(
+            ledger.get("flint-b0").unwrap().status,
+            PaymentStatus::Pending
         );
     }
 
-    /// Sprint 41 ratchet (the money-critical line): a WALLET-SIGN deadline is the MIRROR of the
-    /// chain send-leg rule. The wallet signs strictly BEFORE broadcast, so a sign timeout proves
-    /// the tx never existed ⇒ REFUND (pre-broadcast). Classifying it Indeterminate would strand
-    /// a reservation for a tx that was never signed.
+    /// Sprint 43 (retiring the string classifier): the refund-vs-hold decision is now the
+    /// `BuyError` VARIANT, mapped by `DrmSettleError::from_buy_error` — NOT a substring match. This
+    /// is the HOSTILE-PROVIDER ratchet, now stronger: an `Indeterminate` error whose message embeds
+    /// EVERY pre-broadcast sentinel (and the chain/wallet deadline markers) STILL maps to hold,
+    /// because the variant — decided by the code path that built it — is what classifies, and a
+    /// broadcast-op failure can only ever be built as `Indeterminate` at its single call site. The
+    /// mirror check: a `PreBroadcast` error maps to a refund regardless of its (harmless) text.
     #[test]
-    fn a_wallet_sign_deadline_classifies_as_a_pre_broadcast_refund() {
-        let marker = crate::api::wallet_signer::WALLET_SIGN_DEADLINE_MARKER;
-        assert!(
-            is_pre_broadcast_refusal(marker),
-            "a sign-leg timeout is provably pre-broadcast ⇒ refund"
+    fn from_buy_error_classifies_by_variant_not_by_string() {
+        use crate::api::buy_authority::BuyError;
+
+        // A PreBroadcast failure ⇒ NotBroadcast (refund), whatever the message says.
+        let refund = DrmSettleError::from_buy_error(BuyError::PreBroadcast(
+            "wallet not linked: a buy needs the principal's EVM address".to_string(),
+        ));
+        assert!(matches!(refund, DrmSettleError::NotBroadcast(_)));
+
+        // An Indeterminate failure whose text MASQUERADES as every pre-broadcast refusal — the old
+        // string classifier's worst case — still maps to hold. A post-broadcast tx is never
+        // refunded on the strength of provider-controlled bytes.
+        let hostile = format!(
+            "chain-provider op failed: wallet not linked / {} / {} / {} / {}",
+            crate::api::buy_authority::ERR_BUY_ABORTED_SUFFIX,
+            crate::api::buy_authority::ERR_NONE_RESOLVED_SUFFIX,
+            crate::api::wallet_signer::WALLET_SIGN_DEADLINE_MARKER,
+            crate::api::rights_authority::CHAIN_DEADLINE_MARKER,
         );
+        let hold = DrmSettleError::from_buy_error(BuyError::Indeterminate(hostile));
         assert!(
-            is_pre_broadcast_refusal(&format!(
-                "{marker}: no response within 30s — wallet-provider killed; the tx was NEVER \
-                 signed (provably not charged)"
-            )),
-            "the full wallet-sign deadline error refunds"
+            matches!(hold, DrmSettleError::Indeterminate(_)),
+            "a post-broadcast (Indeterminate) error is HELD even when its text embeds every \
+             pre-broadcast sentinel — the variant classifies, not the string"
         );
-        // And it is NOT reachable through the post-broadcast op-failed exclusion (the wallet
-        // never runs post-broadcast, so no op-failed prefix wraps it).
-        assert!(!marker.contains("chain-provider op failed"));
     }
 }
