@@ -10,6 +10,7 @@ pub mod auth_gateway;
 pub mod browser_capsules;
 pub mod browser_sessions;
 pub mod buy_authority;
+pub(crate) mod capsule_watchdog;
 pub(crate) mod capsule_inventory;
 pub mod chain_tx;
 pub mod content_index;

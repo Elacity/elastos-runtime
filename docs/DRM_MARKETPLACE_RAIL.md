@@ -159,10 +159,16 @@ money-moving code; one spine), with these properties:
   op may traverse a few conversations, each separately bounded). A deadline on a SEND leg
   classifies INDETERMINATE (the tx may have broadcast — hold, reconcile), never a refund;
   deadlines on read legs (resolve/quote/receipt) are ordinary fail-closed refusals/holds.
-  RESIDUAL: the wallet-provider SIGN leg and the rights-provider DECIDE leg are separate
-  subprocesses that are NOT yet deadlined — a hung signer or rights capsule still parks that
-  thread (unix-only kill covers the chain provider; the sibling providers are the tracked
-  follow-on).
+  The wallet-provider SIGN leg and the rights-provider DECIDE leg carry the SAME deadline
+  (Sprint 41 — one shared `capsule_watchdog`): a hung signer or rights capsule is killed too (the
+  kill is unix-only, like the flock protections; elsewhere the watchdog is a stated no-op and the
+  old unbounded behavior remains). A wallet SIGN timeout is a PRE-broadcast refusal (the tx was
+  never signed ⇒ NotCharged/refund — the mirror of the send-leg rule); a rights DECIDE timeout
+  DENIES access (fail-closed). With this, every **chain-read, wallet-sign, and rights-decide**
+  provider conversation the pay/access pipeline traverses is bounded — including the reap (an
+  answered-then-lingering child is group-killed after a short grace, not parked on `wait()`).
+  Access-path *sidecar* helpers outside these three provider conversations (the protected-content
+  open/view descriptors) are not yet under this watchdog — see `KNOWN_GAPS.md`.
 
 ## Watching it (the Marketplace panel + the demo)
 

@@ -25,7 +25,7 @@
 //! Mirrors the proven reference in `scripts/dev/ddrm-runtime-open` (the canonical CLI
 //! vertical) — same chain-provider contract, same attestation shape, same mock.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -424,87 +424,32 @@ fn chain_attestation(
 /// exactly that; a ratchet pins the non-collision.
 pub(crate) const CHAIN_DEADLINE_MARKER: &str = "chain-provider read deadline exceeded";
 
-/// How long ONE chain-provider conversation (spawn → init → op → response) may take before the
-/// child is killed (Sprint 40 — closes the S37/S39-ledgered hung-read residual at its root).
-/// `ELASTOS_CHAIN_READ_DEADLINE_SECS`, default 30, floor 1. A malformed value uses the DEFAULT
-/// with a loud warning — the deadline is an availability knob, not a money decision, so a typo
-/// must not silently remove the protection (fail SAFE, not fail open-ended).
-fn chain_read_deadline() -> std::time::Duration {
-    const DEFAULT_SECS: u64 = 30;
-    let secs = match std::env::var("ELASTOS_CHAIN_READ_DEADLINE_SECS") {
-        Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(n) if n >= 1 => n,
-            _ => {
-                tracing::warn!(
-                    "ELASTOS_CHAIN_READ_DEADLINE_SECS={raw:?} is not a positive integer — \
-                     using the default {DEFAULT_SECS}s deadline"
-                );
-                DEFAULT_SECS
-            }
-        },
-        Err(_) => DEFAULT_SECS,
-    };
-    std::time::Duration::from_secs(secs)
-}
-
 /// Spawn chain-provider, send `init` then one op (e.g. `has_access_by_content_id` or
 /// `broadcast_transaction`) + `shutdown`, returning the op's `data`.
 ///
-/// DEADLINE (Sprint 40): the WHOLE conversation is bounded by [`chain_read_deadline`] — a
+/// DEADLINE (Sprint 40/41): the WHOLE conversation is bounded by the shared
+/// [`capsule_watchdog`](super::capsule_watchdog) — a
 /// watchdog kills the child at expiry, so a hung RPC/subprocess can never park a blocking
 /// thread forever (the pay pipeline's, the quote spine's, or the confirmation scheduler's).
-/// The child is ALWAYS reaped (no zombies): on the normal path it exits on `shutdown`/EOF, on
-/// the deadline path the kill makes `wait()` return. A deadline error carries
+/// The child is ALWAYS reaped (no zombies) and the reap itself is BOUNDED (council S41 guardian
+/// F1/F2): on the normal path it exits on `shutdown`/EOF; on the deadline path the read-watchdog
+/// kill makes the read return; and a child that answered but then refuses to exit is group-killed
+/// by [`reap_grouped`](super::capsule_watchdog::reap_grouped) after a short grace — no reap ever
+/// parks the thread. A deadline error carries
 /// [`CHAIN_DEADLINE_MARKER`] so consumers classify it correctly (see the marker's money note).
 /// Unix-only kill (like the flock protections); elsewhere the watchdog is a no-op and the old
 /// unbounded behavior remains, stated here.
 pub(crate) fn run_chain_capsule(bin: &str, init: &Value, query: &Value) -> Result<Value, String> {
-    let deadline = chain_read_deadline();
+    let deadline = super::capsule_watchdog::capsule_read_deadline();
     let mut cmd = Command::new(bin);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    // Own PROCESS GROUP (unix): the deadline kill must take down the provider AND anything it
-    // spawned — a killed parent whose helper child still holds the stdout pipe would leave the
-    // read blocked past the deadline (exactly the hang the deadline exists to end).
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        cmd.process_group(0);
-    }
-    let mut child = cmd
-        .spawn()
+    let mut child = super::capsule_watchdog::spawn_grouped(&mut cmd)
         .map_err(|e| format!("spawn chain-provider ({bin}): {e}"))?;
     let mut stdin = child.stdin.take().ok_or("no stdin")?;
     let mut reader = BufReader::new(child.stdout.take().ok_or("no stdout")?);
-
-    // The watchdog: armed for the whole conversation AND the reap. Disarmed only after the
-    // child is waited on, so even a child that answers and then lingers cannot block the reap
-    // beyond the deadline. `fired` tells the error path the failure was the deadline.
-    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (disarm_tx, disarm_rx) = std::sync::mpsc::channel::<()>();
-    let watchdog = {
-        let fired = fired.clone();
-        #[cfg(unix)]
-        let pid = child.id();
-        std::thread::spawn(move || {
-            if disarm_rx.recv_timeout(deadline).is_err() {
-                // Kill the whole process GROUP (negative pid) — the provider and any helper it
-                // spawned, so no orphan can keep the stdout pipe open past the deadline. `fired`
-                // is set ONLY where a kill actually happens (unix), so the deadline error is
-                // never minted on a platform where nothing was killed (guardian F2).
-                #[cfg(unix)]
-                {
-                    fired.store(true, std::sync::atomic::Ordering::SeqCst);
-                    unsafe {
-                        libc::kill(-(pid as i32), libc::SIGKILL);
-                    }
-                }
-                #[cfg(not(unix))]
-                let _ = &fired; // no watchdog kill off-unix; the read stays unbounded (stated)
-            }
-        })
-    };
+    let watchdog = super::capsule_watchdog::DeadlineWatchdog::arm(child.id(), deadline);
 
     let result = (|| -> Result<Value, String> {
         writeln!(stdin, "{init}").map_err(|e| format!("write chain init: {e}"))?;
@@ -548,15 +493,15 @@ pub(crate) fn run_chain_capsule(bin: &str, init: &Value, query: &Value) -> Resul
     // receive a stray group kill. A hung conversation is already resolved by the time we reach
     // here — the watchdog killed the (still-live, un-reaped) child, EOF ended the read, the
     // closure returned Err; a fast/normal conversation disarms the watchdog before it fires.
+    // Drop stdin (EOF), disarm+join the watchdog, THEN reap — the disarm-before-reap ordering
+    // (S40 red-team F1) lives in `DeadlineWatchdog::disarm`.
     drop(stdin);
-    let _ = disarm_tx.send(());
-    let _ = watchdog.join();
-    let _ = child.wait(); // reap LAST — the pid is still ours until this returns
+    let fired = watchdog.disarm();
+    // Reap is BOUNDED (S41): an answered-then-lingering child is group-killed after a short grace
+    // rather than parking the thread on an unbounded `wait()`.
+    super::capsule_watchdog::reap_grouped(&mut child);
 
-    if result.is_err() && fired.load(std::sync::atomic::Ordering::SeqCst) {
-        // `fired` is set only inside the `#[cfg(unix)]` watchdog kill, so this branch is
-        // unix-only in practice; keep the underlying error for diagnostics (guardian F2) rather
-        // than discarding what actually failed.
+    if result.is_err() && fired {
         let underlying = result.err().unwrap_or_default();
         return Err(format!(
             "{CHAIN_DEADLINE_MARKER}: no response within {}s — chain-provider killed; the op's \
@@ -567,60 +512,66 @@ pub(crate) fn run_chain_capsule(bin: &str, init: &Value, query: &Value) -> Resul
     result
 }
 
+/// The marker a rights-provider DECIDE-leg deadline carries (Sprint 41). MONEY/ACCESS NOTE: a
+/// rights-decide timeout is an Err, and every access consumer DENIES on Err (a 503 "rights gate
+/// unavailable", never an open) — so, unlike the chain send leg, this needs no special
+/// classification: deny is the fail-closed direction. The marker is for diagnostics.
+pub(crate) const RIGHTS_DEADLINE_MARKER: &str = "rights-provider read deadline exceeded";
+
 /// Spawn the rights-provider capsule, send one request + `shutdown`, return its `data`.
+///
+/// DEADLINE (Sprint 41): the conversation is bounded by the shared
+/// [`capsule_watchdog`](super::capsule_watchdog) — a hung rights provider is killed (process
+/// group and all) so the DECIDE leg can never park a request thread forever. A deadline Errs,
+/// which every access consumer treats as DENY (fail-closed).
 fn run_rights_capsule(bin: &str, request: &Value) -> Result<Value, String> {
-    let mut child = Command::new(bin)
-        .stdin(Stdio::piped())
+    let deadline = super::capsule_watchdog::capsule_read_deadline();
+    let mut cmd = Command::new(bin);
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
+        .stderr(Stdio::inherit());
+    let mut child = super::capsule_watchdog::spawn_grouped(&mut cmd)
         .map_err(|e| format!("spawn rights-provider ({bin}): {e}"))?;
-    {
+    let watchdog = super::capsule_watchdog::DeadlineWatchdog::arm(child.id(), deadline);
+
+    let result = (|| -> Result<Value, String> {
         let mut stdin = child.stdin.take().ok_or("no stdin")?;
         writeln!(stdin, "{request}").map_err(|e| format!("write rights request: {e}"))?;
         writeln!(stdin, "{}", json!({ "op": "shutdown" }))
             .map_err(|e| format!("write shutdown: {e}"))?;
         stdin.flush().map_err(|e| format!("flush: {e}"))?;
+        drop(stdin); // EOF so a well-behaved child exits
+        let mut reader = BufReader::new(child.stdout.take().ok_or("no stdout")?);
+        let resp = read_capsule_line(&mut reader)?;
+        if resp.get("status").and_then(Value::as_str) != Some("ok") {
+            let message = resp
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("rights-provider error");
+            return Err(message.to_string());
+        }
+        resp.get("data")
+            .cloned()
+            .ok_or_else(|| "rights-provider ok response missing data".to_string())
+    })();
+    // Disarm+join BEFORE reap (S40 ordering — lives in DeadlineWatchdog::disarm), then a BOUNDED
+    // reap (S41): an answered-then-lingering rights child is group-killed after a short grace, not
+    // parked on an unbounded `wait()`.
+    let fired = watchdog.disarm();
+    super::capsule_watchdog::reap_grouped(&mut child);
+
+    if result.is_err() && fired {
+        let underlying = result.err().unwrap_or_default();
+        return Err(format!(
+            "{RIGHTS_DEADLINE_MARKER}: no decision within {}s — rights-provider killed; access \
+             is DENIED (fail-closed); underlying: {underlying}",
+            deadline.as_secs()
+        ));
     }
-    let mut reader = BufReader::new(child.stdout.take().ok_or("no stdout")?);
-    let resp = read_capsule_line(&mut reader);
-    let _ = child.wait();
-    let resp = resp?;
-    if resp.get("status").and_then(Value::as_str) != Some("ok") {
-        let message = resp
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("rights-provider error");
-        return Err(message.to_string());
-    }
-    resp.get("data")
-        .cloned()
-        .ok_or_else(|| "rights-provider ok response missing data".to_string())
+    result
 }
 
-/// Longest single response line a capsule may emit. A JSON-RPC response is kilobytes; this is a
-/// generous ceiling that turns a hostile/compromised provider streaming a newline-free firehose
-/// (memory-exhaustion DoS within the deadline window — council S40 red-team F2) into a bounded
-/// error instead of an OOM abort of the whole runtime.
-const MAX_CAPSULE_LINE: u64 = 4 * 1024 * 1024;
-
-/// Read one newline-delimited JSON response line from a capsule's stdout, LENGTH-bounded.
-fn read_capsule_line(reader: &mut impl BufRead) -> Result<Value, String> {
-    let mut line = String::new();
-    // `take` caps the bytes read this call; a line at/over the cap is refused rather than grown
-    // unbounded. `read_line` still stops at the first newline within the cap.
-    let n = reader
-        .take(MAX_CAPSULE_LINE + 1)
-        .read_line(&mut line)
-        .map_err(|e| format!("read capsule stdout: {e}"))?;
-    if n == 0 {
-        return Err("capsule exited before answering".to_string());
-    }
-    if line.len() as u64 > MAX_CAPSULE_LINE {
-        return Err("capsule response line exceeds the size cap (refused)".to_string());
-    }
-    serde_json::from_str(line.trim()).map_err(|e| format!("parse capsule response: {e}"))
-}
+use super::capsule_watchdog::read_capsule_line;
 
 /// Stable hash of the minted receipt for transcript binding: a domain-separated
 /// SHA-256 over the receipt re-serialized with sorted keys, so the gateway, the
@@ -976,21 +927,44 @@ mod tests {
         );
     }
 
-    /// Sprint 40 ratchet: a malformed deadline env falls back to the DEFAULT with the protection
-    /// intact (never an unbounded read), and the floor holds.
+    /// Sprint 41 ratchet: a HUNG rights-provider (the DECIDE leg) is killed at the deadline too —
+    /// the call returns bounded, the child is reaped, and the error carries the rights marker +
+    /// says access is DENIED (the fail-closed direction; every access consumer denies on Err).
     #[test]
-    fn a_malformed_deadline_env_keeps_the_default_protection() {
+    #[cfg(unix)]
+    fn a_hung_rights_provider_is_killed_and_access_is_denied() {
         let _g = crate::api::ddrm_env_lock();
         let prior = std::env::var("ELASTOS_CHAIN_READ_DEADLINE_SECS").ok();
-        std::env::set_var("ELASTOS_CHAIN_READ_DEADLINE_SECS", "soon");
-        assert_eq!(chain_read_deadline(), std::time::Duration::from_secs(30));
-        std::env::set_var("ELASTOS_CHAIN_READ_DEADLINE_SECS", "0");
-        assert_eq!(chain_read_deadline(), std::time::Duration::from_secs(30));
-        std::env::set_var("ELASTOS_CHAIN_READ_DEADLINE_SECS", "5");
-        assert_eq!(chain_read_deadline(), std::time::Duration::from_secs(5));
+        std::env::set_var("ELASTOS_CHAIN_READ_DEADLINE_SECS", "1");
+
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("hung-rights-provider.sh");
+        std::fs::write(&stub, "#!/bin/sh\nsleep 300\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = run_rights_capsule(stub.to_str().unwrap(), &serde_json::json!({ "op": "decide" }))
+            .unwrap_err();
         match prior {
             Some(v) => std::env::set_var("ELASTOS_CHAIN_READ_DEADLINE_SECS", v),
             None => std::env::remove_var("ELASTOS_CHAIN_READ_DEADLINE_SECS"),
         }
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "the DECIDE leg is BOUNDED by the deadline, not the child's 300s sleep"
+        );
+        assert!(
+            err.contains(RIGHTS_DEADLINE_MARKER),
+            "the error carries the rights marker: {err}"
+        );
+        assert!(
+            err.contains("DENIED"),
+            "a rights-decide timeout DENIES access (fail-closed): {err}"
+        );
     }
+
+    // The malformed-env fallback test moved to `capsule_watchdog` (the shared home of the
+    // deadline parser); this module keeps the live hung-provider kill ratchets above.
 }

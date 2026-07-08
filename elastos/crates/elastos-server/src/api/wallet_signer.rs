@@ -18,7 +18,7 @@
 //! `vz` microVM backend). The store lives at `ELASTOS_DDRM_WALLET_BASE` so the managed
 //! account is stable across buys; the key stays inside the capsule's encrypted store.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 
@@ -130,6 +130,12 @@ where
         .ok_or("wallet-provider request_signature missing request_id")?
         .to_string();
 
+    // FOOTGUN (council S41 red-team F1): this approve is INLINE and AUTOMATIC — the operator's
+    // `ELASTOS_DDRM_BUY_SIGN=wallet` opt-in IS the consent, so it returns as fast as any other op
+    // and sits safely under the shared read deadline. It is NOT a human-consent wait. If a future
+    // change routes this approve to the user's Wallet/Inbox for real human consent, that leg MUST
+    // run OUTSIDE this deadline (or under a much larger one) — a 30s watchdog would otherwise kill
+    // the signer the moment a human takes longer than half a minute to approve.
     session.call(&json!({
         "op": "approve_approval",
         "principal_id": principal_id,
@@ -168,15 +174,34 @@ struct WalletSession {
     child: Child,
     stdin: ChildStdin,
     reader: BufReader<std::process::ChildStdout>,
+    /// Set once the deadline watchdog has fired on this session (council S41 guardian F5). A fire
+    /// leaves the child dead; even in the rare fired-but-read-Ok race the child is gone, so every
+    /// subsequent `exchange` must FAIL with the pre-broadcast marker rather than silently degrade
+    /// to an unmarked EPIPE (which `settle` would read as Indeterminate ⇒ a stranded reservation
+    /// for a tx that never signed). Once poisoned, the session mints the refund-classified marker.
+    poisoned: bool,
 }
+
+/// The marker a wallet-provider deadline carries (Sprint 41). MONEY NOTE (the money-critical line
+/// of the sprint): the ENTIRE wallet session (init → create_account → request → approve → sign)
+/// runs strictly BEFORE `broadcast_signed_live`, so a deadline on ANY leg — the marker names the
+/// session's purpose (obtaining a signature), not one specific op — means the tx was never signed,
+/// so it never broadcast, so it is provably NOT charged. The DRM classifier
+/// (`drm_marketplace::is_pre_broadcast_refusal`) recognizes this marker as a PRE-broadcast
+/// refusal ⇒ NotCharged/refund, the exact mirror of the chain SEND-leg rule
+/// (`CHAIN_DEADLINE_MARKER` ⇒ Indeterminate/hold). Classifying a sign timeout as Indeterminate
+/// would strand a reservation for a tx that never existed.
+pub(crate) const WALLET_SIGN_DEADLINE_MARKER: &str = "wallet-provider sign deadline exceeded";
 
 impl WalletSession {
     fn start(bin: &str, base_path: &str) -> Result<Self, String> {
-        let mut child = Command::new(bin)
-            .stdin(Stdio::piped())
+        let mut cmd = Command::new(bin);
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
+            .stderr(Stdio::inherit());
+        // Own process group (unix) so a sign-leg deadline kill takes the provider AND any helper
+        // it spawned — the same discipline the chain/rights conversations use (S41).
+        let mut child = crate::api::capsule_watchdog::spawn_grouped(&mut cmd)
             .map_err(|e| format!("spawn wallet-provider ({bin}): {e}"))?;
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let reader = BufReader::new(child.stdout.take().ok_or("no stdout")?);
@@ -184,6 +209,7 @@ impl WalletSession {
             child,
             stdin,
             reader,
+            poisoned: false,
         };
         let init = json!({ "op": "init", "config": { "base_path": base_path } });
         session
@@ -197,18 +223,43 @@ impl WalletSession {
     }
 
     fn exchange(&mut self, request: &Value) -> Result<Value, String> {
+        // A prior watchdog fire on this session left the child dead; refuse to run a further leg
+        // under an unmarked EOF error (council S41 guardian F5). Every wallet leg is strictly
+        // pre-broadcast, so the marker (⇒ NotCharged/refund) is the correct classification.
+        if self.poisoned {
+            return Err(format!(
+                "{WALLET_SIGN_DEADLINE_MARKER}: session already killed by an earlier deadline; the \
+                 tx was NEVER signed (provably not charged)"
+            ));
+        }
         writeln!(self.stdin, "{request}").map_err(|e| format!("write wallet request: {e}"))?;
         self.stdin.flush().map_err(|e| format!("flush: {e}"))?;
-        let mut line = String::new();
-        let n = self
-            .reader
-            .read_line(&mut line)
-            .map_err(|e| format!("read wallet stdout: {e}"))?;
-        if n == 0 {
-            return Err("wallet-provider exited before answering".to_string());
+        // Bound THIS read with the shared watchdog (S41). The child is persistent — reaped by
+        // `shutdown` on the success path, or by `Drop` on any error path — so arm/disarm per read
+        // is safe: the watchdog only ever kills the still-live child, and a fire poisons the
+        // session so no later leg runs on the corpse. The read is 4MB length-capped by the shared
+        // `read_capsule_line`, so even a firehose wallet is a bounded pre-broadcast error. A
+        // deadline is a PRE-broadcast refusal — see WALLET_SIGN_DEADLINE_MARKER.
+        let deadline = crate::api::capsule_watchdog::capsule_read_deadline();
+        let watchdog =
+            crate::api::capsule_watchdog::DeadlineWatchdog::arm(self.child.id(), deadline);
+        let read = crate::api::capsule_watchdog::read_capsule_line(&mut self.reader);
+        let fired = watchdog.disarm();
+        if fired {
+            // The watchdog killed the child. Poison the session either way: on the common
+            // fired-and-read-Err path AND on the rare fired-but-read-Ok race (a response landed as
+            // the kill fired) — in both the child is now dead, so no later leg may run on it.
+            self.poisoned = true;
+            if let Err(underlying) = &read {
+                return Err(format!(
+                    "{WALLET_SIGN_DEADLINE_MARKER}: no response within {}s — wallet-provider \
+                     killed; the tx was NEVER signed (provably not charged); underlying: \
+                     {underlying}",
+                    deadline.as_secs()
+                ));
+            }
         }
-        let resp: Value =
-            serde_json::from_str(line.trim()).map_err(|e| format!("parse wallet response: {e}"))?;
+        let resp = read?;
         match resp.get("status").and_then(Value::as_str) {
             Some("ok") => Ok(resp.get("data").cloned().unwrap_or(Value::Null)),
             Some("error") => Err(format!(
@@ -224,7 +275,12 @@ impl WalletSession {
     fn shutdown(&mut self) {
         let _ = writeln!(self.stdin, "{}", json!({ "op": "shutdown" }));
         let _ = self.stdin.flush();
-        let _ = self.child.wait();
+        // BOUNDED reap (council S41 guardian F1): a wallet provider that answered every op and
+        // then ignores `shutdown`/EOF must not park the buy/mint thread forever on `wait()` —
+        // after `sign_approved` the signature is in hand but broadcast has NOT been attempted, so
+        // a hang here would strand a Pending reservation indefinitely. `reap_grouped` group-kills
+        // an un-exiting child after a short grace.
+        crate::api::capsule_watchdog::reap_grouped(&mut self.child);
     }
 }
 
@@ -233,5 +289,76 @@ impl Drop for WalletSession {
         // Best-effort: ensure the subprocess is reaped even on the error path.
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sprint 41 ratchet (the MONEY-CRITICAL leg): a HUNG wallet-provider is killed at the
+    /// deadline — `sign_with_managed_account` returns BOUNDED (never parks the buy/mint thread for
+    /// the child's lifetime) and the error carries `WALLET_SIGN_DEADLINE_MARKER`, which the DRM
+    /// classifier reads as a PRE-broadcast refusal ⇒ NotCharged/refund (never a stranded hold).
+    /// This is the live-kill proof the sign leg previously lacked — the string-classification test
+    /// in `drm_marketplace` proved the marker is classified, this proves the marker is actually
+    /// minted by a real hung signer.
+    #[test]
+    #[cfg(unix)]
+    fn a_hung_wallet_provider_is_killed_and_classified_pre_broadcast() {
+        let _g = crate::api::ddrm_env_lock();
+        let prior_deadline = std::env::var("ELASTOS_CHAIN_READ_DEADLINE_SECS").ok();
+        let prior_bin = std::env::var("ELASTOS_WALLET_PROVIDER_BIN").ok();
+        let prior_base = std::env::var("ELASTOS_DDRM_WALLET_BASE").ok();
+        std::env::set_var("ELASTOS_CHAIN_READ_DEADLINE_SECS", "1");
+
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("hung-wallet-provider.sh");
+        std::fs::write(&stub, "#!/bin/sh\nsleep 300\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("ELASTOS_WALLET_PROVIDER_BIN", &stub);
+        std::env::set_var("ELASTOS_DDRM_WALLET_BASE", dir.path().join("store"));
+
+        let started = std::time::Instant::now();
+        let err = sign_with_managed_account(
+            "did:elastos:test-principal",
+            8453,
+            |addr| Ok(json!({ "from": addr })),
+        )
+        .unwrap_err();
+
+        match prior_deadline {
+            Some(v) => std::env::set_var("ELASTOS_CHAIN_READ_DEADLINE_SECS", v),
+            None => std::env::remove_var("ELASTOS_CHAIN_READ_DEADLINE_SECS"),
+        }
+        match prior_bin {
+            Some(v) => std::env::set_var("ELASTOS_WALLET_PROVIDER_BIN", v),
+            None => std::env::remove_var("ELASTOS_WALLET_PROVIDER_BIN"),
+        }
+        match prior_base {
+            Some(v) => std::env::set_var("ELASTOS_DDRM_WALLET_BASE", v),
+            None => std::env::remove_var("ELASTOS_DDRM_WALLET_BASE"),
+        }
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "the SIGN leg is BOUNDED by the deadline, not the child's 300s sleep"
+        );
+        assert!(
+            err.contains(WALLET_SIGN_DEADLINE_MARKER),
+            "the error carries the pre-broadcast refund marker: {err}"
+        );
+        assert!(
+            drm_marketplace_reads_it_as_pre_broadcast(&err),
+            "the DRM classifier reads a hung-signer error as a PRE-broadcast refusal (refund): \
+             {err}"
+        );
+    }
+
+    /// Bridge to the classifier so this ratchet asserts the END-to-end money direction, not just
+    /// the string. Kept a thin wrapper so the intent is legible at the call site.
+    fn drm_marketplace_reads_it_as_pre_broadcast(err: &str) -> bool {
+        crate::drm_marketplace::is_pre_broadcast_refusal_for_test(err)
     }
 }

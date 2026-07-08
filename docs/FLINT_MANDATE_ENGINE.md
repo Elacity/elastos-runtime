@@ -137,7 +137,10 @@ classification, and the signed receipt are byte-identical.
   one replay), and a runtime with no passkey enrolled makes money writes CLI-only — both tracked
   as G-M9.
 - The snapshot files are trusted from `data_dir` (not self-authenticating, unlike the signed
-  chain); the flock/parent-fsync protections are unix-only.
+  chain); the flock/parent-fsync protections are unix-only. Every provider subprocess a
+  money/access path traverses (chain, wallet-sign, rights-decide) is deadline-bounded (S40/S41,
+  one shared watchdog) — no runtime thread parks forever on a hung or hostile provider; the kill
+  is unix-only.
 - DRM-rail residuals are tracked as `MKT-DRM` in `KNOWN_GAPS.md` (the operator-declared spend-unit
   mapping; the confirmation scheduler being opt-in — unset interval ⇒ back to the manual
   reconcile loop).

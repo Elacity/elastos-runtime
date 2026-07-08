@@ -680,6 +680,13 @@ impl DrmReconcileSummary {
     }
 }
 
+/// Test-only bridge so a ratchet in another module (e.g. `wallet_signer`'s hung-signer proof) can
+/// assert the END-to-end money direction of a real error, not just its string shape.
+#[cfg(test)]
+pub(crate) fn is_pre_broadcast_refusal_for_test(err: &str) -> bool {
+    is_pre_broadcast_refusal(err)
+}
+
 /// Whether a `buy_access` error string PROVABLY describes a refusal BEFORE any broadcast — the ONLY
 /// case safe to classify NotCharged (refund the cap). Everything else — including every
 /// post-broadcast RPC error — stays Indeterminate (keep the reservation), because a broadcast may
@@ -717,6 +724,11 @@ fn is_pre_broadcast_refusal(err: &str) -> bool {
         crate::api::buy_authority::ERR_BUY_ABORTED_SUFFIX,
         // operative missing before assembly
         crate::api::buy_authority::ERR_NONE_RESOLVED_SUFFIX,
+        // A wallet-provider SIGN-leg deadline (Sprint 41): the wallet is used ONLY to sign,
+        // strictly BEFORE `broadcast_signed_live`, so a sign timeout PROVES the tx was never
+        // broadcast ⇒ refund. The mirror of the chain send-leg rule (whose CHAIN_DEADLINE_MARKER
+        // is deliberately NOT here — a chain deadline can be a send timeout that may have gone out).
+        crate::api::wallet_signer::WALLET_SIGN_DEADLINE_MARKER,
     ];
     PRE_BROADCAST_SENTINELS.iter().any(|p| err.contains(p))
 }
@@ -1447,5 +1459,28 @@ mod tests {
             )),
             "nor the full deadline error string"
         );
+    }
+
+    /// Sprint 41 ratchet (the money-critical line): a WALLET-SIGN deadline is the MIRROR of the
+    /// chain send-leg rule. The wallet signs strictly BEFORE broadcast, so a sign timeout proves
+    /// the tx never existed ⇒ REFUND (pre-broadcast). Classifying it Indeterminate would strand
+    /// a reservation for a tx that was never signed.
+    #[test]
+    fn a_wallet_sign_deadline_classifies_as_a_pre_broadcast_refund() {
+        let marker = crate::api::wallet_signer::WALLET_SIGN_DEADLINE_MARKER;
+        assert!(
+            is_pre_broadcast_refusal(marker),
+            "a sign-leg timeout is provably pre-broadcast ⇒ refund"
+        );
+        assert!(
+            is_pre_broadcast_refusal(&format!(
+                "{marker}: no response within 30s — wallet-provider killed; the tx was NEVER \
+                 signed (provably not charged)"
+            )),
+            "the full wallet-sign deadline error refunds"
+        );
+        // And it is NOT reachable through the post-broadcast op-failed exclusion (the wallet
+        // never runs post-broadcast, so no op-failed prefix wraps it).
+        assert!(!marker.contains("chain-provider op failed"));
     }
 }
