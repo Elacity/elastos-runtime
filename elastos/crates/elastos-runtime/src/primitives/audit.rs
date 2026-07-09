@@ -3271,7 +3271,7 @@ mod tests {
             monotonic_seq: 7,
         };
         let grant_ev = AuditEvent::CapabilityGrant {
-            timestamp: fixed_ts.clone(),
+            timestamp: fixed_ts,
             token_id: "tok1".into(),
             capsule_id: "vm-a".into(),
             resource: "elastos://pay/v".into(),

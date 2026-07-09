@@ -133,6 +133,11 @@ pub struct PayRail {
     /// Marketplace panel and the agent-facing `runtime.market_quote` affordance, so both ride
     /// the identical single-flight fan-out bound (see `crate::market_quote`).
     pub quote_cache: crate::market_quote::MarketQuoteCache,
+    /// The `runtime.negotiate` seller seam (Sprint 50 — Track D3), present ONLY on rails that have
+    /// a listing to negotiate against (currently the DRM marketplace, whose seller reads live
+    /// listings via the SAME quote spine/cache above). `None` on rails with no listing concept
+    /// (HTTP, ERC-20 caller-specified amounts) ⇒ `runtime.negotiate` stays honestly unwired there.
+    pub negotiator: Option<Arc<dyn crate::negotiation::Negotiator>>,
 }
 
 /// Rail selection, fail-closed (Sprint 29/31; see the serve() doc block for the full rules):
@@ -294,6 +299,19 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
                 let marketplace = Arc::new(crate::drm_marketplace::ChainDrmMarketplace::new(
                     principal, subject, ledger,
                 ));
+                // ONE quote cache, shared same-Arc by the panel, `runtime.market_quote`, AND the
+                // `runtime.negotiate` seller — so the negotiate seller reads listings through the
+                // identical single-flight fan-out bound (Sprint 50 — Track D3).
+                let quote_cache: crate::market_quote::MarketQuoteCache = Arc::default();
+                // The DRM fixed-price seller reuses the buy gate's EXACT spend-unit conversion +
+                // pay-token guard (no second, divergent conversion) — see `ListingNegotiator`.
+                let negotiator: Arc<dyn crate::negotiation::Negotiator> =
+                    Arc::new(crate::negotiation::ListingNegotiator::new(
+                        quote_cache.clone(),
+                        Arc::new(crate::market_quote::LiveMarketQuoter),
+                        spend_unit,
+                        expected_pay_token.clone(),
+                    ));
                 Some(PayRail {
                     meter,
                     provider: Arc::new(crate::drm_marketplace::DrmMarketplaceProvider::new(
@@ -304,7 +322,8 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
                     )),
                     ledger: payment_ledger,
                     drm_confirmer: Some(marketplace),
-                    quote_cache: Arc::default(),
+                    quote_cache,
+                    negotiator: Some(negotiator),
                 })
             }
             _ => {
@@ -430,6 +449,9 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
                     ledger: payment_ledger,
                     drm_confirmer: Some(provider),
                     quote_cache: Arc::default(),
+                    // ERC-20 checkout settles a caller-specified amount — there is no listing to
+                    // negotiate against, so `runtime.negotiate` stays honestly unwired on this rail.
+                    negotiator: None,
                 })
             }
             _ => {
@@ -510,6 +532,9 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
                     ledger,
                     drm_confirmer: None,
                     quote_cache: Arc::default(),
+                    // The generic HTTP rail pays an arbitrary payee — no listing seller ⇒
+                    // `runtime.negotiate` stays honestly unwired.
+                    negotiator: None,
                 })
             }
             (true, _, _) => {
@@ -554,6 +579,8 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
                 ledger,
                 drm_confirmer: None,
                 quote_cache: Arc::default(),
+                // The mock rail settles synthetically — no listing seller ⇒ negotiate unwired.
+                negotiator: None,
             }
         });
     }
@@ -823,19 +850,27 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
                 data_dir.clone(),
             );
             match &pay_rail {
-                Some(rail) => Arc::new(
-                    base.with_payments(
-                        rail.meter.clone(),
-                        rail.provider.clone(),
-                        rail.ledger.clone(),
-                    )
-                    // Sprint 39: the agent-facing quote affordance rides the SAME cache Arc the
-                    // Marketplace panel reads — one quote spine, one fan-out bound.
-                    .with_market_quotes(
-                        rail.quote_cache.clone(),
-                        Arc::new(crate::market_quote::LiveMarketQuoter),
-                    ),
-                ),
+                Some(rail) => {
+                    let mut exec = base
+                        .with_payments(
+                            rail.meter.clone(),
+                            rail.provider.clone(),
+                            rail.ledger.clone(),
+                        )
+                        // Sprint 39: the agent-facing quote affordance rides the SAME cache Arc the
+                        // Marketplace panel reads — one quote spine, one fan-out bound.
+                        .with_market_quotes(
+                            rail.quote_cache.clone(),
+                            Arc::new(crate::market_quote::LiveMarketQuoter),
+                        );
+                    // Sprint 50: `runtime.negotiate` is wired ONLY where the rail has a listing
+                    // seller (the DRM marketplace). The mandate-ceiling check shares the SAME meter
+                    // the pay gate reserves against, so an offer and a buy see one cap.
+                    if let Some(negotiator) = &rail.negotiator {
+                        exec = exec.with_negotiation(rail.meter.clone(), negotiator.clone());
+                    }
+                    Arc::new(exec)
+                }
                 None => Arc::new(base),
             }
         },

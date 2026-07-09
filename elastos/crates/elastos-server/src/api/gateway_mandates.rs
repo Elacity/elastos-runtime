@@ -1619,6 +1619,7 @@ mod tests {
                 ledger: ledger.clone(),
                 drm_confirmer: None,
                 quote_cache: Arc::default(),
+                negotiator: None,
             }),
             spent_fresh_money_tokens: Arc::default(),
             marketplace_quote_cache: Arc::default(),
@@ -1740,6 +1741,7 @@ mod tests {
                 ledger: Arc::new(crate::payment_ledger::PaymentLedger::new()),
                 drm_confirmer: None,
                 quote_cache: Arc::default(),
+                negotiator: None,
             }),
             spent_fresh_money_tokens: Arc::default(),
             marketplace_quote_cache: Arc::default(),
@@ -1835,6 +1837,7 @@ mod tests {
                 ledger: Arc::new(crate::payment_ledger::PaymentLedger::new()),
                 drm_confirmer: None,
                 quote_cache: Arc::default(),
+                negotiator: None,
             }),
             spent_fresh_money_tokens: Arc::default(),
             marketplace_quote_cache: Arc::default(),
@@ -1915,6 +1918,7 @@ mod tests {
                 ledger: ledger.clone(),
                 drm_confirmer: None,
                 quote_cache: Arc::default(),
+                negotiator: None,
             }),
             spent_fresh_money_tokens: Arc::default(),
             marketplace_quote_cache: Arc::default(),
@@ -2084,6 +2088,7 @@ mod tests {
                 ledger: Arc::new(crate::payment_ledger::PaymentLedger::new()),
                 drm_confirmer: None,
                 quote_cache: Arc::default(),
+                negotiator: None,
             }),
             spent_fresh_money_tokens: Arc::default(),
             marketplace_quote_cache: Arc::default(),
@@ -2157,6 +2162,7 @@ mod tests {
                 ledger: Arc::new(crate::payment_ledger::PaymentLedger::new()),
                 drm_confirmer: None,
                 quote_cache: Arc::default(),
+                negotiator: None,
             }),
             spent_fresh_money_tokens: Arc::default(),
             marketplace_quote_cache: Arc::default(),
@@ -2289,6 +2295,7 @@ mod tests {
             ledger: ledger.clone(),
             drm_confirmer: None,
             quote_cache: Arc::default(),
+            negotiator: None,
         });
 
         // A pay-mandate for asset QmMovie…
@@ -2439,6 +2446,7 @@ mod tests {
             ledger: Arc::new(PaymentLedger::new()),
             drm_confirmer: None,
             quote_cache: Arc::default(),
+            negotiator: None,
         });
         // MARKET_MAX_QUOTED_ASSETS + 2 assets, each behind an active pay-mandate.
         for i in 0..(MARKET_MAX_QUOTED_ASSETS + 2) {
@@ -2529,6 +2537,7 @@ mod tests {
             ledger: ledger.clone(),
             drm_confirmer: None,
             quote_cache: Arc::default(),
+            negotiator: None,
         });
 
         // The OLDEST entry is a live pending obligation…

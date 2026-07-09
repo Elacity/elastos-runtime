@@ -865,6 +865,175 @@ impl MethodRegistryExecutor {
         self
     }
 
+    /// Register `runtime.negotiate` (Sprint 50 — Track D3) — the SHOP loop's middle leg: an agent
+    /// makes a BOUNDED OFFER for exactly the asset its pay-mandate scopes, and the injected
+    /// [`Negotiator`](crate::negotiation::Negotiator) seller answers accept / counter / reject.
+    ///
+    /// THE PROVABLE PROPERTY this leg adds: the offer is a canonical positive integer of SPEND
+    /// UNITS, and an offer above the mandate's UN-SPENT cap (`SpendMeter::remaining`) is refused
+    /// BEFORE it reaches the seller — an agent can never PROPOSE to commit its operator beyond the
+    /// granted, un-spent authority. The offer rides the signed `input_hash`, so the receipt attests
+    /// exactly what was offered, and that it was within cap.
+    ///
+    /// NOT VALUE-MOVING BY CONSTRUCTION: negotiate READS `remaining` but never reserves, debits, or
+    /// touches the ledger — no money can move here (no broadcast, no reservation), so the
+    /// two-generals problem does not arise. Settlement stays `runtime.pay`, which re-checks the cap
+    /// and runs the full custody path. The seller's accept-vs-counter answer and its price are
+    /// EPHEMERAL market data on the response's disclosure channel — the receipt records the ACT (the
+    /// bounded offer), NOT the counterparty's disposition, which the runtime cannot verify.
+    ///
+    /// A READ-AUTHORITY probe, exactly like `runtime.market_quote`: negotiate performs no write and
+    /// moves no money, so it reconciles action `read` and takes a `read` mandate on the SAME pay
+    /// resource the `execute` pay-mandate scopes (the dispatch gate only speaks the fixed `Action`
+    /// enum — read/write/execute/message/delete/admin — so a made-up `negotiate` action could never
+    /// be authorized by any token; the receipt reads as a read of the pay resource, the method_id
+    /// `runtime.negotiate` distinguishing it in the dispatch record). The OFFER, not the action, is
+    /// what makes it a proposal — and the offer is on the signed `input_hash`.
+    ///
+    /// Reconciliation: a seller that returns terms (accept OR counter) is `Performed` echoing the
+    /// OFFER (declared == done ⇒ Matched; the receipt names an offer of exactly N). A rejection or a
+    /// seam error DECLINES (⇒ `authorized_not_performed`) — an agreement is `performed` only when
+    /// the seller actually returned terms, the same rule `runtime.market_quote` holds a read to.
+    pub fn with_negotiation(
+        mut self,
+        meter: Arc<elastos_runtime::primitives::spend::SpendMeter>,
+        negotiator: Arc<dyn crate::negotiation::Negotiator>,
+    ) -> Self {
+        // Bound on CONCURRENT in-flight negotiations (same wedge class as MAX_INFLIGHT_QUOTES): the
+        // listing seller's read blocks its dispatch thread for up to the S40 chain-read deadline,
+        // and single-flight only dedups the SAME asset — K distinct assets against a slow RPC would
+        // otherwise park K blocking threads. Over the bound: refuse with retry, never queue.
+        const MAX_INFLIGHT_NEGOTIATIONS: usize = 8;
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        self.register(
+            "runtime.negotiate",
+            Arc::new(move |intent: &IntentDeclarationV1| {
+                // Scoped to the SAME pay namespace as quote/buy — the envelope gate confines
+                // negotiation to the assets the operator granted; the asset is the suffix.
+                let Some(asset) = intent.resource.strip_prefix(PAY_PREFIX) else {
+                    return IntentExecution::Declined {
+                        reason: format!("negotiate resource must be {PAY_PREFIX}<asset>"),
+                    };
+                };
+                if !valid_slug_1_64(asset) {
+                    return IntentExecution::Declined {
+                        reason: "negotiate asset must be 1-64 chars of [A-Za-z0-9._-]".to_string(),
+                    };
+                }
+                // The OFFER rides the signed `input_hash` as a canonical positive decimal of spend
+                // units — the SAME shape and canonical-form discipline `runtime.pay`'s amount uses,
+                // so a Performed offer reconciles Matched (a non-canonical "0200"/"+5"/" 5" would
+                // echo "200"/"5" and Diverge, recording an offer the agent did not sign).
+                let offer: u64 = match intent.input_hash.parse() {
+                    Ok(n) if n > 0 => n,
+                    _ => {
+                        return IntentExecution::Declined {
+                            reason: "negotiate offer (input_hash) must be a positive integer of \
+                                     spend units"
+                                .to_string(),
+                        };
+                    }
+                };
+                if offer.to_string() != intent.input_hash {
+                    return IntentExecution::Declined {
+                        reason: "negotiate offer must be a canonical decimal (no leading zero, \
+                                 sign, or space)"
+                            .to_string(),
+                    };
+                }
+                // THE MANDATE CEILING (the provable property): the offer must fit within the
+                // mandate's UN-SPENT cap. `remaining` is 0 for an unprovisioned capsule, so an
+                // unprovisioned agent cannot offer anything — fail-closed, exactly as the buy's
+                // `try_debit` refuses. This is a READ only: no reservation, no debit, no money move.
+                let remaining = meter.remaining(&intent.capsule);
+                if offer > remaining {
+                    return IntentExecution::Declined {
+                        reason: format!(
+                            "negotiate refused: offer {offer} exceeds the mandate's un-spent cap \
+                             ({remaining} spend units) — an agent may not propose to commit its \
+                             operator beyond granted authority; raise the cap or lower the offer"
+                        ),
+                    };
+                }
+                // Concurrency gate BEFORE the seller call; the RAII guard releases the slot on EVERY
+                // exit path (including the over-bound refusal below and a seller panic).
+                struct NegotiateSlot(Arc<std::sync::atomic::AtomicUsize>);
+                impl Drop for NegotiateSlot {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                let prior = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _slot = NegotiateSlot(in_flight.clone());
+                if prior >= MAX_INFLIGHT_NEGOTIATIONS {
+                    return IntentExecution::Declined {
+                        reason: format!(
+                            "negotiate refused: {MAX_INFLIGHT_NEGOTIATIONS} negotiations already \
+                             in-flight (fail-closed concurrency bound; retry shortly)"
+                        ),
+                    };
+                }
+                // Relay the offer to the seller (isolated from a seller panic — a hostile/buggy
+                // seam must not take down the dispatch worker; a panic reads as no agreement).
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    negotiator.negotiate(asset, offer)
+                }));
+                let outcome = match outcome {
+                    Ok(o) => o,
+                    Err(_panic) => {
+                        return IntentExecution::Declined {
+                            reason:
+                                "negotiate seller panicked — no agreement (nothing was offered \
+                                     or committed; negotiate never moves money)"
+                                    .to_string(),
+                        };
+                    }
+                };
+                match outcome.agent_report() {
+                    // Accept or counter: the negotiation PERFORMED, echoing the OFFER (declared ==
+                    // done ⇒ Matched). Hold the seller-sourced report to the SAME bound the agent's
+                    // own fields face before it rides a signed-adjacent response (council-parity
+                    // with the quote echo): out-of-bound terms mean a broken/hostile seller ⇒ no
+                    // agreement, never a fabricated match.
+                    Some(report)
+                        if report.len() <= 200 && report.chars().all(|c| c.is_ascii_graphic()) =>
+                    {
+                        IntentExecution::Performed {
+                            capsule: intent.capsule.clone(),
+                            method_id: intent.method_id.clone(),
+                            input_hash: offer.to_string(),
+                            resource: intent.resource.clone(),
+                            // A read-authority probe (like market_quote): negotiate writes nothing
+                            // and moves no money, so it reconciles `read` — the ONLY actions the
+                            // dispatch gate can authorize are the fixed Action enum, and the OFFER
+                            // (on input_hash), not the action, is what makes this a proposal.
+                            action: "read".to_string(),
+                            rail_ref: None,
+                            // The seller's terms are the agent's whole reason to negotiate — an
+                            // EXPLICIT disclosure (public market data, like a quote), not a secret.
+                            agent_visible_report: Some(report),
+                        }
+                    }
+                    Some(_) => IntentExecution::Declined {
+                        reason: "negotiate refused: the seller returned malformed terms (out of \
+                                 bound)"
+                            .to_string(),
+                    },
+                    // A rejection (or a seam that declines to name terms) ⇒ no agreement reached.
+                    None => IntentExecution::Declined {
+                        reason: match outcome {
+                            crate::negotiation::NegotiationOutcome::Rejected(why) => {
+                                format!("negotiation rejected by the seller: {why}")
+                            }
+                            _ => "negotiation reached no agreement".to_string(),
+                        },
+                    },
+                }
+            }),
+        );
+        self
+    }
+
     pub fn with_payments(
         mut self,
         meter: Arc<elastos_runtime::primitives::spend::SpendMeter>,
@@ -2555,6 +2724,326 @@ mod tests {
         match exec.execute(&quote_intent("Qm-after", "")) {
             IntentExecution::Performed { .. } => {}
             other => panic!("released slots must admit again, got {other:?}"),
+        }
+    }
+
+    // ─────────────────────── runtime.negotiate (Sprint 50 — Track D3) ───────────────────────
+
+    use crate::negotiation::{NegotiationOutcome, Negotiator};
+
+    /// A seller that returns a scripted outcome and COUNTS how many times it was called — so a test
+    /// can prove the runtime refused an over-cap offer BEFORE the seller ever saw it.
+    struct CountingNegotiator {
+        outcome: std::sync::Mutex<NegotiationOutcome>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl CountingNegotiator {
+        fn new(outcome: NegotiationOutcome) -> Arc<Self> {
+            Arc::new(Self {
+                outcome: std::sync::Mutex::new(outcome),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    impl Negotiator for CountingNegotiator {
+        fn negotiate(&self, _asset: &str, _offer: u64) -> NegotiationOutcome {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.outcome.lock().unwrap().clone()
+        }
+    }
+
+    fn accepted() -> NegotiationOutcome {
+        NegotiationOutcome::Accepted {
+            price: "3000000".to_string(),
+            pay_token: "0xUSDC".to_string(),
+        }
+    }
+
+    /// A negotiate intent: `capsule` is the budget key, `offer` the signed input_hash, and the
+    /// resource is the pay-scoped asset (the mandate boundary the envelope gate enforces).
+    fn negotiate_intent(capsule: &str, asset: &str, offer: &str) -> IntentDeclarationV1 {
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        IntentDeclarationV1::issue(
+            &sk,
+            sk.verifying_key().to_bytes(),
+            "negotiate-intent-1",
+            capsule,
+            "runtime.negotiate",
+            offer,
+            &format!("{PAY_PREFIX}{asset}"),
+            // Read-authority: the dispatch gate only authorizes the fixed Action enum, and negotiate
+            // is a non-value-moving probe — it takes a `read` mandate on the pay resource (like
+            // market_quote). A made-up `negotiate` action would be denied at the gate.
+            "read",
+            "grant-1",
+        )
+    }
+
+    /// A budgeted meter + a counting seller wired into a negotiate registry.
+    fn negotiate_setup(
+        budget: u64,
+        outcome: NegotiationOutcome,
+    ) -> (
+        MethodRegistryExecutor,
+        Arc<SpendMeter>,
+        Arc<CountingNegotiator>,
+    ) {
+        let meter = Arc::new(SpendMeter::new());
+        meter.set_budget("vm-shopper", budget).unwrap();
+        let seller = CountingNegotiator::new(outcome);
+        let exec = MethodRegistryExecutor::new().with_negotiation(meter.clone(), seller.clone());
+        (exec, meter, seller)
+    }
+
+    /// An accepted offer within the cap PERFORMS: it echoes the OFFER (declared == done ⇒ Matched,
+    /// so the receipt attests the agent offered exactly N), tags `action=negotiate`, settles no rail
+    /// (`rail_ref` none), and discloses the seller's terms on the explicit channel.
+    #[test]
+    fn negotiate_accept_performs_echoing_the_offer_and_discloses_terms() {
+        let (exec, meter, seller) = negotiate_setup(500, accepted());
+        match exec.execute(&negotiate_intent("vm-shopper", "QmMovie", "5")) {
+            IntentExecution::Performed {
+                input_hash,
+                action,
+                rail_ref,
+                agent_visible_report,
+                ..
+            } => {
+                assert_eq!(
+                    input_hash, "5",
+                    "the receipt attests the exact offer — Matched"
+                );
+                assert_eq!(
+                    action, "read",
+                    "a non-value-moving probe reconciles read (the gate authorizes only the fixed \
+                     Action enum) — the OFFER on input_hash is what makes it a proposal"
+                );
+                assert!(
+                    rail_ref.is_none(),
+                    "negotiate settles nothing — no rail_ref"
+                );
+                assert_eq!(
+                    agent_visible_report.as_deref(),
+                    Some("outcome=accept;price=3000000;tok=0xUSDC"),
+                    "the seller's terms travel via the explicit disclosure channel"
+                );
+            }
+            other => panic!("expected Performed, got {other:?}"),
+        }
+        assert_eq!(seller.calls(), 1, "the seller saw exactly one in-cap offer");
+        // NON-VALUE-MOVING: negotiate only READS the cap — the balance is untouched.
+        assert_eq!(
+            meter.remaining("vm-shopper"),
+            500,
+            "negotiate debits nothing — settlement stays runtime.pay"
+        );
+    }
+
+    /// RATCHET (the S50 pre-council bug): a faithful negotiate must reconcile Matched through the
+    /// REAL `reconcile`, which means the executor's returned `action` must EQUAL the declared action
+    /// AND be one the dispatch gate can authorize — the gate only speaks the fixed `Action` enum, so
+    /// a made-up `negotiate` action could never be granted by any token (the affordance would be
+    /// dead at the gate). This pins the returned action to a gate-legal, declaration-matching value.
+    #[test]
+    fn a_faithful_negotiate_returns_a_gate_legal_action_that_reconciles_matched() {
+        const GATE_ACTIONS: [&str; 6] = ["read", "write", "execute", "message", "delete", "admin"];
+        let (exec, _meter, _seller) = negotiate_setup(500, accepted());
+        let intent = negotiate_intent("vm-shopper", "QmMovie", "5");
+        match exec.execute(&intent) {
+            IntentExecution::Performed { action, .. } => {
+                assert!(
+                    GATE_ACTIONS.contains(&action.as_str()),
+                    "the returned action {action:?} must be a gate-authorizable Action enum value \
+                     — else no token could ever authorize a negotiate dispatch"
+                );
+                assert_eq!(
+                    action, intent.action,
+                    "declared == done on the action ⇒ reconciles Matched, never Diverged"
+                );
+            }
+            other => panic!("expected Performed, got {other:?}"),
+        }
+    }
+
+    /// A counter PERFORMS too (the agent got actionable terms) — the report names the counter.
+    #[test]
+    fn negotiate_counter_performs_and_discloses_the_counter() {
+        let (exec, _meter, _seller) = negotiate_setup(
+            500,
+            NegotiationOutcome::Countered {
+                price: "8000000".to_string(),
+                pay_token: "0xUSDC".to_string(),
+            },
+        );
+        match exec.execute(&negotiate_intent("vm-shopper", "QmMovie", "5")) {
+            IntentExecution::Performed {
+                agent_visible_report,
+                ..
+            } => assert_eq!(
+                agent_visible_report.as_deref(),
+                Some("outcome=counter;price=8000000;tok=0xUSDC")
+            ),
+            other => panic!("expected Performed, got {other:?}"),
+        }
+    }
+
+    /// A rejection reaches no agreement ⇒ DECLINES (authorized_not_performed) with the seller's
+    /// bounded reason — an agreement is "performed" only when the seller returned terms.
+    #[test]
+    fn negotiate_rejection_declines_with_the_reason() {
+        let (exec, _meter, _seller) =
+            negotiate_setup(500, NegotiationOutcome::Rejected("sold out".to_string()));
+        match exec.execute(&negotiate_intent("vm-shopper", "QmMovie", "5")) {
+            IntentExecution::Declined { reason } => {
+                assert!(reason.contains("rejected"), "honest reason: {reason}");
+                assert!(
+                    reason.contains("sold out"),
+                    "carries the seller's why: {reason}"
+                );
+            }
+            other => panic!("expected Declined, got {other:?}"),
+        }
+    }
+
+    /// THE PROVABLE PROPERTY: an offer above the mandate's un-spent cap is refused BEFORE the seller
+    /// ever sees it — an agent may not propose to commit its operator beyond granted authority.
+    #[test]
+    fn an_over_cap_offer_is_refused_before_the_seller() {
+        let (exec, meter, seller) = negotiate_setup(4, accepted());
+        match exec.execute(&negotiate_intent("vm-shopper", "QmMovie", "5")) {
+            IntentExecution::Declined { reason } => {
+                assert!(
+                    reason.contains("exceeds") && reason.contains("un-spent cap"),
+                    "refused by the ceiling: {reason}"
+                );
+            }
+            other => panic!("expected the cap ceiling to refuse, got {other:?}"),
+        }
+        assert_eq!(
+            seller.calls(),
+            0,
+            "an over-cap offer NEVER reaches the seller — the commitment is bounded at the runtime"
+        );
+        assert_eq!(meter.remaining("vm-shopper"), 4, "nothing was reserved");
+    }
+
+    /// An exactly-at-cap offer is allowed (the ceiling is inclusive), proving the boundary is off
+    /// by nothing.
+    #[test]
+    fn an_offer_exactly_at_the_cap_is_allowed() {
+        let (exec, _meter, seller) = negotiate_setup(5, accepted());
+        assert!(matches!(
+            exec.execute(&negotiate_intent("vm-shopper", "QmMovie", "5")),
+            IntentExecution::Performed { .. }
+        ));
+        assert_eq!(seller.calls(), 1);
+    }
+
+    /// An unprovisioned capsule has remaining == 0, so it cannot offer anything — fail-closed,
+    /// exactly as the buy's reservation refuses an unprovisioned capsule.
+    #[test]
+    fn an_unprovisioned_capsule_cannot_offer_anything() {
+        let (exec, _meter, seller) = negotiate_setup(500, accepted());
+        // "vm-stranger" was never provisioned.
+        match exec.execute(&negotiate_intent("vm-stranger", "QmMovie", "1")) {
+            IntentExecution::Declined { reason } => {
+                assert!(reason.contains("un-spent cap"), "reason: {reason}")
+            }
+            other => panic!("expected Declined, got {other:?}"),
+        }
+        assert_eq!(
+            seller.calls(),
+            0,
+            "an unprovisioned agent never reaches the seller"
+        );
+    }
+
+    /// The offer must be a CANONICAL positive integer of spend units — the same discipline the pay
+    /// amount is held to, so a Performed offer reconciles Matched (never Diverges on the echo).
+    #[test]
+    fn negotiate_offer_must_be_a_canonical_positive_integer() {
+        let (exec, _meter, seller) = negotiate_setup(500, accepted());
+        for bad in ["0", "abc", "0200", "+5", " 5", "5 ", "-1", ""] {
+            match exec.execute(&negotiate_intent("vm-shopper", "QmMovie", bad)) {
+                IntentExecution::Declined { .. } => {}
+                other => panic!("offer {bad:?} must decline, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            seller.calls(),
+            0,
+            "a malformed offer never reaches the seller"
+        );
+    }
+
+    /// The pay namespace is the boundary: a non-pay resource declines before any seller call.
+    #[test]
+    fn negotiate_outside_the_pay_namespace_declines() {
+        let (exec, _meter, seller) = negotiate_setup(500, accepted());
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let outside = IntentDeclarationV1::issue(
+            &sk,
+            sk.verifying_key().to_bytes(),
+            "negotiate-intent-2",
+            "vm-shopper",
+            "runtime.negotiate",
+            "5",
+            "elastos://runtime/state/secret-key",
+            "read",
+            "grant-1",
+        );
+        match exec.execute(&outside) {
+            IntentExecution::Declined { reason } => {
+                assert!(reason.contains("resource must be"), "reason: {reason}")
+            }
+            other => panic!("expected Declined, got {other:?}"),
+        }
+        assert_eq!(seller.calls(), 0);
+    }
+
+    /// A seller PANIC is caught and reads as no agreement — a hostile/buggy seam cannot take down
+    /// the dispatch worker, and (negotiate moving no money) nothing is left in a bad state.
+    #[test]
+    fn a_seller_panic_is_no_agreement() {
+        struct PanicSeller;
+        impl Negotiator for PanicSeller {
+            fn negotiate(&self, _: &str, _: u64) -> NegotiationOutcome {
+                panic!("hostile seller");
+            }
+        }
+        let meter = Arc::new(SpendMeter::new());
+        meter.set_budget("vm-shopper", 500).unwrap();
+        let exec =
+            MethodRegistryExecutor::new().with_negotiation(meter.clone(), Arc::new(PanicSeller));
+        match exec.execute(&negotiate_intent("vm-shopper", "QmMovie", "5")) {
+            IntentExecution::Declined { reason } => {
+                assert!(reason.contains("panicked"), "reason: {reason}")
+            }
+            other => panic!("expected Declined on seller panic, got {other:?}"),
+        }
+        assert_eq!(meter.remaining("vm-shopper"), 500, "a panic moved no money");
+    }
+
+    /// Malformed seller terms (out of bound) reconcile as no agreement, never a fabricated match —
+    /// the seller-sourced report is held to the SAME bound the agent's own fields are.
+    #[test]
+    fn out_of_bound_seller_terms_reach_no_agreement() {
+        let huge = "x".repeat(300);
+        let (exec, _meter, _seller) = negotiate_setup(
+            500,
+            NegotiationOutcome::Accepted {
+                price: huge,
+                pay_token: "0xUSDC".to_string(),
+            },
+        );
+        match exec.execute(&negotiate_intent("vm-shopper", "QmMovie", "5")) {
+            IntentExecution::Declined { reason } => {
+                assert!(reason.contains("malformed terms"), "reason: {reason}")
+            }
+            other => panic!("expected Declined on out-of-bound terms, got {other:?}"),
         }
     }
 }
