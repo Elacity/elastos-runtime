@@ -3512,6 +3512,9 @@ mod tests {
         assert_eq!(meter.remaining("vm-shopper"), 200, "the reservation is held (not refunded)");
         let rec = ledger.get(&idem).expect("a pending rail record exists");
         assert_eq!(rec.status, crate::payment_ledger::PaymentStatus::Pending);
+        // Sprint 44: the production pay closure stamps the DRM rail tag end-to-end (through
+        // `provider.rail()`), so the reconciler selects this by tag, not by the note.
+        assert_eq!(rec.rail, crate::payment_ledger::PaymentRail::Drm);
         assert_eq!(rec.rail_note, "drm:tx=0xC0FFEE;op=0xopER;tid=42;price=0;tok=usdc");
         assert_eq!(rec.token_id.as_deref(), Some(token_id.as_str()), "bound to the mandate");
 
@@ -4010,6 +4013,9 @@ mod tests {
     async fn indeterminate_payment_is_reconciled_against_the_rail() {
         struct IndeterminateRail;
         impl crate::intent_executor::PaymentProvider for IndeterminateRail {
+            fn rail(&self) -> crate::payment_ledger::PaymentRail {
+                crate::payment_ledger::PaymentRail::Unknown
+            }
             fn pay(
                 &self,
                 _payee: &str,

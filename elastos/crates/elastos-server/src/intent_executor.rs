@@ -152,6 +152,16 @@ pub enum PayError {
 /// replay window) — a rail-side dedupe key so retries/reconciliation can never double-move money.
 pub trait PaymentProvider: Send + Sync {
     fn pay(&self, payee: &str, amount: u64, idempotency_key: &str) -> Result<String, PayError>;
+
+    /// Which ledger rail this provider's payments belong to (Sprint 44). Stamped onto the
+    /// `PaymentRecord` at `begin_attempt` so a rail-specific reconciler (e.g. the DRM confirmation
+    /// driver) selects its records by this STRUCTURED tag, not by sniffing the rail-controlled
+    /// `rail_note`. REQUIRED (no default — council S44 guardian F2 / red-team F1): every provider
+    /// MUST declare its rail so "a hostile HTTP endpoint's crafted `drm:tx=` note can never get its
+    /// pending DRM-resolved" is a COMPILE-TIME property, not a comment (the S43 type-over-comment
+    /// lesson). Return [`Unknown`](crate::payment_ledger::PaymentRail::Unknown) only for a provider
+    /// whose pendings are never reconciled by a rail-specific driver.
+    fn rail(&self) -> crate::payment_ledger::PaymentRail;
 }
 
 /// A test/demo payment sink: records every payment and always succeeds, returning a deterministic
@@ -163,6 +173,12 @@ pub struct MockPaymentProvider {
 }
 
 impl PaymentProvider for MockPaymentProvider {
+    fn rail(&self) -> crate::payment_ledger::PaymentRail {
+        // A test/demo sink that always succeeds (never records a Pending) — no rail-specific
+        // reconciler ever polls its records, so Unknown is correct.
+        crate::payment_ledger::PaymentRail::Unknown
+    }
+
     fn pay(&self, payee: &str, amount: u64, _idempotency_key: &str) -> Result<String, PayError> {
         let mut log = match self.payments.lock() {
             Ok(l) => l,
@@ -223,6 +239,12 @@ impl HttpPaymentProvider {
 }
 
 impl PaymentProvider for HttpPaymentProvider {
+    fn rail(&self) -> crate::payment_ledger::PaymentRail {
+        // Positively tag HTTP-rail pendings so the DRM reconciler NEVER polls them — even one whose
+        // Indeterminate body a hostile endpoint crafted to begin `drm:tx=` (council S35 RT-F5).
+        crate::payment_ledger::PaymentRail::Http
+    }
+
     fn pay(&self, payee: &str, amount: u64, idempotency_key: &str) -> Result<String, PayError> {
         let endpoint = self.endpoint.clone();
         let token = self.bearer_token.clone();
@@ -953,12 +975,15 @@ impl MethodRegistryExecutor {
                 // this key is refused idempotently (its reservation is the live one; this one's is
                 // refunded).
                 use crate::payment_ledger::{BeginAttempt, PaymentStatus};
-                match ledger.begin_attempt(
+                match ledger.begin_attempt_on_rail(
                     &idempotency_key,
                     &intent.capsule,
                     payee,
                     amount,
                     Some(intent.standing_grant_id.as_str()),
+                    // Stamp the paying rail so the DRM reconciler selects its pendings by tag, not
+                    // by the rail-controlled note (Sprint 44 / MKT-DRM 2d).
+                    provider.rail(),
                 ) {
                     BeginAttempt::Started => {}
                     BeginAttempt::AlreadyActive(status) => {
@@ -1538,6 +1563,9 @@ mod tests {
     /// exactly (and only) on that classification.
     struct FailingProvider;
     impl PaymentProvider for FailingProvider {
+        fn rail(&self) -> crate::payment_ledger::PaymentRail {
+            crate::payment_ledger::PaymentRail::Unknown
+        }
         fn pay(&self, _payee: &str, _amount: u64, _key: &str) -> Result<String, PayError> {
             Err(PayError::NotCharged("rail unavailable".to_string()))
         }
@@ -1642,6 +1670,9 @@ mod tests {
     fn pay_rail_panic_keeps_the_reservation_as_indeterminate() {
         struct PanickingProvider;
         impl PaymentProvider for PanickingProvider {
+            fn rail(&self) -> crate::payment_ledger::PaymentRail {
+                crate::payment_ledger::PaymentRail::Unknown
+            }
             fn pay(&self, _payee: &str, _amount: u64, _key: &str) -> Result<String, PayError> {
                 panic!("rail exploded mid-charge")
             }
@@ -1672,6 +1703,9 @@ mod tests {
     fn pay_indeterminate_outcome_keeps_the_reservation() {
         struct IndeterminateProvider;
         impl PaymentProvider for IndeterminateProvider {
+            fn rail(&self) -> crate::payment_ledger::PaymentRail {
+                crate::payment_ledger::PaymentRail::Unknown
+            }
             fn pay(&self, _payee: &str, _amount: u64, _key: &str) -> Result<String, PayError> {
                 Err(PayError::Indeterminate("timeout after send".to_string()))
             }
@@ -1806,6 +1840,9 @@ mod tests {
             rx: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
         }
         impl PaymentProvider for BlockingProvider {
+            fn rail(&self) -> crate::payment_ledger::PaymentRail {
+                crate::payment_ledger::PaymentRail::Unknown
+            }
             fn pay(&self, _payee: &str, _amount: u64, _key: &str) -> Result<String, PayError> {
                 self.entered
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1871,6 +1908,9 @@ mod tests {
         #[derive(Default)]
         struct KeyRecordingProvider(std::sync::Mutex<Vec<String>>);
         impl PaymentProvider for KeyRecordingProvider {
+            fn rail(&self) -> crate::payment_ledger::PaymentRail {
+                crate::payment_ledger::PaymentRail::Unknown
+            }
             fn pay(&self, _payee: &str, _amount: u64, key: &str) -> Result<String, PayError> {
                 self.0.lock().unwrap().push(key.to_string());
                 Ok("ok".to_string())
@@ -1900,6 +1940,9 @@ mod tests {
     fn pay_rail_failure_with_unpersistable_refund_is_recorded_honestly() {
         struct DirDestroyingFailingProvider(std::path::PathBuf);
         impl PaymentProvider for DirDestroyingFailingProvider {
+            fn rail(&self) -> crate::payment_ledger::PaymentRail {
+                crate::payment_ledger::PaymentRail::Unknown
+            }
             fn pay(&self, _payee: &str, _amount: u64, _key: &str) -> Result<String, PayError> {
                 std::fs::remove_dir_all(&self.0).expect("kill the meter's persist target");
                 Err(PayError::NotCharged("rail unavailable".to_string()))

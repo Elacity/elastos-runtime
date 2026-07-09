@@ -187,6 +187,13 @@ impl DrmMarketplaceProvider {
 }
 
 impl PaymentProvider for DrmMarketplaceProvider {
+    fn rail(&self) -> crate::payment_ledger::PaymentRail {
+        // Positively tag DRM pendings so `reconcile_drm_confirmations` selects them by this
+        // structured discriminator, not by a `drm:tx=` note prefix a hostile HTTP endpoint could
+        // forge (council S35 red-team F5 / MKT-DRM 2d).
+        crate::payment_ledger::PaymentRail::Drm
+    }
+
     fn pay(&self, payee: &str, amount: u64, idempotency_key: &str) -> Result<String, PayError> {
         // Resolve first — fail-closed. An unresolvable or ambiguous asset never broadcasts, so it
         // is NotCharged (the cap is refunded), never a fallback buy.
@@ -299,6 +306,20 @@ pub trait DrmConfirmer: Send + Sync {
 /// the reconciler skips it).
 pub(crate) fn parse_drm_tx(rail_note: &str) -> Option<&str> {
     rail_note.strip_prefix("drm:tx=")?.split(';').next()
+}
+
+/// Whether a pending record is a DRM pending the confirmation reconciler owns (Sprint 44). A
+/// positively-tagged [`PaymentRail::Drm`](crate::payment_ledger::PaymentRail) record IS ours; a
+/// tagged `Http` (or any non-`Drm`, non-`Unknown`) record is NEVER ours regardless of its note; an
+/// `Unknown` (pre-S44/untagged) record falls back to the `drm:tx=` note heuristic (the bounded
+/// legacy path — see [`reconcile_drm_confirmations`]).
+fn is_drm_pending(record: &crate::payment_ledger::PaymentRecord) -> bool {
+    use crate::payment_ledger::PaymentRail;
+    match record.rail {
+        PaymentRail::Drm => true,
+        PaymentRail::Unknown => parse_drm_tx(&record.rail_note).is_some(),
+        PaymentRail::Http => false,
+    }
 }
 
 /// The PRODUCTION chain adapter — resolves via the MKT-1-hardened `chain_tx::resolve_token_id` and
@@ -471,17 +492,24 @@ impl DrmConfirmer for ChainDrmMarketplace {
 /// bad entry: a per-entry error OR PANIC is logged, that entry stays Pending, and the loop
 /// continues (retried next pass). At most `max_entries` DRM pendings are processed per pass
 /// (oldest-first — `pending()` is seq-ordered); the overflow is counted in `skipped`, never
-/// silently dropped (manual/one-shot callers pass `usize::MAX`). Only entries whose `rail_note`
-/// is a DRM `rail_ref` are considered (a non-DRM pending payment is left for the operator
-/// surface); an entry that lacks a parseable `token_id` is still promoted/refunded but gets NO
-/// receipt binding (the token-keyed `CapabilityUse` is skipped).
+/// silently dropped (manual/one-shot callers pass `usize::MAX`). Only DRM pendings (by the rail
+/// tag — see below) are considered; a non-DRM pending is left for the operator surface. A DRM
+/// pending that lacks a parseable `token_id` is still promoted/refunded but gets NO receipt binding
+/// (the token-keyed `CapabilityUse` is skipped); a DRM pending whose note is not yet a `drm:tx=`
+/// ref (a transient `"reserving"` placeholder, or a buy that went Indeterminate WITHOUT a tx hash)
+/// is left Pending with a one-time WARN — it has no tx to poll and needs operator/chain-scan
+/// recovery (the S29 orphan window), NOT silent inclusion in the never-mining set.
 ///
-/// RESIDUAL (council S35 red-team F5): the DRM discriminator is the `drm:tx=` note prefix. In a
-/// MIXED deployment (an HTTP rail alongside DRM), a malicious payment endpoint whose Indeterminate
-/// error body begins `drm:tx=…` could make this driver poll/resolve that HTTP pending against an
-/// attacker-named tx. The direction is fail-closed (it can only refund or hold — never move NEW
-/// money out), and it requires both a hostile endpoint and this driver running over HTTP pendings;
-/// a rail discriminator on the record is the tracked hardening.
+/// RAIL DISCRIMINATOR (Sprint 44, closing MKT-DRM 2d / council S35 red-team F5): a pending is a DRM
+/// pending iff its STRUCTURED [`PaymentRail::Drm`](crate::payment_ledger::PaymentRail) tag says so —
+/// a tag stamped from the paying provider at `begin_attempt`, NOT rail-controlled text. A
+/// positively-tagged `Http` pending is NEVER polled here, so a hostile HTTP endpoint that crafts an
+/// Indeterminate body beginning `drm:tx=` can no longer get its pending resolved against an
+/// attacker-named tx. BOUNDED LEGACY FALLBACK: a pre-S44 record on disk is `Unknown` (untagged); for
+/// those ONLY, we fall back to the `drm:tx=` note heuristic so in-flight DRM pendings still
+/// reconcile across the upgrade. That fallback carries the old (fail-closed: refund/hold only)
+/// exposure but only for records created before this sprint, which drain as they resolve; every new
+/// record is positively tagged.
 pub fn reconcile_drm_confirmations(
     ledger: &crate::payment_ledger::PaymentLedger,
     meter: &elastos_runtime::primitives::spend::SpendMeter,
@@ -501,7 +529,7 @@ pub fn reconcile_drm_confirmations(
     let drm_pendings: Vec<_> = ledger
         .pending()
         .into_iter()
-        .filter(|r| parse_drm_tx(&r.rail_note).is_some())
+        .filter(is_drm_pending)
         .collect();
     let split = match start_after_seq {
         Some(cursor) => drm_pendings.partition_point(|r| r.seq <= cursor),
@@ -587,7 +615,24 @@ fn reconcile_one_drm_pending(
     use elastos_runtime::capability::ResourceId;
 
     let Some(tx) = parse_drm_tx(&record.rail_note).map(str::to_string) else {
-        return EntryOutcome::LeftPending; // caller filtered; defensive
+        // A DRM-tagged pending with no `drm:tx=` note (Sprint 44): a transient `"reserving"`
+        // placeholder (harmless — the next pass sees the finalized note), OR a buy that went
+        // Indeterminate WITHOUT a tx hash (an S29-class orphan — no tx to poll, needs operator /
+        // chain-scan recovery). Pre-S44 the note filter excluded these; now the rail tag admits
+        // them, so make a permanently-unpollable entry VISIBLE rather than folding it silently into
+        // the never-mining set. Fail-closed: left Pending, money unchanged, confirmer never called.
+        if record.rail == crate::payment_ledger::PaymentRail::Drm
+            && !record.rail_note.is_empty()
+            && record.rail_note != "reserving"
+        {
+            tracing::warn!(
+                key = %record.idempotency_key,
+                rail_note = %record.rail_note,
+                "DRM-tagged pending has no drm:tx= hash to poll — left Pending; needs operator \
+                 reconcile / chain scan (S29 orphan)"
+            );
+        }
+        return EntryOutcome::LeftPending;
     };
     // Confirmed and Reverted share one reconcile spine — only `charged` and the receipt
     // binding differ, so the arms stay a single code path that cannot drift apart.
@@ -1231,7 +1276,146 @@ mod tests {
         );
     }
 
-    /// Seed `n` pending DRM buys (`flint-b0..`, txs `0xB0..`), each with a reservation.
+    /// Sprint 44 (the MKT-DRM 2d ratchet): the DRM reconciler selects its pendings by the STRUCTURED
+    /// `PaymentRail` tag, not by the rail-controlled note. A positively-tagged `Http` pending whose
+    /// note a hostile endpoint CRAFTED to begin `drm:tx=` is NEVER polled/resolved by the DRM driver;
+    /// a real `Drm`-tagged pending and a pre-S44 `Unknown`-tagged pending with a real note both are.
+    #[test]
+    fn a_positively_tagged_http_pending_is_never_reconciled_by_the_drm_driver() {
+        use crate::payment_ledger::{PaymentLedger, PaymentRail, PaymentStatus};
+        use elastos_runtime::primitives::audit::AuditLog;
+        use elastos_runtime::primitives::spend::SpendMeter;
+
+        let ledger = PaymentLedger::new();
+        let meter = SpendMeter::new();
+        let audit = AuditLog::new();
+        meter.set_budget("vm-shop", 1000).unwrap();
+
+        // OURS: a real DRM-tagged pending, and a pre-S44 legacy (Unknown) pending with a DRM note.
+        meter.try_debit("vm-shop", 100).unwrap();
+        assert!(ledger.record_on_rail(
+            "flint-drm",
+            "vm-shop",
+            "QmAsset",
+            100,
+            PaymentStatus::Pending,
+            "drm:tx=0xDRM;op=o;tid=1",
+            None,
+            PaymentRail::Drm,
+        ));
+        meter.try_debit("vm-shop", 100).unwrap();
+        assert!(ledger.record_with_token(
+            "flint-legacy",
+            "vm-shop",
+            "QmAsset",
+            100,
+            PaymentStatus::Pending,
+            "drm:tx=0xLEG;op=o;tid=1",
+            None, // Unknown rail (pre-S44 shape)
+        ));
+        // HOSTILE: an Http-tagged pending whose note is CRAFTED to look like a DRM ref.
+        meter.try_debit("vm-shop", 500).unwrap();
+        assert!(ledger.record_on_rail(
+            "flint-http",
+            "vm-shop",
+            "attacker",
+            500,
+            PaymentStatus::Pending,
+            "drm:tx=0xHTTP;op=o;tid=1",
+            None,
+            PaymentRail::Http,
+        ));
+
+        // A confirmer that would REVERT (refund) ANY tx it is polled about.
+        let mut verdicts = std::collections::HashMap::new();
+        for tx in ["0xDRM", "0xLEG", "0xHTTP"] {
+            verdicts.insert(tx.to_string(), DrmConfirmation::Reverted);
+        }
+        let confirmer = MockConfirmer(verdicts);
+
+        let summary =
+            reconcile_drm_confirmations(&ledger, &meter, &audit, &confirmer, usize::MAX, None);
+
+        assert_eq!(
+            summary.refunded, 2,
+            "only the two DRM-owned pendings are polled + refunded"
+        );
+        assert_eq!(
+            ledger.get("flint-http").unwrap().status,
+            PaymentStatus::Pending,
+            "the hostile Http-tagged pending is NEVER polled by the DRM driver — its crafted \
+             drm:tx= note cannot get it resolved"
+        );
+        // Started 1000; reserved 700; refunded 200 (DRM+legacy). The Http 500 stays reserved.
+        assert_eq!(
+            meter.remaining("vm-shop"),
+            500,
+            "only the DRM-owned reservations were refunded; the Http reservation is untouched"
+        );
+    }
+
+    /// Sprint 44 (council guardian F4): a `Drm`-tagged pending whose note is NOT a `drm:tx=` ref
+    /// (an Indeterminate-without-tx orphan) is now IN the reconciler's work list (the rail tag
+    /// admits it where the old note filter excluded it) — but it is left Pending WITHOUT polling
+    /// (no tx to poll), the confirmer is never called, and no money moves. Fail-closed.
+    #[test]
+    fn a_drm_tagged_pending_with_no_tx_note_is_left_pending_without_polling() {
+        use crate::payment_ledger::{PaymentLedger, PaymentRail, PaymentStatus};
+        use elastos_runtime::primitives::audit::AuditLog;
+        use elastos_runtime::primitives::spend::SpendMeter;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingConfirmer(AtomicUsize);
+        impl DrmConfirmer for CountingConfirmer {
+            fn confirm(&self, _tx: &str) -> DrmConfirmation {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                DrmConfirmation::Confirmed // would promote — proving it's NEVER reached
+            }
+        }
+
+        let ledger = PaymentLedger::new();
+        let meter = SpendMeter::new();
+        let audit = AuditLog::new();
+        meter.set_budget("vm-shop", 100).unwrap();
+        meter.try_debit("vm-shop", 50).unwrap();
+        // A Drm-tagged pending with a non-`drm:tx=` note (a buy that went Indeterminate w/o a hash).
+        assert!(ledger.record_on_rail(
+            "flint-orphan",
+            "vm-shop",
+            "QmAsset",
+            50,
+            PaymentStatus::Pending,
+            "DRM buy outcome indeterminate: rpc down",
+            None,
+            PaymentRail::Drm,
+        ));
+
+        let confirmer = CountingConfirmer(AtomicUsize::new(0));
+        let summary =
+            reconcile_drm_confirmations(&ledger, &meter, &audit, &confirmer, usize::MAX, None);
+
+        assert_eq!(
+            confirmer.0.load(Ordering::SeqCst),
+            0,
+            "no drm:tx= hash ⇒ the confirmer is NEVER called (no attacker-named tx to poll)"
+        );
+        assert_eq!(summary.promoted, 0);
+        assert_eq!(summary.refunded, 0);
+        assert_eq!(summary.left_pending, 1);
+        assert_eq!(
+            ledger.get("flint-orphan").unwrap().status,
+            PaymentStatus::Pending,
+            "money unchanged — left Pending for operator/chain-scan recovery"
+        );
+    }
+
+    /// Seed `n` pending DRM buys (`flint-b0..`, txs `0xB0..`), each with a reservation. These seed
+    /// via `record_with_token` ⇒ the `Unknown` rail, so the scheduler/reconcile tests below
+    /// DELIBERATELY exercise the S44 legacy `drm:tx=` note-fallback path (`is_drm_pending`'s
+    /// `Unknown` arm) — a live compatibility promise worth ratcheting; the positive `Drm`-tag path
+    /// is covered by `a_positively_tagged_http_pending_is_never_reconciled_by_the_drm_driver` + the
+    /// capability e2e. When the legacy fallback is eventually removed, these seeds flip to
+    /// `record_on_rail(.., Drm)` in the same change.
     fn seed_pendings(
         ledger: &crate::payment_ledger::PaymentLedger,
         meter: &elastos_runtime::primitives::spend::SpendMeter,

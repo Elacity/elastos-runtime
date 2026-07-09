@@ -95,6 +95,36 @@ pub enum BeginAttempt {
     CapacityRefused,
 }
 
+/// Which rail a payment record belongs to — a STRUCTURED discriminator (Sprint 44) so the DRM
+/// confirmation reconciler polls ONLY records it owns, instead of sniffing the `rail_note` for a
+/// `drm:tx=` prefix (council S35 red-team F5 / MKT-DRM 2d: a hostile HTTP endpoint could craft an
+/// Indeterminate body starting `drm:tx=` and get its pending polled/resolved by the DRM driver).
+/// The tag is set from the paying [`PaymentProvider`] at record creation, so it is NOT
+/// rail-controlled text. `Unknown` is the back-compat default for pre-S44 records on disk (and for
+/// providers that don't declare a rail); the reconciler treats an `Unknown` record's `drm:tx=` note
+/// as the bounded legacy fallback, but a positively-tagged `Http` record is NEVER polled by the DRM
+/// driver regardless of its note.
+/// FORWARD-COMPAT (council S44 red-team F4): this enum is deliberately NOT `#[serde(other)]` — an
+/// unrecognized `rail` string in a snapshot fails the load fail-CLOSED (the ledger refuses to boot
+/// on a corrupt/unknown record, consistent with `PaymentStatus` and the module's "corrupt snapshot
+/// ⇒ REFUSE" posture), rather than silently degrading an unknown rail to `Unknown`+note-fallback.
+/// The consequence: adding a variant is a FORWARD-INCOMPATIBLE ledger change — an OLDER runtime
+/// reading a snapshot that a NEWER runtime wrote with the new variant will refuse to load until the
+/// downgrade is reversed. Adding a rail variant therefore requires a coordinated upgrade (or a
+/// snapshot version bump), NOT a silent rollout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaymentRail {
+    /// Untagged: a pre-S44 record, or a provider that declares no rail. Reconcilers fall back to
+    /// the note heuristic for these (bounded, drains as legacy records resolve).
+    #[default]
+    Unknown,
+    /// The HTTP payment rail ([`HttpPaymentProvider`](crate::intent_executor::HttpPaymentProvider)).
+    Http,
+    /// The DRM on-chain marketplace rail (`drm_marketplace::DrmMarketplaceProvider`).
+    Drm,
+}
+
 /// One rail attempt. `rail_note` is the sanitized (printable, bounded) rail body/reference.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PaymentRecord {
@@ -123,6 +153,12 @@ pub struct PaymentRecord {
     /// unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_id: Option<String>,
+    /// The rail this record belongs to (Sprint 44). Set from the paying provider at creation, so
+    /// the DRM reconciler can identify its records structurally, not by sniffing `rail_note`.
+    /// BACK-COMPAT: `#[serde(default)]` ⇒ a pre-S44 snapshot round-trips as `Unknown`; the field is
+    /// always serialized (a plain enum, not skipped) so a re-persisted legacy record gains the tag.
+    #[serde(default)]
+    pub rail: PaymentRail,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -348,6 +384,33 @@ impl PaymentLedger {
         rail_note: &str,
         token_id: Option<&str>,
     ) -> bool {
+        self.record_on_rail(
+            idempotency_key,
+            capsule,
+            payee,
+            amount,
+            status,
+            rail_note,
+            token_id,
+            PaymentRail::Unknown,
+        )
+    }
+
+    /// Like [`record_with_token`](Self::record_with_token) — TEST/SEEDING ONLY — but also stamps the
+    /// structured [`PaymentRail`] discriminator (Sprint 44), so a test can seed a positively-tagged
+    /// (e.g. `Http` or `Drm`) record for the reconciler's rail-aware selection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_on_rail(
+        &self,
+        idempotency_key: &str,
+        capsule: &str,
+        payee: &str,
+        amount: u64,
+        status: PaymentStatus,
+        rail_note: &str,
+        token_id: Option<&str>,
+        rail: PaymentRail,
+    ) -> bool {
         let mut records = match self.records.write() {
             Ok(r) => r,
             Err(_) => return false,
@@ -373,6 +436,7 @@ impl PaymentLedger {
                 seq,
                 refund_applied: false,
                 token_id: token_id.map(str::to_string),
+                rail,
             },
         );
         if self.persist_locked(&records).is_err() {
@@ -394,6 +458,8 @@ impl PaymentLedger {
     ///   `Pending` (a legitimate retry the guard allows) ⇒ `Started`.
     ///
     /// The caller then moves money and calls [`finalize`](Self::finalize) with the outcome.
+    /// Records the attempt on the [`Unknown`](PaymentRail::Unknown) rail; the production pay path
+    /// uses [`begin_attempt_on_rail`](Self::begin_attempt_on_rail) to stamp the paying rail.
     pub fn begin_attempt(
         &self,
         idempotency_key: &str,
@@ -401,6 +467,30 @@ impl PaymentLedger {
         payee: &str,
         amount: u64,
         token_id: Option<&str>,
+    ) -> BeginAttempt {
+        self.begin_attempt_on_rail(
+            idempotency_key,
+            capsule,
+            payee,
+            amount,
+            token_id,
+            PaymentRail::Unknown,
+        )
+    }
+
+    /// [`begin_attempt`](Self::begin_attempt) that also stamps the structured [`PaymentRail`]
+    /// (Sprint 44), so the DRM reconciler identifies its pendings by tag, not by the rail-controlled
+    /// `rail_note`. A REOPEN adopts the new attempt's rail (the same key retried on a different rail
+    /// takes the new rail — the money that actually moves is this attempt's).
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_attempt_on_rail(
+        &self,
+        idempotency_key: &str,
+        capsule: &str,
+        payee: &str,
+        amount: u64,
+        token_id: Option<&str>,
+        rail: PaymentRail,
     ) -> BeginAttempt {
         let mut records = match self.records.write() {
             Ok(r) => r,
@@ -412,12 +502,14 @@ impl PaymentLedger {
             }
             // A provably-nothing-moved terminal ⇒ reopen to Pending for the retry. Snapshot the
             // WHOLE prior record so a failed persist restores exact memory⇄disk agreement —
-            // including `rail_note` and the `refund_applied` forensics bit, not just the status.
+            // including `rail_note`, `rail`, and the `refund_applied` forensics bit, not just the
+            // status.
             let prev = existing.clone();
             if let Some(r) = records.get_mut(idempotency_key) {
                 r.status = PaymentStatus::Pending;
                 r.rail_note = sanitize_rail_note("reserving");
                 r.refund_applied = false;
+                r.rail = rail;
             }
             if self.persist_locked(&records).is_err() {
                 records.insert(idempotency_key.to_string(), prev); // roll back the reopen
@@ -444,6 +536,7 @@ impl PaymentLedger {
                 seq,
                 refund_applied: false,
                 token_id: token_id.map(str::to_string),
+                rail,
             },
         );
         if self.persist_locked(&records).is_err() {
@@ -804,12 +897,72 @@ mod tests {
         let rec: PaymentRecord = serde_json::from_str(legacy).unwrap();
         assert!(rec.token_id.is_none(), "absent token_id ⇒ None");
         assert!(!rec.refund_applied, "absent refund_applied ⇒ false");
-        // Re-serialization omits both defaulted-absent fields' keys where skip applies: token_id
-        // (skip_serializing_if) is omitted; the record is byte-shape compatible.
+        // Re-serialization omits `token_id` (skip_serializing_if). It DOES gain `"rail":"unknown"`
+        // since Sprint 44 (the rail tag is a plain enum, not skipped — see the adjacent
+        // `a_pre_s44_record_without_rail_deserializes_as_unknown_and_gains_the_tag`); only the
+        // token_id byte-shape is asserted here.
         let round = serde_json::to_string(&rec).unwrap();
         assert!(
             !round.contains("token_id"),
             "a legacy record re-serializes with NO token_id key: {round}"
+        );
+    }
+
+    /// Sprint 44 back-compat: a pre-S44 record on disk has no `rail` key. It MUST deserialize as
+    /// `PaymentRail::Unknown` (so the DRM reconciler's legacy note-fallback still reconciles it) and
+    /// re-serialize WITH the tag (a plain enum, not skipped — so a re-persisted legacy record gains
+    /// the discriminator).
+    #[test]
+    fn a_pre_s44_record_without_rail_deserializes_as_unknown_and_gains_the_tag() {
+        let legacy = r#"{"idempotency_key":"flint-x","capsule":"vm-a","payee":"acme","amount":200,"status":"pending","rail_note":"drm:tx=0xC0;op=o;tid=7","seq":0}"#;
+        let rec: PaymentRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            rec.rail,
+            PaymentRail::Unknown,
+            "an absent rail key ⇒ Unknown (the legacy fallback still reconciles it)"
+        );
+        let round = serde_json::to_string(&rec).unwrap();
+        assert!(
+            round.contains("\"rail\":\"unknown\""),
+            "a re-persisted legacy record gains the tag: {round}"
+        );
+    }
+
+    /// Sprint 44 (council guardian F3): a REOPEN of a provably-nothing-moved terminal adopts the
+    /// NEW attempt's rail — the money that will move is this attempt's. A money-bearing entry is
+    /// NEVER reopened (it returns `AlreadyActive`), so a live DRM pending can never be re-tagged
+    /// and stranded; only a refunded terminal re-tags, which is correct.
+    #[test]
+    fn a_reopen_adopts_the_new_attempts_rail() {
+        let ledger = PaymentLedger::new();
+        assert!(matches!(
+            ledger.begin_attempt_on_rail("k", "vm-a", "acme", 100, None, PaymentRail::Drm),
+            BeginAttempt::Started
+        ));
+        // Terminal, provably-nothing-moved ⇒ reopenable.
+        assert!(ledger.finalize("k", PaymentStatus::NotCharged, "no charge"));
+        assert_eq!(ledger.get("k").unwrap().rail, PaymentRail::Drm);
+
+        // Retry on a DIFFERENT rail — the record adopts the new attempt's rail.
+        assert!(matches!(
+            ledger.begin_attempt_on_rail("k", "vm-a", "acme", 100, None, PaymentRail::Http),
+            BeginAttempt::Started
+        ));
+        assert_eq!(
+            ledger.get("k").unwrap().rail,
+            PaymentRail::Http,
+            "a reopen adopts the new attempt's rail"
+        );
+
+        // But a money-bearing (Pending) entry is un-reopenable ⇒ its tag is immutable.
+        assert!(matches!(
+            ledger.begin_attempt_on_rail("k", "vm-a", "acme", 100, None, PaymentRail::Drm),
+            BeginAttempt::AlreadyActive(PaymentStatus::Pending)
+        ));
+        assert_eq!(
+            ledger.get("k").unwrap().rail,
+            PaymentRail::Http,
+            "a live (money-bearing) pending's rail is never overwritten — no stranding"
         );
     }
 
