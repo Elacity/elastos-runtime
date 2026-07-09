@@ -318,8 +318,11 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
                  ERC-20 checkout rail wins; the HTTP endpoint is ignored"
             );
         }
-        let mode = match std::env::var("ELASTOS_ERC20_MODE").as_deref() {
-            Ok("mock") => {
+        // Mode parse (council S48 red-team LOW-2): case-insensitive, and an UNRECOGNIZED
+        // non-empty value REFUSES TO WIRE rather than silently defaulting to Live — a typo'd
+        // mode must be visible, not a surprise settlement mode.
+        let mode = match std::env::var("ELASTOS_ERC20_MODE") {
+            Ok(v) if v.trim().eq_ignore_ascii_case("mock") => {
                 if !mock_allowed {
                     tracing::error!(
                         "ELASTOS_ERC20_MODE=mock fabricates synthetic settlements — that is MOCK \
@@ -328,9 +331,26 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
                     );
                     return None;
                 }
+                // Council S48 red-team LOW-1: mock settlements produce tx hashes the LIVE
+                // confirmer can never find — mock pendings hold their reservations until
+                // manually resolved (money-safe over-hold, but a reservation leak worth knowing).
+                tracing::warn!(
+                    "ERC-20 checkout is in MOCK mode — mock settlements are NOT reconcilable by \
+                     the live confirmer; pending reservations hold until manually resolved"
+                );
                 crate::api::erc20_checkout::Erc20Mode::Mock
             }
-            _ => crate::api::erc20_checkout::Erc20Mode::Live,
+            Ok(v) if v.trim().eq_ignore_ascii_case("live") || v.trim().is_empty() => {
+                crate::api::erc20_checkout::Erc20Mode::Live
+            }
+            Ok(v) => {
+                tracing::error!(
+                    "ELASTOS_ERC20_MODE={v:?} is not one of mock|live — refusing to wire with an \
+                     unrecognized settlement mode (fail-closed)"
+                );
+                return None;
+            }
+            Err(_) => crate::api::erc20_checkout::Erc20Mode::Live,
         };
         let token = match std::env::var("ELASTOS_ERC20_TOKEN") {
             Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
