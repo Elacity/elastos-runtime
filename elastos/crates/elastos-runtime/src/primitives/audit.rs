@@ -3132,4 +3132,135 @@ mod tests {
             .unwrap()
             .contains("\"rail_ref\":\"drm:tx=0xbeef;op=0xop;tid=7\""));
     }
+
+    /// Sprint 49 (the SPEC-mandate-v1 conformance ratchet): the WIRE FORMAT the spec documents is
+    /// pinned here — the schema tag, the three domain strings, every serialized key of the receipt
+    /// document / chained record / scope tags, and the mandate-relevant event shapes (including
+    /// the absent-when-unset rules old chains depend on). A change that breaks this test breaks
+    /// the published spec: mint a v2, never edit v1.
+    #[test]
+    fn the_wire_format_matches_spec_mandate_v1() {
+        // §2/§4 domain strings + the schema tag are part of the format.
+        assert_eq!(AUDIT_RECORD_DOMAIN, b"elastos.runtime/audit-chain/v1");
+        assert_eq!(
+            MANDATE_RECEIPT_BINDING_DOMAIN,
+            b"elastos.runtime/mandate-receipt-set/v1"
+        );
+        assert_eq!(MANDATE_RECEIPT_SCHEMA, "elastos.mandate_receipt/v1");
+
+        // A real capability receipt, serialized: the §3 document keys, exactly.
+        let dir = tempfile::tempdir().unwrap();
+        let log = AuditLog::with_file(dir.path().join("audit.log")).unwrap();
+        let token = crate::capability::token::TokenId::new();
+        let vendor = crate::capability::ResourceId::new("elastos://pay/vendor");
+        log.capability_grant(
+            &token,
+            "vm-agent",
+            &vendor,
+            crate::capability::token::Action::Write,
+            None,
+        );
+        log.capability_use_with_rail_ref(
+            &token,
+            "vm-agent",
+            &vendor,
+            crate::capability::token::Action::Write,
+            true,
+            Some("erc20:tx=0xA;to=0xb;amount=1;tok=t".to_string()),
+        );
+        let receipt = log
+            .export_mandate_receipt_for_capability(&token.to_string())
+            .expect("receipt");
+        let doc = serde_json::to_value(&receipt).unwrap();
+        let mut doc_keys: Vec<_> = doc.as_object().unwrap().keys().cloned().collect();
+        doc_keys.sort();
+        assert_eq!(
+            doc_keys,
+            [
+                "records",
+                "schema",
+                "scope",
+                "set_binding",
+                "signer_public_key_hex"
+            ],
+            "the §3 receipt document keys are frozen"
+        );
+        // §3 scope tags.
+        assert_eq!(
+            serde_json::to_value(MandateReceiptScope::Contiguous).unwrap(),
+            serde_json::json!({"kind": "contiguous"})
+        );
+        assert_eq!(
+            doc["scope"]["kind"], "capability",
+            "capability scope tag: {:?}",
+            doc["scope"]
+        );
+        assert!(doc["scope"]["token_id"].is_string());
+
+        // §2 chained-record keys, exactly.
+        let rec = &doc["records"][0];
+        let mut rec_keys: Vec<_> = rec.as_object().unwrap().keys().cloned().collect();
+        rec_keys.sort();
+        assert_eq!(
+            rec_keys,
+            ["alg", "event", "prev_hash", "record_hash", "seq", "sig"],
+            "the §2 record keys are frozen"
+        );
+        assert_eq!(rec["alg"], "ed25519");
+        assert_eq!(
+            rec["prev_hash"].as_str().unwrap().len(),
+            64,
+            "prev_hash is 64 hex chars (genesis = all zeros)"
+        );
+
+        // §5 event shapes: INTERNALLY tagged (`"type"`), snake_case; absent-when-unset rules.
+        let grant = &rec["event"];
+        assert_eq!(grant["type"], "capability_grant");
+        let mut grant_keys: Vec<_> = grant.as_object().unwrap().keys().cloned().collect();
+        grant_keys.sort();
+        assert_eq!(
+            grant_keys,
+            [
+                "action",
+                "capsule_id",
+                "expiry",
+                "resource",
+                "timestamp",
+                "token_id",
+                "type"
+            ],
+            "capability_grant fields (responsible_entity ABSENT — not null — when unset)"
+        );
+        let use_ev = &doc["records"][1]["event"];
+        assert_eq!(use_ev["type"], "capability_use");
+        let mut use_keys: Vec<_> = use_ev.as_object().unwrap().keys().cloned().collect();
+        use_keys.sort();
+        assert_eq!(
+            use_keys,
+            [
+                "action",
+                "capsule_id",
+                "rail_ref",
+                "resource",
+                "success",
+                "timestamp",
+                "token_id",
+                "type"
+            ],
+            "capability_use fields (rail_ref present here because it was set)"
+        );
+        // Timestamp shape (the §7 preimage depends on it too).
+        let ts = &grant["timestamp"];
+        let mut ts_keys: Vec<_> = ts.as_object().unwrap().keys().cloned().collect();
+        ts_keys.sort();
+        assert_eq!(
+            ts_keys,
+            ["monotonic_seq", "unix_secs"],
+            "SecureTimestamp JSON shape is frozen"
+        );
+
+        // And the exported receipt verifies — the spec's §6 algorithm against its own §2-§4 shapes.
+        let signer = log.verifying_key_hex().unwrap();
+        assert!(verify_mandate_receipt(&receipt, Some(&signer)).authenticated);
+    }
 }
