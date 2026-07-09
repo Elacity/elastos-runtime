@@ -314,10 +314,10 @@ pub(crate) fn parse_drm_tx(rail_note: &str) -> Option<&str> {
 /// like a tx-less note: left Pending, confirmer never called). `Unknown` (pre-S44 legacy) keeps
 /// the DRM-only note fallback — the legacy fallback NEVER widens to new rails. `Http` never
 /// parses: a hostile HTTP endpoint crafting either prefix is never polled.
-pub(crate) fn parse_chain_tx<'a>(
+pub(crate) fn parse_chain_tx(
     rail: crate::payment_ledger::PaymentRail,
-    rail_note: &'a str,
-) -> Option<&'a str> {
+    rail_note: &str,
+) -> Option<&str> {
     use crate::payment_ledger::PaymentRail;
     match rail {
         PaymentRail::Drm => parse_drm_tx(rail_note),

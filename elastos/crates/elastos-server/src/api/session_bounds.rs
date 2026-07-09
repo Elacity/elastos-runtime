@@ -55,6 +55,9 @@ pub(crate) const MAX_VIEWER_SESSIONS: usize = 256;
 /// worth a warn at the call site.
 pub(crate) struct SweepOutcome<V> {
     /// Removed sessions — drop AFTER releasing the store lock (each drop may reap a subprocess).
+    /// Deliberately write-only in production (its whole purpose is WHERE it drops, not being
+    /// read); tests read it to assert the deferred-drop contract.
+    #[allow(dead_code)]
     pub removed: Vec<V>,
     /// How many of `removed` were LIVE cap evictions (not expired sweeps).
     pub live_evicted: usize,

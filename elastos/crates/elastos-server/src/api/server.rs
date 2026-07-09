@@ -179,9 +179,24 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
     // REQUIRES the durable meter+ledger (real money on non-durable stores is refused), shares the
     // exact two-generals classification and receipt path. The buyer principal/subject/ledger come
     // from env; the live chain is exercised only by the operator runbook, never CI.
-    let drm_rail = std::env::var("ELASTOS_PAYMENT_RAIL")
-        .map(|v| v.trim().eq_ignore_ascii_case("drm"))
-        .unwrap_or(false);
+    // The rail selector is CLOSED-WORLD (council S48 guardian F2): an unrecognized non-empty
+    // ELASTOS_PAYMENT_RAIL refuses to wire rather than silently falling through to the HTTP/mock
+    // arms — a typo'd rail must be visible, never a silent rail swap (the same rule the mode
+    // parse below applies one level down).
+    let rail_env = std::env::var("ELASTOS_PAYMENT_RAIL")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty());
+    if let Some(v) = rail_env.as_deref() {
+        if v != "drm" && v != "erc20" {
+            tracing::error!(
+                "ELASTOS_PAYMENT_RAIL={v:?} is not one of drm|erc20 — refusing to wire an \
+                 unrecognized rail (fail-closed); unset it to use the HTTP/mock arms"
+            );
+            return None;
+        }
+    }
+    let drm_rail = rail_env.as_deref() == Some("drm");
     if drm_rail {
         if real_endpoint.is_some() {
             tracing::warn!(
@@ -308,9 +323,7 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
     // Same wiring discipline: durable stores required; the unit mapping is REQUIRED (the cap is a
     // literal on-chain ceiling, never a silent 1-wei assumption); MOCK settlement requires the
     // explicit mock-money opt-in (S29 rule) and is dev-modes-only in the provider itself.
-    let erc20_rail = std::env::var("ELASTOS_PAYMENT_RAIL")
-        .map(|v| v.trim().eq_ignore_ascii_case("erc20"))
-        .unwrap_or(false);
+    let erc20_rail = rail_env.as_deref() == Some("erc20");
     if erc20_rail {
         if real_endpoint.is_some() {
             tracing::warn!(
@@ -352,6 +365,16 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
             }
             Err(_) => crate::api::erc20_checkout::Erc20Mode::Live,
         };
+        // Council S48 guardian F6 (P12): on a release build the Live leg refuses every pay
+        // fail-closed (managed signing is dev-modes-only; the external-signature checkout flow
+        // is the tracked follow-up) — say so at boot instead of logging a settling rail.
+        if !cfg!(feature = "dev-modes") && mode == crate::api::erc20_checkout::Erc20Mode::Live {
+            tracing::warn!(
+                "ERC-20 checkout is wired in Live mode on a RELEASE build — every checkout will \
+                 refuse fail-closed (NotCharged) until the external-signature flow ships \
+                 (managed signing is a dev-modes capability)"
+            );
+        }
         let token = match std::env::var("ELASTOS_ERC20_TOKEN") {
             Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
             _ => {
@@ -543,8 +566,8 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
 ///
 /// - OFF BY DEFAULT (P16 — no ambient background chain poller): arms ONLY when
 ///   `ELASTOS_DRM_RECONCILE_INTERVAL_SECS` is set (u64 ≥ 1) AND the wired rail carries a DRM
-///   confirmer. An interval on a non-DRM rail warns and stays off (its pendings are
-///   operator-reconciled; there is no chain to poll).
+///   confirmer. An interval on a non-chain-settled rail (neither DRM nor ERC-20) warns and stays
+///   off (its pendings are operator-reconciled; there is no chain to poll).
 /// - FAIL-CLOSED on a malformed value: an unparseable interval or batch REFUSES to arm with an
 ///   error log — a scheduler must never guess its own cadence or bound.
 /// - `ELASTOS_DRM_RECONCILE_BATCH` (usize ≥ 1, default 64) bounds one tick's work; the overflow
@@ -565,9 +588,9 @@ pub fn drm_reconcile_schedule_from_env(
     };
     if !rail_has_confirmer {
         tracing::warn!(
-            "ELASTOS_DRM_RECONCILE_INTERVAL_SECS is set but the wired payment rail is not the \
-             DRM rail — the confirmation scheduler stays OFF (nothing on-chain to poll; HTTP/mock \
-             pendings are operator-reconciled)"
+            "ELASTOS_DRM_RECONCILE_INTERVAL_SECS is set but the wired payment rail is not a \
+             chain-settled rail (DRM or ERC-20) — the confirmation scheduler stays OFF (nothing \
+             on-chain to poll; HTTP/mock pendings are operator-reconciled)"
         );
         return None;
     }
@@ -1436,6 +1459,96 @@ mod tests {
             assert!(rail.meter.is_durable());
         }
     }
+    /// Sprint 48 (council guardian F3): the ERC-20 rail's wiring discipline, mirroring the DRM
+    /// sibling — every refusal is fail-closed UNWIRED, never a silent fallback or a weaker rail.
+    #[test]
+    fn erc20_rail_obeys_the_wiring_discipline() {
+        // LOCK ORDER (same as the DRM sibling): the crate-wide ddrm env lock FIRST —
+        // ELASTOS_PAYMENT_RAIL / ELASTOS_ALLOW_MOCK_PAYMENTS are process-globals other module
+        // families also guard with it — then the pay-rail lock.
+        let _ddrm = crate::api::ddrm_env_lock();
+        let _serial = PAY_RAIL_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::capture(&[
+            "ELASTOS_PAYMENT_RAIL",
+            "ELASTOS_PAYMENT_ENDPOINT",
+            "ELASTOS_ALLOW_MOCK_PAYMENTS",
+            "ELASTOS_ERC20_TOKEN",
+            "ELASTOS_ERC20_SPEND_UNIT",
+            "ELASTOS_ERC20_MODE",
+            "ELASTOS_ERC20_PAYER_PRINCIPAL",
+        ]);
+
+        // An UNRECOGNIZED rail name refuses to wire — never a silent fall-through to the
+        // HTTP/mock arms (council S48 guardian F2).
+        std::env::set_var("ELASTOS_PAYMENT_RAIL", "erc-20");
+        std::env::set_var("ELASTOS_ALLOW_MOCK_PAYMENTS", "1");
+        let d = tempfile::tempdir().unwrap();
+        assert!(
+            build_pay_rail(Some(d.path())).is_none(),
+            "a typo'd rail name refuses to wire (fail-closed), never a silent rail swap"
+        );
+
+        std::env::set_var("ELASTOS_PAYMENT_RAIL", "erc20");
+        // No token ⇒ refuses.
+        std::env::remove_var("ELASTOS_ERC20_TOKEN");
+        std::env::set_var("ELASTOS_ERC20_SPEND_UNIT", "1000000");
+        let d = tempfile::tempdir().unwrap();
+        assert!(
+            build_pay_rail(Some(d.path())).is_none(),
+            "the erc20 rail refuses to wire without ELASTOS_ERC20_TOKEN"
+        );
+        // Token but no unit mapping ⇒ refuses (the cap must be a literal ceiling).
+        std::env::set_var(
+            "ELASTOS_ERC20_TOKEN",
+            "0x1111111111111111111111111111111111111111",
+        );
+        std::env::remove_var("ELASTOS_ERC20_SPEND_UNIT");
+        let d = tempfile::tempdir().unwrap();
+        assert!(
+            build_pay_rail(Some(d.path())).is_none(),
+            "the erc20 rail refuses to wire without ELASTOS_ERC20_SPEND_UNIT"
+        );
+        // Malformed unit ⇒ refuses.
+        std::env::set_var("ELASTOS_ERC20_SPEND_UNIT", "zero");
+        let d = tempfile::tempdir().unwrap();
+        assert!(
+            build_pay_rail(Some(d.path())).is_none(),
+            "a malformed unit mapping refuses to wire"
+        );
+        // An unrecognized MODE refuses (case-insensitive parse; typo must be visible).
+        std::env::set_var("ELASTOS_ERC20_SPEND_UNIT", "1000000");
+        std::env::set_var("ELASTOS_ERC20_MODE", "mok");
+        let d = tempfile::tempdir().unwrap();
+        assert!(
+            build_pay_rail(Some(d.path())).is_none(),
+            "an unrecognized settlement mode refuses to wire"
+        );
+        // Mock mode WITHOUT the explicit mock-money opt-in ⇒ refuses (S29 rule).
+        std::env::set_var("ELASTOS_ERC20_MODE", "mock");
+        std::env::remove_var("ELASTOS_ALLOW_MOCK_PAYMENTS");
+        let d = tempfile::tempdir().unwrap();
+        assert!(
+            build_pay_rail(Some(d.path())).is_none(),
+            "mock erc20 settlement without ELASTOS_ALLOW_MOCK_PAYMENTS stays UNWIRED"
+        );
+        // Fully declared (mock + opt-in, durable stores) ⇒ wires, on the Erc20 rail, with the
+        // chain-settled confirmer armed for the scheduler.
+        std::env::set_var("ELASTOS_ALLOW_MOCK_PAYMENTS", "1");
+        std::env::set_var("ELASTOS_ERC20_PAYER_PRINCIPAL", "did:test:payer");
+        let d = tempfile::tempdir().unwrap();
+        let rail = build_pay_rail(Some(d.path())).expect("fully-declared erc20 rail wires");
+        assert!(rail.meter.is_durable());
+        assert_eq!(
+            rail.provider.rail(),
+            crate::payment_ledger::PaymentRail::Erc20,
+            "the wired provider positively tags the Erc20 rail"
+        );
+        assert!(
+            rail.drm_confirmer.is_some(),
+            "the chain-settled confirmer is present, so the scheduler can arm"
+        );
+    }
+
     /// Sprint 37 ratchet: the scheduler's fail-closed arming rules. OFF by default (no interval
     /// env ⇒ None); a malformed interval or batch REFUSES to arm (never guesses); an interval on
     /// a non-DRM rail stays off; armed only on interval + DRM confirmer, with batch defaulting

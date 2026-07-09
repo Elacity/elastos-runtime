@@ -613,6 +613,9 @@ impl WasmProvider {
     }
 
     /// Execute a WASM module with WASI preview1.
+    /// (8 args: the WASI plumbing genuinely needs each — an args struct here would be pure
+    /// ceremony. Allowed explicitly so the workspace `-D warnings` gate is truthful.)
+    #[allow(clippy::too_many_arguments)]
     fn execute_wasm(
         engine: &Engine,
         module: &Module,

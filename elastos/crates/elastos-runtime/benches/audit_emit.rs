@@ -12,6 +12,7 @@
 //!      hash-chain cost of an emit, nothing else.
 //!   2. file-backed  (`AuditLog::with_file`) — sign + append + `fsync` per record: THE ceiling
 //!      (this is what a durable-custody deployment pays on the capability-use path).
+//!
 //! (2)/(1) is the price of durable custody per record; 1/µs_file is the single-writer durable
 //! throughput ceiling the group-commit rewrite would lift.
 

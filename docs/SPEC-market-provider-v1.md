@@ -88,8 +88,13 @@ with caller-specified amounts (ERC-20) computes `amount × unit` with checked ar
 - Mock/synthetic settlement requires the explicit `ELASTOS_ALLOW_MOCK_PAYMENTS` opt-in (S29) and
   is a `dev-modes` build capability in the shipped verticals.
 - Misconfiguration refuses to wire (fail-closed) or warns loudly at boot; it never degrades to a
-  weaker rail silently. Exactly ONE rail is wired per runtime (`ELASTOS_PAYMENT_RAIL`); per-payee
-  rail routing is future work.
+  weaker rail silently — including the rail selector itself: an unrecognized
+  `ELASTOS_PAYMENT_RAIL` refuses to wire. Exactly ONE rail is wired per runtime; per-payee rail
+  routing is future work.
+- Chain-settled rails share ONE chain configuration (P5), currently under the DDRM-era names:
+  `ELASTOS_CHAIN_BASE_RPC` (required for any live leg), `ELASTOS_DDRM_CHAIN_ID`,
+  `ELASTOS_DRM_MIN_CONFIRMATIONS` (depth floor), `ELASTOS_DRM_RECONCILE_INTERVAL_SECS`/`_BATCH`
+  (the scheduler). A rail-neutral rename of these env names is tracked follow-up work.
 
 ## 7. Receipts
 
@@ -108,7 +113,7 @@ A new vertical ships when it can answer YES to each, with a gate test per row:
 | 1 | `rail()` declared | compiler (no default) |
 | 2 | Pre-value failures are `NotCharged` by construction | call-site `map_err` + ratchets |
 | 3 | Value-moving-op-and-after failures are `Indeterminate` | call-site `map_err` + ratchets |
-| 4 | Chain rails: never `Ok` at broadcast; parseable `<rail>:tx=` ref | e2e ratchet |
+| 4 | Chain rails: never `Ok` at broadcast; parseable `<rail>:tx=` ref | provider broadcast ratchet + the shared-spine e2e (DRM) |
 | 5 | Confirmation reader is fail-safe (unreadable ⇒ hold) | shared `confirm_chain_tx` |
 | 6 | Unit mapping declared or refuse-to-wire | wiring test |
 | 7 | Hostile cross-rail note is never polled | reconciler ratchet |

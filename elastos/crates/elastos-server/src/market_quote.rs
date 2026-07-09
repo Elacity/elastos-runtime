@@ -175,27 +175,31 @@ pub fn quote_outcome(result: Result<crate::api::buy_authority::BuyQuote, String>
     }
 }
 
+/// Another consumer's read of the same asset is in flight — retry shortly (bounded wait is the
+/// CALLER's policy; this module never sleeps). A named unit-error so the contract is visible at
+/// call sites (clippy `result_unit_err`, S48 gate-truth fold).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadInFlight;
+
 /// One asset's quote through the shared spine, blocking (the caller runs on the blocking pool):
-/// serve fresh, refuse to duplicate an in-flight read, or claim-read-fill. `Err(())` ⇒ another
-/// consumer's read is in flight — retry shortly (bounded wait is the CALLER's policy; this module
-/// never sleeps).
+/// serve fresh, refuse to duplicate an in-flight read, or claim-read-fill.
 pub fn quote_single_flight(
     cache: &MarketQuoteCache,
     quoter: &dyn MarketQuoter,
     asset: &str,
     now: u64,
-) -> Result<MarketQuote, ()> {
+) -> Result<MarketQuote, ReadInFlight> {
     prune(cache, now); // single-asset ask: one bounded prune keeps the cache size-bounded
     match claim_or_serve(cache, asset, now, true) {
         CachedQuote::Fresh(quote) => Ok(quote),
-        CachedQuote::InFlight => Err(()),
+        CachedQuote::InFlight => Err(ReadInFlight),
         CachedQuote::Claimed => {
             let quote = quote_outcome(quoter.quote(asset));
             fill(cache, asset, quote.clone(), now_unix());
             Ok(quote)
         }
         // Unreachable with may_claim=true, but fail SAFE (treat as in-flight) if it ever is.
-        CachedQuote::NotClaimed => Err(()),
+        CachedQuote::NotClaimed => Err(ReadInFlight),
     }
 }
 

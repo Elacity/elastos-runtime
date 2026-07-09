@@ -7796,6 +7796,10 @@ mod tests {
     /// An AUTHENTICATED (allowlisted-DID) peer may perform a content WRITE, and the provider is
     /// attributed the VERIFIED principal — never the caller-supplied `principal_id` (T1 fix).
     #[tokio::test]
+    // The env lock is DESIGNED to be held across this test's awaits — it serializes
+    // process-global ELASTOS_CARRIER_TRUSTED_PEERS access across async tests; the
+    // await-holding-lock lint targets production-executor deadlock risk, not this.
+    #[allow(clippy::await_holding_lock)]
     async fn test_carrier_provider_invoke_authenticated_peer_writes_under_verified_principal() {
         let _g = carrier_peer_env_lock();
         std::env::set_var("ELASTOS_CARRIER_TRUSTED_PEERS", "did:key:zTrusted");
@@ -7852,6 +7856,10 @@ mod tests {
 
     /// An authenticated peer STILL cannot touch key material — auth widens content only.
     #[tokio::test]
+    // The env lock is DESIGNED to be held across this test's awaits — it serializes
+    // process-global ELASTOS_CARRIER_TRUSTED_PEERS access across async tests; the
+    // await-holding-lock lint targets production-executor deadlock risk, not this.
+    #[allow(clippy::await_holding_lock)]
     async fn test_carrier_provider_invoke_authenticated_peer_still_refused_key_material() {
         let _g = carrier_peer_env_lock();
         std::env::set_var("ELASTOS_CARRIER_TRUSTED_PEERS", "did:key:zTrusted");
@@ -7890,6 +7898,10 @@ mod tests {
     /// A peer whose verified DID is NOT on the allowlist is treated as anonymous — a write is
     /// refused exactly as for an unauthenticated peer (the allowlist is the only gate).
     #[tokio::test]
+    // The env lock is DESIGNED to be held across this test's awaits — it serializes
+    // process-global ELASTOS_CARRIER_TRUSTED_PEERS access across async tests; the
+    // await-holding-lock lint targets production-executor deadlock risk, not this.
+    #[allow(clippy::await_holding_lock)]
     async fn test_carrier_provider_invoke_untrusted_peer_stays_read_only() {
         let _g = carrier_peer_env_lock();
         std::env::set_var("ELASTOS_CARRIER_TRUSTED_PEERS", "did:key:zSomeoneElse");

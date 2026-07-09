@@ -23,7 +23,9 @@
 //! the same posture. Mock settlement (gate tests) requires BOTH `dev-modes` AND the operator's
 //! explicit mock-money opt-in at wiring time.
 
+#[cfg(feature = "dev-modes")]
 use serde_json::{json, Value};
+#[cfg(feature = "dev-modes")]
 use sha2::{Digest, Sha256};
 
 use crate::intent_executor::{PayError, PaymentProvider};
@@ -61,6 +63,7 @@ pub(crate) fn encode_erc20_transfer(to: &str, amount_base: u128) -> Result<Strin
 
 /// A deterministic, even-length-hex "signed tx" for the MOCK settlement path (the mock chain
 /// never inspects it; it is not a real signature) — mirrors the DRM rail's mock discipline.
+#[cfg(feature = "dev-modes")]
 fn representative_signed_tx(unsigned: &Value) -> String {
     let mut h = Sha256::new();
     h.update(b"elastos-erc20/checkout-mock-signed/v1");
@@ -84,6 +87,10 @@ pub enum Erc20Mode {
 }
 
 /// The ERC-20 checkout provider — see the module docs for the contract it implements.
+/// (`token`/`principal_id` and `rail_ref` are consumed only by the settlement legs, which are
+/// `dev-modes`-gated — a release build refuses every pay fail-closed, so the fields are
+/// deliberately dead there; council S48 guardian F1.)
+#[cfg_attr(not(feature = "dev-modes"), allow(dead_code))]
 pub struct Erc20CheckoutProvider {
     /// The ONE ERC-20 token this rail pays in (operator-declared; the unit mapping denominates it).
     token: String,
@@ -95,8 +102,17 @@ pub struct Erc20CheckoutProvider {
     mode: Erc20Mode,
 }
 
+#[cfg_attr(not(feature = "dev-modes"), allow(dead_code))]
 impl Erc20CheckoutProvider {
+    /// `spend_unit` MUST be ≥ 1 (the wiring refuses to wire otherwise — SPEC §5's "never a
+    /// silent 1:1" applies to the mapping's DECLARATION, and a 0 here would be a caller bug, not
+    /// an operator choice). Debug builds assert; release clamps to 1 as a last-resort guard
+    /// (council S48 guardian F5: documented, not silent).
     pub fn new(token: String, spend_unit: u128, principal_id: String, mode: Erc20Mode) -> Self {
+        debug_assert!(
+            spend_unit >= 1,
+            "spend_unit must be >= 1 (wiring refuses 0)"
+        );
         Self {
             token,
             spend_unit: spend_unit.max(1),
@@ -140,6 +156,10 @@ impl PaymentProvider for Erc20CheckoutProvider {
                 ))
             })?;
         let data = encode_erc20_transfer(&to, amount_base).map_err(PayError::NotCharged)?;
+        // In a release build both settlement arms refuse before using the calldata — the encode
+        // still runs (it is the payee/amount VALIDATION), but `data` itself goes unused there.
+        #[cfg(not(feature = "dev-modes"))]
+        let _ = &data;
 
         match self.mode {
             Erc20Mode::Mock => {

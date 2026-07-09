@@ -731,8 +731,10 @@ impl MethodRegistryExecutor {
     ///   * the canonical terms string (attested): the executor echoes the ACTUAL terms, so
     ///     `Matched` PROVES "the terms are what I believed" and a changed listing reconciles
     ///     `Diverged` — never a fabricated match.
+    ///
     ///   A failed read (no listing, chain unreachable, sold out) DECLINES with the bounded error
-    ///   (⇒ `authorized_not_performed`) — a quote is `performed` only when it truly returned terms.
+    ///   (⇒ `authorized_not_performed`) — a quote is `performed` only when it truly returned
+    ///   terms.
     /// - The terms are ephemeral agent data: they ride the response, not the signed chain (the
     ///   receipt records the quote ACT; no price data lands on-chain beyond what it already
     ///   carries).
@@ -853,7 +855,7 @@ impl MethodRegistryExecutor {
                     },
                     // Another consumer's read for this asset is in flight — refuse to duplicate
                     // it (the single-flight bound); the agent retries shortly.
-                    Err(()) => IntentExecution::Declined {
+                    Err(crate::market_quote::ReadInFlight) => IntentExecution::Declined {
                         reason: "market_quote in progress for this asset — retry shortly"
                             .to_string(),
                     },
