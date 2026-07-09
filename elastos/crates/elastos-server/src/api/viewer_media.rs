@@ -178,28 +178,62 @@ fn store() -> &'static SessionStore {
 }
 
 /// Register a media session under an opaque `session_id` (called by the Library
-/// open orchestration once the decrypt session is established — B3).
+/// open orchestration once the decrypt session is established — B3). BOUNDED (Sprint 47):
+/// admission first sweeps expired sessions and, at the cap, evicts the soonest-to-expire —
+/// see `session_bounds` for the discipline (an evicted session's next read is a plain
+/// re-open; eviction can never grant access).
 pub fn put_media_session(session_id: impl Into<String>, session: MediaSession) {
-    store()
-        .lock()
-        .expect("media session store poisoned")
-        .insert(session_id.into(), Arc::new(session));
+    // Deferred-drop contract (see `session_bounds`): removed sessions are dropped AFTER the lock
+    // releases — a drop can reap an authority subprocess (~1s grace), which must never run under
+    // the store Mutex where it would stall every viewer's lookup.
+    let outcome = {
+        let mut map = store().lock().expect("media session store poisoned");
+        let outcome = super::session_bounds::sweep_and_make_room(
+            &mut map,
+            crate::auth::now_ts(),
+            super::session_bounds::MAX_VIEWER_SESSIONS,
+            |s| s.expires_at,
+        );
+        map.insert(session_id.into(), Arc::new(session));
+        outcome
+    };
+    if outcome.live_evicted > 0 {
+        tracing::warn!(
+            evicted = outcome.live_evicted,
+            cap = super::session_bounds::MAX_VIEWER_SESSIONS,
+            "media session cap reached — evicted the soonest-to-expire live session(s); \
+             sustained pressure here means abandoned viewers or an open loop"
+        );
+    }
+    drop(outcome); // subprocess reaps happen here, off the lock
 }
 
 /// Drop a media session (on close/expiry) so its sealed material is no longer held.
 pub fn remove_media_session(session_id: &str) {
-    store()
+    // Deferred drop (S47 guardian F1): the removed Arc may be the last — its subprocess reap
+    // (~1s grace) must run after the lock releases, not under it.
+    let removed = store()
         .lock()
         .expect("media session store poisoned")
         .remove(session_id);
+    drop(removed);
 }
 
 fn get_media_session(session_id: &str) -> Option<Arc<MediaSession>> {
-    store()
-        .lock()
-        .expect("media session store poisoned")
-        .get(session_id)
-        .cloned()
+    // Lazy sweep on lookup (Sprint 47): expired sessions release what they pin (init bytes,
+    // sealed material, the authority subprocess) on the next access, not only on the next open.
+    // O(len ≤ cap) u64 compares under the lock; the DROPS (which may reap subprocesses) happen
+    // after the lock releases — deferred-drop contract, see `session_bounds`.
+    let (found, swept) = {
+        let mut map = store().lock().expect("media session store poisoned");
+        let now = crate::auth::now_ts();
+        let swept = super::session_bounds::sweep_expired(&mut map, now, &|s: &Arc<
+            MediaSession,
+        >| s.expires_at);
+        (map.get(session_id).cloned(), swept)
+    };
+    drop(swept); // subprocess reaps happen here, off the lock
+    found
 }
 
 /// GET /api/viewers/:viewer/media/:session — the play manifest (metadata only).
@@ -826,6 +860,28 @@ mod tests {
         assert!(get_media_session(id).is_some());
         remove_media_session(id);
         assert!(get_media_session(id).is_none());
+    }
+
+    /// Sprint 47 (Track C1 wiring ratchet): an EXPIRED session is swept by the store's LOOKUP
+    /// path — released on the next `get`, without a client close. The expired session is
+    /// inserted LAST (council S47 guardian F5a), so no later admission sweep could have removed
+    /// it: the `get` is provably the remover. (The cap/eviction POLICY is proven by the
+    /// `session_bounds` unit tests; flooding the process-global store to the cap here would
+    /// evict concurrent tests' sessions, so the policy is deliberately tested on the helper.)
+    #[test]
+    fn an_expired_session_is_swept_by_the_store_without_a_client_close() {
+        let dead = "s47-media-expired-unique";
+        let live = "s47-media-live-unique";
+        put_media_session(live, session(1, 9_000_000_000));
+        put_media_session(dead, session(1, 1)); // expired long ago; inserted LAST
+                                                // The lookup sweeps the expired entry (its pinned resources drop with the Arc, off-lock)…
+        assert!(
+            get_media_session(dead).is_none(),
+            "expired ⇒ swept by the lookup, not served"
+        );
+        // …and a live session is untouched by the sweep.
+        assert!(get_media_session(live).is_some());
+        remove_media_session(live);
     }
 
     #[test]

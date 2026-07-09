@@ -117,28 +117,66 @@ fn store() -> &'static SessionStore {
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Register an object session under an opaque `session_id`.
+/// Register an object session under an opaque `session_id`. BOUNDED (Sprint 47): admission
+/// first sweeps expired sessions and, at the cap, evicts the soonest-to-expire — see
+/// `session_bounds` for the discipline (an evicted session's next read is a plain re-open;
+/// eviction can never grant access). HONEST TEST GAP (council S47 guardian F5b): this store has
+/// no wiring test — `ObjectSession.authority` is a non-optional `Arc<ObjectAuthorityProc>`
+/// holding a real `Child`, so a session cannot be built without spawning; the wiring is
+/// byte-identical to `viewer_media` (which has the test) and the policy is unit-ratcheted in
+/// `session_bounds`.
 pub fn put_object_session(session_id: impl Into<String>, session: ObjectSession) {
-    store()
-        .lock()
-        .expect("object session store poisoned")
-        .insert(session_id.into(), Arc::new(session));
+    // Deferred-drop contract (see `session_bounds`): removed sessions are dropped AFTER the lock
+    // releases — a drop can reap an authority subprocess (~1s grace), which must never run under
+    // the store Mutex where it would stall every viewer's lookup.
+    let outcome = {
+        let mut map = store().lock().expect("object session store poisoned");
+        let outcome = super::session_bounds::sweep_and_make_room(
+            &mut map,
+            crate::auth::now_ts(),
+            super::session_bounds::MAX_VIEWER_SESSIONS,
+            |s| s.expires_at,
+        );
+        map.insert(session_id.into(), Arc::new(session));
+        outcome
+    };
+    if outcome.live_evicted > 0 {
+        tracing::warn!(
+            evicted = outcome.live_evicted,
+            cap = super::session_bounds::MAX_VIEWER_SESSIONS,
+            "object session cap reached — evicted the soonest-to-expire live session(s); \
+             sustained pressure here means abandoned viewers or an open loop"
+        );
+    }
+    drop(outcome); // subprocess reaps happen here, off the lock
 }
 
 /// Drop an object session (on close/expiry).
 pub fn remove_object_session(session_id: &str) {
-    store()
+    // Deferred drop (S47 guardian F1): the removed Arc may be the last — its subprocess reap
+    // (~1s grace) must run after the lock releases, not under it.
+    let removed = store()
         .lock()
         .expect("object session store poisoned")
         .remove(session_id);
+    drop(removed);
 }
 
 fn get_object_session(session_id: &str) -> Option<Arc<ObjectSession>> {
-    store()
-        .lock()
-        .expect("object session store poisoned")
-        .get(session_id)
-        .cloned()
+    // Lazy sweep on lookup (Sprint 47): expired sessions release what they pin (the authority
+    // subprocess) on the next access, not only on the next open. O(len ≤ cap) under the lock;
+    // the DROPS (which may reap subprocesses) happen after the lock releases — deferred-drop
+    // contract, see `session_bounds`.
+    let (found, swept) = {
+        let mut map = store().lock().expect("object session store poisoned");
+        let now = crate::auth::now_ts();
+        let swept = super::session_bounds::sweep_expired(&mut map, now, &|s: &Arc<
+            ObjectSession,
+        >| s.expires_at);
+        (map.get(session_id).cloned(), swept)
+    };
+    drop(swept); // subprocess reaps happen here, off the lock
+    found
 }
 
 /// GET /api/viewers/:viewer/object/:session — the view manifest (metadata only).

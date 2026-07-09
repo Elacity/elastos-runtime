@@ -26,6 +26,7 @@ pub mod owned_ledger;
 pub mod rights_authority;
 pub mod routes;
 pub mod server;
+pub(crate) mod session_bounds;
 pub mod trade_authority;
 pub mod viewer_gateway;
 pub mod viewer_media;
