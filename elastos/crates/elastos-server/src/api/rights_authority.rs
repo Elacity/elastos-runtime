@@ -944,8 +944,11 @@ mod tests {
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let started = std::time::Instant::now();
-        let err = run_rights_capsule(stub.to_str().unwrap(), &serde_json::json!({ "op": "decide" }))
-            .unwrap_err();
+        let err = run_rights_capsule(
+            stub.to_str().unwrap(),
+            &serde_json::json!({ "op": "decide" }),
+        )
+        .unwrap_err();
         match prior {
             Some(v) => std::env::set_var("ELASTOS_CHAIN_READ_DEADLINE_SECS", v),
             None => std::env::remove_var("ELASTOS_CHAIN_READ_DEADLINE_SECS"),

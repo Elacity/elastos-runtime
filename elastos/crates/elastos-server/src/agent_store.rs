@@ -224,12 +224,18 @@ mod tests {
         assert!(get_agent_state(d, "vm-b", "cursor").unwrap().is_none());
         put_agent_state(d, "vm-b", "cursor", "d00d03", "grant-b", "i3").unwrap();
         assert_eq!(
-            get_agent_state(d, "vm-b", "cursor").unwrap().unwrap().value_hash,
+            get_agent_state(d, "vm-b", "cursor")
+                .unwrap()
+                .unwrap()
+                .value_hash,
             "d00d03"
         );
         // A's key is untouched by B's write.
         assert_eq!(
-            get_agent_state(d, "vm-a", "cursor").unwrap().unwrap().value_hash,
+            get_agent_state(d, "vm-a", "cursor")
+                .unwrap()
+                .unwrap()
+                .value_hash,
             "beef02"
         );
     }
@@ -245,13 +251,20 @@ mod tests {
         }
         let store = read_store(&agent_state_path(d).unwrap()).unwrap();
         let a_keys = store.entries.iter().filter(|e| e.capsule == "vm-a").count();
-        assert!(a_keys <= MAX_KEYS_PER_CAPSULE, "A capped at {MAX_KEYS_PER_CAPSULE}, got {a_keys}");
+        assert!(
+            a_keys <= MAX_KEYS_PER_CAPSULE,
+            "A capped at {MAX_KEYS_PER_CAPSULE}, got {a_keys}"
+        );
         // The operator-facing list spans all principals (sorted), unlike the per-agent read.
         let all = list_agent_state(d).unwrap();
         assert!(all.iter().any(|e| e.capsule == "vm-b" && e.key == "keep"));
         assert!(all.iter().any(|e| e.capsule == "vm-a"));
-        assert!(all.windows(2).all(|w| (w[0].capsule.as_str(), w[0].key.as_str())
-            <= (w[1].capsule.as_str(), w[1].key.as_str())), "sorted by (capsule, key)");
+        assert!(
+            all.windows(2)
+                .all(|w| (w[0].capsule.as_str(), w[0].key.as_str())
+                    <= (w[1].capsule.as_str(), w[1].key.as_str())),
+            "sorted by (capsule, key)"
+        );
         // B's key is never evicted by A's flood.
         assert!(get_agent_state(d, "vm-b", "keep").unwrap().is_some());
         // The LAST key written is always readable back — the cap never evicts the just-written key

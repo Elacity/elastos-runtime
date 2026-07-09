@@ -196,7 +196,9 @@ pub(crate) async fn run_mandate(cmd: MandateCommand) -> Result<()> {
             // The durable CapabilityRevoke is attested by the runtime BEFORE this returns success
             // (emit-before-mutate), so reaching here means the revoke record is on the chain and
             // the token is dead in the runtime's persistent revocation store.
-            println!("Token {token_id} revoked: signed CapabilityRevoke attested on the audit chain.");
+            println!(
+                "Token {token_id} revoked: signed CapabilityRevoke attested on the audit chain."
+            );
             if envelope_was_live {
                 println!("Its live standing mandate is killed; further dispatch is denied.");
             } else {
@@ -302,7 +304,12 @@ fn print_mandate_list(list: &serde_json::Value) {
         let methods = m
             .get("methods")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
             .unwrap_or_default();
         println!("\n  [{}] {}", state, s("token_id"));
         println!("    capsule: {}", s("capsule"));
@@ -379,16 +386,12 @@ async fn run_market_demo(asset: &str, amount: u64) -> Result<()> {
             if !resp.status().is_success() {
                 return Err(error_for(resp, "market-demo grant").await);
             }
-            let token_id = resp
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|out| {
-                    out.get("token_id")
-                        .or_else(|| out.get("grant_id"))
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                });
+            let token_id = resp.json::<serde_json::Value>().await.ok().and_then(|out| {
+                out.get("token_id")
+                    .or_else(|| out.get("grant_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            });
             match token_id {
                 Some(t) => Ok(t),
                 None => {
@@ -412,7 +415,14 @@ async fn run_market_demo(asset: &str, amount: u64) -> Result<()> {
 
     // From here live authorities exist — revoke BOTH on ANY exit.
     let result = market_demo_buy(
-        &http, &api_url, &shell_token, &agent, &quote_token, &pay_token, asset, amount,
+        &http,
+        &api_url,
+        &shell_token,
+        &agent,
+        &quote_token,
+        &pay_token,
+        asset,
+        amount,
     )
     .await;
     println!("── 5. REVOKE — the demo leaves no live authority behind ──");
@@ -490,7 +500,10 @@ async fn market_demo_buy(
         return Err(error_for(resp, "market-demo quote").await);
     }
     let out: serde_json::Value = resp.json().await?;
-    let quote_outcome = out.get("outcome").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let quote_outcome = out
+        .get("outcome")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
     match out.get("report").and_then(|v| v.as_str()) {
         Some(terms) if quote_outcome == "performed" => {
             println!("the agent read the terms: {terms}");
@@ -502,7 +515,9 @@ async fn market_demo_buy(
         _ => {
             let reason = out.get("reason").and_then(|v| v.as_str()).unwrap_or("-");
             println!("quote did not return terms: outcome={quote_outcome} ({reason})");
-            println!("decision: NOT buying — an agent that cannot price an asset does not spend on it\n");
+            println!(
+                "decision: NOT buying — an agent that cannot price an asset does not spend on it\n"
+            );
             bail!("market-demo stopped at the quote (no terms) — nothing was bought");
         }
     }
@@ -529,7 +544,10 @@ async fn market_demo_buy(
         return Err(error_for(resp, "market-demo dispatch").await);
     }
     let out: serde_json::Value = resp.json().await?;
-    let outcome = out.get("outcome").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let outcome = out
+        .get("outcome")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
     let reason = out.get("reason").and_then(|v| v.as_str()).unwrap_or("-");
     println!("dispatched runtime.pay {amount} → {asset}: outcome={outcome} ({reason})");
     println!(
@@ -576,16 +594,12 @@ async fn run_demo() -> Result<()> {
     // The grant SUCCEEDED (2xx) — from here a live mandate may exist. If we cannot read its token
     // id, we cannot target a cleanup revoke, so warn LOUDLY (the mandate is TTL-bounded and findable
     // via `mandate list`) rather than return silently as though nothing was granted.
-    let token_id = resp
-        .json::<serde_json::Value>()
-        .await
-        .ok()
-        .and_then(|out| {
-            out.get("token_id")
-                .or_else(|| out.get("grant_id"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        });
+    let token_id = resp.json::<serde_json::Value>().await.ok().and_then(|out| {
+        out.get("token_id")
+            .or_else(|| out.get("grant_id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    });
     let token_id = match token_id {
         Some(t) => t,
         None => {
@@ -603,7 +617,9 @@ async fn run_demo() -> Result<()> {
     match demo_after_grant(&http, &api_url, &shell_token, &token_id, &agent).await {
         Ok(()) => Ok(()),
         Err(e) => {
-            eprintln!("demo step failed; revoking the demo mandate so no live authority is left behind…");
+            eprintln!(
+                "demo step failed; revoking the demo mandate so no live authority is left behind…"
+            );
             let cleanup = http
                 .post(format!("{api_url}/api/standing-grants/revoke"))
                 .header("Authorization", format!("Bearer {shell_token}"))
@@ -659,7 +675,10 @@ async fn agent_dispatch(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
-    let reason = out.get("reason").and_then(|v| v.as_str()).map(str::to_string);
+    let reason = out
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     Ok((outcome, reason))
 }
 
@@ -685,7 +704,8 @@ async fn demo_after_grant(
     let act2_id = format!("demo-act-2-{token_id}");
 
     println!("\n── 3. ACT — the agent signs an intent and the runtime REALLY performs it ──");
-    let (outcome, _) = agent_dispatch(http, api_url, shell_token, agent, token_id, &act1_id).await?;
+    let (outcome, _) =
+        agent_dispatch(http, api_url, shell_token, agent, token_id, &act1_id).await?;
     println!("agent dispatched runtime.audit_verify → {outcome}");
     if outcome != "performed" {
         bail!("expected the agent's authorized act to be performed, got {outcome:?}");
@@ -705,8 +725,12 @@ async fn demo_after_grant(
     println!("revoked {token_id}: signed CapabilityRevoke on the chain, envelope killed\n");
 
     println!("── 5. ACT AGAIN — the SAME agent, now denied (the kill switch has teeth) ──");
-    let (after, reason) = agent_dispatch(http, api_url, shell_token, agent, token_id, &act2_id).await?;
-    println!("agent re-dispatched after revoke → {after} ({})", reason.as_deref().unwrap_or("-"));
+    let (after, reason) =
+        agent_dispatch(http, api_url, shell_token, agent, token_id, &act2_id).await?;
+    println!(
+        "agent re-dispatched after revoke → {after} ({})",
+        reason.as_deref().unwrap_or("-")
+    );
     // Must be denied SPECIFICALLY because the mandate was revoked — not some incidental denial.
     if after != "denied" || reason.as_deref() != Some("revoked") {
         bail!("expected the post-revoke act to be denied with reason=revoked, got {after:?}/{reason:?}");
@@ -763,8 +787,12 @@ async fn demo_after_grant(
     if !verdict.authenticated {
         bail!("demo receipt failed verification: {verdict:?}");
     }
-    println!("\nThe loop is closed: a scoped mandate GRANTED to one agent key, a real act PERFORMED");
-    println!("under it, the kill switch REVOKED it, a post-revoke attempt DENIED, and the whole thing");
+    println!(
+        "\nThe loop is closed: a scoped mandate GRANTED to one agent key, a real act PERFORMED"
+    );
+    println!(
+        "under it, the kill switch REVOKED it, a post-revoke attempt DENIED, and the whole thing"
+    );
     println!("PROVEN — hand receipt + `elastos verify-receipt` to anyone; no runtime, no trust in this box.");
     Ok(())
 }

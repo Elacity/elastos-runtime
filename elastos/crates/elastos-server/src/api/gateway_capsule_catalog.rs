@@ -103,26 +103,26 @@ pub(super) async fn capsule_interface_invoke(
 
     let secure = request_uses_tls(&headers);
     let output = match enforce_affordance_invocation_policy(&resolved) {
-        Ok(()) => match dispatch_capsule_affordance(&state, &context, &resolved, &request, secure)
-            .await
-        {
-            Ok(output) => output,
-            Err((status, code, message)) => {
-                let _ = append_provider_effect_audit(
-                    &state.data_dir,
-                    ProviderEffectAuditInput {
-                        capsule_id: &resolved.capsule,
-                        event_type: "capsule.affordance.failed",
-                        principal_id: &context.principal_id,
-                        session_id: &context.session_id,
-                        request_id: &request_id,
-                        result: "failed",
-                        reason: &message,
-                    },
-                );
-                return capsule_invoke_error(&resolved, status, code, &message);
+        Ok(()) => {
+            match dispatch_capsule_affordance(&state, &context, &resolved, &request, secure).await {
+                Ok(output) => output,
+                Err((status, code, message)) => {
+                    let _ = append_provider_effect_audit(
+                        &state.data_dir,
+                        ProviderEffectAuditInput {
+                            capsule_id: &resolved.capsule,
+                            event_type: "capsule.affordance.failed",
+                            principal_id: &context.principal_id,
+                            session_id: &context.session_id,
+                            request_id: &request_id,
+                            result: "failed",
+                            reason: &message,
+                        },
+                    );
+                    return capsule_invoke_error(&resolved, status, code, &message);
+                }
             }
-        },
+        }
         Err((status, code, message)) => {
             let _ = append_provider_effect_audit(
                 &state.data_dir,

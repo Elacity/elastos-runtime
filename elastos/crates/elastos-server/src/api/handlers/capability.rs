@@ -1219,12 +1219,19 @@ pub async fn issue_mandate(
     let agent_pubkey = match input.agent_pubkey.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(hex_key) => {
-            let bytes = hex::decode(hex_key)
-                .map_err(|e| (StatusCode::BAD_REQUEST, format!("agent_pubkey not hex: {e}")))?;
+            let bytes = hex::decode(hex_key).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("agent_pubkey not hex: {e}"),
+                )
+            })?;
             let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
                 (
                     StatusCode::BAD_REQUEST,
-                    format!("agent_pubkey must be 32 bytes (64 hex chars), got {}", bytes.len()),
+                    format!(
+                        "agent_pubkey must be 32 bytes (64 hex chars), got {}",
+                        bytes.len()
+                    ),
                 )
             })?;
             // Reject a key that is not a real, non-weak ed25519 point (council, Sprint 20 red-team
@@ -1257,9 +1264,7 @@ pub async fn issue_mandate(
     // fail-closed at the mint. (The gateway shell already binds every mint; this closes the
     // raw-API/CLI path for the confidentiality-sensitive read. The write side `state_put` keeps its
     // pre-existing accepted unbound contract — a symmetric tightening is tracked in KNOWN_GAPS G-M4.)
-    if agent_pubkey.is_none()
-        && input.methods.iter().any(|m| m == "runtime.state_get")
-    {
+    if agent_pubkey.is_none() && input.methods.iter().any(|m| m == "runtime.state_get") {
         return Err((
             StatusCode::BAD_REQUEST,
             "a mandate authorizing runtime.state_get must bind an agent key — an unbound state-read \
@@ -1348,9 +1353,10 @@ pub async fn issue_mandate(
             // rather than an orphan grant a receipt-verifier would read as a live, never-revoked
             // mandate. Best-effort: the grant is already durable; this can only make the record more
             // honest, never less.
-            capability_manager
-                .audit_log()
-                .capability_revoke(token.id(), "issuance aborted: standing-registry persist failed");
+            capability_manager.audit_log().capability_revoke(
+                token.id(),
+                "issuance aborted: standing-registry persist failed",
+            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("mandate could not be durably recorded — not issued: {e}"),
@@ -1412,12 +1418,15 @@ pub async fn revoke_mandate(
     // Durable custody first (emit-before-mutate): a revoke that cannot be signed onto the audit
     // chain does not happen — mirroring revoke_capability. The envelope stays live so the failure
     // is loud and re-runnable, never a silent half-revoke the receipt can't prove.
-    capability_manager.revoke(token_id, reason).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("revoke could not be durably attested: {e}"),
-        )
-    })?;
+    capability_manager
+        .revoke(token_id, reason)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("revoke could not be durably attested: {e}"),
+            )
+        })?;
     // Kill the envelope by the CANONICAL id (the parsed token's lowercase-hex Display form — the
     // exact key the registry stores). Keying off the caller's raw string would let an UPPERCASE
     // spelling revoke the token yet miss the envelope, leaving the dispatch path live. A registry
@@ -1606,8 +1615,9 @@ pub(crate) fn set_spend_budget_core(
         StatusCode::INTERNAL_SERVER_ERROR,
         "budget vanished after set".to_string(),
     ))?;
-    let (pending_units, pending_count) =
-        ledger.map(|l| l.pending_for(&input.capsule)).unwrap_or((0, 0));
+    let (pending_units, pending_count) = ledger
+        .map(|l| l.pending_for(&input.capsule))
+        .unwrap_or((0, 0));
     Ok(SpendBudgetOutput {
         capsule: input.capsule,
         limit: snap.limit,
@@ -1782,19 +1792,17 @@ pub(crate) fn reconcile_payment_core(
             }
         }
     };
-    let attested = audit_log.emit(
-        elastos_runtime::primitives::audit::AuditEvent::Custom {
-            event_type: "payment_reconciled".to_string(),
-            details: serde_json::json!({
-                "idempotency_key": record.idempotency_key,
-                "capsule": record.capsule,
-                "payee": record.payee,
-                "amount": record.amount,
-                "charged": input.charged,
-                "refunded": refunded,
-            }),
-        },
-    );
+    let attested = audit_log.emit(elastos_runtime::primitives::audit::AuditEvent::Custom {
+        event_type: "payment_reconciled".to_string(),
+        details: serde_json::json!({
+            "idempotency_key": record.idempotency_key,
+            "capsule": record.capsule,
+            "payee": record.payee,
+            "amount": record.amount,
+            "charged": input.charged,
+            "refunded": refunded,
+        }),
+    });
     if let Err(e) = attested {
         tracing::error!(
             key = %record.idempotency_key,
@@ -2130,13 +2138,15 @@ pub async fn dispatch_standing_intent(
     // bounded, not monotonic). Checked AFTER authenticity (a forged declaration is rejected first)
     // and BEFORE the replay guard registers the id, so a stale/future intent never burns an id.
     let now_secs = elastos_common::SecureTimestamp::now().unix_secs;
-    if let Err(reason) = elastos_runtime::capability::check_intent_freshness(
-        intent.declared_at.unix_secs,
-        now_secs,
-    ) {
+    if let Err(reason) =
+        elastos_runtime::capability::check_intent_freshness(intent.declared_at.unix_secs, now_secs)
+    {
         return Err((
             StatusCode::BAD_REQUEST,
-            format!("intent declaration outside the freshness window: {}", reason.as_str()),
+            format!(
+                "intent declaration outside the freshness window: {}",
+                reason.as_str()
+            ),
         ));
     }
     // GRANT EXISTENCE (G-M7, Sprint 21 council fix): the intent names a standing grant. Resolve it
@@ -2207,7 +2217,10 @@ pub async fn dispatch_standing_intent(
                 StatusCode::CONFLICT,
                 // "consumed", not "dispatched" (guardian F5): the id burns when REGISTERED — a
                 // prior attempt may have been refused after registration and never acted.
-                format!("intent {} was already consumed (replay refused)", intent.intent_id),
+                format!(
+                    "intent {} was already consumed (replay refused)",
+                    intent.intent_id
+                ),
             ));
         }
         Err(e) => {
@@ -2302,67 +2315,67 @@ pub async fn dispatch_standing_intent(
     let intent_for_gate = intent.clone();
     let out = tokio::task::spawn_blocking(move || {
         let outcome = dispatch_service.dispatch(&intent_for_gate, move || {
-        match executor.execute(&intent_for_exec) {
-            crate::intent_executor::IntentExecution::Declined { reason } => {
-                if reason.contains("INDETERMINATE") {
-                    tracing::error!(
-                        capsule = %intent_for_exec.capsule,
-                        "indeterminate money outcome on dispatch: {reason}"
-                    );
+            match executor.execute(&intent_for_exec) {
+                crate::intent_executor::IntentExecution::Declined { reason } => {
+                    if reason.contains("INDETERMINATE") {
+                        tracing::error!(
+                            capsule = %intent_for_exec.capsule,
+                            "indeterminate money outcome on dispatch: {reason}"
+                        );
+                    }
+                    if let Ok(mut slot) = decline_reason_w.lock() {
+                        *slot = Some(reason);
+                    }
+                    None
                 }
-                if let Ok(mut slot) = decline_reason_w.lock() {
-                    *slot = Some(reason);
+                crate::intent_executor::IntentExecution::Performed {
+                    capsule,
+                    method_id,
+                    input_hash,
+                    resource,
+                    action: performed_action,
+                    rail_ref,
+                    agent_visible_report,
+                } => {
+                    // Stash the rail reference for the out-of-closure use-record. Set only when the
+                    // executor actually settled on a rail (a DRM/pay act); the emit binds it onto the
+                    // chain ONLY on a Matched reconciliation.
+                    if let Some(rail_ref) = rail_ref {
+                        if let Ok(mut slot) = rail_ref_w.lock() {
+                            *slot = Some(rail_ref);
+                        }
+                    }
+                    // Stash the executor's EXPLICIT agent disclosure (Sprint 39 — market_quote's
+                    // terms). Only what the executor opted in reaches the response; the pipeline
+                    // never surfaces receipt echoes wholesale (state_get's one-bit rule stays
+                    // structural).
+                    if let Some(report) = agent_visible_report {
+                        if let Ok(mut slot) = report_w.lock() {
+                            *slot = Some(report);
+                        }
+                    }
+                    let performed = match performed_action.to_lowercase().as_str() {
+                        "read" => Action::Read,
+                        "write" => Action::Write,
+                        "execute" => Action::Execute,
+                        "delete" => Action::Delete,
+                        "message" => Action::Message,
+                        "admin" => Action::Admin,
+                        _ => {
+                            unrepresentable_w.store(true, std::sync::atomic::Ordering::SeqCst);
+                            return None;
+                        }
+                    };
+                    Some(manager.issue_affordance_receipt(
+                        &token_str,
+                        &capsule,
+                        &method_id,
+                        &input_hash,
+                        &resource,
+                        performed,
+                    ))
                 }
-                None
             }
-            crate::intent_executor::IntentExecution::Performed {
-                capsule,
-                method_id,
-                input_hash,
-                resource,
-                action: performed_action,
-                rail_ref,
-                agent_visible_report,
-            } => {
-                // Stash the rail reference for the out-of-closure use-record. Set only when the
-                // executor actually settled on a rail (a DRM/pay act); the emit binds it onto the
-                // chain ONLY on a Matched reconciliation.
-                if let Some(rail_ref) = rail_ref {
-                    if let Ok(mut slot) = rail_ref_w.lock() {
-                        *slot = Some(rail_ref);
-                    }
-                }
-                // Stash the executor's EXPLICIT agent disclosure (Sprint 39 — market_quote's
-                // terms). Only what the executor opted in reaches the response; the pipeline
-                // never surfaces receipt echoes wholesale (state_get's one-bit rule stays
-                // structural).
-                if let Some(report) = agent_visible_report {
-                    if let Ok(mut slot) = report_w.lock() {
-                        *slot = Some(report);
-                    }
-                }
-                let performed = match performed_action.to_lowercase().as_str() {
-                    "read" => Action::Read,
-                    "write" => Action::Write,
-                    "execute" => Action::Execute,
-                    "delete" => Action::Delete,
-                    "message" => Action::Message,
-                    "admin" => Action::Admin,
-                    _ => {
-                        unrepresentable_w.store(true, std::sync::atomic::Ordering::SeqCst);
-                        return None;
-                    }
-                };
-                Some(manager.issue_affordance_receipt(
-                    &token_str,
-                    &capsule,
-                    &method_id,
-                    &input_hash,
-                    &resource,
-                    performed,
-                ))
-            }
-        }
         });
         if unrepresentable.load(std::sync::atomic::Ordering::SeqCst) {
             return Err((
@@ -2665,11 +2678,22 @@ mod tests {
         .0;
 
         let cards = mandate_cards(&state.standing_service, &state.capability_manager).await;
-        let bc = cards.mandates.iter().find(|c| c.token_id == bound.grant_id).unwrap();
+        let bc = cards
+            .mandates
+            .iter()
+            .find(|c| c.token_id == bound.grant_id)
+            .unwrap();
         assert!(bc.agent_bound, "bound mandate card shows agent_bound");
         assert_eq!(bc.agent_pubkey.as_deref(), Some(agent.as_str()));
-        let uc = cards.mandates.iter().find(|c| c.token_id == unbound.grant_id).unwrap();
-        assert!(!uc.agent_bound, "unbound mandate card shows agent_bound=false");
+        let uc = cards
+            .mandates
+            .iter()
+            .find(|c| c.token_id == unbound.grant_id)
+            .unwrap();
+        assert!(
+            !uc.agent_bound,
+            "unbound mandate card shows agent_bound=false"
+        );
         assert!(uc.agent_pubkey.is_none());
     }
 
@@ -2699,9 +2723,15 @@ mod tests {
                 }),
             )
             .await;
-            assert!(matches!(res, Err((StatusCode::BAD_REQUEST, _))), "weak key {weak} refused");
+            assert!(
+                matches!(res, Err((StatusCode::BAD_REQUEST, _))),
+                "weak key {weak} refused"
+            );
         }
-        assert!(state.standing_service.list().is_empty(), "no weak-bound mandate was minted");
+        assert!(
+            state.standing_service.list().is_empty(),
+            "no weak-bound mandate was minted"
+        );
         // A REAL key still binds.
         let real = hex::encode(
             ed25519_dalek::SigningKey::generate(&mut rand::thread_rng())
@@ -2852,7 +2882,10 @@ mod tests {
             "a revoked mandate is NEVER crash-revived"
         );
         assert!(
-            rebooted.get(&out.grant_id).expect("still queryable").revoked,
+            rebooted
+                .get(&out.grant_id)
+                .expect("still queryable")
+                .revoked,
             "the reloaded record is honestly marked revoked"
         );
     }
@@ -2894,21 +2927,41 @@ mod tests {
     #[test]
     fn responsible_entity_validation_is_syntactic_and_fail_closed() {
         // Accepted.
-        for ok in ["did:web:acme.example", "did:key:z6Mk...", "did:elastos:iabc123", "did:web:acme.example%3A8443"] {
-            assert!(validate_responsible_entity(Some(ok)).unwrap().is_some(), "should accept {ok}");
+        for ok in [
+            "did:web:acme.example",
+            "did:key:z6Mk...",
+            "did:elastos:iabc123",
+            "did:web:acme.example%3A8443",
+        ] {
+            assert!(
+                validate_responsible_entity(Some(ok)).unwrap().is_some(),
+                "should accept {ok}"
+            );
         }
         // None / blank ⇒ Ok(None) (optional field).
         assert!(validate_responsible_entity(None).unwrap().is_none());
         assert!(validate_responsible_entity(Some("   ")).unwrap().is_none());
         // Rejected shapes (council F3): no method, no id, uppercase method, non-DID, bad char, long.
         for bad in [
-            "did:", "did:web", "did::x", "did:WEB:x", "notadid", "did:web:a b",
-            "did:web:a/path", "did:web:a<script>",
+            "did:",
+            "did:web",
+            "did::x",
+            "did:WEB:x",
+            "notadid",
+            "did:web:a b",
+            "did:web:a/path",
+            "did:web:a<script>",
         ] {
-            assert!(validate_responsible_entity(Some(bad)).is_err(), "should reject {bad:?}");
+            assert!(
+                validate_responsible_entity(Some(bad)).is_err(),
+                "should reject {bad:?}"
+            );
         }
         let long = format!("did:web:{}", "a".repeat(300));
-        assert!(validate_responsible_entity(Some(&long)).is_err(), "over-long rejected");
+        assert!(
+            validate_responsible_entity(Some(&long)).is_err(),
+            "over-long rejected"
+        );
     }
 
     /// Sprint 32 end-to-end: the responsible-entity attribution travels from the grant input,
@@ -2939,7 +2992,10 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(bad.0, StatusCode::BAD_REQUEST);
-        assert!(state.standing_service.list().is_empty(), "a bad DID mints nothing");
+        assert!(
+            state.standing_service.list().is_empty(),
+            "a bad DID mints nothing"
+        );
 
         // A valid entity mints, surfaces on the card, and rides the SIGNED grant record.
         let out = issue_mandate(
@@ -2958,10 +3014,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let cards =
-            mandate_cards(&state.standing_service, &state.capability_manager).await;
-        let card = cards.mandates.iter().find(|c| c.token_id == out.token_id).unwrap();
-        assert_eq!(card.responsible_entity.as_deref(), Some("did:web:acme.example"));
+        let cards = mandate_cards(&state.standing_service, &state.capability_manager).await;
+        let card = cards
+            .mandates
+            .iter()
+            .find(|c| c.token_id == out.token_id)
+            .unwrap();
+        assert_eq!(
+            card.responsible_entity.as_deref(),
+            Some("did:web:acme.example")
+        );
 
         // Export the portable receipt and verify it off-box against the pinned signer — the
         // liability DID is IN the signed grant record, so a verified receipt authenticates it.
@@ -2969,7 +3031,11 @@ mod tests {
             .await
             .unwrap()
             .0;
-        let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();
+        let signer = state
+            .capability_manager
+            .audit_log()
+            .verifying_key_hex()
+            .unwrap();
         assert!(
             elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer))
                 .authenticated,
@@ -2978,10 +3044,12 @@ mod tests {
         let grant_record = receipt
             .records
             .iter()
-            .find(|r| matches!(
-                r.event,
-                elastos_runtime::primitives::audit::AuditEvent::CapabilityGrant { .. }
-            ))
+            .find(|r| {
+                matches!(
+                    r.event,
+                    elastos_runtime::primitives::audit::AuditEvent::CapabilityGrant { .. }
+                )
+            })
             .expect("the receipt carries the grant record");
         let event_json = serde_json::to_string(&grant_record.event).unwrap();
         assert!(
@@ -3044,7 +3112,10 @@ mod tests {
             }),
         )
         .await;
-        assert!(res.is_err(), "a registry-persist failure aborts the mint (500), no mandate issued");
+        assert!(
+            res.is_err(),
+            "a registry-persist failure aborts the mint (500), no mandate issued"
+        );
 
         // The chain carries the grant AND a compensating revoke — not an orphan live grant.
         let receipt = audit_log
@@ -3060,7 +3131,10 @@ mod tests {
             .iter()
             .filter(|r| matches!(&r.event, AuditEvent::CapabilityRevoke { reason, .. } if reason.contains("issuance aborted")))
             .count();
-        assert_eq!(grants, 1, "the grant did land on the chain (emit-before-issue)");
+        assert_eq!(
+            grants, 1,
+            "the grant did land on the chain (emit-before-issue)"
+        );
         assert_eq!(
             aborted_revokes, 1,
             "and a compensating revoke followed it — the orphan grant is neutralized (F2)"
@@ -3094,7 +3168,10 @@ mod tests {
         .await
         .expect("issue ok")
         .0;
-        assert_eq!(out.token_id, out.grant_id, "the grant id IS the mandate's token id");
+        assert_eq!(
+            out.token_id, out.grant_id,
+            "the grant id IS the mandate's token id"
+        );
 
         // The agent acts under the mandate. This injects the CapabilityUse the way
         // CapabilityManager::validate emits it on every token redemption (manager.rs, check #8
@@ -3140,7 +3217,10 @@ mod tests {
             .verifying_key_hex()
             .expect("signed log");
         let verdict = elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer));
-        assert!(verdict.authenticated, "receipt authenticates when pinned: {verdict:?}");
+        assert!(
+            verdict.authenticated,
+            "receipt authenticates when pinned: {verdict:?}"
+        );
         assert!(verdict.set_binding_ok && verdict.scope_ok);
 
         // An unknown mandate is ABSENT (404), never an empty "clean" receipt.
@@ -3242,8 +3322,15 @@ mod tests {
         .0;
         let pay = |intent_id: &str, amount: &str| {
             IntentDeclarationV1::issue(
-                &agent_sk, agent_sk.verifying_key().to_bytes(), intent_id, "vm-ap-agent",
-                "runtime.pay", amount, &payee_resource, "execute", &out.token_id,
+                &agent_sk,
+                agent_sk.verifying_key().to_bytes(),
+                intent_id,
+                "vm-ap-agent",
+                "runtime.pay",
+                amount,
+                &payee_resource,
+                "execute",
+                &out.token_id,
             )
         };
 
@@ -3252,9 +3339,15 @@ mod tests {
             .await
             .expect("within cap")
             .0;
-        assert_eq!(r1.outcome, "performed", "the agent paid the vendor under its mandate");
+        assert_eq!(
+            r1.outcome, "performed",
+            "the agent paid the vendor under its mandate"
+        );
         assert_eq!(meter.remaining("vm-ap-agent"), 300);
-        assert_eq!(*provider.payments.lock().unwrap(), vec![("acme-vendor".to_string(), 200)]);
+        assert_eq!(
+            *provider.payments.lock().unwrap(),
+            vec![("acme-vendor".to_string(), 200)]
+        );
 
         // Over the remaining cap (300 left, ask 400) → authorized_not_performed; NO money moves.
         let r2 = dispatch_agent_intent(State(state.clone()), Json(pay("inv-2", "400")))
@@ -3269,18 +3362,30 @@ mod tests {
         // it, a cap-refusal and an indeterminate money outcome are indistinguishable to the
         // operator, and nothing surfaces the reconciliation idempotency key.
         assert!(
-            r2.reason.as_deref().is_some_and(|r| r.contains("spend cap")),
+            r2.reason
+                .as_deref()
+                .is_some_and(|r| r.contains("spend cap")),
             "the dispatch response carries the executor's decline reason: {:?}",
             r2.reason
         );
-        assert_eq!(meter.remaining("vm-ap-agent"), 300, "the refused payment left the cap untouched");
-        assert_eq!(provider.payments.lock().unwrap().len(), 1, "still only the one real payment");
+        assert_eq!(
+            meter.remaining("vm-ap-agent"),
+            300,
+            "the refused payment left the cap untouched"
+        );
+        assert_eq!(
+            provider.payments.lock().unwrap().len(),
+            1,
+            "still only the one real payment"
+        );
 
         // Revoke the mandate → the SAME payment is denied outright.
         assert!(
             revoke_standing_grant(
                 State(state.clone()),
-                Json(RevokeStandingGrantInput { grant_id: out.grant_id.clone() }),
+                Json(RevokeStandingGrantInput {
+                    grant_id: out.grant_id.clone()
+                }),
             )
             .await
             .unwrap()
@@ -3299,9 +3404,14 @@ mod tests {
             .await
             .unwrap()
             .0;
-        let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();
+        let signer = state
+            .capability_manager
+            .audit_log()
+            .verifying_key_hex()
+            .unwrap();
         assert!(
-            elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer)).authenticated,
+            elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer))
+                .authenticated,
             "the pay-mandate's receipt verifies off-box"
         );
     }
@@ -3327,14 +3437,16 @@ mod tests {
 
     /// A scripted DRM settler that records whether it ran and returns a fixed outcome.
     struct WedgeSettler {
-        outcome: std::sync::Mutex<Option<Result<crate::drm_marketplace::DrmSettlement, &'static str>>>,
+        outcome:
+            std::sync::Mutex<Option<Result<crate::drm_marketplace::DrmSettlement, &'static str>>>,
         ran: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
     impl crate::drm_marketplace::DrmSettler for WedgeSettler {
         fn quote(
             &self,
             _b: &crate::drm_marketplace::DrmBinding,
-        ) -> Result<crate::drm_marketplace::DrmQuote, crate::drm_marketplace::DrmSettleError> {
+        ) -> Result<crate::drm_marketplace::DrmQuote, crate::drm_marketplace::DrmSettleError>
+        {
             // A FREE quote — the S36 price gate is a no-op for the S34/S35 e2e (they test the
             // lifecycle, not the price gate, which has its own unit tests).
             Ok(crate::drm_marketplace::DrmQuote {
@@ -3360,7 +3472,9 @@ mod tests {
     }
 
     /// A scripted DRM confirmer keyed by tx hash (Sprint 35) — the reconciler's chain verdict.
-    struct WedgeConfirmer(std::collections::HashMap<String, crate::drm_marketplace::DrmConfirmation>);
+    struct WedgeConfirmer(
+        std::collections::HashMap<String, crate::drm_marketplace::DrmConfirmation>,
+    );
     impl crate::drm_marketplace::DrmConfirmer for WedgeConfirmer {
         fn confirm(&self, tx_hash: &str) -> crate::drm_marketplace::DrmConfirmation {
             self.0.get(tx_hash).cloned().unwrap_or_else(|| {
@@ -3378,7 +3492,8 @@ mod tests {
         fn quote(
             &self,
             _b: &crate::drm_marketplace::DrmBinding,
-        ) -> Result<crate::drm_marketplace::DrmQuote, crate::drm_marketplace::DrmSettleError> {
+        ) -> Result<crate::drm_marketplace::DrmQuote, crate::drm_marketplace::DrmSettleError>
+        {
             Ok(crate::drm_marketplace::DrmQuote {
                 price: "0".to_string(),
                 pay_token: "usdc".to_string(),
@@ -3431,11 +3546,7 @@ mod tests {
     async fn drm_pay_mandate(
         state: &CapabilityState,
         asset: &str,
-    ) -> (
-        ed25519_dalek::SigningKey,
-        String,
-        String,
-    ) {
+    ) -> (ed25519_dalek::SigningKey, String, String) {
         let payee_resource = format!("{}{asset}", crate::intent_executor::PAY_PREFIX);
         let agent_sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
         let agent_pub = hex::encode(agent_sk.verifying_key().to_bytes());
@@ -3494,8 +3605,15 @@ mod tests {
         meter.set_budget("vm-shopper", 500).unwrap();
         let (agent_sk, payee_resource, token_id) = drm_pay_mandate(&state, asset).await;
         let buy = IntentDeclarationV1::issue(
-            &agent_sk, agent_sk.verifying_key().to_bytes(), "buy-1", "vm-shopper",
-            "runtime.pay", "300", &payee_resource, "execute", &token_id,
+            &agent_sk,
+            agent_sk.verifying_key().to_bytes(),
+            "buy-1",
+            "vm-shopper",
+            "runtime.pay",
+            "300",
+            &payee_resource,
+            "execute",
+            &token_id,
         );
         let idem = format!("flint-{}", buy.signature);
 
@@ -3508,15 +3626,29 @@ mod tests {
             r1.outcome, "authorized_not_performed",
             "a broadcast-accepted DRM buy is NOT attested performed until confirmed"
         );
-        assert!(ran.load(std::sync::atomic::Ordering::SeqCst), "the buy broadcast");
-        assert_eq!(meter.remaining("vm-shopper"), 200, "the reservation is held (not refunded)");
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the buy broadcast"
+        );
+        assert_eq!(
+            meter.remaining("vm-shopper"),
+            200,
+            "the reservation is held (not refunded)"
+        );
         let rec = ledger.get(&idem).expect("a pending rail record exists");
         assert_eq!(rec.status, crate::payment_ledger::PaymentStatus::Pending);
         // Sprint 44: the production pay closure stamps the DRM rail tag end-to-end (through
         // `provider.rail()`), so the reconciler selects this by tag, not by the note.
         assert_eq!(rec.rail, crate::payment_ledger::PaymentRail::Drm);
-        assert_eq!(rec.rail_note, "drm:tx=0xC0FFEE;op=0xopER;tid=42;price=0;tok=usdc");
-        assert_eq!(rec.token_id.as_deref(), Some(token_id.as_str()), "bound to the mandate");
+        assert_eq!(
+            rec.rail_note,
+            "drm:tx=0xC0FFEE;op=0xopER;tid=42;price=0;tok=usdc"
+        );
+        assert_eq!(
+            rec.token_id.as_deref(),
+            Some(token_id.as_str()),
+            "bound to the mandate"
+        );
 
         // The receipt carries NO rail_ref yet (the tx is not confirmed).
         use elastos_runtime::primitives::audit::AuditEvent;
@@ -3527,7 +3659,10 @@ mod tests {
         assert!(
             !receipt.records.iter().any(|r| matches!(
                 &r.event,
-                AuditEvent::CapabilityUse { rail_ref: Some(_), .. }
+                AuditEvent::CapabilityUse {
+                    rail_ref: Some(_),
+                    ..
+                }
             )),
             "no rail_ref on the receipt before confirmation"
         );
@@ -3553,7 +3688,11 @@ mod tests {
             crate::payment_ledger::PaymentStatus::ResolvedCharged,
             "spend stands"
         );
-        assert_eq!(meter.remaining("vm-shopper"), 200, "confirmation does not refund");
+        assert_eq!(
+            meter.remaining("vm-shopper"),
+            200,
+            "confirmation does not refund"
+        );
 
         // The receipt now carries the confirmed settlement's rail_ref, and verifies off-box.
         let receipt = mandate_receipt(State(state.clone()), Path(token_id.clone()))
@@ -3561,7 +3700,11 @@ mod tests {
             .unwrap()
             .0;
         let use_rail_ref = receipt.records.iter().find_map(|r| match &r.event {
-            AuditEvent::CapabilityUse { rail_ref, success: true, .. } => rail_ref.clone(),
+            AuditEvent::CapabilityUse {
+                rail_ref,
+                success: true,
+                ..
+            } => rail_ref.clone(),
             _ => None,
         });
         assert_eq!(
@@ -3569,9 +3712,14 @@ mod tests {
             Some("drm:tx=0xC0FFEE;op=0xopER;tid=42;price=0;tok=usdc"),
             "the confirmed receipt's pay-use row carries the on-chain settlement reference"
         );
-        let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();
+        let signer = state
+            .capability_manager
+            .audit_log()
+            .verifying_key_hex()
+            .unwrap();
         assert!(
-            elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer)).authenticated,
+            elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer))
+                .authenticated,
             "the confirmed DRM-buy receipt verifies off-box"
         );
     }
@@ -3596,11 +3744,21 @@ mod tests {
         meter.set_budget("vm-shopper", 500).unwrap();
         let (agent_sk, payee_resource, token_id) = drm_pay_mandate(&state, asset).await;
         let buy = IntentDeclarationV1::issue(
-            &agent_sk, agent_sk.verifying_key().to_bytes(), "buy-x", "vm-shopper",
-            "runtime.pay", "100", &payee_resource, "execute", &token_id,
+            &agent_sk,
+            agent_sk.verifying_key().to_bytes(),
+            "buy-x",
+            "vm-shopper",
+            "runtime.pay",
+            "100",
+            &payee_resource,
+            "execute",
+            &token_id,
         );
         // First dispatch: broadcast ⇒ pending, settler ran once, 100 reserved.
-        let r1 = dispatch_agent_intent(State(state.clone()), Json(buy.clone())).await.unwrap().0;
+        let r1 = dispatch_agent_intent(State(state.clone()), Json(buy.clone()))
+            .await
+            .unwrap()
+            .0;
         assert_eq!(r1.outcome, "authorized_not_performed");
         assert_eq!(settle_count.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(meter.remaining("vm-shopper"), 400);
@@ -3609,7 +3767,10 @@ mod tests {
         // memory of this intent id — here we just re-dispatch the SAME signed intent. The durable
         // ledger idempotency must refuse a second settle.
         let idem = format!("flint-{}", buy.signature);
-        assert_eq!(ledger.get(&idem).unwrap().status, crate::payment_ledger::PaymentStatus::Pending);
+        assert_eq!(
+            ledger.get(&idem).unwrap().status,
+            crate::payment_ledger::PaymentStatus::Pending
+        );
         // Re-dispatch through the executor directly (the pay closure's ledger guard is what we test;
         // the replay guard is a separate, already-tested layer).
         let exec_out = state.intent_executor.execute(&buy);
@@ -3651,8 +3812,15 @@ mod tests {
         meter.set_budget("vm-shopper", 500).unwrap();
         let (agent_sk, payee_resource, token_id) = drm_pay_mandate(&state, asset).await;
         let buy = IntentDeclarationV1::issue(
-            &agent_sk, agent_sk.verifying_key().to_bytes(), "buy-amb", "vm-shopper",
-            "runtime.pay", "300", &payee_resource, "execute", &token_id,
+            &agent_sk,
+            agent_sk.verifying_key().to_bytes(),
+            "buy-amb",
+            "vm-shopper",
+            "runtime.pay",
+            "300",
+            &payee_resource,
+            "execute",
+            &token_id,
         );
         let r = dispatch_agent_intent(State(state.clone()), Json(buy))
             .await
@@ -3667,7 +3835,11 @@ mod tests {
             "the refusal names the ambiguity: {:?}",
             r.reason
         );
-        assert_eq!(meter.remaining("vm-shopper"), 500, "the reservation was refunded (nothing bought)");
+        assert_eq!(
+            meter.remaining("vm-shopper"),
+            500,
+            "the reservation was refunded (nothing bought)"
+        );
         assert!(
             !ran.load(std::sync::atomic::Ordering::SeqCst),
             "an ambiguous binding must NEVER reach the settler"
@@ -3703,14 +3875,24 @@ mod tests {
         meter.set_budget("vm-shopper", 100).unwrap(); // cap BELOW the ask
         let (agent_sk, payee_resource, token_id) = drm_pay_mandate(&state, asset).await;
         let buy = IntentDeclarationV1::issue(
-            &agent_sk, agent_sk.verifying_key().to_bytes(), "buy-over", "vm-shopper",
-            "runtime.pay", "300", &payee_resource, "execute", &token_id,
+            &agent_sk,
+            agent_sk.verifying_key().to_bytes(),
+            "buy-over",
+            "vm-shopper",
+            "runtime.pay",
+            "300",
+            &payee_resource,
+            "execute",
+            &token_id,
         );
         let r = dispatch_agent_intent(State(state.clone()), Json(buy))
             .await
             .expect("gate authorized; cap refused")
             .0;
-        assert_eq!(r.outcome, "authorized_not_performed", "the cap refused the buy");
+        assert_eq!(
+            r.outcome, "authorized_not_performed",
+            "the cap refused the buy"
+        );
         assert!(
             r.reason.as_deref().is_some_and(|s| s.contains("spend cap")),
             "the refusal is the cap, before any chain call: {:?}",
@@ -3742,8 +3924,15 @@ mod tests {
         meter.set_budget("vm-shopper", 500).unwrap();
         let (agent_sk, payee_resource, token_id) = drm_pay_mandate(&state, asset).await;
         let buy = IntentDeclarationV1::issue(
-            &agent_sk, agent_sk.verifying_key().to_bytes(), "buy-ind", "vm-shopper",
-            "runtime.pay", "300", &payee_resource, "execute", &token_id,
+            &agent_sk,
+            agent_sk.verifying_key().to_bytes(),
+            "buy-ind",
+            "vm-shopper",
+            "runtime.pay",
+            "300",
+            &payee_resource,
+            "execute",
+            &token_id,
         );
         let r = dispatch_agent_intent(State(state.clone()), Json(buy.clone()))
             .await
@@ -3754,17 +3943,23 @@ mod tests {
             "an indeterminate outcome is not attested as performed"
         );
         assert!(
-            r.reason.as_deref().is_some_and(|s| s.to_uppercase().contains("INDETERMINATE")),
+            r.reason
+                .as_deref()
+                .is_some_and(|s| s.to_uppercase().contains("INDETERMINATE")),
             "the reason flags the indeterminate outcome + names the reconciliation key: {:?}",
             r.reason
         );
         assert_eq!(
-            meter.remaining("vm-shopper"), 200,
+            meter.remaining("vm-shopper"),
+            200,
             "the reservation is KEPT — refunding against a maybe-charge would break the cap"
         );
         let idem = format!("flint-{}", buy.signature);
         let pending = ledger.get(&idem).expect("a pending entry was filed");
-        assert_eq!(pending.status, crate::payment_ledger::PaymentStatus::Pending);
+        assert_eq!(
+            pending.status,
+            crate::payment_ledger::PaymentStatus::Pending
+        );
         assert!(
             ledger.pending().iter().any(|p| p.idempotency_key == idem),
             "the pending entry appears on the reconciliation work list"
@@ -3817,13 +4012,15 @@ mod tests {
             .audit_log()
             .recent_events(16)
             .into_iter()
-            .any(|e| matches!(
-                e,
-                elastos_runtime::primitives::audit::AuditEvent::ConfigChange {
-                    ref setting, ref old_value, ref new_value, ..
-                } if setting == "spend_budget:vm-ap-agent"
-                    && old_value == "unprovisioned" && new_value == "500"
-            ));
+            .any(|e| {
+                matches!(
+                    e,
+                    elastos_runtime::primitives::audit::AuditEvent::ConfigChange {
+                        ref setting, ref old_value, ref new_value, ..
+                    } if setting == "spend_budget:vm-ap-agent"
+                        && old_value == "unprovisioned" && new_value == "500"
+                )
+            });
         assert!(attested, "the budget change landed on the signed chain");
 
         // The agent pays 200 under a bound mandate — the operator-set cap is what gets debited.
@@ -3847,8 +4044,15 @@ mod tests {
         .unwrap()
         .0;
         let intent = IntentDeclarationV1::issue(
-            &agent_sk, agent_sk.verifying_key().to_bytes(), "inv-1", "vm-ap-agent",
-            "runtime.pay", "200", &payee_resource, "execute", &out.token_id,
+            &agent_sk,
+            agent_sk.verifying_key().to_bytes(),
+            "inv-1",
+            "vm-ap-agent",
+            "runtime.pay",
+            "200",
+            &payee_resource,
+            "execute",
+            &out.token_id,
         );
         let r = dispatch_agent_intent(State(state.clone()), Json(intent))
             .await
@@ -3897,7 +4101,10 @@ mod tests {
         no_rail.spend_meter = None;
         let e = set_spend_budget(
             State(no_rail),
-            Json(SetSpendBudgetInput { capsule: "vm-x".into(), limit: 1 }),
+            Json(SetSpendBudgetInput {
+                capsule: "vm-x".into(),
+                limit: 1,
+            }),
         )
         .await
         .unwrap_err();
@@ -3909,7 +4116,10 @@ mod tests {
         ));
         let e = set_spend_budget(
             State(volatile),
-            Json(SetSpendBudgetInput { capsule: "vm-x".into(), limit: 1 }),
+            Json(SetSpendBudgetInput {
+                capsule: "vm-x".into(),
+                limit: 1,
+            }),
         )
         .await
         .unwrap_err();
@@ -3917,7 +4127,10 @@ mod tests {
         // A malformed capsule id ⇒ 400 (same slug bound as the executor's identities).
         let e = set_spend_budget(
             State(state.clone()),
-            Json(SetSpendBudgetInput { capsule: "not a slug!".into(), limit: 1 }),
+            Json(SetSpendBudgetInput {
+                capsule: "not a slug!".into(),
+                limit: 1,
+            }),
         )
         .await
         .unwrap_err();
@@ -3939,9 +4152,8 @@ mod tests {
             .read(true)
             .open(&audit_path)
             .unwrap();
-        let audit_log = std::sync::Arc::new(
-            elastos_runtime::primitives::audit::AuditLog::with_file_handle(ro),
-        );
+        let audit_log =
+            std::sync::Arc::new(elastos_runtime::primitives::audit::AuditLog::with_file_handle(ro));
         let store = std::sync::Arc::new(elastos_runtime::capability::CapabilityStore::new());
         let metrics =
             std::sync::Arc::new(elastos_runtime::primitives::metrics::MetricsManager::new());
@@ -3970,12 +4182,19 @@ mod tests {
         // FIRST-TIME provision: applied, unattestable, rolled back — fully unprovisioned again.
         let e = set_spend_budget(
             State(state.clone()),
-            Json(SetSpendBudgetInput { capsule: "vm-ap-agent".into(), limit: 500 }),
+            Json(SetSpendBudgetInput {
+                capsule: "vm-ap-agent".into(),
+                limit: 500,
+            }),
         )
         .await
         .unwrap_err();
         assert_eq!(e.0, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(e.1.contains("rolled back"), "the 500 names the rollback: {}", e.1);
+        assert!(
+            e.1.contains("rolled back"),
+            "the 500 names the rollback: {}",
+            e.1
+        );
         let g = get_spend_budget(State(state.clone()), Path("vm-ap-agent".to_string()))
             .await
             .unwrap_err();
@@ -3995,13 +4214,19 @@ mod tests {
         meter.set_budget("vm-ap-agent", 100).unwrap();
         let e = set_spend_budget(
             State(state.clone()),
-            Json(SetSpendBudgetInput { capsule: "vm-ap-agent".into(), limit: 900 }),
+            Json(SetSpendBudgetInput {
+                capsule: "vm-ap-agent".into(),
+                limit: 900,
+            }),
         )
         .await
         .unwrap_err();
         assert_eq!(e.0, StatusCode::INTERNAL_SERVER_ERROR);
         let snap = meter.snapshot("vm-ap-agent").unwrap();
-        assert_eq!(snap.limit, 100, "the unattestable raise was rolled back to the prior limit");
+        assert_eq!(
+            snap.limit, 100,
+            "the unattestable raise was rolled back to the prior limit"
+        );
     }
 
     /// Sprint 30 end-to-end: an INDETERMINATE payment becomes a RECONCILABLE obligation. The
@@ -4046,7 +4271,11 @@ mod tests {
                 state.capability_manager.audit_log().clone(),
                 Some(dir.path().to_path_buf()),
             )
-            .with_payments(meter.clone(), std::sync::Arc::new(IndeterminateRail), ledger.clone()),
+            .with_payments(
+                meter.clone(),
+                std::sync::Arc::new(IndeterminateRail),
+                ledger.clone(),
+            ),
         );
         state.spend_meter = Some(meter.clone());
         state.payment_ledger = Some(ledger.clone());
@@ -4072,8 +4301,15 @@ mod tests {
         .unwrap()
         .0;
         let intent = IntentDeclarationV1::issue(
-            &agent_sk, agent_sk.verifying_key().to_bytes(), "inv-1", "vm-ap-agent",
-            "runtime.pay", "200", &payee_resource, "execute", &out.token_id,
+            &agent_sk,
+            agent_sk.verifying_key().to_bytes(),
+            "inv-1",
+            "vm-ap-agent",
+            "runtime.pay",
+            "200",
+            &payee_resource,
+            "execute",
+            &out.token_id,
         );
         let expected_key = format!("flint-{}", intent.signature);
         let r = dispatch_agent_intent(State(state.clone()), Json(intent))
@@ -4089,7 +4325,11 @@ mod tests {
              (S35: durable ledger custody is guaranteed BEFORE the broadcast via begin_attempt): {:?}",
             r.reason
         );
-        assert_eq!(meter.remaining("vm-ap-agent"), 300, "the reservation is HELD");
+        assert_eq!(
+            meter.remaining("vm-ap-agent"),
+            300,
+            "the reservation is HELD"
+        );
 
         // The budget surface shows held-unconfirmed units distinct from confirmed spend (RT-F4).
         let snap = get_spend_budget(State(state.clone()), Path("vm-ap-agent".to_string()))
@@ -4102,7 +4342,10 @@ mod tests {
         let pending = list_pending_payments(State(state.clone())).await.unwrap().0;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].idempotency_key, expected_key);
-        assert_eq!((pending[0].amount, pending[0].payee.as_str()), (200, "acme-vendor"));
+        assert_eq!(
+            (pending[0].amount, pending[0].payee.as_str()),
+            (200, "acme-vendor")
+        );
 
         // Resolve against the rail: NOT charged ⇒ refund, exactly once.
         let res = reconcile_payment(
@@ -4130,7 +4373,11 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(again.0, StatusCode::CONFLICT, "a payment resolves EXACTLY once");
+        assert_eq!(
+            again.0,
+            StatusCode::CONFLICT,
+            "a payment resolves EXACTLY once"
+        );
         assert_eq!(meter.remaining("vm-ap-agent"), 500, "no double refund");
         assert!(
             ledger.get(&expected_key).unwrap().refund_applied,
@@ -4156,8 +4403,15 @@ mod tests {
         // The CHARGED verdict: spend stands, nothing refunded.
         let agent_sk2 = agent_sk; // same mandate, fresh signed intent
         let intent2 = IntentDeclarationV1::issue(
-            &agent_sk2, agent_sk2.verifying_key().to_bytes(), "inv-2", "vm-ap-agent",
-            "runtime.pay", "150", &payee_resource, "execute", &out.token_id,
+            &agent_sk2,
+            agent_sk2.verifying_key().to_bytes(),
+            "inv-2",
+            "vm-ap-agent",
+            "runtime.pay",
+            "150",
+            &payee_resource,
+            "execute",
+            &out.token_id,
         );
         let key2 = format!("flint-{}", intent2.signature);
         let r2 = dispatch_agent_intent(State(state.clone()), Json(intent2))
@@ -4168,7 +4422,10 @@ mod tests {
         assert_eq!(meter.remaining("vm-ap-agent"), 350);
         let res2 = reconcile_payment(
             State(state.clone()),
-            Json(ReconcilePaymentInput { idempotency_key: key2, charged: true }),
+            Json(ReconcilePaymentInput {
+                idempotency_key: key2,
+                charged: true,
+            }),
         )
         .await
         .unwrap()
@@ -4180,7 +4437,11 @@ mod tests {
             "a charged resolution confirms the spend — nothing is refunded"
         );
         assert!(
-            list_pending_payments(State(state)).await.unwrap().0.is_empty(),
+            list_pending_payments(State(state))
+                .await
+                .unwrap()
+                .0
+                .is_empty(),
             "no obligations remain"
         );
     }
@@ -4216,7 +4477,10 @@ mod tests {
             &ledger,
             &meter,
             state.capability_manager.audit_log(),
-            ReconcilePaymentInput { idempotency_key: "flint-k".into(), charged: false },
+            ReconcilePaymentInput {
+                idempotency_key: "flint-k".into(),
+                charged: false,
+            },
         )
         .unwrap_err();
         assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
@@ -4231,7 +4495,10 @@ mod tests {
             &ledger,
             &meter,
             state.capability_manager.audit_log(),
-            ReconcilePaymentInput { idempotency_key: "flint-k".into(), charged: true },
+            ReconcilePaymentInput {
+                idempotency_key: "flint-k".into(),
+                charged: true,
+            },
         )
         .unwrap();
         assert!(!ok.refunded);
@@ -4264,14 +4531,24 @@ mod tests {
         .unwrap()
         .0;
         let intent = IntentDeclarationV1::issue(
-            &agent_sk, agent_sk.verifying_key().to_bytes(), "agent-1", "vm-agent",
-            "runtime.echo", "cafe01", "elastos://pay/vendor", "write", &out.token_id,
+            &agent_sk,
+            agent_sk.verifying_key().to_bytes(),
+            "agent-1",
+            "vm-agent",
+            "runtime.echo",
+            "cafe01",
+            "elastos://pay/vendor",
+            "write",
+            &out.token_id,
         );
         let r = dispatch_agent_intent(State(state.clone()), Json(intent))
             .await
             .expect("the agent's own signed intent performs under its bound mandate")
             .0;
-        assert_eq!(r.outcome, "performed", "the agent acted under its mandate — no operator session");
+        assert_eq!(
+            r.outcome, "performed",
+            "the agent acted under its mandate — no operator session"
+        );
     }
 
     /// Sprint 26: the agent surface refuses — with a UNIFORM 403 (no existence/binding oracle) — a
@@ -4304,14 +4581,25 @@ mod tests {
         let attacker = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
         let intent = |sk: &ed25519_dalek::SigningKey, grant: &str, id: &str| {
             IntentDeclarationV1::issue(
-                sk, sk.verifying_key().to_bytes(), id, "vm-agent", "runtime.echo", "cafe01",
-                "elastos://pay/vendor", "write", grant,
+                sk,
+                sk.verifying_key().to_bytes(),
+                id,
+                "vm-agent",
+                "runtime.echo",
+                "cafe01",
+                "elastos://pay/vendor",
+                "write",
+                grant,
             )
         };
         // Wrong key on a bound mandate → 403.
         assert!(
             matches!(
-                dispatch_agent_intent(State(state.clone()), Json(intent(&attacker, &bound.token_id, "a1"))).await,
+                dispatch_agent_intent(
+                    State(state.clone()),
+                    Json(intent(&attacker, &bound.token_id, "a1"))
+                )
+                .await,
                 Err((StatusCode::FORBIDDEN, _))
             ),
             "an intent signed by a key the mandate is NOT bound to is refused"
@@ -4319,7 +4607,11 @@ mod tests {
         // Unbound mandate → 403 (no ambient authority on the agent surface).
         assert!(
             matches!(
-                dispatch_agent_intent(State(state.clone()), Json(intent(&attacker, &unbound.token_id, "a2"))).await,
+                dispatch_agent_intent(
+                    State(state.clone()),
+                    Json(intent(&attacker, &unbound.token_id, "a2"))
+                )
+                .await,
                 Err((StatusCode::FORBIDDEN, _))
             ),
             "an unbound mandate cannot be dispatched agent-facing"
@@ -4328,7 +4620,8 @@ mod tests {
         let fake = format!("{:064x}", 0xdead_u64);
         assert!(
             matches!(
-                dispatch_agent_intent(State(state.clone()), Json(intent(&attacker, &fake, "a3"))).await,
+                dispatch_agent_intent(State(state.clone()), Json(intent(&attacker, &fake, "a3")))
+                    .await,
                 Err((StatusCode::FORBIDDEN, _))
             ),
             "an absent grant is refused with the same 403"
@@ -4365,8 +4658,15 @@ mod tests {
         let attacker = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
         for i in 0..10 {
             let bad = IntentDeclarationV1::issue(
-                &attacker, attacker.verifying_key().to_bytes(), &format!("bad-{i}"), "vm-agent",
-                "runtime.echo", "cafe01", "elastos://pay/vendor", "write", &out.token_id,
+                &attacker,
+                attacker.verifying_key().to_bytes(),
+                &format!("bad-{i}"),
+                "vm-agent",
+                "runtime.echo",
+                "cafe01",
+                "elastos://pay/vendor",
+                "write",
+                &out.token_id,
             );
             assert!(matches!(
                 dispatch_agent_intent(State(state.clone()), Json(bad)).await,
@@ -4379,11 +4679,22 @@ mod tests {
         );
         // The legit holder still has its full 1-act budget.
         let good = IntentDeclarationV1::issue(
-            &agent_sk, agent_sk.verifying_key().to_bytes(), "good-1", "vm-agent",
-            "runtime.echo", "cafe01", "elastos://pay/vendor", "write", &out.token_id,
+            &agent_sk,
+            agent_sk.verifying_key().to_bytes(),
+            "good-1",
+            "vm-agent",
+            "runtime.echo",
+            "cafe01",
+            "elastos://pay/vendor",
+            "write",
+            &out.token_id,
         );
         assert_eq!(
-            dispatch_agent_intent(State(state.clone()), Json(good)).await.expect("still within budget").0.outcome,
+            dispatch_agent_intent(State(state.clone()), Json(good))
+                .await
+                .expect("still within budget")
+                .0
+                .outcome,
             "performed",
             "the victim's budget was never burned by the attacker's flood"
         );
@@ -4555,8 +4866,14 @@ mod tests {
             .iter()
             .find(|c| c.token_id == out.token_id)
             .expect("minted mandate is on a card");
-        assert_eq!(card.dispatch_limit, 2, "the card shows the mandate's own budget");
-        assert!(card.dispatch_limit_custom, "and marks it as dialed, not default");
+        assert_eq!(
+            card.dispatch_limit, 2,
+            "the card shows the mandate's own budget"
+        );
+        assert!(
+            card.dispatch_limit_custom,
+            "and marks it as dialed, not default"
+        );
         assert_eq!(
             card.dispatch_window_secs,
             elastos_runtime::capability::MANDATE_DISPATCH_WINDOW_SECS
@@ -4587,7 +4904,11 @@ mod tests {
         // The 429 body must report THIS mandate's resolved budget (2), never the global default
         // (60) — the message can't contradict what the gate enforced (council guardian F1, P12).
         let (code, body) = refused.expect_err("over the dialed budget");
-        assert_eq!(code, StatusCode::TOO_MANY_REQUESTS, "the mandate's OWN limit (2) binds");
+        assert_eq!(
+            code,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the mandate's OWN limit (2) binds"
+        );
         assert!(
             body.contains("2 acts per 60s"),
             "the 429 reports the mandate's resolved budget, not the default: {body}"
@@ -4630,8 +4951,14 @@ mod tests {
         .await
         .expect("dispatch ok")
         .0;
-        assert_eq!(resp.outcome, "performed", "a registered executor performed it as declared");
-        assert!(resp.reconciliation.is_some(), "signed reconciliation returned");
+        assert_eq!(
+            resp.outcome, "performed",
+            "a registered executor performed it as declared"
+        );
+        assert!(
+            resp.reconciliation.is_some(),
+            "signed reconciliation returned"
+        );
 
         // A method OUTSIDE the envelope is denied fail-closed — and the denial is receipted too.
         let denied = dispatch_standing_intent(
@@ -4656,10 +4983,21 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(uses, vec![true, false], "the performed act AND the denied attempt are receipted");
-        let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();
+        assert_eq!(
+            uses,
+            vec![true, false],
+            "the performed act AND the denied attempt are receipted"
+        );
+        let signer = state
+            .capability_manager
+            .audit_log()
+            .verifying_key_hex()
+            .unwrap();
         let verdict = elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer));
-        assert!(verdict.authenticated, "receipt with acts still authenticates: {verdict:?}");
+        assert!(
+            verdict.authenticated,
+            "receipt with acts still authenticates: {verdict:?}"
+        );
     }
 
     /// THE FIRST SIDE-EFFECTING AFFORDANCE, full loop (Sprint 16): grant a `message` mandate for
@@ -4672,14 +5010,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut state = test_state_with_durable_audit(dir.path());
         // The PRODUCTION executor set, wired to a real notify store (same tempdir).
-        state.intent_executor = std::sync::Arc::new(
-            crate::intent_executor::MethodRegistryExecutor::production(
+        state.intent_executor =
+            std::sync::Arc::new(crate::intent_executor::MethodRegistryExecutor::production(
                 state.capability_manager.audit_log().clone(),
                 Some(dir.path().to_path_buf()),
-            ),
+            ));
+        let topic_resource = format!(
+            "{}agent-status",
+            crate::intent_executor::INBOX_NOTIFY_PREFIX
         );
-        let topic_resource =
-            format!("{}agent-status", crate::intent_executor::INBOX_NOTIFY_PREFIX);
         let out = issue_standing_grant(
             State(state.clone()),
             Json(IssueStandingGrantInput {
@@ -4713,18 +5052,26 @@ mod tests {
             .await
             .expect("dispatch ok")
             .0;
-        assert_eq!(resp.outcome, "performed", "the message was really delivered");
+        assert_eq!(
+            resp.outcome, "performed",
+            "the message was really delivered"
+        );
 
         // The side effect is REAL and operator-visible: the Inbox store has the row.
         let summary = crate::notifications::load_summary(dir.path()).unwrap();
         assert_eq!(summary.unread_count, 1);
         assert!(summary.entries[0].body.contains("vm-agent"));
-        assert!(summary.entries[0].body.contains(&out.token_id), "body names the mandate");
+        assert!(
+            summary.entries[0].body.contains(&out.token_id),
+            "body names the mandate"
+        );
 
         // Kill the mandate → the SAME act is denied, and nothing further lands in the Inbox.
         let rev = revoke_standing_grant(
             State(state.clone()),
-            Json(RevokeStandingGrantInput { grant_id: out.grant_id.clone() }),
+            Json(RevokeStandingGrantInput {
+                grant_id: out.grant_id.clone(),
+            }),
         )
         .await
         .unwrap()
@@ -4748,7 +5095,11 @@ mod tests {
             .0;
         assert_eq!(denied.outcome, "denied", "revoked mandate delivers nothing");
         let after = crate::notifications::load_summary(dir.path()).unwrap();
-        assert_eq!(after.entries.len(), 1, "the denied act delivered NOTHING new");
+        assert_eq!(
+            after.entries.len(),
+            1,
+            "the denied act delivered NOTHING new"
+        );
 
         // The portable receipt carries the delivered act (success=true) AND the denied one (false).
         let receipt = mandate_receipt(State(state.clone()), Path(out.token_id.clone()))
@@ -4764,10 +5115,21 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(uses, vec![true, false], "delivery and denial both receipted, honestly");
-        let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();
+        assert_eq!(
+            uses,
+            vec![true, false],
+            "delivery and denial both receipted, honestly"
+        );
+        let signer = state
+            .capability_manager
+            .audit_log()
+            .verifying_key_hex()
+            .unwrap();
         let verdict = elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer));
-        assert!(verdict.authenticated, "the receipt verifies off-box: {verdict:?}");
+        assert!(
+            verdict.authenticated,
+            "the receipt verifies off-box: {verdict:?}"
+        );
     }
 
     /// FRESHNESS WINDOW (G-M7): a stale or future-dated declaration is refused at dispatch BEFORE
@@ -4814,24 +5176,39 @@ mod tests {
         // Stale: declared well past the age window → 400, refused.
         let stale = dispatch_standing_intent(
             State(state.clone()),
-            Json(at(now - elastos_runtime::capability::MAX_INTENT_AGE_SECS - 60, "stale-1")),
+            Json(at(
+                now - elastos_runtime::capability::MAX_INTENT_AGE_SECS - 60,
+                "stale-1",
+            )),
         )
         .await;
-        assert!(matches!(stale, Err((StatusCode::BAD_REQUEST, _))), "stale intent refused");
+        assert!(
+            matches!(stale, Err((StatusCode::BAD_REQUEST, _))),
+            "stale intent refused"
+        );
         // Future-dated beyond skew → 400, refused.
         let future = dispatch_standing_intent(
             State(state.clone()),
-            Json(at(now + elastos_runtime::capability::MAX_CLOCK_SKEW_SECS + 60, "future-1")),
+            Json(at(
+                now + elastos_runtime::capability::MAX_CLOCK_SKEW_SECS + 60,
+                "future-1",
+            )),
         )
         .await;
-        assert!(matches!(future, Err((StatusCode::BAD_REQUEST, _))), "future intent refused");
+        assert!(
+            matches!(future, Err((StatusCode::BAD_REQUEST, _))),
+            "future intent refused"
+        );
         // The refused ids never burned: a FRESH intent reusing "stale-1" still acts (proof the
         // freshness check runs BEFORE the replay guard).
         let fresh = dispatch_standing_intent(State(state.clone()), Json(at(now, "stale-1")))
             .await
             .expect("fresh dispatch ok")
             .0;
-        assert_eq!(fresh.outcome, "performed", "a fresh intent reusing the id still acts");
+        assert_eq!(
+            fresh.outcome, "performed",
+            "a fresh intent reusing the id still acts"
+        );
     }
 
     /// THE SECOND SIDE-EFFECTING AFFORDANCE, full loop (Sprint 17): grant a `write` mandate for one
@@ -4842,12 +5219,11 @@ mod tests {
     async fn dispatch_state_put_writes_durable_state_and_revoke_stops_it() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = test_state_with_durable_audit(dir.path());
-        state.intent_executor = std::sync::Arc::new(
-            crate::intent_executor::MethodRegistryExecutor::production(
+        state.intent_executor =
+            std::sync::Arc::new(crate::intent_executor::MethodRegistryExecutor::production(
                 state.capability_manager.audit_log().clone(),
                 Some(dir.path().to_path_buf()),
-            ),
-        );
+            ));
         let key_resource = format!("{}cursor", crate::intent_executor::STATE_PUT_PREFIX);
         let out = issue_standing_grant(
             State(state.clone()),
@@ -4907,7 +5283,9 @@ mod tests {
         // Kill the mandate → the SAME write is denied, and the stored value is UNCHANGED.
         let rev = revoke_standing_grant(
             State(state.clone()),
-            Json(RevokeStandingGrantInput { grant_id: out.grant_id.clone() }),
+            Json(RevokeStandingGrantInput {
+                grant_id: out.grant_id.clone(),
+            }),
         )
         .await
         .unwrap()
@@ -4921,7 +5299,10 @@ mod tests {
         let after = crate::agent_store::get_agent_state(dir.path(), "vm-agent", "cursor")
             .unwrap()
             .unwrap();
-        assert_eq!(after.value_hash, "beef02", "denied write left the value UNCHANGED");
+        assert_eq!(
+            after.value_hash, "beef02",
+            "denied write left the value UNCHANGED"
+        );
         assert_eq!(after.version, 2);
 
         // The portable receipt carries the two writes (success=true) AND the denial (false).
@@ -4938,10 +5319,19 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(uses, vec![true, true, false], "two writes and the denial, honestly receipted");
-        let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();
+        assert_eq!(
+            uses,
+            vec![true, true, false],
+            "two writes and the denial, honestly receipted"
+        );
+        let signer = state
+            .capability_manager
+            .audit_log()
+            .verifying_key_hex()
+            .unwrap();
         assert!(
-            elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer)).authenticated
+            elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer))
+                .authenticated
         );
     }
 
@@ -4955,12 +5345,11 @@ mod tests {
     async fn dispatch_state_get_reads_back_attested_and_revoke_stops_it() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = test_state_with_durable_audit(dir.path());
-        state.intent_executor = std::sync::Arc::new(
-            crate::intent_executor::MethodRegistryExecutor::production(
+        state.intent_executor =
+            std::sync::Arc::new(crate::intent_executor::MethodRegistryExecutor::production(
                 state.capability_manager.audit_log().clone(),
                 Some(dir.path().to_path_buf()),
-            ),
-        );
+            ));
         let key_resource = format!("{}cursor", crate::intent_executor::STATE_PUT_PREFIX);
 
         // Seed the store: a write-mandate + a state_put dispatch.
@@ -4982,11 +5371,22 @@ mod tests {
         .0;
         let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
         let put = IntentDeclarationV1::issue(
-            &sk, sk.verifying_key().to_bytes(), "put-1", "vm-agent",
-            "runtime.state_put", "cafe01", &key_resource, "write", &w.token_id,
+            &sk,
+            sk.verifying_key().to_bytes(),
+            "put-1",
+            "vm-agent",
+            "runtime.state_put",
+            "cafe01",
+            &key_resource,
+            "write",
+            &w.token_id,
         );
         assert_eq!(
-            dispatch_standing_intent(State(state.clone()), Json(put)).await.unwrap().0.outcome,
+            dispatch_standing_intent(State(state.clone()), Json(put))
+                .await
+                .unwrap()
+                .0
+                .outcome,
             "performed"
         );
 
@@ -5012,8 +5412,15 @@ mod tests {
         .0;
         let read = |intent_id: &str, expected: &str| {
             IntentDeclarationV1::issue(
-                &agent_sk, agent_sk.verifying_key().to_bytes(), intent_id, "vm-agent",
-                "runtime.state_get", expected, &key_resource, "read", &r.token_id,
+                &agent_sk,
+                agent_sk.verifying_key().to_bytes(),
+                intent_id,
+                "vm-agent",
+                "runtime.state_get",
+                expected,
+                &key_resource,
+                "read",
+                &r.token_id,
             )
         };
 
@@ -5022,7 +5429,10 @@ mod tests {
             .await
             .unwrap()
             .0;
-        assert_eq!(hit.outcome, "performed", "a correct expected-value is an attested read");
+        assert_eq!(
+            hit.outcome, "performed",
+            "a correct expected-value is an attested read"
+        );
 
         // Wrong expected value → diverged: the agent learns ONE BIT (its guess was wrong). The
         // actual value is NOT returned — the reconciliation carries only the diverged-field name.
@@ -5030,13 +5440,18 @@ mod tests {
             .await
             .unwrap()
             .0;
-        assert_eq!(miss.outcome, "diverged", "a wrong expected-value diverges (one bit, no value leak)");
+        assert_eq!(
+            miss.outcome, "diverged",
+            "a wrong expected-value diverges (one bit, no value leak)"
+        );
 
         // Revoke the read-mandate → reads stop (denied), the write-mandate is untouched.
         assert!(
             revoke_standing_grant(
                 State(state.clone()),
-                Json(RevokeStandingGrantInput { grant_id: r.grant_id.clone() }),
+                Json(RevokeStandingGrantInput {
+                    grant_id: r.grant_id.clone()
+                }),
             )
             .await
             .unwrap()
@@ -5047,16 +5462,24 @@ mod tests {
             .await
             .unwrap()
             .0;
-        assert_eq!(denied.outcome, "denied", "a revoked read-mandate reads nothing");
+        assert_eq!(
+            denied.outcome, "denied",
+            "a revoked read-mandate reads nothing"
+        );
 
         // The read-mandate's portable receipt carries the attested read + the divergence + denial.
         let receipt = mandate_receipt(State(state.clone()), Path(r.token_id.clone()))
             .await
             .unwrap()
             .0;
-        let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();
+        let signer = state
+            .capability_manager
+            .audit_log()
+            .verifying_key_hex()
+            .unwrap();
         assert!(
-            elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer)).authenticated,
+            elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer))
+                .authenticated,
             "the read-mandate's receipt verifies off-box"
         );
     }
@@ -5172,11 +5595,17 @@ mod tests {
         .await
         .unwrap()
         .0;
-        assert_eq!(diverged.outcome, "diverged", "executor did something other than declared");
+        assert_eq!(
+            diverged.outcome, "diverged",
+            "executor did something other than declared"
+        );
 
         // Both are receipted success=false — the mandate receipt never claims an act that did not
         // faithfully happen.
-        let receipt = mandate_receipt(State(state), Path(out.token_id.clone())).await.unwrap().0;
+        let receipt = mandate_receipt(State(state), Path(out.token_id.clone()))
+            .await
+            .unwrap()
+            .0;
         use elastos_runtime::primitives::audit::AuditEvent;
         let uses: Vec<bool> = receipt
             .records
@@ -5186,7 +5615,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(uses, vec![false, false], "neither unperformed nor diverged is a success");
+        assert_eq!(
+            uses,
+            vec![false, false],
+            "neither unperformed nor diverged is a success"
+        );
     }
 
     /// Sprint 9: a STATE-DEPENDENT affordance through the real handler. The SAME agent + method +
@@ -5204,7 +5637,10 @@ mod tests {
             .content_open("s", "vm-agent", "QmSEEN", "view", "opened", "p", None)
             .unwrap();
         let check = |content_id: &str| {
-            format!("{}{content_id}", crate::intent_executor::CONTENT_ACCESS_CHECK_PREFIX)
+            format!(
+                "{}{content_id}",
+                crate::intent_executor::CONTENT_ACCESS_CHECK_PREFIX
+            )
         };
 
         let dispatch_seen = |resource: String, intent_id: &'static str| {
@@ -5238,7 +5674,11 @@ mod tests {
                     "read",
                     &out.token_id,
                 );
-                dispatch_standing_intent(State(value), Json(intent)).await.unwrap().0.outcome
+                dispatch_standing_intent(State(value), Json(intent))
+                    .await
+                    .unwrap()
+                    .0
+                    .outcome
             }
         };
 
@@ -5297,7 +5737,10 @@ mod tests {
             .await
             .expect("dispatch ok")
             .0;
-        assert_eq!(resp.outcome, "performed", "the runtime really re-verified its audit chain");
+        assert_eq!(
+            resp.outcome, "performed",
+            "the runtime really re-verified its audit chain"
+        );
         assert_eq!(
             resp.reconciliation.unwrap().status,
             elastos_runtime::capability::ReconciliationStatus::Matched
@@ -5316,10 +5759,21 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(uses, vec![true], "a real performed read is receipted success=true");
-        let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();
+        assert_eq!(
+            uses,
+            vec![true],
+            "a real performed read is receipted success=true"
+        );
+        let signer = state
+            .capability_manager
+            .audit_log()
+            .verifying_key_hex()
+            .unwrap();
         let verdict = elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer));
-        assert!(verdict.authenticated, "the performed-act receipt authenticates: {verdict:?}");
+        assert!(
+            verdict.authenticated,
+            "the performed-act receipt authenticates: {verdict:?}"
+        );
     }
 
     /// Guardian honesty: audit_verify reads the audit CHAIN regardless of the declared resource, so
@@ -5357,8 +5811,14 @@ mod tests {
             "read",
             &out.token_id,
         );
-        let resp = dispatch_standing_intent(State(state), Json(intent)).await.unwrap().0;
-        assert_eq!(resp.outcome, "diverged", "declared read of pay/vendor, actually read the chain");
+        let resp = dispatch_standing_intent(State(state), Json(intent))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            resp.outcome, "diverged",
+            "declared read of pay/vendor, actually read the chain"
+        );
     }
 
     /// Mirrors `elastos mandate demo` exactly, through the real handlers + production executor:
@@ -5410,7 +5870,9 @@ mod tests {
         // REVOKE.
         let _ = revoke_standing_grant(
             State(state.clone()),
-            Json(RevokeStandingGrantInput { grant_id: out.grant_id.clone() }),
+            Json(RevokeStandingGrantInput {
+                grant_id: out.grant_id.clone(),
+            }),
         )
         .await
         .unwrap();
@@ -5418,7 +5880,11 @@ mod tests {
         // ACT AGAIN: the same agent is denied SPECIFICALLY because the mandate was revoked.
         let denied = act("demo-act-2").await.unwrap().0;
         assert_eq!(denied.outcome, "denied");
-        assert_eq!(denied.reason.as_deref(), Some("revoked"), "denied for the right reason");
+        assert_eq!(
+            denied.reason.as_deref(),
+            Some("revoked"),
+            "denied for the right reason"
+        );
 
         // RECEIPT: grant → performed use → revoke → denied attempt.
         let receipt = mandate_receipt(State(state.clone()), Path(out.token_id.clone()))
@@ -5437,9 +5903,14 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, vec!["grant", "use_ok", "revoke", "use_denied"]);
-        let signer = state.capability_manager.audit_log().verifying_key_hex().unwrap();
+        let signer = state
+            .capability_manager
+            .audit_log()
+            .verifying_key_hex()
+            .unwrap();
         assert!(
-            elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer)).authenticated
+            elastos_runtime::primitives::verify_mandate_receipt(&receipt, Some(&signer))
+                .authenticated
         );
     }
 
@@ -5486,8 +5957,15 @@ mod tests {
         .unwrap()
         .0;
         assert_eq!(resp.outcome, "denied");
-        assert_eq!(resp.reason.as_deref(), Some("revoked"), "the honest reason, not a silent pass");
-        assert!(!state.standing_service.is_active(&out.grant_id), "envelope self-healed to revoked");
+        assert_eq!(
+            resp.reason.as_deref(),
+            Some("revoked"),
+            "the honest reason, not a silent pass"
+        );
+        assert!(
+            !state.standing_service.is_active(&out.grant_id),
+            "envelope self-healed to revoked"
+        );
 
         // A forged declaration is rejected before any grant lookup or record.
         let mut forged = signed_intent(&out.token_id, "pay.invoke");
@@ -5527,9 +6005,15 @@ mod tests {
         assert_eq!(first.outcome, "performed");
         // Byte-for-byte the same signed declaration again ⇒ 409, refused.
         let replay = dispatch_standing_intent(State(state.clone()), Json(intent)).await;
-        assert!(matches!(replay, Err((StatusCode::CONFLICT, _))), "replay must be refused");
+        assert!(
+            matches!(replay, Err((StatusCode::CONFLICT, _))),
+            "replay must be refused"
+        );
         // Exactly ONE use is receipted (the replay never acted).
-        let receipt = mandate_receipt(State(state), Path(out.token_id.clone())).await.unwrap().0;
+        let receipt = mandate_receipt(State(state), Path(out.token_id.clone()))
+            .await
+            .unwrap()
+            .0;
         use elastos_runtime::primitives::audit::AuditEvent;
         let uses = receipt
             .records
@@ -5620,7 +6104,11 @@ mod tests {
         .unwrap()
         .0;
         assert_eq!(resp.outcome, "denied");
-        assert_eq!(resp.reason.as_deref(), Some("revoked"), "epoch-dead mandate denies dispatch");
+        assert_eq!(
+            resp.reason.as_deref(),
+            Some("revoked"),
+            "epoch-dead mandate denies dispatch"
+        );
     }
 
     /// The operator's mandate list renders honest card states: a live mandate is ACTIVE, a revoked
@@ -5649,7 +6137,9 @@ mod tests {
             .0;
         let _ = revoke_standing_grant(
             State(state.clone()),
-            Json(RevokeStandingGrantInput { grant_id: b.grant_id.clone() }),
+            Json(RevokeStandingGrantInput {
+                grant_id: b.grant_id.clone(),
+            }),
         )
         .await
         .unwrap();
@@ -5669,8 +6159,13 @@ mod tests {
         // the epoch kills every backing token, and the envelope registry is revoked alongside.
         let _ = revoke_all_capabilities(
             State(state.clone()),
-            Extension(Session::new(elastos_runtime::session::SessionType::Shell, None)),
-            Json(RevokeAllInput { reason: "incident".to_string() }),
+            Extension(Session::new(
+                elastos_runtime::session::SessionType::Shell,
+                None,
+            )),
+            Json(RevokeAllInput {
+                reason: "incident".to_string(),
+            }),
         )
         .await
         .expect("revoke-all ok");
@@ -5716,7 +6211,10 @@ mod tests {
         .await
         .expect("revoke ok")
         .0;
-        assert!(rev.revoked, "an UPPERCASE spelling of the id must still kill the envelope");
+        assert!(
+            rev.revoked,
+            "an UPPERCASE spelling of the id must still kill the envelope"
+        );
         assert!(!state.standing_service.is_active(&out.grant_id));
     }
 
@@ -6388,14 +6886,25 @@ mod tests {
         .unwrap()
         .0;
         let quote = IntentDeclarationV1::issue(
-            &agent_sk, agent_sk.verifying_key().to_bytes(), "quote-1", "vm-shopper",
-            "runtime.market_quote", "", &asset_resource, "read", &out.token_id,
+            &agent_sk,
+            agent_sk.verifying_key().to_bytes(),
+            "quote-1",
+            "vm-shopper",
+            "runtime.market_quote",
+            "",
+            &asset_resource,
+            "read",
+            &out.token_id,
         );
         let r = dispatch_agent_intent(State(state.clone()), Json(quote))
             .await
             .expect("quote dispatch")
             .0;
-        assert_eq!(r.outcome, "performed", "a discovery quote reconciles Matched: {:?}", r.reason);
+        assert_eq!(
+            r.outcome, "performed",
+            "a discovery quote reconciles Matched: {:?}",
+            r.reason
+        );
         assert_eq!(
             r.report.as_deref(),
             Some("price=5000000;tok=0xUSDC;supply=3"),
@@ -6432,9 +6941,15 @@ mod tests {
         .unwrap()
         .0;
         let guess = IntentDeclarationV1::issue(
-            &reader_sk, reader_sk.verifying_key().to_bytes(), "read-1", "vm-reader",
-            "runtime.state_get", "beef02", // a WRONG guess — diverges
-            &format!("{}cursor", crate::intent_executor::STATE_PUT_PREFIX), "read", &sg.token_id,
+            &reader_sk,
+            reader_sk.verifying_key().to_bytes(),
+            "read-1",
+            "vm-reader",
+            "runtime.state_get",
+            "beef02", // a WRONG guess — diverges
+            &format!("{}cursor", crate::intent_executor::STATE_PUT_PREFIX),
+            "read",
+            &sg.token_id,
         );
         let r2 = dispatch_agent_intent(State(state.clone()), Json(guess))
             .await

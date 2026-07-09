@@ -526,13 +526,19 @@ mod tests {
             .iter()
             .find(|capsule| capsule.name == "mandates")
             .expect("mandates capsule is launchable from the dev root");
-        assert!(mandates.role.is_shell_launchable(), "role must be shell-launchable");
+        assert!(
+            mandates.role.is_shell_launchable(),
+            "role must be shell-launchable"
+        );
         // It resolves + serves as a data/html browser capsule (the dashboard renders in the window).
         let cap = resolve_browser_capsule(data_dir.path(), "mandates")
             .expect("mandates resolves as a browser capsule");
         assert_eq!(cap.manifest.capsule_type, CapsuleType::Data);
         assert!(cap.entrypoint.ends_with(".html"));
-        assert!(cap.root.join(&cap.entrypoint).is_file(), "the dashboard html is served");
+        assert!(
+            cap.root.join(&cap.entrypoint).is_file(),
+            "the dashboard html is served"
+        );
     }
 
     #[test]

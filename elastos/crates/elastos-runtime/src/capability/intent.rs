@@ -2057,7 +2057,8 @@ mod tests {
             None,
         );
         let methods: BTreeSet<String> = ["send"].iter().map(|m| m.to_string()).collect();
-        let active = StandingGrantEnvelope::from_token(&token, methods.clone(), false, None, None, None);
+        let active =
+            StandingGrantEnvelope::from_token(&token, methods.clone(), false, None, None, None);
         assert_eq!(active.expires_at, None);
         assert!(active.is_active(), "None expiry never expires");
 
@@ -2515,7 +2516,9 @@ mod tests {
         // live (never expires) — keep.
         put("live", &|_| {});
         // live (future expiry) — keep.
-        put("live-exp", &|e| e.expires_at = Some(SecureTimestamp::at(now + 10_000)));
+        put("live-exp", &|e| {
+            e.expires_at = Some(SecureTimestamp::at(now + 10_000))
+        });
         // revoked long ago — prune.
         put("rev-old", &|e| {
             e.revoked = true;
@@ -2527,9 +2530,13 @@ mod tests {
             e.revoked_at = Some(recent);
         });
         // expired long ago (not revoked) — prune (times off `expires_at`).
-        put("exp-old", &|e| e.expires_at = Some(SecureTimestamp::at(old)));
+        put("exp-old", &|e| {
+            e.expires_at = Some(SecureTimestamp::at(old))
+        });
         // expired recently — keep.
-        put("exp-recent", &|e| e.expires_at = Some(SecureTimestamp::at(recent)));
+        put("exp-recent", &|e| {
+            e.expires_at = Some(SecureTimestamp::at(recent))
+        });
         // revoked with NO timestamp (legacy) — keep: untimeable, never time-pruned.
         put("rev-legacy", &|e| {
             e.revoked = true;
@@ -2557,7 +2564,10 @@ mod tests {
         let mut grants: HashMap<String, StandingGrantEnvelope> = HashMap::new();
         // A handful of LIVE grants that must all survive even past the cap.
         for i in 0..8 {
-            grants.insert(format!("live-{i}"), envelope_with(&format!("live-{i}"), None));
+            grants.insert(
+                format!("live-{i}"),
+                envelope_with(&format!("live-{i}"), None),
+            );
         }
         // Fill well past the cap with RECENTLY-revoked grants (within retention, so only the cap —
         // not time-retention — can shed them), each stamped a distinct recent revoke time.
@@ -2588,11 +2598,18 @@ mod tests {
         let now = 2_000_000_000u64;
         let mut grants: HashMap<String, StandingGrantEnvelope> = HashMap::new();
         for i in 0..(REGISTRY_HARD_CAP + 20) {
-            grants.insert(format!("live-{i:05}"), envelope_with(&format!("live-{i:05}"), None));
+            grants.insert(
+                format!("live-{i:05}"),
+                envelope_with(&format!("live-{i:05}"), None),
+            );
         }
         let removed = StandingGrantStore::prune_registry_locked(&mut grants, now, "");
         assert!(removed.is_empty(), "no live grant is ever pruned");
-        assert_eq!(grants.len(), REGISTRY_HARD_CAP + 20, "the live set is kept intact over cap");
+        assert_eq!(
+            grants.len(),
+            REGISTRY_HARD_CAP + 20,
+            "the live set is kept intact over cap"
+        );
     }
 
     #[test]
@@ -2601,7 +2618,9 @@ mod tests {
         assert!(store.get("g1").is_none(), "an unissued grant is absent");
         assert!(!store.is_active("g1"), "an unissued grant is not active");
 
-        store.issue(envelope_with("g1", Some(SecureTimestamp::after_secs(3600)))).unwrap();
+        store
+            .issue(envelope_with("g1", Some(SecureTimestamp::after_secs(3600))))
+            .unwrap();
         let got = store.get("g1").expect("issued grant is retrievable");
         assert_eq!(got.grant_id, "g1");
         assert!(!got.revoked);
@@ -2614,7 +2633,10 @@ mod tests {
         store.issue(envelope_with("g1", None)).unwrap(); // None expiry ⇒ never expires until revoked.
         assert!(store.is_active("g1"));
 
-        assert!(store.revoke("g1").unwrap(), "revoking a live grant returns true");
+        assert!(
+            store.revoke("g1").unwrap(),
+            "revoking a live grant returns true"
+        );
         // The record is KEPT, now marked revoked — queryable as revoked for honest denial.
         let got = store.get("g1").expect("a revoked grant is still queryable");
         assert!(got.revoked, "the stored envelope is marked revoked");
@@ -2641,7 +2663,9 @@ mod tests {
         assert!(store.get("g1").unwrap().revoked);
 
         // A past expiry deactivates a grant even though it was never revoked (fail-closed on time).
-        store.issue(envelope_with("g2", Some(SecureTimestamp::after_secs(0)))).unwrap();
+        store
+            .issue(envelope_with("g2", Some(SecureTimestamp::after_secs(0))))
+            .unwrap();
         assert!(
             !store.is_active("g2"),
             "an expired grant is inactive without any revocation"
@@ -2757,7 +2781,10 @@ mod tests {
         let (_dir, log) = gate_log();
         let sk = key();
         let store = store_with(&["send"]);
-        assert!(store.revoke("grant-1").unwrap(), "revoke the standing grant");
+        assert!(
+            store.revoke("grant-1").unwrap(),
+            "revoke the standing grant"
+        );
         let intent = an_intent(&sk, "send", "args-abc");
         let ran = std::cell::Cell::new(false);
         let outcome = dispatch_standing_act(
@@ -2889,7 +2916,10 @@ mod tests {
 
         // 4. Revoke the standing grant by the TOKEN's id — the SAME dispatch is now denied,
         //    fail-closed, and the act never runs. This is the kill switch on an autonomous agent.
-        assert!(store.revoke(&grant_id).unwrap(), "revoke the token's standing grant");
+        assert!(
+            store.revoke(&grant_id).unwrap(),
+            "revoke the token's standing grant"
+        );
         let ran = std::cell::Cell::new(false);
         let after = dispatch_standing_act(
             &store,
@@ -2956,9 +2986,15 @@ mod tests {
             SecureTimestamp::now(),
             Some(SecureTimestamp::after_secs(3600)),
         );
-        let grant_id =
-            svc.issue_from_token(&token, ["send"].iter().map(|m| m.to_string()).collect(), None, None, None)
-                .unwrap();
+        let grant_id = svc
+            .issue_from_token(
+                &token,
+                ["send"].iter().map(|m| m.to_string()).collect(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         assert_eq!(grant_id, token.id().to_string());
         assert!(svc.is_active(&grant_id), "a freshly issued grant is active");
 
@@ -3038,7 +3074,12 @@ mod tests {
                 Some(SecureTimestamp::after_secs(3600)),
             )
         };
-        let methods = || ["send"].iter().map(|m| m.to_string()).collect::<BTreeSet<String>>();
+        let methods = || {
+            ["send"]
+                .iter()
+                .map(|m| m.to_string())
+                .collect::<BTreeSet<String>>()
+        };
         // Zero and over-max are refused with InvalidInput — fail-closed, not stored.
         for bad in [Some(0u32), Some(MANDATE_DISPATCH_LIMIT_MAX + 1)] {
             let err = svc
@@ -3048,10 +3089,20 @@ mod tests {
         }
         // The boundary value MAX and a normal dial and None all mint fine.
         assert!(svc
-            .issue_from_token(&mk_token(), methods(), None, Some(MANDATE_DISPATCH_LIMIT_MAX), None)
+            .issue_from_token(
+                &mk_token(),
+                methods(),
+                None,
+                Some(MANDATE_DISPATCH_LIMIT_MAX),
+                None
+            )
             .is_ok());
-        assert!(svc.issue_from_token(&mk_token(), methods(), None, Some(5), None).is_ok());
-        assert!(svc.issue_from_token(&mk_token(), methods(), None, None, None).is_ok());
+        assert!(svc
+            .issue_from_token(&mk_token(), methods(), None, Some(5), None)
+            .is_ok());
+        assert!(svc
+            .issue_from_token(&mk_token(), methods(), None, None, None)
+            .is_ok());
     }
 
     #[test]
@@ -3177,7 +3228,10 @@ mod tests {
         {
             let store = StandingGrantStore::with_persistence(&path).unwrap();
             store
-                .issue(envelope_with("live-1", Some(SecureTimestamp::after_secs(3600))))
+                .issue(envelope_with(
+                    "live-1",
+                    Some(SecureTimestamp::after_secs(3600)),
+                ))
                 .unwrap();
             store.issue(envelope_with("dead-1", None)).unwrap();
             assert!(store.revoke("dead-1").unwrap());
@@ -3188,7 +3242,10 @@ mod tests {
             assert!(store.record_fresh_intent("intent-once", now, now).unwrap());
         } // drop = the "restart"
         let store = StandingGrantStore::with_persistence(&path).unwrap();
-        assert!(store.is_active("live-1"), "a live mandate survives reboot LIVE");
+        assert!(
+            store.is_active("live-1"),
+            "a live mandate survives reboot LIVE"
+        );
         assert!(
             !store.is_active("dead-1"),
             "a revoked mandate stays DEAD after reboot — never crash-revived"
@@ -3197,7 +3254,10 @@ mod tests {
             store.get("dead-1").expect("still queryable").revoked,
             "the revoked record is retained as revoked, not vanished"
         );
-        assert!(!store.is_active("exp-1"), "an expired mandate reloads inactive");
+        assert!(
+            !store.is_active("exp-1"),
+            "an expired mandate reloads inactive"
+        );
         let now = SecureTimestamp::now().unix_secs;
         assert!(
             !store.record_fresh_intent("intent-once", now, now).unwrap(),
@@ -3207,7 +3267,11 @@ mod tests {
             store.record_fresh_intent("intent-new", now, now).unwrap(),
             "fresh intents still register after reload"
         );
-        assert_eq!(store.list().len(), 3, "every issued mandate is still listed");
+        assert_eq!(
+            store.list().len(),
+            3,
+            "every issued mandate is still listed"
+        );
     }
 
     /// The per-mandate RATE budget (G-M7): a mandate may perform up to the limit per window, then
@@ -3230,7 +3294,10 @@ mod tests {
             "over budget in the same window"
         );
         // A DIFFERENT mandate has its own budget — not spent by g1's flood.
-        assert!(store.record_dispatch_within_budget("g2", t0), "g2 has its own budget");
+        assert!(
+            store.record_dispatch_within_budget("g2", t0),
+            "g2 has its own budget"
+        );
         // A new window (past the window end) resets g1.
         let t1 = t0 + MANDATE_DISPATCH_WINDOW_SECS;
         assert!(
@@ -3252,7 +3319,11 @@ mod tests {
         for i in 0..(DISPATCH_RATE_SOFT_CAP * 4) {
             store.record_dispatch_within_budget(&format!("flood-{i}"), t0);
         }
-        let n = store.dispatch_rate.read().map(|m| m.len()).unwrap_or(usize::MAX);
+        let n = store
+            .dispatch_rate
+            .read()
+            .map(|m| m.len())
+            .unwrap_or(usize::MAX);
         assert!(
             n <= DISPATCH_RATE_SOFT_CAP + 1,
             "same-window distinct-grant_id flood is hard-capped at ~{DISPATCH_RATE_SOFT_CAP}, got {n}"
@@ -3283,7 +3354,10 @@ mod tests {
         store.issue(envelope_with("g-default", None)).unwrap();
         let t0 = 1_000_000u64;
         for i in 0..3 {
-            assert!(store.record_dispatch_within_budget("g-tight", t0), "act {i} within its own budget");
+            assert!(
+                store.record_dispatch_within_budget("g-tight", t0),
+                "act {i} within its own budget"
+            );
         }
         assert!(
             !store.record_dispatch_within_budget("g-tight", t0),
@@ -3291,7 +3365,10 @@ mod tests {
         );
         // The default-budget mandate is unaffected by the tight one's ceiling.
         for i in 0..4 {
-            assert!(store.record_dispatch_within_budget("g-default", t0), "default act {i}");
+            assert!(
+                store.record_dispatch_within_budget("g-default", t0),
+                "default act {i}"
+            );
         }
         // The custom budget resets on a new window like the default does.
         let t1 = t0 + MANDATE_DISPATCH_WINDOW_SECS;
@@ -3330,7 +3407,10 @@ mod tests {
         .unwrap();
         let store = StandingGrantStore::with_persistence(&path).unwrap();
         let g1 = store.get("g1").expect("the v2 mandate survives migration");
-        assert_eq!(g1.dispatch_limit, None, "migrated mandates run at the global default");
+        assert_eq!(
+            g1.dispatch_limit, None,
+            "migrated mandates run at the global default"
+        );
         // Issue a custom-rate mandate; the store now writes v3 — reload must preserve the dial.
         let mut dialed = envelope_with("g-dialed", None);
         dialed.dispatch_limit = Some(5);
@@ -3375,22 +3455,33 @@ mod tests {
         )
         .unwrap();
         let store = StandingGrantStore::with_persistence(&path).unwrap();
-        let live = store.get("g-live").expect("a pre-Sprint-23 v3 file loads (revoked_at defaults)");
-        assert_eq!(live.revoked_at, None, "a missing revoked_at defaults to None — no migration");
+        let live = store
+            .get("g-live")
+            .expect("a pre-Sprint-23 v3 file loads (revoked_at defaults)");
+        assert_eq!(
+            live.revoked_at, None,
+            "a missing revoked_at defaults to None — no migration"
+        );
 
         // Revoke stamps a time; it survives restart.
         assert!(store.revoke("g-live").unwrap());
         let reopened = StandingGrantStore::with_persistence(&path).unwrap();
         let revd = reopened.get("g-live").expect("still present, revoked");
         assert!(revd.revoked, "the revoke round-trips");
-        assert!(revd.revoked_at.is_some(), "and the revoke TIME round-trips (Sprint 23)");
+        assert!(
+            revd.revoked_at.is_some(),
+            "and the revoke TIME round-trips (Sprint 23)"
+        );
 
         // A grant expired PAST the retention window is pruned the next time the registry grows.
         let realnow = SecureTimestamp::now().unix_secs;
         let mut ancient = envelope_with("g-ancient", None);
         ancient.expires_at = Some(SecureTimestamp::at(realnow - GRANT_RETENTION_SECS - 100));
         reopened.issue(ancient).unwrap(); // exempt on its own issue — still present here
-        assert!(reopened.get("g-ancient").is_some(), "the just-issued grant is exempt from its own prune");
+        assert!(
+            reopened.get("g-ancient").is_some(),
+            "the just-issued grant is exempt from its own prune"
+        );
         // Issuing ANOTHER grant runs the prune with the ancient one no longer exempt → it ages out.
         reopened.issue(envelope_with("g-new", None)).unwrap();
         assert!(
@@ -3398,7 +3489,10 @@ mod tests {
             "a grant dead past the retention window is pruned when the registry next grows"
         );
         assert!(reopened.get("g-new").is_some(), "the fresh grant is kept");
-        assert!(reopened.get("g-live").is_some(), "the recently-revoked grant is still within retention");
+        assert!(
+            reopened.get("g-live").is_some(),
+            "the recently-revoked grant is still within retention"
+        );
     }
 
     /// The freshness window (G-M7): a declaration expires (too old) and a future-dated one is
@@ -3406,14 +3500,23 @@ mod tests {
     #[test]
     fn freshness_window_rejects_stale_and_future_dated() {
         let now = 1_000_000u64;
-        assert!(check_intent_freshness(now, now).is_ok(), "declared now → fresh");
-        assert!(check_intent_freshness(now - MAX_INTENT_AGE_SECS, now).is_ok(), "at the age edge → fresh");
+        assert!(
+            check_intent_freshness(now, now).is_ok(),
+            "declared now → fresh"
+        );
+        assert!(
+            check_intent_freshness(now - MAX_INTENT_AGE_SECS, now).is_ok(),
+            "at the age edge → fresh"
+        );
         assert_eq!(
             check_intent_freshness(now - MAX_INTENT_AGE_SECS - 1, now),
             Err(FreshnessError::Stale),
             "one second past the age → stale"
         );
-        assert!(check_intent_freshness(now + MAX_CLOCK_SKEW_SECS, now).is_ok(), "at the skew edge → fresh");
+        assert!(
+            check_intent_freshness(now + MAX_CLOCK_SKEW_SECS, now).is_ok(),
+            "at the skew edge → fresh"
+        );
         assert_eq!(
             check_intent_freshness(now + MAX_CLOCK_SKEW_SECS + 1, now),
             Err(FreshnessError::FutureDated),
@@ -3453,7 +3556,7 @@ mod tests {
     fn backward_clock_step_cannot_readmit_an_evicted_intent() {
         let store = StandingGrantStore::new();
         let d = 10_000_000u64; // captured intent X's declared_at
-        // 1. X dispatched legitimately at wall-time ≈ d — remembered.
+                               // 1. X dispatched legitimately at wall-time ≈ d — remembered.
         assert!(store.record_fresh_intent("X", d, d).unwrap());
         // 2. Clock advances past d + retention; another dispatch compacts X out (and raises the
         //    watermark to ≥ d).
@@ -3462,7 +3565,11 @@ mod tests {
         // 3. Clock steps BACKWARD to ≈ d (t2 within X's freshness window). Freshness would ACCEPT
         //    X here (that is the regression) — but the watermark refuses the readmit.
         let t2 = d; // check_intent_freshness(d, t2) == Ok — the dangerous case
-        assert_eq!(check_intent_freshness(d, t2), Ok(()), "freshness alone would accept the replay");
+        assert_eq!(
+            check_intent_freshness(d, t2),
+            Ok(()),
+            "freshness alone would accept the replay"
+        );
         assert!(
             !store.record_fresh_intent("X", d, t2).unwrap(),
             "the watermark refuses X's replay regardless of the clock rewind — no double-act"
@@ -3537,14 +3644,18 @@ mod tests {
         assert!(store.is_active("g1"), "the v1 mandate survives migration");
         let now = SecureTimestamp::now().unix_secs;
         assert!(
-            !store.record_fresh_intent("legacy-intent", now, now).unwrap(),
+            !store
+                .record_fresh_intent("legacy-intent", now, now)
+                .unwrap(),
             "the migrated replay guard still refuses the legacy intent id"
         );
         // And it is now written back as v2 (a fresh intent persists in the new format).
         assert!(store.record_fresh_intent("new-intent", now, now).unwrap());
         let reopened = StandingGrantStore::with_persistence(&path).unwrap();
         assert!(
-            !reopened.record_fresh_intent("new-intent", now, now).unwrap(),
+            !reopened
+                .record_fresh_intent("new-intent", now, now)
+                .unwrap(),
             "the v2 rewrite round-trips the guard"
         );
     }
@@ -3622,17 +3733,38 @@ mod tests {
         let tmp_path = path.with_extension("tmp");
         std::fs::create_dir(&tmp_path).unwrap();
 
-        assert!(store.issue(envelope_with("g2", None)).is_err(), "issue surfaces the failure");
-        assert!(store.get("g2").is_none(), "the unpersistable mandate was NOT issued");
+        assert!(
+            store.issue(envelope_with("g2", None)).is_err(),
+            "issue surfaces the failure"
+        );
+        assert!(
+            store.get("g2").is_none(),
+            "the unpersistable mandate was NOT issued"
+        );
         assert!(store.revoke("g1").is_err(), "revoke surfaces the failure");
-        assert!(store.is_active("g1"), "the unpersistable revoke did not half-apply");
+        assert!(
+            store.is_active("g1"),
+            "the unpersistable revoke did not half-apply"
+        );
         let now = SecureTimestamp::now().unix_secs;
-        assert!(store.record_fresh_intent("i1", now, now).is_err(), "replay-guard write surfaces");
+        assert!(
+            store.record_fresh_intent("i1", now, now).is_err(),
+            "replay-guard write surfaces"
+        );
         // Clear the failure and verify the store still works (loud failure, re-runnable).
         std::fs::remove_dir(&tmp_path).unwrap();
-        assert!(store.revoke("g1").unwrap(), "after the failure clears, the revoke lands");
         assert!(
-            store.record_fresh_intent("i1", SecureTimestamp::now().unix_secs, SecureTimestamp::now().unix_secs).unwrap(),
+            store.revoke("g1").unwrap(),
+            "after the failure clears, the revoke lands"
+        );
+        assert!(
+            store
+                .record_fresh_intent(
+                    "i1",
+                    SecureTimestamp::now().unix_secs,
+                    SecureTimestamp::now().unix_secs
+                )
+                .unwrap(),
             "the rolled-back intent id was not half-registered"
         );
     }

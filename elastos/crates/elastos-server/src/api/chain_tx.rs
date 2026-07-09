@@ -334,7 +334,7 @@ mod confirmation_tests {
     #[test]
     fn classify_receipt_is_fail_closed_on_status_and_depth() {
         let mined = json!({"status": "0x1", "blockNumber": "0x64"}); // block 100
-        // Deep enough + success ⇒ Confirmed.
+                                                                     // Deep enough + success ⇒ Confirmed.
         assert_eq!(classify_receipt(&mined, 102, 3), TxConfirmation::Confirmed);
         // Below the depth floor ⇒ Pending (tip 100 == mined ⇒ depth 1 < 3).
         assert!(matches!(
@@ -343,7 +343,10 @@ mod confirmation_tests {
         ));
         // Reverted, deep enough ⇒ Reverted (council S35 guardian F2: depth gates the revert too).
         let reverted = json!({"status": "0x0", "blockNumber": "0x64"});
-        assert_eq!(classify_receipt(&reverted, 110, 3), TxConfirmation::Reverted);
+        assert_eq!(
+            classify_receipt(&reverted, 110, 3),
+            TxConfirmation::Reverted
+        );
         // Reverted but SHALLOW ⇒ Pending, NOT an immediate refund.
         assert!(matches!(
             classify_receipt(&reverted, 100, 3),

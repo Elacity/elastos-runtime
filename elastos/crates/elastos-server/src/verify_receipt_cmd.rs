@@ -45,7 +45,10 @@ fn resolve_expected_signer(signer: Option<&str>) -> Result<Option<String>> {
     let bytes = hex::decode(raw)
         .with_context(|| "--signer is neither a did:key nor valid hex".to_string())?;
     if bytes.len() != 32 {
-        bail!("--signer hex must be 32 bytes (64 hex chars), got {}", bytes.len());
+        bail!(
+            "--signer hex must be 32 bytes (64 hex chars), got {}",
+            bytes.len()
+        );
     }
     Ok(Some(hex::encode(bytes)))
 }
@@ -92,7 +95,10 @@ pub fn exit_code(verdict: &MandateReceiptVerdict) -> i32 {
 
 /// Read + parse a receipt file, resolve the pinned signer, and verify. Pure (no printing, no exit) so
 /// it is testable; `run_verify_receipt` layers presentation and the process exit on top.
-pub fn evaluate(path: &Path, signer: Option<&str>) -> Result<(MandateReceipt, MandateReceiptVerdict)> {
+pub fn evaluate(
+    path: &Path,
+    signer: Option<&str>,
+) -> Result<(MandateReceipt, MandateReceiptVerdict)> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading receipt {}", path.display()))?;
     let receipt: MandateReceipt = serde_json::from_str(&raw)
@@ -126,7 +132,10 @@ pub fn run_verify_receipt(path: PathBuf, signer: Option<String>, json: bool) -> 
     println!("  schema:            {}", sanitize_display(&receipt.schema));
     println!("  scope:             {}", scope_label(&receipt.scope));
     println!("  records:           {}", verdict.records);
-    println!("  signer:            {}", sanitize_display(&verdict.signer_public_key_hex));
+    println!(
+        "  signer:            {}",
+        sanitize_display(&verdict.signer_public_key_hex)
+    );
     println!("  hashes:            {}", ok_no(verdict.hashes_ok));
     println!("  signatures:        {}", ok_no(verdict.signatures_ok));
     println!("  set binding:       {}", ok_no(verdict.set_binding_ok));
@@ -279,7 +288,10 @@ mod tests {
     fn pinned_signer_authenticates_and_exits_zero() {
         let (_dir, path, signer) = write_capability_receipt();
         let (_receipt, verdict) = evaluate(&path, Some(&signer)).unwrap();
-        assert!(verdict.authenticated, "hex-pinned to the true signer ⇒ authentic: {verdict:?}");
+        assert!(
+            verdict.authenticated,
+            "hex-pinned to the true signer ⇒ authentic: {verdict:?}"
+        );
         assert_eq!(exit_code(&verdict), 0);
     }
 
@@ -324,7 +336,10 @@ mod tests {
         let trimmed = dir.path().join("trimmed.json");
         std::fs::write(&trimmed, serde_json::to_string(&receipt).unwrap()).unwrap();
         let (_receipt, verdict) = evaluate(&trimmed, Some(&signer)).unwrap();
-        assert!(!verdict.set_binding_ok, "set binding must catch the keyless trim");
+        assert!(
+            !verdict.set_binding_ok,
+            "set binding must catch the keyless trim"
+        );
         assert!(!verdict.structurally_valid);
         assert_eq!(exit_code(&verdict), 1);
     }
@@ -338,7 +353,10 @@ mod tests {
         assert_eq!(resolve_expected_signer(None).unwrap(), None);
         assert!(resolve_expected_signer(Some("   ")).is_err());
         let hex_key = "3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29";
-        assert_eq!(resolve_expected_signer(Some(hex_key)).unwrap(), Some(hex_key.to_string()));
+        assert_eq!(
+            resolve_expected_signer(Some(hex_key)).unwrap(),
+            Some(hex_key.to_string())
+        );
     }
 
     /// Sprint 45 (the live-money last mile, gate-runnable half): a receipt carrying a DRM
@@ -380,7 +398,10 @@ mod tests {
         let (dir, path, signer, _rail_ref) = write_drm_settlement_receipt();
         let raw = std::fs::read_to_string(&path).unwrap();
         let tampered = raw.replace("0xC0FFEE", "0xDEADBEEF");
-        assert_ne!(raw, tampered, "the tamper actually changed the settlement tx bytes");
+        assert_ne!(
+            raw, tampered,
+            "the tamper actually changed the settlement tx bytes"
+        );
         let tpath = dir.path().join("tampered.json");
         std::fs::write(&tpath, tampered).unwrap();
         let (_receipt, verdict) = evaluate(&tpath, Some(&signer)).unwrap();
@@ -392,7 +413,11 @@ mod tests {
             !verdict.structurally_valid,
             "a broken hash ⇒ structurally invalid"
         );
-        assert_eq!(exit_code(&verdict), 1, "a tampered money receipt is INVALID, never trusted");
+        assert_eq!(
+            exit_code(&verdict),
+            1,
+            "a tampered money receipt is INVALID, never trusted"
+        );
     }
 
     #[test]
@@ -403,11 +428,21 @@ mod tests {
         let safe = sanitize_display(attack);
         assert!(!safe.contains('\n'), "newlines must not survive");
         assert!(!safe.contains('\u{1b}'), "ANSI ESC must not survive");
-        assert!(safe.contains("\\u{000a}") && safe.contains("\\u{001b}"), "controls shown escaped");
+        assert!(
+            safe.contains("\\u{000a}") && safe.contains("\\u{001b}"),
+            "controls shown escaped"
+        );
         // A clean value is displayed verbatim (no needless mangling of real hex/schema).
-        assert_eq!(sanitize_display("elastos.mandate_receipt/v1"), "elastos.mandate_receipt/v1");
-        let labelled =
-            scope_label(&MandateReceiptScope::Capability { token_id: attack.to_string() });
-        assert!(!labelled.contains('\n'), "scope label must not carry a raw newline");
+        assert_eq!(
+            sanitize_display("elastos.mandate_receipt/v1"),
+            "elastos.mandate_receipt/v1"
+        );
+        let labelled = scope_label(&MandateReceiptScope::Capability {
+            token_id: attack.to_string(),
+        });
+        assert!(
+            !labelled.contains('\n'),
+            "scope label must not carry a raw newline"
+        );
     }
 }

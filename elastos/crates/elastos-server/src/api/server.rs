@@ -211,8 +211,7 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
         // it, rather than silently assuming 1 spend unit == 1 wei — so the operator must DECLARE
         // the unit and the cap becomes a literal on-chain ceiling. Dev/ChainMock (mock-opt-in) may
         // omit it (a free quote makes the gate a no-op) ⇒ default 1.
-        let is_chain_mode =
-            matches!(mode, super::rights_authority::RightsMode::Chain);
+        let is_chain_mode = matches!(mode, super::rights_authority::RightsMode::Chain);
         let spend_unit = match std::env::var("ELASTOS_DRM_SPEND_UNIT") {
             Ok(v) => match v.trim().parse::<u128>() {
                 Ok(n) if n >= 1 => n,
@@ -834,10 +833,7 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
     // mandate + a matching signer before any act (charge-on-authorized). This is the "a mandate, not
     // your keys" surface.
     let agent_routes = Router::new()
-        .route(
-            "/api/agent/dispatch",
-            post(handlers::dispatch_agent_intent),
-        )
+        .route("/api/agent/dispatch", post(handlers::dispatch_agent_intent))
         .layer(axum_middleware::from_fn_with_state(
             general_rate_state.clone(),
             rate_limit_middleware,

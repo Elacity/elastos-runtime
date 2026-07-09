@@ -149,7 +149,10 @@ pub trait MarketQuoter: Send + Sync {
 pub struct LiveMarketQuoter;
 impl MarketQuoter for LiveMarketQuoter {
     fn quote(&self, asset: &str) -> Result<crate::api::buy_authority::BuyQuote, String> {
-        crate::api::buy_authority::quote_buy(asset, &crate::api::buy_authority::BuyTarget::default())
+        crate::api::buy_authority::quote_buy(
+            asset,
+            &crate::api::buy_authority::BuyTarget::default(),
+        )
     }
 }
 
@@ -227,7 +230,10 @@ mod tests {
             supply: None,
             error: Some("nope".to_string()),
         };
-        assert!(err.canonical_terms().is_none(), "an error outcome has no terms");
+        assert!(
+            err.canonical_terms().is_none(),
+            "an error outcome has no terms"
+        );
     }
 
     #[test]

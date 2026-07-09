@@ -109,7 +109,11 @@ fn classify_assemble_error(err: String) -> MintError {
 /// chain-provider `MintAssembly` (`to`, `token_uri`, `op_type_code`, `content_id`,
 /// optional `value_wei` / `op_raw` / `sell`); the mint `selector` is pinned here when the
 /// caller didn't supply one. `principal_id` owns the managed minting account.
-pub fn mint_asset(principal_id: &str, mint: Value, now_unix: u64) -> Result<MintOutcome, MintError> {
+pub fn mint_asset(
+    principal_id: &str,
+    mint: Value,
+    now_unix: u64,
+) -> Result<MintOutcome, MintError> {
     let mode = super::rights_authority::rights_mode();
 
     // Assemble the real mint calldata first (pure step, all modes). This also validates the
@@ -328,7 +332,10 @@ mod tests {
     fn mint_rejects_a_non_object_assembly() {
         let err = assemble_calldata(json!("not-an-object")).expect_err("must reject");
         // A malformed shape is the caller's fault: a client error (400), reason surfaced.
-        assert!(err.is_client_error(), "non-object must classify as a client error: {err}");
+        assert!(
+            err.is_client_error(),
+            "non-object must classify as a client error: {err}"
+        );
         assert!(
             err.client_message().contains("JSON object"),
             "unexpected error: {err}"

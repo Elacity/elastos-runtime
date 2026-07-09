@@ -269,14 +269,15 @@ impl PaymentProvider for HttpPaymentProvider {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| PayError::NotCharged(format!("rail client not constructed: {e}")))?;
-            let mut req = client
-                .post(&endpoint)
-                .header("Idempotency-Key", &key)
-                .json(&serde_json::json!({
-                    "payee": payee,
-                    "amount": amount,
-                    "idempotency_key": key,
-                }));
+            let mut req =
+                client
+                    .post(&endpoint)
+                    .header("Idempotency-Key", &key)
+                    .json(&serde_json::json!({
+                        "payee": payee,
+                        "amount": amount,
+                        "idempotency_key": key,
+                    }));
             if let Some(t) = &token {
                 req = req.bearer_auth(t);
             }
@@ -416,13 +417,15 @@ impl MethodRegistryExecutor {
                     // free-form is persisted under the mandate.
                     if !valid_slug_1_64(key) {
                         return IntentExecution::Declined {
-                            reason: "state_put key must be 1-64 chars of [A-Za-z0-9._-]".to_string(),
+                            reason: "state_put key must be 1-64 chars of [A-Za-z0-9._-]"
+                                .to_string(),
                         };
                     }
                     if !valid_hex_0_64(&intent.input_hash) {
                         return IntentExecution::Declined {
-                            reason: "state_put value (input_hash) must be <=64 hex chars (or empty)"
-                                .to_string(),
+                            reason:
+                                "state_put value (input_hash) must be <=64 hex chars (or empty)"
+                                    .to_string(),
                         };
                     }
                     // The intent_id is PERSISTED in the entry (attribution), so it is bounded to a
@@ -522,9 +525,7 @@ impl MethodRegistryExecutor {
                     // outside this namespace is not a notify target ⇒ Decline.
                     let Some(topic) = intent.resource.strip_prefix(INBOX_NOTIFY_PREFIX) else {
                         return IntentExecution::Declined {
-                            reason: format!(
-                                "notify resource must be {INBOX_NOTIFY_PREFIX}<topic>"
-                            ),
+                            reason: format!("notify resource must be {INBOX_NOTIFY_PREFIX}<topic>"),
                         };
                     };
                     if !valid_notify_topic(topic) {
@@ -543,7 +544,8 @@ impl MethodRegistryExecutor {
                     }
                     if !valid_hex_0_64(&intent.input_hash) {
                         return IntentExecution::Declined {
-                            reason: "notify input_hash must be <=64 hex chars (or empty)".to_string(),
+                            reason: "notify input_hash must be <=64 hex chars (or empty)"
+                                .to_string(),
                         };
                     }
                     // The REAL side effect: land the row in the operator's Inbox store. Performed
@@ -1140,7 +1142,11 @@ mod tests {
             }),
         );
         match reg.execute(&intent("demo.read")) {
-            IntentExecution::Performed { method_id, resource, .. } => {
+            IntentExecution::Performed {
+                method_id,
+                resource,
+                ..
+            } => {
                 assert_eq!(method_id, "demo.read");
                 assert_eq!(resource, "elastos://pay/vendor");
             }
@@ -1152,10 +1158,12 @@ mod tests {
     fn production_declines_unwired_methods_and_performs_the_real_audit_read() {
         let dir = tempfile::tempdir().unwrap();
         let log = Arc::new(AuditLog::with_file(dir.path().join("audit.log")).unwrap());
-        log.emit(elastos_runtime::primitives::audit::AuditEvent::RuntimeStart {
-            timestamp: elastos_common::SecureTimestamp::now(),
-            version: "t".to_string(),
-        })
+        log.emit(
+            elastos_runtime::primitives::audit::AuditEvent::RuntimeStart {
+                timestamp: elastos_common::SecureTimestamp::now(),
+                version: "t".to_string(),
+            },
+        )
         .unwrap();
         let reg = MethodRegistryExecutor::production(log, None);
         // Unwired methods decline (⇒ Undelivered), never a fabricated match.
@@ -1208,7 +1216,12 @@ mod tests {
         );
         let resource = format!("{INBOX_NOTIFY_PREFIX}agent-status");
         match reg.execute(&notify_intent(&resource, "vm-agent", "cafe")) {
-            IntentExecution::Performed { action, resource: r, input_hash, .. } => {
+            IntentExecution::Performed {
+                action,
+                resource: r,
+                input_hash,
+                ..
+            } => {
                 assert_eq!(action, "message", "the act performed IS a message");
                 assert_eq!(r, resource, "delivered to the declared topic");
                 assert_eq!(input_hash, "cafe", "the consumed input hash is reported");
@@ -1220,10 +1233,19 @@ mod tests {
         assert_eq!(summary.unread_count, 1, "one unread notification landed");
         let entry = &summary.entries[0];
         assert_eq!(entry.kind, crate::notifications::AGENT_ACT_KIND);
-        assert!(entry.title.contains("agent-status"), "title names the topic");
-        assert!(entry.body.contains("vm-agent"), "body names the acting capsule");
+        assert!(
+            entry.title.contains("agent-status"),
+            "title names the topic"
+        );
+        assert!(
+            entry.body.contains("vm-agent"),
+            "body names the acting capsule"
+        );
         assert!(entry.body.contains("grant-1"), "body names the mandate");
-        assert!(entry.body.contains("cafe"), "body carries the input-hash commitment");
+        assert!(
+            entry.body.contains("cafe"),
+            "body carries the input-hash commitment"
+        );
     }
 
     /// Fail-closed scoping: outside the inbox namespace, or with a topic that could smuggle
@@ -1236,11 +1258,11 @@ mod tests {
             Some(dir.path().to_path_buf()),
         );
         for bad in [
-            "elastos://mail/send".to_string(),                       // outside the namespace
-            INBOX_NOTIFY_PREFIX.to_string(),                         // empty topic
-            format!("{INBOX_NOTIFY_PREFIX}<script>x</script>"),      // markup smuggle
-            format!("{INBOX_NOTIFY_PREFIX}a/b"),                     // path trick
-            format!("{INBOX_NOTIFY_PREFIX}{}", "x".repeat(65)),      // over-long
+            "elastos://mail/send".to_string(), // outside the namespace
+            INBOX_NOTIFY_PREFIX.to_string(),   // empty topic
+            format!("{INBOX_NOTIFY_PREFIX}<script>x</script>"), // markup smuggle
+            format!("{INBOX_NOTIFY_PREFIX}a/b"), // path trick
+            format!("{INBOX_NOTIFY_PREFIX}{}", "x".repeat(65)), // over-long
         ] {
             assert!(
                 matches!(
@@ -1251,7 +1273,11 @@ mod tests {
             );
         }
         let summary = crate::notifications::load_summary(dir.path()).unwrap();
-        assert_eq!(summary.entries.len(), 0, "a declined notify delivers NOTHING");
+        assert_eq!(
+            summary.entries.len(),
+            0,
+            "a declined notify delivers NOTHING"
+        );
     }
 
     /// Council F1: `intent_id` and `input_hash` reach the operator's Inbox body, so a malformed
@@ -1295,7 +1321,10 @@ mod tests {
             IntentExecution::Declined { .. }
         ));
         assert_eq!(
-            crate::notifications::load_summary(dir.path()).unwrap().entries.len(),
+            crate::notifications::load_summary(dir.path())
+                .unwrap()
+                .entries
+                .len(),
             0,
             "no operator-unsafe field ever delivered a row"
         );
@@ -1329,7 +1358,10 @@ mod tests {
                 "message",
                 "grant-1",
             );
-            assert!(matches!(reg.execute(&intent), IntentExecution::Performed { .. }));
+            assert!(matches!(
+                reg.execute(&intent),
+                IntentExecution::Performed { .. }
+            ));
         }
         let summary = crate::notifications::load_summary(dir.path()).unwrap();
         assert!(
@@ -1365,7 +1397,12 @@ mod tests {
         );
         let resource = format!("{STATE_PUT_PREFIX}cursor");
         match reg.execute(&state_put_intent(&resource, "vm-agent", "cafe01")) {
-            IntentExecution::Performed { action, resource: r, input_hash, .. } => {
+            IntentExecution::Performed {
+                action,
+                resource: r,
+                input_hash,
+                ..
+            } => {
                 assert_eq!(action, "write", "the act performed IS a write");
                 assert_eq!(r, resource);
                 assert_eq!(input_hash, "cafe01");
@@ -1379,9 +1416,11 @@ mod tests {
         assert_eq!(got.value_hash, "cafe01");
         assert_eq!(got.grant_id, "grant-1");
         // A DIFFERENT capsule cannot read it — no cross-principal state leak.
-        assert!(crate::agent_store::get_agent_state(dir.path(), "vm-other", "cursor")
-            .unwrap()
-            .is_none());
+        assert!(
+            crate::agent_store::get_agent_state(dir.path(), "vm-other", "cursor")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Fail-closed scoping: outside the store namespace, or with a key/value that could smuggle
@@ -1398,7 +1437,10 @@ mod tests {
             (STATE_PUT_PREFIX.to_string(), "aa".to_string()),      // empty key
             (format!("{STATE_PUT_PREFIX}a/b"), "aa".to_string()),  // path trick
             (format!("{STATE_PUT_PREFIX}k"), "not hex".to_string()), // free-text value
-            (format!("{STATE_PUT_PREFIX}{}", "x".repeat(65)), "aa".to_string()), // over-long key
+            (
+                format!("{STATE_PUT_PREFIX}{}", "x".repeat(65)),
+                "aa".to_string(),
+            ), // over-long key
         ] {
             assert!(
                 matches!(
@@ -1409,7 +1451,9 @@ mod tests {
             );
         }
         assert!(
-            crate::agent_store::get_agent_state(dir.path(), "vm-agent", "k").unwrap().is_none(),
+            crate::agent_store::get_agent_state(dir.path(), "vm-agent", "k")
+                .unwrap()
+                .is_none(),
             "a declined state_put persists NOTHING"
         );
     }
@@ -1436,9 +1480,14 @@ mod tests {
             "write",
             "grant-1",
         );
-        assert!(matches!(reg.execute(&intent), IntentExecution::Declined { .. }));
+        assert!(matches!(
+            reg.execute(&intent),
+            IntentExecution::Declined { .. }
+        ));
         assert!(
-            crate::agent_store::get_agent_state(dir.path(), "vm-agent", "cursor").unwrap().is_none(),
+            crate::agent_store::get_agent_state(dir.path(), "vm-agent", "cursor")
+                .unwrap()
+                .is_none(),
             "a declined write persists nothing"
         );
     }
@@ -1491,7 +1540,12 @@ mod tests {
         // the agent declared, so reconcile can Match (declared==actual) or Diverge (declared!=actual).
         for declared in ["cafe01", "beef99", ""] {
             match reg.execute(&state_get_intent(&resource, "vm-agent", declared)) {
-                IntentExecution::Performed { action, resource: r, input_hash, .. } => {
+                IntentExecution::Performed {
+                    action,
+                    resource: r,
+                    input_hash,
+                    ..
+                } => {
                     assert_eq!(action, "read", "the act performed IS a read");
                     assert_eq!(r, resource);
                     assert_eq!(
@@ -1589,7 +1643,11 @@ mod tests {
     fn pay_registry(meter: Arc<SpendMeter>) -> (MethodRegistryExecutor, Arc<MockPaymentProvider>) {
         let provider = Arc::new(MockPaymentProvider::default());
         let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
-            .with_payments(meter, provider.clone(), Arc::new(crate::payment_ledger::PaymentLedger::new()));
+            .with_payments(
+                meter,
+                provider.clone(),
+                Arc::new(crate::payment_ledger::PaymentLedger::new()),
+            );
         (reg, provider)
     }
 
@@ -1601,14 +1659,26 @@ mod tests {
         meter.set_budget("vm-agent", 500).unwrap();
         let (reg, provider) = pay_registry(meter.clone());
         match reg.execute(&pay_intent("acme-vendor", "vm-agent", "200")) {
-            IntentExecution::Performed { action, resource, input_hash, .. } => {
+            IntentExecution::Performed {
+                action,
+                resource,
+                input_hash,
+                ..
+            } => {
                 assert_eq!(action, "execute");
                 assert_eq!(resource, format!("{PAY_PREFIX}acme-vendor"));
-                assert_eq!(input_hash, "200", "the receipt names the amount actually paid");
+                assert_eq!(
+                    input_hash, "200",
+                    "the receipt names the amount actually paid"
+                );
             }
             other => panic!("expected Performed, got {other:?}"),
         }
-        assert_eq!(meter.remaining("vm-agent"), 300, "the cap was debited by exactly the amount");
+        assert_eq!(
+            meter.remaining("vm-agent"),
+            300,
+            "the cap was debited by exactly the amount"
+        );
         assert_eq!(
             *provider.payments.lock().unwrap(),
             vec![("acme-vendor".to_string(), 200)],
@@ -1627,8 +1697,15 @@ mod tests {
             reg.execute(&pay_intent("acme-vendor", "vm-agent", "150")),
             IntentExecution::Declined { .. }
         ));
-        assert_eq!(meter.remaining("vm-agent"), 100, "a refused payment does not touch the cap");
-        assert!(provider.payments.lock().unwrap().is_empty(), "no money moved over the cap");
+        assert_eq!(
+            meter.remaining("vm-agent"),
+            100,
+            "a refused payment does not touch the cap"
+        );
+        assert!(
+            provider.payments.lock().unwrap().is_empty(),
+            "no money moved over the cap"
+        );
     }
 
     /// An unprovisioned capsule has ZERO budget (fail-closed) — it cannot pay a cent until the
@@ -1651,7 +1728,11 @@ mod tests {
         let meter = Arc::new(SpendMeter::new());
         meter.set_budget("vm-agent", 100).unwrap();
         let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
-            .with_payments(meter.clone(), Arc::new(FailingProvider), Arc::new(crate::payment_ledger::PaymentLedger::new()));
+            .with_payments(
+                meter.clone(),
+                Arc::new(FailingProvider),
+                Arc::new(crate::payment_ledger::PaymentLedger::new()),
+            );
         assert!(matches!(
             reg.execute(&pay_intent("acme-vendor", "vm-agent", "40")),
             IntentExecution::Declined { .. }
@@ -1680,7 +1761,11 @@ mod tests {
         let meter = Arc::new(SpendMeter::new());
         meter.set_budget("vm-agent", 100).unwrap();
         let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
-            .with_payments(meter.clone(), Arc::new(PanickingProvider), Arc::new(crate::payment_ledger::PaymentLedger::new()));
+            .with_payments(
+                meter.clone(),
+                Arc::new(PanickingProvider),
+                Arc::new(crate::payment_ledger::PaymentLedger::new()),
+            );
         match reg.execute(&pay_intent("acme-vendor", "vm-agent", "40")) {
             IntentExecution::Declined { reason } => {
                 assert!(
@@ -1713,12 +1798,15 @@ mod tests {
         let meter = Arc::new(SpendMeter::new());
         meter.set_budget("vm-agent", 100).unwrap();
         let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
-            .with_payments(meter.clone(), Arc::new(IndeterminateProvider), Arc::new(crate::payment_ledger::PaymentLedger::new()));
+            .with_payments(
+                meter.clone(),
+                Arc::new(IndeterminateProvider),
+                Arc::new(crate::payment_ledger::PaymentLedger::new()),
+            );
         match reg.execute(&pay_intent("acme-vendor", "vm-agent", "40")) {
             IntentExecution::Declined { reason } => {
                 assert!(
-                    reason.contains("INDETERMINATE")
-                        && reason.contains("idempotency key flint-"),
+                    reason.contains("INDETERMINATE") && reason.contains("idempotency key flint-"),
                     "the reason names the indeterminacy and the reconciliation key: {reason}"
                 );
                 assert!(
@@ -1824,8 +1912,11 @@ mod tests {
         // A malformed endpoint (builder error — nothing ever left the process) is provably NOT
         // charged (council S29 F3), never "the charge may have posted".
         assert!(matches!(
-            HttpPaymentProvider::new("not a url at all".to_string(), None)
-                .pay("acme-vendor", 200, "k"),
+            HttpPaymentProvider::new("not a url at all".to_string(), None).pay(
+                "acme-vendor",
+                200,
+                "k"
+            ),
             Err(PayError::NotCharged(_))
         ));
     }
@@ -1858,8 +1949,11 @@ mod tests {
         let meter = Arc::new(SpendMeter::new());
         meter.set_budget("vm-agent", 1000).unwrap();
         let reg = Arc::new(
-            MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
-                .with_payments(meter.clone(), provider.clone(), Arc::new(crate::payment_ledger::PaymentLedger::new())),
+            MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None).with_payments(
+                meter.clone(),
+                provider.clone(),
+                Arc::new(crate::payment_ledger::PaymentLedger::new()),
+            ),
         );
         let mut handles = Vec::new();
         for _ in 0..8 {
@@ -1890,7 +1984,10 @@ mod tests {
             tx.send(()).unwrap();
         }
         for h in handles {
-            assert!(matches!(h.join().unwrap(), IntentExecution::Performed { .. }));
+            assert!(matches!(
+                h.join().unwrap(),
+                IntentExecution::Performed { .. }
+            ));
         }
         // Slots released: a new payment goes through again.
         drop(tx);
@@ -1920,16 +2017,29 @@ mod tests {
         meter.set_budget("vm-agent", 100).unwrap();
         let provider = Arc::new(KeyRecordingProvider::default());
         let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
-            .with_payments(meter, provider.clone(), Arc::new(crate::payment_ledger::PaymentLedger::new()));
+            .with_payments(
+                meter,
+                provider.clone(),
+                Arc::new(crate::payment_ledger::PaymentLedger::new()),
+            );
         let i1 = pay_intent("acme-vendor", "vm-agent", "10");
         let i2 = pay_intent("acme-vendor", "vm-agent", "10"); // same shape, fresh key+signature
-        assert!(matches!(reg.execute(&i1), IntentExecution::Performed { .. }));
-        assert!(matches!(reg.execute(&i2), IntentExecution::Performed { .. }));
+        assert!(matches!(
+            reg.execute(&i1),
+            IntentExecution::Performed { .. }
+        ));
+        assert!(matches!(
+            reg.execute(&i2),
+            IntentExecution::Performed { .. }
+        ));
         let keys = provider.0.lock().unwrap().clone();
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0], format!("flint-{}", i1.signature));
         assert_eq!(keys[1], format!("flint-{}", i2.signature));
-        assert_ne!(keys[0], keys[1], "distinct signed intents get distinct keys");
+        assert_ne!(
+            keys[0], keys[1],
+            "distinct signed intents get distinct keys"
+        );
     }
 
     /// Council S28 F3: when the rail fails AND the durable refund cannot persist, the signed reason
@@ -1959,7 +2069,11 @@ mod tests {
         );
         meter.set_budget("vm-agent", 100).unwrap();
         let reg = MethodRegistryExecutor::production(Arc::new(AuditLog::new()), None)
-            .with_payments(meter.clone(), Arc::new(DirDestroyingFailingProvider(sub)), Arc::new(crate::payment_ledger::PaymentLedger::new()));
+            .with_payments(
+                meter.clone(),
+                Arc::new(DirDestroyingFailingProvider(sub)),
+                Arc::new(crate::payment_ledger::PaymentLedger::new()),
+            );
         match reg.execute(&pay_intent("acme-vendor", "vm-agent", "40")) {
             IntentExecution::Declined { reason } => {
                 assert!(
@@ -1991,8 +2105,15 @@ mod tests {
         let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
         let bad = |resource: &str, amount: &str| {
             IntentDeclarationV1::issue(
-                &sk, sk.verifying_key().to_bytes(), "pi", "vm-agent",
-                "runtime.pay", amount, resource, "execute", "grant-1",
+                &sk,
+                sk.verifying_key().to_bytes(),
+                "pi",
+                "vm-agent",
+                "runtime.pay",
+                amount,
+                resource,
+                "execute",
+                "grant-1",
             )
         };
         for (resource, amount) in [
@@ -2001,16 +2122,23 @@ mod tests {
             (format!("{PAY_PREFIX}a/b"), "10".to_string()),        // path trick in payee
             (format!("{PAY_PREFIX}acme"), "not-a-number".to_string()), // non-integer amount
             (format!("{PAY_PREFIX}acme"), "0".to_string()),        // zero amount
-            (format!("{PAY_PREFIX}acme"), "0200".to_string()),     // non-canonical (leading zero) — F4
-            (format!("{PAY_PREFIX}acme"), "+200".to_string()),     // non-canonical (sign) — F4
-            (format!("{PAY_PREFIX}acme"), " 200".to_string()),     // non-canonical (space) — F4
+            (format!("{PAY_PREFIX}acme"), "0200".to_string()), // non-canonical (leading zero) — F4
+            (format!("{PAY_PREFIX}acme"), "+200".to_string()), // non-canonical (sign) — F4
+            (format!("{PAY_PREFIX}acme"), " 200".to_string()), // non-canonical (space) — F4
         ] {
             assert!(
-                matches!(reg.execute(&bad(&resource, &amount)), IntentExecution::Declined { .. }),
+                matches!(
+                    reg.execute(&bad(&resource, &amount)),
+                    IntentExecution::Declined { .. }
+                ),
                 "must decline resource {resource:?} amount {amount:?}"
             );
         }
-        assert_eq!(meter.remaining("vm-agent"), 1000, "no declined pay ever touched the cap");
+        assert_eq!(
+            meter.remaining("vm-agent"),
+            1000,
+            "no declined pay ever touched the cap"
+        );
         assert!(provider.payments.lock().unwrap().is_empty());
     }
 
@@ -2037,7 +2165,10 @@ mod tests {
         let resource = format!("{STATE_PUT_PREFIX}cursor");
         match reg.execute(&state_put_intent(&resource, "vm-agent", "cafe01")) {
             IntentExecution::Declined { reason } => {
-                assert!(reason.contains("could not be persisted"), "true reason: {reason}");
+                assert!(
+                    reason.contains("could not be persisted"),
+                    "true reason: {reason}"
+                );
             }
             other => panic!("an unlanded write must Decline, got {other:?}"),
         }
@@ -2107,7 +2238,9 @@ mod tests {
         };
         // The SAME method + declaration shape reconciles differently based on REAL state:
         match reg.execute(&intent_for(check("QmSEEN"), "vm-agent")) {
-            IntentExecution::Performed { resource, action, .. } => {
+            IntentExecution::Performed {
+                resource, action, ..
+            } => {
                 assert_eq!(resource, check("QmSEEN")); // the CHECK resource, honestly echoed
                 assert_eq!(action, "read");
             }
@@ -2155,10 +2288,8 @@ mod tests {
     fn quote_registry(
         outcome: Result<crate::api::buy_authority::BuyQuote, String>,
     ) -> MethodRegistryExecutor {
-        MethodRegistryExecutor::new().with_market_quotes(
-            Arc::default(),
-            Arc::new(ScriptedQuoter(outcome)),
-        )
+        MethodRegistryExecutor::new()
+            .with_market_quotes(Arc::default(), Arc::new(ScriptedQuoter(outcome)))
     }
 
     fn terms_5_usdc() -> crate::api::buy_authority::BuyQuote {
@@ -2204,7 +2335,10 @@ mod tests {
         let current = "price=5000000;tok=0xUSDC;supply=3";
         match exec.execute(&quote_intent("QmMovie", current)) {
             IntentExecution::Performed { input_hash, .. } => {
-                assert_eq!(input_hash, current, "believed-correct terms reconcile Matched");
+                assert_eq!(
+                    input_hash, current,
+                    "believed-correct terms reconcile Matched"
+                );
             }
             other => panic!("expected Performed, got {other:?}"),
         }
@@ -2227,7 +2361,10 @@ mod tests {
         let exec = quote_registry(Err("no active listing".to_string()));
         match exec.execute(&quote_intent("QmMovie", "")) {
             IntentExecution::Declined { reason } => {
-                assert!(reason.contains("no active listing"), "honest reason: {reason}");
+                assert!(
+                    reason.contains("no active listing"),
+                    "honest reason: {reason}"
+                );
             }
             other => panic!("expected Declined, got {other:?}"),
         }
@@ -2268,8 +2405,7 @@ mod tests {
         }
         let cache: crate::market_quote::MarketQuoteCache = Arc::default();
         let quoter = Arc::new(CountingQuoter(std::sync::atomic::AtomicUsize::new(0)));
-        let exec = MethodRegistryExecutor::new()
-            .with_market_quotes(cache.clone(), quoter.clone());
+        let exec = MethodRegistryExecutor::new().with_market_quotes(cache.clone(), quoter.clone());
         assert!(matches!(
             exec.execute(&quote_intent("QmA", "")),
             IntentExecution::Performed { .. }
@@ -2288,7 +2424,10 @@ mod tests {
         crate::market_quote::claim_or_serve(&cache, "QmB", crate::market_quote::now_unix(), true);
         match exec.execute(&quote_intent("QmB", "")) {
             IntentExecution::Declined { reason } => {
-                assert!(reason.contains("in progress"), "single-flight respected: {reason}");
+                assert!(
+                    reason.contains("in progress"),
+                    "single-flight respected: {reason}"
+                );
             }
             other => panic!("expected Declined, got {other:?}"),
         }
@@ -2305,7 +2444,10 @@ mod tests {
         }));
         match huge.execute(&quote_intent("QmMovie", "")) {
             IntentExecution::Declined { reason } => {
-                assert!(reason.contains("malformed terms"), "bounded refusal: {reason}");
+                assert!(
+                    reason.contains("malformed terms"),
+                    "bounded refusal: {reason}"
+                );
             }
             other => panic!("expected Declined on oversized terms, got {other:?}"),
         }
@@ -2316,7 +2458,10 @@ mod tests {
         }));
         match nonprintable.execute(&quote_intent("QmMovie", "")) {
             IntentExecution::Declined { reason } => {
-                assert!(reason.contains("malformed terms"), "charset refusal: {reason}");
+                assert!(
+                    reason.contains("malformed terms"),
+                    "charset refusal: {reason}"
+                );
             }
             other => panic!("expected Declined on non-printable terms, got {other:?}"),
         }
@@ -2372,7 +2517,10 @@ mod tests {
         // Wait until all 8 are genuinely inside the quoter (parked on the channel).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while quoter.entered.load(Ordering::SeqCst) < 8 {
-            assert!(std::time::Instant::now() < deadline, "parked readers never arrived");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parked readers never arrived"
+            );
             std::thread::yield_now();
         }
 

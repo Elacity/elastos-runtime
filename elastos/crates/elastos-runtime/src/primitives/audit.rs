@@ -69,7 +69,11 @@ fn compute_record_hash(seq: u64, prev_hash: &[u8; 32], event_json: &[u8]) -> [u8
 /// each record is hashed over must be identical). `Err` carries the raw serde error.
 fn recompute_record_hash(rec: &ChainedRecord, prev_hash: &[u8; 32]) -> Result<[u8; 32], String> {
     let event_json = serde_json::to_string(&rec.event).map_err(|e| e.to_string())?;
-    Ok(compute_record_hash(rec.seq, prev_hash, event_json.as_bytes()))
+    Ok(compute_record_hash(
+        rec.seq,
+        prev_hash,
+        event_json.as_bytes(),
+    ))
 }
 
 /// Domain separator for the mandate-receipt SET binding — distinct from [`AUDIT_RECORD_DOMAIN`] so a
@@ -298,7 +302,10 @@ pub fn verify_mandate_receipt(
     if receipt.schema != MANDATE_RECEIPT_SCHEMA {
         return MandateReceiptVerdict::failed(
             signer,
-            format!("unexpected schema {:?} (want {MANDATE_RECEIPT_SCHEMA})", receipt.schema),
+            format!(
+                "unexpected schema {:?} (want {MANDATE_RECEIPT_SCHEMA})",
+                receipt.schema
+            ),
         );
     }
     if receipt.records.is_empty() {
@@ -389,8 +396,10 @@ pub fn verify_mandate_receipt(
                 .count();
             // Strictly ascending, unique `seq`: a bundle-only guard against a duplicated or
             // reordered record inflating/misrepresenting the action set.
-            let strictly_ordered =
-                receipt.records.windows(2).all(|pair| pair[1].seq > pair[0].seq);
+            let strictly_ordered = receipt
+                .records
+                .windows(2)
+                .all(|pair| pair[1].seq > pair[0].seq);
             all_bound && grant_count == 1 && strictly_ordered
         }
     };
@@ -416,8 +425,11 @@ pub fn verify_mandate_receipt(
     let structurally_valid = hashes_ok && signatures_ok && scope_ok && set_binding_ok;
     // Authenticity requires the caller's out-of-band pin: the embedded signer must equal a key the
     // consumer already trusts. Without a pin we CANNOT authenticate — an attacker self-signs too.
-    let signer_matches_expected = expected_signer_hex
-        .map(|expected| expected.trim().eq_ignore_ascii_case(receipt.signer_public_key_hex.trim()));
+    let signer_matches_expected = expected_signer_hex.map(|expected| {
+        expected
+            .trim()
+            .eq_ignore_ascii_case(receipt.signer_public_key_hex.trim())
+    });
     let authenticated = structurally_valid && signer_matches_expected == Some(true);
     // Genesis anchor: records[0] is the true start of the chain (front-truncation guard).
     let first = &receipt.records[0];
@@ -1240,7 +1252,13 @@ impl AuditLog {
         records: &[ChainedRecord],
     ) -> Option<String> {
         let signer = self.signer.as_ref()?;
-        Some(BASE64.encode(signer.sign(&mandate_receipt_binding_message(scope, records)).to_bytes()))
+        Some(
+            BASE64.encode(
+                signer
+                    .sign(&mandate_receipt_binding_message(scope, records))
+                    .to_bytes(),
+            ),
+        )
     }
 
     /// Export the durable chain as a PORTABLE [`MandateReceipt`] a third party can verify off-box
@@ -2079,16 +2097,25 @@ mod tests {
 
         // Structural check (no pin): sound, but NOT authenticity.
         let structural = verify_mandate_receipt(&received, None);
-        assert!(structural.structurally_valid, "clean receipt is structurally valid: {structural:?}");
+        assert!(
+            structural.structurally_valid,
+            "clean receipt is structurally valid: {structural:?}"
+        );
         assert!(!structural.authenticated, "no pin ⇒ not authenticated");
         assert_eq!(structural.signer_matches_expected, None);
         assert!(structural.hashes_ok && structural.signatures_ok && structural.chain_linkage_ok);
         assert_eq!(structural.records, 2);
-        assert!(structural.starts_at_genesis, "the export begins at seq 1 / genesis");
+        assert!(
+            structural.starts_at_genesis,
+            "the export begins at seq 1 / genesis"
+        );
 
         // Pinned to the real signer: AUTHENTIC (the bit an auditor acts on).
         let authentic = verify_mandate_receipt(&received, Some(&pin));
-        assert!(authentic.authenticated, "pinned to the true signer ⇒ authenticated: {authentic:?}");
+        assert!(
+            authentic.authenticated,
+            "pinned to the true signer ⇒ authenticated: {authentic:?}"
+        );
         assert_eq!(authentic.signer_matches_expected, Some(true));
     }
 
@@ -2113,11 +2140,17 @@ mod tests {
         // It is structurally valid under its OWN key...
         let structural = verify_mandate_receipt(&forged, None);
         assert!(structural.structurally_valid);
-        assert!(!structural.authenticated, "self-signed is not authentic without a pin");
+        assert!(
+            !structural.authenticated,
+            "self-signed is not authentic without a pin"
+        );
 
         // ...but pinning to the REAL runtime's signer exposes it: not the expected signer.
         let against_real = verify_mandate_receipt(&forged, Some(&real_signer));
-        assert!(!against_real.authenticated, "forged receipt must fail against the pinned real signer");
+        assert!(
+            !against_real.authenticated,
+            "forged receipt must fail against the pinned real signer"
+        );
         assert_eq!(against_real.signer_matches_expected, Some(false));
     }
 
@@ -2132,7 +2165,10 @@ mod tests {
         }
         let verdict = verify_mandate_receipt(&receipt, None);
         assert!(!verdict.structurally_valid, "an edited event must fail");
-        assert!(!verdict.hashes_ok, "record_hash must not recompute after an edit");
+        assert!(
+            !verdict.hashes_ok,
+            "record_hash must not recompute after an edit"
+        );
     }
 
     #[test]
@@ -2163,7 +2199,10 @@ mod tests {
         three.records.remove(1); // drop the middle record
         let verdict = verify_mandate_receipt(&three, None);
         assert!(!verdict.structurally_valid);
-        assert!(!verdict.chain_linkage_ok, "a dropped record must break linkage");
+        assert!(
+            !verdict.chain_linkage_ok,
+            "a dropped record must break linkage"
+        );
     }
 
     #[test]
@@ -2178,7 +2217,10 @@ mod tests {
         receipt.signer_public_key_hex = hex::encode(other);
         let verdict = verify_mandate_receipt(&receipt, None);
         assert!(!verdict.structurally_valid);
-        assert!(!verdict.signatures_ok, "records must not verify under a foreign key");
+        assert!(
+            !verdict.signatures_ok,
+            "records must not verify under a foreign key"
+        );
     }
 
     #[test]
@@ -2187,7 +2229,10 @@ mod tests {
         receipt.schema = "elastos.evil/v9".to_string();
         let verdict = verify_mandate_receipt(&receipt, None);
         assert!(!verdict.structurally_valid && !verdict.authenticated);
-        assert!(verdict.error.is_some(), "wrong schema must fail closed with a reason");
+        assert!(
+            verdict.error.is_some(),
+            "wrong schema must fail closed with a reason"
+        );
     }
 
     #[test]
@@ -2241,18 +2286,36 @@ mod tests {
         let (_dir, receipt, signer, _token) = emit_and_export_capability_receipt();
         // Exactly the grant + its two uses — the interleaved noise is excluded.
         assert_eq!(receipt.records.len(), 3, "grant + 2 uses, noise excluded");
-        assert!(matches!(receipt.scope, MandateReceiptScope::Capability { .. }));
+        assert!(matches!(
+            receipt.scope,
+            MandateReceiptScope::Capability { .. }
+        ));
         // Round-trips as a portable document and authenticates when pinned to the real signer.
         let wire = serde_json::to_string(&receipt).unwrap();
         let received: MandateReceipt = serde_json::from_str(&wire).unwrap();
         let verdict = verify_mandate_receipt(&received, Some(&signer));
-        assert!(verdict.structurally_valid, "scoped receipt is sound: {verdict:?}");
-        assert!(verdict.scope_ok, "all records bound to the token + exactly one grant");
-        assert!(verdict.set_binding_ok, "issuer's set-binding signature verifies");
-        assert!(verdict.authenticated, "pinned to the true signer ⇒ authenticated");
+        assert!(
+            verdict.structurally_valid,
+            "scoped receipt is sound: {verdict:?}"
+        );
+        assert!(
+            verdict.scope_ok,
+            "all records bound to the token + exactly one grant"
+        );
+        assert!(
+            verdict.set_binding_ok,
+            "issuer's set-binding signature verifies"
+        );
+        assert!(
+            verdict.authenticated,
+            "pinned to the true signer ⇒ authenticated"
+        );
         // `starts_at_genesis` is N/A here: the grant sits mid-chain after noise, so it is false and
         // MUST NOT be read as a completeness/suspicion signal for a Capability receipt.
-        assert!(!verdict.starts_at_genesis, "grant is mid-chain ⇒ genesis anchor N/A");
+        assert!(
+            !verdict.starts_at_genesis,
+            "grant is mid-chain ⇒ genesis anchor N/A"
+        );
     }
 
     #[test]
@@ -2269,9 +2332,18 @@ mod tests {
             .expect("a use to drop");
         receipt.records.remove(victim);
         let verdict = verify_mandate_receipt(&receipt, Some(&signer));
-        assert!(verdict.scope_ok, "the trimmed set still passes the filter rule — that is the trap");
-        assert!(!verdict.set_binding_ok, "the issuer's set binding no longer matches the trimmed set");
-        assert!(!verdict.structurally_valid, "a holder-trimmed set must not verify");
+        assert!(
+            verdict.scope_ok,
+            "the trimmed set still passes the filter rule — that is the trap"
+        );
+        assert!(
+            !verdict.set_binding_ok,
+            "the issuer's set binding no longer matches the trimmed set"
+        );
+        assert!(
+            !verdict.structurally_valid,
+            "a holder-trimmed set must not verify"
+        );
         assert!(!verdict.authenticated, "and it must not authenticate");
     }
 
@@ -2284,7 +2356,10 @@ mod tests {
         receipt.records.push(clone);
         let verdict = verify_mandate_receipt(&receipt, Some(&signer));
         assert!(!verdict.scope_ok, "duplicate seq breaks strict ordering");
-        assert!(!verdict.set_binding_ok, "a duplicated record changes the bound set");
+        assert!(
+            !verdict.set_binding_ok,
+            "a duplicated record changes the bound set"
+        );
         assert!(!verdict.structurally_valid);
     }
 
@@ -2306,13 +2381,20 @@ mod tests {
         // Re-sign it under THE SAME signer so signatures still verify (only the token differs).
         // (Simplest: pull a real foreign record from log2's file.)
         let other_line = std::fs::read_to_string(dir2.path().join("other.log")).unwrap();
-        let foreign: ChainedRecord = serde_json::from_str(other_line.lines().next().unwrap()).unwrap();
+        let foreign: ChainedRecord =
+            serde_json::from_str(other_line.lines().next().unwrap()).unwrap();
         receipt.records.push(foreign);
         // Verify against the receipt's OWN signer (structural), not the cross-log signer — the point
         // is the SCOPE check, which must reject the foreign token regardless of signature origin.
         let verdict = verify_mandate_receipt(&receipt, Some(&signer));
-        assert!(!verdict.scope_ok, "a foreign-token record must break scope_ok");
-        assert!(!verdict.structurally_valid, "scope failure ⇒ not structurally valid");
+        assert!(
+            !verdict.scope_ok,
+            "a foreign-token record must break scope_ok"
+        );
+        assert!(
+            !verdict.structurally_valid,
+            "scope failure ⇒ not structurally valid"
+        );
         let _ = signer;
     }
 
@@ -2324,7 +2406,10 @@ mod tests {
         receipt.records.retain(|r| !r.event.is_capability_grant());
         assert!(!receipt.records.is_empty());
         let verdict = verify_mandate_receipt(&receipt, Some(&signer));
-        assert!(!verdict.scope_ok, "no grant ⇒ scope_ok false (actions without a mandate)");
+        assert!(
+            !verdict.scope_ok,
+            "no grant ⇒ scope_ok false (actions without a mandate)"
+        );
     }
 
     #[test]
@@ -2871,7 +2956,9 @@ mod tests {
         let legacy = r#"{"type":"capability_grant","timestamp":{"unix_secs":100,"monotonic_seq":0},"token_id":"abcd","capsule_id":"vm-a","resource":"elastos://x/y","action":"execute","expiry":null}"#;
         let ev: AuditEvent = serde_json::from_str(legacy).unwrap();
         match &ev {
-            AuditEvent::CapabilityGrant { responsible_entity, .. } => {
+            AuditEvent::CapabilityGrant {
+                responsible_entity, ..
+            } => {
                 assert!(responsible_entity.is_none(), "absent field ⇒ None");
             }
             _ => panic!("wrong variant"),
@@ -2886,7 +2973,10 @@ mod tests {
 
         // An S32 grant carries the DID verbatim, and it round-trips.
         let bound = AuditEvent::CapabilityGrant {
-            timestamp: SecureTimestamp { unix_secs: 100, monotonic_seq: 0 },
+            timestamp: SecureTimestamp {
+                unix_secs: 100,
+                monotonic_seq: 0,
+            },
             token_id: "abcd".to_string(),
             capsule_id: "vm-a".to_string(),
             resource: "elastos://x/y".to_string(),
@@ -2975,7 +3065,10 @@ mod tests {
 
         // An S34 use carries the reference verbatim, and it round-trips.
         let settled = AuditEvent::CapabilityUse {
-            timestamp: SecureTimestamp { unix_secs: 100, monotonic_seq: 0 },
+            timestamp: SecureTimestamp {
+                unix_secs: 100,
+                monotonic_seq: 0,
+            },
             token_id: "abcd".to_string(),
             capsule_id: "vm-a".to_string(),
             resource: "elastos://runtime/pay/acme".to_string(),

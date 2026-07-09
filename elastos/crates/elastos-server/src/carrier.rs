@@ -7737,8 +7737,17 @@ mod tests {
     fn carrier_authenticated_plane_widens_content_writes_but_never_key_material() {
         // Reads stay allowed; content push-replication writes are now allowed for an
         // authenticated peer; key/decrypt/drm/rights stay refused EVEN authenticated.
-        assert!(carrier_provider_plane_allows_authenticated("content", "fetch"));
-        for op in ["publish", "import_exact", "import_object", "ensure", "unpublish", "repair"] {
+        assert!(carrier_provider_plane_allows_authenticated(
+            "content", "fetch"
+        ));
+        for op in [
+            "publish",
+            "import_exact",
+            "import_object",
+            "ensure",
+            "unpublish",
+            "repair",
+        ] {
             assert!(
                 carrier_provider_plane_allows_authenticated("content", op),
                 "authenticated content:{op} must be allowed"
@@ -7748,7 +7757,12 @@ mod tests {
                 "anonymous content:{op} must stay refused"
             );
         }
-        for (target, op) in [("key", "unwrap"), ("decrypt", "decrypt"), ("drm", "license"), ("rights", "grant")] {
+        for (target, op) in [
+            ("key", "unwrap"),
+            ("decrypt", "decrypt"),
+            ("drm", "license"),
+            ("rights", "grant"),
+        ] {
             assert!(
                 !carrier_provider_plane_allows_authenticated(target, op),
                 "{target}:{op} must stay refused even when authenticated"
@@ -7763,10 +7777,19 @@ mod tests {
         // Fail-closed: no allowlist ⇒ no peer is trusted; empty DID never trusted.
         assert!(!carrier_trusted_peer("did:key:zTrusted"));
         assert!(!carrier_trusted_peer(""));
-        std::env::set_var("ELASTOS_CARRIER_TRUSTED_PEERS", " did:key:zTrusted , did:key:zOther ");
-        assert!(carrier_trusted_peer("did:key:zTrusted"), "allowlisted peer is trusted");
+        std::env::set_var(
+            "ELASTOS_CARRIER_TRUSTED_PEERS",
+            " did:key:zTrusted , did:key:zOther ",
+        );
+        assert!(
+            carrier_trusted_peer("did:key:zTrusted"),
+            "allowlisted peer is trusted"
+        );
         assert!(carrier_trusted_peer("did:key:zOther"));
-        assert!(!carrier_trusted_peer("did:key:zStranger"), "non-allowlisted peer is not trusted");
+        assert!(
+            !carrier_trusted_peer("did:key:zStranger"),
+            "non-allowlisted peer is not trusted"
+        );
         std::env::remove_var("ELASTOS_CARRIER_TRUSTED_PEERS");
     }
 
@@ -7810,12 +7833,21 @@ mod tests {
                 .await
                 .unwrap();
         std::env::remove_var("ELASTOS_CARRIER_TRUSTED_PEERS");
-        assert_eq!(response["ok"], true, "authenticated write must be allowed: {response}");
+        assert_eq!(
+            response["ok"], true,
+            "authenticated write must be allowed: {response}"
+        );
         // The verified peer DID replaced the caller-supplied victim on the LOAD-BEARING fields the
         // content coordinator attributes quota + ownership on — not just principal_id.
-        assert_eq!(response["result"]["data"]["publisher_did"], "did:key:zTrusted");
+        assert_eq!(
+            response["result"]["data"]["publisher_did"],
+            "did:key:zTrusted"
+        );
         assert_eq!(response["result"]["data"]["object_did"], "did:key:zTrusted");
-        assert_eq!(response["result"]["data"]["principal_id"], "did:key:zTrusted");
+        assert_eq!(
+            response["result"]["data"]["principal_id"],
+            "did:key:zTrusted"
+        );
     }
 
     /// An authenticated peer STILL cannot touch key material — auth widens content only.
@@ -7848,7 +7880,10 @@ mod tests {
                 .await
                 .unwrap();
         std::env::remove_var("ELASTOS_CARRIER_TRUSTED_PEERS");
-        assert_eq!(response["ok"], false, "key material must be refused even authenticated");
+        assert_eq!(
+            response["ok"], false,
+            "key material must be refused even authenticated"
+        );
         assert_eq!(response["code"], "unauthorized_provider_operation");
     }
 

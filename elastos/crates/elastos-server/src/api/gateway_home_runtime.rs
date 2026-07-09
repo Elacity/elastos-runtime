@@ -72,7 +72,9 @@ pub(super) async fn home_launch(
     // on THIS response — the same-origin shell fetch stores it in the browser jar, and the app's
     // path-scoped API calls carry it from there. The URL above holds no credential.
     if let Some(cookie) = delivery.set_cookie {
-        response.headers_mut().append(axum::http::header::SET_COOKIE, cookie);
+        response
+            .headers_mut()
+            .append(axum::http::header::SET_COOKIE, cookie);
     }
     Ok(response)
 }
@@ -121,12 +123,14 @@ pub(super) fn append_home_launch_token(
     let encoded = serializer.finish();
     let separator = if route.contains('?') { '&' } else { '?' };
     let set_cookie = if cookie_delivered {
-        Some(super::gateway_home_token::app_launch_cookie_header_for_token(
-            MANDATES_SESSION_COOKIE,
-            &token,
-            MANDATES_API_COOKIE_PATH,
-            secure,
-        )?)
+        Some(
+            super::gateway_home_token::app_launch_cookie_header_for_token(
+                MANDATES_SESSION_COOKIE,
+                &token,
+                MANDATES_API_COOKIE_PATH,
+                secure,
+            )?,
+        )
     } else {
         None
     };
@@ -1723,20 +1727,33 @@ mod tests {
             .filter(|(key, _)| key == "shell")
             .collect();
         assert_eq!(shell_markers.len(), 1, "exactly one in-shell marker");
-        assert_eq!(shell_markers[0].1.as_ref(), "1", "the smuggled marker is dropped");
+        assert_eq!(
+            shell_markers[0].1.as_ref(),
+            "1",
+            "the smuggled marker is dropped"
+        );
 
         let cookie = delivery
             .set_cookie
             .expect("the launch response must deliver the token via Set-Cookie");
         let cookie = cookie.to_str().unwrap();
         assert!(cookie.starts_with(&format!("{MANDATES_SESSION_COOKIE}=")));
-        assert!(cookie.contains("HttpOnly"), "frame script must not read it: {cookie}");
-        assert!(cookie.contains("SameSite=Strict"), "never sent cross-site: {cookie}");
+        assert!(
+            cookie.contains("HttpOnly"),
+            "frame script must not read it: {cookie}"
+        );
+        assert!(
+            cookie.contains("SameSite=Strict"),
+            "never sent cross-site: {cookie}"
+        );
         assert!(
             cookie.contains(&format!("Path={MANDATES_API_COOKIE_PATH}")),
             "scoped to the mandates API alone: {cookie}"
         );
-        assert!(cookie.contains("Secure"), "TLS launches set Secure: {cookie}");
+        assert!(
+            cookie.contains("Secure"),
+            "TLS launches set Secure: {cookie}"
+        );
         // The cookie value IS a valid launch token for the mandates app.
         let token = cookie
             .split(';')

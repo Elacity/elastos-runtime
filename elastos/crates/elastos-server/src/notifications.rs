@@ -460,7 +460,9 @@ pub fn post_agent_act_notification(
             resolution: None,
         },
     ) {
-        tracing::warn!("agent-act notification delivered but its appeared-event was not recorded: {e}");
+        tracing::warn!(
+            "agent-act notification delivered but its appeared-event was not recorded: {e}"
+        );
     }
     Ok(())
 }

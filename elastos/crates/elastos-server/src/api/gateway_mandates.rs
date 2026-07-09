@@ -102,7 +102,8 @@ pub(crate) struct MandateApiState {
     /// [`consume_fresh_money_token`]). RESIDUAL (documented in KNOWN_GAPS G-M9): a gateway
     /// restart clears it, so a token younger than the freshness window could be replayed once
     /// across a restart — the window is [`MONEY_FRESH_WINDOW_SECS`].
-    pub(crate) spent_fresh_money_tokens: Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+    pub(crate) spent_fresh_money_tokens:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
     /// Sprint 38: the Marketplace panel's per-asset quote cache (TTL-bounded; see
     /// [`MARKET_QUOTE_TTL_SECS`]) — a browser refresh storm costs at most one chain read per
     /// asset per window.
@@ -323,11 +324,13 @@ async fn mandates_list(
     if let Err(resp) = require_mandates_surface(&state, &headers, false) {
         return *resp;
     }
-    Json(crate::api::handlers::capability::mandate_cards(
-        &state.standing_service,
-        &state.capability_manager,
+    Json(
+        crate::api::handlers::capability::mandate_cards(
+            &state.standing_service,
+            &state.capability_manager,
+        )
+        .await,
     )
-    .await)
     .into_response()
 }
 
@@ -370,7 +373,9 @@ async fn mandate_receipt(
     }
     let token_id = match TokenId::from_hex(token_id.trim()) {
         Ok(id) => id.to_string(),
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid token id: {e}")).into_response(),
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid token id: {e}")).into_response()
+        }
     };
     match state
         .capability_manager
@@ -812,16 +817,16 @@ async fn marketplace_view(
         // runtime.market_quote affordance uses): serve fresh free, respect an in-flight claim,
         // claim up to this view's fresh-read budget, and state the over-budget tail.
         let may_claim = to_quote.len() < MARKET_MAX_QUOTED_ASSETS;
-        let (quote, over_cap) = match claim_or_serve(&state.marketplace_quote_cache, &asset, now, may_claim)
-        {
-            CachedQuote::Fresh(q) => (Some(q), false),
-            CachedQuote::InFlight => (None, false),
-            CachedQuote::Claimed => {
-                to_quote.push(asset.clone());
-                (None, false)
-            }
-            CachedQuote::NotClaimed => (None, true),
-        };
+        let (quote, over_cap) =
+            match claim_or_serve(&state.marketplace_quote_cache, &asset, now, may_claim) {
+                CachedQuote::Fresh(q) => (Some(q), false),
+                CachedQuote::InFlight => (None, false),
+                CachedQuote::Claimed => {
+                    to_quote.push(asset.clone());
+                    (None, false)
+                }
+                CachedQuote::NotClaimed => (None, true),
+            };
         assets.push(MarketAssetView {
             asset,
             mandates,
@@ -847,7 +852,12 @@ async fn marketplace_view(
         for (asset, quote) in fresh {
             // Stamped AFTER the read returned (council S38 red-team F4): a slow fetch must not
             // be served as "fresh" for a full TTL past its actual read time.
-            crate::market_quote::fill(&state.marketplace_quote_cache, &asset, quote.clone(), now_ts());
+            crate::market_quote::fill(
+                &state.marketplace_quote_cache,
+                &asset,
+                quote.clone(),
+                now_ts(),
+            );
             if let Some(view) = assets.iter_mut().find(|a| a.asset == asset) {
                 view.quote = Some(quote);
             }
@@ -922,9 +932,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use elastos_runtime::capability::token::TokenConstraints;
-    use elastos_runtime::capability::{
-        Action, CapabilityStore, ResourceId, StandingGrantService,
-    };
+    use elastos_runtime::capability::{Action, CapabilityStore, ResourceId, StandingGrantService};
     use elastos_runtime::primitives::audit::AuditLog;
     use elastos_runtime::primitives::metrics::MetricsManager;
     use tower::ServiceExt;
@@ -1005,7 +1013,10 @@ mod tests {
     /// A money-write body in the Sprint 33 shape: the shared input wrapped with the fresh
     /// verification that authorizes this one write.
     fn money_body(fresh_token: &str, input: &str) -> String {
-        format!(r#"{{"fresh_passkey_token":{},"input":{input}}}"#, serde_json::json!(fresh_token))
+        format!(
+            r#"{{"fresh_passkey_token":{},"input":{input}}}"#,
+            serde_json::json!(fresh_token)
+        )
     }
 
     /// Helper: POST a JSON body to a route with optional home token, return the response.
@@ -1054,7 +1065,8 @@ mod tests {
     async fn issue_route_mints_a_live_mandate_in_the_shared_registry() {
         let dir = tempfile::tempdir().unwrap();
         let state = state_for(dir.path());
-        let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        let token_hdr =
+            super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
         // The web surface grants BOUND mandates (G-M4) — pass a REAL, non-weak agent key.
         let agent = hex::encode(
             ed25519_dalek::SigningKey::generate(&mut rand::thread_rng())
@@ -1071,10 +1083,15 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let out: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let grant_id = out["grant_id"].as_str().expect("grant id returned");
-        assert_eq!(out["token_id"], grant_id, "grant id IS the backing token id");
+        assert_eq!(
+            out["token_id"], grant_id,
+            "grant id IS the backing token id"
+        );
         assert!(
             state.standing_service.is_active(grant_id),
             "the minted mandate is LIVE in the shared registry"
@@ -1093,7 +1110,10 @@ mod tests {
         assert_eq!(card.capsule, "vm-agent");
         assert_eq!(card.methods, vec!["send".to_string()]);
         // The card SURFACES the binding (G-M4): bound = true, and the agent key round-trips.
-        assert!(card.agent_bound, "the card shows the mandate is agent-bound");
+        assert!(
+            card.agent_bound,
+            "the card shows the mandate is agent-bound"
+        );
         assert_eq!(card.agent_pubkey.as_deref(), Some(agent.as_str()));
         // Sprint 32: the responsible-entity liability binding round-trips onto the card.
         assert_eq!(
@@ -1110,10 +1130,12 @@ mod tests {
     async fn issue_route_enforces_the_shared_guards() {
         let dir = tempfile::tempdir().unwrap();
         let state = state_for(dir.path());
-        let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        let token_hdr =
+            super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
         // A valid 64-hex agent key so downstream guards (wildcard, key-format) are the ones tested,
         // not the new G-M4 bound-required check (which fires first when the key is absent).
-        let k = "\"agent_pubkey\":\"".to_string() + &"ab".repeat(32)
+        let k = "\"agent_pubkey\":\"".to_string()
+            + &"ab".repeat(32)
             + "\",\"responsible_entity\":\"did:web:acme.example\"";
         let cases: Vec<(String, StatusCode)> = vec![
             (
@@ -1199,10 +1221,13 @@ mod tests {
     async fn agent_state_route_reflects_the_store_across_principals() {
         let dir = tempfile::tempdir().unwrap();
         // Two different agents write state directly into the store the route reads.
-        crate::agent_store::put_agent_state(dir.path(), "vm-a", "cursor", "cafe01", "g1", "i1").unwrap();
-        crate::agent_store::put_agent_state(dir.path(), "vm-b", "flag", "beef02", "g2", "i2").unwrap();
+        crate::agent_store::put_agent_state(dir.path(), "vm-a", "cursor", "cafe01", "g1", "i1")
+            .unwrap();
+        crate::agent_store::put_agent_state(dir.path(), "vm-b", "flag", "beef02", "g2", "i2")
+            .unwrap();
         let app = mandate_router(state_for(dir.path()));
-        let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        let token_hdr =
+            super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1214,15 +1239,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let entries = json["entries"].as_array().expect("entries array");
         assert_eq!(entries.len(), 2, "operator sees BOTH agents' state");
         let a = entries.iter().find(|e| e["capsule"] == "vm-a").unwrap();
         assert_eq!(a["key"], "cursor");
-        assert_eq!(a["value_hash"], "cafe01", "the commitment, verbatim from the store");
+        assert_eq!(
+            a["value_hash"], "cafe01",
+            "the commitment, verbatim from the store"
+        );
         assert_eq!(a["grant_id"], "g1", "attributed to the mandate");
-        assert!(entries.iter().any(|e| e["capsule"] == "vm-b" && e["key"] == "flag"));
+        assert!(entries
+            .iter()
+            .any(|e| e["capsule"] == "vm-b" && e["key"] == "flag"));
     }
 
     /// The list route is fail-closed: no home-launch token ⇒ 401, no data leaks.
@@ -1264,7 +1296,8 @@ mod tests {
             .unwrap();
 
         let app = mandate_router(state);
-        let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        let token_hdr =
+            super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1276,7 +1309,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let mandates = json["mandates"].as_array().expect("mandates array");
         let card = mandates
@@ -1321,7 +1356,8 @@ mod tests {
         );
 
         let app = mandate_router(state);
-        let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        let token_hdr =
+            super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1333,7 +1369,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let card = json["mandates"]
             .as_array()
@@ -1341,7 +1379,10 @@ mod tests {
             .iter()
             .find(|m| m["token_id"] == grant_id)
             .expect("the mandate is still listed");
-        assert_eq!(card["active"], false, "an epoch-killed mandate never renders Live");
+        assert_eq!(
+            card["active"], false,
+            "an epoch-killed mandate never renders Live"
+        );
         assert_eq!(card["revoked"], true, "and it reads as revoked");
     }
 
@@ -1424,7 +1465,8 @@ mod tests {
         assert!(state.standing_service.is_active(&grant_id));
 
         let app = mandate_router(state.clone());
-        let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        let token_hdr =
+            super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
         let revoke = |hdr: String, gid: String| {
             let app = app.clone();
             async move {
@@ -1441,14 +1483,19 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(resp.status(), StatusCode::OK);
-                let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
                 serde_json::from_slice::<serde_json::Value>(&body).unwrap()
             }
         };
 
         // First pull: kills a live mandate.
         let first = revoke(token_hdr.clone(), grant_id.clone()).await;
-        assert_eq!(first["revoked"], true, "a live mandate is killed by this call");
+        assert_eq!(
+            first["revoked"], true,
+            "a live mandate is killed by this call"
+        );
         assert!(
             !state.standing_service.is_active(&grant_id),
             "the envelope is dead in the SHARED registry"
@@ -1478,7 +1525,8 @@ mod tests {
     async fn revoke_route_rejects_malformed_id() {
         let dir = tempfile::tempdir().unwrap();
         let app = mandate_router(state_for(dir.path()));
-        let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        let token_hdr =
+            super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1526,7 +1574,8 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {uri}");
         }
         // Token but unwired rail ⇒ 503.
-        let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        let token_hdr =
+            super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
         let resp = app
             .clone()
             .oneshot(
@@ -1587,7 +1636,11 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(meter.remaining("vm-ap-agent"), 500, "the ENFORCING meter holds the cap");
+        assert_eq!(
+            meter.remaining("vm-ap-agent"),
+            500,
+            "the ENFORCING meter holds the cap"
+        );
 
         // An indeterminate payment holds 200 and files a pending obligation (as the pay path
         // would): reserve on the meter + record on the ledger.
@@ -1614,7 +1667,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let budget = &json["budgets"][0];
         assert_eq!(budget["capsule"], "vm-ap-agent");
@@ -1627,22 +1682,38 @@ mod tests {
             app.clone(),
             "/api/apps/mandates/payments/reconcile",
             Some(token_hdr.clone()),
-            &money_body(&fresh[1], r#"{"idempotency_key":"flint-abc","charged":false}"#),
+            &money_body(
+                &fresh[1],
+                r#"{"idempotency_key":"flint-abc","charged":false}"#,
+            ),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let out: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(out["refunded"], true);
-        assert_eq!(meter.remaining("vm-ap-agent"), 500, "the refund landed on the shared meter");
+        assert_eq!(
+            meter.remaining("vm-ap-agent"),
+            500,
+            "the refund landed on the shared meter"
+        );
         let retry = post_json(
             app,
             "/api/apps/mandates/payments/reconcile",
             Some(token_hdr),
-            &money_body(&fresh[2], r#"{"idempotency_key":"flint-abc","charged":false}"#),
+            &money_body(
+                &fresh[2],
+                r#"{"idempotency_key":"flint-abc","charged":false}"#,
+            ),
         )
         .await;
-        assert_eq!(retry.status(), StatusCode::CONFLICT, "resolves exactly once");
+        assert_eq!(
+            retry.status(),
+            StatusCode::CONFLICT,
+            "resolves exactly once"
+        );
         assert_eq!(meter.remaining("vm-ap-agent"), 500, "no double refund");
     }
 
@@ -1680,19 +1751,37 @@ mod tests {
             app.clone(),
             "/api/apps/mandates/spend-budget",
             Some(token_hdr.clone()),
-            &money_body(&fresh[0], &format!(r#"{{"capsule":"vm-xss","limit":{over}}}"#)),
+            &money_body(
+                &fresh[0],
+                &format!(r#"{{"capsule":"vm-xss","limit":{over}}}"#),
+            ),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "above the ceiling is refused");
-        assert_eq!(meter.snapshot("vm-xss"), None, "the refused provision set NOTHING");
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "above the ceiling is refused"
+        );
+        assert_eq!(
+            meter.snapshot("vm-xss"),
+            None,
+            "the refused provision set NOTHING"
+        );
         let resp = post_json(
             app,
             "/api/apps/mandates/spend-budget",
             Some(token_hdr),
-            &money_body(&fresh[1], &format!(r#"{{"capsule":"vm-ok","limit":{WEB_MAX_SPEND_CAP_DEFAULT}}}"#)),
+            &money_body(
+                &fresh[1],
+                &format!(r#"{{"capsule":"vm-ok","limit":{WEB_MAX_SPEND_CAP_DEFAULT}}}"#),
+            ),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::OK, "at the ceiling still provisions");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "at the ceiling still provisions"
+        );
     }
 
     /// Council S31 red-team F2 regression: the gateway money routes must emit NO
@@ -1761,7 +1850,11 @@ mod tests {
             &money_body("", r#"{"capsule":"vm-a","limit":5}"#),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "empty fresh token refused");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "empty fresh token refused"
+        );
 
         // The standing token ITSELF is not a fresh verification (it is not proof-bound) — a
         // session-rider replaying the credential they already hold gains nothing.
@@ -1772,7 +1865,11 @@ mod tests {
             &money_body(&standing, r#"{"capsule":"vm-a","limit":5}"#),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "unbound token refused");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "unbound token refused"
+        );
         assert_eq!(meter.snapshot("vm-a"), None, "nothing was provisioned");
 
         // Reads stay on the standing session alone — no regression, no passkey friction.
@@ -1786,7 +1883,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "reads need no fresh verification");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "reads need no fresh verification"
+        );
     }
 
     /// Sprint 33 ratchets (b)+(c): one fresh passkey verification authorizes exactly ONE money
@@ -1829,7 +1930,11 @@ mod tests {
             &money_body(&fresh[0], r#"{"capsule":"vm-once","limit":50}"#),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::OK, "the first write is authorized");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the first write is authorized"
+        );
         assert_eq!(meter.remaining("vm-once"), 50);
 
         // (b) Replay on the SAME verb: refused, and the cap is NOT re-set.
@@ -1840,8 +1945,16 @@ mod tests {
             &money_body(&fresh[0], r#"{"capsule":"vm-once","limit":999}"#),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "replay on the same verb refused");
-        assert_eq!(meter.remaining("vm-once"), 50, "the replayed write applied NOTHING");
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "replay on the same verb refused"
+        );
+        assert_eq!(
+            meter.remaining("vm-once"),
+            50,
+            "the replayed write applied NOTHING"
+        );
 
         // (c) Cross-verb: the spent verification cannot authorize reconcile either. The refusal
         // is at the authorization gate — before any ledger lookup.
@@ -1858,11 +1971,22 @@ mod tests {
             app.clone(),
             "/api/apps/mandates/payments/reconcile",
             Some(standing),
-            &money_body(&fresh[0], r#"{"idempotency_key":"flint-xv","charged":false}"#),
+            &money_body(
+                &fresh[0],
+                r#"{"idempotency_key":"flint-xv","charged":false}"#,
+            ),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "cross-verb replay refused");
-        assert_eq!(meter.remaining("vm-once"), 40, "no refund was applied by the refused call");
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "cross-verb replay refused"
+        );
+        assert_eq!(
+            meter.remaining("vm-once"),
+            40,
+            "no refund was applied by the refused call"
+        );
     }
 
     /// Sprint 33 ratchet (cookie transport): the HttpOnly path-scoped cookie authorizes the
@@ -1926,7 +2050,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "the marker admits the same-origin write");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the marker admits the same-origin write"
+        );
     }
 
     /// Council S33 guardian F1 (the fold's ship-blocker): the single-use guard keys on the
@@ -1999,7 +2127,11 @@ mod tests {
             StatusCode::FORBIDDEN,
             "the re-encoded replay must read SPENT (403), not unverified (401)"
         );
-        assert_eq!(meter.remaining("vm-malleate"), 50, "the replay applied NOTHING");
+        assert_eq!(
+            meter.remaining("vm-malleate"),
+            50,
+            "the replay applied NOTHING"
+        );
     }
 
     /// Council S33 red-team F1: a refusal PROVABLY BEFORE any money effect (here the web
@@ -2038,7 +2170,10 @@ mod tests {
             app.clone(),
             "/api/apps/mandates/spend-budget",
             Some(standing.clone()),
-            &money_body(&fresh[0], &format!(r#"{{"capsule":"vm-cred","limit":{over}}}"#)),
+            &money_body(
+                &fresh[0],
+                &format!(r#"{{"capsule":"vm-cred","limit":{over}}}"#),
+            ),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -2052,7 +2187,11 @@ mod tests {
             &money_body(&fresh[0], r#"{"capsule":"vm-cred","limit":100}"#),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::OK, "the re-credited verification still works");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the re-credited verification still works"
+        );
         assert_eq!(meter.remaining("vm-cred"), 100);
 
         // …and having bought its one applied write, it is now spent for good.
@@ -2063,7 +2202,11 @@ mod tests {
             &money_body(&fresh[0], r#"{"capsule":"vm-cred","limit":101}"#),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "one applied write, then spent");
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "one applied write, then spent"
+        );
         assert_eq!(meter.remaining("vm-cred"), 100);
     }
 
@@ -2072,7 +2215,8 @@ mod tests {
     async fn receipt_route_reports_absence_as_404() {
         let dir = tempfile::tempdir().unwrap();
         let app = mandate_router(state_for(dir.path()));
-        let token_hdr = super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
+        let token_hdr =
+            super::super::issue_home_launch_token(dir.path(), MANDATES_CAPSULE_ID).unwrap();
         // A syntactically valid (16-byte / 32-hex) token id that was never issued.
         let unknown = "0".repeat(32);
         let resp = app
@@ -2178,15 +2322,29 @@ mod tests {
 
         // Ledger truth: a broadcast-pending DRM buy, a chain-confirmed one, and a refusal.
         assert!(ledger.record_with_token(
-            "flint-pending", "vm-shopper", "QmMovie", 5, PaymentStatus::Pending,
-            "drm:tx=0xAB;op=0xop;tid=7", Some(&pay_grant),
+            "flint-pending",
+            "vm-shopper",
+            "QmMovie",
+            5,
+            PaymentStatus::Pending,
+            "drm:tx=0xAB;op=0xop;tid=7",
+            Some(&pay_grant),
         ));
         assert!(ledger.record_with_token(
-            "flint-confirmed", "vm-shopper", "QmMovie", 5, PaymentStatus::ResolvedCharged,
-            "drm:tx=0xCD;op=0xop;tid=7", Some(&pay_grant),
+            "flint-confirmed",
+            "vm-shopper",
+            "QmMovie",
+            5,
+            PaymentStatus::ResolvedCharged,
+            "drm:tx=0xCD;op=0xop;tid=7",
+            Some(&pay_grant),
         ));
         assert!(ledger.record(
-            "flint-refused", "vm-shopper", "QmMovie", 999, PaymentStatus::NotCharged,
+            "flint-refused",
+            "vm-shopper",
+            "QmMovie",
+            999,
+            PaymentStatus::NotCharged,
             "refused by spend cap",
         ));
 
@@ -2218,12 +2376,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         // Assets: exactly the pay-mandate's asset, quote served CACHE-FIRST (no chain read).
         let assets = json["assets"].as_array().unwrap();
-        assert_eq!(assets.len(), 1, "only pay-mandates scope marketplace assets");
+        assert_eq!(
+            assets.len(),
+            1,
+            "only pay-mandates scope marketplace assets"
+        );
         assert_eq!(assets[0]["asset"], "QmMovie");
         assert_eq!(assets[0]["mandates"][0], pay_grant);
         assert_eq!(
@@ -2253,7 +2417,10 @@ mod tests {
         let refused = by_state("refused");
         assert_eq!(refused["detail"], "refused — nothing charged");
         assert_eq!(refused["amount"], 999);
-        assert!(refused.get("tx").is_none(), "no tx on a never-broadcast refusal");
+        assert!(
+            refused.get("tx").is_none(),
+            "no tx on a never-broadcast refusal"
+        );
     }
     /// Council S38 fold (guardian F1 + red-team F1): quote coverage ROTATES — cache hits are
     /// free (they never consume a fresh-read slot), so with more assets than the per-view
@@ -2305,7 +2472,9 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
             serde_json::from_slice::<serde_json::Value>(&body).unwrap()
         };
 
@@ -2320,7 +2489,11 @@ mod tests {
                 .filter(|a| a["unquoted_over_cap"] == true)
                 .count()
         };
-        assert_eq!(over_cap(&first), 2, "the tail waits, stated — never silently dropped");
+        assert_eq!(
+            over_cap(&first),
+            2,
+            "the tail waits, stated — never silently dropped"
+        );
 
         // View 2: the first batch is CACHED (free), so the tail gets the fresh-read slots.
         let second = view(app, token_hdr).await;
@@ -2360,14 +2533,23 @@ mod tests {
 
         // The OLDEST entry is a live pending obligation…
         assert!(ledger.record_with_token(
-            "flint-obligation", "vm-shopper", "QmMovie", 5, PaymentStatus::Pending,
-            "drm:tx=0xAB;op=0xop;tid=7", None,
+            "flint-obligation",
+            "vm-shopper",
+            "QmMovie",
+            5,
+            PaymentStatus::Pending,
+            "drm:tx=0xAB;op=0xop;tid=7",
+            None,
         ));
         // …then a flood of newer settled entries, more than the window.
         for i in 0..(MARKET_BUYS_LIMIT + 10) {
             assert!(ledger.record(
-                &format!("flint-noise-{i}"), "vm-flooder", "QmOther", 1,
-                PaymentStatus::NotCharged, "refused",
+                &format!("flint-noise-{i}"),
+                "vm-flooder",
+                "QmOther",
+                1,
+                PaymentStatus::NotCharged,
+                "refused",
             ));
         }
 
@@ -2385,11 +2567,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let buys = json["buys"].as_array().unwrap();
         assert!(
-            buys.iter().any(|b| b["state"] == "pending" && b["asset"] == "QmMovie"),
+            buys.iter()
+                .any(|b| b["state"] == "pending" && b["asset"] == "QmMovie"),
             "the live obligation is ALWAYS visible, however many settled entries arrive"
         );
         assert_eq!(

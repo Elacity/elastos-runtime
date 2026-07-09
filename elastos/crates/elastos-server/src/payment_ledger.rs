@@ -235,7 +235,11 @@ impl std::fmt::Display for ResolveError {
 ///    would let a cross-window re-dispatch find no entry and re-buy. A cap full of money-bearing
 ///    entries REFUSES the new insert fail-closed (the pay path then refuses to broadcast) rather
 ///    than forgetting a key idempotency depends on.
-fn admit_new_key(records: &mut HashMap<String, PaymentRecord>, capsule: &str, pending: bool) -> bool {
+fn admit_new_key(
+    records: &mut HashMap<String, PaymentRecord>,
+    capsule: &str,
+    pending: bool,
+) -> bool {
     if pending
         && records
             .values()
@@ -367,7 +371,15 @@ impl PaymentLedger {
         status: PaymentStatus,
         rail_note: &str,
     ) -> bool {
-        self.record_with_token(idempotency_key, capsule, payee, amount, status, rail_note, None)
+        self.record_with_token(
+            idempotency_key,
+            capsule,
+            payee,
+            amount,
+            status,
+            rail_note,
+            None,
+        )
     }
 
     /// Like [`record`](Self::record) — TEST/SEEDING ONLY — but binds the mandate token
@@ -800,7 +812,10 @@ mod tests {
         // At cap: a new record evicts the OLDEST EVICTABLE terminal (t-0), never pend-1.
         assert!(ledger.record("t-new", "vm-ap", "acme", 1, PaymentStatus::NotCharged, ""));
         assert!(ledger.get("pend-1").is_some(), "pending is never evicted");
-        assert!(ledger.get("t-0").is_none(), "oldest evictable terminal was evicted");
+        assert!(
+            ledger.get("t-0").is_none(),
+            "oldest evictable terminal was evicted"
+        );
         // A cap full of ONLY pending refuses new inserts (bounded obligations). Spread across
         // capsules so the GLOBAL bound is what trips, not the per-capsule one.
         let small = PaymentLedger::new();
@@ -843,10 +858,20 @@ mod tests {
         }
         // Cap full of Performed (money-bearing): a NEW insert is REFUSED, none evicted.
         assert!(
-            !ledger.record("new-charged", "vm-ap", "acme", 1, PaymentStatus::Performed, ""),
+            !ledger.record(
+                "new-charged",
+                "vm-ap",
+                "acme",
+                1,
+                PaymentStatus::Performed,
+                ""
+            ),
             "a cap full of money-bearing keys refuses new inserts (fail-closed)"
         );
-        assert!(ledger.get("charged-0").is_some(), "the oldest charged key survives");
+        assert!(
+            ledger.get("charged-0").is_some(),
+            "the oldest charged key survives"
+        );
         // begin_attempt refuses too — so the pay path declines WITHOUT broadcasting.
         assert_eq!(
             ledger.begin_attempt("brand-new", "vm-ap", "acme", 1, None),
@@ -982,7 +1007,14 @@ mod tests {
             ));
         }
         assert!(
-            !ledger.record("atk-more", "vm-attacker", "a", 1, PaymentStatus::Pending, ""),
+            !ledger.record(
+                "atk-more",
+                "vm-attacker",
+                "a",
+                1,
+                PaymentStatus::Pending,
+                ""
+            ),
             "the attacker capsule is at its own pending cap"
         );
         assert!(
@@ -1010,7 +1042,10 @@ mod tests {
         // Council S30 G-F2: 404 (absent) vs 409 (terminal) vs 503 (retry) must be
         // machine-distinguishable — a retryable failure must never read as "already resolved".
         let ledger = PaymentLedger::new();
-        assert_eq!(ledger.resolve("ghost", false).unwrap_err(), ResolveError::NotFound);
+        assert_eq!(
+            ledger.resolve("ghost", false).unwrap_err(),
+            ResolveError::NotFound
+        );
         assert!(ledger.record("k", "vm", "a", 5, PaymentStatus::NotCharged, ""));
         assert_eq!(
             ledger.resolve("k", false).unwrap_err(),
@@ -1056,7 +1091,14 @@ mod tests {
         let sub = dir.path().join("ledger");
         std::fs::create_dir(&sub).unwrap();
         let ledger = PaymentLedger::open_durable(sub.join("payments.json")).unwrap();
-        assert!(ledger.record("k", "vm-ap", "acme", 10, PaymentStatus::Pending, "rail said no"));
+        assert!(ledger.record(
+            "k",
+            "vm-ap",
+            "acme",
+            10,
+            PaymentStatus::Pending,
+            "rail said no"
+        ));
         ledger.resolve("k", false).unwrap();
         assert!(ledger.mark_refund_applied("k"));
         let before = ledger.get("k").unwrap();
