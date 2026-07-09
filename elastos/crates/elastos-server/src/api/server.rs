@@ -303,8 +303,8 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
                 // `runtime.negotiate` seller — so the negotiate seller reads listings through the
                 // identical single-flight fan-out bound (Sprint 50 — Track D3).
                 let quote_cache: crate::market_quote::MarketQuoteCache = Arc::default();
-                // The DRM fixed-price seller reuses the buy gate's EXACT spend-unit conversion +
-                // pay-token guard (no second, divergent conversion) — see `ListingNegotiator`.
+                // The DRM fixed-price seller calls the SAME `authorize_amount_against_listing` the
+                // buy gate does (one shared conversion, not a synced copy) — see `ListingNegotiator`.
                 let negotiator: Arc<dyn crate::negotiation::Negotiator> =
                     Arc::new(crate::negotiation::ListingNegotiator::new(
                         quote_cache.clone(),

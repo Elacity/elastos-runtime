@@ -98,24 +98,8 @@ pub async fn request_capability(
     Extension(session): Extension<Session>,
     Json(input): Json<RequestCapabilityInput>,
 ) -> Result<Json<RequestCapabilityOutput>, (StatusCode, String)> {
-    // Parse action
-    let action = match input.action.to_lowercase().as_str() {
-        "read" => Action::Read,
-        "write" => Action::Write,
-        "execute" => Action::Execute,
-        "delete" => Action::Delete,
-        "message" => Action::Message,
-        "admin" => Action::Admin,
-        _ => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "Invalid action: {}. Expected: read, write, execute, delete, message, admin",
-                    input.action
-                ),
-            ));
-        }
-    };
+    // Parse action (the ONE parser — no hand-copied action set; S50 guardian F4).
+    let action = parse_action(&input.action)?;
 
     if !is_supported_resource_scheme(&input.resource) {
         return Err((
@@ -236,22 +220,17 @@ pub struct RequestStatusOutput {
 
 // === Validate And Consume (W2 step 7) ===
 
-/// Parse an action string into an [`Action`], or a 400 listing the allowed set.
+/// Parse an action string into an [`Action`], or a 400 listing the allowed set. Delegates to the
+/// ONE parser (`Action`'s `FromStr`) so the accepted set cannot drift from the enum (S50 guardian F4).
 fn parse_action(raw: &str) -> Result<Action, (StatusCode, String)> {
-    match raw.to_lowercase().as_str() {
-        "read" => Ok(Action::Read),
-        "write" => Ok(Action::Write),
-        "execute" => Ok(Action::Execute),
-        "delete" => Ok(Action::Delete),
-        "message" => Ok(Action::Message),
-        "admin" => Ok(Action::Admin),
-        _ => Err((
+    <Action as std::str::FromStr>::from_str(raw).map_err(|_| {
+        (
             StatusCode::BAD_REQUEST,
             format!(
                 "Invalid action: {raw}. Expected: read, write, execute, delete, message, admin"
             ),
-        )),
-    }
+        )
+    })
 }
 
 /// Map a [`ValidationError`] to a fail-closed response with a DISTINCT, safe code
@@ -1182,23 +1161,7 @@ pub async fn issue_mandate(
     capability_manager: &CapabilityManager,
     input: IssueStandingGrantInput,
 ) -> Result<IssueStandingGrantOutput, (StatusCode, String)> {
-    let action = match input.action.to_lowercase().as_str() {
-        "read" => Action::Read,
-        "write" => Action::Write,
-        "execute" => Action::Execute,
-        "delete" => Action::Delete,
-        "message" => Action::Message,
-        "admin" => Action::Admin,
-        _ => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "Invalid action: {}. Expected: read, write, execute, delete, message, admin",
-                    input.action
-                ),
-            ));
-        }
-    };
+    let action = parse_action(&input.action)?;
     if input.methods.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -2230,20 +2193,9 @@ pub async fn dispatch_standing_intent(
             ));
         }
     }
-    let action = match intent.action.to_lowercase().as_str() {
-        "read" => Action::Read,
-        "write" => Action::Write,
-        "execute" => Action::Execute,
-        "delete" => Action::Delete,
-        "message" => Action::Message,
-        "admin" => Action::Admin,
-        other => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("invalid action in intent: {other}"),
-            ));
-        }
-    };
+    // ONE action parser (`parse_action` → `Action`'s `FromStr`), so the gate's accepted set can
+    // never drift from the enum variants (council S50 guardian F4).
+    let action = parse_action(&intent.action)?;
     // Liveness (G-M1): the envelope gate sees only its own `revoked` flag. A backing token can die
     // by three other paths the gate cannot see — individual revoke, `revoke_all`, and a key-rotation
     // epoch advance. Consult BOTH the revocation store and epoch validity (using the epoch captured

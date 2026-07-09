@@ -133,6 +133,73 @@ pub trait DrmSettler: Send + Sync {
     ) -> Result<DrmSettlement, DrmSettleError>;
 }
 
+/// Why a cap-vs-listing conversion could not be decided (all fail-closed at the buy gate; all a
+/// "no agreement" at the negotiate seller). Carries the offending chain-sourced strings so each
+/// caller can format its OWN message — the strings are bounded/sanitized at the point they become
+/// externally visible, never here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ListingAuthzError {
+    /// The listing quotes a pay-token other than the one `spend_unit` denominates — the amount and
+    /// the ask are in incomparable denominations.
+    TokenMismatch { listing: String, declared: String },
+    /// The listing price is not a parseable base-unit integer.
+    UnparseablePrice(String),
+    /// `amount × spend_unit` overflowed u128.
+    Overflow,
+}
+
+/// The decided conversion: the parsed listing price and what the mandate authorizes, both in the
+/// pay-token's base units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ListingAuthz {
+    pub price: u128,
+    pub authorized: u128,
+}
+impl ListingAuthz {
+    /// The mandate covers the ask ⇔ `authorized ≥ price` — the inclusive proceed/accept boundary
+    /// (a buy at exactly the cap proceeds; an offer at exactly the ask is accepted).
+    pub fn covers(&self) -> bool {
+        self.authorized >= self.price
+    }
+}
+
+/// THE ONE cap-vs-listing conversion (Sprint 36 price gate), extracted so the DRM buy gate
+/// ([`DrmMarketplaceProvider::pay`]) and the `runtime.negotiate` seller
+/// ([`crate::negotiation::ListingNegotiator`]) share a SINGLE implementation — the "reuses the
+/// EXACT conversion" claim is thus true BY CONSTRUCTION, not two hand-synced copies (council S50
+/// guardian F2). Given `amount` spend units and the listing terms, apply the declared
+/// spend-unit⇄pay-token mapping (`spend_unit`, already floored to ≥1 by each caller's constructor)
+/// and decide whether the mandate authorizes the listed price. Callers format their own outcome
+/// (the buy gate's fail-closed `PayError`; the seller's reject/counter) from the structured result;
+/// no message text lives here.
+pub(crate) fn authorize_amount_against_listing(
+    amount: u64,
+    spend_unit: u128,
+    expected_pay_token: Option<&str>,
+    listing_price: &str,
+    listing_pay_token: &str,
+) -> Result<ListingAuthz, ListingAuthzError> {
+    // The declared unit maps ONE token (council S36 F3): a listing in any other token is
+    // incomparable — refuse rather than gate against an unknown denomination.
+    if let Some(want) = expected_pay_token {
+        if !listing_pay_token.trim().eq_ignore_ascii_case(want.trim()) {
+            return Err(ListingAuthzError::TokenMismatch {
+                listing: listing_pay_token.to_string(),
+                declared: want.to_string(),
+            });
+        }
+    }
+    // Fail-closed on an unparseable price or a conversion overflow.
+    let price: u128 = listing_price
+        .trim()
+        .parse()
+        .map_err(|_| ListingAuthzError::UnparseablePrice(listing_price.to_string()))?;
+    let authorized = (amount as u128)
+        .checked_mul(spend_unit)
+        .ok_or(ListingAuthzError::Overflow)?;
+    Ok(ListingAuthz { price, authorized })
+}
+
 /// A [`PaymentProvider`] whose rail is the DRM marketplace. Resolve (fail-closed) → quote →
 /// PRICE-GATE the mandate's cap against the on-chain price → settle (two-generals) → a `rail_ref`
 /// naming the tx, the bound `(operative, tokenId)`, and the pay-token price.
@@ -214,42 +281,42 @@ impl PaymentProvider for DrmMarketplaceProvider {
                 PayError::Indeterminate(format!("DRM quote indeterminate: {why}"))
             }
         })?;
-        // The declared unit maps ONE token (council S36 F3): if the listing quotes a DIFFERENT
-        // pay-token than the deployment declared the `spend_unit` FOR, the cap conversion would be
-        // meaningless — refuse before broadcast rather than gate against an unknown denomination.
-        if let Some(want) = &self.expected_pay_token {
-            if !quote.pay_token.trim().eq_ignore_ascii_case(want.trim()) {
-                return Err(PayError::NotCharged(format!(
-                    "DRM buy refused before broadcast: the listing quotes pay-token {} but the \
-                     declared spend-unit mapping is for {want} — the cap cannot be compared across \
-                     token denominations",
-                    quote.pay_token
-                )));
-            }
-        }
         // THE PRICE GATE (Sprint 36): the mandate's cap, converted to pay-token units via the
         // declared unit mapping, MUST cover the on-chain price — else refuse BEFORE broadcast
-        // (NotCharged/refund), never buy at a price the mandate did not authorize. Fail-closed on
-        // an unparseable price or a conversion overflow.
-        let price: u128 = quote.price.trim().parse().map_err(|_| {
-            PayError::NotCharged(format!(
-                "DRM on-chain price is not a parseable amount ({}) — refused before broadcast",
-                quote.price
+        // (NotCharged/refund), never buy at a price the mandate did not authorize. The conversion
+        // (token guard, price parse, `amount × spend_unit`, cover boundary) is the SHARED
+        // `authorize_amount_against_listing` the negotiate seller also calls (S50 guardian F2); the
+        // buy gate formats its own fail-closed messages from the structured result.
+        let authz = authorize_amount_against_listing(
+            amount,
+            self.spend_unit,
+            self.expected_pay_token.as_deref(),
+            &quote.price,
+            &quote.pay_token,
+        )
+        .map_err(|e| match e {
+            ListingAuthzError::TokenMismatch { listing, declared } => {
+                PayError::NotCharged(format!(
+                "DRM buy refused before broadcast: the listing quotes pay-token {listing} but the \
+                 declared spend-unit mapping is for {declared} — the cap cannot be compared across \
+                 token denominations"
             ))
-        })?;
-        let authorized = (amount as u128)
-            .checked_mul(self.spend_unit)
-            .ok_or_else(|| {
-                PayError::NotCharged(
+            }
+            ListingAuthzError::UnparseablePrice(p) => PayError::NotCharged(format!(
+                "DRM on-chain price is not a parseable amount ({p}) — refused before broadcast"
+            )),
+            ListingAuthzError::Overflow => PayError::NotCharged(
                 "DRM cap conversion overflowed (amount * spend_unit) — refused before broadcast"
                     .to_string(),
-            )
-            })?;
-        if authorized < price {
+            ),
+        })?;
+        if !authz.covers() {
             return Err(PayError::NotCharged(format!(
                 "DRM buy refused before broadcast: the mandate authorizes {authorized} {tok} \
                  units ({amount} spend units × {unit}) but the on-chain price is {price} {tok} — \
                  raise the cap or lower the mandate amount",
+                authorized = authz.authorized,
+                price = authz.price,
                 tok = quote.pay_token,
                 unit = self.spend_unit,
             )));

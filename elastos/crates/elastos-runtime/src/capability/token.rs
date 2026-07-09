@@ -137,6 +137,26 @@ impl fmt::Display for Action {
     }
 }
 
+impl std::str::FromStr for Action {
+    type Err = ();
+
+    /// Parse the canonical lowercase action name (the inverse of [`Display`](fmt::Display)) — the
+    /// ONE place the dispatch gate and any conformance check turn an action STRING back into the
+    /// enum, so no hand-copied action list can drift from the variants (council S50 guardian F4).
+    /// Case-insensitive: callers historically lowercased first, so accept mixed case too.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "read" => Ok(Action::Read),
+            "write" => Ok(Action::Write),
+            "execute" => Ok(Action::Execute),
+            "message" => Ok(Action::Message),
+            "delete" => Ok(Action::Delete),
+            "admin" => Ok(Action::Admin),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Extensible constraints for capability tokens
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenConstraints {
@@ -475,6 +495,35 @@ impl CapabilityToken {
 mod tests {
     use super::*;
     use crate::primitives::time::SecureTimestamp;
+
+    /// `FromStr` is the exact inverse of `Display` for every variant (the one action parser), and
+    /// it is case-insensitive; an unknown action fails closed. This pins the round-trip so the
+    /// dispatch gate's accepted set can never drift from the enum (S50 guardian F4).
+    #[test]
+    fn action_from_str_is_the_inverse_of_display_and_fails_closed() {
+        use std::str::FromStr;
+        for a in [
+            Action::Read,
+            Action::Write,
+            Action::Execute,
+            Action::Message,
+            Action::Delete,
+            Action::Admin,
+        ] {
+            assert_eq!(Action::from_str(&a.to_string()), Ok(a), "round-trips: {a}");
+            assert_eq!(
+                Action::from_str(&a.to_string().to_uppercase()),
+                Ok(a),
+                "case-insensitive: {a}"
+            );
+        }
+        assert_eq!(
+            Action::from_str("negotiate"),
+            Err(()),
+            "unknown ⇒ fail-closed"
+        );
+        assert_eq!(Action::from_str(""), Err(()));
+    }
 
     fn create_test_token() -> CapabilityToken {
         let signing_key = SigningKey::generate(&mut rand::thread_rng());

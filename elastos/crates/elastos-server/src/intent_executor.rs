@@ -974,7 +974,14 @@ impl MethodRegistryExecutor {
                     };
                 }
                 // Relay the offer to the seller (isolated from a seller panic — a hostile/buggy
-                // seam must not take down the dispatch worker; a panic reads as no agreement).
+                // seam must not take down the dispatch worker; a panic reads as no agreement). No
+                // MONEY state is touched here (negotiate reserves/debits nothing), so a caught panic
+                // leaves the meter/ledger clean. AssertUnwindSafe is sound: the only shared state the
+                // production listing seller touches is the quote cache Mutex, which recovers from
+                // poison via `into_inner()`. RESIDUAL (council S50 guardian F5, LOW): a seller that
+                // panics mid-read of the shared quote spine can leave that asset's in-flight claim
+                // set until the ~30s TTL — self-healing, money-free, and not agent-triggerable (the
+                // production quoter is the chain reader, not seller input).
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     negotiator.negotiate(asset, offer)
                 }));
@@ -1020,9 +1027,18 @@ impl MethodRegistryExecutor {
                             .to_string(),
                     },
                     // A rejection (or a seam that declines to name terms) ⇒ no agreement reached.
+                    // The seller's `why` can carry chain-sourced bytes (a listing token/price), so
+                    // BOUND and SANITIZE it before it reaches the agent response and the logs — the
+                    // same discipline the Performed report is held to (council S50 guardian F1); a
+                    // hostile seller must not flood or inject control bytes through the reason.
                     None => IntentExecution::Declined {
                         reason: match outcome {
                             crate::negotiation::NegotiationOutcome::Rejected(why) => {
+                                let why: String = why
+                                    .chars()
+                                    .filter(|c| c.is_ascii_graphic() || *c == ' ')
+                                    .take(200)
+                                    .collect();
                                 format!("negotiation rejected by the seller: {why}")
                             }
                             _ => "negotiation reached no agreement".to_string(),
@@ -2849,13 +2865,16 @@ mod tests {
     /// dead at the gate). This pins the returned action to a gate-legal, declaration-matching value.
     #[test]
     fn a_faithful_negotiate_returns_a_gate_legal_action_that_reconciles_matched() {
-        const GATE_ACTIONS: [&str; 6] = ["read", "write", "execute", "message", "delete", "admin"];
+        use elastos_runtime::capability::Action;
+        use std::str::FromStr;
         let (exec, _meter, _seller) = negotiate_setup(500, accepted());
         let intent = negotiate_intent("vm-shopper", "QmMovie", "5");
         match exec.execute(&intent) {
             IntentExecution::Performed { action, .. } => {
+                // Pins against the SAME parser the dispatch gate uses (Action's FromStr) — not a
+                // hand-copied action list — so a returned action no token could authorize fails CI.
                 assert!(
-                    GATE_ACTIONS.contains(&action.as_str()),
+                    Action::from_str(&action).is_ok(),
                     "the returned action {action:?} must be a gate-authorizable Action enum value \
                      — else no token could ever authorize a negotiate dispatch"
                 );
@@ -3005,7 +3024,8 @@ mod tests {
     }
 
     /// A seller PANIC is caught and reads as no agreement — a hostile/buggy seam cannot take down
-    /// the dispatch worker, and (negotiate moving no money) nothing is left in a bad state.
+    /// the dispatch worker, and (negotiate moving no money) no MONEY state is left in a bad state
+    /// (the only residual is a TTL-bounded quote-cache slot; council S50 guardian F5).
     #[test]
     fn a_seller_panic_is_no_agreement() {
         struct PanicSeller;
@@ -3044,6 +3064,33 @@ mod tests {
                 assert!(reason.contains("malformed terms"), "reason: {reason}")
             }
             other => panic!("expected Declined on out-of-bound terms, got {other:?}"),
+        }
+    }
+
+    /// RATCHET (council S50 guardian F1): a seller's REJECTION reason reaches the agent response and
+    /// the logs, so the executor must BOUND and SANITIZE it — a hostile seller cannot flood it or
+    /// inject control bytes (newlines/escapes). The prefix stays; the seller's bytes are clamped.
+    #[test]
+    fn a_hostile_seller_reject_reason_is_bounded_and_sanitized() {
+        let nasty = format!("line1\nline2\t\x1b[31mred\x07{}", "Z".repeat(500));
+        let (exec, _meter, _seller) = negotiate_setup(500, NegotiationOutcome::Rejected(nasty));
+        match exec.execute(&negotiate_intent("vm-shopper", "QmMovie", "5")) {
+            IntentExecution::Declined { reason } => {
+                assert!(
+                    reason.starts_with("negotiation rejected by the seller: "),
+                    "keeps the honest prefix: {reason}"
+                );
+                assert!(
+                    reason.len() <= "negotiation rejected by the seller: ".len() + 200,
+                    "the seller's bytes are length-bounded: {} chars",
+                    reason.len()
+                );
+                assert!(
+                    reason.chars().all(|c| c.is_ascii_graphic() || c == ' '),
+                    "no control bytes reach the agent/logs: {reason:?}"
+                );
+            }
+            other => panic!("expected Declined, got {other:?}"),
         }
     }
 }

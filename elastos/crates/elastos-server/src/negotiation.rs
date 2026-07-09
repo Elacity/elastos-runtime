@@ -38,8 +38,10 @@ pub enum NegotiationOutcome {
     /// The seller COUNTERS with `price` in `pay_token` (its firm terms). The agent may pay it,
     /// re-negotiate, or walk — each a fresh receipted dispatch.
     Countered { price: String, pay_token: String },
-    /// No terms — a length-bounded reason. The negotiation act performed no agreement (⇒ the
-    /// executor DECLINES, `authorized_not_performed`), exactly as an unreadable quote does.
+    /// No terms — a reason string. The negotiation act performed no agreement (⇒ the executor
+    /// DECLINES, `authorized_not_performed`), exactly as an unreadable quote does. The reason is
+    /// bounded AND sanitized by the executor before it reaches the agent (`with_negotiation`), so a
+    /// hostile seller cannot flood or inject control bytes through it — the type does not bound it.
     Rejected(String),
 }
 
@@ -72,6 +74,14 @@ impl NegotiationOutcome {
 /// domain if it needs to. Blocking is fine (the caller runs on the blocking pool) but the
 /// implementor MUST bound any I/O it does — the listing seller inherits the quote spine's chain-read
 /// deadline (S40) for exactly this reason.
+///
+/// NORMATIVE — implementations MUST be observationally READ-ONLY (council S50 guardian F3): the
+/// offer must not LEAVE the deployment's own read path (no outbound transmission to a counterparty,
+/// no state write, no value move). `runtime.negotiate` is classified `read` and non-value-moving on
+/// that basis, so a read mandate authorizes it; an outbound-negotiating seller (one that emits the
+/// offer to a remote party in the operator's name) would make it side-effecting and MUST NOT be
+/// wired here until the affordance's action is reclassified accordingly. The shipped
+/// [`ListingNegotiator`] is a pure local read (chain-read spine + compare), honoring this.
 pub trait Negotiator: Send + Sync {
     fn negotiate(&self, asset: &str, offer: u64) -> NegotiationOutcome;
 }
@@ -84,7 +94,8 @@ pub trait Negotiator: Send + Sync {
 /// mandate-bound offer primitive and the loop closure (quote → negotiate → pay), which holds
 /// whatever the seller's sophistication.
 ///
-/// THE DECISION, reusing the buy gate's EXACT conversion (never a second, divergent one):
+/// THE DECISION, through the SHARED `authorize_amount_against_listing` the buy gate also calls —
+/// so it is the buy gate's conversion BY CONSTRUCTION (one function, not a synced copy):
 /// 1. Read the live listing terms. Unreadable / sold out / no listing ⇒ [`Rejected`] (no agreement
 ///    on an unreadable listing — the honest counterpart of the buy quote failing NotCharged).
 /// 2. PAY-TOKEN GUARD (council S36 F3, mirrored): if the listing quotes a different pay-token than
@@ -152,44 +163,42 @@ impl Negotiator for ListingNegotiator {
                 quote.error.as_deref().unwrap_or("no terms returned")
             ));
         };
-        // PAY-TOKEN GUARD: the offer is denominated (via `spend_unit`) in exactly one token; a
-        // listing in any other token is incomparable ⇒ refuse, never accept across denominations.
-        if let Some(want) = &self.expected_pay_token {
-            if !pay_token.trim().eq_ignore_ascii_case(want.trim()) {
-                return NegotiationOutcome::Rejected(format!(
-                    "the listing quotes pay-token {pay_token} but the declared spend-unit mapping \
-                     is for {want} — the offer cannot be compared across token denominations"
-                ));
+        // THE conversion — token guard, price parse, `offer × spend_unit`, cover boundary — is the
+        // SHARED `authorize_amount_against_listing` the DRM buy gate also calls (council S50
+        // guardian F2): one implementation, so a negotiate "accept" corresponds EXACTLY to what the
+        // buy gate will pass. The seller formats its own accept/counter/reject from the result.
+        match crate::drm_marketplace::authorize_amount_against_listing(
+            offer,
+            self.spend_unit,
+            self.expected_pay_token.as_deref(),
+            &price_str,
+            &pay_token,
+        ) {
+            Err(crate::drm_marketplace::ListingAuthzError::TokenMismatch { listing, declared }) => {
+                NegotiationOutcome::Rejected(format!(
+                    "the listing quotes pay-token {listing} but the declared spend-unit mapping is \
+                     for {declared} — the offer cannot be compared across token denominations"
+                ))
             }
-        }
-        // Fail-closed on an unparseable listing price (the same posture as the buy gate).
-        let price: u128 = match price_str.trim().parse() {
-            Ok(p) => p,
-            Err(_) => {
-                return NegotiationOutcome::Rejected(format!(
-                    "the listing price is not a parseable amount ({price_str})"
-                ));
+            Err(crate::drm_marketplace::ListingAuthzError::UnparseablePrice(p)) => {
+                NegotiationOutcome::Rejected(format!(
+                    "the listing price is not a parseable amount ({p})"
+                ))
             }
-        };
-        // `authorized = offer × spend_unit`, the IDENTICAL conversion the buy price gate computes.
-        let Some(authorized) = (offer as u128).checked_mul(self.spend_unit) else {
-            return NegotiationOutcome::Rejected(
+            Err(crate::drm_marketplace::ListingAuthzError::Overflow) => NegotiationOutcome::Rejected(
                 "offer × spend_unit overflowed — refusing to negotiate an unrepresentable amount"
                     .to_string(),
-            );
-        };
-        if authorized >= price {
+            ),
             // The offer covers the ask — accept AT the ask (never take more than listed).
-            NegotiationOutcome::Accepted {
-                price: price.to_string(),
+            Ok(authz) if authz.covers() => NegotiationOutcome::Accepted {
+                price: authz.price.to_string(),
                 pay_token,
-            }
-        } else {
+            },
             // Below ask — the fixed-price seller counters with its firm listing price.
-            NegotiationOutcome::Countered {
-                price: price.to_string(),
+            Ok(authz) => NegotiationOutcome::Countered {
+                price: authz.price.to_string(),
                 pay_token,
-            }
+            },
         }
     }
 }
