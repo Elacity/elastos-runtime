@@ -50,10 +50,30 @@ pub(crate) fn capsule_read_deadline() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Runtime-only SECRETS a spawned capsule must never inherit (Sprint 46, council S43 guardian F4 —
+/// P16). Both are consumed exclusively IN-PROCESS by the runtime and passed onward as explicit op
+/// ARGUMENTS where needed, so no capsule has a legitimate use for the env copy:
+/// - `ELASTOS_DDRM_BUY_SIGNED_TX` — a fully broadcastable signed transaction. Read only by
+///   `buy_authority` (the external-signature buy leg); leaked to a hostile provider BINARY it
+///   could be broadcast out-of-band while the read leg fails "pre-broadcast".
+/// - `ELASTOS_PAYMENT_TOKEN` — the HTTP payment rail's bearer token. Read only by `server.rs`
+///   when wiring `HttpPaymentProvider`; a capsule holding it could charge the rail directly.
+///
+/// Stripping happens HERE, at the single spawn seam every capsule goes through (P5: one place, no
+/// per-call-site copy to forget). This is a targeted denylist of runtime-only secrets, NOT a full
+/// env allowlist — capsules legitimately read their own `ELASTOS_*` config (RPC URLs, chain ids,
+/// bin paths), so an allowlist would need a per-capsule contract; that remains the stronger
+/// tracked hardening (KNOWN_GAPS).
+const RUNTIME_ONLY_SECRETS: &[&str] = &["ELASTOS_DDRM_BUY_SIGNED_TX", "ELASTOS_PAYMENT_TOKEN"];
+
 /// Spawn a command in its OWN process group (unix) so a deadline kill takes down the provider AND
 /// anything it spawned — a killed parent whose helper child still holds the stdout pipe would
 /// leave the read blocked past the deadline (exactly the hang the deadline exists to end).
+/// Also strips [`RUNTIME_ONLY_SECRETS`] from the child's environment (P16) — see the const's docs.
 pub(crate) fn spawn_grouped(cmd: &mut Command) -> std::io::Result<Child> {
+    for secret in RUNTIME_ONLY_SECRETS {
+        cmd.env_remove(secret);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -392,5 +412,39 @@ mod tests {
             Some(v) => std::env::set_var("ELASTOS_CHAIN_READ_DEADLINE_SECS", v),
             None => std::env::remove_var("ELASTOS_CHAIN_READ_DEADLINE_SECS"),
         }
+    }
+
+    /// Sprint 46 (P16, council S43 guardian F4): the runtime-only secrets NEVER reach a spawned
+    /// capsule's environment — a canary broadcastable-signed-tx set in the runtime env is ABSENT in
+    /// the child, while an ordinary `ELASTOS_*` config var still passes through. The strip lives at
+    /// `spawn_grouped` (the single spawn seam), so every provider/sidecar gets it for free.
+    #[test]
+    #[cfg(unix)]
+    fn runtime_only_secrets_are_stripped_from_spawned_capsules() {
+        let _g = crate::api::ddrm_env_lock();
+        std::env::set_var("ELASTOS_DDRM_BUY_SIGNED_TX", "0xCANARY_SIGNED_TX");
+        std::env::set_var("ELASTOS_PAYMENT_TOKEN", "canary-bearer");
+        std::env::set_var("ELASTOS_S46_ORDINARY_CONFIG", "passes-through");
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(
+            "printf '%s|%s|%s' \
+             \"${ELASTOS_DDRM_BUY_SIGNED_TX:-ABSENT}\" \
+             \"${ELASTOS_PAYMENT_TOKEN:-ABSENT}\" \
+             \"${ELASTOS_S46_ORDINARY_CONFIG:-ABSENT}\"",
+        );
+        cmd.stdout(std::process::Stdio::piped());
+        let child = spawn_grouped(&mut cmd).expect("spawn canary shell");
+        let out = child.wait_with_output().expect("collect canary output");
+
+        std::env::remove_var("ELASTOS_DDRM_BUY_SIGNED_TX");
+        std::env::remove_var("ELASTOS_PAYMENT_TOKEN");
+        std::env::remove_var("ELASTOS_S46_ORDINARY_CONFIG");
+
+        let seen = String::from_utf8_lossy(&out.stdout).to_string();
+        assert_eq!(
+            seen, "ABSENT|ABSENT|passes-through",
+            "secrets stripped, ordinary config inherited: {seen}"
+        );
     }
 }

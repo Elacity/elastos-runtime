@@ -444,9 +444,18 @@ pub async fn open_owned_in_viewer(
         ) {
             (Some(handle), Some(sig)) if !handle.trim().is_empty() && !sig.trim().is_empty() => {
                 // Fresh wallet signature (first open of this asset in the window) — assemble + cache.
-                match super::access_grant::assemble(handle, sig)
-                    .and_then(|g| super::access_grant::grant_to_b64(&g))
-                {
+                // spawn_blocking (Sprint 46, council S42 guardian F8): `assemble` shells out to the
+                // grant sidecar (deadline-bounded, but still up to ~31s of blocking) — that wait
+                // must hold a blocking-pool thread, not an async worker. A panicked task maps to
+                // the same fail-closed Err arm.
+                let (handle_o, sig_o) = (handle.to_string(), sig.to_string());
+                let assembled = tokio::task::spawn_blocking(move || {
+                    super::access_grant::assemble(&handle_o, &sig_o)
+                        .and_then(|g| super::access_grant::grant_to_b64(&g))
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("assemble task failed: {e}")));
+                match assembled {
                     Ok(b64) => {
                         grant_digest = Some(grant_watermark_digest16_hex(sig));
                         tracing::info!(
@@ -743,21 +752,35 @@ pub async fn prepare_owned_grant(
             .into_response();
     }
 
-    let prepared =
-        match super::access_grant::prepare(chain_id(), &kid_hex, &node_set_id_b64, &subject) {
-            Ok(p) => p,
-            Err(err) => {
-                if err.contains("link an EVM wallet") {
-                    return (StatusCode::FORBIDDEN, err).into_response();
-                }
-                tracing::warn!("prepare-grant failed: {err}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "could not prepare access grant",
-                )
-                    .into_response();
+    // spawn_blocking (Sprint 46, council S42 guardian F8): `prepare` shells out to the grant
+    // sidecar (deadline-bounded, but still up to ~31s of blocking) — that wait must hold a
+    // blocking-pool thread, not an async worker. A panicked task maps to the same fail-closed
+    // Err arm.
+    let prepare_out = {
+        let (chain, kid, nsid, subj) = (
+            chain_id(),
+            kid_hex.clone(),
+            node_set_id_b64.clone(),
+            subject.clone(),
+        );
+        tokio::task::spawn_blocking(move || super::access_grant::prepare(chain, &kid, &nsid, &subj))
+            .await
+            .unwrap_or_else(|e| Err(format!("prepare task failed: {e}")))
+    };
+    let prepared = match prepare_out {
+        Ok(p) => p,
+        Err(err) => {
+            if err.contains("link an EVM wallet") {
+                return (StatusCode::FORBIDDEN, err).into_response();
             }
-        };
+            tracing::warn!("prepare-grant failed: {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not prepare access grant",
+            )
+                .into_response();
+        }
+    };
 
     (
         StatusCode::OK,

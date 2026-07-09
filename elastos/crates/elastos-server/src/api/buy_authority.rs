@@ -1514,6 +1514,121 @@ mod tests {
         );
     }
 
+    /// Sprint 46 (the dedicated PREPARE-leg ratchet — council S43 guardian F2): a chain-provider
+    /// that answers the LISTING read but HANGS on `prepare_transaction` (the nonce/gas READ inside
+    /// the sign closure) is killed at the deadline and the buy is typed `PreBroadcast` ⇒ refund —
+    /// the tx was never signed, so it provably never broadcast. This is the S43 refinement's own
+    /// test: the same `CHAIN_DEADLINE_MARKER` on the SEND leg stays Indeterminate (proven by
+    /// `a_broadcast_op_error_types_the_buy_as_indeterminate_even_with_a_sentinel`); here the marker
+    /// rides a refund because the CALL SITE — not the message — decides. Guards the ordering
+    /// invariant a refactor could silently break (hoisting the prepare out of the sign closure, or
+    /// reusing one provider session for prepare+broadcast).
+    #[test]
+    #[cfg(all(unix, feature = "dev-modes"))]
+    fn a_chain_prepare_deadline_types_the_buy_as_pre_broadcast() {
+        let _g = crate::api::ddrm_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Chain-provider: fresh subprocess per conversation. Answers any read op with a VALID
+        // listing return (qty=5, price=1_000_000, native pay token) — but HANGS on the
+        // prepare_transaction op.
+        let listing_result = format!("0x{:064x}{:064x}{}", 5u128, 1_000_000u128, "0".repeat(64));
+        let chain_stub = dir.path().join("prepare-hang-chain.sh");
+        std::fs::write(
+            &chain_stub,
+            format!(
+                "#!/bin/sh\nread _init\nprintf '{{\"status\":\"ok\",\"data\":{{}}}}\\n'\n\
+                 read op\ncase \"$op\" in\n  *prepare_transaction*) sleep 300;;\n  *) printf \
+                 '{{\"status\":\"ok\",\"data\":{{\"result\":\"{listing_result}\"}}}}\\n';;\nesac\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&chain_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Wallet-provider: a persistent session that answers init + create_managed_account, then
+        // waits — the buy dies on the chain PREPARE inside the sign closure before any further leg.
+        let wallet_stub = dir.path().join("ready-wallet.sh");
+        std::fs::write(
+            &wallet_stub,
+            "#!/bin/sh\nread _init\nprintf '{\"status\":\"ok\",\"data\":{}}\\n'\nread _create\n\
+             printf '{\"status\":\"ok\",\"data\":{\"account\":{\"account_id\":\"acc1\",\
+             \"address\":\"0x00000000000000000000000000000000000000aa\"}}}\\n'\nread _never\n\
+             sleep 300\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&wallet_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prior_deadline = std::env::var("ELASTOS_CHAIN_READ_DEADLINE_SECS").ok();
+        std::env::set_var("ELASTOS_DDRM_RIGHTS", "chain");
+        std::env::set_var("ELASTOS_DDRM_BUY_SIGN", "wallet");
+        std::env::set_var("ELASTOS_CHAIN_PROVIDER_BIN", &chain_stub);
+        std::env::set_var("ELASTOS_WALLET_PROVIDER_BIN", &wallet_stub);
+        std::env::set_var("ELASTOS_DDRM_WALLET_BASE", dir.path().join("wallet"));
+        std::env::set_var("ELASTOS_CHAIN_BASE_RPC", "http://127.0.0.1:9");
+        std::env::set_var("ELASTOS_DDRM_CHAIN_ID", "84532");
+        // Pin the buy terms so the only pre-sign chain conversation is the listing re-read.
+        std::env::set_var(
+            "ELASTOS_DDRM_BUY_LEDGER",
+            "0x1111111111111111111111111111111111111111",
+        );
+        std::env::set_var("ELASTOS_DDRM_BUY_TOKEN_ID", "7");
+        std::env::set_var(
+            "ELASTOS_DDRM_BUY_OPERATIVE",
+            "0x8b0ae79abf9b41dfe8aabf3c791dd52fe7713530",
+        );
+        std::env::set_var(
+            "ELASTOS_DDRM_BUY_SELLER",
+            "0x34daf31b99b5a59ceb18e424dbc112fa6e5f3dc3",
+        );
+        std::env::set_var("ELASTOS_CHAIN_READ_DEADLINE_SECS", "1");
+
+        let started = std::time::Instant::now();
+        let err = buy_access(
+            "did:test:alice",
+            "bafyPREPARE",
+            "",
+            1_700_000_000,
+            &BuyTarget::default(),
+        )
+        .expect_err("a hung prepare leg must error");
+
+        for k in [
+            "ELASTOS_DDRM_RIGHTS",
+            "ELASTOS_DDRM_BUY_SIGN",
+            "ELASTOS_CHAIN_PROVIDER_BIN",
+            "ELASTOS_WALLET_PROVIDER_BIN",
+            "ELASTOS_DDRM_WALLET_BASE",
+            "ELASTOS_CHAIN_BASE_RPC",
+            "ELASTOS_DDRM_CHAIN_ID",
+            "ELASTOS_DDRM_BUY_LEDGER",
+            "ELASTOS_DDRM_BUY_TOKEN_ID",
+            "ELASTOS_DDRM_BUY_OPERATIVE",
+            "ELASTOS_DDRM_BUY_SELLER",
+        ] {
+            std::env::remove_var(k);
+        }
+        match prior_deadline {
+            Some(v) => std::env::set_var("ELASTOS_CHAIN_READ_DEADLINE_SECS", v),
+            None => std::env::remove_var("ELASTOS_CHAIN_READ_DEADLINE_SECS"),
+        }
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "the prepare leg is bounded by the deadline, not the stub's 300s sleep"
+        );
+        assert!(
+            matches!(err, BuyError::PreBroadcast(_)),
+            "a chain deadline on the PREPARE (read) leg is pre-broadcast ⇒ refund: {err:?}"
+        );
+        assert!(
+            err.message()
+                .contains(crate::api::rights_authority::CHAIN_DEADLINE_MARKER),
+            "the refund-classified error carries the CHAIN deadline marker — the same marker the \
+             SEND leg holds as Indeterminate; the call site decides, not the bytes: {err}"
+        );
+    }
+
     /// Sprint 43 council F3a: a Dev-mode buy NEVER broadcasts (synthetic hash, local ledger), so a
     /// record failure is pre-broadcast ⇒ refundable. This is a behavior CHANGE the typing makes
     /// correct — the old string classifier had no sentinel for it and stranded it as Indeterminate.
