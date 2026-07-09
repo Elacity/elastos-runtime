@@ -302,6 +302,103 @@ pub fn build_pay_rail(data_dir: Option<&std::path::Path>) -> Option<PayRail> {
             }
         };
     }
+    // The ERC-20 checkout rail (Sprint 48 — the second chain-settled vertical): `runtime.pay`
+    // becomes `transfer(payee, amount × ELASTOS_ERC20_SPEND_UNIT)` on ONE operator-declared
+    // token, held Pending at broadcast and reconciled by the same chain-settled spine as DRM.
+    // Same wiring discipline: durable stores required; the unit mapping is REQUIRED (the cap is a
+    // literal on-chain ceiling, never a silent 1-wei assumption); MOCK settlement requires the
+    // explicit mock-money opt-in (S29 rule) and is dev-modes-only in the provider itself.
+    let erc20_rail = std::env::var("ELASTOS_PAYMENT_RAIL")
+        .map(|v| v.trim().eq_ignore_ascii_case("erc20"))
+        .unwrap_or(false);
+    if erc20_rail {
+        if real_endpoint.is_some() {
+            tracing::warn!(
+                "both ELASTOS_PAYMENT_RAIL=erc20 and ELASTOS_PAYMENT_ENDPOINT are set — the \
+                 ERC-20 checkout rail wins; the HTTP endpoint is ignored"
+            );
+        }
+        let mode = match std::env::var("ELASTOS_ERC20_MODE").as_deref() {
+            Ok("mock") => {
+                if !mock_allowed {
+                    tracing::error!(
+                        "ELASTOS_ERC20_MODE=mock fabricates synthetic settlements — that is MOCK \
+                         money and requires ELASTOS_ALLOW_MOCK_PAYMENTS to be set explicitly; \
+                         runtime.pay stays UNWIRED"
+                    );
+                    return None;
+                }
+                crate::api::erc20_checkout::Erc20Mode::Mock
+            }
+            _ => crate::api::erc20_checkout::Erc20Mode::Live,
+        };
+        let token = match std::env::var("ELASTOS_ERC20_TOKEN") {
+            Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+            _ => {
+                tracing::error!(
+                    "ELASTOS_PAYMENT_RAIL=erc20 requires ELASTOS_ERC20_TOKEN (the ERC-20 \
+                     contract address the rail pays in) — refusing to wire without it \
+                     (fail-closed)"
+                );
+                return None;
+            }
+        };
+        let spend_unit = match std::env::var("ELASTOS_ERC20_SPEND_UNIT") {
+            Ok(v) => match v.trim().parse::<u128>() {
+                Ok(n) if n >= 1 => n,
+                _ => {
+                    tracing::error!(
+                        "ELASTOS_ERC20_SPEND_UNIT={v:?} is not a positive integer — refusing to \
+                         wire the ERC-20 rail with a malformed unit mapping (fail-closed)"
+                    );
+                    return None;
+                }
+            },
+            Err(_) => {
+                tracing::error!(
+                    "ELASTOS_PAYMENT_RAIL=erc20 requires ELASTOS_ERC20_SPEND_UNIT (token \
+                     base-units per spend unit, e.g. 1000000 for a 6-decimals token) so the cap \
+                     is a literal on-chain ceiling — refusing to wire with an undeclared unit \
+                     mapping (fail-closed)"
+                );
+                return None;
+            }
+        };
+        let principal = std::env::var("ELASTOS_ERC20_PAYER_PRINCIPAL").unwrap_or_default();
+        if principal.trim().is_empty() {
+            tracing::warn!(
+                "ELASTOS_PAYMENT_RAIL=erc20 wired with an EMPTY ELASTOS_ERC20_PAYER_PRINCIPAL — \
+                 every live checkout will fail closed (no managed account) until it is set"
+            );
+        }
+        return match (open_durable_meter(), open_ledger()) {
+            (Some(meter), Some(payment_ledger)) => {
+                tracing::info!(
+                    "runtime.pay is wired to the ERC-20 checkout rail (token {token}, durable \
+                     spend meter; transfers settle on-chain and confirm via the chain-settled \
+                     reconciler)"
+                );
+                let provider = Arc::new(crate::api::erc20_checkout::Erc20CheckoutProvider::new(
+                    token, spend_unit, principal, mode,
+                ));
+                Some(PayRail {
+                    meter,
+                    provider: provider.clone(),
+                    ledger: payment_ledger,
+                    drm_confirmer: Some(provider),
+                    quote_cache: Arc::default(),
+                })
+            }
+            _ => {
+                tracing::error!(
+                    "ELASTOS_PAYMENT_RAIL=erc20 is set but the DURABLE spend meter/ledger is \
+                     unavailable — real money on non-durable stores is refused; runtime.pay \
+                     stays UNWIRED"
+                );
+                None
+            }
+        };
+    }
     if let Some(endpoint) = real_endpoint {
         if mock_allowed {
             tracing::warn!(

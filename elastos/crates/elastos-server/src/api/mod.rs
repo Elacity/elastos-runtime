@@ -15,6 +15,7 @@ pub(crate) mod capsule_watchdog;
 pub mod chain_tx;
 pub mod content_index;
 pub mod creator;
+pub mod erc20_checkout;
 pub mod gateway;
 pub mod handlers;
 pub mod market_reads;

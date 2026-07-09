@@ -123,6 +123,12 @@ pub enum PaymentRail {
     Http,
     /// The DRM on-chain marketplace rail (`drm_marketplace::DrmMarketplaceProvider`).
     Drm,
+    /// The ERC-20 checkout rail (`api::erc20_checkout::Erc20CheckoutProvider`, Sprint 48) — the
+    /// second chain-settled vertical; its pendings carry `erc20:tx=` notes and are reconciled by
+    /// the same chain-settled spine as `Drm`. NOTE: per the forward-compat contract above, adding
+    /// this variant means a pre-S48 runtime refuses to load a snapshot containing an `erc20`
+    /// record — a coordinated upgrade, as documented.
+    Erc20,
 }
 
 /// One rail attempt. `rail_note` is the sanitized (printable, bounded) rail body/reference.
@@ -951,6 +957,17 @@ mod tests {
             round.contains("\"rail\":\"unknown\""),
             "a re-persisted legacy record gains the tag: {round}"
         );
+    }
+
+    /// Sprint 48: the new rail serializes as plain snake_case "erc20" and round-trips — and the
+    /// S44 forward-compat posture (an unknown rail string refuses the whole load, fail-closed)
+    /// is what makes adding it a coordinated upgrade, as documented on the enum.
+    #[test]
+    fn the_erc20_rail_serializes_and_round_trips() {
+        let json = serde_json::to_string(&PaymentRail::Erc20).unwrap();
+        assert_eq!(json, "\"erc20\"");
+        let back: PaymentRail = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, PaymentRail::Erc20);
     }
 
     /// Sprint 44 (council guardian F3): a REOPEN of a provably-nothing-moved terminal adopts the

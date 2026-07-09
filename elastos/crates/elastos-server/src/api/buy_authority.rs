@@ -149,7 +149,7 @@ fn wallet_signing() -> bool {
 }
 
 /// The EVM chain id for the buy (default Base mainnet); overridable for other deployments.
-fn chain_id_default() -> u64 {
+pub(crate) fn chain_id_default() -> u64 {
     env_nonempty("ELASTOS_DDRM_CHAIN_ID")
         .and_then(|s| s.parse().ok())
         .unwrap_or(8453)

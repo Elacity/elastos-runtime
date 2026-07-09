@@ -308,15 +308,34 @@ pub(crate) fn parse_drm_tx(rail_note: &str) -> Option<&str> {
     rail_note.strip_prefix("drm:tx=")?.split(';').next()
 }
 
-/// Whether a pending record is a DRM pending the confirmation reconciler owns (Sprint 44). A
-/// positively-tagged [`PaymentRail::Drm`](crate::payment_ledger::PaymentRail) record IS ours; a
-/// tagged `Http` (or any non-`Drm`, non-`Unknown`) record is NEVER ours regardless of its note; an
-/// `Unknown` (pre-S44/untagged) record falls back to the `drm:tx=` note heuristic (the bounded
-/// legacy path — see [`reconcile_drm_confirmations`]).
-fn is_drm_pending(record: &crate::payment_ledger::PaymentRecord) -> bool {
+/// Extract the settlement tx hash from a pending record, PER ITS RAIL (Sprint 48 — the
+/// chain-settled generalization of the S44 discriminator): `Drm` parses only `drm:tx=`, `Erc20`
+/// only `erc20:tx=` (a Drm-tagged record with an erc20 note — or vice versa — has NO tx, exactly
+/// like a tx-less note: left Pending, confirmer never called). `Unknown` (pre-S44 legacy) keeps
+/// the DRM-only note fallback — the legacy fallback NEVER widens to new rails. `Http` never
+/// parses: a hostile HTTP endpoint crafting either prefix is never polled.
+pub(crate) fn parse_chain_tx<'a>(
+    rail: crate::payment_ledger::PaymentRail,
+    rail_note: &'a str,
+) -> Option<&'a str> {
+    use crate::payment_ledger::PaymentRail;
+    match rail {
+        PaymentRail::Drm => parse_drm_tx(rail_note),
+        PaymentRail::Erc20 => rail_note.strip_prefix("erc20:tx=")?.split(';').next(),
+        PaymentRail::Unknown => parse_drm_tx(rail_note),
+        PaymentRail::Http => None,
+    }
+}
+
+/// Whether a pending record belongs to the CHAIN-SETTLED confirmation reconciler (Sprint 44,
+/// generalized Sprint 48). A positively-tagged `Drm` or `Erc20` record IS ours; a tagged `Http`
+/// record is NEVER ours regardless of its note; an `Unknown` (pre-S44/untagged) record falls back
+/// to the `drm:tx=` note heuristic ONLY (the bounded legacy path — see
+/// [`reconcile_drm_confirmations`]).
+fn is_chain_settled_pending(record: &crate::payment_ledger::PaymentRecord) -> bool {
     use crate::payment_ledger::PaymentRail;
     match record.rail {
-        PaymentRail::Drm => true,
+        PaymentRail::Drm | PaymentRail::Erc20 => true,
         PaymentRail::Unknown => parse_drm_tx(&record.rail_note).is_some(),
         PaymentRail::Http => false,
     }
@@ -466,18 +485,22 @@ fn drm_min_confirmations() -> u64 {
         .unwrap_or(DEFAULT_MIN_CONFIRMATIONS)
 }
 
+/// The ONE live chain-confirmation read (receipt + depth floor) every chain-settled rail shares
+/// (Sprint 48 — P5): DRM buys and ERC-20 checkouts confirm identically. FAIL-SAFE: any read
+/// error ⇒ Unconfirmed (hold; never auto-charge a tx we could not verify).
+pub(crate) fn confirm_chain_tx(tx_hash: &str) -> DrmConfirmation {
+    match crate::api::chain_tx::tx_confirmation_live(tx_hash, drm_min_confirmations()) {
+        Ok(crate::api::chain_tx::TxConfirmation::Confirmed) => DrmConfirmation::Confirmed,
+        Ok(crate::api::chain_tx::TxConfirmation::Reverted) => DrmConfirmation::Reverted,
+        Ok(crate::api::chain_tx::TxConfirmation::Pending(why)) => DrmConfirmation::Unconfirmed(why),
+        Err(e) => DrmConfirmation::Unconfirmed(format!("confirmation read failed: {e}")),
+    }
+}
+
 impl DrmConfirmer for ChainDrmMarketplace {
     fn confirm(&self, tx_hash: &str) -> DrmConfirmation {
-        // Read the receipt + apply the depth floor. FAIL-SAFE: any read error ⇒ Unconfirmed (hold;
-        // never auto-charge a tx we could not verify). Live Base only — the operator runbook.
-        match crate::api::chain_tx::tx_confirmation_live(tx_hash, drm_min_confirmations()) {
-            Ok(crate::api::chain_tx::TxConfirmation::Confirmed) => DrmConfirmation::Confirmed,
-            Ok(crate::api::chain_tx::TxConfirmation::Reverted) => DrmConfirmation::Reverted,
-            Ok(crate::api::chain_tx::TxConfirmation::Pending(why)) => {
-                DrmConfirmation::Unconfirmed(why)
-            }
-            Err(e) => DrmConfirmation::Unconfirmed(format!("confirmation read failed: {e}")),
-        }
+        // Live Base only — the operator runbook.
+        confirm_chain_tx(tx_hash)
     }
 }
 
@@ -529,7 +552,7 @@ pub fn reconcile_drm_confirmations(
     let drm_pendings: Vec<_> = ledger
         .pending()
         .into_iter()
-        .filter(is_drm_pending)
+        .filter(is_chain_settled_pending)
         .collect();
     let split = match start_after_seq {
         Some(cursor) => drm_pendings.partition_point(|r| r.seq <= cursor),
@@ -614,22 +637,26 @@ fn reconcile_one_drm_pending(
     use elastos_runtime::capability::token::TokenId;
     use elastos_runtime::capability::ResourceId;
 
-    let Some(tx) = parse_drm_tx(&record.rail_note).map(str::to_string) else {
-        // A DRM-tagged pending with no `drm:tx=` note (Sprint 44): a transient `"reserving"`
-        // placeholder (harmless — the next pass sees the finalized note), OR a buy that went
-        // Indeterminate WITHOUT a tx hash (an S29-class orphan — no tx to poll, needs operator /
-        // chain-scan recovery). Pre-S44 the note filter excluded these; now the rail tag admits
-        // them, so make a permanently-unpollable entry VISIBLE rather than folding it silently into
-        // the never-mining set. Fail-closed: left Pending, money unchanged, confirmer never called.
-        if record.rail == crate::payment_ledger::PaymentRail::Drm
-            && !record.rail_note.is_empty()
+    let Some(tx) = parse_chain_tx(record.rail, &record.rail_note).map(str::to_string) else {
+        // A chain-rail-tagged pending with no parseable tx note (Sprint 44, generalized S48): a
+        // transient `"reserving"` placeholder (harmless — the next pass sees the finalized note),
+        // OR a settle that went Indeterminate WITHOUT a tx hash (an S29-class orphan — no tx to
+        // poll, needs operator / chain-scan recovery). Pre-S44 the note filter excluded these; now
+        // the rail tag admits them, so make a permanently-unpollable entry VISIBLE rather than
+        // folding it silently into the never-mining set. Fail-closed: left Pending, money
+        // unchanged, confirmer never called.
+        if matches!(
+            record.rail,
+            crate::payment_ledger::PaymentRail::Drm | crate::payment_ledger::PaymentRail::Erc20
+        ) && !record.rail_note.is_empty()
             && record.rail_note != "reserving"
         {
             tracing::warn!(
                 key = %record.idempotency_key,
+                rail = ?record.rail,
                 rail_note = %record.rail_note,
-                "DRM-tagged pending has no drm:tx= hash to poll — left Pending; needs operator \
-                 reconcile / chain scan (S29 orphan)"
+                "chain-rail pending has no parseable tx hash to poll — left Pending; needs \
+                 operator reconcile / chain scan (S29 orphan)"
             );
         }
         return EntryOutcome::LeftPending;
@@ -1354,6 +1381,109 @@ mod tests {
         );
     }
 
+    /// Sprint 48 (the second chain-settled rail): the reconciler owns `Erc20`-tagged pendings
+    /// exactly like `Drm` ones — an `erc20:tx=` pending is polled and promoted/refunded through
+    /// the SAME spine — while the S44 security walls hold in every direction: an `Http`-tagged
+    /// pending with a CRAFTED `erc20:tx=` note is never polled, and the pre-S44 `Unknown` legacy
+    /// note-fallback stays DRM-ONLY (it never widens to new rails).
+    #[test]
+    fn erc20_pendings_are_reconciled_and_the_s44_walls_hold_for_the_new_rail() {
+        use crate::payment_ledger::{PaymentLedger, PaymentRail, PaymentStatus};
+        use elastos_runtime::primitives::audit::AuditLog;
+        use elastos_runtime::primitives::spend::SpendMeter;
+
+        let ledger = PaymentLedger::new();
+        let meter = SpendMeter::new();
+        let audit = AuditLog::new();
+        meter.set_budget("vm-shop", 1000).unwrap();
+
+        // OURS: a real Erc20-tagged checkout pending.
+        meter.try_debit("vm-shop", 100).unwrap();
+        assert!(ledger.record_on_rail(
+            "flint-e20",
+            "vm-shop",
+            "0xpayee",
+            100,
+            PaymentStatus::Pending,
+            "erc20:tx=0xE20;to=0xpayee;amount=100;tok=usdc",
+            None,
+            PaymentRail::Erc20,
+        ));
+        // HOSTILE: an Http-tagged pending whose note is CRAFTED to look like a checkout ref.
+        meter.try_debit("vm-shop", 400).unwrap();
+        assert!(ledger.record_on_rail(
+            "flint-http-e20",
+            "vm-shop",
+            "attacker",
+            400,
+            PaymentStatus::Pending,
+            "erc20:tx=0xEVIL;to=x;amount=1;tok=t",
+            None,
+            PaymentRail::Http,
+        ));
+        // LEGACY: an Unknown-tagged (pre-S44) pending with an erc20 note — the legacy fallback is
+        // DRM-only, so this is NOT ours (left for the operator surface).
+        meter.try_debit("vm-shop", 200).unwrap();
+        assert!(ledger.record_with_token(
+            "flint-legacy-e20",
+            "vm-shop",
+            "someone",
+            200,
+            PaymentStatus::Pending,
+            "erc20:tx=0xOLD;to=x;amount=2;tok=t",
+            None,
+        ));
+
+        // A confirmer that CONFIRMS our tx and would confirm the hostile/legacy ones too — the
+        // walls, not the verdicts, are what keep them unpolled.
+        let mut verdicts = std::collections::HashMap::new();
+        for tx in ["0xE20", "0xEVIL", "0xOLD"] {
+            verdicts.insert(tx.to_string(), DrmConfirmation::Confirmed);
+        }
+        let confirmer = MockConfirmer(verdicts);
+
+        let summary =
+            reconcile_drm_confirmations(&ledger, &meter, &audit, &confirmer, usize::MAX, None);
+
+        assert_eq!(summary.promoted, 1, "exactly the Erc20 pending promoted");
+        assert_eq!(
+            ledger.get("flint-e20").unwrap().status,
+            PaymentStatus::ResolvedCharged,
+            "the checkout's spend stands once confirmed"
+        );
+        assert_eq!(
+            ledger.get("flint-http-e20").unwrap().status,
+            PaymentStatus::Pending,
+            "the hostile Http-tagged pending is NEVER polled — its crafted erc20:tx= note \
+             cannot get it resolved"
+        );
+        assert_eq!(
+            ledger.get("flint-legacy-e20").unwrap().status,
+            PaymentStatus::Pending,
+            "the Unknown legacy fallback stays DRM-only — it never widens to new rails"
+        );
+    }
+
+    /// Sprint 48: `parse_chain_tx` is rail-STRICT — a Drm-tagged record does not parse an erc20
+    /// note and vice versa (a cross-rail note is a tx-less orphan: left Pending, never polled).
+    #[test]
+    fn parse_chain_tx_is_rail_strict() {
+        use crate::payment_ledger::PaymentRail;
+        assert_eq!(
+            parse_chain_tx(PaymentRail::Erc20, "erc20:tx=0xA;to=x"),
+            Some("0xA")
+        );
+        assert_eq!(parse_chain_tx(PaymentRail::Erc20, "drm:tx=0xA;op=o"), None);
+        assert_eq!(parse_chain_tx(PaymentRail::Drm, "erc20:tx=0xA;to=x"), None);
+        assert_eq!(
+            parse_chain_tx(PaymentRail::Unknown, "erc20:tx=0xA;to=x"),
+            None,
+            "the legacy fallback never widens past drm:tx="
+        );
+        assert_eq!(parse_chain_tx(PaymentRail::Http, "drm:tx=0xA"), None);
+        assert_eq!(parse_chain_tx(PaymentRail::Http, "erc20:tx=0xA"), None);
+    }
+
     /// Sprint 44 (council guardian F4): a `Drm`-tagged pending whose note is NOT a `drm:tx=` ref
     /// (an Indeterminate-without-tx orphan) is now IN the reconciler's work list (the rail tag
     /// admits it where the old note filter excluded it) — but it is left Pending WITHOUT polling
@@ -1411,7 +1541,7 @@ mod tests {
 
     /// Seed `n` pending DRM buys (`flint-b0..`, txs `0xB0..`), each with a reservation. These seed
     /// via `record_with_token` ⇒ the `Unknown` rail, so the scheduler/reconcile tests below
-    /// DELIBERATELY exercise the S44 legacy `drm:tx=` note-fallback path (`is_drm_pending`'s
+    /// DELIBERATELY exercise the S44 legacy `drm:tx=` note-fallback path (`is_chain_settled_pending`'s
     /// `Unknown` arm) — a live compatibility promise worth ratcheting; the positive `Drm`-tag path
     /// is covered by `a_positively_tagged_http_pending_is_never_reconciled_by_the_drm_driver` + the
     /// capability e2e. When the legacy fallback is eventually removed, these seeds flip to
