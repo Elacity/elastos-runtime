@@ -50,21 +50,14 @@ pub(crate) fn capsule_read_deadline() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Runtime-only SECRETS a spawned capsule must never inherit (Sprint 46, council S43 guardian F4 —
-/// P16). Both are consumed exclusively IN-PROCESS by the runtime and passed onward as explicit op
-/// ARGUMENTS where needed, so no capsule has a legitimate use for the env copy:
-/// - `ELASTOS_DDRM_BUY_SIGNED_TX` — a fully broadcastable signed transaction. Read only by
-///   `buy_authority` (the external-signature buy leg); leaked to a hostile provider BINARY it
-///   could be broadcast out-of-band while the read leg fails "pre-broadcast".
-/// - `ELASTOS_PAYMENT_TOKEN` — the HTTP payment rail's bearer token. Read only by `server.rs`
-///   when wiring `HttpPaymentProvider`; a capsule holding it could charge the rail directly.
-///
-/// Stripping happens HERE, at the single spawn seam every capsule goes through (P5: one place, no
-/// per-call-site copy to forget). This is a targeted denylist of runtime-only secrets, NOT a full
-/// env allowlist — capsules legitimately read their own `ELASTOS_*` config (RPC URLs, chain ids,
-/// bin paths), so an allowlist would need a per-capsule contract; that remains the stronger
-/// tracked hardening (KNOWN_GAPS).
-const RUNTIME_ONLY_SECRETS: &[&str] = &["ELASTOS_DDRM_BUY_SIGNED_TX", "ELASTOS_PAYMENT_TOKEN"];
+/// The ONE list of runtime-only secrets stripped from every capsule spawn (Sprint 46 — P16/P5).
+/// Defined in `elastos_runtime::provider` so EVERY capsule spawn seam (this watchdog's
+/// `spawn_grouped`, `ProviderBridge::spawn`, the carrier service spawn, and the shell-capsule
+/// spawns in main/serve_cmd) shares it — see its docs for the threat model. The council S46
+/// red-team proved a local copy here was not enough: the general provider seams bypassed it and
+/// leaked the rail bearer to every provider capsule. The source-structural guard test below pins
+/// every spawn site in the tree onto a classified seam.
+use elastos_runtime::provider::RUNTIME_ONLY_SECRETS;
 
 /// Spawn a command in its OWN process group (unix) so a deadline kill takes down the provider AND
 /// anything it spawned — a killed parent whose helper child still holds the stdout pipe would
@@ -445,6 +438,107 @@ mod tests {
         assert_eq!(
             seen, "ABSENT|ABSENT|passes-through",
             "secrets stripped, ordinary config inherited: {seen}"
+        );
+    }
+
+    /// Sprint 46 (council red-team F5 — the structural guard): every `Command::new` site in
+    /// elastos-server + elastos-runtime must be a KNOWN spawn seam. The three CAPSULE seams must
+    /// each reference `RUNTIME_ONLY_SECRETS` (the strip cannot be refactored away silently), and a
+    /// NEW file that starts spawning processes fails this test until it is consciously classified
+    /// here (capsule seam ⇒ add the strip; host tool ⇒ allowlist). This is what turns the canary
+    /// (which proves the helper strips) into a tree-wide invariant (every capsule spawn strips).
+    #[test]
+    fn every_command_spawn_site_is_a_known_seam_and_capsule_seams_strip_secrets() {
+        // The files that SPAWN CAPSULES — each must carry the strip (reference the shared list).
+        // capsule_watchdog (chain/wallet/rights/content sidecars), ProviderBridge (the general
+        // provider capsules), the carrier service, and the shell-capsule spawns in main/serve_cmd.
+        const CAPSULE_SEAMS: &[&str] = &[
+            "crates/elastos-server/src/api/capsule_watchdog.rs",
+            "crates/elastos-server/src/carrier_service.rs",
+            "crates/elastos-runtime/src/provider/bridge.rs",
+            "crates/elastos-server/src/main.rs",
+            "crates/elastos-server/src/serve_cmd.rs",
+        ];
+        // HOST-TOOL / self-exec spawn sites (git, tar, systemctl, the gateway re-exec, CLI
+        // conveniences) — not capsule spawns; they run operator-trusted binaries, not
+        // operator-PINNED provider capsules. Classify deliberately before adding here.
+        const HOST_TOOL_FILES: &[&str] = &[
+            "crates/elastos-server/src/agent_cmd.rs",
+            "crates/elastos-server/src/api/access_grant.rs",
+            "crates/elastos-server/src/api/gateway_server.rs",
+            "crates/elastos-server/src/api/media_authority.rs",
+            "crates/elastos-server/src/api/object_authority.rs",
+            "crates/elastos-server/src/api/rights_authority.rs",
+            "crates/elastos-server/src/api/wallet_signer.rs",
+            "crates/elastos-server/src/chat_cmd.rs",
+            "crates/elastos-server/src/home_cmd.rs",
+            "crates/elastos-server/src/publish.rs",
+            "crates/elastos-server/src/runtime_control.rs",
+            "crates/elastos-server/src/server_infra.rs",
+            "crates/elastos-server/src/setup.rs",
+            "crates/elastos-server/src/update.rs",
+        ];
+        // NOTE: access_grant/media/object/rights/wallet_signer BUILD their Command but spawn via
+        // `spawn_grouped` (this module) — they are allowlisted as "known" above because their
+        // spawn goes through the stripping seam; the guard below still requires the seam files
+        // themselves to reference the strip.
+
+        let ws_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root")
+            .to_path_buf();
+
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    rs_files(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        rs_files(&ws_root.join("crates/elastos-server/src"), &mut files);
+        rs_files(&ws_root.join("crates/elastos-runtime/src"), &mut files);
+
+        let mut unknown = Vec::new();
+        for f in &files {
+            let Ok(src) = std::fs::read_to_string(f) else {
+                continue;
+            };
+            if !src.contains("Command::new(") {
+                continue;
+            }
+            let rel = f
+                .strip_prefix(&ws_root)
+                .unwrap_or(f)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let known = CAPSULE_SEAMS
+                .iter()
+                .chain(HOST_TOOL_FILES)
+                .any(|k| rel == *k);
+            if !known {
+                unknown.push(rel.clone());
+            }
+            if CAPSULE_SEAMS.contains(&rel.as_str()) {
+                assert!(
+                    src.contains("RUNTIME_ONLY_SECRETS"),
+                    "capsule spawn seam {rel} no longer references RUNTIME_ONLY_SECRETS — the \
+                     P16 strip was refactored away"
+                );
+            }
+        }
+        assert!(
+            unknown.is_empty(),
+            "NEW process-spawn site(s) not classified as capsule-seam or host-tool — route them \
+             through a stripping seam or consciously allowlist: {unknown:?}"
         );
     }
 }

@@ -1764,7 +1764,13 @@ async fn serve_web_capsule(
         } else {
             std::process::Stdio::piped()
         };
-        match tokio::process::Command::new(&shell_path)
+        let mut shell_cmd = tokio::process::Command::new(&shell_path);
+        // P16 (Sprint 46): the shell is a capsule spawn — strip the runtime-only secrets (rail
+        // bearer, broadcastable signed tx). ONE shared list: `provider::RUNTIME_ONLY_SECRETS`.
+        for secret in elastos_runtime::provider::RUNTIME_ONLY_SECRETS {
+            shell_cmd.env_remove(secret);
+        }
+        match shell_cmd
             .env("ELASTOS_API", &api_url)
             .env("ELASTOS_TOKEN", &shell_session.token)
             .env("ELASTOS_SHELL_MODE", &shell_mode)

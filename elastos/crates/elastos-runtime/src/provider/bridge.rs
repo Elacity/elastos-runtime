@@ -189,7 +189,15 @@ impl ProviderBridge {
     /// Starts the binary, sends Init with the given config, and waits
     /// for the init response.
     pub async fn spawn(binary_path: &Path, config: ProviderConfig) -> Result<Self, BridgeError> {
-        let mut child = Command::new(binary_path)
+        let mut cmd = Command::new(binary_path);
+        // P16 (Sprint 46, council red-team F1): provider capsules inherit the gateway env by
+        // default — strip the runtime-only secrets (rail bearer, broadcastable signed tx) so a
+        // compromised provider binary cannot read them from its own environment. ONE shared list —
+        // see `provider::RUNTIME_ONLY_SECRETS`.
+        for secret in super::RUNTIME_ONLY_SECRETS {
+            cmd.env_remove(secret);
+        }
+        let mut child = cmd
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())

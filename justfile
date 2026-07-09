@@ -79,6 +79,11 @@ _verify-tail:
     cd elastos && cargo fmt --all -- --check
     cd elastos && cargo clippy --workspace --all-targets -- -D warnings
     cd elastos && cargo test --workspace
+    # The dev-modes lane (Sprint 46, council S46 guardian F3): the money-path construction
+    # ratchets (S43 typed BuyError, the S46 prepare-leg deadline, chain-mock buys) are
+    # `#[cfg(feature = "dev-modes")]` — without this lane the gate never compiles them and a
+    # "ratchet" outside the gate cannot ratchet. Shares the workspace build cache; lib-only.
+    cd elastos && cargo test -p elastos-server --lib --features dev-modes
     just verify-capsules
 
 # Build + test the dDRM capsule crates the elastos-workspace gate does not reach. These crates

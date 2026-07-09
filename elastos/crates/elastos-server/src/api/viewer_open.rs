@@ -481,7 +481,20 @@ pub async fn open_owned_in_viewer(
             // secure-view session parity). The live chain gate above already authorized this open.
             _ => {
                 let kid_for_grant = normalize_kid_0x(&object_cid);
-                match super::access_grant::assemble_cached(&subject, &kid_for_grant) {
+                // spawn_blocking (Sprint 46, council guardian F2): `assemble_cached` shells the
+                // SAME grant sidecar as `assemble` — the popup-free re-open path must not hold an
+                // async worker for the (deadline-bounded, ≤~31s) wait either. A panicked task maps
+                // to the same fall-back-to-enrolled-path arm (fail-safe here, not fail-closed —
+                // the live chain gate above already authorized this open).
+                let cached = {
+                    let (subj, kid) = (subject.clone(), kid_for_grant.clone());
+                    tokio::task::spawn_blocking(move || {
+                        super::access_grant::assemble_cached(&subj, &kid)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("assemble_cached task failed: {e}")))
+                };
+                match cached {
                     Ok(Some(grant)) => {
                         // Anchor from the cached delegation's own signature (the one being forwarded).
                         grant_digest = grant

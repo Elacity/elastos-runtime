@@ -78,6 +78,13 @@ impl CarrierServiceBridge {
         for (k, v) in &self.env_vars {
             cmd.env(k, v);
         }
+        // P16 (Sprint 46, council red-team F1): carrier capsules inherit the gateway env — strip
+        // the runtime-only secrets (rail bearer, broadcastable signed tx). AFTER the explicit
+        // env_vars loop, so even a misconfigured explicit pass of a secret is defeated. ONE shared
+        // list — see `elastos_runtime::provider::RUNTIME_ONLY_SECRETS`.
+        for secret in elastos_runtime::provider::RUNTIME_ONLY_SECRETS {
+            cmd.env_remove(secret);
+        }
         let mut child = cmd.spawn().map_err(|e| {
             ProviderError::Provider(format!(
                 "failed to spawn carrier service '{}': {}",

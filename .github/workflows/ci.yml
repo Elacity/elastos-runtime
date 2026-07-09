@@ -63,6 +63,13 @@ jobs:
         run: cargo test --workspace
         # Network-sensitive tests are #[ignore] and won't run.
         # Run them explicitly with: cargo test --workspace -- --ignored
+      - name: cargo test (dev-modes lane)
+        working-directory: elastos
+        # The money-path construction ratchets (S43 typed BuyError, the S46 prepare-leg
+        # deadline, chain-mock buys) are `#[cfg(feature = "dev-modes")]` — without this lane
+        # the gate never compiles them, and a ratchet outside the gate cannot ratchet
+        # (council S46 guardian F3). Lib-only; shares the workspace build cache.
+        run: cargo test -p elastos-server --lib --features dev-modes
 
   build-release:
     name: Build Release (x86_64)
