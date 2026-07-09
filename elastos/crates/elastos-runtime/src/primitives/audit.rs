@@ -495,8 +495,9 @@ struct ChainState {
 }
 
 /// Group-commit durability state for a file-backed log (Sprint 51 — Track C2). MEASURED motivation
-/// (`benches/audit_emit.rs`): one fsync per record costs ~1.1 ms — a ~911 emits/s global ceiling,
-/// ~490× the CPU cost of the emit itself — and every concurrent emitter serialized behind it. The
+/// (`benches/audit_emit.rs`, the S51 decision run): one fsync per record costs ~950 µs — a ~1.1k
+/// emits/s global ceiling, ~430× the CPU cost of the emit itself — and every concurrent emitter
+/// serialized behind it (magnitudes are box-dependent; re-run the bench on the target). The
 /// group commit lets N concurrent emits share ONE fsync: each emitter appends its record (ordered,
 /// under the chain lock), then waits until a flusher's fsync covers its seq. THE CONTRACT IS
 /// UNCHANGED: `emit` returns `Ok` only after ITS record is durable on disk — batching moves the
@@ -511,9 +512,13 @@ struct FlushState {
     /// Set on the FIRST durable-write or fsync failure and never cleared: the log refuses every
     /// subsequent emit (fail-closed). After a failed write/fsync the on-disk suffix is UNKNOWN
     /// (the bytes may or may not land), so "retry the same seq" — the pre-S51 behavior — could
-    /// append a DUPLICATE seq after a half-landed one and corrupt the chain for verifiers. A
-    /// poisoned log is an operator incident: restart re-opens (and re-verifies) from the durable
-    /// prefix.
+    /// append a DUPLICATE seq after a half-landed one and corrupt the chain for verifiers. The
+    /// write-failure arm poisons while STILL HOLDING the chain lock and `emit` re-checks under it
+    /// (council S51 guardian F1 / red-team F2), so an emit queued on the chain lock during the
+    /// failure can never re-derive the failed seq and append behind the fragment. A poisoned log
+    /// is an operator incident: restart re-opens from the durable prefix (a torn
+    /// never-acknowledged tail is quarantined at open — `quarantine_torn_tail`; the verified open
+    /// then re-verifies the whole remaining chain).
     poisoned: Option<String>,
 }
 
@@ -1007,6 +1012,11 @@ impl AuditLog {
             std::fs::create_dir_all(parent)?;
         }
 
+        // Quarantine a torn (provably never-acknowledged) trailing fragment BEFORE resuming, so a
+        // crash mid-writeback re-opens from the intact durable prefix instead of refusing (verified
+        // mode) or appending onto the fragment (plain mode) — see `quarantine_torn_tail`.
+        quarantine_torn_tail(&path)?;
+
         // Resume the chain head from any existing records (append-only continuity across restarts).
         let chain = resume_chain_state(&path);
 
@@ -1030,6 +1040,12 @@ impl AuditLog {
         let signer = load_or_create_signer(&path)?;
 
         let resumed_seq = chain.last_seq;
+        // Seed the anchor high-water from the ON-DISK anchor too (council S51 guardian F5): a log
+        // reopened (unverified) after truncation resumes at a LOWER seq, and seeding from
+        // resumed_seq alone would let the first flush overwrite the anchor DOWNWARD — destroying
+        // the very truncation evidence a later verified open would have caught. Best-effort read
+        // (an unreadable anchor seeds from the resumed head; the verified open still fail-closes).
+        let disk_anchor = read_head_anchor(&path).ok().flatten().unwrap_or(0);
         Ok(Self {
             writer: Some(Mutex::new(writer)),
             log_path: Some(path),
@@ -1039,7 +1055,7 @@ impl AuditLog {
             signer: Some(signer),
             flush: Self::fresh_flush_state(resumed_seq),
             written_seq: AtomicU64::new(resumed_seq),
-            anchored_seq: Mutex::new(resumed_seq),
+            anchored_seq: Mutex::new(resumed_seq.max(disk_anchor)),
             sync_handle,
         })
     }
@@ -1137,12 +1153,13 @@ impl AuditLog {
     /// DURABILITY CONTRACT (unchanged by the S51 group commit): `Ok(())` means THIS record is
     /// durably on disk (written + `fsync`ed). What changed is HOW: concurrent emits append in
     /// chain order, then share fsyncs — one flusher's `sync_all` covers every record appended
-    /// before it, so N concurrent emitters pay ~1 fsync instead of N (measured ~490× per-record
-    /// fsync cost; `benches/audit_emit.rs`). A failed append or fsync POISONS the log: the failing
-    /// emit and every later one return `Err` (after a failed write/fsync the on-disk suffix is
-    /// unknown, so retrying a seq could append a duplicate after a half-landed record and corrupt
-    /// the chain — refusing is the only honest posture; an operator restart re-opens and
-    /// re-verifies from the durable prefix). The inverse direction is inherent to fsync semantics
+    /// before it, so N concurrent emitters pay ~1 fsync instead of N (measured ~430× per-record
+    /// fsync cost, S51 decision run; `benches/audit_emit.rs`). A failed append or fsync POISONS
+    /// the log: the failing emit and every later one return `Err` (after a failed write/fsync the
+    /// on-disk suffix is unknown, so retrying a seq could append a duplicate after a half-landed
+    /// record and corrupt the chain — refusing is the only honest posture; a restart re-verifies
+    /// the durable prefix, quarantining a torn never-acknowledged tail — see
+    /// `quarantine_torn_tail`). The inverse direction is inherent to fsync semantics
     /// and unchanged: an emit that returned `Err` MAY still have landed on disk — callers already
     /// treat `Err` as "act did not happen", and an extra durable record is an over-record, never a
     /// lost one.
@@ -1150,21 +1167,20 @@ impl AuditLog {
         let event_json =
             serde_json::to_string(&event).map_err(|e| AuditError::Serialize(e.to_string()))?;
 
-        // Fail fast on a poisoned log BEFORE assigning a seq — nothing may append after a
-        // durability failure (see the poison note above).
-        if let Some((flush, _)) = &self.flush {
-            let fs = flush.lock().map_err(|_| AuditError::Lock)?;
-            if let Some(why) = &fs.poisoned {
-                return Err(AuditError::Io(format!(
-                    "audit log poisoned by an earlier durability failure (fail-closed; restart \
-                     re-opens from the durable prefix): {why}"
-                )));
-            }
-        }
+        // Fast-path refusal on a poisoned log (an authoritative re-check runs UNDER the chain
+        // lock below — this one just refuses cheap, before serializing the event).
+        self.check_not_poisoned()?;
 
         // APPEND PHASE — the chain lock serializes seq assignment, signing, and the ORDERED append
         // (chain order IS append order), but no longer spans the fsync.
         let mut chain = self.chain.lock().map_err(|_| AuditError::Lock)?;
+        // AUTHORITATIVE poison check, under the chain lock (council S51 guardian F1): a write
+        // failure poisons BEFORE releasing the chain lock (below), so an emit that was queued on
+        // the chain lock while another emit's append failed re-checks HERE and refuses — it can
+        // never re-derive the failed seq and append after half-landed bytes (the duplicate-seq
+        // corruption this closes). Lock order chain→flush is safe: nothing acquires `chain` while
+        // holding the flush lock.
+        self.check_not_poisoned()?;
         let seq = chain.last_seq + 1;
         let prev_hash = chain.prev_hash;
         let record_hash = compute_record_hash(seq, &prev_hash, event_json.as_bytes());
@@ -1203,8 +1219,12 @@ impl AuditLog {
             };
             if let Err(e) = write_res {
                 tracing::error!("AUDIT durable-write failed (seq {seq}): {e}");
-                drop(chain); // release append before taking the flush lock (lock order)
+                // Poison while STILL HOLDING the chain lock (guardian F1): the next emit queued on
+                // the chain lock must see the poison before it can compute this same seq and
+                // append after our half-landed bytes. chain→flush nesting is acyclic (no path
+                // takes `chain` while holding the flush lock).
                 self.poison(format!("durable write failed at seq {seq}: {e}"));
+                drop(chain);
                 return Err(AuditError::Io(e.to_string()));
             }
             // The bytes are in the OS: advance the APPEND head and publish the flusher's cover
@@ -1236,16 +1256,43 @@ impl AuditLog {
         Ok(())
     }
 
+    /// Lock the flush state, RECOVERING from a panic-poisoned mutex (council S51 guardian F3):
+    /// `FlushState` is three plain fields, each written in a single statement, so a panicked
+    /// holder cannot leave it structurally invalid — refusing to recover would instead turn one
+    /// panic into a permanent `AuditError::Lock` for every future custody emit (an unbounded
+    /// outage, worse than fail-closed).
+    fn lock_flush<'a>(flush: &'a Mutex<FlushState>) -> std::sync::MutexGuard<'a, FlushState> {
+        flush
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Refuse if the durable log is poisoned (see [`FlushState::poisoned`]). `Ok` on memory-only
+    /// logs (no durability to fail).
+    fn check_not_poisoned(&self) -> Result<(), AuditError> {
+        if let Some((flush, _)) = &self.flush {
+            let fs = Self::lock_flush(flush);
+            if let Some(why) = &fs.poisoned {
+                return Err(AuditError::Io(format!(
+                    "audit log poisoned by an earlier durability failure (fail-closed; a restart \
+                     re-verifies the durable prefix — a torn tail needs operator attention): {why}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Mark the durable log permanently failed (until restart): every waiter and every future
-    /// emit gets `Err`. Never called on a memory-only log.
+    /// emit gets `Err`. Never called on a memory-only log. Callable while holding the CHAIN lock
+    /// (guardian F1 — the write-failure arm must poison before releasing it): chain→flush nesting
+    /// is acyclic because no path acquires `chain` while holding the flush lock.
     fn poison(&self, why: String) {
         if let Some((flush, wakeup)) = &self.flush {
-            if let Ok(mut fs) = flush.lock() {
-                if fs.poisoned.is_none() {
-                    fs.poisoned = Some(why);
-                }
-                wakeup.notify_all();
+            let mut fs = Self::lock_flush(flush);
+            if fs.poisoned.is_none() {
+                fs.poisoned = Some(why);
             }
+            wakeup.notify_all();
         }
     }
 
@@ -1261,7 +1308,7 @@ impl AuditLog {
             // for otherwise.
             return Ok(());
         };
-        let mut fs = flush.lock().map_err(|_| AuditError::Lock)?;
+        let mut fs = Self::lock_flush(flush);
         loop {
             if let Some(why) = &fs.poisoned {
                 return Err(AuditError::Io(format!(
@@ -1273,13 +1320,42 @@ impl AuditLog {
             }
             if fs.flushing {
                 // An fsync is in flight; it may not cover us (we may have appended after its
-                // cover point was read) — wait for its completion and re-check.
-                fs = wakeup.wait(fs).map_err(|_| AuditError::Lock)?;
+                // cover point was read) — wait for its completion and re-check. Recover a
+                // panic-poisoned wait the same way lock_flush does (see its doc).
+                fs = wakeup
+                    .wait(fs)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 continue;
             }
-            // Become the flusher for everything appended so far.
+            // Become the flusher for everything appended so far. The guard clears `flushing` and
+            // poisons on UNWIND (guardian F3): if anything in the flusher section panicked with
+            // `flushing` stuck true, every later waiter would block forever with nothing left to
+            // notify them — the guard converts that into the ordinary poisoned-log refusal.
             fs.flushing = true;
             drop(fs);
+            struct FlusherGuard<'a> {
+                log: &'a AuditLog,
+                armed: bool,
+            }
+            impl Drop for FlusherGuard<'_> {
+                fn drop(&mut self) {
+                    if self.armed {
+                        if let Some((flush, wakeup)) = &self.log.flush {
+                            let mut fs = AuditLog::lock_flush(flush);
+                            fs.flushing = false;
+                            if fs.poisoned.is_none() {
+                                fs.poisoned =
+                                    Some("flusher panicked mid-flush (fail-closed)".to_string());
+                            }
+                            wakeup.notify_all();
+                        }
+                    }
+                }
+            }
+            let mut guard = FlusherGuard {
+                log: self,
+                armed: true,
+            };
             // Cover point BEFORE the fsync: all seqs ≤ written_seq have their bytes in the OS
             // (Release-stored under the chain lock after the BufWriter flush), so sync_all
             // durably commits every one of them. Our own seq is ≤ cover by construction.
@@ -1296,16 +1372,21 @@ impl AuditLog {
                     None => Err("no writer to fsync (invariant violation)".to_string()),
                 },
             };
+            // Loud logging OUTSIDE the flush lock (a panicking tracing subscriber must not poison
+            // it — guardian F3).
+            if let Err(e) = &sync_res {
+                tracing::error!("AUDIT sync_all failed (covering seq {cover}): {e}");
+            }
             {
-                let mut fs = flush.lock().map_err(|_| AuditError::Lock)?;
+                let mut fs = Self::lock_flush(flush);
                 fs.flushing = false;
+                guard.armed = false; // completed normally — the guard must not poison
                 match &sync_res {
                     Ok(()) => {
                         fs.durable_seq = fs.durable_seq.max(cover);
                         wakeup.notify_all();
                     }
                     Err(e) => {
-                        tracing::error!("AUDIT sync_all failed (covering seq {cover}): {e}");
                         fs.poisoned = Some(format!("fsync failed covering seq {cover}: {e}"));
                         wakeup.notify_all();
                         return Err(AuditError::Io(format!(
@@ -1315,11 +1396,11 @@ impl AuditLog {
                     }
                 }
             }
-            // Tail-truncation anchor for the DURABLE cover — OFF the flush lock (its own temp +
-            // fsync + rename must never hold up the waiters just woken above; the first S51 cut
-            // anchored under the flush lock and serialized a SECOND fsync into every group-commit
-            // cycle). Guarded-monotone via its own mutex (an overlapping later flusher cannot
-            // regress it); best-effort — a lagging anchor under-claims, never lies.
+            // Tail-truncation anchor for the DURABLE cover — OFF the flush lock (it must never
+            // hold up the waiters just woken above; the first S51 cut anchored under the flush
+            // lock and serialized every group-commit cycle behind it). Guarded-monotone via its
+            // own mutex (an overlapping later flusher cannot regress it); best-effort — a lagging
+            // anchor under-claims, never lies.
             if let Some(path) = &self.log_path {
                 if let Ok(mut anchored) = self.anchored_seq.lock() {
                     if cover > *anchored {
@@ -2161,19 +2242,39 @@ fn load_or_create_signer(log_path: &Path) -> std::io::Result<SigningKey> {
 fn write_head_anchor(log_path: &Path, committed_seq: u64) -> std::io::Result<()> {
     let anchor_path = sibling(log_path, "head-anchor");
     let tmp_path = sibling(log_path, "head-anchor.tmp");
+    // DELIBERATELY NOT fsynced (measured, S51 council fold): a single-threaded emitter is its own
+    // flusher, so an anchor fsync would DOUBLE its per-record durable cost (~950 µs → ~1.7 ms
+    // measured on the S51 box — the first fold cut did exactly that and the bench rejected it).
+    // Crash safety without it (guardian F4's brick scenario): the payload is a ≤20-byte decimal in
+    // ONE sector, so a crash leaves the renamed anchor either COMPLETE or (on filesystems with no
+    // rename-data-ordering heuristic) EMPTY — never partial garbage — and `read_head_anchor`
+    // treats EMPTY as absent: the floor is skipped for that one open, loudly, and the next flush
+    // rewrites it. A stale-but-complete older anchor is the ordinary best-effort lag (never lies
+    // high — see the caller's ordering).
     std::fs::write(&tmp_path, committed_seq.to_string())?;
     std::fs::rename(&tmp_path, &anchor_path)
 }
 
 /// Read the committed chain-head sequence from `<log>.head-anchor`.
 ///
-/// - `Ok(None)` — no anchor (a pre-anchor log or a brand-new file); the truncation check is skipped.
+/// - `Ok(None)` — no anchor (a pre-anchor log or a brand-new file), OR an EMPTY anchor file (the
+///   pre-S51 non-fsynced writer could land one across a crash — defense in depth, warned loudly;
+///   treating it as absent only SKIPS the truncation check, never invents a floor). The check is
+///   skipped.
 /// - `Ok(Some(seq))` — a well-formed anchor (the LOWER bound on how many records must be present).
-/// - `Err` — the anchor exists but is unparseable; fail-CLOSED, since the atomic rename rules out a
-///   torn write, so a corrupt anchor in durable mode is genuinely suspicious.
+/// - `Err` — the anchor has non-empty garbage; fail-CLOSED: the single-sector atomic write means a
+///   crash yields a complete or EMPTY anchor (handled above), never partial garbage — so non-empty
+///   garbage in durable mode is genuinely suspicious.
 fn read_head_anchor(log_path: &Path) -> std::io::Result<Option<u64>> {
     let anchor_path = sibling(log_path, "head-anchor");
     match std::fs::read_to_string(&anchor_path) {
+        Ok(s) if s.trim().is_empty() => {
+            tracing::warn!(
+                "audit head-anchor at {anchor_path:?} is EMPTY (a pre-S51 crash artifact) — \
+                 treating as absent; the tail-truncation floor is unavailable for this open"
+            );
+            Ok(None)
+        }
         Ok(s) => s.trim().parse::<u64>().map(Some).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -2183,6 +2284,65 @@ fn read_head_anchor(log_path: &Path) -> std::io::Result<Option<u64>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// Recover a TORN TAIL at open (council S51 guardian F2 / red-team F1): if the log does not end
+/// with `\n`, its trailing partial line is quarantined to `<log>.torn-tail` and the log truncated
+/// back to the last newline, so both open modes resume from an intact prefix instead of (verified)
+/// refusing a healthy log or (plain) appending onto the fragment and merging two records into one
+/// garbage line.
+///
+/// WHY THIS IS SAFE, precisely:
+/// - A record is acknowledged (`emit` → `Ok`) only after a successful fsync of its FULL
+///   `line\n` write — so a file whose last bytes lack the terminating `\n` PROVES the fragment
+///   was never acknowledged (a crash tore it mid-writeback, or its write failed and poisoned the
+///   log). Removing it can never remove an acknowledged custody record.
+/// - It grants a tamperer nothing: beyond the head-anchor floor, a clean cut at a line boundary
+///   is already undetectable (the anchor is the only lower bound), so laundering a cut as a
+///   "torn tail" adds no power; at or below the floor, the anchor check still refuses.
+/// - The fragment is PRESERVED (appended to the sidecar with a marker line), not destroyed —
+///   append-only in spirit: nothing acknowledged is ever dropped, and even the torn bytes remain
+///   inspectable.
+///
+/// A torn/corrupt line in the MIDDLE of the file (terminated by `\n`) is NOT recovered — that is
+/// indistinguishable from tamper and stays fail-closed at the verified open.
+fn quarantine_torn_tail(path: &Path) -> std::io::Result<()> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if bytes.is_empty() || bytes.ends_with(b"\n") {
+        return Ok(());
+    }
+    let keep = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    let fragment = &bytes[keep..];
+    let sidecar = sibling(path, "torn-tail");
+    {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&sidecar)?;
+        writeln!(
+            f,
+            "--- torn tail quarantined ({} bytes) ---",
+            fragment.len()
+        )?;
+        f.write_all(fragment)?;
+        writeln!(f)?;
+        f.sync_all()?;
+    }
+    // Truncate AFTER the fragment is durably in the sidecar — a crash between the two leaves the
+    // fragment in both places (harmless duplicate), never in neither.
+    let f = OpenOptions::new().write(true).open(path)?;
+    f.set_len(keep as u64)?;
+    f.sync_all()?;
+    tracing::warn!(
+        "audit log at {path:?} had a torn (never-acknowledged) trailing fragment of {} bytes — \
+         quarantined to {sidecar:?} and resumed from the intact prefix",
+        fragment.len()
+    );
+    Ok(())
 }
 
 /// Build a sibling path `<log>.<suffix>` next to the audit log.
@@ -3102,6 +3262,99 @@ mod tests {
         // And the log re-opens fail-closed-verified — the on-disk artifact is coherent.
         drop(log);
         drop(AuditLog::with_file_verified(&path).unwrap());
+    }
+
+    /// TORN-TAIL RECOVERY RATCHET (S51 council fold — guardian F2 / red-team F1): a crash can tear
+    /// the final (never-acknowledged — its fsync never completed, so its emit never returned Ok)
+    /// line mid-writeback. The open must QUARANTINE that fragment and resume from the intact
+    /// durable prefix — never refuse the healthy log (verified mode) and never append onto the
+    /// fragment merging two records into garbage (plain mode). A corrupt line in the MIDDLE stays
+    /// fail-closed (tamper — covered by `with_file_verified_resumes_clean_log_and_rejects_tamper`).
+    #[test]
+    fn a_torn_tail_is_quarantined_and_the_log_resumes_from_the_durable_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        {
+            let log = AuditLog::with_file(&path).unwrap();
+            log.emit(AuditEvent::RuntimeStart {
+                timestamp: SecureTimestamp::now(),
+                version: "a".to_string(),
+            })
+            .unwrap();
+            log.emit(AuditEvent::RuntimeStart {
+                timestamp: SecureTimestamp::now(),
+                version: "b".to_string(),
+            })
+            .unwrap();
+        }
+        // Simulate the crash-torn tail: half a record, NO terminating newline.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(br#"{"seq":3,"prev_hash":"dead"#).unwrap();
+        }
+        // The VERIFIED open (the production custody boot path) recovers instead of bricking...
+        let log = AuditLog::with_file_verified(&path).expect(
+            "a torn never-acknowledged tail must be quarantined, not refuse the healthy log",
+        );
+        // ...the fragment is preserved in the sidecar...
+        let sidecar = std::fs::read_to_string(super::sibling(&path, "torn-tail")).unwrap();
+        assert!(
+            sidecar.contains(r#"{"seq":3,"prev_hash":"dead"#),
+            "the torn bytes are quarantined, not destroyed: {sidecar}"
+        );
+        // ...and the log RESUMES: the next emit is seq 3 and the whole chain verifies.
+        log.emit(AuditEvent::RuntimeStart {
+            timestamp: SecureTimestamp::now(),
+            version: "c".to_string(),
+        })
+        .unwrap();
+        let vk = log.signer.as_ref().map(|s| s.verifying_key());
+        assert_eq!(
+            log.verify_chain(vk.as_ref()).expect("chain verifies clean"),
+            3,
+            "resumed exactly at the durable prefix; no gap, no duplicate"
+        );
+    }
+
+    /// POISON-BEFORE-APPEND RATCHET (S51 council fold — guardian F1 / red-team F2): the
+    /// authoritative poison check runs UNDER the chain lock, so a poisoned log refuses an emit
+    /// BEFORE assigning a seq or writing a byte — an emit racing a failing one can never re-derive
+    /// the failed seq and append behind its half-landed bytes.
+    #[test]
+    fn a_poisoned_log_refuses_before_assigning_a_seq_or_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let log = AuditLog::with_file(&path).unwrap();
+        log.emit(AuditEvent::RuntimeStart {
+            timestamp: SecureTimestamp::now(),
+            version: "a".to_string(),
+        })
+        .unwrap();
+        let bytes_before = std::fs::metadata(&path).unwrap().len();
+
+        log.poison("injected durability failure (test)".to_string());
+        let res = log.emit(AuditEvent::RuntimeStart {
+            timestamp: SecureTimestamp::now(),
+            version: "b".to_string(),
+        });
+        assert!(
+            matches!(&res, Err(e) if e.to_string().contains("poisoned")),
+            "a poisoned log refuses: {res:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            bytes_before,
+            "the refused emit wrote NOTHING — no seq derived, no bytes appended"
+        );
+        assert_eq!(
+            log.chain.lock().unwrap().last_seq,
+            1,
+            "the chain head is untouched by the refused emit"
+        );
     }
 
     /// POISON RATCHET (S51): after a failed durable write the log refuses EVERY subsequent emit
