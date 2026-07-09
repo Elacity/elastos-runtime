@@ -241,6 +241,34 @@ mod tests {
         (dir, path, signer)
     }
 
+    // Emit a signed grant + a pay-USE carrying a DRM settlement `rail_ref` in the signed
+    // `CapabilityUse` — matching the reconciler's confirm-time binding shape (`Action::Execute` on
+    // the `elastos://runtime/pay/<payee>` resource; drm_marketplace.rs). Export the per-capability
+    // receipt to a JSON file as an operator would; return (dir, receipt_path, signer_hex, rail_ref).
+    fn write_drm_settlement_receipt() -> (tempfile::TempDir, PathBuf, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let log = AuditLog::with_file(dir.path().join("audit.log")).unwrap();
+        let token = TokenId::new();
+        let vendor = ResourceId::new("elastos://runtime/pay/drm-vendor");
+        let rail_ref = "drm:tx=0xC0FFEE;op=0xopER;tid=42;price=1000;tok=usdc".to_string();
+        log.capability_grant(&token, "vm-shopper", &vendor, Action::Execute, None);
+        log.capability_use_with_rail_ref(
+            &token,
+            "vm-shopper",
+            &vendor,
+            Action::Execute,
+            true,
+            Some(rail_ref.clone()),
+        );
+        let signer = log.verifying_key_hex().unwrap();
+        let receipt = log
+            .export_mandate_receipt_for_capability(&token.to_string())
+            .expect("receipt");
+        let path = dir.path().join("drm_receipt.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&receipt).unwrap()).unwrap();
+        (dir, path, signer, rail_ref)
+    }
+
     fn did_key_for(hex_key: &str) -> String {
         let bytes: [u8; 32] = hex::decode(hex_key).unwrap().try_into().unwrap();
         let pk = iroh::PublicKey::from_bytes(&bytes).unwrap();
@@ -311,6 +339,60 @@ mod tests {
         assert!(resolve_expected_signer(Some("   ")).is_err());
         let hex_key = "3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29";
         assert_eq!(resolve_expected_signer(Some(hex_key)).unwrap(), Some(hex_key.to_string()));
+    }
+
+    /// Sprint 45 (the live-money last mile, gate-runnable half): a receipt carrying a DRM
+    /// settlement `rail_ref` in its signed `CapabilityUse` — the shape the reconciler binds on
+    /// confirmation — is a real ADMISSIBLE artifact through the standalone CLI evaluator: written to
+    /// disk as JSON, read back, and verified to AUTHENTIC (exit 0) with the true signer pinned, with
+    /// the `drm:tx=` reference surviving the round-trip into the verified receipt. This exercises the
+    /// `evaluate` + `exit_code` path an auditor runs, not just the in-memory `verify_mandate_receipt`.
+    #[test]
+    fn a_drm_settlement_receipt_verifies_authentic_through_the_cli() {
+        let (_dir, path, signer, rail_ref) = write_drm_settlement_receipt();
+        let (receipt, verdict) = evaluate(&path, Some(&signer)).unwrap();
+        assert!(
+            verdict.authenticated,
+            "the money-path receipt authenticates via the CLI evaluator: {verdict:?}"
+        );
+        assert_eq!(exit_code(&verdict), 0, "AUTHENTIC ⇒ exit 0");
+        let carried = receipt.records.iter().find_map(|r| match &r.event {
+            elastos_runtime::primitives::audit::AuditEvent::CapabilityUse {
+                rail_ref: rr,
+                success: true,
+                ..
+            } => rr.clone(),
+            _ => None,
+        });
+        assert_eq!(
+            carried.as_deref(),
+            Some(rail_ref.as_str()),
+            "the on-chain settlement reference survives the JSON round-trip into the verified receipt"
+        );
+    }
+
+    /// Sprint 45: editing the signed settlement reference (an adversary in transit repoints the
+    /// buy at a different on-chain tx) is caught — the hash/signature no longer recompute, so the
+    /// CLI evaluator returns INVALID (exit 1), never a trusted verdict. A money receipt is
+    /// tamper-evident end to end.
+    #[test]
+    fn a_tampered_drm_rail_ref_is_invalid_through_the_cli() {
+        let (dir, path, signer, _rail_ref) = write_drm_settlement_receipt();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let tampered = raw.replace("0xC0FFEE", "0xDEADBEEF");
+        assert_ne!(raw, tampered, "the tamper actually changed the settlement tx bytes");
+        let tpath = dir.path().join("tampered.json");
+        std::fs::write(&tpath, tampered).unwrap();
+        let (_receipt, verdict) = evaluate(&tpath, Some(&signer)).unwrap();
+        assert!(
+            !verdict.hashes_ok,
+            "editing the signed rail_ref must break the RECORD HASH recompute (not merely set-binding)"
+        );
+        assert!(
+            !verdict.structurally_valid,
+            "a broken hash ⇒ structurally invalid"
+        );
+        assert_eq!(exit_code(&verdict), 1, "a tampered money receipt is INVALID, never trusted");
     }
 
     #[test]

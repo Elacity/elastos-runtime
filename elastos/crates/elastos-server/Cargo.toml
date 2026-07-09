@@ -120,3 +120,12 @@ default = []
 # startup guard refuses to boot in a dev rights mode. Dev/CI build the gateway with
 # `--features dev-modes` to use Dev/ChainMock rights + the local quorum.
 dev-modes = []
+# live-chain: compile the OPERATOR/CI live testnet-buy integration test
+# (`tests/live_drm_buy.rs`), which drives the REAL `ChainDrmMarketplace` against env-configured
+# endpoints per docs/LIVE_BUY_RUNBOOK.md. OFF by default and NEVER in the default gate — it needs
+# a funded wallet, a live RPC, and a deployed listing, none of which a CI sandbox has. The test is
+# additionally `#[ignore]`d, so even `--features live-chain` runs it only when named explicitly:
+# `cargo test -p elastos-server --features live-chain --test live_drm_buy -- --ignored`.
+# SAFETY: this pulls in `dev-modes` (managed self-signing) — NEVER reuse a `--features live-chain`
+# build as a release artifact; build release with default features only.
+live-chain = ["dev-modes"]

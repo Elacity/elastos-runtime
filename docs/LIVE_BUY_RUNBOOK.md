@@ -65,10 +65,32 @@ the last mile the gate cannot run for you: a real dollar (of testnet value) movi
   `BuyError::Indeterminate` ⇒ **hold** the reservation; reconciliation resolves it from the chain.
   A hostile provider's error text can NOT flip this — the variant is the code path, not the string.
 
-## 4. Wiring it into CI later (the network gate)
+## 4. The live-buy integration test (network-gated)
 
-When a funded testnet + secret store is available in CI, gate a real-buy integration test behind a
-`live-chain` cargo feature (or a `#[ignore]` run invoked explicitly) that reads the env above from CI
-secrets and asserts: quote ≤ cap, a Pending record tagged `Drm` appears, the scheduler promotes it
-after the depth floor, and the exported receipt verifies. Keep it OUT of the default gate — a test
-that spends real value or needs a network must never run on every push.
+The real-buy test is `crates/elastos-server/tests/live_drm_buy.rs`, compiled ONLY under the
+`live-chain` cargo feature and additionally `#[ignore]`d — so it is never built, let alone run, by
+the default gate (which has no funded wallet or live RPC). It drives the real `ChainDrmMarketplace`
+(resolve → on-chain price gate → sign → broadcast) via `DrmMarketplaceProvider::pay`, then polls
+`ChainDrmMarketplace::confirm` until the depth floor is met — asserting the buy is HELD
+(`Indeterminate` with a real `drm:tx=<hash>`, never charged at broadcast) and then confirms on-chain.
+
+Run it deliberately, with the §1 environment plus three test-only vars
+(`ELASTOS_LIVE_BUY_ASSET`, `ELASTOS_LIVE_BUY_CAP`, `ELASTOS_LIVE_BUY_PRINCIPAL`):
+
+```sh
+cargo test -p elastos-server --features live-chain --test live_drm_buy -- --ignored --nocapture
+```
+
+> **This has not yet been run against a live testnet in this repo.** The first operator to run it
+> should record the resulting tx hash here. **A re-run re-spends:** this standalone test bypasses the
+> runtime's ledger dedup and `ChainDrmMarketplace::settle` ignores the idempotency key, so re-running
+> after a broadcast issues a SECOND real buy — resolve the prior tx on-chain first. (The
+> gateway-driven flow in §2 does NOT have this hazard: its `begin_attempt` custody + `flint-<sig>`
+> idempotency refuse a re-charge.)
+
+The GATE-runnable half — that the receipt a confirmed buy produces is an admissible artifact through
+the standalone `verify-receipt` CLI (AUTHENTIC with the pinned signer; INVALID if the settlement
+reference is edited) — runs on every push:
+`verify_receipt_cmd::{a_drm_settlement_receipt_verifies_authentic_through_the_cli,
+a_tampered_drm_rail_ref_is_invalid_through_the_cli}`. Keep the live test OUT of the default gate — a
+test that spends real value or needs a network must never run on every push.

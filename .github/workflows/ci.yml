@@ -43,6 +43,11 @@ jobs:
       - name: cargo check
         working-directory: elastos
         run: cargo check --workspace
+      # Type-check the network-gated live-buy test so a rename can't silently rot the operator's
+      # only live tool (it stays #[ignore]d + feature-off in the gate; this never runs it). S45 F3.
+      - name: cargo check (live-chain test)
+        working-directory: elastos
+        run: cargo check -p elastos-server --features live-chain --tests
 
   test:
     name: Test
