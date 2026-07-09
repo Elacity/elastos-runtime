@@ -27,7 +27,8 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, RwLock};
 
 use super::time::SecureTimestamp;
 use crate::capability::token::{Action, ResourceId, TokenId};
@@ -484,10 +485,36 @@ impl std::error::Error for AuditError {}
 
 /// Mutable hash-chain head, guarded by a `Mutex` so `emit(&self, ..)` stays `&self`.
 struct ChainState {
-    /// `seq` of the last DURABLY-committed record (0 = none yet; next record is `last_seq + 1`).
+    /// `seq` of the last APPENDED record (0 = none yet; next record is `last_seq + 1`). On a
+    /// file-backed log this advances once the record's bytes are flushed to the OS (append order
+    /// is the chain order); DURABILITY is tracked separately by [`FlushState::durable_seq`] — an
+    /// `emit` does not return `Ok` until its seq is durable (group commit, S51).
     last_seq: u64,
-    /// `record_hash` of the last committed record (genesis = zeros). The next record's `prev_hash`.
+    /// `record_hash` of the last appended record (genesis = zeros). The next record's `prev_hash`.
     prev_hash: [u8; 32],
+}
+
+/// Group-commit durability state for a file-backed log (Sprint 51 — Track C2). MEASURED motivation
+/// (`benches/audit_emit.rs`): one fsync per record costs ~1.1 ms — a ~911 emits/s global ceiling,
+/// ~490× the CPU cost of the emit itself — and every concurrent emitter serialized behind it. The
+/// group commit lets N concurrent emits share ONE fsync: each emitter appends its record (ordered,
+/// under the chain lock), then waits until a flusher's fsync covers its seq. THE CONTRACT IS
+/// UNCHANGED: `emit` returns `Ok` only after ITS record is durable on disk — batching moves the
+/// fsync, never the promise. Single-threaded emits still pay one fsync each (nothing to coalesce);
+/// the ceiling lifts with CONCURRENCY, which is exactly the regime the server's per-request
+/// custody emits are in.
+struct FlushState {
+    /// Highest seq durably on disk (covered by a completed fsync).
+    durable_seq: u64,
+    /// A flusher's fsync is currently in flight (exactly one at a time).
+    flushing: bool,
+    /// Set on the FIRST durable-write or fsync failure and never cleared: the log refuses every
+    /// subsequent emit (fail-closed). After a failed write/fsync the on-disk suffix is UNKNOWN
+    /// (the bytes may or may not land), so "retry the same seq" — the pre-S51 behavior — could
+    /// append a DUPLICATE seq after a half-landed one and corrupt the chain for verifiers. A
+    /// poisoned log is an operator incident: restart re-opens (and re-verifies) from the durable
+    /// prefix.
+    poisoned: Option<String>,
 }
 
 /// Audit event types.
@@ -902,11 +929,32 @@ pub struct AuditLog {
     echo_stdout: bool,
     /// In-memory buffer of recent events (ring buffer)
     memory_buffer: RwLock<VecDeque<AuditEvent>>,
-    /// Hash-chain head (seq + prev_hash), advanced only on a DURABLY-committed record.
+    /// Hash-chain head (seq + prev_hash) — see [`ChainState`] for the append-vs-durable split.
     chain: Mutex<ChainState>,
     /// ed25519 signer for the chain. `None` ⇒ records carry `alg = "none"` (chain only, no
     /// non-repudiation). A persisted, dedicated key (NOT a fresh in-memory one) when file-backed.
     signer: Option<SigningKey>,
+    /// Group-commit durability tracker (S51), file-backed logs only. LOCK ORDER: `chain` → `writer`
+    /// during append; `flush.0` alone, then `writer` alone, during a flush — the flusher NEVER
+    /// holds `chain`, so appends and fsyncs overlap only at the writer mutex.
+    flush: Option<(Mutex<FlushState>, Condvar)>,
+    /// Highest seq whose bytes are flushed to the OS (BufWriter flush complete). Written under the
+    /// chain lock; read by the flusher (without `chain`) to know what seq its fsync will cover.
+    written_seq: AtomicU64,
+    /// Highest seq the tail-truncation head anchor has recorded. Its own mutex (never nested with
+    /// the others) so the anchor write runs OFF the flush critical path and can never hold up the
+    /// waiters a flush just released. Guarded-monotonic: a flusher anchors only a cover above the
+    /// recorded high, so late/overlapping flushers can never regress the anchor.
+    anchored_seq: Mutex<u64>,
+    /// A CLONED fd of the log file, used ONLY for `sync_all` (never written). MEASURED necessity
+    /// (the second S51 cut): fsyncing through the writer mutex convoyed every concurrent appender
+    /// behind the ~1 ms fsync (an appender holds `chain` while waiting on `writer`), collapsing
+    /// group-commit batches to ~1 record — SLOWER than the serial baseline. `fsync` commits the
+    /// INODE, not the fd, so syncing this clone durably commits every byte the appenders already
+    /// flushed to the OS, while they keep appending through the writer. `None` only if the clone
+    /// failed at open (then the flusher falls back to fsync-under-the-writer-mutex: correct,
+    /// convoy-slow).
+    sync_handle: Option<File>,
 }
 
 impl AuditLog {
@@ -923,7 +971,24 @@ impl AuditLog {
                 prev_hash: genesis_prev_hash(),
             }),
             signer: None,
+            flush: None,
+            written_seq: AtomicU64::new(0),
+            anchored_seq: Mutex::new(0),
+            sync_handle: None,
         }
+    }
+
+    /// Fresh group-commit state for a file-backed log resuming at `resumed_seq` (everything already
+    /// on disk is durable by definition — it was read back).
+    fn fresh_flush_state(resumed_seq: u64) -> Option<(Mutex<FlushState>, Condvar)> {
+        Some((
+            Mutex::new(FlushState {
+                durable_seq: resumed_seq,
+                flushing: false,
+                poisoned: None,
+            }),
+            Condvar::new(),
+        ))
     }
 
     /// Create an audit log that writes to the given path, hash-chained and ed25519-signed.
@@ -948,11 +1013,23 @@ impl AuditLog {
         // Open APPEND-ONLY: never truncate or seek; the chain is the integrity, the OS append is the
         // ordering. (`append(true)` forces every write to EOF even under concurrent writers.)
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        // The fsync-only clone (see `sync_handle`) — taken before the fd moves into the BufWriter.
+        let sync_handle = match file.try_clone() {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::warn!(
+                    "audit log fd clone failed ({e}) — group-commit falls back to fsync under \
+                     the writer lock (correct, slower under concurrency)"
+                );
+                None
+            }
+        };
         let writer = BufWriter::new(file);
 
         // Load-or-create the dedicated, persisted signing key alongside the log.
         let signer = load_or_create_signer(&path)?;
 
+        let resumed_seq = chain.last_seq;
         Ok(Self {
             writer: Some(Mutex::new(writer)),
             log_path: Some(path),
@@ -960,6 +1037,10 @@ impl AuditLog {
             memory_buffer: RwLock::new(VecDeque::with_capacity(MAX_MEMORY_EVENTS)),
             chain: Mutex::new(chain),
             signer: Some(signer),
+            flush: Self::fresh_flush_state(resumed_seq),
+            written_seq: AtomicU64::new(resumed_seq),
+            anchored_seq: Mutex::new(resumed_seq),
+            sync_handle,
         })
     }
 
@@ -1018,6 +1099,7 @@ impl AuditLog {
     /// (e.g. the spend-budget attest-failure rollback, council S28 F2) can
     /// inject the same failure; production wiring uses `with_file*` only.
     pub fn with_file_handle(file: File) -> Self {
+        let sync_handle = file.try_clone().ok();
         Self {
             writer: Some(Mutex::new(BufWriter::new(file))),
             log_path: None,
@@ -1028,6 +1110,10 @@ impl AuditLog {
                 prev_hash: genesis_prev_hash(),
             }),
             signer: None,
+            flush: Self::fresh_flush_state(0),
+            written_seq: AtomicU64::new(0),
+            anchored_seq: Mutex::new(0),
+            sync_handle,
         }
     }
 
@@ -1046,14 +1132,38 @@ impl AuditLog {
     /// FAIL-LOUD + FAIL-CLOSED: on a serialization or durable-write failure this returns `Err` AND
     /// logs at `error!`. A custody-relevant caller MUST propagate the `Err` and fail its operation
     /// closed (the open/grant did not make it into the custody trail). Best-effort callers may
-    /// ignore the result; the loud log still fires. The hash-chain head only advances on a record
-    /// that was durably written + `fsync`ed, so a failed write does not corrupt the chain.
+    /// ignore the result; the loud log still fires.
+    ///
+    /// DURABILITY CONTRACT (unchanged by the S51 group commit): `Ok(())` means THIS record is
+    /// durably on disk (written + `fsync`ed). What changed is HOW: concurrent emits append in
+    /// chain order, then share fsyncs — one flusher's `sync_all` covers every record appended
+    /// before it, so N concurrent emitters pay ~1 fsync instead of N (measured ~490× per-record
+    /// fsync cost; `benches/audit_emit.rs`). A failed append or fsync POISONS the log: the failing
+    /// emit and every later one return `Err` (after a failed write/fsync the on-disk suffix is
+    /// unknown, so retrying a seq could append a duplicate after a half-landed record and corrupt
+    /// the chain — refusing is the only honest posture; an operator restart re-opens and
+    /// re-verifies from the durable prefix). The inverse direction is inherent to fsync semantics
+    /// and unchanged: an emit that returned `Err` MAY still have landed on disk — callers already
+    /// treat `Err` as "act did not happen", and an extra durable record is an over-record, never a
+    /// lost one.
     pub fn emit(&self, event: AuditEvent) -> Result<(), AuditError> {
         let event_json =
             serde_json::to_string(&event).map_err(|e| AuditError::Serialize(e.to_string()))?;
 
-        // Take the chain lock for the whole compute→write→advance critical section so `seq`/
-        // `prev_hash` cannot interleave across threads.
+        // Fail fast on a poisoned log BEFORE assigning a seq — nothing may append after a
+        // durability failure (see the poison note above).
+        if let Some((flush, _)) = &self.flush {
+            let fs = flush.lock().map_err(|_| AuditError::Lock)?;
+            if let Some(why) = &fs.poisoned {
+                return Err(AuditError::Io(format!(
+                    "audit log poisoned by an earlier durability failure (fail-closed; restart \
+                     re-opens from the durable prefix): {why}"
+                )));
+            }
+        }
+
+        // APPEND PHASE — the chain lock serializes seq assignment, signing, and the ORDERED append
+        // (chain order IS append order), but no longer spans the fsync.
         let mut chain = self.chain.lock().map_err(|_| AuditError::Lock)?;
         let seq = chain.last_seq + 1;
         let prev_hash = chain.prev_hash;
@@ -1085,40 +1195,38 @@ impl AuditLog {
             println!("[AUDIT] {}", line);
         }
 
-        // Durably commit BEFORE advancing the chain head. A failed write leaves `seq`/`prev_hash`
-        // untouched, so the next emit retries the same seq — no gap, no silent loss.
         if let Some(writer) = &self.writer {
-            let mut w = writer.lock().map_err(|_| AuditError::Lock)?;
-            writeln!(w, "{}", line).map_err(|e| {
+            // Append + flush THIS record's bytes to the OS, still under the chain lock (order).
+            let write_res = {
+                let mut w = writer.lock().map_err(|_| AuditError::Lock)?;
+                writeln!(w, "{}", line).and_then(|_| w.flush())
+            };
+            if let Err(e) = write_res {
                 tracing::error!("AUDIT durable-write failed (seq {seq}): {e}");
-                AuditError::Io(e.to_string())
-            })?;
-            w.flush().map_err(|e| {
-                tracing::error!("AUDIT flush failed (seq {seq}): {e}");
-                AuditError::Io(e.to_string())
-            })?;
-            // fsync: the record must survive a crash/power loss to be a custody record at all.
-            w.get_ref().sync_all().map_err(|e| {
-                tracing::error!("AUDIT sync_all failed (seq {seq}): {e}");
-                AuditError::Io(e.to_string())
-            })?;
-        }
-
-        // Committed: advance the chain head.
-        chain.last_seq = seq;
-        chain.prev_hash = record_hash;
-
-        // Persist the committed head seq for tail-truncation detection (file-backed only). Done under
-        // the chain lock so the anchor advances monotonically with the head; best-effort — the record
-        // is already durable and the log was written first, so a failed/lagging anchor never lies.
-        if let Some(path) = &self.log_path {
-            if let Err(e) = write_head_anchor(path, seq) {
-                tracing::error!("AUDIT head-anchor write failed (seq {seq}): {e}");
+                drop(chain); // release append before taking the flush lock (lock order)
+                self.poison(format!("durable write failed at seq {seq}: {e}"));
+                return Err(AuditError::Io(e.to_string()));
             }
-        }
-        drop(chain);
+            // The bytes are in the OS: advance the APPEND head and publish the flusher's cover
+            // point. Durability is NOT yet promised — that is wait_durable's job.
+            chain.last_seq = seq;
+            chain.prev_hash = record_hash;
+            self.written_seq.store(seq, Ordering::Release);
+            drop(chain);
 
-        // Store in the in-memory ring buffer (best-effort; the durable record is the source of truth).
+            // GROUP-COMMIT PHASE — block until an fsync (ours or a concurrent emitter's) covers
+            // this seq. Only after this is the record a custody record.
+            self.wait_durable(seq)?;
+        } else {
+            // Memory-only: nothing durable to wait for.
+            chain.last_seq = seq;
+            chain.prev_hash = record_hash;
+            drop(chain);
+        }
+
+        // Store in the in-memory ring buffer (best-effort; the durable record is the source of
+        // truth). Under concurrency the ring's arrival order may differ slightly from seq order —
+        // it is an observability projection, never the chain.
         if let Ok(mut buffer) = self.memory_buffer.write() {
             if buffer.len() >= MAX_MEMORY_EVENTS {
                 buffer.pop_front();
@@ -1126,6 +1234,107 @@ impl AuditLog {
             buffer.push_back(event);
         }
         Ok(())
+    }
+
+    /// Mark the durable log permanently failed (until restart): every waiter and every future
+    /// emit gets `Err`. Never called on a memory-only log.
+    fn poison(&self, why: String) {
+        if let Some((flush, wakeup)) = &self.flush {
+            if let Ok(mut fs) = flush.lock() {
+                if fs.poisoned.is_none() {
+                    fs.poisoned = Some(why);
+                }
+                wakeup.notify_all();
+            }
+        }
+    }
+
+    /// Block until `seq` is durably on disk (group commit, S51): serve from a completed fsync,
+    /// wait out one in flight, or become the flusher. The flusher reads the cover point
+    /// (`written_seq` — every record whose bytes reached the OS), fsyncs WITHOUT holding the chain
+    /// lock (appends continue meanwhile), then publishes `durable_seq = cover` and wakes everyone;
+    /// the head anchor advances to `cover` (durable seqs only — the anchor must never over-claim).
+    /// An fsync failure poisons the log (see [`FlushState::poisoned`]).
+    fn wait_durable(&self, seq: u64) -> Result<(), AuditError> {
+        let Some((flush, wakeup)) = &self.flush else {
+            // Unreachable for file-backed logs (constructors pair writer+flush); nothing to wait
+            // for otherwise.
+            return Ok(());
+        };
+        let mut fs = flush.lock().map_err(|_| AuditError::Lock)?;
+        loop {
+            if let Some(why) = &fs.poisoned {
+                return Err(AuditError::Io(format!(
+                    "audit record durability unknown — log poisoned (fail-closed): {why}"
+                )));
+            }
+            if fs.durable_seq >= seq {
+                return Ok(());
+            }
+            if fs.flushing {
+                // An fsync is in flight; it may not cover us (we may have appended after its
+                // cover point was read) — wait for its completion and re-check.
+                fs = wakeup.wait(fs).map_err(|_| AuditError::Lock)?;
+                continue;
+            }
+            // Become the flusher for everything appended so far.
+            fs.flushing = true;
+            drop(fs);
+            // Cover point BEFORE the fsync: all seqs ≤ written_seq have their bytes in the OS
+            // (Release-stored under the chain lock after the BufWriter flush), so sync_all
+            // durably commits every one of them. Our own seq is ≤ cover by construction.
+            let cover = self.written_seq.load(Ordering::Acquire);
+            // fsync the CLONED fd so appenders keep the writer mutex (see `sync_handle` — the
+            // measured convoy fix); fall back to fsync-under-the-writer-lock if the clone failed.
+            let sync_res = match &self.sync_handle {
+                Some(h) => h.sync_all().map_err(|e| e.to_string()),
+                None => match &self.writer {
+                    Some(writer) => match writer.lock() {
+                        Ok(w) => w.get_ref().sync_all().map_err(|e| e.to_string()),
+                        Err(_) => Err("writer lock poisoned".to_string()),
+                    },
+                    None => Err("no writer to fsync (invariant violation)".to_string()),
+                },
+            };
+            {
+                let mut fs = flush.lock().map_err(|_| AuditError::Lock)?;
+                fs.flushing = false;
+                match &sync_res {
+                    Ok(()) => {
+                        fs.durable_seq = fs.durable_seq.max(cover);
+                        wakeup.notify_all();
+                    }
+                    Err(e) => {
+                        tracing::error!("AUDIT sync_all failed (covering seq {cover}): {e}");
+                        fs.poisoned = Some(format!("fsync failed covering seq {cover}: {e}"));
+                        wakeup.notify_all();
+                        return Err(AuditError::Io(format!(
+                            "audit record durability unknown — fsync failed (log poisoned, \
+                             fail-closed): {e}"
+                        )));
+                    }
+                }
+            }
+            // Tail-truncation anchor for the DURABLE cover — OFF the flush lock (its own temp +
+            // fsync + rename must never hold up the waiters just woken above; the first S51 cut
+            // anchored under the flush lock and serialized a SECOND fsync into every group-commit
+            // cycle). Guarded-monotone via its own mutex (an overlapping later flusher cannot
+            // regress it); best-effort — a lagging anchor under-claims, never lies.
+            if let Some(path) = &self.log_path {
+                if let Ok(mut anchored) = self.anchored_seq.lock() {
+                    if cover > *anchored {
+                        match write_head_anchor(path, cover) {
+                            Ok(()) => *anchored = cover,
+                            Err(e) => {
+                                tracing::error!("AUDIT head-anchor write failed (seq {cover}): {e}")
+                            }
+                        }
+                    }
+                }
+            }
+            // The flusher's own record is covered by construction (seq ≤ written_seq ≤ cover).
+            return Ok(());
+        }
     }
 
     /// Walk the on-disk log and VERIFY the hash-chain + signatures end to end. Returns the number of
@@ -2845,6 +3054,86 @@ mod tests {
             err.to_string().contains("tail-truncated"),
             "a sliced-off tail must be detected: {err}"
         );
+    }
+
+    /// GROUP-COMMIT RATCHET (S51): concurrent emitters on one file-backed log all succeed, and the
+    /// resulting chain is PERFECT — contiguous seqs, every hash link and signature verifying end to
+    /// end, and the head anchor at the full count. This is the whole safety claim of the group
+    /// commit in one test: coalescing fsyncs must not reorder, drop, interleave, or half-commit a
+    /// single record. (The THROUGHPUT claim is measured, not asserted: `benches/audit_emit.rs`.)
+    #[test]
+    fn concurrent_emits_group_commit_and_the_chain_stays_perfect() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let log = std::sync::Arc::new(AuditLog::with_file(&path).unwrap());
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 25;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let log = log.clone();
+                std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        log.emit(AuditEvent::RuntimeStart {
+                            timestamp: SecureTimestamp::now(),
+                            version: format!("t{t}-{i}"),
+                        })
+                        .expect("a concurrent emit must durably commit");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let total = (THREADS * PER_THREAD) as u64;
+        let vk = log.signer.as_ref().map(|s| s.verifying_key());
+        assert_eq!(
+            log.verify_chain(vk.as_ref()).expect("chain verifies clean"),
+            total,
+            "every concurrent emit is on the chain exactly once, in order, signed"
+        );
+        assert_eq!(
+            super::read_head_anchor(&path).unwrap(),
+            Some(total),
+            "the head anchor reached the full durable count"
+        );
+        // And the log re-opens fail-closed-verified — the on-disk artifact is coherent.
+        drop(log);
+        drop(AuditLog::with_file_verified(&path).unwrap());
+    }
+
+    /// POISON RATCHET (S51): after a failed durable write the log refuses EVERY subsequent emit
+    /// (fail-closed) instead of retrying the seq — after a failure the on-disk suffix is unknown,
+    /// so a retry could append a duplicate seq behind a half-landed record and corrupt the chain
+    /// for verifiers. The first failure reports the IO error; later emits fail FAST naming the
+    /// poison.
+    #[test]
+    fn a_failed_durable_write_poisons_the_log_fail_closed() {
+        let path = std::env::temp_dir().join(format!("audit-poison-{}.log", std::process::id()));
+        std::fs::File::create(&path).unwrap();
+        let ro = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+        let log = AuditLog::with_file_handle(ro);
+
+        let first = log.emit(AuditEvent::RuntimeStart {
+            timestamp: SecureTimestamp::now(),
+            version: "a".to_string(),
+        });
+        assert!(first.is_err(), "read-only fd: the durable write must fail");
+
+        let second = log.emit(AuditEvent::RuntimeStart {
+            timestamp: SecureTimestamp::now(),
+            version: "b".to_string(),
+        });
+        match second {
+            Err(e) => assert!(
+                e.to_string().contains("poisoned"),
+                "the second emit refuses fast, naming the poison: {e}"
+            ),
+            Ok(()) => panic!("a poisoned log must never accept another record"),
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
