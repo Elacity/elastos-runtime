@@ -2307,6 +2307,38 @@ mod tests {
         );
     }
 
+    /// Sprint 49 (council guardian F2 — the known-answer ratchet SPEC-mandate-v1 §7 cites): the
+    /// WHOLE intent-signature preimage — the trailing-NUL domain, the nine fields in order, the
+    /// LITTLE-endian length prefixes, and the timestamp JSON tail — pinned as ONE fixed digest.
+    /// The timestamp test above pins one segment; this pins everything: any silent reorder,
+    /// domain edit, or endianness change in `signable_digest` fails here even though signer and
+    /// verifier share the code (a round-trip can never catch it).
+    #[test]
+    fn the_intent_preimage_digest_is_frozen() {
+        let decl = IntentDeclarationV1 {
+            schema: INTENT_DECLARATION_SCHEMA_V1.to_string(),
+            intent_id: "intent-1".into(),
+            capsule: "vm-agent".into(),
+            method_id: "runtime.pay".into(),
+            input_hash: "abc123".into(),
+            resource: "elastos://pay/vendor".into(),
+            action: "execute".into(),
+            standing_grant_id: "tok-1".into(),
+            declared_at: SecureTimestamp {
+                unix_secs: 1_700_000_000,
+                monotonic_seq: 42,
+            },
+            signer: "00".repeat(32),
+            signature: String::new(), // not part of the preimage
+        };
+        assert_eq!(
+            hex::encode(decl.signable_digest()),
+            "a1b257a80a1710177632ac99438df36a21cddb2e91043015a36c36add666cb6d",
+            "the FROZEN §7 preimage digest — if this changed, every previously signed intent \
+             stops verifying: mint a v2 schema, never edit v1"
+        );
+    }
+
     #[test]
     fn intent_custody_events_emit_onto_the_durable_chain_and_verify() {
         // The Kent Beck bar: the declaration, the denial (with reason), and the verdict ride

@@ -372,7 +372,10 @@ pub fn verify_mandate_receipt(
             .decode(record.sig.trim())
             .ok()
             .and_then(|bytes| Signature::from_slice(&bytes).ok())
-            .map(|signature| vk.verify(&computed, &signature).is_ok())
+            // STRICT verification (council S49 red-team F3): reject malleated-S and
+            // small-order keys, matching the intent path's own posture — two conforming
+            // verifiers must never disagree on a malleated signature.
+            .map(|signature| vk.verify_strict(&computed, &signature).is_ok())
             .unwrap_or(false);
         if !sig_ok {
             signatures_ok = false;
@@ -413,7 +416,8 @@ pub fn verify_mandate_receipt(
             .ok()
             .and_then(|bytes| Signature::from_slice(&bytes).ok())
             .map(|signature| {
-                vk.verify(
+                // Strict for the same reason as the per-record sigs (S49 red-team F3).
+                vk.verify_strict(
                     &mandate_receipt_binding_message(&receipt.scope, &receipt.records),
                     &signature,
                 )
@@ -3257,6 +3261,42 @@ mod tests {
             ts_keys,
             ["monotonic_seq", "unix_secs"],
             "SecureTimestamp JSON shape is frozen"
+        );
+
+        // §5 revoke shape (S49 guardian F1 — the field list the first draft got wrong: there is
+        // NO capsule_id on a revoke) + BYTE-IDENTITY fixtures pinning field ORDER + compactness
+        // (S49 guardian F3): the hash preimage is these exact bytes, so order is normative.
+        let fixed_ts = elastos_common::SecureTimestamp {
+            unix_secs: 1_700_000_000,
+            monotonic_seq: 7,
+        };
+        let grant_ev = AuditEvent::CapabilityGrant {
+            timestamp: fixed_ts.clone(),
+            token_id: "tok1".into(),
+            capsule_id: "vm-a".into(),
+            resource: "elastos://pay/v".into(),
+            action: "write".into(),
+            expiry: None,
+            responsible_entity: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&grant_ev).unwrap(),
+            "{\"type\":\"capability_grant\",\"timestamp\":{\"unix_secs\":1700000000,\
+             \"monotonic_seq\":7},\"token_id\":\"tok1\",\"capsule_id\":\"vm-a\",\
+             \"resource\":\"elastos://pay/v\",\"action\":\"write\",\"expiry\":null}",
+            "capability_grant byte template (§5) — type first, declared order, compact, \
+             expiry:null when unset, responsible_entity ABSENT when unset"
+        );
+        let revoke_ev = AuditEvent::CapabilityRevoke {
+            timestamp: fixed_ts,
+            token_id: "tok1".into(),
+            reason: "kill switch".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&revoke_ev).unwrap(),
+            "{\"type\":\"capability_revoke\",\"timestamp\":{\"unix_secs\":1700000000,\
+             \"monotonic_seq\":7},\"token_id\":\"tok1\",\"reason\":\"kill switch\"}",
+            "capability_revoke byte template (§5) — exactly type/timestamp/token_id/reason"
         );
 
         // And the exported receipt verifies — the spec's §6 algorithm against its own §2-§4 shapes.
