@@ -128,6 +128,47 @@ pub struct CapabilityManager {
 
     /// Metrics manager
     metrics: Arc<MetricsManager>,
+
+    /// G8 policy flip (Sprint 53), operator opt-in via `ELASTOS_AUDIT_FAIL_CLOSED_USE`: when set,
+    /// ORDINARY capability use-records in [`validate`](Self::validate) are BLOCKING — an act whose
+    /// signed use-record cannot be durably written is DENIED (`AuditWriteFailed`), the discipline
+    /// affordance-consent tokens have always had (W2 step 9). Default OFF: best-effort, byte-
+    /// identical to pre-S53 behavior. The cost that made this a gap (an fsync per validate) was
+    /// retired by the S51 group commit — under concurrency, validates share fsyncs — so this is
+    /// now a POLICY choice: "no act without a durable record" vs "availability over the record".
+    /// Meaningful only with a durable audit log (`ELASTOS_AUDIT_LOG_PATH`); a memory-only emit
+    /// essentially cannot fail.
+    fail_closed_use: bool,
+}
+
+/// Parse the `ELASTOS_AUDIT_FAIL_CLOSED_USE` STRICTNESS switch (pure — the env read is the thin
+/// wrapper below). Unset/`0`/`false` ⇒ off (the default); `1`/`true` ⇒ on; anything else ⇒ ON with
+/// a loud warning — garbage in a switch whose only job is to be STRICTER must never silently
+/// weaken it (the closed-world rule the rail selector applies, pointed in the fail-closed
+/// direction).
+fn parse_fail_closed_use(raw: Option<&str>) -> bool {
+    match raw {
+        None => false,
+        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "" | "0" | "false" => false,
+            "1" | "true" => true,
+            other => {
+                tracing::warn!(
+                    "ELASTOS_AUDIT_FAIL_CLOSED_USE={other:?} is not one of 1|true|0|false — \
+                     treating as ON (a strictness switch never weakens on garbage)"
+                );
+                true
+            }
+        },
+    }
+}
+
+fn fail_closed_use_from_env() -> bool {
+    parse_fail_closed_use(
+        std::env::var("ELASTOS_AUDIT_FAIL_CLOSED_USE")
+            .ok()
+            .as_deref(),
+    )
 }
 
 impl CapabilityManager {
@@ -146,7 +187,15 @@ impl CapabilityManager {
             store,
             audit_log,
             metrics,
+            fail_closed_use: fail_closed_use_from_env(),
         }
+    }
+
+    /// Set the fail-closed use-record policy EXPLICITLY (tests + embedders); production wiring
+    /// reads `ELASTOS_AUDIT_FAIL_CLOSED_USE` in the constructors. See the field doc.
+    pub fn with_fail_closed_use(mut self, on: bool) -> Self {
+        self.fail_closed_use = on;
+        self
     }
 
     /// Load signing key from disk, or generate and persist a new one.
@@ -204,6 +253,7 @@ impl CapabilityManager {
             store,
             audit_log,
             metrics,
+            fail_closed_use: fail_closed_use_from_env(),
         }
     }
 
@@ -257,6 +307,7 @@ impl CapabilityManager {
             store,
             audit_log,
             metrics,
+            fail_closed_use: fail_closed_use_from_env(),
         }
     }
 
@@ -533,8 +584,14 @@ impl CapabilityManager {
         // record cannot be written the redemption FAILS CLOSED (W2 step 9), so a
         // consent-gated affordance can never be consumed without a durable signed record —
         // mirroring the AUD-2/AUD-3 fail-closed audit fixes. Ordinary capability tokens
-        // keep the existing best-effort emit (no behaviour change for other callers).
-        if token.constraints.method_id.is_some() {
+        // keep the best-effort emit BY DEFAULT — unless the operator opted into the G8
+        // policy flip (`fail_closed_use`, Sprint 53): then EVERY use-record is blocking
+        // and an act that cannot be durably recorded is denied. KNOWN ORDERING BOUND
+        // (same as the affordance path has always had): a use-limited token's count was
+        // consumed at step 12 above, so a use burned on a failed record is spent without
+        // an act — the fail-closed direction (never an act without a record), never a
+        // free act.
+        if token.constraints.method_id.is_some() || self.fail_closed_use {
             self.audit_log
                 .emit(AuditEvent::CapabilityUse {
                     timestamp: SecureTimestamp::now(),
@@ -912,6 +969,79 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ValidationError::TokenRevoked)));
+    }
+
+    /// G8 POLICY-FLIP RATCHET (Sprint 53): with `fail_closed_use` ON, an ORDINARY capability act
+    /// whose signed use-record cannot be durably written is DENIED (`AuditWriteFailed`) — "no act
+    /// without a durable record", the discipline affordance-consent tokens have always had. With
+    /// it OFF (the default), the same failing log leaves validation `Ok` — best-effort,
+    /// byte-identical pre-S53 behavior. Both directions pinned against one failing-log seam.
+    #[tokio::test]
+    async fn the_fail_closed_use_opt_in_denies_undurable_acts_and_the_default_does_not() {
+        for (opt_in, expect_denied) in [(true, true), (false, false)] {
+            let path = std::env::temp_dir().join(format!(
+                "mgr-use-ro-{}-{}.log",
+                std::process::id(),
+                opt_in
+            ));
+            std::fs::File::create(&path).unwrap();
+            let ro = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+            // Explicit policy (not the env read) so the test is deterministic under any test env.
+            let manager = CapabilityManager::new(
+                Arc::new(CapabilityStore::new()),
+                Arc::new(AuditLog::with_file_handle(ro)),
+                Arc::new(MetricsManager::new()),
+            )
+            .with_fail_closed_use(opt_in);
+
+            let token = manager.grant(
+                "test-capsule",
+                ResourceId::new("localhost://Users/self/Documents/test.txt"),
+                Action::Read,
+                TokenConstraints::default(),
+                None,
+            );
+            let result = manager
+                .validate(
+                    &token,
+                    "test-capsule",
+                    Action::Read,
+                    &ResourceId::new("localhost://Users/self/Documents/test.txt"),
+                    None,
+                )
+                .await;
+            if expect_denied {
+                assert!(
+                    matches!(result, Err(ValidationError::AuditWriteFailed)),
+                    "opt-in ON: an act with no durable record is denied (got {result:?})"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "default OFF: best-effort is unchanged (got {result:?})"
+                );
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// The `ELASTOS_AUDIT_FAIL_CLOSED_USE` parse is a STRICTNESS switch: unset/0/false ⇒ off,
+    /// 1/true ⇒ on, and GARBAGE ⇒ ON (never silently weaker) — pinned on the pure parser.
+    #[test]
+    fn the_fail_closed_use_switch_never_weakens_on_garbage() {
+        assert!(!parse_fail_closed_use(None));
+        for off in ["0", "false", "FALSE", " 0 ", ""] {
+            assert!(!parse_fail_closed_use(Some(off)), "{off:?} is off");
+        }
+        for on in ["1", "true", "TRUE", " 1 "] {
+            assert!(parse_fail_closed_use(Some(on)), "{on:?} is on");
+        }
+        for garbage in ["yes", "on", "2", "tru"] {
+            assert!(
+                parse_fail_closed_use(Some(garbage)),
+                "{garbage:?} must fail STRICT, never silently off"
+            );
+        }
     }
 
     #[tokio::test]
