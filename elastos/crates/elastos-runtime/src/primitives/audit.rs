@@ -960,6 +960,13 @@ pub struct AuditLog {
     /// failed at open (then the flusher falls back to fsync-under-the-writer-mutex: correct,
     /// convoy-slow).
     sync_handle: Option<File>,
+    /// Held for the log's lifetime (S52, closing the S51 red-team dual-writer residual): an
+    /// exclusive advisory flock on `<log>.lock`, the SAME single-opener discipline the spend meter
+    /// and payment ledger hold. Two live `AuditLog`s on one file each keep independent chain heads
+    /// and mint the same seqs — interleaved appends corrupt the chain on disk, and under the S51
+    /// group commit one instance's fsync even covers the sibling's uncoordinated bytes. Now a
+    /// second opener FAILS fail-closed (`WouldBlock`) instead. Unix only, like the meter's.
+    _lock_file: Option<File>,
 }
 
 impl AuditLog {
@@ -980,6 +987,7 @@ impl AuditLog {
             written_seq: AtomicU64::new(0),
             anchored_seq: Mutex::new(0),
             sync_handle: None,
+            _lock_file: None,
         }
     }
 
@@ -1011,6 +1019,31 @@ impl AuditLog {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+
+        // SINGLE-OPENER (S52): take the exclusive advisory flock FIRST — before the quarantine or
+        // any read — so a second live opener fails here fail-closed rather than two instances
+        // minting the same seqs (or both mutating a torn tail). Held for the log's lifetime; see
+        // `_lock_file`. Mirrors `SpendMeter::open_durable` (council S28 F4 discipline).
+        #[cfg(unix)]
+        let lock_file = {
+            use std::os::unix::io::AsRawFd as _;
+            let lock_path = sibling(&path, "lock");
+            let f = OpenOptions::new()
+                .create(true)
+                .truncate(false) // the lock file carries no content; never disturb it
+                .write(true)
+                .open(&lock_path)?;
+            let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "audit log is already open elsewhere (single-opener, fail-closed)",
+                ));
+            }
+            Some(f)
+        };
+        #[cfg(not(unix))]
+        let lock_file = None;
 
         // Quarantine a torn (provably never-acknowledged) trailing fragment BEFORE resuming, so a
         // crash mid-writeback re-opens from the intact durable prefix instead of refusing (verified
@@ -1057,6 +1090,7 @@ impl AuditLog {
             written_seq: AtomicU64::new(resumed_seq),
             anchored_seq: Mutex::new(resumed_seq.max(disk_anchor)),
             sync_handle,
+            _lock_file: lock_file,
         })
     }
 
@@ -1130,6 +1164,8 @@ impl AuditLog {
             written_seq: AtomicU64::new(0),
             anchored_seq: Mutex::new(0),
             sync_handle,
+            // The test seam has no path to lock (and forces failures on purpose) — no flock.
+            _lock_file: None,
         }
     }
 
@@ -1207,10 +1243,6 @@ impl AuditLog {
         let line =
             serde_json::to_string(&record).map_err(|e| AuditError::Serialize(e.to_string()))?;
 
-        if self.echo_stdout {
-            println!("[AUDIT] {}", line);
-        }
-
         if let Some(writer) = &self.writer {
             // Append + flush THIS record's bytes to the OS, still under the chain lock (order).
             let write_res = {
@@ -1242,6 +1274,13 @@ impl AuditLog {
             chain.last_seq = seq;
             chain.prev_hash = record_hash;
             drop(chain);
+        }
+
+        // Dev-only stdout echo, OFF the chain lock (S52, council S51 red-team F4): a blocked/slow
+        // stdout (full pipe) must never serialize every emit behind it. Echoed only for records
+        // that actually committed — an echo of a failed emit would misreport the chain.
+        if self.echo_stdout {
+            println!("[AUDIT] {}", line);
         }
 
         // Store in the in-memory ring buffer (best-effort; the durable record is the source of
@@ -3318,6 +3357,38 @@ mod tests {
             3,
             "resumed exactly at the durable prefix; no gap, no duplicate"
         );
+    }
+
+    /// SINGLE-OPENER RATCHET (S52, closing the S51 red-team dual-writer residual): a second live
+    /// opener of the SAME log file is refused fail-closed — two instances would keep independent
+    /// chain heads, mint the same seqs, and corrupt the on-disk chain (and under the group commit
+    /// one instance's fsync covers the sibling's uncoordinated bytes). Same flock discipline as
+    /// the spend meter and payment ledger. Reopen after drop succeeds (the lock dies with the log).
+    #[cfg(unix)]
+    #[test]
+    fn a_second_live_opener_of_the_same_log_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let first = AuditLog::with_file(&path).unwrap();
+        let second = AuditLog::with_file(&path);
+        match second {
+            Err(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
+                assert!(
+                    e.to_string().contains("single-opener"),
+                    "names the discipline: {e}"
+                );
+            }
+            Ok(_) => panic!("a second live opener must be refused (single-opener, fail-closed)"),
+        }
+        // The verified open is refused the same way (it routes through with_file).
+        assert!(
+            AuditLog::with_file_verified(&path).is_err(),
+            "verified open also respects the single-opener lock"
+        );
+        drop(first);
+        // The lock dies with the log — a sequential reopen (restart) succeeds.
+        drop(AuditLog::with_file(&path).unwrap());
     }
 
     /// POISON-BEFORE-APPEND RATCHET (S51 council fold — guardian F1 / red-team F2): the

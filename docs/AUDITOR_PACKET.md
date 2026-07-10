@@ -156,3 +156,49 @@ checklist, and the code ever disagree about the §1 invariant, it should fail.
 - [ ] Confirm `Debug` redaction (§4) covers all CEK / escrow-bearing structs.
 - [ ] Note any second consumer of the node re-seal output anywhere in the tree (should be none).
 - [ ] Spot-check the §4b verdict registries against the code and confirm the scope-out is sound.
+
+---
+
+## 7. Second engagement scope — the Flint mandate/money plane (added S52)
+
+Since this packet was first cut, the runtime grew a second audit-worthy plane: **Flint** — agents
+acting under scoped, revocable, cryptographically provable mandates, including REAL payments.
+Design + honest bounds: [FLINT_MANDATE_ENGINE.md](FLINT_MANDATE_ENGINE.md). Wire formats a
+verifier can implement from the documents alone: [SPEC-mandate-v1.md](SPEC-mandate-v1.md)
+(mandate + receipt + signed-intent bytes, pinned by byte-identity conformance ratchets) and
+[SPEC-market-provider-v1.md](SPEC-market-provider-v1.md) (the payment-vertical contract, proven
+non-DRM-shaped by two shipped verticals). Gap ledger: [KNOWN_GAPS.md](KNOWN_GAPS.md) (the honesty
+document — every open residual is listed there, none silently).
+
+**The invariants we are asking a reviewer to attack** (each enforced by construction + ratcheted):
+
+1. **Money never exceeds the mandate.** Cap reservation precedes any rail call (`SpendMeter`,
+   durable, single-opener Unix advisory flock); two-generals classification is decided by CODE PATH, never by
+   error text (`BuyError`/`PayError` typed at the call site — no provider-controlled byte can flip
+   refund vs hold); chain-settled buys are `Pending` at broadcast and charge only after
+   depth-gated confirmation; the record-before-broadcast ledger custody means a re-dispatch can
+   never double-move value (signature-derived idempotency keys, money-bearing keys never evicted).
+2. **The receipt chain is the accountability artifact.** Per-record ed25519 (`verify_strict`) +
+   SHA-256 hash chain + set-binding; exported `MandateReceipt`s verify OFF-BOX via the standalone
+   `elastos verify-receipt` CLI with a pinned issuer key; settlement references (`rail_ref`) are
+   signed fields — editing one flips AUTHENTIC → INVALID.
+3. **The audit plane survives crash + concurrency.** S51 group commit: `emit` returns `Ok` only
+   after ITS record is fsynced; failed durability POISONS the log (never a duplicate-seq retry);
+   a torn never-acknowledged tail is quarantined at open, never bricking the durable prefix; the
+   head anchor floors tail-truncation; single-opener flock (S52). Bench:
+   `cargo bench -p elastos-runtime --bench audit_emit` (verifies the chain it measures).
+4. **The agent is confined by the envelope, not by trust.** Signed intents (domain-separated,
+   freshness-checked, replay-guarded), per-mandate rate budgets, agent-key binding, operator
+   kill-switch (revoke is fail-closed: the signed revoke event lands before the token dies),
+   liability DID on grant + receipt, quote/negotiate/pay all scoped to the granted resource.
+
+**Method note for the engagement:** every sprint since S27 shipped through a two-seat adversarial
+internal council (principles-guardian + red-team) whose findings were folded with reproducing
+ratchet tests — the commit history on this branch records each verdict and fold. That is internal
+review, not independent assurance; it should make the external pass cheaper (the ratchets are the
+scope-out registry), not replace it.
+
+Reproduce the state: the S46-truthful gate is `cargo test -p elastos-server --lib` (default +
+`--features dev-modes`), `--bin elastos`, `-p elastos-runtime --lib`, `-p elastos-common --lib`,
+`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings` — all green
+at every sprint boundary.

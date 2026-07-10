@@ -80,12 +80,22 @@ fn build_audit_log(data_dir: &Path) -> anyhow::Result<Arc<primitives::audit::Aud
                 data_dir.join(configured)
             };
             let log = primitives::audit::AuditLog::with_file_verified(&path).map_err(|e| {
-                anyhow::anyhow!(
-                    "durable audit log at {} failed to open or verify ({e}); set {} only to a \
-                     trusted, untampered custody log",
-                    path.display(),
-                    AUDIT_LOG_PATH_ENV
-                )
+                // A lock conflict means ANOTHER INSTANCE holds the log (S52 single-opener) — say
+                // that, not "tamper" (council S52 LOW2: the wrong hint costs an operator real time).
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    anyhow::anyhow!(
+                        "durable audit log at {} is already open by another live process ({e}); \
+                         is another elastos instance running against this data dir?",
+                        path.display()
+                    )
+                } else {
+                    anyhow::anyhow!(
+                        "durable audit log at {} failed to open or verify ({e}); set {} only to a \
+                         trusted, untampered custody log",
+                        path.display(),
+                        AUDIT_LOG_PATH_ENV
+                    )
+                }
             })?;
             tracing::info!(
                 "Durable audit log enabled (verified-on-open): {}",

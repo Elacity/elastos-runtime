@@ -320,13 +320,24 @@ impl GatewayState {
         if let Some(existing) = self.audit_log.get() {
             return Ok(existing.clone());
         }
+        // Serialize CONSTRUCTION (S52): the audit log now holds a single-opener flock, so the old
+        // benign both-construct-one-wins race would make the LOSER's open fail `WouldBlock` and
+        // surface a spurious error while a healthy canonical log exists. One constructor runs;
+        // everyone else re-reads the cell. A process-global mutex is fine — construction happens
+        // once per gateway lifetime (tests with distinct data_dirs serialize briefly, harmlessly).
+        static CONSTRUCT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = CONSTRUCT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = self.audit_log.get() {
+            return Ok(existing.clone());
+        }
         let path = self.data_dir.join("audit").join("gateway-audit.log");
         let log = Arc::new(
             AuditLog::with_file(&path)
                 .map_err(|e| format!("gateway audit log unavailable at {path:?}: {e}"))?,
         );
         let _ = self.audit_log.set(log.clone());
-        // Another thread may have won the race; return whatever is now canonical.
         Ok(self.audit_log.get().cloned().unwrap_or(log))
     }
 
