@@ -137,7 +137,16 @@ pub struct CapabilityManager {
     /// retired by the S51 group commit — under concurrency, validates share fsyncs — so this is
     /// now a POLICY choice: "no act without a durable record" vs "availability over the record".
     /// Meaningful only with a durable audit log (`ELASTOS_AUDIT_LOG_PATH`); a memory-only emit
-    /// essentially cannot fail.
+    /// essentially cannot fail (short of a panic-poisoned chain lock).
+    ///
+    /// OPERATIONAL CONSEQUENCE the opt-in buys, stated plainly (council S53 F1): a durable log
+    /// POISONS on its first failed append/fsync (S51 — the on-disk suffix is unknown after a
+    /// failure), so with this flag ON, one bad write halts EVERY act process-wide — all tokens,
+    /// all capsules deny `AuditWriteFailed` — until an operator restart re-verifies the durable
+    /// prefix. That is the deliberate posture (acts halt when the custody plane is dead), and it
+    /// is also DoS-shaped: anything that can fail one write (disk full, a co-tenant filling the
+    /// audit filesystem) is a full capability-plane outage. Retries during the outage still burn
+    /// use-limited tokens' counts (the ordering bound below). Choose it knowingly.
     fail_closed_use: bool,
 }
 
@@ -813,7 +822,11 @@ impl CapabilityManager {
         &self.audit_log
     }
 
-    /// Helper to audit validation failures
+    /// Helper to audit validation failures. DELIBERATELY best-effort even under `fail_closed_use`
+    /// (council S53 F2): a deny is not an act — losing its record is observability loss, never an
+    /// unrecorded act — and on the same failing log a blocking failure-record would fail
+    /// identically anyway (the deny already stands). Failure-records are a known best-effort
+    /// residual of the G8 flip.
     fn audit_validation_failure(&self, token: &CapabilityToken, capsule_id: &str, reason: &str) {
         self.audit_log
             .capability_use(&token.id, capsule_id, &token.resource, token.action, false);
@@ -1023,6 +1036,36 @@ mod tests {
             }
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    /// A MEMORY-ONLY log under the opt-in still validates Ok (council S53 F4): with no durable
+    /// writer there is no durability to fail, so the flag adds no availability risk to a
+    /// memory-log deployment — the blocking emit just succeeds.
+    #[tokio::test]
+    async fn the_fail_closed_use_opt_in_is_harmless_on_a_memory_only_log() {
+        let manager = CapabilityManager::new(
+            Arc::new(CapabilityStore::new()),
+            Arc::new(AuditLog::new()),
+            Arc::new(MetricsManager::new()),
+        )
+        .with_fail_closed_use(true);
+        let token = manager.grant(
+            "test-capsule",
+            ResourceId::new("localhost://Users/self/Documents/test.txt"),
+            Action::Read,
+            TokenConstraints::default(),
+            None,
+        );
+        let result = manager
+            .validate(
+                &token,
+                "test-capsule",
+                Action::Read,
+                &ResourceId::new("localhost://Users/self/Documents/test.txt"),
+                None,
+            )
+            .await;
+        assert!(result.is_ok(), "memory-only + opt-in: {result:?}");
     }
 
     /// The `ELASTOS_AUDIT_FAIL_CLOSED_USE` parse is a STRICTNESS switch: unset/0/false ⇒ off,
