@@ -67,6 +67,15 @@ token is refused before broadcast. (In the Dev/chain-mock rights modes the quote
 so the price gate never rejects there.) Provision caps exactly as for any rail:
 `POST /api/spend-budgets` (or the Mandates Money panel).
 
+**Which command serves the buy surface:** both `elastos serve` (the operator runtime) and
+`elastos gateway` (the browser gateway) mount the Mandates/Money/Marketplace sub-router against the
+SAME runtime-built handles (one standing-grant registry, one capability manager, one pay rail — no
+parallel state). This is deliberate: the gateway launches the Home shell whose panels call those
+routes, so serving 404 there was a lie about a surface that exists. Every route stays auth-gated
+(gateway-signed launch/Home tokens; money writes additionally demand a fresh passkey verification),
+so mounting the router widens nothing for an unauthenticated caller — an unauthenticated request
+reads 401, never data.
+
 ## How a payment's state reads across the three surfaces
 
 The rail, the ledger, and the dispatch response each speak their own vocabulary for the same

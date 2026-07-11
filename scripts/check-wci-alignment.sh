@@ -457,15 +457,17 @@ if rg_search 'passkey|webauthn|PublicKeyCredential|credentials\.(create|get)' ca
   --glob '!capsules/system/browser/*' \
   --glob '!capsules/inbox/browser/*' \
   --glob '!capsules/wallet/*' \
+  --glob '!capsules/mandates/*' \
   --glob '!capsules/*-provider/**' \
   --glob '!**/target/**' >"$tmp" 2>/dev/null; then
-  echo "[alignment] forbidden pattern found: passkey ceremonies must stay in Home/System/Inbox/Wallet/runtime auth surfaces"
+  echo "[alignment] forbidden pattern found: passkey ceremonies must stay in Home/System/Inbox/Wallet/Mandates/runtime auth surfaces"
   cat "$tmp"
   echo
   failed=1
 fi
 check_forbidden_in_path 'credentials\.create|passkey/register|webauthn/register' capsules/inbox 'Inbox may request fresh passkey authentication for wallet or Inspector approval, but must not register passkeys'
 check_forbidden_in_path 'credentials\.create|passkey/register|webauthn/register' capsules/wallet 'Wallet may request fresh passkey authentication for protected recovery, but must not register passkeys'
+check_forbidden_in_path 'credentials\.create|passkey/register|webauthn/register' capsules/mandates 'Mandates may request fresh passkey authentication for money writes (Sprint 33: one verification = one write), but must not register passkeys'
 if rg_search $'fetch[[:space:]]*\\([[:space:]]*["\\\'`]https?://|\\.open[[:space:]]*\\([[:space:]]*["\\\'`][A-Z]+["\\\'`][[:space:]]*,[[:space:]]*["\\\'`]https?://|new[[:space:]]+WebSocket[[:space:]]*\\([[:space:]]*["\\\'`]wss?://|new[[:space:]]+EventSource[[:space:]]*\\([[:space:]]*["\\\'`]https?://|sendBeacon[[:space:]]*\\([[:space:]]*["\\\'`]https?://' capsules \
   --glob '*/browser/**' \
   --glob '!capsules/*-provider/**' \

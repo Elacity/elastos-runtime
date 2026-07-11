@@ -1,7 +1,8 @@
 //! Content-index: the marketplace discovery cache (Phase 2).
 //!
-//! A re-derivable view over the chain's `AssetCreated` events (the only mint event that emits on
-//! Base — EventHub, `0xc0a995e4…`). PURE + read-only: it decodes logs into browsable `Listing` rows
+//! A re-derivable view over the chain's content-mint events — `AssetCreated` (`0xc0a995e4…`) plus
+//! the legacy `DigitalAssetRegistered` (`0x1b24f776…`), both emitted by the EventHub (PC2 scans the
+//! same pair). PURE + read-only: it decodes logs into browsable `Listing` rows
 //! and answers search/sections/get. It holds NO keys, NO RPC of its own, NO write authority (P3/P16) —
 //! the gateway feeds it logs fetched through `chain-provider` (the sole RPC declarant). The money path
 //! never trusts this cache: buy re-verifies terms live (Phase-1 abort-on-drift).
@@ -17,6 +18,11 @@ use serde_json::{json, Value};
 /// `AssetCreated` topic0 (keccak of the signature) — must match `chain-provider`.
 pub(crate) const ASSET_CREATED_TOPIC0: &str =
     "0xc0a995e4052be044599af577ab2f3382d67bd34df95a76226e7c464e9d4dba46";
+
+/// `DigitalAssetRegistered` topic0 — the LEGACY mint event (same EventHub source; PC2 scans both,
+/// `ContentIndexerService.ts:60`). Unlike `AssetCreated` it CARRIES the `bytes16 contentId` (KID).
+pub(crate) const DIGITAL_ASSET_REGISTERED_TOPIC0: &str =
+    "0x1b24f7763272894608506beba5887c374d345cd231bf52bd03f40bc2d0508d7b";
 
 /// EventHub (Base) — the contract that emits `AssetCreated`; the index's getLogs source
 /// (`pc2-node config/default.json content_indexer.contracts.v3.event_hub`).
@@ -52,8 +58,14 @@ pub(crate) struct Listing {
     pub op_type: String,
     pub creator_address: String,
     pub first_seen_block: u64,
-    /// `"needs_kid"` until the KID/contentId is enriched (AssetCreated carries none).
+    /// `"needs_kid"` until the KID/contentId is enriched (AssetCreated carries none);
+    /// `"unresolved"` when the KID is known (DigitalAssetRegistered) but metadata isn't fused yet.
     pub metadata_status: String,
+    /// The `bytes16` KID — present only for `DigitalAssetRegistered` rows (the legacy event carries
+    /// it on-chain); `AssetCreated` rows resolve it at enrich/buy time. `serde(default)` keeps
+    /// pre-field snapshots parseable.
+    #[serde(default)]
+    pub content_id: Option<String>,
 }
 
 impl Listing {
@@ -73,8 +85,9 @@ impl Listing {
             "creator_address": self.creator_address,
             "first_seen_block": self.first_seen_block,
             "metadata_status": self.metadata_status,
-            // content_id (== bytes16 KID) is resolved at enrich/buy time, not from AssetCreated.
-            "content_id": Value::Null,
+            // The bytes16 KID: carried on-chain by DigitalAssetRegistered; for AssetCreated rows
+            // it stays null here and is resolved at enrich/buy time.
+            "content_id": self.content_id.as_deref().map(Value::from).unwrap_or(Value::Null),
         })
     }
 }
@@ -165,12 +178,13 @@ impl ContentIndex {
         true
     }
 
-    /// Ingest a batch of `eth_getLogs` entries, decoding the `AssetCreated` ones (others ignored,
-    /// fail-soft per-entry). Returns the count upserted.
+    /// Ingest a batch of `eth_getLogs` entries, decoding the known content-mint events
+    /// (`AssetCreated` + legacy `DigitalAssetRegistered`; others ignored, fail-soft per-entry).
+    /// Returns the count upserted.
     pub(crate) fn ingest_logs(&mut self, logs: &[Value]) -> usize {
         let mut n = 0;
         for log in logs {
-            if let Some(listing) = decode_asset_created(log) {
+            if let Some(listing) = decode_content_event(log) {
                 if self.upsert(listing) {
                     n += 1;
                 }
@@ -294,6 +308,18 @@ fn abi_string(data_clean: &str, off: usize) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// Route one log to the matching content-mint decoder by `topics[0]`. `None` on a foreign event.
+pub(crate) fn decode_content_event(log: &Value) -> Option<Listing> {
+    let t0 = topic_str(log, 0)?;
+    if t0.eq_ignore_ascii_case(ASSET_CREATED_TOPIC0) {
+        decode_asset_created(log)
+    } else if t0.eq_ignore_ascii_case(DIGITAL_ASSET_REGISTERED_TOPIC0) {
+        decode_digital_asset_registered(log)
+    } else {
+        None
+    }
+}
+
 /// Decode one `AssetCreated` log into a `Listing`. `None` on a foreign/malformed entry (fail-soft).
 pub(crate) fn decode_asset_created(log: &Value) -> Option<Listing> {
     let t0 = topic_str(log, 0)?;
@@ -324,6 +350,52 @@ pub(crate) fn decode_asset_created(log: &Value) -> Option<Listing> {
         creator_address: creator,
         first_seen_block,
         metadata_status: "needs_kid".to_string(),
+        content_id: None,
+    })
+}
+
+/// Decode one legacy `DigitalAssetRegistered(address indexed channel, uint256 indexed tokenId,
+/// address creator, string tokenURI, uint16 opType, bytes16 contentId)` log into a `Listing`
+/// (layout confirmed against `content-market::from_digital_asset_registered`). The event carries
+/// the KID on-chain, so `content_id` is set and `metadata_status` starts at `"unresolved"` (KID
+/// known, metadata not fused). No operative/opContract on the legacy event — the terms brief stays
+/// lean for these rows. `None` on a foreign/malformed entry (fail-soft).
+pub(crate) fn decode_digital_asset_registered(log: &Value) -> Option<Listing> {
+    let t0 = topic_str(log, 0)?;
+    if !t0.eq_ignore_ascii_case(DIGITAL_ASSET_REGISTERED_TOPIC0) {
+        return None;
+    }
+    let channel = addr_from_topic(topic_str(log, 1)?)?;
+    let token_id_topic = topic_str(log, 2)?;
+    let token_clean = token_id_topic.strip_prefix("0x").unwrap_or(token_id_topic);
+    if token_clean.len() != 64 || !token_clean.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let token_id = format!("0x{}", token_clean.to_lowercase());
+    let data = log.get("data").and_then(Value::as_str)?;
+    let data_clean = data.strip_prefix("0x").unwrap_or(data);
+    // data = abi.encode(creator, tokenURI-offset, opType, contentId).
+    let creator = format!("0x{}", data_word(data_clean, 0)?.get(24..)?.to_lowercase());
+    let uri_off = word_to_u64(data_word(data_clean, 1)?)? as usize;
+    let op_type = op_type_name(word_to_u64(data_word(data_clean, 2)?)?);
+    // bytes16 contentId = the FIRST 16 bytes (32 hex) of the 4th head word (left-aligned).
+    let content_id = format!("0x{}", data_word(data_clean, 3)?.get(..32)?.to_lowercase());
+    let token_uri = abi_string(data_clean, uri_off).unwrap_or_default();
+    let first_seen_block = log
+        .get("blockNumber")
+        .and_then(Value::as_str)
+        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0);
+    Some(Listing {
+        channel_address: channel,
+        operative_address: String::new(),
+        token_id,
+        token_uri,
+        op_type: op_type.to_string(),
+        creator_address: creator,
+        first_seen_block,
+        metadata_status: "unresolved".to_string(),
+        content_id: Some(content_id),
     })
 }
 
@@ -460,6 +532,61 @@ mod tests {
         let b = restored.search(None, None, None);
         assert_eq!(a, b);
         assert_eq!(b[0].first_seen_block, 20);
+    }
+
+    #[test]
+    fn decodes_digital_asset_registered_with_onchain_kid() {
+        // data = abi.encode(creator, uri-offset(4 words = 0x80), opType, contentId), then len+bytes.
+        let uri = "ipfs://legacy/metadata.json";
+        let uri_hex: String = uri.bytes().map(|b| format!("{b:02x}")).collect();
+        let creator = format!("{:0>64}", "22222222222222222222222222222222222222bb");
+        let kid = "0123456789abcdef0123456789abcdef"; // bytes16, left-aligned in its word
+        let uri_padded = format!("{uri_hex:0<width$}", width = uri.len().div_ceil(32) * 64);
+        let data = format!(
+            "0x{creator}{:064x}{:064x}{kid:0<64}{:064x}{uri_padded}",
+            128, // uri byte-offset: 4 head words
+            2,   // buy_and_resell
+            uri.len(),
+        );
+        let log = json!({
+            "topics": [
+                DIGITAL_ASSET_REGISTERED_TOPIC0,
+                format!("0x{:0>64}", "cccc000000000000000000000000000000000003"),
+                format!("0x{:064x}", 9u64),
+            ],
+            "data": data,
+            "blockNumber": "0x200",
+        });
+        let l = decode_content_event(&log).expect("valid DigitalAssetRegistered decodes");
+        assert_eq!(
+            l.channel_address,
+            "0xcccc000000000000000000000000000000000003"
+        );
+        assert_eq!(l.token_id, format!("0x{:064x}", 9u64));
+        assert_eq!(
+            l.creator_address,
+            "0x22222222222222222222222222222222222222bb"
+        );
+        assert_eq!(l.token_uri, uri);
+        assert_eq!(l.op_type, "buy_and_resell");
+        assert_eq!(
+            l.content_id.as_deref(),
+            Some("0x0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            l.metadata_status, "unresolved",
+            "KID known, metadata not fused"
+        );
+        assert!(
+            l.operative_address.is_empty(),
+            "legacy event carries no opContract"
+        );
+        assert_eq!(l.first_seen_block, 0x200);
+        // The row's JSON carries the on-chain KID (AssetCreated rows keep null).
+        assert_eq!(
+            l.to_json()["content_id"],
+            json!("0x0123456789abcdef0123456789abcdef")
+        );
     }
 
     #[test]

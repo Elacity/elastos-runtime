@@ -129,6 +129,43 @@ pub(super) async fn market_sections(
     }
 }
 
+/// `GET /api/market/indexer-status` — the index's scan progress (PC2's `indexer-status` parity):
+/// coverage label, covered block range, backfill % toward the deploy block, row count, and the poll
+/// cadence. READS ONLY the in-memory cache cell / disk snapshot — never triggers a chain sweep, so
+/// the public route cannot be used as an RPC-amplification sink.
+pub(super) async fn market_indexer_status(State(state): State<GatewayState>) -> Response {
+    ensure_index_snapshot_path(&state.data_dir);
+    let idx = recent_index_cell()
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|(_, idx)| Arc::clone(idx)))
+        .or_else(|| load_index_snapshot_if_recent().map(Arc::new));
+    let (coverage, scanned_to, backfill_low, listings) = match idx.as_deref() {
+        Some(i) => (i.coverage(), i.scanned_to(), i.backfill_low(), i.len()),
+        None => ("recent-window", 0, 0, 0),
+    };
+    let deploy = content_index::EVENT_HUB_DEPLOY_BLOCK;
+    // % of history covered below the cursor: 100 once the backfill lane reaches the deploy block.
+    let backfill_pct = if backfill_low == 0 || scanned_to <= deploy {
+        0.0
+    } else if backfill_low <= deploy {
+        100.0
+    } else {
+        let total = (scanned_to - deploy) as f64;
+        ((scanned_to - backfill_low) as f64 / total * 100.0).min(100.0)
+    };
+    Json(serde_json::json!({
+        "coverage": coverage,
+        "scanned_to": scanned_to,
+        "backfill_low": backfill_low,
+        "deploy_block": deploy,
+        "backfill_pct": (backfill_pct * 10.0).round() / 10.0,
+        "listings": listings,
+        "poll_secs": market_poll_secs(),
+    }))
+    .into_response()
+}
+
 /// Truthy `lean` query flag (`1`/`true`) — selects the lean-first first-paint response.
 fn is_lean(params: &HashMap<String, String>) -> bool {
     matches!(
@@ -225,9 +262,12 @@ fn spawn_index_revalidate() {
             .and_then(|g| g.as_ref().map(|(_, idx)| Arc::clone(idx)));
         if let Ok(idx) = advance_index(prev.as_deref()) {
             persist_index_snapshot(&idx);
+            let idx = Arc::new(idx);
             if let Ok(mut guard) = recent_index_cell().lock() {
-                *guard = Some((Instant::now(), Arc::new(idx)));
+                *guard = Some((Instant::now(), Arc::clone(&idx)));
             }
+            // Swap first (new listings visible immediately), THEN warm prices for the next paint.
+            warm_listing_terms(&idx);
         }
         REFRESHING.store(false, Ordering::Release);
     });
@@ -244,11 +284,7 @@ fn ensure_index_poll_loop() {
         return;
     }
     STARTED.get_or_init(|| {
-        let secs: u64 = std::env::var("ELASTOS_MARKET_POLL_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(300)
-            .clamp(30, 3600);
+        let secs = market_poll_secs();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(secs));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -317,8 +353,10 @@ fn market_error(err: &str) -> Response {
         .into_response()
 }
 
-/// One `EVENT_HUB` `AssetCreated` `getLogs` window ingested into the index. `to_block` is either an
-/// explicit pinned `0x…` bound or `"latest"` (newest window only — head may advance mid-scan).
+/// One `EVENT_HUB` content-mint `getLogs` window ingested into the index — `AssetCreated` OR the
+/// legacy `DigitalAssetRegistered` (one call; topic0 alternatives, the same pair PC2 scans).
+/// `to_block` is either an explicit pinned `0x…` bound or `"latest"` (newest window only — head may
+/// advance mid-scan).
 fn scan_asset_created_window(
     idx: &mut content_index::ContentIndex,
     from: u64,
@@ -328,7 +366,10 @@ fn scan_asset_created_window(
         "address": content_index::EVENT_HUB,
         "fromBlock": format!("0x{from:x}"),
         "toBlock": to_block,
-        "topics": [content_index::ASSET_CREATED_TOPIC0],
+        "topics": [[
+            content_index::ASSET_CREATED_TOPIC0,
+            content_index::DIGITAL_ASSET_REGISTERED_TOPIC0,
+        ]],
     });
     idx.ingest_logs(&chain_tx::get_logs_live(filter)?);
     Ok(())
@@ -1285,19 +1326,31 @@ async fn enrich_listings(
     attach_listing_terms(listings).await
 }
 
+/// The poll-loop interval (`ELASTOS_MARKET_POLL_SECS`, default 300s, clamped 30..3600) — shared by
+/// the loop itself and the listing-terms TTL so warm prices always outlive the gap between cycles.
+fn market_poll_secs() -> u64 {
+    std::env::var("ELASTOS_MARKET_POLL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300)
+        .clamp(30, 3600)
+}
+
 /// Per-(operative,tokenId) cache of the compact discovery listing brief (cheapest active listing price +
 /// summed available supply + resale %). Separate from `get_terms_cache` (which holds the FULL detail body)
-/// so an enrichment pass never poisons the detail cache with a partial shape. 30s TTL > the 10s index TTL.
+/// so an enrichment pass never poisons the detail cache with a partial shape. TTL tracks the poll
+/// interval (+ slack): `warm_listing_terms` re-reads the newest priced cards every cycle, so a card's
+/// price is at most ~one cycle old — and the money path re-verifies live regardless (Phase-1).
 fn listing_terms_cache() -> &'static Mutex<HashMap<String, (Instant, serde_json::Value)>> {
     static C: OnceLock<Mutex<HashMap<String, (Instant, serde_json::Value)>>> = OnceLock::new();
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 fn listing_terms_lookup(key: &str) -> Option<serde_json::Value> {
-    const TTL: Duration = Duration::from_secs(30);
+    let ttl = Duration::from_secs(market_poll_secs() + 120);
     let guard = listing_terms_cache().lock().ok()?;
     guard
         .get(key)
-        .filter(|(at, _)| at.elapsed() < TTL)
+        .filter(|(at, _)| at.elapsed() < ttl)
         .map(|(_, v)| v.clone())
 }
 fn listing_terms_store(key: &str, value: &serde_json::Value) {
@@ -1457,6 +1510,46 @@ async fn attach_listing_terms(mut listings: Vec<serde_json::Value>) -> Vec<serde
         }
     }
     listings
+}
+
+/// Refresh the listing-terms cache for the NEWEST priced listings after each poll cycle (PC2 parity:
+/// prices ride the scan cadence, so browsing hits a warm cache instead of paying on-chain reads on the
+/// request path). Same batched read + canonical brief shape as `attach_listing_terms` (P10), same
+/// per-card fallback. Bounded to one Discover page; free assets carry no listing. Metadata warming is
+/// NOT done here — `enrich_cache` is content-addressed and disk-backed, so each asset pays that fetch
+/// once ever, on first sighting. Blocking (eth_calls) — poll-cycle context only.
+fn warm_listing_terms(idx: &content_index::ContentIndex) {
+    const WARM_MAX: usize = 24;
+    let items: Vec<(String, String, String)> = idx
+        .search(None, None, None)
+        .into_iter()
+        .filter(|l| l.op_type != "free" && !l.operative_address.is_empty())
+        .take(WARM_MAX)
+        .map(|l| {
+            let word = buy_authority::token_id_to_word(&l.token_id);
+            let key = format!("{}:{}", l.operative_address.to_lowercase(), word);
+            (l.operative_address.clone(), word, key)
+        })
+        .collect();
+    if items.is_empty() {
+        return;
+    }
+    let batch: Vec<(String, String)> = items
+        .iter()
+        .map(|(op, w, _)| (op.clone(), w.clone()))
+        .collect();
+    match market_reads::listing_briefs_batched(DEFAULT_GATEWAY, &batch) {
+        Ok(briefs) if briefs.len() == items.len() => {
+            for ((_, _, key), brief) in items.iter().zip(briefs.iter()) {
+                listing_terms_store(key, &brief_to_json(brief));
+            }
+        }
+        _ => {
+            for (operative, word, key) in &items {
+                listing_terms_store(key, &compute_listing_brief(operative, word));
+            }
+        }
+    }
 }
 
 /// Shallow-merge a JSON object's fields onto a row (both must be objects; no-op otherwise).
@@ -2524,6 +2617,179 @@ pub(super) async fn market_order_approve(
 #[cfg(test)]
 mod tests {
     use super::{content_category, format_minor_units, is_evm_address, pay_token_display};
+
+    /// Lane-orchestration tests for `advance_index` against a SCRIPTED chain-provider stub (the
+    /// same subprocess seam the buy tests use): each `chain_tx` call is one fresh conversation
+    /// (init + one op), so the stub routes on the op — `block_number` answers from `head.txt`,
+    /// `logs` answers from a per-`fromBlock` canned file (`logs_<0xfrom>.json`), a `fail_<0xfrom>`
+    /// marker forces that window to error. Proves the cursor semantics end-to-end: cold seed,
+    /// contiguous delta, bounded backfill, fail-soft partial progress, and deploy-block completion.
+    #[cfg(all(unix, feature = "dev-modes"))]
+    mod advance_index_lanes {
+        use crate::api::content_index::{
+            ASSET_CREATED_TOPIC0, EVENT_HUB_DEPLOY_BLOCK, REORG_OVERLAP_BLOCKS,
+        };
+        use serde_json::{json, Value};
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::path::Path;
+
+        const WINDOW: u64 = 10_000;
+
+        /// A minimal well-formed `AssetCreated` log at `block` for a distinct `(channel, tokenId)`.
+        fn ac_log(token_id: u64, block: u64) -> Value {
+            let pad_addr = |a: &str| format!("{:0>64}", a.trim_start_matches("0x").to_lowercase());
+            let uri = format!("ipfs://bafy-{token_id}");
+            let uri_hex: String = uri.bytes().map(|b| format!("{b:02x}")).collect();
+            let data = format!(
+                "0x{:064x}{:064x}{:064x}{:064x}{}",
+                token_id,
+                96, // uri byte-offset
+                1,  // opType buy_once
+                uri.len(),
+                format!("{uri_hex:0<width$}", width = uri.len().div_ceil(32) * 64),
+            );
+            json!({
+                "topics": [
+                    ASSET_CREATED_TOPIC0,
+                    pad_addr("0x1111111111111111111111111111111111111111"),
+                    pad_addr(&format!("0x{:040x}", 0xaaaa_0000_u64 + token_id)),
+                    pad_addr(&format!("0x{:040x}", 0xb0b0_0000_u64 + token_id)),
+                ],
+                "data": data,
+                "blockNumber": format!("0x{block:x}"),
+            })
+        }
+
+        /// Write the scripted stub + `head.txt` into `dir`; returns the stub path.
+        fn write_stub(dir: &Path, head: u64) -> std::path::PathBuf {
+            std::fs::write(dir.join("head.txt"), format!("0x{head:x}")).unwrap();
+            let stub = dir.join("scripted-chain.sh");
+            std::fs::write(
+                &stub,
+                format!(
+                    "#!/bin/sh\nread _init\nprintf '{{\"status\":\"ok\",\"data\":{{}}}}\\n'\n\
+                     read op\ncase \"$op\" in\n\
+                     *block_number*) printf '{{\"status\":\"ok\",\"data\":{{\"block_number\":\"%s\"}}}}\\n' \"$(cat {dir}/head.txt)\";;\n\
+                     *)\n  from=$(printf '%s' \"$op\" | sed -n 's/.*\"fromBlock\":\"\\(0x[0-9a-f]*\\)\".*/\\1/p')\n\
+                     if [ -f \"{dir}/fail_$from\" ]; then printf '{{\"status\":\"err\",\"message\":\"stub rpc failure\"}}\\n'\n\
+                     elif [ -f \"{dir}/logs_$from.json\" ]; then cat \"{dir}/logs_$from.json\"\n\
+                     else printf '{{\"status\":\"ok\",\"data\":{{\"logs\":[]}}}}\\n'\nfi;;\nesac\n",
+                    dir = dir.display(),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            stub
+        }
+
+        fn write_logs(dir: &Path, from: u64, logs: &[Value]) {
+            std::fs::write(
+                dir.join(format!("logs_0x{from:x}.json")),
+                json!({ "status": "ok", "data": { "logs": logs } }).to_string(),
+            )
+            .unwrap();
+        }
+
+        fn set_env(stub: &Path) {
+            std::env::set_var("ELASTOS_CHAIN_PROVIDER_BIN", stub);
+            std::env::set_var("ELASTOS_CHAIN_BASE_RPC", "http://127.0.0.1:9");
+            std::env::set_var("ELASTOS_MARKET_DISCOVERY_WINDOWS", "1");
+            std::env::set_var("ELASTOS_MARKET_BACKFILL_WINDOWS", "1");
+        }
+
+        fn clear_env() {
+            for k in [
+                "ELASTOS_CHAIN_PROVIDER_BIN",
+                "ELASTOS_CHAIN_BASE_RPC",
+                "ELASTOS_MARKET_DISCOVERY_WINDOWS",
+                "ELASTOS_MARKET_BACKFILL_WINDOWS",
+            ] {
+                std::env::remove_var(k);
+            }
+        }
+
+        #[test]
+        fn seeds_then_advances_delta_and_backfill_and_keeps_progress_on_rpc_failure() {
+            let _g = crate::api::ddrm_env_lock();
+            let dir = tempfile::tempdir().unwrap();
+            let head = EVENT_HUB_DEPLOY_BLOCK + 1_000_000;
+            let stub = write_stub(dir.path(), head);
+            set_env(&stub);
+
+            // Cycle 1 (cold): one discovery window [head-9999, head] carrying listing #1 seeds the cursor.
+            write_logs(dir.path(), head - (WINDOW - 1), &[ac_log(1, head - 5)]);
+            let idx = super::super::advance_index(None).expect("cold seed cycle");
+            assert!(idx.cursor_set());
+            assert_eq!(idx.scanned_to(), head);
+            assert_eq!(idx.backfill_low(), head - (WINDOW - 1));
+            assert_eq!(idx.len(), 1);
+            assert_eq!(idx.coverage(), "indexing");
+
+            // Cycle 2: the delta lane re-scans only the reorg overlap (head unchanged, one window);
+            // the backfill lane takes exactly ONE window below the cursor and finds listing #2.
+            let bf1_from = head - (2 * WINDOW - 1);
+            write_logs(dir.path(), bf1_from, &[ac_log(2, head - 15_000)]);
+            // The delta overlap window replaces listing #1's row at a new block (reorg re-derive).
+            write_logs(
+                dir.path(),
+                idx.scanned_to() - REORG_OVERLAP_BLOCKS + 1,
+                &[ac_log(1, head - 3)],
+            );
+            let idx = super::super::advance_index(Some(&idx)).expect("delta+backfill cycle");
+            assert_eq!(idx.scanned_to(), head, "delta lane stays at head");
+            assert_eq!(
+                idx.backfill_low(),
+                bf1_from,
+                "one backfill window per cycle"
+            );
+            assert_eq!(idx.len(), 2, "backfill found the older listing");
+            let newest = idx.search(None, None, None);
+            assert_eq!(
+                newest[0].first_seen_block,
+                head - 3,
+                "the overlap re-scan re-derived the reorged row (idempotent upsert, higher block wins)"
+            );
+
+            // Cycle 3: the next backfill window RPC-fails — the cycle is fail-soft: it returns the
+            // progress it made and the cursor does NOT move past the failed window.
+            std::fs::write(
+                dir.path()
+                    .join(format!("fail_0x{:x}", head - (3 * WINDOW - 1))),
+                b"",
+            )
+            .unwrap();
+            let idx = super::super::advance_index(Some(&idx)).expect("fail-soft cycle still Ok");
+            assert_eq!(
+                idx.backfill_low(),
+                bf1_from,
+                "a failed window leaves backfill_low unchanged — next cycle retries it"
+            );
+            assert_eq!(idx.len(), 2);
+
+            clear_env();
+        }
+
+        #[test]
+        fn backfill_reaching_the_deploy_block_flips_coverage_to_indexed() {
+            let _g = crate::api::ddrm_env_lock();
+            let dir = tempfile::tempdir().unwrap();
+            // Head close enough that one seed window + one backfill window reach the deploy block.
+            let head = EVENT_HUB_DEPLOY_BLOCK + 15_000;
+            let stub = write_stub(dir.path(), head);
+            set_env(&stub);
+
+            let idx = super::super::advance_index(None).expect("cold seed");
+            assert_eq!(idx.backfill_low(), head - (WINDOW - 1)); // deploy+5001
+            assert!(!idx.backfill_complete());
+
+            let idx = super::super::advance_index(Some(&idx)).expect("final backfill window");
+            assert!(idx.backfill_complete(), "backfill reached the deploy block");
+            assert_eq!(idx.coverage(), "indexed");
+            assert_eq!(idx.backfill_low(), EVENT_HUB_DEPLOY_BLOCK);
+
+            clear_env();
+        }
+    }
 
     #[test]
     fn content_category_refines_mime_with_metadata_truthfully() {

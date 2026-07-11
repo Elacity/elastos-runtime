@@ -728,6 +728,7 @@ pub fn gateway_router(state: GatewayState) -> Router {
         .route("/api/apps/services/offers", post(services_offer_update))
         .route("/api/market/search", get(market_search))
         .route("/api/market/sections", get(market_sections))
+        .route("/api/market/indexer-status", get(market_indexer_status))
         .route("/api/market/get", get(market_get))
         .route("/api/market/history", get(market_history))
         .route("/api/market/preview/plan", get(market_preview_plan))
