@@ -18,6 +18,13 @@ const ELASTOS_VERSION: &str = env!("ELASTOS_VERSION");
 pub struct GatewayControlPlane {
     pub provider_registry: Arc<provider::ProviderRegistry>,
     pub host_helpers: Vec<api::server::HostHelperProcess>,
+    /// The shared mandate registry, capability manager, and payment rail. When present, the
+    /// browser gateway mounts the Mandates/Money/Marketplace sub-router (the buy surface) against
+    /// the SAME handles the runtime built — without them those panels 404. `None` keeps the
+    /// infrastructure-only control plane (mint/content) exactly as before.
+    pub standing_service: Option<Arc<elastos_runtime::capability::intent::StandingGrantService>>,
+    pub capability_manager: Option<Arc<elastos_runtime::capability::CapabilityManager>>,
+    pub pay_rail: Option<api::server::PayRail>,
 }
 
 pub async fn run_gateway_direct<F, Fut>(
@@ -62,11 +69,11 @@ where
         None,
         // Control-plane gateway keeps its own durable file sink (no shared infra log here).
         None,
-        // The control-plane gateway serves infrastructure capsules, not the operator's mandate
-        // surface, so it carries no shared standing-grant registry / capability manager / pay rail.
-        None,
-        None,
-        None,
+        // When the control plane supplies the mandate/capability/pay-rail handles, mount the
+        // Mandates/Money/Marketplace buy surface against them; otherwise stay infrastructure-only.
+        control_plane.standing_service,
+        control_plane.capability_manager,
+        control_plane.pay_rail,
     )
     .await
 }

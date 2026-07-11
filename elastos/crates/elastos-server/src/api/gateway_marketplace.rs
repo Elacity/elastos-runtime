@@ -53,10 +53,11 @@ pub(super) async fn marketplace_catalog(
     }
 }
 
-/// `GET /api/market/search?op=&q=` — content discovery over a RECENT window of `AssetCreated`
-/// (one `block_number` + one ≤10k `getLogs` via chain-provider). READ-ONLY; holds no keys/RPC of its
-/// own (P3). The full backfill + persistent polling cache is the Phase-2 follow-on
-/// (PHASE2_INDEX_AND_API.md); the money path NEVER trusts this — buy re-verifies terms live (Phase-1).
+/// `GET /api/market/search?op=&q=` — content discovery over the persistent `AssetCreated` index
+/// (cursor + backfill, PHASE2_INDEX_AND_API.md chunk 2; all reads via chain-provider). READ-ONLY;
+/// holds no keys/RPC of its own (P3). `coverage` reports how much history the index has reached
+/// (`recent-window` → `indexing` → `indexed`); the money path NEVER trusts this — buy re-verifies
+/// terms live (Phase-1).
 pub(super) async fn market_search(
     State(state): State<GatewayState>,
     Query(params): Query<HashMap<String, String>>,
@@ -76,16 +77,21 @@ pub(super) async fn market_search(
                 .get("channel")
                 .map(String::as_str)
                 .filter(|s| !s.is_empty());
+            // Newest-first cap: with the persistent index the searchable set grows toward FULL chain
+            // history, so an uncapped response (and its enrichment fan-out) would scale with the chain,
+            // not the request. `indexed` still reports the whole set.
+            const SEARCH_RESULTS_MAX: usize = 200;
             let listings: Vec<_> = idx
                 .search(op, q, channel)
                 .into_iter()
+                .take(SEARCH_RESULTS_MAX)
                 .map(|l| l.to_json())
                 .collect();
             let listings = enrich_listings(&state, listings, is_lean(&params)).await;
             Json(serde_json::json!({
                 "listings": listings,
                 "indexed": idx.len(),
-                "coverage": "recent-window",
+                "coverage": idx.coverage(),
             }))
             .into_response()
         }
@@ -131,14 +137,14 @@ fn is_lean(params: &HashMap<String, String>) -> bool {
     )
 }
 
-/// Stale-while-revalidate cache around `build_recent_index` so discovery requests almost never block on a
-/// chain sweep. `market_search`/`market_sections` are unauthenticated and each sweep is one `block_number`
-/// plus one <=10k `getLogs` through a freshly-spawned chain-provider subprocess, so without caching an
-/// unauthenticated flood amplifies into per-request RPC cost and subprocess churn (deep-audit MED).
-/// Three tiers by age: under `FRESH`, serve as-is; between `FRESH` and `MAX_STALE`, serve the cached index
-/// IMMEDIATELY and revalidate in a single-flight background sweep (no synchronous stall); past `MAX_STALE`
-/// or cold, rebuild synchronously — fail-closed to freshness rather than serving an ancient list. The money
-/// path NEVER trusts this cache (buy re-verifies terms live, Phase-1); Phase-2 polling cache supersedes it.
+/// Stale-while-revalidate cache around `advance_index` so discovery requests almost never block on a
+/// chain sweep. `market_search`/`market_sections` are unauthenticated and each cycle spawns a
+/// chain-provider subprocess per `getLogs` window, so without caching an unauthenticated flood amplifies
+/// into per-request RPC cost and subprocess churn (deep-audit MED). Tiers by age: under `FRESH`, serve
+/// as-is; past `FRESH`, serve the cached index IMMEDIATELY and advance in a single-flight background
+/// cycle. Only a legacy CURSORLESS window cache past `MAX_STALE` (or a cold start) builds synchronously —
+/// a cursor-bearing index is confirmed history and never blocks a request. The money path NEVER trusts
+/// this cache (buy re-verifies terms live, Phase-1).
 type RecentIndexCacheCell = Mutex<Option<(Instant, Arc<content_index::ContentIndex>)>>;
 
 fn recent_index_cell() -> &'static RecentIndexCacheCell {
@@ -156,18 +162,28 @@ fn ensure_index_snapshot_path(data_dir: &std::path::Path) {
     let _ = INDEX_SNAPSHOT_PATH.set(data_dir.join("market").join("index-snapshot.json"));
 }
 
-/// Load the disk snapshot IF present, parseable, non-empty, and recent enough (mtime within `MAX_DISK_AGE`)
-/// to be worth serving before a fresh sweep completes. `None` => fall through to a synchronous build.
+/// Load the disk snapshot IF present, parseable, and worth serving before a fresh sweep completes.
+/// A CURSOR-BEARING (v2) snapshot is served at ANY age — its listings are confirmed chain history
+/// (never invalidated by time; the delta lane catches the range up and `coverage` labels the gap
+/// honestly). A legacy cursorless (v1) snapshot is only a bounded recent-window cache, so it keeps
+/// the freshness gate: past `MAX_DISK_AGE` it is dropped rather than served as if recent.
+/// `None` => fall through to a synchronous build.
 fn load_index_snapshot_if_recent() -> Option<content_index::ContentIndex> {
-    const MAX_DISK_AGE: Duration = Duration::from_secs(3600); // bound how stale a cold-start list can be
+    const MAX_DISK_AGE: Duration = Duration::from_secs(3600);
     let path = INDEX_SNAPSHOT_PATH.get()?;
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    if modified.elapsed().map(|e| e > MAX_DISK_AGE).unwrap_or(true) {
-        return None; // too old (or clock skew) — rebuild fresh rather than show an ancient list
-    }
     let idx =
         serde_json::from_slice::<content_index::ContentIndex>(&std::fs::read(path).ok()?).ok()?;
-    (idx.len() > 0).then_some(idx)
+    if idx.len() == 0 {
+        return None;
+    }
+    if idx.cursor_set() {
+        return Some(idx);
+    }
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    if modified.elapsed().map(|e| e > MAX_DISK_AGE).unwrap_or(true) {
+        return None; // stale v1 window cache — rebuild fresh rather than show an ancient list
+    }
+    Some(idx)
 }
 
 /// Best-effort atomic write (tmp + rename) of the index snapshot. A failed write just leaves the prior
@@ -187,9 +203,10 @@ fn persist_index_snapshot(idx: &content_index::ContentIndex) {
     }
 }
 
-/// Single-flight background revalidation: at most one sweep in flight; success swaps the cache AND refreshes
-/// the disk snapshot, failure keeps the (stale) entry so the next request still serves and retries. No-op
-/// outside a tokio runtime.
+/// Single-flight background revalidation: at most one advance cycle in flight; success swaps the cache
+/// AND refreshes the disk snapshot, failure keeps the (stale) entry so the next request still serves and
+/// retries. The cycle ADVANCES the cursor-bearing index (delta + backfill lanes) rather than rebuilding
+/// from scratch, so already-covered history is never re-scanned. No-op outside a tokio runtime.
 fn spawn_index_revalidate() {
     static REFRESHING: AtomicBool = AtomicBool::new(false);
     if tokio::runtime::Handle::try_current().is_err() {
@@ -202,7 +219,11 @@ fn spawn_index_revalidate() {
         return;
     }
     tokio::task::spawn_blocking(|| {
-        if let Ok(idx) = build_recent_index() {
+        let prev = recent_index_cell()
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|(_, idx)| Arc::clone(idx)));
+        if let Ok(idx) = advance_index(prev.as_deref()) {
             persist_index_snapshot(&idx);
             if let Ok(mut guard) = recent_index_cell().lock() {
                 *guard = Some((Instant::now(), Arc::new(idx)));
@@ -212,12 +233,41 @@ fn spawn_index_revalidate() {
     });
 }
 
+/// Start the periodic polling loop (once per process, on the first discovery request): every
+/// `ELASTOS_MARKET_POLL_SECS` (default 300s, clamped 30..3600) trigger a single-flight advance cycle so
+/// the index keeps backfilling + tracking head even while nobody browses. Request-driven SWR remains the
+/// freshness floor; this loop is what turns the bounded window cache into the Phase-2 persistent index
+/// (PHASE2_INDEX_AND_API.md chunk 2 — polling, not subscription).
+fn ensure_index_poll_loop() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    STARTED.get_or_init(|| {
+        let secs: u64 = std::env::var("ELASTOS_MARKET_POLL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300)
+            .clamp(30, 3600);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(secs));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await; // consume the immediate first tick — the SWR path covers "now"
+            loop {
+                ticker.tick().await;
+                spawn_index_revalidate();
+            }
+        });
+    });
+}
+
 fn recent_index_cached(
     data_dir: &std::path::Path,
 ) -> Result<Arc<content_index::ContentIndex>, String> {
     const FRESH: Duration = Duration::from_secs(10);
     const MAX_STALE: Duration = Duration::from_secs(300);
     ensure_index_snapshot_path(data_dir);
+    ensure_index_poll_loop();
     let cell = recent_index_cell();
     let snapshot = cell
         .lock()
@@ -228,8 +278,11 @@ fn recent_index_cached(
         if age < FRESH {
             return Ok(idx);
         }
-        if age < MAX_STALE {
-            spawn_index_revalidate(); // serve stale now, refresh in background
+        if age < MAX_STALE || idx.cursor_set() {
+            // Serve now, refresh in background. A cursor-bearing index NEVER blocks the request on a
+            // sync rebuild past MAX_STALE: its rows are confirmed history (only recency is missing, and
+            // `coverage` says so) — fail-closed-to-freshness only applies to the legacy window cache.
+            spawn_index_revalidate();
             return Ok(idx);
         }
     } else if let Some(disk) = load_index_snapshot_if_recent() {
@@ -245,9 +298,10 @@ fn recent_index_cached(
         spawn_index_revalidate();
         return Ok(idx);
     }
-    // Cold start with no usable snapshot, or too-stale-to-trust: rebuild synchronously (fail-closed to
-    // freshness) and persist the snapshot for the next cold start.
-    let fresh = Arc::new(build_recent_index()?);
+    // Cold start with no usable snapshot, or a too-stale legacy window cache: build synchronously
+    // (fail-closed to freshness) and persist the snapshot for the next cold start. This first build
+    // seeds the cursor, so it happens at most once per data dir.
+    let fresh = Arc::new(advance_index(None)?);
     persist_index_snapshot(&fresh);
     if let Ok(mut guard) = cell.lock() {
         *guard = Some((Instant::now(), Arc::clone(&fresh)));
@@ -263,44 +317,117 @@ fn market_error(err: &str) -> Response {
         .into_response()
 }
 
-/// Build a fresh index from a recent `AssetCreated` window (`head-10k .. latest`): one `block_number`
-/// plus one `getLogs` through chain-provider. The persistent polling cache (cursors/backfill, served
-/// from gateway state) is the Phase-2 optimization — kept out so this slice stays one-RPC-window bounded.
-fn build_recent_index() -> Result<content_index::ContentIndex, String> {
-    use content_index::{ContentIndex, ASSET_CREATED_TOPIC0, EVENT_HUB};
+/// One `EVENT_HUB` `AssetCreated` `getLogs` window ingested into the index. `to_block` is either an
+/// explicit pinned `0x…` bound or `"latest"` (newest window only — head may advance mid-scan).
+fn scan_asset_created_window(
+    idx: &mut content_index::ContentIndex,
+    from: u64,
+    to_block: &str,
+) -> Result<(), String> {
+    let filter = serde_json::json!({
+        "address": content_index::EVENT_HUB,
+        "fromBlock": format!("0x{from:x}"),
+        "toBlock": to_block,
+        "topics": [content_index::ASSET_CREATED_TOPIC0],
+    });
+    idx.ingest_logs(&chain_tx::get_logs_live(filter)?);
+    Ok(())
+}
+
+/// One advance cycle of the persistent discovery index (PHASE2_INDEX_AND_API.md chunk 2). Every read
+/// goes through `chain-provider` (the sole RPC declarant, P10) in ≤10k-block `getLogs` windows.
+///
+/// - **Cold (no cursor):** the pre-cursor bounded sweep — `ELASTOS_MARKET_DISCOVERY_WINDOWS` (default 1,
+///   clamp 1..64) windows newest-first — then the cursor is SEEDED over the swept range, so every later
+///   cycle is incremental.
+/// - **Delta lane:** scan `[scanned_to − reorg overlap, head]` upward, bounded windows per cycle; a
+///   longer outage just takes a few cycles to catch up. The overlap re-derives rows a shallow reorg
+///   may have moved (upsert is idempotent).
+/// - **Backfill lane:** scan bounded windows DOWNWARD from `backfill_low` toward the EventHub deploy
+///   block (`ELASTOS_MARKET_BACKFILL_WINDOWS` per cycle, default 8, clamp 0..64; 0 disables). Once the
+///   deploy block is reached the index covers full history and `coverage` reports `indexed`.
+///
+/// Lane errors after the cursor exists are FAIL-SOFT: the cycle returns the progress it made (the cursor
+/// only advanced over ranges actually ingested) and the next cycle retries — discovery is advisory, the
+/// money path never trusts it.
+fn advance_index(
+    prev: Option<&content_index::ContentIndex>,
+) -> Result<content_index::ContentIndex, String> {
+    use content_index::{ContentIndex, EVENT_HUB_DEPLOY_BLOCK, REORG_OVERLAP_BLOCKS};
     const WINDOW: u64 = 10_000;
-    // Discovery depth: how many <=10k `getLogs` windows to scan newest-first. Default 1 (one RPC window,
-    // production-lean — the same single-window slice as before). Raise via `ELASTOS_MARKET_DISCOVERY_WINDOWS`
-    // to surface OLDER assets (each window ~10k Base blocks ≈ 5.5h) until the Phase-2 persistent
-    // cursor/backfill index lands. Clamped so a hostile value can't fan out unbounded RPC.
-    let windows: u64 = std::env::var("ELASTOS_MARKET_DISCOVERY_WINDOWS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1)
-        .clamp(1, 64);
+    /// Delta windows per cycle: 16 × 10k ≈ 3.7 days of Base blocks — one cycle absorbs a long outage.
+    const DELTA_WINDOWS_MAX: u64 = 16;
     let head = chain_tx::block_number_live()?;
-    let mut idx = ContentIndex::new();
-    let mut to = head;
-    for i in 0..windows {
-        let from = to.saturating_sub(WINDOW - 1);
-        // The newest window tracks "latest" (head may advance mid-scan); older windows pin an explicit
-        // toBlock so each call stays a bounded <=10k span the public Base log pool accepts.
-        let to_block = if i == 0 {
+    let mut idx = prev.cloned().unwrap_or_else(ContentIndex::new);
+
+    if !idx.cursor_set() {
+        let windows: u64 = std::env::var("ELASTOS_MARKET_DISCOVERY_WINDOWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1)
+            .clamp(1, 64);
+        let mut to = head;
+        let mut low = head;
+        for i in 0..windows {
+            let from = to.saturating_sub(WINDOW - 1);
+            let to_block = if i == 0 {
+                "latest".to_string()
+            } else {
+                format!("0x{to:x}")
+            };
+            scan_asset_created_window(&mut idx, from, &to_block)?;
+            low = from;
+            if from == 0 {
+                break;
+            }
+            to = from.saturating_sub(1);
+        }
+        idx.seed_cursor(low, head);
+        return Ok(idx);
+    }
+
+    // Delta lane: contiguous upward from just below the cursor (reorg overlap) to head.
+    let mut from = idx
+        .scanned_to()
+        .saturating_sub(REORG_OVERLAP_BLOCKS)
+        .saturating_add(1);
+    for _ in 0..DELTA_WINDOWS_MAX {
+        if from > head {
+            break;
+        }
+        let to = from.saturating_add(WINDOW - 1).min(head);
+        let to_block = if to == head {
             "latest".to_string()
         } else {
             format!("0x{to:x}")
         };
-        let filter = serde_json::json!({
-            "address": EVENT_HUB,
-            "fromBlock": format!("0x{from:x}"),
-            "toBlock": to_block,
-            "topics": [ASSET_CREATED_TOPIC0],
-        });
-        idx.ingest_logs(&chain_tx::get_logs_live(filter)?);
-        if from == 0 {
+        if scan_asset_created_window(&mut idx, from, &to_block).is_err() {
+            return Ok(idx); // fail-soft: keep this cycle's progress, retry next cycle
+        }
+        idx.note_delta_scanned(to);
+        from = to.saturating_add(1);
+    }
+
+    // Backfill lane: bounded windows downward toward the deploy block.
+    let backfill_windows: u64 = std::env::var("ELASTOS_MARKET_BACKFILL_WINDOWS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8)
+        .clamp(0, 64);
+    for _ in 0..backfill_windows {
+        if idx.backfill_complete() {
             break;
         }
-        to = from.saturating_sub(1);
+        let hi = idx.backfill_low().saturating_sub(1);
+        if hi <= EVENT_HUB_DEPLOY_BLOCK {
+            idx.note_backfilled(EVENT_HUB_DEPLOY_BLOCK);
+            break;
+        }
+        let lo = hi.saturating_sub(WINDOW - 1).max(EVENT_HUB_DEPLOY_BLOCK);
+        if scan_asset_created_window(&mut idx, lo, &format!("0x{hi:x}")).is_err() {
+            return Ok(idx); // fail-soft: resume from the same backfill_low next cycle
+        }
+        idx.note_backfilled(lo);
     }
     Ok(idx)
 }

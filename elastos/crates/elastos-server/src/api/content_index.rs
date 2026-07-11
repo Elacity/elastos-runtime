@@ -22,6 +22,14 @@ pub(crate) const ASSET_CREATED_TOPIC0: &str =
 /// (`pc2-node config/default.json content_indexer.contracts.v3.event_hub`).
 pub(crate) const EVENT_HUB: &str = "0x5a694A6d988354dca491fe0F6db7a6ef46b656c2";
 
+/// The EventHub deployment block on Base — the backfill floor. No `AssetCreated` exists below it,
+/// so the backfill lane stops here (`pc2-node config/default.json content_indexer.contracts.v3.from_block`).
+pub(crate) const EVENT_HUB_DEPLOY_BLOCK: u64 = 43_892_000;
+
+/// Blocks re-scanned behind the cursor each delta cycle so a shallow head reorg re-derives its rows
+/// (`upsert` is idempotent, so the overlap is pure insurance, PHASE2_INDEX_AND_API.md chunk 2).
+pub(crate) const REORG_OVERLAP_BLOCKS: u64 = 120;
+
 /// op-type codes carried by the mint / `AssetCreated._opType`.
 fn op_type_name(code: u64) -> &'static str {
     match code {
@@ -72,14 +80,74 @@ impl Listing {
 }
 
 /// The in-memory discovery cache: newest-first listings, deduped by `(channel, tokenId)`.
-#[derive(Debug, Default, Serialize, Deserialize)]
+///
+/// Snapshot v2 adds the two persistent cursors (PHASE2_INDEX_AND_API.md chunk 2): the covered
+/// contiguous block range is `[backfill_low, scanned_to]`. Both default to 0 so a v1 snapshot
+/// (listings only) still parses — 0 means "cursor unset", and the next advance cycle seeds it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct ContentIndex {
     listings: Vec<Listing>,
+    /// Highest block the delta lane has scanned (top of the covered range). 0 = never scanned.
+    #[serde(default)]
+    scanned_to: u64,
+    /// Lowest block the backfill lane has reached (bottom of the covered range). 0 = never scanned.
+    /// Backfill is COMPLETE once this is at/below `EVENT_HUB_DEPLOY_BLOCK`.
+    #[serde(default)]
+    backfill_low: u64,
 }
 
 impl ContentIndex {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn scanned_to(&self) -> u64 {
+        self.scanned_to
+    }
+
+    pub(crate) fn backfill_low(&self) -> u64 {
+        self.backfill_low
+    }
+
+    /// True once a cursor exists (some contiguous range is covered).
+    pub(crate) fn cursor_set(&self) -> bool {
+        self.scanned_to > 0 && self.backfill_low > 0
+    }
+
+    /// True once the backfill lane has reached the EventHub deployment block — full history covered.
+    pub(crate) fn backfill_complete(&self) -> bool {
+        self.cursor_set() && self.backfill_low <= EVENT_HUB_DEPLOY_BLOCK
+    }
+
+    /// The honest coverage label served with every discovery response: full history (`indexed`),
+    /// cursor advancing but history incomplete (`indexing`), or the legacy bounded window.
+    pub(crate) fn coverage(&self) -> &'static str {
+        if self.backfill_complete() {
+            "indexed"
+        } else if self.cursor_set() {
+            "indexing"
+        } else {
+            "recent-window"
+        }
+    }
+
+    /// Seed the cursor after the FIRST full sweep covered `[low, high]`.
+    pub(crate) fn seed_cursor(&mut self, low: u64, high: u64) {
+        self.backfill_low = low.max(1);
+        self.scanned_to = high.max(self.backfill_low);
+    }
+
+    /// Advance the delta lane's top-of-range after a `[.., to]` head scan.
+    pub(crate) fn note_delta_scanned(&mut self, to: u64) {
+        self.scanned_to = self.scanned_to.max(to);
+    }
+
+    /// Lower the backfill lane's bottom-of-range after a `[low, ..]` history scan.
+    pub(crate) fn note_backfilled(&mut self, low: u64) {
+        let low = low.max(1);
+        if self.backfill_low == 0 || low < self.backfill_low {
+            self.backfill_low = low;
+        }
     }
 
     /// Insert or replace a listing (keyed by `(channel, tokenId)`); a re-mint of the same id wins by
@@ -392,6 +460,42 @@ mod tests {
         let b = restored.search(None, None, None);
         assert_eq!(a, b);
         assert_eq!(b[0].first_seen_block, 20);
+    }
+
+    #[test]
+    fn cursor_seed_advance_and_coverage_labels() {
+        let mut idx = ContentIndex::new();
+        // No cursor: legacy label.
+        assert!(!idx.cursor_set());
+        assert_eq!(idx.coverage(), "recent-window");
+        // First sweep covered [head-10k, head] well above the deploy block: indexing.
+        let head = EVENT_HUB_DEPLOY_BLOCK + 1_000_000;
+        idx.seed_cursor(head - 9_999, head);
+        assert!(idx.cursor_set());
+        assert!(!idx.backfill_complete());
+        assert_eq!(idx.coverage(), "indexing");
+        // Delta lane only moves the top upward (a lower value is a no-op).
+        idx.note_delta_scanned(head + 5_000);
+        idx.note_delta_scanned(head);
+        assert_eq!(idx.scanned_to(), head + 5_000);
+        // Backfill lane only moves the bottom downward (a higher value is a no-op).
+        idx.note_backfilled(head - 50_000);
+        idx.note_backfilled(head);
+        assert_eq!(idx.backfill_low(), head - 50_000);
+        // Reaching the deploy block flips coverage to the full-history label.
+        idx.note_backfilled(EVENT_HUB_DEPLOY_BLOCK);
+        assert!(idx.backfill_complete());
+        assert_eq!(idx.coverage(), "indexed");
+    }
+
+    #[test]
+    fn v1_snapshot_without_cursors_still_parses() {
+        // A pre-cursor (v1) on-disk snapshot carries only `listings`; serde defaults must accept it
+        // and report an unset cursor so the next advance cycle seeds it instead of trusting garbage.
+        let v1 = json!({ "listings": [] }).to_string();
+        let idx: ContentIndex = serde_json::from_str(&v1).expect("v1 snapshot parses");
+        assert!(!idx.cursor_set());
+        assert_eq!(idx.coverage(), "recent-window");
     }
 
     #[test]

@@ -9,6 +9,16 @@ The index is **NOT a new provider capsule** — it's a **server-side cache table
 Define `MarketListingV1` = exactly what `content-market` emits (`content_id`==bytes16 KID, `channel_address`, `chain_id`, `token_uri`, `metadata_cid`, `op_type`+code, `copies`, `price_wei`, `pay_token`, `name`, `description`, `image_url`, `mime_type`, `asset_type`, `creator_address`, `metadata_status`, `source`) **plus index-derived** (`tier` from asset_type/mime, `medium` ∈ {watch,listen,read,view,explore}, `first_seen_block`, `listings[]` primary+resale, `resale_floor`, `holders`). Persist one row per `content_id`; every row carries `source` so it's re-derivable. *Check:* a fixture mint round-trips calldata → `content-market` decode → row → JSON matching `api.js`'s shape; serde + a schema test pass.
 
 ## Chunk 2 — the polling indexer (NOT subscription)
+
+> **Status (2026-07-10): core landed** in `content_index.rs` + `gateway_marketplace.rs`. The snapshot
+> carries persistent cursors (`scanned_to`/`backfill_low`, v1 snapshots parse with defaults); each
+> advance cycle runs a delta lane (head-tracking, 120-block reorg overlap, ≤16 windows/cycle) and a
+> backfill lane (`ELASTOS_MARKET_BACKFILL_WINDOWS` per cycle, default 8, toward the EventHub deploy
+> block 43,892,000); a per-process poll loop (`ELASTOS_MARKET_POLL_SECS`, default 300s) advances even
+> while idle; `/api/market/search` reports honest `coverage` (`recent-window` → `indexing` → `indexed`)
+> and caps results at 200 newest-first. All reads remain `getLogs` via chain-provider (sole RPC
+> declarant). Still open from this chunk: `DigitalAssetRegistered` ingestion, `content-market`
+> event-decode fusion + KID enrichment in the loop, and an explicit freshness SLO surface.
 `chain-provider` exposes `eth_getLogs` only (no `eth_subscribe`), capped to **10k-block windows** on a curated RPC subset. Build a poll loop: maintain a cursor; each tick request `getLogs(DigitalAssetRegistered, AssetCreated)` over `[cursor, min(head, cursor+10k)]`; for each event call `content-market.listing_from_event` then enrich via `ipfs-provider` + `content-market.enrich_listing` (which enforces `metadata.kid == calldata contentId` — keep that reject). Upsert rows; advance cursor. Handle: **backfill** (initial sweep from a configured genesis block), **dedup** (idempotent upsert by `content_id`+`tokenId`), **reorg rollback** (on a head reorg below a confirmed depth, re-derive affected rows by `first_seen_block`), and a **freshness SLO** ("indexed within N seconds," configurable — *not* "one block"). RPC-cost/rate-limit aware (the curated subset; backoff). *Check:* a minted asset appears in the cache within the SLO; a simulated reorg re-derives the affected rows; the loop survives an RPC window that returns nothing / rate-limits.
 
 ## Chunk 3 — the `/api/market/*` gateway routes (serve the shell contract)
