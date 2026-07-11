@@ -135,6 +135,11 @@ pub(super) async fn market_sections(
 /// the public route cannot be used as an RPC-amplification sink.
 pub(super) async fn market_indexer_status(State(state): State<GatewayState>) -> Response {
     ensure_index_snapshot_path(&state.data_dir);
+    // Arm the poll loop here too: after a restart the first traffic may be a status probe, not a
+    // discovery request, and the backfill must not stall waiting for someone to browse. Arming is
+    // idempotent + spawn-only (the advance itself stays single-flight in the background); this
+    // route still never performs a synchronous sweep.
+    ensure_index_poll_loop();
     let idx = recent_index_cell()
         .lock()
         .ok()
