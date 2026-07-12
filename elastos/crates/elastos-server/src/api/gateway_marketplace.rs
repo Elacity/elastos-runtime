@@ -591,25 +591,40 @@ pub(super) async fn market_get(
         get_terms_cache_store(&cache_key, &b);
         b
     };
-    // has_access (per-request, wallet-specific — NOT cached): if the metadata carries the KID, read
-    // hasAccessByContentId(buyer_wallet, KID) live so the detail view shows "you own this".
-    if let Some(kid) = body
-        .get("metadata")
-        .and_then(|m| m.get("kid"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-    {
-        let wallet =
-            crate::api::viewer_open::resolve_subject_address(&state, &context.principal_id).await;
-        if !wallet.trim().is_empty() {
-            let gw = gateway.to_string();
-            if let Ok(Ok(owned)) = tokio::task::spawn_blocking(move || {
-                market_reads::has_access_live(&gw, &wallet, &kid)
-            })
-            .await
-            {
-                if let Some(obj) = body.get_mut("on_chain").and_then(|v| v.as_object_mut()) {
+    // has_access + owned_balance (per-request, wallet-specific — NOT cached):
+    //   has_access    = hasAccessByContentId(wallet, KID) — KID-GLOBAL "can I open this content".
+    //   owned_balance = operative.balanceOf(wallet, ACCESS_TOKEN=1) — copies of THIS listing held
+    //                   (empirically keyed from real buy receipts: TransferSingle emits from the
+    //                   operative with id=1 to the buyer).
+    let wallet =
+        crate::api::viewer_open::resolve_subject_address(&state, &context.principal_id).await;
+    if !wallet.trim().is_empty() {
+        let kid = body
+            .get("metadata")
+            .and_then(|m| m.get("kid"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let gw = gateway.to_string();
+        let op = operative.to_string();
+        let w = wallet.clone();
+        let reads = tokio::task::spawn_blocking(move || {
+            let owned = kid
+                .as_deref()
+                .map(|kid| market_reads::has_access_live(&gw, &w, kid));
+            let balance = market_reads::access_token_balance_live(&op, &w);
+            (owned, balance)
+        })
+        .await;
+        if let Ok((owned, balance)) = reads {
+            if let Some(obj) = body.get_mut("on_chain").and_then(|v| v.as_object_mut()) {
+                if let Some(Ok(owned)) = owned {
                     obj.insert("has_access".to_string(), serde_json::json!(owned));
+                }
+                if let Ok(balance) = balance {
+                    obj.insert(
+                        "owned_balance".to_string(),
+                        serde_json::json!(balance.to_string()),
+                    );
                 }
             }
         }

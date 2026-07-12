@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
+use std::sync::Arc;
 use std::time::Duration;
 
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
@@ -53,11 +54,34 @@ struct AvailabilityConfig {
 #[derive(Debug, Clone, Deserialize)]
 struct AvailabilityTarget {
     id: String,
+    /// For `kind: ensure` (default) this is the SmartWeb `/availability/ensure` endpoint.
+    /// For `kind: pinning_service` this is the BASE URL of a standard IPFS Pinning
+    /// Services API (the provider calls `{ensure_url}/pins`).
     ensure_url: String,
+    #[serde(default)]
+    kind: TargetKind,
+    /// Verify the target's TLS certificate against THIS dns name instead of the URL
+    /// host (curl `--resolve` semantics) — for endpoints addressed by IP that serve a
+    /// valid publicly-trusted certificate for a real domain (e.g. the Elacity cluster
+    /// at an IP literal serving the `*.ela.city` certificate). The chain is still
+    /// verified against the system/webpki roots — this never disables verification.
+    #[serde(default)]
+    tls_server_name: Option<String>,
     #[serde(default)]
     authorization: Option<String>,
     #[serde(default)]
     headers: BTreeMap<String, String>,
+}
+
+/// The wire protocol a target speaks. `ensure` is the SmartWeb availability contract;
+/// `pinning_service` is the standard IPFS Pinning Services API (e.g. IPFS Cluster's
+/// port-9097 surface — how the Elacity supernode cluster is addressed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum TargetKind {
+    #[default]
+    Ensure,
+    PinningService,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -100,6 +124,8 @@ impl Response {
 struct AvailabilityProvider {
     targets: Vec<AvailabilityTarget>,
     agent: ureq::Agent,
+    /// Per-target agents for targets with a `tls_server_name` override (keyed by id).
+    tls_agents: BTreeMap<String, ureq::Agent>,
 }
 
 impl AvailabilityProvider {
@@ -109,6 +135,7 @@ impl AvailabilityProvider {
             agent: ureq::AgentBuilder::new()
                 .timeout(Duration::from_secs(default_timeout_secs()))
                 .build(),
+            tls_agents: BTreeMap::new(),
         }
     }
 
@@ -129,12 +156,32 @@ impl AvailabilityProvider {
         self.agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(config.timeout_secs))
             .build();
+        self.tls_agents.clear();
+        for target in &config.targets {
+            if let Some(name) = &target.tls_server_name {
+                match agent_with_pinned_server_name(name, config.timeout_secs) {
+                    Ok(agent) => {
+                        self.tls_agents.insert(target.id.clone(), agent);
+                    }
+                    Err(err) => {
+                        return Response::error(
+                            "invalid_config",
+                            format!("target '{}' tls_server_name: {err}", target.id),
+                        )
+                    }
+                }
+            }
+        }
         self.targets = config.targets;
         Response::ok(json!({
             "provider": "availability-provider",
             "protocol_version": "1.0",
             "target_count": self.targets.len(),
         }))
+    }
+
+    fn agent_for(&self, target: &AvailabilityTarget) -> &ureq::Agent {
+        self.tls_agents.get(&target.id).unwrap_or(&self.agent)
     }
 
     fn ensure(&self, request: EnsureRequest) -> Response {
@@ -202,8 +249,19 @@ impl AvailabilityProvider {
         target: &AvailabilityTarget,
         request: &EnsureRequest,
     ) -> Result<Value, String> {
+        match target.kind {
+            TargetKind::Ensure => self.ensure_smartweb_target(target, request),
+            TargetKind::PinningService => self.ensure_pinning_service_target(target, request),
+        }
+    }
+
+    fn ensure_smartweb_target(
+        &self,
+        target: &AvailabilityTarget,
+        request: &EnsureRequest,
+    ) -> Result<Value, String> {
         let mut http = self
-            .agent
+            .agent_for(target)
             .post(&target.ensure_url)
             .set("Content-Type", "application/json");
         if let Some(value) = &target.authorization {
@@ -222,6 +280,87 @@ impl AvailabilityProvider {
         normalize_upstream_availability(target, request, &value)
     }
 
+    /// Ensure against a standard IPFS Pinning Services API (IPFS Cluster port-9097
+    /// surface, e.g. the Elacity supernode cluster). Probe the pin status first;
+    /// request a pin only when the CID is not already pinned/pending. Honest states:
+    /// `pinned` -> network_available; anything else -> repair_needed with the real
+    /// upstream status as the reason (replication is in flight, not proven).
+    fn ensure_pinning_service_target(
+        &self,
+        target: &AvailabilityTarget,
+        request: &EnsureRequest,
+    ) -> Result<Value, String> {
+        let base = target.ensure_url.trim_end_matches('/');
+
+        let existing = self.pinning_service_status(target, base, &request.cid)?;
+        match existing.as_deref() {
+            Some("pinned") => return Ok(pinning_service_available(target, request)),
+            Some(status @ ("pinning" | "queued")) => {
+                return Ok(pinning_service_pending(target, request, status));
+            }
+            _ => {}
+        }
+
+        let pin_url = format!("{base}/pins");
+        let mut http = self
+            .agent_for(target)
+            .post(&pin_url)
+            .set("Content-Type", "application/json");
+        if let Some(value) = &target.authorization {
+            http = http.set("Authorization", value);
+        }
+        for (name, value) in &target.headers {
+            http = http.set(name, value);
+        }
+        let response = http
+            .send_json(json!({
+                "cid": request.cid,
+                "name": format!("elastos-{}", request.cid),
+            }))
+            .map_err(upstream_error_message)?;
+        let value = response
+            .into_json::<Value>()
+            .map_err(|err| format!("invalid JSON response: {err}"))?;
+        let status = value
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("queued");
+        if status == "pinned" {
+            Ok(pinning_service_available(target, request))
+        } else {
+            Ok(pinning_service_pending(target, request, status))
+        }
+    }
+
+    /// `GET {base}/pins?cid=…` -> the upstream pin status for this CID, or None when
+    /// the service has no record of it.
+    fn pinning_service_status(
+        &self,
+        target: &AvailabilityTarget,
+        base: &str,
+        cid: &str,
+    ) -> Result<Option<String>, String> {
+        let status_url = format!("{base}/pins?cid={cid}&limit=1");
+        let mut http = self.agent_for(target).get(&status_url);
+        if let Some(value) = &target.authorization {
+            http = http.set("Authorization", value);
+        }
+        for (name, value) in &target.headers {
+            http = http.set(name, value);
+        }
+        let response = http.call().map_err(upstream_error_message)?;
+        let value = response
+            .into_json::<Value>()
+            .map_err(|err| format!("invalid JSON response: {err}"))?;
+        Ok(value
+            .get("results")
+            .and_then(Value::as_array)
+            .and_then(|results| results.first())
+            .and_then(|result| result.get("status"))
+            .and_then(Value::as_str)
+            .map(str::to_string))
+    }
+
     fn status(&self) -> Response {
         Response::ok(json!({
             "provider": "availability-provider",
@@ -230,6 +369,10 @@ impl AvailabilityProvider {
                 json!({
                     "id": target.id,
                     "ensure_url": target.ensure_url,
+                    "kind": match target.kind {
+                        TargetKind::Ensure => "ensure",
+                        TargetKind::PinningService => "pinning_service",
+                    },
                     "configured": true,
                 })
             }).collect::<Vec<_>>()
@@ -694,6 +837,71 @@ fn upstream_abuse_controls(target: &AvailabilityTarget, availability: &Value) ->
         })
 }
 
+/// A pinning-service target reporting `pinned` counts as ONE confirmed replica report
+/// (the cluster replicates internally per its own policy, which this provider does not
+/// over-claim — no live multi-peer proof is asserted).
+fn pinning_service_available(target: &AvailabilityTarget, request: &EnsureRequest) -> Value {
+    json!({
+        "status": "network_available",
+        "provider": target.id,
+        "policy": request.policy,
+        "replicas": 1,
+        "peer_selection": {
+            "mode": "pinning_service",
+            "strategy": "cluster_pin",
+            "target_id": target.id,
+            "live_multi_peer_proof": false,
+        },
+        "quota": {
+            "policy": "pinning_service",
+            "target_id": target.id,
+            "requirements": request.requirements.clone(),
+        },
+        "repair_worker": {
+            "scheduled": false,
+            "status": "healthy",
+            "worker": "availability-provider",
+        },
+        "storage_market": {
+            "schema": "elastos.content.storage-market/v1",
+            "mode": "pinning_service",
+            "status": "cluster_pinned_no_market_settlement",
+            "target_id": target.id,
+            "settlement": "not_configured",
+            "escrow": "not_configured",
+            "quota_enforced": false,
+        },
+        "repair_graph": {
+            "schema": "elastos.content.repair-graph/v1",
+            "policy": "pinning_service",
+            "status": "cluster_pin_only",
+            "target_id": target.id,
+            "supported": ["cluster_pin"],
+        },
+        "abuse_controls": {
+            "schema": "elastos.content.abuse-controls/v1",
+            "policy": "pinning_service",
+            "target_id": target.id,
+            "enforced": false,
+            "throttled": false,
+        },
+    })
+}
+
+/// The pin was requested (or is in flight) but the cluster has not confirmed it —
+/// honest repair_needed, never a fabricated network_available.
+fn pinning_service_pending(
+    target: &AvailabilityTarget,
+    request: &EnsureRequest,
+    upstream_status: &str,
+) -> Value {
+    repair_needed(
+        &target.id,
+        request,
+        format!("cluster pin not yet confirmed (upstream status: {upstream_status})"),
+    )
+}
+
 fn repair_needed(provider: &str, request: &EnsureRequest, reason: impl Into<String>) -> Value {
     json!({
         "status": "repair_needed",
@@ -744,6 +952,76 @@ fn local_replicas(request: &EnsureRequest) -> u64 {
         .get("replicas")
         .and_then(Value::as_u64)
         .unwrap_or(0)
+}
+
+/// Certificate verifier that verifies the FULL chain against the webpki roots but
+/// checks the certificate identity against an operator-pinned dns name instead of the
+/// URL host (curl `--resolve` semantics). Verification is never weakened — a target
+/// addressed by IP must present a valid, publicly-trusted certificate for the pinned
+/// name.
+#[derive(Debug)]
+struct PinnedServerNameVerifier {
+    inner: Arc<rustls::client::WebPkiServerVerifier>,
+    server_name: rustls::pki_types::ServerName<'static>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedServerNameVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            &self.server_name,
+            ocsp_response,
+            now,
+        )
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+fn agent_with_pinned_server_name(name: &str, timeout_secs: u64) -> Result<ureq::Agent, String> {
+    let server_name = rustls::pki_types::ServerName::try_from(name.to_string())
+        .map_err(|err| format!("invalid dns name '{name}': {err}"))?;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let inner = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|err| format!("webpki verifier: {err}"))?;
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedServerNameVerifier { inner, server_name }))
+        .with_no_client_auth();
+    Ok(ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(timeout_secs))
+        .tls_config(Arc::new(config))
+        .build())
 }
 
 fn upstream_error_message(err: ureq::Error) -> String {
@@ -811,6 +1089,8 @@ mod tests {
         AvailabilityTarget {
             id: "elacity-supernode".to_string(),
             ensure_url: "https://example.invalid/availability/ensure".to_string(),
+            kind: TargetKind::Ensure,
+            tls_server_name: None,
             authorization: None,
             headers: BTreeMap::new(),
         }
@@ -1176,6 +1456,74 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("replicas > 0"));
+    }
+
+    #[test]
+    fn config_parses_pinning_service_target_kind() {
+        let config = parse_config(json!({
+            "extra": {
+                "targets": [{
+                    "id": "elacity-cluster",
+                    "kind": "pinning_service",
+                    "ensure_url": "https://base.ela.city/cluster-pin",
+                    "authorization": "Bearer test"
+                }]
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(config.targets[0].kind, TargetKind::PinningService);
+        // Default stays the SmartWeb ensure contract when kind is omitted.
+        let config = parse_config(json!({
+            "extra": {
+                "targets": [{"id": "sn", "ensure_url": "https://example.com/ensure"}]
+            }
+        }))
+        .unwrap();
+        assert_eq!(config.targets[0].kind, TargetKind::Ensure);
+    }
+
+    #[test]
+    fn pinned_server_name_agent_rejects_invalid_names_and_builds_for_valid_ones() {
+        assert!(agent_with_pinned_server_name("*.ela.city", 5).is_err());
+        assert!(agent_with_pinned_server_name("", 5).is_err());
+        assert!(agent_with_pinned_server_name("cluster.ela.city", 5).is_ok());
+    }
+
+    #[test]
+    fn pinning_service_pinned_reports_one_replica_without_multi_peer_claim() {
+        let mut target = target();
+        target.id = "elacity-cluster".to_string();
+        target.kind = TargetKind::PinningService;
+        let availability = pinning_service_available(&target, &request());
+
+        assert_eq!(availability["status"], "network_available");
+        assert_eq!(availability["provider"], "elacity-cluster");
+        assert_eq!(availability["replicas"], 1);
+        assert_eq!(availability["peer_selection"]["mode"], "pinning_service");
+        assert_eq!(
+            availability["peer_selection"]["live_multi_peer_proof"],
+            false
+        );
+        // A single pinned cluster report satisfies min_replicas=1 default requirements.
+        let requirements = TargetAvailabilityRequirements::from_value(&request().requirements);
+        assert!(target_report_satisfies_requirements(
+            &availability,
+            requirements
+        ));
+    }
+
+    #[test]
+    fn pinning_service_unconfirmed_pin_is_repair_needed_with_upstream_status() {
+        let mut target = target();
+        target.kind = TargetKind::PinningService;
+        let availability = pinning_service_pending(&target, &request(), "queued");
+
+        assert_eq!(availability["status"], "repair_needed");
+        assert_eq!(
+            availability["reason"],
+            "cluster pin not yet confirmed (upstream status: queued)"
+        );
     }
 
     #[test]

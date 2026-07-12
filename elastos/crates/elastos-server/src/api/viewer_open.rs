@@ -82,6 +82,10 @@ fn grant_watermark_digest16_hex(delegation_sig_hex: &str) -> String {
 #[derive(Debug, Deserialize)]
 pub struct OpenOwnedRequest {
     /// The Library object URI to open (e.g. `localhost://Users/<principal>/…/clip.mp4`).
+    /// Defaulted (not required) because the MARKETPLACE buy path identifies the asset by
+    /// `content_id` instead — the object is not in the Library yet. The open/legacy paths
+    /// still fail closed on an empty uri (the owned-root resolve refuses it).
+    #[serde(default)]
     pub uri: String,
     /// TRUSTLESS open (phase 2): the handle returned by `/api/viewers/prepare-grant` for this
     /// open. Present only when the browser collected a wallet signature; absent => legacy
@@ -105,7 +109,9 @@ pub struct OpenOwnedRequest {
     pub token_id: Option<String>,
     #[serde(default)]
     pub ledger: Option<String>,
-    #[serde(default)]
+    /// Accepts a JSON string OR number (the storefront sends what its stepper holds); normalized
+    /// to the decimal string `buy_authority` parses.
+    #[serde(default, deserialize_with = "de_opt_string_or_number")]
     pub quantity: Option<String>,
     /// MARKETPLACE buy: the chosen listing seller (the storefront shows the lowest-priced one). Omit to
     /// let the gateway pick the lowest active seller live.
@@ -117,6 +123,25 @@ pub struct OpenOwnedRequest {
     pub expected_price: Option<String>,
     #[serde(default)]
     pub expected_pay_token: Option<String>,
+}
+
+/// Accept a JSON string or number and normalize to `Option<String>` (the storefront's qty
+/// stepper naturally serializes a number; the buy core parses a decimal string).
+fn de_opt_string_or_number<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match v {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => Some(s),
+        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+        Some(other) => {
+            return Err(serde::de::Error::custom(format!(
+                "expected a string or number, got {other}"
+            )))
+        }
+    })
 }
 
 /// Phase-1 request: which owned object the user wants to open (so the gateway can bind the

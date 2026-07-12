@@ -451,6 +451,30 @@ pub(crate) fn has_access_live(gateway: &str, holder: &str, kid: &str) -> Result<
     Ok(decode_bool(&result))
 }
 
+// ---- balanceOf(address, uint256) -> uint256 (the "how many copies of THIS listing" read) ----
+// ERC-1155 balance on the per-asset OPERATIVE at ACCESS_TOKEN id=1 — empirically confirmed from real
+// buy receipts (2026-07-11, txs 0x14c9ab69…/0x972b6aea…): the buy's TransferSingle emits from the
+// OPERATIVE with id=0x1 to the buyer. Distinct from `hasAccessByContentId`, which is keyed on the
+// content KID GLOBALLY (any mint of the same content grants access) — balance is per-listing custody.
+const BALANCE_OF_SELECTOR: &str = "00fdd58e";
+
+/// Encode `balanceOf(holder, ACCESS_TOKEN=1)` calldata for an operative. PURE.
+pub(crate) fn encode_balance_of_access_token(holder: &str) -> Result<String, String> {
+    let h = address_word(holder).ok_or_else(|| format!("holder is not an address: {holder}"))?;
+    Ok(format!(
+        "0x{BALANCE_OF_SELECTOR}{h}{}",
+        super::buy_authority::ACCESS_TOKEN_ID_WORD
+    ))
+}
+
+/// Live `operative.balanceOf(holder, 1)` — the number of access-token copies of THIS listing the
+/// wallet holds. READ-ONLY; fail-soft to the caller (they decide whether to omit the field).
+pub(crate) fn access_token_balance_live(operative: &str, holder: &str) -> Result<u128, String> {
+    let data = encode_balance_of_access_token(holder)?;
+    let result = super::chain_tx::contract_call_live(operative, &data)?;
+    word_to_u128(result.trim().trim_start_matches("0x"))
+}
+
 /// Batched `hasAccessByContentId(holder, kid)` for many KIDs against the AuthorityGateway view, via ONE
 /// Multicall3 `aggregate3` round-trip (the Vault's "what do I hold" sweep — minted OR bought — without an
 /// indexer; same canonical read as `has_access_live`, P10, only the transport is batched). Returns a
@@ -1256,6 +1280,16 @@ mod tests {
             .ends_with(&format!("{:0<64}", "9c2a000000000000000000000000e1a1")));
         assert!(encode_has_access("0xnothex", kid).is_err());
         assert!(encode_has_access(holder, "0xtooshort").is_err());
+    }
+
+    #[test]
+    fn encode_balance_of_access_token_pins_selector_and_id_one() {
+        let holder = "0x34DAF31B99B5A59cEB18E424Dbc112FA6e5f3Dc3";
+        let data = encode_balance_of_access_token(holder).unwrap();
+        assert!(data.starts_with("0x00fdd58e"));
+        assert_eq!(data.len(), 2 + 8 + 64 + 64); // 0x + selector + holder word + id word
+        assert!(data.ends_with(super::super::buy_authority::ACCESS_TOKEN_ID_WORD));
+        assert!(encode_balance_of_access_token("0xnothex").is_err());
     }
 
     #[test]

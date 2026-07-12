@@ -779,6 +779,29 @@ or:
 ELASTOS_AVAILABILITY_PROVIDER_CONFIG='{"targets":[{"id":"elacity-supernode","ensure_url":"https://your-supernode.example/availability/ensure"}]}'
 ```
 
+Targets default to the SmartWeb `ensure` contract. A target can instead speak the
+standard IPFS Pinning Services API (IPFS Cluster's port-9097 surface — how the
+Elacity supernode cluster is addressed) by setting `"kind": "pinning_service"`;
+`ensure_url` is then the API base URL and the provider calls `{base}/pins`:
+
+```bash
+ELASTOS_AVAILABILITY_PROVIDER_CONFIG='{"targets":[{"id":"elacity-cluster","kind":"pinning_service","ensure_url":"https://38.242.211.112/cluster-pin","tls_server_name":"ela.city","authorization":"Bearer <token>"}]}'
+```
+
+For pinning-service targets the provider probes pin status first and requests a
+pin only when absent; a confirmed `pinned` reports `network_available` with ONE
+replica (the cluster's internal replication is not over-claimed and no live
+multi-peer proof is asserted), anything unconfirmed reports honest
+`repair_needed` carrying the upstream status. The bearer token is operator
+configuration (env), never repository content.
+
+The optional per-target `tls_server_name` verifies the target's TLS certificate
+against that dns name instead of the URL host (curl `--resolve` semantics) — for
+endpoints addressed by IP literal that serve a valid, publicly-trusted
+certificate for a real domain (the Elacity cluster endpoint above serves the
+`*.ela.city` certificate). The chain is still verified against the webpki
+roots; verification is never disabled.
+
 Optional provider-local operator alert sink:
 
 ```bash

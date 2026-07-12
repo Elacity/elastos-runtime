@@ -7,7 +7,7 @@
  *   POST /api/market/order/sell {ledger,token_id,quantity,price,pay_token?}  -> { unsigned_tx }  (Home-gated)
  *   POST /api/market/order/withdraw {operative,token_id,quantity}            -> { unsigned_tx }  (Home-gated)
  *   POST /api/market/order/approve {operative}                              -> { unsigned_tx }  (Home-gated)
- *   POST /api/market/buy {uri,…}                                            -> buy outcome      (Home-gated)
+ *   POST /api/market/buy {content_id,operative,…}  -> THE REAL BUY (signs+broadcasts on runtime-signing nodes; call on confirm only)  (Home-gated)
  *   GET  /api/market/get?operative&token_id  -> { on_chain{token_id,seller,price,pay_token,supply_left,has_access} }  (live re-verify)
  *   GET  /api/market/vault                   -> { owned:[{uri,name,content_cid,mime}] }  (Home-gated; the Library Acquired assets)
  *   POST /api/market/acquire {content_id,content_cid,metadata?,background?} -> sync: { object,uri,… }; background:true -> { status:"started",content_cid }  (Home-gated; gates hasAccessByContentId then pins)
@@ -180,21 +180,31 @@ window.API = (function () {
       return null;
     },
     async assembleOrder({ content_id, quantity, seller, price, pay_token }) {
-      // BUILT route: POST /api/market/buy (buy_owned_access, Home-gated). Send the asset's on-chain
-      // identity from the cached listing so the gateway sources live terms (sellersOf/listings at id=1)
-      // with no env pins; price/pay_token arm abort-on-drift (the live re-read must match what was shown).
+      // BUILT route: POST /api/market/buy (buy_owned_access, Home-gated). THE REAL BUY — on a node with
+      // runtime signing this signs with the managed wallet and BROADCASTS. Call it ONLY on the user's
+      // explicit confirm click, never as a preview. Send the asset's on-chain identity from the cached
+      // listing so the gateway sources live terms (sellersOf/listings at id=1) with no env pins;
+      // price/pay_token arm abort-on-drift (the live re-read must match what was shown).
       const c = _cache[content_id] || {};
-      const real = await fetch(`${base}/buy`, {
-        method: "POST", headers: { ...H(), "content-type": "application/json" },
-        body: JSON.stringify({
-          content_id, quantity, seller,
-          operative: c.operative_address, token_id: c.token_id, ledger: c.channel_address,
-          expected_price: price != null ? String(price) : undefined,
-          expected_pay_token: pay_token || undefined,
-        }),
-      }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
-      if (real) { this.live = true; return real; }
-      // MOCK unsigned tx — the shell NEVER signs; this is handed to your wallet (human-in-loop).
+      let resp = null;
+      try {
+        resp = await fetch(`${base}/buy`, {
+          method: "POST", headers: { ...H(), "content-type": "application/json" },
+          body: JSON.stringify({
+            content_id, quantity: quantity != null ? String(quantity) : undefined, seller,
+            operative: c.operative_address, token_id: c.token_id, ledger: c.channel_address,
+            expected_price: price != null ? String(price) : undefined,
+            expected_pay_token: pay_token || undefined,
+          }),
+        });
+      } catch { resp = null; }
+      if (resp && resp.ok) { this.live = true; return await resp.json().catch(() => ({})); }
+      // Honest failure in live mode: surface the gateway's refusal verbatim (fail closed, no mock).
+      if (liveMode()) {
+        const text = resp ? await resp.text().catch(() => "") : "";
+        return { error: resp ? `buy refused (http ${resp.status})${text ? ": " + text.slice(0, 400) : ""}` : "buy unreachable — is the gateway running?" };
+      }
+      // Standalone demo only: a MOCK unsigned tx (nothing is signed or broadcast).
       return {
         unsigned_tx: {
           to: "AuthorityGateway 0xf758…0ad9", selector: "buyAccess(...)",

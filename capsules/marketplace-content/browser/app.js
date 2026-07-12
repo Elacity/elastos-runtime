@@ -356,6 +356,9 @@
     view.innerHTML = `<a class="back" id="back" href="#/discover">← Back</a><div class="detail"><div class="stage"><div class="skeleton" style="aspect-ratio:16/9"></div></div><div class="side"><div class="cardx"><div class="sk" style="height:30px;width:55%;margin-bottom:16px"></div><div class="sk" style="height:13px;margin:11px 0"></div><div class="sk" style="height:13px;margin:11px 0;width:70%"></div><div class="sk" style="height:44px;margin-top:18px;border-radius:11px"></div></div></div></div>`;
     const { listing: l, on_chain: oc, royalty, listed } = await window.API.get(id);
     const owned = oc.has_access;
+    // Copies of THIS listing the wallet holds (operative balanceOf at ACCESS_TOKEN=1) — distinct from
+    // `has_access`, which is content-global. Absent/0 => no held-copies row.
+    const heldCopies = oc.owned_balance != null ? parseInt(oc.owned_balance, 10) || 0 : 0;
     const isFree = l.op_type === "free";
     // Honest price/currency: human-formatted price + the real pay-token symbol from the gateway
     // (price_formatted/pay_token_symbol). Falls back to the raw price / CCY only in standalone/mock.
@@ -380,13 +383,16 @@
         </div>
       </div>
       <div class="side">
-        <div class="cardx"><h4>${owned ? "You own this" : (forSale ? "Buy access" : "Access")}</h4>
+        <div class="cardx"><h4>${owned ? "You own access" : (forSale ? "Buy access" : "Access")}</h4>
+          ${owned ? `<div class="muted small" style="margin-bottom:8px">Your wallet can open this content (on-chain access check). Access is per-content — the seller shown may be someone else.</div>` : ""}
+          ${heldCopies > 0 ? `<div class="kv"><span class="k">You hold</span><span>${heldCopies} ${heldCopies === 1 ? "copy" : "copies"} <span class="muted small">· this listing, on-chain</span></span></div>` : ""}
           <div class="bigprice">${isFree ? "Free" : (forSale ? esc(priceStr) + " " + esc(sym) : "Not listed for sale")}${forSale && l.listings.length > 1 ? ' <span class="muted small">· cheapest of ' + l.listings.length + " listings</span>" : ""}</div>
           ${forSale && fiatUsd(priceStr, sym) ? `<div class="muted small fiat">${esc(fiatUsd(priceStr, sym))} USD</div>` : ""}
           ${forSale ? `<div class="kv"><span class="k">Pay token</span><span>${esc(sym)} <span class="muted small">· gas ETH</span></span></div>
           <div class="kv"><span class="k">Copies available</span><span>${esc(String(oc.supply_left))}</span></div>
           <div class="kv"><span class="k">Seller</span><span class="cid" title="${esc(oc.seller)}">${oc.seller === "primary" ? "Primary" : esc(short(oc.seller))}</span></div>` : ""}
           <button class="btn block" id="cta"${buyable ? "" : " disabled"}>${cta}</button>
+          ${owned && forSale ? `<button class="btn ghost block" id="buy-again" style="margin-top:8px">Buy another copy · ${esc(priceStr)} ${esc(sym)}</button>` : ""}
           ${owned ? `<div class="ownedrow"><button class="btn ghost" id="download">${icon("download")} Download to your node</button><button class="btn ghost" id="reveal">${icon("folder")} Reveal in File Explorer</button></div>
           <div class="dlstatus muted small" id="dlstatus" hidden></div>` : ""}
           <div class="note">${owned ? "The encrypted file downloads to your node and lives in your library (Acquired) — open it in your player, the marketplace renders nothing." : (forSale ? "You buy the right to open it. On purchase the encrypted file pins to your library and opens in your player." : "No seller currently has this listed for sale. Royalty terms below are read live from the asset's contract.")}</div>
@@ -407,6 +413,7 @@
       if (!forSale) return; // not listed for sale — button is disabled, nothing to buy
       openBuy(l, oc);
     });
+    $("#buy-again")?.addEventListener("click", () => openBuy(l, oc));
     $("#download")?.addEventListener("click", (e) => downloadToNode(l, e.currentTarget));
     $("#reveal")?.addEventListener("click", () => revealInExplorer(l));
     $("#resell")?.addEventListener("click", () => openResale(l, oc, royalty));
@@ -563,9 +570,18 @@
     const sym = oc.pay_token_symbol || CCY;
     const priceHuman = oc.price_formatted != null ? parseFloat(oc.price_formatted) : (Number(oc.price) || 0);
     const totalStr = () => (l.op_type === "free" ? "Free" : (priceHuman * qty).toFixed(2) + " " + sym);
-    let order = blocked ? null : await window.API.assembleOrder({ content_id: l.content_id, quantity: qty, seller: oc.seller, price: oc.price, pay_token: oc.pay_token });
-    // Mount ONCE; the qty stepper PATCHES the qty/total/disabled in place (no sheet rebuild → no modal-pop
-    // replay, no focus loss, no per-tick network call). The order-preview refresh is debounced.
+    // ORDER PREVIEW is client-rendered — the buy endpoint is the REAL buy (on a runtime-signing node it
+    // signs with the managed wallet and BROADCASTS), so it is called EXACTLY ONCE, on the confirm click.
+    const previewJson = () => JSON.stringify({
+      to: "AuthorityGateway (live sellersOf/listings re-read at assembly)",
+      selector: "buyAccess(...)", content_id: l.content_id, quantity: qty,
+      seller: oc.seller, expected_price: oc.price != null ? String(oc.price) : undefined,
+      expected_pay_token: oc.pay_token || undefined,
+      note: "Nothing is signed or sent until you confirm below. Terms are re-verified from chain "
+          + "and the buy aborts on drift before broadcast (Phase-1 invariant).",
+    }, null, 2);
+    // Mount ONCE; the qty stepper PATCHES the qty/total/preview in place (no sheet rebuild → no
+    // modal-pop replay, no focus loss, and NO network call until confirm).
     const inner = `<button class="x" id="x" aria-label="Close">✕</button><h3 id="buy-title">Buy access</h3>
       <p class="muted small">${esc(l.name)} · ${priceHuman} ${esc(sym)} each</p>
       <div class="kv"><span class="k">You receive</span><span>An access right to ${short(l.content_id)}</span></div>
@@ -575,34 +591,51 @@
       ${checks.map((c) => `<div class="kv"><span class="k">${c.ok ? "✓" : "✕"} ${esc(c.label)}</span></div>`).join("")}
       ${blocked
         ? `<p class="note" style="color:var(--warn)">Blocked: ${esc(blocked.label)} — fix before buying.</p>`
-        : `<p class="muted small" style="margin:12px 0 6px">Unsigned order — the shell holds no keys. Signed only by your wallet (human-in-loop); terms re-verified from chain and abort on drift before broadcast (Phase-1 invariant).</p>
-           <div class="code" id="order-code">${esc(JSON.stringify(order.unsigned_tx, null, 2))}</div>
-           <div style="margin-top:14px"><button class="btn block" id="sign">Route to wallet for signature →</button></div>`}`;
+        : `<p class="muted small" style="margin:12px 0 6px">Order preview — nothing is signed or broadcast until you confirm. The node's wallet signs (human-in-loop); terms re-verified from chain and abort on drift before broadcast (Phase-1 invariant).</p>
+           <div class="code" id="order-code">${esc(previewJson())}</div>
+           <div class="dlstatus muted small" id="buy-status" hidden></div>
+           <div style="margin-top:14px"><button class="btn block" id="sign">Confirm buy → sign &amp; broadcast</button></div>`}`;
     mountModal(inner, "buy-title");
-    let previewT;
     function setQty(n) {
       qty = Math.max(1, Math.min(max, n));
       $("#qty").textContent = qty;
       $("#total").textContent = totalStr();
       $("#dec").disabled = qty <= 1; $("#inc").disabled = qty >= max;
-      if (blocked) return;
-      clearTimeout(previewT);
-      previewT = setTimeout(async () => {
-        order = await window.API.assembleOrder({ content_id: l.content_id, quantity: qty, seller: oc.seller, price: oc.price, pay_token: oc.pay_token });
-        const code = $("#order-code"); if (code && order) code.textContent = JSON.stringify(order.unsigned_tx, null, 2);
-      }, 200);
+      const code = $("#order-code"); if (code) code.textContent = previewJson();
     }
     $("#dec")?.addEventListener("click", () => setQty(qty - 1));
     $("#inc")?.addEventListener("click", () => setQty(qty + 1));
+    const status = (msg) => { const s = $("#buy-status"); if (s) { s.hidden = false; s.textContent = msg; } };
     $("#sign")?.addEventListener("click", async (e) => {
       const btn = e.currentTarget;
       if (btn.dataset.busy) return; // double-submit guard
-      btn.dataset.busy = "1"; btn.disabled = true; btn.textContent = "Routing to wallet…";
-      toast("Routed to your wallet → sign → broadcast → access granted…");
-      // After the right lands, TRIGGER the pin into your Library (live: gated by hasAccessByContentId).
-      const res = await window.API.acquire({ content_id: l.content_id, content_cid: l.content_cid, token_uri: l.token_uri, metadata: { name: l.name } });
+      btn.dataset.busy = "1"; btn.disabled = true; btn.textContent = "Signing & broadcasting…";
+      // THE buy — one call, on this click only.
+      const order = await window.API.assembleOrder({ content_id: l.content_id, quantity: qty, seller: oc.seller, price: oc.price, pay_token: oc.pay_token });
+      if (!order || order.error) {
+        const msg = (order && order.error) || "buy failed — no response from the gateway";
+        status(msg); toast(msg);
+        delete btn.dataset.busy; btn.disabled = false; btn.textContent = "Confirm buy → sign & broadcast";
+        return;
+      }
+      const tx = order.transaction_hash || "";
+      status(tx ? `Broadcast accepted · tx ${tx.slice(0, 14)}… — waiting for on-chain confirmation, then downloading…` : "Buy accepted — confirming access…");
+      toast(tx ? `Buy broadcast (tx ${tx.slice(0, 14)}…) — waiting for confirmation…` : "Buy accepted — confirming…");
+      // The acquire gate reads hasAccessByContentId LIVE, so it refuses (403) until the tx confirms.
+      // Poll it honestly instead of declaring success: ~6s interval, up to ~3 minutes.
+      let res = null;
+      for (let i = 0; i < 30; i++) {
+        res = await window.API.acquire({ content_id: l.content_id, content_cid: l.content_cid, token_uri: l.token_uri, metadata: { name: l.name } });
+        if (res) break;
+        status(`Waiting for on-chain confirmation… (${(i + 1) * 6}s)${tx ? ` · tx ${tx.slice(0, 14)}…` : ""}`);
+        await new Promise((r) => setTimeout(r, 6000));
+      }
       closeModal();
-      toast(res && res.uri ? `Downloaded “${l.name}” to your node — it's in your library (Acquired).` : `Purchase complete — finishing the download. Check your Vault.`);
+      if (res) {
+        toast(res.uri ? `Bought & downloaded “${l.name}” — it's in your library (Acquired).` : `Bought “${l.name}” — download finishing in the background. Check your Vault.`);
+      } else {
+        toast(`Buy broadcast${tx ? ` (tx ${tx.slice(0, 14)}…)` : ""}, but access hasn't confirmed yet — check the Vault in a minute.`);
+      }
     });
   }
 
