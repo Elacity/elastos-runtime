@@ -1713,19 +1713,87 @@ pub(crate) async fn resolve_subject_address(state: &GatewayState, principal_id: 
     let Ok(data) = accounts else {
         return String::new();
     };
-    data.get("accounts")
-        .and_then(|v| v.as_array())
+    select_subject_from_accounts(&data)
+}
+
+/// Pick the DRM subject wallet from a wallet-provider `accounts` response.
+///
+/// The subject is the EVM wallet the runtime binds the open delegation to and runs the on-chain
+/// rights check against — it MUST match the wallet the user actually connects with in the browser.
+/// So we prefer the principal's DEFAULT signable EVM account (the SAME `browser_connect` /
+/// `transaction_intent` default the browser wallet bridge resolves), and only fall back to the
+/// first linked EVM account when no usable default is recorded. Picking "first in the list" was a
+/// latent bug once a principal has more than one linked EVM account (a second/test account could
+/// sort ahead of the MetaMask default and hijack the subject) — see the `subject_*` tests.
+fn select_subject_from_accounts(data: &serde_json::Value) -> String {
+    let accounts = data.get("accounts").and_then(|v| v.as_array());
+    if let Some(addr) = default_evm_subject_address(data, accounts) {
+        return addr;
+    }
+    // No usable default recorded: fall back to the first linked EVM account (legacy behavior).
+    accounts
         .into_iter()
         .flatten()
-        .find(|acct| {
-            acct.get("chain_namespace")
-                .and_then(|v| v.as_str())
-                .map(|ns| ns.starts_with("eip155:"))
-                .unwrap_or(false)
-        })
+        .find(|acct| is_eip155(acct))
         .and_then(|acct| acct.get("address").and_then(|v| v.as_str()))
         .map(str::to_string)
         .unwrap_or_default()
+}
+
+fn is_eip155(acct: &serde_json::Value) -> bool {
+    acct.get("chain_namespace")
+        .and_then(|v| v.as_str())
+        .map(|ns| ns.starts_with("eip155:"))
+        .unwrap_or(false)
+}
+
+fn is_signable_evm(acct: &serde_json::Value) -> bool {
+    is_eip155(acct)
+        && acct
+            .get("signing_available")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+}
+
+/// The principal's default signable EVM account address, resolved the SAME way the browser wallet
+/// bridge resolves it: default intents in priority order, newest `set_at` wins, and the referenced
+/// account must be a linked, signable EVM account. `None` when no such default exists (caller then
+/// falls back to the first linked EVM account).
+fn default_evm_subject_address(
+    data: &serde_json::Value,
+    accounts: Option<&Vec<serde_json::Value>>,
+) -> Option<String> {
+    let accounts = accounts?;
+    let defaults = data.get("default_accounts").and_then(|v| v.as_array())?;
+    let signable_evm_account = |account_id: &str| {
+        accounts.iter().find(|acct| {
+            acct.get("account_id").and_then(|v| v.as_str()) == Some(account_id)
+                && is_signable_evm(acct)
+        })
+    };
+    for intent in ["browser_connect", "transaction_intent"] {
+        let chosen = defaults
+            .iter()
+            .filter(|d| {
+                d.get("intent").and_then(|v| v.as_str()) == Some(intent)
+                    && d.get("chain_namespace")
+                        .and_then(|v| v.as_str())
+                        .map(|ns| ns.starts_with("eip155:"))
+                        .unwrap_or(false)
+                    && d.get("account_id")
+                        .and_then(|v| v.as_str())
+                        .map(|id| signable_evm_account(id).is_some())
+                        .unwrap_or(false)
+            })
+            .max_by_key(|d| d.get("set_at").and_then(|v| v.as_u64()).unwrap_or(0));
+        if let Some(def) = chosen {
+            let account_id = def.get("account_id").and_then(|v| v.as_str())?;
+            return signable_evm_account(account_id)
+                .and_then(|acct| acct.get("address").and_then(|v| v.as_str()))
+                .map(str::to_string);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1745,6 +1813,77 @@ mod tests {
         assert_eq!(grant_watermark_digest16_hex("  0x1234ABCD  "), GOLDEN);
         // 16 bytes => 32 hex chars.
         assert_eq!(grant_watermark_digest16_hex("anything").len(), 32);
+    }
+
+    fn acct(id: &str, ns: &str, addr: &str, signable: bool) -> serde_json::Value {
+        json!({ "account_id": id, "chain_namespace": ns, "address": addr, "signing_available": signable })
+    }
+    fn default_entry(intent: &str, ns: &str, account_id: &str, set_at: u64) -> serde_json::Value {
+        json!({ "intent": intent, "chain_namespace": ns, "account_id": account_id, "set_at": set_at })
+    }
+
+    /// REGRESSION: with two linked EVM accounts, the subject MUST be the DEFAULT one, not the
+    /// first in the list. Mirrors the real bug — a `Test EVM` account sorted ahead of the
+    /// MetaMask default and hijacked the on-chain subject.
+    #[test]
+    fn subject_prefers_default_evm_account() {
+        let data = json!({
+            "accounts": [
+                acct("acct-1", "eip155:8453", "0x4023", true),
+                acct("acct-2", "eip155:8453", "0xab50", true),
+            ],
+            "default_accounts": [default_entry("browser_connect", "eip155:8453", "acct-2", 100)],
+        });
+        assert_eq!(select_subject_from_accounts(&data), "0xab50");
+    }
+
+    /// No default recorded → keep the legacy behavior (first linked EVM account).
+    #[test]
+    fn subject_falls_back_to_first_evm_when_no_default() {
+        let data = json!({
+            "accounts": [
+                acct("acct-1", "eip155:8453", "0x4023", true),
+                acct("acct-2", "eip155:8453", "0xab50", true),
+            ],
+            "default_accounts": [],
+        });
+        assert_eq!(select_subject_from_accounts(&data), "0x4023");
+    }
+
+    /// A default that points at a missing / non-signable account must NOT be honored; fall back.
+    #[test]
+    fn subject_ignores_default_pointing_at_unsignable_account() {
+        let data = json!({
+            "accounts": [
+                acct("acct-1", "eip155:8453", "0x4023", true),
+                acct("acct-3", "eip155:8453", "0xdead", false),
+            ],
+            "default_accounts": [default_entry("browser_connect", "eip155:8453", "acct-3", 100)],
+        });
+        assert_eq!(select_subject_from_accounts(&data), "0x4023");
+    }
+
+    /// Newest `set_at` wins among defaults for the same intent (matches the browser bridge).
+    #[test]
+    fn subject_newest_default_wins_for_same_intent() {
+        let data = json!({
+            "accounts": [
+                acct("a", "eip155:8453", "0xaaa", true),
+                acct("b", "eip155:8453", "0xbbb", true),
+            ],
+            "default_accounts": [
+                default_entry("browser_connect", "eip155:8453", "a", 10),
+                default_entry("browser_connect", "eip155:8453", "b", 20),
+            ],
+        });
+        assert_eq!(select_subject_from_accounts(&data), "0xbbb");
+    }
+
+    /// No EVM accounts at all → empty subject (fail-closed; a chain rights check then denies).
+    #[test]
+    fn subject_empty_when_no_evm_accounts() {
+        let data = json!({ "accounts": [], "default_accounts": [] });
+        assert_eq!(select_subject_from_accounts(&data), "");
     }
 
     /// PRE-2 (log-redaction half): `log_fp` must turn a sensitive identifier into a short,
