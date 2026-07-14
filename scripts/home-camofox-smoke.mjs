@@ -734,7 +734,7 @@ async function main() {
       assert(!system.fieldLabels.includes("Overlay"), "System Appearance should not render Overlay as a separate box", system);
       assert(system.overlayIsInsideBackgroundField, "System overlay controls should live inside the Background box", system);
       assert(system.backgroundActionsSameRow, "System background Choose image and Reset actions should stay on one row", system);
-      assert(system.backgroundPreviewImage.includes("/apps/home/wallpaper.webp"), "System Appearance did not preview the default wallpaper", system);
+      assert(system.backgroundPreviewImage.includes("/apps/home-gui/wallpaper.webp"), "System Appearance did not preview the default wallpaper", system);
       assert(system.backgroundPreviewEmpty === "true", "System Appearance did not label the default wallpaper state", system);
       assert(system.hasBackgroundOverlay && system.backgroundOverlayDisabled === false, "System Appearance did not expose the background overlay setting", system);
       assert(system.hasBackgroundOverlayRange && system.hasBackgroundOverlayOpacity, "System Appearance did not expose the overlay opacity control", system);

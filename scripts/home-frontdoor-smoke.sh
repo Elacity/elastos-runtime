@@ -8,6 +8,7 @@ MAINTAINER_DID="${ELASTOS_MAINTAINER_DID:-did:key:z6MkrFPDgDi98Ek6AFHM3VT9bVJytn
 SOURCE_HOME_CLI_DIR="$ROOT/capsules/home-cli"
 SOURCE_HOME_CLI_WASM="$SOURCE_HOME_CLI_DIR/target/wasm32-wasip1/release/home-cli.wasm"
 SOURCE_HOME_DIR="$ROOT/capsules/home"
+SOURCE_HOME_GUI_DIR="$ROOT/capsules/home-gui"
 SOURCE_SYSTEM_DIR="$ROOT/capsules/system"
 SOURCE_SERVICES_DIR="$ROOT/capsules/services"
 SOURCE_BROWSER_DIR="$ROOT/capsules/browser"
@@ -147,6 +148,7 @@ cp "$SOURCE_HOME_CLI_WASM" "$SOURCE_HOME_CLI_DIR/home-cli.wasm"
 echo "[home-frontdoor] build first-party browser capsule wasm"
 for capsule in \
     home \
+    home-gui \
     system \
     services \
     browser \
@@ -169,7 +171,7 @@ SETUP_PLATFORM="$(host_platform)"
 mkdir -p "$SOURCE_RUNTIME_DATA_DIR/bin"
 install -m 755     "$ROOT/elastos/target/release/localhost-provider"     "$SOURCE_RUNTIME_DATA_DIR/bin/localhost-provider"
 
-COMPONENTS_SRC="$SOURCE_COMPONENTS_MANIFEST" COMPONENTS_DEST="$SOURCE_RUNTIME_DATA_DIR/components.json" DATA_DIR="$SOURCE_RUNTIME_DATA_DIR" PUBLISHER_ROOT="$SOURCE_RUNTIME_DATA_DIR/ElastOS/SystemServices/Publisher" SETUP_PLATFORM="$SETUP_PLATFORM" SHELL_BIN="$ROOT/elastos/target/release/shell" LOCALHOST_PROVIDER_BIN="$ROOT/elastos/target/release/localhost-provider" DID_PROVIDER_BIN="$ROOT/capsules/did-provider/target/release/did-provider" CHAIN_PROVIDER_BIN="$ROOT/capsules/chain-provider/target/release/chain-provider" NET_PROVIDER_BIN="$ROOT/capsules/net-provider/target/release/net-provider" EXIT_PROVIDER_BIN="$ROOT/capsules/exit-provider/target/release/exit-provider" BROWSER_ENGINE_ADAPTER_BIN="$ROOT/capsules/browser-engine-adapter/target/release/browser-engine-adapter" BROWSER_ENGINE_SUPERVISOR_BIN="$ROOT/elastos/tools/browser-engine-supervisor/target/release/browser-engine-supervisor" BROWSER_NATIVE_PROXY_ENGINE_BIN="$ROOT/elastos/tools/browser-native-proxy-engine/target/release/browser-native-proxy-engine" BROWSER_STREAM_BRIDGE_BIN="$ROOT/elastos/tools/browser-stream-bridge/target/release/browser-stream-bridge" BROWSER_LOCAL_EXIT_BIN="$ROOT/elastos/tools/browser-local-exit/target/release/browser-local-exit" WEBSPACE_PROVIDER_BIN="$ROOT/capsules/webspace-provider/target/release/webspace-provider" WALLET_PROVIDER_BIN="$ROOT/capsules/wallet-provider/target/release/wallet-provider" OBJECT_PROVIDER_BIN="$ROOT/capsules/object-provider/target/release/object-provider" CONTENT_BLOCK_GRAPH_PROVIDER_BIN="$ROOT/capsules/content-block-graph-provider/target/release/content-block-graph-provider" HOME_CLI_DIR="$SOURCE_HOME_CLI_DIR" HOME_CAPSULE_DIR="$SOURCE_HOME_DIR" SYSTEM_CAPSULE_DIR="$SOURCE_SYSTEM_DIR" SERVICES_CAPSULE_DIR="$SOURCE_SERVICES_DIR" BROWSER_CAPSULE_DIR="$SOURCE_BROWSER_DIR" DOCUMENTS_CAPSULE_DIR="$SOURCE_DOCUMENTS_DIR" LIBRARY_CAPSULE_DIR="$SOURCE_LIBRARY_DIR" MARKETPLACE_CAPSULE_DIR="$SOURCE_MARKETPLACE_DIR" ARCHIVE_MANAGER_CAPSULE_DIR="$SOURCE_ARCHIVE_MANAGER_DIR" INBOX_CAPSULE_DIR="$SOURCE_INBOX_DIR" WALLET_CAPSULE_DIR="$SOURCE_WALLET_DIR" WALLET_METAMASK_CAPSULE_DIR="$SOURCE_WALLET_METAMASK_DIR" WALLET_UNISAT_CAPSULE_DIR="$SOURCE_WALLET_UNISAT_DIR" WALLET_WALLETCONNECT_CAPSULE_DIR="$SOURCE_WALLET_WALLETCONNECT_DIR" python3 - <<'PY2'
+COMPONENTS_SRC="$SOURCE_COMPONENTS_MANIFEST" COMPONENTS_DEST="$SOURCE_RUNTIME_DATA_DIR/components.json" DATA_DIR="$SOURCE_RUNTIME_DATA_DIR" PUBLISHER_ROOT="$SOURCE_RUNTIME_DATA_DIR/ElastOS/SystemServices/Publisher" SETUP_PLATFORM="$SETUP_PLATFORM" SHELL_BIN="$ROOT/elastos/target/release/shell" LOCALHOST_PROVIDER_BIN="$ROOT/elastos/target/release/localhost-provider" DID_PROVIDER_BIN="$ROOT/capsules/did-provider/target/release/did-provider" CHAIN_PROVIDER_BIN="$ROOT/capsules/chain-provider/target/release/chain-provider" NET_PROVIDER_BIN="$ROOT/capsules/net-provider/target/release/net-provider" EXIT_PROVIDER_BIN="$ROOT/capsules/exit-provider/target/release/exit-provider" BROWSER_ENGINE_ADAPTER_BIN="$ROOT/capsules/browser-engine-adapter/target/release/browser-engine-adapter" BROWSER_ENGINE_SUPERVISOR_BIN="$ROOT/elastos/tools/browser-engine-supervisor/target/release/browser-engine-supervisor" BROWSER_NATIVE_PROXY_ENGINE_BIN="$ROOT/elastos/tools/browser-native-proxy-engine/target/release/browser-native-proxy-engine" BROWSER_STREAM_BRIDGE_BIN="$ROOT/elastos/tools/browser-stream-bridge/target/release/browser-stream-bridge" BROWSER_LOCAL_EXIT_BIN="$ROOT/elastos/tools/browser-local-exit/target/release/browser-local-exit" WEBSPACE_PROVIDER_BIN="$ROOT/capsules/webspace-provider/target/release/webspace-provider" WALLET_PROVIDER_BIN="$ROOT/capsules/wallet-provider/target/release/wallet-provider" OBJECT_PROVIDER_BIN="$ROOT/capsules/object-provider/target/release/object-provider" CONTENT_BLOCK_GRAPH_PROVIDER_BIN="$ROOT/capsules/content-block-graph-provider/target/release/content-block-graph-provider" HOME_CLI_DIR="$SOURCE_HOME_CLI_DIR" HOME_CAPSULE_DIR="$SOURCE_HOME_DIR" HOME_GUI_CAPSULE_DIR="$SOURCE_HOME_GUI_DIR" SYSTEM_CAPSULE_DIR="$SOURCE_SYSTEM_DIR" SERVICES_CAPSULE_DIR="$SOURCE_SERVICES_DIR" BROWSER_CAPSULE_DIR="$SOURCE_BROWSER_DIR" DOCUMENTS_CAPSULE_DIR="$SOURCE_DOCUMENTS_DIR" LIBRARY_CAPSULE_DIR="$SOURCE_LIBRARY_DIR" MARKETPLACE_CAPSULE_DIR="$SOURCE_MARKETPLACE_DIR" ARCHIVE_MANAGER_CAPSULE_DIR="$SOURCE_ARCHIVE_MANAGER_DIR" INBOX_CAPSULE_DIR="$SOURCE_INBOX_DIR" WALLET_CAPSULE_DIR="$SOURCE_WALLET_DIR" WALLET_METAMASK_CAPSULE_DIR="$SOURCE_WALLET_METAMASK_DIR" WALLET_UNISAT_CAPSULE_DIR="$SOURCE_WALLET_UNISAT_DIR" WALLET_WALLETCONNECT_CAPSULE_DIR="$SOURCE_WALLET_WALLETCONNECT_DIR" python3 - <<'PY2'
 import hashlib
 import json
 import os
@@ -236,12 +238,14 @@ with tarfile.open(home_cli_archive, "w:gz") as tar:
         home_cli_dir / "target/wasm32-wasip1/release/home-cli.wasm",
         arcname="home-cli/home-cli.wasm",
     )
+    tar.add(home_cli_dir / "browser", arcname="home-cli/browser")
 home_cli_data = home_cli_archive.read_bytes()
 home_cli_manifest["checksum"] = "sha256:" + hashlib.sha256(home_cli_data).hexdigest()
 home_cli_manifest["size"] = len(home_cli_data)
 
 browser_capsules = {
     "home": pathlib.Path(os.environ["HOME_CAPSULE_DIR"]),
+    "home-gui": pathlib.Path(os.environ["HOME_GUI_CAPSULE_DIR"]),
     "system": pathlib.Path(os.environ["SYSTEM_CAPSULE_DIR"]),
     "services": pathlib.Path(os.environ["SERVICES_CAPSULE_DIR"]),
     "browser": pathlib.Path(os.environ["BROWSER_CAPSULE_DIR"]),
@@ -326,6 +330,12 @@ fi
 for installed in \
     "$HOME_DIR/xdg-data/elastos/capsules/home/home.wasm" \
     "$HOME_DIR/xdg-data/elastos/capsules/home/browser/index.html" \
+    "$HOME_DIR/xdg-data/elastos/capsules/home-cli/home-cli.wasm" \
+    "$HOME_DIR/xdg-data/elastos/capsules/home-cli/browser/index.html" \
+    "$HOME_DIR/xdg-data/elastos/capsules/home-gui/home-gui.wasm" \
+    "$HOME_DIR/xdg-data/elastos/capsules/home-gui/browser/home-gui.js" \
+    "$HOME_DIR/xdg-data/elastos/capsules/home-gui/browser/home-gui-template.html" \
+    "$HOME_DIR/xdg-data/elastos/capsules/home-gui/browser/style.css" \
     "$HOME_DIR/xdg-data/elastos/capsules/system/system.wasm" \
     "$HOME_DIR/xdg-data/elastos/capsules/system/browser/index.html" \
     "$HOME_DIR/xdg-data/elastos/capsules/services/services.wasm" \

@@ -309,6 +309,7 @@ PROVIDER_NAMES_JSON="$(provider_names | python3 -c 'import json,sys; print(json.
 
 APP_CAPSULES=(
     home-cli
+    home-gui
     home
     system
     services

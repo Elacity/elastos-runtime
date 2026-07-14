@@ -132,6 +132,11 @@ code {
   border-top-color: transparent;
 }
 
+.settings-sidebar-icon-shell::before {
+  border-radius: 4px;
+  box-shadow: inset 0 -6px 0 rgba(31, 41, 55, 0.14);
+}
+
 .settings-sidebar-icon-security::before {
   border-radius: 4px 4px 6px 6px;
 }
@@ -254,6 +259,26 @@ code {
   color: #999;
   margin-top: 2px;
   line-height: 1.35;
+}
+
+.shell-picker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: min(260px, 48%);
+}
+
+.shell-picker-select {
+  min-width: 0;
+  flex: 1 1 150px;
+  height: 30px;
+  padding: 4px 8px;
+  border: 1px solid #d0d0d0;
+  border-radius: 4px;
+  background: #fff;
+  color: #333;
+  font: inherit;
+  font-size: 12px;
 }
 
 .pc2-btn,

@@ -59,6 +59,7 @@ DEFAULT_CAPSULES=(
     object-provider
     content-block-graph-provider
     home-cli
+    home-gui
     home
     system
     services
@@ -87,6 +88,7 @@ REQUIRED_SUPPORTED_CAPSULES=(
     object-provider
     content-block-graph-provider
     home-cli
+    home-gui
     home
     system
     services
@@ -774,6 +776,7 @@ build_platform_independent_direct_assets() {
 
     for capsule in \
         home-cli \
+        home-gui \
         home \
         system \
         wallet-metamask \

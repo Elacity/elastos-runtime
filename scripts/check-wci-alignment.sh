@@ -227,6 +227,71 @@ check_forbidden 'alias /var/www/elastos/' 'nginx should not own published applic
 check_forbidden 'proxy_pass http://127\.0\.0\.1:8081' 'public nginx edge should not route the canonical site through the preview site service'
 check_forbidden_in_path '/api/provider/did/sign([^_[:alnum:]]|$)' elastos/crates 'capsules must not call arbitrary DID signing routes'
 check_forbidden_in_path '"operations":.*"sign"' capsules/did-provider/capsule.json 'did-provider must expose typed signing intents, not generic sign(data)'
+check_required '"private": true' elastos/esp/package.json 'ESP type package must remain private'
+check_required 'ESP_TRANSPORT_SCOPE = "local_runtime_adapter"' elastos/esp/esp_v0.ts 'ESP type package must mark HTTP as local adapter scope'
+check_required 'elastos\.inspect\.gate-preview/v1' elastos/esp/esp_v0.ts 'ESP type package must include current Inspect gate preview schema'
+check_required 'elastos\.inspect\.request-binding/v1' elastos/esp/esp_v0.ts 'ESP type package must include current Inspect request binding schema'
+check_required 'elastos\.inspect\.dispatch-result/v1' elastos/esp/esp_v0.ts 'ESP type package must include current Inspect dispatch result schema'
+check_required 'ESP_FACT_DESCRIPTORS' elastos/esp/esp_v0.ts 'ESP type package must expose current fact descriptor identities'
+check_required 'ESP_VERB_DESCRIPTORS' elastos/esp/esp_v0.ts 'ESP type package must expose current verb descriptor identities'
+check_required 'parseDocSupportedSchemas' elastos/esp/check-esp-v0.mjs 'ESP package check must compare docs supported schemas to the served descriptor'
+check_required 'parseDocProjectionFacts' elastos/esp/check-esp-v0.mjs 'ESP package check must compare docs projection facts to the served descriptor'
+check_required 'parseDocVerbTable' elastos/esp/check-esp-v0.mjs 'ESP package check must compare docs verb table to the served descriptor'
+check_required 'gateway\.rs must route' elastos/esp/check-esp-v0.mjs 'ESP package check must prove descriptor routes are wired in the gateway'
+check_required 'Standing grants are not implemented or exposed by ESP v0' docs/ESP_V0.md 'ESP docs must not claim standing grants'
+check_required 'Reach enforcement and reach halos are not implemented by ESP v0' docs/ESP_V0.md 'ESP docs must not claim reach enforcement'
+check_required 'SSE ESP projection streams are not product-ready' docs/ESP_V0.md 'ESP docs must not claim SSE projection streams'
+check_required 'Shell marketplace is not implemented' docs/ESP_V0.md 'ESP docs must not claim shell marketplace'
+check_required 'Full second-shell product UX is not complete' docs/ESP_V0.md 'ESP docs must not claim full second-shell product UX'
+check_required 'browser `home-cli` terminal shell proof' docs/FLINT_SHELL_ESP_EXTRACTION_MAP.md 'ESP extraction map must scope Home CLI as the terminal-shell alternate shell proof'
+check_forbidden_in_path 'affordance-consent-pending|elastos\.reach|ReachFact|AffordanceGrantReceipt|RequestCapabilityInput|ValidateAndConsume|validate-and-consume|standing grant|shell marketplace|EventSource|SSE|projection stream|full second-shell|fetch\(' elastos/esp/esp_v0.ts 'ESP type package must not import unsupported Flint authority or future fact surfaces'
+check_required 'trustMaterial' elastos/esp/trust.ts 'ESP projection helpers must include trust projection'
+check_required 'custodyView' elastos/esp/custody.ts 'ESP projection helpers must include custody projection'
+check_required 'shellPicker' elastos/esp/shell_picker.ts 'ESP projection helpers must include shell picker projection'
+check_required 'inspectActionRequestValidation' elastos/esp/consent.ts 'ESP projection helpers must include current consent validation'
+check_required 'capsuleDetailView' elastos/esp/capsule_detail.ts 'ESP projection helpers must include capsule detail projection'
+check_required 'homeFleetView' elastos/esp/home_fleet.ts 'ESP projection helpers must include Home fleet projection'
+check_required 'auditCountsView' elastos/esp/audit_views.ts 'ESP projection helpers must include audit view projection'
+check_required 'plain ES modules or native Web Components' elastos/esp/README.md 'ESP README must keep the no-framework-first visual UI rule'
+check_required 'Svelte may be used later only as an optional capsule-local UI compiler' elastos/esp/README.md 'ESP README must keep Svelte optional and capsule-local'
+check_required 'standalone capsule-inspector is optional until System Inspector and shared' docs/FLINT_SHELL_ESP_EXTRACTION_MAP.md 'standalone capsule-inspector must remain optional until System Inspector and shared projections are coherent'
+check_required 'must not vendor `spend_audit\.js`' docs/FLINT_SHELL_ESP_EXTRACTION_MAP.md 'standalone capsule-inspector must not duplicate spend-audit projection logic'
+check_forbidden_in_path '"capsule-inspector"' components.json 'standalone capsule-inspector must not be packaged before the optional extraction decision'
+check_forbidden_in_path '"svelte"|@sveltejs|vite|rollup' elastos/esp/package.json 'headless ESP package must not carry UI framework/compiler dependencies'
+check_forbidden_in_path '\.svelte|svelte/compiler|svelte/server|from "svelte|from '\''svelte' elastos/esp 'headless ESP package must not contain framework UI sources or render tests'
+check_forbidden_in_path 'spend_audit|HomeCustodyView|spendBudgetView|auditChainView|intentProofView' elastos/esp 'headless ESP must keep current custody/audit projection canonical instead of duplicating Flint spend-audit logic'
+check_forbidden_in_path 'spend_audit|HomeCustodyView|spendBudgetView|auditChainView|intentProofView|dispatch_approved' capsules/capsule-inspector 'standalone capsule-inspector must not vendor spend-audit logic or direct dispatch authority'
+check_forbidden_in_path 'fetch\(|XMLHttpRequest|WebSocket|localStorage|sessionStorage|indexedDB|crypto\.|privateKey|secret|home_token|dispatch_approved|invoke_provider|send_raw|ProviderRegistry' elastos/esp/audit_views.ts 'ESP audit view helper must stay pure'
+check_forbidden_in_path 'fetch\(|XMLHttpRequest|WebSocket|localStorage|sessionStorage|indexedDB|crypto\.|privateKey|secret|home_token|dispatch_approved|invoke_provider|send_raw|ProviderRegistry' elastos/esp/capsule_detail.ts 'ESP capsule detail helper must stay pure'
+check_forbidden_in_path 'fetch\(|XMLHttpRequest|WebSocket|localStorage|sessionStorage|indexedDB|crypto\.|privateKey|secret|home_token|dispatch_approved|invoke_provider|send_raw|ProviderRegistry' elastos/esp/consent.ts 'ESP consent helper must stay pure'
+check_forbidden_in_path 'fetch\(|XMLHttpRequest|WebSocket|localStorage|sessionStorage|indexedDB|crypto\.|privateKey|secret|home_token|dispatch_approved|invoke_provider|send_raw|ProviderRegistry' elastos/esp/custody.ts 'ESP custody helper must stay pure'
+check_forbidden_in_path 'fetch\(|XMLHttpRequest|WebSocket|localStorage|sessionStorage|indexedDB|crypto\.|privateKey|secret|home_token|dispatch_approved|invoke_provider|send_raw|ProviderRegistry' elastos/esp/home_fleet.ts 'ESP Home fleet helper must stay pure'
+check_forbidden_in_path 'fetch\(|XMLHttpRequest|WebSocket|localStorage|sessionStorage|indexedDB|crypto\.|privateKey|secret|home_token|dispatch_approved|invoke_provider|send_raw|ProviderRegistry' elastos/esp/shell_picker.ts 'ESP shell picker helper must stay pure'
+check_forbidden_in_path 'fetch\(|XMLHttpRequest|WebSocket|localStorage|sessionStorage|indexedDB|crypto\.|privateKey|secret|home_token|dispatch_approved|invoke_provider|send_raw|ProviderRegistry' elastos/esp/trust.ts 'ESP trust helper must stay pure'
+check_required '"role": "shell"' capsules/home-cli/capsule.json 'Home CLI capsule must remain a shell-role capsule'
+check_required 'home-cli\.js' capsules/home-cli/browser/index.html 'Home CLI browser shell must load its terminal surface'
+check_required 'id="xterm-terminal"' capsules/home-cli/browser/index.html 'Home CLI browser shell must mount an xterm terminal'
+check_required '/api/apps/home-cli/terminal/sessions' capsules/home-cli/browser/home-cli.js 'Home CLI browser shell must attach a Runtime-owned terminal session'
+check_required 'elastos\.home-cli\.terminal-start/v1' capsules/home-cli/browser/home-cli.js 'Home CLI browser shell must use the typed terminal start schema'
+check_required 'EventSource' capsules/home-cli/browser/home-cli.js 'Home CLI browser shell must receive terminal events from Runtime'
+check_required 'queueRuntimeTerminalInput' capsules/home-cli/browser/home-cli.js 'Home CLI browser shell must send raw terminal input through Runtime'
+check_required 'resizeRuntimeTerminal' capsules/home-cli/browser/home-cli.js 'Home CLI browser shell must report terminal resize through Runtime'
+check_required 'elastos\.home\.terminal-host-intent/v1' capsules/home-cli/browser/home-cli.js 'Home CLI browser shell must forward Home CLI TUI host intents without direct app launch'
+check_required 'home:open-target' capsules/home-cli/browser/home-cli.js 'Home CLI must ask Home to open visible capsules through the signed Home message channel'
+check_required 'print_cli_inspect' capsules/home-cli/src/main.rs 'Home CLI must render Runtime-derived capsule projection facts'
+check_required 'print_cli_contract' capsules/home-cli/src/main.rs 'Home CLI must render the shared capsule interface contract'
+check_required 'home-shell-boot-mask' capsules/home/browser/index.html 'Home shell host must neutral-mask first paint until Runtime selects the active shell'
+check_required 'print_cli_gates' capsules/home-cli/src/main.rs 'Home CLI must render Runtime gate facts'
+check_required 'print_cli_affordances' capsules/home-cli/src/main.rs 'Home CLI must render capsule affordance facts'
+check_required 'print_cli_wallet' capsules/home-cli/src/main.rs 'Home CLI must render wallet approval hints from Runtime facts'
+check_required 'print_cli_browser' capsules/home-cli/src/main.rs 'Home CLI must render Browser Engine and Exit facts'
+check_forbidden_in_path 'ProviderRegistry|dispatch_approved|/api/provider/|/api/apps/system|window\.ethereum|personal_sign|eth_requestAccounts|localStorage|sessionStorage|indexedDB' capsules/home-cli/browser 'Home CLI browser shell must stay a pure Runtime terminal client'
+check_required 'elastos\.capsule\.projection/v1' elastos/crates/elastos-server/src/api/gateway_capsule_catalog/read_model.rs 'Runtime catalog must derive shared capsule projection facts for shells'
+check_required 'elastos\.capsule\.projection/v1' docs/CAPSULE_INTERFACE_CONTRACT.md 'Capsule interface contract must document the derived projection facts'
+check_required 'active-shell-select' capsules/system/browser/index.html 'System Settings must expose active shell selection'
+check_required '/api/apps/home/active-shell' capsules/system/browser/system.js 'System Settings must use the Runtime-owned active-shell route'
+check_required 'home:refresh-summary' capsules/system/browser/system.js 'System shell setting must ask Home to swap the root shell after changes'
+check_forbidden_in_path 'esp-shell' components.json 'obsolete ESP Shell capsule must not be packaged'
 
 check_required 'Home front door' README.md 'README must teach Home front door'
 check_required 'No Ambient Authority' PRINCIPLES.md 'principles file must codify explicit authority boundaries'
@@ -310,8 +375,8 @@ check_required '/api/apps/system/wallet/approvals' elastos/crates/elastos-server
 check_required '/api/apps/system/wallet/managed' elastos/crates/elastos-server/src/api/gateway.rs 'System must expose built-in wallet creation through the runtime surface'
 check_required '/api/apps/:wallet_connector/wallet/approvals/:request_id/complete' elastos/crates/elastos-server/src/api/gateway.rs 'Wallet connector capsules must complete external wallet handoffs through the runtime surface'
 check_forbidden_in_path 'personal_sign|eth_requestAccounts|window\.ethereum|selectedMetaMaskProvider' capsules/system/browser 'System must not hold injected browser wallet authority'
-check_required 'wallet-metamask' capsules/home/browser/shell.js 'System must be able to open the dedicated MetaMask connector instead of signing in place'
-check_required 'wallet-unisat' capsules/home/browser/shell.js 'Wallet must be able to open the dedicated UniSat connector instead of signing Bitcoin proofs in place'
+check_required 'wallet-metamask' capsules/home/browser/home-shell-host.js 'System must be able to open the dedicated MetaMask connector instead of signing in place'
+check_required 'wallet-unisat' capsules/home/browser/home-shell-host.js 'Wallet must be able to open the dedicated UniSat connector instead of signing Bitcoin proofs in place'
 check_required 'wallet-approve-request' elastos/crates/elastos-server/src/api/gateway_inbox.rs 'Inbox must expose wallet approval review through the runtime surface'
 check_required 'sign_audit_event' elastos/crates/elastos-server/src/auth.rs 'runtime audit events must be signed by runtime authority'
 check_required 'elastos://chain/\{network\}/\{op\}' elastos/crates/elastos-server/src/provider_resource.rs 'chain provider operations must map to network-scoped capability resources'
@@ -333,9 +398,9 @@ check_required 'Guest access' capsules/system/browser/index.html 'System must sh
 check_required 'guest_registration_enabled' capsules/home/browser/shell-auth.js 'Home unlock must respect the guest-enrollment gate'
 check_required 'standard_home_identity_summary' elastos/crates/elastos-server/src/api/gateway_home_system.rs 'unsigned Home summary must use a standard non-user identity snapshot'
 check_required 'standard_home_browser_state' elastos/crates/elastos-server/src/api/gateway_home_system.rs 'unsigned Home summary must not expose principal browser state'
-check_required 'presentation: "prompt"' capsules/home/browser/shell.js 'unsigned Home must encourage sign-in without blocking the standard desktop'
+check_required 'presentation: "prompt"' capsules/home/browser/home-shell-host.js 'unsigned Home must encourage sign-in without blocking the standard desktop'
 check_required '/api/auth/sessions/refresh' capsules/home/browser/shell-auth.js 'Home must refresh proof-bound browser sessions through runtime auth'
-check_required 'home state save failed' capsules/home/browser/shell-core.js 'Home browser state writes must stay explicit and observable'
+check_required 'home state save failed' capsules/home-gui/browser/shell-core.js 'Home GUI browser state writes must stay explicit and observable'
 check_required 'passkey the Home front door authority' elastos/CHANGELOG.md 'CHANGELOG must record the implemented passkey front-door authority model'
 check_forbidden_in_path 'HOME_BROWSER_STATE_ROOT|ElastOS/System/HomeState' elastos/crates/elastos-server/src/api 'Home browser state must be rooted in the active principal user area, not a shared system bucket'
 check_forbidden_in_path 'authority_id|authorityId|home_browser_authority_id' elastos/crates/elastos-server/src/api 'Home browser state must identify the runtime principal, not an ambiguous authority id'
@@ -453,7 +518,7 @@ check_required '/api/apps/browser/open' capsules/browser/browser/browser.js 'Bro
 check_required '/api/auth/sessions/refresh' elastos/crates/elastos-server/src/api/gateway.rs 'browser gateway must expose proof-bound session refresh through runtime auth'
 check_required 'invalid WebAuthn Origin header' elastos/crates/elastos-server/src/api/handlers/identity.rs 'WebAuthn RP derivation must fail closed on malformed browser origins'
 if rg_search 'passkey|webauthn|PublicKeyCredential|credentials\.(create|get)' capsules \
-  --glob '!capsules/home/browser/*' \
+  --glob '!capsules/home/**' \
   --glob '!capsules/system/browser/*' \
   --glob '!capsules/inbox/browser/*' \
   --glob '!capsules/wallet/*' \
@@ -477,6 +542,7 @@ if rg_search $'fetch[[:space:]]*\\([[:space:]]*["\\\'`]https?://|\\.open[[:space
 fi
 if rg_search 'WalletConnect|walletconnect|MetaMask|metamask|UniSat|unisat|window\.ethereum|window\.unisat|ethereum\.request|personal_sign|eth_requestAccounts|eth_sendTransaction|wallet_switchEthereumChain|signMessage' capsules \
   --glob '!capsules/home/browser/*' \
+  --glob '!capsules/home-gui/browser/*' \
   --glob '!capsules/system/browser/*' \
   --glob '!capsules/browser/*' \
   --glob '!capsules/wallet-metamask/*' \
@@ -572,7 +638,7 @@ ordinary_roles = {"app", "viewer", "content"}
 # System is the runtime-owned approval/diagnostic surface. Dedicated wallet
 # connector capsules and the Browser shell are privileged adapter UIs, not
 # general app authority.
-ordinary_capsules_with_privileged_authority_ui = {"system", "wallet-metamask", "wallet-unisat", "wallet", "wallet-walletconnect", "browser", "library"}
+ordinary_capsules_with_privileged_authority_ui = {"home", "system", "wallet-metamask", "wallet-unisat", "wallet", "wallet-walletconnect", "browser", "library"}
 system_only_elastos_backends = {
     "elacity",
     "elacity-sdk",

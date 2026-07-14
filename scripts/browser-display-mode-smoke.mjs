@@ -26,12 +26,12 @@ const browserStyle = fs.readFileSync(
   new URL("capsules/browser/browser/style.css", repoRoot),
   "utf8",
 );
-const homeShellWindowsSource = fs.readFileSync(
-  new URL("capsules/home/browser/shell-windows.js", repoRoot),
+const homeGuiWindowsSource = fs.readFileSync(
+  new URL("capsules/home-gui/browser/shell-windows.js", repoRoot),
   "utf8",
 );
 const homeShellWindowGeometrySource = fs.readFileSync(
-  new URL("capsules/home/browser/shell-window-geometry.js", repoRoot),
+  new URL("capsules/home-gui/browser/shell-window-geometry.js", repoRoot),
   "utf8",
 );
 
@@ -305,21 +305,21 @@ assert(
   "Stable WebRTC Browser display must not send provider resize commands that can freeze the fixed compositor stream",
 );
 assert(
-  homeShellWindowsSource.includes(`syncBrowserWindow(entry, launched);
+  homeGuiWindowsSource.includes(`syncBrowserWindow(entry, launched);
   if (entry.targetId === "browser") {
     fitLaunchedWindow(entry);
   }`) &&
-    homeShellWindowsSource.includes("fitWindowToLargestBrowserAspect") &&
-    homeShellWindowsSource.includes("dataset.browserMaximized") &&
+    homeGuiWindowsSource.includes("fitWindowToLargestBrowserAspect") &&
+    homeGuiWindowsSource.includes("dataset.browserMaximized") &&
     homeShellWindowGeometrySource.includes(
       "export function fitWindowToLargestBrowserAspect",
     ) &&
     homeShellWindowGeometrySource.includes(
       'node.dataset.target === BROWSER_TARGET_ID',
     ) &&
-    !homeShellWindowsSource.includes("prebootBrowserTarget") &&
-    !homeShellWindowsSource.includes("dataset.preboot") &&
-    homeShellWindowsSource.includes(`if (entry.targetId === "browser") {
+    !homeGuiWindowsSource.includes("prebootBrowserTarget") &&
+    !homeGuiWindowsSource.includes("dataset.preboot") &&
+    homeGuiWindowsSource.includes(`if (entry.targetId === "browser") {
     fitWindowToBrowserAspect(entry.node);
     rememberWindowRestoreBounds(entry.node);
     return;
@@ -456,11 +456,11 @@ assert(
   "Browser UI must capture host paste and printable keys through Runtime/provider insertText instead of simulated remote Ctrl+V",
 );
 assert(
-  homeShellWindowsSource.includes("function iframeAllowForLaunch") &&
-    homeShellWindowsSource.includes('launched?.target === "browser"') &&
-    homeShellWindowsSource.includes('"clipboard-read"') &&
-    homeShellWindowsSource.includes('"clipboard-write"') &&
-    homeShellWindowsSource.includes('allow="${iframeAllowForLaunch(launched)}"'),
+  homeGuiWindowsSource.includes("function iframeAllowForLaunch") &&
+    homeGuiWindowsSource.includes('launched?.target === "browser"') &&
+    homeGuiWindowsSource.includes('"clipboard-read"') &&
+    homeGuiWindowsSource.includes('"clipboard-write"') &&
+    homeGuiWindowsSource.includes('allow="${iframeAllowForLaunch(launched)}"'),
   "Home must grant clipboard-read/write only through the Browser iframe allow policy so remote paste can read the host clipboard",
 );
 

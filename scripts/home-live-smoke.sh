@@ -68,22 +68,22 @@ home_html="$(get "/apps/home/")"
 if [[ -z "$HOME_VERSION" ]]; then
     HOME_VERSION="$(grep -oE 'shell\.js\?v=[^"]+' <<<"$home_html" | sed 's/^shell\.js?v=//' | head -n1)"
     if [[ -z "$HOME_VERSION" ]]; then
-        echo "[home-live-smoke] could not discover Home asset version from shell.js tag" >&2
+        echo "[home-live-smoke] could not discover Home asset version from home-shell-host.js tag" >&2
         exit 1
     fi
 fi
-assert_contains "Home HTML" "$home_html" "shell.js?v=${HOME_VERSION}"
+assert_contains "Home HTML" "$home_html" "home-shell-host.js?v=${HOME_VERSION}"
 assert_contains "Home HTML" "$home_html" "style.css?v=${HOME_VERSION}"
 assert_contains "Home HTML" "$home_html" "manifest.webmanifest?v=${HOME_VERSION}"
 assert_not_contains "Home HTML" "$home_html" "home-20260603a"
 assert_not_contains "Home HTML" "$home_html" "home-20260601a"
 
 echo "[home-live-smoke] verify live Home module graph"
-shell_js="$(get "/apps/home/shell.js?v=${HOME_VERSION}")"
-assert_contains "Home shell.js" "$shell_js" "shell-core.js?v=${HOME_VERSION}"
-assert_contains "Home shell.js" "$shell_js" "shell-auth.js?v=${HOME_VERSION}"
-assert_not_contains "Home shell.js" "$shell_js" "navigator.serviceWorker.register"
-assert_not_contains "Home shell.js" "$shell_js" "home-20260603a"
+shell_js="$(get "/apps/home/home-shell-host.js?v=${HOME_VERSION}")"
+assert_contains "Home home-shell-host.js" "$shell_js" "shell-core.js?v=${HOME_VERSION}"
+assert_contains "Home home-shell-host.js" "$shell_js" "shell-auth.js?v=${HOME_VERSION}"
+assert_not_contains "Home home-shell-host.js" "$shell_js" "navigator.serviceWorker.register"
+assert_not_contains "Home home-shell-host.js" "$shell_js" "home-20260603a"
 
 shell_auth_js="$(get "/apps/home/shell-auth.js?v=${HOME_VERSION}")"
 assert_contains "Home shell-auth.js" "$shell_auth_js" "guest_registration_enabled"
@@ -95,8 +95,12 @@ assert_contains "Home service worker" "$service_worker" "self.registration.unreg
 assert_contains "Home service worker" "$service_worker" "key.startsWith(CACHE_PREFIX)"
 assert_not_contains "Home service worker" "$service_worker" "caches.open("
 
-for module in shell-core shell-auth shell-chrome shell-surface shell-windows shell-window-geometry; do
+for module in shell-core shell-auth; do
     curl -fsS -o /dev/null "$GATEWAY_URL/apps/home/${module}.js?v=${HOME_VERSION}"
+done
+
+for module in shell-chrome shell-surface shell-windows shell-window-geometry home-gui; do
+    curl -fsS -o /dev/null "$GATEWAY_URL/apps/home-gui/${module}.js?v=${HOME_VERSION}"
 done
 
 if configure_home_auth; then

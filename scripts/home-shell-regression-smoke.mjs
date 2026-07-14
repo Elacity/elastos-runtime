@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260626a";
+const moduleVersion = "home-20260705a";
 const savedStatePatches = [];
+const requests = [];
 
 class FakeClassList {
   constructor() {
@@ -37,7 +38,10 @@ class FakeElement {
     this.hidden = false;
     this.classList = new FakeClassList();
     this.content = withTemplateContent
-      ? { firstElementChild: new FakeElement(`${selector}:template-child`, false) }
+      ? {
+          firstElementChild: new FakeElement(`:template-child`, false),
+          cloneNode: () => new FakeElement(`:template-fragment`, false),
+        }
       : { firstElementChild: null };
   }
 
@@ -91,6 +95,7 @@ function elementForSelector(selector) {
 globalThis.HTMLElement = FakeElement;
 globalThis.document = {
   activeElement: null,
+  body: elementForSelector("body"),
   querySelector: elementForSelector,
   createElement: (tag) => new FakeElement(tag),
 };
@@ -102,6 +107,10 @@ globalThis.window = {
   clearInterval: () => {},
 };
 globalThis.fetch = async (_url, init = {}) => {
+  requests.push({
+    url: String(_url),
+    body: init.body ? JSON.parse(init.body) : null,
+  });
   if (init.body) {
     savedStatePatches.push(JSON.parse(init.body));
   }
@@ -126,8 +135,9 @@ function positionsOverlap(left, right) {
   return Math.abs(left.x - right.x) < 92 && Math.abs(left.y - right.y) < 98;
 }
 
-const shellCore = await import(`../capsules/home/browser/shell-core.js?v=${moduleVersion}`);
-const shellWindows = await import(`../capsules/home/browser/shell-windows.js?v=${moduleVersion}`);
+const shellCore = await import(`../capsules/home-gui/browser/shell-core.js?v=${moduleVersion}`);
+const shellWindows = await import(`../capsules/home-gui/browser/shell-windows.js?v=${moduleVersion}`);
+const shellSurface = await import(`../capsules/home-gui/browser/shell-surface.js?v=${moduleVersion}`);
 
 const summary = {
   authority: { signed_in: true },
@@ -154,6 +164,7 @@ const summary = {
 };
 
 shellCore.initializeShellLayout(summary);
+document.body.dataset.homeShell = "desktop";
 
 const layout = shellCore.shellState.shellLayoutState.desktop;
 assert(layout.wallet, "wallet desktop position missing", layout);
@@ -167,6 +178,7 @@ assert(
 );
 
 const restored = shellWindows.normalizeRestorableSession(summary, {
+  root_shell: "home-gui",
   windows: [
     { target: "people", active: true, x: 10, y: 10 },
     { target: "people", active: false, x: 20, y: 20 },
@@ -180,6 +192,18 @@ const restored = shellWindows.normalizeRestorableSession(summary, {
   ],
 });
 
+const rootlessSessionRestoredIntoGui = shellWindows.normalizeRestorableSession(summary, {
+  windows: [
+    { target: "browser", query: { url: "https://example.com/rootless" } },
+  ],
+}, { rootShell: "home-gui" });
+const cliOwnedRestoredIntoGui = shellWindows.normalizeRestorableSession(summary, {
+  root_shell: "home-cli",
+  windows: [
+    { target: "browser", query: { url: "https://example.com/cli" } },
+  ],
+}, { rootShell: "home-gui" });
+
 const counts = restored.reduce((next, entry) => {
   next[entry.target] = (next[entry.target] || 0) + 1;
   return next;
@@ -191,11 +215,51 @@ assert(counts.wallet === 1, "Wallet restored more than once", restored);
 assert(counts.browser === 2, "Browser should allow multiple restored windows", restored);
 assert(!counts["missing-target"], "unknown saved session target was restored", restored);
 assert(
+  rootlessSessionRestoredIntoGui.length === 0,
+  "rootless GUI session restored without explicit shell ownership",
+  rootlessSessionRestoredIntoGui,
+);
+assert(
+  cliOwnedRestoredIntoGui.length === 0,
+  "CLI-owned overlay session restored into Home GUI",
+  cliOwnedRestoredIntoGui,
+);
+assert(
   restored
     .filter((entry) => entry.target === "browser")
     .every((entry) => typeof entry.query.browser_instance === "string" && entry.query.browser_instance !== ""),
   "restored Browser windows must receive distinct browser_instance query values",
   restored,
+);
+
+const objectWithoutCapabilities = {
+  uri: "localhost://Users/self/Desktop/Mystery.txt",
+  name: "Mystery.txt",
+  kind: "file",
+  mime: "text/plain",
+};
+shellCore.shellState.currentSummary = {
+  ...summary,
+  desktop_objects: { objects: [objectWithoutCapabilities] },
+};
+shellCore.shellState.selectedDesktopTargetId = `object:${objectWithoutCapabilities.uri}`;
+shellCore.shellState.contextMenuTarget = {
+  kind: "desktop-object",
+  entryId: `object:${objectWithoutCapabilities.uri}`,
+};
+const objectActionRequestCount = requests.length;
+assert(
+  shellSurface.openSelectedDesktopEntry() === false,
+  "desktop object without capability metadata opened instead of failing closed",
+);
+shellSurface.handleContextAction("open-desktop-object");
+shellSurface.handleContextAction("download-desktop-object");
+shellSurface.handleContextAction("properties-desktop-object");
+shellSurface.handleContextAction("empty-trash");
+assert(
+  requests.length === objectActionRequestCount,
+  "desktop object actions without capability metadata reached Runtime",
+  requests.slice(objectActionRequestCount),
 );
 
 console.log("[home-shell-regression] PASS");

@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Home CLI · ElastOS</title>
+    <link rel="stylesheet" href="./vendor/xterm/xterm.css?v=xterm-6.0.0" />
+    <link rel="stylesheet" href="./style.css?v=home-cli-20260705c" />
+  </head>
+  <body>
+    <main class="terminal-shell">
+      <section id="terminal-panel" class="terminal-panel" aria-label="Home CLI terminal">
+        <div class="terminal-screen" role="log" aria-live="polite" aria-relevant="additions text">
+          <pre id="terminal-output"></pre>
+          <div id="xterm-terminal" aria-label="Runtime terminal" hidden></div>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="./home-cli.js?v=home-cli-20260705c"></script>
+  </body>
+</html>

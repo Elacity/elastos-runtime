@@ -1,0 +1,134 @@
+{
+  "schema": "elastos.home-cli.command-contract/v1",
+  "version": "0.5.0",
+  "terminal": {
+    "renderer": "terminal-only capsule-local xterm.js Runtime PTY terminal",
+    "transport": "runtime_pty_stream",
+    "transport_scope": "local_runtime_adapter",
+    "input": "keyboard, paste, mouse, and resize events -> Runtime-owned PTY stream",
+    "pty": "Runtime-owned PTY; xterm sends input bytes and renders PTY output without direct host process authority",
+    "xterm": "capsule-local @xterm/xterm renderer autostarted over the Runtime-owned start/events/input/resize/close stream contract",
+    "entrypoint": "the same home-cli binary runs inside the Runtime PTY and through `elastos home` over local Home state"
+  },
+  "commands": [
+    {
+      "name": "home",
+      "aliases": ["status", "summary", "whoami"],
+      "usage": "home",
+      "summary": "Home dashboard summary",
+      "description": "Show the signed Home summary, active shell, runtime, inbox, app, and capsule counts.",
+      "surface": ["home-cli"]
+    },
+    {
+      "name": "apps",
+      "aliases": ["targets", "ls", "app"],
+      "usage": "apps",
+      "summary": "Launchable capsule targets",
+      "description": "List visible launch targets from the Runtime-owned Home snapshot.",
+      "surface": ["home-cli"]
+    },
+    {
+      "name": "invoke",
+      "aliases": ["call"],
+      "usage": "invoke <capsule> <method> [json|target]",
+      "summary": "Invoke a runtime-policy affordance",
+      "description": "In Home CLI line mode, resolve a declared runtime-policy affordance and write a structured Home intent. User/high-risk methods stay blocked.",
+      "surface": ["home-cli"]
+    },
+    {
+      "name": "inbox",
+      "aliases": ["approvals", "approval", "requests", "approve"],
+      "usage": "inbox",
+      "summary": "Notifications and approvals",
+      "description": "Show Inbox notifications and approval hints surfaced through Runtime facts.",
+      "surface": ["home-cli"]
+    },
+    {
+      "name": "people",
+      "aliases": ["contacts", "contact", "discovery"],
+      "usage": "people",
+      "summary": "People and discovery",
+      "description": "Show contacts, People discovery, visible homes, requests, and available People actions from Runtime facts.",
+      "surface": ["home-cli"]
+    },
+    {
+      "name": "mywebsite",
+      "aliases": ["site", "website", "spaces"],
+      "usage": "mywebsite [status|stage <dir>|preview|publish|open]",
+      "summary": "MyWebSite tasks",
+      "description": "Show MyWebSite status, stage a local directory, start a local preview, publish a temporary public URL, or explicitly open the preview in a browser.",
+      "surface": ["home-cli"]
+    },
+    {
+      "name": "wallet",
+      "aliases": ["wallets"],
+      "usage": "wallet",
+      "summary": "Wallet targets and request hints",
+      "description": "Show wallet capsules and wallet approval notifications from Runtime facts.",
+      "surface": ["home-cli"]
+    },
+    {
+      "name": "exits",
+      "aliases": ["exit-nodes"],
+      "usage": "exits",
+      "summary": "Browser Exit offers",
+      "description": "List local and remote Browser Exit offers from the Services projection.",
+      "surface": ["home-cli"]
+    },
+    {
+      "name": "system",
+      "aliases": ["settings", "sys"],
+      "usage": "system [shell <home-gui>|source|updates|services|identity|diagnostics]",
+      "summary": "System settings and diagnostics",
+      "description": "Show System settings and run explicit settings actions such as switching back to home-gui through the Runtime-owned active-shell state.",
+      "surface": ["home-cli"]
+    },
+    {
+      "name": "debug",
+      "aliases": ["dev"],
+      "usage": "debug [capsules|inspect <capsule>|affordances [capsule]|gates [capsule]|audit <capsule>|people|spaces [root]|services|browser|terminal|contract]",
+      "summary": "Developer facts and projections",
+      "description": "Show diagnostics that are hidden from the default Home CLI product surface. Debug rows are descriptors, not grants.",
+      "surface": ["home-cli"]
+    },
+    {
+      "name": "refresh",
+      "aliases": ["r"],
+      "usage": "refresh",
+      "summary": "Reload Home facts",
+      "description": "Ask Home to refresh the Runtime-owned snapshot.",
+      "surface": ["home-cli"]
+    },
+    {
+      "name": "help",
+      "aliases": ["?"],
+      "usage": "help [command]",
+      "summary": "Show command help",
+      "description": "Show the Home CLI command contract.",
+      "surface": ["home-cli"]
+    },
+    {
+      "name": "exit",
+      "aliases": ["close", "q", "quit", "/q", "/quit"],
+      "usage": "exit",
+      "summary": "Exit Home CLI",
+      "description": "Home CLI line/TUI mode writes a quit intent. In browser root mode, q or Esc returns to home-gui when the Runtime terminal exits.",
+      "surface": ["home-cli"]
+    }
+  ],
+  "controls": [
+    { "key": "Keyboard", "description": "sent as raw terminal input to the Runtime-owned PTY" },
+    { "key": "Up/Down", "description": "select the previous or next visible item" },
+    { "key": "Left/Right", "description": "switch Home CLI sections" },
+    { "key": "Tab", "description": "switch to the next section; Shift+Tab switches back" },
+    { "key": "Enter", "description": "open the selected action" },
+    { "key": "1-9", "description": "quick-launch visible Home actions" },
+    { "key": "r", "description": "refresh Runtime-owned Home facts" },
+    { "key": "q / Esc", "description": "exit Home CLI; in browser root mode this returns to home-gui" },
+    { "key": "?", "description": "toggle help" },
+    { "key": "m / d", "description": "Inbox only: mark read or dismiss" },
+    { "key": "Paste", "description": "sent as terminal input through the same launch-token-gated input route" },
+    { "key": "Mouse", "description": "wheel selects items; tab-row clicks switch sections" },
+    { "key": "Resize", "description": "reported to Runtime through the terminal resize route" }
+  ]
+}

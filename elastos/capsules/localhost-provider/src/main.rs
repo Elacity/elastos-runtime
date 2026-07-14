@@ -35,6 +35,8 @@ pub enum ProviderRequest {
         path: String,
         #[serde(default)]
         token: Option<String>,
+        #[serde(default)]
+        encoding: Option<String>,
         offset: Option<u64>,
         length: Option<u64>,
     },
@@ -680,14 +682,16 @@ impl LocalProvider {
             ProviderRequest::Read {
                 path,
                 token,
+                encoding,
                 offset,
                 length,
             } => match self.read_file(&path, token.as_deref().unwrap_or(""), offset, length) {
-                Ok(data) => ProviderResponse::Ok {
-                    data: Some(serde_json::json!({
-                        "content": data,
-                        "size": data.len(),
-                    })),
+                Ok(data) => match read_response_data(data, encoding.as_deref()) {
+                    Ok(data) => ProviderResponse::Ok { data: Some(data) },
+                    Err(e) => ProviderResponse::Error {
+                        code: "read_failed".to_string(),
+                        message: e.to_string(),
+                    },
                 },
                 Err(e) => ProviderResponse::Error {
                     code: "read_failed".to_string(),
@@ -776,6 +780,33 @@ impl LocalProvider {
                 data: Some(serde_json::json!({ "message": "Provider shutting down" })),
             },
         }
+    }
+}
+
+fn read_response_data(data: Vec<u8>, encoding: Option<&str>) -> io::Result<serde_json::Value> {
+    match encoding {
+        Some("utf8") => {
+            let size = data.len();
+            let content = String::from_utf8(data).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("read content is not valid utf8: {}", e),
+                )
+            })?;
+            Ok(serde_json::json!({
+                "content": content,
+                "encoding": "utf8",
+                "size": size,
+            }))
+        }
+        Some(other) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported read encoding: {}", other),
+        )),
+        None => Ok(serde_json::json!({
+            "content": data,
+            "size": data.len(),
+        })),
     }
 }
 
@@ -921,6 +952,21 @@ mod tests {
             ProviderResponse::Ok { .. }
         ));
         assert_eq!(fs::read(dir.path().join("new.txt")).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn read_response_data_can_return_utf8_content_without_byte_array_expansion() {
+        let data = read_response_data(br#"{"ok":true}"#.to_vec(), Some("utf8")).unwrap();
+
+        assert_eq!(
+            data.get("content").and_then(|value| value.as_str()),
+            Some(r#"{"ok":true}"#)
+        );
+        assert_eq!(
+            data.get("encoding").and_then(|value| value.as_str()),
+            Some("utf8")
+        );
+        assert_eq!(data.get("size").and_then(|value| value.as_u64()), Some(11));
     }
 
     #[test]

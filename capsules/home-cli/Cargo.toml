@@ -2,7 +2,7 @@
 name = "home-cli"
 version = "0.1.0"
 edition = "2021"
-description = "ElastOS Home dashboard"
+description = "Runtime-owned ElastOS Home CLI shell"
 license = "MIT"
 
 [[bin]]

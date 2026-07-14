@@ -110,6 +110,7 @@ echo "[local-carrier-setup] building current binary and first-party Home core as
 (cd "${REPO_ROOT}/capsules/home-cli" && cargo build --target wasm32-wasip1 --release)
 for capsule in \
     home \
+    home-gui \
     system \
     services \
     browser \
@@ -158,6 +159,7 @@ OBJECT_PROVIDER_BIN="${REPO_ROOT}/capsules/object-provider/target/release/object
 CONTENT_BLOCK_GRAPH_PROVIDER_BIN="${REPO_ROOT}/capsules/content-block-graph-provider/target/release/content-block-graph-provider" \
 HOME_CLI_DIR="${REPO_ROOT}/capsules/home-cli" \
 HOME_CAPSULE_DIR="${REPO_ROOT}/capsules/home" \
+HOME_GUI_CAPSULE_DIR="${REPO_ROOT}/capsules/home-gui" \
 SYSTEM_CAPSULE_DIR="${REPO_ROOT}/capsules/system" \
 SERVICES_CAPSULE_DIR="${REPO_ROOT}/capsules/services" \
 BROWSER_CAPSULE_DIR="${REPO_ROOT}/capsules/browser" \
@@ -238,12 +240,14 @@ with tarfile.open(home_cli_archive, "w:gz") as tar:
         home_cli_dir / "target/wasm32-wasip1/release/home-cli.wasm",
         arcname="home-cli/home-cli.wasm",
     )
+    tar.add(home_cli_dir / "browser", arcname="home-cli/browser")
 home_cli_data = home_cli_archive.read_bytes()
 home_cli_manifest["checksum"] = "sha256:" + hashlib.sha256(home_cli_data).hexdigest()
 home_cli_manifest["size"] = len(home_cli_data)
 
 browser_capsules = {
     "home": pathlib.Path(os.environ["HOME_CAPSULE_DIR"]),
+    "home-gui": pathlib.Path(os.environ["HOME_GUI_CAPSULE_DIR"]),
     "system": pathlib.Path(os.environ["SYSTEM_CAPSULE_DIR"]),
     "services": pathlib.Path(os.environ["SERVICES_CAPSULE_DIR"]),
     "browser": pathlib.Path(os.environ["BROWSER_CAPSULE_DIR"]),
@@ -451,6 +455,11 @@ for installed in \
     "${DATA_DIR}/capsules/home-cli/capsule.json" \
     "${DATA_DIR}/capsules/home/home.wasm" \
     "${DATA_DIR}/capsules/home/browser/index.html" \
+    "${DATA_DIR}/capsules/home-cli/browser/index.html" \
+    "${DATA_DIR}/capsules/home-gui/home-gui.wasm" \
+    "${DATA_DIR}/capsules/home-gui/browser/home-gui.js" \
+    "${DATA_DIR}/capsules/home-gui/browser/home-gui-template.html" \
+    "${DATA_DIR}/capsules/home-gui/browser/style.css" \
     "${DATA_DIR}/capsules/system/system.wasm" \
     "${DATA_DIR}/capsules/system/browser/index.html" \
     "${DATA_DIR}/capsules/services/services.wasm" \

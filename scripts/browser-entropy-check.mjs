@@ -69,7 +69,7 @@ const browserJs = readAll([
 const browserInputSurface = read("capsules/browser/browser/browser-input-surface.js");
 const browserRemoteDisplay = read("capsules/browser/browser/browser-remote-display.js");
 const browserStyle = read("capsules/browser/browser/style.css");
-const homeShellWindows = read("capsules/home/browser/shell-windows.js");
+const homeGuiWindowsSource = read("capsules/home-gui/browser/shell-windows.js");
 const netProvider = read("capsules/net-provider/src/main.rs");
 const exitProvider = read("capsules/exit-provider/src/main.rs");
 const browserEngineAdapter = readAll([
@@ -269,7 +269,7 @@ const gatewayBrowserProfileTests = read(
 const gatewayHomeSystemTests = read(
   "elastos/crates/elastos-server/src/api/gateway_tests/home_system.rs",
 );
-const shellWindows = read("capsules/home/browser/shell-windows.js");
+const shellWindows = read("capsules/home-gui/browser/shell-windows.js");
 const browserSettingsPanelIndex = browser.indexOf('id="browser-settings-panel"');
 const browserProfileResetIndex = browser.indexOf('id="browser-profile-reset"');
 
@@ -1526,11 +1526,11 @@ assert(
   "Browser UI must bridge copy through Selkies clipboard messages and paste/printable keys through Runtime/provider CDP insertText while file uploads are Library-mediated",
 );
 assert(
-  homeShellWindows.includes("function iframeAllowForLaunch") &&
-    homeShellWindows.includes('launched?.target === "browser"') &&
-    homeShellWindows.includes('"clipboard-read"') &&
-    homeShellWindows.includes('"clipboard-write"') &&
-    homeShellWindows.includes('allow="${iframeAllowForLaunch(launched)}"'),
+  homeGuiWindowsSource.includes("function iframeAllowForLaunch") &&
+    homeGuiWindowsSource.includes('launched?.target === "browser"') &&
+    homeGuiWindowsSource.includes('"clipboard-read"') &&
+    homeGuiWindowsSource.includes('"clipboard-write"') &&
+    homeGuiWindowsSource.includes('allow="${iframeAllowForLaunch(launched)}"'),
   "Home Browser iframe must explicitly grant clipboard-read/write so render-surface paste can use the Runtime clipboard bridge",
 );
 

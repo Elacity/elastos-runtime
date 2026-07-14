@@ -1,3 +1,9 @@
+import {
+  gatePreviewAuditView,
+  inspectActionRequestValidation,
+  provenanceView,
+} from "./esp-projections.mjs";
+
 const errorNode = document.querySelector(".system-error");
 const storageNoteNode = document.querySelector('[data-field="storage-note"]');
 const backgroundInput = document.querySelector("#background-input");
@@ -24,11 +30,18 @@ const recoveryAttachButton = document.querySelector("#recovery-attach");
 const recoveryCancelButton = document.querySelector("#recovery-cancel");
 const webspaceListNode = document.querySelector("#webspace-list");
 const chainTableNode = document.querySelector("#chain-table");
+const activeShellSelect = document.querySelector("#active-shell-select");
+const activeShellApplyButton = document.querySelector("#active-shell-apply");
+const activeShellStatusNode = document.querySelector('[data-field="active-shell-status"]');
+const activeShellCurrentNode = document.querySelector('[data-field="active-shell-current"]');
 const inspectListNode = document.querySelector("#inspect-list");
 const inspectDetailNode = document.querySelector("#inspect-detail");
 const inspectStatusNode = document.querySelector("#inspect-status");
 const inspectRefreshButton = document.querySelector("#inspect-refresh");
 const frameHomeToken = readQueryParam("home_token");
+const ACTIVE_SHELL_HINT_KEY = "elastos.home.active-shell-hint";
+const HOME_HOST_ID = "home";
+const HOME_GUI_SHELL_ID = "home-gui";
 let apiHomeToken = frameHomeToken;
 let chainNetworks = [];
 let chainStatusById = new Map();
@@ -37,7 +50,7 @@ let inspectEntries = [];
 let currentAccess = {};
 let passkeyAuthorityActive = false;
 let pendingRecoveryImport = null;
-const DEFAULT_BACKGROUND_IMAGE_URL = "/apps/home/wallpaper.webp";
+const DEFAULT_BACKGROUND_IMAGE_URL = "/apps/home-gui/wallpaper.webp";
 const BACKGROUND_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
 const BACKGROUND_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 const BACKGROUND_OVERLAY_OPACITY_DEFAULT = 0.55;
@@ -72,8 +85,10 @@ async function boot() {
   configurePasskeyAccess();
   configureRecoveryAccess();
   configureChainAccess();
+  configureActiveShell();
   configureInspector();
   await refreshSystemSummary();
+  await refreshActiveShell().catch((error) => showActiveShellStatus(String(error.message || error), "error"));
   await refreshAccountList().catch(() => {});
   await refreshRecoveryStatus();
   await refreshChainNetworks();
@@ -142,6 +157,7 @@ function renderSystemSummary(systemSummary) {
   const authority = systemSummary.authority || {};
   const access = systemSummary.access || {};
   const runtime = systemSummary.runtime || {};
+  const source = systemSummary.source || {};
   const storage = systemSummary.storage || {};
   const webspace = systemSummary.webspace || {};
 
@@ -150,6 +166,7 @@ function renderSystemSummary(systemSummary) {
   setPasskeyAuthority(authority);
   setAppearance(appearance);
   setRuntimeState(runtime);
+  setSourceState(source);
   setStorageState(storage);
   setWebspaceState(webspace);
 }
@@ -281,6 +298,17 @@ function configureChainAccess() {
     chainTableNode.addEventListener("click", onChainRowClick);
     chainTableNode.addEventListener("keydown", onChainRowKeydown);
   }
+}
+
+function configureActiveShell() {
+  activeShellApplyButton?.addEventListener("click", () => {
+    applyActiveShell().catch((error) => showActiveShellStatus(String(error.message || error), "error"));
+  });
+  activeShellSelect?.addEventListener("change", () => {
+    if (activeShellApplyButton) {
+      activeShellApplyButton.disabled = false;
+    }
+  });
 }
 
 function configureInspector() {
@@ -496,15 +524,6 @@ function clearOverlayStatus() {
   overlayStatusNode.dataset.tone = "";
 }
 
-function notifyHomeSummaryChanged() {
-  if (window.parent && window.parent !== window) {
-    window.parent.postMessage({
-      type: "home:refresh-summary",
-      homeToken: frameHomeToken,
-    }, window.location.origin);
-  }
-}
-
 function setWebspaceState(webspace) {
   if (!webspaceListNode) {
     return;
@@ -613,6 +632,135 @@ function openCapsuleTarget(target) {
   }, window.location.origin);
 }
 
+async function refreshActiveShell() {
+  if (!activeShellSelect || !hasShellAccess()) {
+    return;
+  }
+  showActiveShellStatus("Loading", "muted");
+  const summary = await fetchJson("/api/apps/home/active-shell", {
+    headers: shellHeaders(),
+  });
+  renderActiveShell(summary);
+  showActiveShellStatus("", "muted");
+}
+
+function renderActiveShell(summary) {
+  if (!activeShellSelect) {
+    return;
+  }
+  const active = shellName(readText(summary?.active) || "home-gui");
+  rememberActiveShellHint(active);
+  const candidates = Array.isArray(summary?.candidates) ? summary.candidates : [];
+  activeShellSelect.replaceChildren();
+  for (const candidate of candidates) {
+    const name = shellName(readText(candidate.name));
+    if (!name || name === HOME_HOST_ID) {
+      continue;
+    }
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = formatShellLabel(name, readText(candidate.title));
+    option.selected = name === active;
+    activeShellSelect.append(option);
+  }
+  if (activeShellSelect.options.length === 0) {
+    const option = document.createElement("option");
+    option.value = active;
+    option.textContent = formatShellName(active);
+    option.selected = true;
+    activeShellSelect.append(option);
+  }
+  activeShellSelect.value = active;
+  if (activeShellApplyButton) {
+    activeShellApplyButton.disabled = false;
+  }
+  if (activeShellCurrentNode) {
+    activeShellCurrentNode.textContent = formatShellName(active);
+  }
+}
+
+function rememberActiveShellHint(active) {
+  try {
+    const shell = shellName(active);
+    if (shell && shell !== "home-gui") {
+      window.localStorage.setItem(ACTIVE_SHELL_HINT_KEY, shell);
+      document.documentElement.dataset.homeShellHint = "alternate";
+      return;
+    }
+    window.localStorage.removeItem(ACTIVE_SHELL_HINT_KEY);
+    delete document.documentElement.dataset.homeShellHint;
+  } catch (_error) {}
+}
+
+async function applyActiveShell() {
+  const active = readText(activeShellSelect?.value);
+  if (!active) {
+    return;
+  }
+  if (activeShellApplyButton) {
+    activeShellApplyButton.disabled = true;
+  }
+  showActiveShellStatus("Applying", "muted");
+  const summary = await fetchJson("/api/apps/home/active-shell", {
+    method: "POST",
+    headers: shellHeaders({ "content-type": "application/json" }),
+    body: JSON.stringify({ active }),
+  });
+  renderActiveShell(summary);
+  notifyHomeActiveShellApplied(readText(summary?.active) || active);
+  notifyHomeSummaryChanged();
+  showActiveShellStatus("Updated", "ok");
+}
+
+function notifyHomeSummaryChanged() {
+  if (!window.parent || window.parent === window) {
+    return;
+  }
+  window.parent.postMessage({
+    type: "home:refresh-summary",
+    homeToken: apiHomeToken,
+  }, window.location.origin);
+}
+
+function notifyHomeActiveShellApplied(active) {
+  const activeShell = readText(active);
+  if (!activeShell || !apiHomeToken || !window.parent || window.parent === window) {
+    return;
+  }
+  window.parent.postMessage({
+    type: "home:active-shell-applied",
+    activeShell,
+    homeToken: apiHomeToken,
+  }, window.location.origin);
+}
+
+function showActiveShellStatus(message, tone = "muted") {
+  if (!activeShellStatusNode) {
+    return;
+  }
+  const text = readText(message);
+  activeShellStatusNode.textContent = text;
+  activeShellStatusNode.dataset.tone = tone;
+  activeShellStatusNode.hidden = !text;
+}
+
+function formatShellLabel(name, title = "") {
+  const label = readText(title);
+  if (label) {
+    return label;
+  }
+  return formatShellName(name);
+}
+
+function formatShellName(value) {
+  const name = shellName(value);
+  return name || "unknown";
+}
+
+function shellName(value) {
+  return readText(value);
+}
+
 async function refreshInspector() {
   if (!inspectListNode || !hasShellAccess()) {
     return;
@@ -704,7 +852,7 @@ function renderInspectDetail(object) {
   header.append(title, meta);
 
   const authority = object && object.authority && typeof object.authority === "object" ? object.authority : {};
-  const provenance = object && object.provenance && typeof object.provenance === "object" ? object.provenance : {};
+  const provenance = provenanceView(object);
   const manifest = object && object.manifest && typeof object.manifest === "object" ? object.manifest : {};
   const capabilities = Array.isArray(authority.capabilities) ? authority.capabilities : [];
   const actions = [...new Set(capabilities.flatMap((capability) => (
@@ -720,7 +868,7 @@ function renderInspectDetail(object) {
     inspectFact("Type", `${readText(object.type) || "unknown"} · ${readText(manifest.role) || "unknown"}`),
     inspectFact("Provides", readText(manifest.provides) || "none"),
     inspectFact("CID", shortText(readText(provenance.cid), 18) || "not stamped"),
-    inspectFact("Signature", provenance.signature_present === true ? shortText(readText(provenance.signature_fingerprint), 16) : "not present"),
+    inspectFact("Signature", provenance.signature_present ? shortText(readText(provenance.signature_fingerprint), 16) : "not present"),
   );
 
   const preview = document.createElement("div");
@@ -784,11 +932,17 @@ async function onInspectDetailClick(event) {
     }
     try {
       const result = await inspectProvider("request_act", { id, operation, request: {} });
+      const validation = inspectActionRequestValidation(result);
       if (output) {
         output.textContent = JSON.stringify({
           status: result.status || "pending",
-          request_id: result.request_id,
-          operation: result.operation,
+          request_id: validation.request_id || result.request_id,
+          operation: validation.operation || result.operation,
+          request_binding: validation.binding,
+          projection: {
+            ok: validation.ok,
+            reasons: validation.reasons,
+          },
           plan: result.plan || null,
         }, null, 2);
       }
@@ -815,20 +969,23 @@ async function onInspectDetailClick(event) {
   }
   try {
     const result = await inspectProvider("plan", { id, operation });
+    const preview = gatePreviewAuditView(result);
     if (output) {
       output.textContent = JSON.stringify({
-        operation: result.operation,
-        capabilities: result.capabilities || [],
-        audit_events: result.audit_events || [],
+        operation: preview.operation,
+        state: preview.state,
+        capability_count: preview.capability_count,
+        audit_events: preview.audit_events,
+        preview_only: preview.preview_only,
+        can_dispatch: preview.can_dispatch,
         execution: result.execution || null,
-        dispatch: result.dispatch === true,
       }, null, 2);
     }
     const requestButton = inspectDetailNode.querySelector("[data-inspect-act-id]");
     if (requestButton) {
       requestButton.dataset.inspectActId = id;
       requestButton.dataset.inspectActOperation = operation;
-      requestButton.hidden = false;
+      requestButton.hidden = preview.state !== "preview";
     }
   } catch (error) {
     if (output) {
@@ -1903,6 +2060,29 @@ function setRuntimeState(runtime) {
   const version = readText(runtime && runtime.version);
   setTextFields("runtime-status", version);
   setHiddenFields("runtime-status", version.length === 0);
+}
+
+function setSourceState(source) {
+  const configured = Boolean(source && source.configured);
+  const name = configured ? readText(source.name) || "default" : "Not configured";
+  const channel = readText(source && source.channel) || "not configured";
+  const installed = readText(source && source.installed_version) || "unknown";
+  const mode = readText(source && source.mode) || "development";
+  const policy = readText(source && source.update_policy);
+  const transport = readText(source && source.transport);
+  const sourcePeer = readText(source && source.source_peer);
+  const checksAllowed = Boolean(source && source.update_checks_allowed);
+  setTextFields("source-status", configured ? mode : "Not configured");
+  setHiddenFields("source-status", false);
+  setTextFields("source-policy", policy);
+  setTextFields("source-name", name);
+  setTextFields("source-channel", channel);
+  setTextFields("source-installed-version", installed);
+  setTextFields("source-checks", checksAllowed ? "Allowed" : "Disabled");
+  setTextFields(
+    "source-transport",
+    sourcePeer ? `${transport} Peer ${shortText(sourcePeer, 28)}` : transport,
+  );
 }
 
 function setStorageState(storage) {

@@ -293,7 +293,7 @@ async function main() {
     assert(!state.fieldLabels.includes("Wallet"), "System page should not duplicate Wallet controls", state);
     assert(state.walletControlsRemoved, "System page should not include wallet account or approval controls", state);
     assert(state.fieldLabels.includes("Network status"), "System page is missing the Network status field", state);
-    assert(state.fieldLabels.includes("Inspector"), "System page is missing the Inspector field", state);
+    assert(state.fieldLabels.includes("Runtime mirror"), "System page is missing the Runtime mirror field", state);
     assert(state.errorText.length === 0, "System should not render an access error after Home launch", state);
     assert(state.handleInputDisabled === false && state.handleSaveDisabled === false, "Home-launched System should allow handle editing", state);
     assert(state.runtimeStatus.length > 0, "System runtime version should be present", state);

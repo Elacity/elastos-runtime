@@ -268,8 +268,10 @@ mkdir -p "$log_dir"
 
 pkill -TERM -f "${gateway_bin} gateway --addr ${addr}" 2>/dev/null || true
 pkill -TERM -f "${gateway_bin} serve --addr" 2>/dev/null || true
+pkill -TERM -f "${gateway_bin} home$" 2>/dev/null || true
 pkill -TERM -f "${data_dir}/bin/" 2>/dev/null || true
 sleep 2
+pkill -KILL -f "${gateway_bin} home$" 2>/dev/null || true
 
 port="${addr##*:}"
 for pid in $(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true); do

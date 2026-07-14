@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>System · ElastOS</title>
-<link rel="stylesheet" href="./style.css?v=system-20260625a">
+<link rel="stylesheet" href="./style.css?v=system-20260704b">
 </head>
 <body>
   <main class="settings-container" aria-label="System">
@@ -23,6 +23,10 @@
           <span class="settings-sidebar-icon settings-sidebar-icon-personalization" aria-hidden="true"></span>
           <span class="settings-sidebar-text">Personalization</span>
         </button>
+        <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-settings="shell">
+          <span class="settings-sidebar-icon settings-sidebar-icon-shell" aria-hidden="true"></span>
+          <span class="settings-sidebar-text">Shell</span>
+        </button>
         <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-settings="security">
           <span class="settings-sidebar-icon settings-sidebar-icon-security" aria-hidden="true"></span>
           <span class="settings-sidebar-text">Security</span>
@@ -33,7 +37,7 @@
         </button>
         <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-settings="inspector">
           <span class="settings-sidebar-icon settings-sidebar-icon-inspector" aria-hidden="true"></span>
-          <span class="settings-sidebar-text">Inspector</span>
+          <span class="settings-sidebar-text">Capsules</span>
         </button>
         <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-settings="about">
           <span class="settings-sidebar-icon settings-sidebar-icon-about" aria-hidden="true"></span>
@@ -59,6 +63,32 @@
                 <div id="account-list" class="account-list" aria-live="polite"></div>
                 <dl class="system-fields compact-proof">
                   <div><dt>Accounts</dt><dd></dd></div>
+                </dl>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <section class="settings-content" data-settings="shell" aria-labelledby="shell-title">
+          <h1 id="shell-title">Shell</h1>
+          <section class="pc2-section" aria-labelledby="shell-settings-title">
+            <h2 id="shell-settings-title" class="pc2-section-title">Home Shell</h2>
+            <div class="pc2-group">
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Root view</div>
+                    <div class="pc2-card-sublabel">Choose which shell Home uses as its root view.</div>
+                  </div>
+                  <div class="shell-picker">
+                    <label class="visually-hidden" for="active-shell-select">Root view</label>
+                    <select id="active-shell-select" class="shell-picker-select" aria-label="Root view"></select>
+                    <button id="active-shell-apply" class="pc2-btn pc2-btn-secondary" type="button">Apply</button>
+                  </div>
+                </div>
+                <div class="pc2-card-value system-status" data-field="active-shell-status" hidden></div>
+                <dl class="system-fields compact-proof">
+                  <div><dt>Root view</dt><dd data-field="active-shell-current"></dd></div>
                 </dl>
               </div>
             </div>
@@ -170,24 +200,6 @@
         <section class="settings-content" data-settings="storage" aria-labelledby="storage-title">
           <h1 id="storage-title">Storage</h1>
 
-          <section class="pc2-section" aria-labelledby="documents-title">
-            <h2 id="documents-title" class="pc2-section-title">Local Objects</h2>
-            <div class="pc2-group">
-              <div class="pc2-group-row">
-                <div class="pc2-card-row">
-                  <div>
-                    <div class="pc2-card-label">Documents</div>
-                    <div class="pc2-card-sublabel" data-field="storage-note" hidden></div>
-                  </div>
-                  <span class="pc2-card-value" data-field="storage-status" hidden></span>
-                </div>
-                <dl class="system-fields compact-proof">
-                  <div><dt>Documents</dt><dd></dd></div>
-                </dl>
-              </div>
-            </div>
-          </section>
-
           <section class="pc2-section" aria-labelledby="webspace-title">
             <h2 id="webspace-title" class="pc2-section-title">Elastos Webspace</h2>
             <div class="pc2-group">
@@ -208,7 +220,7 @@
         </section>
 
         <section class="settings-content" data-settings="inspector" aria-labelledby="inspector-title">
-          <h1 id="inspector-title">Inspector</h1>
+          <h1 id="inspector-title">Capsules</h1>
 
           <section class="pc2-section" aria-labelledby="capsule-inspector-title">
             <h2 id="capsule-inspector-title" class="pc2-section-title">Capsules</h2>
@@ -216,7 +228,7 @@
               <div class="pc2-group-row">
                 <div class="pc2-card-row">
                   <div>
-                    <div class="pc2-card-label">Live objects</div>
+                    <div class="pc2-card-label">Runtime mirror</div>
                     <div class="pc2-card-sublabel">Permissioned Runtime mirror for capsule identity, authority, provenance, and gate previews.</div>
                   </div>
                   <button id="inspect-refresh" class="pc2-btn pc2-btn-secondary" type="button">Refresh</button>
@@ -227,7 +239,7 @@
                   <div id="inspect-detail" class="inspect-detail" aria-live="polite"></div>
                 </div>
                 <dl class="system-fields compact-proof">
-                  <div><dt>Inspector</dt><dd></dd></div>
+                  <div><dt>Runtime mirror</dt><dd></dd></div>
                 </dl>
               </div>
             </div>
@@ -264,6 +276,22 @@
                 </dl>
               </div>
               <div class="pc2-group-row">
+                <div class="pc2-card-row pc2-card-row-stack">
+                  <div>
+                    <div class="pc2-card-label">Trusted source</div>
+                    <div class="pc2-card-sublabel" data-field="source-policy"></div>
+                  </div>
+                  <span class="pc2-card-value" data-field="source-status" hidden></span>
+                </div>
+                <dl class="system-fields compact-proof">
+                  <div><dt>Source</dt><dd data-field="source-name"></dd></div>
+                  <div><dt>Channel</dt><dd data-field="source-channel"></dd></div>
+                  <div><dt>Installed</dt><dd data-field="source-installed-version"></dd></div>
+                  <div><dt>Checks</dt><dd data-field="source-checks"></dd></div>
+                  <div><dt>Transport</dt><dd data-field="source-transport"></dd></div>
+                </dl>
+              </div>
+              <div class="pc2-group-row">
                 <div class="pc2-card-row">
                   <div>
                     <div class="pc2-card-label">Network status</div>
@@ -285,6 +313,6 @@
 
     <p class="system-error" hidden></p>
   </main>
-  <script type="module" src="./system.js?v=system-20260625a"></script>
+  <script type="module" src="./system.js?v=system-20260704b"></script>
 </body>
 </html>

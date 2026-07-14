@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use elastos_guest::runtime::RuntimeClient;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
@@ -15,8 +16,30 @@ thread_local! {
 
 const STARTUP_ENTER_SETTLE_WINDOW: Duration = Duration::from_millis(350);
 const ESCAPE_SEQUENCE_SETTLE_WINDOW: Duration = Duration::from_millis(25);
-const ESCAPE_SEQUENCE_MAX_BYTES: usize = 8;
+const ESCAPE_SEQUENCE_BYTE_TIMEOUT_MS: i32 = 10;
+const ESCAPE_SEQUENCE_MAX_BYTES: usize = 64;
 const LIVE_REFRESH_POLL_MS: i32 = 300;
+const COMMAND_CONTRACT_JSON: &str = include_str!("../browser/commands.json");
+const TUI_TAB_ROW: u16 = 1;
+const TUI_FOOTER_TEXT: &str =
+    " Keys: Up/Down select  Left/Right/Tab sections  Enter open  r refresh  q/Esc home-gui  ? help";
+const TUI_HELP_FOOTER_TEXT: &str = " Keys: ? close help  q/Esc home-gui  Left/Right/Tab sections";
+const TUI_HELP_LINES: &[(&str, &str)] = &[
+    ("Up/Down", "select the previous or next visible item"),
+    ("Left/Right", "switch sections"),
+    ("Tab", "switch to the next section"),
+    ("Shift+Tab", "switch to the previous section"),
+    ("Enter", "open the selected action"),
+    ("1-9", "quick-launch visible Home actions"),
+    ("r", "refresh Home facts"),
+    ("q or Esc", "return to home-gui"),
+    ("?", "close help"),
+    ("Inbox", "m marks read, d dismisses"),
+    (
+        "Mouse",
+        "wheel selects items; tab-row clicks switch sections",
+    ),
+];
 
 #[derive(Debug, Clone, Deserialize)]
 struct HomeSnapshot {
@@ -24,9 +47,13 @@ struct HomeSnapshot {
     user: String,
     nickname: Option<String>,
     did: Option<String>,
+    #[serde(default)]
+    session: HomeCliSessionStatus,
     source: Option<SourceStatus>,
     runtime: RuntimeStatus,
     system_services: Vec<SystemServiceStatus>,
+    #[serde(default)]
+    services: Option<serde_json::Value>,
     site: SiteStatus,
     #[serde(default)]
     shares: ShareStatus,
@@ -39,9 +66,29 @@ struct HomeSnapshot {
     roots: Vec<RootStatus>,
     actions: Vec<ActionInfo>,
     #[serde(default)]
+    active_shell: ActiveShellStatus,
+    #[serde(default)]
     cached_capsules: Vec<String>,
     #[serde(default)]
+    capsule_catalog: Option<serde_json::Value>,
+    #[serde(default)]
+    capsule_interfaces: Option<serde_json::Value>,
+    #[serde(default)]
     notice: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct HomeCliSessionStatus {
+    #[serde(default)]
+    mode: String,
+    #[serde(default, flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ActiveShellStatus {
+    #[serde(default)]
+    active: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -154,23 +201,110 @@ struct RoomInviteStatus {
 #[derive(Debug, Clone, Deserialize, Default)]
 struct PeopleStatus {
     #[serde(default)]
+    schema: String,
+    #[serde(default)]
     contact_count: usize,
     #[serde(default)]
     contacts: Vec<PeopleContactStatus>,
+    #[serde(default)]
+    service_offer_count: usize,
+    #[serde(default)]
+    discovery: PeopleDiscoveryStatus,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 struct PeopleContactStatus {
-    #[allow(dead_code)]
     contact_id: String,
+    #[serde(default)]
     display_name: String,
+    #[serde(default)]
+    handle: Option<String>,
+    #[serde(default)]
     relationship: String,
-    #[allow(dead_code)]
+    #[serde(default)]
     route: String,
     #[serde(default)]
     can_message: bool,
     #[serde(default)]
     device_label: Option<String>,
+    #[serde(default)]
+    profile_card: Option<PeopleProfileCardStatus>,
+    #[serde(default)]
+    last_seen_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PeopleProfileCardStatus {
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    handle: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PeopleDiscoveryStatus {
+    #[serde(default)]
+    schema: String,
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    remaining_seconds: Option<u64>,
+    #[serde(default)]
+    visibility: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    status_message: String,
+    #[serde(default)]
+    topic: String,
+    #[serde(default)]
+    local_peer_id: Option<String>,
+    #[serde(default)]
+    discovered_count: usize,
+    #[serde(default)]
+    discovered_peers: Vec<PeopleDiscoveryPeerStatus>,
+    #[serde(default)]
+    request_count: usize,
+    #[serde(default)]
+    requests: Vec<PeopleDiscoveryRequestStatus>,
+    #[serde(default)]
+    next_refresh_after_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PeopleDiscoveryPeerStatus {
+    #[serde(default)]
+    peer_id: String,
+    #[serde(default)]
+    did: Option<String>,
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    handle: Option<String>,
+    #[serde(default)]
+    last_seen_at: u64,
+    #[serde(default)]
+    status: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PeopleDiscoveryRequestStatus {
+    #[serde(default)]
+    request_id: String,
+    #[serde(default)]
+    peer_id: String,
+    #[serde(default)]
+    did: Option<String>,
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    handle: Option<String>,
+    #[serde(default)]
+    created_at: u64,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    invite_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -212,6 +346,8 @@ struct NotificationActionRefStatus {
 #[derive(Debug, Clone, Deserialize)]
 struct SourceStatus {
     name: String,
+    #[serde(default)]
+    channel: String,
     installed_version: String,
     gateway: Option<String>,
 }
@@ -272,6 +408,17 @@ struct ActionInfo {
 #[derive(Debug, Clone, Serialize)]
 struct HomeIntent<'a> {
     action: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invoke: Option<HomeInvokeIntent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct HomeInvokeIntent {
+    capsule: String,
+    #[serde(rename = "interface")]
+    interface_id: String,
+    method: String,
+    input: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,10 +426,11 @@ enum Tab {
     Home,
     Inbox,
     People,
-    Spaces,
     Apps,
     System,
 }
+
+const DEFAULT_TABS: &[Tab] = &[Tab::Home, Tab::Inbox, Tab::People, Tab::Apps, Tab::System];
 
 #[derive(Debug, Clone)]
 struct TuiState {
@@ -290,8 +438,8 @@ struct TuiState {
     home_index: usize,
     inbox_index: usize,
     people_index: usize,
-    space_index: usize,
     app_index: usize,
+    system_index: usize,
     show_help: bool,
     notice: Option<String>,
 }
@@ -308,6 +456,26 @@ struct AppEntry {
     is_control: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PeopleAction {
+    id: String,
+    label: String,
+    description: String,
+    command: String,
+    ready: bool,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SystemAction {
+    id: String,
+    label: String,
+    description: String,
+    command: String,
+    ready: bool,
+    reason: Option<String>,
+}
+
 #[derive(Clone, Copy)]
 struct AppSurfaceSpec {
     name: &'static str,
@@ -316,6 +484,44 @@ struct AppSurfaceSpec {
     category: &'static str,
     description: &'static str,
     command: &'static str,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CommandContract {
+    schema: String,
+    terminal: TerminalContract,
+    commands: Vec<CommandSpec>,
+    #[serde(default)]
+    controls: Vec<ControlSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct TerminalContract {
+    renderer: Option<String>,
+    transport: Option<String>,
+    transport_scope: Option<String>,
+    input: Option<String>,
+    pty: Option<String>,
+    xterm: Option<String>,
+    entrypoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CommandSpec {
+    name: String,
+    #[serde(default)]
+    aliases: Vec<String>,
+    usage: String,
+    summary: String,
+    description: String,
+    #[serde(default)]
+    surface: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ControlSpec {
+    key: String,
+    description: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -331,74 +537,68 @@ enum UiKey {
     Quit,
     Help,
     Digit(usize),
+    Mouse(MouseEvent),
     None,
 }
 
-struct TerminalGuard;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MouseEvent {
+    button: u16,
+    x: u16,
+    y: u16,
+    released: bool,
+}
 
-const APP_SURFACES: &[AppSurfaceSpec] = &[
-    AppSurfaceSpec {
-        name: "chat",
-        action_ids: &["chat"],
-        label: "Chat",
-        category: "Communication",
-        description: "Talk to people and connected ElastOS homes from this local world.",
-        command: "elastos chat",
-    },
-    AppSurfaceSpec {
-        name: "chat-fullscreen",
-        action_ids: &["capsule-chat-wasm", "capsule-chat"],
-        label: "Full-screen Chat",
-        category: "Communication",
-        description: "Open the packaged full-screen Carrier chat surface from Home.",
-        command: "elastos capsule chat-wasm --lifecycle interactive --interactive",
-    },
-    AppSurfaceSpec {
-        name: "site-local",
-        action_ids: &["site-local"],
-        label: "MyWebSite",
-        category: "Web",
-        description:
-            "Open your local site preview in the browser and keep release/public actions nearby.",
-        command: "elastos site serve --mode local --browser",
-    },
-    AppSurfaceSpec {
-        name: "site-ephemeral",
-        action_ids: &["site-ephemeral"],
-        label: "Go public",
-        category: "Web",
-        description:
-            "Start a temporary public HTTPS URL for MyWebSite and return home when it is ready.",
-        command: "elastos site serve --mode ephemeral",
-    },
-    AppSurfaceSpec {
-        name: "shares-list",
-        action_ids: &["shares-list"],
-        label: "Shared",
-        category: "Web",
-        description:
-            "Review shared channels, open links, and follow the next steps for public content.",
-        command: "elastos shares list",
-    },
-    AppSurfaceSpec {
-        name: "gba-ucity",
-        action_ids: &["capsule-gba-ucity"],
-        label: "GBA UCity",
-        category: "Games",
-        description:
-            "Open the bundled uCity demo cartridge in the browser GBA viewer and return home.",
-        command: "elastos capsule gba-ucity --lifecycle interactive --interactive",
-    },
-    AppSurfaceSpec {
-        name: "update-check",
-        action_ids: &["update-check"],
-        label: "Updates",
-        category: "System",
-        description:
-            "Check the stamped trusted release line and return home with a concise result.",
-        command: "elastos update --check",
-    },
-];
+struct TerminalGuard {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    original_termios: Option<libc::termios>,
+}
+
+const APP_SURFACES: &[AppSurfaceSpec] = &[AppSurfaceSpec {
+    name: "chat",
+    action_ids: &["chat"],
+    label: "Chat",
+    category: "Communication",
+    description: "Talk to people and connected ElastOS homes from this local world.",
+    command: "elastos chat",
+}];
+
+fn command_contract() -> CommandContract {
+    let contract: CommandContract =
+        serde_json::from_str(COMMAND_CONTRACT_JSON).expect("valid Home CLI command contract");
+    assert_eq!(
+        contract.schema, "elastos.home-cli.command-contract/v1",
+        "unexpected Home CLI command contract schema"
+    );
+    contract
+}
+
+fn normalize_contract_command(input: &str) -> String {
+    let query = input.trim().to_lowercase();
+    if query.is_empty() {
+        return String::new();
+    }
+    for command in command_contract().commands {
+        if command.name == query || command.aliases.iter().any(|alias| alias == &query) {
+            return command.name;
+        }
+    }
+    query
+}
+
+fn normalize_lookup(input: &str) -> String {
+    input.trim().to_lowercase()
+}
+
+fn contract_commands_for(surface: &str) -> Vec<CommandSpec> {
+    command_contract()
+        .commands
+        .into_iter()
+        .filter(|command| {
+            command.surface.is_empty() || command.surface.iter().any(|item| item == surface)
+        })
+        .collect()
+}
 
 fn with_client<F, R>(f: F) -> R
 where
@@ -421,25 +621,74 @@ fn carrier_invoke(
     operation: &str,
     body: &serde_json::Value,
 ) -> Result<serde_json::Value> {
-    with_client(|client| {
-        client
-            .carrier_invoke(uri, operation, body, token)
-            .map_err(|e| anyhow!("Carrier invoke {} {} failed: {}", operation, uri, e))
-    })
+    with_client(
+        |client| match client.carrier_invoke(uri, operation, body, token) {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                eprintln!("carrier invoke {operation} {uri} failed: {err}");
+                Err(anyhow!(
+                    "Carrier invoke {} {} failed: {}",
+                    operation,
+                    uri,
+                    err
+                ))
+            }
+        },
+    )
 }
 
-fn storage_read(token: &str, path: &str) -> Result<Vec<u8>> {
-    let result = carrier_invoke(
-        token,
-        path,
-        "read",
-        &serde_json::json!({
-            "path": path,
-        }),
-    )?;
-    let data = result
+fn storage_read_utf8(token: &str, path: &str) -> Result<Vec<u8>> {
+    let body = serde_json::json!({
+        "path": path,
+        "encoding": "utf8",
+    });
+    let result = carrier_invoke(token, path, "read", &body)?;
+    storage_read_bytes_from_result(&result)
+}
+
+fn storage_result_body(result: &serde_json::Value) -> Result<&serde_json::Value> {
+    let response = result.get("response").unwrap_or(result);
+    if response.get("type").and_then(|value| value.as_str()) == Some("carrier_result") {
+        return response
+            .get("result")
+            .ok_or_else(|| anyhow!("carrier_result response missing result"));
+    }
+    Ok(response)
+}
+
+fn storage_read_bytes_from_result(result: &serde_json::Value) -> Result<Vec<u8>> {
+    let body = storage_result_body(result)?;
+    if body.get("status").and_then(|value| value.as_str()) == Some("error") {
+        let code = body
+            .get("code")
+            .and_then(|value| value.as_str())
+            .unwrap_or("read_failed");
+        let message = body
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("localhost/read failed");
+        return Err(anyhow!("localhost/read failed: {}: {}", code, message));
+    }
+    if body.get("type").and_then(|value| value.as_str()) == Some("error") {
+        let code = body
+            .get("code")
+            .and_then(|value| value.as_str())
+            .unwrap_or("read_failed");
+        let message = body
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("localhost/read failed");
+        return Err(anyhow!("localhost/read failed: {}: {}", code, message));
+    }
+    let data = body
         .get("data")
-        .and_then(|value| value.get("content").or_else(|| value.get("data")))
+        .map(|value| {
+            value
+                .get("content")
+                .or_else(|| value.get("data"))
+                .unwrap_or(value)
+        })
+        .or_else(|| body.get("content"))
         .ok_or_else(|| anyhow!("localhost/read response missing data"))?;
 
     if let Some(bytes) = data.as_array() {
@@ -491,7 +740,7 @@ fn main() -> Result<()> {
 }
 
 fn load_snapshot(read_token: &str, snapshot_path: &str) -> Result<HomeSnapshot> {
-    Ok(serde_json::from_slice(&storage_read(
+    Ok(serde_json::from_slice(&storage_read_utf8(
         read_token,
         snapshot_path,
     )?)?)
@@ -536,9 +785,9 @@ fn should_use_tui() -> bool {
 }
 
 fn dashboard_tui_loop(
-    read_token: &str,
-    snapshot_path: &str,
-    mut snapshot: HomeSnapshot,
+    _read_token: &str,
+    _snapshot_path: &str,
+    snapshot: HomeSnapshot,
     write_token: &str,
     intent_path: &str,
 ) -> Result<()> {
@@ -561,10 +810,6 @@ fn dashboard_tui_loop(
 
         let key = read_ui_key()?;
         if key == UiKey::None {
-            if let Ok(next_snapshot) = load_snapshot(read_token, snapshot_path) {
-                snapshot = next_snapshot;
-                needs_render = true;
-            }
             continue;
         }
         match startup_home_enter_decision(
@@ -637,36 +882,26 @@ fn dashboard_tui_loop(
                 state.notice = None;
                 home_launch_ready_at = None;
                 if let Some(action_id) = state.activate(&snapshot) {
-                    write_intent(write_token, intent_path, action_id)?;
+                    write_intent(write_token, intent_path, &action_id)?;
                     return Ok(());
                 }
             }
             UiKey::MarkRead => {
                 if state.tab == Tab::Inbox {
-                    if let Some(notification_id) =
-                        selected_notification(&snapshot, state.inbox_index)
-                            .map(|entry| entry.id.as_str())
+                    if let Some(action_id) =
+                        selected_notification_read_action(&snapshot, state.inbox_index)
                     {
-                        write_intent(
-                            write_token,
-                            intent_path,
-                            &format!("notification-read:{notification_id}"),
-                        )?;
+                        write_intent(write_token, intent_path, &action_id)?;
                         return Ok(());
                     }
                 }
             }
             UiKey::Dismiss => {
                 if state.tab == Tab::Inbox {
-                    if let Some(notification_id) =
-                        selected_notification(&snapshot, state.inbox_index)
-                            .map(|entry| entry.id.as_str())
+                    if let Some(action_id) =
+                        selected_notification_dismiss_action(&snapshot, state.inbox_index)
                     {
-                        write_intent(
-                            write_token,
-                            intent_path,
-                            &format!("notification-dismiss:{notification_id}"),
-                        )?;
+                        write_intent(write_token, intent_path, &action_id)?;
                         return Ok(());
                     }
                 }
@@ -680,6 +915,12 @@ fn dashboard_tui_loop(
                     let action = &snapshot.actions[action_idx];
                     write_intent(write_token, intent_path, &action.id)?;
                     return Ok(());
+                }
+            }
+            UiKey::Mouse(event) => {
+                if state.handle_mouse(event, term_cols(), &snapshot) {
+                    state.notice = None;
+                    needs_render = true;
                 }
             }
             UiKey::None => {}
@@ -776,6 +1017,68 @@ fn dashboard_line_loop(
             _ => {}
         }
 
+        if let Some(result) = cli_invoke_intent(trimmed, &snapshot) {
+            match result {
+                Ok(invoke) => {
+                    write_invoke_intent(write_token, intent_path, invoke)?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    println!();
+                    println!("invoke: {}", error);
+                    wait_for_enter()?;
+                    continue;
+                }
+            }
+        }
+
+        match people_line_action(trimmed, &snapshot) {
+            Ok(Some(action_id)) => {
+                write_intent(write_token, intent_path, &action_id)?;
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                println!();
+                println!("people: {}", error);
+                wait_for_enter()?;
+                continue;
+            }
+        }
+
+        match mywebsite_line_action(trimmed) {
+            Ok(Some(action_id)) => {
+                write_intent(write_token, intent_path, &action_id)?;
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                println!();
+                println!("mywebsite: {}", error);
+                wait_for_enter()?;
+                continue;
+            }
+        }
+
+        match system_line_action(trimmed, &snapshot) {
+            Ok(Some(action_id)) => {
+                write_intent(write_token, intent_path, &action_id)?;
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                println!();
+                println!("system: {}", error);
+                wait_for_enter()?;
+                continue;
+            }
+        }
+
+        if handle_shared_line_command(trimmed, &snapshot)? {
+            wait_for_enter()?;
+            continue;
+        }
+
         let Ok(index) = trimmed.parse::<usize>() else {
             println!("Unknown command: {}. Type ? for help.", trimmed);
             wait_for_enter()?;
@@ -806,14 +1109,28 @@ fn dashboard_line_loop(
 }
 
 fn write_intent(write_token: &str, intent_path: &str, action: &str) -> Result<()> {
-    let data = serde_json::to_vec_pretty(&HomeIntent { action })?;
-    storage_write(write_token, intent_path, data)
+    storage_write(write_token, intent_path, home_intent_payload(action, None)?)
+}
+
+fn write_invoke_intent(
+    write_token: &str,
+    intent_path: &str,
+    invoke: HomeInvokeIntent,
+) -> Result<()> {
+    storage_write(
+        write_token,
+        intent_path,
+        home_intent_payload("invoke", Some(invoke))?,
+    )
+}
+
+fn home_intent_payload(action: &str, invoke: Option<HomeInvokeIntent>) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec_pretty(&HomeIntent { action, invoke })?)
 }
 
 fn render_line_dashboard(snapshot: &HomeSnapshot) -> Result<()> {
-    print!("\x1B[2J\x1B[H");
-    println!("ElastOS Home");
-    println!("A small-device home for people, spaces, apps, and system trust.");
+    print_cli_page_header(snapshot, "Home");
+    println!("A compact Home shell for working CLI journeys.");
     println!(
         "Version: runtime {}  home {}  installed {}",
         snapshot.version,
@@ -831,30 +1148,35 @@ fn render_line_dashboard(snapshot: &HomeSnapshot) -> Result<()> {
     println!("  Nick:      {}", display_name(snapshot));
     println!("  Identity:  {}", identity_summary(snapshot));
     println!("  Network:   {}", network_summary(snapshot));
-    println!("  MyWebSite: {}", website_summary(snapshot));
-    println!("  Spaces:    MyWebSite, Public, Local, WebSpaces");
+    println!("  Shell:     {}", active_shell_label(snapshot));
     println!(
         "  Capsules:  {} installed / {} running",
         snapshot.cached_capsules.len(),
         snapshot.runtime.running_capsules.len()
     );
-    println!("  Source:    {}", source_label(snapshot));
 
     println!();
     let quick_actions = quick_launch_action_indices(snapshot);
-    println!("Start Here");
-    for (slot, action_idx) in quick_actions.iter().enumerate() {
-        let action = &snapshot.actions[*action_idx];
-        println!(
-            "  {}. {} [{}]",
-            slot + 1,
-            action.label,
-            if action.ready { "ready" } else { "blocked" }
-        );
-        println!("     {}", action.description);
-        println!("     {}", action.command);
-        if let Some(reason) = &action.reason {
-            println!("     setup: {}", reason);
+    if quick_actions.is_empty() {
+        println!("Start Here");
+        println!("  No CLI actions are ready in this snapshot.");
+    } else {
+        println!("Start Here");
+        for (slot, action_idx) in quick_actions.iter().enumerate() {
+            let action = &snapshot.actions[*action_idx];
+            println!(
+                "  {}. {} [{}]",
+                slot + 1,
+                action_display_label(action),
+                if action.ready { "ready" } else { "blocked" }
+            );
+            println!("     {}", home_action_summary(action));
+            if !action.command.trim().is_empty() {
+                println!("     {}", action.command);
+            }
+            if let Some(reason) = &action.reason {
+                println!("     setup: {}", reason);
+            }
         }
     }
 
@@ -878,40 +1200,16 @@ fn render_line_dashboard(snapshot: &HomeSnapshot) -> Result<()> {
     }
 
     println!();
-    println!("People");
-    for line in people_summary_lines(snapshot) {
-        println!("  {}", line);
-    }
-
-    println!();
-    println!("Spaces");
-    for line in spaces_summary_lines(snapshot) {
-        println!("  {}", line);
-    }
-
-    println!();
     println!("Apps");
     for line in apps_summary_lines(snapshot) {
         println!("  {}", line);
     }
 
     println!();
-    println!("System");
-    for line in compact_system_summary_lines(snapshot) {
-        println!("  {}", line);
-    }
-
-    let ready = snapshot
-        .system_services
-        .iter()
-        .filter(|service| service.ready)
-        .count();
-    println!();
-    println!(
-        "  Services ready: {} / {}",
-        ready,
-        snapshot.system_services.len()
-    );
+    println!("Other Commands");
+    println!("  wallet       Wallet targets and approval hints");
+    println!("  exits        Browser Exit offers");
+    println!("  debug        Developer facts and projection details");
 
     if let Some(notice) = &snapshot.notice {
         println!();
@@ -920,19 +1218,1214 @@ fn render_line_dashboard(snapshot: &HomeSnapshot) -> Result<()> {
     }
 
     println!();
-    println!("Choose an action number, `r` to refresh, `q` to exit Home, `?` for help.");
+    println!("Choose an action number, `r` to refresh, `q` to return to home-gui, `?` for help.");
     io::stdout().flush()?;
     Ok(())
 }
 
+fn cli_page_header(snapshot: &HomeSnapshot, title: &str) -> String {
+    format!(
+        "\x1B[2J\x1B[HHome CLI / {title}\nuser {}  |  identity {}  |  network {}  |  shell {}\n\n",
+        display_name(snapshot),
+        identity_summary(snapshot),
+        network_summary(snapshot),
+        active_shell_label(snapshot)
+    )
+}
+
+fn print_cli_page_header(snapshot: &HomeSnapshot, title: &str) {
+    print!("{}", cli_page_header(snapshot, title));
+}
+
 fn print_line_help() -> Result<()> {
-    println!();
-    println!("Home Commands");
-    println!("  <number>    Launch a quick action and return home afterward");
-    println!("  r           Refresh the sovereign snapshot");
-    println!("  q           Leave Home");
-    println!("  ?           Show this help");
+    print_cli_help_topic("");
     wait_for_enter()
+}
+
+fn print_cli_help_topic(topic: &str) {
+    println!();
+    let normalized = normalize_contract_command(topic);
+    if !normalized.is_empty() {
+        let contract = command_contract();
+        if let Some(command) = contract
+            .commands
+            .into_iter()
+            .find(|command| command.name == normalized)
+        {
+            println!("{}", command.usage);
+            println!("  {}", command.description);
+            println!("  surface: {}", command.surface.join(", "));
+            return;
+        }
+    }
+    println!("Home Commands");
+    for command in contract_commands_for("home-cli") {
+        println!("  {:<24} {}", command.usage, command.summary);
+    }
+    println!("  <number>                 Launch a quick action and return home afterward");
+    println!();
+    println!("Home CLI line mode uses the shared command vocabulary over the local");
+    println!("Home snapshot. Low-risk invoke writes a signed Home intent; user/high-risk");
+    println!("methods still fail closed.");
+}
+
+fn cli_invoke_intent(input: &str, snapshot: &HomeSnapshot) -> Option<Result<HomeInvokeIntent>> {
+    let mut parts = input.split_whitespace();
+    let raw_name = parts.next()?;
+    if normalize_contract_command(raw_name) != "invoke" {
+        return None;
+    }
+    let arg = parts.collect::<Vec<_>>().join(" ");
+    Some(resolve_cli_invoke_intent(&arg, snapshot))
+}
+
+fn resolve_cli_invoke_intent(arg: &str, snapshot: &HomeSnapshot) -> Result<HomeInvokeIntent> {
+    let raw = arg.trim();
+    let Some((capsule_input, rest)) = raw.split_once(char::is_whitespace) else {
+        anyhow::bail!("usage: invoke <capsule> <method> [json|target]");
+    };
+    let rest = rest.trim();
+    if rest.is_empty() {
+        anyhow::bail!("usage: invoke <capsule> <method> [json|target]");
+    }
+    let (method_input, input) = match rest.split_once(char::is_whitespace) {
+        Some((method, input)) => (method, input.trim()),
+        None => (rest, ""),
+    };
+    let capsule = find_capsule_fact(snapshot, capsule_input)
+        .ok_or_else(|| anyhow!("capsule not found: {capsule_input}"))?;
+    let capsule_name = json_text(capsule, "name");
+    let (interface_id, method) = resolve_cli_method(snapshot, capsule_name, method_input)?;
+    if let Some(reason) = cli_method_block_reason(method) {
+        anyhow::bail!("blocked: {reason}");
+    }
+    Ok(HomeInvokeIntent {
+        capsule: capsule_name.to_string(),
+        interface_id: interface_id.to_string(),
+        method: json_text(method, "id").to_string(),
+        input: parse_cli_invoke_input(input, method)?,
+    })
+}
+
+fn resolve_cli_method<'a>(
+    snapshot: &'a HomeSnapshot,
+    capsule_name: &str,
+    method_input: &str,
+) -> Result<(&'a str, &'a serde_json::Value)> {
+    let method_query = normalize_lookup(method_input);
+    if method_query.is_empty() {
+        anyhow::bail!("usage: invoke <capsule> <method> [json|target]");
+    }
+    let mut matches = Vec::new();
+    for entry in cli_interface_entries_for(snapshot, Some(capsule_name)) {
+        let descriptor = interface_descriptor(entry);
+        let interface_id = json_text(descriptor, "id");
+        if let Some(methods) = descriptor.get("methods").and_then(|value| value.as_array()) {
+            for method in methods {
+                if normalize_lookup(json_text(method, "id")) == method_query {
+                    matches.push((interface_id, method));
+                }
+            }
+        }
+    }
+    match matches.len() {
+        1 => Ok(matches[0]),
+        0 => anyhow::bail!("method not found: {method_input}"),
+        _ => anyhow::bail!("ambiguous method: {method_input}"),
+    }
+}
+
+fn cli_method_block_reason(method: &serde_json::Value) -> Option<String> {
+    let approval = json_text(method, "approval");
+    let approval = if approval.is_empty() {
+        json_text(method, "approval_mode")
+    } else {
+        approval
+    };
+    let risk = json_text(method, "risk");
+    let risk = if risk.is_empty() {
+        json_text(method, "risk_level")
+    } else {
+        risk
+    };
+    if approval == "user" {
+        return Some("user approval is required before invocation".to_string());
+    }
+    if ["payment", "rights", "actuator", "privileged"].contains(&risk) {
+        return Some(format!("{risk} risk requires explicit user approval"));
+    }
+    None
+}
+
+fn parse_cli_invoke_input(input: &str, method: &serde_json::Value) -> Result<serde_json::Value> {
+    let raw = input.trim();
+    if raw.is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    if raw.starts_with('{') || raw.starts_with('[') {
+        return serde_json::from_str(raw).map_err(Into::into);
+    }
+    if json_text(method, "resource") == "elastos://capsules/*"
+        && json_text(method, "operation") == "launch"
+    {
+        return Ok(serde_json::json!({ "target": raw }));
+    }
+    anyhow::bail!("input must be JSON for this affordance")
+}
+
+fn handle_shared_line_command(input: &str, snapshot: &HomeSnapshot) -> Result<bool> {
+    let mut parts = input.split_whitespace();
+    let Some(raw_name) = parts.next() else {
+        return Ok(false);
+    };
+    let arg = parts.collect::<Vec<_>>().join(" ");
+    let name = normalize_contract_command(raw_name);
+    match name.as_str() {
+        "home" => {
+            render_line_dashboard(snapshot)?;
+        }
+        "apps" => {
+            print_cli_section(snapshot, "Apps", &apps_summary_lines(snapshot));
+        }
+        "inbox" => {
+            print_cli_inbox(snapshot);
+        }
+        "people" => {
+            print_cli_people(snapshot);
+        }
+        "mywebsite" => {
+            print_cli_mywebsite(snapshot);
+        }
+        "wallet" => {
+            print_cli_wallet(snapshot);
+        }
+        "exits" => {
+            print_cli_services(snapshot, "remote_exit");
+        }
+        "system" => {
+            print_cli_system(snapshot, &arg);
+        }
+        "debug" => {
+            print_cli_debug(snapshot, &arg);
+        }
+        "help" => {
+            print_cli_help_topic(&arg);
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn people_line_action(input: &str, snapshot: &HomeSnapshot) -> Result<Option<String>> {
+    let mut parts = input.split_whitespace();
+    let Some(raw_name) = parts.next() else {
+        return Ok(None);
+    };
+    if normalize_contract_command(raw_name) != "people" {
+        return Ok(None);
+    }
+
+    let mut args = parts.collect::<Vec<_>>();
+    if normalize_lookup(raw_name) == "discovery" {
+        args.insert(0, "discovery");
+    }
+    if args.is_empty() {
+        return Ok(None);
+    }
+
+    let action_id = match normalize_lookup(args[0]).as_str() {
+        "discovery" => match args.get(1).map(|value| normalize_lookup(value)).as_deref() {
+            Some("on" | "enable" | "start") => "people-discovery-enable".to_string(),
+            Some("off" | "disable" | "stop") => "people-discovery-disable".to_string(),
+            Some("refresh" | "reload") => "people-discovery-refresh".to_string(),
+            _ => anyhow::bail!("usage: people discovery on|off|refresh"),
+        },
+        "request" | "add" => {
+            let Some(peer_id) = args
+                .get(1)
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+            else {
+                anyhow::bail!("usage: people request <peer-id>");
+            };
+            format!("people-request-peer:{peer_id}")
+        }
+        "accept" => {
+            let Some(request_id) = args
+                .get(1)
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+            else {
+                anyhow::bail!("usage: people accept <request-id>");
+            };
+            format!("people-accept-request:{request_id}")
+        }
+        "remove" | "delete" => {
+            let Some(contact_id) = args
+                .get(1)
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+            else {
+                anyhow::bail!("usage: people remove <contact-id>");
+            };
+            format!("people-remove-contact:{contact_id}")
+        }
+        "message" | "chat" => {
+            let Some(contact_id) = args
+                .get(1)
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+            else {
+                anyhow::bail!("usage: people message <contact-id>");
+            };
+            format!("people-message:{contact_id}")
+        }
+        _ => return Ok(None),
+    };
+
+    people_actions(snapshot)
+        .into_iter()
+        .find(|action| action.id == action_id && action.ready)
+        .map(|action| action.id)
+        .ok_or_else(|| {
+            anyhow!("People action is not available in the current Home snapshot: {action_id}")
+        })
+        .map(Some)
+}
+
+fn mywebsite_line_action(input: &str) -> Result<Option<String>> {
+    let mut parts = input.split_whitespace();
+    let Some(raw_name) = parts.next() else {
+        return Ok(None);
+    };
+    if normalize_contract_command(raw_name) != "mywebsite" {
+        return Ok(None);
+    }
+
+    let Some(raw_verb) = parts.next() else {
+        return Ok(None);
+    };
+    let verb = normalize_lookup(raw_verb);
+    match verb.as_str() {
+        "status" => Ok(None),
+        "stage" => {
+            let path = parts.collect::<Vec<_>>().join(" ");
+            let path = path.trim();
+            if path.is_empty() {
+                anyhow::bail!("usage: mywebsite stage <dir>");
+            }
+            Ok(Some(format!("site-stage:{path}")))
+        }
+        "preview" | "serve" => Ok(Some("site-local".to_string())),
+        "publish" | "public" | "go-public" => Ok(Some("site-ephemeral".to_string())),
+        "open" => Ok(Some("site-open".to_string())),
+        _ => anyhow::bail!(
+            "unknown MyWebSite command: {raw_verb}. Try status, stage <dir>, preview, publish, or open"
+        ),
+    }
+}
+
+fn system_line_action(input: &str, _snapshot: &HomeSnapshot) -> Result<Option<String>> {
+    let mut parts = input.split_whitespace();
+    let Some(raw_name) = parts.next() else {
+        return Ok(None);
+    };
+    if normalize_contract_command(raw_name) != "system" {
+        return Ok(None);
+    }
+
+    let Some(raw_topic) = parts.next() else {
+        return Ok(None);
+    };
+    if normalize_system_topic(raw_topic) != "shell" {
+        return Ok(None);
+    }
+
+    let Some(raw_target) = parts.next() else {
+        return Ok(None);
+    };
+    if parts.next().is_some() {
+        anyhow::bail!("usage: system shell home-gui");
+    }
+
+    let target = normalize_shell_target(raw_target);
+    if target != "home-gui" {
+        anyhow::bail!("unsupported shell target `{raw_target}`; use `system shell home-gui`");
+    }
+    Ok(Some("shell-switch:home-gui".to_string()))
+}
+
+fn normalize_shell_target(input: &str) -> String {
+    match normalize_lookup(input).as_str() {
+        "gui" | "desktop" | "home" | "home-gui" => "home-gui".to_string(),
+        "cli" | "terminal" | "home-cli" => "home-cli".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn print_cli_system(snapshot: &HomeSnapshot, arg: &str) {
+    let mut parts = arg.split_whitespace();
+    let topic = parts.next().map(normalize_system_topic).unwrap_or_default();
+    match topic.as_str() {
+        "" => print_cli_section(snapshot, "System", &system_settings_lines(snapshot)),
+        "shell" => print_cli_section(snapshot, "System Shell", &system_shell_lines(snapshot)),
+        "source" => print_cli_section(snapshot, "Trusted Source", &system_source_lines(snapshot)),
+        "updates" => print_cli_section(snapshot, "Updates", &system_update_lines(snapshot)),
+        "services" => print_cli_section(snapshot, "Services", &system_service_lines(snapshot)),
+        "identity" => print_cli_section(snapshot, "Identity", &system_identity_lines(snapshot)),
+        "diagnostics" => {
+            print_cli_section(snapshot, "Diagnostics", &system_diagnostics_lines(snapshot))
+        }
+        _ => {
+            print_cli_page_header(snapshot, "System");
+            println!("Unknown System topic: {arg}");
+            println!("  Try: system shell, source, updates, services, identity, diagnostics");
+        }
+    }
+}
+
+fn normalize_system_topic(input: &str) -> String {
+    match normalize_lookup(input).as_str() {
+        "shells" | "active-shell" | "home-shell" => "shell".to_string(),
+        "source" | "sources" | "trusted-source" | "seed" => "source".to_string(),
+        "update" | "updates" | "upgrade" | "release" => "updates".to_string(),
+        "service" | "services" | "offers" => "services".to_string(),
+        "id" | "identity" | "profile" | "auth" | "security" => "identity".to_string(),
+        "diag" | "diagnostic" | "diagnostics" | "health" => "diagnostics".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn print_cli_debug(snapshot: &HomeSnapshot, arg: &str) {
+    let mut parts = arg.split_whitespace();
+    let Some(raw_name) = parts.next() else {
+        print_cli_debug_help(snapshot);
+        return;
+    };
+    let rest = parts.collect::<Vec<_>>().join(" ");
+    match normalize_debug_command(raw_name).as_str() {
+        "capsules" => print_cli_capsules(snapshot),
+        "inspect" => print_cli_inspect(snapshot, &rest),
+        "affordances" => print_cli_affordances(snapshot, &rest),
+        "gates" => print_cli_gates(snapshot, &rest),
+        "audit" => print_cli_audit(snapshot, &rest),
+        "people" => {
+            print_cli_section(snapshot, "Debug People", &people_debug_lines(snapshot));
+            print_cli_contacts(snapshot);
+        }
+        "spaces" => print_cli_spaces(snapshot, raw_name, &rest),
+        "services" => print_cli_services(snapshot, ""),
+        "browser" => print_cli_browser(snapshot),
+        "contract" => print_cli_contract(snapshot),
+        "terminal" => print_cli_terminal_contract(snapshot),
+        _ => {
+            println!("Unknown debug topic: {raw_name}");
+            print_cli_debug_help(snapshot);
+        }
+    }
+}
+
+fn print_cli_debug_help(snapshot: &HomeSnapshot) {
+    print_cli_page_header(snapshot, "Debug");
+    println!("Developer facts are hidden from the default Home CLI surface.");
+    println!();
+    println!("Debug Topics");
+    println!("  debug capsules              installed capsule catalog");
+    println!("  debug inspect <capsule>     catalog projection for one capsule");
+    println!("  debug affordances [capsule] declared methods and interfaces");
+    println!("  debug gates [capsule]       gate and consent descriptors");
+    println!("  debug audit <capsule>       provenance and trust facts");
+    println!("  debug people                contacts/discovery projection");
+    println!("  debug spaces [root]         root and WebSpace projection");
+    println!("  debug services              local and remote service offers");
+    println!("  debug browser               Browser target and exit facts");
+    println!("  debug terminal              Runtime PTY terminal contract");
+    println!("  debug contract              shared capsule interface model");
+}
+
+fn normalize_debug_command(input: &str) -> String {
+    match normalize_lookup(input).as_str() {
+        "caps" | "catalog" => "capsules".to_string(),
+        "affordance" | "interface" | "interfaces" | "ifaces" => "affordances".to_string(),
+        "gate" => "gates".to_string(),
+        "trust" | "provenance" => "audit".to_string(),
+        "roots" | "places" | "mywebsite" | "public" | "local" | "webspaces" => "spaces".to_string(),
+        "shortcuts" | "keys" => "terminal".to_string(),
+        "model" | "interface-contract" => "contract".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn catalog_capsules(snapshot: &HomeSnapshot) -> &[serde_json::Value] {
+    snapshot
+        .capsule_catalog
+        .as_ref()
+        .and_then(|catalog| catalog.get("capsules"))
+        .and_then(|capsules| capsules.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn interface_registry_entries(snapshot: &HomeSnapshot) -> &[serde_json::Value] {
+    snapshot
+        .capsule_interfaces
+        .as_ref()
+        .and_then(|registry| registry.get("interfaces"))
+        .and_then(|interfaces| interfaces.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn json_text<'a>(value: &'a serde_json::Value, key: &str) -> &'a str {
+    value.get(key).and_then(|item| item.as_str()).unwrap_or("")
+}
+
+fn json_bool(value: &serde_json::Value, key: &str) -> bool {
+    value
+        .get(key)
+        .and_then(|item| item.as_bool())
+        .unwrap_or(false)
+}
+
+fn json_array_len(value: &serde_json::Value, key: &str) -> usize {
+    value
+        .get(key)
+        .and_then(|item| item.as_array())
+        .map(Vec::len)
+        .unwrap_or_default()
+}
+
+fn projection_surface_state(capsule: &serde_json::Value, surface: &str) -> String {
+    capsule
+        .get("projection")
+        .and_then(|projection| projection.get(surface))
+        .and_then(|surface| surface.get("state"))
+        .and_then(|state| state.as_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn projection_surface_note(capsule: &serde_json::Value, surface: &str) -> String {
+    capsule
+        .get("projection")
+        .and_then(|projection| projection.get(surface))
+        .and_then(|surface| surface.get("note"))
+        .and_then(|note| note.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn capsule_matches(capsule: &serde_json::Value, query: &str) -> bool {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    [
+        json_text(capsule, "name"),
+        json_text(capsule, "title"),
+        json_text(capsule, "launch_target"),
+    ]
+    .iter()
+    .any(|value| value.to_lowercase() == needle)
+}
+
+fn find_capsule_fact<'a>(snapshot: &'a HomeSnapshot, query: &str) -> Option<&'a serde_json::Value> {
+    catalog_capsules(snapshot)
+        .iter()
+        .find(|capsule| capsule_matches(capsule, query))
+}
+
+fn require_capsule_arg<'a>(arg: &'a str, command: &str) -> Option<&'a str> {
+    let query = arg.trim();
+    if query.is_empty() {
+        println!();
+        println!("Usage: {command} <capsule>");
+        return None;
+    }
+    Some(query)
+}
+
+fn print_cli_capsules(snapshot: &HomeSnapshot) {
+    print_cli_page_header(snapshot, "Capsules");
+    println!("Capsules");
+    let capsules = catalog_capsules(snapshot);
+    if capsules.is_empty() {
+        println!("  Capsule catalog facts are not available in this snapshot.");
+        return;
+    }
+    if let Some(counts) = snapshot
+        .capsule_catalog
+        .as_ref()
+        .and_then(|catalog| catalog.get("counts"))
+    {
+        println!(
+            "  total {} · installed {} · launchable {} · interfaces {} · methods {}",
+            counts
+                .get("total")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0),
+            counts
+                .get("installed")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0),
+            counts
+                .get("launchable")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0),
+            counts
+                .get("interfaces")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0),
+            counts
+                .get("methods")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0),
+        );
+    }
+    for capsule in capsules.iter().take(18) {
+        println!(
+            "  {:<24} {:<9} cli={} gates={} {}",
+            json_text(capsule, "name"),
+            json_text(capsule, "role"),
+            projection_surface_state(capsule, "cli"),
+            projection_surface_state(capsule, "gates"),
+            if json_bool(capsule, "launchable") {
+                "launchable"
+            } else {
+                "facts"
+            }
+        );
+    }
+    if capsules.len() > 18 {
+        println!("  ... {} more", capsules.len() - 18);
+    }
+}
+
+fn print_cli_inspect(snapshot: &HomeSnapshot, arg: &str) {
+    print_cli_page_header(snapshot, "Inspect");
+    let Some(query) = require_capsule_arg(arg, "inspect") else {
+        return;
+    };
+    let Some(capsule) = find_capsule_fact(snapshot, query) else {
+        println!("inspect: capsule not found: {query}");
+        return;
+    };
+    println!("Capsule {}", json_text(capsule, "name"));
+    println!("  title       {}", json_text(capsule, "title"));
+    println!(
+        "  role/type   {}/{}",
+        json_text(capsule, "role"),
+        json_text(capsule, "type")
+    );
+    println!("  state       {}", json_text(capsule, "state"));
+    println!("  trust       {}", json_text(capsule, "trust_state"));
+    if !json_text(capsule, "route").is_empty() {
+        println!("  route       {}", json_text(capsule, "route"));
+    }
+    for surface in [
+        "web",
+        "cli",
+        "facts",
+        "affordances",
+        "gates",
+        "audit_mirror",
+        "carrier",
+    ] {
+        println!(
+            "  {:<12} {}",
+            surface,
+            projection_surface_state(capsule, surface)
+        );
+    }
+}
+
+fn cli_interface_entries_for<'a>(
+    snapshot: &'a HomeSnapshot,
+    capsule_name: Option<&str>,
+) -> Vec<&'a serde_json::Value> {
+    let entries = interface_registry_entries(snapshot);
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    entries
+        .iter()
+        .filter(|entry| {
+            capsule_name
+                .map(|name| json_text(entry, "capsule") == name)
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
+fn interface_descriptor(entry: &serde_json::Value) -> &serde_json::Value {
+    entry.get("interface").unwrap_or(entry)
+}
+
+fn print_cli_affordances(snapshot: &HomeSnapshot, arg: &str) {
+    print_cli_page_header(snapshot, "Affordances");
+    let capsule = if arg.trim().is_empty() {
+        None
+    } else {
+        match find_capsule_fact(snapshot, arg.trim()) {
+            Some(capsule) => Some(capsule),
+            None => {
+                println!("affordances: capsule not found: {}", arg.trim());
+                return;
+            }
+        }
+    };
+    let capsule_name = capsule.map(|capsule| json_text(capsule, "name"));
+    let entries = cli_interface_entries_for(snapshot, capsule_name);
+    println!("Affordances");
+    if entries.is_empty() {
+        println!("  No declared affordances in this snapshot.");
+        return;
+    }
+    for entry in entries.iter().take(16) {
+        let descriptor = interface_descriptor(entry);
+        println!(
+            "  {} :: {}",
+            json_text(entry, "capsule"),
+            json_text(descriptor, "id")
+        );
+        if let Some(methods) = descriptor.get("methods").and_then(|value| value.as_array()) {
+            for method in methods.iter().take(8) {
+                println!(
+                    "    - {:<24} risk={} approval={}",
+                    json_text(method, "id"),
+                    json_text(method, "risk"),
+                    json_text(method, "approval")
+                );
+            }
+        }
+    }
+    if entries.len() > 16 {
+        println!("  ... {} more interfaces", entries.len() - 16);
+    }
+}
+
+fn print_cli_gates(snapshot: &HomeSnapshot, arg: &str) {
+    print_cli_page_header(snapshot, "Gates");
+    let query = arg.trim();
+    if query.is_empty() {
+        let entries = cli_interface_entries_for(snapshot, None);
+        println!("Gates");
+        if entries.is_empty() {
+            println!("  No declared method gates in this snapshot.");
+            return;
+        }
+        for entry in entries.iter().take(16) {
+            print_cli_gate_entry(entry, 8);
+        }
+        if entries.len() > 16 {
+            println!("  ... {} more interfaces", entries.len() - 16);
+        }
+        return;
+    }
+    let Some(capsule) = find_capsule_fact(snapshot, query) else {
+        println!("gates: capsule not found: {query}");
+        return;
+    };
+    let capsule_name = json_text(capsule, "name");
+    println!("Gates {capsule_name}");
+    println!(
+        "  projection {}",
+        projection_surface_state(capsule, "gates")
+    );
+    let note = projection_surface_note(capsule, "gates");
+    if !note.is_empty() {
+        println!("  note       {note}");
+    }
+    let entries = cli_interface_entries_for(snapshot, Some(capsule_name));
+    if entries.is_empty() {
+        println!("  No declared method gates.");
+        return;
+    }
+    for entry in entries {
+        print_cli_gate_entry(entry, usize::MAX);
+    }
+}
+
+fn print_cli_gate_entry(entry: &serde_json::Value, method_limit: usize) {
+    let descriptor = interface_descriptor(entry);
+    println!(
+        "  {} :: {}",
+        json_text(entry, "capsule"),
+        json_text(descriptor, "id")
+    );
+    if let Some(methods) = descriptor.get("methods").and_then(|value| value.as_array()) {
+        for method in methods.iter().take(method_limit) {
+            println!(
+                "    - {:<24} risk={} approval={}",
+                json_text(method, "id"),
+                json_text(method, "risk"),
+                json_text(method, "approval")
+            );
+        }
+    }
+}
+
+fn print_cli_audit(snapshot: &HomeSnapshot, arg: &str) {
+    print_cli_page_header(snapshot, "Audit");
+    let Some(query) = require_capsule_arg(arg, "audit") else {
+        return;
+    };
+    let Some(capsule) = find_capsule_fact(snapshot, query) else {
+        println!("audit: capsule not found: {query}");
+        return;
+    };
+    println!("Audit {}", json_text(capsule, "name"));
+    println!("  trust      {}", json_text(capsule, "trust_state"));
+    println!("  signature  {}", json_text(capsule, "signature_state"));
+    println!("  cid        {}", json_text(capsule, "cid_state"));
+    println!("  payment    {}", json_text(capsule, "payment_state"));
+    println!("  drm        {}", json_text(capsule, "drm_state"));
+    println!("  source     {}", json_text(capsule, "source"));
+    println!("  interfaces {}", json_array_len(capsule, "interfaces"));
+    let note = projection_surface_note(capsule, "audit_mirror");
+    if !note.is_empty() {
+        println!("  mirror     {note}");
+    }
+}
+
+fn print_cli_section(snapshot: &HomeSnapshot, title: &str, lines: &[String]) {
+    print_cli_page_header(snapshot, title);
+    println!("{title}");
+    if lines.is_empty() {
+        println!("  (none)");
+        return;
+    }
+    for line in lines {
+        println!("  {line}");
+    }
+}
+
+fn print_cli_spaces(snapshot: &HomeSnapshot, raw_name: &str, arg: &str) {
+    let query = space_query_for_command(raw_name, arg);
+    if query.is_empty() {
+        print_cli_section(snapshot, "Spaces", &spaces_summary_lines(snapshot));
+        return;
+    }
+
+    let normalized = normalize_lookup(&query);
+    let Some(root) = snapshot
+        .roots
+        .iter()
+        .find(|root| normalize_lookup(&root.name) == normalized)
+    else {
+        print_cli_page_header(snapshot, "Spaces");
+        println!("Spaces");
+        println!("  Unknown root: {}", query.trim());
+        println!("  Try: MyWebSite, Public, Local, WebSpaces");
+        return;
+    };
+
+    let title = format!("Spaces / {}", root.name);
+    print_cli_section(snapshot, &title, &space_detail_lines(root, snapshot, 80));
+}
+
+fn space_query_for_command(raw_name: &str, arg: &str) -> String {
+    let trimmed = arg.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+
+    let normalized = normalize_lookup(raw_name);
+    match normalized.as_str() {
+        "mywebsite" => "MyWebSite".to_string(),
+        "public" => "Public".to_string(),
+        "local" => "Local".to_string(),
+        "webspaces" => "WebSpaces".to_string(),
+        _ => String::new(),
+    }
+}
+
+fn print_cli_mywebsite(snapshot: &HomeSnapshot) {
+    print_cli_section(snapshot, "MyWebSite", &mywebsite_task_lines(snapshot));
+}
+
+fn mywebsite_task_lines(snapshot: &HomeSnapshot) -> Vec<String> {
+    let mut lines = vec![
+        format!("Status   {}", website_summary(snapshot)),
+        "Stage    mywebsite stage <dir>".to_string(),
+        format!(
+            "Preview  mywebsite preview ({})",
+            action_state_label(action_by_id(snapshot, "site-local"))
+        ),
+        format!(
+            "Publish  mywebsite publish ({})",
+            action_state_label(action_by_id(snapshot, "site-ephemeral"))
+        ),
+        format!(
+            "Open     mywebsite open ({})",
+            action_state_label(action_by_id(snapshot, "site-open"))
+        ),
+    ];
+
+    if let Some(url) = snapshot.site.local_url.as_deref() {
+        lines.push(format!("Preview  {}", url.trim_end_matches('/')));
+    }
+    if let Some(release) = snapshot.site.active_release.as_deref() {
+        let live = snapshot
+            .site
+            .active_channel
+            .as_deref()
+            .map(|channel| format!("{} on {}", release, channel))
+            .unwrap_or_else(|| release.to_string());
+        lines.push(format!("Live     {live}"));
+    } else if snapshot.site.release_count > 0 {
+        lines.push(format!("Releases {}", snapshot.site.release_count));
+    }
+    if let Some(cid) = snapshot.site.active_bundle_cid.as_deref() {
+        lines.push(format!("Bundle   elastos://{}", cid));
+    }
+    if !snapshot.site.staged {
+        lines.push("Next     stage a directory containing index.html".to_string());
+    }
+    lines
+}
+
+fn print_cli_inbox(snapshot: &HomeSnapshot) {
+    print_cli_page_header(snapshot, "Inbox");
+    println!("Inbox");
+    println!(
+        "  Attention: {} waiting / {} unread",
+        snapshot.notifications.attention_count, snapshot.notifications.unread_count
+    );
+    let entries = notification_entries(snapshot);
+    if entries.is_empty() {
+        println!("  No inbox entries waiting.");
+        return;
+    }
+    for entry in entries.iter().take(8) {
+        println!(
+            "  - [{}{}] {}",
+            entry.severity,
+            if entry.read { "" } else { ", new" },
+            entry.title
+        );
+        if !entry.body.trim().is_empty() {
+            println!("    {}", entry.body);
+        }
+    }
+}
+
+fn print_cli_people(snapshot: &HomeSnapshot) {
+    print_cli_page_header(snapshot, "People");
+    println!("People");
+    for line in people_overview_lines(snapshot, 80) {
+        println!("  {line}");
+    }
+    println!();
+    println!("Actions");
+    let actions = people_actions(snapshot);
+    if actions.is_empty() {
+        println!("  No People actions are available right now.");
+    } else {
+        for action in actions.iter().take(12) {
+            println!(
+                "  - {} [{}]",
+                action.label,
+                if action.ready { "ready" } else { "setup" }
+            );
+            println!("    {}", action.command);
+            if let Some(reason) = action.reason.as_deref() {
+                println!("    {reason}");
+            }
+        }
+    }
+}
+
+fn print_cli_wallet(snapshot: &HomeSnapshot) {
+    let wallet_capsules = catalog_capsules(snapshot)
+        .iter()
+        .filter(|capsule| json_text(capsule, "name").contains("wallet"))
+        .map(|capsule| json_text(capsule, "name"))
+        .collect::<Vec<_>>();
+    let wallet_entries = notification_entries(snapshot)
+        .into_iter()
+        .filter(|entry| {
+            [
+                entry.source_app.as_str(),
+                entry.kind.as_str(),
+                entry.title.as_str(),
+                entry.body.as_str(),
+                entry
+                    .action_ref
+                    .as_ref()
+                    .map(|action| action.app.as_str())
+                    .unwrap_or(""),
+            ]
+            .join(" ")
+            .to_lowercase()
+            .contains("wallet")
+                || [
+                    entry.kind.as_str(),
+                    entry.title.as_str(),
+                    entry.body.as_str(),
+                ]
+                .join(" ")
+                .to_lowercase()
+                .contains("approval")
+                || entry.body.to_lowercase().contains("sign")
+        })
+        .collect::<Vec<_>>();
+
+    print_cli_page_header(snapshot, "Wallet");
+    println!("Wallet");
+    println!(
+        "  capsules  {}",
+        if wallet_capsules.is_empty() {
+            "(none)".to_string()
+        } else {
+            wallet_capsules.join(", ")
+        }
+    );
+    println!("  requests  {}", wallet_entries.len());
+    for entry in wallet_entries.iter().take(8) {
+        let action = entry
+            .action_ref
+            .as_ref()
+            .map(|action| format!(" -> {}:{}", action.app, action.action_id))
+            .unwrap_or_default();
+        println!("  - {}{}", entry.title, action);
+    }
+}
+
+fn print_cli_services(snapshot: &HomeSnapshot, kind_filter: &str) {
+    let offers = cli_service_offers(snapshot, kind_filter);
+    let title = if kind_filter == "remote_exit" {
+        "Browser Exits"
+    } else {
+        "Services"
+    };
+    print_cli_page_header(snapshot, title);
+    println!("{title}");
+    if offers.is_empty() {
+        if kind_filter == "remote_exit" {
+            println!("  No Browser Exit offers visible in this snapshot.");
+        } else {
+            for line in compact_system_lines(snapshot) {
+                println!("  {line}");
+            }
+            println!("  No service offers visible in this snapshot.");
+        }
+        return;
+    }
+    for offer in offers.iter().take(12) {
+        let id = first_json_text(offer, &["offer_id", "id"]);
+        let kind = first_json_text(offer, &["service_kind", "kind"]);
+        let name = first_json_text(offer, &["service_display_name", "display_name"]);
+        let status = first_json_text(offer, &["status"]);
+        let route = first_json_text(offer, &["route"]);
+        println!(
+            "  {:<30} {:<12} {:<12} {}{}",
+            if id.is_empty() { "offer" } else { id },
+            if kind.is_empty() { "service" } else { kind },
+            if status.is_empty() {
+                "available"
+            } else {
+                status
+            },
+            if name.is_empty() { id } else { name },
+            if route.is_empty() {
+                String::new()
+            } else {
+                format!(" -> {route}")
+            }
+        );
+    }
+    if offers.len() > 12 {
+        println!("  ... {} more offers", offers.len() - 12);
+    }
+}
+
+fn print_cli_browser(snapshot: &HomeSnapshot) {
+    let browser = find_capsule_fact(snapshot, "browser");
+    let engine = cli_service_offers(snapshot, "browser_engine")
+        .into_iter()
+        .next();
+    let exits = cli_service_offers(snapshot, "remote_exit");
+    print_cli_page_header(snapshot, "Browser");
+    println!("Browser");
+    println!(
+        "  target    {}",
+        browser
+            .map(|capsule| json_text(capsule, "state"))
+            .filter(|state| !state.is_empty())
+            .unwrap_or("missing")
+    );
+    println!(
+        "  route     {}",
+        browser
+            .map(|capsule| json_text(capsule, "route"))
+            .filter(|route| !route.is_empty())
+            .unwrap_or("/apps/browser/")
+    );
+    println!(
+        "  engine    {}",
+        engine
+            .map(|offer| first_json_text(offer, &["status", "display_name", "offer_id"]))
+            .filter(|text| !text.is_empty())
+            .unwrap_or("unknown")
+    );
+    println!("  exits     {}", exits.len());
+    for exit in exits.iter().take(8) {
+        let name = first_json_text(exit, &["display_name", "offer_id"]);
+        let status = first_json_text(exit, &["status"]);
+        println!(
+            "  - {} ({})",
+            if name.is_empty() {
+                "Browser Exit"
+            } else {
+                name
+            },
+            if status.is_empty() { "unknown" } else { status }
+        );
+    }
+}
+
+fn cli_service_offers<'a>(
+    snapshot: &'a HomeSnapshot,
+    kind_filter: &str,
+) -> Vec<&'a serde_json::Value> {
+    let Some(services) = snapshot.services.as_ref() else {
+        return Vec::new();
+    };
+    let mut seen = BTreeSet::new();
+    let mut offers = Vec::new();
+    for key in [
+        "local_offers",
+        "remote_offers",
+        "available_local_offers",
+        "available_remote_offers",
+        "service_offers",
+    ] {
+        if let Some(items) = services.get(key).and_then(|value| value.as_array()) {
+            for offer in items {
+                let kind = first_json_text(offer, &["service_kind", "kind"]);
+                if !kind_filter.is_empty() && kind != kind_filter {
+                    continue;
+                }
+                let id = first_json_text(offer, &["offer_id", "id", "service_uri"]);
+                let dedupe = if id.is_empty() {
+                    offer.to_string()
+                } else {
+                    id.to_string()
+                };
+                if seen.insert(dedupe) {
+                    offers.push(offer);
+                }
+            }
+        }
+    }
+    offers
+}
+
+fn first_json_text<'a>(value: &'a serde_json::Value, keys: &[&str]) -> &'a str {
+    keys.iter()
+        .find_map(|key| {
+            let text = json_text(value, key);
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        })
+        .unwrap_or("")
+}
+
+fn print_cli_contacts(snapshot: &HomeSnapshot) {
+    if snapshot.people.contacts.is_empty() {
+        println!("  Contacts   No accepted ElastOS contacts yet.");
+        return;
+    }
+    println!("  Contacts");
+    for contact in snapshot.people.contacts.iter().take(8) {
+        let device = contact
+            .device_label
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!(" on {value}"))
+            .unwrap_or_default();
+        println!(
+            "  - {}{} · {}",
+            people_contact_display_name(contact, "Person"),
+            device,
+            if contact.relationship.trim().is_empty() {
+                "connected"
+            } else {
+                contact.relationship.as_str()
+            }
+        );
+    }
+}
+
+fn print_cli_contract(snapshot: &HomeSnapshot) {
+    print_cli_page_header(snapshot, "Contract");
+    println!("Capsule Interface Contract");
+    println!("  Home:       Runtime-owned facts, gates, active-shell state, and host routing");
+    println!("  home-gui:   GUI shell surface over the same Home facts");
+    println!("  home-cli:   terminal shell surface over the same Home facts");
+    println!("  entrypoint: `elastos home` runs this home-cli capsule over local Home state");
+    println!("  facts:      Runtime catalog/interface streams are the shared truth");
+    println!("  affordance: descriptors are not grants");
+    println!("  gates:      Runtime/provider/Inbox gates still decide access");
+    println!("  carrier:    capsule-to-capsule actions stay provider/Carrier intents");
+}
+
+fn print_cli_terminal_contract(snapshot: &HomeSnapshot) {
+    let contract = command_contract();
+    let terminal = contract.terminal;
+    print_cli_page_header(snapshot, "Terminal");
+    println!("Home CLI terminal contract");
+    println!(
+        "  renderer  {}",
+        terminal
+            .renderer
+            .as_deref()
+            .unwrap_or("Runtime-owned PTY terminal projection")
+    );
+    println!(
+        "  entrypoint {}",
+        terminal
+            .entrypoint
+            .as_deref()
+            .unwrap_or("snapshot dashboard with shared high-level command vocabulary")
+    );
+    println!(
+        "  transport {} ({})",
+        terminal.transport.as_deref().unwrap_or("runtime snapshot"),
+        terminal
+            .transport_scope
+            .as_deref()
+            .unwrap_or("local_runtime_adapter")
+    );
+    println!(
+        "  input     {}",
+        terminal
+            .input
+            .as_deref()
+            .unwrap_or("keyboard, paste, mouse, and resize events -> Runtime-owned PTY stream")
+    );
+    println!(
+        "  PTY       {}",
+        terminal.pty.as_deref().unwrap_or("not attached")
+    );
+    println!(
+        "  xterm     {}",
+        terminal
+            .xterm
+            .as_deref()
+            .unwrap_or("capsule-local xterm.js renderer over Runtime PTY stream")
+    );
+    if !contract.controls.is_empty() {
+        println!();
+        println!("Controls");
+        for control in contract.controls {
+            println!("  {:<9} {}", control.key, control.description);
+        }
+    }
 }
 
 impl Default for TuiState {
@@ -942,8 +2435,8 @@ impl Default for TuiState {
             home_index: 0,
             inbox_index: 0,
             people_index: 0,
-            space_index: 0,
             app_index: 0,
+            system_index: 0,
             show_help: false,
             notice: None,
         }
@@ -952,25 +2445,19 @@ impl Default for TuiState {
 
 impl TuiState {
     fn next_tab(&mut self) {
-        self.tab = match self.tab {
-            Tab::Home => Tab::Inbox,
-            Tab::Inbox => Tab::People,
-            Tab::People => Tab::Spaces,
-            Tab::Spaces => Tab::Apps,
-            Tab::Apps => Tab::System,
-            Tab::System => Tab::Home,
-        };
+        let current = DEFAULT_TABS
+            .iter()
+            .position(|tab| *tab == self.tab)
+            .unwrap_or(0);
+        self.tab = DEFAULT_TABS[(current + 1) % DEFAULT_TABS.len()];
     }
 
     fn prev_tab(&mut self) {
-        self.tab = match self.tab {
-            Tab::Home => Tab::System,
-            Tab::Inbox => Tab::Home,
-            Tab::People => Tab::Inbox,
-            Tab::Spaces => Tab::People,
-            Tab::Apps => Tab::Spaces,
-            Tab::System => Tab::Apps,
-        };
+        let current = DEFAULT_TABS
+            .iter()
+            .position(|tab| *tab == self.tab)
+            .unwrap_or(0);
+        self.tab = DEFAULT_TABS[(current + DEFAULT_TABS.len() - 1) % DEFAULT_TABS.len()];
     }
 
     fn move_prev(&mut self, snapshot: &HomeSnapshot) {
@@ -986,13 +2473,8 @@ impl TuiState {
                 }
             }
             Tab::People => {
-                if !people_action_indices(snapshot).is_empty() {
+                if !people_actions(snapshot).is_empty() {
                     self.people_index = self.people_index.saturating_sub(1);
-                }
-            }
-            Tab::Spaces => {
-                if !space_root_indices(snapshot).is_empty() {
-                    self.space_index = self.space_index.saturating_sub(1);
                 }
             }
             Tab::Apps => {
@@ -1000,7 +2482,11 @@ impl TuiState {
                     self.app_index = self.app_index.saturating_sub(1);
                 }
             }
-            Tab::System => {}
+            Tab::System => {
+                if !system_actions(snapshot).is_empty() {
+                    self.system_index = self.system_index.saturating_sub(1);
+                }
+            }
         }
     }
 
@@ -1019,15 +2505,9 @@ impl TuiState {
                 }
             }
             Tab::People => {
-                let items = people_action_indices(snapshot);
+                let items = people_actions(snapshot);
                 if !items.is_empty() {
                     self.people_index = (self.people_index + 1).min(items.len() - 1);
-                }
-            }
-            Tab::Spaces => {
-                let items = space_root_indices(snapshot);
-                if !items.is_empty() {
-                    self.space_index = (self.space_index + 1).min(items.len() - 1);
                 }
             }
             Tab::Apps => {
@@ -1036,48 +2516,122 @@ impl TuiState {
                     self.app_index = (self.app_index + 1).min(items.len() - 1);
                 }
             }
-            Tab::System => {}
+            Tab::System => {
+                let items = system_actions(snapshot);
+                if !items.is_empty() {
+                    self.system_index = (self.system_index + 1).min(items.len() - 1);
+                }
+            }
         }
     }
 
-    fn activate<'a>(&self, snapshot: &'a HomeSnapshot) -> Option<&'a str> {
+    fn activate(&self, snapshot: &HomeSnapshot) -> Option<String> {
         match self.tab {
             Tab::Home => selected_action(snapshot, &home_action_indices(snapshot), self.home_index)
-                .map(|action| action.id.as_str()),
+                .filter(|action| action.ready)
+                .map(|action| action.id.clone()),
             Tab::Inbox => selected_notification_action(snapshot, self.inbox_index)
                 .filter(|action| action.ready)
-                .map(|action| action.id.as_str()),
-            Tab::People => selected_action(
-                snapshot,
-                &people_action_indices(snapshot),
-                self.people_index,
-            )
-            .filter(|action| action.ready)
-            .map(|action| action.id.as_str()),
-            Tab::Spaces => {
-                selected_space_action(snapshot, self.space_index).map(|action| action.id.as_str())
-            }
+                .map(|action| action.id.clone()),
+            Tab::People => selected_people_action(snapshot, self.people_index)
+                .filter(|action| action.ready)
+                .map(|action| action.id),
             Tab::Apps => selected_app_action(snapshot, self.app_index)
                 .filter(|action| action.ready)
-                .map(|action| action.id.as_str()),
-            Tab::System => None,
+                .map(|action| action.id.clone()),
+            Tab::System => selected_system_action(snapshot, self.system_index)
+                .filter(|action| action.ready)
+                .map(|action| action.id),
+        }
+    }
+
+    fn handle_mouse(&mut self, event: MouseEvent, cols: usize, snapshot: &HomeSnapshot) -> bool {
+        if event.released {
+            return false;
+        }
+
+        match event.button {
+            64 => {
+                self.move_prev(snapshot);
+                true
+            }
+            65 => {
+                self.move_next(snapshot);
+                true
+            }
+            0 if event.y == TUI_TAB_ROW => {
+                let tab_count = DEFAULT_TABS.len() as u16;
+                let cols = cols.max(tab_count as usize) as u16;
+                let slot = event.x.saturating_sub(1).saturating_mul(tab_count) / cols;
+                self.tab = DEFAULT_TABS[slot.min(tab_count - 1) as usize];
+                true
+            }
+            _ => false,
         }
     }
 }
 
 impl TerminalGuard {
     fn enter() -> Result<Self> {
-        print!("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
+        let guard = Self::new()?;
+        print!("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[2J\x1b[H");
         io::stdout().flush()?;
-        Ok(Self)
+        Ok(guard)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn new() -> Result<Self> {
+        Ok(Self {
+            original_termios: enable_terminal_raw_mode()?,
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn new() -> Result<Self> {
+        Ok(Self {})
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = write!(io::stdout(), "\x1b[?25h\x1b[?1049l");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(original) = self.original_termios.as_ref() {
+            let _ = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, original) };
+        }
+        let _ = write!(io::stdout(), "\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l");
         let _ = io::stdout().flush();
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn enable_terminal_raw_mode() -> Result<Option<libc::termios>> {
+    if !io::stdin().is_terminal() {
+        return Ok(None);
+    }
+
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    let rc = unsafe { libc::tcgetattr(libc::STDIN_FILENO, termios.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(anyhow!(
+            "failed to read terminal attributes: {}",
+            io::Error::last_os_error()
+        ));
+    }
+
+    let original = unsafe { termios.assume_init() };
+    let mut raw = original;
+    unsafe {
+        libc::cfmakeraw(&mut raw);
+    }
+    let rc = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) };
+    if rc != 0 {
+        return Err(anyhow!(
+            "failed to set terminal raw mode: {}",
+            io::Error::last_os_error()
+        ));
+    }
+
+    Ok(Some(original))
 }
 
 fn read_ui_key() -> Result<UiKey> {
@@ -1112,14 +2666,17 @@ fn read_escape_sequence() -> Result<UiKey> {
     std::thread::sleep(ESCAPE_SEQUENCE_SETTLE_WINDOW);
     let mut seq = Vec::with_capacity(ESCAPE_SEQUENCE_MAX_BYTES);
     while seq.len() < ESCAPE_SEQUENCE_MAX_BYTES {
+        if !stdin_has_input(ESCAPE_SEQUENCE_BYTE_TIMEOUT_MS)? {
+            break;
+        }
         let byte = read_stdin_byte()?;
         seq.push(byte);
-        if is_escape_sequence_terminator(byte) {
+        if is_escape_sequence_complete(&seq) {
             break;
         }
     }
 
-    let key = parse_escape_sequence_bytes(&seq);
+    let key = escape_sequence_key(&seq);
     if home_debug_keys() {
         eprintln!("[home-keys] esc-seq={seq:?} parsed={key:?}");
     }
@@ -1127,6 +2684,13 @@ fn read_escape_sequence() -> Result<UiKey> {
 }
 
 fn parse_escape_sequence_bytes(seq: &[u8]) -> UiKey {
+    if let Some(key) = parse_sgr_mouse_sequence(seq) {
+        return key;
+    }
+    if let Some(key) = parse_legacy_mouse_sequence(seq) {
+        return key;
+    }
+
     let Some((&prefix, rest)) = seq.split_first() else {
         return UiKey::None;
     };
@@ -1139,8 +2703,66 @@ fn parse_escape_sequence_bytes(seq: &[u8]) -> UiKey {
         (b'[', b'B') | (b'O', b'B') => UiKey::Down,
         (b'[', b'C') | (b'O', b'C') => UiKey::Right,
         (b'[', b'D') | (b'O', b'D') => UiKey::Left,
+        (b'[', b'Z') => UiKey::Left,
         _ => UiKey::None,
     }
+}
+
+fn escape_sequence_key(seq: &[u8]) -> UiKey {
+    if seq.is_empty() {
+        UiKey::Quit
+    } else {
+        parse_escape_sequence_bytes(seq)
+    }
+}
+
+fn parse_legacy_mouse_sequence(seq: &[u8]) -> Option<UiKey> {
+    if seq.len() < 5 || !seq.starts_with(b"[M") {
+        return None;
+    }
+    let button = seq[2].checked_sub(32)? as u16;
+    let x = seq[3].checked_sub(32)? as u16;
+    let y = seq[4].checked_sub(32)? as u16;
+    Some(UiKey::Mouse(MouseEvent {
+        button,
+        x,
+        y,
+        released: button == 3,
+    }))
+}
+
+fn is_escape_sequence_complete(seq: &[u8]) -> bool {
+    if seq.starts_with(b"[M") {
+        return seq.len() >= 5;
+    }
+    seq.last()
+        .copied()
+        .is_some_and(is_escape_sequence_terminator)
+}
+
+fn parse_sgr_mouse_sequence(seq: &[u8]) -> Option<UiKey> {
+    if seq.len() < 6 || !seq.starts_with(b"[<") {
+        return None;
+    }
+    let released = match seq.last().copied()? {
+        b'M' => false,
+        b'm' => true,
+        _ => return None,
+    };
+    let payload = std::str::from_utf8(&seq[2..seq.len().saturating_sub(1)]).ok()?;
+    let mut parts = payload.split(';');
+    let button = parts.next()?.parse::<u16>().ok()?;
+    let x = parts.next()?.parse::<u16>().ok()?;
+    let y = parts.next()?.parse::<u16>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(UiKey::Mouse(MouseEvent {
+        button,
+        x,
+        y,
+        released,
+    }))
 }
 
 fn is_escape_sequence_terminator(byte: u8) -> bool {
@@ -1158,35 +2780,26 @@ fn render_tui(snapshot: &HomeSnapshot, state: &TuiState) -> Result<()> {
 }
 
 fn build_tui_screen(snapshot: &HomeSnapshot, state: &TuiState, cols: usize, rows: usize) -> String {
+    let cols = terminal_paint_cols(cols);
     let body_width = cols.saturating_sub(4);
     let mut screen = String::new();
+    let mut body = String::new();
     // Steady-state redraws repaint from the home position and clear to the end of the
     // alternate screen. This avoids old tail lines surviving shorter frames without
     // bringing back the heavier full-screen clear on every keypress.
     screen.push_str("\x1b[H\x1b[J");
-    push_screen_line(&mut screen, &banner_line(snapshot, cols));
-    push_screen_line(&mut screen, &fit_line(&header_summary_line(snapshot), cols));
-    push_screen_line(&mut screen, &rule(cols));
     push_screen_line(&mut screen, &render_tabs(state.tab, cols));
     push_screen_line(&mut screen, &rule(cols));
 
-    match state.tab {
-        Tab::Home => render_home_tab(&mut screen, snapshot, state, body_width),
-        Tab::Inbox => render_inbox_tab(&mut screen, snapshot, state, body_width),
-        Tab::People => render_people_tab(&mut screen, snapshot, state, body_width),
-        Tab::Spaces => render_spaces_tab(&mut screen, snapshot, state, body_width),
-        Tab::Apps => render_apps_tab(&mut screen, snapshot, state, body_width),
-        Tab::System => render_system_tab(&mut screen, snapshot, body_width),
-    }
-
     if state.show_help {
-        push_screen_blank(&mut screen);
-        push_screen_line(&mut screen, &section_title("Help", cols));
-        for line in wrap_text(
-            "Arrows or hjkl move, Tab switches sections, Enter runs the selected action, digits 1-9 quick-launch actions, m marks an inbox entry read, d dismisses it, r refreshes the snapshot, q leaves Home.",
-            body_width,
-        ) {
-            push_screen_line(&mut screen, &format!("  {}", line));
+        render_help_tab(&mut body, body_width);
+    } else {
+        match state.tab {
+            Tab::Home => render_home_tab(&mut body, snapshot, state, body_width),
+            Tab::Inbox => render_inbox_tab(&mut body, snapshot, state, body_width),
+            Tab::People => render_people_tab(&mut body, snapshot, state, body_width),
+            Tab::Apps => render_apps_tab(&mut body, snapshot, state, body_width),
+            Tab::System => render_system_tab(&mut body, snapshot, state, body_width),
         }
     }
 
@@ -1196,37 +2809,85 @@ fn build_tui_screen(snapshot: &HomeSnapshot, state: &TuiState, cols: usize, rows
         .or(snapshot.notice.as_deref())
         .filter(|notice| should_render_notice(notice))
     {
-        push_screen_blank(&mut screen);
-        push_screen_line(&mut screen, &section_title("Notice", cols));
+        push_screen_blank(&mut body);
+        push_screen_line(&mut body, &section_title("Notice", cols));
         for line in wrap_text(notice, body_width) {
-            push_screen_line(&mut screen, &format!("  {}", line));
+            push_screen_line(&mut body, &format!("  {}", line));
         }
     }
 
+    let header_lines = 2usize;
     let footer_lines = 3usize;
-    let used_lines = count_screen_lines(&screen);
-    if rows > footer_lines && used_lines < rows.saturating_sub(footer_lines) {
-        for _ in 0..(rows.saturating_sub(footer_lines) - used_lines) {
+    let body_rows = rows.saturating_sub(header_lines + footer_lines);
+    let body_lines = push_bounded_screen_body(&mut screen, &body, body_rows, cols);
+    if body_lines < body_rows {
+        for _ in 0..(body_rows - body_lines) {
             push_screen_blank(&mut screen);
         }
     }
 
     push_screen_blank(&mut screen);
     push_screen_line(&mut screen, &rule(cols));
-    push_screen_line(
-        &mut screen,
-        &fit_line(
-            " Keys: hjkl/arrows  Tab  Enter  1-9  m read  d dismiss  r refresh  q quit  ? help",
-            cols,
-        ),
-    );
+    push_screen_line(&mut screen, &fit_line(tui_footer_text(state), cols));
     trim_trailing_screen_newline(&mut screen);
     screen
+}
+
+fn tui_footer_text(state: &TuiState) -> &'static str {
+    if state.show_help {
+        TUI_HELP_FOOTER_TEXT
+    } else {
+        TUI_FOOTER_TEXT
+    }
+}
+
+fn terminal_paint_cols(cols: usize) -> usize {
+    // Leave the final terminal column untouched. xterm-compatible terminals can
+    // enter autowrap after a full-width line, and the following CRLF may scroll
+    // the first row off the viewport.
+    cols.saturating_sub(1).max(20)
+}
+
+fn push_bounded_screen_body(
+    screen: &mut String,
+    body: &str,
+    max_rows: usize,
+    cols: usize,
+) -> usize {
+    if max_rows == 0 {
+        return 0;
+    }
+    let lines = body.split_terminator("\r\n").collect::<Vec<_>>();
+    if lines.len() <= max_rows {
+        let rendered = lines.len();
+        for line in lines {
+            push_screen_line(screen, line);
+        }
+        return rendered;
+    }
+
+    let visible_rows = max_rows.saturating_sub(1);
+    for line in lines.iter().take(visible_rows) {
+        push_screen_line(screen, line);
+    }
+    push_screen_line(screen, &fit_line("  ...", cols));
+    max_rows
 }
 
 fn trim_trailing_screen_newline(screen: &mut String) {
     if screen.ends_with("\r\n") {
         screen.truncate(screen.len().saturating_sub(2));
+    }
+}
+
+fn render_help_tab(buf: &mut String, width: usize) {
+    push_screen_line(buf, "  Home CLI Controls");
+    push_screen_blank(buf);
+    for (key, description) in TUI_HELP_LINES {
+        let line = format!("  {:<12} {}", key, description);
+        for wrapped in wrap_text(&line, width) {
+            push_screen_line(buf, &wrapped);
+        }
     }
 }
 
@@ -1322,175 +2983,56 @@ fn render_people_tab(buf: &mut String, snapshot: &HomeSnapshot, state: &TuiState
     let mut left = Vec::new();
     let mut right = Vec::new();
 
-    let mut you = vec![
-        format!("User       {}", snapshot.user),
-        format!("Nick       {}", display_name(snapshot)),
-        format!("Identity   {}", identity_summary(snapshot)),
-        format!("Network    {}", network_summary(snapshot)),
-        format!(
-            "Carrier    {} reachable",
-            snapshot.runtime.peer_count.unwrap_or_default()
-        ),
-        "Roots      localhost://Users · localhost://UsersAI".to_string(),
-        "Use        Keep your files in Users and your resident AI homes in UsersAI".to_string(),
-    ];
-    if let Some(ticket) = &snapshot.runtime.ticket {
-        you.extend(wrap_with_label(
-            "Ticket",
-            &format!(
-                "Share this with another Home to connect directly: {}",
-                truncate(ticket, column_width.saturating_sub(44).max(16))
-            ),
-            column_width,
-        ));
-    } else {
-        you.push("Ticket     waiting for runtime".to_string());
-    }
-    push_section_lines(&mut left, "You", &you);
+    push_section_lines(
+        &mut left,
+        "My Profile",
+        &people_profile_lines(snapshot, column_width),
+    );
+    push_section_lines(
+        &mut left,
+        "People",
+        &people_contact_lines(snapshot, column_width),
+    );
 
-    let people_actions = people_action_indices(snapshot);
+    push_section_lines(
+        &mut right,
+        "Discovery",
+        &people_discovery_lines(snapshot, column_width),
+    );
+    push_section_lines(
+        &mut right,
+        "Visible People",
+        &people_visible_peer_lines(snapshot, column_width),
+    );
+    push_section_lines(
+        &mut right,
+        "Requests",
+        &people_request_lines(snapshot, column_width),
+    );
+
+    let people_actions = people_actions(snapshot);
     if !people_actions.is_empty() {
         let actions = people_actions
             .iter()
             .enumerate()
-            .map(|(slot, action_idx)| {
-                let action = &snapshot.actions[*action_idx];
+            .map(|(slot, action)| {
                 format!(
                     "{} {} [{}]",
                     selected_marker(slot == state.people_index),
                     action.label,
-                    if action.ready { "ready" } else { "blocked" }
+                    if action.ready { "ready" } else { "setup" }
                 )
             })
             .collect::<Vec<_>>();
         push_section_lines(&mut left, "Actions", &actions);
     }
 
-    let contacts = if snapshot.people.contacts.is_empty() {
-        vec!["No accepted ElastOS contacts yet. Join a shared conversation first.".to_string()]
-    } else {
-        snapshot
-            .people
-            .contacts
-            .iter()
-            .take(8)
-            .map(|contact| {
-                let device = contact
-                    .device_label
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                    .map(|value| format!(" on {value}"))
-                    .unwrap_or_default();
-                let action = if contact.can_message {
-                    " · Message opens Chat"
-                } else {
-                    ""
-                };
-                format!(
-                    "{}{} · {}{}",
-                    contact.display_name, device, contact.relationship, action
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-    push_section_lines(&mut left, "Contacts", &contacts);
-
-    let mut connections = vec![
-        format!(
-            "Chat       {}",
-            action_state_label(action_by_id(snapshot, "chat"))
-        ),
-        "Flow       Home -> Chat shows conversation, people, sync status, and object sharing"
-            .to_string(),
-        format!(
-            "Delivery   {}",
-            if snapshot.runtime.peer_count.unwrap_or_default() == 0 {
-                "Local only until another ElastOS user joins Chat"
-            } else {
-                "Open Chat and send a line to confirm room delivery"
-            }
-        ),
-    ];
-    connections
-        .push("Mode       Chat is the current first-class Home conversation path.".to_string());
-    push_section_lines(&mut right, "Connections", &connections);
-
-    let mut room = vec![
-        format!("Pending    {}", snapshot.room.pending_count),
-        format!("Active     {}", snapshot.room.active_session_count),
-        format!(
-            "Guests     {}",
-            if snapshot.room.allow_guest_invites {
-                "public join requests enabled"
-            } else {
-                "public join requests disabled"
-            }
-        ),
-        format!(
-            "ElastOS    {}",
-            if snapshot.room.allow_member_invites {
-                "user invites enabled"
-            } else {
-                "user invites disabled"
-            }
-        ),
-    ];
-    room.push(format!(
-        "Approvals  {}",
-        if snapshot.room.allow_members_to_host_guests {
-            "trusted users may approve web guests"
-        } else {
-            "conversation managers approve web guests"
-        }
-    ));
-    room.push(format!("Invites    {}", snapshot.room.pending_invite_count));
-    if let Some(url) = snapshot.room.canonical_hosted_guest_url.as_deref() {
-        room.push(format!(
-            "Hosted     {}",
-            truncate(url, column_width.saturating_sub(13).max(28))
-        ));
-    }
-    if let Some(url) = snapshot.room.ephemeral_hosted_guest_url.as_deref() {
-        room.push(format!(
-            "Quick URL  {}",
-            truncate(url, column_width.saturating_sub(13).max(28))
-        ));
-    }
-    if snapshot.room.pending_requests.is_empty() {
-        room.push("Requests   no web guest join requests pending".to_string());
-    } else {
-        for request in snapshot.room.pending_requests.iter().take(4) {
-            room.push(format!(
-                "Request    {} on {}",
-                request.display_name, request.device_label
-            ));
-        }
-    }
-    if snapshot.room.active_sessions.is_empty() {
-        room.push("Web guests no active web guest sessions".to_string());
-    } else {
-        for session in snapshot.room.active_sessions.iter().take(4) {
-            room.push(format!(
-                "Web guest  {} on {}",
-                session.display_name, session.device_label
-            ));
-        }
-    }
-    for invite in snapshot.room.pending_invites.iter().take(2) {
-        room.push(format!(
-            "Invite     {} pending",
-            truncate(&invite.invited_did, column_width.saturating_sub(18).max(16)),
-        ));
-    }
-    room.push("Control    Open Apps -> Shared Conversation to review access.".to_string());
-    push_section_lines(&mut right, "Conversation", &room);
-
-    if let Some(action) = selected_action(snapshot, &people_actions, state.people_index) {
+    if let Some(action) = selected_people_action(snapshot, state.people_index) {
         let mut profile = vec![
             format!("Action     {}", action.label),
             format!(
                 "State      {}",
-                if action.ready { "ready" } else { "blocked" }
+                if action.ready { "ready" } else { "setup" }
             ),
             format!("Command    {}", action.command),
         ];
@@ -1499,48 +3041,8 @@ fn render_people_tab(buf: &mut String, snapshot: &HomeSnapshot, state: &TuiState
         } else {
             profile.push("Enter      run this People action and return home".to_string());
         }
-        push_section_lines(&mut right, "Selected", &profile);
-    }
-
-    render_two_columns(buf, &left, &right, total_width);
-}
-
-fn render_spaces_tab(buf: &mut String, snapshot: &HomeSnapshot, state: &TuiState, width: usize) {
-    let total_width = width.max(60);
-    let column_width = column_width(total_width);
-    let mut left = Vec::new();
-    let mut right = Vec::new();
-
-    let space_indices = space_root_indices(snapshot);
-    let places: Vec<String> = space_indices
-        .iter()
-        .enumerate()
-        .map(|(slot, root_idx)| {
-            let root = &snapshot.roots[*root_idx];
-            format!(
-                "{} {}. {} [{}]",
-                selected_marker(slot == state.space_index),
-                slot + 1,
-                root.name,
-                space_state_label(root, snapshot)
-            )
-        })
-        .collect();
-    push_section_lines(&mut left, "Spaces", &places);
-
-    if let Some(root) = selected_root(snapshot, state.space_index) {
-        let mut details = space_detail_lines(root, snapshot, column_width);
-        if let Some(action) = space_action_for_root(snapshot, &root.name) {
-            details.push(format!(
-                "Enter      {}",
-                if action.ready {
-                    space_enter_summary(&root.name, &action.label)
-                } else {
-                    blocked_space_enter_summary(&root.name)
-                }
-            ));
-        }
-        push_section_lines(&mut right, &root.name, &details);
+        profile.extend(wrap_with_label("What", &action.description, column_width));
+        push_section_lines(&mut right, "Selected Action", &profile);
     }
 
     render_two_columns(buf, &left, &right, total_width);
@@ -1604,12 +3106,54 @@ fn render_apps_tab(buf: &mut String, snapshot: &HomeSnapshot, state: &TuiState, 
     render_two_columns(buf, &left, &right, total_width);
 }
 
-fn render_system_tab(buf: &mut String, snapshot: &HomeSnapshot, width: usize) {
+fn render_system_tab(buf: &mut String, snapshot: &HomeSnapshot, state: &TuiState, width: usize) {
     let total_width = width.max(60);
-    let lines = compact_system_lines(snapshot);
-    for line in lines {
-        push_screen_line(buf, &format!("  {}", fit_line(&line, total_width)));
+    let column_width = column_width(total_width);
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+
+    let actions = system_actions(snapshot);
+    let action_lines = actions
+        .iter()
+        .enumerate()
+        .map(|(slot, action)| {
+            format!(
+                "{} {} [{}]",
+                selected_marker(slot == state.system_index),
+                action.label,
+                if action.ready { "ready" } else { "current" }
+            )
+        })
+        .collect::<Vec<_>>();
+    push_section_lines(&mut left, "Settings", &action_lines);
+    push_section_lines(&mut left, "Trusted Source", &system_source_lines(snapshot));
+    push_section_lines(&mut left, "Identity", &system_identity_lines(snapshot));
+
+    if let Some(action) = selected_system_action(snapshot, state.system_index) {
+        let mut details = vec![
+            format!("Action     {}", action.label),
+            format!(
+                "State      {}",
+                if action.ready { "ready" } else { "current" }
+            ),
+            format!("Command    {}", action.command),
+        ];
+        if let Some(reason) = &action.reason {
+            details.extend(wrap_with_label("Info", reason, column_width));
+        } else {
+            details.push("Enter      run this System setting through Home".to_string());
+        }
+        details.extend(wrap_with_label("What", &action.description, column_width));
+        push_section_lines(&mut right, "Selected Setting", &details);
     }
+    push_section_lines(&mut right, "Services", &system_service_lines(snapshot));
+    push_section_lines(
+        &mut right,
+        "Diagnostics",
+        &system_diagnostics_lines(snapshot),
+    );
+
+    render_two_columns(buf, &left, &right, total_width);
 }
 
 fn push_screen_line(buf: &mut String, line: &str) {
@@ -1622,16 +3166,24 @@ fn push_screen_blank(buf: &mut String) {
 }
 
 fn render_tabs(active: Tab, cols: usize) -> String {
-    let tabs = [
-        render_tab(active == Tab::Home, "Home"),
-        render_tab(active == Tab::Inbox, "Inbox"),
-        render_tab(active == Tab::People, "People"),
-        render_tab(active == Tab::Spaces, "Spaces"),
-        render_tab(active == Tab::Apps, "Apps"),
-        render_tab(active == Tab::System, "System"),
-    ]
-    .join("  ");
+    let tabs = DEFAULT_TABS
+        .iter()
+        .map(|tab| render_tab(active == *tab, tab.label()))
+        .collect::<Vec<_>>()
+        .join("  ");
     pad_ansi_line(&tabs, cols)
+}
+
+impl Tab {
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Home => "Home",
+            Tab::Inbox => "Inbox",
+            Tab::People => "People",
+            Tab::Apps => "Apps",
+            Tab::System => "System",
+        }
+    }
 }
 
 fn render_tab(active: bool, label: &str) -> String {
@@ -1717,12 +3269,182 @@ fn selected_marker(selected: bool) -> &'static str {
     }
 }
 
-fn people_summary_lines(snapshot: &HomeSnapshot) -> Vec<String> {
+fn people_overview_lines(snapshot: &HomeSnapshot, width: usize) -> Vec<String> {
+    let mut lines = people_profile_lines(snapshot, width);
+    lines.push(format!("Contacts   {}", snapshot.people.contact_count));
+    lines.push(format!(
+        "Discovery  {}",
+        people_discovery_state_label(&snapshot.people.discovery)
+    ));
+    let peers = people_visible_peers(snapshot);
+    lines.push(format!("Visible    {}", peers.len()));
+    let requests = people_visible_requests(snapshot);
+    lines.push(format!("Requests   {}", requests.len()));
+    lines
+}
+
+fn people_profile_lines(snapshot: &HomeSnapshot, width: usize) -> Vec<String> {
+    let mut lines = vec![
+        format!("Name       {}", display_name(snapshot)),
+        format!("User       {}", snapshot.user),
+        format!("Identity   {}", identity_summary(snapshot)),
+    ];
+    if !snapshot.people.schema.trim().is_empty() {
+        lines.push(format!("Model      {}", snapshot.people.schema));
+    }
+    if snapshot.people.service_offer_count > 0 {
+        lines.push(format!(
+            "Services   {}",
+            snapshot.people.service_offer_count
+        ));
+    }
+    if let Some(source) = snapshot.source.as_ref() {
+        lines.extend(wrap_with_label("Source", &source.name, width));
+    }
+    lines
+}
+
+fn people_contact_lines(snapshot: &HomeSnapshot, width: usize) -> Vec<String> {
+    if snapshot.people.contacts.is_empty() {
+        return vec!["No people yet. Turn on Discovery to find another ElastOS home.".to_string()];
+    }
+    snapshot
+        .people
+        .contacts
+        .iter()
+        .take(8)
+        .flat_map(|contact| {
+            let mut lines = vec![format!(
+                "{} · {}",
+                people_contact_display_name(contact, "Person"),
+                if contact.relationship.trim().is_empty() {
+                    "connected"
+                } else {
+                    contact.relationship.as_str()
+                }
+            )];
+            let mut details = Vec::new();
+            if let Some(handle) = contact
+                .handle
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                details.push(handle.to_string());
+            }
+            if let Some(device) = contact
+                .device_label
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                details.push(device.to_string());
+            }
+            if contact.can_message {
+                details.push("message ready".to_string());
+            }
+            if !details.is_empty() {
+                lines.extend(wrap_with_label(" ", &details.join(" · "), width));
+            }
+            lines
+        })
+        .collect()
+}
+
+fn people_discovery_lines(snapshot: &HomeSnapshot, _width: usize) -> Vec<String> {
+    let discovery = &snapshot.people.discovery;
+    let mut lines = vec![
+        format!("State      {}", people_discovery_state_label(discovery)),
+        format!(
+            "Status     {}",
+            if discovery.status_message.trim().is_empty() {
+                discovery.status.as_str()
+            } else {
+                discovery.status_message.as_str()
+            }
+        ),
+    ];
+    if discovery.enabled {
+        lines.push(format!(
+            "Remaining  {}",
+            people_discovery_remaining_text(discovery.remaining_seconds.unwrap_or(0))
+        ));
+    }
+    if discovery.discovered_count > 0 {
+        lines.push(format!("Visible    {}", discovery.discovered_count));
+    }
+    if discovery.request_count > 0 {
+        lines.push(format!("Requests   {}", discovery.request_count));
+    }
+    lines
+}
+
+fn people_visible_peer_lines(snapshot: &HomeSnapshot, _width: usize) -> Vec<String> {
+    let peers = people_visible_peers(snapshot);
+    if peers.is_empty() {
+        return vec![
+            "No visible people yet.".to_string(),
+            "Use Turn On or Refresh while another ElastOS home is discoverable.".to_string(),
+        ];
+    }
+    peers
+        .into_iter()
+        .take(8)
+        .map(|peer| {
+            format!(
+                "{} · {}",
+                people_peer_display_name(peer, "Visible person"),
+                if peer.status.trim().is_empty() {
+                    "visible"
+                } else {
+                    peer.status.as_str()
+                }
+            )
+        })
+        .collect()
+}
+
+fn people_request_lines(snapshot: &HomeSnapshot, _width: usize) -> Vec<String> {
+    let requests = people_visible_requests(snapshot);
+    if requests.is_empty() {
+        return vec!["No People requests waiting.".to_string()];
+    }
+    requests
+        .into_iter()
+        .take(8)
+        .map(|request| {
+            format!(
+                "{} · {}",
+                people_request_display_name(request, "Person"),
+                if request.status.trim().is_empty() {
+                    "requested"
+                } else {
+                    request.status.as_str()
+                }
+            )
+        })
+        .collect()
+}
+
+fn people_debug_lines(snapshot: &HomeSnapshot) -> Vec<String> {
     let mut lines = vec![
         format!("You        {}", snapshot.user),
         format!("Nick       {}", display_name(snapshot)),
         format!("Identity   {}", identity_summary(snapshot)),
         format!("Contacts   {}", snapshot.people.contact_count),
+        format!(
+            "Discovery  {}",
+            people_discovery_state_label(&snapshot.people.discovery)
+        ),
+        format!("Model      {}", snapshot.people.discovery.schema),
+        format!("Topic      {}", snapshot.people.discovery.topic),
+        format!(
+            "LocalPeer  {}",
+            snapshot
+                .people
+                .discovery
+                .local_peer_id
+                .as_deref()
+                .unwrap_or("not advertised")
+        ),
         format!("Network    {}", network_summary(snapshot)),
         format!(
             "Profile    {}",
@@ -1745,6 +3467,61 @@ fn people_summary_lines(snapshot: &HomeSnapshot) -> Vec<String> {
     } else {
         lines.push("Ticket     waiting for runtime".to_string());
     }
+    if let Some(delay) = snapshot.people.discovery.next_refresh_after_ms {
+        lines.push(format!("RefreshMs  {delay}"));
+    }
+    for contact in snapshot.people.contacts.iter().take(3) {
+        if let Some(last_seen_at) = contact.last_seen_at {
+            lines.push(format!(
+                "ContactSeen {} {}",
+                people_contact_display_name(contact, "Person"),
+                last_seen_at
+            ));
+        }
+    }
+    for peer in snapshot.people.discovery.discovered_peers.iter().take(3) {
+        if peer.last_seen_at > 0 {
+            lines.push(format!(
+                "PeerSeen   {} {}",
+                people_peer_display_name(peer, "Visible person"),
+                peer.last_seen_at
+            ));
+        }
+    }
+    for request in snapshot.people.discovery.requests.iter().take(3) {
+        if request.created_at > 0 {
+            lines.push(format!(
+                "ReqCreated {} {}",
+                people_request_display_name(request, "Person"),
+                request.created_at
+            ));
+        }
+        if let Some(invite_id) = request
+            .invite_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(format!("ReqInvite  {}", truncate(invite_id, 42)));
+        }
+    }
+    lines.push(format!(
+        "RoomGuests {}",
+        if snapshot.room.allow_guest_invites {
+            "public join requests enabled"
+        } else {
+            "public join requests disabled"
+        }
+    ));
+    lines.push(format!(
+        "RoomUsers  {}",
+        if snapshot.room.allow_member_invites {
+            "ElastOS user invites enabled"
+        } else {
+            "ElastOS user invites disabled"
+        }
+    ));
+    lines.push(format!("RoomReqs   {}", snapshot.room.pending_count));
+    lines.push(format!("RoomWeb    {}", snapshot.room.active_session_count));
     lines.push("Manage     elastos identity nickname set".to_string());
     lines
 }
@@ -1783,6 +3560,182 @@ fn apps_summary_lines(snapshot: &HomeSnapshot) -> Vec<String> {
     lines
 }
 
+fn system_settings_lines(snapshot: &HomeSnapshot) -> Vec<String> {
+    let mut lines = compact_system_summary_lines(snapshot);
+    lines.push(format!(
+        "Shell      active {} · run `system shell home-gui` to return to Home GUI",
+        active_shell_label(snapshot)
+    ));
+    lines.push("Source     system source".to_string());
+    lines.push("Updates    system updates".to_string());
+    lines.push("Services   system services".to_string());
+    lines.push("Identity   system identity".to_string());
+    lines.push("Health     system diagnostics".to_string());
+    lines
+}
+
+fn system_shell_lines(snapshot: &HomeSnapshot) -> Vec<String> {
+    let active = active_shell_label(snapshot);
+    let mut lines = vec![
+        format!("Active     {active}"),
+        "Home GUI   system shell home-gui".to_string(),
+        "Home CLI   current terminal shell".to_string(),
+        "Authority  Runtime active-shell state, settled by the Home host".to_string(),
+    ];
+    if active == "home-gui" {
+        lines.push("Status     home-gui is already active".to_string());
+    } else {
+        lines.push(
+            "Enter      select Return to Home GUI, or run `system shell home-gui`".to_string(),
+        );
+    }
+    lines
+}
+
+fn system_source_lines(snapshot: &HomeSnapshot) -> Vec<String> {
+    let Some(source) = snapshot.source.as_ref() else {
+        return vec![
+            "Trusted source not configured".to_string(),
+            "Updates disabled until a trusted Runtime source is configured".to_string(),
+        ];
+    };
+    vec![
+        format!("Name       {}", source.name),
+        format!(
+            "Gateway    {}",
+            source.gateway.as_deref().unwrap_or("not configured")
+        ),
+        format!("Channel    {}", source_channel_label(snapshot)),
+        format!("Installed  {}", source_installed_label(snapshot)),
+        format!("Status     {}", source_status_label(snapshot)),
+    ]
+}
+
+fn system_update_lines(snapshot: &HomeSnapshot) -> Vec<String> {
+    vec![
+        format!("Policy     {}", source_update_policy_label(snapshot)),
+        format!("Source     {}", source_label(snapshot)),
+        format!("Channel    {}", source_channel_label(snapshot)),
+        format!("Installed  {}", source_installed_label(snapshot)),
+        "Apply      no automatic update is run from Home CLI".to_string(),
+    ]
+}
+
+fn system_service_lines(snapshot: &HomeSnapshot) -> Vec<String> {
+    let ready = snapshot
+        .system_services
+        .iter()
+        .filter(|service| service.ready)
+        .count();
+    let mut lines = vec![format!(
+        "Runtime    {} / {} core services ready",
+        ready,
+        snapshot.system_services.len()
+    )];
+    for service in snapshot.system_services.iter().take(8) {
+        lines.push(format!(
+            "{:<10} {}",
+            if service.ready { "ready" } else { "blocked" },
+            service.name
+        ));
+    }
+    let offers = cli_service_offers(snapshot, "");
+    lines.push(format!(
+        "Offers     {} visible service offers",
+        offers.len()
+    ));
+    for offer in offers.iter().take(5) {
+        lines.push(format!("Offer      {}", service_offer_line(offer)));
+    }
+    lines
+}
+
+fn system_identity_lines(snapshot: &HomeSnapshot) -> Vec<String> {
+    vec![
+        format!("User       {}", snapshot.user),
+        format!("Display    {}", display_name(snapshot)),
+        format!("DID        {}", identity_summary(snapshot)),
+        format!("Network    {}", network_summary(snapshot)),
+        format!("Session    {}", home_cli_session_mode_label(snapshot)),
+        format!("Auth       {}", home_cli_auth_state_label(snapshot)),
+    ]
+}
+
+fn home_cli_session_mode_label(snapshot: &HomeSnapshot) -> String {
+    match snapshot.session.mode.trim() {
+        "browser_pty" => "browser Runtime PTY".to_string(),
+        "native_terminal" => "native terminal".to_string(),
+        "" => "home-cli".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn home_cli_auth_state_label(snapshot: &HomeSnapshot) -> String {
+    let state = snapshot
+        .session
+        .extra
+        .get(&session_auth_state_key())
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if state.is_empty() {
+        "not reported by this Home snapshot".to_string()
+    } else {
+        state.to_string()
+    }
+}
+
+fn session_auth_state_key() -> String {
+    ["pass", "key_state"].concat()
+}
+
+fn system_diagnostics_lines(snapshot: &HomeSnapshot) -> Vec<String> {
+    let running_capsules = snapshot.runtime.running_capsules.len();
+    let installed_capsules = catalog_capsules(snapshot)
+        .len()
+        .max(snapshot.cached_capsules.len());
+    let service_ready = snapshot
+        .system_services
+        .iter()
+        .filter(|service| service.ready)
+        .count();
+    vec![
+        format!("Runtime    {}", runtime_state_label(snapshot)),
+        format!(
+            "Kind       {}",
+            snapshot.runtime.kind.as_deref().unwrap_or("unknown")
+        ),
+        format!("Peers      {}", snapshot.runtime.peer_count.unwrap_or(0)),
+        format!("Capsules   {running_capsules} running / {installed_capsules} installed"),
+        format!(
+            "Services   {service_ready} / {} ready",
+            snapshot.system_services.len()
+        ),
+        format!("Roots      {} configured", snapshot.roots.len()),
+        format!(
+            "Inbox      {} attention",
+            snapshot.notifications.attention_count
+        ),
+    ]
+}
+
+fn service_offer_line(offer: &serde_json::Value) -> String {
+    let id = first_json_text(offer, &["offer_id", "id", "service_uri"]);
+    let kind = first_json_text(offer, &["service_kind", "kind"]);
+    let status = first_json_text(offer, &["status"]);
+    let name = first_json_text(offer, &["service_display_name", "display_name"]);
+    format!(
+        "{} [{}] {}",
+        if name.is_empty() { id } else { name },
+        if kind.is_empty() { "service" } else { kind },
+        if status.is_empty() {
+            "available"
+        } else {
+            status
+        }
+    )
+}
+
 fn compact_system_summary_lines(snapshot: &HomeSnapshot) -> Vec<String> {
     let ready = snapshot
         .system_services
@@ -1797,11 +3750,8 @@ fn compact_system_summary_lines(snapshot: &HomeSnapshot) -> Vec<String> {
     vec![
         format!("Runtime    {}", runtime_state_label(snapshot)),
         format!("Identity   {}", identity),
-        format!("Trust      {}", source_label(snapshot)),
-        format!(
-            "Updates    {}",
-            action_state_label(action_by_id(snapshot, "update-check"))
-        ),
+        format!("Source     {}", source_status_label(snapshot)),
+        format!("Updates    {}", source_update_policy_label(snapshot)),
         format!(
             "Inbox      {} attention · {} unread",
             snapshot.notifications.attention_count, snapshot.notifications.unread_count
@@ -1835,8 +3785,24 @@ fn compact_system_lines(snapshot: &HomeSnapshot) -> Vec<String> {
         "ElastOS    {}",
         root_example(snapshot, "ElastOS", "localhost://ElastOS/SystemRegistry")
     ));
-    lines.push("Next       elastos home --status for full detail".to_string());
+    if active_shell_label(snapshot) == "home-gui" {
+        lines.push("Shell      home-gui is already active".to_string());
+    } else {
+        lines.push("Switch     system shell home-gui".to_string());
+    }
+    lines.push("Next       system source, services, identity, diagnostics".to_string());
     lines
+}
+
+fn active_shell_label(snapshot: &HomeSnapshot) -> String {
+    snapshot
+        .active_shell
+        .active
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("home-cli")
+        .to_string()
 }
 
 fn root_example(snapshot: &HomeSnapshot, name: &str, default_example: &str) -> String {
@@ -1848,29 +3814,6 @@ fn root_example(snapshot: &HomeSnapshot, name: &str, default_example: &str) -> S
         .filter(|example| !example.is_empty())
         .unwrap_or(default_example)
         .to_string()
-}
-
-fn header_summary_line(snapshot: &HomeSnapshot) -> String {
-    let identity = if snapshot.did.is_some() {
-        "identity ready"
-    } else {
-        "finish setup"
-    };
-    let peers = match snapshot.runtime.peer_count {
-        Some(0) if snapshot.runtime.ticket.is_some() => "bootstrap ready".to_string(),
-        Some(0) => "starting up".to_string(),
-        Some(1) => "1 endpoint reachable".to_string(),
-        Some(count) => format!("{} endpoints reachable", count),
-        None => "runtime offline".to_string(),
-    };
-    let site = website_status_label(snapshot);
-    format!(
-        "{}  •  {}  •  {}  •  {}",
-        display_name(snapshot),
-        identity,
-        peers,
-        site
-    )
 }
 
 fn root_group_name(root: &str) -> &'static str {
@@ -1903,20 +3846,6 @@ fn network_summary(snapshot: &HomeSnapshot) -> String {
         "1 Carrier endpoint reachable".to_string()
     } else {
         format!("{} Carrier endpoints reachable", peers)
-    }
-}
-
-fn website_status_label(snapshot: &HomeSnapshot) -> &'static str {
-    if snapshot.site.active_release.is_some() {
-        "site live"
-    } else if snapshot.site.local_url.is_some() {
-        "site preview ready"
-    } else if snapshot.site.staged {
-        "site staged"
-    } else if snapshot.site.release_count > 0 {
-        "site releases saved"
-    } else {
-        "site empty"
     }
 }
 
@@ -1999,13 +3928,63 @@ fn source_label(snapshot: &HomeSnapshot) -> String {
     }
 }
 
-fn banner_line(snapshot: &HomeSnapshot, cols: usize) -> String {
-    let title = if snapshot.runtime.running {
-        "ElastOS Home"
-    } else {
-        "ElastOS Home (offline)"
+fn source_status_label(snapshot: &HomeSnapshot) -> String {
+    match snapshot.source.as_ref() {
+        Some(_) => format!(
+            "{} · {} · installed {}",
+            source_label(snapshot),
+            source_channel_label(snapshot),
+            source_installed_label(snapshot)
+        ),
+        None => "not configured".to_string(),
+    }
+}
+
+fn source_channel_label(snapshot: &HomeSnapshot) -> String {
+    snapshot
+        .source
+        .as_ref()
+        .map(|source| {
+            let channel = source.channel.trim();
+            if channel.is_empty() {
+                "stable"
+            } else {
+                channel
+            }
+        })
+        .unwrap_or("not configured")
+        .to_string()
+}
+
+fn source_installed_label(snapshot: &HomeSnapshot) -> String {
+    snapshot
+        .source
+        .as_ref()
+        .map(|source| {
+            let version = source.installed_version.trim();
+            if version.is_empty() {
+                "unknown"
+            } else {
+                version
+            }
+        })
+        .unwrap_or("not configured")
+        .to_string()
+}
+
+fn source_update_policy_label(snapshot: &HomeSnapshot) -> String {
+    let Some(source) = snapshot.source.as_ref() else {
+        return "disabled (no trusted source)".to_string();
     };
-    fit_line(title, cols)
+    if snapshot.version.contains("dev") {
+        return "disabled in dev builds; use explicit source/update commands".to_string();
+    }
+    let channel = if source.channel.trim().is_empty() {
+        "stable"
+    } else {
+        source.channel.trim()
+    };
+    format!("allowed on {channel} via Carrier-first trusted source")
 }
 
 fn section_title(title: &str, cols: usize) -> String {
@@ -2013,34 +3992,267 @@ fn section_title(title: &str, cols: usize) -> String {
 }
 
 fn home_action_indices(snapshot: &HomeSnapshot) -> Vec<usize> {
-    let mut indices = prioritized_action_indices(
+    prioritized_action_indices(
         snapshot,
-        &[
-            "chat",
-            "room-approve",
-            "room-deny",
-            "room-revoke-all",
-            "site-local",
-            "update-check",
-        ],
-    );
-    for idx in prioritized_ready_action_indices(snapshot, &["site-ephemeral"]) {
-        if !indices.contains(&idx) {
-            indices.push(idx);
-        }
-    }
-    if snapshot.shares.channel_count > 0 {
-        for idx in prioritized_ready_action_indices(snapshot, &["shares-list"]) {
-            if !indices.contains(&idx) {
-                indices.push(idx);
-            }
-        }
-    }
-    indices
+        &["chat", "room-approve", "room-deny", "room-revoke-all"],
+    )
 }
 
-fn people_action_indices(snapshot: &HomeSnapshot) -> Vec<usize> {
-    prioritized_action_indices(snapshot, &["identity-nickname-set", "chat"])
+fn people_actions(snapshot: &HomeSnapshot) -> Vec<PeopleAction> {
+    let mut actions = Vec::new();
+    let discovery = &snapshot.people.discovery;
+    if discovery.enabled && discovery.remaining_seconds.unwrap_or(0) > 0 {
+        actions.push(PeopleAction {
+            id: "people-discovery-disable".to_string(),
+            label: "Stop discovery".to_string(),
+            description: "Stop advertising this Home as discoverable to nearby ElastOS homes."
+                .to_string(),
+            command: "people discovery off".to_string(),
+            ready: true,
+            reason: None,
+        });
+    } else {
+        actions.push(PeopleAction {
+            id: "people-discovery-enable".to_string(),
+            label: "Turn on discovery".to_string(),
+            description: "Make this Home discoverable for a short window so another ElastOS home can request contact."
+                .to_string(),
+            command: "people discovery on".to_string(),
+            ready: true,
+            reason: None,
+        });
+    }
+    actions.push(PeopleAction {
+        id: "people-discovery-refresh".to_string(),
+        label: "Refresh discovery".to_string(),
+        description:
+            "Refresh visible people and pending People requests through the Runtime People route."
+                .to_string(),
+        command: "people discovery refresh".to_string(),
+        ready: true,
+        reason: None,
+    });
+    for request in people_visible_requests(snapshot)
+        .into_iter()
+        .filter(|request| request.status == "incoming")
+    {
+        if request.request_id.trim().is_empty() {
+            continue;
+        }
+        let name = people_request_display_name(request, "Person");
+        actions.push(PeopleAction {
+            id: format!("people-accept-request:{}", request.request_id),
+            label: format!("Accept {name}"),
+            description: "Accept this incoming People request and add the person to People."
+                .to_string(),
+            command: format!("people accept {}", request.request_id),
+            ready: true,
+            reason: None,
+        });
+    }
+    for peer in people_visible_peers(snapshot) {
+        if peer.peer_id.trim().is_empty() {
+            continue;
+        }
+        let name = people_peer_display_name(peer, "Visible person");
+        actions.push(PeopleAction {
+            id: format!("people-request-peer:{}", peer.peer_id),
+            label: format!("Request {name}"),
+            description: "Send a People request to this visible ElastOS home.".to_string(),
+            command: format!("people request {}", peer.peer_id),
+            ready: true,
+            reason: None,
+        });
+    }
+    for contact in &snapshot.people.contacts {
+        let name = people_contact_display_name(contact, "Person");
+        if contact.can_message && !contact.contact_id.trim().is_empty() {
+            actions.push(PeopleAction {
+                id: format!("people-message:{}", contact.contact_id),
+                label: format!("Chat with {name}"),
+                description: "Open the Home CLI Chat flow for this contact.".to_string(),
+                command: format!("people message {}", contact.contact_id),
+                ready: true,
+                reason: None,
+            });
+        }
+        if !contact.contact_id.trim().is_empty() {
+            actions.push(PeopleAction {
+                id: format!("people-remove-contact:{}", contact.contact_id),
+                label: format!("Remove {name}"),
+                description: "Remove this person from People through the Runtime People route."
+                    .to_string(),
+                command: format!("people remove {}", contact.contact_id),
+                ready: true,
+                reason: None,
+            });
+        }
+    }
+    actions
+}
+
+fn selected_people_action(snapshot: &HomeSnapshot, selected: usize) -> Option<PeopleAction> {
+    let actions = people_actions(snapshot);
+    actions
+        .get(selected.min(actions.len().saturating_sub(1)))
+        .cloned()
+}
+
+fn system_actions(_snapshot: &HomeSnapshot) -> Vec<SystemAction> {
+    vec![SystemAction {
+        id: "shell-switch:home-gui".to_string(),
+        label: "Return to Home GUI".to_string(),
+        description:
+            "Switch the active Home shell back to the graphical desktop through Runtime state."
+                .to_string(),
+        command: "system shell home-gui".to_string(),
+        ready: true,
+        reason: None,
+    }]
+}
+
+fn selected_system_action(snapshot: &HomeSnapshot, selected: usize) -> Option<SystemAction> {
+    let actions = system_actions(snapshot);
+    actions
+        .get(selected.min(actions.len().saturating_sub(1)))
+        .cloned()
+}
+
+fn people_visible_peers(snapshot: &HomeSnapshot) -> Vec<&PeopleDiscoveryPeerStatus> {
+    let mut contact_peer_ids = std::collections::BTreeSet::new();
+    let mut contact_dids = std::collections::BTreeSet::new();
+    for contact in &snapshot.people.contacts {
+        if let Some(device) = contact
+            .device_label
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            contact_peer_ids.insert(device.to_string());
+        }
+        if contact.route.starts_with("elastos://peer/") {
+            contact_peer_ids.insert(
+                contact
+                    .route
+                    .trim_start_matches("elastos://peer/")
+                    .to_string(),
+            );
+        }
+        if let Some(handle) = contact
+            .handle
+            .as_deref()
+            .filter(|value| value.starts_with("did:"))
+        {
+            contact_dids.insert(handle.to_string());
+        }
+    }
+    snapshot
+        .people
+        .discovery
+        .discovered_peers
+        .iter()
+        .filter(|peer| {
+            let peer_id = peer.peer_id.trim();
+            let did = peer.did.as_deref().unwrap_or("").trim();
+            (peer_id.is_empty() || !contact_peer_ids.contains(peer_id))
+                && (did.is_empty() || !contact_dids.contains(did))
+        })
+        .collect()
+}
+
+fn people_visible_requests(snapshot: &HomeSnapshot) -> Vec<&PeopleDiscoveryRequestStatus> {
+    snapshot
+        .people
+        .discovery
+        .requests
+        .iter()
+        .filter(|request| matches!(request.status.as_str(), "incoming" | "requested"))
+        .collect()
+}
+
+fn people_discovery_state_label(discovery: &PeopleDiscoveryStatus) -> String {
+    if discovery.enabled && discovery.remaining_seconds.unwrap_or(0) > 0 {
+        format!(
+            "on for {}",
+            people_discovery_remaining_text(discovery.remaining_seconds.unwrap_or(0))
+        )
+    } else if !discovery.visibility.trim().is_empty() && discovery.visibility != "off" {
+        discovery.visibility.clone()
+    } else if !discovery.status.trim().is_empty() {
+        discovery.status.clone()
+    } else {
+        "off".to_string()
+    }
+}
+
+fn people_discovery_remaining_text(seconds: u64) -> String {
+    if seconds == 0 {
+        "0 sec".to_string()
+    } else if seconds >= 60 {
+        format!("{} min", seconds.div_ceil(60))
+    } else {
+        format!("{seconds} sec")
+    }
+}
+
+fn people_contact_display_name(contact: &PeopleContactStatus, fallback: &str) -> String {
+    let profile = contact.profile_card.as_ref();
+    let display_name = profile
+        .map(|profile| profile.display_name.as_str())
+        .unwrap_or("")
+        .trim();
+    if !display_name.is_empty() && display_name != "ElastOS user" {
+        return display_name.to_string();
+    }
+    let direct = contact.display_name.trim();
+    if !direct.is_empty() && direct != "ElastOS user" {
+        return direct.to_string();
+    }
+    profile
+        .and_then(|profile| profile.handle.as_deref())
+        .or(contact.handle.as_deref())
+        .or(contact.device_label.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+fn people_peer_display_name(peer: &PeopleDiscoveryPeerStatus, fallback: &str) -> String {
+    let display_name = peer.display_name.trim();
+    if !display_name.is_empty() && display_name != "ElastOS user" {
+        return display_name.to_string();
+    }
+    peer.handle
+        .as_deref()
+        .or(peer.did.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            if peer.peer_id.trim().is_empty() {
+                fallback
+            } else {
+                peer.peer_id.as_str()
+            }
+        })
+        .to_string()
+}
+
+fn people_request_display_name(request: &PeopleDiscoveryRequestStatus, fallback: &str) -> String {
+    let display_name = request.display_name.trim();
+    if !display_name.is_empty() && display_name != "ElastOS user" {
+        return display_name.to_string();
+    }
+    request
+        .handle
+        .as_deref()
+        .or(request.did.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            if request.peer_id.trim().is_empty() {
+                fallback
+            } else {
+                request.peer_id.as_str()
+            }
+        })
+        .to_string()
 }
 
 fn notification_entries(snapshot: &HomeSnapshot) -> &[NotificationEntryStatus] {
@@ -2049,10 +4261,6 @@ fn notification_entries(snapshot: &HomeSnapshot) -> &[NotificationEntryStatus] {
 
 fn notification_indices(snapshot: &HomeSnapshot) -> Vec<usize> {
     (0..notification_entries(snapshot).len()).collect()
-}
-
-fn space_root_indices(snapshot: &HomeSnapshot) -> Vec<usize> {
-    root_indices_by_priority(snapshot, &["MyWebSite", "Public", "Local", "WebSpaces"])
 }
 
 fn quick_launch_action_indices(snapshot: &HomeSnapshot) -> Vec<usize> {
@@ -2071,29 +4279,6 @@ fn prioritized_action_indices(snapshot: &HomeSnapshot, ids: &[&str]) -> Vec<usiz
     indices
 }
 
-fn prioritized_ready_action_indices(snapshot: &HomeSnapshot, ids: &[&str]) -> Vec<usize> {
-    prioritized_action_indices(snapshot, ids)
-        .into_iter()
-        .filter(|idx| {
-            snapshot
-                .actions
-                .get(*idx)
-                .map(|action| action.ready)
-                .unwrap_or(false)
-        })
-        .collect()
-}
-
-fn root_indices_by_priority(snapshot: &HomeSnapshot, names: &[&str]) -> Vec<usize> {
-    let mut indices = Vec::new();
-    for name in names {
-        if let Some(idx) = snapshot.roots.iter().position(|root| root.name == *name) {
-            indices.push(idx);
-        }
-    }
-    indices
-}
-
 fn selected_action<'a>(
     snapshot: &'a HomeSnapshot,
     indices: &[usize],
@@ -2103,26 +4288,25 @@ fn selected_action<'a>(
     snapshot.actions.get(*idx)
 }
 
-fn selected_root<'a>(snapshot: &'a HomeSnapshot, selected: usize) -> Option<&'a RootStatus> {
-    let indices = space_root_indices(snapshot);
-    let idx = indices.get(selected.min(indices.len().saturating_sub(1)))?;
-    snapshot.roots.get(*idx)
-}
-
-fn selected_space_action<'a>(
-    snapshot: &'a HomeSnapshot,
-    selected: usize,
-) -> Option<&'a ActionInfo> {
-    let root = selected_root(snapshot, selected)?;
-    space_action_for_root(snapshot, &root.name)
-}
-
 fn selected_notification<'a>(
     snapshot: &'a HomeSnapshot,
     selected: usize,
 ) -> Option<&'a NotificationEntryStatus> {
     let entries = notification_entries(snapshot);
     entries.get(selected.min(entries.len().saturating_sub(1)))
+}
+
+fn selected_notification_read_action(snapshot: &HomeSnapshot, selected: usize) -> Option<String> {
+    let entry = selected_notification(snapshot, selected)?;
+    Some(format!("notification-read:{}", entry.id))
+}
+
+fn selected_notification_dismiss_action(
+    snapshot: &HomeSnapshot,
+    selected: usize,
+) -> Option<String> {
+    let entry = selected_notification(snapshot, selected)?;
+    Some(format!("notification-dismiss:{}", entry.id))
 }
 
 fn selected_notification_action<'a>(
@@ -2156,46 +4340,6 @@ fn first_action_by_id<'a>(
         .find_map(|action_id| action_by_id(snapshot, action_id))
 }
 
-fn space_action_for_root<'a>(
-    snapshot: &'a HomeSnapshot,
-    root_name: &str,
-) -> Option<&'a ActionInfo> {
-    let action_id = match root_name {
-        "MyWebSite" => "site-local",
-        "Public" => "shares-list",
-        _ => return None,
-    };
-    action_by_id(snapshot, action_id)
-}
-
-fn space_state_label(root: &RootStatus, snapshot: &HomeSnapshot) -> &'static str {
-    match root.name.as_str() {
-        "MyWebSite" => {
-            if snapshot.site.local_url.is_some() {
-                "preview"
-            } else if snapshot.site.staged {
-                "staged"
-            } else {
-                "empty"
-            }
-        }
-        "Public" => {
-            if snapshot.shares.channel_count > 0 {
-                "ready"
-            } else {
-                "empty"
-            }
-        }
-        _ => {
-            if root.exists || root.kind == "dynamic" {
-                "ready"
-            } else {
-                "empty"
-            }
-        }
-    }
-}
-
 fn action_state_label(action: Option<&ActionInfo>) -> String {
     match action {
         Some(action) if action.ready => "ready".to_string(),
@@ -2204,22 +4348,6 @@ fn action_state_label(action: Option<&ActionInfo>) -> String {
             action.reason.as_deref().unwrap_or("setup needed")
         ),
         None => "not available".to_string(),
-    }
-}
-
-fn space_enter_summary(root_name: &str, label: &str) -> String {
-    match root_name {
-        "MyWebSite" => "open MyWebSite status, preview, or next steps".to_string(),
-        "Public" => "review shared channels and open links".to_string(),
-        _ => format!("launch {}", label),
-    }
-}
-
-fn blocked_space_enter_summary(root_name: &str) -> String {
-    match root_name {
-        "MyWebSite" => "show MyWebSite next steps and return home".to_string(),
-        "Public" => "show public sharing status and return home".to_string(),
-        _ => "show next step notice".to_string(),
     }
 }
 
@@ -2290,10 +4418,10 @@ fn home_action_summary(action: &ActionInfo) -> &str {
         "room-approve" => "Approve the next pending Chat web guest request",
         "room-deny" => "Deny the next pending Chat web guest request",
         "room-revoke-all" => "Disconnect active Chat web guest sessions",
-        "site-local" => "Stage, preview, and check live state for MyWebSite",
-        "site-ephemeral" => "Open a temporary public HTTPS URL for MyWebSite",
+        "site-local" => "Start or reuse the local MyWebSite preview",
+        "site-ephemeral" => "Publish a temporary public HTTPS URL for MyWebSite",
+        "site-open" => "Open the MyWebSite preview in a browser",
         "shares-list" => "Review shared channels, open links, and next steps",
-        "update-check" => "Check the current trusted release status",
         _ => action.description.as_str(),
     }
 }
@@ -2304,10 +4432,10 @@ fn action_display_label<'a>(action: &'a ActionInfo) -> &'a str {
         "room-approve" => "Approve access",
         "room-deny" => "Deny access",
         "room-revoke-all" => "Disconnect browsers",
-        "site-local" => "MyWebSite",
-        "site-ephemeral" => "Go public",
+        "site-local" => "Preview",
+        "site-ephemeral" => "Publish",
+        "site-open" => "Open",
         "shares-list" => "Shared",
-        "update-check" => "Updates",
         _ => action.label.as_str(),
     }
 }
@@ -2414,6 +4542,7 @@ fn space_detail_lines(root: &RootStatus, snapshot: &HomeSnapshot, width: usize) 
         format!("Group      {}", root_group_name(&root.name)),
         format!("Kind       {}", root.kind),
         format!("URI        {}", root.uri),
+        format!("Exists     {}", if root.exists { "yes" } else { "no" }),
     ];
     if let Some(path) = &root.path {
         details.push(format!("Path       {}", path));
@@ -2427,7 +4556,7 @@ fn space_detail_lines(root: &RootStatus, snapshot: &HomeSnapshot, width: usize) 
                 details.push(format!("Preview    {}", url.trim_end_matches('/')));
             } else if let Some(action) = action_by_id(snapshot, "site-local") {
                 if action.ready {
-                    details.push("Preview    press Enter to start the local preview".to_string());
+                    details.push("Preview    mywebsite preview".to_string());
                 } else if let Some(reason) = action.reason.as_deref() {
                     if let Some(command) = next_step_command(reason) {
                         details.push(format!("Next       {}", command));
@@ -2454,10 +4583,10 @@ fn space_detail_lines(root: &RootStatus, snapshot: &HomeSnapshot, width: usize) 
             if let Some(cid) = snapshot.site.active_bundle_cid.as_deref() {
                 details.push(format!("Bundle     elastos://{}", cid));
             }
-            details.push("Public     Home -> Go public gives a temporary HTTPS URL".to_string());
+            details.push("Public     mywebsite publish gives a temporary HTTPS URL".to_string());
             details.extend(wrap_with_label(
                 "Commands",
-                "elastos site stage <dir> · Go public in Home · elastos site publish --release <name> · elastos site activate --channel live · elastos site rollback --target publisher",
+                "mywebsite stage <dir> · mywebsite preview · mywebsite publish · mywebsite open · elastos site publish --release <name> · elastos site activate --channel live · elastos site rollback --target publisher",
                 width,
             ));
         }
@@ -2544,13 +4673,6 @@ fn app_entries(snapshot: &HomeSnapshot) -> Vec<AppEntry> {
             state,
             is_control: false,
         });
-
-        if action.id == "chat" {
-            if let Some(entry) = chat_room_app_entry(snapshot) {
-                entries.push(entry);
-                entries.extend(room_control_entries(snapshot));
-            }
-        }
     }
     entries
 }
@@ -2884,10 +5006,6 @@ fn term_rows() -> usize {
         .unwrap_or(32)
 }
 
-fn count_screen_lines(screen: &str) -> usize {
-    screen.matches("\r\n").count()
-}
-
 fn home_debug_keys() -> bool {
     std::env::var("ELASTOS_HOME_DEBUG_KEYS")
         .ok()
@@ -3001,14 +5119,493 @@ fn visible_text_width(text: &str) -> usize {
 mod tests {
     use super::*;
 
+    #[test]
+    fn storage_read_bytes_accepts_direct_provider_body() {
+        let body = serde_json::json!({
+            "status": "ok",
+            "data": {
+                "content": [104, 105],
+                "size": 2
+            }
+        });
+
+        assert_eq!(storage_read_bytes_from_result(&body).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn storage_read_bytes_accepts_utf8_provider_body() {
+        let body = serde_json::json!({
+            "status": "ok",
+            "data": {
+                "content": "{\"ok\":true}",
+                "encoding": "utf8",
+                "size": 11
+            }
+        });
+
+        assert_eq!(
+            storage_read_bytes_from_result(&body).unwrap(),
+            br#"{"ok":true}"#
+        );
+    }
+
+    #[test]
+    fn storage_read_bytes_accepts_runtime_carrier_result_body() {
+        let body = serde_json::json!({
+            "type": "carrier_result",
+            "result": {
+                "status": "ok",
+                "data": {
+                    "content": [104, 105],
+                    "size": 2
+                }
+            }
+        });
+
+        assert_eq!(storage_read_bytes_from_result(&body).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn storage_read_bytes_accepts_wrapped_runtime_response() {
+        let body = serde_json::json!({
+            "response": {
+                "type": "carrier_result",
+                "result": {
+                    "status": "ok",
+                    "data": "hi"
+                }
+            }
+        });
+
+        assert_eq!(storage_read_bytes_from_result(&body).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn storage_read_bytes_reports_provider_error() {
+        let body = serde_json::json!({
+            "type": "carrier_result",
+            "result": {
+                "status": "error",
+                "code": "read_failed",
+                "message": "no such object"
+            }
+        });
+
+        let error = storage_read_bytes_from_result(&body)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("read_failed"));
+        assert!(error.contains("no such object"));
+    }
+
+    #[test]
+    fn command_contract_is_home_cli_and_terminal_scoped() {
+        let contract = command_contract();
+        let home_cli_commands: Vec<String> = contract_commands_for("home-cli")
+            .into_iter()
+            .map(|command| command.name)
+            .collect();
+        let drift_surfaces: Vec<String> = contract
+            .commands
+            .iter()
+            .flat_map(|command| command.surface.iter())
+            .filter(|surface| surface.as_str() == "native" || surface.as_str() == "browser")
+            .cloned()
+            .collect();
+
+        assert!(
+            drift_surfaces.is_empty(),
+            "Home CLI command contract must not split entrypoint-specific command vocabularies"
+        );
+        assert_eq!(
+            home_cli_commands,
+            vec![
+                "home".to_string(),
+                "apps".to_string(),
+                "invoke".to_string(),
+                "inbox".to_string(),
+                "people".to_string(),
+                "mywebsite".to_string(),
+                "wallet".to_string(),
+                "exits".to_string(),
+                "system".to_string(),
+                "debug".to_string(),
+                "refresh".to_string(),
+                "help".to_string(),
+                "exit".to_string(),
+            ]
+        );
+        assert_eq!(normalize_contract_command("whoami"), "home");
+        assert_eq!(normalize_contract_command("approvals"), "inbox");
+        assert_eq!(normalize_contract_command("approve"), "inbox");
+        assert_eq!(normalize_contract_command("contacts"), "people");
+        assert_eq!(normalize_contract_command("spaces"), "mywebsite");
+        assert_eq!(normalize_contract_command("exit-nodes"), "exits");
+        assert_eq!(normalize_contract_command("settings"), "system");
+        assert_eq!(normalize_contract_command("dev"), "debug");
+        assert_eq!(normalize_debug_command("webspaces"), "spaces");
+        assert_eq!(normalize_debug_command("shortcuts"), "terminal");
+        assert_eq!(
+            contract.terminal.pty.as_deref(),
+            Some("Runtime-owned PTY; xterm sends input bytes and renders PTY output without direct host process authority"),
+            "Home CLI must describe the Runtime-owned PTY boundary honestly",
+        );
+        assert_eq!(
+            contract.terminal.entrypoint.as_deref(),
+            Some("the same home-cli binary runs inside the Runtime PTY and through `elastos home` over local Home state"),
+            "`elastos home` and browser home-cli must share the same home-cli capsule binary",
+        );
+        assert!(
+            contract
+                .controls
+                .iter()
+                .any(|control| control.key == "q / Esc"
+                    && control.description.contains("home-gui")),
+            "shell-switch copy must name the sibling shell as home-gui",
+        );
+        assert!(
+            !COMMAND_CONTRACT_JSON.contains("Home GUI"),
+            "command contract should not use a third prose name for home-gui",
+        );
+    }
+
+    #[test]
+    fn home_cli_line_mode_accepts_shared_snapshot_backed_commands() {
+        let snapshot = sample_snapshot();
+        for command in [
+            "home",
+            "apps",
+            "inbox",
+            "people",
+            "mywebsite",
+            "mywebsite status",
+            "site",
+            "website",
+            "spaces",
+            "wallet",
+            "exits",
+            "debug",
+            "debug capsules",
+            "debug inspect browser",
+            "debug affordances browser",
+            "debug gates",
+            "debug gates browser",
+            "debug audit browser",
+            "debug people",
+            "debug spaces",
+            "debug spaces webspaces",
+            "debug webspaces",
+            "debug services",
+            "debug browser",
+            "debug terminal",
+            "debug contract",
+            "system",
+            "settings",
+            "system shell",
+            "system source",
+            "system updates",
+            "system services",
+            "system identity",
+            "system auth",
+            "system diagnostics",
+            "approvals",
+            "approve",
+        ] {
+            assert!(
+                handle_shared_line_command(command, &snapshot).unwrap(),
+                "Home CLI line mode did not accept shared command: {command}",
+            );
+        }
+        for command in [
+            "capsules",
+            "inspect browser",
+            "affordances browser",
+            "gates browser",
+            "audit browser",
+            "services",
+            "browser",
+            "terminal",
+            "contract",
+        ] {
+            assert!(
+                !handle_shared_line_command(command, &snapshot).unwrap(),
+                "developer command should require explicit debug prefix: {command}",
+            );
+        }
+        assert_eq!(normalize_contract_command("call"), "invoke");
+    }
+
+    #[test]
+    fn system_line_mode_emits_home_gui_shell_switch() {
+        let mut snapshot = sample_snapshot();
+        snapshot.active_shell.active = Some("home-cli".to_string());
+
+        assert_eq!(
+            system_line_action("system shell home-gui", &snapshot).unwrap(),
+            Some("shell-switch:home-gui".to_string())
+        );
+        assert_eq!(
+            system_line_action("settings shell gui", &snapshot).unwrap(),
+            Some("shell-switch:home-gui".to_string())
+        );
+        assert!(system_line_action("system shell browser", &snapshot).is_err());
+
+        snapshot.active_shell.active = Some("home-gui".to_string());
+        assert_eq!(
+            system_line_action("system shell home-gui", &snapshot).unwrap(),
+            Some("shell-switch:home-gui".to_string())
+        );
+    }
+
+    #[test]
+    fn system_cli_exposes_settings_not_passive_status_only() {
+        let snapshot = sample_snapshot();
+        let lines = system_settings_lines(&snapshot).join("\n");
+        assert!(lines.contains("system shell home-gui"));
+        assert!(lines.contains("system source"));
+        assert!(lines.contains("system updates"));
+        assert!(lines.contains("system services"));
+        assert!(lines.contains("system identity"));
+        assert!(lines.contains("system diagnostics"));
+        assert!(system_identity_lines(&snapshot)
+            .join("\n")
+            .contains("launch-token authorized browser Home session"));
+
+        let mut state = TuiState::default();
+        state.tab = Tab::System;
+        let screen = build_tui_screen(&snapshot, &state, 100, 30);
+        assert!(screen.contains("System"));
+        assert!(screen.contains("Return to Home GUI"));
+        assert!(screen.contains("system shell home-gui"));
+    }
+
+    #[test]
+    fn people_line_mode_emits_snapshot_backed_people_actions() {
+        let mut snapshot = sample_snapshot();
+        snapshot.people = PeopleStatus {
+            contact_count: 1,
+            contacts: vec![PeopleContactStatus {
+                contact_id: "contact-alice".to_string(),
+                display_name: "Alice".to_string(),
+                relationship: "connected".to_string(),
+                can_message: true,
+                ..PeopleContactStatus::default()
+            }],
+            discovery: PeopleDiscoveryStatus {
+                enabled: true,
+                remaining_seconds: Some(60),
+                discovered_peers: vec![PeopleDiscoveryPeerStatus {
+                    peer_id: "peer-bob".to_string(),
+                    display_name: "Bob".to_string(),
+                    status: "visible".to_string(),
+                    ..PeopleDiscoveryPeerStatus::default()
+                }],
+                requests: vec![PeopleDiscoveryRequestStatus {
+                    request_id: "request-carol".to_string(),
+                    peer_id: "peer-carol".to_string(),
+                    display_name: "Carol".to_string(),
+                    status: "incoming".to_string(),
+                    ..PeopleDiscoveryRequestStatus::default()
+                }],
+                ..PeopleDiscoveryStatus::default()
+            },
+            ..PeopleStatus::default()
+        };
+
+        assert_eq!(
+            people_line_action("people discovery off", &snapshot).unwrap(),
+            Some("people-discovery-disable".to_string())
+        );
+        assert_eq!(
+            people_line_action("discovery refresh", &snapshot).unwrap(),
+            Some("people-discovery-refresh".to_string())
+        );
+        assert_eq!(
+            people_line_action("people request peer-bob", &snapshot).unwrap(),
+            Some("people-request-peer:peer-bob".to_string())
+        );
+        assert_eq!(
+            people_line_action("people accept request-carol", &snapshot).unwrap(),
+            Some("people-accept-request:request-carol".to_string())
+        );
+        assert_eq!(
+            people_line_action("people message contact-alice", &snapshot).unwrap(),
+            Some("people-message:contact-alice".to_string())
+        );
+        assert_eq!(
+            people_line_action("people remove contact-alice", &snapshot).unwrap(),
+            Some("people-remove-contact:contact-alice".to_string())
+        );
+        assert!(people_line_action("people request missing", &snapshot)
+            .unwrap_err()
+            .to_string()
+            .contains("not available"));
+        assert_eq!(people_line_action("people", &snapshot).unwrap(), None);
+    }
+
+    #[test]
+    fn mywebsite_line_mode_emits_explicit_site_actions() {
+        assert_eq!(mywebsite_line_action("mywebsite").unwrap(), None);
+        assert_eq!(mywebsite_line_action("spaces status").unwrap(), None);
+        assert_eq!(
+            mywebsite_line_action("mywebsite stage /tmp/my site").unwrap(),
+            Some("site-stage:/tmp/my site".to_string())
+        );
+        assert_eq!(
+            mywebsite_line_action("site preview").unwrap(),
+            Some("site-local".to_string())
+        );
+        assert_eq!(
+            mywebsite_line_action("website publish").unwrap(),
+            Some("site-ephemeral".to_string())
+        );
+        assert_eq!(
+            mywebsite_line_action("spaces open").unwrap(),
+            Some("site-open".to_string())
+        );
+        assert!(mywebsite_line_action("mywebsite stage")
+            .unwrap_err()
+            .to_string()
+            .contains("stage <dir>"));
+    }
+
+    #[test]
+    fn home_cli_pages_keep_context_header() {
+        let snapshot = sample_snapshot();
+        let header = cli_page_header(&snapshot, "People");
+
+        assert!(header.starts_with("\x1B[2J\x1B[HHome CLI / People\n"));
+        assert!(header.contains("user anders"));
+        assert!(header.contains("identity did:key:z6M"));
+        assert!(header.contains("shell home-cli"));
+        assert!(!header.contains("ElastOS Home"));
+    }
+
+    #[test]
+    fn debug_spaces_aliases_resolve_to_selected_roots() {
+        assert_eq!(space_query_for_command("webspaces", ""), "WebSpaces");
+        assert_eq!(space_query_for_command("mywebsite", ""), "MyWebSite");
+        assert_eq!(space_query_for_command("spaces", "public"), "public");
+
+        let snapshot = sample_snapshot();
+        let webspaces = snapshot
+            .roots
+            .iter()
+            .find(|root| root.name == "WebSpaces")
+            .expect("sample WebSpaces root missing");
+        let lines = space_detail_lines(webspaces, &snapshot, 80);
+
+        assert!(lines.iter().any(|line| line == "Group      Spaces"));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("localhost://WebSpaces/Elastos")));
+        assert!(lines.iter().any(|line| line.contains("elastos webspace")));
+    }
+
+    #[test]
+    fn mywebsite_page_is_task_oriented_and_hides_space_roots() {
+        let snapshot = sample_snapshot();
+        let lines = mywebsite_task_lines(&snapshot);
+        let text = lines.join("\n");
+
+        assert!(text.contains("Stage    mywebsite stage <dir>"));
+        assert!(text.contains("Preview  mywebsite preview"));
+        assert!(text.contains("Publish  mywebsite publish"));
+        assert!(text.contains("Open     mywebsite open"));
+        assert!(!text.contains("WebSpaces"));
+        assert!(!text.contains("scratch space"));
+        assert!(!text.contains("localhost://Local"));
+    }
+
+    #[test]
+    fn home_cli_line_mode_reads_browser_exit_service_offers() {
+        let snapshot = sample_snapshot();
+        let exits = cli_service_offers(&snapshot, "remote_exit");
+        let names = exits
+            .iter()
+            .map(|offer| first_json_text(offer, &["display_name", "offer_id"]))
+            .collect::<Vec<_>>();
+
+        assert_eq!(exits.len(), 2);
+        assert!(names.contains(&"Browser Exit node"));
+        assert!(names.contains(&"Seed Node Browser Exit"));
+    }
+
+    #[test]
+    fn home_cli_line_mode_builds_low_risk_invoke_intent() {
+        let snapshot = sample_snapshot();
+        let intent = resolve_cli_invoke_intent("browser page_status", &snapshot).unwrap();
+        assert_eq!(intent.capsule, "browser");
+        assert_eq!(intent.interface_id, "elastos.browser.page");
+        assert_eq!(intent.method, "page_status");
+        assert_eq!(intent.input, serde_json::json!({}));
+    }
+
+    #[test]
+    fn home_cli_line_mode_serializes_structured_invoke_home_intent() {
+        let snapshot = sample_snapshot();
+        let intent =
+            resolve_cli_invoke_intent("browser page_status {\"page_id\":\"default\"}", &snapshot)
+                .unwrap();
+        let payload = home_intent_payload("invoke", Some(intent)).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "action": "invoke",
+                "invoke": {
+                    "capsule": "browser",
+                    "interface": "elastos.browser.page",
+                    "method": "page_status",
+                    "input": {
+                        "page_id": "default"
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn home_cli_line_mode_blocks_high_risk_invoke_intent() {
+        let mut snapshot = sample_snapshot();
+        let methods = snapshot
+            .capsule_interfaces
+            .as_mut()
+            .and_then(|registry| registry.get_mut("interfaces"))
+            .and_then(|interfaces| interfaces.as_array_mut())
+            .and_then(|interfaces| interfaces.first_mut())
+            .and_then(|entry| entry.get_mut("interface"))
+            .and_then(|interface| interface.get_mut("methods"))
+            .and_then(|methods| methods.as_array_mut())
+            .expect("sample interface methods");
+        methods.push(serde_json::json!({
+            "id": "payment.send",
+            "risk": "payment",
+            "approval": "runtime_policy"
+        }));
+        let error = resolve_cli_invoke_intent("browser payment.send", &snapshot)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("payment risk requires explicit user approval"));
+    }
+
     fn sample_snapshot() -> HomeSnapshot {
         HomeSnapshot {
             version: "0.1.0".to_string(),
             user: "anders".to_string(),
             nickname: Some("anders".to_string()),
             did: Some("did:key:z6MkhExample".to_string()),
+            session: HomeCliSessionStatus {
+                mode: "browser_pty".to_string(),
+                extra: BTreeMap::from([(
+                    session_auth_state_key(),
+                    serde_json::json!("launch-token authorized browser Home session"),
+                )]),
+            },
             source: Some(SourceStatus {
                 name: "elastos.elacitylabs.com".to_string(),
+                channel: "stable".to_string(),
                 installed_version: "0.1.0".to_string(),
                 gateway: Some("https://elastos.elacitylabs.com".to_string()),
             }),
@@ -3020,6 +5617,22 @@ mod tests {
                 running_capsules: vec!["chat".to_string()],
             },
             system_services: vec![],
+            services: Some(serde_json::json!({
+                "schema": "elastos.runtime.services/v1",
+                "local_offers": [{
+                    "offer_id": "local:provider:browser-exit",
+                    "service_kind": "remote_exit",
+                    "display_name": "Browser Exit node",
+                    "status": "configured",
+                    "route": "/apps/browser/"
+                }],
+                "remote_offers": [{
+                    "offer_id": "remote:seed:browser-exit",
+                    "service_kind": "remote_exit",
+                    "display_name": "Seed Node Browser Exit",
+                    "status": "available"
+                }]
+            })),
             site: SiteStatus {
                 staged: true,
                 local_url: None,
@@ -3131,15 +5744,31 @@ mod tests {
                     id: "chat".to_string(),
                     label: "Chat".to_string(),
                     description: String::new(),
-                    command: "elastos chat".to_string(),
+                    command: "home: open Chat".to_string(),
                     ready: true,
                     reason: None,
                 },
                 ActionInfo {
                     id: "site-local".to_string(),
-                    label: "MyWebSite".to_string(),
+                    label: "Preview".to_string(),
                     description: String::new(),
-                    command: "elastos site serve --mode local".to_string(),
+                    command: "home: start MyWebSite local preview".to_string(),
+                    ready: true,
+                    reason: None,
+                },
+                ActionInfo {
+                    id: "site-ephemeral".to_string(),
+                    label: "Publish".to_string(),
+                    description: String::new(),
+                    command: "home: publish a temporary HTTPS URL for MyWebSite".to_string(),
+                    ready: true,
+                    reason: None,
+                },
+                ActionInfo {
+                    id: "site-open".to_string(),
+                    label: "Open".to_string(),
+                    description: String::new(),
+                    command: "home: open MyWebSite preview in browser".to_string(),
                     ready: true,
                     reason: None,
                 },
@@ -3148,14 +5777,6 @@ mod tests {
                     label: "Shared".to_string(),
                     description: String::new(),
                     command: "elastos shares list".to_string(),
-                    ready: true,
-                    reason: None,
-                },
-                ActionInfo {
-                    id: "update-check".to_string(),
-                    label: "Check for updates".to_string(),
-                    description: String::new(),
-                    command: "elastos update --check".to_string(),
                     ready: true,
                     reason: None,
                 },
@@ -3187,6 +5808,15 @@ mod tests {
                     reason: None,
                 },
                 ActionInfo {
+                    id: "capsule-browser".to_string(),
+                    label: "browser".to_string(),
+                    description: "Open web sites through the ElastOS Browser boundary.".to_string(),
+                    command: "elastos capsule browser --lifecycle interactive --interactive"
+                        .to_string(),
+                    ready: true,
+                    reason: None,
+                },
+                ActionInfo {
                     id: "capsule-mystery-capsule".to_string(),
                     label: "mystery-capsule".to_string(),
                     description: "Unknown capsule".to_string(),
@@ -3197,13 +5827,316 @@ mod tests {
                     reason: None,
                 },
             ],
+            active_shell: ActiveShellStatus {
+                active: Some("home-cli".to_string()),
+            },
             cached_capsules: vec![
                 "chat".to_string(),
                 "agent".to_string(),
                 "mystery-capsule".to_string(),
             ],
+            capsule_catalog: Some(serde_json::json!({
+                "schema": "elastos.capsules.catalog/v1",
+                "counts": {
+                    "total": 2,
+                    "installed": 2,
+                    "launchable": 2,
+                    "interfaces": 2,
+                    "methods": 3
+                },
+                "capsules": [
+                    {
+                        "name": "browser",
+                        "version": "0.1.0",
+                        "title": "Browser",
+                        "role": "app",
+                        "type": "wasm",
+                        "state": "installed",
+                        "installed": true,
+                        "launchable": true,
+                        "launch_target": "browser",
+                        "route": "/apps/browser/",
+                        "interfaces": [{
+                            "id": "elastos.browser.page",
+                            "methods": [
+                                { "id": "page_status", "risk": "read", "approval": "runtime_policy" },
+                                { "id": "open", "risk": "launch", "approval": "runtime_policy" }
+                            ]
+                        }],
+                        "projection": {
+                            "web": { "state": "available" },
+                            "cli": { "state": "available" },
+                            "facts": { "state": "available" },
+                            "affordances": { "state": "declared" },
+                            "gates": {
+                                "state": "declared",
+                                "note": "Runtime route policy, launch tokens, Inbox/Wallet approval, and provider gates remain authoritative."
+                            },
+                            "audit_mirror": {
+                                "state": "redacted",
+                                "note": "signature=no-manifest-signature; cid=local-only; payment=not-declared; drm=not-declared; ordinary shells receive redacted mirror facts."
+                            },
+                            "carrier": { "state": "requires-provider-intents" }
+                        },
+                        "cid_state": "local-only",
+                        "signature_state": "no-manifest-signature",
+                        "trust_state": "local-dev",
+                        "payment_state": "not-declared",
+                        "drm_state": "not-declared",
+                        "source": "installed"
+                    },
+                    {
+                        "name": "home-cli",
+                        "version": "0.1.0",
+                        "title": "Home CLI",
+                        "role": "shell",
+                        "type": "wasm",
+                        "state": "installed",
+                        "installed": true,
+                        "launchable": true,
+                        "launch_target": "home-cli",
+                        "route": "/apps/home-cli/",
+                        "interfaces": [],
+                        "projection": {
+                            "web": { "state": "available" },
+                            "cli": { "state": "available" },
+                            "facts": { "state": "available" },
+                            "affordances": { "state": "absent" },
+                            "gates": { "state": "absent" },
+                            "audit_mirror": { "state": "redacted" },
+                            "carrier": { "state": "none" }
+                        },
+                        "cid_state": "local-only",
+                        "signature_state": "no-manifest-signature",
+                        "trust_state": "local-dev",
+                        "payment_state": "not-declared",
+                        "drm_state": "not-declared",
+                        "source": "installed"
+                    }
+                ]
+            })),
+            capsule_interfaces: Some(serde_json::json!({
+                "schema": "elastos.capsules.interfaces/v1",
+                "counts": {
+                    "capsules": 1,
+                    "interfaces": 1,
+                    "methods": 2
+                },
+                "interfaces": [{
+                    "capsule": "browser",
+                    "capsule_version": "0.1.0",
+                    "title": "Browser",
+                    "role": "app",
+                    "type": "wasm",
+                    "trust_state": "local-dev",
+                    "interface": {
+                        "id": "elastos.browser.page",
+                        "title": "Browser Page",
+                        "methods": [
+                            { "id": "page_status", "risk": "read", "approval": "runtime_policy" },
+                            { "id": "open", "risk": "launch", "approval": "runtime_policy" }
+                        ]
+                    }
+                }]
+            })),
             notice: None,
         }
+    }
+
+    #[derive(Clone)]
+    struct InboxFixtureScenario {
+        name: &'static str,
+        entry: NotificationEntryStatus,
+        primary_action: ActionInfo,
+        extra_actions: Vec<ActionInfo>,
+        primary_action_id: &'static str,
+    }
+
+    impl InboxFixtureScenario {
+        fn apply(&self, snapshot: &mut HomeSnapshot) {
+            snapshot.notifications.entries = vec![self.entry.clone()];
+            snapshot.notifications.unread_count = 1;
+            snapshot.notifications.attention_count =
+                usize::from(self.entry.severity == "attention");
+            snapshot.actions.push(self.primary_action.clone());
+            snapshot.actions.extend(self.extra_actions.clone());
+        }
+    }
+
+    fn inbox_action(
+        id: &'static str,
+        label: &'static str,
+        description: &'static str,
+        command: &'static str,
+    ) -> ActionInfo {
+        ActionInfo {
+            id: id.to_string(),
+            label: label.to_string(),
+            description: description.to_string(),
+            command: command.to_string(),
+            ready: true,
+            reason: None,
+        }
+    }
+
+    fn inbox_entry(
+        id: &'static str,
+        source_app: &'static str,
+        kind: &'static str,
+        title: &'static str,
+        body: &'static str,
+        severity: &'static str,
+        action_app: &'static str,
+        action_id: &'static str,
+    ) -> NotificationEntryStatus {
+        NotificationEntryStatus {
+            id: id.to_string(),
+            source_app: source_app.to_string(),
+            kind: kind.to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+            action_ref: Some(NotificationActionRefStatus {
+                app: action_app.to_string(),
+                action_id: action_id.to_string(),
+            }),
+            read: false,
+            severity: severity.to_string(),
+        }
+    }
+
+    fn wallet_signing_inbox_fixture() -> InboxFixtureScenario {
+        InboxFixtureScenario {
+            name: "wallet signing",
+            entry: inbox_entry(
+                "wallet-signing:tx-1",
+                "wallet",
+                "wallet_signing_request",
+                "Wallet signature requested",
+                "ela.city wants Wallet to sign a transaction.",
+                "attention",
+                "wallet",
+                "open-gui:wallet",
+            ),
+            primary_action: inbox_action(
+                "open-gui:wallet",
+                "Open Wallet",
+                "Review and sign or reject the pending wallet request.",
+                "home: open Wallet",
+            ),
+            extra_actions: Vec::new(),
+            primary_action_id: "open-gui:wallet",
+        }
+    }
+
+    fn inspect_approval_inbox_fixture() -> InboxFixtureScenario {
+        InboxFixtureScenario {
+            name: "inspect approval",
+            entry: inbox_entry(
+                "inspect-approval:key-release-1",
+                "system",
+                "inspect_approval_request",
+                "Inspect approval requested",
+                "Capsule Inspector wants approval for key.release.",
+                "attention",
+                "system",
+                "open-gui:system",
+            ),
+            primary_action: inbox_action(
+                "open-gui:system",
+                "Open System",
+                "Review the Inspector gate preview before approving.",
+                "home: open System",
+            ),
+            extra_actions: Vec::new(),
+            primary_action_id: "open-gui:system",
+        }
+    }
+
+    fn people_request_inbox_fixture() -> InboxFixtureScenario {
+        InboxFixtureScenario {
+            name: "people request",
+            entry: inbox_entry(
+                "people-request:people-req-1",
+                "people",
+                "people_request",
+                "Bob wants to connect",
+                "Bob from peer-bob sent a People request.",
+                "attention",
+                "people",
+                "people-accept-request:people-req-1",
+            ),
+            primary_action: inbox_action(
+                "people-accept-request:people-req-1",
+                "Accept Bob",
+                "Accept this People request.",
+                "home: accept People request",
+            ),
+            extra_actions: Vec::new(),
+            primary_action_id: "people-accept-request:people-req-1",
+        }
+    }
+
+    fn chat_guest_inbox_fixture() -> InboxFixtureScenario {
+        InboxFixtureScenario {
+            name: "chat guest request",
+            entry: inbox_entry(
+                "room-access-request:chat-guest-1",
+                "chat-room",
+                "room_access_request",
+                "Alice wants to join Chat",
+                "Alice on Phone wants to join Chat.",
+                "attention",
+                "chat-room",
+                "room-approve-request:chat-guest-1",
+            ),
+            primary_action: inbox_action(
+                "room-approve-request:chat-guest-1",
+                "Approve Alice on Phone",
+                "Approve this Chat guest request.",
+                "home: approve Chat guest",
+            ),
+            extra_actions: vec![inbox_action(
+                "room-deny-request:chat-guest-1",
+                "Deny Alice on Phone",
+                "Deny this Chat guest request.",
+                "home: deny Chat guest",
+            )],
+            primary_action_id: "room-approve-request:chat-guest-1",
+        }
+    }
+
+    fn generic_capsule_inbox_fixture() -> InboxFixtureScenario {
+        InboxFixtureScenario {
+            name: "generic capsule notification",
+            entry: inbox_entry(
+                "capsule-documents-ready",
+                "documents",
+                "capsule_notification",
+                "Documents finished importing",
+                "Documents has a completed import ready to review.",
+                "attention",
+                "documents",
+                "open-gui:documents",
+            ),
+            primary_action: inbox_action(
+                "open-gui:documents",
+                "Open Documents",
+                "Open Documents to review the completed import.",
+                "home: open Documents",
+            ),
+            extra_actions: Vec::new(),
+            primary_action_id: "open-gui:documents",
+        }
+    }
+
+    fn inbox_fixture_scenarios() -> Vec<InboxFixtureScenario> {
+        vec![
+            wallet_signing_inbox_fixture(),
+            inspect_approval_inbox_fixture(),
+            people_request_inbox_fixture(),
+            chat_guest_inbox_fixture(),
+            generic_capsule_inbox_fixture(),
+        ]
     }
 
     #[test]
@@ -3213,17 +6146,7 @@ mod tests {
             .into_iter()
             .map(|idx| snapshot.actions[idx].id.as_str())
             .collect();
-        assert_eq!(ids, vec!["chat", "site-local", "update-check"]);
-    }
-
-    #[test]
-    fn spaces_follow_user_facing_order() {
-        let snapshot = sample_snapshot();
-        let names: Vec<&str> = space_root_indices(&snapshot)
-            .into_iter()
-            .map(|idx| snapshot.roots[idx].name.as_str())
-            .collect();
-        assert_eq!(names, vec!["MyWebSite", "Public", "Local", "WebSpaces"]);
+        assert_eq!(ids, vec!["chat"]);
     }
 
     #[test]
@@ -3317,40 +6240,104 @@ mod tests {
     }
 
     #[test]
-    fn app_entries_include_managed_room_surface() {
+    fn default_app_entries_only_include_cli_native_surfaces() {
         let snapshot = sample_snapshot();
         let entries = app_entries(&snapshot);
-        assert!(entries
+        let labels = entries
             .iter()
-            .any(|entry| entry.label == "Chat" && entry.state == "active"));
-        assert!(entries
-            .iter()
-            .any(|entry| entry.label == "Full-screen Chat"));
-        assert!(entries.iter().any(|entry| entry.label == "GBA UCity"));
-        assert!(entries
-            .iter()
-            .any(|entry| entry.label == "Shared Conversation" && entry.state == "ready"));
-        assert!(!entries.iter().any(|entry| entry.label == "Shared"));
-        assert!(!entries.iter().any(|entry| entry.label == "Codex"));
-        assert!(!entries.iter().any(|entry| entry.label == "Mystery Capsule"));
-        assert!(!entries.iter().any(|entry| entry.label == "Home CLI"));
-        assert!(!entries.iter().any(|entry| entry.label == "GBA Viewer"));
-        assert!(!entries.iter().any(|entry| entry.label == "IPFS Provider"));
+            .map(|entry| entry.label.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(labels, vec!["Chat"]);
+        assert!(entries.iter().all(|entry| !entry.is_control));
+        assert!(!labels.contains(&"Full-screen Chat"));
+        assert!(!labels.contains(&"Browser"));
+        assert!(!labels.contains(&"GBA UCity"));
+        assert!(!labels.contains(&"Shared Conversation"));
+        assert!(!labels.contains(&"Shared"));
     }
 
     #[test]
-    fn quick_launch_includes_remaining_actions_after_primary_cards() {
+    fn quick_launch_only_includes_working_home_actions() {
         let snapshot = sample_snapshot();
         let ids: Vec<&str> = quick_launch_action_indices(&snapshot)
             .into_iter()
             .map(|idx| snapshot.actions[idx].id.as_str())
             .collect();
-        assert_eq!(ids, vec!["chat", "site-local", "update-check"]);
+        assert_eq!(ids, vec!["chat"]);
     }
 
     #[test]
-    fn blocked_mywebsite_stays_on_home_before_shared() {
+    fn every_visible_default_menu_item_is_actionable_or_has_next_step() {
         let mut snapshot = sample_snapshot();
+        snapshot.site.staged = false;
+        snapshot.actions.insert(
+            1,
+            ActionInfo {
+                id: "room-approve".to_string(),
+                label: "Approve web guest".to_string(),
+                description: "Approve a pending Chat request.".to_string(),
+                command: "home approve".to_string(),
+                ready: false,
+                reason: Some("open Inbox and review the request first".to_string()),
+            },
+        );
+
+        assert_eq!(
+            DEFAULT_TABS,
+            &[Tab::Home, Tab::Inbox, Tab::People, Tab::Apps, Tab::System]
+        );
+
+        for action_idx in home_action_indices(&snapshot) {
+            let action = &snapshot.actions[action_idx];
+            assert!(
+                action.ready
+                    || action
+                        .reason
+                        .as_ref()
+                        .is_some_and(|reason| !reason.is_empty()),
+                "visible Home action must be ready or explain the next step: {}",
+                action.id
+            );
+        }
+        let mut blocked_state = TuiState::default();
+        blocked_state.home_index = 1;
+        assert_eq!(blocked_state.activate(&snapshot), None);
+
+        for (index, entry) in app_entries(&snapshot).iter().enumerate() {
+            let action = selected_app_action(&snapshot, index)
+                .unwrap_or_else(|| panic!("visible app has no action: {}", entry.label));
+            assert!(
+                action.ready,
+                "visible default app must be immediately actionable: {}",
+                entry.label
+            );
+        }
+
+        let screen = build_tui_screen(&snapshot, &TuiState::default(), 120, 40);
+        assert!(screen.contains("1 Chat [ready]"));
+        assert!(screen.contains("Approve access [setup]"));
+        assert!(screen.contains("setup: open Inbox and review the request first"));
+        assert!(screen.contains("elastos site stage"));
+        for hidden in [
+            "Spaces",
+            "Full-screen Chat",
+            "Browser [ready]",
+            "GBA UCity",
+            "Updates [ready]",
+            "Shared Conversation",
+        ] {
+            assert!(
+                !screen.contains(hidden),
+                "default Home CLI leaked hidden/developer item: {hidden}",
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_mywebsite_is_not_a_default_home_action() {
+        let mut snapshot = sample_snapshot();
+        snapshot.site.staged = false;
         if let Some(action) = snapshot
             .actions
             .iter_mut()
@@ -3363,11 +6350,14 @@ mod tests {
             .into_iter()
             .map(|idx| snapshot.actions[idx].id.as_str())
             .collect();
-        assert_eq!(ids, vec!["chat", "site-local", "update-check"]);
+        assert_eq!(ids, vec!["chat"]);
+        assert!(alerts_lines(&snapshot, 120, None)
+            .iter()
+            .any(|line| line.contains("elastos site stage")));
     }
 
     #[test]
-    fn shared_only_appears_on_home_when_catalog_has_entries() {
+    fn shared_catalog_entries_stay_out_of_default_home_actions() {
         let mut snapshot = sample_snapshot();
         snapshot.shares.channel_count = 1;
         snapshot.shares.active_count = 1;
@@ -3376,10 +6366,7 @@ mod tests {
             .into_iter()
             .map(|idx| snapshot.actions[idx].id.as_str())
             .collect();
-        assert_eq!(
-            ids,
-            vec!["chat", "site-local", "update-check", "shares-list"]
-        );
+        assert_eq!(ids, vec!["chat"]);
     }
 
     #[test]
@@ -3428,16 +6415,7 @@ mod tests {
             .into_iter()
             .map(|idx| snapshot.actions[idx].id.as_str())
             .collect();
-        assert_eq!(
-            ids,
-            vec![
-                "chat",
-                "room-approve",
-                "room-deny",
-                "site-local",
-                "update-check"
-            ]
-        );
+        assert_eq!(ids, vec!["chat", "room-approve", "room-deny"]);
         let alerts = alerts_lines(&snapshot, 120, None);
         assert!(alerts
             .iter()
@@ -3474,10 +6452,7 @@ mod tests {
             .into_iter()
             .map(|idx| snapshot.actions[idx].id.as_str())
             .collect();
-        assert_eq!(
-            ids,
-            vec!["chat", "room-revoke-all", "site-local", "update-check"]
-        );
+        assert_eq!(ids, vec!["chat", "room-revoke-all"]);
 
         let alerts = alerts_lines(&snapshot, 120, None);
         assert!(alerts
@@ -3487,7 +6462,7 @@ mod tests {
     }
 
     #[test]
-    fn people_tab_keeps_room_summary_but_moves_controls_to_apps() {
+    fn people_tab_uses_people_model_and_keeps_transport_in_debug() {
         let mut snapshot = sample_snapshot();
         snapshot.room.pending_count = 1;
         snapshot.room.pending_requests = vec![RoomPendingRequestStatus {
@@ -3525,22 +6500,105 @@ mod tests {
             ready: true,
             reason: None,
         });
+        snapshot.people = PeopleStatus {
+            schema: "elastos.people.contacts/v1".to_string(),
+            contact_count: 1,
+            contacts: vec![PeopleContactStatus {
+                contact_id: "contact-alice".to_string(),
+                display_name: "Alice".to_string(),
+                handle: Some("@alice".to_string()),
+                relationship: "connected".to_string(),
+                route: "elastos://peer/peer-alice".to_string(),
+                can_message: true,
+                device_label: Some("peer-alice".to_string()),
+                profile_card: None,
+                last_seen_at: Some(10),
+            }],
+            service_offer_count: 0,
+            discovery: PeopleDiscoveryStatus {
+                schema: "elastos.people.discovery/v1".to_string(),
+                enabled: true,
+                remaining_seconds: Some(120),
+                visibility: "visible".to_string(),
+                status: "ready".to_string(),
+                status_message: "Discovery is ready.".to_string(),
+                topic: "__elastos_internal/people-discovery-v1".to_string(),
+                local_peer_id: Some("peer-local".to_string()),
+                discovered_count: 1,
+                discovered_peers: vec![PeopleDiscoveryPeerStatus {
+                    peer_id: "peer-bob".to_string(),
+                    did: Some("did:key:bob".to_string()),
+                    display_name: "Bob".to_string(),
+                    handle: Some("@bob".to_string()),
+                    last_seen_at: 20,
+                    status: "visible".to_string(),
+                }],
+                request_count: 1,
+                requests: vec![PeopleDiscoveryRequestStatus {
+                    request_id: "request-carol".to_string(),
+                    peer_id: "peer-carol".to_string(),
+                    did: Some("did:key:carol".to_string()),
+                    display_name: "Carol".to_string(),
+                    handle: Some("@carol".to_string()),
+                    created_at: 30,
+                    status: "incoming".to_string(),
+                    invite_id: None,
+                }],
+                next_refresh_after_ms: None,
+            },
+        };
 
-        let ids: Vec<&str> = people_action_indices(&snapshot)
+        let ids: Vec<String> = people_actions(&snapshot)
             .into_iter()
-            .map(|idx| snapshot.actions[idx].id.as_str())
+            .map(|action| action.id)
             .collect();
-        assert_eq!(ids, vec!["chat"]);
+        assert_eq!(
+            ids,
+            vec![
+                "people-discovery-disable",
+                "people-discovery-refresh",
+                "people-accept-request:request-carol",
+                "people-request-peer:peer-bob",
+                "people-message:contact-alice",
+                "people-remove-contact:contact-alice",
+            ]
+        );
 
         let mut buf = String::new();
         render_people_tab(&mut buf, &snapshot, &TuiState::default(), 120);
-        assert!(buf.contains("Conversation"));
-        assert!(buf.contains("Request    Alice on Phone"));
-        assert!(buf.contains("Web guest  Bob on Safari"));
+        assert!(buf.contains("My Profile"));
+        assert!(buf.contains("People"));
+        assert!(buf.contains("Discovery"));
+        assert!(buf.contains("Visible People"));
+        assert!(buf.contains("Requests"));
+        assert!(buf.contains("Alice"));
+        assert!(buf.contains("Bob"));
+        assert!(buf.contains("Carol"));
+        assert!(buf.contains("Chat with Alice"));
+        assert!(buf.contains("Remove Alice"));
+        for hidden in [
+            "Conversation",
+            "Request    Alice on Phone",
+            "Web guest  Bob on Safari",
+            "Ticket",
+            "Carrier",
+            "Roots",
+            "RoomGuests",
+        ] {
+            assert!(
+                !buf.contains(hidden),
+                "normal People view leaked debug detail: {hidden}"
+            );
+        }
+
+        let debug = people_debug_lines(&snapshot).join("\n");
+        assert!(debug.contains("Ticket"));
+        assert!(debug.contains("RoomGuests"));
+        assert!(debug.contains("__elastos_internal/people-discovery-v1"));
     }
 
     #[test]
-    fn apps_tab_surfaces_room_control_details() {
+    fn room_control_details_remain_available_to_debug_helpers() {
         let mut snapshot = sample_snapshot();
         snapshot.room.title = "Room".to_string();
         snapshot.room.room_slug = "chat-room".to_string();
@@ -3578,25 +6636,9 @@ mod tests {
             },
         ];
 
-        let entry_index = app_entries(&snapshot)
-            .iter()
-            .position(|entry| entry.label == "Shared Conversation")
-            .expect("room entry missing");
+        let entry = chat_room_app_entry(&snapshot).expect("room entry missing");
 
-        let mut state = TuiState::default();
-        state.tab = Tab::Apps;
-        state.app_index = entry_index;
-
-        let mut buf = String::new();
-        render_apps_tab(&mut buf, &snapshot, &state, 120);
-        assert!(buf.contains("Shared Conversation"));
-        assert!(buf.contains("Access     conversation manager"));
-        assert!(buf.contains("People     4 trusted"));
-        assert!(buf.contains("Request    Alice on Phone"));
-        assert!(buf.contains("Web guest  Bob on Safari"));
-
-        let detail_lines =
-            chat_room_app_detail_lines(&snapshot, &app_entries(&snapshot)[entry_index], 120);
+        let detail_lines = chat_room_app_detail_lines(&snapshot, &entry, 120);
         assert!(detail_lines.iter().any(
             |line| line.contains("Public URL https://elastos.elacitylabs.com/apps/chat-room/")
         ));
@@ -3609,7 +6651,7 @@ mod tests {
     }
 
     #[test]
-    fn apps_tab_surfaces_targeted_room_controls() {
+    fn targeted_room_controls_do_not_appear_as_default_apps() {
         let mut snapshot = sample_snapshot();
         snapshot.room.allow_guest_invites = true;
         snapshot.room.allow_member_invites = false;
@@ -3693,40 +6735,24 @@ mod tests {
         });
 
         let entries = app_entries(&snapshot);
-        assert!(entries
-            .iter()
-            .any(|entry| entry.label == "Shared Conversation" && !entry.is_control));
-        assert!(entries
-            .iter()
-            .any(|entry| entry.label == "Close public join requests" && entry.is_control));
-        assert!(entries
-            .iter()
-            .any(|entry| entry.label == "Open ElastOS user invites" && entry.is_control));
-        assert!(entries
-            .iter()
-            .any(|entry| entry.label == "Revoke invite for did:key:z6member" && entry.is_control));
-        assert!(entries
-            .iter()
-            .any(|entry| entry.label == "Remove did:key:z6member" && entry.is_control));
-        assert!(entries
-            .iter()
-            .any(|entry| entry.label == "Approve Alice on Phone" && entry.is_control));
-        assert!(entries
-            .iter()
-            .any(|entry| entry.label == "Disconnect Bob on Safari" && entry.is_control));
-
-        let control_index = entries
-            .iter()
-            .position(|entry| entry.label == "Approve Alice on Phone")
-            .expect("approve control missing");
         assert_eq!(
-            selected_app_action(&snapshot, control_index).map(|action| action.id.as_str()),
-            Some("room-approve-request:req-1")
+            entries
+                .iter()
+                .map(|entry| entry.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Chat"]
         );
 
-        let list = render_app_list(&entries, control_index).join("\n");
-        assert!(list.contains("  Approve Alice on Phone [ready]"));
-        assert!(list.contains("  Close public join requests [ready]"));
+        let controls = room_control_entries(&snapshot);
+        assert!(controls
+            .iter()
+            .any(|entry| entry.label == "Close public join requests" && entry.is_control));
+        assert!(controls
+            .iter()
+            .any(|entry| entry.label == "Approve Alice on Phone" && entry.is_control));
+        assert!(controls
+            .iter()
+            .any(|entry| entry.label == "Disconnect Bob on Safari" && entry.is_control));
     }
 
     #[test]
@@ -3765,23 +6791,129 @@ mod tests {
         assert!(buf.contains("Approve Alice on Phone"));
         assert_eq!(
             state.activate(&snapshot),
-            Some("room-approve-request:req-1")
+            Some("room-approve-request:req-1".to_string())
         );
     }
 
     #[test]
-    fn inbox_tab_order_sits_between_home_and_people() {
+    fn inbox_fixture_scenarios_resolve_actions_and_mark_dismiss_intents() {
+        for scenario in inbox_fixture_scenarios() {
+            let mut snapshot = sample_snapshot();
+            scenario.apply(&mut snapshot);
+
+            let mut state = TuiState::default();
+            state.tab = Tab::Inbox;
+
+            let mut buf = String::new();
+            render_inbox_tab(&mut buf, &snapshot, &state, 200);
+            assert!(
+                buf.contains(&scenario.entry.title),
+                "Inbox did not render {} scenario title",
+                scenario.name
+            );
+            assert!(
+                buf.contains(&scenario.entry.body),
+                "Inbox did not render {} scenario body",
+                scenario.name
+            );
+            assert_eq!(
+                selected_notification_read_action(&snapshot, 0),
+                Some(format!("notification-read:{}", scenario.entry.id)),
+                "{} mark-read intent drifted",
+                scenario.name
+            );
+            assert_eq!(
+                selected_notification_dismiss_action(&snapshot, 0),
+                Some(format!("notification-dismiss:{}", scenario.entry.id)),
+                "{} dismiss intent drifted",
+                scenario.name
+            );
+            assert_eq!(
+                state.activate(&snapshot),
+                Some(scenario.primary_action_id.to_string()),
+                "{} primary action drifted",
+                scenario.name
+            );
+            assert!(
+                buf.contains("Enter      run this inbox action and return here"),
+                "{} Inbox selected action did not promise return behavior",
+                scenario.name
+            );
+        }
+    }
+
+    #[test]
+    fn inbox_chat_guest_fixture_exposes_approve_and_deny_paths() {
+        let scenario = chat_guest_inbox_fixture();
+        let mut snapshot = sample_snapshot();
+        scenario.apply(&mut snapshot);
+
+        let approve = selected_notification_action(&snapshot, 0).expect("approve action");
+        assert_eq!(approve.id, "room-approve-request:chat-guest-1");
+        assert!(approve.ready);
+
+        let deny = action_by_id(&snapshot, "room-deny-request:chat-guest-1").expect("deny action");
+        assert_eq!(deny.label, "Deny Alice on Phone");
+        assert!(deny.ready);
+
+        let mut state = TuiState::default();
+        state.tab = Tab::Inbox;
+        assert_eq!(
+            state.activate(&snapshot),
+            Some("room-approve-request:chat-guest-1".to_string())
+        );
+        assert_eq!(
+            selected_notification_dismiss_action(&snapshot, 0),
+            Some("notification-dismiss:room-access-request:chat-guest-1".to_string())
+        );
+    }
+
+    #[test]
+    fn inbox_selected_index_controls_mark_dismiss_and_open() {
+        let wallet = wallet_signing_inbox_fixture();
+        let generic = generic_capsule_inbox_fixture();
+        let mut snapshot = sample_snapshot();
+        wallet.apply(&mut snapshot);
+        snapshot.notifications.entries.push(generic.entry.clone());
+        snapshot.actions.push(generic.primary_action.clone());
+        snapshot.notifications.unread_count = 2;
+        snapshot.notifications.attention_count = 2;
+
+        let mut state = TuiState::default();
+        state.tab = Tab::Inbox;
+        state.inbox_index = 1;
+
+        assert_eq!(
+            selected_notification_read_action(&snapshot, state.inbox_index),
+            Some("notification-read:capsule-documents-ready".to_string())
+        );
+        assert_eq!(
+            selected_notification_dismiss_action(&snapshot, state.inbox_index),
+            Some("notification-dismiss:capsule-documents-ready".to_string())
+        );
+        assert_eq!(
+            state.activate(&snapshot),
+            Some("open-gui:documents".to_string())
+        );
+    }
+
+    #[test]
+    fn tabs_keep_people_between_inbox_and_apps() {
         let mut state = TuiState::default();
         state.next_tab();
         assert_eq!(state.tab, Tab::Inbox);
         state.next_tab();
+        assert_eq!(state.tab, Tab::People);
+        state.next_tab();
+        assert_eq!(state.tab, Tab::Apps);
+        state.prev_tab();
         assert_eq!(state.tab, Tab::People);
         state.prev_tab();
         assert_eq!(state.tab, Tab::Inbox);
     }
 
     #[test]
-    fn shared_only_appears_in_apps_when_catalog_has_entries() {
+    fn shared_catalog_entries_stay_out_of_default_apps() {
         let mut snapshot = sample_snapshot();
         assert!(!app_entries(&snapshot)
             .iter()
@@ -3790,27 +6922,35 @@ mod tests {
         snapshot.shares.channel_count = 1;
         snapshot.shares.active_count = 1;
 
-        assert!(app_entries(&snapshot)
+        assert!(!app_entries(&snapshot)
             .iter()
             .any(|entry| entry.label == "Shared"));
     }
 
     #[test]
-    fn blocked_home_action_can_still_return_next_step_notice() {
+    fn blocked_home_action_is_visible_but_not_activated() {
         let mut snapshot = sample_snapshot();
-        if let Some(action) = snapshot
-            .actions
-            .iter_mut()
-            .find(|action| action.id == "site-local")
-        {
-            action.ready = false;
-            action.reason = Some("stage a site first".to_string());
-        }
+        snapshot.actions.insert(
+            1,
+            ActionInfo {
+                id: "room-approve".to_string(),
+                label: "Approve web guest".to_string(),
+                description: "Approve a pending request.".to_string(),
+                command: "home approve".to_string(),
+                ready: false,
+                reason: Some("open Inbox and review the request first".to_string()),
+            },
+        );
         let mut state = TuiState::default();
         state.tab = Tab::Home;
         state.home_index = 1;
 
-        assert_eq!(state.activate(&snapshot), Some("site-local"));
+        assert_eq!(state.activate(&snapshot), None);
+        assert!(
+            render_home_actions(&snapshot, &home_action_indices(&snapshot), 1, 120)
+                .join("\n")
+                .contains("setup: open Inbox and review the request first")
+        );
     }
 
     #[test]
@@ -3835,7 +6975,128 @@ mod tests {
             parse_escape_sequence_bytes(&[b'[', b'1', b';', b'2', b'D']),
             UiKey::Left
         );
-        assert_eq!(parse_escape_sequence_bytes(&[b'[', b'Z']), UiKey::None);
+        assert_eq!(parse_escape_sequence_bytes(&[b'[', b'Z']), UiKey::Left);
+        assert_eq!(
+            parse_escape_sequence_bytes(&[b'[', b'1', b';', b'2', b'Z']),
+            UiKey::Left
+        );
+    }
+
+    #[test]
+    fn standalone_escape_exits_tui() {
+        assert_eq!(parse_escape_sequence_bytes(&[]), UiKey::None);
+        assert_eq!(escape_sequence_key(&[]), UiKey::Quit);
+        assert_eq!(escape_sequence_key(&[b'[', b'Z']), UiKey::Left);
+    }
+
+    #[test]
+    fn parse_escape_sequence_bytes_handles_sgr_mouse_sequences() {
+        assert_eq!(
+            parse_escape_sequence_bytes(b"[<64;10;8M"),
+            UiKey::Mouse(MouseEvent {
+                button: 64,
+                x: 10,
+                y: 8,
+                released: false,
+            })
+        );
+        assert_eq!(
+            parse_escape_sequence_bytes(b"[<0;44;4M"),
+            UiKey::Mouse(MouseEvent {
+                button: 0,
+                x: 44,
+                y: 4,
+                released: false,
+            })
+        );
+        let long_coordinate = b"[<0;129;43M";
+        assert!(
+            ESCAPE_SEQUENCE_MAX_BYTES >= long_coordinate.len(),
+            "mouse coordinates must fit in the escape-sequence read buffer"
+        );
+        assert_eq!(
+            parse_escape_sequence_bytes(long_coordinate),
+            UiKey::Mouse(MouseEvent {
+                button: 0,
+                x: 129,
+                y: 43,
+                released: false,
+            })
+        );
+        assert_eq!(
+            parse_escape_sequence_bytes(b"[<0;44;4m"),
+            UiKey::Mouse(MouseEvent {
+                button: 0,
+                x: 44,
+                y: 4,
+                released: true,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_escape_sequence_bytes_handles_legacy_mouse_sequences() {
+        let click = [b'[', b'M', 32, 44, 35];
+        assert_eq!(
+            parse_escape_sequence_bytes(&click),
+            UiKey::Mouse(MouseEvent {
+                button: 0,
+                x: 12,
+                y: 3,
+                released: false,
+            })
+        );
+
+        let release = [b'[', b'M', 35, 44, 35];
+        assert_eq!(
+            parse_escape_sequence_bytes(&release),
+            UiKey::Mouse(MouseEvent {
+                button: 3,
+                x: 12,
+                y: 3,
+                released: true,
+            })
+        );
+    }
+
+    #[test]
+    fn escape_sequence_completion_waits_for_legacy_mouse_coordinates() {
+        assert!(!is_escape_sequence_complete(b"["));
+        assert!(!is_escape_sequence_complete(b"[M"));
+        assert!(!is_escape_sequence_complete(b"[M  "));
+        assert!(is_escape_sequence_complete(b"[M  #"));
+        assert!(is_escape_sequence_complete(b"[<0;12;3M"));
+        assert!(is_escape_sequence_complete(b"[A"));
+    }
+
+    #[test]
+    fn mouse_clicks_use_the_rendered_tab_row() {
+        let snapshot = sample_snapshot();
+        let mut state = TuiState::default();
+        assert!(state.handle_mouse(
+            MouseEvent {
+                button: 0,
+                x: 45,
+                y: TUI_TAB_ROW,
+                released: false,
+            },
+            120,
+            &snapshot,
+        ));
+        assert_eq!(state.tab, Tab::Inbox);
+
+        let mut state = TuiState::default();
+        assert!(!state.handle_mouse(
+            MouseEvent {
+                button: 0,
+                x: 45,
+                y: TUI_TAB_ROW + 1,
+                released: false,
+            },
+            120,
+            &snapshot,
+        ));
+        assert_eq!(state.tab, Tab::Home);
     }
 
     #[test]
@@ -3847,9 +7108,194 @@ mod tests {
         assert!(screen.starts_with("\x1b[H\x1b[J"));
         assert!(!screen.ends_with("\r\n"));
         assert!(screen.contains("1 Chat [ready]"));
-        assert!(screen.contains("2 MyWebSite [ready]"));
-        assert!(screen.contains("3 Updates [ready]"));
+        assert!(!screen.contains("MyWebSite [ready]"));
+        assert!(!screen.contains("Updates [ready]"));
         assert!(!screen.contains("Shared [ready]"));
+        assert!(screen.contains("Up/Down select"));
+        assert!(screen.contains("q/Esc home-gui"));
+        assert!(screen.contains("? help"));
+        assert!(!screen.contains("opens Browser"));
+        assert!(!screen.contains("hjkl"));
+    }
+
+    #[test]
+    fn tui_tabs_replace_redundant_banner() {
+        let snapshot = sample_snapshot();
+        let screen = build_tui_screen(
+            &snapshot,
+            &TuiState {
+                tab: Tab::Apps,
+                ..TuiState::default()
+            },
+            100,
+            32,
+        );
+
+        assert!(!screen.contains("ElastOS Home"));
+        assert!(!screen.contains("ElastOS Apps"));
+        assert!(screen.contains("\x1b[30;46;1m Apps \x1b[0m"));
+    }
+
+    #[test]
+    fn tui_help_matches_keyboard_contract() {
+        let snapshot = sample_snapshot();
+        let screen = build_tui_screen(
+            &snapshot,
+            &TuiState {
+                show_help: true,
+                ..TuiState::default()
+            },
+            120,
+            60,
+        );
+
+        let plain = screen.replace("\r\n", " ");
+        assert!(plain.contains("Tab"));
+        assert!(plain.contains("switch to the next section"));
+        assert!(plain.contains("Shift+Tab"));
+        assert!(plain.contains("switch to the previous section"));
+        assert!(plain.contains("q or Esc"));
+        assert!(plain.contains("m marks read"));
+        assert!(plain.contains("d dismisses"));
+        assert!(screen.contains("? close help"));
+        assert!(!screen.contains("? help"));
+        assert!(!screen.contains("hjkl"));
+    }
+
+    #[test]
+    fn default_tabs_stay_within_viewport_so_tabs_do_not_scroll_away() {
+        let snapshot = sample_snapshot();
+        let rows = 20usize;
+        let screen = build_tui_screen(
+            &snapshot,
+            &TuiState {
+                tab: Tab::Apps,
+                ..TuiState::default()
+            },
+            100,
+            rows,
+        );
+        let rendered_rows = screen.split("\r\n").count();
+        let first_line = screen
+            .strip_prefix("\x1b[H\x1b[J")
+            .unwrap_or(&screen)
+            .split("\r\n")
+            .next()
+            .unwrap_or_default();
+
+        assert!(
+            rendered_rows <= rows,
+            "Apps tab rendered {rendered_rows} rows into a {rows}-row terminal"
+        );
+        assert!(first_line.contains("\x1b[30;46;1m Apps \x1b[0m"));
+        assert!(!first_line.contains("anders"));
+        assert!(!first_line.contains("Home CLI"));
+    }
+
+    #[test]
+    fn every_tui_page_keeps_tabs_inside_viewport() {
+        let snapshot = sample_snapshot();
+        let rows = 20usize;
+        let states = [
+            TuiState {
+                tab: Tab::Home,
+                ..TuiState::default()
+            },
+            TuiState {
+                tab: Tab::Inbox,
+                ..TuiState::default()
+            },
+            TuiState {
+                tab: Tab::People,
+                ..TuiState::default()
+            },
+            TuiState {
+                tab: Tab::Apps,
+                ..TuiState::default()
+            },
+            TuiState {
+                tab: Tab::System,
+                ..TuiState::default()
+            },
+        ];
+
+        for state in states {
+            let screen = build_tui_screen(&snapshot, &state, 100, rows);
+            let rendered_rows = screen.split("\r\n").count();
+            let first_line = screen
+                .strip_prefix("\x1b[H\x1b[J")
+                .unwrap_or(&screen)
+                .split("\r\n")
+                .next()
+                .unwrap_or_default();
+
+            assert!(
+                rendered_rows <= rows,
+                "TUI page {:?} rendered {rendered_rows} rows into a {rows}-row terminal",
+                state.tab
+            );
+            assert!(
+                first_line.contains("Home")
+                    && first_line.contains("Inbox")
+                    && first_line.contains("People")
+                    && first_line.contains("Apps")
+                    && first_line.contains("System")
+                    && !first_line.contains("Spaces"),
+                "TUI page {:?} lost its tab row: {first_line:?}",
+                state.tab
+            );
+        }
+    }
+
+    #[test]
+    fn tui_starts_at_tab_row_without_summary_header() {
+        let snapshot = sample_snapshot();
+        let screen = build_tui_screen(&snapshot, &TuiState::default(), 100, 20);
+        let first_line = screen
+            .strip_prefix("\x1b[H\x1b[J")
+            .unwrap_or(&screen)
+            .split("\r\n")
+            .next()
+            .unwrap_or_default();
+
+        assert!(first_line.contains("\x1b[30;46;1m Home \x1b[0m"));
+        assert!(!first_line.contains("anders"));
+        assert!(!first_line.contains("Home CLI"));
+        assert!(!first_line.contains("identity ready"));
+        assert!(!first_line.contains("bootstrap ready"));
+        assert!(!first_line.contains("site empty"));
+    }
+
+    #[test]
+    fn tui_lines_do_not_trigger_terminal_autowrap() {
+        let snapshot = sample_snapshot();
+        let cols = 100usize;
+        let states = [
+            TuiState {
+                tab: Tab::Home,
+                ..TuiState::default()
+            },
+            TuiState {
+                tab: Tab::Apps,
+                ..TuiState::default()
+            },
+        ];
+
+        for state in states {
+            let screen = build_tui_screen(&snapshot, &state, cols, 24);
+            for line in screen
+                .strip_prefix("\x1b[H\x1b[J")
+                .unwrap_or(&screen)
+                .split("\r\n")
+            {
+                assert!(
+                    visible_text_width(line) < cols,
+                    "TUI page {:?} emitted a full-width line that can trigger xterm autowrap: {:?}",
+                    state.tab,
+                    line
+                );
+            }
+        }
     }
 
     #[test]
@@ -3886,7 +7332,6 @@ mod tests {
                 Some("missing site-provider — run: elastos setup --profile demo".to_string());
         }
 
-        assert_eq!(website_status_label(&snapshot), "site staged");
         assert_eq!(
             website_summary(&snapshot),
             "staged at localhost://MyWebSite"
@@ -3894,7 +7339,7 @@ mod tests {
     }
 
     #[test]
-    fn spaces_show_staged_site_and_next_step_entry() {
+    fn mywebsite_tasks_show_staged_site_and_next_steps() {
         let mut snapshot = sample_snapshot();
         snapshot.site.local_url = None;
         if let Some(action) = snapshot
@@ -3907,19 +7352,12 @@ mod tests {
                 Some("missing site-provider — run: elastos setup --profile demo".to_string());
         }
 
-        let screen = build_tui_screen(
-            &snapshot,
-            &TuiState {
-                tab: Tab::Spaces,
-                ..TuiState::default()
-            },
-            120,
-            32,
-        );
-        assert!(screen.contains("1. MyWebSite [staged]"));
-        assert!(screen.contains("Next       elastos setup --profile demo"));
-        assert!(screen.contains("Enter      show MyWebSite next steps and return home"));
-        assert!(!screen.contains("Preview    press Enter to start the local preview"));
+        let screen = mywebsite_task_lines(&snapshot).join("\n");
+        assert!(screen.contains("Status   staged at localhost://MyWebSite"));
+        assert!(screen.contains("Stage    mywebsite stage <dir>"));
+        assert!(screen.contains("Preview  mywebsite preview (blocked"));
+        assert!(screen.contains("Open     mywebsite open"));
+        assert!(!screen.contains("press Enter"));
     }
 
     #[test]
@@ -3929,8 +7367,12 @@ mod tests {
         assert!(lines.len() <= 10);
         assert!(lines.iter().any(|line| line.starts_with("Updates")));
         assert!(lines.iter().any(|line| line.starts_with("ElastOS")));
+        assert!(lines.iter().any(|line| line.starts_with("Switch")));
         assert!(lines.iter().any(|line| line == "Root       ElastOS"));
         assert!(lines.iter().any(|line| line.starts_with("Next")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("system shell home-gui")));
         assert!(!lines.iter().any(|line| line.starts_with("API")));
     }
 }
