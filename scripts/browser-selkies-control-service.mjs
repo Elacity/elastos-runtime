@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
@@ -22,6 +23,13 @@ const VM_LOG_NAMES = [
   "browser-vm-native-proxy.log",
   "browser-vm-chromium.log",
   "browser-vm-selkies.log",
+  "browser-vm-pipewire.log",
+  "browser-vm-wireplumber.log",
+  "browser-vm-wireplumber-config.log",
+  "browser-vm-pipewire-pulse.log",
+  "browser-vm-pipewire-null-sink.log",
+  "browser-vm-pipewire-summary.log",
+  "browser-vm-pipewire-dump.log",
 ];
 const MAX_WEBSOCKET_FRAME_BYTES = 16 * 1024 * 1024;
 const MAX_BROWSER_FILE_UPLOAD_BYTES = 16 * 1024 * 1024;
@@ -241,6 +249,16 @@ function mediaKindsForSdp(sdp) {
     audio: /(?:^|\r?\n)m=audio\s/.test(text),
     video: /(?:^|\r?\n)m=video\s/.test(text),
   };
+}
+
+function normalizeAudioOfferSdp(sdp) {
+  return String(sdp || "")
+    .split(/\r?\n/)
+    .map((line) => {
+      const match = line.match(/^a=rtpmap:(\d+)\s+opus\/48000$/i);
+      return match ? `a=rtpmap:${match[1]} opus/48000/2` : line;
+    })
+    .join("\r\n");
 }
 
 function publicDisplaySession(displaySession) {
@@ -1470,7 +1488,122 @@ function readTail(path, maxBytes) {
   return buffer.toString("utf8");
 }
 
+function guestAudioEnv() {
+  const runtimeDir = process.env.XDG_RUNTIME_DIR || "/run/elastos/browser-runtime";
+  const pulseRuntimePath = process.env.PULSE_RUNTIME_PATH || `${runtimeDir}/pulse`;
+  return {
+    ...process.env,
+    XDG_RUNTIME_DIR: runtimeDir,
+    PIPEWIRE_RUNTIME_DIR: process.env.PIPEWIRE_RUNTIME_DIR || runtimeDir,
+    PULSE_RUNTIME_PATH: pulseRuntimePath,
+    PULSE_SERVER: process.env.PULSE_SERVER || `unix:${pulseRuntimePath}/native`,
+  };
+}
+
+function runGuestAudioCommand(command, args = [], timeoutMs = 2500) {
+  try {
+    return execFileSync(command, args, {
+      encoding: "utf8",
+      timeout: timeoutMs,
+      maxBuffer: 512 * 1024,
+      env: guestAudioEnv(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    const stdout = error?.stdout ? String(error.stdout) : "";
+    const stderr = error?.stderr ? String(error.stderr) : "";
+    const message = error instanceof Error ? error.message : String(error);
+    return [stdout, stderr, `[${command} failed: ${message}]`].filter(Boolean).join("\n");
+  }
+}
+
+function compactPipewireDump() {
+  const raw = runGuestAudioCommand("pw-dump", [], 3000);
+  let objects = [];
+  try {
+    objects = JSON.parse(raw);
+  } catch {
+    return raw
+      .split(/\r?\n/)
+      .filter((line) => /"(type|id|node\.name|node\.description|media\.class|application\.name|client\.api|object\.path|factory\.name|pulse\.server\.type|audio\.position)"/.test(line))
+      .join("\n");
+  }
+  const interestingKeys = [
+    "node.name",
+    "node.description",
+    "media.class",
+    "application.name",
+    "client.api",
+    "object.path",
+    "factory.name",
+    "pulse.server.type",
+    "audio.position",
+    "node.target",
+    "target.object",
+    "link.output.node",
+    "link.input.node",
+  ];
+  return objects
+    .map((object) => {
+      const props = object?.info?.props || {};
+      const facts = interestingKeys
+        .filter((key) => props[key] !== undefined)
+        .map((key) => `${key}=${JSON.stringify(props[key])}`)
+        .join(" ");
+      if (!facts && !/Client|Node|Link|Metadata|Module|Factory/.test(String(object?.type || ""))) {
+        return "";
+      }
+      return `${object?.id ?? "?"} ${object?.type || "unknown"}${facts ? ` ${facts}` : ""}`;
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function refreshBrowserVmAudioSummary() {
+  const path = `${VM_LOG_DIR}/browser-vm-pipewire-summary.log`;
+  try {
+    const env = guestAudioEnv();
+    const runtimeDir = env.XDG_RUNTIME_DIR;
+    const pulseRuntimePath = env.PULSE_RUNTIME_PATH;
+    const lines = [
+      "=== browser audio environment ===",
+      `XDG_RUNTIME_DIR=${runtimeDir}`,
+      `PIPEWIRE_RUNTIME_DIR=${env.PIPEWIRE_RUNTIME_DIR}`,
+      `PULSE_RUNTIME_PATH=${pulseRuntimePath}`,
+      `PULSE_SERVER=${env.PULSE_SERVER}`,
+      "=== browser audio sockets ===",
+    ];
+    for (const dir of [runtimeDir, pulseRuntimePath].filter(Boolean)) {
+      try {
+        lines.push(`${dir}: ${fs.readdirSync(dir).join(" ")}`);
+      } catch (error) {
+        lines.push(`${dir}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    lines.push("=== pw-cli info 0 ===");
+    lines.push(runGuestAudioCommand("pw-cli", ["info", "0"]));
+    lines.push("=== pw-cli ls Node ===");
+    lines.push(runGuestAudioCommand("pw-cli", ["ls", "Node"]));
+    lines.push("=== pw-cli ls Client ===");
+    lines.push(runGuestAudioCommand("pw-cli", ["ls", "Client"]));
+    lines.push("=== pw-cli ls Port ===");
+    lines.push(runGuestAudioCommand("pw-cli", ["ls", "Port"]));
+    lines.push("=== pw-cli ls Link ===");
+    lines.push(runGuestAudioCommand("pw-cli", ["ls", "Link"]));
+    lines.push("=== pw-link outputs ===");
+    lines.push(runGuestAudioCommand("pw-link", ["-o"]));
+    lines.push("=== pw-link inputs ===");
+    lines.push(runGuestAudioCommand("pw-link", ["-i"]));
+    lines.push("=== pw-link links ===");
+    lines.push(runGuestAudioCommand("pw-link", ["-l"]));
+    lines.push("=== pw-dump compact audio facts ===");
+    lines.push(compactPipewireDump());
+    fs.writeFileSync(path, `${lines.join("\n")}\n`);
+  } catch {}
+}
+
 function readBrowserVmLogTails() {
+  refreshBrowserVmAudioSummary();
   const logs = {};
   for (const name of VM_LOG_NAMES) {
     const path = `${VM_LOG_DIR}/${name}`;
@@ -2025,8 +2158,9 @@ class SelkiesPage {
     return offer;
   }
 
-  supervisorResult(sdp, browserPage, wallet, audioSdp) {
+  supervisorResult(sdp, browserPage, wallet, audioOfferSdp) {
     const displaySize = displaySizeForLaunch(this.launchRequest, this.config);
+    const audioSdp = normalizeAudioOfferSdp(audioOfferSdp);
     const media = mediaKindsForSdp(sdp);
     const audioMedia = mediaKindsForSdp(audioSdp);
     this.webrtcMedia = { audio: audioMedia.audio, video: media.video };
@@ -3208,6 +3342,42 @@ async function collectBrowserDiagnostics(browserPage, timeoutMs) {
           transfer_size: Math.round(entry.transferSize || 0),
           decoded_body_size: Math.round(entry.decodedBodySize || 0),
         });
+      const summarizeMediaElement = (element) => {
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        const buffered = [];
+        try {
+          for (let index = 0; index < element.buffered.length; index += 1) {
+            buffered.push({
+              start: Number(element.buffered.start(index).toFixed(3)),
+              end: Number(element.buffered.end(index).toFixed(3)),
+            });
+          }
+        } catch {}
+        return {
+          tag: String(element.tagName || "").toLowerCase(),
+          src: trim(element.currentSrc || element.src || "", 1000),
+          paused: element.paused === true,
+          muted: element.muted === true,
+          volume: Number(element.volume || 0),
+          current_time: Number((element.currentTime || 0).toFixed(3)),
+          duration: Number.isFinite(element.duration) ? Number(element.duration.toFixed(3)) : null,
+          ready_state: Number(element.readyState || 0),
+          network_state: Number(element.networkState || 0),
+          ended: element.ended === true,
+          autoplay: element.autoplay === true,
+          controls: element.controls === true,
+          plays_inline: element.playsInline === true,
+          visible: rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none",
+          rendered_width: Math.round(rect.width || 0),
+          rendered_height: Math.round(rect.height || 0),
+          error: element.error ? {
+            code: Number(element.error.code || 0),
+            message: trim(element.error.message || "", 500),
+          } : null,
+          buffered,
+        };
+      };
       const allResources = performance.getEntriesByType("resource");
       const resources = allResources
         .slice(-80)
@@ -3241,6 +3411,9 @@ async function collectBrowserDiagnostics(browserPage, timeoutMs) {
             resource_entries,
           };
         });
+      const mediaElements = Array.from(document.querySelectorAll("audio, video"))
+        .slice(-20)
+        .map(summarizeMediaElement);
       let clickables = [];
       try {
         clickables = Array.from(document.querySelectorAll('a[href], button, [role="button"], [role="link"]')).map((element) => {
@@ -3384,6 +3557,8 @@ async function collectBrowserDiagnostics(browserPage, timeoutMs) {
           wallet_bridge: walletDebug,
           storage: storageDebug,
           image_count: document.images ? document.images.length : 0,
+        media_element_count: mediaElements.length,
+        media_elements: mediaElements,
         visible_image_count: images.filter((image) => image.visible).length,
         broken_image_count: images.filter((image) => image.complete && (image.natural_width <= 0 || image.natural_height <= 0)).length,
         pending_image_count: images.filter((image) => !image.complete).length,
@@ -3479,6 +3654,7 @@ async function collectBrowserDiagnostics(browserPage, timeoutMs) {
       direct_network: false,
       file_chooser: summarizeBrowserFileChooser(browserPage),
       cdp_events: diagnosticEvents,
+      vm_log_tails: readBrowserVmLogTails(),
       ...diagnostics,
     };
   });

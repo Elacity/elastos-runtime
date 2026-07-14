@@ -69,8 +69,14 @@ echo 'PipeWire is required for Browser audio'
 echo 'pipewire-pulse is required for Browser audio'
 echo 'WirePlumber is required for Browser audio'
 echo 'pw-cli is required for Browser audio'
+echo configure_browser_wireplumber_headless
+echo browser-vm-wireplumber-config.log
+echo 'alsa_monitor.properties["alsa.reserve"] = false'
+echo 'bluez_monitor.properties["with-logind"] = false'
+echo 'support.logind = disabled'
 echo start_browser_audio_stack
 echo PULSE_SERVER
+echo 'pulsesrc.set_property("device", "auto_null.monitor")'
 echo 'gst-inspect-1.0 pulsesrc'
 echo '--audio_bitrate="$ELASTOS_BROWSER_VM_SELKIES_AUDIO_BITRATE"'
 echo '--audio_channels="$ELASTOS_BROWSER_VM_SELKIES_AUDIO_CHANNELS"'

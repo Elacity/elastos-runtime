@@ -71,14 +71,14 @@ export function bindBrowserInputSurface({
 
   function pasteFromHostClipboard() {
     if (!navigator.clipboard?.readText) {
-      showStatus("Host clipboard read is unavailable.", { sticky: true });
+      showStatus("Clipboard access is unavailable.", { sticky: true });
       return;
     }
     navigator.clipboard
       .readText()
       .then((text) => pasteHostClipboardIntoRemote(text))
       .catch((error) => {
-        showStatus(error.message || "Host clipboard read failed.", {
+        showStatus("Clipboard access is unavailable.", {
           sticky: true,
         });
       });

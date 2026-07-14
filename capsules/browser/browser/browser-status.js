@@ -42,17 +42,23 @@ function browserLaunchFailureSummary(text) {
 export function friendlyOpenError(error) {
   const text = sanitizedErrorText(error);
   if (isAuthoritySessionError(error)) {
-    return "Browser authority expired. Relaunching through Home...";
+    return "Browser session expired. Reopening from Home...";
   }
   const launchFailure = browserLaunchFailureSummary(text);
   if (launchFailure) {
     return launchFailure;
   }
   if (error.status === 403) {
-    return `Blocked by Browser Exit policy: ${text}`;
+    return "This page was blocked by your Exit Node settings.";
   }
   if (error.status === 503) {
-    return `Browser failed closed: ${text}`;
+    return "Browser is temporarily unavailable. Refresh Browser or choose another Browser Engine.";
+  }
+  if (Number(error?.status) >= 400) {
+    return "Browser could not complete the request. Refresh Browser and try again.";
+  }
+  if (/\b(schema|projection|provider|adapter|capability|affordance|runtime-owned|launch token|hostcall|request failed|failed to fetch|unauthorized|forbidden|[45]\d\d)\b|engine_[a-z_]+/i.test(text)) {
+    return "Browser could not complete the request. Refresh Browser and try again.";
   }
   return text;
 }
@@ -71,7 +77,12 @@ export async function collectWebrtcStats(peerConnection) {
     const isInboundAudio =
       item.type === "inbound-rtp" &&
       !isInboundVideo &&
-      (mediaKind === "audio" || "audioLevel" in item || "totalAudioEnergy" in item);
+      (
+        mediaKind === "audio" ||
+        "audioLevel" in item ||
+        "totalAudioEnergy" in item ||
+        "bytesReceived" in item
+      );
     if (isInboundVideo) {
       stats.video_frames_decoded = Number(item.framesDecoded || 0);
       stats.video_frames_dropped = Number(item.framesDropped || 0);

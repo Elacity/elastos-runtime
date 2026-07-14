@@ -462,10 +462,13 @@ elif "Selkies 1.6.1 audio RTP header extensions are fragile" not in text:
     raise SystemExit("Selkies audio RTP extension patch target not found")
 pulsesrc_named = '        pulsesrc = Gst.ElementFactory.make("pulsesrc", "pulsesrc")\n'
 pulsesrc_unnamed = '        pulsesrc = Gst.ElementFactory.make("pulsesrc")\n'
+pulsesrc_device = '        pulsesrc.set_property("device", "auto_null.monitor")\n'
 if pulsesrc_named in text:
     text = text.replace(pulsesrc_named, pulsesrc_unnamed, 1)
 elif pulsesrc_unnamed not in text:
     raise SystemExit("Selkies pulsesrc patch target not found")
+text = re.sub(r'^[ \t]*pulsesrc\.set_property\("device", .*\)\n', '', text, flags=re.MULTILINE)
+text = text.replace(pulsesrc_unnamed, pulsesrc_unnamed + pulsesrc_device, 1)
 opusenc_named = '        opusenc = Gst.ElementFactory.make("opusenc", "opusenc")\n'
 opusenc_unnamed = '        opusenc = Gst.ElementFactory.make("opusenc")\n'
 if opusenc_named in text:

@@ -17,6 +17,7 @@ Configure tool paths with:
   ELASTOS_DEBUGFS_BIN
   ELASTOS_BROWSER_NATIVE_PROXY_BIN
   ELASTOS_BROWSER_VM_ARTIFACT_DATA_DIR
+  ELASTOS_BROWSER_VM_BACKUP_RETENTION (default: 2, range: 1..10)
 
 To target a non-default runtime root, set HOME or XDG_DATA_HOME before running.
 ELASTOS_DATA_DIR is intentionally not accepted as a gateway data-root override.
@@ -267,6 +268,62 @@ clone_or_copy_file() {
     cp -c "$source" "$dest" 2>/dev/null ||
         cp --reflink=auto -p "$source" "$dest" 2>/dev/null ||
         cp -p "$source" "$dest"
+    touch "$dest"
+}
+
+browser_vm_backup_retention() {
+    local retention="${ELASTOS_BROWSER_VM_BACKUP_RETENTION:-2}"
+    if [[ ! "$retention" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ELASTOS_BROWSER_VM_BACKUP_RETENTION must be from 1 to 10" >&2
+        exit 2
+    fi
+    retention=$((10#$retention))
+    if (( retention > 10 )); then
+        echo "ELASTOS_BROWSER_VM_BACKUP_RETENTION must be from 1 to 10" >&2
+        exit 2
+    fi
+    printf '%s\n' "$retention"
+}
+
+file_mtime() {
+    case "$(uname -s)" in
+        Darwin) stat -f '%m' "$1" ;;
+        Linux) stat -c '%Y' "$1" ;;
+        *) return 1 ;;
+    esac
+}
+
+prune_file_backups() {
+    local source="$1"
+    local keep="$2"
+    local candidate
+    local oldest_index
+    local oldest_mtime
+    local candidate_mtime
+    local index
+    local backups=()
+
+    for candidate in "${source}".before-*; do
+        if [[ -f "$candidate" && ! -L "$candidate" ]]; then
+            backups+=("$candidate")
+        fi
+    done
+    while (( ${#backups[@]} > keep )); do
+        oldest_index=0
+        oldest_mtime="$(file_mtime "${backups[0]}")"
+        for (( index = 1; index < ${#backups[@]}; index += 1 )); do
+            candidate_mtime="$(file_mtime "${backups[$index]}")"
+            if (( candidate_mtime < oldest_mtime )); then
+                oldest_index="$index"
+                oldest_mtime="$candidate_mtime"
+            fi
+        done
+        candidate="${backups[$oldest_index]}"
+        rm -f -- "$candidate"
+        echo "[setup-source-home] pruned stale Browser VM backup: ${candidate}"
+        unset "backups[$oldest_index]"
+        backups=("${backups[@]}")
+    done
 }
 
 DEFAULT_DATA_DIR="$(default_data_dir)"
@@ -280,6 +337,7 @@ DATA_DIR="${DEFAULT_DATA_DIR}"
 PLATFORM="$(detect_platform)"
 CARGO_BIN="$(find_cargo)"
 NODE_BIN="$(find_node)"
+BROWSER_VM_ROOTFS_BACKUP=""
 configure_rust_toolchain_env "$CARGO_BIN"
 export PATH="$(dirname "$CARGO_BIN"):$(dirname "$NODE_BIN"):${PATH}"
 
@@ -424,8 +482,10 @@ refresh_browser_vm_rootfs_file() {
         return
     fi
 
-    local backup="${rootfs}.before-${label}-$(date -u +%Y%m%dT%H%M%SZ)"
-    clone_or_copy_file "$rootfs" "$backup"
+    if [[ -z "$BROWSER_VM_ROOTFS_BACKUP" ]]; then
+        BROWSER_VM_ROOTFS_BACKUP="${rootfs}.before-${label}-$(date -u +%Y%m%dT%H%M%SZ)"
+        clone_or_copy_file "$rootfs" "$BROWSER_VM_ROOTFS_BACKUP"
+    fi
 
     cat > "$commands_file" <<EOF
 rm ${guest_path}
@@ -435,7 +495,7 @@ EOF
     "$debugfs" -w -f "$commands_file" "$rootfs" >/dev/null
     "$debugfs" -R "cat ${guest_path}" "$rootfs" > "$updated_copy" 2>/dev/null
     if ! cmp -s "$source" "$updated_copy"; then
-        echo "Browser VM rootfs ${label} refresh did not verify; backup kept at ${backup}" >&2
+        echo "Browser VM rootfs ${label} refresh did not verify; backup kept at ${BROWSER_VM_ROOTFS_BACKUP}" >&2
         exit 1
     fi
     rm -f "$current_copy" "$staged_source" "$updated_copy" "$commands_file"
@@ -593,10 +653,13 @@ elif "Selkies 1.6.1 audio RTP header extensions are fragile" not in text:
     raise SystemExit("Selkies audio RTP extension patch target not found")
 pulsesrc_named = '        pulsesrc = Gst.ElementFactory.make("pulsesrc", "pulsesrc")\n'
 pulsesrc_unnamed = '        pulsesrc = Gst.ElementFactory.make("pulsesrc")\n'
+pulsesrc_device = '        pulsesrc.set_property("device", "auto_null.monitor")\n'
 if pulsesrc_named in text:
     text = text.replace(pulsesrc_named, pulsesrc_unnamed, 1)
 elif pulsesrc_unnamed not in text:
     raise SystemExit("Selkies pulsesrc patch target not found")
+text = re.sub(r'^[ \t]*pulsesrc\.set_property\("device", .*\)\n', '', text, flags=re.MULTILINE)
+text = text.replace(pulsesrc_unnamed, pulsesrc_unnamed + pulsesrc_device, 1)
 opusenc_named = '        opusenc = Gst.ElementFactory.make("opusenc", "opusenc")\n'
 opusenc_unnamed = '        opusenc = Gst.ElementFactory.make("opusenc")\n'
 if opusenc_named in text:
@@ -771,6 +834,7 @@ refresh_browser_vm_rootfs_files() {
             "native-proxy" "$debugfs"
     fi
     rm -f "$init_source" "$selkies_start_source" "$selkies_app_source" "$manifest_source"
+    prune_file_backups "$rootfs" "$(browser_vm_backup_retention)"
 }
 
 resolve_existing_symlink_target() {
@@ -831,6 +895,7 @@ refresh_browser_vm_initrd_path() {
         exit 1
     fi
     rm -rf "$work_dir" "$verify_dir"
+    prune_file_backups "$initrd" "$(browser_vm_backup_retention)"
     if [[ "$requested_initrd" != "$initrd" ]]; then
         echo "[setup-source-home] refreshed Browser VM initrd control service: ${requested_initrd} -> ${initrd}"
     else

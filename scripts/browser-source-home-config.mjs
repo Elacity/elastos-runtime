@@ -41,6 +41,8 @@ const VM_IDLE_KEEPALIVE_MS = "300000";
 const VM_LINUX_IDLE_KEEPALIVE_MS = "0";
 const VM_REUSE_IDLE_VMS = "1";
 const VM_LINUX_REUSE_IDLE_VMS = "0";
+const VM_HIBERNATION_MAX_ENTRIES = "4";
+const VM_HIBERNATION_MAX_AGE_SECS = "604800";
 
 function usage() {
   return `Usage:
@@ -445,6 +447,8 @@ function vmBrowserEngineAdapter(args, sourceEnv = process.env) {
       : VM_REUSE_IDLE_VMS,
     ELASTOS_BROWSER_VM_HIBERNATION: args.platform === "darwin-arm64" ? "1" : "0",
     ELASTOS_BROWSER_VM_HIBERNATION_DIR: path.join(args.dataDir, "browser-vm/hibernation"),
+    ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES: VM_HIBERNATION_MAX_ENTRIES,
+    ELASTOS_BROWSER_VM_HIBERNATION_MAX_AGE_SECS: VM_HIBERNATION_MAX_AGE_SECS,
     ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE: "1",
   };
   if (!remoteVzControlLauncher) {

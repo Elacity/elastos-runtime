@@ -741,6 +741,18 @@ async fn cleanup_stale_browser_pages(state: &GatewayState) {
     for page in take_stale_browser_pages(&state.data_dir).await {
         close_browser_page_record(state, page, "stale_browser_session_janitor").await;
     }
+    if !browser_scope_has_live_sessions(&state.data_dir).await {
+        match prune_orphan_browser_runtime_stream_sockets() {
+            Ok(0) => {}
+            Ok(removed) => {
+                tracing::info!(removed, "Browser pruned stale runtime stream socket files")
+            }
+            Err(err) => tracing::warn!(
+                error = %err,
+                "Browser stale runtime stream socket prune failed"
+            ),
+        }
+    }
 }
 
 async fn retry_pending_browser_stream_cleanups(state: &GatewayState) {

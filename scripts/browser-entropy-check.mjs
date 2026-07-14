@@ -53,6 +53,7 @@ function assertNoForbidden(source, label, forbidden) {
 }
 
 const browserManifest = read("capsules/browser/capsule.json");
+const browserCapsuleManifest = JSON.parse(browserManifest);
 const browser = read("capsules/browser/browser/index.html");
 const browserJs = readAll([
   "capsules/browser/browser/browser.js",
@@ -275,11 +276,27 @@ const browserProfileResetIndex = browser.indexOf('id="browser-profile-reset"');
 
 assert(
   browserManifest.includes('"name": "browser"') &&
-    browserManifest.includes('"elastos://wallet/*"') &&
-    browserManifest.includes('"elastos://net/stream"') &&
+    browserCapsuleManifest.runtime_abi === "elastos.runtime-projection/v1" &&
+    browserCapsuleManifest.bus_contract === "elastos.runtime-projection/v1" &&
+    browserCapsuleManifest.execution === "web-projection" &&
+    browserCapsuleManifest.entrypoint === "browser/index.html" &&
+    !Object.hasOwn(browserCapsuleManifest, "wit_world_sha256") &&
+    browserCapsuleManifest.capabilities.includes("elastos://browser/page") &&
+    browserCapsuleManifest.capabilities.includes("elastos://browser/display") &&
+    browserCapsuleManifest.capabilities.includes("elastos://browser/exit") &&
+    browserCapsuleManifest.capabilities.includes("elastos://browser/profile") &&
+    browserCapsuleManifest.capabilities.includes("elastos://browser/wallet-bridge") &&
+    browserCapsuleManifest.requires.some((req) => req.name === "browser-engine-adapter") &&
+    browserCapsuleManifest.requires.some((req) => req.name === "exit-provider") &&
+    browserCapsuleManifest.requires.some((req) => req.name === "net-provider") &&
+    browserCapsuleManifest.requires.some((req) => req.name === "wallet-provider") &&
+    !browserManifest.includes('"elastos://wallet/*"') &&
+    !browserManifest.includes('"elastos://net/stream"') &&
+    !browserManifest.includes('"elastos://exit/*"') &&
+    !browserManifest.includes('"elastos://browser-engine/*"') &&
     !browserManifest.includes("guest_network") &&
     !browserManifest.includes('"provides"'),
-  "Browser capsule manifest must declare wallet/net intent without provider or guest-network authority",
+  "Browser capsule manifest must declare a Browser-scoped Runtime projection without raw Browser Engine, Exit, Net, Wallet, or guest-network authority",
 );
 
 assert(
@@ -342,8 +359,8 @@ assert(
     browserInputSurface.includes('target.closest?.("#browser-settings-panel")') &&
     browserInputSurface.includes('target.id === "browser-exit"') &&
     browserJs.includes("elastos.browser.open-result/v1") &&
-    browserJs.includes("Browser failed closed") &&
-    browserJs.includes("Blocked by Browser Exit policy") &&
+    browserJs.includes("Browser is temporarily unavailable") &&
+    browserJs.includes("blocked by your Exit Node settings") &&
     browserJs.includes("historyEntries"),
   "Browser UI must use the high-level Browser open route and fail closed instead of direct provider routes",
 );
@@ -1284,8 +1301,15 @@ assert(
     browserVmTargetStage.includes("pipewire-pulse is required for Browser audio") &&
     browserVmTargetStage.includes("WirePlumber is required for Browser audio") &&
     browserVmTargetStage.includes("pw-cli is required for Browser audio") &&
+    browserVmTargetStage.includes("configure_browser_wireplumber_headless") &&
+    browserVmTargetStage.includes("browser-vm-wireplumber-config.log") &&
+    browserVmTargetStage.includes('alsa_monitor.properties["alsa.reserve"] = false') &&
+    browserVmTargetStage.includes('bluez_monitor.properties["with-logind"] = false') &&
+    browserVmTargetStage.includes("support.logind = disabled") &&
+    browserVmTargetStage.includes('pulsesrc.set_property("device", "auto_null.monitor")') &&
     !browserVmTargetStage.includes("audio unavailable; continuing with video-only display") &&
     browserVmRootfsBuild.includes("pipewire-pulse") &&
+    browserVmRootfsBuild.includes('pulsesrc.set_property("device", "auto_null.monitor")') &&
     browserVmRootfsBuild.includes("gst-inspect-1.0 pulsesrc") &&
     browserVmRootfsBuild.includes("forcing audio SDP offer for split product audio peer") &&
     !browserVmTargetStage.includes("console_device") &&
@@ -1540,7 +1564,8 @@ assert(
     browserJs.includes("navigator.clipboard.writeText(message)") &&
     browserStyle.includes('.browser-status[data-visible="true"][data-copyable="true"]') &&
     browserStyle.includes(".browser-status-copy") &&
-    browser.includes("browser-20260629b"),
+    browser.includes("browser.js?v=browser-20260711c") &&
+    !browser.includes("browser.js?v=browser-20260629b"),
   "Browser sticky status/errors must be copyable so live product failures can produce actionable evidence",
 );
 
@@ -1571,8 +1596,10 @@ assert(
 );
 
 assert(
-  browserJs.includes("browser-status.js?v=browser-20260626e") &&
-    browserRemoteDisplay.includes("browser-status.js?v=browser-20260626e") &&
+  browserJs.includes("browser-status.js?v=browser-20260711c") &&
+    browserRemoteDisplay.includes("browser-status.js?v=browser-20260711c") &&
+    !browserJs.includes("browser-status.js?v=browser-20260626e") &&
+    !browserRemoteDisplay.includes("browser-status.js?v=browser-20260626e") &&
     !browserJs.includes("browser-status.js?v=browser-20260616c") &&
     !browserRemoteDisplay.includes("browser-status.js?v=browser-20260616c") &&
     !browserRemoteDisplay.includes("browser-status.js?v=browser-20260616a") &&
@@ -1583,7 +1610,8 @@ assert(
 );
 
 assert(
-  browserJs.includes("browser-remote-display.js?v=browser-20260629a") &&
+  browserJs.includes("browser-remote-display.js?v=browser-20260711h") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260629a") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260627a") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260618b") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260616e") &&
@@ -1640,7 +1668,7 @@ assert(
 );
 
 assert(
-    browserJs.includes("browser-input-surface.js?v=browser-20260620d") &&
+    browserJs.includes("browser-input-surface.js?v=browser-20260711c") &&
     browserInputSurface.includes('renderPanel.addEventListener("click"') &&
     !browserJs.includes('renderImage.addEventListener("click"') &&
     browserInputSurface.includes('remoteVideo.addEventListener("click"') &&
@@ -1677,6 +1705,7 @@ assert(
     browserSelkiesControlService.includes("function mediaKindsForSdp") &&
     !browserSelkiesControlService.includes("isSelkiesAudioUnavailable") &&
     !browserSelkiesControlService.includes("audio_offer_unavailable") &&
+    browserSelkiesControlService.includes("const audioSdp = normalizeAudioOfferSdp(audioOfferSdp)") &&
     browserSelkiesControlService.includes("const audioMedia = mediaKindsForSdp(audioSdp)") &&
     browserSelkiesControlService.includes("this.webrtcMedia = { audio: audioMedia.audio, video: media.video }") &&
     browserSelkiesControlService.includes("audio: audioMedia.audio") &&

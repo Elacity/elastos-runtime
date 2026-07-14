@@ -329,6 +329,12 @@ if (macAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_REUSE_IDLE_VMS !== "1") {
 if (!macAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_HIBERNATION_DIR?.endsWith("/mac-vm-data/browser-vm/hibernation")) {
   throw new Error("Mac source-home Browser config must keep VZ hibernation state under Runtime data");
 }
+if (macAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES !== "4") {
+  throw new Error("Mac source-home Browser config must bound retained VZ hibernation states");
+}
+if (macAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_HIBERNATION_MAX_AGE_SECS !== "604800") {
+  throw new Error("Mac source-home Browser config must expire stale VZ hibernation states");
+}
 if (macAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_CONTROL_LAUNCHER !== macVmAdapterPath.replace(/\/mac-vm-config\/browser-engine-adapter\.json$/, "/browser-vm-remote-vz-launcher")) {
   throw new Error("Mac source-home Browser config must pass the VZ control launcher through the VM supervisor");
 }

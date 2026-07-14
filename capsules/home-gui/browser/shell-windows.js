@@ -55,7 +55,6 @@ const WINDOW_CLOSE_GUARD_MOVE_PX = 18;
 const BROWSER_DESKTOP_OPEN_GUARD_MS = 700;
 const MAX_SESSION_WINDOWS = 24;
 const SINGLE_SESSION_TARGETS = new Set([PEOPLE_TARGET_ID, "inbox", "wallet"]);
-const TEMPORARY_BROWSER_CHILD_FRAME_RELEASE_HOOK = "__elastosBrowserReleaseRuntimePage";
 const COMMON_IFRAME_SANDBOX = [
   "allow-downloads",
   "allow-forms",
@@ -485,7 +484,6 @@ function removeWindowEntries(entries) {
     (entry) => shellState.activeWindowId === entry.id,
   );
   for (const entry of entries) {
-    releaseFrameRuntimePage(entry.node);
     cleanupFrameAutoFit(entry.node);
     cleanupPeopleDiscoveryAutoRefresh(entry.node);
     shellState.windows.delete(entry.id);
@@ -1610,22 +1608,6 @@ function cleanupFrameAutoFit(node) {
   shellState.frameAutoFitCleanup.delete(node);
 }
 
-function releaseFrameRuntimePage(node) {
-  const frame = node.querySelector(".window-frame");
-  if (!frame) {
-    return;
-  }
-  try {
-    // Temporary same-origin bridge until Browser publishes a typed host release intent.
-    const release = frame.contentWindow?.[TEMPORARY_BROWSER_CHILD_FRAME_RELEASE_HOOK];
-    if (typeof release === "function") {
-      release();
-    }
-  } catch (_error) {
-    // Cross-origin or failed frames cannot expose the Browser cleanup hook.
-  }
-}
-
 function hideWindow(id) {
   const entry = shellState.windows.get(id);
   if (!entry) {
@@ -1876,7 +1858,6 @@ export function cleanupBeforeUnload() {
     window.clearInterval(shellState.clockTimer);
   }
   for (const entry of shellState.windows.values()) {
-    releaseFrameRuntimePage(entry.node);
     cleanupFrameAutoFit(entry.node);
     cleanupPeopleDiscoveryAutoRefresh(entry.node);
   }

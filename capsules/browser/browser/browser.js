@@ -12,20 +12,20 @@ import {
   sameBrowserStreamTarget,
   visibleAddressForUrl,
 } from "./browser-runtime-api.js?v=browser-20260627b";
-import { createBrowserClipboardBridge } from "./browser-clipboard.js?v=browser-20260524d";
+import { createBrowserClipboardBridge } from "./browser-clipboard.js?v=browser-20260711c";
 import {
   selkiesMessagesForInput,
   utf8FromBase64,
 } from "./browser-input.js?v=browser-20260520e";
-import { bindBrowserInputSurface } from "./browser-input-surface.js?v=browser-20260620d";
+import { bindBrowserInputSurface } from "./browser-input-surface.js?v=browser-20260711c";
 import {
   browserMetricsText,
   friendlyOpenError,
   isAuthoritySessionError,
   isMissingRuntimePageError,
   requestedDisplayMode,
-} from "./browser-status.js?v=browser-20260626e";
-import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260629a";
+} from "./browser-status.js?v=browser-20260711c";
+import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260711h";
 
 const STATUS_TTL_MS = 4200;
 const PAGE_STATUS_INTERVAL_MS = 2_500;
@@ -179,7 +179,7 @@ function requestHomeRelaunch(reason) {
     return false;
   }
   relaunchRequested = true;
-  showStatus(reason || "Browser authority expired. Relaunching through Home...", {
+  showStatus(reason || "Browser session expired. Reopening from Home...", {
     sticky: true,
   });
   window.parent.postMessage(
@@ -368,12 +368,44 @@ function updateMetricsNode(status) {
   if (!metricsNode) {
     return;
   }
+  const remoteMetrics = remoteDisplay?.metricsState() || {};
+  window.__elastosBrowserRemoteDisplayMetrics = {
+    current_page_id: currentPage?.page_id || "",
+    display_mode: currentDisplayMode || "",
+    display_input: currentDisplayInput || "",
+    status_audio: status?.audio ?? null,
+    status_video: status?.video ?? null,
+    status_webrtc_connection_state: status?.webrtc_connection_state || "",
+    status_ice_connection_state: status?.ice_connection_state || "",
+    latestWebrtcStats: remoteMetrics.latestWebrtcStats || null,
+    latestVideoWebrtcStats: remoteMetrics.latestVideoWebrtcStats || null,
+    latestAudioWebrtcStats: remoteMetrics.latestAudioWebrtcStats || null,
+    remoteAudioExpected: remoteMetrics.remoteAudioExpected === true,
+    remoteAudioUnlocked: remoteMetrics.remoteAudioUnlocked === true,
+    remoteAudioMuted: remoteMetrics.remoteAudioMuted === true,
+    remoteAudioPaused: remoteMetrics.remoteAudioPaused === true,
+    remoteAudioTrackCount: Number(remoteMetrics.remoteAudioTrackCount || 0),
+    remoteAudioConnectionState: remoteMetrics.remoteAudioConnectionState || "",
+    remoteAudioIceConnectionState: remoteMetrics.remoteAudioIceConnectionState || "",
+    remoteAudioSignalingState: remoteMetrics.remoteAudioSignalingState || "",
+    remoteAudioIceGatheringState: remoteMetrics.remoteAudioIceGatheringState || "",
+    audioBrowserCandidateCount: Number(remoteMetrics.audioBrowserCandidateCount || 0),
+    audioEngineCandidateCount: Number(remoteMetrics.audioEngineCandidateCount || 0),
+    audioRawCandidateEventCount: Number(remoteMetrics.audioRawCandidateEventCount || 0),
+    audioNullCandidateEventCount: Number(remoteMetrics.audioNullCandidateEventCount || 0),
+    lastAudioBrowserCandidateSummary: remoteMetrics.lastAudioBrowserCandidateSummary || "",
+    lastAudioEngineCandidateSummary: remoteMetrics.lastAudioEngineCandidateSummary || "",
+    audioOfferSummary: remoteMetrics.audioOfferSummary || null,
+    audioAnswerSummary: remoteMetrics.audioAnswerSummary || null,
+    remoteVideoMuted: remoteMetrics.remoteVideoMuted === true,
+    remoteVideoPaused: remoteMetrics.remoteVideoPaused === true,
+  };
   if (!debugMetrics || !status) {
     metricsNode.hidden = true;
     return;
   }
   metricsNode.textContent = browserMetricsText(status, {
-    ...(remoteDisplay?.metricsState() || {}),
+    ...remoteMetrics,
     remoteVideo,
   });
   metricsNode.hidden = false;
@@ -393,11 +425,11 @@ async function fetchPageStatus({
     { method: "GET" },
   );
   if (status?.schema !== "elastos.browser.page-status/v1") {
-    throw new Error("Browser Engine Adapter returned an invalid page status.");
+    throw new Error("Browser could not read the page status.");
   }
   if (status.direct_network !== false) {
     throw new Error(
-      "Browser Engine Adapter reported direct network authority.",
+      "Browser reported an unsafe network setup.",
     );
   }
   lastPageStatus = status;
@@ -772,7 +804,7 @@ async function sendBrowserInput(
       focusRemoteInput();
     }
     if (response?.accepted !== true && !response?.actual_url && !response?.file_chooser) {
-      throw new Error("Browser Engine Adapter did not accept input.");
+      throw new Error("Browser could not send that input.");
     }
   }
 }
@@ -1136,7 +1168,7 @@ async function waitForRuntimeOpen(response, { engineLabel, exitLabel }) {
     await wait(BROWSER_OPEN_POLL_INTERVAL_MS);
     const status = await fetchJson(response.status_url, { method: "GET" });
     if (status?.schema !== "elastos.browser.open-status/v1") {
-      throw new Error("Browser Engine returned an invalid startup status.");
+      throw new Error("Browser did not finish starting.");
     }
     if (status.status === "completed") {
       return status.result;
@@ -1223,7 +1255,7 @@ async function requestRuntimeOpen(value, { history = "push", reconnect = false }
       response?.schema !== "elastos.browser.open-result/v1" ||
       page?.schema !== "elastos.browser.engine.page/v1"
     ) {
-      throw new Error("Browser Engine Adapter returned an invalid page.");
+      throw new Error("Browser did not open the page.");
     }
     if (remoteExitId && response?.stream_session?.backend !== remoteExitId) {
       throw new Error("Browser could not use the selected Exit Node.");
@@ -1508,7 +1540,6 @@ window.addEventListener("beforeunload", () => {
 });
 
 window.addEventListener("pagehide", releaseRuntimePageForUnload);
-window.__elastosBrowserReleaseRuntimePage = releaseRuntimePageForUnload;
 
 const initialUrl = params.get("url") || DEFAULT_URL;
 addressInput.value = initialUrl;

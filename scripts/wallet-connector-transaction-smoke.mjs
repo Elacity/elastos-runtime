@@ -209,7 +209,10 @@ async function runConnectorSmoke({ connectorId, scriptPath, installProvider }) {
   `)}`;
 
   globalThis.document = document;
-  globalThis.navigator = { clipboard: { async writeText() {} } };
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { clipboard: { async writeText() {} } },
+  });
   globalThis.Event = class Event {
     constructor(type) {
       this.type = type;

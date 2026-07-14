@@ -47,6 +47,10 @@ const EXPECT_BROWSER_CAPACITY_REJECTION =
 const BROWSER_OPEN_DISPLAY_MODE = parseBrowserDisplayMode(
   process.env.HOME_VIRTUAL_AUTH_BROWSER_OPEN_DISPLAY_MODE || "webrtc_remote_display",
 );
+const BROWSER_REMOTE_EXIT_ID = parseOptionalSafeRuntimeId(
+  process.env.HOME_VIRTUAL_AUTH_BROWSER_REMOTE_EXIT_ID || "",
+  "HOME_VIRTUAL_AUTH_BROWSER_REMOTE_EXIT_ID",
+);
 const BROWSER_OPEN_GUARANTEE_LEVEL =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_OPEN_GUARANTEE_LEVEL || "";
 const CHECK_BROWSER_FRAME = process.env.HOME_VIRTUAL_AUTH_BROWSER_FRAME !== "0";
@@ -109,6 +113,14 @@ const BROWSER_REMOTE_VIDEO_TIMEOUT_MS = parseBoundedIntegerEnv(
   180_000,
   1_000,
   300_000,
+);
+const CHECK_BROWSER_AUDIO_STATS =
+  process.env.HOME_VIRTUAL_AUTH_BROWSER_AUDIO_STATS === "1";
+const BROWSER_REMOTE_AUDIO_TIMEOUT_MS = parseBoundedIntegerEnv(
+  "HOME_VIRTUAL_AUTH_BROWSER_REMOTE_AUDIO_TIMEOUT_MS",
+  45_000,
+  1_000,
+  180_000,
 );
 const BROWSER_UI_CLICK_EXPECT_URL_RE =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_UI_CLICK_EXPECT_URL_RE || "";
@@ -252,6 +264,17 @@ function parseOptionalBrowserUrl(raw, name) {
     throw new Error(`${name} must be an http(s) URL`);
   }
   return parsed.toString();
+}
+
+function parseOptionalSafeRuntimeId(raw, name) {
+  const value = String(raw || "").trim();
+  if (!value) {
+    return "";
+  }
+  if (value.length > 128 || !/^[A-Za-z0-9:_-]+$/.test(value)) {
+    throw new Error(`${name} must be a safe Runtime identifier up to 128 bytes`);
+  }
+  return value;
 }
 
 function redactSensitiveString(value) {
@@ -476,6 +499,7 @@ function publicBrowserStreamSession(session) {
     stream_id: session.stream_id || null,
     target: session.target || null,
     carrier_service: session.carrier_service || carrier.carrier_service || null,
+    backend: session.backend || null,
     carrier_schema: carrier.schema || null,
     carrier_peer_did: carrier.peer_did || null,
     carrier_connect_ticket_exposed: carrier.connect_ticket != null,
@@ -656,6 +680,54 @@ async function browserApi(page, token, path, { method = "GET", body = null } = {
   }, { token, path, method, body });
 }
 
+async function waitForBrowserOpenResult(page, browserToken, initialResult, timeoutMs) {
+  if (initialResult?.body?.schema === "elastos.browser.open-result/v1") {
+    return initialResult;
+  }
+  const statusUrl = initialResult?.body?.status_url || "";
+  if (
+    !initialResult?.ok ||
+    initialResult?.body?.schema !== "elastos.browser.open-accepted/v1" ||
+    typeof statusUrl !== "string" ||
+    !statusUrl
+  ) {
+    return initialResult;
+  }
+  const started = Date.now();
+  let last = initialResult;
+  while (Date.now() - started <= timeoutMs) {
+    await delay(500);
+    const status = await browserApi(page, browserToken, statusUrl);
+    last = status;
+    if (status.body?.schema !== "elastos.browser.open-status/v1") {
+      return status;
+    }
+    if (status.body.status === "completed") {
+      return {
+        ok: true,
+        status: 200,
+        body: status.body.result || {},
+      };
+    }
+    if (status.body.status === "failed") {
+      return {
+        ok: false,
+        status: status.body.error?.http_status || 500,
+        body: status.body.error || status.body,
+      };
+    }
+  }
+  return {
+    ok: false,
+    status: 408,
+    body: {
+      schema: "elastos.browser.open-timeout/v1",
+      status_url: statusUrl,
+      last,
+    },
+  };
+}
+
 async function waitForBrowserStatus(page, browserToken, pageId) {
   let lastStatus = null;
   for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -816,7 +888,14 @@ async function checkBrowserPageDiagnostics(page, browserToken, pageId) {
     cdp_events: Array.isArray(diagnostics.body.cdp_events)
       ? diagnostics.body.cdp_events.slice(0, 40)
       : [],
+    vm_log_tails: diagnostics.body.vm_log_tails || null,
+    wallet_bridge: diagnostics.body.wallet_bridge || null,
+    storage: diagnostics.body.storage || null,
     image_count: diagnostics.body.image_count,
+    media_element_count: diagnostics.body.media_element_count,
+    media_elements: Array.isArray(diagnostics.body.media_elements)
+      ? diagnostics.body.media_elements.slice(0, 20)
+      : [],
     visible_image_count: diagnostics.body.visible_image_count,
     broken_image_count: diagnostics.body.broken_image_count,
     pending_image_count: diagnostics.body.pending_image_count,
@@ -910,11 +989,28 @@ function summarizeDiagnosticClickTarget(element) {
   };
 }
 
+function diagnosticTargetIsInViewport(diagnostics, element) {
+  const rect = element?.rect || {};
+  const width = Number(rect.width || 0);
+  const height = Number(rect.height || 0);
+  const x = Number(rect.x || 0);
+  const y = Number(rect.y || 0);
+  const centerX = x + width / 2;
+  const centerY = y + height / 2;
+  const viewportWidth = Number(diagnostics?.viewport_width || 0);
+  const viewportHeight = Number(diagnostics?.viewport_height || 0);
+  return element?.visible !== false &&
+    width > 0 &&
+    height > 0 &&
+    centerX >= 0 &&
+    centerY >= 0 &&
+    (!viewportWidth || centerX <= viewportWidth) &&
+    (!viewportHeight || centerY <= viewportHeight);
+}
+
 function findBrowserHrefClickTarget(diagnostics, pattern) {
   return (diagnostics?.clickable_elements || []).find((element) =>
-    element?.visible !== false &&
-      Number(element?.rect?.width || 0) > 0 &&
-      Number(element?.rect?.height || 0) > 0 &&
+    diagnosticTargetIsInViewport(diagnostics, element) &&
       pattern.test(String(element.href || "")) &&
       pattern.test(String(element.top_element?.action_href || element.href || "")),
   );
@@ -960,9 +1056,7 @@ async function runBrowserDiagnosticClickSequence(page, browserToken, pageId, ini
   let diagnostics = initialDiagnostics;
   for (const pattern of patterns) {
     const target = (diagnostics.clickable_elements || []).find((element) =>
-      element?.visible !== false &&
-        Number(element?.rect?.width || 0) > 0 &&
-        Number(element?.rect?.height || 0) > 0 &&
+      diagnosticTargetIsInViewport(diagnostics, element) &&
         pattern.regex.test(diagnosticElementText(element)),
     );
     if (!target && BROWSER_DIAGNOSTIC_CLICK_OPTIONAL) {
@@ -1059,6 +1153,61 @@ async function browserRemoteVideoMetrics(appPage) {
       client_width: Math.round(rect.width || 0),
       client_height: Math.round(rect.height || 0),
     };
+  });
+}
+
+async function browserRemoteDisplayMetrics(appPage) {
+  return appPage.evaluate(() => window.__elastosBrowserRemoteDisplayMetrics || null);
+}
+
+function browserAudioBytes(metrics) {
+  return Number(
+    metrics?.latestAudioWebrtcStats?.audio_bytes_received ??
+      metrics?.latestWebrtcStats?.audio_bytes_received ??
+      0,
+  );
+}
+
+async function waitForBrowserRemoteAudio(
+  appPage,
+  { timeoutMs = BROWSER_REMOTE_AUDIO_TIMEOUT_MS, browserToken = "", pageId = "" } = {},
+) {
+  const started = Date.now();
+  let last = null;
+  while (Date.now() - started <= timeoutMs) {
+    last = await browserRemoteDisplayMetrics(appPage).catch(() => null);
+    const audioBytes = browserAudioBytes(last);
+    if (
+      last?.remoteAudioExpected === true &&
+      last?.remoteAudioUnlocked === true &&
+      Number(last?.remoteAudioTrackCount || 0) > 0 &&
+      audioBytes > 0
+    ) {
+      return {
+        duration_ms: Date.now() - started,
+        audio_bytes_received: audioBytes,
+        audio_track_count: Number(last.remoteAudioTrackCount || 0),
+        remote_audio_muted: last.remoteAudioMuted === true,
+        remote_audio_paused: last.remoteAudioPaused === true,
+        metrics: last,
+      };
+    }
+    await delay(500);
+  }
+  const statusText = await appPage.locator("#browser-status").innerText().catch(() => "");
+  const runtimeDiagnostics = browserToken && pageId
+    ? await checkBrowserPageDiagnostics(appPage, browserToken, pageId).catch((error) => ({
+        error: error.message || String(error),
+        details: error.details || null,
+      }))
+    : null;
+  throw Object.assign(new Error("Browser remote audio did not receive WebRTC audio frames"), {
+    details: {
+      duration_ms: Date.now() - started,
+      metrics: last,
+      status: statusText,
+      runtime_diagnostics: runtimeDiagnostics,
+    },
   });
 }
 
@@ -1325,6 +1474,12 @@ async function checkBrowserUiInput(context, browserToken, route) {
     const appUrl = new URL(route, HOME_URL);
     appUrl.searchParams.set("url", BROWSER_OPEN_URLS[0] || "https://example.com/");
     appUrl.searchParams.set("display", BROWSER_OPEN_DISPLAY_MODE);
+    if (CHECK_BROWSER_AUDIO_STATS) {
+      appUrl.searchParams.set("metrics", "1");
+    }
+    if (BROWSER_REMOTE_EXIT_ID) {
+      appUrl.searchParams.set("remote_exit_id", BROWSER_REMOTE_EXIT_ID);
+    }
     const openResultPromise = appPage.waitForResponse(
       (response) => {
         const request = response.request();
@@ -1333,12 +1488,13 @@ async function checkBrowserUiInput(context, browserToken, route) {
       { timeout: BROWSER_UI_PAGE_ID_TIMEOUT_MS },
     ).then(async (response) => {
       const body = await response.json().catch(() => ({}));
-      openedPageId = String(body?.engine_page?.page_id || "");
-      return {
+      const result = await waitForBrowserOpenResult(appPage, browserToken, {
         ok: response.ok(),
         status: response.status(),
         body,
-      };
+      }, BROWSER_UI_PAGE_ID_TIMEOUT_MS);
+      openedPageId = String(result.body?.engine_page?.page_id || "");
+      return result;
     }).catch((error) => ({
       ok: false,
       error: error.message || String(error),
@@ -1452,6 +1608,9 @@ async function checkBrowserUiInput(context, browserToken, route) {
       await appPage.locator("#browser-remote-display").click({ position: { x: clickX, y: clickY } });
       clickInput = clickInputResponsePromise ? await clickInputResponsePromise : null;
       await delay(750);
+      const audioProof = CHECK_BROWSER_AUDIO_STATS
+        ? await waitForBrowserRemoteAudio(appPage, { browserToken, pageId })
+        : null;
       const afterClickVideo = await browserRemoteVideoMetrics(appPage);
       const statusTextAfterClick = await appPage.locator("#browser-status").innerText().catch(() => "");
       assert(
@@ -1537,12 +1696,14 @@ async function checkBrowserUiInput(context, browserToken, route) {
       return {
         page_id: pageId,
         url: appUrl.searchParams.get("url"),
+        remote_exit_id: BROWSER_REMOTE_EXIT_ID || null,
         display_mode: BROWSER_OPEN_DISPLAY_MODE,
         video: {
           ready: videoReady,
           before_click: beforeClickVideo,
           after_click: afterClickVideo,
         },
+        audio: audioProof,
         click: { x: clickX, y: clickY, target: clickTarget },
         click_navigation: clickNavigation,
         navigation: {
@@ -1596,6 +1757,7 @@ async function checkBrowserUiInput(context, browserToken, route) {
     return {
       page_id: pageId,
       url: appUrl.searchParams.get("url"),
+      remote_exit_id: BROWSER_REMOTE_EXIT_ID || null,
       display_mode: BROWSER_OPEN_DISPLAY_MODE,
       click: { x: clickX, y: clickY },
       input: {
@@ -1635,6 +1797,12 @@ async function holdBrowserUiForSetup(context, browserToken, route) {
     const appUrl = new URL(route, HOME_URL);
     appUrl.searchParams.set("url", BROWSER_OPEN_URLS[0] || "https://example.com/");
     appUrl.searchParams.set("display", BROWSER_OPEN_DISPLAY_MODE);
+    if (CHECK_BROWSER_AUDIO_STATS) {
+      appUrl.searchParams.set("metrics", "1");
+    }
+    if (BROWSER_REMOTE_EXIT_ID) {
+      appUrl.searchParams.set("remote_exit_id", BROWSER_REMOTE_EXIT_ID);
+    }
     const openResultPromise = appPage.waitForResponse(
       (response) => {
         const request = response.request();
@@ -1643,12 +1811,13 @@ async function holdBrowserUiForSetup(context, browserToken, route) {
       { timeout: BROWSER_UI_PAGE_ID_TIMEOUT_MS },
     ).then(async (response) => {
       const body = await response.json().catch(() => ({}));
-      openedPageId = String(body?.engine_page?.page_id || "");
-      return {
+      const result = await waitForBrowserOpenResult(appPage, browserToken, {
         ok: response.ok(),
         status: response.status(),
         body,
-      };
+      }, BROWSER_UI_PAGE_ID_TIMEOUT_MS);
+      openedPageId = String(result.body?.engine_page?.page_id || "");
+      return result;
     }).catch((error) => ({
       ok: false,
       error: error.message || String(error),
@@ -1726,6 +1895,7 @@ async function holdBrowserUiForSetup(context, browserToken, route) {
     return {
       page_id: pageId,
       url: appUrl.searchParams.get("url"),
+      remote_exit_id: BROWSER_REMOTE_EXIT_ID || null,
       display_mode: BROWSER_OPEN_DISPLAY_MODE,
       hold_ms: BROWSER_OPEN_HOLD_MS,
       video_ready: videoReady,
@@ -1780,18 +1950,25 @@ async function checkBrowserEmbeddedUiInput(page) {
   page.on("response", captureWebrtcResponse);
   await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
   await waitForSignedHome(page);
-  await page.evaluate(({ url, displayMode }) => {
+  await page.evaluate(({ url, displayMode, remoteExitId, collectAudioStats }) => {
+    const query = {
+      url,
+      display: displayMode,
+      remote_exit_id: remoteExitId,
+    };
+    if (collectAudioStats) {
+      query.metrics = "1";
+    }
     window.postMessage({
       type: "home:open-target",
       target: "browser",
-      query: {
-        url,
-        display: displayMode,
-      },
+      query,
     }, window.location.origin);
   }, {
     url: BROWSER_OPEN_URLS[0] || "https://example.com/",
     displayMode: BROWSER_OPEN_DISPLAY_MODE,
+    remoteExitId: BROWSER_REMOTE_EXIT_ID,
+    collectAudioStats: CHECK_BROWSER_AUDIO_STATS,
   });
 
   const windowLocator = page.locator('.window[data-target="browser"]:not(.hidden)').first();
@@ -1922,6 +2099,9 @@ async function checkBrowserEmbeddedUiInput(page) {
       await appFrame.locator("#browser-remote-display").click({ position: { x: videoClickX, y: videoClickY } });
       let clickInput = clickInputResponsePromise ? await clickInputResponsePromise : null;
       await delay(750);
+      const audioProof = CHECK_BROWSER_AUDIO_STATS
+        ? await waitForBrowserRemoteAudio(appFrame, { browserToken, pageId })
+        : null;
       const afterClickVideo = await browserRemoteVideoMetrics(appFrame);
       const statusTextAfterClick = await appFrame.locator("#browser-status").innerText().catch(() => "");
       assert(
@@ -2007,6 +2187,7 @@ async function checkBrowserEmbeddedUiInput(page) {
       return {
         page_id: pageId,
         route_prefix: route.split("?")[0],
+        remote_exit_id: BROWSER_REMOTE_EXIT_ID || null,
         display_mode: BROWSER_OPEN_DISPLAY_MODE,
         display_session: summarizeDisplaySession(displaySession),
         geometry: {
@@ -2018,6 +2199,7 @@ async function checkBrowserEmbeddedUiInput(page) {
           before_click: beforeClickVideo,
           after_click: afterClickVideo,
         },
+        audio: audioProof,
         click: { x: Math.round(videoClickX), y: Math.round(videoClickY) },
         click_navigation: clickNavigation,
         navigation: {
@@ -2089,6 +2271,7 @@ async function checkBrowserEmbeddedUiInput(page) {
       return {
         page_id: pageId,
         route_prefix: route.split("?")[0],
+        remote_exit_id: BROWSER_REMOTE_EXIT_ID || null,
         display_mode: BROWSER_OPEN_DISPLAY_MODE,
         geometry: {
           initial: initialGeometry,
@@ -2138,6 +2321,7 @@ async function checkBrowserEmbeddedUiInput(page) {
     return {
       page_id: pageId,
       route_prefix: route.split("?")[0],
+      remote_exit_id: BROWSER_REMOTE_EXIT_ID || null,
       display_mode: BROWSER_OPEN_DISPLAY_MODE,
       geometry: {
         initial: initialGeometry,
@@ -2557,16 +2741,34 @@ async function checkShellSwitchJourney(page, homeToken) {
   const cliFrame = page.frames().find((frame) => frame.url().includes("/apps/home-cli/"));
   assert(cliFrame, "Home CLI iframe was not available to switch back to home-gui", cliRoot);
   markStage("shell-switch:cli-switch-home-gui");
-  await cliFrame.locator("#xterm-terminal").click();
-  await page.keyboard.press("q");
-  await page.waitForFunction(() => (
-    document.body?.dataset?.homeStatus === "ready" &&
-    document.body?.dataset?.homeAuthority === "signed" &&
-    document.body?.dataset?.homeShell === "desktop" &&
-    document.body?.dataset?.homeGui === "mounted" &&
-    document.querySelector("#active-shell-root")?.hidden === true &&
-    !!document.querySelector('#desktop-shortcuts .desktop-shortcut[data-target="system"]')
-  ), null, { timeout: 30_000 });
+  await pressHomeCliKey(cliFrame, "q");
+  try {
+    await page.waitForFunction(() => (
+      document.body?.dataset?.homeStatus === "ready" &&
+      document.body?.dataset?.homeAuthority === "signed" &&
+      document.body?.dataset?.homeShell === "desktop" &&
+      document.body?.dataset?.homeGui === "mounted" &&
+      document.querySelector("#active-shell-root")?.hidden === true &&
+      !!document.querySelector('#desktop-shortcuts .desktop-shortcut[data-target="system"]')
+    ), null, { timeout: 30_000 });
+  } catch (error) {
+    const details = await page.evaluate(() => {
+      const frame = document.querySelector("#active-shell-frame");
+      const doc = frame?.contentDocument;
+      const terminalText = doc?.querySelector("#xterm-terminal")?.textContent || "";
+      const fallbackText = doc?.querySelector("#terminal-output")?.textContent || "";
+      return {
+        body: { ...document.body.dataset },
+        active_shell_root_hidden: document.querySelector("#active-shell-root")?.hidden === true,
+        active_shell_frame_src: frame?.getAttribute("src") || "",
+        terminal_dataset: { ...(doc?.body?.dataset || {}) },
+        terminal_text_tail: terminalText.slice(-2000),
+        fallback_text_tail: fallbackText.slice(-2000),
+      };
+    });
+    error.details = details;
+    throw error;
+  }
   const restored = await page.evaluate(() => ({
     body: { ...document.body.dataset },
     active_shell_root_hidden: document.querySelector("#active-shell-root")?.hidden === true,
@@ -2608,23 +2810,42 @@ async function checkShellSwitchJourney(page, homeToken) {
   const chatCliFrame = page.frames().find((frame) => frame.url().includes("/apps/home-cli/"));
   assert(chatCliFrame, "Home CLI iframe was not available to open Chat", cliRoot);
   markStage("shell-switch:cli-open-chat");
-  await chatCliFrame.locator("#xterm-terminal").click();
-  await page.keyboard.press("1");
-  await page.waitForFunction(() => (
-    document.body?.dataset?.homeStatus === "ready" &&
-    document.body?.dataset?.homeAuthority === "signed" &&
-	    document.body?.dataset?.homeShell === "alternate" &&
-	    document.body?.dataset?.homeGui === "dormant" &&
-	    document.querySelector("#active-shell-root")?.hidden === false &&
-	    document.querySelector("#active-shell-frame")?.getAttribute("src")?.includes("/apps/home-cli/") &&
-	    !document.querySelector('.window[data-target="chat-room"]') &&
-    (
-      document.querySelector("#active-shell-frame")
-        ?.contentDocument
-        ?.querySelector("#xterm-terminal")
-        ?.textContent || ""
-    ).includes("Type /home to return Home")
-  ), null, { timeout: 30_000 });
+  await pressHomeCliKey(chatCliFrame, "1");
+  try {
+    await page.waitForFunction(() => (
+      document.body?.dataset?.homeStatus === "ready" &&
+      document.body?.dataset?.homeAuthority === "signed" &&
+	      document.body?.dataset?.homeShell === "alternate" &&
+	      document.body?.dataset?.homeGui === "dormant" &&
+	      document.querySelector("#active-shell-root")?.hidden === false &&
+	      document.querySelector("#active-shell-frame")?.getAttribute("src")?.includes("/apps/home-cli/") &&
+	      !document.querySelector('.window[data-target="chat-room"]') &&
+      (
+        document.querySelector("#active-shell-frame")
+          ?.contentDocument
+          ?.querySelector("#xterm-terminal")
+          ?.textContent || ""
+      ).includes("Type /home to return Home")
+    ), null, { timeout: 30_000 });
+  } catch (error) {
+    const details = await page.evaluate(() => {
+      const frame = document.querySelector("#active-shell-frame");
+      const doc = frame?.contentDocument;
+      const terminalText = doc?.querySelector("#xterm-terminal")?.textContent || "";
+      const fallbackText = doc?.querySelector("#terminal-output")?.textContent || "";
+      return {
+        body: { ...document.body.dataset },
+        active_shell_root_hidden: document.querySelector("#active-shell-root")?.hidden === true,
+        active_shell_frame_src: frame?.getAttribute("src") || "",
+        gui_window_contains_chat: Boolean(document.querySelector('.window[data-target="chat-room"]')),
+        terminal_dataset: { ...(doc?.body?.dataset || {}) },
+        terminal_text_tail: terminalText.slice(-2000),
+        fallback_text_tail: fallbackText.slice(-2000),
+      };
+    });
+    error.details = details;
+    throw error;
+  }
   const chatNative = await page.evaluate(() => {
     const terminalText = document.querySelector("#active-shell-frame")
       ?.contentDocument
@@ -2646,7 +2867,8 @@ async function checkShellSwitchJourney(page, homeToken) {
 	  assert(!chatNative.gui_window_contains_chat, "Home CLI Chat opened the GUI chat-room window", chatNative);
   assert(chatNative.terminal_has_chat_prompt, "Home CLI Chat did not render the CLI chat prompt", chatNative);
   assert(chatNative.terminal_has_chat_identity, "Home CLI Chat did not enter native chat", chatNative);
-  await page.keyboard.type("/home");
+  markStage("shell-switch:cli-chat-return-home");
+  await typeHomeCliText(chatCliFrame, "/home");
   await page.keyboard.press("Enter");
   await page.waitForFunction(() => (
     document.querySelector("#active-shell-frame")
@@ -2663,7 +2885,7 @@ async function checkShellSwitchJourney(page, homeToken) {
         ?.contentDocument
         ?.querySelector("#xterm-terminal")
         ?.textContent || "";
-      return /Home\s+Inbox\s+Apps/.test(terminalText) &&
+      return /Home\s+Inbox\s+People\s+Apps\s+System/.test(terminalText) &&
         terminalText.includes("Chat [ready]");
     })()
   ), null, { timeout: 15_000 });
@@ -2724,6 +2946,38 @@ async function checkShellSwitchJourney(page, homeToken) {
       await page.goto(HOME_URL, { waitUntil: "domcontentloaded" }).catch(() => null);
     }
   }
+}
+
+async function homeCliXtermTextarea(frame) {
+  await frame.locator("#xterm-terminal").click();
+  const textarea = frame.locator("#xterm-terminal textarea").first();
+  await textarea.waitFor({ state: "attached", timeout: 5_000 });
+  await textarea.focus();
+  return textarea;
+}
+
+async function pressHomeCliKey(frame, key) {
+  try {
+    const textarea = await homeCliXtermTextarea(frame);
+    await textarea.press(key);
+  } catch (error) {
+    error.details = {
+      ...(error.details || {}),
+      home_cli_keypress: await frame.evaluate(() => ({
+        url: window.location.href,
+        body: { ...(document.body?.dataset || {}) },
+        terminal_text_tail: document.querySelector("#xterm-terminal")?.textContent?.slice(-2000) || "",
+        fallback_text_tail: document.querySelector("#terminal-output")?.textContent?.slice(-2000) || "",
+        textarea_present: Boolean(document.querySelector("#xterm-terminal textarea")),
+      })).catch((detailError) => ({ error: detailError.message || String(detailError) })),
+    };
+    throw error;
+  }
+}
+
+async function typeHomeCliText(frame, text) {
+  const textarea = await homeCliXtermTextarea(frame);
+  await textarea.pressSequentially(text);
 }
 
 async function checkBrowserLaunchGrant(page, homeToken) {
@@ -2805,6 +3059,7 @@ async function checkBrowserLaunchGrant(page, homeToken) {
               viewport: { width: BROWSER_OPEN_VIEWPORT_WIDTH, height: BROWSER_OPEN_VIEWPORT_HEIGHT },
               display_mode: BROWSER_OPEN_DISPLAY_MODE,
               guarantee_level: guaranteeLevel,
+              ...(BROWSER_REMOTE_EXIT_ID ? { remote_exit_id: BROWSER_REMOTE_EXIT_ID } : {}),
             },
           });
           assert(opened.ok, `Browser app token could not open Runtime Browser page ${index + 1}`, opened);
@@ -2823,9 +3078,20 @@ async function checkBrowserLaunchGrant(page, homeToken) {
             "Browser open returned the wrong display mode",
             opened.body.engine_page,
           );
+          if (BROWSER_REMOTE_EXIT_ID) {
+            assert(
+              opened.body?.stream_session?.backend === BROWSER_REMOTE_EXIT_ID,
+              "Browser open did not use the requested remote Exit Node",
+              {
+                requested_remote_exit_id: BROWSER_REMOTE_EXIT_ID,
+                stream_session: publicBrowserStreamSession(opened.body?.stream_session),
+              },
+            );
+          }
           const entry = {
             page_id: pageId,
             url: urls[index],
+            requested_remote_exit_id: BROWSER_REMOTE_EXIT_ID || null,
             stream_session: publicBrowserStreamSession(opened.body?.stream_session),
             display_backend: opened.body.engine_page.display_session.display_backend,
             display_mode: opened.body.engine_page.display_session.mode,
@@ -2870,6 +3136,7 @@ async function checkBrowserLaunchGrant(page, homeToken) {
             viewport: { width: BROWSER_OPEN_VIEWPORT_WIDTH, height: BROWSER_OPEN_VIEWPORT_HEIGHT },
             display_mode: BROWSER_OPEN_DISPLAY_MODE,
             guarantee_level: guaranteeLevel,
+            ...(BROWSER_REMOTE_EXIT_ID ? { remote_exit_id: BROWSER_REMOTE_EXIT_ID } : {}),
           },
         });
         assert(!rejected.ok, "Browser capacity rejection smoke unexpectedly opened an extra page", rejected);
@@ -2974,6 +3241,7 @@ async function checkBrowserLaunchGrant(page, homeToken) {
       concurrent_pages: pages.length,
       display_mode: BROWSER_OPEN_DISPLAY_MODE,
       guarantee_level: guaranteeLevel,
+      remote_exit_id: BROWSER_REMOTE_EXIT_ID || null,
       hold_ms: BROWSER_OPEN_HOLD_MS,
       baseline_principal_sessions: baselinePrincipalSessions,
       final_principal_sessions: Number(summaryAfterClose.body?.sessions?.principal_sessions || 0),
@@ -3249,6 +3517,9 @@ async function main() {
     }
     console.error("FAIL home-passkey-virtual-auth-smoke");
     console.error(error.message || error);
+    if (error.stack) {
+      console.error(error.stack);
+    }
     if (error.details) {
       console.error(JSON.stringify(error.details, null, 2));
     } else {

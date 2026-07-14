@@ -148,6 +148,12 @@ SELKIES_SNIPPETS = [
     "pipewire-pulse is required for Browser audio",
     "WirePlumber is required for Browser audio",
     "pw-cli is required for Browser audio",
+    "configure_browser_wireplumber_headless",
+    "browser-vm-wireplumber-config.log",
+    'alsa_monitor.properties["alsa.reserve"] = false',
+    'bluez_monitor.properties["with-logind"] = false',
+    "support.logind = disabled",
+    'pulsesrc.set_property("device", "auto_null.monitor")',
     "gst-inspect-1.0 pulsesrc",
 ]
 

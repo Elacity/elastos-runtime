@@ -44,6 +44,9 @@ const ICE_CONFIG_BOOT_ARG: &str = "elastos.browser_ice_config_hex";
 const DISPLAY_MODE_BOOT_ARG: &str = "elastos.browser_display_mode";
 const DISPLAY_WIDTH_BOOT_ARG: &str = "elastos.browser_width";
 const DISPLAY_HEIGHT_BOOT_ARG: &str = "elastos.browser_height";
+const DEFAULT_HIBERNATION_MAX_ENTRIES: u32 = 4;
+const DEFAULT_HIBERNATION_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+const HIBERNATION_LEASE_PREFIX: &str = ".active-";
 const VM_ICE_ENV_KEYS: [&str; 8] = [
     "ELASTOS_BROWSER_VM_ICE_SERVER",
     "ELASTOS_BROWSER_VM_ICE_SERVERS_JSON",
@@ -636,7 +639,7 @@ impl LaunchPaths {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct BrowserVmHibernation {
     key: String,
     state_dir: PathBuf,
@@ -644,6 +647,39 @@ struct BrowserVmHibernation {
     state_tmp_path: PathBuf,
     metadata_path: PathBuf,
     launch_rootfs_path: PathBuf,
+    _lease: HibernationLease,
+}
+
+#[derive(Debug)]
+struct HibernationLease {
+    path: PathBuf,
+}
+
+impl HibernationLease {
+    fn acquire(state_dir: &Path) -> Result<Self, String> {
+        fs::create_dir_all(state_dir).map_err(|err| err.to_string())?;
+        let path = state_dir.join(format!(
+            "{HIBERNATION_LEASE_PREFIX}{}-{}",
+            process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            format!(
+                "pid={}\ncreated_at_unix_secs={}\n",
+                process::id(),
+                current_unix_seconds()
+            ),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for HibernationLease {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 impl BrowserVmHibernation {
@@ -660,6 +696,25 @@ impl BrowserVmHibernation {
         let hibernation_root = env_path("ELASTOS_BROWSER_VM_HIBERNATION_DIR")
             .unwrap_or_else(|| paths.data_dir.join("browser-vm/hibernation"));
         validate_clean_absolute_path("ELASTOS_BROWSER_VM_HIBERNATION_DIR", &hibernation_root)?;
+        let max_entries = env_u32(
+            "ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES",
+            DEFAULT_HIBERNATION_MAX_ENTRIES,
+        )?;
+        if !(1..=32).contains(&max_entries) {
+            return Err(
+                "ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES must be from 1 to 32".to_string(),
+            );
+        }
+        let max_age_secs = env_u64(
+            "ELASTOS_BROWSER_VM_HIBERNATION_MAX_AGE_SECS",
+            DEFAULT_HIBERNATION_MAX_AGE_SECS,
+        )?;
+        if !(60 * 60..=30 * 24 * 60 * 60).contains(&max_age_secs) {
+            return Err(
+                "ELASTOS_BROWSER_VM_HIBERNATION_MAX_AGE_SECS must be from 3600 to 2592000"
+                    .to_string(),
+            );
+        }
         let key_material = json!({
             "schema": "elastos.browser.vm-hibernation-key/v1",
             "platform": {
@@ -699,6 +754,22 @@ impl BrowserVmHibernation {
         let state_tmp_path = state_dir.join("machine.state.tmp");
         let metadata_path = state_dir.join("metadata.json");
         let launch_rootfs_path = state_dir.join("rootfs.ext4");
+        let lease = HibernationLease::acquire(&state_dir)?;
+        match prune_hibernation_cache(
+            &hibernation_root,
+            &state_dir,
+            max_entries as usize,
+            Duration::from_secs(max_age_secs),
+        ) {
+            Ok(removed) if removed > 0 => trace_stage(
+                "hibernate_cache_pruned",
+                format!("removed={removed} max_entries={max_entries}"),
+            ),
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("browser-vz-engine-supervisor hibernate_cache_prune_failed error={error}")
+            }
+        }
         Ok(Some(Self {
             key,
             state_dir,
@@ -706,8 +777,182 @@ impl BrowserVmHibernation {
             state_tmp_path,
             metadata_path,
             launch_rootfs_path,
+            _lease: lease,
         }))
     }
+}
+
+#[derive(Debug)]
+struct HibernationCacheEntry {
+    path: PathBuf,
+    last_modified: SystemTime,
+    active: bool,
+}
+
+fn prune_hibernation_cache(
+    root: &Path,
+    protected: &Path,
+    max_entries: usize,
+    max_age: Duration,
+) -> Result<usize, String> {
+    prune_hibernation_cache_at(root, protected, max_entries, max_age, SystemTime::now())
+}
+
+fn prune_hibernation_cache_at(
+    root: &Path,
+    protected: &Path,
+    max_entries: usize,
+    max_age: Duration,
+    now: SystemTime,
+) -> Result<usize, String> {
+    let mut entries = hibernation_cache_entries(root)?;
+    for entry in &mut entries {
+        entry.active = hibernation_entry_has_live_lease(&entry.path)?;
+    }
+
+    let mut removed = 0;
+    for entry in &entries {
+        if entry.path != protected
+            && !entry.active
+            && now.duration_since(entry.last_modified).unwrap_or_default() > max_age
+        {
+            remove_hibernation_cache_entry(&entry.path)?;
+            removed += 1;
+        }
+    }
+
+    entries.retain(|entry| entry.path.exists());
+    entries.sort_by(|left, right| {
+        left.last_modified
+            .cmp(&right.last_modified)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let mut remaining = entries.len();
+    for entry in entries {
+        if remaining <= max_entries {
+            break;
+        }
+        if entry.path == protected || entry.active {
+            continue;
+        }
+        remove_hibernation_cache_entry(&entry.path)?;
+        removed += 1;
+        remaining -= 1;
+    }
+    Ok(removed)
+}
+
+fn hibernation_cache_entries(root: &Path) -> Result<Vec<HibernationCacheEntry>, String> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    for prefix in fs::read_dir(root).map_err(|err| err.to_string())? {
+        let prefix = prefix.map_err(|err| err.to_string())?;
+        if !prefix.file_type().map_err(|err| err.to_string())?.is_dir() {
+            continue;
+        }
+        let prefix_name = prefix.file_name();
+        let Some(prefix_name) = prefix_name.to_str() else {
+            continue;
+        };
+        if !is_lower_hex(prefix_name, 2) {
+            continue;
+        }
+        for candidate in fs::read_dir(prefix.path()).map_err(|err| err.to_string())? {
+            let candidate = candidate.map_err(|err| err.to_string())?;
+            if !candidate
+                .file_type()
+                .map_err(|err| err.to_string())?
+                .is_dir()
+            {
+                continue;
+            }
+            let key = candidate.file_name();
+            let Some(key) = key.to_str() else {
+                continue;
+            };
+            if !is_lower_hex(key, 64) || !key.starts_with(prefix_name) {
+                continue;
+            }
+            let path = candidate.path();
+            entries.push(HibernationCacheEntry {
+                last_modified: hibernation_entry_last_modified(&path)?,
+                path,
+                active: false,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+fn hibernation_entry_last_modified(path: &Path) -> Result<SystemTime, String> {
+    let mut modified = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|err| err.to_string())?;
+    for name in [
+        "machine.state",
+        "machine.state.tmp",
+        "metadata.json",
+        "rootfs.ext4",
+    ] {
+        match fs::metadata(path.join(name)).and_then(|metadata| metadata.modified()) {
+            Ok(candidate) if candidate > modified => modified = candidate,
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(modified)
+}
+
+fn hibernation_entry_has_live_lease(path: &Path) -> Result<bool, String> {
+    for lease in fs::read_dir(path).map_err(|err| err.to_string())? {
+        let lease = lease.map_err(|err| err.to_string())?;
+        let name = lease.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(suffix) = name.strip_prefix(HIBERNATION_LEASE_PREFIX) else {
+            continue;
+        };
+        let pid = suffix
+            .split_once('-')
+            .and_then(|(pid, _)| pid.parse::<u32>().ok());
+        if pid.is_some_and(process_is_alive) {
+            return Ok(true);
+        }
+        match fs::remove_file(lease.path()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(false)
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    if pid == 0 || pid > libc::pid_t::MAX as u32 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn remove_hibernation_cache_entry(path: &Path) -> Result<(), String> {
+    let prefix = path.parent().map(Path::to_path_buf);
+    fs::remove_dir_all(path).map_err(|err| err.to_string())?;
+    if let Some(prefix) = prefix {
+        let _ = fs::remove_dir(prefix);
+    }
+    Ok(())
+}
+
+fn is_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -2112,8 +2357,12 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let _enabled = EnvVarRestore::capture("ELASTOS_BROWSER_VM_HIBERNATION");
         let _dir = EnvVarRestore::capture("ELASTOS_BROWSER_VM_HIBERNATION_DIR");
+        let _max_entries = EnvVarRestore::capture("ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES");
+        let _max_age = EnvVarRestore::capture("ELASTOS_BROWSER_VM_HIBERNATION_MAX_AGE_SECS");
         std::env::set_var("ELASTOS_BROWSER_VM_HIBERNATION", "1");
         std::env::set_var("ELASTOS_BROWSER_VM_HIBERNATION_DIR", root);
+        std::env::remove_var("ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES");
+        std::env::remove_var("ELASTOS_BROWSER_VM_HIBERNATION_MAX_AGE_SECS");
         test()
     }
 
@@ -2169,6 +2418,15 @@ mod tests {
         BrowserVmHibernation::from_env(paths, launch, profile_key, profile_disk_path, boot_args)
             .unwrap()
             .expect("hibernation should be enabled for this test")
+    }
+
+    fn create_hibernation_cache_entry(root: &Path, index: u64) -> PathBuf {
+        let key = format!("{index:064x}");
+        let path = root.join(&key[..2]).join(key);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("rootfs.ext4"), b"rootfs").unwrap();
+        fs::write(path.join("machine.state"), b"state").unwrap();
+        path
     }
 
     #[test]
@@ -2621,5 +2879,74 @@ mod tests {
 
             assert!(!hibernation.state_tmp_path.exists());
         });
+    }
+
+    #[test]
+    fn hibernation_lease_is_removed_when_owner_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("state");
+        let lease = HibernationLease::acquire(&state_dir).unwrap();
+        let lease_path = lease.path.clone();
+
+        assert!(lease_path.is_file());
+        drop(lease);
+        assert!(!lease_path.exists());
+    }
+
+    #[test]
+    fn hibernation_cache_prune_bounds_entries_without_removing_live_or_current_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("hibernation");
+        let mut entries = Vec::new();
+        for index in 0..6 {
+            entries.push(create_hibernation_cache_entry(&root, index));
+        }
+        let current = entries[5].clone();
+        let live = entries[4].clone();
+        fs::write(
+            live.join(format!("{HIBERNATION_LEASE_PREFIX}{}-test", process::id())),
+            b"active",
+        )
+        .unwrap();
+        fs::write(
+            entries[0].join(format!("{HIBERNATION_LEASE_PREFIX}4294967295-stale")),
+            b"stale",
+        )
+        .unwrap();
+
+        let removed = prune_hibernation_cache_at(
+            &root,
+            &current,
+            2,
+            Duration::from_secs(DEFAULT_HIBERNATION_MAX_AGE_SECS),
+            SystemTime::now(),
+        )
+        .unwrap();
+
+        assert_eq!(removed, 4);
+        assert!(current.is_dir());
+        assert!(live.is_dir());
+        assert_eq!(hibernation_cache_entries(&root).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn hibernation_cache_prune_expires_inactive_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("hibernation");
+        let current = create_hibernation_cache_entry(&root, 0);
+        let expired = create_hibernation_cache_entry(&root, 1);
+
+        let removed = prune_hibernation_cache_at(
+            &root,
+            &current,
+            8,
+            Duration::from_secs(DEFAULT_HIBERNATION_MAX_AGE_SECS),
+            SystemTime::now() + Duration::from_secs(DEFAULT_HIBERNATION_MAX_AGE_SECS + 60),
+        )
+        .unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(current.is_dir());
+        assert!(!expired.exists());
     }
 }

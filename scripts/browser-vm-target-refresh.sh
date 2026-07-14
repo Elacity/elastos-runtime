@@ -26,8 +26,9 @@ Options:
   --help, -h              Show this help.
 
 The script preserves initrd/rootfs symlinks by updating their resolved targets.
-It creates timestamped backups before every changed installed helper or VM
-artifact write. Finish target closeout by running:
+It creates timestamped backups before changed installed helpers or VM artifacts
+and retains the newest two default backup sets. Override the bounded retention
+with ELASTOS_BROWSER_VM_BACKUP_RETENTION=1..10. Finish target closeout by running:
 
   scripts/jetson-browser-runtime-audit.mjs \
     --host <target-host> \
@@ -113,7 +114,55 @@ backup_file() {
     cp -c "$path" "$backup" 2>/dev/null ||
         cp --reflink=auto --sparse=always -p "$path" "$backup" 2>/dev/null ||
         cp -p "$path" "$backup"
+    touch "$backup"
     printf '%s\n' "$backup"
+}
+
+backup_retention() {
+    local retention="${ELASTOS_BROWSER_VM_BACKUP_RETENTION:-2}"
+    if [[ ! "$retention" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ELASTOS_BROWSER_VM_BACKUP_RETENTION must be from 1 to 10" >&2
+        exit 2
+    fi
+    retention=$((10#$retention))
+    if (( retention > 10 )); then
+        echo "ELASTOS_BROWSER_VM_BACKUP_RETENTION must be from 1 to 10" >&2
+        exit 2
+    fi
+    printf '%s\n' "$retention"
+}
+
+prune_default_backup_dirs() {
+    local keep
+    local candidate
+    local remove_index
+    local index
+    local LC_ALL=C
+    local backups=()
+
+    keep="$(backup_retention)"
+    for candidate in "$DATA_DIR"/backups/browser-vm-target-refresh-*; do
+        if [[ -d "$candidate" && ! -L "$candidate" ]]; then
+            backups+=("$candidate")
+        fi
+    done
+    while (( ${#backups[@]} > keep )); do
+        remove_index=-1
+        for (( index = 0; index < ${#backups[@]}; index += 1 )); do
+            if [[ "${backups[$index]}" != "$BACKUP_DIR" ]]; then
+                remove_index="$index"
+                break
+            fi
+        done
+        if (( remove_index < 0 )); then
+            break
+        fi
+        candidate="${backups[$remove_index]}"
+        rm -rf -- "$candidate"
+        echo "[browser-vm-target-refresh] pruned stale backup: ${candidate}"
+        unset "backups[$remove_index]"
+        backups=("${backups[@]}")
+    done
 }
 
 safe_label() {
@@ -360,7 +409,9 @@ refresh_rootfs_file() {
         return
     fi
 
-    backup_file "$rootfs" "$(safe_label "$rootfs").${label}.rootfs" >/dev/null
+    if [[ -z "$ROOTFS_BACKUP_PATH" ]]; then
+        ROOTFS_BACKUP_PATH="$(backup_file "$rootfs" "$(safe_label "$rootfs").${label}.rootfs")"
+    fi
     staged_source="$(mktemp)"
     verify_file="$(mktemp)"
     commands_file="$(mktemp)"
@@ -373,7 +424,7 @@ EOF
     "$debugfs" -w -f "$commands_file" "$rootfs" >/dev/null 2>&1
     "$debugfs" -R "cat ${guest_path}" "$rootfs" > "$verify_file" 2>/dev/null
     if ! cmp -s "$source" "$verify_file"; then
-        echo "rootfs helper refresh did not verify: $guest_path in $rootfs" >&2
+        echo "rootfs helper refresh did not verify: $guest_path in $rootfs; backup kept at $ROOTFS_BACKUP_PATH" >&2
         exit 1
     fi
     rm -f "$staged_source" "$verify_file" "$commands_file"
@@ -399,6 +450,7 @@ refresh_rootfs() {
     fi
 
     rootfs="$(resolve_existing_symlink_target "$requested_rootfs")"
+    ROOTFS_BACKUP_PATH=""
     init_source="$(mktemp)"
     selkies_start_source="$(mktemp)"
     manifest_source="$(mktemp)"
@@ -430,11 +482,13 @@ refresh_rootfs() {
 SOURCE_DIR="$ROOT"
 DATA_DIR="$(default_data_dir)"
 BACKUP_DIR=""
+DEFAULT_BACKUP_DIR=0
 NODE_BIN=""
 VERIFY_ONLY=0
 DRIFT=0
 INITRDS=()
 ROOTFS=""
+ROOTFS_BACKUP_PATH=""
 GUEST_CONTROL_BRIDGE_BIN="${ELASTOS_BROWSER_VM_GUEST_CONTROL_BRIDGE_BIN:-}"
 
 while [[ "$#" -gt 0 ]]; do
@@ -493,6 +547,7 @@ done
 SOURCE_DIR="$(cd "$SOURCE_DIR" && pwd -P)"
 if [[ -z "$BACKUP_DIR" ]]; then
     BACKUP_DIR="$DATA_DIR/backups/browser-vm-target-refresh-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    DEFAULT_BACKUP_DIR=1
 fi
 if [[ -z "$NODE_BIN" ]]; then
     NODE_BIN="$(find_node)"
@@ -591,14 +646,20 @@ write_node_wrapper "$DATA_DIR/bin/browser-vm-prepare-rootfs-pool" \
     "$DATA_DIR/scripts/browser-vm-prepare-rootfs-pool.mjs" \
     "browser-vm-prepare-rootfs-pool"
 
-for initrd in "${INITRDS[@]}"; do
-    refresh_initrd "$initrd" "$selkies_source"
-done
+if [[ "${#INITRDS[@]}" -gt 0 ]]; then
+    for initrd in "${INITRDS[@]}"; do
+        refresh_initrd "$initrd" "$selkies_source"
+    done
+fi
 refresh_rootfs "$ROOTFS" "$selkies_source"
 
 if [[ "$VERIFY_ONLY" == "1" && "$DRIFT" == "1" ]]; then
     echo "[browser-vm-target-refresh] verify-only found drift"
     exit 1
+fi
+
+if [[ "$VERIFY_ONLY" != "1" && "$DEFAULT_BACKUP_DIR" == "1" ]]; then
+    prune_default_backup_dirs
 fi
 
 echo "[browser-vm-target-refresh] done"

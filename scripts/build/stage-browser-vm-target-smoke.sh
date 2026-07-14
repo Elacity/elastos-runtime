@@ -29,7 +29,13 @@ for (const executable of [
   "chromium",
 ]) {
   const target = path.join(process.argv[2], executable);
-  fs.writeFileSync(target, elf, { mode: 0o755 });
+  const contents = executable === "browser-vm-guest-control-bridge"
+    ? Buffer.concat([
+        elf,
+        Buffer.from("\nelastos.browser.vm-guest-control-bridge.config/v1\ncontrol_socket_ready_timeout_ms\ncontrol_request_timeout_ms\n"),
+      ])
+    : elf;
+  fs.writeFileSync(target, contents, { mode: 0o755 });
 }
 NODE
 printf '#!/usr/bin/env node\n' > "$tmp_dir/bin/browser-selkies-control-service.mjs"

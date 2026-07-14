@@ -654,8 +654,10 @@ mkdir -p /run/elastos /var/lib/elastos/browser-profiles /tmp
 : "${PIPEWIRE_RUNTIME_DIR:=$XDG_RUNTIME_DIR}"
 : "${PULSE_RUNTIME_PATH:=$XDG_RUNTIME_DIR/pulse}"
 : "${PULSE_SERVER:=unix:$PULSE_RUNTIME_PATH/native}"
+: "${XDG_CONFIG_HOME:=$XDG_RUNTIME_DIR/config}"
 export DISPLAY
-export XDG_RUNTIME_DIR PIPEWIRE_RUNTIME_DIR PULSE_RUNTIME_PATH PULSE_SERVER
+export XDG_RUNTIME_DIR PIPEWIRE_RUNTIME_DIR PULSE_RUNTIME_PATH PULSE_SERVER XDG_CONFIG_HOME
+export GIO_USE_VFS=local
 selkies_checkpoint "environment initialized"
 
 cmdline_value() {
@@ -791,12 +793,76 @@ if command -v gst-inspect-1.0 >/dev/null 2>&1 &&
 fi
 selkies_checkpoint "dependencies checked"
 
+configure_browser_wireplumber_headless() {
+  mkdir -p \
+    "$XDG_CONFIG_HOME/wireplumber/main.lua.d" \
+    "$XDG_CONFIG_HOME/wireplumber/bluetooth.lua.d" \
+    "$XDG_CONFIG_HOME/wireplumber/wireplumber.conf.d"
+  cat >"$XDG_CONFIG_HOME/wireplumber/main.lua.d/80-elastos-headless.lua" <<'LUA'
+if alsa_monitor and alsa_monitor.properties then
+  alsa_monitor.properties["alsa.reserve"] = false
+end
+LUA
+  cat >"$XDG_CONFIG_HOME/wireplumber/bluetooth.lua.d/80-elastos-headless.lua" <<'LUA'
+if bluez_monitor and bluez_monitor.properties then
+  bluez_monitor.properties["with-logind"] = false
+end
+if bluez_monitor then
+  bluez_monitor.enabled = false
+end
+LUA
+  cat >"$XDG_CONFIG_HOME/wireplumber/wireplumber.conf.d/80-elastos-headless.conf" <<'CONF'
+wireplumber.profiles = {
+  main = {
+    support.dbus = disabled
+    support.logind = disabled
+    support.reserve-device = disabled
+    monitor.alsa.reserve-device = disabled
+    monitor.bluez = disabled
+    monitor.bluez.seat-monitoring = disabled
+  }
+}
+CONF
+  {
+    echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME"
+    find "$XDG_CONFIG_HOME/wireplumber" -type f -maxdepth 3 -print | sort
+  } >"$ELASTOS_BROWSER_VM_LOG_DIR/browser-vm-wireplumber-config.log" 2>&1 || true
+}
+
 start_browser_audio_stack() {
   mkdir -p "$XDG_RUNTIME_DIR" "$PULSE_RUNTIME_PATH"
   chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
-  (dbus-run-session -- pipewire >"$ELASTOS_BROWSER_VM_LOG_DIR/browser-vm-pipewire.log" 2>&1 &)
-  (dbus-run-session -- wireplumber >"$ELASTOS_BROWSER_VM_LOG_DIR/browser-vm-wireplumber.log" 2>&1 &)
-  (dbus-run-session -- pipewire-pulse >"$ELASTOS_BROWSER_VM_LOG_DIR/browser-vm-pipewire-pulse.log" 2>&1 &)
+  configure_browser_wireplumber_headless
+
+  export ELASTOS_BROWSER_VM_PIPEWIRE_LOG="$ELASTOS_BROWSER_VM_LOG_DIR/browser-vm-pipewire.log"
+  export ELASTOS_BROWSER_VM_WIREPLUMBER_LOG="$ELASTOS_BROWSER_VM_LOG_DIR/browser-vm-wireplumber.log"
+  export ELASTOS_BROWSER_VM_PIPEWIRE_PULSE_LOG="$ELASTOS_BROWSER_VM_LOG_DIR/browser-vm-pipewire-pulse.log"
+  export ELASTOS_BROWSER_VM_PIPEWIRE_DUMP_LOG="$ELASTOS_BROWSER_VM_LOG_DIR/browser-vm-pipewire-dump.log"
+  export ELASTOS_BROWSER_VM_PIPEWIRE_SUMMARY_LOG="$ELASTOS_BROWSER_VM_LOG_DIR/browser-vm-pipewire-summary.log"
+  dbus-run-session -- sh -c '
+    set -u
+    pipewire >"$ELASTOS_BROWSER_VM_PIPEWIRE_LOG" 2>&1 &
+    pipewire_pid=$!
+    for _ in $(seq 1 120); do
+      pw-cli info 0 >/dev/null 2>&1 && break
+      kill -0 "$pipewire_pid" 2>/dev/null || exit 1
+      sleep 0.1
+    done
+    pw-cli info 0 >/dev/null 2>&1 || exit 1
+
+    wireplumber >"$ELASTOS_BROWSER_VM_WIREPLUMBER_LOG" 2>&1 &
+    wireplumber_pid=$!
+    for _ in $(seq 1 120); do
+      pw-cli ls Client 2>/dev/null | grep -q "WirePlumber" && break
+      kill -0 "$wireplumber_pid" 2>/dev/null || exit 1
+      sleep 0.1
+    done
+    pw-cli ls Client 2>/dev/null | grep -q "WirePlumber" || exit 1
+
+    pipewire-pulse >"$ELASTOS_BROWSER_VM_PIPEWIRE_PULSE_LOG" 2>&1 &
+    wait
+  ' >"$ELASTOS_BROWSER_VM_LOG_DIR/browser-vm-audio-session.log" 2>&1 &
+
   for _ in $(seq 1 120); do
     [ -S "$PULSE_RUNTIME_PATH/native" ] && break
     sleep 0.1
@@ -805,17 +871,83 @@ start_browser_audio_stack() {
     echo "browser-vm-selkies-start: Pulse-compatible Browser audio socket did not start" >&2
     exit 1
   fi
+
+  : >"$ELASTOS_BROWSER_VM_LOG_DIR/browser-vm-pipewire-null-sink.log"
   for _ in $(seq 1 80); do
-    if pw-cli ls Node 2>/dev/null | grep -q 'node.name = "output"'; then
+    if pw-cli ls Node 2>/dev/null | grep -q 'auto_null'; then
       return 0
     fi
-    if pw-cli create-node adapter '{ factory.name=support.null-audio-sink node.name=output node.description=output media.class=Audio/Sink object.linger=true audio.position=[FL FR] }' >"$ELASTOS_BROWSER_VM_LOG_DIR/browser-vm-pipewire-null-sink.log" 2>&1; then
-      return 0
-    fi
+    {
+      echo "waiting for pipewire-pulse module-always-sink auto_null"
+      pw-cli ls Node 2>&1 || true
+    } >"$ELASTOS_BROWSER_VM_LOG_DIR/browser-vm-pipewire-null-sink.log"
     sleep 0.25
   done
-  echo "browser-vm-selkies-start: Browser audio sink did not become available" >&2
+  echo "browser-vm-selkies-start: Browser Pulse monitor source did not become available" >&2
   exit 1
+}
+
+dump_browser_audio_graph() {
+  {
+    echo "=== browser audio environment ==="
+    printf 'XDG_RUNTIME_DIR=%s\n' "$XDG_RUNTIME_DIR"
+    printf 'PIPEWIRE_RUNTIME_DIR=%s\n' "$PIPEWIRE_RUNTIME_DIR"
+    printf 'PULSE_RUNTIME_PATH=%s\n' "$PULSE_RUNTIME_PATH"
+    printf 'PULSE_SERVER=%s\n' "$PULSE_SERVER"
+    echo "=== browser audio sockets ==="
+    ls -la "$XDG_RUNTIME_DIR" "$PULSE_RUNTIME_PATH" 2>&1 || true
+    echo "=== pw-cli info 0 ==="
+    pw-cli info 0 2>&1 || true
+    echo "=== pw-cli ls Node ==="
+    pw-cli ls Node 2>&1 || true
+    echo "=== pw-cli ls Client ==="
+    pw-cli ls Client 2>&1 || true
+    echo "=== pw-cli ls Port ==="
+    pw-cli ls Port 2>&1 || true
+    echo "=== pw-cli ls Link ==="
+    pw-cli ls Link 2>&1 || true
+    echo "=== pw-link outputs ==="
+    if command -v pw-link >/dev/null 2>&1; then
+      pw-link -o 2>&1 || true
+    else
+      echo "pw-link unavailable"
+    fi
+    echo "=== pw-link inputs ==="
+    if command -v pw-link >/dev/null 2>&1; then
+      pw-link -i 2>&1 || true
+    else
+      echo "pw-link unavailable"
+    fi
+    echo "=== pw-link links ==="
+    if command -v pw-link >/dev/null 2>&1; then
+      pw-link -l 2>&1 || true
+    else
+      echo "pw-link unavailable"
+    fi
+    echo "=== pw-dump compact audio facts ==="
+    if command -v pw-dump >/dev/null 2>&1; then
+      pw-dump 2>/dev/null | grep -E '"(type|id|node.name|node.description|media.class|application.name|client.api|object.path|factory.name|pulse.server.type|audio.position)"' || true
+    else
+      echo "pw-dump unavailable"
+    fi
+  } >"$ELASTOS_BROWSER_VM_PIPEWIRE_SUMMARY_LOG" 2>&1 || true
+
+  {
+    echo "=== pw-cli info 0 ==="
+    pw-cli info 0 2>&1 || true
+    echo "=== pw-cli ls Node ==="
+    pw-cli ls Node 2>&1 || true
+    echo "=== pw-cli ls Port ==="
+    pw-cli ls Port 2>&1 || true
+    echo "=== pw-cli ls Link ==="
+    pw-cli ls Link 2>&1 || true
+    echo "=== pw-dump ==="
+    if command -v pw-dump >/dev/null 2>&1; then
+      pw-dump 2>&1 || true
+    else
+      echo "pw-dump unavailable"
+    fi
+  } >"$ELASTOS_BROWSER_VM_PIPEWIRE_DUMP_LOG" 2>&1 || true
 }
 
 mkdir -p "$ELASTOS_BROWSER_VM_PROFILE_DIR"
@@ -840,6 +972,7 @@ done
 selkies_checkpoint "xvfb ready"
 selkies_checkpoint "starting audio"
 start_browser_audio_stack
+dump_browser_audio_graph
 selkies_checkpoint "audio ready"
 
 selkies_checkpoint "starting native proxy"
@@ -1116,10 +1249,13 @@ elif "Selkies 1.6.1 audio RTP header extensions are fragile" not in text:
     raise SystemExit("browser-vm-selkies-start: Selkies audio RTP extension patch target not found")
 pulsesrc_named = '        pulsesrc = Gst.ElementFactory.make("pulsesrc", "pulsesrc")\n'
 pulsesrc_unnamed = '        pulsesrc = Gst.ElementFactory.make("pulsesrc")\n'
+pulsesrc_device = '        pulsesrc.set_property("device", "auto_null.monitor")\n'
 if pulsesrc_named in text:
     text = text.replace(pulsesrc_named, pulsesrc_unnamed, 1)
 elif pulsesrc_unnamed not in text:
     raise SystemExit("browser-vm-selkies-start: Selkies pulsesrc patch target not found")
+text = re.sub(r'^[ \t]*pulsesrc\.set_property\("device", .*\)\n', '', text, flags=re.MULTILINE)
+text = text.replace(pulsesrc_unnamed, pulsesrc_unnamed + pulsesrc_device, 1)
 opusenc_named = '        opusenc = Gst.ElementFactory.make("opusenc", "opusenc")\n'
 opusenc_unnamed = '        opusenc = Gst.ElementFactory.make("opusenc")\n'
 if opusenc_named in text:

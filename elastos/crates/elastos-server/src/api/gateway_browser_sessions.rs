@@ -623,6 +623,17 @@ pub(in crate::api::gateway) async fn browser_principal_has_live_sessions(
         .any(|session| session.scope == scope && session.principal_id == principal_id)
 }
 
+pub(in crate::api::gateway) async fn browser_scope_has_live_sessions(data_dir: &Path) -> bool {
+    let scope = browser_session_scope(data_dir);
+    let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
+    let mut registry = registry.lock().await;
+    registry.purge_expired(Instant::now());
+    registry
+        .sessions
+        .values()
+        .any(|session| session.scope == scope)
+}
+
 pub(in crate::api::gateway) async fn take_stale_browser_pages(
     data_dir: &Path,
 ) -> Vec<BrowserPageCleanup> {

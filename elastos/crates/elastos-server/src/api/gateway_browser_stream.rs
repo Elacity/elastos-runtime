@@ -16,6 +16,10 @@ const BROWSER_RUNTIME_STREAM_TMP_DIR: &str = "elastos-browser-streams";
 const BROWSER_ADAPTER_IPC_TMP_DIR: &str = "elastos-browser-adapter-ipc";
 #[cfg(unix)]
 const BROWSER_RUNTIME_RELAY_OPEN_MAX_BYTES: usize = 16 * 1024;
+#[cfg(unix)]
+const BROWSER_RUNTIME_STREAM_ACCEPT_TIMEOUT_SECS: u64 = 300;
+#[cfg(unix)]
+const BROWSER_RUNTIME_STREAM_STALE_SECS: u64 = BROWSER_RUNTIME_STREAM_ACCEPT_TIMEOUT_SECS * 2;
 const EXIT_STREAM_SESSION_SCHEMA: &str = "elastos.exit.stream-session/v1";
 const EXIT_REMOTE_CARRIER_SESSION_SCHEMA: &str = "elastos.exit.remote-carrier-session/v1";
 
@@ -762,11 +766,7 @@ async fn spawn_browser_runtime_stream_listener(
     tokio::spawn(async move {
         let mut accepted_any = false;
         loop {
-            let timeout = if accepted_any {
-                Duration::from_secs(300)
-            } else {
-                Duration::from_secs(30)
-            };
+            let timeout = Duration::from_secs(BROWSER_RUNTIME_STREAM_ACCEPT_TIMEOUT_SECS);
             match tokio::time::timeout(timeout, listener.accept()).await {
                 Ok(Ok((mut stream, _addr))) => {
                     accepted_any = true;
@@ -828,6 +828,56 @@ async fn spawn_browser_runtime_stream_listener(
         let _ = std::fs::remove_file(cleanup_path);
     });
     Ok(())
+}
+
+#[cfg(unix)]
+pub(in crate::api::gateway) fn prune_orphan_browser_runtime_stream_sockets() -> anyhow::Result<usize>
+{
+    let stream_dir = browser_runtime_stream_root().join(BROWSER_RUNTIME_STREAM_TMP_DIR);
+    prune_orphan_browser_runtime_stream_sockets_in_dir(&stream_dir, std::time::SystemTime::now())
+}
+
+#[cfg(unix)]
+fn prune_orphan_browser_runtime_stream_sockets_in_dir(
+    stream_dir: &FsPath,
+    now: std::time::SystemTime,
+) -> anyhow::Result<usize> {
+    let Ok(entries) = std::fs::read_dir(stream_dir) else {
+        return Ok(0);
+    };
+    let stale_after = Duration::from_secs(BROWSER_RUNTIME_STREAM_STALE_SECS);
+    let mut removed = 0_usize;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("sock") {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        let file_type = metadata.file_type();
+        if !file_type.is_socket() && !file_type.is_fifo() {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age < stale_after {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed = removed.saturating_add(1),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(removed)
 }
 
 #[cfg(not(unix))]
@@ -1118,6 +1168,36 @@ mod tests {
                 .get("runtime_stream_path")
                 .and_then(|value| value.as_str())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_orphan_runtime_stream_sockets_removes_only_stale_browser_sockets() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh_path = dir.path().join("fresh.sock");
+        let stale_path = dir.path().join("stale.sock");
+        let regular_path = dir.path().join("regular.sock");
+
+        let fresh = std::os::unix::net::UnixListener::bind(&fresh_path).unwrap();
+        let stale = std::os::unix::net::UnixListener::bind(&stale_path).unwrap();
+        drop(fresh);
+        drop(stale);
+        std::fs::write(&regular_path, b"not a socket").unwrap();
+
+        let now = std::time::SystemTime::now();
+        let removed = prune_orphan_browser_runtime_stream_sockets_in_dir(dir.path(), now).unwrap();
+        assert_eq!(removed, 0);
+        assert!(fresh_path.exists());
+        assert!(stale_path.exists());
+        assert!(regular_path.exists());
+
+        let future = now + Duration::from_secs(BROWSER_RUNTIME_STREAM_STALE_SECS + 1);
+        let removed =
+            prune_orphan_browser_runtime_stream_sockets_in_dir(dir.path(), future).unwrap();
+        assert_eq!(removed, 2);
+        assert!(!fresh_path.exists());
+        assert!(!stale_path.exists());
+        assert!(regular_path.exists());
     }
 
     #[test]

@@ -506,7 +506,11 @@ function openBody(streamId, overrides = {}) {
   if (principalChangedStatus.active_pages !== 1 || principalChangedStatus.active_vms !== 1 || principalChangedStatus.warm_vms !== 0) {
     throw new Error(`different principal/profile launch retained a non-reusable idle VM: ${JSON.stringify(principalChangedStatus)}`);
   }
-  if (!fs.existsSync(`${proofDir}/stream_vm-persistent-second-smoke.json`)) {
+  const retiredProofPath = `${proofDir}/stream_vm-persistent-second-smoke.json`;
+  for (let attempt = 0; attempt < 100 && !fs.existsSync(retiredProofPath); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  if (!fs.existsSync(retiredProofPath)) {
     throw new Error("different principal/profile launch did not terminate the previous idle VM");
   }
   const shutdownPrincipalChanged = await request("POST", "/shutdown", { page_id: principalChanged.page_id });

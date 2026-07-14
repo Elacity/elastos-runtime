@@ -34,7 +34,7 @@ export function createBrowserClipboardBridge({
       const text = clipboardTextFromData(message.data);
       if (text) {
         writeHostClipboardText(text).catch((error) => {
-          showStatus(error.message || "Host clipboard write failed.", { sticky: true });
+          showStatus("Clipboard access is unavailable.", { sticky: true });
         });
       }
       return;
@@ -62,7 +62,7 @@ export function createBrowserClipboardBridge({
       const text = clipboardTextFromData(data);
       if (text) {
         writeHostClipboardText(text).catch((error) => {
-          showStatus(error.message || "Host clipboard write failed.", { sticky: true });
+          showStatus("Clipboard access is unavailable.", { sticky: true });
         });
       }
     }

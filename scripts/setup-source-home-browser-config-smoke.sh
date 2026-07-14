@@ -23,7 +23,11 @@ if [[ -z "$node_bin" ]]; then
   exit 2
 fi
 
-data_dir="$tmp_dir/xdg/elastos"
+case "$(uname -s)" in
+  Darwin) data_dir="$tmp_dir/home/Library/Application Support/elastos" ;;
+  Linux) data_dir="$tmp_dir/xdg/elastos" ;;
+  *) echo "unsupported setup-source-home smoke host: $(uname -s)" >&2; exit 2 ;;
+esac
 mkdir -p "$data_dir/config"
 shared_turn_env="$tmp_dir/shared-turn.env"
 cat > "$shared_turn_env" <<'EOF'

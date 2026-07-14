@@ -670,10 +670,15 @@ async function retireNonReusableIdleVmsForSinglePageRuntime(config, activeVms, v
       next_vm_key_hash: vmKey ? vmKeyHash(vmKey) : null,
       reason: "single_active_page_non_reusable_profile",
     });
-    await terminatePersistentLauncher(
+    terminatePersistentLauncher(
       vmRecord.launcher_child,
       Number(config.shutdown_timeout_ms ?? 30000),
-    );
+    ).then(() => {
+      logEvent("idle_vm_retire_complete", {
+        vm_key_hash: vmKeyHash(activeVmKey),
+        reason: "single_active_page_non_reusable_profile",
+      });
+    });
   }
 }
 
