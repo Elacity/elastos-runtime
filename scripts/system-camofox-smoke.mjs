@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 
-const CAMOFOX_BASE = process.env.CAMOFOX_BASE || "http://127.0.0.1:9377";
-const ELASTOS_BASE_URL = (process.env.ELASTOS_BASE_URL || "http://127.0.0.1:8090").replace(/\/+$/, "");
+const CAMOFOX_BASE = process.env.CAMOFOX_BASE || "http://localhost:9377";
+const ELASTOS_BASE_URL = (process.env.ELASTOS_BASE_URL || "http://localhost:8090").replace(/\/+$/, "");
 const HOME_URL = process.env.HOME_URL || `${ELASTOS_BASE_URL}/apps/home/`;
 const SYSTEM_URL = process.env.SYSTEM_URL || "";
 const HOST_ORIGIN = new URL(HOME_URL).origin;
 const USER_ID = process.env.CAMOFOX_USER_ID || `system-smoke-${Date.now()}`;
+const BANNED_PUBLIC_COPY = /\b(runtime mirror|permissioned runtime|projection|schema|derived facts?|runtime facts?|capsules?|providers?|capabilit(?:y|ies)|affordances?|authority boundary|provider boundary|gate preview|runtime-owned|host-loaded|structured home intents?|provider operation|launch token|hostcall|objects?)\b/i;
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -131,12 +132,13 @@ async function assertSystemWindowLayout(tabId) {
   await waitForSelector(tabId, '.window[data-target="system"] iframe.window-frame', 20_000);
   await delay(1_500);
   const state = await systemWindowState(tabId);
-  assert(state.panelLabels.includes("Profile"), "System window is missing Profile", state);
+  assert(state.panelLabels.includes("Accounts"), "System window is missing Accounts", state);
+  assert(state.panelLabels.includes("Shell"), "System window is missing Shell", state);
   assert(state.panelLabels.includes("Appearance"), "System window is missing Appearance", state);
   assert(state.panelLabels.includes("Recovery"), "System window is missing Recovery", state);
-  assert(state.panelLabels.includes("Capsules"), "System window is missing Capsule Inspector", state);
+  assert(state.panelLabels.includes("Apps & Services"), "System window is missing Apps & Services", state);
   assert(state.panelLabels.includes("This Device"), "System window is missing About device details", state);
-  assert(!state.panelLabels.includes("Account"), "System window still hides profile under Account", state);
+  assert(!state.panelLabels.includes("Profile"), "System window still duplicates People profile settings", state);
   assert(!state.panelLabels.includes("Local state"), "System window still has the old Local state card", state);
   assert(!state.panelLabels.includes("Networks"), "System window still has the old Networks card", state);
   assert(!state.panelLabels.includes("Runtime"), "System window still has the old Runtime card", state);
@@ -220,23 +222,35 @@ async function systemState(tabId) {
       panelLabels: [...document.querySelectorAll(".pc2-section-title")].map((node) => node.textContent?.trim() || ""),
       fieldLabels: [...document.querySelectorAll(".system-fields dt")].map((node) => node.textContent?.trim() || ""),
       walletControlsRemoved: !document.querySelector("#wallet-create") && !document.querySelector("#wallet-approvals"),
-      handleValue: document.querySelector("#handle-input")?.value || "",
       runtimeStatus: document.querySelector('[data-field="runtime-status"]')?.textContent?.trim() || "",
-      storageStatus: document.querySelector('[data-field="storage-status"]')?.textContent?.trim() || "",
-      storageNote: document.querySelector('[data-field="storage-note"]')?.textContent?.trim() || "",
-      storageNoteHidden: document.querySelector('[data-field="storage-note"]')?.hidden ?? null,
+      storageSectionPresent: !!document.querySelector('[data-settings="storage"], #webspace-list'),
       accountListPresent: !!document.querySelector('#account-list'),
       recoveryPasswordPresent: !!document.querySelector('#recovery-password'),
       recoveryPasswordPlaceholder: document.querySelector('#recovery-password')?.getAttribute('placeholder') || '',
       recoveryDownloadLabel: document.querySelector('#recovery-download')?.textContent?.trim() || '',
       recoveryImportPresent: !!document.querySelector('#recovery-import'),
       recoveryImportLabel: document.querySelector('label[for="recovery-import"]')?.textContent?.trim() || '',
-      inspectorPresent: !!document.querySelector('#inspect-list') && !!document.querySelector('#inspect-detail'),
+      catalogPresent: !!document.querySelector('#capsule-catalog'),
+      catalogGroupLabels: [...document.querySelectorAll('.catalog-group-title')].map((node) => node.textContent?.trim() || ''),
+      technicalDetailsPresent: !!document.querySelector('#technical-details'),
+      technicalDetailsOpen: document.querySelector('#technical-details')?.open ?? null,
+      technicalDetailsLabels: [...document.querySelectorAll('.technical-section-title')].map((node) => node.textContent?.trim() || ''),
+      selectedTechnicalId: document.querySelector('.technical-inspect-row.active')?.dataset.technicalInspectId || '',
+      technicalOperationCount: document.querySelectorAll('.technical-operation option:not([value=""])').length,
+      legacyInspectorPresent: !!document.querySelector('#inspect-list') || !!document.querySelector('#inspect-detail'),
       runtimeEventsPresent: !!document.querySelector('[data-field="runtime-events"]'),
-      handleInputDisabled: document.querySelector('#handle-input')?.disabled ?? null,
-      handleSaveDisabled: document.querySelector('#handle-save')?.disabled ?? null,
       errorText: document.querySelector(".system-error:not([hidden])")?.textContent?.trim() || "",
       bodyText: document.body?.textContent || "",
+      ordinaryText: (() => {
+        const clone = document.body?.cloneNode(true);
+        clone?.querySelector('#technical-details')?.remove();
+        clone?.querySelectorAll('script, style').forEach((node) => node.remove());
+        return clone?.textContent?.replace(/\\s+/g, ' ').trim() || '';
+      })(),
+      ordinaryHeadings: [...document.querySelectorAll('h1, h2')]
+        .filter((node) => !node.closest('#technical-details'))
+        .map((node) => node.textContent?.replace(/\\s+/g, ' ').trim() || '')
+        .filter(Boolean),
     }))()`,
   );
 }
@@ -253,7 +267,7 @@ async function systemWindowState(tabId) {
       }
       const root = doc.documentElement;
       const body = doc.body;
-      const overflowing = [...doc.querySelectorAll('.pc2-group, .pc2-card-value, .pc2-input, .system-code, .account-table, .account-table td, .account-name-wrap, .webspace-list, .inspect-grid, .inspect-detail, .inspect-row, .inspect-plan-output')]
+      const overflowing = [...doc.querySelectorAll('.pc2-group, .pc2-card-value, .pc2-input, .system-code, .account-table, .account-table td, .account-name-wrap, .capsule-catalog, .catalog-row, .catalog-facts, .technical-inspect-grid, .technical-inspect-row, .technical-section')]
         .filter((node) => node.scrollWidth > node.clientWidth + 2)
         .map((node) => ({
           tag: node.tagName.toLowerCase(),
@@ -263,7 +277,7 @@ async function systemWindowState(tabId) {
           clientWidth: node.clientWidth,
         }));
       return {
-        panelLabels: [...doc.querySelectorAll('.pc2-section-title')].map((node) => node.textContent?.trim() || ''),
+        panelLabels: [...doc.querySelectorAll('.pc2-section-title, #catalog-title')].map((node) => node.textContent?.trim() || ''),
         bodyScrollHeight: body?.scrollHeight || 0,
         rootClientHeight: root?.clientHeight || 0,
         overflowing,
@@ -280,38 +294,79 @@ async function main() {
     const state = await systemState(tabId);
     assert(state.title === "System · ElastOS", "System page title mismatch", state);
     assert(state.shellLabel === "System", "System shell label mismatch", state);
-    assert(state.panelLabels.includes("Profile"), "System page is missing the Profile panel", state);
+    assert(state.panelLabels.includes("Accounts"), "System page is missing Accounts", state);
+    assert(state.panelLabels.includes("Shell"), "System page is missing Shell", state);
     assert(state.panelLabels.includes("Appearance"), "System page is missing the Appearance panel", state);
     assert(state.panelLabels.includes("Recovery"), "System page is missing the Recovery panel", state);
+    assert(state.panelLabels.includes("Access"), "System page is missing Access", state);
+    assert(!state.panelLabels.includes("Elastos Webspace"), "System must not present app inventory as a WebSpace", state);
+    assert(state.panelLabels.includes("This Device"), "System page is missing This Device", state);
     assert(state.fieldLabels.includes("Device identity"), "System page is missing the Device identity field", state);
-    assert(state.fieldLabels.includes("Display name"), "System page is missing the Display name field", state);
+    assert(!state.fieldLabels.includes("Display name"), "System must keep People profile settings out of System", state);
     assert(state.fieldLabels.includes("Version"), "System page is missing the Version field", state);
-    assert(state.fieldLabels.includes("Documents"), "System page is missing the Documents field", state);
+    assert(!state.fieldLabels.includes("Documents"), "System About must not duplicate Documents", state);
     assert(state.fieldLabels.includes("Accounts"), "System page is missing the Accounts field", state);
     assert(state.fieldLabels.includes("Recovery"), "System page is missing the Recovery field", state);
     assert(state.fieldLabels.includes("Guest access"), "System page is missing the Guest access field", state);
     assert(!state.fieldLabels.includes("Wallet"), "System page should not duplicate Wallet controls", state);
     assert(state.walletControlsRemoved, "System page should not include wallet account or approval controls", state);
     assert(state.fieldLabels.includes("Network status"), "System page is missing the Network status field", state);
-    assert(state.fieldLabels.includes("Runtime mirror"), "System page is missing the Runtime mirror field", state);
+    assert(!state.fieldLabels.includes("Runtime mirror"), "System page still exposes the old Runtime mirror field", state);
     assert(state.errorText.length === 0, "System should not render an access error after Home launch", state);
-    assert(state.handleInputDisabled === false && state.handleSaveDisabled === false, "Home-launched System should allow handle editing", state);
     assert(state.runtimeStatus.length > 0, "System runtime version should be present", state);
-    assert(state.storageStatus.length > 0, "System storage status should be present", state);
-    assert(state.storageNoteHidden === false, "System storage note should stay visible", state);
-    assert(state.storageNote.length > 0, "System storage note should explain document storage state", state);
+    assert(state.storageSectionPresent === false, "System must not expose the removed Storage section", state);
     assert(state.accountListPresent === true, "System page must expose account management", state);
     assert(state.recoveryPasswordPresent === true, "System page must expose Recovery Kit password protection", state);
     assert(state.recoveryPasswordPlaceholder === "Optional password", "Recovery Kit password input should stay concise", state);
     assert(state.recoveryDownloadLabel.toLowerCase().includes("recovery kit"), "System page must expose Recovery Kit download", state);
     assert(state.recoveryImportPresent === true, "System page must expose Recovery Kit import", state);
     assert(state.recoveryImportLabel === "Import Recovery Kit", "Recovery Kit import label drifted", state);
-    assert(state.inspectorPresent === true, "System page must expose Capsule Inspector", state);
+    assert(state.catalogPresent === true, "System page must expose Apps & Services", state);
+    assert(state.technicalDetailsPresent === true, "System Security must expose Technical Details", state);
+    assert(state.technicalDetailsOpen === false, "System Technical Details must be closed by default", state);
+    assert(state.legacyInspectorPresent === false, "System page still exposes the old Capsule Inspector", state);
     assert(state.runtimeEventsPresent === false, "System should not render an untrusted runtime activity panel", state);
+    assert(!BANNED_PUBLIC_COPY.test(state.ordinaryText), "System ordinary views expose internal narration", state);
+    const duplicateHeadings = state.ordinaryHeadings.filter((heading, index, headings) => headings.indexOf(heading) !== index);
+    assert(duplicateHeadings.length === 0, "System ordinary views contain duplicate headings", { duplicateHeadings, state });
     assert(!state.bodyText.includes("Last Launch"), "System still renders the old launch block", state);
     assert(!state.bodyText.includes("launch did not produce a capsule id"), "System still renders stale launch-failure copy", state);
     assert(!state.bodyText.includes("Most recent runtime launch attempt"), "System still renders stale launch description wording", state);
     assert(!state.bodyText.includes("Nothing to show yet."), "System still renders placeholder runtime-event copy", state);
+    await evaluate(tabId, `(() => {
+      const details = document.querySelector('#technical-details');
+      if (details) details.open = true;
+      return Boolean(details);
+    })()`);
+    const technicalLoaded = await waitFor(async () => {
+      const current = await systemState(tabId);
+      return current.technicalDetailsLabels.includes("Identity");
+    }, 20_000, 300);
+    assert(technicalLoaded, "System Technical Details did not load", await systemState(tabId));
+    const technicalState = await systemState(tabId);
+    assert(technicalState.technicalDetailsLabels.includes("Verification"), "System Technical Details is missing Verification status", technicalState);
+    assert(!technicalState.bodyText.includes("not stamped"), "System Technical Details rendered an absent CID placeholder", technicalState);
+    assert(!technicalState.bodyText.includes("not present"), "System Technical Details rendered an absent signature placeholder", technicalState);
+    assert(!technicalState.bodyText.includes("No gate metadata declared"), "System Technical Details rendered absent approval metadata", technicalState);
+    await evaluate(tabId, `(() => {
+      document.querySelector('[data-technical-inspect-id="capsule:exit-provider"]')?.click();
+      return true;
+    })()`);
+    const providerLoaded = await waitFor(async () => {
+      const current = await systemState(tabId);
+      return current.selectedTechnicalId === "capsule:exit-provider" && current.technicalDetailsLabels.includes("Approval");
+    }, 20_000, 300);
+    assert(providerLoaded, "Registered Exit provider did not expose Approval details", await systemState(tabId));
+    assert((await systemState(tabId)).technicalOperationCount > 0, "Registered Exit provider has no previewable operations", await systemState(tabId));
+    await evaluate(tabId, `(() => {
+      document.querySelector('[data-technical-inspect-id="capsule:browser"]')?.click();
+      return true;
+    })()`);
+    const appLoaded = await waitFor(async () => {
+      const current = await systemState(tabId);
+      return current.selectedTechnicalId === "capsule:browser" && !current.technicalDetailsLabels.includes("Approval");
+    }, 20_000, 300);
+    assert(appLoaded, "Ordinary Browser component incorrectly exposed Approval details", await systemState(tabId));
     console.log(`PASS system-smoke home=${HOME_URL}`);
   } catch (error) {
     if (error.skip) {

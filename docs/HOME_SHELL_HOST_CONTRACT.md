@@ -17,8 +17,6 @@ an isolated Runtime-owned PTY shell surface.
 
 The shared capsule web/CLI/fact/affordance/gate/audit model is documented in
 [`CAPSULE_INTERFACE_CONTRACT.md`](CAPSULE_INTERFACE_CONTRACT.md).
-The current file-by-file Home ownership ledger is documented in
-[`HOME_RESPONSIBILITY_MAP.md`](HOME_RESPONSIBILITY_MAP.md).
 
 ## Decided Shell Model
 

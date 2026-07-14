@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260705a";
+const moduleVersion = "home-20260712b";
 const requests = [];
 const windowListeners = new Map();
 const localStorageValues = new Map([
@@ -395,6 +395,11 @@ for (const data of [
     target: "home",
     homeToken: "root-token",
   },
+  {
+    origin: "http://localhost:61180",
+    type: "home:sign-out",
+    homeToken: "wrong-token",
+  },
 ]) {
   for (const listener of windowListeners.get("message") || []) {
     listener({
@@ -418,7 +423,35 @@ assert(
   "unauthorized shell messages switched active shell",
   requests,
 );
+assert(
+  !requests.some((request) => request.url === "/api/auth/sessions/sign-out"),
+  "unauthorized shell message signed out Home",
+  requests,
+);
 assert(homeGuiCore.shellState.windows.size === 0, "unauthorized shell messages created GUI windows");
+
+for (const listener of windowListeners.get("message") || []) {
+  listener({
+    origin: "http://localhost:61180",
+    source: shellFrameWindow,
+    data: {
+      type: "home:sign-out",
+      homeToken: "root-token",
+    },
+  });
+}
+for (let attempt = 0; attempt < 20 && !requests.some(
+  (request) => request.url === "/api/auth/sessions/sign-out",
+); attempt += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+assert(
+  requests.some((request) => (
+    request.url === "/api/auth/sessions/sign-out" && request.method === "POST"
+  )),
+  "authorized Home CLI sign-out did not revoke the browser Home session",
+  requests,
+);
 
 for (const listener of windowListeners.get("message") || []) {
   listener({

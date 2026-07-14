@@ -1,8 +1,8 @@
-import { textNode } from "./wallet-render.js?v=wallet-20260523a";
+import { publicWalletText, textNode } from "./wallet-render.js?v=wallet-20260711c";
 
 export function createWalletFlows({ modalNode, modalBackdropNode, showStatus }) {
   function openInfoModal(title, message) {
-    openFlowModal(title, message, [], [modalButton("Done", closeModal)]);
+    openFlowModal(title, publicWalletText(message), [], [modalButton("Done", closeModal)]);
   }
 
   function openFlowModal(title, subtitle, nodes, actions = [modalButton("Cancel", closeModal, true)]) {

@@ -10,7 +10,9 @@ export function createWalletRender({ statusNode }) {
     if (!statusNode) {
       return;
     }
-    const text = typeof message === "string" ? message.trim() : "";
+    const text = tone === "error"
+      ? publicWalletText(message, "Wallet action could not be completed.")
+      : typeof message === "string" ? message.trim() : "";
     statusNode.hidden = text.length === 0;
     statusNode.textContent = text;
     statusNode.dataset.tone = tone || "muted";
@@ -20,6 +22,14 @@ export function createWalletRender({ statusNode }) {
     showStatus,
     setBusy,
   };
+}
+
+export function publicWalletText(value, fallback = "Wallet action could not be completed.") {
+  const message = String(value || "").trim();
+  if (!message || /\b(schema|projection|provider|adapter|capability|affordance|runtime-owned|launch token|hostcall|request failed|failed to fetch|unauthorized|forbidden|[45]\d\d)\b|engine_[a-z_]+/i.test(message)) {
+    return fallback;
+  }
+  return message;
 }
 
 export function textNode(tag, text, className = "") {

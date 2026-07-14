@@ -21,7 +21,7 @@ import {
   clearShellSessionState,
   ignoreRepeatedAction,
   targetById,
-} from "./shell-core.js?v=home-20260705a";
+} from "./shell-core.js?v=home-20260712b";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -32,7 +32,7 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260705a";
+} from "./shell-window-geometry.js?v=home-20260712b";
 
 let windowHooks = null;
 const PEOPLE_DISCOVERY_AUTO_REFRESH_INITIAL_MS = 1_500;
@@ -100,6 +100,14 @@ const BROWSER_IFRAME_ALLOW_EXTRAS = ["clipboard-read", "clipboard-write"];
 const WEBAUTHN_IFRAME_ALLOW_TARGETS = new Set(["inbox", "wallet"]);
 const pendingWindowLaunches = new Set();
 const peopleDiscoveryRefreshTimers = new WeakMap();
+
+function publicHomeGuiError(error, fallback) {
+  const message = String(error?.message || error || "").trim();
+  if (!message || /\b(schema|projection|provider|adapter|capability|affordance|runtime-owned|launch token|hostcall|request failed|failed to fetch|unauthorized|forbidden|[45]\d\d)\b|engine_[a-z_]+/i.test(message)) {
+    return fallback;
+  }
+  return message;
+}
 
 function iframeSandboxForLaunch(launched) {
   const tokens = [...COMMON_IFRAME_SANDBOX];
@@ -561,21 +569,24 @@ function renderSystemErrorWindow({
   errorNode.querySelector(".window-error-copy").textContent = copy;
   errorNode.querySelector(".window-error-subject-label").textContent = subjectLabel;
   errorNode.querySelector(".window-error-subject-value").textContent = subjectValue;
-  errorNode.querySelector(".window-error-detail").textContent = detail;
+  const detailNode = errorNode.querySelector(".window-error-detail");
+  detailNode.textContent = detail;
+  detailNode.hidden = !detail;
   body.appendChild(errorNode);
   focusWindow(id);
 }
 
 function renderTargetLaunchError(targetId, error) {
   const title = shellState.currentSummary ? targetTitle(shellState.currentSummary, targetId) : targetId;
+  console.error(`failed to launch ${targetId}`, error);
   renderSystemErrorWindow({
     id: "shell-launch-error",
     title,
     headline: `Could not open ${title}`,
-    copy: "Home asked the runtime to open this item, but the launch did not complete.",
-    subjectLabel: "Item ID",
-    subjectValue: targetId,
-    detail: String(error.message || error),
+    copy: "The app did not start. Close this window and try again.",
+    subjectLabel: "App",
+    subjectValue: title,
+    detail: "",
   });
 }
 
@@ -959,7 +970,7 @@ function bindPeopleWindowActions(body) {
   body.querySelector("[data-people-profile-form]")?.addEventListener("submit", (event) => {
     event.preventDefault();
     savePeopleProfile(body, event.currentTarget).catch((error) => {
-      setPeopleStatus(body, error.message || "Could not save profile.", "error");
+      setPeopleStatus(body, publicHomeGuiError(error, "Could not save profile."), "error");
     });
   });
   for (const button of body.querySelectorAll("[data-people-jump]")) {
@@ -976,25 +987,25 @@ function bindPeopleWindowActions(body) {
   }
   body.querySelector("[data-people-action='toggle-discovery']")?.addEventListener("click", (event) => {
     togglePeopleDiscovery(body, event.currentTarget).catch((error) => {
-      setPeopleStatus(body, error.message || "Could not update discovery.", "error");
+      setPeopleStatus(body, publicHomeGuiError(error, "Could not update discovery."), "error");
     });
   });
   body.querySelector("[data-people-action='refresh-discovery']")?.addEventListener("click", () => {
     refreshPeopleDiscovery(body).catch((error) => {
-      setPeopleStatus(body, error.message || "Could not refresh discovery.", "error");
+      setPeopleStatus(body, publicHomeGuiError(error, "Could not refresh discovery."), "error");
     });
   });
   for (const button of body.querySelectorAll("[data-people-action='request-peer']")) {
     button.addEventListener("click", (event) => {
       requestPeopleDiscoveryPeer(body, event.currentTarget).catch((error) => {
-        setPeopleStatus(body, error.message || "Could not request this person.", "error");
+        setPeopleStatus(body, publicHomeGuiError(error, "Could not request this person."), "error");
       });
     });
   }
   for (const button of body.querySelectorAll("[data-people-action='accept-request']")) {
     button.addEventListener("click", (event) => {
       acceptPeopleDiscoveryRequest(body, event.currentTarget).catch((error) => {
-        setPeopleStatus(body, error.message || "Could not accept this request.", "error");
+        setPeopleStatus(body, publicHomeGuiError(error, "Could not accept this request."), "error");
       });
     });
   }
@@ -1003,14 +1014,14 @@ function bindPeopleWindowActions(body) {
       try {
         openPersonChat(body, event.currentTarget);
       } catch (error) {
-        setPeopleStatus(body, error.message || "Could not open chat.", "error");
+        setPeopleStatus(body, publicHomeGuiError(error, "Could not open chat."), "error");
       }
     });
   }
   for (const button of body.querySelectorAll("[data-people-action='remove']")) {
     button.addEventListener("click", (event) => {
       removePersonFromPeople(body, event.currentTarget).catch((error) => {
-        setPeopleStatus(body, error.message || "Could not remove person.", "error");
+        setPeopleStatus(body, publicHomeGuiError(error, "Could not remove person."), "error");
       });
     });
   }

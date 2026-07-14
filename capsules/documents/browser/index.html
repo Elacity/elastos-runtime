@@ -1498,7 +1498,9 @@ function setInspectorView(view) {
 }
 
 function setStatus(message, type) {
-  elements.statusText.textContent = message;
+  elements.statusText.textContent = type === "warning"
+    ? readableDocumentsError(message, "Documents action could not be completed.")
+    : message;
   elements.statusText.className = "status-text" + (type === "warning" ? " warning" : "");
 }
 
@@ -1712,7 +1714,7 @@ async function documentsProviderApi(op, payload) {
     body: payload ? JSON.stringify(payload) : "",
   });
   if (response && response.status === "error") {
-    throw new Error(response.message || "Documents provider request failed");
+    throw new Error(response.message || "Documents request failed");
   }
   return response && typeof response === "object" && "data" in response ? response.data : response;
 }
@@ -1731,7 +1733,7 @@ async function libraryObjectApi(op, payload) {
     })
     : await documentsApi(endpoint, { method: "GET" });
   if (response && response.status === "error") {
-    throw new Error(response.message || "Library object request failed");
+    throw new Error(response.message || "Library request failed");
   }
   return response && typeof response === "object" && "data" in response ? response.data : response;
 }
@@ -1892,7 +1894,7 @@ async function openChatAttachment(payload) {
     });
     const document = response.document;
     if (!document || !document.doc_did) {
-      throw new Error("Documents import did not return an object.");
+      throw new Error("Documents could not import this file.");
     }
     if (state.current && state.current.doc_did === document.doc_did && !state.dirty) {
       return true;
@@ -1905,7 +1907,7 @@ async function openChatAttachment(payload) {
     renderDocumentsList();
     renderCurrentDocument();
     setWorkspaceView("read");
-    setStatus("Opened Chat attachment as a local Documents object.");
+    setStatus("Opened the Chat attachment.");
     return true;
   } finally {
     state.pendingChatAttachmentId = "";
@@ -2174,13 +2176,16 @@ async function requestDeleteCurrent() {
     setStatus("Deleted.");
   } catch (error) {
     console.error("documents delete failed", error);
-    setStatus(error.message || "Delete failed.", "warning");
+    setStatus(readableDocumentsError(error, "Document could not be deleted."), "warning");
   }
 }
 
 function readableDocumentsError(error, defaultMessage) {
   const message = String(error && error.message ? error.message : error || "").trim();
-  return message || defaultMessage;
+  if (!message || /\b(schema|projection|provider|adapter|capability|affordance|runtime-owned|launch token|hostcall|request failed|failed to fetch|unauthorized|forbidden|[45]\d\d)\b|engine_[a-z_]+/i.test(message)) {
+    return defaultMessage;
+  }
+  return message;
 }
 
 function wireShellEvents() {
@@ -2301,8 +2306,9 @@ async function loadShellMode() {
     await loadSummary();
   } catch (error) {
     elements.documentsList.innerHTML = "";
-    elements.preview.innerHTML = '<div class="error-state">' + escapeHtml(error.message || "Could not load documents.") + "</div>";
-    setStatus(error.message || "Could not load documents.", "warning");
+    const message = readableDocumentsError(error, "Documents could not be loaded.");
+    elements.preview.innerHTML = '<div class="error-state">' + escapeHtml(message) + "</div>";
+    setStatus(message, "warning");
   }
 }
 
@@ -2393,18 +2399,18 @@ async function loadShareBundle(options) {
         await loadRawCidMode(rawCid, sourceUri);
         return;
       } catch (fallbackError) {
-        elements.sharePreview.innerHTML = '<div class="error-state">' + escapeHtml(fallbackError.message || error.message || "Could not load shared content.") + "</div>";
+        elements.sharePreview.innerHTML = '<div class="error-state">' + escapeHtml(readableDocumentsError(fallbackError, "Shared content could not be loaded.")) + "</div>";
         return;
       }
     }
-    elements.sharePreview.innerHTML = '<div class="error-state">' + escapeHtml(error.message || "Could not load shared revision.") + "</div>";
+    elements.sharePreview.innerHTML = '<div class="error-state">' + escapeHtml(readableDocumentsError(error, "Shared document could not be loaded.")) + "</div>";
   }
 }
 
 async function loadRawCidMode(cid, sourceUri) {
   const cleanCid = String(cid || "").trim();
   if (!cleanCid) {
-    throw new Error("Missing content CID.");
+    throw new Error("This shared file link is incomplete.");
   }
   state.mode = "share";
   elements.shareShell.classList.remove("hidden");
@@ -2427,13 +2433,13 @@ async function loadRawCidMode(cid, sourceUri) {
   if (looksLikeTextContent(contentType, buffer)) {
     const markdown = new TextDecoder("utf-8").decode(buffer);
     const title = markdown.match(/^#\s+(.+)$/m)?.[1]?.trim() || shortCid(cleanCid);
-    setSharePreview(title, markdown, "Raw content object.", pills);
+    setSharePreview(title, markdown, "Shared file.", pills);
     return;
   }
 
   document.title = shortCid(cleanCid) + " · Documents";
   elements.shareTitle.textContent = shortCid(cleanCid);
-  elements.shareSubtitle.textContent = "Raw binary content object.";
+  elements.shareSubtitle.textContent = "Shared binary file.";
   elements.shareTopline.innerHTML = "";
   pills.forEach((pill) => {
     const span = document.createElement("span");
@@ -2446,7 +2452,7 @@ async function loadRawCidMode(cid, sourceUri) {
   download.href = contentPath;
   download.download = cleanCid;
   download.textContent = "Download content";
-  elements.sharePreview.innerHTML = '<div class="empty-document"><h2>Binary content</h2><p>This CID is available as raw content, not a Documents share bundle.</p></div>';
+  elements.sharePreview.innerHTML = '<div class="empty-document"><h2>Binary file</h2><p>This link points to a file that Documents cannot preview.</p></div>';
   elements.sharePreview.querySelector(".empty-document").appendChild(download);
 }
 
@@ -2457,7 +2463,7 @@ async function loadShareMode() {
 async function loadPublishedRevisionMode(cid) {
   const cleanCid = String(cid || "").trim();
   if (!cleanCid) {
-    throw new Error("Missing published revision CID.");
+    throw new Error("This published document link is incomplete.");
   }
   await loadShareBundle({
     basePath: "/s/" + encodeURIComponent(cleanCid) + "/",

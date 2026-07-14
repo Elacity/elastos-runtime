@@ -20,7 +20,7 @@ fail-closed and permissioned:
 The pure scope rules live in
 [elastos-runtime/src/inspect/mod.rs](../elastos/crates/elastos-runtime/src/inspect/mod.rs).
 The Runtime provider projection and gate preview live in
-[inspect_provider.rs](../elastos/crates/elastos-server/src/inspect_provider.rs).
+[inspect_provider/](../elastos/crates/elastos-server/src/inspect_provider/).
 The Inbox approval and dispatch path lives in
 [gateway_inspect_actions.rs](../elastos/crates/elastos-server/src/api/gateway_inspect_actions.rs).
 

@@ -5,7 +5,6 @@ import {
 } from "./esp-projections.mjs";
 
 const errorNode = document.querySelector(".system-error");
-const storageNoteNode = document.querySelector('[data-field="storage-note"]');
 const backgroundInput = document.querySelector("#background-input");
 const backgroundResetButton = document.querySelector("#background-reset");
 const backgroundStatusNode = document.querySelector('[data-field="background-status"]');
@@ -28,16 +27,17 @@ const recoveryPendingNode = document.querySelector("#recovery-pending");
 const recoveryPendingTextNode = document.querySelector('[data-field="recovery-pending-text"]');
 const recoveryAttachButton = document.querySelector("#recovery-attach");
 const recoveryCancelButton = document.querySelector("#recovery-cancel");
-const webspaceListNode = document.querySelector("#webspace-list");
 const chainTableNode = document.querySelector("#chain-table");
-const activeShellSelect = document.querySelector("#active-shell-select");
-const activeShellApplyButton = document.querySelector("#active-shell-apply");
+const activeShellOptions = document.querySelector("#active-shell-options");
 const activeShellStatusNode = document.querySelector('[data-field="active-shell-status"]');
-const activeShellCurrentNode = document.querySelector('[data-field="active-shell-current"]');
-const inspectListNode = document.querySelector("#inspect-list");
-const inspectDetailNode = document.querySelector("#inspect-detail");
-const inspectStatusNode = document.querySelector("#inspect-status");
-const inspectRefreshButton = document.querySelector("#inspect-refresh");
+const capsuleCatalogNode = document.querySelector("#capsule-catalog");
+const capsuleCatalogStatusNode = document.querySelector("#capsule-catalog-status");
+const capsuleCatalogRefreshButton = document.querySelector("#capsule-catalog-refresh");
+const technicalDetailsNode = document.querySelector("#technical-details");
+const technicalInspectListNode = document.querySelector("#technical-inspect-list");
+const technicalInspectDetailNode = document.querySelector("#technical-inspect-detail");
+const technicalInspectStatusNode = document.querySelector("#technical-inspect-status");
+const technicalInspectRefreshButton = document.querySelector("#technical-inspect-refresh");
 const frameHomeToken = readQueryParam("home_token");
 const ACTIVE_SHELL_HINT_KEY = "elastos.home.active-shell-hint";
 const HOME_HOST_ID = "home";
@@ -46,10 +46,14 @@ let apiHomeToken = frameHomeToken;
 let chainNetworks = [];
 let chainStatusById = new Map();
 let chainLifecycleById = new Map();
-let inspectEntries = [];
+let technicalInspectEntries = [];
+let technicalSelectedId = "";
+let registeredProviderSchemes = new Set();
 let currentAccess = {};
 let passkeyAuthorityActive = false;
 let pendingRecoveryImport = null;
+let activeShellName = "";
+let activeShellBusy = false;
 const DEFAULT_BACKGROUND_IMAGE_URL = "/apps/home-gui/wallpaper.webp";
 const BACKGROUND_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
 const BACKGROUND_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
@@ -72,6 +76,13 @@ const READABLE_CHAIN_KINDS = new Set([
   "bitcoin_core_rpc",
   "bitcoin_rest",
 ]);
+const CATALOG_GROUPS = [
+  { role: "app", label: "Apps" },
+  { role: "viewer", label: "Viewers" },
+  { role: "content", label: "Content" },
+  { role: "provider", label: "Background services" },
+  { role: "shell", label: "Home views" },
+];
 
 boot().catch((error) => {
   console.error("system boot failed", error);
@@ -79,6 +90,11 @@ boot().catch((error) => {
 });
 
 async function boot() {
+  if (!hasShellAccess()) {
+    document.querySelector(".settings-container").hidden = true;
+    document.querySelector("#system-locked").hidden = false;
+    return;
+  }
   configureSettingsTabs();
   configureAppearanceEditor();
   configureGuestAccess();
@@ -86,13 +102,17 @@ async function boot() {
   configureRecoveryAccess();
   configureChainAccess();
   configureActiveShell();
-  configureInspector();
+  configureCapsuleCatalog();
+  configureTechnicalDetails();
   await refreshSystemSummary();
   await refreshActiveShell().catch((error) => showActiveShellStatus(String(error.message || error), "error"));
   await refreshAccountList().catch(() => {});
   await refreshRecoveryStatus();
   await refreshChainNetworks();
-  await refreshInspector().catch((error) => showInspectStatus(String(error.message || error), "error"));
+  await refreshCapsuleCatalog().catch((error) => {
+    console.error("catalog refresh failed", error);
+    showCapsuleCatalogStatus("Apps and services could not be loaded.", "error");
+  });
 }
 
 function configureSettingsTabs() {
@@ -158,8 +178,6 @@ function renderSystemSummary(systemSummary) {
   const access = systemSummary.access || {};
   const runtime = systemSummary.runtime || {};
   const source = systemSummary.source || {};
-  const storage = systemSummary.storage || {};
-  const webspace = systemSummary.webspace || {};
 
   setField("device-did", shortDid(identity.device_did), "", identity.device_did);
   setAccessPolicy(access);
@@ -167,8 +185,6 @@ function renderSystemSummary(systemSummary) {
   setAppearance(appearance);
   setRuntimeState(runtime);
   setSourceState(source);
-  setStorageState(storage);
-  setWebspaceState(webspace);
 }
 
 function setField(field, value, emptyText, titleValue) {
@@ -301,31 +317,64 @@ function configureChainAccess() {
 }
 
 function configureActiveShell() {
-  activeShellApplyButton?.addEventListener("click", () => {
-    applyActiveShell().catch((error) => showActiveShellStatus(String(error.message || error), "error"));
-  });
-  activeShellSelect?.addEventListener("change", () => {
-    if (activeShellApplyButton) {
-      activeShellApplyButton.disabled = false;
+  activeShellOptions?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-shell-name]");
+    if (!button || !activeShellOptions.contains(button) || activeShellBusy) {
+      return;
     }
+    const next = shellName(button.dataset.shellName);
+    if (!next || next === activeShellName) {
+      return;
+    }
+    applyActiveShell(next).catch((error) => {
+      setActiveShellBusy(false);
+      showActiveShellStatus(String(error.message || error), "error");
+    });
   });
 }
 
-function configureInspector() {
-  if (inspectListNode) {
-    inspectListNode.addEventListener("click", onInspectListClick);
+function configureCapsuleCatalog() {
+  if (!capsuleCatalogRefreshButton) {
+    return;
   }
-  if (inspectDetailNode) {
-    inspectDetailNode.addEventListener("click", onInspectDetailClick);
-  }
-  if (inspectRefreshButton) {
-    inspectRefreshButton.disabled = !hasShellAccess();
-    if (hasShellAccess()) {
-      inspectRefreshButton.addEventListener("click", () => {
-        refreshInspector().catch((error) => showInspectStatus(String(error.message || error), "error"));
+  capsuleCatalogRefreshButton.disabled = !hasShellAccess();
+  if (hasShellAccess()) {
+    capsuleCatalogRefreshButton.addEventListener("click", () => {
+      refreshCapsuleCatalog().catch((error) => {
+        console.error("catalog refresh failed", error);
+        showCapsuleCatalogStatus("Apps and services could not be loaded.", "error");
       });
-    }
+    });
   }
+}
+
+function configureTechnicalDetails() {
+  if (!technicalDetailsNode) {
+    return;
+  }
+  technicalInspectRefreshButton.disabled = !hasShellAccess();
+  technicalDetailsNode.addEventListener("toggle", () => {
+    if (technicalDetailsNode.open && technicalInspectEntries.length === 0 && hasShellAccess()) {
+      refreshTechnicalDetails().catch(onTechnicalDetailsError);
+    }
+  });
+  technicalInspectRefreshButton?.addEventListener("click", () => {
+    refreshTechnicalDetails().catch(onTechnicalDetailsError);
+  });
+  technicalInspectListNode?.addEventListener("click", (event) => {
+    const row = event.target.closest("[data-technical-inspect-id]");
+    if (!row || !hasShellAccess()) {
+      return;
+    }
+    showTechnicalObject(readText(row.dataset.technicalInspectId)).catch(onTechnicalDetailsError);
+  });
+  technicalInspectDetailNode?.addEventListener("change", onTechnicalOperationChange);
+  technicalInspectDetailNode?.addEventListener("click", onTechnicalDetailClick);
+}
+
+function onTechnicalDetailsError(error) {
+  console.error("technical details failed", error);
+  showTechnicalInspectStatus("Technical details could not be loaded.", "error");
 }
 
 async function onBackgroundInputChange() {
@@ -494,7 +543,9 @@ function showBackgroundStatus(message, tone) {
   }
   backgroundStatusNode.hidden = false;
   backgroundStatusNode.dataset.tone = tone;
-  backgroundStatusNode.textContent = message;
+  backgroundStatusNode.textContent = tone === "error"
+    ? publicSystemError(message, "Background could not be updated.")
+    : message;
 }
 
 function clearBackgroundStatus() {
@@ -512,7 +563,9 @@ function showOverlayStatus(message, tone) {
   }
   overlayStatusNode.hidden = false;
   overlayStatusNode.dataset.tone = tone;
-  overlayStatusNode.textContent = message;
+  overlayStatusNode.textContent = tone === "error"
+    ? publicSystemError(message, "Background contrast could not be updated.")
+    : message;
 }
 
 function clearOverlayStatus() {
@@ -522,103 +575,6 @@ function clearOverlayStatus() {
   overlayStatusNode.hidden = true;
   overlayStatusNode.textContent = "";
   overlayStatusNode.dataset.tone = "";
-}
-
-function setWebspaceState(webspace) {
-  if (!webspaceListNode) {
-    return;
-  }
-  const entries = Array.isArray(webspace && webspace.entries) ? webspace.entries : [];
-  webspaceListNode.replaceChildren();
-  if (entries.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "webspace-row webspace-row-empty";
-    empty.textContent = "No capsules or providers discovered.";
-    webspaceListNode.append(empty);
-    return;
-  }
-  for (const entry of entries) {
-    webspaceListNode.append(renderWebspaceEntry(entry));
-  }
-}
-
-function renderWebspaceEntry(entry) {
-  const row = document.createElement("details");
-  row.className = "webspace-row";
-  row.dataset.role = readText(entry.role) || "capsule";
-
-  const summary = document.createElement("summary");
-  summary.className = "webspace-summary";
-
-  const icon = document.createElement("span");
-  icon.className = "webspace-icon";
-  icon.textContent = webspaceIcon(entry);
-
-  const main = document.createElement("span");
-  main.className = "webspace-main";
-  const name = document.createElement("strong");
-  name.textContent = webspaceName(entry);
-  const uri = document.createElement("small");
-  uri.textContent = readText(entry.uri) || `elastos://capsules/${readText(entry.id) || "unknown"}`;
-  main.append(name, uri);
-
-  const state = document.createElement("span");
-  state.className = "webspace-state";
-  const status = document.createElement("strong");
-  status.textContent = webspaceStatus(entry);
-  const backend = document.createElement("small");
-  backend.textContent = readText(entry.backend) || "capsule";
-  state.append(status, backend);
-
-  summary.append(icon, main, state);
-  row.append(summary, renderWebspaceDetails(entry));
-  return row;
-}
-
-function renderWebspaceDetails(entry) {
-  const details = document.createElement("div");
-  details.className = "webspace-details";
-  details.append(
-    webspaceDetail("Role", `${readText(entry.role) || "unknown"} · ${readText(entry.capsule_type) || "unknown"}`),
-    webspaceDetail("Authority", readText(entry.authority_boundary) || "Capability-scoped Runtime access."),
-  );
-
-  const capabilities = Array.isArray(entry.capabilities) ? entry.capabilities.map(readText).filter(Boolean) : [];
-  if (capabilities.length > 0) {
-    details.append(webspaceDetail("Requires", capabilities.join(", ")));
-  }
-
-  const operations = Array.isArray(entry.operations) ? entry.operations.map(readText).filter(Boolean) : [];
-  if (operations.length > 0) {
-    details.append(webspaceDetail("Operations", operations.join(", ")));
-  }
-
-  const route = readText(entry.route);
-  if (route) {
-    const action = document.createElement("button");
-    action.type = "button";
-    action.className = "webspace-open";
-    action.textContent = "Open capsule";
-    action.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      openCapsuleTarget(readText(entry.id));
-    });
-    details.append(action);
-  }
-
-  return details;
-}
-
-function webspaceDetail(label, value) {
-  const item = document.createElement("span");
-  item.className = "webspace-detail";
-  const key = document.createElement("b");
-  key.textContent = label;
-  const text = document.createElement("span");
-  text.textContent = value;
-  item.append(key, text);
-  return item;
 }
 
 function openCapsuleTarget(target) {
@@ -633,7 +589,7 @@ function openCapsuleTarget(target) {
 }
 
 async function refreshActiveShell() {
-  if (!activeShellSelect || !hasShellAccess()) {
+  if (!activeShellOptions || !hasShellAccess()) {
     return;
   }
   showActiveShellStatus("Loading", "muted");
@@ -645,38 +601,67 @@ async function refreshActiveShell() {
 }
 
 function renderActiveShell(summary) {
-  if (!activeShellSelect) {
+  if (!activeShellOptions) {
     return;
   }
   const active = shellName(readText(summary?.active) || "home-gui");
+  activeShellName = active;
   rememberActiveShellHint(active);
   const candidates = Array.isArray(summary?.candidates) ? summary.candidates : [];
-  activeShellSelect.replaceChildren();
+  activeShellOptions.replaceChildren();
   for (const candidate of candidates) {
     const name = shellName(readText(candidate.name));
     if (!name || name === HOME_HOST_ID) {
       continue;
     }
-    const option = document.createElement("option");
-    option.value = name;
-    option.textContent = formatShellLabel(name, readText(candidate.title));
-    option.selected = name === active;
-    activeShellSelect.append(option);
+    activeShellOptions.append(createShellChoice(name, candidate, name === active));
   }
-  if (activeShellSelect.options.length === 0) {
-    const option = document.createElement("option");
-    option.value = active;
-    option.textContent = formatShellName(active);
-    option.selected = true;
-    activeShellSelect.append(option);
+  if (activeShellOptions.children.length === 0) {
+    activeShellOptions.append(createShellChoice(active, {}, true));
   }
-  activeShellSelect.value = active;
-  if (activeShellApplyButton) {
-    activeShellApplyButton.disabled = false;
+  setActiveShellBusy(false);
+}
+
+function createShellChoice(name, candidate, current) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "shell-choice";
+  button.dataset.shellName = name;
+  button.dataset.current = current ? "true" : "false";
+  button.setAttribute("aria-pressed", current ? "true" : "false");
+  button.disabled = candidate?.launchable === false;
+
+  const preview = document.createElement("span");
+  preview.className = `shell-choice-preview shell-choice-preview-${shellPreviewKind(name)}`;
+  preview.setAttribute("aria-hidden", "true");
+
+  const copy = document.createElement("span");
+  copy.className = "shell-choice-copy";
+  const title = document.createElement("strong");
+  title.textContent = formatShellLabel(name, readText(candidate?.title));
+  const description = document.createElement("small");
+  description.textContent = shellChoiceDescription(name, readText(candidate?.description));
+  copy.append(title, description);
+
+  const state = document.createElement("span");
+  state.className = "shell-choice-state";
+  state.textContent = current ? "Current" : "";
+  button.append(preview, copy, state);
+  return button;
+}
+
+function shellPreviewKind(name) {
+  return name === "home-cli" ? "terminal" : "desktop";
+}
+
+function shellChoiceDescription(name, fallback = "") {
+  if (name === "home-gui") {
+    return "Apps, windows and taskbar";
   }
-  if (activeShellCurrentNode) {
-    activeShellCurrentNode.textContent = formatShellName(active);
+  if (name === "home-cli") {
+    return "Full-screen terminal";
   }
+  return fallback || "Home shell";
 }
 
 function rememberActiveShellHint(active) {
@@ -692,15 +677,13 @@ function rememberActiveShellHint(active) {
   } catch (_error) {}
 }
 
-async function applyActiveShell() {
-  const active = readText(activeShellSelect?.value);
+async function applyActiveShell(active) {
+  active = shellName(active);
   if (!active) {
     return;
   }
-  if (activeShellApplyButton) {
-    activeShellApplyButton.disabled = true;
-  }
-  showActiveShellStatus("Applying", "muted");
+  setActiveShellBusy(true);
+  showActiveShellStatus("Switching...", "muted");
   const summary = await fetchJson("/api/apps/home/active-shell", {
     method: "POST",
     headers: shellHeaders({ "content-type": "application/json" }),
@@ -709,7 +692,14 @@ async function applyActiveShell() {
   renderActiveShell(summary);
   notifyHomeActiveShellApplied(readText(summary?.active) || active);
   notifyHomeSummaryChanged();
-  showActiveShellStatus("Updated", "ok");
+  showActiveShellStatus("", "ok");
+}
+
+function setActiveShellBusy(busy) {
+  activeShellBusy = busy;
+  for (const button of activeShellOptions?.querySelectorAll("[data-shell-name]") || []) {
+    button.disabled = busy;
+  }
 }
 
 function notifyHomeSummaryChanged() {
@@ -738,13 +728,21 @@ function showActiveShellStatus(message, tone = "muted") {
   if (!activeShellStatusNode) {
     return;
   }
-  const text = readText(message);
+  const text = tone === "error"
+    ? publicSystemError(message, "Home view could not be updated.")
+    : readText(message);
   activeShellStatusNode.textContent = text;
   activeShellStatusNode.dataset.tone = tone;
   activeShellStatusNode.hidden = !text;
 }
 
 function formatShellLabel(name, title = "") {
+  if (name === "home-gui") {
+    return "Desktop";
+  }
+  if (name === "home-cli") {
+    return "Terminal";
+  }
   const label = readText(title);
   if (label) {
     return label;
@@ -761,236 +759,331 @@ function shellName(value) {
   return readText(value);
 }
 
-async function refreshInspector() {
-  if (!inspectListNode || !hasShellAccess()) {
+async function refreshTechnicalDetails() {
+  if (!technicalInspectListNode || !hasShellAccess()) {
     return;
   }
-  setInspectBusy(true);
-  showInspectStatus("Loading", "muted");
+  setTechnicalInspectBusy(true);
+  showTechnicalInspectStatus("Loading", "muted");
   try {
     const result = await inspectProvider("capsules", {});
-    inspectEntries = Array.isArray(result.capsules) ? result.capsules : [];
-    renderInspectList(inspectEntries);
-    showInspectStatus("", "muted");
-    const first = inspectEntries[0];
-    if (first && readText(first.id)) {
-      await showInspectObject(readText(first.id));
-    } else if (inspectDetailNode) {
-      inspectDetailNode.replaceChildren(inspectEmpty("No inspectable capsules or providers."));
+    technicalInspectEntries = (Array.isArray(result.capsules) ? result.capsules : [])
+      .filter((entry) => entry && readText(entry.id))
+      .sort((left, right) => {
+        const kindOrder = technicalKindLabel(left).localeCompare(technicalKindLabel(right));
+        return kindOrder || technicalDisplayName(left).localeCompare(technicalDisplayName(right));
+      });
+    registeredProviderSchemes = new Set(
+      technicalInspectEntries
+        .filter((entry) => readText(entry.kind) === "provider" && readText(entry.state) === "running")
+        .map((entry) => readText(entry.id).replace(/^provider:/, ""))
+        .filter(Boolean),
+    );
+    renderTechnicalInspectList(technicalInspectEntries);
+    showTechnicalInspectStatus(`${technicalInspectEntries.length} objects`, "muted");
+    const selected = technicalInspectEntries.find((entry) => readText(entry.id) === technicalSelectedId)
+      || technicalInspectEntries.find((entry) => readText(entry.kind) === "capsule")
+      || technicalInspectEntries[0];
+    if (selected) {
+      await showTechnicalObject(readText(selected.id));
+    } else {
+      technicalInspectDetailNode?.replaceChildren(technicalEmpty("No technical details are available."));
     }
   } finally {
-    setInspectBusy(false);
+    setTechnicalInspectBusy(false);
   }
 }
 
-function renderInspectList(entries) {
-  if (!inspectListNode) {
+function renderTechnicalInspectList(entries) {
+  if (!technicalInspectListNode) {
     return;
   }
-  inspectListNode.replaceChildren();
+  technicalInspectListNode.replaceChildren();
   if (entries.length === 0) {
-    inspectListNode.append(inspectEmpty("No inspectable capsules or providers."));
+    technicalInspectListNode.append(technicalEmpty("No technical details are available."));
     return;
   }
   for (const entry of entries) {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = "inspect-row";
-    button.dataset.inspectId = readText(entry.id);
-    button.setAttribute("aria-label", `Inspect ${inspectName(entry)}`);
+    button.className = "technical-inspect-row";
+    button.dataset.technicalInspectId = readText(entry.id);
+    button.setAttribute("aria-label", `View technical details for ${technicalDisplayName(entry)}`);
 
-    const marker = document.createElement("span");
-    marker.className = "inspect-marker";
-    marker.textContent = readText(entry.kind) === "provider" ? "P" : "C";
-
-    const main = document.createElement("span");
-    main.className = "inspect-main";
+    const body = document.createElement("span");
+    body.className = "technical-inspect-row-body";
     const name = document.createElement("strong");
-    name.textContent = inspectName(entry);
-    const id = document.createElement("small");
-    id.textContent = readText(entry.id);
-    main.append(name, id);
+    name.textContent = technicalDisplayName(entry);
+    const kind = document.createElement("small");
+    kind.textContent = technicalKindLabel(entry);
+    body.append(name, kind);
 
     const state = document.createElement("span");
-    state.className = "inspect-state";
-    state.textContent = inspectState(entry);
-    button.append(marker, main, state);
-    inspectListNode.append(button);
+    state.className = "technical-inspect-state";
+    state.textContent = humanizeName(readText(entry.state));
+    button.append(body, state);
+    technicalInspectListNode.append(button);
   }
 }
 
-async function onInspectListClick(event) {
-  const row = event.target.closest("[data-inspect-id]");
-  if (!row || !hasShellAccess()) {
-    return;
-  }
-  await showInspectObject(readText(row.dataset.inspectId));
-}
-
-async function showInspectObject(id) {
+async function showTechnicalObject(id) {
   const inspectId = readText(id);
-  if (!inspectDetailNode || !inspectId) {
+  if (!technicalInspectDetailNode || !inspectId) {
     return;
   }
-  setInspectSelection(inspectId);
-  inspectDetailNode.replaceChildren(inspectEmpty("Loading"));
-  const result = await inspectProvider("capsule", { id: inspectId });
-  renderInspectDetail(result);
+  technicalSelectedId = inspectId;
+  setTechnicalSelection(inspectId);
+  technicalInspectDetailNode.replaceChildren(technicalEmpty("Loading"));
+  const object = await inspectProvider("capsule", { id: inspectId });
+  renderTechnicalObject(object);
 }
 
-function renderInspectDetail(object) {
-  if (!inspectDetailNode) {
+function renderTechnicalObject(object) {
+  if (!technicalInspectDetailNode) {
     return;
   }
-  inspectDetailNode.replaceChildren();
-  const header = document.createElement("div");
-  header.className = "inspect-detail-header";
-  const title = document.createElement("strong");
-  title.textContent = readText(object.name) || readText(object.id) || "Inspectable object";
-  const meta = document.createElement("small");
-  meta.textContent = [readText(object.kind), readText(object.state)].filter(Boolean).join(" · ");
+  technicalInspectDetailNode.replaceChildren();
+  const header = document.createElement("header");
+  header.className = "technical-detail-header";
+  const title = document.createElement("h3");
+  title.textContent = technicalDisplayName(object);
+  const meta = document.createElement("span");
+  meta.textContent = technicalKindLabel(object);
   header.append(title, meta);
+  technicalInspectDetailNode.append(header);
 
-  const authority = object && object.authority && typeof object.authority === "object" ? object.authority : {};
-  const provenance = provenanceView(object);
   const manifest = object && object.manifest && typeof object.manifest === "object" ? object.manifest : {};
-  const capabilities = Array.isArray(authority.capabilities) ? authority.capabilities : [];
-  const actions = [...new Set(capabilities.flatMap((capability) => (
-    Array.isArray(capability.actions) ? capability.actions.map(readText) : []
-  )).filter(Boolean))];
-  const operations = [...new Set(capabilities.flatMap((capability) => (
-    Array.isArray(capability.operations) ? capability.operations.map(readText) : []
-  )).filter(Boolean))];
+  const provenance = provenanceView(object);
+  const trust = object && object.trust_evidence && typeof object.trust_evidence === "object"
+    ? object.trust_evidence
+    : {};
+  appendTechnicalSection(technicalInspectDetailNode, "Identity", [
+    ["Identifier", readText(object && object.id)],
+    ["Author", readText(provenance.author)],
+    ["State", humanizeName(readText(object && object.state))],
+    ["Type", humanizeName(readText(object && object.type))],
+    ["Role", humanizeName(readText(manifest.role))],
+    ["Version", readText(manifest.version)],
+  ]);
 
-  const facts = document.createElement("div");
-  facts.className = "inspect-facts";
-  facts.append(
-    inspectFact("Type", `${readText(object.type) || "unknown"} · ${readText(manifest.role) || "unknown"}`),
-    inspectFact("Provides", readText(manifest.provides) || "none"),
-    inspectFact("CID", shortText(readText(provenance.cid), 18) || "not stamped"),
-    inspectFact("Signature", provenance.signature_present ? shortText(readText(provenance.signature_fingerprint), 16) : "not present"),
+  const permissionRows = technicalPermissionRows(object);
+  appendTechnicalSection(technicalInspectDetailNode, "Permissions", permissionRows);
+
+  const hasVerificationEvidence = Boolean(
+    Object.prototype.hasOwnProperty.call(trust, "verified")
+      || provenance.cid
+      || provenance.signature_fingerprint
+      || readText(trust.verified_by),
   );
+  if (hasVerificationEvidence) {
+    appendTechnicalSection(technicalInspectDetailNode, "Verification", [
+      ["Status", trust.verified === true ? "Verified" : "Unverified"],
+      ["Author", readText(provenance.author)],
+      ["Content ID", readText(provenance.cid)],
+      ["Signature", readText(provenance.signature_fingerprint)],
+      ["Verified by", readText(trust.verified_by)],
+    ]);
+  }
+
+  const operations = providerOperations(object);
+  if (operations.length > 0) {
+    technicalInspectDetailNode.append(technicalApprovalSection(object, operations));
+  }
+}
+
+function technicalPermissionRows(object) {
+  const rows = [];
+  const required = Array.isArray(object && object.required_capabilities)
+    ? object.required_capabilities.map(readText).filter(Boolean)
+    : [];
+  if (required.length > 0) {
+    rows.push(["Required", joinWords(required)]);
+  }
+  const authority = object && object.authority && typeof object.authority === "object" ? object.authority : {};
+  for (const capability of Array.isArray(authority.capabilities) ? authority.capabilities : []) {
+    const resource = readText(capability && capability.resource);
+    const actions = Array.isArray(capability && capability.actions)
+      ? capability.actions.map(readText).filter(Boolean)
+      : [];
+    if (resource) {
+      rows.push(["Allows", actions.length > 0 ? `${resource} — ${joinWords(actions)}` : resource]);
+    }
+  }
+  const storage = Array.isArray(object && object.storage_namespaces)
+    ? object.storage_namespaces.map(readText).filter(Boolean)
+    : [];
+  if (storage.length > 0) {
+    rows.push(["Storage", joinWords(storage)]);
+  }
+  return rows;
+}
+
+function providerOperations(object) {
+  if (readText(object.manifest && object.manifest.role) !== "provider") {
+    return [];
+  }
+  const scheme = providerScheme(object);
+  if (!scheme || !registeredProviderSchemes.has(scheme)) {
+    return [];
+  }
+  const authority = object && object.authority && typeof object.authority === "object" ? object.authority : {};
+  return [...new Set(
+    (Array.isArray(authority.capabilities) ? authority.capabilities : [])
+      .flatMap((capability) => Array.isArray(capability && capability.operations) ? capability.operations : [])
+      .map(readText)
+      .filter(Boolean),
+  )].sort();
+}
+
+function providerScheme(object) {
+  const provides = readText(object && object.manifest && object.manifest.provides);
+  const match = provides.match(/^elastos:\/\/([^/]+)\//);
+  if (match) {
+    return match[1];
+  }
+  return readText(object && object.name).replace(/-(provider|adapter)$/, "");
+}
+
+function technicalApprovalSection(object, operations) {
+  const section = document.createElement("section");
+  section.className = "technical-section technical-approval";
+  section.dataset.technicalInspectId = readText(object.id);
+  const title = document.createElement("h3");
+  title.className = "technical-section-title";
+  title.textContent = "Approval";
+
+  const controls = document.createElement("div");
+  controls.className = "technical-approval-controls";
+  const label = document.createElement("label");
+  label.textContent = "Operation";
+  const select = document.createElement("select");
+  select.className = "pc2-input technical-operation";
+  select.setAttribute("aria-label", "Provider operation");
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "Choose an operation";
+  placeholder.selected = true;
+  select.append(placeholder);
+  for (const operation of operations) {
+    const option = document.createElement("option");
+    option.value = operation;
+    option.textContent = humanizeName(operation);
+    select.append(option);
+  }
+  label.append(select);
+  const previewButton = document.createElement("button");
+  previewButton.type = "button";
+  previewButton.className = "pc2-btn pc2-btn-secondary";
+  previewButton.dataset.technicalPreview = "";
+  previewButton.disabled = true;
+  previewButton.textContent = "Preview";
+  controls.append(label, previewButton);
 
   const preview = document.createElement("div");
-  preview.className = "inspect-preview";
-  const previewTitle = document.createElement("div");
-  previewTitle.className = "inspect-preview-title";
-  previewTitle.textContent = "Gate preview";
-  preview.append(previewTitle);
-  if (operations.length === 0) {
-    preview.append(inspectEmpty("No declared provider operations."));
-  } else {
-    const controls = document.createElement("div");
-    controls.className = "inspect-preview-actions";
-    for (const operation of operations.slice(0, 8)) {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "inspect-plan-button";
-      button.dataset.inspectPlanId = readText(object.id);
-      button.dataset.inspectOperation = operation;
-      button.textContent = operation;
-      controls.append(button);
-    }
-    preview.append(controls);
-  }
-  const output = document.createElement("pre");
-  output.className = "inspect-plan-output";
-  output.textContent = operations.length > 0
-    ? "Select an operation to reflect the capability gate."
-    : "No gate metadata declared.";
-  preview.append(output);
-  const actButton = document.createElement("button");
-  actButton.type = "button";
-  actButton.className = "inspect-plan-button";
-  actButton.dataset.inspectActId = "";
-  actButton.dataset.inspectActOperation = "";
-  actButton.hidden = true;
-  actButton.textContent = "Request approval";
-  preview.append(actButton);
-
-  const affordances = document.createElement("div");
-  affordances.className = "inspect-affordances";
-  affordances.append(
-    inspectFact("Actions", actions.join(", ") || "none"),
-    inspectFact("Audit", Array.isArray(authority.audit_events) ? authority.audit_events.map(readText).filter(Boolean).join(", ") || "none" : "none"),
-  );
-
-  inspectDetailNode.append(header, facts, preview, affordances);
+  preview.className = "technical-approval-preview";
+  preview.hidden = true;
+  const requestButton = document.createElement("button");
+  requestButton.type = "button";
+  requestButton.className = "pc2-btn";
+  requestButton.dataset.technicalRequest = "";
+  requestButton.hidden = true;
+  requestButton.textContent = "Request approval";
+  const status = document.createElement("p");
+  status.className = "system-status technical-approval-status";
+  status.hidden = true;
+  section.append(title, controls, preview, requestButton, status);
+  return section;
 }
 
-async function onInspectDetailClick(event) {
-  const actButton = event.target.closest("[data-inspect-act-id]");
-  if (actButton && hasShellAccess()) {
-    const id = readText(actButton.dataset.inspectActId);
-    const operation = readText(actButton.dataset.inspectActOperation);
-    if (!id || !operation) {
-      return;
-    }
-    const output = inspectDetailNode.querySelector(".inspect-plan-output");
-    if (output) {
-      output.textContent = "Creating Inbox approval request...";
-    }
-    try {
-      const result = await inspectProvider("request_act", { id, operation, request: {} });
-      const validation = inspectActionRequestValidation(result);
-      if (output) {
-        output.textContent = JSON.stringify({
-          status: result.status || "pending",
-          request_id: validation.request_id || result.request_id,
-          operation: validation.operation || result.operation,
-          request_binding: validation.binding,
-          projection: {
-            ok: validation.ok,
-            reasons: validation.reasons,
-          },
-          plan: result.plan || null,
-        }, null, 2);
-      }
-      actButton.hidden = true;
-    } catch (error) {
-      if (output) {
-        output.textContent = String(error.message || error);
-      }
-    }
+function onTechnicalOperationChange(event) {
+  const select = event.target.closest(".technical-operation");
+  if (!select) {
     return;
   }
-  const button = event.target.closest("[data-inspect-plan-id]");
-  if (!button || !hasShellAccess()) {
+  const section = select.closest(".technical-approval");
+  const previewButton = section?.querySelector("[data-technical-preview]");
+  const preview = section?.querySelector(".technical-approval-preview");
+  const requestButton = section?.querySelector("[data-technical-request]");
+  if (previewButton) {
+    previewButton.disabled = !readText(select.value);
+  }
+  if (preview) {
+    preview.hidden = true;
+    preview.replaceChildren();
+  }
+  if (requestButton) {
+    requestButton.hidden = true;
+  }
+  showTechnicalApprovalStatus(section, "", "muted");
+}
+
+function onTechnicalDetailClick(event) {
+  const previewButton = event.target.closest("[data-technical-preview]");
+  if (previewButton) {
+    previewTechnicalOperation(previewButton.closest(".technical-approval")).catch(onTechnicalDetailsError);
     return;
   }
-  const id = readText(button.dataset.inspectPlanId);
-  const operation = readText(button.dataset.inspectOperation);
+  const requestButton = event.target.closest("[data-technical-request]");
+  if (requestButton) {
+    requestTechnicalApproval(requestButton.closest(".technical-approval")).catch(onTechnicalDetailsError);
+  }
+}
+
+async function previewTechnicalOperation(section) {
+  const id = readText(section && section.dataset.technicalInspectId);
+  const operation = readText(section?.querySelector(".technical-operation")?.value);
   if (!id || !operation) {
     return;
   }
-  const output = inspectDetailNode.querySelector(".inspect-plan-output");
-  if (output) {
-    output.textContent = "Reflecting gate preview...";
+  showTechnicalApprovalStatus(section, "Loading", "muted");
+  const result = await inspectProvider("plan", { id, operation });
+  const view = gatePreviewAuditView(result);
+  if (view.state !== "preview") {
+    throw new Error("approval preview is not fail-closed");
   }
+  const rows = [["Operation", humanizeName(operation)]];
+  for (const capability of Array.isArray(result.capabilities) ? result.capabilities : []) {
+    const resource = readText(capability && capability.resource);
+    const actions = Array.isArray(capability && capability.actions)
+      ? capability.actions.map(readText).filter(Boolean)
+      : [];
+    if (resource) {
+      rows.push(["Permission", actions.length > 0 ? `${resource} — ${joinWords(actions)}` : resource]);
+    }
+  }
+  const audit = Array.isArray(result.audit_events) ? result.audit_events.map(readText).filter(Boolean) : [];
+  if (audit.length > 0) {
+    rows.push(["Audit", joinWords(audit)]);
+  }
+  const preview = section.querySelector(".technical-approval-preview");
+  preview.replaceChildren(technicalFactList(rows));
+  preview.hidden = false;
+  const requestButton = section.querySelector("[data-technical-request]");
+  requestButton.dataset.technicalOperation = operation;
+  requestButton.hidden = false;
+  showTechnicalApprovalStatus(section, "", "muted");
+}
+
+async function requestTechnicalApproval(section) {
+  const id = readText(section && section.dataset.technicalInspectId);
+  const requestButton = section?.querySelector("[data-technical-request]");
+  const operation = readText(requestButton && requestButton.dataset.technicalOperation);
+  if (!id || !operation) {
+    return;
+  }
+  requestButton.disabled = true;
+  showTechnicalApprovalStatus(section, "Sending to Inbox", "muted");
   try {
-    const result = await inspectProvider("plan", { id, operation });
-    const preview = gatePreviewAuditView(result);
-    if (output) {
-      output.textContent = JSON.stringify({
-        operation: preview.operation,
-        state: preview.state,
-        capability_count: preview.capability_count,
-        audit_events: preview.audit_events,
-        preview_only: preview.preview_only,
-        can_dispatch: preview.can_dispatch,
-        execution: result.execution || null,
-      }, null, 2);
+    const result = await inspectProvider("request_act", { id, operation, request: {} });
+    const validation = inspectActionRequestValidation(result, {});
+    if (!validation.ok) {
+      throw new Error("approval request did not include a valid preview and request binding");
     }
-    const requestButton = inspectDetailNode.querySelector("[data-inspect-act-id]");
-    if (requestButton) {
-      requestButton.dataset.inspectActId = id;
-      requestButton.dataset.inspectActOperation = operation;
-      requestButton.hidden = preview.state !== "preview";
-    }
-  } catch (error) {
-    if (output) {
-      output.textContent = String(error.message || error);
-    }
+    requestButton.hidden = true;
+    showTechnicalApprovalStatus(section, "Sent to Inbox for approval.", "ok");
+    notifyHomeSummaryChanged();
+  } finally {
+    requestButton.disabled = false;
   }
 }
 
@@ -1004,97 +1097,381 @@ async function inspectProvider(operation, body) {
     return response.data || {};
   }
   if (
-    operation === "request_act" &&
-    response.schema === "elastos.inspect.action-request/v1" &&
-    response.status === "pending"
+    operation === "request_act"
+      && response.schema === "elastos.inspect.action-request/v1"
+      && response.status === "pending"
   ) {
     return response;
   }
-  throw new Error(readText(response.message) || readText(response.code) || "inspect provider error");
+  throw new Error(readText(response.message) || readText(response.code) || "inspection failed");
 }
 
-function inspectFact(label, value) {
-  const item = document.createElement("span");
-  item.className = "inspect-fact";
-  const key = document.createElement("b");
-  key.textContent = label;
-  const text = document.createElement("span");
-  text.textContent = readText(value) || "none";
-  item.append(key, text);
-  return item;
+function appendTechnicalSection(parent, title, rows) {
+  const values = rows.filter(([, value]) => readText(value));
+  if (values.length === 0) {
+    return;
+  }
+  const section = document.createElement("section");
+  section.className = "technical-section";
+  const heading = document.createElement("h3");
+  heading.className = "technical-section-title";
+  heading.textContent = title;
+  section.append(heading, technicalFactList(values));
+  parent.append(section);
 }
 
-function inspectEmpty(message) {
+function technicalFactList(rows) {
+  const list = document.createElement("dl");
+  list.className = "technical-facts";
+  for (const [label, value] of rows) {
+    const item = document.createElement("div");
+    const key = document.createElement("dt");
+    key.textContent = label;
+    const text = document.createElement("dd");
+    text.textContent = readText(value);
+    item.append(key, text);
+    list.append(item);
+  }
+  return list;
+}
+
+function technicalDisplayName(entry) {
+  const name = readText(entry && entry.name);
+  return humanizeName(name.replace(/-(provider|adapter)$/, "")) || "Object";
+}
+
+function technicalKindLabel(entry) {
+  return readText(entry && entry.kind) === "provider" ? "Runtime service" : "Component";
+}
+
+function technicalEmpty(message) {
   const empty = document.createElement("div");
-  empty.className = "inspect-empty";
+  empty.className = "technical-empty";
   empty.textContent = message;
   return empty;
 }
 
-function inspectName(entry) {
-  return readText(entry && entry.name) || readText(entry && entry.id) || "Object";
-}
-
-function inspectState(entry) {
-  const state = readText(entry && entry.state);
-  return state ? state.charAt(0).toUpperCase() + state.slice(1) : "Unknown";
-}
-
-function setInspectSelection(id) {
-  for (const row of document.querySelectorAll("[data-inspect-id]")) {
-    row.classList.toggle("active", row.dataset.inspectId === id);
+function setTechnicalSelection(id) {
+  for (const row of document.querySelectorAll("[data-technical-inspect-id]")) {
+    row.classList.toggle("active", row.dataset.technicalInspectId === id);
   }
 }
 
-function setInspectBusy(busy) {
-  if (inspectRefreshButton) {
-    inspectRefreshButton.disabled = busy || !hasShellAccess();
+function setTechnicalInspectBusy(busy) {
+  if (technicalInspectRefreshButton) {
+    technicalInspectRefreshButton.disabled = busy || !hasShellAccess();
   }
 }
 
-function showInspectStatus(message, tone) {
-  if (!inspectStatusNode) {
+function showTechnicalInspectStatus(message, tone) {
+  if (!technicalInspectStatusNode) {
+    return;
+  }
+  technicalInspectStatusNode.textContent = readText(message);
+  technicalInspectStatusNode.dataset.tone = tone;
+}
+
+function showTechnicalApprovalStatus(section, message, tone) {
+  const status = section?.querySelector(".technical-approval-status");
+  if (!status) {
     return;
   }
   const text = readText(message);
-  inspectStatusNode.hidden = text.length === 0;
-  inspectStatusNode.textContent = text;
-  inspectStatusNode.dataset.tone = tone;
+  status.textContent = text;
+  status.dataset.tone = tone;
+  status.hidden = !text;
 }
 
-function webspaceName(entry) {
-  const id = readText(entry && entry.id);
-  if (!id) {
-    return "Unknown capsule";
+async function refreshCapsuleCatalog() {
+  if (!capsuleCatalogNode || !hasShellAccess()) {
+    return;
   }
-  return id.split("-").map((part) => (
-    part ? part.charAt(0).toUpperCase() + part.slice(1) : part
-  )).join(" ");
+  setCapsuleCatalogBusy(true);
+  showCapsuleCatalogStatus("Loading", "muted");
+  try {
+    const [catalog, interfaces] = await Promise.all([
+      fetchJson("/api/capsules/catalog", { headers: shellHeaders() }),
+      fetchJson("/api/capsules/interfaces", { headers: shellHeaders() }),
+    ]);
+    const entries = (Array.isArray(catalog.capsules) ? catalog.capsules : [])
+      .filter((entry) => entry && entry.installed !== false);
+    const interfaceEntries = Array.isArray(interfaces.interfaces) ? interfaces.interfaces : [];
+    renderCapsuleCatalog(entries, interfaceEntries);
+    showCapsuleCatalogStatus(`${entries.length} available`, "muted");
+  } finally {
+    setCapsuleCatalogBusy(false);
+  }
 }
 
-function webspaceStatus(entry) {
-  if (entry && entry.running === true) {
-    return "Running";
+function renderCapsuleCatalog(entries, interfaceEntries) {
+  if (!capsuleCatalogNode) {
+    return;
   }
-  const status = readText(entry && entry.status);
-  return status ? status.charAt(0).toUpperCase() + status.slice(1) : "Installed";
+  capsuleCatalogNode.replaceChildren();
+  if (entries.length === 0) {
+    capsuleCatalogNode.append(catalogEmpty("No apps or services are installed."));
+    return;
+  }
+  const entriesByName = new Map(entries.map((entry) => [readText(entry.name), entry]));
+  const interfacesByCapsule = new Map();
+  for (const entry of interfaceEntries) {
+    const capsule = readText(entry && entry.capsule);
+    if (!capsule) {
+      continue;
+    }
+    const current = interfacesByCapsule.get(capsule) || [];
+    current.push(entry);
+    interfacesByCapsule.set(capsule, current);
+  }
+  for (const group of CATALOG_GROUPS) {
+    const members = entries
+      .filter((entry) => readText(entry.role) === group.role)
+      .sort((left, right) => catalogTitle(left).localeCompare(catalogTitle(right)));
+    if (members.length === 0) {
+      continue;
+    }
+    const section = document.createElement("section");
+    section.className = "catalog-group";
+    const heading = document.createElement("div");
+    heading.className = "catalog-group-heading";
+    const title = document.createElement("h2");
+    title.className = "catalog-group-title";
+    title.textContent = group.label;
+    const count = document.createElement("span");
+    count.className = "catalog-group-count";
+    count.textContent = String(members.length);
+    heading.append(title, count);
+    const list = document.createElement("div");
+    list.className = "catalog-list";
+    for (const entry of members) {
+      list.append(catalogRow(entry, entriesByName, interfacesByCapsule.get(readText(entry.name)) || []));
+    }
+    section.append(heading, list);
+    capsuleCatalogNode.append(section);
+  }
 }
 
-function webspaceIcon(entry) {
-  const role = readText(entry && entry.role);
-  if (role === "provider") {
-    return "P";
+function catalogRow(entry, entriesByName, interfaceEntries) {
+  const row = document.createElement("article");
+  row.className = "catalog-row";
+  const body = document.createElement("div");
+  body.className = "catalog-row-body";
+  const title = document.createElement("h3");
+  title.textContent = catalogTitle(entry);
+  const summary = document.createElement("p");
+  summary.className = "catalog-summary";
+  summary.textContent = catalogSummary(entry);
+  body.append(title, summary);
+
+  const facts = catalogFacts(entry, entriesByName, interfaceEntries);
+  if (facts.length > 0) {
+    const list = document.createElement("dl");
+    list.className = "catalog-facts";
+    for (const [label, value] of facts) {
+      const item = document.createElement("div");
+      const key = document.createElement("dt");
+      key.textContent = label;
+      const text = document.createElement("dd");
+      text.textContent = value;
+      item.append(key, text);
+      list.append(item);
+    }
+    body.append(list);
   }
-  if (role === "shell") {
-    return "H";
+  row.append(body);
+
+  if (entry.launchable === true && readText(entry.launch_target)) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "pc2-btn pc2-btn-secondary catalog-open";
+    button.textContent = "Open";
+    button.addEventListener("click", () => openCapsuleTarget(readText(entry.launch_target)));
+    row.append(button);
   }
+  return row;
+}
+
+function catalogFacts(entry, entriesByName, interfaceEntries) {
+  const facts = [];
+  const role = readText(entry.role);
   if (role === "viewer") {
-    return "V";
+    const accepts = acceptedContent(entry, interfaceEntries);
+    if (accepts.length > 0) {
+      facts.push(["Accepts", joinWords(accepts)]);
+    }
   }
   if (role === "content") {
-    return "C";
+    const viewer = readText(entry.viewer_title) || catalogTitle(entriesByName.get(readText(entry.viewer)));
+    if (viewer) {
+      facts.push(["Opens with", viewer]);
+    }
   }
-  return "A";
+  const dependencies = (Array.isArray(entry.requires) ? entry.requires : [])
+    .map((requirement) => {
+      const name = readText(requirement && requirement.name);
+      const dependency = entriesByName.get(name);
+      return dependency ? catalogTitle(dependency) : "";
+    })
+    .filter(Boolean);
+  if (dependencies.length > 0) {
+    facts.push(["Needs", joinWords(dependencies)]);
+  }
+  const executable = executableActions(interfaceEntries)
+    .filter((action) => action !== "Open");
+  if (executable.length > 0) {
+    facts.push(["Available", joinWords(executable)]);
+  }
+  return facts;
+}
+
+function acceptedContent(entry, interfaceEntries) {
+  const content = (Array.isArray(entry.accepted_content) ? entry.accepted_content : [])
+    .map((item) => readText(item && item.title) || humanizeName(readText(item && item.name)))
+    .filter(Boolean);
+  const extensions = new Set();
+  for (const interfaceEntry of interfaceEntries) {
+    const methods = interfaceEntry && interfaceEntry.interface && Array.isArray(interfaceEntry.interface.methods)
+      ? interfaceEntry.interface.methods
+      : [];
+    for (const method of methods) {
+      const accepts = method && method.input_schema && Array.isArray(method.input_schema.accepts)
+        ? method.input_schema.accepts
+        : [];
+      for (const accepted of accepts) {
+        if (readText(accepted && accepted.mode) === "unsupported_family_diagnostic") {
+          continue;
+        }
+        for (const extension of Array.isArray(accepted && accepted.extensions) ? accepted.extensions : []) {
+          const value = readText(extension);
+          if (value) {
+            extensions.add(value);
+          }
+        }
+      }
+    }
+  }
+  if (extensions.size > 0) {
+    content.push(`${joinWords([...extensions])} files`);
+  }
+  return content;
+}
+
+function executableActions(interfaceEntries) {
+  const actions = [];
+  for (const interfaceEntry of interfaceEntries) {
+    for (const binding of Array.isArray(interfaceEntry && interfaceEntry.bindings) ? interfaceEntry.bindings : []) {
+      if (!binding || binding.executable !== true) {
+        continue;
+      }
+      const methodId = readText(binding.method);
+      if (methodId === "capsule.open") {
+        actions.push("Open");
+        continue;
+      }
+      const operation = methodId.split(".").filter(Boolean).at(-1);
+      if (operation) actions.push(humanizeName(operation));
+    }
+  }
+  return [...new Set(actions)];
+}
+
+function catalogSummary(entry) {
+  const title = catalogTitle(entry);
+  const role = readText(entry && entry.role);
+  if (role === "provider") {
+    return "Service for apps on this Home.";
+  }
+  if (role === "shell") {
+    return readText(entry && entry.name).endsWith("-cli")
+      ? "Use Home from a command line."
+      : "Use the Home desktop.";
+  }
+  if (readText(entry && entry.name) === "home") {
+    return "Keeps your selected Home view available.";
+  }
+  const description = readText(entry && entry.description)
+    .replace(/\s+through the ElastOS [^.]+ boundary/gi, "")
+    .replace(/\s+inside ElastOS/gi, "")
+    .replace(/\bcapsules\b/gi, "apps")
+    .replace(/\bproviders\b/gi, "services")
+    .replace(/\bruntime settings\b/gi, "settings");
+  if (description && !/\b(runtime|capsules?|providers?|projection|schema|derived facts?|boundary|capabilit(?:y|ies)|affordances?|host-loaded|frontend)\b/i.test(description)) {
+    return description;
+  }
+  if (role === "viewer") {
+    return `Open compatible content with ${title}.`;
+  }
+  return `${title} is available on this Home.`;
+}
+
+function catalogTitle(entry) {
+  const title = readText(entry && entry.title);
+  if (readText(entry && entry.role) === "provider") {
+    return serviceLabel(entry);
+  }
+  return title ? normalizeDisplayTitle(title) : humanizeName(readText(entry && entry.name));
+}
+
+function serviceLabel(entry) {
+  const title = readText(entry && entry.title) || humanizeName(readText(entry && entry.name));
+  return normalizeDisplayTitle(title.replace(/\s+(Provider|Adapter)$/i, ""));
+}
+
+function normalizeDisplayTitle(value) {
+  const acronyms = new Map([["Did", "DID"], ["Gba", "GBA"], ["Ipfs", "IPFS"], ["Cli", "CLI"], ["Gui", "GUI"]]);
+  return readText(value).split(/\s+/).map((part) => acronyms.get(part) || part).join(" ");
+}
+
+function humanizeName(value) {
+  const acronyms = new Map([
+    ["did", "DID"],
+    ["gba", "GBA"],
+    ["ipfs", "IPFS"],
+    ["cli", "CLI"],
+    ["gui", "GUI"],
+    ["wasm", "WASM"],
+    ["microvm", "microVM"],
+    ["ucity", "uCity"],
+    ["metamask", "MetaMask"],
+    ["unisat", "UniSat"],
+    ["walletconnect", "WalletConnect"],
+  ]);
+  return readText(value)
+    .split(/[\s_-]+/)
+    .filter(Boolean)
+    .map((part) => acronyms.get(part.toLowerCase()) || `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
+    .join(" ");
+}
+
+function joinWords(values) {
+  const words = [...new Set(values.map(readText).filter(Boolean))];
+  if (words.length < 2) {
+    return words[0] || "";
+  }
+  return `${words.slice(0, -1).join(", ")} and ${words.at(-1)}`;
+}
+
+function catalogEmpty(message) {
+  const empty = document.createElement("div");
+  empty.className = "catalog-empty";
+  empty.textContent = message;
+  return empty;
+}
+
+function setCapsuleCatalogBusy(busy) {
+  if (capsuleCatalogRefreshButton) {
+    capsuleCatalogRefreshButton.disabled = busy || !hasShellAccess();
+  }
+}
+
+function showCapsuleCatalogStatus(message, tone) {
+  if (!capsuleCatalogStatusNode) {
+    return;
+  }
+  capsuleCatalogStatusNode.textContent = tone === "error"
+    ? publicSystemError(message, "Apps and services could not be loaded.")
+    : readText(message);
+  capsuleCatalogStatusNode.dataset.tone = tone;
 }
 
 async function refreshPasskeyStatus() {
@@ -1606,7 +1983,9 @@ function showRecoveryStatus(message, tone) {
   if (!recoveryStatusNode) {
     return;
   }
-  const text = readText(message);
+  const text = tone === "error"
+    ? publicSystemError(message, "Recovery could not be updated.")
+    : readText(message);
   recoveryStatusNode.hidden = text.length === 0;
   recoveryStatusNode.textContent = text;
   recoveryStatusNode.dataset.tone = tone;
@@ -1617,7 +1996,9 @@ function showRecoveryNote(message, tone) {
   if (!recoveryNoteNode) {
     return;
   }
-  const text = readText(message);
+  const text = tone === "error"
+    ? publicSystemError(message, "Recovery action could not be completed.")
+    : readText(message);
   recoveryNoteNode.hidden = text.length === 0;
   recoveryNoteNode.textContent = text;
   recoveryNoteNode.dataset.tone = tone;
@@ -1653,7 +2034,7 @@ async function refreshChainStatuses() {
   for (const network of chainNetworks) {
     const networkId = readText(network.id);
     if (!READABLE_CHAIN_KINDS.has(network.kind)) {
-      next.set(networkId, { tone: "muted", text: "Listed", detail: "Typed reads pending" });
+      next.set(networkId, { tone: "muted", text: "Listed", detail: "Status unavailable" });
       continue;
     }
     try {
@@ -1663,7 +2044,7 @@ async function refreshChainStatuses() {
       next.set(networkId, {
         tone: "error",
         text: "Unavailable",
-        detail: readText(error.message || error) || chainFailureNote(network),
+        detail: publicSystemError(error, chainFailureNote(network)),
       });
     }
     await refreshChainLifecycle(networkId, false);
@@ -1691,7 +2072,7 @@ async function onChainRowClick(event) {
   renderChainTable();
   try {
     if (!READABLE_CHAIN_KINDS.has(network.kind)) {
-      chainStatusById.set(chainId, { tone: "muted", text: "Listed", detail: "Typed reads pending" });
+      chainStatusById.set(chainId, { tone: "muted", text: "Listed", detail: "Status unavailable" });
       return;
     }
     const data = await fetchProviderJson("/api/provider/chain/status", { network: chainId });
@@ -1701,7 +2082,7 @@ async function onChainRowClick(event) {
     chainStatusById.set(chainId, {
       tone: "error",
       text: "Unavailable",
-      detail: readText(error.message || error) || chainFailureNote(network),
+      detail: publicSystemError(error, chainFailureNote(network)),
     });
     await refreshChainLifecycle(chainId, false);
   } finally {
@@ -1731,8 +2112,8 @@ async function refreshChainLifecycle(chainId, renderWhenDone) {
   } catch (error) {
     chainLifecycleById.set(chainId, {
       tone: "muted",
-      text: "Control off",
-      detail: readText(error.message || error) || "Lifecycle unavailable",
+      text: "Controls unavailable",
+      detail: "This network cannot be controlled from here.",
       control_available: false,
       busy: false,
     });
@@ -1759,7 +2140,7 @@ async function onChainLifecycleAction(button) {
     ...current,
     tone: "muted",
     text: actionLabel(action),
-    detail: "Sending operator-approved control request",
+    detail: "Applying change.",
     busy: true,
   });
   renderChainTable();
@@ -1777,8 +2158,8 @@ async function onChainLifecycleAction(button) {
   } catch (error) {
     chainLifecycleById.set(chainId, {
       tone: "error",
-      text: "Control failed",
-      detail: readText(error.message || error) || "Lifecycle request failed",
+      text: "Could not update",
+      detail: publicSystemError(error, "The network control could not be updated."),
       control_available: current.control_available === true,
       busy: false,
     });
@@ -1791,11 +2172,10 @@ function chainLifecycleView(data) {
   const controlAvailable = data && data.control_available === true;
   const state = readText(data && data.state);
   const action = readText(data && data.action);
-  const reason = readText(data && data.control_reason);
   return {
     tone: controlAvailable ? "success" : "muted",
     text: lifecycleLabel(state),
-    detail: controlAvailable ? "Local controls enabled" : reason || "Remote or unmanaged node",
+    detail: controlAvailable ? "Controls available" : "Controls unavailable",
     action,
     state,
     control_available: controlAvailable,
@@ -1806,15 +2186,15 @@ function chainLifecycleView(data) {
 function lifecycleLabel(state) {
   switch (readText(state)) {
     case "managed_local":
-      return "Managed local";
+      return "On this device";
     case "external_loopback":
       return "Local node";
     case "remote_backend":
-      return "Remote provider";
+      return "Remote";
     case "not_configured":
       return "Not configured";
     default:
-      return "Lifecycle";
+      return "Unavailable";
   }
 }
 
@@ -1848,7 +2228,7 @@ function chainStatusView(network, data) {
 
 function chainFailureNote(network) {
   if (network.kind === "bitcoin_core_rpc") {
-    return "Configure Bitcoin Core in chain-provider to enable BTC status.";
+    return "Bitcoin status is unavailable.";
   }
   return "";
 }
@@ -1873,7 +2253,7 @@ function renderChainTable() {
   if (chainNetworks.length === 0) {
     const empty = document.createElement("div");
     empty.className = "network-row network-row-empty";
-    empty.textContent = "No chains available.";
+    empty.textContent = "No networks available.";
     chainTableNode.append(empty);
     return;
   }
@@ -1982,7 +2362,9 @@ function showPasskeyStatus(message, tone) {
   if (!passkeyStatusNode) {
     return;
   }
-  const text = readText(message);
+  const text = tone === "error"
+    ? publicSystemError(message, "Account action could not be completed.")
+    : readText(message);
   passkeyStatusNode.hidden = text.length === 0;
   passkeyStatusNode.textContent = text;
   passkeyStatusNode.dataset.tone = tone;
@@ -2013,7 +2395,9 @@ function showGuestRegistrationStatus(message, tone) {
   if (!guestRegistrationStatusNode) {
     return;
   }
-  const text = readText(message);
+  const text = tone === "error"
+    ? publicSystemError(message, "Access setting could not be updated.")
+    : readText(message);
   guestRegistrationStatusNode.hidden = text.length === 0;
   guestRegistrationStatusNode.textContent = text;
   guestRegistrationStatusNode.dataset.tone = tone;
@@ -2083,32 +2467,6 @@ function setSourceState(source) {
     "source-transport",
     sourcePeer ? `${transport} Peer ${shortText(sourcePeer, 28)}` : transport,
   );
-}
-
-function setStorageState(storage) {
-  const available = Boolean(storage && storage.available);
-  const documentsCount = Number(storage && storage.documents_count ? storage.documents_count : 0);
-  const draftsCount = Number(storage && storage.drafts_count ? storage.drafts_count : 0);
-  const publishedCount = Number(storage && storage.published_count ? storage.published_count : 0);
-  const status = available
-    ? `${documentsCount} ${documentsCount === 1 ? "document" : "documents"}`
-    : "";
-  setTextFields("storage-status", status);
-  setHiddenFields("storage-status", status.length === 0);
-
-  if (!storageNoteNode) {
-    return;
-  }
-  if (!available) {
-    const note = readText(storage && storage.note);
-    storageNoteNode.hidden = note.length === 0;
-    storageNoteNode.textContent = note;
-    return;
-  }
-
-  const parts = [`${draftsCount} ${draftsCount === 1 ? "draft" : "drafts"}`, `${publishedCount} published`];
-  storageNoteNode.hidden = parts.length === 0;
-  storageNoteNode.textContent = parts.join(" · ");
 }
 
 function readQueryParam(key) {
@@ -2195,10 +2553,18 @@ function readText(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function publicSystemError(value, fallback) {
+  const message = readText(value && value.message ? value.message : value);
+  if (!message || /\b(schema|projection|provider|adapter|capability|affordance|runtime-owned|launch token|hostcall|request failed|failed to fetch|unauthorized|forbidden|[45]\d\d)\b|engine_[a-z_]+/i.test(message)) {
+    return fallback;
+  }
+  return message;
+}
+
 function showError(error) {
   if (!errorNode) {
     return;
   }
   errorNode.hidden = false;
-  errorNode.textContent = String(error.message || error);
+  errorNode.textContent = publicSystemError(error, "System could not be loaded.");
 }

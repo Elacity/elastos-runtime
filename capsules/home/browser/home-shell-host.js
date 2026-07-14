@@ -16,7 +16,7 @@ import {
   shellState,
   fetchJson,
   targetById,
-} from "./shell-core.js?v=home-20260705a";
+} from "./shell-core.js?v=home-20260712b";
 import {
   bindHomeUnlock,
   hideHomeUnlock,
@@ -24,7 +24,7 @@ import {
   refreshHomeSession,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260705a";
+} from "./shell-auth.js?v=home-20260712b";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_AFTER_INTERACTION_MS = 700;
@@ -36,15 +36,16 @@ const SESSION_REFRESH_MS = 10 * 60 * 1000;
 const ACTIVE_SHELL_HINT_KEY = "elastos.home.active-shell-hint";
 const HOME_CLI_SHELL_ID = "home-cli";
 const HOME_GUI_MODULE_URL = import.meta.url.startsWith("file:")
-  ? new URL("../../home-gui/browser/home-gui.js?v=home-20260705a", import.meta.url).href
-  : new URL("../home-gui/home-gui.js?v=home-20260705a", import.meta.url).href;
+  ? new URL("../../home-gui/browser/home-gui.js?v=home-20260712b", import.meta.url).href
+  : new URL("../home-gui/home-gui.js?v=home-20260712b", import.meta.url).href;
 const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   "archive-manager": new Set(["library"]),
   browser: new Set(["library"]),
   "chat-room": new Set(["library"]),
+  "gba-emulator": new Set(["library"]),
   "home-cli": "visible-target",
   inbox: "visible-target",
-  library: new Set(["archive-manager", "documents", "library"]),
+  library: new Set(["archive-manager", "documents", "gba-emulator", "library"]),
   marketplace: "runtime-target",
   services: new Set(["browser", "chat-room"]),
   system: "visible-target",
@@ -133,8 +134,8 @@ async function ensureHomeGuiModule() {
           activateHomeGui: () => activateDesktopShell().catch((error) => {
             console.error("home shell activation failed", error);
             showShellHostRecovery(activeShellTarget(shellState.currentSummary), error, {
-              title: `Could not switch to ${HOME_GUI_SHELL_ID}`,
-              copy: "Reload Home or sign out.",
+              title: "Desktop didn't open",
+              copy: "Reload to try again. Your data is unchanged.",
             });
           }),
           requestHomeUnlock: () => showHostAuthGate({ presentation: "prompt", surface: "neutral" }),
@@ -358,19 +359,28 @@ async function activateDesktopShell(homeToken = "") {
 }
 
 function shellDisplayName(target) {
-  return normalizedActiveShellName(target) === HOME_GUI_SHELL_ID
-    ? HOME_GUI_SHELL_ID
-    : (target || "unknown shell");
+  const shell = normalizedActiveShellName(target);
+  if (shell === HOME_GUI_SHELL_ID) {
+    return "Desktop";
+  }
+  if (shell === "home-cli") {
+    return "Terminal";
+  }
+  return "Home view";
 }
 
 function shellHostRecoveryDetailText(error) {
   if (!error) {
     return "";
   }
-  if (typeof error === "string") {
-    return error;
+  const message = typeof error === "string" ? error : (error.message || String(error));
+  if (/session|token|unauthorized|forbidden|expired/i.test(message)) {
+    return "Your session needs to be unlocked again.";
   }
-  return error.message || String(error);
+  if (/fetch|network|connect|refused|offline/i.test(message)) {
+    return "ElastOS is not responding on this device.";
+  }
+  return "A Home service failed while loading.";
 }
 
 function activeShellRootHomeToken() {
@@ -387,7 +397,7 @@ function hideShellHostRecovery() {
     shellHostRecovery.hidden = true;
   }
   if (shellHostRecoveryTitle) {
-    shellHostRecoveryTitle.textContent = "Shell unavailable";
+    shellHostRecoveryTitle.textContent = "Home didn't open";
   }
   if (shellHostRecoveryCopy) {
     shellHostRecoveryCopy.textContent = "";
@@ -398,7 +408,7 @@ function hideShellHostRecovery() {
   }
   if (shellHostRecoveryHomeButton) {
     shellHostRecoveryHomeButton.disabled = false;
-    shellHostRecoveryHomeButton.title = `Switch back to ${HOME_GUI_SHELL_ID}`;
+    shellHostRecoveryHomeButton.title = "Open Desktop";
   }
 }
 
@@ -425,8 +435,8 @@ function showShellHostRecovery(target, error, options = {}) {
   if (shellHostRecoveryCopy) {
     shellHostRecoveryCopy.textContent = options.copy || (
       tokenAvailable
-        ? `Switch back to ${HOME_GUI_SHELL_ID}, reload Home, or sign out.`
-        : "Reload Home or sign out. Switching shells requires an explicit shell launch token."
+        ? "Open Desktop or reload to try again. Your data is unchanged."
+        : "Reload to try again. Your data is unchanged."
     );
   }
   if (shellHostRecoveryDetail) {
@@ -436,8 +446,8 @@ function showShellHostRecovery(target, error, options = {}) {
   if (shellHostRecoveryHomeButton) {
     shellHostRecoveryHomeButton.disabled = !tokenAvailable;
     shellHostRecoveryHomeButton.title = tokenAvailable
-      ? `Switch back to ${HOME_GUI_SHELL_ID}`
-      : "No shell launch token is available.";
+      ? "Open Desktop"
+      : "Reload Home before opening Desktop.";
   }
 }
 
@@ -453,8 +463,8 @@ async function recoverToHomeGui() {
   const homeToken = activeShellRootHomeToken();
   if (!homeToken) {
     showShellHostRecovery(shellState.activeShellRootTarget, "No shell launch token is available.", {
-      title: `Cannot switch to ${HOME_GUI_SHELL_ID}`,
-      copy: "Reload Home or sign out. The host will not use the ambient cookie to change shells.",
+      title: "Desktop is unavailable",
+      copy: "Reload to try again. Your data is unchanged.",
     });
     return;
   }
@@ -466,8 +476,8 @@ async function recoverToHomeGui() {
   } catch (error) {
     console.error("home-gui recovery failed", error);
     showShellHostRecovery(shellState.activeShellRootTarget, error, {
-      title: `Could not switch to ${HOME_GUI_SHELL_ID}`,
-      copy: "Reload Home or sign out.",
+      title: "Desktop didn't open",
+      copy: "Reload to try again. Your data is unchanged.",
     });
   }
 }
@@ -504,6 +514,20 @@ async function signOutFromShellHostRecovery() {
     if (shellHostRecoverySignOutButton) {
       shellHostRecoverySignOutButton.disabled = false;
     }
+  }
+}
+
+async function signOutFromRootShell() {
+  document.body.dataset.homeStatus = "booting";
+  try {
+    await signOutHome();
+    reloadHomeShellHost();
+  } catch (error) {
+    console.error("home shell sign out failed", error);
+    showShellHostRecovery(shellState.activeShellRootTarget, error, {
+      title: "Could not sign out",
+      copy: "Reload Home and try again.",
+    });
   }
 }
 
@@ -656,8 +680,8 @@ boot().catch((error) => {
   document.body.dataset.homeStatus = "error";
   console.error("home boot failed", error);
   showShellHostRecovery(HOME_SHELL_HOST_ID, error, {
-    title: "Home unavailable",
-    copy: "Reload Home or sign out.",
+    title: "Home didn't open",
+    copy: "Reload to try again. Your data is unchanged.",
   });
 });
 
@@ -696,6 +720,16 @@ window.addEventListener("message", (event) => {
       return;
     }
     preclaimActiveShellSwitch(data.activeShell);
+    return;
+  }
+  if (data.type === "home:sign-out") {
+    if (context.kind !== "shell-frame" || context.targetId !== HOME_CLI_SHELL_ID) {
+      console.warn("home ignored unauthorized sign-out message", context.targetId);
+      return;
+    }
+    signOutFromRootShell().catch((error) => {
+      console.error("home shell sign out failed", error);
+    });
     return;
   }
   if (data.type === "home:open-uri") {
@@ -805,7 +839,7 @@ window.addEventListener("message", (event) => {
       console.error("home shell open-target failed", error);
       showShellHostRecovery(context.targetId, error, {
         title: `Could not open ${target}`,
-        copy: "Reload Home or sign out.",
+        copy: "Reload to try again. Your data is unchanged.",
       });
     });
     return;
@@ -1182,7 +1216,7 @@ async function pollHomeEvents() {
 
 function handleHomeEventsPayload(payload, { broadcastInitial = true } = {}) {
   if (payload?.schema !== "elastos.home.events/v1") {
-    throw new Error("Home event channel returned an invalid schema.");
+    throw new Error("Home updates could not be read.");
   }
   const hadCursor = Boolean(shellState.homeEventsCursor);
   shellState.homeEventsCursor = String(payload.cursor || "");

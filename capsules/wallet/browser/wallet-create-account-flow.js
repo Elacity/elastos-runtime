@@ -50,7 +50,7 @@ export function createWalletCreateAccountFlow({
     }
     openFlowModal(
       "Create account",
-      "Choose the account type. Chains are provider routes, not separate wallet types.",
+      "Choose the account type you want to create.",
       rows,
       [modalButton("Cancel", closeModal, true)],
     );
@@ -73,7 +73,7 @@ export function createWalletCreateAccountFlow({
       "Create account",
       accountType === "bitcoin"
         ? "Create a native Bitcoin account."
-        : "Create an EVM account usable through supported EVM chain providers.",
+        : "Create an EVM account for supported networks.",
       [form],
       [
         modalButton("Back", openCreateAccountFlow, true),
@@ -98,7 +98,7 @@ export function createWalletCreateAccountFlow({
           )
         : "EVM Account");
     if (targetNamespaces.length === 0) {
-      showStatus("No supported provider is available for this account type.", "error");
+      showStatus("This account type is not available yet.", "error");
       return;
     }
     const submit = modalNode.querySelector(
@@ -138,7 +138,7 @@ export function createWalletCreateAccountFlow({
     form.className = "wallet-flow-form";
     form.innerHTML = `
       <label>Wallet recovery key
-        <textarea name="recovery_key" rows="8" spellcheck="false" placeholder='{"schema":"elastos.wallet.recovery-key/v1",...}'></textarea>
+        <textarea name="recovery_key" rows="8" spellcheck="false" placeholder="Paste your Wallet recovery key"></textarea>
       </label>
       <label>Name <input name="label" autocomplete="off" maxlength="40" placeholder="Recovered account"></label>
       <p class="wallet-flow-hint">Paste an individual Wallet recovery key. A full System Recovery Kit can restore Home data and included built-in Wallet accounts from System.</p>
@@ -176,7 +176,7 @@ export function createWalletCreateAccountFlow({
       return;
     }
     if (!recoveryKey || recoveryKey.schema !== "elastos.wallet.recovery-key/v1") {
-      showStatus("Paste an elastos.wallet.recovery-key/v1 account key.", "error");
+      showStatus("This is not a valid Wallet recovery key.", "error");
       return;
     }
     const submit = modalNode.querySelector(

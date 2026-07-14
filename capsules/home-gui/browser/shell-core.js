@@ -32,11 +32,6 @@ export const HOME_SHELL_HOST_ID = "home-shell-host";
 export const HOME_GUI_SHELL_ID = "home-gui";
 export const SYSTEM_APP_ID = "system";
 export const PEOPLE_TARGET_ID = "people";
-const TARGET_TITLE_OVERRIDES = Object.freeze({
-  "archive-manager": "Archive",
-  [SYSTEM_APP_ID]: "System",
-  [PEOPLE_TARGET_ID]: "People",
-});
 const MAX_RECENT_TARGETS = 10;
 export const ICON_DRAG_THRESHOLD = 6;
 const DESKTOP_ICON_WIDTH = 92;
@@ -55,9 +50,9 @@ export const WINDOW_TOP_INSET = 8;
 export const WINDOW_BOTTOM_INSET = 72;
 export const CONTEXT_MENU_IGNORE_OUTSIDE_MS = 220;
 const HOME_GUI_TEMPLATE_ID = "home-gui-template";
-const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260705a", import.meta.url).href;
+const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260712b", import.meta.url).href;
 const HOME_GUI_STYLESHEET_ID = "home-gui-stylesheet";
-const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260705a", import.meta.url).href;
+const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260712b", import.meta.url).href;
 let homeGuiTemplateHtmlPromise = null;
 
 export const shellState = {
@@ -255,28 +250,12 @@ export function allVisibleTargets(summary) {
   if (!summary || !Array.isArray(summary.targets)) {
     return [];
   }
-  const targets = summary.targets
+  return summary.targets
     .filter((target) => target?.role !== "shell")
     .map((target) => ({
       ...target,
-      title: canonicalTargetTitle(target?.target, target?.title),
+      title: normalizeText(target?.title) || target?.target,
     }));
-  if (
-    summary.authority &&
-    summary.authority.signed_in === true &&
-    !targets.some((target) => target.target === PEOPLE_TARGET_ID)
-  ) {
-    targets.push({
-      target: PEOPLE_TARGET_ID,
-      title: "People",
-      description: "See accepted ElastOS contacts and start conversations.",
-      route: "home://people",
-      attach_kind: "home",
-      role: "app",
-      target_kind: "app",
-    });
-  }
-  return targets;
 }
 
 export function desktopObjects(summary) {
@@ -371,8 +350,7 @@ export function targetTitle(summary, targetId) {
 
 export function canonicalTargetTitle(targetId, title) {
   const normalizedTitle = normalizeText(title);
-  const override = TARGET_TITLE_OVERRIDES[targetId];
-  return override || normalizedTitle || targetId;
+  return normalizedTitle || targetId;
 }
 
 export function desktopLabelForTarget(summary, targetId) {
@@ -577,9 +555,6 @@ function normalizeDesktopLabels(labels, summary) {
   for (const [targetId, label] of Object.entries(labels)) {
     const nextLabel = normalizeText(label);
     if (!knownTargets.has(targetId) || nextLabel === "") {
-      continue;
-    }
-    if (TARGET_TITLE_OVERRIDES[targetId]) {
       continue;
     }
     normalized[targetId] = nextLabel;

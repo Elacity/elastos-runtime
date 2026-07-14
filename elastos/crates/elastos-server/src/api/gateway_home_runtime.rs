@@ -99,7 +99,6 @@ pub(super) fn home_targets(data_dir: &std::path::Path) -> Vec<HomeTargetSummary>
     home_targets_from_catalog(&catalog)
 }
 
-#[cfg(test)]
 pub(super) fn home_targets_from_catalog(
     catalog: &CapsuleCatalogResponse,
 ) -> Vec<HomeTargetSummary> {

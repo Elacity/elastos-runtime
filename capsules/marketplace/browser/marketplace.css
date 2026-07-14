@@ -294,137 +294,11 @@ button {
   margin-bottom: 16px;
 }
 
-.section-kicker {
-  margin-bottom: 4px;
-  color: var(--text-secondary);
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-}
-
 .section-title {
   margin: 0;
   color: var(--text-primary);
   font-size: 16px;
   font-weight: 650;
-}
-
-.section-link {
-  color: var(--accent);
-  background: transparent;
-  font-size: 13px;
-  cursor: pointer;
-}
-
-.section-link:hover {
-  text-decoration: underline;
-}
-
-.staff-picks-scroll,
-.apps-scroll {
-  display: flex;
-  gap: 16px;
-  overflow-x: auto;
-  padding: 0 24px 8px;
-  scroll-behavior: smooth;
-  scrollbar-width: none;
-}
-
-.staff-picks-scroll::-webkit-scrollbar,
-.apps-scroll::-webkit-scrollbar {
-  display: none;
-}
-
-.staff-pick-card {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  justify-content: flex-end;
-  min-width: 360px;
-  max-width: 360px;
-  height: 220px;
-  overflow: hidden;
-  border-radius: 18px;
-  padding: 24px;
-  color: #fff;
-  cursor: pointer;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 4px 12px rgba(15, 23, 42, 0.06);
-  transition: transform 0.25s ease, box-shadow 0.25s ease;
-}
-
-.staff-pick-card:hover {
-  transform: translateY(-3px);
-  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.18);
-}
-
-.staff-pick-card::before {
-  position: absolute;
-  inset: 0;
-  z-index: 1;
-  content: "";
-  background: linear-gradient(to top, rgba(0, 0, 0, 0.78) 0%, rgba(0, 0, 0, 0.18) 55%, rgba(0, 0, 0, 0.05) 100%);
-}
-
-.staff-pick-icon {
-  position: absolute;
-  top: 18px;
-  left: 18px;
-  z-index: 2;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 64px;
-  height: 64px;
-  border-radius: 16px;
-  color: var(--accent);
-  background: #fff;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
-}
-
-.staff-pick-icon svg {
-  width: 36px;
-  height: 36px;
-}
-
-.staff-pick-tag {
-  position: absolute;
-  top: 22px;
-  right: 18px;
-  z-index: 2;
-  border: 1px solid rgba(255, 255, 255, 0.25);
-  border-radius: 999px;
-  padding: 4px 10px;
-  color: rgba(255, 255, 255, 0.9);
-  background: rgba(255, 255, 255, 0.18);
-  backdrop-filter: blur(8px);
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}
-
-.staff-pick-content {
-  position: relative;
-  z-index: 2;
-}
-
-.staff-pick-name {
-  margin-bottom: 6px;
-  font-size: 20px;
-  font-weight: 750;
-  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
-}
-
-.staff-pick-desc {
-  display: -webkit-box;
-  overflow: hidden;
-  font-size: 13px;
-  line-height: 1.45;
-  opacity: 0.92;
-  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
 }
 
 .apps-grid {
@@ -444,11 +318,6 @@ button {
   text-align: left;
   cursor: pointer;
   transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
-}
-
-.apps-scroll .app-card {
-  min-width: 280px;
-  max-width: 320px;
 }
 
 .app-card:hover {
@@ -1095,11 +964,6 @@ button {
 
   .main-content {
     overflow: visible;
-  }
-
-  .staff-pick-card {
-    min-width: 300px;
-    max-width: 300px;
   }
 
   .requirements-grid {

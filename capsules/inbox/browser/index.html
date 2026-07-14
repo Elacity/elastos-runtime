@@ -480,7 +480,18 @@
     }
 
     function setStatus(text) {
-      elements.statusText.textContent = text;
+      const message = String(text || "").trim();
+      elements.statusText.textContent = message
+        ? publicInboxText(message, "Inbox action could not be completed.")
+        : "";
+    }
+
+    function publicInboxText(value, fallback) {
+      const text = String(value || "").trim();
+      if (!text || /\b(runtime mirror|projection|schema|derived facts?|capsules?|providers?|capabilit(?:y|ies)|affordances?|authority boundary|provider boundary|gate preview|runtime-owned|launch token|hostcall|request failed|failed to fetch|unauthorized|forbidden|[45]\d\d)\b|engine_[a-z_]+/i.test(text)) {
+        return fallback;
+      }
+      return text;
     }
 
     function notifyHome() {
@@ -522,7 +533,7 @@
       const response = await fetch(path, request);
       if (!response.ok) {
         const text = await response.text();
-        throw new Error(text || "Request failed: " + response.status);
+        throw new Error(publicInboxText(text, "Inbox could not complete the request."));
       }
       return response.json();
     }
@@ -662,7 +673,7 @@
       titleRow.className = "entry-title-row";
       const title = document.createElement("div");
       title.className = "entry-title";
-      title.textContent = entry.title || "Request";
+      title.textContent = publicInboxText(entry.title, "Request");
       titleRow.appendChild(title);
       if (entry.severity === "attention") {
         const badge = document.createElement("span");
@@ -686,7 +697,7 @@
 
       const body = document.createElement("p");
       body.className = "entry-body";
-      body.textContent = entry.body || "";
+      body.textContent = publicInboxText(entry.body, "This request needs your review.");
 
       copy.append(titleRow, time, body);
 
@@ -713,7 +724,7 @@
         const approveButton = createButton("Approve", (button) => approveInspectRequest(button, requestId), "primary");
         approveButton.dataset.actionId = actionId;
         actions.appendChild(approveButton);
-        actions.appendChild(createActionButton("Deny", "inspect-deny-request:" + actionId.slice("inspect-approve-request:".length), "danger"));
+        actions.appendChild(createButton("Deny", () => denyInspectRequest(requestId), "danger"));
       } else if (typeof actionId === "string" && actionId.startsWith("wallet-price-http-approve:")) {
         actions.appendChild(createActionButton("Approve", actionId, "primary"));
         actions.appendChild(createActionButton("Reject", "wallet-price-http-deny:" + actionId.slice("wallet-price-http-approve:".length), "danger"));
@@ -781,18 +792,113 @@
       }
       setButtonsDisabled(true);
       button.disabled = true;
-      setStatus("Confirm with your passkey to approve this Inspector action.");
+      setStatus("Confirm with your passkey to approve this System action.");
       try {
         const homeToken = await requestFreshPasskeyHomeToken();
-        await inboxAction("inspect-approve-request:" + requestId, {
+        const outcome = await inboxAction("inspect-approve-request:" + requestId, {
           home_token: homeToken,
         });
-        setStatus("Inspector action approved.");
+        requireInspectActionResult(outcome, requestId, "completed");
+        setStatus("System action approved.");
         await loadInbox();
         notifyHome();
       } finally {
         setButtonsDisabled(false);
       }
+    }
+
+    async function denyInspectRequest(requestId) {
+      if (!requestId) {
+        return;
+      }
+      setButtonsDisabled(true);
+      try {
+        const outcome = await inboxAction("inspect-deny-request:" + requestId);
+        requireInspectActionResult(outcome, requestId, "denied");
+        setStatus("System action denied.");
+        await loadInbox();
+        notifyHome();
+      } finally {
+        setButtonsDisabled(false);
+      }
+    }
+
+    function requireInspectActionResult(outcome, requestId, expectedStatus) {
+      const result = outcome && outcome.result;
+      const binding = result && result.request_binding;
+      if (
+        !result ||
+        result.schema !== "elastos.inspect.action-result/v1" ||
+        result.status !== expectedStatus ||
+        result.request_id !== requestId ||
+        !binding ||
+        binding.schema !== "elastos.esp.request-binding/v1" ||
+        binding.request_id !== requestId ||
+        typeof binding.principal !== "string" || !binding.principal ||
+        typeof binding.capsule !== "string" || !binding.capsule ||
+        binding.interface !== null ||
+        typeof binding.method !== "string" || !binding.method ||
+        !Array.isArray(binding.resources) ||
+        typeof binding.sha256 !== "string" || !binding.sha256 ||
+        typeof binding.bytes !== "number"
+      ) {
+        throw new Error("Runtime did not return the exact System action result.");
+      }
+      if (expectedStatus === "denied") {
+        if (result.dispatch_result != null) {
+          throw new Error("Denied System action returned an unexpected dispatch result.");
+        }
+        return result;
+      }
+      const dispatch = result.dispatch_result;
+      const provider = dispatch && dispatch.provider_response;
+      const transfer = provider && provider._runtime_transfer;
+      if (
+        !dispatch ||
+        dispatch.schema !== "elastos.inspect.dispatch-result/v1" ||
+        !sameInspectRequestBinding(dispatch.request_binding, binding) ||
+        dispatch.id !== binding.capsule ||
+        dispatch.operation !== binding.method ||
+        !provider || provider.status !== "ok" ||
+        !transfer ||
+        transfer.schema !== "elastos.provider.transfer/v1" ||
+        transfer.source !== "inspect" ||
+        transfer.target !== dispatch.target ||
+        transfer.op !== binding.method ||
+        transfer.status !== "completed"
+      ) {
+        throw new Error("Runtime returned an unrelated System action result.");
+      }
+      return result;
+    }
+
+    function sameInspectRequestBinding(left, right) {
+      return Boolean(
+        left && right &&
+        left.schema === right.schema &&
+        left.request_id === right.request_id &&
+        left.principal === right.principal &&
+        left.capsule === right.capsule &&
+        left.interface === right.interface &&
+        left.method === right.method &&
+        JSON.stringify(left.resources) === JSON.stringify(right.resources) &&
+        left.sha256 === right.sha256 &&
+        left.bytes === right.bytes &&
+        left.truncated === right.truncated &&
+        canonicalInboxJson(left.preview) === canonicalInboxJson(right.preview)
+      );
+    }
+
+    function canonicalInboxJson(value) {
+      if (Array.isArray(value)) {
+        return "[" + value.map(canonicalInboxJson).join(",") + "]";
+      }
+      if (value && typeof value === "object") {
+        return "{" + Object.keys(value).sort().map((key) =>
+          JSON.stringify(key) + ":" + canonicalInboxJson(value[key])
+        ).join(",") + "}";
+      }
+      return JSON.stringify(value);
     }
 
     function setButtonsDisabled(disabled) {

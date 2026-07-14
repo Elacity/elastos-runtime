@@ -14,6 +14,10 @@ const adapterSource = readFileSync(
   new URL("../capsules/system/browser/esp-projections.mjs", import.meta.url),
   "utf8",
 );
+const systemSource = readFileSync(
+  new URL("../capsules/system/browser/system.js", import.meta.url),
+  "utf8",
+);
 
 for (const forbidden of [
   "fetch(",
@@ -26,6 +30,20 @@ for (const forbidden of [
   assert(
     !adapterSource.includes(forbidden),
     `System ESP projection adapter must not contain authority marker ${forbidden}`,
+  );
+}
+
+assert(
+  systemSource.includes("binding.executable !== true"),
+  "System must expose actions only from Runtime-derived executable bindings",
+);
+for (const forbidden of [
+  "binding.state === \"provider-path-only\"",
+  "binding.state === \"approval-required\"",
+]) {
+  assert(
+    !systemSource.includes(forbidden),
+    `System must not present non-executable binding state as an action: ${forbidden}`,
   );
 }
 
@@ -76,7 +94,13 @@ const degradedPreview = {
 };
 
 const binding = {
-  schema: "elastos.inspect.request-binding/v1",
+  schema: "elastos.esp.request-binding/v1",
+  request_id: "inspect-approve-request:test",
+  principal: "person:test",
+  capsule: "capsule:exit-provider",
+  interface: null,
+  method: "status",
+  resources: ["elastos://exit/*"],
   sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   bytes: 2,
   truncated: false,
@@ -114,8 +138,8 @@ assert.equal(
 assert.deepEqual(systemEsp.requestBindingView(binding), requestBindingView(binding));
 assert.deepEqual(systemEsp.requestBindingView(null), requestBindingView(null));
 assert.deepEqual(
-  systemEsp.inspectActionRequestValidation(request),
-  inspectActionRequestValidation(request),
+  systemEsp.inspectActionRequestValidation(request, {}),
+  inspectActionRequestValidation(request, {}),
 );
 assert.deepEqual(
   systemEsp.inspectActionRequestValidation(incompleteRequest),

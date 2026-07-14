@@ -16,10 +16,6 @@
     loadingState: document.querySelector("#loading-state"),
     discoverContent: document.querySelector("#discover-content"),
     installedContent: document.querySelector("#installed-content"),
-    staffPicksSection: document.querySelector("#staff-picks-section"),
-    staffPicks: document.querySelector("#staff-picks"),
-    popularSection: document.querySelector("#popular-section"),
-    popularApps: document.querySelector("#popular-apps"),
     appsGrid: document.querySelector("#apps-grid"),
     allAppsTitle: document.querySelector("#all-apps-title"),
     installedList: document.querySelector("#installed-list"),
@@ -30,19 +26,16 @@
     installContent: document.querySelector("#install-content"),
     searchInput: document.querySelector("#search-input"),
     themeToggle: document.querySelector("#theme-toggle"),
-    viewAll: document.querySelector("#view-all"),
     toast: document.querySelector("#toast"),
   };
 
   const categories = [
-    { id: "all", label: "All Apps", icon: "grid" },
-    { id: "marketplace", label: "Marketplace", icon: "marketplace" },
-    { id: "media", label: "Media", icon: "play" },
-    { id: "defi", label: "DeFi", icon: "wallet" },
-    { id: "blockchain", label: "Blockchain", icon: "blocks" },
-    { id: "tools", label: "Tools", icon: "tools" },
-    { id: "system", label: "System", icon: "system" },
-    { id: "providers", label: "Providers", icon: "server" },
+    { id: "all", label: "All", icon: "grid" },
+    { id: "apps", label: "Apps", icon: "package" },
+    { id: "viewers", label: "Viewers", icon: "play" },
+    { id: "content", label: "Content", icon: "document" },
+    { id: "providers", label: "Services", icon: "server" },
+    { id: "shells", label: "Home views", icon: "system" },
   ];
 
   const icons = {
@@ -59,19 +52,6 @@
     check: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>',
     close: '<svg viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>',
     search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.35-4.35"></path></svg>',
-  };
-
-  const staffGradients = {
-    "gradient-purple": "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
-    "gradient-blue": "linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%)",
-    "gradient-orange": "linear-gradient(135deg, #f97316 0%, #ea580c 100%)",
-    "gradient-green": "linear-gradient(135deg, #22c55e 0%, #16a34a 100%)",
-    "gradient-teal": "linear-gradient(135deg, #14b8a6 0%, #0d9488 100%)",
-    "gradient-pink": "linear-gradient(135deg, #ec4899 0%, #db2777 100%)",
-    "gradient-yellow": "linear-gradient(135deg, #eab308 0%, #ca8a04 100%)",
-    "gradient-indigo": "linear-gradient(135deg, #6366f1 0%, #4f46e5 100%)",
-    "gradient-cyan": "linear-gradient(135deg, #06b6d4 0%, #0891b2 100%)",
-    "gradient-slate": "linear-gradient(135deg, #64748b 0%, #475569 100%)",
   };
 
   initTheme();
@@ -104,7 +84,6 @@
 
   function bindEvents() {
     els.themeToggle.addEventListener("click", toggleTheme);
-    els.viewAll.addEventListener("click", () => selectCategory("all"));
     els.searchInput.addEventListener("input", (event) => {
       state.search = event.target.value.trim().toLowerCase();
       renderAppsGrid();
@@ -142,19 +121,38 @@
     state.loading = true;
     setLoading(true);
     try {
-      const response = await fetch("/api/capsules/catalog", {
-        headers: { "x-elastos-home-token": homeToken },
-      });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(catalogErrorMessage(response, payload));
+      const [catalogResponse, interfacesResponse] = await Promise.all([
+        fetch("/api/capsules/catalog", { headers: { "x-elastos-home-token": homeToken } }),
+        fetch("/api/capsules/interfaces", { headers: { "x-elastos-home-token": homeToken } }),
+      ]);
+      const catalog = await catalogResponse.json().catch(() => ({}));
+      const interfaces = await interfacesResponse.json().catch(() => ({}));
+      if (!catalogResponse.ok) {
+        throw new Error(catalogErrorMessage(catalogResponse, catalog));
       }
-      state.apps = (Array.isArray(payload.capsules) ? payload.capsules : [])
-        .map(capsuleToApp)
+      if (!interfacesResponse.ok) {
+        throw new Error(catalogErrorMessage(interfacesResponse, interfaces));
+      }
+      const capsules = Array.isArray(catalog.capsules) ? catalog.capsules : [];
+      const capsulesByName = new Map(capsules.map((capsule) => [String(capsule.name || ""), capsule]));
+      const interfacesByCapsule = new Map();
+      for (const entry of Array.isArray(interfaces.interfaces) ? interfaces.interfaces : []) {
+        const capsule = String(entry && entry.capsule || "");
+        if (!capsule) continue;
+        const entries = interfacesByCapsule.get(capsule) || [];
+        entries.push(entry);
+        interfacesByCapsule.set(capsule, entries);
+      }
+      state.apps = capsules
+        .map((capsule) => capsuleToApp(
+          capsule,
+          capsulesByName,
+          interfacesByCapsule.get(String(capsule.name || "")) || [],
+        ))
         .sort((left, right) => appSortKey(left).localeCompare(appSortKey(right)));
     } catch (error) {
       state.apps = [];
-      showToast(`Marketplace catalog unavailable: ${error.message || "unknown error"}`, true);
+      showToast(publicError(error.message, "Apps and services could not be loaded."), true);
     } finally {
       state.loading = false;
       setLoading(false);
@@ -167,36 +165,39 @@
     els.installedContent.classList.toggle("hidden", loading || state.currentTab !== "installed");
   }
 
-  function capsuleToApp(capsule) {
+  function capsuleToApp(capsule, capsulesByName, interfaceEntries) {
     const name = String(capsule.name || "");
     const role = String(capsule.role || "").toLowerCase();
-    const category = appCategory(name, role, capsule);
-    const installed = capsule.installed || capsule.source === "runtime-bundle";
-    const badges = appBadges(name, role, capsule, installed);
+    const category = appCategory(capsule, role);
+    const installed = capsule.installed === true;
+    const badges = appBadges(role, capsule, installed);
     const launchable = Boolean(capsule.launchable && capsule.launch_target);
+    const acceptedContent = acceptedContentLabels(capsule, capsulesByName, interfaceEntries);
+    const requirements = Array.isArray(capsule.requires) ? capsule.requires : [];
+    const dependencies = requirements
+      .map((entry) => {
+        const dependency = capsulesByName.get(String(entry && entry.name || ""));
+        return dependency ? publicTitle(dependency) : "";
+      })
+      .filter(Boolean);
+    const technicalDependencies = requirements
+      .map((entry) => String(entry && entry.name || "").trim())
+      .filter(Boolean);
     return {
       id: name,
-      name: capsule.title || titleCase(name),
+      name: publicTitle(capsule),
       developer: capsule.author || "Unknown publisher",
       category,
-      description: capsule.description || "App metadata available through Runtime.",
-      shortDesc: shortDescription(capsule.description),
+      description: publicDescription(capsule),
       size: capsule.cid ? "Verified app" : "Local app",
       version: capsule.version || "",
-      icon: appIcon(name, role),
-      gradient: appGradient(name, role, category),
+      icon: appIcon(role),
+      gradient: appGradient(role),
       badges,
-      permissions: permissionsFor(capsule),
       requirements: {
         storage: capsule.cid ? "SmartWeb" : "Local",
-        memory: role === "provider" ? "Provider" : "App",
-        compatibility: "ElastOS Runtime",
       },
       installed,
-      isBuiltIn: capsule.source === "runtime-bundle",
-      isPendingInstall: !installed && !launchable,
-      isStaffPick: isStaffPick(name, role, launchable),
-      isPopular: isPopular(name, role, launchable),
       launchable,
       launchTarget: capsule.launch_target,
       route: capsule.route,
@@ -212,90 +213,127 @@
       installPath: capsule.install_path || "",
       releasePath: capsule.release_path || "",
       repository: capsule.repository || "",
+      viewerTitle: capsule.viewer_title || "",
+      acceptedContent,
+      dependencies,
+      technicalDependencies,
+      availableActions: executableActions(interfaceEntries),
     };
   }
 
-  function appCategory(name, role, capsule) {
-    if (name === "marketplace") return "marketplace";
-    if (role === "provider") return "providers";
-    if (name.includes("wallet") || name.includes("chain") || name.includes("block") || name.includes("nft")) {
-      return "blockchain";
-    }
-    if (name.includes("market")) return "marketplace";
-    if (name.includes("defi") || name.includes("swap")) {
-      return "defi";
-    }
-    if (name.includes("player") || name.includes("viewer") || name.includes("media") || name.includes("gba") || name.includes("archive")) {
-      return "media";
-    }
-    if (role === "shell" || name === "system" || name.includes("provider")) return "system";
-    if (role === "content") return "media";
-    if (Array.isArray(capsule.capabilities) && capsule.capabilities.some((cap) => String(cap).includes("wallet"))) {
-      return "blockchain";
-    }
-    return "tools";
+  function appCategory(capsule, role) {
+    const category = String(capsule.category || "").toLowerCase();
+    const canonical = {
+      apps: "apps",
+      viewers: "viewers",
+      content: "content",
+      providers: "providers",
+      shells: "shells",
+    };
+    return canonical[category] || canonical[`${role}s`] || "apps";
   }
 
   function catalogErrorMessage(response, payload) {
     if (response.status === 404) {
-      return "app catalog unavailable; update the Runtime gateway and try again";
+      return "Apps and services are unavailable. Update ElastOS and try again.";
     }
-    return payload.error || payload.message || `request failed: ${response.status}`;
+    return publicError(payload.error || payload.message, "Apps and services could not be loaded.");
   }
 
-  function appIcon(name, role) {
-    if (name === "marketplace") return "marketplace";
-    if (name.includes("wallet")) return "wallet";
-    if (name.includes("doc") || name.includes("library")) return "document";
-    if (name.includes("player") || name.includes("viewer") || name.includes("media") || name.includes("gba")) return "play";
-    if (name.includes("chain") || name.includes("block")) return "blocks";
+  function publicDescription(capsule) {
+    const description = String(capsule.description || "").trim();
+    const role = String(capsule.role || "app").toLowerCase();
+    const title = publicTitle(capsule);
+    if (role === "provider") return `${title} service for apps on this Home.`;
+    if (description && !/\b(runtime|capsules?|providers?|projection|schema|derived facts?|boundary|capability surface|affordances?|host-loaded|structured home intents?)\b/i.test(description)) {
+      return description;
+    }
+    if (role === "viewer") return `${title} opens compatible files and content.`;
+    if (role === "content") return `${title} content.`;
+    if (role === "shell") return `${title} Home view.`;
+    return `${title} app.`;
+  }
+
+  function publicTitle(capsule) {
+    const role = String(capsule?.role || "app").toLowerCase();
+    let title = String(capsule?.title || titleCase(capsule?.name || "App")).trim();
+    title = title
+      .replace(/\bDid\b/g, "DID")
+      .replace(/\bIpfs\b/g, "IPFS")
+      .replace(/\bGba\b/g, "GBA");
+    if (role === "provider") {
+      title = title.replace(/\s+(Provider|Adapter)$/i, "").trim();
+    }
+    return title || (role === "provider" ? "Service" : "App");
+  }
+
+  function publicError(value, fallback) {
+    const message = String(value || "").trim();
+    if (!message || /\b(schema|projection|provider|adapter|capability|affordance|runtime-owned|launch token|hostcall|request failed|failed to fetch|unauthorized|forbidden|[45]\d\d)\b|engine_[a-z_]+/i.test(message)) {
+      return fallback;
+    }
+    return message;
+  }
+
+  function appIcon(role) {
     if (role === "provider") return "server";
-    if (role === "shell" || name === "system") return "system";
+    if (role === "shell") return "system";
+    if (role === "viewer") return "play";
+    if (role === "content") return "document";
     return "package";
   }
 
-  function appGradient(name, role, category) {
-    if (name === "marketplace") return "gradient-purple";
-    if (name.includes("wallet")) return "gradient-orange";
-    if (category === "defi") return "gradient-yellow";
-    if (category === "blockchain") return "gradient-indigo";
-    if (category === "media") return "gradient-cyan";
+  function appGradient(role) {
     if (role === "provider") return "gradient-slate";
     if (role === "viewer") return "gradient-blue";
     if (role === "content") return "gradient-green";
+    if (role === "shell") return "gradient-indigo";
     return "gradient-teal";
   }
 
-  function appBadges(name, role, capsule, installed) {
-    const badges = [role || "app"];
+  function appBadges(role, capsule, installed) {
+    const badges = [role === "provider" ? "service" : (role || "app")];
     if (installed) badges.push("installed");
-    if (String(capsule.drm_state || "").includes("provider") || name.includes("drm")) badges.push("ddrm");
-    if (String(capsule.payment_state || "").includes("provider") || name.includes("wallet")) badges.push("wallet");
+    if (String(capsule.drm_state || "") === "provider") badges.push("ddrm");
+    if (String(capsule.payment_state || "") === "provider") badges.push("wallet");
     if (!installed && !capsule.launchable) badges.push("pending");
     return [...new Set(badges)];
   }
 
-  function permissionsFor(capsule) {
-    const permissions = [];
-    if (capsule.provides) permissions.push(`Provides ${capsule.provides}`);
-    if (Array.isArray(capsule.capabilities)) {
-      permissions.push(...capsule.capabilities.map((cap) => `Requests ${cap}`));
+  function executableActions(interfaceEntries) {
+    const actions = [];
+    for (const entry of interfaceEntries) {
+      for (const binding of Array.isArray(entry?.bindings) ? entry.bindings : []) {
+        if (binding?.executable !== true) continue;
+        const methodId = String(binding.method || "");
+        if (methodId === "capsule.open") {
+          actions.push("Open");
+          continue;
+        }
+        const operation = methodId.split(".").filter(Boolean).at(-1);
+        if (operation) actions.push(titleCase(operation));
+      }
     }
-    if (Array.isArray(capsule.requires)) {
-      permissions.push(...capsule.requires.map((req) => `Requires ${req.name || "app"} (${req.kind || "app"})`));
-    }
-    if (capsule.cid) permissions.push("Verified app identity");
-    if (capsule.trust_state) permissions.push(`Trust ${trustLabel(capsule.trust_state)}`);
-    return permissions;
+    return [...new Set(actions.filter(Boolean))];
   }
 
-  function isStaffPick(name, role, launchable) {
-    return (launchable && ["marketplace", "library", "documents", "wallet", "browser"].includes(name))
-      || role === "shell";
-  }
-
-  function isPopular(name, role, launchable) {
-    return launchable || ["provider", "viewer"].includes(role);
+  function acceptedContentLabels(capsule, capsulesByName, interfaceEntries) {
+    const labels = (Array.isArray(capsule.accepted_content) ? capsule.accepted_content : [])
+      .map((entry) => entry.title || capsulesByName.get(String(entry.name || ""))?.title || entry.name)
+      .filter(Boolean);
+    const extensions = new Set();
+    for (const entry of interfaceEntries) {
+      for (const method of Array.isArray(entry?.interface?.methods) ? entry.interface.methods : []) {
+        for (const accepted of Array.isArray(method?.input_schema?.accepts) ? method.input_schema.accepts : []) {
+          if (accepted?.mode === "unsupported_family_diagnostic") continue;
+          for (const extension of Array.isArray(accepted?.extensions) ? accepted.extensions : []) {
+            if (extension) extensions.add(String(extension));
+          }
+        }
+      }
+    }
+    if (extensions.size) labels.push(`${[...extensions].join(", ")} files`);
+    return [...new Set(labels)];
   }
 
   function appSortKey(app) {
@@ -306,8 +344,6 @@
   function render() {
     selectCategory(state.currentCategory, { silent: true });
     selectTab(state.currentTab, { silent: true });
-    renderStaffPicks();
-    renderPopularApps();
     renderAppsGrid();
     renderInstalledApps();
     updateInstalledBadge();
@@ -330,10 +366,8 @@
     document.querySelectorAll(".category-item").forEach((item) => {
       item.classList.toggle("active", item.dataset.category === state.currentCategory);
     });
-    const label = categories.find((category) => category.id === state.currentCategory)?.label || "All Apps";
-    els.allAppsTitle.textContent = state.currentCategory === "all" ? "All Apps" : label;
-    els.staffPicksSection.classList.toggle("hidden", state.currentCategory !== "all");
-    els.popularSection.classList.toggle("hidden", state.currentCategory !== "all");
+    const label = categories.find((category) => category.id === state.currentCategory)?.label || "All";
+    els.allAppsTitle.textContent = state.currentCategory === "all" ? "All" : label;
     if (!options.silent) renderAppsGrid();
   }
 
@@ -348,34 +382,6 @@
     });
   }
 
-  function renderStaffPicks() {
-    const picks = state.apps.filter((app) => app.isStaffPick).slice(0, 5);
-    els.staffPicksSection.classList.toggle("hidden", state.currentCategory !== "all" || picks.length === 0);
-    els.staffPicks.innerHTML = picks.map(renderStaffPick).join("");
-    bindAppActions(els.staffPicks);
-  }
-
-  function renderStaffPick(app) {
-    const bg = staffGradients[app.gradient] || staffGradients["gradient-purple"];
-    return `
-      <button class="staff-pick-card" type="button" style="background:${bg};" data-action="detail" data-app="${escapeAttr(app.id)}">
-        <span class="staff-pick-icon">${icons[app.icon] || icons.package}</span>
-        <span class="staff-pick-tag">${escapeHtml(categoryLabel(app.category))}</span>
-        <span class="staff-pick-content">
-          <span class="staff-pick-name">${escapeHtml(app.name)}</span>
-          <span class="staff-pick-desc">${escapeHtml(app.shortDesc || app.description)}</span>
-        </span>
-      </button>
-    `;
-  }
-
-  function renderPopularApps() {
-    const apps = state.apps.filter((app) => app.isPopular).slice(0, 8);
-    els.popularSection.classList.toggle("hidden", state.currentCategory !== "all" || apps.length === 0);
-    els.popularApps.innerHTML = apps.map(renderAppCard).join("");
-    bindAppActions(els.popularApps);
-  }
-
   function renderAppsGrid() {
     const apps = filteredApps();
     if (!apps.length) {
@@ -387,9 +393,9 @@
   }
 
   function renderInstalledApps() {
-    const installed = state.apps.filter((app) => app.installed || app.isBuiltIn);
+    const installed = state.apps.filter((app) => app.installed);
     if (!installed.length) {
-      els.installedList.innerHTML = emptyState("No apps installed", "Installed Runtime apps will appear here.", icons.package);
+      els.installedList.innerHTML = emptyState("No apps installed", "Installed apps will appear here.", icons.package);
       return;
     }
     els.installedList.innerHTML = installed.map((app) => `
@@ -410,7 +416,7 @@
   }
 
   function updateInstalledBadge() {
-    const count = state.apps.filter((app) => app.installed || app.isBuiltIn).length;
+    const count = state.apps.filter((app) => app.installed).length;
     els.installedBadge.textContent = String(count);
     els.installedBadge.classList.toggle("hidden", count === 0);
   }
@@ -445,7 +451,7 @@
     if (app.launchable) {
       return `<button class="install-btn installed" type="button" data-action="open" data-app="${escapeAttr(app.id)}">Open</button>`;
     }
-    if (app.installed || app.isBuiltIn) {
+    if (app.installed) {
       return `<button class="install-btn secondary" type="button" data-action="detail" data-app="${escapeAttr(app.id)}">Details</button>`;
     }
     return `<button class="install-btn pending" type="button" data-action="install" data-app="${escapeAttr(app.id)}">Install pending</button>`;
@@ -465,7 +471,7 @@
     const openButton = app.launchable
       ? `<button class="modal-btn primary" type="button" data-action="open" data-app="${escapeAttr(app.id)}">Open</button>`
       : `<button class="modal-btn disabled" type="button">Details only</button>`;
-    const installButton = !app.launchable && !app.installed && !app.isBuiltIn
+    const installButton = !app.launchable && !app.installed
       ? `<button class="modal-btn secondary" type="button" data-action="install" data-app="${escapeAttr(app.id)}">Install pending</button>`
       : "";
 
@@ -486,34 +492,13 @@
           <div class="modal-description">${escapeHtml(app.description)}</div>
         </section>
         <section class="modal-section">
-          <div class="modal-section-title">System</div>
-          <div class="requirements-grid">
-            <div class="requirement-item">
-              <div class="requirement-value">${escapeHtml(app.requirements.storage)}</div>
-              <div class="requirement-label">Source</div>
-            </div>
-            <div class="requirement-item">
-              <div class="requirement-value">${escapeHtml(app.role || "-")}</div>
-              <div class="requirement-label">Role</div>
-            </div>
-            <div class="requirement-item">
-              <div class="requirement-value">${escapeHtml(app.capsuleType || "-")}</div>
-              <div class="requirement-label">Type</div>
-            </div>
-          </div>
-        </section>
-        <section class="modal-section">
-          <div class="modal-section-title">Authority</div>
+          <div class="modal-section-title">Access</div>
           <ul class="permissions-list">
-            ${authorityItems(app).map((item) => `<li><span class="permission-icon">${icons.check}</span>${escapeHtml(item)}</li>`).join("")}
+            ${accessItems(app).map((item) => `<li><span class="permission-icon">${icons.check}</span>${escapeHtml(item)}</li>`).join("")}
           </ul>
         </section>
-        <section class="modal-section">
-          <div class="modal-section-title">Distribution</div>
-          <ul class="permissions-list">
-            ${distributionItems(app).map((item) => `<li><span class="permission-icon">${icons.check}</span>${escapeHtml(item)}</li>`).join("")}
-          </ul>
-        </section>
+        ${relationshipSection(app)}
+        ${technicalDetails(app)}
       </div>
       <footer class="modal-footer">
         <div class="modal-footer-price"><span class="price-tag">${app.cid ? "Verified" : "Local"}</span></div>
@@ -528,20 +513,54 @@
     els.detailModal.classList.add("active");
   }
 
-  function authorityItems(app) {
-    const items = app.permissions.length ? app.permissions : ["No provider authority declared"];
-    items.push(`dDRM: ${app.drmState || "not-declared"}`);
-    items.push(`Payment: ${app.paymentState || "not-declared"}`);
-    return items;
+  function accessItems(app) {
+    const items = [];
+    if (app.availableActions.length) items.push(`Available: ${app.availableActions.join(", ")}`);
+    if (app.paymentState && app.paymentState !== "none") items.push("Supports payments");
+    if (app.drmState && app.drmState !== "none") items.push("Uses protected content");
+    return items.length ? items : ["No extra access requested"];
+  }
+
+  function relationshipSection(app) {
+    const items = [];
+    if (app.viewerTitle) items.push(`Opens with ${app.viewerTitle}`);
+    if (app.acceptedContent.length) items.push(`Accepts ${app.acceptedContent.join(", ")}`);
+    if (app.dependencies.length) items.push(`Needs ${app.dependencies.join(", ")}`);
+    if (!items.length) return "";
+    return `
+      <section class="modal-section">
+        <div class="modal-section-title">Works with</div>
+        <ul class="permissions-list">
+          ${items.map((item) => `<li><span class="permission-icon">${icons.check}</span>${escapeHtml(item)}</li>`).join("")}
+        </ul>
+      </section>
+    `;
+  }
+
+  function technicalDetails(app) {
+    return `
+      <details class="modal-section technical-details">
+        <summary class="modal-section-title">Technical details</summary>
+        <div class="requirements-grid">
+          <div class="requirement-item"><div class="requirement-value">${escapeHtml(app.requirements.storage)}</div><div class="requirement-label">Source</div></div>
+          <div class="requirement-item"><div class="requirement-value">${escapeHtml(roleLabel(app.role))}</div><div class="requirement-label">Role</div></div>
+          <div class="requirement-item"><div class="requirement-value">${escapeHtml(app.capsuleType || "Unknown")}</div><div class="requirement-label">Type</div></div>
+        </div>
+        <ul class="permissions-list">
+          ${distributionItems(app).map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
+        </ul>
+      </details>
+    `;
   }
 
   function distributionItems(app) {
     return [
-      `Source: ${app.source || "runtime"}`,
+      `Source: ${app.source || "Local"}`,
       `Trust: ${trustLabel(app.trustState)}`,
       `Signature: ${signatureLabel(app.signatureState)}`,
       `App identity: ${app.cid ? "Verified SmartWeb app" : "Local app"}`,
       app.repository ? `Repository: ${app.repository}` : "",
+      app.technicalDependencies.length ? `Requires: ${app.technicalDependencies.join(", ")}` : "",
     ].filter(Boolean);
   }
 
@@ -575,8 +594,8 @@
     if (!app) return;
     els.installContent.innerHTML = `
       ${appIconHtml(app, "install-modal-icon")}
-      <div class="install-modal-title">Signed install pending</div>
-      <div class="install-modal-status">Marketplace can browse and open installed apps. Installing new apps will be enabled after app signatures, receipts, and provider policy are verified.</div>
+      <div class="install-modal-title">Install unavailable</div>
+      <div class="install-modal-status">Installing new apps is not available yet.</div>
       <button class="modal-btn secondary" type="button" data-action="close-install">Close</button>
     `;
     bindAppActions(els.installContent);
@@ -608,11 +627,11 @@
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error(payload.error || payload.message || `open failed: ${response.status}`);
+        throw new Error(publicError(payload.error || payload.message, "This app could not be opened."));
       }
       if (payload.route) window.location.href = payload.route;
     } catch (error) {
-      showToast(error.message || "Open failed", true);
+      showToast(publicError(error.message, "This app could not be opened."), true);
     }
   }
 
@@ -656,14 +675,10 @@
   function installedMeta(app) {
     return [
       app.version ? `v${app.version}` : "",
-      app.isBuiltIn ? "Runtime bundle" : "Installed",
+      "Installed",
       app.role,
       app.cid ? "Verified" : "",
     ].filter(Boolean).join(" / ");
-  }
-
-  function categoryLabel(categoryId) {
-    return categories.find((category) => category.id === categoryId)?.label.replace(" Apps", "") || titleCase(categoryId);
   }
 
   function showToast(message, isError = false) {
@@ -680,7 +695,7 @@
     const labels = {
       app: "App",
       viewer: "Viewer",
-      provider: "Provider",
+      provider: "Service",
       content: "Content",
       shell: "Shell",
       ddrm: "dDRM",
@@ -691,9 +706,9 @@
     return labels[badge] || titleCase(badge);
   }
 
-  function shortDescription(description) {
-    const text = String(description || "");
-    return text.length > 110 ? `${text.slice(0, 107)}...` : text;
+  function roleLabel(role) {
+    const labels = { app: "App", viewer: "Viewer", provider: "Service", content: "Content", shell: "Home view" };
+    return labels[String(role || "").toLowerCase()] || "App";
   }
 
   function titleCase(value) {

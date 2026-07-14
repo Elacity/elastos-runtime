@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 
-const CAMOFOX_BASE = process.env.CAMOFOX_BASE || "http://127.0.0.1:9377";
-const ELASTOS_BASE_URL = (process.env.ELASTOS_BASE_URL || "http://127.0.0.1:8090").replace(/\/+$/, "");
+const CAMOFOX_BASE = process.env.CAMOFOX_BASE || "http://localhost:9377";
+const ELASTOS_BASE_URL = (process.env.ELASTOS_BASE_URL || "http://localhost:8090").replace(/\/+$/, "");
 const HOME_URL = process.env.HOME_URL || `${ELASTOS_BASE_URL}/apps/home/`;
 const HOST_ORIGIN = new URL(HOME_URL).origin;
 const USER_ID = process.env.CAMOFOX_USER_ID || `home-smoke-${Date.now()}`;
 const TEST_DOCUMENT_CID = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
 const REQUIRE_DOCUMENT_PUBLISH = process.env.REQUIRE_DOCUMENT_PUBLISH === "1";
 const PRESERVE_CAMOFOX_SESSION = process.env.HOME_SMOKE_PRESERVE_SESSION === "1";
+const BANNED_PUBLIC_COPY = /\b(runtime mirror|permissioned runtime|projection|schema|derived facts?|runtime facts?|capsules?|providers?|capabilit(?:y|ies)|affordances?|authority boundary|provider boundary|gate preview|runtime-owned|host-loaded|structured home intents?|provider operation|launch token|hostcall|objects?)\b/i;
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -498,6 +499,39 @@ async function frameState(tabId, targetId, expression) {
   }
 }
 
+async function framePublicCopyState(tabId, targetId) {
+  return frameState(tabId, targetId, `(() => {
+    const text = doc.body?.innerText?.replace(/\\s+/g, " ").trim() || "";
+    const headings = [...doc.querySelectorAll("h1, h2, h3")]
+      .filter((node) => node.offsetParent !== null && !node.closest("#technical-details, .technical-details, [data-tab=technical]"))
+      .map((node) => node.textContent?.replace(/\\s+/g, " ").trim() || "")
+      .filter(Boolean);
+    return { ok: true, text, headings };
+  })()`);
+}
+
+async function directPublicCopyState(tabId, path) {
+  const url = new URL(path, HOST_ORIGIN).toString();
+  await evaluate(tabId, `(() => { window.location.href = ${JSON.stringify(url)}; return true; })()`);
+  const loaded = await waitFor(async () => evaluate(tabId, `(() => (
+    document.readyState === "complete" && Boolean(document.body)
+  ))()`), 15_000, 250);
+  assert(loaded, `direct public-copy page did not load: ${path}`);
+  await delay(600);
+  return evaluate(tabId, `(() => {
+    const headings = [...document.querySelectorAll("h1, h2, h3")]
+      .filter((node) => node.offsetParent !== null && !node.closest("#technical-details, .technical-details, [data-tab=technical]"))
+      .map((node) => node.textContent?.replace(/\\s+/g, " ").trim() || "")
+      .filter(Boolean);
+    return {
+      url: window.location.href,
+      title: document.title,
+      text: document.body?.innerText?.replace(/\\s+/g, " ").trim() || "",
+      headings,
+    };
+  })()`);
+}
+
 async function clickInFrame(tabId, targetId, selector) {
   return evaluate(tabId, `(() => {
     const frame = document.querySelector('.window[data-target="${targetId}"] .window-frame');
@@ -563,6 +597,16 @@ async function main() {
     await runCase("top-toolbar-keeps-only-working-controls", async (tabId) => {
       await delay(1000);
       const state = await shellState(tabId);
+      const publicState = await evaluate(tabId, `(() => ({
+        text: document.body?.innerText?.replace(/\\s+/g, " ").trim() || "",
+        headings: [...document.querySelectorAll("h1, h2, h3")]
+          .filter((node) => node.offsetParent !== null)
+          .map((node) => node.textContent?.replace(/\\s+/g, " ").trim() || "")
+          .filter(Boolean),
+      }))()`);
+      assert(!BANNED_PUBLIC_COPY.test(publicState.text), "Home GUI exposes internal narration", publicState);
+      const duplicateHomeHeadings = publicState.headings.filter((heading, index, headings) => headings.indexOf(heading) !== index);
+      assert(duplicateHomeHeadings.length === 0, "Home GUI renders duplicate visible headings", { duplicateHomeHeadings, publicState });
       assert(state.pageTitle === "Home · ElastOS", "Home page title mismatch", state);
       assert(state.topToolbar.launcherPresent === false, "top toolbar should not show a launcher button", state);
       assert(state.topToolbar.fullscreenPresent === true, "top toolbar should expose fullscreen as a working mobile control", state);
@@ -614,6 +658,28 @@ async function main() {
       );
     });
 
+    await runCase("direct-empty-and-error-copy-stays-plain", async (tabId) => {
+      const paths = [
+        "/apps/home-cli/",
+        "/apps/system/",
+        "/apps/marketplace/",
+        "/apps/services/",
+        "/apps/inbox/",
+        "/apps/library/",
+        "/apps/documents/",
+        "/apps/wallet/",
+        "/apps/browser/",
+      ];
+      for (const path of paths) {
+        const state = await directPublicCopyState(tabId, path);
+        assert(state.text.length > 0, `${path} rendered an empty direct state`, state);
+        assert(!BANNED_PUBLIC_COPY.test(state.text), `${path} direct state exposes internal narration`, state);
+        assert(!/\b(?:400|401|403|500)\b|bad request|request failed|invalid schema|launch token/i.test(state.text), `${path} direct state exposes a raw backend error`, state);
+        const duplicates = state.headings.filter((heading, index, headings) => headings.indexOf(heading) !== index);
+        assert(duplicates.length === 0, `${path} direct state renders duplicate headings`, { duplicates, state });
+      }
+    });
+
     const probeTabId = await createTab();
     const signedProbe = await shellState(probeTabId);
     await closeTab(probeTabId);
@@ -621,6 +687,38 @@ async function main() {
       console.log("SKIP signed Home app journeys: passkey-backed Camofox session unavailable; set HOME_SMOKE_PRESERVE_SESSION=1 with a signed Camofox profile to run them");
       return;
     }
+
+    await runCase("ordinary-app-copy-stays-plain-and-heading-unique", async (tabId) => {
+      for (const target of ["system", "marketplace", "services", "inbox", "library", "documents", "wallet", "browser"]) {
+        await openShellTarget(tabId, target);
+        const ready = await waitFor(async () => (await framePublicCopyState(tabId, target)).ok, 15_000, 300);
+        assert(ready, `${target} did not render for the public-copy visual check`, await shellState(tabId));
+        const state = await framePublicCopyState(tabId, target);
+        assert(!BANNED_PUBLIC_COPY.test(state.text), `${target} exposes internal narration`, state);
+        const duplicates = state.headings.filter((heading, index, headings) => headings.indexOf(heading) !== index);
+        assert(duplicates.length === 0, `${target} renders duplicate visible headings`, { duplicates, state });
+      }
+    });
+
+    await runCase("home-cli-copy-stays-plain", async (tabId) => {
+      const launched = await launchShellTarget(tabId, "home-cli");
+      const route = new URL(launched.route, HOST_ORIGIN).toString();
+      assert(route.includes("home_token="), "Home CLI launch did not mint an app token", launched);
+      await evaluate(tabId, `(() => { window.location.href = ${JSON.stringify(route)}; return true; })()`);
+      await waitForSelector(tabId, "#xterm-terminal", 20_000);
+      await delay(1200);
+      const state = await evaluate(tabId, `(() => ({
+        text: document.body?.innerText?.replace(/\\s+/g, " ").trim() || "",
+        headings: [...document.querySelectorAll("h1, h2, h3")]
+          .filter((node) => node.offsetParent !== null)
+          .map((node) => node.textContent?.replace(/\\s+/g, " ").trim() || "")
+          .filter(Boolean),
+      }))()`);
+      assert(!BANNED_PUBLIC_COPY.test(state.text), "Home CLI exposes internal narration", state);
+      assert(!/\b(?:400|401|403|500)\b|bad request|request failed|invalid schema|launch token/i.test(state.text), "Home CLI exposes a raw backend error", state);
+      const duplicates = state.headings.filter((heading, index, headings) => headings.indexOf(heading) !== index);
+      assert(duplicates.length === 0, "Home CLI renders duplicate headings", { duplicates, state });
+    });
 
     await runCase("launcher-card-opens-system", async (tabId) => {
       await openLauncher(tabId);
@@ -645,14 +743,11 @@ async function main() {
       const system = await frameState(tabId, "system", `({
         ok: true,
         title: doc.title || "",
-        heading: doc.querySelector("h1")?.textContent?.trim() || "",
-        panelLabels: [...doc.querySelectorAll(".system-panel h2")].map((node) => node.textContent?.trim() || ""),
+        heading: [...doc.querySelectorAll("h1")].find((node) => node.offsetParent !== null)?.textContent?.trim() || "",
+        panelLabels: [...doc.querySelectorAll(".pc2-section-title, #catalog-title")].map((node) => node.textContent?.trim() || ""),
         fieldLabels: [...doc.querySelectorAll(".system-fields dt")].map((node) => node.textContent?.trim() || ""),
         aboutFieldLabels: [...doc.querySelectorAll('[data-settings="about"] .system-fields dt')].map((node) => node.textContent?.trim() || ""),
         walletControlsRemoved: !doc.querySelector("#wallet-create") && !doc.querySelector("#wallet-approvals"),
-        handleLabel: doc.querySelector('label[for="handle-input"]')?.textContent?.trim() || "",
-        handleInputDisabled: doc.querySelector('#handle-input')?.disabled ?? null,
-        handleSaveDisabled: doc.querySelector('#handle-save')?.disabled ?? null,
         recoveryPasswordPresent: !!doc.querySelector("#recovery-password"),
         recoveryPasswordPlaceholder: doc.querySelector("#recovery-password")?.getAttribute("placeholder") || "",
         recoveryDownloadLabel: doc.querySelector("#recovery-download")?.textContent?.trim() || "",
@@ -663,9 +758,7 @@ async function main() {
         recoveryAttachLabel: doc.querySelector("#recovery-attach")?.textContent?.trim() || "",
         recoveryCancelLabel: doc.querySelector("#recovery-cancel")?.textContent?.trim() || "",
         runtimeStatus: doc.querySelector('[data-field="runtime-status"]')?.textContent?.trim() || "",
-        runtimeNote: doc.querySelector('[data-field="runtime-note"]')?.textContent?.trim() || "",
-        storageStatus: doc.querySelector('[data-field="storage-status"]')?.textContent?.trim() || "",
-        storageNote: doc.querySelector('[data-field="storage-note"]')?.textContent?.trim() || "",
+        storageSectionPresent: !!doc.querySelector('[data-settings="storage"], #webspace-list'),
         hasAppearancePanel: !!doc.querySelector("#appearance-title"),
         hasBackgroundInput: !!doc.querySelector("#background-input"),
         hasBackgroundPreview: !!doc.querySelector("#background-preview"),
@@ -695,13 +788,19 @@ async function main() {
       })`);
       assert(system.ok, "System frame was not reachable", system);
       assert(system.title === "System · ElastOS", "System frame title mismatch", system);
-      assert(system.heading === "", "System frame should not duplicate the window title", system);
-      assert(system.panelLabels.includes("Profile"), "System frame is missing Profile", system);
+      assert(system.heading === "Accounts", "System frame should open on Accounts", system);
+      assert(system.panelLabels.includes("Accounts"), "System frame is missing Accounts", system);
+      assert(system.panelLabels.includes("Shell"), "System frame is missing Shell", system);
       assert(system.panelLabels.includes("Appearance"), "System frame is missing Appearance", system);
-      assert(system.panelLabels.includes("Advanced"), "System frame is missing Advanced", system);
+      assert(system.panelLabels.includes("Recovery"), "System frame is missing Recovery", system);
+      assert(system.panelLabels.includes("Access"), "System frame is missing Access", system);
+      assert(!system.panelLabels.includes("Elastos Webspace"), "System must not present app inventory as a WebSpace", system);
+      assert(system.panelLabels.includes("Apps & Services"), "System frame is missing Apps & Services", system);
+      assert(system.panelLabels.includes("This Device"), "System frame is missing This Device", system);
+      assert(!system.panelLabels.includes("Profile"), "System frame should keep People profile settings out of System", system);
       assert(system.fieldLabels.includes("Device identity"), "System frame is missing the Device identity section", system);
       assert(system.fieldLabels.includes("Version"), "System frame is missing the runtime version", system);
-      assert(system.fieldLabels.includes("Documents"), "System frame is missing the storage summary", system);
+      assert(!system.fieldLabels.includes("Documents"), "System About should not include Documents", system);
       assert(system.aboutFieldLabels.includes("Version"), "System About is missing the runtime version", system);
       assert(!system.aboutFieldLabels.includes("Documents"), "System About should not include Documents", system);
       assert(system.fieldLabels.includes("Accounts"), "System frame is missing account management", system);
@@ -710,22 +809,17 @@ async function main() {
       assert(!system.fieldLabels.includes("Wallet"), "System frame should not duplicate Wallet controls", system);
       assert(system.walletControlsRemoved, "System frame should not include wallet account or approval controls", system);
       assert(system.fieldLabels.includes("Network status"), "System frame is missing network status diagnostics", system);
-      assert(system.fieldLabels.includes("Display name"), "System frame is missing the display-name field", system);
-      assert(system.handleLabel === "Display name", "System frame display-name label drifted", system);
-      assert(system.handleInputDisabled === false, "Home-launched System should allow handle edits", system);
-      assert(system.handleSaveDisabled === false, "Home-launched System should allow handle saves", system);
+      assert(!system.fieldLabels.includes("Display name"), "System should keep display-name editing in People", system);
       assert(system.recoveryPasswordPresent, "System frame did not expose Recovery Kit password protection", system);
       assert(system.recoveryPasswordPlaceholder === "Optional password", "System Recovery Kit password copy drifted", system);
       assert(system.recoveryDownloadLabel.toLowerCase().includes("recovery kit"), "System frame did not expose Recovery Kit download", system);
       assert(system.recoveryImportPresent, "System frame did not expose Recovery Kit import", system);
-      assert(system.recoveryImportLabel === "Import kit", "System Recovery Kit import label drifted", system);
+      assert(system.recoveryImportLabel === "Import Recovery Kit", "System Recovery Kit import label drifted", system);
       assert(system.recoveryPendingPresent && system.recoveryPendingHidden, "System Recovery Kit reassignment review should exist but stay hidden until needed", system);
       assert(system.recoveryAttachLabel === "Recover account", "System Recovery Kit recover action drifted", system);
       assert(system.recoveryCancelLabel === "Cancel", "System Recovery Kit cancel action drifted", system);
       assert(system.runtimeStatus.length > 0, "System did not show the managed local runtime version", system);
-      assert(!system.runtimeNote.includes("No active local runtime"), "System still reported no local runtime after shell bootstrap", system);
-      assert(system.storageStatus.length > 0, "System did not expose storage status", system);
-      assert(system.storageNote.length > 0, "System did not expose storage detail", system);
+      assert(!system.storageSectionPresent, "System must not expose the removed Storage section", system);
       assert(system.hasAppearancePanel, "System did not expose Appearance", system);
       assert(system.hasBackgroundInput && system.hasBackgroundPreview, "System Appearance did not expose background controls", system);
       assert(system.backgroundInputLabel === "Choose background image", "System background input lacked a stable label", system);
@@ -934,11 +1028,18 @@ async function main() {
       assert(state.windows.length === 1 && state.windows[0].target === "gba-emulator", "gba launcher card did not open gba-emulator", state);
       const gba = await frameState(tabId, "gba-emulator", `({
         ok: true,
-        dropCopy: doc.querySelector('#drop-zone-copy')?.textContent?.trim() || "",
+        chooser: doc.querySelector('#drop-zone-copy')?.textContent?.trim() || "",
+        libraryLabel: doc.querySelector('#drop-zone')?.getAttribute('aria-label') || "",
+        controls: doc.querySelectorAll('[data-key]').length,
+        fastForward: !!doc.querySelector('#btn-ff'),
+        stateSlots: doc.querySelectorAll('[id^="btn-save"]').length,
         status: doc.querySelector('#status')?.textContent?.trim() || "",
       })`);
-      assert(gba.dropCopy === "GBA retired", "GBA retired state copy was not visible", gba);
-      assert(gba.status.includes("GBA support is retired"), "GBA retired status was not visible", gba);
+      assert(gba.chooser === "Insert Game", "GBA game chooser was not visible", gba);
+      assert(gba.libraryLabel === "Open Library to choose a GBA game", "GBA Library action was not available", gba);
+      assert(gba.controls === 10, "GBA controls were incomplete", gba);
+      assert(gba.fastForward && gba.stateSlots === 3, "GBA utility controls were incomplete", gba);
+      assert(gba.status === "", "GBA chooser showed an unexpected error", gba);
     });
 
     await runCase("launcher-card-opens-chat-room", async (tabId) => {

@@ -94,7 +94,7 @@ complete product Browser.
 | RS-02 | DID-backed identity works | `scripts/public-install-identity-smoke.sh` and `scripts/local-identity-profile-smoke.sh` | `elastos identity show`, `nickname set/get`, Home identity surfaces | same on installed path | same on installed path |
 | RS-03 | Home front door works | `scripts/local-carrier-setup-smoke.sh`, `scripts/home-frontdoor-smoke.sh`, `scripts/public-install-home-frontdoor-smoke.sh` | launch `elastos`, open System/Documents/Library/Inbox, return Home | `elastos` -> Home -> System/Documents/Library/Inbox -> Home | same as installed x86_64 |
 | RS-04 | Native chat works | `scripts/local-carrier-chat-smoke.sh` where applicable | open Chat locally, verify send/receive and `/home` / `/quit` | `elastos` -> Chat, exchange messages with another installed host | same as installed x86_64 |
-| RS-05 | Chat WASM works | `scripts/chat-wasm-local-smoke.sh`, `scripts/chat-wasm-native-interop-smoke.sh`, `scripts/shared-runtime-gossip-proof.sh` | run `elastos capsule chat-wasm --lifecycle interactive --interactive` or local dev path and exchange with native chat | n/a unless explicitly shipped there | n/a unless explicitly shipped there |
+| RS-05 | Shared Chat runtime works | `scripts/shared-runtime-gossip-proof.sh` | native Chat and Chat Room share one runtime-backed conversation state | same as seed node on installed path | same as installed x86_64 |
 | RS-06 | Full-screen chat microVM works | `scripts/chat-demo-local-smoke.sh` on KVM hosts; installed-path proof is manual on this line | source-local KVM proof if applicable | `elastos setup --profile chat`, then direct packaged chat | same as installed x86_64 |
 | RS-07 | MyWebSite is useful | covered partly by Home frontdoor smokes and site command tests | staged preview opens, `Go public`/ephemeral exposure gives a URL when installed, and any surfaced Home action is truthful | same as seed node on installed path | same as installed x86_64 |
 | RS-08 | Documents and Library are useful | `scripts/home-camofox-smoke.sh`, `cargo test -p elastos-server --lib documents -- --nocapture` | create/save/publish a document, then open it from Library | same as seed node on installed Home | same as installed x86_64 |
@@ -214,21 +214,19 @@ Pass when:
 - no duplicate delayed replay
 - no runtime logs leak into the UI
 
-### RS-05 Chat WASM works
+### RS-05 Shared Chat runtime works
 
 Automatic:
 ```bash
 cd <repo-root>
 bash scripts/shared-runtime-gossip-proof.sh
-bash scripts/chat-wasm-local-smoke.sh
-bash scripts/chat-wasm-native-interop-smoke.sh
 ```
 
 Manual on seed node:
 1. Launch native chat
-2. Launch WASM chat on the same runtime
+2. Launch Chat Room on the same runtime
 3. Exchange messages both ways
-4. Verify same-host interop is boring
+4. Verify same-host interop uses the shared runtime state
 
 Pass when:
 - lower-layer gossip proof passes
@@ -443,8 +441,6 @@ Everything else must either:
 cd <repo-root>
 just verify
 bash scripts/shared-runtime-gossip-proof.sh
-bash scripts/chat-wasm-local-smoke.sh
-bash scripts/chat-wasm-native-interop-smoke.sh
 bash scripts/gba-demo-smoke.sh
 bash scripts/protected-content-provider-contract-smoke.sh
 

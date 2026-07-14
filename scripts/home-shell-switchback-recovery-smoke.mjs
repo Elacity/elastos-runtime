@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260705a";
+const moduleVersion = "home-20260712b";
 const requests = [];
 const localStorageValues = new Map([
   ["elastos.home.active-shell-hint", "home-cli"],
@@ -333,9 +333,9 @@ assert(activeShellRequests[0].headers["x-elastos-home-token"] === "root-token", 
 assert(recovery.hidden === false, "switchback failure did not show host recovery");
 assert(recovery.dataset.host === "home-shell-host", "switchback recovery did not advertise host ownership", recovery.dataset);
 assert(recovery.dataset.target === "home-cli", "switchback recovery target drifted", recovery.dataset);
-assert(recoveryTitle.textContent.includes("home-gui"), "switchback recovery title did not name home-gui", recoveryTitle.textContent);
-assert(recoveryCopy.textContent.includes("Reload Home"), "switchback recovery copy did not expose reload path", recoveryCopy.textContent);
-assert(recoveryDetail.textContent.includes("simulated active shell switch failure"), "switchback recovery did not expose operator failure detail", recoveryDetail.textContent);
+assert(recoveryTitle.textContent.includes("Desktop"), "switchback recovery title did not name Desktop", recoveryTitle.textContent);
+assert(recoveryCopy.textContent.includes("Reload"), "switchback recovery copy did not expose reload path", recoveryCopy.textContent);
+assert(recoveryDetail.textContent === "A Home service failed while loading.", "switchback recovery exposed an internal shell error", recoveryDetail.textContent);
 assert(
   elementForSelector("#home-shell-boot-mask").hidden === true,
   "switchback failure left the neutral host mask over recovery",

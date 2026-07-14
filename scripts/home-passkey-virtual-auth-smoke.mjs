@@ -2565,6 +2565,39 @@ async function signBackIn(page) {
   return token;
 }
 
+async function checkHomePublicCopy(page) {
+  await waitForSignedHome(page);
+  const state = await page.evaluate(() => {
+    const visible = (node) => {
+      const style = window.getComputedStyle(node);
+      return style.display !== "none"
+        && style.visibility !== "hidden"
+        && node.getClientRects().length > 0;
+    };
+    const text = (document.body.innerText || "").replace(/\s+/g, " ").trim();
+    const headings = [...document.querySelectorAll("h1,h2,h3,[role=heading]")]
+      .filter(visible)
+      .map((node) => (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+    const counts = new Map();
+    for (const heading of headings) counts.set(heading, (counts.get(heading) || 0) + 1);
+    return {
+      text,
+      duplicate_headings: [...counts.entries()].filter(([, count]) => count > 1),
+      horizontal_overflow: document.documentElement.scrollWidth > document.documentElement.clientWidth + 2,
+    };
+  });
+  const internalCopy = state.text.match(/\b(runtime mirror|permissioned runtime|projection|schema|derived facts?|runtime facts?|capsules?|providers?|capabilit(?:y|ies)|affordances?|authority boundary|provider boundary|gate preview|runtime-owned|host-loaded|structured home intents?|provider operation|launch token|hostcall|objects?)\b/i);
+  assert(!internalCopy, "Home GUI exposed implementation copy", { match: internalCopy?.[0], state });
+  assert(state.duplicate_headings.length === 0, "Home GUI rendered duplicate visible headings", state);
+  assert(!state.horizontal_overflow, "Home GUI rendered horizontal overflow", state);
+  return {
+    text_length: state.text.length,
+    duplicate_headings: state.duplicate_headings,
+    horizontal_overflow: state.horizontal_overflow,
+  };
+}
+
 async function launchSystem(page, homeToken) {
   assert(homeToken, "launchSystem requires a passkey-issued Home token");
   const route = await page.evaluate(async (token) => {
@@ -2625,26 +2658,25 @@ async function checkShellSwitchJourney(page, homeToken) {
   markStage("shell-switch:open-system-shell");
   const shellTab = page.locator('button.settings-sidebar-item[data-settings="shell"]');
   await shellTab.click();
-  await page.locator("#active-shell-select").waitFor({ state: "visible", timeout: 15_000 });
+  await page.locator("#active-shell-options").waitFor({ state: "visible", timeout: 15_000 });
   await page.waitForFunction(() => {
-    const select = document.querySelector("#active-shell-select");
-    return Array.from(select?.options || []).some((option) => option.value === "home-gui")
-      && Array.from(select?.options || []).some((option) => option.value === "home-cli");
+    const names = Array.from(document.querySelectorAll("#active-shell-options [data-shell-name]"))
+      .map((button) => button.dataset.shellName);
+    return names.includes("home-gui") && names.includes("home-cli");
   }, null, { timeout: 15_000 });
   const shellOptions = await page.evaluate(() => {
-    const select = document.querySelector("#active-shell-select");
-    return Array.from(select?.options || []).map((option) => ({
-      value: option.value,
-      label: option.textContent?.trim() || "",
+    return Array.from(document.querySelectorAll("#active-shell-options [data-shell-name]"))
+      .map((button) => ({
+      value: button.dataset.shellName,
+      label: button.textContent?.trim() || "",
     }));
   });
-  await page.selectOption("#active-shell-select", "home-cli");
   const switchToCli = page.waitForResponse((response) => (
     response.request().method() === "POST" &&
     response.url().endsWith("/api/apps/home/active-shell")
   ), { timeout: 15_000 });
   markStage("shell-switch:system-post-home-cli");
-  await page.locator("#active-shell-apply").click();
+  await page.locator('#active-shell-options [data-shell-name="home-cli"]').click();
   const switchResponse = await switchToCli;
   assert(switchResponse.ok(), "System shell picker failed to switch to home-cli", {
     status: switchResponse.status(),
@@ -2652,7 +2684,8 @@ async function checkShellSwitchJourney(page, homeToken) {
   });
   switchedToCli = true;
   await page.waitForFunction(() => (
-    document.querySelector('[data-field="active-shell-current"]')?.textContent?.includes("home-cli")
+    document.querySelector('#active-shell-options [data-shell-name="home-cli"]')
+      ?.getAttribute("aria-pressed") === "true"
   ), null, { timeout: 15_000 });
 
   markStage("shell-switch:reload-home-cli");
@@ -3463,6 +3496,7 @@ async function main() {
       ? await persistVirtualAuthenticatorCredentials(virtualAuthenticator)
       : { skipped: true, reason: "created credential will be cleaned up" };
 
+    const homePublicCopy = await checkHomePublicCopy(page);
     const system = await launchSystem(page, homeToken);
     const shellSwitch = await checkShellSwitchJourney(page, homeToken);
     const browserLaunch = INCLUDE_BROWSER ? await checkBrowserLaunchGrant(page, homeToken) : null;
@@ -3484,6 +3518,7 @@ async function main() {
       role: passkey.role,
       virtual_authenticator_credentials: credentialStore,
       system_fields: system.fields,
+      home_public_copy: homePublicCopy,
       shell_switch: shellSwitch,
       browser_launch_checked: Boolean(browserLaunch),
       browser_ui_setup: browserLaunch?.browser_ui_setup || null,

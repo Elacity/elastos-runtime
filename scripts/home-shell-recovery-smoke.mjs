@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260705a";
+const moduleVersion = "home-20260712b";
 const requests = [];
 const originalConsoleError = console.error;
 console.error = (...args) => {
@@ -288,9 +288,9 @@ assert(!activeShellFrame.dataset.route, "failed shell launch kept a stale frame 
 assert(recovery.hidden === false, "host recovery panel did not show after failed shell launch");
 assert(recovery.dataset.host === "home-shell-host", "host recovery did not advertise host ownership", recovery.dataset);
 assert(recovery.dataset.target === "home-cli", "host recovery target drifted", recovery.dataset);
-assert(recoveryTitle.textContent.includes("home-cli"), "recovery title did not name failed shell", recoveryTitle.textContent);
-assert(recoveryCopy.textContent.includes("Reload Home"), "recovery copy did not expose reload path", recoveryCopy.textContent);
-assert(recoveryDetail.textContent.includes("simulated root shell launch failure"), "recovery detail did not preserve operator error");
+assert(recoveryTitle.textContent.includes("Terminal"), "recovery title did not name failed shell", recoveryTitle.textContent);
+assert(recoveryCopy.textContent.includes("Reload"), "recovery copy did not expose reload path", recoveryCopy.textContent);
+assert(recoveryDetail.textContent === "A Home service failed while loading.", "recovery detail exposed an internal launch error", recoveryDetail.textContent);
 assert(recoveryHome.disabled === true, "switchback button must fail closed without a launch token");
 assert((recoveryHome.listeners.get("click") || []).length === 1, "home-gui recovery control was not wired");
 assert((recoveryReload.listeners.get("click") || []).length === 1, "reload recovery control was not wired");

@@ -59,23 +59,7 @@ export function allVisibleTargets(summary) {
   if (!summary || !Array.isArray(summary.targets)) {
     return [];
   }
-  const targets = summary.targets.filter((target) => target?.role !== "shell");
-  if (
-    summary.authority &&
-    summary.authority.signed_in === true &&
-    !targets.some((target) => target.target === PEOPLE_TARGET_ID)
-  ) {
-    targets.push({
-      target: PEOPLE_TARGET_ID,
-      title: "People",
-      description: "See accepted ElastOS contacts and start conversations.",
-      route: "home://people",
-      attach_kind: "home",
-      role: "app",
-      target_kind: "app",
-    });
-  }
-  return targets;
+  return summary.targets.filter((target) => target?.role !== "shell");
 }
 
 export function targetById(summary, targetId) {

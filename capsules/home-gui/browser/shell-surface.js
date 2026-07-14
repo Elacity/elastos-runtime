@@ -45,7 +45,7 @@ import {
   desktopObjectEntryId,
   desktopObjectByEntryId,
   desktopEntryExists,
-} from "./shell-core.js?v=home-20260705a";
+} from "./shell-core.js?v=home-20260712b";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -59,7 +59,7 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260705a";
+} from "./shell-windows.js?v=home-20260712b";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -1540,7 +1540,7 @@ function showHomeNotificationToast(entry) {
   bindHomeNotificationToast();
   lastHomeNotificationToastId = walletApprovalKey(entry);
   homeNotificationTitle.textContent = entry.title || "Wallet approval request";
-  homeNotificationBody.textContent = entry.body || "A capsule requests wallet approval.";
+  homeNotificationBody.textContent = entry.body || "An app requests wallet approval.";
   homeNotificationToast.hidden = false;
   homeNotificationToast.setAttribute("aria-hidden", "false");
   window.clearTimeout(homeNotificationToastTimer);

@@ -152,6 +152,7 @@ function audit(args) {
   const virtualAuthSmoke = read("scripts/home-passkey-virtual-auth-smoke.mjs");
   const gatewayHomeTerminal = read("elastos/crates/elastos-server/src/api/gateway_home_terminal.rs");
   const gatewayHomeTests = read("elastos/crates/elastos-server/src/api/gateway_tests/home_system.rs");
+  const gatewayCapsuleCatalog = read("elastos/crates/elastos-server/src/api/gateway_capsule_catalog.rs");
   const catalogReadModel = read("elastos/crates/elastos-server/src/api/gateway_capsule_catalog/read_model.rs");
   const shellPicker = read("elastos/esp/shell_picker.ts");
   const manual = manualUxResult(args.manualUx);
@@ -214,7 +215,7 @@ function audit(args) {
         !shellCore.includes("function desktopLayoutBounds()") &&
         !shellCore.includes("desktopIconsVisible: true") &&
         entropy.includes("homeGuiJs.includes(\"function retireHomeGuiSurface(options = {})\")") &&
-        homeGuiManifest.includes("host-loaded") &&
+        homeGuiManifest.includes('"execution": "web-projection"') &&
         contractDoc.includes("trusted host-loaded GUI shell code"),
       [
         "capsules/home/browser/index.html",
@@ -296,7 +297,7 @@ function audit(args) {
         !homeCliRust.includes("UiKey::Browser") &&
         !homeCliRust.includes("b opens Browser") &&
         cliSmoke.includes("home-cli did not autostart an xterm terminal") &&
-        cliSmoke.includes("home-cli terminal exit did not request Home GUI recovery"),
+        cliSmoke.includes("home-cli terminal exit did not reattach Home CLI"),
       [
         "capsules/home-cli/browser/commands.json",
         "capsules/home-cli/src/main.rs",
@@ -307,7 +308,7 @@ function audit(args) {
     criterion(
       "canonical_shell_candidates",
       "Catalog and shell picker expose exactly home-gui and home-cli as selectable shells; legacy saved home state repairs to home-gui, but new home writes are rejected.",
-      catalogReadModel.includes("target.is_some() && role.is_shell_launchable()") &&
+      catalogReadModel.includes("let launchable = target.is_some();") &&
         !catalogReadModel.includes("is_home_shell") &&
         shellPicker.includes("HOME_HOST_ID") &&
         shellPicker.includes("export function shellIdentity") &&
@@ -319,7 +320,7 @@ function audit(args) {
         includesNormalized(gatewayHomeTests, "assert_eq!(home_write_rejected.status(), StatusCode::BAD_REQUEST);") &&
         gatewayHomeTests.includes('"active": "home-gui"') &&
         !gatewayHomeTests.includes(retiredHomeActiveStateLiteral) &&
-        includesNormalized(contractDoc, "Catalog facts and shell picker projections expose `home-gui` and `home-cli` only."),
+        includesNormalized(contractDoc, "New active-shell writes use only installed launchable shell candidates."),
       [
         "elastos/crates/elastos-server/src/api/gateway_capsule_catalog/read_model.rs",
         "elastos/esp/shell_picker.ts",
@@ -331,14 +332,14 @@ function audit(args) {
     criterion(
       "capsule_interface_projection",
       "Capsules expose web, CLI, facts, affordances, gate metadata, audit/mirror, and Carrier/service readiness through Runtime-derived projections.",
-      contractDoc.includes("web, CLI, facts, affordances, gates, audit/mirror, and Carrier surfaces") &&
+      contractDoc.includes("web, CLI, facts, affordances, gates, audit/mirror, and Carrier/service") &&
         entropy.includes("first_party_capsules_have_complete_projection_contract") &&
-        gatewayHomeTests.includes("test_home_active_shell_uses_catalog_shell_candidates") &&
+        gatewayCapsuleCatalog.includes("first_party_capsules_have_complete_projection_contract") &&
         state.includes("first_party_capsules_have_complete_projection_contract"),
       [
         "docs/HOME_SHELL_HOST_CONTRACT.md",
         "scripts/home-entropy-check.mjs",
-        "elastos/crates/elastos-server/src/api/gateway_tests/home_system.rs",
+        "elastos/crates/elastos-server/src/api/gateway_capsule_catalog.rs",
         "state.md",
       ],
       "Keep Runtime projection contract and first-party coverage in sync.",
@@ -390,6 +391,7 @@ function audit(args) {
       "Machine tests cover cookie cannot switch shell, token can switch shell, CLI to GUI, CLI Chat staying native, GUI-only Browser hidden/default-blocked boundaries, GUI windows retired on CLI switch, and stale shell state repairs.",
         gatewayHomeTests.includes("cookie_active_shell_write_rejected") &&
         gatewayHomeTests.includes("assert_eq!(payload[\"active_shell\"][\"active\"], \"home-cli\")") &&
+        gatewayHomeTests.includes("test_home_shell_switch_preserves_runtime_facts_and_recovers_after_launch_failure") &&
         virtualAuthSmoke.includes("Home CLI instantiated Home GUI DOM") &&
         virtualAuthSmoke.includes("Home CLI Chat opened the GUI chat-room window") &&
         virtualAuthSmoke.includes("Home CLI Chat did not enter native chat") &&
@@ -466,7 +468,7 @@ function audit(args) {
         cliSmoke.includes("home-cli did not autostart an xterm terminal") &&
         cliSmoke.includes("home-cli terminal event stream did not use a scoped stream ticket") &&
         cliSmoke.includes("home-cli terminal resize did not carry its launch token") &&
-        cliSmoke.includes("home-cli terminal exit did not request Home GUI recovery") &&
+        cliSmoke.includes("home-cli terminal exit did not reattach Home CLI") &&
         contractDoc.includes("Runtime owns the process") &&
         includesNormalized(contractDoc, "stream ticket") &&
         includesNormalized(contractDoc, "dimensions, input/resize routes") &&
@@ -493,7 +495,7 @@ function audit(args) {
         gatewayHomeTerminal.includes("stream_ticket") &&
         gatewayHomeTests.includes("test_home_cli_terminal_stream_requires_cli_launch_token") &&
         gatewayHomeTests.includes("elastos.home-cli.terminal-resize/v1") &&
-        cliSmoke.includes("home-cli terminal exit did not request Home GUI recovery") &&
+        cliSmoke.includes("home-cli terminal exit did not reattach Home CLI") &&
         cliSmoke.includes("home-cli terminal input did not carry its launch token") &&
         homeCli.includes("sendRuntimeTerminalInput") &&
         homeCli.includes('eventsUrl.includes("home_token=")'),

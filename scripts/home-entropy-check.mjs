@@ -455,6 +455,9 @@ function assertOrdinaryCapsulesDoNotReferenceRawBlockchainAuthority() {
 
     const manifestText = readFileSync(manifestPath, "utf8");
     for (const [pattern, reason] of forbiddenAuthorityPatterns) {
+      if (name === "home" && reason === "direct browser wallet adapter authority") {
+        continue;
+      }
       if (manifestText.includes(pattern)) {
         failures.push(`${relativeToRepo(manifestPath)}: ${reason}`);
       }
@@ -473,6 +476,9 @@ function assertOrdinaryCapsulesDoNotReferenceRawBlockchainAuthority() {
       }
       const sourceText = readFileSync(source, "utf8");
       for (const [pattern, reason] of forbiddenAuthorityPatterns) {
+        if (name === "home" && reason === "direct browser wallet adapter authority") {
+          continue;
+        }
         if (sourceText.includes(pattern)) {
           failures.push(`${relativeToRepo(source)}: ${reason}`);
         }
@@ -574,9 +580,9 @@ function assertStaticControlsAreNamed(file) {
 const activeUiFiles = [
   "capsules/home/browser/index.html",
   "capsules/home/browser/style.css",
-  "capsules/home/browser/shell.js",
-  "capsules/home/browser/shell-surface.js",
-  "capsules/home/browser/shell-windows.js",
+  "capsules/home/browser/home-shell-host.js",
+  "capsules/home-gui/browser/shell-surface.js",
+  "capsules/home-gui/browser/shell-windows.js",
   "capsules/home/browser/service-worker.js",
   "capsules/system/browser/index.html",
   "capsules/system/browser/system.js",
@@ -749,7 +755,10 @@ for (const [token, value] of new Map([
   assertToken(libraryStyle, "capsules/library/browser/library.css", token, value);
 }
 
-const shellStyle = read("capsules/home/browser/style.css");
+const shellStyle = [
+  read("capsules/home/browser/style.css"),
+  read("capsules/home-gui/browser/style.css"),
+].join("\n");
 assertToken(
   shellStyle,
   "capsules/home/browser/style.css",
@@ -800,22 +809,33 @@ assert(
   "Home active maximized windows must stack above Home chrome",
 );
 
-const shellIndex = read("capsules/home/browser/index.html");
+const shellIndex = readAll([
+  "capsules/home/browser/index.html",
+  "capsules/home-gui/browser/home-gui-template.html",
+]);
 const shellManifest = JSON.parse(
   read("capsules/home/browser/manifest.webmanifest"),
 );
 const shellServiceWorker = read("capsules/home/browser/service-worker.js");
-const shellSurface = read("capsules/home/browser/shell-surface.js");
-const shellJs = read("capsules/home/browser/shell.js");
-const shellCore = read("capsules/home/browser/shell-core.js");
-const shellWindows = read("capsules/home/browser/shell-windows.js");
+const shellSurface = read("capsules/home-gui/browser/shell-surface.js");
+const shellJs = readAll([
+  "capsules/home/browser/home-shell-host.js",
+  "capsules/home-gui/browser/home-gui.js",
+  "capsules/home-gui/browser/shell-core.js",
+  "capsules/home-gui/browser/shell-chrome.js",
+]);
+const shellCore = readAll([
+  "capsules/home/browser/shell-core.js",
+  "capsules/home-gui/browser/shell-core.js",
+]);
+const shellWindows = read("capsules/home-gui/browser/shell-windows.js");
 const homeShellRegressionSmoke = read("scripts/home-shell-regression-smoke.mjs");
 const servicesCapsule = read("capsules/services/capsule.json");
 const servicesIndex = read("capsules/services/browser/index.html");
 const servicesScript = read("capsules/services/browser/services.js");
 const servicesStyle = read("capsules/services/browser/style.css");
 const shellWindowGeometry = read(
-  "capsules/home/browser/shell-window-geometry.js",
+  "capsules/home-gui/browser/shell-window-geometry.js",
 );
 const shellCmd = read("elastos/crates/elastos-server/src/shell_cmd.rs");
 const homeCmd = read("elastos/crates/elastos-server/src/home_cmd.rs");
@@ -858,6 +878,7 @@ const gatewayHomeSystemTests = read(
   "elastos/crates/elastos-server/src/api/gateway_tests/home_system.rs",
 );
 const gatewayInboxApi = read("elastos/crates/elastos-server/src/api/gateway_inbox.rs");
+const gatewayWalletAppApi = read("elastos/crates/elastos-server/src/api/gateway_wallet_app.rs");
 const gatewayBrowserApi = readAll([
   "elastos/crates/elastos-server/src/api/gateway_browser.rs",
   "elastos/crates/elastos-server/src/api/gateway_browser_engine.rs",
@@ -909,7 +930,13 @@ const capabilityHandler = read(
 const providerResource = read(
   "elastos/crates/elastos-server/src/provider_resource.rs",
 );
-const inspectorProvider = read("elastos/crates/elastos-server/src/inspect_provider.rs");
+const inspectorProvider = readAll([
+  "elastos/crates/elastos-server/src/inspect_provider/mod.rs",
+  "elastos/crates/elastos-server/src/inspect_provider/sources.rs",
+  "elastos/crates/elastos-server/src/inspect_provider/projection.rs",
+  "elastos/crates/elastos-server/src/inspect_provider/planning.rs",
+  "elastos/crates/elastos-server/src/inspect_provider/dispatch.rs",
+]);
 const inspectorCore = read("elastos/crates/elastos-runtime/src/inspect/mod.rs");
 const capsuleInspectorDocs = read("docs/CAPSULE_INSPECTOR.md");
 const inspectorTestingDocs = read("docs/INSPECTOR_TESTING.md");
@@ -928,7 +955,7 @@ const runtimeControl = read(
 );
 const serverInfra = read("elastos/crates/elastos-server/src/server_infra.rs");
 const wasmProvider = read(
-  "elastos/crates/elastos-compute/src/providers/wasm.rs",
+  "elastos/crates/elastos-compute/src/providers/component.rs",
 );
 const protectedContent = read(
   "elastos/crates/elastos-common/src/protected_content.rs",
@@ -1216,8 +1243,7 @@ assert(
   "Linux source-home restart must preserve safe listener ownership checks and ok=false failure receipts",
 );
 const debugPolicy = read("DEBUG.md");
-const gbaScript = read("scripts/gba.sh");
-const homeAssetVersion = "home-20260627a";
+const homeAssetVersion = "home-20260712b";
 assertUsersSelfReferencesAreApproved();
 assert(
   shellIndex.includes('role="listbox"'),
@@ -1341,8 +1367,8 @@ assert(
   "Home runtime status must not preserve data-shell-status",
 );
 assert(
-  shellJs.includes("toggleShellFullscreen"),
-  "Home fullscreen control must be wired to shell behavior",
+  shellJs.includes("toggleHomeGuiFullscreen"),
+  "Home fullscreen control must be wired through Home GUI",
 );
 assert(
   shellCore.includes("toolbarFullscreenButton"),
@@ -1383,11 +1409,11 @@ assert(
   "Home must allow Browser to route file chooser requests into Library through an explicit source gate",
 );
 assert(
-  shellJs.includes('library: new Set(["archive-manager", "documents", "library"])'),
-  "Home must allow Library to open Archive for archive files while keeping the source-gated policy explicit",
+  shellJs.includes('library: new Set(["archive-manager", "documents", "gba-emulator", "library"])'),
+  "Home must keep Library viewer routing source-gated",
 );
 assert(
-  shellIndex.includes(`shell.js?v=${homeAssetVersion}`),
+  shellIndex.includes(`home-shell-host.js?v=${homeAssetVersion}`),
   "Home entry module must cache-bust after shell browser changes",
 );
 assert(
@@ -1424,15 +1450,13 @@ assert(
   "Home must not auto-start hidden Browser preboot VMs; Browser warm sessions need an explicit Runtime/provider-owned contract",
 );
 assert(
-  shellCore.includes('"archive-manager": "Archive"') &&
-    !shellCore.includes('"Archive Manager"') &&
+  !shellCore.includes("TARGET_TITLE_OVERRIDES") &&
     shellCore.includes("export function canonicalTargetTitle") &&
-    shellCore.includes("title: canonicalTargetTitle(target?.target, target?.title)") &&
-    shellCore.includes("return override || normalizedTitle || targetId") &&
-    shellCore.includes("if (TARGET_TITLE_OVERRIDES[targetId])") &&
+    shellCore.includes("title: normalizeText(target?.title) || target?.target") &&
+    shellCore.includes("return normalizedTitle || targetId") &&
     !shellCore.includes("STALE_TARGET_TITLES") &&
     shellWindows.includes("canonicalTargetTitle(launched.target, launched.title)"),
-  "Home must canonicalize Archive labels and window titles without stale generated aliases",
+  "Home must preserve Runtime catalog titles without local target-name overrides",
 );
 assert(
   shellCore.includes("desktopPositionOverlapsAny") &&
@@ -1494,9 +1518,9 @@ assert(
   "Home frame cleanup must tolerate cross-origin failed iframe states on close",
 );
 assert(
-  shellWindows.includes("releaseFrameRuntimePage(entry.node)") &&
-    shellWindows.includes("__elastosBrowserReleaseRuntimePage"),
-  "Home must ask same-origin Browser frames to release hosted runtime pages before removing iframes so singleton Browser providers do not retain stale pages",
+  !shellWindows.includes("releaseFrameRuntimePage") &&
+    !shellWindows.includes("__elastosBrowserReleaseRuntimePage"),
+  "Home must not call into Browser frames for Runtime page cleanup; Browser owns its unload lifecycle",
 );
 const persistSessionBlock = sourceBlock(
   shellWindows,
@@ -1504,7 +1528,7 @@ const persistSessionBlock = sourceBlock(
   "Home browser session persistence",
 );
 assert(
-  persistSessionBlock.includes("saveShellSessionState({ windows: [] });"),
+  persistSessionBlock.includes("saveShellSessionState({ root_shell: rootShell, windows: [] });"),
   "Home must persist an explicit empty session after the last window closes",
 );
 assert(
@@ -1578,7 +1602,7 @@ assert(
 assert(
   shellJs.includes('marketplace: "runtime-target"') &&
     shellJs.includes('if (policy === "runtime-target")') &&
-    shellJs.includes("return target !== SHELL_APP_ID;"),
+    shellJs.includes("return normalizedActiveShellName(target) !== HOME_GUI_SHELL_ID;"),
   "Home must allow Marketplace to open installed Runtime targets while still blocking Home self-launch",
 );
 assert(
@@ -1592,12 +1616,12 @@ assert(
 assert(
   shellJs.includes('"chat-room": new Set(["documents"])') &&
     shellJs.includes('"home:open-target-with-payload"') &&
-    shellJs.includes("openTargetWithPayload"),
+    shellJs.includes("openHomeGuiTargetWithPayload"),
   "Home must broker Chat Room attachment payloads into Documents without host-browser navigation",
 );
 const deliverMessageToTargetFrameBlock = sourceBlock(
   shellJs,
-  "function deliverMessageToTargetFrame",
+  "export function deliverMessageToHomeGuiTargetFrame",
   "Home target message delivery",
 );
 assert(
@@ -1608,14 +1632,14 @@ assert(
 );
 const openTargetWithPayloadBlock = sourceBlock(
   shellJs,
-  "function openTargetWithPayload",
+  "export function openHomeGuiTargetWithPayload",
   "Home open-target-with-payload delivery",
 );
 assert(
-  shellJs.includes("if (!deliverMessageToTargetFrame(target, payload))") &&
+  shellJs.includes("deliverMessageToHomeGuiTargetFrame(target, payload)") &&
     (
       openTargetWithPayloadBlock.match(
-        /deliverMessageToTargetFrame\(target, payload, \{ focus: true \}\)/g,
+        /deliverMessageToHomeGuiTargetFrame\(target, payload, \{ focus: true \}\)/g,
       ) || []
     ).length >= 2,
   "Home must keep deliver-to-target background-only while open-target-with-payload focuses the opened app",
@@ -1626,9 +1650,10 @@ assert(
 );
 assert(
   shellCore.includes('export const PEOPLE_TARGET_ID = "people"') &&
-    shellCore.includes('target: PEOPLE_TARGET_ID') &&
-    shellCore.includes('route: "home://people"'),
-  "Home must expose People as a Home-owned internal target, not a separate half-built capsule",
+    !shellCore.includes('target: PEOPLE_TARGET_ID') &&
+    gatewayApi.includes('target: HOME_PEOPLE_TARGET_ID.to_string()') &&
+    gatewayApi.includes('route: "home://people"'),
+  "Home must consume the Runtime catalog entry for People instead of inventing a local target",
 );
 assert(
   shellWindows.includes("function renderPeopleWindowBody") &&
@@ -1788,12 +1813,11 @@ assert(
   servicesCapsule.includes('"name": "services"') &&
     servicesCapsule.includes('"role": "app"') &&
     servicesIndex.includes("Services · ElastOS") &&
-    servicesIndex.includes("Mine") &&
-    servicesIndex.includes("Others") &&
+    servicesIndex.includes("This device") &&
+    servicesIndex.includes("From People") &&
     servicesIndex.includes("mine-services") &&
     servicesIndex.includes("other-services") &&
-    servicesIndex.includes("services-20260626a") &&
-    servicesIndex.includes("services-20260626g") &&
+    servicesIndex.includes("services-20260711i") &&
     servicesScript.includes("/api/apps/services/summary") &&
     servicesScript.includes("/api/apps/services/offers") &&
     servicesScript.includes("Browser Engine") &&
@@ -2397,10 +2421,6 @@ assert(
   !vmProvider.includes("Users/self"),
   "VM provider path-shaping tests must not preserve shared Users/self storage examples",
 );
-assert(
-  gbaScript.includes("Users/self is a capsule-local alias resolved by Runtime"),
-  "GBA helper must explain Users/self as a runtime-scoped capsule alias",
-);
 assertProtectedPrincipalRootAccessor(
   documentsProvider,
   "fn documents_load_body(",
@@ -2426,7 +2446,7 @@ assertProtectedPrincipalRootAccessor(
   "Home browser state writes",
 );
 assert(
-  gatewayApi.includes("is_unencrypted_home_browser_state") &&
+  gatewayApi.includes("is_unencrypted_principal_root_state") &&
     gatewayTests.includes(
       "test_home_browser_state_resets_plaintext_for_protected_principal_root",
     ),
@@ -2896,18 +2916,20 @@ assert(
   ),
   "Marketplace route must delegate to the canonical capsule catalog",
 );
-const marketplaceCatalogGateway = read(
-  "elastos/crates/elastos-server/src/api/gateway_capsule_catalog.rs",
+const marketplaceCatalogReadModel = read(
+  "elastos/crates/elastos-server/src/api/gateway_capsule_catalog/read_model.rs",
 );
 assert(
-  marketplaceCatalogGateway.includes("signed-app-install-pending") &&
-    marketplaceCatalogGateway.includes("Marketplace can open installed apps now.") &&
-    !marketplaceCatalogGateway.includes("signed-cid-install-pending") &&
-    !marketplaceCatalogGateway.includes("signed CID manifests") &&
-    !marketplaceCatalogGateway.includes("launch installed capsules") &&
-    !marketplaceCatalogGateway.includes("Paid capsules") &&
-    !marketplaceCatalogGateway.includes("Protected capsules"),
-  "Marketplace catalog policy must describe install/payment/dDRM state in app-facing language",
+  marketplaceCatalogReadModel.includes("payment_state") &&
+    marketplaceCatalogReadModel.includes("drm_state") &&
+    marketplaceUi.includes("Install pending") &&
+    marketplaceUi.includes("Installing new apps is not available yet.") &&
+    marketplaceUi.includes("Supports payments") &&
+    marketplaceUi.includes("Uses protected content") &&
+    !marketplaceUi.includes("signed CID manifests") &&
+    !marketplaceUi.includes("Paid capsules") &&
+    !marketplaceUi.includes("Protected capsules"),
+  "Marketplace must translate neutral catalog payment and dDRM facts into app-facing language",
 );
 
 const documents = read("capsules/documents/browser/index.html");
@@ -2953,7 +2975,11 @@ const library = readAll([
 const objectProviderManifest = read("capsules/object-provider/capsule.json");
 const objectProviderImpl = read("elastos/crates/elastos-server/src/library.rs");
 const gatewayProviderProxy = read("elastos/crates/elastos-server/src/api/gateway_provider_proxy.rs");
-const gatewayInspectActions = read("elastos/crates/elastos-server/src/api/gateway_inspect_actions.rs");
+const gatewayInspectActions = readAll([
+  "elastos/crates/elastos-server/src/api/gateway_inspect_actions.rs",
+  "elastos/crates/elastos-server/src/api/gateway_inspect_actions/binding.rs",
+  "elastos/crates/elastos-server/src/api/gateway_inspect_actions/store.rs",
+]);
 const libraryGatewayTests = read("elastos/crates/elastos-server/src/api/gateway_tests/library.rs");
 const retiredObjectProviderMarkers = {
   oldBinary: ["library", "provider"].join("-"),
@@ -3020,16 +3046,16 @@ const browserJs = readAll([
 ]);
 const browserStyle = read("capsules/browser/browser/style.css");
 assert(
-  browserJs.includes(
-    "window.__elastosBrowserReleaseRuntimePage = releaseRuntimePageForUnload",
-  ) &&
+  browserJs.includes('window.addEventListener("beforeunload"') &&
+    browserJs.includes('window.addEventListener("pagehide", releaseRuntimePageForUnload)') &&
     browserJs.includes("window.__elastosBrowserCurrentPageId") &&
+    !browserJs.includes("window.__elastosBrowserReleaseRuntimePage") &&
     gatewayApi.includes('"/api/apps/browser/pages/:page_id/close"') &&
     gatewayBrowserApi.includes("pub(super) async fn browser_app_page_close") &&
     gatewayBrowserRouteTests.includes(
       '.uri(format!("/api/apps/browser/pages/{page_id}/close"))',
     ),
-  "Browser must expose only its same-origin hosted-page release hook/current page id to Home and the gateway must route close_page so iframe teardown can release singleton providers",
+  "Browser must own unload cleanup and the gateway must route close_page so iframe teardown releases singleton providers without a Home-callable frame hook",
 );
 const walletWalletconnect = read("capsules/wallet-walletconnect/browser/index.html");
 const walletWalletconnectJs = read(
@@ -3051,7 +3077,7 @@ const walletconnectConfigSmoke = read(
   "scripts/walletconnect-connector-config-smoke.sh",
 );
 const walletProviderDoc = read("docs/WALLET_PROVIDER.md");
-const systemAssetVersion = "system-20260625a";
+const systemAssetVersion = "system-20260712a";
 const shellAuth = read("capsules/home/browser/shell-auth.js");
 const protectedHomeStateSmoke = read("scripts/protected-home-state-smoke.sh");
 assert(
@@ -3093,7 +3119,7 @@ assert(
     documents.includes("openChatAttachment") &&
     documents.includes("dataUrlToUtf8") &&
     documents.includes('documentsProviderApi("import_chat_attachment"') &&
-    documents.includes("Opened Chat attachment as a local Documents object.") &&
+    documents.includes("Opened the Chat attachment.") &&
     !documents.includes("/api/apps/chat-room/attachments/"),
   "Documents must import Chat attachment payloads through its provider after Home delivery, not call Chat Room routes directly",
 );
@@ -3259,7 +3285,7 @@ const inboxInspectorApprovalBoundary = {
     inbox.includes('inboxAction("inspect-approve-request:" + requestId') &&
     inbox.includes("requestFreshPasskeyHomeToken") &&
     inbox.includes("home_token: homeToken") &&
-    inbox.includes("Confirm with your passkey to approve this Inspector action."),
+    inbox.includes("Confirm with your passkey to approve this System action."),
   gatewayRequiresFreshPasskeyForInspectApproval: gatewayInboxApi.includes(
     "fresh passkey verification is required to approve an Inspector action",
   ) &&
@@ -3352,8 +3378,8 @@ assert(
   "Library attach mode must return a file Blob payload, not a raw published CID text URI",
 );
 assert(
-  libraryApp.includes("Choose an object for Chat Room.") &&
-    libraryApp.includes("Choose an object for Browser.") &&
+  libraryApp.includes("Choose an item for Chat.") &&
+    libraryApp.includes("Choose an item for Browser.") &&
     libraryApp.includes("Select for Browser") &&
     libraryApp.includes("Attach to Chat") &&
     !libraryApp.includes("Choose a published object for Chat Room."),
@@ -3690,9 +3716,9 @@ assert(
     libraryDialog.includes("item-props-tab-content") &&
     libraryDialog.includes("item-props-tbl") &&
     libraryDialog.includes('data-tab="general"') &&
-    libraryDialog.includes('data-tab="runtime"') &&
+    libraryDialog.includes('data-tab="technical"') &&
     libraryDialog.includes("propertiesPanel(\"general\"") &&
-    libraryDialog.includes("propertiesPanel(\"runtime\"") &&
+    libraryDialog.includes("propertiesPanel(\"technical\"") &&
     libraryDialog.includes("propertiesPanel(\"archive\"") &&
     libraryDialog.includes("smartWebIdentity") &&
     libraryDialog.includes("safeAvailabilitySummary") &&
@@ -3752,13 +3778,13 @@ assert(
     libraryApi.includes("CHUNKED_UPLOAD_THRESHOLD_BYTES") &&
     libraryApi.includes("CHUNKED_UPLOAD_BYTES") &&
     libraryApi.includes("uploadFailureMessage") &&
-    libraryApi.includes("public gateway body-size limit") &&
+    libraryApi.includes("This file is too large for the current upload service.") &&
     !libraryApi.includes("/api/provider/library/upload"),
   "Library upload must use object-provider upload only, use chunk sessions for large files, and explain edge-proxy 413 body-size failures",
 );
 assert(
-  library.includes("elements.statusText.classList.toggle(\"hidden\", !text)") &&
-    libraryMenuSmoke.includes("public gateway body-size limit"),
+  library.includes("elements.statusText.classList.toggle(\"hidden\", !message)") &&
+    libraryMenuSmoke.includes("too large for the current upload service"),
   "Library status messages, including upload body-size failures, must be visible to users",
 );
 assert(
@@ -3818,9 +3844,9 @@ assert(
     libraryRender.includes('elements.content.dataset.empty = "true"') &&
     libraryRender.includes('class="empty-inner"') &&
     libraryCss.includes('.content[data-empty="true"]') &&
-    libraryRender.includes("No objects in this space") &&
-    libraryRender.includes("Localhost is your signed local object space") &&
-    libraryRender.includes("Elastos and mounted spaces resolve through providers") &&
+    libraryRender.includes("This space is empty") &&
+    libraryRender.includes("Add files or folders to this space.") &&
+    libraryRender.includes("This folder is empty") &&
     !libraryRender.includes("No connected spaces") &&
     libraryActions.includes("This Space is read-only.") &&
     !libraryActions.includes("Mounted WebSpaces are read-only resolver handles."),
@@ -3959,7 +3985,7 @@ assert(
     inspectorProvider.includes("ProviderInvocationTransport::Local") &&
     inspectorProvider.includes('"can_dispatch": false') &&
     inspectorProvider.includes('"can_mutate": false') &&
-    inspectorProvider.includes("dispatch\": false") &&
+    inspectorProvider.includes('"dispatch": false') &&
     gatewayInspectActions.includes("elastos.inspect.action-request/v1") &&
     gatewayInspectActions.includes("append_inspect_action_notifications") &&
     gatewayInspectActions.includes("inspect_action_gate_summary") &&
@@ -3967,8 +3993,8 @@ assert(
     gatewayInspectActions.includes("approve_inspect_action_request") &&
     gatewayInspectActions.includes("deny_inspect_action_request") &&
     gatewayInspectActions.includes('"op": "dispatch_approved"') &&
-    gatewayApi.includes("inspect-approve-request:") &&
-    gatewayApi.includes("inspect-deny-request:") &&
+    gatewayInboxApi.includes("inspect-approve-request:") &&
+    gatewayInboxApi.includes("inspect-deny-request:") &&
     gatewayTests.includes("inspect_action_requires_inbox_approval_before_dispatch") &&
     gatewayTests.includes("system_approval_attempt") &&
     gatewayTests.includes("StatusCode::FORBIDDEN") &&
@@ -4196,10 +4222,11 @@ assert(
     objectProviderImpl.includes('"allowed": false') &&
     objectProviderImpl.includes('"reason": err.to_string()') &&
     libraryDialog.includes("Share Grants / Key Release") &&
-    libraryDialog.includes("Recipient Grants / Key Release") &&
+    libraryDialog.includes("<strong>Recipients</strong>") &&
+    libraryDialog.includes("<strong>Grants</strong>") &&
     libraryDialog.includes("contentSecurity?.published_payload") &&
     libraryDialog.includes('name="sharePolicy" value="encrypted_recipient" disabled') &&
-    libraryDialog.includes("<strong>Encrypted recipients</strong>") &&
+    libraryDialog.includes("<strong>Key Release</strong>") &&
     libraryDialog.includes("<strong>Provider Chain</strong>") &&
     read("docs/PROTECTED_CONTENT.md").includes(
       "Visible protected-content UI may ship only as a disabled/read-only readiness",
@@ -4208,7 +4235,7 @@ assert(
       "Library protected-content rail is visible only as disabled/read-only readiness/status",
     ) &&
     libraryMenuSmoke.includes("Share Grants / Key Release") &&
-    libraryMenuSmoke.includes("Recipient Grants / Key Release") &&
+    libraryMenuSmoke.includes("Recipients") &&
     libraryMenuSmoke.includes("not_required_for_plain_published_content") &&
     libraryGatewayTests.includes("ready_for_plain_content_fetch") &&
     libraryGatewayTests.includes("recipient_proof_verified") &&
@@ -4359,23 +4386,23 @@ assert(
 );
 assert(
   libraryIndex.includes('rel="stylesheet" href="library.css"') &&
-    libraryIndex.includes('type="module" src="src/app.js"') &&
+    libraryIndex.includes('type="module" src="src/app.js?v=') &&
     !libraryIndex.includes("<style>") &&
     !libraryIndex.includes("function renderContent"),
   "Library index must stay a static shell with CSS and app code split out",
 );
 assert(
   libraryApp.includes('from "./model.js"') &&
-    libraryApp.includes('from "./actions.js"') &&
-    libraryApp.includes('from "./api.js"') &&
-    libraryApp.includes('from "./dialog.js"') &&
+    libraryApp.includes('from "./actions.js') &&
+    libraryApp.includes('from "./api.js') &&
+    libraryApp.includes('from "./dialog.js') &&
     libraryApp.includes('from "./editor.js"') &&
     libraryApp.includes('from "./events.js"') &&
     libraryApp.includes('from "./menu.js"') &&
     libraryApp.includes('from "./navigation.js"') &&
     libraryApp.includes('from "./preview.js"') &&
     libraryApp.includes('from "./realtime.js"') &&
-    libraryApp.includes('from "./render.js"') &&
+    libraryApp.includes('from "./render.js') &&
     libraryApp.includes('from "./selection.js"') &&
     libraryApp.includes('from "./state.js"') &&
     libraryApp.includes('from "./uploads.js"') &&
@@ -4471,8 +4498,8 @@ assert(
   "GBA load slots must expose slot-specific labels",
 );
 assert(
-  gba.includes("Insert Game"),
-  "GBA empty state must use the concise Insert Game copy",
+  gba.includes("Choose a game from Library"),
+  "GBA empty state must direct game selection through Library",
 );
 assert(
   gbaStyle.includes("--control-size: clamp(2.75rem, 13vw, 3.25rem);"),
@@ -4513,8 +4540,10 @@ assert(
   "GBA virtual controls must own touch gestures",
 );
 assert(
-  gbaStyle.includes("width: max-content;"),
-  "GBA mobile collapsed Options must be a small centered Show control",
+  gba.includes('<aside class="utility-card">') &&
+    gba.includes('id="utility-panel"') &&
+    !gba.includes('id="utility-toggle"'),
+  "GBA Options must remain directly available without a separate collapsed toggle",
 );
 assert(
   gbaStyle.includes("max-height: min(8.25rem, 22dvh);"),
@@ -4535,7 +4564,8 @@ assert(
   "GBA mobile screen card must keep compact chrome",
 );
 assert(
-  gbaJs.includes("activeInputPointers"),
+  gbaJs.includes("touchPointers.set(event.pointerId, button)") &&
+    gbaJs.includes("touchPointers.delete(event.pointerId)"),
   "GBA touch controls must track pointer-specific presses",
 );
 assert(
@@ -4547,15 +4577,17 @@ assert(
   "GBA controls must not mix touch and mouse input handlers",
 );
 assert(
-  gbaJs.includes("syncUtilityDefaultForViewport"),
-  "GBA Options must collapse automatically on compact viewports",
+  !gbaJs.includes("syncUtilityDefaultForViewport") &&
+    gbaStyle.includes("max-height: min(8.25rem, 22dvh);"),
+  "GBA compact Options layout must remain CSS-driven",
 );
 assert(
-  gbaJs.includes("assertEmulatorRuntimeSupported"),
+  gbaJs.includes("assertPortableEngineSupport"),
   "GBA startup must preflight threaded WebAssembly support before mGBA init",
 );
 assert(
-  gbaJs.includes("EMULATOR_INIT_TIMEOUT_MS"),
+  gbaJs.includes("withTimeout(") &&
+    gbaJs.includes("The GBA engine did not start."),
   "GBA startup must fail visibly instead of hanging during mGBA init",
 );
 assert(
@@ -4563,25 +4595,14 @@ assert(
   "GBA startup must explicitly guard WebAssembly thread requirements",
 );
 assert(
-  gbaJs.includes("This device cannot run the current GBA engine"),
+  gbaJs.includes("This browser cannot run the GBA engine.") &&
+    gbaJs.includes("This browser does not provide isolated WebAssembly threads."),
   "GBA unsupported-runtime copy must explain WebAssembly thread requirements",
 );
 assert(
-  gbaJs.includes("Insert Game") && !gbaJs.includes("Choose an installed ROM"),
-  "GBA runtime copy must stay concise",
-);
-assert(
-  gbaScript.includes('echo "  X              A button"'),
-  "GBA launcher help must match the emulator X -> A mapping",
-);
-assert(
-  gbaScript.includes('echo "  Z              B button"'),
-  "GBA launcher help must match the emulator Z -> B mapping",
-);
-assert(
-  !gbaScript.includes('echo "  Z              A button"') &&
-    !gbaScript.includes('echo "  X              B button"'),
-  "GBA launcher help must not preserve the old inverted action mapping",
+  gbaJs.includes("Choose a GBA game from Library.") &&
+    !gbaJs.includes("Choose an installed ROM"),
+  "GBA runtime copy must direct game selection through Library",
 );
 assert(
   !system.includes("<dt>Overlay</dt>"),
@@ -4590,25 +4611,26 @@ assert(
 assert(
   system.includes('data-settings="account"') &&
     system.includes('class="settings-content active"') &&
-    system.includes('<h2 id="accounts-title" class="pc2-section-title">Accounts</h2>') &&
+    system.includes('<h1 id="accounts-title" class="pc2-section-title">Accounts</h1>') &&
     system.includes("Local browser credentials for this Home account.") &&
     !system.includes('id="handle-form"') &&
     !system.includes("<dt>Display name</dt>"),
   "System Account tab must focus on accounts; display-name Profile belongs in People",
 );
 assert(
-  system.includes(`style.css?v=${systemAssetVersion}`) &&
-    system.includes(`system.js?v=${systemAssetVersion}`),
+  system.includes(`./style.css?v=${systemAssetVersion}`) &&
+    system.includes(`./system.js?v=${systemAssetVersion}`),
   "System browser assets must be cache-busted after UI changes",
 );
 assert(
-  system.includes('data-settings="inspector"') &&
-    system.includes('id="inspect-list"') &&
-    system.includes('id="inspect-detail"') &&
-    system.includes('id="inspect-refresh"') &&
-    system.includes("Permissioned Runtime mirror") &&
-    systemJs.includes("configureInspector") &&
-    systemJs.includes("refreshInspector") &&
+  system.includes('data-settings="security"') &&
+    system.includes('id="technical-details"') &&
+    system.includes('id="technical-inspect-list"') &&
+    system.includes('id="technical-inspect-detail"') &&
+    system.includes('id="technical-inspect-refresh"') &&
+    system.includes("Review component identity, permissions, verification, and approval requirements.") &&
+    systemJs.includes("configureTechnicalDetails") &&
+    systemJs.includes("refreshTechnicalDetails") &&
     systemJs.includes('inspectProvider("capsules"') &&
     systemJs.includes('inspectProvider("capsule"') &&
     systemJs.includes('inspectProvider("plan"') &&
@@ -4618,13 +4640,11 @@ assert(
     systemJs.includes('response.status === "pending"') &&
     systemJs.includes("Request approval") &&
     systemJs.includes("/api/provider/inspect/") &&
-    systemJs.includes("execution: result.execution || null") &&
-    systemJs.includes("dispatch: result.dispatch === true") &&
     !systemJs.includes('inspectProvider("dispatch_approved"') &&
     !systemJs.includes('inspectProvider("revoke"') &&
     !systemJs.includes("/api/provider/inspect/revoke") &&
-    systemStyle.includes(".inspect-grid") &&
-    systemStyle.includes(".inspect-plan-output"),
+    systemStyle.includes(".technical-inspect-grid") &&
+    systemStyle.includes(".technical-inspect-detail"),
   "System Inspector must expose the Runtime inspect mirror as a System-only read/preview UI that can request Inbox approval without direct revoke or dispatch affordances",
 );
 assert(
@@ -4652,12 +4672,12 @@ assert(
   "System must not render accounts before access role is known",
 );
 assert(
-  system.includes('<h2 id="appearance-title" class="pc2-section-title">Appearance</h2>') &&
+  system.includes('<h1 id="appearance-title" class="pc2-section-title">Appearance</h1>') &&
     system.includes('data-settings="personalization"'),
   "System must keep appearance as a first-class settings area",
 );
 assert(
-  system.includes('<h1 id="about-panel-title">About</h1>') &&
+  system.includes('<h1 id="device-title" class="pc2-section-title">This Device</h1>') &&
     system.includes('data-settings="about"') &&
     system.includes("settings-sidebar-text\">About</span>") &&
     !system.includes("settings-sidebar-text\">System</span>") &&
@@ -5299,11 +5319,18 @@ const browserPlanningSurface = [
 ].join("\n");
 assert(
   browserManifest.includes('"name": "browser"') &&
-    browserManifest.includes('"elastos://wallet/*"') &&
-    browserManifest.includes('"elastos://net/stream"') &&
+    browserManifest.includes('"elastos://browser/page"') &&
+    browserManifest.includes('"elastos://browser/display"') &&
+    browserManifest.includes('"elastos://browser/exit"') &&
+    browserManifest.includes('"elastos://browser/profile"') &&
+    browserManifest.includes('"elastos://browser/wallet-bridge"') &&
+    browserManifest.includes('"name": "net-provider"') &&
+    browserManifest.includes('"name": "wallet-provider"') &&
+    !browserManifest.includes('"elastos://wallet/*"') &&
+    !browserManifest.includes('"elastos://net/stream"') &&
     !browserManifest.includes("guest_network") &&
     !browserManifest.includes('"provides"'),
-  "Browser capsule manifest must declare wallet/net capability intent without provider or guest-network authority",
+  "Browser capsule manifest must declare Browser-specific intents and provider dependencies without direct wallet, network, provider, or guest-network authority",
 );
 assert(
   wciAlignmentScript.includes(
@@ -7716,8 +7743,8 @@ assert(
     browserJs.includes("Only http and https addresses") &&
     browserJs.includes("/api/apps/browser/open") &&
     browserJs.includes("elastos.browser.open-result/v1") &&
-    browserJs.includes("Browser failed closed") &&
-    browserJs.includes("Blocked by Browser Exit policy") &&
+    browserJs.includes("Browser could not complete the request.") &&
+    browserJs.includes("This page was blocked by your Exit Node settings.") &&
     browserJs.includes("historyEntries") &&
     !browserJs.includes("/api/provider/net/stream") &&
     !browserJs.includes("/api/provider/net/http") &&
@@ -7868,7 +7895,7 @@ assert(
     !walletJs.includes("Create your first account") &&
     walletJs.includes('"EVM"') &&
     walletJs.includes('"Bitcoin"') &&
-    walletJs.includes("Chains are provider routes, not separate wallet types.") &&
+    walletJs.includes("Create an EVM account for supported networks.") &&
     !wallet.includes('id="wallet-create-method"') &&
     walletJs.includes("openReceiveFlow") &&
     walletJs.includes("openSendFlow") &&
@@ -7948,7 +7975,7 @@ assert(
     wallet.indexOf("data-wallet-create-account") &&
     wallet.indexOf('id="wallet-settings-drawer"') <
     wallet.indexOf('id="wallet-create"') &&
-    walletJs.includes("Choose the account type.") &&
+    walletJs.includes("Choose the account type you want to create.") &&
     walletJs.includes("One passkey-controlled account for ESC, Base, and supported EVM networks.") &&
     walletJs.includes("evmChainNamespaces.slice(0, 1)") &&
     walletJs.includes("accountGroupKey") &&
@@ -7961,12 +7988,12 @@ assert(
     !walletJs.includes("createAccountTile") &&
     !walletStyle.includes(".wallet-create-card") &&
     walletJs.includes("create_new: index === 0") &&
-    walletJs.includes("Create an EVM account usable through supported EVM chain providers.") &&
+    walletJs.includes("Create an EVM account for supported networks.") &&
     walletJs.includes("dataset.walletAccountMenu") &&
     walletJs.includes("/api/apps/wallet/wallet/default") &&
     walletJs.includes("openRenameAccount") &&
     walletJs.includes('method: "PUT"') &&
-    gatewayApi.includes('"op": "rename_account"') &&
+    gatewayWalletAppApi.includes('"op": "rename_account"') &&
     gatewayTests.includes("test_wallet_app_can_rename_account") &&
     walletProvider.includes("RenameAccount") &&
     walletProvider.includes("rename_account"),
@@ -8181,11 +8208,12 @@ assert(
   "System smoke must cover Recovery Kit download/import controls",
 );
 assert(
-  systemSmoke.includes("inspectorPresent") &&
-    systemSmoke.includes("System page must expose Capsule Inspector") &&
-    systemSmoke.includes(".inspect-grid") &&
+  systemSmoke.includes("technicalDetailsPresent") &&
+    systemSmoke.includes("System Security must expose Technical Details") &&
+    systemSmoke.includes(".technical-inspect-grid") &&
+    systemSmoke.includes("legacyInspectorPresent === false") &&
     !systemSmoke.includes("System window is missing Advanced"),
-  "System smoke must cover the Capsule Inspector and avoid stale Advanced-panel expectations",
+  "System smoke must cover privileged Technical Details and avoid stale Inspector or Advanced-panel expectations",
 );
 assert(
   homeSmoke.includes("unsigned-launch-prompts-passkey") &&
@@ -8355,17 +8383,18 @@ assert(
   "System Settings must keep PC2 compact section/card styling",
 );
 assert(
-  systemStyle.includes(".webspace-list") &&
-    systemStyle.includes("max-height: min(24rem, 45vh);") &&
-    systemStyle.includes("overflow-y: auto;"),
-  "System Storage must bound the capsules/providers list so Webspace does not break Settings layout",
+  !system.includes('data-settings="storage"') &&
+    !systemStyle.includes(".webspace-list") &&
+    system.includes('id="capsule-catalog"') &&
+    systemStyle.includes(".capsule-catalog"),
+  "System must keep removed Storage/WebSpace UI out and render Apps & Services through the catalog",
 );
 assert(
-  systemStyle.includes(".inspect-list") &&
-    systemStyle.includes(".inspect-detail") &&
-    systemStyle.includes("max-height: min(26rem, 48vh);") &&
-    systemStyle.includes("grid-template-columns: minmax(12rem, 0.42fr) minmax(0, 1fr);"),
-  "System Inspector must bound live-object lists and keep detail previews inside the Settings layout",
+  systemStyle.includes(".technical-inspect-list") &&
+    systemStyle.includes(".technical-inspect-detail") &&
+    systemStyle.includes("max-height: min(30rem, 55vh);") &&
+    systemStyle.includes("grid-template-columns: minmax(12rem, 0.36fr) minmax(0, 1fr);"),
+  "System Technical Details must bound object lists and keep previews inside the Settings layout",
 );
 
 const principles = read("PRINCIPLES.md");

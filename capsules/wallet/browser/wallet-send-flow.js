@@ -190,10 +190,10 @@ export function createWalletSendFlow({
       return "";
     }
     if (!account.chain_namespace || !account.chain_namespace.startsWith("eip155:")) {
-      return "Wallet send currently supports passkey-managed EVM accounts through supported chain providers.";
+      return "Sending currently supports built-in EVM accounts protected by your passkey.";
     }
     if (!["eip155:20", "eip155:8453"].includes(account.chain_namespace)) {
-      return "This EVM network is not enabled by the chain-provider yet.";
+      return "This EVM network is not available yet.";
     }
     if (!isPasskeyManagedAccount(account)) {
       return "Open the approval method for this account to send.";
@@ -202,10 +202,10 @@ export function createWalletSendFlow({
       return "This built-in account is missing its local signing key. Import this account's Wallet recovery key or create a new account.";
     }
     if (account.signing_status === "managed_key_unavailable") {
-      return "This built-in account key cannot be decrypted on this Runtime. Import this account's Wallet recovery key or create a new account.";
+      return "This account cannot be unlocked on this device. Import its Wallet recovery key or create a new account.";
     }
     if (!managedAccountCanSign(account)) {
-      return "This built-in account cannot sign from this Runtime yet.";
+      return "This built-in account cannot sign on this device yet.";
     }
     return "";
   }
@@ -227,7 +227,7 @@ export function createWalletSendFlow({
   }
 
   function sendAccountStatusMessage(account) {
-    return sendUnavailableReason(account) || "Ready to sign from this Runtime.";
+    return sendUnavailableReason(account) || "Ready to sign on this device.";
   }
 
   async function sendTransactionFromReview(account, amount, to, button) {

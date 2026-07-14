@@ -20,11 +20,11 @@ import {
   shortAddress,
   validateAddress,
 } from "./wallet-format.js?v=wallet-20260523a";
-import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260523a";
-import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260523a";
+import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260711c";
+import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260711b";
 import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260523a";
 import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260523a";
-import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260523a";
+import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260711b";
 import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260523a";
 import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260522a";
 import {
@@ -34,7 +34,7 @@ import {
   emptyHero,
   setBusy,
   textNode,
-} from "./wallet-render.js?v=wallet-20260523a";
+} from "./wallet-render.js?v=wallet-20260711c";
 
 const statusNode = document.querySelector("#wallet-status");
 const accountsNode = document.querySelector("#wallet-accounts");

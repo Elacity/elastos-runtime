@@ -20,12 +20,12 @@ import {
   shellInteractionActive,
   shouldIgnoreDesktopKeydown,
   targetById,
-} from "./shell-core.js?v=home-20260705a";
+} from "./shell-core.js?v=home-20260712b";
 import {
   clearIdentitySurface,
   syncIdentity,
   updateClock,
-} from "./shell-chrome.js?v=home-20260705a";
+} from "./shell-chrome.js?v=home-20260712b";
 import {
   clearDesktopSelection,
   continueTargetDrag,
@@ -46,7 +46,7 @@ import {
   renderTaskbar,
   toggleLauncher,
   updateTaskbarState,
-} from "./shell-surface.js?v=home-20260705a";
+} from "./shell-surface.js?v=home-20260712b";
 import {
   closeWindow,
   cleanupBeforeUnload,
@@ -57,7 +57,7 @@ import {
   refreshHomeInternalWindows,
   restoreShellSession,
   showDesktopHome,
-} from "./shell-windows.js?v=home-20260705a";
+} from "./shell-windows.js?v=home-20260712b";
 
 await ensureHomeGuiDom();
 

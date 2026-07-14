@@ -204,7 +204,7 @@ function requestServiceActionConfirmation(button) {
   const offerId = readText(button.dataset.serviceOfferId);
   const section = readText(button.dataset.serviceSection);
   if (!offerId || !section) {
-    showStatus("Service selection is missing an offer id.", "error");
+    showStatus("This service could not be selected. Refresh and try again.", "error");
     return;
   }
   pendingServiceAction = {
@@ -237,7 +237,7 @@ async function setServiceOfferSelection(button) {
   const section = readText(button?.dataset?.serviceSection || button?.section);
   const selected = button?.dataset?.serviceSelected === "true" || button?.selected === true;
   if (!offerId || !section) {
-    throw new Error("Service selection is missing an offer id.");
+    throw new Error("This service could not be selected. Refresh and try again.");
   }
   setBusy(true);
   if (button instanceof HTMLButtonElement) {
@@ -306,13 +306,13 @@ function serviceCopy(offer, source, selected) {
     if (offer?.grant_required === true) {
       const requestStatus = serviceRequestStatus(offer);
       if (selected && requestStatus === "approved") {
-        return `${name} was approved. Browser still needs the provider grant installed before it can use this Browser Engine.`;
+        return `${name} was approved. Browser can use it when access becomes active.`;
       }
       if (selected && requestStatus === "denied") {
         return `${name} denied the request. Remove it and ask again if needed.`;
       }
       return selected
-        ? `${name} request is waiting for approval. Browser can use it after the provider grant is active.`
+        ? `${name} is waiting for approval.`
         : `Ask to use ${name}. You need to be connected in People first.`;
     }
     return selected
@@ -326,21 +326,21 @@ function serviceCopy(offer, source, selected) {
       : "Let People you trust use this device's Browser Exit service. Access stays under your approval.";
   }
   if (readText(offer?.source) === CONFIGURED_REMOTE_EXIT_SOURCE) {
-    return `${name} is installed as a Browser Exit option on this device. Browser can use it without exposing the private route ticket to apps.`;
+    return `${name} is available as a Browser Exit option on this device.`;
   }
   if (readText(offer?.status) === "active" && offer?.enabled === true) {
-    return `${name} is active. Browser can use it without exposing the private route ticket to apps.`;
+    return `${name} is active and ready for Browser.`;
   }
   if (offer?.grant_required === true) {
     const requestStatus = serviceRequestStatus(offer);
     if (selected && requestStatus === "approved") {
-      return `${name} was approved. Browser still needs the Browser Exit grant installed before it can use this service.`;
+      return `${name} was approved. Browser can use it when access becomes active.`;
     }
     if (selected && requestStatus === "denied") {
       return `${name} denied the request. Remove it and ask again if needed.`;
     }
     return selected
-      ? `${name} request is waiting for approval. Browser can use it after the Browser Exit grant is active.`
+      ? `${name} is waiting for approval.`
       : `Ask to use ${name}. You need to be connected in People first.`;
   }
   return selected
@@ -457,9 +457,19 @@ function showStatus(text, tone = "muted") {
   if (!statusNode) {
     return;
   }
-  statusNode.textContent = text;
+  statusNode.textContent = tone === "error"
+    ? publicServicesError(text, "Services could not be updated.")
+    : text;
   statusNode.dataset.tone = tone;
   statusNode.hidden = !text;
+}
+
+function publicServicesError(value, fallback) {
+  const message = String(value || "").trim();
+  if (!message || /\b(schema|projection|provider|adapter|capability|affordance|runtime-owned|launch token|hostcall|request failed|failed to fetch|unauthorized|forbidden|[45]\d\d)\b|engine_[a-z_]+/i.test(message)) {
+    return fallback;
+  }
+  return message;
 }
 
 function readText(value) {
