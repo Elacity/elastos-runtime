@@ -45,7 +45,7 @@ import {
   desktopObjectEntryId,
   desktopObjectByEntryId,
   desktopEntryExists,
-} from "./shell-core.js?v=home-20260627a";
+} from "./shell-core.js?v=home-20260705a";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -59,7 +59,7 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260627a";
+} from "./shell-windows.js?v=home-20260705a";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -617,11 +617,14 @@ function attachDesktopObjectInteractions(node, entryId) {
 function openDesktopObject(entryId) {
   const object = desktopObjectByEntryId(shellState.currentSummary, entryId);
   if (!object) {
-    return;
+    return false;
+  }
+  if (!canOpenDesktopObject(object)) {
+    return false;
   }
   if (object.kind === "directory") {
     openTarget("library", { query: { uri: object.uri } });
-    return;
+    return true;
   }
   const viewer = desktopObjectViewer(object);
   openTarget(viewer, {
@@ -632,6 +635,7 @@ function openDesktopObject(entryId) {
       mime: object.mime || "application/octet-stream",
     },
   });
+  return true;
 }
 
 export function openSelectedDesktopEntry() {
@@ -640,8 +644,7 @@ export function openSelectedDesktopEntry() {
     return false;
   }
   if (entryId.startsWith("object:")) {
-    openDesktopObject(entryId);
-    return true;
+    return openDesktopObject(entryId);
   }
   openTarget(entryId);
   return true;
@@ -663,12 +666,23 @@ function parentUri(uri) {
 
 function hasObjectCapability(object, capability) {
   const capabilities = object && object.capabilities;
-  return !Array.isArray(capabilities) || capabilities.includes(capability);
+  return Array.isArray(capabilities) && capabilities.includes(capability);
+}
+
+function canOpenDesktopObject(object) {
+  if (!hasObjectCapability(object, "open")) {
+    return false;
+  }
+  return object.kind !== "directory" || hasObjectCapability(object, "list");
+}
+
+function canRevealDesktopObject(object) {
+  return canOpenDesktopObject(object) || hasObjectCapability(object, "properties");
 }
 
 function revealDesktopObject(entryId) {
   const object = desktopObjectByEntryId(shellState.currentSummary, entryId);
-  if (!object) {
+  if (!object || !canRevealDesktopObject(object)) {
     return;
   }
   const uri = object.kind === "directory" ? object.uri : parentUri(object.uri);
@@ -1151,32 +1165,44 @@ function desktopObjectContextMenuItems(target) {
     return [];
   }
   if (isTrashDesktopObject(object)) {
-    const items = [
-      { action: "open-desktop-object", label: "Open Trash" },
-      { action: "open-desktop-object-new-window", label: "Open in New Window" },
-    ];
-    if (object.metadata?.empty === false) {
+    const items = [];
+    if (canOpenDesktopObject(object)) {
+      items.push({ action: "open-desktop-object", label: "Open Trash" });
+      items.push({ action: "open-desktop-object-new-window", label: "Open in New Window" });
+    }
+    if (object.metadata?.empty === false && hasObjectCapability(object, "empty_trash")) {
       items.push({ action: "empty-trash", label: "Empty Trash" });
     }
-    items.push({ kind: "divider" });
-    items.push({ action: "properties-desktop-object", label: "Properties" });
+    if (items.length > 0 && hasObjectCapability(object, "properties")) {
+      items.push({ kind: "divider" });
+    }
+    if (hasObjectCapability(object, "properties")) {
+      items.push({ action: "properties-desktop-object", label: "Properties" });
+    }
     return items;
   }
-  const items = [
-    {
+  const items = [];
+  if (canOpenDesktopObject(object)) {
+    items.push({
       action: "open-desktop-object",
       label: object.kind === "directory" ? `Open ${object.name}` : "Open",
-    },
-  ];
-  if (object.kind === "directory") {
+    });
+  }
+  if (object.kind === "directory" && canOpenDesktopObject(object)) {
     items.push({ action: "open-desktop-object-new-window", label: "Open in New Window" });
   }
-  items.push({ action: "reveal-desktop-object", label: "Show in Library" });
-  items.push({ kind: "divider" });
+  if (canRevealDesktopObject(object)) {
+    items.push({ action: "reveal-desktop-object", label: "Show in Library" });
+  }
+  if (items.length > 0 && (hasObjectCapability(object, "download") || hasObjectCapability(object, "properties"))) {
+    items.push({ kind: "divider" });
+  }
   if (hasObjectCapability(object, "download")) {
     items.push({ action: "download-desktop-object", label: "Download" });
   }
-  items.push({ action: "properties-desktop-object", label: "Properties" });
+  if (hasObjectCapability(object, "properties")) {
+    items.push({ action: "properties-desktop-object", label: "Properties" });
+  }
   return items;
 }
 
@@ -1227,7 +1253,8 @@ export function handleContextAction(action) {
         shellState.currentSummary,
         shellState.contextMenuTarget.entryId,
       );
-      if (object) {
+      const requiredCapability = action === "download-desktop-object" ? "download" : "properties";
+      if (object && hasObjectCapability(object, requiredCapability)) {
         libraryActionForObject(
           object,
           action === "download-desktop-object" ? "download" : "properties",
@@ -1240,7 +1267,7 @@ export function handleContextAction(action) {
         shellState.currentSummary,
         shellState.contextMenuTarget.entryId,
       );
-      if (object && isTrashDesktopObject(object)) {
+      if (object && isTrashDesktopObject(object) && hasObjectCapability(object, "empty_trash")) {
         libraryActionForObject(object, "empty-trash");
       }
       return;

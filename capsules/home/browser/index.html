@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-home-shell-host="boot">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -10,128 +10,88 @@
     <meta name="apple-mobile-web-app-title" content="ElastOS Home" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <title>Home · ElastOS</title>
-    <link rel="manifest" href="./manifest.webmanifest?v=home-20260627a" />
+    <script>
+      (() => {
+        try {
+          const hintKey = "elastos.home.active-shell-hint";
+          const hintedShell = window.localStorage.getItem(hintKey);
+          if (hintedShell !== "home-cli") {
+            window.localStorage.removeItem(hintKey);
+            return;
+          }
+          document.documentElement.dataset.homeShellHint = "alternate";
+          document.documentElement.dataset.homeShellBoot = "alternate";
+        } catch (_error) {}
+      })();
+    </script>
+    <link rel="manifest" href="./manifest.webmanifest?v=home-20260705a" />
     <link rel="icon" href="./elastos-home-icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./elastos-home-icon-192.png" />
-    <link rel="stylesheet" href="./style.css?v=home-20260627a" />
+    <link rel="stylesheet" href="./style.css?v=home-20260705a" />
   </head>
-  <body data-home-status="booting">
-    <div class="desktop-shell">
-      <div class="desktop-backdrop" data-overlay="false" aria-hidden="true"></div>
+  <body data-home-status="booting" data-home-shell="resolving" data-home-gui="resolving">
+    <script>
+      (() => {
+        try {
+          const hintKey = "elastos.home.active-shell-hint";
+          const hintedShell = window.localStorage.getItem(hintKey);
+          if (hintedShell !== "home-cli") {
+            window.localStorage.removeItem(hintKey);
+            return;
+          }
+          const hasAlternateHint = document.documentElement.dataset.homeShellHint === "alternate";
+          if (hasAlternateHint) {
+            document.documentElement.dataset.homeShellHint = "alternate";
+            document.body.dataset.homeShell = "alternate";
+            document.body.dataset.homeGui = "dormant";
+          }
+        } catch (_error) {}
+      })();
+    </script>
+    <div class="home-host-shell">
+      <div id="home-shell-boot-mask" class="home-shell-boot-mask" aria-hidden="true"></div>
 
-      <header class="toolbar" aria-label="Home toolbar">
-        <button id="toolbar-home" class="toolbar-btn toolbar-brand" type="button" aria-label="Go Home" title="ElastOS">
-          <img src="./elastos-logo.svg" alt="ElastOS" draggable="false" />
-        </button>
-        <div class="toolbar-spacer"></div>
-        <button
-          id="toolbar-inbox"
-          class="toolbar-btn inbox-btn"
-          type="button"
-          aria-label="Open inbox"
-          title="Inbox"
+      <section id="active-shell-root" class="active-shell-root" aria-live="polite" hidden>
+        <!-- Presentation mount only. Same-origin is local API compatibility, not a capsule isolation boundary. -->
+        <iframe
+          id="active-shell-frame"
+          class="active-shell-frame"
+          title="Active Home shell"
+          sandbox="allow-downloads allow-forms allow-modals allow-pointer-lock allow-same-origin allow-scripts"
+          allow="autoplay; fullscreen"
+        ></iframe>
+        <section
+          id="shell-host-recovery"
+          class="shell-host-recovery"
+          role="alert"
+          aria-live="assertive"
+          hidden
         >
-          <span id="toolbar-inbox-count" class="toolbar-inbox-count" hidden></span>
-        </button>
-        <button
-          id="toolbar-fullscreen"
-          class="toolbar-btn fullscreen-btn"
-          type="button"
-          aria-label="Enter fullscreen"
-          title="Fullscreen"
-          aria-pressed="false"
-        >
-          <img src="./fullscreen.svg" alt="" draggable="false" />
-        </button>
-        <button
-          id="toolbar-sign-out"
-          class="toolbar-btn sign-out-btn"
-          type="button"
-          aria-label="Sign out"
-          title="Sign out"
-        ></button>
-        <div id="clock" class="toolbar-clock">--:--</div>
-      </header>
-
-      <main class="desktop-workspace">
-        <section id="desktop" class="desktop" aria-live="polite">
-          <section
-            id="desktop-shortcuts"
-            class="desktop-shortcuts"
-            role="listbox"
-            aria-label="Home items"
-            aria-multiselectable="false"
-            tabindex="0"
-          ></section>
-          <div id="window-snap-preview" class="window-snap-preview" aria-hidden="true" hidden></div>
+          <div class="shell-host-recovery-panel">
+            <p class="shell-host-recovery-eyebrow">home-shell-host</p>
+            <h1 id="shell-host-recovery-title">Shell unavailable</h1>
+            <p id="shell-host-recovery-copy">Reload Home or sign out.</p>
+            <pre id="shell-host-recovery-detail" class="shell-host-recovery-detail" hidden></pre>
+            <div class="shell-host-recovery-actions">
+              <button id="shell-host-recovery-home" class="shell-host-recovery-button" type="button">
+                home-gui
+              </button>
+              <button id="shell-host-recovery-reload" class="shell-host-recovery-button" type="button">
+                Reload
+              </button>
+              <button
+                id="shell-host-recovery-sign-out"
+                class="shell-host-recovery-button shell-host-recovery-button-secondary"
+                type="button"
+              >
+                Sign out
+              </button>
+            </div>
+          </div>
         </section>
-      </main>
-
-      <footer class="taskbar" aria-label="Home taskbar">
-        <div class="taskbar-inner">
-          <div class="taskbar-primary">
-            <button
-              id="launcher-toggle"
-              class="taskbar-item taskbar-item-launcher"
-              type="button"
-              aria-label="Open launcher"
-              aria-controls="launcher"
-              aria-expanded="false"
-            >
-              <span class="taskbar-icon taskbar-icon-launcher"></span>
-            </button>
-            <div id="taskbar-targets" class="taskbar-sortable" aria-label="Taskbar items"></div>
-          </div>
-        </div>
-      </footer>
-
-      <aside id="launcher" class="launcher" aria-hidden="true" data-open="false" hidden>
-        <div class="launcher-popover hide-scrollbar" role="dialog" aria-modal="true" aria-label="Home launcher">
-          <button id="close-launcher" class="launcher-close" type="button" aria-label="Close launcher">
-            <img src="./close.svg" alt="" draggable="false" />
-          </button>
-          <div class="launcher-search-wrap">
-            <input
-              id="launcher-search"
-              class="launcher-search-field"
-              type="search"
-              autocomplete="off"
-              placeholder="Search Home"
-              spellcheck="false"
-            />
-          </div>
-          <h1 class="launcher-heading">Open</h1>
-          <div id="launcher-grid" class="launcher-sections"></div>
-          <p id="launcher-empty-state" class="launcher-empty" hidden>No matching items</p>
-        </div>
-      </aside>
-
-      <div id="desktop-context-menu" class="context-menu" role="menu" aria-label="Home actions" hidden></div>
-
-      <section
-        id="home-notification-toast"
-        class="home-notification-toast"
-        role="status"
-        aria-live="assertive"
-        aria-hidden="true"
-        hidden
-      >
-        <div class="home-notification-copy">
-          <strong id="home-notification-title">Wallet approval request</strong>
-          <span id="home-notification-body">A capsule requests wallet approval.</span>
-        </div>
-        <div class="home-notification-actions">
-          <button id="home-notification-action" class="home-notification-action" type="button">Review</button>
-          <button
-            id="home-notification-dismiss"
-            class="home-notification-dismiss"
-            type="button"
-            aria-label="Dismiss notification"
-          ></button>
-        </div>
       </section>
 
-      <section id="home-unlock" class="home-unlock" aria-labelledby="home-unlock-title" aria-hidden="true" hidden>
+      <section id="home-unlock" class="home-unlock" aria-labelledby="home-unlock-title" aria-hidden="true" data-surface="neutral" hidden>
         <div class="home-unlock-card" role="dialog" aria-modal="true">
           <img class="home-unlock-logo" src="./elastos-logo.svg" alt="ElastOS" draggable="false" />
           <h1 id="home-unlock-title">Sign in</h1>
@@ -155,80 +115,6 @@
       </section>
     </div>
 
-    <template id="window-template">
-      <section class="window" role="dialog" aria-modal="false" aria-hidden="true">
-        <div class="window-head">
-          <div class="window-head-draggable">
-            <span class="window-head-icon"></span>
-            <span class="window-head-title"></span>
-          </div>
-          <button class="window-action-btn" data-action="minimize" type="button" aria-label="Minimize">
-            <img src="./minimize.svg" alt="" draggable="false" />
-          </button>
-          <button class="window-action-btn" data-action="maximize" type="button" aria-label="Maximize">
-            <img src="./scale.svg" alt="" draggable="false" />
-          </button>
-          <button class="window-action-btn" data-action="close" type="button" aria-label="Close">
-            <img src="./close.svg" alt="" draggable="false" />
-          </button>
-        </div>
-        <div class="window-body"></div>
-        <div class="window-resize-handle window-resize-handle-n" data-resize="n" aria-hidden="true"></div>
-        <div class="window-resize-handle window-resize-handle-e" data-resize="e" aria-hidden="true"></div>
-        <div class="window-resize-handle window-resize-handle-s" data-resize="s" aria-hidden="true"></div>
-        <div class="window-resize-handle window-resize-handle-w" data-resize="w" aria-hidden="true"></div>
-        <div class="window-resize-handle window-resize-handle-ne" data-resize="ne" aria-hidden="true"></div>
-        <div class="window-resize-handle window-resize-handle-nw" data-resize="nw" aria-hidden="true"></div>
-        <div class="window-resize-handle window-resize-handle-se" data-resize="se" aria-hidden="true"></div>
-        <div class="window-resize-handle window-resize-handle-sw" data-resize="sw" aria-hidden="true"></div>
-      </section>
-    </template>
-
-    <template id="shortcut-template">
-      <div class="desktop-shortcut" tabindex="-1" role="option" aria-selected="false">
-        <span class="desktop-shortcut-icon app-glyph" aria-hidden="true"></span>
-        <span class="desktop-shortcut-title"></span>
-      </div>
-    </template>
-
-    <template id="launcher-item-template">
-      <button class="launcher-card" type="button">
-        <span class="launcher-card-body">
-          <span class="app-glyph launcher-item-icon" aria-hidden="true"></span>
-          <span class="launcher-card-title"></span>
-        </span>
-      </button>
-    </template>
-
-    <template id="window-error-template">
-      <div class="window-error">
-        <h3 class="window-error-title">Runtime data not attached on this host</h3>
-        <p class="window-error-copy"></p>
-        <dl class="window-error-facts">
-          <div class="window-error-fact">
-            <dt class="window-error-subject-label">Surface</dt>
-            <dd class="window-error-subject-value">Home</dd>
-          </div>
-          <div class="window-error-fact">
-            <dt>Detail</dt>
-            <dd class="window-error-detail"></dd>
-          </div>
-        </dl>
-      </div>
-    </template>
-
-    <template id="taskbar-item-template">
-      <div class="taskbar-entry">
-        <button class="taskbar-item" type="button">
-          <span class="taskbar-icon">
-            <span class="taskbar-item-icon"></span>
-          </span>
-          <span class="active-taskbar-indicator" aria-hidden="true"></span>
-        </button>
-        <button class="taskbar-window-count" type="button" hidden></button>
-      </div>
-    </template>
-
-    <script type="module" src="./shell.js?v=home-20260627a"></script>
+    <script type="module" src="./home-shell-host.js?v=home-20260705a"></script>
   </body>
 </html>

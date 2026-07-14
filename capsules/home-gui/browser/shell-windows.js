@@ -1,5 +1,6 @@
 import {
   desktop,
+  HOME_GUI_SHELL_ID,
   windowTemplate,
   windowErrorTemplate,
   PEOPLE_TARGET_ID,
@@ -20,7 +21,7 @@ import {
   clearShellSessionState,
   ignoreRepeatedAction,
   targetById,
-} from "./shell-core.js?v=home-20260627a";
+} from "./shell-core.js?v=home-20260705a";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -31,7 +32,7 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260627a";
+} from "./shell-window-geometry.js?v=home-20260705a";
 
 let windowHooks = null;
 const PEOPLE_DISCOVERY_AUTO_REFRESH_INITIAL_MS = 1_500;
@@ -54,14 +55,36 @@ const WINDOW_CLOSE_GUARD_MOVE_PX = 18;
 const BROWSER_DESKTOP_OPEN_GUARD_MS = 700;
 const MAX_SESSION_WINDOWS = 24;
 const SINGLE_SESSION_TARGETS = new Set([PEOPLE_TARGET_ID, "inbox", "wallet"]);
+const TEMPORARY_BROWSER_CHILD_FRAME_RELEASE_HOOK = "__elastosBrowserReleaseRuntimePage";
 const COMMON_IFRAME_SANDBOX = [
   "allow-downloads",
   "allow-forms",
   "allow-modals",
   "allow-pointer-lock",
-  "allow-same-origin",
   "allow-scripts",
 ];
+// Same-origin frames are presentation compatibility for current local API
+// capsules. Runtime launch tokens plus provider gates are authoritative.
+const SAME_ORIGIN_PRESENTATION_IFRAME_TARGETS = new Set([
+  "agent",
+  "archive-manager",
+  "browser",
+  "chat",
+  "chat-room",
+  "chat-wasm",
+  "documents",
+  "gba-emulator",
+  "gba-ucity",
+  "inbox",
+  "library",
+  "marketplace",
+  "services",
+  SYSTEM_APP_ID,
+  "wallet",
+  "wallet-metamask",
+  "wallet-unisat",
+  "wallet-walletconnect",
+]);
 const BROWSER_IFRAME_SANDBOX_EXTRAS = [
   "allow-popups",
   "allow-popups-to-escape-sandbox",
@@ -82,6 +105,9 @@ const peopleDiscoveryRefreshTimers = new WeakMap();
 
 function iframeSandboxForLaunch(launched) {
   const tokens = [...COMMON_IFRAME_SANDBOX];
+  if (SAME_ORIGIN_PRESENTATION_IFRAME_TARGETS.has(launched?.target)) {
+    tokens.push("allow-same-origin");
+  }
   if (launched?.target === "browser") {
     tokens.push(...BROWSER_IFRAME_SANDBOX_EXTRAS);
   }
@@ -178,19 +204,37 @@ function persistedBrowserSessionEntries() {
     });
 }
 
+function currentRootShellSessionId() {
+  return HOME_GUI_SHELL_ID;
+}
+
 function persistBrowserSession() {
   if (shellState.restoringSession) {
     return;
   }
+  const rootShell = currentRootShellSessionId();
   const windows = persistedBrowserSessionEntries();
   if (windows.length === 0) {
-    saveShellSessionState({ windows: [] });
+    saveShellSessionState({ root_shell: rootShell, windows: [] });
     return;
   }
-  saveShellSessionState({ windows });
+  saveShellSessionState({ root_shell: rootShell, windows });
 }
 
-export function normalizeRestorableSession(summary, storedSession) {
+function storedSessionRootShell(storedSession) {
+  const rootShell = typeof storedSession?.root_shell === "string"
+    ? storedSession.root_shell.trim()
+    : "";
+  return rootShell;
+}
+
+export function normalizeRestorableSession(summary, storedSession, options = {}) {
+  const requestedRootShell = typeof options.rootShell === "string"
+    ? options.rootShell.trim()
+    : "";
+  if (requestedRootShell && storedSessionRootShell(storedSession) !== requestedRootShell) {
+    return [];
+  }
   const storedWindows = Array.isArray(storedSession?.windows) ? storedSession.windows : [];
   const seenTargets = new Set();
   const normalized = [];
@@ -242,6 +286,10 @@ function renderWindowTaskbar() {
     return;
   }
   requireWindowHooks().renderTaskbar(shellState.currentSummary);
+}
+
+function windowHostContainer() {
+  return desktop;
 }
 
 function rerenderShellSurfaces({ desktop: rerenderDesktop = false, taskbar: rerenderTaskbar = false } = {}) {
@@ -476,19 +524,6 @@ export function closeAllTargetWindows(targetId) {
   return removeWindowEntries(browserWindowEntriesForTarget(targetId));
 }
 
-export function renderBootError(error) {
-  requireWindowHooks().clearIdentitySurface();
-  renderSystemErrorWindow({
-    id: "shell-error",
-    title: "Home",
-    headline: "Runtime data not attached on this host",
-    copy: "Home could not attach runtime-backed summary data here. Static surface facts are still available below.",
-    subjectLabel: "Surface",
-    subjectValue: "Home",
-    detail: String(error.message || error),
-  });
-}
-
 function renderSystemErrorWindow({
   id,
   title,
@@ -509,7 +544,7 @@ function renderSystemErrorWindow({
       height: 220,
       tone: "default",
     });
-    desktop.appendChild(node);
+    windowHostContainer().appendChild(node);
     entry = {
       id,
       node,
@@ -704,7 +739,7 @@ function openPeopleWindow(options = {}) {
   };
   shellState.windows.set(windowId, entry);
   renderPeopleWindowBody(entry, summary);
-  desktop.appendChild(node);
+  windowHostContainer().appendChild(node);
   if (restoredPlacement) {
     applyWindowPlacement(node, restoredPlacement);
   }
@@ -1421,7 +1456,7 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
     ></iframe>
   `;
 
-  desktop.appendChild(node);
+  windowHostContainer().appendChild(node);
   if (restoredPlacement) {
     applyWindowPlacement(node, restoredPlacement);
   } else if (launched.target === "browser" && node.dataset.maximized === "true") {
@@ -1582,7 +1617,8 @@ function releaseFrameRuntimePage(node) {
     return;
   }
   try {
-    const release = frame.contentWindow?.__elastosBrowserReleaseRuntimePage;
+    // Temporary same-origin bridge until Browser publishes a typed host release intent.
+    const release = frame.contentWindow?.[TEMPORARY_BROWSER_CHILD_FRAME_RELEASE_HOOK];
     if (typeof release === "function") {
       release();
     }
@@ -1787,6 +1823,7 @@ export async function restoreShellSession() {
   const restoredWindows = normalizeRestorableSession(
     shellState.currentSummary,
     loadShellSessionState(),
+    { rootShell: currentRootShellSessionId() },
   );
   if (restoredWindows.length === 0) {
     clearShellSessionState();

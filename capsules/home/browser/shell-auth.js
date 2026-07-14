@@ -1,4 +1,4 @@
-import { fetchJson } from "./shell-core.js?v=home-20260627a";
+import { fetchJson } from "./shell-core.js?v=home-20260705a";
 
 const unlockPanel = document.querySelector("#home-unlock");
 const unlockCard = document.querySelector(".home-unlock-card");
@@ -24,11 +24,15 @@ export function isHomeAuthError(error) {
 export async function showHomeUnlock(onUnlocked, options = {}) {
   unlockCallback = typeof onUnlocked === "function" ? onUnlocked : null;
   unlockPresentation = options && options.presentation === "prompt" ? "prompt" : "modal";
+  const forceNeutralSurface = options && options.surface === "neutral";
   if (!unlockPanel) {
     throw new Error("Home unlock surface is missing");
   }
   document.body.dataset.homeStatus = unlockPresentation === "prompt" ? "ready" : "locked";
   unlockPanel.dataset.mode = unlockPresentation;
+  unlockPanel.dataset.surface = !forceNeutralSurface && document.body.dataset.homeShell === "desktop"
+    ? "desktop"
+    : "neutral";
   renderUnlockChecking();
   unlockPanel.hidden = false;
   unlockPanel.setAttribute("aria-hidden", "false");
@@ -67,6 +71,7 @@ export function hideHomeUnlock() {
   unlockPanel.hidden = true;
   unlockPanel.setAttribute("aria-hidden", "true");
   delete unlockPanel.dataset.mode;
+  delete unlockPanel.dataset.surface;
   setUnlockNameVisible(false);
   setUnlockStatus("", "muted");
 }

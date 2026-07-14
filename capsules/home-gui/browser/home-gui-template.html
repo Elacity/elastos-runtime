@@ -1,0 +1,195 @@
+<div
+  class="desktop-backdrop"
+  data-overlay="false"
+  data-home-gui-hidden-by-host="hidden"
+  aria-hidden="true"
+  inert
+  hidden
+></div>
+
+<header class="toolbar" aria-label="Home toolbar" data-home-gui-hidden-by-host="hidden" inert hidden>
+  <button id="toolbar-home" class="toolbar-btn toolbar-brand" type="button" aria-label="Go Home" title="ElastOS">
+    <img src="/apps/home-gui/elastos-logo.svg" alt="ElastOS" draggable="false" />
+  </button>
+  <div class="toolbar-spacer"></div>
+  <button
+    id="toolbar-inbox"
+    class="toolbar-btn inbox-btn"
+    type="button"
+    aria-label="Open inbox"
+    title="Inbox"
+  >
+    <span id="toolbar-inbox-count" class="toolbar-inbox-count" hidden></span>
+  </button>
+  <button
+    id="toolbar-fullscreen"
+    class="toolbar-btn fullscreen-btn"
+    type="button"
+    aria-label="Enter fullscreen"
+    title="Fullscreen"
+    aria-pressed="false"
+  >
+    <img src="/apps/home-gui/fullscreen.svg" alt="" draggable="false" />
+  </button>
+  <button
+    id="toolbar-sign-out"
+    class="toolbar-btn sign-out-btn"
+    type="button"
+    aria-label="Sign out"
+    title="Sign out"
+  ></button>
+  <div id="clock" class="toolbar-clock">--:--</div>
+</header>
+
+<main class="desktop-workspace" data-home-gui-hidden-by-host="hidden" inert hidden>
+  <div id="window-snap-preview" class="window-snap-preview" aria-hidden="true" hidden></div>
+  <section id="desktop" class="desktop" aria-live="polite">
+    <section
+      id="desktop-shortcuts"
+      class="desktop-shortcuts"
+      role="listbox"
+      aria-label="Home items"
+      aria-multiselectable="false"
+      tabindex="0"
+    ></section>
+  </section>
+</main>
+
+<footer class="taskbar" aria-label="Home taskbar" data-home-gui-hidden-by-host="hidden" inert hidden>
+  <div class="taskbar-inner">
+    <div class="taskbar-primary">
+      <button
+        id="launcher-toggle"
+        class="taskbar-item taskbar-item-launcher"
+        type="button"
+        aria-label="Open launcher"
+        aria-controls="launcher"
+        aria-expanded="false"
+      >
+        <span class="taskbar-icon taskbar-icon-launcher"></span>
+      </button>
+      <div id="taskbar-targets" class="taskbar-sortable" aria-label="Taskbar items"></div>
+    </div>
+  </div>
+</footer>
+
+<aside id="launcher" class="launcher" aria-hidden="true" data-open="false" inert hidden>
+  <div class="launcher-popover hide-scrollbar" role="dialog" aria-modal="true" aria-label="Home launcher">
+    <button id="close-launcher" class="launcher-close" type="button" aria-label="Close launcher">
+      <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
+    </button>
+    <div class="launcher-search-wrap">
+      <input
+        id="launcher-search"
+        class="launcher-search-field"
+        type="search"
+        autocomplete="off"
+        placeholder="Search Home"
+        spellcheck="false"
+      />
+    </div>
+    <h1 class="launcher-heading">Open</h1>
+    <div id="launcher-grid" class="launcher-sections"></div>
+    <p id="launcher-empty-state" class="launcher-empty" hidden>No matching items</p>
+  </div>
+</aside>
+
+<div id="desktop-context-menu" class="context-menu" role="menu" aria-label="Home actions" inert hidden></div>
+
+<section
+  id="home-notification-toast"
+  class="home-notification-toast"
+  role="status"
+  aria-live="assertive"
+  aria-hidden="true"
+  inert
+  hidden
+>
+  <div class="home-notification-copy">
+    <strong id="home-notification-title">Wallet approval request</strong>
+    <span id="home-notification-body">A capsule requests wallet approval.</span>
+  </div>
+  <div class="home-notification-actions">
+    <button id="home-notification-action" class="home-notification-action" type="button">Review</button>
+    <button
+      id="home-notification-dismiss"
+      class="home-notification-dismiss"
+      type="button"
+      aria-label="Dismiss notification"
+    ></button>
+  </div>
+</section>
+
+<template id="window-template">
+  <section class="window" role="dialog" aria-modal="false" aria-hidden="true">
+    <div class="window-head">
+      <div class="window-head-draggable">
+        <span class="window-head-icon"></span>
+        <span class="window-head-title"></span>
+      </div>
+      <button class="window-action-btn" data-action="minimize" type="button" aria-label="Minimize">
+        <img src="/apps/home-gui/minimize.svg" alt="" draggable="false" />
+      </button>
+      <button class="window-action-btn" data-action="maximize" type="button" aria-label="Maximize">
+        <img src="/apps/home-gui/scale.svg" alt="" draggable="false" />
+      </button>
+      <button class="window-action-btn" data-action="close" type="button" aria-label="Close">
+        <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
+      </button>
+    </div>
+    <div class="window-body"></div>
+    <div class="window-resize-handle window-resize-handle-n" data-resize="n" aria-hidden="true"></div>
+    <div class="window-resize-handle window-resize-handle-e" data-resize="e" aria-hidden="true"></div>
+    <div class="window-resize-handle window-resize-handle-s" data-resize="s" aria-hidden="true"></div>
+    <div class="window-resize-handle window-resize-handle-w" data-resize="w" aria-hidden="true"></div>
+    <div class="window-resize-handle window-resize-handle-ne" data-resize="ne" aria-hidden="true"></div>
+    <div class="window-resize-handle window-resize-handle-nw" data-resize="nw" aria-hidden="true"></div>
+    <div class="window-resize-handle window-resize-handle-se" data-resize="se" aria-hidden="true"></div>
+    <div class="window-resize-handle window-resize-handle-sw" data-resize="sw" aria-hidden="true"></div>
+  </section>
+</template>
+
+<template id="shortcut-template">
+  <div class="desktop-shortcut" tabindex="-1" role="option" aria-selected="false">
+    <span class="desktop-shortcut-icon app-glyph" aria-hidden="true"></span>
+    <span class="desktop-shortcut-title"></span>
+  </div>
+</template>
+
+<template id="launcher-item-template">
+  <button class="launcher-card" type="button">
+    <span class="launcher-card-body">
+      <span class="app-glyph launcher-item-icon" aria-hidden="true"></span>
+      <span class="launcher-card-title"></span>
+    </span>
+  </button>
+</template>
+
+<template id="window-error-template">
+  <div class="window-error">
+    <h3 class="window-error-title">Runtime data not attached on this host</h3>
+    <p class="window-error-copy"></p>
+    <dl class="window-error-facts">
+      <div class="window-error-fact">
+        <dt class="window-error-subject-label">Surface</dt>
+        <dd class="window-error-subject-value">Home</dd>
+      </div>
+      <div class="window-error-fact">
+        <dt>Detail</dt>
+        <dd class="window-error-detail"></dd>
+      </div>
+    </dl>
+  </div>
+</template>
+
+<template id="taskbar-item-template">
+  <div class="taskbar-entry">
+    <button class="taskbar-item" type="button">
+      <span class="taskbar-icon">
+        <span class="taskbar-item-icon"></span>
+      </span>
+      <span class="active-taskbar-indicator" aria-hidden="true"></span>
+    </button>
+    <button class="taskbar-window-count" type="button" hidden></button>
+  </div>
+</template>
