@@ -97,6 +97,38 @@ pub(super) fn home_targets(data_dir: &std::path::Path) -> Vec<HomeTargetSummary>
     targets
 }
 
+#[cfg(test)]
+pub(super) fn home_targets_from_catalog(
+    catalog: &CapsuleCatalogResponse,
+) -> Vec<HomeTargetSummary> {
+    let mut targets = catalog
+        .capsules
+        .iter()
+        .filter(|capsule| capsule.launchable)
+        .filter(|capsule| capsule.role != CapsuleRole::Shell)
+        .filter(|capsule| is_home_visible_target(&capsule.name))
+        .filter_map(|capsule| {
+            Some(HomeTargetSummary {
+                target: capsule.launch_target.clone()?,
+                title: capsule.title.clone(),
+                description: capsule.description.clone(),
+                route: capsule.route.clone()?,
+                attach_kind: "iframe".to_string(),
+                role: capsule.role.clone(),
+                target_kind: if capsule.role == CapsuleRole::Content {
+                    HomeTargetKind::Object
+                } else {
+                    HomeTargetKind::App
+                },
+                viewer: capsule.viewer.clone(),
+                viewer_title: capsule.viewer_title.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| left.title.cmp(&right.title));
+    targets
+}
+
 pub(super) fn home_launch_targets(data_dir: &std::path::Path) -> Vec<HomeTargetSummary> {
     let mut targets = home_browser_targets(data_dir, false);
     targets.extend(home_viewer_targets(data_dir));
@@ -130,6 +162,8 @@ fn home_browser_targets(data_dir: &std::path::Path, visible_only: bool) -> Vec<H
                 attach_kind: "iframe".to_string(),
                 role: app.role,
                 target_kind: HomeTargetKind::App,
+                viewer: None,
+                viewer_title: None,
             })
             .collect();
     targets.sort_by(|left, right| left.title.cmp(&right.title));
@@ -139,24 +173,29 @@ fn home_browser_targets(data_dir: &std::path::Path, visible_only: bool) -> Vec<H
 fn home_viewer_targets(data_dir: &std::path::Path) -> Vec<HomeTargetSummary> {
     let mut targets = crate::api::browser_capsules::list_all_viewer_bound_capsules(data_dir)
         .into_iter()
-        .map(|capsule| HomeTargetSummary {
-            route: format!("/apps/{}/?capsule={}", capsule.viewer, capsule.name),
-            title: viewer_object_shell_title(&capsule.name, capsule.description.as_deref()),
-            description: viewer_object_shell_description(
-                &capsule.viewer,
-                capsule.description.as_deref(),
-            ),
-            target: capsule.name,
-            attach_kind: "iframe".to_string(),
-            role: CapsuleRole::Content,
-            target_kind: HomeTargetKind::Object,
+        .map(|capsule| {
+            let viewer_title = app_shell_title(&capsule.viewer);
+            HomeTargetSummary {
+                route: format!("/apps/{}/?capsule={}", capsule.viewer, capsule.name),
+                title: viewer_object_shell_title(&capsule.name, capsule.description.as_deref()),
+                description: viewer_object_shell_description(
+                    &capsule.viewer,
+                    capsule.description.as_deref(),
+                ),
+                target: capsule.name,
+                attach_kind: "iframe".to_string(),
+                role: CapsuleRole::Content,
+                target_kind: HomeTargetKind::Object,
+                viewer: Some(capsule.viewer),
+                viewer_title: Some(viewer_title),
+            }
         })
         .collect::<Vec<_>>();
     targets.sort_by(|left, right| left.title.cmp(&right.title));
     targets
 }
 
-fn is_home_visible_target(name: &str) -> bool {
+pub(super) fn is_home_visible_target(name: &str) -> bool {
     !matches!(
         name,
         WALLET_METAMASK_CAPSULE_ID | WALLET_UNISAT_CAPSULE_ID | WALLET_WALLETCONNECT_CAPSULE_ID

@@ -15,11 +15,11 @@
     {
       "id": "elastos.documents.editor",
       "version": "0.5.0",
-      "description": "Document editor projection over Runtime object storage and publication intents",
+      "description": "Create, edit, and publish markdown documents",
       "methods": [
         {
           "id": "document.open",
-          "description": "Open a document object through the Runtime viewer route",
+          "description": "Open a markdown document",
           "risk": "read",
           "approval": "runtime_policy",
           "audit": "event",
@@ -38,7 +38,7 @@
         },
         {
           "id": "document.save",
-          "description": "Save a document through the object-provider backed namespace",
+          "description": "Save a document",
           "risk": "write",
           "approval": "user",
           "audit": "event",
@@ -47,7 +47,7 @@
         },
         {
           "id": "document.publish",
-          "description": "Request publication of a document through Runtime publication gates",
+          "description": "Publish a document and create a shareable link",
           "risk": "privileged",
           "approval": "user",
           "audit": "full",

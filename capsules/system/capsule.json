@@ -2,7 +2,7 @@
   "schema": "elastos.capsule/v1",
   "name": "system",
   "version": "0.1.0",
-  "description": "Runtime-launched System controls for access, appearance, and diagnostics",
+  "description": "Manage your account, appearance, security, storage, apps, and device",
   "author": "elastos",
   "role": "app",
   "type": "wasm",
@@ -15,11 +15,11 @@
     {
       "id": "elastos.system.shell",
       "version": "0.5.0",
-      "description": "System shell picker and runtime settings projection",
+      "description": "System settings",
       "methods": [
         {
           "id": "shells.list",
-          "description": "List selectable Home shell candidates",
+          "description": "List available Home views",
           "risk": "read",
           "approval": "runtime_policy",
           "audit": "summary",
@@ -28,7 +28,7 @@
         },
         {
           "id": "shell.switch",
-          "description": "Switch the active root Home shell for the signed-in principal",
+          "description": "Switch the current Home view",
           "risk": "privileged",
           "approval": "user",
           "audit": "event",
@@ -37,7 +37,7 @@
         },
         {
           "id": "settings.update",
-          "description": "Update Runtime-owned Home settings",
+          "description": "Update Home settings",
           "risk": "write",
           "approval": "user",
           "audit": "event",

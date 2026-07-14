@@ -851,6 +851,10 @@ struct HomeTargetSummary {
     attach_kind: String,
     role: CapsuleRole,
     target_kind: HomeTargetKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    viewer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    viewer_title: Option<String>,
 }
 
 #[derive(Deserialize)]

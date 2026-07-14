@@ -91,11 +91,6 @@ body[data-emulator-host-mode="embedded"] .shell {
   grid-template-columns: minmax(0, 1fr) 15.75rem;
   gap: 0.75rem;
   align-items: stretch;
-  transition: grid-template-columns 0.16s ease;
-}
-
-.emulator-card.sidebar-collapsed {
-  grid-template-columns: minmax(0, 1fr) 3.25rem;
 }
 
 .screen-card,
@@ -159,6 +154,22 @@ body[data-emulator-host-mode="standalone"] .screen-frame {
   box-shadow:
     inset 0 0 0 1px rgba(255, 255, 255, 0.04),
     inset 0 18px 36px rgba(0, 0, 0, 0.34);
+}
+
+#power-led {
+  position: absolute;
+  left: 0.85rem;
+  bottom: 0.75rem;
+  width: 0.42rem;
+  height: 0.42rem;
+  border-radius: 50%;
+  background: #62dfb4;
+  box-shadow: 0 0 0.55rem rgba(98, 223, 180, 0.7);
+}
+
+#power-led.off {
+  background: rgba(255, 255, 255, 0.2);
+  box-shadow: none;
 }
 
 #screen-container:focus,
@@ -229,6 +240,12 @@ body[data-emulator-host-mode="standalone"] #screen-container {
 
 #drop-zone:hover {
   background: rgba(12, 20, 36, 0.95);
+}
+
+#drop-zone:focus-visible,
+#canvas:focus-visible {
+  outline: 2px solid rgba(127, 149, 228, 0.9);
+  outline-offset: -2px;
 }
 
 #drop-zone.drag-over {
@@ -310,10 +327,6 @@ body[data-emulator-host-mode="standalone"] #screen-container {
   outline: none;
 }
 
-#file-input {
-  display: none;
-}
-
 .touch-controls {
   display: grid;
   gap: 0.65rem;
@@ -372,7 +385,6 @@ body[data-emulator-host-mode="standalone"] #screen-container {
 .dpad-btn,
 .small-btn,
 .action-btn,
-.utility-toggle,
 #emulator-controls button {
   appearance: none;
   border: 1px solid var(--line-strong);
@@ -387,7 +399,6 @@ body[data-emulator-host-mode="standalone"] #screen-container {
 .dpad-btn:hover,
 .small-btn:hover,
 .action-btn:hover,
-.utility-toggle:hover,
 #emulator-controls button:hover,
 .state-actions button:hover {
   background: var(--accent-soft);
@@ -402,7 +413,6 @@ body[data-emulator-host-mode="standalone"] #screen-container {
 .small-btn.pressed,
 .action-btn:active,
 .action-btn.pressed,
-.utility-toggle:active,
 #emulator-controls button:active,
 .state-actions button:active {
   transform: translateY(1px);
@@ -515,40 +525,9 @@ body[data-emulator-host-mode="standalone"] #screen-container {
   text-transform: uppercase;
 }
 
-.utility-toggle {
-  min-height: 2rem;
-  padding: 0.48rem 0.7rem;
-  border-radius: 999px;
-  background: var(--panel-soft);
-  color: var(--accent-deep);
-  font-size: 0.72rem;
-  font-weight: 800;
-}
-
 .utility-panel {
   display: grid;
   gap: 0.62rem;
-}
-
-.emulator-card.sidebar-collapsed .utility-card {
-  padding: 0.55rem;
-  overflow: hidden;
-}
-
-.emulator-card.sidebar-collapsed .utility-card-head {
-  justify-content: center;
-}
-
-.emulator-card.sidebar-collapsed .utility-title {
-  display: none;
-}
-
-.emulator-card.sidebar-collapsed .utility-toggle {
-  width: 100%;
-  min-width: 0;
-  aspect-ratio: 1;
-  padding: 0;
-  border-radius: 0.9rem;
 }
 
 .utility-section {
@@ -670,8 +649,7 @@ input:disabled {
     padding: 0.2rem;
   }
 
-  .emulator-card,
-  .emulator-card.sidebar-collapsed {
+  .emulator-card {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr) auto;
     gap: 0.35rem;
@@ -769,97 +747,65 @@ input:disabled {
     padding: 0.32rem;
   }
 
-  .emulator-card:not(.sidebar-collapsed) .utility-panel {
+  .emulator-card .utility-panel {
     grid-template-columns: minmax(7rem, 0.7fr) minmax(0, 1.3fr);
     align-items: start;
     gap: 0.5rem;
   }
 
-  .emulator-card:not(.sidebar-collapsed) .utility-section {
+  .emulator-card .utility-section {
     gap: 0.28rem;
   }
 
-  .emulator-card:not(.sidebar-collapsed) #emulator-controls {
+  .emulator-card #emulator-controls {
     gap: 0.34rem;
   }
 
-  .emulator-card:not(.sidebar-collapsed) #emulator-controls button {
+  .emulator-card #emulator-controls button {
     min-height: 1.8rem;
     aspect-ratio: auto;
     border-radius: 0.72rem;
   }
 
-  .emulator-card:not(.sidebar-collapsed) .state-grid {
+  .emulator-card .state-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 0.34rem;
   }
 
-  .emulator-card:not(.sidebar-collapsed) .state-slot {
+  .emulator-card .state-slot {
     padding: 0.3rem;
     gap: 0.2rem;
     border-radius: 0.76rem;
   }
 
-  .emulator-card:not(.sidebar-collapsed) .state-slot-head {
+  .emulator-card .state-slot-head {
     display: flex;
     gap: 0.24rem;
     justify-content: space-between;
   }
 
-  .emulator-card:not(.sidebar-collapsed) .state-slot-name {
+  .emulator-card .state-slot-name {
     font-size: 0.72rem;
   }
 
-  .emulator-card:not(.sidebar-collapsed) .state-slot-status {
+  .emulator-card .state-slot-status {
     font-size: 0.6rem;
   }
 
-  .emulator-card:not(.sidebar-collapsed) .state-actions {
+  .emulator-card .state-actions {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 0.24rem;
   }
 
-  .emulator-card:not(.sidebar-collapsed) .state-actions button {
+  .emulator-card .state-actions button {
     min-height: 1.48rem;
     padding: 0.22rem 0.3rem;
     border-radius: 0.64rem;
     font-size: 0.62rem;
   }
 
-  .emulator-card.sidebar-collapsed .utility-card {
-    justify-self: center;
-    width: max-content;
-    min-height: 0;
-    max-height: none;
-    padding: 0;
-    border: 0;
-    background: transparent;
-    box-shadow: none;
-    backdrop-filter: none;
-    overflow: visible;
-  }
-
   .utility-card-head {
     min-height: 1.55rem;
-  }
-
-  .utility-toggle {
-    min-height: 1.8rem;
-    padding: 0.38rem 0.62rem;
-  }
-
-  .emulator-card.sidebar-collapsed .utility-card-head {
-    min-height: 0;
-  }
-
-  .emulator-card.sidebar-collapsed .utility-toggle {
-    width: auto;
-    min-width: 4.25rem;
-    min-height: 1.95rem;
-    aspect-ratio: auto;
-    padding: 0.4rem 0.82rem;
-    border-radius: 999px;
-    box-shadow: 0 10px 22px rgba(34, 49, 88, 0.12);
   }
 }
 

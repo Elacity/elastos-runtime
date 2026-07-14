@@ -167,6 +167,12 @@ pub fn capsule_interface_registry_snapshot(data_dir: &std::path::Path) -> serde_
     )
 }
 
+pub fn capsule_affordance_static_executable(
+    method: &elastos_common::CapsuleAffordanceDescriptor,
+) -> bool {
+    gateway_capsule_catalog::capsule_affordance_static_executable(method)
+}
+
 pub fn home_services_snapshot(data_dir: &std::path::Path) -> serde_json::Value {
     serde_json::to_value(gateway_home_runtime::home_state(data_dir).services)
         .unwrap_or_else(|_| serde_json::json!({ "schema": "elastos.runtime.services/v1" }))
@@ -650,6 +656,7 @@ pub fn gateway_router(state: GatewayState) -> Router {
         )
         .route("/api/capsules/catalog", get(capsule_catalog))
         .route("/api/capsules/interfaces", get(capsule_interfaces))
+        .route("/api/capsules/contracts/audit", get(capsule_contract_audit))
         .route(
             "/api/capsules/interfaces/invoke",
             post(capsule_interface_invoke),

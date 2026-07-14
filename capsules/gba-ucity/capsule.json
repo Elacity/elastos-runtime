@@ -12,21 +12,23 @@
     {
       "id": "elastos.content.asset",
       "version": "0.5.0",
-      "description": "Launchable content asset descriptor for viewer-based capsules",
+      "description": "GBA game content",
       "methods": [
         {
           "id": "asset.open",
-          "description": "Open this content asset with its declared Runtime viewer",
+          "description": "Open this game with GBA Emulator",
           "risk": "launch",
           "approval": "runtime_policy",
           "audit": "event",
           "resource": "elastos://content/asset",
-          "operation": "open"
+          "operation": "open",
+          "output_schema": {
+            "schema": "elastos.content.asset-opened/v1",
+            "content_type": "application/x-gba-rom",
+            "viewer": "gba-emulator"
+          }
         }
       ]
     }
-  ],
-  "permissions": {
-    "storage": ["localhost://Users/self/.AppData/LocalHost/GBA/gba-ucity/*"]
-  }
+  ]
 }

@@ -6814,7 +6814,7 @@ fn viewer_ids_for_name(name: &str) -> Vec<&'static str> {
         vec!["video-viewer"]
     } else if lower.ends_with(".pdf") {
         vec!["documents"]
-    } else if lower.ends_with(".gba") || lower.ends_with(".gb") || lower.ends_with(".gbc") {
+    } else if lower.ends_with(".gba") {
         vec!["gba-emulator"]
     } else {
         Vec::new()

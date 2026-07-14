@@ -15,7 +15,7 @@
     {
       "id": "elastos.services.offers",
       "version": "0.5.0",
-      "description": "Local and remote Runtime service-offer projection",
+      "description": "Choose Browser Engine and Browser Exit services",
       "methods": [
         {
           "id": "offers.list",
@@ -37,7 +37,7 @@
         },
         {
           "id": "offer.request",
-          "description": "Request access to a remote Runtime service offer",
+          "description": "Request access to a service shared by another device",
           "risk": "privileged",
           "approval": "user",
           "audit": "full",

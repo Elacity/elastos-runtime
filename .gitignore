@@ -24,8 +24,8 @@ elastos/storage/
 *.gba
 
 # Vendored GBA runtime + tracked open-source ROM
-!capsules/gba-emulator/mgba.js
-!capsules/gba-emulator/mgba.wasm
+!capsules/gba-emulator/browser/mgba.js
+!capsules/gba-emulator/browser/mgba.wasm
 
 # Allow tracked ROM templates (uCity Advance is open-source)
 !capsules/gba-ucity/ucity.gba

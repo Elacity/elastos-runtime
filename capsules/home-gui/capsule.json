@@ -2,7 +2,7 @@
   "schema": "elastos.capsule/v1",
   "name": "home-gui",
   "version": "0.1.0",
-  "description": "Trusted host-loaded Home GUI shell surface for ElastOS",
+  "description": "Desktop Home view for ElastOS",
   "author": "elastos",
   "role": "shell",
   "type": "wasm",
@@ -15,11 +15,11 @@
     {
       "id": "elastos.shell.gui",
       "version": "0.5.0",
-      "description": "Trusted host-loaded desktop shell projection over Runtime facts and structured Home intents",
+      "description": "Desktop, launcher, taskbar, and app windows",
       "methods": [
         {
           "id": "desktop.render",
-          "description": "Render desktop, launcher, taskbar, and windows inside the trusted Home host from Home facts",
+          "description": "Show the ElastOS desktop",
           "risk": "read",
           "approval": "runtime_policy",
           "audit": "summary",
@@ -28,7 +28,7 @@
         },
         {
           "id": "capsule.open",
-          "description": "Ask the Home host to open a visible capsule window through Runtime launch authority",
+          "description": "Open an app window",
           "risk": "launch",
           "approval": "runtime_policy",
           "audit": "event",
@@ -37,7 +37,7 @@
         },
         {
           "id": "shell.switch",
-          "description": "Switch the active root Home shell through Runtime active-shell state",
+          "description": "Switch to another Home view",
           "risk": "privileged",
           "approval": "user",
           "audit": "event",

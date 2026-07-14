@@ -487,6 +487,12 @@ impl CapsuleManifest {
             || self.bus_contract.as_deref() == Some(ELASTOS_BUS_V1_CONTRACT)
     }
 
+    pub fn is_runtime_projection(&self) -> bool {
+        self.runtime_abi.as_ref() == Some(&CapsuleRuntimeAbi::RuntimeProjectionV1)
+            || self.execution.as_ref() == Some(&CapsuleExecution::WebProjection)
+            || self.bus_contract.as_deref() == Some(ELASTOS_RUNTIME_PROJECTION_V1_CONTRACT)
+    }
+
     fn validate_interfaces(&self) -> Result<(), String> {
         let mut interface_ids = BTreeSet::new();
         for interface in &self.interfaces {

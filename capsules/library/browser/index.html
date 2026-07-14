@@ -11,7 +11,7 @@
     <div class="locked-card">
       <p class="eyebrow">ElastOS</p>
       <h1>Open from Home</h1>
-      <p class="subtitle">Library needs a signed Home launch token.</p>
+      <p class="subtitle">Open Library from Home.</p>
     </div>
   </section>
 
@@ -46,7 +46,7 @@
               <span class="inline-icon"><img src="icons/layout-details.svg" alt=""></span>
             </button>
           </div>
-          <select id="sort-select" class="select hidden" aria-label="Sort objects">
+          <select id="sort-select" class="select hidden" aria-label="Sort items">
             <option value="name">Name</option>
             <option value="modified">Modified</option>
             <option value="size">Size</option>
@@ -57,10 +57,10 @@
       </header>
 
       <section id="upload-progress" class="upload-progress hidden" aria-label="Upload progress" aria-live="polite"></section>
-      <section id="content" class="content" data-view="grid" aria-label="Objects"></section>
+      <section id="content" class="content" data-view="grid" aria-label="Items"></section>
       <footer class="statusbar explorer-footer">
-        <span id="footer-left">0 objects</span>
-        <span id="footer-right">Runtime provider: object</span>
+        <span id="footer-left">0 items</span>
+        <span id="footer-right">On this device</span>
       </footer>
     </main>
   </section>
@@ -69,6 +69,6 @@
   <div id="context-menu" class="context-menu hidden"></div>
   <div id="dialog" class="dialog-backdrop hidden"></div>
 
-  <script type="module" src="src/app.js"></script>
+  <script type="module" src="src/app.js?v=library-20260711d"></script>
 </body>
 </html>

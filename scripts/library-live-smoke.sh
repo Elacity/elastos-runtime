@@ -154,7 +154,7 @@ verify_public_library_assets() {
     uploads_js="$(get "/apps/library/src/uploads.js")"
     state_js="$(get "/apps/library/src/state.js")"
     assert_contains "Library shell" "$shell" 'rel="stylesheet" href="library.css"'
-    assert_contains "Library shell" "$shell" 'type="module" src="src/app.js"'
+    assert_contains "Library shell" "$shell" 'type="module" src="src/app.js?v=library-20260711b"'
     assert_contains "Library CSS" "$library_css" "grid-template-rows: 45px auto 18px;"
     assert_contains "Library CSS" "$library_css" '.content[data-view="grid"] .badges'
     assert_contains "Library CSS" "$library_css" '.content[data-view="list"] .badges'
@@ -174,7 +174,7 @@ verify_public_library_assets() {
     assert_contains "Library api.js" "$api_js" "/api/provider/object/download/raw"
     assert_contains "Library api.js" "$api_js" "x-elastos-transfer-receipt"
     assert_contains "Library api.js" "$api_js" "XMLHttpRequest"
-    assert_contains "Library api.js" "$api_js" "public gateway body-size limit"
+    assert_contains "Library api.js" "$api_js" "too large for the current upload service"
     assert_not_contains "Library api.js" "$api_js" "/api/provider/library/upload"
     assert_not_contains "Library api.js" "$api_js" "/api/provider/library/download/raw"
     assert_contains "Library actions.js" "$actions_js" "uploadObject({"

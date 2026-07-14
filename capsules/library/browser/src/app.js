@@ -14,16 +14,16 @@ import {
   publishedCid,
   viewerOptions,
 } from "./model.js";
-import { createLibraryRuntime } from "./api.js";
-import { createLibraryActions } from "./actions.js";
-import { createLibraryDialog } from "./dialog.js";
+import { createLibraryRuntime } from "./api.js?v=library-20260711c";
+import { createLibraryActions } from "./actions.js?v=library-20260711d";
+import { createLibraryDialog } from "./dialog.js?v=library-20260711d";
 import { createLibraryEditor } from "./editor.js";
 import { bindLibraryEvents } from "./events.js";
 import { createLibraryMenu } from "./menu.js";
 import { createLibraryNavigation } from "./navigation.js";
 import { createLibraryPreview } from "./preview.js";
 import { createLibraryRealtime } from "./realtime.js";
-import { createLibraryRenderer, iconPlaceholder } from "./render.js";
+import { createLibraryRenderer, iconPlaceholder } from "./render.js?v=library-20260711d";
 import { createLibrarySelection } from "./selection.js";
 import {
   MUTATING_PROVIDER_OPS,
@@ -324,14 +324,23 @@ import { createLibraryUploads } from "./uploads.js";
     }
 
     function setStatus(text) {
-      elements.statusText.textContent = text;
-      elements.statusText.classList.toggle("hidden", !text);
+      const message = publicLibraryText(text);
+      elements.statusText.textContent = message;
+      elements.statusText.classList.toggle("hidden", !message);
+    }
+
+    function publicLibraryText(value) {
+      const message = String(value || "").trim();
+      if (!message || !/\b(schema|projection|provider|adapter|capability|affordance|runtime-owned|launch token|hostcall|objects?|request failed|failed to fetch|unauthorized|forbidden|[45]\d\d)\b|engine_[a-z_]+/i.test(message)) {
+        return message;
+      }
+      return "Library action could not be completed.";
     }
 
     function attachStatusText() {
       return state.returnTarget === "browser"
-        ? "Choose an object for Browser."
-        : "Choose an object for Chat Room.";
+        ? "Choose an item for Browser."
+        : "Choose an item for Chat.";
     }
 
     async function providerApi(op, payload) {
@@ -528,7 +537,7 @@ import { createLibraryUploads } from "./uploads.js";
         state.currentObject = cached.object || null;
         setObjects(cached.objects);
         state.selectedUris.clear();
-        setFolderStatus(`${state.objects.length} object${state.objects.length === 1 ? "" : "s"}.`);
+        setFolderStatus(`${state.objects.length} item${state.objects.length === 1 ? "" : "s"}.`);
         renderAll();
         await runInitialObjectAction();
         renderedCached = true;
@@ -548,12 +557,12 @@ import { createLibraryUploads } from "./uploads.js";
         state.currentObject = currentObject;
         if (renderedCached && cached.signature === nextCache.signature) {
           renderAfterFetch = false;
-          setFolderStatus(`${state.objects.length} object${state.objects.length === 1 ? "" : "s"}.`);
+          setFolderStatus(`${state.objects.length} item${state.objects.length === 1 ? "" : "s"}.`);
           return;
         }
         setObjects(objects);
         state.selectedUris.clear();
-        setFolderStatus(`${state.objects.length} object${state.objects.length === 1 ? "" : "s"}.`);
+        setFolderStatus(`${state.objects.length} item${state.objects.length === 1 ? "" : "s"}.`);
       } finally {
         if (loadSeq === state.loadSeq && uri === state.currentUri) {
           state.loading = false;
@@ -1056,7 +1065,7 @@ import { createLibraryUploads } from "./uploads.js";
         startLibraryEventStream();
       } catch (error) {
         showError(error);
-        elements.content.innerHTML = `<div class="empty"><div><h2>Could not load Library</h2><p>${escapeHtml(error.message || "Runtime object provider unavailable.")}</p></div></div>`;
+        elements.content.innerHTML = '<div class="empty"><div><h2>Library could not open</h2><p>Close Library and try again.</p></div></div>';
       }
     }
 

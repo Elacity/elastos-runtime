@@ -13,8 +13,8 @@ pub use bridge::{CapsuleProvider, ProviderBridge, ProviderConfig as BridgeProvid
 pub use registry::{
     EntryType, Provider, ProviderByteRange, ProviderCarrierInvoker, ProviderCarrierRoute,
     ProviderError, ProviderInvocation, ProviderInvocationTransport, ProviderProgress,
-    ProviderRegistry, ProviderStreamOptions, ProviderStreamRead, ProviderStreamSession,
-    ProviderTransfer, ResourceAction, ResourceResponse,
+    ProviderRegistration, ProviderRegistry, ProviderStreamOptions, ProviderStreamRead,
+    ProviderStreamSession, ProviderTransfer, ResourceAction, ResourceResponse,
 };
 
 // Re-export for use by external provider implementations

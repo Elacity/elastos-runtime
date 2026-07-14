@@ -1159,7 +1159,7 @@ function getWasmImports() {
   // prepare imports
   return {
     'env': wasmImports,
-    'wasi_snapshot_preview1': wasmImports,
+    'capsule.local.memfs.v1': wasmImports,
   }
 }
 

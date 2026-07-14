@@ -3,30 +3,22 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; media-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
   <title>GBA Emulator - ElastOS</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=gba-20260712c">
 </head>
 <body>
-  <script>
-    const accessMode = new URLSearchParams(window.location.search).has("home_token")
-      ? "shell"
-      : "gateway";
-    const hostMode = window.self === window.top ? "standalone" : "embedded";
-    document.body.setAttribute("data-emulator-access-mode", accessMode);
-    document.body.setAttribute("data-emulator-host-mode", hostMode);
-    document.body.setAttribute("data-shell-window-fit", hostMode === "embedded" ? "fixed" : "auto");
-  </script>
   <main id="app-shell" class="shell">
     <section id="emulator-card" class="emulator-card">
       <section class="screen-card">
         <div id="screen-bezel" class="screen-frame">
           <div id="screen-container">
-            <canvas id="canvas" width="240" height="160"></canvas>
-            <div id="drop-zone">
+            <canvas id="canvas" width="240" height="160" tabindex="0" aria-label="Game screen"></canvas>
+            <div id="drop-zone" role="button" tabindex="0" aria-label="Open Library to choose a GBA game">
               <div class="drop-zone-copy">
                 <div class="icon">&#127918;</div>
-                <p id="drop-zone-copy">Insert Game</p>
+                <p id="drop-zone-copy">Choose a game from Library</p>
               </div>
               <div id="rom-library" class="rom-library" hidden>
                 <div class="rom-library-head">
@@ -34,9 +26,9 @@
                 </div>
                 <div id="rom-library-list" class="rom-library-list"></div>
               </div>
-              <input type="file" id="file-input" accept=".gba,.gbc,.gb,.zip" aria-label="Choose ROM file">
             </div>
           </div>
+          <span id="power-led" class="off" aria-hidden="true"></span>
           <p id="status" class="screen-status" aria-live="polite" hidden></p>
         </div>
 
@@ -99,9 +91,6 @@
       <aside class="utility-card">
         <div class="utility-card-head">
           <h2 class="utility-title">Options</h2>
-          <button id="utility-toggle" class="utility-toggle" type="button" aria-expanded="true" aria-controls="utility-panel" aria-label="Collapse sidebar" title="Collapse sidebar">
-            <span class="utility-toggle-label">Hide</span>
-          </button>
         </div>
         <div id="utility-panel" class="utility-panel">
           <section class="utility-section">
@@ -162,6 +151,6 @@
     </section>
   </main>
 
-  <script type="module" src="emulator.js"></script>
+  <script type="module" src="emulator.js?v=gba-20260712c"></script>
 </body>
 </html>

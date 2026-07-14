@@ -141,6 +141,35 @@ async fn setup_server_infrastructure_impl(
         Ok(())
     };
 
+    if let Some(path) = crate::find_installed_provider_binary("did-provider") {
+        if let Err(e) = verify_provider_binary("did-provider", &path) {
+            tracing::warn!("Skipping did-provider due to verification failure: {}", e);
+        } else {
+            let did_config = provider::BridgeProviderConfig {
+                base_path: data_dir.to_string_lossy().to_string(),
+                allowed_paths: file_backed_prefixes(),
+                read_only: false,
+                encryption_key: device_key_hex.clone(),
+                ..Default::default()
+            };
+            match provider::ProviderBridge::spawn(&path, did_config).await {
+                Ok(bridge) => {
+                    let provider: Arc<dyn provider::Provider> = Arc::new(
+                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "did"),
+                    );
+                    if let Err(e) = provider_registry
+                        .register_sub_provider("did", provider)
+                        .await
+                    {
+                        tracing::warn!("Failed to register elastos://did sub-provider: {}", e);
+                    }
+                    tracing::info!("did-provider capsule from {}", path.display());
+                }
+                Err(e) => tracing::warn!("Failed to spawn did-provider: {}", e),
+            }
+        }
+    }
+
     if spawn_host_providers {
         let binary_path =
             crate::find_installed_provider_binary("localhost-provider").ok_or_else(|| {
@@ -183,35 +212,6 @@ async fn setup_server_infrastructure_impl(
         let provider: Arc<dyn provider::Provider> =
             Arc::new(provider::CapsuleProvider::new(Arc::new(bridge)));
         provider_registry.register(provider).await;
-
-        if let Some(path) = crate::find_installed_provider_binary("did-provider") {
-            if let Err(e) = verify_provider_binary("did-provider", &path) {
-                tracing::warn!("Skipping did-provider due to verification failure: {}", e);
-            } else {
-                let did_config = provider::BridgeProviderConfig {
-                    base_path: data_dir.to_string_lossy().to_string(),
-                    allowed_paths: file_backed_prefixes(),
-                    read_only: false,
-                    encryption_key: device_key_hex.clone(),
-                    ..Default::default()
-                };
-                match provider::ProviderBridge::spawn(&path, did_config).await {
-                    Ok(bridge) => {
-                        let provider: Arc<dyn provider::Provider> = Arc::new(
-                            provider::CapsuleProvider::with_scheme(Arc::new(bridge), "did"),
-                        );
-                        if let Err(e) = provider_registry
-                            .register_sub_provider("did", provider)
-                            .await
-                        {
-                            tracing::warn!("Failed to register elastos://did sub-provider: {}", e);
-                        }
-                        tracing::info!("did-provider capsule from {}", path.display());
-                    }
-                    Err(e) => tracing::warn!("Failed to spawn did-provider: {}", e),
-                }
-            }
-        }
 
         let mut llama_endpoint: Option<String> = None;
         if let Some(path) = crate::find_installed_provider_binary("llama-provider") {
@@ -424,11 +424,13 @@ async fn setup_server_infrastructure_impl(
                     let object_provider: Arc<dyn provider::Provider> = Arc::new(
                         provider::CapsuleProvider::with_scheme(bridge.clone(), "object"),
                     );
-                    provider_registry.register(object_provider).await;
-                    tracing::info!(
-                        "object-provider capsule from {} registered as object provider",
-                        path.display()
-                    );
+                    if let Err(e) = provider_registry
+                        .register_sub_provider("object", object_provider)
+                        .await
+                    {
+                        tracing::warn!("Failed to register elastos://object sub-provider: {}", e);
+                    }
+                    tracing::info!("object-provider capsule from {}", path.display());
                 }
                 Err(e) => tracing::warn!("Failed to spawn object-provider: {}", e),
             }

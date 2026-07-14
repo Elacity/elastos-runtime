@@ -175,7 +175,7 @@ export function createLibraryRuntime({ getHomeToken }) {
   function uploadFailureMessage(xhr, envelope) {
     const body = String(envelope.message || envelope.error || xhr.responseText || "");
     if (xhr.status === 413 || /request entity too large|nginx/i.test(body)) {
-      return "Upload rejected by the public gateway body-size limit before Runtime accepted the object. Large files use Runtime chunked upload sessions; if this appears during a chunked upload, increase the edge proxy limit for /api/provider/object/upload/*/chunk or lower the configured chunk size.";
+      return "This file is too large for the current upload service.";
     }
     return body || `Library upload failed: ${xhr.status}`;
   }

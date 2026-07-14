@@ -80,11 +80,15 @@ async fn library_protected_content_test_state(cache_dir: &std::path::Path) -> Ga
     registry.register(Arc::new(MockKeyProvider)).await;
     registry.register(Arc::new(MockDecryptProvider)).await;
     registry
-        .register(Arc::new(crate::library::ObjectProvider::new(
-            cache_dir.to_path_buf(),
-            Arc::downgrade(&registry),
-        )))
-        .await;
+        .register_sub_provider(
+            "object",
+            Arc::new(crate::library::ObjectProvider::new(
+                cache_dir.to_path_buf(),
+                Arc::downgrade(&registry),
+            )),
+        )
+        .await
+        .unwrap();
     GatewayState {
         provider_registry: Some(registry),
         identity_manager: Arc::new(std::sync::OnceLock::new()),
@@ -101,10 +105,14 @@ async fn library_external_provider_test_state(cache_dir: &std::path::Path) -> Ga
         .await
         .unwrap();
     registry
-        .register(Arc::new(MockExternalObjectProvider {
-            data_dir: cache_dir.to_path_buf(),
-        }))
-        .await;
+        .register_sub_provider(
+            "object",
+            Arc::new(MockExternalObjectProvider {
+                data_dir: cache_dir.to_path_buf(),
+            }),
+        )
+        .await
+        .unwrap();
     GatewayState {
         provider_registry: Some(registry),
         identity_manager: Arc::new(std::sync::OnceLock::new()),
@@ -117,10 +125,14 @@ async fn library_webspace_test_state(cache_dir: &std::path::Path) -> GatewayStat
     seed_test_browser_capsules(cache_dir);
     let registry = Arc::new(ProviderRegistry::new());
     registry
-        .register(Arc::new(MockExternalObjectProvider {
-            data_dir: cache_dir.to_path_buf(),
-        }))
-        .await;
+        .register_sub_provider(
+            "object",
+            Arc::new(MockExternalObjectProvider {
+                data_dir: cache_dir.to_path_buf(),
+            }),
+        )
+        .await
+        .unwrap();
     registry
         .register(Arc::new(MockWebSpaceProvider::default()))
         .await;
@@ -151,11 +163,15 @@ async fn library_test_state_with_content(
             .unwrap();
     }
     registry
-        .register(Arc::new(crate::library::ObjectProvider::new(
-            cache_dir.to_path_buf(),
-            Arc::downgrade(&registry),
-        )))
-        .await;
+        .register_sub_provider(
+            "object",
+            Arc::new(crate::library::ObjectProvider::new(
+                cache_dir.to_path_buf(),
+                Arc::downgrade(&registry),
+            )),
+        )
+        .await
+        .unwrap();
     GatewayState {
         provider_registry: Some(registry),
         identity_manager: Arc::new(std::sync::OnceLock::new()),
@@ -478,6 +494,7 @@ mod documents;
 mod esp;
 #[path = "../gateway_browser_route_tests.rs"]
 mod gateway_browser_route_tests;
+mod gba;
 mod home_system;
 mod inspect;
 mod library;

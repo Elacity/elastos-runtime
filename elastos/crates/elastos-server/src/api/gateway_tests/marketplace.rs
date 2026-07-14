@@ -36,6 +36,14 @@ async fn test_marketplace_catalog_route_is_registered_and_auth_gated() {
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["schema"], "elastos.capsules.catalog/v1");
+    assert!(
+        payload["capsules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|capsule| capsule["name"] != "bus-v1-conformance"
+                && capsule["name"] != "marketplace")
+    );
 
     let marketplace_scoped_response = app
         .oneshot(

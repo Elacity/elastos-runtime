@@ -5,40 +5,42 @@
   "description": "Play GBA games",
   "role": "viewer",
   "type": "wasm",
+  "runtime_abi": "elastos.runtime-projection/v1",
+  "bus_contract": "elastos.runtime-projection/v1",
+  "execution": "web-projection",
+  "projections": ["web", "facts", "affordances", "gates"],
   "author": "elastos",
-  "entrypoint": "gba-emulator.wasm",
+  "entrypoint": "browser/index.html",
   "interfaces": [
     {
       "id": "elastos.gba.emulator",
       "version": "0.5.0",
-      "description": "GBA emulator projection for ROM launch, input, and save state",
+      "description": "Play compatible GBA games from Library",
       "methods": [
         {
-          "id": "rom.open",
-          "description": "Open a selected GBA content capsule or ROM object",
+          "id": "game.open",
+          "description": "Open a compatible GBA game",
           "risk": "launch",
           "approval": "runtime_policy",
           "audit": "event",
-          "resource": "elastos://gba/rom",
-          "operation": "open"
-        },
-        {
-          "id": "input.play",
-          "description": "Drive emulator input inside the launched viewer session",
-          "risk": "write",
-          "approval": "runtime_policy",
-          "audit": "summary",
-          "resource": "elastos://gba/input",
-          "operation": "play"
-        },
-        {
-          "id": "save.persist",
-          "description": "Persist emulator save data in the capsule storage namespace",
-          "risk": "write",
-          "approval": "runtime_policy",
-          "audit": "event",
-          "resource": "elastos://gba/save",
-          "operation": "persist"
+          "resource": "elastos://content/asset",
+          "operation": "open",
+          "input_schema": {
+            "schema": "elastos.gba.rom-open/v1",
+            "accepts": [
+              {
+                "kind": "content_capsule",
+                "role": "content",
+                "type": "data",
+                "viewer": "gba-emulator"
+              },
+              {
+                "kind": "file",
+                "extensions": [".gba"],
+                "mime": ["application/x-gba-rom", "application/octet-stream"]
+              }
+            ]
+          }
         }
       ]
     }
@@ -46,8 +48,11 @@
   "permissions": {
     "storage": ["localhost://Users/self/.AppData/LocalHost/GBA/*"]
   },
+  "requires": [
+    { "name": "object-provider", "kind": "capsule" }
+  ],
   "resources": {
-    "memory_mb": 128,
+    "memory_mb": 192,
     "gpu": false
   }
 }

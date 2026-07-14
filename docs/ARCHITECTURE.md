@@ -389,6 +389,7 @@ These are the current architectural decisions that matter most when reading the 
 |----------|-----|
 | Runtime stays small and trusted | Isolation, capabilities, signatures, and content trust are the TCB |
 | Shell-role surfaces are capsules, not part of the TCB | Policy can evolve without reclassifying UI code as trusted |
+| Executable WASM Components target `elastos.component/v1` and call `elastos:bus@v1` | Runtime owns Component loading, identity, capability/capacity checks, provider dispatch, and audit; WASI Preview 1 is not a product capsule ABI |
 | First-party provider UX converges under `elastos://` | The runtime should expose one native namespace, not a grab bag of unrelated top-level schemes |
 | Release trust is signature-based, not gateway-based | Transport can change; trust must come from signed artifacts and trusted publisher identity |
 | Carrier is a decentralized substrate, not the whole app contract | Capsules consume namespace/provider contracts, not implementation details like Kubo, QUIC, or cloudflared |
@@ -1043,9 +1044,8 @@ elastos-runtime/                        # Repo root
 │   ├── chat-room/                      # Browser Chat Room app capsule
 │   ├── chat-room-ui/                   # Shared Chat Room browser UI assets
 │   ├── chat/                           # Native P2P chat capsule
-│   ├── chat-wasm/                      # WASM chat capsule variant
-│   ├── gba-emulator/                   # GBA emulator web capsule
-│   ├── gba-ucity/                      # Data capsule with included ROM
+│   ├── gba-emulator/                   # Conditional viewer with one portable, lazy mGBA engine
+│   ├── gba-ucity/                      # GBA content capsule opened by gba-emulator
 │   ├── agent/                          # AI agent capsule
 │   ├── did-provider/                   # elastos://did/ identity provider
 │   ├── chain-provider/                 # elastos://chain/ typed chain provider
@@ -1067,7 +1067,8 @@ elastos-runtime/                        # Repo root
 │
 ├── scripts/                            # Dev convenience scripts
 │   ├── chat.sh                         # P2P chat launcher
-│   ├── gba.sh                          # GBA emulator launcher
+│   ├── gba-demo-smoke.sh               # Portable engine, viewer routes, and lifecycle proof
+│   ├── gba-linux-browser-smoke.sh       # Disposable Linux Chromium render/input/audio/save proof
 │   ├── home-demo-local.sh              # Local Home demo launcher
 │   ├── home-smoke.sh                   # Home browser smoke test
 │   └── share-demo.sh                   # Content sharing demo

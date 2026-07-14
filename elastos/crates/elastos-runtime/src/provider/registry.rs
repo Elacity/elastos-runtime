@@ -15,6 +15,14 @@ use tokio::sync::RwLock;
 use base64::Engine as _;
 use elastos_common::localhost::{parse_localhost_path, parse_localhost_uri};
 
+/// A route currently backed by the live Runtime provider registry.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ProviderRegistration {
+    pub route_kind: String,
+    pub route: String,
+    pub provider: String,
+}
+
 /// A resource request
 #[derive(Debug, Clone)]
 pub struct ResourceRequest {
@@ -469,6 +477,7 @@ const RESERVED_SUB_NAMES: &[&str] = &[
     "inspect",
     "availability",
     "block-graph",
+    "object",
 ];
 
 /// Registry of providers
@@ -703,6 +712,69 @@ impl ProviderRegistry {
     pub async fn has_provider(&self, scheme: &str) -> bool {
         let providers = self.providers.read().await;
         providers.contains_key(scheme)
+    }
+
+    /// Snapshot the routes actually registered in this Runtime process.
+    pub async fn registrations(&self) -> Vec<ProviderRegistration> {
+        let providers = self.providers.read().await;
+        let sub_providers = self.sub_providers.read().await;
+        let mut registrations = providers
+            .iter()
+            .map(|(route, provider)| ProviderRegistration {
+                route_kind: "scheme".to_string(),
+                route: route.clone(),
+                provider: provider.name().to_string(),
+            })
+            .chain(
+                sub_providers
+                    .iter()
+                    .map(|(route, provider)| ProviderRegistration {
+                        route_kind: "elastos-sub-provider".to_string(),
+                        route: route.clone(),
+                        provider: provider.name().to_string(),
+                    }),
+            )
+            .collect::<Vec<_>>();
+        registrations.sort_by(|left, right| {
+            left.route_kind
+                .cmp(&right.route_kind)
+                .then_with(|| left.route.cmp(&right.route))
+                .then_with(|| left.provider.cmp(&right.provider))
+        });
+        registrations
+    }
+
+    /// Resolve a declared URI namespace through the same live routing rules
+    /// used for provider requests.
+    pub async fn registration_for_uri(&self, uri: &str) -> Option<ProviderRegistration> {
+        let (scheme, path) = Self::parse_uri(uri).ok()?;
+        if scheme == "localhost" && Self::is_webspaces_localhost_path(&path) {
+            let provider = self.get("webspace").await?;
+            return Some(ProviderRegistration {
+                route_kind: "localhost-webspace".to_string(),
+                route: "webspace".to_string(),
+                provider: provider.name().to_string(),
+            });
+        }
+        if scheme == "elastos" {
+            let (route, _) = Self::split_sub_path(&path)?;
+            let provider = self.get_sub_provider(route).await?;
+            return Some(ProviderRegistration {
+                route_kind: "elastos-sub-provider".to_string(),
+                route: route.to_string(),
+                provider: provider.name().to_string(),
+            });
+        }
+        let provider = self.get(&scheme).await?;
+        Some(ProviderRegistration {
+            route_kind: "scheme".to_string(),
+            route: scheme,
+            provider: provider.name().to_string(),
+        })
+    }
+
+    pub async fn carrier_invoker_registered(&self) -> bool {
+        self.carrier_invoker.read().await.is_some()
     }
 
     /// Get total storage usage for a user (bytes).
@@ -1620,6 +1692,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registration_snapshot_uses_live_runtime_routes() {
+        let registry = ProviderRegistry::new();
+        registry.register(Arc::new(RawMockProvider)).await;
+        registry
+            .register_sub_provider_unchecked("ipfs", Arc::new(RawMockProvider))
+            .await;
+        registry
+            .providers
+            .write()
+            .await
+            .insert("webspace".to_string(), Arc::new(RawMockProvider));
+
+        let ipfs = registry
+            .registration_for_uri("elastos://ipfs/*")
+            .await
+            .unwrap();
+        assert_eq!(ipfs.route_kind, "elastos-sub-provider");
+        assert_eq!(ipfs.route, "ipfs");
+        let webspace = registry
+            .registration_for_uri("localhost://WebSpaces/*")
+            .await
+            .unwrap();
+        assert_eq!(webspace.route_kind, "localhost-webspace");
+        assert_eq!(webspace.route, "webspace");
+        assert_eq!(registry.registrations().await.len(), 3);
+    }
+
+    #[tokio::test]
     async fn test_registry_route() {
         let registry = ProviderRegistry::new();
         let provider = Arc::new(MockProvider::new());
@@ -2154,6 +2254,7 @@ mod tests {
             "decrypt",
             "availability",
             "block-graph",
+            "object",
         ] {
             registry
                 .register_sub_provider(name, Arc::new(MockProvider::new()))

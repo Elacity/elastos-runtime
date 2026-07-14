@@ -34,16 +34,12 @@ export function createLibraryDialog({
     const generalRows = [
       ["Name", object.name || "-"],
       ["Path", copyableValue(object.uri || "-", "path")],
-      ["UID", identity.objectId],
       ["Type", typeLabel],
       ["Opens with", viewers.join(", ") || "-"],
       ["Where", location || "-"],
       ["Size", isDirectory(object) ? "-" : formatBytes(object.size)],
       ["Modified", formatTime(object.modified_at)],
       ["Created", formatTime(object.created_at)],
-      ["SmartWeb Object", identity.kind],
-      ["Content ID", copyableValue(identity.contentId, "content CID")],
-      ["Published CID", copyableValue(identity.publishedId, "published CID")],
       ["Published Link", copyableValue(identity.publishedLink, "published link")],
       ["Placement", badgeValue(placement.label, placement.tone)],
       ["Visibility", badgeValue(visibility.label, visibility.tone)],
@@ -55,8 +51,12 @@ export function createLibraryDialog({
     if (object.metadata?.trash?.original_uri) {
       generalRows.push(["Original location", copyableValue(object.metadata.trash.original_uri, "original location")]);
     }
-    const runtimeRows = [
-      ["Provider", identity.provider],
+    const technicalRows = [
+      ["Object ID", identity.objectId],
+      ["Object kind", identity.kind],
+      ["Content ID", copyableValue(identity.contentId, "content ID")],
+      ["Published CID", copyableValue(identity.publishedId, "published CID")],
+      ["Service", identity.provider],
       ["Object URI", copyableValue(object.uri || "-", "object URI")],
       ["Content URI", copyableValue(identity.contentUri, "content URI")],
       ["Head", copyableValue(identity.headId, "object head")],
@@ -74,7 +74,7 @@ export function createLibraryDialog({
       ["Key Release", remoteAccess.keyRelease],
       ["Protection", object.blocked_reason || "ok"],
       ["Public Folder Policy", placement.policy],
-      ["Visibility Contract", object.metadata?.visibility?.schema || "elastos.library.visibility/v1"],
+      ["Visibility format", object.metadata?.visibility?.schema || "elastos.library.visibility/v1"],
     ];
     const archiveTab = archive.relevant
       ? `<div class="item-props-tab-btn antialiased disable-user-select" data-tab="archive">Archive</div>`
@@ -100,11 +100,11 @@ export function createLibraryDialog({
         <div class="item-props-tabview">
           <div class="item-props-tab">
             <div class="item-props-tab-btn antialiased disable-user-select item-props-tab-selected" data-tab="general">General</div>
-            <div class="item-props-tab-btn antialiased disable-user-select" data-tab="runtime">Runtime</div>
+            <div class="item-props-tab-btn antialiased disable-user-select" data-tab="technical">Technical</div>
             ${archiveTab}
           </div>
           ${propertiesPanel("general", generalRows, true)}
-          ${propertiesPanel("runtime", runtimeRows)}
+          ${propertiesPanel("technical", technicalRows)}
           ${archivePanel}
         </div>
         <div class="properties-window-actions">
@@ -236,15 +236,15 @@ export function createLibraryDialog({
     }
     if (placement === "runtime_private") {
       return {
-        label: "Runtime private",
+        label: "Private",
         tone: "readonly",
-        policy: "Runtime private objects are hidden from normal publishing.",
+        policy: "Private items are not published.",
       };
     }
     return {
       label: visibility.placement_label || "Private folder",
       tone: "private",
-      policy: "Private placement; publish creates an explicit content-provider receipt.",
+      policy: "Private until you publish it and create a shareable link.",
     };
   }
 
@@ -564,10 +564,16 @@ export function createLibraryDialog({
       <div class="dialog-card dialog-card-wide">
         <div>
           <p class="eyebrow">Availability</p>
-          <h2>${escapeHtml(object.name || "Object status")}</h2>
-          <p class="subtitle">${escapeHtml(shortUri(object.uri || ""))}</p>
+          <h2>${escapeHtml(object.name || "Item status")}</h2>
+          <p class="subtitle">Availability and sharing</p>
         </div>
         <div class="details">
+          <div><strong>Stored</strong><br>${object.published ? "Published" : "On this device"}</div>
+          <div><strong>Shared</strong><br>${object.shared ? "Yes" : "No"}</div>
+        </div>
+        <details class="details-json">
+          <summary>Technical details</summary>
+          <div class="details">
           <div><strong>SmartWeb Object</strong><br>${escapeHtml(identity.kind)}</div>
           <div><strong>Content URI</strong><br>${escapeHtml(identity.contentUri)}</div>
           <div><strong>Availability</strong><br>${escapeHtml(availabilitySummary.status)}</div>
@@ -589,31 +595,32 @@ export function createLibraryDialog({
           <div><strong>Payload</strong><br>${escapeHtml(contentSecurity?.published_payload || "-")}</div>
           <div><strong>Key Release</strong><br>${escapeHtml(remoteAccess.keyRelease || contentSecurity?.status || "not required")}</div>
           <div><strong>Revision</strong><br>${escapeHtml(object.revision || "-")}</div>
-        </div>
-        <div class="details-json">
+          </div>
+          <div class="details-json">
           <strong>Remote Access Policy</strong>
           <pre>${escapeHtml(JSON.stringify(remoteAccess.details, null, 2))}</pre>
-        </div>
-        ${protectedContent ? `<div class="details-json">
+          </div>
+          ${protectedContent ? `<div class="details-json">
           <strong>Protected Content Providers</strong>
           <pre>${escapeHtml(JSON.stringify(protectedContent, null, 2))}</pre>
-        </div>` : ""}
-        <div class="details-json">
+          </div>` : ""}
+          <div class="details-json">
           <strong>Availability Summary</strong>
           <pre>${escapeHtml(JSON.stringify(availabilitySummary.details, null, 2))}</pre>
-        </div>
-        <div class="details-json">
+          </div>
+          <div class="details-json">
           <strong>Share Grants / Key Release</strong>
           <pre>${escapeHtml(JSON.stringify({
             policy: record?.share_policy || null,
             grants: shareGrants,
             content_security: contentSecurity,
           }, null, 2))}</pre>
-        </div>
-        <div class="details-json">
+          </div>
+          <div class="details-json">
           <strong>Publish Receipt Summary</strong>
           <pre>${escapeHtml(JSON.stringify(safePublishReceiptSummary(receipt), null, 2))}</pre>
-        </div>
+          </div>
+        </details>
         <div class="button-row">
           <button class="btn" type="button" data-dialog-action="properties">Properties</button>
           <button class="btn btn-primary" type="button" data-dialog-close>Close</button>
@@ -641,50 +648,42 @@ export function createLibraryDialog({
       <div class="dialog-card dialog-card-wide">
         <div>
           <p class="eyebrow">Share</p>
-          <h2>${escapeHtml(object.name || "Published object")}</h2>
-          <p class="subtitle">A published content link is ready. Recipient-scoped grants are recorded by the Runtime provider when recipients are supplied.</p>
+          <h2>${escapeHtml(object.name || "Shared item")}</h2>
+          <p class="subtitle">Your share link is ready.</p>
         </div>
         <div class="details">
-          <div><strong>Policy</strong><br>${escapeHtml(policy)}</div>
+          <div><strong>Link</strong><br>${escapeHtml(uri || identity.contentUri)}</div>
           <div><strong>Recipients</strong><br>${escapeHtml(String(recipientCount))}</div>
-          <div><strong>Grants</strong><br>${escapeHtml(String(grantCount))}</div>
-          <div><strong>Content URI</strong><br>${escapeHtml(uri || identity.contentUri)}</div>
-          <div><strong>SmartWeb Object</strong><br>${escapeHtml(identity.kind)}</div>
-          <div><strong>Shared At</strong><br>${escapeHtml(formatTime(payload?.shared_at))}</div>
-          <div><strong>Availability</strong><br>${escapeHtml(availabilitySummary.status)}</div>
-          <div><strong>Live Proof</strong><br>${escapeHtml(availabilitySummary.liveProof)}</div>
-          <div><strong>Storage Market</strong><br>${escapeHtml(availabilitySummary.storageMarket)}</div>
-          <div><strong>Payload</strong><br>${escapeHtml(contentSecurity?.published_payload || "-")}</div>
-          <div><strong>Remote Open</strong><br>${escapeHtml(remoteAccess.openStatus)}</div>
-          <div><strong>Provider Chain</strong><br>${escapeHtml(protectedContent?.encrypted_recipient_sharing?.status || "-")}</div>
-          <div><strong>Key Release</strong><br>${escapeHtml(remoteAccess.keyRelease || keyRelease?.status || "not required")}</div>
-          <div><strong>Object</strong><br>${escapeHtml(shortUri(payload?.object_uri || object.uri || ""))}</div>
+          <div><strong>Shared</strong><br>${escapeHtml(formatTime(payload?.shared_at))}</div>
         </div>
-        <div class="details-json">
-          <strong>Remote Access Policy</strong>
-          <pre>${escapeHtml(JSON.stringify(remoteAccess.details, null, 2))}</pre>
-        </div>
-        ${protectedContent ? `<div class="details-json">
-          <strong>Protected Content Providers</strong>
-          <pre>${escapeHtml(JSON.stringify(protectedContent, null, 2))}</pre>
-        </div>` : ""}
-        <div class="details-json">
-          <strong>Availability Summary</strong>
-          <pre>${escapeHtml(JSON.stringify(availabilitySummary.details, null, 2))}</pre>
-        </div>
-        <div class="details-json">
-          <strong>Recipient Grants / Key Release</strong>
+        <details class="details-json">
+          <summary>Technical details</summary>
+          <div class="details">
+            <div><strong>Policy</strong><br>${escapeHtml(policy)}</div>
+            <div><strong>Grants</strong><br>${escapeHtml(String(grantCount))}</div>
+            <div><strong>Content URI</strong><br>${escapeHtml(uri || identity.contentUri)}</div>
+            <div><strong>SmartWeb Object</strong><br>${escapeHtml(identity.kind)}</div>
+            <div><strong>Availability</strong><br>${escapeHtml(availabilitySummary.status)}</div>
+            <div><strong>Live Proof</strong><br>${escapeHtml(availabilitySummary.liveProof)}</div>
+            <div><strong>Storage Market</strong><br>${escapeHtml(availabilitySummary.storageMarket)}</div>
+            <div><strong>Payload</strong><br>${escapeHtml(contentSecurity?.published_payload || "-")}</div>
+            <div><strong>Remote Open</strong><br>${escapeHtml(remoteAccess.openStatus)}</div>
+            <div><strong>Provider Chain</strong><br>${escapeHtml(protectedContent?.encrypted_recipient_sharing?.status || "-")}</div>
+            <div><strong>Key Release</strong><br>${escapeHtml(remoteAccess.keyRelease || keyRelease?.status || "not required")}</div>
+            <div><strong>Object</strong><br>${escapeHtml(shortUri(payload?.object_uri || object.uri || ""))}</div>
+          </div>
+          <strong>Share Receipt Summary</strong>
           <pre>${escapeHtml(JSON.stringify({
+            remote_access: remoteAccess.details,
+            protected_content: protectedContent,
+            availability: availabilitySummary.details,
             policy,
             grants: payload?.grants || [],
             key_release: keyRelease,
             content_security: contentSecurity,
+            receipt: safeShareReceiptSummary(payload),
           }, null, 2))}</pre>
-        </div>
-        <div class="details-json">
-          <strong>Share Receipt Summary</strong>
-          <pre>${escapeHtml(JSON.stringify(safeShareReceiptSummary(payload), null, 2))}</pre>
-        </div>
+        </details>
         <div class="button-row">
           <button class="btn" type="button" data-dialog-action="copy-share-link" data-share-uri="${escapeHtml(uri)}">Copy Link</button>
           <button class="btn" type="button" data-dialog-action="properties">Properties</button>
@@ -712,8 +711,8 @@ export function createLibraryDialog({
       <div class="dialog-card dialog-card-wide">
         <div>
           <p class="eyebrow">Access Check</p>
-          <h2>${escapeHtml(object.name || "Shared object")}</h2>
-          <p class="subtitle">Runtime checked this object against the signed Home principal. Recipient proof is injected by Runtime only when the launch grant matches the requested recipient.</p>
+          <h2>${escapeHtml(object.name || "Shared item")}</h2>
+          <p class="subtitle">Access was checked for this account.</p>
         </div>
         <div class="details">
           <div><strong>Decision</strong><br>${escapeHtml(decision.allowed === false ? "denied" : "allowed")}</div>
@@ -725,18 +724,14 @@ export function createLibraryDialog({
           <div><strong>Key Release</strong><br>${escapeHtml(remoteAccess.keyRelease || keyRelease?.status || "not required")}</div>
           <div><strong>Payload</strong><br>${escapeHtml(open.published_payload || "-")}</div>
         </div>
-        <div class="details-json">
-          <strong>Open Contract</strong>
-          <pre>${escapeHtml(JSON.stringify(open, null, 2))}</pre>
-        </div>
-        <div class="details-json">
-          <strong>Remote Access Policy</strong>
-          <pre>${escapeHtml(JSON.stringify(remoteAccess.details, null, 2))}</pre>
-        </div>
-        <div class="details-json">
-          <strong>Shared Access Receipt</strong>
-          <pre>${escapeHtml(JSON.stringify(access, null, 2))}</pre>
-        </div>
+        <details class="details-json">
+          <summary>Technical details</summary>
+          <pre>${escapeHtml(JSON.stringify({
+            open,
+            remote_access: remoteAccess.details,
+            receipt: access,
+          }, null, 2))}</pre>
+        </details>
         <div class="button-row">
           <button class="btn" type="button" data-dialog-action="properties">Properties</button>
           <button class="btn btn-primary" type="button" data-dialog-close>Close</button>
@@ -757,37 +752,41 @@ export function createLibraryDialog({
           <form data-share-form>
             <div>
               <p class="eyebrow">Share</p>
-              <h2>${escapeHtml(object.name || "Published object")}</h2>
-              <p class="subtitle">Choose a Runtime share policy. Public links are open to anyone with the published content URI. Recipient-scoped sharing records explicit grants and fails closed for other recipients.</p>
+              <h2>${escapeHtml(object.name || "Share item")}</h2>
+              <p class="subtitle">Choose who can access this item.</p>
             </div>
             <div class="share-options" role="radiogroup" aria-label="Share policy">
               <label class="share-option">
                 <input type="radio" name="sharePolicy" value="public_link" checked>
                 <span>
                   <strong>Public link</strong>
-                  <small>Copy one published content URI.</small>
+                  <small>Anyone with the link can open it.</small>
                 </span>
               </label>
               <label class="share-option">
                 <input type="radio" name="sharePolicy" value="recipient_scoped">
                 <span>
-                  <strong>Recipient scoped</strong>
-                  <small>Record grants for DIDs, principal ids, people ids, or addresses.</small>
+                  <strong>Specific people</strong>
+                  <small>Limit access to the people you name.</small>
                 </span>
               </label>
               <label class="share-option">
                 <input type="radio" name="sharePolicy" value="encrypted_recipient" disabled>
                 <span>
-                  <strong>Encrypted recipients</strong>
-                  <small>Requires drm/rights/key/decrypt providers and encrypted publish mode.</small>
+                  <strong>Protected sharing</strong>
+                  <small>Not available on this device.</small>
                 </span>
               </label>
             </div>
             <label class="dialog-field">
               <span>Recipients</span>
-              <textarea name="shareRecipients" rows="4" placeholder="did:..., person:..., principal:..., or name@example.com"></textarea>
+              <textarea name="shareRecipients" rows="4" placeholder="Name, email, or identity"></textarea>
             </label>
-            <p class="dialog-hint">Separate recipients with commas or new lines. Recipient-scoped access requires Runtime recipient proof; encrypted key release fails closed until drm/rights/key/decrypt providers and encrypted publish mode are configured.</p>
+            <p class="dialog-hint">Separate recipients with commas or new lines.</p>
+            <details class="details-json">
+              <summary>Technical details</summary>
+              <p>Specific-person sharing records recipient grants. Protected sharing requires rights, key-release, and decryption services.</p>
+            </details>
             <p class="dialog-error hidden" data-share-error></p>
             <div class="button-row">
               <button class="btn" type="button" data-dialog-close>Cancel</button>

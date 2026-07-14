@@ -2,7 +2,7 @@
   "schema": "elastos.capsule/v1",
   "name": "home",
   "version": "0.1.0",
-  "description": "Runtime-owned Home front door and active-shell host for ElastOS",
+  "description": "Open ElastOS and choose your Home view",
   "author": "elastos",
   "role": "app",
   "type": "wasm",
@@ -15,11 +15,11 @@
     {
       "id": "elastos.shell.host",
       "version": "0.5.0",
-      "description": "Front-door host for passkey unlock and active Home shell selection",
+      "description": "Sign in and choose the Home view shown after launch",
       "methods": [
         {
           "id": "auth.unlock",
-          "description": "Unlock the Home session with passkey-backed Runtime authority",
+          "description": "Unlock Home with your passkey",
           "risk": "read",
           "approval": "user",
           "audit": "event",
@@ -28,7 +28,7 @@
         },
         {
           "id": "shell.resolve",
-          "description": "Resolve and mount the active Home shell selected by Runtime state",
+          "description": "Open the selected Home view",
           "risk": "read",
           "approval": "runtime_policy",
           "audit": "summary",
@@ -37,7 +37,7 @@
         },
         {
           "id": "shell.switch",
-          "description": "Switch the active root Home shell through Runtime active-shell state",
+          "description": "Switch between available Home views",
           "risk": "privileged",
           "approval": "user",
           "audit": "event",

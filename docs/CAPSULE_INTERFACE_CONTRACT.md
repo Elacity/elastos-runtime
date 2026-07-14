@@ -16,7 +16,9 @@ Every capsule should be understood through these surfaces:
 | Web projection | Home launch targets from `/api/apps/home/summary` and `/api/apps/home/launch` | A web view is a projection. Launch authority comes from Runtime tokens. |
 | CLI projection | `home-cli` commands over Home, catalog, interface, service, approval, and ESP facts | CLI renders the same facts as GUI, emits host intents, and can attempt runtime-policy affordance invocation through the Runtime route. It does not bypass providers. |
 | Facts | `/api/capsules/catalog`, `/api/capsules/interfaces`, `/api/esp/initialize` | Facts are read-only projections and must tolerate unknown fields. |
+| Contract audit | `/api/capsules/contracts/audit` | A System launch token exposes Runtime's join of installed first-party manifests, live launch targets, provider registrations, Carrier availability, viewer relationships, and the generic affordance dispatcher. A non-empty error set returns HTTP 409. |
 | Affordances | Manifest-declared `interfaces[*].methods` projected through `/api/capsules/interfaces` | Affordances describe possible calls. They are not grants. |
+| Viewer bindings | Manifest `viewer` on `role=content` capsules, projected as `viewer`, `viewer_title`, and viewer-side `accepted_content` in `/api/capsules/catalog` and Home targets; viewer `input_schema.accepts` for Library object compatibility | Content-to-viewer compatibility is a Runtime fact. Viewers such as GBA Emulator do not guess; they accept content capsules that declare them as viewer. Viewers such as Documents and Archive also declare the Library object shapes they can open. |
 | Gate metadata | ESP verbs, method risk/gate descriptors, Runtime route policy, and Inspector gate preview | Route-specific Runtime gates decide authority. |
 | Audit / mirror view | Catalog trust/provenance fields plus System Inspector mirrors | Ordinary shells get redacted facts. Privileged mirrors stay System/Runtime-owned. |
 
@@ -33,9 +35,9 @@ projection that Runtime already knows.
 - `home-gui` renders desktop, windows, launcher, taskbar, and app chrome as
   trusted host-loaded GUI shell code in the current 0.5.0 implementation.
 - `home-cli` renders commands, context, capsule facts, affordances, gates, and
-  approval hints. Runtime-policy invoke attempts go through
-  `/api/capsules/interfaces/invoke`; user/high-risk methods stay blocked or move
-  through the owning approval surface.
+  approval hints. It lists and accepts generic invoke commands only when
+  Runtime reports `bindings[*].executable=true`; other methods remain readable
+  descriptions or move through their owning capability/approval surface.
 - Shells may ask Home to open a visible capsule with a typed host intent.
 - Shells must not call providers directly for authority-bearing effects.
 - Shells must not use ambient same-origin state to switch shells or dispatch
@@ -56,13 +58,75 @@ Those messages are local adapter details. The durable model is:
 Future Carrier transport must preserve the same schemas, gates, consent path,
 dispatch path, and audit semantics.
 
+## Invocation Bindings
+
+Every declared method remains visible in `/api/capsules/interfaces`, alongside
+one Runtime-derived binding record. A manifest declaration alone never makes a
+method callable.
+
+- `executable` means the generic Runtime invoke route has a concrete handler and
+  current policy permits the call.
+- `approval-required` means a handler exists but the generic route cannot
+  satisfy the required approval.
+- `provider-path-only` means a live provider and canonical Runtime action exist,
+  but the effect must use the capability-gated provider/Carrier path.
+- `descriptive-only`, `handler-unavailable`, and `unbound` are non-executable.
+
+`/api/capsules/interfaces/invoke` dispatches only Runtime bindings. It does not
+call `ProviderRegistry` directly. Provider operations retain their existing
+capability token, action mapping, approval, Carrier routing, and audit path.
+Home CLI uses the same binding records for both `invoke list` and command
+acceptance, and fails closed when a record is absent.
+
+## Product And Development Inventory
+
+`/api/capsules/catalog`, `/api/capsules/interfaces`, Home launch targets, System,
+Marketplace, and Home CLI use one product inventory: a capsule must have a valid
+manifest in the installed Runtime capsule tree and its name must be active in
+the installed `components.json`. Missing or invalid `components.json` fails
+closed. Checked-in source directories never make a capsule installed,
+launchable, or invokable.
+
+Home summary embeds those two projections and derives every capsule launcher
+target from the catalog. Content with a bound viewer is launchable through that
+viewer. The Runtime-owned People surface is the sole non-capsule Home target;
+Runtime emits it once as `home://people`, and shells do not synthesize it.
+Consumers may choose different presentation, but must preserve catalog roles,
+viewer/content links, requirements, provider namespaces, and interface binding
+availability without name-based inference.
+
+The System-token-only contract audit keeps repository evidence separate under
+its `development` field. That diagnostic inventory classifies source-only,
+active-but-uninstalled, invalid-installed, installed-inactive, and
+installed-active entries without projecting non-product entries into ordinary
+catalog facts.
+
+## Contract Audit
+
+The contract audit is derived at request time. It does not maintain a separate
+capsule or provider registry. Active first-party names come from
+`components.json` plus checked-in manifests; installed state comes from the
+runtime capsule tree; launch state comes from Home launch targets; provider and
+Carrier state comes from the live `ProviderRegistry`; and generic invocation
+bindings come from the same resolver used by
+`/api/capsules/interfaces/invoke`.
+
+The audit fails closed when an active first-party capsule is not installed, an
+installed capsule is inactive, source and installed manifests disagree, a
+manifest is invalid, a capsule requirement or viewer is unresolved, an external
+requirement has no artifact at its canonical platform install path, a provider
+namespace has no live registration, provider authority lacks a canonical
+Runtime action, or a method is presented as executable without a generic Runtime
+dispatch binding. User/high-risk, provider-path-only, and unbound descriptors
+remain visible; they are not reported as generically executable.
+
 ## Core 0.5.0 Capsule Descriptors
 
 The first manifest-declared affordance descriptors now cover all first-party
 app, viewer, shell, connector, content, and provider surfaces. The Home-facing
 set includes `home`, `home-gui`, `home-cli`, `browser`, `wallet`, `wallet-metamask`,
 `wallet-unisat`, `wallet-walletconnect`, `inbox`, `services`, `system`,
-`library`, `documents`, `archive-manager`, `chat-room`, `chat`, `chat-wasm`,
+`library`, `documents`, `archive-manager`, `chat-room`, `chat`,
 `agent`, `marketplace`, `gba-emulator`, and `gba-ucity`.
 
 These descriptors give shells a shared way to answer "what can this capsule ask
@@ -76,6 +140,12 @@ make the service-plane contract inspectable: Browser/Net/Exit infrastructure
 methods are runtime-policy gated, while direct signing, payment, key release,
 secret export, destructive storage, and protected-content render effects keep
 explicit user approval metadata.
+
+The Browser UI capsule is a component-bus capsule with web assets. It declares
+Browser-scoped page, display, exit selection, profile reset, and wallet-bridge
+affordances so shells can inspect the UX contract, but it does not receive raw
+Browser Engine, Exit, Net, Wallet, media relay, profile-storage, or cleanup
+authority. Those effects stay behind Runtime-owned provider routes and gates.
 
 ## Completion Rule
 

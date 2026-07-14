@@ -2,7 +2,7 @@
   "schema": "elastos.capsule/v1",
   "name": "home-cli",
   "version": "0.1.0",
-  "description": "Runtime-owned Home CLI shell over PTY, Home facts, and structured Home intents",
+  "description": "Terminal Home view for ElastOS",
   "author": "elastos",
   "role": "shell",
   "type": "wasm",
@@ -15,11 +15,11 @@
     {
       "id": "elastos.shell.cli",
       "version": "0.5.0",
-      "description": "Command shell over Runtime facts and structured Home intents",
+      "description": "Use ElastOS from a terminal",
       "methods": [
         {
           "id": "facts.search",
-          "description": "Search Home, capsule, interface, service, people, and Inbox facts",
+          "description": "Search apps, services, People, and Inbox",
           "risk": "read",
           "approval": "runtime_policy",
           "audit": "summary",
@@ -28,7 +28,7 @@
         },
         {
           "id": "capsule.open",
-          "description": "Ask Home to open a visible capsule through a structured Home intent",
+          "description": "Open an available app",
           "risk": "launch",
           "approval": "runtime_policy",
           "audit": "event",
@@ -37,7 +37,7 @@
         },
         {
           "id": "shell.switch",
-          "description": "Request an active root shell switch through Runtime active-shell state",
+          "description": "Switch to another Home view",
           "risk": "privileged",
           "approval": "user",
           "audit": "event",

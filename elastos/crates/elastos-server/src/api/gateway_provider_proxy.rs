@@ -82,7 +82,11 @@ pub(super) async fn gateway_library_upload(
             )
         }
     };
-    if registry.get("object").await.is_none() {
+    if registry
+        .registration_for_uri("elastos://object/*")
+        .await
+        .is_none()
+    {
         return gateway_provider_error_response(
             "object",
             anyhow::anyhow!("object provider unavailable"),
@@ -231,7 +235,11 @@ pub(super) async fn gateway_library_upload_start(
             )
         }
     };
-    if registry.get("object").await.is_none() {
+    if registry
+        .registration_for_uri("elastos://object/*")
+        .await
+        .is_none()
+    {
         return gateway_provider_error_response(
             "object",
             anyhow::anyhow!("object provider unavailable"),
@@ -400,7 +408,11 @@ pub(super) async fn gateway_library_upload_finish(
             )
         }
     };
-    if registry.get("object").await.is_none() {
+    if registry
+        .registration_for_uri("elastos://object/*")
+        .await
+        .is_none()
+    {
         return gateway_provider_error_response(
             "object",
             anyhow::anyhow!("object provider unavailable"),
@@ -634,7 +646,11 @@ pub(super) async fn gateway_library_download(
             )
         }
     };
-    if registry.get("object").await.is_none() {
+    if registry
+        .registration_for_uri("elastos://object/*")
+        .await
+        .is_none()
+    {
         return gateway_provider_error_response(
             "object",
             anyhow::anyhow!("object provider unavailable"),

@@ -26,6 +26,25 @@ fn required_test_string_array(
         .collect()
 }
 
+fn activate_test_capsule(data_dir: &std::path::Path, name: &str) {
+    let path = data_dir.join("components.json");
+    let mut components = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .unwrap_or_else(|| {
+            json!({
+                "external": {},
+                "capsules": {},
+                "profiles": {}
+            })
+        });
+    components["external"][name] = json!({
+        "install_path": format!("capsules/{name}"),
+        "platforms": {}
+    });
+    std::fs::write(path, serde_json::to_vec_pretty(&components).unwrap()).unwrap();
+}
+
 fn write_test_capsule_manifest(data_dir: &std::path::Path, name: &str) {
     let role = if name == GBA_EMULATOR_CAPSULE_ID {
         "viewer"
@@ -42,9 +61,17 @@ fn write_test_browser_capsule(
     description: &str,
     index_html: Option<&str>,
 ) {
+    activate_test_capsule(data_dir, name);
     let capsule_dir = data_dir.join("capsules").join(name);
     let browser_dir = capsule_dir.join("browser");
     std::fs::create_dir_all(&browser_dir).unwrap();
+    let permissions = if name == GBA_EMULATOR_CAPSULE_ID {
+        json!({
+            "storage": ["localhost://Users/self/.AppData/LocalHost/GBA/*"]
+        })
+    } else {
+        json!({})
+    };
     std::fs::write(
         capsule_dir.join("capsule.json"),
         serde_json::to_vec_pretty(&json!({
@@ -55,7 +82,8 @@ fn write_test_browser_capsule(
             "author": "elastos",
             "role": role,
             "type": "wasm",
-            "entrypoint": format!("{name}.wasm")
+            "entrypoint": format!("{name}.wasm"),
+            "permissions": permissions
         }))
         .unwrap(),
     )
@@ -85,6 +113,7 @@ fn write_test_static_capsule(
     description: &str,
     index_html: &str,
 ) {
+    activate_test_capsule(data_dir, name);
     let capsule_dir = data_dir.join("capsules").join(name);
     std::fs::create_dir_all(&capsule_dir).unwrap();
     std::fs::write(
@@ -105,6 +134,42 @@ fn write_test_static_capsule(
     std::fs::write(capsule_dir.join("index.html"), index_html).unwrap();
 }
 
+fn write_test_provider_capsule(
+    data_dir: &std::path::Path,
+    name: &str,
+    provides: &str,
+    description: &str,
+) {
+    activate_test_capsule(data_dir, name);
+    let capsule_dir = data_dir.join("capsules").join(name);
+    std::fs::create_dir_all(&capsule_dir).unwrap();
+    std::fs::write(
+        capsule_dir.join("capsule.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": "elastos.capsule/v1",
+            "name": name,
+            "version": "0.1.0",
+            "description": description,
+            "author": "elastos",
+            "role": "provider",
+            "type": "microvm",
+            "entrypoint": name,
+            "provides": provides,
+            "authority": {
+                "reason": "Test provider boundary",
+                "capabilities": [{
+                    "resource": provides,
+                    "actions": ["read"],
+                    "operations": ["status"]
+                }],
+                "audit_events": [format!("{name}.status")]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
 fn seed_test_browser_capsules(data_dir: &std::path::Path) {
     write_test_browser_capsule(
         data_dir,
@@ -122,6 +187,29 @@ fn seed_test_browser_capsules(data_dir: &std::path::Path) {
         "window.__TEST_HOME__ = true;",
     )
     .unwrap();
+
+    for (name, role, description) in [
+        ("home-gui", "shell", "Test Home GUI capsule"),
+        ("home-cli", "shell", "Test Home CLI capsule"),
+        ("wallet", "app", "Test Wallet capsule"),
+        ("browser", "app", "Test Browser capsule"),
+        ("wallet-metamask", "app", "Test MetaMask connector"),
+        ("wallet-unisat", "app", "Test UniSat connector"),
+        (
+            "wallet-walletconnect",
+            "app",
+            "Test WalletConnect connector",
+        ),
+    ] {
+        write_test_browser_capsule(data_dir, name, role, description, None);
+        write_test_wasm_entrypoint(data_dir, name);
+    }
+    write_test_provider_capsule(
+        data_dir,
+        "wallet-provider",
+        "elastos://wallet/*",
+        "Test Wallet provider",
+    );
 
     write_test_browser_capsule(
         data_dir,
@@ -202,6 +290,7 @@ fn write_test_viewer_capsule(
     entrypoint: &str,
     description: &str,
 ) {
+    activate_test_capsule(data_dir, name);
     let capsule_dir = data_dir.join("capsules").join(name);
     std::fs::create_dir_all(&capsule_dir).unwrap();
     std::fs::write(

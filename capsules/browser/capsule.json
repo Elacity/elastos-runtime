@@ -2,7 +2,7 @@
   "schema": "elastos.capsule/v1",
   "name": "browser",
   "version": "0.1.0",
-  "description": "Browse web sites through the ElastOS Browser boundary",
+  "description": "Browse websites with your chosen Browser Engine and Exit Node",
   "author": "elastos",
   "role": "app",
   "type": "wasm",
@@ -15,11 +15,11 @@
     {
       "id": "elastos.browser.page",
       "version": "0.5.0",
-      "description": "Browser page lifecycle through the Runtime Browser boundary",
+      "description": "Open and control web pages",
       "methods": [
         {
           "id": "page.open",
-          "description": "Open a page through the Runtime Browser engine and selected exit policy",
+          "description": "Open a page with the selected Browser Engine and Exit Node",
           "risk": "launch",
           "approval": "runtime_policy",
           "audit": "event",
@@ -28,7 +28,7 @@
         },
         {
           "id": "page.navigate",
-          "description": "Navigate an existing Browser page through Runtime-owned networking",
+          "description": "Go to another page",
           "risk": "read",
           "approval": "runtime_policy",
           "audit": "event",
@@ -37,7 +37,7 @@
         },
         {
           "id": "page.input",
-          "description": "Send validated input to the active Browser page through Runtime-owned control",
+          "description": "Send keyboard and pointer input to the page",
           "risk": "write",
           "approval": "runtime_policy",
           "audit": "summary",
@@ -46,7 +46,7 @@
         },
         {
           "id": "page.close",
-          "description": "Close the active Browser page and release Runtime-owned engine resources",
+          "description": "Close the active page",
           "risk": "write",
           "approval": "runtime_policy",
           "audit": "event",
@@ -55,7 +55,7 @@
         },
         {
           "id": "display.attach",
-          "description": "Attach Browser remote display audio/video through the Runtime WebRTC relay",
+          "description": "Connect video and audio from the Browser Engine",
           "risk": "read",
           "approval": "runtime_policy",
           "audit": "summary",
@@ -82,7 +82,7 @@
         },
         {
           "id": "wallet.request",
-          "description": "Forward a dapp wallet request into Runtime-owned Wallet and Inbox approval flow",
+          "description": "Send a website signing request to Wallet and Inbox",
           "risk": "payment",
           "approval": "user",
           "audit": "full",

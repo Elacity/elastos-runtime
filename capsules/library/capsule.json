@@ -2,7 +2,7 @@
   "schema": "elastos.capsule/v1",
   "name": "library",
   "version": "0.1.0",
-  "description": "Library for local files, folders, and published objects through the Runtime object provider",
+  "description": "Browse local files, folders, and published content",
   "role": "app",
   "type": "wasm",
   "runtime_abi": "elastos.runtime-projection/v1",
@@ -15,11 +15,11 @@
     {
       "id": "elastos.library.objects",
       "version": "0.5.0",
-      "description": "Library object browser and picker over Runtime object-provider facts",
+      "description": "Browse files and choose content for other apps",
       "methods": [
         {
           "id": "objects.browse",
-          "description": "Browse rooted-localhost objects through the Runtime object provider",
+          "description": "Browse your files and folders",
           "risk": "read",
           "approval": "runtime_policy",
           "audit": "summary",
@@ -28,7 +28,7 @@
         },
         {
           "id": "object.open",
-          "description": "Open a selected object with its Runtime-selected viewer",
+          "description": "Open a selected item with a compatible app",
           "risk": "read",
           "approval": "runtime_policy",
           "audit": "event",
@@ -37,7 +37,7 @@
         },
         {
           "id": "object.choose",
-          "description": "Return a selected object to the requesting capsule through Home intent routing",
+          "description": "Choose an item for the app that opened Library",
           "risk": "read",
           "approval": "user",
           "audit": "event",

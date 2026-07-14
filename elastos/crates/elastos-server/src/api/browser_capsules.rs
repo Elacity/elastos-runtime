@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use elastos_common::{CapsuleManifest, CapsuleRole, CapsuleType};
 
 use super::capsule_inventory::{
-    active_component_names, capsule_dir_candidates, capsule_roots, installed_capsule_is_inactive,
+    installed_active_capsule_dir, installed_capsules_root, list_active_capsule_manifests,
     load_capsule_manifest,
 };
 use super::gateway::{
@@ -101,36 +101,24 @@ async fn serve_browser_capsule_path(
 
 pub(crate) fn list_launchable_browser_capsules(data_dir: &Path) -> Vec<LaunchableBrowserCapsule> {
     let mut capsules = BTreeMap::new();
-    let active_components = active_component_names(data_dir);
-    for root in capsule_roots(data_dir) {
-        let Ok(entries) = std::fs::read_dir(root) else {
+    for manifest in list_active_capsule_manifests(data_dir) {
+        if !manifest.role.is_shell_launchable() {
+            continue;
+        }
+        if ensure_wallet_connector_configured(data_dir, &manifest.name).is_err() {
+            continue;
+        }
+        let Ok(capsule) = resolve_browser_capsule(data_dir, &manifest.name) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let dir = entry.path();
-            if !dir.is_dir() {
-                continue;
-            }
-            let Some(name) = dir.file_name().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            if installed_capsule_is_inactive(data_dir, &dir, name, active_components.as_ref()) {
-                continue;
-            }
-            let Ok(capsule) = resolve_browser_capsule(data_dir, name) else {
-                continue;
-            };
-            if !capsule.manifest.role.is_shell_launchable() {
-                continue;
-            }
-            capsules
-                .entry(capsule.manifest.name.clone())
-                .or_insert(LaunchableBrowserCapsule {
-                    name: capsule.manifest.name,
-                    description: capsule.manifest.description,
-                    role: capsule.manifest.role,
-                });
-        }
+        capsules.insert(
+            capsule.manifest.name.clone(),
+            LaunchableBrowserCapsule {
+                name: capsule.manifest.name,
+                description: capsule.manifest.description,
+                role: capsule.manifest.role,
+            },
+        );
     }
 
     capsules.into_values().collect()
@@ -138,43 +126,27 @@ pub(crate) fn list_launchable_browser_capsules(data_dir: &Path) -> Vec<Launchabl
 
 pub(crate) fn list_viewer_bound_capsules(data_dir: &Path, viewer: &str) -> Vec<ViewerBoundCapsule> {
     let mut capsules = BTreeMap::new();
-    let active_components = active_component_names(data_dir);
-    for root in capsule_roots(data_dir) {
-        let Ok(entries) = std::fs::read_dir(root) else {
+    let installed_root = installed_capsules_root(data_dir);
+    for manifest in list_active_capsule_manifests(data_dir) {
+        let dir = installed_root.join(&manifest.name);
+        if manifest.role != CapsuleRole::Content
+            || manifest.capsule_type != CapsuleType::Data
+            || manifest.viewer.as_deref() != Some(viewer)
+            || !dir.join(&manifest.entrypoint).is_file()
+            || !is_launchable_viewer_capsule(data_dir, viewer)
+        {
             continue;
-        };
-        for entry in entries.flatten() {
-            let dir = entry.path();
-            if !dir.is_dir() {
-                continue;
-            }
-            let Some(name) = dir.file_name().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            if installed_capsule_is_inactive(data_dir, &dir, name, active_components.as_ref()) {
-                continue;
-            }
-            let Some(manifest) = load_capsule_manifest(&dir, name) else {
-                continue;
-            };
-            if manifest.role != CapsuleRole::Content
-                || manifest.capsule_type != CapsuleType::Data
-                || manifest.viewer.as_deref() != Some(viewer)
-                || !dir.join(&manifest.entrypoint).is_file()
-                || !is_launchable_viewer_capsule(data_dir, viewer)
-            {
-                continue;
-            }
-            capsules
-                .entry(manifest.name.clone())
-                .or_insert(ViewerBoundCapsule {
-                    name: manifest.name,
-                    description: manifest.description,
-                    viewer: viewer.to_string(),
-                    entrypoint: manifest.entrypoint,
-                    storage: manifest.permissions.storage,
-                });
         }
+        capsules.insert(
+            manifest.name.clone(),
+            ViewerBoundCapsule {
+                name: manifest.name,
+                description: manifest.description,
+                viewer: viewer.to_string(),
+                entrypoint: manifest.entrypoint,
+                storage: manifest.permissions.storage,
+            },
+        );
     }
 
     capsules.into_values().collect()
@@ -202,24 +174,21 @@ pub(crate) fn resolve_viewer_bound_capsule(
     name: &str,
     viewer: &str,
 ) -> Option<ViewerBoundCapsule> {
-    for candidate in capsule_dir_candidates(data_dir, name) {
-        let Some(manifest) = load_capsule_manifest(&candidate, name) else {
-            continue;
-        };
-        if manifest.role == CapsuleRole::Content
-            && manifest.capsule_type == CapsuleType::Data
-            && manifest.viewer.as_deref() == Some(viewer)
-            && candidate.join(&manifest.entrypoint).is_file()
-            && is_launchable_viewer_capsule(data_dir, viewer)
-        {
-            return Some(ViewerBoundCapsule {
-                name: manifest.name,
-                description: manifest.description,
-                viewer: viewer.to_string(),
-                entrypoint: manifest.entrypoint,
-                storage: manifest.permissions.storage,
-            });
-        }
+    let candidate = installed_active_capsule_dir(data_dir, name)?;
+    let manifest = load_capsule_manifest(&candidate, name)?;
+    if manifest.role == CapsuleRole::Content
+        && manifest.capsule_type == CapsuleType::Data
+        && manifest.viewer.as_deref() == Some(viewer)
+        && candidate.join(&manifest.entrypoint).is_file()
+        && is_launchable_viewer_capsule(data_dir, viewer)
+    {
+        return Some(ViewerBoundCapsule {
+            name: manifest.name,
+            description: manifest.description,
+            viewer: viewer.to_string(),
+            entrypoint: manifest.entrypoint,
+            storage: manifest.permissions.storage,
+        });
     }
 
     None
@@ -230,17 +199,8 @@ pub(crate) fn is_viewer_capsule(data_dir: &Path, viewer: &str) -> bool {
 }
 
 fn resolve_browser_capsule(data_dir: &Path, app: &str) -> Result<BrowserCapsule, StatusCode> {
-    let active_components = active_component_names(data_dir);
-    for candidate in capsule_dir_candidates(data_dir, app) {
-        if installed_capsule_is_inactive(data_dir, &candidate, app, active_components.as_ref()) {
-            continue;
-        }
-        if let Some(capsule) = load_browser_capsule(&candidate, app) {
-            return Ok(capsule);
-        }
-    }
-
-    Err(StatusCode::NOT_FOUND)
+    let candidate = installed_active_capsule_dir(data_dir, app).ok_or(StatusCode::NOT_FOUND)?;
+    load_browser_capsule(&candidate, app).ok_or(StatusCode::NOT_FOUND)
 }
 
 fn is_launchable_viewer_capsule(data_dir: &Path, viewer: &str) -> bool {
@@ -283,7 +243,27 @@ mod tests {
     use crate::api::gateway::WALLET_WALLETCONNECT_CAPSULE_ID;
     use std::fs;
 
+    fn activate_test_capsule(data_dir: &Path, name: &str) {
+        let path = data_dir.join("components.json");
+        let mut components = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "external": {},
+                    "capsules": {},
+                    "profiles": {}
+                })
+            });
+        components["external"][name] = serde_json::json!({
+            "install_path": format!("capsules/{name}"),
+            "platforms": {}
+        });
+        fs::write(path, serde_json::to_vec_pretty(&components).unwrap()).unwrap();
+    }
+
     fn write_test_browser_capsule(data_dir: &Path, name: &str, description: &str, role: &str) {
+        activate_test_capsule(data_dir, name);
         let capsule_dir = data_dir.join("capsules").join(name);
         fs::create_dir_all(&capsule_dir).unwrap();
         fs::write(
@@ -305,6 +285,7 @@ mod tests {
     }
 
     fn write_test_wasm_browser_capsule(data_dir: &Path, name: &str, description: &str, role: &str) {
+        activate_test_capsule(data_dir, name);
         let capsule_dir = data_dir.join("capsules").join(name);
         let browser_dir = capsule_dir.join("browser");
         fs::create_dir_all(&browser_dir).unwrap();
@@ -333,6 +314,7 @@ mod tests {
         entrypoint: &str,
         description: &str,
     ) {
+        activate_test_capsule(data_dir, name);
         let capsule_dir = data_dir.join("capsules").join(name);
         fs::create_dir_all(&capsule_dir).unwrap();
         fs::write(
@@ -431,6 +413,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn source_only_capsules_are_not_apps_or_viewer_content() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_test_components_manifest(data_dir.path(), &["browser", "gba-emulator", "gba-ucity"]);
+
+        assert!(resolve_browser_capsule(data_dir.path(), "browser").is_err());
+        assert!(resolve_browser_capsule(data_dir.path(), "gba-emulator").is_err());
+        assert!(
+            resolve_viewer_bound_capsule(data_dir.path(), "gba-ucity", "gba-emulator").is_none()
+        );
+        assert!(list_launchable_browser_capsules(data_dir.path()).is_empty());
+    }
+
     #[tokio::test]
     async fn browser_capsule_assets_include_cross_origin_isolation_headers() {
         let data_dir = tempfile::tempdir().unwrap();
@@ -513,6 +508,21 @@ mod tests {
             serve_browser_capsule_path(data_dir.path(), WALLET_WALLETCONNECT_CAPSULE_ID, None)
                 .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn unconfigured_walletconnect_browser_capsule_is_not_launchable() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_test_browser_capsule(
+            data_dir.path(),
+            WALLET_WALLETCONNECT_CAPSULE_ID,
+            "WalletConnect",
+            "app",
+        );
+
+        assert!(!list_launchable_browser_capsules(data_dir.path())
+            .iter()
+            .any(|capsule| capsule.name == WALLET_WALLETCONNECT_CAPSULE_ID));
     }
 
     #[test]

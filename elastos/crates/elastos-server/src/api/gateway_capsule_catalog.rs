@@ -5,9 +5,18 @@ use serde::{Deserialize, Serialize};
 
 use super::*;
 
+#[path = "gateway_capsule_catalog/bindings.rs"]
+mod bindings;
+#[path = "gateway_capsule_catalog/contract_audit.rs"]
+mod contract_audit;
 #[path = "gateway_capsule_catalog/read_model.rs"]
 mod read_model;
 
+use bindings::{
+    resolve_capsule_method_binding, static_capsule_method_binding, RuntimeCapsuleAffordanceBinding,
+};
+#[cfg(test)]
+pub(super) use read_model::CapsuleCatalogResponse;
 pub(super) use read_model::{capsule_catalog_summary, capsule_interface_registry_summary};
 
 const CAPSULE_INTERFACE_INVOKE_RESULT_SCHEMA: &str = "elastos.capsules.invoke-result/v1";
@@ -31,7 +40,65 @@ pub(super) async fn capsule_interfaces(
     headers: HeaderMap,
 ) -> Response {
     match require_capsule_catalog_token(&state.data_dir, &headers) {
-        Ok(_) => Json(capsule_interface_registry_summary(&state.data_dir)).into_response(),
+        Ok(_) => Json(
+            capsule_interface_registry_summary_with_bindings(
+                &state.data_dir,
+                state.provider_registry.as_deref(),
+            )
+            .await,
+        )
+        .into_response(),
+        Err(err) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+pub(super) async fn capsule_interface_registry_summary_with_bindings(
+    data_dir: &std::path::Path,
+    registry: Option<&elastos_runtime::provider::ProviderRegistry>,
+) -> read_model::CapsuleInterfaceRegistryResponse {
+    let mut summary = capsule_interface_registry_summary(data_dir);
+    for entry in &mut summary.interfaces {
+        let mut bindings = Vec::with_capacity(entry.interface.methods.len());
+        for method in &entry.interface.methods {
+            bindings.push(
+                resolve_capsule_method_binding(method, registry)
+                    .await
+                    .summary,
+            );
+        }
+        entry.bindings = bindings;
+    }
+    summary.counts.executable_methods = summary
+        .interfaces
+        .iter()
+        .flat_map(|entry| entry.bindings.iter())
+        .filter(|binding| binding.executable)
+        .count();
+    summary
+}
+
+pub(super) fn capsule_affordance_static_executable(method: &CapsuleAffordanceDescriptor) -> bool {
+    static_capsule_method_binding(method).summary.executable
+}
+
+pub(super) async fn capsule_contract_audit(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response {
+    match require_home_launch_token_context(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
+        Ok(_) => {
+            let report = contract_audit::capsule_contract_audit_summary(&state).await;
+            let status = if report.ok {
+                StatusCode::OK
+            } else {
+                StatusCode::CONFLICT
+            };
+            (status, Json(report)).into_response()
+        }
         Err(err) => (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": err.to_string() })),
@@ -78,6 +145,8 @@ pub(super) async fn capsule_interface_invoke(
         resolved.method.id,
         now_ts()
     );
+    let binding =
+        resolve_capsule_method_binding(&resolved.method, state.provider_registry.as_deref()).await;
     if let Err(err) = append_provider_effect_audit(
         &state.data_dir,
         ProviderEffectAuditInput {
@@ -101,8 +170,15 @@ pub(super) async fn capsule_interface_invoke(
         );
     }
 
-    let output = match enforce_affordance_invocation_policy(&resolved) {
-        Ok(()) => match dispatch_capsule_affordance(&state, &context, &resolved, &request).await {
+    let output = if binding.summary.executable {
+        match dispatch_capsule_affordance(
+            &state,
+            &context,
+            &request,
+            binding.runtime_binding.expect("executable Runtime binding"),
+        )
+        .await
+        {
             Ok(output) => output,
             Err((status, code, message)) => {
                 let _ = append_provider_effect_audit(
@@ -119,22 +195,37 @@ pub(super) async fn capsule_interface_invoke(
                 );
                 return capsule_invoke_error(&resolved, status, code, &message);
             }
-        },
-        Err((status, code, message)) => {
-            let _ = append_provider_effect_audit(
-                &state.data_dir,
-                ProviderEffectAuditInput {
-                    capsule_id: &resolved.capsule,
-                    event_type: "capsule.affordance.failed",
-                    principal_id: &context.principal_id,
-                    session_id: &context.session_id,
-                    request_id: &request_id,
-                    result: "failed",
-                    reason: message,
-                },
-            );
-            return capsule_invoke_error(&resolved, status, code, message);
         }
+    } else {
+        let approval_required = binding.summary.state == "approval-required";
+        let status = if approval_required {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::NOT_IMPLEMENTED
+        };
+        let code = if approval_required {
+            "approval_required"
+        } else {
+            "affordance_not_bound"
+        };
+        let message = binding
+            .summary
+            .reason
+            .as_deref()
+            .unwrap_or("method is not executable through generic interface invocation");
+        let _ = append_provider_effect_audit(
+            &state.data_dir,
+            ProviderEffectAuditInput {
+                capsule_id: &resolved.capsule,
+                event_type: "capsule.affordance.failed",
+                principal_id: &context.principal_id,
+                session_id: &context.session_id,
+                request_id: &request_id,
+                result: "failed",
+                reason: message,
+            },
+        );
+        return capsule_invoke_error(&resolved, status, code, message);
     };
 
     if let Err(err) = append_provider_effect_audit(
@@ -227,10 +318,10 @@ fn resolve_capsule_affordance(
     })
 }
 
-fn enforce_affordance_invocation_policy(
-    resolved: &ResolvedCapsuleAffordance,
+fn affordance_invocation_policy(
+    method: &CapsuleAffordanceDescriptor,
 ) -> Result<(), (StatusCode, &'static str, &'static str)> {
-    if resolved.method.approval == AffordanceApprovalMode::User {
+    if method.approval == AffordanceApprovalMode::User {
         return Err((
             StatusCode::FORBIDDEN,
             "approval_required",
@@ -238,7 +329,7 @@ fn enforce_affordance_invocation_policy(
         ));
     }
     if matches!(
-        resolved.method.risk,
+        method.risk,
         AffordanceRisk::Payment
             | AffordanceRisk::Rights
             | AffordanceRisk::Actuator
@@ -256,13 +347,11 @@ fn enforce_affordance_invocation_policy(
 async fn dispatch_capsule_affordance(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
-    resolved: &ResolvedCapsuleAffordance,
     request: &CapsuleInterfaceInvokeRequest,
+    binding: RuntimeCapsuleAffordanceBinding,
 ) -> Result<serde_json::Value, (StatusCode, &'static str, String)> {
-    let resource = resolved.method.resource.as_deref().unwrap_or_default();
-    let operation = resolved.method.operation.as_deref().unwrap_or_default();
-    match (resource, operation) {
-        ("elastos://capsules/*", "list") => {
+    match binding {
+        RuntimeCapsuleAffordanceBinding::CatalogList => {
             serde_json::to_value(capsule_catalog_summary(&state.data_dir))
                 .map(|catalog| serde_json::json!({ "catalog": catalog }))
                 .map_err(|err| {
@@ -273,17 +362,9 @@ async fn dispatch_capsule_affordance(
                     )
                 })
         }
-        ("elastos://capsules/*", "launch") => {
+        RuntimeCapsuleAffordanceBinding::CapsuleLaunch => {
             dispatch_capsule_launch_affordance(state, context, request).await
         }
-        _ => Err((
-            StatusCode::NOT_IMPLEMENTED,
-            "affordance_not_bound",
-            format!(
-                "{} is declared but not yet bound to a Runtime/provider handler",
-                resolved.method.id
-            ),
-        )),
     }
 }
 
@@ -340,6 +421,9 @@ async fn dispatch_capsule_launch_affordance(
     let launch =
         launch_runtime_backed_home_target(&state.data_dir, target_summary.target.as_str(), context)
             .await;
+    if let Some(message) = runtime_launch_failure(launch.as_ref()) {
+        return Err((StatusCode::BAD_GATEWAY, "runtime_launch_failed", message));
+    }
     let route = append_home_launch_token(
         &state.data_dir,
         &target_summary.route,
@@ -366,6 +450,16 @@ async fn dispatch_capsule_launch_affordance(
         "launch_detail": launch.as_ref().and_then(|summary| summary.detail.clone()),
         "capsule_id": launch.and_then(|summary| summary.capsule_id),
     }))
+}
+
+fn runtime_launch_failure(launch: Option<&GatewayRuntimeLaunchOutcome>) -> Option<String> {
+    let failed = launch.filter(|launch| launch.status == "failed")?;
+    Some(
+        failed
+            .detail
+            .clone()
+            .unwrap_or_else(|| "Runtime launch failed".to_string()),
+    )
 }
 
 fn capsule_invoke_error(
@@ -420,9 +514,119 @@ struct ResolvedCapsuleAffordance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use elastos_common::CapsuleExecution;
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct BindingProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl elastos_runtime::provider::Provider for BindingProvider {
+        async fn handle(
+            &self,
+            _request: elastos_runtime::provider::ResourceRequest,
+        ) -> Result<
+            elastos_runtime::provider::ResourceResponse,
+            elastos_runtime::provider::ProviderError,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(elastos_runtime::provider::ResourceResponse::Ok)
+        }
+
+        fn schemes(&self) -> Vec<&'static str> {
+            Vec::new()
+        }
+
+        fn name(&self) -> &'static str {
+            "binding-provider"
+        }
+    }
+
+    fn activate_test_capsule(data_dir: &std::path::Path, name: &str) {
+        let path = data_dir.join("components.json");
+        let mut components = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "external": {},
+                    "capsules": {},
+                    "profiles": {}
+                })
+            });
+        components["external"][name] = serde_json::json!({
+            "install_path": format!("capsules/{name}"),
+            "platforms": {}
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&components).unwrap()).unwrap();
+    }
+
+    fn copy_test_tree(source: &std::path::Path, target: &std::path::Path) {
+        if source.is_dir() {
+            fs::create_dir_all(target).unwrap();
+            for entry in fs::read_dir(source).unwrap().flatten() {
+                copy_test_tree(&entry.path(), &target.join(entry.file_name()));
+            }
+        } else {
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::copy(source, target).unwrap();
+        }
+    }
+
+    fn install_active_first_party_capsules(data_dir: &std::path::Path) {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let components: crate::setup::ComponentsManifest =
+            serde_json::from_slice(&fs::read(repo.join("components.json")).unwrap()).unwrap();
+        let registered = components
+            .external
+            .keys()
+            .chain(components.capsules.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        fs::copy(
+            repo.join("components.json"),
+            data_dir.join("components.json"),
+        )
+        .unwrap();
+        for manifest in crate::api::capsule_inventory::list_development_capsule_manifests() {
+            if !registered.contains(&manifest.name) {
+                continue;
+            }
+            activate_test_capsule(data_dir, &manifest.name);
+            let source = repo.join("capsules").join(&manifest.name);
+            let target = data_dir.join("capsules").join(&manifest.name);
+            copy_test_tree(&source.join("capsule.json"), &target.join("capsule.json"));
+            if source.join("browser").is_dir() {
+                copy_test_tree(&source.join("browser"), &target.join("browser"));
+            }
+            if source.join(&manifest.entrypoint).is_file() {
+                copy_test_tree(
+                    &source.join(&manifest.entrypoint),
+                    &target.join(&manifest.entrypoint),
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn capsule_contract_audit_requires_a_system_launch_token() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let state = GatewayState {
+            provider_registry: None,
+            identity_manager: Arc::new(std::sync::OnceLock::new()),
+            cache_dir: data_dir.path().to_path_buf(),
+            data_dir: data_dir.path().to_path_buf(),
+        };
+        let response = capsule_contract_audit(State(state), HeaderMap::new()).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 
     fn write_capsule(data_dir: &std::path::Path, name: &str, role: &str, capsule_type: &str) {
+        activate_test_capsule(data_dir, name);
         let dir = data_dir.join("capsules").join(name);
         fs::create_dir_all(&dir).unwrap();
         let entrypoint = match capsule_type {
@@ -430,20 +634,32 @@ mod tests {
             "microvm" => "rootfs.ext4".to_string(),
             _ => "index.html".to_string(),
         };
+        let mut manifest = serde_json::json!({
+            "schema": "elastos.capsule/v1",
+            "name": name,
+            "version": "0.1.0",
+            "description": format!("{name} test capsule"),
+            "author": "elastos",
+            "role": role,
+            "type": capsule_type,
+            "entrypoint": entrypoint,
+            "signature": "test-signature"
+        });
+        if role == "provider" {
+            manifest["provides"] = serde_json::json!(format!("elastos://{name}/*"));
+            manifest["authority"] = serde_json::json!({
+                "reason": "Test provider boundary",
+                "capabilities": [{
+                    "resource": format!("elastos://{name}/*"),
+                    "actions": ["read"],
+                    "operations": ["status"]
+                }],
+                "audit_events": [format!("{name}.status")]
+            });
+        }
         fs::write(
             dir.join("capsule.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "schema": "elastos.capsule/v1",
-                "name": name,
-                "version": "0.1.0",
-                "description": format!("{name} test capsule"),
-                "author": "elastos",
-                "role": role,
-                "type": capsule_type,
-                "entrypoint": entrypoint,
-                "signature": "test-signature"
-            }))
-            .unwrap(),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
         if capsule_type == "wasm" {
@@ -456,6 +672,7 @@ mod tests {
     }
 
     fn write_capsule_json(data_dir: &std::path::Path, name: &str, manifest: serde_json::Value) {
+        activate_test_capsule(data_dir, name);
         let dir = data_dir.join("capsules").join(name);
         fs::create_dir_all(&dir).unwrap();
         fs::write(
@@ -528,6 +745,7 @@ mod tests {
             .find(|capsule| capsule.name == "object-provider")
             .unwrap();
         assert!(!provider.launchable);
+        assert_eq!(provider.title, "Storage");
         assert_eq!(provider.projection.web.state, "provider-only");
         assert_eq!(provider.projection.carrier.state, "service-endpoint");
         assert!(provider.repository.is_none());
@@ -616,19 +834,32 @@ mod tests {
         assert!(registry.counts.capsules >= 1);
         assert!(registry.counts.interfaces >= 1);
         assert!(registry.counts.methods >= 2);
+        assert!(registry.counts.executable_methods >= 2);
         let marketplace_registry = registry
             .interfaces
             .iter()
             .find(|interface| interface.capsule == "marketplace")
             .unwrap();
         assert_eq!(marketplace_registry.interface.methods[1].id, "capsule.open");
+        assert_eq!(marketplace_registry.bindings.len(), 2);
+        for (method, binding) in marketplace_registry
+            .interface
+            .methods
+            .iter()
+            .zip(&marketplace_registry.bindings)
+        {
+            assert_eq!(binding.method, method.id);
+            assert!(binding.executable);
+            assert_eq!(binding.handler_kind.as_deref(), Some("runtime"));
+        }
         assert_eq!(registry.policy.invocation_state, "runtime-gated");
     }
 
     #[test]
     fn first_party_capsules_have_complete_projection_contract() {
         let data_dir = tempfile::tempdir().unwrap();
-        let manifests = crate::api::capsule_inventory::list_capsule_manifests(data_dir.path());
+        install_active_first_party_capsules(data_dir.path());
+        let manifests = crate::api::capsule_inventory::list_development_capsule_manifests();
         let manifest_names = manifests
             .iter()
             .map(|manifest| manifest.name.as_str())
@@ -646,12 +877,14 @@ mod tests {
             .iter()
             .map(|capsule| capsule.name.as_str())
             .collect::<BTreeSet<_>>();
-        for name in &manifest_names {
-            assert!(
-                catalog_names.contains(name),
-                "first-party capsule {name} was missing from the Runtime catalog"
-            );
-        }
+        let active = crate::api::capsule_inventory::active_capsule_names(data_dir.path()).unwrap();
+        let active_names = active.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        let expected = manifest_names
+            .intersection(&active_names)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(catalog_names, expected);
+        assert!(!catalog_names.contains("bus-v1-conformance"));
 
         let catalog_interface_count = catalog
             .capsules
@@ -700,10 +933,97 @@ mod tests {
             .iter()
             .find(|capsule| capsule.name == "home-gui")
             .expect("home-gui must remain a first-party shell identity");
-        assert!(
-            home_gui.description.contains("host-loaded"),
-            "home-gui must be described as host-loaded until it has a true isolated shell attach path"
+        assert_eq!(home_gui.execution, Some(CapsuleExecution::WebProjection));
+        assert_eq!(
+            home_gui.bus_contract.as_deref(),
+            Some("elastos.runtime-projection/v1")
         );
+        let gba = catalog
+            .capsules
+            .iter()
+            .find(|capsule| capsule.name == "gba-emulator")
+            .expect("installed active GBA viewer must remain in the product catalog");
+        assert_eq!(gba.role, CapsuleRole::Viewer);
+        assert!(gba.installed);
+        assert!(gba.launchable);
+        assert_eq!(gba.accepted_content.len(), 1);
+        assert_eq!(gba.accepted_content[0].name, "gba-ucity");
+        let ucity = catalog
+            .capsules
+            .iter()
+            .find(|capsule| capsule.name == "gba-ucity")
+            .expect("installed active uCity demo must remain in the product catalog");
+        assert_eq!(ucity.role, CapsuleRole::Content);
+        assert_eq!(ucity.viewer.as_deref(), Some("gba-emulator"));
+        assert!(ucity.launchable);
+        assert_eq!(ucity.launch_target.as_deref(), Some("gba-ucity"));
+
+        let by_name = catalog
+            .capsules
+            .iter()
+            .map(|capsule| (capsule.name.as_str(), capsule))
+            .collect::<BTreeMap<_, _>>();
+        for (name, role) in [
+            ("browser", CapsuleRole::App),
+            ("wallet", CapsuleRole::App),
+            ("documents", CapsuleRole::Viewer),
+            ("archive-manager", CapsuleRole::Viewer),
+            ("home-cli", CapsuleRole::Shell),
+            ("home-gui", CapsuleRole::Shell),
+            ("object-provider", CapsuleRole::Provider),
+            ("wallet-provider", CapsuleRole::Provider),
+            ("net-provider", CapsuleRole::Provider),
+            ("exit-provider", CapsuleRole::Provider),
+        ] {
+            assert_eq!(by_name[name].role, role, "wrong canonical role for {name}");
+        }
+        assert_eq!(
+            by_name["browser"]
+                .requires
+                .iter()
+                .map(|requirement| requirement.name.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "browser-engine-adapter",
+                "exit-provider",
+                "net-provider",
+                "wallet-provider",
+            ])
+        );
+        assert_eq!(
+            by_name["gba-emulator"]
+                .requires
+                .iter()
+                .map(|requirement| requirement.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["object-provider"]
+        );
+        assert_eq!(by_name["chat"].projection.cli.state, "available");
+        assert_eq!(by_name["browser"].projection.cli.state, "facts-only");
+
+        let home_targets = home_targets_from_catalog(&catalog);
+        let target_names = home_targets
+            .iter()
+            .map(|target| target.target.as_str())
+            .collect::<BTreeSet<_>>();
+        let expected_targets = catalog
+            .capsules
+            .iter()
+            .filter(|capsule| capsule.launchable)
+            .filter(|capsule| capsule.role != CapsuleRole::Shell)
+            .filter(|capsule| is_home_visible_target(&capsule.name))
+            .map(|capsule| capsule.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(target_names, expected_targets);
+        for target in &home_targets {
+            let capsule = by_name[target.target.as_str()];
+            assert_eq!(target.title, capsule.title);
+            assert_eq!(target.description, capsule.description);
+            assert_eq!(target.route.as_str(), capsule.route.as_deref().unwrap());
+            assert_eq!(target.role, capsule.role);
+            assert_eq!(target.viewer, capsule.viewer);
+            assert_eq!(target.viewer_title, capsule.viewer_title);
+        }
 
         for capsule in &catalog.capsules {
             let projection = &capsule.projection;
@@ -810,11 +1130,33 @@ mod tests {
                 "interface registry referenced unknown capsule {}",
                 interface.capsule
             );
+            let capsule = by_name[interface.capsule.as_str()];
+            assert_eq!(interface.capsule_version, capsule.version);
+            assert_eq!(interface.title, capsule.title);
+            assert_eq!(interface.role, capsule.role);
+            assert_eq!(interface.capsule_type, capsule.capsule_type);
+            assert_eq!(interface.runtime_abi, capsule.runtime_abi);
+            assert_eq!(interface.execution, capsule.execution);
+            assert_eq!(interface.trust_state, capsule.trust_state);
             assert!(
                 !interface.interface.id.trim().is_empty(),
                 "interface registry contained an empty interface id for {}",
                 interface.capsule
             );
+        }
+        for (capsule_name, extension) in [
+            ("gba-emulator", ".gba"),
+            ("documents", ".md"),
+            ("archive-manager", ".zip"),
+        ] {
+            assert!(registry
+                .interfaces
+                .iter()
+                .filter(|interface| interface.capsule == capsule_name)
+                .flat_map(|interface| interface.interface.methods.iter())
+                .filter_map(|method| method.input_schema.as_ref())
+                .any(|schema| schema.to_string().contains(extension)),
+                "{capsule_name} must expose {extension} acceptance through the canonical interface registry");
         }
     }
 
@@ -861,6 +1203,167 @@ mod tests {
         assert_eq!(resolved.method.id, "catalog.list");
     }
 
+    #[tokio::test]
+    async fn capsule_method_bindings_distinguish_runtime_provider_and_descriptive_methods() {
+        let runtime_method = CapsuleAffordanceDescriptor {
+            id: "capsule.open".to_string(),
+            description: None,
+            risk: AffordanceRisk::Launch,
+            approval: AffordanceApprovalMode::RuntimePolicy,
+            audit: elastos_common::AffordanceAuditMode::Event,
+            resource: Some("elastos://capsules/*".to_string()),
+            operation: Some("launch".to_string()),
+            input_schema: None,
+            output_schema: None,
+        };
+        let runtime = resolve_capsule_method_binding(&runtime_method, None).await;
+        assert_eq!(runtime.summary.state, "executable");
+        assert!(runtime.summary.handler_available);
+        assert!(runtime.summary.executable);
+        assert_eq!(
+            runtime.summary.handler.as_deref(),
+            Some("runtime.capsule.launch")
+        );
+
+        let descriptive = CapsuleAffordanceDescriptor {
+            id: "capsule.describe".to_string(),
+            resource: None,
+            operation: None,
+            ..runtime_method.clone()
+        };
+        let descriptive = resolve_capsule_method_binding(&descriptive, None).await;
+        assert_eq!(descriptive.summary.state, "descriptive-only");
+        assert!(!descriptive.summary.handler_available);
+        assert!(!descriptive.summary.executable);
+
+        let registry = elastos_runtime::provider::ProviderRegistry::new();
+        registry
+            .register_sub_provider("chain", Arc::new(BindingProvider::default()))
+            .await
+            .unwrap();
+        let provider_method = CapsuleAffordanceDescriptor {
+            id: "chain.status".to_string(),
+            resource: Some("elastos://chain/*".to_string()),
+            operation: Some("status".to_string()),
+            ..runtime_method
+        };
+        let provider = resolve_capsule_method_binding(&provider_method, Some(&registry)).await;
+        assert_eq!(provider.summary.state, "provider-path-only");
+        assert!(provider.summary.handler_available);
+        assert!(!provider.summary.executable);
+        assert_eq!(
+            provider.summary.handler.as_deref(),
+            Some("binding-provider")
+        );
+        assert_eq!(provider.summary.required_action.as_deref(), Some("read"));
+    }
+
+    #[tokio::test]
+    async fn generic_invoke_executes_runtime_binding_and_never_dispatches_provider_path() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_capsule_json(
+            data_dir.path(),
+            "marketplace",
+            serde_json::json!({
+                "schema": "elastos.capsule/v1",
+                "name": "marketplace",
+                "version": "0.1.0",
+                "description": "Marketplace test capsule",
+                "author": "elastos",
+                "role": "app",
+                "type": "wasm",
+                "runtime_abi": "elastos.runtime-projection/v1",
+                "bus_contract": "elastos.runtime-projection/v1",
+                "execution": "web-projection",
+                "projections": ["web", "affordances"],
+                "entrypoint": "browser/index.html",
+                "interfaces": [{
+                    "id": "elastos.marketplace.catalog",
+                    "version": "0.1.0",
+                    "methods": [
+                        {
+                            "id": "catalog.list",
+                            "risk": "read",
+                            "approval": "runtime_policy",
+                            "audit": "event",
+                            "resource": "elastos://capsules/*",
+                            "operation": "list"
+                        },
+                        {
+                            "id": "chain.status",
+                            "risk": "read",
+                            "approval": "runtime_policy",
+                            "audit": "event",
+                            "resource": "elastos://chain/*",
+                            "operation": "status"
+                        }
+                    ]
+                }]
+            }),
+        );
+        let provider = Arc::new(BindingProvider::default());
+        let registry = Arc::new(elastos_runtime::provider::ProviderRegistry::new());
+        registry
+            .register_sub_provider("chain", provider.clone())
+            .await
+            .unwrap();
+        let state = GatewayState {
+            provider_registry: Some(registry),
+            identity_manager: Arc::new(std::sync::OnceLock::new()),
+            cache_dir: data_dir.path().to_path_buf(),
+            data_dir: data_dir.path().to_path_buf(),
+        };
+        let token = issue_home_launch_token(data_dir.path(), "marketplace").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-elastos-home-token", token.parse().unwrap());
+
+        let runtime_response = capsule_interface_invoke(
+            State(state.clone()),
+            headers.clone(),
+            Json(CapsuleInterfaceInvokeRequest {
+                capsule: "marketplace".to_string(),
+                interface: "elastos.marketplace.catalog".to_string(),
+                method: "catalog.list".to_string(),
+                input: serde_json::json!({}),
+            }),
+        )
+        .await;
+        assert_eq!(runtime_response.status(), StatusCode::OK);
+
+        let provider_response = capsule_interface_invoke(
+            State(state),
+            headers,
+            Json(CapsuleInterfaceInvokeRequest {
+                capsule: "marketplace".to_string(),
+                interface: "elastos.marketplace.catalog".to_string(),
+                method: "chain.status".to_string(),
+                input: serde_json::json!({}),
+            }),
+        )
+        .await;
+        assert_eq!(provider_response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = axum::body::to_bytes(provider_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "affordance_not_bound");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn generic_invoke_propagates_runtime_launch_failure() {
+        let launch = GatewayRuntimeLaunchOutcome {
+            status: "failed".to_string(),
+            capsule_id: None,
+            detail: Some("compute provider rejected launch".to_string()),
+        };
+        assert_eq!(
+            runtime_launch_failure(Some(&launch)).as_deref(),
+            Some("compute provider rejected launch")
+        );
+        assert!(runtime_launch_failure(None).is_none());
+    }
+
     #[test]
     fn capsule_interface_invoke_request_rejects_hidden_authority_fields() {
         let err = serde_json::from_value::<CapsuleInterfaceInvokeRequest>(serde_json::json!({
@@ -896,7 +1399,7 @@ mod tests {
             },
         };
 
-        let err = enforce_affordance_invocation_policy(&resolved).unwrap_err();
+        let err = affordance_invocation_policy(&resolved.method).unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
         assert_eq!(err.1, "approval_required");
     }

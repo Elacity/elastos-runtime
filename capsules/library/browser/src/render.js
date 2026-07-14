@@ -7,7 +7,6 @@ import {
   isWebSpaceUri,
   isBlockedObject,
   isDirectory,
-  shortUri,
   visibilityContract,
 } from "./model.js";
 
@@ -79,12 +78,12 @@ export function createLibraryRenderer({
 
   function emptyStateCopy(state) {
     if (state.query) {
-      return { title: "No matching objects", body: "Try another search." };
+      return { title: "No matching items", body: "Try another search." };
     }
     if (isWebSpaceUri(state.currentUri)) {
       return {
-        title: "No objects in this space",
-        body: "Localhost is your signed local object space. Elastos and mounted spaces resolve through providers and show only the actions they actually support.",
+        title: "This space is empty",
+        body: "Add files or folders to this space.",
       };
     }
     return { title: "This folder is empty", body: "Upload a file or create a folder." };
@@ -200,8 +199,8 @@ export function createLibraryRenderer({
     const visible = visibleObjects().length;
     const selected = selectedObjects().length;
     const prefix = selected ? `${selected} selected · ` : "";
-    elements.footerLeft.textContent = `${prefix}${visible} object${visible === 1 ? "" : "s"}`;
-    elements.footerRight.textContent = shortUri(state.currentUri);
+    elements.footerLeft.textContent = `${prefix}${visible} item${visible === 1 ? "" : "s"}`;
+    elements.footerRight.textContent = elements.currentTitle.textContent || "Library";
   }
 
   function scheduleContentRender() {

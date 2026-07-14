@@ -169,6 +169,17 @@ const viewerFile = object(`${documentsUri}/Viewer.md`, "Viewer.md", "file", [
 ], {
   viewers: [{ id: "documents", label: "Documents" }],
 });
+const gbaFile = object(`${documentsUri}/Game.gba`, "Game.gba", "file", [
+  "download",
+  "rename",
+  "move",
+  "copy",
+  "trash",
+  "properties",
+], {
+  mime: "application/x-gba-rom",
+  viewers: [{ id: "gba-emulator", label: "GBA Emulator", default: true }],
+});
 const publicDraftFile = object(`${publicUri}/Public Draft.md`, "Public Draft.md", "file", [
   "download",
   "compress_archive",
@@ -453,7 +464,7 @@ const webspaceMutable = createWebspaceFolderObject(webspaceMutableUri, "Mutable"
 const folders = new Map([
   [principalRoot, []],
   [desktopUri, []],
-  [documentsUri, [folder, file, viewerFile, publishedFile, archiveFile, tarArchiveFile, zipArchiveFile, looseZipFile, policyGatedArchiveFile, blockedFile, hiddenFile]],
+  [documentsUri, [folder, file, viewerFile, gbaFile, publishedFile, archiveFile, tarArchiveFile, zipArchiveFile, looseZipFile, policyGatedArchiveFile, blockedFile, hiddenFile]],
   [picturesUri, []],
   [videosUri, []],
   [downloadsUri, []],
@@ -1835,16 +1846,16 @@ async function run() {
     await clickMenu(page, "Properties");
     await page.locator(".window-item-properties").filter({ hasText: "Readme.md properties" }).first().waitFor();
     await page.locator(".item-props-tab-selected").filter({ hasText: "General" }).first().waitFor();
-    await page.locator(".item-props-tbl").filter({ hasText: "SmartWeb Object" }).first().waitFor();
-    await page.locator(".item-props-tbl").filter({ hasText: "Content ID" }).first().waitFor();
     await page.locator(".item-props-tbl").filter({ hasText: "Placement" }).filter({ hasText: "Private folder" }).first().waitFor();
     await page.locator(".item-props-tbl").filter({ hasText: "Visibility" }).first().waitFor();
     await page.locator(".item-props-tbl").filter({ hasText: "Visibility" }).filter({ hasText: "Private" }).first().waitFor();
-    await page.locator('.props-copy-btn[title="Copy content CID"]').first().waitFor();
     assert(await page.locator(".item-props-tab-btn").filter({ hasText: "Archive" }).count() === 0, "Normal file Properties must not show the Archive tab");
-    await page.locator(".item-props-tab-btn").filter({ hasText: "Runtime" }).first().click();
-    await page.locator('.item-props-tab-content-selected[data-tab="runtime"]').filter({ hasText: "Resolver Target" }).first().waitFor();
-    await page.locator('.item-props-tab-content-selected[data-tab="runtime"]').filter({ hasText: "Public Folder Policy" }).first().waitFor();
+    await page.locator(".item-props-tab-btn").filter({ hasText: "Technical" }).first().click();
+    await page.locator('.item-props-tab-content-selected[data-tab="technical"]').filter({ hasText: "Object kind" }).first().waitFor();
+    await page.locator('.item-props-tab-content-selected[data-tab="technical"]').filter({ hasText: "Content ID" }).first().waitFor();
+    await page.locator('.item-props-tab-content-selected[data-tab="technical"]').filter({ hasText: "Resolver Target" }).first().waitFor();
+    await page.locator('.item-props-tab-content-selected[data-tab="technical"]').filter({ hasText: "Public Folder Policy" }).first().waitFor();
+    await page.locator('.props-copy-btn[title="Copy content ID"]').first().waitFor();
     await page.locator(".properties-window-actions [data-dialog-close]").click();
 
     await page.locator(".place").filter({ hasText: "Public" }).first().click();
@@ -1856,8 +1867,8 @@ async function run() {
     await page.locator(".window-item-properties").filter({ hasText: "Public Draft.md properties" }).first().waitFor();
     await page.locator(".item-props-tbl").filter({ hasText: "Placement" }).filter({ hasText: "Public folder" }).first().waitFor();
     await page.locator(".item-props-tbl").filter({ hasText: "Visibility" }).filter({ hasText: "Private until published" }).first().waitFor();
-    await page.locator(".item-props-tab-btn").filter({ hasText: "Runtime" }).first().click();
-    await page.locator('.item-props-tab-content-selected[data-tab="runtime"]').filter({ hasText: "Placement only; publish creates the public content link." }).first().waitFor();
+    await page.locator(".item-props-tab-btn").filter({ hasText: "Technical" }).first().click();
+    await page.locator('.item-props-tab-content-selected[data-tab="technical"]').filter({ hasText: "Placement only; publish creates the public content link." }).first().waitFor();
     await page.locator(".properties-window-actions [data-dialog-close]").click();
 
     await page.locator(".place").filter({ hasText: "Documents" }).first().click();
@@ -1966,6 +1977,7 @@ async function run() {
     excludesAll(publishedRows, ["Publish"], "published file menu");
     await clickMenu(page, "Status");
     await page.locator(".dialog-card").filter({ hasText: "Availability" }).first().waitFor();
+    await page.locator(".dialog-card details").filter({ hasText: "Technical details" }).first().locator("summary").click();
     await page.locator(".dialog-card").filter({ hasText: "Share Grants / Key Release" }).first().waitFor();
     await page.locator(".dialog-card").filter({ hasText: "plain_content" }).first().waitFor();
     await page.locator(".dialog-card").filter({ hasText: "Publish Receipt" }).first().waitFor();
@@ -2036,7 +2048,7 @@ async function run() {
 
     await page.locator(".place").filter({ hasText: "Spaces" }).first().click();
     await assertOnlyActivePlace(page, "Spaces");
-    await page.waitForFunction(() => document.querySelector("#footer-left")?.textContent?.includes("4 objects"));
+    await page.waitForFunction(() => document.querySelector("#footer-left")?.textContent?.includes("4 items"));
     await page.locator(".item").filter({ hasText: "Localhost" }).first().waitFor();
     includesAll(await openItemMenu(page, "Localhost"), ["Open", "Open in New Window", "Properties"], "Localhost Spaces pointer menu");
     excludesAll(await openItemMenu(page, "Localhost"), ["Download", "Compress to ZIP", "Publish", "Delete", "Rename"], "Localhost Spaces pointer menu");
@@ -2154,7 +2166,7 @@ async function run() {
       mimeType: "text/plain",
       buffer: Buffer.from("edge proxy should reject this synthetic upload"),
     });
-    await page.locator("#status-text").filter({ hasText: "public gateway body-size limit" }).first().waitFor();
+    await page.locator("#status-text").filter({ hasText: "too large for the current upload service" }).first().waitFor();
     assert(
       !ops.some((entry) => entry.op === "upload" && entry.payload.uri.endsWith("/TooLarge.txt")),
       "413 uploads must fail before object-provider commit",
@@ -2231,12 +2243,12 @@ async function run() {
 
     await openItemMenu(page, "Guide.md");
     await clickMenu(page, "Publish");
-    await page.waitForFunction(() => document.querySelector("#footer-left")?.textContent?.includes("object"));
+    await page.waitForFunction(() => document.querySelector("#footer-left")?.textContent?.includes("item"));
     assert(ops.some((entry) => entry.op === "publish" && entry.payload.uri.endsWith("/Guide.md")), "Publish must call publish");
     const guidePublishedRows = await openItemMenu(page, "Guide.md");
     includesAll(guidePublishedRows, ["Status", "Repair", "Unpublish", "Share", "Copy Content CID", "Copy Published Link"], "published Guide menu");
     await clickMenu(page, "Share");
-    await page.locator(".dialog-card").filter({ hasText: "Choose a Runtime share policy" }).first().waitFor();
+    await page.locator(".dialog-card").filter({ hasText: "Choose who can access this item" }).first().waitFor();
     await page.locator(".dialog-card button").filter({ hasText: "Share" }).first().click();
     assert(
       ops.some((entry) => entry.op === "share" && entry.payload.uri.endsWith("/Guide.md") && entry.payload.policy === "public_link"),
@@ -2257,7 +2269,7 @@ async function run() {
 
     await openItemMenu(page, "Guide.md");
     await clickMenu(page, "Share");
-    await page.locator(".dialog-card").filter({ hasText: "Choose a Runtime share policy" }).first().waitFor();
+    await page.locator(".dialog-card").filter({ hasText: "Choose who can access this item" }).first().waitFor();
     await page.locator('input[name="sharePolicy"][value="recipient_scoped"]').check();
     await page.locator('textarea[name="shareRecipients"]').fill("did:key:recipient-one\nperson:recipient-two");
     await page.locator(".dialog-card button").filter({ hasText: "Share" }).first().click();
@@ -2273,7 +2285,8 @@ async function run() {
     );
     await page.locator(".dialog-card").filter({ hasText: "recipient_scoped" }).first().waitFor();
     await page.locator(".dialog-card").filter({ hasText: "Grants" }).first().waitFor();
-    await page.locator(".dialog-card").filter({ hasText: "Recipient Grants / Key Release" }).first().waitFor();
+    await page.locator(".dialog-card details").filter({ hasText: "Technical details" }).first().locator("summary").click();
+    await page.locator(".dialog-card").filter({ hasText: "Share Receipt Summary" }).first().waitFor();
     await page.locator(".dialog-card").filter({ hasText: "not_required_for_plain_published_content" }).first().waitFor();
     await page.locator("[data-dialog-close]").click();
 
@@ -2383,13 +2396,23 @@ async function run() {
       ops.filter((entry) => entry.op === "read" && entry.payload.uri.endsWith("/Viewer.md")).length === readsBeforeViewerOpen,
       "Double-click with an installed viewer must not fall back to preview/read",
     );
+    const gbaItem = libraryFrame.locator(".item").filter({ hasText: "Game.gba" }).first();
+    await gbaItem.click();
+    await gbaItem.locator(".item-name").dblclick();
+    await page.waitForFunction(() =>
+      window.__shellMessages?.some((message) =>
+        message?.type === "home:open-target" &&
+        message?.target === "gba-emulator" &&
+        message?.query?.objectUri?.endsWith("/Game.gba") &&
+        message?.query?.mime === "application/x-gba-rom"),
+    );
 
     await page.evaluate(() => {
       window.__shellMessages = [];
     });
     await libraryFrame.goto(`http://127.0.0.1:${port}/apps/library/?home_token=${encodeURIComponent(token)}&mode=attach&returnTarget=browser`);
     await libraryFrame.locator("#picker-action-button").filter({ hasText: "Select for Browser" }).first().waitFor();
-    await libraryFrame.locator("#status-text").filter({ hasText: "Choose an object for Browser." }).first().waitFor();
+    await libraryFrame.locator("#status-text").filter({ hasText: "Choose an item for Browser." }).first().waitFor();
     const browserAttachRows = await openItemMenu(libraryFrame, "Viewer.md");
     includesAll(browserAttachRows, ["Select for Browser", "Download", "Properties"], "Browser attach file menu");
     excludesAll(browserAttachRows, ["Open With"], "Browser attach file menu");

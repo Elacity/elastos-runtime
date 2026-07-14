@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use elastos_common::{CapsuleInterfaceDescriptor, CapsuleManifest, CapsuleRole, CapsuleType};
+use elastos_common::{
+    CapsuleExecution, CapsuleInterfaceDescriptor, CapsuleManifest, CapsuleProjection, CapsuleRole,
+    CapsuleRuntimeAbi, CapsuleType,
+};
 use serde::Serialize;
 
 use super::*;
@@ -17,13 +20,17 @@ pub(in crate::api::gateway) fn capsule_catalog_summary(
         .map(|target| (target.target.clone(), target))
         .collect::<BTreeMap<_, _>>();
     let components = load_capsule_components(data_dir);
-    let active_components = crate::api::capsule_inventory::active_component_names(data_dir);
-    let installed_names = installed_capsule_names(data_dir, active_components.as_ref());
+    let accepted_content_by_viewer = accepted_content_by_viewer(data_dir);
 
-    let mut capsules = crate::api::capsule_inventory::list_capsule_manifests(data_dir)
+    let mut capsules = crate::api::capsule_inventory::list_active_capsule_manifests(data_dir)
         .into_iter()
         .map(|manifest| {
-            catalog_capsule_summary(manifest, &launch_targets, &components, &installed_names)
+            catalog_capsule_summary(
+                manifest,
+                &launch_targets,
+                &components,
+                &accepted_content_by_viewer,
+            )
         })
         .collect::<Vec<_>>();
     capsules.sort_by(|left, right| {
@@ -82,15 +89,26 @@ pub(in crate::api::gateway) fn capsule_interface_registry_summary(
     let mut interfaces = Vec::new();
     for capsule in catalog.capsules {
         for interface in capsule.interfaces {
+            let bindings = interface
+                .methods
+                .iter()
+                .map(|method| static_capsule_method_binding(method).summary)
+                .collect();
             interfaces.push(CapsuleInterfaceSummary {
                 capsule: capsule.name.clone(),
                 capsule_version: capsule.version.clone(),
                 title: capsule.title.clone(),
                 role: capsule.role.clone(),
                 capsule_type: capsule.capsule_type.clone(),
+                runtime_abi: capsule.runtime_abi.clone(),
+                bus_contract: capsule.bus_contract.clone(),
+                wit_world_sha256: capsule.wit_world_sha256.clone(),
+                execution: capsule.execution.clone(),
+                projections: capsule.projections.clone(),
                 cid: capsule.cid.clone(),
                 trust_state: capsule.trust_state.clone(),
                 interface,
+                bindings,
             });
         }
     }
@@ -106,6 +124,11 @@ pub(in crate::api::gateway) fn capsule_interface_registry_summary(
             .iter()
             .map(|summary| summary.interface.methods.len())
             .sum(),
+        executable_methods: interfaces
+            .iter()
+            .flat_map(|summary| summary.bindings.iter())
+            .filter(|binding| binding.executable)
+            .count(),
     };
 
     CapsuleInterfaceRegistryResponse {
@@ -116,7 +139,7 @@ pub(in crate::api::gateway) fn capsule_interface_registry_summary(
             descriptor_state: "manifest-declared".to_string(),
             descriptor_note: "Interfaces describe callable affordances declared by installed apps and providers. They are not authority grants; Runtime approval, expiry, and audit still govern invocation.".to_string(),
             invocation_state: "runtime-gated".to_string(),
-            invocation_note: "Runtime executes low-risk Marketplace bindings and fails closed for high-risk or user-approval methods until approval/provider binding is complete.".to_string(),
+            invocation_note: "Runtime executes only methods marked executable by a concrete generic Runtime binding. Provider-path, approval-required, descriptive, unavailable, and unbound methods fail closed.".to_string(),
         },
     }
 }
@@ -125,16 +148,22 @@ fn catalog_capsule_summary(
     manifest: CapsuleManifest,
     launch_targets: &BTreeMap<String, HomeTargetSummary>,
     components: &BTreeMap<String, CapsuleComponentInfo>,
-    installed_names: &BTreeSet<String>,
+    accepted_content_by_viewer: &BTreeMap<String, Vec<CapsuleAcceptedContentSummary>>,
 ) -> CapsuleSummary {
     let target = launch_targets.get(&manifest.name);
     let component = components.get(&manifest.name);
-    let installed = installed_names.contains(&manifest.name);
     let name = manifest.name.clone();
     let role = manifest.role.clone();
     let capsule_type = manifest.capsule_type.clone();
+    let runtime_abi = manifest.runtime_abi.clone();
+    let bus_contract = manifest.bus_contract.clone();
+    let wit_world_sha256 = manifest.wit_world_sha256.clone();
+    let execution = manifest.execution.clone();
+    let declared_projections = manifest.projections.clone();
     let category = capsule_category(&role);
-    let launchable = target.is_some() && role.is_shell_launchable();
+    // A content capsule with a bound viewer is launchable through that viewer.
+    // The Runtime target, not the manifest role alone, is the launch authority.
+    let launchable = target.is_some();
     let signature_state = if manifest
         .signature
         .as_deref()
@@ -155,6 +184,17 @@ fn catalog_capsule_summary(
     };
 
     let provides = manifest.provides;
+    let viewer = manifest.viewer;
+    let viewer_title = viewer.as_ref().map(|viewer| {
+        launch_targets
+            .get(viewer)
+            .map(|target| target.title.clone())
+            .unwrap_or_else(|| capsule_title(viewer))
+    });
+    let accepted_content = accepted_content_by_viewer
+        .get(&name)
+        .cloned()
+        .unwrap_or_default();
     let capabilities = manifest.capabilities;
     let interfaces = manifest.interfaces;
     let payment_state = capsule_payment_state(&name).to_string();
@@ -166,6 +206,7 @@ fn catalog_capsule_summary(
         provides: provides.as_deref(),
         capabilities: &capabilities,
         interfaces: &interfaces,
+        declared_projections: &declared_projections,
         signature_state,
         cid_state,
         payment_state: &payment_state,
@@ -185,9 +226,14 @@ fn catalog_capsule_summary(
         author: manifest.author,
         role,
         capsule_type,
+        runtime_abi,
+        bus_contract,
+        wit_world_sha256,
+        execution,
+        projections: declared_projections,
         category: category.to_string(),
-        state: if installed { "installed" } else { "bundled" }.to_string(),
-        installed,
+        state: "installed".to_string(),
+        installed: true,
         launchable,
         launch_target: target.map(|target| target.target.clone()),
         route: target.map(|target| target.route.clone()),
@@ -203,23 +249,46 @@ fn catalog_capsule_summary(
         capabilities,
         interfaces,
         projection,
-        viewer: manifest.viewer,
+        viewer,
+        viewer_title,
+        accepted_content,
         cid,
         cid_state: cid_state.to_string(),
         signature_state: signature_state.to_string(),
         trust_state: capsule_trust_state(signature_state, cid_state).to_string(),
         payment_state,
         drm_state,
-        source: if installed {
-            "installed"
-        } else {
-            "runtime-bundle"
-        }
-        .to_string(),
+        source: "installed".to_string(),
         install_path: component.and_then(|entry| entry.install_path.clone()),
         release_path: component.and_then(|entry| entry.release_path.clone()),
         repository: component.and_then(|entry| entry.repository.clone()),
     }
+}
+
+fn accepted_content_by_viewer(
+    data_dir: &std::path::Path,
+) -> BTreeMap<String, Vec<CapsuleAcceptedContentSummary>> {
+    let mut by_viewer: BTreeMap<String, Vec<CapsuleAcceptedContentSummary>> = BTreeMap::new();
+    for capsule in crate::api::browser_capsules::list_all_viewer_bound_capsules(data_dir) {
+        let title = viewer_object_shell_title(&capsule.name, capsule.description.as_deref());
+        by_viewer
+            .entry(capsule.viewer.clone())
+            .or_default()
+            .push(CapsuleAcceptedContentSummary {
+                name: capsule.name,
+                title,
+                description: capsule.description,
+                entrypoint: capsule.entrypoint,
+            });
+    }
+    for capsules in by_viewer.values_mut() {
+        capsules.sort_by(|left, right| {
+            left.title
+                .cmp(&right.title)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+    }
+    by_viewer
 }
 
 fn capsule_category(role: &CapsuleRole) -> &'static str {
@@ -233,6 +302,34 @@ fn capsule_category(role: &CapsuleRole) -> &'static str {
 }
 
 fn capsule_title(name: &str) -> String {
+    let service_title = match name {
+        "ai-provider" => Some("AI"),
+        "availability-provider" => Some("Content Availability"),
+        "browser-engine-adapter" => Some("Browser Engine"),
+        "chain-provider" => Some("Chains"),
+        "content-block-graph-provider" => Some("Content Index"),
+        "decrypt-provider" => Some("Decryption"),
+        "did-provider" => Some("Identity"),
+        "drm-provider" => Some("Content Protection"),
+        "exit-provider" => Some("Browser Exit"),
+        "ipfs-provider" => Some("Content Storage"),
+        "key-provider" => Some("Key Access"),
+        "llama-provider" => Some("Local AI"),
+        "net-provider" => Some("Network"),
+        "object-provider" => Some("Storage"),
+        "operator-drive-adapter" => Some("Drive"),
+        "rights-provider" => Some("Content Rights"),
+        "tunnel-provider" => Some("Network Tunnel"),
+        "wallet-metamask" => Some("MetaMask"),
+        "wallet-provider" => Some("Wallet Security"),
+        "wallet-unisat" => Some("UniSat"),
+        "wallet-walletconnect" => Some("WalletConnect"),
+        "webspace-provider" => Some("Webspaces"),
+        _ => None,
+    };
+    if let Some(title) = service_title {
+        return title.to_string();
+    }
     name.split(['-', '_'])
         .filter(|part| !part.is_empty())
         .map(|part| {
@@ -292,6 +389,7 @@ struct CapsuleProjectionInput<'a> {
     provides: Option<&'a str>,
     capabilities: &'a [String],
     interfaces: &'a [CapsuleInterfaceDescriptor],
+    declared_projections: &'a [CapsuleProjection],
     signature_state: &'a str,
     cid_state: &'a str,
     payment_state: &'a str,
@@ -308,6 +406,24 @@ fn capsule_projection_summary(input: CapsuleProjectionInput<'_>) -> CapsuleProje
     let is_provider_role = input.role == &CapsuleRole::Provider;
     let has_service_namespace = input.provides.is_some();
     let has_capability_surface = !input.capabilities.is_empty();
+    let declares_web = input.declared_projections.contains(&CapsuleProjection::Web);
+    let declares_cli = input.declared_projections.contains(&CapsuleProjection::Cli);
+    let declares_terminal = input
+        .declared_projections
+        .contains(&CapsuleProjection::Terminal);
+    let declares_carrier = input
+        .declared_projections
+        .contains(&CapsuleProjection::Carrier);
+    let has_cli_interface = input.interfaces.iter().any(|interface| {
+        interface.id.contains(".terminal")
+            || interface.id.ends_with(".cli")
+            || interface.methods.iter().any(|method| {
+                matches!(
+                    method.id.as_str(),
+                    "session.open" | "terminal.open" | "cli.open"
+                )
+            })
+    });
 
     CapsuleProjectionSummary {
         schema: "elastos.capsule.projection/v1".to_string(),
@@ -320,7 +436,9 @@ fn capsule_projection_summary(input: CapsuleProjectionInput<'_>) -> CapsuleProje
                 "not-launchable"
             }
             .to_string(),
-            source: if input.route.is_some() {
+            source: if declares_web && input.route.is_some() {
+                "manifest.projections+home.summary.launch_targets"
+            } else if input.route.is_some() {
                 "home.summary.launch_targets"
             } else {
                 "manifest.role"
@@ -331,13 +449,18 @@ fn capsule_projection_summary(input: CapsuleProjectionInput<'_>) -> CapsuleProje
             note: Some("Web projection is launched only through Runtime Home tokens.".to_string()),
         },
         cli: CapsuleProjectionSurface {
-            state: if input.launchable || method_count > 0 {
+            state: if declares_cli || declares_terminal || has_cli_interface {
                 "available"
             } else {
                 "facts-only"
             }
             .to_string(),
-            source: "capsules.catalog+capsules.interfaces".to_string(),
+            source: if declares_cli || declares_terminal {
+                "manifest.projections+capsules.catalog+capsules.interfaces"
+            } else {
+                "capsules.catalog+capsules.interfaces"
+            }
+            .to_string(),
             route: None,
             schemas: vec![
                 CAPSULE_CATALOG_SCHEMA.to_string(),
@@ -397,13 +520,13 @@ fn capsule_projection_summary(input: CapsuleProjectionInput<'_>) -> CapsuleProje
         carrier: CapsuleProjectionSurface {
             state: if has_service_namespace {
                 "service-endpoint"
-            } else if has_capability_surface {
+            } else if declares_carrier || has_capability_surface {
                 "requires-provider-intents"
             } else {
                 "none"
             }
             .to_string(),
-            source: "manifest.provides+manifest.capabilities".to_string(),
+            source: "manifest.provides+manifest.capabilities+manifest.projections".to_string(),
             route: None,
             schemas: Vec::new(),
             note: Some("Future Carrier transport must preserve the same Runtime schemas, gates, consent path, and audit.".to_string()),
@@ -438,65 +561,96 @@ fn load_capsule_components(data_dir: &std::path::Path) -> BTreeMap<String, Capsu
             },
         );
     }
+    let current_platform = crate::setup::detect_platform();
     for (name, component) in manifest.external {
-        let platform = component
-            .platforms
-            .get("*")
-            .or_else(|| component.platforms.values().next());
+        let platform =
+            crate::setup::resolve_platform_info(&component, &current_platform).or_else(|| {
+                if component.platforms.len() == 1 {
+                    component.platforms.values().next()
+                } else {
+                    None
+                }
+            });
+        let install_path =
+            crate::setup::resolve_install_path(&component, platform).map(str::to_string);
+        let cid = platform.and_then(|platform| platform.cid.clone());
+        let release_path = platform.and_then(|platform| platform.release_path.clone());
+        let repository = component.repository.clone();
         entries
             .entry(name)
             .and_modify(|entry| {
                 if entry.cid.as_deref().unwrap_or("").is_empty() {
-                    entry.cid = platform.and_then(|platform| platform.cid.clone());
+                    entry.cid = cid.clone();
                 }
                 if entry.install_path.is_none() {
-                    entry.install_path = component.install_path.clone();
+                    entry.install_path = install_path.clone();
                 }
                 if entry.release_path.is_none() {
-                    entry.release_path =
-                        platform.and_then(|platform| platform.release_path.clone());
+                    entry.release_path = release_path.clone();
                 }
                 if entry.repository.is_none() {
-                    entry.repository = component.repository.clone();
+                    entry.repository = repository.clone();
                 }
             })
             .or_insert_with(|| CapsuleComponentInfo {
-                cid: platform.and_then(|platform| platform.cid.clone()),
-                repository: component.repository,
-                install_path: component.install_path,
-                release_path: platform.and_then(|platform| platform.release_path.clone()),
+                cid,
+                repository,
+                install_path,
+                release_path,
             });
     }
     entries
 }
 
-fn installed_capsule_names(
-    data_dir: &std::path::Path,
-    active_components: Option<&BTreeSet<String>>,
-) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
-    let root = data_dir.join("capsules");
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return names;
-    };
-    for entry in entries.flatten() {
-        let dir = entry.path();
-        let Some(name) = dir.file_name().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        if crate::api::capsule_inventory::installed_capsule_is_inactive(
-            data_dir,
-            &dir,
-            name,
-            active_components,
-        ) {
-            continue;
-        }
-        if crate::api::capsule_inventory::load_capsule_manifest(&dir, name).is_some() {
-            names.insert(name.to_string());
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capsule_title_preserves_product_names() {
+        assert_eq!(capsule_title("wallet-metamask"), "MetaMask");
+        assert_eq!(capsule_title("wallet-unisat"), "UniSat");
+        assert_eq!(capsule_title("wallet-walletconnect"), "WalletConnect");
     }
-    names
+
+    #[test]
+    fn component_metadata_uses_the_current_platform_deterministically() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let platform = crate::setup::detect_platform();
+        std::fs::write(
+            data_dir.path().join("components.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "capsules": {},
+                "external": {
+                    "fixture": {
+                        "platforms": {
+                            platform: {
+                                "release_path": "current-platform",
+                                "install_path": "bin/current"
+                            },
+                            "other-platform-a": {
+                                "release_path": "wrong-amd64",
+                                "install_path": "bin/wrong-amd64"
+                            },
+                            "other-platform-b": {
+                                "release_path": "wrong-arm64",
+                                "install_path": "bin/wrong-arm64"
+                            }
+                        }
+                    }
+                },
+                "profiles": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let fixture = load_capsule_components(data_dir.path())
+            .remove("fixture")
+            .unwrap();
+        assert_eq!(fixture.release_path.as_deref(), Some("current-platform"));
+        assert_eq!(fixture.install_path.as_deref(), Some("bin/current"));
+    }
 }
 
 #[derive(Serialize)]
@@ -542,6 +696,16 @@ pub(in crate::api::gateway) struct CapsuleSummary {
     pub(in crate::api::gateway) role: CapsuleRole,
     #[serde(rename = "type")]
     pub(in crate::api::gateway) capsule_type: CapsuleType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) runtime_abi: Option<CapsuleRuntimeAbi>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) bus_contract: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) wit_world_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) execution: Option<CapsuleExecution>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(in crate::api::gateway) projections: Vec<CapsuleProjection>,
     pub(in crate::api::gateway) category: String,
     pub(in crate::api::gateway) state: String,
     pub(in crate::api::gateway) installed: bool,
@@ -562,6 +726,10 @@ pub(in crate::api::gateway) struct CapsuleSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(in crate::api::gateway) viewer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) viewer_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(in crate::api::gateway) accepted_content: Vec<CapsuleAcceptedContentSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(in crate::api::gateway) cid: Option<String>,
     pub(in crate::api::gateway) cid_state: String,
     pub(in crate::api::gateway) signature_state: String,
@@ -575,6 +743,15 @@ pub(in crate::api::gateway) struct CapsuleSummary {
     pub(in crate::api::gateway) release_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(in crate::api::gateway) repository: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+pub(in crate::api::gateway) struct CapsuleAcceptedContentSummary {
+    pub(in crate::api::gateway) name: String,
+    pub(in crate::api::gateway) title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) description: Option<String>,
+    pub(in crate::api::gateway) entrypoint: String,
 }
 
 #[derive(Serialize)]
@@ -620,6 +797,7 @@ pub(in crate::api::gateway) struct CapsuleInterfaceRegistryCounts {
     pub(in crate::api::gateway) capsules: usize,
     pub(in crate::api::gateway) interfaces: usize,
     pub(in crate::api::gateway) methods: usize,
+    pub(in crate::api::gateway) executable_methods: usize,
 }
 
 #[derive(Serialize)]
@@ -631,9 +809,20 @@ pub(in crate::api::gateway) struct CapsuleInterfaceSummary {
     #[serde(rename = "type")]
     pub(in crate::api::gateway) capsule_type: CapsuleType,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) runtime_abi: Option<CapsuleRuntimeAbi>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) bus_contract: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) wit_world_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) execution: Option<CapsuleExecution>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(in crate::api::gateway) projections: Vec<CapsuleProjection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(in crate::api::gateway) cid: Option<String>,
     pub(in crate::api::gateway) trust_state: String,
     pub(in crate::api::gateway) interface: CapsuleInterfaceDescriptor,
+    pub(in crate::api::gateway) bindings: Vec<bindings::CapsuleMethodBindingSummary>,
 }
 
 #[derive(Serialize)]

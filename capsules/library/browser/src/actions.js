@@ -52,7 +52,7 @@ export function createLibraryActions({
       return;
     }
     if (isBlockedObject(object)) {
-      setStatus("This object is blocked because it is not encrypted for the protected principal root.");
+      setStatus("This item is unavailable because it is not protected for this account.");
       showProperties(object);
       return;
     }
@@ -75,7 +75,7 @@ export function createLibraryActions({
       await previewObject(object);
       return;
     }
-    setStatus("No installed viewer for this object.");
+    setStatus("No installed app can open this item.");
     showProperties(object);
   }
 
@@ -188,18 +188,18 @@ export function createLibraryActions({
             mime: file.type || "application/octet-stream",
             onProgress: (fraction) => {
               setUploadProgress(upload.id, {
-                status: "Uploading through Runtime provider",
+                status: "Uploading",
                 progress: Math.max(4, Math.round(fraction * 96)),
               });
             },
           });
           setUploadProgress(upload.id, {
-            status: "Committing through Runtime provider",
+            status: "Saving",
             progress: 98,
           });
           setUploadProgress(upload.id, { status: "Complete", progress: 100 });
         } catch (error) {
-          setUploadProgress(upload.id, { status: error?.message || "Upload failed" });
+          setUploadProgress(upload.id, { status: "Upload failed" });
           throw error;
         }
       }
@@ -232,7 +232,7 @@ export function createLibraryActions({
     if (objects.length < 2) return;
     const data = await downloadObjectRaw({ uris: objects.map((object) => object.uri) });
     saveDownloadBlob(data.blob, data.filename || "Library Selection.tar.gz");
-    setStatus(`Downloaded ${objects.length} selected objects.`);
+    setStatus(`Downloaded ${objects.length} selected items.`);
   }
 
   async function downloadSelectedObjectsAsZip() {
@@ -243,7 +243,7 @@ export function createLibraryActions({
       archive: "zip",
     });
     saveDownloadBlob(data.blob, data.filename || "Library Selection.zip");
-    setStatus(`Downloaded ${objects.length} selected objects as ZIP.`);
+    setStatus(`Downloaded ${objects.length} selected items as ZIP.`);
   }
 
   async function compressObjectToZip(object) {
@@ -257,9 +257,9 @@ export function createLibraryActions({
   async function compressSelectedObjectsToZip() {
     const objects = compressibleSelectedObjects();
     if (objects.length < 2) return;
-    setStatus(`Compressing ${objects.length} selected objects...`);
+    setStatus(`Compressing ${objects.length} selected items...`);
     await providerApi("compress_archive", { uris: objects.map((object) => object.uri) });
-    setStatus(`Compressed ${objects.length} selected objects to ZIP.`);
+    setStatus(`Compressed ${objects.length} selected items to ZIP.`);
     await loadCurrentFolder();
   }
 
@@ -382,7 +382,7 @@ export function createLibraryActions({
       title: "Delete permanently?",
       message: trash
         ? `${object.name} will be removed from Trash and cannot be restored.`
-        : `${object.name} will be permanently removed from this provider-owned location. This cannot be restored.`,
+        : `${object.name} will be permanently removed from this location. This cannot be restored.`,
       confirmLabel: "Delete Permanently",
     });
     if (!confirmed) return;
@@ -395,12 +395,12 @@ export function createLibraryActions({
   async function runBatchAction(label, objects, action) {
     const list = objects.filter(Boolean);
     if (!list.length) return;
-    setStatus(`${label} ${list.length} object${list.length === 1 ? "" : "s"}...`);
+    setStatus(`${label} ${list.length} item${list.length === 1 ? "" : "s"}...`);
     for (const object of list) {
       await action(object);
     }
     clearSelection(false);
-    setStatus(`${label} ${list.length} object${list.length === 1 ? "" : "s"}.`);
+    setStatus(`${label} ${list.length} item${list.length === 1 ? "" : "s"}.`);
     await loadCurrentFolder();
   }
 
@@ -437,7 +437,7 @@ export function createLibraryActions({
       op,
       uris,
     };
-    setStatus(`${op === "move" ? "Cut" : "Copied"} ${uris.length} object${uris.length === 1 ? "" : "s"}.`);
+    setStatus(`${op === "move" ? "Cut" : "Copied"} ${uris.length} item${uris.length === 1 ? "" : "s"}.`);
   }
 
   function canPasteInto(targetParentUri) {
@@ -467,7 +467,7 @@ export function createLibraryActions({
     if (op === "move") {
       state.clipboard = { op: "", uris: [] };
     }
-    setStatus(`${op === "move" ? "Moved" : "Copied"} ${uris.length} object${uris.length === 1 ? "" : "s"}.`);
+    setStatus(`${op === "move" ? "Moved" : "Copied"} ${uris.length} item${uris.length === 1 ? "" : "s"}.`);
     await loadCurrentFolder();
   }
 
@@ -496,7 +496,7 @@ export function createLibraryActions({
       changed += 1;
     }
     if (changed) {
-      setStatus(`${op === "move" ? "Moved" : "Copied"} ${changed} object${changed === 1 ? "" : "s"}.`);
+      setStatus(`${op === "move" ? "Moved" : "Copied"} ${changed} item${changed === 1 ? "" : "s"}.`);
       await loadCurrentFolder();
     }
   }
@@ -535,8 +535,8 @@ export function createLibraryActions({
     const confirmed = await confirmDestructive({
       title: "Delete permanently?",
       message: allTrash
-        ? `${objects.length} object${objects.length === 1 ? "" : "s"} will be removed from Trash and cannot be restored.`
-        : `${objects.length} object${objects.length === 1 ? "" : "s"} will be permanently removed from provider-owned locations. This cannot be restored.`,
+        ? `${objects.length} item${objects.length === 1 ? "" : "s"} will be removed from Trash and cannot be restored.`
+        : `${objects.length} item${objects.length === 1 ? "" : "s"} will be permanently removed. This cannot be restored.`,
       confirmLabel: "Delete Permanently",
     });
     if (!confirmed) return;
@@ -550,13 +550,13 @@ export function createLibraryActions({
   async function emptyTrash() {
     const confirmed = await confirmDestructive({
       title: "Empty Trash?",
-      message: "Every object in Trash will be permanently deleted. This cannot be restored.",
+      message: "Every item in Trash will be permanently deleted. This cannot be restored.",
       confirmLabel: "Empty Trash",
     });
     if (!confirmed) return;
     const result = await providerApi("empty_trash", {});
     const count = Number(result?.deleted_count || 0);
-    setStatus(`Emptied Trash${count ? ` (${count} object${count === 1 ? "" : "s"})` : ""}.`);
+    setStatus(`Emptied Trash${count ? ` (${count} item${count === 1 ? "" : "s"})` : ""}.`);
     await loadRoots?.();
     await loadCurrentFolder();
   }

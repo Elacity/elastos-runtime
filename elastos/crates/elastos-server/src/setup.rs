@@ -1109,7 +1109,7 @@ fn file_matches_checksum(path: &Path, expected: &str) -> anyhow::Result<bool> {
 }
 
 /// Resolve install_path: platform-specific overrides component-level.
-fn resolve_install_path<'a>(
+pub(crate) fn resolve_install_path<'a>(
     component: &'a Component,
     platform_info: Option<&'a PlatformInfo>,
 ) -> Option<&'a str> {
@@ -1118,7 +1118,10 @@ fn resolve_install_path<'a>(
         .or(component.install_path.as_deref())
 }
 
-fn resolve_platform_info<'a>(component: &'a Component, platform: &str) -> Option<&'a PlatformInfo> {
+pub(crate) fn resolve_platform_info<'a>(
+    component: &'a Component,
+    platform: &str,
+) -> Option<&'a PlatformInfo> {
     component
         .platforms
         .get(platform)

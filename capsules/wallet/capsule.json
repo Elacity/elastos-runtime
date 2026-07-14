@@ -15,11 +15,11 @@
     {
       "id": "elastos.wallet.accounts",
       "version": "0.5.0",
-      "description": "Wallet account, balance, and approval projection",
+      "description": "Manage Wallet accounts, balances, and approvals",
       "methods": [
         {
           "id": "accounts.view",
-          "description": "View Runtime-linked wallet accounts and balances",
+          "description": "View wallet accounts and balances",
           "risk": "read",
           "approval": "runtime_policy",
           "audit": "summary",
@@ -28,7 +28,7 @@
         },
         {
           "id": "approval.review",
-          "description": "Review a wallet approval request before signing",
+          "description": "Review a request before signing",
           "risk": "payment",
           "approval": "user",
           "audit": "full",
@@ -37,7 +37,7 @@
         },
         {
           "id": "approval.sign",
-          "description": "Sign only after Wallet/Inbox approval and fresh proof when required",
+          "description": "Sign only after approval and passkey confirmation when required",
           "risk": "payment",
           "approval": "user",
           "audit": "full",

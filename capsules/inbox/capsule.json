@@ -15,11 +15,11 @@
     {
       "id": "elastos.inbox.approvals",
       "version": "0.5.0",
-      "description": "Inbox request and approval review surface",
+      "description": "Review and respond to requests",
       "methods": [
         {
           "id": "requests.list",
-          "description": "List pending and recent Runtime approval requests",
+          "description": "List pending and recent requests",
           "risk": "read",
           "approval": "runtime_policy",
           "audit": "summary",
@@ -28,7 +28,7 @@
         },
         {
           "id": "request.approve",
-          "description": "Approve a Runtime-bound request after the required user proof",
+          "description": "Approve a request after confirming your identity when needed",
           "risk": "privileged",
           "approval": "user",
           "audit": "full",
@@ -37,7 +37,7 @@
         },
         {
           "id": "request.deny",
-          "description": "Deny a Runtime-bound request without dispatching provider effects",
+          "description": "Deny a request",
           "risk": "write",
           "approval": "runtime_policy",
           "audit": "event",

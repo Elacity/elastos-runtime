@@ -6,6 +6,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use base64::Engine as _;
 use elastos_common::localhost::rooted_localhost_fs_path;
 use elastos_runtime::auth::RuntimeAuditEventV1;
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,8 @@ struct ViewerLibraryItem {
 #[derive(Debug, Deserialize)]
 pub struct ViewerLibraryObjectQuery {
     uri: String,
+    #[serde(default)]
+    raw: bool,
     #[serde(default)]
     stat_only: bool,
     #[serde(default)]
@@ -133,9 +136,7 @@ pub async fn viewer_content(
         return (StatusCode::NOT_FOUND, "viewer content capsule not found").into_response();
     };
     let Some(capsule_dir) =
-        super::capsule_inventory::capsule_dir_candidates(&state.data_dir, &capsule.name)
-            .into_iter()
-            .find(|candidate| candidate.join(&capsule.entrypoint).is_file())
+        super::capsule_inventory::installed_active_capsule_dir(&state.data_dir, &capsule.name)
     else {
         return (StatusCode::NOT_FOUND, "viewer content file not found").into_response();
     };
@@ -168,6 +169,27 @@ pub async fn viewer_library_object_get(
         Ok(context) => context,
         Err(err) => return viewer_error_response(err),
     };
+    if query.raw {
+        if query.stat_only || query.entries || query.preview_entry.is_some() {
+            return (
+                StatusCode::BAD_REQUEST,
+                "raw viewer reads cannot include metadata options",
+            )
+                .into_response();
+        }
+        return match read_viewer_library_object_bytes(&state, &context, &viewer, &query.uri).await {
+            Ok(bytes) => (
+                StatusCode::OK,
+                [
+                    ("content-type", "application/octet-stream"),
+                    ("cache-control", "no-store"),
+                ],
+                bytes,
+            )
+                .into_response(),
+            Err(err) => viewer_error_response(err),
+        };
+    }
     match viewer_library_object(
         &state,
         &context,
@@ -270,7 +292,7 @@ pub async fn viewer_library_roots_get(
         Ok(context) => context,
         Err(err) => return viewer_error_response(err),
     };
-    match viewer_object_provider_request(&state, &context, "roots", json!({})).await {
+    match viewer_object_provider_request(&state, &context, &viewer, "roots", json!({})).await {
         Ok(response) => Json(response).into_response(),
         Err(err) => viewer_error_response(err),
     }
@@ -339,9 +361,14 @@ async fn viewer_library_object(
     viewer: &str,
     request: ViewerLibraryObjectRequest,
 ) -> anyhow::Result<Value> {
-    let stat =
-        viewer_object_provider_request(state, context, "stat", json!({ "uri": &request.uri }))
-            .await?;
+    let stat = viewer_object_provider_request(
+        state,
+        context,
+        viewer,
+        "stat",
+        json!({ "uri": &request.uri }),
+    )
+    .await?;
     ensure_viewer_can_view_library_object(&stat, viewer)?;
     if request.stat_only {
         return Ok(stat);
@@ -353,6 +380,7 @@ async fn viewer_library_object(
         return viewer_object_provider_request(
             state,
             context,
+            viewer,
             "archive_entries",
             json!({ "uri": &request.uri }),
         )
@@ -365,6 +393,7 @@ async fn viewer_library_object(
         return viewer_object_provider_request(
             state,
             context,
+            viewer,
             "archive_preview_entry",
             json!({ "uri": &request.uri, "entry": entry }),
         )
@@ -387,12 +416,13 @@ async fn viewer_library_object(
     } else {
         "read"
     };
-    viewer_object_provider_request(state, context, op, payload).await
+    viewer_object_provider_request(state, context, viewer, op, payload).await
 }
 
 async fn viewer_object_provider_request(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
+    viewer: &str,
     op: &str,
     mut request: Value,
 ) -> anyhow::Result<Value> {
@@ -406,6 +436,7 @@ async fn viewer_object_provider_request(
     append_viewer_library_audit(
         &state.data_dir,
         context,
+        viewer,
         &request_id,
         "library.viewer.requested",
         "requested",
@@ -424,6 +455,7 @@ async fn viewer_object_provider_request(
     append_viewer_library_audit(
         &state.data_dir,
         context,
+        viewer,
         &request_id,
         if completed {
             "library.viewer.completed"
@@ -439,6 +471,39 @@ async fn viewer_object_provider_request(
     Ok(response)
 }
 
+pub(super) async fn read_viewer_library_object_bytes(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+    viewer: &str,
+    uri: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let stat =
+        viewer_object_provider_request(state, context, viewer, "stat", json!({ "uri": uri }))
+            .await?;
+    ensure_viewer_can_view_library_object(&stat, viewer)?;
+    let response =
+        viewer_object_provider_request(state, context, viewer, "read", json!({ "uri": uri }))
+            .await?;
+    if response.get("status").and_then(Value::as_str) == Some("error") {
+        anyhow::bail!(
+            "Library object read failed: {}",
+            response
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown object provider error")
+        );
+    }
+    let encoded = response
+        .get("data")
+        .and_then(|data| data.get("data"))
+        .or_else(|| response.get("data"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Library object read returned no bytes"))?;
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| anyhow::anyhow!("Library object read returned invalid base64"))
+}
+
 async fn viewer_library_archive_extract_entries(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
@@ -450,11 +515,13 @@ async fn viewer_library_archive_extract_entries(
         anyhow::bail!("viewer does not support Library archive extraction");
     }
     let stat =
-        viewer_object_provider_request(state, context, "stat", json!({ "uri": uri })).await?;
+        viewer_object_provider_request(state, context, viewer, "stat", json!({ "uri": uri }))
+            .await?;
     ensure_viewer_can_view_library_object(&stat, viewer)?;
     let response = viewer_object_provider_request(
         state,
         context,
+        viewer,
         "archive_extract_entries",
         json!({
             "uri": uri,
@@ -516,6 +583,7 @@ fn require_documents_viewer_context(
 fn append_viewer_library_audit(
     data_dir: &FsPath,
     context: &HomeLaunchTokenContext,
+    viewer: &str,
     request_id: &str,
     event_type: &str,
     result: &str,
@@ -532,7 +600,7 @@ fn append_viewer_library_audit(
             proof_binding_id: context.proof_binding_id.clone(),
             session_id: Some(context.session_id.clone()),
             challenge_id: Some(request_id.to_string()),
-            capsule_id: Some("documents".to_string()),
+            capsule_id: Some(viewer.to_string()),
             result: result.to_string(),
             reason: reason.to_string(),
             occurred_at: now,
@@ -618,13 +686,18 @@ fn viewer_storage_root_uri(
     viewer: &str,
     capsule: &str,
 ) -> anyhow::Result<String> {
-    let capsule = super::browser_capsules::resolve_viewer_bound_capsule(data_dir, capsule, viewer)
-        .ok_or_else(|| anyhow::anyhow!("viewer content capsule not found"))?;
-    let storage = capsule
-        .storage
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("viewer content capsule has no storage grant"))?;
-    let root_uri = principal_scoped_storage_uri(storage, context);
+    let storage = if capsule == viewer {
+        super::capsule_inventory::list_active_capsule_manifests(data_dir)
+            .into_iter()
+            .find(|manifest| manifest.name == viewer)
+            .and_then(|manifest| manifest.permissions.storage.into_iter().next())
+            .ok_or_else(|| anyhow::anyhow!("viewer capsule has no storage grant"))?
+    } else {
+        super::browser_capsules::resolve_viewer_bound_capsule(data_dir, capsule, viewer)
+            .and_then(|capsule| capsule.storage.into_iter().next())
+            .ok_or_else(|| anyhow::anyhow!("viewer content capsule has no storage grant"))?
+    };
+    let root_uri = principal_scoped_storage_uri(&storage, context);
     let localhost_root = crate::auth::principal_localhost_root(&context.principal_id);
     if root_uri != localhost_root
         && !root_uri

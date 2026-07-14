@@ -2,7 +2,7 @@
   "schema": "elastos.capsule/v1",
   "name": "marketplace",
   "version": "0.1.0",
-  "description": "Marketplace for browsing apps, viewers, providers, and content installed on this Runtime",
+  "description": "Browse apps, viewers, services, and content available in ElastOS",
   "role": "app",
   "type": "wasm",
   "runtime_abi": "elastos.runtime-projection/v1",
@@ -15,11 +15,11 @@
     {
       "id": "elastos.marketplace.catalog",
       "version": "0.5.0",
-      "description": "Marketplace catalog projection and install-request surface",
+      "description": "Browse and open available software",
       "methods": [
         {
           "id": "capsules.browse",
-          "description": "Browse installable capsules and local catalog facts",
+          "description": "Browse available apps and content",
           "risk": "read",
           "approval": "runtime_policy",
           "audit": "summary",
@@ -28,7 +28,7 @@
         },
         {
           "id": "capsule.inspect",
-          "description": "Inspect catalog trust, provenance, payment, and DRM descriptors",
+          "description": "Review verification, payment, and access details",
           "risk": "read",
           "approval": "runtime_policy",
           "audit": "summary",
@@ -37,7 +37,7 @@
         },
         {
           "id": "capsule.install",
-          "description": "Request capsule install through Runtime catalog gates",
+          "description": "Request an app installation",
           "risk": "privileged",
           "approval": "user",
           "audit": "full",

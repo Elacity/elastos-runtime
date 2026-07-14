@@ -16,13 +16,15 @@ Top-level directly-invoked entrypoints stay at the root:
 - `agent.sh` — run the agent capsule
 - `build.sh` — build runtime and capsules
 - `chat.sh` — launch the chat demo
-- `gba.sh` — launch the GBA demo
 - `install.sh` — signed installer
 - `home-demo-local.sh` — prepare and launch the local source-based Home demo in a clean temp home
+- `chat-demo-local.sh` — prepare and launch the local Chat demo against a clean local runtime
+- `build-chat-room-ui.sh` — build the browser Chat Room UI bundle used by Chat smokes
 - `publish-release.sh` — low-level release publisher
 - `setup-crosvm.sh` — install runtime VM prerequisites
 - `setup-source-home.sh` — build/provision the source-home runtime and generated helper scripts
 - `share-demo.sh` — share project docs/content
+- `vendor-walletconnect-adapter.sh` — refresh the pinned local WalletConnect adapter asset
 
 If a script is something a human is expected to type from docs, it belongs here.
 
@@ -44,19 +46,28 @@ Proof, smoke, and audit helpers also currently live at the root. Common examples
 - `chat-room-guest-identity-camofox-smoke.sh`
 - `chat-room-runtime-activity-smoke.sh`
 - `browser-session-capacity-smoke.sh`
+- `browser-abi-provider-contract-smoke.sh`
 - `public-install-identity-smoke.sh`
 - `public-install-operator-smoke.sh`
 - `public-install-home-frontdoor-smoke.sh`
+- `public-root-site-smoke.sh`
+- `public-user-journey-smoke.sh`
+- `home-live-smoke.sh`
+- `installed-home-chat-reuse-smoke.sh`
+- `installed-native-chat-smoke.sh`
 - `protected-content-provider-contract-smoke.sh`
+- `publisher-bootstrap-integrity-smoke.sh`
 - `recovery-kit-live-smoke.sh`
 - `people-conversations-local-smoke.sh`
 - `browser-vm-target-refresh.sh`
 - `linux-source-home-restart.sh`
+- `source-home-capsule-inventory-smoke.py`
+- `capsule-live-parity-smoke.py`
 
 These are review and release helpers, not automatically part of the stable
 end-user command contract. The `public-install-*.sh` helpers can target a
 published candidate gateway by setting `ELASTOS_PUBLISHER_GATEWAY=<url>`. They
-use the stamped trusted-source transports by default. During 0.5.0 candidate
+use the stamped trusted-source transports by default. During 0.5.0 baseline
 review, `ELASTOS_BIN_OVERRIDE=<path-to-branch-elastos>` swaps in the current
 branch binary only when the selected gateway serves a 0.5.0-compatible manifest
 with the current `home` setup profile and checksummed artifacts. The helpers pin
@@ -79,15 +90,32 @@ those helpers are standalone `components.json` release components.
 path for targets such as Jetson. Run it after full source-home setup replaces
 the gateway binary so the live front door comes back with a hash-bound Home and
 Services receipt.
+`source-home-capsule-inventory-smoke.py` proves source-home finalization removes
+only managed inactive capsules, preserves user state and unmanaged capsules,
+and stamps installed capsule metadata after all other manifest writers finish.
+`capsule-live-parity-smoke.py` is the final localhost artifact check: every
+active catalog entry must have one matching installed source tree, and every
+launchable browser projection must match the bytes served by the gateway.
 `auth-wallet-focus-smoke.sh` runs the current passkey, Recovery Kit,
 capsule-bridge principal storage, principal-launch, System managed-wallet route,
 wallet approval, managed-wallet, BTC, typed chain proof/prepare/broadcast,
 chain sync-health, node lifecycle, entropy, and alignment checks as one
 repeatable branch gate.
-`wallet-product-safety-smoke.sh` is the narrower 0.3.0 Wallet release-safety
-gate: MetaMask multi-account link/remove, passkey-gated delete and recovery key
+`wallet-product-safety-smoke.sh` is the product-level Wallet release-safety
+gate: MetaMask multi-account link/remove, passkey-gated delete and recovery-key
 routes, WalletConnect pinned-config gating, hidden Ledger UI, and no hosted
 Browser UniSat injection path.
+`check-first-party-wasi-gate.mjs` reports every first-party capsule with WASI
+Preview 1 evidence, allows only explicit non-product fixture classifications,
+and fails on any first-party product WASI usage.
+`check-component-bus-wit.mjs` verifies the minimal `elastos:bus@v1` WIT world
+and fails if it grows raw filesystem, raw network, environment authority,
+gateway URL, provider-selection, or WASI import surfaces.
+
+Some root `.mjs` files are script-local harnesses for same-named smoke wrappers
+or read-only report generators. Keep those at the root only when they are
+directly invoked by public smoke commands or by documented release gates;
+private target-maintenance commands should stay outside this repo.
 
 Browser proof helpers are intentionally explicit because Browser is still a
 proof surface, not a completed product browser. The commonly referenced gates
@@ -171,6 +199,9 @@ repo scripts parameterized through explicit environment variables or CLI flags.
   - `elastos-browser-selkies.env.example`
   - `elastos-browser-selkies.service`
   - `elastos-browser-selkies.sh`
+- `dev/` — development/operator-only helpers that are not part of the public
+  command contract
+  - `sign-elastos-vz/`
 
 Any deeper deployment or helper assets should stay out of the public root-script story unless they are part of the shipped public contract.
 
