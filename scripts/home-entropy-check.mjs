@@ -831,6 +831,10 @@ const shellCore = readAll([
 const shellWindows = read("capsules/home-gui/browser/shell-windows.js");
 const homeShellRegressionSmoke = read("scripts/home-shell-regression-smoke.mjs");
 const servicesCapsule = read("capsules/services/capsule.json");
+const peopleCapsule = read("capsules/people/capsule.json");
+const peopleIndex = read("capsules/people/browser/index.html");
+const peopleScript = read("capsules/people/browser/people.js");
+const peopleStyle = read("capsules/people/browser/style.css");
 const servicesIndex = read("capsules/services/browser/index.html");
 const servicesScript = read("capsules/services/browser/services.js");
 const servicesStyle = read("capsules/services/browser/style.css");
@@ -1243,7 +1247,7 @@ assert(
   "Linux source-home restart must preserve safe listener ownership checks and ok=false failure receipts",
 );
 const debugPolicy = read("DEBUG.md");
-const homeAssetVersion = "home-20260712b";
+const homeAssetVersion = "home-20260713a";
 assertUsersSelfReferencesAreApproved();
 assert(
   shellIndex.includes('role="listbox"'),
@@ -1470,7 +1474,6 @@ assert(
 );
 assert(
   shellWindows.includes("glyphTarget || id") &&
-    shellWindows.includes("glyphTarget: PEOPLE_TARGET_ID") &&
     shellWindows.includes("glyphTarget: launched.target") &&
     shellCore.includes("targetId === PEOPLE_TARGET_ID") &&
     shellCore.includes('<circle cx="9" cy="8" r="3" />'),
@@ -1651,164 +1654,36 @@ assert(
 assert(
   shellCore.includes('export const PEOPLE_TARGET_ID = "people"') &&
     !shellCore.includes('target: PEOPLE_TARGET_ID') &&
-    gatewayApi.includes('target: HOME_PEOPLE_TARGET_ID.to_string()') &&
-    gatewayApi.includes('route: "home://people"'),
-  "Home must consume the Runtime catalog entry for People instead of inventing a local target",
+    !shellCore.includes('route: "home://people"'),
+  "Home must render the canonical People target without manufacturing a local launcher entry",
 );
 assert(
-  shellWindows.includes("function renderPeopleWindowBody") &&
-    shellWindows.includes("people.contacts") &&
-    shellWindows.includes("No people yet") &&
-    shellWindows.includes("Request sent.") &&
-    shellWindows.includes("Request accepted. This person is now in People.") &&
-    shellWindows.includes("function peopleDisplayName") &&
-    shellWindows.includes("profileCard.display_name") &&
-    shellWindows.includes("function peopleDiscoveryRequestIsVisible") &&
-    shellWindows.includes("data-people-profile-form") &&
-    shellWindows.includes("home-people-discovery-header") &&
-    shellWindows.includes("home-people-discovery-actions") &&
-    shellWindows.includes("Turn on discovery for 10 minutes") &&
-    shellWindows.includes("Discoverable for") &&
-    shellWindows.includes("function peopleDiscoveryRemainingSeconds") &&
-    shellWindows.includes("function peopleDiscoveryRemainingText") &&
-    shellWindows.includes('>${enabled ? "Stop" : "Turn On"}</button>') &&
-    shellWindows.includes("PEOPLE_DISCOVERY_AUTO_REFRESH_STABLE_MS") &&
-    shellWindows.includes("peopleDiscoveryNextAutoRefreshDelay") &&
-    shellWindows.includes("refresh_fingerprint") &&
-    !shellWindows.includes("window.setInterval(run, PEOPLE_DISCOVERY_AUTO_REFRESH_MS)") &&
-    shellWindows.includes("schedulePeopleDiscoveryAutoRefresh") &&
-    shellWindows.includes("cleanupPeopleDiscoveryAutoRefresh") &&
-    shellWindows.includes("/api/apps/people/profile-card") &&
-    shellWindows.includes("data-people-action=\"chat\"") &&
-    shellWindows.includes("data-contact-route=") &&
-    shellWindows.includes("function openPersonChat") &&
-    shellWindows.includes("function homeTargetFromRoute") &&
-    !shellWindows.includes("Works like Bluetooth") &&
-    !shellWindows.includes("Status:") &&
-    !shellWindows.includes("Visibility:") &&
-    !shellWindows.includes("Peer:") &&
-    !shellWindows.includes("then refresh while another ElastOS home is discoverable") &&
-    !shellWindows.includes("home-people-profile-discovery") &&
-    !shellWindows.includes("home-people-discovery-meta") &&
-    !shellWindows.includes("data-people-action='message'") &&
-    !shellWindows.includes('openTarget("chat-room")') &&
-    !shellWindows.includes("Carrier"),
-  "Home People must own profile display names, expose contact Chat through contact routes, and avoid stale Message/Carrier copy",
+  peopleCapsule.includes('"name": "people"') &&
+    peopleCapsule.includes('"role": "app"') &&
+    peopleCapsule.includes('"runtime_abi": "elastos.runtime-projection/v1"') &&
+    peopleIndex.includes("People · ElastOS") &&
+    peopleIndex.includes("Open People from Home.") &&
+    peopleIndex.includes('id="profile-form"') &&
+    peopleIndex.includes('id="discovery"') &&
+    peopleScript.includes("/api/apps/people/summary") &&
+    peopleScript.includes("/api/apps/people/profile-card") &&
+    peopleScript.includes("/api/apps/people/discovery") &&
+    peopleScript.includes("/api/apps/people/discovery/refresh") &&
+    peopleScript.includes("/api/apps/people/discovery/requests") &&
+    peopleScript.includes("/api/apps/people/contacts/remove") &&
+    peopleScript.includes('type: "home:open-target"') &&
+    peopleScript.includes('target !== "chat-room"') &&
+    peopleStyle.includes(".people-shell") &&
+    peopleStyle.includes(".people-sidebar") &&
+    peopleStyle.includes(".discovery-grid") &&
+    !shellWindows.includes("renderPeopleWindowBody") &&
+    !shellWindows.includes("/api/apps/people/") &&
+    !shellStyle.includes(".home-people-") &&
+    shellWindows.includes('"people",') &&
+    shellJs.includes('people: new Set(["chat-room"])') &&
+    homeCmd.includes("issue_capsule_launch_token(&data_dir, PEOPLE_CAPSULE_NAME)"),
+  "People must be a standalone app capsule while Home remains only its launch and message host",
 );
-assert(
-    shellWindows.includes("home-people-shell") &&
-    shellWindows.includes("home-people-sidebar") &&
-    shellWindows.includes("home-people-sidebar-icon-people") &&
-    shellWindows.includes("home-people-sidebar-icon-discovery") &&
-    shellWindows.includes("data-people-action=\"remove\"") &&
-    shellWindows.includes("data-people-section=\"people\"") &&
-    shellWindows.includes("data-people-section=\"discovery\"") &&
-    shellWindows.includes("data-people-action=\"toggle-discovery\"") &&
-    shellWindows.includes("data-people-action='request-peer'") &&
-    shellWindows.includes("data-people-action=\"accept-request\"") &&
-    shellWindows.includes("data-people-action=\"chat\"") &&
-    !shellWindows.includes("data-people-action=\"services\"") &&
-    !shellWindows.includes("function openServicesForPerson") &&
-    !shellWindows.includes('openTarget("services"') &&
-    !shellWindows.includes("data-people-action=\"invite\"") &&
-    !shellWindows.includes("data-people-action=\"join-request\"") &&
-    !shellWindows.includes("Invite Person") &&
-    !shellWindows.includes("People invite ready. Send it to the person you want to add.") &&
-    !shellWindows.includes("No contacts yet") &&
-    !shellWindows.includes("trusted carrier contact") &&
-    !shellWindows.includes("Add trusted people over Carrier") &&
-    !shellWindows.includes("Carrier-visible") &&
-    !shellWindows.includes("Request sent over Carrier") &&
-    !shellWindows.includes("home-people-toolbar") &&
-    !shellWindows.includes("home-people-contact-copy") &&
-    !shellWindows.includes("home-people-contacts-title") &&
-    !shellWindows.includes("home-people-count") &&
-    !shellWindows.includes("home-people-discovery-card") &&
-    !shellWindows.includes("home-people-section-heading") &&
-    !shellWindows.includes("trusted ${") &&
-    !shellWindows.includes("home-people-sidebar-icon-contacts") &&
-    shellWindows.includes("/api/apps/people/discovery") &&
-    shellWindows.includes("/api/apps/people/discovery/refresh") &&
-    shellWindows.includes("/api/apps/people/discovery/requests") &&
-    shellWindows.includes("/accept") &&
-    !shellWindows.includes("/join") &&
-    !shellWindows.includes("/api/apps/people/invites/create") &&
-    shellWindows.includes("/api/apps/people/contacts/remove") &&
-    shellStyle.includes(".home-people-shell") &&
-    shellStyle.includes(".home-people-sidebar") &&
-    shellStyle.includes(".home-people-sidebar-icon") &&
-    !shellStyle.includes(".home-people-sidebar-title") &&
-    !shellWindows.includes("home-people-sidebar-title") &&
-    !shellStyle.includes(".home-people-toolbar") &&
-    !shellStyle.includes(".home-people-contact-copy") &&
-    shellStyle.includes(".home-people-badge") &&
-    !shellStyle.includes(".home-people-invite") &&
-    !shellStyle.includes(".home-people-invite-copy") &&
-    !shellStyle.includes(".home-people-invite-row") &&
-    !shellStyle.includes(".home-people-count") &&
-    !shellStyle.includes(".home-people-sidebar-item strong") &&
-    shellStyle.includes(".home-people-profile-card") &&
-    shellStyle.includes(".home-people-profile-form") &&
-    shellStyle.includes(".home-people-discovery-header") &&
-    shellStyle.includes(".home-people-discovery-actions") &&
-    !shellStyle.includes(".home-people-profile-discovery") &&
-    !shellStyle.includes(".home-people-discovery-meta") &&
-    !shellStyle.includes(".home-people-discovery-card") &&
-    shellStyle.includes(".home-people-discovery-grid") &&
-    shellStyle.includes("grid-template-columns: minmax(0, 1fr)") &&
-    !shellStyle.includes(".home-people-section-heading") &&
-    shellStyle.includes(".home-people-card-actions") &&
-    shellStyle.includes(".home-people-card") &&
-    shellStyle.includes(".home-people-action"),
-  "Home People UI must expose profile, people, discovery requests, and local removal without toolbar, trusted-count, or chat invite controls",
-);
-for (const stalePeopleServiceToken of [
-  "My Runtime Offers",
-  "Trusted People Services",
-  "data-people-action=\"open-service\"",
-  "data-people-action=\"services\"",
-  "data-people-action=\"prepare-share\"",
-  "data-people-action=\"review-service\"",
-  "peopleServiceOfferTargetId",
-  "peopleServiceOfferCardMarkup",
-  "summary.services",
-  "provider-backed discovery",
-  "Runtime capability grants",
-]) {
-  assert(
-    !shellWindows.includes(stalePeopleServiceToken),
-    `Home People must not contain stale service UI token: ${stalePeopleServiceToken}`,
-  );
-}
-for (const stalePeopleContactToken of [
-  "1:1 Chat",
-  "home-people-sidebar-card",
-  "Conversation invite link",
-  "Signed Chat invite URI",
-  "Chat invite",
-  "This is an ElastOS invite URI",
-  "Join a Conversation field labeled Invite code or link",
-  "Invite link ready.",
-  "Invite link copied.",
-  "Add a trusted person to start a conversation.",
-]) {
-  assert(
-    !shellWindows.includes(stalePeopleContactToken) &&
-      !shellStyle.includes(stalePeopleContactToken),
-    `Home People must not contain stale contact UI token: ${stalePeopleContactToken}`,
-  );
-}
-for (const stalePeopleServiceStyle of [
-  ".home-people-services",
-  ".home-people-service-card",
-  ".home-people-service-pill",
-  ".home-people-action-primary",
-]) {
-  assert(
-    !shellStyle.includes(stalePeopleServiceStyle),
-    `Home People CSS must not contain stale service selector: ${stalePeopleServiceStyle}`,
-  );
-}
 assert(
   servicesCapsule.includes('"name": "services"') &&
     servicesCapsule.includes('"role": "app"') &&
@@ -1979,7 +1854,9 @@ assert(
   "Home must expose local and remote service offers through a top-level runtime services summary",
 );
 assert(
-  gatewayApi.includes('"/api/apps/people/discovery"') &&
+  gatewayApi.includes('const PEOPLE_CAPSULE_ID: &str = "people"') &&
+    gatewayApi.includes('"/api/apps/people/summary"') &&
+    gatewayApi.includes('"/api/apps/people/discovery"') &&
     gatewayApi.includes('"/api/apps/people/profile-card"') &&
     gatewayApi.includes('"/api/apps/people/discovery/refresh"') &&
     gatewayApi.includes('"/api/apps/people/discovery/requests"') &&
@@ -2069,7 +1946,8 @@ assert(
       "test_people_discovery_expired_visibility_reports_off_and_refresh_does_not_publish",
     ) &&
     gatewayHomeSystemTests.includes("test_people_discovery_refresh_finds_visible_peer") &&
-    gatewayHomeSystemTests.includes("test_people_profile_card_update_uses_home_session_token") &&
+    gatewayHomeSystemTests.includes("test_people_profile_card_update_uses_people_launch_token") &&
+    gatewayHomeSystemTests.includes("test_people_summary_requires_people_launch_token") &&
     gatewayHomeSystemTests.includes("test_people_discovery_request_accept_contact_round_trip") &&
     gatewayHomeSystemTests.includes(
       "test_people_discovery_request_send_failure_does_not_save_requested_state",
@@ -2086,7 +1964,7 @@ assert(
     gatewayApi.includes("export_room_join_invite") &&
     roomService.includes('invite_url: format!("elastos://peer/invite?token={token}")') &&
     roomService.includes("RoomRole::Member => matches!(invited_role, RoomRole::Member)"),
-  "Home People Discovery must create People entries while conversation invites remain a separate room policy route",
+  "People Discovery must create People entries while conversation invites remain a separate room policy route",
 );
 const finishAttachmentUploadBlock = sourceBlock(
   roomService,
@@ -2129,7 +2007,7 @@ assert(
       "pub(super) async fn people_contact_remove",
       "People contact remove handler",
     ).includes("remove_room_member"),
-  "Home People Remove must be local People state, not conversation member ejection",
+  "People Remove must be local People state, not conversation member ejection",
 );
 assert(
   shellJs.includes('scope === "people"') &&
@@ -7540,7 +7418,7 @@ assert(
     rememberWindowRestoreBounds(entry.node);
     return;
   }`) &&
-    shellWindows.includes('SINGLE_SESSION_TARGETS = new Set([PEOPLE_TARGET_ID, "inbox", "wallet"])') &&
+    shellWindows.includes('SINGLE_SESSION_TARGETS = new Set(["people", "inbox", "wallet"])') &&
     !shellWindows.includes('SINGLE_SESSION_TARGETS = new Set(["browser"])') &&
     shellWindows.includes("export function normalizeRestorableSession") &&
     shellWindows.includes("withBrowserInstanceQuery(options)") &&

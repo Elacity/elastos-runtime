@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>People · ElastOS</title>
+  <link rel="stylesheet" href="./style.css?v=people-20260713a">
+</head>
+<body>
+  <section id="locked-shell" class="locked-shell hidden">
+    <div class="locked-card">
+      <p class="eyebrow">ElastOS</p>
+      <h1>Open from Home</h1>
+      <p>Open People from Home.</p>
+    </div>
+  </section>
+
+  <main id="people-shell" class="people-shell hidden" aria-label="People">
+    <aside class="people-sidebar" aria-label="People sections">
+      <button class="people-sidebar-item active" type="button" data-section-target="people">
+        <span class="people-sidebar-icon people-sidebar-icon-people" aria-hidden="true"></span>
+        <span>People</span>
+      </button>
+      <button class="people-sidebar-item" type="button" data-section-target="discovery">
+        <span class="people-sidebar-icon people-sidebar-icon-discovery" aria-hidden="true"></span>
+        <span>Discovery</span>
+      </button>
+    </aside>
+
+    <section class="people-main">
+      <div id="people-status" class="people-status" role="status" hidden></div>
+      <div class="people-content">
+        <section id="people" class="people-section" aria-label="People">
+          <section class="profile-card" aria-labelledby="profile-title">
+            <div>
+              <h2 id="profile-title">My Profile</h2>
+              <p>Shown to people you connect with.</p>
+            </div>
+            <form id="profile-form" class="profile-form">
+              <label for="profile-name">Display name</label>
+              <input id="profile-name" type="text" maxlength="32" autocomplete="nickname" placeholder="Your name">
+              <button type="submit">Save</button>
+            </form>
+          </section>
+          <div id="people-list" class="people-list"></div>
+        </section>
+
+        <section id="discovery" class="people-section" aria-label="Discovery">
+          <div class="discovery-header">
+            <div>
+              <h2>Discovery</h2>
+              <p id="discovery-copy">Find another ElastOS home nearby.</p>
+            </div>
+            <div class="discovery-actions">
+              <span id="discovery-countdown" class="discovery-countdown" hidden></span>
+              <button id="toggle-discovery" type="button">Turn On</button>
+              <button id="refresh-discovery" type="button">Refresh</button>
+            </div>
+          </div>
+          <div class="discovery-grid">
+            <section>
+              <h3>Visible People</h3>
+              <div id="discovered-list" class="people-list"></div>
+            </section>
+            <section>
+              <h3>Requests</h3>
+              <div id="request-list" class="people-list"></div>
+            </section>
+          </div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="./people.js?v=people-20260713a"></script>
+</body>
+</html>

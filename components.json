@@ -755,6 +755,20 @@
         }
       }
     },
+    "people": {
+      "install_path": "capsules/people",
+      "description": "People capsule for contacts, profile details, and local discovery",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "people.tar.gz",
+          "extract_path": "people",
+          "install_path": "capsules/people"
+        }
+      }
+    },
     "wallet-metamask": {
       "install_path": "capsules/wallet-metamask",
       "description": "Optional MetaMask approval-method connector capsule",
@@ -1194,6 +1208,7 @@
         "home",
         "system",
         "services",
+        "people",
         "wallet-metamask",
         "wallet-unisat",
         "wallet-walletconnect",
@@ -1229,6 +1244,7 @@
         "home",
         "system",
         "services",
+        "people",
         "wallet-metamask",
         "wallet-unisat",
         "wallet-walletconnect",
@@ -1306,6 +1322,7 @@
         "home",
         "system",
         "services",
+        "people",
         "wallet-metamask",
         "wallet-unisat",
         "wallet-walletconnect",
@@ -1345,6 +1362,7 @@
         "home",
         "system",
         "services",
+        "people",
         "wallet-metamask",
         "wallet-unisat",
         "wallet-walletconnect",
@@ -1392,6 +1410,7 @@
         "home",
         "system",
         "services",
+        "people",
         "wallet-metamask",
         "wallet-unisat",
         "wallet-walletconnect",

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260712b";
+const moduleVersion = "home-20260713a";
 const savedStatePatches = [];
 const requests = [];
 
@@ -144,7 +144,7 @@ const summary = {
   targets: [
     { target: "wallet", title: "Wallet", route: "/apps/wallet/" },
     { target: "inbox", title: "Inbox", route: "/apps/inbox/" },
-    { target: "people", title: "People", route: "home://people", attach_kind: "home", role: "app" },
+    { target: "people", title: "People", route: "/apps/people/", attach_kind: "iframe", role: "app" },
     { target: "browser", title: "Browser", route: "/apps/browser/" },
     { target: "system", title: "System", route: "/apps/system/" },
   ],

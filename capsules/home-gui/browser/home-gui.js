@@ -20,12 +20,12 @@ import {
   shellInteractionActive,
   shouldIgnoreDesktopKeydown,
   targetById,
-} from "./shell-core.js?v=home-20260712b";
+} from "./shell-core.js?v=home-20260713a";
 import {
   clearIdentitySurface,
   syncIdentity,
   updateClock,
-} from "./shell-chrome.js?v=home-20260712b";
+} from "./shell-chrome.js?v=home-20260713a";
 import {
   clearDesktopSelection,
   continueTargetDrag,
@@ -46,7 +46,7 @@ import {
   renderTaskbar,
   toggleLauncher,
   updateTaskbarState,
-} from "./shell-surface.js?v=home-20260712b";
+} from "./shell-surface.js?v=home-20260713a";
 import {
   closeWindow,
   cleanupBeforeUnload,
@@ -54,10 +54,9 @@ import {
   handleShellResize,
   openTarget,
   focusWindow,
-  refreshHomeInternalWindows,
   restoreShellSession,
   showDesktopHome,
-} from "./shell-windows.js?v=home-20260712b";
+} from "./shell-windows.js?v=home-20260713a";
 
 await ensureHomeGuiDom();
 
@@ -181,10 +180,6 @@ export function showHomeGuiDesktop() {
 
 export function restoreHomeGuiSession() {
   return restoreShellSession();
-}
-
-export function refreshHomeGuiInternalWindows(summary) {
-  refreshHomeInternalWindows(summary);
 }
 
 export function closeHomeGuiWindowsForTarget(targetId) {
@@ -328,9 +323,6 @@ export function syncHomeGuiProjection(previous, summary, options = {}) {
     syncHomeGuiChrome(previous, summary);
   }
   syncHomeGuiAppearance(summary);
-  if (options.activeShellIsHomeGui === true) {
-    refreshHomeGuiInternalWindows(summary);
-  }
   if (options.activeShellMode === "alternate") {
     hideLauncher();
     return;

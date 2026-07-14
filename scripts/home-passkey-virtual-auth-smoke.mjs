@@ -526,6 +526,7 @@ function parseAppMatrixTargets(raw) {
     "browser",
     "documents",
     "inbox",
+    "people",
     "gba-ucity",
   ];
   const values = raw == null || raw.trim() === ""

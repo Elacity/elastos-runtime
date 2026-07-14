@@ -511,11 +511,6 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
         .as_array()
         .unwrap();
     for target in public_payload["targets"].as_array().unwrap() {
-        if target["target"] == HOME_PEOPLE_TARGET_ID {
-            assert_eq!(target["route"], "home://people");
-            assert_eq!(target["attach_kind"], "home");
-            continue;
-        }
         let capsule = catalog_capsules
             .iter()
             .find(|capsule| capsule["launch_target"] == target["target"])
@@ -700,7 +695,7 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     assert!(targets.iter().all(|target| {
         target["target"]
             .as_str()
-            .is_some_and(|name| name == HOME_PEOPLE_TARGET_ID || active_capsules.contains(name))
+            .is_some_and(|name| active_capsules.contains(name))
     }));
     assert!(targets
         .iter()
@@ -1789,7 +1784,7 @@ async fn test_people_invite_create_returns_conversation_join_link() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/people/invites/create")
-                .header("x-elastos-home-token", authority.home_token.as_str())
+                .header("x-elastos-home-token", authority.people_token.as_str())
                 .header("host", "localhost:61180")
                 .body(Body::empty())
                 .unwrap(),
@@ -1812,7 +1807,8 @@ async fn test_people_invite_create_returns_conversation_join_link() {
 async fn test_people_discovery_toggle_persists_in_home_summary() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
-    let token = home_app_token(dir.path());
+    let token = people_app_token(dir.path());
+    let home_token = home_app_token(dir.path());
 
     let response = app
         .clone()
@@ -1847,7 +1843,7 @@ async fn test_people_discovery_toggle_persists_in_home_summary() {
         .oneshot(
             Request::builder()
                 .uri("/api/apps/home/summary")
-                .header("x-elastos-home-token", token.as_str())
+                .header("x-elastos-home-token", home_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1875,7 +1871,8 @@ async fn test_people_discovery_expired_visibility_reports_off_and_refresh_does_n
     let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
     let runtime = start_fake_runtime(dir.path(), bus, "people-expired").await;
     let app = gateway_router(test_state(dir.path()));
-    let token = home_app_token(dir.path());
+    let token = people_app_token(dir.path());
+    let home_token = home_app_token(dir.path());
     let context = local_home_launch_token_context(dir.path()).unwrap();
     let localhost_root = crate::auth::principal_localhost_root(&context.principal_id);
     write_home_principal_object_json(
@@ -1899,7 +1896,7 @@ async fn test_people_discovery_expired_visibility_reports_off_and_refresh_does_n
         .oneshot(
             Request::builder()
                 .uri("/api/apps/home/summary")
-                .header("x-elastos-home-token", token.as_str())
+                .header("x-elastos-home-token", home_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1954,8 +1951,8 @@ async fn test_people_discovery_refresh_finds_visible_peer() {
     let _right_runtime = start_fake_runtime(right.path(), bus, "people-right").await;
     let left_app = gateway_router(test_state(left.path()));
     let right_app = gateway_router(test_state(right.path()));
-    let left_token = home_app_token(left.path());
-    let right_token = home_app_token(right.path());
+    let left_token = people_app_token(left.path());
+    let right_token = people_app_token(right.path());
 
     let left_enable = left_app
         .clone()
@@ -2019,7 +2016,7 @@ async fn test_people_discovery_refresh_waits_for_pending_peer_capability() {
     let _runtime =
         start_fake_runtime_with_pending_capabilities(dir.path(), bus, "people-pending").await;
     let app = gateway_router(test_state(dir.path()));
-    let token = home_app_token(dir.path());
+    let token = people_app_token(dir.path());
 
     let enable = app
         .clone()
@@ -2076,7 +2073,7 @@ async fn test_people_discovery_refresh_joins_configured_peer_ticket() {
     )
     .unwrap();
     let app = gateway_router(test_state(dir.path()));
-    let token = home_app_token(dir.path());
+    let token = people_app_token(dir.path());
 
     let enable = app
         .clone()
@@ -2134,7 +2131,7 @@ async fn test_people_discovery_refresh_reuses_recent_join_and_presence() {
     let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
     let runtime = start_fake_runtime(dir.path(), bus, "people-quiet").await;
     let app = gateway_router(test_state(dir.path()));
-    let token = home_app_token(dir.path());
+    let token = people_app_token(dir.path());
 
     let enable = app
         .clone()
@@ -2269,8 +2266,8 @@ async fn test_people_discovery_request_send_failure_does_not_save_requested_stat
         start_fake_runtime(right.path(), bus.clone(), "people-right-request-fail").await;
     let left_app = gateway_router(test_state(left.path()));
     let right_app = gateway_router(test_state(right.path()));
-    let left_token = home_app_token(left.path());
-    let right_token = home_app_token(right.path());
+    let left_token = people_app_token(left.path());
+    let right_token = people_app_token(right.path());
 
     for (app, token) in [
         (left_app.clone(), left_token.as_str()),
@@ -2348,8 +2345,8 @@ async fn test_people_discovery_accept_send_failure_does_not_save_joined_state() 
         start_fake_runtime(right.path(), bus.clone(), "people-right-accept-fail").await;
     let left_app = gateway_router(test_state(left.path()));
     let right_app = gateway_router(test_state(right.path()));
-    let left_token = home_app_token(left.path());
-    let right_token = home_app_token(right.path());
+    let left_token = people_app_token(left.path());
+    let right_token = people_app_token(right.path());
 
     for (app, token) in [
         (left_app.clone(), left_token.as_str()),
@@ -2473,7 +2470,7 @@ async fn test_people_discovery_join_send_failure_does_not_save_joined_state() {
     let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
     let _left_runtime = start_fake_runtime(left.path(), bus.clone(), "people-left-join-fail").await;
     let left_app = gateway_router(test_state(left.path()));
-    let left_token = home_app_token(left.path());
+    let left_token = people_app_token(left.path());
     let (_, left_did) = elastos_identity::load_or_create_did(left.path()).unwrap();
     let (_, right_did) = elastos_identity::load_or_create_did(right.path()).unwrap();
     crate::room_service::seed_room_owner(
@@ -2572,8 +2569,10 @@ async fn test_people_discovery_request_accept_without_passkey_handle() {
     let _right_runtime = start_fake_runtime(right.path(), bus, "people-right-no-handle").await;
     let left_app = gateway_router(test_state(left.path()));
     let right_app = gateway_router(test_state(right.path()));
-    let left_token = home_app_token(left.path());
-    let right_token = home_app_token(right.path());
+    let left_token = people_app_token(left.path());
+    let right_token = people_app_token(right.path());
+    let left_home_token = home_app_token(left.path());
+    let right_home_token = home_app_token(right.path());
     let (_, left_did) = elastos_identity::load_or_create_did(left.path()).unwrap();
 
     for (app, token) in [
@@ -2681,7 +2680,7 @@ async fn test_people_discovery_request_accept_without_passkey_handle() {
         .oneshot(
             Request::builder()
                 .uri("/api/apps/home/summary")
-                .header("x-elastos-home-token", right_token.as_str())
+                .header("x-elastos-home-token", right_home_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2725,7 +2724,7 @@ async fn test_people_discovery_request_accept_without_passkey_handle() {
         .oneshot(
             Request::builder()
                 .uri("/api/apps/home/summary")
-                .header("x-elastos-home-token", left_token.as_str())
+                .header("x-elastos-home-token", left_home_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2755,8 +2754,8 @@ async fn test_people_discovery_request_accept_is_idempotent_for_active_member() 
     let _right_runtime = start_fake_runtime(right.path(), bus, "people-right-active-member").await;
     let left_app = gateway_router(test_state(left.path()));
     let right_app = gateway_router(test_state(right.path()));
-    let left_token = home_app_token(left.path());
-    let right_token = home_app_token(right.path());
+    let left_token = people_app_token(left.path());
+    let right_token = people_app_token(right.path());
     let (_, left_did) = elastos_identity::load_or_create_did(left.path()).unwrap();
     let (_, right_did) = elastos_identity::load_or_create_did(right.path()).unwrap();
 
@@ -2952,8 +2951,8 @@ async fn test_people_discovery_request_accept_contact_round_trip() {
     }
 
     for (app, token) in [
-        (left_app.clone(), left_authority.home_token.as_str()),
-        (right_app.clone(), right_authority.home_token.as_str()),
+        (left_app.clone(), left_authority.people_token.as_str()),
+        (right_app.clone(), right_authority.people_token.as_str()),
     ] {
         let response = app
             .oneshot(
@@ -2976,7 +2975,7 @@ async fn test_people_discovery_request_accept_contact_round_trip() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/people/discovery/refresh")
-                .header("x-elastos-home-token", left_authority.home_token.as_str())
+                .header("x-elastos-home-token", left_authority.people_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2990,7 +2989,7 @@ async fn test_people_discovery_request_accept_contact_round_trip() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/people/discovery/requests")
-                .header("x-elastos-home-token", left_authority.home_token.as_str())
+                .header("x-elastos-home-token", left_authority.people_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"peer_id":"people-right"}"#))
                 .unwrap(),
@@ -3015,7 +3014,10 @@ async fn test_people_discovery_request_accept_contact_round_trip() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/people/discovery/refresh")
-                .header("x-elastos-home-token", right_authority.home_token.as_str())
+                .header(
+                    "x-elastos-home-token",
+                    right_authority.people_token.as_str(),
+                )
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3040,7 +3042,10 @@ async fn test_people_discovery_request_accept_contact_round_trip() {
                     "/api/apps/people/discovery/requests/{}/accept",
                     request_id
                 ))
-                .header("x-elastos-home-token", right_authority.home_token.as_str())
+                .header(
+                    "x-elastos-home-token",
+                    right_authority.people_token.as_str(),
+                )
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3086,7 +3091,7 @@ async fn test_people_discovery_request_accept_contact_round_trip() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/people/discovery/refresh")
-                .header("x-elastos-home-token", left_authority.home_token.as_str())
+                .header("x-elastos-home-token", left_authority.people_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3137,7 +3142,10 @@ async fn test_people_discovery_request_accept_contact_round_trip() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/people/discovery/refresh")
-                .header("x-elastos-home-token", right_authority.home_token.as_str())
+                .header(
+                    "x-elastos-home-token",
+                    right_authority.people_token.as_str(),
+                )
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3225,7 +3233,7 @@ async fn test_people_invite_create_allows_conversation_member_when_user_invites_
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/people/invites/create")
-                .header("x-elastos-home-token", authority.home_token.as_str())
+                .header("x-elastos-home-token", authority.people_token.as_str())
                 .header("host", "localhost:61180")
                 .body(Body::empty())
                 .unwrap(),
@@ -3302,7 +3310,7 @@ async fn test_people_contact_remove_hides_accepted_conversation_contact_locally(
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/people/contacts/remove")
-                .header("x-elastos-home-token", authority.home_token.as_str())
+                .header("x-elastos-home-token", authority.people_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({ "contact_id": contact_id }).to_string(),
@@ -4314,7 +4322,7 @@ async fn test_system_handle_derives_from_passkey_principal() {
 }
 
 #[tokio::test]
-async fn test_people_profile_card_update_uses_home_session_token() {
+async fn test_people_profile_card_update_uses_people_launch_token() {
     let dir = tempfile::tempdir().unwrap();
     let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
     let _runtime = start_fake_runtime(dir.path(), bus, "people-profile-peer").await;
@@ -4327,7 +4335,7 @@ async fn test_people_profile_card_update_uses_home_session_token() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/people/profile-card")
-                .header("x-elastos-home-token", authority.home_token.as_str())
+                .header("x-elastos-home-token", authority.people_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"handle":"People Name"}"#))
                 .unwrap(),
@@ -4360,6 +4368,49 @@ async fn test_people_profile_card_update_uses_home_session_token() {
     assert_eq!(
         payload["identity"]["profile_card"]["display_name"],
         "People Name"
+    );
+}
+
+#[tokio::test]
+async fn test_people_summary_requires_people_launch_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority_with_name(dir.path(), Some("Alex"));
+
+    let rejected = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/apps/people/summary")
+                .header("x-elastos-home-token", authority.home_token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+    let summary = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/apps/people/summary")
+                .header("x-elastos-home-token", authority.people_token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(summary.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["schema"], "elastos.people.summary/v1");
+    assert_eq!(payload["identity"]["handle"], "Alex");
+    assert!(payload["people"]["contacts"].is_array());
+    assert_eq!(
+        payload["people"]["discovery"]["schema"],
+        "elastos.people.discovery/v1"
     );
 }
 

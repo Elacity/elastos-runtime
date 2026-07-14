@@ -1,0 +1,72 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "people",
+  "version": "0.1.0",
+  "description": "Manage people, profile details, and local discovery",
+  "author": "elastos",
+  "role": "app",
+  "type": "wasm",
+  "runtime_abi": "elastos.runtime-projection/v1",
+  "bus_contract": "elastos.runtime-projection/v1",
+  "execution": "web-projection",
+  "projections": ["web", "facts", "affordances", "gates"],
+  "entrypoint": "browser/index.html",
+  "interfaces": [
+    {
+      "id": "elastos.people.contacts",
+      "version": "0.6.0",
+      "description": "Manage people and discovery for the signed-in user",
+      "methods": [
+        {
+          "id": "people.summary",
+          "description": "Read the current profile, contacts, and discovery state",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://people",
+          "operation": "read"
+        },
+        {
+          "id": "profile.update",
+          "description": "Update the display name shared with connected people",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://people/profile",
+          "operation": "update"
+        },
+        {
+          "id": "discovery.update",
+          "description": "Change local People discovery state",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://people/discovery",
+          "operation": "update"
+        },
+        {
+          "id": "discovery.request",
+          "description": "Request or approve a connection with a visible person",
+          "risk": "privileged",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://people/discovery/requests",
+          "operation": "request"
+        },
+        {
+          "id": "contacts.remove",
+          "description": "Remove a person from the local contact list",
+          "risk": "write",
+          "approval": "user",
+          "audit": "event",
+          "resource": "elastos://people/contacts",
+          "operation": "remove"
+        }
+      ]
+    }
+  ],
+  "resources": {
+    "memory_mb": 16,
+    "gpu": false
+  }
+}

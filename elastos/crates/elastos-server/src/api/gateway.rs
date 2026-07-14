@@ -159,7 +159,7 @@ const DOCUMENTS_CAPSULE_ID: &str = "documents";
 const LIBRARY_CAPSULE_ID: &str = "library";
 const MARKETPLACE_CAPSULE_ID: &str = "marketplace";
 const INBOX_CAPSULE_ID: &str = "inbox";
-const HOME_PEOPLE_TARGET_ID: &str = "people";
+const PEOPLE_CAPSULE_ID: &str = "people";
 
 pub fn capsule_catalog_snapshot(data_dir: &std::path::Path) -> serde_json::Value {
     serde_json::to_value(gateway_capsule_catalog::capsule_catalog_summary(data_dir)).unwrap_or_else(
@@ -791,6 +791,7 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route("/api/apps/services/offers", post(services_offer_update))
         .route("/api/apps/inbox/summary", get(inbox_summary))
         .route("/api/apps/inbox/actions", post(inbox_action))
+        .route("/api/apps/people/summary", get(people_summary))
         .route(
             "/api/apps/people/invites/create",
             post(people_invite_create),

@@ -9,6 +9,7 @@ const surfaces = [
   "home-cli",
   "system",
   "marketplace",
+  "people",
   "services",
   "inbox",
   "library",
@@ -104,6 +105,7 @@ for (const [path, options] of [
   ["capsules/home-cli/browser/index.html", {}],
   ["capsules/system/browser/index.html", { stripTechnicalDetails: true }],
   ["capsules/marketplace/browser/index.html", {}],
+  ["capsules/people/browser/index.html", {}],
   ["capsules/services/browser/index.html", {}],
   ["capsules/inbox/browser/index.html", {}],
   ["capsules/library/browser/index.html", {}],
@@ -223,6 +225,7 @@ assert(
 
 const homeHost = read("capsules/home/browser/home-shell-host.js");
 const homeWindows = read("capsules/home-gui/browser/shell-windows.js");
+const peopleApp = read("capsules/people/browser/people.js");
 assert(
   !homeHost.includes("Home event channel returned an invalid schema")
     && !homeHost.includes("Switching shells requires an explicit shell launch token")
@@ -232,7 +235,8 @@ assert(
 assert(
   !homeWindows.includes("Home asked the runtime to open this item")
     && !homeWindows.includes('subjectLabel: "Item ID"')
-    && homeWindows.includes("publicHomeGuiError"),
+    && !homeWindows.includes("/api/apps/people/")
+    && peopleApp.includes("function publicError(error, fallback)"),
   "Home GUI restored raw launch or People errors",
 );
 

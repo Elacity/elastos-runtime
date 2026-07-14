@@ -63,6 +63,7 @@ DEFAULT_CAPSULES=(
     home
     system
     services
+    people
     wallet-metamask
     wallet-unisat
     wallet-walletconnect
@@ -92,6 +93,7 @@ REQUIRED_SUPPORTED_CAPSULES=(
     home
     system
     services
+    people
     wallet-metamask
     wallet-unisat
     wallet-walletconnect
@@ -784,6 +786,7 @@ build_platform_independent_direct_assets() {
         archive-manager \
         inbox \
         services \
+        people \
         gba-emulator \
         gba-ucity \
         chat-room; do

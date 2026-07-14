@@ -128,17 +128,6 @@ pub(super) fn home_targets_from_catalog(
             })
         })
         .collect::<Vec<_>>();
-    targets.push(HomeTargetSummary {
-        target: HOME_PEOPLE_TARGET_ID.to_string(),
-        title: "People".to_string(),
-        description: "See accepted ElastOS contacts and start conversations.".to_string(),
-        route: "home://people".to_string(),
-        attach_kind: "home".to_string(),
-        role: CapsuleRole::App,
-        target_kind: HomeTargetKind::App,
-        viewer: None,
-        viewer_title: None,
-    });
     targets.sort_by(|left, right| {
         left.title
             .cmp(&right.title)
@@ -702,6 +691,7 @@ fn app_shell_title(name: &str) -> String {
         CHAT_ROOM_CAPSULE_ID => "Chat".to_string(),
         LIBRARY_CAPSULE_ID => "Library".to_string(),
         MARKETPLACE_CAPSULE_ID => "Marketplace".to_string(),
+        PEOPLE_CAPSULE_ID => "People".to_string(),
         INBOX_CAPSULE_ID => "Inbox".to_string(),
         SERVICES_CAPSULE_ID => "Services".to_string(),
         SYSTEM_CAPSULE_ID => "System".to_string(),
@@ -725,6 +715,7 @@ fn app_shell_description(name: &str, manifest_description: Option<String>) -> St
         MARKETPLACE_CAPSULE_ID => {
             "Browse installed apps, services, viewers, and content.".to_string()
         }
+        PEOPLE_CAPSULE_ID => "Manage people and local discovery.".to_string(),
         INBOX_CAPSULE_ID => "Review messages, requests, and approvals.".to_string(),
         SERVICES_CAPSULE_ID => "Manage Browser Exit Node sharing and subscriptions.".to_string(),
         SYSTEM_CAPSULE_ID => "Manage passkeys, appearance, and Home settings.".to_string(),

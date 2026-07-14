@@ -16,7 +16,7 @@ import {
   shellState,
   fetchJson,
   targetById,
-} from "./shell-core.js?v=home-20260712b";
+} from "./shell-core.js?v=home-20260713a";
 import {
   bindHomeUnlock,
   hideHomeUnlock,
@@ -24,7 +24,7 @@ import {
   refreshHomeSession,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260712b";
+} from "./shell-auth.js?v=home-20260713a";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_AFTER_INTERACTION_MS = 700;
@@ -36,8 +36,8 @@ const SESSION_REFRESH_MS = 10 * 60 * 1000;
 const ACTIVE_SHELL_HINT_KEY = "elastos.home.active-shell-hint";
 const HOME_CLI_SHELL_ID = "home-cli";
 const HOME_GUI_MODULE_URL = import.meta.url.startsWith("file:")
-  ? new URL("../../home-gui/browser/home-gui.js?v=home-20260712b", import.meta.url).href
-  : new URL("../home-gui/home-gui.js?v=home-20260712b", import.meta.url).href;
+  ? new URL("../../home-gui/browser/home-gui.js?v=home-20260713a", import.meta.url).href
+  : new URL("../home-gui/home-gui.js?v=home-20260713a", import.meta.url).href;
 const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   "archive-manager": new Set(["library"]),
   browser: new Set(["library"]),
@@ -47,6 +47,7 @@ const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   inbox: "visible-target",
   library: new Set(["archive-manager", "documents", "gba-emulator", "library"]),
   marketplace: "runtime-target",
+  people: new Set(["chat-room"]),
   services: new Set(["browser", "chat-room"]),
   system: "visible-target",
   "wallet": new Set(["wallet-metamask", "wallet-unisat"]),

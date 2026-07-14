@@ -20,6 +20,7 @@ use crate::runtime_control;
 
 const LOBBY_VERSION: &str = env!("ELASTOS_VERSION");
 const HOME_CLI_CAPSULE_NAME: &str = "home-cli";
+const PEOPLE_CAPSULE_NAME: &str = "people";
 const HOME_TERMINAL_HOST_INTENT_OSC_PREFIX: &str = "\x1b]777;elastos-home-intent=";
 const HOME_TERMINAL_HOST_INTENT_OSC_SUFFIX: &str = "\x07";
 const HOME_SESSION_ROOT: &str = "Local/SharedByLocalUsersAndBots/Home/sessions";
@@ -927,7 +928,7 @@ fn gateway_owned_home_terminal() -> bool {
         == Some(std::ffi::OsStr::new("1"))
 }
 
-fn issue_home_cli_launch_token(data_dir: &Path, app: &str) -> anyhow::Result<String> {
+fn issue_capsule_launch_token(data_dir: &Path, app: &str) -> anyhow::Result<String> {
     if let Some(token) =
         elastos_server::api::gateway::issue_gateway_owned_home_cli_launch_token(data_dir, app)?
     {
@@ -1113,7 +1114,7 @@ async fn dispatch_home_cli_invoke_intent(
     if invoke.resource.trim().is_empty() {
         anyhow::bail!("invoke intent is missing its Runtime resource binding");
     }
-    let token = issue_home_cli_launch_token(data_dir, &invoke.capsule)?;
+    let token = issue_capsule_launch_token(data_dir, &invoke.capsule)?;
     let request_id = home_cli_invoke_request_id();
     let principal = home_cli_invoke_principal(data_dir)?;
     let expected_binding = elastos_server::esp_binding::esp_request_binding(
@@ -2127,7 +2128,7 @@ async fn people_api_post(
     body: serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
     let data_dir = default_data_dir();
-    let token = issue_home_cli_launch_token(&data_dir, HOME_CLI_CAPSULE_NAME)?;
+    let token = issue_capsule_launch_token(&data_dir, PEOPLE_CAPSULE_NAME)?;
     let api_url = gateway_home_cli_api_url().unwrap_or_else(|| coords.api_url.clone());
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -2999,7 +3000,7 @@ async fn gather_home_summary_projection(
         };
         api_url
     };
-    let token = match issue_home_cli_launch_token(data_dir, HOME_CLI_CAPSULE_NAME) {
+    let token = match issue_capsule_launch_token(data_dir, HOME_CLI_CAPSULE_NAME) {
         Ok(token) => token,
         Err(err) if gateway_owned => {
             return Err(err).context("gateway-owned Home CLI summary unavailable: launch token");
@@ -3068,7 +3069,7 @@ async fn gather_capsule_interface_snapshot(
         };
         api_url
     };
-    let token = match issue_home_cli_launch_token(data_dir, HOME_CLI_CAPSULE_NAME) {
+    let token = match issue_capsule_launch_token(data_dir, HOME_CLI_CAPSULE_NAME) {
         Ok(token) => token,
         Err(err) if gateway_owned => {
             return Err(err)

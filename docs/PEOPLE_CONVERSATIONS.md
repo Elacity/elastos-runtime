@@ -1,8 +1,8 @@
 # People, Pairing, Friends, and Conversations
 
 Status: current product/UX contract. The implemented path covers conversation
-copy, signed peer invite links, a System profile-card object, signed profile
-propagation, `people.contacts[]`, and a Home-owned People panel with opt-in peer
+copy, signed peer invite links, a principal profile-card object, signed profile
+propagation, `people.contacts[]`, and a standalone People app with opt-in peer
 discovery. Full FriendRequest objects, Inbox acceptance, timed discoverability,
 deny/block handling, and separate direct-conversation objects remain planned.
 
@@ -110,7 +110,7 @@ Chat should show conversations:
 
 Near-term UI copy should avoid defaulting to "owner/admin/member" unless the
 user opens advanced room controls. The normal participant list should show
-profile names and devices, for example `Anders`, `MacA`, or `Anders on MacBook`.
+profile names and devices, for example `Alex`, `MacA`, or `Alex on MacBook`.
 
 ## UI Patterns
 
@@ -136,7 +136,7 @@ Use a focused sheet with three equivalent ways to pair:
 - copy link
 
 Show the expiry plainly: `Expires in 10 minutes`. The receiver should see:
-`Pair this Mac with Anders?` and a short explanation of what pairing grants.
+`Pair this Mac with Alex?` and a short explanation of what pairing grants.
 
 ### Discovery Panel
 
@@ -237,7 +237,7 @@ invite. The receiver introduces its profile/device proof during accept.
 
 ### Slice 1 - Copy and Mental Model Cleanup
 
-Status: landed locally in `67f0c2e`.
+Status: implemented.
 
 Scope:
 
@@ -256,7 +256,7 @@ User test:
 
 ### Slice 2 - Join Shared Conversation by Code
 
-Status: landed locally in `8529104` for signed peer invite links.
+Status: implemented for signed peer invite links.
 
 Scope:
 
@@ -272,22 +272,22 @@ User test:
 
 ### Slice 3 - Profile Card Object
 
-Status: landed locally in `4045586`.
+Status: implemented.
 
 Scope:
 
 - Add a small profile card object under the principal root.
 - Surface display name/device label consistently in Home/Chat.
-- Keep editing in System/Profile first.
+- Keep editing in People.
 
 User test:
 
 - Change profile display name.
-- Chat and People/Home summary reflect the new label without exposing DID.
+- Chat and People reflect the new label without exposing DID.
 
 ### Slice 4 - People/Friends Read Model
 
-Status: partially landed locally in `453bda2` and `8b65202`.
+Status: partially implemented.
 
 Scope:
 
@@ -306,8 +306,9 @@ Current implementation note:
 - Accepted Chat conversation members are the first contact source.
 - Signed join/accept envelopes carry optional profile-card summaries.
 - Home summary exposes `people.contacts[]`.
-- Home browser renders an internal People panel and opens Chat from `Message`.
-- Home browser also renders opt-in peer discovery backed by Carrier gossip:
+- The People capsule renders contacts and opens Chat from `Chat` through a
+  validated Home intent.
+- The People capsule also renders opt-in peer discovery backed by Carrier gossip:
   visible peers can be requested, receivers can accept, requesters can join, and
   the resulting signed invite/acceptance creates the first People contact.
 - Dedicated `FriendRequest` objects, Inbox approval, timed discoverability, and
@@ -315,7 +316,7 @@ Current implementation note:
 
 ### Slice 5 - Opt-In Discovery
 
-Status: partially landed locally in `b63eedff` and tightened in `5e0a3051`.
+Status: partially implemented.
 
 Scope:
 

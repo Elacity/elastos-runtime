@@ -371,6 +371,7 @@ APP_CAPSULES=(
     home
     system
     services
+    people
     browser
     documents
     library

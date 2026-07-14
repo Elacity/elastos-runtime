@@ -381,14 +381,55 @@ pub(super) async fn home_summary(
     .into_response()
 }
 
+pub(super) async fn people_summary(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response {
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, PEOPLE_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return home_error_response(err),
+        };
+    let identity = load_gateway_identity_summary_for_context(&state.data_dir, &context);
+    let data_dir = state.data_dir.clone();
+    match tokio::task::spawn_blocking(move || {
+        let mut state = home_state(&data_dir);
+        apply_home_people_contacts_state(
+            &data_dir,
+            &context,
+            &mut state.people,
+            &mut state.services,
+        )?;
+        filter_removed_people_contacts(
+            &data_dir,
+            &context,
+            &mut state.people,
+            &mut state.services,
+        )?;
+        state.people.discovery = home_people_discovery_summary(&data_dir, &context)?;
+        Ok::<_, anyhow::Error>(serde_json::json!({
+            "schema": "elastos.people.summary/v1",
+            "identity": identity,
+            "people": state.people,
+        }))
+    })
+    .await
+    {
+        Ok(Ok(summary)) => Json(summary).into_response(),
+        Ok(Err(err)) => home_error_response(err),
+        Err(err) => home_error_response(anyhow::anyhow!(err)),
+    }
+}
+
 pub(super) async fn people_invite_create(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context = match require_home_token_context(&state.data_dir, &headers) {
-        Ok(context) => context,
-        Err(err) => return home_error_response(err),
-    };
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, PEOPLE_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return home_error_response(err),
+        };
     let issuer_gateway = match chat_room_invite_gateway_origin(&headers) {
         Some(value) => value,
         None => {
@@ -428,10 +469,11 @@ pub(super) async fn people_contact_remove(
     headers: HeaderMap,
     Json(body): Json<PeopleContactRemoveRequest>,
 ) -> Response {
-    let context = match require_home_token_context(&state.data_dir, &headers) {
-        Ok(context) => context,
-        Err(err) => return home_error_response(err),
-    };
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, PEOPLE_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return home_error_response(err),
+        };
     let contact_id = body.contact_id.trim().to_string();
     if contact_id.is_empty() {
         return (StatusCode::BAD_REQUEST, "missing contact id").into_response();
@@ -475,10 +517,11 @@ pub(super) async fn people_profile_card_update(
     headers: HeaderMap,
     Json(req): Json<SystemHandleUpdateRequest>,
 ) -> Response {
-    let context = match require_home_token_context(&state.data_dir, &headers) {
-        Ok(context) => context,
-        Err(err) => return home_error_response(err),
-    };
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, PEOPLE_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return home_error_response(err),
+        };
     match update_profile_card_for_context(&state.data_dir, &context, &req.handle) {
         Ok(identity) => Json(identity).into_response(),
         Err(err) => home_error_response(err),
@@ -501,10 +544,11 @@ pub(super) async fn people_discovery_update(
     headers: HeaderMap,
     Json(body): Json<PeopleDiscoveryUpdateRequest>,
 ) -> Response {
-    let context = match require_home_token_context(&state.data_dir, &headers) {
-        Ok(context) => context,
-        Err(err) => return home_error_response(err),
-    };
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, PEOPLE_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return home_error_response(err),
+        };
     let data_dir = state.data_dir.clone();
     match tokio::task::spawn_blocking(move || {
         let mut discovery = home_people_discovery_state(&data_dir, &context)?;
@@ -539,10 +583,11 @@ pub(super) async fn people_discovery_refresh(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context = match require_home_token_context(&state.data_dir, &headers) {
-        Ok(context) => context,
-        Err(err) => return home_error_response(err),
-    };
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, PEOPLE_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return home_error_response(err),
+        };
     let data_dir = state.data_dir.clone();
     if let Err(err) = ensure_people_discovery_runtime_available(&data_dir).await {
         return home_error_response(anyhow::anyhow!(
@@ -582,10 +627,11 @@ pub(super) async fn people_discovery_request_create(
     headers: HeaderMap,
     Json(body): Json<PeopleDiscoveryRequestCreate>,
 ) -> Response {
-    let context = match require_home_token_context(&state.data_dir, &headers) {
-        Ok(context) => context,
-        Err(err) => return home_error_response(err),
-    };
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, PEOPLE_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return home_error_response(err),
+        };
     let data_dir = state.data_dir.clone();
     if let Err(err) = ensure_people_discovery_runtime_available(&data_dir).await {
         return home_error_response(anyhow::anyhow!(
@@ -637,10 +683,11 @@ pub(super) async fn people_discovery_request_accept(
     headers: HeaderMap,
     Path(request_id): Path<String>,
 ) -> Response {
-    let context = match require_home_token_context(&state.data_dir, &headers) {
-        Ok(context) => context,
-        Err(err) => return home_error_response(err),
-    };
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, PEOPLE_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return home_error_response(err),
+        };
     let data_dir = state.data_dir.clone();
     if let Err(err) = ensure_people_discovery_runtime_available(&data_dir).await {
         return home_error_response(anyhow::anyhow!(
@@ -707,10 +754,11 @@ pub(super) async fn people_discovery_request_join(
     headers: HeaderMap,
     Path(request_id): Path<String>,
 ) -> Response {
-    let context = match require_home_token_context(&state.data_dir, &headers) {
-        Ok(context) => context,
-        Err(err) => return home_error_response(err),
-    };
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, PEOPLE_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return home_error_response(err),
+        };
     let data_dir = state.data_dir.clone();
     if let Err(err) = ensure_people_discovery_runtime_available(&data_dir).await {
         return home_error_response(anyhow::anyhow!(
@@ -4798,11 +4846,10 @@ fn sanitize_home_browser_state_targets(
     data_dir: &std::path::Path,
     state: &mut HomeBrowserStateSummary,
 ) {
-    let mut known_targets = home_targets(data_dir)
+    let known_targets = home_targets(data_dir)
         .into_iter()
         .map(|target| target.target)
         .collect::<BTreeSet<_>>();
-    known_targets.insert(HOME_PEOPLE_TARGET_ID.to_string());
     state
         .recent_targets
         .retain(|target| known_targets.contains(target));

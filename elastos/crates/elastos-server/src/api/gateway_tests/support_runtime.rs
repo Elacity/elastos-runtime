@@ -227,6 +227,14 @@ fn seed_test_browser_capsules(data_dir: &std::path::Path) {
         Some("<!doctype html><title>Services</title>"),
     );
     write_test_wasm_entrypoint(data_dir, SERVICES_CAPSULE_ID);
+    write_test_browser_capsule(
+        data_dir,
+        PEOPLE_CAPSULE_ID,
+        "app",
+        "Test People capsule",
+        Some("<!doctype html><title>People</title>"),
+    );
+    write_test_wasm_entrypoint(data_dir, PEOPLE_CAPSULE_ID);
     write_test_static_capsule(
         data_dir,
         DOCUMENTS_CAPSULE_ID,
@@ -357,12 +365,17 @@ fn home_app_token(data_dir: &std::path::Path) -> String {
     issue_home_launch_token(data_dir, HOME_CAPSULE_ID).unwrap()
 }
 
+fn people_app_token(data_dir: &std::path::Path) -> String {
+    issue_home_launch_token(data_dir, PEOPLE_CAPSULE_ID).unwrap()
+}
+
 fn system_app_token(data_dir: &std::path::Path) -> String {
     issue_home_launch_token(data_dir, SYSTEM_CAPSULE_ID).unwrap()
 }
 
 struct TestPasskeyAuthority {
     home_token: String,
+    people_token: String,
     system_token: String,
     principal_id: String,
     proof_binding_id: String,
@@ -425,11 +438,17 @@ fn passkey_authority_with_name_role(
         proof_binding_id: principal.proof_binding_id.clone(),
         issued_at: now,
         expires_at: now + 12 * 60 * 60,
-        apps: vec![HOME_CAPSULE_ID.to_string(), SYSTEM_CAPSULE_ID.to_string()],
+        apps: vec![
+            HOME_CAPSULE_ID.to_string(),
+            PEOPLE_CAPSULE_ID.to_string(),
+            SYSTEM_CAPSULE_ID.to_string(),
+        ],
     };
     crate::auth::store_session_grant(data_dir, grant.clone()).unwrap();
     TestPasskeyAuthority {
         home_token: issue_home_launch_token_for_auth_grant(data_dir, HOME_CAPSULE_ID, &grant)
+            .unwrap(),
+        people_token: issue_home_launch_token_for_auth_grant(data_dir, PEOPLE_CAPSULE_ID, &grant)
             .unwrap(),
         system_token: issue_home_launch_token_for_auth_grant(data_dir, SYSTEM_CAPSULE_ID, &grant)
             .unwrap(),

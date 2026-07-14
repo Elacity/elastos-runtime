@@ -14,11 +14,11 @@ echo "[people-conversations-local-smoke] Home preserves peer invite launch query
 cargo test --manifest-path "$ROOT/elastos/Cargo.toml" -p elastos-server \
     test_home_launch_validates_shell_targets --lib -- --test-threads=1
 
-echo "[people-conversations-local-smoke] System/Profile stores profile cards"
+echo "[people-conversations-local-smoke] People stores profile cards"
 cargo test --manifest-path "$ROOT/elastos/Cargo.toml" -p elastos-server \
     test_system_handle_derives_from_passkey_principal --lib -- --test-threads=1
 
-echo "[people-conversations-local-smoke] Home People projects accepted conversation contacts"
+echo "[people-conversations-local-smoke] People projects accepted conversation contacts"
 cargo test --manifest-path "$ROOT/elastos/Cargo.toml" -p elastos-server \
     test_home_summary_reports_people_contacts_from_accepted_conversation_members --lib -- --test-threads=1
 

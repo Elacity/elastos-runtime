@@ -107,24 +107,25 @@ echo "[local-carrier-setup] building current binary and first-party Home core as
 (cd "${REPO_ROOT}/capsules/wallet-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/object-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/content-block-graph-provider" && cargo build --release)
-(cd "${REPO_ROOT}/capsules/home-cli" && cargo build --target wasm32-wasip1 --release)
+(cd "${REPO_ROOT}/capsules/home-cli" && cargo build --release --bin home-cli)
 for capsule in \
     home \
+    home-cli \
     home-gui \
+    archive-manager \
+    browser \
     system \
     services \
-    browser \
     documents \
     inbox \
     library \
     marketplace \
-    archive-manager \
     wallet \
     wallet-metamask \
     wallet-unisat \
     wallet-walletconnect
 do
-    (cd "${REPO_ROOT}/capsules/${capsule}" && cargo build --target wasm32-wasip1 --release)
+    test -f "${REPO_ROOT}/capsules/${capsule}/browser/index.html"
 done
 
 mkdir -p "${ARTIFACTS_DIR}"
@@ -162,6 +163,7 @@ HOME_CAPSULE_DIR="${REPO_ROOT}/capsules/home" \
 HOME_GUI_CAPSULE_DIR="${REPO_ROOT}/capsules/home-gui" \
 SYSTEM_CAPSULE_DIR="${REPO_ROOT}/capsules/system" \
 SERVICES_CAPSULE_DIR="${REPO_ROOT}/capsules/services" \
+PEOPLE_CAPSULE_DIR="${REPO_ROOT}/capsules/people" \
 BROWSER_CAPSULE_DIR="${REPO_ROOT}/capsules/browser" \
 DOCUMENTS_CAPSULE_DIR="${REPO_ROOT}/capsules/documents" \
 LIBRARY_CAPSULE_DIR="${REPO_ROOT}/capsules/library" \
@@ -228,28 +230,37 @@ for name, src in mapping.items():
     info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
     info["size"] = len(data)
 
-home_cli_dir = pathlib.Path(os.environ["HOME_CLI_DIR"])
-home_cli_manifest = platform_info("home-cli")
-home_cli_release_path = home_cli_manifest.get("release_path")
-if not home_cli_release_path:
-    raise SystemExit(f"home-cli missing release_path for {platform}")
-home_cli_archive = artifacts_dir / home_cli_release_path
-with tarfile.open(home_cli_archive, "w:gz") as tar:
-    tar.add(home_cli_dir / "capsule.json", arcname="home-cli/capsule.json")
-    tar.add(
-        home_cli_dir / "target/wasm32-wasip1/release/home-cli.wasm",
-        arcname="home-cli/home-cli.wasm",
-    )
-    tar.add(home_cli_dir / "browser", arcname="home-cli/browser")
-home_cli_data = home_cli_archive.read_bytes()
-home_cli_manifest["checksum"] = "sha256:" + hashlib.sha256(home_cli_data).hexdigest()
-home_cli_manifest["size"] = len(home_cli_data)
+def write_capsule_archive(name, capsule_dir):
+    capsule_manifest = json.loads((capsule_dir / "capsule.json").read_text())
+    entrypoint = capsule_manifest.get("entrypoint")
+    if not entrypoint:
+        raise SystemExit(f"{name} manifest missing entrypoint")
+    entrypoint_path = capsule_dir / entrypoint
+    if not entrypoint_path.is_file():
+        raise SystemExit(f"{name} entrypoint missing: {entrypoint_path}")
+    info = platform_info(name)
+    release_path = info.get("release_path")
+    if not release_path:
+        raise SystemExit(f"{name} missing release_path for {platform}")
+    archive = artifacts_dir / release_path
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(capsule_dir / "capsule.json", arcname=f"{name}/capsule.json")
+        tar.add(entrypoint_path, arcname=f"{name}/{entrypoint}")
+        browser_dir = capsule_dir / "browser"
+        if browser_dir.is_dir():
+            tar.add(browser_dir, arcname=f"{name}/browser")
+    data = archive.read_bytes()
+    info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
+    info["size"] = len(data)
+
+write_capsule_archive("home-cli", pathlib.Path(os.environ["HOME_CLI_DIR"]))
 
 browser_capsules = {
     "home": pathlib.Path(os.environ["HOME_CAPSULE_DIR"]),
     "home-gui": pathlib.Path(os.environ["HOME_GUI_CAPSULE_DIR"]),
     "system": pathlib.Path(os.environ["SYSTEM_CAPSULE_DIR"]),
     "services": pathlib.Path(os.environ["SERVICES_CAPSULE_DIR"]),
+    "people": pathlib.Path(os.environ["PEOPLE_CAPSULE_DIR"]),
     "browser": pathlib.Path(os.environ["BROWSER_CAPSULE_DIR"]),
     "documents": pathlib.Path(os.environ["DOCUMENTS_CAPSULE_DIR"]),
     "inbox": pathlib.Path(os.environ["INBOX_CAPSULE_DIR"]),
@@ -262,21 +273,7 @@ browser_capsules = {
     "wallet-walletconnect": pathlib.Path(os.environ["WALLET_WALLETCONNECT_CAPSULE_DIR"]),
 }
 for name, capsule_dir in browser_capsules.items():
-    info = platform_info(name)
-    release_path = info.get("release_path")
-    if not release_path:
-        raise SystemExit(f"{name} missing release_path for {platform}")
-    archive = artifacts_dir / release_path
-    with tarfile.open(archive, "w:gz") as tar:
-        tar.add(capsule_dir / "capsule.json", arcname=f"{name}/capsule.json")
-        tar.add(
-            capsule_dir / "target/wasm32-wasip1/release" / f"{name}.wasm",
-            arcname=f"{name}/{name}.wasm",
-        )
-        tar.add(capsule_dir / "browser", arcname=f"{name}/browser")
-    data = archive.read_bytes()
-    info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
-    info["size"] = len(data)
+    write_capsule_archive(name, capsule_dir)
 
 components_dest.parent.mkdir(parents=True, exist_ok=True)
 components_dest.write_text(json.dumps(manifest, indent=2) + "\n")
@@ -451,43 +448,29 @@ for installed in \
     "${DATA_DIR}/bin/wallet-provider" \
     "${DATA_DIR}/bin/object-provider" \
     "${DATA_DIR}/bin/content-block-graph-provider" \
-    "${DATA_DIR}/capsules/home-cli/home-cli.wasm" \
     "${DATA_DIR}/capsules/home-cli/capsule.json" \
-    "${DATA_DIR}/capsules/home/home.wasm" \
     "${DATA_DIR}/capsules/home/browser/index.html" \
     "${DATA_DIR}/capsules/home-cli/browser/index.html" \
-    "${DATA_DIR}/capsules/home-gui/home-gui.wasm" \
     "${DATA_DIR}/capsules/home-gui/browser/home-gui.js" \
     "${DATA_DIR}/capsules/home-gui/browser/home-gui-template.html" \
     "${DATA_DIR}/capsules/home-gui/browser/style.css" \
-    "${DATA_DIR}/capsules/system/system.wasm" \
     "${DATA_DIR}/capsules/system/browser/index.html" \
-    "${DATA_DIR}/capsules/services/services.wasm" \
     "${DATA_DIR}/capsules/services/browser/index.html" \
-    "${DATA_DIR}/capsules/browser/browser.wasm" \
+    "${DATA_DIR}/capsules/people/browser/index.html" \
     "${DATA_DIR}/capsules/browser/browser/index.html" \
-    "${DATA_DIR}/capsules/documents/documents.wasm" \
     "${DATA_DIR}/capsules/documents/browser/index.html" \
-    "${DATA_DIR}/capsules/inbox/inbox.wasm" \
     "${DATA_DIR}/capsules/inbox/browser/index.html" \
-    "${DATA_DIR}/capsules/library/library.wasm" \
     "${DATA_DIR}/capsules/library/browser/index.html" \
     "${DATA_DIR}/capsules/library/browser/library.css" \
     "${DATA_DIR}/capsules/library/browser/src/app.js" \
     "${DATA_DIR}/capsules/library/browser/icons/folder.svg" \
-    "${DATA_DIR}/capsules/marketplace/marketplace.wasm" \
     "${DATA_DIR}/capsules/marketplace/browser/index.html" \
     "${DATA_DIR}/capsules/marketplace/browser/marketplace.css" \
     "${DATA_DIR}/capsules/marketplace/browser/marketplace.js" \
-    "${DATA_DIR}/capsules/archive-manager/archive-manager.wasm" \
     "${DATA_DIR}/capsules/archive-manager/browser/index.html" \
-    "${DATA_DIR}/capsules/wallet/wallet.wasm" \
     "${DATA_DIR}/capsules/wallet/browser/index.html" \
-    "${DATA_DIR}/capsules/wallet-metamask/wallet-metamask.wasm" \
     "${DATA_DIR}/capsules/wallet-metamask/browser/index.html" \
-    "${DATA_DIR}/capsules/wallet-unisat/wallet-unisat.wasm" \
     "${DATA_DIR}/capsules/wallet-unisat/browser/index.html" \
-    "${DATA_DIR}/capsules/wallet-walletconnect/wallet-walletconnect.wasm" \
     "${DATA_DIR}/capsules/wallet-walletconnect/browser/index.html"
 do
     if [[ ! -f "${installed}" ]]; then
