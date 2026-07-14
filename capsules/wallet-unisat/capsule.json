@@ -7,6 +7,33 @@
   "role": "app",
   "type": "wasm",
   "entrypoint": "wallet-unisat.wasm",
+  "interfaces": [
+    {
+      "id": "elastos.wallet.approval-method",
+      "version": "0.5.0",
+      "description": "UniSat Bitcoin wallet approval method projection",
+      "methods": [
+        {
+          "id": "method.connect",
+          "description": "Connect UniSat as a Wallet approval method",
+          "risk": "privileged",
+          "approval": "user",
+          "audit": "event",
+          "resource": "elastos://wallet/approval-method/unisat",
+          "operation": "connect"
+        },
+        {
+          "id": "approval.review",
+          "description": "Review an approval routed from Wallet before any connector effect",
+          "risk": "payment",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://wallet/approval",
+          "operation": "review"
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 16,
     "gpu": false

@@ -19,6 +19,87 @@
     ],
     "audit_events": ["did.resolve", "did.sign", "did.profile_update"]
   },
+  "interfaces": [
+    {
+      "id": "elastos.provider.did",
+      "version": "0.5.0",
+      "description": "Runtime provider affordance descriptors projected from did-provider authority metadata; descriptors are not grants.",
+      "methods": [
+        {
+          "id": "get_did",
+          "description": "Request get did through the did-provider Runtime provider boundary for elastos://did/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://did/*",
+          "operation": "get_did"
+        },
+        {
+          "id": "resolve",
+          "description": "Request resolve through the did-provider Runtime provider boundary for elastos://did/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://did/*",
+          "operation": "resolve"
+        },
+        {
+          "id": "sign_chat_message",
+          "description": "Request sign chat message through the did-provider Runtime provider boundary for elastos://did/*.",
+          "risk": "privileged",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://did/*",
+          "operation": "sign_chat_message"
+        },
+        {
+          "id": "verify",
+          "description": "Request verify through the did-provider Runtime provider boundary for elastos://did/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://did/*",
+          "operation": "verify"
+        },
+        {
+          "id": "verify_did_recovery",
+          "description": "Request verify did recovery through the did-provider Runtime provider boundary for elastos://did/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://did/*",
+          "operation": "verify_did_recovery"
+        },
+        {
+          "id": "get_nickname",
+          "description": "Request get nickname through the did-provider Runtime provider boundary for elastos://did/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://did/*",
+          "operation": "get_nickname"
+        },
+        {
+          "id": "set_nickname",
+          "description": "Request set nickname through the did-provider Runtime provider boundary for elastos://did/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://did/*",
+          "operation": "set_nickname"
+        },
+        {
+          "id": "get_persona_did",
+          "description": "Request get persona did through the did-provider Runtime provider boundary for elastos://did/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://did/*",
+          "operation": "get_persona_did"
+        }
+      ]
+    }
+  ],
   "capabilities": ["localhost://ElastOS/SystemServices/Identity/*"],
   "resources": {
     "memory_mb": 64,

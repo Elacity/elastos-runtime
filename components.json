@@ -35,7 +35,7 @@
       "platforms": [
         "any"
       ],
-      "note": "WASM capsule (wasm32-wasip1) \u2014 platform-independent, runs via runtime bridge"
+      "note": "WASM capsule (wasm32-wasip1) — platform-independent, runs via runtime bridge"
     },
     "did-provider": {
       "cid": "",
@@ -708,6 +708,20 @@
         }
       }
     },
+    "home-gui": {
+      "install_path": "capsules/home-gui",
+      "description": "First-party Home GUI capsule required for the default elastos surface",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "home-gui.tar.gz",
+          "extract_path": "home-gui",
+          "install_path": "capsules/home-gui"
+        }
+      }
+    },
     "home": {
       "install_path": "capsules/home",
       "description": "Runtime-owned Home browser shell capsule",
@@ -1142,7 +1156,7 @@
     },
     "model-qwen3.5-0.8b": {
       "size_mb": 507,
-      "description": "Qwen3.5 0.8B Q4_K_M \u2014 small default for fast local startup",
+      "description": "Qwen3.5 0.8B Q4_K_M — small default for fast local startup",
       "platforms": {
         "*": {
           "url": "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf",
@@ -1153,7 +1167,7 @@
     },
     "model-qwen3.5-4b": {
       "size_mb": 2740,
-      "description": "Qwen3.5 4B Q4_K_M \u2014 default for Orin Nano reliability",
+      "description": "Qwen3.5 4B Q4_K_M — default for Orin Nano reliability",
       "platforms": {
         "*": {
           "url": "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf",
@@ -1164,7 +1178,7 @@
     },
     "model-qwen3.5-9b": {
       "size_mb": 5680,
-      "description": "Qwen3.5 9B Q4_K_M \u2014 higher quality, needs more memory",
+      "description": "Qwen3.5 9B Q4_K_M — higher quality, needs more memory",
       "platforms": {
         "*": {
           "url": "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf",
@@ -1199,6 +1213,7 @@
         "webspace-provider",
         "wallet-provider",
         "home-cli",
+        "home-gui",
         "home",
         "system",
         "services",
@@ -1233,6 +1248,7 @@
         "webspace-provider",
         "wallet-provider",
         "home-cli",
+        "home-gui",
         "home",
         "system",
         "services",
@@ -1310,6 +1326,7 @@
         "webspace-provider",
         "wallet-provider",
         "home-cli",
+        "home-gui",
         "home",
         "system",
         "services",
@@ -1348,6 +1365,7 @@
         "browser-local-exit",
         "wallet-provider",
         "home-cli",
+        "home-gui",
         "home",
         "system",
         "services",
@@ -1394,6 +1412,7 @@
         "key-provider",
         "decrypt-provider",
         "home-cli",
+        "home-gui",
         "home",
         "system",
         "services",

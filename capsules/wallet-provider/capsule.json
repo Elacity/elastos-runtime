@@ -19,6 +19,195 @@
     ],
     "audit_events": ["wallet.status", "wallet.managed.created", "wallet.account_link", "wallet.account_revoke", "wallet.account.deleted", "wallet.account.renamed", "wallet.recovery_key.viewed", "wallet.default.updated", "wallet.proof", "wallet.sign_request", "wallet.approval_reject", "wallet.approval_approve", "wallet.approval_complete"]
   },
+  "interfaces": [
+    {
+      "id": "elastos.provider.wallet",
+      "version": "0.5.0",
+      "description": "Runtime provider affordance descriptors projected from wallet-provider authority metadata; descriptors are not grants.",
+      "methods": [
+        {
+          "id": "status",
+          "description": "Request status through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://wallet/*",
+          "operation": "status"
+        },
+        {
+          "id": "accounts",
+          "description": "Request accounts through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://wallet/*",
+          "operation": "accounts"
+        },
+        {
+          "id": "create_managed_account",
+          "description": "Request create managed account through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://wallet/*",
+          "operation": "create_managed_account"
+        },
+        {
+          "id": "link_account",
+          "description": "Request link account through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://wallet/*",
+          "operation": "link_account"
+        },
+        {
+          "id": "revoke_account",
+          "description": "Request revoke account through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://wallet/*",
+          "operation": "revoke_account"
+        },
+        {
+          "id": "rename_account",
+          "description": "Request rename account through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://wallet/*",
+          "operation": "rename_account"
+        },
+        {
+          "id": "export_managed_secret",
+          "description": "Request export managed secret through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
+          "risk": "privileged",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://wallet/*",
+          "operation": "export_managed_secret"
+        },
+        {
+          "id": "set_default_account",
+          "description": "Request set default account through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://wallet/*",
+          "operation": "set_default_account"
+        },
+        {
+          "id": "default_account",
+          "description": "Request default account through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://wallet/*",
+          "operation": "default_account"
+        },
+        {
+          "id": "challenge",
+          "description": "Request challenge through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://wallet/*",
+          "operation": "challenge"
+        },
+        {
+          "id": "bitcoin_challenge",
+          "description": "Request bitcoin challenge through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://wallet/*",
+          "operation": "bitcoin_challenge"
+        },
+        {
+          "id": "verify_proof",
+          "description": "Request verify proof through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://wallet/*",
+          "operation": "verify_proof"
+        },
+        {
+          "id": "verify_bip322_proof",
+          "description": "Request verify bip322 proof through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://wallet/*",
+          "operation": "verify_bip322_proof"
+        },
+        {
+          "id": "verify_contract_proof",
+          "description": "Request verify contract proof through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://wallet/*",
+          "operation": "verify_contract_proof"
+        },
+        {
+          "id": "request_signature",
+          "description": "Request request signature through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
+          "risk": "payment",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://wallet/*",
+          "operation": "request_signature"
+        },
+        {
+          "id": "approval_requests",
+          "description": "Request approval requests through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://wallet/*",
+          "operation": "approval_requests"
+        },
+        {
+          "id": "reject_approval",
+          "description": "Request reject approval through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://wallet/*",
+          "operation": "reject_approval"
+        },
+        {
+          "id": "approve_approval",
+          "description": "Request approve approval through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
+          "risk": "payment",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://wallet/*",
+          "operation": "approve_approval"
+        },
+        {
+          "id": "complete_approval",
+          "description": "Request complete approval through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
+          "risk": "payment",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://wallet/*",
+          "operation": "complete_approval"
+        },
+        {
+          "id": "sign_approved",
+          "description": "Request sign approved through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
+          "risk": "payment",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://wallet/*",
+          "operation": "sign_approved"
+        }
+      ]
+    }
+  ],
   "capabilities": ["localhost://ElastOS/SystemServices/Wallet/*"],
   "resources": {
     "memory_mb": 64,

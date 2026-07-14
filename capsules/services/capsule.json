@@ -7,6 +7,42 @@
   "role": "app",
   "type": "wasm",
   "entrypoint": "services.wasm",
+  "interfaces": [
+    {
+      "id": "elastos.services.offers",
+      "version": "0.5.0",
+      "description": "Local and remote Runtime service-offer projection",
+      "methods": [
+        {
+          "id": "offers.list",
+          "description": "List available Browser Engine and Browser Exit offers",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://services/offers",
+          "operation": "list"
+        },
+        {
+          "id": "browser.exit.select",
+          "description": "Select a permitted Browser Exit offer",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://browser/exit",
+          "operation": "select"
+        },
+        {
+          "id": "offer.request",
+          "description": "Request access to a remote Runtime service offer",
+          "risk": "privileged",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://services/offers",
+          "operation": "request"
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 16,
     "gpu": false

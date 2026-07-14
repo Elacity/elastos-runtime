@@ -1,30 +1,30 @@
 {
   "schema": "elastos.capsule/v1",
-  "name": "home-cli",
+  "name": "home-gui",
   "version": "0.1.0",
-  "description": "Runtime-owned Home CLI shell over PTY, Home facts, and signed host intents",
+  "description": "Trusted host-loaded Home GUI shell surface for ElastOS",
   "author": "elastos",
   "role": "shell",
   "type": "wasm",
-  "entrypoint": "home-cli.wasm",
+  "entrypoint": "home-gui.wasm",
   "interfaces": [
     {
-      "id": "elastos.shell.cli",
+      "id": "elastos.shell.gui",
       "version": "0.5.0",
-      "description": "Command shell over Runtime facts and signed Home host intents",
+      "description": "Trusted host-loaded desktop shell projection over Runtime facts and signed Home host intents",
       "methods": [
         {
-          "id": "facts.search",
-          "description": "Search Home, capsule, interface, service, people, and Inbox facts",
+          "id": "desktop.render",
+          "description": "Render desktop, launcher, taskbar, and windows inside the trusted Home host from Home facts",
           "risk": "read",
           "approval": "runtime_policy",
           "audit": "summary",
-          "resource": "elastos://home/facts",
-          "operation": "search"
+          "resource": "elastos://home/desktop",
+          "operation": "render"
         },
         {
           "id": "capsule.open",
-          "description": "Ask Home to open a visible capsule through a signed host intent",
+          "description": "Ask the Home host to open a visible capsule window through Runtime launch authority",
           "risk": "launch",
           "approval": "runtime_policy",
           "audit": "event",
@@ -33,7 +33,7 @@
         },
         {
           "id": "shell.switch",
-          "description": "Request an active root shell switch through Runtime active-shell state",
+          "description": "Switch the active root Home shell through Runtime active-shell state",
           "risk": "privileged",
           "approval": "user",
           "audit": "event",

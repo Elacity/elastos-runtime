@@ -7,6 +7,42 @@
   "type": "wasm",
   "author": "elastos",
   "entrypoint": "library.wasm",
+  "interfaces": [
+    {
+      "id": "elastos.library.objects",
+      "version": "0.5.0",
+      "description": "Library object browser and picker over Runtime object-provider facts",
+      "methods": [
+        {
+          "id": "objects.browse",
+          "description": "Browse rooted-localhost objects through the Runtime object provider",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://library/objects",
+          "operation": "browse"
+        },
+        {
+          "id": "object.open",
+          "description": "Open a selected object with its Runtime-selected viewer",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://library/object",
+          "operation": "open"
+        },
+        {
+          "id": "object.choose",
+          "description": "Return a selected object to the requesting capsule through Home intent routing",
+          "risk": "read",
+          "approval": "user",
+          "audit": "event",
+          "resource": "elastos://library/object",
+          "operation": "choose"
+        }
+      ]
+    }
+  ],
   "requires": [
     { "name": "object-provider", "kind": "capsule" }
   ],

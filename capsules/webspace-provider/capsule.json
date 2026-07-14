@@ -19,6 +19,69 @@
     ],
     "audit_events": ["webspace.resolve", "webspace.read"]
   },
+  "interfaces": [
+    {
+      "id": "elastos.provider.webspace",
+      "version": "0.5.0",
+      "description": "Runtime provider affordance descriptors projected from webspace-provider authority metadata; descriptors are not grants.",
+      "methods": [
+        {
+          "id": "resolve",
+          "description": "Request resolve through the webspace-provider Runtime provider boundary for localhost://WebSpaces/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "localhost://WebSpaces/*",
+          "operation": "resolve"
+        },
+        {
+          "id": "read",
+          "description": "Request read through the webspace-provider Runtime provider boundary for localhost://WebSpaces/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "localhost://WebSpaces/*",
+          "operation": "read"
+        },
+        {
+          "id": "list",
+          "description": "Request list through the webspace-provider Runtime provider boundary for localhost://WebSpaces/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "localhost://WebSpaces/*",
+          "operation": "list"
+        },
+        {
+          "id": "stat",
+          "description": "Request stat through the webspace-provider Runtime provider boundary for localhost://WebSpaces/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "localhost://WebSpaces/*",
+          "operation": "stat"
+        },
+        {
+          "id": "exists",
+          "description": "Request exists through the webspace-provider Runtime provider boundary for localhost://WebSpaces/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "localhost://WebSpaces/*",
+          "operation": "exists"
+        },
+        {
+          "id": "ping",
+          "description": "Request ping through the webspace-provider Runtime provider boundary for localhost://WebSpaces/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "localhost://WebSpaces/*",
+          "operation": "ping"
+        }
+      ]
+    }
+  ],
   "capabilities": ["localhost://WebSpaces/*"],
   "resources": {
     "memory_mb": 64,

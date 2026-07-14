@@ -22,6 +22,123 @@
     ],
     "audit_events": ["ipfs.publish", "ipfs.fetch", "ipfs.pin", "ipfs.unpin"]
   },
+  "interfaces": [
+    {
+      "id": "elastos.provider.ipfs",
+      "version": "0.5.0",
+      "description": "Runtime provider affordance descriptors projected from ipfs-provider authority metadata; descriptors are not grants.",
+      "methods": [
+        {
+          "id": "add_bytes",
+          "description": "Request add bytes through the ipfs-provider Runtime provider boundary for elastos://ipfs/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://ipfs/*",
+          "operation": "add_bytes"
+        },
+        {
+          "id": "add_path",
+          "description": "Request add path through the ipfs-provider Runtime provider boundary for elastos://ipfs/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://ipfs/*",
+          "operation": "add_path"
+        },
+        {
+          "id": "add_directory",
+          "description": "Request add directory through the ipfs-provider Runtime provider boundary for elastos://ipfs/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://ipfs/*",
+          "operation": "add_directory"
+        },
+        {
+          "id": "cat",
+          "description": "Request cat through the ipfs-provider Runtime provider boundary for elastos://ipfs/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://ipfs/*",
+          "operation": "cat"
+        },
+        {
+          "id": "cat_to_path",
+          "description": "Request cat to path through the ipfs-provider Runtime provider boundary for elastos://ipfs/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://ipfs/*",
+          "operation": "cat_to_path"
+        },
+        {
+          "id": "get_bytes",
+          "description": "Request get bytes through the ipfs-provider Runtime provider boundary for elastos://ipfs/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://ipfs/*",
+          "operation": "get_bytes"
+        },
+        {
+          "id": "ls",
+          "description": "Request ls through the ipfs-provider Runtime provider boundary for elastos://ipfs/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://ipfs/*",
+          "operation": "ls"
+        },
+        {
+          "id": "download_directory",
+          "description": "Request download directory through the ipfs-provider Runtime provider boundary for elastos://ipfs/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://ipfs/*",
+          "operation": "download_directory"
+        },
+        {
+          "id": "pin",
+          "description": "Request pin through the ipfs-provider Runtime provider boundary for elastos://ipfs/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://ipfs/*",
+          "operation": "pin"
+        },
+        {
+          "id": "unpin",
+          "description": "Request unpin through the ipfs-provider Runtime provider boundary for elastos://ipfs/*.",
+          "risk": "privileged",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://ipfs/*",
+          "operation": "unpin"
+        },
+        {
+          "id": "health",
+          "description": "Request health through the ipfs-provider Runtime provider boundary for elastos://ipfs/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://ipfs/*",
+          "operation": "health"
+        },
+        {
+          "id": "status",
+          "description": "Request status through the ipfs-provider Runtime provider boundary for elastos://ipfs/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://ipfs/*",
+          "operation": "status"
+        }
+      ]
+    }
+  ],
   "capabilities": ["localhost://ElastOS/SystemServices/IPFS/*"],
   "resources": {
     "memory_mb": 128,

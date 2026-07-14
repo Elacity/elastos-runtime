@@ -2,11 +2,47 @@
   "schema": "elastos.capsule/v1",
   "name": "home",
   "version": "0.1.0",
-  "description": "Runtime-owned Home surface for ElastOS",
+  "description": "Runtime-owned Home front door and active-shell host for ElastOS",
   "author": "elastos",
-  "role": "shell",
+  "role": "app",
   "type": "wasm",
   "entrypoint": "home.wasm",
+  "interfaces": [
+    {
+      "id": "elastos.shell.host",
+      "version": "0.5.0",
+      "description": "Front-door host for passkey unlock and active Home shell selection",
+      "methods": [
+        {
+          "id": "auth.unlock",
+          "description": "Unlock the Home session with passkey-backed Runtime authority",
+          "risk": "read",
+          "approval": "user",
+          "audit": "event",
+          "resource": "elastos://home/session",
+          "operation": "unlock"
+        },
+        {
+          "id": "shell.resolve",
+          "description": "Resolve and mount the active Home shell selected by Runtime state",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://home/shell",
+          "operation": "resolve"
+        },
+        {
+          "id": "shell.switch",
+          "description": "Switch the active root Home shell through Runtime active-shell state",
+          "risk": "privileged",
+          "approval": "user",
+          "audit": "event",
+          "resource": "elastos://home/shell",
+          "operation": "switch"
+        }
+      ]
+    }
+  ],
   "requires": [],
   "resources": {
     "memory_mb": 64,

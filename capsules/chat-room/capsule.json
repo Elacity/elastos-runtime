@@ -7,6 +7,42 @@
   "type": "wasm",
   "author": "elastos",
   "entrypoint": "chat-room.wasm",
+  "interfaces": [
+    {
+      "id": "elastos.chat.room",
+      "version": "0.5.0",
+      "description": "Chat room projection over Runtime room facts and Carrier-backed intents",
+      "methods": [
+        {
+          "id": "room.view",
+          "description": "View room membership, invites, guests, and message facts",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://chat/room",
+          "operation": "view"
+        },
+        {
+          "id": "message.send",
+          "description": "Send a chat message through Runtime room and Carrier policy",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://chat/message",
+          "operation": "send"
+        },
+        {
+          "id": "guest.approve",
+          "description": "Approve a guest access request through Runtime room policy",
+          "risk": "privileged",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://chat/guest",
+          "operation": "approve"
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 32,
     "gpu": false

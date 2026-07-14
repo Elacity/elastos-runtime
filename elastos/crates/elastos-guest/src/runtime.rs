@@ -718,8 +718,13 @@ impl RuntimeClient {
             }
         };
 
-        let resp_envelope: ResponseEnvelope = serde_json::from_str(&line)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let resp_envelope: ResponseEnvelope = serde_json::from_str(&line).map_err(|e| {
+            let preview: String = line.chars().take(1024).collect();
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("runtime response decode failed: {e}; response={preview}"),
+            )
+        })?;
 
         if resp_envelope.id != id {
             return Err(io::Error::new(
@@ -782,8 +787,13 @@ impl RuntimeClient {
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "runtime call timed out"))?
             .map_err(|e| io::Error::new(e.kind(), e))?;
 
-        let resp_envelope: ResponseEnvelope = serde_json::from_str(&line)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let resp_envelope: ResponseEnvelope = serde_json::from_str(&line).map_err(|e| {
+            let preview: String = line.chars().take(1024).collect();
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("runtime response decode failed: {e}; response={preview}"),
+            )
+        })?;
 
         if resp_envelope.id != id {
             return Err(io::Error::new(

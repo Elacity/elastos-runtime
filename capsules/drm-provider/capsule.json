@@ -19,6 +19,33 @@
     ],
     "audit_events": ["drm.status", "drm.open.denied"]
   },
+  "interfaces": [
+    {
+      "id": "elastos.provider.drm",
+      "version": "0.5.0",
+      "description": "Runtime provider affordance descriptors projected from drm-provider authority metadata; descriptors are not grants.",
+      "methods": [
+        {
+          "id": "status",
+          "description": "Request status through the drm-provider Runtime provider boundary for elastos://drm/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://drm/*",
+          "operation": "status"
+        },
+        {
+          "id": "open",
+          "description": "Request open through the drm-provider Runtime provider boundary for elastos://drm/*.",
+          "risk": "rights",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://drm/*",
+          "operation": "open"
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 64,
     "gpu": false

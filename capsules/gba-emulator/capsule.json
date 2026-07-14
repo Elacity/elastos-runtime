@@ -7,6 +7,42 @@
   "type": "wasm",
   "author": "elastos",
   "entrypoint": "gba-emulator.wasm",
+  "interfaces": [
+    {
+      "id": "elastos.gba.emulator",
+      "version": "0.5.0",
+      "description": "GBA emulator projection for ROM launch, input, and save state",
+      "methods": [
+        {
+          "id": "rom.open",
+          "description": "Open a selected GBA content capsule or ROM object",
+          "risk": "launch",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://gba/rom",
+          "operation": "open"
+        },
+        {
+          "id": "input.play",
+          "description": "Drive emulator input inside the launched viewer session",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://gba/input",
+          "operation": "play"
+        },
+        {
+          "id": "save.persist",
+          "description": "Persist emulator save data in the capsule storage namespace",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://gba/save",
+          "operation": "persist"
+        }
+      ]
+    }
+  ],
   "permissions": {
     "storage": ["localhost://Users/self/.AppData/LocalHost/GBA/*"]
   },

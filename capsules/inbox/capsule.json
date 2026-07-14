@@ -7,6 +7,42 @@
   "type": "wasm",
   "author": "elastos",
   "entrypoint": "inbox.wasm",
+  "interfaces": [
+    {
+      "id": "elastos.inbox.approvals",
+      "version": "0.5.0",
+      "description": "Inbox request and approval review surface",
+      "methods": [
+        {
+          "id": "requests.list",
+          "description": "List pending and recent Runtime approval requests",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://inbox/requests",
+          "operation": "list"
+        },
+        {
+          "id": "request.approve",
+          "description": "Approve a Runtime-bound request after the required user proof",
+          "risk": "privileged",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://inbox/request",
+          "operation": "approve"
+        },
+        {
+          "id": "request.deny",
+          "description": "Deny a Runtime-bound request without dispatching provider effects",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://inbox/request",
+          "operation": "deny"
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 16,
     "gpu": false

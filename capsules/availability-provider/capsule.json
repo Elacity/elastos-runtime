@@ -19,6 +19,33 @@
     ],
     "audit_events": ["content.availability.ensure", "content.availability.status"]
   },
+  "interfaces": [
+    {
+      "id": "elastos.provider.availability",
+      "version": "0.5.0",
+      "description": "Runtime provider affordance descriptors projected from availability-provider authority metadata; descriptors are not grants.",
+      "methods": [
+        {
+          "id": "ensure",
+          "description": "Request ensure through the availability-provider Runtime provider boundary for elastos://availability/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://availability/*",
+          "operation": "ensure"
+        },
+        {
+          "id": "status",
+          "description": "Request status through the availability-provider Runtime provider boundary for elastos://availability/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://availability/*",
+          "operation": "status"
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 64,
     "gpu": false

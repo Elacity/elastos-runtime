@@ -19,6 +19,60 @@
     ],
     "audit_events": ["net.status", "net.request.denied", "net.exit.unavailable"]
   },
+  "interfaces": [
+    {
+      "id": "elastos.provider.net",
+      "version": "0.5.0",
+      "description": "Runtime provider affordance descriptors projected from net-provider authority metadata; descriptors are not grants.",
+      "methods": [
+        {
+          "id": "status",
+          "description": "Request status through the net-provider Runtime provider boundary for elastos://net/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://net/*",
+          "operation": "status"
+        },
+        {
+          "id": "resolve",
+          "description": "Request resolve through the net-provider Runtime provider boundary for elastos://net/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://net/*",
+          "operation": "resolve"
+        },
+        {
+          "id": "connect",
+          "description": "Request connect through the net-provider Runtime provider boundary for elastos://net/*.",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://net/*",
+          "operation": "connect"
+        },
+        {
+          "id": "stream",
+          "description": "Request stream through the net-provider Runtime provider boundary for elastos://net/*.",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://net/*",
+          "operation": "stream"
+        },
+        {
+          "id": "http",
+          "description": "Request http through the net-provider Runtime provider boundary for elastos://net/*.",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://net/*",
+          "operation": "http"
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 64,
     "gpu": false

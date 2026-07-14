@@ -16,6 +16,11 @@ use elastos_common::{
 
 use crate::{CapsuleHandle, CapsuleInfo, ComputeProvider};
 
+const HOME_CLI_CAPSULE_NAME: &str = "home-cli";
+const HOME_TERMINAL_ENV: &str = "ELASTOS_HOME_TERMINAL";
+const INTERACTIVE_HOME_TERMINAL_FUEL: u64 = 10_000_000_000;
+const INTERACTIVE_HOME_TERMINAL_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// State held by a WASI preview1 instance under wasmtime-wasi 24+.
 ///
 /// Replaces the previous `WasiCtx` from wasmtime-wasi 17. The new `WasiP1Ctx`
@@ -208,6 +213,17 @@ impl WasmProvider {
             .write()
             .await
             .insert(capsule_id.clone(), principal_id);
+    }
+
+    fn launch_limits(&self, manifest: &CapsuleManifest) -> WasmExecutionLimits {
+        let mut limits = self.execution_limits;
+        if manifest.name == HOME_CLI_CAPSULE_NAME
+            && std::env::var_os(HOME_TERMINAL_ENV).as_deref() == Some(std::ffi::OsStr::new("1"))
+        {
+            limits.fuel = INTERACTIVE_HOME_TERMINAL_FUEL;
+            limits.wall_clock_timeout = INTERACTIVE_HOME_TERMINAL_TIMEOUT;
+        }
+        limits
     }
 
     pub async fn clear_bridge_principal(&self, capsule_id: &CapsuleId) {
@@ -735,7 +751,7 @@ impl ComputeProvider for WasmProvider {
                 instance.engine.clone(),
                 instance.module.clone(),
                 instance.manifest.clone(),
-                self.execution_limits,
+                self.launch_limits(&instance.manifest),
             )
         };
 

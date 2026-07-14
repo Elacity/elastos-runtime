@@ -23,6 +23,51 @@
     ],
     "audit_events": ["llama.request", "llama.status"]
   },
+  "interfaces": [
+    {
+      "id": "elastos.provider.llama",
+      "version": "0.5.0",
+      "description": "Runtime provider affordance descriptors projected from llama-provider authority metadata; descriptors are not grants.",
+      "methods": [
+        {
+          "id": "chat_completions",
+          "description": "Request chat completions through the llama-provider Runtime provider boundary for elastos://llama/*.",
+          "risk": "privileged",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://llama/*",
+          "operation": "chat_completions"
+        },
+        {
+          "id": "status",
+          "description": "Request status through the llama-provider Runtime provider boundary for elastos://llama/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://llama/*",
+          "operation": "status"
+        },
+        {
+          "id": "health",
+          "description": "Request health through the llama-provider Runtime provider boundary for elastos://llama/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://llama/*",
+          "operation": "health"
+        },
+        {
+          "id": "list_models",
+          "description": "Request list models through the llama-provider Runtime provider boundary for elastos://llama/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://llama/*",
+          "operation": "list_models"
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 4096,
     "gpu": true

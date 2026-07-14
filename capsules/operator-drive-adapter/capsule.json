@@ -24,6 +24,51 @@
       "operator_drive_adapter.write_bytes"
     ]
   },
+  "interfaces": [
+    {
+      "id": "elastos.provider.operator.drive",
+      "version": "0.5.0",
+      "description": "Runtime provider affordance descriptors projected from operator-drive-adapter authority metadata; descriptors are not grants.",
+      "methods": [
+        {
+          "id": "status",
+          "description": "Request status through the operator-drive-adapter Runtime provider boundary for elastos://operator-drive-adapter/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://operator-drive-adapter/*",
+          "operation": "status"
+        },
+        {
+          "id": "metadata_index",
+          "description": "Request metadata index through the operator-drive-adapter Runtime provider boundary for elastos://operator-drive-adapter/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://operator-drive-adapter/*",
+          "operation": "metadata_index"
+        },
+        {
+          "id": "read_bytes",
+          "description": "Request read bytes through the operator-drive-adapter Runtime provider boundary for elastos://operator-drive-adapter/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://operator-drive-adapter/*",
+          "operation": "read_bytes"
+        },
+        {
+          "id": "write_bytes",
+          "description": "Request write bytes through the operator-drive-adapter Runtime provider boundary for elastos://operator-drive-adapter/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://operator-drive-adapter/*",
+          "operation": "write_bytes"
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 64,
     "gpu": false

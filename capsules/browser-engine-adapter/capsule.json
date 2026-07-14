@@ -26,6 +26,87 @@
       "browser_engine.webrtc.signal"
     ]
   },
+  "interfaces": [
+    {
+      "id": "elastos.provider.browser.engine",
+      "version": "0.5.0",
+      "description": "Runtime provider affordance descriptors projected from browser-engine-adapter authority metadata; descriptors are not grants.",
+      "methods": [
+        {
+          "id": "status",
+          "description": "Request status through the browser-engine-adapter Runtime provider boundary for elastos://browser-engine/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://browser-engine/*",
+          "operation": "status"
+        },
+        {
+          "id": "launch",
+          "description": "Request launch through the browser-engine-adapter Runtime provider boundary for elastos://browser-engine/*.",
+          "risk": "launch",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://browser-engine/*",
+          "operation": "launch"
+        },
+        {
+          "id": "attach_stream",
+          "description": "Request attach stream through the browser-engine-adapter Runtime provider boundary for elastos://browser-engine/*.",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://browser-engine/*",
+          "operation": "attach_stream"
+        },
+        {
+          "id": "close_page",
+          "description": "Request close page through the browser-engine-adapter Runtime provider boundary for elastos://browser-engine/*.",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://browser-engine/*",
+          "operation": "close_page"
+        },
+        {
+          "id": "page_status",
+          "description": "Request page status through the browser-engine-adapter Runtime provider boundary for elastos://browser-engine/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://browser-engine/*",
+          "operation": "page_status"
+        },
+        {
+          "id": "diagnostics",
+          "description": "Request diagnostics through the browser-engine-adapter Runtime provider boundary for elastos://browser-engine/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://browser-engine/*",
+          "operation": "diagnostics"
+        },
+        {
+          "id": "input",
+          "description": "Request input through the browser-engine-adapter Runtime provider boundary for elastos://browser-engine/*.",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://browser-engine/*",
+          "operation": "input"
+        },
+        {
+          "id": "webrtc_signal",
+          "description": "Request webrtc signal through the browser-engine-adapter Runtime provider boundary for elastos://browser-engine/*.",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://browser-engine/*",
+          "operation": "webrtc_signal"
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 64,
     "gpu": false

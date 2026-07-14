@@ -8,6 +8,24 @@
   "author": "elastos",
   "entrypoint": "ucity.gba",
   "viewer": "gba-emulator",
+  "interfaces": [
+    {
+      "id": "elastos.content.asset",
+      "version": "0.5.0",
+      "description": "Launchable content asset descriptor for viewer-based capsules",
+      "methods": [
+        {
+          "id": "asset.open",
+          "description": "Open this content asset with its declared Runtime viewer",
+          "risk": "launch",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://content/asset",
+          "operation": "open"
+        }
+      ]
+    }
+  ],
   "permissions": {
     "storage": ["localhost://Users/self/.AppData/LocalHost/GBA/gba-ucity/*"]
   }

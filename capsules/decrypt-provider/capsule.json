@@ -19,6 +19,42 @@
     ],
     "audit_events": ["decrypt.status", "decrypt.session.denied", "decrypt.render.denied"]
   },
+  "interfaces": [
+    {
+      "id": "elastos.provider.decrypt",
+      "version": "0.5.0",
+      "description": "Runtime provider affordance descriptors projected from decrypt-provider authority metadata; descriptors are not grants.",
+      "methods": [
+        {
+          "id": "status",
+          "description": "Request status through the decrypt-provider Runtime provider boundary for elastos://decrypt/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://decrypt/*",
+          "operation": "status"
+        },
+        {
+          "id": "open_session",
+          "description": "Request open session through the decrypt-provider Runtime provider boundary for elastos://decrypt/*.",
+          "risk": "rights",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://decrypt/*",
+          "operation": "open_session"
+        },
+        {
+          "id": "render",
+          "description": "Request render through the decrypt-provider Runtime provider boundary for elastos://decrypt/*.",
+          "risk": "rights",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://decrypt/*",
+          "operation": "render"
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 64,
     "gpu": false

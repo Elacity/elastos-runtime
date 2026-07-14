@@ -19,6 +19,132 @@
     ],
     "audit_events": ["chain.read", "chain.status", "chain.rights_read", "chain.proof", "chain.broadcast", "chain.node_lifecycle"]
   },
+  "interfaces": [
+    {
+      "id": "elastos.provider.chain",
+      "version": "0.5.0",
+      "description": "Runtime provider affordance descriptors projected from chain-provider authority metadata; descriptors are not grants.",
+      "methods": [
+        {
+          "id": "networks",
+          "description": "Request networks through the chain-provider Runtime provider boundary for elastos://chain/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://chain/*",
+          "operation": "networks"
+        },
+        {
+          "id": "status",
+          "description": "Request status through the chain-provider Runtime provider boundary for elastos://chain/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://chain/*",
+          "operation": "status"
+        },
+        {
+          "id": "block_number",
+          "description": "Request block number through the chain-provider Runtime provider boundary for elastos://chain/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://chain/*",
+          "operation": "block_number"
+        },
+        {
+          "id": "sync_health",
+          "description": "Request sync health through the chain-provider Runtime provider boundary for elastos://chain/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://chain/*",
+          "operation": "sync_health"
+        },
+        {
+          "id": "balance",
+          "description": "Request balance through the chain-provider Runtime provider boundary for elastos://chain/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://chain/*",
+          "operation": "balance"
+        },
+        {
+          "id": "transaction",
+          "description": "Request transaction through the chain-provider Runtime provider boundary for elastos://chain/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://chain/*",
+          "operation": "transaction"
+        },
+        {
+          "id": "receipt",
+          "description": "Request receipt through the chain-provider Runtime provider boundary for elastos://chain/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://chain/*",
+          "operation": "receipt"
+        },
+        {
+          "id": "has_access_by_content_id",
+          "description": "Request has access by content id through the chain-provider Runtime provider boundary for elastos://chain/*.",
+          "risk": "rights",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://chain/*",
+          "operation": "has_access_by_content_id"
+        },
+        {
+          "id": "proof",
+          "description": "Request proof through the chain-provider Runtime provider boundary for elastos://chain/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://chain/*",
+          "operation": "proof"
+        },
+        {
+          "id": "erc1271_is_valid_signature",
+          "description": "Request erc1271 is valid signature through the chain-provider Runtime provider boundary for elastos://chain/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://chain/*",
+          "operation": "erc1271_is_valid_signature"
+        },
+        {
+          "id": "prepare_transaction",
+          "description": "Request prepare transaction through the chain-provider Runtime provider boundary for elastos://chain/*.",
+          "risk": "payment",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://chain/*",
+          "operation": "prepare_transaction"
+        },
+        {
+          "id": "broadcast_transaction",
+          "description": "Request broadcast transaction through the chain-provider Runtime provider boundary for elastos://chain/*.",
+          "risk": "payment",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://chain/*",
+          "operation": "broadcast_transaction"
+        },
+        {
+          "id": "node_lifecycle",
+          "description": "Request node lifecycle through the chain-provider Runtime provider boundary for elastos://chain/*.",
+          "risk": "privileged",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://chain/*",
+          "operation": "node_lifecycle"
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 64,
     "gpu": false

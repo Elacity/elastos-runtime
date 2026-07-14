@@ -7,6 +7,42 @@
   "role": "app",
   "type": "wasm",
   "entrypoint": "system.wasm",
+  "interfaces": [
+    {
+      "id": "elastos.system.shell",
+      "version": "0.5.0",
+      "description": "System shell picker and runtime settings projection",
+      "methods": [
+        {
+          "id": "shells.list",
+          "description": "List selectable Home shell candidates",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://home/shells",
+          "operation": "list"
+        },
+        {
+          "id": "shell.switch",
+          "description": "Switch the active root Home shell for the signed-in principal",
+          "risk": "privileged",
+          "approval": "user",
+          "audit": "event",
+          "resource": "elastos://home/shell",
+          "operation": "switch"
+        },
+        {
+          "id": "settings.update",
+          "description": "Update Runtime-owned Home settings",
+          "risk": "write",
+          "approval": "user",
+          "audit": "event",
+          "resource": "elastos://system/settings",
+          "operation": "update"
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 32,
     "gpu": false

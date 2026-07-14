@@ -22,6 +22,42 @@
     ],
     "audit_events": ["ai.request", "ai.backend_select"]
   },
+  "interfaces": [
+    {
+      "id": "elastos.provider.ai",
+      "version": "0.5.0",
+      "description": "Runtime provider affordance descriptors projected from ai-provider authority metadata; descriptors are not grants.",
+      "methods": [
+        {
+          "id": "chat_completions",
+          "description": "Request chat completions through the ai-provider Runtime provider boundary for elastos://ai/*.",
+          "risk": "privileged",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://ai/*",
+          "operation": "chat_completions"
+        },
+        {
+          "id": "list_backends",
+          "description": "Request list backends through the ai-provider Runtime provider boundary for elastos://ai/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://ai/*",
+          "operation": "list_backends"
+        },
+        {
+          "id": "ping",
+          "description": "Request ping through the ai-provider Runtime provider boundary for elastos://ai/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://ai/*",
+          "operation": "ping"
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 64,
     "gpu": false

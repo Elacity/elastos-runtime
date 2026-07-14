@@ -7,6 +7,51 @@
   "role": "app",
   "type": "wasm",
   "entrypoint": "browser.wasm",
+  "interfaces": [
+    {
+      "id": "elastos.browser.page",
+      "version": "0.5.0",
+      "description": "Browser page lifecycle through the Runtime Browser boundary",
+      "methods": [
+        {
+          "id": "page.open",
+          "description": "Open a page through the Runtime Browser engine and selected exit policy",
+          "risk": "launch",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://browser/page",
+          "operation": "open"
+        },
+        {
+          "id": "page.navigate",
+          "description": "Navigate an existing Browser page through Runtime-owned networking",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://browser/page",
+          "operation": "navigate"
+        },
+        {
+          "id": "exit.select",
+          "description": "Select a Browser Exit offer for future Browser traffic",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://browser/exit",
+          "operation": "select"
+        },
+        {
+          "id": "profile.reset",
+          "description": "Reset isolated Browser profile storage and cookies",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://browser/profile",
+          "operation": "reset"
+        }
+      ]
+    }
+  ],
   "capabilities": [
     "elastos://wallet/*",
     "elastos://net/resolve",

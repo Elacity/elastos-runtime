@@ -22,6 +22,51 @@
     ],
     "audit_events": ["tunnel.start", "tunnel.stop", "tunnel.status"]
   },
+  "interfaces": [
+    {
+      "id": "elastos.provider.tunnel",
+      "version": "0.5.0",
+      "description": "Runtime provider affordance descriptors projected from tunnel-provider authority metadata; descriptors are not grants.",
+      "methods": [
+        {
+          "id": "start",
+          "description": "Request start through the tunnel-provider Runtime provider boundary for elastos://tunnel/*.",
+          "risk": "privileged",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://tunnel/*",
+          "operation": "start"
+        },
+        {
+          "id": "stop",
+          "description": "Request stop through the tunnel-provider Runtime provider boundary for elastos://tunnel/*.",
+          "risk": "privileged",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://tunnel/*",
+          "operation": "stop"
+        },
+        {
+          "id": "status",
+          "description": "Request status through the tunnel-provider Runtime provider boundary for elastos://tunnel/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://tunnel/*",
+          "operation": "status"
+        },
+        {
+          "id": "ping",
+          "description": "Request ping through the tunnel-provider Runtime provider boundary for elastos://tunnel/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://tunnel/*",
+          "operation": "ping"
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 64,
     "gpu": false

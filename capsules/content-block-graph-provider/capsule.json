@@ -23,6 +23,42 @@
       "content.block_graph.failed_closed"
     ]
   },
+  "interfaces": [
+    {
+      "id": "elastos.provider.content.block.graph",
+      "version": "0.5.0",
+      "description": "Runtime provider affordance descriptors projected from content-block-graph-provider authority metadata; descriptors are not grants.",
+      "methods": [
+        {
+          "id": "export_graph",
+          "description": "Request export graph through the content-block-graph-provider Runtime provider boundary for elastos://block-graph/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://block-graph/*",
+          "operation": "export_graph"
+        },
+        {
+          "id": "import_graph",
+          "description": "Request import graph through the content-block-graph-provider Runtime provider boundary for elastos://block-graph/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://block-graph/*",
+          "operation": "import_graph"
+        },
+        {
+          "id": "status",
+          "description": "Request status through the content-block-graph-provider Runtime provider boundary for elastos://block-graph/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://block-graph/*",
+          "operation": "status"
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 64,
     "gpu": false

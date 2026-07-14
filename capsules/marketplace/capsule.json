@@ -7,6 +7,42 @@
   "type": "wasm",
   "author": "elastos",
   "entrypoint": "marketplace.wasm",
+  "interfaces": [
+    {
+      "id": "elastos.marketplace.catalog",
+      "version": "0.5.0",
+      "description": "Marketplace catalog projection and install-request surface",
+      "methods": [
+        {
+          "id": "capsules.browse",
+          "description": "Browse installable capsules and local catalog facts",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://marketplace/catalog",
+          "operation": "browse"
+        },
+        {
+          "id": "capsule.inspect",
+          "description": "Inspect catalog trust, provenance, payment, and DRM descriptors",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://marketplace/capsule",
+          "operation": "inspect"
+        },
+        {
+          "id": "capsule.install",
+          "description": "Request capsule install through Runtime catalog gates",
+          "risk": "privileged",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://marketplace/install",
+          "operation": "install"
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 16,
     "gpu": false

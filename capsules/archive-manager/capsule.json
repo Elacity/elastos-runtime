@@ -7,6 +7,33 @@
   "type": "wasm",
   "author": "elastos",
   "entrypoint": "archive-manager.wasm",
+  "interfaces": [
+    {
+      "id": "elastos.archive.viewer",
+      "version": "0.5.0",
+      "description": "Archive browsing and extraction through Library and object-provider facts",
+      "methods": [
+        {
+          "id": "archive.open",
+          "description": "Open an archive object through the Runtime viewer route",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://archive/object",
+          "operation": "open"
+        },
+        {
+          "id": "entry.extract",
+          "description": "Extract an archive entry into a Runtime-owned object namespace",
+          "risk": "write",
+          "approval": "user",
+          "audit": "event",
+          "resource": "elastos://archive/entry",
+          "operation": "extract"
+        }
+      ]
+    }
+  ],
   "requires": [
     { "name": "object-provider", "kind": "capsule" }
   ],

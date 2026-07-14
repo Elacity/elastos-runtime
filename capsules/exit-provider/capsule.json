@@ -26,6 +26,69 @@
       "exit.http.denied"
     ]
   },
+  "interfaces": [
+    {
+      "id": "elastos.provider.exit",
+      "version": "0.5.0",
+      "description": "Runtime provider affordance descriptors projected from exit-provider authority metadata; descriptors are not grants.",
+      "methods": [
+        {
+          "id": "status",
+          "description": "Request status through the exit-provider Runtime provider boundary for elastos://exit/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://exit/*",
+          "operation": "status"
+        },
+        {
+          "id": "discover_remote_carrier_exits",
+          "description": "Request discover remote carrier exits through the exit-provider Runtime provider boundary for elastos://exit/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://exit/*",
+          "operation": "discover_remote_carrier_exits"
+        },
+        {
+          "id": "quote",
+          "description": "Request quote through the exit-provider Runtime provider boundary for elastos://exit/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://exit/*",
+          "operation": "quote"
+        },
+        {
+          "id": "open_stream",
+          "description": "Request open stream through the exit-provider Runtime provider boundary for elastos://exit/*.",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://exit/*",
+          "operation": "open_stream"
+        },
+        {
+          "id": "close_stream",
+          "description": "Request close stream through the exit-provider Runtime provider boundary for elastos://exit/*.",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://exit/*",
+          "operation": "close_stream"
+        },
+        {
+          "id": "http_fetch",
+          "description": "Request http fetch through the exit-provider Runtime provider boundary for elastos://exit/*.",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://exit/*",
+          "operation": "http_fetch"
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 64,
     "gpu": false

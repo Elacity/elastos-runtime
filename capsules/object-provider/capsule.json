@@ -19,6 +19,195 @@
     ],
     "audit_events": ["object.provider.requested", "object.provider.completed", "object.provider.failed"]
   },
+  "interfaces": [
+    {
+      "id": "elastos.provider.object",
+      "version": "0.5.0",
+      "description": "Runtime provider affordance descriptors projected from object-provider authority metadata; descriptors are not grants.",
+      "methods": [
+        {
+          "id": "roots",
+          "description": "Request roots through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://object/*",
+          "operation": "roots"
+        },
+        {
+          "id": "list",
+          "description": "Request list through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://object/*",
+          "operation": "list"
+        },
+        {
+          "id": "stat",
+          "description": "Request stat through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://object/*",
+          "operation": "stat"
+        },
+        {
+          "id": "read",
+          "description": "Request read through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://object/*",
+          "operation": "read"
+        },
+        {
+          "id": "download",
+          "description": "Request download through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://object/*",
+          "operation": "download"
+        },
+        {
+          "id": "write",
+          "description": "Request write through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://object/*",
+          "operation": "write"
+        },
+        {
+          "id": "mkdir",
+          "description": "Request mkdir through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://object/*",
+          "operation": "mkdir"
+        },
+        {
+          "id": "rename",
+          "description": "Request rename through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://object/*",
+          "operation": "rename"
+        },
+        {
+          "id": "move",
+          "description": "Request move through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://object/*",
+          "operation": "move"
+        },
+        {
+          "id": "copy",
+          "description": "Request copy through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://object/*",
+          "operation": "copy"
+        },
+        {
+          "id": "trash",
+          "description": "Request trash through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://object/*",
+          "operation": "trash"
+        },
+        {
+          "id": "restore",
+          "description": "Request restore through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://object/*",
+          "operation": "restore"
+        },
+        {
+          "id": "delete_permanently",
+          "description": "Request delete permanently through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "privileged",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://object/*",
+          "operation": "delete_permanently"
+        },
+        {
+          "id": "empty_trash",
+          "description": "Request empty trash through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "privileged",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://object/*",
+          "operation": "empty_trash"
+        },
+        {
+          "id": "status",
+          "description": "Request status through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://object/*",
+          "operation": "status"
+        },
+        {
+          "id": "events",
+          "description": "Request events through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://object/*",
+          "operation": "events"
+        },
+        {
+          "id": "publish",
+          "description": "Request publish through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://object/*",
+          "operation": "publish"
+        },
+        {
+          "id": "unpublish",
+          "description": "Request unpublish through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://object/*",
+          "operation": "unpublish"
+        },
+        {
+          "id": "repair",
+          "description": "Request repair through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://object/*",
+          "operation": "repair"
+        },
+        {
+          "id": "share",
+          "description": "Request share through the object-provider Runtime provider boundary for elastos://object/*.",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://object/*",
+          "operation": "share"
+        }
+      ]
+    }
+  ],
   "capabilities": ["localhost://Users/*"],
   "resources": {
     "memory_mb": 64,

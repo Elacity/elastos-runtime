@@ -7,6 +7,42 @@
   "type": "wasm",
   "author": "elastos",
   "entrypoint": "documents.wasm",
+  "interfaces": [
+    {
+      "id": "elastos.documents.editor",
+      "version": "0.5.0",
+      "description": "Document editor projection over Runtime object storage and publication intents",
+      "methods": [
+        {
+          "id": "document.open",
+          "description": "Open a document object through the Runtime viewer route",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://documents/document",
+          "operation": "open"
+        },
+        {
+          "id": "document.save",
+          "description": "Save a document through the object-provider backed namespace",
+          "risk": "write",
+          "approval": "user",
+          "audit": "event",
+          "resource": "elastos://documents/document",
+          "operation": "save"
+        },
+        {
+          "id": "document.publish",
+          "description": "Request publication of a document through Runtime publication gates",
+          "risk": "privileged",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://documents/publication",
+          "operation": "publish"
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 24,
     "gpu": false
