@@ -323,7 +323,6 @@ APP_CAPSULES=(
     wallet-metamask
     wallet-unisat
     wallet-walletconnect
-    gba-emulator
     chat-room
 )
 
@@ -339,6 +338,17 @@ entrypoint = manifest.get("entrypoint")
 if not entrypoint:
     raise SystemExit(f"{sys.argv[1]} missing entrypoint")
 print(entrypoint)
+PY
+}
+
+capsule_runtime_abi() {
+    local manifest="$1"
+    python3 - "$manifest" <<'PY'
+import json
+import pathlib
+import sys
+
+print(json.loads(pathlib.Path(sys.argv[1]).read_text()).get("runtime_abi", ""))
 PY
 }
 
@@ -358,23 +368,27 @@ copy_capsule_tree() {
 }
 
 install_app_capsules() {
-    local capsule src dest entrypoint built_entrypoint
+    local capsule src dest entrypoint runtime_abi built_entrypoint
 
     mkdir -p "${DATA_DIR}/capsules"
     for capsule in "${APP_CAPSULES[@]}"; do
         src="${ROOT}/capsules/${capsule}"
         dest="${DATA_DIR}/capsules/${capsule}"
         entrypoint="$(capsule_entrypoint "${src}/capsule.json")"
-        built_entrypoint="${src}/target/wasm32-wasip1/release/${entrypoint}"
+        runtime_abi="$(capsule_runtime_abi "${src}/capsule.json")"
+        if [[ "$runtime_abi" != "elastos.runtime-projection/v1" ]]; then
+            echo "${capsule} source-home app must be a Runtime projection, found '${runtime_abi:-unset}'" >&2
+            exit 1
+        fi
+        built_entrypoint="${src}/${entrypoint}"
 
         if [[ ! -f "$built_entrypoint" ]]; then
-            echo "${capsule} wasm entrypoint missing after build: ${built_entrypoint}" >&2
+            echo "${capsule} projection entrypoint missing: ${built_entrypoint}" >&2
             exit 1
         fi
 
         copy_capsule_tree "$src" "$dest"
-        mkdir -p "${dest}/$(dirname "$entrypoint")"
-        install -m 644 "$built_entrypoint" "${dest}/${entrypoint}"
+        find "$dest" -maxdepth 1 -type f -name '*.wasm' -delete
     done
 }
 
@@ -1194,15 +1208,14 @@ provider_names | while IFS= read -r provider; do
     fi
 done
 
-echo "[setup-source-home] build app WASM capsules"
-for capsule in "${APP_CAPSULES[@]}"; do
-    "$CARGO_BIN" build --manifest-path "${ROOT}/capsules/${capsule}/Cargo.toml" --target wasm32-wasip1 --release
-done
+echo "[setup-source-home] build Home CLI native renderer"
+"$CARGO_BIN" build --manifest-path "${ROOT}/capsules/home-cli/Cargo.toml" --release --bin home-cli
 
 echo "[setup-source-home] install native providers and stamp manifest"
 mkdir -p "${DATA_DIR}/bin"
 install -m 755 "${ROOT}/elastos/target/release/shell" "${DATA_DIR}/bin/shell"
 install -m 755 "${ROOT}/elastos/target/release/localhost-provider" "${DATA_DIR}/bin/localhost-provider"
+install -m 755 "${ROOT}/capsules/home-cli/target/release/home-cli" "${DATA_DIR}/bin/home-cli"
 provider_names | while IFS= read -r provider; do
     if [[ -x "${ROOT}/capsules/${provider}/target/release/${provider}" ]]; then
         install -m 755 "${ROOT}/capsules/${provider}/target/release/${provider}" "${DATA_DIR}/bin/${provider}"
@@ -1212,7 +1225,7 @@ provider_names | while IFS= read -r provider; do
 done
 stamp_source_home_components_manifest
 
-echo "[setup-source-home] install app capsules and WASM entrypoints"
+echo "[setup-source-home] install app Runtime projections"
 install_app_capsules
 install_browser_runtime_helpers
 start_browser_runtime_turn

@@ -44,7 +44,7 @@ pub(crate) use elastos_server::{runtime_control, shell_cmd, sources};
 
 use runtime::Runtime;
 
-use elastos_compute::providers::{ComponentProvider, WasmProvider};
+use elastos_compute::providers::ComponentProvider;
 use elastos_compute::ComputeProvider;
 use elastos_storage::providers::LocalFSProvider;
 
@@ -2101,10 +2101,9 @@ pub(crate) async fn create_runtime(
 ) -> anyhow::Result<Runtime> {
     let storage = Arc::new(LocalFSProvider::new(storage_path.as_ref().to_path_buf()).await?);
 
-    // Build list of compute providers: WASM + crosvm
-    let wasm_provider = Arc::new(WasmProvider::new());
-    let base_provider: Arc<dyn ComputeProvider> = wasm_provider.clone();
-    let mut compute_providers: Vec<Arc<dyn ComputeProvider>> = vec![base_provider];
+    // Components have a dedicated provider; host-specific VM providers remain
+    // behind the same Runtime compute contract.
+    let mut compute_providers: Vec<Arc<dyn ComputeProvider>> = Vec::new();
 
     // Add crosvm provider if KVM is available
     if elastos_crosvm::is_supported() {
@@ -2127,7 +2126,6 @@ pub(crate) async fn create_runtime(
     let runtime = Runtime::with_providers_and_component(
         storage,
         compute_providers,
-        Some(wasm_provider),
         Some(Arc::new(ComponentProvider::new())),
     );
     runtime

@@ -269,7 +269,6 @@ function assertUsersSelfReferencesAreApproved() {
     "capsules/browser-engine-adapter/src/main.rs",
     "capsules/browser-engine-adapter/src/tests.rs",
     "capsules/browser-engine-adapter/src/validation.rs",
-    "capsules/chat-wasm/capsule.json",
     "capsules/gba-emulator/capsule.json",
     "capsules/gba-ucity/capsule.json",
     "elastos/crates/elastos-server/src/api/browser_capsules.rs",
@@ -2831,7 +2830,7 @@ for (const component of [...publishReleaseDefault]) {
     `publish-release default capsule set must not include demo-only capsule ${component}`,
   );
 }
-for (const component of ["chat", "chat-wasm", "gba-emulator", "gba-ucity", "chat-room", "ipfs-provider", "tunnel-provider"]) {
+for (const component of ["chat", "gba-emulator", "gba-ucity", "chat-room", "ipfs-provider", "tunnel-provider"]) {
   assert(
     publishRustDemo.has(component),
     `Rust demo publish profile must include ${component}`,

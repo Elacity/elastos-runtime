@@ -28,15 +28,6 @@
         "aarch64-linux"
       ]
     },
-    "chat-wasm": {
-      "cid": "",
-      "sha256": "",
-      "size": 0,
-      "platforms": [
-        "any"
-      ],
-      "note": "WASM capsule (wasm32-wasip1) — platform-independent, runs via runtime bridge"
-    },
     "did-provider": {
       "cid": "",
       "sha256": "",
@@ -856,20 +847,6 @@
         }
       }
     },
-    "chat-wasm": {
-      "install_path": "capsules/chat-wasm",
-      "description": "Packaged WASM chat bundle for the non-KVM full-screen Carrier chat path",
-      "platforms": {
-        "*": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "chat-wasm.tar.gz",
-          "extract_path": "chat-wasm",
-          "install_path": "capsules/chat-wasm"
-        }
-      }
-    },
     "ipfs-provider": {
       "install_path": "bin/ipfs-provider",
       "description": "Host IPFS bridge binary required for direct share/open and attest commands",
@@ -1260,7 +1237,6 @@
         "content-block-graph-provider",
         "browser",
         "chat",
-        "chat-wasm",
         "gba-emulator",
         "gba-ucity",
         "chat-room",
@@ -1422,7 +1398,6 @@
         "wallet",
         "browser",
         "chat",
-        "chat-wasm",
         "gba-emulator",
         "gba-ucity",
         "chat-room",

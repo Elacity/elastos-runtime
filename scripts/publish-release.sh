@@ -7,7 +7,7 @@
 #   ./scripts/publish-release.sh --version 0.10.0 --key path/to/release.key
 #   ./scripts/publish-release.sh --version 0.10.0 --key release.key --channel canary
 #   ./scripts/publish-release.sh --version 0.10.0 --key release.key --skip-build
-#   ./scripts/publish-release.sh --version 0.10.0 --key release.key --capsules chat,chat-wasm
+#   ./scripts/publish-release.sh --version 0.10.0 --key release.key --capsules chat,chat-room
 #   ./scripts/publish-release.sh --version 0.10.0 --key release.key --no-public-url
 #   ./scripts/publish-release.sh --version 0.10.0 --key release.key --public-with-sudo
 #   ./scripts/publish-release.sh --help
@@ -607,29 +607,23 @@ stage_wasm_capsule() {
     local capsule_name="$1"
     local capsule_dir="$2"
     local dest="$3"
-    local entrypoint built_wasm candidates candidate
+    local entrypoint runtime_abi built_wasm candidates candidate
 
     entrypoint=$(capsule_manifest_field "$capsule_name" "entrypoint")
     [[ -n "$entrypoint" ]] || die "${capsule_name} capsule manifest missing entrypoint"
+    runtime_abi=$(capsule_manifest_field "$capsule_name" "runtime_abi")
 
-    if [[ -f "${capsule_dir}/Cargo.toml" ]]; then
-        ensure_rust_target_installed "wasm32-wasip1"
-        info "  Building ${capsule_name} (wasm32-wasip1)..." >&2
-        (cd "$capsule_dir" && cargo build --target wasm32-wasip1 --release) >&2
-    fi
-
-    if [[ -f "${capsule_dir}/Cargo.toml" ]]; then
-        candidates=(
-            "${capsule_dir}/target/wasm32-wasip1/release/${entrypoint}"
-            "elastos/target/wasm32-wasip1/release/${entrypoint}"
-        )
-        if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
-            candidates+=("${CARGO_TARGET_DIR}/wasm32-wasip1/release/${entrypoint}")
-        fi
-        candidates+=("${capsule_dir}/${entrypoint}")
+    if [[ "$runtime_abi" == "elastos.component/v1" ]]; then
+        ensure_rust_target_installed "wasm32-unknown-unknown"
+        info "  Building ${capsule_name} Component..." >&2
+        scripts/build-component-capsule.sh "$capsule_dir" >&2
+    elif [[ "$runtime_abi" == "elastos.runtime-projection/v1" ]]; then
+        info "  Using ${capsule_name} Runtime projection from source..." >&2
     else
-        candidates=("${capsule_dir}/${entrypoint}")
+        die "${capsule_name} uses unsupported runtime_abi '${runtime_abi:-unset}'"
     fi
+
+    candidates=("${capsule_dir}/${entrypoint}")
     built_wasm=""
     for candidate in "${candidates[@]}"; do
         if [[ -f "$candidate" ]]; then
@@ -637,7 +631,7 @@ stage_wasm_capsule() {
             break
         fi
     done
-    [[ -n "$built_wasm" ]] || die "${capsule_name} wasm entrypoint missing after build: ${entrypoint}"
+    [[ -n "$built_wasm" ]] || die "${capsule_name} entrypoint missing after build: ${entrypoint}"
 
     mkdir -p "$dest"
     cp "${capsule_dir}/capsule.json" "$dest/"
@@ -790,7 +784,6 @@ build_platform_independent_direct_assets() {
         archive-manager \
         inbox \
         services \
-        chat-wasm \
         gba-emulator \
         gba-ucity \
         chat-room; do
@@ -956,14 +949,6 @@ else
     else
         info "Building publish capsules..."
         for capsule in "${CAPSULES[@]}"; do
-            # chat-wasm: build from capsules/chat source, wasm32-wasip1 target
-            if [[ "$capsule" == "chat-wasm" ]]; then
-                info "  Building chat-wasm (wasm32-wasip1)..."
-                (cd capsules/chat && cargo build --bin chat-stdio --target wasm32-wasip1 --no-default-features --release 2>&1)
-                mkdir -p capsules/chat-wasm
-                cp capsules/chat/target/wasm32-wasip1/release/chat-stdio.wasm capsules/chat-wasm/
-                continue
-            fi
             capsule_dir="$(resolve_capsule_dir "$capsule" || true)"
             if [[ -z "$capsule_dir" || ! -f "${capsule_dir}/Cargo.toml" ]]; then
                 warn "No Cargo.toml for ${capsule}; skipping explicit build step"
@@ -981,10 +966,15 @@ else:
     print(json.loads(path.read_text(encoding="utf-8")).get("type", ""))
 PY
 )"
-            if [[ "$capsule_type" == "wasm" ]]; then
-                info "  Building ${capsule} (wasm32-wasip1)..."
-                ensure_rust_target_installed "wasm32-wasip1"
-                (cd "$capsule_dir" && cargo build --target wasm32-wasip1 --release 2>&1)
+            runtime_abi="$(capsule_manifest_field "$capsule" "runtime_abi")"
+            if [[ "$capsule_type" == "wasm" && "$runtime_abi" == "elastos.component/v1" ]]; then
+                info "  Building ${capsule} Component..."
+                ensure_rust_target_installed "wasm32-unknown-unknown"
+                scripts/build-component-capsule.sh "$capsule_dir" 2>&1
+            elif [[ "$capsule_type" == "wasm" && "$runtime_abi" == "elastos.runtime-projection/v1" ]]; then
+                info "  Using ${capsule} Runtime projection from source..."
+            elif [[ "$capsule_type" == "wasm" ]]; then
+                die "${capsule} uses unsupported runtime_abi '${runtime_abi:-unset}'"
             else
                 info "  Building ${capsule}..."
                 (cd "$capsule_dir" && cargo build --release 2>&1)

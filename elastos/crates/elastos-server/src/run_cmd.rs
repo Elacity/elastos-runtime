@@ -14,7 +14,14 @@ pub async fn run_capsule(
                 return run_microvm_via_operator_runtime(manifest, &capsule_args).await;
             }
             elastos_common::CapsuleType::Wasm => {
-                return run_wasm_via_operator_runtime(&capsule_dir, capsule_args).await;
+                if !manifest.is_component_capsule() {
+                    anyhow::bail!(
+                        "WASI Preview 1 capsules are not supported; '{}' must use runtime_abi=\"elastos.component/v1\"",
+                        manifest.name
+                    );
+                }
+                return run_component_via_operator_runtime(&capsule_dir, manifest, capsule_args)
+                    .await;
             }
             elastos_common::CapsuleType::Data => {
                 let runtime = crate::create_runtime("/tmp/elastos/storage").await?;
@@ -144,13 +151,14 @@ async fn run_microvm_via_operator_runtime(
     Ok(())
 }
 
-async fn run_wasm_via_operator_runtime(
+async fn run_component_via_operator_runtime(
     capsule_dir: &Path,
+    manifest: &elastos_common::CapsuleManifest,
     capsule_args: Vec<String>,
 ) -> anyhow::Result<()> {
     let coords = operator_runtime_coords().await?;
     eprintln!(
-        "[run] WASM capsule attached to runtime at {}",
+        "[run] Component capsule attached to runtime at {}",
         coords.api_url
     );
 
@@ -158,21 +166,35 @@ async fn run_wasm_via_operator_runtime(
     let tokens = crate::runtime_control::attach_to_runtime(&coords).await?;
     let api_url = coords.api_url.clone();
     let client_token = tokens.client_token;
-    runtime.set_wasm_bridge_spawner(std::sync::Arc::new(move |pipes| {
-        elastos_server::carrier_bridge::spawn_wasm_api_bridge(
-            pipes,
-            api_url.clone(),
-            client_token.clone(),
-        );
-    }));
+    let manifest_capabilities = manifest.resource_authority_bounds();
+    let audit_data_dir = crate::default_data_dir();
+    let hostcall_handle = tokio::runtime::Handle::current();
+    runtime.set_bridge_hostcall(std::sync::Arc::new(
+        move |line, capsule_id, principal_id| {
+            let response = hostcall_handle
+                .block_on(
+                    elastos_server::carrier_bridge::handle_remote_request_with_audit_dir(
+                        line,
+                        &api_url,
+                        &client_token,
+                        capsule_id,
+                        &manifest_capabilities,
+                        principal_id,
+                        Some(audit_data_dir.as_path()),
+                    ),
+                )
+                .map_err(|err| err.to_string())?;
+            serde_json::to_string(&response).map_err(|err| err.to_string())
+        },
+    ));
 
     let _saved_termios = crate::runtime_control::enable_host_raw_mode_pub();
     let _term_env = ScopedTerminalEnv::capture();
     let handle = runtime
         .run_local(capsule_dir, capsule_args)
         .await
-        .map_err(|e| anyhow::anyhow!("WASM capsule failed: {}", e))?;
-    eprintln!("[run] WASM capsule '{}' exited", handle.manifest.name);
+        .map_err(|e| anyhow::anyhow!("Component capsule failed: {}", e))?;
+    eprintln!("[run] Component capsule '{}' exited", handle.manifest.name);
     Ok(())
 }
 

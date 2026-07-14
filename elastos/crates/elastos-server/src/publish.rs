@@ -39,7 +39,6 @@ const HOME_PUBLISH_CAPSULES: &[&str] = &[
 const DEFAULT_PUBLISH_CAPSULES: &[&str] = HOME_PUBLISH_CAPSULES;
 const DEMO_PUBLISH_CAPSULES: &[&str] = &[
     "chat",
-    "chat-wasm",
     "gba-emulator",
     "gba-ucity",
     "chat-room",

@@ -20,7 +20,6 @@ use elastos_common::localhost::{
 use rand::RngCore;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use elastos_compute::providers::BridgePipes;
 use elastos_runtime::auth::RuntimeAuditEventV1;
 use elastos_runtime::capability::{Action, CapabilityManager, CapabilityToken, ResourceId};
 use elastos_runtime::provider::ProviderRegistry;
@@ -136,124 +135,6 @@ pub async fn spawn_carrier_bridge(
     });
 
     Ok(())
-}
-
-/// Bridge a WASI capsule's launch-owned FIFOs to Runtime provider dispatch.
-pub fn spawn_wasm_carrier_bridge(pipes: BridgePipes, ctx: BridgeContext) {
-    let tokio_handle = tokio::runtime::Handle::current();
-
-    if let Err(error) = std::thread::Builder::new()
-        .name("wasm-carrier-bridge".into())
-        .spawn(move || {
-            use std::io::{BufRead, Write};
-
-            let reader = std::io::BufReader::new(pipes.capsule_stdout);
-            let mut writer = pipes.capsule_stdin;
-            let ctx = Some(ctx);
-
-            for line_result in reader.lines() {
-                let line = match line_result {
-                    Ok(line) => line,
-                    Err(error) => {
-                        tracing::debug!("WASM bridge read error: {}", error);
-                        break;
-                    }
-                };
-                if line.trim().is_empty() {
-                    continue;
-                }
-
-                let response = if line.len() > MAX_CARRIER_FRAME_BYTES {
-                    request_too_large_envelope()
-                } else {
-                    tokio_handle.block_on(async {
-                        handle_request(&line, &ctx).await.unwrap_or_else(|error| {
-                            tracing::warn!("WASM bridge error: {}", error);
-                            serde_json::json!({
-                                "id": 0,
-                                "response": {
-                                    "type": "error",
-                                    "code": "bridge_error",
-                                    "message": error.to_string(),
-                                }
-                            })
-                        })
-                    })
-                };
-
-                if writer
-                    .write_all(&serialize_bridge_response(response))
-                    .and_then(|_| writer.flush())
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-    {
-        tracing::error!("Failed to spawn WASM bridge thread: {}", error);
-    }
-}
-
-/// Bridge a WASI capsule's launch-owned FIFOs to an attached local Runtime.
-pub fn spawn_wasm_api_bridge(pipes: BridgePipes, api_url: String, client_token: String) {
-    let tokio_handle = tokio::runtime::Handle::current();
-    let capsule_id = pipes.capsule_id.clone();
-    let principal_id = pipes.principal_id.clone();
-    let manifest_capabilities = pipes.manifest_capabilities.clone();
-
-    if let Err(error) = std::thread::Builder::new()
-        .name("wasm-api-bridge".into())
-        .spawn(move || {
-            use std::io::{BufRead, Write};
-
-            let reader = std::io::BufReader::new(pipes.capsule_stdout);
-            let mut writer = pipes.capsule_stdin;
-
-            for line_result in reader.lines() {
-                let line = match line_result {
-                    Ok(line) => line,
-                    Err(error) => {
-                        tracing::debug!("WASM API bridge read error: {}", error);
-                        break;
-                    }
-                };
-                if line.trim().is_empty() {
-                    continue;
-                }
-
-                let response = tokio_handle.block_on(handle_remote_request(
-                    &line,
-                    &api_url,
-                    &client_token,
-                    &capsule_id,
-                    &manifest_capabilities,
-                    principal_id.as_deref(),
-                ));
-                let response = response.unwrap_or_else(|error| {
-                    tracing::warn!("WASM API bridge error: {}", error);
-                    serde_json::json!({
-                        "id": 0,
-                        "response": {
-                            "type": "error",
-                            "code": "bridge_error",
-                            "message": error.to_string(),
-                        }
-                    })
-                });
-
-                if writer
-                    .write_all(&serialize_bridge_response(response))
-                    .and_then(|_| writer.flush())
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-    {
-        tracing::error!("Failed to spawn WASM API bridge thread: {}", error);
-    }
 }
 
 /// Parse an action string into a capability Action.

@@ -6,12 +6,16 @@
   "author": "elastos",
   "role": "shell",
   "type": "wasm",
-  "entrypoint": "home-gui.wasm",
+  "runtime_abi": "elastos.runtime-projection/v1",
+  "bus_contract": "elastos.runtime-projection/v1",
+  "execution": "web-projection",
+  "projections": ["web", "facts", "affordances", "gates"],
+  "entrypoint": "browser/index.html",
   "interfaces": [
     {
       "id": "elastos.shell.gui",
       "version": "0.5.0",
-      "description": "Trusted host-loaded desktop shell projection over Runtime facts and signed Home host intents",
+      "description": "Trusted host-loaded desktop shell projection over Runtime facts and structured Home intents",
       "methods": [
         {
           "id": "desktop.render",

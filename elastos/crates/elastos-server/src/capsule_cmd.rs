@@ -1,5 +1,4 @@
 use anyhow::{anyhow, bail};
-use base64::Engine as _;
 use elastos_server::sources::default_data_dir;
 use std::path::{Path, PathBuf};
 
@@ -97,28 +96,6 @@ fn load_capsule_manifest(
     Ok(manifest)
 }
 
-struct ScopedEnvVar {
-    key: &'static str,
-    previous: Option<std::ffi::OsString>,
-}
-
-impl ScopedEnvVar {
-    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-        let previous = std::env::var_os(key);
-        std::env::set_var(key, value);
-        Self { key, previous }
-    }
-}
-
-impl Drop for ScopedEnvVar {
-    fn drop(&mut self) {
-        match &self.previous {
-            Some(value) => std::env::set_var(self.key, value),
-            None => std::env::remove_var(self.key),
-        }
-    }
-}
-
 struct ScopedTerminalEnv {
     cols_prev: Option<std::ffi::OsString>,
     rows_prev: Option<std::ffi::OsString>,
@@ -162,35 +139,44 @@ impl Drop for ScopedTerminalEnv {
     }
 }
 
-async fn run_wasm_capsule(
+async fn run_component_capsule(
     capsule_dir: PathBuf,
     coords: &crate::runtime_control::RuntimeCoords,
     client_token: String,
-    config: &serde_json::Map<String, serde_json::Value>,
+    manifest: &elastos_common::CapsuleManifest,
     interactive: bool,
 ) -> anyhow::Result<()> {
     let runtime = crate::create_runtime(default_data_dir().join("storage")).await?;
     let api_url = coords.api_url.clone();
-    runtime.set_wasm_bridge_spawner(std::sync::Arc::new(move |pipes| {
-        elastos_server::carrier_bridge::spawn_wasm_api_bridge(
-            pipes,
-            api_url.clone(),
-            client_token.clone(),
-        );
-    }));
+    let manifest_capabilities = manifest.resource_authority_bounds();
+    let audit_data_dir = default_data_dir();
+    let hostcall_handle = tokio::runtime::Handle::current();
+    runtime.set_bridge_hostcall(std::sync::Arc::new(
+        move |line, capsule_id, principal_id| {
+            let response = hostcall_handle
+                .block_on(
+                    elastos_server::carrier_bridge::handle_remote_request_with_audit_dir(
+                        line,
+                        &api_url,
+                        &client_token,
+                        capsule_id,
+                        &manifest_capabilities,
+                        principal_id,
+                        Some(audit_data_dir.as_path()),
+                    ),
+                )
+                .map_err(|err| err.to_string())?;
+            serde_json::to_string(&response).map_err(|err| err.to_string())
+        },
+    ));
 
-    let config_json = serde_json::Value::Object(config.clone());
-    let config_text = serde_json::to_string(&config_json)?;
-    let config_b64 = base64::engine::general_purpose::STANDARD.encode(config_text.as_bytes());
-    let _command_env = ScopedEnvVar::set("ELASTOS_COMMAND", &config_text);
-    let _command_b64_env = ScopedEnvVar::set("ELASTOS_COMMAND_B64", &config_b64);
     let _term_env = ScopedTerminalEnv::capture();
     let _saved_termios = interactive.then(crate::runtime_control::enable_host_raw_mode_pub);
 
     runtime
         .run_local(&capsule_dir, Vec::new())
         .await
-        .map_err(|e| anyhow!("WASM capsule failed: {}", e))?;
+        .map_err(|e| anyhow!("Component capsule failed: {}", e))?;
 
     Ok(())
 }
@@ -268,11 +254,17 @@ pub async fn run_capsule(
         .ok_or_else(|| anyhow!("ensure-capsule response missing path for '{}'", name))?;
     let manifest = load_capsule_manifest(&capsule_dir, &name)?;
     if manifest.capsule_type == elastos_common::CapsuleType::Wasm {
-        return run_wasm_capsule(
+        if !manifest.is_component_capsule() {
+            bail!(
+                "WASI Preview 1 capsules are not supported; '{}' must use runtime_abi=\"elastos.component/v1\" (Runtime projections open through Home)",
+                manifest.name
+            );
+        }
+        return run_component_capsule(
             capsule_dir,
             &coords,
             tokens.client_token,
-            &config,
+            &manifest,
             interactive_surface,
         )
         .await;

@@ -6,7 +6,11 @@
   "author": "elastos",
   "role": "app",
   "type": "wasm",
-  "entrypoint": "browser.wasm",
+  "runtime_abi": "elastos.runtime-projection/v1",
+  "bus_contract": "elastos.runtime-projection/v1",
+  "execution": "web-projection",
+  "projections": ["web", "facts", "affordances", "gates"],
+  "entrypoint": "browser/index.html",
   "interfaces": [
     {
       "id": "elastos.browser.page",
@@ -32,6 +36,33 @@
           "operation": "navigate"
         },
         {
+          "id": "page.input",
+          "description": "Send validated input to the active Browser page through Runtime-owned control",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://browser/page",
+          "operation": "input"
+        },
+        {
+          "id": "page.close",
+          "description": "Close the active Browser page and release Runtime-owned engine resources",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://browser/page",
+          "operation": "close"
+        },
+        {
+          "id": "display.attach",
+          "description": "Attach Browser remote display audio/video through the Runtime WebRTC relay",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://browser/display",
+          "operation": "attach"
+        },
+        {
           "id": "exit.select",
           "description": "Select a Browser Exit offer for future Browser traffic",
           "risk": "write",
@@ -48,16 +79,31 @@
           "audit": "full",
           "resource": "elastos://browser/profile",
           "operation": "reset"
+        },
+        {
+          "id": "wallet.request",
+          "description": "Forward a dapp wallet request into Runtime-owned Wallet and Inbox approval flow",
+          "risk": "payment",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://browser/wallet-bridge",
+          "operation": "request"
         }
       ]
     }
   ],
   "capabilities": [
-    "elastos://wallet/*",
-    "elastos://net/resolve",
-    "elastos://net/connect",
-    "elastos://net/stream",
-    "elastos://net/http"
+    "elastos://browser/page",
+    "elastos://browser/display",
+    "elastos://browser/exit",
+    "elastos://browser/profile",
+    "elastos://browser/wallet-bridge"
+  ],
+  "requires": [
+    { "name": "browser-engine-adapter", "kind": "capsule" },
+    { "name": "exit-provider", "kind": "capsule" },
+    { "name": "net-provider", "kind": "capsule" },
+    { "name": "wallet-provider", "kind": "capsule" }
   ],
   "resources": {
     "memory_mb": 32,

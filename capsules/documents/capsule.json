@@ -5,8 +5,12 @@
   "description": "Create, edit, and publish markdown documents",
   "role": "viewer",
   "type": "wasm",
+  "runtime_abi": "elastos.runtime-projection/v1",
+  "bus_contract": "elastos.runtime-projection/v1",
+  "execution": "web-projection",
+  "projections": ["web", "facts", "affordances", "gates"],
   "author": "elastos",
-  "entrypoint": "documents.wasm",
+  "entrypoint": "browser/index.html",
   "interfaces": [
     {
       "id": "elastos.documents.editor",
@@ -20,7 +24,17 @@
           "approval": "runtime_policy",
           "audit": "event",
           "resource": "elastos://documents/document",
-          "operation": "open"
+          "operation": "open",
+          "input_schema": {
+            "schema": "elastos.documents.document-open/v1",
+            "accepts": [
+              {
+                "kind": "library_object",
+                "extensions": [".md", ".txt"],
+                "mime": ["text/plain", "text/markdown"]
+              }
+            ]
+          }
         },
         {
           "id": "document.save",

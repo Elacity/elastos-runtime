@@ -5499,21 +5499,21 @@ async fn test_home_launch_starts_chat_room_capsule_and_reports_runtime_activity(
 }
 
 #[tokio::test]
-async fn test_home_launch_materializes_source_wasm_capsule_before_runtime_launch() {
+async fn test_home_launch_rejects_source_wasi_materialization() {
     let dir = tempfile::tempdir().unwrap();
     write_test_browser_capsule(
         dir.path(),
-        "archive-manager",
+        "test-wasm-viewer",
         "app",
-        "Archive test capsule",
+        "WASM test capsule",
         None,
     );
-    let archive_dir = dir.path().join("capsules").join("archive-manager");
+    let archive_dir = dir.path().join("capsules").join("test-wasm-viewer");
     let built_wasm = archive_dir
         .join("target")
         .join("wasm32-wasip1")
         .join("release")
-        .join("archive-manager.wasm");
+        .join("test-wasm-viewer.wasm");
     std::fs::create_dir_all(built_wasm.parent().unwrap()).unwrap();
     std::fs::write(&built_wasm, b"\0asm").unwrap();
     assert!(!archive_dir.join("archive-manager.wasm").exists());
@@ -5530,7 +5530,7 @@ async fn test_home_launch_materializes_source_wasm_capsule_before_runtime_launch
                 .uri("/api/apps/home/launch")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"target":"archive-manager"}"#))
+                .body(Body::from(r#"{"target":"test-wasm-viewer"}"#))
                 .unwrap(),
         )
         .await
@@ -5540,20 +5540,20 @@ async fn test_home_launch_materializes_source_wasm_capsule_before_runtime_launch
         .await
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["launch_status"], "launched");
+    assert_eq!(payload["launch_status"], "failed");
+    assert!(payload["launch_detail"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("WASI Preview 1 product capsules are no longer materialized"));
 
     let launch_requests = runtime.launch_requests.lock().await;
-    let launch_path = launch_requests
-        .last()
-        .and_then(|request| request["path"].as_str())
-        .expect("runtime launch path");
-    assert!(launch_path.ends_with("/dev-capsules/archive-manager"));
-    let launch_bundle = std::path::Path::new(launch_path);
-    assert!(launch_bundle.join("capsule.json").is_file());
-    assert!(launch_bundle.join("archive-manager.wasm").is_file());
     assert!(
-        !archive_dir.join("archive-manager.wasm").exists(),
-        "source tree should not be dirtied with generated wasm"
+        launch_requests.is_empty(),
+        "legacy WASI materialization must fail before Runtime launch"
+    );
+    assert!(
+        !archive_dir.join("test-wasm-viewer.wasm").exists(),
+        "source tree should not be dirtied with generated WASI artifacts"
     );
 }
 

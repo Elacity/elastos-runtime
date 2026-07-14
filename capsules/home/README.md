@@ -7,7 +7,8 @@ front-door host. It is not the selectable GUI shell; that identity is
 Current truth:
 
 1. `home` is the internal capsule ID for Home.
-   - the capsule manifest entrypoint is `home.wasm`
+   - the capsule manifest entrypoint is `browser/index.html`
+   - the capsule declares `elastos.runtime-projection/v1`, not a WASI receipt
    - the capsule role is `app` because this is the front-door host, not a
      selectable shell
    - browser assets live under `browser/`

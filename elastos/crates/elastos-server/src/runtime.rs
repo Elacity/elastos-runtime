@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::RwLock;
 
 use elastos_common::{CapsuleManifest, CapsuleType, ElastosError, Result};
-use elastos_compute::providers::{BridgeHostcall, BridgeSpawner, ComponentProvider, WasmProvider};
+use elastos_compute::providers::{BridgeHostcall, ComponentProvider};
 use elastos_compute::{CapsuleHandle, ComputeProvider};
 use elastos_storage::StorageProvider;
 
@@ -44,8 +44,6 @@ pub struct Runtime {
     provider_registry: RwLock<Option<Arc<ProviderRegistry>>>,
     /// Registry of running capsules (for API queries)
     running_capsules: RwLock<HashMap<String, RunningCapsuleInfo>>,
-    /// WASI Preview 1 compute provider, when configured.
-    wasm_provider: Option<Arc<WasmProvider>>,
     /// Reference to the component provider for ABI-specific launch.
     component_provider: Option<Arc<ComponentProvider>>,
     /// Per-launch manifest capability ceilings for capsule bridge requests.
@@ -62,25 +60,14 @@ impl Runtime {
             signature_dev_mode: RwLock::new(false),
             provider_registry: RwLock::new(None),
             running_capsules: RwLock::new(HashMap::new()),
-            wasm_provider: None,
             component_provider: None,
             bridge_manifest_capabilities: Arc::new(StdRwLock::new(HashMap::new())),
         }
     }
 
-    /// Create a new runtime with multiple compute providers.
-    pub fn with_providers(
-        storage: Arc<dyn StorageProvider>,
-        compute_providers: Vec<Arc<dyn ComputeProvider>>,
-        wasm_provider: Option<Arc<WasmProvider>>,
-    ) -> Self {
-        Self::with_providers_and_component(storage, compute_providers, wasm_provider, None)
-    }
-
     pub fn with_providers_and_component(
         storage: Arc<dyn StorageProvider>,
         compute_providers: Vec<Arc<dyn ComputeProvider>>,
-        wasm_provider: Option<Arc<WasmProvider>>,
         component_provider: Option<Arc<ComponentProvider>>,
     ) -> Self {
         Self {
@@ -90,7 +77,6 @@ impl Runtime {
             signature_dev_mode: RwLock::new(false),
             provider_registry: RwLock::new(None),
             running_capsules: RwLock::new(HashMap::new()),
-            wasm_provider,
             component_provider,
             bridge_manifest_capabilities: Arc::new(StdRwLock::new(HashMap::new())),
         }
@@ -108,25 +94,6 @@ impl Runtime {
         pending_store: Arc<elastos_runtime::capability::pending::PendingRequestStore>,
         data_dir: std::path::PathBuf,
     ) {
-        if let Some(ref wasm) = self.wasm_provider {
-            let bridge_registry = registry.clone();
-            let bridge_capabilities = capability_manager.clone();
-            let bridge_pending = pending_store.clone();
-            let bridge_data_dir = data_dir.clone();
-            wasm.set_bridge_spawner(Arc::new(move |pipes| {
-                let ctx = crate::carrier_bridge::BridgeContext {
-                    provider_registry: bridge_registry.clone(),
-                    capability_manager: bridge_capabilities.clone(),
-                    pending_store: bridge_pending.clone(),
-                    capsule_id: pipes.capsule_id.clone(),
-                    principal_id: pipes.principal_id.clone(),
-                    manifest_capabilities: pipes.manifest_capabilities.clone(),
-                    data_dir: Some(bridge_data_dir.clone()),
-                };
-                crate::carrier_bridge::spawn_wasm_carrier_bridge(pipes, ctx);
-            }));
-        }
-
         if let Some(ref component) = self.component_provider {
             let host_reg = registry.clone();
             let host_cap_mgr = capability_manager.clone();
@@ -173,18 +140,6 @@ impl Runtime {
         }
     }
 
-    pub fn set_wasm_bridge_spawner(&self, spawner: BridgeSpawner) {
-        if let Some(ref wasm) = self.wasm_provider {
-            wasm.set_bridge_spawner(spawner);
-        }
-    }
-
-    pub fn set_wasm_bridge_hostcall(&self, hostcall: BridgeHostcall) {
-        if let Some(ref wasm) = self.wasm_provider {
-            wasm.set_bridge_hostcall(hostcall);
-        }
-    }
-
     /// Find a compute provider that supports the given capsule type
     fn get_provider(&self, capsule_type: &CapsuleType) -> Option<Arc<dyn ComputeProvider>> {
         self.compute_providers
@@ -202,6 +157,9 @@ impl Runtime {
                 .component_provider
                 .as_ref()
                 .map(|provider| provider.clone() as Arc<dyn ComputeProvider>);
+        }
+        if manifest.capsule_type == CapsuleType::Wasm {
+            return None;
         }
         self.get_provider(&manifest.capsule_type)
     }
@@ -331,11 +289,6 @@ impl Runtime {
                     .set_bridge_principal(&handle.id, principal_id.clone())
                     .await;
             }
-        } else if handle.manifest.capsule_type == CapsuleType::Wasm {
-            if let Some(ref wasm) = self.wasm_provider {
-                wasm.set_bridge_principal(&handle.id, principal_id.clone())
-                    .await;
-            }
         }
 
         // Set args on handle before starting
@@ -346,10 +299,6 @@ impl Runtime {
         if handle.manifest.is_component_capsule() {
             if let Some(ref component) = self.component_provider {
                 component.clear_bridge_principal(&handle.id).await;
-            }
-        } else if handle.manifest.capsule_type == CapsuleType::Wasm {
-            if let Some(ref wasm) = self.wasm_provider {
-                wasm.clear_bridge_principal(&handle.id).await;
             }
         }
         if let Ok(mut bounds) = self.bridge_manifest_capabilities.write() {
@@ -825,7 +774,6 @@ mod tests {
         let runtime = Arc::new(Runtime::with_providers_and_component(
             storage,
             Vec::new(),
-            None,
             Some(component_provider.clone()),
         ));
         runtime

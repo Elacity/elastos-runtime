@@ -5,8 +5,12 @@
   "description": "Browse and extract supported archive contents through Library",
   "role": "viewer",
   "type": "wasm",
+  "runtime_abi": "elastos.runtime-projection/v1",
+  "bus_contract": "elastos.runtime-projection/v1",
+  "execution": "web-projection",
+  "projections": ["web", "facts", "affordances", "gates"],
   "author": "elastos",
-  "entrypoint": "archive-manager.wasm",
+  "entrypoint": "browser/index.html",
   "interfaces": [
     {
       "id": "elastos.archive.viewer",
@@ -20,7 +24,37 @@
           "approval": "runtime_policy",
           "audit": "event",
           "resource": "elastos://archive/object",
-          "operation": "open"
+          "operation": "open",
+          "input_schema": {
+            "schema": "elastos.archive.open/v1",
+            "accepts": [
+              {
+                "kind": "library_object",
+                "extensions": [".zip", ".tar", ".tar.gz", ".tgz"],
+                "mime": ["application/zip", "application/x-tar", "application/gzip"],
+                "mode": "browse_and_extract"
+              },
+              {
+                "kind": "library_object",
+                "extensions": [
+                  ".7z",
+                  ".rar",
+                  ".gz",
+                  ".xz",
+                  ".bz2",
+                  ".zst",
+                  ".lz4",
+                  ".tar.xz",
+                  ".txz",
+                  ".tar.bz2",
+                  ".tbz2",
+                  ".tar.zst",
+                  ".tzst"
+                ],
+                "mode": "unsupported_family_diagnostic"
+              }
+            ]
+          }
         },
         {
           "id": "entry.extract",

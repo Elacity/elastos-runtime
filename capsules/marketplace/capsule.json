@@ -5,8 +5,12 @@
   "description": "Marketplace for browsing apps, viewers, providers, and content installed on this Runtime",
   "role": "app",
   "type": "wasm",
+  "runtime_abi": "elastos.runtime-projection/v1",
+  "bus_contract": "elastos.runtime-projection/v1",
+  "execution": "web-projection",
+  "projections": ["web", "facts", "affordances", "gates"],
   "author": "elastos",
-  "entrypoint": "marketplace.wasm",
+  "entrypoint": "browser/index.html",
   "interfaces": [
     {
       "id": "elastos.marketplace.catalog",

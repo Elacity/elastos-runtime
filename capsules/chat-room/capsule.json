@@ -5,8 +5,12 @@
   "description": "Runtime-launched Chat capsule with a web surface adapter",
   "role": "app",
   "type": "wasm",
+  "runtime_abi": "elastos.runtime-projection/v1",
+  "bus_contract": "elastos.runtime-projection/v1",
+  "execution": "web-projection",
+  "projections": ["web", "facts", "affordances", "gates", "carrier"],
   "author": "elastos",
-  "entrypoint": "chat-room.wasm",
+  "entrypoint": "browser/index.html",
   "interfaces": [
     {
       "id": "elastos.chat.room",

@@ -5,8 +5,12 @@
   "description": "Library for local files, folders, and published objects through the Runtime object provider",
   "role": "app",
   "type": "wasm",
+  "runtime_abi": "elastos.runtime-projection/v1",
+  "bus_contract": "elastos.runtime-projection/v1",
+  "execution": "web-projection",
+  "projections": ["web", "facts", "affordances", "gates"],
   "author": "elastos",
-  "entrypoint": "library.wasm",
+  "entrypoint": "browser/index.html",
   "interfaces": [
     {
       "id": "elastos.library.objects",

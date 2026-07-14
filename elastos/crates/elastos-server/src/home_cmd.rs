@@ -1,6 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1360,115 +1360,53 @@ async fn run_home_capsule(
     client_token: &str,
     session: &HomeSession,
 ) -> anyhow::Result<()> {
-    let capsule_dir = resolve_home_capsule_dir(data_dir)?;
-    let runtime_storage = data_dir
-        .join("Local")
-        .join("Shared")
-        .join("Home")
-        .join("bootstrap-storage");
-    fs::create_dir_all(&runtime_storage)?;
-
-    let runtime = crate::create_runtime(&runtime_storage).await?;
-    let api_url = api_url.to_string();
-    let client_token = client_token.to_string();
-
-    runtime.set_wasm_bridge_spawner(std::sync::Arc::new(move |pipes| {
-        elastos_server::carrier_bridge::spawn_wasm_api_bridge(
-            pipes,
-            api_url.clone(),
-            client_token.clone(),
-        );
-    }));
-
-    let mut scoped_env = Vec::new();
-    // The Home capsule owns startup-input settle logic for the front-door path.
-    // Do not pre-flush stdin here, or Home and chat end up competing over input repair.
-    let raw_mode = runtime_control::enable_host_raw_mode_pub();
-    if raw_mode.is_some() {
-        if let Some((cols, rows)) = current_terminal_size() {
-            scoped_env.push(ScopedEnvVar::set("ELASTOS_TERM_COLS", cols.to_string()));
-            scoped_env.push(ScopedEnvVar::set("ELASTOS_TERM_ROWS", rows.to_string()));
-        }
-        scoped_env.push(ScopedEnvVar::set("ELASTOS_HOME_TUI", "1"));
-    } else {
-        scoped_env.push(ScopedEnvVar::set("ELASTOS_HOME_TUI", "0"));
-        if home_debug_tty() {
-            eprintln!(
-                "[home-tty] raw mode unavailable (stdin_tty={} stdout_tty={}); falling back to line dashboard",
-                std::io::stdin().is_terminal(),
-                std::io::stdout().is_terminal(),
-            );
-        }
-    }
-    let _saved_termios = raw_mode;
-
-    runtime
-        .run_local(&capsule_dir, vec![session.uri_root.clone()])
-        .await
-        .map_err(|e| anyhow::anyhow!("Home WASM dashboard failed: {}", e))?;
-
+    run_home_cli_renderer(data_dir, api_url, client_token, session)?;
     Ok(())
 }
 
-fn resolve_home_capsule_dir(data_dir: &Path) -> anyhow::Result<PathBuf> {
-    let dev = source_capsule_dir(HOME_CLI_CAPSULE_NAME);
-    let dev_target = dev
-        .join("target")
-        .join("wasm32-wasip1")
-        .join("release")
-        .join("home-cli.wasm");
-    let dev_entry = dev.join("home-cli.wasm");
-    if dev_target.is_file() {
-        fs::copy(&dev_target, &dev_entry).with_context(|| {
-            format!(
-                "failed to stage local Home WASM artifact from {}",
-                dev_target.display()
-            )
-        })?;
+fn run_home_cli_renderer(
+    data_dir: &Path,
+    api_url: &str,
+    client_token: &str,
+    session: &HomeSession,
+) -> anyhow::Result<()> {
+    let renderer = resolve_home_cli_renderer_program(data_dir)?;
+    let status = Command::new(&renderer)
+        .arg(&session.uri_root)
+        .env("ELASTOS_API", api_url)
+        .env("ELASTOS_TOKEN", client_token)
+        .env_remove("ELASTOS_CARRIER_PATH")
+        .status()
+        .with_context(|| format!("failed to start Home CLI renderer {}", renderer.display()))?;
+    if !status.success() {
+        anyhow::bail!("Home CLI renderer exited with {}", status);
     }
-    if dev.join("capsule.json").is_file()
-        && dev.join("home-cli.wasm").is_file()
-        && prefer_dev_home_capsule()
-    {
-        return Ok(dev);
-    }
+    Ok(())
+}
 
-    let installed = data_dir.join("capsules").join(HOME_CLI_CAPSULE_NAME);
-    if installed.join("capsule.json").is_file() && installed.join("home-cli.wasm").is_file() {
+fn resolve_home_cli_renderer_program(data_dir: &Path) -> anyhow::Result<PathBuf> {
+    let installed = data_dir.join("bin").join(HOME_CLI_CAPSULE_NAME);
+    if installed.is_file() {
         return Ok(installed);
     }
 
-    if dev.join("capsule.json").is_file() && dev.join("home-cli.wasm").is_file() {
+    let dev = source_capsule_dir(HOME_CLI_CAPSULE_NAME)
+        .join("target")
+        .join("release")
+        .join(HOME_CLI_CAPSULE_NAME);
+    if dev.is_file() {
         return Ok(dev);
     }
 
-    if prefer_dev_home_capsule() {
-        anyhow::bail!(
-            "home capsule not built yet.\n\nBuild it first:\n\n  cd {}\n  cargo build --target wasm32-wasip1 --release\n\nOr install the published Home surface with:\n\n  elastos setup",
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../capsules")
-                .join(HOME_CLI_CAPSULE_NAME)
-                .display()
-        );
-    }
-
-    anyhow::bail!("Home is not installed yet.\n\nRun:\n\n  elastos setup");
+    anyhow::bail!(
+        "Home CLI renderer missing.\n\nBuild and install source Home first:\n\n  scripts/setup-source-home.sh\n\nOr build it directly:\n\n  cargo build --manifest-path capsules/home-cli/Cargo.toml --release --bin home-cli"
+    );
 }
 
 fn source_capsule_dir(capsule_name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../../capsules")
         .join(capsule_name)
-}
-
-fn prefer_dev_home_capsule() -> bool {
-    std::env::current_exe()
-        .ok()
-        .map(|path| {
-            path.components()
-                .any(|component| component.as_os_str() == "target")
-        })
-        .unwrap_or(false)
 }
 
 async fn dispatch_action(
@@ -2468,23 +2406,6 @@ fn summarize_component_sources(components: &[ComponentStatus], required: &[&str]
         return "local workspace".to_string();
     }
     "ready".to_string()
-}
-
-fn current_terminal_size() -> Option<(u16, u16)> {
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
-    if ok == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
-        Some((ws.ws_col, ws.ws_row))
-    } else {
-        None
-    }
-}
-
-fn home_debug_tty() -> bool {
-    matches!(
-        std::env::var("ELASTOS_HOME_DEBUG_TTY").ok().as_deref(),
-        Some("1" | "true" | "yes")
-    )
 }
 
 fn load_existing_did(data_dir: &Path) -> Option<String> {

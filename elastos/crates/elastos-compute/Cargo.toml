@@ -12,10 +12,7 @@ async-trait = "0.1"
 serde_json = "1"
 tokio = { version = "1.0", features = ["sync", "rt-multi-thread", "time"] }
 wasmtime = "36"
-wasmtime-wasi = "36"
 uuid = { version = "1.0", features = ["v4"] }
-dirs = "5.0"
-libc = "0.2"
 tracing = "0.1"
 
 [dev-dependencies]

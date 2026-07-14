@@ -986,7 +986,7 @@ if publish_rust_home != home_profile_capsules or publish_rust_required != home_p
     print("[alignment] missing from Rust home:", ", ".join(sorted(home_profile_capsules - publish_rust_home)) or "(none)")
     print("[alignment] extra in Rust home:", ", ".join(sorted(publish_rust_home - home_profile_capsules)) or "(none)")
     sys.exit(1)
-for demo_capsule in ["chat", "chat-wasm", "gba-emulator", "gba-ucity", "chat-room", "ipfs-provider", "tunnel-provider"]:
+for demo_capsule in ["chat", "gba-emulator", "gba-ucity", "chat-room", "ipfs-provider", "tunnel-provider"]:
     if demo_capsule not in publish_rust_demo:
         print(f"[alignment] Rust demo publish profile missing {demo_capsule}")
         sys.exit(1)

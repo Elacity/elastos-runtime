@@ -71,7 +71,6 @@ const SAME_ORIGIN_PRESENTATION_IFRAME_TARGETS = new Set([
   "browser",
   "chat",
   "chat-room",
-  "chat-wasm",
   "documents",
   "gba-emulator",
   "gba-ucity",
