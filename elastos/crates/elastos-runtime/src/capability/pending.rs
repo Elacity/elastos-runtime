@@ -117,6 +117,9 @@ pub struct PendingCapabilityRequest {
     /// Requested action
     pub action: Action,
 
+    /// Plain-language reason supplied for the approval decision.
+    pub reason: String,
+
     /// When the request was created
     pub requested_at: SecureTimestamp,
 
@@ -135,6 +138,16 @@ impl PendingCapabilityRequest {
         action: Action,
         timeout_secs: u64,
     ) -> Self {
+        Self::new_with_reason(session_id, resource, action, String::new(), timeout_secs)
+    }
+
+    pub fn new_with_reason(
+        session_id: SessionId,
+        resource: ResourceId,
+        action: Action,
+        reason: String,
+        timeout_secs: u64,
+    ) -> Self {
         let requested_at = SecureTimestamp::now();
         let expires_at = SecureTimestamp::after_secs(timeout_secs);
 
@@ -143,6 +156,7 @@ impl PendingCapabilityRequest {
             session_id,
             resource,
             action,
+            reason,
             requested_at,
             expires_at,
             status: RequestStatus::Pending,
@@ -204,6 +218,11 @@ impl PendingRequestStore {
         }
     }
 
+    /// Shared audit sink used by Runtime-owned bridge adapters.
+    pub fn audit_log(&self) -> Arc<AuditLog> {
+        self.audit_log.clone()
+    }
+
     /// Create with custom timeout
     pub fn with_timeout(audit_log: Arc<AuditLog>, timeout_secs: u64) -> Self {
         Self {
@@ -225,6 +244,17 @@ impl PendingRequestStore {
         resource: ResourceId,
         action: Action,
     ) -> PendingCapabilityRequest {
+        self.create_request_with_reason(session_id, resource, action, String::new())
+            .await
+    }
+
+    pub async fn create_request_with_reason(
+        &self,
+        session_id: SessionId,
+        resource: ResourceId,
+        action: Action,
+        reason: String,
+    ) -> PendingCapabilityRequest {
         // Capacity guard: evict expired if at limit
         {
             let count = self.requests.read().await.len();
@@ -237,10 +267,11 @@ impl PendingRequestStore {
         {
             let count = self.requests.read().await.len();
             if count >= MAX_PENDING_REQUESTS {
-                let mut request = PendingCapabilityRequest::new(
+                let mut request = PendingCapabilityRequest::new_with_reason(
                     session_id.clone(),
                     resource.clone(),
                     action,
+                    reason.clone(),
                     self.timeout_secs,
                 );
                 request.status = RequestStatus::Denied {
@@ -264,10 +295,11 @@ impl PendingRequestStore {
                     })
                     .count();
                 if pending_count >= MAX_PENDING_PER_SESSION {
-                    let mut request = PendingCapabilityRequest::new(
+                    let mut request = PendingCapabilityRequest::new_with_reason(
                         session_id.clone(),
                         resource.clone(),
                         action,
+                        reason.clone(),
                         self.timeout_secs,
                     );
                     request.status = RequestStatus::Denied {
@@ -278,10 +310,11 @@ impl PendingRequestStore {
             }
         }
 
-        let request = PendingCapabilityRequest::new(
+        let request = PendingCapabilityRequest::new_with_reason(
             session_id.clone(),
             resource.clone(),
             action,
+            reason,
             self.timeout_secs,
         );
 

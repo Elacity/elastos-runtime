@@ -24,9 +24,17 @@
 //! }
 //! ```
 
-/// Runtime communication module (requires "serde" feature)
+/// Runtime communication module (requires "serde" feature).
 #[cfg(feature = "serde")]
 pub mod runtime;
+
+/// Canonical Rust request shapes for the `elastos:bus@v1` contract.
+#[cfg(feature = "serde")]
+pub mod bus;
+
+/// Generated `elastos:bus@v1` bindings for Component Model capsules.
+#[cfg(all(feature = "component-bindings", target_arch = "wasm32"))]
+pub mod component;
 
 /// Prelude module with common imports
 pub mod prelude {
@@ -35,6 +43,8 @@ pub mod prelude {
     pub use crate::{log, log_error};
 
     // Re-export runtime types when serde is enabled
+    #[cfg(feature = "serde")]
+    pub use crate::bus::{CapabilityRequest, InvokeRequest};
     #[cfg(feature = "serde")]
     pub use crate::runtime::{RuntimeClient, RuntimeRequest, RuntimeResponse};
 }

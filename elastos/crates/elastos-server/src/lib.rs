@@ -11,6 +11,7 @@ pub mod browser_app_hosts;
 pub mod carrier;
 pub mod carrier_bridge;
 pub mod carrier_service;
+pub(crate) mod component;
 pub mod content;
 pub mod crypto;
 pub mod documents;

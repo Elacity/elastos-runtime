@@ -237,8 +237,7 @@ impl CapsuleManager {
         // Stop the compute instance
         self.compute.stop(&handle).await?;
 
-        // Memory clearing: WasmProvider::stop() drops the RunningInstance
-        // (Engine + Module + compiled code), releasing all WASM linear memory.
+        // Memory clearing is delegated to the selected compute provider.
         // CapsuleManager removes per-capsule metrics below.
 
         // Update state and cleanup
@@ -397,6 +396,11 @@ mod tests {
             author: None,
             role: elastos_common::CapsuleRole::App,
             capsule_type: CapsuleType::Wasm,
+            runtime_abi: None,
+            bus_contract: None,
+            wit_world_sha256: None,
+            execution: None,
+            projections: Vec::new(),
             entrypoint: "main.wasm".to_string(),
             requires: Vec::new(),
             provides: None,

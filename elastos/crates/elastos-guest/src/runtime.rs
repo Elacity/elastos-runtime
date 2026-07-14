@@ -18,7 +18,12 @@ pub type RequestId = u64;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeRequest {
     /// Request a capability token (capsule→shell, waits for approval)
-    RequestCapability { resource: String, action: String },
+    RequestCapability {
+        resource: String,
+        action: String,
+        #[serde(default)]
+        reason: String,
+    },
 
     /// Invoke an ElastOS resource through the capsule-kernel Carrier contract.
     CarrierInvoke {
@@ -55,7 +60,11 @@ pub enum RuntimeResponse {
     CapabilityToken { token: String },
 
     /// Carrier invoke result
-    CarrierResult { result: serde_json::Value },
+    CarrierResult {
+        result: serde_json::Value,
+        #[serde(default)]
+        audit: Option<String>,
+    },
 
     /// Runtime info
     RuntimeInfo {
@@ -262,9 +271,13 @@ impl RuntimeClient {
         token: &str,
     ) -> io::Result<RuntimeResponse> {
         let (path, body, cap_token) = match request {
-            RuntimeRequest::RequestCapability { resource, action } => (
+            RuntimeRequest::RequestCapability {
+                resource,
+                action,
+                reason,
+            } => (
                 "/api/capability/request".to_string(),
-                serde_json::json!({"resource": resource, "action": action}),
+                serde_json::json!({"resource": resource, "action": action, "reason": reason}),
                 None,
             ),
             RuntimeRequest::CarrierInvoke {
@@ -377,9 +390,10 @@ impl RuntimeClient {
                     })
                 }
             }
-            RuntimeRequest::CarrierInvoke { .. } => {
-                Ok(RuntimeResponse::CarrierResult { result: resp_json })
-            }
+            RuntimeRequest::CarrierInvoke { .. } => Ok(RuntimeResponse::CarrierResult {
+                result: resp_json,
+                audit: None,
+            }),
             RuntimeRequest::Ping | RuntimeRequest::GetRuntimeInfo => Ok(RuntimeResponse::Ok {
                 data: Some(resp_json),
             }),
@@ -845,6 +859,7 @@ impl RuntimeClient {
         match self.call(RuntimeRequest::RequestCapability {
             resource: resource.to_string(),
             action: action.to_string(),
+            reason: String::new(),
         })? {
             RuntimeResponse::CapabilityToken { token } => Ok(token),
             RuntimeResponse::Error { code, message } => {
@@ -874,7 +889,7 @@ impl RuntimeClient {
             body: body.clone(),
             token: token.to_string(),
         })? {
-            RuntimeResponse::CarrierResult { result } => Ok(result),
+            RuntimeResponse::CarrierResult { result, .. } => Ok(result),
             RuntimeResponse::Ok { data } => Ok(data.unwrap_or(serde_json::json!({}))),
             RuntimeResponse::Error { code, message } => {
                 Err(io::Error::other(format!("{}: {}", code, message)))
@@ -924,6 +939,7 @@ mod tests {
         let req = RuntimeRequest::RequestCapability {
             resource: "elastos://did/*".to_string(),
             action: "execute".to_string(),
+            reason: String::new(),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("request_capability"));
@@ -935,6 +951,7 @@ mod tests {
     fn test_response_serialization() {
         let resp = RuntimeResponse::CarrierResult {
             result: serde_json::json!({"status": "ok"}),
+            audit: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("carrier_result"));

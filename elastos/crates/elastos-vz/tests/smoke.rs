@@ -32,6 +32,11 @@ fn microvm_manifest(name: &str) -> CapsuleManifest {
         author: None,
         role: CapsuleRole::App,
         capsule_type: CapsuleType::MicroVM,
+        runtime_abi: None,
+        bus_contract: None,
+        wit_world_sha256: None,
+        execution: None,
+        projections: Vec::new(),
         entrypoint: "rootfs.ext4".into(),
         requires: Vec::new(),
         provides: None,
@@ -43,10 +48,8 @@ fn microvm_manifest(name: &str) -> CapsuleManifest {
             gpu: false,
         },
         permissions: Default::default(),
-        // v0.3.0 added the principal-binding `authority` field to the
-        // capsule manifest schema. None ≡ "no authority constraint" —
-        // the right value for a synthetic test manifest that never
-        // boots a real Vz machine. Mac VZ tests don't exercise the
+        // None means "no authority constraint" for a synthetic test manifest
+        // that never boots a real Vz machine. Mac VZ tests don't exercise the
         // principal/permission gates yet.
         authority: None,
         microvm: Some(MicroVmConfig {

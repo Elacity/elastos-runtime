@@ -7,7 +7,9 @@ description = "Compute abstraction layer for ElastOS"
 
 [dependencies]
 elastos-common = { path = "../elastos-common" }
+elastos-guest = { path = "../elastos-guest" }
 async-trait = "0.1"
+serde_json = "1"
 tokio = { version = "1.0", features = ["sync", "rt-multi-thread", "time"] }
 wasmtime = "36"
 wasmtime-wasi = "36"

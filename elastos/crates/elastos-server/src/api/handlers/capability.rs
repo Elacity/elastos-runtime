@@ -35,6 +35,9 @@ pub struct RequestCapabilityInput {
     pub resource: String,
     /// Action to request (e.g., "read", "write")
     pub action: String,
+    /// Plain-language reason shown during approval.
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -107,7 +110,7 @@ pub async fn request_capability(
 
     let request = state
         .pending_store
-        .create_request(session.id.clone(), resource, action)
+        .create_request_with_reason(session.id.clone(), resource, action, input.reason)
         .await;
 
     // If pre-denied (e.g. rate limit), surface the denial immediately
@@ -214,6 +217,7 @@ pub struct PendingRequestOutput {
     pub session_id: String,
     pub resource: String,
     pub action: String,
+    pub reason: String,
     pub requested_at: u64,
     pub expires_at: u64,
 }
@@ -239,6 +243,7 @@ pub async fn list_pending(
             session_id: r.session_id.to_string(),
             resource: r.resource.to_string(),
             action: r.action.to_string(),
+            reason: r.reason,
             requested_at: r.requested_at.unix_secs,
             expires_at: r.expires_at.unix_secs,
         })
@@ -769,6 +774,7 @@ mod tests {
             Json(RequestCapabilityInput {
                 resource: "elastos://ipfs/add".to_string(),
                 action: "write".to_string(),
+                reason: "publish content".to_string(),
             }),
         )
         .await
@@ -788,6 +794,7 @@ mod tests {
             Json(RequestCapabilityInput {
                 resource: "elastos://content/publish".to_string(),
                 action: "write".to_string(),
+                reason: "publish content".to_string(),
             }),
         )
         .await

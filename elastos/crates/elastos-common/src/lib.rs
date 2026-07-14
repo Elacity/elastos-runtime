@@ -10,10 +10,11 @@ mod types;
 
 pub use error::{ElastosError, Result};
 pub use manifest::{
-    AffordanceApprovalMode, AffordanceAuditMode, AffordanceRisk, CapsuleAffordanceDescriptor,
-    CapsuleInterfaceDescriptor, CapsuleManifest, CapsuleRequirement, CapsuleRole, CapsuleType,
+    elastos_bus_v1_wit_sha256, AffordanceApprovalMode, AffordanceAuditMode, AffordanceRisk,
+    CapsuleAffordanceDescriptor, CapsuleExecution, CapsuleInterfaceDescriptor, CapsuleManifest,
+    CapsuleProjection, CapsuleRequirement, CapsuleRole, CapsuleRuntimeAbi, CapsuleType,
     MicroVmConfig, Permissions, ProviderAuthority, ProviderCapabilitySchema, RequirementKind,
-    ResourceLimits, SCHEMA_V1,
+    ResourceLimits, ELASTOS_BUS_V1_CONTRACT, ELASTOS_BUS_V1_WORLD, SCHEMA_V1,
 };
 use sha2::{Digest, Sha256};
 pub use timestamp::{SecureTimestamp, CLOCK_SKEW_TOLERANCE_SECS};

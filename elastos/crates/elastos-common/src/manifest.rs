@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::localhost::{
     is_runtime_system_service_resource, is_supported_resource_scheme,
@@ -31,6 +32,34 @@ pub struct CapsuleManifest {
 
     #[serde(rename = "type")]
     pub capsule_type: CapsuleType,
+
+    /// Current capsule execution ABI.
+    ///
+    /// Runtime uses this field to select the execution provider. `type`
+    /// describes the package class and does not grant execution authority.
+    #[serde(default)]
+    pub runtime_abi: Option<CapsuleRuntimeAbi>,
+
+    /// Runtime bus/interface contract expected by this capsule.
+    ///
+    /// This is a schema id, not a grant.
+    #[serde(default)]
+    pub bus_contract: Option<String>,
+
+    /// SHA-256 of the WIT world this capsule was built against.
+    ///
+    /// For `elastos.component/v1`, this must match the checked-in
+    /// `elastos/wit/elastos-bus-v1.wit` contract.
+    #[serde(default)]
+    pub wit_world_sha256: Option<String>,
+
+    /// Current execution shape for this capsule.
+    #[serde(default)]
+    pub execution: Option<CapsuleExecution>,
+
+    /// Product-visible projection surfaces this capsule declares.
+    #[serde(default)]
+    pub projections: Vec<CapsuleProjection>,
 
     pub entrypoint: String,
 
@@ -218,8 +247,29 @@ pub enum AffordanceAuditMode {
 
 /// Current schema identifier for v1 manifests
 pub const SCHEMA_V1: &str = "elastos.capsule/v1";
+pub const ELASTOS_BUS_V1_CONTRACT: &str = "elastos:bus@v1";
+pub const ELASTOS_BUS_V1_WORLD: &str = "product-capsule-v1";
+pub const ELASTOS_RUNTIME_PROJECTION_V1_CONTRACT: &str = "elastos.runtime-projection/v1";
+
+const ELASTOS_BUS_V1_WIT: &[u8] = include_bytes!("../../../wit/elastos-bus-v1.wit");
+
+pub fn elastos_bus_v1_wit_sha256() -> String {
+    hex::encode(Sha256::digest(ELASTOS_BUS_V1_WIT))
+}
 
 impl CapsuleManifest {
+    /// Resource ceilings a capsule may ask Runtime to authorize at launch time.
+    ///
+    /// `capabilities` covers provider/capsule authority. `permissions.storage`
+    /// covers localhost/object storage authority. Both are upper bounds only;
+    /// explicit Runtime grants and audit still decide actual use.
+    pub fn resource_authority_bounds(&self) -> Vec<String> {
+        let mut bounds = BTreeSet::new();
+        bounds.extend(self.capabilities.iter().cloned());
+        bounds.extend(self.permissions.storage.iter().cloned());
+        bounds.into_iter().collect()
+    }
+
     /// Validate manifest fields after deserialization.
     pub fn validate(&self) -> Result<(), String> {
         if self.schema != SCHEMA_V1 {
@@ -250,6 +300,8 @@ impl CapsuleManifest {
         if self.name.trim().is_empty() {
             return Err("manifest name must not be empty".to_string());
         }
+
+        self.validate_execution_metadata()?;
 
         if self.role == CapsuleRole::Content && self.capsule_type != CapsuleType::Data {
             return Err("content capsules must use type=data".to_string());
@@ -429,6 +481,12 @@ impl CapsuleManifest {
         self.schema == SCHEMA_V1
     }
 
+    pub fn is_component_capsule(&self) -> bool {
+        self.runtime_abi.as_ref() == Some(&CapsuleRuntimeAbi::ElastosComponentV1)
+            || self.execution.as_ref() == Some(&CapsuleExecution::Component)
+            || self.bus_contract.as_deref() == Some(ELASTOS_BUS_V1_CONTRACT)
+    }
+
     fn validate_interfaces(&self) -> Result<(), String> {
         let mut interface_ids = BTreeSet::new();
         for interface in &self.interfaces {
@@ -440,6 +498,101 @@ impl CapsuleManifest {
                 ));
             }
         }
+        Ok(())
+    }
+
+    fn validate_execution_metadata(&self) -> Result<(), String> {
+        if let Some(bus_contract) = &self.bus_contract {
+            validate_descriptor_id("bus_contract", bus_contract)?;
+        }
+        if let Some(wit_world_sha256) = &self.wit_world_sha256 {
+            validate_sha256_hex("wit_world_sha256", wit_world_sha256)?;
+        }
+        if self.runtime_abi.as_ref() == Some(&CapsuleRuntimeAbi::WasiPreview1) {
+            return Err(
+                "WASI Preview 1 is not a supported product capsule ABI; use elastos.component/v1 or elastos.runtime-projection/v1"
+                    .to_string(),
+            );
+        }
+        if matches!(
+            self.execution.as_ref(),
+            Some(CapsuleExecution::WasiReceipt | CapsuleExecution::WasiApp)
+        ) {
+            return Err(
+                "WASI Preview 1 execution metadata is not supported for product capsules"
+                    .to_string(),
+            );
+        }
+
+        let mut projections = BTreeSet::new();
+        for projection in &self.projections {
+            if !projections.insert(projection.as_str()) {
+                return Err(format!(
+                    "manifest declares duplicate projection {}",
+                    projection.as_str()
+                ));
+            }
+        }
+
+        if self.role == CapsuleRole::Content
+            && self
+                .projections
+                .iter()
+                .any(|projection| projection != &CapsuleProjection::Content)
+        {
+            return Err(
+                "content capsules may only declare content projection metadata".to_string(),
+            );
+        }
+
+        if self.is_component_capsule() {
+            if self.capsule_type != CapsuleType::Wasm {
+                return Err("component capsules must use type=wasm".to_string());
+            }
+            if self.runtime_abi.as_ref() != Some(&CapsuleRuntimeAbi::ElastosComponentV1) {
+                return Err(
+                    "component capsules must declare runtime_abi=\"elastos.component/v1\""
+                        .to_string(),
+                );
+            }
+            if self.execution.as_ref() != Some(&CapsuleExecution::Component) {
+                return Err("component capsules must declare execution=\"component\"".to_string());
+            }
+            if self.bus_contract.as_deref() != Some(ELASTOS_BUS_V1_CONTRACT) {
+                return Err(format!(
+                    "component capsules must declare bus_contract=\"{}\"",
+                    ELASTOS_BUS_V1_CONTRACT
+                ));
+            }
+            let expected_hash = elastos_bus_v1_wit_sha256();
+            if self.wit_world_sha256.as_deref() != Some(expected_hash.as_str()) {
+                return Err(format!(
+                    "component capsules must declare wit_world_sha256=\"{}\" for {}",
+                    expected_hash, ELASTOS_BUS_V1_WORLD
+                ));
+            }
+        }
+        if self.execution.as_ref() == Some(&CapsuleExecution::WebProjection) {
+            if self.capsule_type != CapsuleType::Wasm {
+                return Err("web projection capsules must use type=wasm".to_string());
+            }
+            if self.runtime_abi.as_ref() != Some(&CapsuleRuntimeAbi::RuntimeProjectionV1) {
+                return Err(
+                    "web projection capsules must declare runtime_abi=\"elastos.runtime-projection/v1\""
+                        .to_string(),
+                );
+            }
+            if self.bus_contract.as_deref() != Some(ELASTOS_RUNTIME_PROJECTION_V1_CONTRACT) {
+                return Err(format!(
+                    "web projection capsules must declare bus_contract=\"{}\"",
+                    ELASTOS_RUNTIME_PROJECTION_V1_CONTRACT
+                ));
+            }
+            if !self.projections.contains(&CapsuleProjection::Web) {
+                return Err("web projection capsules must declare a web projection".to_string());
+            }
+        }
+
         Ok(())
     }
 }
@@ -467,6 +620,22 @@ fn validate_descriptor_id(kind: &str, value: &str) -> Result<(), String> {
             "{} must not contain whitespace or control characters",
             kind
         ));
+    }
+    Ok(())
+}
+
+fn validate_sha256_hex(kind: &str, value: &str) -> Result<(), String> {
+    if value.len() != 64 {
+        return Err(format!(
+            "{} must be a 64-character SHA-256 hex digest",
+            kind
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("{} must use lowercase SHA-256 hex", kind));
     }
     Ok(())
 }
@@ -567,6 +736,64 @@ pub enum CapsuleType {
     Oci,
     Media,
     Data,
+}
+
+/// Current capsule execution ABI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CapsuleRuntimeAbi {
+    #[serde(rename = "wasi-preview1")]
+    WasiPreview1,
+    #[serde(rename = "elastos.runtime-projection/v1")]
+    RuntimeProjectionV1,
+    #[serde(rename = "elastos.component/v1")]
+    ElastosComponentV1,
+    #[serde(rename = "microvm-linux")]
+    MicrovmLinux,
+    #[serde(rename = "data")]
+    Data,
+}
+
+/// Current execution shape for a capsule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapsuleExecution {
+    WasiReceipt,
+    WasiApp,
+    WebProjection,
+    Component,
+    Microvm,
+    Data,
+}
+
+/// Product-visible projection surface declared by a capsule manifest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapsuleProjection {
+    Web,
+    Cli,
+    Terminal,
+    Facts,
+    Affordances,
+    Gates,
+    AuditMirror,
+    Carrier,
+    Content,
+}
+
+impl CapsuleProjection {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Web => "web",
+            Self::Cli => "cli",
+            Self::Terminal => "terminal",
+            Self::Facts => "facts",
+            Self::Affordances => "affordances",
+            Self::Gates => "gates",
+            Self::AuditMirror => "audit-mirror",
+            Self::Carrier => "carrier",
+            Self::Content => "content",
+        }
+    }
 }
 
 /// Product role of a capsule.
@@ -751,6 +978,199 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_manifest_with_execution_metadata() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "browser",
+            "role": "app",
+            "type": "wasm",
+            "runtime_abi": "elastos.runtime-projection/v1",
+            "bus_contract": "elastos.runtime-projection/v1",
+            "execution": "web-projection",
+            "projections": ["web", "affordances", "gates"],
+            "entrypoint": "browser/index.html"
+        }"#;
+
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        manifest.validate().unwrap();
+        assert_eq!(
+            manifest.runtime_abi,
+            Some(CapsuleRuntimeAbi::RuntimeProjectionV1)
+        );
+        assert_eq!(
+            manifest.bus_contract.as_deref(),
+            Some("elastos.runtime-projection/v1")
+        );
+        assert_eq!(manifest.execution, Some(CapsuleExecution::WebProjection));
+        assert_eq!(
+            manifest.projections,
+            vec![
+                CapsuleProjection::Web,
+                CapsuleProjection::Affordances,
+                CapsuleProjection::Gates
+            ]
+        );
+
+        let component_abi: CapsuleRuntimeAbi =
+            serde_json::from_str(r#""elastos.component/v1""#).unwrap();
+        assert_eq!(component_abi, CapsuleRuntimeAbi::ElastosComponentV1);
+    }
+
+    #[test]
+    fn test_validate_rejects_wasi_preview1_product_metadata() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "old-wasi-capsule",
+            "role": "app",
+            "type": "wasm",
+            "runtime_abi": "wasi-preview1",
+            "execution": "wasi-app",
+            "entrypoint": "main.wasm"
+        }"#;
+
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let error = manifest.validate().unwrap_err();
+        assert!(error.contains("WASI Preview 1"));
+    }
+
+    #[test]
+    fn test_parse_component_manifest_with_wit_hash() {
+        let json = format!(
+            r#"{{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "component-capsule",
+            "role": "app",
+            "type": "wasm",
+            "runtime_abi": "elastos.component/v1",
+            "bus_contract": "{}",
+            "wit_world_sha256": "{}",
+            "execution": "component",
+            "projections": ["cli", "facts"],
+            "entrypoint": "main.component.wasm"
+        }}"#,
+            ELASTOS_BUS_V1_CONTRACT,
+            elastos_bus_v1_wit_sha256()
+        );
+
+        let manifest: CapsuleManifest = serde_json::from_str(&json).unwrap();
+        manifest.validate().unwrap();
+        assert!(manifest.is_component_capsule());
+        assert_eq!(
+            manifest.runtime_abi,
+            Some(CapsuleRuntimeAbi::ElastosComponentV1)
+        );
+        assert_eq!(
+            manifest.bus_contract.as_deref(),
+            Some(ELASTOS_BUS_V1_CONTRACT)
+        );
+        assert_eq!(
+            manifest.wit_world_sha256.as_deref(),
+            Some(elastos_bus_v1_wit_sha256().as_str())
+        );
+    }
+
+    #[test]
+    fn test_component_manifest_rejects_missing_wit_hash() {
+        let json = format!(
+            r#"{{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "component-capsule",
+            "role": "app",
+            "type": "wasm",
+            "runtime_abi": "elastos.component/v1",
+            "bus_contract": "{}",
+            "execution": "component",
+            "projections": ["cli"],
+            "entrypoint": "main.component.wasm"
+        }}"#,
+            ELASTOS_BUS_V1_CONTRACT
+        );
+
+        let manifest: CapsuleManifest = serde_json::from_str(&json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("wit_world_sha256"));
+        assert!(err.contains(ELASTOS_BUS_V1_WORLD));
+    }
+
+    #[test]
+    fn test_component_manifest_rejects_partial_declaration() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "component-capsule",
+            "role": "app",
+            "type": "wasm",
+            "runtime_abi": "elastos.component/v1",
+            "entrypoint": "main.component.wasm"
+        }"#;
+
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("execution=\"component\""));
+    }
+
+    #[test]
+    fn test_manifest_rejects_bad_wit_hash_metadata() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "bad-wit-hash",
+            "role": "app",
+            "type": "wasm",
+            "wit_world_sha256": "ABC",
+            "entrypoint": "main.wasm"
+        }"#;
+
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("64-character SHA-256"));
+    }
+
+    #[test]
+    fn test_manifest_rejects_duplicate_projection_metadata() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "duplicate-projection",
+            "role": "app",
+            "type": "wasm",
+            "runtime_abi": "elastos.runtime-projection/v1",
+            "bus_contract": "elastos.runtime-projection/v1",
+            "execution": "web-projection",
+            "projections": ["web", "web"],
+            "entrypoint": "browser/index.html"
+        }"#;
+
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("duplicate projection web"));
+    }
+
+    #[test]
+    fn test_manifest_rejects_bad_bus_contract_metadata() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "bad-bus-contract",
+            "role": "app",
+            "type": "wasm",
+            "runtime_abi": "elastos.runtime-projection/v1",
+            "bus_contract": "not a descriptor",
+            "execution": "web-projection",
+            "projections": ["web"],
+            "entrypoint": "browser/index.html"
+        }"#;
+
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("bus_contract must not contain whitespace"));
+    }
+
+    #[test]
     fn test_parse_manifest_with_typed_interfaces() {
         let json = r#"{
             "schema": "elastos.capsule/v1",
@@ -760,7 +1180,11 @@ mod tests {
             "author": "elastos",
             "role": "viewer",
             "type": "wasm",
-            "entrypoint": "documents.wasm",
+            "runtime_abi": "elastos.runtime-projection/v1",
+            "bus_contract": "elastos.runtime-projection/v1",
+            "execution": "web-projection",
+            "projections": ["web", "affordances"],
+            "entrypoint": "browser/index.html",
             "interfaces": [{
                 "id": "elastos.documents.viewer",
                 "version": "0.1.0",
@@ -1346,6 +1770,32 @@ mod tests {
         );
         assert_eq!(manifest.resources.memory_mb, 128);
         assert!(!manifest.resources.gpu);
+    }
+
+    #[test]
+    fn resource_authority_bounds_include_capabilities_and_storage() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "name": "storage-app",
+            "version": "0.1.0",
+            "role": "app",
+            "type": "wasm",
+            "entrypoint": "app.wasm",
+            "capabilities": ["elastos://did/*", "localhost://Users/self/Documents/*"],
+            "permissions": {
+                "storage": ["localhost://Users/self/Documents/*", "localhost://Users/self/.AppData/App/*"]
+            }
+        }"#;
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            manifest.resource_authority_bounds(),
+            vec![
+                "elastos://did/*".to_string(),
+                "localhost://Users/self/.AppData/App/*".to_string(),
+                "localhost://Users/self/Documents/*".to_string(),
+            ]
+        );
     }
 
     #[test]

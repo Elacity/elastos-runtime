@@ -1,0 +1,96 @@
+package elastos:bus@1.0.0;
+
+/// Manifest contract id: elastos:bus@v1.
+interface types {
+  type bytes = list<u8>;
+  type resource-uri = string;
+  type operation = string;
+  type action = string;
+  type request-id = string;
+  type grant-id = string;
+
+  record runtime-info {
+    abi: string,
+    runtime-version: string,
+  }
+
+  record identity-context {
+    principal: option<string>,
+    capsule: string,
+    session: string,
+    device: option<string>,
+  }
+
+  record capability-request {
+    %resource: resource-uri,
+    actions: list<action>,
+    reason: string,
+  }
+
+  record capability-grant {
+    id: grant-id,
+    %resource: resource-uri,
+    actions: list<action>,
+    expires-at-ms: option<u64>,
+  }
+
+  record invoke-request {
+    %resource: resource-uri,
+    operation: operation,
+    body: bytes,
+    grant: option<grant-id>,
+  }
+
+  record invoke-response {
+    status: string,
+    body: bytes,
+    audit: option<request-id>,
+  }
+
+  variant bus-error {
+    denied(string),
+    not-found(string),
+    invalid(string),
+    unavailable(string),
+    timeout(string),
+    internal(string),
+  }
+}
+
+interface runtime {
+  use types.{runtime-info};
+
+  info: func() -> runtime-info;
+}
+
+interface identity {
+  use types.{identity-context};
+
+  context: func() -> identity-context;
+}
+
+interface capabilities {
+  use types.{bus-error, capability-grant, capability-request};
+
+  request: func(request: capability-request) -> result<capability-grant, bus-error>;
+}
+
+interface providers {
+  use types.{bus-error, invoke-request, invoke-response};
+
+  invoke: func(request: invoke-request) -> result<invoke-response, bus-error>;
+}
+
+interface lifecycle {
+  use types.{bus-error};
+
+  run: func() -> result<_, bus-error>;
+}
+
+world product-capsule-v1 {
+  import runtime;
+  import identity;
+  import capabilities;
+  import providers;
+  export lifecycle;
+}

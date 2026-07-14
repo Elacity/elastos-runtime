@@ -44,7 +44,7 @@ pub(crate) use elastos_server::{runtime_control, shell_cmd, sources};
 
 use runtime::Runtime;
 
-use elastos_compute::providers::WasmProvider;
+use elastos_compute::providers::{ComponentProvider, WasmProvider};
 use elastos_compute::ComputeProvider;
 use elastos_storage::providers::LocalFSProvider;
 
@@ -2124,7 +2124,12 @@ pub(crate) async fn create_runtime(
     }
 
     let (runtime_config, _) = bootstrap::RuntimeConfig::load(&default_data_dir());
-    let runtime = Runtime::with_providers(storage, compute_providers, Some(wasm_provider));
+    let runtime = Runtime::with_providers_and_component(
+        storage,
+        compute_providers,
+        Some(wasm_provider),
+        Some(Arc::new(ComponentProvider::new())),
+    );
     runtime
         .configure_signature_verification(
             &runtime_config.effective_trusted_keys(),

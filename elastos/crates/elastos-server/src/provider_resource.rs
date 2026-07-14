@@ -126,7 +126,174 @@ pub fn build_capability_resource(
 /// the operation-to-action contract directly.
 pub fn provider_operation_action(scheme: &str, op: &str) -> Option<Action> {
     match scheme {
+        "localhost" | "webspace" => localhost_op_required_action(op),
+        "ai" | "llama" | "did" => execute_op_required_action(op),
+        "availability" => match op {
+            "status" => Some(Action::Read),
+            "ensure" => Some(Action::Write),
+            _ => None,
+        },
+        "block-graph" => match op {
+            "status" | "export_graph" => Some(Action::Read),
+            "import_graph" => Some(Action::Write),
+            _ => None,
+        },
+        "chain" => chain_op_required_action(op),
+        "content" => match op {
+            "status" | "fetch" => Some(Action::Read),
+            "publish" | "ensure" | "repair" | "unpublish" => Some(Action::Write),
+            _ => None,
+        },
+        "drm" | "rights" | "key" | "decrypt" => read_only_provider_action(op),
+        "net" => match op {
+            "status" | "resolve" => Some(Action::Read),
+            "connect" | "stream" | "http" => Some(Action::Write),
+            _ => None,
+        },
+        "exit" => match op {
+            "status" | "discover_remote_carrier_exits" | "quote" => Some(Action::Read),
+            "open_stream" | "close_stream" | "http_fetch" => Some(Action::Write),
+            _ => None,
+        },
+        "browser-engine" => match op {
+            "status" | "page_status" | "diagnostics" => Some(Action::Read),
+            "launch" | "attach_stream" | "input" | "webrtc_signal" => Some(Action::Write),
+            "close_page" => Some(Action::Delete),
+            _ => None,
+        },
+        "wallet" => wallet_op_required_action(op),
+        "ipfs" => ipfs_op_required_action(op),
+        "object" => object_op_required_action(op),
+        "operator-drive-adapter" => match op {
+            "status" | "metadata_index" | "read_bytes" => Some(Action::Read),
+            "write_bytes" => Some(Action::Write),
+            _ => None,
+        },
+        "peer" => match op {
+            "init" | "connect" | "remember_peer" | "gossip_join" | "gossip_leave"
+            | "gossip_send" | "get_ticket" | "get_node_id" | "list_peers" | "list_topics"
+            | "list_topic_peers" | "gossip_join_peers" | "gossip_recv" => Some(Action::Message),
+            _ => None,
+        },
+        "tunnel" => {
+            Some(Action::Admin).filter(|_| matches!(op, "start" | "stop" | "status" | "ping"))
+        }
         "inspect" => inspect_op_required_action(op),
+        _ => None,
+    }
+}
+
+fn localhost_op_required_action(op: &str) -> Option<Action> {
+    match op {
+        "read" | "list" | "stat" | "exists" | "resolve" | "ping" => Some(Action::Read),
+        "write" | "mkdir" => Some(Action::Write),
+        "delete" => Some(Action::Delete),
+        _ => None,
+    }
+}
+
+fn execute_op_required_action(op: &str) -> Option<Action> {
+    match op {
+        "chat_completions"
+        | "list_backends"
+        | "ping"
+        | "status"
+        | "health"
+        | "list_models"
+        | "get_did"
+        | "resolve"
+        | "sign_chat_message"
+        | "verify"
+        | "verify_did_recovery"
+        | "get_nickname"
+        | "set_nickname"
+        | "get_persona_did" => Some(Action::Execute),
+        _ => None,
+    }
+}
+
+fn chain_op_required_action(op: &str) -> Option<Action> {
+    match op {
+        "networks"
+        | "status"
+        | "block_number"
+        | "sync_health"
+        | "balance"
+        | "transaction"
+        | "receipt"
+        | "has_access_by_content_id"
+        | "proof"
+        | "erc1271_is_valid_signature"
+        | "contract_call"
+        | "estimate_gas"
+        | "transaction_count"
+        | "gas_price"
+        | "fee_history"
+        | "code"
+        | "logs" => Some(Action::Read),
+        "prepare_transaction" => Some(Action::Write),
+        "broadcast_transaction" | "node_lifecycle" => Some(Action::Admin),
+        _ => None,
+    }
+}
+
+fn read_only_provider_action(op: &str) -> Option<Action> {
+    match op {
+        "status"
+        | "open"
+        | "has_access_by_content_id"
+        | "is_subscription_active"
+        | "can_stream"
+        | "can_download"
+        | "release"
+        | "open_session"
+        | "render" => Some(Action::Read),
+        _ => None,
+    }
+}
+
+fn wallet_op_required_action(op: &str) -> Option<Action> {
+    match op {
+        "status"
+        | "accounts"
+        | "default_account"
+        | "challenge"
+        | "bitcoin_challenge"
+        | "verify_proof"
+        | "verify_bip322_proof"
+        | "verify_contract_proof"
+        | "approval_requests" => Some(Action::Read),
+        "link_account"
+        | "set_default_account"
+        | "rename_account"
+        | "reject_approval"
+        | "approve_approval"
+        | "complete_approval" => Some(Action::Write),
+        "create_managed_account" | "revoke_account" | "request_signature" | "sign_approved" => {
+            Some(Action::Execute)
+        }
+        "export_managed_secret" => Some(Action::Execute),
+        _ => None,
+    }
+}
+
+fn ipfs_op_required_action(op: &str) -> Option<Action> {
+    match op {
+        "cat" | "cat_to_path" | "get_bytes" | "ls" | "download_directory" | "health" | "status" => {
+            Some(Action::Read)
+        }
+        "add_bytes" | "add_path" | "add_directory" | "pin" => Some(Action::Write),
+        "unpin" => Some(Action::Delete),
+        _ => None,
+    }
+}
+
+fn object_op_required_action(op: &str) -> Option<Action> {
+    match op {
+        "roots" | "list" | "stat" | "read" | "download" | "status" | "events" => Some(Action::Read),
+        "write" | "mkdir" | "rename" | "move" | "copy" | "trash" | "restore" | "publish"
+        | "unpublish" | "repair" | "share" => Some(Action::Write),
+        "delete_permanently" | "empty_trash" => Some(Action::Delete),
         _ => None,
     }
 }
@@ -300,6 +467,9 @@ fn inspect_resource(op: &str) -> Result<String, String> {
 fn exit_resource(op: &str) -> Result<String, String> {
     match op {
         "status" => Ok("elastos://exit/meta/status".to_string()),
+        "discover_remote_carrier_exits" => {
+            Ok("elastos://exit/discover_remote_carrier_exits".to_string())
+        }
         "quote" => Ok("elastos://exit/quote".to_string()),
         "open_stream" => Ok("elastos://exit/open_stream".to_string()),
         "close_stream" => Ok("elastos://exit/close_stream".to_string()),
@@ -347,6 +517,8 @@ fn wallet_resource(op: &str, request: &Value) -> Result<String, String> {
         "create_managed_account" => Ok("elastos://wallet/account/create_managed".to_string()),
         "accounts" => Ok("elastos://wallet/account/list".to_string()),
         "revoke_account" => Ok("elastos://wallet/account/revoke".to_string()),
+        "rename_account" => Ok("elastos://wallet/account/rename".to_string()),
+        "export_managed_secret" => Ok("elastos://wallet/account/export_managed_secret".to_string()),
         "set_default_account" => Ok("elastos://wallet/account/set_default".to_string()),
         "default_account" => Ok("elastos://wallet/account/default".to_string()),
         "approval_requests" => Ok("elastos://wallet/approval/list".to_string()),
@@ -522,6 +694,21 @@ mod tests {
                 "elastos://operator-drive-adapter/metadata_index",
             ),
             ("tunnel", "start", "elastos://tunnel/start"),
+            (
+                "exit",
+                "discover_remote_carrier_exits",
+                "elastos://exit/discover_remote_carrier_exits",
+            ),
+            (
+                "wallet",
+                "rename_account",
+                "elastos://wallet/account/rename",
+            ),
+            (
+                "wallet",
+                "export_managed_secret",
+                "elastos://wallet/account/export_managed_secret",
+            ),
         ] {
             assert_eq!(
                 build_capability_resource(scheme, op, &request).unwrap(),
@@ -542,6 +729,60 @@ mod tests {
                 build_capability_resource(scheme, op, &request).is_err(),
                 "{scheme}/{op} must fail closed"
             );
+        }
+    }
+
+    #[test]
+    fn first_party_provider_authority_operations_have_action_mapping() {
+        let manifests = [
+            ("ai", "../../../capsules/ai-provider/capsule.json"),
+            (
+                "availability",
+                "../../../capsules/availability-provider/capsule.json",
+            ),
+            (
+                "block-graph",
+                "../../../capsules/content-block-graph-provider/capsule.json",
+            ),
+            ("chain", "../../../capsules/chain-provider/capsule.json"),
+            ("decrypt", "../../../capsules/decrypt-provider/capsule.json"),
+            ("did", "../../../capsules/did-provider/capsule.json"),
+            ("drm", "../../../capsules/drm-provider/capsule.json"),
+            ("exit", "../../../capsules/exit-provider/capsule.json"),
+            ("ipfs", "../../../capsules/ipfs-provider/capsule.json"),
+            ("key", "../../../capsules/key-provider/capsule.json"),
+            ("llama", "../../../capsules/llama-provider/capsule.json"),
+            ("net", "../../../capsules/net-provider/capsule.json"),
+            ("object", "../../../capsules/object-provider/capsule.json"),
+            (
+                "operator-drive-adapter",
+                "../../../capsules/operator-drive-adapter/capsule.json",
+            ),
+            ("rights", "../../../capsules/rights-provider/capsule.json"),
+            ("tunnel", "../../../capsules/tunnel-provider/capsule.json"),
+            ("wallet", "../../../capsules/wallet-provider/capsule.json"),
+            (
+                "browser-engine",
+                "../../../capsules/browser-engine-adapter/capsule.json",
+            ),
+        ];
+
+        for (scheme, manifest_path) in manifests {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(manifest_path);
+            let manifest: elastos_common::CapsuleManifest =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let authority = manifest
+                .authority
+                .unwrap_or_else(|| panic!("{scheme} provider manifest must declare authority"));
+            for capability in authority.capabilities {
+                for operation in capability.operations {
+                    assert!(
+                        provider_operation_action(scheme, &operation).is_some(),
+                        "{scheme}/{operation} in {} must have a canonical Runtime action",
+                        path.display()
+                    );
+                }
+            }
         }
     }
 
@@ -609,7 +850,26 @@ mod tests {
             Some(elastos_runtime::capability::Action::Write)
         );
         assert!(build_capability_resource("inspect", "raw", &request).is_err());
-        assert_eq!(provider_operation_action("chain", "status"), None);
+        assert_eq!(
+            provider_operation_action("chain", "status"),
+            Some(elastos_runtime::capability::Action::Read)
+        );
+        assert_eq!(
+            provider_operation_action("chain", "broadcast_transaction"),
+            Some(elastos_runtime::capability::Action::Admin)
+        );
+        assert_eq!(
+            provider_operation_action("localhost", "read"),
+            Some(elastos_runtime::capability::Action::Read)
+        );
+        assert_eq!(
+            provider_operation_action("localhost", "write"),
+            Some(elastos_runtime::capability::Action::Write)
+        );
+        assert_eq!(
+            provider_operation_action("browser-engine", "close_page"),
+            Some(elastos_runtime::capability::Action::Delete)
+        );
     }
 
     #[test]

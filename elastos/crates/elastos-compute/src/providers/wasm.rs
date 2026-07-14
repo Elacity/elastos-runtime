@@ -109,6 +109,8 @@ pub struct BridgePipes {
     pub capsule_id: String,
     /// Optional runtime principal for resolving capsule-facing current-user aliases.
     pub principal_id: Option<String>,
+    /// Manifest-declared resource ceiling bound to this launch.
+    pub manifest_capabilities: Vec<String>,
     /// Read end of the capsule's stdout pipe — runtime reads SDK requests here
     pub capsule_stdout: std::fs::File,
     /// Write end of the capsule's stdin pipe — runtime writes SDK responses here
@@ -311,6 +313,7 @@ impl WasmProvider {
     pub(crate) fn setup_carrier_fifos(
         capsule_id: &str,
         principal_id: Option<&str>,
+        manifest_capabilities: Vec<String>,
     ) -> Result<(PathBuf, BridgePipes)> {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -365,6 +368,7 @@ impl WasmProvider {
             BridgePipes {
                 capsule_id: capsule_id.to_string(),
                 principal_id: principal_id.map(ToOwned::to_owned),
+                manifest_capabilities,
                 capsule_stdout,
                 capsule_stdin,
             },
@@ -488,7 +492,11 @@ impl WasmProvider {
         // transport is available on wasmtime-wasi 24+ (fd injection
         // was removed upstream).
         let bridge_pipes_and_dir = if use_bridge {
-            let (carrier_dir, pipes) = Self::setup_carrier_fifos(capsule_id, principal_id)?;
+            let (carrier_dir, pipes) = Self::setup_carrier_fifos(
+                capsule_id,
+                principal_id,
+                manifest.resource_authority_bounds(),
+            )?;
             // The dir itself only needs READ (no file create/delete from
             // the guest); the FIFOs need READ + WRITE at the file level so
             // the capsule can both read responses and write requests.
@@ -1016,7 +1024,7 @@ mod tests {
         use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
         let cid = unique_test_capsule_id("setup");
-        let (dir, _pipes) = WasmProvider::setup_carrier_fifos(&cid, None)
+        let (dir, _pipes) = WasmProvider::setup_carrier_fifos(&cid, None, Vec::new())
             .expect("setup_carrier_fifos must succeed in a writable temp dir");
 
         // Dir created with mode 0o700 (owner-only).
@@ -1044,7 +1052,7 @@ mod tests {
     #[test]
     fn test_cleanup_carrier_dir_is_idempotent() {
         let cid = unique_test_capsule_id("cleanup-idempotent");
-        let (dir, _pipes) = WasmProvider::setup_carrier_fifos(&cid, None)
+        let (dir, _pipes) = WasmProvider::setup_carrier_fifos(&cid, None, Vec::new())
             .expect("setup_carrier_fifos must succeed");
         assert!(dir.exists(), "dir must exist after setup");
 
@@ -1061,7 +1069,7 @@ mod tests {
         use std::io::{Read, Write};
 
         let cid = unique_test_capsule_id("round-trip");
-        let (dir, mut pipes) = WasmProvider::setup_carrier_fifos(&cid, None)
+        let (dir, mut pipes) = WasmProvider::setup_carrier_fifos(&cid, None, Vec::new())
             .expect("setup_carrier_fifos must succeed");
 
         // Simulate a capsule by opening the FIFOs by their *host* paths. Inside
@@ -1174,6 +1182,11 @@ mod tests {
             author: None,
             role: elastos_common::CapsuleRole::App,
             capsule_type: CapsuleType::Wasm,
+            runtime_abi: None,
+            bus_contract: None,
+            wit_world_sha256: None,
+            execution: None,
+            projections: Vec::new(),
             entrypoint: "missing.wasm".into(),
             requires: Vec::new(),
             provides: None,
@@ -1221,6 +1234,11 @@ mod tests {
             author: None,
             role: elastos_common::CapsuleRole::App,
             capsule_type: CapsuleType::Wasm,
+            runtime_abi: None,
+            bus_contract: None,
+            wit_world_sha256: None,
+            execution: None,
+            projections: Vec::new(),
             entrypoint: "missing.wasm".into(),
             requires: Vec::new(),
             provides: None,

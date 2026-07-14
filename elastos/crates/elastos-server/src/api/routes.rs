@@ -96,6 +96,11 @@ pub async fn launch_capsule(
         .await
     {
         Ok(handle) => {
+            let status = if handle.manifest.is_component_capsule() {
+                "completed"
+            } else {
+                "launched"
+            };
             audit_log.capsule_launch(
                 &handle.id.0,
                 &handle.manifest.name,
@@ -105,7 +110,7 @@ pub async fn launch_capsule(
             Ok(Json(LaunchResponse {
                 id: handle.id.0,
                 name: handle.manifest.name,
-                status: "launched".into(),
+                status: status.into(),
             }))
         }
         Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),

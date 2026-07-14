@@ -12,8 +12,8 @@ use axum::{
 };
 use serde_json::Value;
 
-use crate::provider_resource::build_capability_resource;
-use elastos_runtime::capability::{CapabilityManager, CapabilityToken, ResourceId};
+use crate::provider_resource::{build_capability_resource, provider_operation_action};
+use elastos_runtime::capability::{Action, CapabilityManager, CapabilityToken, ResourceId};
 use elastos_runtime::provider::ProviderRegistry;
 use elastos_runtime::session::Session;
 
@@ -47,8 +47,14 @@ pub async fn provider_proxy(
     // Build capability resource
     let resource = build_capability_resource(&scheme, &op, &request)
         .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    let required_action = provider_operation_action(&scheme, &op).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Unsupported provider operation action mapping: {scheme}/{op}"),
+        )
+    })?;
 
-    enforce_capability(&state, &session, &headers, &resource).await?;
+    enforce_capability(&state, &session, &headers, &resource, required_action).await?;
     attach_localhost_provider_wire_token(&scheme, &op, &headers, &mut request);
 
     // Forward to provider
@@ -101,9 +107,21 @@ async fn enforce_capability(
     session: &Session,
     headers: &HeaderMap,
     resource: &str,
+    required_action: Action,
 ) -> Result<(), (StatusCode, String)> {
-    // Shell sessions have orchestrator privilege
-    if session.is_shell() {
+    let bridge_capsule_id = headers
+        .get("X-Elastos-Capsule-Id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty());
+    let token_b64 = headers
+        .get("X-Capability-Token")
+        .and_then(|v| v.to_str().ok());
+
+    // Shell sessions have orchestrator privilege for direct shell calls. Bridge
+    // metadata makes this a delegated capsule call and therefore requires a
+    // capability token, but it never replaces the authenticated session as the
+    // token subject.
+    if session.is_shell() && bridge_capsule_id.is_none() && token_b64.is_none() {
         return Ok(());
     }
 
@@ -118,15 +136,12 @@ async fn enforce_capability(
         }
     };
 
-    let token_b64 = headers
-        .get("X-Capability-Token")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            (
-                StatusCode::FORBIDDEN,
-                "Missing X-Capability-Token header".to_string(),
-            )
-        })?;
+    let token_b64 = token_b64.ok_or_else(|| {
+        (
+            StatusCode::FORBIDDEN,
+            "Missing X-Capability-Token header".to_string(),
+        )
+    })?;
 
     let token = CapabilityToken::from_base64(token_b64).map_err(|e| {
         (
@@ -143,7 +158,7 @@ async fn enforce_capability(
         .validate(
             &token,
             session.id.as_str(),
-            token.action(),
+            required_action,
             &resource_id,
             None,
         )
@@ -158,6 +173,8 @@ mod tests {
     use axum::http::HeaderMap;
     use axum::http::HeaderValue;
     use axum::Extension;
+    use elastos_runtime::capability::{CapabilityManager, CapabilityStore, TokenConstraints};
+    use elastos_runtime::primitives::{audit::AuditLog, metrics::MetricsManager};
     use elastos_runtime::provider::ProviderRegistry;
     use elastos_runtime::session::SessionType;
 
@@ -220,5 +237,125 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .contains("no provider for scheme: chain"));
+    }
+
+    #[tokio::test]
+    async fn provider_proxy_validates_capsule_bridge_token_even_for_shell_bearer() {
+        let audit_log = Arc::new(AuditLog::new());
+        let capability_manager = Arc::new(CapabilityManager::new(
+            Arc::new(CapabilityStore::new()),
+            audit_log.clone(),
+            Arc::new(MetricsManager::new()),
+        ));
+        let state = ProviderProxyState {
+            registry: Arc::new(ProviderRegistry::new()),
+            capability_manager: Some(capability_manager.clone()),
+        };
+        let session = Session::new(SessionType::Shell, None);
+        let resource = "localhost://Local/SharedByLocalUsersAndBots/Home/a.md";
+        let token = capability_manager.grant(
+            session.id.as_str(),
+            ResourceId::new(resource),
+            Action::Read,
+            TokenConstraints::default(),
+            None,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Elastos-Capsule-Id",
+            HeaderValue::from_static("component-test"),
+        );
+        headers.insert(
+            "X-Capability-Token",
+            HeaderValue::from_str(&token.to_base64().unwrap()).unwrap(),
+        );
+
+        enforce_capability(&state, &session, &headers, resource, Action::Read)
+            .await
+            .expect("bridge token should validate against authenticated session");
+
+        assert!(audit_log.recent_events(10).iter().any(|event| matches!(
+            event,
+            elastos_runtime::primitives::audit::AuditEvent::CapabilityUse {
+                capsule_id,
+                success: true,
+                ..
+            } if capsule_id == session.id.as_str()
+        )));
+    }
+
+    #[tokio::test]
+    async fn provider_proxy_rejects_token_bound_only_to_claimed_capsule_id() {
+        let capability_manager = Arc::new(CapabilityManager::new(
+            Arc::new(CapabilityStore::new()),
+            Arc::new(AuditLog::new()),
+            Arc::new(MetricsManager::new()),
+        ));
+        let state = ProviderProxyState {
+            registry: Arc::new(ProviderRegistry::new()),
+            capability_manager: Some(capability_manager.clone()),
+        };
+        let session = Session::new(SessionType::Shell, None);
+        let resource = "localhost://Local/SharedByLocalUsersAndBots/Home/a.md";
+        let token = capability_manager.grant(
+            "component-test",
+            ResourceId::new(resource),
+            Action::Read,
+            TokenConstraints::default(),
+            None,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Elastos-Capsule-Id",
+            HeaderValue::from_static("component-test"),
+        );
+        headers.insert(
+            "X-Capability-Token",
+            HeaderValue::from_str(&token.to_base64().unwrap()).unwrap(),
+        );
+
+        let err = enforce_capability(&state, &session, &headers, resource, Action::Read)
+            .await
+            .expect_err("capsule metadata must not replace authenticated authority");
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn provider_proxy_rejects_wrong_action_bridge_token_before_dispatch() {
+        let capability_manager = Arc::new(CapabilityManager::new(
+            Arc::new(CapabilityStore::new()),
+            Arc::new(AuditLog::new()),
+            Arc::new(MetricsManager::new()),
+        ));
+        let state = ProviderProxyState {
+            registry: Arc::new(ProviderRegistry::new()),
+            capability_manager: Some(capability_manager.clone()),
+        };
+        let session = Session::new(SessionType::Shell, None);
+        let resource = "localhost://Local/SharedByLocalUsersAndBots/Home/a.md";
+        let token = capability_manager.grant(
+            session.id.as_str(),
+            ResourceId::new(resource),
+            Action::Write,
+            TokenConstraints::default(),
+            None,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Elastos-Capsule-Id",
+            HeaderValue::from_static("component-test"),
+        );
+        headers.insert(
+            "X-Capability-Token",
+            HeaderValue::from_str(&token.to_base64().unwrap()).unwrap(),
+        );
+
+        let err = enforce_capability(&state, &session, &headers, resource, Action::Read)
+            .await
+            .expect_err("write token must not authorize read operation");
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(err.1.contains("Capability denied"));
     }
 }

@@ -1539,6 +1539,11 @@ mod tests {
             author: None,
             role: elastos_common::CapsuleRole::App,
             capsule_type: CapsuleType::MicroVM,
+            runtime_abi: None,
+            bus_contract: None,
+            wit_world_sha256: None,
+            execution: None,
+            projections: Vec::new(),
             entrypoint: "rootfs.ext4".to_string(),
             requires: capsule_requires
                 .iter()

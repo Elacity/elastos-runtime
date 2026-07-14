@@ -1098,6 +1098,7 @@ impl Supervisor {
                     pending_store: pending.clone(),
                     capsule_id: format!("vm-{}", name),
                     principal_id: principal_id.clone(),
+                    manifest_capabilities: manifest.resource_authority_bounds(),
                     data_dir: Some(self.data_dir.clone()),
                 }),
                 _ => None,

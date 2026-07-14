@@ -1372,23 +1372,6 @@ async fn run_home_capsule(
     let api_url = api_url.to_string();
     let client_token = client_token.to_string();
 
-    let api_hostcall_url = api_url.clone();
-    let api_hostcall_token = client_token.clone();
-    let api_hostcall_handle = tokio::runtime::Handle::current();
-    runtime.set_wasm_bridge_hostcall(std::sync::Arc::new(
-        move |line, _capsule_id, principal_id| {
-            let response = api_hostcall_handle
-                .block_on(elastos_server::carrier_bridge::handle_remote_request(
-                    line,
-                    &api_hostcall_url,
-                    &api_hostcall_token,
-                    principal_id,
-                ))
-                .map_err(|err| err.to_string())?;
-            serde_json::to_string(&response).map_err(|err| err.to_string())
-        },
-    ));
-
     runtime.set_wasm_bridge_spawner(std::sync::Arc::new(move |pipes| {
         elastos_server::carrier_bridge::spawn_wasm_api_bridge(
             pipes,
