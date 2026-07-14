@@ -681,6 +681,44 @@ fn save_publish_state(path: &Path, state: &PublishState) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_publishable_manifest(path: &Path, manifest: &CapsuleManifest) -> anyhow::Result<()> {
+    manifest
+        .validate()
+        .map_err(anyhow::Error::msg)
+        .with_context(|| format!("Invalid capsule manifest {}", path.display()))?;
+
+    if manifest
+        .description
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        anyhow::bail!(
+            "Capsule manifest {} must declare a description before publishing",
+            path.display()
+        );
+    }
+    let author = manifest
+        .author
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Capsule manifest {} must declare an author before publishing",
+                path.display()
+            )
+        })?;
+    if matches!(author, "local-development" | "example-publisher") {
+        anyhow::bail!(
+            "Capsule manifest {} still uses placeholder author '{}'",
+            path.display(),
+            author
+        );
+    }
+
+    Ok(())
+}
+
 fn load_capsule_manifests(
     workspace_root: &Path,
 ) -> anyhow::Result<BTreeMap<String, CapsuleManifest>> {
@@ -702,6 +740,7 @@ fn load_capsule_manifests(
             let manifest: CapsuleManifest =
                 serde_json::from_str(&std::fs::read_to_string(&capsule_json)?)
                     .with_context(|| format!("Failed to parse {}", capsule_json.display()))?;
+            validate_publishable_manifest(&capsule_json, &manifest)?;
             if let Some(existing) = manifests.insert(manifest.name.clone(), manifest) {
                 anyhow::bail!(
                     "Duplicate capsule '{}' discovered while scanning workspace",
@@ -1520,8 +1559,9 @@ mod tests {
         bootstrap_required, build_release_ledger_entry, changed_capsules,
         discover_available_capsules, load_publish_state, operator_release_notes,
         publish_profile_capsules, release_discovery_topics, save_publish_state, select_capsules,
-        source_discovery_uri, validate_publish_inputs, PublishReleaseOptions, PublishState,
-        ReleaseLedgerEntry, ReleaseLedgerPlatform, DEFAULT_PUBLISH_CAPSULES, DEMO_PUBLISH_CAPSULES,
+        source_discovery_uri, validate_publish_inputs, validate_publishable_manifest,
+        PublishReleaseOptions, PublishState, ReleaseLedgerEntry, ReleaseLedgerPlatform,
+        DEFAULT_PUBLISH_CAPSULES, DEMO_PUBLISH_CAPSULES,
     };
     use elastos_common::{
         CapsuleManifest, CapsuleType, MicroVmConfig, Permissions, RequirementKind, ResourceLimits,
@@ -1716,6 +1756,41 @@ mod tests {
         assert!(capsules.iter().any(|name| name == "chat"));
         assert!(capsules.iter().any(|name| name == "shell"));
         assert!(capsules.iter().any(|name| name == "ipfs-provider"));
+    }
+
+    #[test]
+    fn test_publish_rejects_invalid_and_placeholder_manifests() {
+        let path = Path::new("capsule.json");
+        let mut manifest = test_manifest("sample", &[]);
+        manifest.description = Some("Useful sample".to_string());
+        manifest.author = Some("publisher".to_string());
+        validate_publishable_manifest(path, &manifest).unwrap();
+
+        manifest.schema = "wrong".to_string();
+        assert!(validate_publishable_manifest(path, &manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid capsule manifest"));
+
+        manifest.schema = elastos_common::SCHEMA_V1.to_string();
+        manifest.author = Some("local-development".to_string());
+        assert!(validate_publishable_manifest(path, &manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("placeholder author"));
+
+        manifest.author = None;
+        assert!(validate_publishable_manifest(path, &manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("must declare an author"));
+
+        manifest.author = Some("publisher".to_string());
+        manifest.description = None;
+        assert!(validate_publishable_manifest(path, &manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("must declare a description"));
     }
 
     #[test]

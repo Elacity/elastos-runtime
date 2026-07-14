@@ -1,0 +1,36 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "example-web-app",
+  "version": "0.1.0",
+  "description": "Show example information",
+  "author": "example-publisher",
+  "role": "app",
+  "type": "wasm",
+  "runtime_abi": "elastos.runtime-projection/v1",
+  "bus_contract": "elastos.runtime-projection/v1",
+  "execution": "web-projection",
+  "projections": ["web", "facts", "affordances", "gates"],
+  "entrypoint": "browser/index.html",
+  "interfaces": [
+    {
+      "id": "example.view",
+      "version": "1.0.0",
+      "description": "Example view",
+      "methods": [
+        {
+          "id": "view.open",
+          "description": "Open the example view",
+          "risk": "launch",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://example/view",
+          "operation": "open"
+        }
+      ]
+    }
+  ],
+  "resources": {
+    "memory_mb": 16,
+    "gpu": false
+  }
+}

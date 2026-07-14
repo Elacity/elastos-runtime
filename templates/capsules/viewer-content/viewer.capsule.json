@@ -1,0 +1,52 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "example-viewer",
+  "version": "0.1.0",
+  "description": "Open example files",
+  "author": "example-publisher",
+  "role": "viewer",
+  "type": "wasm",
+  "runtime_abi": "elastos.runtime-projection/v1",
+  "bus_contract": "elastos.runtime-projection/v1",
+  "execution": "web-projection",
+  "projections": ["web", "facts", "affordances", "gates"],
+  "entrypoint": "browser/index.html",
+  "interfaces": [
+    {
+      "id": "example.viewer",
+      "version": "1.0.0",
+      "description": "Open example files",
+      "methods": [
+        {
+          "id": "file.open",
+          "description": "Open a compatible example file",
+          "risk": "launch",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://content/asset",
+          "operation": "open",
+          "input_schema": {
+            "schema": "example.file-open/v1",
+            "accepts": [
+              {
+                "kind": "content_capsule",
+                "role": "content",
+                "type": "data",
+                "viewer": "example-viewer"
+              },
+              {
+                "kind": "file",
+                "extensions": [".example"],
+                "mime": ["application/x-example"]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "resources": {
+    "memory_mb": 32,
+    "gpu": false
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "example-provider",
+  "version": "0.1.0",
+  "description": "Internal example service contract",
+  "author": "example-publisher",
+  "role": "provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "elastos://example/*",
+  "authority": {
+    "reason": "Owns the narrow example service implementation behind Runtime policy.",
+    "capabilities": [
+      {
+        "resource": "elastos://example/*",
+        "actions": ["read"],
+        "operations": ["status"]
+      }
+    ],
+    "audit_events": ["example.status"]
+  },
+  "interfaces": [
+    {
+      "id": "example.provider",
+      "version": "1.0.0",
+      "description": "Example service",
+      "methods": [
+        {
+          "id": "status",
+          "description": "Read example service status",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://example/*",
+          "operation": "status"
+        }
+      ]
+    }
+  ],
+  "resources": {
+    "memory_mb": 32,
+    "gpu": false
+  },
+  "permissions": {}
+}

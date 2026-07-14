@@ -108,7 +108,7 @@ Browser UniSat injection path.
 `check-first-party-wasi-gate.mjs` reports every first-party capsule with WASI
 Preview 1 evidence, allows only explicit non-product fixture classifications,
 and fails on any first-party product WASI usage.
-`check-component-bus-wit.mjs` verifies the minimal `elastos:bus@v1` WIT world
+`check-elastos-bus-wit.mjs` verifies the minimal `elastos:bus@v1` WIT world
 and fails if it grows raw filesystem, raw network, environment authority,
 gateway URL, provider-selection, or WASI import surfaces.
 

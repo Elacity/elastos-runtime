@@ -6,7 +6,27 @@ SERVER_MANIFEST="$ROOT/elastos/Cargo.toml"
 ELASTOS_CMD=(cargo run -q -p elastos-server --manifest-path "$SERVER_MANIFEST" --)
 TMP_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TMP_ROOT"' EXIT
+ORIGINAL_HOME="$HOME"
+export CARGO_HOME="${CARGO_HOME:-${ORIGINAL_HOME}/.cargo}"
+export RUSTUP_HOME="${RUSTUP_HOME:-${ORIGINAL_HOME}/.rustup}"
+export HOME="$TMP_ROOT/home"
 export XDG_DATA_HOME="$TMP_ROOT/xdg-data"
+mkdir -p "$HOME"
+
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  python3 - "$seconds" "$@" <<'PY'
+import subprocess
+import sys
+
+try:
+    result = subprocess.run(sys.argv[2:], timeout=float(sys.argv[1]))
+except subprocess.TimeoutExpired:
+    raise SystemExit(124)
+raise SystemExit(result.returncode)
+PY
+}
 
 run_ok() {
   local name="$1"
@@ -57,7 +77,7 @@ run_fail_fast() {
   shift
   echo "[command-smoke] $name"
   set +e
-  timeout 15s "$@" >/tmp/command-smoke.out 2>/tmp/command-smoke.err
+  run_with_timeout 15 "$@" >/tmp/command-smoke.out 2>/tmp/command-smoke.err
   local rc=$?
   set -e
   if [[ $rc -eq 0 ]]; then
@@ -90,9 +110,9 @@ run_expect_output "config show on empty home is explicit" "No config file found"
 run_expect_output "site path prints rooted path" "localhost://MyWebSite" "${ELASTOS_CMD[@]}" site path
 run_expect_output "shares list on empty home is explicit" "No shares yet" "${ELASTOS_CMD[@]}" shares list
 run_expect_failure_output \
-  "run wasm without operator runtime fails clearly" \
+  "run component without operator runtime fails clearly" \
   "This command requires a running runtime" \
-  "${ELASTOS_CMD[@]}" run "$ROOT/capsules/home-cli"
+  "${ELASTOS_CMD[@]}" run "$ROOT/elastos/tests/fixtures/components/bus-v1"
 run_fail_fast "open missing bundle CID" "${ELASTOS_CMD[@]}" open elastos://QmU8x9HMWetGzfnXLe4CriiocGuzvSLr9NJ1RwDp6MaWX6
 
 echo "[command-smoke] OK"

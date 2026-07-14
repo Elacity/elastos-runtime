@@ -1079,6 +1079,20 @@ mod tests {
     }
 
     #[test]
+    fn capsule_authoring_templates_validate() {
+        for json in [
+            include_str!("../../../../templates/capsules/component-app/capsule.json"),
+            include_str!("../../../../templates/capsules/web-app/capsule.json"),
+            include_str!("../../../../templates/capsules/viewer-content/viewer.capsule.json"),
+            include_str!("../../../../templates/capsules/viewer-content/content.capsule.json"),
+            include_str!("../../../../templates/capsules/provider-contract/capsule.json"),
+        ] {
+            let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+            manifest.validate().unwrap();
+        }
+    }
+
+    #[test]
     fn test_component_manifest_rejects_missing_wit_hash() {
         let json = format!(
             r#"{{

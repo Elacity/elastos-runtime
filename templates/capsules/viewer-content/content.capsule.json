@@ -1,0 +1,34 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "example-content",
+  "version": "0.1.0",
+  "description": "Example content",
+  "author": "example-publisher",
+  "role": "content",
+  "type": "data",
+  "entrypoint": "sample.example",
+  "viewer": "example-viewer",
+  "interfaces": [
+    {
+      "id": "example.content",
+      "version": "1.0.0",
+      "description": "Example content",
+      "methods": [
+        {
+          "id": "asset.open",
+          "description": "Open this content with Example Viewer",
+          "risk": "launch",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://content/asset",
+          "operation": "open",
+          "output_schema": {
+            "schema": "example.content-opened/v1",
+            "content_type": "application/x-example",
+            "viewer": "example-viewer"
+          }
+        }
+      ]
+    }
+  ]
+}

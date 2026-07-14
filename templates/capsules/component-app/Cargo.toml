@@ -1,0 +1,17 @@
+[package]
+name = "example-component-app"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.57.1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

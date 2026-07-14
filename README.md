@@ -66,6 +66,7 @@ Developer orientation:
 - `ROADMAP.md` is direction, not proof.
 - `docs/README.md` lists the active documentation set.
 - `scripts/README.md` explains which scripts are public entrypoints and which are proof/operator helpers.
+- `docs/CAPSULE_AUTHORING.md` and `templates/capsules/` are the canonical path for adding a capsule.
 
 Source-built setup notes:
 
@@ -139,7 +140,7 @@ source checkout to `http://localhost:61180/apps/home/` and passkey sign-in.
 The interactive product contract is narrower than the full command surface:
 
 - first-class: `elastos`, `elastos home`, `Home -> System/Documents/Library/Inbox`
-- demo profile: `Home -> Chat Room`, `Home -> GBA UCity`, and MyWebSite/public-edge helpers when their components are installed
+- demo profile: `Home -> Chat Room`, MyWebSite/public-edge helpers, and the conditional Runtime-backed GBA/uCity content-viewer path
 - secondary shortcut: `elastos chat`
 - secondary packaged path: `elastos capsule <name> --lifecycle interactive --interactive`
 - operator/developer-only: `elastos agent`, `elastos node`, `elastos run`, non-interactive `elastos capsule`
@@ -201,7 +202,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
 - a bounded protected-content proof for the known `ela.city` test path through
   Runtime Browser, including funded purchase/playback evidence, without claiming
   arbitrary protected-content readiness or completed dDRM/dKMS providers
-- native P2P chat, plus local/source proof for WASM chat interop
+- native P2P chat plus shared-runtime conversation proof
 - sovereign room membership/invite flow, hosted chat-room access under the explicit operator lane, and local cross-runtime Carrier room sync proof
 - signed publish, install, and update flow
 - operator-only remote node status and trusted-source update control over Carrier via `elastos node ...`

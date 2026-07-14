@@ -141,7 +141,7 @@ methods are runtime-policy gated, while direct signing, payment, key release,
 secret export, destructive storage, and protected-content render effects keep
 explicit user approval metadata.
 
-The Browser UI capsule is a component-bus capsule with web assets. It declares
+The Browser UI capsule is a Runtime projection with web assets. It declares
 Browser-scoped page, display, exit selection, profile reset, and wallet-bridge
 affordances so shells can inspect the UX contract, but it does not receive raw
 Browser Engine, Exit, Net, Wallet, media relay, profile-storage, or cleanup

@@ -21,6 +21,21 @@ printf '# installed-command-audit\n' > "$TMP_ROOT/share.txt"
 
 FAILURES=0
 
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  python3 - "$seconds" "$@" <<'PY'
+import subprocess
+import sys
+
+try:
+    result = subprocess.run(sys.argv[2:], timeout=float(sys.argv[1]))
+except subprocess.TimeoutExpired:
+    raise SystemExit(124)
+raise SystemExit(result.returncode)
+PY
+}
+
 run_case() {
   local kind="$1"
   local name="$2"
@@ -108,7 +123,7 @@ run_case fail-fast \
 run_case fail-fast \
   "open without extras fails clearly" \
   "ipfs-provider not found|elastos setup --with kubo --with ipfs-provider" \
-  timeout 15s "$ELASTOS_BIN" open elastos://QmU8x9HMWetGzfnXLe4CriiocGuzvSLr9NJ1RwDp6MaWX6
+  run_with_timeout 15 "$ELASTOS_BIN" open elastos://QmU8x9HMWetGzfnXLe4CriiocGuzvSLr9NJ1RwDp6MaWX6
 
 if [[ $FAILURES -ne 0 ]]; then
   echo "[installed-command-audit] FAIL ($FAILURES cases)" >&2

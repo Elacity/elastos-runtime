@@ -123,13 +123,6 @@ elastos setup --profile chat
 elastos capsule chat --lifecycle interactive --interactive --config '{"nick":"alice"}'
 ```
 
-For the non-KVM packaged WASM variant:
-
-```bash
-elastos setup --profile demo
-elastos capsule chat-wasm --lifecycle interactive --interactive --config '{"nick":"alice"}'
-```
-
 Important honesty rule for those packaged paths:
 
 - when launched from Home, they can return Home
@@ -240,7 +233,7 @@ For the current Apple silicon Mac path, use [MAC.md](MAC.md). The short version
 is:
 
 ```bash
-rustup target add wasm32-wasip1
+rustup target add wasm32-unknown-unknown
 export MAC_TEST_HOME="$HOME/elastos-mac-test-home"
 export USER_HOME="$HOME"
 
@@ -293,13 +286,11 @@ Important boundary:
 ./scripts/chat.sh --nick alice
 ```
 
-### GBA demo
-
-```bash
-./scripts/gba.sh
-```
-
-These source-side scripts are developer/demo entrypoints. They are not the public install contract.
+The source-side scripts are developer/demo entrypoints. They are not the public
+install contract. The `demo` and `full` profiles install the conditional GBA
+engine, viewer, and uCity content capsule together. The viewer uses Runtime for
+ROM and save authority. Use `just gba` to build and verify that path; launch
+games from Home or Library.
 
 ## Operator Runtime
 
@@ -343,14 +334,18 @@ For developer review, the important distinction is:
 
 ## Capsule Development
 
-Create a new capsule:
+Read [Capsule Authoring](CAPSULE_AUTHORING.md) and use the checked-in
+[`templates/capsules`](../templates/capsules/README.md) for web projections,
+viewer/content pairs, and provider contracts. Create a minimal Component Bus
+capsule with:
 
 ```bash
 ./elastos/target/release/elastos init my-capsule
 cd my-capsule
-rustup target add wasm32-wasip1
-cargo build --release
-cp target/wasm32-wasip1/release/my-capsule.wasm .
+cargo build --release --target wasm32-unknown-unknown
+cargo run --quiet --manifest-path ../elastos/tools/componentize/Cargo.toml -- \
+  target/wasm32-unknown-unknown/release/my_capsule.wasm \
+  my-capsule.component.wasm
 ../elastos/target/release/elastos run .
 ```
 

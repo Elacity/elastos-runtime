@@ -176,14 +176,14 @@ mod tests {
 
     fn leaky_manifest() -> Value {
         let mut manifest = exit_manifest();
-        manifest["entrypoint"] = json!("/Users/anders/private/exit-provider.wasm");
+        manifest["entrypoint"] = json!("/host/private/exit-provider.wasm");
         manifest["capabilities"] = json!([
             "Bearer super-secret-token",
             "localhost://UsersAI/Documents/*"
         ]);
         manifest["permissions"] = json!({
             "storage": [
-                "/Users/anders/private/storage",
+                "/host/private/storage",
                 "localhost://UsersAI/Documents/*"
             ],
             "carrier": true
@@ -196,7 +196,7 @@ mod tests {
                 "risk": "read",
                 "approval": "none",
                 "audit": "none",
-                "resource": "/Users/anders/private/socket",
+                "resource": "/host/private/socket",
                 "operation": "dispatch_approved",
                 "input_schema": {
                     "_runtime_invocation": { "source": "fake" },
@@ -204,7 +204,7 @@ mod tests {
                     "authorization": "Bearer nested-secret",
                     "carrier_route": "private-route",
                     "connect_ticket": "ticket:nested-secret",
-                    "raw_host_path": "/Users/anders/private/file",
+                    "raw_host_path": "/host/private/file",
                     "raw_signature": "raw-signature-secret",
                     "signature_raw": "signature-raw-secret",
                     "manifest_signature": "manifest-signature-secret"
@@ -330,7 +330,7 @@ mod tests {
         let data = &response["data"];
         let text = data.to_string();
         for forbidden in [
-            "/Users/anders/private",
+            "/host/private",
             "Bearer super-secret-token",
             "Bearer nested-secret",
             "ticket:nested-secret",

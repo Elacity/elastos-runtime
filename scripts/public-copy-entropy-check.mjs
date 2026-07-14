@@ -114,6 +114,11 @@ for (const [path, options] of [
   assertPlain(path, visibleHtml(path, options));
 }
 
+assertPlain(
+  "Home GUI notification template",
+  visibleHtml("capsules/home-gui/browser/home-gui-template.html"),
+);
+
 const marketplaceHtml = read("capsules/marketplace/browser/index.html");
 const marketplaceJs = read("capsules/marketplace/browser/marketplace.js");
 assert(

@@ -1,0 +1,19 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "example-component-app",
+  "version": "0.1.0",
+  "description": "Show example status",
+  "author": "example-publisher",
+  "role": "app",
+  "type": "wasm",
+  "runtime_abi": "elastos.component/v1",
+  "bus_contract": "elastos:bus@v1",
+  "wit_world_sha256": "7a026e0a641c8c04214576dc85a677e0b52c9f02866d231119f9a3ba609d49e2",
+  "execution": "component",
+  "projections": ["facts"],
+  "entrypoint": "example-component-app.component.wasm",
+  "resources": {
+    "memory_mb": 16,
+    "gpu": false
+  }
+}

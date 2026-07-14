@@ -135,7 +135,7 @@ First-class file-backed localhost roots in the runtime today:
 Reserved special root:
 
 - `localhost://WebSpaces/...`
-  - this is the future dynamic AppCapsule/WebSpace resolver class, not ordinary path-based storage
+  - this is the dynamic WebSpace resolver class, not ordinary path-based storage
 
 Useful current examples:
 

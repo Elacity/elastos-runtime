@@ -51,6 +51,7 @@ verify:
     git diff --check
     just alignment-check
     node scripts/check-elastos-bus-wit.mjs
+    node scripts/check-capsule-templates.mjs
     node scripts/home-entropy-check.mjs
     node scripts/browser-entropy-check.mjs
     just local-carrier-setup-smoke
@@ -73,6 +74,11 @@ alignment-check:
 bus-conformance:
     node scripts/check-elastos-bus-wit.mjs
     cd elastos && cargo test -p elastos-server component_runs_through_real_bus_authority_provider_and_audit_paths -- --nocapture
+
+# Validate canonical capsule scaffolds against the current manifest and WIT contracts
+capsule-templates:
+    node scripts/check-capsule-templates.mjs
+    cd elastos && cargo test -p elastos-common capsule_authoring_templates_validate -- --nocapture
 
 # Real-PTY source proof: current target-built elastos + current home-cli.wasm against clean-home data
 home-frontdoor-smoke:

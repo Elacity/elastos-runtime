@@ -570,10 +570,9 @@ pub(in crate::api::gateway) async fn browser_gateway_session_status(
     let sessions = registry
         .sessions
         .iter()
-        .filter_map(|(session_id, session)| {
-            (session.scope == scope).then(|| {
-                browser_lifecycle_session_value(session_id, session, now, capacity_available)
-            })
+        .filter(|(_, session)| session.scope == scope)
+        .map(|(session_id, session)| {
+            browser_lifecycle_session_value(session_id, session, now, capacity_available)
         })
         .collect::<Vec<_>>();
     serde_json::json!({

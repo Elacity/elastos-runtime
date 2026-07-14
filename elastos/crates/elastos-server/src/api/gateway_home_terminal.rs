@@ -593,7 +593,7 @@ impl HomeTerminalInput {
                 let data = data.to_vec();
                 tokio::task::spawn_blocking(move || writer.write_all(&data))
                     .await
-                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?
+                    .map_err(io::Error::other)?
             }
         }
     }
@@ -619,6 +619,7 @@ impl HomeTerminalInput {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn terminal_start_size(
     start: Option<HomeTerminalStartRequest>,
 ) -> Result<HomeTerminalSize, Response> {
