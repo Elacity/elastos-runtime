@@ -1801,7 +1801,8 @@ const dockState = {
 function dockMagnifyEnabled() {
   return (
     !dockReducedMotion.matches &&
-    !document.body.classList.contains("dragging-target")
+    !document.body.classList.contains("dragging-target") &&
+    window.matchMedia("(hover: hover) and (min-width: 641px)").matches
   );
 }
 

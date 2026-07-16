@@ -2445,6 +2445,8 @@ body.dragging-target {
 }
 
 @media (max-width: 640px) {
+  /* Phone shell: bar keeps brand · identity · clock; the focused-window title
+     and identity name yield the space. The clock never hides. */
   .toolbar {
     padding-right: 8px;
   }
@@ -2453,7 +2455,11 @@ body.dragging-target {
     margin-left: 7px;
   }
 
-  .toolbar-clock {
+  .toolbar-active-title {
+    display: none;
+  }
+
+  .toolbar-identity-name {
     display: none;
   }
 
@@ -2462,6 +2468,23 @@ body.dragging-target {
     max-height: calc(100dvh - 92px);
   }
 
+  /* Windows fill the stage between bar and dock — apps read as full-screen. */
+  .window {
+    position: fixed !important;
+    inset: var(--stage-top) 0 var(--stage-bottom) 0 !important;
+    width: auto !important;
+    height: auto !important;
+    max-width: none !important;
+    max-height: none !important;
+    border-radius: 0 !important;
+  }
+
+  .window .window-resize-handle {
+    display: none;
+  }
+
+  /* Dock: fixed bottom row, horizontally scrollable, no magnification (the
+     magnification code also gates itself off below 641px / non-hover). */
   .taskbar {
     max-width: calc(100vw - 20px);
     padding-left: 8px;
@@ -2472,4 +2495,17 @@ body.dragging-target {
     gap: 8px;
   }
 
+  .taskbar-sortable {
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+  }
+
+  .taskbar-sortable::-webkit-scrollbar {
+    display: none;
+  }
+
+  .dock-tooltip {
+    display: none;
+  }
 }
