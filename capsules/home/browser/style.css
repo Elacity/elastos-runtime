@@ -1101,11 +1101,14 @@ img {
   inset: 0;
   z-index: 100110;
   display: grid;
-  place-items: end center;
-  padding: calc(56px + env(safe-area-inset-top, 0px)) 18px calc(78px + env(safe-area-inset-bottom, 0px));
-  /* Dim only — the full-viewport blur stacked a third live backdrop-filter on
-     top of the popover's own; the popover is the only blurred surface here. */
-  background: rgba(6, 7, 10, 0.32);
+  place-items: center;
+  padding: calc(56px + env(safe-area-inset-top, 0px)) 18px calc(88px + env(safe-area-inset-bottom, 0px));
+  /* Launchpad surface: the container is the single blurred layer while open
+     (transient — not steady-state); the sheet itself stays transparent so no
+     blurs nest. */
+  background: rgba(6, 7, 10, 0.55);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
 }
 
 .launcher[hidden] {
@@ -1323,17 +1326,29 @@ body.dragging-target {
 
 .launcher-popover {
   position: relative;
-  width: 530px;
-  max-width: calc(100vw - 36px);
-  max-height: min(500px, 72vh);
-  padding: 20px;
+  width: min(920px, 100%);
+  max-height: 100%;
+  padding: 8px 20px 24px;
   overflow-y: auto;
-  border: 1px solid var(--line);
-  border-radius: 16px;
-  background-color: rgba(24, 26, 31, 0.9);
   color: var(--text);
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
-  backdrop-filter: blur(12px);
+  animation: launcher-enter 180ms cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+@keyframes launcher-enter {
+  0% {
+    opacity: 0;
+    transform: scale(1.04);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .launcher-popover {
+    animation: none;
+  }
 }
 
 .launcher-close {
@@ -1363,9 +1378,8 @@ body.dragging-target {
 
 .launcher-search-wrap {
   position: relative;
-  margin-top: 16px;
-  margin-bottom: 18px;
-  padding-right: 30px;
+  width: min(420px, 100%);
+  margin: 16px auto 26px;
 }
 
 .launcher-search-wrap::before {
@@ -1402,11 +1416,12 @@ body.dragging-target {
 }
 
 .launcher-heading {
-  margin: 0 5px 14px;
-  padding: 0 0 10px;
-  font-size: 13px;
-  color: var(--brand);
-  border-bottom: 1px solid var(--brand-line);
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
 }
 
 .launcher-sections {
@@ -1429,8 +1444,8 @@ body.dragging-target {
 
 .launcher-group-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
-  gap: 14px 12px;
+  grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+  gap: 18px 14px;
 }
 
 .launcher-card {
@@ -1466,8 +1481,8 @@ body.dragging-target {
 }
 
 .launcher-item-icon {
-  width: 54px;
-  height: 54px;
+  width: 62px;
+  height: 62px;
 }
 
 .launcher-card-title {
