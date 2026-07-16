@@ -1,4 +1,4 @@
-import { fetchJson } from "./shell-core.js?v=home-20260701c";
+import { fetchJson, trapTabWithin } from "./shell-core.js?v=home-20260701c";
 
 const unlockPanel = document.querySelector("#home-unlock");
 const unlockCard = document.querySelector(".home-unlock-card");
@@ -33,6 +33,10 @@ export async function showHomeUnlock(onUnlocked, options = {}) {
   unlockPanel.hidden = false;
   unlockPanel.setAttribute("aria-hidden", "false");
   unlockCard?.setAttribute("aria-modal", "true");
+
+  // The unlock card is a modal dialog: keyboard focus starts on the primary
+  // action and stays inside until the surface is dismissed.
+  unlockPrimary?.focus();
 
   if (!window.PublicKeyCredential) {
     unlockMode = "unsupported";
@@ -72,6 +76,11 @@ export function hideHomeUnlock() {
 }
 
 export function bindHomeUnlock() {
+  unlockPanel?.addEventListener("keydown", (event) => {
+    if (!unlockPanel.hidden) {
+      trapTabWithin(unlockCard, event);
+    }
+  });
   unlockPrimary?.addEventListener("click", () => {
     if (unlockMode === "create" || unlockMode === "create_guest") {
       runPasskeyCreate().catch(reportUnlockError);

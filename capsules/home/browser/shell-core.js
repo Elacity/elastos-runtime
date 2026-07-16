@@ -110,6 +110,40 @@ export const shellState = {
   requestSummaryRefresh: null,
 };
 
+// Keyboard focus trap for modal shell surfaces (launcher, unlock). Wraps Tab
+// and Shift+Tab within the container's visible, enabled controls. Returns true
+// when the event was handled.
+export function trapTabWithin(container, event) {
+  if (event.key !== "Tab" || !container) {
+    return false;
+  }
+  const focusables = Array.from(
+    container.querySelectorAll(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    ),
+  ).filter(
+    (element) => !element.hidden && !element.disabled && element.offsetParent !== null,
+  );
+  if (focusables.length === 0) {
+    event.preventDefault();
+    return true;
+  }
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  const active = document.activeElement;
+  if (event.shiftKey && (active === first || !container.contains(active))) {
+    event.preventDefault();
+    last.focus();
+    return true;
+  }
+  if (!event.shiftKey && (active === last || !container.contains(active))) {
+    event.preventDefault();
+    first.focus();
+    return true;
+  }
+  return false;
+}
+
 export function beginShellInteraction() {
   shellState.geometryInteractionCount += 1;
 }

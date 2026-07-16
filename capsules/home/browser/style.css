@@ -1347,6 +1347,12 @@ body.dragging-target {
   display: none;
 }
 
+/* Windows take programmatic focus (tabindex=-1) on keyboard activation; the
+   active header treatment is the focus indicator, not a page outline. */
+.window:focus {
+  outline: none;
+}
+
 /* Maximize fills the stage — never the system bar or dock. A window that buries
    the clock reads as a browser tab, not a computer. */
 .window[data-maximized="true"] {

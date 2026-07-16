@@ -404,7 +404,7 @@ function restoreWindow(id) {
   entry.node.classList.remove("hidden");
   entry.node.setAttribute("aria-hidden", "false");
   armWindowControlGuard(entry.node);
-  focusWindow(id);
+  focusWindow(id, { moveFocus: true });
   persistBrowserSession();
   return true;
 }
@@ -421,7 +421,7 @@ export function showAllTargetWindows(targetId) {
   }
   const top = topBrowserWindowEntryForTarget(targetId);
   if (top) {
-    focusWindow(top.id);
+    focusWindow(top.id, { moveFocus: true });
   } else {
     refreshWindowUi();
     persistBrowserSession();
@@ -477,7 +477,7 @@ function removeWindowEntries(entries) {
 function activateTargetGroup(targetId) {
   const visibleTop = topBrowserWindowEntryForTarget(targetId, { includeHidden: false });
   if (visibleTop) {
-    focusWindow(visibleTop.id);
+    focusWindow(visibleTop.id, { moveFocus: true });
     return true;
   }
   const restoreTarget = topBrowserWindowEntryForTarget(targetId);
@@ -2179,7 +2179,7 @@ function fitWindowToFrame(node, frame) {
   }
 }
 
-export function focusWindow(id) {
+export function focusWindow(id, { moveFocus = false } = {}) {
   const entry = shellState.windows.get(id);
   if (!entry) {
     return;
@@ -2201,6 +2201,21 @@ export function focusWindow(id) {
   }
   refreshWindowUi();
   persistBrowserSession();
+  // Keyboard activation (taskbar, window menus) must move real DOM focus to
+  // the window; pointer clicks keep the browser's natural focus placement.
+  if (moveFocus) {
+    entry.node.focus({ preventScroll: true });
+  }
+}
+
+function syncMaximizeButtonLabel(node) {
+  const button = node.querySelector('[data-action="maximize"]');
+  if (!button) {
+    return;
+  }
+  const maximized =
+    node.dataset.maximized === "true" || node.dataset.browserMaximized === "true";
+  button.setAttribute("aria-label", maximized ? "Restore" : "Maximize");
 }
 
 function toggleWindowMaximize(id) {
@@ -2216,6 +2231,7 @@ function toggleWindowMaximize(id) {
   ) {
     restoreWindowFromSpecialState(node);
     fitLaunchedWindow(entry);
+    syncMaximizeButtonLabel(node);
     focusWindow(id);
     persistBrowserSession();
     return;
@@ -2226,12 +2242,14 @@ function toggleWindowMaximize(id) {
     node.dataset.maximized = "false";
     node.dataset.browserMaximized = "true";
     fitWindowToLargestBrowserAspect(node);
+    syncMaximizeButtonLabel(node);
     focusWindow(id);
     persistBrowserSession();
     return;
   }
   node.dataset.browserMaximized = "false";
   node.dataset.maximized = "true";
+  syncMaximizeButtonLabel(node);
   focusWindow(id);
   persistBrowserSession();
 }

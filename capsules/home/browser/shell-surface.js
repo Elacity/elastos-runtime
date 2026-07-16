@@ -45,6 +45,7 @@ import {
   desktopObjectEntryId,
   desktopObjectByEntryId,
   desktopEntryExists,
+  trapTabWithin,
 } from "./shell-core.js?v=home-20260701c";
 import {
   browserWindowEntries,
@@ -569,7 +570,8 @@ function attachTargetIconInteractions(node, targetId, source) {
     if (source === "launcher") {
       setSelectedLauncherTarget(targetId);
     }
-    openDesktopContextMenu(event.clientX, event.clientY, {
+    const anchor = contextMenuAnchorPoint(event, node);
+    openDesktopContextMenu(anchor.x, anchor.y, {
       kind: "target",
       targetId,
       source,
@@ -617,12 +619,26 @@ function attachDesktopObjectInteractions(node, entryId) {
     event.preventDefault();
     event.stopPropagation();
     selectDesktopTarget(entryId);
-    openDesktopContextMenu(event.clientX, event.clientY, {
+    const anchor = contextMenuAnchorPoint(event, node);
+    openDesktopContextMenu(anchor.x, anchor.y, {
       kind: "desktop-object",
       entryId,
       source: "desktop",
     });
   });
+}
+
+// Keyboard-invoked contextmenu events (Shift+F10 / Menu key) arrive with
+// (0,0) coordinates — anchor the menu to the element instead.
+function contextMenuAnchorPoint(event, node) {
+  if (event.clientX > 0 || event.clientY > 0) {
+    return { x: event.clientX, y: event.clientY };
+  }
+  const rect = node.getBoundingClientRect();
+  return {
+    x: rect.left + rect.width / 2,
+    y: rect.top + rect.height / 2,
+  };
 }
 
 function openDesktopObject(entryId) {
@@ -1052,10 +1068,16 @@ export function showLauncher() {
 }
 
 export function hideLauncher() {
+  const hadFocus = launcher.contains(document.activeElement);
   syncLauncherVisibility(false);
   launcherSearch.value = "";
   shellState.selectedLauncherTargetId = null;
   filterLauncherItems("");
+  // A closed modal must hand keyboard focus back to its invoker, never drop
+  // it on <body>.
+  if (hadFocus) {
+    launcherToggleButton.focus();
+  }
 }
 
 function syncLauncherVisibility(isVisible) {
@@ -1067,6 +1089,14 @@ function syncLauncherVisibility(isVisible) {
     : 0;
   launcherToggleButton.setAttribute("aria-expanded", isVisible ? "true" : "false");
 }
+
+// The launcher is a modal dialog: Tab cycles inside the popover until it is
+// dismissed.
+launcher.addEventListener("keydown", (event) => {
+  if (!launcher.hidden) {
+    trapTabWithin(launcher.querySelector(".launcher-popover"), event);
+  }
+});
 
 function shouldFocusLauncherSearch() {
   if (navigator.maxTouchPoints > 0) {
@@ -1080,6 +1110,10 @@ export function openDesktopContextMenu(clientX, clientY, target) {
     hideLauncher();
   }
   shellState.contextMenuTarget = target;
+  shellState.contextMenuInvoker =
+    document.activeElement && document.activeElement !== document.body
+      ? document.activeElement
+      : null;
   renderContextMenu(target);
   desktopContextMenu.hidden = false;
   shellState.contextMenuOpen = true;
@@ -1093,12 +1127,50 @@ export function openDesktopContextMenu(clientX, clientY, target) {
 
   desktopContextMenu.style.left = `${left}px`;
   desktopContextMenu.style.top = `${top}px`;
+  contextMenuFocusables()[0]?.focus();
 }
 
-export function hideDesktopContextMenu() {
+export function hideDesktopContextMenu({ restoreFocus = false } = {}) {
+  const hadFocus = desktopContextMenu.contains(document.activeElement);
   desktopContextMenu.hidden = true;
   shellState.contextMenuOpen = false;
+  if (restoreFocus && hadFocus) {
+    shellState.contextMenuInvoker?.focus?.();
+  }
+  shellState.contextMenuInvoker = null;
 }
+
+function contextMenuFocusables() {
+  return Array.from(desktopContextMenu.querySelectorAll('[role="menuitem"]'));
+}
+
+function moveContextMenuFocus(delta) {
+  const items = contextMenuFocusables();
+  if (items.length === 0) {
+    return;
+  }
+  const index = items.indexOf(document.activeElement);
+  const next = index < 0
+    ? (delta > 0 ? 0 : items.length - 1)
+    : (index + delta + items.length) % items.length;
+  items[next].focus();
+}
+
+desktopContextMenu.addEventListener("keydown", (event) => {
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    moveContextMenuFocus(1);
+  } else if (event.key === "ArrowUp") {
+    event.preventDefault();
+    moveContextMenuFocus(-1);
+  } else if (event.key === "Home") {
+    event.preventDefault();
+    contextMenuFocusables()[0]?.focus();
+  } else if (event.key === "End") {
+    event.preventDefault();
+    contextMenuFocusables().at(-1)?.focus();
+  }
+});
 
 function renderContextMenu(target) {
   desktopContextMenu.replaceChildren();
@@ -1258,7 +1330,7 @@ export function handleContextAction(action) {
     }
   }
   if (action.startsWith("focus-window:")) {
-    focusWindow(action.slice("focus-window:".length));
+    focusWindow(action.slice("focus-window:".length), { moveFocus: true });
     return;
   }
   if (action === "toggle-desktop-icons") {

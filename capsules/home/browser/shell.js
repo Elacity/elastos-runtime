@@ -328,7 +328,7 @@ document.addEventListener("pointerdown", (event) => {
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && shellState.contextMenuOpen) {
-    hideDesktopContextMenu();
+    hideDesktopContextMenu({ restoreFocus: true });
   }
   if (event.key === "Escape" && !launcher.hidden) {
     hideLauncher();

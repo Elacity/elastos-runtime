@@ -79,7 +79,7 @@
       </header>
 
       <main class="desktop-workspace">
-        <section id="desktop" class="desktop" aria-live="polite">
+        <section id="desktop" class="desktop">
           <section
             id="desktop-shortcuts"
             class="desktop-shortcuts"
@@ -137,8 +137,7 @@
       <section
         id="home-notification-toast"
         class="home-notification-toast"
-        role="status"
-        aria-live="assertive"
+        role="alert"
         aria-hidden="true"
         hidden
       >
@@ -182,7 +181,7 @@
     </div>
 
     <template id="window-template">
-      <section class="window" role="dialog" aria-modal="false" aria-hidden="true">
+      <section class="window" role="dialog" aria-modal="false" aria-hidden="true" tabindex="-1">
         <div class="window-head">
           <div class="window-head-draggable">
             <span class="window-head-icon"></span>
