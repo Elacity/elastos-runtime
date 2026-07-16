@@ -1957,6 +1957,13 @@ function scheduleDockTooltip(item, delay) {
   }
   window.clearTimeout(dockState.tooltipHideTimer);
   window.clearTimeout(dockState.tooltipShowTimer);
+  /* macOS timing: the first label waits, but while one is already up,
+     sweeping across icons retargets it instantly — no stale label. */
+  const tooltipUp = dockState.tooltipNode && !dockState.tooltipNode.hidden;
+  if (tooltipUp || delay === 0) {
+    showDockTooltip(item, label);
+    return;
+  }
   dockState.tooltipShowTimer = window.setTimeout(() => {
     showDockTooltip(item, label);
   }, delay);
