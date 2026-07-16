@@ -12,6 +12,7 @@ import {
   toolbarInboxButton,
   toolbarFullscreenButton,
   toolbarSignOutButton,
+  identityMenuSystemButton,
   SHELL_APP_ID,
   shellState,
   fetchJson,
@@ -132,9 +133,7 @@ function syncFullscreenButton() {
     return;
   }
   const active = Boolean(fullscreenElement());
-  toolbarFullscreenButton.setAttribute("aria-pressed", active ? "true" : "false");
-  toolbarFullscreenButton.setAttribute("aria-label", active ? "Exit fullscreen" : "Enter fullscreen");
-  toolbarFullscreenButton.title = active ? "Exit fullscreen" : "Fullscreen";
+  toolbarFullscreenButton.textContent = active ? "Exit fullscreen" : "Enter fullscreen";
 }
 
 function toggleShellFullscreen() {
@@ -212,8 +211,7 @@ toolbarInboxButton.addEventListener("click", () => {
 if (toolbarFullscreenButton) {
   const { request, exit } = fullscreenApi();
   if (!request || !exit) {
-    toolbarFullscreenButton.disabled = true;
-    toolbarFullscreenButton.title = "Fullscreen is not available in this browser";
+    toolbarFullscreenButton.hidden = true;
   } else {
     toolbarFullscreenButton.addEventListener("click", toggleShellFullscreen);
     document.addEventListener("fullscreenchange", syncFullscreenButton);
@@ -221,6 +219,13 @@ if (toolbarFullscreenButton) {
     syncFullscreenButton();
   }
 }
+
+identityMenuSystemButton?.addEventListener("click", () => {
+  if (!targetById(shellState.currentSummary, "system")) {
+    return;
+  }
+  openTarget("system");
+});
 
 toolbarSignOutButton?.addEventListener("click", () => {
   document.body.dataset.homeStatus = "booting";

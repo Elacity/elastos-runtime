@@ -311,7 +311,6 @@ img {
   box-shadow:
     inset 0 -0.5px 0 var(--hairline),
     0 1px 12px rgba(0, 0, 0, 0.18);
-  overflow: clip;
   backdrop-filter: blur(10px);
   user-select: none;
   -webkit-user-select: none;
@@ -380,25 +379,128 @@ img {
   height: 17px;
 }
 
-.fullscreen-btn img {
-  width: 15px;
-  height: 15px;
+/* Identity chrome: avatar + name as a disclosure menu. Account actions
+   (fullscreen, system, sign out) live inside — never as naked bar buttons at
+   the same visual weight as the clock. */
+.toolbar-identity {
+  position: relative;
+  margin-left: 12px;
+  display: flex;
+  align-items: center;
+}
+
+.toolbar-identity[hidden] {
+  display: none;
+}
+
+.toolbar-identity-btn {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 26px;
+  padding: 0 8px 0 3px;
+  border-radius: 7px;
+  cursor: pointer;
+  transition: background-color 0.18s ease;
+}
+
+.toolbar-identity-btn:hover,
+.toolbar-identity-btn[aria-expanded="true"] {
+  background-color: rgba(255, 255, 255, 0.15);
+}
+
+.toolbar-identity-btn:focus-visible {
+  outline: 2px solid var(--brand-focus);
+  outline-offset: 1px;
+}
+
+.toolbar-identity-avatar {
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: linear-gradient(180deg, var(--brand-strong), var(--brand));
+  color: #161616;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.toolbar-identity-name {
+  max-width: 140px;
+  overflow: hidden;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  text-overflow: ellipsis;
   opacity: 0.92;
 }
 
-.fullscreen-btn[aria-pressed="true"] {
-  opacity: 1;
-  background-color: rgba(246, 146, 26, 0.18);
+.toolbar-identity-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 100120;
+  min-width: 210px;
+  padding: 5px;
+  display: grid;
+  gap: 2px;
+  border-radius: 12px;
+  background: rgba(22, 24, 29, 0.96);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.34);
+  backdrop-filter: blur(16px);
 }
 
-.sign-out-btn {
+.toolbar-identity-menu[hidden] {
   display: none;
-  flex: 0 0 22px;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9 5H6.8A2.8 2.8 0 0 0 4 7.8v8.4A2.8 2.8 0 0 0 6.8 19H9'/%3E%3Cpath d='M13 8l4 4-4 4'/%3E%3Cpath d='M17 12H8'/%3E%3C/svg%3E");
 }
 
-body[data-home-authority="signed"] .sign-out-btn {
+.toolbar-identity-header {
+  padding: 7px 10px 6px;
+  color: var(--soft);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.toolbar-identity-header strong {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.toolbar-identity-item {
   display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 32px;
+  padding: 0 10px;
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.toolbar-identity-item:hover,
+.toolbar-identity-item:focus-visible {
+  background: rgba(255, 255, 255, 0.08);
+  outline: none;
+}
+
+.toolbar-identity-item:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--brand-focus);
+}
+
+.toolbar-identity-item[hidden] {
+  display: none;
+}
+
+.toolbar-identity-divider {
+  height: 1px;
+  margin: 3px 6px;
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .inbox-btn {

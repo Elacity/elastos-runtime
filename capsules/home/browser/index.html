@@ -34,23 +34,40 @@
         >
           <span id="toolbar-inbox-count" class="toolbar-inbox-count" hidden></span>
         </button>
-        <button
-          id="toolbar-fullscreen"
-          class="toolbar-btn fullscreen-btn"
-          type="button"
-          aria-label="Enter fullscreen"
-          title="Fullscreen"
-          aria-pressed="false"
-        >
-          <img src="./fullscreen.svg" alt="" draggable="false" />
-        </button>
-        <button
-          id="toolbar-sign-out"
-          class="toolbar-btn sign-out-btn"
-          type="button"
-          aria-label="Sign out"
-          title="Sign out"
-        ></button>
+        <div id="toolbar-identity" class="toolbar-identity" hidden>
+          <button
+            id="toolbar-identity-btn"
+            class="toolbar-identity-btn"
+            type="button"
+            aria-haspopup="menu"
+            aria-expanded="false"
+            aria-controls="toolbar-identity-menu"
+          >
+            <span id="toolbar-identity-avatar" class="toolbar-identity-avatar" aria-hidden="true"></span>
+            <span id="toolbar-identity-name" class="toolbar-identity-name"></span>
+          </button>
+          <div
+            id="toolbar-identity-menu"
+            class="toolbar-identity-menu"
+            role="menu"
+            aria-label="Account"
+            hidden
+          >
+            <div class="toolbar-identity-header" role="presentation">
+              Signed in as <strong id="toolbar-identity-menu-name"></strong>
+            </div>
+            <button id="identity-menu-fullscreen" class="toolbar-identity-item" type="button" role="menuitem">
+              Enter fullscreen
+            </button>
+            <button id="identity-menu-system" class="toolbar-identity-item" type="button" role="menuitem">
+              System
+            </button>
+            <div class="toolbar-identity-divider" role="separator"></div>
+            <button id="identity-menu-sign-out" class="toolbar-identity-item" type="button" role="menuitem">
+              Sign out
+            </button>
+          </div>
+        </div>
         <div id="clock" class="toolbar-clock">--:--</div>
       </header>
 
