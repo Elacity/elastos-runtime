@@ -21,6 +21,7 @@ import {
   ignoreRepeatedAction,
   targetById,
   toolbarActiveTitleNode,
+  taskbarTargets,
 } from "./shell-core.js?v=home-20260701c";
 import {
   fitWindowBounds,
@@ -147,6 +148,95 @@ function refreshWindowUi() {
   hooks.updateTaskbarState();
   hooks.refreshLauncherIfVisible();
   syncToolbarActiveTitle();
+}
+
+/* ---- Window lifecycle motion (compositor-only: transform + opacity) ----
+   Logical state (hidden class, windows map, session persistence) always
+   changes synchronously; animation is presentation layered on top, with
+   fallback timers so a missed event can never wedge a window. */
+const WINDOW_EXIT_FALLBACK_MS = 220;
+const WINDOW_MINIMIZE_FALLBACK_MS = 280;
+const windowsReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+
+function playWindowEnter(node) {
+  if (windowsReducedMotion.matches) {
+    return;
+  }
+  node.classList.add("window-enter");
+  node.addEventListener(
+    "animationend",
+    () => {
+      node.classList.remove("window-enter");
+    },
+    { once: true },
+  );
+}
+
+function retireWindowNode(node) {
+  if (windowsReducedMotion.matches || node.classList.contains("hidden")) {
+    node.remove();
+    return;
+  }
+  node.classList.add("window-exit");
+  const finish = () => {
+    node.remove();
+  };
+  node.addEventListener("animationend", finish, { once: true });
+  window.setTimeout(finish, WINDOW_EXIT_FALLBACK_MS);
+}
+
+function dockSlotCenter(targetId) {
+  if (!taskbarTargets || !targetId) {
+    return null;
+  }
+  const button = taskbarTargets.querySelector(
+    `.taskbar-item[data-target="${CSS.escape(targetId)}"]`,
+  );
+  if (!button) {
+    return null;
+  }
+  const rect = button.getBoundingClientRect();
+  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+}
+
+// The window is already logically hidden (class set by the caller); this keeps
+// it painted through `.window-minimizing` while it recedes into its dock slot.
+function playWindowMinimize(entry) {
+  const node = entry.node;
+  const slot = entry.kind === "browser" ? dockSlotCenter(entry.targetId) : null;
+  if (windowsReducedMotion.matches || !slot) {
+    return;
+  }
+  node.classList.add("window-minimizing");
+  const rect = node.getBoundingClientRect();
+  if (rect.width === 0 && rect.height === 0) {
+    node.classList.remove("window-minimizing");
+    return;
+  }
+  const dx = slot.x - (rect.left + rect.width / 2);
+  const dy = slot.y - (rect.top + rect.height / 2);
+  let done = false;
+  const finish = () => {
+    if (done) {
+      return;
+    }
+    done = true;
+    node.classList.remove("window-minimizing");
+    node.style.transform = "";
+    node.style.opacity = "";
+  };
+  window.requestAnimationFrame(() => {
+    node.style.transform = `translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px) scale(0.05)`;
+    node.style.opacity = "0";
+  });
+  node.addEventListener("transitionend", finish, { once: true });
+  window.setTimeout(finish, WINDOW_MINIMIZE_FALLBACK_MS);
+}
+
+function clearWindowMinimizeMotion(node) {
+  node.classList.remove("window-minimizing");
+  node.style.transform = "";
+  node.style.opacity = "";
 }
 
 function currentWindowBounds(node) {
@@ -403,6 +493,8 @@ function restoreWindow(id) {
   }
   entry.node.classList.remove("hidden");
   entry.node.setAttribute("aria-hidden", "false");
+  clearWindowMinimizeMotion(entry.node);
+  playWindowEnter(entry.node);
   armWindowControlGuard(entry.node);
   focusWindow(id, { moveFocus: true });
   persistBrowserSession();
@@ -417,6 +509,7 @@ export function showAllTargetWindows(targetId) {
   for (const entry of entries) {
     entry.node.classList.remove("hidden");
     entry.node.setAttribute("aria-hidden", "false");
+    clearWindowMinimizeMotion(entry.node);
     armWindowControlGuard(entry.node);
   }
   const top = topBrowserWindowEntryForTarget(targetId);
@@ -438,6 +531,7 @@ function hideWindowEntries(entries) {
     entry.node.classList.add("hidden");
     entry.node.classList.remove("window-active");
     entry.node.setAttribute("aria-hidden", "true");
+    playWindowMinimize(entry);
   }
   if (hidActiveWindow) {
     shellState.activeWindowId = null;
@@ -461,7 +555,7 @@ function removeWindowEntries(entries) {
     cleanupFrameAutoFit(entry.node);
     cleanupPeopleDiscoveryAutoRefresh(entry.node);
     shellState.windows.delete(entry.id);
-    entry.node.remove();
+    retireWindowNode(entry.node);
   }
   renderWindowTaskbar();
   if (removedActiveWindow) {
@@ -575,6 +669,7 @@ function createWindow({ id, title, x, y, width, height, tone, glyphTarget }) {
   node.dataset.snap = "";
   node.setAttribute("aria-label", title);
   node.setAttribute("aria-hidden", "false");
+  playWindowEnter(node);
   armWindowControlGuard(node);
   node.style.left = `${bounds.x}px`;
   node.style.top = `${bounds.y}px`;
@@ -2192,6 +2287,7 @@ export function focusWindow(id, { moveFocus = false } = {}) {
   entry.node.classList.remove("hidden");
   entry.node.classList.add("window-active");
   entry.node.setAttribute("aria-hidden", "false");
+  clearWindowMinimizeMotion(entry.node);
   shellState.zIndexCounter += 1;
   entry.node.style.zIndex = String(shellState.zIndexCounter);
   shellState.activeWindowId = id;
