@@ -18,6 +18,12 @@ pub fn build_capability_resource(
     op: &str,
     request: &Value,
 ) -> Result<String, String> {
+    #[cfg(test)]
+    if scheme == "test" {
+        ensure_supported_operation("test", op, &["read"])?;
+        return Ok("elastos://test/bus/probe".to_string());
+    }
+
     match scheme {
         "localhost" => localhost_resource(op, request),
         "ai" => {
@@ -125,6 +131,11 @@ pub fn build_capability_resource(
 /// Canonical capability action for provider operations where the Runtime owns
 /// the operation-to-action contract directly.
 pub fn provider_operation_action(scheme: &str, op: &str) -> Option<Action> {
+    #[cfg(test)]
+    if scheme == "test" {
+        return (op == "read").then_some(Action::Read);
+    }
+
     match scheme {
         "localhost" | "webspace" => localhost_op_required_action(op),
         "ai" | "llama" | "did" => execute_op_required_action(op),

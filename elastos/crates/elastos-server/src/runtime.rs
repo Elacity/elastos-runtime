@@ -537,8 +537,16 @@ mod tests {
         CapsuleType, Permissions, ResourceLimits, ELASTOS_BUS_V1_CONTRACT, SCHEMA_V1,
     };
     use elastos_compute::{CapsuleInfo, ComputeProvider};
+    use elastos_runtime::capability::pending::GrantDuration;
+    use elastos_runtime::capability::{CapabilityManager, CapabilityStore, TokenConstraints};
+    use elastos_runtime::primitives::audit::{AuditEvent, AuditLog};
+    use elastos_runtime::primitives::metrics::MetricsManager;
+    use elastos_runtime::provider::{
+        Provider, ProviderError, ProviderRegistry, ResourceRequest, ResourceResponse,
+    };
     use elastos_storage::providers::LocalFSProvider;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Mutex;
     use wasm_encoder::{
         Component, ComponentImportSection, ComponentTypeRef as EncodedComponentTypeRef,
         ComponentTypeSection, InstanceType,
@@ -584,6 +592,39 @@ mod tests {
 
     struct CountingComputeProvider {
         loads: Arc<AtomicUsize>,
+    }
+
+    #[derive(Default)]
+    struct BusConformanceProvider {
+        requests: Mutex<Vec<serde_json::Value>>,
+    }
+
+    #[async_trait]
+    impl Provider for BusConformanceProvider {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> std::result::Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider(
+                "the Bus conformance provider accepts JSON dispatch only".to_string(),
+            ))
+        }
+
+        fn schemes(&self) -> Vec<&'static str> {
+            vec!["test"]
+        }
+
+        fn name(&self) -> &'static str {
+            "bus-v1-conformance"
+        }
+
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> std::result::Result<serde_json::Value, ProviderError> {
+            self.requests.lock().await.push(request.clone());
+            Ok(serde_json::json!({"status": "ok"}))
+        }
     }
 
     #[async_trait]
@@ -770,5 +811,190 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("component import"));
         assert_eq!(loads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn component_conformance_exercises_bus_authorization_dispatch_and_audit() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(
+            LocalFSProvider::new(temp_dir.path().join("storage"))
+                .await
+                .unwrap(),
+        );
+        let component_provider = Arc::new(ComponentProvider::new());
+        let runtime = Arc::new(Runtime::with_providers_and_component(
+            storage,
+            Vec::new(),
+            None,
+            Some(component_provider.clone()),
+        ));
+        runtime
+            .configure_signature_verification(&[], true)
+            .await
+            .unwrap();
+
+        let audit_log = Arc::new(AuditLog::new());
+        let capability_manager = Arc::new(CapabilityManager::new(
+            Arc::new(CapabilityStore::new()),
+            audit_log.clone(),
+            Arc::new(MetricsManager::new()),
+        ));
+        let pending_store = Arc::new(
+            elastos_runtime::capability::pending::PendingRequestStore::new(audit_log.clone()),
+        );
+        let registry = Arc::new(ProviderRegistry::new());
+        let provider = Arc::new(BusConformanceProvider::default());
+        registry.register(provider.clone()).await;
+        runtime
+            .set_provider_registry(
+                registry,
+                capability_manager.clone(),
+                pending_store.clone(),
+                temp_dir.path().join("runtime-data"),
+            )
+            .await;
+
+        let fixture_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/components/bus-v1");
+        let launch_runtime = runtime.clone();
+        let launch_fixture = fixture_dir.clone();
+        let launch = tokio::spawn(async move {
+            launch_runtime
+                .run_local_with_principal(
+                    &launch_fixture,
+                    Vec::new(),
+                    Some("person:local:bus-conformance".to_string()),
+                )
+                .await
+        });
+
+        let pending = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(request) = pending_store.list_pending().await.into_iter().next() {
+                    break request;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("component must create a pending capability request");
+
+        assert_eq!(pending.resource.as_str(), "elastos://test/bus/probe");
+        assert_eq!(pending.action, elastos_runtime::capability::Action::Read);
+        assert_eq!(pending.reason, "verify the Component-to-Bus authority path");
+        assert!(pending.session_id.as_str().starts_with("component-"));
+
+        let token = capability_manager.grant(
+            pending.session_id.as_str(),
+            pending.resource.clone(),
+            pending.action,
+            TokenConstraints::default(),
+            None,
+        );
+        pending_store
+            .grant_request(pending.id.as_str(), token, GrantDuration::Session)
+            .await
+            .unwrap();
+
+        let handle = tokio::time::timeout(std::time::Duration::from_secs(5), launch)
+            .await
+            .expect("component must finish after the grant")
+            .expect("component launch task must not panic")
+            .expect("component must complete the Bus conformance flow");
+        assert_eq!(handle.manifest.name, "bus-v1-conformance");
+
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["op"], "read");
+        assert_eq!(requests[0]["probe"], "bus-v1-conformance");
+        drop(requests);
+
+        let events = audit_log.recent_events(32);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AuditEvent::CapabilityRequested { resource, .. }
+                if resource == "elastos://test/bus/probe"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AuditEvent::CapabilityUse { capsule_id, success: true, .. }
+                if capsule_id == pending.session_id.as_str()
+        )));
+        let requested_audit = events.iter().find_map(|event| match event {
+            AuditEvent::Custom {
+                event_type,
+                details,
+            } if event_type == "component.invoke.requested" => {
+                details.get("audit_id").and_then(|value| value.as_str())
+            }
+            _ => None,
+        });
+        let completed_audit = events.iter().find_map(|event| match event {
+            AuditEvent::Custom {
+                event_type,
+                details,
+            } if event_type == "component.invoke.completed" => {
+                details.get("audit_id").and_then(|value| value.as_str())
+            }
+            _ => None,
+        });
+        assert!(requested_audit.is_some());
+        assert_eq!(requested_audit, completed_audit);
+
+        let denied_runtime = runtime.clone();
+        let denied_fixture = fixture_dir.clone();
+        let denied_launch = tokio::spawn(async move {
+            denied_runtime
+                .run_local_with_principal(
+                    &denied_fixture,
+                    Vec::new(),
+                    Some("person:local:bus-conformance".to_string()),
+                )
+                .await
+        });
+        let denied_pending = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(request) = pending_store.list_pending().await.into_iter().next() {
+                    break request;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("second component activation must request a capability");
+        let wrong_action_token = capability_manager.grant(
+            denied_pending.session_id.as_str(),
+            denied_pending.resource.clone(),
+            elastos_runtime::capability::Action::Write,
+            TokenConstraints::default(),
+            None,
+        );
+        pending_store
+            .grant_request(
+                denied_pending.id.as_str(),
+                wrong_action_token,
+                GrantDuration::Session,
+            )
+            .await
+            .unwrap();
+
+        let denied = tokio::time::timeout(std::time::Duration::from_secs(5), denied_launch)
+            .await
+            .expect("denied component activation must finish")
+            .expect("denied component task must not panic")
+            .expect_err("wrong-action grant must not authorize provider dispatch");
+        assert!(denied.to_string().contains("Component capsule denied"));
+        assert_eq!(provider.requests.lock().await.len(), 1);
+        assert!(audit_log.recent_events(64).iter().any(|event| matches!(
+            event,
+            AuditEvent::Custom { event_type, details }
+                if event_type == "component.invoke.completed"
+                    && details["capsule_id"] == denied_pending.session_id.as_str()
+                    && details["outcome"] == "denied"
+        )));
+        assert!(matches!(
+            component_provider.status(&handle).await,
+            Err(ElastosError::CapsuleNotFound(_))
+        ));
     }
 }

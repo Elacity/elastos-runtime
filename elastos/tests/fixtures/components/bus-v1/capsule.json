@@ -1,0 +1,21 @@
+{
+  "schema": "elastos.capsule/v1",
+  "version": "0.1.0",
+  "name": "bus-v1-conformance",
+  "description": "Test-only Component fixture for the ElastOS Bus v1 authority path.",
+  "author": "ElastOS",
+  "role": "app",
+  "type": "wasm",
+  "runtime_abi": "elastos.component/v1",
+  "bus_contract": "elastos:bus@v1",
+  "wit_world_sha256": "7a026e0a641c8c04214576dc85a677e0b52c9f02866d231119f9a3ba609d49e2",
+  "execution": "component",
+  "entrypoint": "bus-v1-conformance.component.wasm",
+  "capabilities": [
+    "elastos://test/bus/probe"
+  ],
+  "resources": {
+    "memory_mb": 16,
+    "cpu_shares": 10
+  }
+}

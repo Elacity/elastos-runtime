@@ -1,0 +1,11 @@
+[package]
+name = "elastos-componentize"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+wit-component = "0.247.0"
+
+[workspace]

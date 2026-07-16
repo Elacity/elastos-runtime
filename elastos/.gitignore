@@ -5,6 +5,7 @@
 # Sub-workspace locks are gitignored (independent builds)
 capsules/*/Cargo.lock
 tools/*/Cargo.lock
+!tools/componentize/Cargo.lock
 
 # Node.js
 node_modules/
@@ -23,6 +24,7 @@ Thumbs.db
 # ElastOS
 /storage/
 *.wasm
+!tests/fixtures/components/bus-v1/bus-v1-conformance.component.wasm
 .last-published-cid
 
 
