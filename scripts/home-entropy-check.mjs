@@ -671,12 +671,8 @@ for (const file of activeHtmlFiles) {
   assertStaticControlsAreNamed(file);
 }
 
-const lightTokenFiles = [
-  "capsules/chat-room/browser/style.css",
-  "capsules/gba-emulator/browser/style.css",
-  "capsules/documents/browser/index.html",
-];
-
+// Canonical palettes: migrated capsules alias the shared --el-* tokens
+// (vendored elastos-ui.css); gba-emulator still carries its own light theme.
 const lightTokens = new Map([
   ["--bg", "#edf1fb"],
   ["--bg-strong", "#e3e9fb"],
@@ -695,60 +691,101 @@ const lightTokens = new Map([
   ["--danger", "#b14c5a"],
 ]);
 
-for (const file of lightTokenFiles) {
-  const source = read(file);
+{
+  const gbaStyle = read("capsules/gba-emulator/browser/style.css");
   for (const [token, value] of lightTokens) {
-    assertToken(source, file, token, value);
+    assertToken(gbaStyle, "capsules/gba-emulator/browser/style.css", token, value);
   }
+}
+
+const chatRoomTokensStyle = read("capsules/chat-room/browser/style.css");
+for (const [token, value] of new Map([
+  ["--bg", "var(--el-bg)"],
+  ["--panel", "var(--el-surface)"],
+  ["--panel-strong", "var(--el-surface-raised)"],
+  ["--panel-soft", "var(--el-inset)"],
+  ["--line", "var(--el-hairline)"],
+  ["--line-strong", "var(--el-hairline-strong)"],
+  ["--ink", "var(--el-text)"],
+  ["--muted", "var(--el-muted)"],
+  ["--brand", "var(--el-brand)"],
+  ["--brand-soft", "rgba(246, 146, 26, 0.16)"],
+  ["--accent", "#7d95f0"],
+  ["--accent-soft", "rgba(125, 149, 240, 0.16)"],
+  ["--accent-deep", "#aebfff"],
+  ["--danger", "var(--el-danger)"],
+])) {
+  assertToken(chatRoomTokensStyle, "capsules/chat-room/browser/style.css", token, value);
+}
+
+const documentsIndex = read("capsules/documents/browser/index.html");
+for (const [token, value] of new Map([
+  ["--bg", "var(--el-bg)"],
+  ["--bg-strong", "#10131a"],
+  ["--panel", "rgba(22, 24, 29, 0.78)"],
+  ["--panel-strong", "var(--el-surface-raised)"],
+  ["--panel-soft", "var(--el-inset)"],
+  ["--line", "var(--el-hairline)"],
+  ["--line-strong", "var(--el-hairline-strong)"],
+  ["--ink", "var(--el-text)"],
+  ["--muted", "var(--el-muted)"],
+  ["--brand", "var(--el-brand)"],
+  ["--brand-soft", "rgba(246, 146, 26, 0.16)"],
+  ["--accent", "#7d95f0"],
+  ["--accent-soft", "rgba(125, 149, 240, 0.16)"],
+  ["--accent-deep", "#aebfff"],
+  ["--danger", "var(--el-danger)"],
+])) {
+  assertToken(documentsIndex, "capsules/documents/browser/index.html", token, value);
 }
 
 const inboxStyle = read("capsules/inbox/browser/index.html");
 for (const [token, value] of new Map([
-  ["--bg", "#ffffff"],
-  ["--sidebar-bg", "#f9f9f9"],
-  ["--toolbar-bg", "#fafafa"],
-  ["--panel", "#ffffff"],
-  ["--panel-soft", "#f9f9f9"],
-  ["--line", "#e5e7eb"],
-  ["--line-strong", "#d1d5db"],
-  ["--ink", "#1f2937"],
-  ["--muted", "#6b7280"],
-  ["--brand", "#f6921a"],
-  ["--accent", "#007aff"],
-  ["--accent-soft", "#e5f0ff"],
+  ["--bg", "var(--el-bg)"],
+  ["--sidebar-bg", "rgba(22, 24, 29, 0.78)"],
+  ["--toolbar-bg", "rgba(22, 24, 29, 0.78)"],
+  ["--panel", "var(--el-surface-raised)"],
+  ["--panel-soft", "var(--el-inset)"],
+  ["--line", "var(--el-hairline)"],
+  ["--line-strong", "var(--el-hairline-strong)"],
+  ["--ink", "var(--el-text)"],
+  ["--muted", "var(--el-muted)"],
+  ["--brand", "var(--el-brand)"],
+  ["--accent", "#6ab0ff"],
+  ["--accent-soft", "rgba(106, 176, 255, 0.16)"],
 ])) {
   assertToken(inboxStyle, "capsules/inbox/browser/index.html", token, value);
 }
 
 const systemSettingsStyle = read("capsules/system/browser/style.css");
 for (const [token, value] of new Map([
-  ["--color-settings-bg", "#ffffff"],
-  ["--color-settings-sidebar", "#f9f9f9"],
-  ["--color-settings-card", "#ffffff"],
-  ["--color-bg-tertiary", "#f3f4f6"],
-  ["--color-text-primary", "#1f2937"],
-  ["--color-text-secondary", "#4b5563"],
-  ["--color-text-muted", "#6b7280"],
-  ["--color-border", "#e5e7eb"],
-  ["--color-border-light", "#d1d5db"],
-  ["--color-input-bg", "#ffffff"],
-  ["--color-input-border", "#d1d5db"],
-  ["--color-input-text", "#1f2937"],
+  ["--color-settings-bg", "var(--el-bg)"],
+  ["--color-settings-sidebar", "rgba(22, 24, 29, 0.78)"],
+  ["--color-settings-card", "var(--el-surface-raised)"],
+  ["--color-bg-tertiary", "var(--el-inset)"],
+  ["--color-text-primary", "var(--el-text)"],
+  ["--color-text-secondary", "var(--el-muted)"],
+  ["--color-text-muted", "var(--el-soft)"],
+  ["--color-border", "var(--el-hairline)"],
+  ["--color-border-light", "var(--el-hairline-strong)"],
+  ["--color-input-bg", "var(--el-inset)"],
+  ["--color-input-border", "var(--el-hairline)"],
+  ["--color-input-text", "var(--el-text)"],
 ])) {
   assertToken(systemSettingsStyle, "capsules/system/browser/style.css", token, value);
 }
 
 const libraryStyle = read("capsules/library/browser/library.css");
 for (const [token, value] of new Map([
-  ["--bg", "#f6f7f9"],
-  ["--sidebar-bg", "#f0f1f4"],
-  ["--panel", "#ffffff"],
-  ["--panel-soft", "#f3f4f6"],
-  ["--line", "rgba(60, 60, 67, 0.14)"],
-  ["--ink", "#1d1d1f"],
-  ["--muted", "#6b6b6b"],
-  ["--brand", "#f6921a"],
-  ["--accent", "#007aff"],
+  ["--bg", "var(--el-bg)"],
+  ["--sidebar-bg", "rgba(22, 24, 29, 0.78)"],
+  ["--panel", "var(--el-surface-raised)"],
+  ["--panel-soft", "var(--el-inset)"],
+  ["--line", "var(--el-hairline)"],
+  ["--ink", "var(--el-text)"],
+  ["--muted", "var(--el-muted)"],
+  ["--brand", "var(--el-brand)"],
+  ["--accent", "#6ab0ff"],
 ])) {
   assertToken(libraryStyle, "capsules/library/browser/library.css", token, value);
 }
@@ -796,12 +833,14 @@ assert(
 );
 assert(
   shellStyle.includes('.window[data-maximized="true"]') &&
-    shellStyle.includes("inset: 0 !important;"),
-  "Home maximized windows must own the full viewport",
+    shellStyle.includes(
+      "inset: var(--stage-top) 0 var(--stage-bottom) 0 !important;",
+    ),
+  "Home maximized windows must fill the stage between the system bar and dock",
 );
 assert(
   shellStyle.includes('.window[data-maximized="true"].window-active'),
-  "Home active maximized windows must stack above Home chrome",
+  "Home active maximized windows must stack above sibling windows",
 );
 
 const shellIndex = read("capsules/home/browser/index.html");
@@ -1264,8 +1303,8 @@ assert(
   "Home PWA metadata must include mobile-web-app-capable",
 );
 assert(
-  shellIndex.includes('id="toolbar-fullscreen"'),
-  "Home must expose a fullscreen control in the top toolbar",
+  shellIndex.includes('id="identity-menu-fullscreen"'),
+  "Home must expose a fullscreen control in the identity menu",
 );
 assert(
   shellManifest.name === "ElastOS Home",
@@ -4948,19 +4987,13 @@ assert(
   "Home passkey flow must not flicker from checking copy before the final unlock card",
 );
 assert(
-  shellIndex.includes("toolbar-sign-out") &&
+  shellIndex.includes("identity-menu-sign-out") &&
     shellAuth.includes("/api/auth/sessions/sign-out"),
   "Home must expose an explicit sign-out path that clears the browser session through Runtime",
 );
 assert(
-  shellStyle.includes(".sign-out-btn") &&
-    shellStyle.includes('background-image: url("data:image/svg+xml'),
-  "Home sign-out toolbar icon must use a complete SVG glyph",
-);
-assert(
-  !shellStyle.includes(".sign-out-btn::before") &&
-    !shellStyle.includes(".sign-out-btn::after"),
-  "Home sign-out icon must not use clipped pseudo-element borders",
+  !shellStyle.includes(".sign-out-btn"),
+  "Home sign-out lives in the identity menu; the old toolbar icon styles must not linger",
 );
 assert(
   !identityHandler.includes("host_fallback") &&
@@ -8362,9 +8395,8 @@ assert(
   systemStyle.includes(".pc2-section-title") &&
     systemStyle.includes("font-size: 11px;") &&
     systemStyle.includes("text-transform: uppercase;") &&
-    systemStyle.includes("background: #f9f9f9;") &&
-    systemStyle.includes("border: 1px solid #d0d0d0;"),
-  "System Settings must keep PC2 compact section/card styling",
+    systemStyle.includes("border: 1px solid var(--el-hairline);"),
+  "System Settings must keep PC2 compact section/card styling (dark tokens)",
 );
 assert(
   systemStyle.includes(".webspace-list") &&
