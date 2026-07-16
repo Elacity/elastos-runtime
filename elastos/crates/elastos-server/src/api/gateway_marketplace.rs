@@ -732,10 +732,16 @@ async fn preview_fetch_cached(state: &GatewayState, cid: &str, path: &str) -> Op
         }
     }
     let registry = state.provider_registry.as_ref()?;
-    let bytes =
-        crate::content::fetch_bytes_via_provider(registry, cid, (!path.is_empty()).then_some(path))
-            .await
-            .ok()?;
+    // Interactive preview fetch: bounded so an unresolvable CID fails fast instead of holding
+    // the SERIAL ipfs backend (and every other marketplace fetch behind it) for minutes.
+    let bytes = crate::content::fetch_bytes_via_provider_bounded(
+        registry,
+        cid,
+        (!path.is_empty()).then_some(path),
+        Some(20_000),
+    )
+    .await
+    .ok()?;
     if bytes.is_empty() || bytes.len() > MAX_PREVIEW_FILE {
         return None;
     }
@@ -946,9 +952,19 @@ async fn enrich_from_token_uri(state: &GatewayState, token_uri: &str) -> Option<
     // the bare CID resolves to the directory, not the JSON — fetch the in-dir path when present.
     let subpath = market_reads::extract_cid_subpath(token_uri);
     let registry = state.provider_registry.as_ref()?;
-    let bytes = crate::content::fetch_bytes_via_provider(registry, &cid, subpath.as_deref())
-        .await
-        .ok()?;
+    // metadata.json is small and this fetch sits on every discovery/detail paint: bound it TIGHT.
+    // The backend is SERIAL, so a page of unresolvable CIDs costs (bound × count) wall-clock for
+    // everyone queued behind it — and a metadata.json either resolves in well under a second
+    // (local/cluster) or not at all (DHT-dead mint). Failures are negative-cached by
+    // enrich_fields, so each dead CID pays this bound once per process, not per request.
+    let bytes = crate::content::fetch_bytes_via_provider_bounded(
+        registry,
+        &cid,
+        subpath.as_deref(),
+        Some(2_500),
+    )
+    .await
+    .ok()?;
     let meta: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     serde_json::to_value(market_reads::parse_asset_metadata(&meta)).ok()
 }
@@ -1278,18 +1294,45 @@ async fn compute_enrich_fields(state: &GatewayState, token_uri: &str) -> Option<
 /// on-chain term reads entirely, so the response returns with no new IPFS fetch and no `eth_call` — the
 /// shell paints cards instantly, then issues the full (non-lean) call to fill price/cover/duration. Same
 /// data, same shapes (P10) — lean is a strict subset that never fabricates, only omits.
+/// Warm one asset's descriptive metadata in the BACKGROUND (single-flight per token_uri): the
+/// request path merges only cache hits, so this is the only place an uncached metadata.json fetch
+/// happens for discovery. `enrich_fields` negative-caches failures, so a dead CID is attempted
+/// once per process, and `persist_enrich_cache` write-throughs successes for the next cold start.
+fn spawn_enrich_warm(state: &GatewayState, uri: String) {
+    static IN_FLIGHT: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let in_flight = IN_FLIGHT.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    if let Ok(mut g) = in_flight.lock() {
+        if !g.insert(uri.clone()) {
+            return; // already being warmed
+        }
+    }
+    let s = state.clone();
+    tokio::spawn(async move {
+        let _ = enrich_fields(&s, &uri).await;
+        persist_enrich_cache();
+        if let Ok(mut g) = in_flight.lock() {
+            g.remove(&uri);
+        }
+    });
+}
+
 async fn enrich_listings(
     state: &GatewayState,
     mut listings: Vec<serde_json::Value>,
     lean: bool,
 ) -> Vec<serde_json::Value> {
-    const ENRICH_FETCH_MAX: usize = 24;
+    // Warm budget is deliberately SMALL: each dead-CID warm holds the serial ipfs backend for the
+    // full fetch bound, and an interactive fetch (detail view metadata) queues behind them — 6 ×
+    // ~2.5s caps that queue at ~15s worst, and repeat visits/polls warm the rest progressively.
+    const ENRICH_FETCH_MAX: usize = 6;
     const ENRICH_CONCURRENCY: usize = 8;
-    // Plan which rows to enrich: cache hits are free (always merged); only `ENRICH_FETCH_MAX` NEW fetches
-    // run per request (the rest stay lean and warm on a later load). Built from an immutable pass so the
-    // concurrent fetch below holds no borrow on `listings`.
+    // Plan which rows to enrich: ONLY cache hits are merged into THIS response. Uncached rows are
+    // handed to the background warmer (bounded fetch + negative cache) and stay lean now — the ipfs
+    // backend is SERIAL, so awaiting even a few unresolvable metadata CIDs in the request path
+    // queues MINUTES of wall-clock in front of every other caller (the storefront detail view
+    // included). Discovery never blocks on a fetch; rows fill in as the warmer lands them.
     let mut plan: Vec<(usize, String)> = Vec::new();
-    let mut fetch_budget = if lean { 0 } else { ENRICH_FETCH_MAX };
+    let mut warm_budget = if lean { 0 } else { ENRICH_FETCH_MAX };
     for (i, l) in listings.iter().enumerate() {
         let uri = l
             .get("token_uri")
@@ -1305,16 +1348,15 @@ async fn enrich_listings(
             .is_some_and(|g| g.contains_key(&uri));
         if cached {
             plan.push((i, uri));
-        } else if fetch_budget > 0 {
-            fetch_budget -= 1;
-            plan.push((i, uri));
+        } else if warm_budget > 0 {
+            warm_budget -= 1;
+            spawn_enrich_warm(state, uri);
         }
-        // else: over the per-request fetch budget — leave this row lean
+        // else: over the per-request warm budget — a later load picks the row up
     }
-    // Resolve the planned rows with BOUNDED CONCURRENCY (cache hits return instantly; uncached do their one
-    // IPFS metadata.json fetch in parallel, ENRICH_CONCURRENCY at a time) instead of one-at-a-time — this is
-    // the dominant first-paint cost. `enrich_fields` is internally cached + fail-closed, so concurrent calls
-    // for distinct URIs are safe and never fabricate. Same merged shape as before (P10).
+    // Merge the planned (all-cached) rows with bounded concurrency. `enrich_fields` is internally
+    // cached + fail-closed, so concurrent calls for distinct URIs are safe and never fabricate.
+    // Same merged shape as before (P10).
     let mut set = tokio::task::JoinSet::new();
     let mut pending = plan.into_iter();
     for _ in 0..ENRICH_CONCURRENCY {
@@ -2032,9 +2074,17 @@ async fn fetch_raw_asset_metadata(
     let cid = market_reads::extract_cid(token_uri)?;
     let subpath = market_reads::extract_cid_subpath(token_uri);
     let registry = state.provider_registry.as_ref()?;
-    let bytes = crate::content::fetch_bytes_via_provider(registry, &cid, subpath.as_deref())
-        .await
-        .ok()?;
+    // Acquire-path metadata read: bounded like the other interactive marketplace fetches (a
+    // purchasable asset's metadata.json resolved moments ago on the detail view, so 30s is
+    // generous); on timeout the acquire fails closed with an explicit error, not a hang.
+    let bytes = crate::content::fetch_bytes_via_provider_bounded(
+        registry,
+        &cid,
+        subpath.as_deref(),
+        Some(30_000),
+    )
+    .await
+    .ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 

@@ -2518,6 +2518,19 @@ pub async fn fetch_bytes_via_provider(
     cid: &str,
     path: Option<&str>,
 ) -> anyhow::Result<Vec<u8>> {
+    fetch_bytes_via_provider_bounded(registry, cid, path, None).await
+}
+
+/// Like [`fetch_bytes_via_provider`] but with a per-request fetch bound (ms) forwarded to the
+/// backend. The ipfs-provider is SERIAL: an unbounded cat for a CID nobody provides holds its
+/// pipe for ~10 minutes and starves every other caller — small/interactive fetches (marketplace
+/// metadata.json, cover art) must pass a tight bound and fail fast instead.
+pub async fn fetch_bytes_via_provider_bounded(
+    registry: &ProviderRegistry,
+    cid: &str,
+    path: Option<&str>,
+    timeout_ms: Option<u64>,
+) -> anyhow::Result<Vec<u8>> {
     let mut request = json!({
         "op": "fetch",
         "cid": cid,
@@ -2529,6 +2542,9 @@ pub async fn fetch_bytes_via_provider(
     });
     if let Some(path) = path.filter(|path| !path.is_empty()) {
         request["path"] = Value::String(path.to_string());
+    }
+    if let Some(ms) = timeout_ms {
+        request["timeout_ms"] = json!(ms);
     }
 
     let mut session = registry
@@ -2749,8 +2765,12 @@ impl ContentProvider {
 
         let registry = self.registry()?;
         let transfer = ContentFetchTransfer::from_request(request)?;
+        // Optional per-request fetch bound, forwarded to the SERIAL ipfs backend so an
+        // interactive caller (marketplace metadata, cover art) fails fast on an unresolvable
+        // CID instead of holding the backend pipe for minutes and starving other fetches.
+        let timeout_ms = request.get("timeout_ms").and_then(Value::as_u64);
         let result = match self
-            .fetch_from_local_backend(&registry, cid, path, &transfer)
+            .fetch_from_local_backend(&registry, cid, path, timeout_ms, &transfer)
             .await
         {
             Ok(result) => result,
@@ -2817,6 +2837,7 @@ impl ContentProvider {
         registry: &ProviderRegistry,
         cid: &str,
         path: &str,
+        timeout_ms: Option<u64>,
         transfer: &ContentFetchTransfer,
     ) -> Result<ContentFetchResult, ProviderError> {
         let mut ipfs_request = json!({
@@ -2825,6 +2846,9 @@ impl ContentProvider {
         });
         if !path.is_empty() {
             ipfs_request["path"] = Value::String(path.to_string());
+        }
+        if let Some(ms) = timeout_ms {
+            ipfs_request["timeout_ms"] = json!(ms);
         }
 
         let ipfs_response = self
