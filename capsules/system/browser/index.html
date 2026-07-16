@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>System · ElastOS</title>
+<script src="./elastos-theme.js"></script>
 <link rel="stylesheet" href="./elastos-ui.css">
 <link rel="stylesheet" href="./style.css?v=system-20260625a">
 </head>
@@ -72,6 +73,19 @@
           <section class="pc2-section" aria-labelledby="appearance-title">
             <h2 id="appearance-title" class="pc2-section-title">Appearance</h2>
             <div class="pc2-group">
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Theme</div>
+                    <div class="pc2-card-sublabel">Light or dark across the shell and apps.</div>
+                  </div>
+                  <div id="theme-segment" class="system-segment" role="radiogroup" aria-label="Theme">
+                    <button type="button" class="system-segment-option" data-theme-option="auto" role="radio" aria-checked="false">Auto</button>
+                    <button type="button" class="system-segment-option" data-theme-option="light" role="radio" aria-checked="false">Light</button>
+                    <button type="button" class="system-segment-option" data-theme-option="dark" role="radio" aria-checked="false">Dark</button>
+                  </div>
+                </div>
+              </div>
               <div class="pc2-group-row">
                 <div class="pc2-card-row">
                   <div>

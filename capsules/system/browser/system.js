@@ -208,6 +208,34 @@ function configureAppearanceEditor() {
       backgroundOverlayOpacityInput.addEventListener("change", onBackgroundOverlayChange);
     }
   }
+  configureThemeSegment();
+}
+
+/* Theme lives in the shared vendored runtime (elastos-theme.js): one
+   localStorage key, storage events fan it out to the shell and every open
+   app frame. No gateway round-trip — appearance stays a browser concern. */
+function configureThemeSegment() {
+  const segment = document.querySelector("#theme-segment");
+  if (!segment || !window.elastosTheme) {
+    return;
+  }
+  const options = segment.querySelectorAll("[data-theme-option]");
+  const sync = () => {
+    const preference = window.elastosTheme.preference();
+    for (const option of options) {
+      const selected = option.dataset.themeOption === preference;
+      option.classList.toggle("active", selected);
+      option.setAttribute("aria-checked", selected ? "true" : "false");
+    }
+  };
+  for (const option of options) {
+    option.addEventListener("click", () => {
+      window.elastosTheme.set(option.dataset.themeOption);
+      sync();
+    });
+  }
+  window.addEventListener("storage", sync);
+  sync();
 }
 
 function configureGuestAccess() {

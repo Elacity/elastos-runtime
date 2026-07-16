@@ -18,6 +18,26 @@
   font-family: var(--el-font);
 }
 
+/* Light theme: shared var(--el-*) tokens flip in elastos-ui.css; restore the
+   pre-dark PC2 values for the app-local residue only. */
+:root[data-el-theme="light"] {
+  color-scheme: light;
+  --color-settings-sidebar: #f9f9f9;
+}
+
+:root[data-el-theme="light"] .pc2-btn:hover:not(:disabled),
+:root[data-el-theme="light"] .pc2-btn:focus-visible:not(:disabled),
+:root[data-el-theme="light"] .system-button:hover:not(:disabled),
+:root[data-el-theme="light"] .system-button:focus-visible:not(:disabled) {
+  background: #f3f4f6;
+}
+
+/* The plan output stayed a dark terminal in the original light PC2 look. */
+:root[data-el-theme="light"] .inspect-plan-output {
+  background: #111827;
+  color: #f9fafb;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -373,6 +393,37 @@ code {
   cursor: pointer;
   color: var(--el-text);
   font-size: 12px;
+}
+
+.system-segment {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--el-hairline);
+  border-radius: 8px;
+  background: var(--el-inset);
+}
+
+.system-segment-option {
+  padding: 4px 12px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--el-muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.system-segment-option.active {
+  background: var(--el-surface-raised);
+  color: var(--el-text);
+  box-shadow: var(--el-shadow-1);
+}
+
+.system-segment-option:focus-visible {
+  outline: 2px solid var(--el-focus);
+  outline-offset: 1px;
 }
 
 .system-switch input {
