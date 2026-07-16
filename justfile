@@ -101,6 +101,12 @@ verify-capsules:
 # Fail-closed check for rooted-localhost and Home-first contract drift
 alignment-check:
     ./scripts/check-wci-alignment.sh
+    ./scripts/vendor-ui-tokens.sh --check
+
+# Stamp the shared UI token sheet (capsules/_shared/elastos-ui.css) + Inter
+# font into each participating capsule. Edit the source, run this, commit.
+vendor-ui:
+    ./scripts/vendor-ui-tokens.sh
 
 # Real-PTY source proof: current target-built elastos + current home-cli.wasm against clean-home data
 home-frontdoor-smoke:

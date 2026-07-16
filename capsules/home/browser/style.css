@@ -1,13 +1,5 @@
-/* Inter, self-hosted (latin subset, variable 400-700, OFL). font-display:
-   optional + preload: either the font is ready at first paint or the system
-   stack is used for the whole session — no late swap, no layout shift. */
-@font-face {
-  font-family: "Inter";
-  font-style: normal;
-  font-weight: 400 700;
-  font-display: optional;
-  src: url("./assets/fonts/Inter-latin-var.woff2") format("woff2");
-}
+/* Inter's @font-face lives in the vendored token sheet (elastos-ui.css),
+   loaded before this file. */
 
 :root {
   color-scheme: dark;
@@ -1087,8 +1079,9 @@ img {
   display: grid;
   place-items: end center;
   padding: calc(56px + env(safe-area-inset-top, 0px)) 18px calc(78px + env(safe-area-inset-bottom, 0px));
-  background: rgba(6, 7, 10, 0.12);
-  backdrop-filter: blur(4px);
+  /* Dim only — the full-viewport blur stacked a third live backdrop-filter on
+     top of the popover's own; the popover is the only blurred surface here. */
+  background: rgba(6, 7, 10, 0.32);
 }
 
 .launcher[hidden] {
