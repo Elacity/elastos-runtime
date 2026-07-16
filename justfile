@@ -50,6 +50,7 @@ fmt:
 verify:
     git diff --check
     just alignment-check
+    node scripts/check-elastos-bus-wit.mjs
     node scripts/home-entropy-check.mjs
     node scripts/browser-entropy-check.mjs
     just local-carrier-setup-smoke
@@ -67,6 +68,11 @@ verify-release:
 # Fail-closed check for rooted-localhost and Home-first contract drift
 alignment-check:
     ./scripts/check-wci-alignment.sh
+
+# Verify the checked-in ElastOS Bus contract and real Component fixture
+bus-conformance:
+    node scripts/check-elastos-bus-wit.mjs
+    cd elastos && cargo test -p elastos-server component_runs_through_real_bus_authority_provider_and_audit_paths -- --nocapture
 
 # Real-PTY source proof: current target-built elastos + current home-cli.wasm against clean-home data
 home-frontdoor-smoke:
