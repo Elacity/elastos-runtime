@@ -4,30 +4,31 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Inbox · ElastOS</title>
+  <link rel="stylesheet" href="./elastos-ui.css">
   <style>
     :root {
-      color-scheme: light;
-      --bg: #ffffff;
-      --sidebar-bg: #f9f9f9;
-      --toolbar-bg: #fafafa;
-      --panel: #ffffff;
-      --panel-strong: #ffffff;
-      --panel-soft: #f9f9f9;
-      --line: #e5e7eb;
-      --line-strong: #d1d5db;
-      --ink: #1f2937;
-      --muted: #6b7280;
-      --brand: #f6921a;
-      --accent: #007aff;
-      --accent-soft: #e5f0ff;
-      --danger: #b14c5a;
+      color-scheme: dark;
+      --bg: var(--el-bg);
+      --sidebar-bg: rgba(22, 24, 29, 0.78);
+      --toolbar-bg: rgba(22, 24, 29, 0.78);
+      --panel: var(--el-surface-raised);
+      --panel-strong: var(--el-surface-raised);
+      --panel-soft: var(--el-inset);
+      --line: var(--el-hairline);
+      --line-strong: var(--el-hairline-strong);
+      --ink: var(--el-text);
+      --muted: var(--el-muted);
+      --brand: var(--el-brand);
+      --accent: #6ab0ff;
+      --accent-soft: rgba(106, 176, 255, 0.16);
+      --danger: var(--el-danger);
       --shadow: none;
       --border: var(--line);
       --border-strong: var(--line-strong);
       --text: var(--ink);
       --radius-lg: 8px;
       --radius-md: 6px;
-      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      font-family: var(--el-font);
     }
 
     * {
@@ -38,7 +39,7 @@
       margin: 0;
       min-height: 100vh;
       min-height: 100dvh;
-      background: var(--bg);
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0) 320px) var(--bg);
       color: var(--text);
     }
 
@@ -227,7 +228,7 @@
       border-radius: 6px;
       border: 1px solid var(--border);
       padding: 5px 10px;
-      background: #fff;
+      background: var(--el-inset);
       color: var(--text);
       cursor: pointer;
       font-weight: 600;
@@ -239,7 +240,7 @@
     .entry-action:hover,
     .entry-action:focus-visible {
       border-color: var(--border-strong);
-      background: #f9fafb;
+      background: rgba(255, 255, 255, 0.1);
       outline: none;
     }
 
@@ -256,15 +257,15 @@
       grid-template-columns: minmax(0, 1fr) auto;
       gap: 12px;
       padding: 12px;
-      border: 1px solid #d0d0d0;
+      border: 1px solid var(--line);
       border-radius: 8px;
       background: var(--panel-soft);
       box-shadow: none;
     }
 
     .entry[data-severity="attention"] {
-      border-color: rgba(0, 122, 255, 0.35);
-      background: #f5f9ff;
+      border-color: rgba(106, 176, 255, 0.4);
+      background: rgba(106, 176, 255, 0.08);
     }
 
     .entry-copy {
@@ -323,13 +324,13 @@
     .entry-action.primary {
       background: var(--text);
       border-color: var(--text);
-      color: #f8fbff;
+      color: #0b0d10;
     }
 
     .entry-action.danger {
       color: var(--danger);
-      border-color: rgba(177, 76, 90, 0.24);
-      background: rgba(177, 76, 90, 0.08);
+      border-color: rgba(255, 143, 143, 0.32);
+      background: rgba(255, 143, 143, 0.1);
     }
 
     .entry-action:disabled {
@@ -344,7 +345,7 @@
       place-items: center;
       margin: 12px;
       padding: 20px;
-      border: 1px solid #d0d0d0;
+      border: 1px solid var(--line);
       border-radius: 8px;
       background: var(--panel-soft);
       text-align: center;
