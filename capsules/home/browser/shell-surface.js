@@ -184,6 +184,58 @@ function updateDesktopSelectionState() {
   delete desktopShortcuts.dataset.selectedTarget;
 }
 
+// Spatial (nearest-in-direction) selection so arrows behave sensibly on a
+// free-form icon grid, not just DOM order.
+export function moveDesktopSelection(direction) {
+  const shortcuts = Array.from(desktopShortcuts.querySelectorAll(".desktop-shortcut")).filter(
+    (node) => !node.hidden,
+  );
+  if (shortcuts.length === 0) {
+    return false;
+  }
+  const entryIdOf = (node) => node.dataset.desktopEntryId || node.dataset.target || "";
+  const centerOf = (node) => {
+    const rect = node.getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  };
+  const current = shortcuts.find((node) => entryIdOf(node) === shellState.selectedDesktopTargetId);
+  if (!current) {
+    const first = shortcuts
+      .map((node) => ({ node, center: centerOf(node) }))
+      .sort((a, b) => a.center.y - b.center.y || a.center.x - b.center.x)[0];
+    selectDesktopTarget(entryIdOf(first.node));
+    return true;
+  }
+  const origin = centerOf(current);
+  let best = null;
+  let bestScore = Infinity;
+  for (const node of shortcuts) {
+    if (node === current) {
+      continue;
+    }
+    const center = centerOf(node);
+    const dx = center.x - origin.x;
+    const dy = center.y - origin.y;
+    const along =
+      direction === "left" ? -dx : direction === "right" ? dx : direction === "up" ? -dy : dy;
+    if (along <= 1) {
+      continue;
+    }
+    const cross = direction === "left" || direction === "right" ? Math.abs(dy) : Math.abs(dx);
+    // Weight cross-axis drift heavier so arrows track rows/columns.
+    const score = along + cross * 2.5;
+    if (score < bestScore) {
+      bestScore = score;
+      best = node;
+    }
+  }
+  if (!best) {
+    return false;
+  }
+  selectDesktopTarget(entryIdOf(best));
+  return true;
+}
+
 export function renderTaskbar(summary) {
   taskbarTargets.replaceChildren();
   const pinnedIds = new Set(shellState.shellLayoutState.taskbar);

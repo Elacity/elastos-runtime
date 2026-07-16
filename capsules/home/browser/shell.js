@@ -68,6 +68,7 @@ import {
   showHomeUnlock,
   signOutHome,
 } from "./shell-auth.js?v=home-20260701c";
+import { handleDesktopArrowKey } from "./shell-keyboard.js?v=home-20260701c";
 
 configureWindowHooks({
   clearIdentitySurface,
@@ -280,6 +281,10 @@ desktopShortcuts.addEventListener("keydown", (event) => {
     event.preventDefault();
     event.stopPropagation();
     openSelectedDesktopEntry();
+    return;
+  }
+  if (event.key.startsWith("Arrow") && !event.metaKey && !event.ctrlKey && !event.altKey) {
+    handleDesktopArrowKey(event);
   }
 });
 
