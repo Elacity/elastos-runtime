@@ -1,6 +1,5 @@
 use axum::http::{HeaderMap, HeaderValue};
 use base64::Engine as _;
-#[cfg(test)]
 use rand::RngCore;
 
 use super::*;
@@ -78,7 +77,6 @@ fn home_launch_cookie_header(
     HeaderValue::from_str(&value).map_err(|err| anyhow::anyhow!("invalid Set-Cookie header: {err}"))
 }
 
-#[cfg(test)]
 pub(crate) fn local_home_launch_token_context(
     data_dir: &std::path::Path,
 ) -> anyhow::Result<HomeLaunchTokenContext> {
@@ -93,11 +91,18 @@ pub(crate) fn local_home_launch_token_context(
     })
 }
 
-#[cfg(test)]
 pub(crate) fn uuid_like_token() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
+}
+
+pub(crate) fn issue_local_runtime_home_launch_token(
+    data_dir: &std::path::Path,
+    app: &str,
+) -> anyhow::Result<String> {
+    let context = local_home_launch_token_context(data_dir)?;
+    issue_home_launch_token_with_context(data_dir, app, &context)
 }
 
 #[cfg(test)]

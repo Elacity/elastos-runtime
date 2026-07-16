@@ -415,6 +415,10 @@ fn stage_site(source: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(crate) fn stage_site_from_home(source: &Path) -> anyhow::Result<()> {
+    stage_site(source)
+}
+
 fn print_site_path() -> anyhow::Result<()> {
     let path = site_root_dir();
     println!("Site root:  {}", MY_WEBSITE_URI);

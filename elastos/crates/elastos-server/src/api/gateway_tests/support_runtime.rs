@@ -109,16 +109,16 @@ fn seed_test_browser_capsules(data_dir: &std::path::Path) {
     write_test_browser_capsule(
         data_dir,
         HOME_CAPSULE_ID,
-        "app",
+        "shell",
         "Test Home capsule",
-        Some(r#"<!doctype html><title>Home · ElastOS</title><script src="./shell.js"></script>"#),
+        Some(r#"<!doctype html><title>Home · ElastOS</title><script src="./home-shell-host.js"></script>"#),
     );
     std::fs::write(
         data_dir
             .join("capsules")
             .join(HOME_CAPSULE_ID)
             .join("browser")
-            .join("shell.js"),
+            .join("home-shell-host.js"),
         "window.__TEST_HOME__ = true;",
     )
     .unwrap();
@@ -527,17 +527,19 @@ async fn start_fake_runtime_configured(
         axum::serve(listener, app).await.unwrap();
     });
     let api_url = format!("http://{}", addr);
-    std::fs::write(
-        data_dir.join("runtime-coords.json"),
-        serde_json::to_vec_pretty(&json!({
-            "api_url": api_url,
+    let coords = json!({
+        "api_url": api_url,
             "attach_secret": state.attach_secret,
             "pid": std::process::id(),
             "runtime_kind": crate::runtime_control::RUNTIME_KIND_OPERATOR,
             "binary_sha256": "",
             "policy_sha256": "",
-        }))
-        .unwrap(),
+    });
+    let coords_json = serde_json::to_vec_pretty(&coords).unwrap();
+    std::fs::write(data_dir.join("runtime-coords.json"), &coords_json).unwrap();
+    std::fs::write(
+        crate::runtime_control::home_runtime_coord_path(data_dir),
+        coords_json,
     )
     .unwrap();
     FakeRuntimeHandle {

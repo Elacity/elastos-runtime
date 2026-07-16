@@ -390,6 +390,7 @@ pub async fn run_serve(
         _ => current_binary_sha256().unwrap_or_default(),
     };
     let policy_sha256 = std::env::var("ELASTOS_RUNTIME_POLICY_SHA256").unwrap_or_default();
+    let dependency_sha256 = std::env::var("ELASTOS_RUNTIME_DEPENDENCY_SHA256").unwrap_or_default();
     let coords = crate::runtime_control::RuntimeCoords {
         api_url: format!(
             "http://127.0.0.1:{}",
@@ -400,6 +401,7 @@ pub async fn run_serve(
         runtime_kind: runtime_kind.clone(),
         binary_sha256,
         policy_sha256,
+        dependency_sha256,
     };
     let coords_path = crate::runtime_control::runtime_coord_path(&data_dir);
     if let Err(e) = crate::runtime_control::write_runtime_coords(&coords_path, &coords) {

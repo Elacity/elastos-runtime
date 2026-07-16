@@ -96,7 +96,25 @@ pub fn build_capability_resource(
             op,
             &["status", "metadata_index", "read_bytes", "write_bytes"],
         ),
-        "peer" => simple_elastos_resource("peer", op, &["connect"]),
+        "peer" => simple_elastos_resource(
+            "peer",
+            op,
+            &[
+                "init",
+                "connect",
+                "remember_peer",
+                "get_ticket",
+                "get_node_id",
+                "list_peers",
+                "list_topics",
+                "list_topic_peers",
+                "gossip_join",
+                "gossip_join_peers",
+                "gossip_leave",
+                "gossip_send",
+                "gossip_recv",
+            ],
+        ),
         "tunnel" => simple_elastos_resource("tunnel", op, &["start", "stop", "status", "ping"]),
         "content" => content_resource(op),
         "inspect" => inspect_resource(op),
@@ -160,7 +178,9 @@ fn localhost_resource(op: &str, request: &Value) -> Result<String, String> {
     ensure_supported_operation(
         "localhost",
         op,
-        &["read", "write", "list", "stat", "exists", "resolve", "ping"],
+        &[
+            "read", "write", "list", "delete", "stat", "mkdir", "exists", "resolve", "ping",
+        ],
     )?;
     match request
         .get("path")
@@ -433,6 +453,10 @@ mod tests {
             build_capability_resource("localhost", "read", &bare).unwrap(),
             "localhost://MyWebSite/Documents/demo.md"
         );
+        assert_eq!(
+            build_capability_resource("localhost", "delete", &full).unwrap(),
+            "localhost://MyWebSite/Documents/demo.md"
+        );
     }
 
     #[test]
@@ -462,6 +486,14 @@ mod tests {
         assert_eq!(
             build_capability_resource("peer", "connect", &request).unwrap(),
             "elastos://peer/connect"
+        );
+        assert_eq!(
+            build_capability_resource("peer", "gossip_join", &request).unwrap(),
+            "elastos://peer/gossip_join"
+        );
+        assert_eq!(
+            build_capability_resource("peer", "gossip_recv", &request).unwrap(),
+            "elastos://peer/gossip_recv"
         );
         assert!(build_capability_resource("did", "raw_secret", &request).is_err());
         assert!(build_capability_resource("peer", "raw_socket", &request).is_err());

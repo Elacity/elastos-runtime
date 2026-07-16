@@ -49,6 +49,7 @@ pub async fn provider_proxy(
         .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
 
     enforce_capability(&state, &session, &headers, &resource).await?;
+    attach_localhost_provider_wire_token(&scheme, &op, &headers, &mut request);
 
     // Forward to provider
     let response = state.registry.send_raw(&scheme, &request).await;
@@ -65,6 +66,33 @@ pub async fn provider_proxy(
     };
 
     Ok(Json(response))
+}
+
+fn attach_localhost_provider_wire_token(
+    scheme: &str,
+    op: &str,
+    headers: &HeaderMap,
+    request: &mut Value,
+) {
+    if scheme != "localhost"
+        || !matches!(
+            op,
+            "read" | "write" | "list" | "delete" | "stat" | "mkdir" | "exists"
+        )
+        || request.get("token").is_some()
+    {
+        return;
+    }
+    let Some(token) = headers
+        .get("X-Capability-Token")
+        .and_then(|value| value.to_str().ok())
+        .filter(|token| !token.is_empty())
+    else {
+        return;
+    };
+    if let Some(object) = request.as_object_mut() {
+        object.insert("token".to_string(), Value::String(token.to_string()));
+    }
 }
 
 /// Validate that the session has permission for this provider operation.
@@ -128,9 +156,40 @@ mod tests {
     use super::*;
     use axum::extract::State;
     use axum::http::HeaderMap;
+    use axum::http::HeaderValue;
     use axum::Extension;
     use elastos_runtime::provider::ProviderRegistry;
     use elastos_runtime::session::SessionType;
+
+    #[test]
+    fn localhost_provider_proxy_attaches_validated_header_token_to_wire_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Capability-Token", HeaderValue::from_static("cap-token"));
+        let mut request = serde_json::json!({
+            "op": "read",
+            "path": "localhost://Local/SharedByLocalUsersAndBots/Home/sessions/a/snapshot.json"
+        });
+
+        attach_localhost_provider_wire_token("localhost", "read", &headers, &mut request);
+
+        assert_eq!(
+            request.get("token").and_then(|value| value.as_str()),
+            Some("cap-token")
+        );
+    }
+
+    #[test]
+    fn provider_proxy_does_not_attach_header_token_to_other_providers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Capability-Token", HeaderValue::from_static("cap-token"));
+        let mut request = serde_json::json!({
+            "op": "status"
+        });
+
+        attach_localhost_provider_wire_token("chain", "status", &headers, &mut request);
+
+        assert!(request.get("token").is_none());
+    }
 
     #[tokio::test]
     async fn test_provider_proxy_returns_structured_provider_error() {
@@ -143,9 +202,9 @@ mod tests {
         let response = provider_proxy(
             State(state),
             Extension(session),
-            Path(("peer".to_string(), "gossip_join".to_string())),
+            Path(("chain".to_string(), "networks".to_string())),
             HeaderMap::new(),
-            "{\"topic\":\"#general\"}".to_string(),
+            "{}".to_string(),
         )
         .await
         .expect("provider proxy should return structured JSON");
@@ -160,6 +219,6 @@ mod tests {
             .get("message")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
-            .contains("no provider for scheme: peer"));
+            .contains("no provider for scheme: chain"));
     }
 }

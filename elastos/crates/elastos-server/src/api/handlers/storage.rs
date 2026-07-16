@@ -518,7 +518,7 @@ fn guess_content_type(path: &str) -> &'static str {
         "txt" => "text/plain",
         "html" | "htm" => "text/html",
         "css" => "text/css",
-        "js" => "application/javascript",
+        "js" | "mjs" => "application/javascript",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",

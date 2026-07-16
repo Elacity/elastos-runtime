@@ -19,6 +19,8 @@ pub struct RuntimeCoords {
     pub binary_sha256: String,
     #[serde(default)]
     pub policy_sha256: String,
+    #[serde(default)]
+    pub dependency_sha256: String,
 }
 
 pub const RUNTIME_KIND_OPERATOR: &str = "operator";
@@ -27,7 +29,10 @@ pub const RUNTIME_KIND_MANAGED_CHAT: &str = "managed-chat";
 pub const RUNTIME_KIND_MANAGED_HOME: &str = "managed-home";
 pub const OPERATOR_RUNTIME_REQUIRED_MESSAGE: &str =
     "This command requires a running runtime.\n\n  elastos serve\n\nThen run this command again.";
+pub(crate) const GATEWAY_OWNED_HOME_TERMINAL_ENV: &str = "ELASTOS_GATEWAY_OWNED_HOME_TERMINAL";
 const CARRIER_MDNS_ENV: &str = "ELASTOS_CARRIER_MDNS";
+const MANAGED_RUNTIME_REQUIRED_PROVIDERS: &[&str] =
+    &["localhost-provider", "shell", "did-provider"];
 
 enum ManagedRuntimeStart {
     Owner(ManagedRuntimeStartGuard),
@@ -153,7 +158,7 @@ fn current_process_managed_runtime_child(runtime_kind: &str) -> Option<u32> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn current_process_child_pids() -> Vec<u32> {
     let pid = std::process::id();
     let task_dir = format!("/proc/{pid}/task");
@@ -177,7 +182,39 @@ fn current_process_child_pids() -> Vec<u32> {
     children
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
+fn current_process_child_pids() -> Vec<u32> {
+    let parent_pid = std::process::id();
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut children = Vec::new();
+    for line in stdout.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(pid) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(ppid) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        if ppid == parent_pid {
+            children.push(pid);
+        }
+    }
+    children.sort_unstable();
+    children.dedup();
+    children
+}
+
+#[cfg(target_os = "linux")]
 fn process_env_contains_runtime_kind(pid: u32, runtime_kind: &str) -> bool {
     let env_path = format!("/proc/{pid}/environ");
     let Ok(env) = std::fs::read(env_path) else {
@@ -185,6 +222,22 @@ fn process_env_contains_runtime_kind(pid: u32, runtime_kind: &str) -> bool {
     };
     env.split(|byte| *byte == 0)
         .any(|entry| entry == format!("ELASTOS_RUNTIME_KIND={runtime_kind}").as_bytes())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_env_contains_runtime_kind(pid: u32, runtime_kind: &str) -> bool {
+    let _ = runtime_kind;
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let command = String::from_utf8_lossy(&output.stdout);
+    command.contains("elastos") && command.contains(" serve ") && command.contains(" --addr ")
 }
 
 fn terminate_sibling_managed_runtime_children(runtime_kind: &str, keep_pid: u32) {
@@ -259,7 +312,31 @@ fn managed_runtime_lane_conflict_message(
 fn gateway_owner_allows_subordinate_managed_runtime(
     owner: &crate::host_lock::HostProcessInfo,
 ) -> bool {
-    owner.pid == std::process::id() && matches!(owner.role.as_str(), "gateway" | "gateway-public")
+    if !matches!(owner.role.as_str(), "gateway" | "gateway-public") {
+        return false;
+    }
+    if owner.pid == std::process::id() {
+        return true;
+    }
+    std::env::var_os(GATEWAY_OWNED_HOME_TERMINAL_ENV).as_deref() == Some(std::ffi::OsStr::new("1"))
+        && parent_process_id() == Some(owner.pid)
+}
+
+fn parent_process_id() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        let ppid = unsafe { libc::getppid() };
+        if ppid > 0 {
+            Some(ppid as u32)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 struct SavedTermios(libc::termios);
@@ -363,7 +440,14 @@ fn pid_is_alive(pid: u32) -> bool {
     }
 }
 
-fn home_runtime_coord_path(data_dir: &Path) -> PathBuf {
+fn managed_runtime_coord_path(data_dir: &Path, runtime_kind: &str) -> PathBuf {
+    if runtime_kind == RUNTIME_KIND_MANAGED_HOME {
+        return home_runtime_coord_path(data_dir);
+    }
+    runtime_coord_path(data_dir)
+}
+
+pub(crate) fn home_runtime_coord_path(data_dir: &Path) -> PathBuf {
     data_dir.join("home-runtime-coords.json")
 }
 
@@ -807,7 +891,7 @@ async fn ensure_managed_runtime(
     allow_resources: &[&str],
     surface_name: &str,
 ) -> anyhow::Result<RuntimeCoords> {
-    let coords_path = runtime_coord_path(data_dir);
+    let coords_path = managed_runtime_coord_path(data_dir, runtime_kind);
     // Home boot can issue concurrent app/system/browser requests. Serialize the
     // check/start sequence across processes so only one managed runtime can be
     // spawned for a runtime data directory.
@@ -840,6 +924,7 @@ async fn ensure_managed_runtime(
         "home_launch_auth_data_dir": data_dir.display().to_string(),
     });
     let policy_sha256 = sha256_bytes(serde_json::to_vec(&policy)?.as_slice());
+    let dependency_sha256 = managed_runtime_dependency_sha256();
 
     // 1. Check for existing runtime (operator-started or previous chat-started)
     if let Some(coords) = read_runtime_coords(&coords_path).await {
@@ -863,6 +948,7 @@ async fn ensure_managed_runtime(
                         Some(actual) if actual == expected => {
                             if coords.binary_sha256 == binary_sha256
                                 && coords.policy_sha256 == policy_sha256
+                                && coords.dependency_sha256 == dependency_sha256
                             {
                                 terminate_sibling_managed_runtime_children(
                                     runtime_kind,
@@ -953,7 +1039,7 @@ async fn ensure_managed_runtime(
     //    components.json alone is not sufficient — it's written by install.sh before
     //    any provider binaries are installed.
     let mut missing = Vec::new();
-    for name in &["localhost-provider", "shell", "did-provider"] {
+    for name in MANAGED_RUNTIME_REQUIRED_PROVIDERS {
         if crate::binaries::find_installed_provider_binary(name).is_none() {
             missing.push(*name);
         }
@@ -999,6 +1085,7 @@ async fn ensure_managed_runtime(
         .env("ELASTOS_RUNTIME_KIND", runtime_kind)
         .env("ELASTOS_RUNTIME_BINARY_SHA256", &binary_sha256)
         .env("ELASTOS_RUNTIME_POLICY_SHA256", &policy_sha256)
+        .env("ELASTOS_RUNTIME_DEPENDENCY_SHA256", &dependency_sha256)
         .stdout(std::process::Stdio::from(log_file.try_clone()?))
         .stderr(std::process::Stdio::from(log_file))
         .stdin(std::process::Stdio::null());
@@ -1130,6 +1217,27 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 fn sha256_file(path: &Path) -> anyhow::Result<String> {
     let bytes = std::fs::read(path)?;
     Ok(sha256_bytes(&bytes))
+}
+
+fn managed_runtime_dependency_sha256() -> String {
+    let mut input = String::new();
+    for name in MANAGED_RUNTIME_REQUIRED_PROVIDERS {
+        input.push_str(name);
+        input.push('\n');
+        match crate::binaries::find_installed_provider_binary(name) {
+            Some(path) => {
+                input.push_str(&path.display().to_string());
+                input.push('\n');
+                match sha256_file(&path) {
+                    Ok(hash) => input.push_str(&hash),
+                    Err(err) => input.push_str(&format!("unreadable:{err}")),
+                }
+            }
+            None => input.push_str("missing"),
+        }
+        input.push('\n');
+    }
+    sha256_bytes(input.as_bytes())
 }
 
 fn summarize_runtime_start_failure(log_path: &Path) -> Option<String> {
@@ -1344,6 +1452,24 @@ mod tests {
     }
 
     #[test]
+    fn managed_home_runtime_uses_home_coord_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let override_path = tmp.path().join("override.json");
+        std::env::set_var("ELASTOS_RUNTIME_COORDS_FILE", &override_path);
+
+        assert_eq!(
+            managed_runtime_coord_path(tmp.path(), RUNTIME_KIND_MANAGED_HOME),
+            tmp.path().join("home-runtime-coords.json")
+        );
+        assert_eq!(
+            managed_runtime_coord_path(tmp.path(), RUNTIME_KIND_MANAGED_CHAT),
+            override_path
+        );
+
+        std::env::remove_var("ELASTOS_RUNTIME_COORDS_FILE");
+    }
+
+    #[test]
     fn subordinate_managed_runtime_home_is_nested_under_parent_data_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let home = managed_runtime_child_home_dir(tmp.path(), RUNTIME_KIND_MANAGED_HOME);
@@ -1397,6 +1523,32 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn gateway_owned_terminal_child_allows_parent_gateway_subordinate_runtime() {
+        let _guard = EnvRestore::set(GATEWAY_OWNED_HOME_TERMINAL_ENV, "1");
+        let owner = crate::host_lock::HostProcessInfo {
+            pid: parent_process_id().expect("test process should have a parent"),
+            role: "gateway".to_string(),
+            addr: "127.0.0.1:8090".to_string(),
+        };
+
+        assert!(gateway_owner_allows_subordinate_managed_runtime(&owner));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unmarked_terminal_child_does_not_bypass_foreign_gateway_owner() {
+        let _guard = EnvRestore::remove(GATEWAY_OWNED_HOME_TERMINAL_ENV);
+        let owner = crate::host_lock::HostProcessInfo {
+            pid: parent_process_id().expect("test process should have a parent"),
+            role: "gateway".to_string(),
+            addr: "127.0.0.1:8090".to_string(),
+        };
+
+        assert!(!gateway_owner_allows_subordinate_managed_runtime(&owner));
+    }
+
+    #[test]
     fn foreign_gateway_host_still_conflicts_with_managed_runtime() {
         let owner = crate::host_lock::HostProcessInfo {
             pid: std::process::id().saturating_add(1),
@@ -1405,5 +1557,39 @@ mod tests {
         };
 
         assert!(!gateway_owner_allows_subordinate_managed_runtime(&owner));
+    }
+
+    struct EnvRestore {
+        key: &'static str,
+        value: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self {
+                key,
+                value: previous,
+            }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self {
+                key,
+                value: previous,
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match &self.value {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
     }
 }

@@ -1,15 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use elastos_common::{
-    AffordanceApprovalMode, AffordanceRisk, CapsuleAffordanceDescriptor,
-    CapsuleInterfaceDescriptor, CapsuleManifest, CapsuleRole, CapsuleType,
-};
+use elastos_common::{AffordanceApprovalMode, AffordanceRisk, CapsuleAffordanceDescriptor};
 use serde::{Deserialize, Serialize};
 
 use super::*;
 
-const CAPSULE_CATALOG_SCHEMA: &str = "elastos.capsules.catalog/v1";
-const CAPSULE_INTERFACE_REGISTRY_SCHEMA: &str = "elastos.capsules.interfaces/v1";
+#[path = "gateway_capsule_catalog/read_model.rs"]
+mod read_model;
+
+pub(super) use read_model::{capsule_catalog_summary, capsule_interface_registry_summary};
+
 const CAPSULE_INTERFACE_INVOKE_RESULT_SCHEMA: &str = "elastos.capsules.invoke-result/v1";
 
 pub(super) async fn capsule_catalog(
@@ -173,121 +173,23 @@ pub(super) fn require_capsule_catalog_token(
     data_dir: &std::path::Path,
     headers: &HeaderMap,
 ) -> anyhow::Result<HomeLaunchTokenContext> {
-    require_home_launch_token_for_any_context(
-        data_dir,
-        headers,
-        &[HOME_CAPSULE_ID, MARKETPLACE_CAPSULE_ID, SYSTEM_CAPSULE_ID],
-    )
+    let allowed_apps = capsule_catalog_allowed_apps(data_dir);
+    let allowed_refs = allowed_apps.iter().map(String::as_str).collect::<Vec<_>>();
+    require_home_launch_token_for_any_context(data_dir, headers, &allowed_refs)
 }
 
-pub(super) fn capsule_catalog_summary(data_dir: &std::path::Path) -> CapsuleCatalogResponse {
-    let launch_targets = home_targets(data_dir)
-        .into_iter()
-        .map(|target| (target.target.clone(), target))
-        .collect::<BTreeMap<_, _>>();
-    let components = load_capsule_components(data_dir);
-    let active_components = crate::api::capsule_inventory::active_component_names(data_dir);
-    let installed_names = installed_capsule_names(data_dir, active_components.as_ref());
-
-    let mut capsules = crate::api::capsule_inventory::list_capsule_manifests(data_dir)
-        .into_iter()
-        .map(|manifest| {
-            catalog_capsule_summary(manifest, &launch_targets, &components, &installed_names)
-        })
-        .collect::<Vec<_>>();
-    capsules.sort_by(|left, right| {
-        capsule_category_order(&left.category)
-            .cmp(&capsule_category_order(&right.category))
-            .then_with(|| left.title.cmp(&right.title))
-            .then_with(|| left.name.cmp(&right.name))
-    });
-
-    let mut counts = CapsuleCatalogCounts {
-        total: capsules.len(),
-        ..Default::default()
-    };
-    for capsule in &capsules {
-        match capsule.role.as_str() {
-            "app" => counts.apps += 1,
-            "viewer" => counts.viewers += 1,
-            "provider" => counts.providers += 1,
-            "content" => counts.content += 1,
-            "shell" => counts.shell += 1,
-            _ => {}
-        }
-        counts.interfaces += capsule.interfaces.len();
-        counts.methods += capsule
-            .interfaces
-            .iter()
-            .map(|interface| interface.methods.len())
-            .sum::<usize>();
-        if capsule.launchable {
-            counts.launchable += 1;
-        }
-        if capsule.installed {
-            counts.installed += 1;
+fn capsule_catalog_allowed_apps(data_dir: &std::path::Path) -> Vec<String> {
+    let mut allowed = BTreeSet::from([
+        HOME_CAPSULE_ID.to_string(),
+        MARKETPLACE_CAPSULE_ID.to_string(),
+        SYSTEM_CAPSULE_ID.to_string(),
+    ]);
+    for capsule in capsule_catalog_summary(data_dir).capsules {
+        if capsule.role == CapsuleRole::Shell && capsule.launchable {
+            allowed.insert(capsule.name);
         }
     }
-
-    CapsuleCatalogResponse {
-        schema: CAPSULE_CATALOG_SCHEMA.to_string(),
-        counts,
-        capsules,
-        policy: CapsuleCatalogPolicy {
-            install_state: "signed-app-install-pending".to_string(),
-            install_note: "Marketplace can open installed apps now. Installing new apps will require verified app signatures, receipts, and provider policy.".to_string(),
-            payment_state: "provider-rail-required".to_string(),
-            payment_note: "Paid apps and services must use wallet/payment provider receipts, not embedded payment SDKs.".to_string(),
-            drm_state: "provider-rail-required".to_string(),
-            drm_note: "Protected apps and content must use rights, key, and decrypt providers for dDRM enforcement.".to_string(),
-        },
-    }
-}
-
-pub(super) fn capsule_interface_registry_summary(
-    data_dir: &std::path::Path,
-) -> CapsuleInterfaceRegistryResponse {
-    let catalog = capsule_catalog_summary(data_dir);
-    let mut interfaces = Vec::new();
-    for capsule in catalog.capsules {
-        for interface in capsule.interfaces {
-            interfaces.push(CapsuleInterfaceSummary {
-                capsule: capsule.name.clone(),
-                capsule_version: capsule.version.clone(),
-                title: capsule.title.clone(),
-                role: capsule.role.clone(),
-                capsule_type: capsule.capsule_type.clone(),
-                cid: capsule.cid.clone(),
-                trust_state: capsule.trust_state.clone(),
-                interface,
-            });
-        }
-    }
-
-    let counts = CapsuleInterfaceRegistryCounts {
-        capsules: interfaces
-            .iter()
-            .map(|interface| interface.capsule.as_str())
-            .collect::<BTreeSet<_>>()
-            .len(),
-        interfaces: interfaces.len(),
-        methods: interfaces
-            .iter()
-            .map(|summary| summary.interface.methods.len())
-            .sum(),
-    };
-
-    CapsuleInterfaceRegistryResponse {
-        schema: CAPSULE_INTERFACE_REGISTRY_SCHEMA.to_string(),
-        counts,
-        interfaces,
-        policy: CapsuleInterfaceRegistryPolicy {
-            descriptor_state: "manifest-declared".to_string(),
-            descriptor_note: "Interfaces describe callable affordances declared by installed apps and providers. They are not authority grants; Runtime approval, expiry, and audit still govern invocation.".to_string(),
-            invocation_state: "runtime-gated".to_string(),
-            invocation_note: "0.4.0 executes low-risk Runtime Marketplace bindings and fails closed for high-risk or user-approval methods until approval/provider binding is complete.".to_string(),
-        },
-    }
+    allowed.into_iter().collect()
 }
 
 fn resolve_capsule_affordance(
@@ -487,322 +389,6 @@ fn capsule_invoke_error(
         .into_response()
 }
 
-fn catalog_capsule_summary(
-    manifest: CapsuleManifest,
-    launch_targets: &BTreeMap<String, HomeTargetSummary>,
-    components: &BTreeMap<String, CapsuleComponentInfo>,
-    installed_names: &BTreeSet<String>,
-) -> CapsuleSummary {
-    let target = launch_targets.get(&manifest.name);
-    let component = components.get(&manifest.name);
-    let installed = installed_names.contains(&manifest.name);
-    let name = manifest.name.clone();
-    let role = manifest.role.clone();
-    let capsule_type = manifest.capsule_type.clone();
-    let category = capsule_category(&role);
-    let launchable = target.is_some() && role.is_shell_launchable();
-    let signature_state = if manifest
-        .signature
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
-        "manifest-signature-declared"
-    } else {
-        "no-manifest-signature"
-    };
-    let cid = component
-        .and_then(|entry| entry.cid.as_deref())
-        .filter(|value| !value.trim().is_empty())
-        .map(ToOwned::to_owned);
-    let cid_state = if cid.is_some() {
-        "cid-published"
-    } else {
-        "local-only"
-    };
-
-    CapsuleSummary {
-        name: name.clone(),
-        version: manifest.version,
-        title: target
-            .map(|target| target.title.clone())
-            .unwrap_or_else(|| capsule_title(&name)),
-        description: target
-            .map(|target| target.description.clone())
-            .or_else(|| manifest.description.clone())
-            .unwrap_or_else(|| "Capsule metadata available through Runtime.".to_string()),
-        author: manifest.author,
-        role,
-        capsule_type,
-        category: category.to_string(),
-        state: if installed { "installed" } else { "bundled" }.to_string(),
-        installed,
-        launchable,
-        launch_target: target.map(|target| target.target.clone()),
-        route: target.map(|target| target.route.clone()),
-        provides: manifest.provides,
-        requires: manifest
-            .requires
-            .into_iter()
-            .map(|requirement| CapsuleRequirementSummary {
-                name: requirement.name,
-                kind: format!("{:?}", requirement.kind).to_ascii_lowercase(),
-            })
-            .collect(),
-        capabilities: manifest.capabilities,
-        interfaces: manifest.interfaces,
-        viewer: manifest.viewer,
-        cid,
-        cid_state: cid_state.to_string(),
-        signature_state: signature_state.to_string(),
-        trust_state: capsule_trust_state(signature_state, cid_state).to_string(),
-        payment_state: capsule_payment_state(&name).to_string(),
-        drm_state: capsule_drm_state(&name).to_string(),
-        source: if installed {
-            "installed"
-        } else {
-            "runtime-bundle"
-        }
-        .to_string(),
-        install_path: component.and_then(|entry| entry.install_path.clone()),
-        release_path: component.and_then(|entry| entry.release_path.clone()),
-        repository: component.and_then(|entry| entry.repository.clone()),
-    }
-}
-
-fn capsule_category(role: &CapsuleRole) -> &'static str {
-    match role {
-        CapsuleRole::Shell => "Shells",
-        CapsuleRole::App => "Apps",
-        CapsuleRole::Viewer => "Viewers",
-        CapsuleRole::Provider => "Providers",
-        CapsuleRole::Content => "Content",
-    }
-}
-
-fn capsule_title(name: &str) -> String {
-    name.split(['-', '_'])
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut chars = part.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn capsule_category_order(category: &str) -> u8 {
-    match category {
-        "Apps" => 0,
-        "Viewers" => 1,
-        "Content" => 2,
-        "Providers" => 3,
-        "Shells" => 4,
-        _ => 9,
-    }
-}
-
-fn capsule_trust_state(signature_state: &str, cid_state: &str) -> &'static str {
-    match (signature_state, cid_state) {
-        ("manifest-signature-declared", "cid-published") => "cid-with-manifest-signature",
-        ("manifest-signature-declared", _) => "local-manifest-signature",
-        (_, "cid-published") => "cid-without-manifest-signature",
-        _ => "local-dev",
-    }
-}
-
-fn capsule_payment_state(name: &str) -> &'static str {
-    if name.contains("wallet") {
-        "provider"
-    } else {
-        "not-declared"
-    }
-}
-
-fn capsule_drm_state(name: &str) -> &'static str {
-    if matches!(
-        name,
-        "drm-provider" | "rights-provider" | "key-provider" | "decrypt-provider"
-    ) {
-        "provider"
-    } else {
-        "not-declared"
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct CapsuleComponentInfo {
-    cid: Option<String>,
-    install_path: Option<String>,
-    release_path: Option<String>,
-    repository: Option<String>,
-}
-
-fn load_capsule_components(data_dir: &std::path::Path) -> BTreeMap<String, CapsuleComponentInfo> {
-    let Ok(bytes) = std::fs::read(data_dir.join("components.json")) else {
-        return BTreeMap::new();
-    };
-    let Ok(manifest) = serde_json::from_slice::<crate::setup::ComponentsManifest>(&bytes) else {
-        return BTreeMap::new();
-    };
-    let mut entries = BTreeMap::new();
-    for (name, capsule) in manifest.capsules {
-        entries.insert(
-            name,
-            CapsuleComponentInfo {
-                cid: Some(capsule.cid),
-                install_path: None,
-                release_path: None,
-                repository: capsule.repository,
-            },
-        );
-    }
-    for (name, component) in manifest.external {
-        let platform = component
-            .platforms
-            .get("*")
-            .or_else(|| component.platforms.values().next());
-        entries
-            .entry(name)
-            .and_modify(|entry| {
-                if entry.cid.as_deref().unwrap_or("").is_empty() {
-                    entry.cid = platform.and_then(|platform| platform.cid.clone());
-                }
-                if entry.install_path.is_none() {
-                    entry.install_path = component.install_path.clone();
-                }
-                if entry.release_path.is_none() {
-                    entry.release_path =
-                        platform.and_then(|platform| platform.release_path.clone());
-                }
-                if entry.repository.is_none() {
-                    entry.repository = component.repository.clone();
-                }
-            })
-            .or_insert_with(|| CapsuleComponentInfo {
-                cid: platform.and_then(|platform| platform.cid.clone()),
-                repository: component.repository,
-                install_path: component.install_path,
-                release_path: platform.and_then(|platform| platform.release_path.clone()),
-            });
-    }
-    entries
-}
-
-fn installed_capsule_names(
-    data_dir: &std::path::Path,
-    active_components: Option<&BTreeSet<String>>,
-) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
-    let root = data_dir.join("capsules");
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return names;
-    };
-    for entry in entries.flatten() {
-        let dir = entry.path();
-        let Some(name) = dir.file_name().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        if crate::api::capsule_inventory::installed_capsule_is_inactive(
-            data_dir,
-            &dir,
-            name,
-            active_components,
-        ) {
-            continue;
-        }
-        if crate::api::capsule_inventory::load_capsule_manifest(&dir, name).is_some() {
-            names.insert(name.to_string());
-        }
-    }
-    names
-}
-
-#[derive(Serialize)]
-pub(super) struct CapsuleCatalogResponse {
-    schema: String,
-    counts: CapsuleCatalogCounts,
-    capsules: Vec<CapsuleSummary>,
-    policy: CapsuleCatalogPolicy,
-}
-
-#[derive(Default, Serialize)]
-struct CapsuleCatalogCounts {
-    total: usize,
-    installed: usize,
-    launchable: usize,
-    interfaces: usize,
-    methods: usize,
-    apps: usize,
-    viewers: usize,
-    providers: usize,
-    content: usize,
-    shell: usize,
-}
-
-#[derive(Serialize)]
-struct CapsuleCatalogPolicy {
-    install_state: String,
-    install_note: String,
-    payment_state: String,
-    payment_note: String,
-    drm_state: String,
-    drm_note: String,
-}
-
-#[derive(Serialize)]
-struct CapsuleSummary {
-    name: String,
-    version: String,
-    title: String,
-    description: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    author: Option<String>,
-    role: CapsuleRole,
-    #[serde(rename = "type")]
-    capsule_type: CapsuleType,
-    category: String,
-    state: String,
-    installed: bool,
-    launchable: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    launch_target: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    route: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    provides: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    requires: Vec<CapsuleRequirementSummary>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    capabilities: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    interfaces: Vec<CapsuleInterfaceDescriptor>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    viewer: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cid: Option<String>,
-    cid_state: String,
-    signature_state: String,
-    trust_state: String,
-    payment_state: String,
-    drm_state: String,
-    source: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    install_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    release_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    repository: Option<String>,
-}
-
-#[derive(Serialize)]
-struct CapsuleRequirementSummary {
-    name: String,
-    kind: String,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct CapsuleInterfaceInvokeRequest {
@@ -829,43 +415,6 @@ struct ResolvedCapsuleAffordance {
     capsule: String,
     interface_id: String,
     method: CapsuleAffordanceDescriptor,
-}
-
-#[derive(Serialize)]
-pub(super) struct CapsuleInterfaceRegistryResponse {
-    schema: String,
-    counts: CapsuleInterfaceRegistryCounts,
-    interfaces: Vec<CapsuleInterfaceSummary>,
-    policy: CapsuleInterfaceRegistryPolicy,
-}
-
-#[derive(Default, Serialize)]
-struct CapsuleInterfaceRegistryCounts {
-    capsules: usize,
-    interfaces: usize,
-    methods: usize,
-}
-
-#[derive(Serialize)]
-struct CapsuleInterfaceSummary {
-    capsule: String,
-    capsule_version: String,
-    title: String,
-    role: CapsuleRole,
-    #[serde(rename = "type")]
-    capsule_type: CapsuleType,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cid: Option<String>,
-    trust_state: String,
-    interface: CapsuleInterfaceDescriptor,
-}
-
-#[derive(Serialize)]
-struct CapsuleInterfaceRegistryPolicy {
-    descriptor_state: String,
-    descriptor_note: String,
-    invocation_state: String,
-    invocation_note: String,
 }
 
 #[cfg(test)]
@@ -930,17 +479,41 @@ mod tests {
     #[test]
     fn capsule_catalog_lists_roles_and_launchable_capsules() {
         let data_dir = tempfile::tempdir().unwrap();
+        write_capsule(data_dir.path(), "home", "app", "wasm");
+        write_capsule(data_dir.path(), "home-gui", "shell", "wasm");
+        write_capsule(data_dir.path(), "home-cli", "shell", "wasm");
         write_capsule(data_dir.path(), "marketplace", "app", "wasm");
         write_capsule(data_dir.path(), "documents", "viewer", "wasm");
         write_capsule(data_dir.path(), "object-provider", "provider", "microvm");
 
         let catalog = capsule_catalog_summary(data_dir.path());
 
-        assert_eq!(catalog.schema, CAPSULE_CATALOG_SCHEMA);
+        assert_eq!(catalog.schema, read_model::CAPSULE_CATALOG_SCHEMA);
         assert!(catalog.counts.total >= 3);
         assert!(catalog.counts.apps >= 1);
         assert!(catalog.counts.viewers >= 1);
         assert!(catalog.counts.providers >= 1);
+        assert!(catalog.counts.shell >= 1);
+        let home = catalog
+            .capsules
+            .iter()
+            .find(|capsule| capsule.name == "home")
+            .unwrap();
+        assert!(!home.launchable);
+        assert_eq!(home.role, CapsuleRole::App);
+        assert_eq!(home.route.as_deref(), None);
+        assert_eq!(home.projection.schema, "elastos.capsule.projection/v1");
+        assert_eq!(home.projection.web.state, "not-launchable");
+        assert_eq!(home.projection.web.route.as_deref(), None);
+        assert_eq!(home.projection.cli.state, "facts-only");
+        assert_eq!(home.projection.facts.state, "available");
+        let launchable_shells = catalog
+            .capsules
+            .iter()
+            .filter(|capsule| capsule.role == CapsuleRole::Shell && capsule.launchable)
+            .map(|capsule| capsule.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(launchable_shells, vec!["home-cli", "home-gui"]);
         let marketplace = catalog
             .capsules
             .iter()
@@ -948,12 +521,15 @@ mod tests {
             .unwrap();
         assert!(marketplace.launchable);
         assert_eq!(marketplace.trust_state, "local-manifest-signature");
+        assert_eq!(marketplace.projection.web.state, "available");
         let provider = catalog
             .capsules
             .iter()
             .find(|capsule| capsule.name == "object-provider")
             .unwrap();
         assert!(!provider.launchable);
+        assert_eq!(provider.projection.web.state, "provider-only");
+        assert_eq!(provider.projection.carrier.state, "service-endpoint");
         assert!(provider.repository.is_none());
     }
 
@@ -998,26 +574,248 @@ mod tests {
             }),
         );
         let catalog = capsule_catalog_summary(data_dir.path());
-        assert_eq!(catalog.counts.interfaces, 1);
-        assert_eq!(catalog.counts.methods, 2);
+        assert!(catalog.counts.interfaces >= 1);
+        assert!(catalog.counts.methods >= 2);
         let marketplace = catalog
             .capsules
             .iter()
             .find(|capsule| capsule.name == "marketplace")
             .unwrap();
         assert_eq!(marketplace.interfaces[0].id, "elastos.marketplace.catalog");
+        assert_eq!(marketplace.interfaces.len(), 1);
+        assert_eq!(marketplace.interfaces[0].methods.len(), 2);
+        assert_eq!(marketplace.projection.affordances.state, "declared");
+        assert_eq!(marketplace.projection.gates.state, "declared");
+        assert_eq!(marketplace.projection.audit_mirror.state, "redacted");
+        assert!(marketplace
+            .projection
+            .cli
+            .schemas
+            .contains(&read_model::CAPSULE_INTERFACE_REGISTRY_SCHEMA.to_string()));
+        let serialized = serde_json::to_value(&catalog).unwrap();
+        let marketplace_json = serialized["capsules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|capsule| capsule["name"] == "marketplace")
+            .unwrap();
+        assert_eq!(
+            marketplace_json["projection"]["schema"],
+            "elastos.capsule.projection/v1"
+        );
+        assert_eq!(
+            marketplace_json["projection"]["affordances"]["state"],
+            "declared"
+        );
 
         let registry = capsule_interface_registry_summary(data_dir.path());
-        assert_eq!(registry.schema, CAPSULE_INTERFACE_REGISTRY_SCHEMA);
-        assert_eq!(registry.counts.capsules, 1);
-        assert_eq!(registry.counts.interfaces, 1);
-        assert_eq!(registry.counts.methods, 2);
-        assert_eq!(registry.interfaces[0].capsule, "marketplace");
         assert_eq!(
-            registry.interfaces[0].interface.methods[1].id,
-            "capsule.open"
+            registry.schema,
+            read_model::CAPSULE_INTERFACE_REGISTRY_SCHEMA
         );
+        assert!(registry.counts.capsules >= 1);
+        assert!(registry.counts.interfaces >= 1);
+        assert!(registry.counts.methods >= 2);
+        let marketplace_registry = registry
+            .interfaces
+            .iter()
+            .find(|interface| interface.capsule == "marketplace")
+            .unwrap();
+        assert_eq!(marketplace_registry.interface.methods[1].id, "capsule.open");
         assert_eq!(registry.policy.invocation_state, "runtime-gated");
+    }
+
+    #[test]
+    fn first_party_capsules_have_complete_projection_contract() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let manifests = crate::api::capsule_inventory::list_capsule_manifests(data_dir.path());
+        let manifest_names = manifests
+            .iter()
+            .map(|manifest| manifest.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            manifest_names.len() >= 30,
+            "expected the first-party development capsule set to be visible"
+        );
+
+        let catalog = capsule_catalog_summary(data_dir.path());
+        assert_eq!(catalog.schema, read_model::CAPSULE_CATALOG_SCHEMA);
+        assert_eq!(catalog.counts.total, catalog.capsules.len());
+        let catalog_names = catalog
+            .capsules
+            .iter()
+            .map(|capsule| capsule.name.as_str())
+            .collect::<BTreeSet<_>>();
+        for name in &manifest_names {
+            assert!(
+                catalog_names.contains(name),
+                "first-party capsule {name} was missing from the Runtime catalog"
+            );
+        }
+
+        let catalog_interface_count = catalog
+            .capsules
+            .iter()
+            .map(|capsule| capsule.interfaces.len())
+            .sum::<usize>();
+        let catalog_method_count = catalog
+            .capsules
+            .iter()
+            .flat_map(|capsule| capsule.interfaces.iter())
+            .map(|interface| interface.methods.len())
+            .sum::<usize>();
+        assert_eq!(catalog.counts.interfaces, catalog_interface_count);
+        assert_eq!(catalog.counts.methods, catalog_method_count);
+
+        for required in [
+            HOME_CAPSULE_ID,
+            "home-gui",
+            "home-cli",
+            "browser",
+            "wallet",
+            "inbox",
+            "services",
+            SYSTEM_CAPSULE_ID,
+            "library",
+            "documents",
+            "object-provider",
+            "wallet-provider",
+            "net-provider",
+            "exit-provider",
+        ] {
+            assert!(
+                catalog_names.contains(required),
+                "required first-party capsule {required} was missing"
+            );
+        }
+        let launchable_shells = catalog
+            .capsules
+            .iter()
+            .filter(|capsule| capsule.role == CapsuleRole::Shell && capsule.launchable)
+            .map(|capsule| capsule.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(launchable_shells, vec!["home-cli", "home-gui"]);
+        let home_gui = catalog
+            .capsules
+            .iter()
+            .find(|capsule| capsule.name == "home-gui")
+            .expect("home-gui must remain a first-party shell identity");
+        assert!(
+            home_gui.description.contains("host-loaded"),
+            "home-gui must be described as host-loaded until it has a true isolated shell attach path"
+        );
+
+        for capsule in &catalog.capsules {
+            let projection = &capsule.projection;
+            assert_eq!(projection.schema, "elastos.capsule.projection/v1");
+            for (surface_name, surface) in [
+                ("web", &projection.web),
+                ("cli", &projection.cli),
+                ("facts", &projection.facts),
+                ("affordances", &projection.affordances),
+                ("gates", &projection.gates),
+                ("audit_mirror", &projection.audit_mirror),
+                ("carrier", &projection.carrier),
+            ] {
+                assert!(
+                    !surface.state.trim().is_empty(),
+                    "{} projection {} state was empty",
+                    capsule.name,
+                    surface_name
+                );
+                assert!(
+                    !surface.source.trim().is_empty(),
+                    "{} projection {} source was empty",
+                    capsule.name,
+                    surface_name
+                );
+            }
+            assert!(projection
+                .cli
+                .schemas
+                .contains(&read_model::CAPSULE_CATALOG_SCHEMA.to_string()));
+            assert!(projection
+                .cli
+                .schemas
+                .contains(&read_model::CAPSULE_INTERFACE_REGISTRY_SCHEMA.to_string()));
+            assert_eq!(
+                projection.facts.route.as_deref(),
+                Some("/api/capsules/catalog")
+            );
+            assert!(projection
+                .facts
+                .schemas
+                .contains(&"elastos.esp.initialize/v0".to_string()));
+            assert_eq!(
+                projection.affordances.route.as_deref(),
+                Some("/api/capsules/interfaces")
+            );
+            assert_eq!(
+                projection.gates.route.as_deref(),
+                Some("/api/esp/initialize")
+            );
+            assert_eq!(projection.audit_mirror.state, "redacted");
+            assert!(projection
+                .audit_mirror
+                .schemas
+                .contains(&"elastos.inspect.object/v1".to_string()));
+
+            if capsule.interfaces.is_empty() {
+                assert_eq!(projection.affordances.state, "absent");
+                assert_eq!(projection.gates.state, "absent");
+            } else {
+                assert_eq!(projection.affordances.state, "declared");
+                assert_eq!(projection.gates.state, "declared");
+            }
+            if capsule.launchable {
+                assert_eq!(projection.web.state, "available");
+                assert!(
+                    projection.web.route.is_some(),
+                    "launchable capsule {} must expose a web route",
+                    capsule.name
+                );
+            }
+            if capsule.role == CapsuleRole::Provider || capsule.provides.is_some() {
+                assert!(
+                    matches!(
+                        projection.carrier.state.as_str(),
+                        "service-endpoint" | "requires-provider-intents"
+                    ),
+                    "provider capsule {} must project a Carrier/provider surface, got {}",
+                    capsule.name,
+                    projection.carrier.state
+                );
+            }
+        }
+
+        let registry = capsule_interface_registry_summary(data_dir.path());
+        assert_eq!(
+            registry.schema,
+            read_model::CAPSULE_INTERFACE_REGISTRY_SCHEMA
+        );
+        assert_eq!(registry.counts.interfaces, catalog_interface_count);
+        assert_eq!(registry.counts.methods, catalog_method_count);
+        assert_eq!(
+            registry.counts.capsules,
+            registry
+                .interfaces
+                .iter()
+                .map(|interface| interface.capsule.as_str())
+                .collect::<BTreeSet<_>>()
+                .len()
+        );
+        for interface in &registry.interfaces {
+            assert!(
+                catalog_names.contains(interface.capsule.as_str()),
+                "interface registry referenced unknown capsule {}",
+                interface.capsule
+            );
+            assert!(
+                !interface.interface.id.trim().is_empty(),
+                "interface registry contained an empty interface id for {}",
+                interface.capsule
+            );
+        }
     }
 
     #[test]

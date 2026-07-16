@@ -1,9 +1,42 @@
 use super::*;
 
+const HOME_CLI_CAPSULE_ID_FOR_TEST: &str = "home-cli";
+
+struct EnvRestore {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl EnvRestore {
+    fn set(key: &'static str, value: String) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_home_static_route_serves_browser_surface() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
+    std::fs::write(
+        dir.path()
+            .join("capsules")
+            .join(SYSTEM_CAPSULE_ID)
+            .join("browser")
+            .join("esp-projections.mjs"),
+        "export const ok = true;",
+    )
+    .unwrap();
 
     let resp = app
         .clone()
@@ -35,7 +68,7 @@ async fn test_home_static_route_serves_browser_surface() {
         .unwrap();
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("Home · ElastOS"));
-    assert!(text.contains("./shell.js"));
+    assert!(text.contains("./home-shell-host.js"));
 
     let unsigned_summary = app
         .clone()
@@ -78,9 +111,10 @@ async fn test_home_static_route_serves_browser_surface() {
     );
 
     let asset = app
+        .clone()
         .oneshot(
             Request::builder()
-                .uri("/apps/home/shell.js")
+                .uri("/apps/home/home-shell-host.js")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -94,6 +128,250 @@ async fn test_home_static_route_serves_browser_surface() {
             .and_then(|value| value.to_str().ok()),
         Some("application/javascript")
     );
+
+    let module_asset = app
+        .oneshot(
+            Request::builder()
+                .uri("/apps/system/esp-projections.mjs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(module_asset.status(), StatusCode::OK);
+    assert_eq!(
+        module_asset
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/javascript")
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let _program = EnvRestore::set("ELASTOS_HOME_CLI_TERMINAL_PROGRAM", "/bin/sh".to_string());
+    let _args = EnvRestore::set(
+        "ELASTOS_HOME_CLI_TERMINAL_ARGS_JSON",
+        serde_json::json!([
+            "-c",
+            "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; [ \"$line\" = exit ] && exit 0; done"
+        ])
+        .to_string(),
+    );
+    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority_with_name(dir.path(), Some("terminal"));
+    let home_token = authority.home_token.clone();
+    let cli_token = app_token_for_authority(dir.path(), HOME_CLI_CAPSULE_ID_FOR_TEST, &authority);
+
+    let contract = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/apps/home-cli/terminal/contract")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(contract.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(contract.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let contract: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(contract["schema"], "elastos.home-cli.terminal-contract/v1");
+    assert_eq!(contract["transport"], "runtime_pty_stream");
+    assert!(contract["renderer_contract"]
+        .as_str()
+        .unwrap()
+        .contains("xterm.js"));
+    assert!(contract["pty"]
+        .as_str()
+        .unwrap()
+        .contains("Runtime-owned PTY"));
+
+    let missing = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home-cli/terminal/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+
+    let wrong_app = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home-cli/terminal/sessions")
+                .header("x-elastos-home-token", home_token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_app.status(), StatusCode::FORBIDDEN);
+
+    let started = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home-cli/terminal/sessions")
+                .header("x-elastos-home-token", cli_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "schema": "elastos.home-cli.terminal-start/v1",
+                        "cols": 132,
+                        "rows": 36
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(started.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(started.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let started: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(started["schema"], "elastos.home-cli.terminal-session/v1");
+    assert_eq!(started["transport"], "runtime_pty_stream");
+    assert_eq!(started["pty"], true);
+    assert_eq!(started["authority"]["app"], HOME_CLI_CAPSULE_ID_FOR_TEST);
+    assert_eq!(started["dimensions"]["cols"], 132);
+    assert_eq!(started["dimensions"]["rows"], 36);
+    assert_eq!(started["process"]["mode"], "tui");
+    assert_eq!(started["stream"]["schema"], "elastos.runtime.stream/v1");
+    assert_eq!(
+        started["stream"]["resize_schema"],
+        "elastos.home-cli.terminal-resize/v1"
+    );
+    assert!(started["stream"]["resize_url"]
+        .as_str()
+        .unwrap()
+        .ends_with("/resize"));
+    let session_id = started["session_id"].as_str().unwrap();
+    let events_url = started["stream"]["events_url"].as_str().unwrap();
+    let input_url = started["stream"]["input_url"].as_str().unwrap();
+    let resize_url = started["stream"]["resize_url"].as_str().unwrap();
+    let close_url = started["stream"]["close_url"].as_str().unwrap();
+    assert!(events_url.contains(session_id));
+    assert!(!events_url.contains("home_token="));
+    assert!(events_url.contains("ticket="));
+
+    let bad_events = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/apps/home-cli/terminal/sessions/{session_id}/events?ticket=wrong"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_events.status(), StatusCode::FORBIDDEN);
+
+    let wrong_input = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(input_url)
+                .header("x-elastos-home-token", home_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "schema": "elastos.home-cli.terminal-input/v1",
+                        "data": "hello\n"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_input.status(), StatusCode::FORBIDDEN);
+
+    let resize = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(resize_url)
+                .header("x-elastos-home-token", cli_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "schema": "elastos.home-cli.terminal-resize/v1",
+                        "cols": 90,
+                        "rows": 24
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resize.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resize.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let resize: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(resize["schema"], "elastos.home-cli.terminal-resize/v1");
+    assert_eq!(resize["dimensions"]["cols"], 90);
+    assert_eq!(resize["dimensions"]["rows"], 24);
+
+    let input = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(input_url)
+                .header("x-elastos-home-token", cli_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "schema": "elastos.home-cli.terminal-input/v1",
+                        "data": "exit\n"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(input.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(input.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let input: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(input["schema"], "elastos.home-cli.terminal-input/v1");
+    assert_eq!(input["session_id"], session_id);
+
+    let closed = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(close_url)
+                .header("x-elastos-home-token", cli_token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(closed.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -271,7 +549,7 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     );
     assert_eq!(library["route"], "/apps/library/");
     assert_eq!(library["attach_kind"], "iframe");
-    assert_eq!(library["target_kind"], "object");
+    assert_eq!(library["target_kind"], "app");
     let inbox = targets
         .iter()
         .find(|target| target["target"] == "inbox")
@@ -506,6 +784,17 @@ async fn test_services_summary_projects_configured_remote_exit_without_ticket() 
     assert_eq!(offer["status"], "active");
     assert_eq!(offer["enabled"], true);
     assert_eq!(offer["grant_required"], false);
+
+    let snapshot = home_services_snapshot(dir.path());
+    let snapshot_text = snapshot.to_string();
+    assert!(!snapshot_text.contains("connect_ticket"));
+    assert!(!snapshot_text.contains("ticket:must-not-leak"));
+    assert_eq!(snapshot["remote_offer_count"], 1);
+    assert!(snapshot["remote_offers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|offer| offer["offer_id"] == "configured:remote-exit:mac-browser-exit"));
 
     let remove = app
         .oneshot(
@@ -1364,6 +1653,7 @@ async fn test_people_discovery_toggle_persists_in_home_summary() {
     assert!(remaining > 0 && remaining <= 600);
 
     let summary = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/apps/home/summary")
@@ -2853,6 +3143,7 @@ async fn test_people_contact_remove_hides_accepted_conversation_contact_locally(
     );
 
     let summary = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/apps/home/summary")
@@ -3441,6 +3732,18 @@ async fn test_system_summary_reports_identity_and_app_id() {
     assert_eq!(payload["app"]["route"], "/apps/system/");
     assert_eq!(payload["runtime"]["running"], false);
     assert_eq!(payload["runtime"]["version"], env!("ELASTOS_VERSION"));
+    assert_eq!(payload["source"]["configured"], false);
+    assert_eq!(payload["source"]["channel"], "not configured");
+    assert_eq!(payload["source"]["installed_version"], "unknown");
+    assert_eq!(
+        payload["source"]["runtime_version"],
+        env!("ELASTOS_VERSION")
+    );
+    assert_eq!(payload["source"]["update_checks_allowed"], false);
+    assert!(payload["source"]["update_policy"]
+        .as_str()
+        .unwrap()
+        .contains("No trusted source configured"));
     assert_eq!(payload["storage"]["available"], false);
     assert_eq!(payload["storage"]["note"], "Document provider unavailable.");
     let webspace_entries = payload["webspace"]["entries"].as_array().unwrap();
@@ -3458,6 +3761,74 @@ async fn test_system_summary_reports_identity_and_app_id() {
     }));
     assert!(payload.get("instance").is_none());
     assert_eq!(payload["runtime_log"]["available"], false);
+}
+
+#[tokio::test]
+async fn test_system_summary_reports_trusted_source_update_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    save_trusted_sources(
+        dir.path(),
+        &TrustedSourcesConfig {
+            schema: "elastos.trusted-sources/v1".to_string(),
+            default_source: "seed-node-linux".to_string(),
+            sources: vec![TrustedSource {
+                name: "seed-node-linux".to_string(),
+                publisher_dids: vec!["did:key:seedpublisher".to_string()],
+                channel: "canary".to_string(),
+                discovery_uri: "elastos://source/did:key:seedpublisher/canary".to_string(),
+                connect_ticket: "secret-ticket-must-not-render".to_string(),
+                gateways: vec!["https://seed.example".to_string()],
+                install_path: "/opt/elastos/bin/elastos".to_string(),
+                installed_version: "0.5.0-dev".to_string(),
+                head_cid: "bafyseedhead".to_string(),
+                publisher_node_id: "seed-node-peer-id".to_string(),
+                ipns_name: "k51seed".to_string(),
+            }],
+        },
+    )
+    .unwrap();
+
+    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/apps/system/summary")
+                .header("x-elastos-home-token", authority.system_token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["source"]["configured"], true);
+    assert_eq!(payload["source"]["name"], "seed-node-linux");
+    assert_eq!(payload["source"]["channel"], "canary");
+    assert_eq!(payload["source"]["installed_version"], "0.5.0-dev");
+    assert_eq!(
+        payload["source"]["runtime_version"],
+        env!("ELASTOS_VERSION")
+    );
+    assert_eq!(payload["source"]["source_peer"], "seed-node-peer-id");
+    assert!(payload["source"]["transport"]
+        .as_str()
+        .unwrap()
+        .contains("Carrier-first trusted source"));
+    assert!(!serde_json::to_string(&payload["source"])
+        .unwrap()
+        .contains("secret-ticket-must-not-render"));
+    if env!("ELASTOS_VERSION").contains("dev") {
+        assert_eq!(payload["source"]["mode"], "development");
+        assert_eq!(payload["source"]["update_checks_allowed"], false);
+    } else {
+        assert_eq!(payload["source"]["mode"], "review");
+        assert_eq!(payload["source"]["update_checks_allowed"], true);
+    }
 }
 
 #[tokio::test]
@@ -3930,7 +4301,7 @@ async fn test_home_launch_validates_shell_targets() {
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["target"], "library");
     assert_eq!(payload["title"], "Library");
-    assert_eq!(payload["target_kind"], "object");
+    assert_eq!(payload["target_kind"], "app");
     assert!(payload["launch_status"].is_null());
     assert!(payload["capsule_id"].is_null());
     assert!(payload["route"]
@@ -4087,6 +4458,559 @@ async fn test_home_launch_validates_shell_targets() {
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_home_active_shell_uses_catalog_shell_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    write_test_browser_capsule(
+        dir.path(),
+        "home-cli",
+        "shell",
+        "Home CLI",
+        Some("<!doctype html><title>Home CLI</title>"),
+    );
+    write_test_browser_capsule(
+        dir.path(),
+        "regular-app",
+        "app",
+        "Regular app",
+        Some("<!doctype html><title>Regular App</title>"),
+    );
+    let broken_shell_dir = dir.path().join("capsules").join("broken-shell");
+    std::fs::create_dir_all(&broken_shell_dir).unwrap();
+    std::fs::write(
+        broken_shell_dir.join("capsule.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": "elastos.capsule/v1",
+            "name": "broken-shell",
+            "version": "0.1.0",
+            "description": "No browser entrypoint",
+            "author": "elastos",
+            "role": "shell",
+            "type": "wasm",
+            "entrypoint": "broken-shell.wasm"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let stale_state_uri = format!("{localhost_root}/.AppData/ElastOS/Home/active-shell.json");
+    let stale_state_path =
+        elastos_common::localhost::rooted_localhost_fs_path(dir.path(), &stale_state_uri).unwrap();
+    write_home_principal_object_json_for_authority(
+        dir.path(),
+        &authority,
+        "active-shell.json",
+        json!({
+            "schema": "elastos.home.active-shell/v1",
+            "principal_id": authority.principal_id.clone(),
+            "localhost_root": localhost_root.clone(),
+            "active": "obsolete-shell"
+        }),
+    );
+
+    let summary = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/apps/home/summary")
+                .header("x-elastos-home-token", authority.home_token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(summary.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload["active_shell"]["schema"],
+        "elastos.home.active-shell/v1"
+    );
+    assert_eq!(payload["active_shell"]["active"], HOME_GUI_SHELL_ID);
+    let repaired_state = std::fs::read_to_string(&stale_state_path).unwrap();
+    assert!(!repaired_state.contains("obsolete-shell"));
+    assert!(repaired_state.contains(r#""active": "home-gui""#));
+    let candidates = payload["active_shell"]["candidates"].as_array().unwrap();
+    let candidate_names = candidates
+        .iter()
+        .map(|candidate| candidate["name"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        candidate_names,
+        std::collections::BTreeSet::from([HOME_GUI_SHELL_ID, "home-cli"])
+    );
+    assert!(candidates
+        .iter()
+        .any(|candidate| candidate["name"] == HOME_GUI_SHELL_ID
+            && candidate["role"] == "shell"
+            && candidate["launchable"] == true
+            && candidate["route"] == HOME_ROUTE));
+    assert!(!candidates
+        .iter()
+        .any(|candidate| candidate["name"] == HOME_CAPSULE_ID));
+    assert!(candidates
+        .iter()
+        .any(|candidate| candidate["name"] == "home-cli"
+            && candidate["role"] == "shell"
+            && candidate["launchable"] == true));
+    assert!(!candidates
+        .iter()
+        .any(|candidate| candidate["name"] == "regular-app"));
+    assert!(!candidates
+        .iter()
+        .any(|candidate| candidate["name"] == "broken-shell"));
+    let visible_targets = payload["targets"].as_array().unwrap();
+    assert!(!visible_targets
+        .iter()
+        .any(|target| target["target"] == "home-cli"));
+    assert!(visible_targets
+        .iter()
+        .any(|target| target["target"] == "regular-app"
+            && target["role"] == "app"
+            && target["target_kind"] == "app"));
+
+    let app_rejected = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/active-shell")
+                .header("x-elastos-home-token", authority.home_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"active":"regular-app"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(app_rejected.status(), StatusCode::BAD_REQUEST);
+
+    let cli_launch = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/launch")
+                .header("x-elastos-home-token", authority.home_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"target":"home-cli"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cli_launch.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(cli_launch.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let home_cli_token = payload["route"]
+        .as_str()
+        .unwrap()
+        .split("home_token=")
+        .nth(1)
+        .unwrap()
+        .to_string();
+
+    let shell_summary = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/apps/home/summary")
+                .header("x-elastos-home-token", home_cli_token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(shell_summary.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(shell_summary.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["authority"]["signed_in"], true);
+    assert!(payload["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|target| target["target"] == "regular-app"));
+
+    let catalog = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/capsules/catalog")
+                .header("x-elastos-home-token", home_cli_token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog.status(), StatusCode::OK);
+
+    let interfaces = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/capsules/interfaces")
+                .header("x-elastos-home-token", home_cli_token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(interfaces.status(), StatusCode::OK);
+
+    let esp_initialize = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/esp/initialize")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"esp_version":"0","accepts":["elastos.capsules.catalog/v1"]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(esp_initialize.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(esp_initialize.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["protocol"], "elastos-shell-protocol");
+    assert_eq!(payload["accepted"][0], "elastos.capsules.catalog/v1");
+
+    let regular_launch = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/launch")
+                .header("x-elastos-home-token", authority.home_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"target":"regular-app"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(regular_launch.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(regular_launch.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let regular_token = payload["route"]
+        .as_str()
+        .unwrap()
+        .split("home_token=")
+        .nth(1)
+        .unwrap();
+    let catalog_rejected = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/capsules/catalog")
+                .header("x-elastos-home-token", regular_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_rejected.status(), StatusCode::FORBIDDEN);
+
+    let selected = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/active-shell")
+                .header("x-elastos-home-token", home_cli_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"active":"home-cli"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(selected.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["active"], "home-cli");
+
+    let selected_from_shell = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/apps/home/active-shell")
+                .header("x-elastos-home-token", home_cli_token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected_from_shell.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(selected_from_shell.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["active"], "home-cli");
+
+    let selected_gui_from_shell = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/active-shell")
+                .header("x-elastos-home-token", home_cli_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"active":"home-gui"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected_gui_from_shell.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(selected_gui_from_shell.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["active"], HOME_GUI_SHELL_ID);
+    let saved_state = std::fs::read_to_string(&stale_state_path).unwrap();
+    let saved_state: serde_json::Value = serde_json::from_str(&saved_state).unwrap();
+    assert_eq!(saved_state["active"], HOME_GUI_SHELL_ID);
+
+    let selected_from_system = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/active-shell")
+                .header("x-elastos-home-token", authority.system_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"active":"home-gui"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected_from_system.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(selected_from_system.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["active"], HOME_GUI_SHELL_ID);
+
+    let selected_cli_from_system = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/active-shell")
+                .header("x-elastos-home-token", authority.system_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"active":"home-cli"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected_cli_from_system.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(selected_cli_from_system.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["active"], "home-cli");
+
+    let summary = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/apps/home/summary")
+                .header("x-elastos-home-token", authority.home_token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(summary.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["active_shell"]["active"], "home-cli");
+
+    let cookie_summary = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/apps/home/summary")
+                .header(
+                    COOKIE,
+                    format!("{}={}", HOME_SESSION_COOKIE, authority.home_token),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cookie_summary.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(cookie_summary.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["authority"]["signed_in"], true);
+    assert_eq!(payload["active_shell"]["active"], "home-cli");
+
+    let cookie_active_shell_write_rejected = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/active-shell")
+                .header(
+                    COOKIE,
+                    format!("{}={}", HOME_SESSION_COOKIE, authority.home_token),
+                )
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"active":"home-gui"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        cookie_active_shell_write_rejected.status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let cookie_active_shell = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/apps/home/active-shell")
+                .header(
+                    COOKIE,
+                    format!("{}={}", HOME_SESSION_COOKIE, authority.home_token),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cookie_active_shell.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(cookie_active_shell.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["active"], "home-cli");
+}
+
+#[tokio::test]
+async fn test_home_active_shell_repairs_saved_home_state_but_rejects_home_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    write_test_browser_capsule(
+        dir.path(),
+        HOME_GUI_SHELL_ID,
+        "shell",
+        "Home GUI",
+        Some("<!doctype html><title>Home GUI</title>"),
+    );
+    write_test_browser_capsule(
+        dir.path(),
+        "home-cli",
+        "shell",
+        "Home CLI",
+        Some("<!doctype html><title>Home CLI</title>"),
+    );
+
+    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let state_uri = format!("{localhost_root}/.AppData/ElastOS/Home/active-shell.json");
+    let state_path =
+        elastos_common::localhost::rooted_localhost_fs_path(dir.path(), &state_uri).unwrap();
+    write_home_principal_object_json_for_authority(
+        dir.path(),
+        &authority,
+        "active-shell.json",
+        json!({
+            "schema": "elastos.home.active-shell/v1",
+            "principal_id": authority.principal_id.clone(),
+            "localhost_root": localhost_root.clone(),
+            "active": HOME_CAPSULE_ID
+        }),
+    );
+
+    let migrated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/apps/home/active-shell")
+                .header("x-elastos-home-token", authority.home_token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(migrated.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(migrated.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["active"], HOME_GUI_SHELL_ID);
+    assert!(payload["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(
+            |candidate| candidate["name"] == HOME_GUI_SHELL_ID && candidate["route"] == HOME_ROUTE
+        ));
+    assert!(!payload["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|candidate| candidate["name"] == HOME_CAPSULE_ID));
+    let repaired_state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert_eq!(repaired_state["active"], HOME_GUI_SHELL_ID);
+
+    let home_write_rejected = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/active-shell")
+                .header("x-elastos-home-token", authority.home_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"active":"home"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(home_write_rejected.status(), StatusCode::BAD_REQUEST);
+    let saved_state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert_eq!(saved_state["active"], HOME_GUI_SHELL_ID);
+
+    let invalid_update = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/active-shell")
+                .header("x-elastos-home-token", authority.home_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"active":"home-old"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_update.status(), StatusCode::BAD_REQUEST);
+    let saved_state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert_eq!(saved_state["active"], HOME_GUI_SHELL_ID);
 }
 
 #[tokio::test]
@@ -4721,6 +5645,10 @@ fn test_system_request_bodies_reject_hidden_authority_fields() {
     assert_rejects_unknown_gateway_field::<HomeBrowserStateUpdate>(json!({
         "session": null,
         "principal_id": "person:local:other"
+    }));
+    assert_rejects_unknown_gateway_field::<HomeActiveShellUpdate>(json!({
+        "active": "home-gui",
+        "route": "/apps/home/"
     }));
     assert_rejects_unknown_gateway_field::<SystemHandleUpdateRequest>(json!({
         "handle": "alice",

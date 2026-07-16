@@ -1738,16 +1738,45 @@ async fn peer_provider_request(
         .json(&body)
         .send()
         .await?;
-    let body: serde_json::Value = resp.json().await?;
-    if body.get("status").and_then(|s| s.as_str()) == Some("error") {
+    let status = resp.status();
+    let text = resp.text().await?;
+    let body: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
+        anyhow::anyhow!(
+            "peer provider {op} returned non-JSON HTTP {status}: {} ({err})",
+            short_provider_response_body(&text)
+        )
+    })?;
+    if !status.is_success() {
         anyhow::bail!(
-            "{}",
-            body.get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown Carrier provider error")
+            "peer provider {op} returned HTTP {status}: {}",
+            provider_response_message(&body)
         );
     }
+    if body.get("status").and_then(|s| s.as_str()) == Some("error") {
+        anyhow::bail!("{}", provider_response_message(&body));
+    }
     Ok(body)
+}
+
+fn provider_response_message(body: &serde_json::Value) -> &str {
+    body.get("message")
+        .or_else(|| body.get("error"))
+        .and_then(|message| message.as_str())
+        .unwrap_or("unknown Carrier provider error")
+}
+
+fn short_provider_response_body(text: &str) -> String {
+    let trimmed = text.trim();
+    const MAX_RESPONSE_BODY_CHARS: usize = 240;
+    if trimmed.chars().count() <= MAX_RESPONSE_BODY_CHARS {
+        return trimmed.to_string();
+    }
+    let mut snippet = trimmed
+        .chars()
+        .take(MAX_RESPONSE_BODY_CHARS)
+        .collect::<String>();
+    snippet.push_str("...");
+    snippet
 }
 
 fn is_already_joined_error(err: &anyhow::Error) -> bool {

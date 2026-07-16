@@ -14,6 +14,7 @@ pub mod carrier_service;
 pub mod content;
 pub mod crypto;
 pub mod documents;
+pub mod esp_binding;
 pub mod fetcher;
 pub mod gateway_cmd;
 pub mod host_lock;

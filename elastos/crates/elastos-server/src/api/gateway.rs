@@ -44,10 +44,14 @@ use url::form_urlencoded;
 mod gateway_browser;
 #[path = "gateway_capsule_catalog.rs"]
 mod gateway_capsule_catalog;
+#[path = "gateway_esp.rs"]
+mod gateway_esp;
 #[path = "gateway_home_runtime.rs"]
 mod gateway_home_runtime;
 #[path = "gateway_home_system.rs"]
 mod gateway_home_system;
+#[path = "gateway_home_terminal.rs"]
+mod gateway_home_terminal;
 #[path = "gateway_home_token.rs"]
 mod gateway_home_token;
 #[path = "gateway_inbox.rs"]
@@ -69,10 +73,12 @@ mod gateway_wallet;
 #[cfg(test)]
 use gateway_browser::browser_runtime_stream_socket_path;
 use gateway_capsule_catalog::*;
+use gateway_esp::*;
 pub(crate) use gateway_home_runtime::is_wallet_connector_capsule_id;
 use gateway_home_runtime::*;
 pub(super) use gateway_home_runtime::{viewer_object_shell_description, viewer_object_shell_title};
 use gateway_home_system::*;
+use gateway_home_terminal::*;
 pub(super) use gateway_home_token::{
     home_launch_auth_data_dir, home_launch_token_header, home_session_clear_cookie_header,
     home_session_cookie_header_for_token, issue_home_launch_token_for_auth_grant,
@@ -145,6 +151,33 @@ const DOCUMENTS_CAPSULE_ID: &str = "documents";
 const LIBRARY_CAPSULE_ID: &str = "library";
 const MARKETPLACE_CAPSULE_ID: &str = "marketplace";
 const INBOX_CAPSULE_ID: &str = "inbox";
+
+pub fn capsule_catalog_snapshot(data_dir: &std::path::Path) -> serde_json::Value {
+    serde_json::to_value(gateway_capsule_catalog::capsule_catalog_summary(data_dir)).unwrap_or_else(
+        |_| serde_json::json!({ "schema": "elastos.capsules.catalog/v1", "capsules": [] }),
+    )
+}
+
+pub fn capsule_interface_registry_snapshot(data_dir: &std::path::Path) -> serde_json::Value {
+    serde_json::to_value(gateway_capsule_catalog::capsule_interface_registry_summary(
+        data_dir,
+    ))
+    .unwrap_or_else(
+        |_| serde_json::json!({ "schema": "elastos.capsules.interfaces/v1", "interfaces": [] }),
+    )
+}
+
+pub fn home_services_snapshot(data_dir: &std::path::Path) -> serde_json::Value {
+    serde_json::to_value(gateway_home_runtime::home_state(data_dir).services)
+        .unwrap_or_else(|_| serde_json::json!({ "schema": "elastos.runtime.services/v1" }))
+}
+
+pub fn issue_local_runtime_home_launch_token(
+    data_dir: &std::path::Path,
+    app: &str,
+) -> anyhow::Result<String> {
+    gateway_home_token::issue_local_runtime_home_launch_token(data_dir, app)
+}
 const BROWSER_CAPSULE_ID: &str = "browser";
 const SERVICES_CAPSULE_ID: &str = "services";
 pub(crate) const SYSTEM_CAPSULE_ID: &str = "system";
@@ -165,6 +198,7 @@ pub(crate) const WALLET_LINK_CAPSULE_IDS: &[&str] = &[
     WALLET_WALLETCONNECT_CAPSULE_ID,
 ];
 pub(crate) const HOME_CAPSULE_ID: &str = "home";
+pub(crate) const HOME_GUI_SHELL_ID: &str = "home-gui";
 const HOME_ROUTE: &str = "/apps/home/";
 pub(crate) const WALLETCONNECT_CONFIG_SCHEMA: &str = "elastos.walletconnect.connector/v1";
 pub(crate) const WALLETCONNECT_CONFIG_PATH: &str =
@@ -576,11 +610,44 @@ pub fn gateway_router(state: GatewayState) -> Router {
             get(home_browser_state_get).post(home_browser_state_update),
         )
         .route(
+            "/api/apps/home/active-shell",
+            get(home_active_shell_get).post(home_active_shell_update),
+        )
+        .route(
             "/api/apps/home/appearance/background-image",
             get(home_background_image),
         )
         .route("/api/apps/home/runtime/ensure", post(home_runtime_ensure))
         .route("/api/apps/home/launch", post(home_launch))
+        .route(
+            "/api/apps/home-cli/terminal/contract",
+            get(home_cli_terminal_contract),
+        )
+        .route(
+            "/api/apps/home-cli/terminal/sessions",
+            post(home_cli_terminal_start),
+        )
+        .route(
+            "/api/apps/home-cli/terminal/sessions/:session_id/events",
+            get(home_cli_terminal_events),
+        )
+        .route(
+            "/api/apps/home-cli/terminal/sessions/:session_id/input",
+            post(home_cli_terminal_input)
+                .layer(DefaultBodyLimit::max(HOME_TERMINAL_INPUT_MAX_BYTES)),
+        )
+        .route(
+            "/api/apps/home-cli/terminal/sessions/:session_id/resize",
+            post(home_cli_terminal_resize),
+        )
+        .route(
+            "/api/apps/home-cli/terminal/sessions/:session_id/close",
+            post(home_cli_terminal_close),
+        )
+        .route(
+            "/api/esp/initialize",
+            get(esp_descriptor).post(esp_initialize),
+        )
         .route("/api/capsules/catalog", get(capsule_catalog))
         .route("/api/capsules/interfaces", get(capsule_interfaces))
         .route(

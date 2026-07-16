@@ -1,32 +1,17 @@
 use super::*;
-use sha2::Sha256;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-const INSPECT_ACTION_SCHEMA: &str = "elastos.inspect.action-request/v1";
-const INSPECT_ACTIONS_DIR: &str = "inspect-actions";
-static INSPECT_ACTION_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[path = "gateway_inspect_actions/binding.rs"]
+mod binding;
+#[path = "gateway_inspect_actions/store.rs"]
+mod store;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct InspectActionRequestRecord {
-    schema: String,
-    request_id: String,
-    principal_id: String,
-    session_id: String,
-    id: String,
-    operation: String,
-    request: serde_json::Value,
-    plan: serde_json::Value,
-    #[serde(default)]
-    request_binding: Option<serde_json::Value>,
-    status: String,
-    created_at: u64,
-    updated_at: u64,
-    #[serde(default)]
-    result: Option<serde_json::Value>,
-    #[serde(default)]
-    error: Option<String>,
-}
+use binding::{
+    inspect_action_request_binding, inspect_action_request_id, inspect_action_request_nonce,
+};
+use store::{
+    read_inspect_action_record, write_inspect_action_record, InspectActionRequestRecord,
+    INSPECT_ACTION_SCHEMA,
+};
 
 pub(super) async fn gateway_inspect_action_request(
     state: &GatewayState,
@@ -169,24 +154,7 @@ pub(super) fn pending_inspect_action_requests(
     data_dir: &FsPath,
     principal_id: &str,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
-    let mut records = load_inspect_action_records(data_dir)?;
-    records.sort_by_key(|record| record.created_at);
-    Ok(records
-        .into_iter()
-        .filter(|record| record.status == "pending" && record.principal_id == principal_id)
-        .map(|record| {
-            serde_json::json!({
-                "schema": record.schema,
-                "request_id": record.request_id,
-                "id": record.id,
-                "operation": record.operation,
-                "plan": record.plan,
-                "request_binding": record.request_binding.unwrap_or_else(|| inspect_action_request_binding(&record.request)),
-                "status": record.status,
-                "created_at": record.created_at,
-            })
-        })
-        .collect())
+    store::pending_inspect_action_requests(data_dir, principal_id)
 }
 
 pub(super) async fn approve_inspect_action_request(
@@ -448,127 +416,4 @@ async fn create_inspect_action_request(
         },
     )?;
     Ok(record)
-}
-
-fn inspect_action_request_nonce() -> String {
-    let sequence = INSPECT_ACTION_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    format!("{nanos}-{sequence}")
-}
-
-fn inspect_action_request_id(id: &str, operation: &str, now: u64, nonce: &str) -> String {
-    let digest =
-        <Sha256 as sha2::Digest>::digest(format!("{id}:{operation}:{now}:{nonce}").as_bytes());
-    format!("inspect-act-{now}-{}", &hex::encode(digest)[..16])
-}
-
-fn inspect_action_request_binding(request: &serde_json::Value) -> serde_json::Value {
-    let canonical = canonical_json(request);
-    let encoded = serde_json::to_vec(&canonical).unwrap_or_default();
-    let sha256 = hex::encode(<Sha256 as sha2::Digest>::digest(&encoded));
-    let preview = if encoded.len() <= 1024 {
-        canonical
-    } else {
-        serde_json::Value::Null
-    };
-    serde_json::json!({
-        "schema": "elastos.inspect.request-binding/v1",
-        "sha256": sha256,
-        "bytes": encoded.len(),
-        "truncated": encoded.len() > 1024,
-        "preview": preview,
-    })
-}
-
-fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Array(values) => {
-            serde_json::Value::Array(values.iter().map(canonical_json).collect())
-        }
-        serde_json::Value::Object(object) => serde_json::Value::Object(
-            object
-                .iter()
-                .map(|(key, value)| (key.clone(), canonical_json(value)))
-                .collect(),
-        ),
-        other => other.clone(),
-    }
-}
-
-fn inspect_actions_root(data_dir: &FsPath) -> PathBuf {
-    data_dir.join(INSPECT_ACTIONS_DIR)
-}
-
-fn inspect_action_path(data_dir: &FsPath, request_id: &str) -> anyhow::Result<PathBuf> {
-    if !request_id
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
-    {
-        anyhow::bail!("invalid Inspector action request id");
-    }
-    Ok(inspect_actions_root(data_dir).join(format!("{request_id}.json")))
-}
-
-fn load_inspect_action_records(
-    data_dir: &FsPath,
-) -> anyhow::Result<Vec<InspectActionRequestRecord>> {
-    let root = inspect_actions_root(data_dir);
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return Ok(Vec::new());
-    };
-    let mut records = Vec::new();
-    for entry in entries {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
-        let data = std::fs::read_to_string(path)?;
-        let record: InspectActionRequestRecord = serde_json::from_str(&data)?;
-        records.push(record);
-    }
-    Ok(records)
-}
-
-fn read_inspect_action_record(
-    data_dir: &FsPath,
-    request_id: &str,
-) -> anyhow::Result<InspectActionRequestRecord> {
-    let path = inspect_action_path(data_dir, request_id)?;
-    let data = std::fs::read_to_string(path)?;
-    let record: InspectActionRequestRecord = serde_json::from_str(&data)?;
-    Ok(record)
-}
-
-fn write_inspect_action_record(
-    data_dir: &FsPath,
-    record: &InspectActionRequestRecord,
-) -> anyhow::Result<()> {
-    let root = inspect_actions_root(data_dir);
-    std::fs::create_dir_all(&root)?;
-    let path = inspect_action_path(data_dir, &record.request_id)?;
-    let data = serde_json::to_vec_pretty(record)?;
-    std::fs::write(path, data)?;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn inspect_action_request_id_uses_nonce() {
-        let first = inspect_action_request_id("capsule:exit-provider", "status", 42, "0");
-        let second = inspect_action_request_id("capsule:exit-provider", "status", 42, "1");
-
-        assert_ne!(first, second);
-        assert!(first.starts_with("inspect-act-42-"));
-        assert!(second.starts_with("inspect-act-42-"));
-    }
 }

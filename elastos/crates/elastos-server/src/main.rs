@@ -271,11 +271,11 @@ enum Commands {
 
     /// Launch Home
     Home {
-        /// Print a plain CLI summary instead of the managed WASM dashboard
+        /// Print a local Home-state probe without opening the home-cli surface
         #[arg(long)]
         status: bool,
 
-        /// Emit machine-readable JSON (implies --status)
+        /// Emit the local Home-state probe as machine-readable JSON
         #[arg(long)]
         json: bool,
     },

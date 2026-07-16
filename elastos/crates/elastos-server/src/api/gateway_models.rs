@@ -5,6 +5,7 @@ struct HomeSummaryResponse {
     identity: HomeIdentitySummary,
     authority: HomeAuthoritySummary,
     browser_state: HomeBrowserStateSummary,
+    active_shell: HomeActiveShellSummary,
     appearance: HomeAppearanceSummary,
     runtime: HomeRuntimeSummary,
     site: HomeSiteSummary,
@@ -274,6 +275,39 @@ struct HomeBrowserStateUpdate {
     recent_targets: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+struct HomeActiveShellSummary {
+    schema: String,
+    active: String,
+    #[serde(default)]
+    candidates: Vec<HomeActiveShellCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HomeActiveShellCandidate {
+    name: String,
+    title: String,
+    description: String,
+    route: String,
+    role: CapsuleRole,
+    launchable: bool,
+    trust_state: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct HomeActiveShellState {
+    schema: String,
+    principal_id: String,
+    localhost_root: String,
+    active: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HomeActiveShellUpdate {
+    active: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct HomeDesktopObjectsSummary {
     schema: String,
@@ -418,12 +452,27 @@ struct SystemSummaryResponse {
     home: HomeCapsuleIdentity,
     app: SystemCapsuleIdentity,
     appearance: HomeAppearanceSummary,
+    source: SystemSourceSummary,
     runtime: HomeRuntimeSummary,
     storage: SystemStorageSummary,
     webspace: SystemWebspaceSummary,
     wallet_accounts: SystemWalletAccountsSummary,
     wallet_approvals: SystemWalletApprovalsSummary,
     runtime_log: SystemRuntimeLogSummary,
+}
+
+#[derive(Serialize)]
+struct SystemSourceSummary {
+    configured: bool,
+    name: Option<String>,
+    channel: String,
+    installed_version: String,
+    runtime_version: String,
+    mode: String,
+    update_checks_allowed: bool,
+    update_policy: String,
+    transport: String,
+    source_peer: Option<String>,
 }
 
 #[derive(Serialize)]

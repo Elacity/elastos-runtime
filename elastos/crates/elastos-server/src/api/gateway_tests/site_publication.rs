@@ -5,6 +5,7 @@ fn test_content_type_mapping() {
     assert_eq!(content_type("index.html"), "text/html; charset=utf-8");
     assert_eq!(content_type("style.css"), "text/css");
     assert_eq!(content_type("app.js"), "application/javascript");
+    assert_eq!(content_type("module.mjs"), "application/javascript");
     assert_eq!(content_type("data.json"), "application/json");
     assert_eq!(
         content_type("manifest.webmanifest"),

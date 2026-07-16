@@ -97,13 +97,19 @@ pub(super) fn home_targets(data_dir: &std::path::Path) -> Vec<HomeTargetSummary>
     targets
 }
 
+pub(super) fn home_launch_targets(data_dir: &std::path::Path) -> Vec<HomeTargetSummary> {
+    let mut targets = home_browser_targets(data_dir, false);
+    targets.extend(home_viewer_targets(data_dir));
+    targets.sort_by(|left, right| left.title.cmp(&right.title));
+    targets
+}
+
 pub(super) fn home_launch_target(
     data_dir: &std::path::Path,
     target: &str,
 ) -> Option<HomeTargetSummary> {
-    home_browser_targets(data_dir, false)
+    home_launch_targets(data_dir)
         .into_iter()
-        .chain(home_viewer_targets(data_dir))
         .find(|candidate| candidate.target == target)
 }
 
@@ -112,18 +118,18 @@ fn home_browser_targets(data_dir: &std::path::Path, visible_only: bool) -> Vec<H
         crate::api::browser_capsules::list_launchable_browser_capsules(data_dir)
             .into_iter()
             .filter(|app| app.name != HOME_CAPSULE_ID)
-            .filter(|app| !visible_only || is_home_visible_target(&app.name))
-            .map(|app| {
-                let target_kind = home_target_kind(&app.name);
-                HomeTargetSummary {
-                    route: format!("/apps/{}/", app.name),
-                    title: app_shell_title(&app.name),
-                    description: app_shell_description(&app.name, app.description),
-                    target: app.name,
-                    attach_kind: "iframe".to_string(),
-                    role: app.role,
-                    target_kind,
-                }
+            .filter(|app| {
+                !visible_only
+                    || (app.role != CapsuleRole::Shell && is_home_visible_target(&app.name))
+            })
+            .map(|app| HomeTargetSummary {
+                route: format!("/apps/{}/", app.name),
+                title: app_shell_title(&app.name),
+                description: app_shell_description(&app.name, app.description),
+                target: app.name,
+                attach_kind: "iframe".to_string(),
+                role: app.role,
+                target_kind: HomeTargetKind::App,
             })
             .collect();
     targets.sort_by(|left, right| left.title.cmp(&right.title));
@@ -155,13 +161,6 @@ fn is_home_visible_target(name: &str) -> bool {
         name,
         WALLET_METAMASK_CAPSULE_ID | WALLET_UNISAT_CAPSULE_ID | WALLET_WALLETCONNECT_CAPSULE_ID
     )
-}
-
-fn home_target_kind(name: &str) -> HomeTargetKind {
-    match name {
-        LIBRARY_CAPSULE_ID => HomeTargetKind::Object,
-        _ => HomeTargetKind::App,
-    }
 }
 
 pub(super) fn load_gateway_identity_summary(data_dir: &std::path::Path) -> HomeIdentitySummary {
@@ -656,6 +655,8 @@ pub(super) fn wallet_connector_evm_chains() -> serde_json::Value {
 
 fn app_shell_title(name: &str) -> String {
     match name {
+        HOME_CAPSULE_ID => "Home".to_string(),
+        HOME_GUI_SHELL_ID => "Home GUI".to_string(),
         DOCUMENTS_CAPSULE_ID => "Documents".to_string(),
         CHAT_ROOM_CAPSULE_ID => "Chat".to_string(),
         LIBRARY_CAPSULE_ID => "Library".to_string(),
@@ -666,6 +667,7 @@ fn app_shell_title(name: &str) -> String {
         BROWSER_CAPSULE_ID => "Browser".to_string(),
         WALLET_CAPSULE_ID => "Wallet".to_string(),
         "archive-manager" => "Archive".to_string(),
+        "home-cli" => "Home CLI".to_string(),
         "gba-emulator" => "GBA Emulator".to_string(),
         _ if is_wallet_connector_capsule_id(name) => wallet_connector_label(name).to_string(),
         _ => title_case_capsule_name(name),
@@ -1486,7 +1488,7 @@ pub(super) async fn ensure_home_runtime(data_dir: &std::path::Path) -> HomeRunti
 pub(super) async fn load_live_runtime_coords(
     data_dir: &std::path::Path,
 ) -> Option<crate::runtime_control::RuntimeCoords> {
-    let path = crate::runtime_control::runtime_coord_path(data_dir);
+    let path = crate::runtime_control::home_runtime_coord_path(data_dir);
     crate::runtime_control::read_runtime_coords(&path).await
 }
 

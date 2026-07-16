@@ -386,9 +386,18 @@ async fn inspect_action_requires_inbox_approval_before_dispatch() {
     assert_eq!(call_records.len(), 1);
     assert_eq!(call_records[0]["op"], "status");
     assert_eq!(call_records[0]["probe"], true);
+    assert_eq!(
+        call_records[0]["_runtime_invocation"]["schema"],
+        "elastos.provider.invocation/v1"
+    );
     assert_eq!(call_records[0]["_runtime_invocation"]["source"], "inspect");
     assert_eq!(call_records[0]["_runtime_invocation"]["target"], "exit");
     assert_eq!(call_records[0]["_runtime_invocation"]["op"], "status");
+    assert_eq!(
+        call_records[0]["_runtime_invocation"]["capability"],
+        "provider:inspect->exit:status"
+    );
+    assert_eq!(call_records[0]["_runtime_invocation"]["transfer"], "json");
     drop(call_records);
 
     let after_approve_inbox = app
@@ -431,6 +440,16 @@ async fn inspect_action_requires_inbox_approval_before_dispatch() {
         record["result"]["data"]["schema"],
         "elastos.inspect.dispatch-result/v1"
     );
+    assert_eq!(
+        record["result"]["data"]["execution"]["mode"],
+        "approved_dispatch"
+    );
+    assert_eq!(
+        record["result"]["data"]["execution"]["approval_surface"],
+        "inbox"
+    );
+    assert_eq!(record["result"]["data"]["execution"]["can_dispatch"], true);
+    assert_eq!(record["result"]["data"]["execution"]["can_mutate"], true);
     assert_eq!(record["result"]["data"]["target"], "exit");
     assert_eq!(record["result"]["data"]["operation"], "status");
     assert_eq!(
@@ -448,6 +467,18 @@ async fn inspect_action_requires_inbox_approval_before_dispatch() {
     assert_eq!(
         record["result"]["data"]["provider_response"]["data"]["target"],
         "exit"
+    );
+    assert_eq!(
+        record["result"]["data"]["provider_response"]["_runtime_transfer"]["schema"],
+        "elastos.provider.transfer/v1"
+    );
+    assert_eq!(
+        record["result"]["data"]["provider_response"]["_runtime_transfer"]["capability"],
+        "provider:inspect->exit:status"
+    );
+    assert_eq!(
+        record["result"]["data"]["provider_response"]["_runtime_transfer"]["transfer"],
+        "json"
     );
 
     let auth_state = crate::auth::load_auth_state(dir.path()).unwrap();

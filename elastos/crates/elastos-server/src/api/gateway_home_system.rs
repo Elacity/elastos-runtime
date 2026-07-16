@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context as _;
-use elastos_common::CapsuleManifest;
+use elastos_common::{CapsuleManifest, CapsuleRole};
 
 use super::*;
 
@@ -13,6 +13,8 @@ const HOME_EVENTS_RETRY_MS: u64 = 250;
 const HOME_EVENTS_STREAM_KEEPALIVE_SECS: u64 = 15;
 const HOME_DESKTOP_OBJECTS_SCHEMA: &str = "elastos.home.desktop-objects/v1";
 const HOME_SYSTEM_DESKTOP_OBJECT_SCHEMA: &str = "elastos.home.system-desktop-object/v1";
+const HOME_ACTIVE_SHELL_SCHEMA: &str = "elastos.home.active-shell/v1";
+const HOME_ACTIVE_SHELL_MAX_BYTES: usize = 4 * 1024;
 const HOME_PROFILE_CARD_SCHEMA: &str = "elastos.profile-card/v1";
 const HOME_PROFILE_CARD_MAX_BYTES: usize = 4 * 1024;
 const HOME_PEOPLE_CONTACTS_SCHEMA: &str = "elastos.people.contacts-state/v1";
@@ -256,7 +258,7 @@ pub(super) async fn home_summary(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context = require_home_token_context(&state.data_dir, &headers).ok();
+    let context = require_home_active_shell_token_context(&state.data_dir, &headers).ok();
 
     let (identity, authority, browser_state, appearance, runtime, home_state) =
         if let Some(context) = context.as_ref() {
@@ -321,6 +323,10 @@ pub(super) async fn home_summary(
         };
 
     let mut notifications = home_state.notifications;
+    let active_shell = match home_active_shell_summary(&state.data_dir, context.as_ref()) {
+        Ok(shell) => shell,
+        Err(err) => return home_error_response(err),
+    };
     let desktop_objects = if let Some(context) = context.as_ref() {
         home_desktop_objects_summary(&state, context).await
     } else {
@@ -352,6 +358,7 @@ pub(super) async fn home_summary(
         identity,
         authority,
         browser_state,
+        active_shell,
         appearance,
         runtime,
         site: home_state.site,
@@ -2430,6 +2437,62 @@ pub(super) async fn home_browser_state_update(
     }
 }
 
+pub(super) async fn home_active_shell_get(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response {
+    let context = require_home_active_shell_token_context(&state.data_dir, &headers).ok();
+    match home_active_shell_summary(&state.data_dir, context.as_ref()) {
+        Ok(summary) => Json(summary).into_response(),
+        Err(err) => home_error_response(err),
+    }
+}
+
+pub(super) async fn home_active_shell_update(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(input): Json<HomeActiveShellUpdate>,
+) -> Response {
+    let context = match require_home_active_shell_update_token_context(&state.data_dir, &headers) {
+        Ok(context) => context,
+        Err(err) => return home_error_response(err),
+    };
+    match home_save_active_shell(&state.data_dir, &context, input.active.trim()) {
+        Ok(summary) => Json(summary).into_response(),
+        Err(err) => {
+            let text = err.to_string();
+            let status = if text.contains("not a launchable shell") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, text).into_response()
+        }
+    }
+}
+
+fn require_home_active_shell_token_context(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+) -> anyhow::Result<HomeLaunchTokenContext> {
+    if let Ok(context) = require_home_token_context(data_dir, headers) {
+        return Ok(context);
+    }
+    require_home_active_shell_update_token_context(data_dir, headers)
+}
+
+fn require_home_active_shell_update_token_context(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+) -> anyhow::Result<HomeLaunchTokenContext> {
+    let mut allowed = BTreeSet::from([HOME_CAPSULE_ID.to_string(), SYSTEM_CAPSULE_ID.to_string()]);
+    for candidate in home_active_shell_candidates(data_dir) {
+        allowed.insert(candidate.name);
+    }
+    let allowed_refs = allowed.iter().map(String::as_str).collect::<Vec<_>>();
+    require_home_launch_token_for_any_context(data_dir, headers, &allowed_refs)
+}
+
 fn home_authority_summary(context: &HomeLaunchTokenContext) -> HomeAuthoritySummary {
     HomeAuthoritySummary {
         signed_in: true,
@@ -2564,6 +2627,202 @@ fn standard_home_browser_state() -> HomeBrowserStateSummary {
         schema: HOME_BROWSER_STATE_SCHEMA.to_string(),
         ..HomeBrowserStateSummary::default()
     }
+}
+
+fn home_active_shell_summary(
+    data_dir: &std::path::Path,
+    context: Option<&HomeLaunchTokenContext>,
+) -> anyhow::Result<HomeActiveShellSummary> {
+    let candidates = home_active_shell_candidates(data_dir);
+    let saved = match context {
+        Some(context) => home_active_shell_state(data_dir, context)?.map(|state| state.active),
+        None => None,
+    };
+    let saved_canonical = saved
+        .as_deref()
+        .map(home_active_shell_saved_state_name)
+        .filter(|candidate| !candidate.is_empty());
+    let saved_is_valid = saved_canonical.as_ref().is_some_and(|candidate| {
+        candidates
+            .iter()
+            .any(|shell| shell.name.as_str() == candidate.as_str())
+    });
+    let active = saved_canonical
+        .clone()
+        .filter(|_| saved_is_valid)
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|shell| shell.name == HOME_GUI_SHELL_ID)
+                .map(|shell| shell.name.clone())
+        })
+        .or_else(|| candidates.first().map(|shell| shell.name.clone()))
+        .unwrap_or_default();
+    let needs_repair = saved.as_deref().is_some_and(|saved| saved.trim() != active);
+    if needs_repair && !active.is_empty() {
+        if let Some(context) = context {
+            if let Err(err) = home_save_active_shell(data_dir, context, &active) {
+                tracing::warn!(
+                    active_shell = %active,
+                    error = %err,
+                    "failed to repair obsolete Home active shell state"
+                );
+            }
+        }
+    }
+    Ok(HomeActiveShellSummary {
+        schema: HOME_ACTIVE_SHELL_SCHEMA.to_string(),
+        active,
+        candidates,
+    })
+}
+
+fn home_active_shell_candidates(data_dir: &std::path::Path) -> Vec<HomeActiveShellCandidate> {
+    let mut candidates = BTreeMap::<String, HomeActiveShellCandidate>::new();
+    for capsule in capsule_catalog_summary(data_dir)
+        .capsules
+        .into_iter()
+        .filter(|capsule| capsule.role == CapsuleRole::Shell && capsule.launchable)
+        .filter(|capsule| capsule.name != HOME_CAPSULE_ID)
+    {
+        let Some(catalog_route) = capsule.route else {
+            continue;
+        };
+        let capsule_name = capsule.name;
+        let is_home_gui = capsule_name == HOME_GUI_SHELL_ID;
+        let name = capsule_name.clone();
+        let candidate = HomeActiveShellCandidate {
+            name: name.clone(),
+            title: if is_home_gui {
+                "Home GUI".to_string()
+            } else {
+                capsule.title
+            },
+            description: capsule.description,
+            route: if is_home_gui {
+                HOME_ROUTE.to_string()
+            } else {
+                catalog_route
+            },
+            role: capsule.role,
+            launchable: capsule.launchable,
+            trust_state: capsule.trust_state,
+        };
+        candidates.insert(name, candidate);
+    }
+    candidates.into_values().collect()
+}
+
+fn home_active_shell_saved_state_name(active: &str) -> String {
+    let trimmed = active.trim();
+    if trimmed == HOME_CAPSULE_ID {
+        HOME_GUI_SHELL_ID.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn home_active_shell_state_uri(context: &HomeLaunchTokenContext) -> String {
+    format!(
+        "{}/.AppData/ElastOS/Home/active-shell.json",
+        home_browser_localhost_root(context)
+    )
+}
+
+fn home_active_shell_state_path(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+) -> anyhow::Result<PathBuf> {
+    rooted_localhost_fs_path(data_dir, &home_active_shell_state_uri(context))
+        .ok_or_else(|| anyhow::anyhow!("invalid Home active shell state root"))
+}
+
+fn home_active_shell_state(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+) -> anyhow::Result<Option<HomeActiveShellState>> {
+    let path = home_active_shell_state_path(data_dir, context)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let principal_id = home_browser_principal_id(context);
+    let localhost_root = home_browser_localhost_root(context);
+    let bytes = match crate::auth::read_principal_root_object(
+        data_dir,
+        &principal_id,
+        &localhost_root,
+        &home_active_shell_state_uri(context),
+        &path,
+    ) {
+        Ok(bytes) => bytes,
+        Err(err) if is_unencrypted_home_browser_state(&err) => return Ok(None),
+        Err(err) if is_missing_home_browser_state_file(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if bytes.len() > HOME_ACTIVE_SHELL_MAX_BYTES {
+        anyhow::bail!("Home active shell state is too large");
+    }
+    let state: HomeActiveShellState = match serde_json::from_slice(&bytes) {
+        Ok(state) => state,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "ignored invalid Home active shell state"
+            );
+            return Ok(None);
+        }
+    };
+    if state.schema != HOME_ACTIVE_SHELL_SCHEMA
+        || state.principal_id != principal_id
+        || state.localhost_root != localhost_root
+    {
+        tracing::warn!(
+            path = %path.display(),
+            "ignored mismatched Home active shell state"
+        );
+        return Ok(None);
+    }
+    Ok(Some(state))
+}
+
+fn home_save_active_shell(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    active: &str,
+) -> anyhow::Result<HomeActiveShellSummary> {
+    let candidates = home_active_shell_candidates(data_dir);
+    let active = active.trim();
+    let Some(candidate) = candidates.iter().find(|candidate| candidate.name == active) else {
+        anyhow::bail!("active shell is not a launchable shell");
+    };
+    let state = HomeActiveShellState {
+        schema: HOME_ACTIVE_SHELL_SCHEMA.to_string(),
+        principal_id: home_browser_principal_id(context),
+        localhost_root: home_browser_localhost_root(context),
+        active: candidate.name.clone(),
+    };
+    let bytes = serde_json::to_vec_pretty(&state)?;
+    if bytes.len() > HOME_ACTIVE_SHELL_MAX_BYTES {
+        anyhow::bail!("Home active shell state is too large");
+    }
+    let path = home_active_shell_state_path(data_dir, context)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::auth::write_principal_root_object(
+        data_dir,
+        &home_browser_principal_id(context),
+        &home_browser_localhost_root(context),
+        &home_active_shell_state_uri(context),
+        &path,
+        &bytes,
+    )?;
+    Ok(HomeActiveShellSummary {
+        schema: HOME_ACTIVE_SHELL_SCHEMA.to_string(),
+        active: candidate.name.clone(),
+        candidates,
+    })
 }
 
 fn home_browser_principal_id(context: &HomeLaunchTokenContext) -> String {
@@ -4644,6 +4903,7 @@ pub(super) async fn system_summary(
             Ok(appearance) => appearance,
             Err(err) => return system_error_response(err),
         },
+        source: system_source_summary(&state.data_dir, &runtime),
         runtime,
         storage,
         webspace,
@@ -4652,6 +4912,162 @@ pub(super) async fn system_summary(
         runtime_log,
     })
     .into_response()
+}
+
+fn system_source_summary(
+    data_dir: &std::path::Path,
+    runtime: &HomeRuntimeSummary,
+) -> SystemSourceSummary {
+    let runtime_version = runtime
+        .version
+        .as_deref()
+        .unwrap_or(GATEWAY_VERSION)
+        .to_string();
+    let config = match crate::sources::load_trusted_sources(data_dir) {
+        Ok(config) => config,
+        Err(err) => {
+            return SystemSourceSummary {
+                configured: false,
+                name: None,
+                channel: "unknown".to_string(),
+                installed_version: "unknown".to_string(),
+                runtime_version,
+                mode: "development".to_string(),
+                update_checks_allowed: false,
+                update_policy: format!("trusted source configuration could not be read: {err}"),
+                transport: "Carrier trusted source unavailable".to_string(),
+                source_peer: None,
+            };
+        }
+    };
+    let Some(source) = config.default_source() else {
+        return SystemSourceSummary {
+            configured: false,
+            name: None,
+            channel: "not configured".to_string(),
+            installed_version: "unknown".to_string(),
+            runtime_version,
+            mode: "development".to_string(),
+            update_checks_allowed: false,
+            update_policy: "No trusted source configured. Add one before checking updates."
+                .to_string(),
+            transport: "Carrier trusted source unavailable".to_string(),
+            source_peer: None,
+        };
+    };
+
+    let channel = if source.channel.trim().is_empty() {
+        "stable".to_string()
+    } else {
+        source.channel.trim().to_string()
+    };
+    let installed_version = if source.installed_version.trim().is_empty() {
+        "unknown".to_string()
+    } else {
+        source.installed_version.trim().to_string()
+    };
+    let mode = system_source_mode(&runtime_version, &channel);
+    let has_publisher = source
+        .publisher_dids
+        .iter()
+        .any(|publisher| !publisher.trim().is_empty());
+    let update_checks_allowed = mode != "development" && has_publisher;
+    let update_policy = if !has_publisher {
+        "Disabled because the trusted source has no publisher DID.".to_string()
+    } else if mode == "development" {
+        "Disabled in dev builds; use explicit source/update commands in an operator session."
+            .to_string()
+    } else {
+        format!("Allowed for {mode} mode on the {channel} channel.")
+    };
+    let source_peer = if source.publisher_node_id.trim().is_empty() {
+        None
+    } else {
+        Some(source.publisher_node_id.trim().to_string())
+    };
+    let transport = if source_peer.is_some() || !source.connect_ticket.trim().is_empty() {
+        "Carrier-first trusted source; web gateways require an explicit operator override."
+            .to_string()
+    } else {
+        "Carrier discovery by publisher DID; web gateways require an explicit operator override."
+            .to_string()
+    };
+
+    SystemSourceSummary {
+        configured: true,
+        name: Some(source.name.clone()),
+        channel,
+        installed_version,
+        runtime_version,
+        mode: mode.to_string(),
+        update_checks_allowed,
+        update_policy,
+        transport,
+        source_peer,
+    }
+}
+
+fn system_source_mode(runtime_version: &str, channel: &str) -> &'static str {
+    let version = runtime_version.to_ascii_lowercase();
+    if version.contains("dev") || version.contains("dirty") {
+        "development"
+    } else if version.contains("rc") || version.contains("review") || channel != "stable" {
+        "review"
+    } else {
+        "release"
+    }
+}
+
+#[cfg(test)]
+mod source_summary_tests {
+    use crate::sources::{save_trusted_sources, TrustedSource, TrustedSourcesConfig};
+
+    use super::*;
+
+    #[test]
+    fn system_source_mode_keeps_dev_review_and_release_distinct() {
+        assert_eq!(system_source_mode("0.5.0-dev", "stable"), "development");
+        assert_eq!(system_source_mode("0.5.0", "canary"), "review");
+        assert_eq!(system_source_mode("0.5.0-rc1", "stable"), "review");
+        assert_eq!(system_source_mode("0.5.0", "stable"), "release");
+    }
+
+    #[test]
+    fn system_source_summary_blocks_sources_without_publishers() {
+        let dir = tempfile::tempdir().unwrap();
+        save_trusted_sources(
+            dir.path(),
+            &TrustedSourcesConfig {
+                schema: "elastos.trusted-sources/v1".to_string(),
+                default_source: "seed-node-linux".to_string(),
+                sources: vec![TrustedSource {
+                    name: "seed-node-linux".to_string(),
+                    publisher_dids: Vec::new(),
+                    channel: "stable".to_string(),
+                    discovery_uri: String::new(),
+                    connect_ticket: String::new(),
+                    gateways: Vec::new(),
+                    install_path: String::new(),
+                    installed_version: "0.5.0".to_string(),
+                    head_cid: String::new(),
+                    publisher_node_id: String::new(),
+                    ipns_name: String::new(),
+                }],
+            },
+        )
+        .unwrap();
+
+        let summary = system_source_summary(
+            dir.path(),
+            &HomeRuntimeSummary {
+                version: Some("0.5.0".to_string()),
+                ..HomeRuntimeSummary::default()
+            },
+        );
+        assert_eq!(summary.mode, "release");
+        assert!(!summary.update_checks_allowed);
+        assert!(summary.update_policy.contains("no publisher DID"));
+    }
 }
 
 fn system_webspace_summary(

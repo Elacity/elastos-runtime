@@ -1,0 +1,22 @@
+{
+  "name": "@elastos/esp",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "description": "Private non-TCB ESP v0 TypeScript shapes for current ElastOS Runtime facts.",
+  "exports": {
+    ".": "./index.ts",
+    "./esp_v0": "./esp_v0.ts",
+    "./audit_views": "./audit_views.ts",
+    "./capsule_detail": "./capsule_detail.ts",
+    "./consent": "./consent.ts",
+    "./custody": "./custody.ts",
+    "./home_fleet": "./home_fleet.ts",
+    "./shell_picker": "./shell_picker.ts",
+    "./trust": "./trust.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --check esp_v0.ts && node --experimental-strip-types --check index.ts && node --experimental-strip-types check-esp-v0.mjs && node --experimental-strip-types --test projections.test.mjs"
+  }
+}
