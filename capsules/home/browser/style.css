@@ -39,6 +39,47 @@
   --desktop-wallpaper: url("./wallpaper.webp");
 }
 
+/* Light theme (data-el-theme="light" on <html>, set by the vendored
+   elastos-theme.js from localStorage). Chrome follows PC2's light look:
+   frosted pale bars, navy ink, same brand orange. Desktop icon labels stay
+   white over the wallpaper (as macOS does) — see the explicit rule below. */
+:root[data-el-theme="light"] {
+  color-scheme: light;
+  --bg: #e8ecf3;
+  --panel: rgba(255, 255, 255, 0.82);
+  --panel-strong: rgba(255, 255, 255, 0.96);
+  --panel-soft: rgba(29, 36, 56, 0.06);
+  --line: rgba(29, 36, 56, 0.14);
+  --line-strong: rgba(29, 36, 56, 0.26);
+  --text: #1d2438;
+  --muted: rgba(29, 36, 56, 0.72);
+  --soft: rgba(29, 36, 56, 0.5);
+  --brand-strong: #e07f0a;
+  --shadow: 0 24px 80px rgba(34, 49, 88, 0.2);
+  --shadow-soft: 0 12px 28px rgba(34, 49, 88, 0.14);
+  --window-head-saturation: 16%;
+  --window-head-lightness: 88%;
+  --chrome-fill: rgba(231, 238, 245, 0.78);
+  --dock-fill: rgba(231, 238, 245, 0.8);
+  --hairline: rgba(29, 36, 56, 0.16);
+  --frame-fill: #eef1f6;
+  --menu-fill: rgba(248, 250, 253, 0.97);
+  --overlay-dim: rgba(233, 238, 246, 0.5);
+}
+
+:root {
+  --frame-fill: #0b0d10;
+  --menu-fill: rgba(22, 24, 29, 0.96);
+  --overlay-dim: rgba(6, 7, 10, 0.55);
+  --lift: rgba(255, 255, 255, 0.08);
+  --lift-strong: rgba(255, 255, 255, 0.15);
+}
+
+:root[data-el-theme="light"] {
+  --lift: rgba(29, 36, 56, 0.08);
+  --lift-strong: rgba(29, 36, 56, 0.14);
+}
+
 * {
   box-sizing: border-box;
 }
@@ -138,6 +179,9 @@ img {
   border-radius: 18px;
   background: #1c1c1e;
   box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.6);
+  /* The sign-in card stays dark in both themes (it sits on the dimmed
+     wallpaper), so its ink is pinned rather than themed. */
+  color: #f5f7fa;
   text-align: center;
   animation: home-unlock-pop 220ms cubic-bezier(0.2, 0.9, 0.3, 1) both;
 }
@@ -192,7 +236,7 @@ img {
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.06);
-  color: var(--text);
+  color: #f5f7fa;
   font-size: 14px;
   text-align: center;
 }
@@ -224,7 +268,7 @@ img {
 
 .home-unlock-button-secondary {
   background: rgba(255, 255, 255, 0.08);
-  color: var(--text);
+  color: #f5f7fa;
 }
 
 .home-unlock-button:disabled {
@@ -358,7 +402,7 @@ img {
 .toolbar-btn:hover:not(.toolbar-brand),
 .toolbar-btn:focus-visible:not(.toolbar-brand) {
   opacity: 1;
-  background-color: rgba(255, 255, 255, 0.15);
+  background-color: var(--lift-strong);
 }
 
 .toolbar-btn:focus-visible {
@@ -380,6 +424,13 @@ img {
 .toolbar-brand img {
   width: 107px;
   height: 17px;
+}
+
+/* The wordmark's lettering is white; on the light bar swap to the ink
+   variant (same glyph colors, navy lettering) — PC2 keeps brand color as-is
+   and never blanket-inverts the logo. */
+:root[data-el-theme="light"] .toolbar-brand img {
+  content: url("./elastos-logo-ink.svg");
 }
 
 /* Identity chrome: avatar + name as a disclosure menu. Account actions
@@ -409,7 +460,7 @@ img {
 
 .toolbar-identity-btn:hover,
 .toolbar-identity-btn[aria-expanded="true"] {
-  background-color: rgba(255, 255, 255, 0.15);
+  background-color: var(--lift-strong);
 }
 
 .toolbar-identity-btn:focus-visible {
@@ -451,9 +502,9 @@ img {
   display: grid;
   gap: 2px;
   border-radius: 12px;
-  background: rgba(22, 24, 29, 0.96);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.34);
+  background: var(--menu-fill);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-soft);
   backdrop-filter: blur(16px);
 }
 
@@ -488,7 +539,7 @@ img {
 
 .toolbar-identity-item:hover,
 .toolbar-identity-item:focus-visible {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--lift);
   outline: none;
 }
 
@@ -503,7 +554,17 @@ img {
 .toolbar-identity-divider {
   height: 1px;
   margin: 3px 6px;
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--panel-soft);
+}
+
+/* White stroke glyph; light theme inverts the button (PC2's approach) and
+   counter-inverts the numeric badge so it keeps its own colors. */
+:root[data-el-theme="light"] .inbox-btn {
+  filter: invert(1) hue-rotate(180deg);
+}
+
+:root[data-el-theme="light"] .toolbar-inbox-count {
+  filter: invert(1) hue-rotate(180deg);
 }
 
 .inbox-btn {
@@ -536,7 +597,7 @@ img {
 .toolbar-clock {
   margin-left: 10px;
   margin-right: 0;
-  color: #fff;
+  color: var(--text);
   font-size: 13px;
   font-weight: 500;
   line-height: 22px;
@@ -571,9 +632,9 @@ img {
   align-items: center;
   gap: 14px;
   padding: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
+  border: 1px solid var(--line);
   border-radius: 8px;
-  background: rgba(23, 27, 35, 0.94);
+  background: var(--menu-fill);
   box-shadow: var(--shadow-soft);
   backdrop-filter: blur(14px);
   transform: translateY(0);
@@ -735,6 +796,9 @@ img {
 .desktop-shortcut-title {
   display: block;
   width: 100%;
+  /* Labels sit on the wallpaper, not on a themed surface: white + shadow in
+     both themes (macOS does the same on the desktop). */
+  color: #f5f7fa;
   font-size: 12px;
   line-height: 1.28;
   text-align: center;
@@ -911,8 +975,8 @@ img {
 }
 
 .taskbar-sortable.drop-active {
-  background: rgba(255, 255, 255, 0.06);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16);
+  background: var(--lift);
+  box-shadow: inset 0 0 0 1px var(--hairline);
 }
 
 .taskbar-item {
@@ -1017,6 +1081,20 @@ img {
   outline-offset: 1px;
 }
 
+:root[data-el-theme="light"] .taskbar-window-count {
+  background: rgba(255, 255, 255, 0.94);
+  color: rgba(29, 36, 56, 0.9);
+  box-shadow:
+    0 0 0 1px rgba(29, 36, 56, 0.2),
+    0 2px 8px rgba(34, 49, 88, 0.18);
+}
+
+:root[data-el-theme="light"] .taskbar-window-count:hover,
+:root[data-el-theme="light"] .taskbar-window-count:focus-visible {
+  background: #ffffff;
+  color: #1d2438;
+}
+
 .taskbar-window-count[hidden] {
   display: none;
 }
@@ -1034,6 +1112,14 @@ img {
   opacity: 0.92;
 }
 
+:root[data-el-theme="light"] .taskbar-icon-launcher::before {
+  background:
+    linear-gradient(#3a4358 0 0) left top / 7px 7px no-repeat,
+    linear-gradient(#3a4358 0 0) right top / 7px 7px no-repeat,
+    linear-gradient(#3a4358 0 0) left bottom / 7px 7px no-repeat,
+    linear-gradient(#3a4358 0 0) right bottom / 7px 7px no-repeat;
+}
+
 .active-taskbar-indicator {
   position: absolute;
   left: 50%;
@@ -1045,6 +1131,10 @@ img {
   transform: translateX(-50%);
   opacity: 0;
   transition: opacity 0.16s ease;
+}
+
+:root[data-el-theme="light"] .active-taskbar-indicator {
+  background-color: rgba(55, 62, 68, 0.85);
 }
 
 .taskbar-item.open .active-taskbar-indicator {
@@ -1062,7 +1152,7 @@ img {
   height: 26px;
   margin: 0 5px;
   border-radius: 1px;
-  background: rgba(255, 255, 255, 0.16);
+  background: var(--hairline);
 }
 
 /* Dock tooltip: shared, non-interactive, positioned above the (possibly
@@ -1073,7 +1163,7 @@ img {
   padding: 4px 9px;
   transform: translateX(-50%) translateY(-100%);
   border-radius: 6px;
-  background: rgba(24, 26, 31, 0.96);
+  background: var(--menu-fill);
   color: var(--text);
   font-size: 12px;
   font-weight: 500;
@@ -1106,7 +1196,7 @@ img {
   /* Launchpad surface: the container is the single blurred layer while open
      (transient — not steady-state); the sheet itself stays transparent so no
      blurs nest. */
-  background: rgba(6, 7, 10, 0.55);
+  background: var(--overlay-dim);
   backdrop-filter: blur(24px);
   -webkit-backdrop-filter: blur(24px);
 }
@@ -1138,9 +1228,9 @@ img {
   overflow-x: auto;
   padding: 22px 26px;
   border-radius: 22px;
-  background: rgba(20, 22, 27, 0.86);
-  border: 0.5px solid rgba(255, 255, 255, 0.14);
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.44);
+  background: var(--menu-fill);
+  border: 0.5px solid var(--line);
+  box-shadow: var(--shadow);
   backdrop-filter: blur(24px);
   -webkit-backdrop-filter: blur(24px);
 }
@@ -1156,7 +1246,7 @@ img {
 }
 
 .window-switcher-item[aria-selected="true"] {
-  background: rgba(255, 255, 255, 0.14);
+  background: var(--lift-strong);
 }
 
 .window-switcher-item[data-minimized="true"] .window-switcher-glyph {
@@ -1179,7 +1269,7 @@ img {
 .window-switcher-title {
   font-size: 0.74rem;
   line-height: 1.25;
-  color: rgba(255, 255, 255, 0.88);
+  color: var(--text);
   text-align: center;
   overflow: hidden;
   display: -webkit-box;
@@ -1193,7 +1283,7 @@ img {
   z-index: 100150;
   display: grid;
   place-items: center;
-  background: rgba(6, 8, 11, 0.44);
+  background: var(--overlay-dim);
   backdrop-filter: blur(4px);
   -webkit-backdrop-filter: blur(4px);
 }
@@ -1205,9 +1295,9 @@ img {
   overflow: auto;
   padding: 22px 26px 24px;
   border-radius: 18px;
-  background: rgba(22, 24, 29, 0.97);
-  border: 0.5px solid rgba(255, 255, 255, 0.12);
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.44);
+  background: var(--menu-fill);
+  border: 0.5px solid var(--line);
+  box-shadow: var(--shadow);
 }
 
 .shortcuts-title {
@@ -1229,7 +1319,7 @@ img {
   justify-content: space-between;
   gap: 16px;
   padding: 7px 2px;
-  border-bottom: 0.5px solid rgba(255, 255, 255, 0.07);
+  border-bottom: 0.5px solid var(--panel-soft);
 }
 
 .shortcuts-row:last-child {
@@ -1238,7 +1328,7 @@ img {
 
 .shortcuts-row dt {
   font-size: 0.85rem;
-  color: rgba(255, 255, 255, 0.82);
+  color: var(--text);
 }
 
 .shortcuts-row dd {
@@ -1247,7 +1337,7 @@ img {
   align-items: center;
   gap: 4px;
   font-size: 0.76rem;
-  color: rgba(255, 255, 255, 0.6);
+  color: var(--soft);
   white-space: nowrap;
 }
 
@@ -1257,12 +1347,12 @@ img {
   min-width: 22px;
   padding: 2px 6px;
   border-radius: 5px;
-  background: rgba(255, 255, 255, 0.09);
-  border: 0.5px solid rgba(255, 255, 255, 0.14);
+  background: var(--lift);
+  border: 0.5px solid var(--line);
   box-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.28);
   font-family: inherit;
   font-size: 0.72rem;
-  color: rgba(255, 255, 255, 0.86);
+  color: var(--text);
 }
 
 .context-menu {
@@ -1276,9 +1366,9 @@ img {
   display: grid;
   gap: 0.12rem;
   border-radius: 14px;
-  background: rgba(22, 24, 29, 0.96);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.34);
+  background: var(--menu-fill);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-soft);
   backdrop-filter: blur(16px);
   user-select: none;
   -webkit-user-select: none;
@@ -1314,14 +1404,14 @@ body.dragging-target {
 
 .context-menu-item:hover,
 .context-menu-item:focus-visible {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--lift);
   outline: none;
 }
 
 .context-menu-divider {
   height: 1px;
   margin: 0.2rem 0.35rem;
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--panel-soft);
 }
 
 .launcher-popover {
@@ -1371,8 +1461,12 @@ body.dragging-target {
   filter: invert(1);
 }
 
+:root[data-el-theme="light"] .launcher-close img {
+  filter: none;
+}
+
 .launcher-close:hover {
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--lift);
   opacity: 1;
 }
 
@@ -1401,7 +1495,7 @@ body.dragging-target {
   padding: 0 14px 0 38px;
   border: 1px solid var(--line);
   border-radius: 10px;
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--panel-soft);
   color: var(--text);
   outline: none;
 }
@@ -1471,7 +1565,7 @@ body.dragging-target {
 
 .launcher-card:hover .launcher-card-body,
 .launcher-card:focus-visible .launcher-card-body {
-  background-color: rgba(255, 255, 255, 0.08);
+  background-color: var(--lift);
   outline: none;
 }
 
@@ -1648,6 +1742,10 @@ body.dragging-target {
   text-overflow: ellipsis;
 }
 
+:root[data-el-theme="light"] .window-head-title {
+  color: rgba(29, 36, 56, 0.92);
+}
+
 .window-action-btn {
   width: 26px;
   height: 26px;
@@ -1667,8 +1765,12 @@ body.dragging-target {
   filter: invert(1) brightness(1.05);
 }
 
+:root[data-el-theme="light"] .window-action-btn img {
+  filter: none;
+}
+
 .window-action-btn:hover {
-  background-color: rgba(255, 255, 255, 0.1);
+  background-color: var(--lift);
   opacity: 1;
 }
 
@@ -1685,7 +1787,7 @@ body.dragging-target {
   position: relative;
   padding: 0;
   overflow: hidden;
-  background-color: #0b0d10;
+  background-color: var(--frame-fill);
 }
 
 /* Launch skeleton: one calm pulsing shape on the dark frame while the capsule
@@ -1699,7 +1801,7 @@ body.dragging-target {
   height: 44px;
   margin: -22px 0 0 -22px;
   border-radius: 12px;
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--lift);
   animation: launch-skeleton-pulse 1.1s ease-in-out infinite;
 }
 
@@ -1765,7 +1867,7 @@ body.dragging-target {
 
 .home-people-sidebar-item.active,
 .home-people-sidebar-item:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--lift);
 }
 
 .home-people-sidebar-icon {
@@ -1987,7 +2089,7 @@ body.dragging-target {
   height: 38px;
   place-items: center;
   border-radius: 50%;
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--lift);
   color: var(--el-text);
   font-size: 15px;
   font-weight: 700;
@@ -2042,7 +2144,7 @@ body.dragging-target {
 .home-people-action:hover:not(:disabled),
 .home-people-action:focus-visible:not(:disabled) {
   border-color: var(--el-hairline-strong);
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--lift);
 }
 
 .home-people-action:focus-visible:not(:disabled) {
@@ -2306,7 +2408,7 @@ body.dragging-target {
   width: 100%;
   height: 100%;
   border: 0;
-  background: #0b0d10;
+  background: var(--frame-fill);
   opacity: 0;
   transition: opacity 220ms cubic-bezier(0.2, 0, 0, 1);
   pointer-events: none;
