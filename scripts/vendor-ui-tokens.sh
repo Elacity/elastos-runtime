@@ -21,6 +21,10 @@ TARGETS=(
   documents
   inbox
   system
+  wallet
+  marketplace-content
+  chat-room
+  library
 )
 
 MODE="${1:-sync}"

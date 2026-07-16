@@ -1,0 +1,163 @@
+/* GENERATED from capsules/_shared/elastos-ui.css — do not edit. Run `just vendor-ui`. */
+/* ElastOS UI — shared design tokens (single source of truth).
+ *
+ * This file lives at capsules/_shared/elastos-ui.css and is VENDORED into each
+ * participating capsule's browser/ dir by `just vendor-ui` (no gateway route,
+ * no shared runtime surface — capsules stay self-contained). Edit THIS file,
+ * then run `just vendor-ui`; `just alignment-check` fails on drift.
+ *
+ * Contents: Inter (OFL, latin variable subset), palette, type scale, radii,
+ * hairlines, blur/elevation steps, motion tokens, and minimal control
+ * primitives. Layout is each app's business — tokens only.
+ */
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: optional;
+  src: url("./assets/fonts/Inter-latin-var.woff2") format("woff2");
+}
+
+:root {
+  color-scheme: dark;
+
+  /* Palette */
+  --el-bg: #0b0d10;
+  --el-surface: rgba(22, 24, 29, 0.92);
+  --el-surface-raised: #16181d;
+  --el-inset: rgba(255, 255, 255, 0.06);
+  --el-text: #f5f7fa;
+  --el-muted: rgba(245, 247, 250, 0.7);
+  --el-soft: rgba(245, 247, 250, 0.48);
+  --el-brand: #f6921a;
+  --el-brand-strong: #ffb457;
+  --el-focus: rgba(246, 146, 26, 0.55);
+  --el-danger: #ff8f8f;
+  --el-ok: #34d399;
+
+  /* Hairlines (one pair, everywhere) */
+  --el-hairline: rgba(255, 255, 255, 0.12);
+  --el-hairline-strong: rgba(255, 255, 255, 0.18);
+
+  /* Type: 10/11/12/13/14/16/28; weights 400/500/600/700 */
+  --el-font: "Inter", -apple-system, "Segoe UI", "SF Pro Text", sans-serif;
+  --el-font-mono: ui-monospace, "SF Mono", Menlo, monospace;
+  --el-text-2xs: 10px;
+  --el-text-xs: 11px;
+  --el-text-sm: 12px;
+  --el-text-md: 13px;
+  --el-text-lg: 14px;
+  --el-text-xl: 16px;
+  --el-text-display: 28px;
+
+  /* Radii: 4/6/10/12/16/20 + pill */
+  --el-radius-xs: 4px;
+  --el-radius-sm: 6px;
+  --el-radius-md: 10px;
+  --el-radius-lg: 12px;
+  --el-radius-xl: 16px;
+  --el-radius-2xl: 20px;
+  --el-radius-pill: 999px;
+
+  /* Blur: three steps only */
+  --el-blur-1: 8px;
+  --el-blur-2: 16px;
+  --el-blur-3: 24px;
+
+  /* Elevation: three levels */
+  --el-shadow-1: 0 2px 10px rgba(0, 0, 0, 0.22);
+  --el-shadow-2: 0 12px 28px rgba(0, 0, 0, 0.28);
+  --el-shadow-3: 0 24px 80px rgba(0, 0, 0, 0.35);
+
+  /* Motion: 80/140/180/220, exits 150; one ease */
+  --el-dur-1: 80ms;
+  --el-dur-2: 140ms;
+  --el-dur-3: 180ms;
+  --el-dur-4: 220ms;
+  --el-dur-exit: 150ms;
+  --el-ease: cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* App base: opt in by putting .el-app on <body>. Dark shell surface, shared
+   type. Layout untouched. */
+.el-app {
+  margin: 0;
+  background: var(--el-bg);
+  color: var(--el-text);
+  font-family: var(--el-font);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+.el-app :focus-visible {
+  outline: 2px solid var(--el-focus);
+  outline-offset: 2px;
+}
+
+/* Minimal control primitives — enough that a capsule needs no bespoke button
+   or input styling to look native. */
+.el-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 0 14px;
+  border: 1px solid var(--el-hairline);
+  border-radius: var(--el-radius-md);
+  background: var(--el-inset);
+  color: var(--el-text);
+  font: 500 var(--el-text-md) / 1.2 var(--el-font);
+  cursor: pointer;
+  transition: background-color var(--el-dur-2) var(--el-ease);
+}
+
+.el-button:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.el-button:active {
+  transform: scale(0.96);
+}
+
+.el-button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.el-button-primary {
+  border-color: transparent;
+  background: var(--el-brand);
+  color: #161616;
+  font-weight: 600;
+}
+
+.el-button-primary:hover {
+  background: var(--el-brand-strong);
+}
+
+.el-input {
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--el-hairline);
+  border-radius: var(--el-radius-md);
+  background: var(--el-inset);
+  color: var(--el-text);
+  font: 400 var(--el-text-md) / 1.2 var(--el-font);
+}
+
+.el-input::placeholder {
+  color: var(--el-soft);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .el-app *,
+  .el-app *::before,
+  .el-app *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
