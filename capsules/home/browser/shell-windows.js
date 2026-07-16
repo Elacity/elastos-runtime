@@ -1912,6 +1912,11 @@ function launchDidFail(launched) {
   );
 }
 
+// Reveal budget for a navigating iframe: fade in on load, but never stay
+// invisible longer than this — a slow capsule paints over the dark frame
+// default instead of a white flash.
+const FRAME_REVEAL_FAILSAFE_MS = 300;
+
 function syncBrowserWindow(entry, launched) {
   const node = entry.node;
   const frame = node.querySelector(".window-frame");
@@ -1920,6 +1925,7 @@ function syncBrowserWindow(entry, launched) {
   cleanupFrameAutoFit(node);
 
   const syncLoadedFrame = () => {
+    frame.classList.add("is-ready");
     if (entry.targetId !== "browser") {
       installFrameAutoFit(node, frame);
     }
@@ -1930,6 +1936,9 @@ function syncBrowserWindow(entry, launched) {
   if (frame.dataset.route !== launched.route) {
     frame.src = launched.route;
     frame.dataset.route = launched.route;
+    window.setTimeout(() => {
+      frame.classList.add("is-ready");
+    }, FRAME_REVEAL_FAILSAFE_MS);
     return;
   }
   syncLoadedFrame();

@@ -1,3 +1,14 @@
+/* Inter, self-hosted (latin subset, variable 400-700, OFL). font-display:
+   optional + preload: either the font is ready at first paint or the system
+   stack is used for the whole session — no late swap, no layout shift. */
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: optional;
+  src: url("./assets/fonts/Inter-latin-var.woff2") format("woff2");
+}
+
 :root {
   color-scheme: dark;
   --bg: #050608;
@@ -2001,15 +2012,28 @@ body.dragging-target {
   .dock-tooltip {
     transition: none;
   }
+
+  .window-frame {
+    transition: none;
+  }
 }
 
+/* App iframes are dark until the capsule paints — the white flash is dead.
+   Content fades in on load, with a short fail-open so a slow capsule is never
+   invisible. */
 .window-frame {
   display: block;
   width: 100%;
   height: 100%;
   border: 0;
-  background: #fff;
+  background: #0b0d10;
+  opacity: 0;
+  transition: opacity 220ms cubic-bezier(0.2, 0, 0, 1);
   pointer-events: none;
+}
+
+.window-frame.is-ready {
+  opacity: 1;
 }
 
 .window-active .window-frame {
