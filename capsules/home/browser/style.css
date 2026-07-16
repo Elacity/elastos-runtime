@@ -1461,12 +1461,13 @@ body.dragging-target {
   overflow: hidden;
 }
 
+/* People renders inside the shell itself — it uses the shared dark tokens
+   directly (the last light-on-dark clash in home). */
 .window-body.home-people-body {
   padding: 0;
   overflow: hidden;
-  background: #fff;
-  color: #1f2937;
-  font-family: "Avenir Next", "Segoe UI", sans-serif;
+  background: var(--el-bg);
+  color: var(--el-text);
 }
 
 .home-people-shell {
@@ -1475,7 +1476,7 @@ body.dragging-target {
   width: 100%;
   height: 100%;
   min-height: 0;
-  background: #fff;
+  background: var(--el-bg);
 }
 
 .home-people-sidebar {
@@ -1484,8 +1485,8 @@ body.dragging-target {
   flex-direction: column;
   gap: 4px;
   padding: 20px;
-  border-right: 1px solid #e5e7eb;
-  background: #f9f9f9;
+  border-right: 1px solid var(--el-hairline);
+  background: rgba(255, 255, 255, 0.03);
 }
 
 .home-people-sidebar-item {
@@ -1496,7 +1497,7 @@ body.dragging-target {
   border-radius: 4px;
   padding: 8px 10px;
   background: transparent;
-  color: #1f2937;
+  color: var(--el-text);
   cursor: pointer;
   font: inherit;
   font-size: 14px;
@@ -1506,7 +1507,7 @@ body.dragging-target {
 
 .home-people-sidebar-item.active,
 .home-people-sidebar-item:hover {
-  background: #e5e7eb;
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .home-people-sidebar-icon {
@@ -1564,16 +1565,16 @@ body.dragging-target {
   min-height: 0;
   flex-direction: column;
   overflow: hidden;
-  background: #fff;
+  background: var(--el-bg);
 }
 
 .home-people-status {
   min-height: 32px;
   padding: 9px 30px;
-  border-bottom: 1px solid #e5e7eb;
-  color: #6b7280;
+  border-bottom: 1px solid var(--el-hairline);
+  color: var(--el-muted);
   font-size: 12px;
-  background: #fff;
+  background: transparent;
 }
 
 .home-people-status[hidden] {
@@ -1581,11 +1582,11 @@ body.dragging-target {
 }
 
 .home-people-status[data-tone="error"] {
-  color: #b91c1c;
+  color: var(--el-danger);
 }
 
 .home-people-status[data-tone="ok"] {
-  color: #047857;
+  color: var(--el-ok);
 }
 
 .home-people-content {
@@ -1607,22 +1608,22 @@ body.dragging-target {
   grid-template-columns: minmax(0, 1fr);
   gap: 12px;
   align-items: start;
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--el-hairline);
   border-radius: 8px;
   padding: 16px;
-  background: #fff;
+  background: var(--el-surface-raised);
 }
 
 .home-people-profile-copy h3 {
   margin: 0;
-  color: #111827;
+  color: var(--el-text);
   font-size: 15px;
   font-weight: 700;
 }
 
 .home-people-profile-copy p {
   margin: 0.28rem 0 0;
-  color: #6b7280;
+  color: var(--el-muted);
   font-size: 13px;
   line-height: 1.45;
 }
@@ -1637,7 +1638,7 @@ body.dragging-target {
 
 .home-people-profile-label {
   grid-column: 1 / -1;
-  color: #4b5563;
+  color: var(--el-muted);
   font-size: 12px;
   font-weight: 600;
 }
@@ -1645,18 +1646,18 @@ body.dragging-target {
 .home-people-profile-input {
   width: 100%;
   min-height: 36px;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--el-hairline);
   border-radius: 6px;
   padding: 7px 10px;
-  background: #fff;
-  color: #111827;
+  background: var(--el-inset);
+  color: var(--el-text);
   font: inherit;
   font-size: 13px;
 }
 
 .home-people-profile-input:focus {
-  border-color: #9ca3af;
-  outline: 2px solid rgba(17, 24, 39, 0.1);
+  border-color: var(--el-hairline-strong);
+  outline: 2px solid var(--el-focus);
   outline-offset: 1px;
 }
 
@@ -1664,9 +1665,9 @@ body.dragging-target {
   display: grid;
   gap: 0;
   overflow: hidden;
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--el-hairline);
   border-radius: 8px;
-  background: #fff;
+  background: var(--el-surface-raised);
 }
 
 .home-people-discovery-grid {
@@ -1697,7 +1698,7 @@ body.dragging-target {
 
 .home-people-discovery-column h4 {
   margin: 0;
-  color: #111827;
+  color: var(--el-muted);
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.5px;
@@ -1706,7 +1707,7 @@ body.dragging-target {
 
 .home-people-card,
 .home-people-empty {
-  background: #fff;
+  background: var(--el-surface-raised);
 }
 
 .home-people-card {
@@ -1715,7 +1716,7 @@ body.dragging-target {
   align-items: center;
   gap: 12px;
   padding: 14px 16px;
-  border-bottom: 1px solid #e5e7eb;
+  border-bottom: 1px solid var(--el-hairline);
 }
 
 .home-people-card:last-child {
@@ -1728,8 +1729,8 @@ body.dragging-target {
   height: 38px;
   place-items: center;
   border-radius: 50%;
-  background: #f3f4f6;
-  color: #374151;
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--el-text);
   font-size: 15px;
   font-weight: 700;
 }
@@ -1741,7 +1742,7 @@ body.dragging-target {
 .home-people-card-copy h3,
 .home-people-empty h3 {
   margin: 0;
-  color: #1f2937;
+  color: var(--el-text);
   font-size: 15px;
   font-weight: 700;
 }
@@ -1749,7 +1750,7 @@ body.dragging-target {
 .home-people-card-copy p,
 .home-people-empty p {
   margin: 0.22rem 0 0;
-  color: #6b7280;
+  color: var(--el-muted);
   font-size: 13px;
   line-height: 1.45;
 }
@@ -1769,11 +1770,11 @@ body.dragging-target {
 
 .home-people-action {
   min-height: 34px;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--el-hairline);
   border-radius: 6px;
   padding: 6px 11px;
-  background: #fff;
-  color: #1f2937;
+  background: var(--el-inset);
+  color: var(--el-text);
   cursor: pointer;
   font: inherit;
   font-size: 13px;
@@ -1782,9 +1783,13 @@ body.dragging-target {
 
 .home-people-action:hover:not(:disabled),
 .home-people-action:focus-visible:not(:disabled) {
-  border-color: #9ca3af;
-  background: #f9fafb;
-  outline: none;
+  border-color: var(--el-hairline-strong);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.home-people-action:focus-visible:not(:disabled) {
+  outline: 2px solid var(--el-focus);
+  outline-offset: 1px;
 }
 
 .home-people-action:disabled {
@@ -1793,16 +1798,16 @@ body.dragging-target {
 }
 
 .home-people-action-danger {
-  color: #b91c1c;
+  color: var(--el-danger);
 }
 
 .home-people-badge {
   min-height: 34px;
-  border: 1px solid #bbf7d0;
+  border: 1px solid rgba(52, 211, 153, 0.32);
   border-radius: 999px;
   padding: 7px 11px;
-  background: #f0fdf4;
-  color: #166534;
+  background: rgba(52, 211, 153, 0.12);
+  color: var(--el-ok);
   font-size: 12px;
   font-weight: 700;
 }
@@ -1811,7 +1816,7 @@ body.dragging-target {
   display: grid;
   min-height: 140px;
   place-items: center;
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--el-hairline);
   border-radius: 8px;
   padding: 20px;
   text-align: center;
