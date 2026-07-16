@@ -4,32 +4,41 @@
  * Follow-up (design-systems): replace emoji glyphs with a real inline-SVG icon set. */
 
 /* ---------- TOKENS ---------- */
+/* Dark default is remapped onto the shared ElastOS tokens (./elastos-ui.css, loaded first)
+   so surfaces, text, hairlines, brand, and type match the shell. Semantic names stay —
+   the class contract and the [data-theme=light] override below are untouched. */
 :root{
-  /* color — semantic, dark default */
-  --bg:#0a0c0f; --bg-elev:#0e1116; --panel:#14171d; --panel-2:#1a1e26; --panel-3:#20252e;
-  --line:#252b34; --line-2:#2f3640; --ink:#eef2f7; --ink-2:#c5ccd6; --mut:#8b94a1; --mut-2:#828b98;
-  /* brand: elacity turquoise + gold (design-tokens.json; from elacity-web feature/ui-polish-2026). turquoise
-     is a LIGHT fill, so on-accent text is DARK (matches elacity-web primary.contrastText #0a0a0a). */
-  --acc:#5edad9; --acc-press:#3fc7c5; --acc-soft:#0f2a28; --acc2:#daa520; --on-acc:#04211f;
-  --gold:#daa520; --vivid:#fdecb6; --brand-ink:#131a22; --ok:#34d399; --warn:#fbbf24; --bad:#f87171;
-  --chip:#16213e; --chip-ink:#bcd0ff; --chip-line:#2b3a5e;
+  color-scheme:dark;
+  /* color — semantic, dark default (values = shared --el-* tokens) */
+  --bg:var(--el-bg); --bg-elev:var(--el-surface-raised); --panel:var(--el-surface);
+  --panel-2:var(--el-inset); --panel-3:rgba(255,255,255,.1);
+  --line:var(--el-hairline); --line-2:var(--el-hairline-strong);
+  --ink:var(--el-text); --ink-2:var(--el-muted); --mut:var(--el-muted); --mut-2:var(--el-soft);
+  /* brand: ElastOS orange. Orange is a LIGHT fill, so on-accent text stays DARK. */
+  --acc:var(--el-brand); --acc-press:color-mix(in srgb,var(--el-brand) 82%,#000);
+  --acc-soft:color-mix(in srgb,var(--el-brand) 16%,transparent); --acc2:var(--el-brand-strong); --on-acc:var(--el-bg);
+  --gold:var(--el-brand-strong); --vivid:#fdecb6; --brand-ink:#131a22;
+  --ok:var(--el-ok); --warn:#fbbf24; --bad:var(--el-danger);
+  --chip:color-mix(in srgb,var(--el-brand) 12%,transparent); --chip-ink:var(--el-brand-strong);
+  --chip-line:color-mix(in srgb,var(--el-brand) 32%,transparent);
   /* type ramp (1.20 minor third) */
-  --f:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;
+  --f:var(--el-font);
   --fxs:11.5px; --fsm:12.5px; --fbase:14.5px; --flg:16px; --fxl:19px; --f2xl:23px; --f3xl:31px;
   --lh:1.55; --lh-tight:1.25;
   /* space scale (4pt) */
   --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:20px; --s6:24px; --s7:32px; --s8:44px;
   /* radius + elevation */
   --r-sm:9px; --r:13px; --r-lg:18px; --r-pill:999px;
-  --e1:0 1px 0 rgba(255,255,255,.03),0 1px 2px rgba(0,0,0,.3);
-  --e2:0 1px 0 rgba(255,255,255,.04),0 6px 18px rgba(0,0,0,.32);
-  --e3:0 1px 0 rgba(255,255,255,.05),0 18px 44px rgba(0,0,0,.46);
-  /* shadow-as-border depth (elacity-web ui-polish-2026 shadowBorder) — dark collapses to one translucent ring */
-  --depth:0 0 0 1px rgba(255,255,255,.08); --depth-hover:0 0 0 1px rgba(255,255,255,.13);
-  --ring:0 0 0 2px var(--bg),0 0 0 4px var(--acc);
+  --e1:var(--el-shadow-1);
+  --e2:var(--el-shadow-2);
+  --e3:var(--el-shadow-3);
+  /* shadow-as-border depth — dark collapses to one hairline ring */
+  --depth:0 0 0 1px var(--el-hairline); --depth-hover:0 0 0 1px var(--el-hairline-strong);
+  --ring:0 0 0 2px var(--bg),0 0 0 4px var(--el-focus);
   --t-fast:.12s cubic-bezier(.2,.6,.2,1); --t:.2s cubic-bezier(.2,.6,.2,1); --t-slow:.32s cubic-bezier(.2,.6,.2,1);
 }
 [data-theme=light]{
+  color-scheme:light;
   --bg:#f7f8fa; --bg-elev:#fff; --panel:#fff; --panel-2:#f1f3f6; --panel-3:#e9edf2;
   --line:#e4e8ee; --line-2:#d7dde5; --ink:#0e131a; --ink-2:#2c3340; --mut:#5b6573; --mut-2:#838c98;
   /* light: turquoise is too light to read as text/fill on a light bg, so the accent deepens to a teal that
@@ -64,7 +73,7 @@ body{margin:0;background:var(--bg);color:var(--ink);font:var(--fbase)/var(--lh) 
 .glyph{width:36px;height:36px;display:inline-grid;place-items:center;border-radius:var(--r-sm);background:var(--panel-2);
   border:1px solid var(--line);font-size:15px;cursor:pointer;color:var(--ink);transition:background var(--t-fast),transform var(--t-fast)}
 .glyph:hover{background:var(--panel-3)} .glyph:active{transform:scale(.96)}
-.badge{font-size:var(--fxs);color:var(--ok);border:1px solid #1f4d3a;background:#0f2a20;border-radius:7px;padding:2px 7px;font-weight:600}
+.badge{font-size:var(--fxs);color:var(--ok);border:1px solid color-mix(in srgb,var(--el-ok) 32%,transparent);background:color-mix(in srgb,var(--el-ok) 12%,transparent);border-radius:7px;padding:2px 7px;font-weight:600}
 [data-theme=light] .badge{background:#e7f8f0;border-color:#bfe9d6;color:#0a7a52}
 
 /* ---------- NAV ---------- */
@@ -97,8 +106,8 @@ body{margin:0;background:var(--bg);color:var(--ink);font:var(--fbase)/var(--lh) 
 
 /* ---------- HERO ---------- */
 .hero{position:relative;border-radius:var(--r-lg);overflow:hidden;border:1px solid var(--line);padding:var(--s7);
-  background:radial-gradient(130% 130% at 92% 8%,rgba(124,91,255,.38),transparent 55%),
-    radial-gradient(130% 130% at 8% 92%,rgba(91,140,255,.32),transparent 52%),var(--panel);box-shadow:var(--e2)}
+  background:radial-gradient(130% 130% at 92% 8%,rgba(246,146,26,.26),transparent 55%),
+    radial-gradient(130% 130% at 8% 92%,rgba(255,180,87,.16),transparent 52%),var(--panel);box-shadow:var(--e2)}
 .hero h1{margin:.18em 0;font-size:var(--f3xl);line-height:var(--lh-tight);letter-spacing:-.5px}
 .hero p{max-width:580px;color:var(--ink-2)}
 
@@ -124,7 +133,7 @@ body{margin:0;background:var(--bg);color:var(--ink);font:var(--fbase)/var(--lh) 
 .tm-resell{position:absolute;top:6px;right:6px;z-index:2;display:flex;flex-direction:column;align-items:flex-end;gap:5px}
 .tm-resell .tm{position:static}
 .tm-xl{font-size:13px;padding:3px 6px}
-.tm-off{background:var(--bad);color:#fff}
+.tm-off{background:var(--bad);color:var(--el-bg)}
 /* below the thumbnail: avatar + 2-line title + owner | price (right). Padding 8/8/12 (elacity CardContent) */
 .meta{padding:8px 8px 12px}
 .meta .head{display:flex;align-items:flex-start;gap:8px}
@@ -164,11 +173,11 @@ a.chip-cat:hover{color:var(--ink);background:var(--panel-2)}
 .stage{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);overflow:hidden;box-shadow:var(--e2)}
 .cover{aspect-ratio:16/9;position:relative;display:grid;place-items:center;font-size:54px;color:#fff}
 .cover::after{content:"";position:absolute;inset:0;background:linear-gradient(180deg,transparent 62%,rgba(0,0,0,.30))}
-.covertag{position:absolute;left:var(--s4);bottom:var(--s3);font-size:var(--fsm);color:#e7edf5;text-transform:capitalize;z-index:1;background:rgba(0,0,0,.35);padding:3px 10px;border-radius:999px;-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px)}
+.covertag{position:absolute;left:var(--s4);bottom:var(--s3);font-size:var(--fsm);color:var(--el-text);text-transform:capitalize;z-index:1;background:rgba(0,0,0,.35);padding:3px 10px;border-radius:999px;-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px)}
 .stagehead{padding:var(--s5);border-top:1px solid var(--line)}
 .stagehead h2{margin:0 0 var(--s1);font-size:var(--f2xl);letter-spacing:-.3px}
 .verified{display:inline-flex;align-items:center;gap:6px;color:var(--ok);font-size:var(--fsm);margin-top:var(--s2)}
-.cid{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--mut);font-size:12px}
+.cid{font-family:var(--el-font-mono);color:var(--mut);font-size:12px}
 .cardx{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);padding:var(--s5);margin-bottom:var(--s4);box-shadow:var(--e1)}
 .cardx h4{margin:0 0 var(--s3);font-size:var(--fxs);color:var(--mut);text-transform:uppercase;letter-spacing:.8px}
 .kv{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin:8px 0;font-size:var(--fbase)}
@@ -219,7 +228,7 @@ details.acc[open]>summary::after{transform:rotate(45deg)}
 @keyframes pop-out{to{opacity:0;transform:translateY(-8px) scale(.99)}}
 .sheet h3{margin:0 0 var(--s1);font-size:var(--fxl)} .sheet .x{float:right;cursor:pointer;color:var(--mut);font-size:18px;background:none;border:0;font-family:inherit;line-height:1;padding:4px}
 .sheet .x:hover{color:var(--ink)}
-.code{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:var(--panel-2);border:1px solid var(--line);
+.code{font-family:var(--el-font-mono);font-size:11.5px;background:var(--panel-2);border:1px solid var(--line);
   border-radius:10px;padding:var(--s3);white-space:pre-wrap;word-break:break-all;color:var(--mut);max-height:170px;overflow:auto}
 .toast{position:fixed;left:50%;bottom:var(--s6);transform:translateX(-50%);background:var(--bg-elev);border:1px solid var(--line-2);
   border-radius:11px;padding:12px 17px;box-shadow:var(--e3);z-index:30;animation:toastin var(--t)}
@@ -242,7 +251,7 @@ details.acc[open]>summary::after{transform:rotate(45deg)}
 .kv,.stepper,.legend,.bigprice,.price,.covertag,.cid,.shelf h3,.pill{font-variant-numeric:tabular-nums}
 /* Inset outline on media covers — PURE neutrals only (skill non-negotiable: a tinted ring reads as dirt on
    the poster edge): pure white in dark, pure black in light. */
-.thumb,.cover{box-shadow:inset 0 0 0 1px rgba(255,255,255,.1)}
+.thumb,.cover{box-shadow:inset 0 0 0 1px var(--el-hairline)}
 [data-theme=light] .thumb,[data-theme=light] .cover{box-shadow:inset 0 0 0 1px rgba(0,0,0,.1)}
 
 /* ---------- INLINE ICONS (lucide-style stroke, inherits currentColor — no emoji) ---------- */
