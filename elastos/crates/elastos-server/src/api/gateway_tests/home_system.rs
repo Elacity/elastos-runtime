@@ -24,6 +24,73 @@ impl Drop for EnvRestore {
     }
 }
 
+async fn home_test_get_json(
+    app: &axum::Router,
+    uri: &str,
+    token: &str,
+) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("x-elastos-home-token", token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload = serde_json::from_slice(&body).unwrap();
+    (status, payload)
+}
+
+async fn home_test_post_json(
+    app: &axum::Router,
+    uri: &str,
+    token: &str,
+    payload: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload = serde_json::from_slice(&body).unwrap();
+    (status, payload)
+}
+
+fn home_shell_shared_facts(summary: &serde_json::Value) -> serde_json::Value {
+    json!({
+        "identity": summary["identity"],
+        "authority": {
+            "principal_id": summary["authority"]["principal_id"],
+            "session_id": summary["authority"]["session_id"],
+            "proof_binding_id": summary["authority"]["proof_binding_id"],
+        },
+        "runtime": summary["runtime"],
+        "services": summary["services"],
+        "capsule_catalog": summary["capsule_catalog"],
+        "capsule_interfaces": summary["capsule_interfaces"],
+        "targets": summary["targets"],
+    })
+}
+
 #[tokio::test]
 async fn test_home_static_route_serves_browser_surface() {
     let dir = tempfile::tempdir().unwrap();
@@ -5014,6 +5081,138 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["active"], "home-cli");
+}
+
+#[tokio::test]
+async fn test_home_shell_switch_preserves_runtime_facts_and_recovers_after_launch_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = test_state(dir.path());
+    std::fs::remove_file(dir.path().join("capsules/home-cli").join("home-cli.wasm")).unwrap();
+    let app = gateway_router(state);
+    let authority = passkey_authority_with_name(dir.path(), Some("shell-parity"));
+
+    let (status, gui_before) =
+        home_test_get_json(&app, "/api/apps/home/summary", &authority.home_token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(gui_before["active_shell"]["active"], HOME_GUI_SHELL_ID);
+    let shared_before = home_shell_shared_facts(&gui_before);
+    let installed_before = gui_before["capsule_catalog"]["capsules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|capsule| capsule["installed"] == true)
+        .map(|capsule| capsule["name"].as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+    assert!(installed_before.contains(HOME_GUI_SHELL_ID));
+    assert!(installed_before.contains(HOME_CLI_CAPSULE_ID_FOR_TEST));
+
+    let (status, failed_launch) = home_test_post_json(
+        &app,
+        "/api/apps/home/launch",
+        &authority.home_token,
+        json!({ "target": HOME_CLI_CAPSULE_ID_FOR_TEST }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(failed_launch["launch_status"], "failed");
+    assert!(failed_launch["launch_detail"]
+        .as_str()
+        .unwrap()
+        .contains("WASI Preview 1 product capsules are no longer materialized"));
+    let cli_token = failed_launch["route"]
+        .as_str()
+        .unwrap()
+        .split("home_token=")
+        .nth(1)
+        .unwrap();
+
+    let (status, cli_after_failure) =
+        home_test_get_json(&app, "/api/apps/home/summary", cli_token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        home_shell_shared_facts(&cli_after_failure),
+        shared_before,
+        "a failed shell launch changed shared Runtime facts"
+    );
+    assert_eq!(
+        cli_after_failure["active_shell"]["active"], HOME_GUI_SHELL_ID,
+        "a failed shell launch changed the active shell"
+    );
+
+    let (status, gui_catalog) =
+        home_test_get_json(&app, "/api/capsules/catalog", &authority.home_token).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, cli_catalog) = home_test_get_json(&app, "/api/capsules/catalog", cli_token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(gui_catalog, cli_catalog);
+    assert_eq!(gui_catalog, gui_before["capsule_catalog"]);
+
+    let (status, gui_interfaces) =
+        home_test_get_json(&app, "/api/capsules/interfaces", &authority.home_token).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, cli_interfaces) =
+        home_test_get_json(&app, "/api/capsules/interfaces", cli_token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(gui_interfaces, cli_interfaces);
+    assert_eq!(gui_interfaces, gui_before["capsule_interfaces"]);
+
+    let (status, selected_cli) = home_test_post_json(
+        &app,
+        "/api/apps/home/active-shell",
+        cli_token,
+        json!({ "active": HOME_CLI_CAPSULE_ID_FOR_TEST }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(selected_cli["active"], HOME_CLI_CAPSULE_ID_FOR_TEST);
+
+    let (status, gui_after_switch) =
+        home_test_get_json(&app, "/api/apps/home/summary", &authority.home_token).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, cli_after_switch) =
+        home_test_get_json(&app, "/api/apps/home/summary", cli_token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(gui_after_switch["active_shell"]["active"], "home-cli");
+    assert_eq!(cli_after_switch["active_shell"]["active"], "home-cli");
+    assert_eq!(home_shell_shared_facts(&gui_after_switch), shared_before);
+    assert_eq!(home_shell_shared_facts(&cli_after_switch), shared_before);
+    let candidates = cli_after_switch["active_shell"]["candidates"]
+        .as_array()
+        .unwrap();
+    let candidate_names = candidates
+        .iter()
+        .map(|candidate| candidate["name"].as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(candidate_names.len(), candidates.len());
+    assert_eq!(
+        candidate_names,
+        BTreeSet::from([HOME_GUI_SHELL_ID, HOME_CLI_CAPSULE_ID_FOR_TEST])
+    );
+    assert!(cli_after_switch["runtime"]["running_capsules"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let (status, selected_gui) = home_test_post_json(
+        &app,
+        "/api/apps/home/active-shell",
+        cli_token,
+        json!({ "active": HOME_GUI_SHELL_ID }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(selected_gui["active"], HOME_GUI_SHELL_ID);
+    let (status, gui_after_switchback) =
+        home_test_get_json(&app, "/api/apps/home/summary", &authority.home_token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        gui_after_switchback["active_shell"]["active"],
+        HOME_GUI_SHELL_ID
+    );
+    assert_eq!(
+        home_shell_shared_facts(&gui_after_switchback),
+        shared_before
+    );
 }
 
 #[tokio::test]

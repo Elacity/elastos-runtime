@@ -66,6 +66,8 @@ pub(super) async fn home_launch(
         attach_kind: target_summary.attach_kind,
         role: target_summary.role,
         target_kind: target_summary.target_kind,
+        viewer: target_summary.viewer,
+        viewer_title: target_summary.viewer_title,
         launch_status: launch.as_ref().map(|summary| summary.status.clone()),
         launch_detail: launch.as_ref().and_then(|summary| summary.detail.clone()),
         capsule_id: launch.and_then(|summary| summary.capsule_id),

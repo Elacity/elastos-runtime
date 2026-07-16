@@ -29,7 +29,7 @@ pub const RUNTIME_KIND_MANAGED_CHAT: &str = "managed-chat";
 pub const RUNTIME_KIND_MANAGED_HOME: &str = "managed-home";
 pub const OPERATOR_RUNTIME_REQUIRED_MESSAGE: &str =
     "This command requires a running runtime.\n\n  elastos serve\n\nThen run this command again.";
-pub(crate) const GATEWAY_OWNED_HOME_TERMINAL_ENV: &str = "ELASTOS_GATEWAY_OWNED_HOME_TERMINAL";
+pub const GATEWAY_OWNED_HOME_TERMINAL_ENV: &str = "ELASTOS_GATEWAY_OWNED_HOME_TERMINAL";
 const CARRIER_MDNS_ENV: &str = "ELASTOS_CARRIER_MDNS";
 const MANAGED_RUNTIME_REQUIRED_PROVIDERS: &[&str] =
     &["localhost-provider", "shell", "did-provider"];

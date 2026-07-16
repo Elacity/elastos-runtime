@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::ffi::OsStr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -24,6 +25,7 @@ use axum::response::{
     Html, IntoResponse, Redirect, Response,
 };
 use axum::routing::{delete, get, post, put};
+use axum::Extension;
 use axum::Json;
 use axum::Router;
 use elastos_common::localhost::{
@@ -131,6 +133,13 @@ pub(crate) const HOME_LAUNCH_TRUSTED_SIGNER_DID_ENV: &str =
     "ELASTOS_HOME_LAUNCH_TRUSTED_SIGNER_DID";
 pub(crate) const HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV: &str =
     "ELASTOS_HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR";
+pub const HOME_CLI_AUTH_CONTEXT_PRINCIPAL_ID_ENV: &str =
+    "ELASTOS_HOME_CLI_AUTH_CONTEXT_PRINCIPAL_ID";
+pub const HOME_CLI_AUTH_CONTEXT_SESSION_ID_ENV: &str = "ELASTOS_HOME_CLI_AUTH_CONTEXT_SESSION_ID";
+pub const HOME_CLI_AUTH_CONTEXT_PROOF_BINDING_ID_ENV: &str =
+    "ELASTOS_HOME_CLI_AUTH_CONTEXT_PROOF_BINDING_ID";
+pub const HOME_CLI_AUTH_CONTEXT_GRANT_ID_ENV: &str = "ELASTOS_HOME_CLI_AUTH_CONTEXT_GRANT_ID";
+pub const HOME_CLI_GATEWAY_API_URL_ENV: &str = "ELASTOS_HOME_CLI_GATEWAY_API_URL";
 const WALLET_PRICE_IDS: &[(&str, &str)] = &[
     ("BTC", "bitcoin"),
     ("ETH", "ethereum"),
@@ -178,11 +187,115 @@ pub fn home_services_snapshot(data_dir: &std::path::Path) -> serde_json::Value {
         .unwrap_or_else(|_| serde_json::json!({ "schema": "elastos.runtime.services/v1" }))
 }
 
+pub fn home_targets_snapshot(data_dir: &std::path::Path) -> serde_json::Value {
+    serde_json::to_value(gateway_home_runtime::home_targets(data_dir))
+        .unwrap_or_else(|_| serde_json::json!([]))
+}
+
+pub fn home_active_shell_snapshot(data_dir: &std::path::Path) -> anyhow::Result<serde_json::Value> {
+    gateway_home_system::home_active_shell_snapshot_value(data_dir, None)
+}
+
 pub fn issue_local_runtime_home_launch_token(
     data_dir: &std::path::Path,
     app: &str,
 ) -> anyhow::Result<String> {
     gateway_home_token::issue_local_runtime_home_launch_token(data_dir, app)
+}
+
+fn gateway_owned_home_cli_launch_context_from_env(
+    data_dir: &std::path::Path,
+) -> anyhow::Result<Option<HomeLaunchTokenContext>> {
+    if std::env::var_os(crate::runtime_control::GATEWAY_OWNED_HOME_TERMINAL_ENV).as_deref()
+        != Some(OsStr::new("1"))
+    {
+        return Ok(None);
+    }
+    let required_env = |key: &str| -> anyhow::Result<String> {
+        std::env::var(key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("{key} is missing"))
+    };
+    let proof_binding_id = std::env::var(HOME_CLI_AUTH_CONTEXT_PROOF_BINDING_ID_ENV).ok();
+    Ok(Some(home_launch_token_context_from_parts(
+        data_dir,
+        &required_env(HOME_CLI_AUTH_CONTEXT_PRINCIPAL_ID_ENV)?,
+        &required_env(HOME_CLI_AUTH_CONTEXT_SESSION_ID_ENV)?,
+        proof_binding_id.as_deref(),
+        &required_env(HOME_CLI_AUTH_CONTEXT_GRANT_ID_ENV)?,
+    )?))
+}
+
+pub fn gateway_owned_home_cli_authority_available(data_dir: &std::path::Path) -> bool {
+    gateway_owned_home_cli_launch_context_from_env(data_dir)
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+pub fn issue_gateway_owned_home_cli_launch_token(
+    data_dir: &std::path::Path,
+    app: &str,
+) -> anyhow::Result<Option<String>> {
+    let Some(context) = gateway_owned_home_cli_launch_context_from_env(data_dir)? else {
+        return Ok(None);
+    };
+    let app = app.trim();
+    if app.is_empty() {
+        anyhow::bail!("home launch token context is incomplete");
+    }
+    Ok(Some(
+        gateway_home_token::issue_home_launch_token_with_context(data_dir, app, &context)?,
+    ))
+}
+
+pub fn gateway_owned_home_cli_active_shell_snapshot(
+    data_dir: &std::path::Path,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let Some(context) = gateway_owned_home_cli_launch_context_from_env(data_dir)? else {
+        return Ok(None);
+    };
+    Ok(Some(gateway_home_system::home_active_shell_snapshot_value(
+        data_dir,
+        Some(&context),
+    )?))
+}
+
+fn home_launch_token_context_from_parts(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+    session_id: &str,
+    proof_binding_id: Option<&str>,
+    grant_id: &str,
+) -> anyhow::Result<HomeLaunchTokenContext> {
+    let principal_id = principal_id.trim();
+    let session_id = session_id.trim();
+    let grant_id = grant_id.trim();
+    if principal_id.is_empty() || session_id.is_empty() || grant_id.is_empty() {
+        anyhow::bail!("home launch token context is incomplete");
+    }
+    let proof_binding_id = proof_binding_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if let Some(proof_binding_id) = proof_binding_id.as_deref() {
+        let auth_data_dir = gateway_home_token::home_launch_auth_data_dir(data_dir);
+        let grant = crate::auth::load_active_session_grant(&auth_data_dir, session_id, now_ts())?;
+        if grant.principal_id != principal_id
+            || grant.proof_binding_id != proof_binding_id
+            || grant.grant_id != grant_id
+        {
+            anyhow::bail!("home launch token authority context mismatch");
+        }
+    }
+    Ok(HomeLaunchTokenContext {
+        principal_id: principal_id.to_string(),
+        session_id: session_id.to_string(),
+        proof_binding_id,
+        grant_id: grant_id.to_string(),
+    })
 }
 const BROWSER_CAPSULE_ID: &str = "browser";
 const SERVICES_CAPSULE_ID: &str = "services";
@@ -268,6 +381,9 @@ pub struct GatewayState {
     pub data_dir: PathBuf,
 }
 
+#[derive(Clone)]
+struct TrustedGatewayApiUrl(Arc<str>);
+
 impl GatewayState {
     pub(crate) fn identity_manager(
         &self,
@@ -290,6 +406,10 @@ impl GatewayState {
 }
 
 pub fn gateway_router(state: GatewayState) -> Router {
+    gateway_router_with_api_url(state, "http://localhost".to_string())
+}
+
+fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> Router {
     Router::new()
         .route("/", get(serve_public_root))
         .route("/healthz", get(healthz))
@@ -647,6 +767,11 @@ pub fn gateway_router(state: GatewayState) -> Router {
             post(home_cli_terminal_resize),
         )
         .route(
+            "/api/apps/home-cli/terminal/sessions/:session_id/intent",
+            post(home_cli_terminal_intent)
+                .layer(DefaultBodyLimit::max(HOME_TERMINAL_INTENT_MAX_BYTES)),
+        )
+        .route(
             "/api/apps/home-cli/terminal/sessions/:session_id/close",
             post(home_cli_terminal_close),
         )
@@ -814,6 +939,7 @@ pub fn gateway_router(state: GatewayState) -> Router {
         .route("/ipfs/:cid/*path", get(serve_cid_file))
         .route("/*path", get(serve_public_site_path))
         .with_state(state)
+        .layer(Extension(TrustedGatewayApiUrl(Arc::from(gateway_api_url))))
 }
 
 // ---------------------------------------------------------------------------

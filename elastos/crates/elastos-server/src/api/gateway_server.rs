@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 use elastos_runtime::provider::ProviderRegistry;
 use tokio::net::TcpListener;
 
-use super::{gateway_router, GatewayState, GATEWAY_VERSION};
+use super::{gateway_router_with_api_url, GatewayState, GATEWAY_VERSION};
 
 pub async fn start_gateway_server(
     addr: &str,
@@ -14,14 +14,15 @@ pub async fn start_gateway_server(
     cache_dir: PathBuf,
     data_dir: PathBuf,
 ) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(addr).await?;
+    let gateway_api_url = trusted_gateway_api_url(addr)?;
     let state = GatewayState {
         provider_registry,
         identity_manager: Arc::new(OnceLock::new()),
         cache_dir,
         data_dir,
     };
-    let app = gateway_router(state);
-    let listener = TcpListener::bind(addr).await?;
+    let app = gateway_router_with_api_url(state, gateway_api_url);
     let advertised = advertised_gateway_urls(addr);
     println!("ElastOS Gateway v{}", GATEWAY_VERSION);
     println!("  Bind:      http://{}", addr);
@@ -39,13 +40,35 @@ pub async fn start_gateway_server(
     }
     println!();
     println!("  Cache is unbounded (Tier 1) — delete cache dir to reclaim space");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            shutdown_signal().await;
-            println!("\nShutting down gateway...");
-        })
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        shutdown_signal().await;
+        println!("\nShutting down gateway...");
+    })
+    .await?;
     Ok(())
+}
+
+fn trusted_gateway_api_url(addr: &str) -> anyhow::Result<String> {
+    let authority = addr
+        .parse::<axum::http::uri::Authority>()
+        .map_err(|err| anyhow::anyhow!("invalid Gateway bind address {addr}: {err}"))?;
+    let port = authority
+        .port_u16()
+        .ok_or_else(|| anyhow::anyhow!("Gateway bind address is missing a port"))?;
+    let host = match authority.host().parse::<IpAddr>() {
+        Ok(ip) if ip.is_unspecified() => "localhost".to_string(),
+        _ => authority.host().to_string(),
+    };
+    let authority = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    Ok(format!("http://{authority}"))
 }
 
 pub(crate) fn advertised_gateway_urls(addr: &str) -> Vec<String> {
@@ -140,5 +163,26 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         ctrl_c.await;
+    }
+}
+
+#[cfg(test)]
+mod trusted_gateway_tests {
+    use super::*;
+
+    #[test]
+    fn trusted_gateway_api_url_preserves_operator_localhost() {
+        assert_eq!(
+            trusted_gateway_api_url("localhost:61180").unwrap(),
+            "http://localhost:61180"
+        );
+    }
+
+    #[test]
+    fn trusted_gateway_api_url_replaces_unspecified_bind_address() {
+        assert_eq!(
+            trusted_gateway_api_url("0.0.0.0:8090").unwrap(),
+            "http://localhost:8090"
+        );
     }
 }

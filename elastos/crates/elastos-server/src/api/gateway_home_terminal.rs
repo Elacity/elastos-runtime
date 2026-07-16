@@ -3,14 +3,14 @@ use super::*;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use rand::RngCore;
 use tokio::process::{Child, Command};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Notify};
 
 #[cfg(unix)]
 use std::fs::File;
@@ -25,13 +25,17 @@ const HOME_TERMINAL_INPUT_SCHEMA: &str = "elastos.home-cli.terminal-input/v1";
 const HOME_TERMINAL_RESIZE_SCHEMA: &str = "elastos.home-cli.terminal-resize/v1";
 const HOME_TERMINAL_CLOSE_SCHEMA: &str = "elastos.home-cli.terminal-close/v1";
 const HOME_TERMINAL_EVENT_SCHEMA: &str = "elastos.home-cli.terminal-event/v1";
+const HOME_TERMINAL_HOST_INTENT_SCHEMA: &str = "elastos.home.terminal-host-intent/v1";
+const HOME_TERMINAL_INTENT_SCHEMA: &str = "elastos.home-cli.terminal-intent/v1";
 const HOME_TERMINAL_EVENT_KEEPALIVE_SECS: u64 = 15;
 const HOME_TERMINAL_EVENT_DISCONNECT_GRACE_SECS: u64 = 3;
 const HOME_TERMINAL_PENDING_ATTACH_TIMEOUT_SECS: u64 = 20;
+const HOME_TERMINAL_EXIT_AUTH_GRACE_MS: u64 = 2_000;
 const HOME_TERMINAL_MAX_ACTIVE_SESSIONS: usize = 8;
 const HOME_TERMINAL_MAX_SESSIONS_PER_PRINCIPAL: usize = 4;
 const HOME_TERMINAL_MAX_SESSIONS_PER_AUTH_SESSION: usize = 1;
 pub(super) const HOME_TERMINAL_INPUT_MAX_BYTES: usize = 16 * 1024;
+pub(super) const HOME_TERMINAL_INTENT_MAX_BYTES: usize = 8 * 1024;
 const HOME_TERMINAL_PROGRAM_ENV: &str = "ELASTOS_HOME_CLI_TERMINAL_PROGRAM";
 const HOME_TERMINAL_ARGS_ENV: &str = "ELASTOS_HOME_CLI_TERMINAL_ARGS_JSON";
 const HOME_TERMINAL_DEFAULT_COLS: u16 = 100;
@@ -66,6 +70,19 @@ pub(super) struct HomeTerminalResizeRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct HomeTerminalHostIntentRequest {
+    schema: Option<String>,
+    action: Option<String>,
+    target: Option<String>,
+    action_id: Option<String>,
+    source: Option<String>,
+    contact_id: Option<String>,
+    route: Option<String>,
+    query: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct HomeTerminalStartRequest {
     schema: Option<String>,
     cols: Option<u16>,
@@ -90,6 +107,7 @@ struct HomeTerminalContract {
     events: HomeTerminalEndpoint,
     input: HomeTerminalEndpoint,
     resize: HomeTerminalEndpoint,
+    intent: HomeTerminalEndpoint,
     close: HomeTerminalEndpoint,
     authority: String,
     process: String,
@@ -121,6 +139,8 @@ struct HomeTerminalSession {
     child: Mutex<Child>,
     events: broadcast::Sender<HomeTerminalEvent>,
     event_stream_generation: AtomicU64,
+    pty_reader_drained: AtomicBool,
+    pty_reader_drained_notify: Notify,
 }
 
 enum HomeTerminalInput {
@@ -185,6 +205,22 @@ struct HomeTerminalEvent {
     message: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct HomeTerminalAuthorizedIntent {
+    schema: &'static str,
+    action: String,
+    target: String,
+    action_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contact_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query: Option<serde_json::Value>,
+}
+
 pub(super) async fn home_cli_terminal_contract() -> Response {
     Json(HomeTerminalContract {
         schema: HOME_TERMINAL_CONTRACT_SCHEMA.to_string(),
@@ -213,6 +249,11 @@ pub(super) async fn home_cli_terminal_contract() -> Response {
             route: "/api/apps/home-cli/terminal/sessions/:session_id/resize",
             auth: "same home-cli launch token context that created the session",
         },
+        intent: HomeTerminalEndpoint {
+            method: "POST",
+            route: "/api/apps/home-cli/terminal/sessions/:session_id/intent",
+            auth: "same home-cli launch token context that created the session",
+        },
         close: HomeTerminalEndpoint {
             method: "POST",
             route: "/api/apps/home-cli/terminal/sessions/:session_id/close",
@@ -226,6 +267,7 @@ pub(super) async fn home_cli_terminal_contract() -> Response {
 
 pub(super) async fn home_cli_terminal_start(
     State(state): State<GatewayState>,
+    Extension(gateway_api_url): Extension<TrustedGatewayApiUrl>,
     headers: HeaderMap,
     start: Option<Json<HomeTerminalStartRequest>>,
 ) -> Response {
@@ -241,7 +283,7 @@ pub(super) async fn home_cli_terminal_start(
         Ok(size) => size,
         Err(response) => return response,
     };
-    match start_home_terminal_session(context, size).await {
+    match start_home_terminal_session(context, size, Some(gateway_api_url.0.to_string())).await {
         Ok(session) => Json(serde_json::json!({
             "schema": HOME_TERMINAL_SESSION_SCHEMA,
             "session_id": session.session_id,
@@ -258,9 +300,11 @@ pub(super) async fn home_cli_terminal_start(
                 "events_url": format!("/api/apps/home-cli/terminal/sessions/{}/events?ticket={}", session.session_id, session.stream_ticket),
                 "input_url": format!("/api/apps/home-cli/terminal/sessions/{}/input", session.session_id),
                 "resize_url": format!("/api/apps/home-cli/terminal/sessions/{}/resize", session.session_id),
+                "intent_url": format!("/api/apps/home-cli/terminal/sessions/{}/intent", session.session_id),
                 "close_url": format!("/api/apps/home-cli/terminal/sessions/{}/close", session.session_id),
                 "input_schema": HOME_TERMINAL_INPUT_SCHEMA,
                 "resize_schema": HOME_TERMINAL_RESIZE_SCHEMA,
+                "intent_schema": HOME_TERMINAL_INTENT_SCHEMA,
                 "event_schema": HOME_TERMINAL_EVENT_SCHEMA
             },
             "process": {
@@ -432,6 +476,37 @@ pub(super) async fn home_cli_terminal_resize(
     .into_response()
 }
 
+pub(super) async fn home_cli_terminal_intent(
+    State(state): State<GatewayState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(intent): Json<HomeTerminalHostIntentRequest>,
+) -> Response {
+    cleanup_stale_home_terminal_sessions(now_unix_ms()).await;
+    let context = match require_home_launch_token_for_any_context(
+        &state.data_dir,
+        &headers,
+        &[HOME_CLI_CAPSULE_ID],
+    ) {
+        Ok(context) => context,
+        Err(err) => return home_error_response(err),
+    };
+    let session = match authorized_terminal_session(&session_id, &context).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let intent = match authorize_home_terminal_host_intent(intent) {
+        Ok(intent) => intent,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    Json(serde_json::json!({
+        "schema": HOME_TERMINAL_INTENT_SCHEMA,
+        "session_id": session.session_id,
+        "intent": intent,
+    }))
+    .into_response()
+}
+
 pub(super) async fn home_cli_terminal_close(
     State(state): State<GatewayState>,
     Path(session_id): Path<String>,
@@ -463,6 +538,7 @@ pub(super) async fn home_cli_terminal_close(
 async fn start_home_terminal_session(
     _context: HomeLaunchTokenContext,
     _size: HomeTerminalSize,
+    _gateway_api_url: Option<String>,
 ) -> Result<Arc<HomeTerminalSession>, HomeTerminalStartError> {
     Err(HomeTerminalStartError::Runtime(anyhow::anyhow!(
         "Runtime PTY terminal is not supported on this platform"
@@ -473,6 +549,7 @@ async fn start_home_terminal_session(
 async fn start_home_terminal_session(
     context: HomeLaunchTokenContext,
     size: HomeTerminalSize,
+    gateway_api_url: Option<String>,
 ) -> Result<Arc<HomeTerminalSession>, HomeTerminalStartError> {
     let cleanup = prepare_home_terminal_start(&context, now_unix_ms())
         .await
@@ -496,6 +573,12 @@ async fn start_home_terminal_session(
         .env("ELASTOS_QUIET_RUNTIME_NOTICES", "1")
         .env("TERM", "xterm-256color")
         .env("COLORTERM", "truecolor");
+    for (key, value) in home_terminal_authority_env(&context) {
+        command.env(key, value);
+    }
+    if let Some(gateway_api_url) = gateway_api_url {
+        command.env(HOME_CLI_GATEWAY_API_URL_ENV, gateway_api_url);
+    }
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() == -1 {
@@ -525,6 +608,8 @@ async fn start_home_terminal_session(
         child: Mutex::new(child),
         events,
         event_stream_generation: AtomicU64::new(0),
+        pty_reader_drained: AtomicBool::new(false),
+        pty_reader_drained_notify: Notify::new(),
     });
     insert_home_terminal_session(session.clone()).await;
     spawn_home_terminal_pty_reader(session.clone(), pty.reader);
@@ -709,7 +794,13 @@ fn spawn_home_terminal_pty_reader(session: Arc<HomeTerminalSession>, mut reader:
                 }
             }
         }
+        mark_home_terminal_pty_reader_drained(&session);
     });
+}
+
+fn mark_home_terminal_pty_reader_drained(session: &HomeTerminalSession) {
+    session.pty_reader_drained.store(true, Ordering::SeqCst);
+    session.pty_reader_drained_notify.notify_waiters();
 }
 
 #[derive(Default)]
@@ -780,6 +871,7 @@ fn spawn_home_terminal_waiter(session: Arc<HomeTerminalSession>) {
             let mut input_handle = session.input.lock().await;
             input_handle.take();
         }
+        wait_home_terminal_pty_reader_drained(&session).await;
         let (exit_code, message) = match status {
             Ok(status) => (status.code(), "exited".to_string()),
             Err(err) => (None, format!("wait failed: {err}")),
@@ -792,8 +884,21 @@ fn spawn_home_terminal_waiter(session: Arc<HomeTerminalSession>) {
             exit_code,
             message: Some(message),
         });
+        tokio::time::sleep(Duration::from_millis(HOME_TERMINAL_EXIT_AUTH_GRACE_MS)).await;
         remove_home_terminal_session(&session.session_id).await;
     });
+}
+
+async fn wait_home_terminal_pty_reader_drained(session: &HomeTerminalSession) {
+    if session.pty_reader_drained.load(Ordering::SeqCst) {
+        return;
+    }
+    let notified = session.pty_reader_drained_notify.notified();
+    tokio::pin!(notified);
+    tokio::select! {
+        _ = &mut notified => {}
+        _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+    }
 }
 
 fn spawn_home_terminal_attach_watchdog(session: Arc<HomeTerminalSession>) {
@@ -1095,6 +1200,154 @@ fn random_hex_token() -> String {
     hex::encode(bytes)
 }
 
+fn home_terminal_authority_env(context: &HomeLaunchTokenContext) -> Vec<(&'static str, String)> {
+    let mut env = vec![
+        (
+            HOME_CLI_AUTH_CONTEXT_PRINCIPAL_ID_ENV,
+            context.principal_id.clone(),
+        ),
+        (
+            HOME_CLI_AUTH_CONTEXT_SESSION_ID_ENV,
+            context.session_id.clone(),
+        ),
+        (HOME_CLI_AUTH_CONTEXT_GRANT_ID_ENV, context.grant_id.clone()),
+    ];
+    if let Some(proof_binding_id) = context.proof_binding_id.clone() {
+        env.push((HOME_CLI_AUTH_CONTEXT_PROOF_BINDING_ID_ENV, proof_binding_id));
+    }
+    env
+}
+
+fn authorize_home_terminal_host_intent(
+    intent: HomeTerminalHostIntentRequest,
+) -> Result<HomeTerminalAuthorizedIntent, &'static str> {
+    if intent.schema.as_deref() != Some(HOME_TERMINAL_HOST_INTENT_SCHEMA) {
+        return Err("unsupported terminal host intent schema");
+    }
+    let action = required_intent_text(intent.action.as_deref(), "terminal host intent action")?;
+    let target = required_intent_text(intent.target.as_deref(), "terminal host intent target")?;
+    let action_id = required_intent_text(
+        intent.action_id.as_deref(),
+        "terminal host intent action_id",
+    )?;
+
+    if action == "sign-out" {
+        if target != "home" || action_id != "auth-sign-out" {
+            return Err("unauthorized terminal sign-out intent");
+        }
+        return Ok(HomeTerminalAuthorizedIntent {
+            schema: HOME_TERMINAL_HOST_INTENT_SCHEMA,
+            action,
+            target,
+            action_id,
+            source: None,
+            contact_id: None,
+            route: None,
+            query: None,
+        });
+    }
+
+    if action == "active-shell" {
+        if target != "home-gui" || action_id != "shell-switch:home-gui" {
+            return Err("unauthorized terminal shell intent");
+        }
+        return Ok(HomeTerminalAuthorizedIntent {
+            schema: HOME_TERMINAL_HOST_INTENT_SCHEMA,
+            action,
+            target,
+            action_id,
+            source: None,
+            contact_id: None,
+            route: None,
+            query: None,
+        });
+    }
+
+    if action != "open-target" {
+        return Err("unsupported terminal host intent action");
+    }
+    if target == HOME_CLI_CAPSULE_ID || target == "home-gui" {
+        return Err("unauthorized terminal open target");
+    }
+
+    if let Some(expected_target) = action_id.strip_prefix("open-gui:").map(str::trim) {
+        if expected_target.is_empty() || expected_target != target {
+            return Err("terminal open target does not match action_id");
+        }
+        if intent.query.is_some() {
+            return Err("terminal open target query is not authorized");
+        }
+        return Ok(HomeTerminalAuthorizedIntent {
+            schema: HOME_TERMINAL_HOST_INTENT_SCHEMA,
+            action,
+            target,
+            action_id,
+            source: None,
+            contact_id: None,
+            route: None,
+            query: None,
+        });
+    }
+
+    if let Some(expected_contact_id) = action_id.strip_prefix("people-message:").map(str::trim) {
+        if expected_contact_id.is_empty() {
+            return Err("terminal people action is missing a contact id");
+        }
+        let source = optional_intent_text(intent.source.as_deref());
+        if source.as_deref() != Some("people-contact") {
+            return Err("terminal people action has an unsupported source");
+        }
+        let contact_id =
+            required_intent_text(intent.contact_id.as_deref(), "terminal people contact id")?;
+        if contact_id != expected_contact_id {
+            return Err("terminal people contact does not match action_id");
+        }
+        let route = required_intent_text(intent.route.as_deref(), "terminal people route")?;
+        if terminal_host_intent_target_from_route(&route).as_deref() != Some(target.as_str()) {
+            return Err("terminal people route does not match target");
+        }
+        if intent.query.is_some() {
+            return Err("terminal people query is not authorized");
+        }
+        return Ok(HomeTerminalAuthorizedIntent {
+            schema: HOME_TERMINAL_HOST_INTENT_SCHEMA,
+            action,
+            target,
+            action_id,
+            source,
+            contact_id: Some(contact_id),
+            route: Some(route),
+            query: None,
+        });
+    }
+
+    Err("unauthorized terminal host intent")
+}
+
+fn required_intent_text(
+    value: Option<&str>,
+    field_name: &'static str,
+) -> Result<String, &'static str> {
+    optional_intent_text(value).ok_or(field_name)
+}
+
+fn optional_intent_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn terminal_host_intent_target_from_route(route: &str) -> Option<String> {
+    let rest = route.trim().strip_prefix("/apps/")?;
+    let target = rest.split(['/', '?', '#']).next().unwrap_or("").trim();
+    if target.is_empty() {
+        None
+    } else {
+        Some(target.to_string())
+    }
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1122,6 +1375,146 @@ mod tests {
 
         assert_eq!(decoder.push(b"\xe2"), None);
         assert_eq!(decoder.flush_lossy(), Some("�".to_string()));
+    }
+
+    #[test]
+    fn terminal_authority_env_preserves_home_launch_context() {
+        let mut context = test_home_terminal_context("principal-a", "session-a", "grant-a");
+        context.proof_binding_id = Some("proof:passkey:test".to_string());
+
+        let env = home_terminal_authority_env(&context);
+
+        assert!(env.contains(&(
+            HOME_CLI_AUTH_CONTEXT_PRINCIPAL_ID_ENV,
+            "principal-a".to_string()
+        )));
+        assert!(env.contains(&(
+            HOME_CLI_AUTH_CONTEXT_SESSION_ID_ENV,
+            "session-a".to_string()
+        )));
+        assert!(env.contains(&(HOME_CLI_AUTH_CONTEXT_GRANT_ID_ENV, "grant-a".to_string())));
+        assert!(env.contains(&(
+            HOME_CLI_AUTH_CONTEXT_PROOF_BINDING_ID_ENV,
+            "proof:passkey:test".to_string()
+        )));
+    }
+
+    #[test]
+    fn terminal_host_intent_authorizes_only_explicit_home_actions() {
+        let open =
+            authorize_home_terminal_host_intent(test_terminal_host_intent(serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action": "open-target",
+                "action_id": "open-gui:browser",
+                "target": "browser"
+            })))
+            .expect("explicit open-gui action should be authorized");
+        assert_eq!(open.action, "open-target");
+        assert_eq!(open.action_id, "open-gui:browser");
+        assert_eq!(open.target, "browser");
+        assert!(open.query.is_none());
+
+        let shell =
+            authorize_home_terminal_host_intent(test_terminal_host_intent(serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action": "active-shell",
+                "action_id": "shell-switch:home-gui",
+                "target": "home-gui"
+            })))
+            .expect("explicit shell-switch action should be authorized");
+        assert_eq!(shell.action, "active-shell");
+        assert_eq!(shell.target, "home-gui");
+
+        let sign_out =
+            authorize_home_terminal_host_intent(test_terminal_host_intent(serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action": "sign-out",
+                "action_id": "auth-sign-out",
+                "target": "home"
+            })))
+            .expect("explicit sign-out action should be authorized");
+        assert_eq!(sign_out.action, "sign-out");
+        assert_eq!(sign_out.action_id, "auth-sign-out");
+        assert_eq!(sign_out.target, "home");
+
+        let people =
+            authorize_home_terminal_host_intent(test_terminal_host_intent(serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action": "open-target",
+                "action_id": "people-message:contact-alice",
+                "target": "chat-room",
+                "source": "people-contact",
+                "contact_id": "contact-alice",
+                "route": "/apps/chat-room/"
+            })))
+            .expect("people contact route should be authorized");
+        assert_eq!(people.action_id, "people-message:contact-alice");
+        assert_eq!(people.source.as_deref(), Some("people-contact"));
+        assert_eq!(people.contact_id.as_deref(), Some("contact-alice"));
+    }
+
+    #[test]
+    fn terminal_host_intent_rejects_implicit_or_mismatched_launches() {
+        let cases = [
+            serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action": "open-target",
+                "target": "browser"
+            }),
+            serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action": "open-target",
+                "action_id": "capsule-browser",
+                "target": "browser"
+            }),
+            serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action": "open-target",
+                "action_id": "open-gui:wallet",
+                "target": "browser"
+            }),
+            serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action": "open-target",
+                "action_id": "open-gui:home-cli",
+                "target": "home-cli"
+            }),
+            serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action": "active-shell",
+                "action_id": "shell-switch:browser",
+                "target": "browser"
+            }),
+            serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action": "sign-out",
+                "action_id": "auth-sign-out",
+                "target": "browser"
+            }),
+            serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action": "open-target",
+                "action_id": "people-message:contact-alice",
+                "target": "wallet",
+                "source": "people-contact",
+                "contact_id": "contact-alice",
+                "route": "/apps/chat-room/"
+            }),
+            serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action": "open-target",
+                "action_id": "open-gui:browser",
+                "target": "browser",
+                "query": { "debug": "1" }
+            }),
+        ];
+
+        for case in cases {
+            assert!(
+                authorize_home_terminal_host_intent(test_terminal_host_intent(case)).is_err(),
+                "case should be rejected"
+            );
+        }
     }
 
     #[test]
@@ -1302,5 +1695,9 @@ mod tests {
             created_at_ms,
             event_stream_generation,
         }
+    }
+
+    fn test_terminal_host_intent(value: serde_json::Value) -> HomeTerminalHostIntentRequest {
+        serde_json::from_value(value).expect("test terminal host intent")
     }
 }

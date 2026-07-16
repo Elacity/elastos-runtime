@@ -2711,6 +2711,14 @@ fn home_active_shell_summary(
     })
 }
 
+pub(super) fn home_active_shell_snapshot_value(
+    data_dir: &std::path::Path,
+    context: Option<&HomeLaunchTokenContext>,
+) -> anyhow::Result<serde_json::Value> {
+    serde_json::to_value(home_active_shell_summary(data_dir, context)?)
+        .context("failed to serialize Home active shell snapshot")
+}
+
 fn home_active_shell_candidates(data_dir: &std::path::Path) -> Vec<HomeActiveShellCandidate> {
     let mut candidates = BTreeMap::<String, HomeActiveShellCandidate>::new();
     for capsule in capsule_catalog_summary(data_dir)
