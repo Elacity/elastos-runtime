@@ -1819,6 +1819,9 @@ function hideHomeNotificationToast() {
 const DOCK_MAG_MAX_SCALE = 1.55;
 const DOCK_MAG_RANGE_PX = 88;
 const DOCK_MAG_LIFT_RATIO = 0.35;
+/* Neighbors slide away from the cursor by a fraction of the magnified peers'
+   width growth (macOS grows the whole dock; we spread within the pill). */
+const DOCK_MAG_SPREAD = 0.3;
 const DOCK_ICON_BASE_PX = 40;
 const DOCK_TOOLTIP_SHOW_MS = 320;
 const DOCK_TOOLTIP_HIDE_MS = 100;
@@ -1853,6 +1856,16 @@ function rebuildDockIconCache() {
       center: rect.left + rect.width / 2,
     };
   });
+  /* The wave should span ~2 icons each side of the cursor, whatever the
+     current pitch (icon + gap) is — a fixed px range covers barely one. */
+  let pitch = 0;
+  for (let i = 1; i < dockState.icons.length; i += 1) {
+    const gap = dockState.icons[i].center - dockState.icons[i - 1].center;
+    if (gap > 0 && (pitch === 0 || gap < pitch)) {
+      pitch = gap;
+    }
+  }
+  dockState.range = Math.max(DOCK_MAG_RANGE_PX, pitch * 2.4);
 }
 
 function resetDockMagnification() {
@@ -1869,19 +1882,40 @@ function applyDockMagnification() {
   if (dockState.pointerX === null) {
     return;
   }
-  for (const entry of dockState.icons) {
+  const range = dockState.range || DOCK_MAG_RANGE_PX;
+  const scales = dockState.icons.map((entry) => {
+    const distance = Math.abs(dockState.pointerX - entry.center);
+    if (distance >= range) {
+      return 1;
+    }
+    const falloff = 0.5 * (1 + Math.cos((Math.PI * distance) / range));
+    return 1 + (DOCK_MAG_MAX_SCALE - 1) * falloff;
+  });
+  for (let i = 0; i < dockState.icons.length; i += 1) {
+    const entry = dockState.icons[i];
     if (!entry.node) {
       continue;
     }
-    const distance = Math.abs(dockState.pointerX - entry.center);
-    if (distance >= DOCK_MAG_RANGE_PX) {
+    const scale = scales[i];
+    /* Every magnified peer pushes this icon away from itself, so the row
+       spreads around the cursor like the macOS dock wave. */
+    let shift = 0;
+    for (let j = 0; j < dockState.icons.length; j += 1) {
+      if (j === i || scales[j] <= 1) {
+        continue;
+      }
+      shift +=
+        Math.sign(entry.center - dockState.icons[j].center) *
+        (scales[j] - 1) *
+        DOCK_ICON_BASE_PX *
+        DOCK_MAG_SPREAD;
+    }
+    if (scale <= 1.004 && Math.abs(shift) < 0.5) {
       entry.node.style.transform = "";
       continue;
     }
-    const falloff = 0.5 * (1 + Math.cos((Math.PI * distance) / DOCK_MAG_RANGE_PX));
-    const scale = 1 + (DOCK_MAG_MAX_SCALE - 1) * falloff;
     const lift = -(scale - 1) * DOCK_ICON_BASE_PX * DOCK_MAG_LIFT_RATIO;
-    entry.node.style.transform = `translateY(${lift.toFixed(2)}px) scale(${scale.toFixed(3)})`;
+    entry.node.style.transform = `translate(${shift.toFixed(2)}px, ${lift.toFixed(2)}px) scale(${scale.toFixed(3)})`;
   }
 }
 
