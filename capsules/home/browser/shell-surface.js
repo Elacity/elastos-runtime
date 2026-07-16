@@ -1921,6 +1921,20 @@ function applyDockMagnification() {
     entry.node.style.transform = `translate(${shift.toFixed(2)}px, ${lift.toFixed(2)}px) scale(${scale.toFixed(3)})`;
     entry.item?.style.setProperty("--dock-shift", `${shift.toFixed(2)}px`);
   }
+  repositionDockTooltip();
+}
+
+/* Keep the visible label riding the magnified icon (macOS labels track). */
+function repositionDockTooltip() {
+  const tooltip = dockState.tooltipNode;
+  const anchor = dockState.tooltipAnchor;
+  if (!tooltip || tooltip.hidden || !anchor?.isConnected) {
+    return;
+  }
+  const icon = anchor.querySelector(".taskbar-icon");
+  const rect = (icon || anchor).getBoundingClientRect();
+  tooltip.style.left = `${rect.left + rect.width / 2}px`;
+  tooltip.style.top = `${rect.top - 11}px`;
 }
 
 function dockTooltipNode() {
@@ -1955,10 +1969,12 @@ function showDockTooltip(item, label) {
   const tooltip = dockTooltipNode();
   tooltip.textContent = label;
   tooltip.hidden = false;
-  const rect = item.getBoundingClientRect();
-  const barRect = dockState.taskbar.getBoundingClientRect();
+  /* Anchor to the icon's live (possibly magnified) rect so the label floats
+     clear above the grown icon, tail pointing at it — not glued to the bar. */
+  const icon = item.querySelector(".taskbar-icon");
+  const rect = (icon || item).getBoundingClientRect();
   tooltip.style.left = `${rect.left + rect.width / 2}px`;
-  tooltip.style.top = `${barRect.top - 10}px`;
+  tooltip.style.top = `${rect.top - 11}px`;
   tooltip.dataset.visible = "true";
   if (dockState.tooltipAnchor && dockState.tooltipAnchor !== item) {
     dockState.tooltipAnchor.removeAttribute("aria-describedby");
