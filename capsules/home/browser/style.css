@@ -1437,10 +1437,14 @@ body.dragging-target {
 
 .launcher-popover {
   position: relative;
+  display: flex;
+  flex-direction: column;
   width: min(680px, 100%);
-  max-height: min(70dvh, 680px);
-  padding: 14px 16px 18px;
-  overflow-y: auto;
+  /* Fixed panel size (macOS Apps panel): switching grid/list or filtering
+     changes what's inside, never the box itself. */
+  height: min(70dvh, 680px);
+  padding: 0;
+  overflow: hidden;
   color: var(--text);
   border-radius: 20px;
   background: var(--menu-fill);
@@ -1469,19 +1473,22 @@ body.dragging-target {
 }
 
 /* Header: borderless inline search (macOS Apps panel) with the view toggle
-   and close on the far right, separated from the grid by a hairline. */
+   and close on the far right, separated from the grid by a hairline. A fixed
+   bar above the scroll area — rows scroll under it, never through it. */
 .launcher-header {
-  position: sticky;
-  top: 0;
-  z-index: 2;
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 4px;
-  margin: -14px -16px 12px;
   padding: 10px 12px 8px 16px;
-  background: var(--menu-fill);
   border-bottom: 0.5px solid var(--panel-soft);
-  border-radius: 20px 20px 0 0;
+}
+
+.launcher-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 16px 18px;
 }
 
 .launcher-header-btn {
@@ -2673,7 +2680,7 @@ body.dragging-target {
 
   .launcher-popover {
     width: calc(100vw - 24px);
-    max-height: calc(100dvh - 92px);
+    height: calc(100dvh - 92px);
   }
 
   /* Windows fill the stage between bar and dock — apps read as full-screen. */

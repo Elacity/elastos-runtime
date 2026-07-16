@@ -114,7 +114,7 @@
       </footer>
 
       <aside id="launcher" class="launcher" aria-hidden="true" data-open="false" data-view="grid" hidden>
-        <div class="launcher-popover hide-scrollbar" role="dialog" aria-modal="true" aria-label="Home launcher">
+        <div class="launcher-popover" role="dialog" aria-modal="true" aria-label="Home launcher">
           <div class="launcher-header">
             <div class="launcher-search-wrap">
               <input
@@ -137,9 +137,11 @@
               <img src="./close.svg" alt="" draggable="false" />
             </button>
           </div>
-          <h1 class="launcher-heading">Open</h1>
-          <div id="launcher-grid" class="launcher-sections"></div>
-          <p id="launcher-empty-state" class="launcher-empty" hidden>No matching items</p>
+          <div class="launcher-scroll hide-scrollbar">
+            <h1 class="launcher-heading">Open</h1>
+            <div id="launcher-grid" class="launcher-sections"></div>
+            <p id="launcher-empty-state" class="launcher-empty" hidden>No matching items</p>
+          </div>
         </div>
       </aside>
 
