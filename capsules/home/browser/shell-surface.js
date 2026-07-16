@@ -714,9 +714,14 @@ function contextMenuAnchorPoint(event, node) {
 
 function openDesktopObject(entryId) {
   const object = desktopObjectByEntryId(shellState.currentSummary, entryId);
-  if (!object) {
-    return;
+  if (object) {
+    openFileObject(object);
   }
+}
+
+/* One canonical "open this file object" path — desktop double-click and
+   Spotlight activation both land here. */
+export function openFileObject(object) {
   if (object.kind === "directory") {
     openTarget("library", { query: { uri: object.uri } });
     return;

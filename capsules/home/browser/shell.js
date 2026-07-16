@@ -25,6 +25,7 @@ import {
 } from "./shell-core.js?v=home-20260701c";
 import {
   syncIdentity,
+  syncNetworkStatus,
   clearIdentitySurface,
   updateClock,
 } from "./shell-chrome.js?v=home-20260701c";
@@ -73,6 +74,7 @@ import {
   signOutHome,
 } from "./shell-auth.js?v=home-20260701c";
 import { handleDesktopArrowKey } from "./shell-keyboard.js?v=home-20260701c";
+import { showSpotlight } from "./shell-spotlight.js?v=home-20260701c";
 
 configureWindowHooks({
   clearIdentitySurface,
@@ -249,6 +251,10 @@ launcherToggleButton.addEventListener("click", () => {
 
 closeLauncherButton.addEventListener("click", () => {
   hideLauncher();
+});
+
+document.querySelector("#toolbar-spotlight")?.addEventListener("click", () => {
+  showSpotlight();
 });
 
 /* Grid/list view for the launcher (macOS Apps panel view control). The
@@ -816,6 +822,7 @@ async function refreshShellSummary({ initialize = false } = {}) {
   }
 
   syncIdentity(summary);
+  syncNetworkStatus(summary);
   syncAppearance(summary);
   renderInboxBadge(summary);
   maybeShowWalletApprovalToast(previous, summary);

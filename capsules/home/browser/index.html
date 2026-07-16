@@ -35,6 +35,34 @@
         <span id="toolbar-active-title" class="toolbar-active-title">Home</span>
         <div class="toolbar-spacer"></div>
         <button
+          id="toolbar-spotlight"
+          class="toolbar-btn spotlight-btn"
+          type="button"
+          aria-label="Search"
+          title="Search (Cmd+Space)"
+        ></button>
+        <div id="toolbar-network" class="toolbar-network" hidden>
+          <button
+            id="toolbar-network-btn"
+            class="toolbar-btn network-btn"
+            type="button"
+            data-state="unknown"
+            aria-haspopup="true"
+            aria-expanded="false"
+            aria-controls="toolbar-network-menu"
+            aria-label="Network status"
+            title="Network"
+          ></button>
+          <div
+            id="toolbar-network-menu"
+            class="toolbar-network-menu"
+            role="group"
+            aria-label="Network status"
+            tabindex="-1"
+            hidden
+          ></div>
+        </div>
+        <button
           id="toolbar-inbox"
           class="toolbar-btn inbox-btn"
           type="button"
@@ -145,6 +173,33 @@
         </div>
       </aside>
 
+      <aside id="spotlight" class="spotlight" aria-hidden="true" hidden>
+        <div class="spotlight-panel" role="dialog" aria-modal="true" aria-label="Spotlight search">
+          <div class="spotlight-bar">
+            <input
+              id="spotlight-input"
+              class="spotlight-field"
+              type="search"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="Spotlight Search"
+              role="combobox"
+              aria-expanded="false"
+              aria-controls="spotlight-results"
+              aria-activedescendant=""
+              aria-label="Spotlight search"
+            />
+          </div>
+          <div
+            id="spotlight-results"
+            class="spotlight-results hide-scrollbar"
+            role="listbox"
+            aria-label="Search results"
+            hidden
+          ></div>
+        </div>
+      </aside>
+
       <div id="desktop-context-menu" class="context-menu" role="menu" aria-label="Home actions" hidden></div>
 
       <div id="window-switcher" class="window-switcher" aria-hidden="true" hidden>
@@ -168,7 +223,7 @@
           </button>
           <h1 id="shortcuts-title" class="shortcuts-title">Keyboard shortcuts</h1>
           <dl class="shortcuts-list">
-            <div class="shortcuts-row"><dt>Open launcher</dt><dd><kbd>⌘</kbd><kbd>Space</kbd> or <kbd>Ctrl</kbd><kbd>Space</kbd></dd></div>
+            <div class="shortcuts-row"><dt>Search (Spotlight)</dt><dd><kbd>⌘</kbd><kbd>Space</kbd> or <kbd>Ctrl</kbd><kbd>Space</kbd></dd></div>
             <div class="shortcuts-row"><dt>Switch windows</dt><dd><kbd>Alt</kbd><kbd>Tab</kbd></dd></div>
             <div class="shortcuts-row"><dt>Cycle windows</dt><dd><kbd>⌘</kbd><kbd>`</kbd></dd></div>
             <div class="shortcuts-row"><dt>Close window</dt><dd><kbd>⌘</kbd><kbd>W</kbd></dd></div>

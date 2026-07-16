@@ -5,9 +5,9 @@ import {
   launcher,
 } from "./shell-core.js?v=home-20260701c";
 import {
-  toggleLauncher,
   moveDesktopSelection,
 } from "./shell-surface.js?v=home-20260701c";
+import { toggleSpotlight } from "./shell-spotlight.js?v=home-20260701c";
 import {
   focusWindow,
   closeWindow,
@@ -20,7 +20,7 @@ import {
  * document — an app iframe with focus receives its own keys (that is correct
  * app behavior, same as any OS). macOS reserves Cmd+Space (Spotlight) and
  * Cmd+Tab at the system level, so each binding has an in-browser equivalent:
- *   launcher   Cmd+Space / Ctrl+Space
+ *   spotlight  Cmd+Space / Ctrl+Space (the launcher stays on the dock icon)
  *   switcher   Alt+Tab (hold Alt, Tab advances, release commits)
  *   cycle      Cmd+`
  *   close      Cmd+W (honored when the browser lets the page claim it,
@@ -245,7 +245,7 @@ document.addEventListener(
     }
     if (event.code === "Space" && !event.shiftKey && !event.altKey) {
       event.preventDefault();
-      toggleLauncher();
+      toggleSpotlight();
       return;
     }
     if (event.key === "`" && !event.shiftKey && !event.altKey) {

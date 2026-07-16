@@ -1334,7 +1334,10 @@ pub(super) async fn gateway_provider_proxy(
 ) -> Response {
     let allowed_apps: &[&str] = match scheme.as_str() {
         "documents" => match op.as_str() {
-            "summary" | "get" => &[DOCUMENTS_CAPSULE_ID, LIBRARY_CAPSULE_ID],
+            // Home reads ONLY the summary (titles + uris) to feed shell-wide search
+            // (Spotlight); document BODIES (`get`) stay gated to the editing apps.
+            "summary" => &[DOCUMENTS_CAPSULE_ID, LIBRARY_CAPSULE_ID, HOME_CAPSULE_ID],
+            "get" => &[DOCUMENTS_CAPSULE_ID, LIBRARY_CAPSULE_ID],
             _ => &[DOCUMENTS_CAPSULE_ID],
         },
         "object" => match op.as_str() {
