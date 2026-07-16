@@ -1823,8 +1823,10 @@ body.dragging-target {
   text-align: left;
 }
 
-/* Spotlight: dimmed backdrop, centered floating bar in the upper third,
-   results growing beneath inside the same frosted panel (macOS anatomy).
+/* Spotlight: centered floating bar in the upper third, results growing
+   beneath inside the same frosted panel (macOS anatomy). No backdrop dim —
+   macOS leaves the desktop untouched; the invisible full-stage container
+   only centers the bar and catches click-outside dismissal.
    Unlike the fixed Apps panel, this panel auto-sizes with its matches. */
 .spotlight {
   position: fixed;
@@ -1834,7 +1836,6 @@ body.dragging-target {
   align-items: flex-start;
   justify-content: center;
   padding: 12dvh 16px 0;
-  background: var(--overlay-dim);
 }
 
 .spotlight[hidden] {
@@ -1851,7 +1852,9 @@ body.dragging-target {
   border-radius: 16px;
   background: var(--menu-fill);
   border: 0.5px solid var(--line);
-  box-shadow: var(--shadow);
+  /* With no backdrop dim, the panel's own shadow carries the separation
+     from bright wallpapers (macOS does the same). */
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45), 0 2px 10px rgba(0, 0, 0, 0.25);
   backdrop-filter: blur(24px);
   -webkit-backdrop-filter: blur(24px);
   animation: launcher-enter 140ms cubic-bezier(0.2, 0, 0, 1) both;
