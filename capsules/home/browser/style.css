@@ -1441,8 +1441,9 @@ body.dragging-target {
   flex-direction: column;
   width: min(680px, 100%);
   /* Fixed panel size (macOS Apps panel): switching grid/list or filtering
-     changes what's inside, never the box itself. */
-  height: min(70dvh, 680px);
+     changes what's inside, never the box itself. Sized so the icon grid
+     fills it (~4 ranks); longer content scrolls. */
+  height: min(64dvh, 512px);
   padding: 0;
   overflow: hidden;
   color: var(--text);
