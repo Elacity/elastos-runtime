@@ -20,6 +20,7 @@ import {
   clearShellSessionState,
   ignoreRepeatedAction,
   targetById,
+  toolbarActiveTitleNode,
 } from "./shell-core.js?v=home-20260701c";
 import {
   fitWindowBounds,
@@ -124,10 +125,28 @@ function requireWindowHooks() {
   return windowHooks;
 }
 
+// The system bar owns the focused-window title: the frontmost app's name is what
+// makes the desktop read as "owned" by an app. Falls back to "Home" when nothing
+// is focused. Always textContent — titles are app-derived strings, never HTML.
+function syncToolbarActiveTitle() {
+  if (!toolbarActiveTitleNode) {
+    return;
+  }
+  const active = shellState.activeWindowId
+    ? shellState.windows.get(shellState.activeWindowId)
+    : null;
+  const visible = active && !active.node.classList.contains("hidden");
+  toolbarActiveTitleNode.textContent =
+    visible && typeof active.title === "string" && active.title
+      ? active.title
+      : "Home";
+}
+
 function refreshWindowUi() {
   const hooks = requireWindowHooks();
   hooks.updateTaskbarState();
   hooks.refreshLauncherIfVisible();
+  syncToolbarActiveTitle();
 }
 
 function currentWindowBounds(node) {
