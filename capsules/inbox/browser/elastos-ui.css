@@ -79,6 +79,34 @@
   --el-ease: cubic-bezier(0.2, 0, 0, 1);
 }
 
+/* Light theme: dark is the default (no attribute); the shell sets
+   data-el-theme="light" on <html> and broadcasts changes to app frames.
+   Values restore the pre-token light look: white raised panels over a cool
+   pale stage, navy ink, the same brand orange. */
+:root[data-el-theme="light"] {
+  color-scheme: light;
+
+  --el-bg: #eef1f6;
+  --el-surface: rgba(255, 255, 255, 0.88);
+  --el-surface-raised: #ffffff;
+  --el-inset: rgba(29, 36, 56, 0.055);
+  --el-text: #1d2438;
+  --el-muted: rgba(29, 36, 56, 0.72);
+  --el-soft: rgba(29, 36, 56, 0.5);
+  --el-brand: #f6921a;
+  --el-brand-strong: #e07f0a;
+  --el-focus: rgba(246, 146, 26, 0.55);
+  --el-danger: #b14c5a;
+  --el-ok: #0a7a52;
+
+  --el-hairline: rgba(29, 36, 56, 0.14);
+  --el-hairline-strong: rgba(29, 36, 56, 0.24);
+
+  --el-shadow-1: 0 2px 10px rgba(34, 49, 88, 0.1);
+  --el-shadow-2: 0 12px 28px rgba(34, 49, 88, 0.12);
+  --el-shadow-3: 0 24px 80px rgba(34, 49, 88, 0.16);
+}
+
 /* App base: opt in by putting .el-app on <body>. Dark shell surface, shared
    type. Layout untouched. */
 .el-app {
@@ -114,8 +142,20 @@
   transition: background-color var(--el-dur-2) var(--el-ease);
 }
 
+/* Hover lift over inset surfaces — flips with the theme so apps don't need
+   their own literal rgba(255,255,255,x) hovers. */
+:root {
+  --el-lift: rgba(255, 255, 255, 0.1);
+  --el-lift-strong: rgba(255, 255, 255, 0.16);
+}
+
+:root[data-el-theme="light"] {
+  --el-lift: rgba(29, 36, 56, 0.08);
+  --el-lift-strong: rgba(29, 36, 56, 0.14);
+}
+
 .el-button:hover {
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--el-lift);
 }
 
 .el-button:active {

@@ -12,8 +12,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 SOURCE_CSS="capsules/_shared/elastos-ui.css"
+SOURCE_JS="capsules/_shared/elastos-theme.js"
 SOURCE_FONT="capsules/_shared/fonts/Inter-latin-var.woff2"
 HEADER="/* GENERATED from ${SOURCE_CSS} — do not edit. Run \`just vendor-ui\`. */"
+JS_HEADER="/* GENERATED from ${SOURCE_JS} — do not edit. Run \`just vendor-ui\`. */"
 
 # Capsules that consume the shared tokens today. Extend as apps migrate.
 TARGETS=(
@@ -35,6 +37,11 @@ stamped_source() {
   cat "$SOURCE_CSS"
 }
 
+stamped_js_source() {
+  printf '%s\n' "$JS_HEADER"
+  cat "$SOURCE_JS"
+}
+
 for capsule in "${TARGETS[@]}"; do
   browser_dir="capsules/${capsule}/browser"
   css_target="${browser_dir}/elastos-ui.css"
@@ -46,9 +53,15 @@ for capsule in "${TARGETS[@]}"; do
     exit 1
   fi
 
+  js_target="${browser_dir}/elastos-theme.js"
+
   if [[ "$MODE" == "--check" ]]; then
     if [[ ! -f "$css_target" ]] || ! diff -q <(stamped_source) "$css_target" >/dev/null 2>&1; then
       echo "[vendor-ui] DRIFT: ${css_target} does not match ${SOURCE_CSS}" >&2
+      FAILED=1
+    fi
+    if [[ ! -f "$js_target" ]] || ! diff -q <(stamped_js_source) "$js_target" >/dev/null 2>&1; then
+      echo "[vendor-ui] DRIFT: ${js_target} does not match ${SOURCE_JS}" >&2
       FAILED=1
     fi
     if [[ ! -f "$font_target" ]] || ! cmp -s "$SOURCE_FONT" "$font_target"; then
@@ -58,6 +71,7 @@ for capsule in "${TARGETS[@]}"; do
   else
     mkdir -p "$font_dir"
     stamped_source > "$css_target"
+    stamped_js_source > "$js_target"
     cp "$SOURCE_FONT" "$font_target"
     echo "[vendor-ui] stamped ${css_target}"
   fi
