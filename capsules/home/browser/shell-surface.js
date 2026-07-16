@@ -371,24 +371,16 @@ function syncTaskbarGroupButton(entry, targetId, title, openCount) {
 export function renderLauncher(summary) {
   const query = launcherSearch.value;
   launcherGrid.replaceChildren();
+  /* One continuous grid (macOS Apps panel) — section order still puts
+     running, then recent, then the rest first, but without header breaks. */
+  const grid = document.createElement("div");
+  grid.className = "launcher-group-grid";
   for (const section of launcherSections(summary)) {
-    if (section.targets.length === 0) {
-      continue;
-    }
-    const group = document.createElement("section");
-    group.className = "launcher-group";
-    const heading = document.createElement("h2");
-    heading.className = "launcher-group-heading";
-    heading.textContent = section.label;
-    group.appendChild(heading);
-    const grid = document.createElement("div");
-    grid.className = "launcher-group-grid";
     for (const target of section.targets) {
       grid.appendChild(createLauncherCard(target));
     }
-    group.appendChild(grid);
-    launcherGrid.appendChild(group);
   }
+  launcherGrid.appendChild(grid);
   filterLauncherItems(query);
 }
 
@@ -1690,16 +1682,10 @@ function cancelDesktopRename() {
 
 export function filterLauncherItems(query) {
   const normalized = query.trim().toLowerCase();
+  let visibleCount = 0;
   for (const item of launcherGrid.querySelectorAll(".launcher-card")) {
     item.hidden = normalized !== "" && !item.dataset.search.includes(normalized);
-  }
-  let visibleCount = 0;
-  for (const group of launcherGrid.querySelectorAll(".launcher-group")) {
-    const hasVisibleItems = Array.from(group.querySelectorAll(".launcher-card")).some(
-      (item) => !item.hidden,
-    );
-    group.hidden = !hasVisibleItems;
-    if (hasVisibleItems) {
+    if (!item.hidden) {
       visibleCount += 1;
     }
   }
