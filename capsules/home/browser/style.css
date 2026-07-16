@@ -34,7 +34,7 @@
      and the dock clearance — system chrome is never covered. */
   --stage-top: calc(var(--toolbar-h) + env(safe-area-inset-top, 0px));
   --stage-bottom: calc(var(--taskbar-h) + var(--taskbar-offset) + 10px + env(safe-area-inset-bottom, 0px));
-  --taskbar-h: 50px;
+  --taskbar-h: 60px;
   --taskbar-offset: 12px;
   --desktop-wallpaper: url("./wallpaper.webp");
 }
@@ -961,7 +961,7 @@ img {
   justify-content: flex-start;
   min-width: 12px;
   max-width: 100%;
-  min-height: 40px;
+  min-height: 50px;
   padding: 0 2px;
   gap: 2px;
   /* Magnified icons and tooltips must escape the pill: no clipping here. */
@@ -981,8 +981,8 @@ img {
 
 .taskbar-item {
   position: relative;
-  width: 40px;
-  height: 40px;
+  width: 50px;
+  height: 50px;
   /* Asymmetric: the tile sits 2px above slot center so the running dot gets
      a real shelf below it — macOS seats dock icons the same way. */
   padding: 3px 5px 7px;
@@ -1041,9 +1041,9 @@ img {
 
 .taskbar-entry {
   position: relative;
-  flex: 0 0 40px;
-  width: 40px;
-  height: 40px;
+  flex: 0 0 50px;
+  width: 50px;
+  height: 50px;
 }
 
 /* Window-count chip stays functional (opens the group menu) but is demoted to
@@ -1103,29 +1103,29 @@ img {
 
 .taskbar-icon-launcher::before {
   content: "";
-  width: 18px;
-  height: 18px;
+  width: 22px;
+  height: 22px;
   display: block;
   background:
-    linear-gradient(#ffffff 0 0) left top / 7px 7px no-repeat,
-    linear-gradient(#ffffff 0 0) right top / 7px 7px no-repeat,
-    linear-gradient(#ffffff 0 0) left bottom / 7px 7px no-repeat,
-    linear-gradient(#ffffff 0 0) right bottom / 7px 7px no-repeat;
+    linear-gradient(#ffffff 0 0) left top / 9px 9px no-repeat,
+    linear-gradient(#ffffff 0 0) right top / 9px 9px no-repeat,
+    linear-gradient(#ffffff 0 0) left bottom / 9px 9px no-repeat,
+    linear-gradient(#ffffff 0 0) right bottom / 9px 9px no-repeat;
   opacity: 0.92;
 }
 
 :root[data-el-theme="light"] .taskbar-icon-launcher::before {
   background:
-    linear-gradient(#3a4358 0 0) left top / 7px 7px no-repeat,
-    linear-gradient(#3a4358 0 0) right top / 7px 7px no-repeat,
-    linear-gradient(#3a4358 0 0) left bottom / 7px 7px no-repeat,
-    linear-gradient(#3a4358 0 0) right bottom / 7px 7px no-repeat;
+    linear-gradient(#3a4358 0 0) left top / 9px 9px no-repeat,
+    linear-gradient(#3a4358 0 0) right top / 9px 9px no-repeat,
+    linear-gradient(#3a4358 0 0) left bottom / 9px 9px no-repeat,
+    linear-gradient(#3a4358 0 0) right bottom / 9px 9px no-repeat;
 }
 
 /* macOS-style running dot: only apps with open windows get one; pinned
    favorites stay clean until launched. It rides the magnification spread
    horizontally (JS sets --dock-shift) but never lifts or scales.
-   Geometry: pill 50px / item slot 40px (centered, 5px margins) / tile 30px
+   Geometry: pill 60px / item slot 50px (centered, 5px margins) / tile 40px
    with 7px bottom padding. Dot spans 0-4px of the item, so: tile, 3px air,
    dot, 5px air, pill edge — and it never leaves the item's box (no clipping
    under the mobile scroll container). */
@@ -1158,7 +1158,7 @@ img {
 .taskbar-separator {
   flex: 0 0 1px;
   width: 1px;
-  height: 26px;
+  height: 32px;
   margin: 0 5px;
   border-radius: 1px;
   background: var(--hairline);
@@ -1437,8 +1437,8 @@ body.dragging-target {
 
 .launcher-popover {
   position: relative;
-  width: min(600px, 100%);
-  max-height: min(66dvh, 620px);
+  width: min(680px, 100%);
+  max-height: min(70dvh, 680px);
   padding: 14px 16px 18px;
   overflow-y: auto;
   color: var(--text);
@@ -1547,8 +1547,8 @@ body.dragging-target {
 
 .launcher-group-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(82px, 1fr));
-  gap: 10px 6px;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 12px 8px;
 }
 
 .launcher-card {
@@ -1568,7 +1568,7 @@ body.dragging-target {
   display: grid;
   /* Fixed icon row + top alignment: two-line titles grow downward, the
      icon rank stays level across the row. */
-  grid-template-rows: 48px auto;
+  grid-template-rows: 56px auto;
   align-content: start;
   justify-items: center;
   gap: 0.5rem;
@@ -1588,8 +1588,8 @@ body.dragging-target {
 }
 
 .launcher-item-icon {
-  width: 48px;
-  height: 48px;
+  width: 56px;
+  height: 56px;
 }
 
 /* Single line with ellipsis (macOS Apps panel) — every card is exactly one
