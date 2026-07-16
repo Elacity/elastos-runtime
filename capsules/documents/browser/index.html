@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Documents · ElastOS</title>
+<script src="./elastos-theme.js"></script>
 <link rel="stylesheet" href="./elastos-ui.css">
 <style>
 :root {
@@ -37,6 +38,96 @@
   --radius-sm: 0.85rem;
   color-scheme: dark;
   font-family: var(--el-font);
+}
+
+:root[data-el-theme="light"] {
+  --bg-strong: #e3e9fb;
+  --panel: rgba(255, 255, 255, 0.9);
+  --brand-soft: #fff1dc;
+  --accent: #5f76d8;
+  --accent-soft: #e8edff;
+  --accent-deep: #3c53a7;
+  color-scheme: light;
+}
+
+:root[data-el-theme="light"] body {
+  background:
+    radial-gradient(circle at top left, rgba(95, 118, 216, 0.14), transparent 28%),
+    radial-gradient(circle at bottom right, rgba(126, 149, 226, 0.12), transparent 24%),
+    linear-gradient(180deg, #f7f9ff 0%, var(--bg) 100%);
+}
+
+:root[data-el-theme="light"] .document-list-item,
+:root[data-el-theme="light"] .share-doc-link,
+:root[data-el-theme="light"] .outline-item,
+:root[data-el-theme="light"] .history-item {
+  border-color: rgba(83, 103, 164, 0.08);
+}
+
+:root[data-el-theme="light"] .document-list-item:hover,
+:root[data-el-theme="light"] .share-doc-link:hover,
+:root[data-el-theme="light"] .outline-item:hover,
+:root[data-el-theme="light"] .history-item:hover {
+  background: rgba(255, 255, 255, 0.72);
+  border-color: var(--line);
+}
+
+:root[data-el-theme="light"] .document-list-item.active,
+:root[data-el-theme="light"] .share-doc-link.active,
+:root[data-el-theme="light"] .workspace-tab.active {
+  background: var(--accent-soft);
+  border-color: rgba(95, 118, 216, 0.18);
+}
+
+:root[data-el-theme="light"] .document-list-item.published {
+  background: rgba(232, 237, 255, 0.94);
+  border-color: rgba(95, 118, 216, 0.28);
+}
+
+:root[data-el-theme="light"] .document-list-item.published:hover,
+:root[data-el-theme="light"] .document-list-item.published.active {
+  background: rgba(219, 227, 255, 0.98);
+  border-color: rgba(95, 118, 216, 0.36);
+}
+
+:root[data-el-theme="light"] .document-list-published-icon {
+  background: rgba(95, 118, 216, 0.14);
+}
+
+:root[data-el-theme="light"] .action-danger {
+  border-color: rgba(177, 76, 90, 0.22);
+}
+
+:root[data-el-theme="light"] .action-danger:hover:not(:disabled),
+:root[data-el-theme="light"] .action-danger:focus-visible:not(:disabled) {
+  background: rgba(177, 76, 90, 0.1);
+}
+
+:root[data-el-theme="light"] .action-danger-solid {
+  color: #fffaf9;
+}
+
+:root[data-el-theme="light"] .action-danger-solid:hover:not(:disabled),
+:root[data-el-theme="light"] .action-danger-solid:focus-visible:not(:disabled) {
+  background: #963846;
+}
+
+:root[data-el-theme="light"] .modal-backdrop {
+  background: rgba(29, 36, 56, 0.22);
+}
+
+:root[data-el-theme="light"] .markdown-body code,
+:root[data-el-theme="light"] .markdown-body pre,
+:root[data-el-theme="light"] .markdown-body th {
+  background: rgba(83, 103, 164, 0.08);
+}
+
+:root[data-el-theme="light"] .markdown-body pre code {
+  background: transparent;
+}
+
+:root[data-el-theme="light"] .markdown-body blockquote {
+  border-left-color: rgba(95, 118, 216, 0.28);
 }
 
 * {

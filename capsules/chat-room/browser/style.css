@@ -20,6 +20,78 @@
   font-family: var(--el-font);
 }
 
+/* Light (shared runtime sets data-el-theme="light"; no attribute = dark). Tokens aliased to
+   --el-* flip via elastos-ui.css; the values below restore the capsule's pre-dark light palette
+   for the vars and literals that stayed hardcoded dark. */
+:root[data-el-theme="light"] {
+  color-scheme: light;
+  --bg-strong: #e3e9fb;
+  --brand-soft: #fff1dc;
+  --accent: #5f76d8;
+  --accent-soft: #e8edff;
+  --accent-deep: #3c53a7;
+  --danger: #b14c5a;
+  --self: #edf2ff;
+}
+
+:root[data-el-theme="light"] body {
+  background:
+    radial-gradient(circle at top left, rgba(95, 118, 216, 0.14), transparent 28%),
+    radial-gradient(circle at bottom right, rgba(126, 149, 226, 0.12), transparent 24%),
+    linear-gradient(180deg, #f7f9ff 0%, var(--bg) 100%);
+}
+
+/* accent-filled buttons: light accent (#5f76d8) takes white ink, not the dark-theme #0b0d10 */
+:root[data-el-theme="light"] button,
+:root[data-el-theme="light"] .room-access-toggle[aria-expanded="true"],
+:root[data-el-theme="light"] .policy-row button[aria-pressed="true"] {
+  color: #f8fbff;
+}
+
+:root[data-el-theme="light"] button.secondary,
+:root[data-el-theme="light"] .emoji-chip {
+  color: var(--ink);
+}
+
+:root[data-el-theme="light"] .attachment-open {
+  color: var(--accent-deep);
+}
+
+:root[data-el-theme="light"] .join-link-card,
+:root[data-el-theme="light"] .browser-access-request,
+:root[data-el-theme="light"] .node-row,
+:root[data-el-theme="light"] .policy-row {
+  border-color: rgba(95, 118, 216, 0.18);
+}
+
+:root[data-el-theme="light"] .participant-local {
+  border-color: rgba(95, 118, 216, 0.18);
+}
+
+:root[data-el-theme="light"] .participant-avatar {
+  background: linear-gradient(180deg, #7f95e4 0%, var(--accent) 100%);
+  color: white;
+}
+
+:root[data-el-theme="light"] .message.self-message {
+  border-color: rgba(95, 118, 216, 0.18);
+}
+
+:root[data-el-theme="light"] .browser-access-request-actions .danger,
+:root[data-el-theme="light"] .node-row-actions .danger {
+  background: rgba(177, 76, 90, 0.12);
+}
+
+:root[data-el-theme="light"] .link-body a {
+  border-color: rgba(95, 118, 216, 0.12);
+}
+
+@media (max-width: 760px) {
+  :root[data-el-theme="light"] .chat-card[data-roster-open="true"] .participant-scrim {
+    background: rgba(29, 36, 56, 0.22);
+  }
+}
+
 * {
   box-sizing: border-box;
 }

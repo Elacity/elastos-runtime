@@ -743,15 +743,15 @@
     });
     // search (debounced)
     let t; $("#search").addEventListener("input", (e) => { clearTimeout(t); t = setTimeout(() => { state.q = e.target.value.trim(); if ((location.hash || "").includes("asset")) location.hash = "#/discover"; else renderDiscover(); }, 200); });
-    // theme
-    $("#theme-toggle").addEventListener("click", () => { const cur = document.documentElement.getAttribute("data-theme"); document.documentElement.setAttribute("data-theme", cur === "light" ? "dark" : "light"); });
+    // theme — delegate to the shared runtime (elastos-theme.js) so the choice persists and syncs across frames
+    $("#theme-toggle").addEventListener("click", () => { if (window.elastosTheme) window.elastosTheme.set(window.elastosTheme.resolved() === "light" ? "dark" : "light"); });
     window.addEventListener("hashchange", router);
   }
 
   async function boot() {
     // Inject the inline SVG icons into the static chrome (rail / facets / pills) — one icon source, no emoji.
     document.querySelectorAll("[data-icon]").forEach((el) => el.insertAdjacentHTML("afterbegin", icon(el.dataset.icon)));
-    // Theme toggle: stack sun + moon for the cross-fade (CSS shows one per [data-theme]).
+    // Theme toggle: stack sun + moon for the cross-fade (CSS shows one per [data-el-theme]).
     const tt = $("#theme-toggle"); if (tt) tt.innerHTML = icon("sun", "ico-sun") + icon("moon", "ico-moon");
     wire(); router();
     // Resolve "me" (your wallet + handle) non-blocking, then re-render only if a handle actually applies, so

@@ -6,7 +6,7 @@
 /* ---------- TOKENS ---------- */
 /* Dark default is remapped onto the shared ElastOS tokens (./elastos-ui.css, loaded first)
    so surfaces, text, hairlines, brand, and type match the shell. Semantic names stay —
-   the class contract and the [data-theme=light] override below are untouched. */
+   the class contract holds; light is keyed on the shared runtime's data-el-theme attribute. */
 :root{
   color-scheme:dark;
   /* color — semantic, dark default (values = shared --el-* tokens) */
@@ -37,13 +37,14 @@
   --ring:0 0 0 2px var(--bg),0 0 0 4px var(--el-focus);
   --t-fast:.12s cubic-bezier(.2,.6,.2,1); --t:.2s cubic-bezier(.2,.6,.2,1); --t-slow:.32s cubic-bezier(.2,.6,.2,1);
 }
-[data-theme=light]{
+:root[data-el-theme="light"]{
   color-scheme:light;
   --bg:#f7f8fa; --bg-elev:#fff; --panel:#fff; --panel-2:#f1f3f6; --panel-3:#e9edf2;
   --line:#e4e8ee; --line-2:#d7dde5; --ink:#0e131a; --ink-2:#2c3340; --mut:#5b6573; --mut-2:#838c98;
   /* light: turquoise is too light to read as text/fill on a light bg, so the accent deepens to a teal that
      stays AA both as accent-text and as a white-text fill (dark theme keeps the vivid turquoise). */
   --acc:#0a7370; --acc-press:#086460; --on-acc:#fff; --acc-soft:#e0f5f4; --chip:#e0f5f4; --chip-ink:#0a6360; --chip-line:#bfe9e7;
+  --warn:#b45309;
   --e1:0 1px 2px rgba(20,30,50,.05); --e2:0 1px 2px rgba(20,30,50,.06),0 8px 22px rgba(20,30,50,.08);
   --e3:0 2px 6px rgba(20,30,50,.08),0 18px 44px rgba(20,30,50,.12); --ring:0 0 0 2px var(--bg),0 0 0 4px var(--acc);
   --depth:0 0 0 1px rgba(0,0,0,.06),0 1px 2px -1px rgba(0,0,0,.06),0 2px 4px rgba(0,0,0,.04); --depth-hover:0 0 0 1px rgba(0,0,0,.08),0 1px 2px -1px rgba(0,0,0,.08),0 2px 4px rgba(0,0,0,.06);
@@ -74,7 +75,7 @@ body{margin:0;background:var(--bg);color:var(--ink);font:var(--fbase)/var(--lh) 
   border:1px solid var(--line);font-size:15px;cursor:pointer;color:var(--ink);transition:background var(--t-fast),transform var(--t-fast)}
 .glyph:hover{background:var(--panel-3)} .glyph:active{transform:scale(.96)}
 .badge{font-size:var(--fxs);color:var(--ok);border:1px solid color-mix(in srgb,var(--el-ok) 32%,transparent);background:color-mix(in srgb,var(--el-ok) 12%,transparent);border-radius:7px;padding:2px 7px;font-weight:600}
-[data-theme=light] .badge{background:#e7f8f0;border-color:#bfe9d6;color:#0a7a52}
+:root[data-el-theme="light"] .badge{background:#e7f8f0;border-color:#bfe9d6;color:#0a7a52}
 
 /* ---------- NAV ---------- */
 .nav{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--bg) 78%,transparent);
@@ -174,6 +175,7 @@ a.chip-cat:hover{color:var(--ink);background:var(--panel-2)}
 .cover{aspect-ratio:16/9;position:relative;display:grid;place-items:center;font-size:54px;color:#fff}
 .cover::after{content:"";position:absolute;inset:0;background:linear-gradient(180deg,transparent 62%,rgba(0,0,0,.30))}
 .covertag{position:absolute;left:var(--s4);bottom:var(--s3);font-size:var(--fsm);color:var(--el-text);text-transform:capitalize;z-index:1;background:rgba(0,0,0,.35);padding:3px 10px;border-radius:999px;-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px)}
+:root[data-el-theme="light"] .covertag{color:#fff} /* sits on a black scrim; light --el-text (navy) would vanish */
 .stagehead{padding:var(--s5);border-top:1px solid var(--line)}
 .stagehead h2{margin:0 0 var(--s1);font-size:var(--f2xl);letter-spacing:-.3px}
 .verified{display:inline-flex;align-items:center;gap:6px;color:var(--ok);font-size:var(--fsm);margin-top:var(--s2)}
@@ -252,7 +254,7 @@ details.acc[open]>summary::after{transform:rotate(45deg)}
 /* Inset outline on media covers — PURE neutrals only (skill non-negotiable: a tinted ring reads as dirt on
    the poster edge): pure white in dark, pure black in light. */
 .thumb,.cover{box-shadow:inset 0 0 0 1px var(--el-hairline)}
-[data-theme=light] .thumb,[data-theme=light] .cover{box-shadow:inset 0 0 0 1px rgba(0,0,0,.1)}
+:root[data-el-theme="light"] .thumb,:root[data-el-theme="light"] .cover{box-shadow:inset 0 0 0 1px rgba(0,0,0,.1)}
 
 /* ---------- INLINE ICONS (lucide-style stroke, inherits currentColor — no emoji) ---------- */
 .ico{width:16px;height:16px;flex:none}                 /* default inline size (rail/facets/pills) */
@@ -267,14 +269,14 @@ details.acc[open]>summary::after{transform:rotate(45deg)}
 /* loading placeholder bars (no aspect-ratio, unlike .skeleton) — reuse the sh shimmer */
 .sk{background:linear-gradient(90deg,var(--panel) 25%,var(--panel-2) 37%,var(--panel) 63%);background-size:400% 100%;animation:sh 1.4s ease-in-out infinite;border-radius:8px}
 /* theme toggle: cross-fade sun<->moon (skill icon-animation: scale .25->1, opacity 0->1, blur 4->0). The
-   reduced-motion guard disables the transition; the [data-theme] state still swaps instantly. */
+   reduced-motion guard disables the transition; the [data-el-theme] state still swaps instantly. */
 .theme{position:relative}
 .theme .ico{position:absolute;top:50%;left:50%;width:18px;height:18px;margin:-9px 0 0 -9px;
   transition:opacity .3s cubic-bezier(.2,0,0,1),transform .3s cubic-bezier(.2,0,0,1),filter .3s cubic-bezier(.2,0,0,1)}
 .theme .ico-sun{opacity:0;transform:scale(.25);filter:blur(4px)}
 .theme .ico-moon{opacity:1;transform:scale(1);filter:blur(0)}
-[data-theme=light] .theme .ico-sun{opacity:1;transform:scale(1);filter:blur(0)}
-[data-theme=light] .theme .ico-moon{opacity:0;transform:scale(.25);filter:blur(4px)}
+:root[data-el-theme="light"] .theme .ico-sun{opacity:1;transform:scale(1);filter:blur(0)}
+:root[data-el-theme="light"] .theme .ico-moon{opacity:0;transform:scale(.25);filter:blur(4px)}
 
 /* ---------- BRAND (elacity turquoise->gold; transplanted from elacity-web, values-only — no MUI) ---------- */
 /* Signature gradient text. @supports-guarded: only goes transparent where background-clip:text works, else

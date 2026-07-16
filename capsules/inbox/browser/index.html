@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Inbox · ElastOS</title>
+  <script src="./elastos-theme.js"></script>
   <link rel="stylesheet" href="./elastos-ui.css">
   <style>
     :root {
@@ -29,6 +30,38 @@
       --radius-lg: 8px;
       --radius-md: 6px;
       font-family: var(--el-font);
+    }
+
+    :root[data-el-theme="light"] {
+      color-scheme: light;
+      --sidebar-bg: #f9f9f9;
+      --toolbar-bg: #fafafa;
+      --accent: #007aff;
+      --accent-soft: #e5f0ff;
+    }
+
+    :root[data-el-theme="light"] body {
+      background: var(--bg);
+    }
+
+    :root[data-el-theme="light"] .entry-action:hover,
+    :root[data-el-theme="light"] .entry-action:focus-visible {
+      background: #f9fafb;
+    }
+
+    :root[data-el-theme="light"] .entry[data-severity="attention"] {
+      border-color: rgba(0, 122, 255, 0.35);
+      background: #f5f9ff;
+    }
+
+    :root[data-el-theme="light"] .entry-action.primary {
+      background: var(--text);
+      color: #f8fbff;
+    }
+
+    :root[data-el-theme="light"] .entry-action.danger {
+      border-color: rgba(177, 76, 90, 0.24);
+      background: rgba(177, 76, 90, 0.08);
     }
 
     * {

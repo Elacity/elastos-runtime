@@ -24,7 +24,7 @@
   --mono: var(--el-font-mono, ui-monospace, "SF Mono", monospace);
 }
 
-[data-theme="light"] {
+:root[data-el-theme="light"] {
   color-scheme: light;
   --bg: #fafaf7;
   --surface: #ffffff;
@@ -58,7 +58,7 @@ body {
   font-size: 13px;
 }
 
-[data-theme="light"] body {
+:root[data-el-theme="light"] body {
   background:
     radial-gradient(circle at 20% 0%, oklch(0.55 0.13 250 / 0.1), transparent 55%),
     radial-gradient(circle at 90% 100%, oklch(0.7 0.13 290 / 0.08), transparent 55%),
@@ -429,11 +429,11 @@ h3 {
   box-shadow: 0 0 0 1px var(--accent), 0 8px 24px rgba(0, 0, 0, 0.4);
 }
 
-[data-theme="light"] .wallet-account:hover {
+:root[data-el-theme="light"] .wallet-account:hover {
   box-shadow: 0 8px 24px rgba(20, 20, 18, 0.06);
 }
 
-[data-theme="light"] .wallet-account.is-selected {
+:root[data-el-theme="light"] .wallet-account.is-selected {
   box-shadow: 0 0 0 1px var(--accent), 0 8px 24px rgba(20, 20, 18, 0.06);
 }
 
@@ -605,8 +605,8 @@ h3 {
   backdrop-filter: blur(4px);
 }
 
-[data-theme="light"] .wallet-drawer-backdrop,
-[data-theme="light"] .wallet-modal-backdrop {
+:root[data-el-theme="light"] .wallet-drawer-backdrop,
+:root[data-el-theme="light"] .wallet-modal-backdrop {
   background: rgba(20, 20, 18, 0.18);
 }
 
@@ -633,7 +633,7 @@ h3 {
   justify-self: end;
 }
 
-[data-theme="light"] .wallet-drawer {
+:root[data-el-theme="light"] .wallet-drawer {
   box-shadow: -30px 0 80px rgba(20, 20, 18, 0.1);
 }
 
