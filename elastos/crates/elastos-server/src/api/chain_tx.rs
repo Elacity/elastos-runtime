@@ -11,8 +11,49 @@
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use super::rights_authority::{env_nonempty, resolve_chain_bin, run_chain_capsule, ChainRpcMock};
+
+/// Passive chain-RPC health: every LIVE read op that already runs (indexer sweeps, listing
+/// enrichment, buy pre-reads) records its outcome here, so the shell's network-status glyph can
+/// report RPC health with ZERO probe traffic of its own. Never consulted by the money path.
+#[derive(Default)]
+struct ChainHealthCell {
+    last_ok: Option<Instant>,
+    last_err: Option<(Instant, String)>,
+}
+
+fn chain_health_cell() -> &'static Mutex<ChainHealthCell> {
+    static CELL: OnceLock<Mutex<ChainHealthCell>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(ChainHealthCell::default()))
+}
+
+/// Record a live chain read's outcome, passing the result through unchanged.
+fn record_chain_health<T>(result: Result<T, String>) -> Result<T, String> {
+    if let Ok(mut cell) = chain_health_cell().lock() {
+        match &result {
+            Ok(_) => cell.last_ok = Some(Instant::now()),
+            Err(err) => cell.last_err = Some((Instant::now(), err.clone())),
+        }
+    }
+    result
+}
+
+/// Snapshot for status reporting: seconds since the last successful live read, seconds since the
+/// last failure, and the failure message. All `None` until the first live call of this process.
+pub(crate) fn chain_health_snapshot() -> (Option<u64>, Option<u64>, Option<String>) {
+    let Ok(cell) = chain_health_cell().lock() else {
+        return (None, None, None);
+    };
+    let ok_secs = cell.last_ok.map(|at| at.elapsed().as_secs());
+    let (err_secs, err_msg) = match &cell.last_err {
+        Some((at, msg)) => (Some(at.elapsed().as_secs()), Some(msg.clone())),
+        None => (None, None),
+    };
+    (ok_secs, err_secs, err_msg)
+}
 
 /// Init for the in-process JSON-RPC mock network (offline broadcast proof).
 pub(crate) fn mock_init(rpc_url: &str) -> Value {
@@ -162,7 +203,7 @@ pub(crate) fn contract_call_live(to: &str, data: &str) -> Result<String, String>
     let (network, init) = live_chain_init()?;
     let request = json!({ "op": "contract_call", "network": network, "to": to, "data": data });
     let chain_bin = resolve_chain_bin();
-    let resp = run_chain_capsule(&chain_bin, &init, &request)?;
+    let resp = record_chain_health(run_chain_capsule(&chain_bin, &init, &request))?;
     resp.get("result")
         .and_then(Value::as_str)
         .map(str::to_string)
@@ -174,7 +215,7 @@ pub(crate) fn block_number_live() -> Result<u64, String> {
     let (network, init) = live_chain_init()?;
     let request = json!({ "op": "block_number", "network": network });
     let chain_bin = resolve_chain_bin();
-    let resp = run_chain_capsule(&chain_bin, &init, &request)?;
+    let resp = record_chain_health(run_chain_capsule(&chain_bin, &init, &request))?;
     let bn = resp.get("block_number");
     if let Some(s) = bn.and_then(Value::as_str) {
         return u64::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|e| e.to_string());
@@ -266,7 +307,7 @@ pub(crate) fn get_logs_live(filter: Value) -> Result<Vec<Value>, String> {
     let (network, init) = live_chain_init()?;
     let request = json!({ "op": "logs", "network": network, "filter": filter });
     let chain_bin = resolve_chain_bin();
-    let resp = run_chain_capsule(&chain_bin, &init, &request)?;
+    let resp = record_chain_health(run_chain_capsule(&chain_bin, &init, &request))?;
     Ok(resp
         .get("logs")
         .and_then(Value::as_array)

@@ -58,6 +58,8 @@ mod gateway_inspect_actions;
 mod gateway_mandates;
 #[path = "gateway_marketplace.rs"]
 mod gateway_marketplace;
+#[path = "gateway_network_status.rs"]
+mod gateway_network_status;
 #[path = "gateway_provider_proxy.rs"]
 mod gateway_provider_proxy;
 #[path = "gateway_room.rs"]
@@ -91,6 +93,7 @@ use gateway_home_token::{
 use gateway_inbox::*;
 use gateway_inspect_actions::*;
 use gateway_marketplace::*;
+use gateway_network_status::*;
 use gateway_provider_proxy::*;
 use gateway_room::*;
 pub(crate) use gateway_room::{
@@ -705,6 +708,7 @@ pub fn gateway_router(state: GatewayState) -> Router {
             post(wallet_connector_approval_complete),
         )
         .route("/api/apps/home/summary", get(home_summary))
+        .route("/api/apps/home/network-status", get(home_network_status))
         .route("/api/apps/home/events", get(home_events))
         .route("/api/apps/home/events/stream", get(home_events_stream))
         .route(

@@ -134,11 +134,16 @@ pub(super) async fn market_sections(
 /// cadence. READS ONLY the in-memory cache cell / disk snapshot — never triggers a chain sweep, so
 /// the public route cannot be used as an RPC-amplification sink.
 pub(super) async fn market_indexer_status(State(state): State<GatewayState>) -> Response {
-    ensure_index_snapshot_path(&state.data_dir);
-    // Arm the poll loop here too: after a restart the first traffic may be a status probe, not a
-    // discovery request, and the backfill must not stall waiting for someone to browse. Arming is
-    // idempotent + spawn-only (the advance itself stays single-flight in the background); this
-    // route still never performs a synchronous sweep.
+    Json(indexer_status_json(&state.data_dir)).into_response()
+}
+
+/// The indexer-status payload, shared by `GET /api/market/indexer-status` and the shell's
+/// aggregated network-status view. Reads ONLY the cache cell / disk snapshot (never sweeps).
+/// Arms the poll loop too: after a restart the first traffic may be a status probe, not a
+/// discovery request, and the backfill must not stall waiting for someone to browse. Arming is
+/// idempotent + spawn-only (the advance itself stays single-flight in the background).
+pub(super) fn indexer_status_json(data_dir: &std::path::Path) -> serde_json::Value {
+    ensure_index_snapshot_path(data_dir);
     ensure_index_poll_loop();
     let idx = recent_index_cell()
         .lock()
@@ -159,7 +164,7 @@ pub(super) async fn market_indexer_status(State(state): State<GatewayState>) -> 
         let total = (scanned_to - deploy) as f64;
         ((scanned_to - backfill_low) as f64 / total * 100.0).min(100.0)
     };
-    Json(serde_json::json!({
+    serde_json::json!({
         "coverage": coverage,
         "scanned_to": scanned_to,
         "backfill_low": backfill_low,
@@ -167,8 +172,7 @@ pub(super) async fn market_indexer_status(State(state): State<GatewayState>) -> 
         "backfill_pct": (backfill_pct * 10.0).round() / 10.0,
         "listings": listings,
         "poll_secs": market_poll_secs(),
-    }))
-    .into_response()
+    })
 }
 
 /// Truthy `lean` query flag (`1`/`true`) — selects the lean-first first-paint response.
