@@ -25,6 +25,7 @@
   --toolbar-h: 36px;
   --toolbar-offset: 14px;
   --chrome-fill: hsla(220, 10%, 12%, 0.72);
+  --dock-fill: hsla(216, 8%, 18%, 0.78);
   --hairline: rgba(255, 255, 255, 0.14);
   /* Stage contract: windows (incl. maximize/snap) live between the system bar
      and the dock clearance — system chrome is never covered. */
@@ -737,13 +738,13 @@ body[data-home-authority="signed"] .sign-out-btn {
   height: var(--taskbar-h);
   padding-left: 12px;
   padding-right: 12px;
-  border-radius: 24px;
-  background-color: hsla(216, 8%, 22%, 0.82);
+  border-radius: 20px;
+  background-color: var(--dock-fill);
   box-shadow:
-    inset 0 0 0 0.5px rgba(255, 255, 255, 0.2),
+    inset 0 0 0 0.5px var(--hairline),
     0 0 0 0.5px rgba(0, 0, 0, 0.2),
     0 4px 16px rgba(0, 0, 0, 0.2);
-  backdrop-filter: blur(12px);
+  backdrop-filter: blur(10px);
 }
 
 .taskbar-inner {
@@ -770,9 +771,9 @@ body[data-home-authority="signed"] .sign-out-btn {
   min-height: 40px;
   padding: 0 2px;
   gap: 2px;
-  overflow-x: auto;
+  /* Magnified icons and tooltips must escape the pill: no clipping here. */
+  overflow: visible;
   border-radius: 14px;
-  scrollbar-width: none;
   transition: background-color 0.16s ease, box-shadow 0.16s ease;
 }
 
@@ -802,20 +803,16 @@ body[data-home-authority="signed"] .sign-out-btn {
   opacity: 0.32;
 }
 
-.taskbar-item:hover .taskbar-icon,
-.taskbar-item:focus-visible .taskbar-icon {
-  background-color: rgba(255, 255, 255, 0.4);
-  outline: none;
-}
-
-.taskbar-item.active .taskbar-icon,
-.taskbar-item:active .taskbar-icon,
-.taskbar-item.open .taskbar-icon {
-  background-color: rgba(90, 93, 97, 0.66);
+/* The Dock speaks through magnification and running dots — no hover plates.
+   Keyboard focus keeps an explicit ring. */
+.taskbar-item:focus-visible {
+  outline: 2px solid var(--brand-focus);
+  outline-offset: 2px;
+  border-radius: 12px;
 }
 
 .taskbar-item:active {
-  transform: scale(0.97);
+  transform: scale(0.96);
 }
 
 .taskbar-icon {
@@ -824,7 +821,21 @@ body[data-home-authority="signed"] .sign-out-btn {
   display: grid;
   place-items: center;
   border-radius: 10px;
-  transition: background-color 0.18s ease;
+  /* Magnification is transform-only on this inner node: the 40px layout slot
+     (and hit target) never moves. Grows upward from the dock floor. */
+  transform-origin: 50% 100%;
+  transition: transform 90ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.taskbar-item.launching .taskbar-icon {
+  animation: dock-launch-bounce 420ms cubic-bezier(0.34, 1.4, 0.64, 1);
+}
+
+@keyframes dock-launch-bounce {
+  0% { transform: scale(1); }
+  25% { transform: scale(0.92); }
+  55% { transform: translateY(-10px) scale(1.08); }
+  100% { transform: none; }
 }
 
 .taskbar-item-icon {
@@ -840,6 +851,9 @@ body[data-home-authority="signed"] .sign-out-btn {
   height: 40px;
 }
 
+/* Window-count chip stays functional (opens the group menu) but is demoted to
+   monochrome — the Dock signals presence with dots; brand orange is for
+   notifications in the system bar, not Dock chrome. */
 .taskbar-window-count {
   position: absolute;
   top: 0;
@@ -850,20 +864,28 @@ body[data-home-authority="signed"] .sign-out-btn {
   display: grid;
   place-items: center;
   border-radius: 999px;
-  background: var(--brand);
-  color: #111;
+  background: rgba(32, 34, 40, 0.94);
+  color: rgba(245, 247, 250, 0.85);
   font-size: 10px;
   font-weight: 700;
   line-height: 1;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28);
+  font-variant-numeric: tabular-nums;
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.18),
+    0 2px 8px rgba(0, 0, 0, 0.28);
   cursor: pointer;
   z-index: 2;
 }
 
 .taskbar-window-count:hover,
 .taskbar-window-count:focus-visible {
-  background: var(--brand-strong);
-  outline: none;
+  background: rgba(62, 65, 72, 0.96);
+  color: #fff;
+}
+
+.taskbar-window-count:focus-visible {
+  outline: 2px solid var(--brand-focus);
+  outline-offset: 1px;
 }
 
 .taskbar-window-count[hidden] {
@@ -897,11 +919,52 @@ body[data-home-authority="signed"] .sign-out-btn {
 }
 
 .taskbar-item.open .active-taskbar-indicator {
-  opacity: 0.5;
+  opacity: 0.55;
 }
 
 .taskbar-item.active .active-taskbar-indicator {
   opacity: 1;
+}
+
+/* Pinned ⋮ running divider */
+.taskbar-separator {
+  flex: 0 0 1px;
+  width: 1px;
+  height: 26px;
+  margin: 0 5px;
+  border-radius: 1px;
+  background: rgba(255, 255, 255, 0.16);
+}
+
+/* Dock tooltip: shared, non-interactive, positioned above the (possibly
+   magnified) icon. Shown on hover after a delay and on keyboard focus. */
+.dock-tooltip {
+  position: fixed;
+  z-index: 100130;
+  padding: 4px 9px;
+  transform: translateX(-50%) translateY(-100%);
+  border-radius: 6px;
+  background: rgba(24, 26, 31, 0.96);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.3;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow:
+    inset 0 0 0 0.5px var(--hairline),
+    0 8px 28px rgba(0, 0, 0, 0.32);
+  backdrop-filter: blur(10px);
+  opacity: 0;
+  transition: opacity 140ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.dock-tooltip[data-visible="true"] {
+  opacity: 1;
+}
+
+.dock-tooltip[hidden] {
+  display: none;
 }
 
 .launcher {
@@ -1823,6 +1886,18 @@ body.dragging-target {
 @media (prefers-reduced-motion: reduce) {
   .window-loading-stages li.is-active .stage-mark {
     animation-duration: 2.4s;
+  }
+
+  .taskbar-icon {
+    transition: none;
+  }
+
+  .taskbar-item.launching .taskbar-icon {
+    animation: none;
+  }
+
+  .dock-tooltip {
+    transition: none;
   }
 }
 

@@ -185,16 +185,29 @@ function updateDesktopSelectionState() {
 
 export function renderTaskbar(summary) {
   taskbarTargets.replaceChildren();
+  const pinnedIds = new Set(shellState.shellLayoutState.taskbar);
+  let separatorInserted = false;
   for (const targetId of visibleTaskbarTargets(summary)) {
     const app = targetById(summary, targetId);
     if (!app) {
       continue;
     }
+    if (
+      !pinnedIds.has(targetId) &&
+      !separatorInserted &&
+      taskbarTargets.childElementCount > 0
+    ) {
+      const separator = document.createElement("span");
+      separator.className = "taskbar-separator";
+      separator.setAttribute("aria-hidden", "true");
+      taskbarTargets.appendChild(separator);
+      separatorInserted = true;
+    }
     const entry = taskbarItemTemplate.content.firstElementChild.cloneNode(true);
     const button = entry.querySelector(".taskbar-item");
     const openCount = browserWindowCount(app.target);
     button.dataset.target = app.target;
-    button.title = taskbarItemTitle(app, summary, openCount);
+    button.dataset.label = app.title;
     mountGlyph(button.querySelector(".taskbar-item-icon"), app.target);
     button.dataset.openWindows = String(openCount);
     attachTargetIconInteractions(button, app.target, "taskbar");
@@ -202,11 +215,6 @@ export function renderTaskbar(summary) {
     taskbarTargets.appendChild(entry);
   }
   updateTaskbarState();
-}
-
-function taskbarItemTitle(app, summary, openCount = 0) {
-  const countLine = openCount > 1 ? `\n${openCount} windows open` : "";
-  return `${app.title}${countLine}`;
 }
 
 function visibleTaskbarTargets(summary) {
@@ -259,7 +267,7 @@ function updateTaskbarButton(button, targetId) {
   button.dataset.active = isActive ? "true" : "false";
   button.dataset.openWindows = String(openCount);
   if (appInfo && shellState.currentSummary) {
-    button.title = taskbarItemTitle(appInfo, shellState.currentSummary, openCount);
+    button.dataset.label = appInfo.title;
     button.setAttribute("aria-label", taskbarItemAriaLabel(appInfo.title, openCount, isActive));
   }
   const entry = button.closest(".taskbar-entry");
@@ -497,6 +505,9 @@ function attachTargetIconInteractions(node, targetId, source) {
     if (source === "taskbar") {
       if (event.target.closest(".taskbar-window-count")) {
         return;
+      }
+      if (browserWindowCount(targetId) === 0) {
+        startDockLaunchBounce(node);
       }
       handleTaskbarTargetClick(targetId);
       return;
@@ -1540,3 +1551,221 @@ function hideHomeNotificationToast() {
   homeNotificationToast.setAttribute("aria-hidden", "true");
   homeNotificationToast.hidden = true;
 }
+
+/* ---- Dock behavior: magnification, tooltips, launch bounce ----
+   Magnification is paint-only: layout slots stay fixed at 40px so hit targets
+   never move; only the inner .taskbar-icon scales (origin bottom-center) with
+   a cosine falloff around the pointer. Icon centers are cached on hover entry;
+   pointermove only reads clientX and writes transforms inside one rAF per
+   frame. Disabled while dragging and under prefers-reduced-motion. */
+const DOCK_MAG_MAX_SCALE = 1.55;
+const DOCK_MAG_RANGE_PX = 88;
+const DOCK_MAG_LIFT_RATIO = 0.35;
+const DOCK_ICON_BASE_PX = 40;
+const DOCK_TOOLTIP_SHOW_MS = 320;
+const DOCK_TOOLTIP_HIDE_MS = 100;
+
+const dockReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+const dockState = {
+  taskbar: document.querySelector(".taskbar"),
+  icons: [],
+  raf: 0,
+  pointerX: null,
+  tooltipNode: null,
+  tooltipShowTimer: 0,
+  tooltipHideTimer: 0,
+  tooltipAnchor: null,
+};
+
+function dockMagnifyEnabled() {
+  return (
+    !dockReducedMotion.matches &&
+    !document.body.classList.contains("dragging-target")
+  );
+}
+
+function rebuildDockIconCache() {
+  dockState.icons = Array.from(
+    dockState.taskbar.querySelectorAll(".taskbar-item"),
+  ).map((item) => {
+    const rect = item.getBoundingClientRect();
+    return {
+      node: item.querySelector(".taskbar-icon"),
+      center: rect.left + rect.width / 2,
+    };
+  });
+}
+
+function resetDockMagnification() {
+  dockState.pointerX = null;
+  for (const entry of dockState.icons) {
+    if (entry.node) {
+      entry.node.style.transform = "";
+    }
+  }
+}
+
+function applyDockMagnification() {
+  dockState.raf = 0;
+  if (dockState.pointerX === null) {
+    return;
+  }
+  for (const entry of dockState.icons) {
+    if (!entry.node) {
+      continue;
+    }
+    const distance = Math.abs(dockState.pointerX - entry.center);
+    if (distance >= DOCK_MAG_RANGE_PX) {
+      entry.node.style.transform = "";
+      continue;
+    }
+    const falloff = 0.5 * (1 + Math.cos((Math.PI * distance) / DOCK_MAG_RANGE_PX));
+    const scale = 1 + (DOCK_MAG_MAX_SCALE - 1) * falloff;
+    const lift = -(scale - 1) * DOCK_ICON_BASE_PX * DOCK_MAG_LIFT_RATIO;
+    entry.node.style.transform = `translateY(${lift.toFixed(2)}px) scale(${scale.toFixed(3)})`;
+  }
+}
+
+function dockTooltipNode() {
+  if (!dockState.tooltipNode) {
+    const node = document.createElement("div");
+    node.id = "dock-tooltip";
+    node.className = "dock-tooltip";
+    node.setAttribute("role", "tooltip");
+    node.hidden = true;
+    document.body.appendChild(node);
+    dockState.tooltipNode = node;
+  }
+  return dockState.tooltipNode;
+}
+
+function scheduleDockTooltip(item, delay) {
+  const label = item.dataset.label || "";
+  if (!label) {
+    return;
+  }
+  window.clearTimeout(dockState.tooltipHideTimer);
+  window.clearTimeout(dockState.tooltipShowTimer);
+  dockState.tooltipShowTimer = window.setTimeout(() => {
+    showDockTooltip(item, label);
+  }, delay);
+}
+
+function showDockTooltip(item, label) {
+  if (!item.isConnected) {
+    return;
+  }
+  const tooltip = dockTooltipNode();
+  tooltip.textContent = label;
+  tooltip.hidden = false;
+  const rect = item.getBoundingClientRect();
+  const barRect = dockState.taskbar.getBoundingClientRect();
+  tooltip.style.left = `${rect.left + rect.width / 2}px`;
+  tooltip.style.top = `${barRect.top - 10}px`;
+  tooltip.dataset.visible = "true";
+  if (dockState.tooltipAnchor && dockState.tooltipAnchor !== item) {
+    dockState.tooltipAnchor.removeAttribute("aria-describedby");
+  }
+  dockState.tooltipAnchor = item;
+  item.setAttribute("aria-describedby", "dock-tooltip");
+}
+
+function scheduleDockTooltipHide() {
+  window.clearTimeout(dockState.tooltipShowTimer);
+  window.clearTimeout(dockState.tooltipHideTimer);
+  dockState.tooltipHideTimer = window.setTimeout(hideDockTooltip, DOCK_TOOLTIP_HIDE_MS);
+}
+
+function hideDockTooltip() {
+  window.clearTimeout(dockState.tooltipShowTimer);
+  if (dockState.tooltipNode) {
+    dockState.tooltipNode.hidden = true;
+    delete dockState.tooltipNode.dataset.visible;
+  }
+  if (dockState.tooltipAnchor) {
+    dockState.tooltipAnchor.removeAttribute("aria-describedby");
+    dockState.tooltipAnchor = null;
+  }
+}
+
+function startDockLaunchBounce(item) {
+  if (dockReducedMotion.matches) {
+    return;
+  }
+  const icon = item.querySelector(".taskbar-icon");
+  if (!icon) {
+    return;
+  }
+  item.classList.remove("launching");
+  // Restart the keyframe animation if a bounce is already mid-flight.
+  void item.offsetWidth;
+  item.classList.add("launching");
+  icon.addEventListener(
+    "animationend",
+    () => {
+      item.classList.remove("launching");
+    },
+    { once: true },
+  );
+}
+
+function setupDock() {
+  const taskbar = dockState.taskbar;
+  if (!taskbar) {
+    return;
+  }
+  taskbar.addEventListener("pointerenter", () => {
+    if (dockMagnifyEnabled()) {
+      rebuildDockIconCache();
+    }
+  });
+  taskbar.addEventListener("pointermove", (event) => {
+    if (!dockMagnifyEnabled()) {
+      resetDockMagnification();
+      return;
+    }
+    if (dockState.icons.length === 0) {
+      rebuildDockIconCache();
+    }
+    dockState.pointerX = event.clientX;
+    if (!dockState.raf) {
+      dockState.raf = window.requestAnimationFrame(applyDockMagnification);
+    }
+  });
+  taskbar.addEventListener("pointerleave", resetDockMagnification);
+  window.addEventListener("resize", () => {
+    dockState.icons = [];
+  });
+
+  // Tooltips by delegation so they survive taskbar re-renders. Shown on hover
+  // (after a delay) and on keyboard focus (immediately); Escape dismisses.
+  taskbar.addEventListener("pointerover", (event) => {
+    const item = event.target.closest(".taskbar-item");
+    if (!item || (event.relatedTarget && item.contains(event.relatedTarget))) {
+      return;
+    }
+    scheduleDockTooltip(item, DOCK_TOOLTIP_SHOW_MS);
+  });
+  taskbar.addEventListener("pointerout", (event) => {
+    const item = event.target.closest(".taskbar-item");
+    if (!item || (event.relatedTarget && item.contains(event.relatedTarget))) {
+      return;
+    }
+    scheduleDockTooltipHide();
+  });
+  taskbar.addEventListener("focusin", (event) => {
+    const item = event.target.closest(".taskbar-item");
+    if (item) {
+      scheduleDockTooltip(item, 0);
+    }
+  });
+  taskbar.addEventListener("focusout", scheduleDockTooltipHide);
+  taskbar.addEventListener("click", hideDockTooltip);
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      hideDockTooltip();
+    }
+  });
+}
+
+setupDock();
