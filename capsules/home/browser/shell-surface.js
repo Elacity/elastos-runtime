@@ -1853,6 +1853,7 @@ function rebuildDockIconCache() {
     const rect = item.getBoundingClientRect();
     return {
       node: item.querySelector(".taskbar-icon"),
+      item,
       center: rect.left + rect.width / 2,
     };
   });
@@ -1874,6 +1875,7 @@ function resetDockMagnification() {
     if (entry.node) {
       entry.node.style.transform = "";
     }
+    entry.item?.style.removeProperty("--dock-shift");
   }
 }
 
@@ -1912,10 +1914,12 @@ function applyDockMagnification() {
     }
     if (scale <= 1.004 && Math.abs(shift) < 0.5) {
       entry.node.style.transform = "";
+      entry.item?.style.removeProperty("--dock-shift");
       continue;
     }
     const lift = -(scale - 1) * DOCK_ICON_BASE_PX * DOCK_MAG_LIFT_RATIO;
     entry.node.style.transform = `translate(${shift.toFixed(2)}px, ${lift.toFixed(2)}px) scale(${scale.toFixed(3)})`;
+    entry.item?.style.setProperty("--dock-shift", `${shift.toFixed(2)}px`);
   }
 }
 

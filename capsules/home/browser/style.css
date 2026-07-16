@@ -1120,25 +1120,28 @@ img {
     linear-gradient(#3a4358 0 0) right bottom / 7px 7px no-repeat;
 }
 
+/* macOS-style running dot: only apps with open windows get one; pinned
+   favorites stay clean until launched. It rides the magnification spread
+   horizontally (JS sets --dock-shift) but never lifts or scales. */
 .active-taskbar-indicator {
   position: absolute;
   left: 50%;
-  bottom: 8px;
-  width: 9px;
-  height: 3px;
-  border-radius: 3px;
-  background-color: rgba(242, 243, 246, 0.82);
-  transform: translateX(-50%);
+  bottom: 4px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background-color: rgba(242, 243, 246, 0.9);
+  transform: translateX(calc(-50% + var(--dock-shift, 0px)));
   opacity: 0;
   transition: opacity 0.16s ease;
 }
 
 :root[data-el-theme="light"] .active-taskbar-indicator {
-  background-color: rgba(55, 62, 68, 0.85);
+  background-color: rgba(55, 62, 68, 0.9);
 }
 
 .taskbar-item.open .active-taskbar-indicator {
-  opacity: 0.55;
+  opacity: 0.7;
 }
 
 .taskbar-item.active .active-taskbar-indicator {
