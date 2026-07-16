@@ -5,6 +5,9 @@ const xtermNode = document.querySelector("#xterm-terminal");
 const terminalPanel = document.querySelector("#terminal-panel");
 const terminalScreen = document.querySelector(".terminal-screen");
 const homeToken = readQueryParam("home_token");
+const homeParentOrigin = document.referrer
+  ? new URL(document.referrer).origin
+  : window.location.origin;
 const HOST_INTENT_OSC_PREFIX = "\x1b]777;elastos-home-intent=";
 const HOST_INTENT_OSC_SUFFIX = "\x07";
 const PTY_VISIBLE_ROW_GUARD = 2;
@@ -18,7 +21,11 @@ let xtermSendQueue = Promise.resolve();
 let hostIntentControlBuffer = "";
 let pendingHostIntentTarget = "";
 let pendingHostIntentTimer = 0;
+let pendingHomeReturn = false;
 let returningHome = false;
+let signingOut = false;
+let terminalRestartCount = 0;
+const TERMINAL_RESTART_LIMIT = 1;
 
 terminalPanel?.addEventListener("click", () => {
   xtermInstance?.focus?.();
@@ -30,11 +37,15 @@ globalThis.addEventListener?.("pagehide", () => {
 
 setRuntimeTerminalMode(false);
 boot().catch((error) => {
-  showFallback(`Home CLI terminal could not start: ${error.message || error}`);
-  requestHomeClose();
+  console.error("Home CLI terminal could not start", error);
+  showFallback("Home CLI could not start. Return to the Desktop and try again.");
 });
 
 async function boot() {
+  if (!homeToken) {
+    showFallback("Open Home CLI from Home.");
+    return;
+  }
   showFallback("Starting Home CLI terminal...");
   await startRuntimeTerminal();
 }
@@ -44,7 +55,7 @@ async function startRuntimeTerminal() {
     return;
   }
   if (!globalThis.EventSource) {
-    throw new Error("Runtime terminal stream requires EventSource support");
+    throw new Error("This browser cannot open Home CLI.");
   }
 
   const size = measureTerminalSize();
@@ -58,19 +69,20 @@ async function startRuntimeTerminal() {
     }),
   });
   if (session?.schema !== "elastos.home-cli.terminal-session/v1") {
-    throw new Error("Runtime terminal returned an invalid session schema");
+    throw new Error("Home CLI could not start.");
   }
 
   const stream = session.stream && typeof session.stream === "object" ? session.stream : {};
   const eventsUrl = readText(stream.events_url);
   const inputUrl = readText(stream.input_url);
   const resizeUrl = readText(stream.resize_url);
+  const intentUrl = readText(stream.intent_url);
   const closeUrl = readText(stream.close_url);
-  if (!eventsUrl || !inputUrl || !resizeUrl || !closeUrl) {
-    throw new Error("Runtime terminal session is missing stream routes");
+  if (!eventsUrl || !inputUrl || !resizeUrl || !intentUrl || !closeUrl) {
+    throw new Error("Home CLI could not start.");
   }
   if (eventsUrl.includes("home_token=")) {
-    throw new Error("Runtime terminal refused an event stream URL containing a Home token");
+    throw new Error("Home CLI could not start securely.");
   }
 
   await attachXtermTerminal(size);
@@ -80,6 +92,7 @@ async function startRuntimeTerminal() {
     closeUrl,
     eventsUrl,
     inputUrl,
+    intentUrl,
     resizeUrl,
     sessionId: readText(session.session_id),
     size,
@@ -94,14 +107,7 @@ async function startRuntimeTerminal() {
     if (runtimeTerminal?.source !== source) {
       return;
     }
-    const openedTarget = takePendingHostIntentTarget();
-    cleanupRuntimeTerminal();
-    if (openedTarget) {
-      reattachHomeCliTerminal(openedTarget);
-      return;
-    }
-    showFallback("Home CLI terminal stream closed. Returning to Home GUI.");
-    requestHomeClose();
+    console.warn("Home CLI terminal stream interrupted; waiting for EventSource reconnect");
   };
 
   xtermInstance?.focus?.();
@@ -109,7 +115,7 @@ async function startRuntimeTerminal() {
 
 async function attachXtermTerminal(size) {
   if (!xtermNode) {
-    throw new Error("Runtime terminal mount is missing");
+    throw new Error("Home CLI display is unavailable.");
   }
 
   detachXtermTerminal();
@@ -158,7 +164,8 @@ async function attachXtermTerminal(size) {
       const next = measureTerminalSize();
       xtermInstance?.resize?.(next.cols, next.rows);
       resizeRuntimeTerminal(next).catch((error) => {
-        writeXtermStatus(`terminal resize error: ${error.message || error}`);
+        console.error("Home CLI resize failed", error);
+        writeXtermStatus("Home CLI could not resize.");
       });
     });
     xtermResizeObserver.observe(xtermNode);
@@ -194,11 +201,11 @@ function handleRuntimeTerminalEvent(event) {
   try {
     payload = JSON.parse(event?.data || "{}");
   } catch (_error) {
-    writeXtermStatus("runtime terminal emitted invalid JSON");
+    writeXtermStatus("Home CLI received an unreadable update.");
     return;
   }
   if (payload?.schema !== "elastos.home-cli.terminal-event/v1") {
-    writeXtermStatus("runtime terminal emitted an unsupported event schema");
+    writeXtermStatus("Home CLI received an unreadable update.");
     return;
   }
 
@@ -208,7 +215,8 @@ function handleRuntimeTerminalEvent(event) {
     return;
   }
   if (stream === "error") {
-    writeXtermStatus(`runtime terminal error: ${readText(payload.message) || "unknown"}`);
+    console.error("Home CLI terminal error", readText(payload.message));
+    writeXtermStatus("Home CLI stopped unexpectedly.");
     return;
   }
   if (stream !== "lifecycle") {
@@ -217,19 +225,20 @@ function handleRuntimeTerminalEvent(event) {
 
   const message = readText(payload.message) || "lifecycle";
   if (message === "exited" || message.startsWith("closed")) {
-    const code = payload.exit_code == null ? "" : ` ${payload.exit_code}`;
     const openedTarget = takePendingHostIntentTarget();
     cleanupRuntimeTerminal();
+    if (pendingHomeReturn || returningHome || signingOut) {
+      return;
+    }
     if (openedTarget) {
       reattachHomeCliTerminal(openedTarget);
       return;
     }
-    showFallback(`Home CLI terminal ${message}${code}. Returning to Home GUI.`);
-    requestHomeClose();
+    reattachHomeCliTerminal("", "Home CLI closed unexpectedly. Reconnecting...");
     return;
   }
 
-  writeXtermStatus(`runtime terminal ${message}`);
+  writeXtermStatus(`Home CLI ${message}`);
 }
 
 function writeRuntimeBytes(data) {
@@ -270,14 +279,52 @@ function handleHostIntentControl(rawPayload) {
   try {
     payload = JSON.parse(rawPayload || "{}");
   } catch (error) {
-    writeXtermStatus(`ignored malformed host intent: ${error.message || error}`);
+    console.error("Home CLI ignored an unreadable action", error);
     return;
   }
   if (payload?.schema !== "elastos.home.terminal-host-intent/v1") {
     return;
   }
+  if (payload.action === "active-shell" && payload.target === "home-gui") {
+    pendingHomeReturn = true;
+  }
+  authorizeRuntimeHostIntent(payload)
+    .then((authorized) => {
+      applyRuntimeHostIntent(authorized);
+    })
+    .catch((error) => {
+      pendingHomeReturn = false;
+      console.error("Home CLI action was not authorized", error);
+      writeXtermStatus("This action is not available.");
+    });
+}
+
+async function authorizeRuntimeHostIntent(payload) {
+  if (!runtimeTerminal?.intentUrl) {
+    throw new Error("Home CLI cannot run this action.");
+  }
+  const response = await fetchJson(runtimeTerminal.intentUrl, {
+    method: "POST",
+    headers: homeHeaders({ "content-type": "application/json" }),
+    body: JSON.stringify(payload),
+  });
+  if (response?.schema !== "elastos.home-cli.terminal-intent/v1") {
+    throw new Error("Home could not complete this action.");
+  }
+  const intent = response.intent && typeof response.intent === "object" ? response.intent : null;
+  if (intent?.schema !== "elastos.home.terminal-host-intent/v1") {
+    throw new Error("Home could not complete this action.");
+  }
+  return intent;
+}
+
+function applyRuntimeHostIntent(payload) {
   const action = readText(payload.action);
   const target = readText(payload.target);
+  if (action === "sign-out" && target === "home") {
+    requestHomeSignOut();
+    return;
+  }
   if (action === "active-shell" && target) {
     requestHomeActiveShell(target);
     return;
@@ -289,9 +336,25 @@ function handleHostIntentControl(rawPayload) {
   requestHomeOpenTarget(target, payload.query && typeof payload.query === "object" ? payload.query : {});
 }
 
+function requestHomeSignOut() {
+  if (signingOut) {
+    return;
+  }
+  signingOut = true;
+  closeRuntimeTerminal({ fireAndForget: true });
+  if (!window.parent || window.parent === window) {
+    window.location.href = "/apps/home/";
+    return;
+  }
+  window.parent.postMessage({
+    type: "home:sign-out",
+    homeToken,
+  }, homeParentOrigin);
+}
+
 function requestHomeActiveShell(target) {
   if (target !== "home-gui") {
-    writeXtermStatus(`ignored unsupported Home shell target: ${target}`);
+    writeXtermStatus("That Home view is not available.");
     return;
   }
   requestHomeClose();
@@ -318,11 +381,19 @@ function takePendingHostIntentTarget() {
   return target;
 }
 
-function reattachHomeCliTerminal(target) {
-  showFallback(`Opened ${target}. Reattaching Home CLI terminal...`);
+function reattachHomeCliTerminal(target, message = "") {
+  if (!target && terminalRestartCount >= TERMINAL_RESTART_LIMIT) {
+    showFallback("Home CLI terminal stopped. Refresh Home CLI or switch shell explicitly from System.");
+    return;
+  }
+  if (!target) {
+    terminalRestartCount += 1;
+  }
+  showFallback(message || `Opened ${target}. Reattaching Home CLI terminal...`);
   globalThis.setTimeout?.(() => {
     startRuntimeTerminal().catch((error) => {
-      showFallback(`Home CLI terminal could not restart after opening ${target}: ${error.message || error}`);
+      console.error(`Home CLI could not restart after opening ${target}`, error);
+      showFallback("Home CLI could not reconnect. Return to the Desktop and try again.");
     });
   }, 0);
 }
@@ -337,7 +408,7 @@ function requestHomeOpenTarget(target, query = {}) {
     target,
     query,
     homeToken,
-  }, window.location.origin);
+  }, homeParentOrigin);
 }
 
 function queueRuntimeTerminalInput(data) {
@@ -347,13 +418,14 @@ function queueRuntimeTerminalInput(data) {
   xtermSendQueue = xtermSendQueue
     .then(() => sendRuntimeTerminalInput(data))
     .catch((error) => {
-      writeXtermStatus(`terminal input error: ${error.message || error}`);
+      console.error("Home CLI input failed", error);
+      writeXtermStatus("Home CLI could not send that input.");
     });
 }
 
 async function sendRuntimeTerminalInput(data) {
   if (!runtimeTerminal) {
-    throw new Error("No Runtime terminal is attached");
+    throw new Error("Home CLI is not connected.");
   }
   await fetchJson(runtimeTerminal.inputUrl, {
     method: "POST",
@@ -463,6 +535,7 @@ function requestHomeClose() {
   if (returningHome) {
     return;
   }
+  pendingHomeReturn = false;
   returningHome = true;
   if (!window.parent || window.parent === window) {
     window.location.href = "/apps/home/";
@@ -472,7 +545,7 @@ function requestHomeClose() {
     type: "home:close-self",
     activeShell: "home-gui",
     homeToken,
-  }, window.location.origin);
+  }, homeParentOrigin);
 }
 
 async function fetchJson(url, init = {}) {

@@ -66,6 +66,10 @@ class FakeEventSource {
       listener({ data: JSON.stringify(payload) });
     }
   }
+
+  emitError() {
+    this.onerror?.({ type: "error" });
+  }
 }
 
 const xtermInstances = [];
@@ -192,11 +196,12 @@ globalThis.document = {
   createElement: (tag) => new FakeElement(tag),
   querySelector: elementForSelector,
   querySelectorAll: () => [],
+  referrer: "http://localhost:61180/apps/home/",
 };
 globalThis.window = {
   location: {
-    href: "http://localhost:61180/apps/home-cli/?shell_mode=root&home_token=cli-token",
-    origin: "http://localhost:61180",
+    href: "http://home-cli.localhost:61180/apps/home-cli/?shell_mode=root&home_token=cli-token",
+    origin: "http://home-cli.localhost:61180",
   },
   parent: {
     postMessage(message, origin) {
@@ -235,11 +240,37 @@ globalThis.fetch = async (url, init = {}) => {
         events_url: "/api/apps/home-cli/terminal/sessions/term-smoke/events?ticket=ticket-smoke",
         input_url: "/api/apps/home-cli/terminal/sessions/term-smoke/input",
         resize_url: "/api/apps/home-cli/terminal/sessions/term-smoke/resize",
+        intent_url: "/api/apps/home-cli/terminal/sessions/term-smoke/intent",
         close_url: "/api/apps/home-cli/terminal/sessions/term-smoke/close",
         input_schema: "elastos.home-cli.terminal-input/v1",
         resize_schema: "elastos.home-cli.terminal-resize/v1",
         event_schema: "elastos.home-cli.terminal-event/v1",
+        intent_schema: "elastos.home-cli.terminal-intent/v1",
       },
+    });
+  }
+  if (url === "/api/apps/home-cli/terminal/sessions/term-smoke/intent") {
+    assert(init.method === "POST", "home-cli terminal host intent was not POSTed", init);
+    assert(init.headers?.["x-elastos-home-token"] === "cli-token", "home-cli terminal host intent missed launch token", init);
+    assert(body?.schema === "elastos.home.terminal-host-intent/v1", "home-cli terminal host intent used wrong schema", body);
+    const isBrowserOpen = body?.action_id === "open-gui:browser" &&
+      body?.action === "open-target" &&
+      body?.target === "browser";
+    const isHomeGuiSwitch = body?.action_id === "shell-switch:home-gui" &&
+      body?.action === "active-shell" &&
+      body?.target === "home-gui";
+    const isSignOut = body?.action_id === "auth-sign-out" &&
+      body?.action === "sign-out" &&
+      body?.target === "home";
+    assert(
+      isBrowserOpen || isHomeGuiSwitch || isSignOut,
+      "home-cli terminal host intent was not an explicit signed Home action",
+      body,
+    );
+    return jsonResponse({
+      schema: "elastos.home-cli.terminal-intent/v1",
+      session_id: "term-smoke",
+      intent: body,
     });
   }
   if (url === "/api/apps/home-cli/terminal/sessions/term-smoke/input") {
@@ -321,6 +352,17 @@ assert(
   activeEventSource,
 );
 
+activeEventSource.emitError();
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert(eventSources.length === 1, "home-cli replaced its PTY after a transient event-stream error", eventSources);
+assert(activeEventSource.closed === false, "home-cli disabled native EventSource reconnection", activeEventSource);
+assert(activeXterm.disposed === false, "home-cli disposed xterm after a transient event-stream error", activeXterm);
+assert(
+  body.dataset.runtimeTerminal === "attached" && terminalPanel.dataset.runtimeTerminal === "attached",
+  "home-cli detached its Runtime terminal after a transient event-stream error",
+  { body: body.dataset, panel: terminalPanel.dataset },
+);
+
 xtermMount.clientWidth = 920;
 xtermMount.clientHeight = 420;
 resizeObservers[0]?.trigger();
@@ -363,6 +405,7 @@ activeEventSource.emit("terminal", {
   data: `\u001b]777;elastos-home-intent=${JSON.stringify({
     schema: "elastos.home.terminal-host-intent/v1",
     action: "open-target",
+    action_id: "open-gui:browser",
     target: "browser",
   })}\u0007`,
 });
@@ -374,6 +417,15 @@ await waitFor(
   )),
   "home-cli terminal host intent did not request a Home-owned app open",
   () => parentMessages,
+);
+assert(
+  requests.some((request) => (
+    request.url === "/api/apps/home-cli/terminal/sessions/term-smoke/intent" &&
+      request.body?.schema === "elastos.home.terminal-host-intent/v1" &&
+      request.body?.action_id === "open-gui:browser"
+  )),
+  "home-cli did not ask Runtime to authorize the terminal host intent",
+  requests,
 );
 assert(
   !activeXterm.writes.some((write) => write.includes("elastos.home.terminal-host-intent")),
@@ -432,27 +484,93 @@ restartedEventSource.emit("terminal", {
   exit_code: 0,
 });
 await waitFor(
-  () => parentMessages.some(({ message }) => message?.type === "home:close-self"),
-  "home-cli terminal exit did not request Home GUI recovery",
-  () => parentMessages,
+  () => eventSources.length === 3 && xtermInstances.length === 3,
+  "home-cli terminal exit did not reattach Home CLI",
+  () => ({ eventSources, xtermInstances, output: output.textContent, parentMessages }),
 );
 assert(restartedEventSource.closed === true, "home-cli did not close the restarted terminal event stream after lifecycle exit", restartedEventSource);
 assert(restartedXterm.disposed === true, "home-cli did not dispose restarted xterm after terminal lifecycle exit", restartedXterm);
 assert(
-  body.dataset.runtimeTerminal === "idle" &&
-    terminalPanel.dataset.runtimeTerminal === "idle",
-  "home-cli did not leave attached Runtime terminal mode after lifecycle exit",
+  body.dataset.runtimeTerminal === "attached" &&
+    terminalPanel.dataset.runtimeTerminal === "attached",
+  "home-cli did not stay attached after terminal lifecycle reattach",
   { body: body.dataset, panel: terminalPanel.dataset },
 );
-assert(output.textContent.includes("Returning to Home GUI"), "home-cli did not render a concise recovery fallback", output.textContent);
 assert(
-  parentMessages.some(({ message, origin }) => (
-    origin === "http://localhost:61180" &&
+  !parentMessages.some(({ message }) => message?.type === "home:close-self"),
+  "home-cli terminal lifecycle exit switched back to Home GUI",
+  parentMessages,
+);
+
+const finalEventSource = eventSources[2];
+finalEventSource.emit("terminal", {
+  schema: "elastos.home-cli.terminal-event/v1",
+  session_id: "term-smoke",
+  stream: "stdout",
+  data: `\u001b]777;elastos-home-intent=${JSON.stringify({
+    schema: "elastos.home.terminal-host-intent/v1",
+    action: "active-shell",
+    action_id: "shell-switch:home-gui",
+    target: "home-gui",
+  })}\u0007`,
+});
+await waitFor(
+  () => parentMessages.some(({ message }) => (
     message?.type === "home:close-self" &&
-    message?.activeShell === "home-gui" &&
-    message?.homeToken === "cli-token"
+      message?.activeShell === "home-gui" &&
+      message?.homeToken === "cli-token"
   )),
-  "home-cli close-self did not carry the settled Home shell state",
+  "home-cli terminal shell-switch host intent did not request a Home-owned shell switch",
+  () => parentMessages,
+);
+assert(
+  requests.some((request) => (
+    request.url === "/api/apps/home-cli/terminal/sessions/term-smoke/intent" &&
+      request.body?.schema === "elastos.home.terminal-host-intent/v1" &&
+      request.body?.action_id === "shell-switch:home-gui"
+  )),
+  "home-cli did not ask Runtime to authorize the shell-switch host intent",
+  requests,
+);
+
+finalEventSource.emit("terminal", {
+  schema: "elastos.home-cli.terminal-event/v1",
+  session_id: "term-smoke",
+  stream: "stdout",
+  data: `\u001b]777;elastos-home-intent=${JSON.stringify({
+    schema: "elastos.home.terminal-host-intent/v1",
+    action: "sign-out",
+    action_id: "auth-sign-out",
+    target: "home",
+  })}\u0007`,
+});
+await waitFor(
+  () => parentMessages.some(({ message }) => (
+    message?.type === "home:sign-out" && message?.homeToken === "cli-token"
+  )),
+  "home-cli terminal sign-out intent did not request Home session revocation",
+  () => parentMessages,
+);
+assert(
+  requests.some((request) => (
+    request.url === "/api/apps/home-cli/terminal/sessions/term-smoke/intent" &&
+      request.body?.action === "sign-out" &&
+      request.body?.action_id === "auth-sign-out" &&
+      request.body?.target === "home"
+  )),
+  "home-cli did not ask Runtime to authorize the sign-out intent",
+  requests,
+);
+assert(
+  requests.some((request) => request.url === "/api/apps/home-cli/terminal/sessions/term-smoke/close"),
+  "home-cli did not close its Runtime terminal before signing out",
+  requests,
+);
+assert(
+  parentMessages
+    .filter(({ message }) => ["home:open-target", "home:close-self", "home:sign-out"].includes(message?.type))
+    .every(({ origin }) => origin === "http://localhost:61180"),
+  "home-cli sent a host intent to its isolated capsule origin instead of the parent Home origin",
   parentMessages,
 );
 

@@ -2,16 +2,20 @@
   "schema": "elastos.capsule/v1",
   "name": "home-cli",
   "version": "0.1.0",
-  "description": "Runtime-owned Home CLI shell over PTY, Home facts, and signed host intents",
+  "description": "Runtime-owned Home CLI shell over PTY, Home facts, and structured Home intents",
   "author": "elastos",
   "role": "shell",
   "type": "wasm",
-  "entrypoint": "home-cli.wasm",
+  "runtime_abi": "elastos.runtime-projection/v1",
+  "bus_contract": "elastos.runtime-projection/v1",
+  "execution": "web-projection",
+  "projections": ["web", "terminal", "cli", "facts", "affordances", "gates"],
+  "entrypoint": "browser/index.html",
   "interfaces": [
     {
       "id": "elastos.shell.cli",
       "version": "0.5.0",
-      "description": "Command shell over Runtime facts and signed Home host intents",
+      "description": "Command shell over Runtime facts and structured Home intents",
       "methods": [
         {
           "id": "facts.search",
@@ -24,7 +28,7 @@
         },
         {
           "id": "capsule.open",
-          "description": "Ask Home to open a visible capsule through a signed host intent",
+          "description": "Ask Home to open a visible capsule through a structured Home intent",
           "risk": "launch",
           "approval": "runtime_policy",
           "audit": "event",
