@@ -1217,12 +1217,9 @@ img {
   display: grid;
   place-items: center;
   padding: calc(56px + env(safe-area-inset-top, 0px)) 18px calc(88px + env(safe-area-inset-bottom, 0px));
-  /* Launchpad surface: the container is the single blurred layer while open
-     (transient — not steady-state); the sheet itself stays transparent so no
-     blurs nest. */
-  background: var(--overlay-dim);
-  backdrop-filter: blur(24px);
-  -webkit-backdrop-filter: blur(24px);
+  /* Apps-panel surface (macOS style): the overlay only catches clicks; the
+     modal card below carries the one blurred material — no nested blurs. */
+  background: transparent;
 }
 
 .launcher[hidden] {
@@ -1440,22 +1437,28 @@ body.dragging-target {
 
 .launcher-popover {
   position: relative;
-  width: min(920px, 100%);
-  max-height: 100%;
-  padding: 8px 20px 24px;
+  width: min(600px, 100%);
+  max-height: min(66dvh, 620px);
+  padding: 14px 16px 18px;
   overflow-y: auto;
   color: var(--text);
-  animation: launcher-enter 180ms cubic-bezier(0.2, 0, 0, 1) both;
+  border-radius: 20px;
+  background: var(--menu-fill);
+  border: 0.5px solid var(--line);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  animation: launcher-enter 160ms cubic-bezier(0.2, 0, 0, 1) both;
 }
 
 @keyframes launcher-enter {
   0% {
     opacity: 0;
-    transform: scale(1.04);
+    transform: scale(0.97) translateY(6px);
   }
   100% {
     opacity: 1;
-    transform: scale(1);
+    transform: scale(1) translateY(0);
   }
 }
 
@@ -1467,8 +1470,8 @@ body.dragging-target {
 
 .launcher-close {
   position: absolute;
-  top: 12px;
-  right: 12px;
+  top: 18px;
+  right: 14px;
   z-index: 2;
   width: 28px;
   height: 28px;
@@ -1496,8 +1499,8 @@ body.dragging-target {
 
 .launcher-search-wrap {
   position: relative;
-  width: min(420px, 100%);
-  margin: 16px auto 26px;
+  width: calc(100% - 44px);
+  margin: 0 0 14px;
 }
 
 .launcher-search-wrap::before {
@@ -1515,17 +1518,17 @@ body.dragging-target {
 
 .launcher-search-field {
   width: 100%;
-  height: 42px;
-  padding: 0 14px 0 38px;
+  height: 36px;
+  padding: 0 14px 0 36px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 9px;
   background: var(--panel-soft);
   color: var(--text);
   outline: none;
 }
 
 .launcher-search-field::placeholder {
-  color: rgba(245, 247, 250, 0.45);
+  color: var(--soft);
 }
 
 .launcher-search-field:focus {
@@ -1552,8 +1555,8 @@ body.dragging-target {
 }
 
 .launcher-group-heading {
-  margin: 0 4px 12px;
-  color: rgba(245, 247, 250, 0.62);
+  margin: 0 4px 8px;
+  color: var(--soft);
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.08em;
@@ -1562,8 +1565,8 @@ body.dragging-target {
 
 .launcher-group-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
-  gap: 18px 14px;
+  grid-template-columns: repeat(auto-fill, minmax(82px, 1fr));
+  gap: 10px 6px;
 }
 
 .launcher-card {
@@ -1599,8 +1602,8 @@ body.dragging-target {
 }
 
 .launcher-item-icon {
-  width: 62px;
-  height: 62px;
+  width: 48px;
+  height: 48px;
 }
 
 .launcher-card-title {
@@ -1616,7 +1619,7 @@ body.dragging-target {
 
 .launcher-empty {
   margin: 18px 4px 0;
-  color: rgba(245, 247, 250, 0.58);
+  color: var(--soft);
   font-size: 13px;
 }
 
