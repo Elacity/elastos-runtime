@@ -983,7 +983,9 @@ img {
   position: relative;
   width: 40px;
   height: 40px;
-  padding: 5px;
+  /* Asymmetric: the tile sits 2px above slot center so the running dot gets
+     a real shelf below it — macOS seats dock icons the same way. */
+  padding: 3px 5px 7px;
   display: grid;
   place-items: center;
   border-radius: 10px;
@@ -1122,11 +1124,15 @@ img {
 
 /* macOS-style running dot: only apps with open windows get one; pinned
    favorites stay clean until launched. It rides the magnification spread
-   horizontally (JS sets --dock-shift) but never lifts or scales. */
+   horizontally (JS sets --dock-shift) but never lifts or scales.
+   Geometry: pill 50px / item slot 40px (centered, 5px margins) / tile 30px
+   with 7px bottom padding. Dot spans 0-4px of the item, so: tile, 3px air,
+   dot, 5px air, pill edge — and it never leaves the item's box (no clipping
+   under the mobile scroll container). */
 .active-taskbar-indicator {
   position: absolute;
   left: 50%;
-  bottom: 4px;
+  bottom: 0;
   width: 4px;
   height: 4px;
   border-radius: 50%;
