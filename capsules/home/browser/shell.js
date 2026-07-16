@@ -8,6 +8,7 @@ import {
   launcherSearch,
   launcherToggleButton,
   closeLauncherButton,
+  launcherViewToggle,
   toolbarHomeButton,
   toolbarInboxButton,
   toolbarFullscreenButton,
@@ -248,6 +249,37 @@ launcherToggleButton.addEventListener("click", () => {
 
 closeLauncherButton.addEventListener("click", () => {
   hideLauncher();
+});
+
+/* Grid/list view for the launcher (macOS Apps panel view control). The
+   preference is a pure browser concern, so localStorage — same store the
+   theme runtime uses. */
+const LAUNCHER_VIEW_KEY = "elastos.ui.launcherView";
+
+function applyLauncherView(view) {
+  const list = view === "list";
+  launcher.dataset.view = list ? "list" : "grid";
+  launcherViewToggle.setAttribute("aria-pressed", list ? "true" : "false");
+  launcherViewToggle.setAttribute(
+    "aria-label",
+    list ? "Switch to grid view" : "Switch to list view",
+  );
+}
+
+try {
+  applyLauncherView(localStorage.getItem(LAUNCHER_VIEW_KEY));
+} catch (_error) {
+  applyLauncherView("grid");
+}
+
+launcherViewToggle.addEventListener("click", () => {
+  const next = launcher.dataset.view === "list" ? "grid" : "list";
+  applyLauncherView(next);
+  try {
+    localStorage.setItem(LAUNCHER_VIEW_KEY, next);
+  } catch (_error) {
+    // Preference still applies for this session.
+  }
 });
 
 launcherSearch.addEventListener("input", () => {

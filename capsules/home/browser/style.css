@@ -1468,11 +1468,24 @@ body.dragging-target {
   }
 }
 
-.launcher-close {
-  position: absolute;
-  top: 18px;
-  right: 14px;
+/* Header: borderless inline search (macOS Apps panel) with the view toggle
+   and close on the far right, separated from the grid by a hairline. */
+.launcher-header {
+  position: sticky;
+  top: 0;
   z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: -14px -16px 12px;
+  padding: 10px 12px 8px 16px;
+  background: var(--menu-fill);
+  border-bottom: 0.5px solid var(--panel-soft);
+  border-radius: 20px 20px 0 0;
+}
+
+.launcher-header-btn {
+  flex: 0 0 auto;
   width: 28px;
   height: 28px;
   display: grid;
@@ -1480,6 +1493,39 @@ body.dragging-target {
   border-radius: 6px;
   cursor: pointer;
   opacity: 0.78;
+}
+
+.launcher-header-btn:hover,
+.launcher-header-btn:focus-visible {
+  background: var(--lift);
+  opacity: 1;
+}
+
+/* Grid/list glyph, drawn in CSS so it themes with --text. Shows the view
+   you'd switch TO: list lines while in grid, grid squares while in list. */
+#launcher-view-toggle::before {
+  content: "";
+  width: 14px;
+  height: 12px;
+  display: block;
+  background:
+    linear-gradient(var(--text) 0 0) left 0 top 1px / 100% 2px no-repeat,
+    linear-gradient(var(--text) 0 0) left 0 center / 100% 2px no-repeat,
+    linear-gradient(var(--text) 0 0) left 0 bottom 1px / 100% 2px no-repeat;
+  opacity: 0.85;
+}
+
+.launcher[data-view="list"] #launcher-view-toggle::before {
+  height: 14px;
+  background:
+    linear-gradient(var(--text) 0 0) left top / 6px 6px no-repeat,
+    linear-gradient(var(--text) 0 0) right top / 6px 6px no-repeat,
+    linear-gradient(var(--text) 0 0) left bottom / 6px 6px no-repeat,
+    linear-gradient(var(--text) 0 0) right bottom / 6px 6px no-repeat;
+}
+
+.launcher-close {
+  z-index: 2;
 }
 
 .launcher-close img {
@@ -1499,15 +1545,16 @@ body.dragging-target {
 
 .launcher-search-wrap {
   position: relative;
-  width: calc(100% - 44px);
-  margin: 0 0 14px;
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
 }
 
 .launcher-search-wrap::before {
   content: "";
   position: absolute;
   top: 50%;
-  left: 12px;
+  left: 8px;
   width: 16px;
   height: 16px;
   transform: translateY(-50%);
@@ -1518,12 +1565,13 @@ body.dragging-target {
 
 .launcher-search-field {
   width: 100%;
-  height: 36px;
-  padding: 0 14px 0 36px;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  background: var(--panel-soft);
+  height: 32px;
+  padding: 0 12px 0 30px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
   color: var(--text);
+  font-size: 15px;
   outline: none;
 }
 
@@ -1531,10 +1579,9 @@ body.dragging-target {
   color: var(--soft);
 }
 
-.launcher-search-field:focus {
-  border-color: var(--brand-focus);
-  box-shadow: 0 0 0 1px var(--brand-ring);
-}
+/* No focus ring: the field is auto-focused whenever the panel opens (and
+   Chromium keeps :focus-visible on text inputs), so a ring would be a
+   permanent box — macOS shows only the caret here. */
 
 .launcher-heading {
   position: absolute;
@@ -1605,6 +1652,33 @@ body.dragging-target {
   font-size: 12px;
   text-align: center;
   font-weight: 500;
+}
+
+/* List view: one column of icon + name rows, macOS style. */
+.launcher[data-view="list"] .launcher-group-grid {
+  grid-template-columns: 1fr;
+  gap: 1px;
+}
+
+.launcher[data-view="list"] .launcher-card-body {
+  grid-template-rows: none;
+  grid-template-columns: 30px 1fr;
+  align-content: center;
+  align-items: center;
+  justify-items: start;
+  padding: 5px 10px;
+  gap: 12px;
+  border-radius: 8px;
+}
+
+.launcher[data-view="list"] .launcher-item-icon {
+  width: 30px;
+  height: 30px;
+}
+
+.launcher[data-view="list"] .launcher-card-title {
+  font-size: 13px;
+  text-align: left;
 }
 
 .launcher-empty {

@@ -9,6 +9,7 @@ export const launcherEmptyState = document.querySelector("#launcher-empty-state"
 export const launcherSearch = document.querySelector("#launcher-search");
 export const launcherToggleButton = document.querySelector("#launcher-toggle");
 export const closeLauncherButton = document.querySelector("#close-launcher");
+export const launcherViewToggle = document.querySelector("#launcher-view-toggle");
 export const toolbarHomeButton = document.querySelector("#toolbar-home");
 export const toolbarActiveTitleNode = document.querySelector("#toolbar-active-title");
 export const toolbarInboxButton = document.querySelector("#toolbar-inbox");
