@@ -558,6 +558,26 @@ function attachTargetIconInteractions(node, targetId, source) {
         openTarget(targetId);
         return;
       }
+      // Slow click: a second click on an already-selected icon's label starts
+      // rename, unless a double-click (open) lands first. Selection state is
+      // sampled at pointerdown, before beginTargetDrag reselects the icon.
+      const wasSelected = node.dataset.wasSelectedOnPointerdown === "true";
+      delete node.dataset.wasSelectedOnPointerdown;
+      if (
+        wasSelected &&
+        shellState.selectedDesktopTargetId === targetId &&
+        !node.classList.contains("editing") &&
+        event.target.closest(".desktop-shortcut-title")
+      ) {
+        clearSlowClickRename();
+        slowClickRenameTimer = window.setTimeout(() => {
+          slowClickRenameTimer = null;
+          if (shellState.selectedDesktopTargetId === targetId) {
+            startDesktopRename(targetId);
+          }
+        }, SLOW_CLICK_RENAME_MS);
+        return;
+      }
       selectDesktopTarget(targetId);
       return;
     }
@@ -579,6 +599,7 @@ function attachTargetIconInteractions(node, targetId, source) {
 
   if (source === "desktop") {
     node.addEventListener("dblclick", () => {
+      clearSlowClickRename();
       selectDesktopTarget(targetId);
       openTarget(targetId);
     });
@@ -788,6 +809,16 @@ function clearDragSelection() {
   window.getSelection?.()?.removeAllRanges();
 }
 
+const SLOW_CLICK_RENAME_MS = 620;
+let slowClickRenameTimer = null;
+
+function clearSlowClickRename() {
+  if (slowClickRenameTimer !== null) {
+    window.clearTimeout(slowClickRenameTimer);
+    slowClickRenameTimer = null;
+  }
+}
+
 function beginTargetDrag(event, targetId, source, sourceElement) {
   if (event.button !== 0 || !shellState.currentSummary) {
     return;
@@ -795,11 +826,17 @@ function beginTargetDrag(event, targetId, source, sourceElement) {
   if (sourceElement.classList.contains("editing")) {
     return;
   }
+  clearSlowClickRename();
   if (!isTouchLikePointer(event)) {
     clearDragSelection();
   }
   hideDesktopContextMenu();
   if ((source === "desktop" || source === "desktop-object") && !isTouchLikePointer(event)) {
+    sourceElement.dataset.wasSelectedOnPointerdown =
+      shellState.selectedDesktopTargetId === targetId &&
+      shellState.marqueeSelection.size === 0
+        ? "true"
+        : "false";
     selectDesktopTarget(targetId);
   }
   const rect = sourceElement.getBoundingClientRect();
