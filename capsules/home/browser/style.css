@@ -672,6 +672,15 @@ img {
   display: none;
 }
 
+.desktop-marquee {
+  position: absolute;
+  z-index: 40;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.1);
+  pointer-events: none;
+}
+
 .desktop-shortcut {
   position: absolute;
   width: 92px;

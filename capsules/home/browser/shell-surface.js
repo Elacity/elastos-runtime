@@ -36,6 +36,7 @@ import {
   unpinTargetFromTaskbar,
   isTargetPinnedToTaskbar,
   clampDesktopPosition,
+  snapDesktopPosition,
   saveShellLayoutState,
   mountGlyph,
   clamp,
@@ -133,7 +134,9 @@ function syncDesktopIconsVisibility() {
 }
 
 function selectDesktopTarget(entryId) {
+  shellState.marqueeSelection.clear();
   if (shellState.selectedDesktopTargetId === entryId) {
+    updateDesktopSelectionState();
     focusDesktopSelectionSurface();
     return;
   }
@@ -143,10 +146,11 @@ function selectDesktopTarget(entryId) {
 }
 
 export function clearDesktopSelection() {
-  if (!shellState.selectedDesktopTargetId) {
+  if (!shellState.selectedDesktopTargetId && shellState.marqueeSelection.size === 0) {
     return;
   }
   shellState.selectedDesktopTargetId = null;
+  shellState.marqueeSelection.clear();
   updateDesktopSelectionState();
 }
 
@@ -168,10 +172,12 @@ function updateDesktopSelectionState() {
   }
   for (const shortcut of desktopShortcuts.querySelectorAll(".desktop-shortcut")) {
     const entryId = shortcut.dataset.desktopEntryId || shortcut.dataset.target || "";
-    const selected = entryId === shellState.selectedDesktopTargetId;
+    const selected =
+      entryId === shellState.selectedDesktopTargetId ||
+      shellState.marqueeSelection.has(entryId);
     shortcut.classList.toggle("selected", selected);
     shortcut.setAttribute("aria-selected", selected ? "true" : "false");
-    if (selected) {
+    if (entryId === shellState.selectedDesktopTargetId) {
       activeDescendant = shortcut.id;
     }
   }
@@ -1045,7 +1051,7 @@ function desktopDropTarget(clientX, clientY) {
   }
   return {
     kind: "desktop",
-    position: clampDesktopPosition({
+    position: snapDesktopPosition(shellState.dragState.targetId, {
       x: clientX - rect.left - shellState.dragState.offsetX,
       y: clientY - rect.top - shellState.dragState.offsetY,
     }),
@@ -1098,6 +1104,97 @@ export function finishTargetDrag(event) {
     saveShellLayoutState();
     rerenderShellLayout();
   }
+}
+
+/* Rubber-band (marquee) selection on empty desktop. Pointer-driven visual
+   selection; the anchor icon (last one swept) becomes the primary selection so
+   Enter/context-menu keep working unchanged. */
+
+let marqueeState = null;
+
+export function beginDesktopMarquee(event) {
+  if (event.button !== 0 || isTouchLikePointer(event)) {
+    return false;
+  }
+  const rect = desktop.getBoundingClientRect();
+  marqueeState = {
+    pointerId: event.pointerId,
+    originX: event.clientX - rect.left,
+    originY: event.clientY - rect.top,
+    node: null,
+    swept: false,
+  };
+  return true;
+}
+
+export function updateDesktopMarquee(event) {
+  if (!marqueeState || event.pointerId !== marqueeState.pointerId) {
+    return;
+  }
+  const rect = desktop.getBoundingClientRect();
+  const currentX = clamp(event.clientX - rect.left, 0, rect.width);
+  const currentY = clamp(event.clientY - rect.top, 0, rect.height);
+  const left = Math.min(marqueeState.originX, currentX);
+  const top = Math.min(marqueeState.originY, currentY);
+  const width = Math.abs(currentX - marqueeState.originX);
+  const height = Math.abs(currentY - marqueeState.originY);
+  if (!marqueeState.node) {
+    if (Math.hypot(width, height) < ICON_DRAG_THRESHOLD) {
+      return;
+    }
+    const node = document.createElement("div");
+    node.className = "desktop-marquee";
+    node.setAttribute("aria-hidden", "true");
+    desktop.appendChild(node);
+    marqueeState.node = node;
+    clearDragSelection();
+  }
+  const node = marqueeState.node;
+  node.style.left = `${left}px`;
+  node.style.top = `${top}px`;
+  node.style.width = `${width}px`;
+  node.style.height = `${height}px`;
+
+  const band = {
+    left: rect.left + left,
+    top: rect.top + top,
+    right: rect.left + left + width,
+    bottom: rect.top + top + height,
+  };
+  marqueeState.swept = true;
+  shellState.marqueeSelection.clear();
+  let primary = null;
+  for (const shortcut of desktopShortcuts.querySelectorAll(".desktop-shortcut")) {
+    const iconRect = shortcut.getBoundingClientRect();
+    const hit =
+      iconRect.left < band.right &&
+      iconRect.right > band.left &&
+      iconRect.top < band.bottom &&
+      iconRect.bottom > band.top;
+    if (hit) {
+      const entryId = shortcut.dataset.desktopEntryId || shortcut.dataset.target || "";
+      shellState.marqueeSelection.add(entryId);
+      primary = entryId;
+    }
+  }
+  shellState.selectedDesktopTargetId = primary;
+  updateDesktopSelectionState();
+}
+
+export function finishDesktopMarquee(event) {
+  if (!marqueeState || event.pointerId !== marqueeState.pointerId) {
+    return;
+  }
+  const state = marqueeState;
+  marqueeState = null;
+  state.node?.remove();
+  if (state.swept && shellState.selectedDesktopTargetId) {
+    focusDesktopSelectionSurface();
+  }
+}
+
+export function desktopMarqueeActive() {
+  return Boolean(marqueeState?.node);
 }
 
 export function toggleLauncher() {

@@ -47,6 +47,9 @@ import {
   openDesktopContextMenu,
   hideDesktopContextMenu,
   handleContextAction,
+  beginDesktopMarquee,
+  updateDesktopMarquee,
+  finishDesktopMarquee,
 } from "./shell-surface.js?v=home-20260701c";
 import {
   configureWindowHooks,
@@ -291,14 +294,17 @@ desktopShortcuts.addEventListener("keydown", (event) => {
 document.addEventListener("pointermove", (event) => {
   trackPointerMove(event);
   continueTargetDrag(event);
+  updateDesktopMarquee(event);
 });
 
 document.addEventListener("pointerup", (event) => {
   finishTargetDrag(event);
+  finishDesktopMarquee(event);
 });
 
 document.addEventListener("pointercancel", (event) => {
   finishTargetDrag(event);
+  finishDesktopMarquee(event);
 });
 
 document.addEventListener("pointerdown", (event) => {
@@ -375,6 +381,7 @@ desktop.addEventListener("pointerdown", (event) => {
     return;
   }
   clearDesktopSelection();
+  beginDesktopMarquee(event);
 });
 
 desktopContextMenu.addEventListener("click", (event) => {

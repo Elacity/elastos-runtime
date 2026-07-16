@@ -98,6 +98,7 @@ export const shellState = {
   contextMenuTarget: { kind: "desktop" },
   contextMenuIgnoreOutsideUntil: 0,
   selectedDesktopTargetId: null,
+  marqueeSelection: new Set(),
   recentTargetIds: [],
   selectedLauncherTargetId: null,
   launcherIgnoreOutsideUntil: 0,
@@ -587,6 +588,22 @@ export function clampDesktopPosition(position) {
     x: clamp(position.x, DESKTOP_ICON_MARGIN, maxX),
     y: clamp(position.y, DESKTOP_ICON_MARGIN, maxY),
   };
+}
+
+// Snap a dropped icon to the nearest grid cell; fall back to the free-form
+// position when that cell is already occupied by another icon.
+export function snapDesktopPosition(entryId, position) {
+  const clamped = clampDesktopPosition(position);
+  const snapped = clampDesktopPosition({
+    x: DESKTOP_ICON_MARGIN +
+      Math.round((clamped.x - DESKTOP_ICON_MARGIN) / DESKTOP_ICON_GAP_X) * DESKTOP_ICON_GAP_X,
+    y: DESKTOP_ICON_MARGIN +
+      Math.round((clamped.y - DESKTOP_ICON_MARGIN) / DESKTOP_ICON_GAP_Y) * DESKTOP_ICON_GAP_Y,
+  });
+  if (desktopPositionOverlapsAny(snapped, occupiedDesktopPositionsExcept(entryId))) {
+    return clamped;
+  }
+  return snapped;
 }
 
 export function desktopPositionForTarget(targetId, defaultIndex) {
