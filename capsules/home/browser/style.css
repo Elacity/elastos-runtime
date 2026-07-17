@@ -1184,6 +1184,178 @@ img {
   -webkit-user-select: none;
 }
 
+/* Quick Look: frameless centered preview over the desktop. No dim overlay —
+   same restraint as Spotlight; the panel's shadow does the separation. */
+.quick-look {
+  position: fixed;
+  inset: var(--stage-top) 0 var(--stage-bottom) 0;
+  z-index: 100118;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.quick-look[hidden] {
+  display: none;
+}
+
+.quick-look-panel {
+  display: flex;
+  flex-direction: column;
+  width: min(640px, 100%);
+  max-height: min(72dvh, 640px);
+  overflow: hidden;
+  border-radius: 16px;
+  background: var(--menu-fill);
+  border: 1px solid var(--line);
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.45), 0 2px 10px rgba(0, 0, 0, 0.25);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  color: var(--text);
+  animation: quick-look-enter 160ms cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+@keyframes quick-look-enter {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .quick-look-panel {
+    animation: none;
+  }
+}
+
+.quick-look-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 0.5px solid var(--panel-soft);
+}
+
+.quick-look-head-copy {
+  min-width: 0;
+}
+
+.quick-look-title {
+  margin: 0;
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.quick-look-meta {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.quick-look-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.quick-look-open {
+  min-height: 28px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--el-accent);
+  color: var(--el-accent-ink);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.quick-look-close {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.quick-look-close:hover {
+  background: var(--lift);
+}
+
+.quick-look-close img {
+  width: 10px;
+  height: 10px;
+  opacity: 0.7;
+  filter: invert(1);
+}
+
+:root[data-el-theme="light"] .quick-look-close img {
+  filter: none;
+}
+
+.quick-look-stage {
+  flex: 1 1 auto;
+  min-height: 220px;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  overflow: auto;
+}
+
+.quick-look-glyph {
+  width: 96px;
+  height: 96px;
+  border-radius: 22px;
+}
+
+/* Exposé-lite: windows become selectable cards; pointer events on the stage
+   catch dismiss-outside. Transforms are applied inline (transform-only). */
+body.expose-active .desktop-shortcuts {
+  pointer-events: none;
+  opacity: 0.35;
+}
+
+body.expose-active .window.expose-card {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+body.expose-active .window.expose-card .window-frame {
+  pointer-events: none;
+}
+
+/* Red count badge on the drag ghost when moving a multi-selection (macOS). */
+.desktop-shortcut-ghost-count {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  border-radius: 10px;
+  background: #ec4d3d;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 20px;
+  text-align: center;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}
+
 .desktop-shortcut-icon {
   width: 56px;
   height: 56px;
@@ -1335,6 +1507,35 @@ img {
     0 0 0 0.5px rgba(0, 0, 0, 0.2),
     0 4px 16px rgba(0, 0, 0, 0.2);
   backdrop-filter: blur(10px);
+  transition: transform 220ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* Dock auto-hide: slides under the bottom edge; a thin reveal strip stays
+   hot so the pointer can summon it (macOS). Stage geometry is unchanged —
+   windows keep their room even while the dock is tucked away. */
+body.dock-autohide .taskbar {
+  transform: translateY(calc(100% + var(--taskbar-offset) + 8px));
+}
+
+body.dock-autohide.dock-revealed .taskbar,
+body.dock-autohide .taskbar:focus-within {
+  transform: translateY(0);
+}
+
+body.dock-autohide::after {
+  content: "";
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 6px;
+  z-index: 100099;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .taskbar {
+    transition: none;
+  }
 }
 
 .taskbar-inner {

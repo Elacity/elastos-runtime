@@ -62,6 +62,7 @@ import {
   closeAllTargetWindows,
   focusWindow,
 } from "./shell-windows.js?v=home-20260701c";
+import { playUiSound } from "./shell-sounds.js?v=home-20260701c";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -152,6 +153,61 @@ export function clearDesktopSelection() {
   shellState.selectedDesktopTargetId = null;
   shellState.marqueeSelection.clear();
   updateDesktopSelectionState();
+}
+
+/* Multi-select (macOS): the full selection is the marquee set plus the
+   primary. Cmd/Ctrl+click toggles membership; the last icon added becomes the
+   primary so Enter / arrow keys / context menu keep an anchor. */
+function selectedDesktopEntryIds() {
+  const ids = new Set(shellState.marqueeSelection);
+  if (shellState.selectedDesktopTargetId) {
+    ids.add(shellState.selectedDesktopTargetId);
+  }
+  return ids;
+}
+
+function entryInDesktopSelection(entryId) {
+  return selectedDesktopEntryIds().has(entryId);
+}
+
+function toggleDesktopSelection(entryId) {
+  const ids = selectedDesktopEntryIds();
+  if (ids.has(entryId)) {
+    ids.delete(entryId);
+  } else {
+    ids.add(entryId);
+  }
+  const list = [...ids];
+  shellState.selectedDesktopTargetId = ids.has(entryId)
+    ? entryId
+    : list[list.length - 1] || null;
+  shellState.marqueeSelection.clear();
+  for (const id of list) {
+    if (id !== shellState.selectedDesktopTargetId) {
+      shellState.marqueeSelection.add(id);
+    }
+  }
+  updateDesktopSelectionState();
+  focusDesktopSelectionSurface();
+}
+
+export function selectAllDesktopIcons() {
+  shellState.marqueeSelection.clear();
+  let last = null;
+  for (const shortcut of desktopShortcuts.querySelectorAll(".desktop-shortcut")) {
+    const entryId = shortcut.dataset.desktopEntryId || shortcut.dataset.target || "";
+    if (!entryId) {
+      continue;
+    }
+    shellState.marqueeSelection.add(entryId);
+    last = entryId;
+  }
+  if (last) {
+    shellState.marqueeSelection.delete(last);
+    shellState.selectedDesktopTargetId = last;
+  }
+  updateDesktopSelectionState();
+  focusDesktopSelectionSurface();
 }
 
 function focusDesktopSelectionSurface() {
@@ -584,6 +640,10 @@ function attachTargetIconInteractions(node, targetId, source) {
       return;
     }
     if (source === "desktop") {
+      if (event.metaKey || event.ctrlKey) {
+        toggleDesktopSelection(targetId);
+        return;
+      }
       if (shouldOpenDesktopShortcutFromClick(node, event)) {
         openTarget(targetId);
         return;
@@ -673,6 +733,15 @@ function attachTargetIconInteractions(node, targetId, source) {
   node.addEventListener("contextmenu", (event) => {
     event.preventDefault();
     event.stopPropagation();
+    if (
+      source === "desktop" &&
+      entryInDesktopSelection(targetId) &&
+      selectedDesktopEntryIds().size > 1
+    ) {
+      const anchor = contextMenuAnchorPoint(event, node);
+      openDesktopContextMenu(anchor.x, anchor.y, { kind: "desktop-group" });
+      return;
+    }
     if (source === "desktop") {
       selectDesktopTarget(targetId);
     }
@@ -691,13 +760,20 @@ function attachTargetIconInteractions(node, targetId, source) {
 
 function attachDesktopObjectInteractions(node, entryId) {
   node.addEventListener("click", (event) => {
+    if (event.metaKey || event.ctrlKey) {
+      toggleDesktopSelection(entryId);
+      return;
+    }
     if (shouldOpenDesktopShortcutFromClick(node, event)) {
       openDesktopObject(entryId);
       return;
     }
     selectDesktopTarget(entryId);
   });
-  node.addEventListener("dblclick", () => {
+  node.addEventListener("dblclick", (event) => {
+    if (event.metaKey || event.ctrlKey) {
+      return;
+    }
     selectDesktopTarget(entryId);
     openDesktopObject(entryId);
   });
@@ -720,13 +796,22 @@ function attachDesktopObjectInteractions(node, entryId) {
     node.dataset.lastPointerType = event.pointerType || "";
     maybeStartLongPressGesture(event, entryId, "desktop-object", node);
     beginTargetDrag(event, entryId, "desktop-object", node);
-    if (!isTouchLikePointer(event)) {
+    if (
+      !isTouchLikePointer(event) &&
+      !(event.metaKey || event.ctrlKey) &&
+      !(entryInDesktopSelection(entryId) && selectedDesktopEntryIds().size > 1)
+    ) {
       selectDesktopTarget(entryId);
     }
   });
   node.addEventListener("contextmenu", (event) => {
     event.preventDefault();
     event.stopPropagation();
+    if (entryInDesktopSelection(entryId) && selectedDesktopEntryIds().size > 1) {
+      const anchor = contextMenuAnchorPoint(event, node);
+      openDesktopContextMenu(anchor.x, anchor.y, { kind: "desktop-group" });
+      return;
+    }
     selectDesktopTarget(entryId);
     const anchor = contextMenuAnchorPoint(event, node);
     openDesktopContextMenu(anchor.x, anchor.y, {
@@ -866,13 +951,28 @@ function beginTargetDrag(event, targetId, source, sourceElement) {
     clearDragSelection();
   }
   hideDesktopContextMenu();
-  if ((source === "desktop" || source === "desktop-object") && !isTouchLikePointer(event)) {
-    sourceElement.dataset.wasSelectedOnPointerdown =
-      shellState.selectedDesktopTargetId === targetId &&
-      shellState.marqueeSelection.size === 0
-        ? "true"
-        : "false";
-    selectDesktopTarget(targetId);
+  const onDesktop = source === "desktop" || source === "desktop-object";
+  // Cmd/Ctrl+pointerdown is a selection toggle (handled on click), never a
+  // drag, and must not disturb the current multi-selection.
+  if (onDesktop && (event.metaKey || event.ctrlKey)) {
+    return;
+  }
+  let groupEntryIds = null;
+  if (onDesktop && !isTouchLikePointer(event)) {
+    // Pressing an icon that is already part of a multi-selection keeps the
+    // group (macOS): the drag moves all of them; a plain click on it later
+    // collapses selection via the click handler.
+    if (entryInDesktopSelection(targetId) && selectedDesktopEntryIds().size > 1) {
+      groupEntryIds = [...selectedDesktopEntryIds()];
+      sourceElement.dataset.wasSelectedOnPointerdown = "false";
+    } else {
+      sourceElement.dataset.wasSelectedOnPointerdown =
+        shellState.selectedDesktopTargetId === targetId &&
+        shellState.marqueeSelection.size === 0
+          ? "true"
+          : "false";
+      selectDesktopTarget(targetId);
+    }
   }
   const rect = sourceElement.getBoundingClientRect();
   shellState.dragState = {
@@ -890,6 +990,7 @@ function beginTargetDrag(event, targetId, source, sourceElement) {
     offsetY: event.clientY - rect.top,
     dropTarget: null,
     ghost: null,
+    groupEntryIds,
   };
 }
 
@@ -1037,6 +1138,14 @@ function startTargetDrag() {
   ghost.classList.add("desktop-shortcut-ghost");
   mountGlyph(ghost.querySelector(".desktop-shortcut-icon"), dragEntry.glyphId);
   ghost.querySelector(".desktop-shortcut-title").textContent = dragEntry.title;
+  const group = shellState.dragState.groupEntryIds;
+  if (group && group.length > 1) {
+    const badge = document.createElement("span");
+    badge.className = "desktop-shortcut-ghost-count";
+    badge.textContent = String(group.length);
+    badge.setAttribute("aria-hidden", "true");
+    ghost.appendChild(badge);
+  }
   document.body.appendChild(ghost);
   shellState.dragState.ghost = ghost;
 }
@@ -1161,7 +1270,11 @@ export function finishTargetDrag(event) {
   ) {
     changed = pinTargetToTaskbar(state.targetId, state.dropTarget.index) || changed;
   } else if (state.dropTarget && state.dropTarget.kind === "desktop") {
-    changed = setDesktopPosition(state.targetId, state.dropTarget.position) || changed;
+    if (state.groupEntryIds && state.groupEntryIds.length > 1) {
+      changed = moveDesktopGroup(state, state.dropTarget.position) || changed;
+    } else {
+      changed = setDesktopPosition(state.targetId, state.dropTarget.position) || changed;
+    }
     if (state.source === "taskbar") {
       changed = unpinTargetFromTaskbar(state.targetId) || changed;
     }
@@ -1176,6 +1289,36 @@ export function finishTargetDrag(event) {
     saveShellLayoutState();
     rerenderShellLayout();
   }
+}
+
+/* Group drag: every selected icon moves by the dragged icon's delta, each
+   snapping (or falling back to free-form) independently — the formation is
+   preserved, honest to what macOS does. */
+function moveDesktopGroup(state, droppedPosition) {
+  const anchorNode = state.sourceElement;
+  const anchorLeft = parseFloat(anchorNode.style.left) || 0;
+  const anchorTop = parseFloat(anchorNode.style.top) || 0;
+  const deltaX = droppedPosition.x - anchorLeft;
+  const deltaY = droppedPosition.y - anchorTop;
+  let changed = setDesktopPosition(state.targetId, droppedPosition);
+  for (const entryId of state.groupEntryIds) {
+    if (entryId === state.targetId) {
+      continue;
+    }
+    const node = [...desktopShortcuts.querySelectorAll(".desktop-shortcut")].find(
+      (candidate) =>
+        (candidate.dataset.desktopEntryId || candidate.dataset.target || "") === entryId,
+    );
+    if (!node) {
+      continue;
+    }
+    const next = snapDesktopPosition(entryId, {
+      x: (parseFloat(node.style.left) || 0) + deltaX,
+      y: (parseFloat(node.style.top) || 0) + deltaY,
+    });
+    changed = setDesktopPosition(entryId, next) || changed;
+  }
+  return changed;
 }
 
 /* Rubber-band (marquee) selection on empty desktop. Pointer-driven visual
@@ -1436,6 +1579,14 @@ function contextMenuItems(target) {
   if (target.kind === "desktop-object") {
     return desktopObjectContextMenuItems(target);
   }
+  if (target.kind === "desktop-group") {
+    const count = selectedDesktopEntryIds().size;
+    return [
+      { action: "open-desktop-group", label: `Open ${count} Items` },
+      { kind: "divider" },
+      { action: "clear-desktop-selection", label: "Deselect All" },
+    ];
+  }
   const iconsVisible = shellState.shellLayoutState.desktopIconsVisible !== false;
   const items = [
     {
@@ -1517,6 +1668,20 @@ function desktopPinMenuItem(targetId) {
 }
 
 export function handleContextAction(action) {
+  if (action === "open-desktop-group") {
+    for (const entryId of selectedDesktopEntryIds()) {
+      if (targetById(shellState.currentSummary, entryId)) {
+        openTarget(entryId);
+      } else if (desktopObjectByEntryId(shellState.currentSummary, entryId)) {
+        openDesktopObject(entryId);
+      }
+    }
+    return;
+  }
+  if (action === "clear-desktop-selection") {
+    clearDesktopSelection();
+    return;
+  }
   if (shellState.contextMenuTarget.kind === "desktop-object") {
     if (action === "open-desktop-object" || action === "open-desktop-object-new-window") {
       openDesktopObject(shellState.contextMenuTarget.entryId);
@@ -1545,6 +1710,7 @@ export function handleContextAction(action) {
         shellState.contextMenuTarget.entryId,
       );
       if (object && isTrashDesktopObject(object)) {
+        playUiSound("trash");
         libraryActionForObject(object, "empty-trash");
       }
       return;
@@ -1814,6 +1980,7 @@ function showHomeNotificationToast(entry) {
   homeNotificationBody.textContent = entry.body || "A capsule requests wallet approval.";
   homeNotificationToast.hidden = false;
   homeNotificationToast.setAttribute("aria-hidden", "false");
+  playUiSound("notification");
   window.clearTimeout(homeNotificationToastTimer);
   homeNotificationToastTimer = window.setTimeout(hideHomeNotificationToast, HOME_NOTIFICATION_TOAST_MS);
 }
@@ -2118,3 +2285,49 @@ function setupDock() {
 }
 
 setupDock();
+
+/* ---- Dock auto-hide (local preference, same store as theme/sounds) ---- */
+const DOCK_AUTOHIDE_KEY = "elastos.ui.dockAutoHide";
+
+export function dockAutoHideEnabled() {
+  try {
+    return localStorage.getItem(DOCK_AUTOHIDE_KEY) === "on";
+  } catch (_error) {
+    return false;
+  }
+}
+
+export function setDockAutoHide(on) {
+  try {
+    localStorage.setItem(DOCK_AUTOHIDE_KEY, on ? "on" : "off");
+  } catch (_error) {}
+  syncDockAutoHide();
+}
+
+export function syncDockAutoHide() {
+  const on = dockAutoHideEnabled();
+  document.body.classList.toggle("dock-autohide", on);
+  if (!on) {
+    document.body.classList.remove("dock-revealed");
+  }
+}
+
+function bindDockAutoHideReveal() {
+  const revealBand = 28;
+  window.addEventListener("pointermove", (event) => {
+    if (!document.body.classList.contains("dock-autohide")) {
+      return;
+    }
+    const nearBottom = event.clientY >= window.innerHeight - revealBand;
+    const overDock = Boolean(event.target.closest?.(".taskbar"));
+    document.body.classList.toggle("dock-revealed", nearBottom || overDock);
+  });
+  window.addEventListener("storage", (event) => {
+    if (event.key === DOCK_AUTOHIDE_KEY || event.key === null) {
+      syncDockAutoHide();
+    }
+  });
+}
+
+syncDockAutoHide();
+bindDockAutoHideReveal();

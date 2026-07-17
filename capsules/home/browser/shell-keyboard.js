@@ -13,6 +13,16 @@ import {
   closeWindow,
   sortWindowEntriesByZOrder,
 } from "./shell-windows.js?v=home-20260701c";
+import {
+  closeExpose,
+  isExposeOpen,
+  toggleExpose,
+} from "./shell-expose.js?v=home-20260701c";
+import {
+  hideQuickLook,
+  isQuickLookOpen,
+  toggleQuickLook,
+} from "./shell-quicklook.js?v=home-20260701c";
 
 /* Shell keyboard layer.
  *
@@ -203,6 +213,48 @@ shortcutsOverlay?.addEventListener("keydown", (event) => {
 document.addEventListener(
   "keydown",
   (event) => {
+    if (event.key === "Escape") {
+      if (isExposeOpen()) {
+        event.preventDefault();
+        event.stopPropagation();
+        closeExpose();
+        return;
+      }
+      if (isQuickLookOpen()) {
+        event.preventDefault();
+        event.stopPropagation();
+        hideQuickLook();
+        return;
+      }
+    }
+    if (event.key === "F3" && !event.metaKey && !event.ctrlKey && !event.altKey && !typingInField(event)) {
+      if (toggleExpose()) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      return;
+    }
+    // Quick Look: bare Space with a desktop selection, when focus is still in
+    // the shell document (not an app iframe) — matches desktop-OS convention.
+    if (
+      event.code === "Space" &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      !typingInField(event) &&
+      !isExposeOpen() &&
+      launcher.hidden &&
+      shellState.selectedDesktopTargetId
+    ) {
+      const el = document.activeElement;
+      const inAppFrame =
+        el?.tagName === "IFRAME" || Boolean(el?.closest?.(".window-frame"));
+      if (!inAppFrame && toggleQuickLook()) {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+    }
     if (switcherState.open) {
       if (event.key === "Tab" || event.key === "ArrowRight" || event.key === "ArrowDown") {
         event.preventDefault();

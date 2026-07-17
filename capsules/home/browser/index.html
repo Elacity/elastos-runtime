@@ -143,7 +143,7 @@
             class="desktop-shortcuts"
             role="listbox"
             aria-label="Home items"
-            aria-multiselectable="false"
+            aria-multiselectable="true"
             tabindex="0"
           ></section>
           <div id="window-snap-preview" class="window-snap-preview" aria-hidden="true" hidden></div>
@@ -239,6 +239,32 @@
         ></div>
       </div>
 
+      <aside
+        id="quick-look"
+        class="quick-look"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Quick Look"
+        aria-hidden="true"
+        hidden
+      >
+        <div class="quick-look-panel">
+          <header class="quick-look-head">
+            <div class="quick-look-head-copy">
+              <h2 id="quick-look-title" class="quick-look-title">Preview</h2>
+              <p id="quick-look-meta" class="quick-look-meta"></p>
+            </div>
+            <div class="quick-look-actions">
+              <button id="quick-look-open" class="quick-look-open" type="button">Open</button>
+              <button id="quick-look-close" class="quick-look-close" type="button" aria-label="Close Quick Look">
+                <img src="./close.svg" alt="" draggable="false" />
+              </button>
+            </div>
+          </header>
+          <div id="quick-look-stage" class="quick-look-stage"></div>
+        </div>
+      </aside>
+
       <section
         id="shortcuts-overlay"
         class="shortcuts-overlay"
@@ -252,6 +278,8 @@
           <h1 id="shortcuts-title" class="shortcuts-title">Keyboard shortcuts</h1>
           <dl class="shortcuts-list">
             <div class="shortcuts-row"><dt>Search (Spotlight)</dt><dd><kbd>⌘</kbd><kbd>Space</kbd> or <kbd>Ctrl</kbd><kbd>Space</kbd></dd></div>
+            <div class="shortcuts-row"><dt>Quick Look</dt><dd><kbd>Space</kbd> on a desktop icon</dd></div>
+            <div class="shortcuts-row"><dt>Mission Control</dt><dd><kbd>F3</kbd></dd></div>
             <div class="shortcuts-row"><dt>Switch windows</dt><dd><kbd>Alt</kbd><kbd>Tab</kbd></dd></div>
             <div class="shortcuts-row"><dt>Cycle windows</dt><dd><kbd>⌘</kbd><kbd>`</kbd></dd></div>
             <div class="shortcuts-row"><dt>Close window</dt><dd><kbd>⌘</kbd><kbd>W</kbd></dd></div>

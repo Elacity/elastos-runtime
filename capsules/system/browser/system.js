@@ -373,6 +373,7 @@ function configureThemeSegment() {
   window.addEventListener("storage", sync);
   sync();
   configureAccentPicker();
+  configureChromeToggles();
 }
 
 /* Accent rides the same vendored runtime as theme: one localStorage key,
@@ -399,6 +400,33 @@ function configureAccentPicker() {
   }
   window.addEventListener("storage", sync);
   sync();
+}
+
+/* Dock auto-hide and UI sounds are pure browser prefs (localStorage), same
+   pattern as theme — the shell listens via storage events / boot sync. */
+function configureChromeToggles() {
+  const dock = document.querySelector("#dock-autohide");
+  const sounds = document.querySelector("#ui-sounds");
+  const read = (key) => {
+    try {
+      return localStorage.getItem(key) === "on";
+    } catch (_error) {
+      return false;
+    }
+  };
+  const write = (key, on) => {
+    try {
+      localStorage.setItem(key, on ? "on" : "off");
+    } catch (_error) {}
+  };
+  if (dock) {
+    dock.checked = read("elastos.ui.dockAutoHide");
+    dock.addEventListener("change", () => write("elastos.ui.dockAutoHide", dock.checked));
+  }
+  if (sounds) {
+    sounds.checked = read("elastos.ui.sounds");
+    sounds.addEventListener("change", () => write("elastos.ui.sounds", sounds.checked));
+  }
 }
 
 function configureGuestAccess() {

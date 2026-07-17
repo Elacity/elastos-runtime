@@ -44,6 +44,7 @@ import {
   openSelectedLauncherTarget,
   openSelectedDesktopEntry,
   clearDesktopSelection,
+  selectAllDesktopIcons,
   continueTargetDrag,
   finishTargetDrag,
   openDesktopContextMenu,
@@ -85,6 +86,12 @@ import {
   setMenuManifest,
   syncMenubar,
 } from "./shell-menubar.js?v=home-20260701c";
+import {
+  bindQuickLook,
+  toggleQuickLook,
+} from "./shell-quicklook.js?v=home-20260701c";
+import { bindExpose } from "./shell-expose.js?v=home-20260701c";
+import { playUiSound } from "./shell-sounds.js?v=home-20260701c";
 
 configureWindowHooks({
   clearIdentitySurface,
@@ -98,6 +105,8 @@ configureWindowHooks({
 });
 
 bindMenubar({ closeWindow, openTarget, supportsNewWindow: supportsMenuNewWindow });
+bindQuickLook();
+bindExpose();
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_AFTER_INTERACTION_MS = 700;
@@ -333,10 +342,22 @@ desktopShortcuts.addEventListener("keydown", (event) => {
     clearDesktopSelection();
     return;
   }
-  if ((event.key === "Enter" || event.key === " ") && shellState.selectedDesktopTargetId) {
+  // Space = Quick Look (macOS); Enter opens. Bare Space must not also open.
+  if (event.code === "Space" && !event.metaKey && !event.ctrlKey && !event.altKey) {
+    event.preventDefault();
+    event.stopPropagation();
+    toggleQuickLook();
+    return;
+  }
+  if (event.key === "Enter" && shellState.selectedDesktopTargetId) {
     event.preventDefault();
     event.stopPropagation();
     openSelectedDesktopEntry();
+    return;
+  }
+  if ((event.key === "a" || event.key === "A") && (event.metaKey || event.ctrlKey)) {
+    event.preventDefault();
+    selectAllDesktopIcons();
     return;
   }
   if (event.key.startsWith("Arrow") && !event.metaKey && !event.ctrlKey && !event.altKey) {
