@@ -173,7 +173,7 @@ function shortcutsOverlayOpen() {
 
 let shortcutsInvoker = null;
 
-function toggleShortcutsOverlay() {
+export function toggleShortcutsOverlay() {
   if (!shortcutsOverlay) {
     return;
   }

@@ -31,15 +31,23 @@
       <div class="toolbar-identity-header" role="presentation">
         Signed in as <strong id="toolbar-identity-menu-name"></strong>
       </div>
-      <button id="identity-menu-show-desktop" class="toolbar-identity-item" type="button" role="menuitem">
-        Show desktop
+      <button id="identity-menu-about" class="toolbar-identity-item" type="button" role="menuitem">
+        About ElastOS
       </button>
       <button id="identity-menu-system" class="toolbar-identity-item" type="button" role="menuitem">
-        System
+        System Settings…
+      </button>
+      <div class="toolbar-identity-divider" role="separator"></div>
+      <button id="identity-menu-show-desktop" class="toolbar-identity-item" type="button" role="menuitem">
+        Show Desktop
+      </button>
+      <button id="identity-menu-shortcuts" class="toolbar-identity-item" type="button" role="menuitem">
+        Keyboard Shortcuts
+        <span class="toolbar-identity-shortcut" aria-hidden="true">⌘/</span>
       </button>
       <div class="toolbar-identity-divider" role="separator"></div>
       <button id="identity-menu-sign-out" class="toolbar-identity-item" type="button" role="menuitem">
-        Sign out
+        Sign Out…
       </button>
     </div>
   </div>
@@ -301,6 +309,24 @@
       <div class="shortcuts-row"><dt>App actions</dt><dd><kbd>Shift</kbd><kbd>F10</kbd> on an icon</dd></div>
       <div class="shortcuts-row"><dt>This overlay</dt><dd><kbd>⌘</kbd><kbd>/</kbd></dd></div>
     </dl>
+  </div>
+</section>
+
+<section
+  id="about-overlay"
+  class="about-overlay"
+  aria-hidden="true"
+  inert
+  hidden
+>
+  <div class="about-card" role="dialog" aria-modal="true" aria-labelledby="about-title">
+    <button id="about-close" class="launcher-close" type="button" aria-label="Close About ElastOS">
+      <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
+    </button>
+    <img class="about-logo" src="/apps/home-gui/elastos-logo.svg" alt="" draggable="false" />
+    <h1 id="about-title" class="about-title">ElastOS</h1>
+    <p class="about-line">Home GUI shell</p>
+    <p id="about-identity" class="about-line about-identity"></p>
   </div>
 </section>
 
