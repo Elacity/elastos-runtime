@@ -36,10 +36,7 @@
         <div class="toolbar-right">
           <h2 id="current-title" class="hidden">Loading</h2>
           <span id="status-text" class="subtitle hidden">Loading Library...</span>
-          <input id="search" class="search hidden" type="search" placeholder="Search" spellcheck="false">
           <button id="picker-action-button" class="btn btn-primary hidden" type="button">Select</button>
-          <button id="upload-button" class="btn hidden" type="button">Upload</button>
-          <button id="new-folder-button" class="btn hidden" type="button">New folder</button>
           <div class="window-navbar-layout-toggle" role="group" aria-label="View mode">
             <button id="grid-button" class="layout-toggle-segment" type="button" title="Icons view" aria-label="Icons view">
               <span class="inline-icon"><img src="icons/layout-icons.svg" alt=""></span>
@@ -54,6 +51,17 @@
             <option value="size">Size</option>
             <option value="type">Type</option>
           </select>
+          <button id="new-folder-button" class="btn hidden" type="button">New folder</button>
+          <button id="upload-button" class="btn hidden" type="button">Upload</button>
+          <button id="more-button" class="navbar-btn" type="button" title="More actions" aria-label="More actions" aria-haspopup="true">
+            <span class="inline-icon"><img src="icons/more.svg" alt=""></span>
+          </button>
+          <div id="toolbar-search" class="toolbar-search">
+            <button id="search-toggle" class="navbar-btn" type="button" title="Search" aria-label="Search" aria-expanded="false">
+              <span class="inline-icon"><img src="icons/search.svg" alt=""></span>
+            </button>
+            <input id="search" class="search" type="search" placeholder="Search" spellcheck="false" tabindex="-1">
+          </div>
           <button id="refresh-button" class="btn hidden" type="button">Refresh</button>
         </div>
       </header>

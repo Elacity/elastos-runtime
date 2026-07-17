@@ -1,11 +1,19 @@
+/* Quick Look idiom: content first, minimal quiet chrome. All chrome colors come
+   from the shared ElastOS tokens (elastos-ui.css, vendored via `just vendor-ui`);
+   local aliases below keep the selectors readable. Content stages that must stay
+   dark regardless of theme (3D backdrop, paper pages) are called out inline. */
 :root {
   color-scheme: dark;
-  --bg: #0b0d12;
-  --panel: #14171f;
-  --text: #e8eaf0;
-  --muted: #8b90a0;
-  --error: #ff6b6b;
-  --accent: #6ea8fe;
+  --bg: var(--el-bg);
+  --panel: var(--el-surface);
+  --text: var(--el-text);
+  --muted: var(--el-muted);
+  --error: var(--el-danger);
+  --accent: var(--el-accent);
+  --line: var(--el-hairline);
+  /* Scrim derived from the themed background so the loading overlay reads
+     correctly in light theme too. */
+  --scrim: color-mix(in srgb, var(--el-bg) 78%, transparent);
 }
 
 * {
@@ -18,7 +26,7 @@ body {
   height: 100%;
   background: var(--bg);
   color: var(--text);
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-family: var(--el-font);
 }
 
 .shell {
@@ -35,6 +43,7 @@ body {
   gap: 0;
 }
 
+/* Subtle floating title strip: quiet surface + hairline, no loud colors. */
 .viewer-bar {
   display: flex;
   align-items: center;
@@ -42,7 +51,7 @@ body {
   font-size: 0.85rem;
   padding: 0.5rem 0.85rem;
   background: var(--panel);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  border-bottom: 1px solid var(--line);
 }
 
 .badge {
@@ -50,10 +59,10 @@ body {
   letter-spacing: 0.04em;
   font-size: 0.68rem;
   padding: 0.15rem 0.5rem;
-  border-radius: 999px;
-  background: rgba(110, 168, 254, 0.16);
-  color: var(--accent);
-  border: 1px solid rgba(110, 168, 254, 0.35);
+  border-radius: var(--el-radius-pill);
+  background: var(--el-accent-soft);
+  color: var(--el-accent-strong);
+  border: 1px solid var(--el-accent-soft);
 }
 
 .badge[hidden] {
@@ -75,7 +84,7 @@ body {
   width: 100%;
   flex: 1;
   min-height: 0;
-  background: #000;
+  background: var(--bg);
   overflow: hidden;
 }
 
@@ -98,6 +107,7 @@ body {
   width: 100%;
   height: 100%;
   border: 0;
+  /* Paper backdrop for PDF content — not chrome, stays white in both themes. */
   background: #fff;
 }
 
@@ -113,16 +123,16 @@ body {
   justify-content: center;
   gap: 0.75rem;
   padding: 0.4rem 0.75rem;
-  background: rgba(20, 23, 31, 0.92);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
 }
 
 .pager-btn {
   appearance: none;
-  border: 1px solid rgba(110, 168, 254, 0.35);
-  background: rgba(110, 168, 254, 0.16);
-  color: var(--accent);
-  border-radius: 6px;
+  border: 1px solid var(--el-accent-soft);
+  background: var(--el-accent-soft);
+  color: var(--el-accent-strong);
+  border-radius: var(--el-radius-sm);
   padding: 0.25rem 0.7rem;
   font-size: 0.82rem;
   cursor: pointer;
@@ -151,8 +161,9 @@ body {
 }
 
 .object-page {
+  /* Rendered page image backdrop — paper, stays white in both themes. */
   background: #fff;
-  box-shadow: 0 2px 16px rgba(0, 0, 0, 0.5);
+  box-shadow: var(--el-shadow-1);
 }
 
 /* Continuous-scroll pixel-lock reader: pages stack vertically and the stage scrolls through
@@ -190,16 +201,16 @@ body {
   align-items: center;
   justify-content: center;
   gap: 0.6rem;
-  color: #9aa0a6;
-  font: 0.8rem/1 ui-sans-serif, system-ui, sans-serif;
+  color: var(--muted);
+  font: 0.8rem/1 var(--el-font);
   pointer-events: none;
 }
 
 .page-spinner {
   width: 28px;
   height: 28px;
-  border: 3px solid rgba(255, 255, 255, 0.16);
-  border-top-color: rgba(255, 255, 255, 0.7);
+  border: 3px solid var(--el-hairline-strong);
+  border-top-color: var(--muted);
   border-radius: 50%;
   animation: page-spin 0.8s linear infinite;
 }
@@ -215,23 +226,23 @@ body {
 /* Failed page (decrypt exhausted its retries): an honest error + a Retry the reader can act on,
    rather than an endless spinner — fail closed, then explain. */
 .page-failed .page-loading-label {
-  color: #f08a8a;
+  color: var(--error);
 }
 
 .page-retry {
   margin-top: 0.2rem;
   padding: 0.3rem 0.85rem;
-  font: 0.78rem ui-sans-serif, system-ui, sans-serif;
-  color: #d7dade;
-  background: rgba(255, 255, 255, 0.08);
-  border: 1px solid rgba(255, 255, 255, 0.22);
-  border-radius: 6px;
+  font: 0.78rem var(--el-font);
+  color: var(--text);
+  background: var(--el-inset);
+  border: 1px solid var(--el-hairline-strong);
+  border-radius: var(--el-radius-sm);
   cursor: pointer;
   pointer-events: auto;
 }
 
 .page-retry:hover {
-  background: rgba(255, 255, 255, 0.16);
+  background: var(--el-lift);
 }
 
 /* In scroll mode pages must keep their natural (often tall) height so they stack and scroll,
@@ -242,7 +253,7 @@ body {
   max-height: none;
   height: auto;
   opacity: 0;
-  transition: opacity 0.15s ease;
+  transition: opacity var(--el-dur-2) var(--el-ease);
 }
 
 .pager-page-slot.is-loaded .object-page {
@@ -265,11 +276,14 @@ body {
      height equal to the rendered content (which overrides this). */
   height: 60vh;
   border: 0;
+  /* Book-paper backdrop for EPUB content — stays warm white in both themes. */
   background: #fbfaf6;
-  box-shadow: 0 2px 16px rgba(0, 0, 0, 0.5);
+  box-shadow: var(--el-shadow-1);
 }
 
-/* 3D viewer stage (bundled Three.js WebGL canvas). Fills the frame; orbit controls inside. */
+/* 3D viewer stage (bundled Three.js WebGL canvas). Fills the frame; orbit controls inside.
+   The dark radial backdrop is part of the rendered content (the alpha canvas composites over
+   it and the scene lighting/materials are tuned against it) — fixed in both themes. */
 .object-3d {
   position: absolute;
   inset: 0;
@@ -295,11 +309,11 @@ body {
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
-  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-family: var(--el-font-mono);
   font-size: 0.85rem;
   line-height: 1.5;
   color: var(--text);
-  background: #0f1218;
+  background: var(--el-surface-raised);
 }
 
 .object-placeholder {
@@ -325,7 +339,7 @@ body {
   inset: 0;
   display: grid;
   place-items: center;
-  background: rgba(8, 10, 14, 0.72);
+  background: var(--scrim);
   backdrop-filter: blur(2px);
 }
 

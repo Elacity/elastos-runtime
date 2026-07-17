@@ -17,6 +17,14 @@
 
       <aside class="settings-sidebar disable-user-select disable-context-menu" aria-label="System sections">
         <div class="settings-sidebar-burger disable-context-menu disable-user-select" aria-hidden="true"></div>
+        <input
+          id="settings-search"
+          class="settings-search"
+          type="search"
+          placeholder="Search"
+          spellcheck="false"
+          aria-label="Search settings"
+        >
         <button class="settings-sidebar-item disable-context-menu disable-user-select active" type="button" data-settings="account">
           <span class="settings-sidebar-icon settings-sidebar-icon-account" aria-hidden="true"></span>
           <span class="settings-sidebar-text">Account</span>
@@ -28,6 +36,10 @@
         <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-settings="security">
           <span class="settings-sidebar-icon settings-sidebar-icon-security" aria-hidden="true"></span>
           <span class="settings-sidebar-text">Security</span>
+        </button>
+        <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-settings="network">
+          <span class="settings-sidebar-icon settings-sidebar-icon-network" aria-hidden="true"></span>
+          <span class="settings-sidebar-text">Network</span>
         </button>
         <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-settings="storage">
           <span class="settings-sidebar-icon settings-sidebar-icon-storage" aria-hidden="true"></span>
@@ -195,6 +207,61 @@
                 <dl class="system-fields compact-proof">
                   <div><dt>Guest access</dt><dd></dd></div>
                 </dl>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <section class="settings-content" data-settings="network" aria-labelledby="network-title">
+          <h1 id="network-title">Network</h1>
+
+          <section class="pc2-section" aria-labelledby="network-status-title">
+            <h2 id="network-status-title" class="pc2-section-title">Status</h2>
+            <div class="pc2-group">
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Carrier</div>
+                    <div class="pc2-card-sublabel" data-network-detail="carrier">Peer-to-peer transport for content and providers.</div>
+                  </div>
+                  <span class="system-network-state" data-network-state="carrier" data-state="unknown">Unknown</span>
+                </div>
+              </div>
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Chain RPC</div>
+                    <div class="pc2-card-sublabel" data-network-detail="chain">Read health from live marketplace and rights calls.</div>
+                  </div>
+                  <span class="system-network-state" data-network-state="chain" data-state="unknown">Unknown</span>
+                </div>
+              </div>
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Market index</div>
+                    <div class="pc2-card-sublabel" data-network-detail="index">On-chain listing discovery coverage.</div>
+                  </div>
+                  <span class="system-network-state" data-network-state="index" data-state="unknown">Unknown</span>
+                </div>
+              </div>
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Availability</div>
+                    <div class="pc2-card-sublabel" data-network-detail="availability">Published-content pinning targets.</div>
+                  </div>
+                  <span class="system-network-state" data-network-state="availability" data-state="unknown">Unknown</span>
+                </div>
+              </div>
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Snapshot</div>
+                    <div class="pc2-card-sublabel">Read-only view of the shell's network glyph. Nothing on this page changes network state.</div>
+                  </div>
+                  <span class="pc2-card-value system-value-muted" data-field="network-age">—</span>
+                </div>
               </div>
             </div>
           </section>

@@ -273,7 +273,45 @@ export function renderTaskbar(summary) {
     syncTaskbarGroupButton(entry, app.target, app.title, openCount);
     taskbarTargets.appendChild(entry);
   }
+  appendTaskbarTrash(summary);
   updateTaskbarState();
+}
+
+/* Trash anchors the right end of the dock, past its own divider (the macOS
+   position). It is the same desktop Trash object: the glyph fills when it
+   holds items, click opens it in Library, right-click offers Empty Trash. */
+function appendTaskbarTrash(summary) {
+  const trashObject = desktopObjects(summary).find(isTrashDesktopObject);
+  if (!trashObject) {
+    return;
+  }
+  if (taskbarTargets.childElementCount > 0) {
+    const separator = document.createElement("span");
+    separator.className = "taskbar-separator";
+    separator.setAttribute("aria-hidden", "true");
+    taskbarTargets.appendChild(separator);
+  }
+  const entryId = desktopObjectEntryId(trashObject);
+  const entry = taskbarItemTemplate.content.firstElementChild.cloneNode(true);
+  const button = entry.querySelector(".taskbar-item");
+  const empty = trashObject.metadata?.empty !== false;
+  button.dataset.label = "Trash";
+  button.setAttribute("aria-label", empty ? "Trash. Empty." : "Trash. Contains items.");
+  mountGlyph(button.querySelector(".taskbar-item-icon"), empty ? "trash" : "trash-full");
+  button.addEventListener("click", () => {
+    openDesktopObject(entryId);
+  });
+  button.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const anchor = contextMenuAnchorPoint(event, button);
+    openDesktopContextMenu(anchor.x, anchor.y, {
+      kind: "desktop-object",
+      entryId,
+      source: "taskbar",
+    });
+  });
+  taskbarTargets.appendChild(entry);
 }
 
 function visibleTaskbarTargets(summary) {

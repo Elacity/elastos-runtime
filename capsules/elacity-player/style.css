@@ -1,10 +1,18 @@
+/* Quick Look idiom: full-bleed content, minimal chrome. Chrome colors come from
+   the shared ElastOS tokens (elastos-ui.css, vendored via `just vendor-ui`).
+   The video stage itself letterboxes in black in BOTH themes (media convention),
+   so the overlay that floats over it keeps fixed light-on-dark ink — those
+   literals mirror the dark-theme token values and are deliberate, not drift. */
 :root {
   color-scheme: dark;
-  --bg: #0b0d12;
-  --panel: #14171f;
-  --text: #e8eaf0;
-  --muted: #8b90a0;
-  --error: #ff6b6b;
+  --bg: var(--el-bg);
+  --text: var(--el-text);
+  --muted: var(--el-muted);
+  --error: var(--el-danger);
+  /* Ink used over the always-black video stage; must not flip with the theme. */
+  --stage-ink: #f5f7fa;
+  --stage-ink-muted: rgba(245, 247, 250, 0.7);
+  --stage-ink-error: #ff8f8f;
 }
 
 * {
@@ -17,7 +25,7 @@ body {
   height: 100%;
   background: var(--bg);
   color: var(--text);
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-family: var(--el-font);
 }
 
 .shell {
@@ -39,6 +47,7 @@ body {
   width: 100%;
   flex: 1;
   min-height: 0;
+  /* Letterbox stays black in both themes — media stage, not chrome. */
   background: #000;
   overflow: hidden;
 }
@@ -56,6 +65,7 @@ video {
   inset: 0;
   display: grid;
   place-items: center;
+  /* Dark scrim over the always-black stage — fixed in both themes. */
   background: rgba(8, 10, 14, 0.72);
   backdrop-filter: blur(2px);
 }
@@ -66,19 +76,19 @@ video {
 
 .overlay-copy {
   text-align: center;
-  color: var(--muted);
+  color: var(--stage-ink-muted);
 }
 
 .overlay-copy .icon {
   font-size: 2.5rem;
   line-height: 1;
   margin-bottom: 0.5rem;
-  color: var(--text);
+  color: var(--stage-ink);
 }
 
 .overlay.error .overlay-copy,
 .overlay.error .icon {
-  color: var(--error);
+  color: var(--stage-ink-error);
 }
 
 .status {

@@ -67,6 +67,8 @@ boot().catch((error) => {
 
 async function boot() {
   configureSettingsTabs();
+  configureSettingsSearch();
+  configureNetworkPane();
   configureAppearanceEditor();
   configureGuestAccess();
   configurePasskeyAccess();
@@ -112,6 +114,140 @@ function activateSettingsTab(settings) {
   }
   if (container) {
     container.scrollTop = 0;
+  }
+  onSettingsTabActivated(tab);
+}
+
+/* Sidebar search (macOS System Settings): a section matches when ANY text it
+   contains matches — the label you half-remember lives in the pane, not the
+   sidebar. Filtering only hides sidebar entries; it never changes the pane. */
+function configureSettingsSearch() {
+  const input = document.querySelector("#settings-search");
+  if (!input) {
+    return;
+  }
+  const sectionText = new Map();
+  const textFor = (name) => {
+    if (!sectionText.has(name)) {
+      const pane = document.querySelector(`.settings-content[data-settings="${name}"]`);
+      const item = document.querySelector(`.settings-sidebar-item[data-settings="${name}"]`);
+      const haystack = `${item?.textContent || ""} ${pane?.textContent || ""}`.toLowerCase();
+      sectionText.set(name, haystack);
+    }
+    return sectionText.get(name);
+  };
+  input.addEventListener("input", () => {
+    const query = input.value.trim().toLowerCase();
+    const items = [...document.querySelectorAll(".settings-sidebar-item")];
+    let firstVisible = null;
+    for (const item of items) {
+      const name = item.dataset.settings || "";
+      const matches = !query || textFor(name).includes(query);
+      item.classList.toggle("search-hidden", !matches);
+      if (matches && !firstVisible) {
+        firstVisible = item;
+      }
+    }
+    // If the active section got filtered out, follow the first match so the
+    // pane always corresponds to something visible in the sidebar.
+    const active = document.querySelector(".settings-sidebar-item.active");
+    if (query && firstVisible && active?.classList.contains("search-hidden")) {
+      activateSettingsTab(firstVisible.dataset.settings);
+    }
+  });
+}
+
+/* ---- Network pane: read-only mirror of the shell's network glyph. ----
+   Same endpoint, same rows; polls only while the pane is open. */
+const NETWORK_PANE_ROWS = ["carrier", "chain", "index", "availability"];
+let networkPaneTimer = 0;
+
+function onSettingsTabActivated(tab) {
+  if (tab === "network") {
+    refreshNetworkPane().catch(() => {});
+    window.clearInterval(networkPaneTimer);
+    networkPaneTimer = window.setInterval(() => {
+      refreshNetworkPane().catch(() => {});
+    }, 30_000);
+  } else {
+    window.clearInterval(networkPaneTimer);
+    networkPaneTimer = 0;
+  }
+}
+
+function configureNetworkPane() {
+  if (!hasShellAccess()) {
+    setField("network-age", "Open System from Home for live status", "");
+  }
+}
+
+async function refreshNetworkPane() {
+  if (!hasShellAccess()) {
+    return;
+  }
+  const status = await fetchJson("/api/apps/home/network-status", {
+    headers: shellHeaders(),
+  });
+  for (const key of NETWORK_PANE_ROWS) {
+    const row = status?.[key] || {};
+    const stateNode = document.querySelector(`[data-network-state="${key}"]`);
+    const detailNode = document.querySelector(`[data-network-detail="${key}"]`);
+    const state = networkPaneRowState(row);
+    if (stateNode) {
+      stateNode.dataset.state = state;
+      stateNode.textContent = state.charAt(0).toUpperCase() + state.slice(1);
+    }
+    if (detailNode) {
+      detailNode.textContent = networkPaneRowDetail(key, row);
+    }
+  }
+  const age = typeof status?.age_secs === "number" ? status.age_secs : null;
+  setField("network-age", age === null ? "warming up" : age < 5 ? "just now" : `${age}s ago`, "");
+}
+
+function networkPaneRowState(row) {
+  if (typeof row?.state === "string" && row.state) {
+    return row.state;
+  }
+  if (typeof row?.coverage === "string") {
+    return "ok";
+  }
+  return "unknown";
+}
+
+function networkPaneRowDetail(key, row) {
+  if (!row || typeof row !== "object") {
+    return "no data";
+  }
+  switch (key) {
+    case "carrier":
+      return typeof row.peers === "number"
+        ? `Peer-to-peer transport — ${row.peers} peer${row.peers === 1 ? "" : "s"} connected`
+        : row.detail || "Peer-to-peer transport for content and providers.";
+    case "chain": {
+      if (typeof row.last_ok_secs === "number") {
+        const when = row.last_ok_secs < 5 ? "just now" : `${row.last_ok_secs}s ago`;
+        return `Last successful live read ${when}`;
+      }
+      return row.last_error
+        ? String(row.last_error).slice(0, 120)
+        : "No live chain reads yet this session.";
+    }
+    case "index": {
+      if (typeof row.coverage === "string") {
+        const pct = typeof row.backfill_pct === "number" ? row.backfill_pct : null;
+        return pct !== null && pct < 100
+          ? `${row.coverage} — ${pct}% of history indexed`
+          : row.coverage;
+      }
+      return "On-chain listing discovery coverage.";
+    }
+    case "availability":
+      return typeof row.targets === "number"
+        ? `${row.targets} pinning target${row.targets === 1 ? "" : "s"} configured`
+        : row.detail || "Published-content pinning targets.";
+    default:
+      return "no data";
   }
 }
 

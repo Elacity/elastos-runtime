@@ -18,15 +18,19 @@ HEADER="/* GENERATED from ${SOURCE_CSS} — do not edit. Run \`just vendor-ui\`.
 JS_HEADER="/* GENERATED from ${SOURCE_JS} — do not edit. Run \`just vendor-ui\`. */"
 
 # Capsules that consume the shared tokens today. Extend as apps migrate.
+# Entries are the browser-serving dir relative to capsules/ — most apps serve
+# from a browser/ subdir; viewer-style capsules serve straight from their root.
 TARGETS=(
-  home
-  documents
-  inbox
-  system
-  wallet
-  marketplace-content
-  chat-room
-  library
+  home/browser
+  documents/browser
+  inbox/browser
+  system/browser
+  wallet/browser
+  marketplace-content/browser
+  chat-room/browser
+  library/browser
+  ddrm-viewer
+  elacity-player
 )
 
 MODE="${1:-sync}"
@@ -42,8 +46,8 @@ stamped_js_source() {
   cat "$SOURCE_JS"
 }
 
-for capsule in "${TARGETS[@]}"; do
-  browser_dir="capsules/${capsule}/browser"
+for target_dir in "${TARGETS[@]}"; do
+  browser_dir="capsules/${target_dir}"
   css_target="${browser_dir}/elastos-ui.css"
   font_dir="${browser_dir}/assets/fonts"
   font_target="${font_dir}/Inter-latin-var.woff2"

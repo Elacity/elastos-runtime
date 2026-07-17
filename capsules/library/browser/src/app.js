@@ -63,6 +63,9 @@ import { createLibraryUploads } from "./uploads.js";
       newFolderButton: document.getElementById("new-folder-button"),
       pickerActionButton: document.getElementById("picker-action-button"),
       search: document.getElementById("search"),
+      searchToggle: document.getElementById("search-toggle"),
+      toolbarSearch: document.getElementById("toolbar-search"),
+      moreButton: document.getElementById("more-button"),
       currentTitle: document.getElementById("current-title"),
       statusText: document.getElementById("status-text"),
       refreshButton: document.getElementById("refresh-button"),
@@ -369,7 +372,7 @@ import { createLibraryUploads } from "./uploads.js";
       return folderObject?.metadata?.readonly !== false;
     }
 
-    function setFolderStatus(text) {
+    function setFolderStatus(_text) {
       if (isArchivePickerMode()) {
         setStatus("");
         return;
@@ -378,7 +381,9 @@ import { createLibraryUploads } from "./uploads.js";
         setStatus(attachStatusText());
         return;
       }
-      setStatus(text);
+      // The object count lives in the footer statusbar (with selection state);
+      // the toolbar strip only carries transient messages and picker prompts.
+      setStatus("");
     }
 
     function syncModeChrome() {
@@ -400,7 +405,7 @@ import { createLibraryUploads } from "./uploads.js";
         setStatus("");
         return;
       }
-      setStatus("Ready.");
+      setStatus("");
     }
 
     async function completeAttachPicker() {
@@ -1014,6 +1019,40 @@ import { createLibraryUploads } from "./uploads.js";
       renderMenu(actions, x, y);
     }
 
+    // The toolbar "…" menu: folder actions only. View is omitted (the segmented
+    // toggle sits right beside the button) and Show Hidden stays in the
+    // background context menu — the toolbar carries the everyday actions.
+    function showToolbarMenu(x, y) {
+      const readOnly = currentFolderReadOnly();
+      const actions = [];
+      actions.push(menuAction("Sort By", null, {
+        children: [
+          menuAction("Name", () => setSort("name"), { checked: state.sort === "name" }),
+          menuAction("Date Modified", () => setSort("modified"), { checked: state.sort === "modified" }),
+          menuAction("Type", () => setSort("type"), { checked: state.sort === "type" }),
+          menuAction("Size", () => setSort("size"), { checked: state.sort === "size" }),
+          "-",
+          menuAction("Ascending", () => setSortOrder("asc"), { checked: state.sortOrder !== "desc" }),
+          menuAction("Descending", () => setSortOrder("desc"), { checked: state.sortOrder === "desc" }),
+        ],
+      }));
+      actions.push("-");
+      if (!readOnly) {
+        actions.push(menuAction("New", null, {
+          children: [
+            menuAction("Folder", createFolder),
+            menuAction("Text Document", createTextDocument),
+          ],
+        }));
+      }
+      if (canPasteInto(state.currentUri)) actions.push(menuAction("Paste", () => pasteClipboardTo(state.currentUri)));
+      if (!readOnly) actions.push(menuAction("Upload Here", () => elements.fileInput.click()));
+      actions.push("-");
+      actions.push(menuAction("Refresh", loadCurrentFolder));
+      actions.push(menuAction("Properties", () => showFolderProperties()));
+      renderMenu(actions, x, y);
+    }
+
     function showFolderProperties() {
       const root = rootForUri(state.currentUri);
       showProperties({
@@ -1097,6 +1136,7 @@ import { createLibraryUploads } from "./uploads.js";
         showError,
         showMenuForObject,
         showPlaceMenu,
+        showToolbarMenu,
         startRename,
         state,
         stopLibraryEventStream,

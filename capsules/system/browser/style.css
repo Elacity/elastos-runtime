@@ -161,6 +161,12 @@ code {
   box-shadow: inset 0 -5px 0 var(--el-hairline-strong);
 }
 
+/* Globe: circle + meridian hinted with an inner ring. */
+.settings-sidebar-icon-network::before {
+  border-radius: 50%;
+  box-shadow: inset 3px 0 0 -1.5px currentColor, inset -3px 0 0 -1.5px currentColor;
+}
+
 .settings-sidebar-icon-inspector::before {
   border-radius: 50%;
   box-shadow:
@@ -176,6 +182,69 @@ code {
 
 .settings-sidebar-text {
   flex-grow: 1;
+}
+
+/* Sidebar search (macOS System Settings position): filters sections by any
+   text they contain. */
+.settings-search {
+  width: 100%;
+  margin: 2px 0 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--el-hairline);
+  border-radius: 8px;
+  background: var(--el-inset);
+  color: var(--el-text);
+  font-family: inherit;
+  font-size: 12.5px;
+}
+
+.settings-search::placeholder {
+  color: var(--el-soft);
+}
+
+.settings-search:focus {
+  outline: 2px solid var(--el-focus);
+  outline-offset: 1px;
+}
+
+.settings-sidebar-item.search-hidden {
+  display: none;
+}
+
+/* Network status chips: dot + word, read-only. */
+.system-network-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: 0 0 auto;
+  color: var(--el-muted);
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.system-network-state::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--el-soft);
+}
+
+.system-network-state[data-state="ok"] {
+  color: var(--el-text);
+}
+
+.system-network-state[data-state="ok"]::before {
+  background: var(--el-ok);
+}
+
+.system-network-state[data-state="degraded"]::before {
+  background: var(--el-brand);
+}
+
+.system-network-state[data-state="off"]::before {
+  background: var(--el-danger);
 }
 
 .settings-sidebar-item:hover {
