@@ -22,6 +22,7 @@ import {
 
 let rail = null;
 let frame = null;
+let barButton = null;
 let closeButton = null;
 let windowButton = null;
 let errorBlock = null;
@@ -37,6 +38,7 @@ export function bindWalletRail() {
   }
   rail = document.querySelector("#wallet-rail");
   frame = document.querySelector("#wallet-rail-frame");
+  barButton = document.querySelector("#toolbar-wallet");
   closeButton = document.querySelector("#wallet-rail-close");
   windowButton = document.querySelector("#wallet-rail-open-window");
   errorBlock = document.querySelector("#wallet-rail-error");
@@ -45,6 +47,9 @@ export function bindWalletRail() {
   if (!rail || !frame) {
     return;
   }
+  barButton?.addEventListener("click", () => {
+    toggleWalletRail();
+  });
   closeButton?.addEventListener("click", () => hideWalletRail());
   windowButton?.addEventListener("click", () => {
     hideWalletRail({ restoreFocus: false });
@@ -70,6 +75,19 @@ export function walletRailAvailable() {
   return Boolean(targetById(shellState.currentSummary, "wallet"));
 }
 
+/* Called on every summary sync: the bar icon exists exactly when the home
+   carries a wallet target — never a dead button. */
+export function syncWalletRailAvailability() {
+  if (!barButton) {
+    return;
+  }
+  const available = walletRailAvailable();
+  barButton.hidden = !available;
+  if (!available) {
+    retireWalletRail();
+  }
+}
+
 export function showWalletRail() {
   if (!rail || !walletRailAvailable()) {
     return;
@@ -81,6 +99,7 @@ export function showWalletRail() {
   rail.hidden = false;
   rail.inert = false;
   rail.setAttribute("aria-hidden", "false");
+  barButton?.setAttribute("aria-expanded", "true");
   bindOutsideDismiss();
   rail.focus({ preventScroll: true });
   if (!frame.dataset.route) {
@@ -95,6 +114,7 @@ export function hideWalletRail({ restoreFocus = true } = {}) {
   rail.hidden = true;
   rail.inert = true;
   rail.setAttribute("aria-hidden", "true");
+  barButton?.setAttribute("aria-expanded", "false");
   if (restoreFocus) {
     invoker?.focus?.();
   }

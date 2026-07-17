@@ -102,6 +102,7 @@ import {
 import {
   bindWalletRail,
   retireWalletRail,
+  syncWalletRailAvailability,
 } from "./shell-wallet-rail.js?v=home-20260718n";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
@@ -489,6 +490,7 @@ export function syncHomeGuiChrome(previous, summary) {
   updateClock();
   syncIdentity(summary);
   renderInboxBadge(summary);
+  syncWalletRailAvailability();
   maybeShowWalletApprovalToast(previous, summary);
   recordNotifications(summary);
 }
