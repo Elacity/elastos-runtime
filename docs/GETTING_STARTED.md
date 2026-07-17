@@ -336,16 +336,13 @@ For developer review, the important distinction is:
 
 Read [Capsule Authoring](CAPSULE_AUTHORING.md) and use the checked-in
 [`templates/capsules`](../templates/capsules/README.md) for web projections,
-viewer/content pairs, and provider contracts. Create a minimal Component Bus
+viewer/content pairs, and provider contracts. Create a minimal Component
 capsule with:
 
 ```bash
 ./elastos/target/release/elastos init my-capsule
 cd my-capsule
-cargo build --release --target wasm32-unknown-unknown
-cargo run --quiet --manifest-path ../elastos/tools/componentize/Cargo.toml -- \
-  target/wasm32-unknown-unknown/release/my_capsule.wasm \
-  my-capsule.component.wasm
+../scripts/build-component-capsule.sh .
 ../elastos/target/release/elastos run .
 ```
 

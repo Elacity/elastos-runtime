@@ -91,7 +91,7 @@ For documents, the intended identity split is:
 
 For Home appearance, the current identity split is:
 
-- `capsules/home/browser/wallpaper.webp` = signed capsule-bundled default wallpaper
+- `capsules/home-gui/browser/wallpaper.webp` = signed capsule-bundled default wallpaper
 - `localhost://Users/<principal-root>/.AppData/ElastOS/Home/Appearance/background-image.{png,jpg,webp,gif}` = passkey-principal-owned wallpaper override
 - `localhost://Users/<principal-root>/.AppData/ElastOS/Home/Appearance/background-overlay.json` = passkey-principal-owned overlay enabled/opacity preference; overlay is off by default
 

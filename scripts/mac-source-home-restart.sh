@@ -133,6 +133,8 @@ keys = [
     "browser_helper_installed_sha256",
     "browser_helper_initrd_sha256",
     "browser_helper_rootfs_sha256",
+    "home_cli_renderer_source_sha256",
+    "home_cli_renderer_installed_sha256",
 ]
 data = {}
 for key in keys:
@@ -262,6 +264,8 @@ browser_helper_source_sha=""
 browser_helper_installed_sha=""
 browser_helper_initrd_sha=""
 browser_helper_rootfs_sha=""
+home_cli_renderer_source_sha=""
+home_cli_renderer_installed_sha=""
 verify_browser_helper_freshness
 
 mkdir -p "$log_dir"
@@ -320,6 +324,16 @@ http_code="$(curl -fsS -o /dev/null -w '%{http_code}' "$home_url")"
 served_hash="$(curl -fsS "$home_url" | shasum -a 256 | cut -d ' ' -f 1)"
 installed_hash="$(shasum -a 256 "${data_dir}/capsules/home/browser/index.html" | cut -d ' ' -f 1)"
 source_hash="$(shasum -a 256 "${repo_root}/capsules/home/browser/index.html" | cut -d ' ' -f 1)"
+home_cli_renderer_source="${repo_root}/capsules/home-cli/target/release/home-cli"
+home_cli_renderer_installed="${data_dir}/bin/home-cli"
+
+if [[ ! -f "$home_cli_renderer_source" || ! -f "$home_cli_renderer_installed" ]]; then
+  echo "Mac source-home Home CLI renderer verification failed: source or installed renderer is missing." >&2
+  echo "Run scripts/setup-source-home.sh for ${test_home}, then rerun this restart." >&2
+  exit 1
+fi
+home_cli_renderer_source_sha="$(sha256_file "$home_cli_renderer_source")"
+home_cli_renderer_installed_sha="$(sha256_file "$home_cli_renderer_installed")"
 
 if [[ "$http_code" != "200" || "$served_hash" != "$installed_hash" || "$served_hash" != "$source_hash" ]]; then
   echo "Mac source-home restart verification failed" >&2
@@ -327,6 +341,13 @@ if [[ "$http_code" != "200" || "$served_hash" != "$installed_hash" || "$served_h
   echo "served=${served_hash}" >&2
   echo "installed=${installed_hash}" >&2
   echo "source=${source_hash}" >&2
+  exit 1
+fi
+if [[ "$home_cli_renderer_source_sha" != "$home_cli_renderer_installed_sha" ]]; then
+  echo "Mac source-home Home CLI renderer verification failed" >&2
+  echo "source=${home_cli_renderer_source_sha}" >&2
+  echo "installed=${home_cli_renderer_installed_sha}" >&2
+  echo "Run scripts/setup-source-home.sh for ${test_home}, then rerun this restart." >&2
   exit 1
 fi
 
@@ -349,4 +370,6 @@ BROWSER_HELPER_SOURCE_SHA256="$browser_helper_source_sha" \
 BROWSER_HELPER_INSTALLED_SHA256="$browser_helper_installed_sha" \
 BROWSER_HELPER_INITRD_SHA256="$browser_helper_initrd_sha" \
 BROWSER_HELPER_ROOTFS_SHA256="$browser_helper_rootfs_sha" \
+HOME_CLI_RENDERER_SOURCE_SHA256="$home_cli_renderer_source_sha" \
+HOME_CLI_RENDERER_INSTALLED_SHA256="$home_cli_renderer_installed_sha" \
 emit_json "$json_out"

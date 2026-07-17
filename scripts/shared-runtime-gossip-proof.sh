@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Prove that two sessions on the same runtime can exchange gossip messages.
-# This is the core invariant for native↔WASM chat interop.
+# This is the core invariant for shared-runtime chat interop.
 #
 # No WASM, no TUI, no pty — just API calls via curl.
 #
@@ -79,7 +79,7 @@ TOKEN_A=$(curl -sf -X POST "$API_URL/api/auth/attach" \
   -d "{\"secret\":\"$ATTACH_SECRET\",\"scope\":\"client\"}" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 echo "[proof] session A attached"
 
-# Attach session B (simulates WASM chat)
+# Attach session B (simulates another chat frontend)
 TOKEN_B=$(curl -sf -X POST "$API_URL/api/auth/attach" \
   -H "Content-Type: application/json" \
   -d "{\"secret\":\"$ATTACH_SECRET\",\"scope\":\"client\"}" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")

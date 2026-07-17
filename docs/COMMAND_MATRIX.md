@@ -80,8 +80,8 @@ The detailed runtime/TTY/home contract for those paths lives in [INTERACTIVE_RUN
 | `elastos webspace list [path]` | Queries the dynamic mounted `localhost://WebSpaces/<moniker>/...` resolver surface directly. Today `Elastos` exposes typed children such as `content`, `peer`, `did`, and `ai`; deeper `peer` / `did` / `ai` traversal fails closed until richer resolver semantics exist |
 | `elastos webspace resolve <target>` | Resolves a mounted WebSpace moniker or deeper handle path into a typed local handle. Current contract: `resolve` is handle-only; provider target URIs stay resolver-private; `content/<cid>` resolves to a file endpoint, `peer/<id>`, `did/<did>`, and `ai/<backend>` resolve to one typed folder handle, and `_meta.json` is a metadata file view for `read` / `stat`, not another handle |
 | `elastos run` (Data) | Power-user explicit path/CID launch. Data capsules are served in-process. |
-| `elastos home --status` | Host-side snapshot of Home state |
-| `elastos home --json` | Machine-readable host-side snapshot of Home state |
+| `elastos home --status` | Host-side Home-state probe; not a separate Home shell surface |
+| `elastos home --json` | Machine-readable Home-state probe; not a separate Home shell surface |
 
 ### Managed Dashboard Runtime
 
@@ -95,7 +95,7 @@ The detailed runtime/TTY/home contract for those paths lives in [INTERACTIVE_RUN
 
 | Command | Policy needed | Notes |
 |---------|---------------|-------|
-| `elastos chat` | peer, did, `Users/<principal-root>/.AppData/LocalHost/Chat` | Native Carrier chat only. First tries to reuse a healthy managed Home runtime; otherwise starts/reuses a managed chat runtime on loopback. Packaged full-screen chat and `chat-wasm` surfaces launch through `elastos capsule ...`, not `elastos chat`. |
+| `elastos chat` | peer, did, `Users/<principal-root>/.AppData/LocalHost/Chat` | Native Carrier chat only. First tries to reuse a healthy managed Home runtime; otherwise starts/reuses a managed chat runtime on loopback. Packaged full-screen chat surfaces launch through `elastos capsule chat ...`, not `elastos chat`. |
 
 ### Operator Runtime (requires `elastos serve`)
 

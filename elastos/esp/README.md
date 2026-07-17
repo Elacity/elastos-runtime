@@ -23,7 +23,7 @@ Excluded from this slice:
 - SSE ESP projection streams.
 - Standing grants.
 - Shell marketplace.
-- Full second-shell product UX.
+- Shell UI implementation and product UX evidence.
 - Capability token request/consume flows.
 - Affordance receipts.
 - Svelte or framework UI.

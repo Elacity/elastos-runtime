@@ -133,7 +133,14 @@ function audit(args) {
   const homeCli = read("capsules/home-cli/browser/home-cli.js");
   const homeCliIndex = read("capsules/home-cli/browser/index.html");
   const homeCliStyle = read("capsules/home-cli/browser/style.css");
-  const homeCliRust = read("capsules/home-cli/src/main.rs");
+  const homeCliRust = [
+    "main.rs",
+    "runtime_io.rs",
+    "line_views.rs",
+    "tui_state.rs",
+    "tui_render.rs",
+    "view_models.rs",
+  ].map((file) => read(`capsules/home-cli/src/${file}`)).join("\n");
   const homeGuiManifest = read("capsules/home-gui/capsule.json");
   const commandContract = readJson("capsules/home-cli/browser/commands.json");
   const state = read("state.md");
@@ -306,7 +313,7 @@ function audit(args) {
         cliSmoke.includes("home-cli terminal host intent did not request an explicit GUI shell transition"),
       [
         "capsules/home-cli/browser/commands.json",
-        "capsules/home-cli/src/main.rs",
+        "capsules/home-cli/src/main.rs and included responsibility files",
         "scripts/home-cli-browser-smoke.mjs",
       ],
       "Add missing CLI commands or snapshot facts.",

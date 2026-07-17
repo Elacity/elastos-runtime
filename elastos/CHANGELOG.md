@@ -2,15 +2,55 @@
 
 All notable changes to the public ElastOS Runtime repository.
 
+## [0.6.0-dev] - Unreleased
+
+Development changes on `feat/elastos-shell-protocol`. These changes are not
+part of the 0.5.0 release history.
+
+### Changed
+- Added the ESP v0 descriptor, Runtime-derived capsule/interface catalog, and
+  fail-closed shell selection for the allowlisted Home GUI and Home CLI shells.
+- Split `/apps/home/` into a neutral host, trusted graphical shell modules, and
+  an isolated Runtime-owned Home CLI PTY while keeping both shells on the same
+  catalog, intent, approval, and provider facts.
+- Replaced first-party WASI product entrypoints with explicit Runtime
+  projections and added a test-only `elastos.component/v1` conformance fixture
+  for the `elastos:bus@v1` authority path.
+- Added locked, isolated, path-remapped Component artifact builds and made
+  setup and release packaging use that same build path.
+- Restored the GBA viewer/content relationship as a portable browser projection
+  and tightened Browser audio/session diagnostics without adding a fallback
+  rendering path.
+- Added canonical capsule authoring templates, manifest/interface checks, and
+  active-product inventory gates.
+- Extracted People from Home into a standalone first-party app capsule with an
+  app-scoped launch token while keeping profile, discovery, requests, contacts,
+  removal, and Chat handoff Runtime-mediated.
+
+### Fixed
+- Fixed Home launch classification so browser projections are attached as
+  authorized web surfaces instead of being sent to a WASM compute provider.
+- Bound fresh passkey authority to one app, operation, and request payload;
+  made Inspector approval claims atomic; and made persisted audit records
+  Runtime-signed and hash-chained.
+- Isolated shell and app frames with opaque browser sandboxes, removed
+  ambient-cookie token minting, trusted Host-header callbacks, and manifest-only
+  shell admission.
+- Made passkey session refresh atomically revoke its predecessor, restricted
+  first-owner enrollment to local Runtime access, and removed unauthenticated
+  capsule bootstrap plus obsolete standalone Recovery Kit routes.
+- Rejected archive links and host-path escapes during capsule install and
+  browser asset serving.
+
 ## [0.5.0] - Unreleased
 
-0.5.0 is the current public review candidate. It brings the Mac, Jetson, and
-server work into one candidate line and keeps the release truth explicit:
-Browser is available for review, but product Browser completion is not claimed
-until target-device media, audio, input, and installed-path proof are closed.
+0.5.0 is the current `main` baseline. It brings the Mac, Jetson, and server
+work into one line and keeps the release truth explicit: Browser is available
+for review, but product Browser completion is not claimed until target-device
+media, audio, input, and installed-path proof are closed.
 
-Notes that were previously listed under 0.4.1 are folded into this entry because
-0.4.1 was not published.
+Notes from the unpublished intermediate patch line are folded into this entry
+because no separate patch release was published.
 
 ### Added
 - Added the first Services app so local services start disabled, can be enabled

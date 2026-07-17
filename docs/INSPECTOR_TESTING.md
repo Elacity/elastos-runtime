@@ -48,8 +48,8 @@ Run the broad Home alignment sentinel:
 scripts/capsule-inspector-act-check.sh
 ```
 
-When `node` is not on `PATH` in the Codex Mac environment, use the bundled
-runtime directly:
+When `node` is not on `PATH` in a local development environment, use the
+bundled runtime directly:
 
 ```bash
 node scripts/home-entropy-check.mjs
@@ -92,6 +92,9 @@ These are intentional fail-closed behaviors:
 - `revoke` through `/api/provider/inspect/revoke` returns not found.
 - request bodies with `_runtime_invocation`, `_runtime_transfer`,
   `connect_ticket`, `carrier_route`, or `carrier` are rejected before Inbox.
+- Inspector object facts redact raw signatures, bearer strings, host paths,
+  hidden runtime/Carrier route metadata, and direct mutation handles from
+  manifest-derived projections.
 - if authority metadata changes after request creation, approval fails stale.
 - if the stored request body changes after request creation, approval fails
   stale.

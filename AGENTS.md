@@ -152,6 +152,13 @@ For installed provider changes, also prove the installed binary and manifest:
 scripts/installed-provider-verify.sh <provider>
 ```
 
+For installed or served capsule/runtime changes, source tests are not enough.
+Before declaring a live localhost fix verified, prove artifact parity for the
+path the user is actually running. Report the edited source path, built artifact
+path, installed artifact path, SHA-256 of the built and installed artifact,
+restart or stale-process cleanup performed, and the live localhost proof command
+and result.
+
 ## Public Live Deployment
 
 The public live host must preserve its data root, signing key, passkey state, and

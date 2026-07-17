@@ -49,13 +49,15 @@ Rebuild the provider binary, install it under the active
 size when publishing, and restart the gateway so the provider process is
 respawned.
 
-## Source-Home Entrypoint Invariant
+## Source-Home Artifact Invariant
 
-Source-home app sync must install each WASM capsule's compiled entrypoint at the
-installed capsule root, for example `capsules/wallet/wallet.wasm`. Browser
-assets and `capsule.json` are not enough. If the installed root entrypoint is
-missing and the installed capsule tree lacks the compiled fallback,
-Home app launch fails with `capsule runtime entrypoint missing`.
+Source-home sync must install the artifact declared by each capsule's execution
+contract. Runtime projections need their browser tree, WASM Components need
+the stamped component artifact and WIT hash, and provider or content
+capsules need their declared provider or data artifacts. Do not synthesize a
+missing WASI entrypoint as a compatibility fallback. If the installed artifact
+does not match the manifest, treat the install as incomplete and verify the
+built and installed hashes before debugging Home launch behavior.
 
 ## Browser Display Invariant
 

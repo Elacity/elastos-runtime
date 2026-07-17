@@ -97,6 +97,10 @@ For a Component capsule under `capsules/<name>`:
 scripts/build-component-capsule.sh capsules/<name>
 ```
 
+The builder uses locked dependencies, an isolated target directory, and stable
+path remapping. Setup and release packaging call the same builder; do not commit
+an artifact produced by a persistent capsule `target/` directory.
+
 Minimum gate:
 
 ```bash

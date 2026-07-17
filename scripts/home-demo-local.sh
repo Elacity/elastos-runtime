@@ -30,7 +30,7 @@ Usage:
   bash scripts/home-demo-local.sh --home /tmp/elastos-demo-fixed
 
 What it does:
-  1. Builds the repo-local elastos binary and home-cli.wasm (unless --skip-build)
+  1. Builds the repo-local elastos binary and Home CLI component (unless --skip-build)
   2. Builds a local full-screen chat microVM bundle and stages it into the temp home
   3. Installs into a clean temp home using the canonical maintainer DID + gateway
   4. Generates a local override manifest so `setup --profile demo` and
@@ -143,9 +143,8 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
     echo "[home-demo-local] build elastos binary"
     host_cargo build --manifest-path "$ROOT/elastos/Cargo.toml" -p elastos-server
 
-    echo "[home-demo-local] build Home CLI wasm"
-    host_cargo build --manifest-path "$ROOT/capsules/home-cli/Cargo.toml" --target wasm32-wasip1 --release
-    cp "$ROOT/capsules/home-cli/target/wasm32-wasip1/release/home-cli.wasm" "$ROOT/capsules/home-cli/home-cli.wasm"
+    echo "[home-demo-local] build Home CLI renderer"
+    host_cargo build --manifest-path "$ROOT/capsules/home-cli/Cargo.toml" --release --bin home-cli
 fi
 
 if [[ "$SKIP_BUILD" -eq 0 || ! -f "$ROOT/artifacts/chat.capsule.tar.gz" ]]; then

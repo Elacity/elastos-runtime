@@ -140,7 +140,7 @@ The product should speak in words ordinary people can predict, not in internal r
 
 That means:
 - `Apps` is the public term; `capsules` is the internal and developer term
-- `System` is the operating surface; `Settings` and `Storage` are sections inside it
+- `System` is the operating surface; its sections should represent real user controls, not placeholder implementation categories
 - raw paths, providers, and transport details should stay secondary to object identity
 - one visible concept should have one primary name
 
@@ -175,6 +175,19 @@ That means:
 - first-party capsules share one light token set unless a functional surface needs a scoped exception
 - colors should be named by role, not scattered as one-off literals
 - UI copy, color, and action semantics should stay aligned across Home, System, Inbox, Library, Documents, Chat Room, and games
+
+## 18. Capsules Are Isolated Execution Environments
+
+ElastOS should instantiate explicit, resource-bounded capsule instances, not
+launch applications with ambient host authority.
+
+That means:
+- every capsule instance is bound to a capsule identity, principal, session, capabilities, resources, and lifecycle
+- an executable capsule brings its application, language runtime or dependencies, and a minimal capsule-local system surface; the host OS is not its product ABI
+- capsule effects cross the capability-secured ElastOS Bus and provider plane, never raw host topology
+- mutable state is separate from the immutable capsule artifact and is mounted through rooted objects and WebSpaces
+- portability means independently verifiable and re-instantiable on compatible ElastOS nodes under current trust policy, not an immortal process or a bypass of revocation
+- shells, browser frames, routes, and app stores may project or distribute capsules, but they never become capsule identity or authority
 
 ## Decision Rule
 

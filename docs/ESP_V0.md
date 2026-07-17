@@ -1,15 +1,18 @@
 # ESP v0 - ElastOS Shell Protocol
 
-ESP is the small shell-facing contract over the Runtime facts that already
-exist in 0.5.0. A shell is a projection and consent surface. It does not mint
+ESP is the small shell-facing contract over the Runtime facts exposed by the
+0.6 development stack. A shell is a projection and consent surface. It does not mint
 authority, hold keys, bypass capability checks, dispatch providers directly, or
 invent provenance.
 
 The shared capsule web/CLI/fact/affordance/gate/audit model is documented in
 [`CAPSULE_INTERFACE_CONTRACT.md`](CAPSULE_INTERFACE_CONTRACT.md).
 
-This document is the smallest ESP v0 slice that is true on the current 0.5.0
-Runtime codebase.
+This document describes the ESP v0 slice implemented on the current 0.6
+development branch.
+
+The current terminal implementation is the `home-cli` shell. ESP is its
+protocol contract, not a separate product shell.
 
 ## Non-Negotiables
 
@@ -187,14 +190,17 @@ Current claim boundary:
 - SSE ESP projection streams are not product-ready; ESP v0 is the current
   initialize descriptor plus tested HTTP route/fact projections.
 - Shell marketplace is not implemented.
-- Full second-shell product UX is not complete until the operator-profile
-  manual pass is accepted, but the current browser-facing `home-cli` shell is no
-  longer a fake command form. Its product surface is a Runtime-owned PTY
+- Full second-shell product UX is not complete. The browser-facing `home-cli`
+  terminal shell is implemented and machine-tested, but its current commit
+  still needs operator-profile evidence; no additional framework shell is
+  implemented.
+- The browser-facing `home-cli` product surface is a Runtime-owned PTY
   terminal through explicit start/events/input/resize/close routes. Runtime owns
   the process, PTY, stream ticket, launch-token gate, dimensions, and lifecycle;
   `home-cli` renders PTY bytes with a capsule-local xterm.js terminal and sends
   raw terminal input. xterm renders PTY bytes without receiving host process
-  authority.
+  authority. Product acceptance requires exact-commit operator evidence, and
+  any later Home shell behavior change requires a new review before release.
 - No browser-side command projection remains. The browser wrapper does not
   fetch ESP/catalog facts, render a command form, or interpret shell commands;
   the `home-cli` capsule process owns the TUI/line-mode command surface through

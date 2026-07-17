@@ -3,11 +3,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-echo "[home-smoke] building Home CLI wasm capsule"
-(
-  cd "$REPO_ROOT/capsules/home-cli"
-  cargo build --target wasm32-wasip1 --release >/dev/null
-)
+echo "[home-smoke] building Home CLI renderer"
+cargo build --manifest-path "$REPO_ROOT/capsules/home-cli/Cargo.toml" --release --bin home-cli >/dev/null
 
 cd "$REPO_ROOT/elastos"
 
@@ -35,7 +32,7 @@ run_check() {
 
 run_check "default elastos opens Home" "" "q\n" "ElastOS Home"
 run_check "chat returns home" "home" "1\n/home\nq\n" "Returned home from Chat\\."
-run_check "mywebsite shows next-step notice" "home" "2\n\nq\n" "MyWebSite is empty\\.|MyWebSite is staged at localhost://MyWebSite\\.|MyWebSite is not ready: missing site-provider — run: elastos setup --profile demo"
+run_check "mywebsite shows next-step notice" "home" "2\n\nq\n" "MyWebSite is empty\\.|MyWebSite is staged at localhost://MyWebSite\\.|MyWebSite is not ready: missing site-provider -- run: elastos setup --profile demo"
 run_check "updates action returns home" "home" "3\nq\n" "Returned home from Updates\\.|Updates:|Updates could not complete the trusted-source check:.*You are back at Home\\."
 
 echo "[home-smoke] OK"

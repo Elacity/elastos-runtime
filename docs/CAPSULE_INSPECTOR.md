@@ -40,13 +40,22 @@ Self maps neatly onto the ElastOS runtime model:
 The Inspector projection returns metadata only:
 
 - identity: capsule/provider id, name, kind, state
-- manifest slice: schema, version, role, entrypoint, provided namespace
-- authority: capabilities, actions, operations, audit events
+- manifest slice: schema, version, role, entrypoint, provided namespace,
+  redacted before projection
+- provider authority: capabilities, actions, operations, audit events
 - provenance: CID plus signature presence/fingerprint
+- trust evidence: CID/signature declaration state, with verification fields null
+  until the Runtime has verified signer evidence
 - storage/carrier/process summary
+- granted capabilities, audit summary, spend budget, intent proof, and
+  audit-chain attestation are `null` until the Runtime has direct evidence for
+  them
 
 Raw signatures, bearer tokens, host paths, Carrier tickets, runtime stream
 descriptors, wallet/node authority, and mutation handles are not projected.
+Manifest-derived fields are redacted recursively so future interface schemas,
+authority metadata, or storage declarations cannot smuggle those values into
+Inspector facts.
 
 ## Gate Preview
 

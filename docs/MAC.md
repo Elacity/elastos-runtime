@@ -12,7 +12,7 @@ Install the host tools first:
 xcode-select --install
 brew install node e2fsprogs
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-rustup target add wasm32-wasip1
+rustup target add wasm32-unknown-unknown
 ```
 
 Then get the repo and build/install the source-home runtime into an isolated
@@ -33,10 +33,11 @@ PATH="$USER_HOME/.cargo/bin:/opt/homebrew/bin:$PATH" \
 scripts/setup-source-home.sh
 ```
 
-`setup-source-home.sh` builds the runtime server, native providers, first-party
-WASM capsules, Browser helper scripts, Browser source-home provider config, the
-macOS Browser VZ supervisor, and the local Kubo backend used by Library and
-Documents publish. It also signs the installed VZ supervisor on macOS.
+`setup-source-home.sh` builds the runtime server, native providers,
+WASM Components, runtime-projection browser assets, Browser helper
+scripts, Browser source-home provider config, the macOS Browser VZ supervisor,
+and the local Kubo backend used by Library and Documents publish. It also signs
+the installed VZ supervisor on macOS.
 
 For Home/passkey use without Browser VM proof artifacts, start the gateway
 directly:
@@ -113,7 +114,7 @@ macOS. To sign a rebuilt helper manually:
 
 ```bash
 scripts/dev/sign-elastos-vz/sign.sh \
-  "/Users/operator/elastos-mac-test-home/Library/Application Support/elastos/bin/browser-vz-engine-supervisor"
+  "$MAC_TEST_HOME/Library/Application Support/elastos/bin/browser-vz-engine-supervisor"
 ```
 
 ## Browser VM Proof

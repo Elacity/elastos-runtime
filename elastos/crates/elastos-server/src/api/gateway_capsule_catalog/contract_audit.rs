@@ -663,7 +663,7 @@ fn changed_top_level_fields(
 
 fn execution_boundary(manifest: &CapsuleManifest) -> &'static str {
     match manifest.execution {
-        Some(CapsuleExecution::Component) => "component-bus",
+        Some(CapsuleExecution::Component) => "component",
         Some(CapsuleExecution::WebProjection) => "runtime-projection",
         Some(CapsuleExecution::Microvm) => "runtime-supervised-microvm",
         Some(CapsuleExecution::Data) | None if manifest.role == CapsuleRole::Content => {

@@ -8,9 +8,6 @@ node_bin="${ELASTOS_NODE_BIN:-}"
 if [[ -z "$node_bin" ]]; then
   node_bin="$(command -v node 2>/dev/null || true)"
 fi
-if [[ -z "$node_bin" ]]; then
-  node_bin="$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node"
-fi
 if [[ ! -x "$node_bin" ]]; then
   echo "node not found. Set ELASTOS_NODE_BIN to an executable node binary." >&2
   exit 2

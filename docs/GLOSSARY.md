@@ -92,7 +92,10 @@ Mutable state associated with a capsule instance or user, kept separate from the
 
 ## Shell
 
-A capsule with orchestrator capability. The shell decides whether to grant or deny capability requests from other capsules. Can be a CLI, TUI, or Home surface.
+A capsule that presents Runtime facts and emits typed user or agent intents. A
+shell may be graphical, CLI, or TUI, but its manifest role is not an authority
+grant. Runtime policy decides which shell identities may become active and
+authorizes every launch, approval, provider, and shell-switch effect.
 
 ## Provider
 

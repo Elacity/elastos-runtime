@@ -182,7 +182,7 @@ bash scripts/check-wci-alignment.sh
 # Current checkout: installed-style command behavior in a clean home
 just candidate-command-audit
 
-# Current 0.5.0 candidate through the canonical public installer/source path.
+# Current 0.5.0 baseline through the canonical public installer/source path.
 # Requires a staged or published 0.5.0-compatible manifest with the current
 # home profile and checksummed artifacts.
 ELASTOS_PUBLISHER_GATEWAY=<candidate-url> \
@@ -242,11 +242,11 @@ These are the default paths when XDG variables are unset. Runtime data honors `X
 `elastos setup` installs the components selected by the active profile. The
 default `home` profile installs the Home front door and the visible Home
 surfaces: System, People, Services, Browser, Wallet, Documents, Library,
-Marketplace, Archive, and Inbox. People is Home-owned state and UI, not a
-separate capsule. The profile also installs the local provider components needed
+Marketplace, Archive, and Inbox. People is installed as a separate app capsule;
+Home supplies only the shell and authorized launch. The profile also installs the local provider components needed
 by those surfaces, including DID, webspace, wallet/chain, Browser Engine, Net,
-and Exit providers. Demo chat-room, GBA, public-edge tunnel/cloudflared, IPFS/
-Kubo, and protected-content DRM providers are installed only when you choose a
+and Exit providers. Demo chat-room, GBA, public-edge tunnel/cloudflared,
+IPFS/Kubo, and protected-content DRM providers are installed only when you choose a
 broader profile or add them with `--with`.
 
 ## Policy Capsule

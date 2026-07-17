@@ -1,14 +1,27 @@
 #!/usr/bin/env node
 
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = new URL("../", import.meta.url);
 const repoRootPath = fileURLToPath(repoRoot);
+const RETIRED_HOME_ACTIVE_STATE_LITERAL = ['"active": "', 'home"'].join("");
+const RETIRED_HOME_GUI_OLD_IDENTIFIER = ["HOME_GUI", "LEGACY"].join("_");
+const RETIRED_HOME_GUI_LABEL_IDENTIFIER = ["HOME_GUI", "SHELL_LABEL"].join("_");
+const RETIRED_HOME_ALIAS_EXPRESSION = ['name === "', 'home"'].join("");
+const RETIRED_SYSTEM_HOME_ALIAS_RETURN = [
+  'return name === "',
+  'home" ? "home-gui" : name;',
+].join("");
 
 function read(path) {
   return readFileSync(new URL(path, repoRoot), "utf8");
+}
+
+function fileExists(path) {
+  return existsSync(new URL(path, repoRoot));
 }
 
 function readAll(paths) {
@@ -53,6 +66,76 @@ function assert(condition, message, details = undefined) {
   if (!condition) {
     const suffix = details ? `\n${JSON.stringify(details, null, 2)}` : "";
     throw new Error(`${message}${suffix}`);
+  }
+}
+
+function findManifestMethod(manifest, interfaceId, methodId) {
+  const iface = (manifest.interfaces || []).find((entry) => entry?.id === interfaceId);
+  if (!iface) {
+    return null;
+  }
+  return (iface.methods || []).find((method) => method?.id === methodId) || null;
+}
+
+function assertManifestMethod(manifests, capsule, interfaceId, methodId, metadata = {}) {
+  const manifest = manifests[capsule];
+  assert(manifest, `${capsule} manifest must be loaded`);
+  const method = findManifestMethod(manifest, interfaceId, methodId);
+  assert(
+    method,
+    `${capsule} must declare ${interfaceId}.${methodId}`,
+    { interfaces: (manifest.interfaces || []).map((entry) => entry?.id) },
+  );
+  for (const [key, value] of Object.entries(metadata)) {
+    assert(
+      method[key] === value,
+      `${capsule} ${interfaceId}.${methodId} must declare ${key}=${value}`,
+      method,
+    );
+  }
+}
+
+function assertManifestMethodSchema(manifests, capsule, interfaceId, methodId, schemaKey, schemaId, acceptedKind = undefined) {
+  const manifest = manifests[capsule];
+  assert(manifest, `${capsule} manifest must be loaded`);
+  const method = findManifestMethod(manifest, interfaceId, methodId);
+  assert(method, `${capsule} must declare ${interfaceId}.${methodId}`);
+  const schema = method[schemaKey];
+  assert(
+    schema && typeof schema === "object" && !Array.isArray(schema),
+    `${capsule} ${interfaceId}.${methodId} must declare ${schemaKey}`,
+    method,
+  );
+  assert(schema.schema === schemaId, `${capsule} ${interfaceId}.${methodId} must declare ${schemaKey}.schema=${schemaId}`, schema);
+  if (acceptedKind) {
+    assert(
+      Array.isArray(schema.accepts) && schema.accepts.some((entry) => entry?.kind === acceptedKind),
+      `${capsule} ${interfaceId}.${methodId} must declare accepted ${acceptedKind}`,
+      schema,
+    );
+  }
+}
+
+function assertManifestHasInterfaceMetadata(manifests, capsule) {
+  const manifest = manifests[capsule];
+  assert(manifest, `${capsule} manifest must be loaded`);
+  assert(
+    Array.isArray(manifest.interfaces) && manifest.interfaces.length > 0,
+    `${capsule} must declare at least one capsule interface`,
+    manifest,
+  );
+  for (const iface of manifest.interfaces) {
+    assert(iface.id && iface.version && iface.description, `${capsule} interface metadata is incomplete`, iface);
+    assert(
+      Array.isArray(iface.methods) && iface.methods.length > 0,
+      `${capsule} ${iface.id} must declare methods`,
+      iface,
+    );
+    for (const method of iface.methods) {
+      for (const key of ["id", "description", "risk", "approval", "audit", "resource", "operation"]) {
+        assert(method[key], `${capsule} ${iface.id} method must declare ${key}`, method);
+      }
+    }
   }
 }
 
@@ -375,9 +458,10 @@ function assertOrdinaryCapsulesDoNotReferenceRawBlockchainAuthority() {
   ]);
   const ordinaryRoles = new Set(["app", "viewer", "content"]);
   // System is the runtime-owned approval/diagnostic surface. Dedicated wallet
-  // connector capsules and the Browser shell are privileged adapter UIs, not
+  // connector capsules, Browser, and Home host are privileged adapter UIs, not
   // general app authority.
   const privilegedOrdinaryAuthorityUi = new Set([
+    "home",
     "system",
     "wallet-metamask",
     "wallet-unisat",
@@ -455,9 +539,6 @@ function assertOrdinaryCapsulesDoNotReferenceRawBlockchainAuthority() {
 
     const manifestText = readFileSync(manifestPath, "utf8");
     for (const [pattern, reason] of forbiddenAuthorityPatterns) {
-      if (name === "home" && reason === "direct browser wallet adapter authority") {
-        continue;
-      }
       if (manifestText.includes(pattern)) {
         failures.push(`${relativeToRepo(manifestPath)}: ${reason}`);
       }
@@ -476,9 +557,6 @@ function assertOrdinaryCapsulesDoNotReferenceRawBlockchainAuthority() {
       }
       const sourceText = readFileSync(source, "utf8");
       for (const [pattern, reason] of forbiddenAuthorityPatterns) {
-        if (name === "home" && reason === "direct browser wallet adapter authority") {
-          continue;
-        }
         if (sourceText.includes(pattern)) {
           failures.push(`${relativeToRepo(source)}: ${reason}`);
         }
@@ -581,11 +659,17 @@ const activeUiFiles = [
   "capsules/home/browser/index.html",
   "capsules/home/browser/style.css",
   "capsules/home/browser/home-shell-host.js",
+  "capsules/home/browser/service-worker.js",
+  "capsules/home-gui/browser/home-gui.js",
   "capsules/home-gui/browser/shell-surface.js",
   "capsules/home-gui/browser/shell-windows.js",
-  "capsules/home/browser/service-worker.js",
+  "capsules/home-gui/browser/style.css",
+  "capsules/home-cli/browser/index.html",
+  "capsules/home-cli/browser/home-cli.js",
+  "capsules/home-cli/browser/style.css",
   "capsules/system/browser/index.html",
   "capsules/system/browser/system.js",
+  "capsules/system/browser/esp-projections.mjs",
   "capsules/system/browser/style.css",
   "capsules/wallet-metamask/browser/index.html",
   "capsules/wallet-metamask/browser/wallet-metamask.js",
@@ -630,10 +714,12 @@ const activeUiFiles = [
   "capsules/gba-emulator/browser/index.html",
   "capsules/gba-emulator/browser/style.css",
   "capsules/gba-emulator/browser/emulator.js",
+  "capsules/gba-emulator/browser/gba-input.js",
 ];
 
 const activeHtmlFiles = [
   "capsules/home/browser/index.html",
+  "capsules/home-cli/browser/index.html",
   "capsules/system/browser/index.html",
   "capsules/wallet-metamask/browser/index.html",
   "capsules/wallet-unisat/browser/index.html",
@@ -675,7 +761,6 @@ for (const file of activeHtmlFiles) {
 
 const lightTokenFiles = [
   "capsules/chat-room/browser/style.css",
-  "capsules/gba-emulator/browser/style.css",
   "capsules/documents/browser/index.html",
 ];
 
@@ -723,6 +808,11 @@ for (const [token, value] of new Map([
 }
 
 const systemSettingsStyle = read("capsules/system/browser/style.css");
+const systemStyle = systemSettingsStyle;
+const system = read("capsules/system/browser/index.html");
+const systemJs = read("capsules/system/browser/system.js");
+const systemEspProjections = read("capsules/system/browser/esp-projections.mjs");
+const walletApiSource = read("capsules/wallet/browser/wallet-api.js");
 for (const [token, value] of new Map([
   ["--color-settings-bg", "#ffffff"],
   ["--color-settings-sidebar", "#f9f9f9"],
@@ -782,7 +872,7 @@ assert(
 );
 assert(
   shellHostStyle.includes("min-height: 100dvh;") &&
-    homeGuiStyle.includes('font-family: "Inter", "Segoe UI", "SF Pro Text", sans-serif;'),
+    homeGuiStyle.includes("font-family: \"Inter\", \"Segoe UI\", \"SF Pro Text\", sans-serif;"),
   "Home must use dynamic viewport height for mobile browsers",
 );
 assert(
@@ -811,26 +901,161 @@ assert(
   "Home active maximized windows must stack above Home chrome",
 );
 
-const shellIndex = readAll([
-  "capsules/home/browser/index.html",
-  "capsules/home-gui/browser/home-gui-template.html",
-]);
+const shellIndex = read("capsules/home/browser/index.html");
 const shellManifest = JSON.parse(
   read("capsules/home/browser/manifest.webmanifest"),
 );
 const shellServiceWorker = read("capsules/home/browser/service-worker.js");
+const homeGuiIndex = read("capsules/home-gui/browser/index.html");
+const homeGuiShell = read("capsules/home-gui/browser/home-gui-shell.js");
+const homeGuiTemplateHtml = read("capsules/home-gui/browser/home-gui-template.html");
+const homeGuiJs = read("capsules/home-gui/browser/home-gui.js");
+const homeGuiCore = read("capsules/home-gui/browser/shell-core.js");
 const shellSurface = read("capsules/home-gui/browser/shell-surface.js");
-const shellJs = readAll([
-  "capsules/home/browser/home-shell-host.js",
-  "capsules/home-gui/browser/home-gui.js",
-  "capsules/home-gui/browser/shell-core.js",
-  "capsules/home-gui/browser/shell-chrome.js",
-]);
-const shellCore = readAll([
-  "capsules/home/browser/shell-core.js",
-  "capsules/home-gui/browser/shell-core.js",
-]);
+const shellJs = read("capsules/home/browser/home-shell-host.js");
+const shellAuthJs = read("capsules/home/browser/shell-auth.js");
+const shellCore = read("capsules/home/browser/shell-core.js");
 const shellWindows = read("capsules/home-gui/browser/shell-windows.js");
+assert(
+  (homeGuiJs.match(/export function openHomeGuiTarget\(/g) || []).length === 1,
+  "Home GUI must expose one canonical open-target entrypoint",
+);
+const homeCapsuleManifest = JSON.parse(read("capsules/home/capsule.json"));
+const homeGuiCapsuleManifest = JSON.parse(read("capsules/home-gui/capsule.json"));
+const homeCliManifest = JSON.parse(read("capsules/home-cli/capsule.json"));
+const browserCapsuleManifest = JSON.parse(read("capsules/browser/capsule.json"));
+const walletCapsuleManifest = JSON.parse(read("capsules/wallet/capsule.json"));
+const inboxCapsuleManifest = JSON.parse(read("capsules/inbox/capsule.json"));
+const servicesCapsuleManifest = JSON.parse(read("capsules/services/capsule.json"));
+const peopleCapsuleManifest = JSON.parse(read("capsules/people/capsule.json"));
+const systemCapsuleManifest = JSON.parse(read("capsules/system/capsule.json"));
+const appSurfaceCapsuleManifests = Object.fromEntries(
+  [
+    "agent",
+    "archive-manager",
+    "browser",
+    "chat",
+    "chat-room",
+    "documents",
+    "gba-emulator",
+    "gba-ucity",
+    "home",
+    "home-cli",
+    "inbox",
+    "library",
+    "marketplace",
+    "people",
+    "services",
+    "system",
+    "wallet",
+    "wallet-metamask",
+    "wallet-unisat",
+    "wallet-walletconnect",
+  ].map((name) => [name, JSON.parse(read(`capsules/${name}/capsule.json`))]),
+);
+const providerCapsuleManifests = Object.fromEntries(
+  [
+    "ai-provider",
+    "availability-provider",
+    "browser-engine-adapter",
+    "chain-provider",
+    "content-block-graph-provider",
+    "decrypt-provider",
+    "did-provider",
+    "drm-provider",
+    "exit-provider",
+    "ipfs-provider",
+    "key-provider",
+    "llama-provider",
+    "net-provider",
+    "object-provider",
+    "operator-drive-adapter",
+    "rights-provider",
+    "tunnel-provider",
+    "wallet-provider",
+    "webspace-provider",
+  ].map((name) => [name, JSON.parse(read(`capsules/${name}/capsule.json`))]),
+);
+const firstPartyCapsuleManifests = {
+  ...appSurfaceCapsuleManifests,
+  ...providerCapsuleManifests,
+};
+const coreCapsuleManifests = {
+  home: homeCapsuleManifest,
+  "home-gui": homeGuiCapsuleManifest,
+  "home-cli": homeCliManifest,
+  browser: browserCapsuleManifest,
+  wallet: walletCapsuleManifest,
+  inbox: inboxCapsuleManifest,
+  people: peopleCapsuleManifest,
+  services: servicesCapsuleManifest,
+  system: systemCapsuleManifest,
+};
+const homeCliIndex = read("capsules/home-cli/browser/index.html");
+const homeCliJs = read("capsules/home-cli/browser/home-cli.js");
+const homeCliStyle = read("capsules/home-cli/browser/style.css");
+const homeCliXtermVendorReadme = read("capsules/home-cli/browser/vendor/xterm/README.md");
+const homeCliCommandContract = read("capsules/home-cli/browser/commands.json");
+const homeCliCommandContractJson = JSON.parse(homeCliCommandContract);
+const homeCliContractCommands = Array.isArray(homeCliCommandContractJson.commands)
+  ? homeCliCommandContractJson.commands
+  : [];
+function homeCliContractCommand(name) {
+  return homeCliContractCommands.find((command) => command?.name === name) || null;
+}
+const homeCliExpectedCommands = [
+  "home",
+  "inbox",
+  "people",
+  "apps",
+  "system",
+  "mywebsite",
+  "wallet",
+  "exits",
+  "invoke",
+  "debug",
+  "refresh",
+  "help",
+  "exit",
+];
+const homeCliRetiredCommands = [
+  "open",
+  "use",
+  "shells",
+  "switch",
+  "home-gui",
+  "home-cli",
+  "esp",
+  "schemas",
+  "facts",
+  "search",
+  "copy",
+  "clear",
+  "history",
+  "capsules",
+  "inspect",
+  "affordances",
+  "gates",
+  "audit",
+  "services",
+  "browser",
+  "terminal",
+  "contract",
+];
+function homeCliCommandNames() {
+  return homeCliContractCommands.map((command) => command?.name).filter(Boolean);
+}
+function homeCliCommandHasSurface(name, surface) {
+  return homeCliContractCommand(name)?.surface?.includes(surface) === true;
+}
+const homeCliBrowserSmoke = read("scripts/home-cli-browser-smoke.mjs");
+const homeShellBridgeSmoke = read("scripts/home-shell-bridge-smoke.mjs");
+const homeShellNoHintBootSmoke = read("scripts/home-shell-no-hint-boot-smoke.mjs");
+const homeShellStaleHintBootSmoke = read("scripts/home-shell-stale-hint-boot-smoke.mjs");
+const homeShellAuthGateSmoke = read("scripts/home-shell-auth-gate-smoke.mjs");
+const homeShellRecoverySmoke = read("scripts/home-shell-recovery-smoke.mjs");
+const homeShellSwitchbackRecoverySmoke = read("scripts/home-shell-switchback-recovery-smoke.mjs");
+const homeShellSystemSwitchSmoke = read("scripts/home-shell-system-switch-smoke.mjs");
 const homeShellRegressionSmoke = read("scripts/home-shell-regression-smoke.mjs");
 const servicesCapsule = read("capsules/services/capsule.json");
 const peopleCapsule = read("capsules/people/capsule.json");
@@ -845,7 +1070,18 @@ const shellWindowGeometry = read(
 );
 const shellCmd = read("elastos/crates/elastos-server/src/shell_cmd.rs");
 const homeCmd = read("elastos/crates/elastos-server/src/home_cmd.rs");
-const homeCli = read("capsules/home-cli/src/main.rs");
+const homeCliMain = [
+  "main.rs",
+  "runtime_io.rs",
+  "line_views.rs",
+  "tui_state.rs",
+  "tui_render.rs",
+  "view_models.rs",
+].map((file) => read(`capsules/home-cli/src/${file}`)).join("\n");
+const homeCliTerminal = read("capsules/home-cli/src/terminal.rs");
+const homeCliText = read("capsules/home-cli/src/text.rs");
+const homeCliTests = read("capsules/home-cli/src/tests.rs");
+const homeCli = [homeCliMain, homeCliTerminal, homeCliText, homeCliTests].join("\n");
 const chatCarrier = read("capsules/chat/src/carrier.rs");
 const carrierService = read("elastos/crates/elastos-server/src/carrier_service.rs");
 const localhostProvider = read("elastos/capsules/localhost-provider/src/main.rs");
@@ -863,12 +1099,15 @@ const roomService = read("elastos/crates/elastos-server/src/room_service.rs");
 const gatewayApi = readAll([
   "elastos/crates/elastos-server/src/api/gateway.rs",
   "elastos/crates/elastos-server/src/api/gateway_home_runtime.rs",
+  "elastos/crates/elastos-server/src/api/gateway_esp.rs",
   "elastos/crates/elastos-server/src/api/gateway_home_system.rs",
+  "elastos/crates/elastos-server/src/api/gateway_home_terminal.rs",
   "elastos/crates/elastos-server/src/api/gateway_home_token.rs",
   "elastos/crates/elastos-server/src/api/gateway_inbox.rs",
   "elastos/crates/elastos-server/src/api/gateway_inspect_actions.rs",
   "elastos/crates/elastos-server/src/api/gateway_models.rs",
   "elastos/crates/elastos-server/src/api/gateway_capsule_catalog.rs",
+  "elastos/crates/elastos-server/src/api/gateway_capsule_catalog/read_model.rs",
   "elastos/crates/elastos-server/src/api/gateway_provider_proxy.rs",
   "elastos/crates/elastos-server/src/api/gateway_room.rs",
   "elastos/crates/elastos-server/src/api/gateway_server.rs",
@@ -884,8 +1123,10 @@ const gatewayApi = readAll([
 const gatewayHomeSystemTests = read(
   "elastos/crates/elastos-server/src/api/gateway_tests/home_system.rs",
 );
+const gatewayHomeTerminal = read(
+  "elastos/crates/elastos-server/src/api/gateway_home_terminal.rs",
+);
 const gatewayInboxApi = read("elastos/crates/elastos-server/src/api/gateway_inbox.rs");
-const gatewayWalletAppApi = read("elastos/crates/elastos-server/src/api/gateway_wallet_app.rs");
 const gatewayBrowserApi = readAll([
   "elastos/crates/elastos-server/src/api/gateway_browser.rs",
   "elastos/crates/elastos-server/src/api/gateway_browser_engine.rs",
@@ -940,16 +1181,54 @@ const capabilityHandler = read(
 const providerResource = read(
   "elastos/crates/elastos-server/src/provider_resource.rs",
 );
-const inspectorProvider = readAll([
+const inspectorProviderGlue = read(
   "elastos/crates/elastos-server/src/inspect_provider/mod.rs",
+);
+const inspectorProviderSources = read(
   "elastos/crates/elastos-server/src/inspect_provider/sources.rs",
+);
+const inspectorProviderProjection = read(
   "elastos/crates/elastos-server/src/inspect_provider/projection.rs",
+);
+const inspectorProviderPlanning = read(
   "elastos/crates/elastos-server/src/inspect_provider/planning.rs",
+);
+const inspectorProviderDispatch = read(
   "elastos/crates/elastos-server/src/inspect_provider/dispatch.rs",
-]);
+);
+const inspectorProvider = [
+  inspectorProviderGlue,
+  inspectorProviderSources,
+  inspectorProviderProjection,
+  inspectorProviderPlanning,
+  inspectorProviderDispatch,
+].join("\n");
 const inspectorCore = read("elastos/crates/elastos-runtime/src/inspect/mod.rs");
 const capsuleInspectorDocs = read("docs/CAPSULE_INSPECTOR.md");
 const inspectorTestingDocs = read("docs/INSPECTOR_TESTING.md");
+const espDoc = read("docs/ESP_V0.md");
+const espBoundaryMap = read("docs/SHELL_ESP_BOUNDARY_MAP.md");
+const homeShellHostContract = read("docs/HOME_SHELL_HOST_CONTRACT.md");
+const homeShellManualUxReport = read("scripts/home-shell-manual-ux-report.mjs");
+const homeShellObjectiveAudit = read("scripts/home-shell-objective-audit.mjs");
+const capsuleInterfaceContract = read("docs/CAPSULE_INTERFACE_CONTRACT.md");
+const espReadme = read("elastos/esp/README.md");
+const espTypes = read("elastos/esp/esp_v0.ts");
+const espPackageJson = read("elastos/esp/package.json");
+const espPackageLock = read("elastos/esp/package-lock.json");
+const espPackageCheck = read("elastos/esp/check-esp-v0.mjs");
+const espIndex = read("elastos/esp/index.ts");
+const espAuthority = read("elastos/esp/authority.ts");
+const espTrust = read("elastos/esp/trust.ts");
+const espCustody = read("elastos/esp/custody.ts");
+const espConsent = read("elastos/esp/consent.ts");
+const shellPickerProjection = read("elastos/esp/shell_picker.ts");
+const espCapsuleDetail = read("elastos/esp/capsule_detail.ts");
+const espHomeFleet = read("elastos/esp/home_fleet.ts");
+const espAuditViews = read("elastos/esp/audit_views.ts");
+const espProjectionTests = read("elastos/esp/projections.test.mjs");
+const systemEspProjectionCheck = read("scripts/check-system-esp-projections.mjs");
+const docsIndex = read("docs/README.md");
 const invokeCore = read("elastos/crates/elastos-runtime/src/invoke/mod.rs");
 const vmProvider = read("elastos/crates/elastos-server/src/vm_provider.rs");
 const notifications = read(
@@ -964,7 +1243,7 @@ const runtimeControl = read(
   "elastos/crates/elastos-server/src/runtime_control.rs",
 );
 const serverInfra = read("elastos/crates/elastos-server/src/server_infra.rs");
-const wasmProvider = read(
+const componentProvider = read(
   "elastos/crates/elastos-compute/src/providers/component.rs",
 );
 const protectedContent = read(
@@ -1205,6 +1484,8 @@ const gatewayTests = readAll([
   "elastos/crates/elastos-server/src/api/gateway_tests/support_providers.rs",
   "elastos/crates/elastos-server/src/api/gateway_tests/support_runtime.rs",
   "elastos/crates/elastos-server/src/api/gateway_tests/documents.rs",
+  "elastos/crates/elastos-server/src/api/gateway_tests/esp.rs",
+  "elastos/crates/elastos-server/src/api/gateway_tests/gba.rs",
   "elastos/crates/elastos-server/src/api/gateway_tests/home_system.rs",
   "elastos/crates/elastos-server/src/api/gateway_tests/inspect.rs",
   "elastos/crates/elastos-server/src/api/gateway_tests/recovery.rs",
@@ -1255,14 +1536,34 @@ assert(
   "Linux source-home restart must preserve safe listener ownership checks and ok=false failure receipts",
 );
 const debugPolicy = read("DEBUG.md");
+const gbaDemoSmoke = read("scripts/gba-demo-smoke.sh");
+const gbaLiveSmoke = read("scripts/gba-live-smoke.mjs");
+const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
+const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
+const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260715a";
+for (const [file, source] of [
+  ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
+  ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
+  ["home-shell-no-hint-boot-smoke.mjs", homeShellNoHintBootSmoke],
+  ["home-shell-recovery-smoke.mjs", homeShellRecoverySmoke],
+  ["home-shell-regression-smoke.mjs", homeShellRegressionSmoke],
+  ["home-shell-stale-hint-boot-smoke.mjs", homeShellStaleHintBootSmoke],
+  ["home-shell-switchback-recovery-smoke.mjs", homeShellSwitchbackRecoverySmoke],
+  ["home-shell-system-switch-smoke.mjs", homeShellSystemSwitchSmoke],
+]) {
+  assert(
+    source.includes(`const moduleVersion = "${homeAssetVersion}";`),
+    `${file} must load the same Home module graph as the production shell`,
+  );
+}
 assertUsersSelfReferencesAreApproved();
 assert(
-  shellIndex.includes('role="listbox"'),
+  homeGuiTemplateHtml.includes('role="listbox"'),
   "Home items must expose keyboard-selectable structure",
 );
 assert(
-  shellIndex.includes('aria-label="Home items"'),
+  homeGuiTemplateHtml.includes('aria-label="Home items"'),
   "Home items list must be labeled",
 );
 assert(
@@ -1274,15 +1575,15 @@ assert(
   "Home readiness state must not preserve shell naming",
 );
 assert(
-  shellIndex.includes('data-action="minimize"'),
+  homeGuiTemplateHtml.includes('data-action="minimize"'),
   "Window minimize action must remain explicit",
 );
 assert(
-  shellIndex.includes('data-action="maximize"'),
+  homeGuiTemplateHtml.includes('data-action="maximize"'),
   "Window maximize action must remain explicit",
 );
 assert(
-  shellIndex.includes('data-action="close"'),
+  homeGuiTemplateHtml.includes('data-action="close"'),
   "Window close action must remain explicit",
 );
 assert(
@@ -1298,7 +1599,7 @@ assert(
   "Home PWA metadata must include mobile-web-app-capable",
 );
 assert(
-  shellIndex.includes('id="toolbar-fullscreen"'),
+  homeGuiTemplateHtml.includes('id="toolbar-fullscreen"'),
   "Home must expose a fullscreen control in the top toolbar",
 );
 assert(
@@ -1379,11 +1680,12 @@ assert(
   "Home runtime status must not preserve data-shell-status",
 );
 assert(
-  shellJs.includes("toggleHomeGuiFullscreen"),
-  "Home fullscreen control must be wired through Home GUI",
+  homeGuiJs.includes("toggleHomeGuiFullscreen") &&
+    !shellJs.includes("toggleShellFullscreen"),
+  "Home fullscreen control must be wired through the home-gui facade",
 );
 assert(
-  shellCore.includes("toolbarFullscreenButton"),
+  homeGuiCore.includes("toolbarFullscreenButton"),
   "Home fullscreen control must be exported by shell-core",
 );
 assert(
@@ -1425,8 +1727,9 @@ assert(
   "Home must allow Browser to route file chooser requests into Library through an explicit source gate",
 );
 assert(
-  shellJs.includes('library: new Set(["archive-manager", "documents", "gba-emulator", "library"])'),
-  "Home must keep Library viewer routing source-gated",
+  shellJs.includes('"gba-emulator": new Set(["library"])') &&
+    shellJs.includes('library: new Set(["archive-manager", "documents", "gba-emulator", "library"])'),
+  "Home must allow GBA to open Library and Library to return compatible ROMs while keeping both directions source-gated",
 );
 assert(
   shellIndex.includes(`home-shell-host.js?v=${homeAssetVersion}`),
@@ -1437,24 +1740,43 @@ assert(
   "Home stylesheet must cache-bust after shell browser changes",
 );
 assert(
+  !shellIndex.includes(`/apps/home-gui/style.css?v=${homeAssetVersion}`) &&
+    homeGuiIndex.includes(`./style.css?v=${homeAssetVersion}`) &&
+    homeGuiIndex.includes(`./home-gui-shell.js?v=${homeAssetVersion}`),
+  "Home GUI must own its document, stylesheet, and entry module on its isolated capsule origin",
+);
+assert(
+  !shellJs.includes("home-gui/browser") &&
+    !shellJs.includes("import(HOME_GUI_MODULE_URL)") &&
+    shellJs.includes('await launchHomeTarget(target, { shell_mode: "root" })') &&
+    homeGuiShell.includes('postToHome({ type: "home:shell-ready" })'),
+  "Home must launch Home GUI as an isolated shell document instead of importing GUI code into its trusted DOM",
+);
+assert(
   shellJs.includes(`shell-core.js?v=${homeAssetVersion}`),
-  "Home shell.js must import the current shell-core module instance",
+  "Home home-shell-host.js must import the current shell-core module instance",
 );
 assert(
-  shellJs.includes(`shell-surface.js?v=${homeAssetVersion}`),
-  "Home must not mix old shell-surface module instances with current shell-windows",
+  !shellJs.includes("shell-surface.js"),
+  "Home shell host must not statically import GUI shell-surface",
 );
 assert(
-  shellJs.includes(`shell-windows.js?v=${homeAssetVersion}`),
-  "Home shell.js must import the current shell-windows module instance",
+  !shellJs.includes("shell-windows.js"),
+  "Home home-shell-host.js must not statically import the GUI window manager",
 );
 assert(
-  shellSurface.includes(`shell-core.js?v=${homeAssetVersion}`),
-  "Home shell-surface must import the current shell-core module instance",
+  homeGuiJs.includes(`./shell-core.js?v=${homeAssetVersion}`) &&
+    homeGuiJs.includes(`./shell-surface.js?v=${homeAssetVersion}`) &&
+    homeGuiJs.includes(`./shell-windows.js?v=${homeAssetVersion}`),
+  "Home home-gui facade must import the current GUI surface/window module instances",
 );
 assert(
-  shellSurface.includes(`shell-windows.js?v=${homeAssetVersion}`),
-  "Home shell-surface must import the same shell-windows module instance as shell.js",
+  shellSurface.includes(`./shell-core.js?v=${homeAssetVersion}`),
+  "Home shell-surface must import the home-gui-owned shell-core module instance",
+);
+assert(
+  shellSurface.includes(`./shell-windows.js?v=${homeAssetVersion}`),
+  "Home shell-surface must import the home-gui-owned shell-windows module",
 );
 assert(
   !shellJs.includes("prebootBrowserTarget") &&
@@ -1466,29 +1788,29 @@ assert(
   "Home must not auto-start hidden Browser preboot VMs; Browser warm sessions need an explicit Runtime/provider-owned contract",
 );
 assert(
-  !shellCore.includes("TARGET_TITLE_OVERRIDES") &&
-    shellCore.includes("export function canonicalTargetTitle") &&
-    shellCore.includes("title: normalizeText(target?.title) || target?.target") &&
-    shellCore.includes("return normalizedTitle || targetId") &&
-    !shellCore.includes("STALE_TARGET_TITLES") &&
+  !homeGuiCore.includes("TARGET_TITLE_OVERRIDES") &&
+    homeGuiCore.includes("export function canonicalTargetTitle") &&
+    homeGuiCore.includes("title: normalizeText(target?.title) || target?.target") &&
+    homeGuiCore.includes("return normalizedTitle || targetId") &&
+    !homeGuiCore.includes("STALE_TARGET_TITLES") &&
     shellWindows.includes("canonicalTargetTitle(launched.target, launched.title)"),
   "Home must preserve Runtime catalog titles without local target-name overrides",
 );
 assert(
-  shellCore.includes("desktopPositionOverlapsAny") &&
-    shellCore.includes("nextAvailableDesktopPosition") &&
-    shellCore.includes("occupiedDesktopPositionsExcept(targetId)") &&
-    shellCore.includes("DESKTOP_ICON_WIDTH") &&
-    shellCore.includes("DESKTOP_ICON_HEIGHT") &&
+  homeGuiCore.includes("desktopPositionOverlapsAny") &&
+    homeGuiCore.includes("nextAvailableDesktopPosition") &&
+    homeGuiCore.includes("occupiedDesktopPositionsExcept(targetId)") &&
+    homeGuiCore.includes("DESKTOP_ICON_WIDTH") &&
+    homeGuiCore.includes("DESKTOP_ICON_HEIGHT") &&
     homeShellRegressionSmoke.includes("People and Wallet desktop positions still overlap") &&
     homeShellRegressionSmoke.includes("de-collided desktop layout was not saved"),
   "Home desktop layout must de-collide persisted shortcut positions so People cannot reload on top of Wallet",
 );
 assert(
-  shellWindows.includes("glyphTarget || id") &&
+    shellWindows.includes("glyphTarget || id") &&
     shellWindows.includes("glyphTarget: launched.target") &&
-    shellCore.includes("targetId === PEOPLE_TARGET_ID") &&
-    shellCore.includes('<circle cx="9" cy="8" r="3" />'),
+    homeGuiCore.includes("targetId === PEOPLE_TARGET_ID") &&
+    homeGuiCore.includes('<circle cx="9" cy="8" r="3" />'),
   "Home window titlebar glyphs must use app target identity, and People must not fall back to the generic app glyph",
 );
 assert(
@@ -1504,6 +1826,19 @@ assert(
   "Home must grant clipboard-read/write explicitly and only to the Browser iframe",
 );
 assert(
+    shellJs.includes('const PASSKEY_AUTHORITY_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"])') &&
+    shellJs.includes('data.type === "home:request-passkey-authority"') &&
+    shellJs.includes("const launched = await launchHomeTarget(context.targetId, {}, { operation, request })") &&
+    shellJs.includes("const scopedToken = homeLaunchTokenFromRoute") &&
+    !shellJs.includes(".then((homeToken) => reply({ homeToken }))") &&
+    shellAuthJs.includes("export function requestPasskeyHomeAuthority()") &&
+    inboxStyle.includes('type: "home:request-passkey-authority"') &&
+    systemJs.includes('type: "home:request-passkey-authority"') &&
+    walletApiSource.includes('type: "home:request-passkey-authority"') &&
+    !shellWindows.includes("publickey-credentials-get"),
+  "Fresh passkey proof must run in the trusted Home host and return only capsule-scoped authority to validated Inbox, System, or Wallet frames",
+);
+assert(
   shellJs.includes('scope === "wallet"') &&
     shellJs.includes('kind === "wallet.requests.changed"') &&
     shellJs.includes("hadCursor || broadcastInitial || events.length > 0"),
@@ -1516,8 +1851,8 @@ assert(
   "Home Inbox bell must prefer semantic notification counts over entries length so approval alerts survive payload-shape changes",
 );
 assert(
-  shellIndex.includes('id="home-notification-toast"') &&
-    shellJs.includes("maybeShowWalletApprovalToast(previous, summary)") &&
+  homeGuiTemplateHtml.includes('id="home-notification-toast"') &&
+    homeGuiJs.includes("maybeShowWalletApprovalToast(previous, summary)") &&
     shellSurface.includes("wallet_approval_request") &&
     shellSurface.includes('openTarget("inbox")'),
   "Home must surface new Wallet approval requests as a desktop toast that opens Inbox",
@@ -1540,6 +1875,13 @@ const persistSessionBlock = sourceBlock(
 assert(
   persistSessionBlock.includes("saveShellSessionState({ root_shell: rootShell, windows: [] });"),
   "Home must persist an explicit empty session after the last window closes",
+);
+assert(
+  persistSessionBlock.includes("root_shell: rootShell") &&
+    shellWindows.includes("function currentRootShellSessionId()") &&
+    shellWindows.includes("storedSessionRootShell(storedSession)") &&
+    shellWindows.includes("{ rootShell: currentRootShellSessionId() }"),
+  "Home window session persistence must mark the owning root shell and restore only into the matching shell",
 );
 assert(
   !persistSessionBlock.includes("clearShellSessionState();"),
@@ -1566,12 +1908,12 @@ assert(
   "Home desktop drag must suppress text selection while moving icons",
 );
 assert(
-  shellCore.includes("desktopHidden: []"),
+  homeGuiCore.includes("desktopHidden: []"),
   "Home layout state must track per-target desktop icon removal",
 );
 assert(
-  shellCore.includes("addTargetToDesktop") &&
-    shellCore.includes("removeTargetFromDesktop"),
+  homeGuiCore.includes("addTargetToDesktop") &&
+    homeGuiCore.includes("removeTargetFromDesktop"),
   "Home must support reversible desktop icon presence",
 );
 assert(
@@ -1630,20 +1972,20 @@ assert(
   "Home must broker Chat Room attachment payloads into Documents without host-browser navigation",
 );
 const deliverMessageToTargetFrameBlock = sourceBlock(
-  shellJs,
-  "export function deliverMessageToHomeGuiTargetFrame",
-  "Home target message delivery",
+  homeGuiJs,
+  "function deliverMessageToHomeGuiTargetFrame",
+  "Home GUI target message delivery",
 );
 assert(
   deliverMessageToTargetFrameBlock.includes("options = null") &&
     deliverMessageToTargetFrameBlock.includes("if (options?.focus === true)") &&
     deliverMessageToTargetFrameBlock.includes("focusWindow(entry.id);"),
-  "Home generic target delivery must only focus a recipient when explicitly requested",
+  "Home GUI generic target delivery must only focus a recipient when explicitly requested",
 );
 const openTargetWithPayloadBlock = sourceBlock(
-  shellJs,
-  "export function openHomeGuiTargetWithPayload",
-  "Home open-target-with-payload delivery",
+  homeGuiJs,
+  "function openHomeGuiTargetWithPayload",
+  "Home GUI open-target-with-payload delivery",
 );
 assert(
   shellJs.includes("deliverMessageToHomeGuiTargetFrame(target, payload)") &&
@@ -1652,7 +1994,7 @@ assert(
         /deliverMessageToHomeGuiTargetFrame\(target, payload, \{ focus: true \}\)/g,
       ) || []
     ).length >= 2,
-  "Home must keep deliver-to-target background-only while open-target-with-payload focuses the opened app",
+  "Home host must keep deliver-to-target background-only while Home GUI focuses open-target-with-payload recipients",
 );
 assert(
   shellJs.includes('new Set(["documents", "chat-room"])'),
@@ -1691,14 +2033,18 @@ assert(
     homeCmd.includes("issue_capsule_launch_token(&data_dir, PEOPLE_CAPSULE_NAME)"),
   "People must be a standalone app capsule while Home remains only its launch and message host",
 );
+
 assert(
   servicesCapsule.includes('"name": "services"') &&
     servicesCapsule.includes('"role": "app"') &&
     servicesIndex.includes("Services · ElastOS") &&
     servicesIndex.includes("This device") &&
     servicesIndex.includes("From People") &&
+    servicesIndex.includes("Shared from this device") &&
+    servicesIndex.includes("Available from People") &&
     servicesIndex.includes("mine-services") &&
     servicesIndex.includes("other-services") &&
+    servicesIndex.includes("services-20260626a") &&
     servicesIndex.includes("services-20260711i") &&
     servicesScript.includes("/api/apps/services/summary") &&
     servicesScript.includes("/api/apps/services/offers") &&
@@ -1782,7 +2128,7 @@ assert(
     gatewayApi.includes("HOME_SERVICES_REQUESTS_TOPIC") &&
     gatewayApi.includes("service-approve-request:") &&
     shellJs.includes('services: new Set(["browser", "chat-room"])'),
-  "Services must be a first-party capsule with Mine/Others Browser Engine + Browser Exit service UI and a scoped summary API",
+  "Services must be a first-party capsule with plain device/People Browser Engine + Browser Exit UI and a scoped summary API",
 );
 for (const staleServicesToken of [
   "Services needs a signed Home launch token",
@@ -2321,6 +2667,14 @@ assert(
   !vmProvider.includes("Users/self"),
   "VM provider path-shaping tests must not preserve shared Users/self storage examples",
 );
+assert(
+  viewerGatewayApi.includes("read_viewer_library_object_bytes(") &&
+    viewerGatewayApi.includes("viewer_storage_root_uri(") &&
+    viewerGatewayApi.includes("principal_scoped_storage_uri(") &&
+    !fileExists("elastos/crates/elastos-server/src/api/gateway_gba.rs") &&
+    !fileExists("capsules/gba-engine-provider"),
+  "GBA ROM and save access must use generic Runtime viewer routes without a host engine provider",
+);
 assertProtectedPrincipalRootAccessor(
   documentsProvider,
   "fn documents_load_body(",
@@ -2349,8 +2703,750 @@ assert(
   gatewayApi.includes("is_unencrypted_principal_root_state") &&
     gatewayTests.includes(
       "test_home_browser_state_resets_plaintext_for_protected_principal_root",
+    ) &&
+    gatewayTests.includes(
+      "test_home_summary_ignores_services_state_left_unencrypted_before_root_protection",
+    ) &&
+    gatewayTests.includes("test_home_summary_ignores_invalid_protected_services_state"),
+  "Home must reset untrusted or invalid principal-root UI state without accepting it",
+);
+assertProtectedPrincipalRootAccessor(
+  gatewayApi,
+  "fn home_active_shell_state(\n",
+  "read_principal_root_object(",
+  "Home active shell state reads",
+);
+assertProtectedPrincipalRootAccessor(
+  gatewayApi,
+  "fn home_save_active_shell(",
+  "write_principal_root_object(",
+  "Home active shell state writes",
+);
+assert(
+  gatewayApi.includes('"/api/apps/home/active-shell"') &&
+    gatewayApi.includes("active_shell: HomeActiveShellSummary") &&
+    gatewayApi.includes("elastos.home.active-shell/v1") &&
+    gatewayApi.includes("capsule_catalog_summary(data_dir)") &&
+    gatewayApi.includes("capsule.role == CapsuleRole::Shell && capsule.launchable") &&
+    gatewayApi.includes("let launchable = target.is_some()") &&
+    gatewayApi.includes("capsule.name != HOME_CAPSULE_ID") &&
+    gatewayApi.includes("role.is_shell_launchable()") &&
+    gatewayApi.includes("app.role != CapsuleRole::Shell") &&
+    gatewayApi.includes("pub(super) fn home_launch_targets") &&
+    gatewayApi.includes("home_launch_targets(data_dir)") &&
+    gatewayApi.includes("SYSTEM_CAPSULE_ID.to_string()") &&
+    gatewayApi.includes("fn home_active_shell_saved_state_name(active: &str) -> String") &&
+    gatewayApi.includes("HOME_GUI_SHELL_ID.to_string()") &&
+    gatewayApi.includes("let active = active.trim();") &&
+    gatewayApi.includes('"failed to repair obsolete Home active shell state"') &&
+    gatewayApi.includes("pub(super) async fn home_summary") &&
+    gatewayApi.includes("let context = require_home_active_shell_token_context(&state.data_dir, &headers).ok();") &&
+    gatewayApi.includes("if let Ok(context) = require_home_token_context(data_dir, headers)") &&
+    gatewayApi.includes("require_home_active_shell_update_token_context(&state.data_dir, &headers)") &&
+    gatewayApi.includes("fn require_home_active_shell_update_token_context(") &&
+    gatewayTests.includes("test_home_active_shell_uses_catalog_shell_candidates") &&
+    gatewayTests.includes("./home-shell-host.js") &&
+    gatewayTests.includes('/apps/home/home-shell-host.js') &&
+    gatewayTests.includes('"home-cli"') &&
+    gatewayTests.includes('std::collections::BTreeSet::from([HOME_GUI_SHELL_ID, "home-cli"])') &&
+    gatewayTests.includes('target["target"] == "home-cli"') &&
+    gatewayTests.includes('"active": "obsolete-shell"') &&
+    gatewayTests.includes('"active": "home-gui"') &&
+    !gatewayTests.includes(RETIRED_HOME_ACTIVE_STATE_LITERAL) &&
+    gatewayTests.includes('payload["authority"]["signed_in"], true') &&
+    gatewayTests.includes("HOME_SESSION_COOKIE") &&
+    gatewayTests.includes('payload["active_shell"]["active"], "home-cli"') &&
+    gatewayTests.includes("authority.system_token.as_str()") &&
+    gatewayTests.includes("selected_gui_from_shell") &&
+    gatewayTests.includes("test_home_active_shell_repairs_saved_home_state_but_rejects_home_updates") &&
+    gatewayTests.includes('{"active":"home"}') &&
+    gatewayTests.includes("assert_eq!(home_write_rejected.status(), StatusCode::BAD_REQUEST);") &&
+    gatewayTests.includes("cookie_active_shell_write_rejected") &&
+    gatewayTests.includes("StatusCode::FORBIDDEN") &&
+    gatewayTests.includes('"regular-app"') &&
+    gatewayTests.includes('"broken-shell"') &&
+    gatewayTests.includes("StatusCode::BAD_REQUEST") &&
+    gatewayTests.includes("HomeActiveShellUpdate"),
+  "Home active-shell model must be Runtime-owned, persist per principal, and derive selectable shells from launchable shell catalog facts",
+);
+assert(
+  gatewayApi.includes("capsule_catalog: CapsuleCatalogResponse") &&
+    gatewayApi.includes("capsule_interfaces: CapsuleInterfaceRegistryResponse") &&
+    gatewayApi.includes("let targets = home_targets_from_catalog(&capsule_catalog)") &&
+    gatewayApi.includes("pub(super) fn home_targets_from_catalog(") &&
+    gatewayApi.includes("let launchable = target.is_some()") &&
+    gatewayHomeSystemTests.includes(
+      "Home target must come from the canonical capsule catalog",
     ),
-  "Home must reset untrusted plaintext browser state for protected roots without accepting the plaintext",
+  "Home GUI summary targets must be a direct projection of the canonical capsule catalog and interface registry",
+);
+assert(
+  system.includes('id="active-shell-options"') &&
+    !system.includes('id="active-shell-select"') &&
+    !system.includes('id="active-shell-apply"') &&
+    !system.includes('data-field="active-shell-current"') &&
+    systemJs.includes("configureActiveShell") &&
+    systemJs.includes("refreshActiveShell") &&
+    systemJs.includes("applyActiveShell") &&
+    systemJs.includes('"/api/apps/home/active-shell"') &&
+    systemJs.includes("function shellName(value)") &&
+    systemJs.includes('const HOME_HOST_ID = "home";') &&
+    systemJs.includes("name === HOME_HOST_ID") &&
+    !systemJs.includes(RETIRED_SYSTEM_HOME_ALIAS_RETURN) &&
+    !systemJs.includes("ACTIVE_SHELL_HINT_KEY") &&
+    !systemJs.includes("window.localStorage") &&
+    systemJs.includes('"home:active-shell-applied"') &&
+    systemJs.includes('"home:refresh-summary"') &&
+    system.includes('class="pc2-section-title">Shell<') &&
+    !system.includes("Choose which shell Home uses as its root view.") &&
+    systemJs.includes('return "Desktop"') &&
+    systemJs.includes('return "Terminal"') &&
+    systemJs.includes("createShellChoice") &&
+    systemStyle.includes(".shell-choice-grid") &&
+    systemStyle.includes(".shell-choice-preview-desktop") &&
+    systemStyle.includes(".shell-choice-preview-terminal"),
+  "System Settings must expose a visual Desktop/Terminal selector and notify Home to swap the root shell",
+);
+assertManifestMethod(coreCapsuleManifests, "home-gui", "elastos.shell.gui", "desktop.render", {
+  risk: "read",
+  approval: "runtime_policy",
+  audit: "summary",
+  resource: "elastos://home/desktop",
+  operation: "render",
+});
+assertManifestMethod(coreCapsuleManifests, "home-gui", "elastos.shell.gui", "capsule.open", {
+  risk: "launch",
+  approval: "runtime_policy",
+  audit: "event",
+  resource: "elastos://capsules/*",
+  operation: "launch",
+});
+assertManifestMethod(coreCapsuleManifests, "home-cli", "elastos.shell.cli", "facts.search", {
+  risk: "read",
+  approval: "runtime_policy",
+  audit: "summary",
+  resource: "elastos://home/facts",
+  operation: "search",
+});
+assertManifestMethod(coreCapsuleManifests, "home-cli", "elastos.shell.cli", "capsule.open", {
+  risk: "launch",
+  approval: "runtime_policy",
+  audit: "event",
+  resource: "elastos://capsules/*",
+  operation: "launch",
+});
+assert(
+  homeCapsuleManifest.role === "app" &&
+    homeGuiCapsuleManifest.role === "shell" &&
+    homeGuiCapsuleManifest.description === "Desktop Home view for ElastOS" &&
+    homeCliManifest.role === "shell",
+  "Home identity split must keep home as the host and expose plain Desktop and Terminal shell descriptions",
+);
+assertManifestMethod(coreCapsuleManifests, "browser", "elastos.browser.page", "page.open", {
+  risk: "launch",
+  approval: "runtime_policy",
+  audit: "event",
+  resource: "elastos://browser/page",
+  operation: "open",
+});
+assertManifestMethod(coreCapsuleManifests, "browser", "elastos.browser.page", "exit.select", {
+  risk: "write",
+  approval: "runtime_policy",
+  audit: "event",
+  resource: "elastos://browser/exit",
+  operation: "select",
+});
+assertManifestMethod(coreCapsuleManifests, "wallet", "elastos.wallet.accounts", "approval.sign", {
+  risk: "payment",
+  approval: "user",
+  audit: "full",
+  resource: "elastos://wallet/sign",
+  operation: "sign",
+});
+assertManifestMethod(coreCapsuleManifests, "inbox", "elastos.inbox.approvals", "request.approve", {
+  risk: "privileged",
+  approval: "user",
+  audit: "full",
+  resource: "elastos://inbox/request",
+  operation: "approve",
+});
+assertManifestMethod(coreCapsuleManifests, "services", "elastos.services.offers", "browser.exit.select", {
+  risk: "write",
+  approval: "runtime_policy",
+  audit: "event",
+  resource: "elastos://browser/exit",
+  operation: "select",
+});
+assertManifestMethod(coreCapsuleManifests, "people", "elastos.people.contacts", "people.summary", {
+  risk: "read",
+  approval: "runtime_policy",
+  audit: "summary",
+  resource: "elastos://people",
+  operation: "read",
+});
+assertManifestMethod(coreCapsuleManifests, "system", "elastos.system.shell", "shell.switch", {
+  risk: "privileged",
+  approval: "user",
+  audit: "event",
+  resource: "elastos://home/shell",
+  operation: "switch",
+});
+for (const capsule of Object.keys(firstPartyCapsuleManifests)) {
+  assertManifestHasInterfaceMetadata(firstPartyCapsuleManifests, capsule);
+}
+assertManifestMethod(appSurfaceCapsuleManifests, "library", "elastos.library.objects", "object.choose", {
+  risk: "read",
+  approval: "user",
+  audit: "event",
+});
+assertManifestMethod(appSurfaceCapsuleManifests, "documents", "elastos.documents.editor", "document.publish", {
+  risk: "privileged",
+  approval: "user",
+  audit: "full",
+});
+assertManifestMethodSchema(
+  appSurfaceCapsuleManifests,
+  "documents",
+  "elastos.documents.editor",
+  "document.open",
+  "input_schema",
+  "elastos.documents.document-open/v1",
+  "library_object",
+);
+assertManifestMethod(appSurfaceCapsuleManifests, "archive-manager", "elastos.archive.viewer", "entry.extract", {
+  risk: "write",
+  approval: "user",
+  audit: "event",
+});
+assertManifestMethodSchema(
+  appSurfaceCapsuleManifests,
+  "archive-manager",
+  "elastos.archive.viewer",
+  "archive.open",
+  "input_schema",
+  "elastos.archive.open/v1",
+  "library_object",
+);
+assertManifestMethod(appSurfaceCapsuleManifests, "chat-room", "elastos.chat.room", "guest.approve", {
+  risk: "privileged",
+  approval: "user",
+  audit: "full",
+});
+assertManifestMethod(appSurfaceCapsuleManifests, "marketplace", "elastos.marketplace.catalog", "capsule.install", {
+  risk: "privileged",
+  approval: "user",
+  audit: "full",
+});
+assertManifestMethodSchema(
+  appSurfaceCapsuleManifests,
+  "gba-emulator",
+  "elastos.gba.emulator",
+  "game.open",
+  "input_schema",
+  "elastos.gba.rom-open/v1",
+  "content_capsule",
+);
+assertManifestMethod(appSurfaceCapsuleManifests, "gba-ucity", "elastos.content.asset", "asset.open", {
+  risk: "launch",
+  approval: "runtime_policy",
+  audit: "event",
+});
+assertManifestMethodSchema(
+  appSurfaceCapsuleManifests,
+  "gba-ucity",
+  "elastos.content.asset",
+  "asset.open",
+  "output_schema",
+  "elastos.content.asset-opened/v1",
+);
+assertManifestMethod(appSurfaceCapsuleManifests, "wallet-metamask", "elastos.wallet.approval-method", "method.connect", {
+  risk: "privileged",
+  approval: "user",
+  audit: "event",
+});
+assertManifestMethod(appSurfaceCapsuleManifests, "wallet-unisat", "elastos.wallet.approval-method", "method.connect", {
+  risk: "privileged",
+  approval: "user",
+  audit: "event",
+});
+assertManifestMethod(appSurfaceCapsuleManifests, "wallet-walletconnect", "elastos.wallet.approval-method", "method.connect", {
+  risk: "privileged",
+  approval: "user",
+  audit: "event",
+});
+assertManifestMethod(providerCapsuleManifests, "browser-engine-adapter", "elastos.provider.browser.engine", "launch", {
+  risk: "launch",
+  approval: "runtime_policy",
+  audit: "event",
+  resource: "elastos://browser-engine/*",
+  operation: "launch",
+});
+assertManifestMethod(providerCapsuleManifests, "exit-provider", "elastos.provider.exit", "open_stream", {
+  risk: "write",
+  approval: "runtime_policy",
+  audit: "event",
+  resource: "elastos://exit/*",
+  operation: "open_stream",
+});
+assertManifestMethod(providerCapsuleManifests, "net-provider", "elastos.provider.net", "stream", {
+  risk: "write",
+  approval: "runtime_policy",
+  audit: "event",
+  resource: "elastos://net/*",
+  operation: "stream",
+});
+assertManifestMethod(providerCapsuleManifests, "chain-provider", "elastos.provider.chain", "broadcast_transaction", {
+  risk: "payment",
+  approval: "user",
+  audit: "full",
+  resource: "elastos://chain/*",
+  operation: "broadcast_transaction",
+});
+assertManifestMethod(providerCapsuleManifests, "wallet-provider", "elastos.provider.wallet", "request_signature", {
+  risk: "payment",
+  approval: "user",
+  audit: "full",
+  resource: "elastos://wallet/*",
+  operation: "request_signature",
+});
+assertManifestMethod(providerCapsuleManifests, "wallet-provider", "elastos.provider.wallet", "verify_proof", {
+  risk: "read",
+  approval: "runtime_policy",
+  audit: "event",
+  resource: "elastos://wallet/*",
+  operation: "verify_proof",
+});
+assertManifestMethod(providerCapsuleManifests, "key-provider", "elastos.provider.key", "release", {
+  risk: "rights",
+  approval: "user",
+  audit: "full",
+  resource: "elastos://key/*",
+  operation: "release",
+});
+assertManifestMethod(providerCapsuleManifests, "rights-provider", "elastos.provider.rights", "can_stream", {
+  risk: "rights",
+  approval: "runtime_policy",
+  audit: "event",
+  resource: "elastos://rights/*",
+  operation: "can_stream",
+});
+assertManifestMethod(providerCapsuleManifests, "object-provider", "elastos.provider.object", "delete_permanently", {
+  risk: "privileged",
+  approval: "user",
+  audit: "full",
+  resource: "elastos://object/*",
+  operation: "delete_permanently",
+});
+assert(
+  capsuleInterfaceContract.includes("First-Party Capsule Descriptors") &&
+    includesNormalized(capsuleInterfaceContract, "all first-party app, viewer, shell, connector, content, and provider surfaces") &&
+    includesNormalized(capsuleInterfaceContract, "Provider descriptors are projected from existing provider authority metadata") &&
+    includesNormalized(capsuleInterfaceContract, "The descriptors are still not grants") &&
+    capsuleInterfaceContract.includes("elastos.capsule.projection/v1") &&
+    capsuleInterfaceContract.includes("Runtime's compact shell-facing status for web, CLI, facts") &&
+    gatewayApi.includes("pub(in crate::api::gateway) projection: CapsuleProjectionSummary") &&
+    gatewayApi.includes("fn capsule_projection_summary(") &&
+    gatewayApi.includes('schema: "elastos.capsule.projection/v1".to_string()') &&
+    gatewayApi.includes("manifest.interfaces.methods+routing_policy") &&
+    gatewayApi.includes("catalog.trust+system.inspector") &&
+    gatewayApi.includes("first_party_capsules_have_complete_projection_contract") &&
+    gatewayApi.includes("Future Carrier transport must preserve the same Runtime schemas"),
+  "Capsule Interface Contract and Runtime catalog must document and derive shared shell projection facts",
+);
+assert(
+  homeCliManifest.role === "shell" &&
+    homeCliManifest.type === "wasm" &&
+    homeCliManifest.runtime_abi === "elastos.runtime-projection/v1" &&
+    homeCliManifest.bus_contract === "elastos.runtime-projection/v1" &&
+    homeCliManifest.execution === "web-projection" &&
+    homeCliManifest.entrypoint === "browser/index.html" &&
+    !Object.hasOwn(homeCliManifest, "wit_world_sha256") &&
+    !Object.hasOwn(homeCliManifest, "provides") &&
+    !Object.hasOwn(homeCliManifest, "authority") &&
+    Array.isArray(homeCliManifest.permissions?.storage) &&
+    homeCliManifest.permissions.storage.length === 0 &&
+    Array.isArray(homeCliManifest.permissions?.messaging) &&
+    homeCliManifest.permissions.messaging.length === 0,
+  "Home CLI must be a Runtime-backed shell projection without component or provider authority",
+);
+const commonShellMethods = (manifest) => (manifest.interfaces || [])
+  .flatMap((item) => item.methods || [])
+  .filter((method) => method.id === "capsule.open" || method.id === "shell.switch");
+assert(
+  homeGuiCapsuleManifest.role === "shell" &&
+    homeGuiCapsuleManifest.runtime_abi === homeCliManifest.runtime_abi &&
+    homeGuiCapsuleManifest.bus_contract === homeCliManifest.bus_contract &&
+    homeGuiCapsuleManifest.execution === homeCliManifest.execution &&
+    JSON.stringify(homeGuiCapsuleManifest.resources) === JSON.stringify(homeCliManifest.resources) &&
+    JSON.stringify(homeGuiCapsuleManifest.permissions) === JSON.stringify(homeCliManifest.permissions) &&
+    JSON.stringify(commonShellMethods(homeGuiCapsuleManifest)) ===
+      JSON.stringify(commonShellMethods(homeCliManifest)),
+  "Home GUI and Home CLI must remain sibling shells with identical common authority declarations",
+);
+assert(
+  browserCapsuleManifest.role === "app" &&
+    browserCapsuleManifest.type === "wasm" &&
+    browserCapsuleManifest.runtime_abi === "elastos.runtime-projection/v1" &&
+    browserCapsuleManifest.bus_contract === "elastos.runtime-projection/v1" &&
+    browserCapsuleManifest.execution === "web-projection" &&
+    browserCapsuleManifest.entrypoint === "browser/index.html" &&
+    !Object.hasOwn(browserCapsuleManifest, "wit_world_sha256") &&
+    browserCapsuleManifest.projections.includes("web") &&
+    browserCapsuleManifest.projections.includes("facts") &&
+    browserCapsuleManifest.requires.some((req) => req.name === "browser-engine-adapter") &&
+    browserCapsuleManifest.requires.some((req) => req.name === "exit-provider") &&
+    browserCapsuleManifest.requires.some((req) => req.name === "net-provider") &&
+    browserCapsuleManifest.requires.some((req) => req.name === "wallet-provider") &&
+    !browserCapsuleManifest.capabilities.some(
+      (capability) =>
+        capability.startsWith("elastos://net") ||
+        capability.startsWith("elastos://exit") ||
+        capability.startsWith("elastos://wallet") ||
+        capability.startsWith("elastos://browser-engine"),
+    ),
+  "Browser UI must be a Runtime projection while Browser Engine, Exit, Net, Wallet, media, profile, and cleanup authority stay Runtime/provider-owned",
+);
+assert(
+  homeCliIndex.includes("home-cli.js?v=home-cli-") &&
+    homeCliIndex.includes("style.css?v=home-cli-") &&
+    homeCliIndex.includes('id="xterm-terminal"') &&
+    !homeCliIndex.includes('id="prompt-label"') &&
+    !homeCliIndex.includes('id="command-input"') &&
+    !homeCliIndex.includes('id="command-suggestions"') &&
+    !homeCliIndex.includes('id="copy-output"') &&
+    !homeCliIndex.includes('id="terminal-toggle"') &&
+    !homeCliIndex.includes("data-command="),
+  "Home CLI browser index must be terminal-only xterm chrome, not the retired browser command form",
+);
+assert(
+  homeCliCommandContractJson.schema === "elastos.home-cli.command-contract/v1" &&
+    homeCliExpectedCommands.every((name) => homeCliCommandHasSurface(name, "home-cli")) &&
+    homeCliRetiredCommands.every((name) => !homeCliContractCommand(name)) &&
+    homeCliContractCommand("debug")?.usage?.startsWith("debug [") &&
+    homeCliContractCommand("debug")?.description?.includes("hidden from the default Home CLI product surface") &&
+    !homeCliCommandContractJson.commands.some((command) =>
+      command.surface?.some((surface) => surface === "native" || surface === "browser"),
+    ),
+  "Home CLI command contract must expose only the shared Home CLI vocabulary",
+  { commands: homeCliCommandNames() },
+);
+assert(
+  homeCliCommandContractJson.terminal?.transport === "runtime_pty_stream" &&
+    homeCliCommandContractJson.terminal?.pty?.includes("Runtime-owned PTY") &&
+    homeCliCommandContractJson.terminal?.xterm?.includes("capsule-local @xterm/xterm renderer") &&
+    homeCliCommandContractJson.terminal?.xterm?.includes("autostarted") &&
+    homeCliCommandContractJson.terminal?.xterm?.includes("start/events/input/resize/close"),
+  "Home CLI command contract must describe the Runtime PTY/xterm terminal boundary",
+  homeCliCommandContractJson.terminal,
+);
+assert(
+  homeCliJs.includes("await startRuntimeTerminal()") &&
+    homeCliJs.includes("async function startRuntimeTerminal()") &&
+    homeCliJs.includes("async function resizeRuntimeTerminal") &&
+    homeCliJs.includes("async function attachXtermTerminal") &&
+    homeCliJs.includes("connectRuntimeTerminalInputSocket") &&
+    homeCliJs.includes("input_socket_url") &&
+    homeCliJs.includes("new WebSocket(runtimeWebSocketUrl") &&
+    homeCliJs.includes("setRuntimeTerminalMode(true)") &&
+    homeCliJs.includes("requestHomeActiveShell(target)") &&
+    homeCliJs.includes("activeShell: target") &&
+    homeCliJs.includes('const homeParentOrigin = readQueryParam("home_origin")') &&
+    homeCliJs.includes("!homeToken || !homeParentOrigin || window.parent === window") &&
+    homeCliJs.includes("}, homeParentOrigin);") &&
+    !homeCliJs.includes("}, window.location.origin);") &&
+    homeCliJs.includes('"x-elastos-home-token"') &&
+    homeCliJs.includes('eventsUrl.includes("home_token=")') &&
+    homeCliJs.includes("elastos.home.terminal-host-intent/v1") &&
+    homeCliJs.includes('"home:switch-shell-and-open-target"') &&
+    homeCliJs.includes("./vendor/xterm/xterm.mjs?v=xterm-6.0.0") &&
+    !homeCliJs.includes("COMMAND_CONTRACT_URL") &&
+    !homeCliJs.includes("#command-input") &&
+    !homeCliJs.includes("#command-form") &&
+    !homeCliJs.includes("#command-suggestions") &&
+    !homeCliJs.includes("function runCommand") &&
+    !homeCliJs.includes("completeCommand") &&
+    !homeCliJs.includes("Browser terminal contract") &&
+    !homeCliJs.includes('"/api/esp/initialize"') &&
+    homeCliJs.includes('fetchJson("/api/apps/home/active-shell"') &&
+    !homeCliJs.includes('"/api/capsules/catalog"') &&
+    !homeCliJs.includes('"/api/capsules/interfaces"') &&
+    !homeCliJs.includes('"/api/capsules/interfaces/invoke"') &&
+    !/\/api\/provider\/|\/api\/apps\/system|dispatch_approved|ProviderRegistry|localStorage|sessionStorage|indexedDB|window\.ethereum|personal_sign|eth_requestAccounts/.test(
+      homeCliJs,
+    ),
+  "Home CLI browser JS must stay a Runtime PTY client with only its origin-bound shell-control endpoint and no provider authority path",
+);
+assert(
+  homeCliXtermVendorReadme.includes("@xterm/xterm") &&
+    homeCliXtermVendorReadme.includes("version: `6.0.0`") &&
+    homeCliXtermVendorReadme.includes("license: MIT") &&
+    homeCliXtermVendorReadme.includes("sha512-TQwDdQGtwwDt+2cgKDLn0IRaSxYu1tSUjgKarSDkUM0ZNiSRXFpjxEsvc/Zgc5kq5omJ+V0a8/kIM2WD3sMOYg==") &&
+    homeCliXtermVendorReadme.includes("b336ec65a086c056d4804b3d4c2347da5663d3f23c3f25be866467bd8857ad59") &&
+    homeCliStyle.includes("#xterm-terminal") &&
+    homeCliStyle.includes('body[data-runtime-terminal="attached"] #xterm-terminal') &&
+    homeCliStyle.includes(".terminal-panel") &&
+    homeCliStyle.includes("height: 100dvh") &&
+    homeCliStyle.includes('body[data-runtime-terminal="attached"] #terminal-output') &&
+    !homeCliStyle.includes(".quick-grid") &&
+    !homeCliStyle.includes(".command-row"),
+  "Home CLI terminal renderer assets/styles must stay xterm-based and command-form-free",
+);
+assert(
+  homeCliBrowserSmoke.includes("[home-cli-browser] PASS") &&
+    homeCliBrowserSmoke.includes("runtime_pty_stream") &&
+    homeCliBrowserSmoke.includes("home-cli terminal event stream did not use a scoped stream ticket") &&
+    homeCliBrowserSmoke.includes("home-cli terminal input did not use its scoped Runtime WebSocket ticket") &&
+    homeCliBrowserSmoke.includes("home-cli still serialized terminal keys through HTTP") &&
+    homeCliBrowserSmoke.includes("home-cli terminal resize did not carry its launch token") &&
+    homeCliBrowserSmoke.includes("home-cli did not autostart an xterm terminal") &&
+    homeCliBrowserSmoke.includes("home-cli terminal host intent did not request an explicit GUI shell transition") &&
+    homeCliBrowserSmoke.includes("home-cli unexpected terminal exit switched back to Home GUI") &&
+    homeCliBrowserSmoke.includes("home-cli did not apply the shell switch through its own origin-bound Runtime authority") &&
+    homeCliBrowserSmoke.includes("home-cli terminal sign-out intent did not request Home session revocation") &&
+    homeCliBrowserSmoke.includes("home-cli browser wrapper fetched the old browser command contract") &&
+    homeCliBrowserSmoke.includes("home-cli did not ask Runtime to authorize the explicit GUI transition") &&
+    homeCliBrowserSmoke.includes("home-cli did not ask Runtime to authorize the shell-switch host intent") &&
+    homeCliBrowserSmoke.includes("home-cli did not ask Runtime to authorize the sign-out intent") &&
+    homeCliBrowserSmoke.includes("home-cli called provider routes directly") &&
+    !homeCliBrowserSmoke.includes("home-cli Ctrl+P did not recall the previous command") &&
+    !homeCliBrowserSmoke.includes("home-cli copy did not copy terminal output") &&
+    !homeCliBrowserSmoke.includes("home-cli completion hints did not suggest visible targets"),
+  "Home CLI browser smoke must verify the Runtime PTY stream and retired command UI boundaries",
+);
+assert(
+  gatewayHomeTerminal.includes("HOME_TERMINAL_CONTRACT_SCHEMA") &&
+    gatewayHomeTerminal.includes("HOME_TERMINAL_RESIZE_SCHEMA") &&
+    gatewayHomeTerminal.includes("TIOCSCTTY") &&
+    gatewayHomeTerminal.includes("open_home_terminal_pty") &&
+    gatewayHomeTerminal.includes("libc::openpty") &&
+    gatewayHomeTerminal.includes("stream_ticket") &&
+    gatewayHomeSystemTests.includes("test_home_cli_terminal_stream_requires_cli_launch_token"),
+  "Gateway Home terminal API must own the scoped PTY stream contract",
+);
+assert(
+  homeCli.includes('const COMMAND_CONTRACT_JSON: &str = include_str!("../browser/commands.json");') &&
+    homeCli.includes("capsule_catalog: Option<serde_json::Value>") &&
+    homeCli.includes("capsule_interfaces: Option<serde_json::Value>") &&
+    homeCli.includes("services: Option<serde_json::Value>") &&
+    homeCli.includes("fn cli_service_offers") &&
+    homeCli.includes("home_cli_line_mode_reads_browser_exit_service_offers") &&
+    homeCli.includes("fn cli_invoke_intent(") &&
+    homeCli.includes("fn home_intent_payload(") &&
+    homeCli.includes("fn write_invoke_intent(") &&
+    homeCli.includes('resolve_cli_invoke_intent("home-cli capsule.open", &snapshot).unwrap()') &&
+    homeCli.includes("home_cli_invoke_list_contains_only_runtime_executable_methods") &&
+    homeCli.includes("home_cli_line_mode_rejects_declared_but_non_executable_method") &&
+    homeCli.includes("home_cli_line_mode_serializes_structured_invoke_home_intent") &&
+    homeCli.includes("home_cli_line_mode_blocks_high_risk_invoke_intent") &&
+    homeCli.includes("fn handle_shared_line_command(") &&
+    homeCli.includes("fn print_cli_debug(") &&
+    homeCli.includes("fn print_cli_capsules(") &&
+    homeCli.includes("fn print_cli_inspect(") &&
+    homeCli.includes("fn print_cli_affordances(") &&
+    homeCli.includes("fn print_cli_gates(") &&
+    homeCli.includes("fn print_cli_audit(") &&
+    homeCli.includes("fn print_cli_terminal_contract(snapshot: &HomeSnapshot)") &&
+    homeCli.includes("home_cli_line_mode_accepts_shared_snapshot_backed_commands") &&
+    !homeCli.includes("UiKey::Browser") &&
+    !homeCli.includes("b opens Browser") &&
+    !homeCli.includes("elastos home --status for full detail"),
+  "Home CLI Rust surface must use the shared command contract and snapshot-backed line/debug commands",
+);
+assert(
+  homeCmd.includes("capsule_catalog: Option<serde_json::Value>") &&
+    homeCmd.includes("capsule_interfaces: Option<serde_json::Value>") &&
+    homeCmd.includes("services: Option<serde_json::Value>") &&
+    homeCmd.includes("home_services_snapshot(") &&
+    homeCmd.includes("dispatch_home_cli_invoke_intent") &&
+    homeCmd.includes("fn print_home_state_probe(") &&
+    homeCmd.includes("ElastOS Home State Probe") &&
+    homeCmd.includes('assert!(home_terminal_host_intent_for_action("chat", &snapshot).is_none())') &&
+    homeCmd.includes(
+      'assert!(home_terminal_host_intent_for_action("capsule-browser", &snapshot).is_none())',
+    ) &&
+    homeCmd.includes(
+      'home_terminal_host_intent_for_action("open-gui:browser", &snapshot_with_open).unwrap()',
+    ) &&
+    homeCmd.includes("fn people_contact_message_target(") &&
+    homeCmd.includes("home_terminal_people_message_stays_in_the_cli_runtime_path") &&
+    homeCmd.includes('"action": "switch-shell-open-target"') &&
+    homeCmd.includes("fn catalog_capsule_has_cli_projection(") &&
+    homeCmd.includes("fn capsule_catalog_entry<'a>(") &&
+    homeCmd.includes("gather_notification_host_actions") &&
+    homeCmd.includes("dynamic_capsule_actions_use_only_canonical_cli_projection") &&
+    homeCmd.includes("notification_open_gui_refs_become_explicit_home_snapshot_actions") &&
+    !homeCmd.includes("fn capsule_launch_plan(") &&
+    !homeCmd.includes("fn capsule_manifest_allows_home_cli_launch_action(") &&
+    homeCmd.includes("issue_local_runtime_home_launch_token") &&
+    homeCmd.includes("async fn gather_home_summary_projection(") &&
+    homeCmd.includes("-> anyhow::Result<Option<HomeSummaryFactsProjection>>") &&
+    homeCmd.includes("gateway-owned Home CLI summary unavailable") &&
+    homeCmd.includes("gateway_owned_home_snapshot_propagates_summary_failure") &&
+    homeCmd.includes("native_home_summary_projection_is_optional_without_gateway") &&
+    !homeCmd.includes("response.json::<HomeSummaryFactsProjection>().await.ok()") &&
+    !homeCmd.includes("struct HomeCliAuthorityContext") &&
+    !homeCmd.includes("fn gateway_home_cli_authority_context(") &&
+    !homeCmd.includes("issue_home_launch_token_from_context_parts") &&
+    !homeCmd.includes("home_active_shell_snapshot_from_context_parts") &&
+    !homeCmd.includes("PROVIDER_CAPSULE_NAMES") &&
+    !homeCmd.includes("Direct contact thread for"),
+  "Home command host bridge must preserve explicit terminal intents and catalog-gated CLI launch planning",
+);
+assert(
+  gatewayApi.includes("pub fn capsule_catalog_snapshot(") &&
+    gatewayApi.includes("pub fn capsule_interface_registry_snapshot(") &&
+    gatewayApi.includes("pub fn home_services_snapshot(") &&
+    gatewayApi.includes("pub fn home_targets_snapshot(") &&
+    gatewayApi.includes("pub fn issue_local_runtime_home_launch_token(") &&
+    gatewayApi.includes("fn gateway_owned_home_cli_launch_context_from_env(") &&
+    gatewayApi.includes("pub fn gateway_owned_home_cli_authority_available(") &&
+    gatewayApi.includes("pub fn issue_gateway_owned_home_cli_launch_token(") &&
+    gatewayApi.includes("pub fn gateway_owned_home_cli_active_shell_snapshot("),
+  "Gateway API must expose the Runtime facts and launch-token helpers used by Home CLI",
+);
+assert(
+  homeCli.includes("fn home_visible_targets(") &&
+    homeCli.includes("fn capsule_requirement_titles(") &&
+    homeCli.includes("fn capsule_executable_action_labels(") &&
+    !homeCli.includes("if !seen.contains(PEOPLE_TARGET_ID)") &&
+    !homeCli.includes('"archive-manager" => "Archive"') &&
+    homeCli.includes("fn app_target_action_id(") &&
+    homeCli.includes("open-gui:{target_id}") &&
+    !homeCli.includes("fn append_read_only_catalog_apps(") &&
+    !homeCli.includes("fn append_read_only_capsule_actions(") &&
+    homeCli.includes("apps_use_runtime_targets_but_only_cli_native_or_explicit_open_entries_are_actionable") &&
+    homeCliCommandContract.includes("List apps available in Home") &&
+    homeCliCommandContract.includes("desktop apps are clearly marked") &&
+    homeCliMain.includes("fn people_contact_message_target(") &&
+    homeCliMain.includes("fn people_contact_id_for_reference(") &&
+    homeCli.includes("people_tab_uses_people_model_and_keeps_transport_in_debug") &&
+    homeCli.includes("people_line_mode_resolves_visible_contacts_and_requires_message_route") &&
+    homeCli.includes('"Add People"') &&
+    homeCli.includes("ContactsSchema") &&
+    homeCli.includes("DiscoverySchema") &&
+    !homeCliMain.includes("direct contact threads are not available yet") &&
+    !homeCliMain.includes('"Visible People"') &&
+    homeCli.includes("system_tab_stays_short_and_actionable") &&
+    homeCli.includes("system_pages_hide_peer_context_in_header") &&
+    homeCli.includes("system_line_mode_emits_home_gui_shell_switch") &&
+    homeCli.includes("native terminal has no browser root shell to switch") &&
+    homeCli.includes('"Return to Home Desktop"') &&
+    homeCli.includes('assert!(!screen.contains("Commands"))') &&
+    homeCli.includes('assert!(!lines.iter().any(|line| line.starts_with("Diagnostics")))') &&
+    !homeCli.includes("fn system_more_lines(") &&
+    !homeCli.includes('push_section_lines(&mut left, "Commands"') &&
+    homeCli.includes("fn system_action_state_label(action: &SystemAction)") &&
+    homeCli.includes(
+      'const HELP_TAB_COMMANDS: &[&str] = &["home", "inbox", "people", "apps", "system"];',
+    ) &&
+    homeCli.includes(
+      'const HELP_ADVANCED_COMMANDS: &[&str] = &["mywebsite", "wallet", "exits", "invoke"];',
+    ) &&
+    !homeCliMain.includes("HELP_TASK_COMMANDS") &&
+    !homeCliMain.includes('println!("Other Commands")') &&
+    homeCli.includes("first_run_help_matches_five_tabs_without_power_user_noise") &&
+    homeCli.includes("dashboard_commands_match_five_tabs_without_power_user_noise"),
+  "Home CLI default Apps, People, and System surfaces must stay user-facing and debug-gated",
+);
+assert(
+  homeCli.includes(
+    'const DESCRIPTOR_AUTHORITY_COPY: &str = "descriptors are declared capabilities, not grants";',
+  ) &&
+    homeCli.includes("home_cli_public_help_stays_plain_and_debug_keeps_authority_warning") &&
+    homeCli.includes("first_run_help_matches_five_tabs_without_power_user_noise") &&
+    homeCli.includes("advanced_and_debug_help_keep_contract_commands_available") &&
+    !homeCliCommandContract.includes("Runtime-owned Home summary") &&
+    !homeCliCommandContract.includes("Runtime facts") &&
+    !homeCliCommandContract.includes("structured Home intent") &&
+    homeCliCommandContract.includes("available app actions") &&
+    homeCliCommandContract.includes("Technical details stay under debug topics") &&
+    homeCliCommandContract.includes('"key": "Up/Down"') &&
+    homeCliCommandContract.includes('"key": "Shift+Tab"') &&
+    homeCliCommandContract.includes('"key": "q or Esc"') &&
+    homeCliCommandContract.includes('"key": "Mouse"') &&
+    homeCli.includes("fn tui_control_help_lines()") &&
+    homeCli.includes(".controls") &&
+    !homeCli.includes("TUI_HELP_LINES"),
+  "Home CLI public help must stay plain while authority details remain debug-only",
+);
+assert(
+  includesNormalized(homeShellHostContract, "`home-gui` and `home-cli` are sibling shell capsules") &&
+    includesNormalized(homeShellHostContract, "signed-in principal and Runtime-derived facts") &&
+    includesNormalized(homeShellHostContract, "CLI action uses a CLI projection") &&
+    includesNormalized(homeShellHostContract, "Opening a GUI-only projection from CLI is an explicit `switch shell and open` action") &&
+    includesNormalized(homeShellHostContract, "A plain `home:open-target` from `home-cli` cannot trigger this transition") &&
+    currentState.includes("Home CLI People now matches the Home GUI People model") &&
+    currentState.includes("Home CLI System now keeps the default view") &&
+    currentState.includes("first-run help is split into Tabs, Controls, Advanced, and") &&
+    currentState.includes("default path shows only the five user-facing tab commands") &&
+    currentState.includes("catalog/interface/service facts from the Runtime-owned Home snapshot") &&
+    shellJs.includes('"home-cli": "visible-target"') &&
+    shellJs.includes('data.type === "home:switch-shell-and-open-target"') &&
+    homeCliJs.includes('"home:switch-shell-and-open-target"'),
+  "Home shell docs/state must keep GUI and CLI equal in authority while preserving projection-specific behavior",
+);
+
+assert(
+  shellIndex.includes('id="active-shell-root"') &&
+    shellIndex.includes('id="active-shell-frame"') &&
+    shellIndex.includes('id="home-shell-boot-mask" class="home-shell-boot-mask"') &&
+    shellIndex.includes('id="shell-host-recovery"') &&
+    !shellIndex.includes('<template id="home-gui-template">') &&
+    !shellIndex.includes('class="desktop-backdrop"') &&
+    !shellIndex.includes('id="window-template"') &&
+    homeGuiIndex.includes('<div class="home-gui-shell"></div>') &&
+    homeGuiTemplateHtml.includes('class="desktop-backdrop"') &&
+    homeGuiTemplateHtml.includes('id="window-template"') &&
+    shellCore.includes('export const HOME_SHELL_HOST_ID = "home-shell-host"') &&
+    shellCore.includes('export const HOME_GUI_SHELL_ID = "home-gui"') &&
+    !shellCore.includes("ensureHomeGuiDom") &&
+    shellJs.includes("async function syncActiveShellRoot(summary, options = {})") &&
+    shellJs.includes('await launchHomeTarget(target, { shell_mode: "root" })') &&
+    shellJs.includes('return { kind: "shell-frame", targetId, homeToken };') &&
+    shellJs.includes('data.type === "home:app-ready"') &&
+    shellJs.includes("launched.source = event.source") &&
+    shellJs.includes('"home-gui": "visible-target"') &&
+    shellJs.includes("function showShellHostRecovery(") &&
+    !shellJs.includes("HOME_GUI_MODULE_URL") &&
+    !shellJs.includes("import(HOME_GUI_MODULE_URL)") &&
+    !shellJs.includes("bindHomeGuiInteractions({") &&
+    !shellJs.includes("desktopWorkspace") &&
+    !shellJs.includes("launcherToggleButton") &&
+    homeGuiShell.includes('const homeOrigin = route.searchParams.get("home_origin") || ""') &&
+    homeGuiShell.includes("setHomeGuiLaunchToken(homeToken)") &&
+    homeGuiShell.includes("window.parent.postMessage({ ...message, homeToken }, homeOrigin)") &&
+    homeGuiShell.includes('postToHome({ type: "home:shell-ready" })') &&
+    !homeGuiShell.includes("document.referrer") &&
+    homeGuiCore.includes('"x-elastos-home-token": homeGuiLaunchToken') &&
+    homeGuiJs.includes("function bindHomeGuiInteractions(options = {})") &&
+    homeGuiJs.includes("function syncHomeGuiProjection(previous, summary") &&
+    shellWindows.includes("const tokens = [...COMMON_IFRAME_SANDBOX]") &&
+    !shellWindows.includes("allow-same-origin") &&
+    !shellIndex.includes("allow-same-origin") &&
+    homeShellBridgeSmoke.includes("isolated Home GUI could not ask Home to launch Browser") &&
+    homeShellBridgeSmoke.includes("Home did not return the isolated Browser route to Home GUI") &&
+    homeShellBridgeSmoke.includes("Browser frame obtained host passkey authority") &&
+    homeShellBridgeSmoke.includes('passkeyReply?.payload?.homeToken === "system-fresh-token"') &&
+    homeShellHostContract.includes("The Home DOM is a trusted host surface") &&
+    homeShellHostContract.includes("contain desktop, taskbar, launcher, window, or terminal implementation"),
+  "Home must keep a host-only DOM and run GUI, CLI, and app documents in authenticated opaque frames",
+);
+assert(
+  !existsSync(resolve(repoRootPath, "capsules/esp-shell")),
+  "obsolete ESP Shell capsule source directory must not remain",
+);
+assert(
+  !shellHostStyle.includes("wallpaper.webp") &&
+    !shellHostStyle.includes(".desktop-backdrop") &&
+    !shellHostStyle.includes(".launcher") &&
+    !shellHostStyle.includes(".taskbar") &&
+    !shellHostStyle.includes(".window-snap-preview") &&
+    homeGuiStyle.includes('url("./wallpaper.webp")') &&
+    homeGuiStyle.includes(".desktop-backdrop") &&
+    homeGuiStyle.includes(".launcher") &&
+    homeGuiStyle.includes(".taskbar") &&
+    homeGuiStyle.includes(".window-snap-preview"),
+  "Home host stylesheet must not own GUI wallpaper, desktop, launcher, taskbar, or window snap styles",
 );
 assertProtectedPrincipalRootAccessor(
   viewerGatewayApi,
@@ -2434,14 +3530,18 @@ assert(
   "Capsule-kernel bridge must route protected Users/self object writes through runtime principal-root encryption",
 );
 assert(
-  wasmProvider.includes("principal_id: Option<String>") &&
-    wasmProvider.includes("bridge_principals"),
-  "WASM bridge pipes must carry an explicit runtime principal context",
+  !fileExists("elastos/crates/elastos-compute/src/providers/wasm.rs"),
+  "Old Preview 1 provider must stay removed from elastos-compute",
+);
+assert(
+  componentProvider.includes("principal_id: Option<String>") &&
+    componentProvider.includes("bridge_principals"),
+  "Component-bus bridge must carry an explicit runtime principal context",
 );
 assert(
   runtimeCore.includes("run_local_with_principal") &&
     runtimeCore.includes("set_bridge_principal"),
-  "Runtime WASM launches must bind the launch principal before bridge startup",
+  "Runtime component launches must bind the launch principal before bridge startup",
 );
 assert(
   runtimeCore.includes("self.run_local_with_principal(path, args, None).await"),
@@ -2555,7 +3655,7 @@ assert(
   "Gateway summaries must not expose room session tokens",
 );
 assert(
-  shellCore.includes("desktopIconsVisible: true"),
+  homeGuiCore.includes("desktopIconsVisible: true"),
   "Home layout state must track global desktop icon visibility",
 );
 assert(
@@ -2615,6 +3715,13 @@ assert(
 );
 
 const components = JSON.parse(read("components.json"));
+assert(
+  !components.external?.["esp-shell"] &&
+    Object.values(components.profiles).every(
+      (profile) => !new Set(profile.components || []).has("esp-shell"),
+    ),
+  "obsolete ESP Shell capsule must not be packaged",
+);
 const publishRust = read("elastos/crates/elastos-server/src/publish.rs");
 function shellArrayItems(text, name) {
   const pattern = new RegExp(`^${name}=\\(([\\s\\S]*?)^\\)`, "m");
@@ -2640,6 +3747,10 @@ const publishReleaseRequired = shellArrayItems(
   publishReleaseScript,
   "REQUIRED_SUPPORTED_CAPSULES",
 );
+const publishReleaseSupport = shellArrayItems(
+  publishReleaseScript,
+  "SUPPORT_BINARY_ASSETS",
+);
 const publishRustHome = rustConstItems(publishRust, "HOME_PUBLISH_CAPSULES");
 const publishRustDemo = rustConstItems(publishRust, "DEMO_PUBLISH_CAPSULES");
 const publishRustRequired = rustConstItems(
@@ -2647,6 +3758,53 @@ const publishRustRequired = rustConstItems(
   "REQUIRED_SUPPORTED_PUBLISH_CAPSULES",
 );
 const homeProfile = new Set(components.profiles.home.components);
+const demoProfile = new Set(components.profiles.demo.components);
+assert(
+  !components.external?.["capsule-inspector"] &&
+    Object.values(components.profiles).every(
+      (profile) => !new Set(profile.components || []).has("capsule-inspector"),
+    ),
+  "standalone capsule-inspector must not be packaged before the optional extraction decision",
+);
+for (const component of ["gba-emulator", "gba-ucity"]) {
+  assert(
+    demoProfile.has(component) && !homeProfile.has(component),
+    `${component} must stay conditional to demo and hidden from default Home`,
+  );
+}
+assert(
+  !publishReleaseDefault.has("gba-engine-provider") &&
+    !publishReleaseRequired.has("gba-engine-provider") &&
+    !publishReleaseSupport.has("gba-engine-provider") &&
+    !publishRustHome.has("gba-engine-provider") &&
+    !publishRustRequired.has("gba-engine-provider") &&
+    !JSON.stringify(components).includes("gba-engine-provider") &&
+    !publishReleaseScript.includes("gba-engine-provider") &&
+    setupSourceHome.match(/gba-engine-provider/g)?.length === 2 &&
+    setupSourceHome.includes("RETIRED_SOURCE_HOME_CAPSULES") &&
+    setupSourceHome.includes("RETIRED_SOURCE_HOME_PROVIDER_BINARIES"),
+  "Portable GBA publication must not retain a platform engine component",
+);
+assert(
+  setupSourceHome.includes("\n    home-cli\n") &&
+    setupSourceHome.includes("\n    home-gui\n") &&
+    publishReleaseDefault.has("home-cli") &&
+    publishReleaseDefault.has("home-gui") &&
+    publishReleaseRequired.has("home-cli") &&
+    publishReleaseRequired.has("home-gui") &&
+    publishRustHome.has("home-cli") &&
+    publishRustHome.has("home-gui") &&
+    publishRustRequired.has("home-cli") &&
+    publishRustRequired.has("home-gui") &&
+    homeProfile.has("home-cli") &&
+    homeProfile.has("home-gui") &&
+    !publishReleaseDefault.has("esp-shell") &&
+    !publishReleaseRequired.has("esp-shell") &&
+    !publishRustHome.has("esp-shell") &&
+    !publishRustRequired.has("esp-shell") &&
+    !homeProfile.has("esp-shell"),
+  "Home CLI must be installed and published as the alternate browser shell surface",
+);
 for (const component of [
   "chain-provider",
   "net-provider",
@@ -2760,6 +3918,7 @@ for (const component of [
   "home",
   "system",
   "services",
+  "people",
   "documents",
   "library",
   "marketplace",
@@ -2792,10 +3951,33 @@ for (const component of [
 assert(
   read("capsules/marketplace/browser/marketplace.js").includes(
     'fetch("/api/capsules/catalog"',
+  ) && read("capsules/marketplace/browser/marketplace.js").includes(
+    'fetch("/api/capsules/interfaces"',
   ),
-  "Marketplace must read the canonical capsule catalog, not an app-scoped marketplace catalog",
+  "Marketplace must read the canonical catalog and interface registry",
 );
 const marketplaceUi = read("capsules/marketplace/browser/marketplace.js");
+assert(
+  marketplaceUi.includes("const installed = capsule.installed === true;") &&
+    marketplaceUi.includes('type: "home:open-target"') &&
+    !marketplaceUi.includes("/api/apps/home/launch") &&
+    !marketplaceUi.includes("runtime-bundle") &&
+    !marketplaceUi.includes("isBuiltIn"),
+  "Marketplace must trust the installed-active catalog instead of inferring product state from source or bundle labels",
+);
+assert(
+  marketplaceUi.includes("const category = String(capsule.category || \"\").toLowerCase()") &&
+    marketplaceUi.includes("function acceptedContentLabels(") &&
+    marketplaceUi.includes("function executableActions(") &&
+    marketplaceUi.includes("binding?.executable !== true") &&
+    marketplaceUi.includes("function relationshipSection(") &&
+    !marketplaceUi.includes('name.includes("wallet")') &&
+    !marketplaceUi.includes('name.includes("provider")') &&
+    !marketplaceUi.includes('name.includes("gba")') &&
+    !marketplaceUi.includes("function isStaffPick(") &&
+    !marketplaceUi.includes("function isPopular("),
+  "Marketplace must project canonical roles, relationships, and executable bindings without name-based guesses",
+);
 assert(
   marketplaceUi.includes('size: capsule.cid ? "Verified app" : "Local app"') &&
     marketplaceUi.includes('storage: capsule.cid ? "SmartWeb" : "Local"') &&
@@ -2816,20 +3998,75 @@ assert(
   ),
   "Marketplace route must delegate to the canonical capsule catalog",
 );
+const marketplaceCatalogGateway = read(
+  "elastos/crates/elastos-server/src/api/gateway_capsule_catalog.rs",
+);
 const marketplaceCatalogReadModel = read(
   "elastos/crates/elastos-server/src/api/gateway_capsule_catalog/read_model.rs",
 );
+const capsuleMethodBindings = read(
+  "elastos/crates/elastos-server/src/api/gateway_capsule_catalog/bindings.rs",
+);
+const capsuleInventory = read(
+  "elastos/crates/elastos-server/src/api/capsule_inventory.rs",
+);
+const productInventoryConsumers = readAll([
+  "elastos/crates/elastos-server/src/api/browser_capsules.rs",
+  "elastos/crates/elastos-server/src/api/gateway_capsule_catalog/read_model.rs",
+  "elastos/crates/elastos-server/src/api/gateway_home_runtime.rs",
+  "elastos/crates/elastos-server/src/api/gateway_home_system.rs",
+  "elastos/crates/elastos-server/src/api/viewer_gateway.rs",
+]);
 assert(
-  marketplaceCatalogReadModel.includes("payment_state") &&
-    marketplaceCatalogReadModel.includes("drm_state") &&
-    marketplaceUi.includes("Install pending") &&
-    marketplaceUi.includes("Installing new apps is not available yet.") &&
-    marketplaceUi.includes("Supports payments") &&
-    marketplaceUi.includes("Uses protected content") &&
-    !marketplaceUi.includes("signed CID manifests") &&
-    !marketplaceUi.includes("Paid capsules") &&
-    !marketplaceUi.includes("Protected capsules"),
-  "Marketplace must translate neutral catalog payment and dDRM facts into app-facing language",
+  capsuleInventory.includes("list_active_capsule_manifests") &&
+    capsuleInventory.includes("installed_active_capsule_dir") &&
+    !capsuleInventory.includes("fn capsule_dir_candidates") &&
+    !capsuleInventory.includes("fn capsule_roots"),
+  "The product capsule inventory must fail closed to installed active manifests without source-directory fallbacks",
+);
+assert(
+  !productInventoryConsumers.includes("development_capsules_root") &&
+    !productInventoryConsumers.includes("DEV_CAPSULES_ROOT"),
+  "Normal Home, System, Marketplace, Browser, and viewer facts must not read the development source inventory",
+);
+assert(
+  marketplaceCatalogReadModel.includes("signed-app-install-pending") &&
+    marketplaceCatalogReadModel.includes("Marketplace can open installed apps now.") &&
+    !marketplaceCatalogReadModel.includes("signed-cid-install-pending") &&
+    !marketplaceCatalogReadModel.includes("signed CID manifests") &&
+    !marketplaceCatalogReadModel.includes("launch installed capsules") &&
+    !marketplaceCatalogReadModel.includes("Paid capsules") &&
+    !marketplaceCatalogReadModel.includes("Protected capsules"),
+  "Marketplace catalog policy must describe install/payment/dDRM state in app-facing language",
+);
+assert(
+  marketplaceCatalogGateway.includes("mod read_model;") &&
+    marketplaceCatalogGateway.includes("mod bindings;") &&
+    marketplaceCatalogGateway.includes("capsule_interface_invoke") &&
+    marketplaceCatalogGateway.includes("resolve_capsule_method_binding") &&
+    marketplaceCatalogGateway.includes("binding.summary.executable") &&
+    marketplaceCatalogGateway.includes('"runtime_launch_failed"') &&
+    marketplaceCatalogGateway.includes("dispatch_capsule_affordance") &&
+    marketplaceCatalogGateway.includes("CAPSULE_INTERFACE_INVOKE_RESULT_SCHEMA") &&
+    !marketplaceCatalogGateway.includes(".send_raw(") &&
+    !marketplaceCatalogGateway.includes("invoke_provider(") &&
+    capsuleMethodBindings.includes('"provider-path-only"') &&
+    capsuleMethodBindings.includes("required_action") &&
+    capsuleMethodBindings.includes("runtime_capsule_affordance_binding") &&
+    marketplaceCatalogReadModel.includes("bindings:") &&
+    marketplaceCatalogReadModel.includes("executable_methods") &&
+    homeCliMain.includes("cli_invokable_methods") &&
+    homeCliMain.includes('binding.get("executable")') &&
+    !marketplaceCatalogGateway.includes("struct CapsuleCatalogResponse") &&
+    !marketplaceCatalogGateway.includes("fn catalog_capsule_summary") &&
+    !marketplaceCatalogGateway.includes("fn load_capsule_components") &&
+    marketplaceCatalogReadModel.includes("pub(in crate::api::gateway) struct CapsuleCatalogResponse") &&
+    marketplaceCatalogReadModel.includes("pub(in crate::api::gateway) struct CapsuleInterfaceRegistryResponse") &&
+    marketplaceCatalogReadModel.includes("fn catalog_capsule_summary") &&
+    marketplaceCatalogReadModel.includes("fn load_capsule_components") &&
+    marketplaceCatalogReadModel.includes("elastos.capsules.catalog/v1") &&
+    marketplaceCatalogReadModel.includes("elastos.capsules.interfaces/v1"),
+  "Capsule interfaces must derive executable bindings from Runtime handlers, keep provider paths non-generic, and make Home CLI fail closed to the same projection",
 );
 
 const documents = read("capsules/documents/browser/index.html");
@@ -2875,11 +4112,14 @@ const library = readAll([
 const objectProviderManifest = read("capsules/object-provider/capsule.json");
 const objectProviderImpl = read("elastos/crates/elastos-server/src/library.rs");
 const gatewayProviderProxy = read("elastos/crates/elastos-server/src/api/gateway_provider_proxy.rs");
-const gatewayInspectActions = readAll([
-  "elastos/crates/elastos-server/src/api/gateway_inspect_actions.rs",
+const gatewayInspectActions = read("elastos/crates/elastos-server/src/api/gateway_inspect_actions.rs");
+const gatewayInspectActionBinding = read(
   "elastos/crates/elastos-server/src/api/gateway_inspect_actions/binding.rs",
+);
+const espBinding = read("elastos/crates/elastos-server/src/esp_binding.rs");
+const gatewayInspectActionStore = read(
   "elastos/crates/elastos-server/src/api/gateway_inspect_actions/store.rs",
-]);
+);
 const libraryGatewayTests = read("elastos/crates/elastos-server/src/api/gateway_tests/library.rs");
 const retiredObjectProviderMarkers = {
   oldBinary: ["library", "provider"].join("-"),
@@ -2907,9 +4147,7 @@ const chatStyle = read("capsules/chat-room/browser/style.css");
 const gba = read("capsules/gba-emulator/browser/index.html");
 const gbaStyle = read("capsules/gba-emulator/browser/style.css");
 const gbaJs = read("capsules/gba-emulator/browser/emulator.js");
-const system = read("capsules/system/browser/index.html");
-const systemJs = read("capsules/system/browser/system.js");
-const systemStyle = read("capsules/system/browser/style.css");
+const gbaInputJs = read("capsules/gba-emulator/browser/gba-input.js");
 const walletMetamask = read("capsules/wallet-metamask/browser/index.html");
 const walletMetamaskJs = read("capsules/wallet-metamask/browser/wallet-metamask.js");
 const walletUnisat = read("capsules/wallet-unisat/browser/index.html");
@@ -2949,14 +4187,16 @@ const browserStyle = read("capsules/browser/browser/style.css");
 assert(
   browserJs.includes('window.addEventListener("beforeunload"') &&
     browserJs.includes('window.addEventListener("pagehide", releaseRuntimePageForUnload)') &&
+    browserJs.includes("keepalive: true") &&
+    !browserJs.includes("__elastosBrowserReleaseRuntimePage") &&
+    !shellWindows.includes("__elastosBrowserReleaseRuntimePage") &&
     browserJs.includes("window.__elastosBrowserCurrentPageId") &&
-    !browserJs.includes("window.__elastosBrowserReleaseRuntimePage") &&
     gatewayApi.includes('"/api/apps/browser/pages/:page_id/close"') &&
     gatewayBrowserApi.includes("pub(super) async fn browser_app_page_close") &&
     gatewayBrowserRouteTests.includes(
       '.uri(format!("/api/apps/browser/pages/{page_id}/close"))',
     ),
-  "Browser must own unload cleanup and the gateway must route close_page so iframe teardown releases singleton providers without a Home-callable frame hook",
+  "Browser must own unload cleanup through the authenticated Runtime close route without exposing a same-origin function hook to Home",
 );
 const walletWalletconnect = read("capsules/wallet-walletconnect/browser/index.html");
 const walletWalletconnectJs = read(
@@ -3337,7 +4577,7 @@ assert(
   gatewayApi.includes("HOME_SYSTEM_DESKTOP_OBJECT_SCHEMA") &&
     gatewayApi.includes("home_trash_desktop_object") &&
     gatewayApi.includes('"system_kind": "trash"') &&
-    shellCore.includes('targetId === "trash-full"') &&
+    homeGuiCore.includes('targetId === "trash-full"') &&
     shellSurface.includes("function isTrashDesktopObject") &&
     shellSurface.includes("Open Trash") &&
     shellSurface.includes('action: "empty-trash"') &&
@@ -3585,14 +4825,21 @@ assert(
   "Home desktop must project localhost://Users/self/Desktop through the registered object provider, not direct filesystem access or server-local helpers",
 );
 assert(
-  shellCore.includes("function desktopObjects(summary)") &&
-    shellCore.includes("function desktopObjectEntryId(object)") &&
-    shellCore.includes("function desktopLayoutEntries(summary)"),
+  homeGuiCore.includes("function desktopObjects(summary)") &&
+    homeGuiCore.includes("function desktopObjectEntryId(object)") &&
+    homeGuiCore.includes("function desktopLayoutEntries(summary)"),
   "Home layout state must treat Library Desktop objects as first-class desktop entries",
 );
 assert(
   shellSurface.includes("attachDesktopObjectInteractions") &&
     shellSurface.includes("export function openSelectedDesktopEntry()") &&
+    shellSurface.includes("return Array.isArray(capabilities) && capabilities.includes(capability)") &&
+    shellSurface.includes("function canOpenDesktopObject(object)") &&
+    shellSurface.includes('hasObjectCapability(object, "open")') &&
+    shellSurface.includes('hasObjectCapability(object, "list")') &&
+    shellSurface.includes("function canRevealDesktopObject(object)") &&
+    homeShellRegressionSmoke.includes("desktop object without capability metadata opened instead of failing closed") &&
+    homeShellRegressionSmoke.includes("desktop object actions without capability metadata reached Runtime") &&
     shellSurface.includes('openTarget("library", { query: { uri: object.uri } })') &&
     shellSurface.includes("desktopObjectViewer(object)") &&
     shellSurface.includes('openTarget(viewer,') &&
@@ -3603,7 +4850,8 @@ assert(
     shellSurface.includes('action: "properties-desktop-object"') &&
     shellSurface.includes("function libraryActionForObject(object, action)") &&
     shellSurface.includes('action === "download-desktop-object" ? "download" : "properties"') &&
-    shellJs.includes("openSelectedDesktopEntry()") &&
+    homeGuiJs.includes("openSelectedDesktopEntry()") &&
+    !shellJs.includes("openSelectedDesktopEntry()") &&
     !shellJs.includes("openTarget(shellState.selectedDesktopTargetId)"),
   "Home desktop objects must open and expose object actions through Library/Documents orchestration",
 );
@@ -3620,7 +4868,7 @@ assert(
   "Library must accept Home-delegated object actions by launch query without moving object-provider authority into Home",
 );
 assert(
-  shellJs.includes("desktopObjectsChanged(previous, summary)") &&
+  homeGuiJs.includes("desktopObjectsChanged(previous, summary)") &&
     shellJs.includes('kind === "home.desktop.changed"'),
   "Home shell must refresh when Library Desktop objects change",
 );
@@ -3716,7 +4964,7 @@ assert(
     libraryApi.includes("CHUNKED_UPLOAD_THRESHOLD_BYTES") &&
     libraryApi.includes("CHUNKED_UPLOAD_BYTES") &&
     libraryApi.includes("uploadFailureMessage") &&
-    libraryApi.includes("This file is too large for the current upload service.") &&
+    libraryApi.includes("too large for the current upload service") &&
     !libraryApi.includes("/api/provider/library/upload"),
   "Library upload must use object-provider upload only, use chunk sessions for large files, and explain edge-proxy 413 body-size failures",
 );
@@ -3785,7 +5033,8 @@ assert(
     libraryCss.includes('.content[data-empty="true"]') &&
     libraryRender.includes("This space is empty") &&
     libraryRender.includes("Add files or folders to this space.") &&
-    libraryRender.includes("This folder is empty") &&
+    libraryRender.includes('${visible} item${visible === 1 ? "" : "s"}') &&
+    libraryRender.includes('elements.currentTitle.textContent || "Library"') &&
     !libraryRender.includes("No connected spaces") &&
     libraryActions.includes("This Space is read-only.") &&
     !libraryActions.includes("Mounted WebSpaces are read-only resolver handles."),
@@ -3915,6 +5164,34 @@ assert(
     gatewayProviderProxy.includes('if scheme == "inspect" && op == "request_act"') &&
     !gatewayProviderProxy.includes('"dispatch_approved" => &[SYSTEM_CAPSULE_ID]') &&
     !gatewayProviderProxy.includes('"revoke" => &[SYSTEM_CAPSULE_ID]') &&
+    inspectorProviderGlue.includes("mod sources;") &&
+    inspectorProviderGlue.includes("mod projection;") &&
+    inspectorProviderGlue.includes("mod planning;") &&
+    inspectorProviderGlue.includes("mod dispatch;") &&
+    inspectorProviderGlue.includes("pub use sources::") &&
+    inspectorProviderSources.includes("pub trait InspectSource") &&
+    inspectorProviderSources.includes("pub struct CatalogInspectSource") &&
+    inspectorProviderSources.includes("pub struct RegistryInspectSource") &&
+    inspectorProviderSources.includes("pub struct AggregateInspectSource") &&
+    inspectorProviderProjection.includes("signature_fingerprint") &&
+    inspectorProviderProjection.includes("forbidden_fact_key") &&
+    inspectorProviderProjection.includes("forbidden_fact_string") &&
+    inspectorProviderProjection.includes("redact_fact_value") &&
+    inspectorProviderProjection.includes('"connect_ticket"') &&
+    inspectorProviderProjection.includes('"carrier_route"') &&
+    inspectorProviderProjection.includes('"control_socket_path"') &&
+    inspectorProviderProjection.includes('"raw_signature"') &&
+    inspectorProviderProjection.includes('"relay_ipc"') &&
+    inspectorProviderProjection.includes('"mutation_handle"') &&
+    inspectorProviderProjection.includes('"signature"') &&
+    inspectorProviderProjection.includes("pub(super) fn project") &&
+    inspectorProviderPlanning.includes("preview_execution_policy") &&
+    inspectorProviderPlanning.includes("build_capability_resource") &&
+    inspectorProviderPlanning.includes("pub(super) async fn plan") &&
+    inspectorProviderDispatch.includes("approved_execution_policy") &&
+    inspectorProviderDispatch.includes("ProviderInvocationTransport::Local") &&
+    inspectorProviderDispatch.includes("inspect_hidden_runtime_metadata_field") &&
+    inspectorProviderDispatch.includes("pub(super) async fn dispatch_approved") &&
     inspectorProvider.includes("elastos.inspect.gate-preview/v1") &&
     inspectorProvider.includes("elastos.inspect.dispatch-result/v1") &&
     inspectorProvider.includes("elastos.inspect.execution-policy/v1") &&
@@ -3924,21 +5201,37 @@ assert(
     inspectorProvider.includes("ProviderInvocationTransport::Local") &&
     inspectorProvider.includes('"can_dispatch": false') &&
     inspectorProvider.includes('"can_mutate": false') &&
-    inspectorProvider.includes('"dispatch": false') &&
-    gatewayInspectActions.includes("elastos.inspect.action-request/v1") &&
+    inspectorProvider.includes("dispatch\": false") &&
+    gatewayInspectActions.includes('mod binding;') &&
+    gatewayInspectActions.includes('mod store;') &&
     gatewayInspectActions.includes("append_inspect_action_notifications") &&
     gatewayInspectActions.includes("inspect_action_gate_summary") &&
     gatewayInspectActions.includes("Gate preview:") &&
     gatewayInspectActions.includes("approve_inspect_action_request") &&
     gatewayInspectActions.includes("deny_inspect_action_request") &&
     gatewayInspectActions.includes('"op": "dispatch_approved"') &&
-    gatewayInboxApi.includes("inspect-approve-request:") &&
-    gatewayInboxApi.includes("inspect-deny-request:") &&
+    !gatewayInspectActions.includes("std::fs::") &&
+    !gatewayInspectActions.includes("Sha256") &&
+    gatewayInspectActionBinding.includes("inspect_action_request_binding") &&
+    gatewayInspectActionBinding.includes("inspect_action_request_id_uses_nonce") &&
+    espBinding.includes("canonical_json") &&
+    espBinding.includes("elastos.esp.request-binding/v1") &&
+    gatewayInspectActionStore.includes("elastos.inspect.action-request/v1") &&
+    gatewayInspectActionStore.includes("InspectActionRequestRecord") &&
+    gatewayInspectActionStore.includes("pending_inspect_action_requests") &&
+    gatewayInspectActionStore.includes("read_inspect_action_record") &&
+    gatewayInspectActionStore.includes("write_inspect_action_record") &&
+    gatewayApi.includes("inspect-approve-request:") &&
+    gatewayApi.includes("inspect-deny-request:") &&
     gatewayTests.includes("inspect_action_requires_inbox_approval_before_dispatch") &&
     gatewayTests.includes("system_approval_attempt") &&
     gatewayTests.includes("StatusCode::FORBIDDEN") &&
     gatewayTests.includes("Gate preview: Capability elastos://exit/*: read") &&
     gatewayTests.includes("fresh passkey verification is required") &&
+    gatewayTests.includes("elastos.provider.invocation/v1") &&
+    gatewayTests.includes("provider:inspect->exit:status") &&
+    gatewayTests.includes('"approved_dispatch"') &&
+    gatewayTests.includes("elastos.provider.transfer/v1") &&
     gatewayTests.includes("inspect_action_can_be_denied_without_dispatch") &&
     capsuleInspectorDocs.includes("concise gate-preview summary") &&
     capsuleInspectorDocs.includes("System launch token can") &&
@@ -3949,11 +5242,291 @@ assert(
     inspectorTestingDocs.includes("Do not treat the pure SelfOnly test as proof") &&
     inspectorProvider.includes("signature_fingerprint") &&
     inspectorProvider.includes("signature_present") &&
+    inspectorProvider.includes("elastos.inspect.trust-evidence/v1") &&
+    inspectorProvider.includes('"provider_authority"') &&
+    inspectorProvider.includes('"granted_capabilities": Value::Null') &&
+    inspectorProvider.includes('"audit": Value::Null') &&
+    inspectorProvider.includes('"spend_budget": Value::Null') &&
+    inspectorProvider.includes('"intent_proof": Value::Null') &&
+    inspectorProvider.includes('"audit_chain_attestation": Value::Null') &&
+    inspectorProvider.includes("projection_reports_honest_authority_evidence_and_null_unavailable_facts") &&
+    inspectorProvider.includes("manifest-signature-secret") &&
+    inspectorProvider.includes("signature-raw-secret") &&
+    inspectorProvider.includes("projection_redacts_secret_paths_routes_and_mutation_handles") &&
     !inspectorProvider.includes('"signed_by": manifest') &&
     inspectorProvider.includes("inspect revoke is not implemented") &&
     inspectorProvider.includes("plan_reflects_provider_authority_without_dispatch") &&
     inspectorProvider.includes("projection_redacts_raw_signature_but_keeps_fingerprint"),
   "Capsule Inspector must remain a fail-closed Runtime mirror with System/Self inspect scopes, metadata-only gate preview, redacted provenance, no revoke dispatch, and ProviderRegistry registration",
+);
+assert(
+  gatewayApi.includes('"/api/esp/initialize"') &&
+    gatewayApi.includes("elastos.esp.initialize/v0") &&
+    gatewayApi.includes("elastos-shell-protocol") &&
+    gatewayApi.includes("local_runtime_adapter") &&
+    gatewayApi.includes('operation: "capsules.catalog"') &&
+    gatewayApi.includes('"elastos.inspect.gate-preview/v1"') &&
+    gatewayApi.includes('"elastos.inspect.action-request/v1"') &&
+    gatewayApi.includes("ESP is a projection and consent surface, not an authority layer.") &&
+    gatewayApi.includes("HTTP method and route fields describe the current local adapter") &&
+    gatewayApi.includes("Future Carrier transport may expose the same schemas only by preserving the same Runtime gates") &&
+    gatewayApi.includes("System launch token") &&
+    gatewayApi.includes("Inbox launch token plus fresh same-principal passkey Home token") &&
+    gatewayTests.includes("esp_initialize_describes_existing_projection_routes") &&
+    gatewayTests.includes("esp_initialize_keeps_http_adapter_separate_from_authority_model") &&
+    gatewayTests.includes("esp_initialize_negotiates_schema_tags_without_authority") &&
+    gatewayTests.includes("esp_generic_invocation_executes_only_explicit_runtime_bindings") &&
+    gatewayTests.includes("unsupported_esp_version") &&
+    espDoc.includes("This endpoint is only a descriptor") &&
+    espDoc.includes('`protocol: "elastos-shell-protocol"`') &&
+    espDoc.includes('`transport: "http-json"`') &&
+    espDoc.includes('`transport_scope: "local_runtime_adapter"`') &&
+    espDoc.includes("HTTP `method` and `route` fields describe the current local gateway adapter") &&
+    espDoc.includes("A future Carrier adapter may expose the") &&
+    espDoc.includes("same Runtime gates, consent path") &&
+    espDoc.includes('code: "unsupported_esp_version"') &&
+    espDoc.includes("The currently served `supported_schemas` list is:") &&
+    espDoc.includes("`elastos.esp.request-binding/v1`") &&
+    espDoc.includes("`elastos.inspect.action-result/v1`") &&
+    espDoc.includes("`elastos.inspect.dispatch-result/v1`") &&
+    includesNormalized(
+      espDoc,
+      "are flow schemas, not standalone projection routes",
+    ) &&
+    includesNormalized(espDoc, "Neither schema grants authority") &&
+    espDoc.includes('requires both `executable: true` and a concrete') &&
+    espDoc.includes('`handler_kind: "runtime"` binding') &&
+    espDoc.includes("Provider-path-only, unbound, unknown, and approval-required operations fail") &&
+    espDoc.includes("Out of scope for this branch") &&
+    espDoc.includes("does not call `dispatch_approved` or `revoke`") &&
+    docsIndex.includes("HOME_SHELL_HOST_CONTRACT.md") &&
+    docsIndex.includes("CAPSULE_INTERFACE_CONTRACT.md") &&
+    docsIndex.includes("SHELL_ESP_BOUNDARY_MAP.md") &&
+    espDoc.includes("CAPSULE_INTERFACE_CONTRACT.md") &&
+    espBoundaryMap.includes("## Architecture Placement") &&
+    espBoundaryMap.includes("runtime-owned facts, not as a new authority layer") &&
+    espBoundaryMap.includes("Capability checks, consent gates, request binding, token mint/spend, audit writes") &&
+    espBoundaryMap.includes("Provider-specific operations such as wallet, content, DID, decrypt, exit, browser engine") &&
+    espBoundaryMap.includes("Home shell / second shell / visual shell UX") &&
+    espBoundaryMap.includes("Home shell host contract") &&
+    espBoundaryMap.includes("`docs/HOME_SHELL_HOST_CONTRACT.md` defines the front-door contract") &&
+    espBoundaryMap.includes("Shells are replaceable projection and consent surfaces. They may ask; runtime decides.") &&
+    espBoundaryMap.includes("ESP TypeScript fact/projection package") &&
+    espBoundaryMap.includes("This is shared client/projection code for shells and tests. It must be pure, read-only, and carry no authority.") &&
+    espBoundaryMap.includes("If it proves, gates, mints, spends, routes, audits, or binds a principal") &&
+    espBoundaryMap.includes("If it implements a service behind `elastos://...` or `localhost://...`") &&
+    espBoundaryMap.includes("If it renders, organizes, asks, previews, or explains") &&
+    espBoundaryMap.includes("If it is only shared client typing or pure projection") &&
+    espBoundaryMap.includes("first attempt plain ES modules or native Web Components") &&
+    espBoundaryMap.includes("Svelte is optional only as a capsule-local compiler") &&
+    espBoundaryMap.includes("Extract it only after\n" +
+      "the System Inspector and shared `elastos/esp` projections are coherent") &&
+    espBoundaryMap.includes("must not vendor `spend_audit.js`") &&
+    espBoundaryMap.includes("Home CLI terminal shell proof") &&
+    espBoundaryMap.includes("browser `home-cli` terminal shell proof") &&
+    espBoundaryMap.includes("The browser `home-cli` terminal shell is implemented and machine-tested") &&
+    espBoundaryMap.includes("Shell marketplace") &&
+    espBoundaryMap.includes("SSE projection stream as a required ESP transport") &&
+    espBoundaryMap.includes("shell capsule -> runtime capability/session -> ESP facts/intents -> runtime gate -> provider/Carrier plane") &&
+    homeShellHostContract.includes("# Home Shell Host Contract") &&
+    homeShellHostContract.includes("`home` is not a selectable shell") &&
+    homeShellHostContract.includes("## Equal Shells") &&
+    homeShellHostContract.includes("## Origin Boundary") &&
+    homeShellHostContract.includes("requires no wildcard DNS, extra certificate, or reverse-proxy") &&
+    homeShellHostContract.includes("scoped launch token in the URL") &&
+    includesNormalized(homeShellHostContract, "A Home session cookie alone cannot mint an app token") &&
+    homeShellHostContract.includes("## Host Responsibilities") &&
+    homeShellHostContract.includes("## Shell Messages") &&
+    homeShellHostContract.includes("## App Messages") &&
+    homeShellHostContract.includes("## Passkeys And Sign-Out") &&
+    homeShellHostContract.includes("Runtime owns principals, passkey records, session grants, revocation, and audit") &&
+    homeShellHostContract.includes("Browser `home-cli` sign-out is a launch-token-bound") &&
+    homeShellHostContract.includes("A manifest declaring `role: shell` does not grant shell authority") &&
+    homeShellHostContract.includes("CSS hiding is not an accepted lifecycle model for a live previous") &&
+    homeShellHostContract.includes("browser-local active-shell hint may suppress") &&
+    homeShellHostContract.includes("directly to the top-level Home host") &&
+    homeShellHostContract.includes("CAPSULE_INTERFACE_CONTRACT.md") &&
+    homeShellHostContract.includes("node scripts/home-shell-bridge-smoke.mjs") &&
+    homeShellHostContract.includes("home-shell-objective-audit.mjs --require-complete") &&
+    capsuleInterfaceContract.includes("# Capsule Interface Contract") &&
+    capsuleInterfaceContract.includes("projection contract, not an authority layer") &&
+    capsuleInterfaceContract.includes("capsule manifest -> Runtime facts -> shell projection -> typed intent -> Runtime gate -> provider/Carrier effect") &&
+    capsuleInterfaceContract.includes("| Web projection |") &&
+    capsuleInterfaceContract.includes("| CLI projection |") &&
+    capsuleInterfaceContract.includes("| Facts |") &&
+    capsuleInterfaceContract.includes("| Affordances |") &&
+    capsuleInterfaceContract.includes("| Gate metadata |") &&
+    capsuleInterfaceContract.includes("| Audit / mirror view |") &&
+    capsuleInterfaceContract.includes("Trust material, verification evidence, declared permissions, executable") &&
+    capsuleInterfaceContract.includes("Missing evidence is") &&
+    capsuleInterfaceContract.includes("unknown and must never be presented as safe") &&
+    capsuleInterfaceContract.includes("successful HTTP responses are transport or presentation") &&
+    capsuleInterfaceContract.includes("Shells must not call providers directly for authority-bearing effects") &&
+    capsuleInterfaceContract.includes("Future Carrier transport must preserve the same schemas, gates, consent path") &&
+    capsuleInterfaceContract.includes("absent or incomplete rather than inventing it locally"),
+  "ESP v0 and Home Shell Host docs must preserve the Runtime/provider/shell/non-TCB placement boundary and front-door lifecycle contract",
+);
+assert(
+  espPackageJson.includes('"name": "@elastos/esp"') &&
+    espPackageJson.includes('"private": true') &&
+    !espPackageJson.includes('"dependencies"') &&
+    !espPackageJson.includes('"devDependencies"') &&
+    !/svelte|@sveltejs|vite|rollup/i.test(espPackageJson) &&
+    !/svelte|@sveltejs|vite|rollup/i.test(espPackageLock) &&
+    !existsSync(resolve(repoRootPath, "capsules/capsule-inspector")) &&
+    !/spend_audit|HomeCustodyView|spendBudgetView|auditChainView|intentProofView/.test(
+      readAll([
+        "elastos/esp/README.md",
+        "elastos/esp/audit_views.ts",
+        "elastos/esp/authority.ts",
+        "elastos/esp/capsule_detail.ts",
+        "elastos/esp/consent.ts",
+        "elastos/esp/custody.ts",
+        "elastos/esp/home_fleet.ts",
+        "elastos/esp/index.ts",
+        "elastos/esp/shell_picker.ts",
+        "elastos/esp/trust.ts",
+      ]),
+    ) &&
+    espReadme.includes("first attempt plain ES modules or native Web Components") &&
+    espReadme.includes("Svelte may be used later only as an optional capsule-local UI compiler") &&
+    espDoc.includes("Svelte is allowed only as an optional capsule-local compiler") &&
+    espDoc.includes("Standing grants are not implemented or exposed by ESP v0") &&
+    espDoc.includes("Reach enforcement and reach halos are not implemented by ESP v0") &&
+    espDoc.includes("SSE ESP projection streams are not product-ready") &&
+    espDoc.includes("Shell marketplace is not implemented") &&
+    espDoc.includes("still needs operator-profile evidence") &&
+    espDoc.includes("any later Home shell behavior change requires a new review") &&
+    includesNormalized(espDoc, "Runtime-owned PTY terminal") &&
+    includesNormalized(espDoc, "xterm renders PTY bytes without receiving host process authority") &&
+    includesNormalized(homeShellHostContract, "Runtime-owned PTY terminal") &&
+    espReadme.includes("Reach enforcement") &&
+    espReadme.includes("SSE ESP projection streams") &&
+    espReadme.includes("Shell marketplace") &&
+    espReadme.includes("Shell UI implementation and product UX evidence") &&
+    espTypes.includes("ESP_PROTOCOL = \"elastos-shell-protocol\"") &&
+    espTypes.includes("ESP_TRANSPORT_SCOPE = \"local_runtime_adapter\"") &&
+    espTypes.includes("export const ESP_AUTHORITY_INVARIANTS") &&
+    espTypes.includes("export interface EspInitializeResponse") &&
+    espTypes.includes("export interface EspFactDescriptor") &&
+    espTypes.includes("export interface EspVerbDescriptor") &&
+    espTypes.includes("export const ESP_FACT_DESCRIPTORS") &&
+    espTypes.includes("export const ESP_VERB_DESCRIPTORS") &&
+    espTypes.includes("export interface CapsuleCatalogResponse") &&
+    espTypes.includes("export interface CapsuleInterfaceRegistryResponse") &&
+    espTypes.includes("export interface InspectGatePreview") &&
+    espTypes.includes("export interface InspectActionRequestResponse") &&
+    espTypes.includes("export interface InspectActionResult") &&
+    espTypes.includes("export interface InspectDispatchResult") &&
+    espTypes.includes("export interface CapsuleInterfaceInvokeRequest") &&
+    espTypes.includes("provider_authority:") &&
+    espTypes.includes("trust_evidence:") &&
+    espTypes.includes("granted_capabilities: JsonValue[] | null") &&
+    espTypes.includes("audit_chain_attestation: JsonValue") &&
+    espCustody.includes("object.audit == null") &&
+    espTypes.includes("elastos.esp.request-binding/v1") &&
+    espTypes.includes("elastos.inspect.dispatch-result/v1") &&
+    espIndex.includes("./trust.ts") &&
+    espIndex.includes("./authority.ts") &&
+    espIndex.includes("./custody.ts") &&
+    espIndex.includes("./shell_picker.ts") &&
+    espIndex.includes("./consent.ts") &&
+    espIndex.includes("./capsule_detail.ts") &&
+    espIndex.includes("./home_fleet.ts") &&
+    espIndex.includes("./audit_views.ts") &&
+    espTrust.includes("export function trustMaterial") &&
+    espTrust.includes("export function verificationState") &&
+    espTrust.includes('"signature_declared"') &&
+    espTrust.includes('return "unknown"') &&
+    espAuthority.includes("export function authorityInvariantView") &&
+    espAuthority.includes("verification_grants_authority: false") &&
+    espAuthority.includes("declared_risk_is_advisory: true") &&
+    espAuthority.includes("http_success_grants_authority: false") &&
+    espAuthority.includes('authorized: null') &&
+    espCustody.includes("export function custodyView") &&
+    espCustody.includes('"absent" | "complete" | "incomplete" | "degraded"') &&
+    shellPickerProjection.includes("export function shellPicker") &&
+    shellPickerProjection.includes("HOME_HOST_ID") &&
+    shellPickerProjection.includes("export function shellIdentity") &&
+    shellPickerProjection.includes("return name.trim();") &&
+    !shellPickerProjection.includes(RETIRED_HOME_ALIAS_EXPRESSION) &&
+    espConsent.includes("export function inspectActionRequestValidation") &&
+    espConsent.includes('"absent" | "bound" | "truncated" | "incomplete"') &&
+    espCapsuleDetail.includes("export function capsuleDetailView") &&
+    espHomeFleet.includes("export function homeFleetView") &&
+    espHomeFleet.includes("view.custody.state !== \"complete\"") &&
+    espAuditViews.includes("export function auditCountsView") &&
+    espAuditViews.includes("export function gatePreviewAuditView") &&
+    espAuditViews.includes('"preview" | "degraded"') &&
+    espAuditViews.includes('"approved" | "degraded"') &&
+    espProjectionTests.includes("trust and provenance projections") &&
+    espProjectionTests.includes("trust and authority separation") &&
+    espProjectionTests.includes("does not turn verification into authorization or executability") &&
+    espProjectionTests.includes("keeps missing evidence unknown and declared risk advisory") &&
+    espProjectionTests.includes("rejects contradictory bindings and presentation signals as authority") &&
+    espProjectionTests.includes("custody and audit projections") &&
+    espProjectionTests.includes("consent validation") &&
+    espProjectionTests.includes("shell picker") &&
+    espProjectionTests.includes("capsule detail and Home fleet") &&
+    espProjectionTests.includes("renders missing or partial provenance as absent or incomplete") &&
+    espProjectionTests.includes("renders missing or malformed custody as absent or incomplete") &&
+    espProjectionTests.includes("renders missing preview or dispatch proof as degraded") &&
+    espProjectionTests.includes("renders missing and incomplete request bindings fail-honestly") &&
+    espProjectionTests.includes("must not be counted as healthy") &&
+    !espTypes.includes("affordance-consent-pending") &&
+    !espTypes.includes("elastos.reach") &&
+    !espTypes.includes("AffordanceGrantReceipt") &&
+    !espTypes.includes("RequestCapabilityInput") &&
+    !espTypes.includes("ValidateAndConsume") &&
+    !espTypes.includes("ReachFact") &&
+    !espTypes.includes("EventSource") &&
+    !espTypes.includes("SSE") &&
+    !espTypes.includes("shell marketplace") &&
+    !espTypes.includes("full second-shell") &&
+    !espTypes.includes("fetch(") &&
+    espPackageCheck.includes("ESP_SUPPORTED_SCHEMAS") &&
+    espPackageCheck.includes("ESP_FACT_DESCRIPTORS") &&
+    espPackageCheck.includes("ESP_VERB_DESCRIPTORS") &&
+    espPackageCheck.includes("servedSchemas") &&
+    espPackageCheck.includes("servedOperations") &&
+    espPackageCheck.includes("parseDocSupportedSchemas") &&
+    espPackageCheck.includes("parseDocProjectionFacts") &&
+    espPackageCheck.includes("parseDocVerbTable") &&
+    espPackageCheck.includes("gateway.rs must route") &&
+    espPackageCheck.includes("helperFiles") &&
+    espPackageCheck.includes("projections.test.mjs must cover") &&
+    espPackageCheck.includes("ProviderRegistry"),
+  "ESP type package and projection helpers must stay private, dependency-free, non-TCB, pure, and limited to currently served Runtime facts",
+);
+assert(
+  system.includes('type="module" src="./system.js') &&
+    systemJs.includes('from "./esp-projections.mjs"') &&
+    systemJs.includes("provenanceView(object)") &&
+    systemJs.includes("gatePreviewAuditView(result)") &&
+    systemJs.includes("inspectActionRequestValidation(result, {})") &&
+    systemJs.includes('inspectProvider("request_act"') &&
+    systemJs.includes('inspectProvider("plan"') &&
+    !systemJs.includes('inspectProvider("dispatch_approved"') &&
+    !systemJs.includes('inspectProvider("revoke"') &&
+    systemEspProjections.includes("export function provenanceView") &&
+    systemEspProjections.includes("export function gatePreviewAuditView") &&
+    systemEspProjections.includes("export function requestBindingView") &&
+    systemEspProjections.includes("export function inspectActionRequestValidation") &&
+    systemEspProjections.includes("Runtime/provider gates remain authoritative") &&
+    !systemEspProjections.includes("fetch(") &&
+    !systemEspProjections.includes("localStorage") &&
+    !systemEspProjections.includes("sessionStorage") &&
+    !systemEspProjections.includes("dispatch_approved") &&
+    !systemEspProjections.includes("/api/") &&
+    !systemEspProjections.includes("x-elastos-home-token") &&
+    systemEspProjectionCheck.includes("../elastos/esp/index.ts") &&
+    systemEspProjectionCheck.includes("../capsules/system/browser/esp-projections.mjs") &&
+    systemEspProjectionCheck.includes("System ESP projection adapter matches @elastos/esp projection helpers.") &&
+    systemEspProjectionCheck.includes("provenanceView(object), provenanceView(object)") &&
+    systemEspProjectionCheck.includes("gatePreviewAuditView(preview), gatePreviewAuditView(preview)") &&
+    systemEspProjectionCheck.includes("inspectActionRequestValidation(request, {})") &&
+    systemEspProjectionCheck.includes("must not contain authority marker"),
+  "System Technical Details must consume pure ESP projections while leaving authority, direct dispatch, tokens, and transport outside display code",
 );
 assert(
   carrierRuntime.includes('"provider_invoke"') &&
@@ -4161,11 +5734,11 @@ assert(
     objectProviderImpl.includes('"allowed": false') &&
     objectProviderImpl.includes('"reason": err.to_string()') &&
     libraryDialog.includes("Share Grants / Key Release") &&
-    libraryDialog.includes("<strong>Recipients</strong>") &&
-    libraryDialog.includes("<strong>Grants</strong>") &&
+    libraryDialog.includes("Share Receipt Summary") &&
+    libraryDialog.includes("<summary>Technical details</summary>") &&
     libraryDialog.includes("contentSecurity?.published_payload") &&
     libraryDialog.includes('name="sharePolicy" value="encrypted_recipient" disabled') &&
-    libraryDialog.includes("<strong>Key Release</strong>") &&
+    libraryDialog.includes("<strong>Protected sharing</strong>") &&
     libraryDialog.includes("<strong>Provider Chain</strong>") &&
     read("docs/PROTECTED_CONTENT.md").includes(
       "Visible protected-content UI may ship only as a disabled/read-only readiness",
@@ -4174,7 +5747,7 @@ assert(
       "Library protected-content rail is visible only as disabled/read-only readiness/status",
     ) &&
     libraryMenuSmoke.includes("Share Grants / Key Release") &&
-    libraryMenuSmoke.includes("Recipients") &&
+    libraryMenuSmoke.includes("Share Receipt Summary") &&
     libraryMenuSmoke.includes("not_required_for_plain_published_content") &&
     libraryGatewayTests.includes("ready_for_plain_content_fetch") &&
     libraryGatewayTests.includes("recipient_proof_verified") &&
@@ -4325,23 +5898,23 @@ assert(
 );
 assert(
   libraryIndex.includes('rel="stylesheet" href="library.css"') &&
-    libraryIndex.includes('type="module" src="src/app.js?v=') &&
+    libraryIndex.includes('type="module" src="src/app.js?v=library-20260711d"') &&
     !libraryIndex.includes("<style>") &&
     !libraryIndex.includes("function renderContent"),
   "Library index must stay a static shell with CSS and app code split out",
 );
 assert(
   libraryApp.includes('from "./model.js"') &&
-    libraryApp.includes('from "./actions.js') &&
-    libraryApp.includes('from "./api.js') &&
-    libraryApp.includes('from "./dialog.js') &&
+    libraryApp.includes('from "./actions.js?v=library-20260711d"') &&
+    libraryApp.includes('from "./api.js?v=library-20260711c"') &&
+    libraryApp.includes('from "./dialog.js?v=library-20260711d"') &&
     libraryApp.includes('from "./editor.js"') &&
     libraryApp.includes('from "./events.js"') &&
     libraryApp.includes('from "./menu.js"') &&
     libraryApp.includes('from "./navigation.js"') &&
     libraryApp.includes('from "./preview.js"') &&
     libraryApp.includes('from "./realtime.js"') &&
-    libraryApp.includes('from "./render.js') &&
+    libraryApp.includes('from "./render.js?v=library-20260711d"') &&
     libraryApp.includes('from "./selection.js"') &&
     libraryApp.includes('from "./state.js"') &&
     libraryApp.includes('from "./uploads.js"') &&
@@ -4428,123 +6001,96 @@ assert(
   "Chat Room mobile cards must use compact Home-aligned spacing",
 );
 assert(
-  gba.includes('aria-label="D-pad up, keyboard Arrow Up"'),
-  "GBA directional controls must expose keyboard mapping labels",
+  gba.includes('id="canvas"') &&
+    gba.includes('id="drop-zone" role="button"') &&
+    gba.includes('id="emulator-card"') &&
+    gba.includes('class="screen-card"') &&
+    gba.includes('class="utility-card"') &&
+    gba.includes('id="btn-ff"') &&
+    gba.includes('id="btn-save1"') &&
+    gba.includes('id="slot-status1"') &&
+    gba.includes('id="power-led"') &&
+    gba.includes('data-key="start"') &&
+    gba.includes('data-key="a"') &&
+    !gba.includes('id="utility-toggle"') &&
+    !gba.includes('id="file-input"') &&
+    !gba.includes('id="sound"'),
+  "GBA projection must preserve its responsive screen, Library chooser, state, and input controls",
 );
 assert(
-  gba.includes('aria-label="Save state slot 1"'),
-  "GBA save slots must expose slot-specific labels",
+  gbaStyle.includes(".emulator-card {") &&
+    gbaStyle.includes("grid-template-columns: minmax(0, 1fr) 15.75rem;") &&
+    gbaStyle.includes(".utility-card {") &&
+    gbaStyle.includes("@media (max-width: 780px)") &&
+    !gbaStyle.includes("--gba-width"),
+  "GBA projection must remain responsive inside Home instead of forcing a fixed handheld mockup",
 );
 assert(
-  gba.includes('aria-label="Load state slot 1"'),
-  "GBA load slots must expose slot-specific labels",
+  gbaJs.includes('await import("./mgba.js")') &&
+    gbaJs.includes("/api/viewers/${VIEWER_ID}/content/") &&
+    gbaJs.includes('raw: "true"') &&
+    gbaJs.includes("/storage/${VIEWER_ID}/save/") &&
+    gbaJs.includes("/storage/${VIEWER_ID}/state/") &&
+    gbaJs.includes("engine.resumeAudio()") &&
+    gbaJs.includes("navigator.getGamepads") &&
+    gbaJs.includes('window.addEventListener("pagehide"') &&
+    !gbaJs.includes("/api/apps/gba-emulator/sessions") &&
+    !gbaJs.includes("new AudioContext"),
+  "GBA must lazily load one portable engine and keep ROM/save authority on generic Runtime viewer routes",
 );
 assert(
-  gba.includes("Choose a game from Library"),
-  "GBA empty state must direct game selection through Library",
+  gbaInputJs.includes("export const BUTTON_BITS") &&
+    gbaInputJs.includes("export function gamepadMask") &&
+    gbaProjectionSmoke.includes('from "../capsules/gba-emulator/browser/gba-input.js"') &&
+    gbaProjectionSmoke.includes(
+      "portable=1 lazy=1 imports=${imports.length} keyboard=ok touch=ok gamepad=ok runtime_io=ok",
+    ),
+  "GBA input mapping and portable-engine boundary must remain covered",
 );
 assert(
-  gbaStyle.includes("--control-size: clamp(2.75rem, 13vw, 3.25rem);"),
-  "GBA mobile d-pad buttons must stay touch-sized",
+  fileExists("capsules/gba-emulator/browser/mgba.js") &&
+    fileExists("capsules/gba-emulator/browser/mgba.wasm") &&
+    gba.includes("connect-src 'self'") &&
+    gba.includes("worker-src 'self'"),
+  "GBA must carry its pinned portable engine and constrain it to same-origin Runtime I/O",
+);
+const gbaProductTruth = [
+  read("README.md"),
+  read("TASKS.md"),
+  read("docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md"),
+  read("scripts/build.sh"),
+].join("\n");
+assert(
+    gbaProductTruth.includes("Runtime-backed GBA") &&
+    gbaProductTruth.includes("portable") &&
+    gbaProductTruth.includes("demo") &&
+    gbaProductTruth.includes("full") &&
+    !/GBA (?:is|capsules are|product support is) retired/i.test(gbaProductTruth) &&
+    !gbaProductTruth.includes("gba-emulator, gba-ucity pending non-WASI engine"),
+  "GBA product docs and build output must describe the conditional portable demo path",
 );
 assert(
-  gbaStyle.includes("grid-template-areas:") &&
-    gbaStyle.includes('"left select start right"') &&
-    gbaStyle.includes('"dpad dpad actions actions"'),
-  "GBA mobile controls must place Select/Start in the L/R row",
+  gbaDemoSmoke.includes("normalize-gba-engine-imports.mjs") &&
+    gbaDemoSmoke.includes("gba-projection-smoke.mjs") &&
+    gbaDemoSmoke.includes("gateway_tests::gba") &&
+    gbaLiveSmoke.includes("/api/viewers/gba-emulator/content/gba-ucity") &&
+    gbaLiveSmoke.includes("/storage/gba-emulator/save/") &&
+    gatewayApi.includes("let authority_target = target_summary") &&
+    gatewayTests.includes("home_content_launch_uses_the_bound_gba_viewer_without_compute") &&
+    libraryMenuSmoke.includes('message?.target === "gba-emulator"') &&
+    libraryMenuSmoke.includes('message?.query?.objectUri?.endsWith("/Game.gba")') &&
+    !fileExists("scripts/gba.sh") &&
+    !fileExists("scripts/vendor-gba-runtime.sh"),
+  "GBA must have one portable content-viewer path with authorization, persistence, and gateway proof",
 );
 assert(
-  gbaStyle.includes(
-    ".shoulder-buttons,\n  .controls-row {\n    display: contents;",
-  ),
-  "GBA mobile controls must let the full controller share one grid",
-);
-assert(
-  gbaStyle.includes("#btn-select {\n    grid-area: select;") &&
-    gbaStyle.includes("#btn-start {\n    grid-area: start;"),
-  "GBA mobile Select/Start must be direct grid items in the shoulder row",
-);
-assert(
-  gbaStyle.includes("grid-area: left;\n    width: 100%;") &&
-    gbaStyle.includes("grid-area: right;\n    width: 100%;"),
-  "GBA mobile L/R controls must be full shoulder targets, not content-width dots",
-);
-assert(
-  gbaStyle.includes("#screen-container:focus"),
-  "GBA screen focus must not show a browser outline",
-);
-assert(
-  gbaStyle.includes("grid-template-rows: auto auto;"),
-  "GBA mobile screen must not be starved by a flexible row",
-);
-assert(
-  gbaStyle.includes("touch-action: none;"),
-  "GBA virtual controls must own touch gestures",
-);
-assert(
-  gba.includes('<aside class="utility-card">') &&
-    gba.includes('id="utility-panel"') &&
-    !gba.includes('id="utility-toggle"'),
-  "GBA Options must remain directly available without a separate collapsed toggle",
-);
-assert(
-  gbaStyle.includes("max-height: min(8.25rem, 22dvh);"),
-  "GBA mobile expanded Options must stay compact",
-);
-assert(
-  gbaStyle.includes("grid-template-columns: repeat(3, minmax(0, 1fr));"),
-  "GBA mobile save slots must use one row",
-);
-assert(
-  gbaStyle.includes(".shell {\n    width: 100%;\n    padding: 0.2rem;"),
-  "GBA mobile shell must not waste viewport on outer gutters",
-);
-assert(
-  gbaStyle.includes(
-    ".screen-card {\n    grid-template-rows: auto auto;\n    align-content: start;\n    padding: 0.38rem;",
-  ),
-  "GBA mobile screen card must keep compact chrome",
-);
-assert(
-  gbaJs.includes("touchPointers.set(event.pointerId, button)") &&
-    gbaJs.includes("touchPointers.delete(event.pointerId)"),
-  "GBA touch controls must track pointer-specific presses",
-);
-assert(
-  gbaJs.includes("pointerdown") && gbaJs.includes("pointerup"),
-  "GBA controls must use a single pointer-event input path",
-);
-assert(
-  !gbaJs.includes("touchstart") && !gbaJs.includes("mousedown"),
-  "GBA controls must not mix touch and mouse input handlers",
-);
-assert(
-  !gbaJs.includes("syncUtilityDefaultForViewport") &&
-    gbaStyle.includes("max-height: min(8.25rem, 22dvh);"),
-  "GBA compact Options layout must remain CSS-driven",
-);
-assert(
-  gbaJs.includes("assertPortableEngineSupport"),
-  "GBA startup must preflight threaded WebAssembly support before mGBA init",
-);
-assert(
-  gbaJs.includes("withTimeout(") &&
-    gbaJs.includes("The GBA engine did not start."),
-  "GBA startup must fail visibly instead of hanging during mGBA init",
-);
-assert(
-  gbaJs.includes("SharedArrayBuffer"),
-  "GBA startup must explicitly guard WebAssembly thread requirements",
-);
-assert(
-  gbaJs.includes("This browser cannot run the GBA engine.") &&
-    gbaJs.includes("This browser does not provide isolated WebAssembly threads."),
-  "GBA unsupported-runtime copy must explain WebAssembly thread requirements",
-);
-assert(
-  gbaJs.includes("Choose a GBA game from Library.") &&
-    !gbaJs.includes("Choose an installed ROM"),
-  "GBA runtime copy must direct game selection through Library",
+  gbaLinuxBrowserSmoke.includes("--remote-debugging-port=9222") &&
+    gbaLinuxBrowserSmoke.includes("cleanup=ephemeral") &&
+    gbaLinuxBrowserSmoke.includes("save_bytes=") &&
+    gbaLinuxBrowserProof.includes('new KeyboardEvent("keydown"') &&
+    gbaLinuxBrowserProof.includes('new PointerEvent("pointerdown"') &&
+    gbaLinuxBrowserProof.includes('sessionStorage.setItem("gba-linux-proof-phase", "reload")'),
+  "GBA must keep reproducible Linux Chromium render, input, audio, save/reload, and cleanup proof",
 );
 assert(
   !system.includes("<dt>Overlay</dt>"),
@@ -4560,34 +6106,65 @@ assert(
   "System Account tab must focus on accounts; display-name Profile belongs in People",
 );
 assert(
-  system.includes(`./style.css?v=${systemAssetVersion}`) &&
-    system.includes(`./system.js?v=${systemAssetVersion}`),
+  system.includes(`style.css?v=${systemAssetVersion}`) &&
+    system.includes(`system.js?v=${systemAssetVersion}`),
   "System browser assets must be cache-busted after UI changes",
 );
 assert(
+  (systemJs.match(/function notifyHomeSummaryChanged\(/g) || []).length === 1,
+  "System must keep one Home summary notification helper",
+);
+assert(
+  system.includes('data-settings="catalog"') &&
+    system.includes("Apps &amp; Services") &&
+    system.includes('id="capsule-catalog"') &&
+    system.includes('id="capsule-catalog-refresh"') &&
+    systemJs.includes("configureCapsuleCatalog") &&
+    systemJs.includes("refreshCapsuleCatalog") &&
+    systemJs.includes('fetchJson("/api/capsules/catalog"') &&
+    systemJs.includes('fetchJson("/api/capsules/interfaces"') &&
+    systemJs.includes("binding.executable !== true") &&
+    systemStyle.includes(".catalog-group") &&
+    systemStyle.includes(".catalog-row") &&
+    !system.includes("Permissioned Runtime mirror") &&
+    !system.includes('id="inspect-list"') &&
+    !system.includes('id="inspect-detail"') &&
+    !systemJs.includes("configureInspector") &&
+    !systemStyle.includes(".inspect-plan-output"),
+  "System must present the Runtime catalog as a plain Apps & Services view without exposing the privileged inspector by default",
+);
+assert(
   system.includes('data-settings="security"') &&
-    system.includes('id="technical-details"') &&
+    system.includes('<details id="technical-details"') &&
+    !system.includes('<details id="technical-details" open') &&
+    system.includes("Technical Details") &&
     system.includes('id="technical-inspect-list"') &&
     system.includes('id="technical-inspect-detail"') &&
-    system.includes('id="technical-inspect-refresh"') &&
-    system.includes("Review component identity, permissions, verification, and approval requirements.") &&
     systemJs.includes("configureTechnicalDetails") &&
-    systemJs.includes("refreshTechnicalDetails") &&
+    systemJs.includes('technicalDetailsNode.addEventListener("toggle"') &&
     systemJs.includes('inspectProvider("capsules"') &&
     systemJs.includes('inspectProvider("capsule"') &&
-    systemJs.includes('inspectProvider("plan"') &&
-    systemJs.includes('inspectProvider("request_act"') &&
-    systemJs.includes('operation === "request_act"') &&
-    systemJs.includes('response.schema === "elastos.inspect.action-request/v1"') &&
-    systemJs.includes('response.status === "pending"') &&
+    systemJs.includes("registeredProviderSchemes") &&
+    systemJs.includes('readText(object.manifest && object.manifest.role) !== "provider"') &&
+    systemJs.includes("!registeredProviderSchemes.has(scheme)") &&
+    systemJs.includes("Identity") &&
+    systemJs.includes("Permissions") &&
+    systemJs.includes("Verification") &&
+    systemJs.includes("Approval") &&
     systemJs.includes("Request approval") &&
-    systemJs.includes("/api/provider/inspect/") &&
+    systemJs.includes("Sent to Inbox for approval.") &&
+    !system.includes("not stamped") &&
+    !system.includes("not present") &&
+    !system.includes("No gate metadata declared") &&
+    !systemJs.includes("not stamped") &&
+    !systemJs.includes("not present") &&
+    !systemJs.includes("No gate metadata declared") &&
+    !systemJs.includes("output.textContent = JSON.stringify") &&
     !systemJs.includes('inspectProvider("dispatch_approved"') &&
     !systemJs.includes('inspectProvider("revoke"') &&
-    !systemJs.includes("/api/provider/inspect/revoke") &&
-    systemStyle.includes(".technical-inspect-grid") &&
-    systemStyle.includes(".technical-inspect-detail"),
-  "System Inspector must expose the Runtime inspect mirror as a System-only read/preview UI that can request Inbox approval without direct revoke or dispatch affordances",
+    systemStyle.includes(".technical-details") &&
+    systemStyle.includes(".technical-inspect-grid"),
+  "System must keep privileged inspection collapsed under Security, use plain labels, preview only registered provider operations, and route approval through Inbox",
 );
 assert(
   !system.includes("wallet-create") && !system.includes("Approval requests"),
@@ -4624,7 +6201,7 @@ assert(
     system.includes("settings-sidebar-text\">About</span>") &&
     !system.includes("settings-sidebar-text\">System</span>") &&
     !system.includes("settings-sidebar-text\">Runtime</span>"),
-  "System app must expose technical device details as About, not as duplicate Runtime sections",
+  "System app must expose device details under About, not as duplicate Runtime sections",
 );
 assert(
   !system.includes('<h2 id="identity-title">Profile</h2>') &&
@@ -4648,7 +6225,7 @@ assert(
   "System must label the DID as device identity",
 );
 assert(
-  system.indexOf('<h1 id="about-panel-title">About</h1>') <
+  system.indexOf('<h1 id="device-title" class="pc2-section-title">This Device</h1>') <
     system.indexOf("<dt>Device identity</dt>"),
   "System device DID must live under About, not the primary account surface",
 );
@@ -4760,20 +6337,22 @@ assert(
   "Home shell must keep signed sessions fresh on long-lived desktops",
 );
 assert(
-  shellCore.includes("HOME_BROWSER_CONTEXT_KEY") &&
-    shellCore.includes("browser_context_id"),
+  homeGuiCore.includes("HOME_BROWSER_CONTEXT_KEY") &&
+    homeGuiCore.includes("browser_context_id"),
   "Home open-window restore must be bound to a browser-context id so clearing site data cannot replay stale windows",
 );
 assert(
-  shellCore.includes("newBrowserContextId") &&
-    shellCore.includes("getRandomValues") &&
-    !shellCore.includes("Math.random()"),
+  homeGuiCore.includes("newBrowserContextId") &&
+    homeGuiCore.includes("getRandomValues") &&
+    !homeGuiCore.includes("Math.random()"),
   "Home browser context ids must use browser crypto instead of random fallback ids",
 );
 assert(
   shellWindows.includes("seenTargets") &&
-    shellWindows.includes("seenTargets.has(targetId)"),
-  "Home session restore must de-dupe targets so one stale session cannot spawn repeated System windows",
+    shellWindows.includes("seenTargets.has(targetId)") &&
+    homeShellRegressionSmoke.includes("rootless GUI session restored without explicit shell ownership") &&
+    homeShellRegressionSmoke.includes("CLI-owned overlay session restored into Home GUI"),
+  "Home session restore must de-dupe targets and reject sessions owned by a different root shell",
 );
 assert(
   protectedHomeStateSmoke.includes("home_browser_state"),
@@ -4812,6 +6391,19 @@ assert(
   shellAuth.includes("startAutomaticPasskeySignIn") &&
     shellAuth.includes("Choose your passkey."),
   "Home sign-in must automatically ask for a passkey instead of requiring a duplicate continue click",
+);
+const renderUnlockCheckingBody = shellAuth.match(
+  /function renderUnlockChecking\(\) \{[\s\S]*?\n\}/,
+)?.[0] || "";
+assert(
+  shellAuth.includes("if (registered) {\n      startAutomaticPasskeySignIn") &&
+    renderUnlockCheckingBody.includes("autoSignInAttempted = false") &&
+    !shellAuth.includes("AbortController") &&
+    !shellAuth.includes('name === "AbortError"') &&
+    !shellAuth.includes("guestRegistrationAvailable") &&
+    !shellAuth.includes('registered && unlockPresentation === "modal"') &&
+    shellAuth.includes('unlockMode === "signin_guest_enabled" && guestRegistrationEnabled'),
+  "Home unsigned desktop unlock must stay aligned with the main passkey prompt behavior",
 );
 assert(
   shellAuth.includes('unlockMode === "create_guest"') &&
@@ -4898,7 +6490,7 @@ assert(
   "Home passkey flow must not flicker from checking copy before the final unlock card",
 );
 assert(
-  shellIndex.includes("toolbar-sign-out") &&
+  homeGuiTemplateHtml.includes("toolbar-sign-out") &&
     shellAuth.includes("/api/auth/sessions/sign-out"),
   "Home must expose an explicit sign-out path that clears the browser session through Runtime",
 );
@@ -5261,18 +6853,22 @@ const browserPlanningSurface = [
 ].join("\n");
 assert(
   browserManifest.includes('"name": "browser"') &&
-    browserManifest.includes('"elastos://browser/page"') &&
-    browserManifest.includes('"elastos://browser/display"') &&
-    browserManifest.includes('"elastos://browser/exit"') &&
-    browserManifest.includes('"elastos://browser/profile"') &&
-    browserManifest.includes('"elastos://browser/wallet-bridge"') &&
-    browserManifest.includes('"name": "net-provider"') &&
-    browserManifest.includes('"name": "wallet-provider"') &&
+    browserCapsuleManifest.capabilities.includes("elastos://browser/page") &&
+    browserCapsuleManifest.capabilities.includes("elastos://browser/display") &&
+    browserCapsuleManifest.capabilities.includes("elastos://browser/exit") &&
+    browserCapsuleManifest.capabilities.includes("elastos://browser/profile") &&
+    browserCapsuleManifest.capabilities.includes("elastos://browser/wallet-bridge") &&
+    browserCapsuleManifest.requires.some((req) => req.name === "browser-engine-adapter") &&
+    browserCapsuleManifest.requires.some((req) => req.name === "exit-provider") &&
+    browserCapsuleManifest.requires.some((req) => req.name === "net-provider") &&
+    browserCapsuleManifest.requires.some((req) => req.name === "wallet-provider") &&
     !browserManifest.includes('"elastos://wallet/*"') &&
     !browserManifest.includes('"elastos://net/stream"') &&
+    !browserManifest.includes('"elastos://exit/*"') &&
+    !browserManifest.includes('"elastos://browser-engine/*"') &&
     !browserManifest.includes("guest_network") &&
     !browserManifest.includes('"provides"'),
-  "Browser capsule manifest must declare Browser-specific intents and provider dependencies without direct wallet, network, provider, or guest-network authority",
+  "Browser capsule manifest must declare Browser-scoped intent while raw Browser Engine, Exit, Net, and Wallet provider authority stays Runtime-owned",
 );
 assert(
   wciAlignmentScript.includes(
@@ -6262,7 +7858,7 @@ assert(
   "Browser provider runbook must render, document, and smoke-test the objective checklist plus blocked goal, Selkies session occupancy, artifact-bound decision reports, current-host stop condition, structured next action, read-only safety boundary, and blocking summary so missing product audio, manual UX proof, and provider blockers stay visible before operator commands",
 );
 assert(
-  currentState.includes("Last updated: 2026-06-29 UTC") &&
+  /^Last updated: \d{4}-\d{2}-\d{2} UTC$/m.test(currentState) &&
     currentState.includes(
       "Browser architecture is coherent enough to preserve",
     ) &&
@@ -6289,6 +7885,100 @@ assert(
     currentState.includes("not accepted as the final Browser") &&
     currentState.includes("protected/recoverable Browser profile storage"),
   "state.md must preserve the current Browser truth: architecture valid, Selkies/Docker baseline-only, native proof blocked on this server, hosted candidates unprovisioned, and product audio/manual UX still incomplete",
+);
+assert(
+  currentState.includes("## Home Shell Truth") &&
+    currentState.includes("`home-shell-host` for host lifecycle") &&
+    currentState.includes("`home-gui` for the desktop projection") &&
+    currentState.includes("`home-cli` for the command projection") &&
+    includesNormalized(currentState, "`home-gui` and `home-cli` are sibling shell capsules") &&
+    includesNormalized(currentState, "same Runtime facts, launch validation, lifecycle, sign-out") &&
+    includesNormalized(currentState, "GUI owns windows while CLI owns the Runtime PTY") &&
+    currentState.includes("replaces the obsolete `esp-shell` capsule") &&
+    currentState.includes("no provider authority") &&
+    currentState.includes("Home CLI TUI actions write a structured Home `intent.json`") &&
+    currentState.includes("Core first-party manifests now declare typed affordance") &&
+    currentState.includes("app, viewer, shell, connector, content, and provider surfaces") &&
+    includesNormalized(currentState, "`library`, `documents`, `archive-manager`") &&
+    currentState.includes("provider-role capsules now") &&
+    currentState.includes("project authority metadata for service-plane inspection") &&
+    currentState.includes("first_party_capsules_have_complete_projection_contract") &&
+    tasks.includes("Keep first-party capsule projection validation covered") &&
+    homeShellHostContract.includes("first_party_capsules_have_complete_projection_contract") &&
+    includesNormalized(currentState, "Runtime gates, approval, launch tokens, providers, and audit remain") &&
+    includesNormalized(currentState, "no desktop GUI markup or code in the neutral host document") &&
+	    currentState.includes("Home Host summary handling does not require GUI DOM or GUI layout") &&
+	    currentState.includes("capsules/home-gui/browser/shell-core.js") &&
+    currentState.includes("no-hint neutral resolving through Runtime ensure before") &&
+    currentState.includes("browser-side command projection out of the product entirely") &&
+    currentState.includes("Runtime-owned PTY terminal") &&
+    currentState.includes("first-run help is split into Tabs, Controls, Advanced, and") &&
+    currentState.includes("default path shows only the five user-facing tab commands") &&
+    currentState.includes("hidden until `help advanced`,") &&
+    currentState.includes("catalog/interface/service facts from the Runtime-owned Home snapshot") &&
+    includesNormalized(currentState, "non-delegatable launch token") &&
+    includesNormalized(currentState, "serialized Home CLI invoke intent payload") &&
+    currentState.includes("signed virtual-passkey System picker switch") &&
+    includesNormalized(currentState, "failed signed switchback recovery without mounting `home-gui`") &&
+    includesNormalized(currentState, "Home CLI Apps showing GUI-only Browser/GBA targets read-only without implicit launch") &&
+    includesNormalized(currentState, "Home shell implementation, source gates, and machine smokes pass") &&
+    includesNormalized(currentState, "origin-isolation change requires a fresh commit-bound operator pass") &&
+    currentState.includes("any later Home shell behavior change requires a new or re-reviewed") &&
+    !tasks.includes("finish operator-profile proof for the reduced CLI dispatch boundary") &&
+    tasks.includes("Design `elastos:bus@v2` only when a concrete product Component") &&
+    includesNormalized(tasks, "Keep `elastos:bus@v1` bounded and immutable"),
+  "state.md and TASKS.md must preserve current Home shell proof truth and keep future Components and Bus work versioned",
+);
+assert(
+  homeShellManualUxReport.includes('const SCHEMA = "elastos.home-shell.manual-ux/v1"') &&
+    homeShellManualUxReport.includes('"no_home_gui_chrome_bleed_through"') &&
+    homeShellManualUxReport.includes('"no_desktop_first_paint_before_cli"') &&
+    homeShellManualUxReport.includes('"home_cli_hides_gui_only_browser_from_default_menu"') &&
+    homeShellManualUxReport.includes("validator accepted the stale Home CLI Browser-open check") &&
+    homeShellManualUxReport.includes("home_cli_open_browser_returns_to_home_gui_window") &&
+    !homeShellManualUxReport.includes('"home_cli_open_browser_uses_host_overlay",') &&
+    homeShellManualUxReport.includes("operator_profile.passkey_sign_in must be true") &&
+    homeShellManualUxReport.includes("home_token=") &&
+    homeShellManualUxReport.includes("x-elastos-home-token") &&
+    homeShellManualUxReport.includes("review_artifacts") &&
+    homeShellManualUxReport.includes("--self-test") &&
+    homeShellManualUxReport.includes("--notes-template") &&
+    homeShellManualUxReport.includes("--artifact-entry") &&
+    homeShellManualUxReport.includes("--report-from-notes") &&
+    homeShellManualUxReport.includes("valid_notes_report_accepted") &&
+    homeShellManualUxReport.includes("unreviewed_notes_rejected") &&
+    homeShellManualUxReport.includes("missing_review_time_notes_rejected") &&
+    homeShellManualUxReport.includes("notes-to-report accepted manual notes without reviewed_at") &&
+    homeShellManualUxReport.includes("Set redacted=true in the report only after reviewing the file for secrets.") &&
+    homeShellHostContract.includes("node scripts/home-shell-manual-ux-report.mjs --template") &&
+    homeShellHostContract.includes("node scripts/home-shell-manual-ux-report.mjs --notes-template") &&
+    homeShellHostContract.includes("node scripts/home-shell-manual-ux-report.mjs --artifact-entry") &&
+    homeShellHostContract.includes("node scripts/home-shell-manual-ux-report.mjs --report-from-notes") &&
+    homeShellHostContract.includes("node scripts/home-shell-manual-ux-report.mjs --input") &&
+    includesNormalized(homeShellHostContract, "screen-capture-free artifact path") &&
+    homeShellHostContract.includes("converts the") &&
+    homeShellHostContract.includes("source.commit` to match") &&
+    includesNormalized(homeShellHostContract, "absence of desktop first-paint before"),
+  "Home shell manual UX proof must have a fail-closed template/validator, sensitive-text rejection, docs, screen-capture-free notes artifacts, and explicit GUI bleed-through checks",
+);
+assert(
+  homeShellObjectiveAudit.includes('const SCHEMA = "elastos.home-shell.objective-audit/v1"') &&
+    homeShellObjectiveAudit.includes("validateHomeShellManualUxReport") &&
+    homeShellObjectiveAudit.includes("operator_browser_ux_manual") &&
+    homeShellObjectiveAudit.includes("manual UX source.commit must match current HEAD") &&
+    homeShellObjectiveAudit.includes("current_head") &&
+    homeShellObjectiveAudit.includes("--notes-template") &&
+    homeShellObjectiveAudit.includes("--artifact-entry") &&
+    homeShellObjectiveAudit.includes("--report-from-notes") &&
+    homeShellObjectiveAudit.includes("runtime_pty_stream_terminal") &&
+    homeShellObjectiveAudit.includes("--require-complete") &&
+    homeShellObjectiveAudit.includes("Runtime-owned PTY terminal") &&
+    homeShellObjectiveAudit.includes("xterm renders a Runtime-owned PTY") &&
+    currentState.includes("scripts/home-shell-objective-audit.mjs") &&
+    currentState.includes("Manual evidence is commit-bound") &&
+    homeShellHostContract.includes("node scripts/home-shell-objective-audit.mjs") &&
+    homeShellHostContract.includes("Runtime-owned PTY terminal"),
+  "Home shell objective audit must fail closed on missing or stale operator-profile UX and Runtime PTY/stream terminal evidence",
 );
 assert(
   read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes("bbx install") &&
@@ -7512,9 +9202,7 @@ assert(
     shellWindows.includes("query: restoredWindow.query") &&
     browserJs.includes("const stalePage = previousPage ? null : rememberedRuntimePage();") &&
     browserJs.includes("await closeRuntimePage(stalePage);") &&
-    !browserJs.includes(
-      "window.__elastosBrowserReleaseRuntimePage = releaseRuntimePageForUnload;\npublishRuntimePageForHost(null);",
-    ),
+    !browserJs.includes("__elastosBrowserReleaseRuntimePage"),
   "Home must persist Browser window launch query/browser_instance across restore and Browser must not clear remembered runtime page ids before stale-page cleanup runs",
 );
 assert(
@@ -7685,8 +9373,8 @@ assert(
     browserJs.includes("Only http and https addresses") &&
     browserJs.includes("/api/apps/browser/open") &&
     browserJs.includes("elastos.browser.open-result/v1") &&
-    browserJs.includes("Browser could not complete the request.") &&
-    browserJs.includes("This page was blocked by your Exit Node settings.") &&
+    browserJs.includes("Browser is temporarily unavailable") &&
+    browserJs.includes("blocked by your Exit Node settings") &&
     browserJs.includes("historyEntries") &&
     !browserJs.includes("/api/provider/net/stream") &&
     !browserJs.includes("/api/provider/net/http") &&
@@ -7714,7 +9402,9 @@ assert(
   "Browser capsule must be registered as a platform-independent capsule artifact",
 );
 assert(
-  browserCapsulesApi.includes("browser_capsule_documents_allow_isolated_home_embedding") &&
+  browserCapsulesApi.includes(
+    "browser_capsule_documents_allow_isolated_home_embedding",
+  ) &&
     browserCapsulesApi.includes(
       'const BROWSER_CAPSULE_DOCUMENT_CORP: &str = "cross-origin"',
     ) &&
@@ -7762,11 +9452,45 @@ const iframeOriginBoundary = {
     gatewayTests.includes(
       "gateway_allows_opaque_capsule_preflight_without_granting_unrelated_origins",
     ),
+  hostContractDocumentsIsolation: includesNormalized(
+    homeShellHostContract,
+    "Neither shell nor an app shares Home's effective origin",
+  ),
+  capsuleContractDocumentsIsolation: includesNormalized(
+    capsuleInterfaceContract,
+    "Ordinary browser capsule projections use opaque sandboxed origins",
+  ),
 };
 assert(
   Object.values(iframeOriginBoundary).every(Boolean),
   "Home app frames must use opaque sandbox isolation without DNS or ambient Home authority",
   iframeOriginBoundary,
+);
+const homeLaunchSource = sourceBlock(
+  gatewayApi,
+  "pub(super) async fn home_launch(",
+  "Home launch endpoint",
+);
+assert(
+  homeLaunchSource.includes("require_home_launch_token_context") &&
+    !homeLaunchSource.includes("require_home_token_context") &&
+    gatewayHomeSystemTests.includes("let cookie_only = app") &&
+    gatewayHomeSystemTests.includes("StatusCode::FORBIDDEN") &&
+    gatewayHomeTerminal.includes("Extension(gateway_api_url): Extension<TrustedGatewayApiUrl>") &&
+    !gatewayHomeTerminal.includes("home_terminal_gateway_api_url") &&
+    !gatewayHomeTerminal.includes("header::HOST") &&
+    gatewayApi.includes("fn trusted_gateway_api_url(") &&
+    gatewayApi.includes("fn is_trusted_home_shell_id(") &&
+    gatewayApi.includes(".filter(|capsule| is_trusted_home_shell_id(&capsule.name))") &&
+    gatewayHomeSystemTests.includes("manifest-shell") &&
+    gatewayHomeSystemTests.includes('candidate["name"] == "manifest-shell"') &&
+    gatewayHomeSystemTests.includes("manifest_shell_update.status(), StatusCode::FORBIDDEN") &&
+    homeShellBridgeSmoke.includes("Home launch did not use explicit host-held authority") &&
+    homeShellBridgeSmoke.includes("Home CLI did not receive the same Runtime-scoped launch result as Home GUI") &&
+    homeShellBridgeSmoke.includes("Home CLI launch request switched shells implicitly") &&
+    homeShellBridgeSmoke.includes("Browser frame obtained host passkey authority") &&
+    homeShellBridgeSmoke.includes("validated System frame did not receive capsule-scoped passkey proof"),
+  "Home launch minting must require host-held explicit authority, CLI callbacks must use trusted listener configuration, and ESP v0 shells must be allowlisted",
 );
 assert(
   gatewayApi.includes('const BROWSER_CAPSULE_ID: &str = "browser"') &&
@@ -7872,7 +9596,7 @@ assert(
   "Wallet must provide balances and built-in Bitcoin accounts without manual Bitcoin proof linking",
 );
 assert(
-  wallet.includes("wallet-20260523a") &&
+  wallet.includes("wallet.js?v=wallet-20260711c") &&
     wallet.includes('id="wallet-send"') &&
     wallet.includes('id="wallet-receive"') &&
     wallet.includes("data-wallet-create-account") &&
@@ -7883,7 +9607,8 @@ assert(
     !walletJs.includes("Create your first account") &&
     walletJs.includes('"EVM"') &&
     walletJs.includes('"Bitcoin"') &&
-    walletJs.includes("Create an EVM account for supported networks.") &&
+    walletJs.includes("Choose the account type you want to create.") &&
+    !walletJs.includes("Chains are provider routes") &&
     !wallet.includes('id="wallet-create-method"') &&
     walletJs.includes("openReceiveFlow") &&
     walletJs.includes("openSendFlow") &&
@@ -7981,7 +9706,7 @@ assert(
     walletJs.includes("/api/apps/wallet/wallet/default") &&
     walletJs.includes("openRenameAccount") &&
     walletJs.includes('method: "PUT"') &&
-    gatewayWalletAppApi.includes('"op": "rename_account"') &&
+    gatewayApi.includes('"op": "rename_account"') &&
     gatewayTests.includes("test_wallet_app_can_rename_account") &&
     walletProvider.includes("RenameAccount") &&
     walletProvider.includes("rename_account"),
@@ -8198,12 +9923,11 @@ assert(
   "System smoke must cover Recovery Kit download/import controls",
 );
 assert(
-  systemSmoke.includes("technicalDetailsPresent") &&
-    systemSmoke.includes("System Security must expose Technical Details") &&
-    systemSmoke.includes(".technical-inspect-grid") &&
-    systemSmoke.includes("legacyInspectorPresent === false") &&
+  systemSmoke.includes("catalogPresent") &&
+    systemSmoke.includes("System page must expose Apps & Services") &&
+    systemSmoke.includes("legacyInspectorPresent") &&
     !systemSmoke.includes("System window is missing Advanced"),
-  "System smoke must cover privileged Technical Details and avoid stale Inspector or Advanced-panel expectations",
+  "System smoke must cover Apps & Services and avoid stale Inspector or Advanced-panel expectations",
 );
 assert(
   homeSmoke.includes("unsigned-launch-prompts-passkey") &&
@@ -8229,10 +9953,32 @@ assert(
     homeVirtualAuthSmoke.includes("Home sign-out request failed") &&
     homeVirtualAuthSmoke.includes('"x-elastos-home-token"') &&
     homeVirtualAuthSmoke.includes("/api/apps/home/launch") &&
+    homeVirtualAuthSmoke.includes("function redactSensitive(") &&
+    homeVirtualAuthSmoke.includes("redactSensitive(report)") &&
+    homeVirtualAuthSmoke.includes("[redacted]") &&
     homeVirtualAuthSmoke.includes(
       "System should not duplicate Wallet controls",
     ),
-  "Home signed-session smoke must use a real CDP WebAuthn virtual authenticator on localhost, refuse remote mutation by default, exercise sign-out/sign-in, launch app-scoped System without human cookies, and catch System/Wallet layout drift",
+  "Home signed-session smoke must use a real CDP WebAuthn virtual authenticator on localhost, refuse remote mutation by default, exercise sign-out/sign-in, launch app-scoped System without human cookies, redact proof output, and catch System/Wallet layout drift",
+);
+assert(
+  homeVirtualAuthSmoke.includes("async function checkShellSwitchJourney(") &&
+    homeVirtualAuthSmoke.includes("#active-shell-options") &&
+    homeVirtualAuthSmoke.includes('data-shell-name="home-cli"') &&
+    homeVirtualAuthSmoke.includes("Home CLI did not fill the root viewport") &&
+    homeVirtualAuthSmoke.includes("A Home shell remained mounted behind the passkey prompt") &&
+    homeVirtualAuthSmoke.includes("trusted Home host contained Home GUI DOM") &&
+    homeVirtualAuthSmoke.includes("Home GUI remained loaded behind Home CLI") &&
+    homeVirtualAuthSmoke.includes("Home CLI remained loaded behind Home GUI") &&
+    homeVirtualAuthSmoke.includes("Home GUI did not restore as the root shell") &&
+    homeVirtualAuthSmoke.includes("CLI Chat instantiated Home GUI DOM") &&
+    homeVirtualAuthSmoke.includes("Home CLI did not enter CLI Chat") &&
+    homeVirtualAuthSmoke.includes("Home CLI Chat did not show its identity") &&
+    homeVirtualAuthSmoke.includes("CLI Browser action replaced the root shell") &&
+    homeVirtualAuthSmoke.includes("CLI Browser action instantiated Home GUI DOM") &&
+    homeVirtualAuthSmoke.includes("CLI Browser action loaded Home GUI") &&
+	    homeVirtualAuthSmoke.includes("shell_switch: shellSwitch"),
+	  "Home virtual passkey smoke must prove the signed System shell picker treats GUI and CLI as isolated sibling roots, retires the inactive shell, keeps Chat native in Home CLI, and rejects implicit Browser GUI switchback from default CLI actions",
 );
 assert(
   gatewayApi.includes("pub(crate) fn home_launch_auth_data_dir") &&
@@ -8375,17 +10121,18 @@ assert(
 );
 assert(
   !system.includes('data-settings="storage"') &&
-    !systemStyle.includes(".webspace-list") &&
-    system.includes('id="capsule-catalog"') &&
-    systemStyle.includes(".capsule-catalog"),
-  "System must keep removed Storage/WebSpace UI out and render Apps & Services through the catalog",
+    !system.includes("Elastos Webspace") &&
+    !systemJs.includes("setWebspaceState") &&
+    !systemJs.includes("setStorageState") &&
+    !systemStyle.includes(".webspace-list"),
+  "System must keep storage, app inventory, and WebSpaces out of one misleading settings section",
 );
 assert(
-  systemStyle.includes(".technical-inspect-list") &&
-    systemStyle.includes(".technical-inspect-detail") &&
-    systemStyle.includes("max-height: min(30rem, 55vh);") &&
-    systemStyle.includes("grid-template-columns: minmax(12rem, 0.36fr) minmax(0, 1fr);"),
-  "System Technical Details must bound object lists and keep previews inside the Settings layout",
+  systemStyle.includes(".capsule-catalog") &&
+    systemStyle.includes(".catalog-row") &&
+    systemStyle.includes("overflow-wrap: anywhere;") &&
+    systemStyle.includes("justify-self: start;"),
+  "System Apps & Services must keep catalog relationships and actions inside the responsive Settings layout",
 );
 
 const principles = read("PRINCIPLES.md");
@@ -8458,7 +10205,7 @@ assert(
     currentState.includes("source checkout `components.json` from leaking") &&
     currentState.includes("lacks the current `home` setup profile") &&
     currentState.includes("Branch-override public smokes require a staged or published 0.5.0-compatible") &&
-    includesNormalized(currentState, "source/local Carrier setup proof stays in") &&
+    includesNormalized(currentState, "Source/local Carrier setup proof stays in") &&
     includesNormalized(
       currentState,
       "require a staged or published 0.5.0-compatible manifest with the current `home` profile",
@@ -8642,5 +10389,10 @@ assert(
 assertProviderOperationEnumsRejectUnknownFields();
 assertGatewayRequestStructsRejectUnknownFields();
 assertCapabilityRequestStructsRejectUnknownFields();
+
+execFileSync(process.execPath, [fileURLToPath(new URL("public-copy-entropy-check.mjs", import.meta.url))], {
+  cwd: repoRootPath,
+  stdio: "inherit",
+});
 
 console.log("PASS home entropy check");

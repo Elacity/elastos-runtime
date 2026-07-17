@@ -41,7 +41,7 @@ bash scripts/check-wci-alignment.sh
 # 2. Current branch, installed-style command surface
 just candidate-command-audit
 
-# 3. Current 0.5.0 candidate through the canonical public installer/source path.
+# 3. Current 0.5.0 baseline through the canonical public installer/source path.
 # Requires a staged or published 0.5.0-compatible manifest with the current
 # home profile and checksummed artifacts.
 ELASTOS_PUBLISHER_GATEWAY=<candidate-url> \
@@ -98,7 +98,7 @@ complete product Browser.
 | RS-06 | Full-screen chat microVM works | `scripts/chat-demo-local-smoke.sh` on KVM hosts; installed-path proof is manual on this line | source-local KVM proof if applicable | `elastos setup --profile chat`, then direct packaged chat | same as installed x86_64 |
 | RS-07 | MyWebSite is useful | covered partly by Home frontdoor smokes and site command tests | staged preview opens, `Go public`/ephemeral exposure gives a URL when installed, and any surfaced Home action is truthful | same as seed node on installed path | same as installed x86_64 |
 | RS-08 | Documents and Library are useful | `scripts/home-camofox-smoke.sh`, `cargo test -p elastos-server --lib documents -- --nocapture` | create/save/publish a document, then open it from Library | same as seed node on installed Home | same as installed x86_64 |
-| RS-09 | GBA UCity is useful | `scripts/gba-demo-smoke.sh` | launch from Home or direct path, verify viewer, ROM, save/load persistence | if surfaced in installed Home, verify launch and usefulness | same as installed x86_64 |
+| RS-09 | Runtime-backed GBA works | `scripts/gba-demo-smoke.sh`; `scripts/gba-linux-browser-smoke.sh` in Linux Chromium | verify uCity and Library `.gba` launch, video/input/audio, save persistence, and cleanup | disposable Linux Chromium proof plus installed conditional demo profile | same capsule artifact as installed x86_64 |
 | RS-10 | Updates surface is honest | `scripts/public-install-operator-smoke.sh`; after publish, rerun it with `ELASTOS_PUBLISHER_GATEWAY=<url>` | `elastos update --check`, verify source/runtime state | CLI update status is truthful; compare any surfaced Home/System update action only if visible | same as installed x86_64 |
 | RS-11 | Sovereign room sync works | exact local cross-runtime room gateway tests | seed room, pair both runtimes, verify join/leave before and after chat, then exchange a room message and one attachment | same with one other installed runtime | same as installed x86_64 |
 | RS-12 | Operator remote control works | `scripts/public-install-operator-smoke.sh` and exact local operator two-node test | allow the controller DID on the target, then run remote `node status`, `node room`, and `node update --check` | act as controller or target | same as installed x86_64 |
@@ -294,25 +294,29 @@ Pass when:
 - published revisions open as immutable `elastos://<cid>` objects
 - drafts are clearly local until published
 
-### RS-09 GBA UCity is useful
+### RS-09 Runtime-backed GBA
 
 Automatic:
 ```bash
 cd <repo-root>
 bash scripts/gba-demo-smoke.sh
+# On a Linux Chromium target with no product-state mutation:
+bash scripts/gba-linux-browser-smoke.sh
 ```
 
-Manual on seed and installed hosts if surfaced:
-1. Open `GBA UCity`
-2. Confirm viewer loads
-3. Confirm ROM boots
-4. Save state
-5. Reload
-6. Load state
+Manual:
+1. Install the `demo` or `full` profile and open a uCity or `.gba` object.
+2. Launch the bundled uCity capsule, then open a `.gba` object from Library.
+3. Confirm video, keyboard or controller input, and audio work.
+4. Reload the same game and confirm its principal-scoped save survives.
+5. Close the app and confirm the browser engine workers stop with the capsule view.
 
 Pass when:
-- launch works from the surfaced path
+- both content-capsule and Library launch paths work
 - save persistence actually survives reload
+- one portable engine artifact is used on Mac and Linux
+- the engine has no Runtime WASI, host filesystem, or direct network authority
+- the Linux browser proof exits cleanly and leaves no browser/container state
 
 ### RS-10 Updates surface is honest
 

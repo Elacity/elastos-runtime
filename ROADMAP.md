@@ -151,14 +151,6 @@ root of trust. Rich DRM economics, literal Capsule-NFT mechanics, Android-box
 specifics, and DeFi/BtcFi integrations come later, after principals, packages,
 interfaces, availability receipts, and spaces are real.
 
-PC2 is a useful implementation reference for this sequence, not a competing
-authority model. Wallet bridge method classification, IPFS cluster/supernode
-availability work, dDRM contracts, WASM decrypt/render helpers, and runtime
-heartbeat patterns are convergence inputs only after they are translated into
-Runtime principals, scoped capabilities, provider-owned effects, and signed
-audit. The current translation is tracked in
-[docs/PC2_CONVERGENCE.md](docs/PC2_CONVERGENCE.md).
-
 The first source-reference migration slices should stay product-useful and boundary-small:
 
 1. **Library / WebSpace**: browse, upload, download, open,
@@ -184,14 +176,6 @@ Those slices are intentionally ordered so the user can first manage and publish
 ordinary objects, then use provider-backed AI over those objects, then add
 protected-content economics without giving apps raw keys, wallets, chain RPC,
 Kubo/IPFS, Elacity SDKs, or provider credentials.
-
-COMO is a separate runtime-framework research input, not a planned dependency.
-Its C++ component model, runtime reflection, MetaClass packaging idea, Android
-aarch64 history, and safety/redundancy lessons may inform the capsule-kernel ABI
-and generated interface glue. ElastOS should still keep the trusted foundation
-Rust/Wasm/WASI-first unless research proves a narrower, capability-preserving
-integration path. Track that work in
-[docs/RUNTIME_FRAMEWORK_RESEARCH.md](docs/RUNTIME_FRAMEWORK_RESEARCH.md).
 
 Browser work must follow the same model. The Browser capsule is not the
 platform and must not become an ambient host-web escape hatch. The stable product
@@ -235,6 +219,24 @@ audit events, and user/operator-visible reason strings.
 The gateway edge must stay thin. It authenticates browser/host adapters, checks
 capabilities, and routes operations. It should not quietly become the provider
 implementation for IPFS, social drives, wallet signing, or collaboration logic.
+
+#### Verified provider contracts
+
+Provider discovery and dispatch are dynamic today, but Runtime still keeps the
+provider namespace allowlist plus the canonical operation-to-resource and
+operation-to-action policy in code, chiefly `provider_resource.rs`. That
+fail-closed policy is the correct trust boundary: an installed provider must not
+gain authority merely by declaring it in its own manifest. The duplicate policy
+descriptions will become difficult to maintain as independently installed
+providers are added.
+
+Move toward one signed provider contract per namespace. Runtime must verify the
+contract's namespace owner, operation schemas, resource derivation, action,
+approval, and audit policy before registering it. Manifests remain authority
+upper bounds, never self-grants. Registry dispatch, Bus calls, catalog facts,
+Inspector, and conformance tests should consume the same verified contract, and
+unknown or unverified operations must continue to fail closed. Security-critical
+built-in providers may keep their contracts pinned by Runtime policy.
 
 ### 1. Build content availability as the default SmartWeb object plane
 

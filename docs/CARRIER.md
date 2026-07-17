@@ -41,13 +41,13 @@ in Home/Room summaries, ordinary capsule payloads, or user-facing receipts.
 
 ```
 ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-│  chat (TUI)  │  │ chat-wasm    │  │  agent       │
-│  (ratatui)   │  │ (ansi_ui)    │  │  (headless)  │
+│  chat (TUI)  │  │ chat-room    │  │  agent       │
+│  (ratatui)   │  │ (web)        │  │  (headless)  │
 └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
        │                 │                 │
        └────────┬────────┴────────┬────────┘
-                │  elastos-guest  │
-                │  same interface │
+                │  Runtime APIs   │
+                │  same policy    │
                 ▼                 ▼
 ┌────────────────────────────────────────────────────┐
 │  Runtime (one per machine)                         │
@@ -61,7 +61,9 @@ in Home/Room summaries, ordinary capsule payloads, or user-facing receipts.
 `ipfs*` is the current low-level content backend, not the intended app-facing
 content contract.
 
-**Same machine:** All capsules share one runtime, one Carrier node, one gossip buffer. Messages between native chat and WASM chat on the same machine go through the shared buffer — instant, no network needed.
+**Same machine:** Chat surfaces share one runtime, one Carrier node, and one
+gossip buffer. Messages between native Chat and Chat Room on the same machine
+go through the shared Runtime buffer, not a separate network path.
 
 **Cross machine:** Each machine has its own runtime and Carrier node with its own DID. Messages travel via iroh gossip mesh (QUIC + DHT + relay). From the capsule's perspective, this is invisible — `peer/gossip_send` works the same way.
 

@@ -83,13 +83,6 @@ only off-box network path is the Runtime Net provider and selected Carrier/Exit
 provider. Dapp wallet access is injected only as a Runtime-mediated wallet
 bridge. See [BROWSER_CAPSULE.md](BROWSER_CAPSULE.md).
 
-COMO is tracked as a runtime-framework research input, not an architectural
-dependency. Its C++ component model, runtime reflection, MetaClass-style
-packaging, Android aarch64 history, and safety/redundancy lessons may inform
-typed interface descriptors and generated capsule-kernel glue. It must not
-introduce a second authority model, shared vendor address space, or ambient host
-access. See [RUNTIME_FRAMEWORK_RESEARCH.md](RUNTIME_FRAMEWORK_RESEARCH.md).
-
 The near-term balancing sequence is:
 1. **Passkey-first Runtime authority** to give Home a phishing-resistant default unlock, principal binding, short-lived sessions, scoped capabilities, and human/agent delegation before wallet-first UX.
 2. **Content availability and IPLD-compatible manifests** to make published objects sync through the SmartWeb availability network with signed receipts instead of raw CID creation.
@@ -274,8 +267,8 @@ the technical term for manifests, runtime roles, diagnostics, and developer docs
 │                         User / Browser                               │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                      │
-│                    Home / Orchestrator                               │
-│                    (shell-role capsule with orchestration)           │
+│        Home host + active shell (`home-gui` or `home-cli`)           │
+│        (isolated projections; typed intents to Runtime)              │
 │                                                                      │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                      │
@@ -346,7 +339,17 @@ Browser access is modeled around the browser principal, not around one-off per-a
 
 The host member DID is an approval boundary, not delegated identity. A paired browser guest may be admitted by a member runtime, but it does not inherit that member DID or gain member-signed Carrier transport rights.
 
-Home authority is also explicit. Serving `/apps/home/` may show a standard unsigned desktop so a new browser understands where it is, but that desktop is not a user-owned workspace. The Home summary marks `authority.signed_in=false` and omits identity, appearance, browser state, runtime state, and notifications until passkey sign-in. Runtime ensure, Home state writes, and app launch APIs require a Home-scoped capability; app-specific APIs such as Inbox and System require their own app-scoped launch token. Public summaries may expose the standard app/object catalog, but never bearer session tokens or user-owned state. When the same browser has both a native Home room session and a paired browser session, the native Home room session wins so direct Chat Room access in that browser stays aligned with Home.
+Home authority is also explicit. Serving `/apps/home/` shows only the neutral
+Home host and sign-in surface until Runtime confirms a signed-in principal and
+selects a shell. The Home summary marks `authority.signed_in=false` and omits
+identity, appearance, browser state, runtime state, and notifications until
+passkey sign-in. Runtime ensure, Home state writes, and app launch APIs require
+Home authority; app-specific APIs such as Inbox and System require their own
+target-scoped launch token. Public summaries may expose the standard app/object
+catalog, but never bearer session tokens or user-owned state. When the same
+browser has both a native Home room session and a paired browser session, the
+native Home room session wins so direct Chat Room access in that browser stays
+aligned with Home.
 
 ---
 
@@ -368,18 +371,27 @@ The minimal trusted computing base. Does only what MUST be trusted:
 
 This layer is the **Node Core**, not the Capsule Runtime. It is the trusted host-side enforcement authority. The current repo still carries more host-side orchestration than the end-state architecture described here.
 
-### Layer 2: Home / Orchestrator Capsule
+### Layer 2: Home Host And Shell Capsules
 
-A shell-role capsule with the **orchestrator capability**. Handles user policy decisions:
+The browser adapter has one small `home` front door and two sibling shell
+capsules. `home` owns the top-level passkey origin, session recovery, and one
+active root frame. It is not selectable and contains no desktop or terminal
+implementation. `home-gui` and `home-cli` render the same Runtime principal and
+facts through different projections.
 
 | Function | Description |
 |----------|-------------|
-| **Policy review** | Presents capability and access decisions in human terms |
-| **Launch orchestration** | Requests validated app/object launches from the runtime |
-| **Orchestration** | Launches/stops capsules, manages windows |
-| **Trust UI** | Shows warnings for untrusted capsules |
+| **Host authority** | Owns WebAuthn presentation, session recovery, and validated child-message routing |
+| **Shell projection** | GUI renders desktop/windows; CLI renders the Runtime PTY/TUI |
+| **Launch intent** | Either shell may ask Runtime, through Home, for a target-scoped app launch |
+| **Policy review** | Shells present Runtime decisions without becoming a second authority path |
 
-**Key insight:** a shell-role capsule is NOT privileged code. It runs in a sandbox like everything else. It holds the orchestrator capability, which grants it policy authority over other capsules, but it is still sandboxed and subject to runtime enforcement.
+**Key insight:** declaring `role: shell` is not a privilege grant. Runtime
+currently admits only the installed `home-gui` and `home-cli` shell identities.
+Both run in opaque sandboxed frames, have the same common shell lifecycle and
+intent surface, and have no direct provider, storage, network, wallet, or
+Carrier authority. Projection-specific methods describe presentation rather
+than stronger authority.
 
 ## Architecture Decisions
 
@@ -954,7 +966,7 @@ runtime actions:
 
 ```
 Home -> Runtime: { "cmd": "launch", "target": "documents" }
-Runtime -> Home: { "ok": true, "route": "/apps/documents/?home_token=..." }
+Runtime -> Home: { "ok": true, "route": "/apps/documents/#home_token=..." }
 
 Home -> Runtime: { "cmd": "grant", "capsule": "documents", "resource": "..." }
 Runtime -> Home: { "ok": true, "token": "..." }
@@ -964,13 +976,13 @@ The exact transport can be HTTP, stdio, serial, or another host adapter. The
 authority model must not change: the runtime validates the caller and mints a
 scoped grant.
 
-The current browser-hosted Home adapter still carries the launch token in the
-route query so the child app can bootstrap its `x-elastos-home-token` header.
-That query placement is compatibility transport only. Authority is the signed,
-app-bound, non-delegatable grant, not the URL shape, route path, or iframe
-placement. `TASKS.md` tracks replacing this with a same-origin or HttpOnly
-session-bound launch context before the browser-hosted adapter is treated as the
-final capsule ABI.
+The browser-hosted Home adapter serves shell and app documents through gateway
+paths inside sandboxed iframes that omit `allow-same-origin`, giving each
+document an opaque browser origin. Runtime puts the scoped launch token in the
+route fragment so it is not sent in the HTTP request or referrer. Later API
+requests must present the signed, app-bound, non-delegatable token and, for a
+browser caller, an opaque origin. Authority comes from the validated grant, not
+the URL shape, route path, or iframe placement.
 
 ---
 

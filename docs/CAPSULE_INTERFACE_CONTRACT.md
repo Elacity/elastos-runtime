@@ -29,27 +29,50 @@ affordances, gates, audit/mirror, and Carrier/service readiness, derived from
 the manifest, launch targets, provider namespace, capabilities, and trust
 projection that Runtime already knows.
 
+## Trust And Authority
+
+Trust material, verification evidence, declared permissions, executable
+bindings, and policy gates are independent facts. A signature or verification
+result does not authorize a capsule and does not make an affordance executable.
+Manifest risk is advisory metadata, not a grant or denial. Missing evidence is
+unknown and must never be presented as safe. Routes, frames, iframe placement,
+same-origin access, and successful HTTP responses are transport or presentation
+details; only Runtime tokens, concrete bindings, route policy, provider gates,
+and approval state can authorize an effect.
+
 ## Shell Rules
 
-- `home-gui` and `home-cli` consume the same Runtime facts.
-- `home-gui` renders desktop, windows, launcher, taskbar, and app chrome as
-  trusted host-loaded GUI shell code in the current 0.5.0 implementation.
+- `home-gui` and `home-cli` are sibling shell capsules with the same trust
+  class, opaque-frame isolation, Runtime facts, launch validation, lifecycle, and
+  common host intents.
+- `home-gui` renders desktop, windows, launcher, taskbar, and app chrome from
+  its opaque sandboxed frame.
 - `home-cli` renders commands, context, capsule facts, affordances, gates, and
   approval hints. It lists and accepts generic invoke commands only when
   Runtime reports `bindings[*].executable=true`; other methods remain readable
   descriptions or move through their owning capability/approval surface.
 - Shells may ask Home to open a visible capsule with a typed host intent.
+- Shell changes are separate explicit intents. Running a normal CLI command
+  must not switch to `home-gui`; opening a GUI-only projection from CLI must be
+  presented and authorized as `switch shell and open`.
 - Shells must not call providers directly for authority-bearing effects.
 - Shells must not use ambient same-origin state to switch shells or dispatch
   provider operations.
-- Browser iframes are presentation containers. Same-origin iframe transport is
-  local API compatibility, not an authority grant or capsule isolation proof.
+- Ordinary browser capsule projections use opaque sandboxed origins on the
+  existing Home hostname. They never receive `allow-same-origin`, Home's
+  ambient session, or DOM access.
+- Persistent capsule state belongs in principal-scoped Runtime storage. Browser
+  storage is not an authority or durability boundary.
+- Entry documents and assets permit loading inside the opaque Home frame.
 - Shells must ignore unknown fact fields.
 
 ## Current Intent Path
 
-Browser-hosted shells currently use same-origin host messages such as
-`home:open-target`, `home:close-self`, and `home:refresh-summary`.
+Browser-hosted shells and capsule projections use source-, origin-, target-,
+and token-checked host messages such as `home:launch-target`,
+`home:open-target`, `home:close-self`, and `home:refresh-summary`. The Home host
+accepts common shell lifecycle and launch requests from either `home-gui` or
+`home-cli`; projection-specific presentation remains inside the selected shell.
 
 Those messages are local adapter details. The durable model is:
 
@@ -89,8 +112,8 @@ launchable, or invokable.
 
 Home summary embeds those two projections and derives every capsule launcher
 target from the catalog. Content with a bound viewer is launchable through that
-viewer. The Runtime-owned People surface is the sole non-capsule Home target;
-Runtime emits it once as `home://people`, and shells do not synthesize it.
+viewer. People is a normal catalog-backed app capsule at `/apps/people/`; shells
+must not synthesize it or replace its app-scoped launch authority with Home's.
 Consumers may choose different presentation, but must preserve catalog roles,
 viewer/content links, requirements, provider namespaces, and interface binding
 availability without name-based inference.
@@ -120,7 +143,7 @@ Runtime action, or a method is presented as executable without a generic Runtime
 dispatch binding. User/high-risk, provider-path-only, and unbound descriptors
 remain visible; they are not reported as generically executable.
 
-## Core 0.5.0 Capsule Descriptors
+## First-Party Capsule Descriptors
 
 The first manifest-declared affordance descriptors now cover all first-party
 app, viewer, shell, connector, content, and provider surfaces. The Home-facing

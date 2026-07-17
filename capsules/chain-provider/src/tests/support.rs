@@ -4,8 +4,11 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static TEST_DATA_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn spawn_rpc_server(expected_method: &'static str, result: Value) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -201,8 +204,9 @@ impl TestDataDir {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let sequence = TEST_DATA_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = env::temp_dir().join(format!(
-            "chain-provider-test-{}-{unique}",
+            "chain-provider-test-{}-{unique}-{sequence}",
             std::process::id()
         ));
         fs::create_dir_all(&path).unwrap();

@@ -1,6 +1,7 @@
 # Docs
 
-Reference documentation that used to live at the repo root now lives here.
+Canonical reference documentation for the Runtime and its first-party capsules
+lives here. Current truth and open work remain at the repository root.
 
 ## Canonical Current Docs
 
@@ -8,7 +9,7 @@ These are the main active docs for outside readers and contributors.
 
 - [../README.md](../README.md) — repo front door
 - [../PRINCIPLES.md](../PRINCIPLES.md) — proof discipline and runtime authority constraints
-- [state.md](../state.md) — factual current-state summary
+- [../state.md](../state.md) — factual current-state summary
 - [GETTING_STARTED.md](GETTING_STARTED.md) — developer build/run path
 - [COMMAND_MATRIX.md](COMMAND_MATRIX.md) — command/runtime contract
 - [RUNTIME_REPO_USER_STORY_CHECKLIST.md](RUNTIME_REPO_USER_STORY_CHECKLIST.md) — release-facing test matrix and manual runbook
@@ -19,7 +20,6 @@ Planning and truth surfaces outside `docs/`:
 
 - [../TASKS.md](../TASKS.md)
 - [../ROADMAP.md](../ROADMAP.md)
-- [../state.md](../state.md)
 
 ## Deep Reference
 
@@ -34,12 +34,11 @@ Planning and truth surfaces outside `docs/`:
 - [PEOPLE_CONVERSATIONS.md](PEOPLE_CONVERSATIONS.md) — People, pairing, guest, and conversation model
 - [CONTENT_AVAILABILITY.md](CONTENT_AVAILABILITY.md) — IPLD, CID sync, availability receipts, and SmartWeb content-plane direction
 - [ARCHIVE_POLICY.md](ARCHIVE_POLICY.md) — Archive dependency, release, and generic-family enablement policy
-- [PC2_CONVERGENCE.md](PC2_CONVERGENCE.md) — current translation of useful PC2 patterns into Runtime provider/capsule boundaries
-- [RUNTIME_FRAMEWORK_RESEARCH.md](RUNTIME_FRAMEWORK_RESEARCH.md) — research notes for runtime framework choices that are not current commitments
 - [ESP_V0.md](ESP_V0.md) — shell protocol descriptor for existing projection and consent routes
 - [CAPSULE_INTERFACE_CONTRACT.md](CAPSULE_INTERFACE_CONTRACT.md) — shared web/CLI/fact/affordance/gate/audit contract for capsule projections
 - [HOME_SHELL_HOST_CONTRACT.md](HOME_SHELL_HOST_CONTRACT.md) — runtime-owned Home front-door contract for unlock, active shell selection, root mounting, child intents, and recovery
 - [INTERACTIVE_RUNTIME_CONTRACT.md](INTERACTIVE_RUNTIME_CONTRACT.md) — interactive runtime/session contract
+- [SHELL_ESP_BOUNDARY_MAP.md](SHELL_ESP_BOUNDARY_MAP.md) — Shell, ESP, Inspector, and projection-code placement boundaries
 - [CAPSULE_INSPECTOR.md](CAPSULE_INSPECTOR.md) — Runtime-owned live object mirror, gate preview, and Inbox-gated act path
 - [INSPECTOR_TESTING.md](INSPECTOR_TESTING.md) — local Inspector testing path
 - [CHAIN_PROVIDER.md](CHAIN_PROVIDER.md) — typed chain-provider boundary and current blockchain-quadrant slice

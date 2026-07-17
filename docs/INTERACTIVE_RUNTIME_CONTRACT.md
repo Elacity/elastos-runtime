@@ -101,9 +101,9 @@ Home owns the terminal while visible. Launched actions temporarily take over the
 
 This is the only standalone shortcut that carries a blessed home-return contract today.
 
-### Direct packaged chat-family surfaces
+### Direct packaged chat surface
 
-The `chat` and `chat-wasm` capsules share the same command grammar:
+The packaged `chat` capsule uses the same command grammar:
 
 - `Esc` and `/home` request a home exit
 - `/quit`, `/q`, `/exit` request a chat exit
@@ -113,7 +113,7 @@ But the caller decides what "home" means:
 - when launched from Home, the user ends up back at Home
 - when launched directly from the terminal with `elastos capsule ... --interactive`, both `/home` and `/quit` exit back to the invoking terminal
 
-That is why direct packaged chat-family launch remains secondary today, even though the capsule-level commands exist.
+That is why direct packaged chat launch remains secondary today, even though the capsule-level commands exist.
 
 ### Operator surfaces
 

@@ -5,8 +5,8 @@ ELASTOS_BIN="${ELASTOS_BIN:-$(command -v elastos || true)}"
 HOME_DIR="${ELASTOS_IDENTITY_HOME:-${HOME:-}}"
 XDG_DIR="${ELASTOS_IDENTITY_XDG_DATA_HOME:-${XDG_DATA_HOME:-${HOME_DIR}/xdg-data}}"
 DATA_DIR="${ELASTOS_DATA_DIR:-${XDG_DIR}/elastos}"
-PROFILE_NICK="${ELASTOS_IDENTITY_NICK:-anders-smoke}"
-PERSONA_NAME="${ELASTOS_AGENT_PERSONA_NAME:-codex}"
+PROFILE_NICK="${ELASTOS_IDENTITY_NICK:-alex-smoke}"
+PERSONA_NAME="${ELASTOS_AGENT_PERSONA_NAME:-agent-smoke}"
 
 usage() {
     cat <<'EOF'
@@ -20,7 +20,7 @@ What it proves:
   2. `identity show` and `identity nickname get` return the same profile data
   3. `home --status --json` exposes the same nickname and People action
   4. `chat` starts with the DID nickname by default when `--nick` is omitted
-  5. the `codex` agent persona resolves to a DID distinct from the root profile DID
+  5. a named agent persona resolves to a DID distinct from the root profile DID
 EOF
 }
 

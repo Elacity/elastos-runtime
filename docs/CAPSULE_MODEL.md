@@ -115,20 +115,115 @@ In current repo terms, this concept is implemented across multiple pieces rather
 
 So "Capsule Runtime" is currently a conceptual layer with several implementations, not a monolithic library.
 
-## Capsule Kernel / Carrier ABI
+## Isolated Capsule Execution Contract
+
+Executable capsules run in resource-bounded, isolated execution environments.
+A capsule artifact contains the application and the runtime dependencies it
+needs above the stable Capsule Runtime contract. It does not inherit ambient
+host authority or require a general-purpose guest operating system.
+
+The normative formulation is:
+
+> ElastOS does not launch ambient applications. It instantiates a signed and
+> verified Digital Capsule for an explicit principal and session inside a
+> resource-bounded, isolated execution environment. The capsule brings its
+> application, language runtime or dependencies, and minimal capsule-local
+> system surface; sees only the capability-secured ElastOS Bus; mounts mutable
+> state through WebSpaces; and reaches peripherals or services through
+> providers. Its artifact remains independently verifiable and
+> re-instantiable on compatible ElastOS nodes, subject to the owner's current
+> trust policy.
+
+The contract separates these responsibilities:
+
+| Responsibility | ElastOS contract |
+|----------------|------------------|
+| Workload isolation | A separately admitted capsule instance bound to a capsule identity, principal, session, capabilities, resources, and lifecycle |
+| Package boundary | An immutable signed capsule artifact containing the app and the runtime dependencies needed above the stable Capsule Runtime contract |
+| Guest ABI | The capsule kernel / ElastOS Bus, not ambient POSIX, host WASI, gateway routes, or a full host OS |
+| Provider boundary | A typed provider contract, optionally backed by a narrow host adapter; raw device, protocol, credential, and topology details remain hidden |
+| State mounts | A capability-scoped WebSpace or rooted object view; resolution may expose files, posts, people, identities, or services rather than pretending every space is a disk |
+| User interface | Home and an ESP-compatible shell projection; the shell presents facts and requests verbs but is not the underlying authority |
+
+The contract has these constraints:
+
+- **One capsule instance is an isolation boundary, not necessarily one process
+  forever.** A product may create multiple instances deliberately, but it must
+  never silently share mutable execution state across principals.
+- **The capsule-local runtime surface is small.** It is the guest library,
+  scheduler or event loop, language support, and Bus bindings the app needs.
+  Node scheduling, hardware isolation, principal management, and global policy
+  remain Runtime responsibilities.
+- **Self-contained does not mean state is baked into the executable.** The
+  signed artifact is immutable; principal, app, and shared state are separately
+  mounted, encrypted, synchronized, migrated, and revoked through object and
+  WebSpace contracts.
+- **Providers are interchangeable only at a shared typed interface.** Two drive
+  providers may implement the same object operations. A social provider exposes
+  typed people, post, and conversation objects rather than masquerading as a
+  byte-for-byte drive.
+- **Durable does not mean permanently executing or permanently trusted.** A
+  historical artifact should remain identifiable and reproducible, while a
+  current Runtime may still refuse it because its signature is revoked, its
+  interfaces are unsupported, or policy marks it unsafe.
+- **Vendor independence is a compatibility claim.** It requires a stable ABI,
+  signed packages, portable state, and available artifacts. It does not mean the
+  current repository is already an independent bootable appliance or can ignore
+  the host kernel that runs the Runtime.
+- **Browser and shell surfaces are projections.** An iframe, route, native
+  window, terminal, or app-store listing can present a capsule, but none of
+  those surfaces constitutes capsule authority or the capsule ABI.
+
+### Readiness Proof
+
+The isolated-execution claim is earned only when one reusable acceptance path
+can:
+
+1. fetch an immutable capsule without depending on its original vendor or app
+   store, then verify its full bundle identity, publisher, signatures,
+   provenance, interfaces, and declared resources;
+2. admit it for an explicit principal and session without conflating principal,
+   device, capsule, proof binding, launch grant, or session identity;
+3. enforce declared memory, compute, time, instance, storage, and egress bounds,
+   including cancellation, stop, cleanup, and truthful status;
+4. prove that ordinary product code can import only the versioned ElastOS Bus
+   contract and receives no ambient environment, host files, preopens, sockets,
+   gateway routes, provider credentials, or raw protocol authority;
+5. mount principal and shared state through capability-scoped object and
+   WebSpace contracts, with isolation, encryption, quota, sync, conflict,
+   migration, and recovery behavior explicit;
+6. exchange one provider for another implementing the same signed interface
+   without changing capsule code or revealing backend topology;
+7. reject tampered, revoked, incompatible, over-budget, or incompletely
+   authorized capsules before an effect occurs, with an auditable reason; and
+8. re-instantiate the same historical artifact and compatible state on another
+   compatible ElastOS node while preserving identity and migration receipts.
+
+Until that path passes, isolated capsule execution is an architecture contract
+and a directional description of partial implementation, not a
+release-readiness claim. Current proof and gaps belong in
+[../state.md](../state.md) and [../TASKS.md](../TASKS.md), not in this contract.
+
+## Capsule Kernel / ElastOS Bus
 
 Each executable capsule should boot with a tiny capsule-local system surface: the
 capsule kernel. This is not the node core and not a general-purpose OS kernel.
 It is the in-capsule ABI/SDK that lets capsule code ask ElastOS for effects
 without learning host topology.
 
+The executable product capsule ABI is `elastos.component/v1`. Product capsules
+that execute as WASM are Components that import only the interfaces declared by
+the `elastos:bus@v1` contract. WASI Preview 1 is not a supported product ABI for
+this branch.
+
 The capsule kernel should expose only the stable ElastOS contract:
 
-- lifecycle: boot, suspend, resume, close, checkpoint
 - capability state: inspect granted capabilities and request missing authority
-- Carrier calls: invoke, read, write, subscribe, stream, and cancel
-- object handles: open `localhost://...`, `elastos://...`, and mounted spaces by capability
+- provider/resource invoke by resource URI and operation
+- runtime info
+- identity context
 - audit context: request ID, principal, session, capsule identity, and reason strings
+- cancellation
 
 It should not expose product-facing access to gateway routes, host files, raw
 node RPC, browser-only APIs, IPFS/Kubo APIs, wallet RPC, node RPC, TAP devices,
@@ -340,9 +435,9 @@ Target state:
 Substrates differ in what host capabilities they expose to capsules:
 
 - **MicroVM** — full Linux environment: raw terminal mode, alternate screen, window size, signal handling. This is the canonical surface for rich TUI applications (ratatui, crossterm).
-- **WASM** (WASI preview 1) — sandboxed: inherited stdin/stdout, `poll_oneoff` for non-blocking I/O, clock subscriptions for sleep. No in-capsule terminal control API, no resize signals, and no crossterm/ratatui story. Full-screen terminal apps are still possible if the host provides raw mode plus terminal dimensions and the capsule renders ANSI directly.
+- **WASM Component** — loaded through `elastos.component/v1` and constrained by the `elastos:bus@v1` WIT world. Storage, networking, wallet, and provider effects must be explicit Runtime/provider capabilities, not inherited substrate authority. ElastOS Bus v1 does not expose streams. Home CLI's full-screen terminal uses a separate Runtime-owned, launch-token-gated terminal contract; a future Bus version may add streams only after they share the same authorization, audit, capacity, and lifecycle path.
 
-This is a platform reality, not a design gap. App logic, command parsing, Carrier transport, and capability handling are shared across substrates. Only the UI rendering layer differs. A capsule like chat can ship both variants (`chat` for microVM TUI, `chat-stdio` for WASM ANSI TUI) from the same codebase.
+This is a platform reality, not a design gap. App logic, command parsing, Carrier transport, and capability handling can be shared across substrates. Product capsule IDs should still describe user-facing intent, not the implementation substrate.
 
 ## Recommended Language
 
