@@ -8,9 +8,44 @@
 ></div>
 
 <header class="toolbar" aria-label="System bar" data-home-gui-hidden-by-host="hidden" inert hidden>
-  <button id="toolbar-home" class="toolbar-btn toolbar-brand" type="button" aria-label="Go Home" title="ElastOS">
-    <img src="/apps/home-gui/elastos-logo.svg" alt="" draggable="false" />
-  </button>
+  <div id="toolbar-system" class="toolbar-system">
+    <button
+      id="toolbar-home"
+      class="toolbar-btn toolbar-brand"
+      type="button"
+      aria-label="ElastOS menu"
+      title="ElastOS"
+      aria-haspopup="menu"
+      aria-expanded="false"
+      aria-controls="toolbar-identity-menu"
+    >
+      <img src="/apps/home-gui/elastos-logo.svg" alt="" draggable="false" />
+    </button>
+    <div
+      id="toolbar-identity-menu"
+      class="toolbar-identity-menu toolbar-system-menu"
+      role="menu"
+      aria-label="ElastOS"
+      hidden
+    >
+      <div class="toolbar-identity-header" role="presentation">
+        Signed in as <strong id="toolbar-identity-menu-name"></strong>
+      </div>
+      <button id="identity-menu-show-desktop" class="toolbar-identity-item" type="button" role="menuitem">
+        Show desktop
+      </button>
+      <button id="identity-menu-fullscreen" class="toolbar-identity-item" type="button" role="menuitem">
+        Enter fullscreen
+      </button>
+      <button id="identity-menu-system" class="toolbar-identity-item" type="button" role="menuitem">
+        System
+      </button>
+      <div class="toolbar-identity-divider" role="separator"></div>
+      <button id="identity-menu-sign-out" class="toolbar-identity-item" type="button" role="menuitem">
+        Sign out
+      </button>
+    </div>
+  </div>
   <span id="toolbar-active-title" class="toolbar-active-title">Home</span>
   <nav id="toolbar-menubar" class="toolbar-menubar" aria-label="App menus"></nav>
   <div class="toolbar-spacer"></div>
@@ -31,38 +66,8 @@
     <span id="toolbar-inbox-count" class="toolbar-inbox-count" hidden></span>
   </button>
   <div id="toolbar-identity" class="toolbar-identity" hidden>
-    <button
-      id="toolbar-identity-btn"
-      class="toolbar-identity-btn"
-      type="button"
-      aria-haspopup="menu"
-      aria-expanded="false"
-      aria-controls="toolbar-identity-menu"
-    >
-      <span id="toolbar-identity-avatar" class="toolbar-identity-avatar" aria-hidden="true"></span>
-      <span id="toolbar-identity-name" class="toolbar-identity-name"></span>
-    </button>
-    <div
-      id="toolbar-identity-menu"
-      class="toolbar-identity-menu"
-      role="menu"
-      aria-label="Account"
-      hidden
-    >
-      <div class="toolbar-identity-header" role="presentation">
-        Signed in as <strong id="toolbar-identity-menu-name"></strong>
-      </div>
-      <button id="identity-menu-fullscreen" class="toolbar-identity-item" type="button" role="menuitem">
-        Enter fullscreen
-      </button>
-      <button id="identity-menu-system" class="toolbar-identity-item" type="button" role="menuitem">
-        System
-      </button>
-      <div class="toolbar-identity-divider" role="separator"></div>
-      <button id="identity-menu-sign-out" class="toolbar-identity-item" type="button" role="menuitem">
-        Sign out
-      </button>
-    </div>
+    <span id="toolbar-identity-avatar" class="toolbar-identity-avatar" aria-hidden="true"></span>
+    <span id="toolbar-identity-name" class="toolbar-identity-name"></span>
   </div>
   <button
     id="clock"
