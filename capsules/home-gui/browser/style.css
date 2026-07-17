@@ -222,45 +222,6 @@
   background-color: var(--lift-strong);
 }
 
-/* Identity indicator: avatar + name on the right, read-only. */
-.toolbar-identity {
-  position: relative;
-  margin-left: 12px;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  height: 26px;
-  padding: 0 8px 0 3px;
-}
-
-.toolbar-identity[hidden] {
-  display: none;
-}
-
-.toolbar-identity-avatar {
-  width: 20px;
-  height: 20px;
-  display: grid;
-  place-items: center;
-  border-radius: 50%;
-  background: linear-gradient(180deg, var(--brand-strong), var(--brand));
-  color: #161616;
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1;
-}
-
-.toolbar-identity-name {
-  max-width: 140px;
-  overflow: hidden;
-  color: #fff;
-  font-size: 13px;
-  font-weight: 500;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  opacity: 0.92;
-}
-
 .toolbar-identity-menu {
   position: absolute;
   top: calc(100% + 8px);
@@ -3147,10 +3108,6 @@ body.dragging-target {
 
   .toolbar-active-title,
   .toolbar-menubar {
-    display: none;
-  }
-
-  .toolbar-identity-name {
     display: none;
   }
 
