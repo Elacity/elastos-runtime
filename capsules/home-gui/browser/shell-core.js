@@ -100,7 +100,7 @@ export const shellState = {
     taskbar: [],
     desktop: {},
     desktopLabels: {},
-    desktopHidden: [],
+    desktopApps: [],
     desktopIconsVisible: true,
   },
   dragState: null,
@@ -359,11 +359,13 @@ export function desktopEntryExists(summary, entryId) {
 }
 
 export function desktopLayoutEntries(summary) {
-  const appEntries = allVisibleTargets(summary).map((target) => ({
-    id: target.target,
-    kind: "target",
-    target,
-  }));
+  const appEntries = allVisibleTargets(summary)
+    .filter((target) => isTargetOnDesktop(target.target))
+    .map((target) => ({
+      id: target.target,
+      kind: "target",
+      target,
+    }));
   const objectEntries = desktopObjects(summary).map((object) => ({
     id: desktopObjectEntryId(object),
     kind: "object",
@@ -442,23 +444,41 @@ function sortedDesktopTargets(summary) {
 export function initializeShellLayout(summary) {
   syncHomeBrowserState(summary);
   const stored = shellState.homeBrowserState.layout;
-  const normalizedDesktopHidden = normalizeDesktopHiddenTargets(
-    stored ? stored.desktopHidden : null,
+  /* Desktop philosophy (macOS): the desktop belongs to the user's objects —
+     files, folders, Trash. Apps live in the dock and the launcher. App icons
+     appear on the desktop only when the user explicitly adds them, so the
+     app list is opt-in (desktopApps), not opt-out. */
+  const normalizedDesktopApps = normalizeDesktopAppTargets(
+    stored && Array.isArray(stored.desktopApps)
+      ? stored.desktopApps
+      : defaultDesktopTargets(summary),
     summary,
   );
+  /* Layouts saved before the desktopApps model migrate here: their desktop
+     empties of app icons, so they get the default dock pins exactly once —
+     otherwise "where did my apps go" has no visible answer. Layouts that
+     know the model keep whatever dock the user chose, including empty. */
+  const migratingLayout = Boolean(stored) && !Array.isArray(stored.desktopApps);
+  const storedTaskbar = stored && Array.isArray(stored.taskbar) ? stored.taskbar : [];
   shellState.shellLayoutState = {
-    taskbar: normalizeTaskbarLayout(stored ? stored.taskbar : null, summary),
+    taskbar: normalizeTaskbarLayout(
+      !stored || (migratingLayout && storedTaskbar.length === 0)
+        ? defaultTaskbarPins(summary)
+        : storedTaskbar,
+      summary,
+    ),
     desktop: {},
     desktopLabels: normalizeDesktopLabels(stored ? stored.desktopLabels : null, summary),
-    desktopHidden: normalizedDesktopHidden,
+    desktopApps: normalizedDesktopApps,
     desktopIconsVisible: normalizeDesktopIconsVisible(stored ? stored.desktopIconsVisible : null),
   };
 
   let changed =
     !stored ||
+    migratingLayout ||
     !arrayEquals(
-      Array.isArray(stored.desktopHidden) ? stored.desktopHidden : [],
-      normalizedDesktopHidden,
+      Array.isArray(stored.desktopApps) ? stored.desktopApps : [],
+      normalizedDesktopApps,
     ) ||
     typeof stored.desktopIconsVisible !== "boolean";
   const storedDesktop = stored && stored.desktop && typeof stored.desktop === "object"
@@ -625,7 +645,7 @@ function normalizeDesktopLabels(labels, summary) {
   return normalized;
 }
 
-function normalizeDesktopHiddenTargets(targetIds, summary) {
+function normalizeDesktopAppTargets(targetIds, summary) {
   const knownTargets = new Set(allVisibleTargets(summary).map((target) => target.target));
   const normalized = [];
   for (const targetId of Array.isArray(targetIds) ? targetIds : []) {
@@ -639,6 +659,25 @@ function normalizeDesktopHiddenTargets(targetIds, summary) {
     normalized.push(targetId);
   }
   return normalized;
+}
+
+/* Fresh principals get a working dock instead of an empty bar: the everyday
+   surfaces, pinned in a fixed order. Purely a first-run default — the saved
+   layout owns the dock from the first change onward. */
+const DEFAULT_TASKBAR_PINS = ["browser", "library", "documents", "chat", "system"];
+
+function defaultTaskbarPins(summary) {
+  const knownTargets = new Set(allVisibleTargets(summary).map((target) => target.target));
+  return DEFAULT_TASKBAR_PINS.filter((targetId) => knownTargets.has(targetId));
+}
+
+/* First-run desktop membership: object-kind targets (content projections)
+   belong on the desktop; app targets do not — they live in the dock and the
+   launcher until the user explicitly adds them. */
+function defaultDesktopTargets(summary) {
+  return allVisibleTargets(summary)
+    .filter((target) => target.target_kind === "object")
+    .map((target) => target.target);
 }
 
 function normalizeDesktopIconsVisible(value) {
@@ -770,31 +809,31 @@ export function setDesktopIconsVisible(visible) {
 }
 
 export function isTargetOnDesktop(targetId) {
-  return !shellState.shellLayoutState.desktopHidden.includes(targetId);
+  return shellState.shellLayoutState.desktopApps.includes(targetId);
 }
 
 export function addTargetToDesktop(targetId) {
-  const next = shellState.shellLayoutState.desktopHidden.filter(
-    (candidate) => candidate !== targetId,
-  );
-  if (arrayEquals(next, shellState.shellLayoutState.desktopHidden)) {
+  if (!shellState.currentSummary || !targetById(shellState.currentSummary, targetId)) {
     return false;
   }
-  shellState.shellLayoutState.desktopHidden = next;
+  if (shellState.shellLayoutState.desktopApps.includes(targetId)) {
+    return false;
+  }
+  shellState.shellLayoutState.desktopApps = [
+    ...shellState.shellLayoutState.desktopApps,
+    targetId,
+  ];
   return true;
 }
 
 export function removeTargetFromDesktop(targetId) {
-  if (!shellState.currentSummary || !targetById(shellState.currentSummary, targetId)) {
+  const next = shellState.shellLayoutState.desktopApps.filter(
+    (candidate) => candidate !== targetId,
+  );
+  if (arrayEquals(next, shellState.shellLayoutState.desktopApps)) {
     return false;
   }
-  if (shellState.shellLayoutState.desktopHidden.includes(targetId)) {
-    return false;
-  }
-  shellState.shellLayoutState.desktopHidden = [
-    ...shellState.shellLayoutState.desktopHidden,
-    targetId,
-  ];
+  shellState.shellLayoutState.desktopApps = next;
   return true;
 }
 

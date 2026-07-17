@@ -252,7 +252,7 @@ function summaryFor(activeShell) {
     appearance: {},
     browser_state: {
       principal_id: "principal:home-shell-no-hint-boot",
-      layout: { desktop: {}, taskbar: [], desktopHidden: [], desktopIconsVisible: true },
+      layout: { desktop: {}, taskbar: [], desktopApps: [], desktopIconsVisible: true },
       recent_targets: [],
       session: { windows: [] },
     },

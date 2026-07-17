@@ -162,7 +162,7 @@ const summary = {
         browser: { x: 12, y: 12 },
       },
       taskbar: [],
-      desktopHidden: [],
+      desktopApps: ["wallet", "people", "inbox", "browser"],
       desktopIconsVisible: true,
     },
   },
