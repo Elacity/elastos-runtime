@@ -7,11 +7,20 @@
   hidden
 ></div>
 
-<header class="toolbar" aria-label="Home toolbar" data-home-gui-hidden-by-host="hidden" inert hidden>
+<header class="toolbar" aria-label="System bar" data-home-gui-hidden-by-host="hidden" inert hidden>
   <button id="toolbar-home" class="toolbar-btn toolbar-brand" type="button" aria-label="Go Home" title="ElastOS">
-    <img src="/apps/home-gui/elastos-logo.svg" alt="ElastOS" draggable="false" />
+    <img src="/apps/home-gui/elastos-logo.svg" alt="" draggable="false" />
   </button>
+  <span id="toolbar-active-title" class="toolbar-active-title">Home</span>
+  <nav id="toolbar-menubar" class="toolbar-menubar" aria-label="App menus"></nav>
   <div class="toolbar-spacer"></div>
+  <button
+    id="toolbar-spotlight"
+    class="toolbar-btn spotlight-btn"
+    type="button"
+    aria-label="Search"
+    title="Search (Cmd+Space)"
+  ></button>
   <button
     id="toolbar-inbox"
     class="toolbar-btn inbox-btn"
@@ -21,37 +30,83 @@
   >
     <span id="toolbar-inbox-count" class="toolbar-inbox-count" hidden></span>
   </button>
+  <div id="toolbar-identity" class="toolbar-identity" hidden>
+    <button
+      id="toolbar-identity-btn"
+      class="toolbar-identity-btn"
+      type="button"
+      aria-haspopup="menu"
+      aria-expanded="false"
+      aria-controls="toolbar-identity-menu"
+    >
+      <span id="toolbar-identity-avatar" class="toolbar-identity-avatar" aria-hidden="true"></span>
+      <span id="toolbar-identity-name" class="toolbar-identity-name"></span>
+    </button>
+    <div
+      id="toolbar-identity-menu"
+      class="toolbar-identity-menu"
+      role="menu"
+      aria-label="Account"
+      hidden
+    >
+      <div class="toolbar-identity-header" role="presentation">
+        Signed in as <strong id="toolbar-identity-menu-name"></strong>
+      </div>
+      <button id="identity-menu-fullscreen" class="toolbar-identity-item" type="button" role="menuitem">
+        Enter fullscreen
+      </button>
+      <button id="identity-menu-system" class="toolbar-identity-item" type="button" role="menuitem">
+        System
+      </button>
+      <div class="toolbar-identity-divider" role="separator"></div>
+      <button id="identity-menu-sign-out" class="toolbar-identity-item" type="button" role="menuitem">
+        Sign out
+      </button>
+    </div>
+  </div>
   <button
-    id="toolbar-fullscreen"
-    class="toolbar-btn fullscreen-btn"
+    id="clock"
+    class="toolbar-clock"
     type="button"
-    aria-label="Enter fullscreen"
-    title="Fullscreen"
-    aria-pressed="false"
-  >
-    <img src="/apps/home-gui/fullscreen.svg" alt="" draggable="false" />
-  </button>
-  <button
-    id="toolbar-sign-out"
-    class="toolbar-btn sign-out-btn"
-    type="button"
-    aria-label="Sign out"
-    title="Sign out"
-  ></button>
-  <div id="clock" class="toolbar-clock">--:--</div>
+    aria-haspopup="true"
+    aria-expanded="false"
+    aria-controls="notification-center"
+    aria-label="Clock. Open notifications"
+    title="Notifications"
+  >--:--</button>
 </header>
 
+<aside
+  id="notification-center"
+  class="notification-center"
+  role="group"
+  aria-label="Notification Center"
+  tabindex="-1"
+  data-home-gui-hidden-by-host="hidden"
+  inert
+  hidden
+>
+  <div class="notification-center-head">
+    <h2 class="notification-center-title">Notifications</h2>
+    <button id="notification-center-clear" class="notification-center-clear" type="button">
+      Clear all
+    </button>
+  </div>
+  <div id="notification-center-list" class="notification-center-list hide-scrollbar"></div>
+  <p id="notification-center-empty" class="notification-center-empty" hidden>No notifications</p>
+</aside>
+
 <main class="desktop-workspace" data-home-gui-hidden-by-host="hidden" inert hidden>
-  <div id="window-snap-preview" class="window-snap-preview" aria-hidden="true" hidden></div>
-  <section id="desktop" class="desktop" aria-live="polite">
+  <section id="desktop" class="desktop">
     <section
       id="desktop-shortcuts"
       class="desktop-shortcuts"
       role="listbox"
       aria-label="Home items"
-      aria-multiselectable="false"
+      aria-multiselectable="true"
       tabindex="0"
     ></section>
+    <div id="window-snap-preview" class="window-snap-preview" aria-hidden="true" hidden></div>
   </section>
 </main>
 
@@ -65,6 +120,7 @@
         aria-label="Open launcher"
         aria-controls="launcher"
         aria-expanded="false"
+        data-label="Launcher"
       >
         <span class="taskbar-icon taskbar-icon-launcher"></span>
       </button>
@@ -73,34 +129,135 @@
   </div>
 </footer>
 
-<aside id="launcher" class="launcher" aria-hidden="true" data-open="false" inert hidden>
-  <div class="launcher-popover hide-scrollbar" role="dialog" aria-modal="true" aria-label="Home launcher">
-    <button id="close-launcher" class="launcher-close" type="button" aria-label="Close launcher">
-      <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
-    </button>
-    <div class="launcher-search-wrap">
+<aside id="launcher" class="launcher" aria-hidden="true" data-open="false" data-view="grid" inert hidden>
+  <div class="launcher-popover" role="dialog" aria-modal="true" aria-label="Home launcher">
+    <div class="launcher-header">
+      <div class="launcher-search-wrap">
+        <input
+          id="launcher-search"
+          class="launcher-search-field"
+          type="search"
+          autocomplete="off"
+          placeholder="Search Home"
+          spellcheck="false"
+        />
+      </div>
+      <button
+        id="launcher-view-toggle"
+        class="launcher-header-btn"
+        type="button"
+        aria-label="Switch to list view"
+        aria-pressed="false"
+      ></button>
+      <button id="close-launcher" class="launcher-close launcher-header-btn" type="button" aria-label="Close launcher">
+        <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
+      </button>
+    </div>
+    <div class="launcher-scroll hide-scrollbar">
+      <h1 class="launcher-heading">Open</h1>
+      <div id="launcher-grid" class="launcher-sections"></div>
+      <p id="launcher-empty-state" class="launcher-empty" hidden>No matching items</p>
+    </div>
+  </div>
+</aside>
+
+<aside id="spotlight" class="spotlight" aria-hidden="true" data-home-gui-hidden-by-host="hidden" inert hidden>
+  <div class="spotlight-panel" role="dialog" aria-modal="true" aria-label="Spotlight search">
+    <div class="spotlight-bar">
       <input
-        id="launcher-search"
-        class="launcher-search-field"
+        id="spotlight-input"
+        class="spotlight-field"
         type="search"
         autocomplete="off"
-        placeholder="Search Home"
         spellcheck="false"
+        placeholder="Spotlight Search"
+        role="combobox"
+        aria-expanded="false"
+        aria-controls="spotlight-results"
+        aria-activedescendant=""
+        aria-label="Spotlight search"
       />
     </div>
-    <h1 class="launcher-heading">Open</h1>
-    <div id="launcher-grid" class="launcher-sections"></div>
-    <p id="launcher-empty-state" class="launcher-empty" hidden>No matching items</p>
+    <div
+      id="spotlight-results"
+      class="spotlight-results hide-scrollbar"
+      role="listbox"
+      aria-label="Search results"
+      hidden
+    ></div>
   </div>
 </aside>
 
 <div id="desktop-context-menu" class="context-menu" role="menu" aria-label="Home actions" inert hidden></div>
 
+<div id="window-switcher" class="window-switcher" aria-hidden="true" data-home-gui-hidden-by-host="hidden" inert hidden>
+  <div
+    id="window-switcher-list"
+    class="window-switcher-list"
+    role="listbox"
+    aria-label="Open windows"
+  ></div>
+</div>
+
+<aside
+  id="quick-look"
+  class="quick-look"
+  role="dialog"
+  aria-modal="true"
+  aria-label="Quick Look"
+  aria-hidden="true"
+  data-home-gui-hidden-by-host="hidden"
+  inert
+  hidden
+>
+  <div class="quick-look-panel">
+    <header class="quick-look-head">
+      <div class="quick-look-head-copy">
+        <h2 id="quick-look-title" class="quick-look-title">Preview</h2>
+        <p id="quick-look-meta" class="quick-look-meta"></p>
+      </div>
+      <div class="quick-look-actions">
+        <button id="quick-look-open" class="quick-look-open" type="button">Open</button>
+        <button id="quick-look-close" class="quick-look-close" type="button" aria-label="Close Quick Look">
+          <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
+        </button>
+      </div>
+    </header>
+    <div id="quick-look-stage" class="quick-look-stage"></div>
+  </div>
+</aside>
+
+<section
+  id="shortcuts-overlay"
+  class="shortcuts-overlay"
+  aria-hidden="true"
+  data-home-gui-hidden-by-host="hidden"
+  inert
+  hidden
+>
+  <div class="shortcuts-card" role="dialog" aria-modal="true" aria-labelledby="shortcuts-title">
+    <button id="shortcuts-close" class="launcher-close" type="button" aria-label="Close shortcuts">
+      <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
+    </button>
+    <h1 id="shortcuts-title" class="shortcuts-title">Keyboard shortcuts</h1>
+    <dl class="shortcuts-list">
+      <div class="shortcuts-row"><dt>Search (Spotlight)</dt><dd><kbd>⌘</kbd><kbd>Space</kbd> or <kbd>Ctrl</kbd><kbd>Space</kbd></dd></div>
+      <div class="shortcuts-row"><dt>Quick Look</dt><dd><kbd>Space</kbd> on a desktop icon</dd></div>
+      <div class="shortcuts-row"><dt>Mission Control</dt><dd><kbd>F3</kbd></dd></div>
+      <div class="shortcuts-row"><dt>Switch windows</dt><dd><kbd>Alt</kbd><kbd>Tab</kbd></dd></div>
+      <div class="shortcuts-row"><dt>Cycle windows</dt><dd><kbd>⌘</kbd><kbd>`</kbd></dd></div>
+      <div class="shortcuts-row"><dt>Close window</dt><dd><kbd>⌘</kbd><kbd>W</kbd></dd></div>
+      <div class="shortcuts-row"><dt>Navigate desktop</dt><dd><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd> then <kbd>Enter</kbd></dd></div>
+      <div class="shortcuts-row"><dt>App actions</dt><dd><kbd>Shift</kbd><kbd>F10</kbd> on an icon</dd></div>
+      <div class="shortcuts-row"><dt>This overlay</dt><dd><kbd>⌘</kbd><kbd>/</kbd></dd></div>
+    </dl>
+  </div>
+</section>
+
 <section
   id="home-notification-toast"
   class="home-notification-toast"
-  role="status"
-  aria-live="assertive"
+  role="alert"
   aria-hidden="true"
   inert
   hidden
@@ -121,21 +278,24 @@
 </section>
 
 <template id="window-template">
-  <section class="window" role="dialog" aria-modal="false" aria-hidden="true">
+  <section class="window" role="dialog" aria-modal="false" aria-hidden="true" tabindex="-1">
     <div class="window-head">
+      <div class="window-traffic-lights">
+        <button class="window-action-btn" data-action="close" type="button" aria-label="Close">
+          <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
+        </button>
+        <button class="window-action-btn" data-action="minimize" type="button" aria-label="Minimize">
+          <img src="/apps/home-gui/minimize.svg" alt="" draggable="false" />
+        </button>
+        <button class="window-action-btn" data-action="maximize" type="button" aria-label="Maximize">
+          <img src="/apps/home-gui/scale.svg" alt="" draggable="false" />
+        </button>
+      </div>
       <div class="window-head-draggable">
         <span class="window-head-icon"></span>
         <span class="window-head-title"></span>
       </div>
-      <button class="window-action-btn" data-action="minimize" type="button" aria-label="Minimize">
-        <img src="/apps/home-gui/minimize.svg" alt="" draggable="false" />
-      </button>
-      <button class="window-action-btn" data-action="maximize" type="button" aria-label="Maximize">
-        <img src="/apps/home-gui/scale.svg" alt="" draggable="false" />
-      </button>
-      <button class="window-action-btn" data-action="close" type="button" aria-label="Close">
-        <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
-      </button>
+      <div class="window-head-balance" aria-hidden="true"></div>
     </div>
     <div class="window-body"></div>
     <div class="window-resize-handle window-resize-handle-n" data-resize="n" aria-hidden="true"></div>

@@ -1,3 +1,6 @@
+/* Inter's @font-face lives in the vendored token sheet (elastos-ui.css),
+   loaded before this file. */
+
 :root {
   color-scheme: dark;
   --bg: #050608;
@@ -22,9 +25,16 @@
   --window-head-saturation: 7%;
   --window-head-lightness: 40%;
   --window-head-alpha: 0.58;
-  --toolbar-h: 30px;
+  --toolbar-h: 36px;
   --toolbar-offset: 14px;
-  --taskbar-h: 50px;
+  --chrome-fill: hsla(220, 10%, 12%, 0.72);
+  --dock-fill: hsla(216, 8%, 18%, 0.78);
+  --hairline: rgba(255, 255, 255, 0.14);
+  /* Stage contract: windows (incl. maximize/snap) live between the system bar
+     and the dock clearance — system chrome is never covered. */
+  --stage-top: calc(var(--toolbar-h) + env(safe-area-inset-top, 0px));
+  --stage-bottom: calc(var(--taskbar-h) + var(--taskbar-offset) + 10px + env(safe-area-inset-bottom, 0px));
+  --taskbar-h: 60px;
   --taskbar-offset: 12px;
   --desktop-wallpaper: url("./wallpaper.webp");
 }
@@ -72,6 +82,50 @@ img {
   display: none;
 }
 
+/* Light theme (data-el-theme="light" on <html>, set by the vendored
+   elastos-theme.js from localStorage). Chrome follows PC2's light look:
+   frosted pale bars, navy ink, same brand orange. Desktop icon labels stay
+   white over the wallpaper (as macOS does) — see the explicit rule below. */
+:root[data-el-theme="light"] {
+  color-scheme: light;
+  --bg: #e8ecf3;
+  --panel: rgba(255, 255, 255, 0.82);
+  --panel-strong: rgba(255, 255, 255, 0.96);
+  --panel-soft: rgba(29, 36, 56, 0.06);
+  --line: rgba(29, 36, 56, 0.14);
+  --line-strong: rgba(29, 36, 56, 0.26);
+  --text: #1d2438;
+  --muted: rgba(29, 36, 56, 0.72);
+  --soft: rgba(29, 36, 56, 0.5);
+  --brand-strong: #e07f0a;
+  --shadow: 0 24px 80px rgba(34, 49, 88, 0.2);
+  --shadow-soft: 0 12px 28px rgba(34, 49, 88, 0.14);
+  --window-head-saturation: 16%;
+  --window-head-lightness: 88%;
+  --chrome-fill: rgba(231, 238, 245, 0.78);
+  --dock-fill: rgba(231, 238, 245, 0.8);
+  --hairline: rgba(29, 36, 56, 0.16);
+  --frame-fill: #eef1f6;
+  --menu-fill: rgba(248, 250, 253, 0.97);
+  --overlay-dim: rgba(233, 238, 246, 0.5);
+}
+
+:root {
+  --frame-fill: #0b0d10;
+  --menu-fill: rgba(22, 24, 29, 0.96);
+  --overlay-dim: rgba(6, 7, 10, 0.55);
+  --lift: rgba(255, 255, 255, 0.08);
+  --lift-strong: rgba(255, 255, 255, 0.15);
+}
+
+:root[data-el-theme="light"] {
+  --lift: rgba(29, 36, 56, 0.08);
+  --lift-strong: rgba(29, 36, 56, 0.14);
+}
+
+/* Base resets (*, html/body, button, img, .visually-hidden, .hide-scrollbar)
+   live in the host document's stylesheet — this sheet is injected into the
+   host document by shell-core.ensureHomeGuiDom() and only owns GUI surfaces. */
 
 .desktop-backdrop {
   position: fixed;
@@ -97,31 +151,41 @@ img {
   opacity: var(--desktop-overlay-opacity, 0.55);
 }
 
+/* Full-width system bar: a hard horizontal datum (top:0, edge to edge, no radius).
+   Left: brand + focused-window title. Right: status cluster + clock at the trailing
+   edge. Chrome, not a widget — content never reflows the bar's geometry. */
 .toolbar {
   position: fixed;
-  top: env(safe-area-inset-top, 0);
-  left: 50%;
-  right: auto;
-  transform: translateX(-50%);
-  z-index: 100000;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 100100;
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: flex-start;
   gap: 0;
-  width: max-content;
-  min-height: var(--toolbar-h);
-  padding: 0 10px 0 0;
-  max-width: calc(100vw - 24px);
-  background-color: rgba(0, 0, 0, 0.25);
-  border-bottom-left-radius: 10px;
-  border-bottom-right-radius: 10px;
+  height: calc(var(--toolbar-h) + env(safe-area-inset-top, 0px));
+  padding: env(safe-area-inset-top, 0px) 12px 0;
+  background-color: var(--chrome-fill);
   box-shadow:
-    inset 0 0 0 0.5px rgba(255, 255, 255, 0.14),
-    0 0 0 0.5px rgba(0, 0, 0, 0.2),
-    0 2px 14px rgba(0, 0, 0, 0.2);
-  overflow: clip;
+    inset 0 -0.5px 0 var(--hairline),
+    0 1px 12px rgba(0, 0, 0, 0.18);
   backdrop-filter: blur(10px);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.toolbar-active-title {
+  min-width: 0;
+  max-width: 40vw;
+  margin-left: 12px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: var(--toolbar-h);
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .toolbar-spacer {
@@ -150,8 +214,12 @@ img {
 .toolbar-btn:hover:not(.toolbar-brand),
 .toolbar-btn:focus-visible:not(.toolbar-brand) {
   opacity: 1;
-  background-color: rgba(255, 255, 255, 0.15);
-  outline: none;
+  background-color: var(--lift-strong);
+}
+
+.toolbar-btn:focus-visible {
+  outline: 2px solid var(--brand-focus);
+  outline-offset: 1px;
 }
 
 .toolbar-btn:disabled {
@@ -161,7 +229,7 @@ img {
 
 .toolbar-brand {
   width: 107px;
-  margin-left: 10px;
+  margin-left: 0;
   opacity: 1;
 }
 
@@ -170,25 +238,252 @@ img {
   height: 17px;
 }
 
-.fullscreen-btn img {
-  width: 15px;
-  height: 15px;
+/* The wordmark's lettering is white; on the light bar swap to the ink
+   variant (same glyph colors, navy lettering) — PC2 keeps brand color as-is
+   and never blanket-inverts the logo. */
+:root[data-el-theme="light"] .toolbar-brand img {
+  content: url("./elastos-logo-ink.svg");
+}
+
+/* Identity chrome: avatar + name as a disclosure menu. Account actions
+   (fullscreen, system, sign out) live inside — never as naked bar buttons at
+   the same visual weight as the clock. */
+.toolbar-identity {
+  position: relative;
+  margin-left: 12px;
+  display: flex;
+  align-items: center;
+}
+
+.toolbar-identity[hidden] {
+  display: none;
+}
+
+.toolbar-identity-btn {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 26px;
+  padding: 0 8px 0 3px;
+  border-radius: 7px;
+  cursor: pointer;
+  transition: background-color 0.18s ease;
+}
+
+.toolbar-identity-btn:hover,
+.toolbar-identity-btn[aria-expanded="true"] {
+  background-color: var(--lift-strong);
+}
+
+.toolbar-identity-btn:focus-visible {
+  outline: 2px solid var(--brand-focus);
+  outline-offset: 1px;
+}
+
+.toolbar-identity-avatar {
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: linear-gradient(180deg, var(--brand-strong), var(--brand));
+  color: #161616;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.toolbar-identity-name {
+  max-width: 140px;
+  overflow: hidden;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  text-overflow: ellipsis;
   opacity: 0.92;
 }
 
-.fullscreen-btn[aria-pressed="true"] {
-  opacity: 1;
-  background-color: rgba(246, 146, 26, 0.18);
+.toolbar-identity-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 100120;
+  min-width: 210px;
+  padding: 5px;
+  display: grid;
+  gap: 2px;
+  border-radius: 12px;
+  background: var(--menu-fill);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-soft);
+  backdrop-filter: blur(16px);
 }
 
-.sign-out-btn {
+.toolbar-identity-menu[hidden] {
   display: none;
-  flex: 0 0 22px;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9 5H6.8A2.8 2.8 0 0 0 4 7.8v8.4A2.8 2.8 0 0 0 6.8 19H9'/%3E%3Cpath d='M13 8l4 4-4 4'/%3E%3Cpath d='M17 12H8'/%3E%3C/svg%3E");
 }
 
-body[data-home-authority="signed"] .sign-out-btn {
+.toolbar-identity-header {
+  padding: 7px 10px 6px;
+  color: var(--soft);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.toolbar-identity-header strong {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.toolbar-identity-item {
   display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 32px;
+  padding: 0 10px;
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.toolbar-identity-item:hover,
+.toolbar-identity-item:focus-visible {
+  background: var(--lift);
+  outline: none;
+}
+
+.toolbar-identity-item:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--brand-focus);
+}
+
+.toolbar-identity-item[hidden] {
+  display: none;
+}
+
+.toolbar-identity-divider {
+  height: 1px;
+  margin: 3px 6px;
+  background: var(--panel-soft);
+}
+
+/* App menu bar (macOS anatomy): the focused app's File/Edit/View titles sit
+   right after its name. Titles are quiet bar text; the open one gets the same
+   lift as any bar control, and popovers share the frosted menu material. */
+.toolbar-menubar {
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  margin-left: 4px;
+  height: 100%;
+}
+
+.toolbar-menu {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.toolbar-menu-title {
+  padding: 0 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 22px;
+  white-space: nowrap;
+  opacity: 0.85;
+  cursor: default;
+}
+
+.toolbar-menu-title:hover,
+.toolbar-menu-title[aria-expanded="true"] {
+  background: var(--lift);
+  opacity: 1;
+}
+
+.toolbar-menu-title:focus-visible {
+  outline: 2px solid var(--brand-focus);
+  outline-offset: -2px;
+  opacity: 1;
+}
+
+.toolbar-menu-popover {
+  position: absolute;
+  top: calc(100% - 3px);
+  left: 0;
+  z-index: 100120;
+  min-width: 190px;
+  padding: 5px;
+  display: grid;
+  gap: 2px;
+  border-radius: 12px;
+  background: var(--menu-fill);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-soft);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
+.toolbar-menu-popover[hidden] {
+  display: none;
+}
+
+.toolbar-menu-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.toolbar-menu-item:hover:not(:disabled),
+.toolbar-menu-item:focus-visible {
+  background: var(--lift);
+  outline: none;
+}
+
+.toolbar-menu-item:disabled {
+  color: var(--soft);
+}
+
+.toolbar-menu-divider {
+  height: 1px;
+  margin: 3px 6px;
+  background: var(--panel-soft);
+}
+
+/* White stroke glyph; light theme inverts the button (PC2's approach) and
+   counter-inverts the numeric badge so it keeps its own colors. */
+:root[data-el-theme="light"] .inbox-btn {
+  filter: invert(1) hue-rotate(180deg);
+}
+
+/* Spotlight magnifier: the discoverable mouse path to Cmd+Space. */
+.spotlight-btn {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='1.9' stroke-linecap='round'%3E%3Ccircle cx='10.5' cy='10.5' r='6.2'/%3E%3Cpath d='m15.4 15.4 4.6 4.6'/%3E%3C/svg%3E");
+}
+
+:root[data-el-theme="light"] .spotlight-btn {
+  filter: invert(1) hue-rotate(180deg);
+}
+
+:root[data-el-theme="light"] .toolbar-inbox-count {
+  filter: invert(1) hue-rotate(180deg);
 }
 
 .inbox-btn {
@@ -210,6 +505,7 @@ body[data-home-authority="signed"] .sign-out-btn {
   font-size: 9px;
   font-weight: 700;
   line-height: 1;
+  font-variant-numeric: tabular-nums;
   box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.34);
 }
 
@@ -217,15 +513,181 @@ body[data-home-authority="signed"] .sign-out-btn {
   display: none;
 }
 
+/* The clock is a button (macOS: the clock opens Notification Center), but it
+   must still read as plain bar text — no chrome until hover. */
 .toolbar-clock {
   margin-left: 10px;
   margin-right: 0;
-  color: #fff;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
   font-size: 13px;
   font-weight: 500;
   line-height: 22px;
   white-space: nowrap;
   opacity: 0.9;
+  font-variant-numeric: tabular-nums;
+  cursor: default;
+}
+
+.toolbar-clock:hover,
+.toolbar-clock[aria-expanded="true"] {
+  background: var(--lift);
+  opacity: 1;
+}
+
+/* Notification Center: the memory behind the toast. Slides in under the bar
+   at the right edge, same frosted material as the other bar menus. */
+.notification-center {
+  position: fixed;
+  top: calc(var(--stage-top) + 8px);
+  right: 8px;
+  z-index: 100120;
+  display: flex;
+  flex-direction: column;
+  width: min(340px, calc(100vw - 16px));
+  max-height: calc(100dvh - var(--stage-top) - var(--stage-bottom) - 24px);
+  padding: 10px;
+  border-radius: 14px;
+  background: var(--menu-fill);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-soft);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  outline: none;
+  animation: notification-center-enter 140ms cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+.notification-center[hidden] {
+  display: none;
+}
+
+@keyframes notification-center-enter {
+  from {
+    opacity: 0;
+    transform: translateX(12px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .notification-center {
+    animation: none;
+  }
+}
+
+.notification-center-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 6px 8px;
+}
+
+.notification-center-title {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.notification-center-clear {
+  padding: 3px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.notification-center-clear:hover {
+  background: var(--lift);
+  color: var(--text);
+}
+
+.notification-center-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  gap: 6px;
+}
+
+.notification-center-section {
+  margin: 6px 6px 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.notification-center-item {
+  display: block;
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-soft);
+  color: var(--text);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 120ms ease;
+}
+
+.notification-center-item:hover {
+  background: var(--lift);
+}
+
+.notification-center-item-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.notification-center-item-title {
+  overflow: hidden;
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.notification-center-item-time {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.notification-center-item-body {
+  margin: 3px 0 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.notification-center-empty {
+  margin: 0;
+  padding: 22px 0 18px;
+  color: var(--muted);
+  font-size: 12.5px;
+  text-align: center;
 }
 
 .desktop-workspace {
@@ -244,41 +706,6 @@ body[data-home-authority="signed"] .sign-out-btn {
   -webkit-user-select: none;
 }
 
-body[data-home-shell="resolving"] .desktop-backdrop,
-body[data-home-shell="resolving"] .toolbar,
-body[data-home-shell="resolving"] .desktop-workspace,
-body[data-home-shell="resolving"] .taskbar,
-body[data-home-shell="resolving"] .launcher,
-body[data-home-shell="resolving"] #desktop-context-menu,
-body[data-home-shell="resolving"] #home-notification-toast {
-  display: none;
-}
-
-html[data-home-shell-hint="alternate"] .desktop-backdrop,
-html[data-home-shell-hint="alternate"] .toolbar,
-html[data-home-shell-hint="alternate"] .desktop-workspace,
-html[data-home-shell-hint="alternate"] .taskbar,
-html[data-home-shell-hint="alternate"] .launcher,
-html[data-home-shell-hint="alternate"] #desktop-context-menu,
-html[data-home-shell-hint="alternate"] #home-notification-toast,
-body[data-home-shell="alternate"] .desktop-backdrop,
-body[data-home-shell="alternate"] .toolbar,
-body[data-home-shell="alternate"] .desktop-workspace,
-body[data-home-shell="alternate"] .taskbar,
-body[data-home-shell="alternate"] .launcher,
-body[data-home-shell="alternate"] #desktop-context-menu,
-body[data-home-shell="alternate"] #home-notification-toast,
-body[data-home-gui="dormant"] .desktop-backdrop,
-body[data-home-gui="dormant"] .toolbar,
-body[data-home-gui="dormant"] .desktop-workspace,
-body[data-home-gui="dormant"] .taskbar,
-body[data-home-gui="dormant"] .launcher,
-body[data-home-gui="dormant"] #desktop-context-menu,
-body[data-home-gui="dormant"] #home-notification-toast {
-  display: none !important;
-}
-
-
 .home-notification-toast {
   position: fixed;
   top: calc(var(--toolbar-h) + var(--toolbar-offset) + 12px);
@@ -289,13 +716,28 @@ body[data-home-gui="dormant"] #home-notification-toast {
   align-items: center;
   gap: 14px;
   padding: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
+  border: 1px solid var(--line);
   border-radius: 8px;
-  background: rgba(23, 27, 35, 0.94);
+  background: var(--menu-fill);
   box-shadow: var(--shadow-soft);
   backdrop-filter: blur(14px);
   transform: translateY(0);
   opacity: 1;
+}
+
+.home-notification-toast:not([hidden]) {
+  animation: toast-enter 180ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+@keyframes toast-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .home-notification-toast[hidden] {
@@ -375,6 +817,15 @@ body[data-home-gui="dormant"] #home-notification-toast {
   display: none;
 }
 
+.desktop-marquee {
+  position: absolute;
+  z-index: 40;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.1);
+  pointer-events: none;
+}
+
 .desktop-shortcut {
   position: absolute;
   width: 92px;
@@ -420,6 +871,178 @@ body[data-home-gui="dormant"] #home-notification-toast {
   -webkit-user-select: none;
 }
 
+/* Quick Look: frameless centered preview over the desktop. No dim overlay —
+   same restraint as Spotlight; the panel's shadow does the separation. */
+.quick-look {
+  position: fixed;
+  inset: var(--stage-top) 0 var(--stage-bottom) 0;
+  z-index: 100118;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.quick-look[hidden] {
+  display: none;
+}
+
+.quick-look-panel {
+  display: flex;
+  flex-direction: column;
+  width: min(640px, 100%);
+  max-height: min(72dvh, 640px);
+  overflow: hidden;
+  border-radius: 16px;
+  background: var(--menu-fill);
+  border: 1px solid var(--line);
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.45), 0 2px 10px rgba(0, 0, 0, 0.25);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  color: var(--text);
+  animation: quick-look-enter 160ms cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+@keyframes quick-look-enter {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .quick-look-panel {
+    animation: none;
+  }
+}
+
+.quick-look-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 0.5px solid var(--panel-soft);
+}
+
+.quick-look-head-copy {
+  min-width: 0;
+}
+
+.quick-look-title {
+  margin: 0;
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.quick-look-meta {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.quick-look-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.quick-look-open {
+  min-height: 28px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--el-accent);
+  color: var(--el-accent-ink);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.quick-look-close {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.quick-look-close:hover {
+  background: var(--lift);
+}
+
+.quick-look-close img {
+  width: 10px;
+  height: 10px;
+  opacity: 0.7;
+  filter: invert(1);
+}
+
+:root[data-el-theme="light"] .quick-look-close img {
+  filter: none;
+}
+
+.quick-look-stage {
+  flex: 1 1 auto;
+  min-height: 220px;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  overflow: auto;
+}
+
+.quick-look-glyph {
+  width: 96px;
+  height: 96px;
+  border-radius: 22px;
+}
+
+/* Exposé-lite: windows become selectable cards; pointer events on the stage
+   catch dismiss-outside. Transforms are applied inline (transform-only). */
+body.expose-active .desktop-shortcuts {
+  pointer-events: none;
+  opacity: 0.35;
+}
+
+body.expose-active .window.expose-card {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+body.expose-active .window.expose-card .window-frame {
+  pointer-events: none;
+}
+
+/* Red count badge on the drag ghost when moving a multi-selection (macOS). */
+.desktop-shortcut-ghost-count {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  border-radius: 10px;
+  background: #ec4d3d;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 20px;
+  text-align: center;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}
+
 .desktop-shortcut-icon {
   width: 56px;
   height: 56px;
@@ -429,6 +1052,9 @@ body[data-home-gui="dormant"] #home-notification-toast {
 .desktop-shortcut-title {
   display: block;
   width: 100%;
+  /* Labels sit on the wallpaper, not on a themed surface: white + shadow in
+     both themes (macOS does the same on the desktop). */
+  color: #f5f7fa;
   font-size: 12px;
   line-height: 1.28;
   text-align: center;
@@ -552,7 +1178,7 @@ body[data-home-gui="dormant"] #home-notification-toast {
   left: 0;
   right: 0;
   bottom: calc(var(--taskbar-offset) + env(safe-area-inset-bottom, 0px));
-  z-index: 100000;
+  z-index: 100100;
   display: flex;
   justify-content: center;
   margin-inline: auto;
@@ -561,13 +1187,42 @@ body[data-home-gui="dormant"] #home-notification-toast {
   height: var(--taskbar-h);
   padding-left: 12px;
   padding-right: 12px;
-  border-radius: 24px;
-  background-color: hsla(216, 8%, 22%, 0.82);
+  border-radius: 20px;
+  background-color: var(--dock-fill);
   box-shadow:
-    inset 0 0 0 0.5px rgba(255, 255, 255, 0.2),
+    inset 0 0 0 0.5px var(--hairline),
     0 0 0 0.5px rgba(0, 0, 0, 0.2),
     0 4px 16px rgba(0, 0, 0, 0.2);
-  backdrop-filter: blur(12px);
+  backdrop-filter: blur(10px);
+  transition: transform 220ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* Dock auto-hide: slides under the bottom edge; a thin reveal strip stays
+   hot so the pointer can summon it (macOS). Stage geometry is unchanged —
+   windows keep their room even while the dock is tucked away. */
+body.dock-autohide .taskbar {
+  transform: translateY(calc(100% + var(--taskbar-offset) + 8px));
+}
+
+body.dock-autohide.dock-revealed .taskbar,
+body.dock-autohide .taskbar:focus-within {
+  transform: translateY(0);
+}
+
+body.dock-autohide::after {
+  content: "";
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 6px;
+  z-index: 100099;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .taskbar {
+    transition: none;
+  }
 }
 
 .taskbar-inner {
@@ -591,12 +1246,12 @@ body[data-home-gui="dormant"] #home-notification-toast {
   justify-content: flex-start;
   min-width: 12px;
   max-width: 100%;
-  min-height: 40px;
+  min-height: 50px;
   padding: 0 2px;
   gap: 2px;
-  overflow-x: auto;
+  /* Magnified icons and tooltips must escape the pill: no clipping here. */
+  overflow: visible;
   border-radius: 14px;
-  scrollbar-width: none;
   transition: background-color 0.16s ease, box-shadow 0.16s ease;
 }
 
@@ -605,15 +1260,17 @@ body[data-home-gui="dormant"] #home-notification-toast {
 }
 
 .taskbar-sortable.drop-active {
-  background: rgba(255, 255, 255, 0.06);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16);
+  background: var(--lift);
+  box-shadow: inset 0 0 0 1px var(--hairline);
 }
 
 .taskbar-item {
   position: relative;
-  width: 40px;
-  height: 40px;
-  padding: 5px;
+  width: 50px;
+  height: 50px;
+  /* Asymmetric: the tile sits 2px above slot center so the running dot gets
+     a real shelf below it — macOS seats dock icons the same way. */
+  padding: 3px 5px 7px;
   display: grid;
   place-items: center;
   border-radius: 10px;
@@ -626,20 +1283,16 @@ body[data-home-gui="dormant"] #home-notification-toast {
   opacity: 0.32;
 }
 
-.taskbar-item:hover .taskbar-icon,
-.taskbar-item:focus-visible .taskbar-icon {
-  background-color: rgba(255, 255, 255, 0.4);
-  outline: none;
-}
-
-.taskbar-item.active .taskbar-icon,
-.taskbar-item:active .taskbar-icon,
-.taskbar-item.open .taskbar-icon {
-  background-color: rgba(90, 93, 97, 0.66);
+/* The Dock speaks through magnification and running dots — no hover plates.
+   Keyboard focus keeps an explicit ring. */
+.taskbar-item:focus-visible {
+  outline: 2px solid var(--brand-focus);
+  outline-offset: 2px;
+  border-radius: 12px;
 }
 
 .taskbar-item:active {
-  transform: scale(0.97);
+  transform: scale(0.96);
 }
 
 .taskbar-icon {
@@ -648,7 +1301,21 @@ body[data-home-gui="dormant"] #home-notification-toast {
   display: grid;
   place-items: center;
   border-radius: 10px;
-  transition: background-color 0.18s ease;
+  /* Magnification is transform-only on this inner node: the 40px layout slot
+     (and hit target) never moves. Grows upward from the dock floor. */
+  transform-origin: 50% 100%;
+  transition: transform 90ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.taskbar-item.launching .taskbar-icon {
+  animation: dock-launch-bounce 420ms cubic-bezier(0.34, 1.4, 0.64, 1);
+}
+
+@keyframes dock-launch-bounce {
+  0% { transform: scale(1); }
+  25% { transform: scale(0.92); }
+  55% { transform: translateY(-10px) scale(1.08); }
+  100% { transform: none; }
 }
 
 .taskbar-item-icon {
@@ -659,11 +1326,14 @@ body[data-home-gui="dormant"] #home-notification-toast {
 
 .taskbar-entry {
   position: relative;
-  flex: 0 0 40px;
-  width: 40px;
-  height: 40px;
+  flex: 0 0 50px;
+  width: 50px;
+  height: 50px;
 }
 
+/* Window-count chip stays functional (opens the group menu) but is demoted to
+   monochrome — the Dock signals presence with dots; brand orange is for
+   notifications in the system bar, not Dock chrome. */
 .taskbar-window-count {
   position: absolute;
   top: 0;
@@ -674,20 +1344,42 @@ body[data-home-gui="dormant"] #home-notification-toast {
   display: grid;
   place-items: center;
   border-radius: 999px;
-  background: var(--brand);
-  color: #111;
+  background: rgba(32, 34, 40, 0.94);
+  color: rgba(245, 247, 250, 0.85);
   font-size: 10px;
   font-weight: 700;
   line-height: 1;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28);
+  font-variant-numeric: tabular-nums;
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.18),
+    0 2px 8px rgba(0, 0, 0, 0.28);
   cursor: pointer;
   z-index: 2;
 }
 
 .taskbar-window-count:hover,
 .taskbar-window-count:focus-visible {
-  background: var(--brand-strong);
-  outline: none;
+  background: rgba(62, 65, 72, 0.96);
+  color: #fff;
+}
+
+.taskbar-window-count:focus-visible {
+  outline: 2px solid var(--brand-focus);
+  outline-offset: 1px;
+}
+
+:root[data-el-theme="light"] .taskbar-window-count {
+  background: rgba(255, 255, 255, 0.94);
+  color: rgba(29, 36, 56, 0.9);
+  box-shadow:
+    0 0 0 1px rgba(29, 36, 56, 0.2),
+    0 2px 8px rgba(34, 49, 88, 0.18);
+}
+
+:root[data-el-theme="light"] .taskbar-window-count:hover,
+:root[data-el-theme="light"] .taskbar-window-count:focus-visible {
+  background: #ffffff;
+  color: #1d2438;
 }
 
 .taskbar-window-count[hidden] {
@@ -696,56 +1388,282 @@ body[data-home-gui="dormant"] #home-notification-toast {
 
 .taskbar-icon-launcher::before {
   content: "";
-  width: 18px;
-  height: 18px;
+  width: 22px;
+  height: 22px;
   display: block;
   background:
-    linear-gradient(#ffffff 0 0) left top / 7px 7px no-repeat,
-    linear-gradient(#ffffff 0 0) right top / 7px 7px no-repeat,
-    linear-gradient(#ffffff 0 0) left bottom / 7px 7px no-repeat,
-    linear-gradient(#ffffff 0 0) right bottom / 7px 7px no-repeat;
+    linear-gradient(#ffffff 0 0) left top / 9px 9px no-repeat,
+    linear-gradient(#ffffff 0 0) right top / 9px 9px no-repeat,
+    linear-gradient(#ffffff 0 0) left bottom / 9px 9px no-repeat,
+    linear-gradient(#ffffff 0 0) right bottom / 9px 9px no-repeat;
   opacity: 0.92;
 }
 
+:root[data-el-theme="light"] .taskbar-icon-launcher::before {
+  background:
+    linear-gradient(#3a4358 0 0) left top / 9px 9px no-repeat,
+    linear-gradient(#3a4358 0 0) right top / 9px 9px no-repeat,
+    linear-gradient(#3a4358 0 0) left bottom / 9px 9px no-repeat,
+    linear-gradient(#3a4358 0 0) right bottom / 9px 9px no-repeat;
+}
+
+/* macOS-style running dot: only apps with open windows get one; pinned
+   favorites stay clean until launched. It rides the magnification spread
+   horizontally (JS sets --dock-shift) but never lifts or scales.
+   Geometry: pill 60px / item slot 50px (centered, 5px margins) / tile 40px
+   with 7px bottom padding. Dot spans 0-4px of the item, so: tile, 3px air,
+   dot, 5px air, pill edge — and it never leaves the item's box (no clipping
+   under the mobile scroll container). */
 .active-taskbar-indicator {
   position: absolute;
   left: 50%;
-  bottom: 8px;
-  width: 9px;
-  height: 3px;
-  border-radius: 3px;
-  background-color: rgba(242, 243, 246, 0.82);
-  transform: translateX(-50%);
+  bottom: 0;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background-color: rgba(242, 243, 246, 0.9);
+  transform: translateX(calc(-50% + var(--dock-shift, 0px)));
   opacity: 0;
   transition: opacity 0.16s ease;
 }
 
+:root[data-el-theme="light"] .active-taskbar-indicator {
+  background-color: rgba(55, 62, 68, 0.9);
+}
+
 .taskbar-item.open .active-taskbar-indicator {
-  opacity: 0.5;
+  opacity: 0.7;
 }
 
 .taskbar-item.active .active-taskbar-indicator {
   opacity: 1;
 }
 
+/* Pinned ⋮ running divider */
+.taskbar-separator {
+  flex: 0 0 1px;
+  width: 1px;
+  height: 32px;
+  margin: 0 5px;
+  border-radius: 1px;
+  background: var(--hairline);
+}
+
+/* Dock tooltip: shared, non-interactive, positioned above the (possibly
+   magnified) icon. Shown on hover after a delay and on keyboard focus. */
+.dock-tooltip {
+  position: fixed;
+  z-index: 100130;
+  padding: 5px 12px;
+  transform: translateX(-50%) translateY(-100%);
+  border-radius: 9px;
+  background: var(--menu-fill);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.3;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow:
+    inset 0 0 0 0.5px var(--hairline),
+    0 8px 28px rgba(0, 0, 0, 0.32);
+  backdrop-filter: blur(10px);
+  opacity: 0;
+  transition: opacity 140ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* macOS-style tail: a rotated square in the bubble's own fill, centered on
+   the bottom edge, pointing at the icon. */
+.dock-tooltip::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: -4px;
+  width: 9px;
+  height: 9px;
+  background: var(--menu-fill);
+  box-shadow: inset -0.5px -0.5px 0 var(--hairline);
+  transform: translateX(-50%) rotate(45deg);
+  border-radius: 1.5px;
+}
+
+.dock-tooltip[data-visible="true"] {
+  opacity: 1;
+}
+
+.dock-tooltip[hidden] {
+  display: none;
+}
+
 .launcher {
   position: fixed;
   inset: 0;
-  z-index: 100010;
+  z-index: 100110;
   display: grid;
-  place-items: end center;
-  padding: calc(56px + env(safe-area-inset-top, 0px)) 18px calc(78px + env(safe-area-inset-bottom, 0px));
-  background: rgba(6, 7, 10, 0.12);
-  backdrop-filter: blur(4px);
+  place-items: center;
+  padding: calc(56px + env(safe-area-inset-top, 0px)) 18px calc(88px + env(safe-area-inset-bottom, 0px));
+  /* Apps-panel surface (macOS style): the overlay only catches clicks; the
+     modal card below carries the one blurred material — no nested blurs. */
+  background: transparent;
 }
 
 .launcher[hidden] {
   display: none;
 }
 
+.window-switcher[hidden],
+.shortcuts-overlay[hidden] {
+  display: none;
+}
+
+.window-switcher {
+  position: fixed;
+  inset: 0;
+  z-index: 100140;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+}
+
+.window-switcher-list {
+  pointer-events: auto;
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  max-width: min(84vw, 980px);
+  overflow-x: auto;
+  padding: 22px 26px;
+  border-radius: 22px;
+  background: var(--menu-fill);
+  border: 0.5px solid var(--line);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+}
+
+.window-switcher-item {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  width: 108px;
+  padding: 10px 6px 8px;
+  border-radius: 14px;
+  cursor: pointer;
+}
+
+.window-switcher-item[aria-selected="true"] {
+  background: var(--lift-strong);
+}
+
+.window-switcher-item[data-minimized="true"] .window-switcher-glyph {
+  opacity: 0.55;
+}
+
+.window-switcher-glyph {
+  width: 52px;
+  height: 52px;
+  display: grid;
+  place-items: center;
+}
+
+.window-switcher-glyph img,
+.window-switcher-glyph svg {
+  width: 100%;
+  height: 100%;
+}
+
+.window-switcher-title {
+  font-size: 0.74rem;
+  line-height: 1.25;
+  color: var(--text);
+  text-align: center;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.shortcuts-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100150;
+  display: grid;
+  place-items: center;
+  background: var(--overlay-dim);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+.shortcuts-card {
+  position: relative;
+  width: min(92vw, 480px);
+  max-height: min(80dvh, 560px);
+  overflow: auto;
+  padding: 22px 26px 24px;
+  border-radius: 18px;
+  background: var(--menu-fill);
+  border: 0.5px solid var(--line);
+  box-shadow: var(--shadow);
+}
+
+.shortcuts-title {
+  margin: 0 0 14px;
+  font-size: 1.02rem;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+}
+
+.shortcuts-list {
+  margin: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.shortcuts-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 7px 2px;
+  border-bottom: 0.5px solid var(--panel-soft);
+}
+
+.shortcuts-row:last-child {
+  border-bottom: none;
+}
+
+.shortcuts-row dt {
+  font-size: 0.85rem;
+  color: var(--text);
+}
+
+.shortcuts-row dd {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.76rem;
+  color: var(--soft);
+  white-space: nowrap;
+}
+
+.shortcuts-row kbd {
+  display: inline-grid;
+  place-items: center;
+  min-width: 22px;
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: var(--lift);
+  border: 0.5px solid var(--line);
+  box-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.28);
+  font-family: inherit;
+  font-size: 0.72rem;
+  color: var(--text);
+}
+
 .context-menu {
   position: fixed;
-  z-index: 100020;
+  z-index: 100120;
   min-width: 220px;
   max-width: calc(100vw - 24px);
   max-height: calc(100dvh - 54px);
@@ -754,9 +1672,9 @@ body[data-home-gui="dormant"] #home-notification-toast {
   display: grid;
   gap: 0.12rem;
   border-radius: 14px;
-  background: rgba(22, 24, 29, 0.96);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.34);
+  background: var(--menu-fill);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-soft);
   backdrop-filter: blur(16px);
   user-select: none;
   -webkit-user-select: none;
@@ -792,36 +1710,75 @@ body.dragging-target {
 
 .context-menu-item:hover,
 .context-menu-item:focus-visible {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--lift);
   outline: none;
 }
 
 .context-menu-divider {
   height: 1px;
   margin: 0.2rem 0.35rem;
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--panel-soft);
 }
 
 .launcher-popover {
   position: relative;
-  width: 530px;
-  max-width: calc(100vw - 36px);
-  max-height: min(500px, 72vh);
-  padding: 20px;
-  overflow-y: auto;
-  border: 1px solid var(--line);
-  border-radius: 16px;
-  background-color: rgba(24, 26, 31, 0.9);
+  display: flex;
+  flex-direction: column;
+  width: min(680px, 100%);
+  /* Fixed panel size (macOS Apps panel): switching grid/list or filtering
+     changes what's inside, never the box itself. Sized so the icon grid
+     fills it (~4 ranks); longer content scrolls. */
+  height: min(64dvh, 512px);
+  padding: 0;
+  overflow: hidden;
   color: var(--text);
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
-  backdrop-filter: blur(12px);
+  border-radius: 20px;
+  background: var(--menu-fill);
+  border: 0.5px solid var(--line);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  animation: launcher-enter 160ms cubic-bezier(0.2, 0, 0, 1) both;
 }
 
-.launcher-close {
-  position: absolute;
-  top: 12px;
-  right: 12px;
-  z-index: 2;
+@keyframes launcher-enter {
+  0% {
+    opacity: 0;
+    transform: scale(0.97) translateY(6px);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .launcher-popover {
+    animation: none;
+  }
+}
+
+/* Header: borderless inline search (macOS Apps panel) with the view toggle
+   and close on the far right, separated from the grid by a hairline. A fixed
+   bar above the scroll area — rows scroll under it, never through it. */
+.launcher-header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 10px 12px 8px 16px;
+  border-bottom: 0.5px solid var(--panel-soft);
+}
+
+.launcher-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 16px 18px;
+}
+
+.launcher-header-btn {
+  flex: 0 0 auto;
   width: 28px;
   height: 28px;
   display: grid;
@@ -831,29 +1788,66 @@ body.dragging-target {
   opacity: 0.78;
 }
 
+.launcher-header-btn:hover,
+.launcher-header-btn:focus-visible {
+  background: var(--lift);
+  opacity: 1;
+}
+
+/* Grid/list glyph, drawn in CSS so it themes with --text. Shows the view
+   you'd switch TO: list lines while in grid, grid squares while in list. */
+#launcher-view-toggle::before {
+  content: "";
+  width: 14px;
+  height: 12px;
+  display: block;
+  background:
+    linear-gradient(var(--text) 0 0) left 0 top 1px / 100% 2px no-repeat,
+    linear-gradient(var(--text) 0 0) left 0 center / 100% 2px no-repeat,
+    linear-gradient(var(--text) 0 0) left 0 bottom 1px / 100% 2px no-repeat;
+  opacity: 0.85;
+}
+
+.launcher[data-view="list"] #launcher-view-toggle::before {
+  height: 14px;
+  background:
+    linear-gradient(var(--text) 0 0) left top / 6px 6px no-repeat,
+    linear-gradient(var(--text) 0 0) right top / 6px 6px no-repeat,
+    linear-gradient(var(--text) 0 0) left bottom / 6px 6px no-repeat,
+    linear-gradient(var(--text) 0 0) right bottom / 6px 6px no-repeat;
+}
+
+.launcher-close {
+  z-index: 2;
+}
+
 .launcher-close img {
   width: 14px;
   height: 14px;
   filter: invert(1);
 }
 
+:root[data-el-theme="light"] .launcher-close img {
+  filter: none;
+}
+
 .launcher-close:hover {
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--lift);
   opacity: 1;
 }
 
 .launcher-search-wrap {
   position: relative;
-  margin-top: 16px;
-  margin-bottom: 18px;
-  padding-right: 30px;
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
 }
 
 .launcher-search-wrap::before {
   content: "";
   position: absolute;
   top: 50%;
-  left: 12px;
+  left: 8px;
   width: 16px;
   height: 16px;
   transform: translateY(-50%);
@@ -864,54 +1858,37 @@ body.dragging-target {
 
 .launcher-search-field {
   width: 100%;
-  height: 42px;
-  padding: 0 14px 0 38px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.05);
+  height: 32px;
+  padding: 0 12px 0 30px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
   color: var(--text);
+  font-size: 15px;
   outline: none;
 }
 
 .launcher-search-field::placeholder {
-  color: rgba(245, 247, 250, 0.45);
+  color: var(--soft);
 }
 
-.launcher-search-field:focus {
-  border-color: var(--brand-focus);
-  box-shadow: 0 0 0 1px var(--brand-ring);
-}
+/* No focus ring: the field is auto-focused whenever the panel opens (and
+   Chromium keeps :focus-visible on text inputs), so a ring would be a
+   permanent box — macOS shows only the caret here. */
 
 .launcher-heading {
-  margin: 0 5px 14px;
-  padding: 0 0 10px;
-  font-size: 13px;
-  color: var(--brand);
-  border-bottom: 1px solid var(--brand-line);
-}
-
-.launcher-sections {
-  display: grid;
-  gap: 18px;
-}
-
-.launcher-group[hidden] {
-  display: none;
-}
-
-.launcher-group-heading {
-  margin: 0 4px 12px;
-  color: rgba(245, 247, 250, 0.62);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
 }
 
 .launcher-group-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
-  gap: 14px 12px;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 12px 8px;
 }
 
 .launcher-card {
@@ -929,6 +1906,10 @@ body.dragging-target {
   margin: 0;
   padding: 0.55rem 0.35rem 0.4rem;
   display: grid;
+  /* Fixed icon row + top alignment: two-line titles grow downward, the
+     icon rank stays level across the row. */
+  grid-template-rows: 56px auto;
+  align-content: start;
   justify-items: center;
   gap: 0.5rem;
   border-radius: 12px;
@@ -937,7 +1918,7 @@ body.dragging-target {
 
 .launcher-card:hover .launcher-card-body,
 .launcher-card:focus-visible .launcher-card-body {
-  background-color: rgba(255, 255, 255, 0.08);
+  background-color: var(--lift);
   outline: none;
 }
 
@@ -947,24 +1928,194 @@ body.dragging-target {
 }
 
 .launcher-item-icon {
-  width: 54px;
-  height: 54px;
+  width: 56px;
+  height: 56px;
 }
 
+/* Single line with ellipsis (macOS Apps panel) — every card is exactly one
+   rank tall, no wrapped names. */
 .launcher-card-title {
   width: 100%;
   margin-top: 0;
   display: block;
-  overflow: visible;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
   line-height: 1.25;
   font-size: 12px;
   text-align: center;
   font-weight: 500;
 }
 
+/* List view: one column of icon + name rows, macOS style. */
+.launcher[data-view="list"] .launcher-group-grid {
+  grid-template-columns: 1fr;
+  gap: 1px;
+}
+
+.launcher[data-view="list"] .launcher-card-body {
+  grid-template-rows: none;
+  grid-template-columns: 30px 1fr;
+  align-content: center;
+  align-items: center;
+  justify-items: start;
+  padding: 5px 10px;
+  gap: 12px;
+  border-radius: 8px;
+}
+
+.launcher[data-view="list"] .launcher-item-icon {
+  width: 30px;
+  height: 30px;
+}
+
+.launcher[data-view="list"] .launcher-card-title {
+  font-size: 13px;
+  text-align: left;
+}
+
+/* Spotlight: centered floating bar in the upper third, results growing
+   beneath inside the same frosted panel (macOS anatomy). No backdrop dim —
+   macOS leaves the desktop untouched; the invisible full-stage container
+   only centers the bar and catches click-outside dismissal.
+   Unlike the fixed Apps panel, this panel auto-sizes with its matches. */
+.spotlight {
+  position: fixed;
+  inset: var(--stage-top) 0 var(--stage-bottom) 0;
+  z-index: 100115;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 12dvh 16px 0;
+}
+
+.spotlight[hidden] {
+  display: none;
+}
+
+.spotlight-panel {
+  width: min(640px, 100%);
+  max-height: min(60dvh, 560px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  color: var(--text);
+  border-radius: 16px;
+  background: var(--menu-fill);
+  border: 0.5px solid var(--line);
+  /* With no backdrop dim, the panel's own shadow carries the separation
+     from bright wallpapers (macOS does the same). */
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45), 0 2px 10px rgba(0, 0, 0, 0.25);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  animation: launcher-enter 140ms cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spotlight-panel {
+    animation: none;
+  }
+}
+
+.spotlight-bar {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+/* Magnifier inside the field, macOS-size. */
+.spotlight-bar::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 16px;
+  width: 18px;
+  height: 18px;
+  transform: translateY(-50%);
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23979eb0' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='10.5' cy='10.5' r='6.2'/%3E%3Cpath d='m15.4 15.4 4.6 4.6'/%3E%3C/svg%3E") center / contain no-repeat;
+  opacity: 0.9;
+  pointer-events: none;
+}
+
+.spotlight-field {
+  width: 100%;
+  height: 52px;
+  padding: 0 18px 0 46px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 20px;
+  font-weight: 400;
+  outline: none;
+}
+
+.spotlight-field::placeholder {
+  color: var(--soft);
+}
+
+.spotlight-results {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px 8px 10px;
+  border-top: 0.5px solid var(--panel-soft);
+}
+
+.spotlight-results[hidden] {
+  display: none;
+}
+
+.spotlight-section {
+  padding: 8px 10px 4px;
+  color: var(--soft);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.spotlight-item {
+  display: grid;
+  grid-template-columns: 26px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 34px;
+  padding: 3px 10px;
+  border-radius: 8px;
+  cursor: default;
+}
+
+.spotlight-item[aria-selected="true"] {
+  background: var(--brand);
+  color: #16171b;
+}
+
+.spotlight-glyph {
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+}
+
+.spotlight-title {
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 500;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.spotlight-detail {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.spotlight-item[aria-selected="true"] .spotlight-detail {
+  color: rgba(22, 23, 27, 0.72);
+}
+
 .launcher-empty {
   margin: 18px 4px 0;
-  color: rgba(245, 247, 250, 0.58);
+  color: var(--soft);
   font-size: 13px;
 }
 
@@ -982,22 +2133,66 @@ body.dragging-target {
   transition: opacity 0.18s ease, transform 0.18s ease;
 }
 
-.window[data-snap="left"],
-.window[data-snap="right"],
-.window[data-snap="nw"],
-.window[data-snap="ne"],
-.window[data-snap="sw"],
-.window[data-snap="se"] {
-  transition: opacity 0.18s ease, transform 0.18s ease, left 0.14s ease, top 0.14s ease, width 0.14s ease, height 0.14s ease;
-}
+/* Snap placement is applied instantly: animating left/top/width/height
+   reflows a node hosting a live iframe on every frame (perf budget rule 4).
+   Motion belongs to transform/opacity only. */
 
 .window.hidden {
   display: none;
 }
 
+/* Windows take programmatic focus (tabindex=-1) on keyboard activation; the
+   active header treatment is the focus indicator, not a page outline. */
+.window:focus {
+  outline: none;
+}
+
+/* Window lifecycle choreography — compositor-only (transform + opacity).
+   Enter: settle up into place. Exit: recede. Minimize: JS drives a transform
+   toward the matching dock slot through the transition below. */
+@keyframes window-enter {
+  from {
+    opacity: 0;
+    transform: scale(0.94) translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.window.window-enter {
+  animation: window-enter 200ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+@keyframes window-exit {
+  to {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+}
+
+.window.window-exit {
+  animation: window-exit 150ms cubic-bezier(0.2, 0, 0, 1) forwards;
+  pointer-events: none;
+}
+
+.window.window-minimizing {
+  transition: transform 220ms cubic-bezier(0.2, 0, 0, 1), opacity 220ms cubic-bezier(0.2, 0, 0, 1);
+  pointer-events: none;
+}
+
+/* Logical hide is synchronous (session state, focus logic); this keeps the
+   node painted while the minimize transform plays toward its dock slot. */
+.window.hidden.window-minimizing {
+  display: block;
+}
+
+/* Maximize fills the stage — never the system bar or dock. A window that buries
+   the clock reads as a browser tab, not a computer. */
 .window[data-maximized="true"] {
   position: fixed !important;
-  inset: 0 !important;
+  inset: var(--stage-top) 0 var(--stage-bottom) 0 !important;
   z-index: 100005 !important;
   width: auto !important;
   height: auto !important;
@@ -1042,11 +2237,28 @@ body.dragging-target {
   filter: none;
 }
 
+/* Traffic lights (macOS): close · minimize · zoom on the LEFT, color-coded
+   12px dots. Symbols stay hidden until the group is hovered or focused —
+   exactly the macOS reveal. The balance spacer mirrors the group's width so
+   the title centers optically in the bar. */
+.window-traffic-lights {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
+}
+
+.window-head-balance {
+  flex: 0 0 68px;
+}
+
 .window-head-draggable {
   flex-grow: 1;
   min-width: 0;
   display: flex;
   align-items: center;
+  justify-content: center;
   overflow: hidden;
   cursor: default;
 }
@@ -1070,28 +2282,59 @@ body.dragging-target {
   text-overflow: ellipsis;
 }
 
+:root[data-el-theme="light"] .window-head-title {
+  color: rgba(29, 36, 56, 0.92);
+}
+
 .window-action-btn {
-  width: 26px;
-  height: 26px;
-  flex: 0 0 26px;
-  margin-left: 0;
+  width: 12px;
+  height: 12px;
+  flex: 0 0 12px;
+  margin: 0;
+  padding: 0;
   display: grid;
   place-items: center;
-  border-radius: 6px;
+  border: 0.5px solid rgba(0, 0, 0, 0.18);
+  border-radius: 50%;
   cursor: pointer;
-  opacity: 0.86;
-  transition: background-color 0.18s ease, opacity 0.18s ease;
+}
+
+.window-action-btn[data-action="close"] {
+  background-color: #ff5f57;
+}
+
+.window-action-btn[data-action="minimize"] {
+  background-color: #febc2e;
+}
+
+.window-action-btn[data-action="maximize"] {
+  background-color: #28c840;
 }
 
 .window-action-btn img {
-  width: 11px;
-  height: 11px;
-  filter: invert(1) brightness(1.05);
+  width: 7px;
+  height: 7px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
 }
 
-.window-action-btn:hover {
-  background-color: rgba(255, 255, 255, 0.1);
-  opacity: 1;
+.window-traffic-lights:hover .window-action-btn img,
+.window-traffic-lights:focus-within .window-action-btn img {
+  opacity: 0.6;
+}
+
+/* Inactive window: the dots go neutral (macOS); hovering the group restores
+   color even before the window is focused. */
+.window:not(.window-active) .window-traffic-lights:not(:hover):not(:focus-within) .window-action-btn {
+  background-color: rgba(255, 255, 255, 0.24);
+  border-color: rgba(0, 0, 0, 0.1);
+}
+
+:root[data-el-theme="light"]
+  .window:not(.window-active)
+  .window-traffic-lights:not(:hover):not(:focus-within)
+  .window-action-btn {
+  background-color: rgba(29, 36, 56, 0.18);
 }
 
 .window-body {
@@ -1104,18 +2347,691 @@ body.dragging-target {
 }
 
 .window-body.window-body-frame {
+  position: relative;
   padding: 0;
   overflow: hidden;
+  background-color: var(--frame-fill);
+}
+
+/* Launch skeleton: one calm pulsing shape on the dark frame while the capsule
+   boots — no spinner soup. Hidden the moment the iframe reveals. */
+.window-body-frame::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 44px;
+  height: 44px;
+  margin: -22px 0 0 -22px;
+  border-radius: 12px;
+  background: var(--lift);
+  animation: launch-skeleton-pulse 1.1s ease-in-out infinite;
+}
+
+.window-body-frame:has(.window-frame.is-ready)::before {
+  display: none;
+}
+
+@keyframes launch-skeleton-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(0.94);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* People renders inside the shell itself — it uses the shared dark tokens
+   directly (the last light-on-dark clash in home). */
+.window-body.home-people-body {
+  padding: 0;
+  overflow: hidden;
+  background: var(--el-bg);
+  color: var(--el-text);
+}
+
+.home-people-shell {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  background: var(--el-bg);
+}
+
+.home-people-sidebar {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+  padding: 20px;
+  border-right: 1px solid var(--el-hairline);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.home-people-sidebar-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  border-radius: 4px;
+  padding: 8px 10px;
+  background: transparent;
+  color: var(--el-text);
+  cursor: pointer;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  text-align: left;
+}
+
+.home-people-sidebar-item.active,
+.home-people-sidebar-item:hover {
+  background: var(--lift);
+}
+
+.home-people-sidebar-icon {
+  position: relative;
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  color: currentColor;
+}
+
+.home-people-sidebar-icon::before,
+.home-people-sidebar-icon::after {
+  content: "";
+  position: absolute;
+}
+
+.home-people-sidebar-icon-people::before {
+  top: 3px;
+  left: 7px;
+  width: 8px;
+  height: 8px;
+  border: 1.7px solid currentColor;
+  border-radius: 50%;
+}
+
+.home-people-sidebar-icon-people::after {
+  right: 4px;
+  bottom: 4px;
+  left: 4px;
+  height: 8px;
+  border: 1.7px solid currentColor;
+  border-radius: 9px 9px 4px 4px;
+}
+
+.home-people-sidebar-icon-discovery::before {
+  inset: 5px;
+  border: 1.7px solid currentColor;
+  border-radius: 50%;
+}
+
+.home-people-sidebar-icon-discovery::after {
+  top: 10px;
+  right: 2px;
+  width: 8px;
+  border-top: 1.7px solid currentColor;
+}
+
+.home-people-sidebar-text {
+  flex-grow: 1;
+}
+
+.home-people-main-panel {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--el-bg);
+}
+
+.home-people-status {
+  min-height: 32px;
+  padding: 9px 30px;
+  border-bottom: 1px solid var(--el-hairline);
+  color: var(--el-muted);
+  font-size: 12px;
+  background: transparent;
+}
+
+.home-people-status[hidden] {
+  display: none;
+}
+
+.home-people-status[data-tone="error"] {
+  color: var(--el-danger);
+}
+
+.home-people-status[data-tone="ok"] {
+  color: var(--el-ok);
+}
+
+.home-people-content {
+  display: grid;
+  gap: 14px;
+  min-height: 0;
+  overflow: auto;
+  padding: 20px 30px;
+}
+
+.home-people-section {
+  display: grid;
+  gap: 10px;
+  scroll-margin-top: 12px;
+}
+
+.home-people-profile-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  border: 1px solid var(--el-hairline);
+  border-radius: 8px;
+  padding: 16px;
+  background: var(--el-surface-raised);
+}
+
+.home-people-profile-copy h3 {
+  margin: 0;
+  color: var(--el-text);
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.home-people-profile-copy p {
+  margin: 0.28rem 0 0;
+  color: var(--el-muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.home-people-profile-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: end;
+  max-width: 460px;
+}
+
+.home-people-profile-label {
+  grid-column: 1 / -1;
+  color: var(--el-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.home-people-profile-input {
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid var(--el-hairline);
+  border-radius: 6px;
+  padding: 7px 10px;
+  background: var(--el-inset);
+  color: var(--el-text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.home-people-profile-input:focus {
+  border-color: var(--el-hairline-strong);
+  outline: 2px solid var(--el-focus);
+  outline-offset: 1px;
+}
+
+.home-people-list {
+  display: grid;
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid var(--el-hairline);
+  border-radius: 8px;
+  background: var(--el-surface-raised);
+}
+
+/* People list/detail split — anatomy B: roster on the left, contact pane on
+   the right. Selection is a full row, not buttons scattered in cards. */
+.home-people-split {
+  display: grid;
+  grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
+  min-height: 260px;
+  overflow: hidden;
+  border: 1px solid var(--el-hairline);
+  border-radius: 8px;
+  background: var(--el-surface-raised);
+}
+
+.home-people-roster {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow-y: auto;
+  border-right: 1px solid var(--el-hairline);
+}
+
+.home-people-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid var(--el-hairline);
+  padding: 10px 12px;
+  background: transparent;
+  color: var(--el-text);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.home-people-row:hover {
+  background: var(--lift);
+}
+
+.home-people-row.active {
+  background: var(--el-accent-faint);
+}
+
+.home-people-row:focus-visible {
+  outline: 2px solid var(--el-focus);
+  outline-offset: -2px;
+}
+
+.home-people-row-copy {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.home-people-row-name {
+  overflow: hidden;
+  color: var(--el-text);
+  font-size: 13.5px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.home-people-row-sub {
+  color: var(--el-muted);
+  font-size: 12px;
+}
+
+.home-people-detail {
+  display: grid;
+  min-width: 0;
+  overflow-y: auto;
+  padding: 20px;
+}
+
+.home-people-detail > .home-people-empty {
+  border: 0;
+  background: transparent;
+  align-self: center;
+  text-align: center;
+}
+
+.home-people-detail-card {
+  display: grid;
+  gap: 16px;
+  align-content: start;
+}
+
+.home-people-detail-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.home-people-detail-avatar {
+  width: 56px;
+  height: 56px;
+  font-size: 22px;
+}
+
+.home-people-detail-copy h3 {
+  margin: 0;
+  color: var(--el-text);
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.home-people-detail-copy p {
+  margin: 0.2rem 0 0;
+  color: var(--el-muted);
+  font-size: 13px;
+}
+
+.home-people-detail-rows {
+  display: grid;
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid var(--el-hairline);
+  border-radius: 8px;
+  background: var(--el-inset);
+}
+
+.home-people-detail-row {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr);
+  gap: 10px;
+  align-items: baseline;
+  border-bottom: 1px solid var(--el-hairline);
+  padding: 9px 12px;
+}
+
+.home-people-detail-row:last-child {
+  border-bottom: 0;
+}
+
+.home-people-detail-label {
+  color: var(--el-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.home-people-detail-value {
+  overflow-wrap: anywhere;
+  color: var(--el-text);
+  font-size: 13px;
+}
+
+.home-people-detail-mono {
+  font-family: var(--el-font-mono);
+  font-size: 12px;
+}
+
+.home-people-detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.home-people-discovery-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
+}
+
+.home-people-discovery-column {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.home-people-discovery-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.home-people-discovery-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.home-people-discovery-column h4 {
+  margin: 0;
+  color: var(--el-muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+.home-people-card,
+.home-people-empty {
+  background: var(--el-surface-raised);
+}
+
+.home-people-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--el-hairline);
+}
+
+.home-people-card:last-child {
+  border-bottom: 0;
+}
+
+.home-people-avatar {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--lift);
+  color: var(--el-text);
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.home-people-card-copy {
+  min-width: 0;
+}
+
+.home-people-card-copy h3,
+.home-people-empty h3 {
+  margin: 0;
+  color: var(--el-text);
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.home-people-card-copy p,
+.home-people-empty p {
+  margin: 0.22rem 0 0;
+  color: var(--el-muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.home-people-card-copy p {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.home-people-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.home-people-action {
+  min-height: 34px;
+  border: 1px solid var(--el-hairline);
+  border-radius: 6px;
+  padding: 6px 11px;
+  background: var(--el-inset);
+  color: var(--el-text);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.home-people-action:hover:not(:disabled),
+.home-people-action:focus-visible:not(:disabled) {
+  border-color: var(--el-hairline-strong);
+  background: var(--lift);
+}
+
+.home-people-action:focus-visible:not(:disabled) {
+  outline: 2px solid var(--el-focus);
+  outline-offset: 1px;
+}
+
+.home-people-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.home-people-action-danger {
+  color: var(--el-danger);
+}
+
+/* In-card remove confirmation (replaces the browser-native confirm). */
+.home-people-confirm {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 10px;
+  border: 1px solid color-mix(in srgb, var(--el-danger) 34%, transparent);
+  border-radius: 10px;
+  padding: 8px 12px;
+  background: color-mix(in srgb, var(--el-danger) 9%, transparent);
+}
+
+.home-people-confirm p {
+  margin: 0;
+  color: var(--el-text);
+  font-size: 12.5px;
+}
+
+.home-people-confirm-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.home-people-badge {
+  min-height: 34px;
+  border: 1px solid rgba(52, 211, 153, 0.32);
+  border-radius: 999px;
+  padding: 7px 11px;
+  background: rgba(52, 211, 153, 0.12);
+  color: var(--el-ok);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.home-people-empty {
+  display: grid;
+  min-height: 140px;
+  place-items: center;
+  border: 1px solid var(--el-hairline);
+  border-radius: 8px;
+  padding: 20px;
+  text-align: center;
+}
+
+@media (max-width: 760px) {
+  .home-people-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .home-people-sidebar {
+    display: none;
+  }
+
+  .home-people-content {
+    padding: 12px;
+  }
+
+  .home-people-profile-card,
+  .home-people-profile-form {
+    grid-template-columns: 1fr;
+  }
+
+  .home-people-discovery-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .home-people-discovery-actions {
+    justify-content: flex-start;
+  }
+
+  .home-people-card {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .home-people-discovery-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .home-people-card-actions {
+    grid-column: 1 / -1;
+    justify-self: start;
+  }
+
+  .home-people-split {
+    grid-template-columns: 1fr;
+  }
+
+  .home-people-roster {
+    max-height: 240px;
+    border-right: 0;
+    border-bottom: 1px solid var(--el-hairline);
+  }
 }
 
 
+@media (prefers-reduced-motion: reduce) {
+  .taskbar-icon {
+    transition: none;
+  }
+
+  .taskbar-item.launching .taskbar-icon {
+    animation: none;
+  }
+
+  .dock-tooltip {
+    transition: none;
+  }
+
+  .window-frame {
+    transition: none;
+  }
+
+  .window.window-enter,
+  .window.window-exit,
+  .home-notification-toast:not([hidden]) {
+    animation: none;
+  }
+
+  .window.window-exit {
+    opacity: 0;
+  }
+
+  .window.window-minimizing {
+    transition: none;
+  }
+
+  .window-body-frame::before {
+    animation: none;
+  }
+}
+
+/* App iframes are dark until the capsule paints — the white flash is dead.
+   Content fades in on load, with a short fail-open so a slow capsule is never
+   invisible. */
 .window-frame {
   display: block;
   width: 100%;
   height: 100%;
   border: 0;
-  background: #fff;
+  background: var(--frame-fill);
+  opacity: 0;
+  transition: opacity 220ms cubic-bezier(0.2, 0, 0, 1);
   pointer-events: none;
+}
+
+.window-frame.is-ready {
+  opacity: 1;
 }
 
 .window-active .window-frame {
@@ -1236,10 +3152,6 @@ body.dragging-target {
 }
 
 @media (max-width: 820px) {
-  .toolbar {
-    max-width: calc(100vw - 24px);
-  }
-
   .toolbar-brand {
     width: 90px;
   }
@@ -1266,6 +3178,8 @@ body.dragging-target {
 }
 
 @media (max-width: 640px) {
+  /* Phone shell: bar keeps brand · identity · clock; the focused-window title
+     and identity name yield the space. The clock never hides. */
   .toolbar {
     padding-right: 8px;
   }
@@ -1274,15 +3188,37 @@ body.dragging-target {
     margin-left: 7px;
   }
 
-  .toolbar-clock {
+  .toolbar-active-title,
+  .toolbar-menubar {
+    display: none;
+  }
+
+  .toolbar-identity-name {
     display: none;
   }
 
   .launcher-popover {
     width: calc(100vw - 24px);
-    max-height: calc(100dvh - 92px);
+    height: calc(100dvh - 92px);
   }
 
+  /* Windows fill the stage between bar and dock — apps read as full-screen. */
+  .window {
+    position: fixed !important;
+    inset: var(--stage-top) 0 var(--stage-bottom) 0 !important;
+    width: auto !important;
+    height: auto !important;
+    max-width: none !important;
+    max-height: none !important;
+    border-radius: 0 !important;
+  }
+
+  .window .window-resize-handle {
+    display: none;
+  }
+
+  /* Dock: fixed bottom row, horizontally scrollable, no magnification (the
+     magnification code also gates itself off below 641px / non-hover). */
   .taskbar {
     max-width: calc(100vw - 20px);
     padding-left: 8px;
@@ -1293,7 +3229,76 @@ body.dragging-target {
     gap: 8px;
   }
 
-  .window[data-maximized="true"] {
-    inset: 0 !important;
+  .taskbar-sortable {
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
   }
+
+  .taskbar-sortable::-webkit-scrollbar {
+    display: none;
+  }
+
+  .dock-tooltip {
+    display: none;
+  }
+}
+
+/* ---- Host/GUI split guards ----
+   The host keeps home-gui markup out of sight whenever the GUI is not the
+   active shell: while the root shell is being resolved, while an alternate
+   shell (e.g. home-cli) is active, and whenever the facade marks the GUI
+   dormant. The html-level hint hides pre-hydration flashes on reload. */
+body[data-home-shell="resolving"] .desktop-backdrop,
+body[data-home-shell="resolving"] .toolbar,
+body[data-home-shell="resolving"] .desktop-workspace,
+body[data-home-shell="resolving"] .taskbar,
+body[data-home-shell="resolving"] .launcher,
+body[data-home-shell="resolving"] #desktop-context-menu,
+body[data-home-shell="resolving"] #home-notification-toast,
+body[data-home-shell="resolving"] #notification-center,
+body[data-home-shell="resolving"] #spotlight,
+body[data-home-shell="resolving"] #window-switcher,
+body[data-home-shell="resolving"] #quick-look,
+body[data-home-shell="resolving"] #shortcuts-overlay {
+  display: none;
+}
+
+html[data-home-shell-hint="alternate"] .desktop-backdrop,
+html[data-home-shell-hint="alternate"] .toolbar,
+html[data-home-shell-hint="alternate"] .desktop-workspace,
+html[data-home-shell-hint="alternate"] .taskbar,
+html[data-home-shell-hint="alternate"] .launcher,
+html[data-home-shell-hint="alternate"] #desktop-context-menu,
+html[data-home-shell-hint="alternate"] #home-notification-toast,
+html[data-home-shell-hint="alternate"] #notification-center,
+html[data-home-shell-hint="alternate"] #spotlight,
+html[data-home-shell-hint="alternate"] #window-switcher,
+html[data-home-shell-hint="alternate"] #quick-look,
+html[data-home-shell-hint="alternate"] #shortcuts-overlay,
+body[data-home-shell="alternate"] .desktop-backdrop,
+body[data-home-shell="alternate"] .toolbar,
+body[data-home-shell="alternate"] .desktop-workspace,
+body[data-home-shell="alternate"] .taskbar,
+body[data-home-shell="alternate"] .launcher,
+body[data-home-shell="alternate"] #desktop-context-menu,
+body[data-home-shell="alternate"] #home-notification-toast,
+body[data-home-shell="alternate"] #notification-center,
+body[data-home-shell="alternate"] #spotlight,
+body[data-home-shell="alternate"] #window-switcher,
+body[data-home-shell="alternate"] #quick-look,
+body[data-home-shell="alternate"] #shortcuts-overlay,
+body[data-home-gui="dormant"] .desktop-backdrop,
+body[data-home-gui="dormant"] .toolbar,
+body[data-home-gui="dormant"] .desktop-workspace,
+body[data-home-gui="dormant"] .taskbar,
+body[data-home-gui="dormant"] .launcher,
+body[data-home-gui="dormant"] #desktop-context-menu,
+body[data-home-gui="dormant"] #home-notification-toast,
+body[data-home-gui="dormant"] #notification-center,
+body[data-home-gui="dormant"] #spotlight,
+body[data-home-gui="dormant"] #window-switcher,
+body[data-home-gui="dormant"] #quick-look,
+body[data-home-gui="dormant"] #shortcuts-overlay {
+  display: none !important;
 }

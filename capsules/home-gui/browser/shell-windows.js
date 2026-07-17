@@ -19,7 +19,7 @@ import {
   clearShellSessionState,
   ignoreRepeatedAction,
   targetById,
-} from "./shell-core.js?v=home-20260715a";
+} from "./shell-core.js?v=home-20260718n";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -30,7 +30,7 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260715a";
+} from "./shell-window-geometry.js?v=home-20260718n";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [

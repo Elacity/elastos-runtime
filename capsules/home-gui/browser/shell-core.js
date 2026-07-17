@@ -9,11 +9,20 @@ export let launcherEmptyState = document.querySelector("#launcher-empty-state");
 export let launcherSearch = document.querySelector("#launcher-search");
 export let launcherToggleButton = document.querySelector("#launcher-toggle");
 export let closeLauncherButton = document.querySelector("#close-launcher");
+export let launcherViewToggle = document.querySelector("#launcher-view-toggle");
 export let toolbarHomeButton = document.querySelector("#toolbar-home");
+export let toolbarActiveTitleNode = document.querySelector("#toolbar-active-title");
 export let toolbarInboxButton = document.querySelector("#toolbar-inbox");
 export let toolbarInboxCount = document.querySelector("#toolbar-inbox-count");
-export let toolbarFullscreenButton = document.querySelector("#toolbar-fullscreen");
-export let toolbarSignOutButton = document.querySelector("#toolbar-sign-out");
+export let toolbarFullscreenButton = document.querySelector("#identity-menu-fullscreen");
+export let toolbarSignOutButton = document.querySelector("#identity-menu-sign-out");
+export let toolbarIdentity = document.querySelector("#toolbar-identity");
+export let toolbarIdentityButton = document.querySelector("#toolbar-identity-btn");
+export let toolbarIdentityAvatar = document.querySelector("#toolbar-identity-avatar");
+export let toolbarIdentityName = document.querySelector("#toolbar-identity-name");
+export let toolbarIdentityMenu = document.querySelector("#toolbar-identity-menu");
+export let toolbarIdentityMenuName = document.querySelector("#toolbar-identity-menu-name");
+export let identityMenuSystemButton = document.querySelector("#identity-menu-system");
 export let homeNotificationToast = document.querySelector("#home-notification-toast");
 export let homeNotificationTitle = document.querySelector("#home-notification-title");
 export let homeNotificationBody = document.querySelector("#home-notification-body");
@@ -50,9 +59,9 @@ export const WINDOW_TOP_INSET = 8;
 export const WINDOW_BOTTOM_INSET = 72;
 export const CONTEXT_MENU_IGNORE_OUTSIDE_MS = 220;
 const HOME_GUI_TEMPLATE_ID = "home-gui-template";
-const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260715a", import.meta.url).href;
+const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260718n", import.meta.url).href;
 const HOME_GUI_STYLESHEET_ID = "home-gui-stylesheet";
-const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260715a", import.meta.url).href;
+const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260718n", import.meta.url).href;
 let homeGuiTemplateHtmlPromise = null;
 let homeGuiLaunchToken = "";
 
@@ -102,6 +111,7 @@ export const shellState = {
   contextMenuTarget: { kind: "desktop" },
   contextMenuIgnoreOutsideUntil: 0,
   selectedDesktopTargetId: null,
+  marqueeSelection: new Set(),
   recentTargetIds: [],
   selectedLauncherTargetId: null,
   launcherIgnoreOutsideUntil: 0,
@@ -114,6 +124,40 @@ export const shellState = {
   requestSummaryRefresh: null,
   homeGuiMounted: false,
 };
+
+// Keyboard focus trap for modal shell surfaces (launcher, unlock). Wraps Tab
+// and Shift+Tab within the container's visible, enabled controls. Returns true
+// when the event was handled.
+export function trapTabWithin(container, event) {
+  if (event.key !== "Tab" || !container) {
+    return false;
+  }
+  const focusables = Array.from(
+    container.querySelectorAll(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    ),
+  ).filter(
+    (element) => !element.hidden && !element.disabled && element.offsetParent !== null,
+  );
+  if (focusables.length === 0) {
+    event.preventDefault();
+    return true;
+  }
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  const active = document.activeElement;
+  if (event.shiftKey && (active === first || !container.contains(active))) {
+    event.preventDefault();
+    last.focus();
+    return true;
+  }
+  if (!event.shiftKey && (active === last || !container.contains(active))) {
+    event.preventDefault();
+    first.focus();
+    return true;
+  }
+  return false;
+}
 
 export function retireHomeGuiWindowState() {
   if (shellState.windows.size === 0) {
@@ -138,11 +182,20 @@ function bindHomeGuiDomRefs() {
   launcherSearch = document.querySelector("#launcher-search");
   launcherToggleButton = document.querySelector("#launcher-toggle");
   closeLauncherButton = document.querySelector("#close-launcher");
+  launcherViewToggle = document.querySelector("#launcher-view-toggle");
   toolbarHomeButton = document.querySelector("#toolbar-home");
+  toolbarActiveTitleNode = document.querySelector("#toolbar-active-title");
   toolbarInboxButton = document.querySelector("#toolbar-inbox");
   toolbarInboxCount = document.querySelector("#toolbar-inbox-count");
-  toolbarFullscreenButton = document.querySelector("#toolbar-fullscreen");
-  toolbarSignOutButton = document.querySelector("#toolbar-sign-out");
+  toolbarFullscreenButton = document.querySelector("#identity-menu-fullscreen");
+  toolbarSignOutButton = document.querySelector("#identity-menu-sign-out");
+  toolbarIdentity = document.querySelector("#toolbar-identity");
+  toolbarIdentityButton = document.querySelector("#toolbar-identity-btn");
+  toolbarIdentityAvatar = document.querySelector("#toolbar-identity-avatar");
+  toolbarIdentityName = document.querySelector("#toolbar-identity-name");
+  toolbarIdentityMenu = document.querySelector("#toolbar-identity-menu");
+  toolbarIdentityMenuName = document.querySelector("#toolbar-identity-menu-name");
+  identityMenuSystemButton = document.querySelector("#identity-menu-system");
   homeNotificationToast = document.querySelector("#home-notification-toast");
   homeNotificationTitle = document.querySelector("#home-notification-title");
   homeNotificationBody = document.querySelector("#home-notification-body");
@@ -669,6 +722,22 @@ export function clampDesktopPosition(position) {
     x: clamp(position.x, DESKTOP_ICON_MARGIN, maxX),
     y: clamp(position.y, DESKTOP_ICON_MARGIN, maxY),
   };
+}
+
+// Snap a dropped icon to the nearest grid cell; fall back to the free-form
+// position when that cell is already occupied by another icon.
+export function snapDesktopPosition(entryId, position) {
+  const clamped = clampDesktopPosition(position);
+  const snapped = clampDesktopPosition({
+    x: DESKTOP_ICON_MARGIN +
+      Math.round((clamped.x - DESKTOP_ICON_MARGIN) / DESKTOP_ICON_GAP_X) * DESKTOP_ICON_GAP_X,
+    y: DESKTOP_ICON_MARGIN +
+      Math.round((clamped.y - DESKTOP_ICON_MARGIN) / DESKTOP_ICON_GAP_Y) * DESKTOP_ICON_GAP_Y,
+  });
+  if (desktopPositionOverlapsAny(snapped, occupiedDesktopPositionsExcept(entryId))) {
+    return clamped;
+  }
+  return snapped;
 }
 
 export function desktopPositionForTarget(targetId, defaultIndex) {
