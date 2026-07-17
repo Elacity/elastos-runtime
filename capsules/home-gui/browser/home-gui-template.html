@@ -34,9 +34,6 @@
       <button id="identity-menu-show-desktop" class="toolbar-identity-item" type="button" role="menuitem">
         Show desktop
       </button>
-      <button id="identity-menu-fullscreen" class="toolbar-identity-item" type="button" role="menuitem">
-        Enter fullscreen
-      </button>
       <button id="identity-menu-system" class="toolbar-identity-item" type="button" role="menuitem">
         System
       </button>
@@ -56,6 +53,18 @@
     aria-label="Search"
     title="Search (Cmd+Space)"
   ></button>
+  <button
+    id="toolbar-control-centre"
+    class="toolbar-btn control-centre-btn"
+    type="button"
+    aria-label="Control Centre"
+    title="Control Centre"
+    aria-haspopup="dialog"
+    aria-expanded="false"
+    aria-controls="control-centre"
+  >
+    <span class="control-centre-glyph" aria-hidden="true"></span>
+  </button>
   <button
     id="toolbar-inbox"
     class="toolbar-btn inbox-btn"
@@ -95,6 +104,45 @@
   </div>
   <div id="notification-center-list" class="notification-center-list hide-scrollbar"></div>
   <p id="notification-center-empty" class="notification-center-empty" hidden>No notifications</p>
+</aside>
+
+<aside
+  id="control-centre"
+  class="control-centre"
+  role="group"
+  aria-label="Control Centre"
+  tabindex="-1"
+  aria-hidden="true"
+  inert
+  hidden
+>
+  <div class="control-centre-section" role="radiogroup" aria-label="Appearance">
+    <div class="control-centre-label">Appearance</div>
+    <div id="control-centre-theme" class="control-centre-segment">
+      <button type="button" class="control-centre-segment-option" data-theme-option="auto" role="radio" aria-checked="false">
+        Auto
+      </button>
+      <button type="button" class="control-centre-segment-option" data-theme-option="light" role="radio" aria-checked="false">
+        Light
+      </button>
+      <button type="button" class="control-centre-segment-option" data-theme-option="dark" role="radio" aria-checked="false">
+        Dark
+      </button>
+    </div>
+  </div>
+  <div class="control-centre-divider" role="separator"></div>
+  <button id="control-centre-sounds" class="control-centre-row" type="button" role="switch" aria-checked="false">
+    <span class="control-centre-row-label">UI Sounds</span>
+    <span class="control-centre-switch" aria-hidden="true"></span>
+  </button>
+  <button id="control-centre-fullscreen" class="control-centre-row" type="button">
+    <span class="control-centre-row-label">Enter fullscreen</span>
+  </button>
+  <div class="control-centre-divider" role="separator"></div>
+  <button id="control-centre-wallet" class="control-centre-row control-centre-wallet" type="button">
+    <span class="control-centre-row-label">Wallet</span>
+    <span class="control-centre-row-detail">Open</span>
+  </button>
 </aside>
 
 <main class="desktop-workspace" data-home-gui-hidden-by-host="hidden" inert hidden>

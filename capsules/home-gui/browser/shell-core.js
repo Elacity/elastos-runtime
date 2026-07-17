@@ -14,7 +14,7 @@ export let toolbarHomeButton = document.querySelector("#toolbar-home");
 export let toolbarActiveTitleNode = document.querySelector("#toolbar-active-title");
 export let toolbarInboxButton = document.querySelector("#toolbar-inbox");
 export let toolbarInboxCount = document.querySelector("#toolbar-inbox-count");
-export let toolbarFullscreenButton = document.querySelector("#identity-menu-fullscreen");
+export let toolbarFullscreenButton = document.querySelector("#control-centre-fullscreen");
 export let toolbarSignOutButton = document.querySelector("#identity-menu-sign-out");
 export let toolbarSystem = document.querySelector("#toolbar-system");
 export let toolbarIdentityMenu = document.querySelector("#toolbar-identity-menu");
@@ -181,7 +181,7 @@ function bindHomeGuiDomRefs() {
   toolbarActiveTitleNode = document.querySelector("#toolbar-active-title");
   toolbarInboxButton = document.querySelector("#toolbar-inbox");
   toolbarInboxCount = document.querySelector("#toolbar-inbox-count");
-  toolbarFullscreenButton = document.querySelector("#identity-menu-fullscreen");
+  toolbarFullscreenButton = document.querySelector("#control-centre-fullscreen");
   toolbarSignOutButton = document.querySelector("#identity-menu-sign-out");
   toolbarSystem = document.querySelector("#toolbar-system");
   toolbarIdentityMenu = document.querySelector("#toolbar-identity-menu");
