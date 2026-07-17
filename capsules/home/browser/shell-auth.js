@@ -49,9 +49,11 @@ export async function showHomeUnlock(onUnlocked, options = {}) {
     const status = await fetchJson("/api/auth/passkey/status");
     const registered = status.registered === true;
     const guestRegistrationEnabled = status.guest_registration_enabled === true;
+    // First boot arrives in beats: welcome -> create passkey -> desktop
+    // reveal. Returning users go straight to sign-in.
     unlockMode = registered
       ? (guestRegistrationEnabled ? "signin_guest_enabled" : "signin")
-      : "create";
+      : "welcome";
     renderUnlockMode({ registered, guestRegistrationEnabled });
     setUnlockStatus(unlockStatusCopy(registered, guestRegistrationEnabled), "muted");
     if (registered) {
@@ -68,6 +70,28 @@ export function hideHomeUnlock() {
   if (!unlockPanel) {
     return;
   }
+  // Arrival: when the unlock surface is actually on screen, cross-fade it out
+  // while the desktop settles in behind (opacity/transform only — compositor
+  // work, no layout). Reduced motion and the already-hidden boot path skip it.
+  const reducedMotion = typeof window.matchMedia === "function"
+    && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (!unlockPanel.hidden && !reducedMotion) {
+    const desktopShell = document.querySelector(".desktop-shell");
+    unlockPanel.classList.add("home-unlock-leaving");
+    desktopShell?.classList.add("desktop-arriving");
+    window.setTimeout(() => {
+      unlockPanel.classList.remove("home-unlock-leaving");
+      finishHideHomeUnlock();
+    }, 300);
+    window.setTimeout(() => {
+      desktopShell?.classList.remove("desktop-arriving");
+    }, 760);
+    return;
+  }
+  finishHideHomeUnlock();
+}
+
+function finishHideHomeUnlock() {
   unlockPanel.hidden = true;
   unlockPanel.setAttribute("aria-hidden", "true");
   delete unlockPanel.dataset.mode;
@@ -82,6 +106,12 @@ export function bindHomeUnlock() {
     }
   });
   unlockPrimary?.addEventListener("click", () => {
+    if (unlockMode === "welcome") {
+      unlockMode = "create";
+      renderUnlockMode({ registered: false, guestRegistrationEnabled: false });
+      unlockName?.focus();
+      return;
+    }
     if (unlockMode === "create" || unlockMode === "create_guest") {
       runPasskeyCreate().catch(reportUnlockError);
       return;
@@ -147,14 +177,19 @@ function renderUnlockChecking() {
 }
 
 function renderUnlockMode({ registered, guestRegistrationEnabled }) {
+  const welcoming = unlockMode === "welcome";
   const creatingGuest = unlockMode === "create_guest";
   const creatingAdmin = unlockMode === "create";
   const canCreate = creatingAdmin || creatingGuest;
   if (unlockTitle) {
-    unlockTitle.textContent = creatingGuest ? "Create guest account" : (registered ? "Sign in" : "Set up Home");
+    unlockTitle.textContent = welcoming
+      ? "Welcome to ElastOS"
+      : creatingGuest ? "Create guest account" : (registered ? "Sign in" : "Set up Home");
   }
   if (unlockCopy) {
-    if (creatingGuest) {
+    if (welcoming) {
+      unlockCopy.textContent = "This Home is yours: your data, apps and desktop, unlocked by a passkey only you hold.";
+    } else if (creatingGuest) {
       unlockCopy.textContent = "Use a passkey to create your own guest account.";
     } else {
       unlockCopy.textContent = registered
@@ -163,9 +198,11 @@ function renderUnlockMode({ registered, guestRegistrationEnabled }) {
     }
   }
   if (unlockPrimary) {
-    unlockPrimary.textContent = creatingGuest
-      ? "Create guest passkey"
-      : (registered ? "Use passkey" : "Create admin passkey");
+    unlockPrimary.textContent = welcoming
+      ? "Get started"
+      : creatingGuest
+        ? "Create guest passkey"
+        : (registered ? "Use passkey" : "Create admin passkey");
     unlockPrimary.disabled = unlockMode === "unsupported";
   }
   if (unlockSecondary) {

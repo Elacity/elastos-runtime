@@ -289,6 +289,53 @@ img {
   color: #ff8f8f;
 }
 
+/* Arrival: unlock success cross-fades the overlay away while the desktop
+   settles in behind. Opacity/transform only — compositor work, no layout. */
+.home-unlock.home-unlock-leaving {
+  pointer-events: none;
+  animation: home-unlock-dismiss 280ms ease-in both;
+}
+
+.home-unlock.home-unlock-leaving .home-unlock-card {
+  animation: home-unlock-card-dismiss 280ms ease-in both;
+}
+
+@keyframes home-unlock-dismiss {
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes home-unlock-card-dismiss {
+  to {
+    opacity: 0;
+    transform: scale(1.045);
+  }
+}
+
+.desktop-shell.desktop-arriving {
+  animation: desktop-arrive 560ms cubic-bezier(0.2, 0.7, 0.3, 1) both;
+}
+
+@keyframes desktop-arrive {
+  from {
+    opacity: 0.55;
+    transform: scale(1.012);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .home-unlock.home-unlock-leaving,
+  .home-unlock.home-unlock-leaving .home-unlock-card,
+  .desktop-shell.desktop-arriving {
+    animation: none;
+  }
+}
+
 @media (max-width: 720px) {
   .home-unlock-card,
   .home-unlock[data-mode="prompt"] .home-unlock-card {
