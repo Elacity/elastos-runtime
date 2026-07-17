@@ -53,12 +53,17 @@ verify:
     node scripts/check-elastos-bus-wit.mjs
     node scripts/home-entropy-check.mjs
     node scripts/browser-entropy-check.mjs
+    ./scripts/vendor-ui-tokens.sh --check
     just local-carrier-setup-smoke
     ./scripts/command-smoke.sh
     just candidate-command-audit
     cd elastos && cargo fmt --all -- --check
     cd elastos && cargo clippy --workspace --all-targets -- -D warnings
     cd elastos && cargo test --workspace
+
+# Re-stamp the shared UI token sheet + theme runtime into each capsule
+vendor-ui:
+    ./scripts/vendor-ui-tokens.sh
 
 # Release-trust gate: requires canonical publisher signer, not the dev signer
 verify-release:
