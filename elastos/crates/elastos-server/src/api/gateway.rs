@@ -12,6 +12,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
+use axum::extract::ws::{Message as WebSocketMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, Query, RawQuery, State};
 use axum::http::{
     header::{
@@ -806,8 +807,7 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         )
         .route(
             "/api/apps/home-cli/terminal/sessions/:session_id/input",
-            post(home_cli_terminal_input)
-                .layer(DefaultBodyLimit::max(HOME_TERMINAL_INPUT_MAX_BYTES)),
+            get(home_cli_terminal_input_socket),
         )
         .route(
             "/api/apps/home-cli/terminal/sessions/:session_id/resize",

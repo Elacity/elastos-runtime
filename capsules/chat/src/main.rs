@@ -744,16 +744,8 @@ fn send_dm(app: &mut App, args: &Args, recipient_nick: &str, recipient_pubkey: &
             .map(|c| c.name.clone())
             .unwrap_or_else(|| "#general".to_string());
 
-        let result = session::send_gossip(
-            &app.peer_token,
-            &gossip_topic,
-            &app.nickname,
-            &app.pubkey,
-            Some(&app.session_id),
-            ts,
-            &wire_content,
-            signature.as_deref(),
-        );
+        let result =
+            session::send_gossip(&app.peer_token, &gossip_topic, &msg, Some(&wire_content));
         if let Err(e) = result {
             app.set_status(&format!("DM send failed: {}", e));
         }
@@ -814,16 +806,7 @@ fn send_message(app: &mut App, args: &Args, text: &str) {
         return;
     }
     if !app.peer_token.is_empty() {
-        let result = session::send_gossip(
-            &app.peer_token,
-            &channel,
-            &app.nickname,
-            &app.pubkey,
-            Some(&app.session_id),
-            ts,
-            text,
-            signature.as_deref(),
-        );
+        let result = session::send_gossip(&app.peer_token, &channel, &msg, None);
         if let Err(e) = result {
             app.set_status(&format!("Send failed: {}", e));
         }
@@ -1247,16 +1230,7 @@ fn broadcast_history(app: &App, _args: &Args) {
             .collect();
 
         for msg in recent {
-            let _ = session::send_gossip(
-                &app.peer_token,
-                &ch.name,
-                &msg.sender_nick,
-                &msg.sender_id,
-                msg.sender_session_id.as_deref(),
-                msg.ts,
-                &msg.content,
-                msg.signature.as_deref(),
-            );
+            let _ = session::send_gossip(&app.peer_token, &ch.name, msg, None);
         }
     }
 }

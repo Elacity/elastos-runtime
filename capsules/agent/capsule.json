@@ -37,6 +37,11 @@
   "requires": [
     { "name": "did-provider", "kind": "capsule" }
   ],
+  "capabilities": [
+    "elastos://did/*",
+    "elastos://peer/*",
+    "elastos://ai/*"
+  ],
   "resources": {
     "memory_mb": 64,
     "gpu": false

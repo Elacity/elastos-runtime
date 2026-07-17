@@ -499,15 +499,16 @@ function audit(args) {
         gatewayHomeTerminal.includes("libc::openpty") &&
         gatewayHomeTerminal.includes("HOME_TERMINAL_INPUT_MAX_BYTES") &&
         gatewayHomeTerminal.includes("HOME_TERMINAL_RESIZE_SCHEMA") &&
-        gatewayHomeTerminal.includes("require_home_launch_token_for_any_context") &&
+        gatewayHomeTerminal.includes("input_ticket") &&
+        gatewayHomeTerminal.includes("home_cli_terminal_input_socket") &&
         gatewayHomeTerminal.includes("home_cli_terminal_events") &&
         gatewayHomeTerminal.includes("home_cli_terminal_resize") &&
         gatewayHomeTerminal.includes("stream_ticket") &&
         gatewayHomeTests.includes("test_home_cli_terminal_stream_requires_cli_launch_token") &&
         gatewayHomeTests.includes("elastos.home-cli.terminal-resize/v1") &&
         cliSmoke.includes("home-cli terminal exit did not reattach the root shell terminal") &&
-        cliSmoke.includes("home-cli terminal input did not carry its launch token") &&
-        homeCli.includes("sendRuntimeTerminalInput") &&
+        cliSmoke.includes("home-cli terminal input did not use its scoped Runtime WebSocket ticket") &&
+        homeCli.includes("connectRuntimeTerminalInputSocket") &&
         homeCli.includes('eventsUrl.includes("home_token=")'),
       [
         "elastos/crates/elastos-server/src/api/gateway_home_terminal.rs",

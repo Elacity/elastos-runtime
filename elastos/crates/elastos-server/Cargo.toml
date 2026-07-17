@@ -20,7 +20,7 @@ elastos-identity = { path = "../elastos-identity" }
 elastos-crosvm = { path = "../elastos-crosvm" }
 
 # HTTP server
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 

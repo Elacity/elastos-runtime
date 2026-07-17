@@ -9,13 +9,15 @@ const homeParentOrigin = readQueryParam("home_origin");
 const HOST_INTENT_OSC_PREFIX = "\x1b]777;elastos-home-intent=";
 const HOST_INTENT_OSC_SUFFIX = "\x07";
 const PTY_VISIBLE_ROW_GUARD = 2;
+const TERMINAL_INPUT_CHUNK_SIZE = 4096;
+const TERMINAL_INPUT_RECONNECT_MS = 250;
 
 let runtimeTerminal = null;
 let xtermModulePromise = null;
 let xtermInstance = null;
 let xtermInputDisposable = null;
 let xtermResizeObserver = null;
-let xtermSendQueue = Promise.resolve();
+let pendingRuntimeTerminalInput = "";
 let hostIntentControlBuffer = "";
 let pendingHomeReturn = false;
 let signingOut = false;
@@ -49,7 +51,7 @@ async function startRuntimeTerminal() {
   if (runtimeTerminal) {
     return;
   }
-  if (!globalThis.EventSource) {
+  if (!globalThis.EventSource || !globalThis.WebSocket) {
     throw new Error("This browser cannot open Home CLI.");
   }
 
@@ -69,11 +71,11 @@ async function startRuntimeTerminal() {
 
   const stream = session.stream && typeof session.stream === "object" ? session.stream : {};
   const eventsUrl = readText(stream.events_url);
-  const inputUrl = readText(stream.input_url);
+  const inputSocketUrl = readText(stream.input_socket_url);
   const resizeUrl = readText(stream.resize_url);
   const intentUrl = readText(stream.intent_url);
   const closeUrl = readText(stream.close_url);
-  if (!eventsUrl || !inputUrl || !resizeUrl || !intentUrl || !closeUrl) {
+  if (!eventsUrl || !inputSocketUrl || !resizeUrl || !intentUrl || !closeUrl) {
     throw new Error("Home CLI could not start.");
   }
   if (eventsUrl.includes("home_token=")) {
@@ -86,13 +88,15 @@ async function startRuntimeTerminal() {
     closeSent: false,
     closeUrl,
     eventsUrl,
-    inputUrl,
+    inputSocket: null,
+    inputSocketUrl,
     intentUrl,
     resizeUrl,
     sessionId: readText(session.session_id),
     size,
     source,
   };
+  connectRuntimeTerminalInputSocket(runtimeTerminal);
   setRuntimeTerminalMode(true);
 
   source.addEventListener("terminal", (event) => {
@@ -174,7 +178,7 @@ function detachXtermTerminal() {
   xtermResizeObserver = null;
   xtermInstance?.dispose?.();
   xtermInstance = null;
-  xtermSendQueue = Promise.resolve();
+  pendingRuntimeTerminalInput = "";
   if (xtermNode) {
     xtermNode.hidden = true;
     xtermNode.replaceChildren?.();
@@ -399,26 +403,52 @@ function queueRuntimeTerminalInput(data) {
   if (!data) {
     return;
   }
-  xtermSendQueue = xtermSendQueue
-    .then(() => sendRuntimeTerminalInput(data))
-    .catch((error) => {
-      console.error("Home CLI input failed", error);
-      writeXtermStatus("Home CLI could not send that input.");
-    });
+  pendingRuntimeTerminalInput += data;
+  flushRuntimeTerminalInput();
 }
 
-async function sendRuntimeTerminalInput(data) {
-  if (!runtimeTerminal) {
-    throw new Error("Home CLI is not connected.");
+function connectRuntimeTerminalInputSocket(terminal) {
+  if (!terminal || runtimeTerminal !== terminal || !globalThis.WebSocket) {
+    return;
   }
-  await fetchJson(runtimeTerminal.inputUrl, {
-    method: "POST",
-    headers: homeHeaders({ "content-type": "application/json" }),
-    body: JSON.stringify({
-      schema: "elastos.home-cli.terminal-input/v1",
-      data,
-    }),
-  });
+  const socket = new WebSocket(runtimeWebSocketUrl(terminal.inputSocketUrl));
+  terminal.inputSocket = socket;
+  socket.onopen = () => {
+    if (runtimeTerminal === terminal && terminal.inputSocket === socket) {
+      flushRuntimeTerminalInput();
+    }
+  };
+  socket.onerror = (error) => {
+    console.error("Home CLI input stream failed", error);
+  };
+  socket.onclose = () => {
+    if (runtimeTerminal !== terminal || terminal.closeSent || terminal.inputSocket !== socket) {
+      return;
+    }
+    globalThis.setTimeout?.(() => {
+      if (runtimeTerminal === terminal && terminal.inputSocket === socket) {
+        connectRuntimeTerminalInputSocket(terminal);
+      }
+    }, TERMINAL_INPUT_RECONNECT_MS);
+  };
+}
+
+function flushRuntimeTerminalInput() {
+  const socket = runtimeTerminal?.inputSocket;
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  while (pendingRuntimeTerminalInput) {
+    const chunk = pendingRuntimeTerminalInput.slice(0, TERMINAL_INPUT_CHUNK_SIZE);
+    pendingRuntimeTerminalInput = pendingRuntimeTerminalInput.slice(chunk.length);
+    socket.send(chunk);
+  }
+}
+
+function runtimeWebSocketUrl(path) {
+  const url = new URL(path, window.location.href);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  return url.toString();
 }
 
 async function resizeRuntimeTerminal(size) {
@@ -450,6 +480,7 @@ function closeRuntimeTerminal(options = {}) {
 
   runtimeTerminal = null;
   terminal.source?.close?.();
+  terminal.inputSocket?.close?.();
   setRuntimeTerminalMode(false);
 
   if (terminal.closeSent) {
@@ -472,6 +503,7 @@ function cleanupRuntimeTerminal() {
   if (runtimeTerminal?.source) {
     runtimeTerminal.source.close?.();
   }
+  runtimeTerminal?.inputSocket?.close?.();
   runtimeTerminal = null;
   setRuntimeTerminalMode(false);
 }

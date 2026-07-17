@@ -164,12 +164,15 @@ fn signing_payload_hex(sender_id: &str, ts: u64, content: &str) -> String {
 
 /// Sign a message via the DID provider. Returns the hex signature or None on failure.
 fn sign_message(did_token: &str, sender_id: &str, ts: u64, content: &str) -> Option<String> {
-    let payload_hex = signing_payload_hex(sender_id, ts, content);
     match api::carrier_invoke(
         did_token,
         "elastos://did/*",
-        "sign",
-        &serde_json::json!({"data": payload_hex}),
+        "sign_chat_message",
+        &serde_json::json!({
+            "sender_id": sender_id,
+            "ts": ts,
+            "content": content,
+        }),
     ) {
         Ok(resp) => resp
             .get("data")
@@ -402,7 +405,7 @@ fn main() -> Result<()> {
 
     let did_token = api::acquire_capability("elastos://did/*", "execute")?;
 
-    let peer_token = api::acquire_capability("elastos://peer/*", "execute")?;
+    let peer_token = api::acquire_capability("elastos://peer/*", "message")?;
 
     let ai_resource = if args.respond_all {
         "elastos://ai/*".to_string()

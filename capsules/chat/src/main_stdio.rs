@@ -2,7 +2,7 @@
 //!
 //! Same app core, commands, and wire format as the TUI variant.
 //! Uses inherited stdin/stdout with ANSI rendering instead of ratatui/crossterm.
-//! Single-threaded for WASI compatibility.
+//! Single-threaded so it works in constrained stdio adapters.
 
 mod ansi_ui;
 #[path = "carrier.rs"]
@@ -548,16 +548,7 @@ fn send_message(app: &mut App, args: &Args, text: &str) {
         return;
     }
     if !app.peer_token.is_empty() {
-        let result = session::send_gossip(
-            &app.peer_token,
-            &channel,
-            &app.nickname,
-            &app.pubkey,
-            Some(&app.session_id),
-            ts,
-            text,
-            signature.as_deref(),
-        );
+        let result = session::send_gossip(&app.peer_token, &channel, &msg, None);
         if let Err(e) = result {
             app.set_status(&format!("Send failed: {}", e));
         }
@@ -577,53 +568,51 @@ fn poll_messages(app: &mut App, args: &Args) {
 
     let mut nicks_changed = false;
     for topic in &channels {
-        match session::recv_messages(&app.peer_token, topic, 50, "chat-wasm", None) {
-            Ok(mut msgs) => {
-                for msg in &mut msgs {
-                    if msg.verified.is_none() {
-                        msg.verified = Some(verify_message(app, msg));
-                    }
-                }
-                for msg in msgs {
-                    if is_own_message_instance(app, &msg) {
-                        continue;
-                    }
-
-                    // Verification gate: skip unverified messages from unknown senders
-                    let is_known = app.known_nicks.contains_key(&msg.sender_nick);
-                    if msg.verified == Some(false) && !is_known {
-                        continue;
-                    }
-
-                    let mut msg = msg;
-                    msg.display_ts = Some(local_now_secs());
-
-                    // Only attach peers for verified messages
-                    if !msg.sender_id.is_empty() && msg.verified != Some(false) {
-                        let key =
-                            room_peer_key(topic, &msg.sender_id, msg.sender_session_id.as_deref());
-                        app.attached_room_peers.insert(key.clone());
-                        app.attach_retry_after.remove(&key);
-                    }
-
-                    // Only record nick->DID for verified senders
-                    if !msg.sender_nick.is_empty()
-                        && msg.sender_nick != "*"
-                        && !msg.sender_id.is_empty()
-                        && msg.verified != Some(false)
-                        && !app.known_nicks.contains_key(&msg.sender_nick)
-                    {
-                        app.known_nicks
-                            .insert(msg.sender_nick.clone(), msg.sender_id.clone());
-                        nicks_changed = true;
-                    }
-                    if !args.no_history && ensure_storage_capability(app) {
-                        let _ = api::append_message(&app.storage_token, topic, &msg);
-                    }
-                    app.append_messages(topic, vec![msg]);
+        if let Ok(mut msgs) = session::recv_messages(&app.peer_token, topic, 50, "chat-stdio", None)
+        {
+            for msg in &mut msgs {
+                if msg.verified.is_none() {
+                    msg.verified = Some(verify_message(app, msg));
                 }
             }
-            Err(_) => {}
+            for msg in msgs {
+                if is_own_message_instance(app, &msg) {
+                    continue;
+                }
+
+                // Verification gate: skip unverified messages from unknown senders
+                let is_known = app.known_nicks.contains_key(&msg.sender_nick);
+                if msg.verified == Some(false) && !is_known {
+                    continue;
+                }
+
+                let mut msg = msg;
+                msg.display_ts = Some(local_now_secs());
+
+                // Only attach peers for verified messages
+                if !msg.sender_id.is_empty() && msg.verified != Some(false) {
+                    let key =
+                        room_peer_key(topic, &msg.sender_id, msg.sender_session_id.as_deref());
+                    app.attached_room_peers.insert(key.clone());
+                    app.attach_retry_after.remove(&key);
+                }
+
+                // Only record nick->DID for verified senders
+                if !msg.sender_nick.is_empty()
+                    && msg.sender_nick != "*"
+                    && !msg.sender_id.is_empty()
+                    && msg.verified != Some(false)
+                    && !app.known_nicks.contains_key(&msg.sender_nick)
+                {
+                    app.known_nicks
+                        .insert(msg.sender_nick.clone(), msg.sender_id.clone());
+                    nicks_changed = true;
+                }
+                if !args.no_history && ensure_storage_capability(app) {
+                    let _ = api::append_message(&app.storage_token, topic, &msg);
+                }
+                app.append_messages(topic, vec![msg]);
+            }
         }
     }
 
@@ -681,7 +670,7 @@ fn is_own_message_instance(app: &App, msg: &Message) -> bool {
 }
 
 fn presence_consumer_id(room: &str) -> String {
-    format!("chat-wasm-presence:{}", room)
+    format!("chat-stdio-presence:{}", room)
 }
 
 fn ensure_room_discovery_subscription(app: &mut App, room: &str) {
@@ -829,16 +818,7 @@ fn broadcast_history(app: &App) {
             .cloned()
             .collect();
         for msg in recent {
-            let _ = session::send_gossip(
-                &app.peer_token,
-                &channel.name,
-                &msg.sender_nick,
-                &msg.sender_id,
-                msg.sender_session_id.as_deref(),
-                msg.ts,
-                &msg.content,
-                msg.signature.as_deref(),
-            );
+            let _ = session::send_gossip(&app.peer_token, &channel.name, &msg, None);
         }
     }
 }

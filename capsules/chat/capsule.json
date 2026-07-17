@@ -35,6 +35,10 @@
     }
   ],
   "requires": [],
+  "capabilities": [
+    "elastos://did/*",
+    "elastos://peer/*"
+  ],
   "resources": {
     "memory_mb": 256,
     "gpu": false

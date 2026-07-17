@@ -21,7 +21,6 @@ const HOME_CLI_CAPSULE_ID: &str = "home-cli";
 const HOME_TERMINAL_CONTRACT_SCHEMA: &str = "elastos.home-cli.terminal-contract/v1";
 const HOME_TERMINAL_START_SCHEMA: &str = "elastos.home-cli.terminal-start/v1";
 const HOME_TERMINAL_SESSION_SCHEMA: &str = "elastos.home-cli.terminal-session/v1";
-const HOME_TERMINAL_INPUT_SCHEMA: &str = "elastos.home-cli.terminal-input/v1";
 const HOME_TERMINAL_RESIZE_SCHEMA: &str = "elastos.home-cli.terminal-resize/v1";
 const HOME_TERMINAL_CLOSE_SCHEMA: &str = "elastos.home-cli.terminal-close/v1";
 const HOME_TERMINAL_EVENT_SCHEMA: &str = "elastos.home-cli.terminal-event/v1";
@@ -49,15 +48,8 @@ static HOME_TERMINAL_SESSIONS: OnceLock<Mutex<HashMap<String, Arc<HomeTerminalSe
     OnceLock::new();
 
 #[derive(Debug, Deserialize)]
-pub(super) struct HomeTerminalEventsQuery {
+pub(super) struct HomeTerminalStreamQuery {
     ticket: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct HomeTerminalInputRequest {
-    schema: Option<String>,
-    data: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,6 +122,7 @@ struct HomeTerminalCommand {
 struct HomeTerminalSession {
     session_id: String,
     stream_ticket: String,
+    input_ticket: String,
     principal_id: String,
     auth_session_id: String,
     grant_id: String,
@@ -139,6 +132,7 @@ struct HomeTerminalSession {
     child: Mutex<Child>,
     events: broadcast::Sender<HomeTerminalEvent>,
     event_stream_generation: AtomicU64,
+    input_stream_generation: AtomicU64,
     pty_reader_drained: AtomicBool,
     pty_reader_drained_notify: Notify,
 }
@@ -228,7 +222,7 @@ pub(super) async fn home_cli_terminal_contract() -> Response {
         transport: "runtime_pty_stream".to_string(),
         transport_scope: "local_runtime_adapter".to_string(),
         pty: "Runtime-owned PTY; xterm sends input bytes and renders PTY output without direct host process authority".to_string(),
-        protocol: "SSE PTY output + HTTP input/resize".to_string(),
+        protocol: "SSE PTY output + WebSocket input + HTTP resize".to_string(),
         start: HomeTerminalEndpoint {
             method: "POST",
             route: "/api/apps/home-cli/terminal/sessions",
@@ -240,9 +234,9 @@ pub(super) async fn home_cli_terminal_contract() -> Response {
             auth: "session stream ticket",
         },
         input: HomeTerminalEndpoint {
-            method: "POST",
-            route: "/api/apps/home-cli/terminal/sessions/:session_id/input",
-            auth: "same home-cli launch token context that created the session",
+            method: "GET",
+            route: "/api/apps/home-cli/terminal/sessions/:session_id/input?ticket=...",
+            auth: "session input ticket",
         },
         resize: HomeTerminalEndpoint {
             method: "POST",
@@ -298,11 +292,10 @@ pub(super) async fn home_cli_terminal_start(
             "stream": {
                 "schema": "elastos.runtime.stream/v1",
                 "events_url": format!("/api/apps/home-cli/terminal/sessions/{}/events?ticket={}", session.session_id, session.stream_ticket),
-                "input_url": format!("/api/apps/home-cli/terminal/sessions/{}/input", session.session_id),
+                "input_socket_url": format!("/api/apps/home-cli/terminal/sessions/{}/input?ticket={}", session.session_id, session.input_ticket),
                 "resize_url": format!("/api/apps/home-cli/terminal/sessions/{}/resize", session.session_id),
                 "intent_url": format!("/api/apps/home-cli/terminal/sessions/{}/intent", session.session_id),
                 "close_url": format!("/api/apps/home-cli/terminal/sessions/{}/close", session.session_id),
-                "input_schema": HOME_TERMINAL_INPUT_SCHEMA,
                 "resize_schema": HOME_TERMINAL_RESIZE_SCHEMA,
                 "intent_schema": HOME_TERMINAL_INTENT_SCHEMA,
                 "event_schema": HOME_TERMINAL_EVENT_SCHEMA
@@ -325,7 +318,7 @@ pub(super) async fn home_cli_terminal_start(
 
 pub(super) async fn home_cli_terminal_events(
     Path(session_id): Path<String>,
-    Query(query): Query<HomeTerminalEventsQuery>,
+    Query(query): Query<HomeTerminalStreamQuery>,
 ) -> Response {
     cleanup_stale_home_terminal_sessions(now_unix_ms()).await;
     let session = match home_terminal_session(&session_id).await {
@@ -387,46 +380,59 @@ pub(super) async fn home_cli_terminal_events(
     response
 }
 
-pub(super) async fn home_cli_terminal_input(
-    State(state): State<GatewayState>,
+pub(super) async fn home_cli_terminal_input_socket(
     Path(session_id): Path<String>,
-    headers: HeaderMap,
-    Json(input): Json<HomeTerminalInputRequest>,
+    Query(query): Query<HomeTerminalStreamQuery>,
+    socket: WebSocketUpgrade,
 ) -> Response {
-    if let Some(schema) = input.schema.as_deref() {
-        if schema != HOME_TERMINAL_INPUT_SCHEMA {
-            return (StatusCode::BAD_REQUEST, "unsupported terminal input schema").into_response();
+    cleanup_stale_home_terminal_sessions(now_unix_ms()).await;
+    let session = match home_terminal_session(&session_id).await {
+        Some(session) => session,
+        None => return (StatusCode::NOT_FOUND, "terminal session not found").into_response(),
+    };
+    if !home_terminal_input_ticket_matches(query.ticket.as_deref(), &session.input_ticket) {
+        return (StatusCode::FORBIDDEN, "invalid terminal input ticket").into_response();
+    }
+    let generation = session
+        .input_stream_generation
+        .fetch_add(1, Ordering::AcqRel)
+        + 1;
+    socket.on_upgrade(move |socket| home_terminal_input_socket(socket, session, generation))
+}
+
+pub(super) fn home_terminal_input_ticket_matches(presented: Option<&str>, expected: &str) -> bool {
+    presented == Some(expected)
+}
+
+async fn home_terminal_input_socket(
+    mut socket: WebSocket,
+    session: Arc<HomeTerminalSession>,
+    generation: u64,
+) {
+    while let Some(Ok(message)) = socket.recv().await {
+        if session.input_stream_generation.load(Ordering::Acquire) != generation {
+            break;
+        }
+        let data = match message {
+            WebSocketMessage::Text(data) => data.into_bytes(),
+            WebSocketMessage::Binary(data) => data,
+            WebSocketMessage::Close(_) => break,
+            WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_) => continue,
+        };
+        if data.is_empty() {
+            continue;
+        }
+        if data.len() > HOME_TERMINAL_INPUT_MAX_BYTES {
+            break;
+        }
+        let mut input = session.input.lock().await;
+        let Some(input) = input.as_mut() else {
+            break;
+        };
+        if input.write_all(&data).await.is_err() {
+            break;
         }
     }
-    if input.data.len() > HOME_TERMINAL_INPUT_MAX_BYTES {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "terminal input is too large").into_response();
-    }
-    cleanup_stale_home_terminal_sessions(now_unix_ms()).await;
-    let context = match require_home_launch_token_for_any_context(
-        &state.data_dir,
-        &headers,
-        &[HOME_CLI_CAPSULE_ID],
-    ) {
-        Ok(context) => context,
-        Err(err) => return home_error_response(err),
-    };
-    let session = match authorized_terminal_session(&session_id, &context).await {
-        Ok(session) => session,
-        Err(response) => return response,
-    };
-    let mut input_handle = session.input.lock().await;
-    let Some(input_handle) = input_handle.as_mut() else {
-        return (StatusCode::GONE, "terminal input is closed").into_response();
-    };
-    if let Err(err) = input_handle.write_all(input.data.as_bytes()).await {
-        return home_error_response(anyhow::anyhow!("terminal input write failed: {err}"));
-    }
-    Json(serde_json::json!({
-        "schema": HOME_TERMINAL_INPUT_SCHEMA,
-        "session_id": session_id,
-        "written_bytes": input.data.len()
-    }))
-    .into_response()
 }
 
 pub(super) async fn home_cli_terminal_resize(
@@ -599,6 +605,7 @@ async fn start_home_terminal_session(
     let session = Arc::new(HomeTerminalSession {
         session_id: format!("term-{}", random_hex_token()),
         stream_ticket: format!("ticket-{}", random_hex_token()),
+        input_ticket: format!("input-{}", random_hex_token()),
         principal_id: context.principal_id,
         auth_session_id: context.session_id,
         grant_id: context.grant_id,
@@ -608,6 +615,7 @@ async fn start_home_terminal_session(
         child: Mutex::new(child),
         events,
         event_stream_generation: AtomicU64::new(0),
+        input_stream_generation: AtomicU64::new(0),
         pty_reader_drained: AtomicBool::new(false),
         pty_reader_drained_notify: Notify::new(),
     });

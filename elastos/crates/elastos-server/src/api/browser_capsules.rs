@@ -185,9 +185,23 @@ fn shell_content_security_policy(headers: &axum::http::HeaderMap, app: &str) -> 
             format!("{home_source} 'unsafe-inline'"),
         )
     };
+    let connect_source = if app == super::gateway::HOME_CLI_SHELL_ID {
+        format!("{default_source} {}", home_websocket_origin(&home_source)?)
+    } else {
+        default_source.clone()
+    };
     Some(format!(
-        "default-src {default_source}; script-src {default_source}; style-src {style_source}; img-src {default_source} blob: data:; connect-src {default_source}; frame-src {default_source}; object-src 'none'; base-uri 'none'; form-action {default_source}; frame-ancestors {frame_ancestors}"
+        "default-src {default_source}; script-src {default_source}; style-src {style_source}; img-src {default_source} blob: data:; connect-src {connect_source}; frame-src {default_source}; object-src 'none'; base-uri 'none'; form-action {default_source}; frame-ancestors {frame_ancestors}"
     ))
+}
+
+fn home_websocket_origin(home_source: &str) -> Option<String> {
+    if let Some(authority) = home_source.strip_prefix("https://") {
+        return Some(format!("wss://{authority}"));
+    }
+    home_source
+        .strip_prefix("http://")
+        .map(|authority| format!("ws://{authority}"))
 }
 
 fn home_document_origin(headers: &axum::http::HeaderMap) -> Option<String> {
@@ -625,7 +639,32 @@ mod tests {
             assert!(csp.contains("frame-ancestors http://localhost:61180"));
             assert!(csp.contains("script-src http://localhost:61180"));
             assert!(!csp.contains("script-src 'self'"));
+            if shell == "home-cli" {
+                assert!(csp.contains("connect-src http://localhost:61180 ws://localhost:61180"));
+            } else {
+                assert!(csp.contains("connect-src http://localhost:61180;"));
+                assert!(!csp.contains("ws://localhost:61180"));
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn home_cli_tls_document_allows_only_its_same_origin_input_socket() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_test_wasm_browser_capsule(data_dir.path(), "home-cli", "Home CLI", "shell");
+        let mut headers = test_request_headers();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+
+        let response =
+            serve_browser_capsule_path(data_dir.path(), &headers, "home-cli", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(csp.contains("connect-src https://localhost:61180 wss://localhost:61180"));
+        assert!(!csp.contains("ws://localhost:61180"));
     }
 
     #[test]

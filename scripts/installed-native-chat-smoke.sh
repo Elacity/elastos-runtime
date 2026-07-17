@@ -120,14 +120,14 @@ launch_chat bob "${BOB_NICK}" "${BOB_MSG}" 18 8
 wait_for_chat alice
 wait_for_chat bob
 
-assert_log_contains "${LOG_PATH[alice]}" "Chat as '${ALICE_NICK}' on #general."
-assert_log_contains "${LOG_PATH[bob]}" "Chat as '${BOB_NICK}' on #general."
-assert_log_contains "${LOG_PATH[alice]}" "[chat] chat room peer attached: '${BOB_NICK}' joined #general via Carrier."
-assert_log_contains "${LOG_PATH[bob]}" "[chat] chat room peer attached: '${ALICE_NICK}' joined #general via Carrier."
+assert_log_contains "${LOG_PATH[alice]}" "Chat #general as ${ALICE_NICK}."
+assert_log_contains "${LOG_PATH[bob]}" "Chat #general as ${BOB_NICK}."
+assert_log_contains "${LOG_PATH[alice]}" "${BOB_NICK} joined."
+assert_log_contains "${LOG_PATH[bob]}" "${ALICE_NICK} joined."
 assert_log_contains "${LOG_PATH[alice]}" "<${ALICE_NICK}> ${ALICE_MSG}"
 assert_log_contains "${LOG_PATH[bob]}" "<${BOB_NICK}> ${BOB_MSG}"
-assert_log_contains "${LOG_PATH[alice]}" "v <${BOB_NICK}> ${BOB_MSG}"
-assert_log_contains "${LOG_PATH[bob]}" "v <${ALICE_NICK}> ${ALICE_MSG}"
+assert_log_contains "${LOG_PATH[alice]}" "<${BOB_NICK}> ${BOB_MSG}"
+assert_log_contains "${LOG_PATH[bob]}" "<${ALICE_NICK}> ${ALICE_MSG}"
 assert_log_not_contains "${LOG_PATH[alice]}" "message stayed local"
 assert_log_not_contains "${LOG_PATH[bob]}" "message stayed local"
 assert_log_not_contains "${LOG_PATH[alice]}" "[chat] dropped unverified"

@@ -3,11 +3,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{io::IsTerminal, io::Read, io::Write};
 
-use elastos_server::sources::{default_data_dir, load_trusted_sources, TrustedSourcesConfig};
+use elastos_server::sources::{
+    default_data_dir, load_trusted_sources, normalize_gateways, TrustedSource, TrustedSourcesConfig,
+};
 use sha2::{Digest, Sha256};
 
 const CHAT_TOPIC: &str = "#general";
 const PRESENCE_ATTACH_RETRY_BACKOFF: Duration = Duration::from_secs(12);
+const SOURCE_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, Default)]
 struct AttachedChatIdentity {
@@ -42,6 +45,14 @@ struct ChatPresenceAnnouncement {
     nick: String,
     ticket: String,
     ts: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SourceCarrierBootstrapDocument {
+    schema: String,
+    role: String,
+    ticket: String,
+    node_id: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -213,15 +224,6 @@ impl ChatBootstrap {
             Self::TrustedSourceSeed(_) => "direct",
         }
     }
-
-    fn status_mode_line(&self) -> &'static str {
-        match self {
-            Self::ExplicitConnect(_) => "Carrier mode: direct peer bootstrap.",
-            Self::TrustedSourceSeed(_) => {
-                "Carrier mode: trusted source reachability bootstrap with automatic Carrier rendezvous."
-            }
-        }
-    }
 }
 
 fn new_chat_session_id() -> String {
@@ -263,7 +265,7 @@ pub async fn run_chat(nick: Option<String>, connect: Option<String>) -> anyhow::
     // background runtime with a chat-safe policy. Requires `elastos setup`
     // to have provisioned the first-party Home core first.
     let data_dir = default_data_dir();
-    let connect = resolve_chat_bootstrap(connect, &data_dir);
+    let connect = resolve_chat_bootstrap(connect, &data_dir).await;
     let _logging_guard = LoggingSuppressionGuard::enter();
 
     let coords = crate::runtime_control::ensure_runtime_for_chat(&data_dir).await?;
@@ -276,7 +278,7 @@ pub(crate) async fn run_chat_from_home(
     coords: crate::runtime_control::RuntimeCoords,
 ) -> anyhow::Result<()> {
     let data_dir = default_data_dir();
-    let connect = resolve_chat_bootstrap(connect, &data_dir);
+    let connect = resolve_chat_bootstrap(connect, &data_dir).await;
     let _logging_guard = LoggingSuppressionGuard::enter();
 
     run_native_chat_with_runtime(nick, connect, coords).await
@@ -287,8 +289,6 @@ async fn run_native_chat_with_runtime(
     connect: Option<ChatBootstrap>,
     coords: crate::runtime_control::RuntimeCoords,
 ) -> anyhow::Result<()> {
-    eprintln!("Connected to local runtime.");
-
     let tokens = crate::runtime_control::attach_to_runtime(&coords).await?;
     let client = reqwest::Client::new();
     let api = &coords.api_url;
@@ -315,7 +315,6 @@ async fn run_native_chat_with_runtime(
     let using_bootstrap_rendezvous = connect.is_some();
     let discovery_topic = elastos_server::carrier::chat_discovery_topic(CHAT_TOPIC);
     let discovery_consumer_id = native_discovery_consumer_id(&discovery_topic, &self_session_id);
-    let mut bootstrap_connected = 0usize;
     let input_mode = resolve_native_chat_input_mode();
     let tty_ui = match input_mode {
         NativeChatInputMode::Line => None,
@@ -333,11 +332,11 @@ async fn run_native_chat_with_runtime(
     };
 
     if let Some(ref bootstrap) = connect {
-        let (op, ticket, status_label) = match bootstrap {
-            ChatBootstrap::ExplicitConnect(ticket) => ("connect", ticket.as_str(), "loaded"),
-            ChatBootstrap::TrustedSourceSeed(ticket) => ("connect", ticket.as_str(), "loaded"),
+        let (op, ticket) = match bootstrap {
+            ChatBootstrap::ExplicitConnect(ticket) => ("connect", ticket.as_str()),
+            ChatBootstrap::TrustedSourceSeed(ticket) => ("connect", ticket.as_str()),
         };
-        match peer_provider_request(
+        peer_provider_request(
             &client,
             api,
             client_token,
@@ -346,32 +345,7 @@ async fn run_native_chat_with_runtime(
             serde_json::json!({"ticket": ticket}),
         )
         .await
-        {
-            Ok(body) => {
-                let added = body
-                    .get("data")
-                    .and_then(|d| d.get("added"))
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                bootstrap_connected = body
-                    .get("data")
-                    .and_then(|d| d.get("connected"))
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                eprintln!(
-                    "Carrier bootstrap: {} {} peer endpoint(s), {} reachable now.",
-                    status_label, added, bootstrap_connected
-                );
-            }
-            Err(err) => {
-                eprintln!("Carrier bootstrap failed: {}", err);
-            }
-        }
-        eprintln!("{}", bootstrap.status_mode_line());
-    } else {
-        eprintln!("Carrier mode: DHT topic discovery.");
+        .map_err(|err| anyhow::anyhow!("Chat could not connect through Carrier: {}", err))?;
     }
 
     match peer_provider_request(
@@ -417,59 +391,10 @@ async fn run_native_chat_with_runtime(
         }
     }
 
-    eprintln!("Chat room: {} joined.", CHAT_TOPIC);
-    match connect.as_ref() {
-        Some(ChatBootstrap::TrustedSourceSeed(_)) => {
-            eprintln!(
-                "Carrier reachability peers: {} connected.",
-                bootstrap_connected
-            );
-            eprintln!("Chat room peers: 0 discovered yet.");
-            eprintln!(
-                "Delivery: local only until another participant is discovered and connected."
-            );
-        }
-        _ => match list_connected_carrier_peers(&client, api, client_token, &peer_cap).await {
-            Ok(peers) if peers.is_empty() => match connect.as_ref() {
-                Some(ChatBootstrap::ExplicitConnect(_)) => {
-                    eprintln!(
-                        "Carrier peers: 0. Direct bootstrap loaded, but no active peers are connected yet."
-                    );
-                    eprintln!("Delivery: local only until the remote peer joins this room.");
-                }
-                Some(ChatBootstrap::TrustedSourceSeed(_)) => unreachable!(),
-                None => {
-                    eprintln!("Carrier peers: 0. Messages will stay local until a peer connects.");
-                    eprintln!("Delivery: local only until a Carrier peer joins this room.");
-                }
-            },
-            Ok(peers) => {
-                eprintln!("Carrier peers: {} connected.", peers.len());
-                match connect.as_ref() {
-                    Some(ChatBootstrap::ExplicitConnect(_)) => {
-                        eprintln!(
-                            "Delivery: send a line to confirm the remote peer has joined this room."
-                        );
-                    }
-                    Some(ChatBootstrap::TrustedSourceSeed(_)) => unreachable!(),
-                    None => {
-                        eprintln!(
-                            "Delivery: send a line to confirm another DHT-discovered participant has joined this room."
-                        );
-                    }
-                }
-            }
-            Err(err) => {
-                eprintln!("Carrier peer status unavailable: {}", err);
-                eprintln!("Delivery: unknown until peer status is available.");
-            }
-        },
-    }
-
     eprintln!(
-        "Chat as '{}' on {}. Type messages and press Enter.\n{}\n",
-        nick,
+        "Chat {} as {}.\nWaiting for someone else to join.\nType a message and press Enter. {}\n",
         CHAT_TOPIC,
+        nick,
         native_chat_exit_hint(std::env::var("ELASTOS_PARENT_SURFACE").ok().as_deref())
     );
 
@@ -487,7 +412,6 @@ async fn run_native_chat_with_runtime(
     let mut main_quit_rx = quit_rx.clone();
     let recv_attached_dids = Arc::clone(&attached_dids);
     tokio::spawn(async move {
-        let mut known_nicks: HashMap<String, String> = HashMap::new();
         loop {
             tokio::select! {
                 changed = main_quit_rx.changed() => {
@@ -539,50 +463,22 @@ async fn run_native_chat_with_runtime(
                             )
                             .await;
 
-                            // Verification gate: skip unverified from unknown senders
-                            let is_known = known_nicks.contains_key(sender_nick);
-                            if !verified && !is_known {
-                                eprintln!(
-                                    "[chat] dropped unverified message from unknown sender '{}' (did={})",
-                                    sender_nick, sender_id
-                                );
+                            if !verified {
                                 continue;
                             }
 
-                            // Only record nick→DID for verified senders
-                            if verified && !sender_nick.is_empty() && !sender_id.is_empty() {
-                                known_nicks
-                                    .entry(sender_nick.to_string())
-                                    .or_insert_with(|| sender_id.to_string());
+                            if let Some(sid) = msg
+                                .get("sender_id")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                            {
+                                recv_attached_dids
+                                    .lock()
+                                    .await
+                                    .insert(attached_identity_key(sid, sender_session_id(msg)));
                             }
 
-                            // Only attach peers for verified messages
-                            if verified {
-                                if let Some(sid) = msg
-                                    .get("sender_id")
-                                    .and_then(|v| v.as_str())
-                                    .filter(|s| !s.is_empty())
-                                {
-                                    recv_attached_dids
-                                        .lock()
-                                        .await
-                                        .insert(attached_identity_key(sid, sender_session_id(msg)));
-                                }
-                            }
-
-                            let badge = if verified {
-                                "v"
-                            } else if !signature.is_empty() {
-                                "x"
-                            } else {
-                                "."
-                            };
-                            let rendered = format!("{} <{}> {}", badge, sender_nick, content);
-                            if let Some(ui) = recv_ui.as_ref() {
-                                ui.print_event(&rendered);
-                            } else {
-                                println!("{}", rendered);
-                            }
+                            render_chat_message(recv_ui.as_ref(), sender_nick, content);
                         }
                     }
                 }
@@ -891,8 +787,11 @@ async fn process_presence_messages(
             continue;
         }
         let presence_key = attached_identity_key(&presence.did, presence.session_id.as_deref());
-        if attached_dids.lock().await.contains(&presence_key) {
-            continue;
+        {
+            let attached = attached_dids.lock().await;
+            if chat_instance_is_attached(&attached, &presence.did, presence.session_id.as_deref()) {
+                continue;
+            }
         }
         let now = Instant::now();
         {
@@ -930,13 +829,6 @@ async fn process_presence_messages(
                             Instant::now(),
                         );
                     }
-                    render_chat_event(
-                        tty_ui.as_ref(),
-                        &format!(
-                            "[chat] discovered '{}' and are waiting for a Carrier peer id.",
-                            presence.nick
-                        ),
-                    );
                     continue;
                 }
                 let room_attached = attach_topic_direct_until_joined(
@@ -959,64 +851,45 @@ async fn process_presence_messages(
                 .await;
                 match room_attached {
                     Ok(true) => {
-                        attached_dids.lock().await.insert(presence_key.clone());
+                        let first_presence = {
+                            let mut attached = attached_dids.lock().await;
+                            let first = !attached
+                                .iter()
+                                .any(|key| attached_identity_matches_did(key, &presence.did));
+                            attached
+                                .retain(|key| !attached_identity_matches_did(key, &presence.did));
+                            attached.insert(presence_key.clone());
+                            first
+                        };
                         attach_retry_after.lock().await.remove(&presence_key);
-                        render_chat_event(
-                            tty_ui.as_ref(),
-                            &format!(
-                                "[chat] chat room peer attached: '{}' joined {} via Carrier.",
-                                presence.nick, CHAT_TOPIC
-                            ),
-                        );
+                        if first_presence {
+                            render_chat_event(
+                                tty_ui.as_ref(),
+                                &format!("{} joined.", presence.nick),
+                            );
+                        }
                     }
                     Ok(false) => {
-                        {
-                            let mut retry_after = attach_retry_after.lock().await;
-                            schedule_presence_attach_retry(
-                                &mut retry_after,
-                                &presence_key,
-                                Instant::now(),
-                            );
-                        }
-                        render_chat_event(
-                            tty_ui.as_ref(),
-                            &format!(
-                                "[chat] discovered '{}' and are waiting for room attach via Carrier.",
-                                presence.nick
-                            ),
+                        let mut retry_after = attach_retry_after.lock().await;
+                        schedule_presence_attach_retry(
+                            &mut retry_after,
+                            &presence_key,
+                            Instant::now(),
                         );
                     }
-                    Err(err) => {
-                        {
-                            let mut retry_after = attach_retry_after.lock().await;
-                            schedule_presence_attach_retry(
-                                &mut retry_after,
-                                &presence_key,
-                                Instant::now(),
-                            );
-                        }
-                        render_chat_event(
-                            tty_ui.as_ref(),
-                            &format!(
-                                "[chat] discovered '{}' but room attach failed: {}",
-                                presence.nick, err
-                            ),
+                    Err(_err) => {
+                        let mut retry_after = attach_retry_after.lock().await;
+                        schedule_presence_attach_retry(
+                            &mut retry_after,
+                            &presence_key,
+                            Instant::now(),
                         );
                     }
                 }
             }
-            Err(err) => {
-                {
-                    let mut retry_after = attach_retry_after.lock().await;
-                    schedule_presence_attach_retry(&mut retry_after, &presence_key, Instant::now());
-                }
-                render_chat_event(
-                    tty_ui.as_ref(),
-                    &format!(
-                        "[chat] discovered '{}' but Carrier peer remember failed: {}",
-                        presence.nick, err
-                    ),
-                );
+            Err(_err) => {
+                let mut retry_after = attach_retry_after.lock().await;
+                schedule_presence_attach_retry(&mut retry_after, &presence_key, Instant::now());
             }
         }
     }
@@ -1091,16 +964,73 @@ async fn attach_topic_direct_until_joined(
     attach_room_peer_until_joined(client, api, client_token, peer_cap, topic, peer_ids).await
 }
 
-fn resolve_chat_bootstrap(
+async fn resolve_chat_bootstrap(
     explicit_connect: Option<String>,
     data_dir: &std::path::Path,
 ) -> Option<ChatBootstrap> {
-    explicit_connect
-        .map(ChatBootstrap::ExplicitConnect)
-        .or_else(|| {
-            let config = load_trusted_sources(data_dir).ok()?;
-            bootstrap_ticket_from_config(&config).map(ChatBootstrap::TrustedSourceSeed)
-        })
+    if let Some(ticket) = explicit_connect {
+        return Some(ChatBootstrap::ExplicitConnect(ticket));
+    }
+
+    let config = load_trusted_sources(data_dir).ok()?;
+    let source = config.default_source()?;
+    live_source_bootstrap_ticket(source)
+        .await
+        .or_else(|| bootstrap_ticket_from_config(&config))
+        .map(ChatBootstrap::TrustedSourceSeed)
+}
+
+async fn live_source_bootstrap_ticket(source: &TrustedSource) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(SOURCE_BOOTSTRAP_TIMEOUT)
+        .build()
+        .ok()?;
+
+    for gateway in normalize_gateways(&source.gateways) {
+        let url = format!("{gateway}/.well-known/elastos/carrier-bootstrap.json?role=publisher");
+        let Ok(response) = client.get(url).send().await else {
+            continue;
+        };
+        if !response.status().is_success() {
+            continue;
+        }
+        let Ok(document) = response.json::<SourceCarrierBootstrapDocument>().await else {
+            continue;
+        };
+        if let Some(ticket) = verified_source_bootstrap_ticket(source, &document) {
+            return Some(ticket);
+        }
+    }
+    None
+}
+
+fn verified_source_bootstrap_ticket(
+    source: &TrustedSource,
+    document: &SourceCarrierBootstrapDocument,
+) -> Option<String> {
+    if document.schema != "elastos.carrier.bootstrap/v1"
+        || document.role != "publisher"
+        || document.ticket.trim().is_empty()
+        || document.node_id.trim().is_empty()
+    {
+        return None;
+    }
+
+    let expected_node_id = source.publisher_node_id.trim();
+    if !expected_node_id.is_empty() && document.node_id != expected_node_id {
+        return None;
+    }
+
+    let endpoints = elastos_server::carrier::decode_ticket_endpoints(&document.ticket);
+    if endpoints.is_empty()
+        || endpoints
+            .iter()
+            .any(|endpoint| endpoint.id.to_string() != document.node_id)
+    {
+        return None;
+    }
+
+    Some(document.ticket.trim().to_string())
 }
 
 fn presence_attach_retry_pending(
@@ -1256,6 +1186,21 @@ fn attached_identity_key(did: &str, session_id: Option<&str>) -> String {
         Some(session_id) => format!("{}|{}", did, session_id),
         None => did.to_string(),
     }
+}
+
+fn chat_instance_is_attached(
+    attached: &HashSet<String>,
+    did: &str,
+    session_id: Option<&str>,
+) -> bool {
+    attached.contains(&attached_identity_key(did, session_id))
+}
+
+fn attached_identity_matches_did(key: &str, did: &str) -> bool {
+    key == did
+        || key
+            .strip_prefix(did)
+            .is_some_and(|suffix| suffix.starts_with('|'))
 }
 
 fn is_same_chat_instance(
@@ -1783,27 +1728,6 @@ fn is_already_joined_error(err: &anyhow::Error) -> bool {
     err.to_string().contains("already joined")
 }
 
-async fn list_connected_carrier_peers(
-    client: &reqwest::Client,
-    api: &str,
-    token: &str,
-    cap: &str,
-) -> anyhow::Result<Vec<String>> {
-    let body =
-        peer_provider_request(client, api, token, cap, "list_peers", serde_json::json!({})).await?;
-    Ok(body
-        .get("data")
-        .and_then(|d| d.get("peers"))
-        .and_then(|v| v.as_array())
-        .map(|peers| {
-            peers
-                .iter()
-                .filter_map(|peer| peer.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default())
-}
-
 async fn list_topic_peers(
     client: &reqwest::Client,
     api: &str,
@@ -1938,6 +1862,82 @@ mod tests {
     use elastos_server::sources::{TrustedSource, TrustedSourcesConfig};
     use std::io::Cursor;
     use std::sync::Mutex;
+
+    fn carrier_ticket(seed: u8) -> (String, String) {
+        let secret = iroh::SecretKey::from_bytes(&[seed; 32]);
+        let endpoint = iroh::EndpointAddr::from(secret.public());
+        let node_id = endpoint.id.to_string();
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "topic": null,
+            "endpoints": [endpoint],
+        }))
+        .unwrap();
+        let mut ticket = data_encoding::BASE32_NOPAD.encode(&bytes);
+        ticket.make_ascii_lowercase();
+        (ticket, node_id)
+    }
+
+    fn trusted_source(ticket: &str, node_id: &str) -> TrustedSource {
+        TrustedSource {
+            name: "default".to_string(),
+            publisher_dids: vec![],
+            channel: "stable".to_string(),
+            discovery_uri: String::new(),
+            connect_ticket: ticket.to_string(),
+            gateways: vec!["https://seed.example".to_string()],
+            install_path: String::new(),
+            installed_version: String::new(),
+            head_cid: String::new(),
+            publisher_node_id: node_id.to_string(),
+            ipns_name: String::new(),
+        }
+    }
+
+    #[test]
+    fn live_source_ticket_must_match_the_pinned_publisher_node() {
+        let (ticket, node_id) = carrier_ticket(31);
+        let source = trusted_source("stale-ticket", &node_id);
+        let document = SourceCarrierBootstrapDocument {
+            schema: "elastos.carrier.bootstrap/v1".to_string(),
+            role: "publisher".to_string(),
+            ticket: ticket.clone(),
+            node_id,
+        };
+
+        assert_eq!(
+            verified_source_bootstrap_ticket(&source, &document),
+            Some(ticket)
+        );
+    }
+
+    #[test]
+    fn live_source_ticket_rejects_a_foreign_endpoint() {
+        let (ticket, node_id) = carrier_ticket(32);
+        let (_, pinned_node_id) = carrier_ticket(33);
+        let source = trusted_source("stale-ticket", &pinned_node_id);
+        let document = SourceCarrierBootstrapDocument {
+            schema: "elastos.carrier.bootstrap/v1".to_string(),
+            role: "publisher".to_string(),
+            ticket,
+            node_id,
+        };
+
+        assert_eq!(verified_source_bootstrap_ticket(&source, &document), None);
+    }
+
+    #[test]
+    fn live_source_ticket_rejects_non_publisher_bootstrap_documents() {
+        let (ticket, node_id) = carrier_ticket(34);
+        let source = trusted_source("stale-ticket", &node_id);
+        let document = SourceCarrierBootstrapDocument {
+            schema: "elastos.carrier.bootstrap/v1".to_string(),
+            role: "runtime".to_string(),
+            ticket,
+            node_id,
+        };
+
+        assert_eq!(verified_source_bootstrap_ticket(&source, &document), None);
+    }
 
     #[test]
     fn bootstrap_ticket_prefers_default_source_ticket() {
@@ -2274,6 +2274,42 @@ mod tests {
             native_chat_exit_hint(None),
             "Type /home to return Home, or /quit to exit to the terminal."
         );
+    }
+
+    #[test]
+    fn attached_identity_matches_all_sessions_for_one_did() {
+        assert!(attached_identity_matches_did(
+            "did:key:alice",
+            "did:key:alice"
+        ));
+        assert!(attached_identity_matches_did(
+            "did:key:alice|session-one",
+            "did:key:alice"
+        ));
+        assert!(!attached_identity_matches_did(
+            "did:key:alice-other|session-one",
+            "did:key:alice"
+        ));
+        assert!(!attached_identity_matches_did(
+            "did:key:bob|session-one",
+            "did:key:alice"
+        ));
+    }
+
+    #[test]
+    fn restarted_chat_session_requires_a_new_carrier_attach() {
+        let attached = HashSet::from(["did:key:alice|old-session".to_string()]);
+
+        assert!(chat_instance_is_attached(
+            &attached,
+            "did:key:alice",
+            Some("old-session")
+        ));
+        assert!(!chat_instance_is_attached(
+            &attached,
+            "did:key:alice",
+            Some("new-session")
+        ));
     }
 
     #[test]

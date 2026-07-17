@@ -163,7 +163,7 @@ def send(data: bytes, pause: float = 0.2) -> None:
 
 try:
     initial = read_for(8.0)
-    if f"Chat as '{profile_nick}' on #general." not in initial:
+    if f"Chat #general as {profile_nick}." not in initial:
         raise SystemExit(
             "[identity-profile-smoke] chat did not default to DID nickname:\n" + initial
         )

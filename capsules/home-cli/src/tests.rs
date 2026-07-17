@@ -1603,97 +1603,9 @@ fn quit_action_switches_browser_pty_back_to_home_gui_only() {
 }
 
 #[test]
-fn ignores_startup_enter_on_default_home_selection() {
+fn default_home_selection_activates_chat_on_first_enter() {
     let state = TuiState::default();
-    let now = Instant::now();
-    assert!(matches!(
-        startup_home_enter_decision(&state, UiKey::Enter, false, None, now),
-        HomeLaunchDecision::Defer(_)
-    ));
-}
-
-#[test]
-fn ignores_duplicate_startup_enter_inside_settle_window() {
-    let state = TuiState::default();
-    let now = Instant::now();
-    assert_eq!(
-        startup_home_enter_decision(
-            &state,
-            UiKey::Enter,
-            true,
-            Some(now + STARTUP_ENTER_SETTLE_WINDOW),
-            now
-        ),
-        HomeLaunchDecision::IgnoreDuplicate
-    );
-}
-
-#[test]
-fn allows_enter_after_settle_window() {
-    let state = TuiState::default();
-    let now = Instant::now();
-    assert_eq!(
-        startup_home_enter_decision(
-            &state,
-            UiKey::Enter,
-            true,
-            Some(now),
-            now + STARTUP_ENTER_SETTLE_WINDOW
-        ),
-        HomeLaunchDecision::Allow
-    );
-}
-
-#[test]
-fn does_not_defer_enter_after_default_home_launch_is_armed_and_ready() {
-    let state = TuiState::default();
-    let now = Instant::now();
-    assert_eq!(
-        startup_home_enter_decision(
-            &state,
-            UiKey::Enter,
-            true,
-            Some(now),
-            now + STARTUP_ENTER_SETTLE_WINDOW
-        ),
-        HomeLaunchDecision::Allow
-    );
-}
-
-#[test]
-fn does_not_defer_non_enter_keys() {
-    let state = TuiState::default();
-    let now = Instant::now();
-    assert_eq!(
-        startup_home_enter_decision(&state, UiKey::Digit(1), false, None, now),
-        HomeLaunchDecision::NotApplicable
-    );
-}
-
-#[test]
-fn does_not_defer_enter_off_default_home_selection() {
-    let state = TuiState {
-        home_index: 1,
-        ..TuiState::default()
-    };
-    let now = Instant::now();
-    assert_eq!(
-        startup_home_enter_decision(&state, UiKey::Enter, false, None, now),
-        HomeLaunchDecision::NotApplicable
-    );
-}
-
-#[test]
-fn does_not_defer_enter_when_help_is_open() {
-    let state = TuiState {
-        show_help: true,
-        ..TuiState::default()
-    };
-    let now = Instant::now();
-    assert_eq!(
-        startup_home_enter_decision(&state, UiKey::Enter, false, None, now),
-        HomeLaunchDecision::NotApplicable
-    );
+    assert_eq!(state.activate(&sample_snapshot()), Some("chat".to_string()));
 }
 
 #[test]

@@ -2923,7 +2923,7 @@ async function checkShellSwitchJourney(page, homeToken) {
       const terminalText = document.querySelector("#xterm-terminal")?.textContent || "";
       return {
         terminal_has_chat_prompt: terminalText.includes("Type /home to return Home"),
-        terminal_has_chat_identity: terminalText.includes("Chat as "),
+        terminal_has_chat_identity: terminalText.includes("Chat #general as "),
       };
     });
     const chatNative = { host: chatHost, terminal: chatTerminal };

@@ -239,8 +239,6 @@ fn dashboard_tui_loop(
 ) -> Result<()> {
     let mut state = TuiState::default();
     let _guard = TerminalGuard::enter()?;
-    let mut home_launch_armed = false;
-    let mut home_launch_ready_at: Option<Instant> = None;
     let mut snapshot_fingerprint = snapshot_render_fingerprint(&snapshot);
     let mut needs_render = true;
 
@@ -263,36 +261,6 @@ fn dashboard_tui_loop(
             }
             continue;
         }
-        match startup_home_enter_decision(
-            &state,
-            key,
-            home_launch_armed,
-            home_launch_ready_at,
-            Instant::now(),
-        ) {
-            HomeLaunchDecision::Defer(ready_at) => {
-                state.notice = Some(
-                    "Press Enter again to launch Chat, or use arrows / Tab to pick something else."
-                        .to_string(),
-                );
-                home_launch_armed = true;
-                home_launch_ready_at = Some(ready_at);
-                needs_render = true;
-                continue;
-            }
-            HomeLaunchDecision::IgnoreDuplicate => {
-                continue;
-            }
-            HomeLaunchDecision::Allow | HomeLaunchDecision::NotApplicable => {}
-        }
-        if !matches!(key, UiKey::None | UiKey::Enter) {
-            home_launch_armed = true;
-            home_launch_ready_at = None;
-            if state.notice.take().is_some() {
-                needs_render = true;
-            }
-        }
-
         match key {
             UiKey::Quit => {
                 write_intent(write_token, intent_path, quit_action(&snapshot))?;
@@ -329,7 +297,6 @@ fn dashboard_tui_loop(
             }
             UiKey::Enter => {
                 state.notice = None;
-                home_launch_ready_at = None;
                 if let Some(action_id) = state.activate(&snapshot) {
                     write_intent(write_token, intent_path, &action_id)?;
                     return Ok(());
@@ -375,40 +342,6 @@ fn dashboard_tui_loop(
             UiKey::None => {}
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HomeLaunchDecision {
-    NotApplicable,
-    Defer(Instant),
-    IgnoreDuplicate,
-    Allow,
-}
-
-fn startup_home_enter_decision(
-    state: &TuiState,
-    key: UiKey,
-    home_launch_armed: bool,
-    home_launch_ready_at: Option<Instant>,
-    now: Instant,
-) -> HomeLaunchDecision {
-    if !matches!(key, UiKey::Enter)
-        || state.tab != Tab::Home
-        || state.home_index != 0
-        || state.show_help
-    {
-        return HomeLaunchDecision::NotApplicable;
-    }
-
-    if !home_launch_armed {
-        return HomeLaunchDecision::Defer(now + STARTUP_ENTER_SETTLE_WINDOW);
-    }
-
-    if home_launch_ready_at.is_some_and(|ready_at| now < ready_at) {
-        return HomeLaunchDecision::IgnoreDuplicate;
-    }
-
-    HomeLaunchDecision::Allow
 }
 
 fn dashboard_line_loop(

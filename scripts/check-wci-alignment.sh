@@ -271,6 +271,7 @@ check_required 'id="xterm-terminal"' capsules/home-cli/browser/index.html 'Home 
 check_required '/api/apps/home-cli/terminal/sessions' capsules/home-cli/browser/home-cli.js 'Home CLI browser shell must attach a Runtime-owned terminal session'
 check_required 'elastos\.home-cli\.terminal-start/v1' capsules/home-cli/browser/home-cli.js 'Home CLI browser shell must use the typed terminal start schema'
 check_required 'EventSource' capsules/home-cli/browser/home-cli.js 'Home CLI browser shell must receive terminal events from Runtime'
+check_required 'input_socket_url|new WebSocket' capsules/home-cli/browser/home-cli.js 'Home CLI browser shell must send ordered terminal input through its Runtime-scoped WebSocket'
 check_required 'queueRuntimeTerminalInput' capsules/home-cli/browser/home-cli.js 'Home CLI browser shell must send raw terminal input through Runtime'
 check_required 'resizeRuntimeTerminal' capsules/home-cli/browser/home-cli.js 'Home CLI browser shell must report terminal resize through Runtime'
 check_required 'elastos\.home\.terminal-host-intent/v1' capsules/home-cli/browser/home-cli.js 'Home CLI browser shell must forward Home CLI TUI host intents without direct app launch'

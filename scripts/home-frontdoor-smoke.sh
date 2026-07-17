@@ -444,23 +444,14 @@ def run_chat_case(label: str, payload: bytes) -> None:
     try:
         read_until(label, master, lambda text: "ElastOS Home" in text, 10.0)
         send(master, b"\r\n")
-        after_enter1 = read_until(
+        chat = read_until(
             label,
             master,
-            lambda text: "Press Enter again to launch Chat" in text,
-            6.0,
-        )
-        time.sleep(0.8)
-        send(master, b"\r")
-        after_enter2 = read_until(
-            label,
-            master,
-            lambda text: "Connected to local runtime." in text and "Chat as" in text,
+            lambda text: "Chat #general as " in text,
             20.0,
         )
-        combined_chat = after_enter1 + after_enter2
-        if "Chat room: #general joined." not in combined_chat or "Delivery:" not in combined_chat:
-            raise SystemExit(f"{label}: second enter did not launch chat cleanly:\n{combined_chat}")
+        if "Press Enter again" in chat:
+            raise SystemExit(f"{label}: Chat still requires a second launch confirmation:\n{chat}")
         send(master, payload, 0.5)
         after_exit = read_until(
             label,

@@ -940,8 +940,8 @@ async fn ensure_managed_runtime(
                 terminate_managed_chat_runtime(&coords, &coords_path).await;
             } else {
                 let expected = env!("ELASTOS_VERSION");
-                // Dev-build restart disabled: multiple surfaces (native chat +
-                // WASM chat) share the same managed runtime. Restarting would
+                // Dev-build restart disabled: multiple chat surfaces share the
+                // same managed runtime. Restarting would
                 // kill all existing sessions. Always reuse the running runtime.
                 {
                     match runtime_version_from_health(&coords.api_url).await {

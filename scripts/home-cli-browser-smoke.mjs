@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 const requests = [];
 const parentMessages = [];
 const eventSources = [];
+const webSockets = [];
 const resizeObservers = [];
 let terminalStartCount = 0;
 
@@ -69,6 +70,40 @@ class FakeEventSource {
 
   emitError() {
     this.onerror?.({ type: "error" });
+  }
+}
+
+class FakeWebSocket {
+  static CONNECTING = 0;
+  static OPEN = 1;
+  static CLOSING = 2;
+  static CLOSED = 3;
+
+  constructor(url) {
+    this.url = String(url || "");
+    this.readyState = FakeWebSocket.CONNECTING;
+    this.sent = [];
+    webSockets.push(this);
+    queueMicrotask(() => {
+      if (this.readyState !== FakeWebSocket.CONNECTING) {
+        return;
+      }
+      this.readyState = FakeWebSocket.OPEN;
+      this.onopen?.({ type: "open" });
+    });
+  }
+
+  send(data) {
+    assert(this.readyState === FakeWebSocket.OPEN, "terminal input used a closed WebSocket", this);
+    this.sent.push(String(data || ""));
+  }
+
+  close() {
+    if (this.readyState === FakeWebSocket.CLOSED) {
+      return;
+    }
+    this.readyState = FakeWebSocket.CLOSED;
+    this.onclose?.({ type: "close" });
   }
 }
 
@@ -211,6 +246,7 @@ globalThis.window = {
   },
 };
 globalThis.EventSource = FakeEventSource;
+globalThis.WebSocket = FakeWebSocket;
 globalThis.ResizeObserver = FakeResizeObserver;
 globalThis.__ELASTOS_TEST_XTERM__ = FakeXtermTerminal;
 
@@ -239,11 +275,10 @@ globalThis.fetch = async (url, init = {}) => {
       stream: {
         schema: "elastos.runtime.stream/v1",
         events_url: "/api/apps/home-cli/terminal/sessions/term-smoke/events?ticket=ticket-smoke",
-        input_url: "/api/apps/home-cli/terminal/sessions/term-smoke/input",
+        input_socket_url: "/api/apps/home-cli/terminal/sessions/term-smoke/input?ticket=input-ticket-smoke",
         resize_url: "/api/apps/home-cli/terminal/sessions/term-smoke/resize",
         intent_url: "/api/apps/home-cli/terminal/sessions/term-smoke/intent",
         close_url: "/api/apps/home-cli/terminal/sessions/term-smoke/close",
-        input_schema: "elastos.home-cli.terminal-input/v1",
         resize_schema: "elastos.home-cli.terminal-resize/v1",
         event_schema: "elastos.home-cli.terminal-event/v1",
         intent_schema: "elastos.home-cli.terminal-intent/v1",
@@ -282,16 +317,6 @@ globalThis.fetch = async (url, init = {}) => {
       schema: "elastos.home.active-shell/v1",
       active: "home-gui",
       candidates: [],
-    });
-  }
-  if (url === "/api/apps/home-cli/terminal/sessions/term-smoke/input") {
-    assert(init.method === "POST", "home-cli terminal input was not POSTed", init);
-    assert(init.headers?.["x-elastos-home-token"] === "cli-token", "home-cli terminal input missed launch token", init);
-    assert(body?.schema === "elastos.home-cli.terminal-input/v1", "home-cli terminal input used wrong schema", body);
-    return jsonResponse({
-      schema: "elastos.home-cli.terminal-input/v1",
-      session_id: "term-smoke",
-      written_bytes: String(body?.data || "").length,
     });
   }
   if (url === "/api/apps/home-cli/terminal/sessions/term-smoke/resize") {
@@ -343,6 +368,8 @@ await waitFor(
   () => requests,
 );
 assert(eventSources.length === 1, "home-cli did not autostart the Runtime terminal event stream", eventSources);
+await waitFor(() => webSockets.length === 1 && webSockets[0].readyState === FakeWebSocket.OPEN,
+  "home-cli did not open its Runtime terminal input socket", () => webSockets);
 assert(xtermInstances.length === 1, "home-cli did not autostart an xterm terminal", xtermInstances);
 assert(xtermInstances[0].focused === true, "home-cli did not focus the attached xterm terminal", xtermInstances[0]);
 assert(xtermInstances[0].options.convertEol === false, "home-cli must render raw PTY bytes without xterm EOL rewriting", xtermInstances[0].options);
@@ -355,12 +382,19 @@ assert(
 );
 
 const activeEventSource = eventSources[0];
+const activeInputSocket = webSockets[0];
 const activeXterm = xtermInstances[0];
 assert(
   activeEventSource.url === "/api/apps/home-cli/terminal/sessions/term-smoke/events?ticket=ticket-smoke" &&
     !activeEventSource.url.includes("home_token="),
   "home-cli terminal event stream did not use a scoped stream ticket",
   activeEventSource,
+);
+assert(
+  activeInputSocket.url === "ws://localhost:61180/api/apps/home-cli/terminal/sessions/term-smoke/input?ticket=input-ticket-smoke" &&
+    !activeInputSocket.url.includes("home_token="),
+  "home-cli terminal input did not use its scoped Runtime WebSocket ticket",
+  activeInputSocket,
 );
 
 activeEventSource.emitError();
@@ -417,9 +451,9 @@ activeEventSource.emit("terminal", {
   exit_code: 0,
 });
 await waitFor(
-  () => eventSources.length === 2 && xtermInstances.length === 2,
+  () => eventSources.length === 2 && webSockets.length === 2 && xtermInstances.length === 2,
   "home-cli terminal exit did not reattach the root shell terminal",
-  () => ({ eventSources, xtermInstances, output: output.textContent, parentMessages }),
+  () => ({ eventSources, webSockets, xtermInstances, output: output.textContent, parentMessages }),
 );
 assert(
   !parentMessages.some(({ message }) => message?.type === "home:close-self"),
@@ -427,6 +461,7 @@ assert(
   parentMessages,
 );
 assert(activeEventSource.closed === true, "home-cli did not close the terminal event stream after exit", activeEventSource);
+assert(activeInputSocket.readyState === FakeWebSocket.CLOSED, "home-cli did not close terminal input after exit", activeInputSocket);
 assert(activeXterm.disposed === true, "home-cli did not dispose xterm after terminal exit", activeXterm);
 assert(
   body.dataset.runtimeTerminal === "attached" &&
@@ -436,21 +471,13 @@ assert(
 );
 
 const restartedEventSource = eventSources[1];
+const restartedInputSocket = webSockets[1];
 const restartedXterm = xtermInstances[1];
 restartedXterm.emitData("q");
-const terminalInputRequest = await waitFor(
-  () => requests.find((request) => (
-    request.url === "/api/apps/home-cli/terminal/sessions/term-smoke/input" &&
-      request.body?.data === "q"
-  )),
-  "home-cli did not send xterm input to the Runtime terminal",
-  () => requests,
-);
-assert(
-  terminalInputRequest.headers["x-elastos-home-token"] === "cli-token",
-  "home-cli terminal input did not carry its launch token",
-  terminalInputRequest,
-);
+await waitFor(() => restartedInputSocket.sent.includes("q"),
+  "home-cli did not send xterm input through the Runtime WebSocket", () => restartedInputSocket);
+assert(!requests.some((request) => request.url.endsWith("/input")),
+  "home-cli still serialized terminal keys through HTTP", requests);
 
 const finalEventSource = restartedEventSource;
 finalEventSource.emit("terminal", {

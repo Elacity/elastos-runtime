@@ -4641,7 +4641,7 @@ fn people_attach_peer_runtime_blocking(
         &coords.api_url,
         &token,
         "elastos://peer/*",
-        "execute",
+        "message",
     )
     .ok_or_else(|| anyhow::anyhow!("failed to acquire Carrier peer capability"))?;
     let response = people_peer_provider_request_blocking(

@@ -286,6 +286,8 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
         .as_str()
         .unwrap()
         .contains("Runtime-owned PTY"));
+    assert_eq!(contract["input"]["method"], "GET");
+    assert!(contract["protocol"].as_str().unwrap().contains("WebSocket"));
 
     let missing = app
         .clone()
@@ -351,18 +353,36 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
         started["stream"]["resize_schema"],
         "elastos.home-cli.terminal-resize/v1"
     );
+    assert_eq!(
+        started["stream"]["intent_schema"],
+        "elastos.home-cli.terminal-intent/v1"
+    );
     assert!(started["stream"]["resize_url"]
         .as_str()
         .unwrap()
         .ends_with("/resize"));
     let session_id = started["session_id"].as_str().unwrap();
     let events_url = started["stream"]["events_url"].as_str().unwrap();
-    let input_url = started["stream"]["input_url"].as_str().unwrap();
+    let input_socket_url = started["stream"]["input_socket_url"].as_str().unwrap();
     let resize_url = started["stream"]["resize_url"].as_str().unwrap();
+    let intent_url = started["stream"]["intent_url"].as_str().unwrap();
     let close_url = started["stream"]["close_url"].as_str().unwrap();
     assert!(events_url.contains(session_id));
     assert!(!events_url.contains("home_token="));
     assert!(events_url.contains("ticket="));
+    assert!(input_socket_url.contains(session_id));
+    assert!(input_socket_url.contains("ticket=input-"));
+    assert!(!input_socket_url.contains("home_token="));
+    assert!(intent_url.ends_with("/intent"));
+    let input_ticket = input_socket_url.split("ticket=").nth(1).unwrap();
+    assert!(home_terminal_input_ticket_matches(
+        Some(input_ticket),
+        input_ticket
+    ));
+    assert!(!home_terminal_input_ticket_matches(
+        Some("wrong"),
+        input_ticket
+    ));
 
     let bad_events = app
         .clone()
@@ -378,26 +398,17 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
         .unwrap();
     assert_eq!(bad_events.status(), StatusCode::FORBIDDEN);
 
-    let wrong_input = app
+    let non_websocket_input = app
         .clone()
         .oneshot(
             Request::builder()
-                .method("POST")
-                .uri(input_url)
-                .header("x-elastos-home-token", home_token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "schema": "elastos.home-cli.terminal-input/v1",
-                        "data": "hello\n"
-                    })
-                    .to_string(),
-                ))
+                .uri(input_socket_url)
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(wrong_input.status(), StatusCode::FORBIDDEN);
+    assert_eq!(non_websocket_input.status(), StatusCode::BAD_REQUEST);
 
     let resize = app
         .clone()
@@ -428,18 +439,20 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
     assert_eq!(resize["dimensions"]["cols"], 90);
     assert_eq!(resize["dimensions"]["rows"], 24);
 
-    let input = app
+    let wrong_intent_token = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(input_url)
-                .header("x-elastos-home-token", cli_token.as_str())
+                .uri(intent_url)
+                .header("x-elastos-home-token", home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({
-                        "schema": "elastos.home-cli.terminal-input/v1",
-                        "data": "exit\n"
+                        "schema": "elastos.home.terminal-host-intent/v1",
+                        "action": "open-target",
+                        "action_id": "open-gui:browser",
+                        "target": "browser"
                     })
                     .to_string(),
                 ))
@@ -447,13 +460,91 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
         )
         .await
         .unwrap();
-    assert_eq!(input.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(input.into_body(), usize::MAX)
+    assert_eq!(wrong_intent_token.status(), StatusCode::FORBIDDEN);
+
+    let implicit_intent = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(intent_url)
+                .header("x-elastos-home-token", cli_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "schema": "elastos.home.terminal-host-intent/v1",
+                        "action": "open-target",
+                        "target": "browser"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
         .await
         .unwrap();
-    let input: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(input["schema"], "elastos.home-cli.terminal-input/v1");
-    assert_eq!(input["session_id"], session_id);
+    assert_eq!(implicit_intent.status(), StatusCode::BAD_REQUEST);
+
+    let smuggled_query = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(intent_url)
+                .header("x-elastos-home-token", cli_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "schema": "elastos.home.terminal-host-intent/v1",
+                        "action": "open-target",
+                        "action_id": "open-gui:browser",
+                        "target": "browser",
+                        "query": { "debug": "1" }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(smuggled_query.status(), StatusCode::BAD_REQUEST);
+
+    let authorized_intent = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(intent_url)
+                .header("x-elastos-home-token", cli_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "schema": "elastos.home.terminal-host-intent/v1",
+                        "action": "open-target",
+                        "action_id": "open-gui:browser",
+                        "target": "browser"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorized_intent.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(authorized_intent.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let authorized_intent: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        authorized_intent["schema"],
+        "elastos.home-cli.terminal-intent/v1"
+    );
+    assert_eq!(authorized_intent["session_id"], session_id);
+    assert_eq!(
+        authorized_intent["intent"]["schema"],
+        "elastos.home.terminal-host-intent/v1"
+    );
+    assert_eq!(authorized_intent["intent"]["action_id"], "open-gui:browser");
+    assert!(authorized_intent["intent"]["query"].is_null());
 
     let closed = app
         .oneshot(

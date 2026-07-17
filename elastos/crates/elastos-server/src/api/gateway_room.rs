@@ -306,7 +306,7 @@ async fn managed_runtime_carrier_bootstrap_from_coords(
             &coords.api_url,
             &client_token,
             "elastos://peer/*",
-            "execute",
+            "message",
         )?;
         let body = peer_provider_request_blocking(
             &client,
@@ -1807,7 +1807,7 @@ fn attach_room_runtime_blocking(
         &coords.api_url,
         &client_token,
         "elastos://peer/*",
-        "execute",
+        "message",
     )
     .ok_or_else(|| anyhow::anyhow!("failed to acquire Carrier peer capability"))?;
     let (room_signing_key, did) = room_transport_identity(data_dir)?;

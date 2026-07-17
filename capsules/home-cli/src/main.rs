@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IsTerminal, Write};
-use std::time::{Duration, Instant};
 
 mod terminal;
 mod text;
@@ -31,7 +30,6 @@ thread_local! {
     static CLIENT: RefCell<RuntimeClient> = RefCell::new(RuntimeClient::new());
 }
 
-const STARTUP_ENTER_SETTLE_WINDOW: Duration = Duration::from_millis(350);
 const COMMAND_CONTRACT_JSON: &str = include_str!("../browser/commands.json");
 const TUI_TAB_ROW: u16 = 1;
 const DESCRIPTOR_AUTHORITY_COPY: &str = "descriptors are declared capabilities, not grants";

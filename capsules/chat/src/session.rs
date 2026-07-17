@@ -67,7 +67,7 @@ pub fn resolve_identity(requested_nick: &str, nick_explicit: bool) -> Result<Res
 }
 
 pub fn acquire_peer_token() -> Result<String> {
-    api::acquire_capability("elastos://peer/*", "execute")
+    api::acquire_capability("elastos://peer/*", "message")
 }
 
 pub fn acquire_storage_token() -> Result<String> {
@@ -90,12 +90,15 @@ pub fn sign_message(
     ts: u64,
     content: &str,
 ) -> Result<Option<String>> {
-    let payload_hex = app::signing_payload_hex(sender_id, ts, content);
     let response = api::carrier_invoke(
         identity_token,
         "elastos://did/*",
-        "sign",
-        &serde_json::json!({"data": payload_hex}),
+        "sign_chat_message",
+        &serde_json::json!({
+            "sender_id": sender_id,
+            "ts": ts,
+            "content": content,
+        }),
     )?;
     Ok(response
         .get("data")
@@ -266,28 +269,33 @@ pub fn list_peers(peer_token: &str) -> Result<Vec<String>> {
 pub fn send_gossip(
     peer_token: &str,
     topic: &str,
-    sender_nick: &str,
-    sender_id: &str,
-    sender_session_id: Option<&str>,
-    ts: u64,
-    content: &str,
-    signature: Option<&str>,
+    message: &Message,
+    wire_content: Option<&str>,
 ) -> Result<()> {
+    let content = wire_content.unwrap_or(&message.content);
     let mut body = serde_json::json!({
         "topic": topic,
         "message": content,
-        "sender": sender_nick,
+        "sender": message.sender_nick,
     });
-    if !sender_id.is_empty() {
-        body["sender_id"] = serde_json::Value::String(sender_id.to_string());
+    if !message.sender_id.is_empty() {
+        body["sender_id"] = serde_json::Value::String(message.sender_id.clone());
     }
-    if let Some(sender_session_id) = sender_session_id.filter(|value| !value.is_empty()) {
+    if let Some(sender_session_id) = message
+        .sender_session_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
         body["sender_session_id"] = serde_json::Value::String(sender_session_id.to_string());
     }
-    if ts > 0 {
-        body["ts"] = serde_json::Value::from(ts);
+    if message.ts > 0 {
+        body["ts"] = serde_json::Value::from(message.ts);
     }
-    if let Some(signature) = signature.filter(|value| !value.is_empty()) {
+    if let Some(signature) = message
+        .signature
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
         body["signature"] = serde_json::Value::String(signature.to_string());
     }
     api::carrier_invoke(peer_token, "elastos://peer/*", "gossip_send", &body)?;
@@ -326,16 +334,17 @@ pub fn announce_presence(
     let signature = sign_message(identity_token, sender_id, ts, &content)
         .ok()
         .flatten();
-    send_gossip(
-        peer_token,
-        &chat_discovery_topic(room),
-        sender_nick,
-        sender_id,
-        sender_session_id,
+    let message = Message {
+        sender_id: sender_id.to_string(),
+        sender_session_id: sender_session_id.map(ToOwned::to_owned),
+        sender_nick: sender_nick.to_string(),
+        content,
         ts,
-        &content,
-        signature.as_deref(),
-    )
+        display_ts: None,
+        signature,
+        verified: Some(true),
+    };
+    send_gossip(peer_token, &chat_discovery_topic(room), &message, None)
 }
 
 pub fn recv_presence_announcements(
