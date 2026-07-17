@@ -543,6 +543,160 @@ img {
   }
 }
 
+/* Control Centre: quick projections of state that lives elsewhere (theme,
+   sounds, fullscreen, wallet). Same frosted popover material as the
+   notification center; the deep versions stay in the System app. */
+.control-centre-btn {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='1.9' stroke-linecap='round'%3E%3Crect x='3' y='5' width='18' height='6' rx='3'/%3E%3Ccircle cx='6.5' cy='8' r='1.4' fill='white' stroke='none'/%3E%3Crect x='3' y='13' width='18' height='6' rx='3'/%3E%3Ccircle cx='17.5' cy='16' r='1.4' fill='white' stroke='none'/%3E%3C/svg%3E");
+}
+
+:root[data-el-theme="light"] .control-centre-btn {
+  filter: invert(1) hue-rotate(180deg);
+}
+
+.control-centre {
+  position: fixed;
+  top: calc(var(--stage-top) + 8px);
+  right: 8px;
+  z-index: 100120;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: min(300px, calc(100vw - 16px));
+  padding: 12px;
+  border-radius: 14px;
+  background: var(--menu-fill);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-soft);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  outline: none;
+  animation: notification-center-enter 140ms cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+.control-centre[hidden] {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .control-centre {
+    animation: none;
+  }
+}
+
+.control-centre-label {
+  padding: 0 4px 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.control-centre-segment {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 2px;
+  padding: 2px;
+  border-radius: 9px;
+  background: var(--lift);
+}
+
+.control-centre-segment-option {
+  padding: 6px 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.control-centre-segment-option:hover {
+  background: var(--lift);
+}
+
+.control-centre-segment-option.active {
+  background: var(--panel);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18);
+}
+
+.control-centre-divider {
+  height: 1px;
+  margin: 6px 2px;
+  background: var(--line);
+}
+
+.control-centre-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.control-centre-row:hover {
+  background: var(--lift);
+}
+
+.control-centre-row[hidden] {
+  display: none;
+}
+
+.control-centre-row-detail {
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+/* iOS-grammar switch, pure CSS, driven by aria-checked. */
+.control-centre-switch {
+  flex: 0 0 auto;
+  position: relative;
+  width: 36px;
+  height: 22px;
+  border-radius: 999px;
+  background: var(--lift);
+  transition: background 160ms ease;
+}
+
+.control-centre-switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  transition: transform 160ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.control-centre-row[aria-checked="true"] .control-centre-switch {
+  background: var(--brand);
+}
+
+.control-centre-row[aria-checked="true"] .control-centre-switch::after {
+  transform: translateX(14px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .control-centre-switch,
+  .control-centre-switch::after {
+    transition: none;
+  }
+}
+
 .notification-center-head {
   flex: 0 0 auto;
   display: flex;

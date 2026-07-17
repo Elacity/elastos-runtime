@@ -93,6 +93,10 @@ import {
   toggleQuickLook,
 } from "./shell-quicklook.js?v=home-20260718n";
 import { bindExpose, closeExpose } from "./shell-expose.js?v=home-20260718n";
+import {
+  bindControlCentre,
+  hideControlCentre,
+} from "./shell-control-centre.js?v=home-20260718n";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
@@ -106,6 +110,7 @@ bindQuickLook();
 bindExpose();
 bindShellKeyboard();
 bindMenubar({ closeWindow, openTarget, supportsNewWindow: supportsMenuNewWindow });
+bindControlCentre();
 
 const HOME_GUI_HOST_SELECTORS = Object.freeze([
   ".desktop-backdrop",
@@ -116,6 +121,7 @@ const HOME_GUI_HOST_SELECTORS = Object.freeze([
   "#desktop-context-menu",
   "#home-notification-toast",
   "#notification-center",
+  "#control-centre",
   "#spotlight",
   "#window-switcher",
   "#quick-look",
@@ -186,6 +192,7 @@ export function retireHomeGuiSurface(options = {}) {
   clearDesktopSelection();
   hideSpotlight({ restoreFocus: false });
   hideNotificationCenter();
+  hideControlCentre({ restoreFocus: false });
   hideQuickLook();
   closeExpose();
   retireKeyboardSurfaces();
@@ -562,10 +569,11 @@ function syncFullscreenButton() {
   if (!toolbarFullscreenButton) {
     return;
   }
-  // The fullscreen control is an identity-menu item, so its accessible name
-  // is its visible text.
+  // The fullscreen control is a Control Centre row; its visible label is its
+  // accessible name.
   const active = Boolean(fullscreenElement());
-  toolbarFullscreenButton.textContent = active ? "Exit fullscreen" : "Enter fullscreen";
+  const label = toolbarFullscreenButton.querySelector(".control-centre-row-label");
+  (label || toolbarFullscreenButton).textContent = active ? "Exit fullscreen" : "Enter fullscreen";
 }
 
 function toggleHomeGuiFullscreen() {
