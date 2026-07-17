@@ -21,7 +21,9 @@ import {
   clearShellSessionState,
   ignoreRepeatedAction,
   targetById,
-} from "./shell-core.js?v=home-20260705a";
+  toolbarActiveTitleNode,
+  taskbarTargets,
+} from "./shell-core.js?v=home-20260717b";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -32,7 +34,8 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260705a";
+} from "./shell-window-geometry.js?v=home-20260717b";
+import { playUiSound } from "./shell-sounds.js?v=home-20260717b";
 
 let windowHooks = null;
 const PEOPLE_DISCOVERY_AUTO_REFRESH_INITIAL_MS = 1_500;
@@ -56,6 +59,12 @@ const BROWSER_DESKTOP_OPEN_GUARD_MS = 700;
 const MAX_SESSION_WINDOWS = 24;
 const SINGLE_SESSION_TARGETS = new Set([PEOPLE_TARGET_ID, "inbox", "wallet"]);
 const TEMPORARY_BROWSER_CHILD_FRAME_RELEASE_HOOK = "__elastosBrowserReleaseRuntimePage";
+
+/* Menu-bar honesty: "New Window" appears only where openTarget really opens
+   one. Single-session targets just refocus — the item would be a lie. */
+export function supportsMenuNewWindow(targetId) {
+  return !SINGLE_SESSION_TARGETS.has(targetId);
+}
 const COMMON_IFRAME_SANDBOX = [
   "allow-downloads",
   "allow-forms",
@@ -149,10 +158,125 @@ function requireWindowHooks() {
   return windowHooks;
 }
 
+// The system bar owns the focused-window title: the frontmost app's name is what
+// makes the desktop read as "owned" by an app. Falls back to "Home" when nothing
+// is focused. Always textContent — titles are app-derived strings, never HTML.
+function syncToolbarActiveTitle() {
+  if (!toolbarActiveTitleNode) {
+    return;
+  }
+  const active = shellState.activeWindowId
+    ? shellState.windows.get(shellState.activeWindowId)
+    : null;
+  const visible = active && !active.node.classList.contains("hidden");
+  toolbarActiveTitleNode.textContent =
+    visible && typeof active.title === "string" && active.title
+      ? active.title
+      : "Home";
+}
+
 function refreshWindowUi() {
   const hooks = requireWindowHooks();
   hooks.updateTaskbarState();
   hooks.refreshLauncherIfVisible();
+  syncToolbarActiveTitle();
+}
+
+/* ---- Window lifecycle motion (compositor-only: transform + opacity) ----
+   Logical state (hidden class, windows map, session persistence) always
+   changes synchronously; animation is presentation layered on top, with
+   fallback timers so a missed event can never wedge a window. */
+const WINDOW_EXIT_FALLBACK_MS = 220;
+const WINDOW_MINIMIZE_FALLBACK_MS = 280;
+
+// Queried lazily: matchMedia is unavailable in the host's DOM-stubbed smoke
+// harnesses, and the GUI module graph must stay import-safe there.
+function windowsReducedMotion() {
+  return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+}
+
+function playWindowEnter(node) {
+  if (windowsReducedMotion()) {
+    return;
+  }
+  node.classList.add("window-enter");
+  node.addEventListener(
+    "animationend",
+    () => {
+      node.classList.remove("window-enter");
+    },
+    { once: true },
+  );
+}
+
+function retireWindowNode(node) {
+  // Exit motion is cosmetic and only valid while the GUI owns the surface;
+  // a shell switch must retire stale windows synchronously (host contract).
+  const guiMounted = document.body.dataset.homeGui === "mounted";
+  if (!guiMounted || windowsReducedMotion() || node.classList.contains("hidden")) {
+    node.remove();
+    return;
+  }
+  node.classList.add("window-exit");
+  const finish = () => {
+    node.remove();
+  };
+  node.addEventListener("animationend", finish, { once: true });
+  window.setTimeout(finish, WINDOW_EXIT_FALLBACK_MS);
+}
+
+function dockSlotCenter(targetId) {
+  if (!taskbarTargets || !targetId) {
+    return null;
+  }
+  const button = taskbarTargets.querySelector(
+    `.taskbar-item[data-target="${CSS.escape(targetId)}"]`,
+  );
+  if (!button) {
+    return null;
+  }
+  const rect = button.getBoundingClientRect();
+  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+}
+
+// The window is already logically hidden (class set by the caller); this keeps
+// it painted through `.window-minimizing` while it recedes into its dock slot.
+function playWindowMinimize(entry) {
+  const node = entry.node;
+  const slot = entry.kind === "browser" ? dockSlotCenter(entry.targetId) : null;
+  if (windowsReducedMotion() || !slot) {
+    return;
+  }
+  node.classList.add("window-minimizing");
+  const rect = node.getBoundingClientRect();
+  if (rect.width === 0 && rect.height === 0) {
+    node.classList.remove("window-minimizing");
+    return;
+  }
+  const dx = slot.x - (rect.left + rect.width / 2);
+  const dy = slot.y - (rect.top + rect.height / 2);
+  let done = false;
+  const finish = () => {
+    if (done) {
+      return;
+    }
+    done = true;
+    node.classList.remove("window-minimizing");
+    node.style.transform = "";
+    node.style.opacity = "";
+  };
+  window.requestAnimationFrame(() => {
+    node.style.transform = `translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px) scale(0.05)`;
+    node.style.opacity = "0";
+  });
+  node.addEventListener("transitionend", finish, { once: true });
+  window.setTimeout(finish, WINDOW_MINIMIZE_FALLBACK_MS);
+}
+
+function clearWindowMinimizeMotion(node) {
+  node.classList.remove("window-minimizing");
+  node.style.transform = "";
+  node.style.opacity = "";
 }
 
 function currentWindowBounds(node) {
@@ -431,8 +555,10 @@ function restoreWindow(id) {
   }
   entry.node.classList.remove("hidden");
   entry.node.setAttribute("aria-hidden", "false");
+  clearWindowMinimizeMotion(entry.node);
+  playWindowEnter(entry.node);
   armWindowControlGuard(entry.node);
-  focusWindow(id);
+  focusWindow(id, { moveFocus: true });
   persistBrowserSession();
   return true;
 }
@@ -445,11 +571,12 @@ export function showAllTargetWindows(targetId) {
   for (const entry of entries) {
     entry.node.classList.remove("hidden");
     entry.node.setAttribute("aria-hidden", "false");
+    clearWindowMinimizeMotion(entry.node);
     armWindowControlGuard(entry.node);
   }
   const top = topBrowserWindowEntryForTarget(targetId);
   if (top) {
-    focusWindow(top.id);
+    focusWindow(top.id, { moveFocus: true });
   } else {
     refreshWindowUi();
     persistBrowserSession();
@@ -466,6 +593,7 @@ function hideWindowEntries(entries) {
     entry.node.classList.add("hidden");
     entry.node.classList.remove("window-active");
     entry.node.setAttribute("aria-hidden", "true");
+    playWindowMinimize(entry);
   }
   if (hidActiveWindow) {
     shellState.activeWindowId = null;
@@ -489,7 +617,7 @@ function removeWindowEntries(entries) {
     cleanupFrameAutoFit(entry.node);
     cleanupPeopleDiscoveryAutoRefresh(entry.node);
     shellState.windows.delete(entry.id);
-    entry.node.remove();
+    retireWindowNode(entry.node);
   }
   renderWindowTaskbar();
   if (removedActiveWindow) {
@@ -505,7 +633,7 @@ function removeWindowEntries(entries) {
 function activateTargetGroup(targetId) {
   const visibleTop = topBrowserWindowEntryForTarget(targetId, { includeHidden: false });
   if (visibleTop) {
-    focusWindow(visibleTop.id);
+    focusWindow(visibleTop.id, { moveFocus: true });
     return true;
   }
   const restoreTarget = topBrowserWindowEntryForTarget(targetId);
@@ -566,6 +694,8 @@ function renderSystemErrorWindow({
   errorNode.querySelector(".window-error-detail").textContent = detail;
   body.appendChild(errorNode);
   focusWindow(id);
+  // The refusal moment — the one place the optional error sound belongs.
+  playUiSound("error");
 }
 
 function renderTargetLaunchError(targetId, error) {
@@ -590,6 +720,7 @@ function createWindow({ id, title, x, y, width, height, tone, glyphTarget }) {
   node.dataset.snap = "";
   node.setAttribute("aria-label", title);
   node.setAttribute("aria-hidden", "false");
+  playWindowEnter(node);
   armWindowControlGuard(node);
   node.style.left = `${bounds.x}px`;
   node.style.top = `${bounds.y}px`;
@@ -623,7 +754,11 @@ function createWindow({ id, title, x, y, width, height, tone, glyphTarget }) {
   });
 
   const handle = node.querySelector(".window-head");
-  handle.addEventListener("dblclick", () => {
+  handle.addEventListener("dblclick", (event) => {
+    // Double-clicking the traffic lights is two button presses, not a zoom.
+    if (event.target.closest("button")) {
+      return;
+    }
     toggleWindowMaximize(id);
   });
   attachWindowDrag(node, handle, focusWindow, persistBrowserSession);
@@ -782,6 +917,14 @@ function renderPeopleWindowBody(entry, summary) {
   body.classList.remove("window-body-frame");
   body.classList.add("home-people-body");
   const profileMarkup = peopleProfileMarkup(identity);
+  // List/detail anatomy: the selection survives summary refreshes on the
+  // window node; a vanished contact falls back to the first one.
+  const requestedId = normalizePeopleText(entry.node.dataset.peopleSelectedContact, "");
+  const selectedContact = contacts.find(
+    (contact) => normalizePeopleText(contact?.contact_id, "") === requestedId,
+  ) || contacts[0] || null;
+  const selectedId = normalizePeopleText(selectedContact?.contact_id, "");
+  entry.node.dataset.peopleSelectedContact = selectedId;
   const peopleMarkup = contacts.length === 0
     ? `
       <div class="home-people-empty">
@@ -789,7 +932,16 @@ function renderPeopleWindowBody(entry, summary) {
         <p>Turn on Discovery to find another ElastOS home and send a request.</p>
       </div>
     `
-    : contacts.map(peopleListCardMarkup).join("");
+    : `
+      <div class="home-people-split">
+        <div class="home-people-roster" role="listbox" aria-label="People">
+          ${contacts.map((contact) => peopleRosterRowMarkup(contact, selectedId)).join("")}
+        </div>
+        <div class="home-people-detail">
+          ${peopleContactDetailMarkup(selectedContact)}
+        </div>
+      </div>
+    `;
   body.innerHTML = `
     <section class="home-people-shell" aria-label="People">
       <aside class="home-people-sidebar" aria-label="People sections">
@@ -807,7 +959,7 @@ function renderPeopleWindowBody(entry, summary) {
         <div class="home-people-content">
           <section class="home-people-section" data-people-section="people" aria-label="People">
             ${profileMarkup}
-            <div class="home-people-list">${peopleMarkup}</div>
+            ${peopleMarkup}
           </section>
           <section class="home-people-section" data-people-section="discovery" aria-label="Discovery">
             ${peopleDiscoveryMarkup(discovery, discoveredPeers, discoveryRequests)}
@@ -816,7 +968,7 @@ function renderPeopleWindowBody(entry, summary) {
       </main>
     </section>
   `;
-  bindPeopleWindowActions(body);
+  bindPeopleWindowActions(body, entry, summary);
   schedulePeopleDiscoveryAutoRefresh(body, discovery);
 }
 
@@ -929,40 +1081,122 @@ function peopleDiscoveryRequestMarkup(request) {
   `;
 }
 
-function peopleListCardMarkup(contact) {
+function peopleRosterRowMarkup(contact, selectedId) {
+  const rawDisplayName = peopleDisplayName(contact, "Person");
+  const displayName = escapeHtml(rawDisplayName);
+  const relationship = escapeHtml(normalizePeopleText(contact?.relationship, "connected"));
+  const contactId = normalizePeopleText(contact?.contact_id, "");
+  const selected = contactId && contactId === selectedId;
+  return `
+    <button class="home-people-row${selected ? " active" : ""}" type="button" role="option"
+      aria-selected="${selected ? "true" : "false"}" data-people-select="${escapeHtml(contactId)}">
+      <span class="home-people-avatar" aria-hidden="true">${escapeHtml(rawDisplayName.slice(0, 1).toUpperCase() || "E")}</span>
+      <span class="home-people-row-copy">
+        <span class="home-people-row-name">${displayName}</span>
+        <span class="home-people-row-sub">${relationship}</span>
+      </span>
+    </button>
+  `;
+}
+
+function peopleContactDetailMarkup(contact) {
+  if (!contact) {
+    return `
+      <div class="home-people-empty">
+        <h3>Select a person</h3>
+        <p>Choose someone from the list to see their details.</p>
+      </div>
+    `;
+  }
   const rawDisplayName = peopleDisplayName(contact, "Person");
   const displayName = escapeHtml(rawDisplayName);
   const relationship = escapeHtml(normalizePeopleText(contact?.relationship, "connected"));
   const handle = normalizePeopleText(contact?.handle, "");
   const device = normalizePeopleText(contact?.device_label, "");
-  const handleLine = handle && handle !== rawDisplayName ? `<span>${escapeHtml(handle)}</span>` : "";
-  const deviceLine = device && device !== rawDisplayName ? `<span>${escapeHtml(device)}</span>` : "";
   const contactId = escapeHtml(normalizePeopleText(contact?.contact_id, ""));
   const route = normalizePeopleText(contact?.route, "");
   const chatAction = contact?.can_message === true && route
     ? `<button class="home-people-action" type="button" data-people-action="chat" data-contact-route="${escapeHtml(route)}">Chat</button>`
     : "";
+  const detailRows = [
+    handle && handle !== rawDisplayName
+      ? `<div class="home-people-detail-row"><span class="home-people-detail-label">Handle</span><span class="home-people-detail-value">${escapeHtml(handle)}</span></div>`
+      : "",
+    device && device !== rawDisplayName
+      ? `<div class="home-people-detail-row"><span class="home-people-detail-label">Device</span><span class="home-people-detail-value">${escapeHtml(device)}</span></div>`
+      : "",
+    route
+      ? `<div class="home-people-detail-row"><span class="home-people-detail-label">Route</span><span class="home-people-detail-value home-people-detail-mono">${escapeHtml(route)}</span></div>`
+      : "",
+  ].filter(Boolean).join("");
   return `
-    <article class="home-people-card">
-      <div class="home-people-avatar" aria-hidden="true">${escapeHtml(rawDisplayName.slice(0, 1).toUpperCase() || "E")}</div>
-      <div class="home-people-card-copy">
-        <h3>${displayName}</h3>
-        <p><span>${relationship}</span>${handleLine}${deviceLine}</p>
+    <div class="home-people-detail-card">
+      <div class="home-people-detail-head">
+        <div class="home-people-avatar home-people-detail-avatar" aria-hidden="true">${escapeHtml(rawDisplayName.slice(0, 1).toUpperCase() || "E")}</div>
+        <div class="home-people-detail-copy">
+          <h3>${displayName}</h3>
+          <p>${relationship}</p>
+        </div>
       </div>
-      <div class="home-people-card-actions">
+      ${detailRows ? `<div class="home-people-detail-rows">${detailRows}</div>` : ""}
+      <div class="home-people-detail-actions">
         ${chatAction}
         <button class="home-people-action home-people-action-danger" type="button" data-people-action="remove" data-contact-id="${contactId}">Remove</button>
       </div>
-    </article>
+    </div>
   `;
 }
 
-function bindPeopleWindowActions(body) {
+function bindPeopleWindowActions(body, entry, summary) {
   body.querySelector("[data-people-profile-form]")?.addEventListener("submit", (event) => {
     event.preventDefault();
     savePeopleProfile(body, event.currentTarget).catch((error) => {
       setPeopleStatus(body, error.message || "Could not save profile.", "error");
     });
+  });
+  // Roster selection: click or arrow keys move the selection; the detail pane
+  // follows via a re-render of the same summary.
+  const selectContact = (contactId, focusRow) => {
+    if (!entry || !contactId) {
+      return;
+    }
+    entry.node.dataset.peopleSelectedContact = contactId;
+    renderPeopleWindowBody(entry, summary);
+    if (focusRow) {
+      entry.node
+        .querySelector(`[data-people-select="${CSS.escape(contactId)}"]`)
+        ?.focus();
+    }
+  };
+  for (const row of body.querySelectorAll("[data-people-select]")) {
+    row.addEventListener("click", (event) => {
+      selectContact(event.currentTarget?.dataset?.peopleSelect || "", false);
+    });
+  }
+  body.querySelector(".home-people-roster")?.addEventListener("keydown", (event) => {
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+      return;
+    }
+    const rows = [...body.querySelectorAll("[data-people-select]")];
+    if (!rows.length) {
+      return;
+    }
+    const index = rows.findIndex((row) => row.classList.contains("active"));
+    let next = index;
+    if (event.key === "ArrowDown") {
+      next = Math.min(rows.length - 1, index + 1);
+    } else if (event.key === "ArrowUp") {
+      next = Math.max(0, index - 1);
+    } else if (event.key === "Home") {
+      next = 0;
+    } else {
+      next = rows.length - 1;
+    }
+    if (next === index) {
+      return;
+    }
+    event.preventDefault();
+    selectContact(rows[next].dataset.peopleSelect || "", true);
   });
   for (const button of body.querySelectorAll("[data-people-jump]")) {
     button.addEventListener("click", (event) => {
@@ -1293,22 +1527,52 @@ async function removePersonFromPeople(body, button) {
   if (!contactId) {
     throw new Error("Person id is missing.");
   }
-  const card = button.closest(".home-people-card");
-  const label = card?.querySelector(".home-people-card-copy h3")?.textContent?.trim() || "this person";
-  if (!window.confirm(`Remove ${label} from People?`)) {
+  const card = button.closest(".home-people-detail-card, .home-people-card");
+  const label = card?.querySelector("h3")?.textContent?.trim() || "this person";
+  if (!card || card.querySelector(".home-people-confirm")) {
     return;
   }
-  setPeopleBusy(button, true);
-  try {
-    await fetchJson("/api/apps/people/contacts/remove", {
-      method: "POST",
-      body: JSON.stringify({ contact_id: contactId }),
-    });
-    setPeopleStatus(body, "Removed from People.", "ok");
-    await shellState.requestSummaryRefresh?.();
-  } finally {
-    setPeopleBusy(button, false);
-  }
+  // In-card confirm strip instead of a browser-native confirm dialog.
+  const strip = document.createElement("div");
+  strip.className = "home-people-confirm";
+  strip.setAttribute("role", "alertdialog");
+  strip.setAttribute("aria-label", `Remove ${label} from People?`);
+  const copy = document.createElement("p");
+  copy.textContent = `Remove ${label} from People?`;
+  const actions = document.createElement("div");
+  actions.className = "home-people-confirm-actions";
+  const commit = document.createElement("button");
+  commit.type = "button";
+  commit.className = "home-people-action home-people-action-danger";
+  commit.textContent = "Remove";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "home-people-action";
+  cancel.textContent = "Cancel";
+  actions.append(commit, cancel);
+  strip.append(copy, actions);
+  card.appendChild(strip);
+  cancel.addEventListener("click", () => {
+    strip.remove();
+    button.focus();
+  });
+  commit.addEventListener("click", async () => {
+    strip.remove();
+    setPeopleBusy(button, true);
+    try {
+      await fetchJson("/api/apps/people/contacts/remove", {
+        method: "POST",
+        body: JSON.stringify({ contact_id: contactId }),
+      });
+      setPeopleStatus(body, "Removed from People.", "ok");
+      await shellState.requestSummaryRefresh?.();
+    } catch (error) {
+      setPeopleStatus(body, String(error?.message || error), "error");
+    } finally {
+      setPeopleBusy(button, false);
+    }
+  });
+  cancel.focus();
 }
 
 function openPersonChat(body, button) {
@@ -1499,6 +1763,11 @@ function launchDidFail(launched) {
   );
 }
 
+// Reveal budget for a navigating iframe: fade in on load, but never stay
+// invisible longer than this — a slow capsule paints over the dark frame
+// default instead of a white flash.
+const FRAME_REVEAL_FAILSAFE_MS = 300;
+
 function syncBrowserWindow(entry, launched) {
   const node = entry.node;
   const frame = node.querySelector(".window-frame");
@@ -1507,6 +1776,7 @@ function syncBrowserWindow(entry, launched) {
   cleanupFrameAutoFit(node);
 
   const syncLoadedFrame = () => {
+    frame.classList.add("is-ready");
     if (entry.targetId !== "browser") {
       installFrameAutoFit(node, frame);
     }
@@ -1517,6 +1787,9 @@ function syncBrowserWindow(entry, launched) {
   if (frame.dataset.route !== launched.route) {
     frame.src = launched.route;
     frame.dataset.route = launched.route;
+    window.setTimeout(() => {
+      frame.classList.add("is-ready");
+    }, FRAME_REVEAL_FAILSAFE_MS);
     return;
   }
   syncLoadedFrame();
@@ -1758,7 +2031,7 @@ function fitWindowToFrame(node, frame) {
   }
 }
 
-export function focusWindow(id) {
+export function focusWindow(id, { moveFocus = false } = {}) {
   const entry = shellState.windows.get(id);
   if (!entry) {
     return;
@@ -1771,6 +2044,7 @@ export function focusWindow(id) {
   entry.node.classList.remove("hidden");
   entry.node.classList.add("window-active");
   entry.node.setAttribute("aria-hidden", "false");
+  clearWindowMinimizeMotion(entry.node);
   shellState.zIndexCounter += 1;
   entry.node.style.zIndex = String(shellState.zIndexCounter);
   shellState.activeWindowId = id;
@@ -1780,6 +2054,21 @@ export function focusWindow(id) {
   }
   refreshWindowUi();
   persistBrowserSession();
+  // Keyboard activation (taskbar, window menus) must move real DOM focus to
+  // the window; pointer clicks keep the browser's natural focus placement.
+  if (moveFocus) {
+    entry.node.focus({ preventScroll: true });
+  }
+}
+
+function syncMaximizeButtonLabel(node) {
+  const button = node.querySelector('[data-action="maximize"]');
+  if (!button) {
+    return;
+  }
+  const maximized =
+    node.dataset.maximized === "true" || node.dataset.browserMaximized === "true";
+  button.setAttribute("aria-label", maximized ? "Restore" : "Maximize");
 }
 
 function toggleWindowMaximize(id) {
@@ -1795,6 +2084,7 @@ function toggleWindowMaximize(id) {
   ) {
     restoreWindowFromSpecialState(node);
     fitLaunchedWindow(entry);
+    syncMaximizeButtonLabel(node);
     focusWindow(id);
     persistBrowserSession();
     return;
@@ -1805,12 +2095,14 @@ function toggleWindowMaximize(id) {
     node.dataset.maximized = "false";
     node.dataset.browserMaximized = "true";
     fitWindowToLargestBrowserAspect(node);
+    syncMaximizeButtonLabel(node);
     focusWindow(id);
     persistBrowserSession();
     return;
   }
   node.dataset.browserMaximized = "false";
   node.dataset.maximized = "true";
+  syncMaximizeButtonLabel(node);
   focusWindow(id);
   persistBrowserSession();
 }

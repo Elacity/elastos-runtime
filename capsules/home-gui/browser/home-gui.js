@@ -7,7 +7,9 @@ import {
   launcher,
   launcherSearch,
   launcherToggleButton,
+  launcherViewToggle,
   closeLauncherButton,
+  identityMenuSystemButton,
   shellState,
   taskbarTargets,
   toolbarFullscreenButton,
@@ -20,16 +22,20 @@ import {
   shellInteractionActive,
   shouldIgnoreDesktopKeydown,
   targetById,
-} from "./shell-core.js?v=home-20260705a";
+} from "./shell-core.js?v=home-20260717b";
 import {
+  bindIdentityMenu,
   clearIdentitySurface,
   syncIdentity,
   updateClock,
-} from "./shell-chrome.js?v=home-20260705a";
+} from "./shell-chrome.js?v=home-20260717b";
 import {
+  beginDesktopMarquee,
+  bindShellSurfaceDom,
   clearDesktopSelection,
   continueTargetDrag,
   filterLauncherItems,
+  finishDesktopMarquee,
   finishTargetDrag,
   handleContextAction,
   hideDesktopContextMenu,
@@ -44,9 +50,11 @@ import {
   renderDesktop,
   renderLauncher,
   renderTaskbar,
+  selectAllDesktopIcons,
   toggleLauncher,
+  updateDesktopMarquee,
   updateTaskbarState,
-} from "./shell-surface.js?v=home-20260705a";
+} from "./shell-surface.js?v=home-20260717b";
 import {
   closeWindow,
   cleanupBeforeUnload,
@@ -57,9 +65,11 @@ import {
   refreshHomeInternalWindows,
   restoreShellSession,
   showDesktopHome,
-} from "./shell-windows.js?v=home-20260705a";
+} from "./shell-windows.js?v=home-20260717b";
 
 await ensureHomeGuiDom();
+bindIdentityMenu();
+bindShellSurfaceDom();
 
 const HOME_GUI_HOST_SELECTORS = Object.freeze([
   ".desktop-backdrop",
@@ -69,6 +79,11 @@ const HOME_GUI_HOST_SELECTORS = Object.freeze([
   ".launcher",
   "#desktop-context-menu",
   "#home-notification-toast",
+  "#notification-center",
+  "#spotlight",
+  "#window-switcher",
+  "#quick-look",
+  "#shortcuts-overlay",
 ]);
 let homeGuiInteractionsBound = false;
 
@@ -437,10 +452,10 @@ function syncFullscreenButton() {
   if (!toolbarFullscreenButton) {
     return;
   }
+  // The fullscreen control is an identity-menu item, so its accessible name
+  // is its visible text.
   const active = Boolean(fullscreenElement());
-  toolbarFullscreenButton.setAttribute("aria-pressed", active ? "true" : "false");
-  toolbarFullscreenButton.setAttribute("aria-label", active ? "Exit fullscreen" : "Enter fullscreen");
-  toolbarFullscreenButton.title = active ? "Exit fullscreen" : "Fullscreen";
+  toolbarFullscreenButton.textContent = active ? "Exit fullscreen" : "Enter fullscreen";
 }
 
 function toggleHomeGuiFullscreen() {
@@ -485,14 +500,45 @@ function bindHomeGuiFullscreenControl() {
   }
   const { request, exit } = fullscreenApi();
   if (!request || !exit) {
-    toolbarFullscreenButton.disabled = true;
-    toolbarFullscreenButton.title = "Fullscreen is not available in this browser";
+    toolbarFullscreenButton.hidden = true;
     return;
   }
   toolbarFullscreenButton.addEventListener("click", toggleHomeGuiFullscreen);
   document.addEventListener("fullscreenchange", syncFullscreenButton);
   document.addEventListener("webkitfullscreenchange", syncFullscreenButton);
   syncFullscreenButton();
+}
+
+/* Grid/list view for the launcher (macOS Apps panel view control). The
+   preference is a pure browser concern, so localStorage — same store the
+   theme runtime uses. */
+const LAUNCHER_VIEW_KEY = "elastos.ui.launcherView";
+
+function applyLauncherView(view) {
+  const list = view === "list";
+  launcher.dataset.view = list ? "list" : "grid";
+  launcherViewToggle?.setAttribute("aria-pressed", list ? "true" : "false");
+  launcherViewToggle?.setAttribute(
+    "aria-label",
+    list ? "Switch to grid view" : "Switch to list view",
+  );
+}
+
+function bindLauncherViewToggle() {
+  try {
+    applyLauncherView(localStorage.getItem(LAUNCHER_VIEW_KEY));
+  } catch (_error) {
+    applyLauncherView("grid");
+  }
+  launcherViewToggle?.addEventListener("click", () => {
+    const next = launcher.dataset.view === "list" ? "grid" : "list";
+    applyLauncherView(next);
+    try {
+      localStorage.setItem(LAUNCHER_VIEW_KEY, next);
+    } catch (_error) {
+      // Preference still applies for this session.
+    }
+  });
 }
 
 export function bindHomeGuiInteractions(options = {}) {
@@ -528,6 +574,14 @@ export function bindHomeGuiInteractions(options = {}) {
   });
 
   bindHomeGuiFullscreenControl();
+  bindLauncherViewToggle();
+
+  identityMenuSystemButton?.addEventListener("click", () => {
+    if (!targetById(shellState.currentSummary, "system")) {
+      return;
+    }
+    openTarget("system");
+  });
 
   toolbarSignOutButton?.addEventListener("click", () => {
     document.body.dataset.homeStatus = "booting";
@@ -578,6 +632,11 @@ export function bindHomeGuiInteractions(options = {}) {
       clearDesktopSelection();
       return;
     }
+    if ((event.key === "a" || event.key === "A") && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      selectAllDesktopIcons();
+      return;
+    }
     if ((event.key === "Enter" || event.key === " ") && shellState.selectedDesktopTargetId) {
       event.preventDefault();
       event.stopPropagation();
@@ -588,14 +647,17 @@ export function bindHomeGuiInteractions(options = {}) {
   document.addEventListener("pointermove", (event) => {
     trackPointerMove(event);
     continueTargetDrag(event);
+    updateDesktopMarquee(event);
   });
 
   document.addEventListener("pointerup", (event) => {
     finishTargetDrag(event);
+    finishDesktopMarquee(event);
   });
 
   document.addEventListener("pointercancel", (event) => {
     finishTargetDrag(event);
+    finishDesktopMarquee(event);
   });
 
   document.addEventListener("pointerdown", (event) => {
@@ -630,7 +692,7 @@ export function bindHomeGuiInteractions(options = {}) {
 
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && shellState.contextMenuOpen) {
-      hideDesktopContextMenu();
+      hideDesktopContextMenu({ restoreFocus: true });
     }
     if (event.key === "Escape" && !launcher.hidden) {
       hideLauncher();
@@ -672,6 +734,7 @@ export function bindHomeGuiInteractions(options = {}) {
       return;
     }
     clearDesktopSelection();
+    beginDesktopMarquee(event);
   });
 
   desktopContextMenu?.addEventListener("click", (event) => {

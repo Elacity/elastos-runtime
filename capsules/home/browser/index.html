@@ -24,10 +24,23 @@
         } catch (_error) {}
       })();
     </script>
-    <link rel="manifest" href="./manifest.webmanifest?v=home-20260705a" />
+    <link rel="manifest" href="./manifest.webmanifest?v=home-20260717b" />
     <link rel="icon" href="./elastos-home-icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./elastos-home-icon-192.png" />
-    <link rel="stylesheet" href="./style.css?v=home-20260705a" />
+    <link
+      rel="preload"
+      href="./assets/fonts/Inter-latin-var.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin
+    />
+    <!-- Vendored design tokens + theme runtime (capsules/_shared, stamped by
+         scripts/vendor-ui-tokens.sh). The theme script runs before stylesheets
+         so a stored light/dark choice applies without a flash; home-gui's
+         injected stylesheet resolves its --el-* tokens from this sheet. -->
+    <script src="./elastos-theme.js?v=home-20260717b"></script>
+    <link rel="stylesheet" href="./elastos-ui.css?v=home-20260717b" />
+    <link rel="stylesheet" href="./style.css?v=home-20260717b" />
   </head>
   <body data-home-status="booting" data-home-shell="resolving" data-home-gui="resolving">
     <script>
@@ -115,6 +128,6 @@
       </section>
     </div>
 
-    <script type="module" src="./home-shell-host.js?v=home-20260705a"></script>
+    <script type="module" src="./home-shell-host.js?v=home-20260717b"></script>
   </body>
 </html>
