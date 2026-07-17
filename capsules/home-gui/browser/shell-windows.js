@@ -112,7 +112,7 @@ const WEBAUTHN_IFRAME_ALLOW_TARGETS = new Set(["inbox", "wallet"]);
 const pendingWindowLaunches = new Set();
 const peopleDiscoveryRefreshTimers = new WeakMap();
 
-function iframeSandboxForLaunch(launched) {
+export function iframeSandboxForLaunch(launched) {
   const tokens = [...COMMON_IFRAME_SANDBOX];
   if (SAME_ORIGIN_PRESENTATION_IFRAME_TARGETS.has(launched?.target)) {
     tokens.push("allow-same-origin");
@@ -129,7 +129,7 @@ function iframeSandboxForLaunch(launched) {
   return tokens.join(" ");
 }
 
-function iframeAllowForLaunch(launched) {
+export function iframeAllowForLaunch(launched) {
   const tokens = [...COMMON_IFRAME_ALLOW];
   if (launched?.target === "browser") {
     tokens.push(...BROWSER_IFRAME_ALLOW_EXTRAS);
