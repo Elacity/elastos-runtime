@@ -115,10 +115,16 @@ function syncThemeSegment() {
     return;
   }
   const preference = window.elastosTheme?.preference() || "dark";
-  for (const option of themeSegment.querySelectorAll("[data-theme-option]")) {
+  const options = Array.from(themeSegment.querySelectorAll("[data-theme-option]"));
+  for (const [index, option] of options.entries()) {
     const active = option.dataset.themeOption === preference;
     option.setAttribute("aria-checked", active ? "true" : "false");
     option.classList.toggle("active", active);
+    if (active) {
+      // Drives the sliding thumb; while the panel is display:none the value
+      // still lands, so reopening snaps into place without a phantom slide.
+      themeSegment.style.setProperty("--segment-index", String(index));
+    }
   }
 }
 
