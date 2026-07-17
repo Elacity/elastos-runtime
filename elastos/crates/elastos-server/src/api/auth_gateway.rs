@@ -2921,6 +2921,17 @@ mod tests {
         store.save().unwrap();
     }
 
+    fn copy_test_auth_root(source: &std::path::Path, destination: &std::path::Path) {
+        let state = crate::auth::load_auth_state(source).unwrap();
+        std::fs::create_dir_all(destination.join("identity")).unwrap();
+        std::fs::copy(
+            source.join("identity/device.key"),
+            destination.join("identity/device.key"),
+        )
+        .unwrap();
+        crate::auth::save_auth_state(destination, &state).unwrap();
+    }
+
     fn home_token_headers(token: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -4174,8 +4185,7 @@ mod tests {
             "test passkey grant",
         )
         .unwrap();
-        let state_auth = crate::auth::load_auth_state(temp.path()).unwrap();
-        crate::auth::save_auth_state(trusted.path(), &state_auth).unwrap();
+        copy_test_auth_root(temp.path(), trusted.path());
         let _auth_data_dir =
             super::super::gateway::set_test_home_launch_auth_data_dir(trusted.path());
 
@@ -4247,8 +4257,7 @@ mod tests {
             "test passkey grant",
         )
         .unwrap();
-        let state_auth = crate::auth::load_auth_state(temp.path()).unwrap();
-        crate::auth::save_auth_state(trusted.path(), &state_auth).unwrap();
+        copy_test_auth_root(temp.path(), trusted.path());
         let _auth_data_dir =
             super::super::gateway::set_test_home_launch_auth_data_dir(trusted.path());
 

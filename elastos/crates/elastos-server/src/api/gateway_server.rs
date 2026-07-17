@@ -14,6 +14,7 @@ pub async fn start_gateway_server(
     cache_dir: PathBuf,
     data_dir: PathBuf,
 ) -> anyhow::Result<()> {
+    crate::auth::verify_auth_audit_chain_ready(&data_dir)?;
     let listener = TcpListener::bind(addr).await?;
     let gateway_api_url = trusted_gateway_api_url(addr)?;
     let state = GatewayState {

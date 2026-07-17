@@ -30,8 +30,19 @@ use sha2::{Digest, Sha256};
 const AUTH_STATE_SCHEMA: &str = "elastos.auth.state/v1";
 const AUTH_STATE_ROOT: &str = "ElastOS/System/Auth";
 const AUTH_STATE_FILE: &str = "auth-state.json";
+const AUDIT_CHAIN_REQUIRED_FILE: &str = "audit-chain-required.json";
 const RECOVERY_ARCHIVE_KEY_FILE: &str = "recovery-archive.key";
 const AUDIT_EVENT_DOMAIN: &str = "elastos.audit.event.v1";
+const AUDIT_CHAIN_SCHEMA: &str = "elastos.audit.chain-link/v1";
+const AUDIT_CHAIN_DOMAIN: &str = "elastos.audit.chain-link.v1";
+const AUDIT_CHAIN_GENESIS: &str = "sha256:genesis";
+const AUDIT_CHAIN_STATE_SCHEMA: &str = "elastos.audit.chain-state/v1";
+const AUDIT_CHAIN_STATE_DOMAIN: &str = "elastos.audit.chain-state.v1";
+const AUDIT_CHAIN_ANCHOR_SCHEMA: &str = "elastos.audit.chain-anchor/v1";
+const AUDIT_CHAIN_ANCHOR_DOMAIN: &str = "elastos.audit.chain-anchor.v1";
+const AUDIT_CHAIN_ACTIVATION_SCHEMA: &str = "elastos.audit.chain-activation/v1";
+const AUDIT_CHAIN_ACTIVATION_DOMAIN: &str = "elastos.audit.chain-activation.v1";
+const AUDIT_RETENTION_LIMIT: usize = 512;
 const RECOVERY_DESCRIPTOR_SCHEMA: &str = "elastos.principal.root-descriptor/v1";
 const PRINCIPAL_ROOT_OBJECT_SCHEMA: &str = "elastos.principal-root.object/v1";
 pub const PROTECTED_PRINCIPAL_ROOT_OBJECT_NOT_ENCRYPTED: &str =
@@ -101,6 +112,45 @@ pub struct StoredAuthSession {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditChainLinkV1 {
+    pub schema: String,
+    pub sequence: u64,
+    pub event_id: String,
+    pub previous_hash: String,
+    pub event_hash: String,
+    pub chain_hash: String,
+    pub signer_did: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditChainStateV1 {
+    pub schema: String,
+    pub activated_at: u64,
+    pub head_sequence: u64,
+    pub head_hash: String,
+    pub signer_did: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditChainAnchorV1 {
+    pub schema: String,
+    pub sequence: u64,
+    pub chain_hash: String,
+    pub signer_did: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuditChainActivationV1 {
+    schema: String,
+    activated_at: u64,
+    signer_did: String,
+    signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthState {
     pub schema: String,
     #[serde(default)]
@@ -114,6 +164,12 @@ pub struct AuthState {
     #[serde(default)]
     pub audit: Vec<RuntimeAuditEventV1>,
     #[serde(default)]
+    pub audit_chain: Vec<AuditChainLinkV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_chain_state: Option<AuditChainStateV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_chain_anchor: Option<AuditChainAnchorV1>,
+    #[serde(default)]
     pub guest_registration_enabled: bool,
 }
 
@@ -126,6 +182,9 @@ impl Default for AuthState {
             sessions: Vec::new(),
             principal_root_protections: Vec::new(),
             audit: Vec::new(),
+            audit_chain: Vec::new(),
+            audit_chain_state: None,
+            audit_chain_anchor: None,
             guest_registration_enabled: false,
         }
     }
@@ -135,6 +194,12 @@ pub fn auth_state_path(data_dir: &Path) -> anyhow::Result<PathBuf> {
     rooted_localhost_fs_path(data_dir, AUTH_STATE_ROOT)
         .ok_or_else(|| anyhow!("invalid auth state root"))
         .map(|root| root.join(AUTH_STATE_FILE))
+}
+
+fn audit_chain_activation_path(data_dir: &Path) -> anyhow::Result<PathBuf> {
+    rooted_localhost_fs_path(data_dir, AUTH_STATE_ROOT)
+        .ok_or_else(|| anyhow!("invalid auth state root"))
+        .map(|root| root.join(AUDIT_CHAIN_REQUIRED_FILE))
 }
 
 fn auth_state_lock_path(data_dir: &Path) -> anyhow::Result<PathBuf> {
@@ -245,10 +310,101 @@ fn set_secret_file_permissions(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn audit_chain_activation_payload(activated_at: u64) -> anyhow::Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "schema": AUDIT_CHAIN_ACTIVATION_SCHEMA,
+        "activated_at": activated_at,
+    }))?)
+}
+
+fn load_audit_chain_activation(data_dir: &Path) -> anyhow::Result<Option<AuditChainActivationV1>> {
+    let path = audit_chain_activation_path(data_dir)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let activation: AuditChainActivationV1 = serde_json::from_slice(&std::fs::read(&path)?)
+        .with_context(|| format!("failed to parse audit chain activation record {path:?}"))?;
+    if activation.schema != AUDIT_CHAIN_ACTIVATION_SCHEMA {
+        anyhow::bail!("unsupported audit chain activation schema");
+    }
+    let (_, expected_did) = elastos_identity::load_or_create_did(data_dir)?;
+    if activation.signer_did != expected_did {
+        anyhow::bail!("audit chain activation signer is not the Runtime identity");
+    }
+    crate::crypto::verify_domain_separated_signature(
+        &activation.signer_did,
+        AUDIT_CHAIN_ACTIVATION_DOMAIN,
+        &audit_chain_activation_payload(activation.activated_at)?,
+        &activation.signature,
+    )
+    .context("audit chain activation signature is invalid")?;
+    Ok(Some(activation))
+}
+
+fn persist_audit_chain_activation(data_dir: &Path, activated_at: u64) -> anyhow::Result<()> {
+    if let Some(existing) = load_audit_chain_activation(data_dir)? {
+        if existing.activated_at != activated_at {
+            anyhow::bail!("audit chain activation changed unexpectedly");
+        }
+        return Ok(());
+    }
+    let path = audit_chain_activation_path(data_dir)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let (signing_key, signer_did) = elastos_identity::load_or_create_did(data_dir)?;
+    let (signature, _) = crate::crypto::domain_separated_sign(
+        &signing_key,
+        AUDIT_CHAIN_ACTIVATION_DOMAIN,
+        &audit_chain_activation_payload(activated_at)?,
+    );
+    let activation = AuditChainActivationV1 {
+        schema: AUDIT_CHAIN_ACTIVATION_SCHEMA.to_string(),
+        activated_at,
+        signer_did,
+        signature,
+    };
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&temp, serde_json::to_vec_pretty(&activation)?)?;
+    set_secret_file_permissions(&temp)?;
+    std::fs::rename(temp, path)?;
+    Ok(())
+}
+
 pub fn load_auth_state(data_dir: &Path) -> anyhow::Result<AuthState> {
+    let state = load_auth_state_unverified(data_dir)?.unwrap_or_default();
+    let activation = load_audit_chain_activation(data_dir)?;
+    match (state.audit_chain_state.as_ref(), activation.as_ref()) {
+        (Some(chain_state), Some(activation)) => {
+            if chain_state.activated_at != activation.activated_at {
+                anyhow::bail!("audit chain state does not match its activation record");
+            }
+        }
+        (Some(_), None) => {
+            anyhow::bail!("audit chain activation record is required");
+        }
+        (None, Some(_)) => {
+            anyhow::bail!("audit chain state is required after activation");
+        }
+        (None, None)
+            if !state.audit.is_empty()
+                || !state.audit_chain.is_empty()
+                || state.audit_chain_anchor.is_some() =>
+        {
+            anyhow::bail!(
+                "unchained audit history is unsupported; delete the Runtime auth state or restore a valid anchored audit chain"
+            );
+        }
+        (None, None) => {}
+    }
+    verify_audit_chain(data_dir, &state)?;
+    Ok(state)
+}
+
+fn load_auth_state_unverified(data_dir: &Path) -> anyhow::Result<Option<AuthState>> {
     let path = auth_state_path(data_dir)?;
     if !path.is_file() {
-        return Ok(AuthState::default());
+        return Ok(None);
     }
     let bytes = std::fs::read(&path).with_context(|| format!("failed to read {path:?}"))?;
     let mut state: AuthState = serde_json::from_slice(&bytes)
@@ -258,7 +414,11 @@ pub fn load_auth_state(data_dir: &Path) -> anyhow::Result<AuthState> {
     }
     normalize_principal_records(&mut state);
     prune_auth_state(&mut state, now_ts());
-    Ok(state)
+    Ok(Some(state))
+}
+
+pub fn verify_auth_audit_chain_ready(data_dir: &Path) -> anyhow::Result<()> {
+    load_auth_state(data_dir).map(|_| ())
 }
 
 pub(crate) fn save_auth_state(data_dir: &Path, state: &AuthState) -> anyhow::Result<()> {
@@ -277,6 +437,9 @@ pub(crate) fn save_auth_state(data_dir: &Path, state: &AuthState) -> anyhow::Res
     ));
     std::fs::write(&temp, serde_json::to_vec_pretty(state)?)?;
     std::fs::rename(temp, path)?;
+    if let Some(chain_state) = state.audit_chain_state.as_ref() {
+        persist_audit_chain_activation(data_dir, chain_state.activated_at)?;
+    }
     Ok(())
 }
 
@@ -869,7 +1032,7 @@ pub fn set_guest_registration_enabled(
     )?;
     mutate_auth_state(data_dir, |state| {
         state.guest_registration_enabled = enabled;
-        push_audit_event(state, event);
+        push_audit_event(data_dir, state, event)?;
         Ok(enabled)
     })
 }
@@ -1085,7 +1248,7 @@ fn ensure_recovered_root_reassignable_in_state(
 pub fn append_audit_event(data_dir: &Path, event: RuntimeAuditEventV1) -> anyhow::Result<()> {
     let event = sign_audit_event(data_dir, event)?;
     mutate_auth_state(data_dir, |state| {
-        push_audit_event(state, event);
+        push_audit_event(data_dir, state, event)?;
         Ok(())
     })
 }
@@ -1094,18 +1257,6 @@ pub fn sign_audit_event(
     data_dir: &Path,
     mut event: RuntimeAuditEventV1,
 ) -> anyhow::Result<RuntimeAuditEventV1> {
-    if event.signature.is_some() {
-        if event
-            .signer_did
-            .as_deref()
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
-        {
-            anyhow::bail!("signed audit event missing signer DID");
-        }
-        return Ok(event);
-    }
     let (signing_key, signer_did) = elastos_identity::load_or_create_did(data_dir)?;
     event.signer_did = Some(signer_did);
     event.signature = None;
@@ -1116,12 +1267,363 @@ pub fn sign_audit_event(
     Ok(event)
 }
 
-fn push_audit_event(state: &mut AuthState, event: RuntimeAuditEventV1) {
+fn push_audit_event(
+    data_dir: &Path,
+    state: &mut AuthState,
+    event: RuntimeAuditEventV1,
+) -> anyhow::Result<()> {
+    ensure_audit_chain_state(data_dir, state)?;
+    let link = sign_audit_chain_link(data_dir, state.audit_chain.last(), &event)?;
     state.audit.push(event);
-    if state.audit.len() > 512 {
-        let keep_from = state.audit.len() - 512;
-        state.audit.drain(0..keep_from);
+    state.audit_chain.push(link);
+    retain_audit_tail(data_dir, state, AUDIT_RETENTION_LIMIT)?;
+    state.audit_chain_state = Some(sign_audit_chain_state(
+        data_dir,
+        state
+            .audit_chain_state
+            .as_ref()
+            .map_or_else(now_ts, |chain_state| chain_state.activated_at),
+        state.audit_chain.last(),
+    )?);
+    Ok(())
+}
+
+fn ensure_audit_chain_state(data_dir: &Path, state: &mut AuthState) -> anyhow::Result<()> {
+    if state.audit_chain_state.is_some() {
+        verify_audit_chain(data_dir, state)?;
+        return Ok(());
     }
+    if !state.audit.is_empty()
+        || !state.audit_chain.is_empty()
+        || state.audit_chain_anchor.is_some()
+    {
+        anyhow::bail!(
+            "unchained audit history is unsupported; delete the Runtime auth state or restore a valid anchored audit chain"
+        );
+    }
+    state.audit_chain_state = Some(sign_audit_chain_state(
+        data_dir,
+        now_ts(),
+        state.audit_chain.last(),
+    )?);
+    Ok(())
+}
+
+fn retain_audit_tail(data_dir: &Path, state: &mut AuthState, limit: usize) -> anyhow::Result<()> {
+    if state.audit.len() <= limit {
+        return Ok(());
+    }
+    let keep_from = state.audit.len() - limit;
+    let predecessor = &state.audit_chain[keep_from - 1];
+    state.audit_chain_anchor = Some(sign_audit_chain_anchor(
+        data_dir,
+        predecessor.sequence,
+        &predecessor.chain_hash,
+    )?);
+    state.audit.drain(0..keep_from);
+    state.audit_chain.drain(0..keep_from);
+    Ok(())
+}
+
+fn sign_audit_chain_link(
+    data_dir: &Path,
+    previous: Option<&AuditChainLinkV1>,
+    event: &RuntimeAuditEventV1,
+) -> anyhow::Result<AuditChainLinkV1> {
+    let sequence = previous.map_or(1, |link| link.sequence.saturating_add(1));
+    let previous_hash = previous
+        .map(|link| link.chain_hash.clone())
+        .unwrap_or_else(|| AUDIT_CHAIN_GENESIS.to_string());
+    let event_hash = format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(serde_json::to_vec(event)?))
+    );
+    let chain_hash = audit_chain_hash(sequence, &event.event_id, &previous_hash, &event_hash)?;
+    let payload = audit_chain_signature_payload(
+        sequence,
+        &event.event_id,
+        &previous_hash,
+        &event_hash,
+        &chain_hash,
+    )?;
+    let (signing_key, signer_did) = elastos_identity::load_or_create_did(data_dir)?;
+    let (signature, _) =
+        crate::crypto::domain_separated_sign(&signing_key, AUDIT_CHAIN_DOMAIN, &payload);
+    Ok(AuditChainLinkV1 {
+        schema: AUDIT_CHAIN_SCHEMA.to_string(),
+        sequence,
+        event_id: event.event_id.clone(),
+        previous_hash,
+        event_hash,
+        chain_hash,
+        signer_did,
+        signature,
+    })
+}
+
+fn audit_chain_hash(
+    sequence: u64,
+    event_id: &str,
+    previous_hash: &str,
+    event_hash: &str,
+) -> anyhow::Result<String> {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "schema": AUDIT_CHAIN_SCHEMA,
+        "sequence": sequence,
+        "event_id": event_id,
+        "previous_hash": previous_hash,
+        "event_hash": event_hash,
+    }))?;
+    Ok(format!("sha256:{}", hex::encode(Sha256::digest(bytes))))
+}
+
+fn audit_chain_signature_payload(
+    sequence: u64,
+    event_id: &str,
+    previous_hash: &str,
+    event_hash: &str,
+    chain_hash: &str,
+) -> anyhow::Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "schema": AUDIT_CHAIN_SCHEMA,
+        "sequence": sequence,
+        "event_id": event_id,
+        "previous_hash": previous_hash,
+        "event_hash": event_hash,
+        "chain_hash": chain_hash,
+    }))?)
+}
+
+fn sign_audit_chain_state(
+    data_dir: &Path,
+    activated_at: u64,
+    head: Option<&AuditChainLinkV1>,
+) -> anyhow::Result<AuditChainStateV1> {
+    let head_sequence = head.map_or(0, |link| link.sequence);
+    let head_hash = head
+        .map(|link| link.chain_hash.clone())
+        .unwrap_or_else(|| AUDIT_CHAIN_GENESIS.to_string());
+    let payload = audit_chain_state_payload(activated_at, head_sequence, &head_hash)?;
+    let (signing_key, signer_did) = elastos_identity::load_or_create_did(data_dir)?;
+    let (signature, _) =
+        crate::crypto::domain_separated_sign(&signing_key, AUDIT_CHAIN_STATE_DOMAIN, &payload);
+    Ok(AuditChainStateV1 {
+        schema: AUDIT_CHAIN_STATE_SCHEMA.to_string(),
+        activated_at,
+        head_sequence,
+        head_hash,
+        signer_did,
+        signature,
+    })
+}
+
+fn audit_chain_state_payload(
+    activated_at: u64,
+    head_sequence: u64,
+    head_hash: &str,
+) -> anyhow::Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "schema": AUDIT_CHAIN_STATE_SCHEMA,
+        "activated_at": activated_at,
+        "head_sequence": head_sequence,
+        "head_hash": head_hash,
+    }))?)
+}
+
+fn sign_audit_chain_anchor(
+    data_dir: &Path,
+    sequence: u64,
+    chain_hash: &str,
+) -> anyhow::Result<AuditChainAnchorV1> {
+    let payload = audit_chain_anchor_payload(sequence, chain_hash)?;
+    let (signing_key, signer_did) = elastos_identity::load_or_create_did(data_dir)?;
+    let (signature, _) =
+        crate::crypto::domain_separated_sign(&signing_key, AUDIT_CHAIN_ANCHOR_DOMAIN, &payload);
+    Ok(AuditChainAnchorV1 {
+        schema: AUDIT_CHAIN_ANCHOR_SCHEMA.to_string(),
+        sequence,
+        chain_hash: chain_hash.to_string(),
+        signer_did,
+        signature,
+    })
+}
+
+fn audit_chain_anchor_payload(sequence: u64, chain_hash: &str) -> anyhow::Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "schema": AUDIT_CHAIN_ANCHOR_SCHEMA,
+        "sequence": sequence,
+        "chain_hash": chain_hash,
+    }))?)
+}
+
+fn verify_audit_event_signature(
+    event: &RuntimeAuditEventV1,
+    expected_runtime_did: &str,
+) -> anyhow::Result<()> {
+    if event.schema != RuntimeAuditEventV1::SCHEMA {
+        anyhow::bail!("unsupported audit event schema");
+    }
+    let signer_did = event
+        .signer_did
+        .as_deref()
+        .ok_or_else(|| anyhow!("audit event is missing its signer DID"))?;
+    if signer_did != expected_runtime_did {
+        anyhow::bail!("audit event signer is not the Runtime identity");
+    }
+    let signature = event
+        .signature
+        .as_deref()
+        .ok_or_else(|| anyhow!("audit event is missing its signature"))?;
+    let mut unsigned = event.clone();
+    unsigned.signature = None;
+    crate::crypto::verify_domain_separated_signature(
+        expected_runtime_did,
+        AUDIT_EVENT_DOMAIN,
+        &serde_json::to_vec(&unsigned)?,
+        signature,
+    )
+    .context("audit event signature is invalid")
+}
+
+fn require_runtime_audit_signer(
+    actual: &str,
+    expected_runtime_did: &str,
+    artifact: &str,
+) -> anyhow::Result<()> {
+    if actual != expected_runtime_did {
+        anyhow::bail!("{artifact} signer is not the Runtime identity");
+    }
+    Ok(())
+}
+
+fn verify_audit_chain(data_dir: &Path, state: &AuthState) -> anyhow::Result<()> {
+    if state.audit.is_empty()
+        && state.audit_chain.is_empty()
+        && state.audit_chain_state.is_none()
+        && state.audit_chain_anchor.is_none()
+    {
+        return Ok(());
+    }
+    let (_, expected_runtime_did) = elastos_identity::load_or_create_did(data_dir)?;
+    if let Some(chain_state) = state.audit_chain_state.as_ref() {
+        if chain_state.schema != AUDIT_CHAIN_STATE_SCHEMA {
+            anyhow::bail!("unsupported audit chain state schema");
+        }
+        require_runtime_audit_signer(
+            &chain_state.signer_did,
+            &expected_runtime_did,
+            "audit chain state",
+        )?;
+        let payload = audit_chain_state_payload(
+            chain_state.activated_at,
+            chain_state.head_sequence,
+            &chain_state.head_hash,
+        )?;
+        crate::crypto::verify_domain_separated_signature(
+            &expected_runtime_did,
+            AUDIT_CHAIN_STATE_DOMAIN,
+            &payload,
+            &chain_state.signature,
+        )
+        .context("audit chain state signature is invalid")?;
+        let (head_sequence, head_hash) = state
+            .audit_chain
+            .last()
+            .map(|link| (link.sequence, link.chain_hash.as_str()))
+            .unwrap_or((0, AUDIT_CHAIN_GENESIS));
+        if chain_state.head_sequence != head_sequence || chain_state.head_hash != head_hash {
+            anyhow::bail!("audit chain state does not match the persisted chain head");
+        }
+    } else if state.audit_chain_anchor.is_some() {
+        anyhow::bail!("audit chain anchor requires explicit chain state");
+    }
+    if state.audit_chain.is_empty() {
+        if !state.audit.is_empty() && state.audit_chain_state.is_some() {
+            anyhow::bail!("audit chain is required after activation");
+        }
+        return Ok(());
+    }
+    if state.audit_chain.len() != state.audit.len() {
+        anyhow::bail!("audit chain length does not match persisted audit events");
+    }
+    let protected_chain = state.audit_chain_state.is_some();
+    let anchor = state.audit_chain_anchor.as_ref();
+    if let Some(anchor) = anchor {
+        if anchor.schema != AUDIT_CHAIN_ANCHOR_SCHEMA {
+            anyhow::bail!("unsupported audit chain anchor schema");
+        }
+        require_runtime_audit_signer(
+            &anchor.signer_did,
+            &expected_runtime_did,
+            "audit chain anchor",
+        )?;
+        let payload = audit_chain_anchor_payload(anchor.sequence, &anchor.chain_hash)?;
+        crate::crypto::verify_domain_separated_signature(
+            &expected_runtime_did,
+            AUDIT_CHAIN_ANCHOR_DOMAIN,
+            &payload,
+            &anchor.signature,
+        )
+        .context("audit chain anchor signature is invalid")?;
+    }
+    let mut previous: Option<&AuditChainLinkV1> = None;
+    for (event, link) in state.audit.iter().zip(&state.audit_chain) {
+        verify_audit_event_signature(event, &expected_runtime_did)?;
+        if link.schema != AUDIT_CHAIN_SCHEMA || link.event_id != event.event_id {
+            anyhow::bail!("audit chain event binding is invalid");
+        }
+        require_runtime_audit_signer(&link.signer_did, &expected_runtime_did, "audit chain link")?;
+        if let Some(previous) = previous {
+            if link.sequence != previous.sequence.saturating_add(1)
+                || link.previous_hash != previous.chain_hash
+            {
+                anyhow::bail!("audit chain sequence is invalid");
+            }
+        } else if let Some(anchor) = anchor {
+            if link.sequence != anchor.sequence.saturating_add(1)
+                || link.previous_hash != anchor.chain_hash
+            {
+                anyhow::bail!("audit chain does not continue from its retained anchor");
+            }
+        } else if protected_chain
+            && (link.sequence != 1 || link.previous_hash != AUDIT_CHAIN_GENESIS)
+        {
+            anyhow::bail!("protected audit chain is missing its retained anchor");
+        } else if link.sequence == 1 && link.previous_hash != AUDIT_CHAIN_GENESIS {
+            anyhow::bail!("audit chain genesis is invalid");
+        }
+        let event_hash = format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(serde_json::to_vec(event)?))
+        );
+        if link.event_hash != event_hash
+            || link.chain_hash
+                != audit_chain_hash(
+                    link.sequence,
+                    &link.event_id,
+                    &link.previous_hash,
+                    &link.event_hash,
+                )?
+        {
+            anyhow::bail!("audit chain hash is invalid");
+        }
+        let payload = audit_chain_signature_payload(
+            link.sequence,
+            &link.event_id,
+            &link.previous_hash,
+            &link.event_hash,
+            &link.chain_hash,
+        )?;
+        crate::crypto::verify_domain_separated_signature(
+            &expected_runtime_did,
+            AUDIT_CHAIN_DOMAIN,
+            &payload,
+            &link.signature,
+        )
+        .context("audit chain signature is invalid")?;
+        previous = Some(link);
+    }
+    Ok(())
 }
 
 pub fn local_person_principal_id(proof_binding_id: &str) -> String {
@@ -1409,6 +1911,24 @@ mod tests {
     use super::*;
     use elastos_runtime::auth::PasskeyWebAuthnBinding;
 
+    fn test_audit_event(index: u64) -> RuntimeAuditEventV1 {
+        RuntimeAuditEventV1 {
+            schema: RuntimeAuditEventV1::SCHEMA.to_string(),
+            event_id: format!("audit:test:{index}"),
+            event_type: "test.audit".to_string(),
+            principal_id: Some("person:local:test".to_string()),
+            proof_binding_id: None,
+            session_id: Some("session:test".to_string()),
+            challenge_id: None,
+            capsule_id: Some("system".to_string()),
+            result: "allowed".to_string(),
+            reason: format!("test event {index}"),
+            occurred_at: index,
+            signer_did: None,
+            signature: None,
+        }
+    }
+
     fn passkey_binding(sign_count: u32, created_at: u64, last_used_at: u64) -> ProofBinding {
         passkey_binding_with_credential("credential-1", sign_count, created_at, last_used_at)
     }
@@ -1562,6 +2082,12 @@ mod tests {
 
         let state = load_auth_state(data_dir.path()).unwrap();
         assert_eq!(state.audit.len(), 2);
+        assert_eq!(state.audit_chain.len(), 2);
+        assert_eq!(state.audit_chain[0].sequence, 1);
+        assert_eq!(
+            state.audit_chain[1].previous_hash,
+            state.audit_chain[0].chain_hash
+        );
         assert!(state.audit.iter().all(|event| event
             .signer_did
             .as_deref()
@@ -1570,6 +2096,39 @@ mod tests {
             .signature
             .as_deref()
             .is_some_and(|signature| signature.len() == 128)));
+    }
+
+    #[test]
+    fn persisted_audit_events_are_always_runtime_signed() {
+        let data_dir = tempfile::tempdir().unwrap();
+        append_audit_event(
+            data_dir.path(),
+            RuntimeAuditEventV1 {
+                schema: RuntimeAuditEventV1::SCHEMA.to_string(),
+                event_id: "audit:foreign-claim".to_string(),
+                event_type: "test.foreign-claim".to_string(),
+                principal_id: None,
+                proof_binding_id: None,
+                session_id: None,
+                challenge_id: None,
+                capsule_id: Some("component-test".to_string()),
+                result: "claimed".to_string(),
+                reason: "guest-supplied claim".to_string(),
+                occurred_at: 1,
+                signer_did: Some("did:key:guest".to_string()),
+                signature: Some("guest-signature".to_string()),
+            },
+        )
+        .unwrap();
+
+        let state = load_auth_state(data_dir.path()).unwrap();
+        let event = state.audit.last().unwrap();
+        assert_ne!(event.signer_did.as_deref(), Some("did:key:guest"));
+        assert_ne!(event.signature.as_deref(), Some("guest-signature"));
+        assert!(event
+            .signer_did
+            .as_deref()
+            .is_some_and(|did| did.starts_with("did:key:")));
     }
 
     #[test]
@@ -1631,6 +2190,173 @@ mod tests {
             .filter(|event| event.event_type == "browser.chain_read.completed")
             .count();
         assert_eq!(read_events, 24);
+        assert_eq!(state.audit_chain.len(), state.audit.len());
+    }
+
+    #[test]
+    fn audit_chain_rejects_tampered_event_content() {
+        let data_dir = tempfile::tempdir().unwrap();
+        append_audit_event(
+            data_dir.path(),
+            RuntimeAuditEventV1 {
+                schema: RuntimeAuditEventV1::SCHEMA.to_string(),
+                event_id: "audit:tamper-test".to_string(),
+                event_type: "test.audit".to_string(),
+                principal_id: Some("person:local:test".to_string()),
+                proof_binding_id: None,
+                session_id: Some("session:test".to_string()),
+                challenge_id: None,
+                capsule_id: Some("system".to_string()),
+                result: "allowed".to_string(),
+                reason: "original".to_string(),
+                occurred_at: 1,
+                signer_did: None,
+                signature: None,
+            },
+        )
+        .unwrap();
+        let path = auth_state_path(data_dir.path()).unwrap();
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        state["audit"][0]["reason"] = serde_json::json!("tampered");
+        std::fs::write(path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+        let err = load_auth_state(data_dir.path()).unwrap_err();
+        assert!(err.to_string().contains("audit event signature is invalid"));
+    }
+
+    #[test]
+    fn audit_chain_activation_is_fail_closed() {
+        let data_dir = tempfile::tempdir().unwrap();
+        append_audit_event(data_dir.path(), test_audit_event(1)).unwrap();
+
+        let marker_path = audit_chain_activation_path(data_dir.path()).unwrap();
+        let marker = std::fs::read(&marker_path).unwrap();
+
+        std::fs::remove_file(&marker_path).unwrap();
+        let err = verify_auth_audit_chain_ready(data_dir.path()).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("audit chain activation record is required"));
+        std::fs::write(&marker_path, marker).unwrap();
+
+        let mut tampered = load_auth_state(data_dir.path()).unwrap();
+        tampered.audit_chain.clear();
+        save_auth_state(data_dir.path(), &tampered).unwrap();
+        let err = load_auth_state(data_dir.path()).unwrap_err().to_string();
+        assert!(err.contains("does not match the persisted chain head"));
+
+        let mut unchained = tampered;
+        unchained.audit_chain_state = None;
+        unchained.audit_chain_anchor = None;
+        std::fs::remove_file(&marker_path).unwrap();
+        save_auth_state(data_dir.path(), &unchained).unwrap();
+        let err = load_auth_state(data_dir.path()).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unchained audit history is unsupported"));
+    }
+
+    #[test]
+    fn audit_chain_rejects_foreign_signers_for_every_artifact() {
+        let data_dir = tempfile::tempdir().unwrap();
+        for index in 1..=3 {
+            append_audit_event(data_dir.path(), test_audit_event(index)).unwrap();
+        }
+        let mut state = load_auth_state(data_dir.path()).unwrap();
+        retain_audit_tail(data_dir.path(), &mut state, 2).unwrap();
+        let activated_at = state.audit_chain_state.as_ref().unwrap().activated_at;
+        state.audit_chain_state = Some(
+            sign_audit_chain_state(data_dir.path(), activated_at, state.audit_chain.last())
+                .unwrap(),
+        );
+        save_auth_state(data_dir.path(), &state).unwrap();
+        let state = load_auth_state(data_dir.path()).unwrap();
+        let foreign_dir = tempfile::tempdir().unwrap();
+        let (_, foreign_did) = elastos_identity::load_or_create_did(foreign_dir.path()).unwrap();
+
+        let activation_path = audit_chain_activation_path(data_dir.path()).unwrap();
+        let activation_bytes = std::fs::read(&activation_path).unwrap();
+        let mut foreign_activation: AuditChainActivationV1 =
+            serde_json::from_slice(&activation_bytes).unwrap();
+        foreign_activation.signer_did = foreign_did.clone();
+        std::fs::write(
+            &activation_path,
+            serde_json::to_vec_pretty(&foreign_activation).unwrap(),
+        )
+        .unwrap();
+        let err = load_auth_state(data_dir.path()).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("audit chain activation signer is not the Runtime identity"));
+        std::fs::write(&activation_path, activation_bytes).unwrap();
+
+        let mut foreign_event = state.clone();
+        foreign_event.audit[0].signer_did = Some(foreign_did.clone());
+        let err = verify_audit_chain(data_dir.path(), &foreign_event).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("audit event signer is not the Runtime identity"));
+
+        let mut foreign_link = state.clone();
+        foreign_link.audit_chain[0].signer_did = foreign_did.clone();
+        let err = verify_audit_chain(data_dir.path(), &foreign_link).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("audit chain link signer is not the Runtime identity"));
+
+        let mut foreign_anchor = state.clone();
+        foreign_anchor
+            .audit_chain_anchor
+            .as_mut()
+            .unwrap()
+            .signer_did = foreign_did.clone();
+        let err = verify_audit_chain(data_dir.path(), &foreign_anchor).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("audit chain anchor signer is not the Runtime identity"));
+
+        let mut foreign_state = state;
+        foreign_state.audit_chain_state.as_mut().unwrap().signer_did = foreign_did;
+        let err = verify_audit_chain(data_dir.path(), &foreign_state).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("audit chain state signer is not the Runtime identity"));
+    }
+
+    #[test]
+    fn retained_audit_chain_requires_its_signed_anchor() {
+        let data_dir = tempfile::tempdir().unwrap();
+        for index in 1..=3 {
+            append_audit_event(data_dir.path(), test_audit_event(index)).unwrap();
+        }
+
+        let mut state = load_auth_state(data_dir.path()).unwrap();
+        retain_audit_tail(data_dir.path(), &mut state, 2).unwrap();
+        let activated_at = state.audit_chain_state.as_ref().unwrap().activated_at;
+        state.audit_chain_state = Some(
+            sign_audit_chain_state(data_dir.path(), activated_at, state.audit_chain.last())
+                .unwrap(),
+        );
+        save_auth_state(data_dir.path(), &state).unwrap();
+
+        let retained = load_auth_state(data_dir.path()).unwrap();
+        let anchor = retained.audit_chain_anchor.as_ref().unwrap();
+        assert_eq!(anchor.sequence, 1);
+        assert_eq!(retained.audit_chain[0].sequence, 2);
+        assert_eq!(retained.audit_chain[0].previous_hash, anchor.chain_hash);
+
+        let mut truncated = retained;
+        truncated.audit.remove(0);
+        truncated.audit_chain.remove(0);
+        let activated_at = truncated.audit_chain_state.as_ref().unwrap().activated_at;
+        truncated.audit_chain_state = Some(
+            sign_audit_chain_state(data_dir.path(), activated_at, truncated.audit_chain.last())
+                .unwrap(),
+        );
+        save_auth_state(data_dir.path(), &truncated).unwrap();
+        let err = load_auth_state(data_dir.path()).unwrap_err().to_string();
+        assert!(err.contains("does not continue from its retained anchor"));
     }
 
     #[test]

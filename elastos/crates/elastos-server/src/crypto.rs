@@ -42,6 +42,28 @@ pub fn domain_separated_sign(
     (hex::encode(sig.to_bytes()), did)
 }
 
+pub fn verify_domain_separated_signature(
+    signer_did: &str,
+    domain: &str,
+    payload: &[u8],
+    signature_hex: &str,
+) -> anyhow::Result<()> {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(domain.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(payload);
+    let digest = hasher.finalize();
+    let verifying_key = decode_did_key(signer_did)?;
+    let signature = hex::decode(signature_hex)
+        .map_err(|err| anyhow::anyhow!("Invalid signature hex: {err}"))?;
+    let signature = ed25519_dalek::Signature::from_slice(&signature)
+        .map_err(|err| anyhow::anyhow!("Invalid Ed25519 signature: {err}"))?;
+    verifying_key
+        .verify(&digest, &signature)
+        .map_err(|_| anyhow::anyhow!("Domain-separated signature verification failed"))
+}
+
 /// Verify a signed JSON envelope `{ payload, signature, signer_did }`.
 /// The `domain` is the domain separator used when signing.
 /// Returns the parsed JSON value and signer DID on success.

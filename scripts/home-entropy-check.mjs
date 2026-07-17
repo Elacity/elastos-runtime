@@ -899,6 +899,9 @@ const gatewayBrowserApi = readAll([
 const authGatewayApi = read(
   "elastos/crates/elastos-server/src/api/auth_gateway.rs",
 );
+const gatewayServerApi = read(
+  "elastos/crates/elastos-server/src/api/gateway_server.rs",
+);
 const recoveryKitLiveSmoke = read("scripts/recovery-kit-live-smoke.sh");
 const browserCapsulesApi = read(
   "elastos/crates/elastos-server/src/api/browser_capsules.rs",
@@ -2893,6 +2896,7 @@ const availabilityProvider = read("capsules/availability-provider/src/main.rs");
 const webspaceProvider = read("capsules/webspace-provider/src/main.rs");
 const webspaceCmd = read("elastos/crates/elastos-server/src/webspace_cmd.rs");
 const serverMain = read("elastos/crates/elastos-server/src/main.rs");
+const gatewayCmd = read("elastos/crates/elastos-server/src/gateway_cmd.rs");
 const providerRegistry = read("elastos/crates/elastos-runtime/src/provider/registry.rs");
 const libraryDesktopIcon = read("capsules/library/browser/icons/sidebar-folder-desktop.svg");
 const libraryMenuSmoke = read("scripts/library-menu-smoke.mjs");
@@ -2977,6 +2981,31 @@ const walletProviderDoc = read("docs/WALLET_PROVIDER.md");
 const systemAssetVersion = "system-20260712a";
 const shellAuth = read("capsules/home/browser/shell-auth.js");
 const protectedHomeStateSmoke = read("scripts/protected-home-state-smoke.sh");
+const auditChainBoundary = {
+  startupOnlyVerifies: gatewayServerApi.includes("verify_auth_audit_chain_ready") &&
+    !gatewayServerApi.includes("migrate_auth_audit_chain"),
+  gatewayPreflightsBeforeProviders: (gatewayCmd.match(/verify_auth_audit_chain_ready/g) || []).length === 2 &&
+    !gatewayCmd.includes("migrate_auth_audit_chain"),
+  noAuditHistoryConversion: !serverMain.includes("MigrateChain") &&
+    !serverMain.includes("migrate-chain") &&
+    !runtimeAuth.includes("migrate_auth_audit_chain"),
+  chainArtifactsUseRuntimeIdentity: runtimeAuth.includes("verify_audit_event_signature") &&
+    runtimeAuth.includes("require_runtime_audit_signer") &&
+    runtimeAuth.includes("audit chain activation signer is not the Runtime identity") &&
+    runtimeAuth.includes("audit event signer is not the Runtime identity") &&
+    runtimeAuth.includes("audit chain link signer is not the Runtime identity") &&
+    runtimeAuth.includes("audit chain anchor signer is not the Runtime identity") &&
+    runtimeAuth.includes("audit chain state signer is not the Runtime identity"),
+  unchainedHistoryFailsClosed: runtimeAuth.includes("unchained audit history is unsupported") &&
+    runtimeAuth.includes("audit chain activation record is required"),
+  regressionCoverage: runtimeAuth.includes("audit_chain_rejects_foreign_signers_for_every_artifact") &&
+    runtimeAuth.includes("audit_chain_activation_is_fail_closed"),
+};
+assert(
+  Object.values(auditChainBoundary).every(Boolean),
+  "Audit history must bind every artifact to the local Runtime DID and reject unchained history without a conversion path",
+  auditChainBoundary,
+);
 assert(
   !documents.includes("home:open-uri"),
   "Documents published URI sharing must copy the elastos:// link, not reopen itself",
