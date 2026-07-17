@@ -11,9 +11,9 @@
   --muted: var(--el-muted);
   --brand: var(--el-brand);
   --brand-soft: rgba(246, 146, 26, 0.16);
-  --accent: #7d95f0;
-  --accent-soft: rgba(125, 149, 240, 0.16);
-  --accent-deep: #aebfff;
+  --accent: var(--el-accent);
+  --accent-soft: var(--el-accent-soft);
+  --accent-deep: var(--el-accent-strong);
   --danger: var(--el-danger);
   --self: rgba(246, 146, 26, 0.14);
   --shadow: var(--el-shadow-2);
@@ -27,9 +27,6 @@
   color-scheme: light;
   --bg-strong: #e3e9fb;
   --brand-soft: #fff1dc;
-  --accent: #5f76d8;
-  --accent-soft: #e8edff;
-  --accent-deep: #3c53a7;
   --danger: #b14c5a;
   --self: #edf2ff;
 }

@@ -77,6 +77,47 @@
   --el-dur-4: 220ms;
   --el-dur-exit: 150ms;
   --el-ease: cubic-bezier(0.2, 0, 0, 1);
+
+  /* System accent — ONE accent, chosen by the user in System > Personalization
+     (macOS model), obeyed by every app. Selected via data-el-accent on <html>
+     (absence = blue). Apps consume the derived tones and never define their own
+     accent colors. */
+  --el-accent: #0a84ff;
+  --el-accent-ink: #ffffff;
+  --el-accent-strong: color-mix(in srgb, var(--el-accent) 78%, #ffffff);
+  --el-accent-soft: color-mix(in srgb, var(--el-accent) 22%, transparent);
+  --el-accent-faint: color-mix(in srgb, var(--el-accent) 11%, transparent);
+}
+
+/* The eight macOS accents. Yellow and orange carry dark ink on filled controls. */
+:root[data-el-accent="purple"] {
+  --el-accent: #bf5af2;
+}
+
+:root[data-el-accent="pink"] {
+  --el-accent: #ff375f;
+}
+
+:root[data-el-accent="red"] {
+  --el-accent: #ff453a;
+}
+
+:root[data-el-accent="orange"] {
+  --el-accent: #f6921a;
+  --el-accent-ink: #161616;
+}
+
+:root[data-el-accent="yellow"] {
+  --el-accent: #ffd60a;
+  --el-accent-ink: #161616;
+}
+
+:root[data-el-accent="green"] {
+  --el-accent: #30b84f;
+}
+
+:root[data-el-accent="graphite"] {
+  --el-accent: #8e8e93;
 }
 
 /* Light theme: dark is the default (no attribute); the shell sets
@@ -105,6 +146,10 @@
   --el-shadow-1: 0 2px 10px rgba(34, 49, 88, 0.1);
   --el-shadow-2: 0 12px 28px rgba(34, 49, 88, 0.12);
   --el-shadow-3: 0 24px 80px rgba(34, 49, 88, 0.16);
+
+  /* "Strong" means higher contrast against the CURRENT background: lighter on
+     dark, deeper on light. */
+  --el-accent-strong: color-mix(in srgb, var(--el-accent) 72%, #1d2438);
 }
 
 /* App base: opt in by putting .el-app on <body>. Dark shell surface, shared

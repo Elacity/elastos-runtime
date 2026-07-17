@@ -236,6 +236,33 @@ function configureThemeSegment() {
   }
   window.addEventListener("storage", sync);
   sync();
+  configureAccentPicker();
+}
+
+/* Accent rides the same vendored runtime as theme: one localStorage key,
+   storage events fan the change out to the shell and every open app frame. */
+function configureAccentPicker() {
+  const picker = document.querySelector("#accent-picker");
+  if (!picker || !window.elastosTheme || !window.elastosTheme.setAccent) {
+    return;
+  }
+  const dots = picker.querySelectorAll("[data-accent-option]");
+  const sync = () => {
+    const accent = window.elastosTheme.accent();
+    for (const dot of dots) {
+      const selected = dot.dataset.accentOption === accent;
+      dot.classList.toggle("active", selected);
+      dot.setAttribute("aria-checked", selected ? "true" : "false");
+    }
+  };
+  for (const dot of dots) {
+    dot.addEventListener("click", () => {
+      window.elastosTheme.setAccent(dot.dataset.accentOption);
+      sync();
+    });
+  }
+  window.addEventListener("storage", sync);
+  sync();
 }
 
 function configureGuestAccess() {

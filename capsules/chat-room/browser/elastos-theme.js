@@ -5,16 +5,31 @@
  * next to elastos-ui.css. Everything is served same-origin from the gateway,
  * so localStorage is the one canonical store (mirrors PC2's approach):
  *
- *   localStorage["elastos.ui.theme"] = "dark" | "light" | "auto"
+ *   localStorage["elastos.ui.theme"]  = "dark" | "light" | "auto"
+ *   localStorage["elastos.ui.accent"] = "blue" | "purple" | "pink" | "red" |
+ *                                       "orange" | "yellow" | "green" | "graphite"
  *
- * Dark is the default when unset. "auto" follows prefers-color-scheme.
- * The resolved theme is applied as data-el-theme="light" on <html> (absence
- * means dark), which activates the light token block in elastos-ui.css.
- * Cross-document sync is the browser's own `storage` event — no shell
- * messaging required, and sandboxed app frames (allow-same-origin) see it.
+ * Dark is the default theme when unset; blue is the default accent. "auto"
+ * follows prefers-color-scheme. The resolved theme is applied as
+ * data-el-theme="light" on <html> (absence means dark); the accent as
+ * data-el-accent (absence means blue) — both activate token blocks in
+ * elastos-ui.css. Cross-document sync is the browser's own `storage` event —
+ * no shell messaging required, and sandboxed app frames (allow-same-origin)
+ * see it.
  */
 (function () {
   const KEY = "elastos.ui.theme";
+  const ACCENT_KEY = "elastos.ui.accent";
+  const ACCENTS = [
+    "blue",
+    "purple",
+    "pink",
+    "red",
+    "orange",
+    "yellow",
+    "green",
+    "graphite",
+  ];
   const media = window.matchMedia
     ? window.matchMedia("(prefers-color-scheme: light)")
     : null;
@@ -38,18 +53,36 @@
     return pref;
   }
 
+  function accentPreference() {
+    try {
+      const value = localStorage.getItem(ACCENT_KEY);
+      if (ACCENTS.includes(value)) {
+        return value;
+      }
+    } catch (_error) {
+      // Storage may be unavailable; fall through to the default.
+    }
+    return "blue";
+  }
+
   function apply() {
     if (resolve(preference()) === "light") {
       document.documentElement.setAttribute("data-el-theme", "light");
     } else {
       document.documentElement.removeAttribute("data-el-theme");
     }
+    const accent = accentPreference();
+    if (accent === "blue") {
+      document.documentElement.removeAttribute("data-el-accent");
+    } else {
+      document.documentElement.setAttribute("data-el-accent", accent);
+    }
   }
 
   apply();
 
   window.addEventListener("storage", (event) => {
-    if (event.key === KEY || event.key === null) {
+    if (event.key === KEY || event.key === ACCENT_KEY || event.key === null) {
       apply();
     }
   });
@@ -69,6 +102,17 @@
       const pref = value === "light" || value === "auto" ? value : "dark";
       try {
         localStorage.setItem(KEY, pref);
+      } catch (_error) {
+        // Applying still works for this document.
+      }
+      apply();
+    },
+    accents: ACCENTS.slice(),
+    accent: accentPreference,
+    setAccent(value) {
+      const accent = ACCENTS.includes(value) ? value : "blue";
+      try {
+        localStorage.setItem(ACCENT_KEY, accent);
       } catch (_error) {
         // Applying still works for this document.
       }

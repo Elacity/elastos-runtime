@@ -14,13 +14,13 @@
   --panel-2:var(--el-inset); --panel-3:rgba(255,255,255,.1);
   --line:var(--el-hairline); --line-2:var(--el-hairline-strong);
   --ink:var(--el-text); --ink-2:var(--el-muted); --mut:var(--el-muted); --mut-2:var(--el-soft);
-  /* brand: ElastOS orange. Orange is a LIGHT fill, so on-accent text stays DARK. */
-  --acc:var(--el-brand); --acc-press:color-mix(in srgb,var(--el-brand) 82%,#000);
-  --acc-soft:color-mix(in srgb,var(--el-brand) 16%,transparent); --acc2:var(--el-brand-strong); --on-acc:var(--el-bg);
+  /* accent: the ONE system accent (System > Personalization), same as every app. */
+  --acc:var(--el-accent); --acc-press:color-mix(in srgb,var(--el-accent) 82%,#000);
+  --acc-soft:var(--el-accent-soft); --acc2:var(--el-accent-strong); --on-acc:var(--el-accent-ink);
   --gold:var(--el-brand-strong); --vivid:#fdecb6; --brand-ink:#131a22;
   --ok:var(--el-ok); --warn:#fbbf24; --bad:var(--el-danger);
-  --chip:color-mix(in srgb,var(--el-brand) 12%,transparent); --chip-ink:var(--el-brand-strong);
-  --chip-line:color-mix(in srgb,var(--el-brand) 32%,transparent);
+  --chip:var(--el-accent-faint); --chip-ink:var(--el-accent-strong);
+  --chip-line:color-mix(in srgb,var(--el-accent) 32%,transparent);
   /* type ramp (1.20 minor third) */
   --f:var(--el-font);
   --fxs:11.5px; --fsm:12.5px; --fbase:14.5px; --flg:16px; --fxl:19px; --f2xl:23px; --f3xl:31px;
@@ -41,9 +41,9 @@
   color-scheme:light;
   --bg:#f7f8fa; --bg-elev:#fff; --panel:#fff; --panel-2:#f1f3f6; --panel-3:#e9edf2;
   --line:#e4e8ee; --line-2:#d7dde5; --ink:#0e131a; --ink-2:#2c3340; --mut:#5b6573; --mut-2:#838c98;
-  /* light: turquoise is too light to read as text/fill on a light bg, so the accent deepens to a teal that
-     stays AA both as accent-text and as a white-text fill (dark theme keeps the vivid turquoise). */
-  --acc:#0a7370; --acc-press:#086460; --on-acc:#fff; --acc-soft:#e0f5f4; --chip:#e0f5f4; --chip-ink:#0a6360; --chip-line:#bfe9e7;
+  /* light: same system accent; --el-accent-strong flips to its deep-ink variant
+     via elastos-ui.css, keeping chip text AA on light tints. */
+  --chip-ink:var(--el-accent-strong);
   --warn:#b45309;
   --e1:0 1px 2px rgba(20,30,50,.05); --e2:0 1px 2px rgba(20,30,50,.06),0 8px 22px rgba(20,30,50,.08);
   --e3:0 2px 6px rgba(20,30,50,.08),0 18px 44px rgba(20,30,50,.12); --ring:0 0 0 2px var(--bg),0 0 0 4px var(--acc);

@@ -728,16 +728,181 @@ img {
   display: none;
 }
 
+/* The clock is a button (macOS: the clock opens Notification Center), but it
+   must still read as plain bar text — no chrome until hover. */
 .toolbar-clock {
   margin-left: 10px;
   margin-right: 0;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
   color: var(--text);
+  font-family: inherit;
   font-size: 13px;
   font-weight: 500;
   line-height: 22px;
   white-space: nowrap;
   opacity: 0.9;
   font-variant-numeric: tabular-nums;
+  cursor: default;
+}
+
+.toolbar-clock:hover,
+.toolbar-clock[aria-expanded="true"] {
+  background: var(--lift);
+  opacity: 1;
+}
+
+/* Notification Center: the memory behind the toast. Slides in under the bar
+   at the right edge, same frosted material as the other bar menus. */
+.notification-center {
+  position: fixed;
+  top: calc(var(--stage-top) + 8px);
+  right: 8px;
+  z-index: 100120;
+  display: flex;
+  flex-direction: column;
+  width: min(340px, calc(100vw - 16px));
+  max-height: calc(100dvh - var(--stage-top) - var(--stage-bottom) - 24px);
+  padding: 10px;
+  border-radius: 14px;
+  background: var(--menu-fill);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-soft);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  outline: none;
+  animation: notification-center-enter 140ms cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+.notification-center[hidden] {
+  display: none;
+}
+
+@keyframes notification-center-enter {
+  from {
+    opacity: 0;
+    transform: translateX(12px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .notification-center {
+    animation: none;
+  }
+}
+
+.notification-center-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 6px 8px;
+}
+
+.notification-center-title {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.notification-center-clear {
+  padding: 3px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.notification-center-clear:hover {
+  background: var(--lift);
+  color: var(--text);
+}
+
+.notification-center-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  gap: 6px;
+}
+
+.notification-center-section {
+  margin: 6px 6px 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.notification-center-item {
+  display: block;
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-soft);
+  color: var(--text);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 120ms ease;
+}
+
+.notification-center-item:hover {
+  background: var(--lift);
+}
+
+.notification-center-item-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.notification-center-item-title {
+  overflow: hidden;
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.notification-center-item-time {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.notification-center-item-body {
+  margin: 3px 0 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.notification-center-empty {
+  margin: 0;
+  padding: 22px 0 18px;
+  color: var(--muted);
+  font-size: 12.5px;
+  text-align: center;
 }
 
 .desktop-workspace {
@@ -2086,11 +2251,28 @@ body.dragging-target {
   filter: none;
 }
 
+/* Traffic lights (macOS): close · minimize · zoom on the LEFT, color-coded
+   12px dots. Symbols stay hidden until the group is hovered or focused —
+   exactly the macOS reveal. The balance spacer mirrors the group's width so
+   the title centers optically in the bar. */
+.window-traffic-lights {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
+}
+
+.window-head-balance {
+  flex: 0 0 68px;
+}
+
 .window-head-draggable {
   flex-grow: 1;
   min-width: 0;
   display: flex;
   align-items: center;
+  justify-content: center;
   overflow: hidden;
   cursor: default;
 }
@@ -2119,31 +2301,54 @@ body.dragging-target {
 }
 
 .window-action-btn {
-  width: 26px;
-  height: 26px;
-  flex: 0 0 26px;
-  margin-left: 0;
+  width: 12px;
+  height: 12px;
+  flex: 0 0 12px;
+  margin: 0;
+  padding: 0;
   display: grid;
   place-items: center;
-  border-radius: 6px;
+  border: 0.5px solid rgba(0, 0, 0, 0.18);
+  border-radius: 50%;
   cursor: pointer;
-  opacity: 0.86;
-  transition: background-color 0.18s ease, opacity 0.18s ease;
+}
+
+.window-action-btn[data-action="close"] {
+  background-color: #ff5f57;
+}
+
+.window-action-btn[data-action="minimize"] {
+  background-color: #febc2e;
+}
+
+.window-action-btn[data-action="maximize"] {
+  background-color: #28c840;
 }
 
 .window-action-btn img {
-  width: 11px;
-  height: 11px;
-  filter: invert(1) brightness(1.05);
+  width: 7px;
+  height: 7px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
 }
 
-:root[data-el-theme="light"] .window-action-btn img {
-  filter: none;
+.window-traffic-lights:hover .window-action-btn img,
+.window-traffic-lights:focus-within .window-action-btn img {
+  opacity: 0.6;
 }
 
-.window-action-btn:hover {
-  background-color: var(--lift);
-  opacity: 1;
+/* Inactive window: the dots go neutral (macOS); hovering the group restores
+   color even before the window is focused. */
+.window:not(.window-active) .window-traffic-lights:not(:hover):not(:focus-within) .window-action-btn {
+  background-color: rgba(255, 255, 255, 0.24);
+  border-color: rgba(0, 0, 0, 0.1);
+}
+
+:root[data-el-theme="light"]
+  .window:not(.window-active)
+  .window-traffic-lights:not(:hover):not(:focus-within)
+  .window-action-btn {
+  background-color: rgba(29, 36, 56, 0.18);
 }
 
 .window-body {

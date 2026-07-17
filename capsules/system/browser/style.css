@@ -426,6 +426,80 @@ code {
   outline-offset: 1px;
 }
 
+/* Accent picker: the macOS row of color dots. Selected dot gets a ring in its
+   own color; the swatch colors are fixed samples of the accent palette (the
+   live token would make every dot the same color). */
+.system-accent-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.system-accent-dot {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid rgba(0, 0, 0, 0.25);
+  border-radius: 50%;
+  cursor: pointer;
+  transition: transform 120ms var(--el-ease);
+}
+
+.system-accent-dot:hover {
+  transform: scale(1.15);
+}
+
+.system-accent-dot.active {
+  box-shadow:
+    0 0 0 2px var(--el-surface-raised),
+    0 0 0 4px currentColor;
+}
+
+.system-accent-dot:focus-visible {
+  outline: 2px solid var(--el-focus);
+  outline-offset: 2px;
+}
+
+.system-accent-dot[data-accent-option="blue"] {
+  background: #0a84ff;
+  color: #0a84ff;
+}
+
+.system-accent-dot[data-accent-option="purple"] {
+  background: #bf5af2;
+  color: #bf5af2;
+}
+
+.system-accent-dot[data-accent-option="pink"] {
+  background: #ff375f;
+  color: #ff375f;
+}
+
+.system-accent-dot[data-accent-option="red"] {
+  background: #ff453a;
+  color: #ff453a;
+}
+
+.system-accent-dot[data-accent-option="orange"] {
+  background: #f6921a;
+  color: #f6921a;
+}
+
+.system-accent-dot[data-accent-option="yellow"] {
+  background: #ffd60a;
+  color: #ffd60a;
+}
+
+.system-accent-dot[data-accent-option="green"] {
+  background: #30b84f;
+  color: #30b84f;
+}
+
+.system-accent-dot[data-accent-option="graphite"] {
+  background: #8e8e93;
+  color: #8e8e93;
+}
+
 .system-switch input {
   position: absolute;
   width: 1px;

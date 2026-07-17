@@ -703,7 +703,11 @@ function createWindow({ id, title, x, y, width, height, tone, glyphTarget }) {
   });
 
   const handle = node.querySelector(".window-head");
-  handle.addEventListener("dblclick", () => {
+  handle.addEventListener("dblclick", (event) => {
+    // Double-clicking the traffic lights is two button presses, not a zoom.
+    if (event.target.closest("button")) {
+      return;
+    }
     toggleWindowMaximize(id);
   });
   attachWindowDrag(node, handle, focusWindow, persistBrowserSession);

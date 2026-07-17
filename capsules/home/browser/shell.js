@@ -75,6 +75,10 @@ import {
 } from "./shell-auth.js?v=home-20260701c";
 import { handleDesktopArrowKey } from "./shell-keyboard.js?v=home-20260701c";
 import { showSpotlight } from "./shell-spotlight.js?v=home-20260701c";
+import {
+  bindNotificationCenter,
+  recordNotifications,
+} from "./shell-notifications.js?v=home-20260701c";
 
 configureWindowHooks({
   clearIdentitySurface,
@@ -256,6 +260,8 @@ closeLauncherButton.addEventListener("click", () => {
 document.querySelector("#toolbar-spotlight")?.addEventListener("click", () => {
   showSpotlight();
 });
+
+bindNotificationCenter();
 
 /* Grid/list view for the launcher (macOS Apps panel view control). The
    preference is a pure browser concern, so localStorage — same store the
@@ -826,6 +832,7 @@ async function refreshShellSummary({ initialize = false } = {}) {
   syncAppearance(summary);
   renderInboxBadge(summary);
   maybeShowWalletApprovalToast(previous, summary);
+  recordNotifications(summary);
   refreshHomeInternalWindows(summary);
   if (homeSummarySignedIn(summary)) {
     ensureHomeEventChannel();

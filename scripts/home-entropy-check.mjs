@@ -710,9 +710,9 @@ for (const [token, value] of new Map([
   ["--muted", "var(--el-muted)"],
   ["--brand", "var(--el-brand)"],
   ["--brand-soft", "rgba(246, 146, 26, 0.16)"],
-  ["--accent", "#7d95f0"],
-  ["--accent-soft", "rgba(125, 149, 240, 0.16)"],
-  ["--accent-deep", "#aebfff"],
+  ["--accent", "var(--el-accent)"],
+  ["--accent-soft", "var(--el-accent-soft)"],
+  ["--accent-deep", "var(--el-accent-strong)"],
   ["--danger", "var(--el-danger)"],
 ])) {
   assertToken(chatRoomTokensStyle, "capsules/chat-room/browser/style.css", token, value);
@@ -731,9 +731,9 @@ for (const [token, value] of new Map([
   ["--muted", "var(--el-muted)"],
   ["--brand", "var(--el-brand)"],
   ["--brand-soft", "rgba(246, 146, 26, 0.16)"],
-  ["--accent", "#7d95f0"],
-  ["--accent-soft", "rgba(125, 149, 240, 0.16)"],
-  ["--accent-deep", "#aebfff"],
+  ["--accent", "var(--el-accent)"],
+  ["--accent-soft", "var(--el-accent-soft)"],
+  ["--accent-deep", "var(--el-accent-strong)"],
   ["--danger", "var(--el-danger)"],
 ])) {
   assertToken(documentsIndex, "capsules/documents/browser/index.html", token, value);
@@ -751,8 +751,8 @@ for (const [token, value] of new Map([
   ["--ink", "var(--el-text)"],
   ["--muted", "var(--el-muted)"],
   ["--brand", "var(--el-brand)"],
-  ["--accent", "#6ab0ff"],
-  ["--accent-soft", "rgba(106, 176, 255, 0.16)"],
+  ["--accent", "var(--el-accent)"],
+  ["--accent-soft", "var(--el-accent-soft)"],
 ])) {
   assertToken(inboxStyle, "capsules/inbox/browser/index.html", token, value);
 }
@@ -785,7 +785,7 @@ for (const [token, value] of new Map([
   ["--ink", "var(--el-text)"],
   ["--muted", "var(--el-muted)"],
   ["--brand", "var(--el-brand)"],
-  ["--accent", "#6ab0ff"],
+  ["--accent", "var(--el-accent)"],
 ])) {
   assertToken(libraryStyle, "capsules/library/browser/library.css", token, value);
 }
