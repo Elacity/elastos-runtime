@@ -2,17 +2,13 @@ import {
   clockNode,
   toolbarHomeButton,
   toolbarSystem,
-  toolbarIdentity,
-  toolbarIdentityAvatar,
-  toolbarIdentityName,
   toolbarIdentityMenu,
   toolbarIdentityMenuName,
 } from "./shell-core.js?v=home-20260718n";
 
 /* System chrome: the ElastOS brand at the far left of the bar is the system
    menu (the macOS Apple-menu position) — show desktop, fullscreen, System,
-   sign out, headed by the signed-in principal. The avatar + name on the right
-   is a passive identity indicator. Data comes from the home summary; the name
+   sign out, headed by the signed-in principal from the home summary. The name
    is always rendered as textContent — never HTML. */
 
 function summaryDisplayName(summary) {
@@ -24,7 +20,7 @@ function summaryDisplayName(summary) {
 }
 
 export function syncIdentity(summary) {
-  if (!toolbarIdentity) {
+  if (!toolbarIdentityMenuName) {
     return;
   }
   const signedIn = Boolean(summary?.authority?.signed_in);
@@ -32,23 +28,15 @@ export function syncIdentity(summary) {
     clearIdentitySurface();
     return;
   }
-  const name = summaryDisplayName(summary);
-  toolbarIdentityName.textContent = name;
-  toolbarIdentityMenuName.textContent = name;
-  toolbarIdentityAvatar.textContent = [...name][0].toUpperCase();
-  toolbarIdentity.setAttribute("aria-label", `Signed in as ${name}`);
-  toolbarIdentity.hidden = false;
+  toolbarIdentityMenuName.textContent = summaryDisplayName(summary);
 }
 
 export function clearIdentitySurface() {
-  if (!toolbarIdentity) {
+  if (!toolbarIdentityMenuName) {
     return;
   }
   closeIdentityMenu({ restoreFocus: false });
-  toolbarIdentity.hidden = true;
-  toolbarIdentityName.textContent = "";
   toolbarIdentityMenuName.textContent = "";
-  toolbarIdentityAvatar.textContent = "";
 }
 
 /* Disclosure menu behavior (APG menu-button pattern): click or ArrowDown opens

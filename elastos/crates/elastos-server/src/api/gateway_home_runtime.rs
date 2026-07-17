@@ -336,6 +336,14 @@ pub(super) async fn launch_runtime_backed_home_target(
         return None;
     }
 
+    // Web projections are gateway-served surfaces: the launch route below is
+    // their canonical open path and there is no runtime process to start.
+    // The runtime itself refuses plain Wasm capsules (fail-closed), so
+    // forwarding them would only ever produce a launch error.
+    if manifest.execution.as_ref() == Some(&elastos_common::CapsuleExecution::WebProjection) {
+        return None;
+    }
+
     let runtime_capsule_dir =
         match materialize_source_wasm_capsule_for_runtime(data_dir, &capsule_dir, &manifest) {
             Ok(path) => path,
