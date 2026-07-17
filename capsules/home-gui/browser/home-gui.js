@@ -13,6 +13,7 @@ import {
   shellState,
   taskbarTargets,
   toolbarFullscreenButton,
+  toolbarHomeButton,
   identityMenuShowDesktopButton,
   toolbarInboxButton,
   toolbarSignOutButton,
@@ -71,6 +72,7 @@ import {
   bindShellKeyboard,
   handleDesktopArrowKey,
   retireKeyboardSurfaces,
+  toggleShortcutsOverlay,
 } from "./shell-keyboard.js?v=home-20260717b";
 import {
   bindSpotlight,
@@ -124,6 +126,7 @@ const HOME_GUI_HOST_SELECTORS = Object.freeze([
   "#window-switcher",
   "#quick-look",
   "#shortcuts-overlay",
+  "#about-overlay",
 ]);
 let homeGuiInteractionsBound = false;
 
@@ -189,6 +192,7 @@ export function retireHomeGuiSurface(options = {}) {
   hideSpotlight({ restoreFocus: false });
   hideNotificationCenter();
   hideControlCentre({ restoreFocus: false });
+  hideAboutOverlay({ restoreFocus: false });
   hideQuickLook();
   closeExpose();
   retireKeyboardSurfaces();
@@ -528,6 +532,77 @@ function fullscreenApi() {
   return { root, request, exit };
 }
 
+/* About ElastOS: the smallest honest dialog — logo, product name, which
+   shell this is, who is signed in. No version claims the shell cannot
+   verify from runtime facts. */
+let aboutOverlayBound = false;
+
+function aboutOverlayNode() {
+  return document.querySelector("#about-overlay");
+}
+
+function showAboutOverlay() {
+  const overlay = aboutOverlayNode();
+  if (!overlay) {
+    return;
+  }
+  const identityLine = overlay.querySelector("#about-identity");
+  if (identityLine) {
+    const name = document.querySelector("#toolbar-identity-menu-name")?.textContent?.trim();
+    identityLine.textContent = name ? `Signed in as ${name}` : "";
+    identityLine.hidden = !name;
+  }
+  overlay.hidden = false;
+  overlay.inert = false;
+  overlay.setAttribute("aria-hidden", "false");
+  overlay.querySelector("#about-close")?.focus();
+}
+
+function hideAboutOverlay({ restoreFocus = true } = {}) {
+  const overlay = aboutOverlayNode();
+  if (!overlay || overlay.hidden) {
+    return;
+  }
+  overlay.hidden = true;
+  overlay.inert = true;
+  overlay.setAttribute("aria-hidden", "true");
+  if (restoreFocus) {
+    toolbarHomeButton?.focus();
+  }
+}
+
+function bindAboutOverlay() {
+  if (aboutOverlayBound) {
+    return;
+  }
+  aboutOverlayBound = true;
+  document.querySelector("#identity-menu-about")?.addEventListener("click", () => {
+    showAboutOverlay();
+  });
+  const overlay = aboutOverlayNode();
+  if (!overlay) {
+    return;
+  }
+  overlay.querySelector("#about-close")?.addEventListener("click", () => hideAboutOverlay());
+  overlay.addEventListener("pointerdown", (event) => {
+    if (!event.target.closest(".about-card")) {
+      hideAboutOverlay({ restoreFocus: false });
+    }
+  });
+  overlay.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      hideAboutOverlay();
+      return;
+    }
+    if (event.key === "Tab") {
+      // Single focusable control; keep focus inside the modal.
+      event.preventDefault();
+    }
+  });
+}
+
 function syncFullscreenButton() {
   if (!toolbarFullscreenButton) {
     return;
@@ -665,6 +740,12 @@ export function bindHomeGuiInteractions(options = {}) {
     }
     openTarget("system");
   });
+
+  document.querySelector("#identity-menu-shortcuts")?.addEventListener("click", () => {
+    toggleShortcutsOverlay();
+  });
+
+  bindAboutOverlay();
 
   toolbarSignOutButton?.addEventListener("click", () => {
     document.body.dataset.homeStatus = "booting";
