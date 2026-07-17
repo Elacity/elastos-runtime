@@ -124,6 +124,7 @@ function manualUxResult(path) {
 
 function audit(args) {
   const homeIndex = read("capsules/home/browser/index.html");
+  const homeGuiIndex = read("capsules/home-gui/browser/index.html");
   const homeTemplate = read("capsules/home-gui/browser/home-gui-template.html");
   const host = read("capsules/home/browser/home-shell-host.js");
   const shellCore = read("capsules/home/browser/shell-core.js");
@@ -138,6 +139,7 @@ function audit(args) {
   const state = read("state.md");
   const tasks = read("TASKS.md");
   const contractDoc = read("docs/HOME_SHELL_HOST_CONTRACT.md");
+  const capsuleContractDoc = read("docs/CAPSULE_INTERFACE_CONTRACT.md");
   const espDoc = read("docs/ESP_V0.md");
   const entropy = read("scripts/home-entropy-check.mjs");
   const bridgeSmoke = read("scripts/home-shell-bridge-smoke.mjs");
@@ -214,9 +216,12 @@ function audit(args) {
         !shellCore.includes("export async function ensureHomeGuiDom()") &&
         !shellCore.includes("function desktopLayoutBounds()") &&
         !shellCore.includes("desktopIconsVisible: true") &&
-        entropy.includes("homeGuiJs.includes(\"function retireHomeGuiSurface(options = {})\")") &&
+        entropy.includes("Home must keep a host-only DOM") &&
         homeGuiManifest.includes('"execution": "web-projection"') &&
-        contractDoc.includes("trusted host-loaded GUI shell code"),
+        homeIndex.includes('id="active-shell-frame"') &&
+        homeGuiIndex.includes('<div class="home-gui-shell"></div>') &&
+        contractDoc.includes("`home-gui` and `home-cli` are sibling shell capsules") &&
+        includesNormalized(contractDoc, "Neither shell nor an app shares Home's effective origin"),
       [
         "capsules/home/browser/index.html",
         "capsules/home-gui/capsule.json",
@@ -228,7 +233,7 @@ function audit(args) {
         "docs/HOME_SHELL_HOST_CONTRACT.md",
         "scripts/home-entropy-check.mjs",
       ],
-      "Keep GUI projection in the home-gui package and document that it is trusted host-loaded UI until a true isolated GUI shell exists.",
+      "Keep GUI projection inside the isolated home-gui capsule and keep the Home host free of GUI DOM or behavior.",
     ),
     criterion(
       "minimal_host_recovery",
@@ -297,7 +302,8 @@ function audit(args) {
         !homeCliRust.includes("UiKey::Browser") &&
         !homeCliRust.includes("b opens Browser") &&
         cliSmoke.includes("home-cli did not autostart an xterm terminal") &&
-        cliSmoke.includes("home-cli terminal exit did not reattach Home CLI"),
+        cliSmoke.includes("home-cli terminal exit did not reattach the root shell terminal") &&
+        cliSmoke.includes("home-cli terminal host intent did not request an explicit GUI shell transition"),
       [
         "capsules/home-cli/browser/commands.json",
         "capsules/home-cli/src/main.rs",
@@ -307,7 +313,7 @@ function audit(args) {
     ),
     criterion(
       "canonical_shell_candidates",
-      "Catalog and shell picker expose exactly home-gui and home-cli as selectable shells; legacy saved home state repairs to home-gui, but new home writes are rejected.",
+      "Catalog and shell picker expose exactly home-gui and home-cli as selectable shells; home remains only the front-door host.",
       catalogReadModel.includes("let launchable = target.is_some();") &&
         !catalogReadModel.includes("is_home_shell") &&
         shellPicker.includes("HOME_HOST_ID") &&
@@ -316,23 +322,23 @@ function audit(args) {
         !shellPicker.includes(retiredHomeAliasExpression) &&
         includesNormalized(gatewayHomeTests, 'std::collections::BTreeSet::from([HOME_GUI_SHELL_ID, "home-cli"])') &&
         gatewayHomeTests.includes("test_home_active_shell_repairs_saved_home_state_but_rejects_home_updates") &&
-        gatewayHomeTests.includes('{"active":"home"}') &&
         includesNormalized(gatewayHomeTests, "assert_eq!(home_write_rejected.status(), StatusCode::BAD_REQUEST);") &&
         gatewayHomeTests.includes('"active": "home-gui"') &&
         !gatewayHomeTests.includes(retiredHomeActiveStateLiteral) &&
-        includesNormalized(contractDoc, "New active-shell writes use only installed launchable shell candidates."),
+        contractDoc.includes("`home` is not a selectable shell") &&
+        contractDoc.includes("A manifest declaring `role: shell` does not grant shell authority"),
       [
         "elastos/crates/elastos-server/src/api/gateway_capsule_catalog/read_model.rs",
         "elastos/esp/shell_picker.ts",
         "elastos/crates/elastos-server/src/api/gateway_tests/home_system.rs",
         "docs/HOME_SHELL_HOST_CONTRACT.md",
       ],
-      "Keep `home` as the host route and saved-state migration value only; never accept or expose it as a selectable shell.",
+      "Keep `home` as the front-door host only; never accept or expose it as a selectable shell.",
     ),
     criterion(
       "capsule_interface_projection",
       "Capsules expose web, CLI, facts, affordances, gate metadata, audit/mirror, and Carrier/service readiness through Runtime-derived projections.",
-      contractDoc.includes("web, CLI, facts, affordances, gates, audit/mirror, and Carrier/service") &&
+      includesNormalized(capsuleContractDoc, "web, CLI, facts, affordances, gates, audit/mirror, and Carrier/service") &&
         entropy.includes("first_party_capsules_have_complete_projection_contract") &&
         gatewayCapsuleCatalog.includes("first_party_capsules_have_complete_projection_contract") &&
         state.includes("first_party_capsules_have_complete_projection_contract"),
@@ -349,13 +355,15 @@ function audit(args) {
       "Capsule-to-capsule operations are signed Home/Runtime/Carrier/provider intents, not DOM hacks, provider bypasses, or ambient same-origin authority.",
       noDirectHomeCliAuthority &&
         homeCli.includes("elastos.home.terminal-host-intent/v1") &&
-        homeCli.includes('"home:open-target"') &&
+        homeCli.includes('"home:switch-shell-and-open-target"') &&
         !homeCli.includes('"/api/capsules/interfaces/invoke"') &&
         homeCliRust.includes("fn write_invoke_intent(") &&
         bridgeSmoke.includes("wrong-token") &&
         bridgeSmoke.includes("http://evil.invalid") &&
+        bridgeSmoke.includes("Home CLI did not receive the same Runtime-scoped launch result as Home GUI") &&
         cliSmoke.includes("home-cli called provider routes directly") &&
-        contractDoc.includes("Child messages must carry the launch token"),
+        includesNormalized(contractDoc, "Every message must come from the active shell frame, its opaque origin, and its current launch token") &&
+        includesNormalized(contractDoc, "Apps post directly to the top-level Home host"),
       [
         "capsules/home-cli/browser/home-cli.js",
         "scripts/home-shell-bridge-smoke.mjs",
@@ -367,15 +375,15 @@ function audit(args) {
     criterion(
       "root_shell_lifecycle",
       "Only one active root shell owns the viewport; shell switch retires GUI windows, prevents hidden windows, and restores sessions per shell.",
-        bridgeSmoke.includes("const homeGuiCore = await import") &&
-        bridgeSmoke.includes("homeGuiCore.shellState.windows.size === 0") &&
-        bridgeSmoke.includes("homeGuiCore.shellState.windows.size === 1") &&
+        bridgeSmoke.includes("explicit graphical action did not replace the alternate root shell") &&
+        bridgeSmoke.includes("active shell root stayed hidden") &&
         authGateSmoke.includes("auth gate left a root shell visible") &&
         systemSwitchSmoke.includes("System shell switch did not retire Home GUI immediately") &&
         systemSwitchSmoke.includes("System shell switch did not cancel stale root-shell launches") &&
         regressionSmoke.includes("CLI-owned overlay session restored into Home GUI") &&
-        host.includes("function dormantHomeGui(options = {})") &&
-        contractDoc.includes("pre-retire stale GUI surfaces"),
+        host.includes('activeShellFrame.removeAttribute("src")') &&
+        includesNormalized(contractDoc, "Changing shells retires the previous root frame before the next shell becomes active") &&
+        contractDoc.includes("CSS hiding is not an accepted lifecycle model"),
       [
         "scripts/home-shell-bridge-smoke.mjs",
         "scripts/home-shell-auth-gate-smoke.mjs",
@@ -392,13 +400,16 @@ function audit(args) {
         gatewayHomeTests.includes("cookie_active_shell_write_rejected") &&
         gatewayHomeTests.includes("assert_eq!(payload[\"active_shell\"][\"active\"], \"home-cli\")") &&
         gatewayHomeTests.includes("test_home_shell_switch_preserves_runtime_facts_and_recovers_after_launch_failure") &&
-        virtualAuthSmoke.includes("Home CLI instantiated Home GUI DOM") &&
-        virtualAuthSmoke.includes("Home CLI Chat opened the GUI chat-room window") &&
-        virtualAuthSmoke.includes("Home CLI Chat did not enter native chat") &&
-        virtualAuthSmoke.includes("Home CLI Browser shortcut unexpectedly switched back to Home GUI") &&
-        virtualAuthSmoke.includes("Home CLI Browser shortcut unexpectedly opened a Browser window through Home") &&
-        virtualAuthSmoke.includes("Home CLI Browser shortcut dropped the CLI root frame") &&
-        bridgeSmoke.includes("homeGuiCore.shellState.windows.size === 0") &&
+        virtualAuthSmoke.includes("trusted Home host contained Home GUI DOM") &&
+        virtualAuthSmoke.includes("Home GUI remained loaded behind Home CLI") &&
+        virtualAuthSmoke.includes("Home CLI remained loaded behind Home GUI") &&
+        virtualAuthSmoke.includes("CLI Chat instantiated Home GUI DOM") &&
+        virtualAuthSmoke.includes("Home CLI did not enter CLI Chat") &&
+        virtualAuthSmoke.includes("CLI Browser action replaced the root shell") &&
+        virtualAuthSmoke.includes("CLI Browser action loaded Home GUI") &&
+        bridgeSmoke.includes("ordinary CLI app intent switched Home GUI implicitly") &&
+        bridgeSmoke.includes("explicit graphical action did not switch to desktop shell mode") &&
+        bridgeSmoke.includes("Home CLI launch request switched shells implicitly") &&
         staleHintSmoke.includes("stale") &&
         staleHintSmoke.includes("was inserted during alternate shell boot") &&
         noHintSmoke.includes("no-hint") &&
@@ -426,7 +437,8 @@ function audit(args) {
       "docs_and_stale_esp_cleanup",
       "ESP/Home docs explain the model plainly and stale esp-shell is not a selectable product shell.",
       state.includes("replaces the obsolete `esp-shell` capsule") &&
-        contractDoc.includes("Home is the shell host") &&
+        contractDoc.includes("`home` is not a selectable shell") &&
+        contractDoc.includes("`home-gui` and `home-cli` are sibling shell capsules") &&
         espDoc.includes("`home-cli` shell") &&
         !commandContract.commands.some((command) => command.name === "esp-shell") &&
         !homeIndex.includes("Esp Shell"),
@@ -468,11 +480,9 @@ function audit(args) {
         cliSmoke.includes("home-cli did not autostart an xterm terminal") &&
         cliSmoke.includes("home-cli terminal event stream did not use a scoped stream ticket") &&
         cliSmoke.includes("home-cli terminal resize did not carry its launch token") &&
-        cliSmoke.includes("home-cli terminal exit did not reattach Home CLI") &&
-        contractDoc.includes("Runtime owns the process") &&
-        includesNormalized(contractDoc, "stream ticket") &&
-        includesNormalized(contractDoc, "dimensions, input/resize routes") &&
-        contractDoc.includes("lifecycle"),
+        cliSmoke.includes("home-cli terminal exit did not reattach the root shell terminal") &&
+        includesNormalized(contractDoc, "`home-cli` owns the Runtime-owned PTY terminal and TUI projections") &&
+        contractDoc.includes("start/events/input/resize/close routes"),
       [
         "capsules/home-cli/browser/commands.json",
         "capsules/home-cli/browser/home-cli.js",
@@ -495,7 +505,7 @@ function audit(args) {
         gatewayHomeTerminal.includes("stream_ticket") &&
         gatewayHomeTests.includes("test_home_cli_terminal_stream_requires_cli_launch_token") &&
         gatewayHomeTests.includes("elastos.home-cli.terminal-resize/v1") &&
-        cliSmoke.includes("home-cli terminal exit did not reattach Home CLI") &&
+        cliSmoke.includes("home-cli terminal exit did not reattach the root shell terminal") &&
         cliSmoke.includes("home-cli terminal input did not carry its launch token") &&
         homeCli.includes("sendRuntimeTerminalInput") &&
         homeCli.includes('eventsUrl.includes("home_token=")'),

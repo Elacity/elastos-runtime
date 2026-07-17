@@ -755,32 +755,34 @@ for (const [token, value] of new Map([
   assertToken(libraryStyle, "capsules/library/browser/library.css", token, value);
 }
 
-const shellStyle = [
-  read("capsules/home/browser/style.css"),
-  read("capsules/home-gui/browser/style.css"),
-].join("\n");
+const shellHostStyle = read("capsules/home/browser/style.css");
+const homeGuiStyle = read("capsules/home-gui/browser/style.css");
+const shellStyle = `${shellHostStyle}\n${homeGuiStyle}`;
 assertToken(
-  shellStyle,
+  shellHostStyle,
   "capsules/home/browser/style.css",
   "--brand",
   "#f6921a",
 );
 assertToken(
-  shellStyle,
+  shellHostStyle,
   "capsules/home/browser/style.css",
   "--brand-strong",
   "#ffb457",
 );
 assert(
-  (shellStyle.match(/#f6921a/g) || []).length === 1,
-  "Home brand orange should be defined once as --brand",
+  (shellHostStyle.match(/#f6921a/g) || []).length === 1 &&
+    (homeGuiStyle.match(/#f6921a/g) || []).length === 1,
+  "Each independent Home document should define brand orange once as --brand",
 );
 assert(
-  (shellStyle.match(/#ffb457/g) || []).length === 1,
-  "Home hover brand orange should be defined once as --brand-strong",
+  (shellHostStyle.match(/#ffb457/g) || []).length === 1 &&
+    (homeGuiStyle.match(/#ffb457/g) || []).length === 1,
+  "Each independent Home document should define hover orange once as --brand-strong",
 );
 assert(
-  shellStyle.includes("min-height: 100dvh;"),
+  shellHostStyle.includes("min-height: 100dvh;") &&
+    homeGuiStyle.includes('font-family: "Inter", "Segoe UI", "SF Pro Text", sans-serif;'),
   "Home must use dynamic viewport height for mobile browsers",
 );
 assert(
@@ -856,6 +858,7 @@ const linuxSourceHomeRestartSmoke = read(
   "scripts/linux-source-home-restart-smoke.sh",
 );
 const chatRoomUi = read("capsules/chat-room-ui/src/lib.rs");
+const chatRoomIndex = read("capsules/chat-room/browser/index.html");
 const roomService = read("elastos/crates/elastos-server/src/room_service.rs");
 const gatewayApi = readAll([
   "elastos/crates/elastos-server/src/api/gateway.rs",
@@ -1228,12 +1231,14 @@ assert(
     agentsContract.includes("## Public Live Deployment") &&
     agentsContract.includes("## Staging Machines") &&
     agentsContract.includes("## Browser Claim Discipline") &&
-    agentsContract.includes("review/0.5.0") &&
+    agentsContract.includes("`main` is the stable release line; it currently represents 0.5.0") &&
+    agentsContract.includes("`upstream/0.6-dev` is the current 0.6 development integration line") &&
+    agentsContract.includes("Do not assume a `review/*` or `live` ref exists") &&
     agentsContract.includes("reporting its exact branch, commit, tree id, dirty status") &&
     agentsContract.includes("Target proof must cite the exact source tree") &&
     agentsContract.includes("explicit user approval before the mutation") &&
     agentsContract.includes("WebRTC remote display"),
-  "Root AGENTS.md must preserve the operator contract headings, review branch role, target proof discipline, public-live approval rule, and Browser claim discipline",
+  "Root AGENTS.md must preserve the operator contract headings, actual branch roles, target proof discipline, public-live approval rule, and Browser claim discipline",
 );
 assert(
   linuxSourceHomeRestart.includes("process_matches_gateway_listener") &&
@@ -1247,7 +1252,7 @@ assert(
   "Linux source-home restart must preserve safe listener ownership checks and ok=false failure receipts",
 );
 const debugPolicy = read("DEBUG.md");
-const homeAssetVersion = "home-20260713a";
+const homeAssetVersion = "home-20260715a";
 assertUsersSelfReferencesAreApproved();
 assert(
   shellIndex.includes('role="listbox"'),
@@ -1405,6 +1410,10 @@ assert(
   "Home open-target messages must stay source-gated",
 );
 assert(
+  shellJs.includes('"home-gui": "visible-target"'),
+  "The isolated Home GUI shell may request only Runtime-visible launch targets",
+);
+assert(
   shellJs.includes('"archive-manager": new Set(["library"])'),
   "Home must allow Archive to route users into Library for open/create archive journeys",
 );
@@ -1490,11 +1499,6 @@ assert(
     shellWindows.includes('launched?.target === "browser"') &&
     shellWindows.includes("tokens.push(...BROWSER_IFRAME_ALLOW_EXTRAS)"),
   "Home must grant clipboard-read/write explicitly and only to the Browser iframe",
-);
-assert(
-  shellWindows.includes('const WEBAUTHN_IFRAME_ALLOW_TARGETS = new Set(["inbox", "wallet"])') &&
-    shellWindows.includes('tokens.push("publickey-credentials-get")'),
-  "Home must grant WebAuthn only to Inbox and Wallet approval surfaces so passkey-gated signing works without broad capsule authority",
 );
 assert(
   shellJs.includes('scope === "wallet"') &&
@@ -2019,6 +2023,19 @@ assert(
   "Chat Room service must classify elastos:// document links as first-class room links",
 );
 assert(
+  chatRoomUi.includes('extract_fragment_param(&url, "home_token")') &&
+    !chatRoomUi.includes('extract_query_param(&url, "home_token")') &&
+    chatRoomUi.includes("session_storage: Option<Storage>") &&
+    chatRoomUi.includes("AccessMode::Shell => None"),
+  "Chat Room shell mode must use fragment authority without same-origin browser storage",
+);
+assert(
+  chatRoomIndex.includes("init({") &&
+    chatRoomIndex.includes("module_or_path: new URL(") &&
+    !chatRoomIndex.includes("init(new URL("),
+  "Chat Room must initialize wasm-bindgen with the supported options object",
+);
+assert(
   chatRoomUi.includes("data-open-uri"),
   "Chat Room must render elastos:// room links as shell-openable actions",
 );
@@ -2141,27 +2158,29 @@ assert(
   "Principal-root recovery status must be a runtime auth route, not app-local state",
 );
 assert(
-  gatewayApi.includes('"/api/auth/recovery/export"') &&
-    gatewayApi.includes('"/api/auth/recovery/import"') &&
-    gatewayApi.includes('"/api/auth/recovery/full-export"') &&
+  gatewayApi.includes('"/api/auth/recovery/full-export"') &&
     gatewayApi.includes('"/api/auth/recovery/full-import"'),
-  "Recovery Kit import/export handlers must be wired as runtime auth routes",
+  "Full Recovery Bundle import/export handlers must be wired as runtime auth routes",
+);
+assert(
+  !gatewayApi.includes('"/api/auth/recovery/create"') &&
+    !gatewayApi.includes('"/api/auth/recovery/export"') &&
+    !gatewayApi.includes('"/api/auth/recovery/import"'),
+  "Legacy standalone Recovery Kit routes must remain removed",
 );
 assert(
   recoveryKitLiveSmoke.includes("elastos.principal.root-recovery.status/v1"),
   "Recovery Kit live smoke must validate the current runtime recovery-status schema",
 );
 assert(
-  gatewayTests.includes(
-    "test_recovery_kit_routes_create_export_and_import_password_package",
-  ),
-  "Recovery Kit route journey must be covered at the public gateway route layer",
+  gatewayTests.includes("test_legacy_recovery_kit_routes_are_absent"),
+  "Removed standalone Recovery Kit routes must be covered at the public gateway route layer",
 );
 assert(
   gatewayTests.includes(
-    "test_recovery_kit_routes_prevent_admin_exporting_guest_kit",
+    "test_full_recovery_bundle_prevents_admin_exporting_guest_root",
   ),
-  "Recovery Kit route coverage must prove admins cannot export another principal's kit",
+  "Full Recovery Bundle coverage must prove admins cannot export another principal's root",
 );
 assert(
   authGatewayApi.includes("PrincipalRootRecoveryStatusV1::unprotected"),
@@ -2188,7 +2207,7 @@ assert(
     "principal_root_protection_rejects_unknown_contract_fields_at_decode",
   ) &&
     authContract.includes(
-      "recovery_kit_import_request_rejects_unknown_nested_fields_at_decode",
+      "recovery_kit_rejects_unknown_fields_at_decode",
     ),
   "Principal-root recovery contracts must reject unknown hidden fields at decode time",
 );
@@ -3109,8 +3128,9 @@ assert(
 );
 const inboxWalletApprovalBoundary = {
   inboxCanApproveWithFreshPasskey: inbox.includes("requestFreshPasskeyHomeToken") &&
-    inbox.includes("/api/auth/passkey/authenticate/begin") &&
-    inbox.includes("navigator.credentials.get") &&
+    inbox.includes('type: "home:request-passkey-authority"') &&
+    !inbox.includes("/api/auth/passkey/authenticate/begin") &&
+    !inbox.includes("navigator.credentials.get") &&
     inbox.includes("home_token: homeToken") &&
     inbox.includes('inboxAction("wallet-approve-request:" + requestId'),
   inboxKeepsWalletDeepLink: inbox.includes("Review in Wallet") &&
@@ -3119,8 +3139,10 @@ const inboxWalletApprovalBoundary = {
     "fresh passkey verification is required to sign with a built-in wallet",
   ) &&
     gatewayInboxApi.includes(
-      "require_fresh_passkey_home_token(data_dir, home_token, context, 180)?",
-    ),
+      "consume_fresh_passkey_home_token(",
+    ) &&
+    gatewayInboxApi.includes('"wallet.approve"') &&
+    gatewayInboxApi.includes('"reason": "Approved in Inbox"'),
   gatewayApprovesManagedWalletFromInbox: gatewayInboxApi.includes(
     "approve_managed_wallet_request(",
   ) &&
@@ -3140,14 +3162,14 @@ const inboxWalletApprovalBoundary = {
   staleWalletOnlyRejectionRemoved: !gatewayInboxApi.includes(
     "Open Wallet to approve wallet signing requests.",
   ),
-  homeGrantsWebAuthnOnlyToApprovalSurfaces: shellWindows.includes(
-    'const WEBAUTHN_IFRAME_ALLOW_TARGETS = new Set(["inbox", "wallet"])',
-  ),
-  wciAllowsInboxFreshAuthOnly: wciAlignmentScript.includes(
-    "--glob '!capsules/inbox/browser/*'",
+  homeDelegatesFreshAuthOnlyToApprovalSurfaces:
+    shellJs.includes('const PASSKEY_AUTHORITY_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"])') &&
+    !shellWindows.includes("publickey-credentials-get"),
+  wciRequiresHostOwnedFreshAuth: wciAlignmentScript.includes(
+    "Inbox passkey ceremonies must remain in the trusted Home host",
   ) &&
     wciAlignmentScript.includes(
-      "Inbox may request fresh passkey authentication for wallet or Inspector approval, but must not register passkeys",
+      "Wallet passkey ceremonies must remain in the trusted Home host",
     ),
   walletOwnsFreshPasskeyToken: walletJs.includes("requestFreshPasskeyHomeToken"),
   walletReadsFocusedRequest: walletJs.includes('readQueryParam("wallet_request")'),
@@ -3167,17 +3189,26 @@ const inboxInspectorApprovalBoundary = {
   gatewayRequiresFreshPasskeyForInspectApproval: gatewayInboxApi.includes(
     "fresh passkey verification is required to approve an Inspector action",
   ) &&
-    gatewayInboxApi.includes(
-      "require_fresh_passkey_home_token(data_dir, home_token, context, 180)?",
-    ) &&
-    gatewayInboxApi.includes("approve_inspect_action_request(state, context, request_id)"),
+    gatewayInboxApi.includes("approve_inspect_action_request(state, context, request_id, home_token)") &&
+    gatewayInspectActions.includes("claim_bound_pending_inspect_action(") &&
+    gatewayInspectActions.includes("consume_fresh_passkey_home_token(") &&
+    gatewayInspectActions.includes('"inspect.approve"') &&
+    gatewayInspectActions.includes('json!({ "request_id": record.request_id })'),
+  inboxRequiresExactInspectorReceipt: inbox.includes("requireInspectActionResult") &&
+    inbox.includes('result.schema !== "elastos.inspect.action-result/v1"') &&
+    inbox.includes('binding.schema !== "elastos.esp.request-binding/v1"') &&
+    inbox.includes('transfer.status !== "completed"') &&
+    gatewayInspectActions.includes("inspect_action_result_receipt") &&
+    gatewayInspectActions.includes("validate_inspect_dispatch_result"),
   gatewayTestsCoverFreshInspectorProof: gatewayTests.includes(
     "inspect_action_requires_inbox_approval_before_dispatch",
   ) &&
     gatewayTests.includes("missing_fresh_proof") &&
     gatewayTests.includes("inspect_action_rejects_stale_fresh_passkey_before_dispatch") &&
     gatewayTests.includes('message.contains("auth session")') &&
-    gatewayTests.includes("other.home_token.as_str()"),
+    gatewayTests.includes("other_inbox_token.as_str()") &&
+    gatewayApi.includes("fresh_passkey_proof_is_app_scoped_and_single_use") &&
+    gatewayApi.includes("fresh_passkey_proof_rejects_substituted_intent"),
   docsDeclareFreshInspectorProof: capsuleInspectorDocs.includes(
     "fresh same-principal passkey Home token",
   ) &&
@@ -3695,7 +3726,8 @@ assert(
     libraryApp.includes('sidebar: document.querySelector(".sidebar")') &&
     libraryApp.includes("function orderRoots(roots)") &&
     libraryApp.includes("function reorderPlace(sourceRootId, targetRootId") &&
-    libraryApp.includes("localStorage.setItem(\"library.sidebarOrder\"") &&
+    libraryApp.includes("viewPreferenceStore.setItem(\"library.sidebarOrder\"") &&
+    !libraryApp.includes("localStorage") &&
     libraryState.includes("sidebarOrder: readStoredStringArray(storage.getItem(\"library.sidebarOrder\"))") &&
     libraryApp.includes("function showPlaceMenu(uri, x, y)") &&
     libraryApp.includes('menuAction("Open in New Window", () => openTarget("library", { uri: root.uri }))') &&
@@ -3707,7 +3739,7 @@ assert(
     libraryEvents.includes("event.stopPropagation();\n    hideMenu();") &&
     libraryCss.includes(".place.window-sidebar-item-dragging") &&
     libraryCss.includes(".place[data-drop-position=\"before\"]"),
-  "Library sidebar must suppress browser right-click on chrome, expose Open/Open in New Window on place items, persist user root ordering, and mark only the most specific active place",
+  "Library sidebar must suppress browser right-click on chrome, expose Open/Open in New Window on place items, retain session ordering without ambient browser storage, and mark only the most specific active place",
 );
 assert(
   libraryRender.includes('const badgesMarkup = badges ? `<span class="badges">${badges}</span>` : "";') &&
@@ -4309,7 +4341,10 @@ assert(
     libraryNavigation.includes("createLibraryNavigation") &&
     libraryPreview.includes("createLibraryPreview") &&
     libraryRealtime.includes("createLibraryRealtime") &&
-    libraryRealtime.includes("new EventSource(") &&
+    libraryRealtime.includes('fetch("/api/provider/object/events/stream"') &&
+    libraryRealtime.includes('"x-elastos-home-token": state.homeToken') &&
+    !libraryRealtime.includes("home_token=") &&
+    libraryRealtime.includes("readLibraryEventStream(response.body)") &&
     libraryRealtime.includes("function handleLibraryEventsPayload(") &&
     libraryRender.includes("createLibraryRenderer") &&
     libraryRender.includes("function renderContent(") &&
@@ -7650,13 +7685,59 @@ assert(
   "Browser capsule must be registered as a platform-independent capsule artifact",
 );
 assert(
-  browserCapsulesApi.includes(
-    "general_browser_capsule_assets_remain_cross_origin_isolated_for_home_embedding",
-  ) &&
+  browserCapsulesApi.includes("browser_capsule_documents_allow_isolated_home_embedding") &&
+    browserCapsulesApi.includes(
+      'const BROWSER_CAPSULE_DOCUMENT_CORP: &str = "cross-origin"',
+    ) &&
+    browserCapsulesApi.includes(
+      'const BROWSER_CAPSULE_ASSET_CORP: &str = "cross-origin"',
+    ) &&
+    browserCapsulesApi.includes(
+      'const BROWSER_CAPSULE_OPAQUE_ORIGIN: &str = "null"',
+    ) &&
+    browserCapsulesApi.includes("ACCESS_CONTROL_ALLOW_ORIGIN") &&
+    browserCapsulesApi.includes("browser_capsule_assets_can_load_in_an_opaque_frame") &&
     !browserCapsulesApi.includes(
       'headers_mut().remove("cross-origin-embedder-policy")',
     ),
-  "Browser app serving must keep COEP/CORP headers so Home can embed it inside the cross-origin-isolated shell",
+  "Browser capsule documents and assets must load inside opaque Home frames",
+);
+const commonIframeSandboxStart = shellWindows.indexOf("const COMMON_IFRAME_SANDBOX");
+const iframeSandboxPolicyStart = shellWindows.indexOf("function iframeSandboxForLaunch(launched)");
+const iframeOriginBoundary = {
+  commonSandboxExcludesSameOrigin:
+    commonIframeSandboxStart >= 0 &&
+    iframeSandboxPolicyStart > commonIframeSandboxStart &&
+    !shellWindows.slice(commonIframeSandboxStart, iframeSandboxPolicyStart)
+      .includes("allow-same-origin"),
+  runtimeReturnsCanonicalIframeRoutes:
+    gatewayApi.includes("canonical_browser_capsule_route(&route)") &&
+    gatewayHomeSystemTests.includes("assert_isolated_launch_route") &&
+    !shellJs.includes("isolatedHomeTargetRoute"),
+  isolatedFramesUseOpaqueOrigins:
+    sourceBlock(
+      shellWindows,
+      "function iframeSandboxForLaunch(launched)",
+      "Home iframe sandbox policy",
+    ).includes("[...COMMON_IFRAME_SANDBOX]") &&
+    !shellWindows.includes("allow-same-origin") &&
+    !shellIndex.includes("allow-same-origin"),
+  runtimeKeepsCapsuleRoutesOnOneHost:
+    browserCapsulesApi.includes("canonical_capsule_route_stays_on_the_home_origin") &&
+    !browserCapsulesApi.includes("CAPSULE_PUBLIC_ORIGIN") &&
+    !browserCapsulesApi.includes("browser_capsule_origin_redirect"),
+  gatewayAllowsOnlyScopedOpaqueCors:
+    gatewayApi.includes("async fn capsule_origin_cors(") &&
+    gatewayApi.includes("ACCESS_CONTROL_REQUEST_METHOD") &&
+    gatewayApi.includes("is_allowed_capsule_origin") &&
+    gatewayTests.includes(
+      "gateway_allows_opaque_capsule_preflight_without_granting_unrelated_origins",
+    ),
+};
+assert(
+  Object.values(iframeOriginBoundary).every(Boolean),
+  "Home app frames must use opaque sandbox isolation without DNS or ambient Home authority",
+  iframeOriginBoundary,
 );
 assert(
   gatewayApi.includes('const BROWSER_CAPSULE_ID: &str = "browser"') &&
@@ -7879,8 +7960,9 @@ assert(
 );
 assert(
     walletJs.includes("requestFreshPasskeyHomeToken") &&
-    walletJs.includes("/api/auth/passkey/authenticate/begin") &&
-    walletJs.includes("/api/auth/passkey/authenticate/complete") &&
+    walletJs.includes('type: "home:request-passkey-authority"') &&
+    !walletJs.includes("/api/auth/passkey/authenticate/begin") &&
+    !walletJs.includes("navigator.credentials.get") &&
     walletJs.includes("/recovery-key") &&
     walletJs.includes('schema: "elastos.wallet.recovery-key/v1"') &&
     walletJs.includes("JSON.stringify(recoveryKey, null, 2)") &&
@@ -7895,7 +7977,8 @@ assert(
     gatewayApi.includes(
       "/api/apps/wallet/wallet/accounts/:account_id/recovery-key",
     ) &&
-    gatewayApi.includes("require_fresh_passkey_home_token") &&
+    gatewayApi.includes("consume_fresh_passkey_home_token") &&
+    gatewayApi.includes('"wallet.recovery-key.export"') &&
     gatewayTests.includes(
       "test_wallet_recovery_key_requires_fresh_passkey_home_token",
     ) &&
@@ -8125,12 +8208,13 @@ assert(
 assert(
   gatewayApi.includes("pub(crate) fn home_launch_auth_data_dir") &&
     authGatewayApi.includes("home_launch_auth_data_dir(&state.data_dir)") &&
-    authGatewayApi.includes("crate::auth::store_session_grant(&auth_data_dir") &&
+    authGatewayApi.includes("crate::auth::renew_session_grant(&auth_data_dir") &&
+    authGatewayApi.includes("an open child token must survive host session renewal") &&
     authGatewayApi.includes("crate::auth::revoke_session_grant(&auth_data_dir") &&
     authGatewayApi.includes(
       "refresh_session_uses_trusted_auth_data_dir_for_refreshed_tokens",
     ),
-  "Home auth session refresh/sign-out must use the trusted Home-launch auth data root so refreshed tokens validate and revoke against the same authority state",
+  "Home auth session renewal must preserve open child authority while refresh/sign-out use the trusted Home-launch auth data root",
 );
 assert(
   homeVirtualAuthSmoke.includes("/revoke") &&

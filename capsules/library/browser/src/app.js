@@ -34,12 +34,21 @@ import {
 } from "./state.js";
 import { createLibraryUploads } from "./uploads.js";
 
+    const viewPreferences = new Map();
+    const viewPreferenceStore = {
+      getItem: (key) => viewPreferences.get(key) ?? null,
+      setItem: (key, value) => viewPreferences.set(key, String(value)),
+    };
     const queryParams = new URLSearchParams(window.location.search);
     const { state, perf } = createLibraryState({
       queryParams,
-      storage: localStorage,
+      storage: viewPreferenceStore,
       perfTarget: (window.__libraryPerf = window.__libraryPerf || {}),
     });
+    const homeOrigin = queryParams.get("home_origin") || "";
+    if (state.homeToken && homeOrigin && window.top !== window) {
+      window.top.postMessage({ type: "home:app-ready", homeToken: state.homeToken }, homeOrigin);
+    }
     const {
       providerApi: runtimeProviderApi,
       uploadObject,
@@ -518,7 +527,7 @@ import { createLibraryUploads } from "./uploads.js";
       const insertIndex = placement === "after" ? adjustedTargetIndex + 1 : adjustedTargetIndex;
       state.roots.splice(insertIndex, 0, source);
       state.sidebarOrder = state.roots.map(rootKey).filter(Boolean);
-      localStorage.setItem("library.sidebarOrder", JSON.stringify(state.sidebarOrder));
+      viewPreferenceStore.setItem("library.sidebarOrder", JSON.stringify(state.sidebarOrder));
       renderPlaces({ animateFrom: previousTops });
       syncPlacesActive();
       setStatus("Sidebar order saved.");
@@ -974,25 +983,25 @@ import { createLibraryUploads } from "./uploads.js";
     function setSort(sort) {
       state.sort = sort || "name";
       elements.sortSelect.value = state.sort;
-      localStorage.setItem("library.sort", state.sort);
+      viewPreferenceStore.setItem("library.sort", state.sort);
       scheduleContentRender();
     }
 
     function setSortOrder(order) {
       state.sortOrder = order === "desc" ? "desc" : "asc";
-      localStorage.setItem("library.sortOrder", state.sortOrder);
+      viewPreferenceStore.setItem("library.sortOrder", state.sortOrder);
       scheduleContentRender();
     }
 
     function toggleShowHidden() {
       state.showHidden = !state.showHidden;
-      localStorage.setItem("library.showHidden", String(state.showHidden));
+      viewPreferenceStore.setItem("library.showHidden", String(state.showHidden));
       scheduleContentRender();
     }
 
     function setView(view) {
       state.view = view === "list" ? "list" : "grid";
-      localStorage.setItem("library.view", state.view);
+      viewPreferenceStore.setItem("library.view", state.view);
       syncContentViewMode();
       syncViewButtons();
       renderFooter();

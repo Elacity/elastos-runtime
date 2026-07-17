@@ -6,9 +6,13 @@ lives in [state.md](state.md), and open work lives in [TASKS.md](TASKS.md).
 
 ## Branch Roles
 
-- `main` is the stable release line.
-- `review/0.5.0` is the public review branch for this candidate stack.
-- `live` represents the exact code deployed to the public Home URL.
+- `main` is the stable release line; it currently represents 0.5.0.
+- `upstream/0.6-dev` is the current 0.6 development integration line.
+- Feature and fix branches remain unpublished working lines until they are
+  explicitly pushed for review.
+- Do not assume a `review/*` or `live` ref exists. Identify the exact public
+  review or deployed commit from fetched refs and target-host evidence before
+  making either claim.
 - Treat any other local branch or target-host checkout as evidence only after
   reporting its exact branch, commit, tree id, dirty status, and verification
   command.

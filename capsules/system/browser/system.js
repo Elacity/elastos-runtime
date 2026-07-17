@@ -38,10 +38,13 @@ const technicalInspectListNode = document.querySelector("#technical-inspect-list
 const technicalInspectDetailNode = document.querySelector("#technical-inspect-detail");
 const technicalInspectStatusNode = document.querySelector("#technical-inspect-status");
 const technicalInspectRefreshButton = document.querySelector("#technical-inspect-refresh");
-const frameHomeToken = readQueryParam("home_token");
-const ACTIVE_SHELL_HINT_KEY = "elastos.home.active-shell-hint";
+const frameHomeToken = readLaunchToken();
+const homeParentOrigin = readQueryParam("home_origin");
 const HOME_HOST_ID = "home";
 const HOME_GUI_SHELL_ID = "home-gui";
+if (frameHomeToken && homeParentOrigin && window.top !== window) {
+  window.top.postMessage({ type: "home:app-ready", homeToken: frameHomeToken }, homeParentOrigin);
+}
 let apiHomeToken = frameHomeToken;
 let chainNetworks = [];
 let chainStatusById = new Map();
@@ -579,13 +582,14 @@ function clearOverlayStatus() {
 
 function openCapsuleTarget(target) {
   const id = readText(target);
-  if (!id || !window.parent || window.parent === window) {
+  if (!id || !homeParentOrigin || !window.top || window.top === window) {
     return;
   }
-  window.parent.postMessage({
+  window.top.postMessage({
     type: "home:open-target",
     target: id,
-  }, window.location.origin);
+    homeToken: apiHomeToken,
+  }, homeParentOrigin);
 }
 
 async function refreshActiveShell() {
@@ -606,7 +610,6 @@ function renderActiveShell(summary) {
   }
   const active = shellName(readText(summary?.active) || "home-gui");
   activeShellName = active;
-  rememberActiveShellHint(active);
   const candidates = Array.isArray(summary?.candidates) ? summary.candidates : [];
   activeShellOptions.replaceChildren();
   for (const candidate of candidates) {
@@ -664,19 +667,6 @@ function shellChoiceDescription(name, fallback = "") {
   return fallback || "Home shell";
 }
 
-function rememberActiveShellHint(active) {
-  try {
-    const shell = shellName(active);
-    if (shell && shell !== "home-gui") {
-      window.localStorage.setItem(ACTIVE_SHELL_HINT_KEY, shell);
-      document.documentElement.dataset.homeShellHint = "alternate";
-      return;
-    }
-    window.localStorage.removeItem(ACTIVE_SHELL_HINT_KEY);
-    delete document.documentElement.dataset.homeShellHint;
-  } catch (_error) {}
-}
-
 async function applyActiveShell(active) {
   active = shellName(active);
   if (!active) {
@@ -703,25 +693,25 @@ function setActiveShellBusy(busy) {
 }
 
 function notifyHomeSummaryChanged() {
-  if (!window.parent || window.parent === window) {
+  if (!homeParentOrigin || !window.top || window.top === window) {
     return;
   }
-  window.parent.postMessage({
+  window.top.postMessage({
     type: "home:refresh-summary",
     homeToken: apiHomeToken,
-  }, window.location.origin);
+  }, homeParentOrigin);
 }
 
 function notifyHomeActiveShellApplied(active) {
   const activeShell = readText(active);
-  if (!activeShell || !apiHomeToken || !window.parent || window.parent === window) {
+  if (!activeShell || !apiHomeToken || !homeParentOrigin || !window.top || window.top === window) {
     return;
   }
-  window.parent.postMessage({
+  window.top.postMessage({
     type: "home:active-shell-applied",
     activeShell,
     homeToken: apiHomeToken,
-  }, window.location.origin);
+  }, homeParentOrigin);
 }
 
 function showActiveShellStatus(message, tone = "muted") {
@@ -1811,10 +1801,7 @@ async function onRecoveryAttach() {
 }
 
 async function submitRecoveryImport(body) {
-  const endpoint = body && body.schema === "elastos.full-recovery-bundle.import.request/v1"
-    ? "/api/auth/recovery/full-import"
-    : "/api/auth/recovery/import";
-  const response = await fetchJson(endpoint, {
+  const response = await fetchJson("/api/auth/recovery/full-import", {
     method: "POST",
     headers: shellHeaders({ "content-type": "application/json" }),
     body: JSON.stringify(body),
@@ -1847,24 +1834,6 @@ function recoveryImportPlan(status, imported, options = {}) {
   const kitRoot = readText(imported && imported.localhost_root);
   const reassign = kitPrincipal !== principalId || kitRoot !== localhostRoot;
   const allowReassign = options.allowReassign === true;
-  const request = {
-    schema: "elastos.recovery-kit.import.request/v1",
-    principal_id: principalId,
-    localhost_root: localhostRoot,
-    reassign_to_current_principal: Boolean(reassign && allowReassign),
-  };
-  if (importedSchema === "elastos.recovery-kit.package/v1") {
-    request.package = imported;
-    const password = recoveryDownloadPassword();
-    if (password) {
-      request.password = password;
-    }
-    return { request, reassign, kitPrincipal, kitRoot };
-  }
-  if (importedSchema === "elastos.recovery-kit/v1") {
-    request.kit = imported;
-    return { request, reassign, kitPrincipal, kitRoot };
-  }
   if (importedSchema === "elastos.full-recovery-bundle/v1") {
     return {
       request: fullRecoveryImportRequest(principalId, localhostRoot, imported, null, reassign, allowReassign),
@@ -1886,15 +1855,21 @@ function recoveryImportPlan(status, imported, options = {}) {
 
 async function exportFullRecoveryBundle(status) {
   const downloadPassword = recoveryDownloadPassword();
-  const homeToken = await requestFreshPasskeyHomeToken();
+  const intent = {
+    principal_id: readText(status.principal_id),
+    localhost_root: readText(status.localhost_root),
+    label: "Recovery Kit",
+  };
+  const homeToken = await requestFreshPasskeyHomeToken(
+    "auth.full-recovery-bundle.export",
+    intent,
+  );
   return fetchJson("/api/auth/recovery/full-export", {
     method: "POST",
-    headers: shellHeaders({ "content-type": "application/json" }),
+    headers: shellHeaders({ "content-type": "application/json" }, homeToken),
     body: JSON.stringify({
       schema: "elastos.full-recovery-bundle.export.request/v1",
-      principal_id: readText(status.principal_id),
-      localhost_root: readText(status.localhost_root),
-      label: "Recovery Kit",
+      ...intent,
       home_token: homeToken,
       ...(downloadPassword ? { download_password: downloadPassword } : {}),
     }),
@@ -2474,77 +2449,56 @@ function readQueryParam(key) {
   return (url.searchParams.get(key) || "").trim();
 }
 
-async function requestFreshPasskeyHomeToken() {
-  if (!window.PublicKeyCredential) {
-    throw new Error("Passkey verification is unavailable in this browser.");
+function readLaunchToken() {
+  return new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
+}
+
+async function requestFreshPasskeyHomeToken(operation, request) {
+  return requestHomePasskeyAuthority(apiHomeToken, homeParentOrigin, operation, request);
+}
+
+function requestHomePasskeyAuthority(homeToken, parentOrigin, operation, request) {
+  if (!homeToken || window.top === window || !parentOrigin) {
+    return Promise.reject(new Error("Open System from Home to verify your passkey."));
   }
-  const begin = await fetchJson("/api/auth/passkey/authenticate/begin", { method: "POST" });
-  const credential = await navigator.credentials.get(toRequestOptions(begin.options));
-  if (!credential) {
-    throw new Error("Passkey verification was cancelled.");
-  }
-  const complete = await fetchJson("/api/auth/passkey/authenticate/complete", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      ceremony_id: begin.ceremony_id,
-      response: serializeAssertionCredential(credential),
-    }),
+  const requestId = window.crypto?.randomUUID?.()
+    || `passkey-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      window.removeEventListener("message", onResult);
+      reject(new Error("Passkey verification timed out."));
+    }, 120_000);
+    const onResult = (event) => {
+      if (event.source !== window.top || event.origin !== parentOrigin) {
+        return;
+      }
+      const result = event.data && typeof event.data === "object" ? event.data : null;
+      if (result?.type !== "home:passkey-authority-result" || result.requestId !== requestId) {
+        return;
+      }
+      window.clearTimeout(timeout);
+      window.removeEventListener("message", onResult);
+      const freshToken = readText(result.homeToken);
+      if (freshToken) {
+        resolve(freshToken);
+        return;
+      }
+      reject(new Error(readText(result.error) || "Passkey verification failed."));
+    };
+    window.addEventListener("message", onResult);
+    window.top.postMessage({
+      type: "home:request-passkey-authority",
+      requestId,
+      homeToken,
+      operation,
+      request,
+    }, parentOrigin);
   });
-  const homeToken = readText(complete.home_token);
-  if (!homeToken) {
-    throw new Error("Fresh passkey token was not issued.");
-  }
-  return homeToken;
 }
 
-function toRequestOptions(options) {
-  const publicKey = { ...(options && options.publicKey ? options.publicKey : {}) };
-  publicKey.challenge = base64UrlToBuffer(publicKey.challenge);
-  publicKey.allowCredentials = (publicKey.allowCredentials || []).map((credential) => ({
-    ...credential,
-    id: base64UrlToBuffer(credential.id),
-  }));
-  return { publicKey };
-}
-
-function serializeAssertionCredential(credential) {
-  return {
-    id: credential.id,
-    rawId: bufferToBase64Url(credential.rawId),
-    type: credential.type,
-    response: {
-      authenticatorData: bufferToBase64Url(credential.response.authenticatorData),
-      clientDataJson: bufferToBase64Url(credential.response.clientDataJSON),
-      signature: bufferToBase64Url(credential.response.signature),
-      userHandle: credential.response.userHandle ? bufferToBase64Url(credential.response.userHandle) : null,
-    },
-  };
-}
-
-function base64UrlToBuffer(value) {
-  const input = readText(value).replace(/-/g, "+").replace(/_/g, "/");
-  const padded = input + "=".repeat((4 - (input.length % 4)) % 4);
-  const binary = window.atob(padded);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
-  }
-  return bytes.buffer;
-}
-
-function bufferToBase64Url(value) {
-  const bytes = new Uint8Array(value);
-  let binary = "";
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-  return window.btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-}
-
-function shellHeaders(extra) {
+function shellHeaders(extra, authorityToken = apiHomeToken) {
   return Object.assign(
-    apiHomeToken.length > 0 ? { "x-elastos-home-token": apiHomeToken } : {},
+    authorityToken.length > 0 ? { "x-elastos-home-token": authorityToken } : {},
     extra || {},
   );
 }

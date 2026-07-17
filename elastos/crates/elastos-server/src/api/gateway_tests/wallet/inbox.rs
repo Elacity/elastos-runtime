@@ -80,16 +80,26 @@ async fn test_inbox_approves_wallet_requests_through_runtime_wallet_signing() {
     let missing_text = String::from_utf8(missing_body.to_vec()).unwrap();
     assert!(missing_text.contains("fresh passkey verification is required"));
 
+    let approval_token = intent_token_for_app_context(
+        dir.path(),
+        INBOX_CAPSULE_ID,
+        &token,
+        "wallet.approve",
+        &json!({
+            "request_id": "wallet-approval:test",
+            "reason": "Approved in Inbox",
+        }),
+    );
     let approved = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/inbox/actions")
-                .header("x-elastos-home-token", token)
+                .header("x-elastos-home-token", token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
                     r#"{{"action_id":"wallet-approve-request:wallet-approval:test","home_token":"{}"}}"#,
-                    authority.home_token
+                    approval_token
                 )))
                 .unwrap(),
         )
@@ -264,6 +274,16 @@ async fn test_wallet_approval_journey_creates_request_reviews_in_inbox_and_signs
         "documents"
     );
 
+    let approval_token = intent_token_for_app_context(
+        dir.path(),
+        WALLET_CAPSULE_ID,
+        &wallet_token,
+        "wallet.approve",
+        &json!({
+            "request_id": request_id,
+            "reason": "Approved in Wallet",
+        }),
+    );
     let approved = app
         .clone()
         .oneshot(
@@ -273,11 +293,11 @@ async fn test_wallet_approval_journey_creates_request_reviews_in_inbox_and_signs
                     "/api/apps/wallet/wallet/managed-approvals/{}/approve",
                     request_id.replace(':', "%3A")
                 ))
-                .header("x-elastos-home-token", wallet_token)
+                .header("x-elastos-home-token", wallet_token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
                     r#"{{"reason":"Approved in Wallet","home_token":"{}"}}"#,
-                    authority.home_token
+                    approval_token
                 )))
                 .unwrap(),
         )
@@ -485,6 +505,16 @@ async fn test_btc_wallet_approval_journey_reviews_in_inbox_and_signs() {
         "Bitcoin proof request"
     );
 
+    let approval_token = intent_token_for_app_context(
+        dir.path(),
+        WALLET_CAPSULE_ID,
+        &wallet_token,
+        "wallet.approve",
+        &json!({
+            "request_id": request_id,
+            "reason": "Approved in Wallet",
+        }),
+    );
     let approved = app
         .clone()
         .oneshot(
@@ -494,11 +524,11 @@ async fn test_btc_wallet_approval_journey_reviews_in_inbox_and_signs() {
                     "/api/apps/wallet/wallet/managed-approvals/{}/approve",
                     request_id.replace(':', "%3A")
                 ))
-                .header("x-elastos-home-token", wallet_token)
+                .header("x-elastos-home-token", wallet_token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
                     r#"{{"reason":"Approved in Wallet","home_token":"{}"}}"#,
-                    authority.home_token
+                    approval_token
                 )))
                 .unwrap(),
         )

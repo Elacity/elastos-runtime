@@ -83,7 +83,7 @@ struct App {
     state: RefCell<AppState>,
     document: Document,
     body: HtmlElement,
-    session_storage: Storage,
+    session_storage: Option<Storage>,
     status_badge: Option<HtmlElement>,
     status_detail: Option<HtmlElement>,
     error_text: HtmlElement,
@@ -438,11 +438,16 @@ pub fn start() -> Result<(), JsValue> {
     let document = window
         .document()
         .ok_or_else(|| JsValue::from_str("document unavailable"))?;
-    let session_storage = window
-        .session_storage()?
-        .ok_or_else(|| JsValue::from_str("sessionStorage unavailable"))?;
     let config = load_config(&document)?;
-    let state = load_state(&session_storage, &config);
+    let session_storage = match config.access_mode {
+        AccessMode::Gateway => Some(
+            window
+                .session_storage()?
+                .ok_or_else(|| JsValue::from_str("sessionStorage unavailable"))?,
+        ),
+        AccessMode::Shell => None,
+    };
+    let state = load_state(session_storage.as_ref(), &config);
     let gateway_ui = if config.access_mode == AccessMode::Gateway {
         Some(GatewayUi {
             browser_access_stage: element_by_id(&document, "browser-access-stage")?,
@@ -1361,10 +1366,26 @@ impl App {
         }
     }
 
+    fn clear_browser_session_request_storage(&self) {
+        if let Some(storage) = &self.session_storage {
+            storage
+                .remove_item(&self.config.browser_session_request_storage_key)
+                .ok();
+        }
+    }
+
+    fn store_browser_session_request(&self, request_id: &str) -> Result<(), String> {
+        let storage = self
+            .session_storage
+            .as_ref()
+            .ok_or_else(|| "Browser session storage unavailable.".to_string())?;
+        storage
+            .set_item(&self.config.browser_session_request_storage_key, request_id)
+            .map_err(js_error)
+    }
+
     fn reset_browser_session_request(&self) {
-        self.session_storage
-            .remove_item(&self.config.browser_session_request_storage_key)
-            .ok();
+        self.clear_browser_session_request_storage();
         if let Some(gateway_ui) = &self.gateway_ui {
             gateway_ui.display_name_input.set_value("");
         }
@@ -1387,9 +1408,7 @@ impl App {
     }
 
     fn handle_session_loss(&self, detail: &str) {
-        self.session_storage
-            .remove_item(&self.config.browser_session_request_storage_key)
-            .ok();
+        self.clear_browser_session_request_storage();
         let mut state = self.state.borrow_mut();
         state.request_id = None;
         state.session_active = false;
@@ -1510,12 +1529,7 @@ impl App {
         let response: BrowserSessionRequestOutput =
             api_post_json(&format!("{BROWSER_SESSION_API_BASE}/request"), &payload).await?;
 
-        self.session_storage
-            .set_item(
-                &self.config.browser_session_request_storage_key,
-                &response.request_id,
-            )
-            .map_err(js_error)?;
+        self.store_browser_session_request(&response.request_id)?;
 
         let mut state = self.state.borrow_mut();
         state.request_id = Some(response.request_id);
@@ -2095,9 +2109,7 @@ impl App {
                 return Ok(changed);
             }
             "approved" => {
-                self.session_storage
-                    .remove_item(&self.config.browser_session_request_storage_key)
-                    .ok();
+                self.clear_browser_session_request_storage();
 
                 let mut state = self.state.borrow_mut();
                 let previous_badge = state.status_badge.clone();
@@ -2112,9 +2124,7 @@ impl App {
                 );
             }
             "denied" => {
-                self.session_storage
-                    .remove_item(&self.config.browser_session_request_storage_key)
-                    .ok();
+                self.clear_browser_session_request_storage();
                 let mut state = self.state.borrow_mut();
                 state.request_id = None;
                 state.status_badge = "Denied".to_string();
@@ -2125,9 +2135,7 @@ impl App {
                 return Ok(true);
             }
             "expired" => {
-                self.session_storage
-                    .remove_item(&self.config.browser_session_request_storage_key)
-                    .ok();
+                self.clear_browser_session_request_storage();
                 let mut state = self.state.borrow_mut();
                 state.request_id = None;
                 state.status_badge = "Expired".to_string();
@@ -2841,7 +2849,7 @@ fn load_config(document: &Document) -> Result<AppConfig, JsValue> {
         .body()
         .ok_or_else(|| JsValue::from_str("document body unavailable"))?;
     let url = document.url().unwrap_or_default();
-    let home_token = extract_query_param(&url, "home_token");
+    let home_token = extract_fragment_param(&url, "home_token");
     let access_mode = if home_token.is_some() {
         AccessMode::Shell
     } else {
@@ -2858,13 +2866,15 @@ fn load_config(document: &Document) -> Result<AppConfig, JsValue> {
     })
 }
 
-fn load_state(session_storage: &Storage, config: &AppConfig) -> AppState {
+fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState {
     AppState {
         request_id: if config.access_mode == AccessMode::Gateway {
-            session_storage
-                .get_item(&config.browser_session_request_storage_key)
-                .ok()
-                .flatten()
+            session_storage.and_then(|storage| {
+                storage
+                    .get_item(&config.browser_session_request_storage_key)
+                    .ok()
+                    .flatten()
+            })
         } else {
             None
         },
@@ -2893,8 +2903,22 @@ fn load_state(session_storage: &Storage, config: &AppConfig) -> AppState {
 }
 
 fn extract_query_param(url: &str, key: &str) -> Option<String> {
-    let (_, query) = url.split_once('?')?;
-    for pair in query.split('&') {
+    let (_, query_and_fragment) = url.split_once('?')?;
+    extract_encoded_param(
+        query_and_fragment
+            .split_once('#')
+            .map_or(query_and_fragment, |(query, _)| query),
+        key,
+    )
+}
+
+fn extract_fragment_param(url: &str, key: &str) -> Option<String> {
+    let (_, fragment) = url.split_once('#')?;
+    extract_encoded_param(fragment, key)
+}
+
+fn extract_encoded_param(encoded: &str, key: &str) -> Option<String> {
+    for pair in encoded.split('&') {
         let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
         if name == key {
             let decoded = decode_query_value(value);
@@ -2942,7 +2966,17 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_query_value;
+    use super::{decode_query_value, extract_fragment_param, extract_query_param};
+
+    #[test]
+    fn reads_shell_authority_only_from_the_fragment() {
+        let url = "http://localhost/apps/chat-room/?invite=peer#home_token=scope%2D123";
+        assert_eq!(
+            extract_fragment_param(url, "home_token").as_deref(),
+            Some("scope-123")
+        );
+        assert_eq!(extract_query_param(url, "home_token"), None);
+    }
 
     #[test]
     fn decodes_query_value_for_invite_urls() {

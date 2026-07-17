@@ -226,6 +226,7 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", authority.home_token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"system"}"#))
@@ -238,12 +239,7 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
         .await
         .unwrap();
     let launch_json: serde_json::Value = serde_json::from_slice(&launch_body).unwrap();
-    let system_token = launch_json["route"]
-        .as_str()
-        .unwrap()
-        .split("home_token=")
-        .nth(1)
-        .unwrap();
+    let system_token = test_launch_token_from_route(launch_json["route"].as_str().unwrap());
     let system_summary = app
         .clone()
         .oneshot(
@@ -554,6 +550,13 @@ async fn test_metamask_can_link_multiple_accounts_and_wallet_can_remove_one() {
 
     let removed_id = metamask_accounts[0]["account_id"].as_str().unwrap();
     let encoded = removed_id.replace(':', "%3A");
+    let delete_token = intent_token_for_app_context(
+        dir.path(),
+        WALLET_CAPSULE_ID,
+        &wallet_token,
+        "wallet.account.delete",
+        &json!({ "account_id": removed_id }),
+    );
     let deleted = app
         .clone()
         .oneshot(
@@ -564,7 +567,7 @@ async fn test_metamask_can_link_multiple_accounts_and_wallet_can_remove_one() {
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
                     r#"{{"home_token":"{}"}}"#,
-                    authority.home_token
+                    delete_token
                 )))
                 .unwrap(),
         )

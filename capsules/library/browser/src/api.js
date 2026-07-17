@@ -2,6 +2,7 @@ export function createLibraryRuntime({ getHomeToken }) {
   const CHUNKED_UPLOAD_THRESHOLD_BYTES = 512 * 1024;
   const CHUNKED_UPLOAD_BYTES = 512 * 1024;
   const CHUNKED_UPLOAD_TRANSPORT = "http-chunk-session";
+  const homeParentOrigin = new URLSearchParams(window.location.search).get("home_origin") || "";
 
   async function providerApi(op, payload) {
     const response = await fetch("/api/provider/object/" + encodeURIComponent(op), {
@@ -221,8 +222,8 @@ export function createLibraryRuntime({ getHomeToken }) {
   }
 
   function shellMessage(message) {
-    if (window.parent && window.parent !== window) {
-      window.parent.postMessage({ ...message, homeToken: getHomeToken() }, window.location.origin);
+    if (homeParentOrigin && window.top && window.top !== window) {
+      window.top.postMessage({ ...message, homeToken: getHomeToken() }, homeParentOrigin);
       return true;
     }
     return false;

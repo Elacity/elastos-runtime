@@ -16,18 +16,19 @@ import {
   shellState,
   fetchJson,
   targetById,
-} from "./shell-core.js?v=home-20260713a";
+} from "./shell-core.js?v=home-20260715a";
 import {
   bindHomeUnlock,
   hideHomeUnlock,
   isHomeAuthError,
   refreshHomeSession,
+  requestPasskeyHomeAuthority,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260713a";
+} from "./shell-auth.js?v=home-20260715a";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
-const SUMMARY_REFRESH_AFTER_INTERACTION_MS = 700;
+const SUMMARY_REFRESH_RETRY_MS = 700;
 const HOME_EVENTS_WAIT_MS = 25_000;
 const HOME_EVENTS_RETRY_MS = 2_000;
 const HOME_EVENTS_HIDDEN_RETRY_MS = 30_000;
@@ -35,15 +36,16 @@ const HOME_EVENTS_STREAM_URL = "/api/apps/home/events/stream";
 const SESSION_REFRESH_MS = 10 * 60 * 1000;
 const ACTIVE_SHELL_HINT_KEY = "elastos.home.active-shell-hint";
 const HOME_CLI_SHELL_ID = "home-cli";
-const HOME_GUI_MODULE_URL = import.meta.url.startsWith("file:")
-  ? new URL("../../home-gui/browser/home-gui.js?v=home-20260713a", import.meta.url).href
-  : new URL("../home-gui/home-gui.js?v=home-20260713a", import.meta.url).href;
+const OPAQUE_CAPSULE_ORIGIN = "null";
+const OPAQUE_FRAME_TARGET = "*";
+const MAX_LAUNCHED_APP_CONTEXTS = 128;
 const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   "archive-manager": new Set(["library"]),
   browser: new Set(["library"]),
   "chat-room": new Set(["library"]),
   "gba-emulator": new Set(["library"]),
   "home-cli": "visible-target",
+  "home-gui": "visible-target",
   inbox: "visible-target",
   library: new Set(["archive-manager", "documents", "gba-emulator", "library"]),
   marketplace: "runtime-target",
@@ -58,8 +60,8 @@ const SHELL_MESSAGE_DELIVER_TARGET_SOURCES = Object.freeze({
   documents: new Set(["chat-room"]),
   library: new Set(["archive-manager", "browser", "chat-room"]),
 });
-let homeGuiModule = null;
-let homeGuiLoadPromise = null;
+const PASSKEY_AUTHORITY_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"]);
+const launchedAppContexts = new Map();
 
 function hideHostBootMask() {
   if (!homeShellBootMask) {
@@ -77,16 +79,7 @@ function showHostBootMask() {
   homeShellBootMask.setAttribute("aria-hidden", "true");
 }
 
-function markHomeGuiDormant(options = {}) {
-  document.body.dataset.homeGui = "dormant";
-  document.body.dataset.homeShell = "alternate";
-  if (options.closeWindows === true) {
-    homeGuiModule?.retireHomeGuiSurface?.({ closeWindows: true });
-  }
-  shellState.homeGuiMounted = false;
-}
-
-async function openTargetFromRootShell(context, target, options = {}) {
+async function switchToHomeGuiAndOpenTarget(context, target, options = {}) {
   await activateDesktopShell(context.homeToken);
   await openTargetFromHomeGui(target, options);
 }
@@ -96,9 +89,9 @@ function enterHostAuthGate() {
   shellState.activeShellRootTarget = "";
   shellState.activeShellRootRoute = "";
   rememberActiveShellHint(HOME_GUI_SHELL_ID);
-  dormantHomeGui({ closeWindows: true });
   document.body.dataset.homeShell = "resolving";
   document.body.dataset.homeGui = "dormant";
+  launchedAppContexts.clear();
   if (activeShellRoot) {
     activeShellRoot.hidden = true;
     activeShellRoot.dataset.target = "";
@@ -123,71 +116,32 @@ async function showHostAuthGate(options = {}) {
   await unlockReady;
 }
 
-async function ensureHomeGuiModule() {
-  if (homeGuiModule) {
-    return homeGuiModule;
+async function launchHomeTarget(target, query = {}, authority = null) {
+  const body = {
+    target,
+    query: {
+      ...query,
+      home_origin: window.location.origin,
+    },
+  };
+  if (authority) {
+    body.authority = authority;
   }
-  if (!homeGuiLoadPromise) {
-    homeGuiLoadPromise = import(HOME_GUI_MODULE_URL)
-      .then((module) => {
-        homeGuiModule = module;
-        module.bindHomeGuiInteractions({
-          activateHomeGui: () => activateDesktopShell().catch((error) => {
-            console.error("home shell activation failed", error);
-            showShellHostRecovery(activeShellTarget(shellState.currentSummary), error, {
-              title: "Desktop didn't open",
-              copy: "Reload to try again. Your data is unchanged.",
-            });
-          }),
-          requestHomeUnlock: () => showHostAuthGate({ presentation: "prompt", surface: "neutral" }),
-          requestSummaryRefresh: () => refreshShellSummary(),
-          signOut: signOutHome,
-        });
-        return module;
-      })
-      .catch((error) => {
-        homeGuiLoadPromise = null;
-        throw error;
-      });
+  const launched = await fetchJson("/api/apps/home/launch", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  if (launched?.attach_kind === "iframe") {
+    rememberLaunchedAppContext(launched);
   }
-  return homeGuiLoadPromise;
-}
-
-function dormantHomeGui(options = {}) {
-  const closeWindows = options.closeWindows === true;
-  if (homeGuiModule?.setHomeGuiMounted) {
-    homeGuiModule.setHomeGuiMounted(false, { closeWindows });
-    return;
-  }
-  markHomeGuiDormant({ closeWindows });
-}
-
-async function mountHomeGui() {
-  const module = await ensureHomeGuiModule();
-  module.setHomeGuiMounted(true);
-  hideHostBootMask();
-  return module;
-}
-
-function closeHomeGuiWindowsForTarget(target) {
-  if (homeGuiModule?.closeHomeGuiWindowsForTarget) {
-    homeGuiModule.closeHomeGuiWindowsForTarget(target);
-  }
-}
-
-function homeGuiHasWindows() {
-  return homeGuiModule?.homeGuiHasWindows?.() === true;
-}
-
-function homeGuiInteractionActive() {
-  return homeGuiModule?.homeGuiInteractionActive?.() === true;
+  return launched;
 }
 
 function requireHomeGuiActive(action) {
   if (
     activeShellTarget(shellState.currentSummary) !== HOME_GUI_SHELL_ID ||
-    document.body.dataset.homeShell === "alternate" ||
-    document.body.dataset.homeGui === "dormant"
+    shellState.activeShellRootTarget !== HOME_GUI_SHELL_ID ||
+    !activeShellFrame?.contentWindow
   ) {
     throw new Error(`${action} requires active ${HOME_GUI_SHELL_ID}`);
   }
@@ -195,54 +149,102 @@ function requireHomeGuiActive(action) {
 
 async function openTargetFromHomeGui(target, options = {}) {
   requireHomeGuiActive("open target");
-  const module = await ensureHomeGuiModule();
-  module.openHomeGuiTarget(target, options);
+  postToActiveShell({
+    type: "home:gui-command",
+    command: "open-target",
+    target,
+    query: options.query || {},
+  });
 }
 
-async function closeHomeGuiWindowById(windowId) {
+async function closeHomeGuiWindow(homeToken) {
   requireHomeGuiActive("close window");
-  const module = await ensureHomeGuiModule();
-  module.closeHomeGuiWindow(windowId);
+  postToActiveShell({ type: "home:gui-command", command: "close-window", homeToken });
+  launchedAppContexts.delete(homeToken);
 }
 
-async function relaunchHomeGuiTarget(windowId, target) {
+async function relaunchHomeGuiTarget(homeToken) {
   requireHomeGuiActive("relaunch window");
-  const module = await ensureHomeGuiModule();
-  module.relaunchHomeGuiTarget(windowId, target);
+  postToActiveShell({ type: "home:gui-command", command: "relaunch-window", homeToken });
+  launchedAppContexts.delete(homeToken);
 }
 
 async function deliverMessageToHomeGuiTargetFrame(target, payload) {
   requireHomeGuiActive("deliver target message");
-  const module = await ensureHomeGuiModule();
-  return module.deliverMessageToHomeGuiTargetFrame(target, payload);
+  const contexts = [...launchedAppContexts.values()].reverse();
+  const context = contexts.find((candidate) => candidate.targetId === target && candidate.source);
+  if (!context) {
+    return false;
+  }
+  context.source.postMessage(payload, context.origin);
+  return true;
 }
 
 async function openHomeGuiTargetWithPayload(target, payload) {
   requireHomeGuiActive("open target with payload");
-  const module = await ensureHomeGuiModule();
-  return module.openHomeGuiTargetWithPayload(target, payload);
+  if (await deliverMessageToHomeGuiTargetFrame(target, payload)) {
+    return true;
+  }
+  postToActiveShell({ type: "home:gui-command", command: "open-target", target, query: {} });
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    await new Promise((resolve) => window.setTimeout(resolve, 150));
+    if (await deliverMessageToHomeGuiTargetFrame(target, payload)) {
+      return true;
+    }
+  }
+  console.warn("home target did not become ready for payload", target);
+  return false;
 }
 
 async function showHomeGuiDesktop() {
-  const module = await mountHomeGui();
-  module.showHomeGuiDesktop();
+  requireHomeGuiActive("show desktop");
+  postToActiveShell({ type: "home:gui-command", command: "show-desktop" });
 }
 
-async function restoreHomeGuiSession() {
-  const module = await mountHomeGui();
-  return module.restoreHomeGuiSession();
+function syncActiveShellProjection(summary, activeShellMode) {
+  if (
+    activeShellMode !== "locked" &&
+    activeShellTarget(summary) === shellState.activeShellRootTarget
+  ) {
+    postToActiveShell({ type: "home:shell-summary", summary });
+  }
 }
 
-async function syncHomeGuiProjection(previous, summary, options = {}) {
-  if (options.activeShellMode === "locked") {
+function postToActiveShell(message) {
+  const route = shellState.activeShellRootRoute || activeShellFrame?.dataset?.route || "";
+  if (!route || !activeShellFrame?.contentWindow) {
+    return false;
+  }
+  activeShellFrame.contentWindow.postMessage(message, OPAQUE_FRAME_TARGET);
+  return true;
+}
+
+function replyToShellRequest(event, requestId, result, error = null) {
+  if (!requestId || !event.source) {
     return;
   }
-  if (options.activeShellMode === "alternate") {
-    dormantHomeGui();
-    return;
+  event.source.postMessage({
+    type: "home:shell-response",
+    requestId,
+    result,
+    error: error ? (error.message || String(error)) : undefined,
+    status: Number(error?.status || 0),
+  }, OPAQUE_FRAME_TARGET);
+}
+
+function rememberLaunchedAppContext(launched) {
+  const token = homeLaunchTokenFromRoute(launched?.route || "");
+  if (!token || !launched?.target) {
+    throw new Error("Runtime returned an incomplete isolated launch");
   }
-  const module = await mountHomeGui();
-  module.syncHomeGuiProjection(previous, summary, options);
+  while (launchedAppContexts.size >= MAX_LAUNCHED_APP_CONTEXTS) {
+    launchedAppContexts.delete(launchedAppContexts.keys().next().value);
+  }
+  launchedAppContexts.set(token, {
+    targetId: launched.target,
+    origin: OPAQUE_CAPSULE_ORIGIN,
+    source: null,
+  });
 }
 
 function activeShellTarget(summary) {
@@ -300,15 +302,9 @@ function preclaimActiveShellSwitch(active) {
   shellState.activeShellRootLaunchSeq += 1;
   showHostBootMask();
   hideShellHostRecovery();
-  if (target === HOME_GUI_SHELL_ID) {
-    shellState.activeShellRootTarget = "";
-    shellState.activeShellRootRoute = "";
-    rememberActiveShellHint(HOME_GUI_SHELL_ID);
-    requestShellSummaryRefresh({ reason: "active-shell-applied", delay: 0 });
-    return true;
-  }
   rememberActiveShellHint(target);
-  dormantHomeGui({ closeWindows: true });
+  document.body.dataset.homeShell = target === HOME_GUI_SHELL_ID ? "desktop" : "alternate";
+  document.body.dataset.homeGui = target === HOME_GUI_SHELL_ID ? "mounted" : "dormant";
   if (activeShellRoot) {
     activeShellRoot.hidden = false;
     activeShellRoot.dataset.target = target;
@@ -334,7 +330,7 @@ function applyActiveShellBootHint() {
   document.documentElement.dataset.homeShellHint = "alternate";
   document.documentElement.dataset.homeShellBoot = "alternate";
   document.body.dataset.homeShell = "alternate";
-  dormantHomeGui();
+  document.body.dataset.homeGui = "dormant";
   if (activeShellRoot) {
     activeShellRoot.hidden = false;
     activeShellRoot.dataset.target = target;
@@ -416,7 +412,7 @@ function hideShellHostRecovery() {
 function showShellHostRecovery(target, error, options = {}) {
   const detail = shellHostRecoveryDetailText(error);
   const tokenAvailable = Boolean(activeShellRootHomeToken());
-  dormantHomeGui();
+  document.body.dataset.homeGui = "dormant";
   hideHostBootMask();
   if (activeShellRoot) {
     activeShellRoot.hidden = false;
@@ -532,18 +528,12 @@ async function signOutFromRootShell() {
   }
 }
 
-async function clearActiveShellRoot({ mountGui = true, clearHint = false } = {}) {
-  if (mountGui) {
-    await mountHomeGui();
+function clearActiveShellRoot({ resetHint = false } = {}) {
+  if (resetHint) {
     rememberActiveShellHint(HOME_GUI_SHELL_ID);
   }
-  if (!mountGui && clearHint) {
-    rememberActiveShellHint(HOME_GUI_SHELL_ID);
-  }
-  if (!mountGui) {
-    dormantHomeGui();
-    document.body.dataset.homeShell = "resolving";
-  }
+  document.body.dataset.homeShell = "resolving";
+  document.body.dataset.homeGui = "dormant";
   shellState.activeShellRootTarget = "";
   shellState.activeShellRootRoute = "";
   if (activeShellRoot) {
@@ -576,29 +566,26 @@ function shouldDeferHomeGuiForBootHint(summary, options = {}) {
 async function syncActiveShellRoot(summary, options = {}) {
   const target = activeShellTarget(summary);
   if (!homeSummarySignedIn(summary)) {
-    await clearActiveShellRoot({ mountGui: false, clearHint: true });
+    clearActiveShellRoot({ resetHint: true });
     return "locked";
   }
-  if (target === HOME_GUI_SHELL_ID) {
-    if (shouldDeferHomeGuiForBootHint(summary, options)) {
-      showHostBootMask();
-      await clearActiveShellRoot({ mountGui: false });
-      return "alternate";
-    }
-    await clearActiveShellRoot();
-    return "desktop";
+  if (target === HOME_GUI_SHELL_ID && shouldDeferHomeGuiForBootHint(summary, options)) {
+    showHostBootMask();
+    clearActiveShellRoot();
+    return "alternate";
   }
 
   const candidate = activeShellCandidate(summary, target);
   if (!candidate || candidate.launchable !== true) {
-    await clearActiveShellRoot();
-    return "desktop";
+    clearActiveShellRoot();
+    showActiveShellError(target, "The selected Home shell is not launchable");
+    return "locked";
   }
 
   rememberActiveShellHint(target);
   showHostBootMask();
-  const closeStaleGuiWindows = shellState.homeGuiMounted === true || homeGuiHasWindows();
-  dormantHomeGui({ closeWindows: closeStaleGuiWindows });
+  document.body.dataset.homeShell = target === HOME_GUI_SHELL_ID ? "desktop" : "alternate";
+  document.body.dataset.homeGui = target === HOME_GUI_SHELL_ID ? "mounted" : "dormant";
   if (activeShellRoot) {
     activeShellRoot.hidden = false;
     activeShellRoot.dataset.target = target;
@@ -607,8 +594,6 @@ async function syncActiveShellRoot(summary, options = {}) {
   if (activeShellFrame) {
     activeShellFrame.title = candidate.title || target;
   }
-  closeHomeGuiWindowsForTarget(target);
-
   if (
     shellState.activeShellRootTarget === target &&
     shellState.activeShellRootRoute &&
@@ -616,7 +601,7 @@ async function syncActiveShellRoot(summary, options = {}) {
   ) {
     activeShellFrame.hidden = false;
     hideHostBootMask();
-    return "alternate";
+    return target === HOME_GUI_SHELL_ID ? "desktop" : "alternate";
   }
 
   const launchSeq = shellState.activeShellRootLaunchSeq + 1;
@@ -628,15 +613,9 @@ async function syncActiveShellRoot(summary, options = {}) {
     activeShellFrame.dataset.route = "";
   }
   try {
-    const launched = await fetchJson("/api/apps/home/launch", {
-      method: "POST",
-      body: JSON.stringify({
-        target,
-        query: { shell_mode: "root" },
-      }),
-    });
+    const launched = await launchHomeTarget(target, { shell_mode: "root" });
     if (shellState.activeShellRootLaunchSeq !== launchSeq) {
-      return "alternate";
+      return target === HOME_GUI_SHELL_ID ? "desktop" : "alternate";
     }
     if (launched.attach_kind !== "iframe") {
       throw new Error(`unsupported shell attach kind: ${launched.attach_kind || "unknown"}`);
@@ -656,7 +635,7 @@ async function syncActiveShellRoot(summary, options = {}) {
     console.error("active shell root launch failed", error);
     showActiveShellError(target, error);
   }
-  return "alternate";
+  return target === HOME_GUI_SHELL_ID ? "desktop" : "alternate";
 }
 
 function registerHomeServiceWorker() {
@@ -711,26 +690,139 @@ window.addEventListener("message", (event) => {
   if (!context) {
     return;
   }
+  if (data.type === "home:shell-ready") {
+    if (context.kind === "shell-frame" && shellState.currentSummary) {
+      postToActiveShell({ type: "home:shell-summary", summary: shellState.currentSummary });
+    }
+    return;
+  }
+  if (data.type === "home:app-ready") {
+    return;
+  }
+  if (data.type === "home:launch-target") {
+    const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
+    const target = typeof data.target === "string" ? data.target.trim() : "";
+    if (
+      context.kind !== "shell-frame" ||
+      ![HOME_GUI_SHELL_ID, HOME_CLI_SHELL_ID].includes(context.targetId) ||
+      !requestId ||
+      !target ||
+      !canOpenTargetFromHomeMessage(context, target)
+    ) {
+      replyToShellRequest(event, requestId, null, new Error("Home denied the shell launch"));
+      return;
+    }
+    const query = data.query && typeof data.query === "object" ? data.query : {};
+    launchHomeTarget(target, query)
+      .then((launched) => replyToShellRequest(event, requestId, launched))
+      .catch((error) => replyToShellRequest(event, requestId, null, error));
+    return;
+  }
+  if (data.type === "home:request-unlock") {
+    const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
+    if (
+      context.kind !== "shell-frame" ||
+      ![HOME_GUI_SHELL_ID, HOME_CLI_SHELL_ID].includes(context.targetId)
+    ) {
+      replyToShellRequest(event, requestId, null, new Error("Home denied the unlock request"));
+      return;
+    }
+    replyToShellRequest(event, requestId, true);
+    showHostAuthGate({ presentation: "prompt", surface: "neutral" }).catch((error) => {
+      console.error("home unlock failed", error);
+    });
+    return;
+  }
   if (data.type === "home:refresh-summary") {
     requestShellSummaryRefresh({ reason: "child-message" });
     return;
   }
   if (data.type === "home:active-shell-applied") {
-    if (context.kind !== "app-frame" || context.targetId !== SYSTEM_APP_ID) {
+    const trustedSystemApp = context.kind === "app-frame" && context.targetId === SYSTEM_APP_ID;
+    const trustedRootShell = context.kind === "shell-frame" &&
+      [HOME_GUI_SHELL_ID, HOME_CLI_SHELL_ID].includes(context.targetId);
+    if (!trustedSystemApp && !trustedRootShell) {
       console.warn("home ignored unauthorized active-shell-applied message", context.targetId);
       return;
     }
     preclaimActiveShellSwitch(data.activeShell);
     return;
   }
-  if (data.type === "home:sign-out") {
-    if (context.kind !== "shell-frame" || context.targetId !== HOME_CLI_SHELL_ID) {
-      console.warn("home ignored unauthorized sign-out message", context.targetId);
+  if (data.type === "home:request-passkey-authority") {
+    const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
+    const operation = typeof data.operation === "string" ? data.operation.trim() : "";
+    const request = data.request && typeof data.request === "object" ? data.request : null;
+    if (
+      context.kind !== "app-frame"
+      || !PASSKEY_AUTHORITY_TARGETS.has(context.targetId)
+      || !requestId
+      || requestId.length > 128
+      || !operation
+      || operation.length > 128
+      || !request
+      || JSON.stringify(request).length > 65_536
+    ) {
+      console.warn("home ignored unauthorized passkey request", context.targetId);
       return;
     }
+    const reply = (payload) => {
+      try {
+        event.source?.postMessage({
+          type: "home:passkey-authority-result",
+          requestId,
+          ...payload,
+        }, OPAQUE_FRAME_TARGET);
+      } catch (error) {
+        console.error("home could not return passkey result", error);
+      }
+    };
+    requestPasskeyHomeAuthority()
+      .then(async () => {
+        const launched = await launchHomeTarget(context.targetId, {}, { operation, request });
+        const scopedToken = homeLaunchTokenFromRoute(launched?.route || "");
+        if (!scopedToken) {
+          throw new Error("Passkey verification did not return capsule authority.");
+        }
+        reply({ homeToken: scopedToken });
+      })
+      .catch((error) => reply({
+        error: error instanceof Error ? error.message : "Passkey verification failed.",
+      }));
+    return;
+  }
+  if (data.type === "home:sign-out") {
+    const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
+    if (
+      context.kind !== "shell-frame" ||
+      ![HOME_GUI_SHELL_ID, HOME_CLI_SHELL_ID].includes(context.targetId)
+    ) {
+      console.warn("home ignored unauthorized sign-out message", context.targetId);
+      replyToShellRequest(event, requestId, null, new Error("Home denied the sign-out request"));
+      return;
+    }
+    replyToShellRequest(event, requestId, true);
     signOutFromRootShell().catch((error) => {
       console.error("home shell sign out failed", error);
     });
+    return;
+  }
+  if (data.type === "home:switch-shell-and-open-target") {
+    const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
+    const target = typeof data.target === "string" ? data.target.trim() : "";
+    if (
+      context.kind !== "shell-frame" ||
+      context.targetId !== HOME_CLI_SHELL_ID ||
+      !requestId ||
+      !target ||
+      !canOpenTargetFromHomeMessage(context, target)
+    ) {
+      replyToShellRequest(event, requestId, null, new Error("Home denied the graphical launch"));
+      return;
+    }
+    const query = data.query && typeof data.query === "object" ? data.query : {};
+    switchToHomeGuiAndOpenTarget(context, target, { query })
+      .then(() => replyToShellRequest(event, requestId, true))
+      .catch((error) => replyToShellRequest(event, requestId, null, error));
     return;
   }
   if (data.type === "home:open-uri") {
@@ -803,22 +895,21 @@ window.addEventListener("message", (event) => {
       });
       return;
     }
-    if (context.kind !== "app-frame" || !context.windowId) {
+    if (context.kind !== "app-frame") {
       console.warn("home ignored unauthorized close-self message", context.targetId);
       return;
     }
-    closeHomeGuiWindowById(context.windowId).catch((error) => {
+    closeHomeGuiWindow(context.homeToken).catch((error) => {
       console.error("home close-self failed", error);
     });
     return;
   }
   if (data.type === "home:relaunch-self") {
-    if (context.kind !== "app-frame" || !context.windowId || !context.targetId) {
+    if (context.kind !== "app-frame" || !context.targetId) {
       console.warn("home ignored unauthorized relaunch-self message", context.targetId);
       return;
     }
-    const target = context.targetId;
-    relaunchHomeGuiTarget(context.windowId, target).catch((error) => {
+    relaunchHomeGuiTarget(context.homeToken).catch((error) => {
       console.error("home relaunch-self failed", error);
     });
     return;
@@ -836,13 +927,13 @@ window.addEventListener("message", (event) => {
   }
   const query = data.query && typeof data.query === "object" ? data.query : {};
   if (context.kind === "shell-frame") {
-    openTargetFromRootShell(context, target, { query }).catch((error) => {
-      console.error("home shell open-target failed", error);
-      showShellHostRecovery(context.targetId, error, {
-        title: `Could not open ${target}`,
-        copy: "Reload to try again. Your data is unchanged.",
+    if (context.targetId === HOME_GUI_SHELL_ID) {
+      openTargetFromHomeGui(target, { query }).catch((error) => {
+        console.error("home shell open-target failed", error);
       });
-    });
+    } else {
+      console.warn("home ignored non-graphical shell open-target message", context.targetId, target);
+    }
     return;
   }
   openTargetFromHomeGui(target, { query }).catch((error) => {
@@ -851,11 +942,13 @@ window.addEventListener("message", (event) => {
 });
 
 function homeMessageContext(event, data) {
-  if (event.origin !== window.location.origin || !data || typeof data !== "object") {
+  if (!data || typeof data !== "object") {
     return null;
   }
   if (event.source === window) {
-    return { kind: "home", targetId: HOME_GUI_SHELL_ID };
+    return event.origin === window.location.origin
+      ? { kind: "home", targetId: HOME_GUI_SHELL_ID }
+      : null;
   }
   const homeToken = typeof data.homeToken === "string" ? data.homeToken.trim() : "";
   if (!homeToken) {
@@ -869,6 +962,9 @@ function homeMessageContext(event, data) {
       shellFrameWindow = null;
     }
     if (shellFrameWindow === event.source) {
+      if (event.origin !== OPAQUE_CAPSULE_ORIGIN) {
+        return null;
+      }
       const expectedToken = homeLaunchTokenFromRoute(
         activeShellFrame.dataset.route || activeShellFrame.getAttribute("src") || "",
       );
@@ -881,12 +977,25 @@ function homeMessageContext(event, data) {
       return { kind: "shell-frame", targetId, homeToken };
     }
   }
-  return homeGuiModule?.homeGuiMessageContextForSource?.(event.source, homeToken) || null;
+  const launched = launchedAppContexts.get(homeToken);
+  if (!launched || launched.origin !== event.origin) {
+    return null;
+  }
+  if (launched.source && launched.source !== event.source) {
+    return null;
+  }
+  launched.source = event.source;
+  return {
+    kind: "app-frame",
+    targetId: launched.targetId,
+    homeToken,
+  };
 }
 
 function homeLaunchTokenFromRoute(route) {
   try {
-    return new URL(route, window.location.href).searchParams.get("home_token") || "";
+    const url = new URL(route, window.location.href);
+    return new URLSearchParams(url.hash.replace(/^#/, "")).get("home_token") || "";
   } catch (_error) {
     return "";
   }
@@ -971,10 +1080,14 @@ async function boot() {
   let summary = null;
   const deferHomeGuiForBootHint = Boolean(activeShellBootHintTarget());
   try {
-    summary = await refreshShellSummary({
-      initialize: true,
-      deferHomeGuiForBootHint,
-    });
+    await refreshHomeSession();
+  } catch (error) {
+    if (!isHomeAuthError(error)) {
+      throw error;
+    }
+  }
+  try {
+    summary = await refreshShellSummary({ deferHomeGuiForBootHint });
   } catch (error) {
     if (isHomeAuthError(error)) {
       await showHostAuthGate();
@@ -995,16 +1108,9 @@ async function boot() {
     });
   document.body.dataset.homeStatus = "ready";
   hideHomeUnlock();
-  runtimeReady.then(async () => {
-    const refreshed = await refreshShellSummary();
-    if (activeShellTarget(refreshed) === HOME_GUI_SHELL_ID) {
-      await restoreHomeGuiSession();
-    }
-  }).catch((error) => {
+  runtimeReady.then(() => refreshShellSummary()).catch((error) => {
     console.error("home summary refresh failed after runtime ensure", error);
   });
-  refreshSignedHomeSession();
-
   startShellTimers();
 }
 
@@ -1028,16 +1134,13 @@ function startShellTimers() {
 
 function requestShellSummaryRefresh({ reason = "request", delay = SUMMARY_REFRESH_DEBOUNCE_MS } = {}) {
   window.clearTimeout(shellState.summaryRefreshDebounceTimer);
-  const nextDelay = homeGuiInteractionActive()
-    ? Math.max(delay, SUMMARY_REFRESH_AFTER_INTERACTION_MS)
-    : delay;
   shellState.summaryRefreshDebounceTimer = window.setTimeout(() => {
-    if (document.hidden || homeGuiInteractionActive()) {
-      requestShellSummaryRefresh({ reason, delay: SUMMARY_REFRESH_AFTER_INTERACTION_MS });
+    if (document.hidden) {
+      requestShellSummaryRefresh({ reason, delay: SUMMARY_REFRESH_RETRY_MS });
       return;
     }
     if (shellState.summaryRefreshInFlight) {
-      requestShellSummaryRefresh({ reason, delay: SUMMARY_REFRESH_AFTER_INTERACTION_MS });
+      requestShellSummaryRefresh({ reason, delay: SUMMARY_REFRESH_RETRY_MS });
       return;
     }
     shellState.summaryRefreshInFlight = true;
@@ -1053,7 +1156,7 @@ function requestShellSummaryRefresh({ reason = "request", delay = SUMMARY_REFRES
       .finally(() => {
         shellState.summaryRefreshInFlight = false;
       });
-  }, nextDelay);
+  }, delay);
 }
 
 function homeSummarySignedIn(summary) {
@@ -1087,17 +1190,13 @@ function refreshSignedHomeSession() {
 }
 
 async function refreshShellSummary({
-  initialize = false,
   deferHomeGuiForBootHint = false,
   deferHomeGuiForRuntimeSettle = false,
 } = {}) {
   const summary = await fetchJson("/api/apps/home/summary");
-  const previous = shellState.currentSummary;
   shellState.currentSummary = summary;
   shellState.requestSummaryRefresh = refreshShellSummary;
   document.body.dataset.homeAuthority = homeSummarySignedIn(summary) ? "signed" : "unsigned";
-
-  const principalChanged = browserStatePrincipal(previous) !== browserStatePrincipal(summary);
 
   if (homeSummarySignedIn(summary)) {
     ensureHomeEventChannel();
@@ -1105,20 +1204,11 @@ async function refreshShellSummary({
     stopHomeEventChannel();
   }
 
-  const activeShellChanged = activeShellTarget(previous) !== activeShellTarget(summary);
-  const homeGuiWasMounted = shellState.homeGuiMounted === true;
   const activeShellMode = await syncActiveShellRoot(summary, {
     deferHomeGuiForBootHint,
     deferHomeGuiForRuntimeSettle,
   });
-  await syncHomeGuiProjection(previous, summary, {
-    initialize,
-    principalChanged,
-    activeShellChanged,
-    activeShellIsHomeGui: activeShellTarget(summary) === HOME_GUI_SHELL_ID,
-    activeShellMode,
-    homeGuiWasMounted,
-  });
+  syncActiveShellProjection(summary, activeShellMode);
   return summary;
 }
 
@@ -1257,11 +1347,15 @@ function scheduleHomeEventPoll(delayMs) {
 }
 
 function broadcastHomeRuntimeEvents(events) {
-  homeGuiModule?.broadcastHomeGuiRuntimeEvents?.(events);
-}
-
-function browserStatePrincipal(summary) {
-  return typeof summary?.browser_state?.principal_id === "string"
-    ? summary.browser_state.principal_id
-    : "";
+  const message = {
+    type: "elastos:runtime-events",
+    schema: "elastos.home.runtime-events/v1",
+    events,
+  };
+  postToActiveShell(message);
+  for (const context of launchedAppContexts.values()) {
+    if (context.source) {
+      context.source.postMessage(message, OPAQUE_FRAME_TARGET);
+    }
+  }
 }

@@ -1,4 +1,23 @@
 :root {
+  color-scheme: dark;
+  --bg: #050608;
+  --panel: rgba(22, 24, 29, 0.78);
+  --panel-strong: rgba(22, 24, 29, 0.92);
+  --panel-soft: rgba(255, 255, 255, 0.06);
+  --line: rgba(255, 255, 255, 0.12);
+  --line-strong: rgba(255, 255, 255, 0.2);
+  --text: #f5f7fa;
+  --muted: rgba(245, 247, 250, 0.7);
+  --soft: rgba(245, 247, 250, 0.48);
+  --brand: #f6921a;
+  --brand-strong: #ffb457;
+  --brand-focus: rgba(246, 146, 26, 0.55);
+  --brand-border: rgba(246, 146, 26, 0.72);
+  --brand-ring: rgba(246, 146, 26, 0.24);
+  --brand-glow: rgba(246, 146, 26, 0.26);
+  --brand-line: rgba(246, 146, 26, 0.45);
+  --shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+  --shadow-soft: 0 12px 28px rgba(0, 0, 0, 0.22);
   --window-head-hue: 214;
   --window-head-saturation: 7%;
   --window-head-lightness: 40%;
@@ -8,6 +27,49 @@
   --taskbar-h: 50px;
   --taskbar-offset: 12px;
   --desktop-wallpaper: url("./wallpaper.webp");
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Inter", "Segoe UI", "SF Pro Text", sans-serif;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+}
+
+img {
+  display: block;
+}
+
+.hide-scrollbar {
+  scrollbar-width: none;
+}
+
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
 }
 
 

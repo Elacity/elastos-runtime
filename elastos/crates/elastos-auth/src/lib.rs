@@ -241,10 +241,6 @@ impl RuntimeAuditEventV1 {
 pub const PRINCIPAL_ROOT_PROTECTION_SCHEMA: &str = "elastos.principal.root-protection/v1";
 pub const PRINCIPAL_ROOT_RECOVERY_STATUS_SCHEMA: &str = "elastos.principal.root-recovery.status/v1";
 pub const RECOVERY_KIT_SCHEMA: &str = "elastos.recovery-kit/v1";
-pub const RECOVERY_KIT_PACKAGE_SCHEMA: &str = "elastos.recovery-kit.package/v1";
-pub const RECOVERY_KIT_CREATE_REQUEST_SCHEMA: &str = "elastos.recovery-kit.create.request/v1";
-pub const RECOVERY_KIT_EXPORT_REQUEST_SCHEMA: &str = "elastos.recovery-kit.export.request/v1";
-pub const RECOVERY_KIT_IMPORT_REQUEST_SCHEMA: &str = "elastos.recovery-kit.import.request/v1";
 pub const DEFAULT_PRINCIPAL_ROOT_CIPHER: &str = "aes-256-gcm";
 pub const DEFAULT_PRINCIPAL_ROOT_SIGNATURES: &[&str] = &["ed25519", "ml-dsa-65"];
 pub const DEFAULT_PRINCIPAL_ROOT_KEMS: &[&str] = &["x25519", "ml-kem-768"];
@@ -398,28 +394,6 @@ pub struct RecoveryKitV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RecoveryKitPackageV1 {
-    pub schema: String,
-    pub principal_id: String,
-    pub localhost_root: String,
-    pub kit_id: String,
-    pub created_at: u64,
-    pub protection: RecoveryKitPackageProtectionV1,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecoveryKitPackageProtectionV1 {
-    pub cipher: String,
-    pub kdf: String,
-    pub kdf_params: String,
-    pub salt: String,
-    pub nonce: String,
-    pub encrypted_recovery_kit: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DidRecoveryProofV1 {
     pub schema: String,
     pub did: String,
@@ -431,50 +405,6 @@ pub struct DidRecoveryProofV1 {
     pub issued_at: u64,
     pub expires_at: u64,
     pub signature: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecoveryKitCreateRequestV1 {
-    pub schema: String,
-    pub principal_id: String,
-    pub localhost_root: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub download_password: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecoveryKitExportRequestV1 {
-    pub schema: String,
-    pub principal_id: String,
-    pub localhost_root: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub download_password: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecoveryKitImportRequestV1 {
-    pub schema: String,
-    pub principal_id: String,
-    pub localhost_root: String,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub reassign_to_current_principal: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kit: Option<RecoveryKitV1>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub package: Option<RecoveryKitPackageV1>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub password: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub did_recovery_proof: Option<DidRecoveryProofV1>,
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 pub fn validate_principal_root_crypto_profile(
@@ -579,129 +509,29 @@ pub fn validate_recovery_kit(kit: &RecoveryKitV1) -> Result<(), String> {
     Ok(())
 }
 
-pub fn validate_recovery_kit_package(package: &RecoveryKitPackageV1) -> Result<(), String> {
-    if package.schema != RECOVERY_KIT_PACKAGE_SCHEMA {
-        return Err("unsupported recovery kit package schema".to_string());
+pub fn validate_did_recovery_proof(proof: &DidRecoveryProofV1) -> Result<(), String> {
+    if proof.schema != "elastos.did.recovery-proof/v1" {
+        return Err("unsupported DID recovery proof schema".to_string());
     }
-    validate_principal_root_identity(&package.principal_id, &package.localhost_root)?;
-    validate_auth_token_like_id(&package.kit_id, "kit_id")?;
-    require_allowed_auth_algorithm(
-        &package.protection.cipher,
-        ALLOWED_PRINCIPAL_ROOT_CIPHERS,
-        "recovery kit package cipher",
+    if !(proof.did.starts_with("did:key:") || proof.did.starts_with("did:elastos:")) {
+        return Err("DID recovery proof subject must be did:key or did:elastos".to_string());
+    }
+    validate_principal_root_common(
+        &proof.principal_id,
+        &proof.localhost_root,
+        &proof.data_key_id,
     )?;
-    if package.protection.kdf != "argon2id" {
-        return Err("recovery kit package kdf must be argon2id".to_string());
-    }
-    if package.protection.kdf_params.trim().is_empty()
-        || package.protection.kdf_params.len() > 128
-        || package
-            .protection
-            .kdf_params
-            .chars()
-            .any(|ch| ch.is_ascii_control())
+    validate_auth_token_like_id(&proof.protector_id, "did_recovery_proof.protector_id")?;
+    validate_auth_token_like_id(&proof.nonce, "did_recovery_proof.nonce")?;
+    if proof.signature.is_empty()
+        || proof.signature.len() > 4096
+        || proof.signature.len() % 2 != 0
+        || !proof.signature.chars().all(|ch| ch.is_ascii_hexdigit())
     {
-        return Err("recovery kit package kdf_params is invalid".to_string());
+        return Err("did_recovery_proof.signature must be hex encoded".to_string());
     }
-    validate_base64url_field(&package.protection.salt, "recovery kit package salt")?;
-    validate_base64url_field(&package.protection.nonce, "recovery kit package nonce")?;
-    validate_base64url_field(
-        &package.protection.encrypted_recovery_kit,
-        "encrypted recovery kit package",
-    )
-}
-
-pub fn validate_recovery_kit_create_request(
-    request: &RecoveryKitCreateRequestV1,
-) -> Result<(), String> {
-    if request.schema != RECOVERY_KIT_CREATE_REQUEST_SCHEMA {
-        return Err("unsupported recovery kit create request schema".to_string());
-    }
-    validate_principal_root_identity(&request.principal_id, &request.localhost_root)?;
-    if let Some(label) = &request.label {
-        if label.trim().is_empty()
-            || label.len() > 64
-            || label
-                .chars()
-                .any(|ch| ch.is_ascii_control() || ch == '/' || ch == '\\')
-        {
-            return Err("recovery kit label is invalid".to_string());
-        }
-    }
-    if let Some(password) = &request.download_password {
-        validate_recovery_kit_password(password, "download_password")?;
-    }
-    Ok(())
-}
-
-pub fn validate_recovery_kit_export_request(
-    request: &RecoveryKitExportRequestV1,
-) -> Result<(), String> {
-    if request.schema != RECOVERY_KIT_EXPORT_REQUEST_SCHEMA {
-        return Err("unsupported recovery kit export request schema".to_string());
-    }
-    validate_principal_root_identity(&request.principal_id, &request.localhost_root)?;
-    if let Some(password) = &request.download_password {
-        validate_recovery_kit_password(password, "download_password")?;
-    }
-    Ok(())
-}
-
-pub fn validate_recovery_kit_import_request(
-    request: &RecoveryKitImportRequestV1,
-) -> Result<(), String> {
-    if request.schema != RECOVERY_KIT_IMPORT_REQUEST_SCHEMA {
-        return Err("unsupported recovery kit import request schema".to_string());
-    }
-    validate_principal_root_identity(&request.principal_id, &request.localhost_root)?;
-    match (&request.kit, &request.package) {
-        (Some(kit), None) => {
-            validate_recovery_kit(kit)?;
-            if !request.reassign_to_current_principal
-                && (kit.principal_id != request.principal_id
-                    || kit.localhost_root != request.localhost_root)
-            {
-                return Err("recovery kit principal binding mismatch".to_string());
-            }
-            if request.password.is_some() {
-                return Err(
-                    "recovery kit password is only valid with a protected package".to_string(),
-                );
-            }
-        }
-        (None, Some(package)) => {
-            validate_recovery_kit_package(package)?;
-            if !request.reassign_to_current_principal
-                && (package.principal_id != request.principal_id
-                    || package.localhost_root != request.localhost_root)
-            {
-                return Err("recovery kit package principal binding mismatch".to_string());
-            }
-            let Some(password) = &request.password else {
-                return Err("recovery kit package password is required".to_string());
-            };
-            validate_recovery_kit_password(password, "password")?;
-        }
-        (Some(_), Some(_)) => {
-            return Err("recovery import must include either kit or package, not both".to_string());
-        }
-        (None, None) => {
-            return Err("recovery import requires kit or package".to_string());
-        }
-    }
-    if let Some(proof) = &request.did_recovery_proof {
-        validate_did_recovery_proof(proof)?;
-    }
-    Ok(())
-}
-
-pub fn validate_recovery_kit_password(password: &str, field: &str) -> Result<(), String> {
-    let password = password.trim();
-    if password.len() < 12 || password.len() > 256 {
-        return Err(format!("{field} must be between 12 and 256 characters"));
-    }
-    if password.chars().any(|ch| ch.is_ascii_control()) {
-        return Err(format!("{field} must not contain control characters"));
+    if proof.expires_at <= proof.issued_at {
+        return Err("DID recovery proof expiry is invalid".to_string());
     }
     Ok(())
 }
@@ -772,38 +602,6 @@ fn validate_principal_root_protector_archive_kind(
     Ok(())
 }
 
-fn validate_did_recovery_proof(proof: &DidRecoveryProofV1) -> Result<(), String> {
-    if proof.schema != "elastos.did.recovery-proof/v1" {
-        return Err("unsupported DID recovery proof schema".to_string());
-    }
-    if !(proof.did.starts_with("did:key:") || proof.did.starts_with("did:elastos:")) {
-        return Err("DID recovery proof subject must be did:key or did:elastos".to_string());
-    }
-    validate_principal_root_common(
-        &proof.principal_id,
-        &proof.localhost_root,
-        &proof.data_key_id,
-    )?;
-    validate_auth_token_like_id(&proof.protector_id, "did_recovery_proof.protector_id")?;
-    validate_auth_token_like_id(&proof.nonce, "did_recovery_proof.nonce")?;
-    validate_hex_field(&proof.signature, "did_recovery_proof.signature")?;
-    if proof.expires_at <= proof.issued_at {
-        return Err("DID recovery proof expiry is invalid".to_string());
-    }
-    Ok(())
-}
-
-fn validate_hex_field(value: &str, field: &str) -> Result<(), String> {
-    if value.is_empty()
-        || value.len() > 4096
-        || value.len() % 2 != 0
-        || !value.chars().all(|ch| ch.is_ascii_hexdigit())
-    {
-        return Err(format!("{field} must be hex encoded"));
-    }
-    Ok(())
-}
-
 fn validate_principal_root_recovery_archive(
     archive: &PrincipalRootRecoveryArchiveV1,
 ) -> Result<(), String> {
@@ -853,14 +651,6 @@ fn validate_principal_root_common(
     if !data_key_id.starts_with("pdek:") {
         return Err("data_key_id must start with pdek:".to_string());
     }
-    validate_principal_localhost_root(localhost_root)
-}
-
-fn validate_principal_root_identity(
-    principal_id: &str,
-    localhost_root: &str,
-) -> Result<(), String> {
-    validate_auth_token_like_id(principal_id, "principal_id")?;
     validate_principal_localhost_root(localhost_root)
 }
 
@@ -1611,292 +1401,45 @@ mod tests {
     }
 
     #[test]
-    fn recovery_kit_import_request_rejects_cross_principal_material() {
-        let request = RecoveryKitImportRequestV1 {
-            schema: RECOVERY_KIT_IMPORT_REQUEST_SCHEMA.to_string(),
-            principal_id: "person:local:abc123".to_string(),
-            localhost_root: "localhost://Users/abc123".to_string(),
-            reassign_to_current_principal: false,
-            kit: Some(RecoveryKitV1 {
-                schema: RECOVERY_KIT_SCHEMA.to_string(),
-                kit_id: "kit:abc123".to_string(),
-                protector_id: "protector:recovery:abc123".to_string(),
-                principal_id: "person:local:def456".to_string(),
-                localhost_root: "localhost://Users/def456".to_string(),
-                data_key_id: "pdek:abc123".to_string(),
-                recovery_phrase: "aaaa-bbbb-cccc-dddd-eeee-ffff-1111-2222-3333-4444".to_string(),
-                salt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
-                nonce: "AAAAAAAAAAAAAAAA".to_string(),
-                wrapped_data_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
-                encrypted_root_descriptor: "enc:v1:metadata-ciphertext".to_string(),
-                crypto: PrincipalRootCryptoProfileV1 {
-                    recovery_kdf: "hkdf-sha256".to_string(),
-                    ..PrincipalRootCryptoProfileV1::default()
-                },
-                created_at: 1_800_000_000,
-                instructions: vec!["Import through ElastOS Runtime recovery.".to_string()],
-            }),
-            package: None,
-            password: None,
-            did_recovery_proof: None,
-        };
-
-        let err = validate_recovery_kit_import_request(&request)
-            .expect_err("recovery kit material must be bound to the request principal");
-        assert!(err.contains("principal binding mismatch"));
-    }
-
-    #[test]
-    fn recovery_kit_import_request_allows_explicit_reassignment_shape() {
-        let request = RecoveryKitImportRequestV1 {
-            schema: RECOVERY_KIT_IMPORT_REQUEST_SCHEMA.to_string(),
-            principal_id: "person:local:new123".to_string(),
-            localhost_root: "localhost://Users/new123".to_string(),
-            reassign_to_current_principal: true,
-            kit: Some(RecoveryKitV1 {
-                schema: RECOVERY_KIT_SCHEMA.to_string(),
-                kit_id: "kit:old123".to_string(),
-                protector_id: "protector:recovery:old123".to_string(),
-                principal_id: "person:local:old123".to_string(),
-                localhost_root: "localhost://Users/old123".to_string(),
-                data_key_id: "pdek:abc123".to_string(),
-                recovery_phrase: "aaaa-bbbb-cccc-dddd-eeee-ffff-1111-2222-3333-4444".to_string(),
-                salt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
-                nonce: "AAAAAAAAAAAAAAAA".to_string(),
-                wrapped_data_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
-                encrypted_root_descriptor: "enc:v1:metadata-ciphertext".to_string(),
-                crypto: PrincipalRootCryptoProfileV1 {
-                    recovery_kdf: "hkdf-sha256".to_string(),
-                    ..PrincipalRootCryptoProfileV1::default()
-                },
-                created_at: 1_800_000_000,
-                instructions: vec!["Import through ElastOS Runtime recovery.".to_string()],
-            }),
-            package: None,
-            password: None,
-            did_recovery_proof: None,
-        };
-
-        validate_recovery_kit_import_request(&request)
-            .expect("explicit reassignment may carry a recovered principal/root");
-    }
-
-    #[test]
-    fn recovery_kit_import_request_accepts_did_recovery_proof_shape() {
-        let request = RecoveryKitImportRequestV1 {
-            schema: RECOVERY_KIT_IMPORT_REQUEST_SCHEMA.to_string(),
-            principal_id: "person:local:abc123".to_string(),
-            localhost_root: "localhost://Users/abc123".to_string(),
-            reassign_to_current_principal: false,
-            kit: Some(RecoveryKitV1 {
-                schema: RECOVERY_KIT_SCHEMA.to_string(),
-                kit_id: "kit:abc123".to_string(),
-                protector_id: "protector:recovery:abc123".to_string(),
-                principal_id: "person:local:abc123".to_string(),
-                localhost_root: "localhost://Users/abc123".to_string(),
-                data_key_id: "pdek:abc123".to_string(),
-                recovery_phrase: "aaaa-bbbb-cccc-dddd-eeee-ffff-1111-2222-3333-4444".to_string(),
-                salt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
-                nonce: "AAAAAAAAAAAAAAAA".to_string(),
-                wrapped_data_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
-                encrypted_root_descriptor: "enc:v1:metadata-ciphertext".to_string(),
-                crypto: PrincipalRootCryptoProfileV1 {
-                    recovery_kdf: "hkdf-sha256".to_string(),
-                    ..PrincipalRootCryptoProfileV1::default()
-                },
-                created_at: 1_800_000_000,
-                instructions: vec!["Import through ElastOS Runtime recovery.".to_string()],
-            }),
-            package: None,
-            password: None,
-            did_recovery_proof: Some(DidRecoveryProofV1 {
-                schema: "elastos.did.recovery-proof/v1".to_string(),
-                did: "did:key:z6Mkh11111111111111111111111111111111111111111".to_string(),
-                principal_id: "person:local:abc123".to_string(),
-                localhost_root: "localhost://Users/abc123".to_string(),
-                protector_id: "protector:did:abc123".to_string(),
-                data_key_id: "pdek:abc123".to_string(),
-                nonce: "nonce:abc123".to_string(),
-                issued_at: 1_800_000_000,
-                expires_at: 1_800_000_300,
-                signature: "ab".repeat(64),
-            }),
-        };
-
-        validate_recovery_kit_import_request(&request)
-            .expect("DID recovery proof shape should validate before provider verification");
-    }
-
-    #[test]
-    fn recovery_kit_import_request_rejects_unknown_nested_fields_at_decode() {
-        let mut request = serde_json::json!({
-            "schema": RECOVERY_KIT_IMPORT_REQUEST_SCHEMA,
+    fn recovery_kit_rejects_unknown_fields_at_decode() {
+        let value = serde_json::json!({
+            "schema": RECOVERY_KIT_SCHEMA,
+            "kit_id": "kit:abc123",
+            "protector_id": "protector:recovery:abc123",
             "principal_id": "person:local:abc123",
             "localhost_root": "localhost://Users/abc123",
-            "reassign_to_current_principal": false,
-            "kit": {
-                "schema": RECOVERY_KIT_SCHEMA,
-                "kit_id": "kit:abc123",
-                "protector_id": "protector:recovery:abc123",
-                "principal_id": "person:local:abc123",
-                "localhost_root": "localhost://Users/abc123",
-                "data_key_id": "pdek:abc123",
-                "recovery_phrase": "aaaa-bbbb-cccc-dddd-eeee-ffff-1111-2222-3333-4444",
-                "salt": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                "nonce": "AAAAAAAAAAAAAAAA",
-                "wrapped_data_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                "encrypted_root_descriptor": "enc:v1:metadata-ciphertext",
-                "crypto": {
-                    "cipher": "aes-256-gcm",
-                    "signatures": ["ed25519", "ml-dsa-65"],
-                    "kems": ["x25519", "ml-kem-768"],
-                    "recovery_kdf": "hkdf-sha256"
-                },
-                "created_at": 1800000000,
-                "instructions": ["Import through ElastOS Runtime recovery."],
-                "raw_prf_output": "secret"
-            },
-            "did_recovery_proof": {
-                "schema": "elastos.did.recovery-proof/v1",
-                "did": "did:key:z6Mkh11111111111111111111111111111111111111111",
-                "principal_id": "person:local:abc123",
-                "localhost_root": "localhost://Users/abc123",
-                "protector_id": "protector:did:abc123",
-                "data_key_id": "pdek:abc123",
-                "nonce": "nonce:abc123",
-                "issued_at": 1800000000,
-                "expires_at": 1800000300,
-                "signature": "ab"
-            }
+            "data_key_id": "pdek:abc123",
+            "recovery_phrase": "aaaa-bbbb-cccc-dddd-eeee-ffff-1111-2222-3333-4444",
+            "salt": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "nonce": "AAAAAAAAAAAAAAAA",
+            "wrapped_data_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "encrypted_root_descriptor": "enc:v1:metadata-ciphertext",
+            "crypto": PrincipalRootCryptoProfileV1::default(),
+            "created_at": 1_800_000_000_u64,
+            "instructions": ["Keep it offline."],
+            "hidden_key": "must not deserialize",
         });
-        let err = serde_json::from_value::<RecoveryKitImportRequestV1>(request.clone())
+
+        assert!(serde_json::from_value::<RecoveryKitV1>(value).is_err());
+    }
+
+    #[test]
+    fn did_recovery_proof_rejects_malformed_signature() {
+        let proof = DidRecoveryProofV1 {
+            schema: "elastos.did.recovery-proof/v1".to_string(),
+            did: "did:key:z6Mktest".to_string(),
+            principal_id: "person:local:abc123".to_string(),
+            localhost_root: "localhost://Users/abc123".to_string(),
+            protector_id: "protector:did:abc123".to_string(),
+            data_key_id: "pdek:abc123".to_string(),
+            nonce: "nonce:abc123".to_string(),
+            issued_at: 1_800_000_000,
+            expires_at: 1_800_000_300,
+            signature: "not-hex".to_string(),
+        };
+
+        assert!(validate_did_recovery_proof(&proof)
             .unwrap_err()
-            .to_string();
-        assert!(err.contains("raw_prf_output"));
-
-        request["kit"]
-            .as_object_mut()
-            .unwrap()
-            .remove("raw_prf_output");
-        request["did_recovery_proof"]
-            .as_object_mut()
-            .unwrap()
-            .insert(
-                "unchecked_resolver".to_string(),
-                serde_json::json!("bypass"),
-            );
-        let err = serde_json::from_value::<RecoveryKitImportRequestV1>(request)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unchecked_resolver"));
-    }
-
-    #[test]
-    fn recovery_kit_import_request_rejects_malformed_did_recovery_proof() {
-        let request = RecoveryKitImportRequestV1 {
-            schema: RECOVERY_KIT_IMPORT_REQUEST_SCHEMA.to_string(),
-            principal_id: "person:local:abc123".to_string(),
-            localhost_root: "localhost://Users/abc123".to_string(),
-            reassign_to_current_principal: false,
-            kit: None,
-            package: Some(RecoveryKitPackageV1 {
-                schema: RECOVERY_KIT_PACKAGE_SCHEMA.to_string(),
-                principal_id: "person:local:abc123".to_string(),
-                localhost_root: "localhost://Users/abc123".to_string(),
-                kit_id: "kit:abc123".to_string(),
-                created_at: 1_800_000_000,
-                protection: RecoveryKitPackageProtectionV1 {
-                    cipher: "aes-256-gcm".to_string(),
-                    kdf: "argon2id".to_string(),
-                    kdf_params: "m=19456,t=2,p=1,len=32".to_string(),
-                    salt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
-                    nonce: "AAAAAAAAAAAAAAAA".to_string(),
-                    encrypted_recovery_kit: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-                        .to_string(),
-                },
-            }),
-            password: Some("correct horse battery".to_string()),
-            did_recovery_proof: Some(DidRecoveryProofV1 {
-                schema: "elastos.did.recovery-proof/v1".to_string(),
-                did: "did:key:z6Mkh11111111111111111111111111111111111111111".to_string(),
-                principal_id: "person:local:abc123".to_string(),
-                localhost_root: "localhost://Users/abc123".to_string(),
-                protector_id: "protector:did:abc123".to_string(),
-                data_key_id: "pdek:abc123".to_string(),
-                nonce: "nonce:abc123".to_string(),
-                issued_at: 1_800_000_000,
-                expires_at: 1_800_000_300,
-                signature: "not hex".to_string(),
-            }),
-        };
-
-        let err = validate_recovery_kit_import_request(&request)
-            .expect_err("DID recovery proof must be structurally valid");
-        assert!(err.contains("signature"));
-    }
-
-    #[test]
-    fn recovery_kit_import_request_accepts_password_package_shape() {
-        let request = RecoveryKitImportRequestV1 {
-            schema: RECOVERY_KIT_IMPORT_REQUEST_SCHEMA.to_string(),
-            principal_id: "person:local:abc123".to_string(),
-            localhost_root: "localhost://Users/abc123".to_string(),
-            reassign_to_current_principal: false,
-            kit: None,
-            package: Some(RecoveryKitPackageV1 {
-                schema: RECOVERY_KIT_PACKAGE_SCHEMA.to_string(),
-                principal_id: "person:local:abc123".to_string(),
-                localhost_root: "localhost://Users/abc123".to_string(),
-                kit_id: "kit:abc123".to_string(),
-                created_at: 1_800_000_000,
-                protection: RecoveryKitPackageProtectionV1 {
-                    cipher: "aes-256-gcm".to_string(),
-                    kdf: "argon2id".to_string(),
-                    kdf_params: "m=19456,t=2,p=1,len=32".to_string(),
-                    salt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
-                    nonce: "AAAAAAAAAAAAAAAA".to_string(),
-                    encrypted_recovery_kit: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-                        .to_string(),
-                },
-            }),
-            password: Some("correct horse battery".to_string()),
-            did_recovery_proof: None,
-        };
-
-        validate_recovery_kit_import_request(&request)
-            .expect("password package import contract should validate");
-    }
-
-    #[test]
-    fn recovery_kit_import_request_requires_password_for_package() {
-        let request = RecoveryKitImportRequestV1 {
-            schema: RECOVERY_KIT_IMPORT_REQUEST_SCHEMA.to_string(),
-            principal_id: "person:local:abc123".to_string(),
-            localhost_root: "localhost://Users/abc123".to_string(),
-            reassign_to_current_principal: false,
-            kit: None,
-            package: Some(RecoveryKitPackageV1 {
-                schema: RECOVERY_KIT_PACKAGE_SCHEMA.to_string(),
-                principal_id: "person:local:abc123".to_string(),
-                localhost_root: "localhost://Users/abc123".to_string(),
-                kit_id: "kit:abc123".to_string(),
-                created_at: 1_800_000_000,
-                protection: RecoveryKitPackageProtectionV1 {
-                    cipher: "aes-256-gcm".to_string(),
-                    kdf: "argon2id".to_string(),
-                    kdf_params: "m=19456,t=2,p=1,len=32".to_string(),
-                    salt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
-                    nonce: "AAAAAAAAAAAAAAAA".to_string(),
-                    encrypted_recovery_kit: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-                        .to_string(),
-                },
-            }),
-            password: None,
-            did_recovery_proof: None,
-        };
-
-        let err = validate_recovery_kit_import_request(&request)
-            .expect_err("protected package import must require a password");
-        assert!(err.contains("password"));
+            .contains("hex encoded"));
     }
 }

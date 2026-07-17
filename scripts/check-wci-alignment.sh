@@ -274,7 +274,7 @@ check_required 'EventSource' capsules/home-cli/browser/home-cli.js 'Home CLI bro
 check_required 'queueRuntimeTerminalInput' capsules/home-cli/browser/home-cli.js 'Home CLI browser shell must send raw terminal input through Runtime'
 check_required 'resizeRuntimeTerminal' capsules/home-cli/browser/home-cli.js 'Home CLI browser shell must report terminal resize through Runtime'
 check_required 'elastos\.home\.terminal-host-intent/v1' capsules/home-cli/browser/home-cli.js 'Home CLI browser shell must forward Home CLI TUI host intents without direct app launch'
-check_required 'home:open-target' capsules/home-cli/browser/home-cli.js 'Home CLI must ask Home to open visible capsules through the signed Home message channel'
+check_required 'home:switch-shell-and-open-target' capsules/home-cli/browser/home-cli.js 'Home CLI must ask Home to switch explicitly before opening a GUI-only capsule'
 check_required 'print_cli_inspect' capsules/home-cli/src/line_views.rs 'Home CLI must render Runtime-derived capsule projection facts'
 check_required 'print_cli_contract' capsules/home-cli/src/line_views.rs 'Home CLI must render the shared capsule interface contract'
 check_required 'home-shell-boot-mask' capsules/home/browser/index.html 'Home shell host must neutral-mask first paint until Runtime selects the active shell'
@@ -522,8 +522,9 @@ if rg_search 'passkey|webauthn|PublicKeyCredential|credentials\.(create|get)' ca
   echo
   failed=1
 fi
-check_forbidden_in_path 'credentials\.create|passkey/register|webauthn/register' capsules/inbox 'Inbox may request fresh passkey authentication for wallet or Inspector approval, but must not register passkeys'
-check_forbidden_in_path 'credentials\.create|passkey/register|webauthn/register' capsules/wallet 'Wallet may request fresh passkey authentication for protected recovery, but must not register passkeys'
+check_forbidden_in_path 'navigator\.credentials|/api/auth/passkey/(authenticate|register)' capsules/inbox 'Inbox passkey ceremonies must remain in the trusted Home host'
+check_forbidden_in_path 'navigator\.credentials|/api/auth/passkey/(authenticate|register)' capsules/system 'System passkey ceremonies must remain in the trusted Home host'
+check_forbidden_in_path 'navigator\.credentials|/api/auth/passkey/(authenticate|register)' capsules/wallet 'Wallet passkey ceremonies must remain in the trusted Home host'
 if rg_search $'fetch[[:space:]]*\\([[:space:]]*["\\\'`]https?://|\\.open[[:space:]]*\\([[:space:]]*["\\\'`][A-Z]+["\\\'`][[:space:]]*,[[:space:]]*["\\\'`]https?://|new[[:space:]]+WebSocket[[:space:]]*\\([[:space:]]*["\\\'`]wss?://|new[[:space:]]+EventSource[[:space:]]*\\([[:space:]]*["\\\'`]https?://|sendBeacon[[:space:]]*\\([[:space:]]*["\\\'`]https?://' capsules \
   --glob '*/browser/**' \
   --glob '!capsules/*-provider/**' \

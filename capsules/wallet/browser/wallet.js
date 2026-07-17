@@ -1,5 +1,10 @@
 import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260523a";
-import { createWalletApi, readQueryParam } from "./wallet-api.js?v=wallet-20260523a";
+import {
+  createWalletApi,
+  readHomeOrigin,
+  readLaunchToken,
+  readQueryParam,
+} from "./wallet-api.js?v=wallet-20260715a";
 import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260523a";
 import {
   BALANCE_NETWORKS,
@@ -37,6 +42,7 @@ import {
 } from "./wallet-render.js?v=wallet-20260711c";
 
 const statusNode = document.querySelector("#wallet-status");
+const homeParentOrigin = readHomeOrigin();
 const accountsNode = document.querySelector("#wallet-accounts");
 const requestsNode = document.querySelector("#wallet-requests");
 const requestsPanelNode = document.querySelector("#wallet-requests-panel");
@@ -53,7 +59,10 @@ const modalBackdropNode = document.querySelector("#wallet-modal-backdrop");
 const modalNode = document.querySelector("#wallet-modal");
 const activityNode = document.querySelector("#wallet-activity");
 
-let activeHomeToken = readQueryParam("home_token");
+let activeHomeToken = readLaunchToken();
+if (activeHomeToken && homeParentOrigin && window.top !== window) {
+  window.top.postMessage({ type: "home:app-ready", homeToken: activeHomeToken }, homeParentOrigin);
+}
 let currentAccounts = [];
 let currentDefaults = [];
 let currentBalanceRows = [];
@@ -229,7 +238,7 @@ function boot() {
 }
 
 function onRuntimeEvents(event) {
-  if (event.origin !== window.location.origin) {
+  if (event.origin !== homeParentOrigin || event.source !== window.top) {
     return;
   }
   const message = event.data || {};

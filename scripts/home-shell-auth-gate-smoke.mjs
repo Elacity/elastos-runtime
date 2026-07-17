@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260713a";
+const moduleVersion = "home-20260715a";
 const requests = [];
 const windowListeners = new Map();
 
@@ -253,7 +253,7 @@ const activeShellFrame = elementForSelector("#active-shell-frame");
 activeShellRoot.hidden = false;
 activeShellRoot.dataset.target = "home-cli";
 activeShellFrame.hidden = false;
-activeShellFrame.dataset.route = "/apps/home-cli/?shell_mode=root&home_token=stale-token";
+activeShellFrame.dataset.route = "/apps/home-cli/?shell_mode=root#home_token=stale-token";
 activeShellFrame.setAttribute("src", activeShellFrame.dataset.route);
 
 await import(`../capsules/home/browser/home-shell-host.js?v=${moduleVersion}`);
@@ -295,7 +295,7 @@ for (
 }
 assert(
   document.body.dataset.homeShell === "resolving",
-  "locked summary refresh put Home back into alternate-shell mode",
+  "locked summary refresh exposed a root shell",
   document.body.dataset,
 );
 assert(activeShellRoot.hidden === true, "locked summary refresh showed the active shell root");

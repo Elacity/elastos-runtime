@@ -261,7 +261,18 @@ async fn dispatch_inbox_action(
         let Some(home_token) = action.home_token.as_deref() else {
             anyhow::bail!("fresh passkey verification is required to sign with a built-in wallet");
         };
-        require_fresh_passkey_home_token(data_dir, home_token, context, 180)?;
+        consume_fresh_passkey_home_token(
+            data_dir,
+            home_token,
+            context,
+            INBOX_CAPSULE_ID,
+            180,
+            "wallet.approve",
+            &serde_json::json!({
+                "request_id": request_id,
+                "reason": "Approved in Inbox",
+            }),
+        )?;
         let outcome = approve_managed_wallet_request(
             state,
             data_dir,
@@ -330,8 +341,7 @@ async fn dispatch_inbox_action(
         let Some(home_token) = action.home_token.as_deref() else {
             anyhow::bail!("fresh passkey verification is required to approve an Inspector action");
         };
-        require_fresh_passkey_home_token(data_dir, home_token, context, 180)?;
-        return approve_inspect_action_request(state, context, request_id).await;
+        return approve_inspect_action_request(state, context, request_id, home_token).await;
     }
     if let Some(request_id) = action_id.strip_prefix("inspect-deny-request:") {
         return deny_inspect_action_request(state, context, request_id);

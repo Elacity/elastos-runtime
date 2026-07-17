@@ -30,7 +30,7 @@ async fn test_system_can_select_default_wallet_without_exposing_connector_author
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/system/wallet/default")
-                .header("x-elastos-home-token", token)
+                .header("x-elastos-home-token", token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
                     r#"{{"account_id":"{account_id}","chain_namespace":"eip155:8453","intent":"transaction_intent"}}"#
@@ -97,16 +97,26 @@ async fn test_system_approves_managed_wallet_request_and_executes_signature() {
     let missing_text = String::from_utf8(missing_body.to_vec()).unwrap();
     assert!(missing_text.contains("fresh passkey verification is required"));
 
+    let approval_token = intent_token_for_authority_context(
+        dir.path(),
+        SYSTEM_CAPSULE_ID,
+        &authority,
+        "wallet.approve",
+        &json!({
+            "request_id": "wallet-approval:managed",
+            "reason": "Looks correct",
+        }),
+    );
     let approved = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/system/wallet/approvals/wallet-approval%3Amanaged/approve")
-                .header("x-elastos-home-token", token)
+                .header("x-elastos-home-token", token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
                     r#"{{"reason":"Looks correct","home_token":"{}"}}"#,
-                    authority.home_token
+                    approval_token
                 )))
                 .unwrap(),
         )
@@ -150,16 +160,26 @@ async fn test_system_does_not_approve_external_wallet_request() {
     };
     let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
 
+    let approval_token = intent_token_for_authority_context(
+        dir.path(),
+        SYSTEM_CAPSULE_ID,
+        &authority,
+        "wallet.approve",
+        &json!({
+            "request_id": "wallet-approval:external",
+            "reason": "Looks correct",
+        }),
+    );
     let approved = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/system/wallet/approvals/wallet-approval%3Aexternal/approve")
-                .header("x-elastos-home-token", token)
+                .header("x-elastos-home-token", token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
                     r#"{{"reason":"Looks correct","home_token":"{}"}}"#,
-                    authority.home_token
+                    approval_token
                 )))
                 .unwrap(),
         )

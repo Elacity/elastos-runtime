@@ -184,14 +184,20 @@ export function createWalletCreateAccountFlow({
     );
     setBusy(submit, true);
     try {
-      const homeToken = await requestFreshPasskeyHomeToken();
+      const intent = {
+        recovery_key: recoveryKey,
+        label: label || null,
+      };
+      const homeToken = await requestFreshPasskeyHomeToken(
+        "wallet.recovery-key.import",
+        intent,
+      );
       await fetchJson("/api/apps/wallet/wallet/accounts/import-recovery-key", {
         method: "POST",
-        headers: shellHeaders({ "content-type": "application/json" }),
+        headers: shellHeaders({ "content-type": "application/json" }, homeToken),
         body: JSON.stringify({
           home_token: homeToken,
-          recovery_key: recoveryKey,
-          label: label || undefined,
+          ...intent,
         }),
       });
       closeModal();

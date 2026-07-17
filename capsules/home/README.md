@@ -13,14 +13,16 @@ Current truth:
      selectable shell
    - browser assets live under `browser/`
    - the runtime serves that surface at `/apps/home/`
-   - legacy saved active-shell state may use `home` only as a migration value
-     that repairs to `home-gui`; new active-shell writes must not use `home`
+   - active-shell writes use only `home-gui` or `home-cli`; `home` is never a
+     selectable shell
 
 2. Home mounts exactly one active shell through runtime-owned summary and launch routes.
-   - `home-gui` owns desktop, launcher, taskbar, and app windows as trusted
-     host-loaded GUI shell code
-   - `home-cli` owns the terminal viewport while selected through the
-     Runtime-owned PTY path
+   - `home-gui` owns desktop, launcher, taskbar, and app windows in its opaque
+     sandboxed frame
+   - `home-cli` owns the terminal viewport and Runtime-owned PTY path in its
+     opaque sandboxed frame
+   - both shells share the same Runtime facts, lifecycle, launch validation,
+     sign-out, and explicit shell-switch authority
    - child shell/app intents must carry the Home launch token and pass host routing policy
 
 3. Home is the shipped browser front door.
@@ -36,8 +38,9 @@ Interaction contract for the Home host:
 - unlock and sign-out stay in the host plus Runtime auth endpoints
 - active-shell selection is resolved from Runtime state, not local UI state
 - shell mounting uses a host-owned root iframe plus launch-token validation
-- `home-gui` is the current exception to iframe mounting: it is selected by
-  Runtime state, then lazy-loaded by the trusted Home host facade
+- both shells and ordinary app frames use opaque browser origins on the same
+  hostname; only the Home host
+  holds the explicit authority used to mint their launch tokens
 - recovery is host-owned and must not depend on `home-gui` being mounted
 - `home` must not contain desktop/taskbar/window/launcher templates or behavior
 - GUI sessions, desktop shortcuts, taskbar state, and app-window placement belong to

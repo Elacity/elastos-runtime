@@ -7,7 +7,7 @@ HOME_TOKEN="${ELASTOS_HOME_TOKEN:-${ELASTOS_SYSTEM_TOKEN:-}}"
 HOME_COOKIE="${ELASTOS_HOME_COOKIE:-${ELASTOS_COOKIE:-}}"
 HOME_COOKIE_JAR="${ELASTOS_HOME_COOKIE_JAR:-${ELASTOS_COOKIE_JAR:-}}"
 PASSWORD="${ELASTOS_RECOVERY_KIT_PASSWORD:-}"
-ALLOW_CREATE="${ELASTOS_RECOVERY_KIT_CREATE:-0}"
+FRESH_PASSKEY_TOKEN="${ELASTOS_FRESH_PASSKEY_HOME_TOKEN:-}"
 ALLOW_IMPORT="${ELASTOS_RECOVERY_KIT_IMPORT:-0}"
 CURL_AUTH_ARGS=()
 
@@ -15,10 +15,9 @@ usage() {
     cat <<EOF
 Usage: ELASTOS_HOME_TOKEN=<signed-token> $(basename "$0")
 
-Live Recovery Kit proof for a signed Home/System session. By default the script
-checks status and exports/downloads an existing kit. It does not create or
-import unless explicitly enabled. Auth can use a copied token, a copied Cookie
-header, or a curl-compatible cookie jar from a signed browser session.
+Live Full Recovery Bundle proof for a signed Home/System session. Export needs
+a fresh request-bound passkey token from System. Import remains opt-in. Auth can
+use a copied token, a copied Cookie header, or a curl-compatible cookie jar.
 
 Environment:
   ELASTOS_GATEWAY_URL             Default: https://elastos.elacitylabs.com
@@ -26,9 +25,9 @@ Environment:
   ELASTOS_SYSTEM_TOKEN            Accepted alias for ELASTOS_HOME_TOKEN
   ELASTOS_HOME_COOKIE             Cookie header containing home-session=<token>
   ELASTOS_HOME_COOKIE_JAR         curl cookie jar containing home-session
+  ELASTOS_FRESH_PASSKEY_HOME_TOKEN  Fresh System passkey token for this export
   ELASTOS_RECOVERY_KIT_PASSWORD   Optional package password for export/import
-  ELASTOS_RECOVERY_KIT_CREATE=1   Create a kit if no downloadable kit exists
-  ELASTOS_RECOVERY_KIT_IMPORT=1   Import the exported kit back into same root
+  ELASTOS_RECOVERY_KIT_IMPORT=1   Import the exported full bundle into same root
 EOF
 }
 
@@ -98,10 +97,8 @@ printf '%s\n' "$status" | jq -e '
 
 principal="$(jq -r '.principal_id' <<<"$status")"
 localhost_root="$(jq -r '.localhost_root' <<<"$status")"
-download_available="$(jq -r '.recovery_download_available' <<<"$status")"
-
-if [[ "$download_available" != "true" && "$ALLOW_CREATE" != "1" ]]; then
-    echo "[recovery-kit-live-smoke] SKIP: no downloadable kit; set ELASTOS_RECOVERY_KIT_CREATE=1 to create one"
+if [[ -z "$FRESH_PASSKEY_TOKEN" ]]; then
+    echo "[recovery-kit-live-smoke] SKIP: set ELASTOS_FRESH_PASSKEY_HOME_TOKEN from a fresh System passkey verification"
     exit 0
 fi
 
@@ -112,34 +109,23 @@ request_common="$(
         '{principal_id: $principal_id, localhost_root: $localhost_root}'
 )"
 
-if [[ "$download_available" == "true" ]]; then
-    echo "[recovery-kit-live-smoke] export existing kit"
-    body="$(
-        jq -nc \
-            --argjson common "$request_common" \
-            --arg password "$PASSWORD" \
-            '$common + {
-              schema: "elastos.recovery-kit.export.request/v1"
-            } + (if $password == "" then {} else {download_password: $password} end)'
-    )"
-    kit="$(post_json "/api/auth/recovery/export" "$body")"
-else
-    echo "[recovery-kit-live-smoke] create kit"
-    body="$(
-        jq -nc \
-            --argjson common "$request_common" \
-            --arg password "$PASSWORD" \
-            '$common + {
-              schema: "elastos.recovery-kit.create.request/v1",
-              label: "Recovery Kit"
-            } + (if $password == "" then {} else {download_password: $password} end)'
-    )"
-    kit="$(post_json "/api/auth/recovery/create" "$body")"
-fi
+echo "[recovery-kit-live-smoke] export full recovery bundle"
+body="$(
+    jq -nc \
+        --argjson common "$request_common" \
+        --arg home_token "$FRESH_PASSKEY_TOKEN" \
+        --arg password "$PASSWORD" \
+        '$common + {
+          schema: "elastos.full-recovery-bundle.export.request/v1",
+          label: "Recovery Kit",
+          home_token: $home_token
+        } + (if $password == "" then {} else {download_password: $password} end)'
+)"
+kit="$(post_json "/api/auth/recovery/full-export" "$body")"
 
-expected_schema="elastos.recovery-kit/v1"
+expected_schema="elastos.full-recovery-bundle/v1"
 if [[ -n "$PASSWORD" ]]; then
-    expected_schema="elastos.recovery-kit.package/v1"
+    expected_schema="elastos.full-recovery-bundle.package/v1"
 fi
 
 printf '%s\n' "$kit" | jq -e \
@@ -149,19 +135,19 @@ printf '%s\n' "$kit" | jq -e \
     '.schema == $schema
      and .principal_id == $principal_id
      and .localhost_root == $localhost_root
-     and (.kit_id | type == "string" and length > 0)' >/dev/null
+     and (.bundle_id | type == "string" and length > 0)' >/dev/null
 
 if [[ "$ALLOW_IMPORT" == "1" ]]; then
-    echo "[recovery-kit-live-smoke] import exported kit into same root"
+    echo "[recovery-kit-live-smoke] import exported full bundle into same root"
     kit_schema="$(jq -r '.schema' <<<"$kit")"
-    if [[ "$kit_schema" == "elastos.recovery-kit.package/v1" ]]; then
+    if [[ "$kit_schema" == "elastos.full-recovery-bundle.package/v1" ]]; then
         import_body="$(
             jq -nc \
                 --argjson common "$request_common" \
                 --argjson package "$kit" \
                 --arg password "$PASSWORD" \
                 '$common + {
-                  schema: "elastos.recovery-kit.import.request/v1",
+                  schema: "elastos.full-recovery-bundle.import.request/v1",
                   reassign_to_current_principal: false,
                   package: $package
                 } + (if $password == "" then {} else {password: $password} end)'
@@ -170,19 +156,19 @@ if [[ "$ALLOW_IMPORT" == "1" ]]; then
         import_body="$(
             jq -nc \
                 --argjson common "$request_common" \
-                --argjson kit "$kit" \
+                --argjson bundle "$kit" \
                 '$common + {
-                  schema: "elastos.recovery-kit.import.request/v1",
+                  schema: "elastos.full-recovery-bundle.import.request/v1",
                   reassign_to_current_principal: false,
-                  kit: $kit
+                  bundle: $bundle
                 }'
         )"
     fi
-    imported="$(post_json "/api/auth/recovery/import" "$import_body")"
+    imported="$(post_json "/api/auth/recovery/full-import" "$import_body")"
     printf '%s\n' "$imported" | jq -e \
         --arg principal_id "$principal" \
         --arg localhost_root "$localhost_root" \
-        '.schema == "elastos.recovery-kit.import.response/v1"
+        '.schema == "elastos.full-recovery-bundle.import.response/v1"
          and .status == "imported"
          and .principal_id == $principal_id
          and .localhost_root == $localhost_root' >/dev/null

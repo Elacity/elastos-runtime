@@ -1743,21 +1743,6 @@ async fn serve_web_capsule(
         .as_ref()
         .map(|m| m.name.as_str())
         .unwrap_or("web-capsule");
-    let has_viewer = manifest.as_ref().and_then(|m| m.viewer.as_ref()).is_some();
-
-    // Bootstrap state only for data capsules with a viewer — the viewer's JS
-    // needs the token, ROM entrypoint, and storage paths to auto-load
-    let bootstrap_state = if has_viewer {
-        manifest
-            .as_ref()
-            .map(|m| api::server::CapsuleBootstrapState {
-                token: app_session.token.clone(),
-                manifest: m.clone(),
-            })
-    } else {
-        None
-    };
-
     let local_url = format!("http://{}", addr);
     let mut public_tunnel = None;
     let public_url = match public_preview_timeout_secs {
@@ -1809,7 +1794,6 @@ async fn serve_web_capsule(
         addr: addr.to_string(),
         capsule_dir: Some(serve_dir),
         data_dir,
-        bootstrap_state,
         tls_config: None,
         supervisor: None,
         ready_tx: None,

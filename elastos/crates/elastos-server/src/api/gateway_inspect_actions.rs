@@ -9,8 +9,8 @@ use binding::{
     inspect_action_request_binding, inspect_action_request_id, inspect_action_request_nonce,
 };
 use store::{
-    read_inspect_action_record, write_inspect_action_record, InspectActionRequestRecord,
-    INSPECT_ACTION_SCHEMA,
+    claim_pending_inspect_action_record, read_inspect_action_record, write_inspect_action_record,
+    InspectActionRequestRecord, INSPECT_ACTION_SCHEMA,
 };
 
 pub(super) async fn gateway_inspect_action_request(
@@ -161,9 +161,10 @@ pub(super) async fn approve_inspect_action_request(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
     request_id: &str,
+    home_token: &str,
 ) -> anyhow::Result<String> {
     let (mut record, request_binding) =
-        read_bound_pending_inspect_action(state, context, request_id)?;
+        claim_bound_pending_inspect_action(state, context, request_id, "approving")?;
     let registry = state
         .provider_registry
         .as_ref()
@@ -204,6 +205,20 @@ pub(super) async fn approve_inspect_action_request(
             },
         )?;
         anyhow::bail!(message);
+    }
+    if let Err(err) = consume_fresh_passkey_home_token(
+        &state.data_dir,
+        home_token,
+        context,
+        INBOX_CAPSULE_ID,
+        180,
+        "inspect.approve",
+        &serde_json::json!({ "request_id": record.request_id }),
+    ) {
+        record.status = "pending".to_string();
+        record.updated_at = now_ts();
+        write_inspect_action_record(&state.data_dir, &record)?;
+        return Err(err);
     }
     let response = registry
         .send_raw(
@@ -292,7 +307,8 @@ pub(super) fn deny_inspect_action_request(
     context: &HomeLaunchTokenContext,
     request_id: &str,
 ) -> anyhow::Result<String> {
-    let (mut record, _) = read_bound_pending_inspect_action(state, context, request_id)?;
+    let (mut record, _) =
+        claim_bound_pending_inspect_action(state, context, request_id, "denying")?;
     record.status = "denied".to_string();
     record.updated_at = now_ts();
     write_inspect_action_record(&state.data_dir, &record)?;
@@ -352,21 +368,22 @@ pub(super) fn inspect_action_result_receipt(
     }))
 }
 
-fn read_bound_pending_inspect_action(
+fn claim_bound_pending_inspect_action(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
     request_id: &str,
+    claim_status: &str,
 ) -> anyhow::Result<(
     InspectActionRequestRecord,
     crate::esp_binding::EspRequestBinding,
 )> {
-    let mut record = read_inspect_action_record(&state.data_dir, request_id)?;
-    if record.status != "pending" {
-        anyhow::bail!("Inspector action request is not pending");
-    }
-    if record.principal_id != context.principal_id {
-        anyhow::bail!("Inspector action request belongs to a different principal");
-    }
+    let mut record = claim_pending_inspect_action_record(
+        &state.data_dir,
+        request_id,
+        &context.principal_id,
+        claim_status,
+        now_ts(),
+    )?;
     let current = inspect_action_request_binding(
         &record.request_id,
         &record.principal_id,

@@ -8,10 +8,15 @@
 </head>
 <body data-room-session-active="false">
   <script>
-    const accessMode = new URLSearchParams(window.location.search).has("home_token")
+    const homeLaunchToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
+    const homeOrigin = new URLSearchParams(window.location.search).get("home_origin") || "";
+    const accessMode = homeLaunchToken
       ? "shell"
       : "gateway";
     document.body.setAttribute("data-room-access-mode", accessMode);
+    if (homeLaunchToken && homeOrigin && window.top !== window) {
+      window.top.postMessage({ type: "home:app-ready", homeToken: homeLaunchToken }, homeOrigin);
+    }
   </script>
   <main id="app-shell" class="shell">
     <section id="chat-card" class="card chat-card chat-room-shell">
@@ -107,8 +112,10 @@
     </section>
   </main>
   <script type="module">
-    import init from "./chat_room_ui.js?v=chat-room-ui-20260612c";
-    init(new URL("./chat_room_ui_bg.wasm?v=chat-room-ui-20260612c", import.meta.url));
+    import init from "./chat_room_ui.js?v=chat-room-ui-20260716a";
+    init({
+      module_or_path: new URL("./chat_room_ui_bg.wasm?v=chat-room-ui-20260716a", import.meta.url),
+    });
   </script>
 </body>
 </html>

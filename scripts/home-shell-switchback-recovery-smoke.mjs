@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260713a";
+const moduleVersion = "home-20260715a";
 const requests = [];
 const localStorageValues = new Map([
   ["elastos.home.active-shell-hint", "home-cli"],
@@ -276,7 +276,7 @@ globalThis.fetch = async (url, init = {}) => {
     assert(body?.query?.shell_mode === "root", "switchback recovery did not launch root shell mode", body);
     return jsonResponse({
       attach_kind: "iframe",
-      route: "/apps/home-cli/?shell_mode=root&home_token=root-token",
+      route: "/apps/home-cli/?shell_mode=root&home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=root-token",
       target: "home-cli",
     });
   }
@@ -313,7 +313,7 @@ assert(document.body.dataset.homeGui === "dormant", "switchback setup left Home 
 assert(activeShellRoot.hidden === false, "switchback setup did not show active shell root");
 assert(activeShellRoot.dataset.target === "home-cli", "switchback setup active shell target drifted", activeShellRoot.dataset);
 assert(activeShellFrame.hidden === false, "switchback setup did not show active shell frame");
-assert(activeShellFrame.dataset.route.includes("home_token=root-token"), "switchback setup did not carry root launch token", activeShellFrame.dataset);
+assert(activeShellFrame.dataset.route.includes("#home_token=root-token"), "switchback setup did not carry root launch token", activeShellFrame.dataset);
 assert(
   elementForSelector("#home-shell-boot-mask").hidden === true,
   "switchback setup left the neutral host mask over the launched shell",

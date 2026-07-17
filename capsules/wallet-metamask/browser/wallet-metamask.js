@@ -3,8 +3,13 @@ const statusNode = document.querySelector("#wallet-status");
 const stateNode = document.querySelector("#wallet-state");
 const accountsNode = document.querySelector("#wallet-accounts");
 const requestsNode = document.querySelector("#wallet-requests");
-const frameHomeToken = readQueryParam("home_token");
+const frameHomeToken = readLaunchToken();
+const homeOrigin = readQueryParam("home_origin");
 const discoveredWalletProviders = [];
+
+if (frameHomeToken && homeOrigin && window.top !== window) {
+  window.top.postMessage({ type: "home:app-ready", homeToken: frameHomeToken }, homeOrigin);
+}
 
 boot();
 
@@ -494,17 +499,22 @@ function shellHeaders(extra = {}) {
 }
 
 function notifyHomeSummaryChanged() {
-  if (!frameHomeToken || window.parent === window) {
+  if (!frameHomeToken || !homeOrigin || window.top === window) {
     return;
   }
-  window.parent.postMessage({
+  window.top.postMessage({
     type: "home:refresh-summary",
     homeToken: frameHomeToken,
-  }, window.location.origin);
+  }, homeOrigin);
 }
 
 function readQueryParam(name) {
   const value = new URLSearchParams(window.location.search).get(name);
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function readLaunchToken() {
+  const value = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token");
   return typeof value === "string" ? value.trim() : "";
 }
 

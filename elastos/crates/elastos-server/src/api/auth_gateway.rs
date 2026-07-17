@@ -1,13 +1,14 @@
 //! Browser-host adapter for runtime proof-bound authentication.
 
 use std::collections::BTreeMap;
+use std::net::{IpAddr, SocketAddr};
 
 use aes_gcm::{
     aead::{Aead, Payload},
     Aes256Gcm, KeyInit, Nonce,
 };
 use argon2::{Algorithm, Argon2, Params, Version};
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{header::SET_COOKIE, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -16,14 +17,11 @@ use elastos_identity::{
     AuthenticationResponse, CreationOptions, RegistrationResponse, RequestOptions, StoredCredential,
 };
 use elastos_runtime::auth::{
-    ethereum_signed_message_hash, normalize_evm_address, validate_evm_address,
-    validate_recovery_kit_create_request, validate_recovery_kit_export_request,
-    validate_recovery_kit_import_request, AuthChallengeV1, AuthSessionGrantV1, DidRecoveryProofV1,
-    PasskeyWebAuthnBinding, PrincipalRootCryptoProfileV1, PrincipalRootProtectionV1,
-    PrincipalRootProtectorEnvelopeV1, PrincipalRootProtectorKind, PrincipalRootProtectorV1,
-    PrincipalRootRecoveryArchiveV1, PrincipalRootRecoveryStatusV1, ProofBinding, ProofBindingKind,
-    RecoveryKitCreateRequestV1, RecoveryKitExportRequestV1, RecoveryKitImportRequestV1,
-    RecoveryKitV1, RuntimeAuditEventV1,
+    ethereum_signed_message_hash, normalize_evm_address, validate_evm_address, AuthChallengeV1,
+    AuthSessionGrantV1, DidRecoveryProofV1, PasskeyWebAuthnBinding, PrincipalRootCryptoProfileV1,
+    PrincipalRootProtectionV1, PrincipalRootProtectorEnvelopeV1, PrincipalRootProtectorKind,
+    PrincipalRootProtectorV1, PrincipalRootRecoveryArchiveV1, PrincipalRootRecoveryStatusV1,
+    ProofBinding, ProofBindingKind, RecoveryKitV1, RuntimeAuditEventV1,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -31,14 +29,12 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::gateway::{
-    home_session_cookie_header_for_token, is_wallet_connector_capsule_id,
-    issue_home_launch_token_for_auth_grant, require_fresh_passkey_home_token, GatewayState,
+    consume_fresh_passkey_home_token, home_session_cookie_header_for_token,
+    is_wallet_connector_capsule_id, issue_home_launch_token_for_auth_grant, GatewayState,
     HOME_CAPSULE_ID, WALLET_LINK_CAPSULE_IDS,
 };
 
 const AUTH_SESSION_TTL_SECS: u64 = 12 * 60 * 60;
-const RECOVERY_KIT_UNAVAILABLE_REASON: &str =
-    "principal root encryption and recovery protector are not configured";
 const RECOVERY_DESCRIPTOR_SCHEMA: &str = "elastos.principal.root-descriptor/v1";
 const FULL_RECOVERY_BUNDLE_SCHEMA: &str = "elastos.full-recovery-bundle/v1";
 const FULL_RECOVERY_BUNDLE_EXPORT_REQUEST_SCHEMA: &str =
@@ -203,6 +199,15 @@ pub struct RecoveryKitImportResponse {
     pub system_token: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct RecoveryKitMaterialImport {
+    principal_id: String,
+    localhost_root: String,
+    kit: RecoveryKitV1,
+    did_recovery_proof: Option<DidRecoveryProofV1>,
+    reassign_to_current_principal: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FullRecoveryBundleExportRequest {
@@ -351,57 +356,6 @@ pub async fn recovery_status(State(state): State<GatewayState>, headers: HeaderM
     }
 }
 
-pub async fn recovery_kit_create(
-    State(state): State<GatewayState>,
-    headers: HeaderMap,
-    Json(input): Json<RecoveryKitCreateRequestV1>,
-) -> Response {
-    let download_password = input.download_password.clone();
-    match recovery_kit_create_inner(&state, &headers, input).await {
-        Ok(kit) => match recovery_kit_download_value(&kit, download_password.as_deref()) {
-            Ok(response) => Json(response).into_response(),
-            Err(err) => auth_error_response(err),
-        },
-        Err(err) => auth_error_response(err),
-    }
-}
-
-pub async fn recovery_kit_export(
-    State(state): State<GatewayState>,
-    headers: HeaderMap,
-    Json(input): Json<RecoveryKitExportRequestV1>,
-) -> Response {
-    let download_password = input.download_password.clone();
-    match recovery_kit_export_inner(&state, &headers, input).await {
-        Ok(kit) => match recovery_kit_download_value(&kit, download_password.as_deref()) {
-            Ok(response) => Json(response).into_response(),
-            Err(err) => auth_error_response(err),
-        },
-        Err(err) => auth_error_response(err),
-    }
-}
-
-pub async fn recovery_kit_import(
-    State(state): State<GatewayState>,
-    headers: HeaderMap,
-    Json(input): Json<RecoveryKitImportRequestV1>,
-) -> Response {
-    match recovery_kit_import_inner(&state, &headers, input).await {
-        Ok(response) => {
-            let home_token = response.home_token.clone();
-            let mut http_response = Json(response).into_response();
-            if let Some(home_token) = home_token {
-                let secure = super::gateway::request_uses_tls(&headers);
-                if let Ok(cookie) = home_session_cookie_header_for_token(&home_token, secure) {
-                    http_response.headers_mut().append(SET_COOKIE, cookie);
-                }
-            }
-            http_response
-        }
-        Err(err) => auth_error_response(err),
-    }
-}
-
 pub async fn full_recovery_bundle_export(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -496,9 +450,11 @@ pub async fn refresh_session(State(state): State<GatewayState>, headers: HeaderM
 
 pub async fn passkey_register_begin(
     State(state): State<GatewayState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> Response {
-    match passkey_register_begin_inner(&state, &headers).await {
+    let local_first_owner = local_first_owner_registration(&headers, peer.map(|peer| peer.0));
+    match passkey_register_begin_inner(&state, &headers, local_first_owner).await {
         Ok(response) => Json(response).into_response(),
         Err(err) => auth_error_response(err),
     }
@@ -506,10 +462,12 @@ pub async fn passkey_register_begin(
 
 pub async fn passkey_register_complete(
     State(state): State<GatewayState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Json(input): Json<PasskeyRegisterCompleteRequest>,
 ) -> Response {
-    match passkey_register_complete_inner(&state, &headers, input).await {
+    let local_first_owner = local_first_owner_registration(&headers, peer.map(|peer| peer.0));
+    match passkey_register_complete_inner(&state, &headers, input, local_first_owner).await {
         Ok(response) => passkey_verified_response(&headers, response),
         Err(err) => auth_error_response(err),
     }
@@ -882,171 +840,6 @@ async fn recovery_status_inner(
     })
 }
 
-async fn recovery_kit_create_inner(
-    state: &GatewayState,
-    headers: &HeaderMap,
-    input: RecoveryKitCreateRequestV1,
-) -> anyhow::Result<RecoveryKitV1> {
-    let context = require_auth_home_or_system_context(state, headers)?;
-    let principal = require_active_passkey_principal_for_context(state, &context)?;
-    if let Err(err) = validate_recovery_kit_create_request(&input) {
-        return fail_recovery_kit_request(
-            state,
-            &context,
-            &principal,
-            "auth.recovery_kit.create.rejected",
-            err,
-        );
-    }
-    if input.principal_id != principal.principal_id
-        || input.localhost_root != principal.localhost_root
-    {
-        return fail_recovery_kit_request(
-            state,
-            &context,
-            &principal,
-            "auth.recovery_kit.create.rejected",
-            "recovery request principal binding mismatch",
-        );
-    }
-    if let Some(protection) = crate::auth::load_principal_root_protection(
-        &state.data_dir,
-        &principal.principal_id,
-        &principal.localhost_root,
-    )? {
-        if recovery_archive_from_protection(&protection).is_some() {
-            return fail_recovery_kit_request(
-                state,
-                &context,
-                &principal,
-                "auth.recovery_kit.create.denied",
-                "recovery kit already exists; download the existing kit",
-            );
-        }
-    }
-
-    let now = crate::auth::now_ts();
-    let kit = create_recovery_kit_for_principal(
-        &principal.principal_id,
-        &principal.localhost_root,
-        input.label.as_deref(),
-        now,
-    )?;
-    let archive = crate::auth::recovery_archive_from_kit(&state.data_dir, &kit)?;
-    let protection =
-        protection_from_recovery_kit(&kit, input.label.as_deref(), now, Some(archive))?;
-    crate::auth::store_principal_root_protection(&state.data_dir, protection)?;
-    crate::auth::append_audit_event(
-        &state.data_dir,
-        audit_event(AuditEventInput {
-            event_type: "auth.recovery_kit.created",
-            principal_id: Some(principal.principal_id),
-            proof_binding_id: Some(principal.proof_binding_id),
-            session_id: Some(context.session_id),
-            result: "ok",
-            reason: "principal recovery kit created and root protection configured",
-            occurred_at: now,
-            ..AuditEventInput::default()
-        }),
-    )?;
-    Ok(kit)
-}
-
-async fn recovery_kit_export_inner(
-    state: &GatewayState,
-    headers: &HeaderMap,
-    input: RecoveryKitExportRequestV1,
-) -> anyhow::Result<RecoveryKitV1> {
-    let context = require_auth_home_or_system_context(state, headers)?;
-    let principal = require_active_passkey_principal_for_context(state, &context)?;
-    if let Err(err) = validate_recovery_kit_export_request(&input) {
-        return fail_recovery_kit_request(
-            state,
-            &context,
-            &principal,
-            "auth.recovery_kit.export.rejected",
-            err,
-        );
-    }
-    if input.principal_id != principal.principal_id
-        || input.localhost_root != principal.localhost_root
-    {
-        return fail_recovery_kit_request(
-            state,
-            &context,
-            &principal,
-            "auth.recovery_kit.export.rejected",
-            "recovery request principal binding mismatch",
-        );
-    }
-    let Some(protection) = crate::auth::load_principal_root_protection(
-        &state.data_dir,
-        &principal.principal_id,
-        &principal.localhost_root,
-    )?
-    else {
-        return fail_recovery_kit_request(
-            state,
-            &context,
-            &principal,
-            "auth.recovery_kit.export.denied",
-            RECOVERY_KIT_UNAVAILABLE_REASON,
-        );
-    };
-    let Some(archive) = recovery_archive_from_protection(&protection) else {
-        return fail_recovery_kit_request(
-            state,
-            &context,
-            &principal,
-            "auth.recovery_kit.export.denied",
-            "recovery kit archive is unavailable; import your recovery kit again to enable downloads",
-        );
-    };
-    let kit = crate::auth::recovery_kit_from_archive(&state.data_dir, archive)?;
-    crate::auth::verify_recovery_kit_material(&kit)?;
-    if kit.principal_id != principal.principal_id || kit.localhost_root != principal.localhost_root
-    {
-        return fail_recovery_kit_request(
-            state,
-            &context,
-            &principal,
-            "auth.recovery_kit.export.rejected",
-            "recovery kit archive principal binding mismatch",
-        );
-    }
-    let now = crate::auth::now_ts();
-    crate::auth::append_audit_event(
-        &state.data_dir,
-        audit_event(AuditEventInput {
-            event_type: "auth.recovery_kit.exported",
-            principal_id: Some(principal.principal_id),
-            proof_binding_id: Some(principal.proof_binding_id),
-            session_id: Some(context.session_id),
-            result: "ok",
-            reason: "principal recovery kit downloaded through active System authority",
-            occurred_at: now,
-            ..AuditEventInput::default()
-        }),
-    )?;
-    Ok(kit)
-}
-
-fn recovery_kit_download_value(
-    kit: &RecoveryKitV1,
-    download_password: Option<&str>,
-) -> anyhow::Result<Value> {
-    match download_password
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        Some(password) => {
-            let package = crate::auth::password_protected_recovery_kit_package(kit, password)?;
-            serde_json::to_value(package).map_err(Into::into)
-        }
-        None => serde_json::to_value(kit).map_err(Into::into),
-    }
-}
-
 async fn full_recovery_bundle_export_inner(
     state: &GatewayState,
     headers: &HeaderMap,
@@ -1055,8 +848,20 @@ async fn full_recovery_bundle_export_inner(
     if input.schema != FULL_RECOVERY_BUNDLE_EXPORT_REQUEST_SCHEMA {
         anyhow::bail!("unsupported full recovery bundle export request schema");
     }
-    let context = require_auth_home_or_system_context(state, headers)?;
-    require_fresh_passkey_home_token(&state.data_dir, &input.home_token, &context, 180)?;
+    let (app, context) = require_auth_home_or_system_app_context(state, headers)?;
+    consume_fresh_passkey_home_token(
+        &state.data_dir,
+        &input.home_token,
+        &context,
+        &app,
+        180,
+        "auth.full-recovery-bundle.export",
+        &serde_json::json!({
+            "principal_id": input.principal_id,
+            "localhost_root": input.localhost_root,
+            "label": input.label,
+        }),
+    )?;
     let principal = require_active_passkey_principal_for_context(state, &context)?;
     if input.principal_id != principal.principal_id
         || input.localhost_root != principal.localhost_root
@@ -1157,13 +962,10 @@ async fn full_recovery_bundle_import_inner(
     let recovery_response = recovery_kit_import_inner(
         state,
         headers,
-        RecoveryKitImportRequestV1 {
-            schema: elastos_runtime::auth::RECOVERY_KIT_IMPORT_REQUEST_SCHEMA.to_string(),
+        RecoveryKitMaterialImport {
             principal_id: input.principal_id,
             localhost_root: input.localhost_root,
-            kit: Some(data_kit),
-            package: None,
-            password: None,
+            kit: data_kit,
             did_recovery_proof: input.did_recovery_proof,
             reassign_to_current_principal: input.reassign_to_current_principal,
         },
@@ -1507,19 +1309,10 @@ fn b64_decode_field(value: &Value, field: &str) -> anyhow::Result<Vec<u8>> {
 async fn recovery_kit_import_inner(
     state: &GatewayState,
     headers: &HeaderMap,
-    input: RecoveryKitImportRequestV1,
+    input: RecoveryKitMaterialImport,
 ) -> anyhow::Result<RecoveryKitImportResponse> {
     let context = require_auth_home_or_system_context(state, headers)?;
     let principal = require_active_passkey_principal_for_context(state, &context)?;
-    if let Err(err) = validate_recovery_kit_import_request(&input) {
-        return fail_recovery_kit_request(
-            state,
-            &context,
-            &principal,
-            "auth.recovery_kit.import.rejected",
-            err.to_string(),
-        );
-    }
     if input.principal_id != principal.principal_id
         || input.localhost_root != principal.localhost_root
     {
@@ -1531,33 +1324,18 @@ async fn recovery_kit_import_inner(
             "recovery request principal binding mismatch",
         );
     }
-    let kit = match (&input.kit, &input.package) {
-        (Some(kit), None) => kit.clone(),
-        (None, Some(package)) => {
-            let password = input.password.as_deref().map(str::trim).unwrap_or_default();
-            match crate::auth::recovery_kit_from_password_package(package, password) {
-                Ok(kit) => kit,
-                Err(err) => {
-                    return fail_recovery_kit_request(
-                        state,
-                        &context,
-                        &principal,
-                        "auth.recovery_kit.import.rejected",
-                        format!("invalid recovery kit package: {err}"),
-                    );
-                }
-            }
-        }
-        _ => {
-            return fail_recovery_kit_request(
-                state,
-                &context,
-                &principal,
-                "auth.recovery_kit.import.rejected",
-                "recovery import requires exactly one kit or package",
-            );
-        }
-    };
+    let kit = input.kit;
+    if !input.reassign_to_current_principal
+        && (kit.principal_id != input.principal_id || kit.localhost_root != input.localhost_root)
+    {
+        return fail_recovery_kit_request(
+            state,
+            &context,
+            &principal,
+            "auth.recovery_kit.import.rejected",
+            "recovery kit principal binding mismatch",
+        );
+    }
     if let Err(err) = crate::auth::verify_recovery_kit_material(&kit) {
         return fail_recovery_kit_request(
             state,
@@ -1841,6 +1619,7 @@ async fn verify_did_recovery_import_proof(
     proof: &DidRecoveryProofV1,
     now: u64,
 ) -> anyhow::Result<PrincipalRootProtectorV1> {
+    elastos_runtime::auth::validate_did_recovery_proof(proof).map_err(anyhow::Error::msg)?;
     if proof.principal_id != kit.principal_id
         || proof.localhost_root != kit.localhost_root
         || proof.data_key_id != kit.data_key_id
@@ -2011,17 +1790,17 @@ fn refresh_session_inner(
     }
     let grant = AuthSessionGrantV1 {
         schema: AuthSessionGrantV1::SCHEMA.to_string(),
-        grant_id: format!("grant:{}", random_hex(16)),
-        session_id: format!("auth:{}", random_hex(16)),
+        grant_id: previous.grant_id.clone(),
+        session_id: previous.session_id.clone(),
         principal_id: previous.principal_id.clone(),
         proof_binding_id: previous.proof_binding_id.clone(),
-        issued_at: now,
+        issued_at: previous.issued_at,
         expires_at: now.saturating_add(AUTH_SESSION_TTL_SECS),
         apps: previous.apps,
     };
-    crate::auth::store_session_grant(&auth_data_dir, grant.clone())?;
+    crate::auth::renew_session_grant(&auth_data_dir, grant.clone())?;
     if auth_data_dir != state.data_dir {
-        let _ = crate::auth::store_session_grant(&state.data_dir, grant.clone());
+        let _ = crate::auth::renew_session_grant(&state.data_dir, grant.clone());
     }
     crate::auth::append_audit_event(
         &auth_data_dir,
@@ -2069,6 +1848,21 @@ fn require_auth_home_or_system_context(
     Ok(context)
 }
 
+fn require_auth_home_or_system_app_context(
+    state: &GatewayState,
+    headers: &HeaderMap,
+) -> anyhow::Result<(String, super::gateway::HomeLaunchTokenContext)> {
+    let (app, context) = super::gateway::require_home_launch_token_for_any_app_context(
+        &state.data_dir,
+        headers,
+        &[HOME_CAPSULE_ID, super::gateway::SYSTEM_CAPSULE_ID],
+    )?;
+    if context.proof_binding_id.is_none() {
+        anyhow::bail!("missing proof-bound auth session");
+    }
+    Ok((app, context))
+}
+
 struct WalletLinkContext {
     app: String,
     context: super::gateway::HomeLaunchTokenContext,
@@ -2112,8 +1906,9 @@ pub(crate) fn principal_role_label(role: crate::auth::RuntimePrincipalRole) -> &
 async fn passkey_register_begin_inner(
     state: &GatewayState,
     headers: &HeaderMap,
+    local_first_owner: bool,
 ) -> anyhow::Result<PasskeyBeginResponse<CreationOptions>> {
-    require_passkey_registration_allowed(state, headers).await?;
+    require_passkey_registration_allowed(state, local_first_owner).await?;
     let ceremony_id = format!("passkey:register:{}", random_hex(16));
     let rp = super::handlers::identity::derive_rp(headers)?;
     let manager = state.identity_manager()?;
@@ -2130,8 +1925,9 @@ async fn passkey_register_complete_inner(
     state: &GatewayState,
     headers: &HeaderMap,
     input: PasskeyRegisterCompleteRequest,
+    local_first_owner: bool,
 ) -> anyhow::Result<PasskeyVerifyResponse> {
-    require_passkey_registration_allowed(state, headers).await?;
+    require_passkey_registration_allowed(state, local_first_owner).await?;
     let rp = super::handlers::identity::derive_rp(headers)?;
     let manager = state.identity_manager()?;
     let mut manager = manager.lock().await;
@@ -2195,19 +1991,79 @@ async fn passkey_authenticate_complete_inner(
 
 async fn require_passkey_registration_allowed(
     state: &GatewayState,
-    _headers: &HeaderMap,
+    local_first_owner: bool,
 ) -> anyhow::Result<()> {
     let manager = state.identity_manager()?;
     let manager = manager.lock().await;
     let registered = manager.status().registered;
     drop(manager);
     if !registered && crate::auth::active_passkey_principal_count(&state.data_dir)? == 0 {
-        return Ok(());
+        if local_first_owner {
+            return Ok(());
+        }
+        anyhow::bail!("first owner passkey registration requires local Runtime access");
     }
     if crate::auth::guest_registration_enabled(&state.data_dir)? {
         return Ok(());
     }
     anyhow::bail!("guest passkey registration is disabled")
+}
+
+fn local_first_owner_registration(headers: &HeaderMap, peer: Option<SocketAddr>) -> bool {
+    let Some(peer) = peer else {
+        return false;
+    };
+    if !peer.ip().is_loopback() || forwarded_client_is_remote(headers) {
+        return false;
+    }
+    super::handlers::identity::derive_rp(headers)
+        .map(|rp| loopback_host(&rp.id))
+        .unwrap_or(false)
+}
+
+fn forwarded_client_is_remote(headers: &HeaderMap) -> bool {
+    if let Some(value) = headers.get("x-forwarded-for") {
+        let Ok(value) = value.to_str() else {
+            return true;
+        };
+        return value
+            .split(',')
+            .map(str::trim)
+            .any(|value| parse_forwarded_ip(value).is_none_or(|ip| !ip.is_loopback()));
+    }
+    let Some(value) = headers.get("forwarded") else {
+        return false;
+    };
+    let Ok(value) = value.to_str() else {
+        return true;
+    };
+    let mut found = false;
+    for field in value.split(',').flat_map(|entry| entry.split(';')) {
+        let Some(value) = field.trim().strip_prefix("for=") else {
+            continue;
+        };
+        found = true;
+        if parse_forwarded_ip(value).is_none_or(|ip| !ip.is_loopback()) {
+            return true;
+        }
+    }
+    !found
+}
+
+fn parse_forwarded_ip(value: &str) -> Option<IpAddr> {
+    let value = value.trim_matches('"');
+    value
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| value.parse::<SocketAddr>().ok().map(|addr| addr.ip()))
+}
+
+fn loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host == "::1"
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 async fn evm_challenge_inner(
@@ -2958,36 +2814,7 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
     use elastos_runtime::provider::{Provider, ProviderError, ResourceRequest, ResourceResponse};
-    use std::ffi::OsString;
-    use std::sync::{Arc, Mutex, OnceLock};
-
-    fn trusted_auth_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
-
-    struct EnvVarRestore {
-        key: &'static str,
-        value: Option<OsString>,
-    }
-
-    impl EnvVarRestore {
-        fn capture(key: &'static str) -> Self {
-            Self {
-                key,
-                value: std::env::var_os(key),
-            }
-        }
-    }
-
-    impl Drop for EnvVarRestore {
-        fn drop(&mut self) {
-            match self.value.as_ref() {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
+    use std::sync::Arc;
 
     fn test_gateway_state(data_dir: &std::path::Path) -> GatewayState {
         GatewayState {
@@ -3117,7 +2944,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn passkey_register_begin_uses_request_origin_rp() {
+    async fn first_owner_registration_rejects_public_origin() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
         let mut headers = HeaderMap::new();
@@ -3127,23 +2954,42 @@ mod tests {
             HeaderValue::from_static("https://elastos.elacitylabs.com"),
         );
 
-        let response = passkey_register_begin_inner(&state, &headers)
+        let response = passkey_register_begin_inner(&state, &headers, false)
+            .await
+            .unwrap_err();
+
+        assert!(response
+            .to_string()
+            .contains("first owner passkey registration requires local Runtime access"));
+    }
+
+    #[tokio::test]
+    async fn first_owner_registration_accepts_local_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("localhost:61180"));
+        headers.insert("origin", HeaderValue::from_static("http://localhost:61180"));
+
+        let response = passkey_register_begin_inner(&state, &headers, true)
             .await
             .unwrap();
 
         assert_eq!(response.schema, "elastos.auth.passkey.register.begin/v1");
-        assert!(response.ceremony_id.starts_with("passkey:register:"));
-        assert_eq!(response.options.public_key.rp.id, "elastos.elacitylabs.com");
-        assert_eq!(
-            response
-                .options
-                .public_key
-                .authenticator_selection
-                .user_verification,
-            "required"
-        );
-        assert_eq!(response.options.public_key.attestation, "none");
-        assert!(response.options.public_key.exclude_credentials.is_empty());
+        assert_eq!(response.options.public_key.rp.id, "localhost");
+    }
+
+    #[test]
+    fn first_owner_registration_distinguishes_local_and_proxied_clients() {
+        let peer = "127.0.0.1:61180".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("localhost:61180"));
+        headers.insert("origin", HeaderValue::from_static("http://localhost:61180"));
+        assert!(local_first_owner_registration(&headers, Some(peer)));
+
+        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.8"));
+        assert!(!local_first_owner_registration(&headers, Some(peer)));
+        assert!(!local_first_owner_registration(&headers, None));
     }
 
     #[test]
@@ -3625,235 +3471,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_kit_create_configures_protection_and_archived_download() {
-        let temp = tempfile::tempdir().unwrap();
-        let state = test_gateway_state(temp.path());
-        let credential = test_credential();
-        store_test_credential(temp.path(), credential.clone());
-        let grant = issue_passkey_session_grant(
-            &state,
-            "identity-test",
-            &credential,
-            "https://elastos.elacitylabs.com",
-            true,
-            "test passkey grant",
-        )
-        .unwrap();
-        let principal =
-            crate::auth::load_principal_for_proof_binding(temp.path(), &grant.proof_binding_id)
-                .unwrap();
-        let request = elastos_runtime::auth::RecoveryKitCreateRequestV1 {
-            schema: elastos_runtime::auth::RECOVERY_KIT_CREATE_REQUEST_SCHEMA.to_string(),
-            principal_id: principal.principal_id.clone(),
-            localhost_root: principal.localhost_root.clone(),
-            label: Some("Owner backup".to_string()),
-            download_password: None,
-        };
-
-        let kit =
-            recovery_kit_create_inner(&state, &home_token_headers(&grant.home_token), request)
-                .await
-                .unwrap();
-
-        assert_eq!(kit.principal_id, principal.principal_id);
-        assert_eq!(kit.localhost_root, principal.localhost_root);
-        assert!(kit.data_key_id.starts_with("pdek:"));
-        assert!(kit.recovery_phrase.split('-').count() >= 8);
-        assert!(kit.encrypted_root_descriptor.starts_with("aes-256-gcm:v1:"));
-        let status = recovery_status_inner(&state, &home_token_headers(&grant.home_token))
-            .await
-            .unwrap();
-        assert!(status.root_encrypted);
-        assert!(status.recovery_configured);
-        assert!(status.required_actions.is_empty());
-        let exported = recovery_kit_export_inner(
-            &state,
-            &home_token_headers(&grant.home_token),
-            elastos_runtime::auth::RecoveryKitExportRequestV1 {
-                schema: elastos_runtime::auth::RECOVERY_KIT_EXPORT_REQUEST_SCHEMA.to_string(),
-                principal_id: principal.principal_id.clone(),
-                localhost_root: principal.localhost_root.clone(),
-                download_password: None,
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(exported.kit_id, kit.kit_id);
-        assert_eq!(exported.recovery_phrase, kit.recovery_phrase);
-        let auth_state = crate::auth::load_auth_state(temp.path()).unwrap();
-        let event = auth_state.audit.last().unwrap();
-        assert_eq!(event.event_type, "auth.recovery_kit.exported");
-        assert_eq!(event.result, "ok");
-    }
-
-    #[tokio::test]
-    async fn recovery_kit_create_reuses_existing_archive_instead_of_rotating() {
-        let temp = tempfile::tempdir().unwrap();
-        let state = test_gateway_state(temp.path());
-        let credential = test_credential();
-        store_test_credential(temp.path(), credential.clone());
-        let grant = issue_passkey_session_grant(
-            &state,
-            "identity-test",
-            &credential,
-            "https://elastos.elacitylabs.com",
-            true,
-            "test passkey grant",
-        )
-        .unwrap();
-        let principal =
-            crate::auth::load_principal_for_proof_binding(temp.path(), &grant.proof_binding_id)
-                .unwrap();
-        let request = elastos_runtime::auth::RecoveryKitCreateRequestV1 {
-            schema: elastos_runtime::auth::RECOVERY_KIT_CREATE_REQUEST_SCHEMA.to_string(),
-            principal_id: principal.principal_id.clone(),
-            localhost_root: principal.localhost_root.clone(),
-            label: None,
-            download_password: None,
-        };
-
-        recovery_kit_create_inner(
-            &state,
-            &home_token_headers(&grant.home_token),
-            request.clone(),
-        )
-        .await
-        .unwrap();
-        let err =
-            recovery_kit_create_inner(&state, &home_token_headers(&grant.home_token), request)
-                .await
-                .unwrap_err()
-                .to_string();
-
-        assert!(err.contains("already exists"));
-        let auth_state = crate::auth::load_auth_state(temp.path()).unwrap();
-        let event = auth_state.audit.last().unwrap();
-        assert_eq!(event.event_type, "auth.recovery_kit.create.denied");
-        assert_eq!(event.result, "denied");
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn recovery_kit_password_package_imports_with_password_only() {
-        let _guard = trusted_auth_env_lock();
-        let temp = tempfile::tempdir().unwrap();
-        let state = test_gateway_state(temp.path());
-        let credential = test_credential();
-        store_test_credential(temp.path(), credential.clone());
-        let grant = issue_passkey_session_grant(
-            &state,
-            "identity-test",
-            &credential,
-            "https://elastos.elacitylabs.com",
-            true,
-            "test passkey grant",
-        )
-        .unwrap();
-        let principal =
-            crate::auth::load_principal_for_proof_binding(temp.path(), &grant.proof_binding_id)
-                .unwrap();
-        let kit = create_recovery_kit_for_principal(
-            &grant.principal_id,
-            &principal.localhost_root,
-            Some("password package"),
-            1_800_000_000,
-        )
-        .unwrap();
-        let package =
-            crate::auth::password_protected_recovery_kit_package(&kit, "correct horse battery")
-                .unwrap();
-        let wrong_password = elastos_runtime::auth::RecoveryKitImportRequestV1 {
-            schema: elastos_runtime::auth::RECOVERY_KIT_IMPORT_REQUEST_SCHEMA.to_string(),
-            principal_id: grant.principal_id.clone(),
-            localhost_root: principal.localhost_root.clone(),
-            reassign_to_current_principal: false,
-            kit: None,
-            package: Some(package.clone()),
-            password: Some("wrong horse battery".to_string()),
-            did_recovery_proof: None,
-        };
-
-        let err = recovery_kit_import_inner(
-            &state,
-            &home_token_headers(&grant.home_token),
-            wrong_password,
-        )
-        .await
-        .expect_err("wrong package password must fail")
-        .to_string();
-        assert!(err.contains("invalid recovery kit package"));
-        let accepted = recovery_kit_import_inner(
-            &state,
-            &home_token_headers(&grant.home_token),
-            elastos_runtime::auth::RecoveryKitImportRequestV1 {
-                schema: elastos_runtime::auth::RECOVERY_KIT_IMPORT_REQUEST_SCHEMA.to_string(),
-                principal_id: grant.principal_id.clone(),
-                localhost_root: principal.localhost_root.clone(),
-                reassign_to_current_principal: false,
-                kit: None,
-                package: Some(package),
-                password: Some("correct horse battery".to_string()),
-                did_recovery_proof: None,
-            },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(accepted.status, "imported");
-        let status = recovery_status_inner(&state, &home_token_headers(&grant.home_token))
-            .await
-            .unwrap();
-        assert!(status.recovery_configured);
-    }
-
-    #[tokio::test]
-    async fn recovery_kit_export_fails_closed_without_root_protection() {
-        let temp = tempfile::tempdir().unwrap();
-        let state = test_gateway_state(temp.path());
-        let credential = test_credential();
-        store_test_credential(temp.path(), credential.clone());
-        let grant = issue_passkey_session_grant(
-            &state,
-            "identity-test",
-            &credential,
-            "https://elastos.elacitylabs.com",
-            true,
-            "test passkey grant",
-        )
-        .unwrap();
-        let principal =
-            crate::auth::load_principal_for_proof_binding(temp.path(), &grant.proof_binding_id)
-                .unwrap();
-        let request = elastos_runtime::auth::RecoveryKitExportRequestV1 {
-            schema: elastos_runtime::auth::RECOVERY_KIT_EXPORT_REQUEST_SCHEMA.to_string(),
-            principal_id: grant.principal_id.clone(),
-            localhost_root: principal.localhost_root,
-            download_password: None,
-        };
-
-        let err =
-            recovery_kit_export_inner(&state, &home_token_headers(&grant.home_token), request)
-                .await
-                .expect_err("export must fail until root encryption and recovery protectors exist")
-                .to_string();
-
-        assert!(err.contains("principal root encryption"));
-        assert!(err.contains("recovery protector"));
-        let auth_state = crate::auth::load_auth_state(temp.path()).unwrap();
-        let event = auth_state.audit.last().unwrap();
-        assert_eq!(event.event_type, "auth.recovery_kit.export.denied");
-        assert_eq!(event.result, "denied");
-        assert_eq!(
-            event.principal_id.as_deref(),
-            Some(grant.principal_id.as_str())
-        );
-        assert_eq!(
-            event.proof_binding_id.as_deref(),
-            Some(grant.proof_binding_id.as_str())
-        );
-    }
-
-    #[tokio::test]
     async fn recovery_kit_import_rejects_invalid_material() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
@@ -3879,14 +3496,11 @@ mod tests {
         )
         .unwrap();
         kit.encrypted_root_descriptor.clear();
-        let request = elastos_runtime::auth::RecoveryKitImportRequestV1 {
-            schema: elastos_runtime::auth::RECOVERY_KIT_IMPORT_REQUEST_SCHEMA.to_string(),
+        let request = RecoveryKitMaterialImport {
             principal_id: grant.principal_id.clone(),
             localhost_root: principal.localhost_root,
             reassign_to_current_principal: false,
-            kit: Some(kit),
-            package: None,
-            password: None,
+            kit,
             did_recovery_proof: None,
         };
 
@@ -3929,14 +3543,11 @@ mod tests {
             1_800_000_000,
         )
         .unwrap();
-        let request = elastos_runtime::auth::RecoveryKitImportRequestV1 {
-            schema: elastos_runtime::auth::RECOVERY_KIT_IMPORT_REQUEST_SCHEMA.to_string(),
+        let request = RecoveryKitMaterialImport {
             principal_id: grant.principal_id.clone(),
             localhost_root: principal.localhost_root.clone(),
             reassign_to_current_principal: false,
-            kit: Some(kit),
-            package: None,
-            password: None,
+            kit,
             did_recovery_proof: None,
         };
 
@@ -3988,14 +3599,11 @@ mod tests {
         let response = recovery_kit_import_inner(
             &state,
             &home_token_headers(&grant.home_token),
-            elastos_runtime::auth::RecoveryKitImportRequestV1 {
-                schema: elastos_runtime::auth::RECOVERY_KIT_IMPORT_REQUEST_SCHEMA.to_string(),
+            RecoveryKitMaterialImport {
                 principal_id: grant.principal_id.clone(),
                 localhost_root: principal.localhost_root,
                 reassign_to_current_principal: false,
-                kit: Some(kit.clone()),
-                package: None,
-                password: None,
+                kit: kit.clone(),
                 did_recovery_proof: Some(did_recovery_proof_for(&kit)),
             },
         )
@@ -4056,14 +3664,11 @@ mod tests {
         let err = recovery_kit_import_inner(
             &state,
             &home_token_headers(&grant.home_token),
-            elastos_runtime::auth::RecoveryKitImportRequestV1 {
-                schema: elastos_runtime::auth::RECOVERY_KIT_IMPORT_REQUEST_SCHEMA.to_string(),
+            RecoveryKitMaterialImport {
                 principal_id: grant.principal_id,
                 localhost_root: principal.localhost_root,
                 reassign_to_current_principal: false,
-                kit: Some(kit.clone()),
-                package: None,
-                password: None,
+                kit: kit.clone(),
                 did_recovery_proof: Some(did_recovery_proof_for(&kit)),
             },
         )
@@ -4135,14 +3740,11 @@ mod tests {
         let response = recovery_kit_import_inner(
             &state,
             &home_token_headers(&current.home_token),
-            elastos_runtime::auth::RecoveryKitImportRequestV1 {
-                schema: elastos_runtime::auth::RECOVERY_KIT_IMPORT_REQUEST_SCHEMA.to_string(),
+            RecoveryKitMaterialImport {
                 principal_id: current_principal.principal_id.clone(),
                 localhost_root: current_principal.localhost_root.clone(),
                 reassign_to_current_principal: true,
-                kit: Some(kit),
-                package: None,
-                password: None,
+                kit,
                 did_recovery_proof: None,
             },
         )
@@ -4238,15 +3840,24 @@ mod tests {
         let mut headers = home_token_headers(&current.home_token);
         headers.insert("host", HeaderValue::from_static("elastos.elacitylabs.com"));
 
-        let response = recovery_kit_import(
+        let bundle_principal_id = kit.principal_id.clone();
+        let bundle_localhost_root = kit.localhost_root.clone();
+        let response = full_recovery_bundle_import(
             State(state),
             headers,
-            Json(elastos_runtime::auth::RecoveryKitImportRequestV1 {
-                schema: elastos_runtime::auth::RECOVERY_KIT_IMPORT_REQUEST_SCHEMA.to_string(),
+            Json(FullRecoveryBundleImportRequest {
+                schema: FULL_RECOVERY_BUNDLE_IMPORT_REQUEST_SCHEMA.to_string(),
                 principal_id: current_principal.principal_id,
                 localhost_root: current_principal.localhost_root,
                 reassign_to_current_principal: true,
-                kit: Some(kit),
+                bundle: Some(serde_json::json!({
+                    "schema": FULL_RECOVERY_BUNDLE_SCHEMA,
+                    "bundle_id": "bundle:cookie-test",
+                    "principal_id": bundle_principal_id,
+                    "localhost_root": bundle_localhost_root,
+                    "data_kit": kit,
+                    "wallet_recovery_keys": [],
+                })),
                 package: None,
                 password: None,
                 did_recovery_proof: None,
@@ -4308,14 +3919,11 @@ mod tests {
         let response = recovery_kit_import_inner(
             &state,
             &home_token_headers(&current.home_token),
-            elastos_runtime::auth::RecoveryKitImportRequestV1 {
-                schema: elastos_runtime::auth::RECOVERY_KIT_IMPORT_REQUEST_SCHEMA.to_string(),
+            RecoveryKitMaterialImport {
                 principal_id: current_principal.principal_id,
                 localhost_root: current_principal.localhost_root,
                 reassign_to_current_principal: true,
-                kit: Some(kit),
-                package: None,
-                password: None,
+                kit,
                 did_recovery_proof: None,
             },
         )
@@ -4381,17 +3989,11 @@ mod tests {
         let guest_principal =
             crate::auth::load_principal_for_proof_binding(temp.path(), &guest.proof_binding_id)
                 .unwrap();
-        let request = elastos_runtime::auth::RecoveryKitImportRequestV1 {
-            schema: elastos_runtime::auth::RECOVERY_KIT_IMPORT_REQUEST_SCHEMA.to_string(),
+        let request = RecoveryKitMaterialImport {
             principal_id: guest.principal_id.clone(),
             localhost_root: guest_principal.localhost_root,
             reassign_to_current_principal: false,
-            kit: Some(recovery_kit_for(
-                &admin.principal_id,
-                &admin_principal.localhost_root,
-            )),
-            package: None,
-            password: None,
+            kit: recovery_kit_for(&admin.principal_id, &admin_principal.localhost_root),
             did_recovery_proof: None,
         };
 
@@ -4450,12 +4052,12 @@ mod tests {
         .unwrap();
         let empty_headers = HeaderMap::new();
 
-        let denied = passkey_register_begin_inner(&state, &empty_headers)
+        let denied = passkey_register_begin_inner(&state, &empty_headers, false)
             .await
             .unwrap_err()
             .to_string();
         let admin_denied =
-            passkey_register_begin_inner(&state, &home_token_headers(&grant.home_token))
+            passkey_register_begin_inner(&state, &home_token_headers(&grant.home_token), false)
                 .await
                 .unwrap_err()
                 .to_string();
@@ -4469,13 +4071,13 @@ mod tests {
         )
         .unwrap();
         let guest_denied =
-            passkey_register_begin_inner(&state, &home_token_headers(&guest.home_token))
+            passkey_register_begin_inner(&state, &home_token_headers(&guest.home_token), false)
                 .await
                 .unwrap_err()
                 .to_string();
         crate::auth::set_guest_registration_enabled(temp.path(), true, crate::auth::now_ts())
             .unwrap();
-        let public_allowed = passkey_register_begin_inner(&state, &empty_headers)
+        let public_allowed = passkey_register_begin_inner(&state, &empty_headers, false)
             .await
             .unwrap();
 
@@ -4495,11 +4097,8 @@ mod tests {
 
     #[test]
     fn refresh_session_reissues_proof_bound_home_and_system_tokens() {
-        let _guard = trusted_auth_env_lock();
-        let _restore =
-            EnvVarRestore::capture(super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV);
-        std::env::remove_var(super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV);
         let temp = tempfile::tempdir().unwrap();
+        let _auth_data_dir = super::super::gateway::set_test_home_launch_auth_data_dir(temp.path());
         let state = test_gateway_state(temp.path());
         let credential = test_credential();
         let grant = issue_passkey_session_grant(
@@ -4518,24 +4117,27 @@ mod tests {
         assert_eq!(response.schema, "elastos.auth.session.refresh/v1");
         assert_eq!(response.principal_id, grant.principal_id);
         assert_eq!(response.proof_binding_id, grant.proof_binding_id);
-        assert_ne!(response.session_id, grant.session_id);
+        assert_eq!(response.session_id, grant.session_id);
         assert!(crate::auth::is_auth_session_active(
             temp.path(),
             &response.session_id,
             crate::auth::now_ts()
         )
         .unwrap());
+        super::super::gateway::require_home_launch_token_context(
+            temp.path(),
+            &home_token_headers(&grant.system_token),
+            super::super::gateway::SYSTEM_CAPSULE_ID,
+        )
+        .expect("an open child token must survive host session renewal");
         assert!(!response.home_token.is_empty());
         assert!(!response.system_token.is_empty());
     }
 
     #[test]
     fn refresh_session_accepts_http_only_home_cookie() {
-        let _guard = trusted_auth_env_lock();
-        let _restore =
-            EnvVarRestore::capture(super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV);
-        std::env::remove_var(super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV);
         let temp = tempfile::tempdir().unwrap();
+        let _auth_data_dir = super::super::gateway::set_test_home_launch_auth_data_dir(temp.path());
         let state = test_gateway_state(temp.path());
         let credential = test_credential();
         let grant = issue_passkey_session_grant(
@@ -4553,15 +4155,12 @@ mod tests {
 
         assert_eq!(response.schema, "elastos.auth.session.refresh/v1");
         assert_eq!(response.principal_id, grant.principal_id);
-        assert_ne!(response.session_id, grant.session_id);
+        assert_eq!(response.session_id, grant.session_id);
         assert!(!response.home_token.is_empty());
     }
 
     #[test]
     fn refresh_session_uses_trusted_auth_data_dir_for_refreshed_tokens() {
-        let _guard = trusted_auth_env_lock();
-        let _restore =
-            EnvVarRestore::capture(super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV);
         let temp = tempfile::tempdir().unwrap();
         let trusted = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
@@ -4577,10 +4176,8 @@ mod tests {
         .unwrap();
         let state_auth = crate::auth::load_auth_state(temp.path()).unwrap();
         crate::auth::save_auth_state(trusted.path(), &state_auth).unwrap();
-        std::env::set_var(
-            super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV,
-            trusted.path(),
-        );
+        let _auth_data_dir =
+            super::super::gateway::set_test_home_launch_auth_data_dir(trusted.path());
 
         let response =
             refresh_session_inner(&state, &home_token_headers(&grant.home_token)).unwrap();
@@ -4592,7 +4189,7 @@ mod tests {
 
         assert_eq!(refreshed_context.session_id, response.session_id);
         assert_eq!(signed_out.session_id, response.session_id);
-        assert!(crate::auth::is_auth_session_active(
+        assert!(!crate::auth::is_auth_session_active(
             trusted.path(),
             &grant.session_id,
             crate::auth::now_ts(),
@@ -4608,11 +4205,8 @@ mod tests {
 
     #[test]
     fn sign_out_revokes_http_only_home_cookie_session() {
-        let _guard = trusted_auth_env_lock();
-        let _restore =
-            EnvVarRestore::capture(super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV);
-        std::env::remove_var(super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV);
         let temp = tempfile::tempdir().unwrap();
+        let _auth_data_dir = super::super::gateway::set_test_home_launch_auth_data_dir(temp.path());
         let state = test_gateway_state(temp.path());
         let credential = test_credential();
         let grant = issue_passkey_session_grant(
@@ -4639,11 +4233,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn revoke_session_uses_trusted_auth_data_dir_for_target_session() {
-        let _guard = trusted_auth_env_lock();
-        let _restore =
-            EnvVarRestore::capture(super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV);
         let temp = tempfile::tempdir().unwrap();
         let trusted = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
@@ -4659,10 +4249,8 @@ mod tests {
         .unwrap();
         let state_auth = crate::auth::load_auth_state(temp.path()).unwrap();
         crate::auth::save_auth_state(trusted.path(), &state_auth).unwrap();
-        std::env::set_var(
-            super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV,
-            trusted.path(),
-        );
+        let _auth_data_dir =
+            super::super::gateway::set_test_home_launch_auth_data_dir(trusted.path());
 
         let response = revoke_session(
             State(state),
@@ -4681,13 +4269,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn sign_out_response_clears_home_cookie() {
-        let _guard = trusted_auth_env_lock();
-        let _restore =
-            EnvVarRestore::capture(super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV);
-        std::env::remove_var(super::super::gateway::HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV);
         let temp = tempfile::tempdir().unwrap();
+        let _auth_data_dir = super::super::gateway::set_test_home_launch_auth_data_dir(temp.path());
         let state = test_gateway_state(temp.path());
         let credential = test_credential();
         let grant = issue_passkey_session_grant(

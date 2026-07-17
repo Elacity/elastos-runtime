@@ -24,6 +24,14 @@ struct HomeLaunchTokenPayload {
     proof_binding_id: Option<String>,
     grant_id: String,
     non_delegatable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    intent: Option<HomeLaunchTokenIntent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HomeLaunchTokenIntent {
+    operation: String,
+    request_sha256: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -53,7 +61,7 @@ pub(crate) fn home_session_cookie_header_for_token(
 
 pub(crate) fn home_session_clear_cookie_header(secure: bool) -> anyhow::Result<HeaderValue> {
     let mut value = format!(
-        "{}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax",
+        "{}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict",
         HOME_SESSION_COOKIE
     );
     if secure {
@@ -70,7 +78,7 @@ fn home_launch_cookie_header(
     secure: bool,
 ) -> anyhow::Result<HeaderValue> {
     let mut value =
-        format!("{name}={token}; Max-Age={max_age_secs}; Path={path}; HttpOnly; SameSite=Lax");
+        format!("{name}={token}; Max-Age={max_age_secs}; Path={path}; HttpOnly; SameSite=Strict");
     if secure {
         value.push_str("; Secure");
     }
@@ -139,6 +147,41 @@ pub(crate) fn issue_home_launch_token_with_context(
     app: &str,
     context: &HomeLaunchTokenContext,
 ) -> anyhow::Result<String> {
+    issue_home_launch_token_with_context_and_intent(data_dir, app, context, None)
+}
+
+pub(crate) fn issue_home_launch_token_with_intent(
+    data_dir: &std::path::Path,
+    app: &str,
+    context: &HomeLaunchTokenContext,
+    operation: &str,
+    request: &serde_json::Value,
+) -> anyhow::Result<String> {
+    let operation = operation.trim();
+    if operation.is_empty() || operation.len() > 128 {
+        anyhow::bail!("invalid Home authority operation");
+    }
+    let request_bytes = serde_json::to_vec(request)?;
+    if request_bytes.len() > 64 * 1024 {
+        anyhow::bail!("Home authority request is too large");
+    }
+    issue_home_launch_token_with_context_and_intent(
+        data_dir,
+        app,
+        context,
+        Some(HomeLaunchTokenIntent {
+            operation: operation.to_string(),
+            request_sha256: hex::encode(Sha256::digest(request_bytes)),
+        }),
+    )
+}
+
+fn issue_home_launch_token_with_context_and_intent(
+    data_dir: &std::path::Path,
+    app: &str,
+    context: &HomeLaunchTokenContext,
+    intent: Option<HomeLaunchTokenIntent>,
+) -> anyhow::Result<String> {
     let (signing_key, _did) = elastos_identity::load_or_create_did(data_dir)?;
     let now = now_ts();
     let envelope = HomeLaunchTokenEnvelope {
@@ -152,6 +195,7 @@ pub(crate) fn issue_home_launch_token_with_context(
             proof_binding_id: context.proof_binding_id.clone(),
             grant_id: context.grant_id.clone(),
             non_delegatable: true,
+            intent,
         },
         signature: String::new(),
         signer_did: String::new(),
@@ -213,11 +257,14 @@ pub(crate) fn require_home_launch_token_for_any_app_context(
         .map(|required| (required.app, required.context))
 }
 
-pub(crate) fn require_fresh_passkey_home_token(
+pub(crate) fn consume_fresh_passkey_home_token(
     data_dir: &std::path::Path,
     token: &str,
     expected_context: &HomeLaunchTokenContext,
+    expected_app: &str,
     max_age_secs: u64,
+    operation: &str,
+    request: &serde_json::Value,
 ) -> anyhow::Result<()> {
     let token = token.trim();
     if token.is_empty() {
@@ -240,8 +287,8 @@ pub(crate) fn require_fresh_passkey_home_token(
     )
     .map_err(|err| anyhow::anyhow!("invalid fresh passkey token: {}", err))?;
     let now = now_ts();
-    if envelope.payload.app != HOME_CAPSULE_ID {
-        anyhow::bail!("fresh passkey token must be a Home token");
+    if envelope.payload.app != expected_app {
+        anyhow::bail!("fresh passkey token is not authorized for this operation");
     }
     if envelope.payload.principal_id != expected_context.principal_id {
         anyhow::bail!("fresh passkey token belongs to a different principal");
@@ -265,9 +312,54 @@ pub(crate) fn require_fresh_passkey_home_token(
     if grant.principal_id != envelope.payload.principal_id
         || grant.proof_binding_id != proof_binding_id
         || grant.grant_id != envelope.payload.grant_id
+        || envelope.payload.session_id != expected_context.session_id
+        || envelope.payload.grant_id != expected_context.grant_id
+        || expected_context.proof_binding_id.as_deref() != Some(proof_binding_id)
     {
         anyhow::bail!("fresh passkey token authority context mismatch");
     }
+    let operation = operation.trim();
+    if operation.is_empty() {
+        anyhow::bail!("fresh passkey operation is required");
+    }
+    let request_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(request)?));
+    let Some(intent) = envelope.payload.intent.as_ref() else {
+        anyhow::bail!("fresh passkey token is not bound to an operation");
+    };
+    if intent.operation != operation || intent.request_sha256 != request_sha256 {
+        anyhow::bail!("fresh passkey token intent mismatch");
+    }
+    let auth_state_path = crate::auth::auth_state_path(data_dir)?;
+    let root = auth_state_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("authentication state root is unavailable"))?
+        .join("consumed-passkey-proofs");
+    std::fs::create_dir_all(&root)?;
+    let token_sha256 = hex::encode(Sha256::digest(token.as_bytes()));
+    let path = root.join(format!("{token_sha256}.json"));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                anyhow::anyhow!("fresh passkey token has already been used")
+            } else {
+                anyhow::Error::from(err)
+            }
+        })?;
+    let marker = serde_json::json!({
+        "schema": "elastos.auth.consumed-passkey-proof/v1",
+        "token_sha256": token_sha256,
+        "principal_id": envelope.payload.principal_id,
+        "session_id": envelope.payload.session_id,
+        "app": envelope.payload.app,
+        "operation": operation,
+        "request_sha256": request_sha256,
+        "consumed_at": now,
+    });
+    std::io::Write::write_all(&mut file, &serde_json::to_vec_pretty(&marker)?)?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -354,6 +446,7 @@ fn require_home_launch_token_for_any_from_expected_did(
     if !allowed_apps.iter().any(|app| envelope.payload.app == *app) {
         anyhow::bail!("home launch token is not authorized for this provider");
     }
+    require_capsule_browser_origin(headers, &envelope.payload.app)?;
     if envelope.payload.exp <= now_ts() {
         anyhow::bail!("home launch token expired");
     }
@@ -386,7 +479,36 @@ fn require_home_launch_token_for_any_from_expected_did(
     })
 }
 
+fn require_capsule_browser_origin(headers: &HeaderMap, app: &str) -> anyhow::Result<()> {
+    let browser_request = headers.contains_key(axum::http::header::ORIGIN)
+        || headers.contains_key(axum::http::header::REFERER)
+        || headers.contains_key("sec-fetch-site");
+    if !browser_request || app == HOME_CAPSULE_ID {
+        return Ok(());
+    }
+    headers
+        .get(axum::http::header::HOST)
+        .ok_or_else(|| anyhow::anyhow!("capsule browser request is missing its host"))?
+        .to_str()
+        .map_err(|_| anyhow::anyhow!("capsule browser request has an invalid host"))?
+        .parse::<axum::http::uri::Authority>()
+        .map_err(|_| anyhow::anyhow!("capsule browser request has an invalid host"))?;
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .ok_or_else(|| anyhow::anyhow!("capsule browser request is missing its opaque origin"))?
+        .to_str()
+        .map_err(|_| anyhow::anyhow!("capsule browser request has an invalid origin"))?;
+    if origin != "null" {
+        anyhow::bail!("home launch token requires an opaque capsule origin");
+    }
+    Ok(())
+}
+
 pub(crate) fn home_launch_auth_data_dir(data_dir: &std::path::Path) -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = TEST_HOME_LAUNCH_AUTH_DATA_DIR.with(|value| value.borrow().clone()) {
+        return path;
+    }
     std::env::var_os(HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR_ENV)
         .and_then(|value| {
             let value = value.into_string().ok()?;
@@ -401,8 +523,193 @@ pub(crate) fn home_launch_auth_data_dir(data_dir: &std::path::Path) -> PathBuf {
 }
 
 #[cfg(test)]
+thread_local! {
+    static TEST_HOME_LAUNCH_AUTH_DATA_DIR: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) struct TestHomeLaunchAuthDataDir {
+    previous: Option<PathBuf>,
+}
+
+#[cfg(test)]
+impl Drop for TestHomeLaunchAuthDataDir {
+    fn drop(&mut self) {
+        TEST_HOME_LAUNCH_AUTH_DATA_DIR.with(|value| {
+            *value.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_home_launch_auth_data_dir(
+    data_dir: &std::path::Path,
+) -> TestHomeLaunchAuthDataDir {
+    let previous = TEST_HOME_LAUNCH_AUTH_DATA_DIR
+        .with(|value| value.borrow_mut().replace(data_dir.to_path_buf()));
+    TestHomeLaunchAuthDataDir { previous }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_launch_token_requires_an_opaque_capsule_origin() {
+        let data_dir = tempfile::tempdir().unwrap();
+        elastos_identity::load_or_create_did(data_dir.path()).unwrap();
+        let token = issue_home_launch_token(data_dir.path(), "browser").unwrap();
+
+        let mut valid = HeaderMap::new();
+        valid.insert("x-elastos-home-token", token.parse().unwrap());
+        valid.insert("host", "localhost:61180".parse().unwrap());
+        valid.insert("origin", "null".parse().unwrap());
+        require_home_launch_token(data_dir.path(), &valid, "browser").unwrap();
+
+        let mut stolen = valid.clone();
+        stolen.insert("origin", "https://evil.example".parse().unwrap());
+        let error = require_home_launch_token(data_dir.path(), &stolen, "browser").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires an opaque capsule origin"));
+
+        let mut missing_origin = valid;
+        missing_origin.remove("origin");
+        missing_origin.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        let error =
+            require_home_launch_token(data_dir.path(), &missing_origin, "browser").unwrap_err();
+        assert!(error.to_string().contains("missing its opaque origin"));
+    }
+
+    #[test]
+    fn fresh_passkey_proof_is_app_scoped_and_single_use() {
+        let data_dir = tempfile::tempdir().unwrap();
+        elastos_identity::load_or_create_did(data_dir.path()).unwrap();
+        let now = now_ts();
+        let context = HomeLaunchTokenContext {
+            principal_id: "person:local:alice".to_string(),
+            session_id: "auth:alice".to_string(),
+            proof_binding_id: Some("proof:passkey:alice".to_string()),
+            grant_id: "grant:alice".to_string(),
+        };
+        crate::auth::store_session_grant(
+            data_dir.path(),
+            elastos_runtime::auth::AuthSessionGrantV1 {
+                schema: elastos_runtime::auth::AuthSessionGrantV1::SCHEMA.to_string(),
+                grant_id: context.grant_id.clone(),
+                session_id: context.session_id.clone(),
+                principal_id: context.principal_id.clone(),
+                proof_binding_id: context.proof_binding_id.clone().unwrap(),
+                issued_at: now,
+                expires_at: now + HOME_LAUNCH_TOKEN_TTL_SECS,
+                apps: vec![INBOX_CAPSULE_ID.to_string()],
+            },
+        )
+        .unwrap();
+        let request = serde_json::json!({ "request_id": "inspect-action-1" });
+        let token = issue_home_launch_token_with_intent(
+            data_dir.path(),
+            INBOX_CAPSULE_ID,
+            &context,
+            "inspect.approve",
+            &request,
+        )
+        .unwrap();
+
+        let wrong_app = consume_fresh_passkey_home_token(
+            data_dir.path(),
+            &token,
+            &context,
+            SYSTEM_CAPSULE_ID,
+            180,
+            "inspect.approve",
+            &request,
+        )
+        .unwrap_err();
+        assert!(wrong_app.to_string().contains("not authorized"));
+        consume_fresh_passkey_home_token(
+            data_dir.path(),
+            &token,
+            &context,
+            INBOX_CAPSULE_ID,
+            180,
+            "inspect.approve",
+            &request,
+        )
+        .unwrap();
+        let replay = consume_fresh_passkey_home_token(
+            data_dir.path(),
+            &token,
+            &context,
+            INBOX_CAPSULE_ID,
+            180,
+            "inspect.approve",
+            &request,
+        )
+        .unwrap_err();
+        assert!(replay.to_string().contains("already been used"));
+    }
+
+    #[test]
+    fn fresh_passkey_proof_rejects_substituted_intent() {
+        let data_dir = tempfile::tempdir().unwrap();
+        elastos_identity::load_or_create_did(data_dir.path()).unwrap();
+        let now = now_ts();
+        let context = HomeLaunchTokenContext {
+            principal_id: "person:local:alice".to_string(),
+            session_id: "auth:alice".to_string(),
+            proof_binding_id: Some("proof:passkey:alice".to_string()),
+            grant_id: "grant:alice".to_string(),
+        };
+        crate::auth::store_session_grant(
+            data_dir.path(),
+            elastos_runtime::auth::AuthSessionGrantV1 {
+                schema: elastos_runtime::auth::AuthSessionGrantV1::SCHEMA.to_string(),
+                grant_id: context.grant_id.clone(),
+                session_id: context.session_id.clone(),
+                principal_id: context.principal_id.clone(),
+                proof_binding_id: context.proof_binding_id.clone().unwrap(),
+                issued_at: now,
+                expires_at: now + HOME_LAUNCH_TOKEN_TTL_SECS,
+                apps: vec![INBOX_CAPSULE_ID.to_string()],
+            },
+        )
+        .unwrap();
+        let approved = serde_json::json!({ "request_id": "inspect-action-1" });
+        let token = issue_home_launch_token_with_intent(
+            data_dir.path(),
+            INBOX_CAPSULE_ID,
+            &context,
+            "inspect.approve",
+            &approved,
+        )
+        .unwrap();
+
+        let wrong_operation = consume_fresh_passkey_home_token(
+            data_dir.path(),
+            &token,
+            &context,
+            INBOX_CAPSULE_ID,
+            180,
+            "wallet.approve",
+            &approved,
+        )
+        .unwrap_err();
+        assert!(wrong_operation.to_string().contains("intent mismatch"));
+        let wrong_request = consume_fresh_passkey_home_token(
+            data_dir.path(),
+            &token,
+            &context,
+            INBOX_CAPSULE_ID,
+            180,
+            "inspect.approve",
+            &serde_json::json!({ "request_id": "inspect-action-2" }),
+        )
+        .unwrap_err();
+        assert!(wrong_request.to_string().contains("intent mismatch"));
+    }
 
     #[test]
     fn launch_grant_accepts_explicit_parent_gateway_signer() {

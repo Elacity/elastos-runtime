@@ -825,6 +825,15 @@ struct HomeLaunchRequest {
     target: String,
     #[serde(default)]
     query: BTreeMap<String, String>,
+    #[serde(default)]
+    authority: Option<HomeLaunchAuthorityRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HomeLaunchAuthorityRequest {
+    operation: String,
+    request: serde_json::Value,
 }
 
 #[derive(Deserialize)]

@@ -2494,7 +2494,7 @@ pub(super) async fn home_browser_state_get(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context = match require_home_token_context(&state.data_dir, &headers) {
+    let context = match require_home_shell_state_token_context(&state.data_dir, &headers) {
         Ok(context) => context,
         Err(err) => return home_error_response(err),
     };
@@ -2509,7 +2509,7 @@ pub(super) async fn home_browser_state_update(
     headers: HeaderMap,
     Json(input): Json<HomeBrowserStateUpdate>,
 ) -> Response {
-    let context = match require_home_token_context(&state.data_dir, &headers) {
+    let context = match require_home_shell_state_token_context(&state.data_dir, &headers) {
         Ok(context) => context,
         Err(err) => return home_error_response(err),
     };
@@ -2563,14 +2563,27 @@ fn require_home_active_shell_token_context(
     require_home_active_shell_update_token_context(data_dir, headers)
 }
 
+fn require_home_shell_state_token_context(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+) -> anyhow::Result<HomeLaunchTokenContext> {
+    require_home_launch_token_for_any_context(
+        data_dir,
+        headers,
+        &[HOME_CAPSULE_ID, HOME_GUI_SHELL_ID, HOME_CLI_SHELL_ID],
+    )
+}
+
 fn require_home_active_shell_update_token_context(
     data_dir: &std::path::Path,
     headers: &HeaderMap,
 ) -> anyhow::Result<HomeLaunchTokenContext> {
-    let mut allowed = BTreeSet::from([HOME_CAPSULE_ID.to_string(), SYSTEM_CAPSULE_ID.to_string()]);
-    for candidate in home_active_shell_candidates(data_dir) {
-        allowed.insert(candidate.name);
-    }
+    let allowed = BTreeSet::from([
+        HOME_CAPSULE_ID.to_string(),
+        SYSTEM_CAPSULE_ID.to_string(),
+        HOME_GUI_SHELL_ID.to_string(),
+        HOME_CLI_SHELL_ID.to_string(),
+    ]);
     let allowed_refs = allowed.iter().map(String::as_str).collect::<Vec<_>>();
     require_home_launch_token_for_any_context(data_dir, headers, &allowed_refs)
 }
@@ -2774,6 +2787,7 @@ fn home_active_shell_candidates(data_dir: &std::path::Path) -> Vec<HomeActiveShe
         .into_iter()
         .filter(|capsule| capsule.role == CapsuleRole::Shell && capsule.launchable)
         .filter(|capsule| capsule.name != HOME_CAPSULE_ID)
+        .filter(|capsule| is_trusted_home_shell_id(&capsule.name))
     {
         let Some(catalog_route) = capsule.route else {
             continue;

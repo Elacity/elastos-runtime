@@ -13,12 +13,6 @@ const LIBRARY_UPLOAD_SESSION_TTL_SECS: u64 = 24 * 60 * 60;
 static LIBRARY_UPLOAD_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Deserialize)]
-pub(super) struct LibraryEventsStreamQuery {
-    #[serde(default)]
-    home_token: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 pub(super) struct LibraryUploadQuery {
     uri: String,
     #[serde(default)]
@@ -1202,12 +1196,7 @@ fn library_download_content_disposition(filename: &str) -> String {
 pub(super) async fn gateway_library_events_stream(
     State(state): State<GatewayState>,
     headers: HeaderMap,
-    Query(query): Query<LibraryEventsStreamQuery>,
 ) -> Response {
-    let headers = match library_events_stream_headers(headers, query.home_token.as_deref()) {
-        Ok(headers) => headers,
-        Err(err) => return gateway_provider_error_response("object", err),
-    };
     let context = match require_home_launch_token_for_any_context(
         &state.data_dir,
         &headers,
@@ -1654,18 +1643,6 @@ struct LibraryEventsStreamState {
     principal_id: String,
     cursor: String,
     initialized: bool,
-}
-
-fn library_events_stream_headers(
-    mut headers: HeaderMap,
-    query_token: Option<&str>,
-) -> anyhow::Result<HeaderMap> {
-    if headers.get("x-elastos-home-token").is_none() {
-        if let Some(token) = query_token.map(str::trim).filter(|token| !token.is_empty()) {
-            headers.insert("x-elastos-home-token", HeaderValue::from_str(token)?);
-        }
-    }
-    Ok(headers)
 }
 
 async fn library_events_since_cursor(

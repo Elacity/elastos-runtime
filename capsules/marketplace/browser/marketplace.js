@@ -1,7 +1,11 @@
 (function () {
   const params = new URLSearchParams(window.location.search);
-  const homeToken = params.get("home_token") || "";
-  const themeKey = "elastos-marketplace-theme";
+  const homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
+  const homeParentOrigin = params.get("home_origin") || "";
+
+  if (homeToken && homeParentOrigin && window.top !== window) {
+    window.top.postMessage({ type: "home:app-ready", homeToken }, homeParentOrigin);
+  }
 
   const state = {
     apps: [],
@@ -65,8 +69,7 @@
   }
 
   function initTheme() {
-    const saved = localStorage.getItem(themeKey);
-    if (saved === "dark" || (!saved && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches)) {
+    if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
       document.documentElement.setAttribute("data-theme", "dark");
     }
   }
@@ -75,11 +78,9 @@
     const isDark = document.documentElement.getAttribute("data-theme") === "dark";
     if (isDark) {
       document.documentElement.removeAttribute("data-theme");
-      localStorage.setItem(themeKey, "light");
       return;
     }
     document.documentElement.setAttribute("data-theme", "dark");
-    localStorage.setItem(themeKey, "dark");
   }
 
   function bindEvents() {
@@ -602,37 +603,21 @@
     els.installModal.classList.add("active");
   }
 
-  async function openApp(appId) {
+  function openApp(appId) {
     const app = state.apps.find((candidate) => candidate.id === appId);
     if (!app || !app.launchable || !app.launchTarget) {
       showToast("This app is not launchable from Home.", true);
       return;
     }
-    try {
-      if (window.parent && window.parent !== window) {
-        window.parent.postMessage({
-          type: "home:open-target",
-          target: app.launchTarget,
-          homeToken,
-        }, window.location.origin);
-        return;
-      }
-      const response = await fetch("/api/apps/home/launch", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-elastos-home-token": homeToken,
-        },
-        body: JSON.stringify({ target: app.launchTarget }),
-      });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(publicError(payload.error || payload.message, "This app could not be opened."));
-      }
-      if (payload.route) window.location.href = payload.route;
-    } catch (error) {
-      showToast(publicError(error.message, "This app could not be opened."), true);
+    if (window.top === window || !homeParentOrigin) {
+      showToast("Open Marketplace from Home to launch apps.", true);
+      return;
     }
+    window.top.postMessage({
+      type: "home:open-target",
+      target: app.launchTarget,
+      homeToken,
+    }, homeParentOrigin);
   }
 
   function bindAppActions(root) {

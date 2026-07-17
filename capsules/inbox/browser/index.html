@@ -451,12 +451,18 @@
 
   <script>
     const INBOX_SAFETY_REFRESH_MS = 5 * 60 * 1000;
+    const launchParams = new URLSearchParams(window.location.search);
+    const homeParentOrigin = launchParams.get("home_origin") || "";
 
     const state = {
-      homeToken: new URLSearchParams(window.location.search).get("home_token") || "",
+      homeToken: new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "",
       entries: [],
       refreshInFlight: null,
     };
+
+    if (state.homeToken && homeParentOrigin && window.top !== window) {
+      window.top.postMessage({ type: "home:app-ready", homeToken: state.homeToken }, homeParentOrigin);
+    }
 
     const elements = {
       lockedShell: document.getElementById("locked-shell"),
@@ -495,11 +501,11 @@
     }
 
     function notifyHome() {
-      if (window.parent && window.parent !== window) {
-        window.parent.postMessage({
+      if (homeParentOrigin && window.top && window.top !== window) {
+        window.top.postMessage({
           type: "home:refresh-summary",
           homeToken: state.homeToken,
-        }, window.location.origin);
+        }, homeParentOrigin);
       }
     }
 
@@ -510,7 +516,7 @@
     }
 
     function onRuntimeEvents(event) {
-      if (event.origin !== window.location.origin) {
+      if (event.origin !== homeParentOrigin || event.source !== window.top) {
         return;
       }
       const message = event.data || {};
@@ -522,10 +528,10 @@
       }
     }
 
-    async function api(path, options) {
+    async function api(path, options, authorityToken = state.homeToken) {
       const request = Object.assign({ method: "GET" }, options || {});
       request.headers = Object.assign({}, request.headers || {}, {
-        "x-elastos-home-token": state.homeToken,
+        "x-elastos-home-token": authorityToken,
       });
       if (request.body && !request.headers["content-type"]) {
         request.headers["content-type"] = "application/json";
@@ -538,89 +544,52 @@
       return response.json();
     }
 
-    async function requestFreshPasskeyHomeToken() {
-      if (!window.PublicKeyCredential) {
-        throw new Error("Passkey verification is unavailable in this browser.");
+    async function requestFreshPasskeyHomeToken(operation, request) {
+      if (!state.homeToken || window.top === window || !homeParentOrigin) {
+        throw new Error("Open Inbox from Home to verify your passkey.");
       }
-      const begin = await passkeyJson("/api/auth/passkey/authenticate/begin", { method: "POST" });
-      const credential = await navigator.credentials.get(toRequestOptions(begin.options));
-      if (!credential) {
-        throw new Error("Passkey verification was cancelled.");
-      }
-      const complete = await passkeyJson("/api/auth/passkey/authenticate/complete", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          ceremony_id: begin.ceremony_id,
-          response: serializeAssertionCredential(credential),
-        }),
+      const requestId = window.crypto?.randomUUID?.()
+        || `passkey-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      return new Promise((resolve, reject) => {
+        const timeout = window.setTimeout(() => {
+          window.removeEventListener("message", onResult);
+          reject(new Error("Passkey verification timed out."));
+        }, 120_000);
+        const onResult = (event) => {
+          if (event.source !== window.top || event.origin !== homeParentOrigin) {
+            return;
+          }
+          const result = event.data && typeof event.data === "object" ? event.data : null;
+          if (result?.type !== "home:passkey-authority-result" || result.requestId !== requestId) {
+            return;
+          }
+          window.clearTimeout(timeout);
+          window.removeEventListener("message", onResult);
+          const freshToken = typeof result.homeToken === "string" ? result.homeToken.trim() : "";
+          if (freshToken) {
+            resolve(freshToken);
+            return;
+          }
+          reject(new Error(typeof result.error === "string" && result.error.trim()
+            ? result.error.trim()
+            : "Passkey verification failed."));
+        };
+        window.addEventListener("message", onResult);
+        window.top.postMessage({
+          type: "home:request-passkey-authority",
+          requestId,
+          homeToken: state.homeToken,
+          operation,
+          request,
+        }, homeParentOrigin);
       });
-      const homeToken = typeof complete.home_token === "string" ? complete.home_token.trim() : "";
-      if (!homeToken) {
-        throw new Error("Fresh passkey token was not issued.");
-      }
-      return homeToken;
     }
 
-    async function passkeyJson(path, options) {
-      const response = await fetch(path, options);
-      if (!response.ok) {
-        const text = await response.text().catch(() => "");
-        throw new Error(text || "Passkey verification failed.");
-      }
-      return response.json();
-    }
-
-    function toRequestOptions(options) {
-      const publicKey = Object.assign({}, options && options.publicKey ? options.publicKey : {});
-      publicKey.challenge = base64UrlToBuffer(publicKey.challenge);
-      publicKey.allowCredentials = (publicKey.allowCredentials || []).map((credential) => Object.assign({}, credential, {
-        id: base64UrlToBuffer(credential.id),
-      }));
-      return { publicKey };
-    }
-
-    function serializeAssertionCredential(credential) {
-      return {
-        id: credential.id,
-        rawId: bufferToBase64Url(credential.rawId),
-        type: credential.type,
-        response: {
-          clientDataJson: bufferToBase64Url(credential.response.clientDataJSON),
-          authenticatorData: bufferToBase64Url(credential.response.authenticatorData),
-          signature: bufferToBase64Url(credential.response.signature),
-          userHandle: credential.response.userHandle
-            ? bufferToBase64Url(credential.response.userHandle)
-            : null,
-        },
-      };
-    }
-
-    function base64UrlToBuffer(value) {
-      const base64 = String(value || "").replace(/-/g, "+").replace(/_/g, "/");
-      const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
-      const raw = window.atob(padded);
-      const bytes = new Uint8Array(raw.length);
-      for (let index = 0; index < raw.length; index += 1) {
-        bytes[index] = raw.charCodeAt(index);
-      }
-      return bytes.buffer;
-    }
-
-    function bufferToBase64Url(buffer) {
-      const bytes = new Uint8Array(buffer);
-      let binary = "";
-      for (const byte of bytes) {
-        binary += String.fromCharCode(byte);
-      }
-      return window.btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-    }
-
-    async function inboxAction(actionId, fields = {}) {
+    async function inboxAction(actionId, fields = {}, authorityToken = state.homeToken) {
       return api("/api/apps/inbox/actions", {
         method: "POST",
         body: JSON.stringify(Object.assign({ action_id: actionId }, fields)),
-      });
+      }, authorityToken);
     }
 
     async function loadInbox() {
@@ -774,10 +743,13 @@
       button.disabled = true;
       setStatus("Confirm with your passkey to sign.");
       try {
-        const homeToken = await requestFreshPasskeyHomeToken();
+        const homeToken = await requestFreshPasskeyHomeToken("wallet.approve", {
+          request_id: requestId,
+          reason: "Approved in Inbox",
+        });
         await inboxAction("wallet-approve-request:" + requestId, {
           home_token: homeToken,
-        });
+        }, homeToken);
         setStatus("Request signed.");
         await loadInbox();
         notifyHome();
@@ -794,10 +766,12 @@
       button.disabled = true;
       setStatus("Confirm with your passkey to approve this System action.");
       try {
-        const homeToken = await requestFreshPasskeyHomeToken();
+        const homeToken = await requestFreshPasskeyHomeToken("inspect.approve", {
+          request_id: requestId,
+        });
         const outcome = await inboxAction("inspect-approve-request:" + requestId, {
           home_token: homeToken,
-        });
+        }, homeToken);
         requireInspectActionResult(outcome, requestId, "completed");
         setStatus("System action approved.");
         await loadInbox();
@@ -910,15 +884,15 @@
 
     function openSource(sourceApp, query = {}) {
       const target = typeof sourceApp === "string" ? sourceApp.trim() : "";
-      if (!target || !window.parent || window.parent === window) {
+      if (!target || !homeParentOrigin || !window.top || window.top === window) {
         return;
       }
-      window.parent.postMessage({
+      window.top.postMessage({
         type: "home:open-target",
         target,
         query,
         homeToken: state.homeToken,
-      }, window.location.origin);
+      }, homeParentOrigin);
     }
 
     function markVisibleRead(notifications) {

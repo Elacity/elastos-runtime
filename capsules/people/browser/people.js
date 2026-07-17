@@ -9,11 +9,15 @@ const requestList = document.getElementById("request-list");
 const toggleDiscoveryButton = document.getElementById("toggle-discovery");
 const refreshDiscoveryButton = document.getElementById("refresh-discovery");
 const discoveryCountdown = document.getElementById("discovery-countdown");
-const homeToken = new URLSearchParams(window.location.search).get("home_token") || "";
+const launchParams = new URLSearchParams(window.location.search);
+const homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
+const homeParentOrigin = launchParams.get("home_origin") || "";
 const AUTO_REFRESH_MS = 15_000;
 
 let currentSummary = null;
 let refreshTimer = 0;
+
+announceReady();
 
 boot().catch((error) => {
   showStatus(publicError(error, "People could not load."), "error");
@@ -30,6 +34,12 @@ async function boot() {
   lockedShell?.classList.add("hidden");
   peopleShell?.classList.remove("hidden");
   await refreshPeople();
+}
+
+function announceReady() {
+  if (homeToken && homeParentOrigin && window.top !== window) {
+    window.top.postMessage({ type: "home:app-ready", homeToken }, homeParentOrigin);
+  }
 }
 
 function bindNavigation() {
@@ -287,12 +297,12 @@ function openChat(route) {
   if (target !== "chat-room") {
     throw new Error("Chat is not available for this person yet.");
   }
-  window.parent.postMessage({
+  window.top.postMessage({
     type: "home:open-target",
     target,
     query: {},
     homeToken,
-  }, window.location.origin);
+  }, homeParentOrigin);
   showStatus("Opening Chat.", "ok");
 }
 

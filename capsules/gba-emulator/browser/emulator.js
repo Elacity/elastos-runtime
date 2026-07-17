@@ -3,7 +3,11 @@ import { BUTTON_BITS, gamepadMask as readGamepadMask } from "./gba-input.js";
 const VIEWER_ID = "gba-emulator";
 const MAX_ROM_BYTES = 64 * 1024 * 1024;
 const query = new URLSearchParams(window.location.search);
-const homeToken = query.get("home_token") || "";
+const homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
+const homeParentOrigin = query.get("home_origin") || "";
+if (homeToken && homeParentOrigin && window.top !== window) {
+  window.top.postMessage({ type: "home:app-ready", homeToken }, homeParentOrigin);
+}
 const hostMode = window.self === window.top ? "standalone" : "embedded";
 document.body.dataset.emulatorAccessMode = homeToken ? "shell" : "gateway";
 document.body.dataset.emulatorHostMode = hostMode;
@@ -455,10 +459,10 @@ async function enableSound() {
 }
 
 function openLibrary() {
-  if (window.parent && window.parent !== window) {
-    window.parent.postMessage(
+  if (homeParentOrigin && window.top && window.top !== window) {
+    window.top.postMessage(
       { type: "home:open-target", target: "library", homeToken },
-      window.location.origin,
+      homeParentOrigin,
     );
     return;
   }

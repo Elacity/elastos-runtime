@@ -34,6 +34,7 @@ async fn home_test_get_json(
         .oneshot(
             Request::builder()
                 .uri(uri)
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
                 .unwrap(),
@@ -60,6 +61,7 @@ async fn home_test_post_json(
             Request::builder()
                 .method("POST")
                 .uri(uri)
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", token)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(payload.to_string()))
@@ -73,6 +75,31 @@ async fn home_test_post_json(
         .unwrap();
     let payload = serde_json::from_slice(&body).unwrap();
     (status, payload)
+}
+
+fn assert_isolated_launch_route(route: &str, app: &str) -> url::Url {
+    let route = url::Url::parse("http://localhost")
+        .unwrap()
+        .join(route)
+        .expect("canonical capsule launch route");
+    assert_eq!(route.host_str(), Some("localhost"));
+    assert_eq!(route.path(), format!("/apps/{app}/"));
+    assert!(
+        launch_token_from_route(route.as_str()).is_some(),
+        "launch authority must be in the URL fragment: {route}"
+    );
+    assert!(
+        route.query_pairs().all(|(key, _)| key != "home_token"),
+        "launch authority must not be in the query: {route}"
+    );
+    route
+}
+
+fn launch_token_from_route(route: &str) -> Option<String> {
+    let route = url::Url::parse("http://localhost").ok()?.join(route).ok()?;
+    url::form_urlencoded::parse(route.fragment()?.as_bytes())
+        .find(|(key, _)| key == "home_token")
+        .map(|(_, value)| value.into_owned())
 }
 
 fn home_shell_shared_facts(summary: &serde_json::Value) -> serde_json::Value {
@@ -200,6 +227,7 @@ async fn test_home_static_route_serves_browser_surface() {
         .oneshot(
             Request::builder()
                 .uri("/apps/system/esp-projections.mjs")
+                .header(HOST, "localhost:61180")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -4283,6 +4311,7 @@ async fn test_system_handle_derives_from_passkey_principal() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
@@ -4295,12 +4324,7 @@ async fn test_system_handle_derives_from_passkey_principal() {
         .await
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let chat_token = payload["route"]
-        .as_str()
-        .unwrap()
-        .split("home_token=")
-        .nth(1)
-        .unwrap();
+    let chat_token = launch_token_from_route(payload["route"].as_str().unwrap()).unwrap();
 
     let chat_session = app
         .oneshot(
@@ -4446,6 +4470,7 @@ async fn test_home_launch_validates_shell_targets() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
                 .unwrap(),
@@ -4454,13 +4479,31 @@ async fn test_home_launch_validates_shell_targets() {
         .unwrap();
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
 
+    let home_token = home_app_token(dir.path());
+    let cookie_only = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
+                .header(COOKIE, format!("{}={home_token}", HOME_SESSION_COOKIE))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"target":"chat-room"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cookie_only.status(), StatusCode::FORBIDDEN);
+
     let ok = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
-                .header("x-elastos-home-token", home_app_token(dir.path()))
+                .header(HOST, "localhost:61180")
+                .header("x-elastos-home-token", home_token)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
                 .unwrap(),
@@ -4476,10 +4519,7 @@ async fn test_home_launch_validates_shell_targets() {
     assert_eq!(payload["target_kind"], "app");
     assert_eq!(payload["launch_status"], "launched");
     assert_eq!(payload["capsule_id"], "wasm-chat-room-instance");
-    assert!(payload["route"]
-        .as_str()
-        .unwrap_or_default()
-        .starts_with("/apps/chat-room/?home_token="));
+    assert_isolated_launch_route(payload["route"].as_str().unwrap(), "chat-room");
 
     let library = app
         .clone()
@@ -4487,6 +4527,7 @@ async fn test_home_launch_validates_shell_targets() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"library"}"#))
@@ -4504,10 +4545,7 @@ async fn test_home_launch_validates_shell_targets() {
     assert_eq!(payload["target_kind"], "app");
     assert!(payload["launch_status"].is_null());
     assert!(payload["capsule_id"].is_null());
-    assert!(payload["route"]
-        .as_str()
-        .unwrap_or_default()
-        .starts_with("/apps/library/?home_token="));
+    assert_isolated_launch_route(payload["route"].as_str().unwrap(), "library");
 
     let projection = app
         .clone()
@@ -4515,6 +4553,7 @@ async fn test_home_launch_validates_shell_targets() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"projection-app"}"#))
@@ -4530,10 +4569,7 @@ async fn test_home_launch_validates_shell_targets() {
     assert_eq!(payload["target"], "projection-app");
     assert!(payload["launch_status"].is_null());
     assert!(payload["capsule_id"].is_null());
-    assert!(payload["route"]
-        .as_str()
-        .unwrap_or_default()
-        .starts_with("/apps/projection-app/?home_token="));
+    assert_isolated_launch_route(payload["route"].as_str().unwrap(), "projection-app");
 
     let hidden_connector = app
         .clone()
@@ -4541,6 +4577,7 @@ async fn test_home_launch_validates_shell_targets() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"wallet-metamask"}"#))
@@ -4555,10 +4592,7 @@ async fn test_home_launch_validates_shell_targets() {
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["target"], "wallet-metamask");
     assert_eq!(payload["title"], "MetaMask");
-    assert!(payload["route"]
-        .as_str()
-        .unwrap_or_default()
-        .starts_with("/apps/wallet-metamask/?home_token="));
+    assert_isolated_launch_route(payload["route"].as_str().unwrap(), "wallet-metamask");
 
     let with_query = app
             .clone()
@@ -4566,6 +4600,7 @@ async fn test_home_launch_validates_shell_targets() {
                 Request::builder()
                     .method("POST")
                     .uri("/api/apps/home/launch")
+                    .header(HOST, "localhost:61180")
                     .header("x-elastos-home-token", home_app_token(dir.path()))
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(
@@ -4581,7 +4616,7 @@ async fn test_home_launch_validates_shell_targets() {
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let route = payload["route"].as_str().unwrap_or_default();
-    assert!(route.starts_with("/apps/documents/?home_token="), "{route}");
+    assert_isolated_launch_route(route, "documents");
     assert!(route.contains("doc=did%3Akey%3Az6ExampleDoc"), "{route}");
     assert!(route.contains("view=read"), "{route}");
 
@@ -4591,6 +4626,7 @@ async fn test_home_launch_validates_shell_targets() {
                 Request::builder()
                     .method("POST")
                     .uri("/api/apps/home/launch")
+                    .header(HOST, "localhost:61180")
                     .header("x-elastos-home-token", home_app_token(dir.path()))
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(
@@ -4606,7 +4642,7 @@ async fn test_home_launch_validates_shell_targets() {
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let route = payload["route"].as_str().unwrap_or_default();
-    assert!(route.starts_with("/apps/documents/?home_token="), "{route}");
+    assert_isolated_launch_route(route, "documents");
     assert!(
         route.contains("cid=bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"),
         "{route}"
@@ -4625,6 +4661,7 @@ async fn test_home_launch_validates_shell_targets() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -4640,7 +4677,7 @@ async fn test_home_launch_validates_shell_targets() {
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let route = payload["route"].as_str().unwrap_or_default();
-    assert!(route.starts_with("/apps/chat-room/?home_token="), "{route}");
+    assert_isolated_launch_route(route, "chat-room");
     assert!(
         route.contains("invite=elastos%3A%2F%2Fpeer%2Finvite%3Ftoken%3Dabc-123"),
         "{route}"
@@ -4652,6 +4689,7 @@ async fn test_home_launch_validates_shell_targets() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"gba-ucity"}"#))
@@ -4666,16 +4704,22 @@ async fn test_home_launch_validates_shell_targets() {
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["target"], "gba-ucity");
     assert_eq!(payload["target_kind"], "object");
-    assert!(payload["route"]
-        .as_str()
-        .unwrap()
-        .starts_with("/apps/gba-emulator/?capsule=gba-ucity&home_token="));
+    let route = assert_isolated_launch_route(payload["route"].as_str().unwrap(), "gba-emulator");
+    assert_eq!(
+        route
+            .query_pairs()
+            .find(|(key, _)| key == "capsule")
+            .unwrap()
+            .1,
+        "gba-ucity"
+    );
 
     let missing = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"missing-shell-target"}"#))
@@ -4702,6 +4746,13 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
         "app",
         "Regular app",
         Some("<!doctype html><title>Regular App</title>"),
+    );
+    write_test_browser_capsule(
+        dir.path(),
+        "manifest-shell",
+        "shell",
+        "Manifest shell",
+        Some("<!doctype html><title>Manifest Shell</title>"),
     );
     let broken_shell_dir = dir.path().join("capsules").join("broken-shell");
     std::fs::create_dir_all(&broken_shell_dir).unwrap();
@@ -4792,6 +4843,24 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
     assert!(!candidates
         .iter()
         .any(|candidate| candidate["name"] == "broken-shell"));
+    assert!(!candidates
+        .iter()
+        .any(|candidate| candidate["name"] == "manifest-shell"));
+    let manifest_shell_token = issue_home_launch_token(dir.path(), "manifest-shell").unwrap();
+    let manifest_shell_update = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/active-shell")
+                .header("x-elastos-home-token", manifest_shell_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"active":"home-gui"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(manifest_shell_update.status(), StatusCode::FORBIDDEN);
     let visible_targets = payload["targets"].as_array().unwrap();
     assert!(!visible_targets
         .iter()
@@ -4823,6 +4892,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"home-cli"}"#))
@@ -4835,13 +4905,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
         .await
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let home_cli_token = payload["route"]
-        .as_str()
-        .unwrap()
-        .split("home_token=")
-        .nth(1)
-        .unwrap()
-        .to_string();
+    let home_cli_token = launch_token_from_route(payload["route"].as_str().unwrap()).unwrap();
 
     let shell_summary = app
         .clone()
@@ -4920,6 +4984,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"regular-app"}"#))
@@ -4932,12 +4997,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
         .await
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let regular_token = payload["route"]
-        .as_str()
-        .unwrap()
-        .split("home_token=")
-        .nth(1)
-        .unwrap();
+    let regular_token = launch_token_from_route(payload["route"].as_str().unwrap()).unwrap();
     let catalog_rejected = app
         .clone()
         .oneshot(
@@ -5170,15 +5230,10 @@ async fn test_home_shell_switch_preserves_runtime_facts_and_recovers_after_launc
         .as_str()
         .unwrap()
         .contains("WASI Preview 1 product capsules are no longer materialized"));
-    let cli_token = failed_launch["route"]
-        .as_str()
-        .unwrap()
-        .split("home_token=")
-        .nth(1)
-        .unwrap();
+    let cli_token = launch_token_from_route(failed_launch["route"].as_str().unwrap()).unwrap();
 
     let (status, cli_after_failure) =
-        home_test_get_json(&app, "/api/apps/home/summary", cli_token).await;
+        home_test_get_json(&app, "/api/apps/home/summary", &cli_token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         home_shell_shared_facts(&cli_after_failure),
@@ -5193,7 +5248,7 @@ async fn test_home_shell_switch_preserves_runtime_facts_and_recovers_after_launc
     let (status, gui_catalog) =
         home_test_get_json(&app, "/api/capsules/catalog", &authority.home_token).await;
     assert_eq!(status, StatusCode::OK);
-    let (status, cli_catalog) = home_test_get_json(&app, "/api/capsules/catalog", cli_token).await;
+    let (status, cli_catalog) = home_test_get_json(&app, "/api/capsules/catalog", &cli_token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(gui_catalog, cli_catalog);
     assert_eq!(gui_catalog, gui_before["capsule_catalog"]);
@@ -5202,7 +5257,7 @@ async fn test_home_shell_switch_preserves_runtime_facts_and_recovers_after_launc
         home_test_get_json(&app, "/api/capsules/interfaces", &authority.home_token).await;
     assert_eq!(status, StatusCode::OK);
     let (status, cli_interfaces) =
-        home_test_get_json(&app, "/api/capsules/interfaces", cli_token).await;
+        home_test_get_json(&app, "/api/capsules/interfaces", &cli_token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(gui_interfaces, cli_interfaces);
     assert_eq!(gui_interfaces, gui_before["capsule_interfaces"]);
@@ -5210,7 +5265,7 @@ async fn test_home_shell_switch_preserves_runtime_facts_and_recovers_after_launc
     let (status, selected_cli) = home_test_post_json(
         &app,
         "/api/apps/home/active-shell",
-        cli_token,
+        &cli_token,
         json!({ "active": HOME_CLI_CAPSULE_ID_FOR_TEST }),
     )
     .await;
@@ -5221,7 +5276,7 @@ async fn test_home_shell_switch_preserves_runtime_facts_and_recovers_after_launc
         home_test_get_json(&app, "/api/apps/home/summary", &authority.home_token).await;
     assert_eq!(status, StatusCode::OK);
     let (status, cli_after_switch) =
-        home_test_get_json(&app, "/api/apps/home/summary", cli_token).await;
+        home_test_get_json(&app, "/api/apps/home/summary", &cli_token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(gui_after_switch["active_shell"]["active"], "home-cli");
     assert_eq!(cli_after_switch["active_shell"]["active"], "home-cli");
@@ -5247,7 +5302,7 @@ async fn test_home_shell_switch_preserves_runtime_facts_and_recovers_after_launc
     let (status, selected_gui) = home_test_post_json(
         &app,
         "/api/apps/home/active-shell",
-        cli_token,
+        &cli_token,
         json!({ "active": HOME_GUI_SHELL_ID }),
     )
     .await;
@@ -5433,6 +5488,55 @@ async fn test_home_browser_state_is_encrypted_for_protected_principal_root() {
         loaded_json["layout"]["desktopIconsVisible"],
         serde_json::Value::Bool(false)
     );
+}
+
+#[tokio::test]
+async fn test_home_browser_state_accepts_trusted_shells_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("shell-state"));
+    let home_gui_token =
+        launch_token_for_authority_context(dir.path(), HOME_GUI_SHELL_ID, &authority);
+    let home_cli_token =
+        launch_token_for_authority_context(dir.path(), HOME_CLI_CAPSULE_ID_FOR_TEST, &authority);
+    let system_token = authority.system_token.clone();
+    let regular_token = launch_token_for_authority_context(dir.path(), "regular-app", &authority);
+    let app = gateway_router(test_state(dir.path()));
+
+    for token in [&home_gui_token, &home_cli_token] {
+        let (status, updated) = home_test_post_json(
+            &app,
+            "/api/apps/home/state",
+            token,
+            json!({
+                "layout": { "desktopIconsVisible": false },
+                "session": { "windows": [] },
+                "recent_targets": ["system"]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(updated["layout"]["desktopIconsVisible"], false);
+
+        let (status, loaded) = home_test_get_json(&app, "/api/apps/home/state", token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(loaded["principal_id"], authority.principal_id);
+    }
+
+    for token in [&system_token, &regular_token] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/home/state")
+                    .header(HOST, "localhost:61180")
+                    .header("x-elastos-home-token", token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 }
 
 #[tokio::test]
@@ -5719,6 +5823,7 @@ async fn test_home_launch_starts_system_capsule_and_reports_runtime() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"system"}"#))
@@ -5731,20 +5836,12 @@ async fn test_home_launch_starts_system_capsule_and_reports_runtime() {
         .await
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(payload["route"]
-        .as_str()
-        .unwrap()
-        .starts_with("/apps/system/?home_token="));
+    assert_isolated_launch_route(payload["route"].as_str().unwrap(), "system");
     assert_eq!(payload["target"], "system");
     assert_eq!(payload["target_kind"], "app");
     assert_eq!(payload["launch_status"], "launched");
     assert_eq!(payload["capsule_id"], "wasm-system-instance");
-    let system_token = payload["route"]
-        .as_str()
-        .unwrap()
-        .split("home_token=")
-        .nth(1)
-        .unwrap();
+    let system_token = launch_token_from_route(payload["route"].as_str().unwrap()).unwrap();
 
     let summary = app
         .oneshot(
@@ -5785,6 +5882,7 @@ async fn test_home_launch_starts_chat_room_capsule_and_reports_runtime_activity(
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
@@ -5797,10 +5895,7 @@ async fn test_home_launch_starts_chat_room_capsule_and_reports_runtime_activity(
         .await
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(payload["route"]
-        .as_str()
-        .unwrap()
-        .starts_with("/apps/chat-room/?home_token="));
+    assert_isolated_launch_route(payload["route"].as_str().unwrap(), "chat-room");
     assert_eq!(payload["target"], "chat-room");
     assert_eq!(payload["target_kind"], "app");
     assert_eq!(payload["launch_status"], "launched");
@@ -5886,6 +5981,7 @@ async fn test_home_launch_rejects_source_wasi_materialization() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"test-wasm-viewer"}"#))
@@ -5926,6 +6022,7 @@ async fn test_home_launch_reports_system_launch_failure_when_runtime_cannot_star
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"system"}"#))
@@ -5938,21 +6035,13 @@ async fn test_home_launch_reports_system_launch_failure_when_runtime_cannot_star
         .await
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(payload["route"]
-        .as_str()
-        .unwrap()
-        .starts_with("/apps/system/?home_token="));
+    assert_isolated_launch_route(payload["route"].as_str().unwrap(), "system");
     assert_eq!(payload["launch_status"], "failed");
     assert!(payload["launch_detail"]
         .as_str()
         .unwrap()
         .contains("managed local runtime could not start"));
-    let system_token = payload["route"]
-        .as_str()
-        .unwrap()
-        .split("home_token=")
-        .nth(1)
-        .unwrap();
+    let system_token = launch_token_from_route(payload["route"].as_str().unwrap()).unwrap();
 
     let summary = app
         .oneshot(

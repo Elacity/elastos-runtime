@@ -5,7 +5,18 @@ export function readQueryParam(name) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+export function readLaunchToken() {
+  const value = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token");
+  return typeof value === "string" ? value.trim() : "";
+}
+
+export function readHomeOrigin() {
+  return readQueryParam("home_origin");
+}
+
 export function createWalletApi({ getHomeToken }) {
+  const homeParentOrigin = readHomeOrigin();
+
   async function fetchJson(url, init) {
     const response = await fetch(url, init);
     if (!response.ok) {
@@ -16,46 +27,26 @@ export function createWalletApi({ getHomeToken }) {
     return response.json();
   }
 
-  async function requestFreshPasskeyHomeToken() {
-    if (!window.PublicKeyCredential) {
-      throw new Error("Passkey verification is unavailable in this browser.");
-    }
-    const begin = await fetchJson("/api/auth/passkey/authenticate/begin", { method: "POST" });
-    const credential = await navigator.credentials.get(toRequestOptions(begin.options));
-    if (!credential) {
-      throw new Error("Passkey verification was cancelled.");
-    }
-    const complete = await fetchJson("/api/auth/passkey/authenticate/complete", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        ceremony_id: begin.ceremony_id,
-        response: serializeAssertionCredential(credential),
-      }),
-    });
-    const homeToken = readText(complete.home_token);
-    if (!homeToken) {
-      throw new Error("Fresh passkey token was not issued.");
-    }
-    return homeToken;
+  async function requestFreshPasskeyHomeToken(operation, request) {
+    return requestHomePasskeyAuthority(getHomeToken(), homeParentOrigin, operation, request);
   }
 
-  function shellHeaders(extra = {}) {
+  function shellHeaders(extra = {}, authorityToken = getHomeToken()) {
     return {
       ...extra,
-      "x-elastos-home-token": getHomeToken(),
+      "x-elastos-home-token": authorityToken,
     };
   }
 
   function notifyHomeSummaryChanged() {
     const homeToken = getHomeToken();
-    if (!homeToken || window.parent === window) {
+    if (!homeToken || !homeParentOrigin || window.top === window) {
       return;
     }
-    window.parent.postMessage({
+    window.top.postMessage({
       type: "home:refresh-summary",
       homeToken,
-    }, window.location.origin);
+    }, homeParentOrigin);
   }
 
   return {
@@ -66,48 +57,41 @@ export function createWalletApi({ getHomeToken }) {
   };
 }
 
-function toRequestOptions(options) {
-  const publicKey = { ...(options && options.publicKey ? options.publicKey : {}) };
-  publicKey.challenge = base64UrlToBuffer(publicKey.challenge);
-  publicKey.allowCredentials = (publicKey.allowCredentials || []).map((credential) => ({
-    ...credential,
-    id: base64UrlToBuffer(credential.id),
-  }));
-  return { publicKey };
-}
-
-function serializeAssertionCredential(credential) {
-  return {
-    id: credential.id,
-    rawId: bufferToBase64Url(credential.rawId),
-    type: credential.type,
-    response: {
-      clientDataJson: bufferToBase64Url(credential.response.clientDataJSON),
-      authenticatorData: bufferToBase64Url(credential.response.authenticatorData),
-      signature: bufferToBase64Url(credential.response.signature),
-      userHandle: credential.response.userHandle
-        ? bufferToBase64Url(credential.response.userHandle)
-        : null,
-    },
-  };
-}
-
-function base64UrlToBuffer(value) {
-  const text = readText(value);
-  const padded = `${text.replace(/-/g, "+").replace(/_/g, "/")}${"=".repeat((4 - (text.length % 4)) % 4)}`;
-  const binary = window.atob(padded);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
+function requestHomePasskeyAuthority(homeToken, parentOrigin, operation, request) {
+  if (!homeToken || window.top === window || !parentOrigin) {
+    return Promise.reject(new Error("Open Wallet from Home to verify your passkey."));
   }
-  return bytes.buffer;
-}
-
-function bufferToBase64Url(buffer) {
-  const bytes = new Uint8Array(buffer || new ArrayBuffer(0));
-  let binary = "";
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-  return window.btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  const requestId = window.crypto?.randomUUID?.()
+    || `passkey-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      window.removeEventListener("message", onResult);
+      reject(new Error("Passkey verification timed out."));
+    }, 120_000);
+    const onResult = (event) => {
+      if (event.source !== window.top || event.origin !== parentOrigin) {
+        return;
+      }
+      const result = event.data && typeof event.data === "object" ? event.data : null;
+      if (result?.type !== "home:passkey-authority-result" || result.requestId !== requestId) {
+        return;
+      }
+      window.clearTimeout(timeout);
+      window.removeEventListener("message", onResult);
+      const freshToken = readText(result.homeToken);
+      if (freshToken) {
+        resolve(freshToken);
+        return;
+      }
+      reject(new Error(readText(result.error) || "Passkey verification failed."));
+    };
+    window.addEventListener("message", onResult);
+    window.top.postMessage({
+      type: "home:request-passkey-authority",
+      requestId,
+      homeToken,
+      operation,
+      request,
+    }, parentOrigin);
+  });
 }

@@ -6,7 +6,9 @@ const mineCountNode = document.getElementById("mine-count");
 const othersCountNode = document.getElementById("others-count");
 const mineServicesList = document.getElementById("mine-services-list");
 const otherServicesList = document.getElementById("other-services-list");
-const homeToken = new URLSearchParams(window.location.search).get("home_token") || "";
+const launchParams = new URLSearchParams(window.location.search);
+const homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
+const homeOrigin = launchParams.get("home_origin") || "";
 const EXIT_SERVICE_KIND = "remote_exit";
 const BROWSER_ENGINE_SERVICE_KIND = "browser_engine";
 const CONFIGURED_REMOTE_EXIT_SOURCE = "configured_remote_exit";
@@ -14,6 +16,8 @@ const VISIBLE_SERVICE_KINDS = new Set([BROWSER_ENGINE_SERVICE_KIND, EXIT_SERVICE
 
 let currentServices = null;
 let pendingServiceAction = null;
+
+announceReady();
 
 boot().catch((error) => {
   showStatus(error.message || "Services failed to load.", "error");
@@ -32,6 +36,12 @@ async function boot() {
   lockedShell?.classList.add("hidden");
   servicesShell?.classList.remove("hidden");
   await refreshServices();
+}
+
+function announceReady() {
+  if (homeToken && homeOrigin && window.top !== window) {
+    window.top.postMessage({ type: "home:app-ready", homeToken }, homeOrigin);
+  }
 }
 
 function bindNavigation() {

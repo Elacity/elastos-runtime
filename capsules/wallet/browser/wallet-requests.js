@@ -97,11 +97,12 @@ export function createWalletRequests({
     setBusy(button, true);
     showStatus("Confirm with your passkey to sign.", "muted");
     try {
-      const homeToken = await requestFreshPasskeyHomeToken();
+      const intent = { request_id: requestId, reason: "Approved in Wallet" };
+      const homeToken = await requestFreshPasskeyHomeToken("wallet.approve", intent);
       await fetchJson(`/api/apps/wallet/wallet/managed-approvals/${encodeURIComponent(requestId)}/approve`, {
         method: "POST",
-        headers: shellHeaders({ "content-type": "application/json" }),
-        body: JSON.stringify({ reason: "Approved in Wallet", home_token: homeToken }),
+        headers: shellHeaders({ "content-type": "application/json" }, homeToken),
+        body: JSON.stringify({ reason: intent.reason, home_token: homeToken }),
       });
       showStatus("Request signed.", "success");
       notifyHomeSummaryChanged();

@@ -11,9 +11,20 @@ pub(in crate::api::gateway) async fn wallet_app_send_transaction(
         Ok(context) => context,
         Err(err) => return system_error_response(err),
     };
-    if let Err(err) =
-        require_fresh_passkey_home_token(&state.data_dir, &input.home_token, &context, 180)
-    {
+    if let Err(err) = consume_fresh_passkey_home_token(
+        &state.data_dir,
+        &input.home_token,
+        &context,
+        WALLET_CAPSULE_ID,
+        180,
+        "wallet.send",
+        &serde_json::json!({
+            "account_id": input.account_id,
+            "chain_namespace": input.chain_namespace,
+            "to": input.to,
+            "amount": input.amount,
+        }),
+    ) {
         return system_error_response(err);
     }
     let audit_id = wallet_send_request_id(&input.account_id);

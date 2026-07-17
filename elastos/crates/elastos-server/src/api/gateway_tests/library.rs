@@ -4430,12 +4430,25 @@ async fn test_library_provider_events_stream_requires_library_token_and_serves_s
         .unwrap();
     assert_eq!(unauthorized.status(), StatusCode::FORBIDDEN);
 
-    let authorized = app
+    let query_authority = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri(format!(
                     "/api/provider/object/events/stream?home_token={token}"
                 ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(query_authority.status(), StatusCode::FORBIDDEN);
+
+    let authorized = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/provider/object/events/stream")
+                .header("x-elastos-home-token", token)
                 .body(Body::empty())
                 .unwrap(),
         )

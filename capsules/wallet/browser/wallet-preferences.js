@@ -23,6 +23,7 @@ export function createWalletPreferences({
   shellHeaders,
   showStatus,
 }) {
+  const homeParentOrigin = new URLSearchParams(window.location.search).get("home_origin") || "";
   const privacyButton = document.querySelector("#wallet-privacy");
   const privacySettingsButton = document.querySelector("#wallet-privacy-settings");
   const settingsDrawerNode = document.querySelector("#wallet-settings-drawer");
@@ -126,10 +127,13 @@ export function createWalletPreferences({
     }
     remove.disabled = true;
     try {
-      const homeToken = await requestFreshPasskeyHomeToken();
+      const homeToken = await requestFreshPasskeyHomeToken(
+        "wallet.account.delete",
+        { account_id: accountId },
+      );
       await fetchJson(`/api/apps/wallet/wallet/accounts/${encodeURIComponent(accountId)}`, {
         method: "DELETE",
-        headers: shellHeaders({ "content-type": "application/json" }),
+        headers: shellHeaders({ "content-type": "application/json" }, homeToken),
         body: JSON.stringify({ home_token: homeToken }),
       });
       showStatus(`${name} removed.`, "success");
@@ -197,15 +201,15 @@ export function createWalletPreferences({
 
   function openApprovalMethod(target) {
     const activeHomeToken = getHomeToken();
-    if (!target || !activeHomeToken || window.parent === window) {
+    if (!target || !activeHomeToken || !homeParentOrigin || window.top === window) {
       return;
     }
     closeDrawers();
-    window.parent.postMessage({
+    window.top.postMessage({
       type: "home:open-target",
       target,
       homeToken: activeHomeToken,
-    }, window.location.origin);
+    }, homeParentOrigin);
   }
 
   return {

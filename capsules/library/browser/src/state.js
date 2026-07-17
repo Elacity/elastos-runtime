@@ -19,7 +19,7 @@ export const MUTATING_PROVIDER_OPS = new Set([
 export function createLibraryState({ queryParams, storage, perfTarget }) {
   const rawMode = queryParams.get("mode") || "";
   const state = {
-    homeToken: queryParams.get("home_token") || "",
+    homeToken: new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "",
     mode: ["attach", "archive-open", "archive-create"].includes(rawMode) ? rawMode : "browse",
     returnTarget: queryParams.get("returnTarget") || "",
     initialUri: queryParams.get("uri") || "",

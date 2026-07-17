@@ -36,11 +36,25 @@ export const shellState = {
   homeGuiMounted: false,
 };
 
+let homeAuthorityToken = "";
+
+export function setHomeAuthorityToken(value) {
+  homeAuthorityToken = typeof value === "string" ? value.trim() : "";
+}
+
+export function clearHomeAuthorityToken() {
+  homeAuthorityToken = "";
+}
+
 export async function fetchJson(url, init) {
+  const authorityHeaders = url === "/api/apps/home/launch" && homeAuthorityToken
+    ? { "x-elastos-home-token": homeAuthorityToken }
+    : {};
   const response = await fetch(url, {
     ...init,
     headers: {
       "content-type": "application/json",
+      ...authorityHeaders,
       ...(init && init.headers ? init.headers : {}),
     },
   });

@@ -315,7 +315,8 @@ async fn test_wallet_app_can_delete_managed_account() {
         .iter()
         .find(|account| account["label"] == "Temporary")
         .and_then(|account| account["account_id"].as_str())
-        .unwrap();
+        .unwrap()
+        .to_string();
     let encoded = account_id.replace(':', "%3A");
 
     let missing_fresh = app
@@ -333,6 +334,13 @@ async fn test_wallet_app_can_delete_managed_account() {
         .unwrap();
     assert_eq!(missing_fresh.status(), StatusCode::FORBIDDEN);
 
+    let delete_token = intent_token_for_app_context(
+        dir.path(),
+        WALLET_CAPSULE_ID,
+        &token,
+        "wallet.account.delete",
+        &json!({ "account_id": account_id }),
+    );
     let deleted = app
         .clone()
         .oneshot(
@@ -343,7 +351,7 @@ async fn test_wallet_app_can_delete_managed_account() {
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
                     r#"{{"home_token":"{}"}}"#,
-                    authority.home_token
+                    delete_token
                 )))
                 .unwrap(),
         )
@@ -407,7 +415,8 @@ async fn test_wallet_app_can_rename_account() {
         .iter()
         .find(|account| account["label"] == "Spending")
         .and_then(|account| account["account_id"].as_str())
-        .unwrap();
+        .unwrap()
+        .to_string();
     let encoded = account_id.replace(':', "%3A");
 
     let renamed = app
@@ -497,6 +506,36 @@ async fn test_wallet_recovery_key_requires_fresh_passkey_home_token() {
         .unwrap();
     assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
 
+    let fresh_authority = passkey_authority(dir.path());
+    let export_token = intent_token_for_authority_context(
+        dir.path(),
+        WALLET_CAPSULE_ID,
+        &fresh_authority,
+        "wallet.recovery-key.export",
+        &json!({ "account_id": account_id }),
+    );
+    let mismatched = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/apps/wallet/wallet/accounts/{encoded}/recovery-key"
+                ))
+                .header("x-elastos-home-token", wallet_token.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "home_token": export_token.clone(),
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mismatched.status(), StatusCode::FORBIDDEN);
+
     let exported = app
         .oneshot(
             Request::builder()
@@ -504,11 +543,11 @@ async fn test_wallet_recovery_key_requires_fresh_passkey_home_token() {
                 .uri(format!(
                     "/api/apps/wallet/wallet/accounts/{encoded}/recovery-key"
                 ))
-                .header("x-elastos-home-token", wallet_token)
+                .header("x-elastos-home-token", export_token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
-                        "home_token": authority.home_token,
+                        "home_token": export_token,
                     }))
                     .unwrap(),
                 ))
@@ -567,18 +606,29 @@ async fn test_wallet_recovery_key_import_requires_fresh_passkey_home_token() {
         .unwrap();
     assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
 
+    let import_intent = json!({
+        "recovery_key": recovery_key,
+        "label": "Recovered Base",
+    });
+    let import_token = intent_token_for_app_context(
+        dir.path(),
+        WALLET_CAPSULE_ID,
+        &wallet_token,
+        "wallet.recovery-key.import",
+        &import_intent,
+    );
     let imported = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/wallet/wallet/accounts/import-recovery-key")
-                .header("x-elastos-home-token", wallet_token)
+                .header("x-elastos-home-token", wallet_token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
-                        "home_token": authority.home_token,
-                        "recovery_key": recovery_key,
-                        "label": "Recovered Base",
+                        "home_token": import_token,
+                        "recovery_key": import_intent["recovery_key"],
+                        "label": import_intent["label"],
                     }))
                     .unwrap(),
                 ))

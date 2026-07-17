@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260713a";
+const moduleVersion = "home-20260715a";
 const requests = [];
 const localStorageValues = new Map([
   ["elastos.home.active-shell-hint", "home-cli"],
@@ -332,7 +332,7 @@ globalThis.fetch = async (url, init = {}) => {
     assert(body?.query?.shell_mode === "root", "stale-hint boot did not launch root shell mode", body);
     return jsonResponse({
       attach_kind: "iframe",
-      route: "/apps/home-cli/?shell_mode=root&home_token=root-token",
+      route: "/apps/home-cli/?shell_mode=root&home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=root-token",
       target: "home-cli",
     });
   }

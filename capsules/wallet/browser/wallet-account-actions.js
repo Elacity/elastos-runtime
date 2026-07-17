@@ -155,14 +155,17 @@ export function createWalletAccountActions({
     const button = modalNode.querySelector(".wallet-modal-actions .wallet-button-danger");
     setBusy(button, true);
     try {
-      const homeToken = await requestFreshPasskeyHomeToken();
-      await Promise.all(accountIds(account).map((accountId) =>
-        fetchJson(`/api/apps/wallet/wallet/accounts/${encodeURIComponent(accountId)}`, {
+      for (const accountId of accountIds(account)) {
+        const homeToken = await requestFreshPasskeyHomeToken(
+          "wallet.account.delete",
+          { account_id: accountId },
+        );
+        await fetchJson(`/api/apps/wallet/wallet/accounts/${encodeURIComponent(accountId)}`, {
           method: "DELETE",
-          headers: shellHeaders({ "content-type": "application/json" }),
+          headers: shellHeaders({ "content-type": "application/json" }, homeToken),
           body: JSON.stringify({ home_token: homeToken }),
-        }),
-      ));
+        });
+      }
       closeModal();
       clearAccountSelection();
       showStatus(`${account.name} deleted.`, "success");
@@ -191,12 +194,15 @@ export function createWalletAccountActions({
       ),
     ]);
     try {
-      const homeToken = await requestFreshPasskeyHomeToken();
+      const homeToken = await requestFreshPasskeyHomeToken(
+        "wallet.recovery-key.export",
+        { account_id: account.account_id },
+      );
       const payload = await fetchJson(
         `/api/apps/wallet/wallet/accounts/${encodeURIComponent(account.account_id)}/recovery-key`,
         {
           method: "POST",
-          headers: shellHeaders({ "content-type": "application/json" }),
+          headers: shellHeaders({ "content-type": "application/json" }, homeToken),
           body: JSON.stringify({ home_token: homeToken }),
         },
       );

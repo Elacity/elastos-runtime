@@ -3,7 +3,7 @@ use crate::sources::{save_trusted_sources, TrustedSource, TrustedSourcesConfig};
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, State as AxumState};
 use axum::http::{
-    header::{CONTENT_TYPE, COOKIE},
+    header::{CONTENT_TYPE, COOKIE, HOST},
     HeaderMap, Request,
 };
 use axum::routing::{get, post};
@@ -33,6 +33,22 @@ const TEST_CIDV0: &str = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
 const TEST_CIDV1: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
 const GBA_EMULATOR_CAPSULE_ID: &str = "gba-emulator";
 
+fn test_launch_token_from_route(route: &str) -> String {
+    let route = url::Url::parse("http://localhost")
+        .unwrap()
+        .join(route)
+        .expect("canonical capsule launch route");
+    url::form_urlencoded::parse(
+        route
+            .fragment()
+            .expect("launch authority must be in the URL fragment")
+            .as_bytes(),
+    )
+    .find(|(key, _)| key == "home_token")
+    .map(|(_, value)| value.into_owned())
+    .expect("launch route home token")
+}
+
 fn test_state(cache_dir: &std::path::Path) -> GatewayState {
     seed_test_browser_capsules(cache_dir);
     GatewayState {
@@ -41,6 +57,49 @@ fn test_state(cache_dir: &std::path::Path) -> GatewayState {
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
     }
+}
+
+#[tokio::test]
+async fn gateway_allows_opaque_capsule_preflight_without_granting_unrelated_origins() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let preflight = |origin: &'static str| {
+        Request::builder()
+            .method("OPTIONS")
+            .uri("/api/apps/home/state")
+            .header("origin", origin)
+            .header("access-control-request-method", "POST")
+            .header(
+                "access-control-request-headers",
+                "content-type,x-elastos-home-token",
+            )
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let allowed = app.clone().oneshot(preflight("null")).await.unwrap();
+    assert_eq!(allowed.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        allowed
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("null")
+    );
+    assert!(allowed
+        .headers()
+        .get("access-control-allow-headers")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("x-elastos-home-token")));
+
+    let denied = app
+        .oneshot(preflight("https://evil.example"))
+        .await
+        .unwrap();
+    assert!(denied
+        .headers()
+        .get("access-control-allow-origin")
+        .is_none());
 }
 
 async fn documents_test_state(cache_dir: &std::path::Path) -> GatewayState {

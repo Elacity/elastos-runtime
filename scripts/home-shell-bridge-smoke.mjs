@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260713a";
+const moduleVersion = "home-20260715a";
 const requests = [];
 const windowListeners = new Map();
 const localStorageValues = new Map([
@@ -71,6 +71,7 @@ class FakeElement {
     this.src = "";
     this.attributes = new Map();
     this.listeners = new Map();
+    this.queries = new Map();
     this.classList = new FakeClassList();
     this.content = withTemplateContent
       ? {
@@ -120,7 +121,10 @@ class FakeElement {
   }
 
   querySelector(selector) {
-    return new FakeElement(`${this.selector} ${selector}`);
+    if (!this.queries.has(selector)) {
+      this.queries.set(selector, new FakeElement(`${this.selector} ${selector}`));
+    }
+    return this.queries.get(selector);
   }
 
   querySelectorAll() {
@@ -203,9 +207,11 @@ const summary = {
   targets: [
     { target: "browser", title: "Browser", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "inbox", title: "Inbox", attach_kind: "iframe", role: "app", target_kind: "app" },
+    { target: "system", title: "System", attach_kind: "iframe", role: "app", target_kind: "app" },
   ],
 };
 let activeShellName = "home-cli";
+let passkeyCompleted = false;
 
 function currentSummary() {
   return {
@@ -229,9 +235,26 @@ globalThis.document = {
 };
 Object.defineProperty(globalThis, "navigator", {
   configurable: true,
-  value: {},
+  value: {
+    credentials: {
+      get: async () => ({
+        id: "credential-id",
+        rawId: new Uint8Array([1]).buffer,
+        type: "public-key",
+        response: {
+          authenticatorData: new Uint8Array([2]).buffer,
+          clientDataJSON: new Uint8Array([3]).buffer,
+          signature: new Uint8Array([4]).buffer,
+          userHandle: null,
+        },
+      }),
+    },
+  },
 });
 globalThis.window = {
+  PublicKeyCredential: function PublicKeyCredential() {},
+  atob: globalThis.atob,
+  btoa: globalThis.btoa,
   crypto: { randomUUID: () => "home-shell-bridge-smoke" },
   location: { href: "http://localhost:61180/apps/home/", origin: "http://localhost:61180" },
   localStorage: {
@@ -292,6 +315,19 @@ globalThis.fetch = async (url, init = {}) => {
     }
     return jsonResponse(currentSummary());
   }
+  if (url === "/api/auth/sessions/refresh") {
+    return jsonResponse({ home_token: "host-token" });
+  }
+  if (url === "/api/auth/passkey/authenticate/begin") {
+    return jsonResponse({
+      ceremony_id: "ceremony-id",
+      options: { publicKey: { challenge: "AQ", allowCredentials: [] } },
+    });
+  }
+  if (url === "/api/auth/passkey/authenticate/complete") {
+    passkeyCompleted = true;
+    return jsonResponse({ home_token: "fresh-passkey-token" });
+  }
   if (url === "/api/apps/home/active-shell") {
     assert(body?.active === "home-gui", "root shell app-open must switch back to home-gui", body);
     assert(
@@ -303,20 +339,43 @@ globalThis.fetch = async (url, init = {}) => {
     return jsonResponse({ active: "home-gui" });
   }
   if (url === "/api/apps/home/launch") {
+    const expectedToken = body?.authority ? "fresh-passkey-token" : "host-token";
+    assert(
+      init.headers?.["x-elastos-home-token"] === expectedToken,
+      "Home launch did not use explicit host-held authority",
+      init.headers,
+    );
     if (body?.target === "home-cli") {
       assert(body?.query?.shell_mode === "root", "alternate shell must launch in root mode", body);
       return jsonResponse({
         attach_kind: "iframe",
-        route: "/apps/home-cli/?shell_mode=root&home_token=root-token",
+        route: "/apps/home-cli/?shell_mode=root&home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=root-token",
         target: "home-cli",
+      });
+    }
+    if (body?.target === "home-gui") {
+      assert(body?.query?.shell_mode === "root", "GUI shell must launch in root mode", body);
+      return jsonResponse({
+        attach_kind: "iframe",
+        route: "/apps/home-gui/?shell_mode=root&home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=gui-token",
+        target: "home-gui",
       });
     }
     if (body?.target === "browser") {
       return jsonResponse({
         attach_kind: "iframe",
-        route: "/apps/browser/?home_token=browser-token",
+        route: "/apps/browser/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=browser-token",
         target: "browser",
         title: "Browser",
+      });
+    }
+    if (body?.target === "system") {
+      const token = body?.authority ? "system-fresh-token" : "system-token";
+      return jsonResponse({
+        attach_kind: "iframe",
+        route: `/apps/system/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=${token}`,
+        target: "system",
+        title: "System",
       });
     }
     throw new Error(`unexpected launch target: ${body?.target || "missing"}`);
@@ -325,7 +384,6 @@ globalThis.fetch = async (url, init = {}) => {
 };
 
 const hostCore = await import(`../capsules/home/browser/shell-core.js?v=${moduleVersion}`);
-const homeGuiCore = await import(`../capsules/home-gui/browser/shell-core.js?v=${moduleVersion}`);
 
 await import(`../capsules/home/browser/home-shell-host.js?v=${moduleVersion}`);
 for (let attempt = 0; attempt < 20 && !elementForSelector("#active-shell-frame").dataset.route; attempt += 1) {
@@ -336,12 +394,6 @@ const body = document.body;
 const activeShellRoot = elementForSelector("#active-shell-root");
 const activeShellFrame = elementForSelector("#active-shell-frame");
 const shellHostRecovery = elementForSelector("#shell-host-recovery");
-const workspace = elementForSelector(".desktop-workspace");
-const toolbarHome = elementForSelector("#toolbar-home");
-const toolbarInbox = elementForSelector("#toolbar-inbox");
-const launcherToggle = elementForSelector("#launcher-toggle");
-const launcherSearch = elementForSelector("#launcher-search");
-const desktop = elementForSelector("#desktop");
 const launchRequest = requests.find((request) => request.url === "/api/apps/home/launch");
 
 assert(body.dataset.homeShell === "alternate", "alternate shell did not take root mode", body.dataset);
@@ -360,18 +412,18 @@ assert(activeShellRoot.hidden === false, "active shell root stayed hidden");
 assert(activeShellRoot.dataset.target === "home-cli", "active shell root target drifted", activeShellRoot.dataset);
 assert(activeShellFrame.hidden === false, "active shell frame stayed hidden");
 assert(activeShellFrame.dataset.route.includes("/apps/home-cli/"), "active shell frame did not load Home CLI", activeShellFrame.dataset);
-assert(activeShellFrame.dataset.route.includes("home_token=root-token"), "active shell launch token was not carried in frame route", activeShellFrame.dataset);
+assert(activeShellFrame.dataset.route.includes("#home_token=root-token"), "active shell launch token was not carried in the frame fragment", activeShellFrame.dataset);
+assert(!activeShellFrame.dataset.route.includes("?home_token="), "active shell authority leaked into the query string", activeShellFrame.dataset);
 assert(shellHostRecovery.hidden === true, "host recovery panel showed during healthy shell launch");
-assert((toolbarHome.listeners.get("click") || []).length === 0, "Home GUI toolbar was bound before alternate shell settled");
-assert((toolbarInbox.listeners.get("click") || []).length === 0, "Home GUI inbox control was bound before alternate shell settled");
-assert((launcherToggle.listeners.get("click") || []).length === 0, "Home GUI launcher was bound before alternate shell settled");
-assert((launcherSearch.listeners.get("input") || []).length === 0, "Home GUI launcher search was bound before alternate shell settled");
-assert((workspace.listeners.get("contextmenu") || []).length === 0, "Home GUI desktop context menu was bound before alternate shell settled");
-assert((desktop.listeners.get("pointerdown") || []).length === 0, "Home GUI desktop input was bound before alternate shell settled");
 assert(launchRequest, "alternate shell launch request was not made", requests);
 assert(!requests.some((request) => request.url === "/api/apps/home/active-shell"), "bridge smoke should not switch shell using ambient state", requests);
 
-const shellFrameWindow = {};
+const shellMessages = [];
+const shellFrameWindow = {
+  postMessage(payload, origin) {
+    shellMessages.push({ origin, payload });
+  },
+};
 activeShellFrame.contentWindow = shellFrameWindow;
 const launchRequestsBeforeInvalidMessages = requests.filter(
   (request) => request.url === "/api/apps/home/launch",
@@ -384,19 +436,19 @@ for (const data of [
     homeToken: "root-token",
   },
   {
-    origin: "http://localhost:61180",
+    origin: "null",
     type: "home:open-target",
     target: "browser",
     homeToken: "wrong-token",
   },
   {
-    origin: "http://localhost:61180",
+    origin: "null",
     type: "home:open-target",
     target: "home",
     homeToken: "root-token",
   },
   {
-    origin: "http://localhost:61180",
+    origin: "null",
     type: "home:sign-out",
     homeToken: "wrong-token",
   },
@@ -428,34 +480,44 @@ assert(
   "unauthorized shell message signed out Home",
   requests,
 );
-assert(homeGuiCore.shellState.windows.size === 0, "unauthorized shell messages created GUI windows");
-
 for (const listener of windowListeners.get("message") || []) {
   listener({
-    origin: "http://localhost:61180",
+    origin: "null",
     source: shellFrameWindow,
     data: {
-      type: "home:sign-out",
+      type: "home:launch-target",
+      requestId: "cli-launch-browser",
+      target: "browser",
+      query: {},
       homeToken: "root-token",
     },
   });
 }
-for (let attempt = 0; attempt < 20 && !requests.some(
-  (request) => request.url === "/api/auth/sessions/sign-out",
-); attempt += 1) {
+for (
+  let attempt = 0;
+  attempt < 20 && !shellMessages.some((message) => message.payload?.requestId === "cli-launch-browser");
+  attempt += 1
+) {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 assert(
-  requests.some((request) => (
-    request.url === "/api/auth/sessions/sign-out" && request.method === "POST"
-  )),
-  "authorized Home CLI sign-out did not revoke the browser Home session",
+  shellMessages.some((message) =>
+    message.origin === "*" &&
+    message.payload?.type === "home:shell-response" &&
+    message.payload?.requestId === "cli-launch-browser" &&
+    message.payload?.result?.route?.includes("#home_token=browser-token")
+  ),
+  "Home CLI did not receive the same Runtime-scoped launch result as Home GUI",
+  shellMessages,
+);
+assert(
+  !requests.some((request) => request.url === "/api/apps/home/active-shell"),
+  "Home CLI launch request switched shells implicitly",
   requests,
 );
-
 for (const listener of windowListeners.get("message") || []) {
   listener({
-    origin: "http://localhost:61180",
+    origin: "null",
     source: shellFrameWindow,
     data: {
       type: "home:open-target",
@@ -464,27 +526,153 @@ for (const listener of windowListeners.get("message") || []) {
     },
   });
 }
-for (let attempt = 0; attempt < 20 && homeGuiCore.shellState.windows.size === 0; attempt += 1) {
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert(
+  !requests.some((request) => request.url === "/api/apps/home/active-shell"),
+  "ordinary CLI app intent switched Home GUI implicitly",
+  requests,
+);
+for (const listener of windowListeners.get("message") || []) {
+  listener({
+    origin: "null",
+    source: shellFrameWindow,
+    data: {
+      type: "home:switch-shell-and-open-target",
+      requestId: "explicit-gui-browser",
+      target: "browser",
+      homeToken: "root-token",
+    },
+  });
+}
+for (let attempt = 0; attempt < 20 && activeShellFrame.dataset.route.includes("home-cli"); attempt += 1) {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
-assert(body.dataset.homeShell === "desktop", "root shell app-open did not switch to desktop shell mode", body.dataset);
-assert(body.dataset.homeGui === "mounted", "root shell app-open did not mount Home GUI", body.dataset);
-assert(activeShellRoot.hidden === true, "root shell app-open left the alternate shell root visible");
-assert(homeGuiCore.shellState.windows.size === 1, "root shell app-open did not create a GUI-owned Browser window", [...homeGuiCore.shellState.windows.keys()]);
+assert(body.dataset.homeShell === "desktop", "explicit graphical action did not switch to desktop shell mode", body.dataset);
+assert(body.dataset.homeGui === "mounted", "explicit graphical action did not mount Home GUI", body.dataset);
+assert(activeShellRoot.hidden === false, "explicit graphical action hid the active shell root");
+assert(activeShellRoot.dataset.target === "home-gui", "explicit graphical action did not select isolated Home GUI", activeShellRoot.dataset);
+assert(activeShellFrame.dataset.route.includes("/apps/home-gui/"), "explicit graphical action did not launch isolated Home GUI", activeShellFrame.dataset);
+assert(activeShellFrame.dataset.route.includes("#home_token=gui-token"), "isolated Home GUI did not receive fragment authority", activeShellFrame.dataset);
 assert(
-  hostCore.shellState.activeShellRootTarget === "",
-  "root shell app-open did not clear the alternate shell target",
+  hostCore.shellState.activeShellRootTarget === "home-gui",
+  "explicit graphical action did not replace the alternate root shell",
   hostCore.shellState,
 );
 assert(
-  requests.some((request) => request.url === "/api/apps/home/launch" && request.body?.target === "browser"),
-  "root shell open did not launch Browser through Home",
+  requests.some((request) => request.url === "/api/apps/home/active-shell"),
+  "explicit graphical action did not switch active shell with the shell token",
   requests,
 );
 assert(
-  requests.some((request) => request.url === "/api/apps/home/active-shell"),
-  "root shell app-open did not switch active shell with the shell token",
+  shellMessages.some((message) => message.payload?.type === "home:gui-command" && message.payload?.target === "browser"),
+  "explicit graphical action did not hand Browser intent to isolated Home GUI",
+  shellMessages,
+);
+
+function sendChildMessage(origin, source, data) {
+  for (const listener of windowListeners.get("message") || []) {
+    listener({ origin, source, data });
+  }
+}
+
+sendChildMessage("null", shellFrameWindow, {
+  type: "home:shell-ready",
+  homeToken: "gui-token",
+});
+sendChildMessage("null", shellFrameWindow, {
+  type: "home:launch-target",
+  requestId: "launch-browser",
+  target: "browser",
+  query: {},
+  homeToken: "gui-token",
+});
+for (let attempt = 0; attempt < 20 && !shellMessages.some((message) => message.payload?.requestId === "launch-browser"); attempt += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+assert(
+  requests.some((request) => request.url === "/api/apps/home/launch" && request.body?.target === "browser"),
+  "isolated Home GUI could not ask Home to launch Browser",
   requests,
+);
+assert(
+  shellMessages.some((message) =>
+    message.origin === "*" &&
+    message.payload?.type === "home:shell-response" &&
+    message.payload?.requestId === "launch-browser" &&
+    message.payload?.result?.route?.includes("#home_token=browser-token")
+  ),
+  "Home did not return the isolated Browser route to Home GUI",
+  shellMessages,
+);
+
+const browserFrameWindow = { postMessage() {} };
+sendChildMessage("null", browserFrameWindow, {
+  type: "home:app-ready",
+  homeToken: "browser-token",
+});
+const passkeyRequestsBeforeBrowser = requests.filter(
+  (request) => request.url === "/api/auth/passkey/authenticate/begin",
+).length;
+sendChildMessage("null", browserFrameWindow, {
+  type: "home:request-passkey-authority",
+  requestId: "browser-request",
+  homeToken: "browser-token",
+  operation: "browser.profile.delete",
+  request: { profile: "default" },
+});
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert(
+  requests.filter((request) => request.url === "/api/auth/passkey/authenticate/begin").length ===
+    passkeyRequestsBeforeBrowser,
+  "Browser frame obtained host passkey authority",
+  requests,
+);
+
+sendChildMessage("null", shellFrameWindow, {
+  type: "home:launch-target",
+  requestId: "launch-system",
+  target: "system",
+  query: {},
+  homeToken: "gui-token",
+});
+for (let attempt = 0; attempt < 20 && !shellMessages.some((message) => message.payload?.requestId === "launch-system"); attempt += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+assert(
+  shellMessages.some((message) =>
+    message.payload?.requestId === "launch-system" &&
+    message.payload?.result?.route?.includes("#home_token=system-token")
+  ),
+  "Home did not return an isolated System launch",
+  shellMessages,
+);
+
+let passkeyReply = null;
+const systemFrameWindow = {
+  postMessage(payload, origin) {
+    passkeyReply = { origin, payload };
+  },
+};
+sendChildMessage("null", systemFrameWindow, {
+  type: "home:app-ready",
+  homeToken: "system-token",
+});
+sendChildMessage("null", systemFrameWindow, {
+  type: "home:request-passkey-authority",
+  requestId: "system-request",
+  homeToken: "system-token",
+  operation: "auth.full-recovery-bundle.export",
+  request: { label: "Recovery Kit" },
+});
+for (let attempt = 0; attempt < 20 && !passkeyReply; attempt += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+assert(
+  passkeyReply?.payload?.homeToken === "system-fresh-token" &&
+    passkeyReply?.payload?.requestId === "system-request" &&
+    passkeyReply?.origin === "*",
+  "validated System frame did not receive capsule-scoped passkey proof",
+  passkeyReply,
 );
 
 console.log("[home-shell-bridge] PASS");

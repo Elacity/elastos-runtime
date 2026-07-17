@@ -2596,7 +2596,9 @@ fn request_host_is_local(host: &str) -> bool {
     } else {
         host.split(':').next().unwrap_or(host.as_str())
     };
-    matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "::1")
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || matches!(host, "127.0.0.1" | "0.0.0.0" | "::1")
 }
 
 pub(crate) fn set_room_session_cookie_header(

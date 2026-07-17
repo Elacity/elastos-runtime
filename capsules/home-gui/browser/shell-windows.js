@@ -5,7 +5,6 @@ import {
   windowErrorTemplate,
   SYSTEM_APP_ID,
   shellState,
-  fetchJson,
   targetTitle,
   canonicalTargetTitle,
   escapeHtml,
@@ -20,7 +19,7 @@ import {
   clearShellSessionState,
   ignoreRepeatedAction,
   targetById,
-} from "./shell-core.js?v=home-20260713a";
+} from "./shell-core.js?v=home-20260715a";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -31,7 +30,7 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260713a";
+} from "./shell-window-geometry.js?v=home-20260715a";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -41,6 +40,7 @@ const REQUIRED_WINDOW_HOOKS = [
   "renderDesktop",
   "renderTaskbar",
   "updateTaskbarState",
+  "launchTarget",
 ];
 const WINDOW_CONTROL_GUARD_MS = 400;
 const WINDOW_MAXIMIZE_CLOSE_GUARD_MS = 360;
@@ -56,28 +56,6 @@ const COMMON_IFRAME_SANDBOX = [
   "allow-pointer-lock",
   "allow-scripts",
 ];
-// Same-origin frames are presentation compatibility for current local API
-// capsules. Runtime launch tokens plus provider gates are authoritative.
-const SAME_ORIGIN_PRESENTATION_IFRAME_TARGETS = new Set([
-  "agent",
-  "archive-manager",
-  "browser",
-  "chat",
-  "chat-room",
-  "documents",
-  "gba-emulator",
-  "gba-ucity",
-  "inbox",
-  "library",
-  "marketplace",
-  "people",
-  "services",
-  SYSTEM_APP_ID,
-  "wallet",
-  "wallet-metamask",
-  "wallet-unisat",
-  "wallet-walletconnect",
-]);
 const BROWSER_IFRAME_SANDBOX_EXTRAS = [
   "allow-popups",
   "allow-popups-to-escape-sandbox",
@@ -92,14 +70,10 @@ const SYSTEM_IFRAME_SANDBOX_EXTRAS = [
 ];
 const COMMON_IFRAME_ALLOW = ["autoplay", "fullscreen"];
 const BROWSER_IFRAME_ALLOW_EXTRAS = ["clipboard-read", "clipboard-write"];
-const WEBAUTHN_IFRAME_ALLOW_TARGETS = new Set(["inbox", "wallet"]);
 const pendingWindowLaunches = new Set();
 
 function iframeSandboxForLaunch(launched) {
   const tokens = [...COMMON_IFRAME_SANDBOX];
-  if (SAME_ORIGIN_PRESENTATION_IFRAME_TARGETS.has(launched?.target)) {
-    tokens.push("allow-same-origin");
-  }
   if (launched?.target === "browser") {
     tokens.push(...BROWSER_IFRAME_SANDBOX_EXTRAS);
   }
@@ -116,9 +90,6 @@ function iframeAllowForLaunch(launched) {
   const tokens = [...COMMON_IFRAME_ALLOW];
   if (launched?.target === "browser") {
     tokens.push(...BROWSER_IFRAME_ALLOW_EXTRAS);
-  }
-  if (WEBAUTHN_IFRAME_ALLOW_TARGETS.has(launched?.target)) {
-    tokens.push("publickey-credentials-get");
   }
   return tokens.join("; ");
 }
@@ -752,13 +723,7 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
   const launchQuery = targetId === "browser"
     ? withBrowserInstanceQuery({ query: options.query }).query
     : normalizedLaunchQuery(options.query);
-  const launched = await fetchJson("/api/apps/home/launch", {
-    method: "POST",
-    body: JSON.stringify({
-      target: targetId,
-      query: launchQuery,
-    }),
-  });
+  const launched = await requireWindowHooks().launchTarget(targetId, launchQuery);
   launched.title = canonicalTargetTitle(launched.target, launched.title);
   if (launched.attach_kind !== "iframe") {
     throw new Error(`unsupported attach kind: ${launched.attach_kind || "unknown"}`);
@@ -770,7 +735,6 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
         : `launch status: ${launched.launch_status}`,
     );
   }
-
   const offset = browserWindowEntries().length;
   const restoredPlacement = options.restoredPlacement || null;
   const windowSpec = restoredPlacement || browserWindowSpec(launched, offset);
@@ -995,7 +959,7 @@ function browserWindowSpec(launched, offset) {
       height: 620,
     };
   }
-  if (typeof launched.route === "string" && launched.route.startsWith("/apps/gba-emulator/")) {
+  if (launched.target === "gba-emulator") {
     return {
       x: 88 + offset * 24,
       y: 62 + offset * 20,

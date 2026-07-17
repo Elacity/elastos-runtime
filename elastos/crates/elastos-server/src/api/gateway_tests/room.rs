@@ -138,6 +138,7 @@ async fn test_room_service_assets_serve() {
         .oneshot(
             Request::builder()
                 .uri("/apps/chat-room/")
+                .header(HOST, "chat-room.localhost:61180")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -160,6 +161,7 @@ async fn test_room_service_assets_serve() {
         .oneshot(
             Request::builder()
                 .uri("/apps/chat-room/chat_room_ui_bg.wasm")
+                .header(HOST, "chat-room.localhost:61180")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -703,6 +705,7 @@ async fn test_chat_room_session_start_connects_open_room_local_runtime() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
@@ -715,14 +718,14 @@ async fn test_chat_room_session_start_connects_open_room_local_runtime() {
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let route = payload["route"].as_str().unwrap();
-    let token = route.split("home_token=").nth(1).unwrap();
+    let token = test_launch_token_from_route(route);
 
     let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/chat-room/session/start")
-                .header("x-elastos-home-token", token)
+                .header("x-elastos-home-token", token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -752,6 +755,7 @@ async fn test_chat_room_join_link_create_returns_elastos_join_object() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
@@ -764,7 +768,7 @@ async fn test_chat_room_join_link_create_returns_elastos_join_object() {
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let route = payload["route"].as_str().unwrap();
-    let token = route.split("home_token=").nth(1).unwrap();
+    let token = test_launch_token_from_route(route);
 
     let start = app
         .clone()
@@ -772,7 +776,7 @@ async fn test_chat_room_join_link_create_returns_elastos_join_object() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/chat-room/session/start")
-                .header("x-elastos-home-token", token)
+                .header("x-elastos-home-token", token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -789,7 +793,7 @@ async fn test_chat_room_join_link_create_returns_elastos_join_object() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/chat-room/invites/create-link")
-                .header("x-elastos-home-token", token)
+                .header("x-elastos-home-token", token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"issuer_gateway":"https://elastos.elacitylabs.com"}"#,
@@ -847,6 +851,7 @@ async fn test_chat_room_session_start_requires_active_local_member_for_seeded_ro
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
@@ -859,14 +864,14 @@ async fn test_chat_room_session_start_requires_active_local_member_for_seeded_ro
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let route = payload["route"].as_str().unwrap();
-    let token = route.split("home_token=").nth(1).unwrap();
+    let token = test_launch_token_from_route(route);
 
     let denied = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/chat-room/session/start")
-                .header("x-elastos-home-token", token)
+                .header("x-elastos-home-token", token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -907,6 +912,7 @@ async fn test_chat_room_session_start_connects_active_local_member() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
@@ -919,7 +925,7 @@ async fn test_chat_room_session_start_connects_active_local_member() {
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let route = payload["route"].as_str().unwrap();
-    let token = route.split("home_token=").nth(1).unwrap();
+    let token = test_launch_token_from_route(route);
 
     let response = app
         .oneshot(
@@ -958,6 +964,7 @@ async fn test_chat_room_shell_requests_use_shell_launch_authority_without_room_c
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
@@ -970,7 +977,7 @@ async fn test_chat_room_shell_requests_use_shell_launch_authority_without_room_c
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let route = payload["route"].as_str().unwrap();
-    let token = route.split("home_token=").nth(1).unwrap();
+    let token = test_launch_token_from_route(route);
 
     let send = app
         .clone()
@@ -978,7 +985,7 @@ async fn test_chat_room_shell_requests_use_shell_launch_authority_without_room_c
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/chat-room/objects/send")
-                .header("x-elastos-home-token", token)
+                .header("x-elastos-home-token", token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"body":"hello from shell"}"#))
                 .unwrap(),
@@ -1001,7 +1008,7 @@ async fn test_chat_room_shell_requests_use_shell_launch_authority_without_room_c
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/chat-room/poll")
-                .header("x-elastos-home-token", token)
+                .header("x-elastos-home-token", token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"since":0}"#))
                 .unwrap(),
@@ -1133,6 +1140,7 @@ async fn test_chat_room_cookie_auth_prefers_home_room_session_over_browser_sessi
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
@@ -1144,12 +1152,7 @@ async fn test_chat_room_cookie_auth_prefers_home_room_session_over_browser_sessi
         .await
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let home_token = payload["route"]
-        .as_str()
-        .unwrap()
-        .split("home_token=")
-        .nth(1)
-        .unwrap();
+    let home_token = test_launch_token_from_route(payload["route"].as_str().unwrap());
 
     let native_session = app
         .clone()
@@ -1157,7 +1160,7 @@ async fn test_chat_room_cookie_auth_prefers_home_room_session_over_browser_sessi
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/chat-room/session/start")
-                .header("x-elastos-home-token", home_token)
+                .header("x-elastos-home-token", home_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1237,6 +1240,7 @@ async fn test_chat_room_shell_can_approve_browser_access_request() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
@@ -1249,7 +1253,7 @@ async fn test_chat_room_shell_can_approve_browser_access_request() {
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let route = payload["route"].as_str().unwrap();
-    let home_token = route.split("home_token=").nth(1).unwrap();
+    let home_token = test_launch_token_from_route(route);
 
     let request = app
             .clone()

@@ -20,12 +20,12 @@ import {
   shellInteractionActive,
   shouldIgnoreDesktopKeydown,
   targetById,
-} from "./shell-core.js?v=home-20260713a";
+} from "./shell-core.js?v=home-20260715a";
 import {
   clearIdentitySurface,
   syncIdentity,
   updateClock,
-} from "./shell-chrome.js?v=home-20260713a";
+} from "./shell-chrome.js?v=home-20260715a";
 import {
   clearDesktopSelection,
   continueTargetDrag,
@@ -46,7 +46,7 @@ import {
   renderTaskbar,
   toggleLauncher,
   updateTaskbarState,
-} from "./shell-surface.js?v=home-20260713a";
+} from "./shell-surface.js?v=home-20260715a";
 import {
   closeWindow,
   cleanupBeforeUnload,
@@ -56,7 +56,10 @@ import {
   focusWindow,
   restoreShellSession,
   showDesktopHome,
-} from "./shell-windows.js?v=home-20260713a";
+} from "./shell-windows.js?v=home-20260715a";
+
+const OPAQUE_CAPSULE_ORIGIN = "null";
+const OPAQUE_FRAME_TARGET = "*";
 
 await ensureHomeGuiDom();
 
@@ -82,6 +85,7 @@ export const homeGuiWindowHooks = Object.freeze({
 });
 
 const homeGuiHostActions = {
+  launchTarget: null,
   requestHomeUnlock: null,
   requestSummaryRefresh: null,
 };
@@ -94,6 +98,7 @@ configureWindowHooks({
   renderDesktop,
   renderTaskbar,
   updateTaskbarState,
+  launchTarget: (...args) => homeGuiHostActions.launchTarget?.(...args),
 });
 
 function homeGuiHostNodes() {
@@ -190,10 +195,6 @@ export function closeHomeGuiWindowsForTarget(targetId) {
   }
 }
 
-export function openHomeGuiTarget(target, options = {}) {
-  openTarget(target, options);
-}
-
 export function homeGuiHasWindows() {
   return shellState.windows.size > 0;
 }
@@ -220,7 +221,7 @@ export function deliverMessageToHomeGuiTargetFrame(target, payload, options = nu
   if (!frame?.contentWindow) {
     return false;
   }
-  frame.contentWindow.postMessage(payload, window.location.origin);
+  frame.contentWindow.postMessage(payload, OPAQUE_FRAME_TARGET);
   if (options?.focus === true) {
     focusWindow(entry.id);
   }
@@ -258,15 +259,15 @@ export function broadcastHomeGuiRuntimeEvents(events) {
   for (const entry of shellState.windows.values()) {
     const frame = entry?.node?.querySelector(".window-frame");
     try {
-      frame?.contentWindow?.postMessage(message, window.location.origin);
+      frame?.contentWindow?.postMessage(message, OPAQUE_FRAME_TARGET);
     } catch (error) {
       console.warn("could not deliver runtime event to app frame", error);
     }
   }
 }
 
-export function homeGuiMessageContextForSource(source, homeToken) {
-  if (!source || !homeToken) {
+export function homeGuiMessageContextForSource(source, origin, homeToken) {
+  if (!source || !origin || !homeToken) {
     return null;
   }
   for (const entry of shellState.windows.values()) {
@@ -279,6 +280,9 @@ export function homeGuiMessageContextForSource(source, homeToken) {
     }
     if (frameWindow !== source) {
       continue;
+    }
+    if (origin !== OPAQUE_CAPSULE_ORIGIN) {
+      return null;
     }
     const expectedToken = homeLaunchTokenFromRoute(
       frame?.dataset?.route || frame?.getAttribute("src") || "",
@@ -298,10 +302,51 @@ export function homeGuiMessageContextForSource(source, homeToken) {
 
 function homeLaunchTokenFromRoute(route) {
   try {
-    return new URL(route, window.location.href).searchParams.get("home_token") || "";
+    const url = new URL(route, window.location.href);
+    return new URLSearchParams(url.hash.replace(/^#/, "")).get("home_token") || "";
   } catch (_error) {
     return "";
   }
+}
+
+function homeGuiWindowEntryForToken(homeToken) {
+  if (!homeToken) {
+    return null;
+  }
+  for (const entry of shellState.windows.values()) {
+    const frame = entry?.node?.querySelector(".window-frame");
+    const token = homeLaunchTokenFromRoute(
+      frame?.dataset?.route || frame?.getAttribute("src") || "",
+    );
+    if (token === homeToken) {
+      return entry;
+    }
+  }
+  return null;
+}
+
+export function closeHomeGuiWindowForToken(homeToken) {
+  const entry = homeGuiWindowEntryForToken(homeToken);
+  if (!entry) {
+    return false;
+  }
+  closeWindow(entry.id);
+  return true;
+}
+
+export function openHomeGuiTarget(target, options = {}) {
+  return openTarget(target, options);
+}
+
+export function relaunchHomeGuiWindowForToken(homeToken) {
+  const entry = homeGuiWindowEntryForToken(homeToken);
+  if (!entry) {
+    return false;
+  }
+  const { id, targetId, launchQuery } = entry;
+  closeWindow(id);
+  window.setTimeout(() => openTarget(targetId, { query: launchQuery || {} }), 0);
+  return true;
 }
 
 export function hideHomeGuiLauncher() {
@@ -500,6 +545,9 @@ export function bindHomeGuiInteractions(options = {}) {
     : () => Promise.resolve();
   homeGuiHostActions.requestHomeUnlock = typeof options.requestHomeUnlock === "function"
     ? options.requestHomeUnlock
+    : null;
+  homeGuiHostActions.launchTarget = typeof options.launchTarget === "function"
+    ? options.launchTarget
     : null;
   homeGuiHostActions.requestSummaryRefresh = typeof options.requestSummaryRefresh === "function"
     ? options.requestSummaryRefresh

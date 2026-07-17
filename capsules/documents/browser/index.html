@@ -1136,7 +1136,7 @@ a {
 
 <script>
 const state = {
-  homeToken: new URLSearchParams(window.location.search).get("home_token") || "",
+  homeToken: new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "",
   initialDocDid: new URLSearchParams(window.location.search).get("doc") || "",
   initialCid: new URLSearchParams(window.location.search).get("cid") || "",
   initialLibraryObjectUri:
@@ -1156,6 +1156,10 @@ const state = {
   pendingConfirmation: null,
   pendingChatAttachmentId: "",
 };
+const homeOrigin = new URLSearchParams(window.location.search).get("home_origin") || "";
+if (state.homeToken && homeOrigin && window.top !== window) {
+  window.top.postMessage({ type: "home:app-ready", homeToken: state.homeToken }, homeOrigin);
+}
 
 const elements = {
   documentsShell: document.getElementById("documents-shell"),
@@ -1915,7 +1919,8 @@ async function openChatAttachment(payload) {
 }
 
 function sendChatAttachmentOpenResult({ attachmentId, ok, message }) {
-  if (!state.homeToken || window.parent === window) {
+  const homeOrigin = new URLSearchParams(window.location.search).get("home_origin") || "";
+  if (!state.homeToken || !homeOrigin || window.top === window) {
     return;
   }
   const payload = {
@@ -1924,12 +1929,12 @@ function sendChatAttachmentOpenResult({ attachmentId, ok, message }) {
     ok: ok === true,
     message: String(message || ""),
   };
-  window.parent.postMessage({
+  window.top.postMessage({
     type: "home:deliver-to-target",
     target: "chat-room",
     homeToken: state.homeToken,
     payload,
-  }, window.location.origin);
+  }, homeOrigin);
 }
 
 async function selectDocument(docDid, options) {
@@ -2229,7 +2234,8 @@ function wireShellEvents() {
     }
   });
   window.addEventListener("message", (event) => {
-    if (event.origin !== window.location.origin) {
+    const homeParentOrigin = new URLSearchParams(window.location.search).get("home_origin") || "";
+    if (event.origin !== homeParentOrigin || event.source !== window.top) {
       return;
     }
     const data = event.data;

@@ -81,17 +81,18 @@ pub(super) use gateway_home_runtime::{viewer_object_shell_description, viewer_ob
 use gateway_home_system::*;
 use gateway_home_terminal::*;
 pub(super) use gateway_home_token::{
-    home_launch_auth_data_dir, home_launch_token_header, home_session_clear_cookie_header,
-    home_session_cookie_header_for_token, issue_home_launch_token_for_auth_grant,
-    issue_home_launch_token_with_context, require_fresh_passkey_home_token,
-    require_home_launch_token, require_home_launch_token_context,
-    require_home_launch_token_for_any, require_home_launch_token_for_any_app_context,
-    require_home_launch_token_for_any_context, require_home_token, require_home_token_context,
-    HomeLaunchTokenContext,
+    consume_fresh_passkey_home_token, home_launch_auth_data_dir, home_launch_token_header,
+    home_session_clear_cookie_header, home_session_cookie_header_for_token,
+    issue_home_launch_token_for_auth_grant, issue_home_launch_token_with_context,
+    issue_home_launch_token_with_intent, require_home_launch_token,
+    require_home_launch_token_context, require_home_launch_token_for_any,
+    require_home_launch_token_for_any_app_context, require_home_launch_token_for_any_context,
+    require_home_token, require_home_token_context, HomeLaunchTokenContext,
 };
 #[cfg(test)]
-use gateway_home_token::{
-    issue_home_launch_token, local_home_launch_token_context, uuid_like_token,
+pub(crate) use gateway_home_token::{
+    issue_home_launch_token, local_home_launch_token_context, set_test_home_launch_auth_data_dir,
+    uuid_like_token,
 };
 use gateway_inbox::*;
 use gateway_inspect_actions::*;
@@ -318,6 +319,7 @@ pub(crate) const WALLET_LINK_CAPSULE_IDS: &[&str] = &[
 ];
 pub(crate) const HOME_CAPSULE_ID: &str = "home";
 pub(crate) const HOME_GUI_SHELL_ID: &str = "home-gui";
+pub(crate) const HOME_CLI_SHELL_ID: &str = "home-cli";
 const HOME_ROUTE: &str = "/apps/home/";
 pub(crate) const WALLETCONNECT_CONFIG_SCHEMA: &str = "elastos.walletconnect.connector/v1";
 pub(crate) const WALLETCONNECT_CONFIG_PATH: &str =
@@ -384,6 +386,10 @@ pub struct GatewayState {
 #[derive(Clone)]
 struct TrustedGatewayApiUrl(Arc<str>);
 
+pub(crate) fn is_trusted_home_shell_id(name: &str) -> bool {
+    matches!(name, HOME_GUI_SHELL_ID | HOME_CLI_SHELL_ID)
+}
+
 impl GatewayState {
     pub(crate) fn identity_manager(
         &self,
@@ -407,6 +413,59 @@ impl GatewayState {
 
 pub fn gateway_router(state: GatewayState) -> Router {
     gateway_router_with_api_url(state, "http://localhost".to_string())
+}
+
+async fn capsule_origin_cors(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let origin = request.headers().get(axum::http::header::ORIGIN).cloned();
+    let allowed = origin
+        .as_ref()
+        .is_some_and(super::browser_capsules::is_allowed_capsule_origin);
+    let is_preflight = request.method() == axum::http::Method::OPTIONS
+        && request
+            .headers()
+            .contains_key(axum::http::header::ACCESS_CONTROL_REQUEST_METHOD);
+
+    if allowed && is_preflight {
+        let requested_headers = request
+            .headers()
+            .get(axum::http::header::ACCESS_CONTROL_REQUEST_HEADERS)
+            .cloned();
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        apply_capsule_cors_headers(response.headers_mut(), origin.as_ref().unwrap());
+        response.headers_mut().insert(
+            axum::http::header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
+        );
+        if let Some(requested_headers) = requested_headers {
+            response.headers_mut().insert(
+                axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
+                requested_headers,
+            );
+        }
+        return response;
+    }
+
+    let mut response = next.run(request).await;
+    if allowed {
+        apply_capsule_cors_headers(response.headers_mut(), origin.as_ref().unwrap());
+    }
+    response
+}
+
+fn apply_capsule_cors_headers(headers: &mut HeaderMap, origin: &HeaderValue) {
+    headers.insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        origin.clone(),
+    );
+    headers.append(
+        axum::http::header::VARY,
+        HeaderValue::from_static(
+            "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+        ),
+    );
 }
 
 fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> Router {
@@ -449,18 +508,6 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route(
             "/api/auth/recovery/status",
             get(super::auth_gateway::recovery_status),
-        )
-        .route(
-            "/api/auth/recovery/create",
-            post(super::auth_gateway::recovery_kit_create),
-        )
-        .route(
-            "/api/auth/recovery/export",
-            post(super::auth_gateway::recovery_kit_export),
-        )
-        .route(
-            "/api/auth/recovery/import",
-            post(super::auth_gateway::recovery_kit_import),
         )
         .route(
             "/api/auth/recovery/full-export",
@@ -941,6 +988,7 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route("/*path", get(serve_public_site_path))
         .with_state(state)
         .layer(Extension(TrustedGatewayApiUrl(Arc::from(gateway_api_url))))
+        .layer(axum::middleware::from_fn(capsule_origin_cors))
 }
 
 // ---------------------------------------------------------------------------

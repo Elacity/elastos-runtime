@@ -34,9 +34,15 @@ pub(in crate::api::gateway) async fn wallet_app_account_delete(
         Ok(context) => context,
         Err(err) => return system_error_response(err),
     };
-    if let Err(err) =
-        require_fresh_passkey_home_token(&state.data_dir, &input.home_token, &context, 180)
-    {
+    if let Err(err) = consume_fresh_passkey_home_token(
+        &state.data_dir,
+        &input.home_token,
+        &context,
+        WALLET_CAPSULE_ID,
+        180,
+        "wallet.account.delete",
+        &serde_json::json!({ "account_id": account_id }),
+    ) {
         return system_error_response(err);
     }
     match crate::api::auth_gateway::wallet_provider_data(
@@ -121,9 +127,15 @@ pub(in crate::api::gateway) async fn wallet_app_account_recovery_key(
         Ok(context) => context,
         Err(err) => return system_error_response(err),
     };
-    if let Err(err) =
-        require_fresh_passkey_home_token(&state.data_dir, &input.home_token, &context, 180)
-    {
+    if let Err(err) = consume_fresh_passkey_home_token(
+        &state.data_dir,
+        &input.home_token,
+        &context,
+        WALLET_CAPSULE_ID,
+        180,
+        "wallet.recovery-key.export",
+        &serde_json::json!({ "account_id": account_id }),
+    ) {
         return system_error_response(err);
     }
     match crate::api::auth_gateway::wallet_provider_data(
@@ -164,9 +176,18 @@ pub(in crate::api::gateway) async fn wallet_app_account_import_recovery_key(
         Ok(context) => context,
         Err(err) => return system_error_response(err),
     };
-    if let Err(err) =
-        require_fresh_passkey_home_token(&state.data_dir, &input.home_token, &context, 180)
-    {
+    if let Err(err) = consume_fresh_passkey_home_token(
+        &state.data_dir,
+        &input.home_token,
+        &context,
+        WALLET_CAPSULE_ID,
+        180,
+        "wallet.recovery-key.import",
+        &serde_json::json!({
+            "recovery_key": input.recovery_key,
+            "label": input.label,
+        }),
+    ) {
         return system_error_response(err);
     }
     match crate::api::auth_gateway::wallet_provider_data(

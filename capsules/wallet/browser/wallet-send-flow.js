@@ -234,15 +234,18 @@ export function createWalletSendFlow({
     setBusy(button, true);
     showStatus("Confirm with your passkey to sign.", "muted");
     try {
-      const homeToken = await requestFreshPasskeyHomeToken();
+      const intent = {
+        account_id: account.account_id,
+        chain_namespace: account.chain_namespace,
+        to,
+        amount,
+      };
+      const homeToken = await requestFreshPasskeyHomeToken("wallet.send", intent);
       const payload = await fetchJson("/api/apps/wallet/wallet/send", {
         method: "POST",
-        headers: shellHeaders({ "content-type": "application/json" }),
+        headers: shellHeaders({ "content-type": "application/json" }, homeToken),
         body: JSON.stringify({
-          account_id: account.account_id,
-          chain_namespace: account.chain_namespace,
-          to,
-          amount,
+          ...intent,
           home_token: homeToken,
         }),
       });

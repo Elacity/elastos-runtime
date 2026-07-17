@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260713a";
+const moduleVersion = "home-20260715a";
 const requests = [];
 const windowListeners = new Map();
 const localStorageValues = new Map();
@@ -280,11 +280,26 @@ globalThis.fetch = async (url, init = {}) => {
     return jsonResponse(summary);
   }
   if (url === "/api/apps/home/launch") {
+    if (body?.target === "home-gui") {
+      assert(body?.query?.shell_mode === "root", "setup did not launch Home GUI in root mode", body);
+      return jsonResponse({
+        attach_kind: "iframe",
+        route: "/apps/home-gui/?shell_mode=root&home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=gui-token",
+        target: "home-gui",
+      });
+    }
+    if (body?.target === "system") {
+      return jsonResponse({
+        attach_kind: "iframe",
+        route: "/apps/system/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=system-token",
+        target: "system",
+      });
+    }
     assert(body?.target === "home-cli", "system switch should launch Home CLI as the root shell", body);
     assert(body?.query?.shell_mode === "root", "system switch did not launch shell root mode", body);
     return jsonResponse({
       attach_kind: "iframe",
-      route: "/apps/home-cli/?shell_mode=root&home_token=root-token",
+      route: "/apps/home-cli/?shell_mode=root&home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=root-token",
       target: "home-cli",
     });
   }
@@ -293,42 +308,54 @@ globalThis.fetch = async (url, init = {}) => {
 
 const hostCore = await import(`../capsules/home/browser/shell-core.js?v=${moduleVersion}`);
 await import(`../capsules/home/browser/home-shell-host.js?v=${moduleVersion}`);
-for (let attempt = 0; attempt < 20 && document.body.dataset.homeGui !== "mounted"; attempt += 1) {
+for (let attempt = 0; attempt < 20 && !elementForSelector("#active-shell-frame").dataset.route; attempt += 1) {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
-const homeGuiCore = await import(`../capsules/home-gui/browser/shell-core.js?v=${moduleVersion}`);
 
 const activeShellRoot = elementForSelector("#active-shell-root");
 const activeShellFrame = elementForSelector("#active-shell-frame");
 assert(document.body.dataset.homeShell === "desktop", "setup did not mount Home GUI", document.body.dataset);
-assert(activeShellFrame.dataset.route === "", "setup launched a root shell before System switched", activeShellFrame.dataset);
+assert(activeShellFrame.dataset.route.includes("/apps/home-gui/"), "setup did not launch isolated Home GUI", activeShellFrame.dataset);
+
+const guiMessages = [];
+const guiFrameWindow = {
+  postMessage(payload, origin) {
+    guiMessages.push({ payload, origin });
+  },
+};
+activeShellFrame.contentWindow = guiFrameWindow;
+for (const listener of windowListeners.get("message") || []) {
+  listener({
+    origin: "null",
+    source: guiFrameWindow,
+    data: {
+      type: "home:launch-target",
+      requestId: "launch-system",
+      target: "system",
+      query: {},
+      homeToken: "gui-token",
+    },
+  });
+}
+for (let attempt = 0; attempt < 20 && !guiMessages.some((message) => message.payload?.requestId === "launch-system"); attempt += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
 
 const staleLaunchSeq = hostCore.shellState.activeShellRootLaunchSeq;
-const systemWindow = new FakeElement("system-window");
-systemWindow.dataset.target = "system";
-systemWindow.dataset.windowId = "system--1";
-const systemFrame = new FakeElement("system-frame");
-systemFrame.contentWindow = {};
-systemFrame.dataset.route = "/apps/system/?home_token=system-token";
-systemFrame.closestNode = systemWindow;
-systemWindow.querySelector = (selector) => selector === ".window-frame"
-  ? systemFrame
-  : new FakeElement(`system-window ${selector}`);
-homeGuiCore.shellState.windows.set("system--1", {
-  id: "system--1",
-  kind: "system",
-  node: systemWindow,
-  serial: 1,
-  targetId: "system",
-  title: "System",
-});
-homeGuiCore.shellState.activeWindowId = "system--1";
+const systemFrameWindow = {};
+for (const listener of windowListeners.get("message") || []) {
+  listener({
+    origin: "null",
+    source: systemFrameWindow,
+    data: { type: "home:app-ready", homeToken: "system-token" },
+  });
+}
 summary.active_shell.active = "home-cli";
 
 for (const listener of windowListeners.get("message") || []) {
   listener({
-    origin: "http://localhost:61180",
-    source: systemFrame.contentWindow,
+    origin: "null",
+    source: systemFrameWindow,
     data: {
       type: "home:active-shell-applied",
       activeShell: "home-cli",
@@ -345,7 +372,6 @@ assert(activeShellFrame.hidden === true, "System shell switch did not blank the 
 assert(!activeShellFrame.dataset.route, "System shell switch left the stale shell route visible", activeShellFrame.dataset);
 assert(!activeShellFrame.getAttribute("src"), "System shell switch left the stale iframe src visible");
 assert(elementForSelector("#home-shell-boot-mask").hidden === false, "System shell switch did not show the neutral boot mask");
-assert(systemWindow.removed === true, "System shell switch did not remove stale GUI windows");
 assert(
   hostCore.shellState.activeShellRootLaunchSeq > staleLaunchSeq,
   "System shell switch did not cancel stale root-shell launches",

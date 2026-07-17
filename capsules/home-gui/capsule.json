@@ -28,7 +28,7 @@
         },
         {
           "id": "capsule.open",
-          "description": "Open an app window",
+          "description": "Open an available app",
           "risk": "launch",
           "approval": "runtime_policy",
           "audit": "event",

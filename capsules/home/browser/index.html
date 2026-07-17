@@ -10,54 +10,23 @@
     <meta name="apple-mobile-web-app-title" content="ElastOS Home" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <title>Home · ElastOS</title>
-    <script>
-      (() => {
-        try {
-          const hintKey = "elastos.home.active-shell-hint";
-          const hintedShell = window.localStorage.getItem(hintKey);
-          if (hintedShell !== "home-cli") {
-            window.localStorage.removeItem(hintKey);
-            return;
-          }
-          document.documentElement.dataset.homeShellHint = "alternate";
-          document.documentElement.dataset.homeShellBoot = "alternate";
-        } catch (_error) {}
-      })();
-    </script>
-    <link rel="manifest" href="./manifest.webmanifest?v=home-20260713a" />
+    <script src="./home-boot-hint.js?v=home-20260715a"></script>
+    <link rel="manifest" href="./manifest.webmanifest?v=home-20260715a" />
     <link rel="icon" href="./elastos-home-icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./elastos-home-icon-192.png" />
-    <link rel="stylesheet" href="./style.css?v=home-20260713a" />
+    <link rel="stylesheet" href="./style.css?v=home-20260715a" />
   </head>
   <body data-home-status="booting" data-home-shell="resolving" data-home-gui="resolving">
-    <script>
-      (() => {
-        try {
-          const hintKey = "elastos.home.active-shell-hint";
-          const hintedShell = window.localStorage.getItem(hintKey);
-          if (hintedShell !== "home-cli") {
-            window.localStorage.removeItem(hintKey);
-            return;
-          }
-          const hasAlternateHint = document.documentElement.dataset.homeShellHint === "alternate";
-          if (hasAlternateHint) {
-            document.documentElement.dataset.homeShellHint = "alternate";
-            document.body.dataset.homeShell = "alternate";
-            document.body.dataset.homeGui = "dormant";
-          }
-        } catch (_error) {}
-      })();
-    </script>
     <div class="home-host-shell">
       <div id="home-shell-boot-mask" class="home-shell-boot-mask" aria-hidden="true"></div>
 
       <section id="active-shell-root" class="active-shell-root" aria-live="polite" hidden>
-        <!-- Presentation mount only. Same-origin is local API compatibility, not a capsule isolation boundary. -->
+        <!-- Opaque sandboxing isolates the shell without DNS or ambient Home authority. -->
         <iframe
           id="active-shell-frame"
           class="active-shell-frame"
           title="Active Home shell"
-          sandbox="allow-downloads allow-forms allow-modals allow-pointer-lock allow-same-origin allow-scripts"
+          sandbox="allow-downloads allow-forms allow-modals allow-pointer-lock allow-scripts"
           allow="autoplay; fullscreen"
         ></iframe>
         <section
@@ -115,6 +84,6 @@
       </section>
     </div>
 
-    <script type="module" src="./home-shell-host.js?v=home-20260713a"></script>
+    <script type="module" src="./home-shell-host.js?v=home-20260715a"></script>
   </body>
 </html>

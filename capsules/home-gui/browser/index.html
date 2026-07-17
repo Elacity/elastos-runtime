@@ -3,12 +3,12 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta http-equiv="refresh" content="0; url=/apps/home/" />
-    <title>Home GUI · ElastOS</title>
+    <meta name="theme-color" content="#050608" />
+    <title>Desktop · ElastOS</title>
+    <link rel="stylesheet" href="./style.css?v=home-20260715a" />
   </head>
-  <body>
-    <script>
-      window.location.replace("/apps/home/");
-    </script>
+  <body data-home-status="booting" data-home-shell="desktop" data-home-gui="mounted">
+    <div class="home-gui-shell"></div>
+    <script type="module" src="./home-gui-shell.js?v=home-20260715a"></script>
   </body>
 </html>

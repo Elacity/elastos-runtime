@@ -37,6 +37,7 @@ run cargo test --manifest-path capsules/chain-provider/Cargo.toml node_lifecycle
 run cargo test --manifest-path elastos/Cargo.toml -p elastos-server gateway_blocks_chain_proof_prepare_and_broadcast_routes -- --nocapture
 run bash -n scripts/vendor-walletconnect-adapter.sh
 run scripts/walletconnect-connector-config-smoke.sh
+run node scripts/home-fresh-passkey-authority-smoke.mjs
 run node scripts/home-entropy-check.mjs
 run scripts/check-wci-alignment.sh
 run scripts/recovery-kit-live-smoke.sh

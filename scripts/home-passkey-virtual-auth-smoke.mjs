@@ -280,6 +280,7 @@ function parseOptionalSafeRuntimeId(raw, name) {
 function redactSensitiveString(value) {
   return String(value)
     .replace(/([?&]home_token=)[^&#\s"]+/gi, "$1[redacted]")
+    .replace(/(#home_token=)[^&#\s"]+/gi, "$1[redacted]")
     .replace(/("home_token"\s*:\s*")[^"]+(")/gi, "$1[redacted]$2")
     .replace(/\bperson:local:[a-z0-9]+\b/gi, "person:local:[redacted]")
     .replace(/\bproof:passkey:[^\s"',}]+\b/gi, "proof:passkey:[redacted]")
@@ -582,6 +583,49 @@ async function waitForHomeReady(page, timeoutMs = 30_000) {
   );
 }
 
+function launchTokenFromRoute(route) {
+  const url = new URL(route, HOME_URL);
+  return new URLSearchParams(url.hash.replace(/^#/, "")).get("home_token") || "";
+}
+
+function capsuleFrameForTarget(page, target) {
+  return page.frames().find((frame) => {
+    try {
+      const url = new URL(frame.url());
+      return url.hostname.split(".")[0] === target && url.pathname.startsWith(`/apps/${target}/`);
+    } catch {
+      return false;
+    }
+  }) || null;
+}
+
+async function waitForCapsuleFrame(page, target, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const frame = capsuleFrameForTarget(page, target);
+    if (frame) {
+      return frame;
+    }
+    await delay(100);
+  }
+  throw Object.assign(new Error(`Timed out waiting for isolated ${target} frame`), {
+    details: { target, frames: page.frames().map((frame) => frame.url()) },
+  });
+}
+
+function assertIsolatedLaunchRoute(route, target) {
+  const url = new URL(route, HOME_URL);
+  const token = launchTokenFromRoute(route);
+  assert(token, `${target} launch route did not contain a fragment-scoped token`, { route });
+  assert(!url.searchParams.has("home_token"), `${target} launch token leaked into the query`, { route });
+  assert(
+    url.origin !== new URL(HOME_URL).origin,
+    `${target} launch route reused the trusted Home origin`,
+    { route },
+  );
+  return token;
+}
+
 async function homeState(page) {
   return page.evaluate(() => ({
     status: document.body?.dataset?.homeStatus || "",
@@ -595,11 +639,11 @@ async function homeState(page) {
     unlockSecondaryHidden: document.querySelector("#home-unlock-secondary")?.hidden ?? true,
     unlockNameVisible: !(document.querySelector("#home-unlock-name")?.hidden ?? true),
     unlockStatus: document.querySelector("#home-unlock-status")?.textContent?.trim() || "",
-    toolbarHidden: document.querySelector(".toolbar")?.hidden === true,
-    workspaceHidden: document.querySelector(".desktop-workspace")?.hidden === true,
-    taskbarHidden: document.querySelector(".taskbar")?.hidden === true,
-    systemShortcutPresent: !!document.querySelector('#desktop-shortcuts .desktop-shortcut[data-target="system"]'),
-    browserShortcutPresent: !!document.querySelector('#desktop-shortcuts .desktop-shortcut[data-target="browser"]'),
+    activeShellRootHidden: document.querySelector("#active-shell-root")?.hidden !== false,
+    activeShellFrameSrc: document.querySelector("#active-shell-frame")?.getAttribute("src") || "",
+    hostGuiDomPresent: Boolean(document.querySelector(
+      "#desktop, .desktop-backdrop, .toolbar, .desktop-workspace, .taskbar, #launcher, #window-template",
+    )),
   }));
 }
 
@@ -607,7 +651,8 @@ async function waitForSignedHome(page, timeoutMs = 30_000) {
   await page.waitForFunction(
     () => document.body?.dataset?.homeStatus === "ready"
       && document.body?.dataset?.homeAuthority === "signed"
-      && !!document.querySelector('#desktop-shortcuts .desktop-shortcut[data-target="system"]'),
+      && document.querySelector("#active-shell-root")?.hidden === false
+      && Boolean(document.querySelector("#active-shell-frame")?.getAttribute("src")),
     null,
     { timeout: timeoutMs },
   );
@@ -1951,30 +1996,16 @@ async function checkBrowserEmbeddedUiInput(page) {
   page.on("response", captureWebrtcResponse);
   await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
   await waitForSignedHome(page);
-  await page.evaluate(({ url, displayMode, remoteExitId, collectAudioStats }) => {
-    const query = {
-      url,
-      display: displayMode,
-      remote_exit_id: remoteExitId,
-    };
-    if (collectAudioStats) {
-      query.metrics = "1";
-    }
-    window.postMessage({
-      type: "home:open-target",
-      target: "browser",
-      query,
-    }, window.location.origin);
-  }, {
-    url: BROWSER_OPEN_URLS[0] || "https://example.com/",
-    displayMode: BROWSER_OPEN_DISPLAY_MODE,
-    remoteExitId: BROWSER_REMOTE_EXIT_ID,
-    collectAudioStats: CHECK_BROWSER_AUDIO_STATS,
-  });
+  const homeGuiFrame = await waitForCapsuleFrame(page, "home-gui");
+  const browserShortcut = homeGuiFrame.locator(
+    '#desktop-shortcuts .desktop-shortcut[data-target="browser"]',
+  );
+  await browserShortcut.waitFor({ state: "visible", timeout: 30_000 });
+  await browserShortcut.dblclick();
 
-  const windowLocator = page.locator('.window[data-target="browser"]:not(.hidden)').first();
+  const windowLocator = homeGuiFrame.locator('.window[data-target="browser"]:not(.hidden)').first();
   await windowLocator.waitFor({ state: "visible", timeout: 30_000 });
-  await page.waitForFunction(() => {
+  await homeGuiFrame.waitForFunction(() => {
     const node = [...document.querySelectorAll('.window[data-target="browser"]')]
       .find((candidate) => !candidate.classList.contains("hidden"));
     return node?.classList.contains("window-active") &&
@@ -1983,8 +2014,7 @@ async function checkBrowserEmbeddedUiInput(page) {
   const frameHandle = await windowLocator.locator("iframe.window-frame").elementHandle();
   assert(frameHandle, "Home Browser window did not contain an iframe");
   const route = await frameHandle.getAttribute("src") || "";
-  const browserToken = new URL(route, HOME_URL).searchParams.get("home_token") || "";
-  assert(browserToken, "Embedded Browser iframe did not include a Browser app token", { route });
+  const browserToken = assertIsolatedLaunchRoute(route, "browser");
   const appFrame = await frameHandle.contentFrame();
   assert(appFrame, "Embedded Browser iframe did not expose a content frame");
 
@@ -2551,10 +2581,10 @@ async function signBackIn(page) {
   assert(
     state.shell === "resolving" &&
       state.gui === "dormant" &&
-      state.toolbarHidden &&
-      state.workspaceHidden &&
-      state.taskbarHidden,
-    "Home GUI shell leaked behind the passkey prompt",
+      state.activeShellRootHidden &&
+      !state.activeShellFrameSrc &&
+      !state.hostGuiDomPresent,
+    "A Home shell remained mounted behind the passkey prompt",
     state,
   );
   const clickTokenPromise = captureNextPasskeyToken(page).catch(() => null);
@@ -2568,7 +2598,8 @@ async function signBackIn(page) {
 
 async function checkHomePublicCopy(page) {
   await waitForSignedHome(page);
-  const state = await page.evaluate(() => {
+  const homeGuiFrame = await waitForCapsuleFrame(page, "home-gui");
+  const state = await homeGuiFrame.evaluate(() => {
     const visible = (node) => {
       const style = window.getComputedStyle(node);
       return style.display !== "none"
@@ -2619,7 +2650,7 @@ async function launchSystem(page, homeToken) {
     }
     return body.route || "";
   }, homeToken);
-  assert(route.includes("home_token="), "System launch did not mint an app-scoped token", { route });
+  assertIsolatedLaunchRoute(route, "system");
   await page.goto(new URL(route, HOME_URL).toString(), { waitUntil: "domcontentloaded" });
   await page.locator(".settings-container").waitFor({ state: "visible", timeout: 20_000 });
   const system = await page.evaluate(() => ({
@@ -2651,327 +2682,302 @@ async function launchSystem(page, homeToken) {
 async function checkShellSwitchJourney(page, homeToken) {
   assert(homeToken, "checkShellSwitchJourney requires a passkey-issued Home token");
   let switchedToCli = false;
+  const shellConsole = [];
+  const shellPageErrors = [];
+  const shellRequestFailures = [];
+  const shellResponses = [];
+  const captureConsole = (message) => {
+    shellConsole.push({ type: message.type(), text: redactSensitiveString(message.text()) });
+    if (shellConsole.length > 50) {
+      shellConsole.shift();
+    }
+  };
+  const capturePageError = (error) => {
+    shellPageErrors.push(redactSensitiveString(error?.stack || error?.message || String(error)));
+  };
+  const captureRequestFailure = (request) => {
+    shellRequestFailures.push({
+      error: request.failure()?.errorText || "request failed",
+      method: request.method(),
+      url: redactSensitiveString(request.url()),
+    });
+  };
+  const captureResponse = (response) => {
+    const url = response.url();
+    if (
+      url.includes("/api/apps/home/active-shell") ||
+      url.includes("/api/apps/home-cli/terminal/")
+    ) {
+      shellResponses.push({
+        method: response.request().method(),
+        status: response.status(),
+        url: redactSensitiveString(url),
+      });
+    }
+  };
+  page.on("console", captureConsole);
+  page.on("pageerror", capturePageError);
+  page.on("requestfailed", captureRequestFailure);
+  page.on("response", captureResponse);
   try {
-  markStage("shell-switch:launch-system");
-  if (!page.url().includes("/apps/system/")) {
-    await launchSystem(page, homeToken);
-  }
-  markStage("shell-switch:open-system-shell");
-  const shellTab = page.locator('button.settings-sidebar-item[data-settings="shell"]');
-  await shellTab.click();
-  await page.locator("#active-shell-options").waitFor({ state: "visible", timeout: 15_000 });
-  await page.waitForFunction(() => {
-    const names = Array.from(document.querySelectorAll("#active-shell-options [data-shell-name]"))
-      .map((button) => button.dataset.shellName);
-    return names.includes("home-gui") && names.includes("home-cli");
-  }, null, { timeout: 15_000 });
-  const shellOptions = await page.evaluate(() => {
-    return Array.from(document.querySelectorAll("#active-shell-options [data-shell-name]"))
-      .map((button) => ({
-      value: button.dataset.shellName,
-      label: button.textContent?.trim() || "",
+    markStage("shell-switch:launch-system");
+    if (!page.url().includes("/apps/system/")) {
+      await launchSystem(page, homeToken);
+    }
+
+    markStage("shell-switch:open-system-shell");
+    await page.locator('button.settings-sidebar-item[data-settings="shell"]').click();
+    await page.locator("#active-shell-options").waitFor({ state: "visible", timeout: 15_000 });
+    await page.waitForFunction(() => {
+      const names = [...document.querySelectorAll("#active-shell-options [data-shell-name]")]
+        .map((button) => button.dataset.shellName);
+      return names.includes("home-gui") && names.includes("home-cli");
+    }, null, { timeout: 15_000 });
+    const shellOptions = await page.evaluate(() => (
+      [...document.querySelectorAll("#active-shell-options [data-shell-name]")].map((button) => ({
+        value: button.dataset.shellName,
+        label: button.textContent?.trim() || "",
+      }))
+    ));
+
+    const switchToCli = page.waitForResponse((response) => (
+      response.request().method() === "POST" &&
+      response.url().endsWith("/api/apps/home/active-shell")
+    ), { timeout: 15_000 });
+    markStage("shell-switch:system-post-home-cli");
+    await page.locator('#active-shell-options [data-shell-name="home-cli"]').click();
+    const switchResponse = await switchToCli;
+    assert(switchResponse.ok(), "System shell picker failed to switch to Home CLI", {
+      status: switchResponse.status(),
+      body: await switchResponse.text().catch(() => ""),
+    });
+    switchedToCli = true;
+
+    markStage("shell-switch:load-home-cli");
+    await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
+    await waitForSignedHome(page);
+    const cliFrame = await waitForCapsuleFrame(page, "home-cli");
+    await cliFrame.waitForFunction(() => (
+      document.body?.dataset?.runtimeTerminal === "attached" &&
+      document.querySelector("#xterm-terminal")?.hidden === false
+    ), null, { timeout: 20_000 });
+    const cliRoot = await page.evaluate(() => {
+      const root = document.querySelector("#active-shell-root");
+      const rect = root?.getBoundingClientRect();
+      return {
+        body: { ...document.body.dataset },
+        root: rect ? { top: rect.top, left: rect.left, width: rect.width, height: rect.height } : null,
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+        frame_src: document.querySelector("#active-shell-frame")?.getAttribute("src") || "",
+        root_hidden: root?.hidden !== false,
+        host_gui_dom_present: Boolean(document.querySelector(
+          "#desktop, .desktop-backdrop, .toolbar, .desktop-workspace, .taskbar, #launcher, #window-template",
+        )),
+        unlock_visible: document.querySelector("#home-unlock")?.hidden === false,
+      };
+    });
+    const cliState = await cliFrame.evaluate(() => ({
+      origin: window.location.origin,
+      runtime_terminal: document.body?.dataset?.runtimeTerminal || "",
+      terminal_visible: document.querySelector("#xterm-terminal")?.hidden === false,
     }));
-  });
-  const switchToCli = page.waitForResponse((response) => (
-    response.request().method() === "POST" &&
-    response.url().endsWith("/api/apps/home/active-shell")
-  ), { timeout: 15_000 });
-  markStage("shell-switch:system-post-home-cli");
-  await page.locator('#active-shell-options [data-shell-name="home-cli"]').click();
-  const switchResponse = await switchToCli;
-  assert(switchResponse.ok(), "System shell picker failed to switch to home-cli", {
-    status: switchResponse.status(),
-    body: await switchResponse.text().catch(() => ""),
-  });
-  switchedToCli = true;
-  await page.waitForFunction(() => (
-    document.querySelector('#active-shell-options [data-shell-name="home-cli"]')
-      ?.getAttribute("aria-pressed") === "true"
-  ), null, { timeout: 15_000 });
+    assert(cliRoot.root && !cliRoot.root_hidden, "Home CLI root was not visible", cliRoot);
+    assert(
+      Math.abs(cliRoot.root.top) <= 1 &&
+        Math.abs(cliRoot.root.left) <= 1 &&
+        cliRoot.root.width >= cliRoot.viewport.width - 2 &&
+        cliRoot.root.height >= cliRoot.viewport.height - 2,
+      "Home CLI did not fill the root viewport",
+      cliRoot,
+    );
+    assert(!cliRoot.host_gui_dom_present, "trusted Home host contained Home GUI DOM", cliRoot);
+    assert(!cliRoot.unlock_visible, "Home unlock prompt remained visible behind Home CLI", cliRoot);
+    assert(cliRoot.frame_src.includes("/apps/home-cli/"), "Home CLI was not the active root", cliRoot);
+    assert(cliState.origin !== new URL(HOME_URL).origin, "Home CLI reused the trusted Home origin", cliState);
+    assert(cliState.runtime_terminal === "attached" && cliState.terminal_visible, "Home CLI terminal was not ready", cliState);
+    assert(!capsuleFrameForTarget(page, "home-gui"), "Home GUI remained loaded behind Home CLI", {
+      frames: page.frames().map((frame) => frame.url()),
+    });
 
-  markStage("shell-switch:reload-home-cli");
-  await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
-  await page.waitForFunction(() => (
-    document.body?.dataset?.homeStatus === "ready" &&
-    document.body?.dataset?.homeAuthority === "signed" &&
-    document.body?.dataset?.homeShell === "alternate" &&
-    document.body?.dataset?.homeGui === "dormant" &&
-    document.querySelector("#active-shell-frame")?.getAttribute("src")?.includes("/apps/home-cli/")
-  ), null, { timeout: 30_000 });
-  await page.waitForFunction(() => (
-    document.querySelector("#active-shell-frame")
-      ?.contentDocument
-      ?.body
-      ?.dataset
-      ?.runtimeTerminal === "attached" &&
-    document.querySelector("#active-shell-frame")
-      ?.contentDocument
-      ?.querySelector("#xterm-terminal")
-      ?.hidden === false
-  ), null, { timeout: 15_000 });
-  const cliRoot = await page.evaluate(() => {
-    const rectJson = (node) => {
-      if (!node) return null;
-      const rect = node.getBoundingClientRect();
-      return {
-        top: rect.top,
-        left: rect.left,
-        width: rect.width,
-        height: rect.height,
+    markStage("shell-switch:cli-switch-home-gui");
+    await pressHomeCliKey(cliFrame, "q");
+    try {
+      await page.waitForFunction(() => (
+        document.body?.dataset?.homeStatus === "ready" &&
+        document.body?.dataset?.homeAuthority === "signed" &&
+        document.querySelector("#active-shell-root")?.hidden === false &&
+        document.querySelector("#active-shell-frame")?.getAttribute("src")?.includes("/apps/home-gui/")
+      ), null, { timeout: 30_000 });
+    } catch (error) {
+      error.details = {
+        host: await page.evaluate(async () => {
+          const summaryResponse = await fetch("/api/apps/home/summary");
+          return {
+            body: { ...(document.body?.dataset || {}) },
+            frame_src: document.querySelector("#active-shell-frame")?.getAttribute("src") || "",
+            frame_route: document.querySelector("#active-shell-frame")?.dataset?.route || "",
+            root_target: document.querySelector("#active-shell-root")?.dataset?.target || "",
+            summary_status: summaryResponse.status,
+            summary: await summaryResponse.json().then((value) => ({
+              authority: value?.authority || null,
+              active_shell: value?.active_shell || null,
+            })).catch(() => null),
+          };
+        }).catch((detailError) => ({ error: detailError.message || String(detailError) })),
+        cli: await cliFrame.evaluate(() => ({
+          body: { ...(document.body?.dataset || {}) },
+          terminal_text_tail: document.querySelector("#xterm-terminal")?.textContent?.slice(-3000) || "",
+          fallback_text_tail: document.querySelector("#terminal-output")?.textContent?.slice(-3000) || "",
+        })).catch((detailError) => ({ error: detailError.message || String(detailError) })),
+        frames: page.frames().map((frame) => redactSensitiveString(frame.url())),
+        console: [...shellConsole],
+        page_errors: [...shellPageErrors],
+        request_failures: [...shellRequestFailures],
+        responses: [...shellResponses],
       };
+      throw error;
+    }
+    const homeGuiFrame = await waitForCapsuleFrame(page, "home-gui");
+    try {
+      await homeGuiFrame.locator('#desktop-shortcuts .desktop-shortcut[data-target="system"]')
+        .waitFor({ state: "visible", timeout: 30_000 });
+    } catch (error) {
+      error.details = {
+        host: await page.evaluate(() => ({
+          body: { ...(document.body?.dataset || {}) },
+          frame_src: document.querySelector("#active-shell-frame")?.getAttribute("src") || "",
+          frame_route: document.querySelector("#active-shell-frame")?.dataset?.route || "",
+          root_target: document.querySelector("#active-shell-root")?.dataset?.target || "",
+        })).catch((detailError) => ({ error: detailError.message || String(detailError) })),
+        gui: await homeGuiFrame.evaluate(() => ({
+          body: { ...(document.body?.dataset || {}) },
+          document_text: document.body?.innerText?.slice(0, 3000) || "",
+          shortcut_count: document.querySelectorAll("#desktop-shortcuts .desktop-shortcut").length,
+          toolbar_hidden: document.querySelector(".toolbar")?.hidden,
+          taskbar_hidden: document.querySelector(".taskbar")?.hidden,
+        })).catch((detailError) => ({ error: detailError.message || String(detailError) })),
+        frames: page.frames().map((frame) => redactSensitiveString(frame.url())),
+        console: [...shellConsole],
+        page_errors: [...shellPageErrors],
+        request_failures: [...shellRequestFailures],
+        responses: [...shellResponses],
+      };
+      throw error;
+    }
+    const restored = {
+      host: await page.evaluate(() => ({
+        body: { ...document.body.dataset },
+        frame_src: document.querySelector("#active-shell-frame")?.getAttribute("src") || "",
+        host_gui_dom_present: Boolean(document.querySelector(
+          "#desktop, .desktop-backdrop, .toolbar, .desktop-workspace, .taskbar, #launcher, #window-template",
+        )),
+      })),
+      gui: await homeGuiFrame.evaluate(() => ({
+        origin: window.location.origin,
+        toolbar_visible: document.querySelector(".toolbar")?.hidden === false,
+        taskbar_visible: document.querySelector(".taskbar")?.hidden === false,
+        system_shortcut_present: Boolean(
+          document.querySelector('#desktop-shortcuts .desktop-shortcut[data-target="system"]'),
+        ),
+      })),
     };
-	    const toolbar = document.querySelector(".toolbar");
-	    const workspace = document.querySelector(".desktop-workspace");
-	    const taskbar = document.querySelector(".taskbar");
-	    const guiDomPresent = Boolean(document.querySelector(
-	      "#desktop, .desktop-backdrop, .toolbar, .desktop-workspace, .taskbar, #launcher, #window-template",
-	    ));
-	    const dormantNode = (node) => !node || node.hidden === true;
-    const inertOrAbsent = (node) => !node || node.inert === true;
-    const root = document.querySelector("#active-shell-root");
-    const frame = document.querySelector("#active-shell-frame");
-    const cliDocument = frame?.contentDocument || null;
-    return {
+    assert(!restored.host.host_gui_dom_present, "trusted Home host absorbed Home GUI implementation", restored);
+    assert(restored.gui.origin !== new URL(HOME_URL).origin, "Home GUI reused the trusted Home origin", restored);
+    assert(
+      restored.gui.toolbar_visible && restored.gui.taskbar_visible && restored.gui.system_shortcut_present,
+      "Home GUI did not restore as the root shell",
+      restored,
+    );
+    assert(!capsuleFrameForTarget(page, "home-cli"), "Home CLI remained loaded behind Home GUI", {
+      frames: page.frames().map((frame) => frame.url()),
+    });
+
+    markStage("shell-switch:direct-home-cli");
+    const directSwitch = await browserApi(page, homeToken, "/api/apps/home/active-shell", {
+      method: "POST",
+      body: { active: "home-cli" },
+    });
+    assert(directSwitch.ok, "direct Home CLI switch failed", directSwitch);
+    switchedToCli = true;
+    await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
+    await waitForSignedHome(page);
+    const chatCliFrame = await waitForCapsuleFrame(page, "home-cli");
+    await chatCliFrame.waitForFunction(() => (
+      document.body?.dataset?.runtimeTerminal === "attached" &&
+      document.querySelector("#xterm-terminal")?.hidden === false
+    ), null, { timeout: 20_000 });
+
+    markStage("shell-switch:cli-open-chat");
+    await pressHomeCliKey(chatCliFrame, "1");
+    await chatCliFrame.waitForFunction(() => (
+      (document.querySelector("#xterm-terminal")?.textContent || "").includes("Type /home to return Home")
+    ), null, { timeout: 30_000 });
+    const chatHost = await page.evaluate(() => ({
       body: { ...document.body.dataset },
-      root: rectJson(root),
-      viewport: { width: window.innerWidth, height: window.innerHeight },
-	      frame_src: frame?.getAttribute("src") || "",
-	      gui_dom_present: guiDomPresent,
-	      toolbar_present: Boolean(toolbar),
-      toolbar_dormant: dormantNode(toolbar),
-      toolbar_inert_or_absent: inertOrAbsent(toolbar),
-      workspace_present: Boolean(workspace),
-      workspace_dormant: dormantNode(workspace),
-      taskbar_present: Boolean(taskbar),
-      taskbar_dormant: dormantNode(taskbar),
-      unlock_visible: document.querySelector("#home-unlock")?.hidden === false,
-      cli_ready: cliDocument?.body?.dataset?.runtimeTerminal === "attached" &&
-        cliDocument?.querySelector("#xterm-terminal")?.hidden === false,
-    };
-  });
-  assert(cliRoot.root, "Home CLI root did not expose layout geometry", cliRoot);
-  assert(
-    Math.abs(cliRoot.root.top) <= 1 &&
-      Math.abs(cliRoot.root.left) <= 1 &&
-      cliRoot.root.width >= cliRoot.viewport.width - 2 &&
-      cliRoot.root.height >= cliRoot.viewport.height - 2,
-    "Home CLI did not fill the root viewport",
-    cliRoot,
-  );
-	  assert(
-	    cliRoot.toolbar_dormant && cliRoot.toolbar_inert_or_absent,
-	    "Home GUI toolbar leaked behind Home CLI",
-	    cliRoot,
-	  );
-	  assert(!cliRoot.gui_dom_present, "Home CLI instantiated Home GUI DOM", cliRoot);
-	  assert(
-	    cliRoot.workspace_dormant && cliRoot.taskbar_dormant,
-    "Home GUI workspace/taskbar leaked behind Home CLI",
-    cliRoot,
-  );
-  assert(!cliRoot.unlock_visible, "Home unlock prompt remained visible behind signed Home CLI", cliRoot);
-  assert(cliRoot.cli_ready, "Home CLI did not attach a Runtime-owned xterm terminal", cliRoot);
-
-  const cliFrame = page.frames().find((frame) => frame.url().includes("/apps/home-cli/"));
-  assert(cliFrame, "Home CLI iframe was not available to switch back to home-gui", cliRoot);
-  markStage("shell-switch:cli-switch-home-gui");
-  await pressHomeCliKey(cliFrame, "q");
-  try {
-    await page.waitForFunction(() => (
-      document.body?.dataset?.homeStatus === "ready" &&
-      document.body?.dataset?.homeAuthority === "signed" &&
-      document.body?.dataset?.homeShell === "desktop" &&
-      document.body?.dataset?.homeGui === "mounted" &&
-      document.querySelector("#active-shell-root")?.hidden === true &&
-      !!document.querySelector('#desktop-shortcuts .desktop-shortcut[data-target="system"]')
-    ), null, { timeout: 30_000 });
-  } catch (error) {
-    const details = await page.evaluate(() => {
-      const frame = document.querySelector("#active-shell-frame");
-      const doc = frame?.contentDocument;
-      const terminalText = doc?.querySelector("#xterm-terminal")?.textContent || "";
-      const fallbackText = doc?.querySelector("#terminal-output")?.textContent || "";
+      frame_src: document.querySelector("#active-shell-frame")?.getAttribute("src") || "",
+      host_gui_dom_present: Boolean(document.querySelector(
+        "#desktop, .desktop-backdrop, .toolbar, .desktop-workspace, .taskbar, #launcher, #window-template",
+      )),
+    }));
+    const chatTerminal = await chatCliFrame.evaluate(() => {
+      const terminalText = document.querySelector("#xterm-terminal")?.textContent || "";
       return {
-        body: { ...document.body.dataset },
-        active_shell_root_hidden: document.querySelector("#active-shell-root")?.hidden === true,
-        active_shell_frame_src: frame?.getAttribute("src") || "",
-        terminal_dataset: { ...(doc?.body?.dataset || {}) },
-        terminal_text_tail: terminalText.slice(-2000),
-        fallback_text_tail: fallbackText.slice(-2000),
+        terminal_has_chat_prompt: terminalText.includes("Type /home to return Home"),
+        terminal_has_chat_identity: terminalText.includes("Chat as "),
       };
     });
-    error.details = details;
-    throw error;
-  }
-  const restored = await page.evaluate(() => ({
-    body: { ...document.body.dataset },
-    active_shell_root_hidden: document.querySelector("#active-shell-root")?.hidden === true,
-    toolbar_hidden: document.querySelector(".toolbar")?.hidden === true,
-    toolbar_inert: document.querySelector(".toolbar")?.inert === true,
-    taskbar_hidden: document.querySelector(".taskbar")?.hidden === true,
-    system_shortcut_present: !!document.querySelector('#desktop-shortcuts .desktop-shortcut[data-target="system"]'),
-  }));
-  assert(!restored.toolbar_hidden && !restored.toolbar_inert && !restored.taskbar_hidden, "Home GUI chrome did not restore after CLI switchback", restored);
-
-  markStage("shell-switch:direct-home-cli");
-  const directSwitch = await browserApi(page, homeToken, "/api/apps/home/active-shell", {
-    method: "POST",
-    body: { active: "home-cli" },
-  });
-  assert(directSwitch.ok, "direct Home CLI switch failed before Browser open", directSwitch);
-  switchedToCli = true;
-  await page.evaluate(() => {
-    window.postMessage({ type: "home:refresh-summary" }, window.location.origin);
-  });
-  markStage("shell-switch:host-refresh-home-cli");
-  await page.waitForFunction(() => (
-    document.body?.dataset?.homeStatus === "ready" &&
-    document.body?.dataset?.homeAuthority === "signed" &&
-    document.body?.dataset?.homeShell === "alternate" &&
-    document.querySelector("#active-shell-frame")?.getAttribute("src")?.includes("/apps/home-cli/")
-  ), null, { timeout: 30_000 });
-  await page.waitForFunction(() => (
-    document.querySelector("#active-shell-frame")
-      ?.contentDocument
-      ?.body
-      ?.dataset
-      ?.runtimeTerminal === "attached" &&
-    document.querySelector("#active-shell-frame")
-      ?.contentDocument
-      ?.querySelector("#xterm-terminal")
-      ?.hidden === false
-  ), null, { timeout: 15_000 });
-  const chatCliFrame = page.frames().find((frame) => frame.url().includes("/apps/home-cli/"));
-  assert(chatCliFrame, "Home CLI iframe was not available to open Chat", cliRoot);
-  markStage("shell-switch:cli-open-chat");
-  await pressHomeCliKey(chatCliFrame, "1");
-  try {
-    await page.waitForFunction(() => (
-      document.body?.dataset?.homeStatus === "ready" &&
-      document.body?.dataset?.homeAuthority === "signed" &&
-	      document.body?.dataset?.homeShell === "alternate" &&
-	      document.body?.dataset?.homeGui === "dormant" &&
-	      document.querySelector("#active-shell-root")?.hidden === false &&
-	      document.querySelector("#active-shell-frame")?.getAttribute("src")?.includes("/apps/home-cli/") &&
-	      !document.querySelector('.window[data-target="chat-room"]') &&
-      (
-        document.querySelector("#active-shell-frame")
-          ?.contentDocument
-          ?.querySelector("#xterm-terminal")
-          ?.textContent || ""
-      ).includes("Type /home to return Home")
-    ), null, { timeout: 30_000 });
-  } catch (error) {
-    const details = await page.evaluate(() => {
-      const frame = document.querySelector("#active-shell-frame");
-      const doc = frame?.contentDocument;
-      const terminalText = doc?.querySelector("#xterm-terminal")?.textContent || "";
-      const fallbackText = doc?.querySelector("#terminal-output")?.textContent || "";
-      return {
-        body: { ...document.body.dataset },
-        active_shell_root_hidden: document.querySelector("#active-shell-root")?.hidden === true,
-        active_shell_frame_src: frame?.getAttribute("src") || "",
-        gui_window_contains_chat: Boolean(document.querySelector('.window[data-target="chat-room"]')),
-        terminal_dataset: { ...(doc?.body?.dataset || {}) },
-        terminal_text_tail: terminalText.slice(-2000),
-        fallback_text_tail: fallbackText.slice(-2000),
-      };
+    const chatNative = { host: chatHost, terminal: chatTerminal };
+    assert(chatHost.frame_src.includes("/apps/home-cli/"), "CLI Chat replaced the root shell", chatNative);
+    assert(!chatHost.host_gui_dom_present, "CLI Chat instantiated Home GUI DOM", chatNative);
+    assert(!capsuleFrameForTarget(page, "home-gui"), "CLI Chat loaded Home GUI", {
+      frames: page.frames().map((frame) => frame.url()),
     });
-    error.details = details;
-    throw error;
-  }
-  const chatNative = await page.evaluate(() => {
-    const terminalText = document.querySelector("#active-shell-frame")
-      ?.contentDocument
-      ?.querySelector("#xterm-terminal")
-      ?.textContent || "";
-    return {
-	      body: { ...document.body.dataset },
-	      active_shell_root_hidden: document.querySelector("#active-shell-root")?.hidden === true,
-	      active_shell_frame_src: document.querySelector("#active-shell-frame")?.getAttribute("src") || "",
-	      gui_window_contains_chat: Boolean(document.querySelector('.window[data-target="chat-room"]')),
-	      terminal_has_chat_prompt: terminalText.includes("Type /home to return Home"),
-	      terminal_has_chat_identity: terminalText.includes("Chat as "),
-    };
-  });
-  assert(chatNative.body.homeShell === "alternate", "Home CLI Chat left alternate shell mode", chatNative);
-  assert(chatNative.body.homeGui === "dormant", "Home CLI Chat mounted Home GUI", chatNative);
-  assert(!chatNative.active_shell_root_hidden, "Home CLI Chat hid the active shell root", chatNative);
-  assert(chatNative.active_shell_frame_src.includes("/apps/home-cli/"), "Home CLI Chat dropped the CLI root frame", chatNative);
-	  assert(!chatNative.gui_window_contains_chat, "Home CLI Chat opened the GUI chat-room window", chatNative);
-  assert(chatNative.terminal_has_chat_prompt, "Home CLI Chat did not render the CLI chat prompt", chatNative);
-  assert(chatNative.terminal_has_chat_identity, "Home CLI Chat did not enter native chat", chatNative);
-  markStage("shell-switch:cli-chat-return-home");
-  await typeHomeCliText(chatCliFrame, "/home");
-  await page.keyboard.press("Enter");
-  await page.waitForFunction(() => (
-    document.querySelector("#active-shell-frame")
-      ?.contentDocument
-      ?.body
-      ?.dataset
-      ?.runtimeTerminal === "attached" &&
-    document.querySelector("#active-shell-frame")
-      ?.contentDocument
-      ?.querySelector("#xterm-terminal")
-      ?.hidden === false &&
-    (() => {
-      const terminalText = document.querySelector("#active-shell-frame")
-        ?.contentDocument
-        ?.querySelector("#xterm-terminal")
-        ?.textContent || "";
+    assert(chatTerminal.terminal_has_chat_prompt, "Home CLI did not enter CLI Chat", chatNative);
+    assert(chatTerminal.terminal_has_chat_identity, "Home CLI Chat did not show its identity", chatNative);
+
+    markStage("shell-switch:cli-chat-return-home");
+    const cliTextarea = await homeCliXtermTextarea(chatCliFrame);
+    await cliTextarea.pressSequentially("/home");
+    await cliTextarea.press("Enter");
+    await chatCliFrame.waitForFunction(() => {
+      const terminalText = document.querySelector("#xterm-terminal")?.textContent || "";
       return /Home\s+Inbox\s+People\s+Apps\s+System/.test(terminalText) &&
         terminalText.includes("Chat [ready]");
-    })()
-  ), null, { timeout: 15_000 });
+    }, null, { timeout: 20_000 });
 
-  const browserCliFrame = page.frames().find((frame) => frame.url().includes("/apps/home-cli/"));
-  assert(browserCliFrame, "Home CLI iframe was not available to verify Browser boundary", cliRoot);
-  markStage("shell-switch:cli-browser-hidden");
-  await browserCliFrame.locator("#xterm-terminal").click();
-  await page.keyboard.press("b");
-  await page.waitForTimeout(500);
-  const browserBoundary = await page.evaluate(() => {
-    const windowNode = document.querySelector('.window[data-target="browser"]');
-    const frame = windowNode?.querySelector(".window-frame") || null;
-    const toolbar = document.querySelector(".toolbar");
-    const workspace = document.querySelector(".desktop-workspace");
-    const taskbar = document.querySelector(".taskbar");
-    const dormantNode = (node) => !node || node.hidden === true;
-    return {
-      body: { ...document.body.dataset },
-	      active_shell_root_hidden: document.querySelector("#active-shell-root")?.hidden === true,
-	      active_shell_frame_src: document.querySelector("#active-shell-frame")?.getAttribute("src") || "",
-	      workspace_dormant: dormantNode(workspace),
-	      workspace_overlay: workspace?.dataset?.homeShellOverlay || "",
-	      window_in_desktop: windowNode?.parentElement?.id === "desktop",
-	      toolbar_dormant: dormantNode(toolbar),
-	      taskbar_dormant: dormantNode(taskbar),
-      window_present: Boolean(windowNode),
-      frame_src: frame?.getAttribute("src") || "",
-      frame_title: frame?.getAttribute("title") || "",
+    markStage("shell-switch:cli-browser-boundary");
+    await pressHomeCliKey(chatCliFrame, "b");
+    await page.waitForTimeout(500);
+    const browserBoundary = {
+      host: await page.evaluate(() => ({
+        body: { ...document.body.dataset },
+        frame_src: document.querySelector("#active-shell-frame")?.getAttribute("src") || "",
+        host_gui_dom_present: Boolean(document.querySelector(
+          "#desktop, .desktop-backdrop, .toolbar, .desktop-workspace, .taskbar, #launcher, #window-template",
+        )),
+      })),
+      cli: await chatCliFrame.evaluate(() => ({
+        runtime_terminal: document.body?.dataset?.runtimeTerminal || "",
+        terminal_text_tail: (document.querySelector("#xterm-terminal")?.textContent || "").slice(-2000),
+      })),
+      gui_frame_present: Boolean(capsuleFrameForTarget(page, "home-gui")),
     };
-  });
-	  assert(!browserBoundary.window_present, "Home CLI Browser shortcut unexpectedly opened a Browser window through Home", browserBoundary);
-	  assert(browserBoundary.body.homeShell === "alternate", "Home CLI Browser shortcut unexpectedly switched back to Home GUI", browserBoundary);
-	  assert(browserBoundary.body.homeGui === "dormant", "Home CLI Browser shortcut mounted Home GUI", browserBoundary);
-	  assert(!browserBoundary.active_shell_root_hidden, "Home CLI Browser shortcut hid the CLI root shell", browserBoundary);
-	  assert(browserBoundary.active_shell_frame_src.includes("/apps/home-cli/"), "Home CLI Browser shortcut dropped the CLI root frame", browserBoundary);
-	  assert(browserBoundary.workspace_dormant, "Home CLI Browser shortcut woke the Home GUI desktop workspace", browserBoundary);
-	  assert(browserBoundary.toolbar_dormant && browserBoundary.taskbar_dormant, "Home CLI Browser shortcut restored Home GUI chrome", browserBoundary);
-  return {
-    shell_options: shellOptions,
-    cli_root: {
-	      fills_viewport: true,
-	      gui_dom_present: cliRoot.gui_dom_present,
-	      toolbar_dormant: cliRoot.toolbar_dormant,
-      taskbar_dormant: cliRoot.taskbar_dormant,
-      cli_ready: cliRoot.cli_ready,
-    },
-    restored,
-    chat_cli: chatNative,
-    browser_boundary: browserBoundary,
-  };
+    assert(browserBoundary.host.frame_src.includes("/apps/home-cli/"), "CLI Browser action replaced the root shell", browserBoundary);
+    assert(!browserBoundary.host.host_gui_dom_present, "CLI Browser action instantiated Home GUI DOM", browserBoundary);
+    assert(!browserBoundary.gui_frame_present, "CLI Browser action loaded Home GUI", browserBoundary);
+
+    return {
+      shell_options: shellOptions,
+      cli_root: { fills_viewport: true, origin: cliState.origin, terminal_ready: true },
+      restored,
+      chat_cli: chatNative,
+      browser_boundary: browserBoundary,
+    };
   } finally {
+    page.off("console", captureConsole);
+    page.off("pageerror", capturePageError);
+    page.off("requestfailed", captureRequestFailure);
+    page.off("response", captureResponse);
     if (switchedToCli) {
       await browserApi(page, homeToken, "/api/apps/home/active-shell", {
         method: "POST",
@@ -3038,23 +3044,17 @@ async function checkBrowserLaunchGrant(page, homeToken) {
   assert(launched.ok, "Browser launch grant failed", launched);
   assert(launched.body?.target === "browser", "Browser launch did not resolve the Browser capsule", launched);
   const route = String(launched.body?.route || "");
-  assert(route.includes("home_token="), "Browser launch did not mint an app token", launched);
+  const browserToken = assertIsolatedLaunchRoute(route, "browser");
   if (CHECK_BROWSER_UI_SETUP) {
-    const browserToken = new URL(route, HOME_URL).searchParams.get("home_token") || "";
-    assert(browserToken, "Browser launch route did not contain a Browser app token", launched);
     launched.body.browser_ui_setup = await holdBrowserUiForSetup(page.context(), browserToken, route);
   }
   if (CHECK_BROWSER_UI_INPUT) {
-    const browserToken = new URL(route, HOME_URL).searchParams.get("home_token") || "";
-    assert(browserToken, "Browser launch route did not contain a Browser app token", launched);
     launched.body.browser_ui_input = await checkBrowserUiInput(page.context(), browserToken, route);
   }
   if (CHECK_BROWSER_EMBEDDED_UI_INPUT) {
     launched.body.browser_embedded_ui_input = await checkBrowserEmbeddedUiInput(page);
   }
   if (OPEN_BROWSER) {
-    const browserToken = new URL(route, HOME_URL).searchParams.get("home_token") || "";
-    assert(browserToken, "Browser launch route did not contain a Browser app token", launched);
     assert(
       BROWSER_OPEN_CONCURRENT <= BROWSER_OPEN_URLS.length,
       "HOME_VIRTUAL_AUTH_BROWSER_OPEN_CONCURRENT exceeds HOME_VIRTUAL_AUTH_BROWSER_OPEN_URLS",
@@ -3284,8 +3284,6 @@ async function checkBrowserLaunchGrant(page, homeToken) {
       close_results: closeResults,
     };
   } else if (CHECK_BROWSER_SUMMARY) {
-    const browserToken = new URL(route, HOME_URL).searchParams.get("home_token") || "";
-    assert(browserToken, "Browser launch route did not contain a Browser app token", launched);
     const summary = await browserApi(page, browserToken, "/api/apps/browser/summary");
     assert(summary.ok, "Browser summary failed", summary);
     assert(
@@ -3300,8 +3298,6 @@ async function checkBrowserLaunchGrant(page, homeToken) {
     };
   }
   if (CHECK_BROWSER_PROFILE_RESET) {
-    const browserToken = new URL(route, HOME_URL).searchParams.get("home_token") || "";
-    assert(browserToken, "Browser launch route did not contain a Browser app token", launched);
     const reset = await browserApi(page, browserToken, "/api/apps/browser/profile/reset", {
       method: "POST",
     });
@@ -3372,7 +3368,7 @@ async function checkAppLaunchMatrix(page, homeToken) {
     assert(launched.ok, `Home launch failed for ${target}`, launched);
     assert(launched.body?.target === target, `Home launch resolved the wrong target for ${target}`, launched);
     const route = String(launched.body?.route || "");
-    assert(route.includes("home_token="), `Home launch did not mint an app token for ${target}`, launched);
+    assertIsolatedLaunchRoute(route, target);
     const appPage = await page.context().newPage();
     try {
       const response = await appPage.goto(new URL(route, HOME_URL).toString(), {
@@ -3400,7 +3396,7 @@ async function checkAppLaunchMatrix(page, homeToken) {
       results.push({
         target,
         title: summaryTarget.title || "",
-        route_prefix: route.split("home_token=")[0],
+        route_prefix: route.split("#")[0],
         status: response.status(),
         document_title: appState.title,
         body_status: appState.bodyStatus,
@@ -3557,7 +3553,7 @@ async function main() {
       console.error(error.stack);
     }
     if (error.details) {
-      console.error(JSON.stringify(error.details, null, 2));
+      console.error(JSON.stringify(redactSensitive(error.details), null, 2));
     } else {
       const state = page ? await homeState(page).catch(() => null) : null;
       if (state) {

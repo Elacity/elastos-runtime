@@ -1,4 +1,8 @@
-import { fetchJson } from "./shell-core.js?v=home-20260713a";
+import {
+  clearHomeAuthorityToken,
+  fetchJson,
+  setHomeAuthorityToken,
+} from "./shell-core.js?v=home-20260715a";
 
 const unlockPanel = document.querySelector("#home-unlock");
 const unlockCard = document.querySelector(".home-unlock-card");
@@ -14,6 +18,7 @@ let unlockPresentation = "modal";
 let unlockCallback = null;
 let busy = false;
 let sessionRefreshInFlight = null;
+let passkeyAuthorityRequestInFlight = null;
 let autoSignInAttempted = false;
 
 export function isHomeAuthError(error) {
@@ -104,6 +109,14 @@ export function bindHomeUnlock() {
 export function refreshHomeSession() {
   if (!sessionRefreshInFlight) {
     sessionRefreshInFlight = fetchJson("/api/auth/sessions/refresh", { method: "POST" })
+      .then((response) => {
+        setHomeAuthorityToken(response?.home_token);
+        return response;
+      })
+      .catch((error) => {
+        clearHomeAuthorityToken();
+        throw error;
+      })
       .finally(() => {
         sessionRefreshInFlight = null;
       });
@@ -112,15 +125,52 @@ export function refreshHomeSession() {
 }
 
 export async function signOutHome() {
-  const response = await fetch("/api/auth/sessions/sign-out", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-  });
-  if (response.ok || response.status === 401 || response.status === 403) {
-    return null;
+  try {
+    const response = await fetch("/api/auth/sessions/sign-out", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+    });
+    if (response.ok || response.status === 401 || response.status === 403) {
+      return null;
+    }
+    const detail = await response.text().catch(() => "");
+    throw new Error(`request failed: ${response.status} ${response.statusText}${detail ? ` ${detail}` : ""}`);
+  } finally {
+    clearHomeAuthorityToken();
   }
-  const detail = await response.text().catch(() => "");
-  throw new Error(`request failed: ${response.status} ${response.statusText}${detail ? ` ${detail}` : ""}`);
+}
+
+export function requestPasskeyHomeAuthority() {
+  if (!window.PublicKeyCredential) {
+    return Promise.reject(new Error("Passkey verification is unavailable in this browser."));
+  }
+  if (!passkeyAuthorityRequestInFlight) {
+    passkeyAuthorityRequestInFlight = (async () => {
+      const begin = await fetchJson("/api/auth/passkey/authenticate/begin", { method: "POST" });
+      const credential = await navigator.credentials.get(toRequestOptions(begin.options));
+      if (!credential) {
+        throw new Error("Passkey verification was cancelled.");
+      }
+      const response = await fetchJson("/api/auth/passkey/authenticate/complete", {
+        method: "POST",
+        body: JSON.stringify({
+          ceremony_id: begin.ceremony_id,
+          response: serializeAssertionCredential(credential),
+        }),
+      });
+      const homeToken = typeof response?.home_token === "string"
+        ? response.home_token.trim()
+        : "";
+      if (!homeToken) {
+        throw new Error("Passkey verification did not return authority.");
+      }
+      setHomeAuthorityToken(homeToken);
+      return homeToken;
+    })().finally(() => {
+      passkeyAuthorityRequestInFlight = null;
+    });
+  }
+  return passkeyAuthorityRequestInFlight;
 }
 
 function renderUnlockChecking() {
@@ -217,7 +267,7 @@ async function runPasskeyCreate() {
     if (!credential) {
       throw new Error("Passkey creation was cancelled.");
     }
-    await fetchJson("/api/auth/passkey/register/complete", {
+    const response = await fetchJson("/api/auth/passkey/register/complete", {
       method: "POST",
       body: JSON.stringify({
         ceremony_id: begin.ceremony_id,
@@ -225,6 +275,7 @@ async function runPasskeyCreate() {
         display_name: displayName,
       }),
     });
+    setHomeAuthorityToken(response?.home_token);
     await unlockComplete();
   } finally {
     busy = false;
@@ -245,13 +296,14 @@ async function runPasskeySignIn(options = {}) {
     if (!credential) {
       throw new Error("Passkey sign-in was cancelled.");
     }
-    await fetchJson("/api/auth/passkey/authenticate/complete", {
+    const response = await fetchJson("/api/auth/passkey/authenticate/complete", {
       method: "POST",
       body: JSON.stringify({
         ceremony_id: begin.ceremony_id,
         response: serializeAssertionCredential(credential),
       }),
     });
+    setHomeAuthorityToken(response?.home_token);
     await unlockComplete();
   } finally {
     busy = false;

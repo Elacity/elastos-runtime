@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260713a";
+const moduleVersion = "home-20260715a";
 const requests = [];
 const localStorageValues = new Map([
   ["elastos.home.active-shell-hint", "home-gui"],
@@ -343,12 +343,23 @@ globalThis.fetch = async (url, init = {}) => {
       elementForSelector("#home-shell-boot-mask").hidden === true,
       "no-hint runtime settle left the neutral host mask over Home GUI",
     );
-    assert(elementForSelector("#active-shell-root").hidden === true, "no-hint runtime settle showed a root shell");
+    assert(elementForSelector("#active-shell-root").hidden === false, "no-hint runtime settle hid the active GUI shell");
+    assert(
+      elementForSelector("#active-shell-frame").dataset.route?.includes("/apps/home-gui/"),
+      "no-hint runtime settle did not keep the isolated GUI shell",
+      elementForSelector("#active-shell-frame").dataset,
+    );
     runtimeEnsureSawGuiMounted = true;
     return jsonResponse({ ok: true });
   }
   if (url === "/api/apps/home/launch") {
-    throw new Error(`no-hint boot should not launch an alternate shell: ${JSON.stringify(body)}`);
+    assert(body?.target === "home-gui", "no-hint boot launched the wrong root shell", body);
+    assert(body?.query?.shell_mode === "root", "no-hint GUI shell did not use root mode", body);
+    return jsonResponse({
+      attach_kind: "iframe",
+      route: "/apps/home-gui/?shell_mode=root&home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=gui-token",
+      target: "home-gui",
+    });
   }
   return jsonResponse({ ok: true });
 };
@@ -365,10 +376,10 @@ assert(summaryCalls >= 2, "no-hint boot did not refresh summary after Runtime se
 assert(runtimeEnsureSawGuiMounted, "no-hint boot did not prove GUI stayed mounted during Runtime settle");
 assert(document.body.dataset.homeShell === "desktop", "no-hint boot did not keep Home GUI active", document.body.dataset);
 assert(document.body.dataset.homeGui === "mounted", "no-hint boot left Home GUI dormant", document.body.dataset);
-assert(activeShellRoot.hidden === true, "no-hint boot showed active shell root");
-assert(activeShellRoot.dataset.target === "", "no-hint boot kept a stale active shell target", activeShellRoot.dataset);
-assert(activeShellFrame.hidden === true, "no-hint boot showed active shell frame");
-assert(!activeShellFrame.dataset.route, "no-hint boot kept a stale shell frame route", activeShellFrame.dataset);
+assert(activeShellRoot.hidden === false, "no-hint boot hid the active GUI shell root");
+assert(activeShellRoot.dataset.target === "home-gui", "no-hint boot selected the wrong root shell", activeShellRoot.dataset);
+assert(activeShellFrame.hidden === false, "no-hint boot hid the active GUI shell frame");
+assert(activeShellFrame.dataset.route.includes("#home_token=gui-token"), "no-hint boot did not launch isolated Home GUI", activeShellFrame.dataset);
 assert(
   elementForSelector("#home-shell-boot-mask").hidden === true,
   "no-hint boot left the neutral host mask over Home GUI",
@@ -379,6 +390,10 @@ assert(
   Object.fromEntries(localStorageValues),
 );
 assert(!requests.some((request) => request.url === "/api/apps/home/active-shell"), "no-hint boot switched shell using ambient state", requests);
-assert(!requests.some((request) => request.url === "/api/apps/home/launch"), "no-hint boot launched an alternate shell", requests);
+assert(
+  requests.some((request) => request.url === "/api/apps/home/launch" && request.body?.target === "home-gui"),
+  "no-hint boot did not launch Home GUI through Runtime",
+  requests,
+);
 
 console.log("[home-shell-no-hint-boot] PASS");

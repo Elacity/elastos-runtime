@@ -1,145 +1,40 @@
 use super::*;
 
 #[tokio::test]
-async fn test_recovery_kit_routes_are_principal_bound_and_fail_closed() {
+async fn test_legacy_recovery_kit_routes_are_absent() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
-    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
-    let principal =
-        crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
+
+    for path in [
+        "/api/auth/recovery/create",
+        "/api/auth/recovery/export",
+        "/api/auth/recovery/import",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
             .unwrap();
-    let principal_id = authority.principal_id.clone();
-    let localhost_root = principal.localhost_root.clone();
-
-    let export = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/recovery/export")
-                .header("x-elastos-home-token", authority.home_token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({
-                        "schema": elastos_runtime::auth::RECOVERY_KIT_EXPORT_REQUEST_SCHEMA,
-                        "principal_id": principal_id,
-                        "localhost_root": localhost_root,
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(export.status(), StatusCode::FORBIDDEN);
-    let export_body = axum::body::to_bytes(export.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let export_text = String::from_utf8(export_body.to_vec()).unwrap();
-    assert!(export_text.contains("principal root encryption"));
-    assert!(export_text.contains("recovery protector"));
-
-    let import = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/recovery/import")
-                .header("x-elastos-home-token", authority.home_token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({
-                        "schema": elastos_runtime::auth::RECOVERY_KIT_IMPORT_REQUEST_SCHEMA,
-                        "principal_id": principal_id,
-                        "localhost_root": localhost_root,
-                        "kit": {
-                            "schema": elastos_runtime::auth::RECOVERY_KIT_SCHEMA,
-                            "kit_id": "kit:route-test",
-                            "protector_id": "protector:recovery:route-test",
-                            "principal_id": principal_id,
-                            "localhost_root": localhost_root,
-                            "data_key_id": "pdek:route-test",
-                            "recovery_phrase": "aaaa-bbbb-cccc-dddd-eeee-ffff-1111-2222-3333-4444",
-                            "salt": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                            "nonce": "AAAAAAAAAAAAAAAA",
-                            "wrapped_data_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                            "encrypted_root_descriptor": "enc:v1:metadata-ciphertext",
-                            "crypto": {
-                                "cipher": "aes-256-gcm",
-                                "signatures": ["ed25519", "ml-dsa-65"],
-                                "kems": ["x25519", "ml-kem-768"],
-                                "recovery_kdf": "hkdf-sha256"
-                            },
-                            "created_at": 1_800_000_000u64,
-                            "instructions": ["Import through ElastOS Runtime recovery."]
-                        }
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(import.status(), StatusCode::FORBIDDEN);
-    let import_body = axum::body::to_bytes(import.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let import_text = String::from_utf8(import_body.to_vec()).unwrap();
-    assert!(
-        import_text.contains("invalid recovery kit")
-            || import_text.contains("unsupported encrypted root descriptor")
-    );
+        assert!(
+            matches!(
+                response.status(),
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ),
+            "{path} unexpectedly resolved with {}",
+            response.status()
+        );
+    }
 }
 
 #[tokio::test]
-async fn test_recovery_kit_routes_reject_wallet_bound_home_session() {
-    let dir = tempfile::tempdir().unwrap();
-    let app = gateway_router(test_state(dir.path()));
-    let now = crate::auth::now_ts();
-    let wallet_binding =
-        ProofBinding::evm_account(20, "0x1111111111111111111111111111111111111111", now);
-    let principal = crate::auth::upsert_principal_for_binding_as_role(
-        dir.path(),
-        wallet_binding,
-        "person:local:wallet-recovery-test".to_string(),
-        crate::auth::RuntimePrincipalRole::Admin,
-        now,
-    )
-    .unwrap();
-    let grant = AuthSessionGrantV1 {
-        schema: AuthSessionGrantV1::SCHEMA.to_string(),
-        grant_id: format!("grant:{}", uuid_like_token()),
-        session_id: format!("auth:{}", uuid_like_token()),
-        principal_id: principal.principal_id,
-        proof_binding_id: principal.proof_binding_id,
-        issued_at: now,
-        expires_at: now + 12 * 60 * 60,
-        apps: vec![HOME_CAPSULE_ID.to_string(), SYSTEM_CAPSULE_ID.to_string()],
-    };
-    crate::auth::store_session_grant(dir.path(), grant.clone()).unwrap();
-    let system_token =
-        issue_home_launch_token_for_auth_grant(dir.path(), SYSTEM_CAPSULE_ID, &grant).unwrap();
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/auth/recovery/status")
-                .header("x-elastos-home-token", system_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let text = String::from_utf8(body.to_vec()).unwrap();
-    assert!(text.contains("passkey authority"));
-}
-
-#[tokio::test]
-async fn test_recovery_kit_routes_prevent_admin_exporting_guest_kit() {
+async fn test_full_recovery_bundle_prevents_admin_exporting_guest_root() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
     let admin = passkey_authority_with_name(dir.path(), Some("admin"));
@@ -150,147 +45,33 @@ async fn test_recovery_kit_routes_prevent_admin_exporting_guest_kit() {
     );
     let guest_principal =
         crate::auth::load_principal_for_proof_binding(dir.path(), &guest.proof_binding_id).unwrap();
-
-    let create = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/recovery/create")
-                .header("x-elastos-home-token", guest.system_token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({
-                        "schema": elastos_runtime::auth::RECOVERY_KIT_CREATE_REQUEST_SCHEMA,
-                        "principal_id": guest.principal_id,
-                        "localhost_root": guest_principal.localhost_root,
-                        "label": "Guest Recovery Kit",
-                        "download_password": "guest password",
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(create.status(), StatusCode::OK);
-
-    let export = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/recovery/export")
-                .header("x-elastos-home-token", admin.system_token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({
-                        "schema": elastos_runtime::auth::RECOVERY_KIT_EXPORT_REQUEST_SCHEMA,
-                        "principal_id": guest.principal_id,
-                        "localhost_root": guest_principal.localhost_root,
-                        "download_password": "guest password",
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(export.status(), StatusCode::FORBIDDEN);
-    let body = axum::body::to_bytes(export.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let text = String::from_utf8(body.to_vec()).unwrap();
-    assert!(text.contains("principal binding mismatch"));
-    assert!(!text.contains("recovery_phrase"));
-}
-
-#[tokio::test]
-async fn test_recovery_kit_routes_create_export_and_import_password_package() {
-    let dir = tempfile::tempdir().unwrap();
-    let app = gateway_router(test_state(dir.path()));
-    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
-    let principal =
-        crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
-            .unwrap();
-    let principal_id = authority.principal_id.clone();
-    let localhost_root = principal.localhost_root.clone();
-    let password = "correct horse battery";
-
-    let create = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/recovery/create")
-                .header("x-elastos-home-token", authority.system_token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({
-                        "schema": elastos_runtime::auth::RECOVERY_KIT_CREATE_REQUEST_SCHEMA,
-                        "principal_id": principal_id,
-                        "localhost_root": localhost_root,
-                        "label": "Recovery Kit",
-                        "download_password": password,
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(create.status(), StatusCode::OK);
-    let create_body = axum::body::to_bytes(create.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let create_json: serde_json::Value = serde_json::from_slice(&create_body).unwrap();
-    assert_eq!(
-        create_json["schema"],
-        elastos_runtime::auth::RECOVERY_KIT_PACKAGE_SCHEMA
-    );
-    assert_eq!(create_json["principal_id"], principal_id);
-    assert_eq!(create_json["localhost_root"], localhost_root);
-    assert!(
-        create_json["protection"]["encrypted_recovery_kit"]
-            .as_str()
-            .unwrap_or_default()
-            .len()
-            > 32
+    let intent = json!({
+        "principal_id": guest.principal_id,
+        "localhost_root": guest_principal.localhost_root,
+        "label": "Guest root",
+    });
+    let fresh_token = intent_token_for_authority_context(
+        dir.path(),
+        SYSTEM_CAPSULE_ID,
+        &admin,
+        "auth.full-recovery-bundle.export",
+        &intent,
     );
 
-    let status = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/auth/recovery/status")
-                .header("x-elastos-home-token", authority.system_token.as_str())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(status.status(), StatusCode::OK);
-    let status_body = axum::body::to_bytes(status.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
-    assert_eq!(status_json["recovery_configured"], true);
-    assert_eq!(status_json["recovery_download_available"], true);
-
-    let export = app
-        .clone()
+    let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/auth/recovery/export")
-                .header("x-elastos-home-token", authority.system_token.as_str())
+                .uri("/api/auth/recovery/full-export")
+                .header("x-elastos-home-token", admin.system_token)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({
-                        "schema": elastos_runtime::auth::RECOVERY_KIT_EXPORT_REQUEST_SCHEMA,
-                        "principal_id": principal_id,
-                        "localhost_root": localhost_root,
-                        "download_password": password,
+                        "schema": "elastos.full-recovery-bundle.export.request/v1",
+                        "principal_id": intent["principal_id"],
+                        "localhost_root": intent["localhost_root"],
+                        "label": intent["label"],
+                        "home_token": fresh_token,
                     })
                     .to_string(),
                 ))
@@ -298,87 +79,19 @@ async fn test_recovery_kit_routes_create_export_and_import_password_package() {
         )
         .await
         .unwrap();
-    assert_eq!(export.status(), StatusCode::OK);
-    let export_body = axum::body::to_bytes(export.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let package: serde_json::Value = serde_json::from_slice(&export_body).unwrap();
-    assert_eq!(
-        package["schema"],
-        elastos_runtime::auth::RECOVERY_KIT_PACKAGE_SCHEMA
-    );
-    assert_eq!(package["principal_id"], principal_id);
-    assert_eq!(package["localhost_root"], localhost_root);
 
-    let wrong_import = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/recovery/import")
-                .header("x-elastos-home-token", authority.system_token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({
-                        "schema": elastos_runtime::auth::RECOVERY_KIT_IMPORT_REQUEST_SCHEMA,
-                        "principal_id": principal_id,
-                        "localhost_root": localhost_root,
-                        "reassign_to_current_principal": false,
-                        "package": package,
-                        "password": "wrong password",
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    assert_eq!(wrong_import.status(), StatusCode::FORBIDDEN);
-    let wrong_body = axum::body::to_bytes(wrong_import.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert!(String::from_utf8(wrong_body.to_vec())
-        .unwrap()
-        .contains("invalid recovery kit package"));
-
-    let import = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/recovery/import")
-                .header("x-elastos-home-token", authority.system_token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({
-                        "schema": elastos_runtime::auth::RECOVERY_KIT_IMPORT_REQUEST_SCHEMA,
-                        "principal_id": principal_id,
-                        "localhost_root": localhost_root,
-                        "reassign_to_current_principal": false,
-                        "package": package,
-                        "password": password,
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(import.status(), StatusCode::OK);
-    let import_body = axum::body::to_bytes(import.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let import_json: serde_json::Value = serde_json::from_slice(&import_body).unwrap();
-    assert_eq!(import_json["status"], "imported");
-    assert_eq!(import_json["principal_id"], principal_id);
-    assert_eq!(import_json["localhost_root"], localhost_root);
+    assert!(String::from_utf8_lossy(&body).contains("principal binding mismatch"));
 }
 
 #[tokio::test]
 async fn test_full_recovery_bundle_exports_and_restores_wallet_keys() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(wallet_chain_test_state(dir.path()).await);
-    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let authority = passkey_authority_with_name(dir.path(), Some("alex"));
     let principal =
         crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
             .unwrap();
@@ -414,6 +127,18 @@ async fn test_full_recovery_bundle_exports_and_restores_wallet_keys() {
         .unwrap()
         .to_string();
 
+    let export_intent = json!({
+        "principal_id": authority.principal_id,
+        "localhost_root": principal.localhost_root,
+        "label": "Everything",
+    });
+    let fresh_token = intent_token_for_authority_context(
+        dir.path(),
+        SYSTEM_CAPSULE_ID,
+        &authority,
+        "auth.full-recovery-bundle.export",
+        &export_intent,
+    );
     let export = app
         .clone()
         .oneshot(
@@ -425,10 +150,10 @@ async fn test_full_recovery_bundle_exports_and_restores_wallet_keys() {
                 .body(Body::from(
                     json!({
                         "schema": "elastos.full-recovery-bundle.export.request/v1",
-                        "principal_id": authority.principal_id,
-                        "localhost_root": principal.localhost_root,
-                        "label": "Everything",
-                        "home_token": authority.home_token,
+                        "principal_id": export_intent["principal_id"],
+                        "localhost_root": export_intent["localhost_root"],
+                        "label": export_intent["label"],
+                        "home_token": fresh_token,
                         "download_password": "test password"
                     })
                     .to_string(),
@@ -455,6 +180,13 @@ async fn test_full_recovery_bundle_exports_and_restores_wallet_keys() {
     );
     assert!(!export_json.to_string().contains("private_key_hex"));
 
+    let delete_token = intent_token_for_app_context(
+        dir.path(),
+        WALLET_CAPSULE_ID,
+        &wallet_token,
+        "wallet.account.delete",
+        &json!({ "account_id": account_id }),
+    );
     let delete = app
         .clone()
         .oneshot(
@@ -464,7 +196,7 @@ async fn test_full_recovery_bundle_exports_and_restores_wallet_keys() {
                 .header("x-elastos-home-token", wallet_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    json!({ "home_token": authority.home_token }).to_string(),
+                    json!({ "home_token": delete_token }).to_string(),
                 ))
                 .unwrap(),
         )
@@ -562,6 +294,18 @@ async fn test_full_recovery_bundle_recovers_existing_account_under_new_passkey()
         .unwrap();
     assert_eq!(create_account.status(), StatusCode::OK);
 
+    let export_intent = json!({
+        "principal_id": original.principal_id,
+        "localhost_root": original_principal.localhost_root,
+        "label": "Everything",
+    });
+    let fresh_token = intent_token_for_authority_context(
+        dir.path(),
+        SYSTEM_CAPSULE_ID,
+        &original,
+        "auth.full-recovery-bundle.export",
+        &export_intent,
+    );
     let export = app
         .clone()
         .oneshot(
@@ -573,10 +317,10 @@ async fn test_full_recovery_bundle_recovers_existing_account_under_new_passkey()
                 .body(Body::from(
                     json!({
                         "schema": "elastos.full-recovery-bundle.export.request/v1",
-                        "principal_id": original.principal_id,
-                        "localhost_root": original_principal.localhost_root,
-                        "label": "Everything",
-                        "home_token": original.home_token,
+                        "principal_id": export_intent["principal_id"],
+                        "localhost_root": export_intent["localhost_root"],
+                        "label": export_intent["label"],
+                        "home_token": fresh_token,
                         "download_password": "test password"
                     })
                     .to_string(),

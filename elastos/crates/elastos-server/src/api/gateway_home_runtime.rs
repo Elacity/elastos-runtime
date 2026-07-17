@@ -5,12 +5,13 @@ pub(super) async fn home_launch(
     headers: HeaderMap,
     Json(req): Json<HomeLaunchRequest>,
 ) -> Result<Json<HomeLaunchResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let context = require_home_token_context(&state.data_dir, &headers).map_err(|err| {
-        (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "error": err.to_string() })),
-        )
-    })?;
+    let context = require_home_launch_token_context(&state.data_dir, &headers, HOME_CAPSULE_ID)
+        .map_err(|err| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": err.to_string() })),
+            )
+        })?;
 
     let target = req.target.trim();
     if target.is_empty() || target == HOME_CAPSULE_ID {
@@ -50,14 +51,32 @@ pub(super) async fn home_launch(
         .viewer
         .as_deref()
         .unwrap_or(target_summary.target.as_str());
-    let route = append_home_launch_token(
-        &state.data_dir,
-        &target_summary.route,
-        authority_target,
-        &req.query,
-        &context,
-    )
+    let route = match req.authority.as_ref() {
+        Some(authority) => append_home_launch_token_with_intent(
+            &state.data_dir,
+            &target_summary.route,
+            authority_target,
+            &req.query,
+            &context,
+            &authority.operation,
+            &authority.request,
+        ),
+        None => append_home_launch_token(
+            &state.data_dir,
+            &target_summary.route,
+            authority_target,
+            &req.query,
+            &context,
+        ),
+    }
     .map_err(gateway_internal_error)?;
+    let route =
+        crate::api::browser_capsules::canonical_browser_capsule_route(&route).map_err(|error| {
+            (
+                StatusCode::MISDIRECTED_REQUEST,
+                Json(serde_json::json!({ "error": error })),
+            )
+        })?;
 
     Ok(Json(HomeLaunchResponse {
         target: target_summary.target,
@@ -74,6 +93,19 @@ pub(super) async fn home_launch(
     }))
 }
 
+fn append_home_launch_token_with_intent(
+    data_dir: &std::path::Path,
+    route: &str,
+    target: &str,
+    query: &BTreeMap<String, String>,
+    context: &HomeLaunchTokenContext,
+    operation: &str,
+    request: &serde_json::Value,
+) -> anyhow::Result<String> {
+    let token = issue_home_launch_token_with_intent(data_dir, target, context, operation, request)?;
+    append_home_launch_token_to_route(route, query, &token)
+}
+
 pub(super) fn append_home_launch_token(
     data_dir: &std::path::Path,
     route: &str,
@@ -82,8 +114,15 @@ pub(super) fn append_home_launch_token(
     context: &HomeLaunchTokenContext,
 ) -> anyhow::Result<String> {
     let token = issue_home_launch_token_with_context(data_dir, target, context)?;
+    append_home_launch_token_to_route(route, query, &token)
+}
+
+fn append_home_launch_token_to_route(
+    route: &str,
+    query: &BTreeMap<String, String>,
+    token: &str,
+) -> anyhow::Result<String> {
     let mut serializer = form_urlencoded::Serializer::new(String::new());
-    serializer.append_pair("home_token", &token);
     for (key, value) in query {
         let key = key.trim();
         if key.is_empty() || key == "home_token" {
@@ -92,8 +131,15 @@ pub(super) fn append_home_launch_token(
         serializer.append_pair(key, value);
     }
     let encoded = serializer.finish();
-    let separator = if route.contains('?') { '&' } else { '?' };
-    Ok(format!("{route}{separator}{encoded}"))
+    let route = if encoded.is_empty() {
+        route.to_string()
+    } else {
+        let separator = if route.contains('?') { '&' } else { '?' };
+        format!("{route}{separator}{encoded}")
+    };
+    let mut fragment = form_urlencoded::Serializer::new(String::new());
+    fragment.append_pair("home_token", token);
+    Ok(format!("{route}#{}", fragment.finish()))
 }
 
 pub(super) fn home_targets(data_dir: &std::path::Path) -> Vec<HomeTargetSummary> {
@@ -1577,7 +1623,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn append_home_launch_token_drops_reserved_query_token() {
+    fn append_home_launch_token_keeps_authority_out_of_the_request_url() {
         let dir = tempfile::tempdir().unwrap();
         let context = local_home_launch_token_context(dir.path()).unwrap();
         let mut query = BTreeMap::new();
@@ -1594,13 +1640,21 @@ mod tests {
         .unwrap();
         let parsed = url::Url::parse(&format!("http://localhost{route}")).unwrap();
         let query_pairs = parsed.query_pairs().collect::<Vec<_>>();
-        let home_tokens = query_pairs
-            .iter()
-            .filter(|(key, _)| key == "home_token")
-            .collect::<Vec<_>>();
+        let fragment_pairs =
+            form_urlencoded::parse(parsed.fragment().unwrap_or_default().as_bytes())
+                .collect::<Vec<_>>();
 
-        assert_eq!(home_tokens.len(), 1);
-        assert_ne!(home_tokens[0].1.as_ref(), "attacker");
+        assert!(query_pairs.iter().all(|(key, _)| key != "home_token"));
+        assert_eq!(
+            fragment_pairs
+                .iter()
+                .filter(|(key, _)| key == "home_token")
+                .count(),
+            1
+        );
+        assert!(fragment_pairs
+            .iter()
+            .any(|(key, value)| key == "home_token" && value != "attacker"));
         assert!(query_pairs
             .iter()
             .any(|(key, value)| key == "capsule" && value == "documents"));

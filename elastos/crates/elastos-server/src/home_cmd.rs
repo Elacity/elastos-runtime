@@ -1014,30 +1014,6 @@ fn home_terminal_host_intent_for_action(
         }));
     }
 
-    if let Some(contact_id) = action_id.strip_prefix("people-message:").map(str::trim) {
-        if contact_id.is_empty() {
-            return None;
-        }
-        let contact = snapshot
-            .people
-            .contacts
-            .iter()
-            .find(|contact| contact.contact_id == contact_id)?;
-        let target = people_contact_message_target(contact)?;
-        if target == HOME_CLI_CAPSULE_NAME {
-            return None;
-        }
-        return Some(serde_json::json!({
-            "schema": "elastos.home.terminal-host-intent/v1",
-            "action": "open-target",
-            "action_id": action_id,
-            "target": target,
-            "source": "people-contact",
-            "contact_id": contact.contact_id.as_str(),
-            "route": contact.route.as_str(),
-        }));
-    }
-
     if let Some(target) = action_id.strip_prefix("open-gui:").map(str::trim) {
         if target.is_empty() || target == HOME_CLI_CAPSULE_NAME {
             return None;
@@ -1051,7 +1027,7 @@ fn home_terminal_host_intent_for_action(
         }
         return Some(serde_json::json!({
             "schema": "elastos.home.terminal-host-intent/v1",
-            "action": "open-target",
+            "action": "switch-shell-open-target",
             "action_id": action_id,
             "target": target,
         }));
@@ -1680,59 +1656,7 @@ async fn run_home_capsule(
     client_token: &str,
     session: &HomeSession,
 ) -> anyhow::Result<()> {
-    let capsule_dir = resolve_home_capsule_dir(data_dir)?;
-    let manifest: elastos_common::CapsuleManifest = serde_json::from_slice(
-        &fs::read(capsule_dir.join("capsule.json")).with_context(|| {
-            format!(
-                "failed to read Home capsule manifest from {}",
-                capsule_dir.display()
-            )
-        })?,
-    )
-    .context("failed to parse Home capsule manifest")?;
-    let mut manifest_capabilities = manifest.resource_authority_bounds();
-    manifest_capabilities.push(format!("{}/*", session.uri_root.trim_end_matches('/')));
-    let runtime_storage = data_dir
-        .join("Local")
-        .join("Shared")
-        .join("Home")
-        .join("bootstrap-storage");
-    fs::create_dir_all(&runtime_storage)?;
-
-    let runtime = crate::create_runtime(&runtime_storage).await?;
-    let api_url = api_url.to_string();
-    let client_token = client_token.to_string();
-
-    let api_hostcall_url = api_url.clone();
-    let api_hostcall_token = client_token.clone();
-    let api_hostcall_manifest_capabilities = manifest_capabilities.clone();
-    let api_hostcall_data_dir = data_dir.to_path_buf();
-    let api_hostcall_handle = tokio::runtime::Handle::current();
-    runtime.set_bridge_hostcall(std::sync::Arc::new(
-        move |line, capsule_id, principal_id| {
-            let response = api_hostcall_handle
-                .block_on(
-                    elastos_server::carrier_bridge::handle_remote_request_with_audit_dir(
-                        line,
-                        &api_hostcall_url,
-                        &api_hostcall_token,
-                        capsule_id,
-                        &api_hostcall_manifest_capabilities,
-                        principal_id,
-                        Some(api_hostcall_data_dir.as_path()),
-                    ),
-                )
-                .map_err(|err| err.to_string())?;
-            serde_json::to_string(&response).map_err(|err| err.to_string())
-        },
-    ));
-
-    runtime
-        .run_local(&capsule_dir, vec![session.uri_root.clone()])
-        .await
-        .map_err(|e| anyhow::anyhow!("Home CLI component descriptor failed: {}", e))?;
-
-    run_home_cli_renderer(data_dir, &api_url, &client_token, session)?;
+    run_home_cli_renderer(data_dir, api_url, client_token, session)?;
     Ok(())
 }
 
@@ -1775,72 +1699,10 @@ fn resolve_home_cli_renderer_program(data_dir: &Path) -> anyhow::Result<PathBuf>
     );
 }
 
-fn resolve_home_capsule_dir(data_dir: &Path) -> anyhow::Result<PathBuf> {
-    let dev = source_capsule_dir(HOME_CLI_CAPSULE_NAME);
-    if prefer_dev_home_capsule() && capsule_dir_has_entrypoint(&dev)? {
-        return Ok(dev);
-    }
-
-    let installed = data_dir.join("capsules").join(HOME_CLI_CAPSULE_NAME);
-    if capsule_dir_has_entrypoint(&installed)? {
-        return Ok(installed);
-    }
-
-    if capsule_dir_has_entrypoint(&dev)? {
-        return Ok(dev);
-    }
-
-    if prefer_dev_home_capsule() {
-        anyhow::bail!(
-            "home capsule component not built yet.\n\nBuild and install source Home first:\n\n  scripts/setup-source-home.sh\n\nOr build the Home CLI component artifact directly:\n\n  cd {}\n  cargo build --lib --target wasm32-unknown-unknown --release\n  cd ../..\n  cargo run --quiet --manifest-path elastos/tools/componentize/Cargo.toml -- capsules/home-cli/target/wasm32-unknown-unknown/release/home_cli.wasm capsules/home-cli/home-cli.component.wasm\n\nOr install the published Home surface with:\n\n  elastos setup",
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../capsules")
-                .join(HOME_CLI_CAPSULE_NAME)
-                .display()
-        );
-    }
-
-    anyhow::bail!("Home is not installed yet.\n\nRun:\n\n  elastos setup");
-}
-
-fn capsule_dir_has_entrypoint(dir: &Path) -> anyhow::Result<bool> {
-    let manifest_path = dir.join("capsule.json");
-    if !manifest_path.is_file() {
-        return Ok(false);
-    }
-    let manifest: elastos_common::CapsuleManifest =
-        serde_json::from_slice(&fs::read(&manifest_path).with_context(|| {
-            format!(
-                "failed to read Home capsule manifest {}",
-                manifest_path.display()
-            )
-        })?)
-        .with_context(|| {
-            format!(
-                "failed to parse Home capsule manifest {}",
-                manifest_path.display()
-            )
-        })?;
-    manifest
-        .validate()
-        .map_err(|err| anyhow::anyhow!("invalid {}: {}", manifest_path.display(), err))?;
-    Ok(dir.join(&manifest.entrypoint).is_file())
-}
-
 fn source_capsule_dir(capsule_name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../../capsules")
         .join(capsule_name)
-}
-
-fn prefer_dev_home_capsule() -> bool {
-    std::env::current_exe()
-        .ok()
-        .map(|path| {
-            path.components()
-                .any(|component| component.as_os_str() == "target")
-        })
-        .unwrap_or(false)
 }
 
 async fn dispatch_action(
@@ -4475,7 +4337,7 @@ mod tests {
             home_terminal_host_intent_for_action("open-gui:wallet", &snapshot).unwrap(),
             serde_json::json!({
                 "schema": "elastos.home.terminal-host-intent/v1",
-                "action": "open-target",
+                "action": "switch-shell-open-target",
                 "action_id": "open-gui:wallet",
                 "target": "wallet",
             })
@@ -4552,7 +4414,7 @@ mod tests {
     }
 
     #[test]
-    fn home_terminal_people_message_uses_runtime_contact_route() {
+    fn home_terminal_people_message_stays_in_the_cli_runtime_path() {
         let mut snapshot = sample_snapshot_with_components(&[]);
         snapshot.people.contacts.push(PeopleContactStatus {
             contact_id: "contact-alice".to_string(),
@@ -4563,21 +4425,9 @@ mod tests {
             ..PeopleContactStatus::default()
         });
 
-        let intent =
+        assert!(
             home_terminal_host_intent_for_action("people-message:contact-alice", &snapshot)
-                .unwrap();
-
-        assert_eq!(
-            intent,
-            serde_json::json!({
-                "schema": "elastos.home.terminal-host-intent/v1",
-                "action": "open-target",
-                "action_id": "people-message:contact-alice",
-                "target": "chat-room",
-                "source": "people-contact",
-                "contact_id": "contact-alice",
-                "route": "/apps/chat-room/",
-            })
+                .is_none()
         );
 
         snapshot.people.contacts[0].route = "elastos://peer/peer-alice".to_string();
@@ -4720,7 +4570,7 @@ mod tests {
             intent,
             serde_json::json!({
                 "schema": "elastos.home.terminal-host-intent/v1",
-                "action": "open-target",
+                "action": "switch-shell-open-target",
                 "action_id": "open-gui:browser",
                 "target": "browser",
             })
@@ -4742,7 +4592,7 @@ mod tests {
                 intent,
                 serde_json::json!({
                     "schema": "elastos.home.terminal-host-intent/v1",
-                    "action": "open-target",
+                    "action": "switch-shell-open-target",
                     "action_id": action_id,
                     "target": target,
                 })

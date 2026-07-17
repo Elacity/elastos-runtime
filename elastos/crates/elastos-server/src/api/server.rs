@@ -54,27 +54,6 @@ async fn cross_origin_isolation(
     response
 }
 
-fn is_allowed_local_origin(origin: &HeaderValue) -> bool {
-    let s = match origin.to_str() {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    match url::Url::parse(s) {
-        Ok(url) => matches!(
-            url.host_str(),
-            Some("127.0.0.1") | Some("localhost") | Some("::1") | Some("[::1]")
-        ),
-        Err(_) => false,
-    }
-}
-
-/// Bootstrap state for web capsules (provides token + manifest info to the frontend)
-#[derive(Clone)]
-pub struct CapsuleBootstrapState {
-    pub token: String,
-    pub manifest: elastos_common::CapsuleManifest,
-}
-
 /// Configuration for the full HTTP API server (Phase 5+).
 pub struct ServerConfig {
     pub runtime: Arc<Runtime>,
@@ -90,8 +69,6 @@ pub struct ServerConfig {
     pub capsule_dir: Option<PathBuf>,
     /// Directory containing data capsule files (served at /capsule-data/)
     pub data_dir: Option<PathBuf>,
-    /// Bootstrap state for web capsule auto-configuration
-    pub bootstrap_state: Option<CapsuleBootstrapState>,
     pub tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
     /// Capsule supervisor for VM-based capsule lifecycle (supervisor path only)
     pub supervisor: Option<Arc<crate::supervisor::Supervisor>>,
@@ -141,7 +118,6 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         addr,
         capsule_dir,
         data_dir,
-        bootstrap_state,
         tls_config,
         supervisor,
         ready_tx,
@@ -149,12 +125,11 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         host_helpers,
     } = config;
     let _host_helpers = host_helpers;
-    // CORS: allow localhost origins for browser-based capsule UIs and
-    // local development. Parses the Origin URL and compares the host
-    // to prevent bypass via domains like localhost.evil.com.
+    // Opaque sandboxed capsules send Origin: null. Local loopback origins
+    // remain available for development, but unrelated web origins do not.
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(|origin, _| {
-            is_allowed_local_origin(origin)
+            super::browser_capsules::is_allowed_capsule_origin(origin)
         }))
         .allow_methods(Any)
         .allow_headers(Any);
@@ -452,26 +427,6 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         Router::new()
     };
 
-    // Bootstrap route (no auth — localhost only, returns app token + capsule info)
-    let bootstrap_routes = if let Some(bs) = bootstrap_state {
-        Router::new().route(
-            "/api/capsule/bootstrap",
-            get({
-                let bs = bs.clone();
-                move || async move {
-                    axum::Json(serde_json::json!({
-                        "token": bs.token,
-                        "name": bs.manifest.name,
-                        "rom": bs.manifest.entrypoint,
-                        "storage": bs.manifest.permissions.storage,
-                    }))
-                }
-            }),
-        )
-    } else {
-        Router::new()
-    };
-
     // Capsule management routes (require shell session — launching/stopping is an orchestrator operation)
     let capsule_mgmt_routes = Router::new()
         .route("/api/capsules", get(routes::list_capsules))
@@ -498,7 +453,6 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         .merge(storage_routes)
         .merge(identity_routes)
         .merge(docs_routes)
-        .merge(bootstrap_routes)
         .merge(capsule_mgmt_routes)
         .layer(cors.clone());
 
@@ -572,28 +526,33 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
 
 #[cfg(test)]
 mod tests {
-    use super::is_allowed_local_origin;
+    use super::super::browser_capsules::is_allowed_capsule_origin;
     use axum::http::HeaderValue;
 
     #[test]
     fn allows_local_loopback_origins() {
-        assert!(is_allowed_local_origin(&HeaderValue::from_static(
+        assert!(is_allowed_capsule_origin(&HeaderValue::from_static(
             "http://localhost:3000"
         )));
-        assert!(is_allowed_local_origin(&HeaderValue::from_static(
+        assert!(is_allowed_capsule_origin(&HeaderValue::from_static(
             "http://127.0.0.1:3000"
         )));
-        assert!(is_allowed_local_origin(&HeaderValue::from_static(
+        assert!(is_allowed_capsule_origin(&HeaderValue::from_static(
             "http://[::1]:3000"
         )));
     }
 
     #[test]
+    fn allows_opaque_capsule_origins() {
+        assert!(is_allowed_capsule_origin(&HeaderValue::from_static("null")));
+    }
+
+    #[test]
     fn rejects_non_local_origins() {
-        assert!(!is_allowed_local_origin(&HeaderValue::from_static(
+        assert!(!is_allowed_capsule_origin(&HeaderValue::from_static(
             "http://localhost.evil.com"
         )));
-        assert!(!is_allowed_local_origin(&HeaderValue::from_static(
+        assert!(!is_allowed_capsule_origin(&HeaderValue::from_static(
             "https://example.com"
         )));
     }

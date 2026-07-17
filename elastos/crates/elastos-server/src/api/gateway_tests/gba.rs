@@ -11,6 +11,7 @@ async fn home_content_launch_uses_the_bound_gba_viewer_without_compute() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"gba-ucity"}"#))
@@ -28,19 +29,20 @@ async fn home_content_launch_uses_the_bound_gba_viewer_without_compute() {
     ));
     assert!(launch["status"].is_null());
 
-    let route = url::Url::parse(&format!(
-        "http://localhost{}",
-        launch["route"].as_str().unwrap()
-    ))
-    .unwrap();
-    let token = route
-        .query_pairs()
+    let route = url::Url::parse("http://localhost")
+        .unwrap()
+        .join(launch["route"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(route.host_str(), Some("localhost"));
+    let token = url::form_urlencoded::parse(route.fragment().unwrap().as_bytes())
         .find_map(|(key, value)| (key == "home_token").then(|| value.into_owned()))
         .unwrap();
     let content = app
         .oneshot(
             Request::builder()
                 .uri("/api/viewers/gba-emulator/content/gba-ucity")
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
                 .unwrap(),

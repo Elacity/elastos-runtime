@@ -49,7 +49,11 @@ const LOCAL_EXIT_SUMMARY = "Use this device's Exit Node for Browser traffic.";
 const DEFAULT_ENGINE_LABEL = "Automatic";
 const DEFAULT_ENGINE_SUMMARY = "Use the best Browser Engine available.";
 const params = new URLSearchParams(window.location.search);
-const launchToken = params.get("home_token") || "";
+const launchToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
+const homeParentOrigin = params.get("home_origin") || "";
+if (launchToken && homeParentOrigin && window.top !== window) {
+  window.top.postMessage({ type: "home:app-ready", homeToken: launchToken }, homeParentOrigin);
+}
 const debugMetrics =
   params.get("debug") === "1" || params.get("metrics") === "1";
 const browserInstanceId =
@@ -182,13 +186,13 @@ function requestHomeRelaunch(reason) {
   showStatus(reason || "Browser session expired. Reopening from Home...", {
     sticky: true,
   });
-  window.parent.postMessage(
+  window.top.postMessage(
     {
       type: "home:relaunch-self",
       homeToken: launchToken,
       reason: reason || "browser_authority_expired",
     },
-    window.location.origin,
+    homeParentOrigin,
   );
   return true;
 }
@@ -469,7 +473,7 @@ function openLibraryFilePicker() {
     });
     return false;
   }
-  window.parent.postMessage(
+  window.top.postMessage(
     {
       type: "home:open-target",
       homeToken: launchToken,
@@ -479,7 +483,7 @@ function openLibraryFilePicker() {
         returnTarget: "browser",
       },
     },
-    window.location.origin,
+    homeParentOrigin,
   );
   return true;
 }
@@ -822,7 +826,7 @@ const {
 });
 
 window.addEventListener("message", (event) => {
-  if (event.origin !== window.location.origin || event.source !== window.parent) {
+  if (event.origin !== homeParentOrigin || event.source !== window.top) {
     return;
   }
   const payload = event.data && typeof event.data === "object" ? event.data : null;

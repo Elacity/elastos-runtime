@@ -97,7 +97,18 @@ pub(in crate::api::gateway) async fn approve_wallet_managed_request(
             "fresh passkey verification is required to sign with a built-in wallet"
         ));
     };
-    if let Err(err) = require_fresh_passkey_home_token(&state.data_dir, home_token, context, 180) {
+    if let Err(err) = consume_fresh_passkey_home_token(
+        &state.data_dir,
+        home_token,
+        context,
+        capsule_id,
+        180,
+        "wallet.approve",
+        &serde_json::json!({
+            "request_id": request_id,
+            "reason": input.reason,
+        }),
+    ) {
         return system_error_response(err);
     }
     let reason = input.reason.unwrap_or_else(|| {

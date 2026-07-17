@@ -1563,7 +1563,6 @@ async fn test_browser_personal_sign_queues_wallet_inbox_approval() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/browser/wallet/request-signature")
-                .header("origin", "https://glidefinance.io")
                 .header("x-elastos-home-token", browser_token)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
@@ -1582,13 +1581,6 @@ async fn test_browser_personal_sign_queues_wallet_inbox_approval() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get("access-control-allow-origin")
-            .and_then(|value| value.to_str().ok()),
-        Some("https://glidefinance.io")
-    );
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1675,7 +1667,6 @@ async fn test_browser_typed_data_sign_queues_wallet_inbox_approval() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/browser/wallet/request-signature")
-                .header("origin", "https://ela.city")
                 .header("x-elastos-home-token", browser_token)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -1807,7 +1798,6 @@ async fn test_browser_chain_reads_route_through_chain_provider_without_inbox_app
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/browser/wallet/read")
-                .header("origin", "https://ela.city")
                 .header("x-elastos-home-token", browser_token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -1826,13 +1816,6 @@ async fn test_browser_chain_reads_route_through_chain_provider_without_inbox_app
         .await
         .unwrap();
     assert_eq!(block_response.status(), StatusCode::OK);
-    assert_eq!(
-        block_response
-            .headers()
-            .get("access-control-allow-origin")
-            .and_then(|value| value.to_str().ok()),
-        Some("https://ela.city")
-    );
     let block_body = axum::body::to_bytes(block_response.into_body(), usize::MAX)
         .await
         .unwrap();

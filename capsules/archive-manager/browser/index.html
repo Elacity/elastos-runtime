@@ -679,6 +679,8 @@
 
   <script>
     const params = new URLSearchParams(window.location.search);
+    const homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
+    const homeParentOrigin = params.get("home_origin") || "";
     let objectUri = params.get("objectUri") || params.get("uri") || "";
     const objectName = params.get("name") || objectUri.split("/").pop() || "Archive";
     const launchPolicy = parseArchiveSupport(params.get("archiveSupport"));
@@ -700,12 +702,16 @@
       extracting: false,
     };
 
+    if (homeToken && homeParentOrigin && window.top !== window) {
+      window.top.postMessage({ type: "home:app-ready", homeToken }, homeParentOrigin);
+    }
+
     document.querySelector("#open-existing-archive").addEventListener("click", () => openLibraryPicker("open"));
     document.querySelector("#make-new-archive").addEventListener("click", () => openLibraryPicker("create"));
     document.querySelector("#open-archive-button").addEventListener("click", () => openLibraryPicker("open"));
     document.querySelector("#new-archive-button").addEventListener("click", () => openLibraryPicker("create"));
     window.addEventListener("message", (event) => {
-      if (event.origin !== window.location.origin) return;
+      if (event.origin !== homeParentOrigin || event.source !== window.top) return;
       const data = event.data || {};
       if (data.type !== "archive:open-library-object") return;
       openLibraryObject(data.object).catch((error) => {
@@ -786,22 +792,20 @@
     }
 
     function openLibraryPicker(intent) {
-      const homeToken = params.get("home_token") || "";
       const query = {
         mode: intent === "create" ? "archive-create" : "archive-open",
         returnTarget: "archive-manager",
       };
-      if (homeToken && window.parent && window.parent !== window) {
-        window.parent.postMessage({
+      if (homeToken && homeParentOrigin && window.top && window.top !== window) {
+        window.top.postMessage({
           type: "home:open-target",
           target: "library",
           query,
           homeToken,
-        }, window.location.origin);
+        }, homeParentOrigin);
         return;
       }
       const url = new URL("/apps/library/", window.location.origin);
-      if (homeToken) url.searchParams.set("home_token", homeToken);
       for (const [key, value] of Object.entries(query)) {
         if (value) url.searchParams.set(key, value);
       }
@@ -836,7 +840,7 @@
     }
 
     async function hydrateStatOnly() {
-      const token = params.get("home_token") || "";
+      const token = homeToken;
       if (!token || !objectUri) {
         return;
       }
@@ -862,7 +866,7 @@
     }
 
     async function hydrateArchiveEntries() {
-      const token = params.get("home_token") || "";
+      const token = homeToken;
       if (!token || !objectUri) {
         state.entryStatus = "Opened with launch metadata only.";
         renderEntries();
@@ -905,7 +909,7 @@
     }
 
     async function hydrateDestinationRoots() {
-      const token = params.get("home_token") || "";
+      const token = homeToken;
       if (!token) return;
       const response = await fetch("/api/viewers/archive-manager/library-roots", {
         headers: { "x-elastos-home-token": token },
@@ -930,7 +934,7 @@
     }
 
     async function extractEntries(entries, progressText) {
-      const token = params.get("home_token") || "";
+      const token = homeToken;
       const destinationUri = document.querySelector("#destination-uri").value.trim();
       if (!token || !objectUri) throw new Error("launch token missing");
       if (!destinationUri) throw new Error("destination URI is required");
@@ -981,7 +985,7 @@
       state.previewStatus = "Loading bounded preview...";
       renderEntries();
       renderEntryPreview();
-      const token = params.get("home_token") || "";
+      const token = homeToken;
       if (!token || !objectUri) {
         state.previewStatus = "Launch token missing; preview unavailable.";
         renderEntryPreview();
