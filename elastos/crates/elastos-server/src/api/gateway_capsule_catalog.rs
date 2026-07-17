@@ -15,9 +15,10 @@ mod read_model;
 use bindings::{
     resolve_capsule_method_binding, static_capsule_method_binding, RuntimeCapsuleAffordanceBinding,
 };
-#[cfg(test)]
-pub(super) use read_model::CapsuleCatalogResponse;
-pub(super) use read_model::{capsule_catalog_summary, capsule_interface_registry_summary};
+pub(super) use read_model::{
+    capsule_catalog_summary, capsule_interface_registry_summary, CapsuleCatalogResponse,
+    CapsuleInterfaceRegistryResponse,
+};
 
 const CAPSULE_INTERFACE_INVOKE_RESULT_SCHEMA: &str = "elastos.capsules.invoke-result/v1";
 
@@ -115,11 +116,12 @@ pub(super) async fn capsule_interface_invoke(
     let resolved = match resolve_capsule_affordance(&state.data_dir, &request) {
         Ok(resolved) => resolved,
         Err(err) => {
-            return (
+            return capsule_invoke_request_error(
+                &request,
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": err.to_string() })),
+                "affordance_not_declared",
+                &err.to_string(),
             )
-                .into_response()
         }
     };
 
@@ -131,19 +133,38 @@ pub(super) async fn capsule_interface_invoke(
     ) {
         Ok(value) => value,
         Err(err) => {
-            return (
+            return capsule_invoke_request_error(
+                &request,
                 StatusCode::FORBIDDEN,
-                Json(serde_json::json!({ "error": err.to_string() })),
+                "forbidden",
+                &err.to_string(),
             )
-                .into_response()
         }
     };
 
-    let request_id = format!(
-        "capsule-affordance:{}:{}:{}",
-        resolved.capsule,
-        resolved.method.id,
-        now_ts()
+    let request_id = request.request_id.trim();
+    if request_id.is_empty()
+        || request_id.len() > 160
+        || !request_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.'))
+    {
+        return capsule_invoke_error(
+            &resolved,
+            request_id,
+            StatusCode::BAD_REQUEST,
+            "invalid_request_id",
+            "request_id must be a stable ASCII correlation id",
+        );
+    }
+    let request_binding = crate::esp_binding::esp_request_binding(
+        request_id,
+        &context.principal_id,
+        &resolved.capsule,
+        Some(&resolved.interface_id),
+        &resolved.method.id,
+        resolved.method.resource.iter().cloned(),
+        &request.input,
     );
     let binding =
         resolve_capsule_method_binding(&resolved.method, state.provider_registry.as_deref()).await;
@@ -154,7 +175,7 @@ pub(super) async fn capsule_interface_invoke(
             event_type: "capsule.affordance.requested",
             principal_id: &context.principal_id,
             session_id: &context.session_id,
-            request_id: &request_id,
+            request_id,
             result: "requested",
             reason: &format!(
                 "{} requested {} through {}",
@@ -164,21 +185,49 @@ pub(super) async fn capsule_interface_invoke(
     ) {
         return capsule_invoke_error(
             &resolved,
+            request_id,
             StatusCode::INTERNAL_SERVER_ERROR,
             "audit_failed",
             &err.to_string(),
         );
     }
 
-    let output = if binding.summary.executable {
-        match dispatch_capsule_affordance(
-            &state,
-            &context,
-            &request,
-            binding.runtime_binding.expect("executable Runtime binding"),
-        )
-        .await
-        {
+    let runtime_binding = match (binding.summary.executable, binding.runtime_binding) {
+        (true, Some(runtime_binding)) => runtime_binding,
+        _ => {
+            let approval_required = binding.summary.state == "approval-required";
+            let status = if approval_required {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::NOT_IMPLEMENTED
+            };
+            let code = if approval_required {
+                "approval_required"
+            } else {
+                "affordance_not_bound"
+            };
+            let message = binding
+                .summary
+                .reason
+                .as_deref()
+                .unwrap_or("method is not executable through generic interface invocation");
+            let _ = append_provider_effect_audit(
+                &state.data_dir,
+                ProviderEffectAuditInput {
+                    capsule_id: &resolved.capsule,
+                    event_type: "capsule.affordance.failed",
+                    principal_id: &context.principal_id,
+                    session_id: &context.session_id,
+                    request_id,
+                    result: "failed",
+                    reason: message,
+                },
+            );
+            return capsule_invoke_error(&resolved, request_id, status, code, message);
+        }
+    };
+    let output =
+        match dispatch_capsule_affordance(&state, &context, &request, runtime_binding).await {
             Ok(output) => output,
             Err((status, code, message)) => {
                 let _ = append_provider_effect_audit(
@@ -188,45 +237,14 @@ pub(super) async fn capsule_interface_invoke(
                         event_type: "capsule.affordance.failed",
                         principal_id: &context.principal_id,
                         session_id: &context.session_id,
-                        request_id: &request_id,
+                        request_id,
                         result: "failed",
                         reason: &message,
                     },
                 );
-                return capsule_invoke_error(&resolved, status, code, &message);
+                return capsule_invoke_error(&resolved, request_id, status, code, &message);
             }
-        }
-    } else {
-        let approval_required = binding.summary.state == "approval-required";
-        let status = if approval_required {
-            StatusCode::FORBIDDEN
-        } else {
-            StatusCode::NOT_IMPLEMENTED
         };
-        let code = if approval_required {
-            "approval_required"
-        } else {
-            "affordance_not_bound"
-        };
-        let message = binding
-            .summary
-            .reason
-            .as_deref()
-            .unwrap_or("method is not executable through generic interface invocation");
-        let _ = append_provider_effect_audit(
-            &state.data_dir,
-            ProviderEffectAuditInput {
-                capsule_id: &resolved.capsule,
-                event_type: "capsule.affordance.failed",
-                principal_id: &context.principal_id,
-                session_id: &context.session_id,
-                request_id: &request_id,
-                result: "failed",
-                reason: message,
-            },
-        );
-        return capsule_invoke_error(&resolved, status, code, message);
-    };
 
     if let Err(err) = append_provider_effect_audit(
         &state.data_dir,
@@ -235,13 +253,14 @@ pub(super) async fn capsule_interface_invoke(
             event_type: "capsule.affordance.completed",
             principal_id: &context.principal_id,
             session_id: &context.session_id,
-            request_id: &request_id,
+            request_id,
             result: "completed",
             reason: &format!("Runtime completed {}", resolved.method.id),
         },
     ) {
         return capsule_invoke_error(
             &resolved,
+            request_id,
             StatusCode::INTERNAL_SERVER_ERROR,
             "audit_failed",
             &err.to_string(),
@@ -254,7 +273,8 @@ pub(super) async fn capsule_interface_invoke(
         capsule: resolved.capsule,
         interface: resolved.interface_id,
         method: resolved.method.id,
-        request_id,
+        request_id: request_id.to_string(),
+        request_binding,
         output,
     })
     .into_response()
@@ -464,6 +484,7 @@ fn runtime_launch_failure(launch: Option<&GatewayRuntimeLaunchOutcome>) -> Optio
 
 fn capsule_invoke_error(
     resolved: &ResolvedCapsuleAffordance,
+    request_id: &str,
     status: StatusCode,
     code: &str,
     message: &str,
@@ -478,6 +499,29 @@ fn capsule_invoke_error(
             "capsule": resolved.capsule,
             "interface": resolved.interface_id,
             "method": resolved.method.id,
+            "request_id": request_id,
+        })),
+    )
+        .into_response()
+}
+
+fn capsule_invoke_request_error(
+    request: &CapsuleInterfaceInvokeRequest,
+    status: StatusCode,
+    code: &str,
+    message: &str,
+) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "schema": CAPSULE_INTERFACE_INVOKE_RESULT_SCHEMA,
+            "status": "error",
+            "code": code,
+            "message": message,
+            "capsule": request.capsule,
+            "interface": request.interface,
+            "method": request.method,
+            "request_id": request.request_id,
         })),
     )
         .into_response()
@@ -486,6 +530,7 @@ fn capsule_invoke_error(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct CapsuleInterfaceInvokeRequest {
+    request_id: String,
     capsule: String,
     interface: String,
     method: String,
@@ -501,6 +546,7 @@ struct CapsuleInterfaceInvokeResponse {
     interface: String,
     method: String,
     request_id: String,
+    request_binding: crate::esp_binding::EspRequestBinding,
     output: serde_json::Value,
 }
 
@@ -1192,6 +1238,7 @@ mod tests {
         );
 
         let request = CapsuleInterfaceInvokeRequest {
+            request_id: "test-request-1".to_string(),
             capsule: "marketplace".to_string(),
             interface: "elastos.marketplace.catalog".to_string(),
             method: "catalog.list".to_string(),
@@ -1321,6 +1368,7 @@ mod tests {
             State(state.clone()),
             headers.clone(),
             Json(CapsuleInterfaceInvokeRequest {
+                request_id: "test-runtime-request".to_string(),
                 capsule: "marketplace".to_string(),
                 interface: "elastos.marketplace.catalog".to_string(),
                 method: "catalog.list".to_string(),
@@ -1334,6 +1382,7 @@ mod tests {
             State(state),
             headers,
             Json(CapsuleInterfaceInvokeRequest {
+                request_id: "test-provider-request".to_string(),
                 capsule: "marketplace".to_string(),
                 interface: "elastos.marketplace.catalog".to_string(),
                 method: "chain.status".to_string(),
@@ -1367,6 +1416,7 @@ mod tests {
     #[test]
     fn capsule_interface_invoke_request_rejects_hidden_authority_fields() {
         let err = serde_json::from_value::<CapsuleInterfaceInvokeRequest>(serde_json::json!({
+            "request_id": "test-hidden-authority",
             "capsule": "marketplace",
             "interface": "elastos.marketplace.catalog",
             "method": "catalog.list",

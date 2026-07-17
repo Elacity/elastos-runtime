@@ -432,6 +432,34 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
         .unwrap()
         .iter()
         .any(|target| target["target"] == "system"));
+    assert_eq!(
+        public_payload["capsule_catalog"]["schema"],
+        "elastos.capsules.catalog/v1"
+    );
+    assert_eq!(
+        public_payload["capsule_interfaces"]["schema"],
+        "elastos.capsules.interfaces/v1"
+    );
+    let catalog_capsules = public_payload["capsule_catalog"]["capsules"]
+        .as_array()
+        .unwrap();
+    for target in public_payload["targets"].as_array().unwrap() {
+        if target["target"] == HOME_PEOPLE_TARGET_ID {
+            assert_eq!(target["route"], "home://people");
+            assert_eq!(target["attach_kind"], "home");
+            continue;
+        }
+        let capsule = catalog_capsules
+            .iter()
+            .find(|capsule| capsule["launch_target"] == target["target"])
+            .expect("Home target must come from the canonical capsule catalog");
+        assert_eq!(target["title"], capsule["title"]);
+        assert_eq!(target["description"], capsule["description"]);
+        assert_eq!(target["route"], capsule["route"]);
+        assert_eq!(target["role"], capsule["role"]);
+        assert_eq!(target["viewer"], capsule["viewer"]);
+        assert_eq!(target["viewer_title"], capsule["viewer_title"]);
+    }
 
     let resp = app
         .clone()
@@ -516,7 +544,7 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     assert_eq!(system["title"], "System");
     assert_eq!(
         system["description"],
-        "Manage passkeys, appearance, and runtime settings for this Home."
+        "Manage passkeys, appearance, and Home settings."
     );
     assert_eq!(system["route"], "/apps/system/");
     assert_eq!(system["attach_kind"], "iframe");
@@ -558,7 +586,7 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     assert_eq!(inbox["title"], "Inbox");
     assert_eq!(
         inbox["description"],
-        "Review requests and approvals for this Home."
+        "Review messages, requests, and approvals."
     );
     assert_eq!(inbox["route"], "/apps/inbox/");
     assert_eq!(inbox["attach_kind"], "iframe");
@@ -582,10 +610,7 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
         .expect("browser target");
     assert_eq!(browser["role"], "app");
     assert_eq!(browser["title"], "Browser");
-    assert_eq!(
-        browser["description"],
-        "Open web sites through the ElastOS Browser boundary."
-    );
+    assert_eq!(browser["description"], "Browse websites from this device.");
     assert_eq!(browser["route"], "/apps/browser/");
     assert_eq!(browser["attach_kind"], "iframe");
     assert_eq!(browser["target_kind"], "app");
@@ -598,6 +623,18 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     assert!(targets
         .iter()
         .all(|target| target["target"] != "wallet-walletconnect"));
+    assert!(targets
+        .iter()
+        .all(|target| target["target"] != "marketplace"));
+    let active_capsules = crate::api::capsule_inventory::list_active_capsule_manifests(dir.path())
+        .into_iter()
+        .map(|manifest| manifest.name)
+        .collect::<BTreeSet<_>>();
+    assert!(targets.iter().all(|target| {
+        target["target"]
+            .as_str()
+            .is_some_and(|name| name == HOME_PEOPLE_TARGET_ID || active_capsules.contains(name))
+    }));
     assert!(targets
         .iter()
         .any(|target| target["target"] == "gba-ucity" && target["target_kind"] == "object"));
@@ -902,6 +939,92 @@ async fn test_services_selection_state_is_principal_scoped() {
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["local_offer_count"], 1);
     assert!(!dir.path().join("config/services-state.json").exists());
+}
+
+#[tokio::test]
+async fn test_home_summary_ignores_services_state_left_unencrypted_before_root_protection() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("config")).unwrap();
+    std::fs::write(dir.path().join("config/exit-provider.json"), "{}").unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("alice"));
+    let app = gateway_router(test_state(dir.path()));
+    let services_token = app_token_for_authority(dir.path(), SERVICES_CAPSULE_ID, &authority);
+
+    let selected = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/services/offers")
+                .header("x-elastos-home-token", services_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"offer_id":"local:provider:browser-exit","section":"mine","selected":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.status(), StatusCode::OK);
+
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+
+    let summary = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/apps/home/summary")
+                .header("x-elastos-home-token", authority.home_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(summary.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["services"]["local_offer_count"], 0);
+}
+
+#[tokio::test]
+async fn test_home_summary_ignores_invalid_protected_services_state() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("config")).unwrap();
+    std::fs::write(dir.path().join("config/exit-provider.json"), "{}").unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("alice"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let object_uri = format!("{localhost_root}/.AppData/ElastOS/Home/services-state.json");
+    let path = rooted_localhost_fs_path(dir.path(), &object_uri).unwrap();
+    crate::auth::write_principal_root_object(
+        dir.path(),
+        &authority.principal_id,
+        &localhost_root,
+        &object_uri,
+        &path,
+        b"{not-json",
+    )
+    .unwrap();
+
+    let app = gateway_router(test_state(dir.path()));
+    let summary = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/apps/home/summary")
+                .header("x-elastos-home-token", authority.home_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(summary.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["services"]["local_offer_count"], 0);
 }
 
 #[tokio::test]
@@ -3744,21 +3867,8 @@ async fn test_system_summary_reports_identity_and_app_id() {
         .as_str()
         .unwrap()
         .contains("No trusted source configured"));
-    assert_eq!(payload["storage"]["available"], false);
-    assert_eq!(payload["storage"]["note"], "Document provider unavailable.");
-    let webspace_entries = payload["webspace"]["entries"].as_array().unwrap();
-    assert!(webspace_entries.iter().any(|entry| {
-        entry["id"] == "system"
-            && entry["role"] == "app"
-            && entry["uri"] == "elastos://capsules/system"
-            && entry["route"] == "/apps/system/"
-    }));
-    assert!(webspace_entries.iter().any(|entry| {
-        entry["id"] == "wallet-provider"
-            && entry["role"] == "provider"
-            && entry["uri"] == "elastos://wallet/*"
-            && entry["backend"] == "Wallet authority provider"
-    }));
+    assert!(payload.get("storage").is_none());
+    assert!(payload.get("webspace").is_none());
     assert!(payload.get("instance").is_none());
     assert_eq!(payload["runtime_log"]["available"], false);
 }
@@ -3915,53 +4025,6 @@ async fn test_system_guest_registration_requires_admin_passkey() {
         .as_str()
         .unwrap()
         .starts_with("localhost://Users/"));
-}
-
-#[tokio::test]
-async fn test_system_summary_reports_storage_counts_when_documents_available() {
-    let dir = tempfile::tempdir().unwrap();
-    let app = gateway_router(documents_test_state(dir.path()).await);
-    let token = issue_home_launch_token(dir.path(), DOCUMENTS_CAPSULE_ID).unwrap();
-
-    let created = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/provider/documents/create")
-                .header("x-elastos-home-token", token)
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"title":"System Storage Test"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(created.status(), StatusCode::OK);
-
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/apps/system/summary")
-                .header("x-elastos-home-token", system_app_token(dir.path()))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["storage"]["available"], true);
-    assert_eq!(payload["storage"]["documents_count"], 1);
-    assert_eq!(payload["storage"]["drafts_count"], 1);
-    assert_eq!(payload["storage"]["published_count"], 0);
-    assert_eq!(
-        payload["storage"]["objects_root"],
-        "localhost://ElastOS/Documents/"
-    );
 }
 
 #[test]
@@ -4236,6 +4299,25 @@ async fn test_people_profile_card_update_uses_home_session_token() {
 #[tokio::test]
 async fn test_home_launch_validates_shell_targets() {
     let dir = tempfile::tempdir().unwrap();
+    write_test_browser_capsule(
+        dir.path(),
+        "projection-app",
+        "app",
+        "Runtime-backed browser projection",
+        None,
+    );
+    let projection_manifest_path = dir.path().join("capsules/projection-app/capsule.json");
+    let mut projection_manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&projection_manifest_path).unwrap()).unwrap();
+    projection_manifest["runtime_abi"] = serde_json::json!("elastos.runtime-projection/v1");
+    projection_manifest["bus_contract"] = serde_json::json!("elastos.runtime-projection/v1");
+    projection_manifest["execution"] = serde_json::json!("web-projection");
+    projection_manifest["projections"] = serde_json::json!(["web"]);
+    std::fs::write(
+        projection_manifest_path,
+        serde_json::to_vec_pretty(&projection_manifest).unwrap(),
+    )
+    .unwrap();
     let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
     let _runtime = start_fake_runtime(dir.path(), bus, "launch-peer").await;
     let app = gateway_router(test_state(dir.path()));
@@ -4308,6 +4390,32 @@ async fn test_home_launch_validates_shell_targets() {
         .as_str()
         .unwrap_or_default()
         .starts_with("/apps/library/?home_token="));
+
+    let projection = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/launch")
+                .header("x-elastos-home-token", home_app_token(dir.path()))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"target":"projection-app"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(projection.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(projection.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["target"], "projection-app");
+    assert!(payload["launch_status"].is_null());
+    assert!(payload["capsule_id"].is_null());
+    assert!(payload["route"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("/apps/projection-app/?home_token="));
 
     let hidden_connector = app
         .clone()

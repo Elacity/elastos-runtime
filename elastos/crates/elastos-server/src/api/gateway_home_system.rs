@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context as _;
-use elastos_common::{CapsuleManifest, CapsuleRole};
+use elastos_common::CapsuleRole;
 
 use super::*;
 
@@ -33,7 +33,6 @@ const HOME_PEOPLE_DISCOVERY_PRESENCE_INTERVAL_SECS: u64 = 15;
 const HOME_PEOPLE_DISCOVERY_REFRESH_FAST_MS: u64 = 3_000;
 const HOME_PEOPLE_DISCOVERY_REFRESH_SEARCH_MS: u64 = 5_000;
 const HOME_PEOPLE_DISCOVERY_REFRESH_IDLE_MS: u64 = 30_000;
-const HOME_PEOPLE_TARGET_ID: &str = "people";
 const HOME_SERVICES_STATE_SCHEMA: &str = "elastos.services.state/v1";
 const HOME_SERVICES_STATE_MAX_BYTES: usize = 32 * 1024;
 const HOME_SERVICES_REQUESTS_SCHEMA: &str = "elastos.services.requests/v1";
@@ -346,6 +345,14 @@ pub(super) async fn home_summary(
         append_home_service_access_notifications(&state.data_dir, context, &mut notifications);
     }
 
+    let capsule_catalog = capsule_catalog_summary(&state.data_dir);
+    let targets = home_targets_from_catalog(&capsule_catalog);
+    let capsule_interfaces = capsule_interface_registry_summary_with_bindings(
+        &state.data_dir,
+        state.provider_registry.as_deref(),
+    )
+    .await;
+
     Json(HomeSummaryResponse {
         home: HomeRouteInfo {
             route: HOME_ROUTE.to_string(),
@@ -367,7 +374,9 @@ pub(super) async fn home_summary(
         services: home_state.services,
         notifications,
         desktop_objects,
-        targets: home_targets(&state.data_dir),
+        capsule_catalog,
+        capsule_interfaces,
+        targets,
     })
     .into_response()
 }
@@ -960,19 +969,37 @@ fn home_services_selection_state(
     if !path.is_file() {
         return Ok(default_state);
     };
-    let raw = crate::auth::read_principal_root_object(
+    let raw = match crate::auth::read_principal_root_object(
         data_dir,
         &default_state.principal_id,
         &default_state.localhost_root,
         &home_services_selection_state_uri(context),
         &path,
-    )
-    .with_context(|| format!("could not read {}", path.display()))?;
+    ) {
+        Ok(raw) => raw,
+        Err(err) if is_unencrypted_principal_root_state(&err) => return Ok(default_state),
+        Err(err) if is_missing_principal_root_state_file(&err) => return Ok(default_state),
+        Err(err) => return Err(err).with_context(|| format!("could not read {}", path.display())),
+    };
     if raw.len() > HOME_SERVICES_STATE_MAX_BYTES {
-        anyhow::bail!("Services state is too large");
+        tracing::warn!(
+            path = %path.display(),
+            bytes = raw.len(),
+            "ignored oversized Home services state"
+        );
+        return Ok(default_state);
     }
-    let mut state: HomeServicesSelectionState = serde_json::from_slice(&raw)
-        .with_context(|| format!("invalid Services state at {}", path.display()))?;
+    let mut state: HomeServicesSelectionState = match serde_json::from_slice(&raw) {
+        Ok(state) => state,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "ignored invalid Home services state"
+            );
+            return Ok(default_state);
+        }
+    };
     if state.principal_id != default_state.principal_id
         || state.localhost_root != default_state.localhost_root
     {
@@ -980,6 +1007,13 @@ fn home_services_selection_state(
     }
     if state.schema.trim().is_empty() {
         state.schema = HOME_SERVICES_STATE_SCHEMA.to_string();
+    } else if state.schema != HOME_SERVICES_STATE_SCHEMA {
+        tracing::warn!(
+            path = %path.display(),
+            schema = %state.schema,
+            "ignored unsupported Home services state schema"
+        );
+        return Ok(default_state);
     }
     Ok(state)
 }
@@ -2755,8 +2789,8 @@ fn home_active_shell_state(
         &path,
     ) {
         Ok(bytes) => bytes,
-        Err(err) if is_unencrypted_home_browser_state(&err) => return Ok(None),
-        Err(err) if is_missing_home_browser_state_file(&err) => return Ok(None),
+        Err(err) if is_unencrypted_principal_root_state(&err) => return Ok(None),
+        Err(err) if is_missing_principal_root_state_file(&err) => return Ok(None),
         Err(err) => return Err(err),
     };
     if bytes.len() > HOME_ACTIVE_SHELL_MAX_BYTES {
@@ -3069,10 +3103,10 @@ fn home_browser_state(
         &path,
     ) {
         Ok(bytes) => bytes,
-        Err(err) if is_unencrypted_home_browser_state(&err) => {
+        Err(err) if is_unencrypted_principal_root_state(&err) => {
             return Ok(default_home_browser_state(context));
         }
-        Err(err) if is_missing_home_browser_state_file(&err) => {
+        Err(err) if is_missing_principal_root_state_file(&err) => {
             return Ok(default_home_browser_state(context));
         }
         Err(err) => return Err(err),
@@ -3117,7 +3151,7 @@ fn home_browser_state(
     Ok(state)
 }
 
-fn is_unencrypted_home_browser_state(err: &anyhow::Error) -> bool {
+fn is_unencrypted_principal_root_state(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
             .to_string()
@@ -3125,7 +3159,7 @@ fn is_unencrypted_home_browser_state(err: &anyhow::Error) -> bool {
     })
 }
 
-fn is_missing_home_browser_state_file(err: &anyhow::Error) -> bool {
+fn is_missing_principal_root_state_file(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
             .downcast_ref::<std::io::Error>()
@@ -3211,10 +3245,10 @@ fn home_people_contacts_state(
         &path,
     ) {
         Ok(bytes) => bytes,
-        Err(err) if is_unencrypted_home_browser_state(&err) => {
+        Err(err) if is_unencrypted_principal_root_state(&err) => {
             return Ok(default_home_people_contacts_state(context));
         }
-        Err(err) if is_missing_home_browser_state_file(&err) => {
+        Err(err) if is_missing_principal_root_state_file(&err) => {
             return Ok(default_home_people_contacts_state(context));
         }
         Err(err) => return Err(err),
@@ -3498,10 +3532,10 @@ fn home_people_removed_contacts(
         &path,
     ) {
         Ok(bytes) => bytes,
-        Err(err) if is_unencrypted_home_browser_state(&err) => {
+        Err(err) if is_unencrypted_principal_root_state(&err) => {
             return Ok(default_home_people_removed_contacts(context));
         }
-        Err(err) if is_missing_home_browser_state_file(&err) => {
+        Err(err) if is_missing_principal_root_state_file(&err) => {
             return Ok(default_home_people_removed_contacts(context));
         }
         Err(err) => return Err(err),
@@ -3605,10 +3639,10 @@ fn home_people_discovery_state(
         &path,
     ) {
         Ok(bytes) => bytes,
-        Err(err) if is_unencrypted_home_browser_state(&err) => {
+        Err(err) if is_unencrypted_principal_root_state(&err) => {
             return Ok(default_home_people_discovery_state(context));
         }
-        Err(err) if is_missing_home_browser_state_file(&err) => {
+        Err(err) if is_missing_principal_root_state_file(&err) => {
             return Ok(default_home_people_discovery_state(context));
         }
         Err(err) => return Err(err),
@@ -4876,17 +4910,12 @@ pub(super) async fn system_summary(
             Err(err) => return system_error_response(err),
         };
 
-    let (runtime, storage, wallet_accounts, wallet_approvals, runtime_log) = tokio::join!(
+    let (runtime, wallet_accounts, wallet_approvals, runtime_log) = tokio::join!(
         home_runtime_summary(&state.data_dir),
-        system_storage_summary(
-            state.provider_registry.as_ref().cloned(),
-            &context.principal_id
-        ),
         system_wallet_accounts_summary(&state, &context.principal_id),
         system_wallet_approvals_summary(&state, &context.principal_id, false),
         system_runtime_log(&state.data_dir)
     );
-    let webspace = system_webspace_summary(&state.data_dir, &runtime);
     Json(SystemSummaryResponse {
         identity: load_gateway_identity_summary_for_context(&state.data_dir, &context),
         authority: home_authority_summary(&context),
@@ -4905,8 +4934,6 @@ pub(super) async fn system_summary(
         },
         source: system_source_summary(&state.data_dir, &runtime),
         runtime,
-        storage,
-        webspace,
         wallet_accounts,
         wallet_approvals,
         runtime_log,
@@ -5070,136 +5097,6 @@ mod source_summary_tests {
     }
 }
 
-fn system_webspace_summary(
-    data_dir: &std::path::Path,
-    runtime: &HomeRuntimeSummary,
-) -> SystemWebspaceSummary {
-    let running = runtime
-        .running_capsules
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let mut entries = crate::api::capsule_inventory::list_capsule_manifests(data_dir)
-        .into_iter()
-        .map(|manifest| {
-            let role = manifest.role.as_str().to_string();
-            let capsule_type = capsule_type_label(&manifest.capsule_type).to_string();
-            let provides = manifest.provides.clone();
-            let uri = provides
-                .clone()
-                .unwrap_or_else(|| format!("elastos://capsules/{}", manifest.name));
-            let operations = manifest
-                .authority
-                .as_ref()
-                .map(|authority| {
-                    let mut operations = authority
-                        .capabilities
-                        .iter()
-                        .flat_map(|capability| capability.operations.iter().cloned())
-                        .collect::<BTreeSet<_>>();
-                    if operations.is_empty() {
-                        operations.insert("capability-gated".to_string());
-                    }
-                    operations.into_iter().collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let route = if manifest.role.is_shell_launchable() {
-                Some(format!("/apps/{}/", manifest.name))
-            } else {
-                None
-            };
-            let is_running = running.contains(&manifest.name);
-            let status = system_webspace_status(&manifest, is_running).to_string();
-            let backend = system_webspace_backend(&manifest).to_string();
-            let authority_boundary = system_webspace_boundary(&manifest);
-            SystemWebspaceEntry {
-                id: manifest.name.clone(),
-                role,
-                capsule_type,
-                uri,
-                provides,
-                capabilities: manifest.capabilities,
-                operations,
-                route,
-                running: is_running,
-                status,
-                backend,
-                authority_boundary,
-            }
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by(|left, right| {
-        system_webspace_sort_rank(&left.role, &left.id)
-            .cmp(&system_webspace_sort_rank(&right.role, &right.id))
-    });
-    SystemWebspaceSummary { entries }
-}
-
-fn system_webspace_sort_rank(role: &str, id: &str) -> (u8, String) {
-    let rank = match role {
-        "shell" => 0,
-        "app" => 1,
-        "viewer" => 2,
-        "provider" => 3,
-        "content" => 4,
-        _ => 5,
-    };
-    (rank, id.to_string())
-}
-
-fn capsule_type_label(capsule_type: &CapsuleType) -> &'static str {
-    match capsule_type {
-        CapsuleType::Wasm => "wasm",
-        CapsuleType::MicroVM => "microvm",
-        CapsuleType::Oci => "oci",
-        CapsuleType::Media => "media",
-        CapsuleType::Data => "data",
-    }
-}
-
-fn system_webspace_status(manifest: &CapsuleManifest, running: bool) -> &'static str {
-    if running {
-        return "running";
-    }
-    if manifest.role == CapsuleRole::Provider {
-        return "available";
-    }
-    "installed"
-}
-
-fn system_webspace_backend(manifest: &CapsuleManifest) -> &'static str {
-    if manifest.role != CapsuleRole::Provider {
-        return "capsule";
-    }
-    let provides = manifest.provides.as_deref().unwrap_or_default();
-    if provides.starts_with("elastos://browser-engine/") {
-        "Browser Engine provider"
-    } else if provides.starts_with("elastos://net/") || provides.starts_with("elastos://exit/") {
-        "Net/Exit provider"
-    } else if provides.starts_with("elastos://wallet/") {
-        "Wallet authority provider"
-    } else if provides.starts_with("elastos://chain/") {
-        "Typed chain provider"
-    } else if provides.starts_with("elastos://ipfs/")
-        || provides.starts_with("elastos://availability/")
-        || provides.starts_with("localhost://WebSpaces/")
-    {
-        "Content/Webspace provider"
-    } else {
-        "provider"
-    }
-}
-
-fn system_webspace_boundary(manifest: &CapsuleManifest) -> String {
-    if let Some(authority) = manifest.authority.as_ref() {
-        return authority.reason.clone();
-    }
-    if manifest.role == CapsuleRole::Provider {
-        return "Provider capsule: concrete backend access stays behind the declared URI and capability schema.".to_string();
-    }
-    "User-facing capsule: Runtime grants scoped launch/capability access; raw provider authority stays outside the app.".to_string()
-}
-
 fn system_access_summary(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
@@ -5254,51 +5151,6 @@ pub(super) async fn system_guest_registration_update(
     match crate::auth::set_guest_registration_enabled(&state.data_dir, req.enabled, now_ts()) {
         Ok(_) => Json(system_access_summary(&state.data_dir, &context)).into_response(),
         Err(err) => system_error_response(err),
-    }
-}
-
-pub(super) async fn system_storage_summary(
-    provider_registry: Option<Arc<ProviderRegistry>>,
-    principal_id: &str,
-) -> SystemStorageSummary {
-    let Some(registry) = provider_registry else {
-        return SystemStorageSummary {
-            available: false,
-            note: Some("Document provider unavailable.".to_string()),
-            ..SystemStorageSummary::default()
-        };
-    };
-    match DocumentsClient::for_principal(registry, principal_id)
-        .summary()
-        .await
-    {
-        Ok(documents) => {
-            let published_count = documents
-                .iter()
-                .filter(|item| {
-                    !item
-                        .latest_published_cid
-                        .as_deref()
-                        .unwrap_or("")
-                        .trim()
-                        .is_empty()
-                })
-                .count();
-            let documents_count = documents.len();
-            SystemStorageSummary {
-                available: true,
-                documents_count,
-                drafts_count: documents_count.saturating_sub(published_count),
-                published_count,
-                objects_root: Some("localhost://ElastOS/Documents/".to_string()),
-                note: Some("Documents stay local until published.".to_string()),
-            }
-        }
-        Err(err) => SystemStorageSummary {
-            available: false,
-            note: Some(err.to_string()),
-            ..SystemStorageSummary::default()
-        },
     }
 }
 

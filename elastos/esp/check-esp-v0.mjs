@@ -4,6 +4,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  ESP_AUTHORITY_INVARIANTS,
   ESP_FACT_DESCRIPTORS,
   ESP_FACT_OPERATIONS,
   ESP_PROTOCOL,
@@ -20,6 +21,7 @@ const read = (path) => readFileSync(resolve(repoRoot, path), "utf8");
 const espTypes = read("elastos/esp/esp_v0.ts");
 const helperFiles = [
   "elastos/esp/audit_views.ts",
+  "elastos/esp/authority.ts",
   "elastos/esp/capsule_detail.ts",
   "elastos/esp/consent.ts",
   "elastos/esp/custody.ts",
@@ -69,6 +71,12 @@ const parseDocSupportedSchemas = () => {
   assert.notEqual(start, -1, "ESP docs must include supported_schemas section");
   const section = docs.slice(start + marker.length).split(/\n## /)[0];
   return [...section.matchAll(/^- `([^`]+)`/gm)].map((match) => match[1]);
+};
+
+const parseDocAuthorityInvariants = () => {
+  const match = docs.match(/## Trust And Authority Invariants\n([\s\S]*?)(?:\n## |$)/);
+  assert.ok(match, "ESP docs must include Trust And Authority Invariants");
+  return [...match[1].matchAll(/^- (.+)$/gm)].map((entry) => entry[1]);
 };
 
 const parseMarkdownTable = (sectionTitle) => {
@@ -132,6 +140,19 @@ assert.deepEqual(
   servedSchemas,
   "ESP docs supported_schemas must match the served Runtime descriptor",
 );
+const servedInvariants = [
+  ...rustConstArray(gatewayEsp, "INVARIANTS").matchAll(/"([^"]+)"/g),
+].map((match) => match[1]);
+assert.deepEqual(
+  ESP_AUTHORITY_INVARIANTS,
+  servedInvariants.slice(-ESP_AUTHORITY_INVARIANTS.length),
+  "ESP TypeScript authority invariants must match the served Runtime descriptor",
+);
+assert.deepEqual(
+  parseDocAuthorityInvariants(),
+  ESP_AUTHORITY_INVARIANTS,
+  "ESP docs authority invariants must match the served Runtime descriptor",
+);
 
 const servedFacts = parseRustStructArray("FACTS", "EspFact", [
   "family",
@@ -157,7 +178,7 @@ assert.deepEqual(
 );
 assert.deepEqual(
   ESP_FACT_DESCRIPTORS,
-  servedFactDescriptors,
+  servedFacts,
   "ESP TypeScript fact descriptors must match the served Runtime descriptor",
 );
 assert.deepEqual(
@@ -182,7 +203,7 @@ const servedVerbs = parseRustStructArray("VERBS", "EspVerb", [
 ]);
 assert.deepEqual(
   ESP_VERB_DESCRIPTORS,
-  servedVerbs.map(({ name, method, route }) => ({ name, method, route })),
+  servedVerbs,
   "ESP TypeScript verb descriptors must match the served Runtime descriptor",
 );
 assert.deepEqual(
@@ -225,7 +246,8 @@ for (const needle of [
   "export interface InspectObjectProjection",
   "export interface InspectGatePreview",
   "export interface InspectActionRequestResponse",
-  "export interface InspectRequestBinding",
+  "export interface InspectActionResult",
+  "export interface EspRequestBinding",
   "export interface InspectDispatchResult",
   "export interface CapsuleInterfaceInvokeRequest",
   "export interface InboxActionRequest",
@@ -274,6 +296,7 @@ for (const needle of ["absent", "incomplete", "degraded", "never signed", "not b
 
 for (const path of [
   "./audit_views.ts",
+  "./authority.ts",
   "./capsule_detail.ts",
   "./consent.ts",
   "./custody.ts",
@@ -282,6 +305,12 @@ for (const path of [
   "./trust.ts",
 ]) {
   assert.ok(read("elastos/esp/index.ts").includes(path), `index must export ${path}`);
+  const subpath = path.slice(0, -3);
+  assert.equal(
+    packageJson.exports[subpath],
+    path,
+    `package exports must expose ${subpath}`,
+  );
 }
 
 for (const forbidden of [
@@ -292,6 +321,11 @@ for (const forbidden of [
   "RequestCapabilityInput",
   "ValidateAndConsume",
   "validate-and-consume",
+  "Mandate",
+  "mandate",
+  "ReachScore",
+  "reach_score",
+  "reach score",
   "standing grant",
   "shell marketplace",
   "EventSource",
@@ -304,7 +338,7 @@ for (const forbidden of [
 ]) {
   assert.ok(
     !espTypes.includes(forbidden),
-    `ESP type package must not include unsupported Flint surface: ${forbidden}`,
+    `ESP type package must not include unsupported future authority surface: ${forbidden}`,
   );
 }
 
@@ -315,6 +349,27 @@ assert.ok(
 assert.ok(
   docs.includes("A future Carrier adapter may expose the"),
   "ESP docs must preserve the future Carrier same-schema/same-gate boundary",
+);
+assert.ok(
+  docs.includes('requires both `executable: true` and a concrete') &&
+    docs.includes('`handler_kind: "runtime"` binding') &&
+    docs.includes("Provider-path-only, unbound, unknown, and approval-required operations fail"),
+  "ESP docs must describe the concrete executable Runtime binding gate",
+);
+for (const needle of [
+  "ESP_AUTHORITY_INVARIANTS",
+  "export interface CapsuleMethodBindingSummary",
+  "executable_methods: number",
+  "bindings: CapsuleMethodBindingSummary[]",
+  'status: "ok"',
+  'status: "error"',
+]) {
+  assert.ok(espTypes.includes(needle), `ESP types must include served invocation shape ${needle}`);
+}
+assert.ok(
+  gatewayCatalog.includes("match (binding.summary.executable, binding.runtime_binding)") &&
+    gatewayCatalog.includes("(true, Some(runtime_binding)) => runtime_binding"),
+  "generic invocation must require an executable projection and concrete Runtime binding",
 );
 
 console.log("PASS esp v0 type package check");

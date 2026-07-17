@@ -2,8 +2,10 @@ import type {
   InspectDispatchResult,
   InspectGatePreview,
   InspectObjectProjection,
+  EspRequestBinding,
   JsonValue,
 } from "./esp_v0.ts";
+import { requestBindingView } from "./consent.ts";
 
 export type AuditState = "absent" | "clean" | "denied" | "attested";
 
@@ -65,9 +67,14 @@ export interface DispatchResultAuditView {
   audit_events: string[];
   approved_execution: boolean;
   provider_status: string | null;
+  request_id: string;
+  request_bound: boolean;
 }
 
-export function dispatchResultAuditView(result: InspectDispatchResult): DispatchResultAuditView {
+export function dispatchResultAuditView(
+  result: InspectDispatchResult,
+  expected?: EspRequestBinding,
+): DispatchResultAuditView {
   const response =
     typeof result.provider_response === "object" &&
     result.provider_response !== null &&
@@ -79,13 +86,79 @@ export function dispatchResultAuditView(result: InspectDispatchResult): Dispatch
     result.execution?.mode === "approved_dispatch" &&
     result.execution?.approval_surface === "inbox";
   const provider_status = typeof status === "string" ? status : null;
+  const binding = result.request_binding;
+  const bindingView = requestBindingView(binding);
+  const capabilityResources = Array.isArray(result.capabilities)
+    ? result.capabilities
+        .map((capability) => capability?.resource)
+        .filter((resource): resource is string => typeof resource === "string")
+        .sort()
+    : [];
+  const bindingResources = Array.isArray(binding?.resources)
+    ? binding.resources.filter((resource): resource is string => typeof resource === "string").sort()
+    : [];
+  const expectedMatches = expected === undefined || requestBindingsEqual(binding, expected);
+  const transfer =
+    typeof response._runtime_transfer === "object" &&
+    response._runtime_transfer !== null &&
+    !Array.isArray(response._runtime_transfer)
+      ? response._runtime_transfer
+      : {};
+  const runtimeReceiptMatches =
+    transfer.schema === "elastos.provider.transfer/v1" &&
+    transfer.source === "inspect" &&
+    transfer.target === result.target &&
+    transfer.op === result.operation &&
+    transfer.status === "completed";
+  const request_bound =
+    bindingView.state === "bound" &&
+    binding.capsule === result.id &&
+    binding.interface === null &&
+    binding.method === result.operation &&
+    JSON.stringify(bindingResources) === JSON.stringify([...new Set(capabilityResources)]) &&
+    expectedMatches &&
+    runtimeReceiptMatches;
   return {
-    state: approved_execution && provider_status === "ok" ? "approved" : "degraded",
+    state: approved_execution && provider_status === "ok" && request_bound ? "approved" : "degraded",
     operation: result.operation,
     target: result.target,
     capability_count: result.capabilities.length,
     audit_events: result.audit_events,
     approved_execution,
     provider_status,
+    request_id: typeof binding?.request_id === "string" ? binding.request_id : "",
+    request_bound,
   };
+}
+
+function requestBindingsEqual(
+  left: EspRequestBinding | null | undefined,
+  right: EspRequestBinding | null | undefined,
+): boolean {
+  return (
+    left?.schema === right?.schema &&
+    left?.request_id === right?.request_id &&
+    left?.principal === right?.principal &&
+    left?.capsule === right?.capsule &&
+    left?.interface === right?.interface &&
+    left?.method === right?.method &&
+    JSON.stringify(left?.resources) === JSON.stringify(right?.resources) &&
+    left?.sha256 === right?.sha256 &&
+    left?.bytes === right?.bytes &&
+    left?.truncated === right?.truncated &&
+    canonicalJson(left?.preview) === canonicalJson(right?.preview)
+  );
+}
+
+function canonicalJson(value: JsonValue | undefined): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+  if (typeof value === "object" && value !== null) {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "undefined";
 }

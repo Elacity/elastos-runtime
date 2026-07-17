@@ -9,6 +9,7 @@
     ".": "./index.ts",
     "./esp_v0": "./esp_v0.ts",
     "./audit_views": "./audit_views.ts",
+    "./authority": "./authority.ts",
     "./capsule_detail": "./capsule_detail.ts",
     "./consent": "./consent.ts",
     "./custody": "./custody.ts",
@@ -17,6 +18,6 @@
     "./trust": "./trust.ts"
   },
   "scripts": {
-    "test": "node --experimental-strip-types --check esp_v0.ts && node --experimental-strip-types --check index.ts && node --experimental-strip-types check-esp-v0.mjs && node --experimental-strip-types --test projections.test.mjs"
+    "test": "node --experimental-strip-types --check esp_v0.ts && node --experimental-strip-types --check authority.ts && node --experimental-strip-types --check index.ts && node --experimental-strip-types check-esp-v0.mjs && node --experimental-strip-types --test projections.test.mjs"
   }
 }

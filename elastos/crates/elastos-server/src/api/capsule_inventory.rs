@@ -13,15 +13,6 @@ pub(crate) fn development_capsules_root() -> PathBuf {
     PathBuf::from(DEV_CAPSULES_ROOT)
 }
 
-// Kept during the catalog migration for callers that still resolve source-home
-// capsules. The next Runtime-facts slice removes those callers and this helper.
-pub(crate) fn capsule_dir_candidates(data_dir: &Path, app: &str) -> [PathBuf; 2] {
-    [
-        installed_capsules_root(data_dir).join(app),
-        development_capsules_root().join(app),
-    ]
-}
-
 fn components_manifest(data_dir: &Path) -> Option<crate::setup::ComponentsManifest> {
     let bytes = std::fs::read(data_dir.join("components.json")).ok()?;
     serde_json::from_slice(&bytes).ok()
@@ -130,11 +121,6 @@ pub(crate) fn list_active_capsule_manifests(data_dir: &Path) -> Vec<CapsuleManif
         return Vec::new();
     };
     list_manifests(&installed_capsules_root(data_dir), Some(&active_capsules))
-}
-
-// Transitional name for Runtime callers migrated in the following facts slice.
-pub(crate) fn list_capsule_manifests(data_dir: &Path) -> Vec<CapsuleManifest> {
-    list_active_capsule_manifests(data_dir)
 }
 
 #[cfg(test)]

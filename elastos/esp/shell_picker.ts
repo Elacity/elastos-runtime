@@ -1,5 +1,9 @@
 import type { CapsuleCatalogResponse, CapsuleSummary } from "./esp_v0.ts";
-import { trustMaterial, type TrustMaterial } from "./trust.ts";
+import {
+  trustMaterial,
+  type TrustMaterial,
+  type VerificationState,
+} from "./trust.ts";
 
 const HOME_HOST_ID = "home";
 
@@ -25,6 +29,7 @@ export interface ShellTrustCard {
   name: string;
   title: string;
   trust: TrustMaterial;
+  verification: VerificationState;
 }
 
 export function shellTrustCard(capsule: CapsuleSummary): ShellTrustCard {
@@ -32,6 +37,7 @@ export function shellTrustCard(capsule: CapsuleSummary): ShellTrustCard {
     name: capsule.name,
     title: capsule.title,
     trust: trustMaterial(capsule),
+    verification: "unknown",
   };
 }
 

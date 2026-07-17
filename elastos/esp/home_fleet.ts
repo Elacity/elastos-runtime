@@ -40,7 +40,8 @@ export interface HomeFleetView {
 
 export function capsuleNeedsAttention(view: CapsuleDetailView): boolean {
   return (
-    view.trust.trust === "unsigned" ||
+    ["unsigned", "unknown"].includes(view.trust.trust) ||
+    view.trust.verification !== "verified" ||
     view.custody.state !== "complete" ||
     view.audit.state === "denied" ||
     view.custody.processes.total > 0 && view.custody.processes.running === 0

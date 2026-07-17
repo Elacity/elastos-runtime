@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use super::binding::inspect_action_request_binding;
+use crate::esp_binding::EspRequestBinding;
 
 pub(super) const INSPECT_ACTION_SCHEMA: &str = "elastos.inspect.action-request/v1";
 const INSPECT_ACTIONS_DIR: &str = "inspect-actions";
@@ -16,7 +17,7 @@ pub(super) struct InspectActionRequestRecord {
     pub(super) request: serde_json::Value,
     pub(super) plan: serde_json::Value,
     #[serde(default)]
-    pub(super) request_binding: Option<serde_json::Value>,
+    pub(super) request_binding: Option<EspRequestBinding>,
     pub(super) status: String,
     pub(super) created_at: u64,
     pub(super) updated_at: u64,
@@ -42,7 +43,14 @@ pub(super) fn pending_inspect_action_requests(
                 "id": record.id,
                 "operation": record.operation,
                 "plan": record.plan,
-                "request_binding": record.request_binding.unwrap_or_else(|| inspect_action_request_binding(&record.request)),
+                "request_binding": record.request_binding.unwrap_or_else(|| inspect_action_request_binding(
+                    &record.request_id,
+                    &record.principal_id,
+                    &record.id,
+                    &record.operation,
+                    &record.plan,
+                    &record.request,
+                )),
                 "status": record.status,
                 "created_at": record.created_at,
             })

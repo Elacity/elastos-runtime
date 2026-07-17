@@ -18,6 +18,14 @@ export const ESP_TRANSPORT = "http-json" as const;
 export const ESP_TRANSPORT_SCOPE = "local_runtime_adapter" as const;
 export const ESP_INITIALIZE_SCHEMA = "elastos.esp.initialize/v0" as const;
 
+export const ESP_AUTHORITY_INVARIANTS = [
+  "Verification proves evidence only; it does not authorize or make a method executable.",
+  "Declared risk is advisory metadata; Runtime bindings and route policy decide executability and authority.",
+  "Missing trust, permission, binding, or policy evidence is unknown, never safe.",
+  "Routes, frames, iframe placement, and HTTP success are transport or presentation facts, not authority.",
+  "Effect completion requires an exact request binding and matching Runtime result receipt.",
+] as const;
+
 export const ESP_SCHEMA_TAGS = {
   capsuleCatalog: "elastos.capsules.catalog/v1",
   capsuleInterfaces: "elastos.capsules.interfaces/v1",
@@ -25,8 +33,10 @@ export const ESP_SCHEMA_TAGS = {
   inspectObject: "elastos.inspect.object/v1",
   inspectGatePreview: "elastos.inspect.gate-preview/v1",
   inspectActionRequest: "elastos.inspect.action-request/v1",
-  inspectRequestBinding: "elastos.inspect.request-binding/v1",
+  inspectActionResult: "elastos.inspect.action-result/v1",
+  requestBinding: "elastos.esp.request-binding/v1",
   inspectDispatchResult: "elastos.inspect.dispatch-result/v1",
+  capsuleInvokeResult: "elastos.capsules.invoke-result/v1",
 } as const;
 
 export type EspSupportedSchema =
@@ -39,8 +49,10 @@ export type EspFactSchema =
   | typeof ESP_SCHEMA_TAGS.inspectGatePreview
   | typeof ESP_SCHEMA_TAGS.inspectActionRequest;
 export type EspFlowSchema =
-  | typeof ESP_SCHEMA_TAGS.inspectRequestBinding
-  | typeof ESP_SCHEMA_TAGS.inspectDispatchResult;
+  | typeof ESP_SCHEMA_TAGS.requestBinding
+  | typeof ESP_SCHEMA_TAGS.inspectActionResult
+  | typeof ESP_SCHEMA_TAGS.inspectDispatchResult
+  | typeof ESP_SCHEMA_TAGS.capsuleInvokeResult;
 
 export const ESP_SUPPORTED_SCHEMAS: readonly EspSupportedSchema[] = [
   ESP_SCHEMA_TAGS.capsuleCatalog,
@@ -49,8 +61,10 @@ export const ESP_SUPPORTED_SCHEMAS: readonly EspSupportedSchema[] = [
   ESP_SCHEMA_TAGS.inspectObject,
   ESP_SCHEMA_TAGS.inspectGatePreview,
   ESP_SCHEMA_TAGS.inspectActionRequest,
-  ESP_SCHEMA_TAGS.inspectRequestBinding,
+  ESP_SCHEMA_TAGS.inspectActionResult,
+  ESP_SCHEMA_TAGS.requestBinding,
   ESP_SCHEMA_TAGS.inspectDispatchResult,
+  ESP_SCHEMA_TAGS.capsuleInvokeResult,
 ] as const;
 
 export const ESP_FACT_OPERATIONS = {
@@ -121,6 +135,9 @@ export const ESP_FACT_DESCRIPTORS = [
     operation: ESP_FACT_OPERATIONS.capsuleCatalog,
     method: "GET",
     route: "/api/capsules/catalog",
+    auth: "Home, System, Marketplace, or launchable shell token",
+    authority:
+      "Read-only installed capsule and affordance projection; descriptors are not grants.",
   },
   {
     family: "capsule_interfaces",
@@ -128,6 +145,9 @@ export const ESP_FACT_DESCRIPTORS = [
     operation: ESP_FACT_OPERATIONS.capsuleInterfaces,
     method: "GET",
     route: "/api/capsules/interfaces",
+    auth: "Home, System, Marketplace, or launchable shell token",
+    authority:
+      "Read-only interface registry derived from installed capsule manifests.",
   },
   {
     family: "inspect_capsules",
@@ -135,6 +155,9 @@ export const ESP_FACT_DESCRIPTORS = [
     operation: ESP_FACT_OPERATIONS.inspectCapsules,
     method: "POST",
     route: "/api/provider/inspect/capsules",
+    auth: "System launch token",
+    authority:
+      "System mirror list; ordinary capsules do not receive the system-wide view.",
   },
   {
     family: "inspect_object",
@@ -142,6 +165,9 @@ export const ESP_FACT_DESCRIPTORS = [
     operation: ESP_FACT_OPERATIONS.inspectObject,
     method: "POST",
     route: "/api/provider/inspect/capsule",
+    auth: "System launch token",
+    authority:
+      "Redacted capsule/provider object projection with provenance fingerprint, not raw secrets.",
   },
   {
     family: "gate_preview",
@@ -149,6 +175,8 @@ export const ESP_FACT_DESCRIPTORS = [
     operation: ESP_FACT_OPERATIONS.inspectGatePreview,
     method: "POST",
     route: "/api/provider/inspect/plan",
+    auth: "System launch token",
+    authority: "Preview-only authority reflection; cannot dispatch or mutate.",
   },
   {
     family: "inspect_action_request",
@@ -156,31 +184,52 @@ export const ESP_FACT_DESCRIPTORS = [
     operation: ESP_FACT_OPERATIONS.inspectActionRequest,
     method: "POST",
     route: "/api/provider/inspect/request_act",
+    auth: "System launch token",
+    authority:
+      "Creates a principal-bound Inbox approval request; no provider dispatch happens here.",
   },
-] as const;
+] as const satisfies readonly EspFactDescriptor[];
 
 export const ESP_VERB_DESCRIPTORS = [
   {
     name: "inspect.request_act",
     method: "POST",
     route: "/api/provider/inspect/request_act",
+    auth: "System launch token",
+    effect:
+      "Stores a pending Inspector action request bound to its request ID, principal, capsule, method, resources, and body.",
+    gate: "Inbox approval required before dispatch.",
   },
   {
     name: "inbox.approve_inspect_action",
     method: "POST",
     route: "/api/apps/inbox/actions",
+    auth: "Inbox launch token plus fresh same-principal passkey Home token",
+    effect:
+      "Revalidates the exact request binding and authority plan, dispatches through ProviderRegistry, and returns a matching Runtime receipt.",
+    gate:
+      "Fails closed when request body, authority plan, principal, or passkey proof does not match.",
   },
   {
     name: "inbox.deny_inspect_action",
     method: "POST",
     route: "/api/apps/inbox/actions",
+    auth: "Inbox launch token",
+    effect:
+      "Marks only the exactly bound Inspector action request denied and returns its matching receipt without dispatch.",
+    gate: "Fail-safe direction only; denial never mutates the target provider.",
   },
   {
     name: "capsule.invoke_runtime_policy_affordance",
     method: "POST",
     route: "/api/capsules/interfaces/invoke",
+    auth: "Target capsule launch token",
+    effect:
+      "Invokes only executable generic Runtime bindings and returns the exact request ID, principal, capsule, interface, method, resource, and body binding.",
+    gate:
+      "Provider-path-only, unbound, unknown, and approval-required operations fail closed.",
   },
-] as const;
+] as const satisfies readonly EspVerbDescriptor[];
 
 export interface EspInitializeResponse {
   schema: typeof ESP_INITIALIZE_SCHEMA;
@@ -207,6 +256,26 @@ export interface EspUnsupportedVersionResponse {
 
 export type CapsuleRole = "shell" | "app" | "viewer" | "provider" | "content";
 export type CapsuleType = "wasm" | "microvm" | "oci" | "media" | "data";
+export type CapsuleRuntimeAbi =
+  | "elastos.runtime-projection/v1"
+  | "elastos.component/v1"
+  | "microvm-linux"
+  | "data";
+export type CapsuleExecution =
+  | "web-projection"
+  | "component"
+  | "microvm"
+  | "data";
+export type CapsuleProjection =
+  | "web"
+  | "cli"
+  | "terminal"
+  | "facts"
+  | "affordances"
+  | "gates"
+  | "audit-mirror"
+  | "carrier"
+  | "content";
 export type RequirementKind = "capsule" | "external";
 export type AffordanceApprovalMode = "none" | "runtime_policy" | "user";
 export type AffordanceRisk =
@@ -278,6 +347,11 @@ export interface CapsuleSummary {
   author?: string | null;
   role: CapsuleRole;
   type: CapsuleType;
+  runtime_abi?: CapsuleRuntimeAbi | null;
+  bus_contract?: string | null;
+  wit_world_sha256?: string | null;
+  execution?: CapsuleExecution | null;
+  projections?: CapsuleProjection[];
   category: string;
   state: string;
   installed: boolean;
@@ -314,6 +388,28 @@ export interface CapsuleInterfaceRegistryCounts {
   capsules: number;
   interfaces: number;
   methods: number;
+  executable_methods: number;
+  [key: string]: unknown;
+}
+
+export type CapsuleMethodBindingState =
+  | "executable"
+  | "approval-required"
+  | "provider-path-only"
+  | "unbound"
+  | "handler-unavailable"
+  | "descriptive-only"
+  | string;
+
+export interface CapsuleMethodBindingSummary {
+  method: string;
+  state: CapsuleMethodBindingState;
+  handler_available: boolean;
+  executable: boolean;
+  handler_kind?: "runtime" | "provider" | string;
+  handler?: string;
+  required_action?: string;
+  reason?: string;
   [key: string]: unknown;
 }
 
@@ -323,9 +419,15 @@ export interface CapsuleInterfaceSummary {
   title: string;
   role: CapsuleRole;
   type: CapsuleType;
+  runtime_abi?: CapsuleRuntimeAbi | null;
+  bus_contract?: string | null;
+  wit_world_sha256?: string | null;
+  execution?: CapsuleExecution | null;
+  projections?: CapsuleProjection[];
   cid?: string | null;
   trust_state: string;
   interface: CapsuleInterfaceDescriptor;
+  bindings: CapsuleMethodBindingSummary[];
   [key: string]: unknown;
 }
 
@@ -466,8 +568,14 @@ export interface InspectGatePreview {
   [key: string]: unknown;
 }
 
-export interface InspectRequestBinding {
-  schema: typeof ESP_SCHEMA_TAGS.inspectRequestBinding;
+export interface EspRequestBinding {
+  schema: typeof ESP_SCHEMA_TAGS.requestBinding;
+  request_id: string;
+  principal: string;
+  capsule: string;
+  interface: string | null;
+  method: string;
+  resources: string[];
   sha256: string;
   bytes: number;
   truncated: boolean;
@@ -482,7 +590,7 @@ export interface InspectActionRequestResponse {
   id: string;
   operation: string;
   plan: InspectGatePreview | JsonValue;
-  request_binding?: InspectRequestBinding;
+  request_binding?: EspRequestBinding;
   [key: string]: unknown;
 }
 
@@ -493,6 +601,7 @@ export interface InspectDispatchResult {
   provider: string;
   target: string;
   operation: string;
+  request_binding: EspRequestBinding;
   capabilities: InspectCapabilityProjection[];
   audit_events: string[];
   execution: InspectExecutionPolicy;
@@ -545,25 +654,53 @@ export interface InboxActionRequest {
   home_token?: string;
 }
 
+export interface InspectActionResult {
+  schema: typeof ESP_SCHEMA_TAGS.inspectActionResult;
+  status: "completed" | "denied";
+  request_id: string;
+  request_binding: EspRequestBinding;
+  dispatch_result: InspectDispatchResult | null;
+  [key: string]: unknown;
+}
+
 export interface InboxActionResponse {
   message: string;
+  result?: InspectActionResult;
   [key: string]: unknown;
 }
 
 export interface CapsuleInterfaceInvokeRequest {
+  request_id: string;
   capsule: string;
   interface: string;
   method: string;
   input?: JsonValue;
 }
 
-export interface CapsuleInterfaceInvokeResponse {
+export interface CapsuleInterfaceInvokeSuccess {
   schema: "elastos.capsules.invoke-result/v1";
-  status: string;
+  status: "ok";
   capsule: string;
   interface: string;
   method: string;
   request_id: string;
+  request_binding: EspRequestBinding;
   output: JsonValue;
   [key: string]: unknown;
 }
+
+export interface CapsuleInterfaceInvokeError {
+  schema: "elastos.capsules.invoke-result/v1";
+  status: "error";
+  code: string;
+  message: string;
+  capsule: string;
+  interface: string;
+  method: string;
+  request_id: string;
+  [key: string]: unknown;
+}
+
+export type CapsuleInterfaceInvokeResponse =
+  | CapsuleInterfaceInvokeSuccess
+  | CapsuleInterfaceInvokeError;

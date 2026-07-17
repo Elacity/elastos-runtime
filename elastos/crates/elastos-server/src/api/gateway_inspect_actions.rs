@@ -162,44 +162,8 @@ pub(super) async fn approve_inspect_action_request(
     context: &HomeLaunchTokenContext,
     request_id: &str,
 ) -> anyhow::Result<String> {
-    let mut record = read_inspect_action_record(&state.data_dir, request_id)?;
-    if record.status != "pending" {
-        anyhow::bail!("Inspector action request is not pending");
-    }
-    if record.principal_id != context.principal_id {
-        anyhow::bail!("Inspector action request belongs to a different principal");
-    }
-    let current_request_binding = inspect_action_request_binding(&record.request);
-    if let Some(stored_binding) = &record.request_binding {
-        if stored_binding != &current_request_binding {
-            record.status = "stale".to_string();
-            record.error =
-                Some("Inspector action request body changed before Inbox approval".to_string());
-            record.result = Some(serde_json::json!({
-                "status": "error",
-                "code": "request_binding_changed",
-                "expected": stored_binding,
-                "actual": current_request_binding,
-            }));
-            record.updated_at = now_ts();
-            write_inspect_action_record(&state.data_dir, &record)?;
-            append_provider_effect_audit(
-                &state.data_dir,
-                ProviderEffectAuditInput {
-                    capsule_id: INBOX_CAPSULE_ID,
-                    event_type: "inspect.action.stale",
-                    principal_id: &context.principal_id,
-                    session_id: &context.session_id,
-                    request_id,
-                    result: "stale",
-                    reason: "Inspector action request body changed before Inbox approval",
-                },
-            )?;
-            anyhow::bail!("Inspector action request body changed before Inbox approval");
-        }
-    } else {
-        record.request_binding = Some(current_request_binding);
-    }
+    let (mut record, request_binding) =
+        read_bound_pending_inspect_action(state, context, request_id)?;
     let registry = state
         .provider_registry
         .as_ref()
@@ -249,10 +213,37 @@ pub(super) async fn approve_inspect_action_request(
                 "id": record.id,
                 "operation": record.operation,
                 "request": record.request,
+                "request_binding": request_binding,
             }),
         )
         .await?;
     if response.get("status").and_then(serde_json::Value::as_str) == Some("ok") {
+        if let Err(message) = validate_inspect_dispatch_result(&response, &request_binding) {
+            record.status = "failed".to_string();
+            record.error = Some(message.clone());
+            record.result = Some(serde_json::json!({
+                "status": "error",
+                "code": "result_binding_mismatch",
+                "message": message,
+                "provider_result": response,
+                "request_binding": request_binding,
+            }));
+            record.updated_at = now_ts();
+            write_inspect_action_record(&state.data_dir, &record)?;
+            append_provider_effect_audit(
+                &state.data_dir,
+                ProviderEffectAuditInput {
+                    capsule_id: INBOX_CAPSULE_ID,
+                    event_type: "inspect.action.failed",
+                    principal_id: &context.principal_id,
+                    session_id: &context.session_id,
+                    request_id,
+                    result: "failed",
+                    reason: "Inspector action result did not match its exact request binding",
+                },
+            )?;
+            anyhow::bail!("Inspector action result did not match its exact request binding");
+        }
         record.status = "completed".to_string();
         record.result = Some(response.clone());
         record.updated_at = now_ts();
@@ -301,13 +292,7 @@ pub(super) fn deny_inspect_action_request(
     context: &HomeLaunchTokenContext,
     request_id: &str,
 ) -> anyhow::Result<String> {
-    let mut record = read_inspect_action_record(&state.data_dir, request_id)?;
-    if record.status != "pending" {
-        anyhow::bail!("Inspector action request is not pending");
-    }
-    if record.principal_id != context.principal_id {
-        anyhow::bail!("Inspector action request belongs to a different principal");
-    }
+    let (mut record, _) = read_bound_pending_inspect_action(state, context, request_id)?;
     record.status = "denied".to_string();
     record.updated_at = now_ts();
     write_inspect_action_record(&state.data_dir, &record)?;
@@ -324,6 +309,183 @@ pub(super) fn deny_inspect_action_request(
         },
     )?;
     Ok("Denied Inspector action.".to_string())
+}
+
+pub(super) fn inspect_action_result_receipt(
+    data_dir: &FsPath,
+    request_id: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let record = read_inspect_action_record(data_dir, request_id)?;
+    if !matches!(record.status.as_str(), "completed" | "denied") {
+        anyhow::bail!("Inspector action has no completed result");
+    }
+    let expected = inspect_action_request_binding(
+        &record.request_id,
+        &record.principal_id,
+        &record.id,
+        &record.operation,
+        &record.plan,
+        &record.request,
+    );
+    let binding = record
+        .request_binding
+        .filter(|binding| binding == &expected)
+        .ok_or_else(|| anyhow::anyhow!("Inspector action result binding is invalid"))?;
+    let dispatch_result = if record.status == "completed" {
+        record.result.as_ref().and_then(|result| result.get("data"))
+    } else {
+        None
+    };
+    if record.status == "completed" {
+        let provider_result = record
+            .result
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Inspector action completed result is missing"))?;
+        validate_inspect_dispatch_result(provider_result, &binding).map_err(anyhow::Error::msg)?;
+    }
+    Ok(serde_json::json!({
+        "schema": "elastos.inspect.action-result/v1",
+        "status": record.status,
+        "request_id": record.request_id,
+        "request_binding": binding,
+        "dispatch_result": dispatch_result,
+    }))
+}
+
+fn read_bound_pending_inspect_action(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+    request_id: &str,
+) -> anyhow::Result<(
+    InspectActionRequestRecord,
+    crate::esp_binding::EspRequestBinding,
+)> {
+    let mut record = read_inspect_action_record(&state.data_dir, request_id)?;
+    if record.status != "pending" {
+        anyhow::bail!("Inspector action request is not pending");
+    }
+    if record.principal_id != context.principal_id {
+        anyhow::bail!("Inspector action request belongs to a different principal");
+    }
+    let current = inspect_action_request_binding(
+        &record.request_id,
+        &record.principal_id,
+        &record.id,
+        &record.operation,
+        &record.plan,
+        &record.request,
+    );
+    let matches = record
+        .request_binding
+        .as_ref()
+        .is_some_and(|stored| stored == &current)
+        && record.request_id == request_id;
+    if matches {
+        return Ok((record, current));
+    }
+
+    let stored_request_id = record.request_id.clone();
+    record.request_id = request_id.to_string();
+    record.status = "stale".to_string();
+    record.error = Some(
+        "Inspector action request binding changed before Inbox approval or denial".to_string(),
+    );
+    record.result = Some(serde_json::json!({
+        "status": "error",
+        "code": "request_binding_changed",
+        "expected": record.request_binding.clone(),
+        "actual": current,
+        "stored_request_id": stored_request_id,
+    }));
+    record.updated_at = now_ts();
+    write_inspect_action_record(&state.data_dir, &record)?;
+    append_provider_effect_audit(
+        &state.data_dir,
+        ProviderEffectAuditInput {
+            capsule_id: INBOX_CAPSULE_ID,
+            event_type: "inspect.action.stale",
+            principal_id: &context.principal_id,
+            session_id: &context.session_id,
+            request_id,
+            result: "stale",
+            reason: "Inspector action request binding changed before Inbox approval or denial",
+        },
+    )?;
+    anyhow::bail!("Inspector action request binding changed before Inbox approval or denial")
+}
+
+fn validate_inspect_dispatch_result(
+    response: &serde_json::Value,
+    expected: &crate::esp_binding::EspRequestBinding,
+) -> Result<(), String> {
+    if response.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
+        return Err(response
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Inspector action dispatch failed")
+            .to_string());
+    }
+    let data = response
+        .get("data")
+        .ok_or_else(|| "Inspector action result is missing data".to_string())?;
+    if data.get("schema").and_then(serde_json::Value::as_str)
+        != Some("elastos.inspect.dispatch-result/v1")
+    {
+        return Err("Inspector action result has the wrong schema".to_string());
+    }
+    let actual = data
+        .get("request_binding")
+        .ok_or_else(|| "Inspector action result is missing its request binding".to_string())?;
+    let actual: crate::esp_binding::EspRequestBinding = serde_json::from_value(actual.clone())
+        .map_err(|err| format!("Inspector action result request binding is invalid: {err}"))?;
+    if &actual != expected {
+        return Err("Inspector action result request binding does not match".to_string());
+    }
+    if data.get("id").and_then(serde_json::Value::as_str) != Some(expected.capsule.as_str())
+        || data.get("operation").and_then(serde_json::Value::as_str)
+            != Some(expected.method.as_str())
+    {
+        return Err("Inspector action result target or method does not match".to_string());
+    }
+    let mut result_resources = data
+        .get("capabilities")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|capability| capability.get("resource"))
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    result_resources.sort();
+    result_resources.dedup();
+    if result_resources != expected.resources {
+        return Err("Inspector action result resources do not match".to_string());
+    }
+    let provider_status = data
+        .pointer("/provider_response/status")
+        .and_then(serde_json::Value::as_str);
+    if provider_status != Some("ok") {
+        return Err("Inspector action provider result did not complete successfully".to_string());
+    }
+    let transfer = data
+        .pointer("/provider_response/_runtime_transfer")
+        .ok_or_else(|| {
+            "Inspector action provider result is missing its Runtime receipt".to_string()
+        })?;
+    let target = data
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if transfer.get("schema").and_then(serde_json::Value::as_str)
+        != Some("elastos.provider.transfer/v1")
+        || transfer.get("source").and_then(serde_json::Value::as_str) != Some("inspect")
+        || transfer.get("target").and_then(serde_json::Value::as_str) != Some(target)
+        || transfer.get("op").and_then(serde_json::Value::as_str) != Some(expected.method.as_str())
+        || transfer.get("status").and_then(serde_json::Value::as_str) != Some("completed")
+    {
+        return Err("Inspector action provider result Runtime receipt does not match".to_string());
+    }
+    Ok(())
 }
 
 async fn create_inspect_action_request(
@@ -385,7 +547,14 @@ async fn create_inspect_action_request(
     let now = now_ts();
     let nonce = inspect_action_request_nonce();
     let request_id = inspect_action_request_id(id, operation, now, &nonce);
-    let request_binding = inspect_action_request_binding(&provider_request);
+    let request_binding = inspect_action_request_binding(
+        &request_id,
+        &context.principal_id,
+        id,
+        operation,
+        &plan["data"],
+        &provider_request,
+    );
     let record = InspectActionRequestRecord {
         schema: INSPECT_ACTION_SCHEMA.to_string(),
         request_id,
@@ -416,4 +585,79 @@ async fn create_inspect_action_request(
         },
     )?;
     Ok(record)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn esp_dispatch_result_requires_the_exact_request_and_runtime_receipt() {
+        let binding = crate::esp_binding::esp_request_binding(
+            "inspect-act-test",
+            "person:test",
+            "capsule:exit-provider",
+            None,
+            "status",
+            ["elastos://exit/*".to_string()],
+            &serde_json::json!({ "probe": true }),
+        );
+        let valid = serde_json::json!({
+            "status": "ok",
+            "data": {
+                "schema": "elastos.inspect.dispatch-result/v1",
+                "id": "capsule:exit-provider",
+                "target": "exit",
+                "operation": "status",
+                "request_binding": binding,
+                "capabilities": [{ "resource": "elastos://exit/*", "actions": ["read"] }],
+                "provider_response": {
+                    "status": "ok",
+                    "data": { "status": "ready" },
+                    "_runtime_transfer": {
+                        "schema": "elastos.provider.transfer/v1",
+                        "source": "inspect",
+                        "target": "exit",
+                        "op": "status",
+                        "status": "completed"
+                    }
+                }
+            }
+        });
+        assert!(validate_inspect_dispatch_result(&valid, &binding).is_ok());
+
+        for (field, replacement) in [
+            ("request_id", serde_json::json!("inspect-act-other")),
+            ("principal", serde_json::json!("person:other")),
+            ("capsule", serde_json::json!("capsule:other")),
+            ("interface", serde_json::json!("elastos.other")),
+            ("method", serde_json::json!("other")),
+            ("resources", serde_json::json!(["elastos://other/*"])),
+            ("sha256", serde_json::json!("00".repeat(32))),
+        ] {
+            let mut mutated = valid.clone();
+            mutated["data"]["request_binding"][field] = replacement;
+            assert!(
+                validate_inspect_dispatch_result(&mutated, &binding).is_err(),
+                "accepted mutated result binding field {field}"
+            );
+        }
+
+        for pointer in [
+            "/data/id",
+            "/data/operation",
+            "/data/capabilities/0/resource",
+            "/data/provider_response/status",
+            "/data/provider_response/_runtime_transfer/target",
+            "/data/provider_response/_runtime_transfer/op",
+            "/data/provider_response/_runtime_transfer/status",
+        ] {
+            let mut mutated = valid.clone();
+            *mutated.pointer_mut(pointer).unwrap() = serde_json::json!("unrelated");
+            assert!(
+                validate_inspect_dispatch_result(&mutated, &binding).is_err(),
+                "accepted unrelated result at {pointer}"
+            );
+        }
+    }
 }

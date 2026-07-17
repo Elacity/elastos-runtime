@@ -10,7 +10,6 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::documents::DocumentsClient;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, RawQuery, State};
 use axum::http::{
@@ -151,6 +150,7 @@ const DOCUMENTS_CAPSULE_ID: &str = "documents";
 const LIBRARY_CAPSULE_ID: &str = "library";
 const MARKETPLACE_CAPSULE_ID: &str = "marketplace";
 const INBOX_CAPSULE_ID: &str = "inbox";
+const HOME_PEOPLE_TARGET_ID: &str = "people";
 
 pub fn capsule_catalog_snapshot(data_dir: &std::path::Path) -> serde_json::Value {
     serde_json::to_value(gateway_capsule_catalog::capsule_catalog_summary(data_dir)).unwrap_or_else(

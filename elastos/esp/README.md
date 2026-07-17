@@ -14,11 +14,11 @@ Included in this slice:
 - Current verb request/response shapes for Inspector approval and low-risk
   capsule interface invocation.
 - Pure projection helpers for trust, custody, shell selection, consent
-  validation, capsule detail, Home fleet, and audit views.
+  validation, capsule detail, Home fleet, audit views, and authority separation.
 
 Excluded from this slice:
 
-- Flint reach halos.
+- Reach halos.
 - Reach enforcement.
 - SSE ESP projection streams.
 - Standing grants.
@@ -30,7 +30,9 @@ Excluded from this slice:
 
 Visual UI remains outside this package. If a shell needs reusable visual
 components, first attempt plain ES modules or native Web Components bundled in a
-shell/app capsule. Svelte may be used later only as an optional capsule-local UI compiler. That may happen only after the headless projections and tests pass; compiled components must paint ESP facts and emit intents only.
+shell/app capsule. Svelte may be used later only as an optional capsule-local UI compiler.
+That may happen only after the headless projections and tests pass; compiled
+components must paint ESP facts and emit intents only.
 
 Facts include index signatures because shells must ignore unknown fact fields.
 Verb request bodies intentionally do not; the Rust handlers use strict request
@@ -40,6 +42,11 @@ Projection helpers are also non-TCB. They accept Runtime facts and return
 render-ready summaries. They do not open transports, store local state, sign,
 verify signatures, hold keys, hold tokens, dispatch providers, or invoke
 Runtime operations.
+
+The authority projection keeps trust material, verification, declared
+permissions, executable bindings, and policy metadata separate. It never emits
+an authorization verdict: missing evidence remains unknown, declared risk stays
+advisory, and route/frame/HTTP presentation signals never grant authority.
 
 Check:
 

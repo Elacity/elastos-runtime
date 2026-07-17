@@ -164,9 +164,23 @@ pub(super) async fn inbox_action(
         Err(err) => return inbox_error_response(err),
     };
     match dispatch_inbox_action(&state, &context, &action).await {
-        Ok(message) => Json(InboxActionResponse { message }).into_response(),
+        Ok(message) => {
+            let result = inspect_action_request_id_from_action(&action.action_id)
+                .map(|request_id| inspect_action_result_receipt(&state.data_dir, request_id))
+                .transpose();
+            match result {
+                Ok(result) => Json(InboxActionResponse { message, result }).into_response(),
+                Err(err) => inbox_error_response(err),
+            }
+        }
         Err(err) => inbox_error_response(err),
     }
+}
+
+fn inspect_action_request_id_from_action(action_id: &str) -> Option<&str> {
+    action_id
+        .strip_prefix("inspect-approve-request:")
+        .or_else(|| action_id.strip_prefix("inspect-deny-request:"))
 }
 
 fn parse_inbox_action_request(

@@ -1,17 +1,35 @@
 import type { CapsuleSummary, InspectObjectProjection, JsonValue } from "./esp_v0.ts";
 
-export type TrustMaterial = "verified" | "content_addressed" | "unsigned";
+export type TrustMaterial =
+  | "signature_declared"
+  | "content_addressed"
+  | "unsigned"
+  | "unknown";
+export type VerificationState = "verified" | "unverified" | "unknown";
 
-export function trustMaterial(capsule: Pick<CapsuleSummary, "trust_state">): TrustMaterial {
-  switch (capsule.trust_state) {
+export function trustMaterial(
+  capsule: Pick<CapsuleSummary, "trust_state"> | null | undefined,
+): TrustMaterial {
+  switch (capsule?.trust_state) {
     case "cid-with-manifest-signature":
     case "local-manifest-signature":
-      return "verified";
+      return "signature_declared";
     case "cid-without-manifest-signature":
       return "content_addressed";
-    default:
+    case "local-dev":
       return "unsigned";
+    default:
+      return "unknown";
   }
+}
+
+export function verificationState(
+  object: Pick<InspectObjectProjection, "trust_evidence"> | null | undefined,
+): VerificationState {
+  const verified = object?.trust_evidence?.verified;
+  if (verified === true) return "verified";
+  if (verified === false) return "unverified";
+  return "unknown";
 }
 
 export interface ProvenanceView {
@@ -61,17 +79,19 @@ export interface TrustCard {
   name: string;
   title: string;
   trust: TrustMaterial;
+  verification: VerificationState;
   provenance?: ProvenanceView;
 }
 
 export function trustCard(
   capsule: Pick<CapsuleSummary, "name" | "title" | "trust_state">,
-  object?: Pick<InspectObjectProjection, "provenance"> | null,
+  object?: Pick<InspectObjectProjection, "provenance" | "trust_evidence"> | null,
 ): TrustCard {
   return {
     name: capsule.name,
     title: capsule.title,
     trust: trustMaterial(capsule),
+    verification: verificationState(object),
     ...(object ? { provenance: provenanceView(object) } : {}),
   };
 }

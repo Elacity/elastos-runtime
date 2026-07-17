@@ -13,8 +13,10 @@ const SUPPORTED_SCHEMAS: &[&str] = &[
     "elastos.inspect.object/v1",
     "elastos.inspect.gate-preview/v1",
     "elastos.inspect.action-request/v1",
-    "elastos.inspect.request-binding/v1",
+    "elastos.inspect.action-result/v1",
+    "elastos.esp.request-binding/v1",
     "elastos.inspect.dispatch-result/v1",
+    "elastos.capsules.invoke-result/v1",
 ];
 
 const FACTS: &[EspFact] = &[
@@ -80,7 +82,7 @@ const VERBS: &[EspVerb] = &[
         method: "POST",
         route: "/api/provider/inspect/request_act",
         auth: "System launch token",
-        effect: "Stores a pending Inspector action request with a canonical request binding.",
+        effect: "Stores a pending Inspector action request bound to its request ID, principal, capsule, method, resources, and body.",
         gate: "Inbox approval required before dispatch.",
     },
     EspVerb {
@@ -88,7 +90,7 @@ const VERBS: &[EspVerb] = &[
         method: "POST",
         route: "/api/apps/inbox/actions",
         auth: "Inbox launch token plus fresh same-principal passkey Home token",
-        effect: "Revalidates request binding and authority plan, then dispatches through ProviderRegistry.",
+        effect: "Revalidates the exact request binding and authority plan, dispatches through ProviderRegistry, and returns a matching Runtime receipt.",
         gate: "Fails closed when request body, authority plan, principal, or passkey proof does not match.",
     },
     EspVerb {
@@ -96,7 +98,7 @@ const VERBS: &[EspVerb] = &[
         method: "POST",
         route: "/api/apps/inbox/actions",
         auth: "Inbox launch token",
-        effect: "Marks the Inspector action request denied without dispatch.",
+        effect: "Marks only the exactly bound Inspector action request denied and returns its matching receipt without dispatch.",
         gate: "Fail-safe direction only; denial never mutates the target provider.",
     },
     EspVerb {
@@ -104,8 +106,8 @@ const VERBS: &[EspVerb] = &[
         method: "POST",
         route: "/api/capsules/interfaces/invoke",
         auth: "Target capsule launch token",
-        effect: "Invokes only Runtime-policy, low-risk affordances with existing Runtime bindings.",
-        gate: "User-approval and high-risk affordances fail closed in this slice.",
+        effect: "Invokes only executable generic Runtime bindings and returns the exact request ID, principal, capsule, interface, method, resource, and body binding.",
+        gate: "Provider-path-only, unbound, unknown, and approval-required operations fail closed.",
     },
 ];
 
@@ -117,6 +119,11 @@ const INVARIANTS: &[&str] = &[
     "Preview-only facts must not mutate or dispatch.",
     "Approved dispatch must go through Inbox approval and ProviderRegistry.",
     "Shells must ignore unknown fact fields and must not send hidden Runtime metadata.",
+    "Verification proves evidence only; it does not authorize or make a method executable.",
+    "Declared risk is advisory metadata; Runtime bindings and route policy decide executability and authority.",
+    "Missing trust, permission, binding, or policy evidence is unknown, never safe.",
+    "Routes, frames, iframe placement, and HTTP success are transport or presentation facts, not authority.",
+    "Effect completion requires an exact request binding and matching Runtime result receipt.",
 ];
 
 #[derive(Debug, Deserialize)]

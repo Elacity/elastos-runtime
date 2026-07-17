@@ -46,10 +46,14 @@ pub(super) async fn home_launch(
         &context,
     )
     .await;
+    let authority_target = target_summary
+        .viewer
+        .as_deref()
+        .unwrap_or(target_summary.target.as_str());
     let route = append_home_launch_token(
         &state.data_dir,
         &target_summary.route,
-        target_summary.target.as_str(),
+        authority_target,
         &req.query,
         &context,
     )
@@ -91,10 +95,8 @@ pub(super) fn append_home_launch_token(
 }
 
 pub(super) fn home_targets(data_dir: &std::path::Path) -> Vec<HomeTargetSummary> {
-    let mut targets = home_browser_targets(data_dir, true);
-    targets.extend(home_viewer_targets(data_dir));
-    targets.sort_by(|left, right| left.title.cmp(&right.title));
-    targets
+    let catalog = capsule_catalog_summary(data_dir);
+    home_targets_from_catalog(&catalog)
 }
 
 #[cfg(test)]
@@ -125,7 +127,22 @@ pub(super) fn home_targets_from_catalog(
             })
         })
         .collect::<Vec<_>>();
-    targets.sort_by(|left, right| left.title.cmp(&right.title));
+    targets.push(HomeTargetSummary {
+        target: HOME_PEOPLE_TARGET_ID.to_string(),
+        title: "People".to_string(),
+        description: "See accepted ElastOS contacts and start conversations.".to_string(),
+        route: "home://people".to_string(),
+        attach_kind: "home".to_string(),
+        role: CapsuleRole::App,
+        target_kind: HomeTargetKind::App,
+        viewer: None,
+        viewer_title: None,
+    });
+    targets.sort_by(|left, right| {
+        left.title
+            .cmp(&right.title)
+            .then_with(|| left.target.cmp(&right.target))
+    });
     targets
 }
 
@@ -277,6 +294,9 @@ pub(super) async fn launch_runtime_backed_home_target(
     let capsule_dir = resolve_capsule_dir(data_dir, target)?;
     let manifest = crate::api::capsule_inventory::load_capsule_manifest(&capsule_dir, target)?;
     if !manifest.role.is_shell_launchable() || manifest.capsule_type == CapsuleType::Data {
+        return None;
+    }
+    if manifest.is_runtime_projection() {
         return None;
     }
 
@@ -619,16 +639,7 @@ fn system_runtime_event_summary(
 }
 
 pub(super) fn resolve_capsule_dir(data_dir: &FsPath, app: &str) -> Option<PathBuf> {
-    for candidate in crate::api::capsule_inventory::capsule_dir_candidates(data_dir, app) {
-        if let Some(manifest) =
-            crate::api::capsule_inventory::load_capsule_manifest(&candidate, app)
-        {
-            if manifest.name == app {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    crate::api::capsule_inventory::installed_active_capsule_dir(data_dir, app)
 }
 
 pub(super) fn now_ts() -> u64 {
@@ -708,17 +719,15 @@ fn app_shell_description(name: &str, manifest_description: Option<String>) -> St
         DOCUMENTS_CAPSULE_ID => {
             "Create, edit, and publish markdown documents from this device.".to_string()
         }
-        CHAT_ROOM_CAPSULE_ID => "Open Chat conversations inside ElastOS.".to_string(),
+        CHAT_ROOM_CAPSULE_ID => "Send messages and join conversations.".to_string(),
         LIBRARY_CAPSULE_ID => "Browse documents and open them in Documents.".to_string(),
         MARKETPLACE_CAPSULE_ID => {
-            "Browse installed capsules, providers, viewers, and content.".to_string()
+            "Browse installed apps, services, viewers, and content.".to_string()
         }
-        INBOX_CAPSULE_ID => "Review requests and approvals for this Home.".to_string(),
+        INBOX_CAPSULE_ID => "Review messages, requests, and approvals.".to_string(),
         SERVICES_CAPSULE_ID => "Manage Browser Exit Node sharing and subscriptions.".to_string(),
-        SYSTEM_CAPSULE_ID => {
-            "Manage passkeys, appearance, and runtime settings for this Home.".to_string()
-        }
-        BROWSER_CAPSULE_ID => "Open web sites through the ElastOS Browser boundary.".to_string(),
+        SYSTEM_CAPSULE_ID => "Manage passkeys, appearance, and Home settings.".to_string(),
+        BROWSER_CAPSULE_ID => "Browse websites from this device.".to_string(),
         WALLET_CAPSULE_ID => {
             "View accounts, balances, approvals, and approval methods.".to_string()
         }
@@ -727,7 +736,7 @@ fn app_shell_description(name: &str, manifest_description: Option<String>) -> St
             "Add {} as an approval method.",
             wallet_connector_label(name)
         ),
-        "gba-emulator" => "Launch the browser-based mGBA frontend.".to_string(),
+        "gba-emulator" => "Play GBA games from Library.".to_string(),
         _ => manifest_description
             .unwrap_or_else(|| format!("Open {} from Home.", app_shell_title(name))),
     }

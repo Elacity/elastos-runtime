@@ -3733,7 +3733,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn recovery_kit_password_package_imports_with_password_only() {
+        let _guard = trusted_auth_env_lock();
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
         let credential = test_credential();

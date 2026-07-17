@@ -8,6 +8,7 @@ use elastos_runtime::provider::{
 use serde_json::{json, Value};
 
 use super::{error, ok, InspectSource};
+use crate::esp_binding::{esp_request_binding, EspRequestBinding};
 
 fn approved_execution_policy() -> Value {
     json!({
@@ -105,13 +106,50 @@ pub(super) async fn dispatch_approved(
             &format!("inspect dispatch request must not predeclare Runtime metadata field {field}"),
         );
     }
-    let Some(provider_object) = provider_request.as_object_mut() else {
+    if !provider_request.is_object() {
         return error(
             "invalid_request",
             "inspect dispatch request must be a JSON object",
         );
+    }
+    let request_binding = match request
+        .get("request_binding")
+        .cloned()
+        .map(serde_json::from_value::<EspRequestBinding>)
+    {
+        Some(Ok(binding)) => binding,
+        Some(Err(err)) => {
+            return error(
+                "invalid_request_binding",
+                &format!("inspect dispatch request binding is invalid: {err}"),
+            )
+        }
+        None => {
+            return error(
+                "invalid_request_binding",
+                "inspect dispatch requires request binding",
+            )
+        }
     };
-    provider_object.insert("op".to_string(), Value::String(operation.to_string()));
+    let expected_binding = esp_request_binding(
+        &request_binding.request_id,
+        &request_binding.principal,
+        id,
+        None,
+        operation,
+        plan.resources.iter().cloned(),
+        &provider_request,
+    );
+    if request_binding != expected_binding {
+        return error(
+            "request_binding_mismatch",
+            "inspect dispatch request does not match its exact request binding",
+        );
+    }
+    provider_request
+        .as_object_mut()
+        .expect("validated provider request object")
+        .insert("op".to_string(), Value::String(operation.to_string()));
 
     let Some(registry) = registry.upgrade() else {
         return error(
@@ -132,21 +170,33 @@ pub(super) async fn dispatch_approved(
         })
         .await
     {
-        Ok(provider_response) => ok(json!({
-            "schema": "elastos.inspect.dispatch-result/v1",
-            "mode": "provider_authority",
-            "id": entry.id,
-            "provider": entry.name,
-            "target": target,
-            "operation": operation,
-            "capabilities": plan.resources.iter().map(|resource| json!({
-                "resource": resource,
-                "actions": plan.actions.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            })).collect::<Vec<_>>(),
-            "audit_events": plan.audit_events,
-            "execution": approved_execution_policy(),
-            "provider_response": provider_response,
-        })),
+        Ok(provider_response) => {
+            if provider_response.get("status").and_then(Value::as_str) != Some("ok") {
+                return error(
+                    "dispatch_failed",
+                    provider_response
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("provider returned a non-success result"),
+                );
+            }
+            ok(json!({
+                "schema": "elastos.inspect.dispatch-result/v1",
+                "mode": "provider_authority",
+                "id": entry.id,
+                "provider": entry.name,
+                "target": target,
+                "operation": operation,
+                "request_binding": request_binding,
+                "capabilities": plan.resources.iter().map(|resource| json!({
+                    "resource": resource,
+                    "actions": plan.actions.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+                "audit_events": plan.audit_events,
+                "execution": approved_execution_policy(),
+                "provider_response": provider_response,
+            }))
+        }
         Err(err) => error("dispatch_failed", &err.to_string()),
     }
 }

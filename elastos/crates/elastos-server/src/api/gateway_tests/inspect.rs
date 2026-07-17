@@ -274,13 +274,31 @@ async fn inspect_action_requires_inbox_approval_before_dispatch() {
     assert!(request_id.starts_with("inspect-act-"));
     assert_eq!(
         request_payload["request_binding"]["schema"],
-        "elastos.inspect.request-binding/v1"
+        "elastos.esp.request-binding/v1"
     );
     assert_eq!(request_payload["request_binding"]["preview"]["probe"], true);
     let request_hash = request_payload["request_binding"]["sha256"]
         .as_str()
         .unwrap();
     assert_eq!(request_hash.len(), 64);
+    assert_eq!(request_payload["request_binding"]["request_id"], request_id);
+    assert_eq!(
+        request_payload["request_binding"]["principal"],
+        authority.principal_id
+    );
+    assert_eq!(
+        request_payload["request_binding"]["capsule"],
+        "capsule:exit-provider"
+    );
+    assert_eq!(
+        request_payload["request_binding"]["interface"],
+        serde_json::Value::Null
+    );
+    assert_eq!(request_payload["request_binding"]["method"], "status");
+    assert_eq!(
+        request_payload["request_binding"]["resources"],
+        json!(["elastos://exit/*"])
+    );
     assert!(calls.lock().await.is_empty());
 
     let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
@@ -382,6 +400,24 @@ async fn inspect_action_requires_inbox_approval_before_dispatch() {
         .await
         .unwrap();
     assert_eq!(approved.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(approved.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let approval: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        approval["result"]["schema"],
+        "elastos.inspect.action-result/v1"
+    );
+    assert_eq!(approval["result"]["status"], "completed");
+    assert_eq!(approval["result"]["request_id"], request_id);
+    assert_eq!(
+        approval["result"]["request_binding"]["request_id"],
+        request_id
+    );
+    assert_eq!(
+        approval["result"]["dispatch_result"]["request_binding"],
+        approval["result"]["request_binding"]
+    );
     let call_records = calls.lock().await;
     assert_eq!(call_records.len(), 1);
     assert_eq!(call_records[0]["op"], "status");
@@ -949,7 +985,7 @@ async fn inspect_action_rejects_changed_request_binding_before_dispatch() {
         .await
         .unwrap();
     let message = String::from_utf8(body.to_vec()).unwrap();
-    assert!(message.contains("request body changed"));
+    assert!(message.contains("request binding changed"));
     assert!(calls.lock().await.is_empty());
 
     let inbox = app
@@ -978,6 +1014,92 @@ async fn inspect_action_rejects_changed_request_binding_before_dispatch() {
                     == format!("inspect-approve-request:{request_id}")
         });
     assert!(!still_pending);
+}
+
+#[tokio::test]
+async fn esp_inspect_action_rejects_every_mutated_binding_field_before_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, calls) = inspect_act_test_state(dir.path()).await;
+    let app = gateway_router(state);
+    let authority = passkey_authority_with_name(dir.path(), Some("requester"));
+    let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+
+    for (field, replacement) in [
+        ("schema", json!("elastos.esp.request-binding/v999")),
+        ("request_id", json!("inspect-act-other")),
+        ("principal", json!("person:other")),
+        ("capsule", json!("capsule:other-provider")),
+        ("interface", json!("elastos.other")),
+        ("method", json!("other_operation")),
+        ("resources", json!(["elastos://other/*"])),
+        ("sha256", json!("00".repeat(32))),
+        ("bytes", json!(999)),
+        ("truncated", json!(true)),
+        ("preview", json!({ "probe": false })),
+    ] {
+        for action in ["approve", "deny"] {
+            let requested = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/provider/inspect/request_act")
+                        .header("x-elastos-home-token", authority.system_token.clone())
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            r#"{"id":"capsule:exit-provider","operation":"status","request":{"probe":true}}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(requested.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(requested.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let request_id = payload["request_id"].as_str().unwrap();
+            let record_path = dir
+                .path()
+                .join("inspect-actions")
+                .join(format!("{request_id}.json"));
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+            record["request_binding"][field] = replacement.clone();
+            std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+            let action_body = if action == "approve" {
+                format!(
+                    r#"{{"action_id":"inspect-approve-request:{request_id}","home_token":"{}"}}"#,
+                    authority.home_token
+                )
+            } else {
+                format!(r#"{{"action_id":"inspect-deny-request:{request_id}"}}"#)
+            };
+            let rejected = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/apps/inbox/actions")
+                        .header("x-elastos-home-token", inbox_token.clone())
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(action_body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                rejected.status(),
+                StatusCode::BAD_REQUEST,
+                "action={action} field={field}"
+            );
+            assert!(
+                calls.lock().await.is_empty(),
+                "action={action} field={field}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -1228,5 +1350,16 @@ async fn inspect_action_can_be_denied_without_dispatch() {
         .await
         .unwrap();
     assert_eq!(denied.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(denied.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let denial: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        denial["result"]["schema"],
+        "elastos.inspect.action-result/v1"
+    );
+    assert_eq!(denial["result"]["status"], "denied");
+    assert_eq!(denial["result"]["request_id"], request_id);
+    assert_eq!(denial["result"]["dispatch_result"], serde_json::Value::Null);
     assert!(calls.lock().await.is_empty());
 }

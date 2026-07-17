@@ -14,6 +14,8 @@ struct HomeSummaryResponse {
     services: HomeServicesSummary,
     notifications: HomeNotificationsSummary,
     desktop_objects: HomeDesktopObjectsSummary,
+    capsule_catalog: CapsuleCatalogResponse,
+    capsule_interfaces: CapsuleInterfaceRegistryResponse,
     targets: Vec<HomeTargetSummary>,
 }
 
@@ -454,8 +456,6 @@ struct SystemSummaryResponse {
     appearance: HomeAppearanceSummary,
     source: SystemSourceSummary,
     runtime: HomeRuntimeSummary,
-    storage: SystemStorageSummary,
-    webspace: SystemWebspaceSummary,
     wallet_accounts: SystemWalletAccountsSummary,
     wallet_approvals: SystemWalletApprovalsSummary,
     runtime_log: SystemRuntimeLogSummary,
@@ -479,29 +479,6 @@ struct SystemSourceSummary {
 struct SystemCapsuleIdentity {
     id: String,
     route: String,
-}
-
-#[derive(Serialize)]
-struct SystemWebspaceSummary {
-    entries: Vec<SystemWebspaceEntry>,
-}
-
-#[derive(Serialize)]
-struct SystemWebspaceEntry {
-    id: String,
-    role: String,
-    capsule_type: String,
-    uri: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    provides: Option<String>,
-    capabilities: Vec<String>,
-    operations: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    route: Option<String>,
-    running: bool,
-    status: String,
-    backend: String,
-    authority_boundary: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -538,21 +515,6 @@ struct RuntimeCapabilityPendingRequest {
     resource: String,
     action: String,
     requested_at: u64,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-struct SystemStorageSummary {
-    available: bool,
-    #[serde(default)]
-    documents_count: usize,
-    #[serde(default)]
-    drafts_count: usize,
-    #[serde(default)]
-    published_count: usize,
-    #[serde(default)]
-    objects_root: Option<String>,
-    #[serde(default)]
-    note: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -876,6 +838,8 @@ struct InboxActionRequest {
 #[derive(Serialize)]
 struct InboxActionResponse {
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]

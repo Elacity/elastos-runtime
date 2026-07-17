@@ -1,5 +1,6 @@
 export * from "./esp_v0.ts";
 export * from "./audit_views.ts";
+export * from "./authority.ts";
 export * from "./consent.ts";
 export * from "./custody.ts";
 export * from "./capsule_detail.ts";
