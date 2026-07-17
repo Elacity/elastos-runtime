@@ -1801,9 +1801,22 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let temp = path.with_extension("tmp");
-    std::fs::write(&temp, bytes)?;
-    std::fs::rename(temp, path)?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("atomic write path has no file name"))?;
+    let temp = path.with_file_name(format!(
+        ".{file_name}.{:016x}.tmp",
+        rand::thread_rng().next_u64()
+    ));
+    if let Err(err) = std::fs::write(&temp, bytes) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(err.into());
+    }
+    if let Err(err) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(err.into());
+    }
     Ok(())
 }
 
@@ -2404,6 +2417,37 @@ mod tests {
             );
         }
         assert_eq!(state.sessions.len(), 24);
+    }
+
+    #[test]
+    fn atomic_write_supports_concurrent_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(24));
+        let mut handles = Vec::new();
+
+        for index in 0..24 {
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                atomic_write(&path, format!("writer-{index}").as_bytes())
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .starts_with("writer-"));
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .count(),
+            1
+        );
     }
 
     #[test]
