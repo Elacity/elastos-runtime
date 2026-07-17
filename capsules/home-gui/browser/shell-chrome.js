@@ -1,17 +1,19 @@
 import {
   clockNode,
+  toolbarHomeButton,
+  toolbarSystem,
   toolbarIdentity,
-  toolbarIdentityButton,
   toolbarIdentityAvatar,
   toolbarIdentityName,
   toolbarIdentityMenu,
   toolbarIdentityMenuName,
 } from "./shell-core.js?v=home-20260718n";
 
-/* Identity chrome: the signed-in principal's name and avatar initial live in
-   the system bar as a disclosure menu (account actions: fullscreen, system,
-   sign out). Data comes from the home summary; the name is always rendered as
-   textContent — never HTML. */
+/* System chrome: the ElastOS brand at the far left of the bar is the system
+   menu (the macOS Apple-menu position) — show desktop, fullscreen, System,
+   sign out, headed by the signed-in principal. The avatar + name on the right
+   is a passive identity indicator. Data comes from the home summary; the name
+   is always rendered as textContent — never HTML. */
 
 function summaryDisplayName(summary) {
   const handle = summary?.identity?.handle;
@@ -34,7 +36,7 @@ export function syncIdentity(summary) {
   toolbarIdentityName.textContent = name;
   toolbarIdentityMenuName.textContent = name;
   toolbarIdentityAvatar.textContent = [...name][0].toUpperCase();
-  toolbarIdentityButton.setAttribute("aria-label", `Account: ${name}`);
+  toolbarIdentity.setAttribute("aria-label", `Signed in as ${name}`);
   toolbarIdentity.hidden = false;
 }
 
@@ -65,7 +67,7 @@ function identityMenuOpen() {
 
 function openIdentityMenu({ focusLast = false } = {}) {
   toolbarIdentityMenu.hidden = false;
-  toolbarIdentityButton.setAttribute("aria-expanded", "true");
+  toolbarHomeButton.setAttribute("aria-expanded", "true");
   const items = identityMenuItems();
   const target = focusLast ? items[items.length - 1] : items[0];
   target?.focus();
@@ -76,9 +78,9 @@ function closeIdentityMenu({ restoreFocus = true } = {}) {
     return;
   }
   toolbarIdentityMenu.hidden = true;
-  toolbarIdentityButton.setAttribute("aria-expanded", "false");
+  toolbarHomeButton.setAttribute("aria-expanded", "false");
   if (restoreFocus) {
-    toolbarIdentityButton.focus();
+    toolbarHomeButton.focus();
   }
 }
 
@@ -99,18 +101,18 @@ function moveIdentityMenuFocus(delta) {
 let identityMenuBound = false;
 
 export function bindIdentityMenu() {
-  if (identityMenuBound || !toolbarIdentityButton || !toolbarIdentityMenu) {
+  if (identityMenuBound || !toolbarHomeButton || !toolbarIdentityMenu) {
     return;
   }
   identityMenuBound = true;
-  toolbarIdentityButton.addEventListener("click", () => {
+  toolbarHomeButton.addEventListener("click", () => {
     if (identityMenuOpen()) {
       closeIdentityMenu();
     } else {
       openIdentityMenu();
     }
   });
-  toolbarIdentityButton.addEventListener("keydown", (event) => {
+  toolbarHomeButton.addEventListener("keydown", (event) => {
     if (event.key === "ArrowDown") {
       event.preventDefault();
       openIdentityMenu();
@@ -146,7 +148,7 @@ export function bindIdentityMenu() {
     }
   });
   document.addEventListener("pointerdown", (event) => {
-    if (identityMenuOpen() && !toolbarIdentity.contains(event.target)) {
+    if (identityMenuOpen() && !toolbarSystem.contains(event.target)) {
       closeIdentityMenu({ restoreFocus: false });
     }
   });

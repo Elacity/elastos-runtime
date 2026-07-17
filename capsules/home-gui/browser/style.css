@@ -245,39 +245,39 @@ img {
   content: url("./elastos-logo-ink.svg");
 }
 
-/* Identity chrome: avatar + name as a disclosure menu. Account actions
-   (fullscreen, system, sign out) live inside — never as naked bar buttons at
+/* System menu: the ElastOS brand at the far left is the menu trigger (the
+   macOS Apple-menu position). Account/system actions (show desktop,
+   fullscreen, System, sign out) live inside — never as naked bar buttons at
    the same visual weight as the clock. */
+.toolbar-system {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.toolbar-system .toolbar-brand {
+  border-radius: 7px;
+  transition: background-color 0.18s ease;
+}
+
+.toolbar-system .toolbar-brand:hover,
+.toolbar-system .toolbar-brand[aria-expanded="true"] {
+  background-color: var(--lift-strong);
+}
+
+/* Identity indicator: avatar + name on the right, read-only. */
 .toolbar-identity {
   position: relative;
   margin-left: 12px;
   display: flex;
   align-items: center;
+  gap: 7px;
+  height: 26px;
+  padding: 0 8px 0 3px;
 }
 
 .toolbar-identity[hidden] {
   display: none;
-}
-
-.toolbar-identity-btn {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  height: 26px;
-  padding: 0 8px 0 3px;
-  border-radius: 7px;
-  cursor: pointer;
-  transition: background-color 0.18s ease;
-}
-
-.toolbar-identity-btn:hover,
-.toolbar-identity-btn[aria-expanded="true"] {
-  background-color: var(--lift-strong);
-}
-
-.toolbar-identity-btn:focus-visible {
-  outline: 2px solid var(--brand-focus);
-  outline-offset: 1px;
 }
 
 .toolbar-identity-avatar {
@@ -307,7 +307,7 @@ img {
 .toolbar-identity-menu {
   position: absolute;
   top: calc(100% + 8px);
-  right: 0;
+  left: 0;
   z-index: 100120;
   min-width: 210px;
   padding: 5px;

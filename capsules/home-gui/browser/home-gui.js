@@ -13,7 +13,7 @@ import {
   shellState,
   taskbarTargets,
   toolbarFullscreenButton,
-  toolbarHomeButton,
+  identityMenuShowDesktopButton,
   toolbarInboxButton,
   toolbarSignOutButton,
   ensureHomeGuiDom,
@@ -673,7 +673,9 @@ export function bindHomeGuiInteractions(options = {}) {
     : null;
   shellState.requestSummaryRefresh = homeGuiHostActions.requestSummaryRefresh;
 
-  toolbarHomeButton?.addEventListener("click", () => {
+  // The brand button itself toggles the ElastOS menu (bound in
+  // bindIdentityMenu); the go-home action lives inside it as Show desktop.
+  identityMenuShowDesktopButton?.addEventListener("click", () => {
     activateHomeGui().catch((error) => {
       console.error("home-gui activation failed", error);
     });
