@@ -11,7 +11,7 @@
  * commands are dispatched only to the window that declared them.
  */
 
-import { shellState } from "./shell-core.js?v=home-20260701c";
+import { shellState } from "./shell-core.js?v=home-20260717a";
 
 const menubarNode = document.querySelector("#toolbar-menubar");
 

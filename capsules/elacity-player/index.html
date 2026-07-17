@@ -21,18 +21,27 @@
   <main id="app-shell" class="shell">
     <section class="player-card">
       <div class="video-frame">
-        <video id="video" playsinline controls preload="metadata"></video>
+        <video id="video" playsinline preload="metadata"></video>
         <div id="overlay" class="overlay" aria-live="polite">
           <div class="overlay-copy">
             <div class="icon" aria-hidden="true">&#9654;</div>
             <p id="overlay-text">Opening protected stream…</p>
           </div>
         </div>
+        <div id="transport" class="transport" data-visible="true" aria-label="Playback controls">
+          <button id="transport-play" class="transport-button transport-play" type="button" data-state="paused" aria-label="Play"></button>
+          <span id="transport-time" class="transport-time">0:00 / 0:00</span>
+          <input id="transport-seek" class="transport-seek" type="range" min="0" max="0" step="0.1" value="0" aria-label="Seek" />
+          <button id="transport-mute" class="transport-button transport-mute" type="button" data-state="on" aria-label="Mute"></button>
+          <input id="transport-volume" class="transport-volume" type="range" min="0" max="100" step="1" value="100" aria-label="Volume" />
+          <button id="transport-fullscreen" class="transport-button transport-fullscreen" type="button" aria-label="Enter full screen"></button>
+        </div>
       </div>
       <p id="status" class="status" aria-live="polite" hidden></p>
     </section>
   </main>
   <script type="module" src="player.js?v=20260618-audiocard"></script>
+  <script type="module" src="transport.js?v=20260717a"></script>
   <script>
     // Shell menu bar: a Playback menu driving the SAME <video> element the
     // native controls use. No open/new-window entries — a protected viewer

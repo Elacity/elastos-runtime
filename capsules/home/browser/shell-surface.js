@@ -47,7 +47,7 @@ import {
   desktopObjectByEntryId,
   desktopEntryExists,
   trapTabWithin,
-} from "./shell-core.js?v=home-20260701c";
+} from "./shell-core.js?v=home-20260717a";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -61,8 +61,8 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260701c";
-import { playUiSound } from "./shell-sounds.js?v=home-20260701c";
+} from "./shell-windows.js?v=home-20260717a";
+import { playUiSound } from "./shell-sounds.js?v=home-20260717a";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;

@@ -4,15 +4,15 @@ import {
   mountGlyph,
   allVisibleTargets,
   desktopObjects,
-} from "./shell-core.js?v=home-20260701c";
-import { openFileObject } from "./shell-surface.js?v=home-20260701c";
+} from "./shell-core.js?v=home-20260717a";
+import { openFileObject } from "./shell-surface.js?v=home-20260717a";
 import {
   openTarget,
   focusWindow,
   browserWindowEntries,
   sortWindowEntriesByZOrder,
   browserWindowDisplayTitle,
-} from "./shell-windows.js?v=home-20260701c";
+} from "./shell-windows.js?v=home-20260717a";
 
 /* Spotlight: shell-wide search (macOS anatomy — dimmed backdrop, centered
  * floating bar, grouped results that grow beneath it). Searches everything

@@ -1082,3 +1082,51 @@ body[data-room-session-active="true"] .presence-card {
     display: none !important;
   }
 }
+
+/* ---- Shell chrome ----------------------------------------------------------
+   Inside a Home window the room is an OS app, not a webpage: no gradient
+   backdrop, no floating rounded cards. The conversation is the content plane
+   and the roster is a real sidebar behind one hairline. Gateway/standalone
+   mode keeps the card look above. */
+body[data-room-access-mode="shell"] {
+  background: var(--el-bg);
+}
+
+body[data-room-access-mode="shell"] .shell {
+  padding: 0;
+}
+
+body[data-room-access-mode="shell"] .chat-room-shell {
+  height: 100vh;
+  height: 100dvh;
+}
+
+body[data-room-access-mode="shell"] .chat-card {
+  gap: 0;
+}
+
+body[data-room-access-mode="shell"] .conversation-card,
+body[data-room-access-mode="shell"] .presence-card {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+body[data-room-access-mode="shell"] .conversation-card {
+  padding: 0.75rem 0.9rem;
+}
+
+body[data-room-access-mode="shell"] .presence-card {
+  border-left: 1px solid var(--line);
+  background: var(--el-surface);
+  padding: 0.75rem;
+}
+
+@media (max-width: 760px) {
+  body[data-room-access-mode="shell"] .chat-card[data-roster-open="true"] .presence-card {
+    border: 1px solid var(--line);
+    border-radius: 0.9rem;
+    background: var(--panel-strong);
+  }
+}

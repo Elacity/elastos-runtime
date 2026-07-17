@@ -1275,7 +1275,7 @@ assert(
 );
 const debugPolicy = read("DEBUG.md");
 const gbaScript = read("scripts/gba.sh");
-const homeAssetVersion = "home-20260701c";
+const homeAssetVersion = "home-20260717a";
 assertUsersSelfReferencesAreApproved();
 assert(
   shellIndex.includes('role="listbox"'),

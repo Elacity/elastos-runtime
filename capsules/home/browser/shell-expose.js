@@ -3,12 +3,12 @@
  * focus that window; Esc dismisses. Pure shell presentation — no gateway.
  */
 
-import { shellState } from "./shell-core.js?v=home-20260701c";
+import { shellState } from "./shell-core.js?v=home-20260717a";
 import {
   browserWindowEntries,
   focusWindow,
   sortWindowEntriesByZOrder,
-} from "./shell-windows.js?v=home-20260701c";
+} from "./shell-windows.js?v=home-20260717a";
 
 const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 let active = false;

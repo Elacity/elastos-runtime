@@ -10,7 +10,7 @@ import {
   toolbarNetwork,
   toolbarNetworkButton,
   toolbarNetworkMenu,
-} from "./shell-core.js?v=home-20260701c";
+} from "./shell-core.js?v=home-20260717a";
 
 /* Identity chrome: the signed-in principal's name and avatar initial live in
    the system bar as a disclosure menu (account actions: fullscreen, system,

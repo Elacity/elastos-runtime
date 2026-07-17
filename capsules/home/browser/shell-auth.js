@@ -1,4 +1,4 @@
-import { fetchJson, trapTabWithin } from "./shell-core.js?v=home-20260701c";
+import { fetchJson, trapTabWithin } from "./shell-core.js?v=home-20260717a";
 
 const unlockPanel = document.querySelector("#home-unlock");
 const unlockCard = document.querySelector(".home-unlock-card");

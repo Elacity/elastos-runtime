@@ -101,3 +101,179 @@ video {
 .status.error {
   color: var(--error);
 }
+
+/* Custom transport — floats over the always-black stage, so its ink is fixed
+   light-on-dark like the overlay above (media convention, not theme drift). */
+.transport {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 26px 14px 10px;
+  background: linear-gradient(to top, rgba(6, 8, 12, 0.82), rgba(6, 8, 12, 0));
+  color: var(--stage-ink);
+  opacity: 1;
+  transition: opacity 180ms ease;
+}
+
+.transport[data-visible="false"] {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.video-frame.cursor-idle {
+  cursor: none;
+}
+
+.transport-button {
+  position: relative;
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--stage-ink);
+  cursor: pointer;
+}
+
+.transport-button:hover {
+  background: rgba(245, 247, 250, 0.14);
+}
+
+.transport-button:focus-visible {
+  outline: 2px solid var(--el-focus);
+  outline-offset: 1px;
+}
+
+.transport-button::before,
+.transport-button::after {
+  content: "";
+  position: absolute;
+}
+
+/* Play / pause glyphs drawn with borders — one icon language, no emoji. */
+.transport-play[data-state="paused"]::before {
+  top: 50%;
+  left: 50%;
+  border-style: solid;
+  border-width: 7px 0 7px 12px;
+  border-color: transparent transparent transparent currentColor;
+  transform: translate(-40%, -50%);
+}
+
+.transport-play[data-state="playing"]::before,
+.transport-play[data-state="playing"]::after {
+  top: 50%;
+  width: 4px;
+  height: 14px;
+  background: currentColor;
+  transform: translateY(-50%);
+}
+
+.transport-play[data-state="playing"]::before {
+  left: 12px;
+}
+
+.transport-play[data-state="playing"]::after {
+  right: 12px;
+}
+
+.transport-mute::before {
+  top: 50%;
+  left: 9px;
+  width: 7px;
+  height: 8px;
+  background: currentColor;
+  clip-path: polygon(0 25%, 40% 25%, 100% 0, 100% 100%, 40% 75%, 0 75%);
+  transform: translateY(-50%) scale(1.6);
+  transform-origin: left center;
+}
+
+.transport-mute[data-state="on"]::after {
+  top: 50%;
+  right: 9px;
+  width: 6px;
+  height: 6px;
+  border: 2px solid currentColor;
+  border-left: 0;
+  border-radius: 0 8px 8px 0;
+  transform: translateY(-50%);
+}
+
+.transport-mute[data-state="muted"]::after {
+  top: 50%;
+  right: 7px;
+  width: 10px;
+  border-top: 2px solid currentColor;
+  transform: translateY(-50%) rotate(-45deg);
+}
+
+.transport-fullscreen::before {
+  inset: 9px;
+  border: 2px solid currentColor;
+  border-radius: 3px;
+  clip-path: polygon(0 0, 35% 0, 35% 35%, 0 35%, 0 100%, 100% 100%, 100% 65%, 65% 65%, 65% 100%, 100% 100%, 100% 0);
+}
+
+.transport-time {
+  flex-shrink: 0;
+  min-width: 88px;
+  color: var(--stage-ink-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.transport-seek {
+  flex: 1;
+  min-width: 0;
+}
+
+.transport-volume {
+  width: 72px;
+  flex-shrink: 0;
+}
+
+.transport-seek,
+.transport-volume {
+  height: 4px;
+  appearance: none;
+  border-radius: 2px;
+  background: rgba(245, 247, 250, 0.28);
+  cursor: pointer;
+}
+
+.transport-seek::-webkit-slider-thumb,
+.transport-volume::-webkit-slider-thumb {
+  width: 12px;
+  height: 12px;
+  appearance: none;
+  border: 0;
+  border-radius: 50%;
+  background: var(--stage-ink);
+}
+
+.transport-seek::-moz-range-thumb,
+.transport-volume::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--stage-ink);
+}
+
+.transport-seek:focus-visible,
+.transport-volume:focus-visible {
+  outline: 2px solid var(--el-focus);
+  outline-offset: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .transport {
+    transition: none;
+  }
+}

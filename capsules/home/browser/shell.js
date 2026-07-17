@@ -22,13 +22,13 @@ import {
   shouldIgnoreDesktopKeydown,
   shellInteractionActive,
   targetById,
-} from "./shell-core.js?v=home-20260701c";
+} from "./shell-core.js?v=home-20260717a";
 import {
   syncIdentity,
   syncNetworkStatus,
   clearIdentitySurface,
   updateClock,
-} from "./shell-chrome.js?v=home-20260701c";
+} from "./shell-chrome.js?v=home-20260717a";
 import {
   renderDesktop,
   renderTaskbar,
@@ -53,7 +53,7 @@ import {
   beginDesktopMarquee,
   updateDesktopMarquee,
   finishDesktopMarquee,
-} from "./shell-surface.js?v=home-20260701c";
+} from "./shell-surface.js?v=home-20260717a";
 import {
   configureWindowHooks,
   renderBootError,
@@ -66,7 +66,7 @@ import {
   handleShellResize,
   refreshHomeInternalWindows,
   supportsMenuNewWindow,
-} from "./shell-windows.js?v=home-20260701c";
+} from "./shell-windows.js?v=home-20260717a";
 import {
   bindHomeUnlock,
   hideHomeUnlock,
@@ -74,24 +74,24 @@ import {
   refreshHomeSession,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260701c";
-import { handleDesktopArrowKey } from "./shell-keyboard.js?v=home-20260701c";
-import { showSpotlight } from "./shell-spotlight.js?v=home-20260701c";
+} from "./shell-auth.js?v=home-20260717a";
+import { handleDesktopArrowKey } from "./shell-keyboard.js?v=home-20260717a";
+import { showSpotlight } from "./shell-spotlight.js?v=home-20260717a";
 import {
   bindNotificationCenter,
   recordNotifications,
-} from "./shell-notifications.js?v=home-20260701c";
+} from "./shell-notifications.js?v=home-20260717a";
 import {
   bindMenubar,
   setMenuManifest,
   syncMenubar,
-} from "./shell-menubar.js?v=home-20260701c";
+} from "./shell-menubar.js?v=home-20260717a";
 import {
   bindQuickLook,
   toggleQuickLook,
-} from "./shell-quicklook.js?v=home-20260701c";
-import { bindExpose } from "./shell-expose.js?v=home-20260701c";
-import { playUiSound } from "./shell-sounds.js?v=home-20260701c";
+} from "./shell-quicklook.js?v=home-20260717a";
+import { bindExpose } from "./shell-expose.js?v=home-20260717a";
+import { playUiSound } from "./shell-sounds.js?v=home-20260717a";
 
 configureWindowHooks({
   clearIdentitySurface,

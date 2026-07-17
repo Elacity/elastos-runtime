@@ -22,7 +22,7 @@ import {
   targetById,
   toolbarActiveTitleNode,
   taskbarTargets,
-} from "./shell-core.js?v=home-20260701c";
+} from "./shell-core.js?v=home-20260717a";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -33,8 +33,8 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260701c";
-import { playUiSound } from "./shell-sounds.js?v=home-20260701c";
+} from "./shell-window-geometry.js?v=home-20260717a";
+import { playUiSound } from "./shell-sounds.js?v=home-20260717a";
 
 let windowHooks = null;
 const PEOPLE_DISCOVERY_AUTO_REFRESH_INITIAL_MS = 1_500;
@@ -1311,6 +1311,14 @@ function renderPeopleWindowBody(entry, summary) {
   body.classList.remove("window-body-frame");
   body.classList.add("home-people-body");
   const profileMarkup = peopleProfileMarkup(identity);
+  // List/detail anatomy: the selection survives summary refreshes on the
+  // window node; a vanished contact falls back to the first one.
+  const requestedId = normalizePeopleText(entry.node.dataset.peopleSelectedContact, "");
+  const selectedContact = contacts.find(
+    (contact) => normalizePeopleText(contact?.contact_id, "") === requestedId,
+  ) || contacts[0] || null;
+  const selectedId = normalizePeopleText(selectedContact?.contact_id, "");
+  entry.node.dataset.peopleSelectedContact = selectedId;
   const peopleMarkup = contacts.length === 0
     ? `
       <div class="home-people-empty">
@@ -1318,7 +1326,16 @@ function renderPeopleWindowBody(entry, summary) {
         <p>Turn on Discovery to find another ElastOS home and send a request.</p>
       </div>
     `
-    : contacts.map(peopleListCardMarkup).join("");
+    : `
+      <div class="home-people-split">
+        <div class="home-people-roster" role="listbox" aria-label="People">
+          ${contacts.map((contact) => peopleRosterRowMarkup(contact, selectedId)).join("")}
+        </div>
+        <div class="home-people-detail">
+          ${peopleContactDetailMarkup(selectedContact)}
+        </div>
+      </div>
+    `;
   body.innerHTML = `
     <section class="home-people-shell" aria-label="People">
       <aside class="home-people-sidebar" aria-label="People sections">
@@ -1336,7 +1353,7 @@ function renderPeopleWindowBody(entry, summary) {
         <div class="home-people-content">
           <section class="home-people-section" data-people-section="people" aria-label="People">
             ${profileMarkup}
-            <div class="home-people-list">${peopleMarkup}</div>
+            ${peopleMarkup}
           </section>
           <section class="home-people-section" data-people-section="discovery" aria-label="Discovery">
             ${peopleDiscoveryMarkup(discovery, discoveredPeers, discoveryRequests)}
@@ -1345,7 +1362,7 @@ function renderPeopleWindowBody(entry, summary) {
       </main>
     </section>
   `;
-  bindPeopleWindowActions(body);
+  bindPeopleWindowActions(body, entry, summary);
   schedulePeopleDiscoveryAutoRefresh(body, discovery);
 }
 
@@ -1458,40 +1475,122 @@ function peopleDiscoveryRequestMarkup(request) {
   `;
 }
 
-function peopleListCardMarkup(contact) {
+function peopleRosterRowMarkup(contact, selectedId) {
+  const rawDisplayName = peopleDisplayName(contact, "Person");
+  const displayName = escapeHtml(rawDisplayName);
+  const relationship = escapeHtml(normalizePeopleText(contact?.relationship, "connected"));
+  const contactId = normalizePeopleText(contact?.contact_id, "");
+  const selected = contactId && contactId === selectedId;
+  return `
+    <button class="home-people-row${selected ? " active" : ""}" type="button" role="option"
+      aria-selected="${selected ? "true" : "false"}" data-people-select="${escapeHtml(contactId)}">
+      <span class="home-people-avatar" aria-hidden="true">${escapeHtml(rawDisplayName.slice(0, 1).toUpperCase() || "E")}</span>
+      <span class="home-people-row-copy">
+        <span class="home-people-row-name">${displayName}</span>
+        <span class="home-people-row-sub">${relationship}</span>
+      </span>
+    </button>
+  `;
+}
+
+function peopleContactDetailMarkup(contact) {
+  if (!contact) {
+    return `
+      <div class="home-people-empty">
+        <h3>Select a person</h3>
+        <p>Choose someone from the list to see their details.</p>
+      </div>
+    `;
+  }
   const rawDisplayName = peopleDisplayName(contact, "Person");
   const displayName = escapeHtml(rawDisplayName);
   const relationship = escapeHtml(normalizePeopleText(contact?.relationship, "connected"));
   const handle = normalizePeopleText(contact?.handle, "");
   const device = normalizePeopleText(contact?.device_label, "");
-  const handleLine = handle && handle !== rawDisplayName ? `<span>${escapeHtml(handle)}</span>` : "";
-  const deviceLine = device && device !== rawDisplayName ? `<span>${escapeHtml(device)}</span>` : "";
   const contactId = escapeHtml(normalizePeopleText(contact?.contact_id, ""));
   const route = normalizePeopleText(contact?.route, "");
   const chatAction = contact?.can_message === true && route
     ? `<button class="home-people-action" type="button" data-people-action="chat" data-contact-route="${escapeHtml(route)}">Chat</button>`
     : "";
+  const detailRows = [
+    handle && handle !== rawDisplayName
+      ? `<div class="home-people-detail-row"><span class="home-people-detail-label">Handle</span><span class="home-people-detail-value">${escapeHtml(handle)}</span></div>`
+      : "",
+    device && device !== rawDisplayName
+      ? `<div class="home-people-detail-row"><span class="home-people-detail-label">Device</span><span class="home-people-detail-value">${escapeHtml(device)}</span></div>`
+      : "",
+    route
+      ? `<div class="home-people-detail-row"><span class="home-people-detail-label">Route</span><span class="home-people-detail-value home-people-detail-mono">${escapeHtml(route)}</span></div>`
+      : "",
+  ].filter(Boolean).join("");
   return `
-    <article class="home-people-card">
-      <div class="home-people-avatar" aria-hidden="true">${escapeHtml(rawDisplayName.slice(0, 1).toUpperCase() || "E")}</div>
-      <div class="home-people-card-copy">
-        <h3>${displayName}</h3>
-        <p><span>${relationship}</span>${handleLine}${deviceLine}</p>
+    <div class="home-people-detail-card">
+      <div class="home-people-detail-head">
+        <div class="home-people-avatar home-people-detail-avatar" aria-hidden="true">${escapeHtml(rawDisplayName.slice(0, 1).toUpperCase() || "E")}</div>
+        <div class="home-people-detail-copy">
+          <h3>${displayName}</h3>
+          <p>${relationship}</p>
+        </div>
       </div>
-      <div class="home-people-card-actions">
+      ${detailRows ? `<div class="home-people-detail-rows">${detailRows}</div>` : ""}
+      <div class="home-people-detail-actions">
         ${chatAction}
         <button class="home-people-action home-people-action-danger" type="button" data-people-action="remove" data-contact-id="${contactId}">Remove</button>
       </div>
-    </article>
+    </div>
   `;
 }
 
-function bindPeopleWindowActions(body) {
+function bindPeopleWindowActions(body, entry, summary) {
   body.querySelector("[data-people-profile-form]")?.addEventListener("submit", (event) => {
     event.preventDefault();
     savePeopleProfile(body, event.currentTarget).catch((error) => {
       setPeopleStatus(body, error.message || "Could not save profile.", "error");
     });
+  });
+  // Roster selection: click or arrow keys move the selection; the detail pane
+  // follows via a re-render of the same summary.
+  const selectContact = (contactId, focusRow) => {
+    if (!entry || !contactId) {
+      return;
+    }
+    entry.node.dataset.peopleSelectedContact = contactId;
+    renderPeopleWindowBody(entry, summary);
+    if (focusRow) {
+      entry.node
+        .querySelector(`[data-people-select="${CSS.escape(contactId)}"]`)
+        ?.focus();
+    }
+  };
+  for (const row of body.querySelectorAll("[data-people-select]")) {
+    row.addEventListener("click", (event) => {
+      selectContact(event.currentTarget?.dataset?.peopleSelect || "", false);
+    });
+  }
+  body.querySelector(".home-people-roster")?.addEventListener("keydown", (event) => {
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+      return;
+    }
+    const rows = [...body.querySelectorAll("[data-people-select]")];
+    if (!rows.length) {
+      return;
+    }
+    const index = rows.findIndex((row) => row.classList.contains("active"));
+    let next = index;
+    if (event.key === "ArrowDown") {
+      next = Math.min(rows.length - 1, index + 1);
+    } else if (event.key === "ArrowUp") {
+      next = Math.max(0, index - 1);
+    } else if (event.key === "Home") {
+      next = 0;
+    } else {
+      next = rows.length - 1;
+    }
+    if (next === index) {
+      return;
+    }
+    event.preventDefault();
+    selectContact(rows[next].dataset.peopleSelect || "", true);
   });
   for (const button of body.querySelectorAll("[data-people-jump]")) {
     button.addEventListener("click", (event) => {
@@ -1822,8 +1921,8 @@ async function removePersonFromPeople(body, button) {
   if (!contactId) {
     throw new Error("Person id is missing.");
   }
-  const card = button.closest(".home-people-card");
-  const label = card?.querySelector(".home-people-card-copy h3")?.textContent?.trim() || "this person";
+  const card = button.closest(".home-people-detail-card, .home-people-card");
+  const label = card?.querySelector("h3")?.textContent?.trim() || "this person";
   if (!card || card.querySelector(".home-people-confirm")) {
     return;
   }

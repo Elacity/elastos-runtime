@@ -13,9 +13,9 @@ import {
   mountGlyph,
   targetById,
   desktopObjectByEntryId,
-} from "./shell-core.js?v=home-20260701c";
-import { openFileObject } from "./shell-surface.js?v=home-20260701c";
-import { openTarget } from "./shell-windows.js?v=home-20260701c";
+} from "./shell-core.js?v=home-20260717a";
+import { openFileObject } from "./shell-surface.js?v=home-20260717a";
+import { openTarget } from "./shell-windows.js?v=home-20260717a";
 
 const panel = document.querySelector("#quick-look");
 const stage = document.querySelector("#quick-look-stage");
