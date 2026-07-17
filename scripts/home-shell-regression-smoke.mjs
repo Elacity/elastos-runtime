@@ -45,6 +45,10 @@ class FakeElement {
       : { firstElementChild: null };
   }
 
+  append(...children) {
+    for (const child of children) this.appendChild(child);
+  }
+
   appendChild(child) {
     this.children.push(child);
     return child;

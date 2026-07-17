@@ -4,6 +4,7 @@ import {
   openHomeGuiTarget,
   relaunchHomeGuiWindowForToken,
   restoreHomeGuiSession,
+  setHomeGuiMenuManifest,
   setHomeGuiMounted,
   showHomeGuiDesktop,
   syncHomeGuiProjection,
@@ -97,6 +98,10 @@ function handleGuiCommand(message) {
   }
   if (command === "show-desktop") {
     showHomeGuiDesktop();
+    return true;
+  }
+  if (command === "set-menu-manifest") {
+    setHomeGuiMenuManifest(message.windowId, message.menus);
     return true;
   }
   return false;

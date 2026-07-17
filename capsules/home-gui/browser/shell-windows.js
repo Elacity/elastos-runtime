@@ -49,6 +49,13 @@ const WINDOW_CLOSE_GUARD_MOVE_PX = 18;
 const BROWSER_DESKTOP_OPEN_GUARD_MS = 700;
 const MAX_SESSION_WINDOWS = 24;
 const SINGLE_SESSION_TARGETS = new Set(["people", "inbox", "wallet"]);
+
+/* Menu-bar honesty: "New Window" appears only where openTarget really opens
+   one. Single-session targets just refocus — the item would be a lie. */
+export function supportsMenuNewWindow(targetId) {
+  return !SINGLE_SESSION_TARGETS.has(targetId);
+}
+
 const COMMON_IFRAME_SANDBOX = [
   "allow-downloads",
   "allow-forms",

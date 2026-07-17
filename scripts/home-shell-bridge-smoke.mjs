@@ -88,6 +88,10 @@ class FakeElement {
     this.listeners.get(type).push(callback);
   }
 
+  append(...children) {
+    for (const child of children) this.appendChild(child);
+  }
+
   appendChild(child) {
     child.parentElement = this;
     this.children.push(child);
