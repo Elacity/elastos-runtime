@@ -314,7 +314,7 @@ pub(super) async fn launch_runtime_backed_home_target(
 }
 
 fn materialize_source_wasm_capsule_for_runtime(
-    data_dir: &FsPath,
+    _data_dir: &FsPath,
     capsule_dir: &FsPath,
     manifest: &elastos_common::CapsuleManifest,
 ) -> anyhow::Result<PathBuf> {
@@ -323,26 +323,16 @@ fn materialize_source_wasm_capsule_for_runtime(
         return Ok(capsule_dir.to_path_buf());
     }
 
-    let built_entrypoint = capsule_dir
-        .join("target")
-        .join("wasm32-wasip1")
-        .join("release")
-        .join(&manifest.entrypoint);
-    if !built_entrypoint.is_file() {
+    if manifest.is_component_capsule() {
         anyhow::bail!(
-            "capsule runtime entrypoint missing: {}",
-            capsule_dir.join(&manifest.entrypoint).display()
+            "Component capsule Runtime entrypoint missing: {}",
+            entrypoint.display()
         );
     }
-
-    let bundle_dir = data_dir.join("dev-capsules").join(&manifest.name);
-    std::fs::create_dir_all(&bundle_dir)?;
-    std::fs::copy(
-        capsule_dir.join("capsule.json"),
-        bundle_dir.join("capsule.json"),
-    )?;
-    std::fs::copy(&built_entrypoint, bundle_dir.join(&manifest.entrypoint))?;
-    Ok(bundle_dir)
+    anyhow::bail!(
+        "WASI Preview 1 product capsules are no longer materialized from target/wasm32-wasip1: {}",
+        entrypoint.display()
+    );
 }
 
 async fn launch_runtime_capsule(
