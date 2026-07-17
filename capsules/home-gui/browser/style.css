@@ -279,10 +279,29 @@ img {
   border: 1px solid var(--line);
   box-shadow: var(--shadow-soft);
   backdrop-filter: blur(16px);
+  transform-origin: top left;
+  animation: bar-menu-enter 140ms cubic-bezier(0.2, 0, 0, 1) both;
 }
 
 .toolbar-identity-menu[hidden] {
   display: none;
+}
+
+@keyframes bar-menu-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toolbar-identity-menu {
+    animation: none;
+  }
 }
 
 .toolbar-identity-header {
@@ -603,6 +622,7 @@ img {
 }
 
 .control-centre-segment {
+  position: relative;
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: 2px;
@@ -611,25 +631,52 @@ img {
   background: var(--lift);
 }
 
+/* The selection is one physical thumb that slides between options (iOS
+   segmented-control grammar) — state moves through space, it does not
+   teleport. Driven by --segment-index from the controller. */
+.control-centre-segment-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: calc((100% - 8px) / 3);
+  height: calc(100% - 4px);
+  border-radius: 7px;
+  background: var(--panel);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18);
+  transform: translateX(calc(var(--segment-index, 0) * (100% + 2px)));
+  transition: transform 240ms cubic-bezier(0.3, 0.85, 0.25, 1);
+  pointer-events: none;
+}
+
 .control-centre-segment-option {
+  position: relative;
+  z-index: 1;
   padding: 6px 0;
   border: 0;
   border-radius: 7px;
   background: transparent;
-  color: var(--text);
+  color: var(--muted);
   font-family: inherit;
   font-size: 12.5px;
   font-weight: 500;
   cursor: pointer;
+  transition: color 160ms ease;
 }
 
 .control-centre-segment-option:hover {
-  background: var(--lift);
+  color: var(--text);
 }
 
 .control-centre-segment-option.active {
-  background: var(--panel);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18);
+  color: var(--text);
+  font-weight: 600;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .control-centre-segment-thumb,
+  .control-centre-segment-option {
+    transition: none;
+  }
 }
 
 .control-centre-divider {
