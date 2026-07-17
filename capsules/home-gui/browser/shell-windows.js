@@ -79,7 +79,7 @@ const COMMON_IFRAME_ALLOW = ["autoplay", "fullscreen"];
 const BROWSER_IFRAME_ALLOW_EXTRAS = ["clipboard-read", "clipboard-write"];
 const pendingWindowLaunches = new Set();
 
-function iframeSandboxForLaunch(launched) {
+export function iframeSandboxForLaunch(launched) {
   const tokens = [...COMMON_IFRAME_SANDBOX];
   if (launched?.target === "browser") {
     tokens.push(...BROWSER_IFRAME_SANDBOX_EXTRAS);
@@ -93,7 +93,7 @@ function iframeSandboxForLaunch(launched) {
   return tokens.join(" ");
 }
 
-function iframeAllowForLaunch(launched) {
+export function iframeAllowForLaunch(launched) {
   const tokens = [...COMMON_IFRAME_ALLOW];
   if (launched?.target === "browser") {
     tokens.push(...BROWSER_IFRAME_ALLOW_EXTRAS);
@@ -118,6 +118,16 @@ function requireWindowHooks() {
     throw new Error("Home window hooks are not configured");
   }
   return windowHooks;
+}
+
+/* Authority-carrying launch for chrome surfaces (wallet rail, connector sheet).
+   Must go through the host bridge — never raw fetch from the GUI frame. */
+export async function launchHomeTarget(targetId, query = {}) {
+  const launched = await requireWindowHooks().launchTarget(targetId, query);
+  if (!launched || typeof launched !== "object") {
+    throw new Error("Home launch returned no result");
+  }
+  return launched;
 }
 
 function refreshWindowUi() {

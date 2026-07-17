@@ -1,6 +1,5 @@
-import { shellState, targetById } from "./shell-core.js?v=home-20260718n";
-import { openTarget } from "./shell-windows.js?v=home-20260718n";
 import { uiSoundsEnabled, setUiSoundsEnabled, playUiSound } from "./shell-sounds.js?v=home-20260718n";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260718n";
 
 /* Control Centre: the quick layer for controls that already have canonical
    stores — theme (elastos-theme.js), UI sounds (shell-sounds.js), fullscreen
@@ -54,11 +53,11 @@ export function bindControlCentre() {
   });
 
   walletRow?.addEventListener("click", () => {
-    if (!targetById(shellState.currentSummary, "wallet")) {
+    if (!walletRailAvailable()) {
       return;
     }
     hideControlCentre({ restoreFocus: false });
-    openTarget("wallet");
+    showWalletRail();
   });
 
   panel.addEventListener("keydown", (event) => {
@@ -141,7 +140,7 @@ function syncWalletRow() {
   }
   // No wallet target in this home means no wallet affordance — never a dead
   // button (fail-closed, matching the capability discipline everywhere else).
-  walletRow.hidden = !targetById(shellState.currentSummary, "wallet");
+  walletRow.hidden = !walletRailAvailable();
 }
 
 function bindOutsideDismiss() {

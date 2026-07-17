@@ -99,6 +99,10 @@ import {
   bindControlCentre,
   hideControlCentre,
 } from "./shell-control-centre.js?v=home-20260718n";
+import {
+  bindWalletRail,
+  retireWalletRail,
+} from "./shell-wallet-rail.js?v=home-20260718n";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
@@ -113,6 +117,7 @@ bindExpose();
 bindShellKeyboard();
 bindMenubar({ closeWindow, openTarget, supportsNewWindow: supportsMenuNewWindow });
 bindControlCentre();
+bindWalletRail();
 
 const HOME_GUI_HOST_SELECTORS = Object.freeze([
   ".desktop-backdrop",
@@ -124,6 +129,7 @@ const HOME_GUI_HOST_SELECTORS = Object.freeze([
   "#home-notification-toast",
   "#notification-center",
   "#control-centre",
+  "#wallet-rail",
   "#spotlight",
   "#window-switcher",
   "#quick-look",
@@ -196,6 +202,7 @@ export function retireHomeGuiSurface(options = {}) {
   hideSpotlight({ restoreFocus: false });
   hideNotificationCenter();
   hideControlCentre({ restoreFocus: false });
+  retireWalletRail();
   hideAboutOverlay({ restoreFocus: false });
   hideQuickLook();
   closeExpose();
