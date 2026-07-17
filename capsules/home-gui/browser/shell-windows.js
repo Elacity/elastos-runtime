@@ -49,6 +49,7 @@ const REQUIRED_WINDOW_HOOKS = [
   "refreshLauncherIfVisible",
   "renderDesktop",
   "renderTaskbar",
+  "syncMenubar",
   "updateTaskbarState",
 ];
 const WINDOW_CONTROL_GUARD_MS = 400;
@@ -180,6 +181,7 @@ function refreshWindowUi() {
   hooks.updateTaskbarState();
   hooks.refreshLauncherIfVisible();
   syncToolbarActiveTitle();
+  hooks.syncMenubar();
 }
 
 /* ---- Window lifecycle motion (compositor-only: transform + opacity) ----

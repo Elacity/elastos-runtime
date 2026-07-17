@@ -65,11 +65,45 @@ import {
   refreshHomeInternalWindows,
   restoreShellSession,
   showDesktopHome,
+  supportsMenuNewWindow,
 } from "./shell-windows.js?v=home-20260717b";
+import {
+  bindShellKeyboard,
+  handleDesktopArrowKey,
+  retireKeyboardSurfaces,
+} from "./shell-keyboard.js?v=home-20260717b";
+import {
+  bindSpotlight,
+  hideSpotlight,
+  showSpotlight,
+} from "./shell-spotlight.js?v=home-20260717b";
+import {
+  bindNotificationCenter,
+  hideNotificationCenter,
+  recordNotifications,
+} from "./shell-notifications.js?v=home-20260717b";
+import {
+  bindMenubar,
+  closeMenus,
+  setMenuManifest,
+  syncMenubar,
+} from "./shell-menubar.js?v=home-20260717b";
+import {
+  bindQuickLook,
+  hideQuickLook,
+  toggleQuickLook,
+} from "./shell-quicklook.js?v=home-20260717b";
+import { bindExpose, closeExpose } from "./shell-expose.js?v=home-20260717b";
 
 await ensureHomeGuiDom();
 bindIdentityMenu();
 bindShellSurfaceDom();
+bindSpotlight();
+bindNotificationCenter();
+bindQuickLook();
+bindExpose();
+bindShellKeyboard();
+bindMenubar({ closeWindow, openTarget, supportsNewWindow: supportsMenuNewWindow });
 
 const HOME_GUI_HOST_SELECTORS = Object.freeze([
   ".desktop-backdrop",
@@ -109,6 +143,7 @@ configureWindowHooks({
   refreshLauncherIfVisible,
   renderDesktop,
   renderTaskbar,
+  syncMenubar,
   updateTaskbarState,
 });
 
@@ -145,6 +180,12 @@ export function retireHomeGuiSurface(options = {}) {
   hideLauncher();
   hideDesktopContextMenu();
   clearDesktopSelection();
+  hideSpotlight({ restoreFocus: false });
+  hideNotificationCenter();
+  hideQuickLook();
+  closeExpose();
+  retireKeyboardSurfaces();
+  closeMenus({ restoreFocus: false });
   if (options.closeWindows === true) {
     for (const id of [...shellState.windows.keys()]) {
       closeWindow(id);
@@ -369,6 +410,13 @@ export function syncHomeGuiChrome(previous, summary) {
   syncIdentity(summary);
   renderInboxBadge(summary);
   maybeShowWalletApprovalToast(previous, summary);
+  recordNotifications(summary);
+}
+
+/* Menus are self-declared UI, not authority: the host verifies the sender's
+   frame identity and hands us only that window's id. */
+export function setHomeGuiMenuManifest(windowId, menus) {
+  setMenuManifest(windowId, menus);
 }
 
 export function renderHomeGuiShell(summary, options = {}) {
@@ -594,6 +642,10 @@ export function bindHomeGuiInteractions(options = {}) {
       });
   });
 
+  document.querySelector("#toolbar-spotlight")?.addEventListener("click", () => {
+    showSpotlight();
+  });
+
   launcherToggleButton?.addEventListener("click", () => {
     toggleLauncher();
   });
@@ -632,15 +684,26 @@ export function bindHomeGuiInteractions(options = {}) {
       clearDesktopSelection();
       return;
     }
+    // Space = Quick Look (macOS); Enter opens. Bare Space must not also open.
+    if (event.code === "Space" && !event.metaKey && !event.ctrlKey && !event.altKey) {
+      event.preventDefault();
+      event.stopPropagation();
+      toggleQuickLook();
+      return;
+    }
+    if (event.key === "Enter" && shellState.selectedDesktopTargetId) {
+      event.preventDefault();
+      event.stopPropagation();
+      openSelectedDesktopEntry();
+      return;
+    }
     if ((event.key === "a" || event.key === "A") && (event.metaKey || event.ctrlKey)) {
       event.preventDefault();
       selectAllDesktopIcons();
       return;
     }
-    if ((event.key === "Enter" || event.key === " ") && shellState.selectedDesktopTargetId) {
-      event.preventDefault();
-      event.stopPropagation();
-      openSelectedDesktopEntry();
+    if (event.key.startsWith("Arrow") && !event.metaKey && !event.ctrlKey && !event.altKey) {
+      handleDesktopArrowKey(event);
     }
   });
 

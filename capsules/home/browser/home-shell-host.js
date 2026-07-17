@@ -215,6 +215,12 @@ async function deliverMessageToHomeGuiTargetFrame(target, payload) {
   return module.deliverMessageToHomeGuiTargetFrame(target, payload);
 }
 
+async function setHomeGuiMenuManifest(windowId, menus) {
+  requireHomeGuiActive("set menu manifest");
+  const module = await ensureHomeGuiModule();
+  module.setHomeGuiMenuManifest(windowId, menus);
+}
+
 async function openHomeGuiTargetWithPayload(target, payload) {
   requireHomeGuiActive("open target with payload");
   const module = await ensureHomeGuiModule();
@@ -688,6 +694,18 @@ window.addEventListener("message", (event) => {
   }
   if (data.type === "home:refresh-summary") {
     requestShellSummaryRefresh({ reason: "child-message" });
+    return;
+  }
+  if (data.type === "home:menu-manifest") {
+    // Menus are self-declared UI, not authority: a window may only shape its
+    // OWN menu bar entry, so the manifest binds to the sender's window id.
+    if (context.kind !== "app-frame" || !context.windowId) {
+      console.warn("home ignored unauthorized menu-manifest message", context.targetId);
+      return;
+    }
+    setHomeGuiMenuManifest(context.windowId, data.menus).catch((error) => {
+      console.error("home menu-manifest failed", error);
+    });
     return;
   }
   if (data.type === "home:active-shell-applied") {
