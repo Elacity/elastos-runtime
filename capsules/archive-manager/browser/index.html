@@ -777,6 +777,57 @@
       });
     }
 
+    // Shell menu bar: declare File/Edit menus to Home; commands come back as
+    // elastos:menu-command and route to the same functions the buttons use.
+    (function bindShellMenu() {
+      const homeToken = params.get("home_token") || "";
+      if (!homeToken || window.parent === window) {
+        return;
+      }
+      window.parent.postMessage({
+        type: "home:menu-manifest",
+        homeToken,
+        menus: [
+          {
+            title: "File",
+            items: [
+              { label: "Open Archive...", cmd: "open-archive" },
+              { label: "New Archive...", cmd: "new-archive" },
+              "-",
+              { label: "Close Window", cmd: "__close-window" },
+            ],
+          },
+          {
+            title: "Edit",
+            items: [
+              { label: "Select All Safe Files", cmd: "select-all-safe" },
+              { label: "Clear Selection", cmd: "clear-selection" },
+            ],
+          },
+        ],
+      }, window.location.origin);
+      window.addEventListener("message", (event) => {
+        if (event.origin !== window.location.origin) return;
+        const message = event.data;
+        if (message?.type !== "elastos:menu-command" || typeof message.cmd !== "string") return;
+        switch (message.cmd) {
+          case "open-archive":
+            openLibraryPicker("open");
+            return;
+          case "new-archive":
+            openLibraryPicker("create");
+            return;
+          case "select-all-safe":
+            document.querySelector("#select-all-safe").click();
+            return;
+          case "clear-selection":
+            document.querySelector("#clear-selection").click();
+            return;
+          default:
+        }
+      });
+    })();
+
     function showEmptyState() {
       document.querySelector("#empty-state").hidden = false;
       document.querySelector("#archive-workspace").hidden = true;

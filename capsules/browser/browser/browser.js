@@ -1504,6 +1504,76 @@ profileResetCommitButton?.addEventListener("click", () => {
   });
 });
 
+// Shell menu bar: declare File/View/History menus to Home; commands come back
+// as elastos:menu-command and drive the same toolbar handlers.
+function announceShellMenuManifest() {
+  if (!launchToken || window.parent === window) {
+    return;
+  }
+  window.parent.postMessage({
+    type: "home:menu-manifest",
+    homeToken: launchToken,
+    menus: [
+      {
+        title: "File",
+        items: [
+          { label: "Open Location", cmd: "open-location" },
+          "-",
+          { label: "Settings...", cmd: "settings" },
+          "-",
+          { label: "Close Window", cmd: "__close-window" },
+        ],
+      },
+      {
+        title: "View",
+        items: [
+          { label: "Reload Page", cmd: "reload" },
+        ],
+      },
+      {
+        title: "History",
+        items: [
+          { label: "Back", cmd: "back" },
+          { label: "Forward", cmd: "forward" },
+        ],
+      },
+    ],
+  }, window.location.origin);
+}
+
+function onShellMenuCommand(event) {
+  if (event.origin !== window.location.origin) {
+    return;
+  }
+  const message = event.data;
+  if (message?.type !== "elastos:menu-command" || typeof message.cmd !== "string") {
+    return;
+  }
+  switch (message.cmd) {
+    case "open-location":
+      addressInput.focus();
+      addressInput.select();
+      return;
+    case "settings":
+      setSettingsOpen(true);
+      void fetchBrowserSummary();
+      return;
+    case "reload":
+      refreshButton.click();
+      return;
+    case "back":
+      backButton.click();
+      return;
+    case "forward":
+      forwardButton.click();
+      return;
+    default:
+  }
+}
+
+window.addEventListener("message", onShellMenuCommand);
+announceShellMenuManifest();
+
 bindBrowserInputSurface({
   copyRemoteClipboardToHost,
   friendlyOpenError,

@@ -33,5 +33,58 @@
     </section>
   </main>
   <script type="module" src="player.js?v=20260618-audiocard"></script>
+  <script>
+    // Shell menu bar: a Playback menu driving the SAME <video> element the
+    // native controls use. No open/new-window entries — a protected viewer
+    // must never offer a menu side door into a dKMS open.
+    (function () {
+      const homeToken = new URLSearchParams(window.location.search).get("home_token") || "";
+      if (!homeToken || window.parent === window) {
+        return;
+      }
+      window.parent.postMessage({
+        type: "home:menu-manifest",
+        homeToken,
+        menus: [
+          {
+            title: "File",
+            items: [
+              { label: "Close Window", cmd: "__close-window" },
+            ],
+          },
+          {
+            title: "Playback",
+            items: [
+              { label: "Play / Pause", cmd: "play-pause" },
+              "-",
+              { label: "Enter Full Screen", cmd: "fullscreen" },
+            ],
+          },
+        ],
+      }, window.location.origin);
+      window.addEventListener("message", (event) => {
+        if (event.origin !== window.location.origin) {
+          return;
+        }
+        const message = event.data;
+        if (message?.type !== "elastos:menu-command" || typeof message.cmd !== "string") {
+          return;
+        }
+        const video = document.getElementById("video");
+        if (!video) {
+          return;
+        }
+        if (message.cmd === "play-pause") {
+          if (video.paused) {
+            video.play().catch(() => {});
+          } else {
+            video.pause();
+          }
+        } else if (message.cmd === "fullscreen") {
+          video.requestFullscreen?.().catch(() => {});
+        }
+      });
+    })();
+  </script>
 </body>
 </html>

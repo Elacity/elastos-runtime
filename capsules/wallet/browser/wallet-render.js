@@ -3,7 +3,7 @@ import {
   assetColor,
   formatAmount,
   shortAddress,
-} from "./wallet-format.js?v=wallet-20260523a";
+} from "./wallet-format.js?v=wallet-20260717a";
 
 export function createWalletRender({ statusNode }) {
   function showStatus(message, tone) {

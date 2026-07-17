@@ -112,5 +112,49 @@
     import init from "./chat_room_ui.js?v=chat-room-ui-20260612c";
     init(new URL("./chat_room_ui_bg.wasm?v=chat-room-ui-20260612c", import.meta.url));
   </script>
+  <script>
+    // Shell menu bar: the WASM app owns the room logic, so the host page
+    // declares the menus and routes each command to the SAME on-screen
+    // control the pointer would use — no second path into the app.
+    (function () {
+      const homeToken = new URLSearchParams(window.location.search).get("home_token") || "";
+      if (!homeToken || window.parent === window) {
+        return;
+      }
+      window.parent.postMessage({
+        type: "home:menu-manifest",
+        homeToken,
+        menus: [
+          {
+            title: "File",
+            items: [
+              { label: "Close Window", cmd: "__close-window" },
+            ],
+          },
+          {
+            title: "View",
+            items: [
+              { label: "People", cmd: "toggle-people" },
+              { label: "Access Settings", cmd: "toggle-access" },
+            ],
+          },
+        ],
+      }, window.location.origin);
+      window.addEventListener("message", (event) => {
+        if (event.origin !== window.location.origin) {
+          return;
+        }
+        const message = event.data;
+        if (message?.type !== "elastos:menu-command" || typeof message.cmd !== "string") {
+          return;
+        }
+        if (message.cmd === "toggle-people") {
+          document.getElementById("participant-toggle")?.click();
+        } else if (message.cmd === "toggle-access") {
+          document.getElementById("room-access-toggle")?.click();
+        }
+      });
+    })();
+  </script>
 </body>
 </html>

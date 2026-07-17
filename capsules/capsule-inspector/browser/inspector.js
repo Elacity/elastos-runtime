@@ -203,6 +203,8 @@ function kv(pairs) {
 function renderList(capsules, activeId, onSelect) {
   const list = document.getElementById("capsule-list");
   list.innerHTML = "";
+  list.setAttribute("role", "listbox");
+  list.setAttribute("aria-label", "Capsules");
   for (const c of capsules) {
     const item = el("li", {
       class: "capsule-item" + (c.id === activeId ? " active" : ""),
@@ -213,9 +215,44 @@ function renderList(capsules, activeId, onSelect) {
       ]),
       el("span", { class: "state-pill state-" + (c.state || "stopped") }),
     ]);
+    item.setAttribute("role", "option");
+    item.setAttribute("aria-selected", c.id === activeId ? "true" : "false");
+    item.tabIndex = c.id === activeId || (!activeId && c === capsules[0]) ? 0 : -1;
     item.addEventListener("click", () => onSelect(c.id));
     list.appendChild(item);
   }
+}
+
+// Capsule list keyboard: arrows move the selection, Home/End jump, and the
+// detail pane follows — the list behaves like a real listbox, not a webpage.
+function bindListKeyboard(onSelect) {
+  const list = document.getElementById("capsule-list");
+  list.addEventListener("keydown", (event) => {
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+      return;
+    }
+    const capsules = state.capsules || [];
+    if (!capsules.length) {
+      return;
+    }
+    const index = capsules.findIndex((c) => c.id === state.activeId);
+    let next = index;
+    if (event.key === "ArrowDown") {
+      next = Math.min(capsules.length - 1, index + 1);
+    } else if (event.key === "ArrowUp") {
+      next = Math.max(0, index - 1);
+    } else if (event.key === "Home") {
+      next = 0;
+    } else {
+      next = capsules.length - 1;
+    }
+    if (next === index) {
+      return;
+    }
+    event.preventDefault();
+    onSelect(capsules[next].id);
+    list.querySelectorAll(".capsule-item")[next]?.focus();
+  });
 }
 
 function renderAffordances(affordances) {
@@ -530,6 +567,7 @@ async function selectCapsule(id) {
 }
 
 async function boot() {
+  bindListKeyboard(selectCapsule);
   state.capsules = await loadCapsuleList();
   renderList(state.capsules, null, selectCapsule);
   if (state.capsules.length) {

@@ -1540,7 +1540,7 @@ assert(
     browserJs.includes("navigator.clipboard.writeText(message)") &&
     browserStyle.includes('.browser-status[data-visible="true"][data-copyable="true"]') &&
     browserStyle.includes(".browser-status-copy") &&
-    browser.includes("browser-20260629b"),
+    browser.includes("browser-20260717a"),
   "Browser sticky status/errors must be copyable so live product failures can produce actionable evidence",
 );
 

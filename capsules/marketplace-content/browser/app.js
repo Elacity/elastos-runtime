@@ -755,6 +755,54 @@
     // theme — delegate to the shared runtime (elastos-theme.js) so the choice persists and syncs across frames
     $("#theme-toggle").addEventListener("click", () => { if (window.elastosTheme) window.elastosTheme.set(window.elastosTheme.resolved() === "light" ? "dark" : "light"); });
     window.addEventListener("hashchange", router);
+    announceShellMenuManifest();
+    window.addEventListener("message", onShellMenuCommand);
+  }
+
+  // Shell menu bar: declare File/Go/View menus to Home; commands come back as
+  // elastos:menu-command and drive the same hash router the rail links use.
+  function announceShellMenuManifest() {
+    const homeToken = (() => { try { return new URL(location.href).searchParams.get("home_token") || ""; } catch { return ""; } })();
+    if (!homeToken || window.parent === window) return;
+    window.parent.postMessage({
+      type: "home:menu-manifest",
+      homeToken,
+      menus: [
+        {
+          title: "File",
+          items: [
+            { label: "Close Window", cmd: "__close-window" },
+          ],
+        },
+        {
+          title: "Go",
+          items: [
+            { label: "Discover", cmd: "go-discover" },
+            { label: "Vault", cmd: "go-vault" },
+            { label: "Activity", cmd: "go-activity" },
+          ],
+        },
+        {
+          title: "View",
+          items: [
+            { label: "Find", cmd: "find" },
+          ],
+        },
+      ],
+    }, window.location.origin);
+  }
+
+  function onShellMenuCommand(event) {
+    if (event.origin !== window.location.origin) return;
+    const message = event.data;
+    if (message?.type !== "elastos:menu-command" || typeof message.cmd !== "string") return;
+    switch (message.cmd) {
+      case "go-discover": location.hash = "#/discover"; return;
+      case "go-vault": location.hash = "#/vault"; return;
+      case "go-activity": location.hash = "#/activity"; return;
+      case "find": { const field = $("#search"); field?.focus(); field?.select(); return; }
+      default:
+    }
   }
 
   async function boot() {

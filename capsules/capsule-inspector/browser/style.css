@@ -91,6 +91,7 @@ html, body {
 }
 .capsule-item:hover { background: var(--panel-2); }
 .capsule-item.active { background: var(--panel-2); outline: 1px solid var(--line); }
+.capsule-item:focus-visible { outline: 2px solid var(--el-focus); outline-offset: -2px; }
 .capsule-item .ci-name { font-weight: 600; }
 .capsule-item .ci-role { color: var(--muted); font-size: 12px; }
 .state-pill {

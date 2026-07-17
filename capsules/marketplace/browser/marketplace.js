@@ -100,7 +100,73 @@
         els.detailModal.classList.remove("active");
         els.installModal.classList.remove("active");
       }
+      // ⌘K / Ctrl+K focuses search — parity with the content market.
+      if ((event.metaKey || event.ctrlKey) && String(event.key).toLowerCase() === "k") {
+        event.preventDefault();
+        els.searchInput.focus();
+        els.searchInput.select();
+      }
     });
+    announceShellMenuManifest();
+    window.addEventListener("message", onShellMenuCommand);
+  }
+
+  // Shell menu bar: declare File/View menus to Home; commands come back as
+  // elastos:menu-command and route to the same functions the chrome uses.
+  function announceShellMenuManifest() {
+    if (!homeToken || window.parent === window) {
+      return;
+    }
+    window.parent.postMessage({
+      type: "home:menu-manifest",
+      homeToken,
+      menus: [
+        {
+          title: "File",
+          items: [
+            { label: "Refresh", cmd: "refresh" },
+            "-",
+            { label: "Close Window", cmd: "__close-window" },
+          ],
+        },
+        {
+          title: "View",
+          items: [
+            { label: "Discover", cmd: "tab-discover" },
+            { label: "Installed", cmd: "tab-installed" },
+            "-",
+            { label: "Find", cmd: "find" },
+          ],
+        },
+      ],
+    }, window.location.origin);
+  }
+
+  function onShellMenuCommand(event) {
+    if (event.origin !== window.location.origin) {
+      return;
+    }
+    const message = event.data;
+    if (message?.type !== "elastos:menu-command" || typeof message.cmd !== "string") {
+      return;
+    }
+    switch (message.cmd) {
+      case "refresh":
+        // loadData surfaces its own failures via toast; render always runs.
+        loadData().then(render);
+        return;
+      case "tab-discover":
+        selectTab("discover");
+        return;
+      case "tab-installed":
+        selectTab("installed");
+        return;
+      case "find":
+        els.searchInput.focus();
+        els.searchInput.select();
+        return;
+      default:
+    }
   }
 
   function renderCategories() {

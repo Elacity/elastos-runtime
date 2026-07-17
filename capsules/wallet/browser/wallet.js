@@ -1,6 +1,6 @@
-import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260523a";
-import { createWalletApi, readQueryParam } from "./wallet-api.js?v=wallet-20260523a";
-import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260523a";
+import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260717a";
+import { createWalletApi, readQueryParam } from "./wallet-api.js?v=wallet-20260717a";
+import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260717a";
 import {
   BALANCE_NETWORKS,
   MANAGED_CHAIN_NAMESPACES,
@@ -19,14 +19,14 @@ import {
   readText,
   shortAddress,
   validateAddress,
-} from "./wallet-format.js?v=wallet-20260523a";
-import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260523a";
-import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260523a";
-import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260523a";
-import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260523a";
-import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260523a";
-import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260523a";
-import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260522a";
+} from "./wallet-format.js?v=wallet-20260717a";
+import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260717a";
+import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260717a";
+import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260717a";
+import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260717a";
+import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260717a";
+import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260717a";
+import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260717a";
 import {
   accountCard,
   copyButton,
@@ -34,7 +34,7 @@ import {
   emptyHero,
   setBusy,
   textNode,
-} from "./wallet-render.js?v=wallet-20260523a";
+} from "./wallet-render.js?v=wallet-20260717a";
 
 const statusNode = document.querySelector("#wallet-status");
 const accountsNode = document.querySelector("#wallet-accounts");
@@ -228,7 +228,70 @@ function boot() {
   });
   bindPreferenceEvents();
   window.addEventListener("message", onRuntimeEvents);
+  window.addEventListener("message", onShellMenuCommand);
+  announceShellMenuManifest();
   refreshWalletState().catch((error) => showStatus(String(error.message || error), "error"));
+}
+
+// Shell menu bar: declare File/Account menus to Home; commands come back as
+// elastos:menu-command and route to the same flows the buttons open. Every
+// entry still ends at the same passkey/approval gates — menus add no authority.
+function announceShellMenuManifest() {
+  if (!activeHomeToken || window.parent === window) {
+    return;
+  }
+  window.parent.postMessage({
+    type: "home:menu-manifest",
+    homeToken: activeHomeToken,
+    menus: [
+      {
+        title: "File",
+        items: [
+          { label: "Send...", cmd: "send" },
+          { label: "Receive...", cmd: "receive" },
+          "-",
+          { label: "Refresh", cmd: "refresh" },
+          "-",
+          { label: "Close Window", cmd: "__close-window" },
+        ],
+      },
+      {
+        title: "Account",
+        items: [
+          { label: "Create Account...", cmd: "create-account" },
+          { label: "Import Recovery Key...", cmd: "import-recovery-key" },
+        ],
+      },
+    ],
+  }, window.location.origin);
+}
+
+function onShellMenuCommand(event) {
+  if (event.origin !== window.location.origin) {
+    return;
+  }
+  const message = event.data;
+  if (message?.type !== "elastos:menu-command" || typeof message.cmd !== "string") {
+    return;
+  }
+  switch (message.cmd) {
+    case "send":
+      openSendFlow();
+      return;
+    case "receive":
+      openReceiveFlow();
+      return;
+    case "refresh":
+      refreshWalletState().catch((error) => showStatus(String(error.message || error), "error"));
+      return;
+    case "create-account":
+      openCreateAccountFlow();
+      return;
+    case "import-recovery-key":
+      openImportRecoveryKeyFlow();
+      return;
+    default:
+  }
 }
 
 function onRuntimeEvents(event) {

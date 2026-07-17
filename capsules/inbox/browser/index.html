@@ -1038,10 +1038,96 @@
       button.addEventListener("click", () => setFilter(button.dataset.filter));
     }
 
+    // Shell menu bar: declare File/View menus to Home; commands come back as
+    // elastos:menu-command and route to the same functions the buttons use.
+    function announceShellMenuManifest() {
+      if (!state.homeToken || window.parent === window) {
+        return;
+      }
+      window.parent.postMessage({
+        type: "home:menu-manifest",
+        homeToken: state.homeToken,
+        menus: [
+          {
+            title: "File",
+            items: [
+              { label: "Refresh", cmd: "refresh" },
+              "-",
+              { label: "Close Window", cmd: "__close-window" },
+            ],
+          },
+          {
+            title: "View",
+            items: [
+              { label: "All Pending", cmd: "filter-all" },
+              { label: "Needs Review", cmd: "filter-review" },
+            ],
+          },
+        ],
+      }, window.location.origin);
+    }
+
+    function handleShellMenuCommand(cmd) {
+      switch (cmd) {
+        case "refresh":
+          requestInboxRefresh().catch((error) => setStatus(error.message || "Could not refresh."));
+          return;
+        case "filter-all":
+          setFilter("all");
+          return;
+        case "filter-review":
+          setFilter("review");
+          return;
+        default:
+      }
+    }
+
+    window.addEventListener("message", (event) => {
+      if (event.origin !== window.location.origin) {
+        return;
+      }
+      const message = event.data;
+      if (message?.type === "elastos:menu-command" && typeof message.cmd === "string") {
+        handleShellMenuCommand(message.cmd);
+      }
+    });
+
+    // List keyboard: the requests list is a listbox — arrows move the
+    // selection, Home/End jump, and the reading pane follows.
+    elements.entryRows.addEventListener("keydown", (event) => {
+      if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+        return;
+      }
+      const entries = filteredEntries();
+      if (!entries.length) {
+        return;
+      }
+      const index = entries.findIndex((entry) => entry.id === state.selectedId);
+      let next = index;
+      if (event.key === "ArrowDown") {
+        next = Math.min(entries.length - 1, index + 1);
+      } else if (event.key === "ArrowUp") {
+        next = Math.max(0, index - 1);
+      } else if (event.key === "Home") {
+        next = 0;
+      } else {
+        next = entries.length - 1;
+      }
+      if (next === index) {
+        return;
+      }
+      event.preventDefault();
+      state.selectedId = entries[next].id || "";
+      renderInbox(state.lastNotifications);
+      const rows = elements.entryRows.querySelectorAll(".entry-row");
+      rows[next]?.focus();
+    });
+
     if (!state.homeToken) {
       showLocked();
     } else {
       showInbox();
+      announceShellMenuManifest();
       requestInboxRefresh().catch(() => {});
       window.addEventListener("message", onRuntimeEvents);
       window.setInterval(() => {
