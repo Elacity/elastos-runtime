@@ -63,6 +63,9 @@ const backButton = document.querySelector("#browser-back");
 const forwardButton = document.querySelector("#browser-forward");
 const refreshButton = document.querySelector("#browser-refresh");
 const profileResetButton = document.querySelector("#browser-profile-reset");
+const profileResetConfirm = document.querySelector("#browser-profile-reset-confirm");
+const profileResetCommitButton = document.querySelector("#browser-profile-reset-commit");
+const profileResetCancelButton = document.querySelector("#browser-profile-reset-cancel");
 const settingsButton = document.querySelector("#browser-settings");
 const settingsPanel = document.querySelector("#browser-settings-panel");
 const settingsCloseButton = document.querySelector("#browser-settings-close");
@@ -111,6 +114,22 @@ function setSettingsOpen(open) {
   }
   settingsPanel.hidden = !open;
   settingsButton.setAttribute("aria-expanded", open ? "true" : "false");
+  if (!open) {
+    setProfileResetConfirmOpen(false);
+  }
+}
+
+function setProfileResetConfirmOpen(open) {
+  if (!profileResetConfirm) {
+    return;
+  }
+  profileResetConfirm.hidden = !open;
+  if (profileResetButton) {
+    profileResetButton.hidden = open;
+  }
+  if (open) {
+    profileResetCancelButton?.focus();
+  }
 }
 
 function focusRemoteInput() {
@@ -1433,9 +1452,7 @@ async function resetBrowserProfile() {
     showStatus("Browser profile reset requires a Browser launch token.", { sticky: true });
     return;
   }
-  if (!window.confirm("Reset Browser cookies, local storage, history, and cache for this account?")) {
-    return;
-  }
+  setProfileResetConfirmOpen(false);
   const activePage = currentPage;
   const rememberedPage = rememberedRuntimePage();
   const stalePage =
@@ -1473,10 +1490,89 @@ async function resetBrowserProfile() {
 }
 
 profileResetButton?.addEventListener("click", () => {
+  setProfileResetConfirmOpen(true);
+});
+
+profileResetCancelButton?.addEventListener("click", () => {
+  setProfileResetConfirmOpen(false);
+  profileResetButton?.focus();
+});
+
+profileResetCommitButton?.addEventListener("click", () => {
   resetBrowserProfile().catch((error) => {
     showStatus(friendlyOpenError(error), { sticky: true });
   });
 });
+
+// Shell menu bar: declare File/View/History menus to Home; commands come back
+// as elastos:menu-command and drive the same toolbar handlers.
+function announceShellMenuManifest() {
+  if (!launchToken || window.parent === window) {
+    return;
+  }
+  window.parent.postMessage({
+    type: "home:menu-manifest",
+    homeToken: launchToken,
+    menus: [
+      {
+        title: "File",
+        items: [
+          { label: "Open Location", cmd: "open-location" },
+          "-",
+          { label: "Settings...", cmd: "settings" },
+          "-",
+          { label: "Close Window", cmd: "__close-window" },
+        ],
+      },
+      {
+        title: "View",
+        items: [
+          { label: "Reload Page", cmd: "reload" },
+        ],
+      },
+      {
+        title: "History",
+        items: [
+          { label: "Back", cmd: "back" },
+          { label: "Forward", cmd: "forward" },
+        ],
+      },
+    ],
+  }, window.location.origin);
+}
+
+function onShellMenuCommand(event) {
+  if (event.origin !== window.location.origin) {
+    return;
+  }
+  const message = event.data;
+  if (message?.type !== "elastos:menu-command" || typeof message.cmd !== "string") {
+    return;
+  }
+  switch (message.cmd) {
+    case "open-location":
+      addressInput.focus();
+      addressInput.select();
+      return;
+    case "settings":
+      setSettingsOpen(true);
+      void fetchBrowserSummary();
+      return;
+    case "reload":
+      refreshButton.click();
+      return;
+    case "back":
+      backButton.click();
+      return;
+    case "forward":
+      forwardButton.click();
+      return;
+    default:
+  }
+}
+
+window.addEventListener("message", onShellMenuCommand);
+announceShellMenuManifest();
 
 bindBrowserInputSurface({
   copyRemoteClipboardToHost,

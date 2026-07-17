@@ -1,16 +1,17 @@
+/* Chrome rides the shared tokens (dark default, light via data-el-theme).
+   The page stage itself stays white below — that is content, not chrome. */
 :root {
-  color-scheme: light;
-  --bg: #f7f3ea;
-  --surface: rgba(255, 255, 255, 0.88);
-  --surface-strong: #ffffff;
-  --ink: #16130e;
-  --ink-soft: rgba(22, 19, 14, 0.66);
-  --ink-mute: rgba(22, 19, 14, 0.44);
-  --line: rgba(22, 19, 14, 0.12);
-  --line-strong: rgba(22, 19, 14, 0.22);
-  --accent: #d46f24;
-  --accent-soft: rgba(212, 111, 36, 0.14);
-  --shadow: 0 10px 34px rgba(38, 29, 18, 0.1);
+  --bg: var(--el-bg);
+  --surface: var(--el-surface);
+  --surface-strong: var(--el-surface-raised);
+  --ink: var(--el-text);
+  --ink-soft: var(--el-muted);
+  --ink-mute: var(--el-soft);
+  --line: var(--el-hairline);
+  --line-strong: var(--el-hairline-strong);
+  --accent: var(--el-accent);
+  --accent-soft: var(--el-accent-soft);
+  --shadow: var(--el-shadow-2);
 }
 
 * {
@@ -28,7 +29,8 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--ink);
-  font: 13px/1.4 "Geist", "Inter Tight", ui-sans-serif, system-ui, sans-serif;
+  font: 13px/1.4 var(--el-font);
+  -webkit-font-smoothing: antialiased;
 }
 
 button,
@@ -75,7 +77,7 @@ select {
   height: 34px;
   border: 1px solid var(--line);
   border-radius: 10px;
-  background: rgba(255, 255, 255, 0.72);
+  background: var(--el-inset);
   color: var(--ink);
   cursor: pointer;
   font-size: 16px;
@@ -110,7 +112,7 @@ select {
   width: min(280px, calc(100% - 16px));
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.96);
+  background: var(--surface-strong);
   box-shadow: var(--shadow);
   padding: 10px;
 }
@@ -163,7 +165,7 @@ select {
   height: 34px;
   border: 1px solid var(--line);
   border-radius: 10px;
-  background: rgba(255, 255, 255, 0.82);
+  background: var(--el-inset);
   color: var(--ink);
   padding: 0 26px 0 10px;
   outline: none;
@@ -188,7 +190,7 @@ select {
   margin-top: 12px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.82);
+  background: var(--el-inset);
   color: var(--ink);
   cursor: pointer;
   font-weight: 650;
@@ -208,12 +210,51 @@ select {
 }
 
 .browser-settings-danger {
-  color: #7f1d1d;
+  color: var(--el-danger);
 }
 
 .browser-settings-danger:hover,
 .browser-settings-danger:focus-visible {
-  background: rgba(239, 68, 68, 0.1);
+  background: color-mix(in srgb, var(--el-danger) 12%, transparent);
+}
+
+/* In-panel confirm for profile reset (replaces window.confirm). */
+.browser-settings-confirm {
+  margin-top: 12px;
+  border: 1px solid color-mix(in srgb, var(--el-danger) 40%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--el-danger) 8%, transparent);
+  padding: 10px;
+}
+
+.browser-settings-confirm[hidden] {
+  display: none;
+}
+
+.browser-settings-confirm p {
+  margin: 0 0 10px;
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.browser-settings-confirm-row {
+  display: flex;
+  gap: 8px;
+}
+
+.browser-settings-confirm-row .browser-settings-action {
+  margin-top: 0;
+}
+
+.browser-settings-confirm-commit {
+  border-color: transparent;
+  background: var(--el-danger);
+  color: var(--el-bg);
+}
+
+.browser-settings-confirm-commit:hover,
+.browser-settings-confirm-commit:focus-visible {
+  background: color-mix(in srgb, var(--el-danger) 84%, var(--el-text));
 }
 
 .browser-address {
@@ -222,11 +263,11 @@ select {
   height: 34px;
   border: 1px solid var(--line);
   border-radius: 12px;
-  background: rgba(255, 255, 255, 0.82);
+  background: var(--el-inset);
   color: var(--ink);
   padding: 0 12px;
   outline: none;
-  font-family: "Geist Mono", "JetBrains Mono", ui-monospace, monospace;
+  font-family: var(--el-font-mono);
   font-size: 12px;
 }
 
@@ -243,6 +284,8 @@ select {
   background: var(--surface-strong);
 }
 
+/* The stage is the web page itself — white is content ground, not chrome
+   (same rule as the viewers' PDF paper / video letterbox). */
 .browser-render-panel {
   position: relative;
   display: grid;
@@ -303,7 +346,7 @@ select {
   max-width: min(520px, calc(100% - 24px));
   border: 1px solid var(--line);
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.94);
+  background: var(--surface-strong);
   box-shadow: var(--shadow);
   color: var(--ink-soft);
   display: inline-flex;
@@ -361,11 +404,11 @@ select {
   max-width: min(720px, calc(100% - 24px));
   border: 1px solid var(--line);
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.9);
+  background: var(--surface-strong);
   box-shadow: var(--shadow);
   color: var(--ink-soft);
   padding: 6px 10px;
-  font-family: "Geist Mono", "JetBrains Mono", ui-monospace, monospace;
+  font-family: var(--el-font-mono);
   font-size: 11px;
   white-space: nowrap;
   overflow: hidden;

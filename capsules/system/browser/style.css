@@ -1,21 +1,41 @@
 :root {
-  color-scheme: light;
+  color-scheme: dark;
   --primary-color-icon: invert(0);
-  --color-settings-bg: #ffffff;
+  --color-settings-bg: var(--el-bg);
+  --color-settings-sidebar: rgba(22, 24, 29, 0.78);
+  --color-settings-card: var(--el-surface-raised);
+  --color-bg-tertiary: var(--el-inset);
+  --color-text-primary: var(--el-text);
+  --color-text-secondary: var(--el-muted);
+  --color-text-muted: var(--el-soft);
+  --color-border: var(--el-hairline);
+  --color-border-light: var(--el-hairline-strong);
+  --color-input-bg: var(--el-inset);
+  --color-input-border: var(--el-hairline);
+  --color-input-text: var(--el-text);
+  --color-success: var(--el-ok);
+  --color-error: var(--el-danger);
+  font-family: var(--el-font);
+}
+
+/* Light theme: shared var(--el-*) tokens flip in elastos-ui.css; restore the
+   pre-dark PC2 values for the app-local residue only. */
+:root[data-el-theme="light"] {
+  color-scheme: light;
   --color-settings-sidebar: #f9f9f9;
-  --color-settings-card: #ffffff;
-  --color-bg-tertiary: #f3f4f6;
-  --color-text-primary: #1f2937;
-  --color-text-secondary: #4b5563;
-  --color-text-muted: #6b7280;
-  --color-border: #e5e7eb;
-  --color-border-light: #d1d5db;
-  --color-input-bg: #ffffff;
-  --color-input-border: #d1d5db;
-  --color-input-text: #1f2937;
-  --color-success: #22c55e;
-  --color-error: #ef4444;
-  font-family: "Avenir Next", "Segoe UI", sans-serif;
+}
+
+:root[data-el-theme="light"] .pc2-btn:hover:not(:disabled),
+:root[data-el-theme="light"] .pc2-btn:focus-visible:not(:disabled),
+:root[data-el-theme="light"] .system-button:hover:not(:disabled),
+:root[data-el-theme="light"] .system-button:focus-visible:not(:disabled) {
+  background: #f3f4f6;
+}
+
+/* The plan output stayed a dark terminal in the original light PC2 look. */
+:root[data-el-theme="light"] .inspect-plan-output {
+  background: #111827;
+  color: #f9fafb;
 }
 
 * {
@@ -54,7 +74,7 @@ dd {
 }
 
 code {
-  font-family: "SFMono-Regular", "Monaco", "Menlo", monospace;
+  font-family: var(--el-font-mono);
 }
 
 .settings-container {
@@ -143,13 +163,13 @@ code {
 
 .settings-sidebar-icon-storage::before {
   border-radius: 3px;
-  box-shadow: inset 0 -5px 0 rgba(31, 41, 55, 0.16);
+  box-shadow: inset 0 -5px 0 var(--el-hairline-strong);
 }
 
 .settings-sidebar-icon-inspector::before {
   border-radius: 50%;
   box-shadow:
-    inset 0 0 0 3px #f9f9f9,
+    inset 0 0 0 3px var(--el-surface-raised),
     0 0 0 1px currentColor;
 }
 
@@ -161,6 +181,33 @@ code {
 
 .settings-sidebar-text {
   flex-grow: 1;
+}
+
+/* Sidebar search (macOS System Settings position): filters sections by any
+   text they contain. */
+.settings-search {
+  width: 100%;
+  margin: 2px 0 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--el-hairline);
+  border-radius: 8px;
+  background: var(--el-inset);
+  color: var(--el-text);
+  font-family: inherit;
+  font-size: 12.5px;
+}
+
+.settings-search::placeholder {
+  color: var(--el-soft);
+}
+
+.settings-search:focus {
+  outline: 2px solid var(--el-focus);
+  outline-offset: 1px;
+}
+
+.settings-sidebar-item.search-hidden {
+  display: none;
 }
 
 .settings-sidebar-item:hover {
@@ -208,7 +255,7 @@ code {
 .pc2-section-title {
   font-size: 11px;
   font-weight: 700;
-  color: #000;
+  color: var(--el-text);
   text-transform: uppercase;
   letter-spacing: 0.5px;
   margin-bottom: 8px;
@@ -217,15 +264,15 @@ code {
 
 .pc2-card,
 .pc2-group {
-  background: #f9f9f9;
+  background: var(--el-surface-raised);
   border-radius: 8px;
-  border: 1px solid #d0d0d0;
+  border: 1px solid var(--el-hairline);
   overflow: hidden;
 }
 
 .pc2-group-row {
   padding: 10px 12px;
-  border-bottom: 1px solid #e5e5e5;
+  border-bottom: 1px solid var(--el-hairline);
 }
 
 .pc2-group-row:last-child {
@@ -246,17 +293,17 @@ code {
 .pc2-card-label {
   font-size: 13px;
   font-weight: 500;
-  color: #333;
+  color: var(--el-text);
 }
 
 .pc2-card-value {
   font-size: 12px;
-  color: #666;
+  color: var(--el-muted);
 }
 
 .pc2-card-sublabel {
   font-size: 11px;
-  color: #999;
+  color: var(--el-soft);
   margin-top: 2px;
   line-height: 1.35;
 }
@@ -290,9 +337,9 @@ code {
   line-height: 1.2;
   height: auto;
   margin: 0;
-  border: 1px solid #d0d0d0;
-  background: #fff;
-  color: #333;
+  border: 1px solid var(--el-hairline);
+  background: var(--el-inset);
+  color: var(--el-text);
   text-decoration: none;
   white-space: nowrap;
 }
@@ -301,7 +348,7 @@ code {
 .pc2-btn:focus-visible:not(:disabled),
 .system-button:hover:not(:disabled),
 .system-button:focus-visible:not(:disabled) {
-  background: #f3f4f6;
+  background: rgba(255, 255, 255, 0.1);
   outline: none;
 }
 
@@ -328,19 +375,19 @@ code {
 .system-input {
   font-size: 11px;
   padding: 4px 8px;
-  border: 1px solid #ddd;
+  border: 1px solid var(--el-hairline);
   border-radius: 4px;
-  background: #fff;
+  background: var(--el-inset);
   width: auto;
   min-width: 180px;
   flex: 1 1 auto;
-  color: #333;
+  color: var(--el-text);
 }
 
 .pc2-input:focus-visible,
 .system-input:focus-visible {
-  border-color: #3b82f6;
-  outline: 2px solid rgba(59, 130, 246, 0.16);
+  border-color: var(--el-brand);
+  outline: 2px solid var(--el-focus);
   outline-offset: 0;
 }
 
@@ -368,11 +415,11 @@ code {
   min-height: 9rem;
   aspect-ratio: 16 / 9;
   margin: 10px 0;
-  border: 1px solid #d0d0d0;
+  border: 1px solid var(--el-hairline);
   border-radius: 8px;
   background:
-    linear-gradient(135deg, rgba(59, 130, 246, 0.12), transparent 42%),
-    linear-gradient(180deg, #fff, #f9f9f9);
+    linear-gradient(135deg, color-mix(in srgb, var(--el-brand) 12%, transparent), transparent 42%),
+    linear-gradient(180deg, var(--el-surface-raised), var(--el-bg));
   background-position: center;
   background-size: cover;
 }
@@ -387,7 +434,7 @@ code {
   gap: 8px;
   margin-top: 10px;
   padding-top: 10px;
-  border-top: 1px solid #e5e5e5;
+  border-top: 1px solid var(--el-hairline);
 }
 
 .system-switch {
@@ -396,8 +443,113 @@ code {
   align-items: center;
   gap: 8px;
   cursor: pointer;
-  color: #333;
+  color: var(--el-text);
   font-size: 12px;
+}
+
+.system-segment {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--el-hairline);
+  border-radius: 8px;
+  background: var(--el-inset);
+}
+
+.system-segment-option {
+  padding: 4px 12px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--el-muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.system-segment-option.active {
+  background: var(--el-surface-raised);
+  color: var(--el-text);
+  box-shadow: var(--el-shadow-1);
+}
+
+.system-segment-option:focus-visible {
+  outline: 2px solid var(--el-focus);
+  outline-offset: 1px;
+}
+
+/* Accent picker: the macOS row of color dots. Selected dot gets a ring in its
+   own color; the swatch colors are fixed samples of the accent palette (the
+   live token would make every dot the same color). */
+.system-accent-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.system-accent-dot {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid rgba(0, 0, 0, 0.25);
+  border-radius: 50%;
+  cursor: pointer;
+  transition: transform 120ms var(--el-ease);
+}
+
+.system-accent-dot:hover {
+  transform: scale(1.15);
+}
+
+.system-accent-dot.active {
+  box-shadow:
+    0 0 0 2px var(--el-surface-raised),
+    0 0 0 4px currentColor;
+}
+
+.system-accent-dot:focus-visible {
+  outline: 2px solid var(--el-focus);
+  outline-offset: 2px;
+}
+
+.system-accent-dot[data-accent-option="blue"] {
+  background: #0a84ff;
+  color: #0a84ff;
+}
+
+.system-accent-dot[data-accent-option="purple"] {
+  background: #bf5af2;
+  color: #bf5af2;
+}
+
+.system-accent-dot[data-accent-option="pink"] {
+  background: #ff375f;
+  color: #ff375f;
+}
+
+.system-accent-dot[data-accent-option="red"] {
+  background: #ff453a;
+  color: #ff453a;
+}
+
+.system-accent-dot[data-accent-option="orange"] {
+  background: #f6921a;
+  color: #f6921a;
+}
+
+.system-accent-dot[data-accent-option="yellow"] {
+  background: #ffd60a;
+  color: #ffd60a;
+}
+
+.system-accent-dot[data-accent-option="green"] {
+  background: #30b84f;
+  color: #30b84f;
+}
+
+.system-accent-dot[data-accent-option="graphite"] {
+  background: #8e8e93;
+  color: #8e8e93;
 }
 
 .system-switch input {
@@ -432,7 +584,7 @@ code {
 }
 
 .system-switch input:checked + .system-switch-track {
-  background-color: #3b82f6;
+  background-color: var(--el-brand);
 }
 
 .system-switch input:checked + .system-switch-track::before {
@@ -440,7 +592,7 @@ code {
 }
 
 .system-switch input:focus-visible + .system-switch-track {
-  outline: 2px solid rgba(59, 130, 246, 0.28);
+  outline: 2px solid var(--el-focus);
   outline-offset: 2px;
 }
 
@@ -453,29 +605,29 @@ code {
   display: flex;
   justify-content: space-between;
   gap: 12px;
-  color: #666;
+  color: var(--el-muted);
   font-size: 11px;
 }
 
 .system-range-input {
   width: 100%;
-  accent-color: #3b82f6;
+  accent-color: var(--el-brand);
 }
 
 .system-status[data-tone="success"] {
-  color: #166534;
+  color: var(--el-ok);
 }
 
 .system-status[data-tone="error"] {
-  color: #dc2626;
+  color: var(--el-danger);
 }
 
 .system-status[data-tone="muted"] {
-  color: #666;
+  color: var(--el-muted);
 }
 
 .system-value-muted {
-  color: #666;
+  color: var(--el-muted);
 }
 
 .system-code {
@@ -497,10 +649,10 @@ code {
 .network-row-empty,
 .inspect-empty {
   padding: 10px 12px;
-  border: 1px solid #e5e5e5;
+  border: 1px solid var(--el-hairline);
   border-radius: 8px;
-  background: #fff;
-  color: #666;
+  background: var(--el-inset);
+  color: var(--el-muted);
   font-size: 12px;
 }
 
@@ -512,8 +664,8 @@ code {
   width: 100%;
   min-width: 34rem;
   border-collapse: collapse;
-  background: #fff;
-  border: 1px solid #e5e5e5;
+  background: var(--el-inset);
+  border: 1px solid var(--el-hairline);
   border-radius: 8px;
   overflow: hidden;
   font-size: 12px;
@@ -522,13 +674,13 @@ code {
 .account-table th,
 .account-table td {
   padding: 8px 10px;
-  border-bottom: 1px solid #e5e5e5;
+  border-bottom: 1px solid var(--el-hairline);
   text-align: left;
   vertical-align: middle;
 }
 
 .account-table th {
-  color: #666;
+  color: var(--el-muted);
   font-size: 11px;
   font-weight: 700;
   text-transform: uppercase;
@@ -554,13 +706,13 @@ code {
 }
 
 .account-name-wrap strong {
-  color: #333;
+  color: var(--el-text);
   font-size: 12px;
 }
 
 .account-name-wrap small,
 .account-used {
-  color: #666;
+  color: var(--el-muted);
   font-size: 11px;
 }
 
@@ -569,18 +721,18 @@ code {
   align-items: center;
   max-width: 100%;
   padding: 3px 7px;
-  border: 1px solid #d0d0d0;
+  border: 1px solid var(--el-hairline);
   border-radius: 999px;
-  background: #f9f9f9;
-  color: #666;
+  background: var(--el-inset);
+  color: var(--el-muted);
   font-size: 11px;
   white-space: nowrap;
 }
 
 .account-role[data-role="admin"] {
-  border-color: #bfdbfe;
-  background: #dbeafe;
-  color: #1d4ed8;
+  border-color: color-mix(in srgb, var(--el-brand) 45%, transparent);
+  background: color-mix(in srgb, var(--el-brand) 16%, transparent);
+  color: var(--el-brand-strong);
 }
 
 .account-actions-cell {
@@ -613,14 +765,14 @@ code {
   gap: 10px;
   margin-top: 10px;
   padding: 10px 12px;
-  border: 1px solid #bfdbfe;
+  border: 1px solid color-mix(in srgb, var(--el-brand) 45%, transparent);
   border-radius: 8px;
-  background: #dbeafe;
+  background: color-mix(in srgb, var(--el-brand) 14%, transparent);
 }
 
 .recovery-pending-text {
   min-width: 0;
-  color: #1d4ed8;
+  color: var(--el-brand-strong);
   font-size: 12px;
   line-height: 1.35;
   overflow-wrap: anywhere;
@@ -673,10 +825,10 @@ code {
   width: 100%;
   gap: 8px;
   padding: 9px 10px;
-  border: 1px solid #e5e5e5;
+  border: 1px solid var(--el-hairline);
   border-radius: 8px;
-  background: #fff;
-  color: #333;
+  background: var(--el-inset);
+  color: var(--el-text);
   font: inherit;
   text-align: left;
   cursor: pointer;
@@ -687,7 +839,7 @@ code {
 .inspect-row.active,
 .inspect-plan-button:hover,
 .inspect-plan-button:focus-visible {
-  border-color: #bfdbfe;
+  border-color: color-mix(in srgb, var(--el-brand) 50%, transparent);
   outline: none;
 }
 
@@ -698,8 +850,8 @@ code {
   width: 28px;
   height: 28px;
   border-radius: 8px;
-  background: #f3f4f6;
-  color: #333;
+  background: var(--el-inset);
+  color: var(--el-text);
   font-size: 11px;
   font-weight: 700;
 }
@@ -714,7 +866,7 @@ code {
 
 .inspect-main strong,
 .inspect-detail-header strong {
-  color: #333;
+  color: var(--el-text);
   font-size: 12px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -725,16 +877,16 @@ code {
 .inspect-detail-header small,
 .inspect-state,
 .inspect-fact span {
-  color: #666;
+  color: var(--el-muted);
   font-size: 11px;
   overflow-wrap: anywhere;
 }
 
 .inspect-detail {
   padding: 10px;
-  border: 1px solid #e5e5e5;
+  border: 1px solid var(--el-hairline);
   border-radius: 8px;
-  background: #fff;
+  background: var(--el-inset);
 }
 
 .inspect-facts {
@@ -745,14 +897,14 @@ code {
 
 .inspect-fact {
   padding: 7px 8px;
-  border: 1px solid #e5e5e5;
+  border: 1px solid var(--el-hairline);
   border-radius: 8px;
-  background: #f9f9f9;
+  background: var(--el-inset);
 }
 
 .inspect-fact b,
 .inspect-preview-title {
-  color: #333;
+  color: var(--el-text);
   font-size: 11px;
   font-weight: 700;
   text-transform: uppercase;
@@ -771,10 +923,10 @@ code {
 
 .inspect-plan-button {
   padding: 4px 8px;
-  border: 1px solid #d0d0d0;
+  border: 1px solid var(--el-hairline);
   border-radius: 4px;
-  background: #fff;
-  color: #333;
+  background: var(--el-inset);
+  color: var(--el-text);
   font: inherit;
   font-size: 11px;
   cursor: pointer;
@@ -786,10 +938,11 @@ code {
   margin: 0;
   overflow: auto;
   padding: 8px;
-  border: 1px solid #e5e5e5;
+  border: 1px solid var(--el-hairline);
   border-radius: 8px;
-  background: #111827;
-  color: #f9fafb;
+  background: var(--el-bg);
+  color: var(--el-text);
+  font-family: var(--el-font-mono);
   font-size: 11px;
   line-height: 1.45;
   white-space: pre-wrap;
@@ -802,10 +955,10 @@ code {
 
 .network-row,
 .webspace-row {
-  border: 1px solid #e5e5e5;
+  border: 1px solid var(--el-hairline);
   border-radius: 8px;
-  background: #fff;
-  color: #333;
+  background: var(--el-inset);
+  color: var(--el-text);
 }
 
 .network-row {
@@ -825,7 +978,7 @@ code {
 .network-row:focus-visible,
 .webspace-open:hover,
 .webspace-open:focus-visible {
-  border-color: #bfdbfe;
+  border-color: color-mix(in srgb, var(--el-brand) 50%, transparent);
   outline: none;
 }
 
@@ -837,8 +990,8 @@ code {
   min-width: 34px;
   min-height: 34px;
   border-radius: 8px;
-  background: #f3f4f6;
-  color: #333;
+  background: var(--el-inset);
+  color: var(--el-text);
   font-size: 11px;
   font-weight: 700;
 }
@@ -857,7 +1010,7 @@ code {
 .network-state strong,
 .webspace-main strong,
 .webspace-state strong {
-  color: #333;
+  color: var(--el-text);
   font-size: 12px;
 }
 
@@ -866,7 +1019,7 @@ code {
 .webspace-main small,
 .webspace-state small,
 .webspace-detail span {
-  color: #666;
+  color: var(--el-muted);
   font-size: 11px;
   overflow-wrap: anywhere;
 }
@@ -880,10 +1033,10 @@ code {
 .network-action,
 .webspace-open {
   padding: 4px 8px;
-  border: 1px solid #d0d0d0;
+  border: 1px solid var(--el-hairline);
   border-radius: 4px;
-  background: #fff;
-  color: #333;
+  background: var(--el-inset);
+  color: var(--el-text);
   font: inherit;
   font-size: 11px;
   cursor: pointer;
@@ -895,11 +1048,11 @@ code {
 }
 
 .network-row[data-tone="success"] .network-state strong {
-  color: #166534;
+  color: var(--el-ok);
 }
 
 .network-row[data-tone="error"] .network-state strong {
-  color: #dc2626;
+  color: var(--el-danger);
 }
 
 .webspace-summary {
@@ -917,7 +1070,7 @@ code {
 }
 
 .webspace-row[open] {
-  border-color: #bfdbfe;
+  border-color: color-mix(in srgb, var(--el-brand) 50%, transparent);
 }
 
 .webspace-details {
@@ -927,7 +1080,7 @@ code {
 }
 
 .webspace-detail b {
-  color: #333;
+  color: var(--el-text);
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.5px;
@@ -940,10 +1093,10 @@ code {
 .system-error {
   margin: 10px 30px;
   padding: 10px 12px;
-  border: 1px solid #fecaca;
+  border: 1px solid color-mix(in srgb, var(--el-danger) 45%, transparent);
   border-radius: 8px;
-  background: #fee2e2;
-  color: #dc2626;
+  background: color-mix(in srgb, var(--el-danger) 14%, transparent);
+  color: var(--el-danger);
   font-size: 12px;
   line-height: 1.45;
 }
@@ -976,7 +1129,7 @@ code {
 }
 
 .sidebar-toggle span span {
-  border-bottom: 2px solid #374151;
+  border-bottom: 2px solid var(--el-text);
   display: block;
   margin-bottom: 5px;
   width: 100%;
@@ -1002,7 +1155,7 @@ code {
     left: 0;
     height: 100%;
     z-index: 100;
-    box-shadow: 2px 0 10px rgba(0, 0, 0, 0.3);
+    box-shadow: var(--el-shadow-2);
   }
 
   .settings-content-container {
@@ -1050,9 +1203,9 @@ code {
   .account-table tr {
     margin-bottom: 6px;
     padding: 8px;
-    border: 1px solid #e5e5e5;
+    border: 1px solid var(--el-hairline);
     border-radius: 8px;
-    background: #fff;
+    background: var(--el-inset);
   }
 
   .account-table td {
@@ -1065,7 +1218,7 @@ code {
 
   .account-table td::before {
     content: attr(data-label);
-    color: #666;
+    color: var(--el-muted);
     font-size: 11px;
     font-weight: 700;
     text-transform: uppercase;

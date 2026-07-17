@@ -6,17 +6,20 @@ import {
   readStoredBoolean,
   readStoredValue,
   storeValue,
-} from "./wallet-format.js?v=wallet-20260523a";
+} from "./wallet-format.js?v=wallet-20260717a";
 import {
   actionButton,
   methodMark,
   textNode,
-} from "./wallet-render.js?v=wallet-20260523a";
+} from "./wallet-render.js?v=wallet-20260717a";
 
 export function createWalletPreferences({
+  closeModal,
   fetchJson,
   getHomeToken,
+  modalButton,
   notifyHomeSummaryChanged,
+  openFlowModal,
   renderAll,
   requestFreshPasskeyHomeToken,
   refreshWalletState,
@@ -111,7 +114,7 @@ export function createWalletPreferences({
     return row;
   }
 
-  async function onMethodClick(event) {
+  function onMethodClick(event) {
     const remove = event.target && event.target.closest("[data-wallet-remove-account]");
     if (!remove) {
       return;
@@ -121,9 +124,21 @@ export function createWalletPreferences({
       return;
     }
     const name = readStoredValueFromDataset(remove.dataset.walletAccountName) || "account";
-    if (!window.confirm(`Remove ${name} from this Wallet? Built-in accounts require their Wallet recovery key to restore later. Passkey confirmation is required.`)) {
-      return;
-    }
+    // In-window confirm sheet (same modal the flows use); the passkey prompt
+    // that follows remains the real authority gate.
+    openFlowModal(
+      `Remove ${name}?`,
+      "Built-in accounts require their Wallet recovery key to restore later. Passkey confirmation is required.",
+      [],
+      [
+        modalButton("Cancel", closeModal, true),
+        modalButton("Remove", () => removeAccount(remove, accountId, name), false, true),
+      ],
+    );
+  }
+
+  async function removeAccount(remove, accountId, name) {
+    closeModal();
     remove.disabled = true;
     try {
       const homeToken = await requestFreshPasskeyHomeToken();

@@ -80,6 +80,7 @@ boot().catch((error) => {
 
 async function boot() {
   configureSettingsTabs();
+  configureSettingsSearch();
   configureAppearanceEditor();
   configureGuestAccess();
   configurePasskeyAccess();
@@ -128,7 +129,52 @@ function activateSettingsTab(settings) {
   if (container) {
     container.scrollTop = 0;
   }
+  onSettingsTabActivated(tab);
 }
+
+/* Sidebar search (macOS System Settings): a section matches when ANY text it
+   contains matches — the label you half-remember lives in the pane, not the
+   sidebar. Filtering only hides sidebar entries; it never changes the pane. */
+function configureSettingsSearch() {
+  const input = document.querySelector("#settings-search");
+  if (!input) {
+    return;
+  }
+  const sectionText = new Map();
+  const textFor = (name) => {
+    if (!sectionText.has(name)) {
+      const pane = document.querySelector(`.settings-content[data-settings="${name}"]`);
+      const item = document.querySelector(`.settings-sidebar-item[data-settings="${name}"]`);
+      const haystack = `${item?.textContent || ""} ${pane?.textContent || ""}`.toLowerCase();
+      sectionText.set(name, haystack);
+    }
+    return sectionText.get(name);
+  };
+  input.addEventListener("input", () => {
+    const query = input.value.trim().toLowerCase();
+    const items = [...document.querySelectorAll(".settings-sidebar-item")];
+    let firstVisible = null;
+    for (const item of items) {
+      const name = item.dataset.settings || "";
+      const matches = !query || textFor(name).includes(query);
+      item.classList.toggle("search-hidden", !matches);
+      if (matches && !firstVisible) {
+        firstVisible = item;
+      }
+    }
+    // If the active section got filtered out, follow the first match so the
+    // pane always corresponds to something visible in the sidebar.
+    const active = document.querySelector(".settings-sidebar-item.active");
+    if (query && firstVisible && active?.classList.contains("search-hidden")) {
+      activateSettingsTab(firstVisible.dataset.settings);
+    }
+  });
+}
+
+/* Network pane intentionally absent: its backend (/api/apps/home/network-status,
+   market index, carrier status) is Flint gateway code that does not exist on
+   this branch; it returns with the Flint bring-across. */
+function onSettingsTabActivated(_tab) {}
 
 function hasShellAccess() {
   return apiHomeToken.length > 0;
@@ -224,6 +270,89 @@ function configureAppearanceEditor() {
       });
       backgroundOverlayOpacityInput.addEventListener("change", onBackgroundOverlayChange);
     }
+  }
+  configureThemeSegment();
+}
+
+/* Theme lives in the shared vendored runtime (elastos-theme.js): one
+   localStorage key, storage events fan it out to the shell and every open
+   app frame. No gateway round-trip — appearance stays a browser concern. */
+function configureThemeSegment() {
+  const segment = document.querySelector("#theme-segment");
+  if (!segment || !window.elastosTheme) {
+    return;
+  }
+  const options = segment.querySelectorAll("[data-theme-option]");
+  const sync = () => {
+    const preference = window.elastosTheme.preference();
+    for (const option of options) {
+      const selected = option.dataset.themeOption === preference;
+      option.classList.toggle("active", selected);
+      option.setAttribute("aria-checked", selected ? "true" : "false");
+    }
+  };
+  for (const option of options) {
+    option.addEventListener("click", () => {
+      window.elastosTheme.set(option.dataset.themeOption);
+      sync();
+    });
+  }
+  window.addEventListener("storage", sync);
+  sync();
+  configureAccentPicker();
+  configureChromeToggles();
+}
+
+/* Accent rides the same vendored runtime as theme: one localStorage key,
+   storage events fan the change out to the shell and every open app frame. */
+function configureAccentPicker() {
+  const picker = document.querySelector("#accent-picker");
+  if (!picker || !window.elastosTheme || !window.elastosTheme.setAccent) {
+    return;
+  }
+  const dots = picker.querySelectorAll("[data-accent-option]");
+  const sync = () => {
+    const accent = window.elastosTheme.accent();
+    for (const dot of dots) {
+      const selected = dot.dataset.accentOption === accent;
+      dot.classList.toggle("active", selected);
+      dot.setAttribute("aria-checked", selected ? "true" : "false");
+    }
+  };
+  for (const dot of dots) {
+    dot.addEventListener("click", () => {
+      window.elastosTheme.setAccent(dot.dataset.accentOption);
+      sync();
+    });
+  }
+  window.addEventListener("storage", sync);
+  sync();
+}
+
+/* Dock auto-hide and UI sounds are pure browser prefs (localStorage), same
+   pattern as theme — the shell listens via storage events / boot sync. */
+function configureChromeToggles() {
+  const dock = document.querySelector("#dock-autohide");
+  const sounds = document.querySelector("#ui-sounds");
+  const read = (key) => {
+    try {
+      return localStorage.getItem(key) === "on";
+    } catch (_error) {
+      return false;
+    }
+  };
+  const write = (key, on) => {
+    try {
+      localStorage.setItem(key, on ? "on" : "off");
+    } catch (_error) {}
+  };
+  if (dock) {
+    dock.checked = read("elastos.ui.dockAutoHide");
+    dock.addEventListener("change", () => write("elastos.ui.dockAutoHide", dock.checked));
+  }
+  if (sounds) {
+    sounds.checked = read("elastos.ui.sounds");
+    sounds.addEventListener("change", () => write("elastos.ui.sounds", sounds.checked));
   }
 }
 
@@ -533,7 +662,7 @@ function setWebspaceState(webspace) {
   if (entries.length === 0) {
     const empty = document.createElement("div");
     empty.className = "webspace-row webspace-row-empty";
-    empty.textContent = "No capsules or providers discovered.";
+    empty.textContent = "No Apps or services found yet.";
     webspaceListNode.append(empty);
     return;
   }
@@ -598,7 +727,7 @@ function renderWebspaceDetails(entry) {
     const action = document.createElement("button");
     action.type = "button";
     action.className = "webspace-open";
-    action.textContent = "Open capsule";
+    action.textContent = "Open";
     action.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -1065,7 +1194,7 @@ function showInspectStatus(message, tone) {
 function webspaceName(entry) {
   const id = readText(entry && entry.id);
   if (!id) {
-    return "Unknown capsule";
+    return "Unknown App";
   }
   return id.split("-").map((part) => (
     part ? part.charAt(0).toUpperCase() + part.slice(1) : part

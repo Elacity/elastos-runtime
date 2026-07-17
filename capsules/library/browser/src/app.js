@@ -25,6 +25,7 @@ import { createLibraryPreview } from "./preview.js";
 import { createLibraryRealtime } from "./realtime.js";
 import { createLibraryRenderer, iconPlaceholder } from "./render.js";
 import { createLibrarySelection } from "./selection.js";
+import { TAG_COLORS, getTag, setTag } from "./tags.js";
 import {
   MUTATING_PROVIDER_OPS,
   cacheFolderListing,
@@ -61,6 +62,9 @@ import { createLibraryUploads } from "./uploads.js";
       newFolderButton: document.getElementById("new-folder-button"),
       pickerActionButton: document.getElementById("picker-action-button"),
       search: document.getElementById("search"),
+      searchToggle: document.getElementById("search-toggle"),
+      toolbarSearch: document.getElementById("toolbar-search"),
+      moreButton: document.getElementById("more-button"),
       currentTitle: document.getElementById("current-title"),
       statusText: document.getElementById("status-text"),
       refreshButton: document.getElementById("refresh-button"),
@@ -366,7 +370,7 @@ import { createLibraryUploads } from "./uploads.js";
       return folderObject?.metadata?.readonly !== false;
     }
 
-    function setFolderStatus(text) {
+    function setFolderStatus(_text) {
       if (isArchivePickerMode()) {
         setStatus("");
         return;
@@ -375,7 +379,9 @@ import { createLibraryUploads } from "./uploads.js";
         setStatus(attachStatusText());
         return;
       }
-      setStatus(text);
+      // The object count lives in the footer statusbar (with selection state);
+      // the toolbar strip only carries transient messages and picker prompts.
+      setStatus("");
     }
 
     function syncModeChrome() {
@@ -397,7 +403,7 @@ import { createLibraryUploads } from "./uploads.js";
         setStatus("");
         return;
       }
-      setStatus("Ready.");
+      setStatus("");
     }
 
     async function completeAttachPicker() {
@@ -708,6 +714,7 @@ import { createLibraryUploads } from "./uploads.js";
         documents: "icons/sidebar-folder-documents.svg",
         pictures: "icons/sidebar-folder-pictures.svg",
         videos: "icons/sidebar-folder-videos.svg",
+        music: "icons/sidebar-folder.svg",
         downloads: "icons/sidebar-folder.svg",
         public: "icons/sidebar-folder-public.svg",
         webspaces: "icons/sidebar-folder.svg",
@@ -751,6 +758,61 @@ import { createLibraryUploads } from "./uploads.js";
 
     function visibleObjects() {
       return visibleObjectsForState(state);
+    }
+
+    // Apply (or, when colorId is falsy, clear) a colour tag on every given object, then refresh
+    // just those rows. Tags live in localStorage (see tags.js), so this is instant and local.
+    function applyTag(objects, colorId) {
+      for (const object of objects) {
+        if (!object || !object.uri) continue;
+        setTag(object.uri, colorId);
+        state.objectNodeCache.delete(object.uri); // bust the render cache so the dot updates
+      }
+      scheduleContentRender();
+    }
+
+    // A file-manager-style colour-tag row: seven dots + Clear. A dot already on every selected item is
+    // shown active; clicking it toggles it off. Returns a custom menu entry that builds its own DOM.
+    function tagsMenuRow(objects) {
+      const uris = objects.map((object) => object.uri).filter(Boolean);
+      const current = uris.length
+        ? uris.map((uri) => getTag(uri)).reduce((a, b) => (a === b ? a : ""))
+        : "";
+      return {
+        custom: ({ hideMenu }) => {
+          const row = document.createElement("div");
+          row.className = "menu-tags-row";
+          for (const color of TAG_COLORS) {
+            const dot = document.createElement("button");
+            dot.type = "button";
+            dot.className = "menu-tag-dot";
+            dot.style.setProperty("--tag-color", color.hex);
+            dot.title = color.label;
+            dot.setAttribute("aria-label", `Tag ${color.label}`);
+            if (current && current === color.id) dot.dataset.active = "true";
+            dot.addEventListener("click", (event) => {
+              event.stopPropagation();
+              // Toggle: clicking the colour already on all selected items clears it.
+              applyTag(objects, current === color.id ? "" : color.id);
+              hideMenu();
+            });
+            row.appendChild(dot);
+          }
+          const clear = document.createElement("button");
+          clear.type = "button";
+          clear.className = "menu-tag-clear";
+          clear.title = "Clear tag";
+          clear.setAttribute("aria-label", "Clear tag");
+          clear.textContent = "\u2715";
+          clear.addEventListener("click", (event) => {
+            event.stopPropagation();
+            applyTag(objects, "");
+            hideMenu();
+          });
+          row.appendChild(clear);
+          return row;
+        },
+      };
     }
 
     function showMenuForObject(object, x, y) {
@@ -837,6 +899,10 @@ import { createLibraryUploads } from "./uploads.js";
       if (object.published && publicCid) {
         actions.push(menuAction("Copy Published Link", () => copyText("elastos://" + publicCid, "published link")));
       }
+      if (!inTrash(object)) {
+        actions.push("-");
+        actions.push(tagsMenuRow([object]));
+      }
       actions.push(menuAction("Properties", () => showProperties(object)));
       renderMenu(actions, x, y);
     }
@@ -904,6 +970,10 @@ import { createLibraryUploads } from "./uploads.js";
       if (active.some((object) => hasCapability(object, "trash"))) actions.push(menuAction("Delete", trashSelectedObjects));
       if (trash.length) actions.push(menuAction("Restore", restoreSelectedObjects));
       if (permanentlyDeletable) actions.push(menuAction("Delete Permanently", deleteSelectedObjects));
+      if (active.length) {
+        actions.push("-");
+        actions.push(tagsMenuRow(active));
+      }
       renderMenu(actions, x, y);
     }
 
@@ -943,6 +1013,40 @@ import { createLibraryUploads } from "./uploads.js";
       if (canPasteInto(state.currentUri)) actions.push(menuAction("Paste", () => pasteClipboardTo(state.currentUri)));
       if (!readOnly) actions.push(menuAction("Upload Here", () => elements.fileInput.click()));
       actions.push("-");
+      actions.push(menuAction("Properties", () => showFolderProperties()));
+      renderMenu(actions, x, y);
+    }
+
+    // The toolbar "…" menu: folder actions only. View is omitted (the segmented
+    // toggle sits right beside the button) and Show Hidden stays in the
+    // background context menu — the toolbar carries the everyday actions.
+    function showToolbarMenu(x, y) {
+      const readOnly = currentFolderReadOnly();
+      const actions = [];
+      actions.push(menuAction("Sort By", null, {
+        children: [
+          menuAction("Name", () => setSort("name"), { checked: state.sort === "name" }),
+          menuAction("Date Modified", () => setSort("modified"), { checked: state.sort === "modified" }),
+          menuAction("Type", () => setSort("type"), { checked: state.sort === "type" }),
+          menuAction("Size", () => setSort("size"), { checked: state.sort === "size" }),
+          "-",
+          menuAction("Ascending", () => setSortOrder("asc"), { checked: state.sortOrder !== "desc" }),
+          menuAction("Descending", () => setSortOrder("desc"), { checked: state.sortOrder === "desc" }),
+        ],
+      }));
+      actions.push("-");
+      if (!readOnly) {
+        actions.push(menuAction("New", null, {
+          children: [
+            menuAction("Folder", createFolder),
+            menuAction("Text Document", createTextDocument),
+          ],
+        }));
+      }
+      if (canPasteInto(state.currentUri)) actions.push(menuAction("Paste", () => pasteClipboardTo(state.currentUri)));
+      if (!readOnly) actions.push(menuAction("Upload Here", () => elements.fileInput.click()));
+      actions.push("-");
+      actions.push(menuAction("Refresh", loadCurrentFolder));
       actions.push(menuAction("Properties", () => showFolderProperties()));
       renderMenu(actions, x, y);
     }
@@ -1030,6 +1134,7 @@ import { createLibraryUploads } from "./uploads.js";
         showError,
         showMenuForObject,
         showPlaceMenu,
+        showToolbarMenu,
         startRename,
         state,
         stopLibraryEventStream,
@@ -1038,6 +1143,79 @@ import { createLibraryUploads } from "./uploads.js";
         uploadFiles,
       });
     }
+
+    // Shell menu bar: declare File/View menus to Home; commands come back as
+    // elastos:menu-command and route to the same functions the toolbar uses.
+    function announceMenuManifest() {
+      if (!state.homeToken || window.parent === window) {
+        return;
+      }
+      window.parent.postMessage({
+        type: "home:menu-manifest",
+        homeToken: state.homeToken,
+        menus: [
+          {
+            title: "File",
+            items: [
+              { label: "New Folder", cmd: "new-folder" },
+              { label: "New Text Document", cmd: "new-text-document" },
+              "-",
+              { label: "Upload Files...", cmd: "upload" },
+              "-",
+              { label: "New Window", cmd: "__new-window" },
+              { label: "Close Window", cmd: "__close-window" },
+            ],
+          },
+          {
+            title: "View",
+            items: [
+              { label: "As Icons", cmd: "view-icons" },
+              { label: "As Details", cmd: "view-details" },
+              "-",
+              { label: "Show Hidden", cmd: "toggle-hidden" },
+              { label: "Refresh", cmd: "refresh" },
+            ],
+          },
+        ],
+      }, window.location.origin);
+    }
+
+    function handleMenuCommand(cmd) {
+      switch (cmd) {
+        case "new-folder":
+          createFolder().catch(showError);
+          return;
+        case "new-text-document":
+          createTextDocument();
+          return;
+        case "upload":
+          elements.fileInput.click();
+          return;
+        case "view-icons":
+          setView("grid");
+          return;
+        case "view-details":
+          setView("list");
+          return;
+        case "toggle-hidden":
+          toggleShowHidden();
+          return;
+        case "refresh":
+          loadCurrentFolder().catch(showError);
+          return;
+        default:
+      }
+    }
+
+    window.addEventListener("message", (event) => {
+      if (event.origin !== window.location.origin) {
+        return;
+      }
+      const message = event.data;
+      if (message?.type === "elastos:menu-command" && typeof message.cmd === "string") {
+        handleMenuCommand(message.cmd);
+      }
+    });
 
     async function boot() {
       if (!state.homeToken) {
@@ -1048,6 +1226,7 @@ import { createLibraryUploads } from "./uploads.js";
       elements.content.dataset.view = state.view;
       syncModeChrome();
       bindEvents();
+      announceMenuManifest();
       try {
         await loadRoots();
         installBrowserHistory();
