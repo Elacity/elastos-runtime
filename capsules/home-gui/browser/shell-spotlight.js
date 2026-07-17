@@ -38,6 +38,7 @@ const DOCUMENTS_CACHE_MS = 60_000;
 
 const spotlightState = {
   invoker: null,
+  query: "",
   results: [],
   index: -1,
   documents: [],
@@ -238,7 +239,17 @@ function renderResults() {
     });
     spotlightResults.appendChild(row);
   });
-  spotlightResults.hidden = spotlightState.results.length === 0;
+  // A searched-for miss deserves an answer, not a silent panel (the empty
+  // prompt state, before typing, stays quiet).
+  if (spotlightState.results.length === 0 && spotlightState.query) {
+    const empty = document.createElement("div");
+    empty.className = "spotlight-empty";
+    empty.setAttribute("role", "presentation");
+    empty.textContent = `No results for \u201C${spotlightState.query}\u201D`;
+    spotlightResults.appendChild(empty);
+  }
+  spotlightResults.hidden =
+    spotlightState.results.length === 0 && !spotlightState.query;
   spotlightInput.setAttribute(
     "aria-expanded",
     spotlightState.results.length > 0 ? "true" : "false",
@@ -268,6 +279,7 @@ function syncActiveDescendant() {
 }
 
 function runSearch(rawQuery) {
+  spotlightState.query = String(rawQuery || "").trim();
   spotlightState.results = collectResults(rawQuery);
   spotlightState.index = spotlightState.results.length > 0 ? 0 : -1;
   renderResults();
@@ -311,6 +323,7 @@ export function hideSpotlight({ restoreFocus = true } = {}) {
   }
   spotlight.hidden = true;
   spotlight.setAttribute("aria-hidden", "true");
+  spotlightState.query = "";
   spotlightState.results = [];
   spotlightState.index = -1;
   spotlightResults.replaceChildren();

@@ -500,6 +500,7 @@ function renderSystemErrorWindow({
   subjectLabel,
   subjectValue,
   detail,
+  onRetry,
 }) {
   let entry = shellState.windows.get(id);
   if (!entry) {
@@ -535,6 +536,18 @@ function renderSystemErrorWindow({
   const detailNode = errorNode.querySelector(".window-error-detail");
   detailNode.textContent = detail;
   detailNode.hidden = !detail;
+  // Error grammar: what happened (headline), why (copy), what you can do
+  // (actions), technical facts last. Retry appears only when the caller can
+  // honestly offer one.
+  const actions = errorNode.querySelector(".window-error-actions");
+  const retryButton = errorNode.querySelector(".window-error-retry");
+  if (actions && retryButton && typeof onRetry === "function") {
+    actions.hidden = false;
+    retryButton.addEventListener("click", () => {
+      closeWindow(id);
+      onRetry();
+    });
+  }
   body.appendChild(errorNode);
   focusWindow(id);
 }
@@ -546,10 +559,11 @@ function renderTargetLaunchError(targetId, error) {
     id: "shell-launch-error",
     title,
     headline: `Could not open ${title}`,
-    copy: "The app did not start. Close this window and try again.",
-    subjectLabel: "App",
-    subjectValue: title,
-    detail: "",
+    copy: "Home asked the runtime to open this item, but the launch did not complete. It may be momentary — trying again is safe.",
+    subjectLabel: "Item ID",
+    subjectValue: targetId,
+    detail: String(error.message || error),
+    onRetry: () => openTarget(targetId),
   });
 }
 
