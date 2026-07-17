@@ -205,7 +205,7 @@ const summary = {
   appearance: {},
   browser_state: {
     principal_id: "principal:home-shell-system-switch",
-    layout: { desktop: {}, taskbar: [], desktopHidden: [], desktopIconsVisible: true },
+    layout: { desktop: {}, taskbar: [], desktopApps: [], desktopIconsVisible: true },
     recent_targets: [],
     session: { windows: [] },
   },

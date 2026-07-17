@@ -111,6 +111,52 @@ export function renderDesktop(summary) {
   }
   syncDesktopIconsVisibility();
   updateDesktopSelectionState();
+  syncDesktopFirstRunHint();
+}
+
+/* First-contact teaching (shown once per browser): after the desktop stopped
+   carrying app icons, a fresh user must still get a visible answer to "where
+   are my apps". The hint sits above the dock and retires forever the first
+   time the launcher opens or the hint itself is clicked. */
+const DESKTOP_HINT_KEY = "elastos.shell.desktopHintDone";
+let desktopHintBound = false;
+
+function desktopFirstRunHintNode() {
+  return document.querySelector("#desktop-first-run-hint");
+}
+
+function syncDesktopFirstRunHint() {
+  const hint = desktopFirstRunHintNode();
+  if (!hint) {
+    return;
+  }
+  let done = false;
+  try {
+    done = localStorage.getItem(DESKTOP_HINT_KEY) === "1";
+  } catch (_error) {
+    done = true;
+  }
+  const show = !done && shellState.shellLayoutState.desktopApps.length === 0;
+  hint.hidden = !show;
+  launcherToggleButton?.classList.toggle("launcher-first-run", show);
+  if (show && !desktopHintBound) {
+    desktopHintBound = true;
+    hint.addEventListener("click", () => dismissDesktopFirstRunHint());
+  }
+}
+
+function dismissDesktopFirstRunHint() {
+  const hint = desktopFirstRunHintNode();
+  if (!hint || hint.hidden) {
+    return;
+  }
+  try {
+    localStorage.setItem(DESKTOP_HINT_KEY, "1");
+  } catch (_error) {
+    // Session-only dismissal still applies below.
+  }
+  hint.hidden = true;
+  launcherToggleButton?.classList.remove("launcher-first-run");
 }
 
 function desktopShortcutIdForEntry(entryId) {
@@ -1433,6 +1479,7 @@ export function toggleLauncher() {
 }
 
 export function showLauncher() {
+  dismissDesktopFirstRunHint();
   if (shellState.currentSummary) {
     renderLauncher(shellState.currentSummary);
   }

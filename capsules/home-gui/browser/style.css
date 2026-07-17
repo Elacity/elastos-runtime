@@ -1028,6 +1028,70 @@ body.expose-active .window.expose-card .window-frame {
   display: none;
 }
 
+/* First-run teaching hint: one quiet sentence above the dock, gone forever
+   after first contact with the launcher (or a click on the hint itself). */
+.desktop-first-run-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 92px;
+  transform: translateX(-50%);
+  z-index: 5;
+  padding: 9px 16px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--menu-fill);
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+  box-shadow: var(--shadow-soft);
+  backdrop-filter: blur(14px);
+  cursor: pointer;
+  animation: desktop-hint-in 0.6s cubic-bezier(0.2, 0.9, 0.3, 1) both;
+}
+
+.desktop-first-run-hint[hidden] {
+  display: none;
+}
+
+@keyframes desktop-hint-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+
+/* The launcher button softly pulses while the hint is up, answering "where
+   did my apps go" without a word. */
+.taskbar-item.launcher-first-run .taskbar-icon-launcher {
+  animation: launcher-first-run-pulse 2.4s ease-in-out infinite;
+}
+
+@keyframes launcher-first-run-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.12);
+    opacity: 0.75;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .desktop-first-run-hint {
+    animation: none;
+  }
+
+  .taskbar-item.launcher-first-run .taskbar-icon-launcher {
+    animation: none;
+  }
+}
+
 .app-glyph,
 .taskbar-item-icon,
 .window-head-icon {
