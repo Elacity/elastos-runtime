@@ -3259,3 +3259,46 @@ body[data-home-gui="dormant"] #quick-look,
 body[data-home-gui="dormant"] #shortcuts-overlay {
   display: none !important;
 }
+
+/* Arrival: the desktop settles in as the GUI mounts — the unlock overlay's
+   departure lives in the host stylesheet; this beat is the GUI's own.
+   Opacity/transform only (compositor work, no layout). The workspace and
+   backdrop get the gentle scale settle; the bars just fade in. */
+.desktop-backdrop.home-gui-arriving,
+.desktop-workspace.home-gui-arriving {
+  animation: home-gui-arrive 560ms cubic-bezier(0.2, 0.7, 0.3, 1) both;
+}
+
+.toolbar.home-gui-arriving,
+.taskbar.home-gui-arriving {
+  animation: home-gui-arrive-fade 560ms cubic-bezier(0.2, 0.7, 0.3, 1) both;
+}
+
+@keyframes home-gui-arrive {
+  from {
+    opacity: 0.55;
+    transform: scale(1.012);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes home-gui-arrive-fade {
+  from {
+    opacity: 0.55;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .desktop-backdrop.home-gui-arriving,
+  .desktop-workspace.home-gui-arriving,
+  .toolbar.home-gui-arriving,
+  .taskbar.home-gui-arriving {
+    animation: none;
+  }
+}

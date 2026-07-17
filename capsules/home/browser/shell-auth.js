@@ -1,4 +1,4 @@
-import { fetchJson } from "./shell-core.js?v=home-20260717b";
+import { fetchJson, trapTabWithin } from "./shell-core.js?v=home-20260717b";
 
 const unlockPanel = document.querySelector("#home-unlock");
 const unlockCard = document.querySelector(".home-unlock-card");
@@ -38,6 +38,10 @@ export async function showHomeUnlock(onUnlocked, options = {}) {
   unlockPanel.setAttribute("aria-hidden", "false");
   unlockCard?.setAttribute("aria-modal", "true");
 
+  // The unlock card is a modal dialog: keyboard focus starts on the primary
+  // action and stays inside until the surface is dismissed.
+  unlockPrimary?.focus();
+
   if (!window.PublicKeyCredential) {
     unlockMode = "unsupported";
     renderUnlockMode({ registered: true, guestRegistrationEnabled: false });
@@ -49,9 +53,11 @@ export async function showHomeUnlock(onUnlocked, options = {}) {
     const status = await fetchJson("/api/auth/passkey/status");
     const registered = status.registered === true;
     const guestRegistrationEnabled = status.guest_registration_enabled === true;
+    // First boot arrives in beats: welcome -> create passkey -> desktop
+    // reveal. Returning users go straight to sign-in.
     unlockMode = registered
       ? (guestRegistrationEnabled ? "signin_guest_enabled" : "signin")
-      : "create";
+      : "welcome";
     renderUnlockMode({ registered, guestRegistrationEnabled });
     setUnlockStatus(unlockStatusCopy(registered, guestRegistrationEnabled), "muted");
     if (registered) {
@@ -68,6 +74,25 @@ export function hideHomeUnlock() {
   if (!unlockPanel) {
     return;
   }
+  // Departure: when the unlock surface is actually on screen, cross-fade it
+  // out (opacity/transform only — compositor work, no layout). The desktop's
+  // own arrival settle is the GUI shell's mount transition, so the neutral
+  // mask never has to carry the desktop. Reduced motion and the
+  // already-hidden boot path skip the fade.
+  const reducedMotion = typeof window.matchMedia === "function"
+    && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (!unlockPanel.hidden && !reducedMotion) {
+    unlockPanel.classList.add("home-unlock-leaving");
+    window.setTimeout(() => {
+      unlockPanel.classList.remove("home-unlock-leaving");
+      finishHideHomeUnlock();
+    }, 300);
+    return;
+  }
+  finishHideHomeUnlock();
+}
+
+function finishHideHomeUnlock() {
   unlockPanel.hidden = true;
   unlockPanel.setAttribute("aria-hidden", "true");
   delete unlockPanel.dataset.mode;
@@ -77,7 +102,18 @@ export function hideHomeUnlock() {
 }
 
 export function bindHomeUnlock() {
+  unlockPanel?.addEventListener("keydown", (event) => {
+    if (!unlockPanel.hidden) {
+      trapTabWithin(unlockCard, event);
+    }
+  });
   unlockPrimary?.addEventListener("click", () => {
+    if (unlockMode === "welcome") {
+      unlockMode = "create";
+      renderUnlockMode({ registered: false, guestRegistrationEnabled: false });
+      unlockName?.focus();
+      return;
+    }
     if (unlockMode === "create" || unlockMode === "create_guest") {
       runPasskeyCreate().catch(reportUnlockError);
       return;
@@ -146,11 +182,16 @@ function renderUnlockMode({ registered, guestRegistrationEnabled }) {
   const creatingGuest = unlockMode === "create_guest";
   const creatingAdmin = unlockMode === "create";
   const canCreate = creatingAdmin || creatingGuest;
+  const welcoming = unlockMode === "welcome";
   if (unlockTitle) {
-    unlockTitle.textContent = creatingGuest ? "Create guest account" : (registered ? "Sign in" : "Set up Home");
+    unlockTitle.textContent = welcoming
+      ? "Welcome to ElastOS"
+      : creatingGuest ? "Create guest account" : (registered ? "Sign in" : "Set up Home");
   }
   if (unlockCopy) {
-    if (creatingGuest) {
+    if (welcoming) {
+      unlockCopy.textContent = "This Home is yours: your data, apps and desktop, unlocked by a passkey only you hold.";
+    } else if (creatingGuest) {
       unlockCopy.textContent = "Use a passkey to create your own guest account.";
     } else {
       unlockCopy.textContent = registered
@@ -159,9 +200,11 @@ function renderUnlockMode({ registered, guestRegistrationEnabled }) {
     }
   }
   if (unlockPrimary) {
-    unlockPrimary.textContent = creatingGuest
-      ? "Create guest passkey"
-      : (registered ? "Use passkey" : "Create admin passkey");
+    unlockPrimary.textContent = welcoming
+      ? "Get started"
+      : creatingGuest
+        ? "Create guest passkey"
+        : (registered ? "Use passkey" : "Create admin passkey");
     unlockPrimary.disabled = unlockMode === "unsupported";
   }
   if (unlockSecondary) {

@@ -2203,6 +2203,13 @@ async function statusFromServer(page) {
 }
 
 async function createPasskeyFromCurrentUnlock(page, mode) {
+  // First boot opens on the welcome beat; "Get started" advances to the
+  // create-passkey form. Returning flows (guest create) land on the form
+  // directly, so the click is conditional.
+  const primary = page.locator("#home-unlock-primary");
+  if ((await primary.textContent())?.trim() === "Get started") {
+    await primary.click();
+  }
   const name = page.locator("#home-unlock-name");
   await name.waitFor({ state: "visible", timeout: 10_000 });
   await name.fill(TEST_NAME);

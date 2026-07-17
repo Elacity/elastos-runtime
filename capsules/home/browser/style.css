@@ -276,6 +276,40 @@ img {
   100% { opacity: 1; transform: scale(1); }
 }
 
+/* Departure: unlock success cross-fades the overlay away. Opacity/transform
+   only — compositor work, no layout. The desktop's own settle-in is the GUI
+   shell's mount transition (home-gui style.css). */
+.home-unlock.home-unlock-leaving {
+  pointer-events: none;
+  animation: home-unlock-dismiss 280ms ease-in both;
+}
+
+.home-unlock.home-unlock-leaving .home-unlock-card {
+  animation: home-unlock-card-dismiss 280ms ease-in both;
+}
+
+@keyframes home-unlock-dismiss {
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes home-unlock-card-dismiss {
+  to {
+    opacity: 0;
+    transform: scale(1.045);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .home-unlock,
+  .home-unlock-card,
+  .home-unlock.home-unlock-leaving,
+  .home-unlock.home-unlock-leaving .home-unlock-card {
+    animation: none;
+  }
+}
+
 .active-shell-root {
   position: fixed;
   inset: 0;
