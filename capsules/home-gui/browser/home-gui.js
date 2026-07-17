@@ -103,6 +103,7 @@ import {
 import {
   bindWalletRail,
   retireWalletRail,
+  syncWalletRailAvailability,
 } from "./shell-wallet-rail.js?v=home-20260717b";
 
 await ensureHomeGuiDom();
@@ -452,6 +453,7 @@ export function syncHomeGuiChrome(previous, summary) {
   updateClock();
   syncIdentity(summary);
   renderInboxBadge(summary);
+  syncWalletRailAvailability();
   maybeShowWalletApprovalToast(previous, summary);
   recordNotifications(summary);
 }
