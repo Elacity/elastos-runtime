@@ -54,7 +54,7 @@ verify:
     node scripts/check-capsule-templates.mjs
     node scripts/home-entropy-check.mjs
     node scripts/browser-entropy-check.mjs
-    just local-carrier-setup-smoke
+    python3 scripts/source-home-capsule-inventory-smoke.py
     ./scripts/command-smoke.sh
     just candidate-command-audit
     cd elastos && cargo fmt --all -- --check
@@ -64,6 +64,7 @@ verify:
 # Release-trust gate: requires canonical publisher signer, not the dev signer
 verify-release:
     just verify
+    just local-carrier-setup-smoke
     just home-frontdoor-smoke
 
 # Fail-closed check for rooted-localhost and Home-first contract drift

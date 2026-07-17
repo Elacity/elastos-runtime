@@ -11,7 +11,7 @@ Usage:
 Options:
   --home <path>           Source-home root. Default: $LINUX_SOURCE_HOME or $HOME.
   --xdg-data-home <path>  XDG data root. Default: $XDG_DATA_HOME or <home>/.local/share.
-  --addr <host:port>      Gateway bind address. Default: $LINUX_GATEWAY_ADDR or 127.0.0.1:8090.
+  --addr <host:port>      Gateway bind address. Default: $LINUX_GATEWAY_ADDR or localhost:8090.
   --gateway-bin <path>    Gateway binary. Default: <repo>/elastos/target/release/elastos.
   --log-dir <path>        Restart log directory. Default: <xdg-data-home>/elastos/logs.
   --pid-file <path>       PID file. Default: <home>/run/gateway-<port>.pid.
@@ -144,7 +144,7 @@ process_matches_gateway_listener() {
 http_status() {
   local url="$1"
   local code
-  code="$(curl -sS -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
+  code="$(curl -sS --location --max-redirs 1 --proto-redir '=http' -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
   if [[ "$code" =~ ^[0-9][0-9][0-9]$ ]]; then
     printf '%s\n' "$code"
   else
@@ -155,7 +155,7 @@ http_status() {
 http_index_hash() {
   local url="$1"
   local out="$2"
-  if curl -sS "$url" -o "$out" 2>/dev/null; then
+  if curl -sS --location --max-redirs 1 --proto-redir '=http' "$url" -o "$out" 2>/dev/null; then
     sha256_file "$out"
   else
     printf 'unavailable\n'
@@ -164,7 +164,7 @@ http_index_hash() {
 
 source_home="${LINUX_SOURCE_HOME:-${HOME}}"
 xdg_data_home="${XDG_DATA_HOME:-}"
-addr="${LINUX_GATEWAY_ADDR:-127.0.0.1:8090}"
+addr="${LINUX_GATEWAY_ADDR:-localhost:8090}"
 gateway_bin="${repo_root}/elastos/target/release/elastos"
 log_dir=""
 pid_file=""
@@ -271,7 +271,7 @@ port="${addr##*:}"
 bind_host="${addr%:*}"
 probe_host="$bind_host"
 if [[ "$probe_host" == "0.0.0.0" || "$probe_host" == "*" ]]; then
-  probe_host="127.0.0.1"
+  probe_host="localhost"
 fi
 home_url="http://${probe_host}:${port}/apps/home/"
 services_url="http://${probe_host}:${port}/apps/services/"

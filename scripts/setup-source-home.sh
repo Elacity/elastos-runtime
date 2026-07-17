@@ -382,7 +382,22 @@ APP_CAPSULES=(
     wallet-metamask
     wallet-unisat
     wallet-walletconnect
+    gba-emulator
+    gba-ucity
     chat-room
+)
+
+APP_CAPSULES_JSON="$(printf '%s\n' "${APP_CAPSULES[@]}" | python3 -c 'import json,sys; print(json.dumps([line.strip() for line in sys.stdin if line.strip()]))')"
+
+# Historical source-home app trees that this installer owns but no longer installs.
+# Keep this list narrow: unrelated or user-installed capsule directories are preserved.
+RETIRED_SOURCE_HOME_CAPSULES=(
+    chat-wasm
+    gba-engine-provider
+)
+
+RETIRED_SOURCE_HOME_PROVIDER_BINARIES=(
+    gba-engine-provider
 )
 
 capsule_entrypoint() {
@@ -407,7 +422,38 @@ import json
 import pathlib
 import sys
 
-print(json.loads(pathlib.Path(sys.argv[1]).read_text()).get("runtime_abi", ""))
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
+print(manifest.get("runtime_abi", ""))
+PY
+}
+
+ensure_rust_target_installed() {
+    local target="$1"
+    if command -v rustup >/dev/null 2>&1 && ! rustup target list --installed 2>/dev/null | grep -qx "$target"; then
+        rustup target add "$target"
+    fi
+}
+
+build_component_capsule() {
+    local src="$1"
+
+    ensure_rust_target_installed "wasm32-unknown-unknown"
+    CARGO_BIN="$CARGO_BIN" "${ROOT}/scripts/build-component-capsule.sh" "$src"
+}
+
+is_runtime_projection_capsule() {
+    [[ "$1" == "elastos.runtime-projection/v1" ]]
+}
+
+is_content_data_capsule() {
+    local manifest="$1"
+    python3 - "$manifest" <<'PY'
+import json
+import pathlib
+import sys
+
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
+print("yes" if manifest.get("role") == "content" and manifest.get("type") == "data" else "no")
 PY
 }
 
@@ -435,19 +481,27 @@ install_app_capsules() {
         dest="${DATA_DIR}/capsules/${capsule}"
         entrypoint="$(capsule_entrypoint "${src}/capsule.json")"
         runtime_abi="$(capsule_runtime_abi "${src}/capsule.json")"
-        if [[ "$runtime_abi" != "elastos.runtime-projection/v1" ]]; then
-            echo "${capsule} source-home app must be a Runtime projection, found '${runtime_abi:-unset}'" >&2
+        if [[ "$runtime_abi" == "elastos.component/v1" ]] || is_runtime_projection_capsule "$runtime_abi" || [[ "$(is_content_data_capsule "${src}/capsule.json")" == "yes" ]]; then
+            built_entrypoint="${src}/${entrypoint}"
+        else
+            echo "${capsule} uses unsupported runtime_abi '${runtime_abi:-unset}'; first-party product capsules must use elastos.component/v1, elastos.runtime-projection/v1, or role=content type=data" >&2
             exit 1
         fi
-        built_entrypoint="${src}/${entrypoint}"
 
         if [[ ! -f "$built_entrypoint" ]]; then
-            echo "${capsule} projection entrypoint missing: ${built_entrypoint}" >&2
+            echo "${capsule} entrypoint missing after build: ${built_entrypoint}" >&2
             exit 1
         fi
 
+        # Generated source materializations are obsolete once source-home installs
+        # the canonical capsule tree and manifest-selected entrypoint.
+        rm -rf "${DATA_DIR}/dev-capsules/${capsule}"
         copy_capsule_tree "$src" "$dest"
-        find "$dest" -maxdepth 1 -type f -name '*.wasm' -delete
+        if is_runtime_projection_capsule "$runtime_abi"; then
+            find "$dest" -maxdepth 1 -type f -name '*.wasm' -delete
+        fi
+        mkdir -p "${dest}/$(dirname "$entrypoint")"
+        install -m 644 "$built_entrypoint" "${dest}/${entrypoint}"
     done
 }
 
@@ -1180,6 +1234,7 @@ stamp_source_home_components_manifest() {
     DATA_DIR="${DATA_DIR}" \
     SETUP_PLATFORM="${PLATFORM}" \
     PROVIDER_NAMES_JSON="${PROVIDER_NAMES_JSON}" \
+    APP_CAPSULES_JSON="${APP_CAPSULES_JSON}" \
     python3 - <<'PY'
 import hashlib
 import json
@@ -1197,6 +1252,9 @@ host_components = [
     "localhost-provider",
     *json.loads(os.environ["PROVIDER_NAMES_JSON"]),
 ]
+source_home_components = list(
+    dict.fromkeys([*host_components, *json.loads(os.environ["APP_CAPSULES_JSON"])])
+)
 
 for name in host_components:
     platforms = manifest["external"][name].setdefault("platforms", {})
@@ -1210,9 +1268,37 @@ for name in host_components:
     info["install_path"] = f"bin/{name}"
     info.setdefault("release_path", f"{name}-{platform}")
 
+manifest.setdefault("profiles", {})["source-home"] = {
+    "description": "Components built and installed by setup-source-home.sh",
+    "components": source_home_components,
+}
+
 components_dest.parent.mkdir(parents=True, exist_ok=True)
 components_dest.write_text(json.dumps(manifest, indent=2) + "\n")
 PY
+}
+
+stamp_source_home_capsule_artifacts_manifest() {
+    local args=()
+    local capsule
+    for capsule in "${APP_CAPSULES[@]}"; do
+        args+=(--capsule "$capsule")
+    done
+    for capsule in "${RETIRED_SOURCE_HOME_CAPSULES[@]}"; do
+        args+=(--retired-capsule "$capsule")
+    done
+    while IFS= read -r capsule; do
+        if [[ -f "${ROOT}/capsules/${capsule}/capsule.json" ]]; then
+            args+=(--capsule "$capsule")
+        fi
+    done < <(provider_names)
+    python3 "${ROOT}/scripts/stamp-source-home-capsule-metadata.py" \
+        --components "${DATA_DIR}/components.json" \
+        --data-dir "${DATA_DIR}" \
+        --root "${ROOT}" \
+        --platform "${PLATFORM}" \
+        --managed-state "${DATA_DIR}/receipts/source-home-capsules.json" \
+        "${args[@]}"
 }
 
 install_content_publish_backend() {
@@ -1277,6 +1363,28 @@ done
 echo "[setup-source-home] build Home CLI native renderer"
 "$CARGO_BIN" build --manifest-path "${ROOT}/capsules/home-cli/Cargo.toml" --release --bin home-cli
 
+echo "[setup-source-home] build app WASM capsules"
+for capsule in "${APP_CAPSULES[@]}"; do
+    entrypoint="$(capsule_entrypoint "${ROOT}/capsules/${capsule}/capsule.json")"
+    runtime_abi="$(capsule_runtime_abi "${ROOT}/capsules/${capsule}/capsule.json")"
+    if [[ "$runtime_abi" == "elastos.component/v1" ]]; then
+        build_component_capsule "${ROOT}/capsules/${capsule}"
+    elif is_runtime_projection_capsule "$runtime_abi"; then
+        test -f "${ROOT}/capsules/${capsule}/${entrypoint}" || {
+            echo "${capsule} projection entrypoint missing: ${ROOT}/capsules/${capsule}/${entrypoint}" >&2
+            exit 1
+        }
+    elif [[ "$(is_content_data_capsule "${ROOT}/capsules/${capsule}/capsule.json")" == "yes" ]]; then
+        test -f "${ROOT}/capsules/${capsule}/${entrypoint}" || {
+            echo "${capsule} content entrypoint missing: ${ROOT}/capsules/${capsule}/${entrypoint}" >&2
+            exit 1
+        }
+    else
+        echo "${capsule} uses unsupported runtime_abi '${runtime_abi:-unset}'; first-party product capsules must use elastos.component/v1, elastos.runtime-projection/v1, or role=content type=data" >&2
+        exit 1
+    fi
+done
+
 echo "[setup-source-home] install native providers and stamp manifest"
 mkdir -p "${DATA_DIR}/bin"
 install -m 755 "${ROOT}/elastos/target/release/shell" "${DATA_DIR}/bin/shell"
@@ -1291,13 +1399,24 @@ provider_names | while IFS= read -r provider; do
 done
 stamp_source_home_components_manifest
 
-echo "[setup-source-home] install app Runtime projections"
+echo "[setup-source-home] install content publish backend before final manifest stamp"
+install_content_publish_backend
+
+echo "[setup-source-home] install app capsules and manifest entrypoints"
 install_app_capsules
+for retired_provider in "${RETIRED_SOURCE_HOME_PROVIDER_BINARIES[@]}"; do
+    rm -f "${DATA_DIR}/bin/${retired_provider}"
+done
+stamp_source_home_capsule_artifacts_manifest
+python3 "${ROOT}/scripts/components-release-integrity-check.py" \
+    --manifest "${DATA_DIR}/components.json" \
+    --platform "${PLATFORM}" \
+    --profile source-home \
+    --source-root "${ROOT}" \
+    --source-home-data-dir "${DATA_DIR}"
 install_browser_runtime_helpers
 start_browser_runtime_turn
 install_browser_source_home_config
-
-install_content_publish_backend
 
 cat <<EOF
 [setup-source-home] ready

@@ -103,6 +103,7 @@ Minimum gate:
 node scripts/check-capsule-templates.mjs
 node scripts/check-elastos-bus-wit.mjs
 node scripts/check-first-party-wasi-gate.mjs
+python3 scripts/source-home-capsule-inventory-smoke.py
 (cd elastos && cargo test -p elastos-common manifest -- --nocapture)
 (cd elastos && cargo test -p elastos-server init::tests -- --nocapture)
 (cd elastos && cargo test -p elastos-server component_conformance_exercises_bus_authorization_dispatch_and_audit -- --nocapture)

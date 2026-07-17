@@ -23,7 +23,7 @@ free_port() {
   python3 - <<'PY'
 import socket
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-    sock.bind(("127.0.0.1", 0))
+    sock.bind(("localhost", 0))
     print(sock.getsockname()[1])
 PY
 }
@@ -44,7 +44,7 @@ dry_run_json="$tmp_dir/restart-dry-run.json"
   --dry-run \
   --home "$tmp_dir/source home" \
   --xdg-data-home "$tmp_dir/xdg data" \
-  --addr 127.0.0.1:18090 \
+  --addr localhost:18090 \
   --gateway-bin "$repo_root/elastos/target/release/elastos" \
   --log-dir "$tmp_dir/logs" \
   --pid-file "$tmp_dir/run/gateway.pid" \
@@ -75,9 +75,9 @@ if from_file.get("xdg_data_home") != xdg_data_home:
     raise SystemExit("restart plan xdg_data_home mismatch")
 if from_file.get("data_dir") != f"{xdg_data_home}/elastos":
     raise SystemExit("restart plan data_dir mismatch")
-if from_file.get("home_url") != "http://127.0.0.1:18090/apps/home/":
+if from_file.get("home_url") != "http://localhost:18090/apps/home/":
     raise SystemExit("restart plan home URL mismatch")
-if from_file.get("services_url") != "http://127.0.0.1:18090/apps/services/":
+if from_file.get("services_url") != "http://localhost:18090/apps/services/":
     raise SystemExit("restart plan Services URL mismatch")
 if not from_file.get("gateway_log", "").startswith(f"{pathlib.Path(source_home).parent}/logs/gateway-18090-"):
     raise SystemExit("restart plan gateway log mismatch")
@@ -97,6 +97,7 @@ required = [
     "Linux source-home restart verification failed",
     "OK=0",
     "http_status",
+    "--max-redirs 1",
     "process_matches_gateway_listener",
     "refusing to kill unrelated listener",
     "pkill -TERM -f",
@@ -118,6 +119,11 @@ if [[ "$invalid_addr_status" -eq 0 ]]; then
   exit 1
 fi
 
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "SKIP linux-source-home-restart runtime behavior (Linux only)"
+  exit 0
+fi
+
 failing_gateway="$tmp_dir/failing-gateway"
 cat >"$failing_gateway" <<'SH'
 #!/usr/bin/env bash
@@ -134,7 +140,7 @@ set +e
 "$repo_root/scripts/linux-source-home-restart.sh" \
   --home "$fail_home" \
   --xdg-data-home "$fail_xdg" \
-  --addr "127.0.0.1:${fail_port}" \
+  --addr "localhost:${fail_port}" \
   --gateway-bin "$failing_gateway" \
   --wait-seconds 1 \
   --log-dir "$tmp_dir/fail-logs" \
@@ -165,7 +171,7 @@ PY
 mismatch_gateway="$tmp_dir/mismatch-gateway"
 cat >"$mismatch_gateway" <<'SH'
 #!/usr/bin/env bash
-addr="127.0.0.1:0"
+addr="localhost:0"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --addr)
@@ -194,7 +200,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, _format, *_args):
         pass
 
-HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+HTTPServer(("localhost", port), Handler).serve_forever()
 PY
 SH
 chmod +x "$mismatch_gateway"
@@ -208,7 +214,7 @@ set +e
 "$repo_root/scripts/linux-source-home-restart.sh" \
   --home "$mismatch_home" \
   --xdg-data-home "$mismatch_xdg" \
-  --addr "127.0.0.1:${mismatch_port}" \
+  --addr "localhost:${mismatch_port}" \
   --gateway-bin "$mismatch_gateway" \
   --wait-seconds 3 \
   --log-dir "$tmp_dir/mismatch-logs" \
@@ -252,11 +258,11 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, _format, *_args):
         pass
 
-HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+HTTPServer(("localhost", port), Handler).serve_forever()
 PY
 unrelated_listener_pid="$!"
 for _ in {1..100}; do
-  if curl -sS -o /dev/null "http://127.0.0.1:${unrelated_port}/" 2>/dev/null; then
+  if curl -sS -o /dev/null "http://localhost:${unrelated_port}/" 2>/dev/null; then
     break
   fi
   sleep 0.05
@@ -269,7 +275,7 @@ set +e
 "$repo_root/scripts/linux-source-home-restart.sh" \
   --home "$unrelated_home" \
   --xdg-data-home "$unrelated_xdg" \
-  --addr "127.0.0.1:${unrelated_port}" \
+  --addr "localhost:${unrelated_port}" \
   --gateway-bin "$failing_gateway" \
   --wait-seconds 1 \
   --log-dir "$tmp_dir/unrelated-logs" \
