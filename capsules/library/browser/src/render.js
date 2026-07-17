@@ -9,6 +9,7 @@ import {
   isDirectory,
   visibilityContract,
 } from "./model.js";
+import { getTag, tagColor } from "./tags.js";
 
 const LARGE_RENDER_THRESHOLD = 240;
 const INITIAL_RENDER_LIMIT = 120;
@@ -152,9 +153,20 @@ export function createLibraryRenderer({
       inTrash(object) ? '<span class="badge badge-trash">Trash</span>' : "",
     ].join("");
     const badgesMarkup = badges ? `<span class="badges">${badges}</span>` : "";
+    const tag = getTag(object.uri);
+    const tagHex = tag ? tagColor(tag)?.hex || "#9aa0a6" : "";
+    // List view keeps the right-aligned badge dot (a separate cell). Grid view uses an inline dot
+    // placed just left of the centered filename — desktop file-manager style — so it never displaces the icon.
+    const tagMarkup = tag
+      ? `<span class="item-tag" style="--tag-color:${escapeHtml(tagHex)}" title="Tag: ${escapeHtml(tag)}" aria-label="Tag: ${escapeHtml(tag)}"></span>`
+      : "";
+    const tagDotInline = tag
+      ? `<span class="item-tag-inline" style="--tag-color:${escapeHtml(tagHex)}" aria-hidden="true"></span>`
+      : "";
     item.innerHTML = `
       ${iconPlaceholder(iconFor(object), "file-icon")}
-      <span class="item-name" data-name-uri="${escapeHtml(object.uri)}" title="${escapeHtml(object.name)}">${escapeHtml(object.name)}</span>
+      <span class="item-name" data-name-uri="${escapeHtml(object.uri)}" title="${escapeHtml(object.name)}">${tagDotInline}<span class="item-name-text">${escapeHtml(object.name)}</span></span>
+      ${tagMarkup}
       <span class="item-date">${escapeHtml(formatTime(object.modified_at))}</span>
       <span class="item-size">${escapeHtml(isDirectory(object) ? "-" : formatBytes(object.size))}</span>
       <span class="item-type">${escapeHtml(isDirectory(object) ? "Folder" : object.mime || "File")}</span>
@@ -167,6 +179,7 @@ export function createLibraryRenderer({
   function objectRenderSignature(object) {
     return [
       object.uri,
+      getTag(object.uri),
       object.kind,
       object.name,
       object.mime || "",

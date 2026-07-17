@@ -84,7 +84,9 @@
   }
 
   function bindEvents() {
-    els.themeToggle.addEventListener("click", toggleTheme);
+    if (els.themeToggle) {
+      els.themeToggle.addEventListener("click", toggleTheme);
+    }
     els.searchInput.addEventListener("input", (event) => {
       state.search = event.target.value.trim().toLowerCase();
       renderAppsGrid();

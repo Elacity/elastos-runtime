@@ -1,4 +1,30 @@
 :root {
+  color-scheme: dark;
+  --bg: var(--el-bg, #0b0d10);
+  --surface: rgba(255, 255, 255, 0.04);
+  --surface-alt: rgba(255, 255, 255, 0.025);
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.16);
+  --ink: var(--el-text, #f5f7fa);
+  --ink-soft: var(--el-muted, rgba(245, 247, 250, 0.7));
+  --ink-mute: var(--el-soft, rgba(245, 247, 250, 0.48));
+  --chip: rgba(255, 255, 255, 0.05);
+  --chip-hover: rgba(255, 255, 255, 0.09);
+  --pos: oklch(0.74 0.13 150);
+  --neg: oklch(0.7 0.16 28);
+  --warn: oklch(0.78 0.13 78);
+  --accent: var(--el-accent);
+  --btc: oklch(0.72 0.14 70);
+  --eth: oklch(0.6 0.05 270);
+  --ela: oklch(0.62 0.13 200);
+  --usdc: oklch(0.62 0.13 230);
+  --metamask: oklch(0.65 0.13 50);
+  --wc: oklch(0.6 0.13 220);
+  --font: var(--el-font, ui-sans-serif, system-ui, sans-serif);
+  --mono: var(--el-font-mono, ui-monospace, "SF Mono", monospace);
+}
+
+:root[data-el-theme="light"] {
   color-scheme: light;
   --bg: #fafaf7;
   --surface: #ffffff;
@@ -13,33 +39,6 @@
   --pos: oklch(0.55 0.13 150);
   --neg: oklch(0.55 0.18 28);
   --warn: oklch(0.65 0.13 78);
-  --accent: oklch(0.55 0.13 250);
-  --btc: oklch(0.72 0.14 70);
-  --eth: oklch(0.6 0.05 270);
-  --ela: oklch(0.62 0.13 200);
-  --usdc: oklch(0.62 0.13 230);
-  --metamask: oklch(0.65 0.13 50);
-  --wc: oklch(0.6 0.13 220);
-  --font: "Geist", "Inter Tight", ui-sans-serif, system-ui, sans-serif;
-  --mono: "Geist Mono", "JetBrains Mono", ui-monospace, "SF Mono", monospace;
-}
-
-[data-theme="dark"] {
-  color-scheme: dark;
-  --bg: #0f1115;
-  --surface: rgba(255, 255, 255, 0.04);
-  --surface-alt: rgba(255, 255, 255, 0.025);
-  --line: rgba(255, 255, 255, 0.08);
-  --line-strong: rgba(255, 255, 255, 0.16);
-  --ink: #e9e7e1;
-  --ink-soft: rgba(233, 231, 225, 0.66);
-  --ink-mute: rgba(233, 231, 225, 0.4);
-  --chip: rgba(255, 255, 255, 0.05);
-  --chip-hover: rgba(255, 255, 255, 0.09);
-  --pos: oklch(0.74 0.13 150);
-  --neg: oklch(0.7 0.16 28);
-  --warn: oklch(0.78 0.13 78);
-  --accent: oklch(0.72 0.13 250);
 }
 
 * {
@@ -50,18 +49,18 @@ body {
   margin: 0;
   min-height: 100vh;
   background:
-    radial-gradient(circle at 20% 0%, oklch(0.55 0.13 250 / 0.1), transparent 55%),
-    radial-gradient(circle at 90% 100%, oklch(0.7 0.13 290 / 0.08), transparent 55%),
+    radial-gradient(circle at 20% 0%, oklch(0.72 0.13 250 / 0.12), transparent 60%),
+    radial-gradient(circle at 90% 100%, oklch(0.5 0.13 290 / 0.18), transparent 55%),
     var(--bg);
   color: var(--ink);
   font-family: var(--font);
   font-size: 13px;
 }
 
-[data-theme="dark"] body {
+:root[data-el-theme="light"] body {
   background:
-    radial-gradient(circle at 20% 0%, oklch(0.72 0.13 250 / 0.12), transparent 60%),
-    radial-gradient(circle at 90% 100%, oklch(0.5 0.13 290 / 0.18), transparent 55%),
+    radial-gradient(circle at 20% 0%, oklch(0.55 0.13 250 / 0.1), transparent 55%),
+    radial-gradient(circle at 90% 100%, oklch(0.7 0.13 290 / 0.08), transparent 55%),
     var(--bg);
 }
 
@@ -421,20 +420,20 @@ h3 {
 
 .wallet-account:hover {
   border-color: var(--line-strong);
-  box-shadow: 0 8px 24px rgba(20, 20, 18, 0.06);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
 }
 
 .wallet-account.is-selected {
   border-color: var(--line-strong);
-  box-shadow: 0 0 0 1px var(--accent), 0 8px 24px rgba(20, 20, 18, 0.06);
-}
-
-[data-theme="dark"] .wallet-account:hover {
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
-}
-
-[data-theme="dark"] .wallet-account.is-selected {
   box-shadow: 0 0 0 1px var(--accent), 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+:root[data-el-theme="light"] .wallet-account:hover {
+  box-shadow: 0 8px 24px rgba(20, 20, 18, 0.06);
+}
+
+:root[data-el-theme="light"] .wallet-account.is-selected {
+  box-shadow: 0 0 0 1px var(--accent), 0 8px 24px rgba(20, 20, 18, 0.06);
 }
 
 .wallet-account-top {
@@ -601,13 +600,13 @@ h3 {
   position: fixed;
   inset: 0;
   z-index: 40;
-  background: rgba(20, 20, 18, 0.18);
+  background: rgba(8, 9, 12, 0.5);
   backdrop-filter: blur(4px);
 }
 
-[data-theme="dark"] .wallet-drawer-backdrop,
-[data-theme="dark"] .wallet-modal-backdrop {
-  background: rgba(8, 9, 12, 0.5);
+:root[data-el-theme="light"] .wallet-drawer-backdrop,
+:root[data-el-theme="light"] .wallet-modal-backdrop {
+  background: rgba(20, 20, 18, 0.18);
 }
 
 .wallet-drawer {
@@ -620,7 +619,7 @@ h3 {
   overflow: auto;
   border-width: 0 0 0 1px;
   border-radius: 20px 0 0 20px;
-  box-shadow: -30px 0 80px rgba(20, 20, 18, 0.1);
+  box-shadow: -30px 0 80px rgba(0, 0, 0, 0.4);
   padding: 18px;
 }
 
@@ -633,8 +632,8 @@ h3 {
   justify-self: end;
 }
 
-[data-theme="dark"] .wallet-drawer {
-  box-shadow: -30px 0 80px rgba(0, 0, 0, 0.4);
+:root[data-el-theme="light"] .wallet-drawer {
+  box-shadow: -30px 0 80px rgba(20, 20, 18, 0.1);
 }
 
 .wallet-drawer-header {

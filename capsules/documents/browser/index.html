@@ -4,38 +4,127 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Documents · ElastOS</title>
+<script src="./elastos-theme.js"></script>
+<link rel="stylesheet" href="./elastos-ui.css">
 <style>
 :root {
-  --bg: #edf1fb;
-  --bg-strong: #e3e9fb;
-  --panel: rgba(255, 255, 255, 0.9);
-  --panel-strong: #ffffff;
-  --panel-soft: #eef2ff;
-  --line: rgba(83, 103, 164, 0.14);
-  --line-strong: rgba(83, 103, 164, 0.22);
-  --ink: #1d2438;
+  --bg: var(--el-bg);
+  --bg-strong: #10131a;
+  --panel: rgba(22, 24, 29, 0.78);
+  --panel-strong: var(--el-surface-raised);
+  --panel-soft: var(--el-inset);
+  --line: var(--el-hairline);
+  --line-strong: var(--el-hairline-strong);
+  --ink: var(--el-text);
   --text: var(--ink);
   --paper: var(--panel);
-  --muted: #66708a;
-  --brand: #f6921a;
-  --brand-soft: #fff1dc;
-  --accent: #5f76d8;
-  --accent-soft: #e8edff;
-  --accent-deep: #3c53a7;
-  --warning: #b14c5a;
-  --danger: #b14c5a;
+  --muted: var(--el-muted);
+  --brand: var(--el-brand);
+  --brand-soft: rgba(246, 146, 26, 0.16);
+  --accent: var(--el-accent);
+  --accent-soft: var(--el-accent-soft);
+  --accent-deep: var(--el-accent-strong);
+  --warning: var(--el-danger);
+  --danger: var(--el-danger);
   --sidebar-bg: var(--panel);
   --sidebar-panel: var(--panel-strong);
   --sidebar-line: var(--line);
   --sidebar-text: var(--ink);
   --sidebar-muted: var(--muted);
-  --shadow: 0 24px 60px rgba(34, 49, 88, 0.12);
+  --shadow: var(--el-shadow-2);
   --radius-xl: 1.35rem;
   --radius-lg: 1.25rem;
   --radius-md: 0.95rem;
   --radius-sm: 0.85rem;
+  color-scheme: dark;
+  font-family: var(--el-font);
+}
+
+:root[data-el-theme="light"] {
+  --bg-strong: #e3e9fb;
+  --panel: rgba(255, 255, 255, 0.9);
+  --brand-soft: #fff1dc;
   color-scheme: light;
-  font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
+}
+
+:root[data-el-theme="light"] body {
+  background:
+    radial-gradient(circle at top left, rgba(95, 118, 216, 0.14), transparent 28%),
+    radial-gradient(circle at bottom right, rgba(126, 149, 226, 0.12), transparent 24%),
+    linear-gradient(180deg, #f7f9ff 0%, var(--bg) 100%);
+}
+
+:root[data-el-theme="light"] .document-list-item,
+:root[data-el-theme="light"] .share-doc-link,
+:root[data-el-theme="light"] .outline-item,
+:root[data-el-theme="light"] .history-item {
+  border-color: rgba(83, 103, 164, 0.08);
+}
+
+:root[data-el-theme="light"] .document-list-item:hover,
+:root[data-el-theme="light"] .share-doc-link:hover,
+:root[data-el-theme="light"] .outline-item:hover,
+:root[data-el-theme="light"] .history-item:hover {
+  background: rgba(255, 255, 255, 0.72);
+  border-color: var(--line);
+}
+
+:root[data-el-theme="light"] .document-list-item.active,
+:root[data-el-theme="light"] .share-doc-link.active,
+:root[data-el-theme="light"] .workspace-tab.active {
+  background: var(--accent-soft);
+  border-color: rgba(95, 118, 216, 0.18);
+}
+
+:root[data-el-theme="light"] .document-list-item.published {
+  background: rgba(232, 237, 255, 0.94);
+  border-color: rgba(95, 118, 216, 0.28);
+}
+
+:root[data-el-theme="light"] .document-list-item.published:hover,
+:root[data-el-theme="light"] .document-list-item.published.active {
+  background: rgba(219, 227, 255, 0.98);
+  border-color: rgba(95, 118, 216, 0.36);
+}
+
+:root[data-el-theme="light"] .document-list-published-icon {
+  background: rgba(95, 118, 216, 0.14);
+}
+
+:root[data-el-theme="light"] .action-danger {
+  border-color: rgba(177, 76, 90, 0.22);
+}
+
+:root[data-el-theme="light"] .action-danger:hover:not(:disabled),
+:root[data-el-theme="light"] .action-danger:focus-visible:not(:disabled) {
+  background: rgba(177, 76, 90, 0.1);
+}
+
+:root[data-el-theme="light"] .action-danger-solid {
+  color: #fffaf9;
+}
+
+:root[data-el-theme="light"] .action-danger-solid:hover:not(:disabled),
+:root[data-el-theme="light"] .action-danger-solid:focus-visible:not(:disabled) {
+  background: #963846;
+}
+
+:root[data-el-theme="light"] .modal-backdrop {
+  background: rgba(29, 36, 56, 0.22);
+}
+
+:root[data-el-theme="light"] .markdown-body code,
+:root[data-el-theme="light"] .markdown-body pre,
+:root[data-el-theme="light"] .markdown-body th {
+  background: rgba(83, 103, 164, 0.08);
+}
+
+:root[data-el-theme="light"] .markdown-body pre code {
+  background: transparent;
+}
+
+:root[data-el-theme="light"] .markdown-body blockquote {
+  border-left-color: rgba(95, 118, 216, 0.28);
 }
 
 * {
@@ -52,9 +141,9 @@ body {
   font-family: inherit;
   color: var(--text);
   background:
-    radial-gradient(circle at top left, rgba(95, 118, 216, 0.14), transparent 28%),
-    radial-gradient(circle at bottom right, rgba(126, 149, 226, 0.12), transparent 24%),
-    linear-gradient(180deg, #f7f9ff 0%, var(--bg) 100%);
+    radial-gradient(circle at top left, rgba(125, 149, 240, 0.1), transparent 30%),
+    radial-gradient(circle at bottom right, rgba(125, 149, 240, 0.07), transparent 24%),
+    linear-gradient(180deg, #0f1218 0%, var(--bg) 100%);
 }
 
 button,
@@ -183,7 +272,7 @@ a {
   padding: 0.72rem 0.85rem;
   border: 1px solid var(--sidebar-line);
   border-radius: var(--radius-sm);
-  background: rgba(255, 255, 255, 0.98);
+  background: var(--el-inset);
   color: var(--text);
   outline: none;
 }
@@ -210,14 +299,14 @@ a {
   padding: 0.72rem 0.78rem;
   border-radius: var(--radius-md);
   background: var(--panel-strong);
-  border: 1px solid rgba(83, 103, 164, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.07);
   text-align: left;
   transition: background 140ms ease, border-color 140ms ease, transform 140ms ease;
 }
 
 .document-list-item:hover,
 .share-doc-link:hover {
-  background: rgba(255, 255, 255, 0.72);
+  background: rgba(255, 255, 255, 0.08);
   border-color: var(--line);
   transform: translateY(-1px);
 }
@@ -225,18 +314,18 @@ a {
 .document-list-item.active,
 .share-doc-link.active {
   background: var(--accent-soft);
-  border-color: rgba(95, 118, 216, 0.18);
+  border-color: rgba(125, 149, 240, 0.35);
 }
 
 .document-list-item.published {
-  background: rgba(232, 237, 255, 0.94);
-  border-color: rgba(95, 118, 216, 0.28);
+  background: rgba(125, 149, 240, 0.14);
+  border-color: rgba(125, 149, 240, 0.3);
 }
 
 .document-list-item.published:hover,
 .document-list-item.published.active {
-  background: rgba(219, 227, 255, 0.98);
-  border-color: rgba(95, 118, 216, 0.36);
+  background: rgba(125, 149, 240, 0.2);
+  border-color: rgba(125, 149, 240, 0.4);
 }
 
 .document-list-title-row {
@@ -288,7 +377,7 @@ a {
   min-width: 1.35rem;
   height: 1.35rem;
   border-radius: 999px;
-  background: rgba(95, 118, 216, 0.14);
+  background: rgba(125, 149, 240, 0.2);
   color: var(--accent-deep);
 }
 
@@ -414,23 +503,23 @@ a {
 }
 
 .action-danger {
-  border-color: rgba(177, 76, 90, 0.22);
+  border-color: rgba(255, 143, 143, 0.35);
   color: var(--danger);
 }
 
 .action-danger:hover:not(:disabled),
 .action-danger:focus-visible:not(:disabled) {
-  background: rgba(177, 76, 90, 0.1);
+  background: rgba(255, 143, 143, 0.12);
 }
 
 .action-danger-solid {
   background: var(--danger);
-  color: #fffaf9;
+  color: #2a1215;
 }
 
 .action-danger-solid:hover:not(:disabled),
 .action-danger-solid:focus-visible:not(:disabled) {
-  background: #963846;
+  background: #ff9f9f;
 }
 
 .action-link {
@@ -496,7 +585,7 @@ a {
   padding: 0.72rem 0.9rem;
   border-radius: 999px;
   border: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.56);
+  background: var(--el-inset);
   color: var(--muted);
   font-size: 0.84rem;
   font-weight: 700;
@@ -506,7 +595,7 @@ a {
 
 .workspace-tab.active {
   background: var(--accent-soft);
-  border-color: rgba(95, 118, 216, 0.18);
+  border-color: rgba(125, 149, 240, 0.35);
   color: var(--accent-deep);
 }
 
@@ -591,7 +680,7 @@ a {
 }
 
 .editor::placeholder {
-  color: rgba(102, 112, 138, 0.78);
+  color: var(--el-soft);
 }
 
 .preview-scroll {
@@ -620,12 +709,12 @@ a {
   padding: 0.8rem 0.9rem;
   border-radius: var(--radius-md);
   background: var(--panel-strong);
-  border: 1px solid rgba(83, 103, 164, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.07);
 }
 
 .outline-item:hover,
 .history-item:hover {
-  background: rgba(255, 255, 255, 0.72);
+  background: rgba(255, 255, 255, 0.08);
   border-color: var(--line);
 }
 
@@ -747,7 +836,7 @@ a {
   display: none;
   align-items: center;
   justify-content: center;
-  background: rgba(29, 36, 56, 0.22);
+  background: rgba(0, 0, 0, 0.55);
   padding: 1rem;
   z-index: 30;
 }
@@ -795,7 +884,7 @@ a {
   padding: 0.8rem 0.85rem;
   border: 1px solid var(--line-strong);
   border-radius: var(--radius-sm);
-  background: #fff;
+  background: var(--el-inset);
 }
 
 .modal-actions {
@@ -866,10 +955,10 @@ a {
 }
 
 .markdown-body code {
-  font-family: "SFMono-Regular", Consolas, Menlo, monospace;
+  font-family: var(--el-font-mono);
   font-size: 0.9em;
   padding: 0.15em 0.35em;
-  background: rgba(83, 103, 164, 0.08);
+  background: rgba(255, 255, 255, 0.07);
   border-radius: 0.35rem;
 }
 
@@ -877,7 +966,7 @@ a {
   overflow: auto;
   padding: 0.95rem 1rem;
   border-radius: var(--radius-sm);
-  background: rgba(83, 103, 164, 0.08);
+  background: rgba(255, 255, 255, 0.07);
 }
 
 .markdown-body pre code {
@@ -887,7 +976,7 @@ a {
 
 .markdown-body blockquote {
   padding-left: 1rem;
-  border-left: 3px solid rgba(95, 118, 216, 0.28);
+  border-left: 3px solid rgba(125, 149, 240, 0.35);
   color: var(--muted);
 }
 
@@ -904,7 +993,7 @@ a {
 }
 
 .markdown-body th {
-  background: rgba(83, 103, 164, 0.08);
+  background: rgba(255, 255, 255, 0.07);
 }
 
 @media (max-width: 980px) {
@@ -965,7 +1054,7 @@ a {
   .documents-sidebar,
   .share-sidebar {
     border-radius: 0.82rem;
-    box-shadow: 0 10px 26px rgba(34, 49, 88, 0.08);
+    box-shadow: var(--el-shadow-1);
   }
 
   .documents-main,
@@ -2239,6 +2328,10 @@ function wireShellEvents() {
       return;
     }
     const data = event.data;
+    if (data && typeof data === "object" && data.type === "elastos:menu-command") {
+      handleShellMenuCommand(data.cmd);
+      return;
+    }
     if (!data || typeof data !== "object" || data.type !== "documents:open-chat-attachment") {
       return;
     }
@@ -2491,8 +2584,75 @@ function loadLockedMode() {
     '<div class="empty-document"><h2>Documents is ready.</h2><p>Open it from Home to create, edit, or publish documents.</p></div>';
 }
 
+// Shell menu bar: declare File/View menus to Home; commands come back as
+// elastos:menu-command and route to the same functions the toolbar uses.
+function announceShellMenuManifest() {
+  if (!state.homeToken || window.parent === window) {
+    return;
+  }
+  window.parent.postMessage({
+    type: "home:menu-manifest",
+    homeToken: state.homeToken,
+    menus: [
+      {
+        title: "File",
+        items: [
+          { label: "New Document", cmd: "new-document" },
+          "-",
+          { label: "Save", cmd: "save" },
+          { label: "Save As...", cmd: "save-as" },
+          "-",
+          { label: "Publish", cmd: "publish" },
+          { label: "Delete Document", cmd: "delete" },
+          "-",
+          { label: "Close Window", cmd: "__close-window" },
+        ],
+      },
+      {
+        title: "View",
+        items: [
+          { label: "Write", cmd: "view-write" },
+          { label: "Split", cmd: "view-split" },
+          { label: "Read", cmd: "view-read" },
+        ],
+      },
+    ],
+  }, window.location.origin);
+}
+
+function handleShellMenuCommand(cmd) {
+  switch (cmd) {
+    case "new-document":
+      createDocument("");
+      return;
+    case "save":
+      saveCurrent().catch((error) => setStatus(error.message || "Save failed.", "warning"));
+      return;
+    case "save-as":
+      openSaveAsModal();
+      return;
+    case "publish":
+      publishCurrent().catch((error) => setStatus(error.message || "Publish failed.", "warning"));
+      return;
+    case "delete":
+      requestDeleteCurrent();
+      return;
+    case "view-write":
+      setWorkspaceView("write");
+      return;
+    case "view-split":
+      setWorkspaceView("split");
+      return;
+    case "view-read":
+      setWorkspaceView("read");
+      return;
+    default:
+  }
+}
+
 (async function init() {
   if (state.homeToken) {
+    announceShellMenuManifest();
     await loadShellMode();
   } else if (window.location.pathname.startsWith("/apps/documents")) {
     loadLockedMode();

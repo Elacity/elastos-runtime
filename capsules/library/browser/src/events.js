@@ -34,6 +34,7 @@ export function bindLibraryEvents({
   showError,
   showMenuForObject,
   showPlaceMenu,
+  showToolbarMenu,
   startRename,
   state,
   stopLibraryEventStream,
@@ -131,6 +132,47 @@ export function bindLibraryEvents({
   elements.search.addEventListener("input", () => {
     state.query = elements.search.value || "";
     scheduleContentRender();
+  });
+  // Toolbar search: the magnifier expands into the field; Escape or an empty
+  // blur collapses it, so a live filter can never hide behind a closed icon.
+  const setSearchOpen = (open) => {
+    elements.toolbarSearch.classList.toggle("open", open);
+    elements.searchToggle.setAttribute("aria-expanded", open ? "true" : "false");
+    elements.search.tabIndex = open ? 0 : -1;
+    if (open) {
+      elements.search.focus();
+    }
+  };
+  elements.searchToggle.addEventListener("click", () => {
+    const isOpen = elements.toolbarSearch.classList.contains("open");
+    if (isOpen && !elements.search.value) {
+      setSearchOpen(false);
+      return;
+    }
+    setSearchOpen(true);
+  });
+  elements.search.addEventListener("blur", () => {
+    if (!elements.search.value) {
+      setSearchOpen(false);
+    }
+  });
+  elements.search.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") {
+      return;
+    }
+    event.stopPropagation();
+    elements.search.value = "";
+    state.query = "";
+    scheduleContentRender();
+    setSearchOpen(false);
+  });
+  // The toolbar "…" opens the folder-action menu — sort, New, Paste, Upload,
+  // Refresh, Properties — anchored under the button. View is not repeated
+  // here; its segmented toggle sits directly beside it.
+  elements.moreButton.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const rect = elements.moreButton.getBoundingClientRect();
+    showToolbarMenu(rect.right, rect.bottom + 6);
   });
   elements.sortSelect.addEventListener("change", () => {
     setSort(elements.sortSelect.value || "name");

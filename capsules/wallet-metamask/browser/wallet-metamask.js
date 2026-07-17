@@ -6,6 +6,13 @@ const requestsNode = document.querySelector("#wallet-requests");
 const frameHomeToken = readLaunchToken();
 const homeOrigin = readQueryParam("home_origin");
 const discoveredWalletProviders = [];
+// Skip the background poll while the user is mid-connect/mid-sign so we never tear down an
+// in-flight approval's button state, and a re-entrancy guard so polls can't overlap.
+let interactionBusy = false;
+let refreshInFlight = false;
+// How often to pick up newly-queued approvals (e.g. a mint tx just enqueued by the Create
+// portal) without the user having to reconnect/reopen the Wallet.
+const APPROVAL_POLL_MS = 5000;
 
 if (frameHomeToken && homeOrigin && window.top !== window) {
   window.top.postMessage({ type: "home:app-ready", homeToken: frameHomeToken }, homeOrigin);
@@ -28,6 +35,22 @@ function boot() {
   refreshWalletState().catch((error) => {
     showStatus(String(error.message || error), "error");
   });
+  startApprovalAutoRefresh();
+}
+
+// Poll for newly-queued approvals so a mint/trade tx enqueued elsewhere appears here on its
+// own. Quiet by design: only when the tab is visible, we have a launch token, and the user
+// isn't mid-interaction; errors are swallowed (the next tick retries).
+function startApprovalAutoRefresh() {
+  window.setInterval(() => {
+    if (!frameHomeToken || interactionBusy || refreshInFlight) {
+      return;
+    }
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+      return;
+    }
+    refreshWalletState().catch(() => {});
+  }, APPROVAL_POLL_MS);
 }
 
 function configureMetaMaskDiscovery() {
@@ -44,13 +67,43 @@ function configureMetaMaskDiscovery() {
   window.dispatchEvent(new Event("eip6963:requestProvider"));
 }
 
+// Re-request EIP-6963 announcements and wait briefly for them to arrive. Resolves as
+// soon as a MetaMask provider is seen, or after a short timeout. Makes connect robust
+// to a slow injection or a co-installed wallet that grabbed window.ethereum.
+function ensureWalletDiscovery(timeoutMs = 400) {
+  window.dispatchEvent(new Event("eip6963:requestProvider"));
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const tick = () => {
+      const haveMetaMask = discoveredWalletProviders.some(({ info, provider }) => {
+        const rdns = readText(info && info.rdns).toLowerCase();
+        return rdns.includes("metamask") || Boolean(provider && provider.isMetaMask && !provider.isPhantom);
+      });
+      if (haveMetaMask || Date.now() - start >= timeoutMs) {
+        resolve();
+        return;
+      }
+      setTimeout(tick, 50);
+    };
+    tick();
+  });
+}
+
 async function onConnect() {
+  // Re-run EIP-6963 discovery and give announcements a tick to arrive, so a slow
+  // MetaMask injection doesn't fall through to a window.ethereum a co-installed wallet
+  // (e.g. Phantom) has overridden. Discovery is the authoritative, per-wallet source.
+  await ensureWalletDiscovery();
   const provider = metaMaskProvider();
   if (!provider) {
-    showStatus("No compatible wallet found.", "error");
+    showStatus(
+      "MetaMask not found. If another wallet (e.g. Phantom) is set as your default Ethereum wallet, MetaMask may not announce — disable that wallet's Ethereum default, or unlock MetaMask, and retry.",
+      "error",
+    );
     return;
   }
   setButtonBusy(connectButton, true);
+  interactionBusy = true;
   showStatus("Approve in your wallet.", "muted");
   try {
     const { address, chainId } = await connectProvider(provider);
@@ -77,6 +130,7 @@ async function onConnect() {
     showStatus(String(error.message || error), "error");
   } finally {
     setButtonBusy(connectButton, false);
+    interactionBusy = false;
   }
 }
 
@@ -120,26 +174,34 @@ async function refreshWalletState() {
     showStatus("Open from Wallet to review approval requests.", "error");
     return;
   }
-  const [accountSummary, requestSummary] = await Promise.all([
-    fetchJson("/api/apps/wallet-metamask/wallet/accounts", {
-      headers: shellHeaders(),
-    }),
-    fetchJson("/api/apps/wallet-metamask/wallet/approvals", {
-      headers: shellHeaders(),
-    }),
-  ]);
-  const accounts = Array.isArray(accountSummary && accountSummary.accounts)
-    ? accountSummary.accounts
-    : [];
-  const requests = Array.isArray(requestSummary && requestSummary.approval_requests)
-    ? requestSummary.approval_requests
-    : [];
-  renderAccounts(accounts);
-  renderRequests(requests);
-  if (accounts.length > 0) {
-    setState(`${accounts.length} linked`);
-  } else {
-    setState("0 linked");
+  if (refreshInFlight) {
+    return;
+  }
+  refreshInFlight = true;
+  try {
+    const [accountSummary, requestSummary] = await Promise.all([
+      fetchJson("/api/apps/wallet-metamask/wallet/accounts", {
+        headers: shellHeaders(),
+      }),
+      fetchJson("/api/apps/wallet-metamask/wallet/approvals", {
+        headers: shellHeaders(),
+      }),
+    ]);
+    const accounts = Array.isArray(accountSummary && accountSummary.accounts)
+      ? accountSummary.accounts
+      : [];
+    const requests = Array.isArray(requestSummary && requestSummary.approval_requests)
+      ? requestSummary.approval_requests
+      : [];
+    renderAccounts(accounts);
+    renderRequests(requests);
+    if (accounts.length > 0) {
+      setState(`${accounts.length} linked`);
+    } else {
+      setState("0 linked");
+    }
+  } finally {
+    refreshInFlight = false;
   }
 }
 
@@ -273,6 +335,7 @@ async function onRequestClick(event) {
     return;
   }
   setButtonBusy(button, true);
+  interactionBusy = true;
   showStatus("Preparing request.", "muted");
   try {
     const handoffSummary = await fetchJson(`/api/apps/wallet-metamask/wallet/approvals/${encodeURIComponent(requestId)}/approve`, {
@@ -332,6 +395,7 @@ async function onRequestClick(event) {
     showStatus(String(error.message || error), "error");
   } finally {
     setButtonBusy(button, false);
+    interactionBusy = false;
   }
 }
 
@@ -408,14 +472,21 @@ function metaMaskProvider() {
 
 function selectedMetaMaskProvider(entries) {
   const list = Array.isArray(entries) ? entries : [];
-  const metamask = list.find(({ info, provider }) => {
-    const rdns = readText(info && info.rdns).toLowerCase();
-    return Boolean(provider && provider.isMetaMask) || rdns.includes("metamask");
-  });
-  if (metamask && metamask.provider && typeof metamask.provider.request === "function") {
-    return metamask.provider;
+  const usable = ({ provider }) =>
+    provider && typeof provider.request === "function" && !provider.isPhantom;
+  // Prefer the authoritative EIP-6963 identity (rdns), which a wallet cannot spoof as
+  // another wallet's. Only then fall back to the isMetaMask flag — and never trust it
+  // on a provider that also identifies as Phantom (Phantom sets isMetaMask for compat).
+  const byRdns = list.find(
+    (entry) => usable(entry) && readText(entry.info && entry.info.rdns).toLowerCase().includes("metamask"),
+  );
+  if (byRdns) {
+    return byRdns.provider;
   }
-  return null;
+  const byFlag = list.find(
+    (entry) => usable(entry) && Boolean(entry.provider.isMetaMask),
+  );
+  return byFlag ? byFlag.provider : null;
 }
 
 function walletIntentLabel(intent) {

@@ -1,19 +1,19 @@
+/* Rides the shared tokens (dark default, light via data-el-theme). */
 :root {
-  color-scheme: light;
-  --bg: #edf1fb;
-  --panel: rgba(255, 255, 255, 0.9);
-  --line: rgba(83, 103, 164, 0.14);
-  --line-strong: rgba(83, 103, 164, 0.22);
-  --ink: #1d2438;
-  --muted: #66708a;
-  --brand: #f6921a;
-  --brand-soft: #fff1dc;
-  --accent: #5f76d8;
-  --accent-soft: #e8edff;
-  --accent-deep: #3c53a7;
-  --danger: #b14c5a;
-  --shadow: 0 24px 60px rgba(34, 49, 88, 0.12);
-  font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
+  --bg: var(--el-bg);
+  --panel: var(--el-surface);
+  --line: var(--el-hairline);
+  --line-strong: var(--el-hairline-strong);
+  --ink: var(--el-text);
+  --muted: var(--el-muted);
+  --brand: var(--el-brand);
+  --brand-soft: color-mix(in srgb, var(--el-brand) 16%, transparent);
+  --accent: var(--el-accent);
+  --accent-soft: var(--el-accent-soft);
+  --accent-deep: var(--el-accent-strong);
+  --danger: var(--el-danger);
+  --shadow: var(--el-shadow-2);
+  font-family: var(--el-font);
 }
 
 * {
@@ -33,9 +33,8 @@ body {
 body {
   padding: clamp(0.45rem, 1.35vw, 0.85rem);
   background:
-    radial-gradient(circle at top left, rgba(95, 118, 216, 0.14), transparent 28%),
-    radial-gradient(circle at bottom right, rgba(126, 149, 226, 0.12), transparent 24%),
-    linear-gradient(180deg, #f7f9ff 0%, var(--bg) 100%);
+    radial-gradient(circle at top left, var(--el-accent-faint), transparent 28%),
+    var(--bg);
   color: var(--ink);
 }
 
@@ -116,7 +115,7 @@ h2 {
   padding: 0.34rem 0.55rem;
   border: 1px solid var(--line);
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.58);
+  background: var(--el-inset);
   font-size: 0.78rem;
   font-weight: 800;
 }
@@ -129,11 +128,11 @@ h2 {
   min-height: 2.35rem;
   padding: 0.58rem 0.9rem;
   border-radius: 999px;
-  background: linear-gradient(135deg, var(--brand), #ffb24c);
-  color: #1d2438;
+  background: linear-gradient(135deg, var(--brand), var(--el-brand-strong));
+  color: #161616;
   font-weight: 900;
   cursor: pointer;
-  box-shadow: 0 12px 26px rgba(246, 146, 26, 0.25);
+  box-shadow: var(--el-shadow-1);
 }
 
 .wallet-button-secondary {
@@ -152,17 +151,17 @@ h2 {
   padding: 0.6rem 0.72rem;
   border: 1px solid var(--line);
   border-radius: 0.85rem;
-  background: rgba(255, 255, 255, 0.6);
+  background: var(--el-inset);
   color: var(--muted);
 }
 
 .wallet-status[data-tone="success"] {
-  color: #2d6b48;
+  color: var(--el-ok);
 }
 
 .wallet-status[data-tone="error"] {
-  border-color: rgba(177, 76, 90, 0.24);
-  background: rgba(177, 76, 90, 0.1);
+  border-color: color-mix(in srgb, var(--danger) 30%, transparent);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
   color: var(--danger);
 }
 
@@ -178,7 +177,7 @@ h2 {
   padding: 0.72rem;
   border: 1px solid var(--line);
   border-radius: 0.95rem;
-  background: rgba(255, 255, 255, 0.62);
+  background: var(--el-inset);
 }
 
 .wallet-empty {
@@ -217,7 +216,7 @@ h2 {
   display: block;
   max-width: 100%;
   color: var(--accent-deep);
-  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: var(--el-font-mono);
   font-size: 0.82rem;
   line-height: 1.35;
   overflow-wrap: anywhere;

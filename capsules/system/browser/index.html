@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>System · ElastOS</title>
+<script src="./elastos-theme.js"></script>
+<link rel="stylesheet" href="./elastos-ui.css">
 <link rel="stylesheet" href="./style.css?v=system-20260712a">
 </head>
 <body>
@@ -22,6 +24,14 @@
 
       <aside class="settings-sidebar disable-user-select disable-context-menu" aria-label="System sections">
         <div class="settings-sidebar-burger disable-context-menu disable-user-select" aria-hidden="true"></div>
+        <input
+          id="settings-search"
+          class="settings-search"
+          type="search"
+          placeholder="Search"
+          spellcheck="false"
+          aria-label="Search settings"
+        >
         <button class="settings-sidebar-item disable-context-menu disable-user-select active" type="button" data-settings="account">
           <span class="settings-sidebar-icon settings-sidebar-icon-account" aria-hidden="true"></span>
           <span class="settings-sidebar-text">Account</span>
@@ -82,6 +92,61 @@
           <section class="pc2-section" aria-labelledby="appearance-title">
             <h1 id="appearance-title" class="pc2-section-title">Appearance</h1>
             <div class="pc2-group">
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Theme</div>
+                    <div class="pc2-card-sublabel">Light or dark across the shell and apps.</div>
+                  </div>
+                  <div id="theme-segment" class="system-segment" role="radiogroup" aria-label="Theme">
+                    <button type="button" class="system-segment-option" data-theme-option="auto" role="radio" aria-checked="false">Auto</button>
+                    <button type="button" class="system-segment-option" data-theme-option="light" role="radio" aria-checked="false">Light</button>
+                    <button type="button" class="system-segment-option" data-theme-option="dark" role="radio" aria-checked="false">Dark</button>
+                  </div>
+                </div>
+              </div>
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Accent color</div>
+                    <div class="pc2-card-sublabel">One accent across the shell and every app.</div>
+                  </div>
+                  <div id="accent-picker" class="system-accent-picker" role="radiogroup" aria-label="Accent color">
+                    <button type="button" class="system-accent-dot" data-accent-option="blue" role="radio" aria-checked="false" aria-label="Blue" title="Blue"></button>
+                    <button type="button" class="system-accent-dot" data-accent-option="purple" role="radio" aria-checked="false" aria-label="Purple" title="Purple"></button>
+                    <button type="button" class="system-accent-dot" data-accent-option="pink" role="radio" aria-checked="false" aria-label="Pink" title="Pink"></button>
+                    <button type="button" class="system-accent-dot" data-accent-option="red" role="radio" aria-checked="false" aria-label="Red" title="Red"></button>
+                    <button type="button" class="system-accent-dot" data-accent-option="orange" role="radio" aria-checked="false" aria-label="Orange" title="Orange"></button>
+                    <button type="button" class="system-accent-dot" data-accent-option="yellow" role="radio" aria-checked="false" aria-label="Yellow" title="Yellow"></button>
+                    <button type="button" class="system-accent-dot" data-accent-option="green" role="radio" aria-checked="false" aria-label="Green" title="Green"></button>
+                    <button type="button" class="system-accent-dot" data-accent-option="graphite" role="radio" aria-checked="false" aria-label="Graphite" title="Graphite"></button>
+                  </div>
+                </div>
+              </div>
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Automatically hide and show the Dock</div>
+                    <div class="pc2-card-sublabel">Tuck the dock under the bottom edge until the pointer approaches.</div>
+                  </div>
+                  <label class="system-switch">
+                    <input id="dock-autohide" type="checkbox" aria-label="Automatically hide and show the Dock">
+                    <span class="system-switch-track" aria-hidden="true"></span>
+                  </label>
+                </div>
+              </div>
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Play interface sounds</div>
+                    <div class="pc2-card-sublabel">Three optional cues — notification, empty Trash, and refusal. Off by default.</div>
+                  </div>
+                  <label class="system-switch">
+                    <input id="ui-sounds" type="checkbox" aria-label="Play interface sounds">
+                    <span class="system-switch-track" aria-hidden="true"></span>
+                  </label>
+                </div>
+              </div>
               <div class="pc2-group-row">
                 <div class="pc2-card-row">
                   <div>
