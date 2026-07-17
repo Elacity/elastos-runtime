@@ -200,6 +200,7 @@ export function retireHomeGuiSurface(options = {}) {
 }
 
 export function setHomeGuiMounted(mounted, options = {}) {
+  const wasMounted = document.body.dataset.homeGui === "mounted";
   document.body.dataset.homeGui = mounted ? "mounted" : "dormant";
   if (mounted) {
     shellState.homeGuiMounted = true;
@@ -207,6 +208,9 @@ export function setHomeGuiMounted(mounted, options = {}) {
     startHomeGuiClock();
     for (const node of homeGuiHostNodes()) {
       setHomeGuiHostNodeMounted(node, true);
+    }
+    if (!wasMounted) {
+      playHomeGuiArrival();
     }
     return;
   }
@@ -217,6 +221,27 @@ export function setHomeGuiMounted(mounted, options = {}) {
   for (const node of homeGuiHostNodes()) {
     setHomeGuiHostNodeMounted(node, false);
   }
+}
+
+// Arrival: the desktop settles in as the GUI mounts (unlock hand-off or a
+// switch back from an alternate shell). Opacity/transform only — compositor
+// work, no layout. The host's neutral mask never carries the desktop; this
+// beat is the GUI's own. Reduced motion skips it.
+function playHomeGuiArrival() {
+  if (window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches === true) {
+    return;
+  }
+  const arriving = [".desktop-backdrop", ".toolbar", ".desktop-workspace", ".taskbar"]
+    .map((selector) => document.querySelector(selector))
+    .filter((node) => node && !node.hidden);
+  for (const node of arriving) {
+    node.classList.add("home-gui-arriving");
+  }
+  window.setTimeout(() => {
+    for (const node of arriving) {
+      node.classList.remove("home-gui-arriving");
+    }
+  }, 760);
 }
 
 function startHomeGuiClock() {
