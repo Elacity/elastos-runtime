@@ -1,46 +1,51 @@
 # ElastOS Design System
 
 This is the active visual contract for Home and the first-party browser capsules.
-It is intentionally small: one brand layer, one capsule layer, and no per-app
-color personality unless the app has a functional reason.
+It is intentionally small: one shared token layer, one theme switch, one accent,
+and no per-app color personality unless the app has a functional reason.
+
+## Token Source and Vendoring
+
+The single source of truth is `capsules/_shared/elastos-ui.css` (tokens) and
+`capsules/_shared/elastos-theme.js` (theme runtime). Capsules never share these
+files at runtime — `scripts/vendor-ui-tokens.sh` (run via `just vendor-ui`)
+copies them into each participating capsule's browser-serving directory, and
+`--check` mode fails the gate when a vendored copy drifts from the source.
+Vendor targets are listed in the script; most apps serve from `browser/`,
+viewer-style capsules serve from their root.
 
 ## Color Contract
 
-Home sits on the user wallpaper and ElastOS mark. It uses a dark glass layer with
-the ElastOS orange as brand emphasis:
+Dark is the base theme. Every first-party surface consumes the `--el-*` tokens
+(surfaces, text, hairlines, radii, shadows, motion) and maps any legacy local
+variable names onto them in a small `:root` alias block.
 
-| Token | Value | Use |
-|------|-------|-----|
-| `--brand` | `#f6921a` | ElastOS logo-adjacent emphasis, badges, selected chrome |
-| `--brand-strong` | `#ffb457` | hover/focus brand emphasis |
-| `--bg` | `#050608` | Home base behind wallpaper |
-| `--text` | `#f5f7fa` | Home foreground text |
+- **Theme:** `elastos-theme.js` applies `data-el-theme="light"` on `<html>`
+  from the `elastos.ui.theme` localStorage key (system/light/dark). The light
+  palette lives in the same `elastos-ui.css`; apps must not hardcode dark
+  assumptions in chrome.
+- **One system accent:** `--el-accent` (plus `-ink`, `-strong`, `-soft`,
+  `-faint` derivatives). The user picks one of eight macOS-style accents in
+  System → Personalization (`elastos.ui.accent`, `data-el-accent` on `<html>`);
+  every app obeys it and none defines its own accent color.
+- **Brand:** the ElastOS orange (`--el-brand`, `#f6921a`) is reserved for
+  logo-adjacent emphasis and badges — it is not the interaction accent.
+- **Content is not chrome:** viewer paper (PDF/EPUB white), video letterbox
+  black, and 3D stage gradients stay fixed across themes on purpose.
 
-First-party capsules use a light, document-like layer over the same product
-world. The palette is shared by Chat Room, Documents, Inbox, Library, System,
-and GBA:
+## Shell Chrome Anatomy
 
-| Token | Value | Use |
-|------|-------|-----|
-| `--bg` | `#edf1fb` | capsule background |
-| `--bg-strong` | `#e3e9fb` | stronger capsule wash |
-| `--panel` | `rgba(255, 255, 255, 0.9)` | primary glass cards |
-| `--panel-strong` | `#ffffff` | solid cards and inputs |
-| `--panel-soft` | `#eef2ff` | secondary controls |
-| `--line` | `rgba(83, 103, 164, 0.14)` | normal borders |
-| `--line-strong` | `rgba(83, 103, 164, 0.22)` | focusable borders |
-| `--ink` | `#1d2438` | foreground text |
-| `--muted` | `#66708a` | secondary text |
-| `--accent` | `#5f76d8` | primary action and selected state |
-| `--accent-soft` | `#e8edff` | selected/soft action background |
-| `--accent-deep` | `#3c53a7` | strong accent text |
-| `--danger` | `#b14c5a` | destructive actions |
-| `--brand` | `#f6921a` | ElastOS brand accent, used sparingly |
-| `--brand-soft` | `#fff1dc` | soft brand background |
+The Home shell follows the macOS anatomy deliberately:
 
-The capsule accent is blue-lavender because it holds contrast against the pale
-wallpaper and lets the orange logo remain the brand anchor instead of competing
-with every button.
+- A full-width system bar owns the focused app's name, its **menu bar**
+  (see message contract below), Spotlight, network status, inbox, identity,
+  and the clock (which opens Notification Center).
+- Windows carry traffic-light controls on the left; inactive windows go
+  neutral. Maximized windows own the stage between bar and dock, never the bar.
+- The dock is a centered pill with cosine-falloff magnification; running apps
+  get an indicator dot; **Trash anchors the right end** past a divider.
+- All window/dock motion is transform/opacity-only and honors
+  `prefers-reduced-motion`.
 
 ## Interaction Contract
 
@@ -54,9 +59,32 @@ Every visible action must have the same contract for humans and agents:
 - First-party surfaces expose state in simple product nouns before raw paths,
   CIDs, or provider details.
 
+## Home Message Contract (shell ↔ app iframes)
+
+All messages are same-origin `postMessage`, authenticated by the app frame's
+launch token (`homeToken`), validated in Home against the frame that sent them.
+The inventory (handler: `capsules/home/browser/shell.js`):
+
+| Type | Direction | Purpose |
+|------|-----------|---------|
+| `home:refresh-summary` | app → shell | ask Home to re-poll the summary |
+| `home:open-target` / `home:open-uri` | app → shell | open another app / viewer (allow-listed per source app) |
+| `home:deliver-to-target` / `home:open-target-with-payload` | app → shell | routed app-to-app payloads (allow-listed) |
+| `home:close-self` / `home:relaunch-self` | app → shell | window lifecycle for the sender only |
+| `home:menu-manifest` | app → shell | declare the app's menu bar (File/View…); UI data only, sanitized and size-capped, bound to the sender's window |
+| `elastos:menu-command` | shell → app | a chosen menu item's `cmd`, posted only to the window that declared it |
+
+Menu manifests carry zero authority: the shell renders labels via
+`textContent`, commands route to the same in-app functions as the app's own
+buttons, and `__`-prefixed commands (`__new-window`, `__close-window`) are
+handled by the shell itself. "New Window" is offered only for targets where
+`openTarget` genuinely opens a new window (never for single-session apps or
+the protected dKMS viewers).
+
 ## Drift Checks
 
 `scripts/home-entropy-check.mjs` enforces the active token set, stale-copy
 removal, and the basic human/agent interaction contract for first-party browser
-surfaces. Update this document and the check together when the design language
-intentionally changes.
+surfaces; `scripts/vendor-ui-tokens.sh --check` enforces vendored-token
+freshness. Update this document and the checks together when the design
+language intentionally changes.

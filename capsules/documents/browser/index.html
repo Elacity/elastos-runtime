@@ -2317,6 +2317,10 @@ function wireShellEvents() {
       return;
     }
     const data = event.data;
+    if (data && typeof data === "object" && data.type === "elastos:menu-command") {
+      handleShellMenuCommand(data.cmd);
+      return;
+    }
     if (!data || typeof data !== "object" || data.type !== "documents:open-chat-attachment") {
       return;
     }
@@ -2568,8 +2572,75 @@ function loadLockedMode() {
     '<div class="empty-document"><h2>Documents is ready.</h2><p>Open it from Home to create, edit, or publish documents.</p></div>';
 }
 
+// Shell menu bar: declare File/View menus to Home; commands come back as
+// elastos:menu-command and route to the same functions the toolbar uses.
+function announceShellMenuManifest() {
+  if (!state.homeToken || window.parent === window) {
+    return;
+  }
+  window.parent.postMessage({
+    type: "home:menu-manifest",
+    homeToken: state.homeToken,
+    menus: [
+      {
+        title: "File",
+        items: [
+          { label: "New Document", cmd: "new-document" },
+          "-",
+          { label: "Save", cmd: "save" },
+          { label: "Save As...", cmd: "save-as" },
+          "-",
+          { label: "Publish", cmd: "publish" },
+          { label: "Delete Document", cmd: "delete" },
+          "-",
+          { label: "Close Window", cmd: "__close-window" },
+        ],
+      },
+      {
+        title: "View",
+        items: [
+          { label: "Write", cmd: "view-write" },
+          { label: "Split", cmd: "view-split" },
+          { label: "Read", cmd: "view-read" },
+        ],
+      },
+    ],
+  }, window.location.origin);
+}
+
+function handleShellMenuCommand(cmd) {
+  switch (cmd) {
+    case "new-document":
+      createDocument("");
+      return;
+    case "save":
+      saveCurrent().catch((error) => setStatus(error.message || "Save failed.", "warning"));
+      return;
+    case "save-as":
+      openSaveAsModal();
+      return;
+    case "publish":
+      publishCurrent().catch((error) => setStatus(error.message || "Publish failed.", "warning"));
+      return;
+    case "delete":
+      requestDeleteCurrent();
+      return;
+    case "view-write":
+      setWorkspaceView("write");
+      return;
+    case "view-split":
+      setWorkspaceView("split");
+      return;
+    case "view-read":
+      setWorkspaceView("read");
+      return;
+    default:
+  }
+}
+
 (async function init() {
   if (state.homeToken) {
+    announceShellMenuManifest();
     await loadShellMode();
   } else if (window.location.pathname.startsWith("/apps/documents")) {
     loadLockedMode();

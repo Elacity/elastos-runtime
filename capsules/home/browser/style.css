@@ -557,6 +557,104 @@ img {
   background: var(--panel-soft);
 }
 
+/* App menu bar (macOS anatomy): the focused app's File/Edit/View titles sit
+   right after its name. Titles are quiet bar text; the open one gets the same
+   lift as any bar control, and popovers share the frosted menu material. */
+.toolbar-menubar {
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  margin-left: 4px;
+  height: 100%;
+}
+
+.toolbar-menu {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.toolbar-menu-title {
+  padding: 0 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 22px;
+  white-space: nowrap;
+  opacity: 0.85;
+  cursor: default;
+}
+
+.toolbar-menu-title:hover,
+.toolbar-menu-title[aria-expanded="true"] {
+  background: var(--lift);
+  opacity: 1;
+}
+
+.toolbar-menu-title:focus-visible {
+  outline: 2px solid var(--brand-focus);
+  outline-offset: -2px;
+  opacity: 1;
+}
+
+.toolbar-menu-popover {
+  position: absolute;
+  top: calc(100% - 3px);
+  left: 0;
+  z-index: 100120;
+  min-width: 190px;
+  padding: 5px;
+  display: grid;
+  gap: 2px;
+  border-radius: 12px;
+  background: var(--menu-fill);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-soft);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
+.toolbar-menu-popover[hidden] {
+  display: none;
+}
+
+.toolbar-menu-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.toolbar-menu-item:hover:not(:disabled),
+.toolbar-menu-item:focus-visible {
+  background: var(--lift);
+  outline: none;
+}
+
+.toolbar-menu-item:disabled {
+  color: var(--soft);
+}
+
+.toolbar-menu-divider {
+  height: 1px;
+  margin: 3px 6px;
+  background: var(--panel-soft);
+}
+
 /* White stroke glyph; light theme inverts the button (PC2's approach) and
    counter-inverts the numeric badge so it keeps its own colors. */
 :root[data-el-theme="light"] .inbox-btn {
@@ -3149,7 +3247,8 @@ body.dragging-target {
     margin-left: 7px;
   }
 
-  .toolbar-active-title {
+  .toolbar-active-title,
+  .toolbar-menubar {
     display: none;
   }
 

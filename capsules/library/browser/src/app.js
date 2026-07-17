@@ -1146,6 +1146,79 @@ import { createLibraryUploads } from "./uploads.js";
       });
     }
 
+    // Shell menu bar: declare File/View menus to Home; commands come back as
+    // elastos:menu-command and route to the same functions the toolbar uses.
+    function announceMenuManifest() {
+      if (!state.homeToken || window.parent === window) {
+        return;
+      }
+      window.parent.postMessage({
+        type: "home:menu-manifest",
+        homeToken: state.homeToken,
+        menus: [
+          {
+            title: "File",
+            items: [
+              { label: "New Folder", cmd: "new-folder" },
+              { label: "New Text Document", cmd: "new-text-document" },
+              "-",
+              { label: "Upload Files...", cmd: "upload" },
+              "-",
+              { label: "New Window", cmd: "__new-window" },
+              { label: "Close Window", cmd: "__close-window" },
+            ],
+          },
+          {
+            title: "View",
+            items: [
+              { label: "As Icons", cmd: "view-icons" },
+              { label: "As Details", cmd: "view-details" },
+              "-",
+              { label: "Show Hidden", cmd: "toggle-hidden" },
+              { label: "Refresh", cmd: "refresh" },
+            ],
+          },
+        ],
+      }, window.location.origin);
+    }
+
+    function handleMenuCommand(cmd) {
+      switch (cmd) {
+        case "new-folder":
+          createFolder().catch(showError);
+          return;
+        case "new-text-document":
+          createTextDocument();
+          return;
+        case "upload":
+          elements.fileInput.click();
+          return;
+        case "view-icons":
+          setView("grid");
+          return;
+        case "view-details":
+          setView("list");
+          return;
+        case "toggle-hidden":
+          toggleShowHidden();
+          return;
+        case "refresh":
+          loadCurrentFolder().catch(showError);
+          return;
+        default:
+      }
+    }
+
+    window.addEventListener("message", (event) => {
+      if (event.origin !== window.location.origin) {
+        return;
+      }
+      const message = event.data;
+      if (message?.type === "elastos:menu-command" && typeof message.cmd === "string") {
+        handleMenuCommand(message.cmd);
+      }
+    });
+
     async function boot() {
       if (!state.homeToken) {
         elements.lockedShell.classList.remove("hidden");
@@ -1155,6 +1228,7 @@ import { createLibraryUploads } from "./uploads.js";
       elements.content.dataset.view = state.view;
       syncModeChrome();
       bindEvents();
+      announceMenuManifest();
       try {
         await loadRoots();
         installBrowserHistory();

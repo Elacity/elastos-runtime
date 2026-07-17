@@ -64,6 +64,7 @@ import {
   cleanupBeforeUnload,
   handleShellResize,
   refreshHomeInternalWindows,
+  supportsMenuNewWindow,
 } from "./shell-windows.js?v=home-20260701c";
 import {
   bindHomeUnlock,
@@ -79,6 +80,11 @@ import {
   bindNotificationCenter,
   recordNotifications,
 } from "./shell-notifications.js?v=home-20260701c";
+import {
+  bindMenubar,
+  setMenuManifest,
+  syncMenubar,
+} from "./shell-menubar.js?v=home-20260701c";
 
 configureWindowHooks({
   clearIdentitySurface,
@@ -87,8 +93,11 @@ configureWindowHooks({
   refreshLauncherIfVisible,
   renderDesktop,
   renderTaskbar,
+  syncMenubar,
   updateTaskbarState,
 });
+
+bindMenubar({ closeWindow, openTarget, supportsNewWindow: supportsMenuNewWindow });
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_AFTER_INTERACTION_MS = 700;
@@ -453,6 +462,16 @@ window.addEventListener("message", (event) => {
   }
   if (data.type === "home:refresh-summary") {
     requestShellSummaryRefresh({ reason: "child-message" });
+    return;
+  }
+  if (data.type === "home:menu-manifest") {
+    // Menus are self-declared UI, not authority: a window may only shape its
+    // OWN menu bar entry, so the manifest binds to the sender's window id.
+    if (context.kind !== "app-frame" || !context.windowId) {
+      console.warn("home ignored unauthorized menu-manifest message", context.targetId);
+      return;
+    }
+    setMenuManifest(context.windowId, data.menus);
     return;
   }
   if (data.type === "home:open-uri") {

@@ -47,6 +47,7 @@ const REQUIRED_WINDOW_HOOKS = [
   "refreshLauncherIfVisible",
   "renderDesktop",
   "renderTaskbar",
+  "syncMenubar",
   "updateTaskbarState",
 ];
 const WINDOW_CONTROL_GUARD_MS = 400;
@@ -56,6 +57,18 @@ const WINDOW_CLOSE_GUARD_MOVE_PX = 18;
 const BROWSER_DESKTOP_OPEN_GUARD_MS = 700;
 const MAX_SESSION_WINDOWS = 24;
 const SINGLE_SESSION_TARGETS = new Set([PEOPLE_TARGET_ID, "inbox", "wallet"]);
+
+/* Menu-bar honesty: "New Window" appears only where openTarget really opens
+   one. Single-session targets just refocus (the item would be a lie), and the
+   protected viewers launch a dKMS-backed demo open when given no object —
+   a menu item must never be a side door into that machinery. */
+export function supportsMenuNewWindow(targetId) {
+  return (
+    !SINGLE_SESSION_TARGETS.has(targetId) &&
+    targetId !== "elacity-player" &&
+    targetId !== "ddrm-viewer"
+  );
+}
 const COMMON_IFRAME_SANDBOX = [
   "allow-downloads",
   "allow-forms",
@@ -148,6 +161,7 @@ function refreshWindowUi() {
   hooks.updateTaskbarState();
   hooks.refreshLauncherIfVisible();
   syncToolbarActiveTitle();
+  hooks.syncMenubar();
 }
 
 /* ---- Window lifecycle motion (compositor-only: transform + opacity) ----
