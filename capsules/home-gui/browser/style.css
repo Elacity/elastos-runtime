@@ -720,20 +720,22 @@
   }
 }
 
-/* Wallet rail: a true sidebar — flush to the right edge and the bottom of
-   the screen, under the bar (macOS sidebar grammar, no floating gap).
-   Chrome only — the capsule owns every wallet fact shown inside the frame. */
+/* Wallet rail: floating card at the right edge (Big Sur notification-panel
+   grammar) that runs the full usable height — small even margins on all
+   sides, no dead band above the dock. Chrome only — the capsule owns every
+   wallet fact shown inside the frame. */
 .wallet-rail {
   position: fixed;
-  top: var(--stage-top);
-  right: 0;
-  bottom: 0;
+  top: calc(var(--stage-top) + 8px);
+  right: 8px;
+  bottom: 8px;
   z-index: 100120;
   display: flex;
   flex-direction: column;
-  width: min(392px, 100vw);
+  width: min(392px, calc(100vw - 16px));
+  border-radius: 14px;
   background: var(--menu-fill);
-  border-left: 1px solid var(--line);
+  border: 1px solid var(--line);
   box-shadow: var(--shadow);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
@@ -748,9 +750,11 @@
 
 @keyframes wallet-rail-enter {
   from {
-    transform: translateX(100%);
+    opacity: 0;
+    transform: translateX(calc(100% + 8px));
   }
   to {
+    opacity: 1;
     transform: none;
   }
 }
