@@ -1,10 +1,12 @@
 // Capsule Inspector (Phase 1) — read-only object-centered view.
 //
 // Data flow: the UI reads the `elastos://inspect/*` endpoints (System-scope
-// capability `elastos://inspect/*`) through the runtime bridge when present. When the
-// bridge is absent (e.g. opened standalone in a plain browser for design
-// review), it falls back to SAMPLE_DATA so the surface always renders. No
-// write/sign/launch path exists anywhere in this capsule.
+// capability `elastos://inspect/*`) through the runtime bridge when present.
+// SAMPLE_DATA renders ONLY in standalone design-review mode (no home token and
+// no bridge — a plain browser outside the shell), and is labelled as such.
+// When a live channel exists but fails, the surface fails EXPLICITLY (error
+// state + retry) — it never substitutes fabricated data for a live runtime
+// (Principle 11). No write/sign/launch path exists anywhere in this capsule.
 
 "use strict";
 
@@ -52,34 +54,68 @@ async function inspectInvoke(operation, payload) {
   return envelope.data || envelope;
 }
 
+// "sample" (standalone design review) · "live" · "error" (live channel failed).
+let dataMode = "sample";
+
+function hasLiveChannel() {
+  const bridge = globalThis.elastos && globalThis.elastos.inspect;
+  return Boolean(HOME_TOKEN || (bridge && typeof bridge.invoke === "function"));
+}
+
 async function loadCapsuleList() {
+  if (!hasLiveChannel()) {
+    // Standalone design review (plain browser, no shell): labelled sample.
+    dataMode = "sample";
+    setSourceBadge("sample");
+    setScopeBadge("system");
+    return SAMPLE_DATA.map((c) => ({
+      id: c.id, name: c.name, role: c.role, type: c.type, state: c.state,
+    }));
+  }
   try {
     const live = await inspectInvoke("capsules", {});
-    if (live && Array.isArray(live.capsules)) {
-      setSourceBadge(true);
-      // Scope is reported by the runtime ("system" | "self").
-      setScopeBadge(live.scope || "system");
-      return live.capsules;
+    if (!live || !Array.isArray(live.capsules)) {
+      throw new Error("inspect returned no capsule list");
     }
+    dataMode = "live";
+    setSourceBadge("live");
+    // Scope is reported by the runtime ("system" | "self").
+    setScopeBadge(live.scope || "system");
+    return live.capsules;
   } catch (err) {
-    console.warn("inspect capsules failed, showing sample:", err);
+    // Live channel exists but failed: fail explicitly, never fabricate.
+    dataMode = "error";
+    setSourceBadge("error");
+    renderInspectError(err);
+    return [];
   }
-  setSourceBadge(false);
-  // Sample data illustrates the privileged System view.
-  setScopeBadge("system");
-  return SAMPLE_DATA.map((c) => ({
-    id: c.id, name: c.name, role: c.role, type: c.type, state: c.state,
-  }));
 }
 
 async function loadCapsuleDetail(id) {
+  if (dataMode === "sample") {
+    return SAMPLE_DATA.find((c) => c.id === id) || null;
+  }
   try {
     const live = await inspectInvoke("capsule", { id });
     if (live && live.id) return live;
+    throw new Error("inspect returned no capsule detail");
   } catch (err) {
-    console.warn("inspect capsule failed, showing sample:", err);
+    renderInspectError(err);
+    return undefined;
   }
-  return SAMPLE_DATA.find((c) => c.id === id) || null;
+}
+
+function renderInspectError(err) {
+  const detail = document.getElementById("detail");
+  detail.innerHTML = "";
+  const retry = el("button", { class: "btn-retry", text: "Retry" });
+  retry.addEventListener("click", () => boot());
+  detail.appendChild(el("div", { class: "detail-error" }, [
+    el("strong", { text: "Runtime inspection unavailable" }),
+    el("p", { text: "The inspect provider did not answer. Nothing is shown rather than showing stale or illustrative data." }),
+    el("p", { class: "mono", text: String((err && err.message) || err || "unknown error") }),
+    retry,
+  ]));
 }
 
 // Phase 2 (write): revoke a capability by token id. A System-admin mutation
@@ -117,10 +153,20 @@ function el(tag, attrs, children) {
   return node;
 }
 
-function setSourceBadge(isLive) {
+function setSourceBadge(mode) {
   const badge = document.getElementById("source-badge");
-  badge.textContent = isLive ? "live" : "sample data";
-  badge.className = "badge " + (isLive ? "badge-live" : "badge-sample");
+  if (mode === "live") {
+    badge.textContent = "live";
+    badge.className = "badge badge-live";
+    return;
+  }
+  if (mode === "error") {
+    badge.textContent = "unavailable";
+    badge.className = "badge badge-error";
+    return;
+  }
+  badge.textContent = "sample data";
+  badge.className = "badge badge-sample";
 }
 
 function setScopeBadge(scope) {
@@ -260,13 +306,15 @@ async function runOperationPreview(capsuleId, operation, target, btn) {
   target.innerHTML = "";
   try {
     let plan;
-    try {
-      plan = await planOperation(capsuleId, operation);
-    } catch (liveErr) {
-      // No live runtime (sample/offline): derive the same preview from the
+    if (dataMode === "sample") {
+      // Standalone design review: derive the same preview from the sample
       // capsule's in-memory authority metadata so the demo still works.
       plan = localPlanOperation(capsuleId, operation);
-      if (!plan) throw liveErr;
+      if (!plan) throw new Error("no sample authority for " + operation);
+    } else {
+      // Live mode: the runtime's answer or an explicit failure — never the
+      // offline twin standing in for a live gate.
+      plan = await planOperation(capsuleId, operation);
     }
     if (plan && plan.valid) {
       const actions = (plan.capability_actions || []).join(" + ");
@@ -473,14 +521,22 @@ let state = { capsules: [], activeId: null };
 async function selectCapsule(id) {
   state.activeId = id;
   renderList(state.capsules, id, selectCapsule);
-  renderDetail(await loadCapsuleDetail(id));
+  const detail = await loadCapsuleDetail(id);
+  // `undefined` means the live channel failed and the error state is already
+  // on screen — don't paint the empty state over it.
+  if (detail !== undefined) {
+    renderDetail(detail);
+  }
 }
 
 async function boot() {
   state.capsules = await loadCapsuleList();
   renderList(state.capsules, null, selectCapsule);
-  if (state.capsules.length) selectCapsule(state.capsules[0].id);
-  else renderDetail(null);
+  if (state.capsules.length) {
+    selectCapsule(state.capsules[0].id);
+  } else if (dataMode !== "error") {
+    renderDetail(null);
+  }
 }
 
 // `type="module"` scripts are deferred, so DOMContentLoaded may have already fired

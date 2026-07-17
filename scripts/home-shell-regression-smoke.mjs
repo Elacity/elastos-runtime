@@ -100,6 +100,8 @@ globalThis.window = {
   performance: { now: () => Date.now() },
   innerWidth: 1280,
   clearInterval: () => {},
+  // Shell motion code reads reduced-motion at module load.
+  matchMedia: () => ({ matches: false, addEventListener: () => {} }),
 };
 globalThis.fetch = async (_url, init = {}) => {
   if (init.body) {

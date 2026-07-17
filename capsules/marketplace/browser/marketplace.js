@@ -1,7 +1,6 @@
 (function () {
   const params = new URLSearchParams(window.location.search);
   const homeToken = params.get("home_token") || "";
-  const themeKey = "elastos-marketplace-theme";
 
   const state = {
     apps: [],
@@ -29,7 +28,6 @@
     installModal: document.querySelector("#install-modal"),
     installContent: document.querySelector("#install-content"),
     searchInput: document.querySelector("#search-input"),
-    themeToggle: document.querySelector("#theme-toggle"),
     viewAll: document.querySelector("#view-all"),
     toast: document.querySelector("#toast"),
   };
@@ -74,7 +72,6 @@
     "gradient-slate": "linear-gradient(135deg, #64748b 0%, #475569 100%)",
   };
 
-  initTheme();
   boot();
 
   async function boot() {
@@ -84,26 +81,7 @@
     render();
   }
 
-  function initTheme() {
-    const saved = localStorage.getItem(themeKey);
-    if (saved === "dark" || (!saved && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches)) {
-      document.documentElement.setAttribute("data-theme", "dark");
-    }
-  }
-
-  function toggleTheme() {
-    const isDark = document.documentElement.getAttribute("data-theme") === "dark";
-    if (isDark) {
-      document.documentElement.removeAttribute("data-theme");
-      localStorage.setItem(themeKey, "light");
-      return;
-    }
-    document.documentElement.setAttribute("data-theme", "dark");
-    localStorage.setItem(themeKey, "dark");
-  }
-
   function bindEvents() {
-    els.themeToggle.addEventListener("click", toggleTheme);
     els.viewAll.addEventListener("click", () => selectCategory("all"));
     els.searchInput.addEventListener("input", (event) => {
       state.search = event.target.value.trim().toLowerCase();

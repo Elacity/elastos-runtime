@@ -1,24 +1,27 @@
+/* Chrome rides the shared tokens (dark default, light via data-el-theme).
+   The console bezel, screen, and their overlays stay deliberately dark in
+   both themes — that zone is device hardware, not app chrome. */
 :root {
-  --bg: #edf1fb;
-  --bg-strong: #e3e9fb;
-  --panel: rgba(255, 255, 255, 0.9);
-  --panel-strong: #ffffff;
-  --panel-soft: #eef2ff;
-  --line: rgba(83, 103, 164, 0.14);
-  --line-strong: rgba(83, 103, 164, 0.22);
-  --ink: #1d2438;
-  --muted: #66708a;
-  --brand: #f6921a;
-  --brand-soft: #fff1dc;
-  --accent: #5f76d8;
-  --accent-soft: #e8edff;
-  --accent-deep: #3c53a7;
-  --danger: #b14c5a;
-  --shadow: 0 24px 60px rgba(34, 49, 88, 0.12);
+  --bg: var(--el-bg);
+  --bg-strong: var(--el-bg);
+  --panel: var(--el-surface);
+  --panel-strong: var(--el-surface-raised);
+  --panel-soft: var(--el-inset);
+  --line: var(--el-hairline);
+  --line-strong: var(--el-hairline-strong);
+  --ink: var(--el-text);
+  --muted: var(--el-muted);
+  --brand: var(--el-brand);
+  --brand-soft: color-mix(in srgb, var(--el-brand) 16%, transparent);
+  --accent: var(--el-accent);
+  --accent-soft: var(--el-accent-faint);
+  --accent-deep: var(--el-accent-strong);
+  --danger: var(--el-danger);
+  --shadow: var(--el-shadow-2);
   --control-size: 2.7rem;
   --action-size: 3.15rem;
   --control-gap: 0.75rem;
-  font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
+  font-family: var(--el-font);
 }
 
 * {
@@ -38,9 +41,8 @@ body {
 
 body {
   background:
-    radial-gradient(circle at top left, rgba(95, 118, 216, 0.14), transparent 28%),
-    radial-gradient(circle at bottom right, rgba(126, 149, 226, 0.12), transparent 24%),
-    linear-gradient(180deg, #f7f9ff 0%, var(--bg) 100%);
+    radial-gradient(circle at top left, var(--el-accent-faint), transparent 28%),
+    var(--bg);
   color: var(--ink);
   overflow: hidden;
   overscroll-behavior: none;
@@ -102,7 +104,7 @@ body[data-emulator-host-mode="embedded"] .shell {
 .utility-card {
   border: 1px solid var(--line);
   border-radius: 1.25rem;
-  background: rgba(255, 255, 255, 0.88);
+  background: var(--panel);
   box-shadow: var(--shadow);
   backdrop-filter: blur(12px);
 }
@@ -232,8 +234,8 @@ body[data-emulator-host-mode="standalone"] #screen-container {
 }
 
 #drop-zone.drag-over {
-  background: rgba(95, 118, 216, 0.18);
-  box-shadow: inset 0 0 0 2px rgba(95, 118, 216, 0.5);
+  background: var(--el-accent-soft);
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--el-accent) 50%, transparent);
 }
 
 #drop-zone.hidden {
@@ -303,11 +305,16 @@ body[data-emulator-host-mode="standalone"] #screen-container {
   color: rgba(223, 230, 255, 0.72);
 }
 
-.rom-library-item:hover,
-.rom-library-item:focus-visible {
-  border-color: rgba(95, 118, 216, 0.48);
+.rom-library-item:hover {
+  border-color: color-mix(in srgb, var(--el-accent) 48%, transparent);
   background: rgba(22, 34, 58, 0.94);
-  outline: none;
+}
+
+.rom-library-item:focus-visible {
+  border-color: color-mix(in srgb, var(--el-accent) 48%, transparent);
+  background: rgba(22, 34, 58, 0.94);
+  outline: 2px solid var(--el-focus);
+  outline-offset: 2px;
 }
 
 #file-input {
@@ -391,7 +398,7 @@ body[data-emulator-host-mode="standalone"] #screen-container {
 #emulator-controls button:hover,
 .state-actions button:hover {
   background: var(--accent-soft);
-  border-color: rgba(95, 118, 216, 0.32);
+  border-color: color-mix(in srgb, var(--el-accent) 34%, transparent);
 }
 
 .shoulder-btn:active,
@@ -466,9 +473,9 @@ body[data-emulator-host-mode="standalone"] #screen-container {
   width: var(--action-size);
   height: var(--action-size);
   border-radius: 999px;
-  background: linear-gradient(180deg, #7f95e4 0%, var(--accent) 100%);
+  background: linear-gradient(180deg, var(--el-accent-strong) 0%, var(--accent) 100%);
   border: 0;
-  color: white;
+  color: var(--el-accent-ink);
   font-size: 0.98rem;
   font-weight: 800;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.16);
@@ -859,7 +866,7 @@ input:disabled {
     aspect-ratio: auto;
     padding: 0.4rem 0.82rem;
     border-radius: 999px;
-    box-shadow: 0 10px 22px rgba(34, 49, 88, 0.12);
+    box-shadow: var(--el-shadow-1);
   }
 }
 

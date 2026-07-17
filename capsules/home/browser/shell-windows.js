@@ -34,6 +34,7 @@ import {
   attachWindowDrag,
   attachWindowResize,
 } from "./shell-window-geometry.js?v=home-20260701c";
+import { playUiSound } from "./shell-sounds.js?v=home-20260701c";
 
 let windowHooks = null;
 const PEOPLE_DISCOVERY_AUTO_REFRESH_INITIAL_MS = 1_500;
@@ -659,6 +660,8 @@ function renderSystemErrorWindow({
   errorNode.querySelector(".window-error-detail").textContent = detail;
   body.appendChild(errorNode);
   focusWindow(id);
+  // The refusal moment — the one place the optional error sound belongs.
+  playUiSound("error");
 }
 
 function renderTargetLaunchError(targetId, error) {
@@ -1821,20 +1824,50 @@ async function removePersonFromPeople(body, button) {
   }
   const card = button.closest(".home-people-card");
   const label = card?.querySelector(".home-people-card-copy h3")?.textContent?.trim() || "this person";
-  if (!window.confirm(`Remove ${label} from People?`)) {
+  if (!card || card.querySelector(".home-people-confirm")) {
     return;
   }
-  setPeopleBusy(button, true);
-  try {
-    await fetchJson("/api/apps/people/contacts/remove", {
-      method: "POST",
-      body: JSON.stringify({ contact_id: contactId }),
-    });
-    setPeopleStatus(body, "Removed from People.", "ok");
-    await shellState.requestSummaryRefresh?.();
-  } finally {
-    setPeopleBusy(button, false);
-  }
+  // In-card confirm strip instead of a browser-native confirm dialog.
+  const strip = document.createElement("div");
+  strip.className = "home-people-confirm";
+  strip.setAttribute("role", "alertdialog");
+  strip.setAttribute("aria-label", `Remove ${label} from People?`);
+  const copy = document.createElement("p");
+  copy.textContent = `Remove ${label} from People?`;
+  const actions = document.createElement("div");
+  actions.className = "home-people-confirm-actions";
+  const commit = document.createElement("button");
+  commit.type = "button";
+  commit.className = "home-people-action home-people-action-danger";
+  commit.textContent = "Remove";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "home-people-action";
+  cancel.textContent = "Cancel";
+  actions.append(commit, cancel);
+  strip.append(copy, actions);
+  card.appendChild(strip);
+  cancel.addEventListener("click", () => {
+    strip.remove();
+    button.focus();
+  });
+  commit.addEventListener("click", async () => {
+    strip.remove();
+    setPeopleBusy(button, true);
+    try {
+      await fetchJson("/api/apps/people/contacts/remove", {
+        method: "POST",
+        body: JSON.stringify({ contact_id: contactId }),
+      });
+      setPeopleStatus(body, "Removed from People.", "ok");
+      await shellState.requestSummaryRefresh?.();
+    } catch (error) {
+      setPeopleStatus(body, String(error?.message || error), "error");
+    } finally {
+      setPeopleBusy(button, false);
+    }
+  });
+  cancel.focus();
 }
 
 function openPersonChat(body, button) {

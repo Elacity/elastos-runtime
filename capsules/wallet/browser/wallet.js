@@ -89,9 +89,12 @@ const {
   openApprovalMethod,
   renderMethods,
 } = createWalletPreferences({
+  closeModal,
   fetchJson,
   getHomeToken: () => activeHomeToken,
+  modalButton,
   notifyHomeSummaryChanged,
+  openFlowModal,
   renderAll,
   requestFreshPasskeyHomeToken,
   refreshWalletState,

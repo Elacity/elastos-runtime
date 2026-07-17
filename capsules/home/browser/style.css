@@ -3037,6 +3037,31 @@ body.dragging-target {
   color: var(--el-danger);
 }
 
+/* In-card remove confirmation (replaces the browser-native confirm). */
+.home-people-confirm {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 10px;
+  border: 1px solid color-mix(in srgb, var(--el-danger) 34%, transparent);
+  border-radius: 10px;
+  padding: 8px 12px;
+  background: color-mix(in srgb, var(--el-danger) 9%, transparent);
+}
+
+.home-people-confirm p {
+  margin: 0;
+  color: var(--el-text);
+  font-size: 12.5px;
+}
+
+.home-people-confirm-actions {
+  display: flex;
+  gap: 8px;
+}
+
 .home-people-badge {
   min-height: 34px;
   border: 1px solid rgba(52, 211, 153, 0.32);

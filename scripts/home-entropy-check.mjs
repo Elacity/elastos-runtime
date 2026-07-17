@@ -672,29 +672,44 @@ for (const file of activeHtmlFiles) {
 }
 
 // Canonical palettes: migrated capsules alias the shared --el-* tokens
-// (vendored elastos-ui.css); gba-emulator still carries its own light theme.
-const lightTokens = new Map([
-  ["--bg", "#edf1fb"],
-  ["--bg-strong", "#e3e9fb"],
-  ["--panel", "rgba(255, 255, 255, 0.9)"],
-  ["--panel-strong", "#ffffff"],
-  ["--panel-soft", "#eef2ff"],
-  ["--line", "rgba(83, 103, 164, 0.14)"],
-  ["--line-strong", "rgba(83, 103, 164, 0.22)"],
-  ["--ink", "#1d2438"],
-  ["--muted", "#66708a"],
-  ["--brand", "#f6921a"],
-  ["--brand-soft", "#fff1dc"],
-  ["--accent", "#5f76d8"],
-  ["--accent-soft", "#e8edff"],
-  ["--accent-deep", "#3c53a7"],
-  ["--danger", "#b14c5a"],
-]);
-
+// (vendored elastos-ui.css). gba-emulator chrome is on the shared tokens;
+// only its console bezel/screen zone stays deliberately dark.
 {
   const gbaStyle = read("capsules/gba-emulator/browser/style.css");
-  for (const [token, value] of lightTokens) {
+  for (const [token, value] of new Map([
+    ["--bg", "var(--el-bg)"],
+    ["--bg-strong", "var(--el-bg)"],
+    ["--panel", "var(--el-surface)"],
+    ["--panel-strong", "var(--el-surface-raised)"],
+    ["--panel-soft", "var(--el-inset)"],
+    ["--line", "var(--el-hairline)"],
+    ["--line-strong", "var(--el-hairline-strong)"],
+    ["--ink", "var(--el-text)"],
+    ["--muted", "var(--el-muted)"],
+    ["--brand", "var(--el-brand)"],
+    ["--brand-soft", "color-mix(in srgb, var(--el-brand) 16%, transparent)"],
+    ["--accent", "var(--el-accent)"],
+    ["--accent-soft", "var(--el-accent-faint)"],
+    ["--accent-deep", "var(--el-accent-strong)"],
+    ["--danger", "var(--el-danger)"],
+  ])) {
     assertToken(gbaStyle, "capsules/gba-emulator/browser/style.css", token, value);
+  }
+}
+
+// The three wallet connectors share one connector look, now on shared tokens.
+for (const connector of ["wallet-metamask", "wallet-unisat", "wallet-walletconnect"]) {
+  const file = `capsules/${connector}/browser/style.css`;
+  const style = read(file);
+  for (const [token, value] of new Map([
+    ["--bg", "var(--el-bg)"],
+    ["--panel", "var(--el-surface)"],
+    ["--line", "var(--el-hairline)"],
+    ["--ink", "var(--el-text)"],
+    ["--accent", "var(--el-accent)"],
+    ["--danger", "var(--el-danger)"],
+  ])) {
+    assertToken(style, file, token, value);
   }
 }
 
@@ -1839,7 +1854,7 @@ assert(
     servicesIndex.includes("Others") &&
     servicesIndex.includes("mine-services") &&
     servicesIndex.includes("other-services") &&
-    servicesIndex.includes("services-20260626a") &&
+    servicesIndex.includes("services-20260717a") &&
     servicesIndex.includes("services-20260626g") &&
     servicesScript.includes("/api/apps/services/summary") &&
     servicesScript.includes("/api/apps/services/offers") &&
@@ -7779,7 +7794,7 @@ assert(
 assert(
   browserStyle.includes(".browser-stage") &&
     browserStyle.includes("@media (max-width: 640px)") &&
-    browserStyle.includes("--accent: #d46f24") &&
+    browserStyle.includes("--accent: var(--el-accent)") &&
     !browserStyle.includes(".browser-hero") &&
     !browserStyle.includes(".browser-card"),
   "Browser capsule must have a compact responsive ElastOS-aligned host-adapter UI without proof/debug cards",

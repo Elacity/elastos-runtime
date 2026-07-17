@@ -31,6 +31,15 @@ TARGETS=(
   library/browser
   ddrm-viewer
   elacity-player
+  browser/browser
+  marketplace/browser
+  services/browser
+  archive-manager/browser
+  gba-emulator/browser
+  capsule-inspector/browser
+  wallet-metamask/browser
+  wallet-unisat/browser
+  wallet-walletconnect/browser
 )
 
 MODE="${1:-sync}"

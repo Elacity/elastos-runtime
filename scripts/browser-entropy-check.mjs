@@ -368,7 +368,7 @@ assert(
 assert(
   browserStyle.includes(".browser-stage") &&
     browserStyle.includes("@media (max-width: 640px)") &&
-    browserStyle.includes("--accent: #d46f24") &&
+    browserStyle.includes("--accent: var(--el-accent)") &&
     browserStyle.includes("overflow: hidden") &&
     browserStyle.includes("height: 100%") &&
     browserStyle.includes("min-height: 0") &&
@@ -1547,13 +1547,20 @@ assert(
 assert(
   browserJs.includes("function resetBrowserProfile") &&
     browserJs.includes("/api/apps/browser/profile/reset") &&
-    browserJs.includes("Reset Browser cookies, local storage, history, and cache for this account?") &&
+    // In-window confirm (no browser-native confirm dialog): the copy lives in
+    // the settings panel markup; JS wires the commit/cancel pair.
+    browser.includes("Reset Browser cookies, local storage, history, and cache for this account?") &&
+    !browserJs.includes("window.confirm") &&
+    browserJs.includes("setProfileResetConfirmOpen") &&
+    browserJs.includes("profileResetCommitButton") &&
+    browserJs.includes("profileResetCancelButton") &&
     browserJs.includes("await closeRuntimePage(activePage)") &&
     browserJs.includes("await closeRuntimePage(stalePage)") &&
     browserJs.includes("publishRuntimePageForHost(null)") &&
     browserJs.includes("Browser profile reset. Open the address again.") &&
     !browserJs.includes("ELASTOS_BROWSER_VM_PROFILE_DISK_ROOT") &&
-    browserStyle.includes(".browser-settings-danger"),
+    browserStyle.includes(".browser-settings-danger") &&
+    browserStyle.includes(".browser-settings-confirm"),
   "Browser profile reset must be a user-confirmed Runtime route after closing active pages, without exposing host profile disk paths",
 );
 

@@ -743,6 +743,15 @@
     });
     // search (debounced)
     let t; $("#search").addEventListener("input", (e) => { clearTimeout(t); t = setTimeout(() => { state.q = e.target.value.trim(); if ((location.hash || "").includes("asset")) location.hash = "#/discover"; else renderDiscover(); }, 200); });
+    // ⌘K / Ctrl+K focuses search — the badge on the field promises this.
+    document.addEventListener("keydown", (e) => {
+      if ((e.metaKey || e.ctrlKey) && String(e.key).toLowerCase() === "k") {
+        e.preventDefault();
+        const field = $("#search");
+        field?.focus();
+        field?.select();
+      }
+    });
     // theme — delegate to the shared runtime (elastos-theme.js) so the choice persists and syncs across frames
     $("#theme-toggle").addEventListener("click", () => { if (window.elastosTheme) window.elastosTheme.set(window.elastosTheme.resolved() === "light" ? "dark" : "light"); });
     window.addEventListener("hashchange", router);

@@ -1,46 +1,25 @@
+/* Rides the shared tokens: dark by default, light via data-el-theme (set by
+   the system, not a private toggle). Accent is the user's system accent. */
 :root {
-  color-scheme: light;
-  --bg-page: #f8fafc;
-  --bg-surface: #ffffff;
-  --bg-elev: #f1f5f9;
-  --bg-input: #f8fafc;
-  --bg-hover: #f1f5f9;
-  --border: #e6ebf2;
-  --border-strong: #cbd5e1;
-  --text-primary: #1e293b;
-  --text-secondary: #64748b;
-  --text-muted: #94a3b8;
-  --accent: #3b82f6;
-  --accent-hover: #2563eb;
-  --accent-soft: rgba(59, 130, 246, 0.08);
-  --success: #22c55e;
-  --warning: #d97706;
-  --danger: #ef4444;
-  --shadow-card: 0 1px 3px rgba(15, 23, 42, 0.04);
-  --shadow-hover: 0 6px 18px rgba(15, 23, 42, 0.10);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-}
-
-[data-theme="dark"] {
-  color-scheme: dark;
-  --bg-page: #121212;
-  --bg-surface: #1a1a1a;
-  --bg-elev: #1e1e1e;
-  --bg-input: #262626;
-  --bg-hover: #262626;
-  --border: #2e2e2e;
-  --border-strong: #3a3a3a;
-  --text-primary: #e5e5e5;
-  --text-secondary: #a3a3a3;
-  --text-muted: #737373;
-  --accent: #3b82f6;
-  --accent-hover: #60a5fa;
-  --accent-soft: rgba(59, 130, 246, 0.16);
-  --success: #34d399;
-  --warning: #fbbf24;
-  --danger: #f87171;
-  --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.3);
-  --shadow-hover: 0 6px 18px rgba(0, 0, 0, 0.5);
+  --bg-page: var(--el-bg);
+  --bg-surface: var(--el-surface-raised);
+  --bg-elev: var(--el-inset);
+  --bg-input: var(--el-inset);
+  --bg-hover: var(--el-lift);
+  --border: var(--el-hairline);
+  --border-strong: var(--el-hairline-strong);
+  --text-primary: var(--el-text);
+  --text-secondary: var(--el-muted);
+  --text-muted: var(--el-soft);
+  --accent: var(--el-accent);
+  --accent-hover: var(--el-accent-strong);
+  --accent-soft: var(--el-accent-faint);
+  --success: var(--el-ok);
+  --warning: var(--el-brand);
+  --danger: var(--el-danger);
+  --shadow-card: var(--el-shadow-1);
+  --shadow-hover: var(--el-shadow-2);
+  font-family: var(--el-font);
 }
 
 * {
@@ -103,47 +82,6 @@ button {
   gap: 12px;
 }
 
-.theme-toggle {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 36px;
-  height: 36px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  color: var(--text-secondary);
-  background: var(--bg-surface);
-  cursor: pointer;
-  transition: background 0.15s, color 0.15s, border-color 0.15s;
-}
-
-.theme-toggle:hover {
-  color: var(--text-primary);
-  border-color: var(--border-strong);
-  background: var(--bg-hover);
-}
-
-.theme-toggle svg {
-  width: 18px;
-  height: 18px;
-}
-
-.theme-toggle .icon-moon {
-  display: block;
-}
-
-.theme-toggle .icon-sun {
-  display: none;
-}
-
-[data-theme="dark"] .theme-toggle .icon-moon {
-  display: none;
-}
-
-[data-theme="dark"] .theme-toggle .icon-sun {
-  display: block;
-}
-
 .search-container {
   position: relative;
   width: 300px;
@@ -170,8 +108,9 @@ button {
   font-size: 14px;
 }
 
-.search-input:focus {
-  outline: none;
+.search-input:focus-visible {
+  outline: 2px solid var(--el-focus);
+  outline-offset: 1px;
   border-color: var(--accent);
   background: var(--bg-surface);
 }
@@ -558,25 +497,30 @@ button {
   text-transform: uppercase;
 }
 
-.badge.app { background: #dbeafe; color: #1d4ed8; }
-.badge.viewer { background: #e0f2fe; color: #0369a1; }
-.badge.provider { background: #fef3c7; color: #b45309; }
-.badge.content { background: #dcfce7; color: #15803d; }
-.badge.shell { background: #f1f5f9; color: #475569; }
-.badge.ddrm { background: #fae8ff; color: #a21caf; }
-.badge.wallet { background: #fff7ed; color: #c2410c; }
-.badge.installed { background: #dcfce7; color: #16a34a; }
-.badge.pending { background: #fef3c7; color: #d97706; }
+/* Type badges keep fixed semantic hues (like desktop tag colors) — one hue
+   variable per type, tinted for the current theme with color-mix. */
+.badge.app { --badge-hue: #3b82f6; }
+.badge.viewer { --badge-hue: #0ea5e9; }
+.badge.provider { --badge-hue: #f59e0b; }
+.badge.content { --badge-hue: #22c55e; }
+.badge.shell { --badge-hue: #94a3b8; }
+.badge.ddrm { --badge-hue: #d946ef; }
+.badge.wallet { --badge-hue: #f97316; }
+.badge.installed { --badge-hue: #22c55e; }
+.badge.pending { --badge-hue: #f59e0b; }
 
-[data-theme="dark"] .badge.app { background: rgba(59, 130, 246, 0.18); color: #93c5fd; }
-[data-theme="dark"] .badge.viewer { background: rgba(14, 165, 233, 0.18); color: #7dd3fc; }
-[data-theme="dark"] .badge.provider { background: rgba(245, 158, 11, 0.18); color: #fcd34d; }
-[data-theme="dark"] .badge.content { background: rgba(34, 197, 94, 0.18); color: #86efac; }
-[data-theme="dark"] .badge.shell { background: rgba(148, 163, 184, 0.18); color: #cbd5e1; }
-[data-theme="dark"] .badge.ddrm { background: rgba(217, 70, 239, 0.18); color: #f0abfc; }
-[data-theme="dark"] .badge.wallet { background: rgba(249, 115, 22, 0.18); color: #fdba74; }
-[data-theme="dark"] .badge.installed { background: rgba(34, 197, 94, 0.18); color: #86efac; }
-[data-theme="dark"] .badge.pending { background: rgba(245, 158, 11, 0.18); color: #fcd34d; }
+.badge.app,
+.badge.viewer,
+.badge.provider,
+.badge.content,
+.badge.shell,
+.badge.ddrm,
+.badge.wallet,
+.badge.installed,
+.badge.pending {
+  background: color-mix(in srgb, var(--badge-hue) 18%, transparent);
+  color: color-mix(in srgb, var(--badge-hue) 62%, var(--el-text));
+}
 
 .app-description {
   display: -webkit-box;
@@ -1008,6 +952,7 @@ button {
   font-size: 14px;
 }
 
+/* Inverted chip, both themes (dark text-plate on light, light on dark). */
 .toast {
   position: fixed;
   bottom: 24px;
@@ -1015,8 +960,8 @@ button {
   z-index: 2000;
   border-radius: 8px;
   padding: 12px 24px;
-  color: #fff;
-  background: #1e293b;
+  color: var(--el-bg);
+  background: var(--el-text);
   font-size: 14px;
   transform: translateX(-50%) translateY(100px);
   transition: transform 0.3s ease;
@@ -1027,34 +972,26 @@ button {
 }
 
 .toast.error {
-  background: #dc2626;
+  color: #fff;
+  background: color-mix(in srgb, var(--el-danger) 82%, #000);
 }
 
-[data-theme="dark"] .modal-overlay {
-  background: rgba(0, 0, 0, 0.65);
-}
-
-[data-theme="dark"] .app-detail-modal,
-[data-theme="dark"] .install-modal {
-  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
-}
-
-[data-theme="dark"] ::-webkit-scrollbar {
+::-webkit-scrollbar {
   width: 10px;
   height: 10px;
 }
 
-[data-theme="dark"] ::-webkit-scrollbar-track {
-  background: var(--bg-page);
+::-webkit-scrollbar-track {
+  background: transparent;
 }
 
-[data-theme="dark"] ::-webkit-scrollbar-thumb {
+::-webkit-scrollbar-thumb {
   border-radius: 5px;
-  background: #404040;
+  background: var(--el-hairline-strong);
 }
 
-[data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
-  background: #525252;
+::-webkit-scrollbar-thumb:hover {
+  background: var(--el-soft);
 }
 
 @media (max-width: 860px) {
