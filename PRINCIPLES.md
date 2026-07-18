@@ -85,6 +85,11 @@ That means:
 - the resolver owns the moniker first
 - `localhost://WebSpaces/<moniker>/...` is a dynamic interpreted handle
 - file-like traversal is a result of resolution, not the starting assumption
+- names, paths, mounts, and resolver handles do not grant resource authority
+- a capsule-visible resource view is derived from active Runtime grants and
+  provider bindings; it is not a second access-control system
+- every capsule resource operation still requires the applicable
+  Runtime-verified capability, even when the resource is already visible
 
 ## 9. HTTP Is Edge Transport, Not Product Truth
 

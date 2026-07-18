@@ -171,6 +171,15 @@ A virtual network interface used only when a microVM capsule is explicitly place
 
 A cryptographically signed permission (Ed25519). Grants a specific capsule the right to perform a specific action on a specific resource. Tokens have constraints: epoch, expiry, max uses, delegatability.
 
+## Capability View
+
+A derived per-capsule projection of active Runtime grants, provider bindings,
+and WebSpace mounts. It helps shells, Capsules, and System inspection discover
+which resources are currently available under stable names. The view grants no
+authority by itself: every resource operation still requires the applicable
+Runtime-verified capability. It is not a second token store or namespace
+access-control system.
+
 ## CID (Content ID)
 
 A content-addressed identifier (hash of the content). Used for capsule identity, IPFS references, and the `elastos://` namespace. The identity is the content, not the location.

@@ -145,6 +145,12 @@ The contract separates these responsibilities:
 | State mounts | A capability-scoped WebSpace or rooted object view; resolution may expose files, posts, people, identities, or services rather than pretending every space is a disk |
 | User interface | Home and an ESP-compatible shell projection; the shell presents facts and requests verbs but is not the underlying authority |
 
+State mounts, resolved names, and provider bindings are not grants. A shell or
+Runtime projection may show them as a coherent per-capsule capability view,
+but each resource operation remains authorized by the applicable
+Runtime-verified capability. The view is derived from active grants and must
+not become a second namespace authority system.
+
 The contract has these constraints:
 
 - **One capsule instance is an isolation boundary, not necessarily one process

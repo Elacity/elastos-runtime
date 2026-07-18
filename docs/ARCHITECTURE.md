@@ -639,6 +639,29 @@ struct CapabilityToken {
 }
 ```
 
+### Per-Capsule Capability View
+
+Capability tokens already express narrow resource authority such as "this
+capsule may read `localhost://Users/<principal-root>/Pictures/*`." A separate
+private-namespace authority system would duplicate that contract and create
+two sources of truth.
+
+Runtime or a shell may instead present a derived per-capsule capability view:
+
+- the token answers whether the caller may perform an action on a resource
+- the view shows which active grants, provider bindings, and WebSpace mounts
+  are currently available to the capsule
+- a manifest requirement requests a possible binding but grants no authority
+- resolving, mounting, or displaying a resource never replaces token
+  validation at invocation
+
+This derived view is useful for discovery, stable provider replacement, System
+inspection, and lifecycle cleanup. It must disappear or update when the
+underlying grant expires or is revoked, and a stale view must never keep an
+operation authorized. The existing signed path-to-CID `elastos-namespace` and
+the dynamic WebSpace resolver remain data/resolution structures, not alternate
+capability stores.
+
 **Delegation:** Depth-1 only. A delegated token inherits the parent's action and constraints but is not itself delegatable. Parent must pass full validation (signature, expiry, revocation) before delegation succeeds. Scope can only be narrowed, never widened.
 
 ### Flow

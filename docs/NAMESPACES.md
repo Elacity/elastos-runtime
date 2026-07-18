@@ -23,6 +23,31 @@ Target SmartWeb space model:
   raw Carrier links, cloud APIs, or host paths. Runtime and providers hide the
   underlying internet and expose only capability-scoped WebSpace handles.
 
+## Names Identify; Capabilities Authorize
+
+A namespace name, rooted path, WebSpace mount, or resolved handle identifies
+resource intent. It does not grant permission to use the resource. For capsule
+resource operations, authority remains the Runtime-issued capability bound to
+the caller, action, resource scope, constraints, and lifetime. Knowing or
+guessing a URI must never bypass that check.
+
+Runtime and shells may project the active grants, provider bindings, and
+WebSpace mounts as a coherent per-capsule capability view. That view answers
+"which authorized resources are available here?" Capability validation still
+answers "may this capsule perform this operation now?" The view is derived
+state for discovery, inspection, and stable binding; it is not another token,
+grant store, or access-control system.
+
+This repository uses `namespace` for several related but distinct concepts:
+
+- rooted URI spaces such as `localhost://...` and `elastos://...`
+- dynamic mounted WebSpace resolver views
+- the signed user path-to-CID tree implemented by `elastos-namespace`
+
+None of those names or mappings is authority by itself. Manifest requirements
+also describe requested bounds rather than granting them. Runtime capability
+validation remains canonical at invocation.
+
 File-backed localhost roots currently exposed by the runtime:
 
 - `localhost://Users/...`
