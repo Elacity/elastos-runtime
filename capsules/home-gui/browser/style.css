@@ -867,20 +867,25 @@ img {
 .wallet-rail-head-actions {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
 }
 
 .wallet-rail-head-btn {
+  box-sizing: border-box;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 5px 10px;
+  justify-content: center;
+  gap: 5px;
+  height: 30px;
+  min-height: 30px;
+  padding: 0 10px;
   border: 1px solid var(--line);
   border-radius: 7px;
   background: transparent;
   color: var(--muted);
   font-family: inherit;
   font-size: 12px;
+  line-height: 1;
   cursor: pointer;
 }
 
@@ -889,8 +894,54 @@ img {
   color: var(--text);
 }
 
+.wallet-rail-icon-btn {
+  position: relative;
+  width: 30px;
+  min-width: 30px;
+  padding: 0;
+}
+
+.wallet-rail-text-btn {
+  position: relative;
+  padding: 0 9px;
+}
+
+.wallet-rail-icon-svg {
+  display: block;
+  flex: 0 0 auto;
+}
+
+.wallet-rail-badge {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  display: inline-grid;
+  place-items: center;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 999px;
+  background: var(--accent, #007aff);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.wallet-rail-badge[hidden] {
+  display: none !important;
+}
+
+#wallet-rail-privacy.is-active {
+  color: var(--text);
+  background: var(--lift);
+}
+
 .wallet-rail-close {
-  padding: 5px 7px;
+  /* Square hit target — without width, padding:0 collapses to a tall pill. */
+  width: 30px;
+  min-width: 30px;
+  padding: 0;
 }
 
 .wallet-rail-close img {

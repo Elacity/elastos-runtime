@@ -32,6 +32,7 @@ import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-202607
 import {
   accountCard,
   copyButton,
+  copyIconButton,
   createWalletRender,
   emptyHero,
   methodMark,
@@ -108,7 +109,9 @@ const {
   getDisplayCurrency,
   getPrivacyMode,
   openApprovalMethod,
+  openDrawer,
   renderMethods,
+  togglePrivacy,
 } = createWalletPreferences({
   closeModal,
   fetchJson,
@@ -124,6 +127,7 @@ const {
 });
 const {
   onRequestClick,
+  openPendingReview,
   pendingWalletRequests,
   renderRequests,
 } = createWalletRequests({
@@ -261,11 +265,62 @@ function boot() {
     }
   });
   bindPreferenceEvents();
+  document.querySelector("#wallet-activity-open")?.addEventListener("click", openActivityChrome);
+  applyRailPresentationChrome();
   window.addEventListener("message", onRuntimeEvents);
   window.addEventListener("message", onWalletRefreshMessage);
   window.addEventListener("message", onShellMenuCommand);
+  window.addEventListener("message", onWalletChromeCommand);
   announceShellMenuManifest();
   refreshWalletState().catch((error) => showStatus(String(error.message || error), "error"));
+}
+
+function applyRailPresentationChrome() {
+  // Rail: 3D card flip + Home owns nav chrome. Window: in-place morph (no flip).
+  const presentation = readQueryParam("presentation") === "rail" ? "rail" : "window";
+  document.documentElement.dataset.walletPresentation = presentation;
+  if (presentation === "rail") {
+    document.querySelector(".wallet-hero-nav")?.setAttribute("hidden", "");
+  }
+}
+
+function openActivityChrome() {
+  // Badge counts pending under Send/Receive — open that when any exist;
+  // otherwise show history in the Activity drawer.
+  const pending = pendingWalletRequests(currentRequests);
+  if (pending.length > 0) {
+    closeDrawers();
+    openPendingReview();
+    return;
+  }
+  openDrawer("activity");
+}
+
+function onWalletChromeCommand(event) {
+  if (event.origin !== window.location.origin) {
+    return;
+  }
+  const message = event.data;
+  if (message?.type !== "elastos:wallet-chrome-command" || typeof message.cmd !== "string") {
+    return;
+  }
+  switch (message.cmd) {
+    case "open-activity":
+    case "open-approvals":
+      openActivityChrome();
+      return;
+    case "open-settings":
+      openDrawer("settings");
+      return;
+    case "toggle-privacy":
+      togglePrivacy();
+      return;
+    case "close-overlays":
+      closeModal();
+      closeDrawers();
+      return;
+    default:
+  }
 }
 
 // Shell menu bar: declare File/Account menus to Home; commands come back as
@@ -449,22 +504,30 @@ function renderAll() {
 function renderApprovalsBadge(pendingCount) {
   const badge = document.querySelector("#wallet-approvals-badge");
   const button = document.querySelector("#wallet-activity-open");
-  if (!badge || !button) {
-    return;
-  }
   const count = Math.max(0, Number(pendingCount) || 0);
-  if (count <= 0) {
-    badge.hidden = true;
-    badge.textContent = "";
-    button.setAttribute("aria-label", "Open approvals");
-    return;
+  if (badge && button) {
+    if (count <= 0) {
+      badge.hidden = true;
+      badge.textContent = "";
+      button.setAttribute("aria-label", "Activity");
+    } else {
+      badge.hidden = false;
+      badge.textContent = count > 9 ? "9+" : String(count);
+      button.setAttribute(
+        "aria-label",
+        count === 1 ? "Activity, 1 pending" : `Activity, ${count} pending`,
+      );
+    }
   }
-  badge.hidden = false;
-  badge.textContent = count > 9 ? "9+" : String(count);
-  button.setAttribute(
-    "aria-label",
-    count === 1 ? "Open approvals, 1 pending" : `Open approvals, ${count} pending`,
-  );
+  if (window.parent !== window) {
+    window.parent.postMessage(
+      {
+        type: "wallet:pending-count",
+        count,
+      },
+      window.location.origin,
+    );
+  }
 }
 
 function buildViewAccounts() {
@@ -643,14 +706,7 @@ function renderHeroAccount(accounts) {
   const label = textNode("span", account.name, "wallet-hero-address-name");
   const address = textNode("code", shortAddress(account.address), "wallet-hero-address-value");
   address.dataset.walletCopyAddress = account.address;
-  const copy = document.createElement("button");
-  copy.className = "wallet-copy-icon";
-  copy.type = "button";
-  copy.setAttribute("aria-label", `Copy ${account.name} address`);
-  copy.title = "Copy address";
-  copy.dataset.walletCopyAddress = account.address;
-  copy.innerHTML =
-    '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M3.5 10.5V3.5A1 1 0 0 1 4.5 2.5h7" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
+  const copy = copyIconButton(account.address, `Copy ${account.name} address`);
 
   pill.append(label, address, copy);
   accountDetailNode.append(pill);

@@ -47,7 +47,7 @@
 
 /* Rail/window viewport scroll stays wheel/trackpad-driven. A classic
    scrollbar appearing on Send/Receive flip steals ~15px and shoves
-   Approvals/Settings left — hide the gutter, keep overflow. */
+   Activity/Settings left — hide the gutter, keep overflow. */
 html {
   overflow-y: auto;
   scrollbar-width: none;
@@ -128,7 +128,7 @@ button {
 }
 
 /* Static chrome above the flip card: status can come/go without shoving
-   Approvals · Settings · Hide. */
+   Activity · Settings · privacy. */
 .wallet-hero-actions {
   position: relative;
   z-index: 2;
@@ -166,7 +166,22 @@ button {
 }
 
 .wallet-nav-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   padding: 6px 10px;
+}
+
+.wallet-nav-button-icon {
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+}
+
+.wallet-nav-icon-svg {
+  display: block;
+  flex: 0 0 auto;
 }
 
 .wallet-nav-badge {
@@ -174,7 +189,7 @@ button {
   place-items: center;
   min-width: 16px;
   height: 16px;
-  margin-left: 5px;
+  margin-left: 0;
   padding: 0 4px;
   border-radius: 999px;
   background: var(--accent);
@@ -188,6 +203,20 @@ button {
 
 .wallet-nav-badge[hidden] {
   display: none !important;
+}
+
+/* Rail presentation: Home owns Activity/Settings/privacy in the panel head. */
+html[data-wallet-presentation="rail"] .wallet-hero-nav {
+  display: none !important;
+}
+
+html[data-wallet-presentation="rail"] .wallet-hero-actions {
+  min-height: 0;
+  margin: 0;
+}
+
+html[data-wallet-presentation="rail"] .wallet-hero-actions:not(:has(#wallet-status:not([hidden])) ) {
+  display: none;
 }
 
 .wallet-icon-button {
@@ -204,7 +233,7 @@ button {
   color: var(--ink);
 }
 
-/* Privacy toggle — text peer of Approvals/Settings; pressed = balances hidden. */
+/* Privacy toggle — icon peer of Settings; pressed = balances hidden. */
 #wallet-privacy.is-active {
   color: var(--ink);
   background: var(--chip-hover);
@@ -238,7 +267,7 @@ button {
   background: var(--surface);
 }
 
-/* Outer hero owns Approvals/Settings/Hide; only .wallet-hero-scene is the
+/* Outer hero owns Activity/Settings/privacy; only .wallet-hero-scene is the
    bordered card that flips and eases height for Send/Receive. */
 .wallet-hero {
   position: relative;
@@ -262,33 +291,19 @@ button {
 .wallet-hero-scene {
   border-radius: 18px;
   padding: 12px 16px 16px;
-  perspective: 1400px;
 }
 
 .wallet-hero-flip {
   position: relative;
-  transform-style: preserve-3d;
-  /* Transform + height morph together so Send/Receive never snap the card. */
-  transition:
-    transform 420ms cubic-bezier(0.2, 0, 0, 1),
-    min-height 420ms cubic-bezier(0.2, 0, 0, 1);
-}
-
-.wallet-hero.is-flipped .wallet-hero-flip {
-  transform: rotateY(180deg);
-}
-
-.wallet-hero-face {
-  backface-visibility: hidden;
-  -webkit-backface-visibility: hidden;
+  /* Height eases for Send/Receive; window morphs in-plane, rail may also flip. */
+  transition: min-height 420ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .wallet-hero-face-front {
   position: relative;
 }
 
-/* Flipped face: same card chrome, height grows to fit content so nothing
-   clips. Front height is the floor; Receive/Send can be a bit taller. */
+/* Same card chrome; absolute so front height is the floor until JS eases. */
 .wallet-hero-face-back {
   position: absolute;
   top: 0;
@@ -304,6 +319,55 @@ button {
   overflow: visible;
   padding: 2px 0 4px;
   box-sizing: border-box;
+}
+
+/*
+  Window morph: JS adds is-flipped (front out) then is-morph-back (back in).
+  Hard sequence — no CSS delay race when leaving [hidden].
+*/
+html:not([data-wallet-presentation="rail"]) .wallet-hero-face-front {
+  opacity: 1;
+  transition: opacity 200ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+html:not([data-wallet-presentation="rail"]) .wallet-hero.is-flipped .wallet-hero-face-front {
+  opacity: 0;
+  pointer-events: none;
+}
+
+html:not([data-wallet-presentation="rail"]) .wallet-hero-face-back {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 200ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+html:not([data-wallet-presentation="rail"]) .wallet-hero.is-flipped.is-morph-back .wallet-hero-face-back {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* Rail: keep the 3D card flip — reads well in the narrow sidebar. */
+html[data-wallet-presentation="rail"] .wallet-hero-scene {
+  perspective: 1400px;
+}
+
+html[data-wallet-presentation="rail"] .wallet-hero-flip {
+  transform-style: preserve-3d;
+  transition:
+    transform 420ms cubic-bezier(0.2, 0, 0, 1),
+    min-height 420ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+html[data-wallet-presentation="rail"] .wallet-hero.is-flipped .wallet-hero-flip {
+  transform: rotateY(180deg);
+}
+
+html[data-wallet-presentation="rail"] .wallet-hero-face {
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+}
+
+html[data-wallet-presentation="rail"] .wallet-hero-face-back {
   transform: rotateY(180deg);
 }
 
@@ -326,6 +390,27 @@ button {
   text-overflow: unset;
   white-space: normal;
   line-height: 1.35;
+}
+
+/* Receive: "Family" sits beside "Receive" instead of stacking under it. */
+.wallet-hero-face-back .wallet-modal-header-inline {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.wallet-hero-face-back .wallet-modal-header-inline .wallet-state {
+  margin: 0;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+  color: var(--ink-mute);
+  font-size: 12.5px;
+  font-weight: 500;
 }
 
 .wallet-hero-face-back .wallet-modal-body {
@@ -475,7 +560,9 @@ button {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .wallet-hero-flip {
+  .wallet-hero-flip,
+  .wallet-hero-face-front,
+  .wallet-hero-face-back {
     transition: none;
   }
 }
@@ -601,6 +688,29 @@ button {
   color: var(--neg);
 }
 
+/* Modal footers: solid blocks like Done — not outline chips. */
+.wallet-modal-actions .wallet-button-secondary {
+  background: var(--chip, var(--surface-alt, #ececec));
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+
+.wallet-modal-actions .wallet-button-secondary:hover:not(:disabled) {
+  background: var(--chip-hover, #e2e2e2);
+  color: var(--ink);
+}
+
+.wallet-modal-actions .wallet-button-danger {
+  background: var(--neg, #c23b22);
+  border-color: transparent;
+  color: #fff;
+}
+
+.wallet-modal-actions .wallet-button-danger:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--neg, #c23b22) 88%, black);
+  color: #fff;
+}
+
 .wallet-button:disabled {
   cursor: not-allowed;
   opacity: 0.42;
@@ -691,21 +801,14 @@ button {
   white-space: nowrap;
 }
 
-/* Accounts Create/Import ceremony — same flip grammar as the hero. */
+/* Accounts Create/Import ceremony — same surface grammar as the hero. */
 .wallet-accounts-scene {
-  perspective: 1400px;
+  perspective: none;
 }
 
 .wallet-accounts-flip {
   position: relative;
-  transform-style: preserve-3d;
-  transition:
-    transform 420ms cubic-bezier(0.2, 0, 0, 1),
-    min-height 420ms cubic-bezier(0.2, 0, 0, 1);
-}
-
-.wallet-accounts-section.is-flipped .wallet-accounts-flip {
-  transform: rotateY(180deg);
+  transition: min-height 420ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 /* Must leave the layout — opacity:0 still reserved the button row height. */
@@ -713,13 +816,29 @@ button {
   display: none;
 }
 
+/* Flow owns "Accounts | Family" — hide the static section title stack. */
 .wallet-accounts-section.is-flipped .wallet-section-heading {
-  margin-bottom: 8px;
+  display: none;
 }
 
-.wallet-accounts-face {
-  backface-visibility: hidden;
-  -webkit-backface-visibility: hidden;
+.wallet-accounts-face-back .wallet-modal-header-inline {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.wallet-accounts-face-back .wallet-modal-header-inline .wallet-state {
+  margin: 0;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+  color: var(--ink-mute);
+  font-size: 12.5px;
+  font-weight: 500;
 }
 
 .wallet-accounts-face-front {
@@ -741,6 +860,52 @@ button {
   overflow: visible;
   padding: 2px 0 4px;
   box-sizing: border-box;
+}
+
+/* Window accounts: same hard sequence as hero (Create/Import must not overlap cards). */
+html:not([data-wallet-presentation="rail"]) .wallet-accounts-face-front {
+  opacity: 1;
+  transition: opacity 200ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+html:not([data-wallet-presentation="rail"]) .wallet-accounts-section.is-flipped .wallet-accounts-face-front {
+  opacity: 0;
+  pointer-events: none;
+}
+
+html:not([data-wallet-presentation="rail"]) .wallet-accounts-face-back {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 200ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+html:not([data-wallet-presentation="rail"]) .wallet-accounts-section.is-flipped.is-morph-back .wallet-accounts-face-back {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* Rail: 3D flip for accounts Create/Import / ⋮ menu. */
+html[data-wallet-presentation="rail"] .wallet-accounts-scene {
+  perspective: 1400px;
+}
+
+html[data-wallet-presentation="rail"] .wallet-accounts-flip {
+  transform-style: preserve-3d;
+  transition:
+    transform 420ms cubic-bezier(0.2, 0, 0, 1),
+    min-height 420ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+html[data-wallet-presentation="rail"] .wallet-accounts-section.is-flipped .wallet-accounts-flip {
+  transform: rotateY(180deg);
+}
+
+html[data-wallet-presentation="rail"] .wallet-accounts-face {
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+}
+
+html[data-wallet-presentation="rail"] .wallet-accounts-face-back {
   transform: rotateY(180deg);
 }
 
@@ -789,7 +954,9 @@ button {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .wallet-accounts-flip {
+  .wallet-accounts-flip,
+  .wallet-accounts-face-front,
+  .wallet-accounts-face-back {
     transition: none;
   }
 }
@@ -1254,9 +1421,33 @@ h3 {
   margin-left: auto;
 }
 
+/* One plate per signer family — header + nested accounts share a border. */
+.wallet-method-group {
+  display: grid;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.wallet-method-group .wallet-method {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.wallet-method-group .wallet-method + .wallet-method {
+  border-top: 1px solid var(--line);
+}
+
 .wallet-method {
   gap: 10px;
   padding: 11px;
+}
+
+.wallet-method-account {
+  padding-left: 14px;
+  background: color-mix(in oklab, var(--surface) 92%, var(--ink) 3%);
 }
 
 .wallet-method > div {

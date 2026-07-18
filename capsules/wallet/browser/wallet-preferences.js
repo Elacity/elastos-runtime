@@ -6,12 +6,12 @@ import {
   readStoredBoolean,
   readStoredValue,
   storeValue,
-} from "./wallet-format.js?v=wallet-20260719j";
+} from "./wallet-format.js?v=wallet-20260719w";
 import {
   actionButton,
   methodMark,
   textNode,
-} from "./wallet-render.js?v=wallet-20260719j";
+} from "./wallet-render.js?v=wallet-20260719w";
 
 export function createWalletPreferences({
   closeModal,
@@ -31,7 +31,6 @@ export function createWalletPreferences({
   const settingsDrawerNode = document.querySelector("#wallet-settings-drawer");
   const activityDrawerNode = document.querySelector("#wallet-activity-drawer");
   const drawerBackdropNode = document.querySelector("#wallet-drawer-backdrop");
-  const activityOpenButton = document.querySelector("#wallet-activity-open");
   const settingsOpenButton = document.querySelector("#wallet-settings-open");
   const methodsNode = document.querySelector("#wallet-methods");
 
@@ -43,7 +42,7 @@ export function createWalletPreferences({
 
   function bindPreferenceEvents() {
     privacyButton?.addEventListener("click", onTogglePrivacy);
-    activityOpenButton?.addEventListener("click", () => openDrawer("activity"));
+    // Activity click is bound in wallet.js — pending focuses hero; else history.
     settingsOpenButton?.addEventListener("click", () => openDrawer("settings"));
     drawerBackdropNode?.addEventListener("click", closeDrawers);
     document.querySelectorAll("[data-wallet-currency]").forEach((button) => {
@@ -89,31 +88,46 @@ export function createWalletPreferences({
       },
     ].filter((method) => method.id !== "wc" || walletConnectAvailable || method.connected.length > 0);
 
-    // Order: Built-in → linked accounts → connector rows to add more.
+    // One shared container per signer family: header + its accounts, then
+    // the next connector block (MetaMask / UniSat / WC) below.
     const passkey = methods.find((method) => method.id === "passkey");
     const connectors = methods.filter((method) => method.id !== "passkey");
-    const passkeyAccounts = accounts.filter((account) => account.method === "passkey");
-    const linkedAccounts = accounts.filter((account) => account.method !== "passkey");
-
     if (passkey) {
-      methodsNode.append(methodRow(passkey));
-    }
-    for (const account of [...passkeyAccounts, ...linkedAccounts]) {
-      methodsNode.append(methodAccountRow(account));
+      methodsNode.append(methodGroup(
+        passkey,
+        accounts.filter((account) => account.method === "passkey"),
+      ));
     }
     for (const method of connectors) {
-      methodsNode.append(methodRow(method));
+      methodsNode.append(methodGroup(
+        method,
+        accounts.filter((account) => account.method === method.id),
+      ));
     }
+  }
+
+  function methodGroup(method, methodAccounts) {
+    const group = document.createElement("section");
+    group.className = "wallet-method-group";
+    group.setAttribute("aria-label", method.label);
+    group.append(methodRow(method));
+    for (const account of methodAccounts) {
+      group.append(methodAccountRow(account));
+    }
+    return group;
   }
 
   function methodRow(method) {
     const row = document.createElement("article");
-    row.className = "wallet-method";
+    row.className = "wallet-method wallet-method-head";
     row.append(methodMark(method.id, METHOD_MONOGRAMS[method.id], true, ""));
     const body = document.createElement("div");
-    // Names live on account rows — method row only shows a count when linked.
+    // Built-in shows "Passkey (N)" so the signer kind is visible; connector
+    // rows stay "(N)" because the title already names MetaMask / UniSat / WC.
     const subtitle = method.connected.length > 0
-      ? `(${method.connected.length})`
+      ? method.id === "passkey"
+        ? `Passkey (${method.connected.length})`
+        : `(${method.connected.length})`
       : method.hint;
     body.append(
       textNode("strong", method.label),
@@ -289,13 +303,30 @@ export function createWalletPreferences({
   function applyPrivacyState() {
     const label = privacyMode ? "Show balances" : "Hide balances";
     const short = privacyMode ? "Show" : "Hide";
+    // Window nav: eye + Show/Hide. Rail stays icon-only in Home chrome.
+    const eyeSvg = privacyMode
+      ? '<svg class="wallet-nav-icon-svg" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.25 2.25l11.5 11.5" /><path d="M6.6 6.7A1.75 1.75 0 0 0 9.3 9.4" /><path d="M4.2 4.55C2.85 5.55 1.75 8 1.75 8s2.5 3.75 6.25 3.75c1.05 0 2-.3 2.8-.75" /><path d="M7.1 4.35c.3-.05.6-.1.9-.1 3.75 0 6.25 3.75 6.25 3.75a12.4 12.4 0 0 1-1.55 1.7" /></svg>'
+      : '<svg class="wallet-nav-icon-svg" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M1.75 8s2.5-3.75 6.25-3.75S14.25 8 14.25 8s-2.5 3.75-6.25 3.75S1.75 8 1.75 8Z" /><circle cx="8" cy="8" r="1.75" /></svg>';
     if (privacyButton) {
-      privacyButton.textContent = short;
+      privacyButton.innerHTML = `${eyeSvg}<span>${short}</span>`;
       privacyButton.setAttribute("aria-label", label);
       privacyButton.setAttribute("aria-pressed", privacyMode ? "true" : "false");
       privacyButton.title = label;
       privacyButton.classList.toggle("is-active", privacyMode);
     }
+    if (window.parent !== window) {
+      window.parent.postMessage(
+        {
+          type: "wallet:privacy-state",
+          privacyMode,
+        },
+        window.location.origin,
+      );
+    }
+  }
+
+  function togglePrivacy() {
+    onTogglePrivacy();
   }
 
   function openApprovalMethod(target) {
@@ -324,5 +355,6 @@ export function createWalletPreferences({
     openApprovalMethod,
     openDrawer,
     renderMethods,
+    togglePrivacy,
   };
 }

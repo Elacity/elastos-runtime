@@ -106,6 +106,7 @@ import {
   syncWalletRailAvailability,
   walletRailFrame,
   walletRailOpen,
+  walletRailSessionMounted,
 } from "./shell-wallet-rail.js?v=home-20260718p";
 import {
   bindConnectorSheet,
@@ -179,9 +180,10 @@ configureWindowHooks({
   syncMenubar,
   updateTaskbarState,
   // One Wallet session: dock/desktop window launch retires the rail so we
-  // do not keep two iframes / home_tokens for the same capsule.
+  // do not keep two iframes / home_tokens for the same capsule — including
+  // when the rail is hidden but the warm iframe is still mounted.
   retireWalletRailBeforeWindow: () => {
-    if (walletRailOpen()) {
+    if (walletRailSessionMounted() || walletRailOpen()) {
       retireWalletRail();
     }
   },

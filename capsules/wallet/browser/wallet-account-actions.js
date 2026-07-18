@@ -4,8 +4,8 @@ import {
   isPasskeyManagedAccount,
   readText,
   shortAddress,
-} from "./wallet-format.js?v=wallet-20260719j";
-import { pulseCopied, setBusy, textNode } from "./wallet-render.js?v=wallet-20260719j";
+} from "./wallet-format.js?v=wallet-20260719w";
+import { pulseCopied, setBusy, textNode } from "./wallet-render.js?v=wallet-20260719w";
 
 const accountsSurface = { surface: "accounts" };
 
@@ -76,7 +76,8 @@ export function createWalletAccountActions({
       flowRow("Copy address", shortAddress(account.address), async () => {
         await copyText(account.address);
         closeModal();
-        showStatus("Address copied.", "success");
+        // Tick the hero copy control — no status banner (avoids layout shift).
+        pulseHeroCopy(account.address);
       }),
       flowRow("Use by default", defaultIntentLabel(account), () => setDefaultAccount(account)),
     ];
@@ -84,9 +85,21 @@ export function createWalletAccountActions({
       rows.push(flowRow("Show recovery key", "Requires passkey", () => showRecoveryKey(account)));
     }
     rows.push(
-      flowRow("Delete account", "Remove from this Wallet", () => confirmDeleteAccount(account)),
+      flowRow("Remove account", "Remove from this Wallet", () => confirmDeleteAccount(account)),
     );
-    openFlowModal("Account", account.name, rows, undefined, accountsSurface);
+    // Outer "Accounts / N accounts" hides while flipped; this row is Accounts | name.
+    openFlowModal("Accounts", account.name, rows, undefined, {
+      ...accountsSurface,
+      headerInline: true,
+    });
+  }
+
+  function pulseHeroCopy(address) {
+    const match = [...document.querySelectorAll(".wallet-copy-icon[data-wallet-copy-address]")]
+      .find((node) => readText(node.dataset.walletCopyAddress) === address);
+    if (match) {
+      pulseCopied(match);
+    }
   }
 
   function openRenameAccount(account) {
@@ -148,12 +161,12 @@ export function createWalletAccountActions({
   function confirmDeleteAccount(account) {
     const warning = textNode(
       "p",
-      `Delete ${account.name} from this Wallet. Export the recovery key first if this is a built-in account you may need later. Passkey confirmation is required.`,
+      `Remove ${account.name} from this Wallet. Export the recovery key first if this is a built-in account you may need later. Passkey confirmation is required.`,
       "wallet-flow-hint",
     );
-    openFlowModal("Delete account", account.network, [warning], [
+    openFlowModal("Remove account", account.network, [warning], [
       modalButton("Cancel", closeModal, true),
-      modalButton("Delete", () => deleteAccount(account), true, true),
+      modalButton("Remove", () => deleteAccount(account), false, true),
     ], accountsSurface);
   }
 
@@ -302,8 +315,8 @@ export function createWalletAccountActions({
     setBusy(button, true);
     try {
       await copyText(address);
+      // Icon → tick only; status text above the hero shifts the whole card.
       pulseCopied(button);
-      showStatus("Address copied.", "success");
     } catch (error) {
       showStatus(String(error.message || error), "error");
     } finally {

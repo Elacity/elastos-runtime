@@ -1,3 +1,5 @@
+import { copyIconButton, textNode as defaultTextNode } from "./wallet-render.js?v=wallet-20260719w";
+
 export function createWalletReceiveFlow({
   buildViewAccounts,
   closeModal,
@@ -8,11 +10,12 @@ export function createWalletReceiveFlow({
   openFlowModal,
   selectedOrDefaultAccount,
   shellHeaders,
-  textNode,
+  textNode = defaultTextNode,
 }) {
   const accountQrCache = new Map();
   const accountQrPending = new Set();
   const heroSurface = { surface: "hero" };
+  const receiveAddressSurface = { surface: "hero", headerInline: true };
 
   function qrForAccount(account) {
     return accountQrCache.get(account.address) || "";
@@ -79,25 +82,13 @@ export function createWalletReceiveFlow({
     );
   }
 
-  function copyIconButton(address) {
-    const copy = document.createElement("button");
-    copy.className = "wallet-copy-icon";
-    copy.type = "button";
-    copy.setAttribute("aria-label", "Copy address");
-    copy.title = "Copy address";
-    copy.dataset.walletCopyAddress = address;
-    copy.innerHTML =
-      '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M3.5 10.5V3.5A1 1 0 0 1 4.5 2.5h7" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
-    return copy;
-  }
-
   async function renderReceiveAddress(account) {
     openFlowModal(
       "Receive",
       account.name,
       [textNode("p", "Preparing QR.", "wallet-state")],
       [modalButton("Done", closeModal)],
-      heroSurface,
+      receiveAddressSurface,
     );
     try {
       await loadAccountQr(account);
@@ -133,7 +124,7 @@ export function createWalletReceiveFlow({
         account.name,
         [row],
         [modalButton("Done", closeModal)],
-        heroSurface,
+        receiveAddressSurface,
       );
     } catch (error) {
       openFlowModal(

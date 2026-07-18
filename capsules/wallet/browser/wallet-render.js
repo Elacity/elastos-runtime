@@ -186,6 +186,12 @@ export function methodMark(method, monogram, large = false, chainNamespace = "")
   return mark;
 }
 
+export const COPY_ICON_SVG =
+  '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M3.5 10.5V3.5A1 1 0 0 1 4.5 2.5h7" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
+
+export const CHECK_ICON_SVG =
+  '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M3.25 8.25l3 3 6.5-6.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
 export function copyButton(value) {
   const button = document.createElement("button");
   button.className = "wallet-copy-button";
@@ -195,16 +201,31 @@ export function copyButton(value) {
   return button;
 }
 
+export function copyIconButton(address, ariaLabel = "Copy address") {
+  const copy = document.createElement("button");
+  copy.className = "wallet-copy-icon";
+  copy.type = "button";
+  copy.setAttribute("aria-label", ariaLabel);
+  copy.title = "Copy address";
+  copy.dataset.walletCopyAddress = address;
+  copy.innerHTML = COPY_ICON_SVG;
+  return copy;
+}
+
 export function pulseCopied(button) {
   button.classList.add("is-copied");
   if (button.classList.contains("wallet-copy-icon")) {
-    const previous = button.getAttribute("aria-label") || "Copy address";
+    const previousLabel = button.getAttribute("aria-label") || "Copy address";
+    const previousTitle = button.title || "Copy address";
+    const previousHtml = button.innerHTML;
+    button.innerHTML = CHECK_ICON_SVG;
     button.setAttribute("aria-label", "Copied");
     button.title = "Copied";
     window.setTimeout(() => {
       button.classList.remove("is-copied");
-      button.setAttribute("aria-label", previous);
-      button.title = previous;
+      button.innerHTML = previousHtml || COPY_ICON_SVG;
+      button.setAttribute("aria-label", previousLabel);
+      button.title = previousTitle;
     }, 1200);
     return;
   }
