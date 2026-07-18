@@ -103,7 +103,10 @@ import {
 import {
   bindWalletRail,
   retireWalletRail,
+  showWalletRail,
   syncWalletRailAvailability,
+  walletRailFrame,
+  walletRailOpen,
 } from "./shell-wallet-rail.js?v=home-20260717b";
 
 await ensureHomeGuiDom();
@@ -317,6 +320,18 @@ export function relaunchHomeGuiTarget(windowId, target) {
 }
 
 export function deliverMessageToHomeGuiTargetFrame(target, payload, options = null) {
+  // Prefer an open wallet rail over a desktop window — same capsule, user's
+  // current surface. Focus shows the rail; window focus is the fallback.
+  if (target === "wallet" && walletRailOpen()) {
+    const railFrame = walletRailFrame();
+    if (railFrame?.contentWindow) {
+      railFrame.contentWindow.postMessage(payload, window.location.origin);
+      if (options?.focus === true) {
+        showWalletRail();
+      }
+      return true;
+    }
+  }
   const entries = [...shellState.windows.values()]
     .filter((entry) => entry.kind === "browser" && entry.targetId === target)
     .sort((left, right) => Number(right.serial || 0) - Number(left.serial || 0));
@@ -336,6 +351,8 @@ export function openHomeGuiTargetWithPayload(target, payload) {
   let deliveredCount = 0;
   if (deliverMessageToHomeGuiTargetFrame(target, payload, { focus: true })) {
     deliveredCount += 1;
+  } else if (target === "wallet" && targetById(shellState.currentSummary, "wallet")) {
+    showWalletRail();
   } else if (targetById(shellState.currentSummary, target)) {
     openTarget(target);
   } else {
@@ -368,10 +385,37 @@ export function broadcastHomeGuiRuntimeEvents(events) {
       console.warn("could not deliver runtime event to app frame", error);
     }
   }
+  const railFrame = walletRailFrame();
+  try {
+    railFrame?.contentWindow?.postMessage(message, window.location.origin);
+  } catch (error) {
+    console.warn("could not deliver runtime event to wallet rail", error);
+  }
 }
 
 export function homeGuiMessageContextForSource(source, homeToken) {
   if (!source || !homeToken) {
+    return null;
+  }
+  const railFrame = walletRailFrame();
+  let railWindow = null;
+  try {
+    railWindow = railFrame?.contentWindow || null;
+  } catch (_error) {
+    railWindow = null;
+  }
+  if (railWindow && railWindow === source) {
+    const expectedToken = homeLaunchTokenFromRoute(
+      railFrame?.dataset?.route || railFrame?.getAttribute("src") || "",
+    );
+    if (expectedToken && expectedToken === homeToken) {
+      return {
+        kind: "app-frame",
+        targetId: "wallet",
+        windowId: "wallet-rail",
+        homeToken,
+      };
+    }
     return null;
   }
   for (const entry of shellState.windows.values()) {
@@ -453,7 +497,7 @@ export function syncHomeGuiChrome(previous, summary) {
   updateClock();
   syncIdentity(summary);
   renderInboxBadge(summary);
-  syncWalletRailAvailability();
+  syncWalletRailAvailability(summary);
   maybeShowWalletApprovalToast(previous, summary);
   recordNotifications(summary);
 }

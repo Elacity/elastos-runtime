@@ -1,6 +1,6 @@
-import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260717a";
-import { createWalletApi, readQueryParam } from "./wallet-api.js?v=wallet-20260717a";
-import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260717a";
+import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260718a";
+import { createWalletApi, readQueryParam } from "./wallet-api.js?v=wallet-20260718a";
+import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260718a";
 import {
   BALANCE_NETWORKS,
   MANAGED_CHAIN_NAMESPACES,
@@ -19,14 +19,14 @@ import {
   readText,
   shortAddress,
   validateAddress,
-} from "./wallet-format.js?v=wallet-20260717a";
-import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260717a";
-import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260717a";
-import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260717a";
-import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260717a";
-import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260717a";
-import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260717a";
-import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260717a";
+} from "./wallet-format.js?v=wallet-20260718a";
+import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260718a";
+import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260718a";
+import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260718a";
+import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260718a";
+import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260718a";
+import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260718a";
+import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260718a";
 import {
   accountCard,
   copyButton,
@@ -34,7 +34,7 @@ import {
   emptyHero,
   setBusy,
   textNode,
-} from "./wallet-render.js?v=wallet-20260717a";
+} from "./wallet-render.js?v=wallet-20260718a";
 
 const statusNode = document.querySelector("#wallet-status");
 const accountsNode = document.querySelector("#wallet-accounts");
@@ -48,6 +48,9 @@ const deltaNode = document.querySelector("#wallet-delta");
 const deltaValueNode = document.querySelector("#wallet-delta-value");
 const sendButton = document.querySelector("#wallet-send");
 const receiveButton = document.querySelector("#wallet-receive");
+const getStartedNode = document.querySelector("#wallet-get-started");
+const connectCtaButton = document.querySelector("#wallet-connect-cta");
+const signersSection = document.querySelector("#wallet-signers");
 const accountDetailNode = document.querySelector("#wallet-account-detail");
 const modalBackdropNode = document.querySelector("#wallet-modal-backdrop");
 const modalNode = document.querySelector("#wallet-modal");
@@ -217,6 +220,7 @@ function boot() {
   document.addEventListener("click", onWalletActionClick);
   sendButton?.addEventListener("click", openSendFlow);
   receiveButton?.addEventListener("click", openReceiveFlow);
+  connectCtaButton?.addEventListener("click", focusSignersSection);
   modalBackdropNode?.addEventListener("click", closeModal);
   document.addEventListener("click", onDocumentClick);
   document.addEventListener("keydown", (event) => {
@@ -645,8 +649,9 @@ function accountMatchesDefault(account, defaultAccount) {
 function renderAccounts(accounts) {
   accountsNode.replaceChildren();
   stateNode.textContent = `${accounts.length} account${accounts.length === 1 ? "" : "s"}`;
+  // Create / Import stay visible even with accounts — never bury the path.
   if (accountActionsNode) {
-    accountActionsNode.hidden = accounts.length > 0;
+    accountActionsNode.hidden = false;
   }
   if (accounts.length === 0) {
     accountsNode.append(emptyHero());
@@ -663,8 +668,29 @@ function renderAccounts(accounts) {
 }
 
 function updateFlowButtons(accounts) {
-  sendButton.disabled = accounts.length === 0;
-  receiveButton.disabled = accounts.length === 0;
+  const empty = accounts.length === 0;
+  sendButton.disabled = empty;
+  receiveButton.disabled = empty;
+  if (sendButton) {
+    sendButton.hidden = empty;
+  }
+  if (receiveButton) {
+    receiveButton.hidden = empty;
+  }
+  if (getStartedNode) {
+    getStartedNode.hidden = !empty;
+  }
+}
+
+function focusSignersSection() {
+  if (!signersSection) {
+    return;
+  }
+  signersSection.classList.add("is-highlighted");
+  signersSection.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  window.setTimeout(() => {
+    signersSection.classList.remove("is-highlighted");
+  }, 1600);
 }
 
 function openAccountDetail(accountId) {

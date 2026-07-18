@@ -616,7 +616,7 @@ h3 {
 }
 
 .wallet-settings-drawer {
-  width: min(760px, 94vw);
+  width: min(420px, 94vw);
 }
 
 .wallet-detail {
@@ -644,14 +644,32 @@ h3 {
 }
 
 .wallet-settings {
-  grid-template-columns: minmax(0, 1fr) minmax(250px, 0.8fr);
+  grid-template-columns: minmax(0, 1fr);
   align-items: start;
 }
 
-.wallet-settings-main,
-.wallet-settings-side {
+.wallet-settings-main {
   display: grid;
   gap: 10px;
+}
+
+#wallet-signers.is-highlighted {
+  outline: 1px solid color-mix(in oklab, var(--accent) 55%, transparent);
+  outline-offset: 4px;
+  border-radius: 14px;
+}
+
+.wallet-get-started[hidden] {
+  display: none;
+}
+
+/* Narrow rail / window: signer rows stack cleanly. */
+.wallet-methods .wallet-method {
+  flex-wrap: wrap;
+}
+
+.wallet-methods .wallet-method > button {
+  margin-left: auto;
 }
 
 .wallet-method {

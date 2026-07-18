@@ -63,6 +63,7 @@ import {
   focusWindow,
 } from "./shell-windows.js?v=home-20260717b";
 import { playUiSound } from "./shell-sounds.js?v=home-20260717b";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260717b";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -2056,6 +2057,15 @@ function bindHomeNotificationToast() {
   homeNotificationToast.dataset.bound = "true";
   homeNotificationAction.addEventListener("click", () => {
     hideHomeNotificationToast();
+    // Wallet approvals belong in Wallet — Inbox is the wrong room.
+    if (walletRailAvailable()) {
+      showWalletRail();
+      return;
+    }
+    if (targetById(shellState.currentSummary, "wallet")) {
+      openTarget("wallet");
+      return;
+    }
     openTarget("inbox");
   });
   homeNotificationDismiss.addEventListener("click", hideHomeNotificationToast);

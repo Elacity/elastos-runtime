@@ -3,7 +3,7 @@ import {
   assetColor,
   formatAmount,
   shortAddress,
-} from "./wallet-format.js?v=wallet-20260717a";
+} from "./wallet-format.js?v=wallet-20260718a";
 
 export function createWalletRender({ statusNode }) {
   function showStatus(message, tone) {
@@ -78,7 +78,7 @@ export function emptyHero() {
   const empty = document.createElement("div");
   empty.className = "wallet-empty";
   empty.innerHTML = `
-    <p class="wallet-state">No accounts yet. Create an EVM or Bitcoin account from Accounts, or import a Wallet key.</p>
+    <p class="wallet-state">No accounts yet. Create a built-in account, or connect MetaMask / UniSat below.</p>
   `;
   return empty;
 }
