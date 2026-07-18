@@ -1,0 +1,212 @@
+import {
+  escapeHtml,
+  fetchJson,
+} from "./shell-core.js?v=home-20260717b";
+import {
+  iframeAllowForLaunch,
+  iframeSandboxForLaunch,
+} from "./shell-windows.js?v=home-20260717b";
+import { showWalletRail, walletRailOpen } from "./shell-wallet-rail.js?v=home-20260717b";
+
+/* Connector sheet: thin ceremony surface for wallet-metamask / unisat /
+   walletconnect. Same launch path as a window, mounted in a rail-aligned
+   overlay instead of a second product window. Authority stays in the
+   connector capsule; this module is chrome only. */
+
+const CONNECTOR_SHEET_TARGETS = new Set([
+  "wallet-metamask",
+  "wallet-unisat",
+  "wallet-walletconnect",
+]);
+
+const SHEET_TITLES = {
+  "wallet-metamask": "Connect MetaMask",
+  "wallet-unisat": "Connect UniSat",
+  "wallet-walletconnect": "Connect WalletConnect",
+};
+
+let sheet = null;
+let frame = null;
+let titleNode = null;
+let closeButton = null;
+let launching = false;
+let activeTarget = "";
+let bound = false;
+
+export function bindConnectorSheet() {
+  if (bound) {
+    return;
+  }
+  sheet = document.querySelector("#connector-sheet");
+  frame = document.querySelector("#connector-sheet-frame");
+  titleNode = document.querySelector("#connector-sheet-title");
+  closeButton = document.querySelector("#connector-sheet-close");
+  if (!sheet || !frame) {
+    return;
+  }
+  bound = true;
+  closeButton?.addEventListener("click", () => hideConnectorSheet());
+  sheet.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      hideConnectorSheet();
+    }
+  });
+}
+
+export function isConnectorSheetTarget(targetId) {
+  return CONNECTOR_SHEET_TARGETS.has(targetId);
+}
+
+export function connectorSheetOpen() {
+  return Boolean(sheet) && !sheet.hidden;
+}
+
+export function connectorSheetFrame() {
+  return frame;
+}
+
+export function connectorSheetTarget() {
+  return activeTarget;
+}
+
+export async function showConnectorSheet(targetId, options = {}) {
+  if (!sheet || !frame || !isConnectorSheetTarget(targetId)) {
+    return false;
+  }
+  // Connectors are often hidden from the launcher; launch fails closed via API.
+  if (!walletRailOpen()) {
+    showWalletRail();
+  }
+  activeTarget = targetId;
+  if (titleNode) {
+    titleNode.textContent = SHEET_TITLES[targetId] || "Connect wallet";
+  }
+  sheet.hidden = false;
+  sheet.inert = false;
+  sheet.setAttribute("aria-hidden", "false");
+  sheet.focus({ preventScroll: true });
+  await mountConnectorFrame(targetId, options.query || {});
+  return true;
+}
+
+export function hideConnectorSheet() {
+  if (!sheet || sheet.hidden) {
+    return;
+  }
+  sheet.hidden = true;
+  sheet.inert = true;
+  sheet.setAttribute("aria-hidden", "true");
+  if (frame) {
+    frame.removeAttribute("src");
+    delete frame.dataset.route;
+    frame.hidden = true;
+    frame.classList.remove("is-ready");
+  }
+  activeTarget = "";
+}
+
+export function retireConnectorSheet() {
+  hideConnectorSheet();
+}
+
+/* After a successful link the connector posts home:refresh-summary — close
+   the ceremony so the user lands back on the wallet rail. */
+export function noteConnectorSheetSummaryRefresh(source) {
+  if (!connectorSheetOpen()) {
+    return;
+  }
+  let frameWindow = null;
+  try {
+    frameWindow = frame?.contentWindow || null;
+  } catch (_error) {
+    return;
+  }
+  if (source && frameWindow && source === frameWindow) {
+    window.setTimeout(() => {
+      hideConnectorSheet();
+      if (walletRailOpen()) {
+        showWalletRail();
+      }
+    }, 450);
+  }
+}
+
+async function mountConnectorFrame(targetId, query) {
+  if (launching) {
+    return;
+  }
+  launching = true;
+  frame.hidden = false;
+  frame.classList.remove("is-ready");
+  try {
+    const launchQuery = {
+      ...normalizedQuery(query),
+      presentation: "sheet",
+    };
+    const launched = await fetchJson("/api/apps/home/launch", {
+      method: "POST",
+      body: JSON.stringify({ target: targetId, query: launchQuery }),
+    });
+    if (launched.attach_kind !== "iframe") {
+      throw new Error(`unsupported attach kind: ${launched.attach_kind || "unknown"}`);
+    }
+    if (
+      typeof launched.launch_status === "string" &&
+      launched.launch_status.trim() !== "" &&
+      launched.launch_status !== "launched"
+    ) {
+      throw new Error(
+        typeof launched.launch_detail === "string" && launched.launch_detail.trim() !== ""
+          ? launched.launch_detail.trim()
+          : `launch status: ${launched.launch_status}`,
+      );
+    }
+    frame.setAttribute("sandbox", iframeSandboxForLaunch(launched));
+    frame.setAttribute("allow", iframeAllowForLaunch(launched));
+    frame.title = escapeHtml(launched.title || SHEET_TITLES[targetId] || "Connector");
+    frame.addEventListener(
+      "load",
+      () => {
+        frame.classList.add("is-ready");
+      },
+      { once: true },
+    );
+    // Ensure the connector sees presentation=sheet even if the gateway
+    // does not echo query params onto the route.
+    const route = withPresentationSheet(launched.route);
+    frame.src = route;
+    frame.dataset.route = route;
+  } catch (error) {
+    console.error("connector sheet launch failed", error);
+    hideConnectorSheet();
+    throw error;
+  } finally {
+    launching = false;
+  }
+}
+
+function normalizedQuery(query) {
+  if (!query || typeof query !== "object") {
+    return {};
+  }
+  const next = {};
+  for (const [key, value] of Object.entries(query)) {
+    if (typeof key !== "string" || !key.trim()) {
+      continue;
+    }
+    next[key] = typeof value === "string" ? value : String(value ?? "");
+  }
+  return next;
+}
+
+function withPresentationSheet(route) {
+  try {
+    const url = new URL(route, window.location.href);
+    url.searchParams.set("presentation", "sheet");
+    return `${url.pathname}${url.search}${url.hash}`;
+  } catch (_error) {
+    return route;
+  }
+}

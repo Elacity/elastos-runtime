@@ -216,10 +216,12 @@ export function createWalletPreferences({
       return;
     }
     closeDrawers();
+    // Ask Home for the in-rail ceremony sheet — not a second desktop window.
     window.parent.postMessage({
       type: "home:open-target",
       target,
       homeToken: activeHomeToken,
+      query: { presentation: "sheet" },
     }, window.location.origin);
   }
 

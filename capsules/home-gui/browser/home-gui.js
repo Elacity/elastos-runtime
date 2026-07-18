@@ -108,6 +108,15 @@ import {
   walletRailFrame,
   walletRailOpen,
 } from "./shell-wallet-rail.js?v=home-20260717b";
+import {
+  bindConnectorSheet,
+  connectorSheetFrame,
+  connectorSheetTarget,
+  isConnectorSheetTarget,
+  noteConnectorSheetSummaryRefresh,
+  retireConnectorSheet,
+  showConnectorSheet,
+} from "./shell-connector-sheet.js?v=home-20260717b";
 
 await ensureHomeGuiDom();
 bindIdentityMenu();
@@ -120,6 +129,7 @@ bindShellKeyboard();
 bindMenubar({ closeWindow, openTarget, supportsNewWindow: supportsMenuNewWindow });
 bindControlCentre();
 bindWalletRail();
+bindConnectorSheet();
 
 const HOME_GUI_HOST_SELECTORS = Object.freeze([
   ".desktop-backdrop",
@@ -132,6 +142,7 @@ const HOME_GUI_HOST_SELECTORS = Object.freeze([
   "#notification-center",
   "#control-centre",
   "#wallet-rail",
+  "#connector-sheet",
   "#spotlight",
   "#window-switcher",
   "#quick-look",
@@ -203,6 +214,7 @@ export function retireHomeGuiSurface(options = {}) {
   hideNotificationCenter();
   hideControlCentre({ restoreFocus: false });
   retireWalletRail();
+  retireConnectorSheet();
   hideAboutOverlay({ restoreFocus: false });
   hideQuickLook();
   closeExpose();
@@ -299,7 +311,27 @@ export function closeHomeGuiWindowsForTarget(targetId) {
 }
 
 export function openHomeGuiTarget(target, options = {}) {
+  const query = options.query && typeof options.query === "object" ? options.query : {};
+  // Wallet connectors open as an in-rail ceremony sheet — not a second
+  // desktop product window — when the wallet asks for sheet presentation
+  // or the wallet rail is already open.
+  if (
+    isConnectorSheetTarget(target) &&
+    (query.presentation === "sheet" || walletRailOpen())
+  ) {
+    showConnectorSheet(target, { ...options, query: { ...query, presentation: "sheet" } }).catch(
+      (error) => {
+        console.error("connector sheet open failed", error);
+        openTarget(target, options);
+      },
+    );
+    return;
+  }
   openTarget(target, options);
+}
+
+export function noteHomeGuiConnectorSheetSummaryRefresh(source) {
+  noteConnectorSheetSummaryRefresh(source);
 }
 
 export function homeGuiHasWindows() {
@@ -413,6 +445,27 @@ export function homeGuiMessageContextForSource(source, homeToken) {
         kind: "app-frame",
         targetId: "wallet",
         windowId: "wallet-rail",
+        homeToken,
+      };
+    }
+    return null;
+  }
+  const sheetFrame = connectorSheetFrame();
+  let sheetWindow = null;
+  try {
+    sheetWindow = sheetFrame?.contentWindow || null;
+  } catch (_error) {
+    sheetWindow = null;
+  }
+  if (sheetWindow && sheetWindow === source) {
+    const expectedToken = homeLaunchTokenFromRoute(
+      sheetFrame?.dataset?.route || sheetFrame?.getAttribute("src") || "",
+    );
+    if (expectedToken && expectedToken === homeToken) {
+      return {
+        kind: "app-frame",
+        targetId: connectorSheetTarget() || "wallet-metamask",
+        windowId: "connector-sheet",
         homeToken,
       };
     }

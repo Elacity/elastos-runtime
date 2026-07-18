@@ -38,6 +38,25 @@ body {
   color: var(--ink);
 }
 
+/* In-rail ceremony: solid fill, single panel — no decorative bleed into the sheet. */
+body[data-presentation="sheet"] {
+  min-height: 100%;
+  padding: 18px 16px;
+  background: var(--bg);
+  display: grid;
+  align-content: start;
+  gap: 12px;
+}
+
+body[data-presentation="sheet"] .wallet-shell {
+  display: grid;
+  gap: 12px;
+}
+
+body[data-presentation="sheet"] .wallet-panel {
+  box-shadow: none;
+}
+
 button {
   border: 0;
   font: inherit;

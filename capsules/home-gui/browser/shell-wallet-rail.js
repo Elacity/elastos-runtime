@@ -255,8 +255,15 @@ function bindOutsideDismiss() {
   }
   outsideDismissBound = true;
   document.addEventListener("pointerdown", (event) => {
-    if (walletRailOpen() && !rail.contains(event.target)) {
-      hideWalletRail({ restoreFocus: false });
+    if (!walletRailOpen() || rail.contains(event.target)) {
+      return;
     }
+    // The connector ceremony sheet sits above the rail — ignore outside
+    // dismiss while it is open (and never treat sheet clicks as outside).
+    const connectorSheet = document.querySelector("#connector-sheet");
+    if (connectorSheet && !connectorSheet.hidden) {
+      return;
+    }
+    hideWalletRail({ restoreFocus: false });
   });
 }
