@@ -6,12 +6,12 @@ import {
   readStoredBoolean,
   readStoredValue,
   storeValue,
-} from "./wallet-format.js?v=wallet-20260719h";
+} from "./wallet-format.js?v=wallet-20260719j";
 import {
   actionButton,
   methodMark,
   textNode,
-} from "./wallet-render.js?v=wallet-20260719h";
+} from "./wallet-render.js?v=wallet-20260719j";
 
 export function createWalletPreferences({
   closeModal,
@@ -37,6 +37,8 @@ export function createWalletPreferences({
   let privacyMode = readStoredBoolean("wallet.privacy");
   let displayCurrency = readStoredValue(DISPLAY_CURRENCY_STORAGE_KEY, "usd", ["btc", "usd", "ela"]);
   let activeDrawer = "";
+  let drawerCloseTimer = 0;
+  const DRAWER_MS = 320;
 
   function bindPreferenceEvents() {
     privacyButton?.addEventListener("click", onTogglePrivacy);
@@ -50,6 +52,20 @@ export function createWalletPreferences({
       button.addEventListener("click", closeDrawers);
     });
     methodsNode?.addEventListener("click", onMethodClick);
+  }
+
+  function prefersReducedMotion() {
+    return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  }
+
+  function drawerFor(name) {
+    if (name === "settings") {
+      return settingsDrawerNode;
+    }
+    if (name === "activity") {
+      return activityDrawerNode;
+    }
+    return null;
   }
 
   function renderMethods(accounts, approvalMethods = {}) {
@@ -194,17 +210,53 @@ export function createWalletPreferences({
   }
 
   function openDrawer(name) {
+    window.clearTimeout(drawerCloseTimer);
+    const next = drawerFor(name);
+    if (!next) {
+      return;
+    }
+    // Swap drawers without animating the previous closed mid-flight.
+    for (const node of [settingsDrawerNode, activityDrawerNode]) {
+      if (node && node !== next) {
+        node.classList.remove("is-open");
+        node.hidden = true;
+      }
+    }
     activeDrawer = name;
-    settingsDrawerNode.hidden = name !== "settings";
-    activityDrawerNode.hidden = name !== "activity";
-    drawerBackdropNode.hidden = false;
+    next.hidden = false;
+    if (drawerBackdropNode) {
+      drawerBackdropNode.hidden = false;
+    }
+    // Force layout so the closed transform is painted before we open —
+    // otherwise some engines skip the enter transition.
+    void next.offsetWidth;
+    void drawerBackdropNode?.offsetWidth;
+    next.classList.add("is-open");
+    drawerBackdropNode?.classList.add("is-open");
   }
 
   function closeDrawers() {
+    window.clearTimeout(drawerCloseTimer);
     activeDrawer = "";
-    settingsDrawerNode.hidden = true;
-    activityDrawerNode.hidden = true;
-    drawerBackdropNode.hidden = true;
+    settingsDrawerNode?.classList.remove("is-open");
+    activityDrawerNode?.classList.remove("is-open");
+    drawerBackdropNode?.classList.remove("is-open");
+    const finish = () => {
+      if (settingsDrawerNode) {
+        settingsDrawerNode.hidden = true;
+      }
+      if (activityDrawerNode) {
+        activityDrawerNode.hidden = true;
+      }
+      if (drawerBackdropNode) {
+        drawerBackdropNode.hidden = true;
+      }
+    };
+    if (prefersReducedMotion()) {
+      finish();
+      return;
+    }
+    drawerCloseTimer = window.setTimeout(finish, DRAWER_MS);
   }
 
   function onTogglePrivacy() {

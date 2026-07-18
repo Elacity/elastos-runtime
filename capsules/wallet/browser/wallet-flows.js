@@ -1,4 +1,4 @@
-import { textNode } from "./wallet-render.js?v=wallet-20260719h";
+import { textNode } from "./wallet-render.js?v=wallet-20260719j";
 
 export function createWalletFlows({
   modalNode,

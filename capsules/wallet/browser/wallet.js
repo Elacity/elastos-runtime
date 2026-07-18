@@ -1,6 +1,6 @@
-import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260719h";
-import { createWalletApi, readQueryParam } from "./wallet-api.js?v=wallet-20260719h";
-import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260719h";
+import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260719j";
+import { createWalletApi, readQueryParam } from "./wallet-api.js?v=wallet-20260719j";
+import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260719j";
 import {
   BALANCE_NETWORKS,
   MANAGED_CHAIN_NAMESPACES,
@@ -18,14 +18,14 @@ import {
   readText,
   shortAddress,
   validateAddress,
-} from "./wallet-format.js?v=wallet-20260719h";
-import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260719h";
-import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260719h";
-import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260719h";
-import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260719h";
-import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260719h";
-import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260719h";
-import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260719h";
+} from "./wallet-format.js?v=wallet-20260719j";
+import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260719j";
+import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260719j";
+import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260719j";
+import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260719j";
+import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260719j";
+import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260719j";
+import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260719j";
 import {
   accountCard,
   copyButton,
@@ -34,7 +34,7 @@ import {
   methodMark,
   setBusy,
   textNode,
-} from "./wallet-render.js?v=wallet-20260719h";
+} from "./wallet-render.js?v=wallet-20260719j";
 
 const statusNode = document.querySelector("#wallet-status");
 const accountsNode = document.querySelector("#wallet-accounts");
@@ -233,9 +233,23 @@ function boot() {
   modalBackdropNode?.addEventListener("click", closeModal);
   document.addEventListener("click", onDocumentClick);
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
-      closeModal();
-      closeDrawers();
+    if (event.key !== "Escape") {
+      return;
+    }
+    const settingsDrawer = document.querySelector("#wallet-settings-drawer");
+    const activityDrawer = document.querySelector("#wallet-activity-drawer");
+    const hadOverlay = Boolean(
+      (modalNode && !modalNode.hidden)
+        || (settingsDrawer && !settingsDrawer.hidden)
+        || (activityDrawer && !activityDrawer.hidden)
+        || heroNode?.classList.contains("is-flipped")
+        || accountsSectionNode?.classList.contains("is-flipped"),
+    );
+    closeModal();
+    closeDrawers();
+    // Escape clears selection only when nothing was open — don't yank the
+    // hero account while dismissing Send/Receive or a drawer.
+    if (!hadOverlay) {
       clearAccountSelection();
     }
   });
@@ -421,7 +435,29 @@ function renderAll() {
   }
   renderMethods(allAccounts, currentApprovalMethods);
   renderActivity(currentRequests);
+  renderApprovalsBadge(pending.length);
   updateFlowButtons(allAccounts);
+}
+
+function renderApprovalsBadge(pendingCount) {
+  const badge = document.querySelector("#wallet-approvals-badge");
+  const button = document.querySelector("#wallet-activity-open");
+  if (!badge || !button) {
+    return;
+  }
+  const count = Math.max(0, Number(pendingCount) || 0);
+  if (count <= 0) {
+    badge.hidden = true;
+    badge.textContent = "";
+    button.setAttribute("aria-label", "Open approvals");
+    return;
+  }
+  badge.hidden = false;
+  badge.textContent = count > 9 ? "9+" : String(count);
+  button.setAttribute(
+    "aria-label",
+    count === 1 ? "Open approvals, 1 pending" : `Open approvals, ${count} pending`,
+  );
 }
 
 function buildViewAccounts() {

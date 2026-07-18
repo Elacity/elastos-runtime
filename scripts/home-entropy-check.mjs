@@ -7,8 +7,22 @@ import { fileURLToPath } from "node:url";
 const repoRoot = new URL("../", import.meta.url);
 const repoRootPath = fileURLToPath(repoRoot);
 
+// Home GUI split: shell modules that used to live under capsules/home/browser
+// now live under home-gui. Alias so the gate fails on contract drift, not ENOENT.
+const HOME_SHELL_PATH_ALIASES = Object.freeze({
+  "capsules/home/browser/shell.js": "capsules/home-gui/browser/home-gui.js",
+  "capsules/home/browser/shell-surface.js": "capsules/home-gui/browser/shell-surface.js",
+  "capsules/home/browser/shell-windows.js": "capsules/home-gui/browser/shell-windows.js",
+  "capsules/home/browser/shell-window-geometry.js":
+    "capsules/home-gui/browser/shell-window-geometry.js",
+});
+
+function resolveRepoPath(path) {
+  return HOME_SHELL_PATH_ALIASES[path] || path;
+}
+
 function read(path) {
-  return readFileSync(new URL(path, repoRoot), "utf8");
+  return readFileSync(new URL(resolveRepoPath(path), repoRoot), "utf8");
 }
 
 function readAll(paths) {
@@ -574,9 +588,9 @@ function assertStaticControlsAreNamed(file) {
 const activeUiFiles = [
   "capsules/home/browser/index.html",
   "capsules/home/browser/style.css",
-  "capsules/home/browser/shell.js",
-  "capsules/home/browser/shell-surface.js",
-  "capsules/home/browser/shell-windows.js",
+  "capsules/home-gui/browser/home-gui.js",
+  "capsules/home-gui/browser/shell-surface.js",
+  "capsules/home-gui/browser/shell-windows.js",
   "capsules/home/browser/service-worker.js",
   "capsules/system/browser/index.html",
   "capsules/system/browser/system.js",
@@ -7857,7 +7871,7 @@ assert(
   "Wallet must provide balances and built-in Bitcoin accounts without manual Bitcoin proof linking",
 );
 assert(
-  wallet.includes("wallet-20260719d") &&
+  wallet.includes("wallet-20260719j") &&
     wallet.includes('id="wallet-send"') &&
     wallet.includes('id="wallet-receive"') &&
     wallet.includes("data-wallet-create-account") &&
@@ -7928,6 +7942,15 @@ assert(
   walletStyle.includes("scrollbar-width: none") &&
     walletStyle.includes("html::-webkit-scrollbar"),
   "Wallet viewport must hide the classic scrollbar gutter so Send/Receive overflow does not shift Approvals/Settings",
+);
+assert(
+  walletStyle.includes(".wallet-drawer.is-open") &&
+    walletJs.includes("DRAWER_MS") &&
+    walletJs.includes('classList.add("is-open")') &&
+    walletJs.includes("void next.offsetWidth") &&
+    wallet.includes('id="wallet-approvals-badge"') &&
+    walletJs.includes("renderApprovalsBadge"),
+  "Wallet Approvals/Settings drawers must slide open with backdrop fade, and Approvals nav must badge pending count",
 );
 assert(
   wallet.includes("wallet-settings-drawer") &&
