@@ -169,6 +169,27 @@ button {
   padding: 6px 10px;
 }
 
+.wallet-nav-badge {
+  display: inline-grid;
+  place-items: center;
+  min-width: 16px;
+  height: 16px;
+  margin-left: 5px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  vertical-align: middle;
+}
+
+.wallet-nav-badge[hidden] {
+  display: none !important;
+}
+
 .wallet-icon-button {
   display: grid;
   place-items: center;
@@ -1076,6 +1097,15 @@ h3 {
   -webkit-backdrop-filter: blur(14px);
 }
 
+.wallet-drawer-backdrop {
+  opacity: 0;
+  transition: opacity 280ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.wallet-drawer-backdrop.is-open {
+  opacity: 1;
+}
+
 :root[data-el-theme="light"] .wallet-drawer-backdrop,
 :root[data-el-theme="light"] .wallet-modal-backdrop {
   background: rgba(20, 20, 18, 0.42);
@@ -1095,6 +1125,20 @@ h3 {
   background: var(--el-surface-raised, #16181d);
   box-shadow: -30px 0 80px rgba(0, 0, 0, 0.4);
   padding: 18px;
+  transform: translateX(104%);
+  transition: transform 320ms cubic-bezier(0.2, 0, 0, 1);
+  will-change: transform;
+}
+
+.wallet-drawer.is-open {
+  transform: translateX(0);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wallet-drawer-backdrop,
+  .wallet-drawer {
+    transition: none;
+  }
 }
 
 .wallet-settings-drawer {

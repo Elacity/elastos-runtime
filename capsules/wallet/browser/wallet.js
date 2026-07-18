@@ -1,10 +1,8 @@
 import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260719w";
-import {
-  createWalletApi,
+import { createWalletApi,
   readHomeOrigin,
   readLaunchToken,
-  readQueryParam,
-} from "./wallet-api.js?v=wallet-20260719w";
+  readQueryParam } from "./wallet-api.js?v=wallet-20260719w";
 import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260719w";
 import {
   BALANCE_NETWORKS,
@@ -242,9 +240,23 @@ function boot() {
   modalBackdropNode?.addEventListener("click", closeModal);
   document.addEventListener("click", onDocumentClick);
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
-      closeModal();
-      closeDrawers();
+    if (event.key !== "Escape") {
+      return;
+    }
+    const settingsDrawer = document.querySelector("#wallet-settings-drawer");
+    const activityDrawer = document.querySelector("#wallet-activity-drawer");
+    const hadOverlay = Boolean(
+      (modalNode && !modalNode.hidden)
+        || (settingsDrawer && !settingsDrawer.hidden)
+        || (activityDrawer && !activityDrawer.hidden)
+        || heroNode?.classList.contains("is-flipped")
+        || accountsSectionNode?.classList.contains("is-flipped"),
+    );
+    closeModal();
+    closeDrawers();
+    // Escape clears selection only when nothing was open — don't yank the
+    // hero account while dismissing Send/Receive or a drawer.
+    if (!hadOverlay) {
       clearAccountSelection();
     }
   });
@@ -430,7 +442,29 @@ function renderAll() {
   }
   renderMethods(allAccounts, currentApprovalMethods);
   renderActivity(currentRequests);
+  renderApprovalsBadge(pending.length);
   updateFlowButtons(allAccounts);
+}
+
+function renderApprovalsBadge(pendingCount) {
+  const badge = document.querySelector("#wallet-approvals-badge");
+  const button = document.querySelector("#wallet-activity-open");
+  if (!badge || !button) {
+    return;
+  }
+  const count = Math.max(0, Number(pendingCount) || 0);
+  if (count <= 0) {
+    badge.hidden = true;
+    badge.textContent = "";
+    button.setAttribute("aria-label", "Open approvals");
+    return;
+  }
+  badge.hidden = false;
+  badge.textContent = count > 9 ? "9+" : String(count);
+  button.setAttribute(
+    "aria-label",
+    count === 1 ? "Open approvals, 1 pending" : `Open approvals, ${count} pending`,
+  );
 }
 
 function buildViewAccounts() {

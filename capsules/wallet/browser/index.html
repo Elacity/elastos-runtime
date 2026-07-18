@@ -6,7 +6,7 @@
 <title>Wallet · ElastOS</title>
 <script src="./elastos-theme.js"></script>
 <link rel="stylesheet" href="./elastos-ui.css">
-<link rel="stylesheet" href="./style.css?v=wallet-20260719h">
+<link rel="stylesheet" href="./style.css?v=wallet-20260719j">
 </head>
 <body>
   <main class="wallet-shell" aria-label="Wallet">
@@ -17,7 +17,9 @@
         <nav class="wallet-hero-actions" aria-label="Wallet actions">
           <p id="wallet-status" class="wallet-status" hidden role="status" aria-live="polite"></p>
           <div class="wallet-hero-nav">
-            <button id="wallet-activity-open" class="wallet-nav-button" type="button" aria-label="Open approvals">↻ Approvals</button>
+            <button id="wallet-activity-open" class="wallet-nav-button" type="button" aria-label="Open approvals">
+              ↻ Approvals<span id="wallet-approvals-badge" class="wallet-nav-badge" hidden></span>
+            </button>
             <button id="wallet-settings-open" class="wallet-nav-button" type="button" aria-label="Open settings">✦ Settings</button>
             <button id="wallet-privacy" class="wallet-nav-button" type="button" aria-label="Hide balances" aria-pressed="false">Hide</button>
           </div>
@@ -140,6 +142,6 @@
     <div id="wallet-modal-backdrop" class="wallet-modal-backdrop" hidden></div>
     <section id="wallet-modal" class="wallet-modal" hidden aria-live="polite"></section>
   </main>
-  <script type="module" src="./wallet.js?v=wallet-20260719h"></script>
+  <script type="module" src="./wallet.js?v=wallet-20260719j"></script>
 </body>
 </html>
