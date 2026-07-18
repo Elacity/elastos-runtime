@@ -1,4 +1,4 @@
-import { textNode } from "./wallet-render.js?v=wallet-20260719j";
+import { textNode } from "./wallet-render.js?v=wallet-20260719w";
 
 export function createWalletFlows({
   modalNode,
@@ -9,7 +9,9 @@ export function createWalletFlows({
   accountsBackNode = null,
   showStatus,
 }) {
+  // Rail 3D flip ~420ms; window morph is hard-sequenced (out, then in).
   const FLIP_MS = 420;
+  const MORPH_FACE_MS = 200;
   let heroFlowActive = false;
   let accountsFlowActive = false;
   let heroResizeObserver = null;
@@ -17,6 +19,13 @@ export function createWalletFlows({
   let restoreFocusNode = null;
   let heroHeightReleaseTimer = 0;
   let accountsHeightReleaseTimer = 0;
+  let heroMorphTimer = 0;
+  let accountsMorphTimer = 0;
+
+  function useWindowMorph() {
+    return document.documentElement.dataset.walletPresentation !== "rail"
+      && !prefersReducedMotion();
+  }
 
   function openInfoModal(title, message) {
     openFlowModal(title, message, [], [modalButton("Done", closeModal)], { surface: "modal" });
@@ -32,7 +41,7 @@ export function createWalletFlows({
     return Boolean(
       accountsSectionNode
         && accountsBackNode
-        && /^(Create account|Import recovery key|Account|Rename account|Delete account|Passkey required|Recovery key)\b/i.test(
+        && /^(Create account|Import recovery key|Account|Rename account|Remove account|Delete account|Passkey required|Recovery key)\b/i.test(
           String(title || ""),
         ),
     );
@@ -58,7 +67,11 @@ export function createWalletFlows({
     }
     host.replaceChildren();
     const header = document.createElement("header");
-    header.className = "wallet-modal-header";
+    // Receive (and short account labels) put the name beside the title to
+    // reclaim the vertical stack under "Receive".
+    header.className = options.headerInline
+      ? "wallet-modal-header wallet-modal-header-inline"
+      : "wallet-modal-header";
     const heading = textNode("h2", title);
     heading.tabIndex = -1;
     header.append(heading, textNode("p", subtitle, "wallet-state"));
@@ -79,9 +92,7 @@ export function createWalletFlows({
       accountsBackNode.setAttribute("role", "dialog");
       accountsBackNode.setAttribute("aria-modal", "true");
       accountsBackNode.setAttribute("aria-label", title);
-      showAccountsBack();
-      queueAccountsFlipMeasure();
-      window.requestAnimationFrame(() => heading.focus({ preventScroll: true }));
+      showAccountsBack(() => heading.focus({ preventScroll: true }));
       return;
     }
     if (useHero) {
@@ -90,40 +101,82 @@ export function createWalletFlows({
       heroBackNode.setAttribute("role", "dialog");
       heroBackNode.setAttribute("aria-modal", "true");
       heroBackNode.setAttribute("aria-label", title);
-      showHeroBack();
-      queueHeroFlipMeasure();
-      window.requestAnimationFrame(() => heading.focus({ preventScroll: true }));
+      showHeroBack(() => heading.focus({ preventScroll: true }));
       return;
     }
     modalNode.hidden = false;
     modalBackdropNode.hidden = false;
   }
 
-  function showHeroBack() {
+  function showHeroBack(onReady = null) {
     if (!heroNode || !heroBackNode) {
       return;
     }
     captureRestoreFocus();
     window.clearTimeout(heroHeightReleaseTimer);
+    window.clearTimeout(heroMorphTimer);
     // Lock to front height first, then ease to back after the flip starts.
     lockFlipShellHeight(
       heroNode.querySelector(".wallet-hero-flip"),
       heroNode.querySelector(".wallet-hero-face-front"),
     );
     setHeroFrontInert(true);
+    const alreadyBack = heroNode.classList.contains("is-flipped");
     heroBackNode.hidden = false;
+    // Reflow at opacity 0 before revealing — avoids a flash when leaving [hidden].
+    void heroBackNode.offsetWidth;
     heroNode.dataset.face = "back";
-    heroNode.classList.add("is-flipped");
+    if (alreadyBack) {
+      heroNode.classList.add("is-flipped", "is-morph-back");
+      startHeroResizeObserver();
+      queueHeroFlipMeasure();
+      onReady?.();
+      return;
+    }
+    if (useWindowMorph()) {
+      heroNode.classList.remove("is-morph-back");
+      heroNode.classList.add("is-flipped");
+      heroMorphTimer = window.setTimeout(() => {
+        heroMorphTimer = 0;
+        heroNode.classList.add("is-morph-back");
+        startHeroResizeObserver();
+        queueHeroFlipMeasure();
+        onReady?.();
+      }, MORPH_FACE_MS);
+      return;
+    }
+    heroNode.classList.add("is-flipped", "is-morph-back");
     startHeroResizeObserver();
+    queueHeroFlipMeasure();
+    onReady?.();
   }
 
   function hideHeroBack() {
     if (!heroNode || !heroBackNode) {
       return;
     }
-    heroNode.dataset.face = "front";
-    heroNode.classList.remove("is-flipped");
+    window.clearTimeout(heroMorphTimer);
     stopHeroResizeObserver();
+    if (useWindowMorph() && heroNode.classList.contains("is-morph-back")) {
+      heroNode.classList.remove("is-morph-back");
+      heroNode.dataset.face = "front";
+      heroMorphTimer = window.setTimeout(() => {
+        heroMorphTimer = 0;
+        heroNode.classList.remove("is-flipped");
+        easeFlipShellToFront(
+          heroNode.querySelector(".wallet-hero-flip"),
+          heroNode.querySelector(".wallet-hero-face-front"),
+          (timer) => {
+            heroHeightReleaseTimer = timer;
+          },
+        );
+        setHeroFrontInert(false);
+        finishFlipUnmount(heroNode, heroBackNode, MORPH_FACE_MS);
+      }, MORPH_FACE_MS);
+      return;
+    }
+    heroNode.dataset.face = "front";
+    heroNode.classList.remove("is-flipped", "is-morph-back");
     easeFlipShellToFront(
       heroNode.querySelector(".wallet-hero-flip"),
       heroNode.querySelector(".wallet-hero-face-front"),
@@ -135,31 +188,77 @@ export function createWalletFlows({
     finishFlipUnmount(heroNode, heroBackNode);
   }
 
-  function showAccountsBack() {
+  function showAccountsBack(onReady = null) {
     if (!accountsSectionNode || !accountsBackNode) {
       return;
     }
     captureRestoreFocus();
     window.clearTimeout(accountsHeightReleaseTimer);
+    window.clearTimeout(accountsMorphTimer);
     lockFlipShellHeight(
       accountsSectionNode.querySelector(".wallet-accounts-flip"),
       accountsSectionNode.querySelector(".wallet-accounts-face-front"),
     );
     setAccountsFrontInert(true);
+    const alreadyBack = accountsSectionNode.classList.contains("is-flipped");
     accountsBackNode.hidden = false;
+    void accountsBackNode.offsetWidth;
     accountsSectionNode.dataset.face = "back";
-    accountsSectionNode.classList.add("is-flipped");
     accountsSectionNode.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    if (alreadyBack) {
+      // Create → chain step: stay on the back face, no re-overlap with cards.
+      accountsSectionNode.classList.add("is-flipped", "is-morph-back");
+      startAccountsResizeObserver();
+      queueAccountsFlipMeasure();
+      onReady?.();
+      return;
+    }
+    if (useWindowMorph()) {
+      // Phase 1: account cards fade out; back stays at opacity 0.
+      accountsSectionNode.classList.remove("is-morph-back");
+      accountsSectionNode.classList.add("is-flipped");
+      accountsMorphTimer = window.setTimeout(() => {
+        accountsMorphTimer = 0;
+        // Phase 2: only now fade Create/Import (or menu) in.
+        accountsSectionNode.classList.add("is-morph-back");
+        startAccountsResizeObserver();
+        queueAccountsFlipMeasure();
+        onReady?.();
+      }, MORPH_FACE_MS);
+      return;
+    }
+    accountsSectionNode.classList.add("is-flipped", "is-morph-back");
     startAccountsResizeObserver();
+    queueAccountsFlipMeasure();
+    onReady?.();
   }
 
   function hideAccountsBack() {
     if (!accountsSectionNode || !accountsBackNode) {
       return;
     }
-    accountsSectionNode.dataset.face = "front";
-    accountsSectionNode.classList.remove("is-flipped");
+    window.clearTimeout(accountsMorphTimer);
     stopAccountsResizeObserver();
+    if (useWindowMorph() && accountsSectionNode.classList.contains("is-morph-back")) {
+      accountsSectionNode.classList.remove("is-morph-back");
+      accountsSectionNode.dataset.face = "front";
+      accountsMorphTimer = window.setTimeout(() => {
+        accountsMorphTimer = 0;
+        accountsSectionNode.classList.remove("is-flipped");
+        easeFlipShellToFront(
+          accountsSectionNode.querySelector(".wallet-accounts-flip"),
+          accountsSectionNode.querySelector(".wallet-accounts-face-front"),
+          (timer) => {
+            accountsHeightReleaseTimer = timer;
+          },
+        );
+        setAccountsFrontInert(false);
+        finishFlipUnmount(accountsSectionNode, accountsBackNode, MORPH_FACE_MS);
+      }, MORPH_FACE_MS);
+      return;
+    }
+    accountsSectionNode.dataset.face = "front";
+    accountsSectionNode.classList.remove("is-flipped", "is-morph-back");
     easeFlipShellToFront(
       accountsSectionNode.querySelector(".wallet-accounts-flip"),
       accountsSectionNode.querySelector(".wallet-accounts-face-front"),
@@ -207,7 +306,7 @@ export function createWalletFlows({
     }
   }
 
-  function finishFlipUnmount(sectionNode, backNode) {
+  function finishFlipUnmount(sectionNode, backNode, delayMs = FLIP_MS) {
     const focusTarget = restoreFocusNode;
     restoreFocusNode = null;
     const finish = () => {
@@ -218,12 +317,13 @@ export function createWalletFlows({
         backNode.removeAttribute("aria-modal");
         backNode.removeAttribute("aria-label");
         backNode.replaceChildren();
+        sectionNode.classList.remove("is-morph-back");
       }
       if (focusTarget?.isConnected) {
         focusTarget.focus({ preventScroll: true });
       }
     };
-    window.setTimeout(finish, prefersReducedMotion() ? 0 : FLIP_MS);
+    window.setTimeout(finish, prefersReducedMotion() ? 0 : delayMs);
   }
 
   function setHeroFrontInert(inert) {

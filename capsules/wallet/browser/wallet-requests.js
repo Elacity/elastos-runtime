@@ -1,4 +1,4 @@
-import { pendingRequests } from "./wallet-activity.js?v=wallet-20260719j";
+import { pendingRequests } from "./wallet-activity.js?v=wallet-20260719w";
 import {
   isBitcoinProofRequest,
   isManagedRequest,
@@ -6,8 +6,8 @@ import {
   requestTiming,
   requestTitle,
   shortAddress,
-} from "./wallet-format.js?v=wallet-20260719j";
-import { actionButton, setBusy, textNode } from "./wallet-render.js?v=wallet-20260719j";
+} from "./wallet-format.js?v=wallet-20260719w";
+import { actionButton, setBusy, textNode } from "./wallet-render.js?v=wallet-20260719w";
 
 export function createWalletRequests({
   fetchJson,
@@ -79,7 +79,16 @@ export function createWalletRequests({
   }
 
   function openPendingReview() {
-    requestsNode?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    if (!requestsNode || requestsNode.hidden) {
+      return;
+    }
+    requestsNode.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    const focusTarget =
+      requestsNode.querySelector(".wallet-request-focused button, .wallet-request-focused")
+      || requestsNode.querySelector(".wallet-request button, .wallet-request");
+    if (focusTarget && typeof focusTarget.focus === "function") {
+      window.requestAnimationFrame(() => focusTarget.focus({ preventScroll: true }));
+    }
   }
 
   async function onRequestClick(event) {

@@ -13,9 +13,9 @@ import {
   mountGlyph,
   targetById,
   desktopObjectByEntryId,
-} from "./shell-core.js?v=home-20260718d";
-import { openFileObject } from "./shell-surface.js?v=home-20260718d";
-import { openTarget } from "./shell-windows.js?v=home-20260718d";
+} from "./shell-core.js?v=home-20260718m";
+import { openFileObject } from "./shell-surface.js?v=home-20260718m";
+import { openTarget } from "./shell-windows.js?v=home-20260718m";
 
 /* Bound by bindQuickLook() once the lazy GUI template is in the DOM. */
 let panel = null;

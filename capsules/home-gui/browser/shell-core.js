@@ -62,9 +62,9 @@ export const WINDOW_TOP_INSET = 8;
 export const WINDOW_BOTTOM_INSET = 72;
 export const CONTEXT_MENU_IGNORE_OUTSIDE_MS = 220;
 const HOME_GUI_TEMPLATE_ID = "home-gui-template";
-const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260718d", import.meta.url).href;
+const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260718m", import.meta.url).href;
 const HOME_GUI_STYLESHEET_ID = "home-gui-stylesheet";
-const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260718d", import.meta.url).href;
+const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260718m", import.meta.url).href;
 let homeGuiTemplateHtmlPromise = null;
 
 export const shellState = {

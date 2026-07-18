@@ -36,8 +36,8 @@ const SESSION_REFRESH_MS = 10 * 60 * 1000;
 const ACTIVE_SHELL_HINT_KEY = "elastos.home.active-shell-hint";
 const HOME_CLI_SHELL_ID = "home-cli";
 const HOME_GUI_MODULE_URL = import.meta.url.startsWith("file:")
-  ? new URL("../../home-gui/browser/home-gui.js?v=home-20260717b", import.meta.url).href
-  : new URL("../home-gui/home-gui.js?v=home-20260717b", import.meta.url).href;
+  ? new URL("../../home-gui/browser/home-gui.js?v=home-20260718m", import.meta.url).href
+  : new URL("../home-gui/home-gui.js?v=home-20260718m", import.meta.url).href;
 const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   "archive-manager": new Set(["library"]),
   browser: new Set(["library"]),

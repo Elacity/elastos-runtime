@@ -7871,7 +7871,7 @@ assert(
   "Wallet must provide balances and built-in Bitcoin accounts without manual Bitcoin proof linking",
 );
 assert(
-  wallet.includes("wallet-20260719j") &&
+  wallet.includes("wallet-20260719w") &&
     wallet.includes('id="wallet-send"') &&
     wallet.includes('id="wallet-receive"') &&
     wallet.includes("data-wallet-create-account") &&
@@ -7927,21 +7927,29 @@ assert(
     walletStyle.includes(".wallet-hero-scene") &&
     walletStyle.includes(".wallet-hero-nav") &&
     walletStyle.includes(".wallet-hero-pending") &&
-    wallet.includes("Recent approvals") &&
+    wallet.includes("Recent activity") &&
+    wallet.includes("M19.4 15a1.65") &&
+    !wallet.includes("✦ Settings") &&
+    !wallet.includes("↻ Activity") &&
     !wallet.includes("wallet-topbar") &&
     !wallet.includes("wallet-sidebar") &&
     !wallet.includes('id="wallet-pending-ribbon"') &&
     !wallet.includes('id="wallet-requests-panel"') &&
     walletJs.includes("renderRequests(pending, reviewWalletRequestId)") &&
     walletJs.includes('querySelector("#wallet-hero-pending")') &&
+    walletJs.includes("openActivityChrome") &&
+    walletJs.includes("openPendingReview") &&
     !walletJs.includes("renderPendingRibbon") &&
-    !walletJs.includes("Review 1 pending request"),
-  "Wallet must keep Approvals/Privacy/Settings as static hero chrome, put pending approve/reject under Send/Receive, keep Approvals drawer as history, and avoid separate header/sidebar chrome",
+    !walletJs.includes("Review 1 pending request") &&
+    read("capsules/wallet/browser/wallet-activity.js").includes("No activity yet.") &&
+    wallet.includes('aria-label="Activity"') &&
+    walletJs.includes('aria-label", "Activity"'),
+  "Wallet must keep Activity/Privacy/Settings as static hero chrome with the same outline marks as the rail, put pending under Send/Receive, keep Activity drawer as history, and avoid separate header/sidebar chrome",
 );
 assert(
   walletStyle.includes("scrollbar-width: none") &&
     walletStyle.includes("html::-webkit-scrollbar"),
-  "Wallet viewport must hide the classic scrollbar gutter so Send/Receive overflow does not shift Approvals/Settings",
+  "Wallet viewport must hide the classic scrollbar gutter so Send/Receive overflow does not shift Activity/Settings",
 );
 assert(
   walletStyle.includes(".wallet-drawer.is-open") &&
@@ -7950,7 +7958,47 @@ assert(
     walletJs.includes("void next.offsetWidth") &&
     wallet.includes('id="wallet-approvals-badge"') &&
     walletJs.includes("renderApprovalsBadge"),
-  "Wallet Approvals/Settings drawers must slide open with backdrop fade, and Approvals nav must badge pending count",
+  "Wallet Activity/Settings drawers must slide open with backdrop fade, and Activity nav must badge pending count",
+);
+assert(
+  read("capsules/home-gui/browser/home-gui-template.html").includes('id="wallet-rail-approvals"') &&
+    read("capsules/home-gui/browser/home-gui-template.html").includes('id="wallet-rail-settings"') &&
+    read("capsules/home-gui/browser/home-gui-template.html").includes('id="wallet-rail-privacy"') &&
+    read("capsules/home-gui/browser/home-gui-template.html").includes('aria-label="Open as a window"') &&
+    read("capsules/home-gui/browser/home-gui-template.html").includes(
+      'id="connector-sheet-close"',
+    ) &&
+    read("capsules/home-gui/browser/home-gui-template.html").includes(
+      'class="wallet-rail-head-btn wallet-rail-icon-btn wallet-rail-close"',
+    ) &&
+    read("capsules/home-gui/browser/shell-wallet-rail.js").includes(
+      'searchParams.set("presentation", "rail")',
+    ) &&
+    read("capsules/home-gui/browser/shell-wallet-rail.js").includes(
+      "elastos:wallet-chrome-command",
+    ) &&
+    read("capsules/home-gui/browser/shell-wallet-rail.js").includes("close-overlays") &&
+    read("capsules/home-gui/browser/shell-wallet-rail.js").includes("queuedChromeCommand") &&
+    read("capsules/home-gui/browser/shell-wallet-rail.js").includes("EYE_HIDDEN_SVG") &&
+    read("capsules/home-gui/browser/shell-wallet-rail.js").includes("bindEdgeReveal") &&
+    read("capsules/home-gui/browser/shell-wallet-rail.js").includes("fromEdgeHover") &&
+    read("capsules/home-gui/browser/shell-wallet-rail.js").includes("EDGE_REVEAL_PX") &&
+    walletJs.includes("onWalletChromeCommand") &&
+    walletJs.includes('case "close-overlays"') &&
+    walletJs.includes('dataset.walletPresentation = presentation') &&
+    read("capsules/home-gui/browser/shell-wallet-rail.js").includes(
+      "walletRailSessionMounted",
+    ) &&
+    read("capsules/home-gui/browser/shell-wallet-rail.js").includes("preloadWalletRail") &&
+    read("capsules/home-gui/browser/shell-wallet-rail.js").includes("postWalletSoftRefresh") &&
+    read("capsules/home-gui/browser/shell-wallet-rail.js").includes(
+      "event.source !== frame.contentWindow",
+    ) &&
+    read("capsules/home-gui/browser/shell-wallet-rail.js").includes("graceLeft") &&
+    read("capsules/home-gui/browser/home-gui.js").includes(
+      "walletRailSessionMounted()",
+    ),
+  "Wallet rail head must own Activity/Settings/privacy icon chrome and command the capsule without adding authority",
 );
 assert(
   wallet.includes("wallet-settings-drawer") &&
@@ -8103,9 +8151,16 @@ assert(
     wallet.includes("wallet-accounts-back") &&
     wallet.includes("wallet-accounts-section") &&
     walletStyle.includes(".wallet-hero-flip") &&
-    walletStyle.includes(".wallet-hero.is-flipped") &&
+    walletStyle.includes('.wallet-hero.is-flipped') &&
     walletStyle.includes(".wallet-accounts-flip") &&
     walletStyle.includes(".wallet-accounts-section.is-flipped") &&
+    walletStyle.includes('data-wallet-presentation="rail"') &&
+    walletStyle.includes("rotateY(180deg)") &&
+    walletJs.includes('dataset.walletPresentation = presentation') &&
+    walletJs.includes('readQueryParam("presentation")') &&
+    walletJs.includes("useWindowMorph") &&
+    walletJs.includes("is-morph-back") &&
+    walletStyle.includes("is-morph-back") &&
     walletStyle.includes(".wallet-hero-address-pill") &&
     !walletStyle.includes(".wallet-detail-chip") &&
     walletStyle.includes(

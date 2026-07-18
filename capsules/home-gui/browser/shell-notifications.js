@@ -6,8 +6,8 @@
  * drive the inbox badge.
  */
 
-import { clockNode } from "./shell-core.js?v=home-20260718d";
-import { openTarget } from "./shell-windows.js?v=home-20260718d";
+import { clockNode } from "./shell-core.js?v=home-20260718m";
+import { openTarget } from "./shell-windows.js?v=home-20260718m";
 
 const STORE_KEY = "elastos.home.notifications";
 const MAX_ENTRIES = 50;

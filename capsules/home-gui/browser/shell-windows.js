@@ -23,7 +23,7 @@ import {
   targetById,
   toolbarActiveTitleNode,
   taskbarTargets,
-} from "./shell-core.js?v=home-20260718d";
+} from "./shell-core.js?v=home-20260718m";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -34,8 +34,8 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260718d";
-import { playUiSound } from "./shell-sounds.js?v=home-20260718d";
+} from "./shell-window-geometry.js?v=home-20260718m";
+import { playUiSound } from "./shell-sounds.js?v=home-20260718m";
 
 let windowHooks = null;
 const PEOPLE_DISCOVERY_AUTO_REFRESH_INITIAL_MS = 1_500;

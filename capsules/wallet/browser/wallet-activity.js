@@ -1,4 +1,4 @@
-import { readText, relativeTime, requestTitle, shortAddress } from "./wallet-format.js?v=wallet-20260719j";
+import { readText, relativeTime, requestTitle, shortAddress } from "./wallet-format.js?v=wallet-20260719w";
 
 export function createWalletActivity({
   activityNode,
@@ -12,7 +12,7 @@ export function createWalletActivity({
       .sort((a, b) => activityTime(b) - activityTime(a))
       .slice(0, 12);
     if (history.length === 0) {
-      activityNode.append(textNode("p", "No approvals yet.", "wallet-state"));
+      activityNode.append(textNode("p", "No activity yet.", "wallet-state"));
       return;
     }
     for (const request of history) {
