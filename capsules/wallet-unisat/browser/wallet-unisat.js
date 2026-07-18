@@ -8,6 +8,7 @@ const accountsNode = document.querySelector("#wallet-accounts");
 const requestsNode = document.querySelector("#wallet-requests");
 const frameHomeToken = readLaunchToken();
 const homeOrigin = readQueryParam("home_origin");
+const ceremonyMode = readQueryParam("presentation") === "sheet";
 
 if (frameHomeToken && homeOrigin && window.top !== window) {
   window.top.postMessage({ type: "home:app-ready", homeToken: frameHomeToken }, homeOrigin);
@@ -16,6 +17,7 @@ if (frameHomeToken && homeOrigin && window.top !== window) {
 boot();
 
 function boot() {
+  applyCeremonyMode();
   if (connectButton) {
     connectButton.addEventListener("click", onConnect);
   }
@@ -29,8 +31,26 @@ function boot() {
     requestsNode.addEventListener("click", onRequestClick);
   }
   setState("0 linked");
-  refreshWalletState().catch((error) => {
-    showStatus(String(error.message || error), "error");
+  if (!ceremonyMode) {
+    refreshWalletState().catch((error) => {
+      showStatus(String(error.message || error), "error");
+    });
+  }
+}
+
+function applyCeremonyMode() {
+  if (!ceremonyMode) {
+    return;
+  }
+  document.body.dataset.presentation = "sheet";
+  const eyebrow = document.querySelector(".eyebrow");
+  if (eyebrow) {
+    eyebrow.textContent = "Continue with UniSat";
+  }
+  document.querySelectorAll(".wallet-panel").forEach((panel, index) => {
+    if (index > 0) {
+      panel.hidden = true;
+    }
   });
 }
 
@@ -62,7 +82,7 @@ async function onConnect() {
         public_key: proof.publicKey,
       }),
     });
-    showStatus("Approval method added.", "success");
+    showStatus(ceremonyMode ? "Connected. Returning to Wallet…" : "Approval method added.", "success");
     notifyHomeSummaryChanged();
     await refreshWalletState();
   } catch (error) {

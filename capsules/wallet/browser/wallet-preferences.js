@@ -220,10 +220,13 @@ export function createWalletPreferences({
       return;
     }
     closeDrawers();
+    // Ask Home for the in-rail ceremony sheet — not a second desktop window.
+    // Opaque capsule frames post to window.top (the Home host).
     window.top.postMessage({
       type: "home:open-target",
       target,
       homeToken: activeHomeToken,
+      query: { presentation: "sheet" },
     }, homeParentOrigin);
   }
 

@@ -5,6 +5,7 @@ const accountsNode = document.querySelector("#wallet-accounts");
 const requestsNode = document.querySelector("#wallet-requests");
 const frameHomeToken = readLaunchToken();
 const homeOrigin = readQueryParam("home_origin");
+const ceremonyMode = readQueryParam("presentation") === "sheet";
 const discoveredWalletProviders = [];
 // Skip the background poll while the user is mid-connect/mid-sign so we never tear down an
 // in-flight approval's button state, and a re-entrancy guard so polls can't overlap.
@@ -21,6 +22,7 @@ if (frameHomeToken && homeOrigin && window.top !== window) {
 boot();
 
 function boot() {
+  applyCeremonyMode();
   configureMetaMaskDiscovery();
   if (connectButton) {
     connectButton.addEventListener("click", onConnect);
@@ -32,10 +34,35 @@ function boot() {
     requestsNode.addEventListener("click", onRequestClick);
   }
   setState("0 linked");
-  refreshWalletState().catch((error) => {
-    showStatus(String(error.message || error), "error");
+  if (!ceremonyMode) {
+    refreshWalletState().catch((error) => {
+      showStatus(String(error.message || error), "error");
+    });
+    startApprovalAutoRefresh();
+  }
+}
+
+/* Sheet presentation: this capsule is only the EIP-1193 ceremony. Connected
+   accounts and approval requests live on the main Wallet surface — hide the
+   duplicate chrome so the user is not managing a second product. */
+function applyCeremonyMode() {
+  if (!ceremonyMode) {
+    return;
+  }
+  document.documentElement.dataset.presentation = "sheet";
+  document.body.dataset.presentation = "sheet";
+  const eyebrow = document.querySelector(".eyebrow");
+  if (eyebrow) {
+    eyebrow.textContent = "Continue with MetaMask";
+  }
+  if (connectButton) {
+    connectButton.textContent = "Connect MetaMask";
+  }
+  document.querySelectorAll(".wallet-panel").forEach((panel, index) => {
+    if (index > 0) {
+      panel.hidden = true;
+    }
   });
-  startApprovalAutoRefresh();
 }
 
 // Poll for newly-queued approvals so a mint/trade tx enqueued elsewhere appears here on its
@@ -123,9 +150,11 @@ async function onConnect() {
       headers: shellHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ message: challenge.message, signature }),
     });
-    showStatus("Approval method added.", "success");
+    showStatus("Connected. Returning to Wallet…", "success");
     notifyHomeSummaryChanged();
-    await refreshWalletState();
+    if (!ceremonyMode) {
+      await refreshWalletState();
+    }
   } catch (error) {
     showStatus(String(error.message || error), "error");
   } finally {

@@ -207,6 +207,31 @@
   </div>
 </aside>
 
+<aside
+  id="connector-sheet"
+  class="connector-sheet"
+  role="dialog"
+  aria-modal="true"
+  aria-labelledby="connector-sheet-title"
+  tabindex="-1"
+  aria-hidden="true"
+  inert
+  hidden
+>
+  <div class="connector-sheet-head">
+    <h2 id="connector-sheet-title" class="connector-sheet-title">Connect wallet</h2>
+    <button
+      id="connector-sheet-close"
+      class="wallet-rail-head-btn wallet-rail-close"
+      type="button"
+      aria-label="Close connector"
+    >
+      <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
+    </button>
+  </div>
+  <iframe id="connector-sheet-frame" class="connector-sheet-frame" title="Wallet connector" hidden></iframe>
+</aside>
+
 <main class="desktop-workspace" data-home-gui-hidden-by-host="hidden" inert hidden>
   <section id="desktop" class="desktop">
     <section

@@ -746,6 +746,9 @@ window.addEventListener("message", (event) => {
   }
   if (data.type === "home:refresh-summary") {
     requestShellSummaryRefresh({ reason: "child-message" });
+    // Successful connector link — close the in-rail ceremony sheet so the
+    // user lands back on Wallet (projection only; refresh already ran).
+    homeGuiModule?.noteHomeGuiConnectorSheetSummaryRefresh?.(event.source);
     return;
   }
   if (data.type === "home:menu-manifest") {
