@@ -35,6 +35,8 @@ function boot() {
     refreshWalletState().catch((error) => {
       showStatus(String(error.message || error), "error");
     });
+  } else {
+    queueCeremonyAutostart();
   }
 }
 
@@ -47,6 +49,9 @@ function applyCeremonyMode() {
   if (eyebrow) {
     eyebrow.textContent = "Continue with UniSat";
   }
+  if (connectButton) {
+    connectButton.textContent = "Continue in UniSat";
+  }
   document.querySelectorAll(".wallet-panel").forEach((panel, index) => {
     if (index > 0) {
       panel.hidden = true;
@@ -54,10 +59,27 @@ function applyCeremonyMode() {
   });
 }
 
+function queueCeremonyAutostart() {
+  if (!connectButton) {
+    return;
+  }
+  showStatus("Opening UniSat…", "muted");
+  window.requestAnimationFrame(() => {
+    onConnect().catch(() => {});
+  });
+}
+
+function markCeremonyRetry() {
+  if (ceremonyMode && connectButton) {
+    connectButton.textContent = "Try again";
+  }
+}
+
 async function onConnect() {
   const provider = unisatProvider();
   if (!provider) {
     handleMissingProvider();
+    markCeremonyRetry();
     return;
   }
   setButtonBusy(connectButton, true);
@@ -87,6 +109,7 @@ async function onConnect() {
     await refreshWalletState();
   } catch (error) {
     showStatus(String(error.message || error), "error");
+    markCeremonyRetry();
   } finally {
     setButtonBusy(connectButton, false);
   }

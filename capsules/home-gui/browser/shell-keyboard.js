@@ -3,26 +3,26 @@ import {
   mountGlyph,
   trapTabWithin,
   launcher,
-} from "./shell-core.js?v=home-20260718n";
+} from "./shell-core.js?v=home-20260718p";
 import {
   moveDesktopSelection,
-} from "./shell-surface.js?v=home-20260718n";
-import { toggleSpotlight } from "./shell-spotlight.js?v=home-20260718n";
+} from "./shell-surface.js?v=home-20260718p";
+import { toggleSpotlight } from "./shell-spotlight.js?v=home-20260718p";
 import {
   focusWindow,
   closeWindow,
   sortWindowEntriesByZOrder,
-} from "./shell-windows.js?v=home-20260718n";
+} from "./shell-windows.js?v=home-20260718p";
 import {
   closeExpose,
   isExposeOpen,
   toggleExpose,
-} from "./shell-expose.js?v=home-20260718n";
+} from "./shell-expose.js?v=home-20260718p";
 import {
   hideQuickLook,
   isQuickLookOpen,
   toggleQuickLook,
-} from "./shell-quicklook.js?v=home-20260718n";
+} from "./shell-quicklook.js?v=home-20260718p";
 
 /* Shell keyboard layer.
  *

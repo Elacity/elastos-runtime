@@ -128,6 +128,14 @@ function createFakeProvider() {
         case "eth_accounts":
         case "eth_requestAccounts":
           return [ADDRESS];
+        case "wallet_requestPermissions":
+          // Connect path re-prompts eth_accounts permissions so a second
+          // MetaMask account can be granted; approval smokes don't call it,
+          // but the mock must not fail-closed on the method.
+          return [{ parentCapability: "eth_accounts" }];
+        case "wallet_revokePermissions":
+          // Connect clears the sticky origin grant before re-prompting.
+          return null;
         case "personal_sign":
           return "0xsigned";
         case "eth_sendTransaction":
@@ -229,6 +237,10 @@ async function runConnectorSmoke({ connectorId, scriptPath, installProvider }) {
     },
     addEventListener() {},
     dispatchEvent() {},
+    setInterval() {
+      return 0;
+    },
+    clearInterval() {},
   };
   globalThis.window.window = globalThis.window;
   installProvider(globalThis.window, provider);

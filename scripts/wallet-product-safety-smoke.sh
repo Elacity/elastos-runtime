@@ -64,6 +64,13 @@ assert(
     walletPreferences.includes("[data-wallet-remove-account]"),
   "Wallet approval methods must expose connector-owned add/open actions and Wallet-owned remove actions",
 );
+const metamaskConnector = read("capsules/wallet-metamask/browser/wallet-metamask.js");
+assert(
+  metamaskConnector.includes('method: "wallet_revokePermissions"') &&
+    metamaskConnector.includes('method: "wallet_requestPermissions"') &&
+    metamaskConnector.includes("eth_accounts"),
+  "MetaMask connect must revoke then re-prompt eth_accounts permissions so a second account can be linked",
+);
 
 console.log("[wallet-product-safety-smoke] static UI/connector invariants OK");
 NODE

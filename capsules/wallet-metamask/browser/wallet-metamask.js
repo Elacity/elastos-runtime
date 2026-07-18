@@ -39,6 +39,10 @@ function boot() {
       showStatus(String(error.message || error), "error");
     });
     startApprovalAutoRefresh();
+  } else {
+    // Wallet Connect / Add account already clicked — start MetaMask immediately.
+    // Button stays as "Try again" if discovery fails or the user cancels.
+    queueCeremonyAutostart();
   }
 }
 
@@ -56,7 +60,7 @@ function applyCeremonyMode() {
     eyebrow.textContent = "Continue with MetaMask";
   }
   if (connectButton) {
-    connectButton.textContent = "Connect MetaMask";
+    connectButton.textContent = "Continue in MetaMask";
   }
   document.querySelectorAll(".wallet-panel").forEach((panel, index) => {
     if (index > 0) {
@@ -65,10 +69,29 @@ function applyCeremonyMode() {
   });
 }
 
+function queueCeremonyAutostart() {
+  if (!connectButton) {
+    return;
+  }
+  showStatus("Opening MetaMask…", "muted");
+  window.requestAnimationFrame(() => {
+    onConnect().catch(() => {});
+  });
+}
+
+function markCeremonyRetry() {
+  if (ceremonyMode && connectButton) {
+    connectButton.textContent = "Try again";
+  }
+}
+
 // Poll for newly-queued approvals so a mint/trade tx enqueued elsewhere appears here on its
 // own. Quiet by design: only when the tab is visible, we have a launch token, and the user
 // isn't mid-interaction; errors are swallowed (the next tick retries).
 function startApprovalAutoRefresh() {
+  if (typeof window?.setInterval !== "function") {
+    return;
+  }
   window.setInterval(() => {
     if (!frameHomeToken || interactionBusy || refreshInFlight) {
       return;
@@ -127,13 +150,15 @@ async function onConnect() {
       "MetaMask not found. If another wallet (e.g. Phantom) is set as your default Ethereum wallet, MetaMask may not announce — disable that wallet's Ethereum default, or unlock MetaMask, and retry.",
       "error",
     );
+    markCeremonyRetry();
     return;
   }
   setButtonBusy(connectButton, true);
   interactionBusy = true;
-  showStatus("Approve in your wallet.", "muted");
+  showStatus("In MetaMask, pick the account you want to link, then approve.", "muted");
   try {
     const { address, chainId } = await connectProvider(provider);
+    showStatus("Approve the signature in MetaMask.", "muted");
     const challenge = await fetchJson("/api/auth/evm/challenge", {
       method: "POST",
       headers: shellHeaders({ "content-type": "application/json" }),
@@ -157,6 +182,7 @@ async function onConnect() {
     }
   } catch (error) {
     showStatus(String(error.message || error), "error");
+    markCeremonyRetry();
   } finally {
     setButtonBusy(connectButton, false);
     interactionBusy = false;
@@ -164,11 +190,19 @@ async function onConnect() {
 }
 
 async function connectProvider(provider) {
+  // MetaMask site permissions are sticky per origin. After Account A is
+  // connected, wallet_requestPermissions often only lists A (with an "Edit
+  // accounts" affordance) even when the MetaMask chrome is on Account B.
+  // Revoke eth_accounts for this origin first so the next permission prompt
+  // is a fresh picker — same as a first-time connect. This does NOT remove
+  // already-linked ElastOS wallet accounts; only the browser↔MetaMask grant.
+  await refreshAccountPermissionPrompt(provider);
   const accounts = await provider.request({ method: "eth_requestAccounts" });
-  const address = Array.isArray(accounts) && accounts[0] ? String(accounts[0]) : "";
+  const address = preferredConnectAddress(provider, accounts);
   if (!address) {
     throw new Error("Wallet returned no account.");
   }
+  assertGrantedMatchesChromeSelection(provider, address);
   const chainHex = await provider.request({ method: "eth_chainId" });
   const chainId = Number.parseInt(String(chainHex), 16);
   if (!Number.isFinite(chainId) || chainId <= 0) {
@@ -177,9 +211,113 @@ async function connectProvider(provider) {
   return { address, chainId };
 }
 
+async function refreshAccountPermissionPrompt(provider) {
+  await revokeAccountPermissions(provider);
+  await requestAccountPermissions(provider);
+}
+
+async function revokeAccountPermissions(provider) {
+  try {
+    await provider.request({
+      method: "wallet_revokePermissions",
+      params: [{ eth_accounts: {} }],
+    });
+  } catch (error) {
+    if (isUserRejectedProviderError(error)) {
+      throw error instanceof Error ? error : new Error(String(error.message || error));
+    }
+    // Unsupported revoke: still try requestPermissions below.
+  }
+}
+
+async function requestAccountPermissions(provider) {
+  try {
+    await provider.request({
+      method: "wallet_requestPermissions",
+      params: [{ eth_accounts: {} }],
+    });
+  } catch (error) {
+    if (isUserRejectedProviderError(error)) {
+      throw error instanceof Error ? error : new Error(String(error.message || error));
+    }
+    // Unsupported / unavailable method: fall through to eth_requestAccounts.
+    if (isUnsupportedProviderMethodError(error)) {
+      return;
+    }
+    // Other provider quirks — still attempt eth_requestAccounts rather than
+    // blocking the whole connect path.
+  }
+}
+
+function preferredConnectAddress(provider, accounts) {
+  const list = Array.isArray(accounts)
+    ? accounts.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+  if (list.length === 0) {
+    return "";
+  }
+  // Prefer the chrome-selected account when MetaMask exposes it and it is in
+  // the granted set (covers providers that keep a stale accounts[0] order).
+  const selected = readText(provider?.selectedAddress);
+  if (selected) {
+    const match = list.find((item) => normalizeAddress(item) === normalizeAddress(selected));
+    if (match) {
+      return match;
+    }
+  }
+  return list[0];
+}
+
+function assertGrantedMatchesChromeSelection(provider, grantedAddress) {
+  const selected = readText(provider?.selectedAddress);
+  if (!selected || !grantedAddress) {
+    return;
+  }
+  if (normalizeAddress(selected) === normalizeAddress(grantedAddress)) {
+    return;
+  }
+  throw new Error(
+    "MetaMask is on a different account than the one granted to this site. "
+      + "In the MetaMask connect dialog, use Edit accounts, select the account "
+      + "you are on, then Connect again.",
+  );
+}
+
+function isUserRejectedProviderError(error) {
+  const code = providerErrorCode(error);
+  if (code === 4001) {
+    return true;
+  }
+  const message = String(error?.message || error || "").toLowerCase();
+  return message.includes("user rejected") || message.includes("user denied") || message.includes("rejected the request");
+}
+
+function isUnsupportedProviderMethodError(error) {
+  const code = providerErrorCode(error);
+  if (code === 4200 || code === -32601) {
+    return true;
+  }
+  const message = String(error?.message || error || "").toLowerCase();
+  return (
+    message.includes("method not found")
+    || message.includes("does not exist")
+    || message.includes("not supported")
+    || message.includes("unsupported method")
+  );
+}
+
+function providerErrorCode(error) {
+  const direct = error && error.code;
+  if (typeof direct === "number") {
+    return direct;
+  }
+  const nested = error && error.error && error.error.code;
+  return typeof nested === "number" ? nested : null;
+}
+
 async function currentProviderAddress(provider) {
   const accounts = await provider.request({ method: "eth_accounts" });
-  const address = Array.isArray(accounts) && accounts[0] ? String(accounts[0]) : "";
+  const address = preferredConnectAddress(provider, accounts);
   if (!address) {
     throw new Error("Wallet has no selected account.");
   }

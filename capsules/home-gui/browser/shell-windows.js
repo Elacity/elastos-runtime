@@ -19,7 +19,7 @@ import {
   clearShellSessionState,
   ignoreRepeatedAction,
   targetById,
-} from "./shell-core.js?v=home-20260718n";
+} from "./shell-core.js?v=home-20260718p";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -30,7 +30,7 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260718n";
+} from "./shell-window-geometry.js?v=home-20260718p";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -659,6 +659,9 @@ function launchActionKey(targetId, query) {
 }
 
 export function openTarget(targetId, options = {}) {
+  if (targetId === "wallet") {
+    windowHooks?.retireWalletRailBeforeWindow?.();
+  }
   if (SINGLE_SESSION_TARGETS.has(targetId) && browserWindowCount(targetId) > 0) {
     activateTargetGroup(targetId);
     return;

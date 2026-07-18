@@ -47,7 +47,7 @@ import {
   desktopObjectByEntryId,
   desktopEntryExists,
   trapTabWithin,
-} from "./shell-core.js?v=home-20260718n";
+} from "./shell-core.js?v=home-20260718p";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -61,9 +61,9 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260718n";
-import { playUiSound } from "./shell-sounds.js?v=home-20260718n";
-import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260718n";
+} from "./shell-windows.js?v=home-20260718p";
+import { playUiSound } from "./shell-sounds.js?v=home-20260718p";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260718p";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;

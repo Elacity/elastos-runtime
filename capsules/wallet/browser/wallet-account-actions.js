@@ -4,8 +4,10 @@ import {
   isPasskeyManagedAccount,
   readText,
   shortAddress,
-} from "./wallet-format.js?v=wallet-20260718b";
-import { pulseCopied, setBusy, textNode } from "./wallet-render.js?v=wallet-20260718b";
+} from "./wallet-format.js?v=wallet-20260719h";
+import { pulseCopied, setBusy, textNode } from "./wallet-render.js?v=wallet-20260719h";
+
+const accountsSurface = { surface: "accounts" };
 
 export function createWalletAccountActions({
   buildViewAccounts,
@@ -13,11 +15,11 @@ export function createWalletAccountActions({
   closeModal,
   copyText,
   fetchJson,
+  flowHost,
   flowRow,
   flowStaticRow,
   getSelectedAccountId,
   modalButton,
-  modalNode,
   notifyHomeSummaryChanged,
   openAccountDetail,
   openApprovalMethod,
@@ -67,7 +69,10 @@ export function createWalletAccountActions({
         },
       ),
       flowRow("Rename", "Change display name", () => openRenameAccount(account)),
-      flowRow("Receive", "Show QR code", () => renderReceiveAddress(account)),
+      flowRow("Receive", "Show QR code", () => {
+        closeModal();
+        renderReceiveAddress(account);
+      }),
       flowRow("Copy address", shortAddress(account.address), async () => {
         await copyText(account.address);
         closeModal();
@@ -81,7 +86,7 @@ export function createWalletAccountActions({
     rows.push(
       flowRow("Delete account", "Remove from this Wallet", () => confirmDeleteAccount(account)),
     );
-    openFlowModal("Account", account.name, rows);
+    openFlowModal("Account", account.name, rows, undefined, accountsSurface);
   }
 
   function openRenameAccount(account) {
@@ -105,7 +110,7 @@ export function createWalletAccountActions({
     openFlowModal("Rename account", account.network, [form], [
       modalButton("Cancel", closeModal, true),
       modalButton("Save", () => form.requestSubmit()),
-    ]);
+    ], accountsSurface);
     input.focus();
     input.select();
   }
@@ -117,7 +122,8 @@ export function createWalletAccountActions({
       showStatus("Enter an account name.", "error");
       return;
     }
-    const button = modalNode.querySelector(
+    const host = typeof flowHost === "function" ? flowHost() : null;
+    const button = host?.querySelector(
       ".wallet-modal-actions .wallet-button:not(.wallet-button-secondary)",
     );
     setBusy(button, true);
@@ -148,11 +154,12 @@ export function createWalletAccountActions({
     openFlowModal("Delete account", account.network, [warning], [
       modalButton("Cancel", closeModal, true),
       modalButton("Delete", () => deleteAccount(account), true, true),
-    ]);
+    ], accountsSurface);
   }
 
   async function deleteAccount(account) {
-    const button = modalNode.querySelector(".wallet-modal-actions .wallet-button-danger");
+    const host = typeof flowHost === "function" ? flowHost() : null;
+    const button = host?.querySelector(".wallet-modal-actions .wallet-button-danger");
     setBusy(button, true);
     try {
       for (const accountId of accountIds(account)) {
@@ -182,7 +189,7 @@ export function createWalletAccountActions({
     if (!isPasskeyManagedAccount(account)) {
       openInfoModal(
         "Recovery",
-        "This account is controlled by an external approval method. Recover it from that wallet.",
+        "This account is controlled by an external wallet. Recover it from MetaMask, UniSat, or WalletConnect.",
       );
       return;
     }
@@ -192,7 +199,7 @@ export function createWalletAccountActions({
         "The key is shown only after fresh passkey verification. Store it offline.",
         "wallet-flow-hint",
       ),
-    ]);
+    ], undefined, accountsSurface);
     try {
       const homeToken = await requestFreshPasskeyHomeToken(
         "wallet.recovery-key.export",
@@ -208,7 +215,13 @@ export function createWalletAccountActions({
       );
       renderRecoveryKey(account, payload);
     } catch (error) {
-      openInfoModal("Recovery", String(error.message || error));
+      openFlowModal(
+        "Recovery",
+        String(error.message || error),
+        [],
+        [modalButton("Done", closeModal)],
+        accountsSurface,
+      );
     }
   }
 
@@ -241,7 +254,7 @@ export function createWalletAccountActions({
     openFlowModal("Recovery key", "Keep this private.", [note, key, ...details], [
       modalButton("Done", closeModal, true),
       copy,
-    ]);
+    ], accountsSurface);
   }
 
   async function setDefaultAccount(account) {

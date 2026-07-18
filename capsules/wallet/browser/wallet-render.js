@@ -3,19 +3,44 @@ import {
   assetColor,
   formatAmount,
   shortAddress,
-} from "./wallet-format.js?v=wallet-20260718b";
+} from "./wallet-format.js?v=wallet-20260719w";
+
+const METHOD_ICON_SRC = Object.freeze({
+  metamask: "./icons/metamask.png",
+  btc: "./icons/unisat.png",
+  ethereum: "./icons/ethereum.png",
+  bitcoin: "./icons/bitcoin.png",
+  passkey: "./icons/passkey.png",
+});
 
 export function createWalletRender({ statusNode }) {
-  function showStatus(message, tone) {
+  let statusClearTimer = 0;
+
+  function showStatus(message, tone = "muted") {
     if (!statusNode) {
       return;
     }
-    const text = tone === "error"
-      ? publicWalletText(message, "Wallet action could not be completed.")
-      : typeof message === "string" ? message.trim() : "";
+    if (statusClearTimer) {
+      window.clearTimeout(statusClearTimer);
+      statusClearTimer = 0;
+    }
+    const text = typeof message === "string" ? message.trim() : "";
     statusNode.hidden = text.length === 0;
     statusNode.textContent = text;
     statusNode.dataset.tone = tone || "muted";
+    if (!text) {
+      return;
+    }
+    // Brief confirmations shouldn't pin the hero open; errors linger longer.
+    const dismissMs = tone === "error" ? 8000 : tone === "success" ? 3200 : 4000;
+    statusClearTimer = window.setTimeout(() => {
+      if (statusNode.textContent === text) {
+        statusNode.hidden = true;
+        statusNode.textContent = "";
+        delete statusNode.dataset.tone;
+      }
+      statusClearTimer = 0;
+    }, dismissMs);
   }
 
   return {
@@ -50,13 +75,22 @@ export function accountCard(account, displayedAccountId = "", { privacyMode, pri
 
   const top = document.createElement("div");
   top.className = "wallet-account-top";
+  const identity = document.createElement("div");
+  identity.className = "wallet-account-identity";
   const title = document.createElement("div");
   title.className = "wallet-card-title";
   title.append(
     textNode("strong", account.name, "wallet-card-name"),
     textNode("span", shortAddress(account.address), "wallet-card-address"),
   );
-  top.append(methodMark(account.method, account.monogram), title);
+  identity.append(
+    methodMark(account.method, account.monogram, false, account.chain_namespace),
+    title,
+  );
+
+  const balance = document.createElement("div");
+  balance.className = "wallet-card-balance";
+  balance.textContent = privacyMode ? "••••••" : accountDisplayBalance(account, prices, displayCurrency);
 
   const more = document.createElement("button");
   more.className = "wallet-more-button";
@@ -64,23 +98,17 @@ export function accountCard(account, displayedAccountId = "", { privacyMode, pri
   more.textContent = "⋯";
   more.dataset.walletAccountMenu = account.account_id;
   more.setAttribute("aria-label", `Account actions for ${account.name}`);
-  top.append(more);
 
-  const balance = document.createElement("div");
-  balance.className = "wallet-card-balance";
-  balance.textContent = privacyMode ? "••••••" : accountDisplayBalance(account, prices, displayCurrency);
+  top.append(identity, balance, more);
 
-  const network = document.createElement("div");
-  network.className = "wallet-account-network";
-  network.textContent = account.network;
-
-  const footer = document.createElement("div");
-  footer.className = "wallet-card-footer";
+  const meta = document.createElement("div");
+  meta.className = "wallet-account-meta";
+  meta.append(textNode("span", account.network, "wallet-account-network"));
   for (const asset of account.assets.slice(0, 3)) {
-    footer.append(assetChip(asset));
+    meta.append(assetChip(asset));
   }
 
-  card.append(top, balance, network, footer);
+  card.append(top, meta);
   return card;
 }
 
@@ -108,11 +136,53 @@ export function assetGlyph(symbol) {
   return glyph;
 }
 
-export function methodMark(method, monogram, large = false) {
+export function methodMarkIconSrc(method, chainNamespace = "") {
+  if (method === "metamask") {
+    return METHOD_ICON_SRC.metamask;
+  }
+  if (method === "btc") {
+    return METHOD_ICON_SRC.btc;
+  }
+  if (method === "passkey") {
+    const namespace = String(chainNamespace || "");
+    if (namespace.startsWith("eip155:")) {
+      return METHOD_ICON_SRC.ethereum;
+    }
+    if (namespace.startsWith("bip122:")) {
+      return METHOD_ICON_SRC.bitcoin;
+    }
+    // Built-in accounts header / passkey without a chain → passkey mark.
+    return METHOD_ICON_SRC.passkey;
+  }
+  return "";
+}
+
+export function methodMark(method, monogram, large = false, chainNamespace = "") {
   const mark = document.createElement("span");
-  mark.className = `wallet-method-mark wallet-method-${method}${large ? " wallet-method-mark-large" : ""}`;
-  mark.textContent = monogram || "?";
+  const iconSrc = methodMarkIconSrc(method, chainNamespace);
+  const markKind = iconSrc
+    ? method === "passkey" && String(chainNamespace).startsWith("bip122:")
+      ? "bitcoin"
+      : method === "passkey" && String(chainNamespace).startsWith("eip155:")
+        ? "ethereum"
+        : method
+    : method;
+  mark.className = [
+    "wallet-method-mark",
+    `wallet-method-${markKind}`,
+    large ? "wallet-method-mark-large" : "",
+    iconSrc ? "wallet-method-mark-icon" : "",
+  ].filter(Boolean).join(" ");
   mark.setAttribute("aria-hidden", "true");
+  if (iconSrc) {
+    const img = document.createElement("img");
+    img.src = iconSrc;
+    img.alt = "";
+    img.draggable = false;
+    mark.append(img);
+  } else {
+    mark.textContent = monogram || "?";
+  }
   return mark;
 }
 
@@ -126,9 +196,20 @@ export function copyButton(value) {
 }
 
 export function pulseCopied(button) {
+  button.classList.add("is-copied");
+  if (button.classList.contains("wallet-copy-icon")) {
+    const previous = button.getAttribute("aria-label") || "Copy address";
+    button.setAttribute("aria-label", "Copied");
+    button.title = "Copied";
+    window.setTimeout(() => {
+      button.classList.remove("is-copied");
+      button.setAttribute("aria-label", previous);
+      button.title = previous;
+    }, 1200);
+    return;
+  }
   const previous = button.textContent;
   button.textContent = "Copied";
-  button.classList.add("is-copied");
   window.setTimeout(() => {
     button.textContent = previous;
     button.classList.remove("is-copied");
