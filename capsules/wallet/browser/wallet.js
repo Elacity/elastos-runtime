@@ -1,6 +1,6 @@
-import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260718a";
-import { createWalletApi, readQueryParam } from "./wallet-api.js?v=wallet-20260718a";
-import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260718a";
+import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260718b";
+import { createWalletApi, readQueryParam } from "./wallet-api.js?v=wallet-20260718b";
+import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260718b";
 import {
   BALANCE_NETWORKS,
   MANAGED_CHAIN_NAMESPACES,
@@ -19,14 +19,14 @@ import {
   readText,
   shortAddress,
   validateAddress,
-} from "./wallet-format.js?v=wallet-20260718a";
-import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260718a";
-import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260718a";
-import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260718a";
-import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260718a";
-import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260718a";
-import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260718a";
-import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260718a";
+} from "./wallet-format.js?v=wallet-20260718b";
+import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260718b";
+import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260718b";
+import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260718b";
+import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260718b";
+import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260718b";
+import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260718b";
+import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260718b";
 import {
   accountCard,
   copyButton,
@@ -34,7 +34,7 @@ import {
   emptyHero,
   setBusy,
   textNode,
-} from "./wallet-render.js?v=wallet-20260718a";
+} from "./wallet-render.js?v=wallet-20260718b";
 
 const statusNode = document.querySelector("#wallet-status");
 const accountsNode = document.querySelector("#wallet-accounts");
@@ -232,6 +232,7 @@ function boot() {
   });
   bindPreferenceEvents();
   window.addEventListener("message", onRuntimeEvents);
+  window.addEventListener("message", onWalletRefreshMessage);
   window.addEventListener("message", onShellMenuCommand);
   announceShellMenuManifest();
   refreshWalletState().catch((error) => showStatus(String(error.message || error), "error"));
@@ -311,6 +312,21 @@ function onRuntimeEvents(event) {
       showStatus(String(error.message || error), "error"),
     );
   }
+}
+
+/* Shell pokes this after a connector ceremony succeeds. home:refresh-summary
+   only updates Home chrome — it does not reload Wallet accounts by itself. */
+function onWalletRefreshMessage(event) {
+  if (event.origin !== window.location.origin) {
+    return;
+  }
+  const message = event.data || {};
+  if (message.type !== "elastos:wallet-refresh") {
+    return;
+  }
+  refreshWalletState().catch((error) =>
+    showStatus(String(error.message || error), "error"),
+  );
 }
 
 function walletRuntimeEventIsRelevant(event) {
