@@ -145,10 +145,7 @@ async function mountConnectorFrame(targetId, query) {
       ...normalizedQuery(query),
       presentation: "sheet",
     };
-    const launched = await fetchJson("/api/apps/home/launch", {
-      method: "POST",
-      body: JSON.stringify({ target: targetId, query: launchQuery }),
-    });
+    const launched = await launchHomeTarget(targetId, launchQuery);
     if (launched.attach_kind !== "iframe") {
       throw new Error(`unsupported attach kind: ${launched.attach_kind || "unknown"}`);
     }
