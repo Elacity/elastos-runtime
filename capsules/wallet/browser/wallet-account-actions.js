@@ -4,8 +4,8 @@ import {
   isPasskeyManagedAccount,
   readText,
   shortAddress,
-} from "./wallet-format.js?v=wallet-20260718a";
-import { pulseCopied, setBusy, textNode } from "./wallet-render.js?v=wallet-20260718a";
+} from "./wallet-format.js?v=wallet-20260718b";
+import { pulseCopied, setBusy, textNode } from "./wallet-render.js?v=wallet-20260718b";
 
 export function createWalletAccountActions({
   buildViewAccounts,

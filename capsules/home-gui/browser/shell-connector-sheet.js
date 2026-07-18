@@ -111,8 +111,9 @@ export function retireConnectorSheet() {
   hideConnectorSheet();
 }
 
-/* After a successful link the connector posts home:refresh-summary — close
-   the ceremony so the user lands back on the wallet rail. */
+/* After a successful link the connector posts home:refresh-summary. Tell every
+   Wallet surface to reload accounts (summary refresh alone does not), then
+   close the ceremony so the user lands back on the rail. */
 export function noteConnectorSheetSummaryRefresh(source) {
   if (!connectorSheetOpen()) {
     return;
@@ -123,13 +124,36 @@ export function noteConnectorSheetSummaryRefresh(source) {
   } catch (_error) {
     return;
   }
-  if (source && frameWindow && source === frameWindow) {
-    window.setTimeout(() => {
-      hideConnectorSheet();
-      if (walletRailOpen()) {
-        showWalletRail();
-      }
-    }, 450);
+  if (!source || !frameWindow || source !== frameWindow) {
+    return;
+  }
+  broadcastWalletAccountsRefresh();
+  window.setTimeout(() => {
+    hideConnectorSheet();
+    if (walletRailOpen()) {
+      showWalletRail();
+    }
+    // Second nudge after the sheet is gone — covers slow provider write.
+    broadcastWalletAccountsRefresh();
+  }, 450);
+}
+
+function broadcastWalletAccountsRefresh() {
+  const message = {
+    type: "elastos:wallet-refresh",
+    schema: "elastos.home.wallet-refresh/v1",
+  };
+  const origin = window.location.origin;
+  const post = (contentWindow) => {
+    try {
+      contentWindow?.postMessage(message, origin);
+    } catch (_error) {
+      // Frame may be unloaded or mid-nav.
+    }
+  };
+  post(document.querySelector("#wallet-rail-frame")?.contentWindow);
+  for (const node of document.querySelectorAll(".window[data-target='wallet'] .window-frame")) {
+    post(node.contentWindow);
   }
 }
 
