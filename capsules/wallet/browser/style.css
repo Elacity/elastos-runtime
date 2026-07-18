@@ -45,6 +45,19 @@
   box-sizing: border-box;
 }
 
+/* Rail/window viewport scroll stays wheel/trackpad-driven. A classic
+   scrollbar appearing on Send/Receive flip steals ~15px and shoves
+   Approvals/Settings left — hide the gutter, keep overflow. */
+html {
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+html::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
 body {
   margin: 0;
   min-height: 100vh;
@@ -70,7 +83,6 @@ button {
   min-height: 100vh;
 }
 
-.wallet-hero-actions,
 .wallet-hero-row,
 .wallet-action-row,
 .wallet-section-heading,
@@ -98,14 +110,13 @@ button {
 }
 
 .wallet-status {
-  position: absolute;
-  top: 16px;
-  left: 22px;
-  right: 280px;
+  min-width: 0;
   overflow: hidden;
   margin: 0;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-size: 12px;
+  font-weight: 500;
 }
 
 .wallet-status[data-tone="error"] {
@@ -116,14 +127,25 @@ button {
   color: var(--pos);
 }
 
+/* Static chrome above the flip card: status can come/go without shoving
+   Approvals · Settings · Hide. */
 .wallet-hero-actions {
-  position: absolute;
-  top: 14px;
-  right: 14px;
+  position: relative;
   z-index: 2;
-  justify-content: flex-end;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
   gap: 8px;
-  margin-left: auto;
+  margin: 0;
+  min-height: 32px;
+}
+
+.wallet-hero-nav {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: nowrap;
+  gap: 4px;
 }
 
 .wallet-nav-button,
@@ -161,6 +183,12 @@ button {
   color: var(--ink);
 }
 
+/* Privacy toggle — text peer of Approvals/Settings; pressed = balances hidden. */
+#wallet-privacy.is-active {
+  color: var(--ink);
+  background: var(--chip-hover);
+}
+
 .wallet-page {
   display: grid;
   gap: 14px;
@@ -181,18 +209,24 @@ button {
   }
 }
 
-.wallet-hero,
 .wallet-section,
 .wallet-drawer,
-.wallet-modal {
+.wallet-modal,
+.wallet-hero-scene {
   border: 1px solid var(--line);
   background: var(--surface);
 }
 
+/* Outer hero owns Approvals/Settings/Hide; only .wallet-hero-scene is the
+   bordered card that flips and eases height for Send/Receive. */
 .wallet-hero {
   position: relative;
-  border-radius: 18px;
-  padding: 52px 22px 22px;
+  display: grid;
+  gap: 8px;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
 }
 
 .eyebrow {
@@ -204,28 +238,287 @@ button {
   text-transform: uppercase;
 }
 
+.wallet-hero-scene {
+  border-radius: 18px;
+  padding: 12px 16px 16px;
+  perspective: 1400px;
+}
+
+.wallet-hero-flip {
+  position: relative;
+  transform-style: preserve-3d;
+  /* Transform + height morph together so Send/Receive never snap the card. */
+  transition:
+    transform 420ms cubic-bezier(0.2, 0, 0, 1),
+    min-height 420ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.wallet-hero.is-flipped .wallet-hero-flip {
+  transform: rotateY(180deg);
+}
+
+.wallet-hero-face {
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+}
+
+.wallet-hero-face-front {
+  position: relative;
+}
+
+/* Flipped face: same card chrome, height grows to fit content so nothing
+   clips. Front height is the floor; Receive/Send can be a bit taller. */
+.wallet-hero-face-back {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: auto;
+  display: grid;
+  grid-template-rows: auto max-content auto;
+  align-content: start;
+  gap: 8px;
+  min-height: 100%;
+  height: max-content;
+  overflow: visible;
+  padding: 2px 0 4px;
+  box-sizing: border-box;
+  transform: rotateY(180deg);
+}
+
+.wallet-hero-face-back .wallet-modal-header {
+  margin: 0;
+  gap: 2px;
+  min-width: 0;
+  flex-shrink: 0;
+}
+
+.wallet-hero-face-back .wallet-modal-header h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1.25;
+}
+
+.wallet-hero-face-back .wallet-modal-header .wallet-state {
+  overflow: visible;
+  text-overflow: unset;
+  white-space: normal;
+  line-height: 1.35;
+}
+
+.wallet-hero-face-back .wallet-modal-body {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: visible;
+}
+
+.wallet-hero-face-back .wallet-modal-body:empty {
+  display: none;
+}
+
+.wallet-hero-face-back .wallet-modal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 0;
+  min-width: 0;
+  flex-shrink: 0;
+  padding-top: 2px;
+}
+
+.wallet-hero-face-back .wallet-modal-actions .wallet-button {
+  flex: 1 1 auto;
+}
+
+.wallet-hero-face-back .wallet-qr {
+  width: 88px;
+  height: 88px;
+  padding: 5px;
+  flex: 0 0 auto;
+}
+
+.wallet-hero-face-back .wallet-qr svg {
+  width: 78px;
+  height: 78px;
+}
+
+.wallet-hero-face-back .wallet-qr-address {
+  display: none;
+}
+
+.wallet-receive-compact {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-width: 0;
+}
+
+.wallet-qr-unavailable {
+  display: grid;
+  place-items: center;
+  width: 88px;
+  height: 88px;
+  margin: 0;
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  color: var(--ink-mute);
+  font-size: 10.5px;
+  font-weight: 550;
+  line-height: 1.25;
+  text-align: center;
+  padding: 8px;
+  box-sizing: border-box;
+}
+
+.wallet-receive-meta {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.wallet-receive-address-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+}
+
+.wallet-receive-address {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.wallet-copy-icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  margin-top: 0;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-alt);
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+
+.wallet-copy-icon:hover {
+  background: var(--chip-hover);
+  color: var(--ink);
+}
+
+.wallet-copy-icon.is-copied {
+  color: var(--pos);
+  border-color: color-mix(in srgb, var(--pos) 35%, var(--line));
+}
+
+.wallet-hero-face-back .wallet-flow-hint {
+  margin: 0;
+  max-width: 100%;
+  color: var(--ink-mute);
+  font-size: 10.5px;
+  font-weight: 450;
+  line-height: 1.3;
+  text-align: left;
+}
+
+.wallet-hero-face-back .wallet-flow-form,
+.wallet-hero-face-back .wallet-flow-row {
+  width: 100%;
+  min-width: 0;
+  flex: 0 0 auto;
+}
+
+.wallet-hero-face-back .wallet-flow-row {
+  padding: 9px 10px;
+}
+
+.wallet-hero-face-back .wallet-flow-form input,
+.wallet-hero-face-back .wallet-flow-form select {
+  min-width: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wallet-hero-flip {
+    transition: none;
+  }
+}
+
 .wallet-hero-row {
   display: grid;
-  grid-template-columns: minmax(240px, 1fr) minmax(160px, 0.6fr) minmax(190px, 220px);
-  align-items: center;
-  gap: 22px;
-  min-height: 172px;
+  grid-template-columns: 1fr;
+  align-items: stretch;
+  gap: 14px;
+  min-height: 0;
 }
 
 .wallet-hero-balance {
   display: grid;
-  align-content: center;
+  align-content: start;
+  gap: 8px;
+  min-width: 0;
+}
+
+.wallet-hero-balance-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   gap: 10px;
   min-width: 0;
 }
 
+.wallet-hero-balance-label-row .eyebrow {
+  margin: 0;
+  flex: 0 0 auto;
+}
+
+.wallet-hero-balance-label-row .wallet-detail {
+  width: auto;
+  max-width: min(52%, 240px);
+  margin-left: auto;
+}
+
+/* Amount left, 24h delta right — original bottom-aligned pair. */
+.wallet-hero-balance-top {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.wallet-hero-balance-top .wallet-total-value {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.wallet-hero-balance-top .wallet-delta {
+  flex: 0 0 auto;
+  margin: 0 0 6px;
+}
+
 .wallet-total-value {
-  min-height: 68px;
+  min-height: 48px;
   color: var(--ink);
-  font-size: 64px;
+  font-size: 48px;
   font-variant-numeric: tabular-nums;
   font-weight: 500;
-  letter-spacing: -2.4px;
+  letter-spacing: -1.8px;
   line-height: 1;
 }
 
@@ -233,34 +526,21 @@ button {
   color: var(--ink-mute);
 }
 
+/* Honest 24h delta — number only (no decorative fake sparkline). */
 .wallet-delta {
   display: grid;
-  gap: 8px;
-  justify-self: center;
-  justify-items: center;
-  margin: 0;
+  gap: 0;
+  justify-items: end;
+  margin: 0 0 6px;
   color: var(--pos);
   font-size: 12.5px;
-  font-weight: 500;
-  text-align: center;
+  font-weight: 600;
+  text-align: right;
   white-space: nowrap;
 }
 
 .wallet-delta.is-negative {
   color: var(--neg);
-}
-
-.wallet-sparkline {
-  width: 148px;
-  height: 52px;
-}
-
-.wallet-sparkline polyline {
-  fill: none;
-  stroke: currentColor;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  stroke-width: 1.4;
 }
 
 .wallet-action-row {
@@ -363,6 +643,136 @@ button {
   gap: 8px;
 }
 
+/* Accounts heading: title left, Create/Import right — one compact row. */
+.wallet-accounts-section .wallet-section-heading {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.wallet-accounts-section .wallet-section-heading > div:first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.wallet-accounts-section .wallet-section-actions {
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.wallet-accounts-section .wallet-section-actions .wallet-button {
+  padding: 6px 10px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* Accounts Create/Import ceremony — same flip grammar as the hero. */
+.wallet-accounts-scene {
+  perspective: 1400px;
+}
+
+.wallet-accounts-flip {
+  position: relative;
+  transform-style: preserve-3d;
+  transition:
+    transform 420ms cubic-bezier(0.2, 0, 0, 1),
+    min-height 420ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.wallet-accounts-section.is-flipped .wallet-accounts-flip {
+  transform: rotateY(180deg);
+}
+
+/* Must leave the layout — opacity:0 still reserved the button row height. */
+.wallet-accounts-section.is-flipped .wallet-section-actions {
+  display: none;
+}
+
+.wallet-accounts-section.is-flipped .wallet-section-heading {
+  margin-bottom: 8px;
+}
+
+.wallet-accounts-face {
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+}
+
+.wallet-accounts-face-front {
+  position: relative;
+}
+
+.wallet-accounts-face-back {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: auto;
+  display: grid;
+  grid-template-rows: auto max-content auto;
+  align-content: start;
+  gap: 10px;
+  min-height: 100%;
+  height: max-content;
+  overflow: visible;
+  padding: 2px 0 4px;
+  box-sizing: border-box;
+  transform: rotateY(180deg);
+}
+
+.wallet-accounts-face-back .wallet-modal-header {
+  margin: 0;
+  gap: 2px;
+}
+
+.wallet-accounts-face-back .wallet-modal-header h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 650;
+}
+
+.wallet-accounts-face-back .wallet-modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.wallet-accounts-face-back .wallet-modal-body:empty {
+  display: none;
+}
+
+.wallet-accounts-face-back .wallet-modal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 0;
+  padding-top: 2px;
+}
+
+.wallet-accounts-face-back .wallet-modal-actions .wallet-button {
+  flex: 1 1 auto;
+}
+
+.wallet-accounts-face-back .wallet-flow-form,
+.wallet-accounts-face-back .wallet-flow-row {
+  width: 100%;
+  min-width: 0;
+}
+
+.wallet-accounts-face-back .wallet-flow-form textarea {
+  min-height: 110px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wallet-accounts-flip {
+    transition: none;
+  }
+}
+
 h1,
 h2,
 h3 {
@@ -405,9 +815,9 @@ h3 {
 .wallet-account {
   display: flex;
   flex-direction: column;
-  gap: 7px;
-  min-height: 118px;
-  padding: 12px;
+  gap: 8px;
+  min-height: 72px;
+  padding: 10px 12px;
 }
 
 .wallet-account:hover {
@@ -429,7 +839,18 @@ h3 {
 }
 
 .wallet-account-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.wallet-account-identity {
+  display: flex;
+  align-items: center;
   gap: 7px;
+  min-width: 0;
+  flex: 1 1 auto;
 }
 
 .wallet-card-title {
@@ -457,7 +878,7 @@ h3 {
 }
 
 .wallet-more-button {
-  margin-left: auto;
+  flex: 0 0 auto;
   border: 0;
   background: transparent;
   color: var(--ink-mute);
@@ -468,16 +889,26 @@ h3 {
 }
 
 .wallet-card-balance {
-  margin-top: 2px;
-  font-size: 22px;
+  flex: 0 0 auto;
+  margin: 0;
+  font-size: 15px;
   font-variant-numeric: tabular-nums;
-  font-weight: 500;
-  letter-spacing: -0.8px;
-  line-height: 1;
+  font-weight: 600;
+  letter-spacing: -0.4px;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.wallet-account-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
 }
 
 .wallet-account-network {
-  margin-top: -2px;
+  margin: 0;
   font-size: 11px;
 }
 
@@ -518,6 +949,7 @@ h3 {
   background: var(--accent);
   color: white;
   font-weight: 600;
+  overflow: hidden;
 }
 
 .wallet-method-mark-large {
@@ -526,12 +958,38 @@ h3 {
   border-radius: 9px;
 }
 
-.wallet-method-metamask {
-  background: var(--metamask);
+.wallet-method-mark-icon {
+  padding: 2px;
 }
 
-.wallet-method-btc {
-  background: var(--btc);
+.wallet-method-mark-icon img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.wallet-method-passkey {
+  /* Blue key on white artwork — white mark plate matches MetaMask. */
+  background: #fff;
+}
+
+.wallet-method-metamask {
+  background: #fff;
+  color: #e2761b;
+}
+
+.wallet-method-btc,
+.wallet-method-unisat {
+  background: #0b0d10;
+}
+
+.wallet-method-ethereum {
+  background: #627eea;
+}
+
+.wallet-method-bitcoin {
+  background: #f7931a;
 }
 
 .wallet-method-wc {
@@ -541,6 +999,26 @@ h3 {
 .wallet-method-unknown {
   background: var(--chip-hover);
   color: var(--ink-mute);
+}
+
+.wallet-hero-pending {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.wallet-hero-pending[hidden] {
+  display: none !important;
+}
+
+.wallet-hero-request {
+  padding: 10px;
+  border-radius: 12px;
+  background: var(--surface-alt);
+}
+
+.wallet-hero-request .wallet-request-actions {
+  margin-top: 8px;
 }
 
 .wallet-empty {
@@ -592,13 +1070,15 @@ h3 {
   position: fixed;
   inset: 0;
   z-index: 40;
-  background: rgba(8, 9, 12, 0.5);
-  backdrop-filter: blur(4px);
+  /* Dim hard enough that page content cannot compete with the sheet. */
+  background: rgba(6, 7, 10, 0.72);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
 }
 
 :root[data-el-theme="light"] .wallet-drawer-backdrop,
 :root[data-el-theme="light"] .wallet-modal-backdrop {
-  background: rgba(20, 20, 18, 0.18);
+  background: rgba(20, 20, 18, 0.42);
 }
 
 .wallet-drawer {
@@ -611,6 +1091,8 @@ h3 {
   overflow: auto;
   border-width: 0 0 0 1px;
   border-radius: 20px 0 0 20px;
+  /* Opaque raised surface — shared --surface is ~4% glass and bleeds the page. */
+  background: var(--el-surface-raised, #16181d);
   box-shadow: -30px 0 80px rgba(0, 0, 0, 0.4);
   padding: 18px;
 }
@@ -620,17 +1102,73 @@ h3 {
 }
 
 .wallet-detail {
-  width: min(100%, 220px);
-  justify-self: end;
+  width: 100%;
+  justify-self: stretch;
+}
+
+/* Selected-account meme on the far right — address + copy, no card chrome. */
+.wallet-hero-address-pill {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  width: fit-content;
+  max-width: 100%;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.wallet-hero-address-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wallet-hero-address-value {
+  flex: 0 0 auto;
+  color: var(--ink-mute);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.wallet-hero-address-pill .wallet-copy-icon {
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
 }
 
 :root[data-el-theme="light"] .wallet-drawer {
+  background: var(--el-surface-raised, #ffffff);
   box-shadow: -30px 0 80px rgba(20, 20, 18, 0.1);
 }
 
 .wallet-drawer-header {
-  justify-content: flex-end;
-  margin-bottom: 10px;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.wallet-drawer-header h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.3px;
+}
+
+.wallet-drawer-header .eyebrow {
+  margin-bottom: 2px;
 }
 
 .wallet-settings-card {
@@ -696,51 +1234,25 @@ h3 {
 .wallet-detail-inline {
   display: grid;
   align-items: center;
-  justify-items: center;
-  gap: 9px;
+  justify-items: stretch;
+  gap: 10px;
   width: 100%;
 }
 
 .wallet-detail-summary {
   display: grid;
   gap: 2px;
-  justify-items: center;
-  text-align: center;
-}
-
-.wallet-detail-summary strong {
-  font-size: 13px;
-  font-weight: 500;
-}
-
-.wallet-detail-summary span {
-  color: var(--ink-mute);
-  font-size: 11px;
+  justify-items: start;
+  text-align: left;
 }
 
 .wallet-detail-address {
-  justify-content: center;
+  justify-content: flex-start;
   width: 100%;
   border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--surface-alt);
+  border-radius: 10px;
+  background: var(--surface);
   padding: 6px 8px;
-}
-
-.wallet-detail-qr {
-  flex: 0 0 auto;
-  display: grid;
-  place-items: center;
-  width: 156px;
-  height: 156px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: white;
-}
-
-.wallet-detail-qr svg {
-  width: 136px;
-  height: 136px;
 }
 
 .wallet-pending-expiry,
@@ -801,6 +1313,15 @@ h3 {
   border-radius: 18px;
   padding: 24px;
   transform: translate(-50%, -50%);
+  /* Confirm sheets must read as solid cards. The page-level --surface token
+     is intentional glass for hero/sections; here it made account cards behind
+     the modal look like blurred modal content. */
+  background: var(--el-surface-raised, #16181d);
+  box-shadow: var(--el-shadow-3, 0 24px 80px rgba(0, 0, 0, 0.45));
+}
+
+:root[data-el-theme="light"] .wallet-modal {
+  background: var(--el-surface-raised, #ffffff);
 }
 
 .wallet-modal-header {
@@ -864,20 +1385,22 @@ h3 {
   font: inherit;
 }
 
+/* Receive modal only — white plate for reliable scanning. */
 .wallet-qr {
   display: grid;
   place-items: center;
-  width: 148px;
-  height: 148px;
+  width: min(200px, 100%);
   margin: 0 auto;
   border: 1px solid var(--line);
   border-radius: 12px;
-  background: var(--surface-alt);
+  background: #fff;
+  padding: 12px;
 }
 
 .wallet-qr svg {
-  width: 132px;
-  height: 132px;
+  width: 160px;
+  height: 160px;
+  display: block;
 }
 
 .wallet-qr-address {
@@ -936,14 +1459,12 @@ textarea {
 }
 
 @media (max-width: 780px) {
-  .wallet-status {
-    left: 14px;
-    right: 14px;
-    top: 50px;
-  }
-
   .wallet-hero-actions {
     gap: 4px;
+  }
+
+  .wallet-status {
+    font-size: 11px;
   }
 
   .wallet-nav-button {
@@ -959,14 +1480,15 @@ textarea {
     padding: 16px;
   }
 
-  .wallet-hero,
+  .wallet-hero-scene,
   .wallet-section {
     border-radius: 14px;
-    padding: 14px;
+    padding: 12px 14px 14px;
   }
 
-  .wallet-hero {
-    padding-top: 92px;
+  .wallet-hero-actions {
+    min-height: 28px;
+    gap: 6px;
   }
 
   .wallet-hero-row {
@@ -1008,8 +1530,16 @@ textarea {
     display: grid;
   }
 
+  .wallet-accounts-section .wallet-section-heading {
+    display: flex;
+  }
+
   .wallet-section-actions {
     justify-content: flex-start;
+  }
+
+  .wallet-accounts-section .wallet-section-actions {
+    justify-content: flex-end;
   }
 
   .wallet-drawer {
@@ -1022,37 +1552,11 @@ textarea {
   }
 
   .wallet-detail {
-    justify-self: center;
-  }
-
-  .wallet-detail-inline {
-    align-items: center;
-    justify-items: center;
-  }
-
-  .wallet-detail-qr {
-    width: 132px;
-    height: 132px;
-  }
-
-  .wallet-detail-qr svg {
-    width: 114px;
-    height: 114px;
+    width: 100%;
   }
 
   .wallet-detail-address {
     max-width: none;
-  }
-
-  .wallet-delta {
-    justify-self: center;
-    justify-items: center;
-    text-align: center;
-  }
-
-  .wallet-sparkline {
-    width: 124px;
-    height: 44px;
   }
 
   .wallet-modal {

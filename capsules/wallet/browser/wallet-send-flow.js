@@ -43,24 +43,18 @@ export function createWalletSendFlow({
           ),
         ],
         [modalButton("Done", closeModal)],
+        { surface: "hero" },
       );
       return;
     }
     if (sendableAccounts.length === 0) {
-      const rows = accounts.length
-        ? accounts.map((account) =>
-            flowStaticRow(account.name, sendAccountStatusMessage(account)),
-          )
-        : [
-            textNode(
-              "p",
-              "Create a passkey-managed EVM account before sending on an EVM chain.",
-              "wallet-flow-hint",
-            ),
-          ];
-      openFlowModal("Send", "No signing account available", rows, [
-        modalButton("Done", closeModal),
-      ]);
+      openFlowModal(
+        "Send",
+        "Wallet Send needs a built-in passkey account. MetaMask-linked accounts can Receive and approve here — send from MetaMask, or create a built-in account.",
+        [],
+        [modalButton("Done", closeModal)],
+        { surface: "hero" },
+      );
       return;
     }
     const fundedSendableAccounts = sendableAccounts.filter((account) => account.assets.length > 0);
@@ -94,7 +88,7 @@ export function createWalletSendFlow({
         ),
       ),
     );
-    openFlowModal("Send", "Choose a signing account", rows);
+    openFlowModal("Send", "Choose a signing account", rows, undefined, { surface: "hero" });
   }
 
   function renderSendAssetStep(account) {
@@ -110,6 +104,7 @@ export function createWalletSendFlow({
           ),
         ],
         [modalButton("Back", openSendFlow, true), modalButton("Done", closeModal)],
+        { surface: "hero" },
       );
       return;
     }
@@ -123,6 +118,8 @@ export function createWalletSendFlow({
           () => renderSendForm(account, asset),
         ),
       ),
+      undefined,
+      { surface: "hero" },
     );
   }
 
@@ -151,6 +148,7 @@ export function createWalletSendFlow({
       `${account.name} · ${asset.symbol}`,
       [form],
       [modalButton("Cancel", closeModal, true), next],
+      { surface: "hero" },
     );
   }
 
@@ -179,24 +177,30 @@ export function createWalletSendFlow({
       sendTransactionFromReview(account, amount, to, button),
     );
     sign.disabled = Boolean(unavailableReason);
-    openFlowModal("Review send", "Confirm details", rows, [
-      modalButton("Back", () => renderSendForm(account, asset), true),
-      sign,
-    ]);
+    openFlowModal(
+      "Review send",
+      "Confirm details",
+      rows,
+      [
+        modalButton("Back", () => renderSendForm(account, asset), true),
+        sign,
+      ],
+      { surface: "hero" },
+    );
   }
 
   function sendUnavailableReason(account) {
     if (canSendFromAccount(account)) {
       return "";
     }
+    if (!isPasskeyManagedAccount(account)) {
+      return "External signer — send from MetaMask/UniSat, or create a built-in account for Wallet Send.";
+    }
     if (!account.chain_namespace || !account.chain_namespace.startsWith("eip155:")) {
-      return "Wallet send currently supports passkey-managed EVM accounts through supported chain providers.";
+      return "Wallet Send currently supports passkey-managed EVM accounts.";
     }
     if (!["eip155:20", "eip155:8453"].includes(account.chain_namespace)) {
-      return "This EVM network is not enabled by the chain-provider yet.";
-    }
-    if (!isPasskeyManagedAccount(account)) {
-      return "Open the approval method for this account to send.";
+      return "This EVM network is not enabled for Wallet Send yet.";
     }
     if (account.signing_status === "managed_key_missing") {
       return "This built-in account is missing its local signing key. Import this account's Wallet recovery key or create a new account.";

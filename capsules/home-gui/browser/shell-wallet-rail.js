@@ -3,12 +3,12 @@ import {
   fetchJson,
   shellState,
   targetById,
-} from "./shell-core.js?v=home-20260717b";
+} from "./shell-core.js?v=home-20260718d";
 import {
   iframeAllowForLaunch,
   iframeSandboxForLaunch,
   openTarget,
-} from "./shell-windows.js?v=home-20260717b";
+} from "./shell-windows.js?v=home-20260718d";
 
 /* Wallet rail: a right-hand slide-over that hosts the wallet capsule.
    Chrome only — it launches the wallet through the exact same canonical
@@ -31,6 +31,10 @@ let retryButton = null;
 let invoker = null;
 let launching = false;
 let outsideDismissBound = false;
+let hideAnimating = false;
+let hideFinishTimer = 0;
+let hideEndHandler = null;
+let pendingRestoreFocus = true;
 
 export function bindWalletRail() {
   if (rail) {
@@ -144,6 +148,7 @@ export function showWalletRail() {
   if (!rail || !walletRailAvailable()) {
     return;
   }
+  cancelHideAnimation();
   invoker =
     document.activeElement && document.activeElement !== document.body
       ? document.activeElement
@@ -152,6 +157,11 @@ export function showWalletRail() {
   rail.inert = false;
   rail.setAttribute("aria-hidden", "false");
   barButton?.setAttribute("aria-expanded", "true");
+  // Retrigger the enter motion when reopening after a leave (or mid-leave cancel).
+  rail.classList.remove("wallet-rail-leaving");
+  rail.style.animation = "none";
+  void rail.offsetWidth;
+  rail.style.animation = "";
   bindOutsideDismiss();
   rail.focus({ preventScroll: true });
   if (!frame.dataset.route) {
@@ -159,21 +169,72 @@ export function showWalletRail() {
   }
 }
 
-export function hideWalletRail({ restoreFocus = true } = {}) {
-  if (!walletRailOpen()) {
+export function hideWalletRail({ restoreFocus = true, animate = true } = {}) {
+  if (!rail || rail.hidden) {
     return;
   }
+  if (hideAnimating) {
+    pendingRestoreFocus = pendingRestoreFocus && restoreFocus;
+    return;
+  }
+  pendingRestoreFocus = restoreFocus;
+  const reduceMotion = Boolean(
+    window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches,
+  );
+  if (!animate || reduceMotion) {
+    finishHideWalletRail();
+    return;
+  }
+  hideAnimating = true;
+  rail.classList.add("wallet-rail-leaving");
+  hideEndHandler = (event) => {
+    if (event.target !== rail) {
+      return;
+    }
+    finishHideWalletRail();
+  };
+  rail.addEventListener("animationend", hideEndHandler);
+  hideFinishTimer = window.setTimeout(() => {
+    finishHideWalletRail();
+  }, 280);
+}
+
+function finishHideWalletRail() {
+  if (!rail || rail.hidden) {
+    cancelHideAnimation();
+    return;
+  }
+  cancelHideAnimation();
   rail.hidden = true;
   rail.inert = true;
   rail.setAttribute("aria-hidden", "true");
   barButton?.setAttribute("aria-expanded", "false");
-  if (restoreFocus) {
+  if (pendingRestoreFocus) {
     invoker?.focus?.();
   }
   invoker = null;
+  pendingRestoreFocus = true;
+}
+
+function cancelHideAnimation() {
+  if (hideFinishTimer) {
+    window.clearTimeout(hideFinishTimer);
+    hideFinishTimer = 0;
+  }
+  if (hideEndHandler && rail) {
+    rail.removeEventListener("animationend", hideEndHandler);
+  }
+  hideEndHandler = null;
+  hideAnimating = false;
+  rail?.classList.remove("wallet-rail-leaving");
 }
 
 export function toggleWalletRail() {
+  if (hideAnimating) {
+    // Mid-leave: treat as reopen (cancel the exit motion).
+    showWalletRail();
+    return;
+  }
   if (walletRailOpen()) {
     hideWalletRail();
   } else {
@@ -184,7 +245,7 @@ export function toggleWalletRail() {
 /* Full teardown for shell switches: the capsule session must not survive the
    GUI going dormant. */
 export function retireWalletRail() {
-  hideWalletRail({ restoreFocus: false });
+  hideWalletRail({ restoreFocus: false, animate: false });
   if (frame) {
     frame.removeAttribute("src");
     delete frame.dataset.route;

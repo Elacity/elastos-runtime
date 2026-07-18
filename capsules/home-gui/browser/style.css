@@ -767,6 +767,11 @@
   animation: wallet-rail-enter 240ms cubic-bezier(0.2, 0, 0, 1) both;
 }
 
+.wallet-rail.wallet-rail-leaving {
+  animation: wallet-rail-leave 240ms cubic-bezier(0.2, 0, 0, 1) both;
+  pointer-events: none;
+}
+
 .wallet-rail[hidden] {
   display: none;
 }
@@ -782,8 +787,20 @@
   }
 }
 
+@keyframes wallet-rail-leave {
+  from {
+    opacity: 1;
+    transform: none;
+  }
+  to {
+    opacity: 0;
+    transform: translateX(calc(100% + 8px));
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .wallet-rail {
+  .wallet-rail,
+  .wallet-rail.wallet-rail-leaving {
     animation: none;
   }
 }
@@ -837,6 +854,14 @@
   width: 10px;
   height: 10px;
   display: block;
+  opacity: 0.75;
+  /* close.svg strokes are black; invert for dark chrome (same as quick-look). */
+  filter: invert(1);
+}
+
+:root[data-el-theme="light"] .wallet-rail-close img {
+  filter: none;
+  opacity: 0.7;
 }
 
 .wallet-rail-frame {

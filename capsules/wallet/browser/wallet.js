@@ -1,6 +1,6 @@
-import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260718b";
-import { createWalletApi, readQueryParam } from "./wallet-api.js?v=wallet-20260718b";
-import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260718b";
+import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260719h";
+import { createWalletApi, readQueryParam } from "./wallet-api.js?v=wallet-20260719h";
+import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260719h";
 import {
   BALANCE_NETWORKS,
   MANAGED_CHAIN_NAMESPACES,
@@ -9,7 +9,6 @@ import {
   accountDisplayBalance,
   accountName,
   chainLabel,
-  cssEscape,
   delta24h,
   formatAmount,
   formatMoney,
@@ -19,27 +18,27 @@ import {
   readText,
   shortAddress,
   validateAddress,
-} from "./wallet-format.js?v=wallet-20260718b";
-import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260718b";
-import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260718b";
-import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260718b";
-import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260718b";
-import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260718b";
-import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260718b";
-import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260718b";
+} from "./wallet-format.js?v=wallet-20260719h";
+import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260719h";
+import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260719h";
+import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260719h";
+import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260719h";
+import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260719h";
+import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260719h";
+import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260719h";
 import {
   accountCard,
   copyButton,
   createWalletRender,
   emptyHero,
+  methodMark,
   setBusy,
   textNode,
-} from "./wallet-render.js?v=wallet-20260718b";
+} from "./wallet-render.js?v=wallet-20260719h";
 
 const statusNode = document.querySelector("#wallet-status");
 const accountsNode = document.querySelector("#wallet-accounts");
-const requestsNode = document.querySelector("#wallet-requests");
-const requestsPanelNode = document.querySelector("#wallet-requests-panel");
+const requestsNode = document.querySelector("#wallet-hero-pending");
 const stateNode = document.querySelector("#wallet-account-state");
 const accountActionsNode = document.querySelector(".wallet-section-actions");
 const balanceStateNode = document.querySelector("#wallet-balance-state");
@@ -52,6 +51,10 @@ const getStartedNode = document.querySelector("#wallet-get-started");
 const connectCtaButton = document.querySelector("#wallet-connect-cta");
 const signersSection = document.querySelector("#wallet-signers");
 const accountDetailNode = document.querySelector("#wallet-account-detail");
+const heroNode = document.querySelector(".wallet-hero");
+const heroBackNode = document.querySelector("#wallet-hero-back");
+const accountsSectionNode = document.querySelector(".wallet-accounts-section");
+const accountsBackNode = document.querySelector("#wallet-accounts-back");
 const modalBackdropNode = document.querySelector("#wallet-modal-backdrop");
 const modalNode = document.querySelector("#wallet-modal");
 const activityNode = document.querySelector("#wallet-activity");
@@ -74,13 +77,21 @@ const { fetchJson, notifyHomeSummaryChanged, requestFreshPasskeyHomeToken, shell
 const { showStatus } = createWalletRender({ statusNode });
 const {
   closeModal,
+  flowHost,
   flowRow,
   flowStaticRow,
   modalButton,
   openFlowModal,
   openInfoModal,
-} = createWalletFlows({ modalNode, modalBackdropNode, showStatus });
-const { renderActivity } = createWalletActivity({ activityNode, textNode });
+} = createWalletFlows({
+  modalNode,
+  modalBackdropNode,
+  heroNode,
+  heroBackNode,
+  accountsSectionNode,
+  accountsBackNode,
+  showStatus,
+});
 const { loadBalanceRows, loadPrices } = createWalletStateLoader({ fetchJson, shellHeaders });
 const {
   applyCurrencySelection,
@@ -115,25 +126,23 @@ const {
   requestFreshPasskeyHomeToken,
   refreshWalletState,
   requestsNode,
-  requestsPanelNode,
   shellHeaders,
   showStatus,
 });
+const { renderActivity } = createWalletActivity({
+  activityNode,
+  textNode,
+});
 const {
-  loadAccountQr,
   openReceiveFlow,
-  qrForAccount,
   renderReceiveAddress,
 } = createWalletReceiveFlow({
   buildViewAccounts,
   closeModal,
-  copyButton,
   fetchJson,
   flowRow,
   modalButton,
-  onQrReady: updateAccountQr,
   openFlowModal,
-  openInfoModal,
   selectedOrDefaultAccount,
   shellHeaders,
   textNode,
@@ -143,9 +152,9 @@ const { onCreateManagedWallet, openCreateAccountFlow, openImportRecoveryKeyFlow 
   buildViewAccounts,
   closeModal,
   fetchJson,
+  flowHost,
   flowRow,
   modalButton,
-  modalNode,
   nextAccountName,
   notifyHomeSummaryChanged,
   openFlowModal,
@@ -193,11 +202,11 @@ const { onAccountClick, onDocumentClick } = createWalletAccountActions({
   closeModal,
   copyText,
   fetchJson,
+  flowHost,
   flowRow,
   flowStaticRow,
   getSelectedAccountId: () => selectedAccountId,
   modalButton,
-  modalNode,
   notifyHomeSummaryChanged,
   openAccountDetail,
   openApprovalMethod,
@@ -401,13 +410,10 @@ async function loadWalletState() {
 function renderAll() {
   const allAccounts = buildViewAccounts();
   const pending = pendingWalletRequests(currentRequests);
-  const reviewRequests = reviewWalletRequestId
-    ? pending.filter((request) => readText(request.request_id) === reviewWalletRequestId)
-    : pending;
   renderHero(allAccounts);
   renderHeroAccount(allAccounts);
   renderAccounts(allAccounts);
-  const focusedRequestVisible = renderRequests(reviewRequests, reviewWalletRequestId);
+  const focusedRequestVisible = renderRequests(pending, reviewWalletRequestId);
   if (reviewWalletRequestId && focusedRequestVisible) {
     showStatus("Review and approve this request in Wallet.", "muted");
   } else if (reviewWalletRequestId) {
@@ -579,51 +585,32 @@ function renderHeroAccount(accounts) {
     accountDetailNode.hidden = true;
     return;
   }
+  // Active account meme on the far right (with 24h delta): name + address + copy.
+  // Accounts list owns method, balances, and the full roster.
   accountDetailNode.hidden = false;
-  accountDetailNode.setAttribute("aria-label", selectedAccountId ? "Selected account" : "Default account");
-
-  const inline = document.createElement("div");
-  inline.className = "wallet-detail-inline";
-
-  const summary = document.createElement("div");
-  summary.className = "wallet-detail-summary";
-  summary.append(
-    textNode("strong", selectedAccountId ? account.name : `Default: ${account.name}`),
-    textNode("span", `${account.network} · ${account.method === "metamask" ? "MetaMask" : account.method === "btc" ? "Bitcoin" : "Passkey"}`),
+  accountDetailNode.setAttribute(
+    "aria-label",
+    selectedAccountId ? `Selected · ${account.name}` : `Default · ${account.name}`,
   );
 
-  const receive = document.createElement("div");
-  receive.className = "wallet-detail-qr";
-  receive.dataset.walletDetailQr = account.account_id;
-  const cachedQr = qrForAccount(account);
-  if (cachedQr) {
-    receive.innerHTML = cachedQr;
-  } else {
-    receive.append(textNode("span", "QR", "wallet-state"));
-    loadAccountQr(account);
-  }
+  const pill = document.createElement("div");
+  pill.className = "wallet-hero-address-pill";
+  pill.title = `${account.name} · ${account.address}`;
 
-  const address = document.createElement("div");
-  address.className = "wallet-detail-address";
-  address.append(copyButton(account.address));
+  const label = textNode("span", account.name, "wallet-hero-address-name");
+  const address = textNode("code", shortAddress(account.address), "wallet-hero-address-value");
+  address.dataset.walletCopyAddress = account.address;
+  const copy = document.createElement("button");
+  copy.className = "wallet-copy-icon";
+  copy.type = "button";
+  copy.setAttribute("aria-label", `Copy ${account.name} address`);
+  copy.title = "Copy address";
+  copy.dataset.walletCopyAddress = account.address;
+  copy.innerHTML =
+    '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M3.5 10.5V3.5A1 1 0 0 1 4.5 2.5h7" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
 
-  inline.append(summary, receive, address);
-  accountDetailNode.append(inline);
-}
-
-function updateAccountQr(account, svg) {
-  const qrBox = accountDetailNode.querySelector(
-    `[data-wallet-detail-qr="${cssEscape(account.account_id)}"]`,
-  );
-  if (!qrBox) {
-    return;
-  }
-  if (svg) {
-    qrBox.replaceChildren();
-    qrBox.innerHTML = svg;
-  } else {
-    qrBox.replaceChildren(textNode("span", "QR unavailable", "wallet-state"));
-  }
+  pill.append(label, address, copy);
+  accountDetailNode.append(pill);
 }
 
 function selectedOrDefaultAccount(accounts = buildViewAccounts()) {
@@ -685,10 +672,17 @@ function renderAccounts(accounts) {
 
 function updateFlowButtons(accounts) {
   const empty = accounts.length === 0;
+  const canSend = accounts.some((account) => canSendFromAccount(account));
+  // Keep Send clickable when accounts exist but none are built-in sendable —
+  // the hero flip explains MetaMask vs Wallet Send instead of a dead control.
   sendButton.disabled = empty;
   receiveButton.disabled = empty;
   if (sendButton) {
     sendButton.hidden = empty;
+    sendButton.title = empty || canSend
+      ? "Send"
+      : "Wallet Send needs a built-in passkey account";
+    sendButton.setAttribute("aria-description", sendButton.title);
   }
   if (receiveButton) {
     receiveButton.hidden = empty;

@@ -23,13 +23,13 @@ import {
   shellInteractionActive,
   shouldIgnoreDesktopKeydown,
   targetById,
-} from "./shell-core.js?v=home-20260717b";
+} from "./shell-core.js?v=home-20260718d";
 import {
   bindIdentityMenu,
   clearIdentitySurface,
   syncIdentity,
   updateClock,
-} from "./shell-chrome.js?v=home-20260717b";
+} from "./shell-chrome.js?v=home-20260718d";
 import {
   beginDesktopMarquee,
   bindShellSurfaceDom,
@@ -55,7 +55,7 @@ import {
   toggleLauncher,
   updateDesktopMarquee,
   updateTaskbarState,
-} from "./shell-surface.js?v=home-20260717b";
+} from "./shell-surface.js?v=home-20260718d";
 import {
   closeWindow,
   cleanupBeforeUnload,
@@ -67,39 +67,39 @@ import {
   restoreShellSession,
   showDesktopHome,
   supportsMenuNewWindow,
-} from "./shell-windows.js?v=home-20260717b";
+} from "./shell-windows.js?v=home-20260718d";
 import {
   bindShellKeyboard,
   handleDesktopArrowKey,
   retireKeyboardSurfaces,
   toggleShortcutsOverlay,
-} from "./shell-keyboard.js?v=home-20260717b";
+} from "./shell-keyboard.js?v=home-20260718d";
 import {
   bindSpotlight,
   hideSpotlight,
   showSpotlight,
-} from "./shell-spotlight.js?v=home-20260717b";
+} from "./shell-spotlight.js?v=home-20260718d";
 import {
   bindNotificationCenter,
   hideNotificationCenter,
   recordNotifications,
-} from "./shell-notifications.js?v=home-20260717b";
+} from "./shell-notifications.js?v=home-20260718d";
 import {
   bindMenubar,
   closeMenus,
   setMenuManifest,
   syncMenubar,
-} from "./shell-menubar.js?v=home-20260717b";
+} from "./shell-menubar.js?v=home-20260718d";
 import {
   bindQuickLook,
   hideQuickLook,
   toggleQuickLook,
-} from "./shell-quicklook.js?v=home-20260717b";
-import { bindExpose, closeExpose } from "./shell-expose.js?v=home-20260717b";
+} from "./shell-quicklook.js?v=home-20260718d";
+import { bindExpose, closeExpose } from "./shell-expose.js?v=home-20260718d";
 import {
   bindControlCentre,
   hideControlCentre,
-} from "./shell-control-centre.js?v=home-20260717b";
+} from "./shell-control-centre.js?v=home-20260718d";
 import {
   bindWalletRail,
   retireWalletRail,
@@ -107,7 +107,7 @@ import {
   syncWalletRailAvailability,
   walletRailFrame,
   walletRailOpen,
-} from "./shell-wallet-rail.js?v=home-20260717b";
+} from "./shell-wallet-rail.js?v=home-20260718d";
 import {
   bindConnectorSheet,
   connectorSheetFrame,
@@ -116,7 +116,7 @@ import {
   noteConnectorSheetSummaryRefresh,
   retireConnectorSheet,
   showConnectorSheet,
-} from "./shell-connector-sheet.js?v=home-20260717b";
+} from "./shell-connector-sheet.js?v=home-20260718d";
 
 await ensureHomeGuiDom();
 bindIdentityMenu();
@@ -175,6 +175,13 @@ configureWindowHooks({
   renderTaskbar,
   syncMenubar,
   updateTaskbarState,
+  // One Wallet session: dock/desktop window launch retires the rail so we
+  // do not keep two iframes / home_tokens for the same capsule.
+  retireWalletRailBeforeWindow: () => {
+    if (walletRailOpen()) {
+      retireWalletRail();
+    }
+  },
 });
 
 function homeGuiHostNodes() {

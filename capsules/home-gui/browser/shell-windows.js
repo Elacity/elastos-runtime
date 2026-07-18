@@ -23,7 +23,7 @@ import {
   targetById,
   toolbarActiveTitleNode,
   taskbarTargets,
-} from "./shell-core.js?v=home-20260717b";
+} from "./shell-core.js?v=home-20260718d";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -34,8 +34,8 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260717b";
-import { playUiSound } from "./shell-sounds.js?v=home-20260717b";
+} from "./shell-window-geometry.js?v=home-20260718d";
+import { playUiSound } from "./shell-sounds.js?v=home-20260718d";
 
 let windowHooks = null;
 const PEOPLE_DISCOVERY_AUTO_REFRESH_INITIAL_MS = 1_500;
@@ -814,6 +814,9 @@ function launchActionKey(targetId, query) {
 }
 
 export function openTarget(targetId, options = {}) {
+  if (targetId === "wallet") {
+    windowHooks?.retireWalletRailBeforeWindow?.();
+  }
   if (SINGLE_SESSION_TARGETS.has(targetId) && browserWindowCount(targetId) > 0) {
     activateTargetGroup(targetId);
     return;

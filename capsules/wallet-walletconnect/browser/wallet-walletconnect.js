@@ -25,6 +25,8 @@ function boot() {
   setState("0 linked");
   if (!ceremonyMode) {
     refreshWalletState().catch((error) => showStatus(String(error.message || error), "error"));
+  } else {
+    queueCeremonyAutostart();
   }
 }
 
@@ -37,11 +39,30 @@ function applyCeremonyMode() {
   if (eyebrow) {
     eyebrow.textContent = "Continue with WalletConnect";
   }
+  if (connectButton) {
+    connectButton.textContent = "Continue with WalletConnect";
+  }
   document.querySelectorAll(".wallet-panel").forEach((panel, index) => {
     if (index > 0) {
       panel.hidden = true;
     }
   });
+}
+
+function queueCeremonyAutostart() {
+  if (!connectButton) {
+    return;
+  }
+  showStatus("Opening wallet…", "muted");
+  window.requestAnimationFrame(() => {
+    onConnect().catch(() => {});
+  });
+}
+
+function markCeremonyRetry() {
+  if (ceremonyMode && connectButton) {
+    connectButton.textContent = "Try again";
+  }
 }
 
 async function onConnect() {
@@ -70,6 +91,7 @@ async function onConnect() {
     await refreshWalletState();
   } catch (error) {
     showStatus(String(error.message || error), "error");
+    markCeremonyRetry();
   } finally {
     setButtonBusy(connectButton, false);
   }

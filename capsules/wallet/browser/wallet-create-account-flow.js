@@ -3,9 +3,9 @@ export function createWalletCreateAccountFlow({
   buildViewAccounts,
   closeModal,
   fetchJson,
+  flowHost,
   flowRow,
   modalButton,
-  modalNode,
   nextAccountName,
   notifyHomeSummaryChanged,
   openFlowModal,
@@ -16,6 +16,7 @@ export function createWalletCreateAccountFlow({
   shellHeaders,
   showStatus,
 }) {
+  const accountsSurface = { surface: "accounts" };
   const evmChainNamespaces = MANAGED_CHAIN_NAMESPACES.filter((namespace) =>
     namespace.startsWith("eip155:"),
   );
@@ -26,6 +27,13 @@ export function createWalletCreateAccountFlow({
   async function onCreateManagedWallet(event) {
     event.preventDefault();
     openCreateAccountFlow();
+  }
+
+  function primaryActionButton() {
+    const host = typeof flowHost === "function" ? flowHost() : null;
+    return host?.querySelector(
+      ".wallet-modal-actions .wallet-button:not(.wallet-button-secondary)",
+    ) || null;
   }
 
   function openCreateAccountFlow() {
@@ -53,6 +61,7 @@ export function createWalletCreateAccountFlow({
       "Choose the account type. Chains are provider routes, not separate wallet types.",
       rows,
       [modalButton("Cancel", closeModal, true)],
+      accountsSurface,
     );
   }
 
@@ -79,6 +88,7 @@ export function createWalletCreateAccountFlow({
         modalButton("Back", openCreateAccountFlow, true),
         modalButton("Create", () => form.requestSubmit()),
       ],
+      accountsSurface,
     );
   }
 
@@ -101,9 +111,7 @@ export function createWalletCreateAccountFlow({
       showStatus("No supported provider is available for this account type.", "error");
       return;
     }
-    const submit = modalNode.querySelector(
-      ".wallet-modal-actions .wallet-button:not(.wallet-button-secondary)",
-    );
+    const submit = primaryActionButton();
     setBusy(submit, true);
     try {
       for (const [index, chainNamespace] of targetNamespaces.entries()) {
@@ -138,7 +146,7 @@ export function createWalletCreateAccountFlow({
     form.className = "wallet-flow-form";
     form.innerHTML = `
       <label>Wallet recovery key
-        <textarea name="recovery_key" rows="8" spellcheck="false" placeholder='{"schema":"elastos.wallet.recovery-key/v1",...}'></textarea>
+        <textarea name="recovery_key" rows="6" spellcheck="false" placeholder='{"schema":"elastos.wallet.recovery-key/v1",...}'></textarea>
       </label>
       <label>Name <input name="label" autocomplete="off" maxlength="40" placeholder="Recovered account"></label>
       <p class="wallet-flow-hint">Paste an individual Wallet recovery key. A full System Recovery Kit can restore Home data and included built-in Wallet accounts from System.</p>
@@ -157,6 +165,7 @@ export function createWalletCreateAccountFlow({
         modalButton("Cancel", closeModal, true),
         modalButton("Import", () => form.requestSubmit()),
       ],
+      accountsSurface,
     );
   }
 
@@ -179,9 +188,7 @@ export function createWalletCreateAccountFlow({
       showStatus("Paste an elastos.wallet.recovery-key/v1 account key.", "error");
       return;
     }
-    const submit = modalNode.querySelector(
-      ".wallet-modal-actions .wallet-button:not(.wallet-button-secondary)",
-    );
+    const submit = primaryActionButton();
     setBusy(submit, true);
     try {
       const homeToken = await requestFreshPasskeyHomeToken();
