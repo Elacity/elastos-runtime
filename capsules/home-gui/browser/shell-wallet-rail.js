@@ -52,7 +52,9 @@ export function bindWalletRail() {
   });
   closeButton?.addEventListener("click", () => hideWalletRail());
   windowButton?.addEventListener("click", () => {
-    hideWalletRail({ restoreFocus: false });
+    // Single session: tear down the rail frame before the window launch so
+    // two home_tokens never race.
+    retireWalletRail();
     openTarget("wallet");
   });
   retryButton?.addEventListener("click", () => {
@@ -75,17 +77,67 @@ export function walletRailAvailable() {
   return Boolean(targetById(shellState.currentSummary, "wallet"));
 }
 
-/* Called on every summary sync: the bar icon exists exactly when the home
-   carries a wallet target — never a dead button. */
-export function syncWalletRailAvailability() {
+export function walletRailFrame() {
+  return frame;
+}
+
+/* Pending wallet approvals from summary facts — badge only, no authority. */
+export function syncWalletRailAvailability(summary = shellState.currentSummary) {
   if (!barButton) {
     return;
   }
-  const available = walletRailAvailable();
+  const available = Boolean(targetById(summary, "wallet"));
   barButton.hidden = !available;
   if (!available) {
     retireWalletRail();
+    syncWalletBarBadge(0);
+    return;
   }
+  syncWalletBarBadge(walletApprovalPendingCount(summary));
+}
+
+function walletApprovalPendingCount(summary) {
+  const entries = Array.isArray(summary?.notifications?.entries)
+    ? summary.notifications.entries
+    : [];
+  return entries.filter((entry) => {
+    const actionId = entry?.action_ref?.action_id;
+    return (
+      entry?.kind === "wallet_approval_request" &&
+      typeof actionId === "string" &&
+      actionId.startsWith("wallet-approve-request:")
+    );
+  }).length;
+}
+
+function syncWalletBarBadge(count) {
+  if (!barButton) {
+    return;
+  }
+  let badge = barButton.querySelector(".toolbar-wallet-count");
+  if (count <= 0) {
+    if (badge) {
+      badge.hidden = true;
+      badge.textContent = "";
+    }
+    barButton.setAttribute(
+      "aria-label",
+      walletRailOpen() ? "Wallet. Close" : "Wallet",
+    );
+    return;
+  }
+  if (!badge) {
+    badge = document.createElement("span");
+    badge.className = "toolbar-wallet-count";
+    badge.setAttribute("aria-hidden", "true");
+    barButton.appendChild(badge);
+  }
+  badge.hidden = false;
+  badge.textContent = count > 99 ? "99+" : String(count);
+  barButton.setAttribute(
+    "aria-label",
+    `Wallet. ${count} pending approval${count === 1 ? "" : "s"}`,
+  );
 }
 
 export function showWalletRail() {

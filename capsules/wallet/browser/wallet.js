@@ -1,11 +1,11 @@
-import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260523a";
+import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260718a";
 import {
   createWalletApi,
   readHomeOrigin,
   readLaunchToken,
   readQueryParam,
-} from "./wallet-api.js?v=wallet-20260715a";
-import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260523a";
+} from "./wallet-api.js?v=wallet-20260718a";
+import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260718a";
 import {
   BALANCE_NETWORKS,
   MANAGED_CHAIN_NAMESPACES,
@@ -24,14 +24,14 @@ import {
   readText,
   shortAddress,
   validateAddress,
-} from "./wallet-format.js?v=wallet-20260523a";
-import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260711c";
-import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260711b";
-import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260523a";
-import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260523a";
-import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260711b";
-import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260523a";
-import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260522a";
+} from "./wallet-format.js?v=wallet-20260718a";
+import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260718a";
+import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260718a";
+import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260718a";
+import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260718a";
+import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260718a";
+import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260718a";
+import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260718a";
 import {
   accountCard,
   copyButton,
@@ -39,7 +39,7 @@ import {
   emptyHero,
   setBusy,
   textNode,
-} from "./wallet-render.js?v=wallet-20260711c";
+} from "./wallet-render.js?v=wallet-20260718a";
 
 const statusNode = document.querySelector("#wallet-status");
 const homeParentOrigin = readHomeOrigin();
@@ -54,6 +54,9 @@ const deltaNode = document.querySelector("#wallet-delta");
 const deltaValueNode = document.querySelector("#wallet-delta-value");
 const sendButton = document.querySelector("#wallet-send");
 const receiveButton = document.querySelector("#wallet-receive");
+const getStartedNode = document.querySelector("#wallet-get-started");
+const connectCtaButton = document.querySelector("#wallet-connect-cta");
+const signersSection = document.querySelector("#wallet-signers");
 const accountDetailNode = document.querySelector("#wallet-account-detail");
 const modalBackdropNode = document.querySelector("#wallet-modal-backdrop");
 const modalNode = document.querySelector("#wallet-modal");
@@ -98,9 +101,12 @@ const {
   openApprovalMethod,
   renderMethods,
 } = createWalletPreferences({
+  closeModal,
   fetchJson,
   getHomeToken: () => activeHomeToken,
+  modalButton,
   notifyHomeSummaryChanged,
+  openFlowModal,
   renderAll,
   requestFreshPasskeyHomeToken,
   refreshWalletState,
@@ -223,6 +229,7 @@ function boot() {
   document.addEventListener("click", onWalletActionClick);
   sendButton?.addEventListener("click", openSendFlow);
   receiveButton?.addEventListener("click", openReceiveFlow);
+  connectCtaButton?.addEventListener("click", focusSignersSection);
   modalBackdropNode?.addEventListener("click", closeModal);
   document.addEventListener("click", onDocumentClick);
   document.addEventListener("keydown", (event) => {
@@ -234,7 +241,70 @@ function boot() {
   });
   bindPreferenceEvents();
   window.addEventListener("message", onRuntimeEvents);
+  window.addEventListener("message", onShellMenuCommand);
+  announceShellMenuManifest();
   refreshWalletState().catch((error) => showStatus(String(error.message || error), "error"));
+}
+
+// Shell menu bar: declare File/Account menus to Home; commands come back as
+// elastos:menu-command and route to the same flows the buttons open. Every
+// entry still ends at the same passkey/approval gates — menus add no authority.
+function announceShellMenuManifest() {
+  if (!activeHomeToken || !homeParentOrigin || window.top === window) {
+    return;
+  }
+  window.top.postMessage({
+    type: "home:menu-manifest",
+    homeToken: activeHomeToken,
+    menus: [
+      {
+        title: "File",
+        items: [
+          { label: "Send...", cmd: "send" },
+          { label: "Receive...", cmd: "receive" },
+          "-",
+          { label: "Refresh", cmd: "refresh" },
+          "-",
+          { label: "Close Window", cmd: "__close-window" },
+        ],
+      },
+      {
+        title: "Account",
+        items: [
+          { label: "Create Account...", cmd: "create-account" },
+          { label: "Import Recovery Key...", cmd: "import-recovery-key" },
+        ],
+      },
+    ],
+  }, homeParentOrigin);
+}
+
+function onShellMenuCommand(event) {
+  if (event.origin !== homeParentOrigin || event.source !== window.top) {
+    return;
+  }
+  const message = event.data;
+  if (message?.type !== "elastos:menu-command" || typeof message.cmd !== "string") {
+    return;
+  }
+  switch (message.cmd) {
+    case "send":
+      openSendFlow();
+      return;
+    case "receive":
+      openReceiveFlow();
+      return;
+    case "refresh":
+      refreshWalletState().catch((error) => showStatus(String(error.message || error), "error"));
+      return;
+    case "create-account":
+      openCreateAccountFlow();
+      return;
+    case "import-recovery-key":
+      openImportRecoveryKeyFlow();
+      return;
+    default:
+  }
 }
 
 function onRuntimeEvents(event) {
@@ -588,8 +658,9 @@ function accountMatchesDefault(account, defaultAccount) {
 function renderAccounts(accounts) {
   accountsNode.replaceChildren();
   stateNode.textContent = `${accounts.length} account${accounts.length === 1 ? "" : "s"}`;
+  // Create / Import stay visible even with accounts — never bury the path.
   if (accountActionsNode) {
-    accountActionsNode.hidden = accounts.length > 0;
+    accountActionsNode.hidden = false;
   }
   if (accounts.length === 0) {
     accountsNode.append(emptyHero());
@@ -606,8 +677,29 @@ function renderAccounts(accounts) {
 }
 
 function updateFlowButtons(accounts) {
-  sendButton.disabled = accounts.length === 0;
-  receiveButton.disabled = accounts.length === 0;
+  const empty = accounts.length === 0;
+  sendButton.disabled = empty;
+  receiveButton.disabled = empty;
+  if (sendButton) {
+    sendButton.hidden = empty;
+  }
+  if (receiveButton) {
+    receiveButton.hidden = empty;
+  }
+  if (getStartedNode) {
+    getStartedNode.hidden = !empty;
+  }
+}
+
+function focusSignersSection() {
+  if (!signersSection) {
+    return;
+  }
+  signersSection.classList.add("is-highlighted");
+  signersSection.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  window.setTimeout(() => {
+    signersSection.classList.remove("is-highlighted");
+  }, 1600);
 }
 
 function openAccountDetail(accountId) {

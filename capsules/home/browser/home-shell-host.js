@@ -52,7 +52,7 @@ const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   people: new Set(["chat-room"]),
   services: new Set(["browser", "chat-room"]),
   system: "visible-target",
-  "wallet": new Set(["wallet-metamask", "wallet-unisat"]),
+  "wallet": new Set(["wallet-metamask", "wallet-unisat", "wallet-walletconnect"]),
 });
 const SHELL_MESSAGE_OPEN_URI_SOURCES = new Set(["documents", "chat-room"]);
 const SHELL_MESSAGE_DELIVER_TARGET_SOURCES = Object.freeze({

@@ -664,7 +664,7 @@ function normalizeDesktopAppTargets(targetIds, summary) {
 /* Fresh principals get a working dock instead of an empty bar: the everyday
    surfaces, pinned in a fixed order. Purely a first-run default — the saved
    layout owns the dock from the first change onward. */
-const DEFAULT_TASKBAR_PINS = ["browser", "library", "documents", "chat", "system"];
+const DEFAULT_TASKBAR_PINS = ["browser", "library", "wallet", "documents", "chat", "system"];
 
 function defaultTaskbarPins(summary) {
   const knownTargets = new Set(allVisibleTargets(summary).map((target) => target.target));

@@ -6,7 +6,7 @@
 <title>Wallet · ElastOS</title>
 <script src="./elastos-theme.js"></script>
 <link rel="stylesheet" href="./elastos-ui.css">
-<link rel="stylesheet" href="./style.css?v=wallet-20260717a">
+<link rel="stylesheet" href="./style.css?v=wallet-20260718a">
 </head>
 <body>
   <main class="wallet-shell" aria-label="Wallet">
@@ -25,6 +25,12 @@
             <div class="wallet-action-row">
               <button id="wallet-send" class="wallet-button" type="button">↗ Send</button>
               <button id="wallet-receive" class="wallet-button wallet-button-secondary" type="button">↙ Receive</button>
+            </div>
+            <div id="wallet-get-started" class="wallet-action-row wallet-get-started" hidden>
+              <button class="wallet-button" type="button" data-wallet-create-account>Create account</button>
+              <button id="wallet-connect-cta" class="wallet-button wallet-button-secondary" type="button">
+                Connect a wallet
+              </button>
             </div>
           </div>
           <div id="wallet-delta" class="wallet-delta" hidden>
@@ -52,6 +58,16 @@
         <div id="wallet-accounts" class="wallet-account-grid" aria-live="polite"></div>
       </section>
 
+      <section id="wallet-signers" class="wallet-section" aria-label="Wallets and signers">
+        <div class="wallet-section-heading">
+          <div>
+            <h2>Wallets &amp; signers</h2>
+            <span class="wallet-state">Built-in passkey accounts, or connect MetaMask, UniSat, or WalletConnect.</span>
+          </div>
+        </div>
+        <div id="wallet-methods" class="wallet-methods"></div>
+      </section>
+
       <section id="wallet-requests-panel" class="wallet-section wallet-requests-panel" hidden>
         <div class="wallet-section-heading">
           <h2>Requests</h2>
@@ -70,7 +86,8 @@
       <div class="wallet-settings">
         <div class="wallet-settings-main">
           <section class="wallet-settings-card">
-            <h3>Manage accounts</h3>
+            <h3>Accounts</h3>
+            <p class="wallet-state">Create, import, and connect wallets from the main Wallet view.</p>
             <button id="wallet-create" class="wallet-button" type="button" data-wallet-create-account>Create account</button>
             <button id="wallet-import-recovery-key" class="wallet-button wallet-button-secondary" type="button" data-wallet-import-recovery-key>Import Wallet recovery key</button>
           </section>
@@ -87,12 +104,6 @@
             <button id="wallet-privacy-settings" class="wallet-button wallet-button-secondary" type="button">Hide balances</button>
           </section>
         </div>
-        <aside class="wallet-settings-side" aria-label="Approval methods">
-          <section class="wallet-settings-card">
-            <h3>Approval methods</h3>
-            <div id="wallet-methods" class="wallet-methods"></div>
-          </section>
-        </aside>
       </div>
     </aside>
 
@@ -110,6 +121,6 @@
     <div id="wallet-modal-backdrop" class="wallet-modal-backdrop" hidden></div>
     <section id="wallet-modal" class="wallet-modal" hidden aria-live="polite"></section>
   </main>
-  <script type="module" src="./wallet.js?v=wallet-20260711c"></script>
+  <script type="module" src="./wallet.js?v=wallet-20260718a"></script>
 </body>
 </html>

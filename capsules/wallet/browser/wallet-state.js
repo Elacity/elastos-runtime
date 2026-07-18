@@ -3,7 +3,7 @@ import {
   parseBalanceValue,
   readText,
   unitsToNumber,
-} from "./wallet-format.js?v=wallet-20260717a";
+} from "./wallet-format.js?v=wallet-20260718a";
 
 export function createWalletStateLoader({ fetchJson, shellHeaders }) {
   async function loadPrices() {
