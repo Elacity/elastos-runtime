@@ -78,6 +78,17 @@ Two follow-ups found in live product smoke, same closed-set discipline:
   pattern, verbatim), and `wallet-metamask` joins `wallet-unisat` in the
   connector popup sandbox extras.
 
+## Known limitation inherited from the opaque-frame model (decision yours)
+
+`gba-emulator` fail-closes with "This browser does not provide isolated
+WebAssembly threads": the mGBA build needs `crossOriginIsolated` +
+`SharedArrayBuffer`, and an opaque-sandboxed frame (no `allow-same-origin`)
+can never be cross-origin isolated, even with the gateway's COOP/COEP headers.
+This reproduces identically on your tip — we did not reintroduce
+`allow-same-origin` to paper over it. Options if you want GBA playable:
+a credentialless/COEP-frame carve-out, a non-threaded mGBA build, or a scoped
+same-origin grant for the viewer. Your model, your call.
+
 ## Forbidden paths (ripgrep-clean on this tip)
 
 - No `openPeopleWindow` / embedded People DOM

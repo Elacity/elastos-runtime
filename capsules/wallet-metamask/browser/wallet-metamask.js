@@ -154,6 +154,15 @@ async function onConnect() {
     markCeremonyRetry();
     return;
   }
+  // In the opaque-sandboxed sheet MetaMask's inpage provider announces while
+  // its content-script transport is dead — requests then hang forever, never
+  // reject. Probe with a promptless call before committing the button to its
+  // busy state; a hung probe means "no usable provider here", go top-level.
+  if (isEmbeddedFrame() && !(await providerTransportAlive(provider))) {
+    handleMissingProvider();
+    markCeremonyRetry();
+    return;
+  }
   setButtonBusy(connectButton, true);
   interactionBusy = true;
   showStatus("In MetaMask, pick the account you want to link, then approve.", "muted");
@@ -197,6 +206,26 @@ async function onConnect() {
   } finally {
     setButtonBusy(connectButton, false);
     interactionBusy = false;
+  }
+}
+
+const PROVIDER_PROBE_TIMEOUT_MS = 1500;
+
+async function providerTransportAlive(provider) {
+  try {
+    await Promise.race([
+      provider.request({ method: "eth_chainId" }),
+      new Promise((_, reject) => {
+        window.setTimeout(
+          () => reject(new Error("MetaMask transport probe timed out")),
+          PROVIDER_PROBE_TIMEOUT_MS,
+        );
+      }),
+    ]);
+    return true;
+  } catch (error) {
+    return !isDeadProviderTransportError(error) &&
+      !String(error?.message || "").includes("probe timed out");
   }
 }
 
