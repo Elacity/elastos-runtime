@@ -1620,7 +1620,7 @@ const gbaLiveSmoke = read("scripts/gba-live-smoke.mjs");
 const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
 const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
-const homeAssetVersion = "home-20260715a";
+const homeAssetVersion = "home-20260719b";
 const homeGuiAssetVersion = "home-20260719a";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
@@ -1798,6 +1798,15 @@ assert(
 assert(
   shellJs.includes('"home-gui": "visible-target"'),
   "The isolated Home GUI shell may request only Runtime-visible launch targets",
+);
+// Connectors are hidden from the visible-target summary by design, yet the
+// GUI hosts the wallet rail ceremony sheet. Without this carve-out the host
+// denies every connector launch (2026-07-19 "Home denied the shell launch").
+assert(
+  shellJs.includes(
+    "context.targetId === HOME_GUI_SHELL_ID && WALLET_CONNECTOR_TARGETS.has(target)",
+  ) && shellJs.includes('"wallet": WALLET_CONNECTOR_TARGETS'),
+  "Home GUI must carry the wallet's closed connector-launch authority (rail ceremony sheet)",
 );
 assert(
   shellJs.includes('"archive-manager": new Set(["library"])'),
@@ -6724,8 +6733,9 @@ assert(
       "ensure_wallet_connector_configured(data_dir, app)",
     ) &&
     shellJs.includes(
-      '"wallet": new Set(["wallet-metamask", "wallet-unisat", "wallet-walletconnect"])',
+      'new Set(["wallet-metamask", "wallet-unisat", "wallet-walletconnect"])',
     ) &&
+    shellJs.includes('"wallet": WALLET_CONNECTOR_TARGETS') &&
     !systemJs.includes("wallet-walletconnect") &&
     read("components.json").includes('"wallet-walletconnect"'),
   "WalletConnect must be installable as a capsule while its SDK/configuration stay fail-closed until pinned and tested",

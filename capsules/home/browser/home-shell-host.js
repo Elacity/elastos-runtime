@@ -16,7 +16,7 @@ import {
   shellState,
   fetchJson,
   targetById,
-} from "./shell-core.js?v=home-20260715a";
+} from "./shell-core.js?v=home-20260719b";
 import {
   bindHomeUnlock,
   hideHomeUnlock,
@@ -25,7 +25,7 @@ import {
   requestPasskeyHomeAuthority,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260715a";
+} from "./shell-auth.js?v=home-20260719b";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
@@ -39,6 +39,9 @@ const HOME_CLI_SHELL_ID = "home-cli";
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
 const MAX_LAUNCHED_APP_CONTEXTS = 128;
+const WALLET_CONNECTOR_TARGETS = Object.freeze(
+  new Set(["wallet-metamask", "wallet-unisat", "wallet-walletconnect"]),
+);
 const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   "archive-manager": new Set(["library"]),
   browser: new Set(["library"]),
@@ -52,7 +55,7 @@ const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   people: new Set(["chat-room"]),
   services: new Set(["browser", "chat-room"]),
   system: "visible-target",
-  "wallet": new Set(["wallet-metamask", "wallet-unisat", "wallet-walletconnect"]),
+  "wallet": WALLET_CONNECTOR_TARGETS,
 });
 const SHELL_MESSAGE_OPEN_URI_SOURCES = new Set(["documents", "chat-room"]);
 const SHELL_MESSAGE_DELIVER_TARGET_SOURCES = Object.freeze({
@@ -1052,6 +1055,13 @@ function canOpenTargetFromHomeMessage(context, target) {
   const policy = SHELL_MESSAGE_OPEN_TARGET_SOURCES[context.targetId];
   if (!policy) {
     return false;
+  }
+  // Connector capsules are hidden from Home's visible targets by design, so
+  // the visible-target policy can never authorize them. The GUI hosts the
+  // wallet rail ceremony sheet, so it carries the wallet's connector-launch
+  // authority — the same closed set the wallet capsule itself holds.
+  if (context.targetId === HOME_GUI_SHELL_ID && WALLET_CONNECTOR_TARGETS.has(target)) {
+    return true;
   }
   if (policy === "visible-target") {
     return !!targetById(shellState.currentSummary, target) &&

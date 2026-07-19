@@ -38,7 +38,7 @@ git merge-base --is-ancestor 70ef68532 HEAD   # must succeed
 
 | File | Why |
 |------|-----|
-| `home-shell-*.mjs` (bridge, regression, recovery, no-hint, stale-hint, switchback, system-switch, auth-gate) | GUI cache tip `home-20260715a` → `home-20260719a`; `FakeElement.append(...)` shim because our chrome uses `Element.append`; regression summary uses `desktopApps` (successor of `desktopHidden`) |
+| `home-shell-*.mjs` (bridge, regression, recovery, no-hint, stale-hint, switchback, system-switch, auth-gate) | GUI cache tip `home-20260715a` → `home-20260719a`; host cache tip `home-20260715a` → `home-20260719b` (host JS changed, see host authority note); `FakeElement.append(...)` shim because our chrome uses `Element.append`; regression summary uses `desktopApps` (successor of `desktopHidden`) |
 | `home-passkey-virtual-auth-smoke.mjs` | First boot now opens on a welcome beat; smoke conditionally clicks "Get started" before the create-passkey form |
 | `wallet-product-safety-smoke.sh` | New assert: MetaMask connect must revoke + re-prompt `eth_accounts` so a second account can be linked |
 | `wallet-connector-transaction-smoke.mjs` | Mock provider answers `wallet_requestPermissions` / `wallet_revokePermissions` used by the connect ceremony |
@@ -52,6 +52,17 @@ During integration the `launchTarget` forward was briefly dropped from
 the GUI threw at module load (black desktop). Fixed in `9356944eb`, and the
 entropy check now asserts the wiring so `just verify` catches this class of
 regression (assert verified to fail on the broken commit).
+
+## Host authority note (one deliberate policy extension)
+
+Your `SHELL_MESSAGE_OPEN_TARGET_SOURCES` gives `home-gui` the `visible-target`
+policy, and connectors (`wallet-metamask`/`wallet-unisat`/`wallet-walletconnect`)
+are hidden from the visible summary by design — so with the connector ceremony
+sheet living in GUI chrome, every connector launch was denied ("Home denied the
+shell launch"). We extended `canOpenTargetFromHomeMessage` so the GUI also
+carries the wallet's connector set — the exact same closed set your `"wallet"`
+entry holds (now shared as `WALLET_CONNECTOR_TARGETS`), nothing broader. The
+entropy check asserts both the carve-out and that the set stays closed.
 
 ## Forbidden paths (ripgrep-clean on this tip)
 

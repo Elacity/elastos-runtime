@@ -3,7 +3,7 @@ import {
   fetchJson,
   setHomeAuthorityToken,
   trapTabWithin,
-} from "./shell-core.js?v=home-20260715a";
+} from "./shell-core.js?v=home-20260719b";
 
 const unlockPanel = document.querySelector("#home-unlock");
 const unlockCard = document.querySelector(".home-unlock-card");
