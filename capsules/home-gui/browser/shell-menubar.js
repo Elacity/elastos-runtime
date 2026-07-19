@@ -11,7 +11,7 @@
  * commands are dispatched only to the window that declared them.
  */
 
-import { shellState } from "./shell-core.js?v=home-20260719c";
+import { shellState } from "./shell-core.js?v=home-20260719e";
 
 /* Resolved lazily — the menubar lives in the lazy GUI template, which is not
    in the DOM at module-evaluation time. */

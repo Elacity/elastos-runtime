@@ -1,0 +1,33 @@
+---
+description: Opaque-frame UI/UX principles for Home shell work on Anders' ESP tip
+globs: capsules/**/browser/**/*.{js,html,css},scripts/home-*.mjs,ANDERS_REVIEW_PACK.md
+alwaysApply: false
+---
+
+# Opaque-frame UI/UX (ESP shell)
+
+Branch context: `feat/shell-ui-esp-on-protocol` on Anders tip `70ef68532`.
+Backend (`elastos/`) stays byte-identical. UI lives in capsules only.
+
+## Four architectural facts
+
+1. **Every capsule frame is opaque.** No `localStorage`/`sessionStorage`, `event.origin` is `"null"`, extensions cannot inject, `crossOriginIsolated` is impossible. Persist or cross-frame state only via the Home host (real-origin document). Template: `home:ui-preference`.
+2. **postMessage idiom is fixed.** Outbound to opaque frames: target `"*"`. Inbound from opaque: pin `event.origin === "null" && event.source === window.parent` (or the specific frame). Token-authorized messages go to `window.top` with `homeOrigin`.
+3. **Token'd API calls only from opaque frames.** Gateway rejects launch-token requests whose `Origin` is not `null`. Top-level extension ceremonies relay through the host bridge (`home:connector-popup-relay` / BroadcastChannel) — never call token'd APIs from a popup.
+4. **Never touch `elastos/`, never add `allow-same-origin`.** If a feature seems to need either, stop and surface it for Anders.
+
+## Process rules
+
+- New invariant → new assert in `scripts/home-entropy-check.mjs` in the same change.
+- Bump capsule cache tags (`?v=…`) with every asset change; sync to managed store (`~/elastos-mac-test-home/.../capsules/`) — gateway serves from there, not the repo.
+- Shared theme/tokens: edit `capsules/_shared/`, then `just vendor-ui`. Do not hand-edit vendored copies.
+- Prefer a live browser probe (Playwright + fresh gateway) for shell/wallet/theme paths; static gates alone miss opaque-frame failures.
+
+## Open edges (do not "fix" by weakening the model)
+
+- UniSat / WalletConnect still need the MetaMask-style popup relay port.
+- GBA / uCity threaded WASM awaits Anders' decision (opaque frames cannot be COI).
+
+## Authority extensions (closed sets only)
+
+Any new host policy must be a closed set, fail-closed, and documented in `ANDERS_REVIEW_PACK.md`. Existing: GUI may launch wallet connectors; content inherits viewer open-target policy; `home:ui-preference` (closed keys/enums); `home:connector-popup-relay` (connector sheets only).

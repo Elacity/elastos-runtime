@@ -57,6 +57,7 @@ let passkeyAuthorityActive = false;
 let pendingRecoveryImport = null;
 let activeShellName = "";
 let activeShellBusy = false;
+let uiPreferencesReadPromise = null;
 const DEFAULT_BACKGROUND_IMAGE_URL = "/apps/home-gui/wallpaper.webp";
 const BACKGROUND_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
 const BACKGROUND_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
@@ -99,6 +100,10 @@ async function boot() {
     return;
   }
   configureSettingsTabs();
+  configureThemeSegment();
+  configureAccentPicker();
+  configureDockAutoHide();
+  configureUiSounds();
   configureAppearanceEditor();
   configureGuestAccess();
   configurePasskeyAccess();
@@ -213,6 +218,148 @@ function setHiddenFields(field, hidden) {
   for (const node of document.querySelectorAll(`[data-field="${field}"]`)) {
     node.hidden = hidden;
   }
+}
+
+/* Theme + dock preferences: this opaque frame has no localStorage, so the
+   Home host is the canonical store. Clicks apply locally for instant feedback
+   and post home:ui-preference; the host persists and relays to the GUI, which
+   re-themes the shell chrome and every open app frame. */
+function postUiPreference(key, value) {
+  if (!frameHomeToken || !homeParentOrigin || window.top === window) {
+    return;
+  }
+  window.top.postMessage({
+    type: "home:ui-preference",
+    action: "write",
+    key,
+    value,
+    homeToken: frameHomeToken,
+  }, homeParentOrigin);
+}
+
+function readUiPreferencesFromHome() {
+  if (uiPreferencesReadPromise) {
+    return uiPreferencesReadPromise;
+  }
+  uiPreferencesReadPromise = requestUiPreferencesFromHome();
+  return uiPreferencesReadPromise;
+}
+
+function requestUiPreferencesFromHome() {
+  return new Promise((resolve) => {
+    if (!frameHomeToken || !homeParentOrigin || window.top === window) {
+      resolve({});
+      return;
+    }
+    const requestId = window.crypto?.randomUUID?.() || `system-ui-pref-${Date.now()}`;
+    const timeout = window.setTimeout(() => {
+      window.removeEventListener("message", onAnswer);
+      resolve({});
+    }, 5000);
+    function onAnswer(event) {
+      if (event.source !== window.top || event.origin !== homeParentOrigin) {
+        return;
+      }
+      const message = event.data || {};
+      if (message.type !== "home:shell-response" || message.requestId !== requestId) {
+        return;
+      }
+      window.clearTimeout(timeout);
+      window.removeEventListener("message", onAnswer);
+      resolve(message.result && typeof message.result === "object" ? message.result : {});
+    }
+    window.addEventListener("message", onAnswer);
+    window.top.postMessage({
+      type: "home:ui-preference",
+      action: "read",
+      requestId,
+      homeToken: frameHomeToken,
+    }, homeParentOrigin);
+  });
+}
+
+function configureThemeSegment() {
+  const segment = document.querySelector("#theme-segment");
+  if (!segment || !window.elastosTheme) {
+    return;
+  }
+  const options = segment.querySelectorAll("[data-theme-option]");
+  const sync = (preference) => {
+    for (const option of options) {
+      const selected = option.dataset.themeOption === preference;
+      option.classList.toggle("active", selected);
+      option.setAttribute("aria-checked", selected ? "true" : "false");
+    }
+  };
+  for (const option of options) {
+    option.addEventListener("click", () => {
+      window.elastosTheme.set(option.dataset.themeOption);
+      sync(window.elastosTheme.preference());
+      postUiPreference("theme", option.dataset.themeOption);
+    });
+  }
+  sync(window.elastosTheme.preference());
+  readUiPreferencesFromHome().then((preferences) => {
+    if (typeof preferences.theme === "string") {
+      window.elastosTheme.set(preferences.theme);
+      sync(preferences.theme);
+    }
+  });
+}
+
+function configureAccentPicker() {
+  const picker = document.querySelector("#accent-picker");
+  if (!picker || !window.elastosTheme) {
+    return;
+  }
+  const options = picker.querySelectorAll("[data-accent-option]");
+  const sync = (accent) => {
+    for (const option of options) {
+      const selected = option.dataset.accentOption === accent;
+      option.classList.toggle("active", selected);
+      option.setAttribute("aria-checked", selected ? "true" : "false");
+    }
+  };
+  for (const option of options) {
+    option.addEventListener("click", () => {
+      window.elastosTheme.setAccent(option.dataset.accentOption);
+      sync(window.elastosTheme.accent());
+      postUiPreference("accent", option.dataset.accentOption);
+    });
+  }
+  sync(window.elastosTheme.accent());
+  readUiPreferencesFromHome().then((preferences) => {
+    if (typeof preferences.accent === "string") {
+      window.elastosTheme.setAccent(preferences.accent);
+      sync(preferences.accent);
+    }
+  });
+}
+
+function configureDockAutoHide() {
+  const input = document.querySelector("#dock-autohide");
+  if (!input) {
+    return;
+  }
+  input.addEventListener("change", () => {
+    postUiPreference("dockAutoHide", input.checked ? "on" : "off");
+  });
+  readUiPreferencesFromHome().then((preferences) => {
+    input.checked = preferences.dockAutoHide === "on";
+  });
+}
+
+function configureUiSounds() {
+  const input = document.querySelector("#ui-sounds");
+  if (!input) {
+    return;
+  }
+  input.addEventListener("change", () => {
+    postUiPreference("sounds", input.checked ? "on" : "off");
+  });
+  readUiPreferencesFromHome().then((preferences) => {
+    input.checked = preferences.sounds === "on";
+  });
 }
 
 function configureAppearanceEditor() {

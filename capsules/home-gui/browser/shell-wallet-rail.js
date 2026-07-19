@@ -1,14 +1,15 @@
 import {
   escapeHtml,
+  pushUiPreferencesToFrameWindow,
   shellState,
   targetById,
-} from "./shell-core.js?v=home-20260719c";
+} from "./shell-core.js?v=home-20260719e";
 import {
   iframeAllowForLaunch,
   iframeSandboxForLaunch,
   launchHomeTarget,
   openTarget,
-} from "./shell-windows.js?v=home-20260719c";
+} from "./shell-windows.js?v=home-20260719e";
 
 /* Wallet rail: a right-hand slide-over that hosts the wallet capsule.
    Chrome only — it launches the wallet through the same host-mediated
@@ -314,6 +315,7 @@ function markFrameReady() {
   }
   frameReady = true;
   frame?.classList.add("is-ready");
+  pushUiPreferencesToFrameWindow(frame?.contentWindow);
   flushQueuedChromeCommand();
 }
 

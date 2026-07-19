@@ -47,7 +47,7 @@ import {
   desktopObjectByEntryId,
   desktopEntryExists,
   trapTabWithin,
-} from "./shell-core.js?v=home-20260719c";
+} from "./shell-core.js?v=home-20260719e";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -61,9 +61,9 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260719c";
-import { playUiSound } from "./shell-sounds.js?v=home-20260719c";
-import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260719c";
+} from "./shell-windows.js?v=home-20260719e";
+import { playUiSound } from "./shell-sounds.js?v=home-20260719e";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260719e";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -2385,10 +2385,17 @@ export function bindShellSurfaceDom() {
   bindDockAutoHideReveal();
 }
 
-/* ---- Dock auto-hide (local preference, same store as theme/sounds) ---- */
+/* ---- Dock auto-hide (host-persisted preference; see home:ui-preference) ----
+   This GUI document is opaque-sandboxed: every localStorage access throws, so
+   a write-then-read-back cycle silently resets the toggle. Keep the current
+   value in memory; the Home host owns persistence and replays it at boot. */
 const DOCK_AUTOHIDE_KEY = "elastos.ui.dockAutoHide";
+let dockAutoHideMemory = "";
 
 export function dockAutoHideEnabled() {
+  if (dockAutoHideMemory) {
+    return dockAutoHideMemory === "on";
+  }
   try {
     return localStorage.getItem(DOCK_AUTOHIDE_KEY) === "on";
   } catch (_error) {
@@ -2397,8 +2404,9 @@ export function dockAutoHideEnabled() {
 }
 
 export function setDockAutoHide(on) {
+  dockAutoHideMemory = on ? "on" : "off";
   try {
-    localStorage.setItem(DOCK_AUTOHIDE_KEY, on ? "on" : "off");
+    localStorage.setItem(DOCK_AUTOHIDE_KEY, dockAutoHideMemory);
   } catch (_error) {}
   syncDockAutoHide();
 }

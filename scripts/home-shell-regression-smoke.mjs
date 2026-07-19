@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260719c";
+const moduleVersion = "home-20260719e";
 const savedStatePatches = [];
 const requests = [];
 

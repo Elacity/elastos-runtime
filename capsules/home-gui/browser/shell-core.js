@@ -57,9 +57,9 @@ export const WINDOW_TOP_INSET = 8;
 export const WINDOW_BOTTOM_INSET = 72;
 export const CONTEXT_MENU_IGNORE_OUTSIDE_MS = 220;
 const HOME_GUI_TEMPLATE_ID = "home-gui-template";
-const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260719c", import.meta.url).href;
+const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260719e", import.meta.url).href;
 const HOME_GUI_STYLESHEET_ID = "home-gui-stylesheet";
-const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260719c", import.meta.url).href;
+const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260719e", import.meta.url).href;
 let homeGuiTemplateHtmlPromise = null;
 let homeGuiLaunchToken = "";
 
@@ -1151,4 +1151,33 @@ export function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll("\"", "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+/* ---- Shell UI preferences snapshot ----
+   The Home host is the canonical store (opaque frames have no localStorage);
+   the GUI keeps the last relayed snapshot here so frames that mount LATER
+   (windows, wallet rail, connector sheet) can be brought up to the current
+   theme on load — change-time broadcasts only reach frames already open. */
+const sharedUiPreferences = {};
+
+export function rememberSharedUiPreferences(preferences) {
+  if (preferences && typeof preferences === "object") {
+    Object.assign(sharedUiPreferences, preferences);
+  }
+}
+
+export function pushUiPreferencesToFrameWindow(frameWindow) {
+  if (!frameWindow || Object.keys(sharedUiPreferences).length === 0) {
+    return;
+  }
+  try {
+    // Recipient is an opaque-sandboxed capsule frame ("null" origin); the
+    // payload is cosmetic theme state, no secrets.
+    frameWindow.postMessage(
+      { type: "elastos:ui-preference", preferences: { ...sharedUiPreferences } },
+      "*",
+    );
+  } catch (_error) {
+    // Frame mid-teardown.
+  }
 }

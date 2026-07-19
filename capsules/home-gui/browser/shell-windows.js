@@ -18,8 +18,9 @@ import {
   saveShellSessionState,
   clearShellSessionState,
   ignoreRepeatedAction,
+  pushUiPreferencesToFrameWindow,
   targetById,
-} from "./shell-core.js?v=home-20260719c";
+} from "./shell-core.js?v=home-20260719e";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -30,7 +31,7 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260719c";
+} from "./shell-window-geometry.js?v=home-20260719e";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -855,6 +856,9 @@ function syncBrowserWindow(entry, launched) {
     // App iframes mount at opacity 0 (kills the white flash); the capsule
     // fades in on load. Without this class the window stays black forever.
     frame.classList.add("is-ready");
+    // Bring the fresh document up to the current shell theme (change-time
+    // broadcasts only reach frames that were already open).
+    pushUiPreferencesToFrameWindow(frame.contentWindow);
     if (entry.targetId !== "browser") {
       installFrameAutoFit(node, frame);
     }

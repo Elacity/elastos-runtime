@@ -38,7 +38,7 @@ git merge-base --is-ancestor 70ef68532 HEAD   # must succeed
 
 | File | Why |
 |------|-----|
-| `home-shell-*.mjs` (bridge, regression, recovery, no-hint, stale-hint, switchback, system-switch, auth-gate) | GUI and host cache tips `home-20260715a` → `home-20260719c` (host JS changed, see host authority note); `FakeElement.append(...)` shim because our chrome uses `Element.append`; regression summary uses `desktopApps` (successor of `desktopHidden`) |
+| `home-shell-*.mjs` (bridge, regression, recovery, no-hint, stale-hint, switchback, system-switch, auth-gate) | GUI and host cache tips `home-20260715a` → `home-20260719d` (host JS changed, see host authority note); `FakeElement.append(...)` shim because our chrome uses `Element.append`; regression summary uses `desktopApps` (successor of `desktopHidden`) |
 | `home-passkey-virtual-auth-smoke.mjs` | First boot now opens on a welcome beat; smoke conditionally clicks "Get started" before the create-passkey form |
 | `wallet-product-safety-smoke.sh` | New assert: MetaMask connect must revoke + re-prompt `eth_accounts` so a second account can be linked |
 | `wallet-connector-transaction-smoke.mjs` | Mock provider answers `wallet_requestPermissions` / `wallet_revokePermissions` used by the connect ceremony |
@@ -113,6 +113,65 @@ ceremony, and Browser menus were inert. The entropy check asserts the idiom
 on both capsules, and the live probe (sign-in → rail → chrome command →
 MetaMask ceremony → popup) runs with zero `postMessage` origin-mismatch
 warnings.
+
+## Connector popup relay (host-bridged; token'd APIs never leave the sheet)
+
+Your gateway fail-closes any launch-token API call whose `Origin` is not
+`null` (`require_capsule_browser_origin`) — correct, and we kept it. But it
+means the top-level connector popup (the only place a wallet extension
+injects; content scripts crash in opaque frames on `sessionStorage`) can
+never call `/api/auth/evm/*` itself: real origin → 500 "home launch token
+requires an opaque capsule origin". The popup also has no window handle back
+to the sheet (escaping a sandbox implies `noopener`), and `BroadcastChannel`
+is origin-partitioned, so popup and opaque sheet share nothing directly.
+
+The host is the piece that shares the popup's real origin, so it bridges:
+
+- popup drives the provider only (accounts, chain, `personal_sign`) and posts
+  stages on a same-origin `BroadcastChannel` (`elastos:connector-popup`);
+- the host forwards a stage only into the mounted frame whose launch token
+  matches the stage's correlation tail *and* whose target is in the closed
+  `WALLET_CONNECTOR_TARGETS` set;
+- the sheet makes every token'd API call (challenge, verify) from its opaque
+  frame and answers back through the host (`home:connector-popup-relay`,
+  token-bound app-frame context only).
+
+Stage payloads are an address, the SIWE challenge text, and its signature —
+no launch token and no secrets cross the channel. In the embedded sheet the
+Continue button opens the companion window synchronously on the click (no
+discovery/probe first): no provider can ever exist in the opaque frame, and
+burning the transient activation on a probe made strict popup blockers
+(Brave) deny the window we always need. Verified live end-to-end with an
+injected EIP-6963 fake provider: the ceremony reaches `verify` and fails
+only on the fake's garbage signature (403), with zero origin errors.
+`wallet-unisat` has the same latent issue on your tip (its popup calls
+`/api/auth/btc/*` from a real origin); we left it untouched and flag it here
+as a follow-up you may want the same bridge for.
+
+## Shell UI preferences (theme / accent / dock / sounds) — host is the store
+
+Opaque frames throw on every `localStorage` access, which silently killed the
+old preference model (localStorage + `storage` events fanning out across
+same-origin frames): theme clicks applied nothing, the dock auto-hide and
+sounds toggles reset themselves, and System's Personalization controls were
+dead. New canonical path, one direction:
+
+- System (Personalization) and the GUI Control Centre write
+  `home:ui-preference` to the host — closed key set (`theme`, `accent`,
+  `dockAutoHide`, `sounds`), closed value enums, writers restricted to the
+  System app-frame context and the `home-gui` shell-frame context;
+- the host (the only real-origin document) persists to its own localStorage
+  and relays a `ui-preference` gui-command; it replays stored preferences on
+  every `home:shell-ready`;
+- the GUI applies (theme runtime, dock class, sounds flag — all now with
+  in-memory overrides so opaque storage failures cannot reset state) and
+  fans `elastos:ui-preference` out to its app frames, whose vendored
+  `elastos-theme.js` (regenerated via `vendor-ui`) accepts it from the opaque
+  parent only.
+
+Cosmetic state only — no authority moves. Live probe: System → Light re-themes
+the GUI chrome instantly, dock auto-hide toggles the dock, and both survive a
+full reload + re-sign-in.
 
 ## Known limitation inherited from the opaque-frame model (decision yours)
 

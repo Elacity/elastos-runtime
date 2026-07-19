@@ -7,6 +7,17 @@ const requestsNode = document.querySelector("#wallet-requests");
 const frameHomeToken = readLaunchToken();
 const homeOrigin = readQueryParam("home_origin");
 const ceremonyMode = readQueryParam("presentation") === "sheet";
+// Top-level popup ceremony: the extension injects into a real top-level page,
+// but the gateway fail-closes token'd API calls from a non-opaque origin
+// ("home launch token requires an opaque capsule origin"), and a sandboxed
+// sheet opening a window that escapes its sandbox gets an implicit noopener —
+// no handle in either direction. So the popup relays over a same-origin
+// BroadcastChannel to the Home host (both are the gateway's real origin);
+// the host forwards to this opaque sheet by launch token. The popup only
+// drives the provider; every API call stays in the sheet.
+const CONNECTOR_POPUP_CHANNEL = "elastos:connector-popup";
+const CONNECTOR_POPUP_RELAY_TYPE = "elastos:connector-popup-relay";
+const popupRelayMode = !isEmbeddedFrame() && ceremonyMode && Boolean(frameHomeToken);
 const discoveredWalletProviders = [];
 // Skip the background poll while the user is mid-connect/mid-sign so we never tear down an
 // in-flight approval's button state, and a re-entrancy guard so polls can't overlap.
@@ -25,6 +36,9 @@ boot();
 function boot() {
   applyCeremonyMode();
   configureMetaMaskDiscovery();
+  if (ceremonyMode && isEmbeddedFrame()) {
+    bindSheetPopupRelay();
+  }
   if (connectButton) {
     connectButton.addEventListener("click", onConnect);
   }
@@ -144,6 +158,25 @@ function ensureWalletDiscovery(timeoutMs = 400) {
 }
 
 async function onConnect() {
+  // Extension content scripts crash in this opaque-sandboxed sheet, so no
+  // usable provider can EVER exist here — don't burn the user's click on
+  // discovery/probing (transient activation expires and the browser then
+  // blocks the window we know we need). Open the MetaMask companion window
+  // synchronously while the click is still live; the ceremony continues
+  // there and relays back to this sheet.
+  if (ceremonyMode && isEmbeddedFrame()) {
+    if (popupButton) {
+      popupButton.hidden = false;
+    }
+    if (navigator.userActivation?.isActive) {
+      openTopLevelConnector();
+    } else {
+      // Ceremony autostart has no gesture — invite the click instead of
+      // greeting the user with a blocked-popup error.
+      showStatus('MetaMask opens in its own window. Click "Continue in MetaMask".', "muted");
+    }
+    return;
+  }
   // Re-run EIP-6963 discovery and give announcements a tick to arrive, so a slow
   // MetaMask injection doesn't fall through to a window.ethereum a co-installed wallet
   // (e.g. Phantom) has overridden. Discovery is the authoritative, per-wallet source.
@@ -169,6 +202,20 @@ async function onConnect() {
   try {
     const { address, chainId } = await connectProvider(provider);
     showStatus("Approve the signature in MetaMask.", "muted");
+    if (popupRelayMode) {
+      // The sheet owns the API ceremony; this popup only signs.
+      const challengeMessage = await relayPopupStage("connected", { address, chainId });
+      const signer = await currentProviderAddress(provider);
+      ensureSameAddress(signer, address, "Wallet account changed before signing.");
+      const signature = await provider.request({
+        method: "personal_sign",
+        params: [challengeMessage, signer],
+      });
+      await relayPopupStage("signature", { message: challengeMessage, signature });
+      showStatus("Connected. You can close this window.", "success");
+      window.setTimeout(() => window.close(), 1200);
+      return;
+    }
     const challenge = await fetchJson("/api/auth/evm/challenge", {
       method: "POST",
       headers: shellHeaders({ "content-type": "application/json" }),
@@ -284,6 +331,120 @@ function openTopLevelConnector() {
     return;
   }
   showStatus("Continue in the MetaMask window, then approve there.", "muted");
+}
+
+/* ---- Popup relay: provider ceremony in the popup, API calls in this opaque
+   sheet. A window opened from a sandboxed frame (allow-popups-to-escape-
+   sandbox) carries an implicit noopener, and BroadcastChannel is partitioned
+   by origin — the opaque sheet and the real-origin popup share nothing. The
+   Home host shares the popup's real origin, so the popup rides a same-origin
+   BroadcastChannel to the host, and the host forwards to this sheet over its
+   token-bound frame bridge. Stage messages carry no launch token — only a
+   token tail as correlation id — and no secrets: an address, the SIWE
+   challenge text, and its signature. ---- */
+
+const POPUP_RELAY_TIMEOUT_MS = 120_000;
+
+function popupTokenTail() {
+  return frameHomeToken.slice(-32);
+}
+
+function relayPopupStage(stage, payload) {
+  return new Promise((resolve, reject) => {
+    const channel = new BroadcastChannel(CONNECTOR_POPUP_CHANNEL);
+    const timeout = window.setTimeout(() => {
+      channel.close();
+      reject(new Error("The Wallet sheet did not answer. Reopen the connector from Wallet."));
+    }, POPUP_RELAY_TIMEOUT_MS);
+    channel.onmessage = (event) => {
+      const message = event.data || {};
+      if (
+        message.type !== CONNECTOR_POPUP_RELAY_TYPE ||
+        message.from !== "sheet" ||
+        message.tokenTail !== popupTokenTail()
+      ) {
+        return;
+      }
+      window.clearTimeout(timeout);
+      channel.close();
+      if (message.stage === "error") {
+        reject(new Error(readText(message.error) || "The Wallet sheet reported an error."));
+        return;
+      }
+      resolve(readText(message.message));
+    };
+    channel.postMessage({
+      type: CONNECTOR_POPUP_RELAY_TYPE,
+      from: "popup",
+      tokenTail: popupTokenTail(),
+      stage,
+      ...payload,
+    });
+  });
+}
+
+function bindSheetPopupRelay() {
+  window.addEventListener("message", (event) => {
+    // Stage messages are forwarded by the Home host — the top window, real
+    // origin. Nothing else may drive the ceremony.
+    if (event.source !== window.top || event.origin !== homeOrigin) {
+      return;
+    }
+    const message = event.data || {};
+    if (message.type !== CONNECTOR_POPUP_RELAY_TYPE || message.from !== "popup") {
+      return;
+    }
+    handleSheetPopupStage(message).catch((error) => {
+      const text = String(error?.message || error);
+      showStatus(text, "error");
+      markCeremonyRetry();
+      postRelayToPopup({ stage: "error", error: text });
+    });
+  });
+}
+
+function postRelayToPopup(payload) {
+  if (!frameHomeToken || !homeOrigin || window.top === window) {
+    return;
+  }
+  window.top.postMessage({
+    type: "home:connector-popup-relay",
+    homeToken: frameHomeToken,
+    ...payload,
+  }, homeOrigin);
+}
+
+async function handleSheetPopupStage(message) {
+  if (message.stage === "connected") {
+    const address = readText(message.address);
+    const chainId = Number(message.chainId);
+    if (!address || !Number.isFinite(chainId) || chainId <= 0) {
+      throw new Error("MetaMask window returned an invalid account.");
+    }
+    showStatus("Approve the signature in the MetaMask window.", "muted");
+    const challenge = await fetchJson("/api/auth/evm/challenge", {
+      method: "POST",
+      headers: shellHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ address, chain_id: chainId }),
+    });
+    postRelayToPopup({ stage: "challenge", message: challenge.message });
+    return;
+  }
+  if (message.stage === "signature") {
+    const challengeMessage = readText(message.message);
+    const signature = readText(message.signature);
+    if (!challengeMessage || !signature) {
+      throw new Error("MetaMask window returned an incomplete signature.");
+    }
+    await fetchJson("/api/auth/evm/verify", {
+      method: "POST",
+      headers: shellHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ message: challengeMessage, signature }),
+    });
+    postRelayToPopup({ stage: "done" });
+    showStatus("Connected. Returning to Wallet…", "success");
+    notifyHomeSummaryChanged();
+  }
 }
 
 async function connectProvider(provider) {

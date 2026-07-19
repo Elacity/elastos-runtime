@@ -1620,8 +1620,8 @@ const gbaLiveSmoke = read("scripts/gba-live-smoke.mjs");
 const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
 const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
-const homeAssetVersion = "home-20260719c";
-const homeGuiAssetVersion = "home-20260719c";
+const homeAssetVersion = "home-20260719e";
+const homeGuiAssetVersion = "home-20260719e";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -4316,7 +4316,7 @@ const walletconnectConfigSmoke = read(
   "scripts/walletconnect-connector-config-smoke.sh",
 );
 const walletProviderDoc = read("docs/WALLET_PROVIDER.md");
-const systemAssetVersion = "system-20260712a";
+const systemAssetVersion = "system-20260719b";
 const shellAuth = read("capsules/home/browser/shell-auth.js");
 const protectedHomeStateSmoke = read("scripts/protected-home-state-smoke.sh");
 const auditChainBoundary = {
@@ -9759,6 +9759,38 @@ assert(
     !browserJs.includes("event.origin !== window.location.origin") &&
     browserJs.includes('type: "home:menu-manifest"'),
   "Browser menu channels must use opaque-frame origins (host-bound manifest, parent-pinned commands)",
+);
+// The gateway fail-closes token'd API calls from non-opaque origins, so the
+// MetaMask top-level popup must never call them: it drives the provider and
+// relays stages through the host's same-origin BroadcastChannel bridge to the
+// opaque sheet, which owns every API call.
+assert(
+  walletMetamaskJs.includes("popupRelayMode") &&
+    walletMetamaskJs.includes('"elastos:connector-popup"') &&
+    walletMetamaskJs.includes("relayPopupStage") &&
+    walletMetamaskJs.includes("bindSheetPopupRelay") &&
+    walletMetamaskJs.includes("handleSheetPopupStage") &&
+    walletMetamaskJs.includes('type: "home:connector-popup-relay"') &&
+    walletMetamaskJs.includes("event.source !== window.top || event.origin !== homeOrigin") &&
+    shellJs.includes('data.type === "home:connector-popup-relay"') &&
+    shellJs.includes("relayConnectorSheetAnswerToPopup") &&
+    shellJs.includes("WALLET_CONNECTOR_TARGETS.has(context.targetId)"),
+  "MetaMask popup ceremony must relay provider results host<->sheet (token'd APIs never leave the opaque sheet)",
+);
+// Shell UI preferences: opaque frames have no localStorage, so the host is
+// the canonical store — System/Control Centre write through home:ui-preference,
+// the host persists + relays a gui-command, the GUI applies and fans out.
+assert(
+  shellJs.includes('data.type === "home:ui-preference"') &&
+    shellJs.includes("UI_PREFERENCE_KEYS") &&
+    shellJs.includes("pushUiPreferencesToActiveShell") &&
+    homeGuiShell.includes('command === "ui-preference"') &&
+    homeGuiJs.includes("applyHomeGuiUiPreferences") &&
+    homeGuiJs.includes('type: "elastos:ui-preference"') &&
+    systemJs.includes("configureThemeSegment") &&
+    systemJs.includes("configureDockAutoHide") &&
+    systemJs.includes('type: "home:ui-preference"'),
+  "Shell UI preferences must flow System/GUI -> host store -> GUI apply/fan-out (no opaque-frame localStorage)",
 );
 assert(
   wallet.includes('id="wallet-currency-settings"') &&

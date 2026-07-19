@@ -1,4 +1,5 @@
 import {
+  applyHomeGuiUiPreferences,
   bindHomeGuiInteractions,
   closeHomeGuiWindowForToken,
   noteHomeGuiConnectorSheetSummaryRefresh,
@@ -9,8 +10,8 @@ import {
   setHomeGuiMounted,
   showHomeGuiDesktop,
   syncHomeGuiProjection,
-} from "./home-gui.js?v=home-20260719c";
-import { setHomeGuiLaunchToken } from "./shell-core.js?v=home-20260719c";
+} from "./home-gui.js?v=home-20260719e";
+import { setHomeGuiLaunchToken } from "./shell-core.js?v=home-20260719e";
 
 const route = new URL(window.location.href);
 const fragment = new URLSearchParams(route.hash.replace(/^#/, ""));
@@ -109,8 +110,23 @@ function handleGuiCommand(message) {
     noteHomeGuiConnectorSheetSummaryRefresh(message.homeToken);
     return true;
   }
+  if (command === "ui-preference") {
+    applyHomeGuiUiPreferences(message.preferences);
+    return true;
+  }
   return false;
 }
+
+// Control Centre / GUI chrome write shell preferences through the host — the
+// only real-origin document, so the only working localStorage. The module
+// raises a DOM event; we carry the token.
+window.addEventListener("elastos:ui-preference-changed", (event) => {
+  const detail = event?.detail || {};
+  if (typeof detail.key !== "string" || typeof detail.value !== "string") {
+    return;
+  }
+  postToHome({ type: "home:ui-preference", action: "write", key: detail.key, value: detail.value });
+});
 
 window.addEventListener("message", (event) => {
   if (event.source !== window.parent || event.origin !== homeOrigin) {

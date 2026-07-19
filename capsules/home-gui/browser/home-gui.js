@@ -20,16 +20,17 @@ import {
   ensureHomeGuiDom,
   initializeRecentTargets,
   initializeShellLayout,
+  rememberSharedUiPreferences,
   shellInteractionActive,
   shouldIgnoreDesktopKeydown,
   targetById,
-} from "./shell-core.js?v=home-20260719c";
+} from "./shell-core.js?v=home-20260719e";
 import {
   bindIdentityMenu,
   clearIdentitySurface,
   syncIdentity,
   updateClock,
-} from "./shell-chrome.js?v=home-20260719c";
+} from "./shell-chrome.js?v=home-20260719e";
 import {
   beginDesktopMarquee,
   bindShellSurfaceDom,
@@ -52,10 +53,11 @@ import {
   renderLauncher,
   renderTaskbar,
   selectAllDesktopIcons,
+  setDockAutoHide,
   toggleLauncher,
   updateDesktopMarquee,
   updateTaskbarState,
-} from "./shell-surface.js?v=home-20260719c";
+} from "./shell-surface.js?v=home-20260719e";
 import {
   closeWindow,
   cleanupBeforeUnload,
@@ -66,39 +68,40 @@ import {
   restoreShellSession,
   showDesktopHome,
   supportsMenuNewWindow,
-} from "./shell-windows.js?v=home-20260719c";
+} from "./shell-windows.js?v=home-20260719e";
 import {
   bindShellKeyboard,
   handleDesktopArrowKey,
   retireKeyboardSurfaces,
   toggleShortcutsOverlay,
-} from "./shell-keyboard.js?v=home-20260719c";
+} from "./shell-keyboard.js?v=home-20260719e";
 import {
   bindSpotlight,
   hideSpotlight,
   showSpotlight,
-} from "./shell-spotlight.js?v=home-20260719c";
+} from "./shell-spotlight.js?v=home-20260719e";
 import {
   bindNotificationCenter,
   hideNotificationCenter,
   recordNotifications,
-} from "./shell-notifications.js?v=home-20260719c";
+} from "./shell-notifications.js?v=home-20260719e";
 import {
   bindMenubar,
   closeMenus,
   setMenuManifest,
   syncMenubar,
-} from "./shell-menubar.js?v=home-20260719c";
+} from "./shell-menubar.js?v=home-20260719e";
 import {
   bindQuickLook,
   hideQuickLook,
   toggleQuickLook,
-} from "./shell-quicklook.js?v=home-20260719c";
-import { bindExpose, closeExpose } from "./shell-expose.js?v=home-20260719c";
+} from "./shell-quicklook.js?v=home-20260719e";
+import { bindExpose, closeExpose } from "./shell-expose.js?v=home-20260719e";
+import { setUiSoundsEnabled } from "./shell-sounds.js?v=home-20260719e";
 import {
   bindControlCentre,
   hideControlCentre,
-} from "./shell-control-centre.js?v=home-20260719c";
+} from "./shell-control-centre.js?v=home-20260719e";
 import {
   bindWalletRail,
   retireWalletRail,
@@ -107,7 +110,7 @@ import {
   walletRailFrame,
   walletRailOpen,
   walletRailSessionMounted,
-} from "./shell-wallet-rail.js?v=home-20260719c";
+} from "./shell-wallet-rail.js?v=home-20260719e";
 import {
   bindConnectorSheet,
   connectorSheetFrame,
@@ -116,7 +119,7 @@ import {
   noteConnectorSheetSummaryRefresh,
   retireConnectorSheet,
   showConnectorSheet,
-} from "./shell-connector-sheet.js?v=home-20260719c";
+} from "./shell-connector-sheet.js?v=home-20260719e";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
@@ -412,6 +415,46 @@ export function openHomeGuiTargetWithPayload(target, payload) {
     }
   }, 150);
   return true;
+}
+
+/* Shell UI preferences arrive from the host (the canonical store — opaque
+   frames have no localStorage). Apply to this document's theme/dock state,
+   then fan out to every mounted app frame so their vendored theme runtimes
+   follow. Cosmetic only; values were validated against closed sets by the
+   host. */
+export function applyHomeGuiUiPreferences(preferences) {
+  const entries = preferences && typeof preferences === "object" ? preferences : {};
+  rememberSharedUiPreferences(entries);
+  if (typeof entries.theme === "string" && window.elastosTheme) {
+    window.elastosTheme.set(entries.theme);
+  }
+  if (typeof entries.accent === "string" && window.elastosTheme?.setAccent) {
+    window.elastosTheme.setAccent(entries.accent);
+  }
+  if (typeof entries.dockAutoHide === "string") {
+    setDockAutoHide(entries.dockAutoHide === "on");
+  }
+  if (typeof entries.sounds === "string") {
+    setUiSoundsEnabled(entries.sounds === "on");
+  }
+  broadcastHomeGuiUiPreferences(entries);
+}
+
+function broadcastHomeGuiUiPreferences(preferences) {
+  const message = { type: "elastos:ui-preference", preferences };
+  for (const entry of shellState.windows.values()) {
+    const frame = entry?.node?.querySelector(".window-frame");
+    try {
+      frame?.contentWindow?.postMessage(message, OPAQUE_FRAME_TARGET);
+    } catch (_error) {
+      // Frame mid-teardown; the boot push covers the next mount.
+    }
+  }
+  try {
+    walletRailFrame()?.contentWindow?.postMessage(message, OPAQUE_FRAME_TARGET);
+  } catch (_error) {
+    // Rail not mounted.
+  }
 }
 
 export function broadcastHomeGuiRuntimeEvents(events) {

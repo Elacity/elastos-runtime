@@ -16,7 +16,7 @@ import {
   shellState,
   fetchJson,
   targetById,
-} from "./shell-core.js?v=home-20260719c";
+} from "./shell-core.js?v=home-20260719e";
 import {
   bindHomeUnlock,
   hideHomeUnlock,
@@ -25,7 +25,7 @@ import {
   requestPasskeyHomeAuthority,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260719c";
+} from "./shell-auth.js?v=home-20260719e";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
@@ -216,6 +216,116 @@ async function openHomeGuiTargetWithPayload(target, payload) {
 async function showHomeGuiDesktop() {
   requireHomeGuiActive("show desktop");
   postToActiveShell({ type: "home:gui-command", command: "show-desktop" });
+}
+
+/* ---- Connector popup relay ----
+   Wallet connector popups are real-origin top-level windows: the extension
+   injects there, but the gateway (correctly) refuses their token'd API calls,
+   and the sandbox's implicit noopener plus BroadcastChannel origin
+   partitioning leave popup and opaque sheet with no direct channel. The host
+   shares the popup's real origin, so it bridges: popup stages arrive on a
+   same-origin BroadcastChannel and are forwarded into the sheet frame that
+   owns the matching launch token; sheet answers come back over the token-bound
+   frame bridge and are rebroadcast. Stages carry addresses/signatures only —
+   the launch token never crosses, and API calls stay inside the opaque sheet. */
+const CONNECTOR_POPUP_CHANNEL = "elastos:connector-popup";
+const CONNECTOR_POPUP_RELAY_TYPE = "elastos:connector-popup-relay";
+
+const connectorPopupChannel = "BroadcastChannel" in window
+  ? new BroadcastChannel(CONNECTOR_POPUP_CHANNEL)
+  : null;
+
+if (connectorPopupChannel) {
+  connectorPopupChannel.onmessage = (event) => {
+    const message = event.data || {};
+    if (message.type !== CONNECTOR_POPUP_RELAY_TYPE || message.from !== "popup") {
+      return;
+    }
+    const tokenTail = typeof message.tokenTail === "string" ? message.tokenTail : "";
+    if (!tokenTail) {
+      return;
+    }
+    for (const [token, context] of launchedAppContexts) {
+      if (!token.endsWith(tokenTail) || !WALLET_CONNECTOR_TARGETS.has(context.targetId)) {
+        continue;
+      }
+      if (context.source) {
+        context.source.postMessage(message, OPAQUE_FRAME_TARGET);
+      }
+      return;
+    }
+  };
+}
+
+function relayConnectorSheetAnswerToPopup(context, data) {
+  if (!connectorPopupChannel) {
+    return;
+  }
+  const { type: _type, homeToken: _homeToken, ...payload } = data;
+  connectorPopupChannel.postMessage({
+    type: CONNECTOR_POPUP_RELAY_TYPE,
+    from: "sheet",
+    tokenTail: context.homeToken.slice(-32),
+    ...payload,
+  });
+}
+
+/* ---- Shell UI preferences (theme / dock auto-hide / accent) ----
+   Opaque frames cannot reach localStorage, so the host — the only real-origin
+   document — is the canonical store. System (deep settings) and the GUI
+   (Control Centre) write through a token-gated message; the host persists and
+   relays a gui-command so the GUI chrome and its app frames re-apply. Closed
+   key set, values are short enums — cosmetic state only, no authority. */
+const UI_PREFERENCE_KEYS = Object.freeze({
+  theme: new Set(["auto", "light", "dark"]),
+  accent: new Set(["blue", "purple", "pink", "red", "orange", "yellow", "green", "graphite"]),
+  dockAutoHide: new Set(["on", "off"]),
+  sounds: new Set(["on", "off"]),
+});
+const UI_PREFERENCE_STORE_PREFIX = "elastos.ui.";
+
+function readUiPreferences() {
+  const preferences = {};
+  for (const key of Object.keys(UI_PREFERENCE_KEYS)) {
+    try {
+      const value = window.localStorage?.getItem(`${UI_PREFERENCE_STORE_PREFIX}${key}`) || "";
+      if (UI_PREFERENCE_KEYS[key].has(value)) {
+        preferences[key] = value;
+      }
+    } catch (_error) {
+      // Host storage unavailable — defaults apply.
+    }
+  }
+  return preferences;
+}
+
+function writeUiPreference(key, value) {
+  if (!UI_PREFERENCE_KEYS[key]?.has(value)) {
+    return false;
+  }
+  try {
+    window.localStorage?.setItem(`${UI_PREFERENCE_STORE_PREFIX}${key}`, value);
+  } catch (_error) {
+    // Still relay: the GUI applies for this session even without persistence.
+  }
+  postToActiveShell({
+    type: "home:gui-command",
+    command: "ui-preference",
+    preferences: { [key]: value },
+  });
+  return true;
+}
+
+function pushUiPreferencesToActiveShell() {
+  const preferences = readUiPreferences();
+  if (Object.keys(preferences).length === 0) {
+    return;
+  }
+  postToActiveShell({
+    type: "home:gui-command",
+    command: "ui-preference",
+    preferences,
+  });
 }
 
 function syncActiveShellProjection(summary, activeShellMode) {
@@ -711,6 +821,46 @@ window.addEventListener("message", (event) => {
   if (data.type === "home:shell-ready") {
     if (context.kind === "shell-frame" && shellState.currentSummary) {
       postToActiveShell({ type: "home:shell-summary", summary: shellState.currentSummary });
+    }
+    if (context.kind === "shell-frame" && context.targetId === HOME_GUI_SHELL_ID) {
+      pushUiPreferencesToActiveShell();
+    }
+    return;
+  }
+  if (data.type === "home:connector-popup-relay") {
+    // Only a mounted wallet connector sheet may answer its own popup.
+    if (context.kind !== "app-frame" || !WALLET_CONNECTOR_TARGETS.has(context.targetId)) {
+      console.warn("home ignored unauthorized connector-popup-relay message", context.targetId);
+      return;
+    }
+    relayConnectorSheetAnswerToPopup(context, data);
+    return;
+  }
+  if (data.type === "home:ui-preference") {
+    // Cosmetic shell preferences: System's Personalization pane and the GUI's
+    // Control Centre are the only writers. Closed key/value sets.
+    const trustedSystemApp = context.kind === "app-frame" && context.targetId === SYSTEM_APP_ID;
+    const trustedGuiShell = context.kind === "shell-frame" && context.targetId === HOME_GUI_SHELL_ID;
+    if (!trustedSystemApp && !trustedGuiShell) {
+      console.warn("home ignored unauthorized ui-preference message", context.targetId);
+      return;
+    }
+    const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
+    if (data.action === "read") {
+      replyToShellRequest(event, requestId, readUiPreferences());
+      return;
+    }
+    const key = typeof data.key === "string" ? data.key.trim() : "";
+    const value = typeof data.value === "string" ? data.value.trim() : "";
+    if (!writeUiPreference(key, value)) {
+      console.warn("home ignored invalid ui-preference", key, value);
+      if (requestId) {
+        replyToShellRequest(event, requestId, null, new Error("Home rejected the preference"));
+      }
+      return;
+    }
+    if (requestId) {
+      replyToShellRequest(event, requestId, true);
     }
     return;
   }

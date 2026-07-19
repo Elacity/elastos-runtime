@@ -1,5 +1,5 @@
-import { uiSoundsEnabled, setUiSoundsEnabled, playUiSound } from "./shell-sounds.js?v=home-20260719c";
-import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260719c";
+import { uiSoundsEnabled, setUiSoundsEnabled, playUiSound } from "./shell-sounds.js?v=home-20260719e";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260719e";
 
 /* Control Centre: the quick layer for controls that already have canonical
    stores — theme (elastos-theme.js), UI sounds (shell-sounds.js), fullscreen
@@ -41,12 +41,19 @@ export function bindControlCentre() {
     }
     window.elastosTheme.set(option.dataset.themeOption);
     syncThemeSegment();
+    // This opaque frame has no localStorage — the host persists and fans out.
+    window.dispatchEvent(new CustomEvent("elastos:ui-preference-changed", {
+      detail: { key: "theme", value: option.dataset.themeOption },
+    }));
   });
 
   soundsSwitch?.addEventListener("click", () => {
     const next = !uiSoundsEnabled();
     setUiSoundsEnabled(next);
     syncSoundsSwitch();
+    window.dispatchEvent(new CustomEvent("elastos:ui-preference-changed", {
+      detail: { key: "sounds", value: next ? "on" : "off" },
+    }));
     if (next) {
       playUiSound("notification");
     }

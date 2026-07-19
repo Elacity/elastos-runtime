@@ -5,8 +5,14 @@
 
 const KEY = "elastos.ui.sounds";
 let context = null;
+// Opaque-sandboxed GUI frame: localStorage throws, so the toggle keeps its
+// value in memory and the Home host persists it (home:ui-preference).
+let memoryState = "";
 
 function enabled() {
+  if (memoryState) {
+    return memoryState === "on";
+  }
   try {
     return localStorage.getItem(KEY) === "on";
   } catch (_error) {
@@ -72,7 +78,8 @@ export function uiSoundsEnabled() {
 }
 
 export function setUiSoundsEnabled(on) {
+  memoryState = on ? "on" : "off";
   try {
-    localStorage.setItem(KEY, on ? "on" : "off");
+    localStorage.setItem(KEY, memoryState);
   } catch (_error) {}
 }
