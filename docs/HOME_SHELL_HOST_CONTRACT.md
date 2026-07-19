@@ -74,7 +74,9 @@ appropriate to their document or asset role.
 
 The Home host may:
 
-- show the passkey or guest sign-in surface;
+- show the passkey or guest sign-in surface as a **local account picker**
+  (icon + display name for each enrolled principal) followed by that
+  principal's WebAuthn ceremony — after Sign out or on a cold unsigned boot;
 - read the Runtime-owned Home summary;
 - launch exactly one trusted root shell;
 - validate child source, origin, target, and launch token before accepting a
@@ -105,8 +107,8 @@ Common shell messages are:
 | `home:shell-ready` | Home sends the current Runtime summary. |
 | `home:refresh-summary` | Home refreshes Runtime facts. |
 | `home:launch-target` | Runtime returns a target-scoped launch route. |
-| `home:request-unlock` | Home displays its host-owned sign-in surface. |
-| `home:sign-out` | Home revokes the active session and reloads the front door. |
+| `home:request-unlock` | Home displays its host-owned sign-in surface (compact re-auth for the current principal, or the full account picker on the unsigned front door). |
+| `home:sign-out` | Home revokes the active session and reloads the front door (account picker). |
 | `home:close-self` | Home closes the active root shell through Runtime state. |
 
 `home:switch-shell-and-open-target` is the explicit CLI-to-GUI transition for a
@@ -141,13 +143,27 @@ Runtime owns principals, passkey records, session grants, revocation, and audit.
 Home owns the browser sign-in prompt because WebAuthn is bound to the top-level
 Home origin.
 
+On an unsigned front door (cold boot or after Sign out), Home shows enrolled
+local accounts from Runtime (`GET /api/auth/passkey/status` includes a minimal
+`accounts` list: display name, role, credential id, optional `avatar_cid` —
+never principal roots, secrets, or image bytes). The user selects an account,
+then Home runs WebAuthn for that credential only. When `avatar_cid` is present,
+the host loads the picture from
+`GET /api/auth/passkey/account-avatar?credential_id=…` (bound to that enrolled
+credential only; fail-closed to monogram). Profile pictures are set after
+sign-in in **System → Accounts** (content-addressed CID on the principal
+profile card), never on the unlock surface. Guest enrollment appears only when
+guest registration is enabled. First boot (no passkeys) keeps the welcome →
+create-admin path on the same host surface.
+
 Only approved first-party targets may ask Home for fresh passkey authority.
 Home binds that proof to the requesting capsule, operation, and request before
 returning a new target-scoped token to the same source and origin.
 
 Both shells can sign out. Browser `home-cli` sign-out is a launch-token-bound
 terminal host intent; `home-gui` uses the same host message contract. Neither
-shell owns or clears authentication state itself.
+shell owns or clears authentication state itself. Sign out always returns to
+the host front-door account picker.
 
 ## Recovery And Cleanup
 

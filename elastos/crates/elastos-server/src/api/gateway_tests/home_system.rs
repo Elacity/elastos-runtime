@@ -6170,6 +6170,150 @@ fn resolve_capsule_dir_prefers_installed_capsule_before_dev_tree_copy() {
     );
 }
 
+/// Full profile-picture loop: System upload → unsigned status carries the CID →
+/// credential-bound GET serves the bytes with COEP-safe headers → reset 404s.
+/// Locks the three integration failures this feature shipped with once:
+/// unregistered route, missing CORP under `require-corp`, and a status/list
+/// join that lost the picture on reopen.
+#[tokio::test]
+async fn test_profile_picture_loop_upload_status_unsigned_get_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority_with_name(dir.path(), Some("Sash"));
+    // Minimal valid JPEG per avatar_magic_matches (ff d8 ff prefix).
+    let jpeg: Vec<u8> = vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0xff, 0xd9];
+
+    let upload = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/system/identity/avatar")
+                .header("x-elastos-home-token", authority.system_token.as_str())
+                .header(CONTENT_TYPE, "image/jpeg")
+                .body(Body::from(jpeg.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::OK);
+    let upload_body = axum::body::to_bytes(upload.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let upload_payload: serde_json::Value = serde_json::from_slice(&upload_body).unwrap();
+    let avatar_cid = upload_payload["avatar_cid"]
+        .as_str()
+        .expect("upload returns avatar_cid")
+        .to_string();
+
+    let status_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/passkey/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status_response.status(), StatusCode::OK);
+    let status_body = axum::body::to_bytes(status_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let status_payload: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
+    let account = status_payload["accounts"]
+        .as_array()
+        .and_then(|accounts| {
+            accounts.iter().find(|entry| {
+                entry["principal_id"].as_str() == Some(authority.principal_id.as_str())
+            })
+        })
+        .expect("unsigned status lists the enrolled account");
+    assert_eq!(account["avatar_cid"].as_str(), Some(avatar_cid.as_str()));
+    let credential_id = account["credential_id"]
+        .as_str()
+        .expect("status account carries credential_id for the avatar URL");
+
+    let avatar_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/auth/passkey/account-avatar?credential_id={credential_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(avatar_response.status(), StatusCode::OK);
+    assert_eq!(
+        avatar_response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/jpeg")
+    );
+    // COEP require-corp frames need CORP or the <img> render is blocked.
+    assert_eq!(
+        avatar_response
+            .headers()
+            .get("cross-origin-resource-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("cross-origin")
+    );
+    assert_eq!(
+        avatar_response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("null")
+    );
+    let avatar_bytes = axum::body::to_bytes(avatar_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(avatar_bytes.as_ref(), jpeg.as_slice());
+
+    let unknown = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/passkey/account-avatar?credential_id=not-enrolled")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+    let reset = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/apps/system/identity/avatar")
+                .header("x-elastos-home-token", authority.system_token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), StatusCode::OK);
+    let after_reset = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/auth/passkey/account-avatar?credential_id={credential_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_reset.status(), StatusCode::NOT_FOUND);
+}
+
 fn assert_rejects_unknown_gateway_field<T: serde::de::DeserializeOwned>(value: serde_json::Value) {
     let err = match serde_json::from_value::<T>(value) {
         Ok(_) => panic!("expected request body to reject unknown fields"),

@@ -6,7 +6,7 @@
 <title>System · ElastOS</title>
 <script src="./elastos-theme.js"></script>
 <link rel="stylesheet" href="./elastos-ui.css">
-<link rel="stylesheet" href="./style.css?v=system-20260719b">
+<link rel="stylesheet" href="./style.css?v=system-20260719f">
 </head>
 <body>
   <section id="system-locked" class="system-locked" hidden>
@@ -63,6 +63,41 @@
           <section class="pc2-section" aria-labelledby="accounts-title">
             <h1 id="accounts-title" class="pc2-section-title">Accounts</h1>
             <div class="pc2-group">
+              <div class="pc2-group-row" id="account-picture-row">
+                <div class="pc2-card-row account-picture-card">
+                  <div class="account-picture-preview-wrap">
+                    <div
+                      id="account-picture-preview"
+                      class="account-picture-preview"
+                      role="img"
+                      aria-label="Profile picture"
+                    >
+                      <span id="account-picture-monogram" class="account-picture-monogram">·</span>
+                      <img id="account-picture-image" class="account-picture-image" alt="" hidden />
+                    </div>
+                    <div>
+                      <div class="pc2-card-label">Your picture</div>
+                      <div class="pc2-card-sublabel">Shown on this computer’s login screen.</div>
+                      <div class="account-picture-actions">
+                        <button type="button" class="system-button system-button-secondary" id="account-picture-choose">
+                          Choose picture…
+                        </button>
+                        <button type="button" class="system-button system-button-secondary" id="account-picture-remove" hidden>
+                          Remove picture
+                        </button>
+                      </div>
+                      <p id="account-picture-status" class="pc2-card-value system-value-muted" hidden></p>
+                      <input
+                        id="account-picture-file"
+                        class="visually-hidden"
+                        type="file"
+                        accept="image/png,image/jpeg,image/webp"
+                        hidden
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
               <div class="pc2-group-row">
                 <div class="pc2-card-row">
                   <div>
@@ -341,6 +376,6 @@
 
     <p class="system-error" hidden></p>
   </main>
-  <script type="module" src="./system.js?v=system-20260719b"></script>
+  <script type="module" src="./system.js?v=system-20260719f"></script>
 </body>
 </html>

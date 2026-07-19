@@ -2646,11 +2646,14 @@ fn home_save_profile_card(
 ) -> anyhow::Result<HomeProfileCardSummary> {
     let display_name = crate::auth::clean_principal_display_name(Some(display_name))?
         .ok_or_else(|| anyhow::anyhow!("profile name must not be empty"))?;
+    let existing = home_profile_card(data_dir, context).ok().flatten();
     let card = HomeProfileCardSummary {
         schema: HOME_PROFILE_CARD_SCHEMA.to_string(),
         profile_id: home_profile_id(context),
         display_name,
-        handle: None,
+        handle: existing.as_ref().and_then(|card| card.handle.clone()),
+        avatar_cid: existing.as_ref().and_then(|card| card.avatar_cid.clone()),
+        avatar_updated_at: existing.and_then(|card| card.avatar_updated_at),
         updated_at,
     };
     let bytes = serde_json::to_vec_pretty(&card)?;
@@ -2684,8 +2687,23 @@ fn validate_home_profile_card(
     }
     let display_name = crate::auth::clean_principal_display_name(Some(&card.display_name))?
         .ok_or_else(|| anyhow::anyhow!("profile card display name must not be empty"))?;
+    let avatar_cid = match card
+        .avatar_cid
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        Some(cid) => {
+            if cid::Cid::try_from(cid).is_err() {
+                anyhow::bail!("profile card avatar_cid is not a valid CID");
+            }
+            Some(cid.to_string())
+        }
+        None => None,
+    };
     Ok(HomeProfileCardSummary {
         display_name,
+        avatar_cid,
         ..card
     })
 }
@@ -5495,6 +5513,321 @@ fn update_profile_card_for_context(
         principal.updated_at,
     )?;
     Ok(load_gateway_identity_summary_for_context(data_dir, context))
+}
+
+#[derive(Debug, Serialize)]
+struct IdentityAvatarResponse {
+    schema: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    avatar_cid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    avatar_updated_at: Option<u64>,
+}
+
+pub(super) async fn system_identity_avatar_update(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return system_error_response(err),
+        };
+    let upload = match parse_avatar_image_upload(&headers, &body) {
+        Ok(upload) => upload,
+        Err(err) => return system_error_response(err),
+    };
+    match home_save_identity_avatar(&state.data_dir, &context, upload.0, upload.1) {
+        Ok(card) => Json(IdentityAvatarResponse {
+            schema: "elastos.identity.avatar/v1".to_string(),
+            avatar_cid: card.avatar_cid,
+            avatar_updated_at: card.avatar_updated_at,
+        })
+        .into_response(),
+        Err(err) => system_error_response(err),
+    }
+}
+
+pub(super) async fn system_identity_avatar_reset(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response {
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return system_error_response(err),
+        };
+    match home_reset_identity_avatar(&state.data_dir, &context) {
+        Ok(card) => Json(IdentityAvatarResponse {
+            schema: "elastos.identity.avatar/v1".to_string(),
+            avatar_cid: card.avatar_cid,
+            avatar_updated_at: card.avatar_updated_at,
+        })
+        .into_response(),
+        Err(err) => system_error_response(err),
+    }
+}
+
+fn parse_avatar_image_upload(
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> anyhow::Result<(&'static str, Vec<u8>)> {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .unwrap_or("");
+    let file_name = match content_type {
+        "image/png" => "avatar.png",
+        "image/jpeg" => "avatar.jpg",
+        "image/webp" => "avatar.webp",
+        _ => anyhow::bail!("profile picture must be PNG, JPEG, or WebP"),
+    };
+    if body.is_empty() {
+        anyhow::bail!("profile picture is empty");
+    }
+    if body.len() > HOME_AVATAR_IMAGE_MAX_BYTES {
+        anyhow::bail!("profile picture is larger than 512 KB");
+    }
+    if !avatar_magic_matches(content_type, body) {
+        anyhow::bail!("profile picture bytes do not match the declared image type");
+    }
+    Ok((file_name, body.to_vec()))
+}
+
+fn avatar_magic_matches(content_type: &str, body: &[u8]) -> bool {
+    match content_type {
+        "image/png" => body.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
+        "image/jpeg" => body.len() >= 3 && body[0] == 0xff && body[1] == 0xd8 && body[2] == 0xff,
+        "image/webp" => body.len() >= 12 && &body[0..4] == b"RIFF" && &body[8..12] == b"WEBP",
+        _ => false,
+    }
+}
+
+fn raw_sha256_content_cid(bytes: &[u8]) -> anyhow::Result<String> {
+    let digest = Sha256::digest(bytes);
+    let multihash = cid::multihash::Multihash::<64>::wrap(0x12, &digest)
+        .map_err(|err| anyhow::anyhow!("failed to build avatar content CID: {err}"))?;
+    Ok(cid::Cid::new_v1(0x55, multihash).to_string())
+}
+
+fn home_avatar_object_uri(context: &HomeLaunchTokenContext, file_name: &str) -> String {
+    format!(
+        "{}/.AppData/ElastOS/Profile/{}",
+        home_browser_localhost_root(context),
+        file_name
+    )
+}
+
+fn home_avatar_path(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    file_name: &str,
+) -> anyhow::Result<PathBuf> {
+    rooted_localhost_fs_path(data_dir, &home_avatar_object_uri(context, file_name))
+        .ok_or_else(|| anyhow::anyhow!("invalid profile avatar object path"))
+}
+
+fn remove_home_avatar_images(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+) -> anyhow::Result<()> {
+    for &(file_name, _content_type) in HOME_AVATAR_IMAGE_FILES {
+        let path = home_avatar_path(data_dir, context, file_name)?;
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
+fn home_write_profile_card_record(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    card: &HomeProfileCardSummary,
+) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(card)?;
+    if bytes.len() > HOME_PROFILE_CARD_MAX_BYTES {
+        anyhow::bail!("profile card object is too large");
+    }
+    let path = home_profile_card_path(data_dir, context)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::auth::write_principal_root_object(
+        data_dir,
+        &home_browser_principal_id(context),
+        &home_browser_localhost_root(context),
+        &home_profile_card_uri(context),
+        &path,
+        &bytes,
+    )?;
+    Ok(())
+}
+
+fn home_save_identity_avatar(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    file_name: &'static str,
+    bytes: Vec<u8>,
+) -> anyhow::Result<HomeProfileCardSummary> {
+    let path = home_avatar_path(data_dir, context, file_name)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    remove_home_avatar_images(data_dir, context)?;
+    crate::auth::write_principal_root_object(
+        data_dir,
+        &home_browser_principal_id(context),
+        &home_browser_localhost_root(context),
+        &home_avatar_object_uri(context, file_name),
+        &path,
+        &bytes,
+    )?;
+    let avatar_cid = raw_sha256_content_cid(&bytes)?;
+    let now = now_ts();
+    let existing = home_profile_card(data_dir, context).ok().flatten();
+    let display_name = existing
+        .as_ref()
+        .map(|card| card.display_name.clone())
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            context.proof_binding_id.as_deref().and_then(|binding| {
+                crate::auth::load_principal_for_proof_binding(data_dir, binding)
+                    .ok()
+                    .map(|principal| principal.display_name)
+            })
+        })
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "Account".to_string());
+    let card = HomeProfileCardSummary {
+        schema: HOME_PROFILE_CARD_SCHEMA.to_string(),
+        profile_id: home_profile_id(context),
+        display_name,
+        handle: existing.and_then(|card| card.handle),
+        avatar_cid: Some(avatar_cid),
+        avatar_updated_at: Some(now),
+        updated_at: now,
+    };
+    let card = validate_home_profile_card(context, card)?;
+    home_write_profile_card_record(data_dir, context, &card)?;
+    Ok(card)
+}
+
+fn home_reset_identity_avatar(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+) -> anyhow::Result<HomeProfileCardSummary> {
+    remove_home_avatar_images(data_dir, context)?;
+    let now = now_ts();
+    let existing = home_profile_card(data_dir, context).ok().flatten();
+    let display_name = existing
+        .as_ref()
+        .map(|card| card.display_name.clone())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "Account".to_string());
+    let card = HomeProfileCardSummary {
+        schema: HOME_PROFILE_CARD_SCHEMA.to_string(),
+        profile_id: home_profile_id(context),
+        display_name,
+        handle: existing.and_then(|card| card.handle),
+        avatar_cid: None,
+        avatar_updated_at: None,
+        updated_at: now,
+    };
+    let card = validate_home_profile_card(context, card)?;
+    home_write_profile_card_record(data_dir, context, &card)?;
+    Ok(card)
+}
+
+/// Content CID recorded on a principal's profile card for the unsigned login directory.
+pub(crate) fn login_avatar_cid_for_principal(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+    localhost_root: &str,
+) -> Option<String> {
+    let uri = format!(
+        "{}/.AppData/ElastOS/Profile/profile-card.json",
+        localhost_root
+    );
+    let path = rooted_localhost_fs_path(data_dir, &uri)?;
+    let bytes = crate::auth::read_principal_root_object(
+        data_dir,
+        principal_id,
+        localhost_root,
+        &uri,
+        &path,
+    )
+    .ok()?;
+    if bytes.len() > HOME_PROFILE_CARD_MAX_BYTES {
+        return None;
+    }
+    let card: HomeProfileCardSummary = serde_json::from_slice(&bytes).ok()?;
+    card.avatar_cid
+        .filter(|cid| !cid.trim().is_empty() && cid::Cid::try_from(cid.as_str()).is_ok())
+}
+
+/// Serve enrolled principal avatar bytes for the unsigned Home front door.
+pub(crate) fn login_avatar_bytes_for_credential(
+    data_dir: &std::path::Path,
+    credential_id: &str,
+) -> anyhow::Result<(Vec<u8>, &'static str)> {
+    let wanted = credential_id.trim();
+    if wanted.is_empty() {
+        anyhow::bail!("credential_id required");
+    }
+    let principal = crate::auth::active_passkey_principals(data_dir)?
+        .into_iter()
+        .find(|principal| {
+            principal
+                .proof_binding
+                .passkey
+                .as_ref()
+                .map(|passkey| passkey.credential_id == wanted)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| anyhow::anyhow!("unknown passkey credential"))?;
+    let card_cid = login_avatar_cid_for_principal(
+        data_dir,
+        &principal.principal_id,
+        &principal.localhost_root,
+    )
+    .ok_or_else(|| anyhow::anyhow!("no profile picture"))?;
+    for &(file_name, content_type) in HOME_AVATAR_IMAGE_FILES {
+        let uri = format!(
+            "{}/.AppData/ElastOS/Profile/{}",
+            principal.localhost_root, file_name
+        );
+        let Some(path) = rooted_localhost_fs_path(data_dir, &uri) else {
+            continue;
+        };
+        if !path.is_file() {
+            continue;
+        }
+        let bytes = crate::auth::read_principal_root_object(
+            data_dir,
+            &principal.principal_id,
+            &principal.localhost_root,
+            &uri,
+            &path,
+        )?;
+        if bytes.len() > HOME_AVATAR_IMAGE_MAX_BYTES {
+            anyhow::bail!("profile picture is too large");
+        }
+        let computed = raw_sha256_content_cid(&bytes)?;
+        if computed != card_cid {
+            continue;
+        }
+        if !avatar_magic_matches(content_type, &bytes) {
+            anyhow::bail!("profile picture is corrupt");
+        }
+        return Ok((bytes, content_type));
+    }
+    anyhow::bail!("no profile picture");
 }
 
 pub(super) async fn system_background_image_update(

@@ -103,7 +103,45 @@ img {
   padding: max(18px, env(safe-area-inset-top, 0)) 18px max(18px, env(safe-area-inset-bottom, 0));
   background: #050608;
   backdrop-filter: none;
-  animation: home-unlock-fade 180ms ease-out both;
+  animation: home-unlock-fade 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.home-unlock-stage {
+  position: relative;
+  width: min(720px, 100%);
+  display: grid;
+  place-items: center;
+  /* No transform here — it would trap position:fixed wallpaper/vignette
+     into this 720px box (containing block). Lift the card only. */
+}
+
+.home-unlock-wallpaper,
+.home-unlock-vignette {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+}
+
+.home-unlock-wallpaper {
+  background:
+    center / cover no-repeat url("/apps/home-gui/wallpaper.webp"),
+    #050608;
+}
+
+.home-unlock-vignette {
+  background:
+    linear-gradient(to bottom, rgba(0, 0, 0, 0.28), transparent 22%, transparent 72%, rgba(0, 0, 0, 0.34)),
+    radial-gradient(ellipse at 50% 42%, rgba(0, 0, 0, 0.12), rgba(0, 0, 0, 0.48) 58%, rgba(0, 0, 0, 0.68));
+}
+
+html[data-el-theme="light"] .home-unlock-vignette {
+  background:
+    linear-gradient(to bottom, rgba(10, 12, 16, 0.22), transparent 22%, transparent 72%, rgba(10, 12, 16, 0.28)),
+    radial-gradient(ellipse at 50% 42%, rgba(255, 255, 255, 0.06), rgba(20, 24, 32, 0.38) 55%, rgba(10, 12, 16, 0.62));
+}
+
+.home-unlock[data-surface="desktop"] .home-unlock-wallpaper {
+  display: none;
 }
 
 .home-unlock[data-surface="desktop"] {
@@ -124,6 +162,11 @@ img {
   padding: max(18px, env(safe-area-inset-top, 0)) 18px max(18px, env(safe-area-inset-bottom, 0));
 }
 
+.home-unlock[data-mode="prompt"] .home-unlock-wallpaper,
+.home-unlock[data-mode="prompt"] .home-unlock-vignette {
+  display: none;
+}
+
 .home-unlock[data-surface="desktop"][data-mode="prompt"] {
   background:
     radial-gradient(circle at 50% 28%, rgba(246, 146, 26, 0.14), transparent 30%),
@@ -131,32 +174,135 @@ img {
   backdrop-filter: blur(4px);
 }
 
-.home-unlock[data-surface="neutral"],
 .home-unlock[data-surface="neutral"][data-mode="prompt"] {
-  background: #050608;
-  backdrop-filter: none;
+  background: rgba(5, 6, 8, 0.92);
+  backdrop-filter: blur(8px);
 }
 
 .home-unlock-card {
-  width: min(390px, 100%);
-  padding: 28px 30px 30px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 18px;
-  background: #1c1c1e;
-  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.6);
+  position: relative;
+  z-index: 1;
+  width: min(720px, 100%);
+  padding: 28px 24px 32px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
   text-align: center;
-  animation: home-unlock-pop 220ms cubic-bezier(0.2, 0.9, 0.3, 1) both;
+  animation: home-unlock-enter 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Non-picker full-door modes: slight optical lift (Login Window energy). */
+.home-unlock:not([data-mode="prompt"]):not([data-flow="picker"]) .home-unlock-card {
+  transform: translateY(-5vh);
+  animation: home-unlock-enter-lifted 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/*
+  Lock Screen–led picker: full-bleed column.
+  Quiet brand → hero clock high → users pinned low with air between.
+*/
+/* Full-bleed picker: the panel's inset padding would push the 100dvh card
+   past the viewport and clip the pinned account row — remove it here. */
+.home-unlock[data-flow="picker"] {
+  padding: 0;
+}
+
+.home-unlock[data-flow="picker"] .home-unlock-stage {
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  min-height: 100dvh;
+  place-items: stretch;
+}
+
+.home-unlock[data-flow="picker"] .home-unlock-card {
+  width: 100%;
+  min-height: 100dvh;
+  padding:
+    max(20px, env(safe-area-inset-top, 0px))
+    24px
+    max(28px, env(safe-area-inset-bottom, 0px));
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  transform: none;
+  animation: home-unlock-enter 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
 .home-unlock[data-mode="prompt"] .home-unlock-card {
   width: min(370px, 100%);
   padding: 26px 28px 28px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 18px;
+  background: #1c1c1e;
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.6);
+  animation: home-unlock-pop 220ms cubic-bezier(0.2, 0.9, 0.3, 1) both;
+}
+
+.home-unlock-brand {
+  flex: 0 0 auto;
 }
 
 .home-unlock-logo {
-  width: 118px;
+  width: 72px;
   height: auto;
-  margin: 0 auto 22px;
+  margin: 0 auto 18px;
+  opacity: 0.96;
+}
+
+/* Picker: brand is a quiet signature, not the hero. */
+.home-unlock[data-flow="picker"] .home-unlock-brand {
+  padding-top: 1.5vh;
+}
+
+.home-unlock[data-flow="picker"] .home-unlock-logo {
+  width: 112px;
+  margin: 0 auto;
+  opacity: 0.92;
+}
+
+.home-unlock-clock {
+  margin: 4px auto 0;
+  text-align: center;
+  user-select: none;
+}
+
+.home-unlock-clock[hidden] {
+  display: none;
+}
+
+.home-unlock[data-flow="picker"] .home-unlock-clock {
+  flex: 0 0 auto;
+  margin-top: clamp(28px, 7vh, 72px);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Beat generic copy rules — clock is the picker hero. */
+.home-unlock .home-unlock-date {
+  margin: 0;
+  color: rgba(245, 245, 247, 0.94);
+  font-size: clamp(22px, 3.2vw, 28px);
+  font-weight: 500;
+  letter-spacing: -0.015em;
+  line-height: 1.15;
+  text-shadow: 0 1px 18px rgba(0, 0, 0, 0.4);
+}
+
+.home-unlock .home-unlock-time {
+  margin: 6px 0 0;
+  color: #f5f5f7;
+  font-size: clamp(72px, 12.5vw, 112px);
+  font-weight: 500;
+  letter-spacing: -0.035em;
+  line-height: 0.94;
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 3px 28px rgba(0, 0, 0, 0.38);
+}
+
+html[data-el-theme="light"] .home-unlock .home-unlock-date,
+html[data-el-theme="light"] .home-unlock .home-unlock-time {
+  color: #f5f5f7;
 }
 
 .home-unlock[data-mode="prompt"] .home-unlock-logo {
@@ -166,20 +312,229 @@ img {
 
 .home-unlock h1 {
   margin: 0;
-  font-size: clamp(26px, 6vw, 34px);
-  line-height: 1.04;
-  letter-spacing: -0.045em;
+  color: #f5f5f7;
+  font-size: clamp(22px, 4vw, 28px);
+  line-height: 1.1;
+  letter-spacing: -0.04em;
+  font-weight: 650;
+}
+
+.home-unlock[data-flow="picker"] h1 {
+  /* Picker uses the clock; keep the heading for assistive tech only. */
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+html[data-el-theme="light"] .home-unlock:not([data-mode="prompt"]) h1 {
+  color: #f5f5f7;
+  text-shadow: 0 1px 18px rgba(0, 0, 0, 0.35);
 }
 
 .home-unlock[data-mode="prompt"] h1 {
   font-size: 30px;
 }
 
-.home-unlock p {
-  margin: 12px 0 0;
+.home-unlock-copy {
+  margin: 10px 0 0;
+  color: rgba(245, 245, 247, 0.72);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.home-unlock-copy[hidden] {
+  display: none;
+}
+
+.home-unlock[data-mode="prompt"] .home-unlock-copy {
   color: #9ca3af;
   font-size: 13px;
   line-height: 1.55;
+}
+
+.home-unlock-users {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.home-unlock[data-flow="picker"] .home-unlock-users {
+  flex: 0 0 auto;
+  margin-top: auto;
+  padding-top: clamp(32px, 8vh, 80px);
+  padding-bottom: clamp(12px, 4vh, 40px);
+}
+
+.home-unlock-accounts {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 22px 32px;
+  margin: 28px auto 0;
+  max-width: 100%;
+}
+
+.home-unlock[data-flow="picker"] .home-unlock-accounts {
+  margin-top: 0;
+}
+
+.home-unlock-accounts[hidden] {
+  display: none;
+}
+
+.home-unlock-account {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  width: 88px;
+  padding: 8px 4px 4px;
+  cursor: pointer;
+  border-radius: 18px;
+  transition:
+    transform 120ms cubic-bezier(0.4, 0, 0.2, 1),
+    opacity 200ms cubic-bezier(0.4, 0, 0.2, 1);
+  animation: home-unlock-account-enter 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.home-unlock-account:nth-child(1) { animation-delay: 0ms; }
+.home-unlock-account:nth-child(2) { animation-delay: 40ms; }
+.home-unlock-account:nth-child(3) { animation-delay: 80ms; }
+.home-unlock-account:nth-child(4) { animation-delay: 120ms; }
+.home-unlock-account:nth-child(5) { animation-delay: 160ms; }
+.home-unlock-account:nth-child(n+6) { animation-delay: 160ms; }
+
+.home-unlock-account:hover {
+  transform: scale(1.03);
+}
+
+.home-unlock-account:active {
+  transform: scale(0.98);
+  transition-duration: 80ms;
+}
+
+.home-unlock-account:focus-visible {
+  outline: none;
+}
+
+.home-unlock-account:focus-visible .home-unlock-avatar {
+  box-shadow:
+    0 0 0 2px rgba(5, 6, 8, 0.55),
+    0 0 0 4px var(--el-accent, #3b82f6);
+}
+
+.home-unlock-account.is-selected {
+  transform: scale(1.04);
+}
+
+.home-unlock-account.is-selected .home-unlock-avatar {
+  box-shadow:
+    0 0 0 2px rgba(5, 6, 8, 0.55),
+    0 0 0 4px var(--el-accent, #3b82f6);
+}
+
+.home-unlock.is-busy .home-unlock-account:not(.is-selected) {
+  opacity: 0.35;
+  transform: scale(0.96);
+  pointer-events: none;
+}
+
+.home-unlock-avatar {
+  width: 72px;
+  height: 72px;
+  margin: 0 auto;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+  position: relative;
+  overflow: hidden;
+  transition: box-shadow 200ms cubic-bezier(0.4, 0, 0.2, 1), transform 280ms cubic-bezier(0.34, 1.3, 0.64, 1);
+}
+
+.home-unlock-avatar-monogram {
+  position: relative;
+  z-index: 0;
+}
+
+.home-unlock-avatar-image {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  z-index: 1;
+  opacity: 0;
+  transition: opacity 180ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.home-unlock-avatar.has-photo .home-unlock-avatar-image {
+  opacity: 1;
+}
+
+.home-unlock-avatar.has-photo {
+  background: transparent !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .home-unlock-avatar-image {
+    transition: none;
+  }
+}
+
+.home-unlock-account-name {
+  display: block;
+  margin-top: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: #f5f5f7;
+  text-shadow: 0 1px 10px rgba(0, 0, 0, 0.35);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.home-unlock-account-role {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  color: rgba(245, 245, 247, 0.55);
+}
+
+.home-unlock-add-guest {
+  appearance: none;
+  margin: 28px auto 0;
+  padding: 8px 12px;
+  border: 0;
+  background: transparent;
+  color: rgba(245, 245, 247, 0.78);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.home-unlock-add-guest[hidden] {
+  display: none;
+}
+
+.home-unlock-add-guest:focus-visible {
+  outline: 2px solid var(--el-accent, #3b82f6);
+  outline-offset: 3px;
+  border-radius: 8px;
 }
 
 .home-unlock-actions {
@@ -189,17 +544,29 @@ img {
   justify-content: center;
   margin-top: 24px;
 }
+
+.home-unlock-actions[hidden] {
+  display: none;
+}
+
 .home-unlock-input {
-  width: 100%;
+  width: min(320px, 100%);
   min-height: 44px;
-  margin-top: 22px;
+  margin: 22px auto 0;
   padding: 0 16px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.18);
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.06);
-  color: var(--text);
+  background: rgba(0, 0, 0, 0.28);
+  color: #f5f5f7;
   font-size: 14px;
   text-align: center;
+}
+
+.home-unlock[data-mode="prompt"] .home-unlock-input {
+  width: 100%;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
 }
 
 .home-unlock-input[hidden] {
@@ -250,11 +617,72 @@ img {
   color: #ff8f8f;
 }
 
+@media (max-width: 1099px) {
+  .home-unlock:not([data-mode="prompt"]):not([data-flow="picker"]) .home-unlock-logo {
+    width: 120px;
+  }
+
+  .home-unlock[data-flow="picker"] .home-unlock-logo {
+    width: 100px;
+  }
+
+  .home-unlock-avatar {
+    width: 68px;
+    height: 68px;
+    font-size: 22px;
+  }
+
+  .home-unlock-account {
+    width: 84px;
+  }
+}
+
 @media (max-width: 720px) {
   .home-unlock-card,
   .home-unlock[data-mode="prompt"] .home-unlock-card {
     width: min(360px, 100%);
     padding: 24px 22px 26px;
+  }
+
+  .home-unlock:not([data-mode="prompt"]):not([data-flow="picker"]) .home-unlock-card {
+    width: 100%;
+    padding: 20px 12px 28px;
+  }
+
+  .home-unlock[data-flow="picker"] .home-unlock-card {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .home-unlock-accounts {
+    gap: 16px 18px;
+    margin-top: 28px;
+  }
+
+  .home-unlock[data-flow="picker"] .home-unlock-accounts {
+    margin-top: 0;
+  }
+
+  .home-unlock:not([data-mode="prompt"]):not([data-flow="picker"]) .home-unlock-logo {
+    width: 108px;
+  }
+
+  .home-unlock[data-flow="picker"] .home-unlock-logo {
+    width: 92px;
+  }
+
+  .home-unlock[data-flow="picker"] .home-unlock-time {
+    font-size: clamp(60px, 14vw, 96px);
+  }
+
+  .home-unlock-avatar {
+    width: 64px;
+    height: 64px;
+    font-size: 20px;
+  }
+
+  .home-unlock-account {
+    width: 80px;
   }
 
   .home-unlock-actions {
@@ -266,9 +694,92 @@ img {
   }
 }
 
+@media (max-width: 479px) {
+  .home-unlock:not([data-mode="prompt"]):not([data-flow="picker"]) .home-unlock-logo {
+    width: 96px;
+  }
+
+  .home-unlock[data-flow="picker"] .home-unlock-logo {
+    width: 84px;
+  }
+
+  .home-unlock-avatar {
+    width: 56px;
+    height: 56px;
+    font-size: 18px;
+  }
+
+  .home-unlock-account {
+    width: 72px;
+  }
+
+  .home-unlock-account-name {
+    font-size: 13px;
+  }
+}
+
+@media (max-height: 560px) {
+  .home-unlock:not([data-mode="prompt"]):not([data-flow="picker"]) .home-unlock-card {
+    transform: translateY(-2vh);
+    animation-name: home-unlock-enter-lifted-short;
+  }
+
+  .home-unlock[data-flow="picker"] .home-unlock-clock {
+    margin-top: 16px;
+  }
+
+  .home-unlock[data-flow="picker"] .home-unlock-users {
+    padding-top: 20px;
+    padding-bottom: 8px;
+  }
+
+  .home-unlock:not([data-mode="prompt"]):not([data-flow="picker"]) .home-unlock-logo {
+    width: 96px;
+    margin-bottom: 10px;
+  }
+
+  .home-unlock[data-flow="picker"] .home-unlock-logo {
+    width: 80px;
+  }
+
+  .home-unlock:not([data-flow="picker"]) .home-unlock-accounts {
+    margin-top: 18px;
+  }
+
+  .home-unlock[data-flow="picker"] .home-unlock-time {
+    font-size: clamp(56px, 12vw, 84px);
+  }
+
+  .home-unlock-avatar {
+    width: 56px;
+    height: 56px;
+    font-size: 18px;
+  }
+}
+
 @keyframes home-unlock-fade {
   0% { opacity: 0; }
   100% { opacity: 1; }
+}
+
+@keyframes home-unlock-enter {
+  0% { opacity: 0; transform: translateY(6px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes home-unlock-enter-lifted {
+  0% { opacity: 0; transform: translateY(calc(-5vh + 8px)); }
+  100% { opacity: 1; transform: translateY(-5vh); }
+}
+
+@keyframes home-unlock-enter-lifted-short {
+  0% { opacity: 0; transform: translateY(calc(-2vh + 6px)); }
+  100% { opacity: 1; transform: translateY(-2vh); }
+}
+
+@keyframes home-unlock-account-enter {
+  0% { opacity: 0; transform: translateY(8px); }
+  100% { opacity: 1; transform: translateY(0); }
 }
 
 @keyframes home-unlock-pop {
@@ -304,9 +815,15 @@ img {
 @media (prefers-reduced-motion: reduce) {
   .home-unlock,
   .home-unlock-card,
+  .home-unlock-account,
   .home-unlock.home-unlock-leaving,
   .home-unlock.home-unlock-leaving .home-unlock-card {
     animation: none;
+  }
+
+  .home-unlock-account,
+  .home-unlock-avatar {
+    transition: none;
   }
 }
 

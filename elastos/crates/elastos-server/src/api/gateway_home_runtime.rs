@@ -1413,6 +1413,8 @@ fn home_profile_card_from_room_profile(
         profile_id: card.profile_id,
         display_name: card.display_name,
         handle: card.handle,
+        avatar_cid: None,
+        avatar_updated_at: None,
         updated_at: card.updated_at,
     }
 }

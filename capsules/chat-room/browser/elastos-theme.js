@@ -16,7 +16,7 @@
  * data-el-accent (absence means blue) — both activate token blocks in
  * elastos-ui.css. Cross-document sync is the shell's `elastos:ui-preference`
  * message (opaque parent only); localStorage + `storage` events remain a
- * best-effort fallback for standalone same-origin documents.
+ * best-effort path for standalone same-origin documents.
  */
 (function () {
   const KEY = "elastos.ui.theme";
@@ -35,8 +35,8 @@
     ? window.matchMedia("(prefers-color-scheme: light)")
     : null;
   // Opaque-sandboxed frames throw on every localStorage access, which used to
-  // make set()/setAccent() no-ops there (write fails, the reader falls back to
-  // the default). The in-memory override keeps the current document honest;
+  // make set()/setAccent() no-ops there (write fails, the reader uses the
+  // default). The in-memory override keeps the current document honest;
   // persistence stays with the shell's canonical store.
   let memoryPreference = "";
   let memoryAccent = "";

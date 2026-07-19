@@ -20,7 +20,7 @@ import {
   ignoreRepeatedAction,
   pushUiPreferencesToFrameWindow,
   targetById,
-} from "./shell-core.js?v=home-20260719e";
+} from "./shell-core.js?v=home-20260719f";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -31,7 +31,7 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260719e";
+} from "./shell-window-geometry.js?v=home-20260719f";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -79,6 +79,9 @@ const SYSTEM_IFRAME_SANDBOX_EXTRAS = [
 ];
 const COMMON_IFRAME_ALLOW = ["autoplay", "fullscreen"];
 const BROWSER_IFRAME_ALLOW_EXTRAS = ["clipboard-read", "clipboard-write"];
+/* Wallet needs write so address / recovery copy works in the opaque frame.
+   Read stays Browser-only — paste into Wallet is not a product path. */
+const WALLET_IFRAME_ALLOW_EXTRAS = ["clipboard-write"];
 const pendingWindowLaunches = new Set();
 
 export function iframeSandboxForLaunch(launched) {
@@ -102,6 +105,9 @@ export function iframeAllowForLaunch(launched) {
   const tokens = [...COMMON_IFRAME_ALLOW];
   if (launched?.target === "browser") {
     tokens.push(...BROWSER_IFRAME_ALLOW_EXTRAS);
+  }
+  if (launched?.target === "wallet") {
+    tokens.push(...WALLET_IFRAME_ALLOW_EXTRAS);
   }
   return tokens.join("; ");
 }

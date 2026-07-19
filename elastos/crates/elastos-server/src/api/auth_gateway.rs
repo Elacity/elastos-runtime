@@ -8,8 +8,11 @@ use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
 };
 use argon2::{Algorithm, Argon2, Params, Version};
-use axum::extract::{ConnectInfo, Path, State};
-use axum::http::{header::SET_COOKIE, HeaderMap, StatusCode};
+use axum::extract::{ConnectInfo, Path, Query, State};
+use axum::http::{
+    header::{CACHE_CONTROL, CONTENT_TYPE, SET_COOKIE},
+    HeaderMap, HeaderValue, StatusCode,
+};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -30,7 +33,8 @@ use sha2::{Digest, Sha256};
 
 use super::gateway::{
     consume_fresh_passkey_home_token, home_session_cookie_header_for_token,
-    is_wallet_connector_capsule_id, issue_home_launch_token_for_auth_grant, GatewayState,
+    is_wallet_connector_capsule_id, issue_home_launch_token_for_auth_grant,
+    login_avatar_bytes_for_credential, login_avatar_cid_for_principal, GatewayState,
     HOME_CAPSULE_ID, WALLET_LINK_CAPSULE_IDS,
 };
 
@@ -136,6 +140,26 @@ pub struct AuthRevokeResponse {
 pub struct PasskeyStatusResponse {
     pub registered: bool,
     pub guest_registration_enabled: bool,
+    /// Minimal local account directory for the unsigned Home front door.
+    /// Never includes principal roots, grants, or recovery material.
+    #[serde(default)]
+    pub accounts: Vec<PasskeyLoginAccount>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PasskeyLoginAccount {
+    pub principal_id: String,
+    pub display_name: String,
+    pub role: String,
+    pub credential_id: String,
+    pub last_used_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_cid: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PasskeyAccountAvatarQuery {
+    pub credential_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -262,6 +286,12 @@ pub struct PasskeyAuthenticateCompleteRequest {
     pub response: AuthenticationResponse,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PasskeyAuthenticateBeginRequest {
+    pub credential_id: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PasskeyVerifyResponse {
     pub schema: String,
@@ -334,12 +364,50 @@ pub async fn passkey_status(State(state): State<GatewayState>) -> Response {
         Err(err) => return auth_error_response(err),
     };
     let manager = manager.lock().await;
+    let registered = manager.status().registered;
+    drop(manager);
+    let accounts = match passkey_login_accounts(&state.data_dir) {
+        Ok(accounts) => accounts,
+        Err(err) => return auth_error_response(err),
+    };
     Json(PasskeyStatusResponse {
-        registered: manager.status().registered,
+        registered,
         guest_registration_enabled: crate::auth::guest_registration_enabled(&state.data_dir)
             .unwrap_or(false),
+        accounts,
     })
     .into_response()
+}
+
+/// Unsigned front-door avatar: only the CID registered for this enrolled credential.
+pub async fn passkey_account_avatar(
+    State(state): State<GatewayState>,
+    Query(query): Query<PasskeyAccountAvatarQuery>,
+) -> Response {
+    match login_avatar_bytes_for_credential(&state.data_dir, &query.credential_id) {
+        Ok((bytes, content_type)) => {
+            let mut response = bytes.into_response();
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+            response.headers_mut().insert(
+                CACHE_CONTROL,
+                HeaderValue::from_static("private, max-age=300"),
+            );
+            // Capsule frames use COEP require-corp; without CORP the <img> is
+            // blocked (opaque Origin: null) even when the GET itself is 200.
+            response.headers_mut().insert(
+                "cross-origin-resource-policy",
+                HeaderValue::from_static("cross-origin"),
+            );
+            response.headers_mut().insert(
+                axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                HeaderValue::from_static("null"),
+            );
+            response
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 pub async fn passkey_list(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
@@ -476,8 +544,10 @@ pub async fn passkey_register_complete(
 pub async fn passkey_authenticate_begin(
     State(state): State<GatewayState>,
     headers: HeaderMap,
+    body: Option<Json<PasskeyAuthenticateBeginRequest>>,
 ) -> Response {
-    match passkey_authenticate_begin_inner(&state, &headers).await {
+    let input = body.map(|Json(value)| value).unwrap_or_default();
+    match passkey_authenticate_begin_inner(&state, &headers, input).await {
         Ok(response) => Json(response).into_response(),
         Err(err) => auth_error_response(err),
     }
@@ -1951,17 +2021,70 @@ async fn passkey_register_complete_inner(
 async fn passkey_authenticate_begin_inner(
     state: &GatewayState,
     headers: &HeaderMap,
+    input: PasskeyAuthenticateBeginRequest,
 ) -> anyhow::Result<PasskeyBeginResponse<RequestOptions>> {
     let ceremony_id = format!("passkey:authenticate:{}", random_hex(16));
     let rp = super::handlers::identity::derive_rp(headers)?;
     let manager = state.identity_manager()?;
     let mut manager = manager.lock().await;
-    let options = manager.begin_authentication(&ceremony_id, &rp.id)?;
+    let credential_id = input
+        .credential_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let options = manager.begin_authentication_for(&ceremony_id, &rp.id, credential_id)?;
     Ok(PasskeyBeginResponse {
         schema: "elastos.auth.passkey.authenticate.begin/v1".to_string(),
         ceremony_id,
         options,
     })
+}
+
+fn passkey_login_accounts(data_dir: &std::path::Path) -> anyhow::Result<Vec<PasskeyLoginAccount>> {
+    let mut accounts = crate::auth::active_passkey_principals(data_dir)?
+        .into_iter()
+        .filter_map(|principal| {
+            let passkey = principal.proof_binding.passkey.as_ref()?;
+            let display_name = if principal.display_name.trim().is_empty() {
+                "Account".to_string()
+            } else {
+                principal.display_name.clone()
+            };
+            let role = match principal.role {
+                crate::auth::RuntimePrincipalRole::Admin => "admin",
+                crate::auth::RuntimePrincipalRole::Guest => "guest",
+            };
+            let avatar_cid = login_avatar_cid_for_principal(
+                data_dir,
+                &principal.principal_id,
+                &principal.localhost_root,
+            );
+            Some(PasskeyLoginAccount {
+                principal_id: principal.principal_id,
+                display_name,
+                role: role.to_string(),
+                credential_id: passkey.credential_id.clone(),
+                last_used_at: passkey.last_used_at,
+                avatar_cid,
+            })
+        })
+        .collect::<Vec<_>>();
+    accounts.sort_by(|left, right| {
+        right
+            .last_used_at
+            .cmp(&left.last_used_at)
+            .then_with(|| {
+                let left_admin = left.role == "admin";
+                let right_admin = right.role == "admin";
+                right_admin.cmp(&left_admin)
+            })
+            .then_with(|| {
+                left.display_name
+                    .to_lowercase()
+                    .cmp(&right.display_name.to_lowercase())
+            })
+    });
+    Ok(accounts)
 }
 
 async fn passkey_authenticate_complete_inner(
@@ -3081,6 +3204,52 @@ mod tests {
             first_principal.localhost_root,
             second_principal.localhost_root
         );
+    }
+
+    #[test]
+    fn passkey_login_accounts_are_sorted_and_omit_roots() {
+        let empty = tempfile::tempdir().unwrap();
+        assert!(passkey_login_accounts(empty.path()).unwrap().is_empty());
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        let admin = issue_named_passkey_session_grant(
+            &state,
+            "identity-test",
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            true,
+            "admin passkey",
+            Some("Zed Admin"),
+        )
+        .unwrap();
+        let guest = issue_named_passkey_session_grant(
+            &state,
+            "identity-test",
+            &test_credential_2(),
+            "https://elastos.elacitylabs.com",
+            true,
+            "guest passkey",
+            Some("Ada Guest"),
+        )
+        .unwrap();
+
+        // Equal last_used_at (second resolution) → admin before guest, then name.
+        let accounts = passkey_login_accounts(temp.path()).unwrap();
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(accounts[0].principal_id, admin.principal_id);
+        assert_eq!(accounts[0].display_name, "Zed Admin");
+        assert_eq!(accounts[0].role, "admin");
+        assert_eq!(accounts[0].credential_id, "credential-1");
+        assert_eq!(accounts[1].principal_id, guest.principal_id);
+        assert_eq!(accounts[1].display_name, "Ada Guest");
+        assert_eq!(accounts[1].role, "guest");
+        assert_eq!(accounts[1].credential_id, "credential-2");
+        assert!(accounts[0].avatar_cid.is_none());
+        let encoded = serde_json::to_value(&accounts).unwrap();
+        assert!(encoded[0].get("localhost_root").is_none());
+        assert!(encoded[0].get("proof_binding_id").is_none());
+        assert!(encoded[0].get("avatar_cid").is_none());
     }
 
     #[tokio::test]

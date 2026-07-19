@@ -10,8 +10,8 @@ import {
   setHomeGuiMounted,
   showHomeGuiDesktop,
   syncHomeGuiProjection,
-} from "./home-gui.js?v=home-20260719e";
-import { setHomeGuiLaunchToken } from "./shell-core.js?v=home-20260719e";
+} from "./home-gui.js?v=home-20260719f";
+import { setHomeGuiLaunchToken } from "./shell-core.js?v=home-20260719f";
 
 const route = new URL(window.location.href);
 const fragment = new URLSearchParams(route.hash.replace(/^#/, ""));

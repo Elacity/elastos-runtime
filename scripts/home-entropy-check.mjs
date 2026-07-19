@@ -1620,8 +1620,8 @@ const gbaLiveSmoke = read("scripts/gba-live-smoke.mjs");
 const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
 const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
-const homeAssetVersion = "home-20260719e";
-const homeGuiAssetVersion = "home-20260719e";
+const homeAssetVersion = "home-20260719q";
+const homeGuiAssetVersion = "home-20260719f";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -1918,9 +1918,12 @@ assert(
 );
 assert(
   shellWindows.includes('const BROWSER_IFRAME_ALLOW_EXTRAS = ["clipboard-read", "clipboard-write"]') &&
+    shellWindows.includes('const WALLET_IFRAME_ALLOW_EXTRAS = ["clipboard-write"]') &&
     shellWindows.includes('launched?.target === "browser"') &&
-    shellWindows.includes("tokens.push(...BROWSER_IFRAME_ALLOW_EXTRAS)"),
-  "Home must grant clipboard-read/write explicitly and only to the Browser iframe",
+    shellWindows.includes('launched?.target === "wallet"') &&
+    shellWindows.includes("tokens.push(...BROWSER_IFRAME_ALLOW_EXTRAS)") &&
+    shellWindows.includes("tokens.push(...WALLET_IFRAME_ALLOW_EXTRAS)"),
+  "Home must grant clipboard-read/write to Browser, and clipboard-write to Wallet (address copy)",
 );
 assert(
     shellJs.includes('const PASSKEY_AUTHORITY_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"])') &&
@@ -3534,17 +3537,18 @@ assert(
   "obsolete ESP Shell capsule source directory must not remain",
 );
 assert(
-  !shellHostStyle.includes("wallpaper.webp") &&
+  !shellHostStyle.includes('url("./wallpaper.webp")') &&
     !shellHostStyle.includes(".desktop-backdrop") &&
     !shellHostStyle.includes(".launcher") &&
     !shellHostStyle.includes(".taskbar") &&
     !shellHostStyle.includes(".window-snap-preview") &&
+    shellHostStyle.includes("/apps/home-gui/wallpaper.webp") &&
     homeGuiStyle.includes('url("./wallpaper.webp")') &&
     homeGuiStyle.includes(".desktop-backdrop") &&
     homeGuiStyle.includes(".launcher") &&
     homeGuiStyle.includes(".taskbar") &&
     homeGuiStyle.includes(".window-snap-preview"),
-  "Home host stylesheet must not own GUI wallpaper, desktop, launcher, taskbar, or window snap styles",
+  "Home host stylesheet must not own desktop chrome; unlock stage may only reuse the GUI wallpaper asset URL",
 );
 assertProtectedPrincipalRootAccessor(
   viewerGatewayApi,
@@ -4316,7 +4320,7 @@ const walletconnectConfigSmoke = read(
   "scripts/walletconnect-connector-config-smoke.sh",
 );
 const walletProviderDoc = read("docs/WALLET_PROVIDER.md");
-const systemAssetVersion = "system-20260719b";
+const systemAssetVersion = "system-20260719f";
 const shellAuth = read("capsules/home/browser/shell-auth.js");
 const protectedHomeStateSmoke = read("scripts/protected-home-state-smoke.sh");
 const auditChainBoundary = {
@@ -6482,35 +6486,104 @@ assert(
   "Home must not create anonymous Passkey/guest principals",
 );
 assert(
-  shellAuth.includes("Create guest account") &&
-    shellAuth.includes("create your own guest account"),
-  "Home must present guest enrollment as self-registration",
+  shellIndex.includes("Add Guest") &&
+    shellAuth.includes("Guests get their own apps, files, and passkey.") &&
+    shellAuth.includes("unlockAddGuest"),
+  "Home must present guest enrollment as self-registration from the account picker",
 );
 assert(
-  shellAuth.includes("startAutomaticPasskeySignIn") &&
-    shellAuth.includes("Choose your passkey."),
-  "Home sign-in must automatically ask for a passkey instead of requiring a duplicate continue click",
+  shellAuth.includes("home-unlock-accounts") &&
+    shellAuth.includes("startUnlockClock") &&
+    shellAuth.includes("formatUnlockDate") &&
+    shellAuth.includes("Choose an account") &&
+    shellIndex.includes('id="home-unlock-clock"') &&
+    shellIndex.includes('id="home-unlock-time"') &&
+    shellAuth.includes("runPasskeySignIn({ credentialId") &&
+    shellAuth.includes("credential_id: credentialId") &&
+    !shellAuth.includes("Who’s using this computer?") &&
+    !shellAuth.includes("startAutomaticPasskeySignIn"),
+  "Home front door must use an account picker with live clock (icon click → filtered passkey); no automatic WebAuthn",
 );
-const renderUnlockCheckingBody = shellAuth.match(
-  /function renderUnlockChecking\(\) \{[\s\S]*?\n\}/,
-)?.[0] || "";
 assert(
-  shellAuth.includes("if (registered) {\n      startAutomaticPasskeySignIn") &&
-    renderUnlockCheckingBody.includes("autoSignInAttempted = false") &&
-    !shellAuth.includes("AbortController") &&
-    !shellAuth.includes('name === "AbortError"') &&
-    !shellAuth.includes("guestRegistrationAvailable") &&
-    !shellAuth.includes('registered && unlockPresentation === "modal"') &&
-    shellAuth.includes('unlockMode === "signin_guest_enabled" && guestRegistrationEnabled'),
-  "Home unsigned desktop unlock must stay aligned with the main passkey prompt behavior",
+  shellJs.includes(
+    "Unsigned front door (cold boot or after Sign out): full account picker.",
+  ) &&
+    shellJs.includes("await showHostAuthGate();") &&
+    !/!homeSummarySignedIn\(summary\)[\s\S]{0,240}showHostAuthGate\(\{\s*presentation:\s*"prompt"/.test(
+      shellJs,
+    ),
+  "Unsigned Home boot must open the account picker, not the compact prompt gate",
+);
+assert(
+  shellJs.includes("Mid-session summary 401: compact re-auth") &&
+    shellJs.includes('showHostAuthGate({ presentation: "prompt" })') &&
+    shellJs.includes('data.type === "home:request-unlock"'),
+  "Mid-session unlock (summary 401 / request-unlock / session refresh) stays compact prompt",
+);
+assert(
+  shellHostStyle.includes("width: 112px") &&
+    shellHostStyle.includes("width: 72px") &&
+    shellHostStyle.includes('.home-unlock[data-flow="picker"] .home-unlock-card') &&
+    shellHostStyle.includes("margin-top: auto") &&
+    shellHostStyle.includes("home-unlock-users") &&
+    shellHostStyle.includes("translateY(-5vh)") &&
+    !/\.home-unlock:not\(\[data-mode="prompt"\]\) \.home-unlock-stage\s*\{[^}]*transform/.test(
+      shellHostStyle,
+    ) &&
+    shellHostStyle.includes("rgba(0, 0, 0, 0.68)") &&
+    !shellHostStyle.includes("rgba(0, 0, 0, 0.88)") &&
+    shellHostStyle.includes(".home-unlock .home-unlock-time") &&
+    shellHostStyle.includes("font-weight: 500") &&
+    shellHostStyle.includes(".home-unlock .home-unlock-date") &&
+    shellHostStyle.includes("clamp(72px, 12.5vw, 112px)"),
+  "Login picker is Lock Screen–led: quiet brand, hero clock, users pinned low",
+);
+assert(
+  shellIndex.includes('id="home-unlock-accounts"') &&
+    shellIndex.includes('id="home-unlock-add-guest"') &&
+    shellIndex.includes("home-unlock-stage") &&
+    shellIndex.includes("home-unlock-brand") &&
+    shellIndex.includes("home-unlock-users") &&
+    !homeGuiIndex.includes('id="home-unlock-accounts"'),
+  "Account picker markup stays on the Home host; home-gui must not own unlock accounts",
+);
+assert(
+  shellAuth.includes("account-avatar?credential_id=") &&
+    shellAuth.includes("avatarCid") &&
+    shellAuth.includes("home-unlock-avatar-image") &&
+    system.includes("Choose picture") &&
+    systemJs.includes("/api/apps/system/identity/avatar") &&
+    systemJs.includes("PasskeyView has no credential_id") &&
+    systemJs.includes("readText(entry?.principal_id) === principalId") &&
+    !shellIndex.includes('id="account-picture-file"') &&
+    !homeGuiIndex.includes("account-avatar"),
+  "Profile pictures: System uploads via identity/avatar; host picker loads bound account-avatar; unlock never uploads",
+);
+assert(
+  authGatewayApi.includes("passkey_account_avatar") &&
+    authGatewayApi.includes("login_avatar_bytes_for_credential") &&
+    authGatewayApi.includes("avatar_cid") &&
+    authGatewayApi.includes("PasskeyAccountAvatarQuery") &&
+    authGatewayApi.includes("cross-origin-resource-policy") &&
+    read("elastos/crates/elastos-server/src/api/gateway.rs").includes(
+      "/api/auth/passkey/account-avatar",
+    ) &&
+    !authGatewayApi.includes("pub cid:") &&
+    read("elastos/crates/elastos-server/src/api/gateway_home_system.rs").includes(
+      "HOME_AVATAR_IMAGE_MAX_BYTES",
+    ) &&
+    read("elastos/crates/elastos-server/src/api/gateway_home_system.rs").includes(
+      "profile picture must be PNG, JPEG, or WebP",
+    ),
+  "Unsigned avatar GET is credential-bound; avatar store is MIME/size fail-closed",
 );
 assert(
   shellAuth.includes('unlockMode === "create_guest"') &&
-    shellAuth.includes("Back to sign in"),
+    shellAuth.includes("Back to accounts"),
   "Home guest creation must be a distinct state, not blended into sign-in",
 );
 assert(
-  shellAuth.includes("setUnlockNameVisible(canCreate)") &&
+  shellAuth.includes("setUnlockNameVisible(creatingAdmin || creatingGuest)") &&
     !shellAuth.includes(
       "const canCreate = !registered || guestRegistrationEnabled",
     ),
@@ -6518,14 +6591,13 @@ assert(
 );
 assert(
   shellAuth.includes("isPasskeyNotSelected") &&
-    shellAuth.includes('setUnlockStatus("No passkey selected.", "muted")'),
-  "Home sign-in must suppress raw WebAuthn cancellation errors and keep onboarding actionable",
+    shellAuth.includes("Passkey cancelled. Choose an account to try again."),
+  "Home sign-in must suppress raw WebAuthn cancellation errors and keep the picker actionable",
 );
 assert(
-  shellAuth.includes(
-    "unlockSecondary.hidden = !registered || !guestRegistrationEnabled",
-  ),
-  "Home guest creation must stay available in both modal and prompt unlock presentations",
+  shellAuth.includes("unlockAddGuest.hidden = !picking || !guestRegistrationEnabled") &&
+    shellAuth.includes('unlockMode === "prompt"'),
+  "Home guest creation is picker-only; re-auth prompt stays current-principal compact",
 );
 assert(
   !shellAuth.includes("getClientExtensionResults"),
@@ -9720,7 +9792,7 @@ assert(
   "Wallet must provide balances and built-in Bitcoin accounts without manual Bitcoin proof linking",
 );
 assert(
-  wallet.includes("wallet.js?v=wallet-20260719x") &&
+  wallet.includes("wallet.js?v=wallet-20260720j") &&
     wallet.includes('id="wallet-send"') &&
     wallet.includes('id="wallet-receive"') &&
     wallet.includes("data-wallet-create-account") &&
@@ -9737,7 +9809,8 @@ assert(
     walletJs.includes("openReceiveFlow") &&
     walletJs.includes("openSendFlow") &&
     walletJs.includes("balance_key") &&
-    walletJs.includes("wallet-hero-address-pill") &&
+    walletJs.includes("wallet-account-card") &&
+    walletJs.includes("cardAddressDisplay") &&
     walletJs.includes("fundedSendableAccounts"),
   "Wallet must expose Send/Receive plus canonical Accounts create-import surfaces with cache-busted assets",
 );
@@ -9873,7 +9946,7 @@ assert(
 assert(
   !wallet.includes("wallet-brand") &&
     walletJs.includes("selectedAccountId") &&
-    walletJs.includes("wallet-hero-address-pill") &&
+    walletJs.includes("wallet-account-card") &&
     wallet.includes("wallet-hero-back") &&
     wallet.includes('data-face="front"') &&
     walletJs.includes('account.proof_type === "siwe"') &&
@@ -9947,20 +10020,21 @@ assert(
   "wallet-provider manifest must document rename and managed recovery export without claiming impossible zero key display for the Wallet recovery surface",
 );
 assert(
-  wallet.includes(
-    '<section id="wallet-account-detail" class="wallet-detail" aria-label="Selected account"></section>',
-  ) &&
+  wallet.includes('id="wallet-account-card"') &&
+    wallet.includes("wallet-account-card-chip") &&
+    wallet.includes('id="wallet-account-card-network"') &&
     wallet.indexOf('class="wallet-hero-balance"') <
-      wallet.indexOf('id="wallet-account-detail"') &&
-    wallet.indexOf('id="wallet-account-detail"') <
-      wallet.indexOf('id="wallet-delta"') &&
+      wallet.indexOf('id="wallet-total-balance"') &&
     wallet.indexOf('id="wallet-total-balance"') <
-      wallet.indexOf('class="wallet-action-row"') &&
+      wallet.indexOf('id="wallet-account-card"') &&
+    wallet.indexOf('id="wallet-account-card"') <
+      wallet.indexOf('id="wallet-send"') &&
     walletJs.includes("renderHeroAccount(allAccounts)") &&
     walletJs.includes("selectedOrDefaultAccount") &&
     walletJs.includes("defaultWalletAccount") &&
     walletJs.includes("latestDefault") &&
-    walletJs.includes("wallet-hero-address-pill") &&
+    walletJs.includes("cardNetworkLabel") &&
+    walletJs.includes("has-account-card") &&
     walletJs.includes(
       'selectedAccountId = selectedAccountId === accountId ? "" : accountId',
     ) &&
@@ -9969,7 +10043,7 @@ assert(
     ) &&
     walletJs.includes("clearAccountSelection") &&
     walletJs.includes("is-selected") &&
-    walletJs.includes("wallet-hero-address-pill") &&
+    walletStyle.includes(".wallet-account-card-chip") &&
     walletJs.includes("heroFlowActive") &&
     walletJs.includes("accountsFlowActive") &&
     walletJs.includes("showHeroBack") &&
@@ -10000,8 +10074,11 @@ assert(
     walletStyle.includes(".wallet-hero.is-flipped") &&
     walletStyle.includes(".wallet-accounts-flip") &&
     walletStyle.includes(".wallet-accounts-section.is-flipped") &&
-    walletStyle.includes(".wallet-hero-address-pill") &&
+    walletStyle.includes(".wallet-account-card") &&
+    walletStyle.includes("has-account-card") &&
     !walletStyle.includes(".wallet-detail-chip") &&
+    !walletJs.includes("wallet-hero-address-pill") &&
+    !wallet.includes('id="wallet-account-detail"') &&
     walletStyle.includes(
       "grid-template-columns: repeat(auto-fill, minmax(200px, 1fr))",
     ) &&
@@ -10298,11 +10375,11 @@ assert(
 );
 assert(
   systemStyle.includes(".pc2-section-title") &&
-    systemStyle.includes("font-size: 11px;") &&
-    systemStyle.includes("text-transform: uppercase;") &&
+    /\.pc2-section-title\s*\{[^}]*font-size:\s*14px/.test(systemStyle) &&
+    !/\.pc2-section-title\s*\{[^}]*text-transform:\s*uppercase/.test(systemStyle) &&
     systemStyle.includes("--color-settings-sidebar: #f9f9f9") &&
     systemStyle.includes("border: 1px solid #d0d0d0;"),
-  "System Settings must keep PC2 compact section/card styling",
+  "System Settings section titles use normal casing (match Apps), not all-caps",
 );
 assert(
   !system.includes('data-settings="storage"') &&

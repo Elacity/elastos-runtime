@@ -80,6 +80,9 @@ pub(crate) use gateway_home_runtime::is_wallet_connector_capsule_id;
 use gateway_home_runtime::*;
 pub(super) use gateway_home_runtime::{viewer_object_shell_description, viewer_object_shell_title};
 use gateway_home_system::*;
+pub(crate) use gateway_home_system::{
+    login_avatar_bytes_for_credential, login_avatar_cid_for_principal,
+};
 use gateway_home_terminal::*;
 pub(super) use gateway_home_token::{
     consume_fresh_passkey_home_token, home_launch_auth_data_dir, home_launch_token_header,
@@ -505,6 +508,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             "/api/auth/passkey/status",
             get(super::auth_gateway::passkey_status),
         )
+        .route(
+            "/api/auth/passkey/account-avatar",
+            get(super::auth_gateway::passkey_account_avatar),
+        )
         .route("/api/auth/passkeys", get(super::auth_gateway::passkey_list))
         .route(
             "/api/auth/recovery/status",
@@ -605,6 +612,12 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route(
             "/api/apps/system/identity/profile-card",
             post(system_profile_card_update),
+        )
+        .route(
+            "/api/apps/system/identity/avatar",
+            post(system_identity_avatar_update)
+                .delete(system_identity_avatar_reset)
+                .layer(DefaultBodyLimit::max(HOME_AVATAR_IMAGE_TRANSPORT_MAX_BYTES)),
         )
         .route(
             "/api/apps/system/appearance/background-image",

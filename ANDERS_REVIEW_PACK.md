@@ -32,7 +32,7 @@ git merge-base --is-ancestor 70ef68532 HEAD   # must succeed
 | Ops/gate scripts | 14 | 13 of your smokes updated (reasons below) + new `vendor-ui-tokens.sh` |
 | Docs | 4 | `ALIGN_TIPS.md`, this pack, `docs/DESIGN_SYSTEM.md`, `state.md` (append-only entry) |
 | `justfile` | 1 | Adds `vendor-ui` recipe and `vendor-ui-tokens.sh --check` to `verify` |
-| **`elastos/` backend** | **0** | **Byte-identical to your tip** (an earlier 8-line web-projection launch guard was reverted as redundant — `is_runtime_projection()` already covers `execution=web-projection`) |
+| **`elastos/` backend** | **small auth surface** | Intentional for local account picker only — see section below. Opaque-frame red lines unchanged: **no `allow-same-origin`**, no broader trusted-core growth. |
 
 ## Your smoke/gate files we touched (each with the reason)
 
@@ -147,6 +147,67 @@ only on the fake's garbage signature (403), with zero origin errors.
 `wallet-unisat` has the same latent issue on your tip (its popup calls
 `/api/auth/btc/*` from a real origin); we left it untouched and flag it here
 as a follow-up you may want the same bridge for.
+
+## Local account picker on the unsigned front door
+
+Sign out still revokes the session and reloads the Home host. The unsigned
+front door is now a macOS-style **local account picker** (monogram icon +
+display name), not an auto-fired passkey prompt. This was **not** on your tip —
+it is presentation + a minimal auth directory API on top of your opaque-frame
+host contract.
+
+### Intentional `elastos/` exception (review carefully)
+
+Opaque-frame process rule remains: do not grow the trusted core casually, and
+**never** add `allow-same-origin`. This picker needs three narrow Runtime pieces:
+
+- `GET /api/auth/passkey/status` → minimal `accounts[]`
+  (`principal_id`, `display_name`, `role`, `credential_id`, `last_used_at`,
+  optional `avatar_cid`) — **never** principal roots, recovery material, or
+  image bytes. Sorted by last used, then admin, then name. Revoked principals
+  are omitted.
+- `POST /api/auth/passkey/authenticate/begin` accepts optional
+  `credential_id` and offers only that credential in `allowCredentials`
+  (`begin_authentication_for` in identity). Unknown ids fail closed.
+- `GET /api/auth/passkey/account-avatar?credential_id=…` → the profile-picture
+  bytes for that enrolled credential only (bytes must match the CID on the
+  principal's profile card; never a free-form CID query). Served with
+  `Cross-Origin-Resource-Policy: cross-origin` + `ACAO: null` so COEP
+  (`require-corp`) capsule frames can render it. Unknown / mismatched → 404.
+
+Anything beyond that directory/filter/picture surface should be a design
+question with you, not more code in `elastos/`.
+
+### Host UI (real-origin only)
+
+- Full-bleed stage, wallpaper reuse of `/apps/home-gui/wallpaper.webp`, soft
+  vignette, optical lift; icon click starts WebAuthn.
+- **Add Guest…** only when guest registration is enabled.
+- Unsigned / Sign out → family picker. Mid-session re-auth
+  (`home:request-unlock`, session refresh, summary 401) → compact prompt for
+  the current principal only — never the family grid over a live shell.
+- No unlock picker in `home-gui`. First-boot welcome → create-admin unchanged
+  on the same stage language.
+- Optional **profile picture**: set in System → Accounts after sign-in; stored
+  as a content CID on `elastos.profile-card/v1` (`avatar_cid`); unsigned
+  `accounts[]` may include that CID; host loads
+  `/api/auth/passkey/account-avatar?credential_id=…` only for the registered
+  CID (never free-form cid query, never image bytes in status). Fail → monogram.
+
+### Opaque-frame facts this work must keep
+
+1. Capsule frames stay opaque (no `allow-same-origin`); host is the only
+   real-origin persistence surface (`home:ui-preference` template).
+2. postMessage: outbound to opaque frames uses `"*"`; inbound pins
+   `event.origin === "null"`.
+3. Token’d APIs only from opaque frames; unlock itself uses the host cookie
+   on `/api/auth/*`.
+4. UniSat/WalletConnect still need the MetaMask-style popup-relay port; GBA
+   threads remain your call — we will not paper over with `allow-same-origin`.
+5. Iframe `allow` grants stay explicit and per-target: Browser keeps
+   `clipboard-read; clipboard-write`; **Wallet now gets `clipboard-write`
+   only** (address/recovery-key copy from the opaque frame; paste into Wallet
+   is not a product path, so read is not granted).
 
 ## Shell UI preferences (theme / accent / dock / sounds) — host is the store
 

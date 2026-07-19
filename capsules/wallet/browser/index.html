@@ -6,7 +6,7 @@
 <title>Wallet · ElastOS</title>
 <script src="./elastos-theme.js"></script>
 <link rel="stylesheet" href="./elastos-ui.css">
-<link rel="stylesheet" href="./style.css?v=wallet-20260719x">
+<link rel="stylesheet" href="./style.css?v=wallet-20260720j">
 </head>
 <body>
   <main class="wallet-shell" aria-label="Wallet">
@@ -45,32 +45,58 @@
         <div class="wallet-hero-scene">
           <div class="wallet-hero-flip">
             <div class="wallet-hero-face wallet-hero-face-front">
+              <!-- Window: balance+actions left, identity card right. Rail: stack. -->
               <div class="wallet-hero-row">
                 <div class="wallet-hero-balance">
                   <div class="wallet-hero-balance-label-row">
                     <p class="eyebrow">Total balance</p>
-                    <!-- Same row as the label, far right. -->
-                    <section id="wallet-account-detail" class="wallet-detail" aria-label="Selected account"></section>
                   </div>
-                  <!-- Original value row: amount left, 24h delta right. -->
                   <div class="wallet-hero-balance-top">
                     <div id="wallet-total-balance" class="wallet-total-value" aria-live="polite">$—,———</div>
                     <div id="wallet-delta" class="wallet-delta" hidden>
                       <span id="wallet-delta-value">+0.00% · 24h</span>
                     </div>
                   </div>
-                  <div class="wallet-action-row">
-                    <button id="wallet-send" class="wallet-button" type="button">↗ Send</button>
-                    <button id="wallet-receive" class="wallet-button wallet-button-secondary" type="button">↙ Receive</button>
+                </div>
+                <section
+                  id="wallet-account-card"
+                  class="wallet-account-card"
+                  aria-label="Selected account"
+                  hidden
+                >
+                  <div class="wallet-account-card-top">
+                    <div class="wallet-account-card-brand">
+                      <img
+                        class="wallet-account-card-logo"
+                        src="./elastos-logo.svg"
+                        alt="ElastOS"
+                        draggable="false"
+                      />
+                    </div>
+                    <div class="wallet-account-card-chip" aria-hidden="true">
+                      <span class="wallet-account-card-chip-pads"></span>
+                    </div>
                   </div>
-                  <!-- Pending approvals live under Send/Receive (history stays in Activity drawer). -->
-                  <div id="wallet-hero-pending" class="wallet-hero-pending" hidden aria-live="polite"></div>
-                  <div id="wallet-get-started" class="wallet-action-row wallet-get-started" hidden>
-                    <button class="wallet-button" type="button" data-wallet-create-account>Create account</button>
-                    <button id="wallet-connect-cta" class="wallet-button wallet-button-secondary" type="button">
-                      Connect a wallet
-                    </button>
+                  <div class="wallet-account-card-number-row">
+                    <code id="wallet-account-card-address" class="wallet-account-card-address"></code>
+                    <span id="wallet-account-card-copy" class="wallet-account-card-copy"></span>
                   </div>
+                  <div class="wallet-account-card-foot">
+                    <span id="wallet-account-card-name" class="wallet-account-card-name"></span>
+                    <span id="wallet-account-card-network" class="wallet-account-card-network"></span>
+                  </div>
+                </section>
+                <div class="wallet-action-row">
+                  <button id="wallet-send" class="wallet-button" type="button">↗ Send</button>
+                  <button id="wallet-receive" class="wallet-button wallet-button-secondary" type="button">↙ Receive</button>
+                </div>
+                <!-- Pending approvals live under Send/Receive (history stays in Activity drawer). -->
+                <div id="wallet-hero-pending" class="wallet-hero-pending" hidden aria-live="polite"></div>
+                <div id="wallet-get-started" class="wallet-action-row wallet-get-started" hidden>
+                  <button class="wallet-button" type="button" data-wallet-create-account>Create account</button>
+                  <button id="wallet-connect-cta" class="wallet-button wallet-button-secondary" type="button">
+                    Connect a wallet
+                  </button>
                 </div>
               </div>
               <p id="wallet-balance-state" class="wallet-state">Loading balances</p>
@@ -160,6 +186,6 @@
     <div id="wallet-modal-backdrop" class="wallet-modal-backdrop" hidden></div>
     <section id="wallet-modal" class="wallet-modal" hidden aria-live="polite"></section>
   </main>
-  <script type="module" src="./wallet.js?v=wallet-20260719x"></script>
+  <script type="module" src="./wallet.js?v=wallet-20260720j"></script>
 </body>
 </html>

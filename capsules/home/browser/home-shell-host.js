@@ -16,7 +16,7 @@ import {
   shellState,
   fetchJson,
   targetById,
-} from "./shell-core.js?v=home-20260719e";
+} from "./shell-core.js?v=home-20260719q";
 import {
   bindHomeUnlock,
   hideHomeUnlock,
@@ -25,7 +25,7 @@ import {
   requestPasskeyHomeAuthority,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260719e";
+} from "./shell-auth.js?v=home-20260719q";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
@@ -1302,8 +1302,10 @@ async function boot() {
     throw error;
   }
   if (!homeSummarySignedIn(summary)) {
+    // Unsigned front door (cold boot or after Sign out): full account picker.
+    // Compact prompt is only for mid-session re-auth over a live shell.
     document.body.dataset.homeStatus = "ready";
-    await showHostAuthGate({ presentation: "prompt" });
+    await showHostAuthGate();
     startShellTimers();
     return;
   }
@@ -1352,7 +1354,8 @@ function requestShellSummaryRefresh({ reason = "request", delay = SUMMARY_REFRES
     shellState.summaryRefreshInFlight = true;
     refreshShellSummary().catch((error) => {
       if (isHomeAuthError(error)) {
-        showHostAuthGate().catch((unlockError) => {
+        // Mid-session summary 401: compact re-auth, never the family picker.
+        showHostAuthGate({ presentation: "prompt" }).catch((unlockError) => {
           console.error("home unlock failed", unlockError);
         });
         return;

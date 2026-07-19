@@ -18,6 +18,13 @@ const guestRegistrationInput = document.querySelector("#guest-registration");
 const guestRegistrationStatusNode = document.querySelector('[data-field="guest-registration-status"]');
 const passkeyStatusNode = document.querySelector('[data-field="passkey-status"]');
 const accountListNode = document.querySelector("#account-list");
+const accountPicturePreview = document.querySelector("#account-picture-preview");
+const accountPictureMonogram = document.querySelector("#account-picture-monogram");
+const accountPictureImage = document.querySelector("#account-picture-image");
+const accountPictureChoose = document.querySelector("#account-picture-choose");
+const accountPictureRemove = document.querySelector("#account-picture-remove");
+const accountPictureFile = document.querySelector("#account-picture-file");
+const accountPictureStatus = document.querySelector("#account-picture-status");
 const recoveryDownloadButton = document.querySelector("#recovery-download");
 const recoveryImportInput = document.querySelector("#recovery-import");
 const recoveryPasswordInput = document.querySelector("#recovery-password");
@@ -61,6 +68,11 @@ let uiPreferencesReadPromise = null;
 const DEFAULT_BACKGROUND_IMAGE_URL = "/apps/home-gui/wallpaper.webp";
 const BACKGROUND_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
 const BACKGROUND_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+const AVATAR_IMAGE_MAX_BYTES = 512 * 1024;
+const AVATAR_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
+const AVATAR_OUTPUT_EDGE = 512;
+let currentAccountPicture = { credentialId: "", avatarCid: "", displayName: "" };
+let accountPictureBusy = false;
 const BACKGROUND_OVERLAY_OPACITY_DEFAULT = 0.55;
 const BACKGROUND_OVERLAY_OPACITY_MAX = 0.8;
 const CHAIN_NAMESPACE_LABELS = new Map([
@@ -437,6 +449,21 @@ function configurePasskeyAccess() {
   if (accountListNode) {
     accountListNode.addEventListener("click", onAccountListClick);
   }
+  configureAccountPicture();
+}
+
+function configureAccountPicture() {
+  if (accountPictureChoose) {
+    accountPictureChoose.disabled = !hasShellAccess();
+    accountPictureChoose.addEventListener("click", () => accountPictureFile?.click());
+  }
+  if (accountPictureRemove) {
+    accountPictureRemove.addEventListener("click", onAccountPictureRemove);
+  }
+  if (accountPictureFile) {
+    accountPictureFile.addEventListener("change", onAccountPictureFileChange);
+  }
+  setAccountPictureBusy(false);
 }
 
 function configureRecoveryAccess() {
@@ -1626,10 +1653,295 @@ async function refreshAccountList() {
   if (!accountListNode || !hasShellAccess()) {
     return;
   }
-  const data = await fetchJson("/api/auth/passkeys", {
-    headers: shellHeaders(),
+  const [data, status] = await Promise.all([
+    fetchJson("/api/auth/passkeys", { headers: shellHeaders() }),
+    fetchJson("/api/auth/passkey/status").catch(() => ({ accounts: [] })),
+  ]);
+  const passkeys = Array.isArray(data.passkeys) ? data.passkeys : [];
+  renderAccounts(passkeys);
+  refreshAccountPictureFrom(passkeys, status);
+}
+
+function refreshAccountPictureFrom(passkeys, status) {
+  const current = passkeys.find((entry) => entry && entry.current) || passkeys[0] || null;
+  const principalId = readText(current?.principal_id);
+  const accounts = Array.isArray(status?.accounts) ? status.accounts : [];
+  // PasskeyView has no credential_id — join the unsigned login directory by principal.
+  const match =
+    (principalId
+      ? accounts.find((entry) => readText(entry?.principal_id) === principalId)
+      : null) ||
+    accounts.find(
+      (entry) => readText(entry?.credential_id) === readText(current?.credential_id),
+    ) ||
+    null;
+  renderAccountPicturePreview({
+    displayName: readText(current?.display_name) || readText(match?.display_name) || "Account",
+    avatarCid: readText(match?.avatar_cid),
+    credentialId: readText(match?.credential_id) || readText(current?.credential_id),
   });
-  renderAccounts(Array.isArray(data.passkeys) ? data.passkeys : []);
+}
+
+function renderAccountPicturePreview({ displayName, avatarCid, credentialId }) {
+  currentAccountPicture = {
+    displayName: readText(displayName) || "Account",
+    avatarCid: readText(avatarCid),
+    credentialId: readText(credentialId),
+  };
+  const monogram = monogramForDisplayName(currentAccountPicture.displayName);
+  if (accountPictureMonogram) {
+    accountPictureMonogram.textContent = monogram;
+    accountPictureMonogram.hidden = Boolean(currentAccountPicture.avatarCid);
+  }
+  if (accountPicturePreview) {
+    accountPicturePreview.style.background = currentAccountPicture.avatarCid
+      ? "transparent"
+      : avatarColorForId(currentAccountPicture.credentialId || currentAccountPicture.displayName);
+    accountPicturePreview.setAttribute(
+      "aria-label",
+      currentAccountPicture.avatarCid
+        ? `Profile picture for ${currentAccountPicture.displayName}`
+        : `Monogram for ${currentAccountPicture.displayName}`,
+    );
+  }
+  if (accountPictureImage) {
+    if (currentAccountPicture.avatarCid && currentAccountPicture.credentialId) {
+      accountPictureImage.hidden = false;
+      accountPictureImage.src =
+        `/api/auth/passkey/account-avatar?credential_id=${encodeURIComponent(currentAccountPicture.credentialId)}&v=${encodeURIComponent(currentAccountPicture.avatarCid)}`;
+      accountPictureImage.onerror = () => {
+        accountPictureImage.hidden = true;
+        if (accountPictureMonogram) {
+          accountPictureMonogram.hidden = false;
+        }
+        if (accountPicturePreview) {
+          accountPicturePreview.style.background = avatarColorForId(
+            currentAccountPicture.credentialId || currentAccountPicture.displayName,
+          );
+        }
+      };
+    } else {
+      accountPictureImage.removeAttribute("src");
+      accountPictureImage.hidden = true;
+    }
+  }
+  if (accountPictureRemove) {
+    accountPictureRemove.hidden = !currentAccountPicture.avatarCid;
+    accountPictureRemove.disabled = accountPictureBusy || !hasShellAccess();
+  }
+  if (accountPictureChoose) {
+    accountPictureChoose.disabled = accountPictureBusy || !hasShellAccess();
+  }
+}
+
+function showAccountPictureStatus(message, tone = "muted") {
+  if (!accountPictureStatus) {
+    return;
+  }
+  const text = readText(message);
+  accountPictureStatus.hidden = !text;
+  accountPictureStatus.textContent = text;
+  accountPictureStatus.dataset.tone = tone;
+}
+
+function setAccountPictureBusy(busy) {
+  accountPictureBusy = Boolean(busy);
+  if (accountPictureChoose) {
+    accountPictureChoose.disabled = accountPictureBusy || !hasShellAccess();
+  }
+  if (accountPictureRemove) {
+    accountPictureRemove.disabled =
+      accountPictureBusy || !hasShellAccess() || !currentAccountPicture.avatarCid;
+  }
+  if (accountPictureFile) {
+    accountPictureFile.disabled = accountPictureBusy;
+  }
+}
+
+async function onAccountPictureFileChange() {
+  if (!accountPictureFile || !hasShellAccess() || accountPictureBusy) {
+    return;
+  }
+  const file = accountPictureFile.files && accountPictureFile.files[0]
+    ? accountPictureFile.files[0]
+    : null;
+  accountPictureFile.value = "";
+  if (!file) {
+    return;
+  }
+  showAccountPictureStatus("");
+  if (!AVATAR_IMAGE_TYPES.has(file.type)) {
+    showAccountPictureStatus("Use a PNG, JPEG, or WebP image.", "error");
+    return;
+  }
+  if (file.size > AVATAR_IMAGE_MAX_BYTES * 4) {
+    showAccountPictureStatus("That image is too large. Try one under 512 KB.", "error");
+    return;
+  }
+  setAccountPictureBusy(true);
+  showAccountPictureStatus("Saving picture…", "muted");
+  try {
+    const blob = await centerCropImageFile(file, AVATAR_OUTPUT_EDGE);
+    if (blob.size > AVATAR_IMAGE_MAX_BYTES) {
+      throw new Error("That image is too large. Try one under 512 KB.");
+    }
+    const result = await fetchJson("/api/apps/system/identity/avatar", {
+      method: "POST",
+      headers: {
+        "content-type": blob.type || "image/jpeg",
+        "x-elastos-home-token": apiHomeToken,
+      },
+      body: blob,
+    });
+    // Re-join status so credential_id is present for the durable account-avatar URL.
+    await refreshAccountList().catch(() => {
+      currentAccountPicture.avatarCid = readText(result?.avatar_cid);
+      renderAccountPicturePreview({
+        ...currentAccountPicture,
+        avatarCid: currentAccountPicture.avatarCid,
+      });
+    });
+    // Immediate local preview while the bound GET warms; keep blob until swapped.
+    if (accountPictureImage && currentAccountPicture.avatarCid) {
+      const localUrl = URL.createObjectURL(blob);
+      const durableSrc =
+        currentAccountPicture.credentialId
+          ? `/api/auth/passkey/account-avatar?credential_id=${encodeURIComponent(currentAccountPicture.credentialId)}&v=${encodeURIComponent(currentAccountPicture.avatarCid)}`
+          : "";
+      accountPictureImage.hidden = false;
+      if (accountPictureMonogram) {
+        accountPictureMonogram.hidden = true;
+      }
+      if (accountPicturePreview) {
+        accountPicturePreview.style.background = "transparent";
+      }
+      if (durableSrc) {
+        accountPictureImage.onload = () => {
+          if (accountPictureImage.src === localUrl) {
+            return;
+          }
+          URL.revokeObjectURL(localUrl);
+          accountPictureImage.onload = null;
+        };
+        accountPictureImage.src = localUrl;
+        // Swap to the durable URL without flashing empty on COEP/cache delay.
+        const probe = new Image();
+        probe.onload = () => {
+          accountPictureImage.src = durableSrc;
+        };
+        probe.onerror = () => {
+          // Keep blob preview; reopen will retry the durable URL.
+        };
+        probe.src = durableSrc;
+      } else {
+        accountPictureImage.src = localUrl;
+      }
+    }
+    showAccountPictureStatus("Updated.", "success");
+  } catch (error) {
+    showAccountPictureStatus(
+      publicSystemError(error, "Couldn’t save picture. Try again."),
+      "error",
+    );
+  } finally {
+    setAccountPictureBusy(false);
+  }
+}
+
+async function onAccountPictureRemove() {
+  if (!hasShellAccess() || accountPictureBusy || !currentAccountPicture.avatarCid) {
+    return;
+  }
+  setAccountPictureBusy(true);
+  showAccountPictureStatus("Removing picture…", "muted");
+  try {
+    await fetchJson("/api/apps/system/identity/avatar", {
+      method: "DELETE",
+      headers: { "x-elastos-home-token": apiHomeToken },
+    });
+    renderAccountPicturePreview({
+      ...currentAccountPicture,
+      avatarCid: "",
+    });
+    showAccountPictureStatus("Removed.", "success");
+  } catch (error) {
+    showAccountPictureStatus(
+      publicSystemError(error, "Couldn’t remove picture. Try again."),
+      "error",
+    );
+  } finally {
+    setAccountPictureBusy(false);
+  }
+}
+
+function centerCropImageFile(file, edge) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      try {
+        const size = Math.max(1, Math.min(edge, Math.min(image.naturalWidth, image.naturalHeight)));
+        const canvas = document.createElement("canvas");
+        canvas.width = size;
+        canvas.height = size;
+        const context = canvas.getContext("2d");
+        if (!context) {
+          throw new Error("Couldn’t prepare picture.");
+        }
+        const source = Math.min(image.naturalWidth, image.naturalHeight);
+        const sx = Math.floor((image.naturalWidth - source) / 2);
+        const sy = Math.floor((image.naturalHeight - source) / 2);
+        context.drawImage(image, sx, sy, source, source, 0, 0, size, size);
+        canvas.toBlob(
+          (blob) => {
+            URL.revokeObjectURL(url);
+            if (!blob) {
+              reject(new Error("Couldn’t prepare picture."));
+              return;
+            }
+            resolve(blob);
+          },
+          "image/jpeg",
+          0.9,
+        );
+      } catch (error) {
+        URL.revokeObjectURL(url);
+        reject(error);
+      }
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("Couldn’t read that image."));
+    };
+    image.src = url;
+  });
+}
+
+function monogramForDisplayName(name) {
+  const parts = String(name || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (parts.length === 0) {
+    return "·";
+  }
+  const first = [...parts[0]][0] || "·";
+  if (parts.length === 1) {
+    return first.toUpperCase();
+  }
+  const second = [...parts[parts.length - 1]][0] || "";
+  return `${first}${second}`.toUpperCase().replace(/[^A-Z0-9]/g, "") || "·";
+}
+
+function avatarColorForId(seed) {
+  let hash = 0;
+  const text = String(seed || "");
+  for (let i = 0; i < text.length; i += 1) {
+    hash = ((hash << 5) - hash) + text.charCodeAt(i);
+    hash |= 0;
+  }
+  const hue = Math.abs(hash) % 360;
+  return `linear-gradient(145deg, hsl(${hue} 52% 46%), hsl(${(hue + 28) % 360} 58% 36%))`;
 }
 
 function renderAccounts(accounts) {

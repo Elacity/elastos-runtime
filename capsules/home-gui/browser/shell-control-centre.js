@@ -1,5 +1,5 @@
-import { uiSoundsEnabled, setUiSoundsEnabled, playUiSound } from "./shell-sounds.js?v=home-20260719e";
-import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260719e";
+import { uiSoundsEnabled, setUiSoundsEnabled, playUiSound } from "./shell-sounds.js?v=home-20260719f";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260719f";
 
 /* Control Centre: the quick layer for controls that already have canonical
    stores — theme (elastos-theme.js), UI sounds (shell-sounds.js), fullscreen

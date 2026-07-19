@@ -201,6 +201,44 @@ export function shortAddress(value) {
   return `${address.slice(0, 6)}…${address.slice(-4)}`;
 }
 
+/** Card-number rhythm for the hero identity card. Hex gets PAN groups; others truncate.
+    Privacy mode hides balances, not identity — the PAN display already exposes
+    only head/tail, so hex addresses render the same either way. */
+export function cardAddressDisplay(value, { privacy = false } = {}) {
+  const address = readText(value);
+  if (!address) {
+    return "—";
+  }
+  if (address.startsWith("0x") && address.length >= 12) {
+    return `${address.slice(0, 6)}  ····  ····  ${address.slice(-4)}`;
+  }
+  if (privacy && address.length > 10) {
+    return `${address.slice(0, 4)}  ····  ${address.slice(-4)}`;
+  }
+  return shortAddress(address);
+}
+
+/** Bottom-right card lockup: connector primary, short chain cue secondary. */
+export function cardNetworkLabel(account) {
+  const method = methodForAccount(account);
+  const connector =
+    method === "passkey"
+      ? "Built-in"
+      : method === "btc"
+        ? "UniSat"
+        : METHOD_LABELS[method] || "Wallet";
+  const namespace = readText(account?.chain_namespace);
+  let chain = "";
+  if (namespace.startsWith("eip155:")) {
+    chain = "EVM";
+  } else if (namespace.startsWith("bip122:")) {
+    chain = "BTC";
+  } else if (namespace) {
+    chain = chainLabel(namespace);
+  }
+  return chain ? `${connector} · ${chain}` : connector;
+}
+
 export function relativeTime(value) {
   const timestamp = Number(value || 0);
   if (!Number.isFinite(timestamp) || timestamp <= 0) {

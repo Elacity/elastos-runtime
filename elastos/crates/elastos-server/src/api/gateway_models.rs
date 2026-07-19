@@ -40,6 +40,11 @@ struct HomeProfileCardSummary {
     display_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     handle: Option<String>,
+    /// Raw sha256 content CID of the principal login avatar (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    avatar_cid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    avatar_updated_at: Option<u64>,
     updated_at: u64,
 }
 
@@ -619,6 +624,13 @@ const HOME_BACKGROUND_IMAGE_FILES: &[(&str, &str)] = &[
     ("background-image.jpg", "image/jpeg"),
     ("background-image.webp", "image/webp"),
     ("background-image.gif", "image/gif"),
+];
+const HOME_AVATAR_IMAGE_MAX_BYTES: usize = 512 * 1024;
+const HOME_AVATAR_IMAGE_TRANSPORT_MAX_BYTES: usize = 768 * 1024;
+const HOME_AVATAR_IMAGE_FILES: &[(&str, &str)] = &[
+    ("avatar.png", "image/png"),
+    ("avatar.jpg", "image/jpeg"),
+    ("avatar.webp", "image/webp"),
 ];
 
 #[derive(Debug, Clone, Default)]

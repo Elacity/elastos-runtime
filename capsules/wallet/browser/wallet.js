@@ -1,9 +1,9 @@
-import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260719x";
+import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260720j";
 import { createWalletApi,
   readHomeOrigin,
   readLaunchToken,
-  readQueryParam } from "./wallet-api.js?v=wallet-20260719x";
-import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260719x";
+  readQueryParam } from "./wallet-api.js?v=wallet-20260720j";
+import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260720j";
 import {
   BALANCE_NETWORKS,
   MANAGED_CHAIN_NAMESPACES,
@@ -11,6 +11,8 @@ import {
   METHOD_MONOGRAMS,
   accountDisplayBalance,
   accountName,
+  cardAddressDisplay,
+  cardNetworkLabel,
   chainLabel,
   delta24h,
   formatAmount,
@@ -21,14 +23,14 @@ import {
   readText,
   shortAddress,
   validateAddress,
-} from "./wallet-format.js?v=wallet-20260719x";
-import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260719x";
-import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260719x";
-import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260719x";
-import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260719x";
-import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260719x";
-import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260719x";
-import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260719x";
+} from "./wallet-format.js?v=wallet-20260720j";
+import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260720j";
+import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260720j";
+import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260720j";
+import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260720j";
+import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260720j";
+import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260720j";
+import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260720j";
 import {
   accountCard,
   copyButton,
@@ -38,7 +40,7 @@ import {
   methodMark,
   setBusy,
   textNode,
-} from "./wallet-render.js?v=wallet-20260719x";
+} from "./wallet-render.js?v=wallet-20260720j";
 
 const statusNode = document.querySelector("#wallet-status");
 const homeParentOrigin = readHomeOrigin();
@@ -55,7 +57,12 @@ const receiveButton = document.querySelector("#wallet-receive");
 const getStartedNode = document.querySelector("#wallet-get-started");
 const connectCtaButton = document.querySelector("#wallet-connect-cta");
 const signersSection = document.querySelector("#wallet-signers");
-const accountDetailNode = document.querySelector("#wallet-account-detail");
+const accountCardNode = document.querySelector("#wallet-account-card");
+const accountCardAddressNode = document.querySelector("#wallet-account-card-address");
+const accountCardCopyNode = document.querySelector("#wallet-account-card-copy");
+const accountCardNameNode = document.querySelector("#wallet-account-card-name");
+const accountCardNetworkNode = document.querySelector("#wallet-account-card-network");
+const heroSceneNode = document.querySelector(".wallet-hero-scene");
 const heroNode = document.querySelector(".wallet-hero");
 const heroBackNode = document.querySelector("#wallet-hero-back");
 const accountsSectionNode = document.querySelector(".wallet-accounts-section");
@@ -694,30 +701,44 @@ function renderHero(accounts) {
 
 function renderHeroAccount(accounts) {
   const account = selectedOrDefaultAccount(accounts);
-  accountDetailNode.replaceChildren();
-  if (!account) {
-    accountDetailNode.hidden = true;
+  if (!accountCardNode) {
     return;
   }
-  // Active account meme on the far right (with 24h delta): name + address + copy.
-  // Accounts list owns method, balances, and the full roster.
-  accountDetailNode.hidden = false;
-  accountDetailNode.setAttribute(
-    "aria-label",
-    selectedAccountId ? `Selected · ${account.name}` : `Default · ${account.name}`,
-  );
+  if (!account) {
+    accountCardNode.hidden = true;
+    heroSceneNode?.classList.remove("has-account-card");
+    if (accountCardCopyNode) {
+      accountCardCopyNode.replaceChildren();
+    }
+    return;
+  }
 
-  const pill = document.createElement("div");
-  pill.className = "wallet-hero-address-pill";
-  pill.title = `${account.name} · ${account.address}`;
+  const privacy = getPrivacyMode();
+  const addressText = cardAddressDisplay(account.address, { privacy });
+  const networkText = cardNetworkLabel(account);
+  const selectionLabel = selectedAccountId ? `Selected · ${account.name}` : `Default · ${account.name}`;
 
-  const label = textNode("span", account.name, "wallet-hero-address-name");
-  const address = textNode("code", shortAddress(account.address), "wallet-hero-address-value");
-  address.dataset.walletCopyAddress = account.address;
-  const copy = copyIconButton(account.address, `Copy ${account.name} address`);
+  accountCardNode.hidden = false;
+  heroSceneNode?.classList.add("has-account-card");
+  accountCardNode.classList.toggle("is-selected", Boolean(selectedAccountId));
+  accountCardNode.setAttribute("aria-label", `${selectionLabel}. ${networkText}`);
+  accountCardNode.title = `${account.name} · ${account.address}`;
 
-  pill.append(label, address, copy);
-  accountDetailNode.append(pill);
+  if (accountCardAddressNode) {
+    accountCardAddressNode.textContent = addressText;
+    accountCardAddressNode.dataset.walletCopyAddress = account.address;
+  }
+  if (accountCardNameNode) {
+    accountCardNameNode.textContent = account.name;
+  }
+  if (accountCardNetworkNode) {
+    accountCardNetworkNode.textContent = networkText;
+  }
+  if (accountCardCopyNode) {
+    accountCardCopyNode.replaceChildren(
+      copyIconButton(account.address, `Copy ${account.name} address`),
+    );
+  }
 }
 
 function selectedOrDefaultAccount(accounts = buildViewAccounts()) {
@@ -833,8 +854,29 @@ async function copyText(value) {
   if (!text) {
     throw new Error("Nothing to copy.");
   }
-  if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
-    throw new Error("Clipboard is unavailable.");
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+  } catch {
+    // Opaque frames without clipboard-write reject Clipboard API — try legacy path.
   }
-  await navigator.clipboard.writeText(text);
+  const input = document.createElement("textarea");
+  input.value = text;
+  input.setAttribute("readonly", "");
+  input.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0;";
+  document.body.appendChild(input);
+  input.focus();
+  input.select();
+  input.setSelectionRange(0, text.length);
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } finally {
+    input.remove();
+  }
+  if (!ok) {
+    throw new Error("Clipboard is unavailable in this window. Reopen Wallet and try again.");
+  }
 }

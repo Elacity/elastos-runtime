@@ -453,11 +453,23 @@ impl IdentityManager {
         })
     }
 
-    /// Begin authentication flow
+    /// Begin authentication flow.
+    ///
+    /// When `credential_id` is `Some`, only that credential is offered in
+    /// `allowCredentials` (Home account picker). Unknown ids fail closed.
     pub fn begin_authentication(
         &mut self,
         session_token: &str,
         rp_id: &str,
+    ) -> anyhow::Result<RequestOptions> {
+        self.begin_authentication_for(session_token, rp_id, None)
+    }
+
+    pub fn begin_authentication_for(
+        &mut self,
+        session_token: &str,
+        rp_id: &str,
+        credential_id: Option<&str>,
     ) -> anyhow::Result<RequestOptions> {
         self.cleanup_expired();
 
@@ -466,16 +478,30 @@ impl IdentityManager {
             anyhow::bail!("No registered credentials. Register first.");
         }
 
+        let selected = credential_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let allow: Vec<CredentialDescriptor> = if let Some(wanted) = selected {
+            let matched = credentials
+                .iter()
+                .find(|credential| credential.credential_id == wanted)
+                .ok_or_else(|| anyhow::anyhow!("unknown passkey credential"))?;
+            vec![CredentialDescriptor {
+                type_: "public-key".to_string(),
+                id: matched.credential_id.clone(),
+            }]
+        } else {
+            credentials
+                .iter()
+                .map(|credential| CredentialDescriptor {
+                    type_: "public-key".to_string(),
+                    id: credential.credential_id.clone(),
+                })
+                .collect()
+        };
+
         let challenge = generate_challenge();
         let challenge_b64 = URL_SAFE_NO_PAD.encode(&challenge);
-
-        let allow = credentials
-            .iter()
-            .map(|c| CredentialDescriptor {
-                type_: "public-key".to_string(),
-                id: c.credential_id.clone(),
-            })
-            .collect();
 
         let options = RequestOptions {
             public_key: PublicKeyCredentialRequestOptions {
@@ -1009,6 +1035,41 @@ mod tests {
             .unwrap();
 
         assert_eq!(options.public_key.user_verification, "required");
+    }
+
+    #[test]
+    fn authentication_for_filters_allow_credentials_to_requested_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = IdentityManager::new(temp.path().to_path_buf()).unwrap();
+        manager.store.add_credential(StoredCredential {
+            credential_id: "credential-a".to_string(),
+            public_key: "public-key-a".to_string(),
+            sign_count: 0,
+            rp_id: "localhost".to_string(),
+        });
+        manager.store.add_credential(StoredCredential {
+            credential_id: "credential-b".to_string(),
+            public_key: "public-key-b".to_string(),
+            sign_count: 0,
+            rp_id: "localhost".to_string(),
+        });
+
+        let all = manager
+            .begin_authentication("session-all", "localhost")
+            .unwrap();
+        assert_eq!(all.public_key.allow_credentials.len(), 2);
+
+        let filtered = manager
+            .begin_authentication_for("session-one", "localhost", Some("credential-b"))
+            .unwrap();
+        assert_eq!(filtered.public_key.allow_credentials.len(), 1);
+        assert_eq!(filtered.public_key.allow_credentials[0].id, "credential-b");
+
+        let unknown = manager
+            .begin_authentication_for("session-missing", "localhost", Some("credential-z"))
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("unknown passkey credential"));
     }
 
     #[test]
