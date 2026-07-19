@@ -23,6 +23,36 @@ git merge-base --is-ancestor 70ef68532 HEAD   # must succeed
 
 **Intentional behavior change vs our old tip:** People is a capsule (`openTarget("people")`), not an embedded Home window.
 
+## Full diff census vs your tip (149 files — nothing outside these buckets)
+
+| Bucket | Files | What it is |
+|--------|-------|------------|
+| Presentation (capsule UI) | 79 | Home GUI chrome modules, wallet rail/ceremony UX, per-app CSS/HTML/JS visual ports |
+| Vendored design tokens | 51 | `_shared` token sheet + `elastos-theme.js`/`elastos-ui.css`/Inter font stamped per capsule |
+| Ops/gate scripts | 14 | 13 of your smokes updated (reasons below) + new `vendor-ui-tokens.sh` |
+| Docs | 4 | `ALIGN_TIPS.md`, this pack, `docs/DESIGN_SYSTEM.md`, `state.md` (append-only entry) |
+| `justfile` | 1 | Adds `vendor-ui` recipe and `vendor-ui-tokens.sh --check` to `verify` |
+| **`elastos/` backend** | **0** | **Byte-identical to your tip** (an earlier 8-line web-projection launch guard was reverted as redundant — `is_runtime_projection()` already covers `execution=web-projection`) |
+
+## Your smoke/gate files we touched (each with the reason)
+
+| File | Why |
+|------|-----|
+| `home-shell-*.mjs` (bridge, regression, recovery, no-hint, stale-hint, switchback, system-switch, auth-gate) | GUI cache tip `home-20260715a` → `home-20260718p`; `FakeElement.append(...)` shim because our chrome uses `Element.append`; regression summary uses `desktopApps` (successor of `desktopHidden`) |
+| `home-passkey-virtual-auth-smoke.mjs` | First boot now opens on a welcome beat; smoke conditionally clicks "Get started" before the create-passkey form |
+| `wallet-product-safety-smoke.sh` | New assert: MetaMask connect must revoke + re-prompt `eth_accounts` so a second account can be linked |
+| `wallet-connector-transaction-smoke.mjs` | Mock provider answers `wallet_requestPermissions` / `wallet_revokePermissions` used by the connect ceremony |
+| `browser-entropy-check.mjs` | Browser accent asserts moved to the shared `--el-accent` token |
+| `home-entropy-check.mjs` | Your tip's file as base + our UX asserts appended (rail, connector sheet, desktop objects, tokens, wallet microcopy). A handful of our stale asserts were replaced by successors (e.g. `desktopHidden` → `desktopApps`); none of your protocol asserts were weakened or removed. Also adds a regression assert that `configureWindowHooks` forwards `launchTarget` (see incident note) |
+
+## Incident note (fixed, gated)
+
+During integration the `launchTarget` forward was briefly dropped from
+`configureWindowHooks` in `home-gui.js` — your hook contract fails closed, so
+the GUI threw at module load (black desktop). Fixed in `9356944eb`, and the
+entropy check now asserts the wiring so `just verify` catches this class of
+regression (assert verified to fail on the broken commit).
+
 ## Forbidden paths (ripgrep-clean on this tip)
 
 - No `openPeopleWindow` / embedded People DOM
@@ -30,15 +60,22 @@ git merge-base --is-ancestor 70ef68532 HEAD   # must succeed
 - No GUI-frame `fetchJson("/api/apps/home/launch")` bypass
 - No `HOME_GUI_MODULE_URL` direct GUI mount
 
-## Gates
+## Bridge conformance (positive checks, not just absence)
 
-- `just verify` — green
-- `./scripts/vendor-ui-tokens.sh --check` — OK
-- `node scripts/home-entropy-check.mjs` — PASS (Anders base + UX asserts)
+- Every `home:*` message the GUI sends has a host handler; every `home:gui-command` the host sends has a GUI handler (inventories match)
+- Wallet rail + connector sheet launch through `launchHomeTarget()` → your `launchTarget` hook, and take sandbox/allow from your `iframeSandboxForLaunch` / `iframeAllowForLaunch` (constants unchanged from your tip)
+- Wallet fresh authority: `home:request-passkey-authority` via `window.top` only
+- Spotlight People result activates `openTarget("people")`
+
+## Gates (run on this exact tip)
+
+- `just verify` — green (one macOS-local flaky: `elastos-vz bridge_propagates_runtime_eof_to_guest_and_exits` timed out once, passed 3/3 on rerun and the full gate passed end-to-end)
+- `./scripts/vendor-ui-tokens.sh --check` — OK (runs inside verify)
+- `node scripts/home-entropy-check.mjs` — PASS (your base + UX asserts)
 
 ## What we are asking
 
-Please review whether this UI/UX sits correctly on your contracts. Prefer merging/pulling **this branch** into yours when happy — we are not asking you to re-merge protocol work.
+Please review whether this UI/UX sits correctly on your contracts. Prefer merging/pulling **this branch** into yours when happy — we are not asking you to re-merge protocol work. Pulling is fast-forward from your tip.
 
 We will **not** retarget `feat/shell-ui-esp` until Katie explicitly approves.
 
