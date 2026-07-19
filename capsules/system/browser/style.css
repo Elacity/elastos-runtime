@@ -259,6 +259,136 @@ code {
   margin-bottom: 16px;
 }
 
+.shell-choice-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.shell-choice {
+  display: grid;
+  grid-template-rows: minmax(112px, 1fr) auto;
+  position: relative;
+  min-width: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--color-border-light);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--color-text-primary);
+  cursor: pointer;
+  text-align: left;
+}
+
+.shell-choice:hover:not(:disabled),
+.shell-choice:focus-visible:not(:disabled) {
+  border-color: #6b7280;
+}
+
+.shell-choice:focus-visible {
+  outline: 2px solid rgba(59, 130, 246, 0.35);
+  outline-offset: 2px;
+}
+
+.shell-choice[data-current="true"] {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 1px #2563eb;
+}
+
+.shell-choice:disabled:not([data-current="true"]) {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.shell-choice-preview {
+  display: block;
+  position: relative;
+  min-height: 112px;
+  overflow: hidden;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.shell-choice-preview-desktop {
+  background: #6ca4e8 url("/apps/home-gui/wallpaper.webp") center / cover no-repeat;
+}
+
+.shell-choice-preview-desktop::before {
+  content: "";
+  position: absolute;
+  top: 9px;
+  left: 50%;
+  width: 72px;
+  height: 12px;
+  border-radius: 3px;
+  background: rgba(31, 41, 55, 0.75);
+  transform: translateX(-50%);
+}
+
+.shell-choice-preview-desktop::after {
+  content: "";
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  width: 21px;
+  height: 21px;
+  border-radius: 5px;
+  background: #f7f7f7;
+  box-shadow: 29px 0 #111827, 58px 0 #f6921a;
+}
+
+.shell-choice-preview-terminal {
+  background: #050608;
+}
+
+.shell-choice-preview-terminal::before {
+  content: "> home\A  Home   Inbox   People   Apps   System\A\A  ElastOS ready.\A  _";
+  display: block;
+  padding: 14px;
+  color: #d7f5ea;
+  font: 10px/1.6 "SFMono-Regular", "Monaco", "Menlo", monospace;
+  white-space: pre;
+}
+
+.shell-choice-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 10px 12px;
+}
+
+.shell-choice-copy strong {
+  font-size: 13px;
+}
+
+.shell-choice-copy small {
+  overflow: hidden;
+  color: var(--color-text-muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shell-choice-state {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  min-height: 18px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.92);
+  color: #1d4ed8;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.shell-choice-state:empty {
+  display: none;
+}
+
+.shell-choice-status {
+  margin-top: 10px;
+}
+
 .pc2-section-title {
   font-size: 11px;
   font-weight: 700;
@@ -646,14 +776,17 @@ code {
 
 .account-list,
 .network-table-card,
-.webspace-list,
 .inspect-grid,
 .capsule-catalog {
   margin-top: 10px;
 }
 
+.catalog-row .catalog-actions,
+.catalog-row button {
+  justify-self: start;
+}
+
 .account-empty,
-.webspace-row-empty,
 .network-row-empty,
 .inspect-empty,
 .catalog-empty {
@@ -794,15 +927,6 @@ code {
   flex-wrap: wrap;
   gap: 5px;
   justify-content: flex-end;
-}
-
-.webspace-list {
-  display: grid;
-  gap: 6px;
-  max-height: min(24rem, 45vh);
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  padding-right: 4px;
 }
 
 .inspect-grid {
@@ -957,8 +1081,6 @@ code {
   white-space: pre-wrap;
 }
 
-
-/* Anders protocol selectors kept alongside UX inspect/webspace presentation. */
 .technical-details {
   border: 1px solid var(--el-hairline);
   border-radius: 8px;
@@ -1299,8 +1421,7 @@ code {
   gap: 6px;
 }
 
-.network-row,
-.webspace-row {
+.network-row {
   border: 1px solid var(--el-hairline);
   border-radius: 8px;
   background: var(--el-inset);
@@ -1321,15 +1442,12 @@ code {
 }
 
 .network-row:hover,
-.network-row:focus-visible,
-.webspace-open:hover,
-.webspace-open:focus-visible {
+.network-row:focus-visible {
   border-color: color-mix(in srgb, var(--el-brand) 50%, transparent);
   outline: none;
 }
 
-.network-icon,
-.webspace-icon {
+.network-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1343,41 +1461,31 @@ code {
 }
 
 .network-main,
-.network-state,
-.webspace-main,
-.webspace-state,
-.webspace-detail {
+.network-state {
   display: grid;
   gap: 2px;
   min-width: 0;
 }
 
 .network-main strong,
-.network-state strong,
-.webspace-main strong,
-.webspace-state strong {
+.network-state strong {
   color: var(--el-text);
   font-size: 12px;
 }
 
 .network-main small,
-.network-state small,
-.webspace-main small,
-.webspace-state small,
-.webspace-detail span {
+.network-state small {
   color: var(--el-muted);
   font-size: 11px;
   overflow-wrap: anywhere;
 }
 
-.network-state,
-.webspace-state {
+.network-state {
   justify-items: end;
   text-align: right;
 }
 
-.network-action,
-.webspace-open {
+.network-action {
   padding: 4px 8px;
   border: 1px solid var(--el-hairline);
   border-radius: 4px;
@@ -1399,41 +1507,6 @@ code {
 
 .network-row[data-tone="error"] .network-state strong {
   color: var(--el-danger);
-}
-
-.webspace-summary {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
-  cursor: pointer;
-  list-style: none;
-}
-
-.webspace-summary::-webkit-details-marker {
-  display: none;
-}
-
-.webspace-row[open] {
-  border-color: color-mix(in srgb, var(--el-brand) 50%, transparent);
-}
-
-.webspace-details {
-  display: grid;
-  gap: 7px;
-  padding: 0 12px 12px 56px;
-}
-
-.webspace-detail b {
-  color: var(--el-text);
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-}
-
-.webspace-open {
-  justify-self: start;
 }
 
 .system-error {
@@ -1572,7 +1645,6 @@ code {
   }
 
   .network-row,
-  .webspace-summary,
   .inspect-grid,
   .inspect-row,
   .inspect-facts {
@@ -1580,22 +1652,12 @@ code {
     grid-template-columns: 1fr;
   }
 
-  .network-state,
-  .webspace-state {
+  .network-state {
     justify-items: start;
     text-align: left;
   }
 
-  .webspace-details {
-    padding: 0 12px 12px;
-  }
-
-  .webspace-list {
-    max-height: 18rem;
-  }
-
-  .inspect-list,
-  .inspect-detail {
-    max-height: none;
+  .shell-choice-grid {
+    grid-template-columns: 1fr;
   }
 }

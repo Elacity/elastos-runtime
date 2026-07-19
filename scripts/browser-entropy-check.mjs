@@ -385,7 +385,7 @@ assert(
 assert(
   browserStyle.includes(".browser-stage") &&
     browserStyle.includes("@media (max-width: 640px)") &&
-    browserStyle.includes("--accent: #d46f24") &&
+    browserStyle.includes("--accent: var(--el-accent)") &&
     browserStyle.includes("overflow: hidden") &&
     browserStyle.includes("height: 100%") &&
     browserStyle.includes("min-height: 0") &&
@@ -1572,7 +1572,9 @@ assert(
 assert(
   browserJs.includes("function resetBrowserProfile") &&
     browserJs.includes("/api/apps/browser/profile/reset") &&
-    browserJs.includes("Reset Browser cookies, local storage, history, and cache for this account?") &&
+    browser.includes(
+      "Reset Browser cookies, local storage, history, and cache for this account?",
+    ) &&
     browserJs.includes("await closeRuntimePage(activePage)") &&
     browserJs.includes("await closeRuntimePage(stalePage)") &&
     browserJs.includes("publishRuntimePageForHost(null)") &&

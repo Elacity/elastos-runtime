@@ -146,7 +146,7 @@ export function createWalletCreateAccountFlow({
     form.className = "wallet-flow-form";
     form.innerHTML = `
       <label>Wallet recovery key
-        <textarea name="recovery_key" rows="6" spellcheck="false" placeholder='{"schema":"elastos.wallet.recovery-key/v1",...}'></textarea>
+        <textarea name="recovery_key" rows="6" spellcheck="false" placeholder="Paste the full Wallet recovery key JSON"></textarea>
       </label>
       <label>Name <input name="label" autocomplete="off" maxlength="40" placeholder="Recovered account"></label>
       <p class="wallet-flow-hint">Paste an individual Wallet recovery key. A full System Recovery Kit can restore Home data and included built-in Wallet accounts from System.</p>

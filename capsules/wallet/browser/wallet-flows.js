@@ -1,4 +1,4 @@
-import { textNode } from "./wallet-render.js?v=wallet-20260719w";
+import { publicWalletText, textNode } from "./wallet-render.js?v=wallet-20260719w";
 
 export function createWalletFlows({
   modalNode,
@@ -461,7 +461,10 @@ export function createWalletFlows({
     row.firstChild.append(textNode("strong", title), textNode("span", subtitle));
     row.append(textNode("span", "›", "wallet-state"));
     row.addEventListener("click", () => {
-      Promise.resolve(onClick(row)).catch((error) => showStatus(String(error.message || error), "error"));
+      Promise.resolve(onClick(row)).catch((error) => {
+        const message = error && error.message ? error.message : error;
+        showStatus(publicWalletText(message), "error");
+      });
     });
     return row;
   }
@@ -483,7 +486,10 @@ export function createWalletFlows({
     button.type = "button";
     button.textContent = label;
     button.addEventListener("click", () => {
-      Promise.resolve(onClick(button)).catch((error) => showStatus(String(error.message || error), "error"));
+      Promise.resolve(onClick(button)).catch((error) => {
+        const message = error && error.message ? error.message : error;
+        showStatus(publicWalletText(message), "error");
+      });
     });
     return button;
   }

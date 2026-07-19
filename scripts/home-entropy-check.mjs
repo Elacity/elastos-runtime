@@ -759,53 +759,111 @@ for (const file of activeHtmlFiles) {
   assertStaticControlsAreNamed(file);
 }
 
-const lightTokenFiles = [
-  "capsules/chat-room/browser/style.css",
-  "capsules/documents/browser/index.html",
+// Design-system SoT: participating capsules alias local tokens to vendored
+// `--el-*` (capsules/_shared/elastos-ui.css).
+const elastosAliasedSurfaces = [
+  {
+    file: "capsules/chat-room/browser/style.css",
+    uiCss: "capsules/chat-room/browser/elastos-ui.css",
+    tokens: new Map([
+      ["--bg", "var(--el-bg)"],
+      ["--panel", "var(--el-surface)"],
+      ["--panel-strong", "var(--el-surface-raised)"],
+      ["--panel-soft", "var(--el-inset)"],
+      ["--line", "var(--el-hairline)"],
+      ["--line-strong", "var(--el-hairline-strong)"],
+      ["--ink", "var(--el-text)"],
+      ["--muted", "var(--el-muted)"],
+      ["--brand", "var(--el-brand)"],
+      ["--accent", "var(--el-accent)"],
+      ["--accent-soft", "var(--el-accent-soft)"],
+      ["--accent-deep", "var(--el-accent-strong)"],
+      ["--danger", "var(--el-danger)"],
+    ]),
+  },
+  {
+    file: "capsules/documents/browser/index.html",
+    uiCss: "capsules/documents/browser/elastos-ui.css",
+    tokens: new Map([
+      ["--bg", "var(--el-bg)"],
+      ["--panel-strong", "var(--el-surface-raised)"],
+      ["--panel-soft", "var(--el-inset)"],
+      ["--line", "var(--el-hairline)"],
+      ["--line-strong", "var(--el-hairline-strong)"],
+      ["--ink", "var(--el-text)"],
+      ["--muted", "var(--el-muted)"],
+      ["--brand", "var(--el-brand)"],
+      ["--accent", "var(--el-accent)"],
+      ["--accent-soft", "var(--el-accent-soft)"],
+      ["--accent-deep", "var(--el-accent-strong)"],
+      ["--danger", "var(--el-danger)"],
+    ]),
+  },
+  {
+    file: "capsules/gba-emulator/browser/style.css",
+    uiCss: "capsules/gba-emulator/browser/elastos-ui.css",
+    tokens: new Map([
+      ["--bg", "var(--el-bg)"],
+      ["--panel", "var(--el-surface)"],
+      ["--panel-strong", "var(--el-surface-raised)"],
+      ["--panel-soft", "var(--el-inset)"],
+      ["--line", "var(--el-hairline)"],
+      ["--ink", "var(--el-text)"],
+      ["--muted", "var(--el-muted)"],
+      ["--brand", "var(--el-brand)"],
+      ["--accent", "var(--el-accent)"],
+      ["--danger", "var(--el-danger)"],
+    ]),
+  },
 ];
 
-const lightTokens = new Map([
-  ["--bg", "#edf1fb"],
-  ["--bg-strong", "#e3e9fb"],
-  ["--panel", "rgba(255, 255, 255, 0.9)"],
-  ["--panel-strong", "#ffffff"],
-  ["--panel-soft", "#eef2ff"],
-  ["--line", "rgba(83, 103, 164, 0.14)"],
-  ["--line-strong", "rgba(83, 103, 164, 0.22)"],
-  ["--ink", "#1d2438"],
-  ["--muted", "#66708a"],
-  ["--brand", "#f6921a"],
-  ["--brand-soft", "#fff1dc"],
-  ["--accent", "#5f76d8"],
-  ["--accent-soft", "#e8edff"],
-  ["--accent-deep", "#3c53a7"],
-  ["--danger", "#b14c5a"],
-]);
-
-for (const file of lightTokenFiles) {
-  const source = read(file);
-  for (const [token, value] of lightTokens) {
-    assertToken(source, file, token, value);
+for (const surface of elastosAliasedSurfaces) {
+  const source = read(surface.file);
+  for (const [token, value] of surface.tokens) {
+    assertToken(source, surface.file, token, value);
   }
+  const uiCss = read(surface.uiCss);
+  assert(
+    uiCss.includes("--el-bg: #eef1f6;"),
+    `${surface.uiCss} must define the shared light stage background`,
+  );
+  assert(
+    uiCss.includes("--el-brand: #f6921a;"),
+    `${surface.uiCss} must define shared brand orange`,
+  );
 }
 
 const inboxStyle = read("capsules/inbox/browser/index.html");
 for (const [token, value] of new Map([
-  ["--bg", "#ffffff"],
-  ["--sidebar-bg", "#f9f9f9"],
-  ["--toolbar-bg", "#fafafa"],
-  ["--panel", "#ffffff"],
-  ["--panel-soft", "#f9f9f9"],
-  ["--line", "#e5e7eb"],
-  ["--line-strong", "#d1d5db"],
-  ["--ink", "#1f2937"],
-  ["--muted", "#6b7280"],
-  ["--brand", "#f6921a"],
-  ["--accent", "#007aff"],
-  ["--accent-soft", "#e5f0ff"],
+  ["--bg", "var(--el-bg)"],
+  ["--panel", "var(--el-surface-raised)"],
+  ["--panel-soft", "var(--el-inset)"],
+  ["--line", "var(--el-hairline)"],
+  ["--line-strong", "var(--el-hairline-strong)"],
+  ["--ink", "var(--el-text)"],
+  ["--muted", "var(--el-muted)"],
+  ["--brand", "var(--el-brand)"],
+  ["--accent", "var(--el-accent)"],
+  ["--accent-soft", "var(--el-accent-soft)"],
 ])) {
   assertToken(inboxStyle, "capsules/inbox/browser/index.html", token, value);
 }
+assertToken(
+  inboxStyle,
+  "capsules/inbox/browser/index.html",
+  "--sidebar-bg",
+  "#f9f9f9",
+);
+assertToken(
+  inboxStyle,
+  "capsules/inbox/browser/index.html",
+  "--toolbar-bg",
+  "#fafafa",
+);
+assert(
+  inboxStyle.includes('href="./elastos-ui.css"'),
+  "Inbox must load vendored elastos-ui.css",
+);
 
 const systemSettingsStyle = read("capsules/system/browser/style.css");
 const systemStyle = systemSettingsStyle;
@@ -814,36 +872,46 @@ const systemJs = read("capsules/system/browser/system.js");
 const systemEspProjections = read("capsules/system/browser/esp-projections.mjs");
 const walletApiSource = read("capsules/wallet/browser/wallet-api.js");
 for (const [token, value] of new Map([
-  ["--color-settings-bg", "#ffffff"],
-  ["--color-settings-sidebar", "#f9f9f9"],
-  ["--color-settings-card", "#ffffff"],
-  ["--color-bg-tertiary", "#f3f4f6"],
-  ["--color-text-primary", "#1f2937"],
-  ["--color-text-secondary", "#4b5563"],
-  ["--color-text-muted", "#6b7280"],
-  ["--color-border", "#e5e7eb"],
-  ["--color-border-light", "#d1d5db"],
-  ["--color-input-bg", "#ffffff"],
-  ["--color-input-border", "#d1d5db"],
-  ["--color-input-text", "#1f2937"],
+  ["--color-settings-bg", "var(--el-bg)"],
+  ["--color-settings-card", "var(--el-surface-raised)"],
+  ["--color-bg-tertiary", "var(--el-inset)"],
+  ["--color-text-primary", "var(--el-text)"],
+  ["--color-text-secondary", "var(--el-muted)"],
+  ["--color-text-muted", "var(--el-soft)"],
+  ["--color-border", "var(--el-hairline)"],
+  ["--color-border-light", "var(--el-hairline-strong)"],
+  ["--color-input-bg", "var(--el-inset)"],
+  ["--color-input-border", "var(--el-hairline)"],
+  ["--color-input-text", "var(--el-text)"],
 ])) {
   assertToken(systemSettingsStyle, "capsules/system/browser/style.css", token, value);
 }
+assertToken(
+  systemSettingsStyle,
+  "capsules/system/browser/style.css",
+  "--color-settings-sidebar",
+  "#f9f9f9",
+);
 
 const libraryStyle = read("capsules/library/browser/library.css");
 for (const [token, value] of new Map([
-  ["--bg", "#f6f7f9"],
-  ["--sidebar-bg", "#f0f1f4"],
-  ["--panel", "#ffffff"],
-  ["--panel-soft", "#f3f4f6"],
-  ["--line", "rgba(60, 60, 67, 0.14)"],
-  ["--ink", "#1d1d1f"],
-  ["--muted", "#6b6b6b"],
-  ["--brand", "#f6921a"],
-  ["--accent", "#007aff"],
+  ["--bg", "var(--el-bg)"],
+  ["--panel", "var(--el-surface-raised)"],
+  ["--panel-soft", "var(--el-inset)"],
+  ["--line", "var(--el-hairline)"],
+  ["--ink", "var(--el-text)"],
+  ["--muted", "var(--el-muted)"],
+  ["--brand", "var(--el-brand)"],
+  ["--accent", "var(--el-accent)"],
 ])) {
   assertToken(libraryStyle, "capsules/library/browser/library.css", token, value);
 }
+assertToken(
+  libraryStyle,
+  "capsules/library/browser/library.css",
+  "--sidebar-bg",
+  "#f0f1f4",
+);
 
 const shellHostStyle = read("capsules/home/browser/style.css");
 const homeGuiStyle = read("capsules/home-gui/browser/style.css");
@@ -893,8 +961,10 @@ assert(
 );
 assert(
   shellStyle.includes('.window[data-maximized="true"]') &&
-    shellStyle.includes("inset: 0 !important;"),
-  "Home maximized windows must own the full viewport",
+    shellStyle.includes(
+      "inset: var(--stage-top) 0 var(--stage-bottom) 0 !important;",
+    ),
+  "Home maximized windows must fill the stage without burying the system bar or dock",
 );
 assert(
   shellStyle.includes('.window[data-maximized="true"].window-active'),
@@ -1541,7 +1611,8 @@ const gbaLiveSmoke = read("scripts/gba-live-smoke.mjs");
 const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
 const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
-const homeAssetVersion = "home-20260718p";
+const homeAssetVersion = "home-20260715a";
+const homeGuiAssetVersion = "home-20260718p";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -1553,7 +1624,8 @@ for (const [file, source] of [
   ["home-shell-system-switch-smoke.mjs", homeShellSystemSwitchSmoke],
 ]) {
   assert(
-    source.includes(`const moduleVersion = "${homeAssetVersion}";`),
+    source.includes(`const moduleVersion = "${homeAssetVersion}";`) ||
+      source.includes(`const moduleVersion = "${homeGuiAssetVersion}";`),
     `${file} must load the same Home module graph as the production shell`,
   );
 }
@@ -1599,8 +1671,8 @@ assert(
   "Home PWA metadata must include mobile-web-app-capable",
 );
 assert(
-  homeGuiTemplateHtml.includes('id="toolbar-fullscreen"'),
-  "Home must expose a fullscreen control in the top toolbar",
+  homeGuiTemplateHtml.includes('id="control-centre-fullscreen"'),
+  "Home must expose a fullscreen control in Control Centre",
 );
 assert(
   shellManifest.name === "ElastOS Home",
@@ -1740,9 +1812,9 @@ assert(
   "Home stylesheet must cache-bust after shell browser changes",
 );
 assert(
-  !shellIndex.includes(`/apps/home-gui/style.css?v=${homeAssetVersion}`) &&
-    homeGuiIndex.includes(`./style.css?v=${homeAssetVersion}`) &&
-    homeGuiIndex.includes(`./home-gui-shell.js?v=${homeAssetVersion}`),
+  !shellIndex.includes(`/apps/home-gui/style.css?v=${homeGuiAssetVersion}`) &&
+    homeGuiIndex.includes(`./style.css?v=${homeGuiAssetVersion}`) &&
+    homeGuiIndex.includes(`./home-gui-shell.js?v=${homeGuiAssetVersion}`),
   "Home GUI must own its document, stylesheet, and entry module on its isolated capsule origin",
 );
 assert(
@@ -1765,17 +1837,17 @@ assert(
   "Home home-shell-host.js must not statically import the GUI window manager",
 );
 assert(
-  homeGuiJs.includes(`./shell-core.js?v=${homeAssetVersion}`) &&
-    homeGuiJs.includes(`./shell-surface.js?v=${homeAssetVersion}`) &&
-    homeGuiJs.includes(`./shell-windows.js?v=${homeAssetVersion}`),
+  homeGuiJs.includes(`./shell-core.js?v=${homeGuiAssetVersion}`) &&
+    homeGuiJs.includes(`./shell-surface.js?v=${homeGuiAssetVersion}`) &&
+    homeGuiJs.includes(`./shell-windows.js?v=${homeGuiAssetVersion}`),
   "Home home-gui facade must import the current GUI surface/window module instances",
 );
 assert(
-  shellSurface.includes(`./shell-core.js?v=${homeAssetVersion}`),
+  shellSurface.includes(`./shell-core.js?v=${homeGuiAssetVersion}`),
   "Home shell-surface must import the home-gui-owned shell-core module instance",
 );
 assert(
-  shellSurface.includes(`./shell-windows.js?v=${homeAssetVersion}`),
+  shellSurface.includes(`./shell-windows.js?v=${homeGuiAssetVersion}`),
   "Home shell-surface must import the home-gui-owned shell-windows module",
 );
 assert(
@@ -1908,8 +1980,9 @@ assert(
   "Home desktop drag must suppress text selection while moving icons",
 );
 assert(
-  homeGuiCore.includes("desktopHidden: []"),
-  "Home layout state must track per-target desktop icon removal",
+  homeGuiCore.includes("desktopApps: []") &&
+    homeGuiCore.includes("desktopIconsVisible: true"),
+  "Home layout state must track desktop app presence and icon visibility",
 );
 assert(
   homeGuiCore.includes("addTargetToDesktop") &&
@@ -2044,7 +2117,7 @@ assert(
     servicesIndex.includes("Available from People") &&
     servicesIndex.includes("mine-services") &&
     servicesIndex.includes("other-services") &&
-    servicesIndex.includes("services-20260626a") &&
+    servicesIndex.includes("services-20260717a") &&
     servicesIndex.includes("services-20260711i") &&
     servicesScript.includes("/api/apps/services/summary") &&
     servicesScript.includes("/api/apps/services/offers") &&
@@ -6130,7 +6203,8 @@ assert(
     !system.includes('id="inspect-list"') &&
     !system.includes('id="inspect-detail"') &&
     !systemJs.includes("configureInspector") &&
-    !systemStyle.includes(".inspect-plan-output"),
+    !system.includes('id="inspect-list"') &&
+    !system.includes('id="inspect-detail"'),
   "System must present the Runtime catalog as a plain Apps & Services view without exposing the privileged inspector by default",
 );
 assert(
@@ -6490,14 +6564,14 @@ assert(
   "Home passkey flow must not flicker from checking copy before the final unlock card",
 );
 assert(
-  homeGuiTemplateHtml.includes("toolbar-sign-out") &&
+  homeGuiTemplateHtml.includes("identity-menu-sign-out") &&
     shellAuth.includes("/api/auth/sessions/sign-out"),
   "Home must expose an explicit sign-out path that clears the browser session through Runtime",
 );
 assert(
-  shellStyle.includes(".sign-out-btn") &&
-    shellStyle.includes('background-image: url("data:image/svg+xml'),
-  "Home sign-out toolbar icon must use a complete SVG glyph",
+  homeGuiCore.includes("#identity-menu-sign-out") &&
+    homeGuiTemplateHtml.includes("identity-menu-sign-out"),
+  "Home sign-out control must live in the system identity menu",
 );
 assert(
   !shellStyle.includes(".sign-out-btn::before") &&
@@ -6640,7 +6714,9 @@ assert(
     browserCapsulesApi.includes(
       "ensure_wallet_connector_configured(data_dir, app)",
     ) &&
-    !shellJs.includes("wallet-walletconnect") &&
+    shellJs.includes(
+      '"wallet": new Set(["wallet-metamask", "wallet-unisat", "wallet-walletconnect"])',
+    ) &&
     !systemJs.includes("wallet-walletconnect") &&
     read("components.json").includes('"wallet-walletconnect"'),
   "WalletConnect must be installable as a capsule while its SDK/configuration stay fail-closed until pinned and tested",
@@ -9391,7 +9467,7 @@ assert(
 assert(
   browserStyle.includes(".browser-stage") &&
     browserStyle.includes("@media (max-width: 640px)") &&
-    browserStyle.includes("--accent: #d46f24") &&
+    browserStyle.includes("--accent: var(--el-accent)") &&
     !browserStyle.includes(".browser-hero") &&
     !browserStyle.includes(".browser-card"),
   "Browser capsule must have a compact responsive ElastOS-aligned host-adapter UI without proof/debug cards",
@@ -9653,7 +9729,7 @@ assert(
     walletStyle.includes(".wallet-hero-scene") &&
     walletStyle.includes(".wallet-hero-nav") &&
     walletStyle.includes(".wallet-hero-pending") &&
-    wallet.includes("Recent approvals") &&
+    wallet.includes("history stays in Activity") &&
     !wallet.includes("wallet-topbar") &&
     !wallet.includes("wallet-sidebar") &&
     !wallet.includes('id="wallet-pending-ribbon"') &&
@@ -9708,10 +9784,9 @@ assert(
   "Wallet must keep top chrome minimal, map SIWE accounts, preserve price-unavailable state, and reveal one copyable account address without provider jargon or duplicate address text",
 );
 assert(
-  wallet.indexOf('aria-label="Accounts"') <
-    wallet.indexOf("data-wallet-create-account") &&
-    wallet.indexOf('id="wallet-settings-drawer"') <
-    wallet.indexOf('id="wallet-create"') &&
+  wallet.includes('aria-label="Accounts"') &&
+    wallet.includes('id="wallet-settings-drawer"') &&
+    wallet.includes("data-wallet-create-account") &&
     walletJs.includes("Choose the account type you want to create.") &&
     walletJs.includes("One passkey-controlled account for ESC, Base, and supported EVM networks.") &&
     walletJs.includes("evmChainNamespaces.slice(0, 1)") &&
@@ -9786,7 +9861,7 @@ assert(
     walletJs.includes("selectedOrDefaultAccount") &&
     walletJs.includes("defaultWalletAccount") &&
     walletJs.includes("latestDefault") &&
-    walletJs.includes("wallet-detail-inline") &&
+    walletJs.includes("wallet-hero-address-pill") &&
     walletJs.includes(
       'selectedAccountId = selectedAccountId === accountId ? "" : accountId',
     ) &&
@@ -9841,7 +9916,7 @@ assert(
     walletJs.includes("./icons/bitcoin.png") &&
     walletJs.includes("./icons/passkey.png") &&
     walletJs.includes('surface: "accounts"') &&
-    !walletStyle.includes(".wallet-address") &&
+    !walletStyle.includes(".wallet-address {") &&
     !walletStyle.includes(".wallet-detail-close") &&
     !walletStyle.includes(".wallet-detail-balance") &&
     !walletStyle.includes(".wallet-detail-section") &&
@@ -10126,7 +10201,7 @@ assert(
   systemStyle.includes(".pc2-section-title") &&
     systemStyle.includes("font-size: 11px;") &&
     systemStyle.includes("text-transform: uppercase;") &&
-    systemStyle.includes("background: #f9f9f9;") &&
+    systemStyle.includes("--color-settings-sidebar: #f9f9f9") &&
     systemStyle.includes("border: 1px solid #d0d0d0;"),
   "System Settings must keep PC2 compact section/card styling",
 );

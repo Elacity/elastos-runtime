@@ -779,7 +779,7 @@ import { createLibraryUploads } from "./uploads.js";
     }
 
     // Apply (or, when colorId is falsy, clear) a colour tag on every given object, then refresh
-    // just those rows. Tags live in localStorage (see tags.js), so this is instant and local.
+    // just those rows. Tags live in the local preference store (see tags.js), so this is instant and local.
     function applyTag(objects, colorId) {
       for (const object of objects) {
         if (!object || !object.uri) continue;

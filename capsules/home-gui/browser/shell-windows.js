@@ -569,10 +569,10 @@ function renderTargetLaunchError(targetId, error) {
     id: "shell-launch-error",
     title,
     headline: `Could not open ${title}`,
-    copy: "Home asked the runtime to open this item, but the launch did not complete. It may be momentary — trying again is safe.",
-    subjectLabel: "Item ID",
-    subjectValue: targetId,
-    detail: String(error.message || error),
+    copy: "The app did not start. Close this window and try again.",
+    subjectLabel: "App",
+    subjectValue: title,
+    detail: "",
     onRetry: () => openTarget(targetId),
   });
 }

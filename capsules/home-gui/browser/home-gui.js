@@ -546,10 +546,6 @@ export function closeHomeGuiWindowForToken(homeToken) {
   return true;
 }
 
-export function openHomeGuiTarget(target, options = {}) {
-  return openTarget(target, options);
-}
-
 export function relaunchHomeGuiWindowForToken(homeToken) {
   const entry = homeGuiWindowEntryForToken(homeToken);
   if (!entry) {

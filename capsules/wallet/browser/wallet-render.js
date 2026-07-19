@@ -24,7 +24,14 @@ export function createWalletRender({ statusNode }) {
       window.clearTimeout(statusClearTimer);
       statusClearTimer = 0;
     }
-    const text = typeof message === "string" ? message.trim() : "";
+    const raw = typeof message === "string" ? message.trim() : String(message ?? "").trim();
+    if (!raw) {
+      statusNode.hidden = true;
+      statusNode.textContent = "";
+      delete statusNode.dataset.tone;
+      return;
+    }
+    const text = publicWalletText(raw);
     statusNode.hidden = text.length === 0;
     statusNode.textContent = text;
     statusNode.dataset.tone = tone || "muted";

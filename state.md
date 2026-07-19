@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-07-16 UTC
+Last updated: 2026-07-18 UTC
 
 This file records public-safe current truth for the 0.5.0 line and active
 feature branches. Historical
@@ -15,6 +15,13 @@ the public repository.
 - `feat/elastos-shell-protocol` is the current Components, ElastOS Bus, and shell-protocol
   work branch based on `upstream/0.6-dev`. Its review-readiness requirements are
   tracked in [TASKS.md](TASKS.md).
+- `feat/shell-ui-esp-on-protocol` is the UX-on-protocol integration branch cut from
+  Anders tip `70ef68532`: Home GUI iframe bridge + People-as-capsule + Wallet
+  passkey mediation stay Anders-owned; shell chrome / Wallet rail / design tokens
+  are Katie-owned. `just verify` is green on this tip (entropy union included).
+  Pre-align UX backup: `backup/shell-ui-esp-pre-anders-align` / tag
+  `backup/shell-ui-esp-4ee88d690`. Do not retarget `feat/shell-ui-esp` without
+  explicit approval.
 - Executable product capsules target the WASM Component Model through
   `elastos.component/v1` and use the Runtime-mediated `elastos:bus@v1`
   authority contract. WASI Preview 1 is not a supported product capsule ABI.
