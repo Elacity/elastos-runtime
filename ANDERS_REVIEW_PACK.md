@@ -86,6 +86,34 @@ Two follow-ups found in live product smoke, same closed-set discipline:
   the only host sandbox delta; `escape-sandbox` is required or the popup
   would itself be opaque and break the extension identically.
 
+## Opaque-frame origin sweep (wallet + browser capsules)
+
+`window.location.origin` inside an opaque-sandboxed frame still returns the
+URL origin, while the frame's *security* origin serializes to `"null"` — so
+any capsule-side channel that posts to its GUI parent with a concrete URL
+target, or filters inbound GUI messages against `location.origin`, silently
+dies under your sandbox model. A live-browser sweep (Playwright, virtual
+passkey, real gateway) found seven such sites and we converged them on one
+idiom: outbound to the opaque parent posts with `"*"` (chrome hints only —
+badge counts, privacy booleans, menu manifests carry no secrets), inbound
+pins `event.origin === "null" && event.source === window.parent` (fail-closed
+to the direct parent, same as the GUI rail's own filter):
+
+- `wallet.js` — rail chrome commands (`elastos:wallet-chrome-command`), GUI
+  menubar commands (`elastos:menu-command`), post-ceremony refresh
+  (`elastos:wallet-refresh`) inbound filters; `wallet:pending-count` outbound.
+- `wallet-preferences.js` — `wallet:privacy-state` outbound.
+- `browser.js` — `home:menu-manifest` now goes to the token-authorizing host
+  (`window.top`, your relay path) instead of the opaque parent;
+  `elastos:menu-command` inbound filter.
+
+Without these, the rail's Activity/Settings/privacy buttons were dead, the
+approvals badge never updated, Wallet never refreshed after a connector
+ceremony, and Browser menus were inert. The entropy check asserts the idiom
+on both capsules, and the live probe (sign-in → rail → chrome command →
+MetaMask ceremony → popup) runs with zero `postMessage` origin-mismatch
+warnings.
+
 ## Known limitation inherited from the opaque-frame model (decision yours)
 
 `gba-emulator` fail-closes with "This browser does not provide isolated

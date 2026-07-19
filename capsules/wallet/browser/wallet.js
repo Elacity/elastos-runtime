@@ -1,9 +1,9 @@
-import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260719w";
+import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260719x";
 import { createWalletApi,
   readHomeOrigin,
   readLaunchToken,
-  readQueryParam } from "./wallet-api.js?v=wallet-20260719w";
-import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260719w";
+  readQueryParam } from "./wallet-api.js?v=wallet-20260719x";
+import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260719x";
 import {
   BALANCE_NETWORKS,
   MANAGED_CHAIN_NAMESPACES,
@@ -21,14 +21,14 @@ import {
   readText,
   shortAddress,
   validateAddress,
-} from "./wallet-format.js?v=wallet-20260719w";
-import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260719w";
-import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260719w";
-import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260719w";
-import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260719w";
-import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260719w";
-import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260719w";
-import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260719w";
+} from "./wallet-format.js?v=wallet-20260719x";
+import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260719x";
+import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260719x";
+import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260719x";
+import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260719x";
+import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260719x";
+import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260719x";
+import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260719x";
 import {
   accountCard,
   copyButton,
@@ -38,7 +38,7 @@ import {
   methodMark,
   setBusy,
   textNode,
-} from "./wallet-render.js?v=wallet-20260719w";
+} from "./wallet-render.js?v=wallet-20260719x";
 
 const statusNode = document.querySelector("#wallet-status");
 const homeParentOrigin = readHomeOrigin();
@@ -297,7 +297,10 @@ function openActivityChrome() {
 }
 
 function onWalletChromeCommand(event) {
-  if (event.origin !== window.location.origin) {
+  // Rail chrome buttons live in the opaque-sandboxed Home GUI frame: its
+  // security origin serializes to "null" (location.origin here is the URL
+  // origin, never "null"). Pin the sender to our direct parent instead.
+  if (event.origin !== "null" || event.source !== window.parent) {
     return;
   }
   const message = event.data;
@@ -357,7 +360,9 @@ function announceShellMenuManifest() {
 }
 
 function onShellMenuCommand(event) {
-  if (event.origin !== homeParentOrigin || event.source !== window.top) {
+  // Menu commands come from the GUI menubar — our direct parent frame, which
+  // is opaque-sandboxed (security origin "null"), not the top-level host.
+  if (event.origin !== "null" || event.source !== window.parent) {
     return;
   }
   const message = event.data;
@@ -402,7 +407,8 @@ function onRuntimeEvents(event) {
 /* Shell pokes this after a connector ceremony succeeds. home:refresh-summary
    only updates Home chrome — it does not reload Wallet accounts by itself. */
 function onWalletRefreshMessage(event) {
-  if (event.origin !== window.location.origin) {
+  // Posted by the GUI rail / connector sheet — opaque parent frame ("null").
+  if (event.origin !== "null" || event.source !== window.parent) {
     return;
   }
   const message = event.data || {};
@@ -520,12 +526,14 @@ function renderApprovalsBadge(pendingCount) {
     }
   }
   if (window.parent !== window) {
+    // Parent is the opaque-sandboxed GUI frame: a concrete URL target never
+    // matches its "null" origin, so post with "*" (badge count is not secret).
     window.parent.postMessage(
       {
         type: "wallet:pending-count",
         count,
       },
-      window.location.origin,
+      "*",
     );
   }
 }

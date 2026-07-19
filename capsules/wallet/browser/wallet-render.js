@@ -3,7 +3,7 @@ import {
   assetColor,
   formatAmount,
   shortAddress,
-} from "./wallet-format.js?v=wallet-20260719w";
+} from "./wallet-format.js?v=wallet-20260719x";
 
 const METHOD_ICON_SRC = Object.freeze({
   metamask: "./icons/metamask.png",

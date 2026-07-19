@@ -1564,7 +1564,7 @@ assert(
     browserJs.includes("navigator.clipboard.writeText(message)") &&
     browserStyle.includes('.browser-status[data-visible="true"][data-copyable="true"]') &&
     browserStyle.includes(".browser-status-copy") &&
-    browser.includes("browser.js?v=browser-20260711c") &&
+    browser.includes("browser.js?v=browser-20260719a") &&
     !browser.includes("browser.js?v=browser-20260629b"),
   "Browser sticky status/errors must be copyable so live product failures can produce actionable evidence",
 );
@@ -1598,8 +1598,8 @@ assert(
 );
 
 assert(
-  browserJs.includes("browser-status.js?v=browser-20260711c") &&
-    browserRemoteDisplay.includes("browser-status.js?v=browser-20260711c") &&
+  browserJs.includes("browser-status.js?v=browser-20260719a") &&
+    browserRemoteDisplay.includes("browser-status.js?v=browser-20260719a") &&
     !browserJs.includes("browser-status.js?v=browser-20260626e") &&
     !browserRemoteDisplay.includes("browser-status.js?v=browser-20260626e") &&
     !browserJs.includes("browser-status.js?v=browser-20260616c") &&
@@ -1670,7 +1670,7 @@ assert(
 );
 
 assert(
-    browserJs.includes("browser-input-surface.js?v=browser-20260711c") &&
+    browserJs.includes("browser-input-surface.js?v=browser-20260719a") &&
     browserInputSurface.includes('renderPanel.addEventListener("click"') &&
     !browserJs.includes('renderImage.addEventListener("click"') &&
     browserInputSurface.includes('remoteVideo.addEventListener("click"') &&

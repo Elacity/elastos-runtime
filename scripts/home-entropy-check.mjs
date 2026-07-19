@@ -9720,7 +9720,7 @@ assert(
   "Wallet must provide balances and built-in Bitcoin accounts without manual Bitcoin proof linking",
 );
 assert(
-  wallet.includes("wallet.js?v=wallet-20260719w") &&
+  wallet.includes("wallet.js?v=wallet-20260719x") &&
     wallet.includes('id="wallet-send"') &&
     wallet.includes('id="wallet-receive"') &&
     wallet.includes("data-wallet-create-account") &&
@@ -9740,6 +9740,25 @@ assert(
     walletJs.includes("wallet-hero-address-pill") &&
     walletJs.includes("fundedSendableAccounts"),
   "Wallet must expose Send/Receive plus canonical Accounts create-import surfaces with cache-busted assets",
+);
+// Wallet runs in an opaque-sandboxed frame under the Home GUI: inbound GUI
+// messages arrive with security origin "null" (never location.origin, which
+// stays the URL origin), and posts to the opaque parent must target "*".
+assert(
+  (walletJs.match(/event\.origin !== "null" \|\| event\.source !== window\.parent/g) || []).length >= 3 &&
+    !walletJs.includes("event.origin !== window.location.origin") &&
+    !walletJs.includes("window.location.origin,\n    );") &&
+    walletJs.includes('type: "wallet:pending-count"') &&
+    walletJs.includes('type: "wallet:privacy-state"'),
+  "Wallet chrome/menu/refresh channels must use opaque-frame origins (parent-pinned \"null\" inbound, \"*\" outbound)",
+);
+// Browser app frame: menu manifest goes to the token-authorizing host
+// (window.top), menu commands come from the opaque GUI menubar (parent).
+assert(
+  browserJs.includes('event.origin !== "null" || event.source !== window.parent') &&
+    !browserJs.includes("event.origin !== window.location.origin") &&
+    browserJs.includes('type: "home:menu-manifest"'),
+  "Browser menu channels must use opaque-frame origins (host-bound manifest, parent-pinned commands)",
 );
 assert(
   wallet.includes('id="wallet-currency-settings"') &&

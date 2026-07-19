@@ -6,12 +6,12 @@ import {
   readStoredBoolean,
   readStoredValue,
   storeValue,
-} from "./wallet-format.js?v=wallet-20260719w";
+} from "./wallet-format.js?v=wallet-20260719x";
 import {
   actionButton,
   methodMark,
   textNode,
-} from "./wallet-render.js?v=wallet-20260719w";
+} from "./wallet-render.js?v=wallet-20260719x";
 
 export function createWalletPreferences({
   closeModal,
@@ -315,12 +315,14 @@ export function createWalletPreferences({
       privacyButton.classList.toggle("is-active", privacyMode);
     }
     if (window.parent !== window) {
+      // Parent is the opaque-sandboxed GUI frame ("null" origin): post with
+      // "*" — a boolean chrome hint, no secrets cross the boundary.
       window.parent.postMessage(
         {
           type: "wallet:privacy-state",
           privacyMode,
         },
-        window.location.origin,
+        "*",
       );
     }
   }

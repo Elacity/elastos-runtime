@@ -12,19 +12,19 @@ import {
   sameBrowserStreamTarget,
   visibleAddressForUrl,
 } from "./browser-runtime-api.js?v=browser-20260627b";
-import { createBrowserClipboardBridge } from "./browser-clipboard.js?v=browser-20260711c";
+import { createBrowserClipboardBridge } from "./browser-clipboard.js?v=browser-20260719a";
 import {
   selkiesMessagesForInput,
   utf8FromBase64,
 } from "./browser-input.js?v=browser-20260520e";
-import { bindBrowserInputSurface } from "./browser-input-surface.js?v=browser-20260711c";
+import { bindBrowserInputSurface } from "./browser-input-surface.js?v=browser-20260719a";
 import {
   browserMetricsText,
   friendlyOpenError,
   isAuthoritySessionError,
   isMissingRuntimePageError,
   requestedDisplayMode,
-} from "./browser-status.js?v=browser-20260711c";
+} from "./browser-status.js?v=browser-20260719a";
 import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260711h";
 
 const STATUS_TTL_MS = 4200;
@@ -1543,10 +1543,12 @@ profileResetCommitButton?.addEventListener("click", () => {
 // Shell menu bar: declare File/View/History menus to Home; commands come back
 // as elastos:menu-command and drive the same toolbar handlers.
 function announceShellMenuManifest() {
-  if (!launchToken || window.parent === window) {
+  if (!launchToken || !homeParentOrigin || window.parent === window) {
     return;
   }
-  window.parent.postMessage({
+  // Manifests are token-authorized by the Home host (window.top), which
+  // relays them to the GUI menubar — same path as home:app-ready above.
+  window.top.postMessage({
     type: "home:menu-manifest",
     homeToken: launchToken,
     menus: [
@@ -1574,11 +1576,13 @@ function announceShellMenuManifest() {
         ],
       },
     ],
-  }, window.location.origin);
+  }, homeParentOrigin);
 }
 
 function onShellMenuCommand(event) {
-  if (event.origin !== window.location.origin) {
+  // Menu commands come from the GUI menubar — our direct parent frame, which
+  // is opaque-sandboxed (security origin "null"), not a same-origin window.
+  if (event.origin !== "null" || event.source !== window.parent) {
     return;
   }
   const message = event.data;

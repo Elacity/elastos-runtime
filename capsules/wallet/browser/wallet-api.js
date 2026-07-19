@@ -1,4 +1,4 @@
-import { readText } from "./wallet-format.js?v=wallet-20260719w";
+import { readText } from "./wallet-format.js?v=wallet-20260719x";
 
 export function readQueryParam(name) {
   const value = new URLSearchParams(window.location.search).get(name);

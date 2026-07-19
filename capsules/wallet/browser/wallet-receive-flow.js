@@ -1,4 +1,4 @@
-import { copyIconButton, textNode as defaultTextNode } from "./wallet-render.js?v=wallet-20260719w";
+import { copyIconButton, textNode as defaultTextNode } from "./wallet-render.js?v=wallet-20260719x";
 
 export function createWalletReceiveFlow({
   buildViewAccounts,
