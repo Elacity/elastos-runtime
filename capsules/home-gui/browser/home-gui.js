@@ -179,6 +179,9 @@ configureWindowHooks({
   renderTaskbar,
   syncMenubar,
   updateTaskbarState,
+  // Host-mediated launches (Anders): GUI never fetch-launches; shell-windows
+  // and the wallet rail call this hook after bindHomeGuiInteractions binds it.
+  launchTarget: (...args) => homeGuiHostActions.launchTarget?.(...args),
   // One Wallet session: dock/desktop window launch retires the rail so we
   // do not keep two iframes / home_tokens for the same capsule — including
   // when the rail is hidden but the warm iframe is still mounted.

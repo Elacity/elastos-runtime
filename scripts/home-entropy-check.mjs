@@ -990,6 +990,15 @@ assert(
   (homeGuiJs.match(/export function openHomeGuiTarget\(/g) || []).length === 1,
   "Home GUI must expose one canonical open-target entrypoint",
 );
+// Regression gate (2026-07-19 black screen): configureWindowHooks runs at
+// module load and fails closed on missing required hooks, so the launchTarget
+// forward must be wired there — bindHomeGuiInteractions alone is too late.
+assert(
+  homeGuiJs.includes(
+    "launchTarget: (...args) => homeGuiHostActions.launchTarget?.(...args)",
+  ),
+  "Home GUI configureWindowHooks must forward launchTarget to the host bridge actions",
+);
 const homeCapsuleManifest = JSON.parse(read("capsules/home/capsule.json"));
 const homeGuiCapsuleManifest = JSON.parse(read("capsules/home-gui/capsule.json"));
 const homeCliManifest = JSON.parse(read("capsules/home-cli/capsule.json"));
