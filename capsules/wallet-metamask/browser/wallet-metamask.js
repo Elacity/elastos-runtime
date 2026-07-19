@@ -182,12 +182,31 @@ async function onConnect() {
       await refreshWalletState();
     }
   } catch (error) {
-    showStatus(String(error.message || error), "error");
-    markCeremonyRetry();
+    // MetaMask can inject its inpage provider into the opaque-sandboxed sheet
+    // while the content-script transport behind it is dead (the extension's
+    // sessionStorage crash). The provider then announces but every request
+    // fails "extension not found" — treat that exactly like a missing
+    // provider and continue in the top-level popup.
+    if (isEmbeddedFrame() && isDeadProviderTransportError(error)) {
+      handleMissingProvider();
+      markCeremonyRetry();
+    } else {
+      showStatus(String(error.message || error), "error");
+      markCeremonyRetry();
+    }
   } finally {
     setButtonBusy(connectButton, false);
     interactionBusy = false;
   }
+}
+
+function isDeadProviderTransportError(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  return (
+    message.includes("failed to connect to metamask") ||
+    message.includes("extension not found") ||
+    message.includes("disconnected from metamask")
+  );
 }
 
 // Same fallback as the UniSat connector: extension content scripts crash in

@@ -9674,10 +9674,11 @@ assert(
   walletMetamaskJs.includes("openTopLevelConnector") &&
     walletMetamaskJs.includes('"elastos-wallet-metamask"') &&
     walletMetamask.includes('id="wallet-open-popup"') &&
+    walletMetamaskJs.includes("isDeadProviderTransportError") &&
     shellWindows.includes(
       'launched?.target === "wallet-unisat" || launched?.target === "wallet-metamask"',
     ),
-  "MetaMask connector must fall back to a top-level popup ceremony with popup sandbox grants (extension cannot inject into opaque frames)",
+  "MetaMask connector must fall back to a top-level popup ceremony with popup sandbox grants (extension cannot inject a working transport into opaque frames)",
 );
 assert(
   walletUnisat.includes('id="wallet-connect"') &&
