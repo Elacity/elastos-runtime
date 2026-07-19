@@ -244,14 +244,20 @@ function isDeadProviderTransportError(error) {
 // normal page where MetaMask injects; the ceremony continues there.
 function handleMissingProvider() {
   if (isEmbeddedFrame()) {
-    showStatus(
-      "MetaMask cannot inject into this embedded sheet. Continue in the MetaMask window and approve there.",
-      "error",
-    );
     if (popupButton) {
       popupButton.hidden = false;
     }
-    openTopLevelConnector();
+    // Only attempt window.open on a real user gesture — the ceremony
+    // autostart has none, so the browser would block it and we'd greet the
+    // user with a scary failure for a popup we knew could not open.
+    if (navigator.userActivation?.isActive) {
+      openTopLevelConnector();
+      return;
+    }
+    showStatus(
+      'MetaMask runs in its own window here. Click "Open MetaMask window" to continue.',
+      "muted",
+    );
     return;
   }
   showStatus(
@@ -271,8 +277,13 @@ function isEmbeddedFrame() {
 function openTopLevelConnector() {
   const popup = window.open(window.location.href, "elastos-wallet-metamask", "popup,width=460,height=720");
   if (!popup) {
-    showStatus("Open this connector in a top-level browser window so MetaMask can inject.", "error");
+    showStatus(
+      "The browser blocked the MetaMask window. Allow pop-ups for this site (address-bar icon), then try again.",
+      "error",
+    );
+    return;
   }
+  showStatus("Continue in the MetaMask window, then approve there.", "muted");
 }
 
 async function connectProvider(provider) {
