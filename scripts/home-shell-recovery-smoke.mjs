@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260719b";
+const moduleVersion = "home-20260719c";
 const requests = [];
 const originalConsoleError = console.error;
 console.error = (...args) => {

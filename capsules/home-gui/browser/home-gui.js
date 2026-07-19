@@ -23,13 +23,13 @@ import {
   shellInteractionActive,
   shouldIgnoreDesktopKeydown,
   targetById,
-} from "./shell-core.js?v=home-20260719a";
+} from "./shell-core.js?v=home-20260719c";
 import {
   bindIdentityMenu,
   clearIdentitySurface,
   syncIdentity,
   updateClock,
-} from "./shell-chrome.js?v=home-20260719a";
+} from "./shell-chrome.js?v=home-20260719c";
 import {
   beginDesktopMarquee,
   bindShellSurfaceDom,
@@ -55,7 +55,7 @@ import {
   toggleLauncher,
   updateDesktopMarquee,
   updateTaskbarState,
-} from "./shell-surface.js?v=home-20260719a";
+} from "./shell-surface.js?v=home-20260719c";
 import {
   closeWindow,
   cleanupBeforeUnload,
@@ -66,39 +66,39 @@ import {
   restoreShellSession,
   showDesktopHome,
   supportsMenuNewWindow,
-} from "./shell-windows.js?v=home-20260719a";
+} from "./shell-windows.js?v=home-20260719c";
 import {
   bindShellKeyboard,
   handleDesktopArrowKey,
   retireKeyboardSurfaces,
   toggleShortcutsOverlay,
-} from "./shell-keyboard.js?v=home-20260719a";
+} from "./shell-keyboard.js?v=home-20260719c";
 import {
   bindSpotlight,
   hideSpotlight,
   showSpotlight,
-} from "./shell-spotlight.js?v=home-20260719a";
+} from "./shell-spotlight.js?v=home-20260719c";
 import {
   bindNotificationCenter,
   hideNotificationCenter,
   recordNotifications,
-} from "./shell-notifications.js?v=home-20260719a";
+} from "./shell-notifications.js?v=home-20260719c";
 import {
   bindMenubar,
   closeMenus,
   setMenuManifest,
   syncMenubar,
-} from "./shell-menubar.js?v=home-20260719a";
+} from "./shell-menubar.js?v=home-20260719c";
 import {
   bindQuickLook,
   hideQuickLook,
   toggleQuickLook,
-} from "./shell-quicklook.js?v=home-20260719a";
-import { bindExpose, closeExpose } from "./shell-expose.js?v=home-20260719a";
+} from "./shell-quicklook.js?v=home-20260719c";
+import { bindExpose, closeExpose } from "./shell-expose.js?v=home-20260719c";
 import {
   bindControlCentre,
   hideControlCentre,
-} from "./shell-control-centre.js?v=home-20260719a";
+} from "./shell-control-centre.js?v=home-20260719c";
 import {
   bindWalletRail,
   retireWalletRail,
@@ -107,7 +107,7 @@ import {
   walletRailFrame,
   walletRailOpen,
   walletRailSessionMounted,
-} from "./shell-wallet-rail.js?v=home-20260719a";
+} from "./shell-wallet-rail.js?v=home-20260719c";
 import {
   bindConnectorSheet,
   connectorSheetFrame,
@@ -116,7 +116,7 @@ import {
   noteConnectorSheetSummaryRefresh,
   retireConnectorSheet,
   showConnectorSheet,
-} from "./shell-connector-sheet.js?v=home-20260719a";
+} from "./shell-connector-sheet.js?v=home-20260719c";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";

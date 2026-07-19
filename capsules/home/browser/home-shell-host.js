@@ -16,7 +16,7 @@ import {
   shellState,
   fetchJson,
   targetById,
-} from "./shell-core.js?v=home-20260719b";
+} from "./shell-core.js?v=home-20260719c";
 import {
   bindHomeUnlock,
   hideHomeUnlock,
@@ -25,7 +25,7 @@ import {
   requestPasskeyHomeAuthority,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260719b";
+} from "./shell-auth.js?v=home-20260719c";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
@@ -259,6 +259,7 @@ function rememberLaunchedAppContext(launched) {
   }
   launchedAppContexts.set(token, {
     targetId: launched.target,
+    viewerId: typeof launched.viewer === "string" ? launched.viewer : "",
     origin: OPAQUE_CAPSULE_ORIGIN,
     source: null,
   });
@@ -1031,6 +1032,7 @@ function homeMessageContext(event, data) {
   return {
     kind: "app-frame",
     targetId: launched.targetId,
+    viewerId: launched.viewerId || "",
     homeToken,
   };
 }
@@ -1052,7 +1054,11 @@ function canOpenTargetFromHomeMessage(context, target) {
   if (context.kind === "home") {
     return true;
   }
-  const policy = SHELL_MESSAGE_OPEN_TARGET_SOURCES[context.targetId];
+  // Viewer-bound content (e.g. gba-ucity) speaks with its own target id but
+  // carries no policy entry; it inherits its viewer's grants (gba-emulator),
+  // still a closed set — never broader than the viewer itself.
+  const policy = SHELL_MESSAGE_OPEN_TARGET_SOURCES[context.targetId] ||
+    (context.viewerId ? SHELL_MESSAGE_OPEN_TARGET_SOURCES[context.viewerId] : undefined);
   if (!policy) {
     return false;
   }

@@ -1620,8 +1620,8 @@ const gbaLiveSmoke = read("scripts/gba-live-smoke.mjs");
 const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
 const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
-const homeAssetVersion = "home-20260719b";
-const homeGuiAssetVersion = "home-20260719a";
+const homeAssetVersion = "home-20260719c";
+const homeGuiAssetVersion = "home-20260719c";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -1807,6 +1807,13 @@ assert(
     "context.targetId === HOME_GUI_SHELL_ID && WALLET_CONNECTOR_TARGETS.has(target)",
   ) && shellJs.includes('"wallet": WALLET_CONNECTOR_TARGETS'),
   "Home GUI must carry the wallet's closed connector-launch authority (rail ceremony sheet)",
+);
+// Viewer-bound content (gba-ucity) has no policy entry of its own; it must
+// inherit its viewer's closed grants or "Choose a game from Library" is dead.
+assert(
+  shellJs.includes("SHELL_MESSAGE_OPEN_TARGET_SOURCES[context.viewerId]") &&
+    shellJs.includes("viewerId: typeof launched.viewer"),
+  "Home open-target policy must fall back to the launched capsule's viewer id for viewer-bound content",
 );
 assert(
   shellJs.includes('"archive-manager": new Set(["library"])'),
@@ -9659,6 +9666,18 @@ assert(
     walletMetamaskJs.includes("isMetaMaskSignableRequest") &&
     walletMetamaskJs.includes('intent !== "bitcoin_bip322_proof"'),
   "MetaMask connector must not show built-in or Bitcoin BIP-322 requests as MetaMask-signable requests",
+);
+// Extension wallets cannot inject providers into opaque-sandboxed frames, so
+// MetaMask needs the same top-level popup ceremony UniSat ships (2026-07-19:
+// "Continue in MetaMask" dead in the rail sheet without it).
+assert(
+  walletMetamaskJs.includes("openTopLevelConnector") &&
+    walletMetamaskJs.includes('"elastos-wallet-metamask"') &&
+    walletMetamask.includes('id="wallet-open-popup"') &&
+    shellWindows.includes(
+      'launched?.target === "wallet-unisat" || launched?.target === "wallet-metamask"',
+    ),
+  "MetaMask connector must fall back to a top-level popup ceremony with popup sandbox grants (extension cannot inject into opaque frames)",
 );
 assert(
   walletUnisat.includes('id="wallet-connect"') &&

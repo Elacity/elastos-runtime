@@ -2,13 +2,13 @@ import {
   escapeHtml,
   shellState,
   targetById,
-} from "./shell-core.js?v=home-20260719a";
+} from "./shell-core.js?v=home-20260719c";
 import {
   iframeAllowForLaunch,
   iframeSandboxForLaunch,
   launchHomeTarget,
   openTarget,
-} from "./shell-windows.js?v=home-20260719a";
+} from "./shell-windows.js?v=home-20260719c";
 
 /* Wallet rail: a right-hand slide-over that hosts the wallet capsule.
    Chrome only — it launches the wallet through the same host-mediated

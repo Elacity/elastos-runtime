@@ -19,7 +19,7 @@ import {
   clearShellSessionState,
   ignoreRepeatedAction,
   targetById,
-} from "./shell-core.js?v=home-20260719a";
+} from "./shell-core.js?v=home-20260719c";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -30,7 +30,7 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260719a";
+} from "./shell-window-geometry.js?v=home-20260719c";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -85,7 +85,10 @@ export function iframeSandboxForLaunch(launched) {
   if (launched?.target === "browser") {
     tokens.push(...BROWSER_IFRAME_SANDBOX_EXTRAS);
   }
-  if (launched?.target === "wallet-unisat") {
+  // Browser-extension wallets cannot inject providers into opaque-sandboxed
+  // frames; both connectors fall back to a top-level popup ceremony, which
+  // needs the popup grants.
+  if (launched?.target === "wallet-unisat" || launched?.target === "wallet-metamask") {
     tokens.push(...WALLET_CONNECTOR_IFRAME_SANDBOX_EXTRAS);
   }
   if (launched?.target === SYSTEM_APP_ID) {

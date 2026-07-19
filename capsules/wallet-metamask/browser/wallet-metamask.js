@@ -1,4 +1,5 @@
 const connectButton = document.querySelector("#wallet-connect");
+const popupButton = document.querySelector("#wallet-open-popup");
 const statusNode = document.querySelector("#wallet-status");
 const stateNode = document.querySelector("#wallet-state");
 const accountsNode = document.querySelector("#wallet-accounts");
@@ -26,6 +27,9 @@ function boot() {
   configureMetaMaskDiscovery();
   if (connectButton) {
     connectButton.addEventListener("click", onConnect);
+  }
+  if (popupButton) {
+    popupButton.addEventListener("click", openTopLevelConnector);
   }
   if (accountsNode) {
     accountsNode.addEventListener("click", onAccountClick);
@@ -146,10 +150,7 @@ async function onConnect() {
   await ensureWalletDiscovery();
   const provider = metaMaskProvider();
   if (!provider) {
-    showStatus(
-      "MetaMask not found. If another wallet (e.g. Phantom) is set as your default Ethereum wallet, MetaMask may not announce — disable that wallet's Ethereum default, or unlock MetaMask, and retry.",
-      "error",
-    );
+    handleMissingProvider();
     markCeremonyRetry();
     return;
   }
@@ -186,6 +187,43 @@ async function onConnect() {
   } finally {
     setButtonBusy(connectButton, false);
     interactionBusy = false;
+  }
+}
+
+// Same fallback as the UniSat connector: extension content scripts crash in
+// opaque-sandboxed frames (no allow-same-origin), so no provider is ever
+// injected in the embedded sheet. A top-level popup of this same route is a
+// normal page where MetaMask injects; the ceremony continues there.
+function handleMissingProvider() {
+  if (isEmbeddedFrame()) {
+    showStatus(
+      "MetaMask cannot inject into this embedded sheet. Continue in the MetaMask window and approve there.",
+      "error",
+    );
+    if (popupButton) {
+      popupButton.hidden = false;
+    }
+    openTopLevelConnector();
+    return;
+  }
+  showStatus(
+    "MetaMask not found. If another wallet (e.g. Phantom) is set as your default Ethereum wallet, MetaMask may not announce — disable that wallet's Ethereum default, or unlock MetaMask, and retry.",
+    "error",
+  );
+}
+
+function isEmbeddedFrame() {
+  try {
+    return window.self !== window.top;
+  } catch {
+    return true;
+  }
+}
+
+function openTopLevelConnector() {
+  const popup = window.open(window.location.href, "elastos-wallet-metamask", "popup,width=460,height=720");
+  if (!popup) {
+    showStatus("Open this connector in a top-level browser window so MetaMask can inject.", "error");
   }
 }
 

@@ -38,7 +38,7 @@ git merge-base --is-ancestor 70ef68532 HEAD   # must succeed
 
 | File | Why |
 |------|-----|
-| `home-shell-*.mjs` (bridge, regression, recovery, no-hint, stale-hint, switchback, system-switch, auth-gate) | GUI cache tip `home-20260715a` → `home-20260719a`; host cache tip `home-20260715a` → `home-20260719b` (host JS changed, see host authority note); `FakeElement.append(...)` shim because our chrome uses `Element.append`; regression summary uses `desktopApps` (successor of `desktopHidden`) |
+| `home-shell-*.mjs` (bridge, regression, recovery, no-hint, stale-hint, switchback, system-switch, auth-gate) | GUI and host cache tips `home-20260715a` → `home-20260719c` (host JS changed, see host authority note); `FakeElement.append(...)` shim because our chrome uses `Element.append`; regression summary uses `desktopApps` (successor of `desktopHidden`) |
 | `home-passkey-virtual-auth-smoke.mjs` | First boot now opens on a welcome beat; smoke conditionally clicks "Get started" before the create-passkey form |
 | `wallet-product-safety-smoke.sh` | New assert: MetaMask connect must revoke + re-prompt `eth_accounts` so a second account can be linked |
 | `wallet-connector-transaction-smoke.mjs` | Mock provider answers `wallet_requestPermissions` / `wallet_revokePermissions` used by the connect ceremony |
@@ -53,7 +53,7 @@ the GUI threw at module load (black desktop). Fixed in `9356944eb`, and the
 entropy check now asserts the wiring so `just verify` catches this class of
 regression (assert verified to fail on the broken commit).
 
-## Host authority note (one deliberate policy extension)
+## Host authority note (deliberate policy extensions, all closed sets)
 
 Your `SHELL_MESSAGE_OPEN_TARGET_SOURCES` gives `home-gui` the `visible-target`
 policy, and connectors (`wallet-metamask`/`wallet-unisat`/`wallet-walletconnect`)
@@ -63,6 +63,20 @@ shell launch"). We extended `canOpenTargetFromHomeMessage` so the GUI also
 carries the wallet's connector set — the exact same closed set your `"wallet"`
 entry holds (now shared as `WALLET_CONNECTOR_TARGETS`), nothing broader. The
 entropy check asserts both the carve-out and that the set stays closed.
+
+Two follow-ups found in live product smoke, same closed-set discipline:
+
+- **Viewer-bound content inherits its viewer's grants.** `gba-ucity` speaks
+  with its own target id but has no policy entry, so "Choose a game from
+  Library" was silently ignored. `canOpenTargetFromHomeMessage` now falls back
+  to the launch's `viewer` id (`gba-emulator` → Library) — never broader than
+  the viewer itself.
+- **MetaMask gets UniSat's top-level popup ceremony.** Extension content
+  scripts crash in opaque-sandboxed frames (no `allow-same-origin`), so no
+  provider injects into the embedded sheet and Connect was dead. The MetaMask
+  connector now falls back to `window.open` of its own route (your UniSat
+  pattern, verbatim), and `wallet-metamask` joins `wallet-unisat` in the
+  connector popup sandbox extras.
 
 ## Forbidden paths (ripgrep-clean on this tip)
 
