@@ -1,12 +1,12 @@
 import {
   escapeHtml,
-} from "./shell-core.js?v=home-20260718p";
+} from "./shell-core.js?v=home-20260719a";
 import {
   iframeAllowForLaunch,
   iframeSandboxForLaunch,
   launchHomeTarget,
-} from "./shell-windows.js?v=home-20260718p";
-import { showWalletRail, walletRailOpen } from "./shell-wallet-rail.js?v=home-20260718p";
+} from "./shell-windows.js?v=home-20260719a";
+import { showWalletRail, walletRailOpen } from "./shell-wallet-rail.js?v=home-20260719a";
 
 /* Connector sheet: thin ceremony surface for wallet-metamask / unisat /
    walletconnect. Same launch path as a window, mounted in a rail-aligned
@@ -111,20 +111,16 @@ export function retireConnectorSheet() {
   hideConnectorSheet();
 }
 
-/* After a successful link the connector posts home:refresh-summary. Tell every
-   Wallet surface to reload accounts (summary refresh alone does not), then
-   close the ceremony so the user lands back on the rail. */
-export function noteConnectorSheetSummaryRefresh(source) {
-  if (!connectorSheetOpen()) {
+/* After a successful link the connector posts home:refresh-summary (to the
+   host, which relays it here token-bound). Tell every Wallet surface to
+   reload accounts (summary refresh alone does not), then close the ceremony
+   so the user lands back on the rail. */
+export function noteConnectorSheetSummaryRefresh(homeToken) {
+  if (!connectorSheetOpen() || !homeToken) {
     return;
   }
-  let frameWindow = null;
-  try {
-    frameWindow = frame?.contentWindow || null;
-  } catch (_error) {
-    return;
-  }
-  if (!source || !frameWindow || source !== frameWindow) {
+  const mountedToken = connectorLaunchTokenFromRoute(frame?.dataset?.route || "");
+  if (!mountedToken || mountedToken !== homeToken) {
     return;
   }
   broadcastWalletAccountsRefresh();
@@ -138,15 +134,24 @@ export function noteConnectorSheetSummaryRefresh(source) {
   }, 450);
 }
 
+function connectorLaunchTokenFromRoute(route) {
+  try {
+    const url = new URL(route, window.location.href);
+    return new URLSearchParams(url.hash.replace(/^#/, "")).get("home_token") || "";
+  } catch (_error) {
+    return "";
+  }
+}
+
 function broadcastWalletAccountsRefresh() {
   const message = {
     type: "elastos:wallet-refresh",
     schema: "elastos.home.wallet-refresh/v1",
   };
-  const origin = window.location.origin;
+  // Wallet frames are opaque-sandboxed (origin "null"); target must be "*".
   const post = (contentWindow) => {
     try {
-      contentWindow?.postMessage(message, origin);
+      contentWindow?.postMessage(message, "*");
     } catch (_error) {
       // Frame may be unloaded or mid-nav.
     }

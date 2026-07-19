@@ -1621,7 +1621,7 @@ const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
 const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260715a";
-const homeGuiAssetVersion = "home-20260718p";
+const homeGuiAssetVersion = "home-20260719a";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],

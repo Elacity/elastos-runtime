@@ -19,7 +19,7 @@ import {
   clearShellSessionState,
   ignoreRepeatedAction,
   targetById,
-} from "./shell-core.js?v=home-20260718p";
+} from "./shell-core.js?v=home-20260719a";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -30,7 +30,7 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260718p";
+} from "./shell-window-geometry.js?v=home-20260719a";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -43,6 +43,7 @@ const REQUIRED_WINDOW_HOOKS = [
   "launchTarget",
 ];
 const WINDOW_CONTROL_GUARD_MS = 400;
+const FRAME_REVEAL_FAILSAFE_MS = 300;
 const WINDOW_MAXIMIZE_CLOSE_GUARD_MS = 360;
 const WINDOW_OPEN_CLOSE_GHOST_GUARD_MS = 2600;
 const WINDOW_CLOSE_GUARD_MOVE_PX = 18;
@@ -848,6 +849,9 @@ function syncBrowserWindow(entry, launched) {
   cleanupFrameAutoFit(node);
 
   const syncLoadedFrame = () => {
+    // App iframes mount at opacity 0 (kills the white flash); the capsule
+    // fades in on load. Without this class the window stays black forever.
+    frame.classList.add("is-ready");
     if (entry.targetId !== "browser") {
       installFrameAutoFit(node, frame);
     }
@@ -858,6 +862,10 @@ function syncBrowserWindow(entry, launched) {
   if (frame.dataset.route !== launched.route) {
     frame.src = launched.route;
     frame.dataset.route = launched.route;
+    // Fail open: a slow or handshake-shy capsule must still become visible.
+    window.setTimeout(() => {
+      frame.classList.add("is-ready");
+    }, FRAME_REVEAL_FAILSAFE_MS);
     return;
   }
   syncLoadedFrame();

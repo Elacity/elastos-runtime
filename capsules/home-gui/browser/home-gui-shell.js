@@ -1,6 +1,7 @@
 import {
   bindHomeGuiInteractions,
   closeHomeGuiWindowForToken,
+  noteHomeGuiConnectorSheetSummaryRefresh,
   openHomeGuiTarget,
   relaunchHomeGuiWindowForToken,
   restoreHomeGuiSession,
@@ -8,8 +9,8 @@ import {
   setHomeGuiMounted,
   showHomeGuiDesktop,
   syncHomeGuiProjection,
-} from "./home-gui.js?v=home-20260718p";
-import { setHomeGuiLaunchToken } from "./shell-core.js?v=home-20260718p";
+} from "./home-gui.js?v=home-20260719a";
+import { setHomeGuiLaunchToken } from "./shell-core.js?v=home-20260719a";
 
 const route = new URL(window.location.href);
 const fragment = new URLSearchParams(route.hash.replace(/^#/, ""));
@@ -101,7 +102,11 @@ function handleGuiCommand(message) {
     return true;
   }
   if (command === "set-menu-manifest") {
-    setHomeGuiMenuManifest(message.windowId, message.menus);
+    setHomeGuiMenuManifest(message.windowId, message.menus, message.homeToken);
+    return true;
+  }
+  if (command === "connector-summary-refresh") {
+    noteHomeGuiConnectorSheetSummaryRefresh(message.homeToken);
     return true;
   }
   return false;

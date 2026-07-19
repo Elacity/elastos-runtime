@@ -3,12 +3,12 @@
  * focus that window; Esc dismisses. Pure shell presentation — no gateway.
  */
 
-import { shellState } from "./shell-core.js?v=home-20260718p";
+import { shellState } from "./shell-core.js?v=home-20260719a";
 import {
   browserWindowEntries,
   focusWindow,
   sortWindowEntriesByZOrder,
-} from "./shell-windows.js?v=home-20260718p";
+} from "./shell-windows.js?v=home-20260719a";
 
 // Queried lazily: matchMedia is unavailable in the host's DOM-stubbed smoke
 // harnesses, and the GUI module graph must stay import-safe there.

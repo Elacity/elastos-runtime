@@ -38,7 +38,7 @@ git merge-base --is-ancestor 70ef68532 HEAD   # must succeed
 
 | File | Why |
 |------|-----|
-| `home-shell-*.mjs` (bridge, regression, recovery, no-hint, stale-hint, switchback, system-switch, auth-gate) | GUI cache tip `home-20260715a` → `home-20260718p`; `FakeElement.append(...)` shim because our chrome uses `Element.append`; regression summary uses `desktopApps` (successor of `desktopHidden`) |
+| `home-shell-*.mjs` (bridge, regression, recovery, no-hint, stale-hint, switchback, system-switch, auth-gate) | GUI cache tip `home-20260715a` → `home-20260719a`; `FakeElement.append(...)` shim because our chrome uses `Element.append`; regression summary uses `desktopApps` (successor of `desktopHidden`) |
 | `home-passkey-virtual-auth-smoke.mjs` | First boot now opens on a welcome beat; smoke conditionally clicks "Get started" before the create-passkey form |
 | `wallet-product-safety-smoke.sh` | New assert: MetaMask connect must revoke + re-prompt `eth_accounts` so a second account can be linked |
 | `wallet-connector-transaction-smoke.mjs` | Mock provider answers `wallet_requestPermissions` / `wallet_revokePermissions` used by the connect ceremony |

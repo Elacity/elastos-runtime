@@ -11,7 +11,7 @@
  * commands are dispatched only to the window that declared them.
  */
 
-import { shellState } from "./shell-core.js?v=home-20260718p";
+import { shellState } from "./shell-core.js?v=home-20260719a";
 
 /* Resolved lazily — the menubar lives in the lazy GUI template, which is not
    in the DOM at module-evaluation time. */
@@ -304,8 +304,10 @@ function runMenuCommand(windowId, cmd) {
     return;
   }
   const frame = entry.node.querySelector(".window-frame");
+  // App frames are opaque-sandboxed (origin "null"): a concrete URL target
+  // would never match, so post with "*" — the frame element pins the target.
   frame?.contentWindow?.postMessage(
     { type: "elastos:menu-command", cmd },
-    window.location.origin,
+    "*",
   );
 }

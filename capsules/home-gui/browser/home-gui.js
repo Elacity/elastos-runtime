@@ -23,13 +23,13 @@ import {
   shellInteractionActive,
   shouldIgnoreDesktopKeydown,
   targetById,
-} from "./shell-core.js?v=home-20260718p";
+} from "./shell-core.js?v=home-20260719a";
 import {
   bindIdentityMenu,
   clearIdentitySurface,
   syncIdentity,
   updateClock,
-} from "./shell-chrome.js?v=home-20260718p";
+} from "./shell-chrome.js?v=home-20260719a";
 import {
   beginDesktopMarquee,
   bindShellSurfaceDom,
@@ -55,7 +55,7 @@ import {
   toggleLauncher,
   updateDesktopMarquee,
   updateTaskbarState,
-} from "./shell-surface.js?v=home-20260718p";
+} from "./shell-surface.js?v=home-20260719a";
 import {
   closeWindow,
   cleanupBeforeUnload,
@@ -66,39 +66,39 @@ import {
   restoreShellSession,
   showDesktopHome,
   supportsMenuNewWindow,
-} from "./shell-windows.js?v=home-20260718p";
+} from "./shell-windows.js?v=home-20260719a";
 import {
   bindShellKeyboard,
   handleDesktopArrowKey,
   retireKeyboardSurfaces,
   toggleShortcutsOverlay,
-} from "./shell-keyboard.js?v=home-20260718p";
+} from "./shell-keyboard.js?v=home-20260719a";
 import {
   bindSpotlight,
   hideSpotlight,
   showSpotlight,
-} from "./shell-spotlight.js?v=home-20260718p";
+} from "./shell-spotlight.js?v=home-20260719a";
 import {
   bindNotificationCenter,
   hideNotificationCenter,
   recordNotifications,
-} from "./shell-notifications.js?v=home-20260718p";
+} from "./shell-notifications.js?v=home-20260719a";
 import {
   bindMenubar,
   closeMenus,
   setMenuManifest,
   syncMenubar,
-} from "./shell-menubar.js?v=home-20260718p";
+} from "./shell-menubar.js?v=home-20260719a";
 import {
   bindQuickLook,
   hideQuickLook,
   toggleQuickLook,
-} from "./shell-quicklook.js?v=home-20260718p";
-import { bindExpose, closeExpose } from "./shell-expose.js?v=home-20260718p";
+} from "./shell-quicklook.js?v=home-20260719a";
+import { bindExpose, closeExpose } from "./shell-expose.js?v=home-20260719a";
 import {
   bindControlCentre,
   hideControlCentre,
-} from "./shell-control-centre.js?v=home-20260718p";
+} from "./shell-control-centre.js?v=home-20260719a";
 import {
   bindWalletRail,
   retireWalletRail,
@@ -107,7 +107,7 @@ import {
   walletRailFrame,
   walletRailOpen,
   walletRailSessionMounted,
-} from "./shell-wallet-rail.js?v=home-20260718p";
+} from "./shell-wallet-rail.js?v=home-20260719a";
 import {
   bindConnectorSheet,
   connectorSheetFrame,
@@ -116,7 +116,7 @@ import {
   noteConnectorSheetSummaryRefresh,
   retireConnectorSheet,
   showConnectorSheet,
-} from "./shell-connector-sheet.js?v=home-20260718p";
+} from "./shell-connector-sheet.js?v=home-20260719a";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
@@ -341,8 +341,8 @@ export function openHomeGuiTarget(target, options = {}) {
   openTarget(target, options);
 }
 
-export function noteHomeGuiConnectorSheetSummaryRefresh(source) {
-  noteConnectorSheetSummaryRefresh(source);
+export function noteHomeGuiConnectorSheetSummaryRefresh(homeToken) {
+  noteConnectorSheetSummaryRefresh(homeToken);
 }
 
 export function homeGuiHasWindows() {
@@ -608,8 +608,18 @@ export function syncHomeGuiChrome(previous, summary) {
 
 /* Menus are self-declared UI, not authority: the host verifies the sender's
    frame identity and hands us only that window's id. */
-export function setHomeGuiMenuManifest(windowId, menus) {
-  setMenuManifest(windowId, menus);
+export function setHomeGuiMenuManifest(windowId, menus, homeToken = "") {
+  // The host forwards the sender's launch token; only this GUI knows which
+  // of its windows carries that token. Rail/sheet frames have no menubar
+  // entry, so an unresolved token is dropped, not guessed.
+  let resolvedId = windowId;
+  if (!resolvedId && homeToken) {
+    resolvedId = homeGuiWindowEntryForToken(homeToken)?.id || "";
+  }
+  if (!resolvedId) {
+    return;
+  }
+  setMenuManifest(resolvedId, menus);
 }
 
 export function renderHomeGuiShell(summary, options = {}) {

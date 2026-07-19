@@ -180,13 +180,16 @@ async function deliverMessageToHomeGuiTargetFrame(target, payload) {
   return true;
 }
 
-function setHomeGuiMenuManifest(windowId, menus) {
+function setHomeGuiMenuManifest(windowId, menus, homeToken = "") {
   requireHomeGuiActive("set menu manifest");
   // Bridge to the isolated Home GUI frame — never direct-import the GUI module.
+  // The host does not know GUI window ids; it forwards the sender's launch
+  // token and the GUI resolves its own window (menus stay self-declared UI).
   postToActiveShell({
     type: "home:gui-command",
     command: "set-menu-manifest",
     windowId,
+    homeToken,
     menus,
   });
 }
@@ -746,20 +749,29 @@ window.addEventListener("message", (event) => {
   }
   if (data.type === "home:refresh-summary") {
     requestShellSummaryRefresh({ reason: "child-message" });
-    // Successful connector link — close the in-rail ceremony sheet so the
-    // user lands back on Wallet (projection only; refresh already ran).
-    homeGuiModule?.noteHomeGuiConnectorSheetSummaryRefresh?.(event.source);
+    // Successful connector link — tell the isolated GUI to close its in-rail
+    // ceremony sheet (projection only; refresh already ran). Token-bound:
+    // the GUI verifies the token against its mounted sheet frame, so no
+    // other child can dismiss a ceremony it does not own.
+    if (context.kind === "app-frame" && context.homeToken) {
+      postToActiveShell({
+        type: "home:gui-command",
+        command: "connector-summary-refresh",
+        homeToken: context.homeToken,
+      });
+    }
     return;
   }
   if (data.type === "home:menu-manifest") {
     // Menus are self-declared UI, not authority: a window may only shape its
-    // OWN menu bar entry, so the manifest binds to the sender's window id.
-    if (context.kind !== "app-frame" || !context.windowId) {
+    // OWN menu bar entry. The host binds the manifest to the sender's launch
+    // token; the isolated GUI resolves that token to its own window.
+    if (context.kind !== "app-frame" || !context.homeToken) {
       console.warn("home ignored unauthorized menu-manifest message", context.targetId);
       return;
     }
     try {
-      setHomeGuiMenuManifest(context.windowId, data.menus);
+      setHomeGuiMenuManifest(context.windowId || "", data.menus, context.homeToken);
     } catch (error) {
       console.error("home menu-manifest failed", error);
     }

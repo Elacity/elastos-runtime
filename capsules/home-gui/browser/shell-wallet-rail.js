@@ -2,13 +2,13 @@ import {
   escapeHtml,
   shellState,
   targetById,
-} from "./shell-core.js?v=home-20260718p";
+} from "./shell-core.js?v=home-20260719a";
 import {
   iframeAllowForLaunch,
   iframeSandboxForLaunch,
   launchHomeTarget,
   openTarget,
-} from "./shell-windows.js?v=home-20260718p";
+} from "./shell-windows.js?v=home-20260719a";
 
 /* Wallet rail: a right-hand slide-over that hosts the wallet capsule.
    Chrome only — it launches the wallet through the same host-mediated
@@ -287,12 +287,14 @@ function postWalletChromeCommand(cmd) {
     queuedChromeCommand = cmd;
     return;
   }
+  // Opaque-sandboxed wallet frame: target origin must be "*"; the frame
+  // element reference pins the recipient, and the wallet checks event.source.
   target.postMessage(
     {
       type: "elastos:wallet-chrome-command",
       cmd,
     },
-    window.location.origin,
+    "*",
   );
 }
 
@@ -316,7 +318,8 @@ function markFrameReady() {
 }
 
 function onWalletChromeMessage(event) {
-  if (event.origin !== window.location.origin) {
+  // Wallet frame is opaque-sandboxed, so its origin serializes to "null".
+  if (event.origin !== "null") {
     return;
   }
   // Fail closed: only the mounted Wallet rail frame may drive chrome badges.
@@ -422,7 +425,7 @@ function postWalletSoftRefresh() {
         type: "elastos:wallet-refresh",
         schema: "elastos.home.wallet-refresh/v1",
       },
-      window.location.origin,
+      "*",
     );
   } catch (_error) {
     // Frame may be unloaded or mid-nav.
