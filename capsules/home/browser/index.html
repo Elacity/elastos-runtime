@@ -21,12 +21,17 @@
       <div id="home-shell-boot-mask" class="home-shell-boot-mask" aria-hidden="true"></div>
 
       <section id="active-shell-root" class="active-shell-root" aria-live="polite" hidden>
-        <!-- Opaque sandboxing isolates the shell without DNS or ambient Home authority. -->
+        <!-- Opaque sandboxing isolates the shell without DNS or ambient Home authority.
+             Popup grants exist for the wallet connector ceremony only: nested sandboxes
+             intersect, so without them here the connector frames' allow-popups is inert
+             and extension wallets (which cannot inject into opaque frames) have no
+             top-level window to complete in. escape-sandbox keeps that popup a normal
+             page — an opaque popup would break the extension the same way. -->
         <iframe
           id="active-shell-frame"
           class="active-shell-frame"
           title="Active Home shell"
-          sandbox="allow-downloads allow-forms allow-modals allow-pointer-lock allow-scripts"
+          sandbox="allow-downloads allow-forms allow-modals allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts"
           allow="autoplay; fullscreen"
         ></iframe>
         <section

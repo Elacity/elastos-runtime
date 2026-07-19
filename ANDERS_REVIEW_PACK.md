@@ -76,7 +76,15 @@ Two follow-ups found in live product smoke, same closed-set discipline:
   provider injects into the embedded sheet and Connect was dead. The MetaMask
   connector now falls back to `window.open` of its own route (your UniSat
   pattern, verbatim), and `wallet-metamask` joins `wallet-unisat` in the
-  connector popup sandbox extras.
+  connector popup sandbox extras. Two hardening notes from live smoke:
+  MetaMask sometimes injects a *dead* provider into the sandboxed sheet
+  (announces via EIP-6963, then hangs every request), so the connector probes
+  `eth_chainId` under a 1.5s race before trusting it; and because nested
+  sandboxes intersect, your host `active-shell-frame` sandbox now includes
+  `allow-popups allow-popups-to-escape-sandbox` — without them the connector
+  frames' own popup grants are inert and the ceremony cannot open. That is
+  the only host sandbox delta; `escape-sandbox` is required or the popup
+  would itself be opaque and break the extension identically.
 
 ## Known limitation inherited from the opaque-frame model (decision yours)
 

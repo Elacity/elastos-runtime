@@ -9667,6 +9667,15 @@ assert(
     walletMetamaskJs.includes('intent !== "bitcoin_bip322_proof"'),
   "MetaMask connector must not show built-in or Bitcoin BIP-322 requests as MetaMask-signable requests",
 );
+// Nested sandboxes intersect: the connector frames' allow-popups is inert
+// unless the host's GUI shell frame carries the popup grants too (2026-07-19:
+// "Blocked opening ... 'allow-popups' permission is not set").
+assert(
+  shellIndex.includes(
+    'sandbox="allow-downloads allow-forms allow-modals allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts"',
+  ),
+  "Host active-shell-frame must grant popups (escape-sandbox) or the wallet connector popup ceremony cannot open",
+);
 // Extension wallets cannot inject providers into opaque-sandboxed frames, so
 // MetaMask needs the same top-level popup ceremony UniSat ships (2026-07-19:
 // "Continue in MetaMask" dead in the rail sheet without it).
