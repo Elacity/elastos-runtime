@@ -137,9 +137,11 @@ assert(
     && !marketplaceJs.includes("Marketplace catalog unavailable")
     && marketplaceJs.includes("runtime|capsules?|providers?|projection|schema|derived facts?|boundary")
     && marketplaceJs.includes("function publicTitle(capsule)")
-    && marketplaceJs.includes('role === "provider" ? "service"')
+    && marketplaceJs.includes('role === "provider" ? "provider"')
     && marketplaceJs.includes('if (role === "provider") return `${title} service for apps on this Home.`;')
-    && marketplaceJs.includes("technicalDependencies"),
+    && marketplaceJs.includes("technicalDependencies")
+    && !marketplaceJs.includes("showInstallPending")
+    && !marketplaceJs.includes("Install pending"),
   "Marketplace restored internal empty or error copy",
 );
 
@@ -147,11 +149,19 @@ const homeRuntime = read("elastos/crates/elastos-server/src/api/gateway_home_run
 const catalogReadModel = read("elastos/crates/elastos-server/src/api/gateway_capsule_catalog/read_model.rs");
 assert(
   homeRuntime.includes('CHAT_ROOM_CAPSULE_ID => "Send messages and join conversations."')
-    && homeRuntime.includes('MARKETPLACE_CAPSULE_ID => {\n            "Browse installed apps, services, viewers, and content."')
+    && homeRuntime.includes(
+      'MARKETPLACE_CAPSULE_ID => {\n            "Discover and open apps, viewers, and content on this device."',
+    )
+    && homeRuntime.includes('SERVICES_CAPSULE_ID => "Sharing".to_string()')
+    && homeRuntime.includes(
+      'SERVICES_CAPSULE_ID => {\n            "Share Browser Engine and Browser Exit services with people."',
+    )
     && homeRuntime.includes('INBOX_CAPSULE_ID => "Review messages, requests, and approvals."')
     && homeRuntime.includes('BROWSER_CAPSULE_ID => "Browse websites from this device."')
     && !homeRuntime.includes("Open web sites through the ElastOS Browser boundary")
-    && !homeRuntime.includes("Browse installed capsules, providers, viewers, and content"),
+    && !homeRuntime.includes("Browse installed capsules, providers, viewers, and content")
+    && !homeRuntime.includes("Browse installed apps, services, viewers, and content.")
+    && !homeRuntime.includes("Manage Browser Exit Node sharing and subscriptions."),
   "Runtime restored internal app descriptions used by public catalogs",
 );
 assert(
@@ -246,7 +256,7 @@ assert(
     && !services.includes("private route ticket")
     && !services.includes("missing an offer id")
     && services.includes("function publicServicesError(")
-    && services.includes('publicServicesError(text, "Services could not be updated.")'),
+    && services.includes('publicServicesError(text, "Sharing could not be updated.")'),
   "Services restored provider implementation copy",
 );
 

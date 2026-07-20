@@ -84,6 +84,37 @@ handled by the shell itself. "New Window" is offered only for targets where
 `openTarget` genuinely opens a new window (never for single-session apps or
 protected viewer capsules).
 
+## Copy voice (empty / loading)
+
+Keep status copy short and sentence case:
+
+- Empty state = one status line + optional one action line.
+  Example: “No requests” / “Approvals and invitations will appear here.”
+- Loading = `Loading…` (real ellipsis `…`, never `...`), or `Loading <noun>…`
+  when the noun helps.
+- No policy paragraphs in empty states; details belong in docs or help.
+
+## Shell popovers, rails, and badges
+
+Menubar popovers (Notification Center, Control Centre) and the Wallet/Inbox
+rails share one geometry contract in Home GUI CSS:
+
+- `--popover-radius: 14px`
+- `--popover-shadow: var(--shadow-soft)`
+
+Spotlight is intentionally different: 16px radius and a heavier stage shadow —
+it is a modal search stage, not a menubar popover. Do not flatten it onto the
+popover tokens.
+
+Notification badges (Inbox bell, Wallet toolbar, rail Activity) use one
+formatter: `formatBadgeCount(n)` → blank for 0, raw digits through 99, then
+`99+`. Dock window-count badges stay uncapped (they count open windows, not
+alerts).
+
+Inbox and Wallet rails reuse the same chassis (`wallet-rail` classes): warm
+iframe, head actions, Open-window, mutual dismissal via `shell-popovers.js`.
+New shell slides should clone that chassis rather than invent a third shape.
+
 ## Drift Checks
 
 `scripts/home-entropy-check.mjs` enforces the active token set, stale-copy

@@ -986,6 +986,18 @@ const shellJs = read("capsules/home/browser/home-shell-host.js");
 const shellAuthJs = read("capsules/home/browser/shell-auth.js");
 const shellCore = read("capsules/home/browser/shell-core.js");
 const shellWindows = read("capsules/home-gui/browser/shell-windows.js");
+const shellNotifications = read("capsules/home-gui/browser/shell-notifications.js");
+const shellControlCentre = read("capsules/home-gui/browser/shell-control-centre.js");
+const shellWalletRail = read("capsules/home-gui/browser/shell-wallet-rail.js");
+const shellInboxRail = read("capsules/home-gui/browser/shell-inbox-rail.js");
+const shellPopovers = read("capsules/home-gui/browser/shell-popovers.js");
+const shellMotion = read("capsules/home-gui/browser/shell-motion.js");
+const shellChrome = read("capsules/home-gui/browser/shell-chrome.js");
+const shellMenubar = read("capsules/home-gui/browser/shell-menubar.js");
+const shellQuickLook = read("capsules/home-gui/browser/shell-quicklook.js");
+const shellSpotlight = read("capsules/home-gui/browser/shell-spotlight.js");
+const shellKeyboard = read("capsules/home-gui/browser/shell-keyboard.js");
+const shellExpose = read("capsules/home-gui/browser/shell-expose.js");
 assert(
   (homeGuiJs.match(/export function openHomeGuiTarget\(/g) || []).length === 1,
   "Home GUI must expose one canonical open-target entrypoint",
@@ -1620,8 +1632,8 @@ const gbaLiveSmoke = read("scripts/gba-live-smoke.mjs");
 const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
 const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
-const homeAssetVersion = "home-20260719q";
-const homeGuiAssetVersion = "home-20260719f";
+const homeAssetVersion = "home-20260719y";
+const homeGuiAssetVersion = "home-20260719x";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -1682,6 +1694,71 @@ assert(
 assert(
   homeGuiTemplateHtml.includes('id="control-centre-fullscreen"'),
   "Home must expose a fullscreen control in Control Centre",
+);
+assert(
+  homeGuiTemplateHtml.includes('id="control-centre-accent"') &&
+    homeGuiTemplateHtml.includes('id="control-centre-dock"') &&
+    homeGuiTemplateHtml.includes('id="identity-menu-lock"') &&
+    !homeGuiTemplateHtml.includes('id="control-centre-lock"') &&
+    shellControlCentre.includes("setAccent") &&
+    shellControlCentre.includes("setDockAutoHide") &&
+    homeGuiJs.includes('elastos:request-lock') &&
+    homeGuiShell.includes('elastos:request-lock') &&
+    homeGuiShell.includes('home:request-unlock'),
+  "Control Centre keeps accent/dock; Lock Screen lives on the ElastOS menu (Apple-menu placement)",
+);
+assert(
+  shellChrome.includes("export function formatMenubarClock") &&
+    shellChrome.includes("formatToParts") &&
+    shellChrome.includes("clockNode.textContent = formatMenubarClock(now)"),
+  "Menubar clock must assemble Apple-style Mon 20 Jul 12:51 via formatToParts",
+);
+assert(
+  homeGuiTemplateHtml.includes('id="identity-menu-marketplace"') &&
+    homeGuiTemplateHtml.includes("App Store") &&
+    homeGuiJs.includes('openTarget("marketplace")'),
+  "ElastOS menu must expose App Store → marketplace target",
+);
+(() => {
+  const walletAt = homeGuiTemplateHtml.indexOf('id="toolbar-wallet"');
+  const inboxAt = homeGuiTemplateHtml.indexOf('id="toolbar-inbox"');
+  const spotlightAt = homeGuiTemplateHtml.indexOf('id="toolbar-spotlight"');
+  const ccAt = homeGuiTemplateHtml.indexOf('id="toolbar-control-centre"');
+  const clockAt = homeGuiTemplateHtml.indexOf('id="clock"');
+  assert(
+    walletAt > 0 &&
+      inboxAt > walletAt &&
+      spotlightAt > inboxAt &&
+      ccAt > spotlightAt &&
+      clockAt > ccAt,
+    "Menubar right cluster must be Wallet → Inbox → Spotlight → Control Centre → Clock",
+  );
+})();
+assert(
+  shellMotion.includes("export function dismissWithMotion") &&
+    shellMotion.includes("prepareSurfaceOpen") &&
+    shellMotion.includes("prefersReducedMotion") &&
+    homeGuiStyle.includes("--shell-motion-enter") &&
+    homeGuiStyle.includes("bar-menu-leaving") &&
+    homeGuiStyle.includes("menubar-card-leaving") &&
+    homeGuiStyle.includes("menubar-card-enter") &&
+    homeGuiStyle.includes("launcher-leaving") &&
+    homeGuiStyle.includes("about-overlay") &&
+    homeGuiStyle.includes("content: url(\"./elastos-logo-ink.svg\")") &&
+    homeGuiStyle.includes("about-traffic-lights") &&
+    homeGuiTemplateHtml.includes('id="about-more"') &&
+    homeGuiTemplateHtml.includes('id="about-version"') &&
+    homeGuiTemplateHtml.includes('id="about-software-update"') &&
+    homeGuiTemplateHtml.includes("about-traffic-lights") &&
+    homeGuiJs.includes("aboutRuntimeVersion") &&
+    homeGuiJs.includes("aboutUpdateSignal") &&
+    shellChrome.includes("dismissWithMotion") &&
+    shellControlCentre.includes("menubar-card-leaving") &&
+    shellNotifications.includes("menubar-card-leaving") &&
+    shellSpotlight.includes("launcher-leaving") &&
+    shellMenubar.includes("bar-menu-leaving") &&
+    shellSurface.includes("bar-menu-leaving"),
+  "Shell chrome must share dismissWithMotion leave paths (menus, CC/NC drop-cards, Spotlight, context)",
 );
 assert(
   shellManifest.name === "ElastOS Home",
@@ -1954,8 +2031,162 @@ assert(
   homeGuiTemplateHtml.includes('id="home-notification-toast"') &&
     homeGuiJs.includes("maybeShowWalletApprovalToast(previous, summary)") &&
     shellSurface.includes("wallet_approval_request") &&
-    shellSurface.includes('openTarget("inbox")'),
-  "Home must surface new Wallet approval requests as a desktop toast that opens Inbox",
+    shellSurface.includes("showWalletRail()") &&
+    shellSurface.includes('openTarget("wallet")') &&
+    !shellSurface.includes('openTarget("inbox")'),
+  "Home must surface new Wallet approval requests as a desktop toast that opens Wallet — never Inbox",
+);
+assert(
+  homeGuiTemplateHtml.includes('id="inbox-rail"') &&
+    homeGuiTemplateHtml.includes('id="inbox-rail-frame"') &&
+    homeGuiTemplateHtml.includes("Clear history") &&
+    !homeGuiTemplateHtml.includes(">Clear all<") &&
+    shellInboxRail.includes('route.searchParams.set("presentation", "rail")') &&
+    shellInboxRail.includes('launchHomeTarget("inbox"') &&
+    homeGuiJs.includes("bindInboxRail()") &&
+    homeGuiJs.includes("toggleInboxRail()"),
+  "Home bell must open the Inbox rail through the canonical launch path with rail presentation",
+);
+assert(
+  shellNotifications.includes('item.kind === "wallet_approval_request"') &&
+    shellNotifications.includes("showWalletRail()") &&
+    shellNotifications.includes("showInboxRail()"),
+  "Notification Center is history-only: entry clicks route to the actionable rail by kind",
+);
+assert(
+  shellPopovers.includes("closeOtherShellPopovers") &&
+    shellPopovers.includes("export function setOverlayOpen") &&
+    shellNotifications.includes('closeOtherShellPopovers("notification-center")') &&
+    shellControlCentre.includes('closeOtherShellPopovers("control-centre")') &&
+    shellWalletRail.includes('closeOtherShellPopovers("wallet-rail")') &&
+    shellInboxRail.includes('closeOtherShellPopovers("inbox-rail")') &&
+    shellSurface.includes('registerShellPopover("launcher"') &&
+    shellKeyboard.includes('registerShellPopover("window-switcher"') &&
+    shellKeyboard.includes('registerShellPopover("shortcuts"') &&
+    shellQuickLook.includes('registerShellPopover("quick-look"'),
+  "Menubar popovers are mutually exclusive: opening one closes the others; overlays clear inert via setOverlayOpen",
+);
+assert(
+  !shellSpotlight.includes("/api/provider/") &&
+    shellSpotlight.includes("Documents come from Home summary facts only") &&
+    shellSpotlight.includes("no provider-plane fetches from this shell module"),
+  "Spotlight must not call provider APIs — Continuity allowlist is Home facts only",
+);
+assert(
+  homeGuiTemplateHtml.includes('aria-label="Dock"') &&
+    shellSurface.includes("Pin to Dock") &&
+    shellSurface.includes("Remove from Dock") &&
+    !shellSurface.includes("Pin to Taskbar") &&
+    !homeGuiTemplateHtml.includes("Home GUI shell") &&
+    !homeGuiTemplateHtml.includes("Runtime data not attached"),
+  "Dock naming + product About/error copy — no Taskbar diglossia or engineer stage-fail strings",
+);
+assert(
+  homeGuiCore.includes('targetId === "chat"') &&
+    shellStyle.includes("--accent: var(--el-accent"),
+  "Chat dock glyph exists; home-gui accent aliases --el-accent",
+);
+assert(
+  inboxStyle.includes("passkeyBoundApprove") &&
+    inboxStyle.includes('"room.approve"') &&
+    inboxStyle.includes('"capability.approve"') &&
+    inboxStyle.includes('"service.approve"') &&
+    gatewayInboxApi.includes('"room.approve"') &&
+    gatewayInboxApi.includes('"capability.approve"') &&
+    gatewayInboxApi.includes('"service.approve"'),
+  "Inbox high-risk Approves require fresh passkey (UI + runtime consume)",
+);
+assert(
+  gatewayApi.includes('"/api/apps/home/discovery"') &&
+    gatewayApi.includes("home_discovery_update") &&
+    gatewayApi.includes("apply_people_discovery_enabled") &&
+    shellControlCentre.includes("/api/apps/home/discovery") &&
+    homeGuiTemplateHtml.includes("Find People") &&
+    !shellControlCentre.includes("Bluetooth") &&
+    !homeGuiTemplateHtml.includes("Bluetooth") &&
+    !shellControlCentre.includes("did:key") &&
+    !homeGuiTemplateHtml.includes("did:key") &&
+    shellJs.includes("focusMode") &&
+    homeGuiCore.includes("focusModeEnabled") &&
+    homeGuiTemplateHtml.includes('id="control-centre-show-windows"') &&
+    homeGuiTemplateHtml.includes("Show Windows"),
+  "Shell Continuity: home discovery proxy + Focus + Show Windows; no Bluetooth/DID in CC",
+);
+assert(
+  shellExpose.includes("exposeEntries") &&
+    shellExpose.includes("wasMinimized") &&
+    shellExpose.includes("mountExposeCaption") &&
+    shellExpose.includes('registerShellPopover("show-windows"') &&
+    shellExpose.includes("No open windows") &&
+    homeGuiTemplateHtml.includes("<dt>Show Windows</dt>") &&
+    !homeGuiTemplateHtml.includes("<dt>Mission Control</dt>"),
+  "Show Windows v1 includes minimized windows, captions, empty state; shortcuts say Show Windows",
+);
+assert(
+  homeGuiTemplateHtml.includes('id="nc-cal-date"') &&
+    homeGuiTemplateHtml.includes('id="nc-cal-month"') &&
+    shellNotifications.includes("renderNcTimeChrome") &&
+    shellNotifications.includes('aria-current", "date"') &&
+    homeGuiTemplateHtml.includes(">History<") &&
+    shellSurface.includes('dataset.kind = "alias"') &&
+    shellJs.includes('surface: "desktop"') &&
+    shellAuthJs.includes("frostPrompt") &&
+    homeGuiTemplateHtml.includes("toolbar-identity-avatar") &&
+    homeGuiTemplateHtml.includes('id="inbox-rail-refresh"') &&
+    homeGuiTemplateHtml.includes('placeholder="Search"') &&
+    homeGuiTemplateHtml.includes("launcher-browse-label") &&
+    shellJs.includes("frostLock") &&
+    shellJs.includes("must keep the live desktop mounted"),
+  "Shell Continuity: NC calendar, frost lock keeps desktop, alias badges, menu avatar, Search primacy",
+);
+assert(
+  shellNotifications.includes("panel.inert = false") &&
+    shellNotifications.includes("panel.inert = true") &&
+    shellSpotlight.includes("spotlight.inert = false") &&
+    shellSpotlight.includes("spotlight.inert = true"),
+  "Notification Center and Spotlight must clear and restore inert with aria-hidden",
+);
+assert(
+  homeGuiCore.includes("export function formatBadgeCount") &&
+    shellSurface.includes("formatBadgeCount(badgeCount)") &&
+    shellWalletRail.includes("formatBadgeCount(n)") &&
+    shellWalletRail.includes("formatBadgeCount(count)") &&
+    !shellWalletRail.includes('n > 9 ? "9+"') &&
+    shellStyle.includes("--popover-radius: 14px") &&
+    shellStyle.includes("--popover-shadow: var(--shadow-soft)") &&
+    shellStyle.includes("border-radius: var(--popover-radius)") &&
+    shellStyle.includes("box-shadow: var(--popover-shadow)"),
+  "Shell badges use formatBadgeCount(99+) and popovers share radius/shadow tokens",
+);
+assert(
+  homeGuiCore.includes('targetId === "library"') &&
+    homeGuiCore.includes('targetId === "services"') &&
+    homeGuiCore.includes('targetId === "archive-manager"') &&
+    homeGuiCore.includes('targetId === "home-cli"') &&
+    homeGuiTemplateHtml.includes("Minimize window") &&
+    homeGuiTemplateHtml.includes("Snap window"),
+  "Shell glyphs distinguish library/services/archive-manager/home-cli; shortcuts list minimize/snap",
+);
+assert(
+  shellWindows.includes("export function minimizeWindow") &&
+    shellWindows.includes("export function maximizeActiveWindow") &&
+    shellWindowGeometry.includes("export function applyWindowSnapState") &&
+    shellKeyboard.includes("minimizeWindow(shellState.activeWindowId)") &&
+    shellKeyboard.includes('applyWindowSnapState(entry.node, "left")') &&
+    shellSpotlight.includes("recentTargetIds") &&
+    shellSpotlight.includes('if (query === "")') &&
+    shellSurface.includes("notificationCountsBySourceApp") &&
+    homeGuiTemplateHtml.includes('class="taskbar-notification-badge"') &&
+    shellWindows.includes('playUiSound("error")') &&
+    peopleScript.includes("home:menu-manifest"),
+  "Phase 7: minimize/snap keys, Spotlight recents, dock notification badges, error sound, menus",
+);
+assert(
+  inboxStyle.includes('actionId.startsWith("service-approve-request:")') &&
+    inboxStyle.includes('"service-deny-request:"') &&
+    inboxStyle.includes('data-inbox-presentation') &&
+    inboxStyle.includes('presentation === "rail"'),
+  "Inbox must render Approve/Deny for service access requests and support rail presentation",
 );
 assert(
   shellWindows.includes("cross-origin or failed state") &&
@@ -2016,6 +2247,40 @@ assert(
   homeGuiCore.includes("addTargetToDesktop") &&
     homeGuiCore.includes("removeTargetFromDesktop"),
   "Home must support reversible desktop icon presence",
+);
+assert(
+  shellSurface.includes("isTrashDesktopObject") &&
+    shellSurface.includes("if (isTrashDesktopObject(object))") &&
+    shellSurface.includes("const trashObject = desktopObjects(summary).find(isTrashDesktopObject)"),
+  "Desktop must filter Trash from icons while keeping the dock Trash affordance",
+);
+assert(
+  shellSurface.includes('action: "new-folder"') &&
+    shellSurface.includes('action: "new-text-document"') &&
+    shellSurface.includes('action: "change-wallpaper"') &&
+    shellSurface.includes('action: "rename-desktop-file"') &&
+    shellSurface.includes('action: "trash-desktop-object"') &&
+    shellSurface.includes("mutateDesktopObject") &&
+    homeGuiCore.includes('/api/apps/home/desktop/objects') &&
+    homeGuiCore.includes("export async function mutateDesktopObject"),
+  "Desktop menus must create/rename/trash via the Desktop-scoped mutation API",
+);
+assert(
+  shellSurface.includes('state.source === "launcher"') &&
+    shellSurface.includes("never silent-unpin") &&
+    shellSurface.includes("hideLauncher()") &&
+    shellSurface.includes('shellState.dragState.source === "launcher"'),
+  "Launcher/dock drops onto Desktop must add aliases without unpinning the dock",
+);
+assert(
+  shellSpotlight.includes('system_kind === "trash"') &&
+    shellSpotlight.includes("/.Trash"),
+  "Spotlight file results must exclude Trash",
+);
+assert(
+  systemJs.includes('readQueryParam("settings")') &&
+    systemJs.includes("activateSettingsTab(settingsTab)"),
+  "System must deep-link Personalization via ?settings=personalization",
 );
 assert(
   shellSurface.includes('action: "remove-desktop-icon"') &&
@@ -2115,6 +2380,9 @@ assert(
     peopleIndex.includes("Open People from Home.") &&
     peopleIndex.includes('id="profile-form"') &&
     peopleIndex.includes('id="discovery"') &&
+    peopleIndex.includes('src="./elastos-theme.js"') &&
+    peopleIndex.includes('href="./elastos-ui.css"') &&
+    !peopleIndex.includes('data-theme="light"') &&
     peopleScript.includes("/api/apps/people/summary") &&
     peopleScript.includes("/api/apps/people/profile-card") &&
     peopleScript.includes("/api/apps/people/discovery") &&
@@ -2126,6 +2394,8 @@ assert(
     peopleStyle.includes(".people-shell") &&
     peopleStyle.includes(".people-sidebar") &&
     peopleStyle.includes(".discovery-grid") &&
+    peopleStyle.includes("var(--el-text)") &&
+    !peopleStyle.includes("#1f2937") &&
     !shellWindows.includes("renderPeopleWindowBody") &&
     !shellWindows.includes("/api/apps/people/") &&
     !shellStyle.includes(".home-people-") &&
@@ -2138,7 +2408,10 @@ assert(
 assert(
   servicesCapsule.includes('"name": "services"') &&
     servicesCapsule.includes('"role": "app"') &&
-    servicesIndex.includes("Services · ElastOS") &&
+    servicesIndex.includes("Sharing · ElastOS") &&
+    servicesIndex.includes("Open Sharing from Home.") &&
+    servicesIndex.includes('aria-label="Sharing"') &&
+    !servicesIndex.includes("Services · ElastOS") &&
     servicesIndex.includes("This device") &&
     servicesIndex.includes("From People") &&
     servicesIndex.includes("Shared from this device") &&
@@ -4059,13 +4332,29 @@ assert(
   "Marketplace must read the canonical catalog and interface registry",
 );
 const marketplaceUi = read("capsules/marketplace/browser/marketplace.js");
+const marketplaceIndex = read("capsules/marketplace/browser/index.html");
 assert(
   marketplaceUi.includes("const installed = capsule.installed === true;") &&
     marketplaceUi.includes('type: "home:open-target"') &&
     !marketplaceUi.includes("/api/apps/home/launch") &&
     !marketplaceUi.includes("runtime-bundle") &&
-    !marketplaceUi.includes("isBuiltIn"),
-  "Marketplace must trust the installed-active catalog instead of inferring product state from source or bundle labels",
+    !marketplaceUi.includes("isBuiltIn") &&
+    !marketplaceUi.includes("initTheme") &&
+    !marketplaceIndex.includes('class="header-title"') &&
+    marketplaceIndex.includes("App Store · ElastOS") &&
+    marketplaceIndex.includes("store-shell") &&
+    marketplaceIndex.includes('id="store-sidebar"') &&
+    marketplaceUi.includes("home:menu-manifest") &&
+    marketplaceUi.includes("function selectDestination(") &&
+    marketplaceUi.includes("function renderAppRow(") &&
+    marketplaceUi.includes('class="store-pill"') &&
+    !marketplaceUi.includes("showInstallPending") &&
+    !marketplaceUi.includes("Install pending") &&
+    !marketplaceUi.includes("Install unavailable") &&
+    !marketplaceUi.includes("app-price") &&
+    !marketplaceIndex.includes("install-modal") &&
+    !marketplaceIndex.includes('data-tab="discover"'),
+  "App Store chrome: sidebar destinations, list rows, Open pills; no Install theater",
 );
 assert(
   marketplaceUi.includes("const category = String(capsule.category || \"\").toLowerCase()") &&
@@ -4320,7 +4609,7 @@ const walletconnectConfigSmoke = read(
   "scripts/walletconnect-connector-config-smoke.sh",
 );
 const walletProviderDoc = read("docs/WALLET_PROVIDER.md");
-const systemAssetVersion = "system-20260719f";
+const systemAssetVersion = "system-20260719g";
 const shellAuth = read("capsules/home/browser/shell-auth.js");
 const protectedHomeStateSmoke = read("scripts/protected-home-state-smoke.sh");
 const auditChainBoundary = {
@@ -6301,10 +6590,30 @@ assert(
 assert(
   system.includes('<h1 id="device-title" class="pc2-section-title">This Device</h1>') &&
     system.includes('data-settings="about"') &&
-    system.includes("settings-sidebar-text\">About</span>") &&
+    system.includes("settings-sidebar-text\">This Device</span>") &&
+    system.includes("settings-sidebar-text\">Accounts</span>") &&
+    system.includes("settings-sidebar-text\">Appearance</span>") &&
+    !system.includes("settings-sidebar-text\">About</span>") &&
+    !system.includes("settings-sidebar-text\">Account</span>") &&
+    !system.includes("settings-sidebar-text\">Personalization</span>") &&
     !system.includes("settings-sidebar-text\">System</span>") &&
     !system.includes("settings-sidebar-text\">Runtime</span>"),
-  "System app must expose device details under About, not as duplicate Runtime sections",
+  "System sidebar labels must read Accounts / Appearance / This Device (ids stay for deep links)",
+);
+assert(
+  (system.match(/class="settings-sidebar-icon"/g) || []).length >= 6 &&
+    (system.match(/<svg viewBox="0 0 24 24"/g) || []).length >= 6 &&
+    !system.includes("settings-sidebar-icon-account") &&
+    !system.includes("settings-sidebar-icon-storage") &&
+    !system.includes("settings-sidebar-icon-inspector") &&
+    !system.includes("settings-sidebar-burger") &&
+    !systemStyle.includes(".settings-sidebar-icon::before") &&
+    systemJs.includes("configureSettingsSearch") &&
+    systemJs.includes("SETTINGS_SEARCH_KEYWORDS") &&
+    systemStyle.includes(".settings-sidebar-item.search-hidden") &&
+    systemStyle.includes(".compact-proof") &&
+    systemStyle.includes(".sidebar-toggle"),
+  "System sidebar must use inline SVG icons, drop dead burger/storage glyphs, and filter via search",
 );
 assert(
   !system.includes('<h2 id="identity-title">Profile</h2>') &&

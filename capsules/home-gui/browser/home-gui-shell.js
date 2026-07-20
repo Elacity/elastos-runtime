@@ -10,8 +10,8 @@ import {
   setHomeGuiMounted,
   showHomeGuiDesktop,
   syncHomeGuiProjection,
-} from "./home-gui.js?v=home-20260719f";
-import { setHomeGuiLaunchToken } from "./shell-core.js?v=home-20260719f";
+} from "./home-gui.js?v=home-20260719x";
+import { setHomeGuiLaunchToken } from "./shell-core.js?v=home-20260719x";
 
 const route = new URL(window.location.href);
 const fragment = new URLSearchParams(route.hash.replace(/^#/, ""));
@@ -126,6 +126,14 @@ window.addEventListener("elastos:ui-preference-changed", (event) => {
     return;
   }
   postToHome({ type: "home:ui-preference", action: "write", key: detail.key, value: detail.value });
+});
+
+// ElastOS menu Lock Screen — same host-mediated unlock prompt as 401/403
+// launch failures. Cosmetic chrome only; no new runtime surface.
+window.addEventListener("elastos:request-lock", () => {
+  requestHome("home:request-unlock").catch((error) => {
+    console.error("home-gui lock request failed", error);
+  });
 });
 
 window.addEventListener("message", (event) => {

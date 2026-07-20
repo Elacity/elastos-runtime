@@ -11,6 +11,9 @@ export let launcherToggleButton = document.querySelector("#launcher-toggle");
 export let closeLauncherButton = document.querySelector("#close-launcher");
 export let launcherViewToggle = document.querySelector("#launcher-view-toggle");
 export let toolbarHomeButton = document.querySelector("#toolbar-home");
+export let toolbarIdentityAvatar = document.querySelector("#toolbar-identity-avatar");
+export let toolbarIdentityMonogram = document.querySelector("#toolbar-identity-monogram");
+export let toolbarIdentityAvatarImage = document.querySelector("#toolbar-identity-avatar-image");
 export let toolbarActiveTitleNode = document.querySelector("#toolbar-active-title");
 export let toolbarInboxButton = document.querySelector("#toolbar-inbox");
 export let toolbarInboxCount = document.querySelector("#toolbar-inbox-count");
@@ -57,9 +60,9 @@ export const WINDOW_TOP_INSET = 8;
 export const WINDOW_BOTTOM_INSET = 72;
 export const CONTEXT_MENU_IGNORE_OUTSIDE_MS = 220;
 const HOME_GUI_TEMPLATE_ID = "home-gui-template";
-const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260719f", import.meta.url).href;
+const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260719x", import.meta.url).href;
 const HOME_GUI_STYLESHEET_ID = "home-gui-stylesheet";
-const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260719f", import.meta.url).href;
+const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260719x", import.meta.url).href;
 let homeGuiTemplateHtmlPromise = null;
 let homeGuiLaunchToken = "";
 
@@ -182,6 +185,9 @@ function bindHomeGuiDomRefs() {
   closeLauncherButton = document.querySelector("#close-launcher");
   launcherViewToggle = document.querySelector("#launcher-view-toggle");
   toolbarHomeButton = document.querySelector("#toolbar-home");
+  toolbarIdentityAvatar = document.querySelector("#toolbar-identity-avatar");
+  toolbarIdentityMonogram = document.querySelector("#toolbar-identity-monogram");
+  toolbarIdentityAvatarImage = document.querySelector("#toolbar-identity-avatar-image");
   toolbarActiveTitleNode = document.querySelector("#toolbar-active-title");
   toolbarInboxButton = document.querySelector("#toolbar-inbox");
   toolbarInboxCount = document.querySelector("#toolbar-inbox-count");
@@ -309,6 +315,15 @@ export async function fetchJson(url, init) {
   return response.json();
 }
 
+/* Narrow Desktop-URI mutations — mkdir/write/rename/trash only. The gateway
+   fail-closes outside {localhost_root}/Desktop. See ANDERS_REVIEW_PACK. */
+export async function mutateDesktopObject(op, payload = {}) {
+  return fetchJson("/api/apps/home/desktop/objects", {
+    method: "POST",
+    body: JSON.stringify({ op, ...payload }),
+  });
+}
+
 export function allVisibleTargets(summary) {
   if (!summary || !Array.isArray(summary.targets)) {
     return [];
@@ -414,6 +429,9 @@ export function targetTitle(summary, targetId) {
 }
 
 export function canonicalTargetTitle(targetId, title) {
+  if (targetId === "marketplace") {
+    return "App Store";
+  }
   const normalizedTitle = normalizeText(title);
   return normalizedTitle || targetId;
 }
@@ -923,14 +941,34 @@ export function mountGlyph(container, targetId, forcedTone) {
   container.innerHTML = glyphSvg(targetId);
 }
 
+export function formatBadgeCount(count, cap = 99) {
+  const n = Math.max(0, Number(count) || 0);
+  if (n === 0) {
+    return "";
+  }
+  return n > cap ? `${cap}+` : String(n);
+}
+
+/* Focus: host-persisted cosmetic pref. Mutes desktop toasts only — never
+   hides Inbox/Wallet rails or badge counts. */
+let focusModeMemory = "";
+
+export function focusModeEnabled() {
+  return focusModeMemory === "on";
+}
+
+export function setFocusModeEnabled(on) {
+  focusModeMemory = on ? "on" : "off";
+}
+
 export function glyphTone(targetId) {
   if (targetId === "trash" || targetId === "trash-full") {
     return "system";
   }
-  if (targetId === SYSTEM_APP_ID) {
+  if (targetId === SYSTEM_APP_ID || targetId === "home-cli") {
     return "system";
   }
-  if (targetId === "inbox") {
+  if (targetId === "inbox" || targetId === "library" || targetId === "archive-manager") {
     return "docs";
   }
   if (targetId === "marketplace") {
@@ -945,7 +983,10 @@ export function glyphTone(targetId) {
   if (targetId.includes("file")) {
     return "docs";
   }
-  if (targetId.includes("room")) {
+  if (targetId === "chat" || targetId === "chat-room") {
+    return "room";
+  }
+  if (targetId.includes("room") || targetId === "services") {
     return "room";
   }
   if (targetId === PEOPLE_TARGET_ID) {
@@ -1004,6 +1045,15 @@ function glyphSvg(targetId) {
         <path d="M6 9.25V18a1.5 1.5 0 0 0 1.5 1.5h9A1.5 1.5 0 0 0 18 18V9.25" />
         <path d="M9 13.25h6" />
         <path d="M9 16.25h4" />
+      </svg>
+    `;
+  }
+  if (targetId === "chat" || targetId === "chat-room") {
+    return `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5.5 6.75A2.25 2.25 0 0 1 7.75 4.5h8.5A2.25 2.25 0 0 1 18.5 6.75v6.5A2.25 2.25 0 0 1 16.25 15.5H12l-3.75 3.25V15.5H7.75A2.25 2.25 0 0 1 5.5 13.25Z" />
+        <path d="M9 9.25h6" />
+        <path d="M9 12h4" />
       </svg>
     `;
   }
@@ -1074,6 +1124,43 @@ function glyphSvg(targetId) {
         <path d="M14 3.75V8h4" />
         <path d="M9 12h6" />
         <path d="M9 15h6" />
+      </svg>
+    `;
+  }
+  if (targetId === "library") {
+    return `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 4.5v15" />
+        <path d="M9.5 4.5v15" />
+        <path d="M13.5 5.2l4.6 1.2-3.6 13.4-4.6-1.2z" />
+      </svg>
+    `;
+  }
+  if (targetId === "services") {
+    return `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="7" cy="12" r="2.5" />
+        <circle cx="17" cy="12" r="2.5" />
+        <path d="M9.5 12c1.2-2.8 3.8-2.8 5 0" />
+      </svg>
+    `;
+  }
+  if (targetId === "archive-manager") {
+    return `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5.5 7.5h13v11a1.5 1.5 0 0 1-1.5 1.5h-10a1.5 1.5 0 0 1-1.5-1.5z" />
+        <path d="M5.5 7.5 7 4.5h10l1.5 3" />
+        <path d="M12 10.5v6" />
+        <path d="M10.25 13h3.5" />
+      </svg>
+    `;
+  }
+  if (targetId === "home-cli") {
+    return `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3.5" y="5" width="17" height="14" rx="2" />
+        <path d="m8 10 3 2-3 2" />
+        <path d="M13 14h3.5" />
       </svg>
     `;
   }

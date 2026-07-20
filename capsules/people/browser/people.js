@@ -16,6 +16,7 @@ const AUTO_REFRESH_MS = 15_000;
 
 let currentSummary = null;
 let refreshTimer = 0;
+let pendingRemoveContactId = null;
 
 announceReady();
 
@@ -39,8 +40,35 @@ async function boot() {
 function announceReady() {
   if (homeToken && homeParentOrigin && window.top !== window) {
     window.top.postMessage({ type: "home:app-ready", homeToken }, homeParentOrigin);
+    window.top.postMessage({
+      type: "home:menu-manifest",
+      homeToken,
+      menus: [
+        {
+          title: "File",
+          items: [{ label: "Close Window", cmd: "__close-window" }],
+        },
+        {
+          title: "View",
+          items: [{ label: "Refresh", cmd: "refresh" }],
+        },
+      ],
+    }, homeParentOrigin);
   }
 }
+
+window.addEventListener("message", (event) => {
+  if (event.origin !== "null" || event.source !== window.parent) {
+    return;
+  }
+  const message = event.data;
+  if (message?.type !== "elastos:menu-command" || typeof message.cmd !== "string") {
+    return;
+  }
+  if (message.cmd === "refresh") {
+    refreshPeople().catch((error) => showStatus(publicError(error, "People could not load."), "error"));
+  }
+});
 
 function bindNavigation() {
   for (const button of document.querySelectorAll("[data-section-target]")) {
@@ -101,10 +129,26 @@ async function handleAction(button) {
   }
   if (action === "remove") {
     const contactId = readText(button.dataset.contactId);
-    const label = readText(button.dataset.contactName) || "this person";
-    if (!contactId || !window.confirm(`Remove ${label} from People?`)) {
+    if (!contactId || !currentSummary) {
       return;
     }
+    pendingRemoveContactId = contactId;
+    renderPeople(currentSummary);
+    return;
+  }
+  if (action === "remove-cancel") {
+    pendingRemoveContactId = null;
+    if (currentSummary) {
+      renderPeople(currentSummary);
+    }
+    return;
+  }
+  if (action === "remove-confirm") {
+    const contactId = readText(button.dataset.contactId);
+    if (!contactId) {
+      return;
+    }
+    pendingRemoveContactId = null;
     await mutatePeople(
       "/api/apps/people/contacts/remove",
       { contact_id: contactId },
@@ -137,6 +181,12 @@ function renderPeople(summary) {
   const identity = objectValue(summary?.identity);
   const people = objectValue(summary?.people);
   const contacts = arrayValue(people.contacts);
+  if (
+    pendingRemoveContactId
+    && !contacts.some((contact) => readText(contact?.contact_id) === pendingRemoveContactId)
+  ) {
+    pendingRemoveContactId = null;
+  }
   const discovery = objectValue(people.discovery);
   const peers = filterDiscoveredPeople(arrayValue(discovery.discovered_peers), contacts);
   const requests = arrayValue(discovery.requests).filter(requestIsVisible);
@@ -149,7 +199,7 @@ function renderPeople(summary) {
     : emptyMarkup("No people yet", "Turn on Discovery to find another ElastOS home and send a request.");
   discoveredList.innerHTML = peers.length
     ? peers.map(discoveredPeerMarkup).join("")
-    : emptyMarkup("No visible people yet", "Keep Discovery on while another ElastOS home is discoverable.");
+    : emptyMarkup("Nobody nearby", "Turn on Discovery to find people on other homes nearby.");
   requestList.innerHTML = requests.length
     ? requests.map(requestMarkup).join("")
     : emptyMarkup("No requests", "Requests to add people will appear here.");
@@ -164,6 +214,7 @@ function renderPeople(summary) {
 
 function contactMarkup(contact) {
   const name = displayName(contact, "Person");
+  const contactId = readText(contact?.contact_id);
   const relationship = readText(contact?.relationship) || "connected";
   const handle = readText(contact?.handle);
   const device = readText(contact?.device_label);
@@ -172,13 +223,24 @@ function contactMarkup(contact) {
     .map((value) => `<span>${escapeHtml(value)}</span>`)
     .join("");
   const route = readText(contact?.route);
-  const chat = contact?.can_message === true && route
+  const confirming = pendingRemoveContactId === contactId && Boolean(contactId);
+  const chat = !confirming && contact?.can_message === true && route
     ? `<button type="button" data-action="chat" data-contact-route="${escapeHtml(route)}">Chat</button>`
     : "";
+  const actions = confirming
+    ? ""
+    : `${chat}<button class="danger" type="button" data-action="remove" data-contact-id="${escapeHtml(contactId)}">Remove</button>`;
+  const confirm = confirming
+    ? {
+      message: `Remove ${name} from People?`,
+      contactId,
+    }
+    : null;
   return personCard({
     name,
     details,
-    actions: `${chat}<button class="danger" type="button" data-action="remove" data-contact-id="${escapeHtml(readText(contact?.contact_id))}" data-contact-name="${escapeHtml(name)}">Remove</button>`,
+    actions,
+    confirm,
   });
 }
 
@@ -208,15 +270,25 @@ function requestMarkup(request) {
   });
 }
 
-function personCard({ name, details, actions }) {
+function personCard({ name, details, actions, confirm = null }) {
+  const confirmMarkup = confirm
+    ? `<div class="person-confirm" role="alert">
+        <p>${escapeHtml(confirm.message)}</p>
+        <div class="person-confirm-actions">
+          <button type="button" data-action="remove-cancel">Cancel</button>
+          <button class="danger" type="button" data-action="remove-confirm" data-contact-id="${escapeHtml(confirm.contactId)}">Remove</button>
+        </div>
+      </div>`
+    : "";
   return `
-    <article class="person-card">
+    <article class="person-card${confirm ? " is-confirming" : ""}">
       <div class="person-avatar" aria-hidden="true">${escapeHtml(name.slice(0, 1).toUpperCase() || "E")}</div>
       <div class="person-copy">
         <h4>${escapeHtml(name)}</h4>
         <p>${details}</p>
       </div>
       <div class="person-actions">${actions}</div>
+      ${confirmMarkup}
     </article>
   `;
 }

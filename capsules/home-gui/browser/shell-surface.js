@@ -47,7 +47,10 @@ import {
   desktopObjectByEntryId,
   desktopEntryExists,
   trapTabWithin,
-} from "./shell-core.js?v=home-20260719f";
+  mutateDesktopObject,
+  formatBadgeCount,
+  focusModeEnabled,
+} from "./shell-core.js?v=home-20260719x";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -61,9 +64,18 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260719f";
-import { playUiSound } from "./shell-sounds.js?v=home-20260719f";
-import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260719f";
+} from "./shell-windows.js?v=home-20260719x";
+import { playUiSound } from "./shell-sounds.js?v=home-20260719x";
+import {
+  closeOtherShellPopovers,
+  registerShellPopover,
+  setOverlayOpen,
+} from "./shell-popovers.js?v=home-20260719x";
+import {
+  dismissWithMotion,
+  prepareSurfaceOpen,
+} from "./shell-motion.js?v=home-20260719x";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260719x";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -82,10 +94,11 @@ export function renderDesktop(summary) {
     const label = desktopLabelForTarget(summary, app.target);
     button.dataset.target = app.target;
     button.dataset.desktopEntryId = app.target;
+    button.dataset.kind = "alias";
     button.id = `desktop-shortcut-${app.target}`;
     button.style.left = `${position.x}px`;
     button.style.top = `${position.y}px`;
-    button.setAttribute("aria-label", desktopShortcutAriaLabel(label));
+    button.setAttribute("aria-label", `${label}, shortcut`);
     button.title = `${label}\nDouble-click or press Enter to open`;
     mountGlyph(button.querySelector(".desktop-shortcut-icon"), app.target);
     button.querySelector(".desktop-shortcut-title").textContent = label;
@@ -94,12 +107,17 @@ export function renderDesktop(summary) {
   }
   const desktopObjectOffset = allVisibleTargets(summary).length;
   for (const [index, object] of desktopObjects(summary).entries()) {
+    if (isTrashDesktopObject(object)) {
+      // Trash lives in the dock only (macOS position); one affordance.
+      continue;
+    }
     const entryId = desktopObjectEntryId(object);
     const button = shortcutTemplate.content.firstElementChild.cloneNode(true);
     const position = desktopPositionForTarget(entryId, desktopObjectOffset + index);
     const label = object.name;
     button.dataset.desktopEntryId = entryId;
     button.dataset.objectUri = object.uri;
+    button.dataset.kind = "object";
     button.id = desktopShortcutIdForEntry(entryId);
     button.style.left = `${position.x}px`;
     button.style.top = `${position.y}px`;
@@ -345,9 +363,28 @@ export function moveDesktopSelection(direction) {
   return true;
 }
 
+function notificationCountsBySourceApp(summary) {
+  const counts = new Map();
+  const entries = Array.isArray(summary?.notifications?.entries)
+    ? summary.notifications.entries
+    : [];
+  for (const entry of entries) {
+    if (entry?.read) {
+      continue;
+    }
+    const app = String(entry?.source_app || "").trim();
+    if (!app || app === "inbox" || app === "wallet") {
+      continue;
+    }
+    counts.set(app, (counts.get(app) || 0) + 1);
+  }
+  return counts;
+}
+
 export function renderTaskbar(summary) {
   taskbarTargets.replaceChildren();
   const pinnedIds = new Set(shellState.shellLayoutState.taskbar);
+  const notificationCounts = notificationCountsBySourceApp(summary);
   let separatorInserted = false;
   for (const targetId of visibleTaskbarTargets(summary)) {
     const app = targetById(summary, targetId);
@@ -372,6 +409,12 @@ export function renderTaskbar(summary) {
     button.dataset.label = app.title;
     mountGlyph(button.querySelector(".taskbar-item-icon"), app.target);
     button.dataset.openWindows = String(openCount);
+    const badge = button.querySelector(".taskbar-notification-badge");
+    const badgeLabel = formatBadgeCount(notificationCounts.get(app.target) || 0);
+    if (badge) {
+      badge.hidden = !badgeLabel;
+      badge.textContent = badgeLabel;
+    }
     attachTargetIconInteractions(button, app.target, "taskbar");
     syncTaskbarGroupButton(entry, app.target, app.title, openCount);
     taskbarTargets.appendChild(entry);
@@ -591,7 +634,7 @@ function desktopShortcutAriaLabel(title) {
 function taskbarItemAriaLabel(title, openCount, isActive) {
   const countLabel = openCount === 1 ? "1 window open" : `${openCount} windows open`;
   if (isActive) {
-    return `${title}. ${countLabel}. Active in taskbar.`;
+    return `${title}. ${countLabel}. Active in Dock.`;
   }
   return `${title}. ${countLabel}.`;
 }
@@ -766,7 +809,7 @@ function attachTargetIconInteractions(node, targetId, source) {
     });
   }
 
-  if (source === "desktop" || source === "taskbar") {
+  if (source === "desktop" || source === "taskbar" || source === "launcher") {
     node.addEventListener("pointerdown", (event) => {
       if (node.classList.contains("editing")) {
         return;
@@ -1180,6 +1223,10 @@ function startTargetDrag() {
   }
   shellState.dragState.started = true;
   hideDesktopContextMenu();
+  if (shellState.dragState.source === "launcher") {
+    // Reveal the desktop drop surface under the ghost.
+    hideLauncher();
+  }
   shellState.dragState.sourceElement.classList.add("drag-source");
   shellState.dragState.sourceElement.dataset.suppressClick = "true";
   try {
@@ -1329,13 +1376,16 @@ export function finishTargetDrag(event) {
   ) {
     changed = pinTargetToTaskbar(state.targetId, state.dropTarget.index) || changed;
   } else if (state.dropTarget && state.dropTarget.kind === "desktop") {
-    if (state.groupEntryIds && state.groupEntryIds.length > 1) {
+    if (state.source === "launcher" || state.source === "taskbar") {
+      // Drag out = Add to Desktop. Dock pin stays (independent of desktop
+      // presence), matching macOS aliases — never silent-unpin.
+      changed = addTargetToDesktop(state.targetId) || changed;
+      changed = setDesktopIconsVisible(true) || changed;
+      changed = setDesktopPosition(state.targetId, state.dropTarget.position) || changed;
+    } else if (state.groupEntryIds && state.groupEntryIds.length > 1) {
       changed = moveDesktopGroup(state, state.dropTarget.position) || changed;
     } else {
       changed = setDesktopPosition(state.targetId, state.dropTarget.position) || changed;
-    }
-    if (state.source === "taskbar") {
-      changed = unpinTargetFromTaskbar(state.targetId) || changed;
     }
   }
 
@@ -1492,22 +1542,21 @@ export function showLauncher() {
 }
 
 export function hideLauncher() {
-  const hadFocus = launcher.contains?.(document.activeElement) === true;
   syncLauncherVisibility(false);
   launcherSearch.value = "";
   shellState.selectedLauncherTargetId = null;
   filterLauncherItems("");
-  // A closed modal must hand keyboard focus back to its invoker, never drop
-  // it on <body>.
-  if (hadFocus) {
-    launcherToggleButton.focus();
-  }
 }
 
 function syncLauncherVisibility(isVisible) {
-  launcher.hidden = !isVisible;
+  if (isVisible) {
+    closeOtherShellPopovers("launcher");
+  }
+  setOverlayOpen(launcher, isVisible, {
+    invoker: launcherToggleButton,
+    focusEl: isVisible && shouldFocusLauncherSearch() ? launcherSearch : undefined,
+  });
   launcher.dataset.open = isVisible ? "true" : "false";
-  launcher.setAttribute("aria-hidden", isVisible ? "false" : "true");
   shellState.launcherIgnoreOutsideUntil = isVisible
     ? (window.performance ? window.performance.now() : Date.now()) + 350
     : 0;
@@ -1515,10 +1564,8 @@ function syncLauncherVisibility(isVisible) {
 }
 
 function shouldFocusLauncherSearch() {
-  if (navigator.maxTouchPoints > 0) {
-    return false;
-  }
-  return !window.matchMedia?.("(hover: none), (pointer: coarse)")?.matches;
+  // Typed search lives in Spotlight; the launcher is browse-only.
+  return false;
 }
 
 export function openDesktopContextMenu(clientX, clientY, target) {
@@ -1531,7 +1578,12 @@ export function openDesktopContextMenu(clientX, clientY, target) {
       ? document.activeElement
       : null;
   renderContextMenu(target);
+  closeOtherShellPopovers("context-menu");
+  // Clear inert before measuring so geometry is valid.
+  prepareSurfaceOpen(desktopContextMenu);
   desktopContextMenu.hidden = false;
+  desktopContextMenu.inert = false;
+  desktopContextMenu.setAttribute("aria-hidden", "false");
   shellState.contextMenuOpen = true;
   shellState.contextMenuIgnoreOutsideUntil =
     (window.performance ? window.performance.now() : Date.now()) +
@@ -1543,17 +1595,31 @@ export function openDesktopContextMenu(clientX, clientY, target) {
 
   desktopContextMenu.style.left = `${left}px`;
   desktopContextMenu.style.top = `${top}px`;
-  contextMenuFocusables()[0]?.focus();
+  setOverlayOpen(desktopContextMenu, true, {
+    invoker: shellState.contextMenuInvoker,
+    focusEl: contextMenuFocusables()[0],
+  });
 }
 
 export function hideDesktopContextMenu({ restoreFocus = false } = {}) {
-  const hadFocus = desktopContextMenu.contains?.(document.activeElement) === true;
-  desktopContextMenu.hidden = true;
-  shellState.contextMenuOpen = false;
-  if (restoreFocus && hadFocus) {
-    shellState.contextMenuInvoker?.focus?.();
+  if (!desktopContextMenu || desktopContextMenu.hidden) {
+    shellState.contextMenuOpen = false;
+    shellState.contextMenuInvoker = null;
+    return;
   }
-  shellState.contextMenuInvoker = null;
+  if (!restoreFocus) {
+    desktopContextMenu._overlayInvoker = null;
+  }
+  dismissWithMotion(desktopContextMenu, {
+    className: "bar-menu-leaving",
+    ms: 120,
+    hide: false,
+    onDone: () => {
+      setOverlayOpen(desktopContextMenu, false);
+      shellState.contextMenuOpen = false;
+      shellState.contextMenuInvoker = null;
+    },
+  });
 }
 
 function contextMenuFocusables() {
@@ -1610,8 +1676,8 @@ function renderContextMenu(target) {
 
 function taskbarPinMenuItem(targetId) {
   return isTargetPinnedToTaskbar(targetId)
-    ? { action: "unpin-taskbar", label: "Remove from Taskbar" }
-    : { action: "pin-taskbar", label: "Pin to Taskbar" };
+    ? { action: "unpin-taskbar", label: "Remove from Dock" }
+    : { action: "pin-taskbar", label: "Pin to Dock" };
 }
 
 function appendTargetGroupManagementItems(items, openWindows) {
@@ -1641,6 +1707,9 @@ function contextMenuItems(target) {
   }
   const iconsVisible = shellState.shellLayoutState.desktopIconsVisible !== false;
   const items = [
+    { action: "new-folder", label: "New Folder" },
+    { action: "new-text-document", label: "New Text Document" },
+    { kind: "divider" },
     {
       action: "toggle-desktop-icons",
       label: iconsVisible ? "Hide Desktop Icons" : "Show Desktop Icons",
@@ -1649,6 +1718,7 @@ function contextMenuItems(target) {
   if (iconsVisible) {
     items.push({ action: "auto-arrange", label: "Auto-arrange Icons" });
   }
+  items.push({ kind: "divider" }, { action: "change-wallpaper", label: "Change Wallpaper…" });
   return items;
 }
 
@@ -1687,6 +1757,8 @@ function desktopObjectContextMenuItems(target) {
   if (canRevealDesktopObject(object)) {
     items.push({ action: "reveal-desktop-object", label: "Show in Library" });
   }
+  items.push({ action: "rename-desktop-file", label: "Rename" });
+  items.push({ action: "trash-desktop-object", label: "Move to Trash" });
   if (items.length > 0 && (hasObjectCapability(object, "download") || hasObjectCapability(object, "properties"))) {
     items.push({ kind: "divider" });
   }
@@ -1746,6 +1818,14 @@ export function handleContextAction(action) {
     clearDesktopSelection();
     return;
   }
+  if (action === "new-folder" || action === "new-text-document") {
+    void createDesktopItem(action === "new-folder");
+    return;
+  }
+  if (action === "change-wallpaper") {
+    openTarget("system", { query: { settings: "personalization" } });
+    return;
+  }
   if (shellState.contextMenuTarget.kind === "desktop-object") {
     if (action === "open-desktop-object" || action === "open-desktop-object-new-window") {
       openDesktopObject(shellState.contextMenuTarget.entryId);
@@ -1753,6 +1833,14 @@ export function handleContextAction(action) {
     }
     if (action === "reveal-desktop-object") {
       revealDesktopObject(shellState.contextMenuTarget.entryId);
+      return;
+    }
+    if (action === "rename-desktop-file") {
+      startDesktopObjectRename(shellState.contextMenuTarget.entryId);
+      return;
+    }
+    if (action === "trash-desktop-object") {
+      void trashDesktopObject(shellState.contextMenuTarget.entryId);
       return;
     }
     if (action === "download-desktop-object" || action === "properties-desktop-object") {
@@ -1863,6 +1951,140 @@ export function handleContextAction(action) {
     if (unpinTargetFromTaskbar(shellState.contextMenuTarget.targetId)) {
       commitTaskbarLayoutChange();
     }
+  }
+}
+
+function nextAvailableDesktopName(baseName) {
+  const taken = new Set(
+    desktopObjects(shellState.currentSummary)
+      .filter((object) => !isTrashDesktopObject(object))
+      .map((object) => String(object.name || "").toLowerCase()),
+  );
+  if (!taken.has(baseName.toLowerCase())) {
+    return baseName;
+  }
+  for (let index = 2; index < 1000; index += 1) {
+    const candidate = baseName.includes(".")
+      ? (() => {
+        const dot = baseName.lastIndexOf(".");
+        return `${baseName.slice(0, dot)} ${index}${baseName.slice(dot)}`;
+      })()
+      : `${baseName} ${index}`;
+    if (!taken.has(candidate.toLowerCase())) {
+      return candidate;
+    }
+  }
+  return `${baseName} ${Date.now()}`;
+}
+
+async function createDesktopItem(isFolder) {
+  const name = nextAvailableDesktopName(isFolder ? "untitled folder" : "untitled.txt");
+  try {
+    await mutateDesktopObject(isFolder ? "mkdir" : "write", { name });
+    shellState.requestSummaryRefresh?.();
+  } catch (error) {
+    console.warn("desktop create failed", error);
+    showDesktopMutationError();
+  }
+}
+
+async function trashDesktopObject(entryId) {
+  const object = desktopObjectByEntryId(shellState.currentSummary, entryId);
+  if (!object?.uri || isTrashDesktopObject(object)) {
+    return;
+  }
+  try {
+    await mutateDesktopObject("trash", { uri: object.uri });
+    playUiSound("trash");
+    if (shellState.selectedDesktopTargetId === entryId) {
+      clearDesktopSelection();
+    }
+    shellState.requestSummaryRefresh?.();
+  } catch (error) {
+    console.warn("desktop trash failed", error);
+    showDesktopMutationError();
+  }
+}
+
+function startDesktopObjectRename(entryId) {
+  const object = desktopObjectByEntryId(shellState.currentSummary, entryId);
+  if (!object?.uri || isTrashDesktopObject(object)) {
+    return;
+  }
+  const shortcut = document.getElementById(desktopShortcutIdForEntry(entryId));
+  if (!shortcut) {
+    return;
+  }
+  cancelDesktopRename();
+  shellState.editingDesktopTargetId = entryId;
+  shortcut.classList.add("editing");
+  const titleNode = shortcut.querySelector(".desktop-shortcut-title");
+  const input = document.createElement("input");
+  input.className = "desktop-shortcut-rename";
+  input.type = "text";
+  input.spellcheck = false;
+  input.maxLength = 120;
+  input.value = object.name;
+  input.addEventListener("pointerdown", (event) => {
+    event.stopPropagation();
+  });
+  input.addEventListener("click", (event) => {
+    event.stopPropagation();
+  });
+  titleNode.replaceChildren(input);
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void commitDesktopObjectRename(entryId, object.uri, input.value);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancelDesktopRename();
+    }
+  });
+  input.addEventListener("blur", () => {
+    const now = window.performance ? window.performance.now() : Date.now();
+    const ignoreBlurUntil = Number.parseFloat(input.dataset.ignoreBlurUntil || "0");
+    if (Number.isFinite(ignoreBlurUntil) && now < ignoreBlurUntil) {
+      window.setTimeout(() => {
+        if (shellState.editingDesktopTargetId === entryId) {
+          input.focus();
+          input.select();
+        }
+      }, 0);
+      return;
+    }
+    if (shellState.editingDesktopTargetId === entryId) {
+      void commitDesktopObjectRename(entryId, object.uri, input.value);
+    }
+  });
+  input.dataset.ignoreBlurUntil = String(
+    (window.performance ? window.performance.now() : Date.now()) + DESKTOP_RENAME_BLUR_GUARD_MS,
+  );
+  input.focus();
+  input.select();
+}
+
+async function commitDesktopObjectRename(entryId, uri, value) {
+  const name = String(value || "").trim();
+  shellState.editingDesktopTargetId = null;
+  if (!name || !uri) {
+    cancelDesktopRename();
+    return;
+  }
+  const object = desktopObjectByEntryId(shellState.currentSummary, entryId);
+  if (object && object.name === name) {
+    renderDesktop(shellState.currentSummary);
+    return;
+  }
+  try {
+    await mutateDesktopObject("rename", { uri, name });
+    shellState.requestSummaryRefresh?.();
+  } catch (error) {
+    console.warn("desktop rename failed", error);
+    showDesktopMutationError();
+    renderDesktop(shellState.currentSummary);
   }
 }
 
@@ -1986,8 +2208,9 @@ export function renderInboxBadge(summary) {
   const semanticCount =
     Number(notifications.attention_count || 0) || Number(notifications.unread_count || 0);
   const badgeCount = Math.max(0, semanticCount || entries.length);
-  toolbarInboxCount.hidden = badgeCount === 0;
-  toolbarInboxCount.textContent = String(badgeCount);
+  const badgeLabel = formatBadgeCount(badgeCount);
+  toolbarInboxCount.hidden = !badgeLabel;
+  toolbarInboxCount.textContent = badgeLabel;
   toolbarInboxButton.title = badgeCount === 0
     ? "Inbox"
     : `Inbox\n${badgeCount} pending items`;
@@ -2029,6 +2252,25 @@ function walletApprovalKey(entry) {
   return String(entry?.id || entry?.action_ref?.action_id || "");
 }
 
+function showDesktopMutationError() {
+  playUiSound("error");
+  if (
+    !homeNotificationToast ||
+    !homeNotificationTitle ||
+    !homeNotificationBody ||
+    !homeNotificationAction
+  ) {
+    return;
+  }
+  bindHomeNotificationToast();
+  homeNotificationTitle.textContent = "Desktop";
+  homeNotificationBody.textContent = "Couldn't update the Desktop. Try again.";
+  homeNotificationAction.hidden = true;
+  setOverlayOpen(homeNotificationToast, true);
+  window.clearTimeout(homeNotificationToastTimer);
+  homeNotificationToastTimer = window.setTimeout(hideHomeNotificationToast, 5000);
+}
+
 function showHomeNotificationToast(entry) {
   if (
     !homeNotificationToast ||
@@ -2039,12 +2281,18 @@ function showHomeNotificationToast(entry) {
   ) {
     return;
   }
+  // Focus mutes toasts only — Inbox/Wallet rails and badges keep working.
+  if (focusModeEnabled()) {
+    lastHomeNotificationToastId = walletApprovalKey(entry);
+    return;
+  }
   bindHomeNotificationToast();
   lastHomeNotificationToastId = walletApprovalKey(entry);
   homeNotificationTitle.textContent = entry.title || "Wallet approval request";
   homeNotificationBody.textContent = entry.body || "An app requests wallet approval.";
-  homeNotificationToast.hidden = false;
-  homeNotificationToast.setAttribute("aria-hidden", "false");
+  homeNotificationAction.hidden = false;
+  homeNotificationAction.textContent = "Review";
+  setOverlayOpen(homeNotificationToast, true);
   playUiSound("notification");
   window.clearTimeout(homeNotificationToastTimer);
   homeNotificationToastTimer = window.setTimeout(hideHomeNotificationToast, HOME_NOTIFICATION_TOAST_MS);
@@ -2057,7 +2305,7 @@ function bindHomeNotificationToast() {
   homeNotificationToast.dataset.bound = "true";
   homeNotificationAction.addEventListener("click", () => {
     hideHomeNotificationToast();
-    // Wallet approvals belong in Wallet — Inbox is the wrong room.
+    // Wallet approvals belong in Wallet — never route to Inbox.
     if (walletRailAvailable()) {
       showWalletRail();
       return;
@@ -2066,7 +2314,7 @@ function bindHomeNotificationToast() {
       openTarget("wallet");
       return;
     }
-    openTarget("inbox");
+    playUiSound("error");
   });
   homeNotificationDismiss.addEventListener("click", hideHomeNotificationToast);
 }
@@ -2076,8 +2324,11 @@ function hideHomeNotificationToast() {
     return;
   }
   window.clearTimeout(homeNotificationToastTimer);
-  homeNotificationToast.setAttribute("aria-hidden", "true");
-  homeNotificationToast.hidden = true;
+  homeNotificationToast._overlayInvoker = null;
+  setOverlayOpen(homeNotificationToast, false);
+  if (homeNotificationAction) {
+    homeNotificationAction.hidden = false;
+  }
 }
 
 /* ---- Dock behavior: magnification, tooltips, launch bounce ----
@@ -2372,6 +2623,9 @@ export function bindShellSurfaceDom() {
     return;
   }
   shellSurfaceDomBound = true;
+  registerShellPopover("launcher", () => hideLauncher());
+  registerShellPopover("context-menu", () => hideDesktopContextMenu());
+  registerShellPopover("notification-toast", () => hideHomeNotificationToast());
   // The launcher is a modal dialog: Tab cycles inside the popover until it is
   // dismissed.
   launcher?.addEventListener("keydown", (event) => {

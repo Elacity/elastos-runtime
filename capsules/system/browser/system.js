@@ -112,6 +112,15 @@ async function boot() {
     return;
   }
   configureSettingsTabs();
+  configureSettingsSearch();
+  configureDeviceDidCopy();
+  const settingsTab = readQueryParam("settings");
+  if (
+    settingsTab &&
+    document.querySelector(`.settings-sidebar-item[data-settings="${settingsTab}"]`)
+  ) {
+    activateSettingsTab(settingsTab);
+  }
   configureThemeSegment();
   configureAccentPicker();
   configureDockAutoHide();
@@ -150,6 +159,109 @@ function configureSettingsTabs() {
   });
   document.querySelector(".sidebar-toggle")?.addEventListener("click", () => {
     document.querySelector(".settings-sidebar")?.classList.toggle("active");
+  });
+}
+
+const SETTINGS_SEARCH_KEYWORDS = {
+  account: ["accounts", "passkey", "credential", "sign in", "handle"],
+  personalization: [
+    "appearance",
+    "theme",
+    "background",
+    "wallpaper",
+    "accent",
+    "dark",
+    "light",
+  ],
+  shell: ["shell", "home", "gui", "cli", "desktop", "terminal"],
+  security: [
+    "security",
+    "access",
+    "guest",
+    "sessions",
+    "recovery",
+    "advanced",
+    "technical",
+    "inspection",
+  ],
+  catalog: ["apps", "services", "capsule", "installed", "viewer"],
+  about: ["device", "runtime", "version", "identity", "did", "copy"],
+};
+
+function panelSearchText(settingsId) {
+  const panel = document.querySelector(`.settings-content[data-settings="${settingsId}"]`);
+  if (!panel) {
+    return "";
+  }
+  const bits = [];
+  for (const node of panel.querySelectorAll(
+    "h1, h2, .pc2-card-label, .pc2-card-sublabel, .pc2-section-title, label, dt, summary",
+  )) {
+    const text = node.textContent?.trim();
+    if (text) {
+      bits.push(text);
+    }
+  }
+  return bits.join(" ").toLowerCase();
+}
+
+function clearSearchHitMarks() {
+  for (const node of document.querySelectorAll(".settings-search-hit")) {
+    node.classList.remove("settings-search-hit");
+  }
+}
+
+function markFirstContentHit(settingsId, query) {
+  if (!query) {
+    return;
+  }
+  const panel = document.querySelector(`.settings-content[data-settings="${settingsId}"]`);
+  if (!panel) {
+    return;
+  }
+  for (const node of panel.querySelectorAll(
+    "h1, h2, .pc2-card-label, .pc2-card-sublabel, .pc2-section-title, label, dt, summary",
+  )) {
+    const text = node.textContent?.trim().toLowerCase() || "";
+    if (!text.includes(query)) {
+      continue;
+    }
+    node.classList.add("settings-search-hit");
+    if (typeof node.scrollIntoView === "function") {
+      node.scrollIntoView({ block: "nearest" });
+    }
+    return;
+  }
+}
+
+function configureSettingsSearch() {
+  const input = document.querySelector("#settings-search");
+  if (!input) {
+    return;
+  }
+  input.addEventListener("input", () => {
+    const query = input.value.trim().toLowerCase();
+    clearSearchHitMarks();
+    let firstHit = "";
+    for (const item of document.querySelectorAll(".settings-sidebar-item")) {
+      const id = item.dataset.settings || "";
+      const label = item.textContent.toLowerCase();
+      const keywords = SETTINGS_SEARCH_KEYWORDS[id] || [];
+      const content = panelSearchText(id);
+      const hit =
+        query === "" ||
+        label.includes(query) ||
+        content.includes(query) ||
+        keywords.some((keyword) => keyword.includes(query) || query.includes(keyword));
+      item.classList.toggle("search-hidden", !hit);
+      if (hit && !firstHit && query) {
+        firstHit = id;
+      }
+    }
+    if (firstHit) {
+      activateSettingsTab(firstHit);
+      markFirstContentHit(firstHit, query);
+    }
   });
 }
 
@@ -200,6 +312,7 @@ function renderSystemSummary(systemSummary) {
   const source = systemSummary.source || {};
 
   setField("device-did", shortDid(identity.device_did), "", identity.device_did);
+  syncDeviceDidCopy(identity.device_did);
   setAccessPolicy(access);
   setPasskeyAuthority(authority);
   setAppearance(appearance);
@@ -218,6 +331,69 @@ function setField(field, value, emptyText, titleValue) {
     }
     node.removeAttribute("title");
   }
+}
+
+function syncDeviceDidCopy(did) {
+  const button = document.querySelector("#device-did-copy");
+  if (!button) {
+    return;
+  }
+  const value = readText(did);
+  button.disabled = value.length === 0;
+  button.dataset.did = value;
+}
+
+function pulseCopyButton(button, restoreLabel = "Copy") {
+  if (!button) {
+    return;
+  }
+  const copyIcon = button.querySelector(".el-copy-icon");
+  const checkIcon = button.querySelector(".el-copy-check");
+  button.dataset.copied = "true";
+  button.setAttribute("aria-label", "Copied");
+  button.title = "Copied";
+  if (copyIcon) {
+    copyIcon.hidden = true;
+  }
+  if (checkIcon) {
+    checkIcon.hidden = false;
+  }
+  window.setTimeout(() => {
+    delete button.dataset.copied;
+    button.setAttribute("aria-label", restoreLabel);
+    button.title = "Copy";
+    if (copyIcon) {
+      copyIcon.hidden = false;
+    }
+    if (checkIcon) {
+      checkIcon.hidden = true;
+    }
+  }, 1400);
+}
+
+function configureDeviceDidCopy() {
+  const button = document.querySelector("#device-did-copy");
+  if (!button || button.dataset.bound === "true") {
+    return;
+  }
+  button.dataset.bound = "true";
+  button.addEventListener("click", async () => {
+    const value = readText(button.dataset.did);
+    if (!value) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(value);
+      pulseCopyButton(button, "Copy device identity");
+    } catch (_error) {
+      button.setAttribute("aria-label", "Copy failed");
+      button.title = "Copy failed";
+      window.setTimeout(() => {
+        button.setAttribute("aria-label", "Copy device identity");
+        button.title = "Copy";
+      }, 1500);
+    }
+  });
 }
 
 function setTextFields(field, value) {
@@ -833,7 +1009,7 @@ function shellPreviewKind(name) {
 
 function shellChoiceDescription(name, fallback = "") {
   if (name === "home-gui") {
-    return "Apps, windows and taskbar";
+    return "Apps, windows and Dock";
   }
   if (name === "home-cli") {
     return "Full-screen terminal";
@@ -1373,7 +1549,9 @@ function renderCapsuleCatalog(entries, interfaceEntries) {
   }
   capsuleCatalogNode.replaceChildren();
   if (entries.length === 0) {
-    capsuleCatalogNode.append(catalogEmpty("No apps or services are installed."));
+    capsuleCatalogNode.append(
+      catalogEmpty("No apps or services are installed. Discover apps in Marketplace."),
+    );
     return;
   }
   const entriesByName = new Map(entries.map((entry) => [readText(entry.name), entry]));

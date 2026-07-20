@@ -1,9 +1,12 @@
 import {
+  activeShellRoot,
   clearHomeAuthorityToken,
   fetchJson,
   setHomeAuthorityToken,
   trapTabWithin,
-} from "./shell-core.js?v=home-20260719q";
+} from "./shell-core.js?v=home-20260719y";
+
+const HOME_SESSION_LOCK_KEY = "elastos.home.session_lock";
 
 const unlockPanel = document.querySelector("#home-unlock");
 const unlockCard = document.querySelector(".home-unlock-card");
@@ -31,6 +34,56 @@ let selectedCredentialId = "";
 let guestRegistrationEnabled = false;
 let accountFocusIndex = 0;
 let unlockClockTimer = 0;
+let promptAccount = null;
+
+export function rememberHomeSessionLock(meta = {}) {
+  try {
+    const previous = readHomeSessionLockMeta() || {};
+    window.localStorage?.setItem(
+      HOME_SESSION_LOCK_KEY,
+      JSON.stringify({
+        locked: true,
+        credentialId: readText(meta.credentialId) || previous.credentialId || "",
+        principalId: readText(meta.principalId) || previous.principalId || "",
+        at: Date.now(),
+      }),
+    );
+  } catch (_error) {
+    // Persistence is best-effort; lock UI still works in this tab.
+  }
+}
+
+export function clearHomeSessionLock() {
+  try {
+    window.localStorage?.removeItem(HOME_SESSION_LOCK_KEY);
+  } catch (_error) {
+    // ignore
+  }
+}
+
+export function isHomeSessionLocked() {
+  return readHomeSessionLockMeta()?.locked === true;
+}
+
+function readHomeSessionLockMeta() {
+  try {
+    const raw = window.localStorage?.getItem(HOME_SESSION_LOCK_KEY);
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw);
+    if (parsed?.locked !== true) {
+      return null;
+    }
+    return {
+      locked: true,
+      credentialId: readText(parsed.credentialId),
+      principalId: readText(parsed.principalId),
+    };
+  } catch (_error) {
+    return null;
+  }
+}
 
 export function isHomeAuthError(error) {
   const status = Number(error && error.status);
@@ -40,21 +93,32 @@ export function isHomeAuthError(error) {
 export async function showHomeUnlock(onUnlocked, options = {}) {
   unlockCallback = typeof onUnlocked === "function" ? onUnlocked : null;
   unlockPresentation = options && options.presentation === "prompt" ? "prompt" : "modal";
-  const forceNeutralSurface = options && options.surface === "neutral";
   if (!unlockPanel) {
     throw new Error("Home unlock surface is missing");
   }
   document.body.dataset.homeStatus = unlockPresentation === "prompt" ? "ready" : "locked";
   unlockPanel.dataset.mode = unlockPresentation;
-  unlockPanel.dataset.surface = !forceNeutralSurface && document.body.dataset.homeShell === "desktop"
-    ? "desktop"
-    : "neutral";
+  // Honor an explicit surface request (session frost lock). Otherwise infer
+  // from the mounted shell — never treat "resolving" as desktop.
+  if (options.surface === "desktop") {
+    unlockPanel.dataset.surface = "desktop";
+  } else if (options.surface === "neutral") {
+    unlockPanel.dataset.surface = "neutral";
+  } else {
+    unlockPanel.dataset.surface =
+      document.body.dataset.homeShell === "desktop" ? "desktop" : "neutral";
+  }
   selectedCredentialId = "";
   loginAccounts = [];
+  promptAccount = null;
   renderUnlockChecking();
   unlockPanel.hidden = false;
   unlockPanel.setAttribute("aria-hidden", "false");
   unlockCard?.setAttribute("aria-modal", "true");
+  // Keep the signed-in shell out of the a11y/input tree while locked.
+  if (activeShellRoot) {
+    activeShellRoot.inert = true;
+  }
 
   if (!window.PublicKeyCredential) {
     unlockMode = "unsupported";
@@ -72,6 +136,16 @@ export async function showHomeUnlock(onUnlocked, options = {}) {
       unlockMode = "welcome";
     } else if (unlockPresentation === "prompt") {
       unlockMode = "prompt";
+      promptAccount = await resolvePromptAccount();
+      if (promptAccount) {
+        selectedCredentialId = promptAccount.credentialId;
+        if (options.surface === "desktop") {
+          rememberHomeSessionLock({
+            credentialId: promptAccount.credentialId,
+            principalId: promptAccount.principalId,
+          });
+        }
+      }
     } else {
       unlockMode = "picker";
     }
@@ -82,6 +156,9 @@ export async function showHomeUnlock(onUnlocked, options = {}) {
       setUnlockStatus("", "muted");
     }
     if (unlockMode === "picker" && loginAccounts.length > 0) {
+      focusAccountButton(0);
+    } else if (unlockMode === "prompt" && promptAccount) {
+      // Avatar is the unlock affordance — same as the account picker.
       focusAccountButton(0);
     } else {
       unlockPrimary?.focus();
@@ -118,6 +195,11 @@ function finishHideHomeUnlock() {
   delete unlockPanel.dataset.mode;
   delete unlockPanel.dataset.flow;
   delete unlockPanel.dataset.surface;
+  unlockTitle?.classList.remove("visually-hidden");
+  promptAccount = null;
+  if (activeShellRoot) {
+    activeShellRoot.inert = false;
+  }
   selectedCredentialId = "";
   setUnlockNameVisible(false);
   setUnlockStatus("", "muted");
@@ -168,7 +250,7 @@ export function bindHomeUnlock() {
       return;
     }
     if (unlockMode === "prompt") {
-      runPasskeySignIn().catch(reportUnlockError);
+      runPasskeySignIn({ credentialId: selectedCredentialId }).catch(reportUnlockError);
     }
   });
   unlockSecondary?.addEventListener("click", () => {
@@ -224,6 +306,7 @@ export async function signOutHome() {
     const detail = await response.text().catch(() => "");
     throw new Error(`request failed: ${response.status} ${response.statusText}${detail ? ` ${detail}` : ""}`);
   } finally {
+    clearHomeSessionLock();
     clearHomeAuthorityToken();
   }
 }
@@ -355,7 +438,9 @@ function renderUnlockMode() {
     unlockPanel.dataset.flow = unlockMode;
   }
 
-  if (picking) {
+  const frostPrompt =
+    prompting && unlockPanel?.dataset.surface === "desktop";
+  if (picking || frostPrompt) {
     startUnlockClock();
   } else {
     stopUnlockClock();
@@ -372,10 +457,12 @@ function renderUnlockMode() {
       // Visible chrome is logo + clock; heading stays for screen readers.
       unlockTitle.textContent = "Choose an account";
     } else if (prompting) {
-      unlockTitle.textContent = "Unlock to continue";
+      // Visible chrome is clock + avatar/name; heading stays for screen readers.
+      unlockTitle.textContent = "Unlock";
     } else {
       unlockTitle.textContent = "Sign in";
     }
+    unlockTitle.classList.toggle("visually-hidden", picking || frostPrompt);
   }
 
   if (unlockCopy) {
@@ -388,12 +475,10 @@ function renderUnlockMode() {
     } else if (creatingAdmin) {
       unlockCopy.hidden = false;
       unlockCopy.textContent = "Name this passkey, then create it on this device.";
-    } else if (picking) {
+    } else if (picking || prompting) {
+      // Picker + frost lock: identity chrome carries the message — no redundant copy.
       unlockCopy.hidden = true;
       unlockCopy.textContent = "";
-    } else if (prompting) {
-      unlockCopy.hidden = false;
-      unlockCopy.textContent = "Use your passkey to continue.";
     } else if (unsupported) {
       unlockCopy.hidden = false;
       unlockCopy.textContent = "Passkeys are required to unlock Home.";
@@ -407,26 +492,33 @@ function renderUnlockMode() {
     if (picking) {
       renderAccountPicker();
       unlockAccounts.hidden = loginAccounts.length === 0;
+    } else if (prompting && promptAccount) {
+      renderPromptIdentity(promptAccount);
+      unlockAccounts.hidden = false;
     } else {
       unlockAccounts.hidden = true;
       unlockAccounts.replaceChildren();
     }
   }
 
+  // Frost lock with a known account: click the avatar (login-picker energy).
+  // Keep the button only when we have no identity chrome to click.
+  const identityUnlock = (picking || (prompting && promptAccount));
+
   if (unlockActions) {
-    unlockActions.hidden = picking;
+    unlockActions.hidden = identityUnlock;
   }
 
   if (unlockPrimary) {
     unlockPrimary.textContent = welcoming
       ? "Get started"
-      : creatingGuest
+      : creatingGuest || creatingAdmin
         ? "Create passkey"
-        : creatingAdmin
-          ? "Create passkey"
+        : prompting
+          ? "Unlock"
           : "Continue";
     unlockPrimary.disabled = unsupported || busy;
-    unlockPrimary.hidden = picking;
+    unlockPrimary.hidden = identityUnlock;
   }
 
   if (unlockSecondary) {
@@ -442,62 +534,126 @@ function renderUnlockMode() {
   setUnlockNameVisible(creatingAdmin || creatingGuest);
 }
 
+function buildAccountButton(account, index, { role = "radio", selected = false } = {}) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "home-unlock-account";
+  button.dataset.credentialId = account.credentialId;
+  button.setAttribute("role", role);
+  if (role === "radio") {
+    button.setAttribute("aria-checked", selected ? "true" : "false");
+  }
+  button.tabIndex = index === accountFocusIndex || selected ? 0 : -1;
+  const roleLabel = account.role === "guest" ? "Guest" : "Admin";
+  button.setAttribute("aria-label", `${account.displayName}, ${roleLabel}`);
+  button.title = account.displayName;
+  if (selected) {
+    button.classList.add("is-selected");
+  }
+
+  const avatar = document.createElement("span");
+  avatar.className = "home-unlock-avatar";
+  avatar.setAttribute("aria-hidden", "true");
+  avatar.style.background = avatarColorForId(account.principalId);
+  const monogram = document.createElement("span");
+  monogram.className = "home-unlock-avatar-monogram";
+  monogram.textContent = monogramForName(account.displayName);
+  avatar.append(monogram);
+  if (account.avatarCid) {
+    const image = document.createElement("img");
+    image.className = "home-unlock-avatar-image";
+    image.alt = "";
+    image.decoding = "async";
+    image.src =
+      `/api/auth/passkey/account-avatar?credential_id=${encodeURIComponent(account.credentialId)}&v=${encodeURIComponent(account.avatarCid)}`;
+    image.addEventListener("load", () => {
+      avatar.classList.add("has-photo");
+    });
+    image.addEventListener("error", () => {
+      image.remove();
+      avatar.classList.remove("has-photo");
+    });
+    avatar.append(image);
+  }
+
+  const name = document.createElement("span");
+  name.className = "home-unlock-account-name";
+  name.textContent = account.displayName;
+
+  button.append(avatar, name);
+  if (account.role === "guest") {
+    const guest = document.createElement("span");
+    guest.className = "home-unlock-account-role";
+    guest.textContent = "Guest";
+    button.append(guest);
+  }
+  return button;
+}
+
 function renderAccountPicker() {
   if (!unlockAccounts) {
     return;
   }
   unlockAccounts.replaceChildren();
   loginAccounts.forEach((account, index) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "home-unlock-account";
-    button.dataset.credentialId = account.credentialId;
-    button.setAttribute("role", "radio");
-    button.setAttribute("aria-checked", "false");
-    button.tabIndex = index === accountFocusIndex ? 0 : -1;
-    const roleLabel = account.role === "guest" ? "Guest" : "Admin";
-    button.setAttribute("aria-label", `${account.displayName}, ${roleLabel}`);
-    button.title = account.displayName;
-
-    const avatar = document.createElement("span");
-    avatar.className = "home-unlock-avatar";
-    avatar.setAttribute("aria-hidden", "true");
-    avatar.style.background = avatarColorForId(account.principalId);
-    const monogram = document.createElement("span");
-    monogram.className = "home-unlock-avatar-monogram";
-    monogram.textContent = monogramForName(account.displayName);
-    avatar.append(monogram);
-    if (account.avatarCid) {
-      const image = document.createElement("img");
-      image.className = "home-unlock-avatar-image";
-      image.alt = "";
-      image.decoding = "async";
-      image.src =
-        `/api/auth/passkey/account-avatar?credential_id=${encodeURIComponent(account.credentialId)}&v=${encodeURIComponent(account.avatarCid)}`;
-      image.addEventListener("load", () => {
-        avatar.classList.add("has-photo");
-      });
-      image.addEventListener("error", () => {
-        image.remove();
-        avatar.classList.remove("has-photo");
-      });
-      avatar.append(image);
-    }
-
-    const name = document.createElement("span");
-    name.className = "home-unlock-account-name";
-    name.textContent = account.displayName;
-
-    button.append(avatar, name);
-    if (account.role === "guest") {
-      const role = document.createElement("span");
-      role.className = "home-unlock-account-role";
-      role.textContent = "Guest";
-      button.append(role);
-    }
-    unlockAccounts.append(button);
+    unlockAccounts.append(buildAccountButton(account, index, { role: "radio" }));
   });
   syncAccountSelection();
+}
+
+function renderPromptIdentity(account) {
+  if (!unlockAccounts || !account) {
+    return;
+  }
+  unlockAccounts.replaceChildren();
+  unlockAccounts.append(
+    buildAccountButton(account, 0, { role: "button", selected: true }),
+  );
+}
+
+async function resolvePromptAccount() {
+  if (!loginAccounts.length) {
+    return null;
+  }
+  const lockMeta = readHomeSessionLockMeta();
+  if (lockMeta?.credentialId) {
+    const locked = loginAccounts.find(
+      (entry) => entry.credentialId === lockMeta.credentialId,
+    );
+    if (locked) {
+      return locked;
+    }
+  }
+  if (lockMeta?.principalId) {
+    const locked = loginAccounts.find(
+      (entry) => entry.principalId === lockMeta.principalId,
+    );
+    if (locked) {
+      return locked;
+    }
+  }
+  try {
+    const summary = await fetchJson("/api/apps/home/summary");
+    const principalId = readText(summary?.identity?.principal_id);
+    const displayName = readText(summary?.identity?.profile_card?.display_name);
+    if (principalId) {
+      const match = loginAccounts.find((entry) => entry.principalId === principalId);
+      if (match) {
+        return match;
+      }
+    }
+    if (displayName) {
+      const match = loginAccounts.find(
+        (entry) => entry.displayName.toLowerCase() === displayName.toLowerCase(),
+      );
+      if (match) {
+        return match;
+      }
+    }
+  } catch (_error) {
+    // Fall through to last-used heuristic.
+  }
+  return [...loginAccounts].sort((a, b) => b.lastUsedAt - a.lastUsedAt)[0] || null;
 }
 
 function syncAccountSelection() {
@@ -623,12 +779,20 @@ async function runPasskeySignIn(options = {}) {
 }
 
 async function unlockComplete() {
-  setUnlockStatus("Opening Home…", "success");
-  if (unlockCallback) {
-    await unlockCallback();
+  clearHomeSessionLock();
+  // Dismiss the gate first. Frost lock used to await session/summary refresh
+  // and return without hideHomeUnlock() — UI stuck on "Opening Home…".
+  const callback = unlockCallback;
+  unlockCallback = null;
+  hideHomeUnlock();
+  if (!callback) {
     return;
   }
-  hideHomeUnlock();
+  try {
+    await callback();
+  } catch (error) {
+    console.error("home unlock callback failed", error);
+  }
 }
 
 function reportUnlockError(error) {

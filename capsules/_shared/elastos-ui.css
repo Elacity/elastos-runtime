@@ -236,6 +236,25 @@
   color: var(--el-soft);
 }
 
+/* Copy affordance: icon flips to a check briefly after a successful copy.
+   Apps mount both .el-copy-icon and .el-copy-check children, then set
+   data-copied="true" for ~1.4s (see System DID / Library properties). */
+.el-copy-btn {
+  display: inline-grid;
+  place-items: center;
+  color: var(--el-muted);
+  cursor: pointer;
+}
+
+.el-copy-btn[data-copied="true"] {
+  color: var(--el-ok);
+}
+
+.el-copy-btn .el-copy-check[hidden],
+.el-copy-btn .el-copy-icon[hidden] {
+  display: none;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .el-app *,
   .el-app *::before,

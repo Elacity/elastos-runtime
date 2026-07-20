@@ -44,18 +44,17 @@
 
     :root[data-el-theme="light"] .entry-action:hover,
     :root[data-el-theme="light"] .entry-action:focus-visible {
-      background: #f9fafb;
+      background: var(--el-inset);
     }
-
 
     :root[data-el-theme="light"] .entry-action.primary {
       background: var(--text);
-      color: #f8fbff;
+      color: var(--el-surface-raised);
     }
 
     :root[data-el-theme="light"] .entry-action.danger {
-      border-color: rgba(177, 76, 90, 0.24);
-      background: rgba(177, 76, 90, 0.08);
+      border-color: color-mix(in srgb, var(--el-danger) 24%, transparent);
+      background: color-mix(in srgb, var(--el-danger) 8%, transparent);
     }
 
     * {
@@ -456,6 +455,74 @@
       text-align: center;
     }
 
+    .empty-state h2 {
+      font-size: 16px;
+    }
+
+    .empty-state .muted {
+      margin-top: 6px;
+      font-size: 13px;
+    }
+
+    /* Rail: Home owns title/Open/Close. Single-column cards with inline actions. */
+    html[data-inbox-presentation="rail"] .sidebar {
+      display: none;
+    }
+
+    html[data-inbox-presentation="rail"] .shell {
+      grid-template-columns: 1fr;
+    }
+
+    html[data-inbox-presentation="rail"] .toolbar {
+      display: none;
+    }
+
+    html[data-inbox-presentation="rail"] .toolbar-title h1 {
+      display: none;
+    }
+
+    html[data-inbox-presentation="rail"] .entry-split {
+      grid-template-columns: 1fr;
+    }
+
+    html[data-inbox-presentation="rail"] .entry-detail {
+      display: none;
+    }
+
+    html[data-inbox-presentation="rail"] .entry-rows {
+      padding: 8px;
+      gap: 8px;
+      border-right: 0;
+    }
+
+    html[data-inbox-presentation="rail"] .entry-rail-card {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-soft);
+    }
+
+    html[data-inbox-presentation="rail"] .entry-rail-card .entry-row-title {
+      white-space: normal;
+      font-size: 13px;
+    }
+
+    html[data-inbox-presentation="rail"] .entry-rail-card .entry-row-snippet {
+      white-space: normal;
+      display: -webkit-box;
+      -webkit-line-clamp: 3;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+
+    html[data-inbox-presentation="rail"] .entry-rail-card .entry-actions {
+      margin-top: 8px;
+      padding-top: 10px;
+    }
+
     @media (max-width: 900px) {
       .shell {
         grid-template-columns: 1fr;
@@ -537,7 +604,7 @@
       <div class="toolbar">
         <div class="toolbar-title">
           <h1 id="list-title">Requests</h1>
-          <p id="status-text" class="status">Loading...</p>
+          <p id="status-text" class="status">Loading…</p>
         </div>
         <button id="refresh" class="action-secondary" type="button">Refresh</button>
       </div>
@@ -549,6 +616,7 @@
       <section id="empty-state" class="empty-state hidden">
         <div>
           <h2>No requests</h2>
+          <p class="muted">Approvals and connection requests will show up here.</p>
         </div>
       </section>
     </main>
@@ -558,6 +626,8 @@
     const INBOX_SAFETY_REFRESH_MS = 5 * 60 * 1000;
     const launchParams = new URLSearchParams(window.location.search);
     const homeParentOrigin = launchParams.get("home_origin") || "";
+    const presentation = launchParams.get("presentation") === "rail" ? "rail" : "window";
+    document.documentElement.dataset.inboxPresentation = presentation;
 
     const state = {
       homeToken: new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "",
@@ -571,6 +641,16 @@
     if (state.homeToken && homeParentOrigin && window.top !== window) {
       window.top.postMessage({ type: "home:app-ready", homeToken: state.homeToken }, homeParentOrigin);
     }
+
+    window.addEventListener("message", (event) => {
+      if (event.origin !== "null" || event.source !== window.parent) {
+        return;
+      }
+      const message = event.data || {};
+      if (message.type === "elastos:inbox-chrome-command" && message.cmd === "refresh") {
+        void requestInboxRefresh().catch(() => {});
+      }
+    });
 
     const elements = {
       lockedShell: document.getElementById("locked-shell"),
@@ -619,6 +699,15 @@
           homeToken: state.homeToken,
         }, homeParentOrigin);
       }
+      notifyRailChrome();
+    }
+
+    function notifyRailChrome() {
+      if (presentation !== "rail" || window.parent === window) {
+        return;
+      }
+      const pending = state.entries.filter((entry) => !entry.read).length;
+      window.parent.postMessage({ type: "inbox:pending-count", count: pending }, "*");
     }
 
     function runtimeEventIsRelevant(event) {
@@ -710,6 +799,7 @@
       state.entries = Array.isArray(notifications.entries) ? notifications.entries : [];
       renderInbox(notifications);
       markVisibleRead(notifications);
+      notifyRailChrome();
       notifyHome();
     }
 
@@ -760,15 +850,23 @@
       }
 
       elements.entryRows.replaceChildren();
-      for (const entry of entries) {
-        elements.entryRows.appendChild(createRow(entry));
+      if (presentation === "rail") {
+        for (const entry of entries) {
+          elements.entryRows.appendChild(createRailCard(entry));
+        }
+        elements.entryDetail.replaceChildren();
+      } else {
+        for (const entry of entries) {
+          elements.entryRows.appendChild(createRow(entry));
+        }
+        renderDetail(entries.find((entry) => entry.id === state.selectedId) || null);
       }
-      renderDetail(entries.find((entry) => entry.id === state.selectedId) || null);
 
       const empty = entries.length === 0;
       elements.emptyState.classList.toggle("hidden", !empty);
       elements.entrySplit.classList.toggle("hidden", empty);
       setStatus(state.entries.length === 0 ? "" : `${state.entries.length} pending.`);
+      notifyRailChrome();
     }
 
     function createRow(entry) {
@@ -800,6 +898,81 @@
         renderInbox(state.lastNotifications);
       });
       return row;
+    }
+
+    function createRailCard(entry) {
+      const card = document.createElement("article");
+      card.className = "entry-rail-card";
+      if (!entry.read) {
+        card.classList.add("entry-row-unread");
+      }
+
+      const top = document.createElement("div");
+      top.className = "entry-row-top";
+      const title = document.createElement("span");
+      title.className = "entry-row-title";
+      title.textContent = publicInboxText(entry.title, "Request");
+      const time = document.createElement("span");
+      time.className = "entry-row-time";
+      time.textContent = entry.created_at ? formatInboxTime(entry.created_at) : "";
+      top.append(title, time);
+
+      const snippet = document.createElement("span");
+      snippet.className = "entry-row-snippet";
+      snippet.textContent = publicInboxText(entry.body, "This request needs your review.");
+
+      const actions = document.createElement("div");
+      actions.className = "entry-actions";
+      fillEntryActions(actions, entry);
+
+      card.append(top, snippet, actions);
+      return card;
+    }
+
+    function fillEntryActions(actions, entry) {
+      if (typeof entry.source_app === "string" && entry.source_app.trim()) {
+        actions.appendChild(createButton("Open", () => openSource(entry.source_app)));
+      }
+
+      const actionId = entry.action_ref && entry.action_ref.action_id;
+      if (typeof actionId === "string" && actionId.startsWith("room-approve-request:")) {
+        actions.appendChild(createActionButton("Approve", actionId, "primary"));
+        actions.appendChild(createActionButton("Deny", "room-deny-request:" + actionId.slice("room-approve-request:".length), "danger"));
+      } else if (typeof actionId === "string" && actionId.startsWith("wallet-approve-request:")) {
+        const requestId = actionId.slice("wallet-approve-request:".length);
+        actions.appendChild(createButton("Approve", (button) => approveWalletRequest(button, requestId), "primary"));
+        actions.appendChild(createButton("Review in Wallet", () => openSource("wallet", { wallet_request: requestId })));
+        actions.appendChild(createActionButton("Reject", "wallet-reject-request:" + actionId.slice("wallet-approve-request:".length), "danger"));
+      } else if (typeof actionId === "string" && actionId.startsWith("capability-approve-request:")) {
+        actions.appendChild(createActionButton("Approve", actionId, "primary"));
+        actions.appendChild(createActionButton("Deny", "capability-deny-request:" + actionId.slice("capability-approve-request:".length), "danger"));
+      } else if (typeof actionId === "string" && actionId.startsWith("inspect-approve-request:")) {
+        const requestId = actionId.slice("inspect-approve-request:".length);
+        const approveButton = createButton("Approve", (button) => approveInspectRequest(button, requestId), "primary");
+        approveButton.dataset.actionId = actionId;
+        actions.appendChild(approveButton);
+        actions.appendChild(createButton("Deny", () => denyInspectRequest(requestId), "danger"));
+      } else if (typeof actionId === "string" && actionId.startsWith("wallet-price-http-approve:")) {
+        actions.appendChild(createActionButton("Approve", actionId, "primary"));
+        actions.appendChild(createActionButton("Reject", "wallet-price-http-deny:" + actionId.slice("wallet-price-http-approve:".length), "danger"));
+      } else if (typeof actionId === "string" && actionId.startsWith("service-approve-request:")) {
+        actions.appendChild(createActionButton("Approve", actionId, "primary"));
+        actions.appendChild(createActionButton(
+          "Deny",
+          "service-deny-request:" + actionId.slice("service-approve-request:".length),
+          "danger",
+        ));
+      }
+
+      if (
+        entry.kind !== "wallet_approval_request" &&
+        entry.kind !== "capability_request" &&
+        entry.kind !== "inspect_action_request" &&
+        entry.kind !== "external_http_request" &&
+        entry.kind !== "service_access_request"
+      ) {
+        actions.appendChild(createActionButton("Dismiss", "notification-dismiss:" + entry.id));
+      }
     }
 
     function renderDetail(entry) {
@@ -844,36 +1017,7 @@
 
       const actions = document.createElement("div");
       actions.className = "entry-actions";
-      if (typeof entry.source_app === "string" && entry.source_app.trim()) {
-        actions.appendChild(createButton("Open", () => openSource(entry.source_app)));
-      }
-
-      const actionId = entry.action_ref && entry.action_ref.action_id;
-      if (typeof actionId === "string" && actionId.startsWith("room-approve-request:")) {
-        actions.appendChild(createActionButton("Approve", actionId, "primary"));
-        actions.appendChild(createActionButton("Deny", "room-deny-request:" + actionId.slice("room-approve-request:".length), "danger"));
-      } else if (typeof actionId === "string" && actionId.startsWith("wallet-approve-request:")) {
-        const requestId = actionId.slice("wallet-approve-request:".length);
-        actions.appendChild(createButton("Approve", (button) => approveWalletRequest(button, requestId), "primary"));
-        actions.appendChild(createButton("Review in Wallet", () => openSource("wallet", { wallet_request: requestId })));
-        actions.appendChild(createActionButton("Reject", "wallet-reject-request:" + actionId.slice("wallet-approve-request:".length), "danger"));
-      } else if (typeof actionId === "string" && actionId.startsWith("capability-approve-request:")) {
-        actions.appendChild(createActionButton("Approve", actionId, "primary"));
-        actions.appendChild(createActionButton("Deny", "capability-deny-request:" + actionId.slice("capability-approve-request:".length), "danger"));
-      } else if (typeof actionId === "string" && actionId.startsWith("inspect-approve-request:")) {
-        const requestId = actionId.slice("inspect-approve-request:".length);
-        const approveButton = createButton("Approve", (button) => approveInspectRequest(button, requestId), "primary");
-        approveButton.dataset.actionId = actionId;
-        actions.appendChild(approveButton);
-        actions.appendChild(createButton("Deny", () => denyInspectRequest(requestId), "danger"));
-      } else if (typeof actionId === "string" && actionId.startsWith("wallet-price-http-approve:")) {
-        actions.appendChild(createActionButton("Approve", actionId, "primary"));
-        actions.appendChild(createActionButton("Reject", "wallet-price-http-deny:" + actionId.slice("wallet-price-http-approve:".length), "danger"));
-      }
-
-      if (entry.kind !== "wallet_approval_request" && entry.kind !== "capability_request" && entry.kind !== "inspect_action_request" && entry.kind !== "external_http_request") {
-        actions.appendChild(createActionButton("Dismiss", "notification-dismiss:" + entry.id));
-      }
+      fillEntryActions(actions, entry);
       elements.entryDetail.append(titleRow, time, body, actions);
     }
 
@@ -899,11 +1043,42 @@
     async function runAction(actionId) {
       setButtonsDisabled(true);
       try {
+        const passkeyApprove = passkeyBoundApprove(actionId);
+        if (passkeyApprove) {
+          setStatus("Confirm with your passkey to approve.");
+          const homeToken = await requestFreshPasskeyHomeToken(passkeyApprove.operation, {
+            request_id: passkeyApprove.requestId,
+          });
+          await inboxAction(actionId, { home_token: homeToken }, homeToken);
+          setStatus("Approved.");
+          await loadInbox();
+          notifyHome();
+          return;
+        }
         await inboxAction(actionId);
         await loadInbox();
+      } catch (error) {
+        setStatus(String(error.message || error));
       } finally {
         setButtonsDisabled(false);
       }
+    }
+
+    function passkeyBoundApprove(actionId) {
+      if (typeof actionId !== "string") {
+        return null;
+      }
+      const pairs = [
+        ["room-approve-request:", "room.approve"],
+        ["capability-approve-request:", "capability.approve"],
+        ["service-approve-request:", "service.approve"],
+      ];
+      for (const [prefix, operation] of pairs) {
+        if (actionId.startsWith(prefix)) {
+          return { operation, requestId: actionId.slice(prefix.length) };
+        }
+      }
+      return null;
     }
 
     async function approveWalletRequest(button, requestId) {

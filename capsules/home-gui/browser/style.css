@@ -3,6 +3,7 @@
 
 :root {
   color-scheme: dark;
+  --accent: var(--el-accent, #0a84ff);
   --bg: #050608;
   --panel: rgba(22, 24, 29, 0.78);
   --panel-strong: rgba(22, 24, 29, 0.92);
@@ -21,6 +22,8 @@
   --brand-line: rgba(246, 146, 26, 0.45);
   --shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
   --shadow-soft: 0 12px 28px rgba(0, 0, 0, 0.22);
+  --popover-radius: 14px;
+  --popover-shadow: var(--shadow-soft);
   --window-head-hue: 214;
   --window-head-saturation: 7%;
   --window-head-lightness: 40%;
@@ -37,6 +40,11 @@
   --taskbar-h: 60px;
   --taskbar-offset: 12px;
   --desktop-wallpaper: url("./wallpaper.webp");
+  /* Shell chrome motion — water, not switches. */
+  --shell-motion-enter: 160ms;
+  --shell-motion-leave: 120ms;
+  --shell-motion-enter-ease: cubic-bezier(0.2, 0, 0, 1);
+  --shell-motion-leave-ease: cubic-bezier(0.4, 0, 1, 1);
 }
 
 * {
@@ -121,6 +129,18 @@ img {
 :root[data-el-theme="light"] {
   --lift: rgba(29, 36, 56, 0.08);
   --lift-strong: rgba(29, 36, 56, 0.14);
+}
+
+.visually-hidden {
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 /* Base resets (*, html/body, button, img, .visually-hidden, .hide-scrollbar)
@@ -270,7 +290,7 @@ img {
   top: calc(100% + 8px);
   left: 0;
   z-index: 100120;
-  min-width: 210px;
+  min-width: 228px;
   padding: 5px;
   display: grid;
   gap: 2px;
@@ -280,11 +300,18 @@ img {
   box-shadow: var(--shadow-soft);
   backdrop-filter: blur(16px);
   transform-origin: top left;
-  animation: bar-menu-enter 140ms cubic-bezier(0.2, 0, 0, 1) both;
+  animation: bar-menu-enter var(--shell-motion-enter) var(--shell-motion-enter-ease) both;
 }
 
 .toolbar-identity-menu[hidden] {
   display: none;
+}
+
+.toolbar-identity-menu.bar-menu-leaving,
+.toolbar-menu-popover.bar-menu-leaving,
+.context-menu.bar-menu-leaving {
+  animation: bar-menu-leave var(--shell-motion-leave) var(--shell-motion-leave-ease) both;
+  pointer-events: none;
 }
 
 @keyframes bar-menu-enter {
@@ -298,17 +325,75 @@ img {
   }
 }
 
+@keyframes bar-menu-leave {
+  from {
+    opacity: 1;
+    transform: none;
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .toolbar-identity-menu {
+  .toolbar-identity-menu,
+  .toolbar-identity-menu.bar-menu-leaving,
+  .toolbar-menu-popover.bar-menu-leaving,
+  .context-menu.bar-menu-leaving {
     animation: none;
   }
 }
 
 .toolbar-identity-header {
-  padding: 7px 10px 6px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px 7px;
   color: var(--soft);
   font-size: 12px;
   line-height: 1.35;
+}
+
+.toolbar-identity-menu-avatar {
+  position: relative;
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 999px;
+  color: #fff;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+}
+
+.toolbar-identity-menu-avatar[hidden] {
+  display: none;
+}
+
+.toolbar-identity-menu-monogram {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  line-height: 1;
+  user-select: none;
+}
+
+.toolbar-identity-menu-avatar-image {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.toolbar-identity-menu-avatar-image[hidden] {
+  display: none;
+}
+
+.toolbar-identity-header-copy {
+  min-width: 0;
 }
 
 .toolbar-identity-header strong {
@@ -319,6 +404,7 @@ img {
 .toolbar-identity-item {
   display: flex;
   align-items: center;
+  gap: 8px;
   width: 100%;
   min-height: 32px;
   padding: 0 10px;
@@ -330,6 +416,11 @@ img {
 }
 
 /* Right-aligned shortcut glyph inside a menu item (macOS menu grammar). */
+.toolbar-identity-item-icon {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
 .toolbar-identity-shortcut {
   margin-left: auto;
   padding-left: 18px;
@@ -417,10 +508,18 @@ img {
   box-shadow: var(--shadow-soft);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
+  transform-origin: top left;
+  animation: bar-menu-enter var(--shell-motion-enter) var(--shell-motion-enter-ease) both;
 }
 
 .toolbar-menu-popover[hidden] {
   display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toolbar-menu-popover {
+    animation: none;
+  }
 }
 
 .toolbar-menu-item {
@@ -519,7 +618,7 @@ img {
   white-space: nowrap;
   opacity: 0.9;
   font-variant-numeric: tabular-nums;
-  cursor: default;
+  cursor: pointer;
 }
 
 .toolbar-clock:hover,
@@ -528,8 +627,8 @@ img {
   opacity: 1;
 }
 
-/* Notification Center: the memory behind the toast. Slides in under the bar
-   at the right edge, same frosted material as the other bar menus. */
+/* Notification Center + Control Centre: menubar status cards — drop down
+   from the bar (Apple Wi‑Fi / Control Center), not side rails. */
 .notification-center {
   position: fixed;
   top: calc(var(--stage-top) + 8px);
@@ -540,24 +639,31 @@ img {
   width: min(340px, calc(100vw - 16px));
   max-height: calc(100dvh - var(--stage-top) - var(--stage-bottom) - 24px);
   padding: 10px;
-  border-radius: 14px;
+  border-radius: var(--popover-radius);
   background: var(--menu-fill);
   border: 1px solid var(--line);
-  box-shadow: var(--shadow-soft);
+  box-shadow: var(--popover-shadow);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
   outline: none;
-  animation: notification-center-enter 140ms cubic-bezier(0.2, 0, 0, 1) both;
+  transform-origin: top right;
+  animation: menubar-card-enter var(--shell-motion-enter) var(--shell-motion-enter-ease) both;
 }
 
 .notification-center[hidden] {
   display: none;
 }
 
-@keyframes notification-center-enter {
+.notification-center.menubar-card-leaving,
+.control-centre.menubar-card-leaving {
+  animation: menubar-card-leave var(--shell-motion-leave) var(--shell-motion-leave-ease) both;
+  pointer-events: none;
+}
+
+@keyframes menubar-card-enter {
   from {
     opacity: 0;
-    transform: translateX(12px);
+    transform: translateY(-8px) scale(0.98);
   }
   to {
     opacity: 1;
@@ -565,8 +671,21 @@ img {
   }
 }
 
+@keyframes menubar-card-leave {
+  from {
+    opacity: 1;
+    transform: none;
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.98);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .notification-center {
+  .notification-center,
+  .notification-center.menubar-card-leaving,
+  .control-centre.menubar-card-leaving {
     animation: none;
   }
 }
@@ -624,15 +743,19 @@ img {
   flex-direction: column;
   gap: 4px;
   width: min(300px, calc(100vw - 16px));
+  max-height: calc(100vh - var(--stage-top) - var(--stage-bottom) - 24px);
+  overflow-x: hidden;
+  overflow-y: auto;
   padding: 12px;
-  border-radius: 14px;
+  border-radius: var(--popover-radius);
   background: var(--menu-fill);
   border: 1px solid var(--line);
-  box-shadow: var(--shadow-soft);
+  box-shadow: var(--popover-shadow);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
   outline: none;
-  animation: notification-center-enter 140ms cubic-bezier(0.2, 0, 0, 1) both;
+  transform-origin: top right;
+  animation: menubar-card-enter var(--shell-motion-enter) var(--shell-motion-enter-ease) both;
 }
 
 .control-centre[hidden] {
@@ -643,6 +766,16 @@ img {
   .control-centre {
     animation: none;
   }
+}
+
+.control-centre-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.control-centre-section + .control-centre-section {
+  margin-top: 10px;
 }
 
 .control-centre-label {
@@ -712,6 +845,78 @@ img {
   }
 }
 
+.control-centre-accents {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 2px 2px 4px;
+}
+
+.control-centre-accent-swatch {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid rgba(0, 0, 0, 0.25);
+  border-radius: 50%;
+  cursor: pointer;
+  background: #888;
+}
+
+.control-centre-accent-swatch:hover {
+  transform: scale(1.12);
+}
+
+.control-centre-accent-swatch[aria-checked="true"] {
+  box-shadow:
+    0 0 0 2px var(--frame-fill),
+    0 0 0 4px currentColor;
+}
+
+.control-centre-accent-swatch:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+.control-centre-accent-swatch[data-accent-option="blue"] {
+  background: #0a84ff;
+  color: #0a84ff;
+}
+
+.control-centre-accent-swatch[data-accent-option="purple"] {
+  background: #bf5af2;
+  color: #bf5af2;
+}
+
+.control-centre-accent-swatch[data-accent-option="pink"] {
+  background: #ff375f;
+  color: #ff375f;
+}
+
+.control-centre-accent-swatch[data-accent-option="red"] {
+  background: #ff453a;
+  color: #ff453a;
+}
+
+.control-centre-accent-swatch[data-accent-option="orange"] {
+  background: var(--brand);
+  color: var(--brand);
+}
+
+.control-centre-accent-swatch[data-accent-option="yellow"] {
+  background: #ffd60a;
+  color: #ffd60a;
+}
+
+.control-centre-accent-swatch[data-accent-option="green"] {
+  background: #30b84f;
+  color: #30b84f;
+}
+
+.control-centre-accent-swatch[data-accent-option="graphite"] {
+  background: #8e8e93;
+  color: #8e8e93;
+}
+
 .control-centre-divider {
   height: 1px;
   margin: 6px 2px;
@@ -745,6 +950,21 @@ img {
 .control-centre-row-detail {
   color: var(--muted);
   font-size: 12.5px;
+}
+
+.control-centre-row-static {
+  cursor: default;
+}
+
+.control-centre-row-static:hover {
+  background: transparent;
+}
+
+.control-centre-hint {
+  margin: 0 10px 4px;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.35;
 }
 
 /* iOS-grammar switch, pure CSS, driven by aria-checked. */
@@ -799,7 +1019,7 @@ img {
   display: flex;
   flex-direction: column;
   width: min(392px, calc(100vw - 16px));
-  border-radius: 14px;
+  border-radius: var(--popover-radius);
   /* Opaque fill — frosted glass was picking up the wallpaper's violet band
      along the bottom edge. Same card shape, no color bleed. */
   background: var(--frame-fill);
@@ -911,6 +1131,26 @@ img {
   flex: 0 0 auto;
 }
 
+#inbox-rail-refresh.is-refreshing .wallet-rail-icon-svg {
+  animation: inbox-rail-refresh-spin 700ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+@keyframes inbox-rail-refresh-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #inbox-rail-refresh.is-refreshing .wallet-rail-icon-svg {
+    animation: none;
+    opacity: 0.55;
+  }
+}
+
 .wallet-rail-badge {
   position: absolute;
   top: -3px;
@@ -921,7 +1161,7 @@ img {
   height: 14px;
   padding: 0 3px;
   border-radius: 999px;
-  background: var(--accent, #007aff);
+  background: var(--accent);
   color: #fff;
   font-size: 9px;
   font-weight: 700;
@@ -1020,10 +1260,10 @@ img {
   display: flex;
   flex-direction: column;
   width: min(392px, calc(100vw - 16px));
-  border-radius: 14px;
+  border-radius: var(--popover-radius);
   background: var(--frame-fill);
   border: 1px solid var(--line);
-  box-shadow: var(--shadow-soft);
+  box-shadow: var(--popover-shadow);
   outline: none;
   overflow: hidden;
   animation: wallet-rail-enter 240ms cubic-bezier(0.2, 0, 0, 1) both;
@@ -1070,6 +1310,91 @@ img {
 
 .connector-sheet-frame[hidden] {
   display: none;
+}
+
+.nc-cal {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 4px 6px 12px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 4px;
+}
+
+.nc-cal-primary {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.nc-cal-date {
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 620;
+  letter-spacing: -0.015em;
+  line-height: 1.2;
+}
+
+.nc-cal-time {
+  color: var(--text);
+  font-size: 22px;
+  font-weight: 560;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+  line-height: 1;
+}
+
+.nc-cal-month {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.nc-cal-weekdays,
+.nc-cal-row {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(28px, 1fr));
+  gap: 2px;
+  justify-items: center;
+}
+
+.nc-cal-weekday {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  line-height: 28px;
+  text-transform: uppercase;
+}
+
+.nc-cal-day {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  color: var(--text);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.nc-cal-day.is-empty {
+  visibility: hidden;
+}
+
+.nc-cal-day.is-today {
+  background: var(--brand, var(--el-accent, #5b8cff));
+  color: #111;
+  font-weight: 700;
+}
+
+@media (max-height: 700px) {
+  .nc-cal-month {
+    display: none;
+  }
 }
 
 .notification-center-head {
@@ -1499,11 +1824,20 @@ img {
   border-radius: 22px;
 }
 
-/* Exposé-lite: windows become selectable cards; pointer events on the stage
+/* Show Windows: windows become selectable cards; pointer events on the stage
    catch dismiss-outside. Transforms are applied inline (transform-only). */
+body.expose-active {
+  cursor: default;
+}
+
 body.expose-active .desktop-shortcuts {
   pointer-events: none;
-  opacity: 0.35;
+  opacity: 0.28;
+}
+
+body.expose-active .window:not(.expose-card) {
+  opacity: 0.2;
+  pointer-events: none;
 }
 
 body.expose-active .window.expose-card {
@@ -1513,6 +1847,61 @@ body.expose-active .window.expose-card {
 
 body.expose-active .window.expose-card .window-frame {
   pointer-events: none;
+}
+
+body.expose-active .window.expose-card-active {
+  outline: 2px solid var(--el-accent, var(--accent, #5b8cff));
+  outline-offset: 4px;
+}
+
+.expose-caption {
+  position: absolute;
+  left: 50%;
+  bottom: -26px;
+  transform: translateX(-50%);
+  max-width: min(220px, 90%);
+  padding: 3px 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--el-surface, #1c1c1e) 92%, transparent);
+  color: var(--el-label, #f5f5f7);
+  font-size: 12px;
+  font-weight: 560;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+}
+
+.expose-empty {
+  position: absolute;
+  inset: 0;
+  z-index: 190000;
+  display: grid;
+  place-content: center;
+  gap: 6px;
+  text-align: center;
+  pointer-events: none;
+  color: var(--el-label, #f5f5f7);
+}
+
+.expose-empty[hidden] {
+  display: none;
+}
+
+.expose-empty-title {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 620;
+  letter-spacing: -0.02em;
+}
+
+.expose-empty-hint {
+  margin: 0;
+  max-width: 28rem;
+  font-size: 13px;
+  opacity: 0.72;
 }
 
 /* Red count badge on the drag ghost when moving a multi-selection (macOS). */
@@ -1534,9 +1923,27 @@ body.expose-active .window.expose-card .window-frame {
 }
 
 .desktop-shortcut-icon {
+  position: relative;
   width: 56px;
   height: 56px;
   border-radius: 16px;
+}
+
+/* macOS-style alias badge — app shortcuts only, never real desktop objects. */
+.desktop-shortcut[data-kind="alias"] .desktop-shortcut-icon::after {
+  content: "";
+  position: absolute;
+  left: 1px;
+  bottom: 1px;
+  width: 15px;
+  height: 15px;
+  border-radius: 3px;
+  background:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M3.2 8.2C4.6 5.4 7.2 3.8 9.5 3.5M6.2 2.8h3.4v3.4' stroke='%23111113' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+      center / 11px no-repeat,
+    rgba(255, 255, 255, 0.92);
+  box-shadow: 0 0.5px 2px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
 }
 
 .desktop-shortcut-title {
@@ -1850,6 +2257,7 @@ body.dock-autohide::after {
 }
 
 .taskbar-icon {
+  position: relative;
   width: 100%;
   height: 100%;
   display: grid;
@@ -1859,6 +2267,31 @@ body.dock-autohide::after {
      (and hit target) never moves. Grows upward from the dock floor. */
   transform-origin: 50% 100%;
   transition: transform 90ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.taskbar-notification-badge {
+  position: absolute;
+  top: -3px;
+  right: -4px;
+  z-index: 2;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--brand);
+  color: #111;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.34);
+  pointer-events: none;
+}
+
+.taskbar-notification-badge[hidden] {
+  display: none;
 }
 
 .taskbar-item.launching .taskbar-icon {
@@ -2148,17 +2581,18 @@ body.dock-autohide::after {
   -webkit-backdrop-filter: blur(4px);
 }
 
-/* About ElastOS: same modal material as the shortcuts overlay, one card,
-   only verifiable facts. */
+/* About ElastOS: floating card like About This Mac — desktop stays readable,
+   no full-screen frost blow-out. Only facts the shell can verify. */
 .about-overlay {
   position: fixed;
   inset: 0;
   z-index: 100150;
   display: grid;
   place-items: center;
-  background: var(--overlay-dim);
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
+  /* Click-catch only — do not dim/blur the whole stage. */
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 .about-overlay[hidden] {
@@ -2170,26 +2604,42 @@ body.dock-autohide::after {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 6px;
-  width: min(88vw, 320px);
-  padding: 34px 28px 28px;
-  border-radius: 18px;
+  gap: 4px;
+  width: min(88vw, 300px);
+  padding: 28px 24px 22px;
+  border-radius: 16px;
   background: var(--menu-fill);
   border: 0.5px solid var(--line);
-  box-shadow: var(--shadow);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28), 0 2px 10px rgba(0, 0, 0, 0.16);
   text-align: center;
 }
 
+/* Dialog chrome: close only — no decorative min/zoom that cannot act. */
+.about-traffic-lights {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  padding: 0;
+}
+
 .about-logo {
-  width: 56px;
-  height: 56px;
-  margin-bottom: 6px;
+  /* Wordmark SVG is wide; crop to the cube mark for the About card. */
+  width: 72px;
+  height: 48px;
+  margin: 4px 0 8px;
+  object-fit: cover;
+  object-position: 0% 50%;
+}
+
+/* Wordmark lettering is white in the default asset — use ink on light cards. */
+:root[data-el-theme="light"] .about-logo {
+  content: url("./elastos-logo-ink.svg");
 }
 
 .about-title {
   margin: 0;
   color: var(--text);
-  font-size: 19px;
+  font-size: 20px;
   font-weight: 700;
   letter-spacing: 0.01em;
 }
@@ -2201,7 +2651,54 @@ body.dock-autohide::after {
 }
 
 .about-identity {
-  margin-top: 8px;
+  margin-top: 6px;
+}
+
+.about-version {
+  margin-top: 2px;
+  font-variant-numeric: tabular-nums;
+}
+
+.about-update {
+  margin-top: 4px;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.about-update[data-state="available"] {
+  color: var(--brand);
+}
+
+.about-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.about-more {
+  appearance: none;
+  margin: 0;
+  min-height: 28px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--lift-strong);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.about-more:hover {
+  filter: brightness(1.06);
+}
+
+.about-more:focus-visible {
+  outline: 2px solid var(--brand-focus);
+  outline-offset: 2px;
 }
 
 .shortcuts-card {
@@ -2288,10 +2785,18 @@ body.dock-autohide::after {
   backdrop-filter: blur(16px);
   user-select: none;
   -webkit-user-select: none;
+  transform-origin: top left;
+  animation: bar-menu-enter var(--shell-motion-enter) var(--shell-motion-enter-ease) both;
 }
 
 .context-menu[hidden] {
   display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .context-menu {
+    animation: none;
+  }
 }
 
 .context-menu-item {
@@ -2378,6 +2883,15 @@ body.dragging-target {
   gap: 4px;
   padding: 10px 12px 8px 16px;
   border-bottom: 0.5px solid var(--panel-soft);
+}
+
+.launcher-browse-label {
+  flex: 1 1 auto;
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 620;
+  letter-spacing: -0.01em;
 }
 
 .launcher-scroll {
@@ -2618,11 +3132,28 @@ body.dragging-target {
   box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45), 0 2px 10px rgba(0, 0, 0, 0.25);
   backdrop-filter: blur(24px);
   -webkit-backdrop-filter: blur(24px);
-  animation: launcher-enter 140ms cubic-bezier(0.2, 0, 0, 1) both;
+  animation: launcher-enter var(--shell-motion-enter) var(--shell-motion-enter-ease) both;
+}
+
+.spotlight-panel.launcher-leaving {
+  animation: launcher-leave var(--shell-motion-leave) var(--shell-motion-leave-ease) both;
+  pointer-events: none;
+}
+
+@keyframes launcher-leave {
+  from {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+  to {
+    opacity: 0;
+    transform: scale(0.98) translateY(-6px);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .spotlight-panel {
+  .spotlight-panel,
+  .spotlight-panel.launcher-leaving {
     animation: none;
   }
 }

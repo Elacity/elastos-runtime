@@ -1,21 +1,55 @@
-import { uiSoundsEnabled, setUiSoundsEnabled, playUiSound } from "./shell-sounds.js?v=home-20260719f";
-import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260719f";
+import {
+  closeOtherShellPopovers,
+  registerShellPopover,
+} from "./shell-popovers.js?v=home-20260719x";
+import {
+  dismissWithMotion,
+  prepareSurfaceOpen,
+} from "./shell-motion.js?v=home-20260719x";
+import {
+  fetchJson,
+  focusModeEnabled,
+  formatBadgeCount,
+  setDesktopIconsVisible,
+  setFocusModeEnabled,
+  shellState,
+} from "./shell-core.js?v=home-20260719x";
+import { uiSoundsEnabled, setUiSoundsEnabled, playUiSound } from "./shell-sounds.js?v=home-20260719x";
+import {
+  dockAutoHideEnabled,
+  setDockAutoHide,
+} from "./shell-surface.js?v=home-20260719x";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260719x";
+import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260719x";
+import { openTarget } from "./shell-windows.js?v=home-20260719x";
+import { openExpose } from "./shell-expose.js?v=home-20260719x";
 
 /* Control Centre: the quick layer for controls that already have canonical
-   stores — theme (elastos-theme.js), UI sounds (shell-sounds.js), fullscreen
-   (home-gui facade) — plus the wallet entry point. The System app keeps the
-   deep versions; this panel only projects and toggles existing state, it
-   owns none of its own.
-
-   Same popover contract as the notification center: starts hidden, outside
-   pointerdown or Escape dismisses, focus returns to the bar button. */
+   stores — theme, sounds, focus, accent, dock, desktop icons — plus Nearby
+   (shell-gated discovery), Show Windows, and session deep links. Owns no
+   authority of its own. */
 
 let panel = null;
 let button = null;
 let themeSegment = null;
+let accentRow = null;
+let focusSwitch = null;
+let approvalsRow = null;
+let approvalsDetail = null;
+let discoverySwitch = null;
+let discoveryDetail = null;
+let carrierDetail = null;
 let soundsSwitch = null;
+let dockSwitch = null;
+let desktopIconsSwitch = null;
+let showWindowsRow = null;
+let whoamiDetail = null;
 let walletRow = null;
+let thisDeviceRow = null;
+let systemRow = null;
 let outsideDismissBound = false;
+let registered = false;
+let discoveryTick = 0;
 
 export function bindControlCentre() {
   if (panel) {
@@ -24,11 +58,30 @@ export function bindControlCentre() {
   panel = document.querySelector("#control-centre");
   button = document.querySelector("#toolbar-control-centre");
   themeSegment = document.querySelector("#control-centre-theme");
+  accentRow = document.querySelector("#control-centre-accent");
+  focusSwitch = document.querySelector("#control-centre-focus");
+  approvalsRow = document.querySelector("#control-centre-approvals");
+  approvalsDetail = document.querySelector("#control-centre-approvals-detail");
+  discoverySwitch = document.querySelector("#control-centre-discovery");
+  discoveryDetail = document.querySelector("#control-centre-discovery-detail");
+  carrierDetail = document.querySelector("#control-centre-carrier-detail");
   soundsSwitch = document.querySelector("#control-centre-sounds");
+  dockSwitch = document.querySelector("#control-centre-dock");
+  desktopIconsSwitch = document.querySelector("#control-centre-desktop-icons");
+  showWindowsRow = document.querySelector("#control-centre-show-windows");
+  whoamiDetail = document.querySelector("#control-centre-whoami-detail");
   walletRow = document.querySelector("#control-centre-wallet");
+  thisDeviceRow = document.querySelector("#control-centre-this-device");
+  systemRow = document.querySelector("#control-centre-system");
   if (!panel || !button) {
     return;
   }
+  if (!registered) {
+    registerShellPopover("control-centre", () => hideControlCentre({ restoreFocus: false }));
+    registered = true;
+  }
+
+  buildAccentRow();
 
   button.addEventListener("click", () => {
     toggleControlCentre();
@@ -41,10 +94,49 @@ export function bindControlCentre() {
     }
     window.elastosTheme.set(option.dataset.themeOption);
     syncThemeSegment();
-    // This opaque frame has no localStorage — the host persists and fans out.
     window.dispatchEvent(new CustomEvent("elastos:ui-preference-changed", {
       detail: { key: "theme", value: option.dataset.themeOption },
     }));
+  });
+
+  accentRow?.addEventListener("click", (event) => {
+    const option = event.target.closest("[data-accent-option]");
+    if (!option || !window.elastosTheme?.setAccent) {
+      return;
+    }
+    window.elastosTheme.setAccent(option.dataset.accentOption);
+    syncAccentRow();
+    window.dispatchEvent(new CustomEvent("elastos:ui-preference-changed", {
+      detail: { key: "accent", value: option.dataset.accentOption },
+    }));
+  });
+
+  focusSwitch?.addEventListener("click", () => {
+    const next = !focusModeEnabled();
+    setFocusModeEnabled(next);
+    syncFocusSwitch();
+    window.dispatchEvent(new CustomEvent("elastos:ui-preference-changed", {
+      detail: { key: "focusMode", value: next ? "on" : "off" },
+    }));
+  });
+
+  approvalsRow?.addEventListener("click", () => {
+    hideControlCentre({ restoreFocus: false });
+    const pending = pendingApprovalEntries(shellState.currentSummary);
+    if (pending.some((entry) => entry.kind === "wallet_approval_request")) {
+      showWalletRail();
+      return;
+    }
+    showInboxRail();
+  });
+
+  discoverySwitch?.addEventListener("click", () => {
+    const on = discoverySwitch.getAttribute("aria-checked") === "true";
+    setDiscoveryEnabled(!on).catch((error) => {
+      console.warn("discovery toggle failed", error);
+      playUiSound("error");
+      syncNearby(shellState.currentSummary);
+    });
   });
 
   soundsSwitch?.addEventListener("click", () => {
@@ -59,12 +151,43 @@ export function bindControlCentre() {
     }
   });
 
+  dockSwitch?.addEventListener("click", () => {
+    const next = !dockAutoHideEnabled();
+    setDockAutoHide(next);
+    syncDockSwitch();
+    window.dispatchEvent(new CustomEvent("elastos:ui-preference-changed", {
+      detail: { key: "dockAutoHide", value: next ? "on" : "off" },
+    }));
+  });
+
+  desktopIconsSwitch?.addEventListener("click", () => {
+    const visible = shellState.shellLayoutState.desktopIconsVisible !== false;
+    if (setDesktopIconsVisible(!visible)) {
+      syncDesktopIconsSwitch();
+    }
+  });
+
+  showWindowsRow?.addEventListener("click", () => {
+    hideControlCentre({ restoreFocus: false });
+    openExpose();
+  });
+
   walletRow?.addEventListener("click", () => {
     if (!walletRailAvailable()) {
       return;
     }
     hideControlCentre({ restoreFocus: false });
     showWalletRail();
+  });
+
+  thisDeviceRow?.addEventListener("click", () => {
+    hideControlCentre({ restoreFocus: false });
+    openTarget("system", { query: { settings: "about" } });
+  });
+
+  systemRow?.addEventListener("click", () => {
+    hideControlCentre({ restoreFocus: false });
+    openTarget("system");
   });
 
   panel.addEventListener("keydown", (event) => {
@@ -84,28 +207,37 @@ export function showControlCentre() {
   if (!panel) {
     return;
   }
-  syncThemeSegment();
-  syncSoundsSwitch();
-  syncWalletRow();
+  closeOtherShellPopovers("control-centre");
+  syncControlCentre(shellState.currentSummary);
+  prepareSurfaceOpen(panel);
   panel.hidden = false;
   panel.inert = false;
   panel.setAttribute("aria-hidden", "false");
   button?.setAttribute("aria-expanded", "true");
   bindOutsideDismiss();
   panel.focus({ preventScroll: true });
+  startDiscoveryTick();
 }
 
 export function hideControlCentre({ restoreFocus = true } = {}) {
   if (!controlCentreOpen()) {
     return;
   }
-  panel.hidden = true;
-  panel.inert = true;
-  panel.setAttribute("aria-hidden", "true");
+  stopDiscoveryTick();
   button?.setAttribute("aria-expanded", "false");
-  if (restoreFocus) {
-    button?.focus();
-  }
+  dismissWithMotion(panel, {
+    className: "menubar-card-leaving",
+    ms: 120,
+    hide: false,
+    onDone: () => {
+      panel.hidden = true;
+      panel.inert = true;
+      panel.setAttribute("aria-hidden", "true");
+      if (restoreFocus) {
+        button?.focus();
+      }
+    },
+  });
 }
 
 export function toggleControlCentre() {
@@ -113,6 +245,45 @@ export function toggleControlCentre() {
     hideControlCentre();
   } else {
     showControlCentre();
+  }
+}
+
+export function syncControlCentre(summary) {
+  syncThemeSegment();
+  syncAccentRow();
+  syncFocusSwitch();
+  syncApprovals(summary);
+  syncNearby(summary);
+  syncSoundsSwitch();
+  syncDockSwitch();
+  syncDesktopIconsSwitch();
+  syncWhoami(summary);
+  syncWalletRow();
+}
+
+function buildAccentRow() {
+  if (!accentRow || accentRow.childElementCount > 0) {
+    return;
+  }
+  const accents = window.elastosTheme?.accents || [
+    "blue",
+    "purple",
+    "pink",
+    "red",
+    "orange",
+    "yellow",
+    "green",
+    "graphite",
+  ];
+  for (const accent of accents) {
+    const swatch = document.createElement("button");
+    swatch.type = "button";
+    swatch.className = "control-centre-accent-swatch";
+    swatch.role = "radio";
+    swatch.dataset.accentOption = accent;
+    swatch.setAttribute("aria-label", accent.charAt(0).toUpperCase() + accent.slice(1));
+    swatch.title = swatch.getAttribute("aria-label");
+    accentRow.appendChild(swatch);
   }
 }
 
@@ -127,10 +298,106 @@ function syncThemeSegment() {
     option.setAttribute("aria-checked", active ? "true" : "false");
     option.classList.toggle("active", active);
     if (active) {
-      // Drives the sliding thumb; while the panel is display:none the value
-      // still lands, so reopening snaps into place without a phantom slide.
       themeSegment.style.setProperty("--segment-index", String(index));
     }
+  }
+}
+
+function syncAccentRow() {
+  if (!accentRow) {
+    return;
+  }
+  const accent = window.elastosTheme?.accent?.() || "blue";
+  for (const option of accentRow.querySelectorAll("[data-accent-option]")) {
+    const active = option.dataset.accentOption === accent;
+    option.setAttribute("aria-checked", active ? "true" : "false");
+  }
+}
+
+function syncFocusSwitch() {
+  if (!focusSwitch) {
+    return;
+  }
+  focusSwitch.setAttribute("aria-checked", focusModeEnabled() ? "true" : "false");
+}
+
+function pendingApprovalEntries(summary) {
+  const entries = Array.isArray(summary?.notifications?.entries)
+    ? summary.notifications.entries
+    : [];
+  return entries.filter((entry) => {
+    const status = String(entry?.status || "").toLowerCase();
+    if (status && status !== "pending" && status !== "open" && status !== "unread") {
+      return false;
+    }
+    return Boolean(entry?.action_ref?.action_id || entry?.kind);
+  });
+}
+
+function syncApprovals(summary) {
+  if (!approvalsDetail) {
+    return;
+  }
+  const count = pendingApprovalEntries(summary).length;
+  approvalsDetail.textContent = count > 0 ? `${formatBadgeCount(count)} pending` : "None";
+}
+
+function discoveryRemainingSeconds(discovery) {
+  const until = Number(discovery?.expires_at || discovery?.enabled_until || 0);
+  if (!Number.isFinite(until) || until <= 0) {
+    return 0;
+  }
+  const remaining = until - Math.floor(Date.now() / 1000);
+  return Math.max(0, remaining);
+}
+
+function formatMmSs(totalSeconds) {
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function syncNearby(summary) {
+  const discovery = summary?.people?.discovery;
+  const remaining = discoveryRemainingSeconds(discovery);
+  const on = discovery?.enabled === true && remaining > 0;
+  discoverySwitch?.setAttribute("aria-checked", on ? "true" : "false");
+  if (discoveryDetail) {
+    discoveryDetail.hidden = !on;
+    discoveryDetail.textContent = on ? `Discoverable · ${formatMmSs(remaining)}` : "";
+  }
+  if (carrierDetail) {
+    const status = discovery?.status;
+    carrierDetail.textContent =
+      status === "visible" ? "Online" :
+      status === "runtime_unavailable" ? "Unavailable" : "Idle";
+  }
+}
+
+async function setDiscoveryEnabled(enabled) {
+  await fetchJson("/api/apps/home/discovery", {
+    method: "POST",
+    body: JSON.stringify({ enabled }),
+  });
+  await shellState.requestSummaryRefresh?.();
+  syncNearby(shellState.currentSummary);
+}
+
+function startDiscoveryTick() {
+  stopDiscoveryTick();
+  discoveryTick = window.setInterval(() => {
+    if (!controlCentreOpen()) {
+      stopDiscoveryTick();
+      return;
+    }
+    syncNearby(shellState.currentSummary);
+  }, 1000);
+}
+
+function stopDiscoveryTick() {
+  if (discoveryTick) {
+    window.clearInterval(discoveryTick);
+    discoveryTick = 0;
   }
 }
 
@@ -141,13 +408,40 @@ function syncSoundsSwitch() {
   soundsSwitch.setAttribute("aria-checked", uiSoundsEnabled() ? "true" : "false");
 }
 
+function syncDockSwitch() {
+  if (!dockSwitch) {
+    return;
+  }
+  dockSwitch.setAttribute("aria-checked", dockAutoHideEnabled() ? "true" : "false");
+}
+
+function syncDesktopIconsSwitch() {
+  if (!desktopIconsSwitch) {
+    return;
+  }
+  const visible = shellState.shellLayoutState.desktopIconsVisible !== false;
+  desktopIconsSwitch.setAttribute("aria-checked", visible ? "true" : "false");
+}
+
+function syncWhoami(summary) {
+  if (!whoamiDetail) {
+    return;
+  }
+  const name =
+    summary?.identity?.profile_card?.display_name ||
+    summary?.identity?.handle ||
+    summary?.authority?.principal_id ||
+    "Signed in";
+  whoamiDetail.textContent = String(name);
+}
+
 function syncWalletRow() {
   if (!walletRow) {
     return;
   }
-  // No wallet target in this home means no wallet affordance — never a dead
-  // button (fail-closed, matching the capability discipline everywhere else).
-  walletRow.hidden = !walletRailAvailable();
+  // Toolbar Wallet is the primary door — keep CC Wallet hidden when the rail
+  // is available (Jobs: quiet money).
+  walletRow.hidden = true;
 }
 
 function bindOutsideDismiss() {

@@ -16,16 +16,19 @@ import {
   shellState,
   fetchJson,
   targetById,
-} from "./shell-core.js?v=home-20260719q";
+} from "./shell-core.js?v=home-20260719y";
 import {
   bindHomeUnlock,
+  clearHomeSessionLock,
   hideHomeUnlock,
   isHomeAuthError,
+  isHomeSessionLocked,
+  rememberHomeSessionLock,
   refreshHomeSession,
   requestPasskeyHomeAuthority,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260719q";
+} from "./shell-auth.js?v=home-20260719y";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
@@ -110,10 +113,41 @@ function enterHostAuthGate() {
 }
 
 async function showHostAuthGate(options = {}) {
-  enterHostAuthGate();
-  const unlockReady = showHomeUnlock(() => boot(), {
+  // Session Lock (Control Centre) must keep the live desktop mounted so frost
+  // can blur it. enterHostAuthGate() tears the shell down — that path is only
+  // for cold boot / unsigned front door / hard re-auth.
+  const frostLock =
+    options.presentation === "prompt" && options.surface === "desktop";
+  if (frostLock) {
+    // Survive refresh: seat stays locked until passkey unlock or Sign out.
+    rememberHomeSessionLock();
+  } else {
+    enterHostAuthGate();
+  }
+  const surface = frostLock || options.surface === "desktop" ? "desktop" : "neutral";
+  const onUnlocked = frostLock
+    ? async () => {
+        clearHomeSessionLock();
+        document.body.dataset.homeStatus = "ready";
+        // Gate already dismissed in unlockComplete; refresh under the live desktop.
+        try {
+          await refreshHomeSession();
+        } catch (error) {
+          if (!isHomeAuthError(error)) {
+            console.error("home session refresh after lock failed", error);
+          }
+        }
+        try {
+          await refreshShellSummary();
+        } catch (error) {
+          console.error("home summary refresh after lock failed", error);
+        }
+        startShellTimers();
+      }
+    : () => boot();
+  const unlockReady = showHomeUnlock(onUnlocked, {
     ...options,
-    surface: "neutral",
+    surface,
   });
   hideHostBootMask();
   await unlockReady;
@@ -281,6 +315,7 @@ const UI_PREFERENCE_KEYS = Object.freeze({
   accent: new Set(["blue", "purple", "pink", "red", "orange", "yellow", "green", "graphite"]),
   dockAutoHide: new Set(["on", "off"]),
   sounds: new Set(["on", "off"]),
+  focusMode: new Set(["on", "off"]),
 });
 const UI_PREFERENCE_STORE_PREFIX = "elastos.ui.";
 
@@ -896,7 +931,7 @@ window.addEventListener("message", (event) => {
       return;
     }
     replyToShellRequest(event, requestId, true);
-    showHostAuthGate({ presentation: "prompt", surface: "neutral" }).catch((error) => {
+    showHostAuthGate({ presentation: "prompt", surface: "desktop" }).catch((error) => {
       console.error("home unlock failed", error);
     });
     return;
@@ -1284,7 +1319,10 @@ function resolvePeerInviteUri(uri) {
 async function boot() {
   document.body.dataset.homeStatus = "booting";
   let summary = null;
-  const deferHomeGuiForBootHint = Boolean(activeShellBootHintTarget());
+  const sessionLocked = isHomeSessionLocked();
+  // Lock restore needs the desktop mounted under frost — never defer GUI away.
+  const deferHomeGuiForBootHint =
+    !sessionLocked && Boolean(activeShellBootHintTarget());
   try {
     await refreshHomeSession();
   } catch (error) {
@@ -1296,6 +1334,7 @@ async function boot() {
     summary = await refreshShellSummary({ deferHomeGuiForBootHint });
   } catch (error) {
     if (isHomeAuthError(error)) {
+      clearHomeSessionLock();
       await showHostAuthGate();
       return;
     }
@@ -1304,6 +1343,7 @@ async function boot() {
   if (!homeSummarySignedIn(summary)) {
     // Unsigned front door (cold boot or after Sign out): full account picker.
     // Compact prompt is only for mid-session re-auth over a live shell.
+    clearHomeSessionLock();
     document.body.dataset.homeStatus = "ready";
     await showHostAuthGate();
     startShellTimers();
@@ -1315,6 +1355,12 @@ async function boot() {
       return null;
     });
   document.body.dataset.homeStatus = "ready";
+  if (sessionLocked) {
+    // Seat was locked before refresh — restore frost over the live desktop.
+    await showHostAuthGate({ presentation: "prompt", surface: "desktop" });
+    startShellTimers();
+    return;
+  }
   hideHomeUnlock();
   runtimeReady.then(() => refreshShellSummary()).catch((error) => {
     console.error("home summary refresh failed after runtime ensure", error);

@@ -1,18 +1,21 @@
 import {
   shellState,
-  fetchJson,
   mountGlyph,
   allVisibleTargets,
   desktopObjects,
-} from "./shell-core.js?v=home-20260719f";
-import { openFileObject } from "./shell-surface.js?v=home-20260719f";
+} from "./shell-core.js?v=home-20260719x";
+import { openFileObject } from "./shell-surface.js?v=home-20260719x";
 import {
   openTarget,
   focusWindow,
   browserWindowEntries,
   sortWindowEntriesByZOrder,
   browserWindowDisplayTitle,
-} from "./shell-windows.js?v=home-20260719f";
+} from "./shell-windows.js?v=home-20260719x";
+import {
+  dismissWithMotion,
+  prepareSurfaceOpen,
+} from "./shell-motion.js?v=home-20260719x";
 
 /* Spotlight: shell-wide search (macOS anatomy — dimmed backdrop, centered
  * floating bar, grouped results that grow beneath it). Searches everything
@@ -20,13 +23,13 @@ import {
  *
  *   windows      shellState.windows (switch to)         in memory
  *   apps         summary.targets (launch/focus)         in memory
- *   documents    documents summary (titles + uris)      one cheap POST, cached
- *   files        summary.desktop_objects                in memory
- *   library      summary.targets (target_kind=object)   in memory
- *   people       summary.people.contacts                in memory
+ *   documents    Home summary document facts (if present)   in memory
+ *   files        summary.desktop_objects                    in memory
+ *   library      summary.targets (target_kind=object)        in memory
  *
  * Focus stays in the field the whole time (real Spotlight behavior): arrows
  * move the aria-activedescendant selection, Enter activates, Esc closes.
+ * Continuity allowlist: no provider-plane fetches from this shell module.
  */
 
 /* Bound by bindSpotlight() once the lazy GUI template is in the DOM. */
@@ -91,55 +94,34 @@ function documentResults() {
 }
 
 function fileResults() {
-  return desktopObjects(shellState.currentSummary).map((object) => ({
-    kind: "file",
-    group: "Files",
-    title: object.name,
-    detail: object.kind === "directory" ? "Folder" : "Desktop file",
-    glyphTarget: object.kind === "directory" ? "library" : "documents",
-    extraText: object.mime || "",
-    activate: () => openFileObject(object),
-  }));
-}
-
-function peopleResults() {
-  const contacts = shellState.currentSummary?.people?.contacts;
-  if (!Array.isArray(contacts)) {
-    return [];
-  }
-  return contacts
-    .filter((contact) => contact && typeof contact.display_name === "string")
-    .map((contact) => ({
-      kind: "person",
-      group: "People",
-      title: contact.display_name,
-      detail: "Contact",
-      glyphTarget: "people",
-      extraText: typeof contact.handle === "string" ? contact.handle : "",
-      activate: () => openTarget("people"),
+  return desktopObjects(shellState.currentSummary)
+    .filter((object) => !(
+      object?.metadata?.system_kind === "trash" || object?.uri?.endsWith("/.Trash")
+    ))
+    .map((object) => ({
+      kind: "file",
+      group: "Files",
+      title: object.name,
+      detail: object.kind === "directory" ? "Folder" : "Desktop file",
+      glyphTarget: object.kind === "directory" ? "library" : "documents",
+      extraText: object.mime || "",
+      activate: () => openFileObject(object),
     }));
 }
 
-/* Documents titles come from ONE cheap summary op (no bodies), cached for a
-   minute; a fetch failure just means no Documents group this open. */
-async function refreshDocuments() {
-  if (Date.now() - spotlightState.documentsFetchedAt < DOCUMENTS_CACHE_MS) {
-    return;
-  }
+/* People results omitted until a contact deep-link exists — opening the People
+   app for every name looked like authority and was fail-closed incorrect. */
+function peopleResults() {
+  return [];
+}
+
+/* Documents come from Home summary facts only (Continuity allowlist). */
+function refreshDocuments() {
+  const fromSummary = shellState.currentSummary?.documents?.documents
+    || shellState.currentSummary?.documents
+    || [];
+  spotlightState.documents = Array.isArray(fromSummary) ? fromSummary : [];
   spotlightState.documentsFetchedAt = Date.now();
-  try {
-    const response = await fetchJson("/api/provider/documents/summary", {
-      method: "POST",
-      body: JSON.stringify({}),
-    });
-    const docs = response?.data?.documents || response?.documents;
-    spotlightState.documents = Array.isArray(docs) ? docs : [];
-  } catch (_error) {
-    spotlightState.documents = [];
-  }
-  if (spotlightOpen() && spotlightInput.value.trim() !== "") {
-    runSearch(spotlightInput.value);
-  }
 }
 
 /* ---- Matching + ranking ---- */
@@ -163,7 +145,13 @@ function matchScore(item, query) {
 function collectResults(rawQuery) {
   const query = rawQuery.trim().toLowerCase();
   if (query === "") {
-    return [];
+    const recents = shellState.recentTargetIds || [];
+    const apps = targetResults()
+      .filter((item) => item.group === "Applications" && recents.includes(item.glyphTarget))
+      .sort((a, b) => recents.indexOf(a.glyphTarget) - recents.indexOf(b.glyphTarget))
+      .slice(0, 5);
+    const docs = documentResults().slice(0, 4);
+    return [...apps, ...docs];
   }
   const all = [
     ...windowResults(),
@@ -309,7 +297,13 @@ export function showSpotlight() {
     document.activeElement && document.activeElement !== document.body
       ? document.activeElement
       : null;
+  const panel = spotlight.querySelector(".spotlight-panel");
+  prepareSurfaceOpen(panel);
+  if (panel) {
+    panel.hidden = false;
+  }
   spotlight.hidden = false;
+  spotlight.inert = false;
   spotlight.setAttribute("aria-hidden", "false");
   spotlightInput.value = "";
   runSearch("");
@@ -321,17 +315,31 @@ export function hideSpotlight({ restoreFocus = true } = {}) {
   if (!spotlight || spotlight.hidden) {
     return;
   }
-  spotlight.hidden = true;
-  spotlight.setAttribute("aria-hidden", "true");
-  spotlightState.query = "";
-  spotlightState.results = [];
-  spotlightState.index = -1;
-  spotlightResults.replaceChildren();
-  spotlightInput.value = "";
-  if (restoreFocus) {
-    spotlightState.invoker?.focus?.();
+  const panel = spotlight.querySelector(".spotlight-panel");
+  const finish = () => {
+    spotlight.hidden = true;
+    spotlight.inert = true;
+    spotlight.setAttribute("aria-hidden", "true");
+    spotlightState.query = "";
+    spotlightState.results = [];
+    spotlightState.index = -1;
+    spotlightResults.replaceChildren();
+    spotlightInput.value = "";
+    if (restoreFocus) {
+      spotlightState.invoker?.focus?.();
+    }
+    spotlightState.invoker = null;
+  };
+  if (!panel) {
+    finish();
+    return;
   }
-  spotlightState.invoker = null;
+  dismissWithMotion(panel, {
+    className: "launcher-leaving",
+    ms: 120,
+    hide: false,
+    onDone: finish,
+  });
 }
 
 export function toggleSpotlight() {

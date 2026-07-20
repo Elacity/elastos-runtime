@@ -539,6 +539,30 @@ async fn ensure_people_discovery_runtime_available(
         .map(|_| ())
 }
 
+fn apply_people_discovery_enabled(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    enabled: bool,
+) -> anyhow::Result<HomePeopleDiscoverySummary> {
+    let mut discovery = home_people_discovery_state(data_dir, context)?;
+    let now = now_ts();
+    discovery.enabled = enabled;
+    discovery.enabled_until = enabled.then_some(now + HOME_PEOPLE_DISCOVERY_ENABLED_SECS);
+    discovery.updated_at = now;
+    if !discovery.enabled {
+        discovery.local_peer_id = None;
+        discovery.last_bootstrap_at = None;
+        discovery.last_presence_sent_at = None;
+    }
+    if discovery.enabled {
+        let _ = home_people_discovery_sync(data_dir, context, &mut discovery);
+    }
+    home_save_people_discovery_state(data_dir, context, &discovery)?;
+    let mut summary = home_people_discovery_summary(data_dir, context)?;
+    home_people_discovery_annotate_refresh(&mut summary, true);
+    Ok(summary)
+}
+
 pub(super) async fn people_discovery_update(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -551,25 +575,30 @@ pub(super) async fn people_discovery_update(
         };
     let data_dir = state.data_dir.clone();
     match tokio::task::spawn_blocking(move || {
-        let mut discovery = home_people_discovery_state(&data_dir, &context)?;
-        let now = now_ts();
-        discovery.enabled = body.enabled;
-        discovery.enabled_until = body
-            .enabled
-            .then_some(now + HOME_PEOPLE_DISCOVERY_ENABLED_SECS);
-        discovery.updated_at = now;
-        if !discovery.enabled {
-            discovery.local_peer_id = None;
-            discovery.last_bootstrap_at = None;
-            discovery.last_presence_sent_at = None;
-        }
-        if discovery.enabled {
-            let _ = home_people_discovery_sync(&data_dir, &context, &mut discovery);
-        }
-        home_save_people_discovery_state(&data_dir, &context, &discovery)?;
-        let mut summary = home_people_discovery_summary(&data_dir, &context)?;
-        home_people_discovery_annotate_refresh(&mut summary, true);
-        Ok(summary)
+        apply_people_discovery_enabled(&data_dir, &context, body.enabled)
+    })
+    .await
+    {
+        Ok(Ok(discovery)) => Json(discovery).into_response(),
+        Ok(Err(err)) => home_error_response(err),
+        Err(err) => home_error_response(anyhow::anyhow!(err)),
+    }
+}
+
+/// Shell-token twin of People discovery enable/disable (Control Centre Find People).
+/// Same state machine as `people_discovery_update` — no request/accept/join here.
+pub(super) async fn home_discovery_update(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<PeopleDiscoveryUpdateRequest>,
+) -> Response {
+    let context = match require_home_shell_state_token_context(&state.data_dir, &headers) {
+        Ok(context) => context,
+        Err(err) => return home_error_response(err),
+    };
+    let data_dir = state.data_dir.clone();
+    match tokio::task::spawn_blocking(move || {
+        apply_people_discovery_enabled(&data_dir, &context, body.enabled)
     })
     .await
     {
@@ -2957,6 +2986,204 @@ fn home_browser_localhost_root(context: &HomeLaunchTokenContext) -> String {
 
 fn home_desktop_uri(context: &HomeLaunchTokenContext) -> String {
     format!("{}/Desktop", home_browser_localhost_root(context))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct HomeDesktopMutationRequest {
+    op: String,
+    #[serde(default)]
+    uri: Option<String>,
+    #[serde(default)]
+    parent_uri: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    data: Option<String>,
+}
+
+fn home_desktop_uri_in_scope(desktop: &str, uri: &str) -> bool {
+    if uri.contains("..") || uri.contains('\\') {
+        return false;
+    }
+    if uri == desktop {
+        return true;
+    }
+    uri.starts_with(desktop) && uri.as_bytes().get(desktop.len()) == Some(&b'/')
+}
+
+fn home_desktop_child_uri(desktop: &str, name: &str) -> anyhow::Result<String> {
+    let name = name.trim();
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name == "."
+        || name == ".."
+    {
+        return Err(anyhow::anyhow!(
+            "desktop mutation requires a plain file name"
+        ));
+    }
+    Ok(format!("{desktop}/{name}"))
+}
+
+/// Narrow Desktop-only mutations for the Home GUI shell.
+/// Ops: mkdir | write | rename | trash. Fail-closed outside Desktop.
+pub(super) async fn home_desktop_object_mutation(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(req): Json<HomeDesktopMutationRequest>,
+) -> Response {
+    let context = match require_home_shell_state_token_context(&state.data_dir, &headers) {
+        Ok(context) => context,
+        Err(err) => return home_error_response(err),
+    };
+    let Some(registry) = state.provider_registry.as_ref() else {
+        return home_error_response(anyhow::anyhow!("object provider registry unavailable"));
+    };
+    let desktop = home_desktop_uri(&context);
+    let op = req.op.trim();
+    let provider_request = match op {
+        "mkdir" => {
+            let parent = req
+                .parent_uri
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(desktop.as_str());
+            if !home_desktop_uri_in_scope(&desktop, parent) {
+                return home_error_response(anyhow::anyhow!("outside Desktop"));
+            }
+            let name = match req
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some(name) if !name.contains('/') && !name.contains('\\') && name != ".." => name,
+                _ => {
+                    return home_error_response(anyhow::anyhow!(
+                        "desktop mutation requires a plain file name"
+                    ));
+                }
+            };
+            serde_json::json!({
+                "op": "mkdir",
+                "principal_id": &context.principal_id,
+                "parent_uri": parent,
+                "name": name,
+            })
+        }
+        "write" => {
+            let parent = req
+                .parent_uri
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(desktop.as_str());
+            if !home_desktop_uri_in_scope(&desktop, parent) {
+                return home_error_response(anyhow::anyhow!("outside Desktop"));
+            }
+            let name = match req.name.as_deref() {
+                Some(name) => name,
+                None => {
+                    return home_error_response(anyhow::anyhow!(
+                        "desktop mutation requires a plain file name"
+                    ));
+                }
+            };
+            let uri = match home_desktop_child_uri(parent, name) {
+                Ok(uri) => uri,
+                Err(err) => return home_error_response(err),
+            };
+            // Create-only text documents from the shell — never arbitrary uploads.
+            serde_json::json!({
+                "op": "write",
+                "principal_id": &context.principal_id,
+                "uri": uri,
+                "mime": "text/plain",
+                "data": req.data.as_deref().unwrap_or(""),
+            })
+        }
+        "rename" => {
+            let uri = match req
+                .uri
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some(uri) => uri,
+                None => {
+                    return home_error_response(anyhow::anyhow!("desktop mutation requires uri"));
+                }
+            };
+            // Rename only Desktop children — never the Desktop root itself.
+            if uri == desktop || !home_desktop_uri_in_scope(&desktop, uri) {
+                return home_error_response(anyhow::anyhow!("outside Desktop"));
+            }
+            let name = match req
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some(name) if !name.contains('/') && !name.contains('\\') && name != ".." => name,
+                _ => {
+                    return home_error_response(anyhow::anyhow!(
+                        "desktop mutation requires a plain file name"
+                    ));
+                }
+            };
+            serde_json::json!({
+                "op": "rename",
+                "principal_id": &context.principal_id,
+                "uri": uri,
+                "name": name,
+            })
+        }
+        "trash" => {
+            let uri = match req
+                .uri
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some(uri) => uri,
+                None => {
+                    return home_error_response(anyhow::anyhow!("desktop mutation requires uri"));
+                }
+            };
+            // Trash only Desktop children — never the Desktop root itself.
+            if uri == desktop || !home_desktop_uri_in_scope(&desktop, uri) {
+                return home_error_response(anyhow::anyhow!("outside Desktop"));
+            }
+            serde_json::json!({
+                "op": "trash",
+                "principal_id": &context.principal_id,
+                "uri": uri,
+            })
+        }
+        other => {
+            return home_error_response(anyhow::anyhow!("unsupported desktop op: {other}"));
+        }
+    };
+    let response = match registry.send_raw("object", &provider_request).await {
+        Ok(response) => response,
+        Err(err) => return home_error_response(anyhow::anyhow!(err)),
+    };
+    if response.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
+        let message = response
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("desktop mutation failed");
+        return home_error_response(anyhow::anyhow!(message.to_string()));
+    }
+    Json(serde_json::json!({
+        "status": "ok",
+        "data": response.get("data").cloned().unwrap_or(serde_json::Value::Null),
+    }))
+    .into_response()
 }
 
 fn standard_home_desktop_objects_summary() -> HomeDesktopObjectsSummary {

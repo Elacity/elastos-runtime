@@ -110,6 +110,16 @@ Common shell messages are:
 | `home:request-unlock` | Home displays its host-owned sign-in surface (compact re-auth for the current principal, or the full account picker on the unsigned front door). |
 | `home:sign-out` | Home revokes the active session and reloads the front door (account picker). |
 | `home:close-self` | Home closes the active root shell through Runtime state. |
+| `home:request-unlock` (via `elastos:request-lock`) | GUI Control Centre Lock Screen asks the host to show its unlock surface; the host maps it to the existing `home:request-unlock` path. |
+| `home:ui-preference` | Cosmetic prefs only (`theme`, `accent`, `dockAutoHide`, `sounds`); host persists and relays. |
+
+Presentation-only capsule → GUI shell messages (opaque origin, no host authority):
+
+| Message | Result |
+| --- | --- |
+| `inbox:pending-count` | Inbox rail marks its frame ready / syncs chrome. |
+| `elastos:inbox-chrome-command` | Inbox asks the shell for rail chrome actions (open window, etc.). |
+| `wallet:pending-count` | Wallet rail Activity badge sync. |
 
 `home:switch-shell-and-open-target` is the explicit CLI-to-GUI transition for a
 GUI-only target. Home validates the target, persists `home-gui` through the

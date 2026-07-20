@@ -103,10 +103,6 @@ code {
   z-index: 2;
 }
 
-.settings-sidebar-burger {
-  display: none;
-}
-
 .settings-sidebar-item {
   cursor: pointer;
   border-radius: 4px;
@@ -126,64 +122,21 @@ code {
 .settings-sidebar-icon {
   width: 22px;
   height: 22px;
-  background-repeat: no-repeat;
-  background-position: center;
-  background-size: contain;
   flex-shrink: 0;
-  filter: var(--primary-color-icon);
-  position: relative;
+  color: var(--el-soft);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
-.settings-sidebar-icon::before {
-  content: "";
-  position: absolute;
-  inset: 4px;
-  border: 1.7px solid currentColor;
-  border-radius: 5px;
+.settings-sidebar-icon svg {
+  width: 18px;
+  height: 18px;
+  display: block;
 }
 
-.settings-sidebar-icon-account::before {
-  border-radius: 50%;
-  box-shadow: 0 7px 0 -3px currentColor;
-}
-
-.settings-sidebar-icon-personalization::before {
-  border-radius: 50%;
-  border-top-color: transparent;
-}
-
-.settings-sidebar-icon-shell::before {
-  border-radius: 4px;
-  box-shadow: inset 0 -6px 0 rgba(31, 41, 55, 0.14);
-}
-
-.settings-sidebar-icon-security::before {
-  border-radius: 4px 4px 6px 6px;
-}
-
-.settings-sidebar-icon-catalog::before {
-  border-radius: 50%;
-  box-shadow:
-    inset 0 0 0 3px var(--el-surface-raised),
-    0 0 0 1px currentColor;
-}
-
-.settings-sidebar-icon-storage::before {
-  border-radius: 3px;
-  box-shadow: inset 0 -5px 0 var(--el-hairline-strong);
-}
-
-.settings-sidebar-icon-inspector::before {
-  border-radius: 50%;
-  box-shadow:
-    inset 0 0 0 3px var(--el-surface-raised),
-    0 0 0 1px currentColor;
-}
-
-.settings-sidebar-icon-about::before {
-  border-radius: 50%;
-  outline: 1.5px dotted currentColor;
-  outline-offset: 2px;
+.settings-sidebar-item.active .settings-sidebar-icon {
+  color: var(--el-accent, var(--brand));
 }
 
 .settings-sidebar-text {
@@ -267,7 +220,7 @@ code {
 
 .shell-choice {
   display: grid;
-  grid-template-rows: minmax(112px, 1fr) auto;
+  grid-template-rows: minmax(168px, 1fr) auto;
   position: relative;
   min-width: 0;
   padding: 0;
@@ -303,7 +256,7 @@ code {
 .shell-choice-preview {
   display: block;
   position: relative;
-  min-height: 112px;
+  min-height: 168px;
   overflow: hidden;
   border-bottom: 1px solid var(--color-border);
 }
@@ -1137,6 +1090,63 @@ code {
   font-size: 11px;
   line-height: 1.45;
   white-space: pre-wrap;
+}
+
+.device-identity-row {
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.device-did-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: min(100%, 28rem);
+  min-width: 0;
+}
+
+.device-did-value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.device-did-copy {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--el-hairline);
+  border-radius: 7px;
+  background: var(--el-inset);
+  color: var(--el-muted);
+  cursor: pointer;
+}
+
+.device-did-copy:hover,
+.device-did-copy:focus-visible {
+  color: var(--el-text);
+  background: var(--el-lift, var(--el-inset));
+}
+
+.device-did-copy[data-copied="true"] {
+  color: var(--el-ok, #1f8a4c);
+}
+
+.device-did-copy .el-copy-check[hidden],
+.device-did-copy .el-copy-icon[hidden] {
+  display: none;
+}
+
+.settings-search-hit {
+  border-radius: 4px;
+  outline: 2px solid color-mix(in srgb, var(--el-brand, #5b8cff) 55%, transparent);
+  outline-offset: 2px;
 }
 
 .technical-details {

@@ -20,7 +20,7 @@ import {
   ignoreRepeatedAction,
   pushUiPreferencesToFrameWindow,
   targetById,
-} from "./shell-core.js?v=home-20260719f";
+} from "./shell-core.js?v=home-20260719x";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -31,7 +31,8 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260719f";
+} from "./shell-window-geometry.js?v=home-20260719x";
+import { playUiSound } from "./shell-sounds.js?v=home-20260719x";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -576,6 +577,7 @@ function renderSystemErrorWindow({
 function renderTargetLaunchError(targetId, error) {
   const title = shellState.currentSummary ? targetTitle(shellState.currentSummary, targetId) : targetId;
   console.error(`failed to launch ${targetId}`, error);
+  playUiSound("error");
   renderSystemErrorWindow({
     id: "shell-launch-error",
     title,
@@ -672,6 +674,9 @@ function launchActionKey(targetId, query) {
 export function openTarget(targetId, options = {}) {
   if (targetId === "wallet") {
     windowHooks?.retireWalletRailBeforeWindow?.();
+  }
+  if (targetId === "inbox") {
+    windowHooks?.retireInboxRailBeforeWindow?.();
   }
   if (SINGLE_SESSION_TARGETS.has(targetId) && browserWindowCount(targetId) > 0) {
     activateTargetGroup(targetId);
@@ -978,6 +983,16 @@ function hideWindow(id) {
     return;
   }
   hideWindowEntries([entry]);
+}
+
+export function minimizeWindow(id) {
+  hideWindow(id);
+}
+
+export function maximizeActiveWindow() {
+  if (shellState.activeWindowId) {
+    toggleWindowMaximize(shellState.activeWindowId);
+  }
 }
 
 export function closeWindow(id) {

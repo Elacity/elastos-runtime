@@ -797,6 +797,11 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             get(home_browser_state_get).post(home_browser_state_update),
         )
         .route(
+            "/api/apps/home/desktop/objects",
+            post(home_desktop_object_mutation),
+        )
+        .route("/api/apps/home/discovery", post(home_discovery_update))
+        .route(
             "/api/apps/home/active-shell",
             get(home_active_shell_get).post(home_active_shell_update),
         )
@@ -1277,7 +1282,10 @@ fn home_error_response(err: anyhow::Error) -> Response {
     let text = err.to_string();
     let status = if text.contains("home launch token") || text.contains("gateway identity") {
         StatusCode::FORBIDDEN
-    } else if text.contains("service access request delivery failed: service offer")
+    } else if text.contains("outside Desktop")
+        || text.contains("unsupported desktop op")
+        || text.contains("desktop mutation requires")
+        || text.contains("service access request delivery failed: service offer")
         || text.contains("service access request delivery failed: only Browser Exit")
     {
         StatusCode::BAD_REQUEST

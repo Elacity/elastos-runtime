@@ -1,15 +1,21 @@
 import {
   escapeHtml,
+  formatBadgeCount,
   pushUiPreferencesToFrameWindow,
   shellState,
   targetById,
-} from "./shell-core.js?v=home-20260719f";
+} from "./shell-core.js?v=home-20260719x";
+import {
+  closeOtherShellPopovers,
+  registerShellPopover,
+} from "./shell-popovers.js?v=home-20260719x";
 import {
   iframeAllowForLaunch,
   iframeSandboxForLaunch,
   launchHomeTarget,
   openTarget,
-} from "./shell-windows.js?v=home-20260719f";
+} from "./shell-windows.js?v=home-20260719x";
+import { playUiSound } from "./shell-sounds.js?v=home-20260719x";
 
 /* Wallet rail: a right-hand slide-over that hosts the wallet capsule.
    Chrome only — it launches the wallet through the same host-mediated
@@ -58,6 +64,7 @@ let lastPointerClientX = 0;
 /* Set from summary sync — do not rely only on this module's shellState copy. */
 let walletTargetAvailable = false;
 let preloadTimer = 0;
+let registered = false;
 
 const EDGE_REVEAL_PX = 16;
 const EDGE_OPEN_MS = 100;
@@ -84,6 +91,10 @@ export function bindWalletRail() {
   retryButton = document.querySelector("#wallet-rail-retry");
   if (!rail || !frame) {
     return;
+  }
+  if (!registered) {
+    registerShellPopover("wallet-rail", () => hideWalletRail({ restoreFocus: false }));
+    registered = true;
   }
   barButton?.addEventListener("click", () => {
     // Toolbar is an intentional pin — not an edge peek session.
@@ -365,7 +376,7 @@ function syncRailApprovalsBadge(count) {
     return;
   }
   approvalsBadge.hidden = false;
-  approvalsBadge.textContent = n > 9 ? "9+" : String(n);
+  approvalsBadge.textContent = formatBadgeCount(n);
   approvalsButton.setAttribute(
     "aria-label",
     n === 1 ? "Activity, 1 pending" : `Activity, ${n} pending`,
@@ -493,7 +504,7 @@ function syncWalletBarBadge(count) {
     barButton.appendChild(badge);
   }
   badge.hidden = false;
-  badge.textContent = count > 99 ? "99+" : String(count);
+  badge.textContent = formatBadgeCount(count);
   barButton.setAttribute(
     "aria-label",
     `Wallet. ${count} pending approval${count === 1 ? "" : "s"}`,
@@ -504,6 +515,7 @@ export function showWalletRail(options = {}) {
   if (!rail || !walletRailAvailable()) {
     return;
   }
+  closeOtherShellPopovers("wallet-rail");
   const fromEdgeHover = options.fromEdgeHover === true;
   if (!fromEdgeHover) {
     openedByEdgeHover = false;
@@ -682,6 +694,7 @@ async function mountWalletFrame() {
   } catch (error) {
     frame.hidden = true;
     frameReady = false;
+    playUiSound("error");
     if (errorBlock) {
       errorBlock.hidden = false;
       if (errorDetail) {

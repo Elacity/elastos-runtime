@@ -2,7 +2,7 @@
   "schema": "elastos.capsule/v1",
   "name": "services",
   "version": "0.1.0",
-  "description": "Manage Browser Engine and Browser Exit service access",
+  "description": "Share Browser Engine and Browser Exit services with people",
   "author": "elastos",
   "role": "app",
   "type": "wasm",

@@ -11,7 +11,11 @@
  * commands are dispatched only to the window that declared them.
  */
 
-import { shellState } from "./shell-core.js?v=home-20260719f";
+import { shellState } from "./shell-core.js?v=home-20260719x";
+import {
+  dismissWithMotion,
+  prepareSurfaceOpen,
+} from "./shell-motion.js?v=home-20260719x";
 
 /* Resolved lazily — the menubar lives in the lazy GUI template, which is not
    in the DOM at module-evaluation time. */
@@ -122,7 +126,7 @@ export function syncMenubar() {
       manifests.delete(windowId);
     }
   }
-  closeMenus();
+  closeMenus({ restoreFocus: false, animate: false });
   root.replaceChildren();
   const entry = activeBrowserWindow();
   if (!entry) {
@@ -204,13 +208,15 @@ function menuContainers() {
 }
 
 function openMenuAt(index, options = {}) {
-  closeMenus({ restoreFocus: false });
+  // Instant close when sweeping between titles — leave motion only on full dismiss.
+  closeMenus({ restoreFocus: false, animate: false });
   const container = menuContainers()[index];
   if (!container) {
     return;
   }
   const button = container.querySelector(".toolbar-menu-title");
   const popover = container.querySelector(".toolbar-menu-popover");
+  prepareSurfaceOpen(popover);
   popover.hidden = false;
   button.setAttribute("aria-expanded", "true");
   openMenu = { index, button, popover };
@@ -225,12 +231,20 @@ export function closeMenus(options = {}) {
     return;
   }
   const { button, popover } = openMenu;
-  popover.hidden = true;
-  button.setAttribute("aria-expanded", "false");
-  if (options.restoreFocus !== false && popover.contains(document.activeElement)) {
-    button.focus();
-  }
   openMenu = null;
+  button.setAttribute("aria-expanded", "false");
+  const restore =
+    options.restoreFocus !== false && popover.contains(document.activeElement);
+  dismissWithMotion(popover, {
+    className: "bar-menu-leaving",
+    ms: 120,
+    animate: options.animate !== false,
+    onDone: () => {
+      if (restore) {
+        button.focus();
+      }
+    },
+  });
 }
 
 function bindOutsideDismiss() {

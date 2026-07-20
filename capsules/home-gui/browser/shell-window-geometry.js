@@ -10,7 +10,7 @@ import {
   beginShellInteraction,
   clamp,
   endShellInteraction,
-} from "./shell-core.js?v=home-20260719f";
+} from "./shell-core.js?v=home-20260719x";
 
 const WINDOW_MIN_VISIBLE_DRAG_WIDTH = 96;
 const WINDOW_MIN_VISIBLE_DRAG_HEIGHT = 32;
@@ -562,6 +562,22 @@ function restoreWindowForDrag(node, clientX, clientY) {
   restoreWindowFromSpecialState(node);
   applyWindowBounds(node, nextBounds);
   return nextBounds;
+}
+
+export function applyWindowSnapState(node, state) {
+  if (!node || !state) {
+    return;
+  }
+  rememberWindowRestoreBounds(node);
+  node.dataset.maximized = "false";
+  node.dataset.browserMaximized = "false";
+  node.dataset.snap = state;
+  applyWindowBounds(
+    node,
+    node.dataset.target === BROWSER_TARGET_ID
+      ? browserAspectBoundsForState(node, snappedWindowBounds(state), state)
+      : snappedWindowBounds(state),
+  );
 }
 
 function snappedWindowBounds(state) {

@@ -209,7 +209,41 @@ question with you, not more code in `elastos/`.
    only** (address/recovery-key copy from the opaque frame; paste into Wallet
    is not a product path, so read is not granted).
 
-## Shell UI preferences (theme / accent / dock / sounds) — host is the store
+## Desktop object mutations — shell-token, Desktop-prefix only
+
+Home GUI “New Folder / New Text Document / Rename / Move to Trash” no longer
+reach the generic `/api/provider/object/*` surface from the opaque frame.
+Canonical path:
+
+- `POST /api/apps/home/desktop/objects` with `x-elastos-home-token` for a
+  trusted Home shell (`home` / `home-gui` / `home-cli` only)
+- Ops closed set: `mkdir` | `write` | `rename` | `trash`
+- Fail-closed prefix guard: every `uri` / `parent_uri` must be under
+  `{localhost_root}/Desktop` (no `..`, no Documents/Library escape)
+- `write` is create-only text/plain for shell “untitled.txt” — not a general
+  upload API
+- Trash stays on the dock; the synthetic Desktop Trash icon is filtered from
+  desktop icons / Spotlight files (dock affordance unchanged)
+
+Cosmetic layout (alias drag from launcher/dock → Desktop) still uses
+`/api/apps/home/state` layout fields; content mutations use the new endpoint.
+
+## Home discovery toggle — shell-token, enable/disable only
+
+Control Centre “Find People” needs the same timed discovery state People already
+owns, without giving the shell a People launch token. Canonical path:
+
+- `POST /api/apps/home/discovery` with `x-elastos-home-token` for a trusted Home
+  shell (`home` / `home-gui` / `home-cli` only)
+- Body closed set: `{ "enabled": bool }` (`deny_unknown_fields`)
+- Calls the **same** internals as `POST /api/apps/people/discovery` (10‑minute
+  `enabled_until`, sync, summary projection)
+- Does **not** expose refresh / request / accept / join — those stay People-token
+- System / other capsule tokens → 403
+
+People app keeps its own toggle; both writers share one state machine.
+
+## Shell UI preferences (theme / accent / dock / sounds / focusMode) — host is the store
 
 Opaque frames throw on every `localStorage` access, which silently killed the
 old preference model (localStorage + `storage` events fanning out across
@@ -219,8 +253,9 @@ dead. New canonical path, one direction:
 
 - System (Personalization) and the GUI Control Centre write
   `home:ui-preference` to the host — closed key set (`theme`, `accent`,
-  `dockAutoHide`, `sounds`), closed value enums, writers restricted to the
+  `dockAutoHide`, `sounds`, `focusMode`), closed value enums, writers restricted to the
   System app-frame context and the `home-gui` shell-frame context;
+  `focusMode` mutes desktop toasts only (never hides Inbox/Wallet);
 - the host (the only real-origin document) persists to its own localStorage
   and relays a `ui-preference` gui-command; it replays stored preferences on
   every `home:shell-ready`;

@@ -1,15 +1,28 @@
 import {
   clockNode,
+  fetchJson,
   toolbarHomeButton,
+  toolbarIdentityAvatar,
+  toolbarIdentityAvatarImage,
+  toolbarIdentityMonogram,
   toolbarSystem,
   toolbarIdentityMenu,
   toolbarIdentityMenuName,
-} from "./shell-core.js?v=home-20260719f";
+} from "./shell-core.js?v=home-20260719x";
+import { renderNcTimeChrome } from "./shell-notifications.js?v=home-20260719x";
+import {
+  dismissWithMotion,
+  prepareSurfaceOpen,
+} from "./shell-motion.js?v=home-20260719x";
 
 /* System chrome: the ElastOS brand at the far left of the bar is the system
    menu (the macOS Apple-menu position) — show desktop, fullscreen, System,
    sign out, headed by the signed-in principal from the home summary. The name
    is always rendered as textContent — never HTML. */
+
+let passkeyAccountsCache = null;
+let passkeyAccountsCachedAt = 0;
+let avatarResolveSeq = 0;
 
 function summaryDisplayName(summary) {
   const handle = summary?.identity?.handle;
@@ -17,6 +30,129 @@ function summaryDisplayName(summary) {
     return handle.trim();
   }
   return "Operator";
+}
+
+function monogramForName(name) {
+  const parts = String(name || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (parts.length === 0) {
+    return "·";
+  }
+  const first = [...parts[0]][0] || "·";
+  if (parts.length === 1) {
+    return first.toUpperCase();
+  }
+  const second = [...parts[parts.length - 1]][0] || "";
+  return `${first}${second}`.toUpperCase().replace(/[^A-Z0-9]/g, "") || "·";
+}
+
+function avatarColorForId(principalId) {
+  let hash = 0;
+  const text = String(principalId || "");
+  for (let i = 0; i < text.length; i += 1) {
+    hash = ((hash << 5) - hash) + text.charCodeAt(i);
+    hash |= 0;
+  }
+  const hue = Math.abs(hash) % 360;
+  return `linear-gradient(145deg, hsl(${hue} 52% 46%), hsl(${(hue + 28) % 360} 58% 36%))`;
+}
+
+async function loadPasskeyAccounts() {
+  if (passkeyAccountsCache && Date.now() - passkeyAccountsCachedAt < 60_000) {
+    return passkeyAccountsCache;
+  }
+  const status = await fetchJson("/api/auth/passkey/status");
+  passkeyAccountsCache = Array.isArray(status?.accounts) ? status.accounts : [];
+  passkeyAccountsCachedAt = Date.now();
+  return passkeyAccountsCache;
+}
+
+function clearAvatarPhoto() {
+  if (toolbarIdentityAvatarImage) {
+    toolbarIdentityAvatarImage.hidden = true;
+    toolbarIdentityAvatarImage.removeAttribute("src");
+    toolbarIdentityAvatarImage.onload = null;
+    toolbarIdentityAvatarImage.onerror = null;
+  }
+  toolbarIdentityAvatar?.classList.remove("has-photo");
+}
+
+function showMonogramAvatar(name, seed) {
+  clearAvatarPhoto();
+  if (toolbarIdentityMonogram) {
+    toolbarIdentityMonogram.textContent = monogramForName(name);
+    toolbarIdentityMonogram.hidden = false;
+  }
+  if (toolbarIdentityAvatar) {
+    toolbarIdentityAvatar.hidden = false;
+    toolbarIdentityAvatar.style.background = avatarColorForId(seed || name);
+  }
+}
+
+async function resolveProfileAvatarUrl(summary) {
+  const avatarCid =
+    typeof summary?.identity?.profile_card?.avatar_cid === "string"
+      ? summary.identity.profile_card.avatar_cid.trim()
+      : "";
+  if (!avatarCid) {
+    return "";
+  }
+  try {
+    const accounts = await loadPasskeyAccounts();
+    const name = summaryDisplayName(summary).toLowerCase();
+    const match =
+      accounts.find((entry) => String(entry?.avatar_cid || "").trim() === avatarCid) ||
+      accounts.find(
+        (entry) => String(entry?.display_name || "").trim().toLowerCase() === name,
+      );
+    const credentialId = String(match?.credential_id || "").trim();
+    if (!credentialId) {
+      return "";
+    }
+    return `/api/auth/passkey/account-avatar?credential_id=${encodeURIComponent(credentialId)}&v=${encodeURIComponent(avatarCid)}`;
+  } catch (_error) {
+    return "";
+  }
+}
+
+function applyAvatarPhoto(url, name, seed) {
+  if (!toolbarIdentityAvatarImage || !url) {
+    showMonogramAvatar(name, seed);
+    return;
+  }
+  const seq = ++avatarResolveSeq;
+  toolbarIdentityAvatarImage.onload = () => {
+    if (seq !== avatarResolveSeq) {
+      return;
+    }
+    toolbarIdentityAvatarImage.hidden = false;
+    if (toolbarIdentityMonogram) {
+      toolbarIdentityMonogram.hidden = true;
+    }
+    if (toolbarIdentityAvatar) {
+      toolbarIdentityAvatar.hidden = false;
+      toolbarIdentityAvatar.style.background = "transparent";
+      toolbarIdentityAvatar.classList.add("has-photo");
+    }
+  };
+  toolbarIdentityAvatarImage.onerror = () => {
+    if (seq !== avatarResolveSeq) {
+      return;
+    }
+    showMonogramAvatar(name, seed);
+  };
+  if (toolbarIdentityMonogram) {
+    toolbarIdentityMonogram.textContent = monogramForName(name);
+    toolbarIdentityMonogram.hidden = false;
+  }
+  if (toolbarIdentityAvatar) {
+    toolbarIdentityAvatar.hidden = false;
+    toolbarIdentityAvatar.style.background = avatarColorForId(seed || name);
+  }
+  toolbarIdentityAvatarImage.hidden = true;
+  toolbarIdentityAvatarImage.src = url;
 }
 
 export function syncIdentity(summary) {
@@ -28,7 +164,19 @@ export function syncIdentity(summary) {
     clearIdentitySurface();
     return;
   }
-  toolbarIdentityMenuName.textContent = summaryDisplayName(summary);
+  const name = summaryDisplayName(summary);
+  toolbarIdentityMenuName.textContent = name;
+  const seed =
+    typeof summary?.identity?.principal_id === "string"
+      ? summary.identity.principal_id
+      : name;
+  showMonogramAvatar(name, seed);
+  resolveProfileAvatarUrl(summary).then((url) => {
+    if (!url || !toolbarIdentityMenuName?.textContent) {
+      return;
+    }
+    applyAvatarPhoto(url, name, seed);
+  });
 }
 
 export function clearIdentitySurface() {
@@ -37,6 +185,18 @@ export function clearIdentitySurface() {
   }
   closeIdentityMenu({ restoreFocus: false });
   toolbarIdentityMenuName.textContent = "";
+  avatarResolveSeq += 1;
+  passkeyAccountsCache = null;
+  passkeyAccountsCachedAt = 0;
+  clearAvatarPhoto();
+  if (toolbarIdentityMonogram) {
+    toolbarIdentityMonogram.textContent = "";
+    toolbarIdentityMonogram.hidden = true;
+  }
+  if (toolbarIdentityAvatar) {
+    toolbarIdentityAvatar.hidden = true;
+    toolbarIdentityAvatar.style.background = "";
+  }
 }
 
 /* Disclosure menu behavior (APG menu-button pattern): click or ArrowDown opens
@@ -53,9 +213,14 @@ function identityMenuOpen() {
   return !toolbarIdentityMenu.hidden;
 }
 
+function setIdentityMenuExpanded(expanded) {
+  toolbarHomeButton?.setAttribute("aria-expanded", expanded ? "true" : "false");
+}
+
 function openIdentityMenu({ focusLast = false } = {}) {
+  prepareSurfaceOpen(toolbarIdentityMenu);
   toolbarIdentityMenu.hidden = false;
-  toolbarHomeButton.setAttribute("aria-expanded", "true");
+  setIdentityMenuExpanded(true);
   const items = identityMenuItems();
   const target = focusLast ? items[items.length - 1] : items[0];
   target?.focus();
@@ -65,11 +230,16 @@ function closeIdentityMenu({ restoreFocus = true } = {}) {
   if (!toolbarIdentityMenu || toolbarIdentityMenu.hidden) {
     return;
   }
-  toolbarIdentityMenu.hidden = true;
-  toolbarHomeButton.setAttribute("aria-expanded", "false");
-  if (restoreFocus) {
-    toolbarHomeButton.focus();
-  }
+  setIdentityMenuExpanded(false);
+  dismissWithMotion(toolbarIdentityMenu, {
+    className: "bar-menu-leaving",
+    ms: 120,
+    onDone: () => {
+      if (restoreFocus) {
+        toolbarHomeButton?.focus();
+      }
+    },
+  });
 }
 
 function moveIdentityMenuFocus(delta) {
@@ -88,19 +258,18 @@ function moveIdentityMenuFocus(delta) {
    GUI template — the identity nodes do not exist in the first host document. */
 let identityMenuBound = false;
 
-export function bindIdentityMenu() {
-  if (identityMenuBound || !toolbarHomeButton || !toolbarIdentityMenu) {
+function bindIdentityMenuInvoker(invoker) {
+  if (!invoker) {
     return;
   }
-  identityMenuBound = true;
-  toolbarHomeButton.addEventListener("click", () => {
+  invoker.addEventListener("click", () => {
     if (identityMenuOpen()) {
       closeIdentityMenu();
     } else {
       openIdentityMenu();
     }
   });
-  toolbarHomeButton.addEventListener("keydown", (event) => {
+  invoker.addEventListener("keydown", (event) => {
     if (event.key === "ArrowDown") {
       event.preventDefault();
       openIdentityMenu();
@@ -109,6 +278,14 @@ export function bindIdentityMenu() {
       openIdentityMenu({ focusLast: true });
     }
   });
+}
+
+export function bindIdentityMenu() {
+  if (identityMenuBound || !toolbarHomeButton || !toolbarIdentityMenu) {
+    return;
+  }
+  identityMenuBound = true;
+  bindIdentityMenuInvoker(toolbarHomeButton);
   toolbarIdentityMenu.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       event.preventDefault();
@@ -142,12 +319,30 @@ export function bindIdentityMenu() {
   });
 }
 
-export function updateClock() {
-  clockNode.textContent = new Intl.DateTimeFormat([], {
+/* Apple menubar chip: "Mon 20 Jul 12:51" — no commas, day before month. */
+export function formatMenubarClock(now = new Date()) {
+  const parts = new Intl.DateTimeFormat(undefined, {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
     hour: "numeric",
     minute: "2-digit",
-    weekday: "short",
-    month: "short",
-    day: "2-digit",
-  }).format(new Date());
+    hour12: true,
+  }).formatToParts(now);
+  const pick = (type) => parts.find((part) => part.type === type)?.value || "";
+  const weekday = pick("weekday").replace(/\.$/, "");
+  const day = pick("day");
+  const month = pick("month").replace(/\.$/, "");
+  const hour = pick("hour");
+  const minute = pick("minute");
+  // Apple menubar omits AM/PM on the chip; hour is still 12-hour cycle.
+  return `${weekday} ${day} ${month} ${hour}:${minute}`.replace(/\s+/g, " ").trim();
+}
+
+export function updateClock() {
+  const now = new Date();
+  if (clockNode) {
+    clockNode.textContent = formatMenubarClock(now);
+  }
+  renderNcTimeChrome(now);
 }

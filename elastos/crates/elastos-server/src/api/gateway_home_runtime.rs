@@ -739,7 +739,7 @@ fn app_shell_title(name: &str) -> String {
         MARKETPLACE_CAPSULE_ID => "Marketplace".to_string(),
         PEOPLE_CAPSULE_ID => "People".to_string(),
         INBOX_CAPSULE_ID => "Inbox".to_string(),
-        SERVICES_CAPSULE_ID => "Services".to_string(),
+        SERVICES_CAPSULE_ID => "Sharing".to_string(),
         SYSTEM_CAPSULE_ID => "System".to_string(),
         BROWSER_CAPSULE_ID => "Browser".to_string(),
         WALLET_CAPSULE_ID => "Wallet".to_string(),
@@ -759,11 +759,13 @@ fn app_shell_description(name: &str, manifest_description: Option<String>) -> St
         CHAT_ROOM_CAPSULE_ID => "Send messages and join conversations.".to_string(),
         LIBRARY_CAPSULE_ID => "Browse documents and open them in Documents.".to_string(),
         MARKETPLACE_CAPSULE_ID => {
-            "Browse installed apps, services, viewers, and content.".to_string()
+            "Discover and open apps, viewers, and content on this device.".to_string()
         }
         PEOPLE_CAPSULE_ID => "Manage people and local discovery.".to_string(),
         INBOX_CAPSULE_ID => "Review messages, requests, and approvals.".to_string(),
-        SERVICES_CAPSULE_ID => "Manage Browser Exit Node sharing and subscriptions.".to_string(),
+        SERVICES_CAPSULE_ID => {
+            "Share Browser Engine and Browser Exit services with people.".to_string()
+        }
         SYSTEM_CAPSULE_ID => "Manage passkeys, appearance, and Home settings.".to_string(),
         BROWSER_CAPSULE_ID => "Browse websites from this device.".to_string(),
         WALLET_CAPSULE_ID => {

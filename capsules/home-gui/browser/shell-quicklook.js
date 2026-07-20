@@ -13,9 +13,14 @@ import {
   mountGlyph,
   targetById,
   desktopObjectByEntryId,
-} from "./shell-core.js?v=home-20260719f";
-import { openFileObject } from "./shell-surface.js?v=home-20260719f";
-import { openTarget } from "./shell-windows.js?v=home-20260719f";
+} from "./shell-core.js?v=home-20260719x";
+import { openFileObject } from "./shell-surface.js?v=home-20260719x";
+import { openTarget } from "./shell-windows.js?v=home-20260719x";
+import {
+  closeOtherShellPopovers,
+  registerShellPopover,
+  setOverlayOpen,
+} from "./shell-popovers.js?v=home-20260719x";
 
 /* Bound by bindQuickLook() once the lazy GUI template is in the DOM. */
 let panel = null;
@@ -90,10 +95,12 @@ export function showQuickLook() {
   }
   const entry = selectedEntry();
   open = true;
-  panel.hidden = false;
-  panel.setAttribute("aria-hidden", "false");
+  closeOtherShellPopovers("quick-look");
   renderQuickLook(entry);
-  closeButton?.focus();
+  setOverlayOpen(panel, true, {
+    invoker: document.activeElement,
+    focusEl: closeButton || panel,
+  });
   return true;
 }
 
@@ -102,8 +109,7 @@ export function hideQuickLook() {
     return;
   }
   open = false;
-  panel.hidden = true;
-  panel.setAttribute("aria-hidden", "true");
+  setOverlayOpen(panel, false);
   stage?.replaceChildren();
 }
 
@@ -134,6 +140,7 @@ export function bindQuickLook() {
   if (!panel) {
     return;
   }
+  registerShellPopover("quick-look", () => hideQuickLook());
   closeButton?.addEventListener("click", () => hideQuickLook());
   openButton?.addEventListener("click", () => openEntry());
   panel.addEventListener("click", (event) => {

@@ -1428,6 +1428,11 @@
       color: var(--el-ok);
     }
 
+    .props-copy-btn .el-copy-check[hidden],
+    .props-copy-btn .el-copy-icon[hidden] {
+      display: none;
+    }
+
     .item-prop-badge {
       display: inline-flex;
       align-items: center;

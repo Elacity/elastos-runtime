@@ -29,24 +29,43 @@
       hidden
     >
       <div class="toolbar-identity-header" role="presentation">
-        Signed in as <strong id="toolbar-identity-menu-name"></strong>
+        <span id="toolbar-identity-avatar" class="toolbar-identity-menu-avatar" aria-hidden="true">
+          <span id="toolbar-identity-monogram" class="toolbar-identity-menu-monogram"></span>
+          <img id="toolbar-identity-avatar-image" class="toolbar-identity-menu-avatar-image" alt="" hidden />
+        </span>
+        <span class="toolbar-identity-header-copy">
+          Signed in as <strong id="toolbar-identity-menu-name"></strong>
+        </span>
       </div>
       <button id="identity-menu-about" class="toolbar-identity-item" type="button" role="menuitem">
+        <svg class="toolbar-identity-item-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.5"/><path d="M8 7.25V11M8 5.25h.01"/></svg>
         About ElastOS
       </button>
       <button id="identity-menu-system" class="toolbar-identity-item" type="button" role="menuitem">
+        <svg class="toolbar-identity-item-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="2"/><path d="M8 2.5v1.2M8 12.3V13.5M2.5 8h1.2M12.3 8h1.2M4.1 4.1l.85.85M11.05 11.05l.85.85M4.1 11.9l.85-.85M11.05 4.95l.85-.85"/></svg>
         System Settings…
+      </button>
+      <button id="identity-menu-marketplace" class="toolbar-identity-item" type="button" role="menuitem">
+        <svg class="toolbar-identity-item-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="10" height="10" rx="2.2"/><path d="M6.2 9.2V6.8l2.3 1.35L10.8 6.8v2.4"/></svg>
+        App Store
       </button>
       <div class="toolbar-identity-divider" role="separator"></div>
       <button id="identity-menu-show-desktop" class="toolbar-identity-item" type="button" role="menuitem">
+        <svg class="toolbar-identity-item-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3.5" width="11" height="7.5" rx="1.2"/><path d="M5.5 13.5h5M8 11v2.5"/></svg>
         Show Desktop
       </button>
       <button id="identity-menu-shortcuts" class="toolbar-identity-item" type="button" role="menuitem">
-        Keyboard Shortcuts
+        <svg class="toolbar-identity-item-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="11" height="8" rx="1.2"/><path d="M5 10h2.2M8.8 10H11M5.5 7h5"/></svg>
+        Shortcuts
         <span class="toolbar-identity-shortcut" aria-hidden="true">⌘/</span>
       </button>
       <div class="toolbar-identity-divider" role="separator"></div>
+      <button id="identity-menu-lock" class="toolbar-identity-item" type="button" role="menuitem">
+        <svg class="toolbar-identity-item-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="7" width="9" height="6.5" rx="1.2"/><path d="M5.5 7V5.2a2.5 2.5 0 0 1 5 0V7"/></svg>
+        Lock Screen
+      </button>
       <button id="identity-menu-sign-out" class="toolbar-identity-item" type="button" role="menuitem">
+        <svg class="toolbar-identity-item-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 3.5H4.2A1.7 1.7 0 0 0 2.5 5.2v5.6A1.7 1.7 0 0 0 4.2 12.5h2.3M7 8h6.5M11.2 5.5 13.5 8l-2.3 2.5"/></svg>
         Sign Out…
       </button>
     </div>
@@ -54,6 +73,28 @@
   <span id="toolbar-active-title" class="toolbar-active-title">Home</span>
   <nav id="toolbar-menubar" class="toolbar-menubar" aria-label="App menus"></nav>
   <div class="toolbar-spacer"></div>
+  <button
+    id="toolbar-wallet"
+    class="toolbar-btn wallet-btn"
+    type="button"
+    aria-label="Wallet"
+    title="Wallet"
+    aria-expanded="false"
+    aria-controls="wallet-rail"
+    hidden
+  ></button>
+  <button
+    id="toolbar-inbox"
+    class="toolbar-btn inbox-btn"
+    type="button"
+    aria-label="Inbox — pending actions"
+    title="Inbox"
+    aria-haspopup="dialog"
+    aria-expanded="false"
+    aria-controls="inbox-rail"
+  >
+    <span id="toolbar-inbox-count" class="toolbar-inbox-count" hidden></span>
+  </button>
   <button
     id="toolbar-spotlight"
     class="toolbar-btn spotlight-btn"
@@ -74,33 +115,14 @@
     <span class="control-centre-glyph" aria-hidden="true"></span>
   </button>
   <button
-    id="toolbar-wallet"
-    class="toolbar-btn wallet-btn"
-    type="button"
-    aria-label="Wallet"
-    title="Wallet"
-    aria-expanded="false"
-    aria-controls="wallet-rail"
-    hidden
-  ></button>
-  <button
-    id="toolbar-inbox"
-    class="toolbar-btn inbox-btn"
-    type="button"
-    aria-label="Open inbox"
-    title="Inbox"
-  >
-    <span id="toolbar-inbox-count" class="toolbar-inbox-count" hidden></span>
-  </button>
-  <button
     id="clock"
     class="toolbar-clock"
     type="button"
     aria-haspopup="true"
     aria-expanded="false"
     aria-controls="notification-center"
-    aria-label="Clock. Open notifications"
-    title="Notifications"
+    aria-label="Clock. Open notification history"
+    title="Notification history"
   >--:--</button>
 </header>
 
@@ -108,20 +130,34 @@
   id="notification-center"
   class="notification-center"
   role="group"
-  aria-label="Notification Center"
+  aria-label="Notification history"
   tabindex="-1"
   aria-hidden="true"
   inert
   hidden
 >
+  <div class="nc-cal" aria-label="Date">
+    <div class="nc-cal-primary">
+      <div id="nc-cal-date" class="nc-cal-date">—</div>
+      <div id="nc-cal-time" class="nc-cal-time">—</div>
+    </div>
+    <div
+      id="nc-cal-month"
+      class="nc-cal-month"
+      role="grid"
+      aria-label="This month"
+    ></div>
+  </div>
   <div class="notification-center-head">
-    <h2 class="notification-center-title">Notifications</h2>
-    <button id="notification-center-clear" class="notification-center-clear" type="button">
-      Clear all
+    <h2 class="notification-center-title">History</h2>
+    <button id="notification-center-clear" class="notification-center-clear" type="button" hidden>
+      Clear history
     </button>
   </div>
   <div id="notification-center-list" class="notification-center-list hide-scrollbar"></div>
-  <p id="notification-center-empty" class="notification-center-empty" hidden>No notifications</p>
+  <p id="notification-center-empty" class="notification-center-empty" hidden>
+    No recent notifications on this device
+  </p>
 </aside>
 
 <aside
@@ -149,19 +185,78 @@
       </button>
     </div>
   </div>
+  <div class="control-centre-section" aria-label="Accent">
+    <div class="control-centre-label">Accent</div>
+    <div id="control-centre-accent" class="control-centre-accents" role="radiogroup" aria-label="Accent color"></div>
+  </div>
   <div class="control-centre-divider" role="separator"></div>
-  <button id="control-centre-sounds" class="control-centre-row" type="button" role="switch" aria-checked="false">
-    <span class="control-centre-row-label">UI Sounds</span>
-    <span class="control-centre-switch" aria-hidden="true"></span>
-  </button>
-  <button id="control-centre-fullscreen" class="control-centre-row" type="button">
-    <span class="control-centre-row-label">Enter fullscreen</span>
-  </button>
+  <div class="control-centre-section" aria-label="Attention">
+    <div class="control-centre-label">Attention</div>
+    <button id="control-centre-focus" class="control-centre-row" type="button" role="switch" aria-checked="false">
+      <span class="control-centre-row-label">Focus</span>
+      <span class="control-centre-switch" aria-hidden="true"></span>
+    </button>
+    <button id="control-centre-approvals" class="control-centre-row" type="button">
+      <span class="control-centre-row-label">Approvals</span>
+      <span id="control-centre-approvals-detail" class="control-centre-row-detail">None</span>
+    </button>
+  </div>
   <div class="control-centre-divider" role="separator"></div>
-  <button id="control-centre-wallet" class="control-centre-row control-centre-wallet" type="button">
-    <span class="control-centre-row-label">Wallet</span>
-    <span class="control-centre-row-detail">Open</span>
-  </button>
+  <div class="control-centre-section" aria-label="Nearby">
+    <div class="control-centre-label">Nearby</div>
+    <button id="control-centre-discovery" class="control-centre-row" type="button" role="switch" aria-checked="false">
+      <span class="control-centre-row-label">Find People</span>
+      <span class="control-centre-switch" aria-hidden="true"></span>
+    </button>
+    <p id="control-centre-discovery-detail" class="control-centre-hint" hidden></p>
+    <div id="control-centre-carrier" class="control-centre-row control-centre-row-static" aria-live="polite">
+      <span class="control-centre-row-label">Carrier</span>
+      <span id="control-centre-carrier-detail" class="control-centre-row-detail">—</span>
+    </div>
+  </div>
+  <div class="control-centre-divider" role="separator"></div>
+  <div class="control-centre-section" aria-label="Display">
+    <div class="control-centre-label">Display</div>
+    <button id="control-centre-sounds" class="control-centre-row" type="button" role="switch" aria-checked="false">
+      <span class="control-centre-row-label">UI Sounds</span>
+      <span class="control-centre-switch" aria-hidden="true"></span>
+    </button>
+    <button id="control-centre-dock" class="control-centre-row" type="button" role="switch" aria-checked="false">
+      <span class="control-centre-row-label">Auto-hide Dock</span>
+      <span class="control-centre-switch" aria-hidden="true"></span>
+    </button>
+    <button id="control-centre-desktop-icons" class="control-centre-row" type="button" role="switch" aria-checked="true">
+      <span class="control-centre-row-label">Desktop Icons</span>
+      <span class="control-centre-switch" aria-hidden="true"></span>
+    </button>
+    <button id="control-centre-fullscreen" class="control-centre-row" type="button">
+      <span class="control-centre-row-label">Enter fullscreen</span>
+    </button>
+    <button id="control-centre-show-windows" class="control-centre-row" type="button">
+      <span class="control-centre-row-label">Show Windows</span>
+      <span class="control-centre-row-detail">›</span>
+    </button>
+  </div>
+  <div class="control-centre-divider" role="separator"></div>
+  <div class="control-centre-section" aria-label="Session">
+    <div class="control-centre-label">Session</div>
+    <div id="control-centre-whoami" class="control-centre-row control-centre-row-static">
+      <span class="control-centre-row-label">Signed in as</span>
+      <span id="control-centre-whoami-detail" class="control-centre-row-detail">—</span>
+    </div>
+    <button id="control-centre-wallet" class="control-centre-row control-centre-wallet" type="button" hidden>
+      <span class="control-centre-row-label">Wallet</span>
+      <span class="control-centre-row-detail">Open</span>
+    </button>
+    <button id="control-centre-this-device" class="control-centre-row" type="button">
+      <span class="control-centre-row-label">This Device</span>
+      <span class="control-centre-row-detail">About</span>
+    </button>
+    <button id="control-centre-system" class="control-centre-row" type="button">
+      <span class="control-centre-row-label">System</span>
+      <span class="control-centre-row-detail">Open</span>
+    </button>
+  </div>
 </aside>
 
 <aside
@@ -249,6 +344,62 @@
 </aside>
 
 <aside
+  id="inbox-rail"
+  class="wallet-rail inbox-rail"
+  role="complementary"
+  aria-label="Inbox"
+  tabindex="-1"
+  aria-hidden="true"
+  inert
+  hidden
+>
+  <div class="wallet-rail-head">
+    <h2 class="wallet-rail-title">Inbox</h2>
+    <div class="wallet-rail-head-actions">
+      <button
+        id="inbox-rail-refresh"
+        class="wallet-rail-head-btn wallet-rail-icon-btn"
+        type="button"
+        aria-label="Refresh inbox"
+        title="Refresh"
+      >
+        <svg class="wallet-rail-icon-svg" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+          <path d="M21 3v6h-6" />
+        </svg>
+      </button>
+      <button
+        id="inbox-rail-open-window"
+        class="wallet-rail-head-btn wallet-rail-text-btn"
+        type="button"
+        aria-label="Open as a window"
+        title="Open as a window"
+      >
+        Open
+      </button>
+      <button
+        id="inbox-rail-close"
+        class="wallet-rail-head-btn wallet-rail-icon-btn wallet-rail-close"
+        type="button"
+        aria-label="Close inbox"
+      >
+        <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
+      </button>
+    </div>
+  </div>
+  <iframe id="inbox-rail-frame" class="wallet-rail-frame" title="Inbox" hidden></iframe>
+  <div id="inbox-rail-error" class="wallet-rail-error" hidden>
+    <h3 class="wallet-rail-error-title">Could not open Inbox</h3>
+    <p class="wallet-rail-error-copy">
+      Home asked the runtime to open Inbox, but the launch did not complete. It may be
+      momentary — trying again is safe.
+    </p>
+    <p id="inbox-rail-error-detail" class="wallet-rail-error-detail"></p>
+    <button id="inbox-rail-retry" class="window-error-retry" type="button">Try Again</button>
+  </div>
+</aside>
+
+<aside
   id="connector-sheet"
   class="connector-sheet"
   role="dialog"
@@ -290,7 +441,7 @@
   </section>
 </main>
 
-<footer class="taskbar" aria-label="Home taskbar" data-home-gui-hidden-by-host="hidden" inert hidden>
+<footer class="taskbar" aria-label="Dock" data-home-gui-hidden-by-host="hidden" inert hidden>
   <div class="taskbar-inner">
     <div class="taskbar-primary">
       <button
@@ -304,7 +455,7 @@
       >
         <span class="taskbar-icon taskbar-icon-launcher"></span>
       </button>
-      <div id="taskbar-targets" class="taskbar-sortable" aria-label="Taskbar items"></div>
+      <div id="taskbar-targets" class="taskbar-sortable" aria-label="Dock items"></div>
     </div>
   </div>
 </footer>
@@ -312,16 +463,19 @@
 <aside id="launcher" class="launcher" aria-hidden="true" data-open="false" data-view="grid" inert hidden>
   <div class="launcher-popover" role="dialog" aria-modal="true" aria-label="Home launcher">
     <div class="launcher-header">
-      <div class="launcher-search-wrap">
+      <div class="launcher-search-wrap" hidden>
         <input
           id="launcher-search"
           class="launcher-search-field"
           type="search"
           autocomplete="off"
-          placeholder="Search Home"
+          placeholder="Search"
           spellcheck="false"
+          tabindex="-1"
+          aria-hidden="true"
         />
       </div>
+      <p class="launcher-browse-label">Apps</p>
       <button
         id="launcher-view-toggle"
         class="launcher-header-btn"
@@ -334,7 +488,7 @@
       </button>
     </div>
     <div class="launcher-scroll hide-scrollbar">
-      <h1 class="launcher-heading">Open</h1>
+      <h1 class="launcher-heading visually-hidden">Apps</h1>
       <div id="launcher-grid" class="launcher-sections"></div>
       <p id="launcher-empty-state" class="launcher-empty" hidden>No matching items</p>
     </div>
@@ -342,7 +496,7 @@
 </aside>
 
 <aside id="spotlight" class="spotlight" aria-hidden="true" inert hidden>
-  <div class="spotlight-panel" role="dialog" aria-modal="true" aria-label="Spotlight search">
+  <div class="spotlight-panel" role="dialog" aria-modal="true" aria-label="Search">
     <div class="spotlight-bar">
       <input
         id="spotlight-input"
@@ -350,12 +504,12 @@
         type="search"
         autocomplete="off"
         spellcheck="false"
-        placeholder="Spotlight Search"
+        placeholder="Search"
         role="combobox"
         aria-expanded="false"
         aria-controls="spotlight-results"
         aria-activedescendant=""
-        aria-label="Spotlight search"
+        aria-label="Search"
       />
     </div>
     <div
@@ -421,10 +575,12 @@
     <dl class="shortcuts-list">
       <div class="shortcuts-row"><dt>Search (Spotlight)</dt><dd><kbd>⌘</kbd><kbd>Space</kbd> or <kbd>Ctrl</kbd><kbd>Space</kbd></dd></div>
       <div class="shortcuts-row"><dt>Quick Look</dt><dd><kbd>Space</kbd> on a desktop icon</dd></div>
-      <div class="shortcuts-row"><dt>Mission Control</dt><dd><kbd>F3</kbd></dd></div>
+      <div class="shortcuts-row"><dt>Show Windows</dt><dd><kbd>F3</kbd></dd></div>
       <div class="shortcuts-row"><dt>Switch windows</dt><dd><kbd>Alt</kbd><kbd>Tab</kbd></dd></div>
       <div class="shortcuts-row"><dt>Cycle windows</dt><dd><kbd>⌘</kbd><kbd>`</kbd></dd></div>
       <div class="shortcuts-row"><dt>Close window</dt><dd><kbd>⌘</kbd><kbd>W</kbd></dd></div>
+      <div class="shortcuts-row"><dt>Minimize window</dt><dd><kbd>⌘</kbd><kbd>M</kbd> or <kbd>Ctrl</kbd><kbd>M</kbd></dd></div>
+      <div class="shortcuts-row"><dt>Snap window</dt><dd><kbd>⌘</kbd><kbd>⌥</kbd><kbd>←</kbd><kbd>→</kbd><kbd>↑</kbd><kbd>↓</kbd> or <kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>arrows</kbd></dd></div>
       <div class="shortcuts-row"><dt>Navigate desktop</dt><dd><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd> then <kbd>Enter</kbd></dd></div>
       <div class="shortcuts-row"><dt>App actions</dt><dd><kbd>Shift</kbd><kbd>F10</kbd> on an icon</dd></div>
       <div class="shortcuts-row"><dt>This overlay</dt><dd><kbd>⌘</kbd><kbd>/</kbd></dd></div>
@@ -440,13 +596,27 @@
   hidden
 >
   <div class="about-card" role="dialog" aria-modal="true" aria-labelledby="about-title">
-    <button id="about-close" class="launcher-close" type="button" aria-label="Close About ElastOS">
-      <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
-    </button>
-    <img class="about-logo" src="/apps/home-gui/elastos-logo.svg" alt="" draggable="false" />
+    <div class="about-traffic-lights window-traffic-lights">
+      <button
+        id="about-close"
+        class="window-action-btn"
+        data-action="close"
+        type="button"
+        aria-label="Close About ElastOS"
+      >
+        <img src="./close.svg" alt="" draggable="false" />
+      </button>
+    </div>
+    <img class="about-logo" src="./elastos-logo.svg" alt="" draggable="false" />
     <h1 id="about-title" class="about-title">ElastOS</h1>
-    <p class="about-line">Home GUI shell</p>
+    <p class="about-line">ElastOS desktop</p>
+    <p id="about-version" class="about-line about-version" hidden></p>
     <p id="about-identity" class="about-line about-identity"></p>
+    <p id="about-update" class="about-line about-update" hidden></p>
+    <div class="about-actions">
+      <button id="about-more" class="about-more" type="button">More Info…</button>
+      <button id="about-software-update" class="about-more" type="button">Software Update…</button>
+    </div>
   </div>
 </section>
 
@@ -523,7 +693,7 @@
 
 <template id="window-error-template">
   <div class="window-error">
-    <h3 class="window-error-title">Runtime data not attached on this host</h3>
+    <h3 class="window-error-title">This window couldn't open</h3>
     <p class="window-error-copy"></p>
     <dl class="window-error-facts">
       <div class="window-error-fact">
@@ -546,6 +716,7 @@
     <button class="taskbar-item" type="button">
       <span class="taskbar-icon">
         <span class="taskbar-item-icon"></span>
+        <span class="taskbar-notification-badge" hidden></span>
       </span>
       <span class="active-taskbar-indicator" aria-hidden="true"></span>
     </button>

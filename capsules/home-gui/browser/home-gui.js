@@ -24,13 +24,13 @@ import {
   shellInteractionActive,
   shouldIgnoreDesktopKeydown,
   targetById,
-} from "./shell-core.js?v=home-20260719f";
+} from "./shell-core.js?v=home-20260719x";
 import {
   bindIdentityMenu,
   clearIdentitySurface,
   syncIdentity,
   updateClock,
-} from "./shell-chrome.js?v=home-20260719f";
+} from "./shell-chrome.js?v=home-20260719x";
 import {
   beginDesktopMarquee,
   bindShellSurfaceDom,
@@ -57,7 +57,7 @@ import {
   toggleLauncher,
   updateDesktopMarquee,
   updateTaskbarState,
-} from "./shell-surface.js?v=home-20260719f";
+} from "./shell-surface.js?v=home-20260719x";
 import {
   closeWindow,
   cleanupBeforeUnload,
@@ -68,40 +68,42 @@ import {
   restoreShellSession,
   showDesktopHome,
   supportsMenuNewWindow,
-} from "./shell-windows.js?v=home-20260719f";
+} from "./shell-windows.js?v=home-20260719x";
 import {
   bindShellKeyboard,
   handleDesktopArrowKey,
   retireKeyboardSurfaces,
   toggleShortcutsOverlay,
-} from "./shell-keyboard.js?v=home-20260719f";
+} from "./shell-keyboard.js?v=home-20260719x";
 import {
   bindSpotlight,
   hideSpotlight,
   showSpotlight,
-} from "./shell-spotlight.js?v=home-20260719f";
+} from "./shell-spotlight.js?v=home-20260719x";
 import {
   bindNotificationCenter,
   hideNotificationCenter,
   recordNotifications,
-} from "./shell-notifications.js?v=home-20260719f";
+} from "./shell-notifications.js?v=home-20260719x";
 import {
   bindMenubar,
   closeMenus,
   setMenuManifest,
   syncMenubar,
-} from "./shell-menubar.js?v=home-20260719f";
+} from "./shell-menubar.js?v=home-20260719x";
 import {
   bindQuickLook,
   hideQuickLook,
   toggleQuickLook,
-} from "./shell-quicklook.js?v=home-20260719f";
-import { bindExpose, closeExpose } from "./shell-expose.js?v=home-20260719f";
-import { setUiSoundsEnabled } from "./shell-sounds.js?v=home-20260719f";
+} from "./shell-quicklook.js?v=home-20260719x";
+import { bindExpose, closeExpose } from "./shell-expose.js?v=home-20260719x";
+import { setUiSoundsEnabled } from "./shell-sounds.js?v=home-20260719x";
+import { setFocusModeEnabled } from "./shell-core.js?v=home-20260719x";
 import {
   bindControlCentre,
   hideControlCentre,
-} from "./shell-control-centre.js?v=home-20260719f";
+  syncControlCentre,
+} from "./shell-control-centre.js?v=home-20260719x";
 import {
   bindWalletRail,
   retireWalletRail,
@@ -110,7 +112,16 @@ import {
   walletRailFrame,
   walletRailOpen,
   walletRailSessionMounted,
-} from "./shell-wallet-rail.js?v=home-20260719f";
+} from "./shell-wallet-rail.js?v=home-20260719x";
+import {
+  bindInboxRail,
+  retireInboxRail,
+  toggleInboxRail,
+  showInboxRail,
+  inboxRailFrame,
+  inboxRailOpen,
+  inboxRailSessionMounted,
+} from "./shell-inbox-rail.js?v=home-20260719x";
 import {
   bindConnectorSheet,
   connectorSheetFrame,
@@ -119,7 +130,7 @@ import {
   noteConnectorSheetSummaryRefresh,
   retireConnectorSheet,
   showConnectorSheet,
-} from "./shell-connector-sheet.js?v=home-20260719f";
+} from "./shell-connector-sheet.js?v=home-20260719x";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
@@ -135,6 +146,7 @@ bindShellKeyboard();
 bindMenubar({ closeWindow, openTarget, supportsNewWindow: supportsMenuNewWindow });
 bindControlCentre();
 bindWalletRail();
+bindInboxRail();
 bindConnectorSheet();
 
 const HOME_GUI_HOST_SELECTORS = Object.freeze([
@@ -148,6 +160,7 @@ const HOME_GUI_HOST_SELECTORS = Object.freeze([
   "#notification-center",
   "#control-centre",
   "#wallet-rail",
+  "#inbox-rail",
   "#connector-sheet",
   "#spotlight",
   "#window-switcher",
@@ -193,6 +206,11 @@ configureWindowHooks({
       retireWalletRail();
     }
   },
+  retireInboxRailBeforeWindow: () => {
+    if (inboxRailSessionMounted() || inboxRailOpen()) {
+      retireInboxRail();
+    }
+  },
 });
 
 function homeGuiHostNodes() {
@@ -229,9 +247,10 @@ export function retireHomeGuiSurface(options = {}) {
   hideDesktopContextMenu();
   clearDesktopSelection();
   hideSpotlight({ restoreFocus: false });
-  hideNotificationCenter();
+  hideNotificationCenter({ restoreFocus: false });
   hideControlCentre({ restoreFocus: false });
   retireWalletRail();
+  retireInboxRail();
   retireConnectorSheet();
   hideAboutOverlay({ restoreFocus: false });
   hideQuickLook();
@@ -366,7 +385,7 @@ export function relaunchHomeGuiTarget(windowId, target) {
 }
 
 export function deliverMessageToHomeGuiTargetFrame(target, payload, options = null) {
-  // Prefer an open wallet rail over a desktop window — same capsule, user's
+  // Prefer an open rail over a desktop window — same capsule, user's
   // current surface. Focus shows the rail; window focus is the fallback.
   if (target === "wallet" && walletRailOpen()) {
     const railFrame = walletRailFrame();
@@ -374,6 +393,16 @@ export function deliverMessageToHomeGuiTargetFrame(target, payload, options = nu
       railFrame.contentWindow.postMessage(payload, OPAQUE_FRAME_TARGET);
       if (options?.focus === true) {
         showWalletRail();
+      }
+      return true;
+    }
+  }
+  if (target === "inbox" && inboxRailOpen()) {
+    const railFrame = inboxRailFrame();
+    if (railFrame?.contentWindow) {
+      railFrame.contentWindow.postMessage(payload, OPAQUE_FRAME_TARGET);
+      if (options?.focus === true) {
+        showInboxRail();
       }
       return true;
     }
@@ -399,6 +428,8 @@ export function openHomeGuiTargetWithPayload(target, payload) {
     deliveredCount += 1;
   } else if (target === "wallet" && targetById(shellState.currentSummary, "wallet")) {
     showWalletRail();
+  } else if (target === "inbox" && targetById(shellState.currentSummary, "inbox")) {
+    showInboxRail();
   } else if (targetById(shellState.currentSummary, target)) {
     openTarget(target);
   } else {
@@ -437,6 +468,9 @@ export function applyHomeGuiUiPreferences(preferences) {
   if (typeof entries.sounds === "string") {
     setUiSoundsEnabled(entries.sounds === "on");
   }
+  if (typeof entries.focusMode === "string") {
+    setFocusModeEnabled(entries.focusMode === "on");
+  }
   broadcastHomeGuiUiPreferences(entries);
 }
 
@@ -452,6 +486,11 @@ function broadcastHomeGuiUiPreferences(preferences) {
   }
   try {
     walletRailFrame()?.contentWindow?.postMessage(message, OPAQUE_FRAME_TARGET);
+  } catch (_error) {
+    // Rail not mounted.
+  }
+  try {
+    inboxRailFrame()?.contentWindow?.postMessage(message, OPAQUE_FRAME_TARGET);
   } catch (_error) {
     // Rail not mounted.
   }
@@ -476,6 +515,12 @@ export function broadcastHomeGuiRuntimeEvents(events) {
     railFrame?.contentWindow?.postMessage(message, OPAQUE_FRAME_TARGET);
   } catch (error) {
     console.warn("could not deliver runtime event to wallet rail", error);
+  }
+  const inboxFrame = inboxRailFrame();
+  try {
+    inboxFrame?.contentWindow?.postMessage(message, OPAQUE_FRAME_TARGET);
+  } catch (error) {
+    console.warn("could not deliver runtime event to inbox rail", error);
   }
 }
 
@@ -502,6 +547,30 @@ export function homeGuiMessageContextForSource(source, origin, homeToken) {
         kind: "app-frame",
         targetId: "wallet",
         windowId: "wallet-rail",
+        homeToken,
+      };
+    }
+    return null;
+  }
+  const inboxFrame = inboxRailFrame();
+  let inboxWindow = null;
+  try {
+    inboxWindow = inboxFrame?.contentWindow || null;
+  } catch (_error) {
+    inboxWindow = null;
+  }
+  if (inboxWindow && inboxWindow === source) {
+    if (origin !== OPAQUE_CAPSULE_ORIGIN) {
+      return null;
+    }
+    const expectedToken = homeLaunchTokenFromRoute(
+      inboxFrame?.dataset?.route || inboxFrame?.getAttribute("src") || "",
+    );
+    if (expectedToken && expectedToken === homeToken) {
+      return {
+        kind: "app-frame",
+        targetId: "inbox",
+        windowId: "inbox-rail",
         homeToken,
       };
     }
@@ -647,6 +716,7 @@ export function syncHomeGuiChrome(previous, summary) {
   syncWalletRailAvailability(summary);
   maybeShowWalletApprovalToast(previous, summary);
   recordNotifications(summary);
+  syncControlCentre(summary);
 }
 
 /* Menus are self-declared UI, not authority: the host verifies the sender's
@@ -742,19 +812,45 @@ function fullscreenApi() {
   return { root, request, exit };
 }
 
-/* About ElastOS: the smallest honest dialog — logo, product name, which
-   shell this is, who is signed in. No version claims the shell cannot
-   verify from runtime facts. */
+/* About ElastOS: window-chrome close, verified runtime version, and an
+   honest update path (System About owns check/install — no fake badges). */
 let aboutOverlayBound = false;
 
 function aboutOverlayNode() {
   return document.querySelector("#about-overlay");
 }
 
-function showAboutOverlay() {
-  const overlay = aboutOverlayNode();
-  if (!overlay) {
-    return;
+function aboutRuntimeVersion(summary) {
+  const version = summary?.runtime?.version;
+  return typeof version === "string" && version.trim() ? version.trim() : "";
+}
+
+/* Prefer an explicit summary flag when present; never invent “up to date”. */
+function aboutUpdateSignal(summary) {
+  const runtime = summary?.runtime;
+  if (!runtime || typeof runtime !== "object") {
+    return null;
+  }
+  if (runtime.update_available === true) {
+    return { state: "available", label: "Update available" };
+  }
+  if (runtime.update_available === false) {
+    return { state: "current", label: "Up to date" };
+  }
+  const note = typeof runtime.update_status === "string" ? runtime.update_status.trim() : "";
+  if (note) {
+    return { state: "info", label: note };
+  }
+  return null;
+}
+
+function syncAboutOverlayFacts(overlay) {
+  const summary = shellState.currentSummary;
+  const versionLine = overlay.querySelector("#about-version");
+  if (versionLine) {
+    const version = aboutRuntimeVersion(summary);
+    versionLine.textContent = version ? `Version ${version}` : "";
+    versionLine.hidden = !version;
   }
   const identityLine = overlay.querySelector("#about-identity");
   if (identityLine) {
@@ -762,6 +858,35 @@ function showAboutOverlay() {
     identityLine.textContent = name ? `Signed in as ${name}` : "";
     identityLine.hidden = !name;
   }
+  const updateLine = overlay.querySelector("#about-update");
+  if (updateLine) {
+    const signal = aboutUpdateSignal(summary);
+    if (signal) {
+      updateLine.textContent = signal.label;
+      updateLine.dataset.state = signal.state;
+      updateLine.hidden = false;
+    } else {
+      updateLine.textContent = "";
+      delete updateLine.dataset.state;
+      updateLine.hidden = true;
+    }
+  }
+}
+
+function openSystemAboutFromOverlay() {
+  hideAboutOverlay({ restoreFocus: false });
+  if (!targetById(shellState.currentSummary, "system")) {
+    return;
+  }
+  openTarget("system", { query: { settings: "about" } });
+}
+
+function showAboutOverlay() {
+  const overlay = aboutOverlayNode();
+  if (!overlay) {
+    return;
+  }
+  syncAboutOverlayFacts(overlay);
   overlay.hidden = false;
   overlay.inert = false;
   overlay.setAttribute("aria-hidden", "false");
@@ -794,6 +919,10 @@ function bindAboutOverlay() {
     return;
   }
   overlay.querySelector("#about-close")?.addEventListener("click", () => hideAboutOverlay());
+  overlay.querySelector("#about-more")?.addEventListener("click", () => openSystemAboutFromOverlay());
+  overlay.querySelector("#about-software-update")?.addEventListener("click", () => {
+    openSystemAboutFromOverlay();
+  });
   overlay.addEventListener("pointerdown", (event) => {
     if (!event.target.closest(".about-card")) {
       hideAboutOverlay({ restoreFocus: false });
@@ -807,8 +936,22 @@ function bindAboutOverlay() {
       return;
     }
     if (event.key === "Tab") {
-      // Single focusable control; keep focus inside the modal.
+      const focusables = [
+        overlay.querySelector("#about-close"),
+        overlay.querySelector("#about-more"),
+        overlay.querySelector("#about-software-update"),
+      ].filter((node) => node && !node.disabled && !node.hidden);
+      if (focusables.length < 2) {
+        event.preventDefault();
+        focusables[0]?.focus();
+        return;
+      }
       event.preventDefault();
+      const index = focusables.indexOf(document.activeElement);
+      const next = event.shiftKey
+        ? (index <= 0 ? focusables.length - 1 : index - 1)
+        : (index >= focusables.length - 1 ? 0 : index + 1);
+      focusables[next].focus();
     }
   });
 }
@@ -941,7 +1084,7 @@ export function bindHomeGuiInteractions(options = {}) {
     if (!targetById(shellState.currentSummary, "inbox")) {
       return;
     }
-    openTarget("inbox");
+    toggleInboxRail();
   });
 
   bindHomeGuiFullscreenControl();
@@ -954,8 +1097,19 @@ export function bindHomeGuiInteractions(options = {}) {
     openTarget("system");
   });
 
+  document.querySelector("#identity-menu-marketplace")?.addEventListener("click", () => {
+    if (!targetById(shellState.currentSummary, "marketplace")) {
+      return;
+    }
+    openTarget("marketplace");
+  });
+
   document.querySelector("#identity-menu-shortcuts")?.addEventListener("click", () => {
     toggleShortcutsOverlay();
+  });
+
+  document.querySelector("#identity-menu-lock")?.addEventListener("click", () => {
+    window.dispatchEvent(new CustomEvent("elastos:request-lock"));
   });
 
   bindAboutOverlay();

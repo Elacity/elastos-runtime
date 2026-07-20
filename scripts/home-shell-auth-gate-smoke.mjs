@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260719q";
+const moduleVersion = "home-20260719y";
 const requests = [];
 const windowListeners = new Map();
 
@@ -272,7 +272,11 @@ assert(
   elementForSelector("#home-shell-boot-mask").hidden === true,
   "auth gate left the neutral host mask over the passkey prompt",
 );
-assert(document.body.dataset.homeStatus === "ready", "auth gate prompt did not leave Home ready for passkey input", document.body.dataset);
+assert(
+  document.body.dataset.homeStatus === "locked",
+  "unsigned auth gate must leave Home locked for the account picker",
+  document.body.dataset,
+);
 assert(document.body.dataset.homeShell === "resolving", "auth gate left a root shell visible", document.body.dataset);
 assert(document.body.dataset.homeGui === "dormant", "auth gate left Home GUI mounted", document.body.dataset);
 assert(activeShellRoot.hidden === true, "auth gate left the active shell root visible");

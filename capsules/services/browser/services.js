@@ -20,7 +20,7 @@ let pendingServiceAction = null;
 announceReady();
 
 boot().catch((error) => {
-  showStatus(error.message || "Services failed to load.", "error");
+  showStatus(error.message || "Sharing failed to load.", "error");
   lockedShell?.classList.remove("hidden");
   servicesShell?.classList.add("hidden");
 });
@@ -69,7 +69,7 @@ function activateServicesSection(target, options = {}) {
 
 function bindActions() {
   refreshButton?.addEventListener("click", () => {
-    refreshServices().catch((error) => showStatus(error.message || "Could not refresh Services.", "error"));
+    refreshServices().catch((error) => showStatus(error.message || "Could not refresh Sharing.", "error"));
   });
   document.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target : event.target?.parentElement;
@@ -92,13 +92,13 @@ function bindActions() {
 
 async function refreshServices() {
   setBusy(true);
-  showStatus("Refreshing Services...", "muted");
+  showStatus("Refreshing Sharing...", "muted");
   try {
     const services = await fetchJson("/api/apps/services/summary", {
       headers: shellHeaders(),
     });
     renderServices(services);
-    showStatus("Services updated.", "ok");
+    showStatus("Sharing updated.", "ok");
   } finally {
     setBusy(false);
   }
@@ -118,8 +118,8 @@ function renderServices(services) {
     source: "mine",
     selectedTitle: "Shared",
     availableTitle: "Available on this device",
-    emptySelected: "No Services are shared.",
-    emptyAvailable: "No Browser Engine or Browser Exit service is installed on this device.",
+    emptySelected: "Nothing shared yet.",
+    emptyAvailable: "No shareable services on this device.",
   });
   otherServicesList.innerHTML = renderServiceSection({
     selected: remoteOffers,
@@ -127,8 +127,8 @@ function renderServices(services) {
     source: "others",
     selectedTitle: "Subscribed",
     availableTitle: "Available from People",
-    emptySelected: "No Services from others are subscribed.",
-    emptyAvailable: "No Browser Engine or Browser Exit services are available from People you are connected with.",
+    emptySelected: "No subscriptions yet.",
+    emptyAvailable: "No services from People yet.",
   });
 }
 
@@ -468,7 +468,7 @@ function showStatus(text, tone = "muted") {
     return;
   }
   statusNode.textContent = tone === "error"
-    ? publicServicesError(text, "Services could not be updated.")
+    ? publicServicesError(text, "Sharing could not be updated.")
     : text;
   statusNode.dataset.tone = tone;
   statusNode.hidden = !text;

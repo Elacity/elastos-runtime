@@ -14,6 +14,7 @@
   --neg: oklch(0.7 0.16 28);
   --warn: oklch(0.78 0.13 78);
   --accent: var(--el-accent);
+  --accent-ink: var(--el-accent-ink, #ffffff);
   --btc: oklch(0.72 0.14 70);
   --eth: oklch(0.6 0.05 270);
   --ela: oklch(0.62 0.13 200);
@@ -26,16 +27,16 @@
 
 :root[data-el-theme="light"] {
   color-scheme: light;
-  --bg: #fafaf7;
-  --surface: #ffffff;
-  --surface-alt: #f4f2ec;
-  --line: rgba(14, 14, 12, 0.08);
-  --line-strong: rgba(14, 14, 12, 0.16);
-  --ink: #0e0e0c;
-  --ink-soft: rgba(14, 14, 12, 0.66);
-  --ink-mute: rgba(14, 14, 12, 0.44);
-  --chip: rgba(14, 14, 12, 0.045);
-  --chip-hover: rgba(14, 14, 12, 0.08);
+  --bg: var(--el-bg);
+  --surface: var(--el-surface-raised);
+  --surface-alt: var(--el-inset);
+  --line: var(--el-hairline);
+  --line-strong: var(--el-hairline-strong);
+  --ink: var(--el-text);
+  --ink-soft: var(--el-muted);
+  --ink-mute: var(--el-soft);
+  --chip: var(--el-inset);
+  --chip-hover: var(--el-lift);
   --pos: oklch(0.55 0.13 150);
   --neg: oklch(0.55 0.18 28);
   --warn: oklch(0.65 0.13 78);
@@ -192,7 +193,7 @@ button {
   padding: 0 4px;
   border-radius: 999px;
   background: var(--accent);
-  color: #fff;
+  color: var(--accent-ink);
   font-size: 10px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
@@ -1406,7 +1407,7 @@ h3 {
   height: 20px;
   border-radius: 7px;
   background: var(--accent);
-  color: white;
+  color: var(--accent-ink);
   font-weight: 600;
   overflow: hidden;
 }

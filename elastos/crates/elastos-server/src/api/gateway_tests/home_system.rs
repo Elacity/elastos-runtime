@@ -735,10 +735,10 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
         .find(|target| target["target"] == "services")
         .expect("services target");
     assert_eq!(services["role"], "app");
-    assert_eq!(services["title"], "Services");
+    assert_eq!(services["title"], "Sharing");
     assert_eq!(
         services["description"],
-        "Manage Browser Exit Node sharing and subscriptions."
+        "Share Browser Engine and Browser Exit services with people."
     );
     assert_eq!(services["route"], "/apps/services/");
     assert_eq!(services["attach_kind"], "iframe");
@@ -1406,6 +1406,16 @@ async fn test_services_remote_exit_request_delivers_provider_inbox_notification(
         .unwrap()
         .to_string();
     assert!(action_id.starts_with("service-approve-request:"));
+    let request_id = action_id
+        .strip_prefix("service-approve-request:")
+        .expect("service approve action id prefix");
+    let approval_token = intent_token_for_app_context(
+        right.path(),
+        INBOX_CAPSULE_ID,
+        &right_inbox_token,
+        "service.approve",
+        &json!({ "request_id": request_id }),
+    );
 
     let approved = right_app
         .clone()
@@ -1415,7 +1425,13 @@ async fn test_services_remote_exit_request_delivers_provider_inbox_notification(
                 .uri("/api/apps/inbox/actions")
                 .header("x-elastos-home-token", right_inbox_token.clone())
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(json!({ "action_id": action_id }).to_string()))
+                .body(Body::from(
+                    json!({
+                        "action_id": action_id,
+                        "home_token": approval_token,
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -1920,6 +1936,103 @@ async fn test_people_invite_create_returns_conversation_join_link() {
     assert!(invite_url.starts_with("elastos://peer/invite?token="));
     assert_eq!(payload["issuer_gateway"], "http://localhost:61180");
     assert_eq!(payload["room_title"], "Chat");
+}
+
+#[tokio::test]
+async fn test_home_discovery_shell_token_toggles_same_state_as_people() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority_with_name(dir.path(), Some("shell-discovery"));
+    let home_gui_token =
+        launch_token_for_authority_context(dir.path(), HOME_GUI_SHELL_ID, &authority);
+    let system_token = authority.system_token.clone();
+    let home_token = authority.home_token.clone();
+
+    let enabled = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/discovery")
+                .header("x-elastos-home-token", home_gui_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"enabled":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = enabled.status();
+    let body = axum::body::to_bytes(enabled.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["enabled"], true);
+
+    let summary = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/apps/home/summary")
+                .header("x-elastos-home-token", home_token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(summary.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["people"]["discovery"]["enabled"], true);
+
+    let forbidden = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/discovery")
+                .header("x-elastos-home-token", system_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"enabled":false}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    let unknown = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/discovery")
+                .header("x-elastos-home-token", home_gui_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"enabled":true,"extra":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        unknown.status().is_client_error(),
+        "unknown fields must fail closed"
+    );
+
+    let disabled = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/discovery")
+                .header("x-elastos-home-token", home_gui_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"enabled":false}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -5579,6 +5692,105 @@ async fn test_home_browser_state_is_encrypted_for_protected_principal_root() {
         loaded_json["layout"]["desktopIconsVisible"],
         serde_json::Value::Bool(false)
     );
+}
+
+#[tokio::test]
+async fn test_home_desktop_object_mutation_is_desktop_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = library_test_state(dir.path()).await;
+    let app = gateway_router(state);
+    let authority = passkey_authority_with_name(dir.path(), Some("desktop-mutate"));
+    let home_gui_token =
+        launch_token_for_authority_context(dir.path(), HOME_GUI_SHELL_ID, &authority);
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let desktop = format!("{localhost_root}/Desktop");
+    let documents = format!("{localhost_root}/Documents");
+
+    let (status, created) = home_test_post_json(
+        &app,
+        "/api/apps/home/desktop/objects",
+        &home_gui_token,
+        json!({ "op": "mkdir", "name": "Shell Folder" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(created["status"], "ok");
+
+    let folder_uri = format!("{desktop}/Shell Folder");
+    let (status, renamed) = home_test_post_json(
+        &app,
+        "/api/apps/home/desktop/objects",
+        &home_gui_token,
+        json!({ "op": "rename", "uri": folder_uri, "name": "Renamed Folder" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(renamed["status"], "ok");
+
+    let renamed_uri = format!("{desktop}/Renamed Folder");
+    let (status, trashed) = home_test_post_json(
+        &app,
+        "/api/apps/home/desktop/objects",
+        &home_gui_token,
+        json!({ "op": "trash", "uri": renamed_uri }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(trashed["status"], "ok");
+
+    let (status, written) = home_test_post_json(
+        &app,
+        "/api/apps/home/desktop/objects",
+        &home_gui_token,
+        json!({ "op": "write", "name": "untitled.txt" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(written["status"], "ok");
+
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/desktop/objects")
+                .header(HOST, "localhost:61180")
+                .header("x-elastos-home-token", home_gui_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "op": "mkdir", "parent_uri": documents, "name": "Nope" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+    let denied_body = axum::body::to_bytes(denied.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let denied_text = String::from_utf8_lossy(&denied_body);
+    assert!(
+        denied_text.contains("outside Desktop"),
+        "expected outside Desktop denial, got {denied_text}"
+    );
+
+    let forbidden = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/desktop/objects")
+                .header(HOST, "localhost:61180")
+                .header("x-elastos-home-token", authority.system_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "op": "mkdir", "name": "System Folder" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

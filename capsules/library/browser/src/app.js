@@ -559,7 +559,7 @@ import { createLibraryUploads } from "./uploads.js";
       } else {
         state.loading = true;
         state.currentObject = null;
-        setStatus("Loading...");
+        setStatus("Loading…");
       }
       try {
         const data = await providerApi("list", { uri });

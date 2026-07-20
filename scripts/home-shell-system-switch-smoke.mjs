@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260719q";
+const moduleVersion = "home-20260719y";
 const requests = [];
 const windowListeners = new Map();
 const localStorageValues = new Map();

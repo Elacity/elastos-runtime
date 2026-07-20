@@ -231,6 +231,20 @@ async fn dispatch_inbox_action(
         );
     }
     if let Some(request_id) = action_id.strip_prefix("room-approve-request:") {
+        let Some(home_token) = action.home_token.as_deref() else {
+            anyhow::bail!("fresh passkey verification is required to approve a room request");
+        };
+        consume_fresh_passkey_home_token(
+            data_dir,
+            home_token,
+            context,
+            INBOX_CAPSULE_ID,
+            180,
+            "room.approve",
+            &serde_json::json!({
+                "request_id": request_id,
+            }),
+        )?;
         let message = match crate::room_service::approve_request(data_dir, request_id)? {
             Some(outcome) => format!(
                 "Approved Chat web guest request for {} on {}.",
@@ -312,12 +326,40 @@ async fn dispatch_inbox_action(
         return Ok("Rejected wallet request.".to_string());
     }
     if let Some(request_id) = action_id.strip_prefix("capability-approve-request:") {
+        let Some(home_token) = action.home_token.as_deref() else {
+            anyhow::bail!("fresh passkey verification is required to approve a capability request");
+        };
+        consume_fresh_passkey_home_token(
+            data_dir,
+            home_token,
+            context,
+            INBOX_CAPSULE_ID,
+            180,
+            "capability.approve",
+            &serde_json::json!({
+                "request_id": request_id,
+            }),
+        )?;
         return approve_runtime_capability_request(data_dir, request_id).await;
     }
     if let Some(request_id) = action_id.strip_prefix("capability-deny-request:") {
         return deny_runtime_capability_request(data_dir, request_id).await;
     }
     if let Some(request_id) = action_id.strip_prefix("service-approve-request:") {
+        let Some(home_token) = action.home_token.as_deref() else {
+            anyhow::bail!("fresh passkey verification is required to approve a sharing request");
+        };
+        consume_fresh_passkey_home_token(
+            data_dir,
+            home_token,
+            context,
+            INBOX_CAPSULE_ID,
+            180,
+            "service.approve",
+            &serde_json::json!({
+                "request_id": request_id,
+            }),
+        )?;
         let data_dir = data_dir.clone();
         let context = context.clone();
         let request_id = request_id.to_string();

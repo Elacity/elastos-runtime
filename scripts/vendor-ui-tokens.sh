@@ -28,6 +28,7 @@ TARGETS=(
   home-gui/browser
   documents/browser
   inbox/browser
+  people/browser
   system/browser
   wallet/browser
   chat-room/browser

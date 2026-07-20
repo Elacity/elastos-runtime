@@ -3,26 +3,37 @@ import {
   mountGlyph,
   trapTabWithin,
   launcher,
-} from "./shell-core.js?v=home-20260719f";
+} from "./shell-core.js?v=home-20260719x";
 import {
   moveDesktopSelection,
-} from "./shell-surface.js?v=home-20260719f";
-import { toggleSpotlight } from "./shell-spotlight.js?v=home-20260719f";
+} from "./shell-surface.js?v=home-20260719x";
+import { toggleSpotlight } from "./shell-spotlight.js?v=home-20260719x";
 import {
   focusWindow,
   closeWindow,
+  minimizeWindow,
+  maximizeActiveWindow,
   sortWindowEntriesByZOrder,
-} from "./shell-windows.js?v=home-20260719f";
+} from "./shell-windows.js?v=home-20260719x";
+import {
+  applyWindowSnapState,
+  restoreWindowFromSpecialState,
+} from "./shell-window-geometry.js?v=home-20260719x";
 import {
   closeExpose,
   isExposeOpen,
   toggleExpose,
-} from "./shell-expose.js?v=home-20260719f";
+} from "./shell-expose.js?v=home-20260719x";
 import {
   hideQuickLook,
   isQuickLookOpen,
   toggleQuickLook,
-} from "./shell-quicklook.js?v=home-20260719f";
+} from "./shell-quicklook.js?v=home-20260719x";
+import {
+  closeOtherShellPopovers,
+  registerShellPopover,
+  setOverlayOpen,
+} from "./shell-popovers.js?v=home-20260719x";
 
 /* Shell keyboard layer.
  *
@@ -82,9 +93,12 @@ function openSwitcher() {
   switcherState.entries = entries;
   switcherState.index = entries.length > 1 ? 1 : 0;
   switcherState.invoker = document.activeElement;
+  closeOtherShellPopovers("window-switcher");
   renderSwitcher();
-  switcherRoot.hidden = false;
-  switcherRoot.setAttribute("aria-hidden", "false");
+  setOverlayOpen(switcherRoot, true, {
+    invoker: switcherState.invoker,
+    focusEl: switcherList,
+  });
   return true;
 }
 
@@ -138,9 +152,9 @@ function moveSwitcherSelection(delta) {
 function closeSwitcher() {
   switcherState.open = false;
   switcherState.entries = [];
-  switcherRoot.hidden = true;
-  switcherRoot.setAttribute("aria-hidden", "true");
+  switcherState.invoker = null;
   switcherList.replaceChildren();
+  setOverlayOpen(switcherRoot, false);
 }
 
 function commitSwitcher() {
@@ -185,18 +199,18 @@ export function toggleShortcutsOverlay() {
     document.activeElement && document.activeElement !== document.body
       ? document.activeElement
       : null;
-  shortcutsOverlay.hidden = false;
-  shortcutsOverlay.setAttribute("aria-hidden", "false");
-  shortcutsClose?.focus();
+  closeOtherShellPopovers("shortcuts");
+  setOverlayOpen(shortcutsOverlay, true, {
+    invoker: shortcutsInvoker,
+    focusEl: shortcutsClose || shortcutsOverlay,
+  });
 }
 
 function hideShortcutsOverlay() {
   if (!shortcutsOverlay || shortcutsOverlay.hidden) {
     return;
   }
-  shortcutsOverlay.hidden = true;
-  shortcutsOverlay.setAttribute("aria-hidden", "true");
-  shortcutsInvoker?.focus?.();
+  setOverlayOpen(shortcutsOverlay, false);
   shortcutsInvoker = null;
 }
 
@@ -225,6 +239,12 @@ export function bindShellKeyboard() {
   shortcutsOverlay = document.querySelector("#shortcuts-overlay");
   shortcutsClose = document.querySelector("#shortcuts-close");
 
+  registerShellPopover("window-switcher", () => {
+    if (switcherState.open) {
+      closeSwitcher();
+    }
+  });
+  registerShellPopover("shortcuts", () => hideShortcutsOverlay());
   shortcutsClose?.addEventListener("click", hideShortcutsOverlay);
   shortcutsOverlay?.addEventListener("pointerdown", (event) => {
     if (!event.target.closest(".shortcuts-card")) {
@@ -345,6 +365,45 @@ export function bindShellKeyboard() {
         if (shellState.activeWindowId && !typingInField(event) && launcher.hidden) {
           event.preventDefault();
           closeWindow(shellState.activeWindowId);
+        }
+        return;
+      }
+      if ((event.key === "m" || event.key === "M") && !event.shiftKey && !event.altKey) {
+        if (shellState.activeWindowId && !typingInField(event) && launcher.hidden) {
+          event.preventDefault();
+          minimizeWindow(shellState.activeWindowId);
+        }
+        return;
+      }
+      if (
+        event.altKey &&
+        (event.key === "ArrowLeft" ||
+          event.key === "ArrowRight" ||
+          event.key === "ArrowUp" ||
+          event.key === "ArrowDown")
+      ) {
+        const entry = shellState.windows.get(shellState.activeWindowId);
+        if (!entry || typingInField(event)) {
+          return;
+        }
+        event.preventDefault();
+        if (event.key === "ArrowLeft") {
+          applyWindowSnapState(entry.node, "left");
+          focusWindow(entry.id);
+        } else if (event.key === "ArrowRight") {
+          applyWindowSnapState(entry.node, "right");
+          focusWindow(entry.id);
+        } else if (event.key === "ArrowUp") {
+          maximizeActiveWindow();
+        } else if (
+          entry.node.dataset.snap ||
+          entry.node.dataset.maximized === "true" ||
+          entry.node.dataset.browserMaximized === "true"
+        ) {
+          restoreWindowFromSpecialState(entry.node);
+          focusWindow(entry.id);
+        } else {
+          minimizeWindow(entry.id);
         }
         return;
       }

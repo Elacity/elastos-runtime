@@ -1414,7 +1414,7 @@ fn print_cli_services(snapshot: &HomeSnapshot, kind_filter: &str) {
     let title = if kind_filter == "remote_exit" {
         "Browser Exits"
     } else {
-        "Services"
+        "Sharing"
     };
     print_cli_page_header(snapshot, title);
     println!("{title}");
