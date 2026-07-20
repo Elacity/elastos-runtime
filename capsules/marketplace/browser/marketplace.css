@@ -57,10 +57,17 @@ button {
   flex-direction: column;
   flex: 0 0 220px;
   width: 220px;
-  padding: 12px 10px 16px;
+  /* Safe-top clears shell traffic lights in unified-sidebar chrome. */
+  padding: var(--window-chrome-safe-top, 52px) 12px 16px;
   overflow: auto;
-  background: var(--bg-surface);
-  border-right: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg-surface) 78%, transparent);
+  border-right: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  backdrop-filter: blur(22px);
+  -webkit-backdrop-filter: blur(22px);
+}
+
+:root[data-el-theme="light"] .store-sidebar {
+  background: color-mix(in srgb, var(--bg-surface) 86%, transparent);
 }
 
 .store-search {
@@ -89,8 +96,8 @@ button {
 .store-search-input {
   width: 100%;
   border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 7px 10px 7px 30px;
+  border-radius: 999px;
+  padding: 7px 12px 7px 30px;
   color: var(--text-primary);
   background: var(--bg-input);
   font-size: 13px;

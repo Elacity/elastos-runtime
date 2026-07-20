@@ -11,11 +11,11 @@
  * commands are dispatched only to the window that declared them.
  */
 
-import { shellState } from "./shell-core.js?v=home-20260719x";
+import { shellState } from "./shell-core.js?v=home-20260719y";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20260719x";
+} from "./shell-motion.js?v=home-20260719y";
 
 /* Resolved lazily — the menubar lives in the lazy GUI template, which is not
    in the DOM at module-evaluation time. */

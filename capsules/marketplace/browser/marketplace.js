@@ -537,10 +537,30 @@
     els.installedBadge.classList.toggle("hidden", count === 0);
   }
 
+  function isFirstPartyPublisher(author) {
+    const value = String(author || "").trim();
+    return !value || /^elastos$/i.test(value) || value === "Unknown publisher";
+  }
+
+  function rowSubtitle(app) {
+    if (!isFirstPartyPublisher(app.developer)) {
+      return app.developer;
+    }
+    const description = String(app.description || "").trim();
+    if (description) {
+      const line = description.split(/[.!?]/)[0].trim();
+      if (line) return line;
+    }
+    return roleLabel(app.role);
+  }
+
+  function detailPublisher(app) {
+    if (isFirstPartyPublisher(app.developer)) return "ElastOS";
+    return app.developer;
+  }
+
   function renderAppRow(app) {
-    const sub = app.developer && app.developer !== "Unknown publisher"
-      ? app.developer
-      : (app.description || roleLabel(app.role));
+    const sub = rowSubtitle(app);
     return `
       <article class="store-row" data-action="detail" data-app="${escapeAttr(app.id)}" tabindex="0">
         ${appIconHtml(app, "store-row-icon")}
@@ -595,7 +615,7 @@
         ${appIconHtml(app, "modal-icon-size")}
         <div class="modal-title-section">
           <div class="modal-title">${escapeHtml(app.name)}</div>
-          <div class="modal-developer">${escapeHtml(app.developer)}</div>
+          <div class="modal-developer">${escapeHtml(detailPublisher(app))}</div>
           ${app.version ? `<div class="modal-version">Version ${escapeHtml(app.version)}</div>` : ""}
           <div class="modal-badges">${badgesHtml(app)}</div>
         </div>

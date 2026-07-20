@@ -3,18 +3,18 @@ import {
   pushUiPreferencesToFrameWindow,
   shellState,
   targetById,
-} from "./shell-core.js?v=home-20260719x";
+} from "./shell-core.js?v=home-20260719y";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
-} from "./shell-popovers.js?v=home-20260719x";
+} from "./shell-popovers.js?v=home-20260719y";
 import {
   iframeAllowForLaunch,
   iframeSandboxForLaunch,
   launchHomeTarget,
   openTarget,
-} from "./shell-windows.js?v=home-20260719x";
-import { playUiSound } from "./shell-sounds.js?v=home-20260719x";
+} from "./shell-windows.js?v=home-20260719y";
+import { playUiSound } from "./shell-sounds.js?v=home-20260719y";
 
 /* Inbox rail: right-hand slide-over hosting the Inbox capsule with
    presentation=rail. Chrome only — launches through the same host-mediated

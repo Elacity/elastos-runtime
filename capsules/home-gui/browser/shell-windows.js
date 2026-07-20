@@ -7,6 +7,7 @@ import {
   shellState,
   targetTitle,
   canonicalTargetTitle,
+  applyWindowChrome,
   escapeHtml,
   shouldOpenMaximizedByDefault,
   mountGlyph,
@@ -20,7 +21,7 @@ import {
   ignoreRepeatedAction,
   pushUiPreferencesToFrameWindow,
   targetById,
-} from "./shell-core.js?v=home-20260719x";
+} from "./shell-core.js?v=home-20260719y";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -31,8 +32,8 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260719x";
-import { playUiSound } from "./shell-sounds.js?v=home-20260719x";
+} from "./shell-window-geometry.js?v=home-20260719y";
+import { playUiSound } from "./shell-sounds.js?v=home-20260719y";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -801,6 +802,7 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
   });
   armWindowControlGuard(node, { closeMs: WINDOW_OPEN_CLOSE_GHOST_GUARD_MS });
   node.dataset.target = launched.target;
+  applyWindowChrome(node, launched.target);
   const body = node.querySelector(".window-body");
   body.classList.add("window-body-frame");
   body.innerHTML = `
@@ -859,7 +861,10 @@ function launchDidFail(launched) {
 function syncBrowserWindow(entry, launched) {
   const node = entry.node;
   const frame = node.querySelector(".window-frame");
-  node.querySelector(".window-head-title").textContent = launched.title;
+  applyWindowChrome(node, launched.target || entry.targetId);
+  if (node.dataset.chrome !== "unified-sidebar") {
+    node.querySelector(".window-head-title").textContent = launched.title;
+  }
   node.setAttribute("aria-label", launched.title);
   cleanupFrameAutoFit(node);
 

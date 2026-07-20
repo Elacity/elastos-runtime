@@ -3494,6 +3494,53 @@ body.dragging-target {
   background-color: var(--panel-strong);
 }
 
+/* Unified-sidebar chrome: App Store / Finder grammar. Traffic lights sit over
+   the leading column only (~220px) so Search/main stay clickable. Capsules pad
+   with --window-chrome-safe-top (marketplace fallback 52px). Fail closed:
+   absent class ⇒ standard titlebar. */
+.window.window-chrome-unified-sidebar {
+  --window-chrome-safe-top: 52px;
+}
+
+.window.window-chrome-unified-sidebar .window-head {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 6;
+  width: 220px;
+  height: 52px;
+  min-height: 52px;
+  margin-bottom: 0;
+  padding: 14px 10px 0 12px;
+  align-items: flex-start;
+  border-radius: 12px 0 0 0;
+  background: transparent;
+  box-shadow: none;
+  filter: none;
+}
+
+.window.window-chrome-unified-sidebar.window-active .window-head {
+  filter: none;
+}
+
+.window.window-chrome-unified-sidebar .window-head-icon,
+.window.window-chrome-unified-sidebar .window-head-title,
+.window.window-chrome-unified-sidebar .window-head-balance {
+  display: none;
+}
+
+.window.window-chrome-unified-sidebar .window-head-draggable {
+  flex: 1 1 auto;
+  min-width: 48px;
+  min-height: 28px;
+  justify-content: flex-start;
+  align-self: stretch;
+}
+
+.window.window-chrome-unified-sidebar .window-body {
+  height: 100%;
+}
+
 .window-body.window-body-frame {
   position: relative;
   padding: 0;

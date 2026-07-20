@@ -47,6 +47,25 @@ The Home shell follows the macOS anatomy deliberately:
 - All window/dock motion is transform/opacity-only and honors
   `prefers-reduced-motion`.
 
+## Window Chrome Modes
+
+Window chrome is a **presentation-only** shell mode. It never grants authority.
+Unknown or missing modes **fail closed** to `standard`.
+
+| Mode | Grammar | Opt-in |
+|------|---------|--------|
+| `standard` | Full titlebar: lights + icon + title; body sits below the head | Default for every target |
+| `unified-sidebar` | Transparent head overlay on the **leading column only** (~220px); body is full window height; capsule pads with `--window-chrome-safe-top` | Explicit target map in `windowChromeModeForTarget` (App Store / `marketplace` first) |
+| `immersive` | Reserved — not shipped | — |
+
+Rules:
+
+- Do **not** invent in-app sidebars just to “earn” unified chrome.
+- Unified head must not be a full-width opaque hit target (steals Search/main clicks).
+- Capsules own safe-top padding; shell owns lights + certified drag on the leading strip.
+- Materials are token + blur approximations — never claim true OS vibrancy until a Tier 3 host surface exists.
+- Document every new opt-in target here and in the entropy matrix before shipping.
+
 ## Interaction Contract
 
 Every visible action must have the same contract for humans and agents:

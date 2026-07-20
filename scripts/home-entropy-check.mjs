@@ -1633,7 +1633,7 @@ const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
 const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260719y";
-const homeGuiAssetVersion = "home-20260719x";
+const homeGuiAssetVersion = "home-20260719y";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -4355,6 +4355,33 @@ assert(
     !marketplaceIndex.includes("install-modal") &&
     !marketplaceIndex.includes('data-tab="discover"'),
   "App Store chrome: sidebar destinations, list rows, Open pills; no Install theater",
+);
+const marketplaceCss = read("capsules/marketplace/browser/marketplace.css");
+assert(
+  marketplaceUi.includes("function isFirstPartyPublisher(") &&
+    marketplaceUi.includes("function rowSubtitle(") &&
+    marketplaceUi.includes("function detailPublisher(") &&
+    marketplaceUi.includes('return "ElastOS"') &&
+    !marketplaceUi.includes("developer: capsule.author || \"Unknown publisher\",\n    subtitle: capsule.author"),
+  "App Store rows must not show bare elastos publisher; detail publisher is ElastOS",
+);
+assert(
+  marketplaceCss.includes("--window-chrome-safe-top") &&
+    marketplaceCss.includes("backdrop-filter: blur(22px)") &&
+    marketplaceCss.includes("border-radius: 999px"),
+  "App Store sidebar must pad for unified chrome and use pill search + material blur",
+);
+assert(
+  homeGuiCore.includes("WINDOW_CHROME_UNIFIED_SIDEBAR") &&
+    homeGuiCore.includes("function windowChromeModeForTarget(") &&
+    homeGuiCore.includes("function applyWindowChrome(") &&
+    homeGuiCore.includes("marketplace: WINDOW_CHROME_UNIFIED_SIDEBAR") &&
+    shellWindows.includes("applyWindowChrome(node, launched.target)") &&
+    homeGuiStyle.includes(".window.window-chrome-unified-sidebar") &&
+    homeGuiStyle.includes("--window-chrome-safe-top: 52px") &&
+    read("docs/DESIGN_SYSTEM.md").includes("## Window Chrome Modes") &&
+    read("docs/DESIGN_SYSTEM.md").includes("`unified-sidebar`"),
+  "Unified-sidebar chrome must be opt-in in shell-core, applied on launch, styled, and documented",
 );
 assert(
   marketplaceUi.includes("const category = String(capsule.category || \"\").toLowerCase()") &&
