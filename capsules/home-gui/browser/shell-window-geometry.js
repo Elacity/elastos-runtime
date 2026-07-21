@@ -10,14 +10,14 @@ import {
   beginShellInteraction,
   clamp,
   endShellInteraction,
-} from "./shell-core.js?v=home-20260719y";
+} from "./shell-core.js?v=home-20260720q";
 
 const WINDOW_MIN_VISIBLE_DRAG_WIDTH = 96;
 const WINDOW_MIN_VISIBLE_DRAG_HEIGHT = 32;
 const WINDOW_SNAP_ACTIVATION_DISTANCE = 12;
 const BROWSER_TARGET_ID = "browser";
 const BROWSER_REMOTE_ASPECT_RATIO = 16 / 9;
-const BROWSER_DEFAULT_CHROME_HEIGHT = 46;
+const BROWSER_DEFAULT_CHROME_HEIGHT = 52;
 
 function safeClamp(value, min, max) {
   return max < min ? min : clamp(value, min, max);
@@ -277,12 +277,6 @@ export function applyWindowPlacement(node, placement) {
 
   if (placement?.maximized) {
     node.dataset.snap = "";
-    if (node.dataset.target === BROWSER_TARGET_ID) {
-      node.dataset.maximized = "false";
-      node.dataset.browserMaximized = "true";
-      fitWindowToLargestBrowserAspect(node);
-      return;
-    }
     node.dataset.maximized = "true";
     node.dataset.browserMaximized = "false";
     return;
@@ -682,12 +676,6 @@ function applyWindowSnap(node, target) {
   hideWindowSnapPreview();
   if (target.state === "maximize") {
     node.dataset.snap = "";
-    if (node.dataset.target === BROWSER_TARGET_ID) {
-      node.dataset.maximized = "false";
-      node.dataset.browserMaximized = "true";
-      fitWindowToLargestBrowserAspect(node);
-      return;
-    }
     node.dataset.maximized = "true";
     node.dataset.browserMaximized = "false";
     return;

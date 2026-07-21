@@ -81,47 +81,64 @@ code {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  overflow: hidden;
+  background: var(--color-settings-bg);
 }
 
+/* Apps-level blend: flex split shell (not fixed sidebar + margin). */
 .settings {
   display: flex;
   flex-direction: row;
   -webkit-font-smoothing: antialiased;
-  flex-grow: 1;
+  flex: 1;
+  min-height: 0;
   position: relative;
-  min-height: 100%;
+  background: var(--color-settings-bg);
 }
 
 .settings-sidebar {
-  width: 200px;
-  background-color: var(--color-settings-sidebar);
-  border-right: 1px solid var(--color-border);
-  padding: 20px;
-  position: fixed;
-  margin-top: 1px;
-  height: 100%;
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 220px;
+  width: 220px;
+  min-width: 220px;
+  /* Safe-top clears shell traffic lights in unified-sidebar chrome. */
+  padding: var(--window-chrome-safe-top, 52px) 12px 16px;
+  position: relative;
+  margin: 0;
+  height: auto;
+  align-self: stretch;
   z-index: 2;
+  overflow: auto;
+  background: color-mix(in srgb, var(--color-settings-sidebar) 78%, transparent);
+  border-right: 1px solid color-mix(in srgb, var(--color-border) 70%, transparent);
+  backdrop-filter: blur(22px);
+  -webkit-backdrop-filter: blur(22px);
+}
+
+:root[data-el-theme="light"] .settings-sidebar {
+  background: color-mix(in srgb, var(--color-settings-sidebar) 86%, transparent);
 }
 
 .settings-sidebar-item {
   cursor: pointer;
-  border-radius: 4px;
-  padding: 8px 10px;
-  margin-bottom: 4px;
-  padding-left: 10px;
-  font-size: 14px;
-  color: var(--color-text-primary);
+  border-radius: 999px;
+  padding: 7px 12px;
+  margin: 0 4px 2px;
+  width: calc(100% - 8px);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--el-muted);
   display: flex;
   align-items: center;
   gap: 10px;
-  width: 100%;
   background: transparent;
   text-align: left;
 }
 
 .settings-sidebar-icon {
-  width: 22px;
-  height: 22px;
+  width: 18px;
+  height: 18px;
   flex-shrink: 0;
   color: var(--el-soft);
   display: inline-flex;
@@ -143,14 +160,13 @@ code {
   flex-grow: 1;
 }
 
-/* Sidebar search (macOS System Settings position): filters sections by any
-   text they contain. */
+/* Sidebar search: filters sections by any text they contain. */
 .settings-search {
   width: 100%;
-  margin: 2px 0 8px;
-  padding: 6px 10px;
+  margin: 0 0 12px;
+  padding: 7px 12px;
   border: 1px solid var(--el-hairline);
-  border-radius: 8px;
+  border-radius: 999px;
   background: var(--el-inset);
   color: var(--el-text);
   font-family: inherit;
@@ -164,6 +180,7 @@ code {
 .settings-search:focus {
   outline: 2px solid var(--el-focus);
   outline-offset: 1px;
+  border-color: var(--el-accent, var(--brand));
 }
 
 .settings-sidebar-item.search-hidden {
@@ -171,37 +188,44 @@ code {
 }
 
 .settings-sidebar-item:hover {
-  background-color: var(--color-bg-tertiary);
+  background: var(--el-lift);
+  color: var(--el-text);
 }
 
 .settings-sidebar-item.active {
-  background-color: var(--color-border);
+  color: var(--el-accent, var(--brand));
+  background: var(--el-lift-strong);
+  font-weight: 600;
 }
 
 .settings-content-container {
   flex: 1;
-  padding: 20px 30px;
+  min-width: 0;
+  padding: 28px 32px 48px;
   overflow-y: auto;
-  margin-left: 240px;
-  background-color: var(--color-settings-bg);
+  margin-left: 0;
+  background: var(--color-settings-bg);
 }
 
 .settings-content {
   display: none;
-  max-width: 800px;
-  margin: auto;
-  background-color: var(--color-settings-bg);
+  max-width: 720px;
+  margin: 0;
+  background: transparent;
   color: var(--color-text-primary);
 }
 
-.settings-content h1 {
-  font-size: 24px;
-  margin-bottom: 20px;
-  border-bottom: 1px solid var(--color-border);
-  padding-bottom: 10px;
-  padding-left: 5px;
-  font-weight: 500;
-  color: var(--color-text-primary);
+/* Destination page title — Apps catalog grammar (big H1, no underline bar). */
+.settings-content h1,
+.settings-content h1.pc2-section-title {
+  margin: 0 0 20px;
+  padding: 0;
+  border: 0;
+  color: var(--el-text);
+  font-size: 34px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
 }
 
 .settings-content.active {
@@ -342,6 +366,7 @@ code {
   margin-top: 10px;
 }
 
+/* In-page group labels (not destination H1s — those use .settings-content h1). */
 .pc2-section-title {
   font-size: 14px;
   font-weight: 700;
@@ -1633,6 +1658,13 @@ code {
     display: block !important;
   }
 
+  /* Clear shell traffic lights (unified leading strip). Full mobile polish
+     is a separate campaign — this only avoids the hamburger/lights collision. */
+  .sidebar-toggle {
+    left: 72px;
+    top: 12px;
+  }
+
   .settings-sidebar {
     display: none;
     width: 240px;
@@ -1642,16 +1674,18 @@ code {
     left: 0;
     height: 100%;
     z-index: 100;
+    padding-top: var(--window-chrome-safe-top, 52px);
     box-shadow: var(--el-shadow-2);
   }
 
   .settings-content-container {
     margin-left: 0;
-    padding: 44px 14px 18px;
+    padding: var(--window-chrome-safe-top, 52px) 14px 18px;
   }
 
-  .settings-content h1 {
-    font-size: 22px;
+  .settings-content h1,
+  .settings-content h1.pc2-section-title {
+    font-size: 28px;
   }
 
   .pc2-card-row,

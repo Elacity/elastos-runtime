@@ -60,9 +60,9 @@ export const WINDOW_TOP_INSET = 8;
 export const WINDOW_BOTTOM_INSET = 72;
 export const CONTEXT_MENU_IGNORE_OUTSIDE_MS = 220;
 const HOME_GUI_TEMPLATE_ID = "home-gui-template";
-const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260719y", import.meta.url).href;
+const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260720q", import.meta.url).href;
 const HOME_GUI_STYLESHEET_ID = "home-gui-stylesheet";
-const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260719y", import.meta.url).href;
+const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260720q", import.meta.url).href;
 let homeGuiTemplateHtmlPromise = null;
 let homeGuiLaunchToken = "";
 
@@ -430,24 +430,52 @@ export function targetTitle(summary, targetId) {
 
 export function canonicalTargetTitle(targetId, title) {
   if (targetId === "marketplace") {
-    return "App Store";
+    return "Apps";
   }
   const normalizedTitle = normalizeText(title);
   return normalizedTitle || targetId;
 }
 
 /* Window chrome modes (presentation-only). Fail closed to standard.
-   unified-sidebar: App Store / Finder grammar — lights over leading column. */
+   unified-sidebar: split-view apps — lights over the leading column.
+   unified-toolbar: Browser-style — lights over the tool row; no window title
+   (menubar already shows the focused app name). */
 export const WINDOW_CHROME_STANDARD = "standard";
 export const WINDOW_CHROME_UNIFIED_SIDEBAR = "unified-sidebar";
+export const WINDOW_CHROME_UNIFIED_TOOLBAR = "unified-toolbar";
 
 const WINDOW_CHROME_BY_TARGET = {
   marketplace: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  system: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  library: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  services: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  people: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  documents: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  browser: WINDOW_CHROME_UNIFIED_TOOLBAR,
+  /* Inbox WINDOW has a real left filter column — same grammar as Library.
+     Shell Inbox rail is a separate surface (not this map). */
+  inbox: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  /* Chat People column is leading — earns unified-sidebar. */
+  chat: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  "chat-room": WINDOW_CHROME_UNIFIED_SIDEBAR,
 };
+
+/* Standard apps that keep a titlebar but share one plate with the body. */
+const WINDOW_CHROME_CONTINUOUS_TARGETS = new Set([
+  "wallet",
+  "archive-manager",
+  "gba-emulator",
+  "wallet-metamask",
+  "wallet-unisat",
+  "wallet-walletconnect",
+]);
 
 export function parseWindowChromeMode(value) {
   if (value === WINDOW_CHROME_UNIFIED_SIDEBAR) {
     return WINDOW_CHROME_UNIFIED_SIDEBAR;
+  }
+  if (value === WINDOW_CHROME_UNIFIED_TOOLBAR) {
+    return WINDOW_CHROME_UNIFIED_TOOLBAR;
   }
   return WINDOW_CHROME_STANDARD;
 }
@@ -456,19 +484,118 @@ export function windowChromeModeForTarget(targetId) {
   return parseWindowChromeMode(WINDOW_CHROME_BY_TARGET[String(targetId || "")]);
 }
 
+export function windowChromeContinuousForTarget(targetId) {
+  const id = String(targetId || "");
+  return (
+    windowChromeModeForTarget(id) === WINDOW_CHROME_STANDARD &&
+    WINDOW_CHROME_CONTINUOUS_TARGETS.has(id)
+  );
+}
+
+/* TEMPORARY tip-lag defense for Chat only. Canonical mode is
+   WINDOW_CHROME_BY_TARGET → applyWindowChrome class/dataset. Remove once
+   Chat no longer flashes a full titlebar when CSS tips lag. */
+const FORCED_UNIFIED_HEAD_PROPS = [
+  "position",
+  "top",
+  "left",
+  "right",
+  "z-index",
+  "width",
+  "height",
+  "min-height",
+  "margin",
+  "margin-bottom",
+  "padding",
+  "background",
+  "background-color",
+  "box-shadow",
+  "filter",
+  "border-radius",
+];
+const FORCED_UNIFIED_BODY_PROPS = ["height", "min-height", "margin"];
+
+function clearForcedUnifiedSidebarGeometry(windowNode) {
+  const head = windowNode.querySelector(".window-head");
+  const body = windowNode.querySelector(".window-body");
+  for (const prop of FORCED_UNIFIED_HEAD_PROPS) {
+    head?.style.removeProperty(prop);
+  }
+  for (const prop of FORCED_UNIFIED_BODY_PROPS) {
+    body?.style.removeProperty(prop);
+  }
+}
+
+function forceUnifiedSidebarGeometry(windowNode) {
+  const head = windowNode.querySelector(".window-head");
+  const body = windowNode.querySelector(".window-body");
+  if (head) {
+    head.style.setProperty("position", "absolute", "important");
+    head.style.setProperty("top", "0", "important");
+    head.style.setProperty("left", "0", "important");
+    head.style.setProperty("right", "auto", "important");
+    head.style.setProperty("z-index", "6", "important");
+    head.style.setProperty(
+      "width",
+      "var(--window-chrome-sidebar-width, 220px)",
+      "important",
+    );
+    head.style.setProperty("height", "52px", "important");
+    head.style.setProperty("min-height", "52px", "important");
+    head.style.setProperty("margin", "0", "important");
+    head.style.setProperty("margin-bottom", "0", "important");
+    head.style.setProperty("padding", "14px 10px 0 12px", "important");
+    head.style.setProperty("background", "transparent", "important");
+    head.style.setProperty("background-color", "transparent", "important");
+    head.style.setProperty("box-shadow", "none", "important");
+    head.style.setProperty("filter", "none", "important");
+    head.style.setProperty("border-radius", "12px 0 0 0", "important");
+  }
+  if (body) {
+    body.style.setProperty("height", "100%", "important");
+    body.style.setProperty("min-height", "0", "important");
+    body.style.setProperty("margin", "0", "important");
+  }
+}
+
 export function applyWindowChrome(windowNode, targetId) {
   if (!windowNode) {
     return WINDOW_CHROME_STANDARD;
   }
-  const mode = windowChromeModeForTarget(targetId);
+  const id = String(targetId || "");
+  /* Map is the sole mode source — Chat is listed in WINDOW_CHROME_BY_TARGET. */
+  const mode = windowChromeModeForTarget(id);
+  const continuous =
+    mode === WINDOW_CHROME_STANDARD && windowChromeContinuousForTarget(id);
+  windowNode.dataset.target = id || windowNode.dataset.target || "";
   windowNode.dataset.chrome = mode;
   windowNode.classList.toggle(
     "window-chrome-unified-sidebar",
     mode === WINDOW_CHROME_UNIFIED_SIDEBAR,
   );
+  windowNode.classList.toggle(
+    "window-chrome-unified-toolbar",
+    mode === WINDOW_CHROME_UNIFIED_TOOLBAR,
+  );
+  windowNode.classList.toggle("window-chrome-continuous", continuous);
+  if (mode === WINDOW_CHROME_UNIFIED_SIDEBAR) {
+    windowNode.style.setProperty("--window-chrome-sidebar-width", "220px");
+    windowNode.classList.remove("window-chrome-continuous");
+    if (id === "chat" || id === "chat-room") {
+      forceUnifiedSidebarGeometry(windowNode);
+    } else {
+      clearForcedUnifiedSidebarGeometry(windowNode);
+    }
+  } else {
+    windowNode.style.removeProperty("--window-chrome-sidebar-width");
+    clearForcedUnifiedSidebarGeometry(windowNode);
+  }
   const titleEl = windowNode.querySelector(".window-head-title");
   const iconEl = windowNode.querySelector(".window-head-icon");
-  if (mode === WINDOW_CHROME_UNIFIED_SIDEBAR) {
+  if (
+    mode === WINDOW_CHROME_UNIFIED_SIDEBAR ||
+    mode === WINDOW_CHROME_UNIFIED_TOOLBAR
+  ) {
     if (titleEl) {
       titleEl.textContent = "";
       titleEl.setAttribute("aria-hidden", "true");
@@ -729,7 +856,7 @@ function normalizeDesktopAppTargets(targetIds, summary) {
 /* Fresh principals get a working dock instead of an empty bar: the everyday
    surfaces, pinned in a fixed order. Purely a first-run default — the saved
    layout owns the dock from the first change onward. */
-const DEFAULT_TASKBAR_PINS = ["browser", "library", "wallet", "documents", "chat", "system"];
+const DEFAULT_TASKBAR_PINS = ["browser", "library", "wallet", "documents", "chat-room", "system"];
 
 function defaultTaskbarPins(summary) {
   const knownTargets = new Set(allVisibleTargets(summary).map((target) => target.target));

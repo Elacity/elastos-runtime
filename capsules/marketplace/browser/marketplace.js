@@ -115,6 +115,40 @@
         trapDetailFocus(event);
       }
     });
+    /* Sidebar roving: ArrowUp/Down among Discover / Installed / categories.
+       Never steal keys from Search (or other fields inside the sidebar). */
+    document.querySelector(".store-sidebar")?.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowDown" && event.key !== "ArrowUp") {
+        return;
+      }
+      const field = event.target;
+      if (
+        field instanceof HTMLElement &&
+        (field.matches("input, textarea, select") || field.isContentEditable)
+      ) {
+        return;
+      }
+      const items = [...document.querySelectorAll(".store-nav-item")];
+      if (!items.length) {
+        return;
+      }
+      const current = event.target.closest?.(".store-nav-item");
+      let index = current
+        ? items.indexOf(current)
+        : items.findIndex((node) => node.classList.contains("selected"));
+      if (index < 0) {
+        index = 0;
+      }
+      event.preventDefault();
+      const next = event.key === "ArrowDown"
+        ? Math.min(items.length - 1, index + 1)
+        : Math.max(0, index - 1);
+      const item = items[next];
+      item.focus();
+      if (item.dataset.destination) {
+        selectDestination(item.dataset.destination);
+      }
+    });
   }
 
   function renderCategories() {
@@ -760,7 +794,7 @@
       return;
     }
     if (window.top === window || !homeParentOrigin) {
-      showToast("Open App Store from Home to launch apps.", true);
+      showToast("Open Apps from Home to launch apps.", true);
       return;
     }
     window.top.postMessage({

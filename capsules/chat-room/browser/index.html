@@ -6,7 +6,7 @@
   <title>Chat</title>
   <script src="./elastos-theme.js"></script>
   <link rel="stylesheet" href="./elastos-ui.css" />
-  <link rel="stylesheet" href="./style.css" />
+  <link rel="stylesheet" href="./style.css?v=chat-room-20260721f" />
 </head>
 <body data-room-session-active="false">
   <script>
@@ -24,6 +24,45 @@
     <section id="chat-card" class="card chat-card chat-room-shell">
       <div id="participant-scrim" class="participant-scrim" hidden></div>
       <button id="participant-toggle" type="button" class="secondary participant-toggle chat-room-toggle">People</button>
+      <!-- Leading People column (Library/System grammar + unified-sidebar). -->
+      <section class="presence-card" aria-label="People">
+        <div class="roster-head">
+          <h3 id="participant-count" class="roster-title">Opening conversation</h3>
+          <div class="roster-actions">
+            <button id="room-access-toggle" type="button" class="secondary room-access-toggle" aria-label="Access settings" title="Access settings" hidden>⚙</button>
+            <button id="participant-close" type="button" class="secondary roster-close" hidden>Close</button>
+          </div>
+        </div>
+        <ol id="participant-list" class="participants"></ol>
+        <section id="browser-access-section" class="browser-access" hidden>
+          <div class="browser-access-head">
+            <h3 id="browser-access-count" class="browser-access-title">Join Requests · 0</h3>
+          </div>
+          <ol id="browser-access-list" class="browser-access-list"></ol>
+        </section>
+        <section id="room-access-section" class="room-access" hidden>
+          <div class="room-access-head">
+            <h3 class="room-access-title">Access</h3>
+          </div>
+          <div id="room-policy-list" class="room-policy-list"></div>
+          <section class="join-link-card">
+            <div class="join-link-copy">
+              <h4>Invite another device</h4>
+              <p>Create a short-lived link that lets another ElastOS profile join this conversation.</p>
+            </div>
+            <button id="conversation-invite-create" type="button">Create join link</button>
+            <div id="conversation-invite-output-row" class="join-link-output" hidden>
+              <input id="conversation-invite-output" type="text" readonly aria-label="Conversation join link" />
+              <button id="conversation-invite-copy" type="button" class="secondary">Copy</button>
+            </div>
+          </section>
+          <form id="node-invite-form" class="node-invite-form" hidden>
+            <input id="node-did-input" type="text" autocomplete="off" placeholder="Advanced DID invite" aria-label="Advanced DID invite" />
+            <button id="node-invite-submit" type="submit">Add</button>
+          </form>
+          <ol id="node-list" class="node-list"></ol>
+        </section>
+      </section>
       <section class="conversation-card">
         <section id="browser-access-stage" class="browser-access-stage">
           <div id="browser-access-status-row" class="status-row browser-access-status" hidden>
@@ -73,50 +112,12 @@
           </div>
         </form>
       </section>
-      <section class="presence-card">
-        <div class="roster-head">
-          <h3 id="participant-count" class="roster-title">Opening conversation</h3>
-          <div class="roster-actions">
-            <button id="room-access-toggle" type="button" class="secondary room-access-toggle" aria-label="Access settings" title="Access settings" hidden>⚙</button>
-            <button id="participant-close" type="button" class="secondary roster-close" hidden>Close</button>
-          </div>
-        </div>
-        <ol id="participant-list" class="participants"></ol>
-        <section id="browser-access-section" class="browser-access" hidden>
-          <div class="browser-access-head">
-            <h3 id="browser-access-count" class="browser-access-title">Join Requests · 0</h3>
-          </div>
-          <ol id="browser-access-list" class="browser-access-list"></ol>
-        </section>
-        <section id="room-access-section" class="room-access" hidden>
-          <div class="room-access-head">
-            <h3 class="room-access-title">Access</h3>
-          </div>
-          <div id="room-policy-list" class="room-policy-list"></div>
-          <section class="join-link-card">
-            <div class="join-link-copy">
-              <h4>Invite another device</h4>
-              <p>Create a short-lived link that lets another ElastOS profile join this conversation.</p>
-            </div>
-            <button id="conversation-invite-create" type="button">Create join link</button>
-            <div id="conversation-invite-output-row" class="join-link-output" hidden>
-              <input id="conversation-invite-output" type="text" readonly aria-label="Conversation join link" />
-              <button id="conversation-invite-copy" type="button" class="secondary">Copy</button>
-            </div>
-          </section>
-          <form id="node-invite-form" class="node-invite-form" hidden>
-            <input id="node-did-input" type="text" autocomplete="off" placeholder="Advanced DID invite" aria-label="Advanced DID invite" />
-            <button id="node-invite-submit" type="submit">Add</button>
-          </form>
-          <ol id="node-list" class="node-list"></ol>
-        </section>
-      </section>
     </section>
   </main>
   <script type="module">
-    import init from "./chat_room_ui.js?v=chat-room-ui-20260716a";
+    import init from "./chat_room_ui.js?v=chat-room-ui-20260721a";
     init({
-      module_or_path: new URL("./chat_room_ui_bg.wasm?v=chat-room-ui-20260716a", import.meta.url),
+      module_or_path: new URL("./chat_room_ui_bg.wasm?v=chat-room-ui-20260721a", import.meta.url),
     });
   </script>
   <script>

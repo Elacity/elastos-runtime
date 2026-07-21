@@ -21,19 +21,18 @@ import {
   ignoreRepeatedAction,
   pushUiPreferencesToFrameWindow,
   targetById,
-} from "./shell-core.js?v=home-20260719y";
+} from "./shell-core.js?v=home-20260720q";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
-  fitWindowToLargestBrowserAspect,
   applyWindowPlacement,
   rememberWindowRestoreBounds,
   restoreWindowFromSpecialState,
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260719y";
-import { playUiSound } from "./shell-sounds.js?v=home-20260719y";
+} from "./shell-window-geometry.js?v=home-20260720q";
+import { playUiSound } from "./shell-sounds.js?v=home-20260720q";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -84,6 +83,8 @@ const BROWSER_IFRAME_ALLOW_EXTRAS = ["clipboard-read", "clipboard-write"];
 /* Wallet needs write so address / recovery copy works in the opaque frame.
    Read stays Browser-only — paste into Wallet is not a product path. */
 const WALLET_IFRAME_ALLOW_EXTRAS = ["clipboard-write"];
+/* Chat invite Copy uses navigator.clipboard.writeText in the opaque frame. */
+const CHAT_IFRAME_ALLOW_EXTRAS = ["clipboard-write"];
 const pendingWindowLaunches = new Set();
 
 export function iframeSandboxForLaunch(launched) {
@@ -110,6 +111,9 @@ export function iframeAllowForLaunch(launched) {
   }
   if (launched?.target === "wallet") {
     tokens.push(...WALLET_IFRAME_ALLOW_EXTRAS);
+  }
+  if (launched?.target === "chat" || launched?.target === "chat-room") {
+    tokens.push(...CHAT_IFRAME_ALLOW_EXTRAS);
   }
   return tokens.join("; ");
 }
@@ -147,6 +151,10 @@ function refreshWindowUi() {
   const hooks = requireWindowHooks();
   hooks.updateTaskbarState();
   hooks.refreshLauncherIfVisible();
+  // Focused app owns the menubar name + File/Edit menus (not stuck on Home).
+  if (typeof hooks.syncMenubar === "function") {
+    hooks.syncMenubar();
+  }
 }
 
 function currentWindowBounds(node) {
@@ -817,10 +825,6 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
   windowHostContainer().appendChild(node);
   if (restoredPlacement) {
     applyWindowPlacement(node, restoredPlacement);
-  } else if (launched.target === "browser" && node.dataset.maximized === "true") {
-    node.dataset.maximized = "false";
-    node.dataset.browserMaximized = "true";
-    fitWindowToLargestBrowserAspect(node);
   }
   const entry = {
     id: windowId,
@@ -1132,6 +1136,9 @@ export function focusWindow(id) {
   entry.node.style.zIndex = String(shellState.zIndexCounter);
   shellState.activeWindowId = id;
   if (entry.kind === "browser") {
+    /* Re-apply chrome on focus so Chat/etc pick up map changes without a
+       full Home remount (stale windows kept a full titlebar strip). */
+    applyWindowChrome(entry.node, entry.targetId);
     rememberRecentTarget(entry.targetId);
     fitLaunchedWindow(entry);
   }
@@ -1158,14 +1165,8 @@ function toggleWindowMaximize(id) {
   }
   rememberWindowRestoreBounds(node);
   node.dataset.snap = "";
-  if (entry.targetId === "browser") {
-    node.dataset.maximized = "false";
-    node.dataset.browserMaximized = "true";
-    fitWindowToLargestBrowserAspect(node);
-    focusWindow(id);
-    persistBrowserSession();
-    return;
-  }
+  /* Browser uses the same stage maximize as every other app (not 16:9 letterbox).
+     Windowed resize still locks remote aspect via browserAspectConfig. */
   node.dataset.browserMaximized = "false";
   node.dataset.maximized = "true";
   focusWindow(id);
@@ -1209,6 +1210,13 @@ export async function restoreShellSession() {
     }
   }
   shellState.restoringSession = false;
+
+  /* Re-stamp chrome after restore — Chat must not keep a stale full titlebar. */
+  for (const { entry } of restoredEntries) {
+    if (entry?.kind === "browser") {
+      applyWindowChrome(entry.node, entry.targetId);
+    }
+  }
 
   if (restoredEntries.length === 0) {
     clearShellSessionState();

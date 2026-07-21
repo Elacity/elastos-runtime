@@ -1,4 +1,4 @@
-/* App Store chrome: sidebar-first, list rows, system tokens. */
+/* Apps catalog chrome: sidebar-first, list rows, system tokens. */
 :root {
   --bg-page: var(--el-bg);
   --bg-surface: var(--el-surface-raised);
@@ -132,7 +132,7 @@ button {
   width: 100%;
   margin: 0;
   padding: 7px 12px;
-  /* Capsule / floating pill selection (App Store sidebar). */
+  /* Capsule / floating pill selection (sidebar nav). */
   border-radius: 999px;
   color: var(--text-secondary);
   background: transparent;
@@ -347,7 +347,7 @@ button {
   transition: filter 0.12s ease, background 0.12s ease;
 }
 
-/* App Store Get/Open: accent *label* on neutral pill — never white-on-soft
+/* Open pill: accent *label* on neutral fill — never white-on-soft
    (--el-accent-ink is for solid accent fills only). Works light + dark. */
 .store-pill {
   color: var(--el-accent);

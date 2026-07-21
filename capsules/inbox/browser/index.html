@@ -4,14 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Inbox · ElastOS</title>
+  <!-- tip: inbox-20260720b — unified-sidebar window (rail unchanged) -->
   <script src="./elastos-theme.js"></script>
   <link rel="stylesheet" href="./elastos-ui.css">
   <style>
+    /* Apps-level blend for the Inbox WINDOW (Library/System grammar).
+       Shell Inbox rail stays a separate surface. */
     :root {
       color-scheme: dark;
       --bg: var(--el-bg);
       --sidebar-bg: rgba(22, 24, 29, 0.78);
-      --toolbar-bg: rgba(22, 24, 29, 0.78);
+      --toolbar-bg: var(--bg);
       --panel: var(--el-surface-raised);
       --panel-strong: var(--el-surface-raised);
       --panel-soft: var(--el-inset);
@@ -34,8 +37,8 @@
 
     :root[data-el-theme="light"] {
       color-scheme: light;
-      --sidebar-bg: #f9f9f9;
-      --toolbar-bg: #fafafa;
+      --sidebar-bg: #f0f1f4;
+      --toolbar-bg: var(--bg);
     }
 
     :root[data-el-theme="light"] body {
@@ -65,7 +68,7 @@
       margin: 0;
       min-height: 100vh;
       min-height: 100dvh;
-      background: linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0) 320px) var(--bg);
+      background: var(--bg);
       color: var(--text);
     }
 
@@ -99,14 +102,15 @@
       padding: 30px;
     }
 
+    /* Apps-level blend: flex/grid split; sidebar owns lights safe-top. */
     .shell {
       height: 100vh;
       height: 100dvh;
       display: grid;
-      grid-template-columns: 200px minmax(0, 1fr);
+      grid-template-columns: 220px minmax(0, 1fr);
       gap: 0;
       overflow: hidden;
-      background: var(--panel);
+      background: var(--bg);
     }
 
     .sidebar,
@@ -117,13 +121,16 @@
     .sidebar {
       display: flex;
       flex-direction: column;
-      gap: 4px;
-      padding: 20px;
+      gap: 2px;
+      padding: var(--window-chrome-safe-top, 52px) 12px 16px;
       border: 0;
-      border-right: 1px solid var(--line);
+      border-right: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
       border-radius: 0;
-      background: var(--sidebar-bg);
+      background: color-mix(in srgb, var(--sidebar-bg) 78%, transparent);
       box-shadow: none;
+      backdrop-filter: blur(22px);
+      -webkit-backdrop-filter: blur(22px);
+      overflow-y: auto;
     }
 
     .main {
@@ -133,7 +140,7 @@
       overflow: hidden;
       border: 0;
       border-radius: 0;
-      background: var(--panel);
+      background: var(--bg);
       box-shadow: none;
     }
 
@@ -172,15 +179,18 @@
     }
 
     .sidebar-title {
-      margin: 15px 0 16px;
+      margin: 0 0 10px;
+      padding: 0 4px;
       color: var(--muted);
-      font-size: 19px;
+      font-size: 11px;
       font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
     }
 
     .summary-stack {
       display: grid;
-      gap: 4px;
+      gap: 2px;
     }
 
     .summary-card {
@@ -189,9 +199,9 @@
       justify-content: space-between;
       gap: 10px;
       min-height: 34px;
-      padding: 7px 10px;
-      border: 0;
-      border-radius: 6px;
+      padding: 7px 12px;
+      border: 1px solid transparent;
+      border-radius: 999px;
       background: transparent;
       color: var(--ink);
       font: inherit;
@@ -200,17 +210,17 @@
     }
 
     .summary-card:hover {
-      background: var(--line);
+      background: var(--el-lift);
     }
 
-    /* The active mailbox row carries the accent, like Mail's sidebar. */
+    /* Capsule selected row (Library/System grammar). */
     .summary-card.active {
-      background: var(--accent-soft);
-      color: var(--accent);
+      background: var(--el-lift-strong);
+      color: var(--el-accent);
     }
 
     .summary-card.active strong {
-      color: var(--accent);
+      color: var(--el-accent);
     }
 
     .summary-card strong {

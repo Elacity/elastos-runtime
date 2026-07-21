@@ -3523,7 +3523,33 @@ fn runtime_event_is_chat_room(event: &MessageEvent) -> bool {
 }
 
 fn js_error(error: JsValue) -> String {
-    error
-        .as_string()
-        .unwrap_or_else(|| "browser storage error".to_string())
+    if let Some(text) = error.as_string() {
+        return text;
+    }
+    if let Ok(message) = Reflect::get(&error, &JsValue::from_str("message")) {
+        if let Some(text) = message.as_string() {
+            if !text.trim().is_empty() {
+                // Opaque-sandbox frames often block clipboard; don't mislabel as storage.
+                if text.to_ascii_lowercase().contains("clipboard")
+                    || text.to_ascii_lowercase().contains("permissions policy")
+                {
+                    return "Clipboard blocked in this window. Select the link and copy manually."
+                        .to_string();
+                }
+                return text;
+            }
+        }
+    }
+    if let Ok(name) = Reflect::get(&error, &JsValue::from_str("name")) {
+        if let Some(text) = name.as_string() {
+            if text == "NotAllowedError" || text == "SecurityError" {
+                return "Clipboard blocked in this window. Select the link and copy manually."
+                    .to_string();
+            }
+            if !text.trim().is_empty() {
+                return text;
+            }
+        }
+    }
+    "Something went wrong.".to_string()
 }

@@ -11,11 +11,16 @@
  * commands are dispatched only to the window that declared them.
  */
 
-import { shellState } from "./shell-core.js?v=home-20260719y";
+import {
+  shellState,
+  toolbarActiveTitleNode,
+  canonicalTargetTitle,
+  targetTitle,
+} from "./shell-core.js?v=home-20260720q";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20260719y";
+} from "./shell-motion.js?v=home-20260720q";
 
 /* Resolved lazily — the menubar lives in the lazy GUI template, which is not
    in the DOM at module-evaluation time. */
@@ -114,10 +119,31 @@ function activeBrowserWindow() {
   return entry;
 }
 
+function syncActiveAppTitle(entry) {
+  const node = toolbarActiveTitleNode || document.querySelector("#toolbar-active-title");
+  if (!node) {
+    return;
+  }
+  if (!entry) {
+    node.textContent = "Home";
+    return;
+  }
+  const summary = shellState.currentSummary;
+  const fromSummary = summary ? targetTitle(summary, entry.targetId) : "";
+  const title =
+    canonicalTargetTitle(entry.targetId, entry.title || fromSummary) ||
+    fromSummary ||
+    entry.targetId ||
+    "Home";
+  node.textContent = title;
+}
+
 /* Re-render for the focused window. Runs on every window UI refresh, so it
    also prunes manifests whose windows are gone. */
 export function syncMenubar() {
   const root = menubarRoot();
+  const entry = activeBrowserWindow();
+  syncActiveAppTitle(entry);
   if (!root) {
     return;
   }
@@ -128,7 +154,6 @@ export function syncMenubar() {
   }
   closeMenus({ restoreFocus: false, animate: false });
   root.replaceChildren();
-  const entry = activeBrowserWindow();
   if (!entry) {
     return;
   }

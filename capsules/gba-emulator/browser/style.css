@@ -40,9 +40,9 @@ body {
 }
 
 body {
-  background:
-    radial-gradient(circle at top left, var(--el-accent-faint), transparent 28%),
-    var(--bg);
+  /* Apps-level standard polish: one plate with continuous titlebar.
+     Screen/bezel stay device-black (content-not-chrome). */
+  background: var(--bg);
   color: var(--ink);
   overflow: hidden;
   overscroll-behavior: none;
@@ -81,8 +81,9 @@ body[data-emulator-host-mode="embedded"] .shell {
   min-height: 100vh;
   min-height: 100dvh;
   margin: 0;
-  padding: 0.4rem;
+  padding: 0.55rem;
   display: flex;
+  background: var(--bg);
 }
 
 .emulator-card {

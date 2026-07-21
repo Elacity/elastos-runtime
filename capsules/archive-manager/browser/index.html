@@ -4,10 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Archive - ElastOS</title>
+  <!-- tip: archive-20260720a — continuous one-plate standard chrome -->
   <script src="./elastos-theme.js"></script>
   <link rel="stylesheet" href="./elastos-ui.css">
   <style>
-    /* Rides the shared tokens (dark default, light via data-el-theme). */
+    /* Rides the shared tokens (dark default, light via data-el-theme).
+       Apps-level standard polish: one plate with continuous titlebar; no fake sidebar. */
     :root {
       --bg: var(--el-bg);
       --panel: var(--el-surface-raised);
@@ -66,7 +68,7 @@
       display: grid;
       place-items: center;
       padding: 28px;
-      background: var(--panel);
+      background: var(--bg);
     }
 
     .empty-card {
@@ -187,10 +189,10 @@
     .destination-input,
     .select {
       min-width: 0;
-      border: 1px solid var(--line);
-      border-radius: 7px;
-      background: var(--panel-soft);
-      padding: 7px 9px;
+      border: 1px solid transparent;
+      border-radius: 999px;
+      background: var(--el-inset);
+      padding: 7px 12px;
       color: var(--ink);
       outline: none;
       font-size: 0.84rem;
@@ -208,10 +210,10 @@
     }
 
     .btn {
-      border: 1px solid var(--line);
-      border-radius: 7px;
-      background: var(--panel-soft);
-      padding: 6px 10px;
+      border: 1px solid transparent;
+      border-radius: 999px;
+      background: var(--el-inset);
+      padding: 6px 12px;
       cursor: pointer;
       font-size: 0.84rem;
       font-weight: 600;
@@ -219,7 +221,7 @@
     }
 
     .btn:hover:not(:disabled) {
-      border-color: var(--line-strong);
+      border-color: transparent;
       background: var(--el-lift);
     }
 
@@ -288,8 +290,8 @@
       justify-content: space-between;
       gap: 8px;
       padding: 8px 10px;
-      border-bottom: 1px solid var(--line);
-      background: var(--panel);
+      border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+      background: var(--bg);
     }
 
     .list-title {
@@ -311,7 +313,7 @@
     .content-pane {
       min-height: 0;
       overflow: auto;
-      background: var(--panel);
+      background: var(--bg);
     }
 
     .entry-head,

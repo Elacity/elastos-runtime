@@ -31,10 +31,9 @@ body {
 }
 
 body {
+  /* Apps-level continuous plate when opened as a window; sheet mode overrides below. */
   padding: clamp(0.45rem, 1.35vw, 0.85rem);
-  background:
-    radial-gradient(circle at top left, var(--el-accent-faint), transparent 28%),
-    var(--bg);
+  background: var(--bg);
   color: var(--ink);
 }
 

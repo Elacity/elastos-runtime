@@ -18,9 +18,21 @@ let currentSummary = null;
 let refreshTimer = 0;
 let pendingRemoveContactId = null;
 
+const SECTION_TITLES = {
+  people: "People",
+  discovery: "Discovery",
+};
+
 announceReady();
 
 boot().catch((error) => {
+  if (!homeToken) {
+    lockedShell?.classList.remove("hidden");
+    peopleShell?.classList.add("hidden");
+    return;
+  }
+  lockedShell?.classList.add("hidden");
+  peopleShell?.classList.remove("hidden");
   showStatus(publicError(error, "People could not load."), "error");
 });
 
@@ -73,12 +85,36 @@ window.addEventListener("message", (event) => {
 function bindNavigation() {
   for (const button of document.querySelectorAll("[data-section-target]")) {
     button.addEventListener("click", () => {
-      const target = readText(button.dataset.sectionTarget);
-      document.getElementById(target)?.scrollIntoView({ block: "start", behavior: "smooth" });
-      for (const item of document.querySelectorAll("[data-section-target]")) {
-        item.classList.toggle("active", item === button);
-      }
+      activatePeopleSection(button.dataset.sectionTarget);
     });
+  }
+  activatePeopleSection("people", { initial: true });
+}
+
+function activatePeopleSection(target, options = {}) {
+  const targetId = readText(target);
+  if (!targetId || !SECTION_TITLES[targetId]) {
+    return;
+  }
+  for (const item of document.querySelectorAll("[data-section-target]")) {
+    const selected = item.getAttribute("data-section-target") === targetId;
+    item.classList.toggle("active", selected);
+    if (selected) {
+      item.setAttribute("aria-current", "page");
+    } else {
+      item.removeAttribute("aria-current");
+    }
+  }
+  for (const section of document.querySelectorAll(".people-section[id]")) {
+    const selected = section.id === targetId;
+    section.hidden = !selected;
+  }
+  const titleNode = document.querySelector(".people-page-title");
+  if (titleNode) {
+    titleNode.textContent = SECTION_TITLES[targetId];
+  }
+  if (!options.initial) {
+    document.getElementById(targetId)?.scrollIntoView({ block: "start", behavior: "smooth" });
   }
 }
 

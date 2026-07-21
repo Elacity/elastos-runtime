@@ -852,13 +852,13 @@ assertToken(
   inboxStyle,
   "capsules/inbox/browser/index.html",
   "--sidebar-bg",
-  "#f9f9f9",
+  "#f0f1f4",
 );
 assertToken(
   inboxStyle,
   "capsules/inbox/browser/index.html",
   "--toolbar-bg",
-  "#fafafa",
+  "var(--bg)",
 );
 assert(
   inboxStyle.includes('href="./elastos-ui.css"'),
@@ -1633,7 +1633,7 @@ const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
 const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260719y";
-const homeGuiAssetVersion = "home-20260719y";
+const homeGuiAssetVersion = "home-20260720q";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -1705,19 +1705,29 @@ assert(
     homeGuiJs.includes('elastos:request-lock') &&
     homeGuiShell.includes('elastos:request-lock') &&
     homeGuiShell.includes('home:request-unlock'),
-  "Control Centre keeps accent/dock; Lock Screen lives on the ElastOS menu (Apple-menu placement)",
+  "Control Centre keeps accent/dock; Lock Screen lives on the ElastOS menu",
 );
 assert(
   shellChrome.includes("export function formatMenubarClock") &&
     shellChrome.includes("formatToParts") &&
     shellChrome.includes("clockNode.textContent = formatMenubarClock(now)"),
-  "Menubar clock must assemble Apple-style Mon 20 Jul 12:51 via formatToParts",
+  "Menubar clock must assemble Mon 20 Jul 12:51 via formatToParts",
 );
 assert(
   homeGuiTemplateHtml.includes('id="identity-menu-marketplace"') &&
-    homeGuiTemplateHtml.includes("App Store") &&
-    homeGuiJs.includes('openTarget("marketplace")'),
-  "ElastOS menu must expose App Store → marketplace target",
+    /identity-menu-marketplace[\s\S]{0,800}\bApps\b/.test(homeGuiTemplateHtml) &&
+    homeGuiJs.includes('openTarget("marketplace")') &&
+    homeGuiCore.includes('return "Apps"') &&
+    !homeGuiTemplateHtml.includes("App Store") &&
+    !homeGuiCore.includes('return "App Store"'),
+  "ElastOS menu must expose Apps → marketplace target (no App Store trademark)",
+);
+assert(
+  read("capsules/home-gui/browser/shell-menubar.js").includes("function syncActiveAppTitle(") &&
+    read("capsules/home-gui/browser/shell-menubar.js").includes('node.textContent = "Home"') &&
+    read("capsules/home-gui/browser/shell-windows.js").includes("hooks.syncMenubar()") &&
+    homeGuiTemplateHtml.includes('id="toolbar-active-title"'),
+  "Menubar app name must follow the focused window; desktop falls back to Home",
 );
 (() => {
   const walletAt = homeGuiTemplateHtml.indexOf('id="toolbar-wallet"');
@@ -1996,11 +2006,14 @@ assert(
 assert(
   shellWindows.includes('const BROWSER_IFRAME_ALLOW_EXTRAS = ["clipboard-read", "clipboard-write"]') &&
     shellWindows.includes('const WALLET_IFRAME_ALLOW_EXTRAS = ["clipboard-write"]') &&
+    shellWindows.includes('const CHAT_IFRAME_ALLOW_EXTRAS = ["clipboard-write"]') &&
     shellWindows.includes('launched?.target === "browser"') &&
     shellWindows.includes('launched?.target === "wallet"') &&
+    shellWindows.includes('launched?.target === "chat" || launched?.target === "chat-room"') &&
     shellWindows.includes("tokens.push(...BROWSER_IFRAME_ALLOW_EXTRAS)") &&
-    shellWindows.includes("tokens.push(...WALLET_IFRAME_ALLOW_EXTRAS)"),
-  "Home must grant clipboard-read/write to Browser, and clipboard-write to Wallet (address copy)",
+    shellWindows.includes("tokens.push(...WALLET_IFRAME_ALLOW_EXTRAS)") &&
+    shellWindows.includes("tokens.push(...CHAT_IFRAME_ALLOW_EXTRAS)"),
+  "Home must grant clipboard to Browser/Wallet/Chat; Chat invite Copy needs write",
 );
 assert(
     shellJs.includes('const PASSKEY_AUTHORITY_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"])') &&
@@ -2395,6 +2408,12 @@ assert(
     peopleStyle.includes(".people-sidebar") &&
     peopleStyle.includes(".discovery-grid") &&
     peopleStyle.includes("var(--el-text)") &&
+    peopleStyle.includes("Apps-level blend") &&
+    peopleStyle.includes("var(--el-lift-strong)") &&
+    peopleStyle.includes(".people-page-title") &&
+    peopleIndex.includes("people-20260720c") &&
+    peopleScript.includes("SECTION_TITLES") &&
+    peopleScript.includes("activatePeopleSection") &&
     !peopleStyle.includes("#1f2937") &&
     !shellWindows.includes("renderPeopleWindowBody") &&
     !shellWindows.includes("/api/apps/people/") &&
@@ -2418,8 +2437,11 @@ assert(
     servicesIndex.includes("Available from People") &&
     servicesIndex.includes("mine-services") &&
     servicesIndex.includes("other-services") &&
-    servicesIndex.includes("services-20260717a") &&
-    servicesIndex.includes("services-20260711i") &&
+    servicesIndex.includes("style.css?v=services-20260720c") &&
+    servicesIndex.includes("services.js?v=services-20260720e") &&
+    servicesIndex.includes('class="services-page-title">This device</h1>') &&
+    servicesScript.includes("SECTION_TITLES") &&
+    servicesScript.includes("section.hidden = !selected") &&
     servicesScript.includes("/api/apps/services/summary") &&
     servicesScript.includes("/api/apps/services/offers") &&
     servicesScript.includes("Browser Engine") &&
@@ -4341,7 +4363,8 @@ assert(
     !marketplaceUi.includes("isBuiltIn") &&
     !marketplaceUi.includes("initTheme") &&
     !marketplaceIndex.includes('class="header-title"') &&
-    marketplaceIndex.includes("App Store · ElastOS") &&
+    marketplaceIndex.includes("Apps · ElastOS") &&
+    !marketplaceIndex.includes("App Store") &&
     marketplaceIndex.includes("store-shell") &&
     marketplaceIndex.includes('id="store-sidebar"') &&
     marketplaceUi.includes("home:menu-manifest") &&
@@ -4352,9 +4375,10 @@ assert(
     !marketplaceUi.includes("Install pending") &&
     !marketplaceUi.includes("Install unavailable") &&
     !marketplaceUi.includes("app-price") &&
+    !marketplaceUi.includes("App Store") &&
     !marketplaceIndex.includes("install-modal") &&
     !marketplaceIndex.includes('data-tab="discover"'),
-  "App Store chrome: sidebar destinations, list rows, Open pills; no Install theater",
+  "Apps catalog chrome: sidebar destinations, list rows, Open pills; no Install theater",
 );
 const marketplaceCss = read("capsules/marketplace/browser/marketplace.css");
 assert(
@@ -4363,25 +4387,142 @@ assert(
     marketplaceUi.includes("function detailPublisher(") &&
     marketplaceUi.includes('return "ElastOS"') &&
     !marketplaceUi.includes("developer: capsule.author || \"Unknown publisher\",\n    subtitle: capsule.author"),
-  "App Store rows must not show bare elastos publisher; detail publisher is ElastOS",
+  "Apps rows must not show bare elastos publisher; detail publisher is ElastOS",
 );
 assert(
   marketplaceCss.includes("--window-chrome-safe-top") &&
     marketplaceCss.includes("backdrop-filter: blur(22px)") &&
-    marketplaceCss.includes("border-radius: 999px"),
-  "App Store sidebar must pad for unified chrome and use pill search + material blur",
+    marketplaceCss.includes("border-radius: 999px") &&
+    !marketplaceCss.includes("App Store"),
+  "Apps sidebar must pad for unified chrome and use pill search + material blur",
 );
+const servicesStyleChrome = read("capsules/services/browser/style.css");
+const peopleStyleChrome = read("capsules/people/browser/style.css");
+const libraryStyleChrome = read("capsules/library/browser/library.css");
 assert(
   homeGuiCore.includes("WINDOW_CHROME_UNIFIED_SIDEBAR") &&
     homeGuiCore.includes("function windowChromeModeForTarget(") &&
     homeGuiCore.includes("function applyWindowChrome(") &&
     homeGuiCore.includes("marketplace: WINDOW_CHROME_UNIFIED_SIDEBAR") &&
+    homeGuiCore.includes("system: WINDOW_CHROME_UNIFIED_SIDEBAR") &&
+    homeGuiCore.includes("library: WINDOW_CHROME_UNIFIED_SIDEBAR") &&
+    homeGuiCore.includes("services: WINDOW_CHROME_UNIFIED_SIDEBAR") &&
+    homeGuiCore.includes("people: WINDOW_CHROME_UNIFIED_SIDEBAR") &&
+    homeGuiCore.includes("documents: WINDOW_CHROME_UNIFIED_SIDEBAR") &&
+    homeGuiCore.includes("inbox: WINDOW_CHROME_UNIFIED_SIDEBAR") &&
+    homeGuiCore.includes("chat: WINDOW_CHROME_UNIFIED_SIDEBAR") &&
+    homeGuiCore.includes('"chat-room": WINDOW_CHROME_UNIFIED_SIDEBAR') &&
+    homeGuiCore.includes("browser: WINDOW_CHROME_UNIFIED_TOOLBAR") &&
+    homeGuiCore.includes("WINDOW_CHROME_UNIFIED_TOOLBAR") &&
     shellWindows.includes("applyWindowChrome(node, launched.target)") &&
     homeGuiStyle.includes(".window.window-chrome-unified-sidebar") &&
     homeGuiStyle.includes("--window-chrome-safe-top: 52px") &&
+    homeGuiStyle.includes("var(--window-chrome-sidebar-width, 220px)") &&
+    homeGuiCore.includes(
+      'windowNode.style.setProperty("--window-chrome-sidebar-width", "220px")',
+    ) &&
+    shellWindows.includes("Re-apply chrome on focus so Chat") &&
+    homeGuiStyle.includes(".window.window-chrome-unified-toolbar") &&
+    homeGuiStyle.includes("--window-chrome-safe-leading: 96px") &&
+    homeGuiStyle.includes(".window.window-chrome-continuous") &&
+    homeGuiCore.includes("WINDOW_CHROME_CONTINUOUS_TARGETS") &&
+    homeGuiCore.includes(`const WINDOW_CHROME_CONTINUOUS_TARGETS = new Set([
+  "wallet",
+  "archive-manager",
+  "gba-emulator",
+  "wallet-metamask",
+  "wallet-unisat",
+  "wallet-walletconnect",
+]);`) &&
+    homeGuiCore.includes(
+      'DEFAULT_TASKBAR_PINS = ["browser", "library", "wallet", "documents", "chat-room", "system"]',
+    ) &&
+    homeGuiStyle.includes(".taskbar-item-launcher .taskbar-icon") &&
+    shellSurface.includes(
+      '.taskbar-item:not(.taskbar-item-launcher)',
+    ) &&
+    shellSurface.includes("Magnify only while the pointer is on an app") &&
+    shellSurface.includes("cancelAnimationFrame(dockState.raf)") &&
+    read("capsules/wallet/browser/style.css").includes("Apps-level object blend") &&
+    read("capsules/archive-manager/browser/index.html").includes("Apps-level standard polish") &&
+    read("capsules/chat-room/browser/style.css").includes(
+      "Exact Apps/marketplace recipe",
+    ) &&
+    read("capsules/chat-room/browser/style.css").includes(
+      "#chat-card MUST zero its ID padding",
+    ) &&
+    read("capsules/chat-room/browser/style.css").includes("flex: 0 0 220px") &&
+    read("capsules/chat-room/browser/style.css").includes("--sidebar-bg:") &&
+    read("capsules/chat-room/browser/style.css").includes(
+      "grid-template-columns: minmax(0, 1fr) auto",
+    ) &&
+    read("capsules/chat-room/browser/index.html").includes("chat-room-20260721f") &&
+    read("capsules/chat-room/browser/index.html").includes('aria-label="People"') &&
+    homeGuiStyle.includes('.window[data-target="chat-room"] .window-head') &&
+    homeGuiStyle.includes("Continuous must not paint a full black bar over Chat") &&
+    homeGuiStyle.includes("var(--panel-strong)") &&
+    homeGuiStyle.includes("never hardcode a dark strip in light mode") &&
+    !homeGuiStyle.includes(
+      "color-mix(in srgb, rgba(22, 24, 29, 0.92) 100%, transparent)",
+    ) &&
+    homeGuiStyle.includes("Wallet / Archive / GBA / connectors") &&
+    !homeGuiStyle.includes("Wallet / Archive / Chat") &&
+    homeGuiCore.includes("forceUnifiedSidebarGeometry") &&
+    homeGuiCore.includes("TEMPORARY tip-lag defense for Chat only") &&
+    homeGuiCore.includes("clearForcedUnifiedSidebarGeometry") &&
+    homeGuiCore.includes("Map is the sole mode source") &&
+    !homeGuiCore.includes("Hard-pin Chat to the same chrome as Apps/marketplace") &&
+    read("docs/DESIGN_SYSTEM.md").includes(
+      "Chat may temporarily force head/body geometry",
+    ) &&
+    read("capsules/gba-emulator/browser/style.css").includes("Apps-level standard polish") &&
+    read("capsules/inbox/browser/index.html").includes("Apps-level blend") &&
+    read("capsules/inbox/browser/index.html").includes("--window-chrome-safe-top") &&
+    read("capsules/marketplace/browser/marketplace.js").includes("Sidebar roving") &&
+    read("capsules/marketplace/browser/marketplace.js").includes(
+      'field.matches("input, textarea, select")',
+    ) &&
+    read("capsules/marketplace/browser/marketplace.js").includes(
+      "selectDestination(item.dataset.destination)",
+    ) &&
+    read("capsules/marketplace/browser/index.html").includes("marketplace-20260720g") &&
+    read("capsules/marketplace/browser/index.html").includes('aria-label="Apps"') &&
+    !read("capsules/marketplace/browser/index.html").includes('aria-label="Store"') &&
+    read("capsules/wallet-metamask/browser/style.css").includes("Apps-level continuous plate") &&
+    read("capsules/wallet-unisat/browser/style.css").includes("Apps-level continuous plate") &&
+    read("capsules/wallet-walletconnect/browser/style.css").includes("Apps-level continuous plate") &&
+    systemSettingsStyle.includes("--window-chrome-safe-top") &&
+    servicesStyleChrome.includes("--window-chrome-safe-top") &&
+    servicesStyleChrome.includes("Apps-level blend: flex split shell") &&
+    servicesStyleChrome.includes("var(--el-lift-strong)") &&
+    servicesStyleChrome.includes(".services-page-title") &&
+    !servicesStyleChrome.includes("margin-left: 220px") &&
+    peopleStyleChrome.includes("--window-chrome-safe-top") &&
+    peopleStyleChrome.includes("Apps-level blend") &&
+    peopleStyleChrome.includes(".people-page-title") &&
+    libraryStyleChrome.includes("--window-chrome-safe-top") &&
+    read("capsules/documents/browser/index.html").includes("--window-chrome-safe-top") &&
+    read("capsules/documents/browser/index.html").includes("Apps-level blend") &&
+    read("capsules/browser/browser/style.css").includes("--window-chrome-safe-leading") &&
+    read("capsules/browser/browser/style.css").includes("browser-nav-group") &&
+    read("capsules/browser/browser/index.html").includes('class="browser-nav-group"') &&
+    !read("capsules/browser/browser/style.css").includes("font-weight: 650") &&
     read("docs/DESIGN_SYSTEM.md").includes("## Window Chrome Modes") &&
-    read("docs/DESIGN_SYSTEM.md").includes("`unified-sidebar`"),
-  "Unified-sidebar chrome must be opt-in in shell-core, applied on launch, styled, and documented",
+    read("docs/DESIGN_SYSTEM.md").includes("`unified-sidebar`") &&
+    read("docs/DESIGN_SYSTEM.md").includes("`unified-toolbar`") &&
+    read("docs/DESIGN_SYSTEM.md").includes("**Inbox window**") &&
+    read("docs/DESIGN_SYSTEM.md").includes("**Chat / Chat Room**") &&
+    read("docs/DESIGN_SYSTEM.md").includes("Documents"),
+  "Unified-sidebar includes Inbox window + Chat; Browser unified-toolbar; continuous without Inbox/Chat",
+);
+assert(
+  systemSettingsStyle.includes("Apps-level blend: flex split shell") &&
+    systemSettingsStyle.includes("flex: 0 0 220px") &&
+    systemSettingsStyle.includes("font-size: 34px") &&
+    systemSettingsStyle.includes("var(--el-lift-strong)") &&
+    !systemSettingsStyle.includes("margin-left: 220px") &&
+    !systemSettingsStyle.includes("position: fixed;\n  margin-top"),
+  "System blend: flex shell, big H1, capsule nav; no fixed-sidebar margin hack",
 );
 assert(
   marketplaceUi.includes("const category = String(capsule.category || \"\").toLowerCase()") &&
@@ -4636,7 +4777,7 @@ const walletconnectConfigSmoke = read(
   "scripts/walletconnect-connector-config-smoke.sh",
 );
 const walletProviderDoc = read("docs/WALLET_PROVIDER.md");
-const systemAssetVersion = "system-20260719g";
+const systemAssetVersion = "system-20260720b";
 const shellAuth = read("capsules/home/browser/shell-auth.js");
 const protectedHomeStateSmoke = read("scripts/protected-home-state-smoke.sh");
 const auditChainBoundary = {
@@ -4796,14 +4937,15 @@ assert(
   "Documents Hide list icon button must keep an accessible label",
 );
 assert(
-  documents.includes(".page-shell {\n    padding: 0;"),
-  "Documents mobile shell must not add an extra outer gutter",
+  documents.includes("padding: 0;\n  overflow: hidden;\n  background: var(--bg);") &&
+    documents.includes("--window-chrome-safe-top") &&
+    documents.includes("Apps-level blend"),
+  "Documents shell must be gutterless one-plate blend with unified chrome safe-top",
 );
 assert(
-  documents.includes(
-    ".documents-main,\n  .share-main {\n    padding: 0.38rem;",
-  ),
-  "Documents mobile panels must use compact padding",
+  documents.includes("border-radius: 999px") &&
+    documents.includes("var(--el-lift-strong)"),
+  "Documents list rows must use capsule selection like Apps/Library",
 );
 assert(
   inbox.includes("button.dataset.actionId = actionId;"),
@@ -6315,11 +6457,19 @@ assert(
   "Library live smoke must verify public static assets without a signed session and provider publish/share with a signed Home session",
 );
 assert(
-  libraryIndex.includes('rel="stylesheet" href="library.css"') &&
+  libraryIndex.includes('rel="stylesheet" href="library.css?v=library-20260720c"') &&
     libraryIndex.includes('type="module" src="src/app.js?v=library-20260711d"') &&
     !libraryIndex.includes("<style>") &&
     !libraryIndex.includes("function renderContent"),
   "Library index must stay a static shell with CSS and app code split out",
+);
+assert(
+  libraryCss.includes("Apps-level blend") &&
+    libraryCss.includes("border-radius: 999px") &&
+    libraryCss.includes("var(--el-lift-strong)") &&
+    libraryCss.includes("background: var(--bg)") &&
+    libraryCss.includes("--window-chrome-safe-top"),
+  "Library blend: capsule places nav, page bg, unified safe-top",
 );
 assert(
   libraryApp.includes('from "./model.js"') &&
@@ -6405,8 +6555,12 @@ assert(
   "Library toolbar must stack on narrow screens",
 );
 assert(
-  libraryCss.includes("padding: 4px;") && libraryCss.includes("border-radius: 14px;"),
-  "Library mobile panels must use compact Home-aligned spacing",
+  libraryCss.includes("@media (max-width: 720px)") &&
+    libraryCss.includes("border-radius: 0;") &&
+    libraryCss.includes("box-shadow: none;") &&
+    libraryCss.includes(".locked-card") &&
+    libraryCss.includes("border-radius: 14px;"),
+  "Library narrow layout keeps flat blended shell; locked card may keep compact radius",
 );
 assert(
   chatStyle.includes("width: 100%;") &&
@@ -9669,7 +9823,8 @@ assert(
 assert(
   shellWindows.includes("function fitLaunchedWindow") &&
     shellWindows.includes("fitWindowToBrowserAspect") &&
-    shellWindows.includes("fitWindowToLargestBrowserAspect") &&
+    !shellWindows.includes("fitWindowToLargestBrowserAspect") &&
+    shellWindows.includes("Browser uses the same stage maximize") &&
     shellWindows.includes("dataset.browserMaximized") &&
     shellWindows.includes(`syncBrowserWindow(entry, launched);
   if (entry.targetId === "browser") {
@@ -9696,12 +9851,11 @@ assert(
     ) &&
     shellWindowGeometry.includes("BROWSER_REMOTE_ASPECT_RATIO = 16 / 9") &&
     shellWindowGeometry.includes("browserAspectBoundsForState") &&
-    shellWindowGeometry.includes(
-      "export function fitWindowToLargestBrowserAspect",
-    ) &&
-    shellWindowGeometry.includes("node.dataset.browserMaximized") &&
-    shellWindowGeometry.includes("browserAspectResizeBounds"),
-  "Home Browser windows must lock to the current 16:9 remote compositor aspect, allow multiple Browser instances, keep true singleton handling scoped to People, and must not install generic iframe auto-fit observers that fight the remote display during resize",
+    shellWindowGeometry.includes("browserAspectResizeBounds") &&
+    !shellWindowGeometry.includes(
+      'node.dataset.target === BROWSER_TARGET_ID) {\n      node.dataset.maximized = "false";\n      node.dataset.browserMaximized = "true";\n      fitWindowToLargestBrowserAspect',
+    ),
+  "Home Browser windows lock 16:9 while windowed; green maximize uses the full stage like other apps; multiple Browser instances allowed; no iframe auto-fit fighting remote resize",
 );
 assert(
   shellWindows.includes("query: normalizedLaunchQuery(entry.launchQuery)") &&

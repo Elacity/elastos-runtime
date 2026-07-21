@@ -50,7 +50,7 @@ import {
   mutateDesktopObject,
   formatBadgeCount,
   focusModeEnabled,
-} from "./shell-core.js?v=home-20260719y";
+} from "./shell-core.js?v=home-20260720q";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -64,18 +64,18 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260719y";
-import { playUiSound } from "./shell-sounds.js?v=home-20260719y";
+} from "./shell-windows.js?v=home-20260720q";
+import { playUiSound } from "./shell-sounds.js?v=home-20260720q";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
   setOverlayOpen,
-} from "./shell-popovers.js?v=home-20260719y";
+} from "./shell-popovers.js?v=home-20260720q";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20260719y";
-import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260719y";
+} from "./shell-motion.js?v=home-20260720q";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260720q";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -2372,8 +2372,10 @@ function dockMagnifyEnabled() {
 }
 
 function rebuildDockIconCache() {
+  /* Launcher has no app container — keep it static (no magnify / lift / shift).
+     App icons still get the normal dock wave. */
   dockState.icons = Array.from(
-    dockState.taskbar.querySelectorAll(".taskbar-item"),
+    dockState.taskbar.querySelectorAll(".taskbar-item:not(.taskbar-item-launcher)"),
   ).map((item) => {
     const rect = item.getBoundingClientRect();
     return {
@@ -2396,12 +2398,25 @@ function rebuildDockIconCache() {
 
 function resetDockMagnification() {
   dockState.pointerX = null;
+  if (dockState.raf) {
+    window.cancelAnimationFrame(dockState.raf);
+    dockState.raf = 0;
+  }
   for (const entry of dockState.icons) {
     if (entry.node) {
       entry.node.style.transform = "";
     }
     entry.item?.style.removeProperty("--dock-shift");
   }
+  const launcherIcon = dockState.taskbar?.querySelector(
+    ".taskbar-item-launcher .taskbar-icon",
+  );
+  if (launcherIcon) {
+    launcherIcon.style.transform = "";
+  }
+  dockState.taskbar
+    ?.querySelector(".taskbar-item-launcher")
+    ?.style.removeProperty("--dock-shift");
 }
 
 function applyDockMagnification() {
@@ -2446,6 +2461,16 @@ function applyDockMagnification() {
     entry.node.style.transform = `translate(${shift.toFixed(2)}px, ${lift.toFixed(2)}px) scale(${scale.toFixed(3)})`;
     entry.item?.style.setProperty("--dock-shift", `${shift.toFixed(2)}px`);
   }
+  /* Keep launcher paint-static even if a stale transform lingered. */
+  const launcherIcon = dockState.taskbar?.querySelector(
+    ".taskbar-item-launcher .taskbar-icon",
+  );
+  if (launcherIcon) {
+    launcherIcon.style.transform = "";
+  }
+  dockState.taskbar
+    ?.querySelector(".taskbar-item-launcher")
+    ?.style.removeProperty("--dock-shift");
   repositionDockTooltip();
 }
 
@@ -2567,6 +2592,13 @@ function setupDock() {
   });
   taskbar.addEventListener("pointermove", (event) => {
     if (!dockMagnifyEnabled()) {
+      resetDockMagnification();
+      return;
+    }
+    /* Magnify only while the pointer is on an app/trash icon — not Launcher,
+       not separators, not the gap beside Launcher (that caused neighbor flicker). */
+    const magItem = event.target.closest(".taskbar-item:not(.taskbar-item-launcher)");
+    if (!magItem) {
       resetDockMagnification();
       return;
     }

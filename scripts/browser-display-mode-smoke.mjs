@@ -309,10 +309,11 @@ assert(
   if (entry.targetId === "browser") {
     fitLaunchedWindow(entry);
   }`) &&
-    homeGuiWindowsSource.includes("fitWindowToLargestBrowserAspect") &&
+    !homeGuiWindowsSource.includes("fitWindowToLargestBrowserAspect") &&
+    homeGuiWindowsSource.includes("Browser uses the same stage maximize") &&
     homeGuiWindowsSource.includes("dataset.browserMaximized") &&
     homeShellWindowGeometrySource.includes(
-      "export function fitWindowToLargestBrowserAspect",
+      "BROWSER_REMOTE_ASPECT_RATIO = 16 / 9",
     ) &&
     homeShellWindowGeometrySource.includes(
       'node.dataset.target === BROWSER_TARGET_ID',
@@ -324,7 +325,7 @@ assert(
     rememberWindowRestoreBounds(entry.node);
     return;
   }`),
-  "Home Browser windows must immediately fit/persist 16:9 restore geometry without automatic hidden preboot windows",
+  "Home Browser windows must immediately fit/persist 16:9 restore geometry without automatic hidden preboot windows; maximize uses the full stage",
 );
 assert(
   !selkiesMessagesForInputSource.includes('event.type === "resize"'),

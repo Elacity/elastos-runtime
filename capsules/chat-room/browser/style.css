@@ -2,6 +2,8 @@
   color-scheme: dark;
   --bg: var(--el-bg);
   --bg-strong: #10131a;
+  /* Same sidebar plate as Library / Inbox / System. */
+  --sidebar-bg: rgba(22, 24, 29, 0.78);
   --panel: var(--el-surface);
   --panel-strong: var(--el-surface-raised);
   --panel-soft: var(--el-inset);
@@ -26,16 +28,14 @@
 :root[data-el-theme="light"] {
   color-scheme: light;
   --bg-strong: #e3e9fb;
+  --sidebar-bg: #f0f1f4;
   --brand-soft: #fff1dc;
   --danger: #b14c5a;
   --self: #edf2ff;
 }
 
 :root[data-el-theme="light"] body {
-  background:
-    radial-gradient(circle at top left, rgba(95, 118, 216, 0.14), transparent 28%),
-    radial-gradient(circle at bottom right, rgba(126, 149, 226, 0.12), transparent 24%),
-    linear-gradient(180deg, #f7f9ff 0%, var(--bg) 100%);
+  background: var(--bg);
 }
 
 /* accent-filled buttons: light accent (#5f76d8) takes white ink, not the dark-theme #0b0d10 */
@@ -105,10 +105,8 @@ body {
 }
 
 body {
-  background:
-    radial-gradient(circle at top left, rgba(125, 149, 240, 0.12), transparent 28%),
-    radial-gradient(circle at bottom right, rgba(246, 146, 26, 0.07), transparent 24%),
-    linear-gradient(180deg, var(--bg-strong) 0%, var(--bg) 100%);
+  /* Apps-level standard polish: solid plate (shell continuous titlebar matches). */
+  background: var(--bg);
   color: var(--ink);
 }
 
@@ -134,17 +132,7 @@ body[data-room-access-mode="gateway"][data-room-session-active="false"] .shell {
   justify-content: center;
 }
 
-body[data-room-access-mode="shell"] .shell,
-body[data-room-session-active="true"] .shell {
-  width: 100%;
-  height: 100%;
-  min-height: 100vh;
-  min-height: 100dvh;
-  margin: 0;
-  padding: 0.4rem;
-  display: flex;
-  flex-direction: column;
-}
+/* Shell grid is finalized in the Shell chrome block (Library 220px | 1fr). */
 
 h1,
 h2,
@@ -281,31 +269,11 @@ body[data-room-access-mode="gateway"][data-room-session-active="false"] #chat-ca
   backdrop-filter: none;
 }
 
-body[data-room-access-mode="shell"] #chat-card,
-body[data-room-session-active="true"] #chat-card {
-  margin-top: 0;
-}
-
-body[data-room-access-mode="shell"] .chat-room-shell,
-body[data-room-session-active="true"] .chat-room-shell {
-  flex: 1 1 auto;
-  min-height: 0;
-  height: calc(100vh - 0.8rem);
-  height: calc(100dvh - 0.8rem);
-  padding: 0;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  box-shadow: none;
-  backdrop-filter: none;
-  position: relative;
-  align-items: stretch;
-  grid-template-rows: minmax(0, 1fr);
-}
+/* Shell #chat-card layout is defined with the marketplace clone block below. */
 
 .chat-card {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 15rem;
+  grid-template-columns: 15rem minmax(0, 1fr);
   gap: 0.8rem;
   align-items: start;
 }
@@ -561,12 +529,20 @@ body[data-room-access-mode="gateway"][data-room-session-active="false"] .convers
 }
 
 .browser-access-request-head,
-.node-row-head,
-.policy-row {
+.node-row-head {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
   gap: 0.55rem;
+  min-width: 0;
+}
+
+/* Copy | toggle — keep On/Off visible inside the narrow People column. */
+.policy-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.5rem;
 }
 
 .join-link-copy {
@@ -589,6 +565,9 @@ body[data-room-access-mode="gateway"][data-room-session-active="false"] .convers
 .policy-row-name {
   font-size: 0.84rem;
   font-weight: 700;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .browser-access-request-time,
@@ -597,6 +576,19 @@ body[data-room-access-mode="gateway"][data-room-session-active="false"] .convers
   color: var(--muted);
   font-size: 0.72rem;
   line-height: 1.35;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.policy-row > div {
+  min-width: 0;
+}
+
+.node-row-head {
+  flex: 1 1 auto;
+  flex-direction: column;
+  align-items: stretch;
 }
 
 .browser-access-request-detail,
@@ -648,13 +640,11 @@ body[data-room-access-mode="gateway"][data-room-session-active="false"] .convers
   font-size: 0.78rem;
 }
 
-.policy-row {
-  align-items: center;
-}
-
 .policy-row button {
   flex: 0 0 auto;
-  min-width: 4.25rem;
+  min-width: 3.5rem;
+  max-width: 100%;
+  justify-self: end;
 }
 
 .policy-row button[aria-pressed="true"] {
@@ -952,10 +942,8 @@ body[data-room-access-mode="gateway"][data-room-session-active="false"] #browser
 }
 
 body[data-room-access-mode="shell"] .conversation-card,
-body[data-room-access-mode="shell"] .presence-card,
-body[data-room-session-active="true"] .conversation-card,
-body[data-room-session-active="true"] .presence-card {
-  box-shadow: var(--el-shadow-1);
+body[data-room-session-active="true"] .conversation-card {
+  box-shadow: none;
 }
 
 @media (max-width: 960px) {
@@ -964,8 +952,15 @@ body[data-room-session-active="true"] .presence-card {
   }
 
   .chat-card {
-    grid-template-columns: minmax(0, 1fr) 13rem;
+    grid-template-columns: 13rem minmax(0, 1fr);
     gap: 0.7rem;
+  }
+
+  body[data-room-access-mode="shell"] .shell,
+  body[data-room-session-active="true"] .shell {
+    width: 100%;
+    grid-template-columns: 220px minmax(0, 1fr);
+    gap: 0;
   }
 
   .presence-card {
@@ -1084,49 +1079,140 @@ body[data-room-session-active="true"] .presence-card {
 }
 
 /* ---- Shell chrome ----------------------------------------------------------
-   Inside a Home window the room is an OS app, not a webpage: no gradient
-   backdrop, no floating rounded cards. The conversation is the content plane
-   and the roster is a real sidebar behind one hairline. Gateway/standalone
-   mode keeps the card look above. */
-body[data-room-access-mode="shell"] {
-  background: var(--el-bg);
-}
-
-body[data-room-access-mode="shell"] .shell {
-  padding: 0;
-}
-
-body[data-room-access-mode="shell"] .chat-room-shell {
+   Exact Apps/marketplace recipe:
+   body 100vh → flex split → 220px sidebar plate + main (safe-top under lights).
+   #chat-card MUST zero its ID padding or a black strip shows above People. */
+body[data-room-access-mode="shell"],
+body[data-room-session-active="true"] {
+  margin: 0;
   height: 100vh;
-  height: 100dvh;
+  overflow: hidden;
+  background: var(--bg);
 }
 
-body[data-room-access-mode="shell"] .chat-card {
-  gap: 0;
+body[data-room-access-mode="shell"] .shell,
+body[data-room-session-active="true"] .shell {
+  display: block;
+  width: 100%;
+  height: 100vh;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: var(--bg);
 }
 
-body[data-room-access-mode="shell"] .conversation-card,
-body[data-room-access-mode="shell"] .presence-card {
+/* marketplace .store-shell — kill .card float + #chat-card padding */
+body[data-room-access-mode="shell"] #chat-card,
+body[data-room-session-active="true"] #chat-card {
+  display: flex;
+  width: 100%;
+  height: 100vh;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
   border: 0;
   border-radius: 0;
-  background: transparent;
+  background: var(--bg);
   box-shadow: none;
+  backdrop-filter: none;
+  gap: 0;
+  overflow: hidden;
+  align-items: stretch;
 }
 
-body[data-room-access-mode="shell"] .conversation-card {
+body[data-room-access-mode="shell"] .participant-scrim,
+body[data-room-access-mode="shell"] .participant-toggle,
+body[data-room-session-active="true"] .participant-scrim,
+body[data-room-session-active="true"] .participant-toggle {
+  display: none !important;
+}
+
+/* marketplace .store-sidebar — must paint from y=0 under traffic lights */
+body[data-room-access-mode="shell"] .presence-card,
+body[data-room-session-active="true"] .presence-card {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 220px;
+  width: 220px;
+  min-width: 220px;
+  max-width: 220px;
+  gap: 0.45rem;
+  margin: 0 !important;
+  padding: var(--window-chrome-safe-top, 52px) 12px 16px;
+  border: 0 !important;
+  border-right: 1px solid color-mix(in srgb, var(--line) 70%, transparent) !important;
+  border-radius: 0 !important;
+  background: color-mix(in srgb, var(--sidebar-bg) 92%, transparent) !important;
+  box-shadow: none !important;
+  backdrop-filter: blur(22px);
+  -webkit-backdrop-filter: blur(22px);
+  max-height: none;
+  height: 100% !important;
+  min-height: 100% !important;
+  align-self: stretch;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* marketplace .store-main */
+body[data-room-access-mode="shell"] .conversation-card,
+body[data-room-session-active="true"] .conversation-card {
+  position: relative;
+  z-index: 0;
+  flex: 1 1 auto;
+  border: 0;
+  border-radius: 0;
+  background: var(--bg);
+  box-shadow: none;
   padding: 0.75rem 0.9rem;
+  min-width: 0;
+  min-height: 0;
+  height: auto;
+  align-self: stretch;
+  overflow: hidden;
 }
 
-body[data-room-access-mode="shell"] .presence-card {
-  border-left: 1px solid var(--line);
-  background: var(--el-surface);
-  padding: 0.75rem;
+body[data-room-access-mode="shell"] .roster-title,
+body[data-room-session-active="true"] .roster-title {
+  margin: 0 4px 4px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+body[data-room-access-mode="shell"] .roster-head,
+body[data-room-session-active="true"] .roster-head {
+  min-height: 28px;
+  margin-bottom: 2px;
+}
+
+body[data-room-access-mode="shell"] .room-access-toggle,
+body[data-room-session-active="true"] .room-access-toggle {
+  width: 28px;
+  min-height: 28px;
+  border-radius: 8px;
 }
 
 @media (max-width: 760px) {
-  body[data-room-access-mode="shell"] .chat-card[data-roster-open="true"] .presence-card {
+  body[data-room-access-mode="shell"] #chat-card,
+  body[data-room-session-active="true"] #chat-card {
+    flex-direction: column;
+  }
+
+  body[data-room-access-mode="shell"] .chat-card[data-roster-open="true"] .presence-card,
+  body[data-room-session-active="true"] .chat-card[data-roster-open="true"] .presence-card {
+    flex: 1 1 auto;
+    width: auto;
+    min-width: 0;
+    max-width: none;
     border: 1px solid var(--line);
     border-radius: 0.9rem;
     background: var(--panel-strong);
+    padding: 0.75rem;
   }
 }

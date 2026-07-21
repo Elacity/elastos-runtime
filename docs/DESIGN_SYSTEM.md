@@ -25,7 +25,7 @@ variable names onto them in a small `:root` alias block.
   palette lives in the same `elastos-ui.css`; apps must not hardcode dark
   assumptions in chrome.
 - **One system accent:** `--el-accent` (plus `-ink`, `-strong`, `-soft`,
-  `-faint` derivatives). The user picks one of eight macOS-style accents in
+  `-faint` derivatives). The user picks one of eight system accents in
   System → Personalization (`elastos.ui.accent`, `data-el-accent` on `<html>`);
   every app obeys it and none defines its own accent color.
 - **Brand:** the ElastOS orange (`--el-brand`, `#f6921a`) is reserved for
@@ -35,7 +35,7 @@ variable names onto them in a small `:root` alias block.
 
 ## Shell Chrome Anatomy
 
-The Home shell follows the macOS anatomy deliberately:
+The Home shell follows a familiar desktop anatomy deliberately:
 
 - A full-width system bar owns the focused app's name, its **menu bar**
   (see message contract below), Spotlight, inbox, identity,
@@ -55,7 +55,9 @@ Unknown or missing modes **fail closed** to `standard`.
 | Mode | Grammar | Opt-in |
 |------|---------|--------|
 | `standard` | Full titlebar: lights + icon + title; body sits below the head | Default for every target |
-| `unified-sidebar` | Transparent head overlay on the **leading column only** (~220px); body is full window height; capsule pads with `--window-chrome-safe-top` | Explicit target map in `windowChromeModeForTarget` (App Store / `marketplace` first) |
+| `standard` + continuous | Same geometry as `standard`, but titlebar fill matches `--frame-fill` (one plate with body) | Opt-in via `WINDOW_CHROME_CONTINUOUS_TARGETS`: Wallet, Archive, GBA Emulator, wallet connectors. Not a fake sidebar. |
+| `unified-sidebar` | Transparent head overlay on the **leading column only** (~220px); body is full window height; capsule pads with `--window-chrome-safe-top` | Explicit opt-in: Apps, System, Library, Services, People, Documents, **Inbox window**, **Chat / Chat Room** (People leading). Shell Inbox **rail** is a separate surface (not this map). |
+| `unified-toolbar` | No window title/icon (menubar already shows focused app); transparent lights overlay on the **leading tool-row** (~76px); body full height; capsule pads `--window-chrome-safe-leading` | Explicit opt-in: Browser. Safari-inspired single tool band — not a fake sidebar. |
 | `immersive` | Reserved — not shipped | — |
 
 Rules:
@@ -65,6 +67,9 @@ Rules:
 - Capsules own safe-top padding; shell owns lights + certified drag on the leading strip.
 - Materials are token + blur approximations — never claim true OS vibrancy until a Tier 3 host surface exists.
 - Document every new opt-in target here and in the entropy matrix before shipping.
+- Chat may temporarily force head/body geometry in shell JS when CSS tips lag
+  (presentation only). `WINDOW_CHROME_BY_TARGET` remains the sole mode source —
+  remove the force once tips are stable.
 
 ## Interaction Contract
 

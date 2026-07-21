@@ -17,12 +17,23 @@ const VISIBLE_SERVICE_KINDS = new Set([BROWSER_ENGINE_SERVICE_KIND, EXIT_SERVICE
 let currentServices = null;
 let pendingServiceAction = null;
 
+const SECTION_TITLES = {
+  "mine-services": "This device",
+  "other-services": "From People",
+};
+
 announceReady();
 
 boot().catch((error) => {
+  // Only the no-token path owns the locked card. API/boot errors stay in-app.
+  if (!homeToken) {
+    lockedShell?.classList.remove("hidden");
+    servicesShell?.classList.add("hidden");
+    return;
+  }
+  lockedShell?.classList.add("hidden");
+  servicesShell?.classList.remove("hidden");
   showStatus(error.message || "Sharing failed to load.", "error");
-  lockedShell?.classList.remove("hidden");
-  servicesShell?.classList.add("hidden");
 });
 
 async function boot() {
@@ -51,19 +62,34 @@ function bindNavigation() {
       activateServicesSection(target);
     });
   }
+  activateServicesSection("mine-services", { initial: true });
 }
 
 function activateServicesSection(target, options = {}) {
   const targetId = readText(target);
-  if (!targetId) {
+  if (!targetId || !SECTION_TITLES[targetId]) {
     return;
   }
-  document.getElementById(targetId)?.scrollIntoView({
-    block: "start",
-    behavior: options.behavior || "smooth",
-  });
   for (const item of document.querySelectorAll("[data-section-target]")) {
-    item.classList.toggle("active", item.getAttribute("data-section-target") === targetId);
+    const selected = item.getAttribute("data-section-target") === targetId;
+    item.classList.toggle("active", selected);
+    if (selected) {
+      item.setAttribute("aria-current", "page");
+    } else {
+      item.removeAttribute("aria-current");
+    }
+  }
+  for (const section of document.querySelectorAll(".pc2-section[id]")) {
+    const selected = section.id === targetId;
+    section.classList.toggle("is-active-destination", selected);
+    section.hidden = !selected;
+  }
+  const titleNode = document.querySelector(".services-page-title");
+  if (titleNode) {
+    titleNode.textContent = SECTION_TITLES[targetId];
+  }
+  if (!options.initial) {
+    document.getElementById(targetId)?.scrollIntoView({ block: "start", behavior: "smooth" });
   }
 }
 

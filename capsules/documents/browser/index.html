@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Documents · ElastOS</title>
+<!-- tip: documents-20260720a — unified-sidebar + one-plate blend -->
 <script src="./elastos-theme.js"></script>
 <link rel="stylesheet" href="./elastos-ui.css">
 <style>
@@ -17,7 +18,7 @@
   --line-strong: var(--el-hairline-strong);
   --ink: var(--el-text);
   --text: var(--ink);
-  --paper: var(--panel);
+  --paper: var(--bg);
   --muted: var(--el-muted);
   --brand: var(--el-brand);
   --brand-soft: rgba(246, 146, 26, 0.16);
@@ -26,65 +27,62 @@
   --accent-deep: var(--el-accent-strong);
   --warning: var(--el-danger);
   --danger: var(--el-danger);
-  --sidebar-bg: var(--panel);
+  --sidebar-bg: rgba(22, 24, 29, 0.78);
   --sidebar-panel: var(--panel-strong);
   --sidebar-line: var(--line);
   --sidebar-text: var(--ink);
   --sidebar-muted: var(--muted);
-  --shadow: var(--el-shadow-2);
-  --radius-xl: 1.35rem;
-  --radius-lg: 1.25rem;
-  --radius-md: 0.95rem;
-  --radius-sm: 0.85rem;
+  --shadow: none;
+  --radius-xl: 0;
+  --radius-lg: 10px;
+  --radius-md: 10px;
+  --radius-sm: 999px;
   color-scheme: dark;
   font-family: var(--el-font);
 }
 
 :root[data-el-theme="light"] {
-  --bg-strong: #e3e9fb;
+  --bg-strong: #e8eaef;
   --panel: rgba(255, 255, 255, 0.9);
+  --sidebar-bg: #f0f1f4;
   --brand-soft: #fff1dc;
   color-scheme: light;
 }
 
 :root[data-el-theme="light"] body {
-  background:
-    radial-gradient(circle at top left, rgba(95, 118, 216, 0.14), transparent 28%),
-    radial-gradient(circle at bottom right, rgba(126, 149, 226, 0.12), transparent 24%),
-    linear-gradient(180deg, #f7f9ff 0%, var(--bg) 100%);
+  background: var(--bg);
 }
 
-:root[data-el-theme="light"] .document-list-item,
-:root[data-el-theme="light"] .share-doc-link,
-:root[data-el-theme="light"] .outline-item,
-:root[data-el-theme="light"] .history-item {
-  border-color: rgba(83, 103, 164, 0.08);
+:root[data-el-theme="light"] .documents-sidebar,
+:root[data-el-theme="light"] .share-sidebar {
+  background: color-mix(in srgb, var(--sidebar-bg) 90%, transparent);
 }
 
 :root[data-el-theme="light"] .document-list-item:hover,
 :root[data-el-theme="light"] .share-doc-link:hover,
 :root[data-el-theme="light"] .outline-item:hover,
 :root[data-el-theme="light"] .history-item:hover {
-  background: rgba(255, 255, 255, 0.72);
-  border-color: var(--line);
+  background: var(--el-lift);
 }
 
 :root[data-el-theme="light"] .document-list-item.active,
-:root[data-el-theme="light"] .share-doc-link.active,
+:root[data-el-theme="light"] .share-doc-link.active {
+  background: var(--el-lift-strong);
+  color: var(--el-accent);
+}
+
 :root[data-el-theme="light"] .workspace-tab.active {
   background: var(--accent-soft);
   border-color: rgba(95, 118, 216, 0.18);
 }
 
 :root[data-el-theme="light"] .document-list-item.published {
-  background: rgba(232, 237, 255, 0.94);
-  border-color: rgba(95, 118, 216, 0.28);
+  background: color-mix(in srgb, var(--el-accent-soft) 70%, transparent);
 }
 
 :root[data-el-theme="light"] .document-list-item.published:hover,
 :root[data-el-theme="light"] .document-list-item.published.active {
-  background: rgba(219, 227, 255, 0.98);
-  border-color: rgba(95, 118, 216, 0.36);
+  background: var(--el-lift-strong);
 }
 
 :root[data-el-theme="light"] .document-list-published-icon {
@@ -133,6 +131,7 @@
 
 html,
 body {
+  height: 100%;
   min-height: 100%;
 }
 
@@ -140,10 +139,7 @@ body {
   margin: 0;
   font-family: inherit;
   color: var(--text);
-  background:
-    radial-gradient(circle at top left, rgba(125, 149, 240, 0.1), transparent 30%),
-    radial-gradient(circle at bottom right, rgba(125, 149, 240, 0.07), transparent 24%),
-    linear-gradient(180deg, #0f1218 0%, var(--bg) 100%);
+  background: var(--bg);
 }
 
 button,
@@ -166,50 +162,79 @@ a {
   width: 100%;
   height: 100vh;
   height: 100dvh;
-  margin: 0 auto;
-  padding: 0.4rem;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: var(--bg);
 }
 
 .hidden {
   display: none !important;
 }
 
-.documents-shell {
+/* Apps-level blend: flex/grid split; sidebar owns lights safe-top. */
+.documents-shell,
+.share-shell {
   display: grid;
-  grid-template-columns: 16.5rem minmax(0, 1fr);
-  gap: 0.8rem;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 0;
   height: 100%;
   min-height: 0;
+  overflow: hidden;
+  background: var(--bg);
 }
 
+/* Collapsed: keep leading chrome column so traffic lights stay over material. */
 .documents-shell[data-sidebar-collapsed="true"] {
-  grid-template-columns: minmax(0, 1fr);
+  grid-template-columns: 220px minmax(0, 1fr);
 }
 
-.documents-shell[data-sidebar-collapsed="true"] .documents-sidebar {
+.documents-shell[data-sidebar-collapsed="true"] .sidebar-search,
+.documents-shell[data-sidebar-collapsed="true"] .documents-list {
   display: none;
-}
-
-.documents-sidebar,
-.documents-main,
-.share-sidebar,
-.share-main {
-  background: var(--paper);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-xl);
-  box-shadow: var(--shadow);
 }
 
 .documents-sidebar,
 .share-sidebar {
   display: flex;
   flex-direction: column;
+  min-width: 0;
   min-height: 0;
   overflow: hidden;
-  padding: 0.8rem;
-  background: var(--sidebar-bg);
-  border-color: var(--line);
+  padding: var(--window-chrome-safe-top, 52px) 12px 16px;
+  background: color-mix(in srgb, var(--sidebar-bg) 78%, transparent);
+  border: 0;
+  border-right: 1px solid color-mix(in srgb, var(--el-hairline) 70%, transparent);
+  border-radius: 0;
+  box-shadow: none;
   color: var(--sidebar-text);
+  backdrop-filter: blur(22px);
+  -webkit-backdrop-filter: blur(22px);
+}
+
+.documents-main,
+.share-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  padding: 14px 18px 16px;
+  overflow: hidden;
+  background: var(--bg);
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+/* Share without list: one column; clear traffic-light overlay on the page. */
+.share-shell:has(> .share-sidebar.hidden) {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.share-shell:has(> .share-sidebar.hidden) .share-main {
+  padding-top: var(--window-chrome-safe-top, 52px);
+  padding-left: 78px;
 }
 
 .sidebar-header,
@@ -250,16 +275,16 @@ a {
 
 .sidebar-create {
   display: inline-grid;
-  width: 2.45rem;
-  min-width: 2.45rem;
-  height: 2.45rem;
+  width: 2rem;
+  min-width: 2rem;
+  height: 2rem;
   place-items: center;
   background: var(--accent);
   color: #f8fbff;
   border: 1px solid transparent;
-  border-radius: 1rem;
+  border-radius: 999px;
   padding: 0;
-  font-size: 1.35rem;
+  font-size: 1.15rem;
   font-weight: 700;
   line-height: 1;
   white-space: nowrap;
@@ -269,12 +294,17 @@ a {
   flex: 1;
   min-width: 0;
   width: 100%;
-  padding: 0.72rem 0.85rem;
-  border: 1px solid var(--sidebar-line);
-  border-radius: var(--radius-sm);
+  padding: 0.55rem 0.85rem;
+  border: 1px solid transparent;
+  border-radius: 999px;
   background: var(--el-inset);
   color: var(--text);
   outline: none;
+}
+
+.sidebar-search:focus {
+  border-color: var(--el-focus);
+  box-shadow: 0 0 0 3px rgba(246, 146, 26, 0.15);
 }
 
 .sidebar-search::placeholder {
@@ -285,47 +315,49 @@ a {
 .share-doc-list {
   display: flex;
   flex-direction: column;
-  gap: 0.55rem;
+  gap: 2px;
   min-height: 0;
-  margin-top: 0.75rem;
+  margin-top: 0.65rem;
   overflow: auto;
-  padding-right: 0.15rem;
+  padding: 0 2px;
   scrollbar-gutter: stable;
 }
 
 .document-list-item,
 .share-doc-link {
   width: 100%;
-  padding: 0.72rem 0.78rem;
-  border-radius: var(--radius-md);
-  background: var(--panel-strong);
-  border: 1px solid rgba(255, 255, 255, 0.07);
+  padding: 0.55rem 0.75rem;
+  border-radius: 999px;
+  background: transparent;
+  border: 1px solid transparent;
   text-align: left;
-  transition: background 140ms ease, border-color 140ms ease, transform 140ms ease;
+  transition: background 140ms ease, color 140ms ease;
 }
 
 .document-list-item:hover,
 .share-doc-link:hover {
-  background: rgba(255, 255, 255, 0.08);
-  border-color: var(--line);
-  transform: translateY(-1px);
+  background: var(--el-lift);
 }
 
 .document-list-item.active,
 .share-doc-link.active {
-  background: var(--accent-soft);
-  border-color: rgba(125, 149, 240, 0.35);
+  background: var(--el-lift-strong);
+  color: var(--el-accent);
+}
+
+.document-list-item.active .document-list-title,
+.share-doc-link.active .share-doc-title {
+  color: var(--el-accent);
+  font-weight: 600;
 }
 
 .document-list-item.published {
-  background: rgba(125, 149, 240, 0.14);
-  border-color: rgba(125, 149, 240, 0.3);
+  background: color-mix(in srgb, var(--el-accent-soft) 55%, transparent);
 }
 
 .document-list-item.published:hover,
 .document-list-item.published.active {
-  background: rgba(125, 149, 240, 0.2);
-  border-color: rgba(125, 149, 240, 0.4);
+  background: var(--el-lift-strong);
 }
 
 .document-list-title-row {
@@ -396,18 +428,6 @@ a {
   color: var(--sidebar-muted);
   font-size: 0.82rem;
   line-height: 1.5;
-}
-
-.documents-main,
-.share-main {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  min-height: 0;
-  height: 100%;
-  padding: 0.85rem;
-  background: var(--paper);
-  overflow: hidden;
 }
 
 .documents-toolbar {
@@ -767,18 +787,6 @@ a {
   text-decoration: underline;
 }
 
-.share-shell {
-  display: grid;
-  grid-template-columns: 16.5rem minmax(0, 1fr);
-  gap: 0.8rem;
-  height: 100%;
-  min-height: 0;
-}
-
-.share-main {
-  padding: 0.95rem;
-}
-
 .share-topline {
   display: flex;
   flex-wrap: wrap;
@@ -996,35 +1004,26 @@ a {
   background: rgba(255, 255, 255, 0.07);
 }
 
+/* Narrow: keep split + safe-top; full mobile campaign is MOBILE.01. */
 @media (max-width: 980px) {
   .documents-shell,
-  .share-shell,
-  .documents-workspace {
-    grid-template-columns: 1fr;
-  }
-
-  .documents-shell,
   .share-shell {
-    grid-template-rows: minmax(0, 1fr) auto;
-  }
-
-  .documents-sidebar,
-  .share-sidebar {
-    order: 2;
-    max-height: min(34vh, 18rem);
+    grid-template-columns: 200px minmax(0, 1fr);
   }
 
   .documents-main,
   .share-main {
     min-height: 0;
+    padding: 12px 12px 12px;
+  }
+
+  .documents-sidebar,
+  .share-sidebar {
+    padding: var(--window-chrome-safe-top, 52px) 10px 12px;
   }
 }
 
 @media (max-width: 720px) {
-  .page-shell {
-    padding: 0;
-  }
-
   .documents-toolbar,
   .share-header {
     flex-direction: column;
@@ -1047,24 +1046,6 @@ a {
   .document-list-row {
     flex-direction: column;
     align-items: flex-start;
-  }
-
-  .documents-main,
-  .share-main,
-  .documents-sidebar,
-  .share-sidebar {
-    border-radius: 0.82rem;
-    box-shadow: var(--el-shadow-1);
-  }
-
-  .documents-main,
-  .share-main {
-    padding: 0.38rem;
-  }
-
-  .documents-sidebar,
-  .share-sidebar {
-    padding: 0.42rem;
   }
 
   .documents-workspace {

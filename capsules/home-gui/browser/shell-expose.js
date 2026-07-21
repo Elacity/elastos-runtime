@@ -4,16 +4,16 @@
  * capture pipeline. Alt+Tab remains the fast list switcher.
  */
 
-import { shellState } from "./shell-core.js?v=home-20260719y";
+import { shellState } from "./shell-core.js?v=home-20260720q";
 import {
   browserWindowEntries,
   focusWindow,
   sortWindowEntriesByZOrder,
-} from "./shell-windows.js?v=home-20260719y";
+} from "./shell-windows.js?v=home-20260720q";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
-} from "./shell-popovers.js?v=home-20260719y";
+} from "./shell-popovers.js?v=home-20260720q";
 
 function exposeReducedMotion() {
   return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
