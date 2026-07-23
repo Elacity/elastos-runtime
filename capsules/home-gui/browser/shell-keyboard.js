@@ -3,37 +3,45 @@ import {
   mountGlyph,
   trapTabWithin,
   launcher,
-} from "./shell-core.js?v=home-20260720q";
+} from "./shell-core.js?v=home-20260722w";
 import {
   moveDesktopSelection,
-} from "./shell-surface.js?v=home-20260720q";
-import { toggleSpotlight } from "./shell-spotlight.js?v=home-20260720q";
+} from "./shell-surface.js?v=home-20260722w";
+import { toggleSpotlight } from "./shell-spotlight.js?v=home-20260722w";
 import {
   focusWindow,
   closeWindow,
   minimizeWindow,
   maximizeActiveWindow,
   sortWindowEntriesByZOrder,
-} from "./shell-windows.js?v=home-20260720q";
+} from "./shell-windows.js?v=home-20260722w";
 import {
   applyWindowSnapState,
   restoreWindowFromSpecialState,
-} from "./shell-window-geometry.js?v=home-20260720q";
+} from "./shell-window-geometry.js?v=home-20260722w";
 import {
   closeExpose,
   isExposeOpen,
   toggleExpose,
-} from "./shell-expose.js?v=home-20260720q";
+} from "./shell-expose.js?v=home-20260722w";
 import {
   hideQuickLook,
   isQuickLookOpen,
   toggleQuickLook,
-} from "./shell-quicklook.js?v=home-20260720q";
+} from "./shell-quicklook.js?v=home-20260722w";
 import {
   closeOtherShellPopovers,
+  handleShellEscape,
+  registerEscapeHandler,
   registerShellPopover,
   setOverlayOpen,
-} from "./shell-popovers.js?v=home-20260720q";
+} from "./shell-popovers.js?v=home-20260722w";
+import {
+  exitActiveFullscreenStage,
+  flickStage,
+  getActiveStageId,
+  desktopStageId,
+} from "./shell-stages.js?v=home-20260722w";
 
 /* Shell keyboard layer.
  *
@@ -245,6 +253,24 @@ export function bindShellKeyboard() {
     }
   });
   registerShellPopover("shortcuts", () => hideShortcutsOverlay());
+  registerEscapeHandler("shortcuts", {
+    priority: 90,
+    isActive: () => Boolean(shortcutsOverlay && !shortcutsOverlay.hidden),
+    dismiss: () => hideShortcutsOverlay(),
+  });
+  registerEscapeHandler("window-switcher", {
+    priority: 85,
+    isActive: () => switcherState.open === true,
+    dismiss: () => closeSwitcher(),
+  });
+  registerEscapeHandler("fullscreen-stage", {
+    priority: 50,
+    isActive: () =>
+      getActiveStageId() !== desktopStageId() && !isExposeOpen() && !isQuickLookOpen(),
+    dismiss: () => {
+      exitActiveFullscreenStage();
+    },
+  });
   shortcutsClose?.addEventListener("click", hideShortcutsOverlay);
   shortcutsOverlay?.addEventListener("pointerdown", (event) => {
     if (!event.target.closest(".shortcuts-card")) {
@@ -269,6 +295,11 @@ export function bindShellKeyboard() {
         return;
       }
       if (event.key === "Escape") {
+        if (handleShellEscape()) {
+          event.preventDefault();
+          event.stopPropagation();
+          return;
+        }
         if (isExposeOpen()) {
           event.preventDefault();
           event.stopPropagation();
@@ -284,6 +315,19 @@ export function bindShellKeyboard() {
       }
       if (event.key === "F3" && !event.metaKey && !event.ctrlKey && !event.altKey && !typingInField(event)) {
         if (toggleExpose()) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+        return;
+      }
+      if (
+        event.ctrlKey &&
+        !event.metaKey &&
+        !event.altKey &&
+        !typingInField(event) &&
+        (event.key === "ArrowLeft" || event.key === "ArrowRight")
+      ) {
+        if (flickStage(event.key === "ArrowRight" ? 1 : -1)) {
           event.preventDefault();
           event.stopPropagation();
         }

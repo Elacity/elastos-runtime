@@ -50,7 +50,7 @@ import {
   mutateDesktopObject,
   formatBadgeCount,
   focusModeEnabled,
-} from "./shell-core.js?v=home-20260720q";
+} from "./shell-core.js?v=home-20260722w";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -64,18 +64,19 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260720q";
-import { playUiSound } from "./shell-sounds.js?v=home-20260720q";
+} from "./shell-windows.js?v=home-20260722w";
+import { playUiSound } from "./shell-sounds.js?v=home-20260722w";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
   setOverlayOpen,
-} from "./shell-popovers.js?v=home-20260720q";
+} from "./shell-popovers.js?v=home-20260722w";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20260720q";
-import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260720q";
+} from "./shell-motion.js?v=home-20260722w";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260722w";
+import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260722w";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -767,6 +768,9 @@ function attachTargetIconInteractions(node, targetId, source) {
       }
       if (browserWindowCount(targetId) === 0) {
         startDockLaunchBounce(node);
+      }
+      if (isExposeOpen()) {
+        closeExpose();
       }
       handleTaskbarTargetClick(targetId);
       return;
@@ -2595,10 +2599,11 @@ function setupDock() {
       resetDockMagnification();
       return;
     }
-    /* Magnify only while the pointer is on an app/trash icon — not Launcher,
-       not separators, not the gap beside Launcher (that caused neighbor flicker). */
-    const magItem = event.target.closest(".taskbar-item:not(.taskbar-item-launcher)");
-    if (!magItem) {
+    /* Keep the wave alive across the tiny gaps between icons (and separators).
+       Resetting on those gaps caused demagnify/remagnify flicker. Only calm
+       the wave over Launcher or outside the app strip. */
+    const inAppStrip = Boolean(event.target.closest(".taskbar-sortable"));
+    if (!inAppStrip) {
       resetDockMagnification();
       return;
     }

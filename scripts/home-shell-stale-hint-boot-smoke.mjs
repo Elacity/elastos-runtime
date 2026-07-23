@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260719y";
+const moduleVersion = "home-20260721b";
 const requests = [];
 const localStorageValues = new Map([
   ["elastos.home.active-shell-hint", "home-cli"],

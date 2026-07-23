@@ -16,7 +16,7 @@ import {
   shellState,
   fetchJson,
   targetById,
-} from "./shell-core.js?v=home-20260719y";
+} from "./shell-core.js?v=home-20260721b";
 import {
   bindHomeUnlock,
   clearHomeSessionLock,
@@ -28,7 +28,7 @@ import {
   requestPasskeyHomeAuthority,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260719y";
+} from "./shell-auth.js?v=home-20260721b";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
@@ -213,7 +213,8 @@ async function deliverMessageToHomeGuiTargetFrame(target, payload) {
   if (!context) {
     return false;
   }
-  context.source.postMessage(payload, context.origin);
+  /* Opaque capsule frames reject targetOrigin "null"; use * like every other host→frame post. */
+  context.source.postMessage(payload, OPAQUE_FRAME_TARGET);
   return true;
 }
 

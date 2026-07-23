@@ -103,6 +103,15 @@
     title="Search (Cmd+Space)"
   ></button>
   <button
+    id="toolbar-mission-control"
+    class="toolbar-btn toolbar-mission-btn"
+    type="button"
+    aria-label="Mission Control"
+    title="Mission Control (F3)"
+  >
+    <span class="mission-control-glyph" aria-hidden="true"></span>
+  </button>
+  <button
     id="toolbar-control-centre"
     class="toolbar-btn control-centre-btn"
     type="button"
@@ -230,10 +239,10 @@
       <span class="control-centre-switch" aria-hidden="true"></span>
     </button>
     <button id="control-centre-fullscreen" class="control-centre-row" type="button">
-      <span class="control-centre-row-label">Enter fullscreen</span>
+      <span class="control-centre-row-label">Enter Fullscreen</span>
     </button>
     <button id="control-centre-show-windows" class="control-centre-row" type="button">
-      <span class="control-centre-row-label">Show Windows</span>
+      <span class="control-centre-row-label">Mission Control</span>
       <span class="control-centre-row-detail">›</span>
     </button>
   </div>
@@ -443,6 +452,7 @@
 
 <footer class="taskbar" aria-label="Dock" data-home-gui-hidden-by-host="hidden" inert hidden>
   <div class="taskbar-inner">
+    <div id="space-pager" class="space-pager" hidden aria-hidden="true"></div>
     <div class="taskbar-primary">
       <button
         id="launcher-toggle"
@@ -575,7 +585,9 @@
     <dl class="shortcuts-list">
       <div class="shortcuts-row"><dt>Search (Spotlight)</dt><dd><kbd>⌘</kbd><kbd>Space</kbd> or <kbd>Ctrl</kbd><kbd>Space</kbd></dd></div>
       <div class="shortcuts-row"><dt>Quick Look</dt><dd><kbd>Space</kbd> on a desktop icon</dd></div>
-      <div class="shortcuts-row"><dt>Show Windows</dt><dd><kbd>F3</kbd></dd></div>
+      <div class="shortcuts-row"><dt>Mission Control</dt><dd><kbd>F3</kbd></dd></div>
+      <div class="shortcuts-row"><dt>Switch Space</dt><dd><kbd>⌃←</kbd><kbd>⌃→</kbd></dd></div>
+      <div class="shortcuts-row"><dt>Enter / Exit Fullscreen</dt><dd>Green button</dd></div>
       <div class="shortcuts-row"><dt>Switch windows</dt><dd><kbd>Alt</kbd><kbd>Tab</kbd></dd></div>
       <div class="shortcuts-row"><dt>Cycle windows</dt><dd><kbd>⌘</kbd><kbd>`</kbd></dd></div>
       <div class="shortcuts-row"><dt>Close window</dt><dd><kbd>⌘</kbd><kbd>W</kbd></dd></div>
@@ -653,7 +665,7 @@
         <button class="window-action-btn" data-action="minimize" type="button" aria-label="Minimize">
           <img src="/apps/home-gui/minimize.svg" alt="" draggable="false" />
         </button>
-        <button class="window-action-btn" data-action="maximize" type="button" aria-label="Maximize">
+        <button class="window-action-btn" data-action="maximize" type="button" aria-label="Enter Fullscreen" title="Enter Fullscreen">
           <img src="/apps/home-gui/scale.svg" alt="" draggable="false" />
         </button>
       </div>

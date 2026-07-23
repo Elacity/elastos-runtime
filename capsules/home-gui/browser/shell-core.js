@@ -52,6 +52,9 @@ const DESKTOP_ICON_GAP_Y = 104;
 const DEFAULT_DESKTOP_LAYOUT_WIDTH = 1280;
 const DEFAULT_DESKTOP_LAYOUT_HEIGHT = 720;
 const HOME_BROWSER_CONTEXT_KEY = "elastos.home.browser-context-id";
+/* True only when localStorage can pin the context across refresh. Opaque
+   home-gui has no durable localStorage — adopt host-persisted session id. */
+let browserContextDurable = false;
 export const WINDOW_MIN_WIDTH = 320;
 export const WINDOW_MIN_HEIGHT = 220;
 export const WINDOW_SNAP_THRESHOLD = 28;
@@ -60,9 +63,9 @@ export const WINDOW_TOP_INSET = 8;
 export const WINDOW_BOTTOM_INSET = 72;
 export const CONTEXT_MENU_IGNORE_OUTSIDE_MS = 220;
 const HOME_GUI_TEMPLATE_ID = "home-gui-template";
-const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260720q", import.meta.url).href;
+const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260722w", import.meta.url).href;
 const HOME_GUI_STYLESHEET_ID = "home-gui-stylesheet";
-const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260720q", import.meta.url).href;
+const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260722w", import.meta.url).href;
 let homeGuiTemplateHtmlPromise = null;
 let homeGuiLaunchToken = "";
 
@@ -80,6 +83,12 @@ export const shellState = {
   zIndexCounter: 100,
   browserWindowSerial: 0,
   activeWindowId: null,
+  /** "desktop" | "desk-*" | windowId — active Space */
+  activeStageId: "desktop",
+  /** Extra Desktop Spaces created via Mission Control + (ids like desk-2). */
+  extraDesktops: [],
+  /** Optional Mission Control Spaces order (desktop / desk-* / window ids). */
+  spaceOrder: [],
   clockTimer: null,
   summaryRefreshDebounceTimer: null,
   summaryRefreshInFlight: false,
@@ -711,7 +720,25 @@ export function loadShellSessionState() {
   if (!session || typeof session !== "object") {
     return null;
   }
-  return session.browser_context_id === shellState.browserContextId ? session : null;
+  const storedContext = typeof session.browser_context_id === "string"
+    ? session.browser_context_id.trim()
+    : "";
+  if (!storedContext.startsWith("browser:")) {
+    /* Pre-context sessions still restore; next save stamps a context id. */
+    return session;
+  }
+  if (storedContext === shellState.browserContextId) {
+    return session;
+  }
+  /* Opaque GUI: localStorage throws, so each boot minted a fresh id and
+     wrongly dropped (then wiped) the host-persisted window session. Adopt
+     the server context. Real-origin browsers keep durable localStorage and
+     still reject foreign contexts after site-data clear. */
+  if (!browserContextDurable) {
+    shellState.browserContextId = storedContext;
+    return session;
+  }
+  return null;
 }
 
 export function saveShellSessionState(session) {
@@ -764,12 +791,16 @@ function ensureBrowserContextId() {
   try {
     const stored = window.localStorage?.getItem(HOME_BROWSER_CONTEXT_KEY);
     if (typeof stored === "string" && stored.startsWith("browser:")) {
+      browserContextDurable = true;
       return stored;
     }
     const next = newBrowserContextId();
     window.localStorage?.setItem(HOME_BROWSER_CONTEXT_KEY, next);
+    browserContextDurable = true;
     return next;
   } catch (_error) {
+    /* Opaque sandbox — no durable store for this id on the GUI frame. */
+    browserContextDurable = false;
     return newBrowserContextId();
   }
 }

@@ -182,10 +182,30 @@ pub fn build_share_bundle_with_viewer_dir(
         .prefix("elastos-share-")
         .tempdir()?;
 
-    std::fs::copy(
-        viewer_dir.join("index.html"),
-        bundle_dir.path().join("index.html"),
-    )?;
+    let viewer_index = {
+        let browser = viewer_dir.join("browser").join("index.html");
+        let root = viewer_dir.join("index.html");
+        if browser.is_file() {
+            browser
+        } else if root.is_file() {
+            root
+        } else {
+            anyhow::bail!(
+                "Publishing needs the Documents app on this device.\n\n\
+                 Open App Store and install Documents, then try again."
+            );
+        }
+    };
+    let viewer_assets = viewer_index
+        .parent()
+        .unwrap_or(viewer_dir);
+    std::fs::copy(&viewer_index, bundle_dir.path().join("index.html"))?;
+    for asset in ["elastos-theme.js", "elastos-ui.css"] {
+        let src = viewer_assets.join(asset);
+        if src.is_file() {
+            std::fs::copy(&src, bundle_dir.path().join(asset))?;
+        }
+    }
 
     let mut markdown_paths = Vec::new();
     if input_path.is_file() {

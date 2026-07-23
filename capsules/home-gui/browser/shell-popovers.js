@@ -1,14 +1,58 @@
 /* One popover at a time (macOS). Surfaces self-register a close function;
    each show* calls closeOtherShellPopovers(ownId) before revealing itself.
-   Registry only — this module holds no DOM and no state of its own. */
+   Registry only — this module holds no DOM and no state of its own.
+   Escape stack (Shell Continuity II): higher priority dismisses first.
+   See DESIGN_SYSTEM / plan Appendix — modal > overlay > rails > MC > stage. */
 
 const registry = new Map();
+/** @type {Map<string, { priority: number, isActive: () => boolean, dismiss: () => void }>} */
+const escapeHandlers = new Map();
 
 export function registerShellPopover(id, close) {
   if (typeof id !== "string" || !id || typeof close !== "function") {
     return;
   }
   registry.set(id, close);
+}
+
+/**
+ * Ordered Escape dismiss. Priority examples:
+ * 100 modal/passkey · 90 QL/shortcuts/context · 80 CC/NC/menus ·
+ * 70 rails · 60 Mission Control / Show Windows · 50 fullscreen stage
+ */
+export function registerEscapeHandler(id, { priority = 50, isActive, dismiss } = {}) {
+  if (typeof id !== "string" || !id || typeof isActive !== "function" || typeof dismiss !== "function") {
+    return;
+  }
+  escapeHandlers.set(id, { priority, isActive, dismiss });
+}
+
+export function unregisterEscapeHandler(id) {
+  escapeHandlers.delete(id);
+}
+
+/** @returns {boolean} true if something was dismissed */
+export function handleShellEscape() {
+  const active = [...escapeHandlers.entries()]
+    .map(([id, handler]) => ({ id, ...handler }))
+    .filter((handler) => {
+      try {
+        return handler.isActive() === true;
+      } catch (_error) {
+        return false;
+      }
+    })
+    .sort((a, b) => b.priority - a.priority);
+  const top = active[0];
+  if (!top) {
+    return false;
+  }
+  try {
+    top.dismiss();
+  } catch (_error) {
+    return false;
+  }
+  return true;
 }
 
 export function closeOtherShellPopovers(exceptId) {

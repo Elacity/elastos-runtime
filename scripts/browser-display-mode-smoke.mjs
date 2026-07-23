@@ -310,6 +310,7 @@ assert(
     fitLaunchedWindow(entry);
   }`) &&
     !homeGuiWindowsSource.includes("fitWindowToLargestBrowserAspect") &&
+    !homeShellWindowGeometrySource.includes("fitWindowToLargestBrowserAspect") &&
     homeGuiWindowsSource.includes("Browser uses the same stage maximize") &&
     homeGuiWindowsSource.includes("dataset.browserMaximized") &&
     homeShellWindowGeometrySource.includes(

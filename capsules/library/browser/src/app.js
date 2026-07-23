@@ -89,6 +89,7 @@ import { createLibraryUploads } from "./uploads.js";
       contextMenu: document.getElementById("context-menu"),
       dialog: document.getElementById("dialog"),
       sidebar: document.querySelector(".sidebar"),
+      sidebarResizer: document.getElementById("sidebar-resizer"),
     };
     let renderContent = () => {};
     let renderFooter = () => {};
@@ -1105,10 +1106,92 @@ import { createLibraryUploads } from "./uploads.js";
 
     function setView(view) {
       state.view = view === "list" ? "list" : "grid";
-      viewPreferenceStore.setItem("library.view", state.view);
+      viewPreferenceStore.setItem("library.contentView", state.view);
       syncContentViewMode();
       syncViewButtons();
       renderFooter();
+    }
+
+    function applySidebarWidth(widthPx) {
+      const width = Math.min(420, Math.max(160, Math.round(widthPx)));
+      state.sidebarWidth = width;
+      if (elements.libraryShell) {
+        elements.libraryShell.style.setProperty("--library-sidebar-w", `${width}px`);
+      }
+      if (elements.sidebarResizer) {
+        elements.sidebarResizer.setAttribute("aria-valuenow", String(width));
+      }
+      return width;
+    }
+
+    function persistSidebarWidth(widthPx) {
+      const width = applySidebarWidth(widthPx);
+      viewPreferenceStore.setItem("library.sidebarWidth", String(width));
+    }
+
+    function bindSidebarResize() {
+      const handle = elements.sidebarResizer;
+      const shell = elements.libraryShell;
+      if (!handle || !shell) {
+        return;
+      }
+      handle.setAttribute("aria-valuemin", "160");
+      handle.setAttribute("aria-valuemax", "420");
+      applySidebarWidth(state.sidebarWidth);
+
+      let drag = null;
+      const onMove = (event) => {
+        if (!drag) {
+          return;
+        }
+        const x = event.clientX ?? event.touches?.[0]?.clientX;
+        if (!Number.isFinite(x)) {
+          return;
+        }
+        applySidebarWidth(drag.startWidth + (x - drag.startX));
+      };
+      const onUp = () => {
+        if (!drag) {
+          return;
+        }
+        persistSidebarWidth(state.sidebarWidth);
+        drag = null;
+        document.body.classList.remove("library-sidebar-resizing");
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        window.removeEventListener("pointercancel", onUp);
+      };
+      handle.addEventListener("pointerdown", (event) => {
+        if (event.button != null && event.button !== 0) {
+          return;
+        }
+        event.preventDefault();
+        drag = {
+          startX: event.clientX,
+          startWidth: state.sidebarWidth || 220,
+        };
+        document.body.classList.add("library-sidebar-resizing");
+        handle.setPointerCapture?.(event.pointerId);
+        window.addEventListener("pointermove", onMove);
+        window.addEventListener("pointerup", onUp);
+        window.addEventListener("pointercancel", onUp);
+      });
+      handle.addEventListener("keydown", (event) => {
+        const step = event.shiftKey ? 24 : 12;
+        if (event.key === "ArrowLeft") {
+          event.preventDefault();
+          persistSidebarWidth(state.sidebarWidth - step);
+        } else if (event.key === "ArrowRight") {
+          event.preventDefault();
+          persistSidebarWidth(state.sidebarWidth + step);
+        } else if (event.key === "Home") {
+          event.preventDefault();
+          persistSidebarWidth(160);
+        } else if (event.key === "End") {
+          event.preventDefault();
+          persistSidebarWidth(420);
+        }
+      });
     }
 
     function showError(error) {
@@ -1243,8 +1326,10 @@ import { createLibraryUploads } from "./uploads.js";
       elements.libraryShell.classList.remove("hidden");
       elements.content.dataset.view = state.view;
       syncModeChrome();
+      bindSidebarResize();
       bindEvents();
       announceMenuManifest();
+      syncViewButtons();
       try {
         await loadRoots();
         installBrowserHistory();

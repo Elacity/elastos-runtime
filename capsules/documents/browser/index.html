@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Documents · ElastOS</title>
-<!-- tip: documents-20260720a — unified-sidebar + one-plate blend -->
+<!-- tip: documents-20260721o — list hover full width under + and search -->
 <script src="./elastos-theme.js"></script>
 <link rel="stylesheet" href="./elastos-ui.css">
 <style>
@@ -71,7 +71,7 @@
   color: var(--el-accent);
 }
 
-:root[data-el-theme="light"] .workspace-tab.active {
+:root[data-el-theme="light"] .view-toggle-button.active {
   background: var(--accent-soft);
   border-color: rgba(95, 118, 216, 0.18);
 }
@@ -196,6 +196,8 @@ a {
 
 .documents-sidebar,
 .share-sidebar {
+  --sidebar-compose-size: 2rem;
+  --sidebar-compose-gap: 0.55rem;
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -214,12 +216,13 @@ a {
 
 .documents-main,
 .share-main {
+  --documents-toolbar-band: 14px;
   display: flex;
   flex-direction: column;
   min-width: 0;
   min-height: 0;
   height: 100%;
-  padding: 14px 18px 16px;
+  padding: var(--documents-toolbar-band) 18px 16px;
   overflow: hidden;
   background: var(--bg);
   border: 0;
@@ -270,14 +273,14 @@ a {
 .sidebar-controls {
   display: flex;
   align-items: center;
-  gap: 0.55rem;
+  gap: var(--sidebar-compose-gap);
 }
 
 .sidebar-create {
   display: inline-grid;
-  width: 2rem;
-  min-width: 2rem;
-  height: 2rem;
+  width: var(--sidebar-compose-size);
+  min-width: var(--sidebar-compose-size);
+  height: var(--sidebar-compose-size);
   place-items: center;
   background: var(--accent);
   color: #f8fbff;
@@ -319,15 +322,125 @@ a {
   min-height: 0;
   margin-top: 0.65rem;
   overflow: auto;
-  padding: 0 2px;
-  scrollbar-gutter: stable;
+  /* Full row width: left of New note (+) through right of search. */
+  padding: 0;
+}
+
+.documents-list-section {
+  margin: 0.55rem 0 0.2rem;
+  color: var(--sidebar-muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.document-list-marks {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex: 0 0 auto;
+}
+
+.document-list-pin-icon {
+  flex: 0 0 auto;
+  width: 0.85rem;
+  height: 0.85rem;
+  color: var(--sidebar-muted);
+}
+
+.document-list-pin-icon svg {
+  width: 100%;
+  height: 100%;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 80;
+  min-width: 198px;
+  max-width: calc(100vw - 16px);
+  border: 1px solid var(--el-hairline-strong, var(--line));
+  border-radius: 10px;
+  background: rgba(30, 32, 38, 0.98);
+  box-shadow: var(--el-shadow-2, 0 12px 40px rgba(0, 0, 0, 0.28));
+  padding: 5px 0;
+  color: var(--text);
+  user-select: none;
+}
+
+:root[data-el-theme="light"] .context-menu {
+  background: rgba(248, 248, 250, 0.98);
+}
+
+.context-menu.hidden {
+  display: none;
+}
+
+.context-menu .menu-item {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  width: 100%;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  min-height: 1.7rem;
+  padding: 0.28rem 0.85rem;
+  cursor: default;
+  text-align: left;
+  font: inherit;
+  font-size: 0.88rem;
+  color: inherit;
+}
+
+.context-menu .menu-item:hover:not(:disabled) {
+  background: #0a84ff;
+  color: #fff;
+}
+
+.context-menu .menu-item:disabled {
+  opacity: 0.45;
+}
+
+.context-menu .menu-item-icon {
+  flex: 0 0 auto;
+  width: 0.95rem;
+  height: 0.95rem;
+  opacity: 0.9;
+}
+
+.context-menu .menu-item-icon svg {
+  width: 100%;
+  height: 100%;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.context-menu .menu-item-label {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.context-menu .menu-divider {
+  height: 1px;
+  margin: 4px 8px;
+  background: var(--line);
 }
 
 .document-list-item,
 .share-doc-link {
   width: 100%;
   padding: 0.55rem 0.75rem;
-  border-radius: 999px;
+  /* Row highlight — not a capsule; pills stay on search/create only. */
+  border-radius: 10px;
   background: transparent;
   border: 1px solid transparent;
   text-align: left;
@@ -432,11 +545,11 @@ a {
 
 .documents-toolbar {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  padding-bottom: 0.8rem;
-  border-bottom: 1px solid var(--line);
+  /* Match main top inset so title/actions sit centered above Write. */
+  padding-bottom: var(--documents-toolbar-band);
 }
 
 .documents-identity {
@@ -560,8 +673,12 @@ a {
   align-items: center;
   justify-content: space-between;
   gap: 0.7rem;
-  padding: 0.65rem 0 0.05rem;
-  min-height: 2.15rem;
+  padding: 0.35rem 0 0.05rem;
+  min-height: 0;
+}
+
+.status-row[hidden] {
+  display: none;
 }
 
 .status-text {
@@ -571,6 +688,60 @@ a {
 
 .status-text.warning {
   color: var(--warning);
+}
+
+.find-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin: 0 0 0.55rem;
+  padding: 0.35rem 0.45rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--el-inset);
+}
+
+.find-bar[hidden] {
+  display: none;
+}
+
+.find-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.92rem;
+  outline: none;
+}
+
+.find-count {
+  flex: 0 0 auto;
+  min-width: 2.6rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.find-bar button {
+  flex: 0 0 auto;
+  width: 1.85rem;
+  height: 1.85rem;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.find-bar button:hover {
+  border-color: var(--line);
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.04);
 }
 
 .documents-workspace {
@@ -594,29 +765,37 @@ a {
   display: none;
 }
 
-.workspace-toggle {
-  display: flex;
-  gap: 0.45rem;
-  margin: 0.2rem 0 0.7rem;
-}
-
-.workspace-tab {
-  flex: 1 1 0;
-  padding: 0.72rem 0.9rem;
-  border-radius: 999px;
+.view-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.12rem;
+  box-sizing: border-box;
+  height: 2.35rem;
+  margin-right: 0.2rem;
+  padding: 0.18rem;
   border: 1px solid var(--line);
+  border-radius: 0.95rem;
   background: var(--el-inset);
-  color: var(--muted);
-  font-size: 0.84rem;
-  font-weight: 700;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
 }
 
-.workspace-tab.active {
+.view-toggle-button {
+  width: 1.95rem;
+  height: 1.95rem;
+  border-radius: 0.7rem;
+  color: var(--muted);
+  background: transparent;
+  border-color: transparent;
+}
+
+.view-toggle-button.active {
   background: var(--accent-soft);
   border-color: rgba(125, 149, 240, 0.35);
   color: var(--accent-deep);
+}
+
+.view-toggle-button .action-icon {
+  width: 1rem;
+  height: 1rem;
 }
 
 .inspector-pane {
@@ -953,6 +1132,54 @@ a {
   padding-left: 1.6rem;
 }
 
+.markdown-body ul.task-list {
+  list-style: none;
+  padding-left: 0.15rem;
+}
+
+.markdown-body .task-item {
+  list-style: none;
+  margin: 0.2rem 0;
+}
+
+.markdown-body .task-label {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  cursor: pointer;
+}
+
+.markdown-body .task-checkbox {
+  flex: 0 0 auto;
+  width: 1rem;
+  height: 1rem;
+  margin: 0.38em 0 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.markdown-body .task-text {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.markdown-body .task-item:has(.task-checkbox:checked) .task-text {
+  color: var(--muted);
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
+.markdown-body mark.find-hit {
+  background: rgba(250, 204, 21, 0.35);
+  color: inherit;
+  border-radius: 0.15em;
+  padding: 0 0.05em;
+}
+
+.markdown-body mark.find-hit.active {
+  background: rgba(250, 204, 21, 0.7);
+}
+
 .markdown-body a {
   color: var(--accent);
   text-decoration: none;
@@ -1013,8 +1240,9 @@ a {
 
   .documents-main,
   .share-main {
+    --documents-toolbar-band: 12px;
     min-height: 0;
-    padding: 12px 12px 12px;
+    padding: var(--documents-toolbar-band) 12px 12px;
   }
 
   .documents-sidebar,
@@ -1029,7 +1257,7 @@ a {
     flex-direction: column;
     align-items: stretch;
     gap: 0.42rem;
-    padding-bottom: 0.42rem;
+    padding-bottom: var(--documents-toolbar-band, 12px);
   }
 
   .toolbar-actions {
@@ -1081,39 +1309,52 @@ a {
           <input id="title-input" class="title-input" type="text" placeholder="Untitled document" spellcheck="false">
         </div>
         <div class="toolbar-actions">
-          <button id="save-button" class="action-primary action-icon-button" type="button" aria-label="Save" title="Save">
+          <div class="view-toggle" role="group" aria-label="View">
+            <button id="mode-write" class="action-secondary action-icon-button view-toggle-button active" type="button" aria-label="Write" title="Write — edit markdown" aria-pressed="true">
+              <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3.5h12v17H6z"></path><path d="M9 8h6"></path><path d="M9 12h6"></path><path d="M9 16h4"></path></svg>
+            </button>
+            <button id="mode-split" class="action-secondary action-icon-button view-toggle-button" type="button" aria-label="Split" title="Split — edit and preview" aria-pressed="false">
+              <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4z"></path><path d="M12 5v14"></path></svg>
+            </button>
+            <button id="mode-read" class="action-secondary action-icon-button view-toggle-button" type="button" aria-label="Read" title="Read — preview only" aria-pressed="false">
+              <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.2-6 9.5-6 9.5 6 9.5 6-3.2 6-9.5 6-9.5-6-9.5-6z"></path><circle cx="12" cy="12" r="2.6"></circle></svg>
+            </button>
+          </div>
+          <button id="save-button" class="action-primary action-icon-button" type="button" aria-label="Save" title="Save now (notes also autosave)">
             <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h12l2 2v14H5z"></path><path d="M8 4v6h8V4"></path><path d="M8 20v-6h8v6"></path></svg>
           </button>
-          <button id="save-as-button" class="action-secondary action-icon-button" type="button" aria-label="Save as" title="Save as">
+          <button id="save-as-button" class="action-secondary action-icon-button" type="button" aria-label="Save as" title="Save as — create a separate copy">
             <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7h9l3 3v9H8z"></path><path d="M4 4h9v3"></path><path d="M4 4v12h4"></path><path d="M13 12v5"></path><path d="M10.5 14.5h5"></path></svg>
           </button>
-          <button id="publish-button" class="action-secondary action-icon-button" type="button" aria-label="Publish" title="Publish">
-            <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4"></path><path d="m7 9 5-5 5 5"></path><path d="M5 16v4h14v-4"></path></svg>
+          <button id="publish-button" class="action-secondary action-icon-button" type="button" aria-label="Publish" title="Publish — create a shareable link">
+            <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="18" cy="5" r="2.4"></circle><circle cx="6" cy="12" r="2.4"></circle><circle cx="18" cy="19" r="2.4"></circle><path d="m8.2 10.7 7.5-4.4"></path><path d="m8.2 13.3 7.5 4.4"></path></svg>
           </button>
-          <button id="unpublish-button" class="action-secondary action-icon-button" type="button" aria-label="Unpublish" title="Unpublish">
-            <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12"></path><path d="m7 11 5 5 5-5"></path><path d="M5 20h14"></path></svg>
+          <button id="unpublish-button" class="action-secondary action-icon-button" type="button" aria-label="Unpublish" title="Unpublish — remove the shareable link">
+            <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="18" cy="5" r="2.4"></circle><circle cx="6" cy="12" r="2.4"></circle><circle cx="18" cy="19" r="2.4"></circle><path d="m8.2 10.7 7.5-4.4"></path><path d="m8.2 13.3 7.5 4.4"></path><path d="M4 4l16 16"></path></svg>
           </button>
-          <button id="copy-published-link" class="action-secondary copy-link-button hidden" type="button" aria-label="Copy link" title="Copy link" disabled>
+          <button id="copy-published-link" class="action-secondary copy-link-button hidden" type="button" aria-label="Copy published link" title="Copy published link" disabled>
             <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"></path><path d="M14 11a5 5 0 0 0-7.1 0l-2 2A5 5 0 0 0 12 20.1l1.1-1.1"></path></svg>
             <span>Copy link</span>
           </button>
-          <button id="delete-button" class="action-secondary action-danger action-icon-button" type="button" aria-label="Delete" title="Delete">
+          <button id="delete-button" class="action-secondary action-danger action-icon-button" type="button" aria-label="Delete" title="Delete this document">
             <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14"></path><path d="M9 7V5h6v2"></path><path d="M8 7l1 13h6l1-13"></path><path d="M10.5 11v5"></path><path d="M13.5 11v5"></path></svg>
           </button>
-          <button id="sidebar-toggle" class="action-secondary action-icon-button sidebar-toggle" type="button" aria-label="Hide list" title="Hide list" aria-controls="documents-sidebar" aria-expanded="true">
+          <button id="sidebar-toggle" class="action-secondary action-icon-button sidebar-toggle" type="button" aria-label="Hide list" title="Hide or show the notes list" aria-controls="documents-sidebar" aria-expanded="true">
             <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4z"></path><path d="M9 5v14"></path><path d="m15 9-3 3 3 3"></path></svg>
           </button>
         </div>
       </header>
 
-      <div class="status-row">
-        <span id="status-text" class="status-text">Ready.</span>
+      <div id="status-row" class="status-row" hidden>
+        <span id="status-text" class="status-text"></span>
       </div>
 
-      <div class="workspace-toggle">
-        <button id="mode-write" class="workspace-tab" type="button">Write</button>
-        <button id="mode-split" class="workspace-tab active" type="button">Split</button>
-        <button id="mode-read" class="workspace-tab" type="button">Read</button>
+      <div id="find-bar" class="find-bar" hidden>
+        <input id="find-input" class="find-input" type="search" placeholder="Find in note" autocomplete="off" spellcheck="false" aria-label="Find in note">
+        <span id="find-count" class="find-count" aria-live="polite"></span>
+        <button id="find-prev" type="button" aria-label="Previous match" title="Previous">↑</button>
+        <button id="find-next" type="button" aria-label="Next match" title="Next">↓</button>
+        <button id="find-close" type="button" aria-label="Close find" title="Close">×</button>
       </div>
 
       <div class="documents-workspace">
@@ -1204,6 +1445,8 @@ a {
   </div>
 </div>
 
+<div id="context-menu" class="context-menu hidden" role="menu" hidden></div>
+
 <script>
 const state = {
   homeToken: new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "",
@@ -1219,12 +1462,18 @@ const state = {
   documents: [],
   current: null,
   dirty: false,
-  workspaceView: "split",
+  workspaceView: "write",
   inspectorView: "preview",
   sidebarCollapsed: false,
   filterQuery: "",
   pendingConfirmation: null,
   pendingChatAttachmentId: "",
+  autosaveTimer: null,
+  autosaveInFlight: false,
+  findOpen: false,
+  findQuery: "",
+  findMatches: [],
+  findIndex: 0,
 };
 const homeOrigin = new URLSearchParams(window.location.search).get("home_origin") || "";
 if (state.homeToken && homeOrigin && window.top !== window) {
@@ -1242,7 +1491,14 @@ const elements = {
   publishButton: document.getElementById("publish-button"),
   unpublishButton: document.getElementById("unpublish-button"),
   deleteButton: document.getElementById("delete-button"),
+  statusRow: document.getElementById("status-row"),
   statusText: document.getElementById("status-text"),
+  findBar: document.getElementById("find-bar"),
+  findInput: document.getElementById("find-input"),
+  findCount: document.getElementById("find-count"),
+  findPrev: document.getElementById("find-prev"),
+  findNext: document.getElementById("find-next"),
+  findClose: document.getElementById("find-close"),
   copyPublishedLink: document.getElementById("copy-published-link"),
   editor: document.getElementById("editor"),
   preview: document.getElementById("preview"),
@@ -1274,6 +1530,7 @@ const elements = {
   confirmMessage: document.getElementById("confirm-message"),
   confirmCancel: document.getElementById("confirm-cancel"),
   confirmAction: document.getElementById("confirm-action"),
+  contextMenu: document.getElementById("context-menu"),
 };
 
 function escapeHtml(value) {
@@ -1310,7 +1567,8 @@ function headingSlug(text, number) {
   return (slug || "section") + "-" + number;
 }
 
-function renderMarkdownDocument(source) {
+function renderMarkdownDocument(source, options) {
+  const interactiveTasks = !!(options && options.interactiveTasks);
   const lines = String(source || "").replace(/\r\n/g, "\n").split("\n");
   const blocks = [];
   const outline = [];
@@ -1362,11 +1620,36 @@ function renderMarkdownDocument(source) {
 
     if (/^[-*]\s+/.test(line)) {
       const items = [];
+      let hasTask = false;
       while (index < lines.length && /^[-*]\s+/.test(lines[index])) {
-        items.push("<li>" + renderInlineMarkdown(lines[index].replace(/^[-*]\s+/, "")) + "</li>");
+        const task = /^[-*]\s+\[([ xX])\]\s+(.*)$/.exec(lines[index]);
+        if (task) {
+          hasTask = true;
+          const checked = /x/i.test(task[1]);
+          const sourceLine = index;
+          if (interactiveTasks) {
+            items.push(
+              '<li class="task-item"><label class="task-label">' +
+                '<input type="checkbox" class="task-checkbox" aria-label="Task" data-source-line="' + sourceLine + '"' +
+                (checked ? " checked" : "") + ">" +
+                '<span class="task-text">' + renderInlineMarkdown(task[2]) + "</span>" +
+                "</label></li>"
+            );
+          } else {
+            items.push(
+              '<li class="task-item"><label class="task-label">' +
+                '<input type="checkbox" class="task-checkbox" aria-label="Task" disabled' +
+                (checked ? " checked" : "") + ">" +
+                '<span class="task-text">' + renderInlineMarkdown(task[2]) + "</span>" +
+                "</label></li>"
+            );
+          }
+        } else {
+          items.push("<li>" + renderInlineMarkdown(lines[index].replace(/^[-*]\s+/, "")) + "</li>");
+        }
         index += 1;
       }
-      blocks.push("<ul>" + items.join("") + "</ul>");
+      blocks.push((hasTask ? '<ul class="task-list">' : "<ul>") + items.join("") + "</ul>");
       continue;
     }
 
@@ -1410,6 +1693,15 @@ function renderMarkdownDocument(source) {
     html: blocks.join("\n"),
     outline: outline,
   };
+}
+
+function refreshPreviewFromEditor() {
+  const rendered = renderMarkdownDocument(elements.editor.value, { interactiveTasks: true });
+  elements.preview.innerHTML = rendered.html;
+  renderOutline(rendered.outline);
+  if (state.findOpen && state.findQuery) {
+    applyPreviewFindHighlights();
+  }
 }
 
 function shortCid(cid) {
@@ -1537,6 +1829,10 @@ function formatTime(timestamp) {
 
 function sortDocuments() {
   state.documents.sort((left, right) => {
+    const pinDelta = Number(!!right.pinned) - Number(!!left.pinned);
+    if (pinDelta) {
+      return pinDelta;
+    }
     return (right.updated_at || 0) - (left.updated_at || 0) || left.title.localeCompare(right.title);
   });
 }
@@ -1550,6 +1846,9 @@ function setWorkspaceView(view) {
   elements.modeWrite.classList.toggle("active", state.workspaceView === "write");
   elements.modeSplit.classList.toggle("active", state.workspaceView === "split");
   elements.modeRead.classList.toggle("active", state.workspaceView === "read");
+  elements.modeWrite.setAttribute("aria-pressed", String(state.workspaceView === "write"));
+  elements.modeSplit.setAttribute("aria-pressed", String(state.workspaceView === "split"));
+  elements.modeRead.setAttribute("aria-pressed", String(state.workspaceView === "read"));
 }
 
 function setSidebarCollapsed(collapsed) {
@@ -1572,14 +1871,18 @@ function setInspectorView(view) {
 }
 
 function setStatus(message, type) {
-  elements.statusText.textContent = type === "warning"
+  const text = type === "warning"
     ? readableDocumentsError(message, "Documents action could not be completed.")
-    : message;
+    : String(message || "");
+  const idle = !text || /^ready\.?$/i.test(text.trim());
+  elements.statusText.textContent = idle ? "" : text;
   elements.statusText.className = "status-text" + (type === "warning" ? " warning" : "");
+  if (elements.statusRow) {
+    elements.statusRow.hidden = idle && type !== "warning";
+  }
 }
 
-function setDirty(dirty) {
-  state.dirty = !!dirty;
+function updateActionButtons() {
   const hasCurrent = !!state.current;
   const hasPersistedCurrent = hasCurrent && !isDraftDocument(state.current);
   const isLibraryFile = isLibraryFileProjection(state.current);
@@ -1588,12 +1891,228 @@ function setDirty(dirty) {
   elements.publishButton.disabled = !hasCurrent || isLibraryFile;
   elements.unpublishButton.disabled = !hasPersistedCurrent || isLibraryFile || !state.current.latest_published_cid;
   elements.deleteButton.disabled = !hasPersistedCurrent || isLibraryFile;
-  if (hasCurrent && state.dirty) {
-    setStatus("Unsaved local changes.", "warning");
-  } else if (hasCurrent) {
-    setStatus("Ready.");
+}
+
+function scheduleAutosave() {
+  if (state.autosaveTimer) {
+    window.clearTimeout(state.autosaveTimer);
+  }
+  state.autosaveTimer = window.setTimeout(() => {
+    state.autosaveTimer = null;
+    runAutosave().catch((error) => {
+      setStatus(error.message || "Autosave failed.", "warning");
+    });
+  }, 900);
+}
+
+async function runAutosave() {
+  if (!state.current || !state.dirty || state.autosaveInFlight) {
+    return;
+  }
+  state.autosaveInFlight = true;
+  try {
+    await saveCurrent({ quiet: true });
+  } finally {
+    state.autosaveInFlight = false;
+    if (state.dirty) {
+      scheduleAutosave();
+    }
+  }
+}
+
+function setDirty(dirty) {
+  state.dirty = !!dirty;
+  updateActionButtons();
+  if (state.current && state.dirty) {
+    scheduleAutosave();
+  } else if (state.autosaveTimer) {
+    window.clearTimeout(state.autosaveTimer);
+    state.autosaveTimer = null;
   }
   renderDocumentsList();
+}
+
+function setTaskLineChecked(lineIndex, checked) {
+  const lines = elements.editor.value.replace(/\r\n/g, "\n").split("\n");
+  if (lineIndex < 0 || lineIndex >= lines.length) {
+    return false;
+  }
+  const match = /^([-*]\s+)\[([ xX])\](\s+.*)$/.exec(lines[lineIndex]);
+  if (!match) {
+    return false;
+  }
+  const mark = checked ? "x" : " ";
+  lines[lineIndex] = match[1] + "[" + mark + "]" + match[3];
+  const selectionStart = elements.editor.selectionStart;
+  const selectionEnd = elements.editor.selectionEnd;
+  elements.editor.value = lines.join("\n");
+  try {
+    elements.editor.setSelectionRange(selectionStart, selectionEnd);
+  } catch (_error) {
+    /* ignore */
+  }
+  refreshPreviewFromEditor();
+  setDirty(true);
+  return true;
+}
+
+function toggleTaskAtCursor() {
+  const value = elements.editor.value;
+  const pos = elements.editor.selectionStart || 0;
+  const lineStart = value.lastIndexOf("\n", pos - 1) + 1;
+  const lineEnd = value.indexOf("\n", pos);
+  const end = lineEnd === -1 ? value.length : lineEnd;
+  const line = value.slice(lineStart, end);
+  const task = /^([-*]\s+)\[([ xX])\](\s+.*)$/.exec(line);
+  if (task) {
+    const checked = !/x/i.test(task[2]);
+    const nextLine = task[1] + "[" + (checked ? "x" : " ") + "]" + task[3];
+    elements.editor.value = value.slice(0, lineStart) + nextLine + value.slice(end);
+    const cursor = lineStart + nextLine.length;
+    elements.editor.setSelectionRange(cursor, cursor);
+    refreshPreviewFromEditor();
+    setDirty(true);
+    return;
+  }
+  const bullet = /^([-*]\s+)(?!\[[ xX]\])(.*)$/.exec(line);
+  if (bullet) {
+    const nextLine = bullet[1] + "[ ] " + bullet[2];
+    elements.editor.value = value.slice(0, lineStart) + nextLine + value.slice(end);
+    const cursor = lineStart + nextLine.length;
+    elements.editor.setSelectionRange(cursor, cursor);
+    refreshPreviewFromEditor();
+    setDirty(true);
+  }
+}
+
+function collectFindMatches(text, query) {
+  const matches = [];
+  const needle = String(query || "");
+  if (!needle) {
+    return matches;
+  }
+  const haystack = String(text || "");
+  const lowerHay = haystack.toLowerCase();
+  const lowerNeedle = needle.toLowerCase();
+  let from = 0;
+  while (from <= lowerHay.length) {
+    const at = lowerHay.indexOf(lowerNeedle, from);
+    if (at === -1) {
+      break;
+    }
+    matches.push({ start: at, end: at + needle.length });
+    from = at + Math.max(1, needle.length);
+  }
+  return matches;
+}
+
+function openFindBar() {
+  state.findOpen = true;
+  elements.findBar.hidden = false;
+  elements.findInput.focus();
+  elements.findInput.select();
+  updateFindFromQuery(elements.findInput.value, { keepIndex: true });
+}
+
+function closeFindBar() {
+  state.findOpen = false;
+  state.findQuery = "";
+  state.findMatches = [];
+  state.findIndex = 0;
+  elements.findBar.hidden = true;
+  elements.findInput.value = "";
+  elements.findCount.textContent = "";
+  refreshPreviewFromEditor();
+  if (state.workspaceView !== "read") {
+    elements.editor.focus();
+  }
+}
+
+function applyPreviewFindHighlights() {
+  const query = state.findQuery;
+  if (!query || !elements.preview) {
+    return;
+  }
+  const walker = document.createTreeWalker(elements.preview, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  while (walker.nextNode()) {
+    nodes.push(walker.currentNode);
+  }
+  const lowerQuery = query.toLowerCase();
+  let occurrence = 0;
+  nodes.forEach((node) => {
+    const text = node.nodeValue || "";
+    const lower = text.toLowerCase();
+    if (!lower.includes(lowerQuery)) {
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    let cursor = 0;
+    let at = lower.indexOf(lowerQuery);
+    while (at !== -1) {
+      if (at > cursor) {
+        frag.appendChild(document.createTextNode(text.slice(cursor, at)));
+      }
+      const mark = document.createElement("mark");
+      mark.className = "find-hit" + (occurrence === state.findIndex ? " active" : "");
+      mark.textContent = text.slice(at, at + query.length);
+      frag.appendChild(mark);
+      occurrence += 1;
+      cursor = at + query.length;
+      at = lower.indexOf(lowerQuery, cursor);
+    }
+    if (cursor < text.length) {
+      frag.appendChild(document.createTextNode(text.slice(cursor)));
+    }
+    node.parentNode.replaceChild(frag, node);
+  });
+  const active = elements.preview.querySelector("mark.find-hit.active");
+  if (active && typeof active.scrollIntoView === "function") {
+    active.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+}
+
+function revealFindMatch() {
+  const total = state.findMatches.length;
+  if (!state.findQuery) {
+    elements.findCount.textContent = "";
+    return;
+  }
+  if (!total) {
+    elements.findCount.textContent = "0";
+    refreshPreviewFromEditor();
+    return;
+  }
+  elements.findCount.textContent = (state.findIndex + 1) + " / " + total;
+  const match = state.findMatches[state.findIndex];
+  if (state.workspaceView !== "read") {
+    elements.editor.focus();
+    elements.editor.setSelectionRange(match.start, match.end);
+    const before = elements.editor.value.slice(0, match.start);
+    const line = before.split("\n").length;
+    const lineHeight = 22;
+    elements.editor.scrollTop = Math.max(0, (line - 3) * lineHeight);
+  }
+  refreshPreviewFromEditor();
+}
+
+function updateFindFromQuery(query, options) {
+  const keepIndex = !!(options && options.keepIndex);
+  state.findQuery = String(query || "");
+  state.findMatches = collectFindMatches(elements.editor.value, state.findQuery);
+  if (!keepIndex || state.findIndex >= state.findMatches.length) {
+    state.findIndex = 0;
+  }
+  revealFindMatch();
+}
+
+function stepFind(delta) {
+  if (!state.findMatches.length) {
+    updateFindFromQuery(elements.findInput.value);
+    return;
+  }
+  state.findIndex = (state.findIndex + delta + state.findMatches.length) % state.findMatches.length;
+  revealFindMatch();
 }
 
 function setPublishedUri(uri) {
@@ -1704,7 +2223,7 @@ function renderCurrentDocument() {
   elements.editor.disabled = false;
   elements.titleInput.value = state.current.title;
   elements.editor.value = state.current.body;
-  const rendered = renderMarkdownDocument(state.current.body || "");
+  const rendered = renderMarkdownDocument(state.current.body || "", { interactiveTasks: true });
   elements.preview.innerHTML = rendered.html;
   renderOutline(rendered.outline);
 
@@ -1717,6 +2236,48 @@ function renderCurrentDocument() {
   renderHistory();
   setStatus("Ready.");
   setDirty(false);
+}
+
+function appendDocumentsListSection(label) {
+  const heading = window.document.createElement("div");
+  heading.className = "documents-list-section";
+  heading.textContent = label;
+  elements.documentsList.appendChild(heading);
+}
+
+function appendDocumentListItem(item) {
+  const button = window.document.createElement("button");
+  button.type = "button";
+  const classes = ["document-list-item"];
+  if (item.latest_published_cid) {
+    classes.push("published");
+  }
+  if (item.pinned) {
+    classes.push("pinned");
+  }
+  if (state.current && state.current.doc_did === item.doc_did) {
+    classes.push("active");
+  }
+  button.className = classes.join(" ");
+  button.dataset.docDid = item.doc_did;
+  const dirtyMarker = state.current && state.current.doc_did === item.doc_did && state.dirty ? " • unsaved" : "";
+  const pinIcon = item.pinned
+    ? '<span class="document-list-pin-icon" aria-label="Pinned" title="Pinned"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 17v5"></path><path d="M9 3h6l1 7h2l-5 4-5-4h2z"></path></svg></span>'
+    : "";
+  const publishedIcon = item.latest_published_cid
+    ? '<span class="document-list-published-icon" aria-label="Published" title="Published"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="18" cy="5" r="2.4"></circle><circle cx="6" cy="12" r="2.4"></circle><circle cx="18" cy="19" r="2.4"></circle><path d="m8.2 10.7 7.5-4.4"></path><path d="m8.2 13.3 7.5 4.4"></path></svg></span>'
+    : "";
+  button.innerHTML =
+    '<span class="document-list-title-row"><span class="document-list-title">' + escapeHtml(item.title) + '</span><span class="document-list-marks">' + pinIcon + publishedIcon + '</span></span>' +
+    '<span class="document-list-meta">' + escapeHtml(item.file_name + dirtyMarker) + '</span>' +
+    '<span class="document-list-row"><span class="document-list-updated">' + escapeHtml(formatTime(item.updated_at)) + '</span></span>';
+  button.addEventListener("click", () => selectDocument(item.doc_did));
+  button.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    openDocumentContextMenu(event.clientX, event.clientY, item);
+  });
+  elements.documentsList.appendChild(button);
 }
 
 function renderDocumentsList() {
@@ -1733,29 +2294,16 @@ function renderDocumentsList() {
     return;
   }
 
-  visibleDocuments.forEach((item) => {
-    const button = window.document.createElement("button");
-    button.type = "button";
-    const classes = ["document-list-item"];
-    if (item.latest_published_cid) {
-      classes.push("published");
-    }
-    if (state.current && state.current.doc_did === item.doc_did) {
-      classes.push("active");
-    }
-    button.className = classes.join(" ");
-    button.dataset.docDid = item.doc_did;
-    const dirtyMarker = state.current && state.current.doc_did === item.doc_did && state.dirty ? " • unsaved" : "";
-    const publishedIcon = item.latest_published_cid
-      ? '<span class="document-list-published-icon" aria-label="Published" title="Published"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10"></path><path d="m7 9 5-5 5 5"></path><path d="M5 16v4h14v-4"></path></svg></span>'
-      : "";
-    button.innerHTML =
-      '<span class="document-list-title-row"><span class="document-list-title">' + escapeHtml(item.title) + "</span>" + publishedIcon + "</span>" +
-      '<span class="document-list-meta">' + escapeHtml(item.file_name + dirtyMarker) + "</span>" +
-      '<span class="document-list-row"><span class="document-list-updated">' + escapeHtml(formatTime(item.updated_at)) + '</span></span>';
-    button.addEventListener("click", () => selectDocument(item.doc_did));
-    elements.documentsList.appendChild(button);
-  });
+  const pinned = visibleDocuments.filter((item) => !!item.pinned);
+  const rest = visibleDocuments.filter((item) => !item.pinned);
+  if (pinned.length) {
+    appendDocumentsListSection("Pinned");
+    pinned.forEach(appendDocumentListItem);
+  }
+  if (rest.length && pinned.length) {
+    appendDocumentsListSection("Notes");
+  }
+  rest.forEach(appendDocumentListItem);
 }
 
 async function documentsApi(path, options) {
@@ -1838,6 +2386,7 @@ function upsertDocumentListItem(document) {
     working_copy_uri: document.working_copy_uri,
     updated_at: document.updated_at,
     latest_published_cid: document.latest_published_cid || null,
+    pinned: !!document.pinned,
   };
   const index = state.documents.findIndex((item) => item.doc_did === listItem.doc_did);
   if (index === -1) {
@@ -1846,6 +2395,150 @@ function upsertDocumentListItem(document) {
     state.documents[index] = listItem;
   }
   sortDocuments();
+}
+
+function hideDocumentContextMenu() {
+  if (!elements.contextMenu) {
+    return;
+  }
+  elements.contextMenu.classList.add("hidden");
+  elements.contextMenu.hidden = true;
+  elements.contextMenu.innerHTML = "";
+}
+
+function menuIcon(paths) {
+  return '<span class="menu-item-icon" aria-hidden="true"><svg viewBox="0 0 24 24">' + paths + "</svg></span>";
+}
+
+function openDocumentContextMenu(clientX, clientY, item) {
+  hideDocumentContextMenu();
+  const menu = elements.contextMenu;
+  const entries = [];
+  const hasDoc = !!(item && item.doc_did);
+  if (hasDoc) {
+    entries.push({
+      label: item.pinned ? "Unpin Note" : "Pin Note",
+      icon: item.pinned
+        ? '<path d="M12 17v5"></path><path d="M9 3h6l1 7h2l-5 4-5-4h2z"></path><path d="M4 4l16 16"></path>'
+        : '<path d="M12 17v5"></path><path d="M9 3h6l1 7h2l-5 4-5-4h2z"></path>',
+      run: () => setDocumentPinned(item.doc_did, !item.pinned),
+    });
+    entries.push("-");
+  }
+  entries.push({
+    label: "New Note",
+    icon: '<path d="M6 3.5h12v17H6z"></path><path d="M9 8h6"></path><path d="M9 12h4"></path>',
+    run: () => createDocument(""),
+  });
+  if (hasDoc) {
+    entries.push({
+      label: "Duplicate Note",
+      icon: '<path d="M8 7h9l3 3v9H8z"></path><path d="M4 4h9v3"></path><path d="M4 4v12h4"></path>',
+      run: () => duplicateDocument(item.doc_did),
+    });
+    entries.push("-");
+    if (item.latest_published_cid) {
+      entries.push({
+        label: "Copy Published Link",
+        icon: '<path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"></path><path d="M14 11a5 5 0 0 0-7.1 0l-2 2A5 5 0 0 0 12 20.1l1.1-1.1"></path>',
+        run: () => copyPublishedUri("elastos://" + item.latest_published_cid),
+      });
+      entries.push({
+        label: "Unpublish Note",
+        icon: '<circle cx="18" cy="5" r="2.4"></circle><circle cx="6" cy="12" r="2.4"></circle><circle cx="18" cy="19" r="2.4"></circle><path d="m8.2 10.7 7.5-4.4"></path><path d="m8.2 13.3 7.5 4.4"></path><path d="M4 4l16 16"></path>',
+        run: async () => {
+          await selectDocument(item.doc_did);
+          await unpublishCurrent();
+        },
+      });
+    } else {
+      entries.push({
+        label: "Publish Note",
+        icon: '<circle cx="18" cy="5" r="2.4"></circle><circle cx="6" cy="12" r="2.4"></circle><circle cx="18" cy="19" r="2.4"></circle><path d="m8.2 10.7 7.5-4.4"></path><path d="m8.2 13.3 7.5 4.4"></path>',
+        run: async () => {
+          await selectDocument(item.doc_did);
+          await publishCurrent();
+        },
+      });
+    }
+    entries.push("-");
+    entries.push({
+      label: "Delete",
+      icon: '<path d="M5 7h14"></path><path d="M9 7V5h6v2"></path><path d="M8 7l1 13h6l1-13"></path>',
+      run: () => requestDeleteDocument(item.doc_did, item.title),
+    });
+  }
+
+  entries.forEach((entry) => {
+    if (entry === "-") {
+      const divider = window.document.createElement("div");
+      divider.className = "menu-divider";
+      divider.setAttribute("role", "separator");
+      menu.appendChild(divider);
+      return;
+    }
+    const button = window.document.createElement("button");
+    button.type = "button";
+    button.className = "menu-item";
+    button.setAttribute("role", "menuitem");
+    button.innerHTML = menuIcon(entry.icon) + '<span class="menu-item-label">' + escapeHtml(entry.label) + "</span>";
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      hideDocumentContextMenu();
+      Promise.resolve(entry.run()).catch((error) => {
+        setStatus(readableDocumentsError(error, "Documents action could not be completed."), "warning");
+      });
+    });
+    menu.appendChild(button);
+  });
+
+  menu.hidden = false;
+  menu.classList.remove("hidden");
+  menu.style.visibility = "hidden";
+  const rect = menu.getBoundingClientRect();
+  const margin = 8;
+  const left = Math.max(margin, Math.min(clientX, window.innerWidth - rect.width - margin));
+  const top = Math.max(margin, Math.min(clientY, window.innerHeight - rect.height - margin));
+  menu.style.left = left + "px";
+  menu.style.top = top + "px";
+  menu.style.visibility = "";
+}
+
+async function setDocumentPinned(docDid, pinned) {
+  if (!docDid) {
+    return;
+  }
+  const response = await documentsProviderApi("set_pin", {
+    doc_did: docDid,
+    pinned: !!pinned,
+  });
+  const document = response.document || {};
+  upsertDocumentListItem(document);
+  if (state.current && state.current.doc_did === docDid) {
+    state.current = { ...state.current, pinned: !!document.pinned };
+  }
+  renderDocumentsList();
+  setStatus(document.pinned ? "Pinned." : "Unpinned.");
+}
+
+async function duplicateDocument(docDid) {
+  if (!docDid) {
+    return;
+  }
+  setStatus("Duplicating…");
+  const loaded = await documentsProviderApi("get", { doc_did: docDid });
+  const source = loaded.document || {};
+  const response = await documentsProviderApi("save_as", {
+    doc_did: docDid,
+    title: source.title || null,
+    body: source.body || "",
+  });
+  state.current = response.document;
+  upsertDocumentListItem(response.document);
+  renderDocumentsList();
+  renderCurrentDocument();
+  setStatus("Duplicated.");
 }
 
 function startDraftDocument(options) {
@@ -2048,15 +2741,31 @@ async function createDocument(title) {
   setStatus("Ready.");
 }
 
-async function saveCurrent() {
+function markCleanAfterSave(savedBody, savedTitle) {
+  const stillDirty =
+    elements.editor.value !== savedBody ||
+    elements.titleInput.value !== savedTitle;
+  state.dirty = stillDirty;
+  updateActionButtons();
+  if (stillDirty) {
+    scheduleAutosave();
+  }
+}
+
+async function saveCurrent(options) {
   if (!state.current) {
     return;
   }
-  setStatus("Saving…");
+  const quiet = !!(options && options.quiet);
+  const savedBody = elements.editor.value;
+  const savedTitle = elements.titleInput.value;
+  if (!quiet) {
+    setStatus("Saving…");
+  }
   if (isLibraryFileProjection(state.current)) {
     const response = await libraryObjectApi("write", {
       uri: state.current.library_object_uri,
-      data: utf8ToBase64(elements.editor.value),
+      data: utf8ToBase64(savedBody),
       mime: state.current.mime || "text/markdown",
       if_revision: state.current.revision || null,
     });
@@ -2068,10 +2777,18 @@ async function saveCurrent() {
       revision: object.revision || state.current.revision,
       title: object.name || state.current.title,
       file_name: object.name || state.current.file_name,
-      body: elements.editor.value,
+      body: savedBody,
       mime: object.mime || state.current.mime,
       updated_at: object.modified_at || state.current.updated_at,
     };
+    markCleanAfterSave(savedBody, savedTitle);
+    if (quiet) {
+      renderDocumentsList();
+      if (!state.dirty) {
+        setStatus("Saved · just now");
+      }
+      return;
+    }
     renderCurrentDocument();
     renderDocumentsList();
     setStatus("Saved to Library.");
@@ -2079,17 +2796,29 @@ async function saveCurrent() {
   }
   if (isDraftDocument(state.current)) {
     const created = await documentsProviderApi("create", {
-      title: elements.titleInput.value || null,
+      title: savedTitle || null,
     });
     state.current = created.document;
   }
   const response = await documentsProviderApi("save", {
     doc_did: state.current.doc_did,
-    title: elements.titleInput.value,
-    body: elements.editor.value,
+    title: savedTitle,
+    body: savedBody,
   });
-  state.current = response.document;
+  state.current = {
+    ...response.document,
+    body: savedBody,
+    title: savedTitle || response.document.title,
+  };
   upsertDocumentListItem(state.current);
+  markCleanAfterSave(savedBody, savedTitle);
+  if (quiet) {
+    renderDocumentsList();
+    if (!state.dirty) {
+      setStatus("Saved · just now");
+    }
+    return;
+  }
   renderCurrentDocument();
   renderDocumentsList();
   setStatus("Saved.");
@@ -2224,19 +2953,18 @@ async function unpublishCurrent() {
   }
 }
 
-async function requestDeleteCurrent() {
-  if (!state.current || isDraftDocument(state.current) || isLibraryFileProjection(state.current)) {
+async function requestDeleteDocument(docDid, title) {
+  const deletedDocDid = String(docDid || "").trim();
+  if (!deletedDocDid) {
     return;
   }
-  const deletedDocDid = state.current.doc_did;
-  const title = state.current.title || "this document";
   const confirmed = await confirmInCapsule({
     title: "",
-    message: 'Delete "' + title + '" from this device?',
+    message: 'Delete "' + (title || "this document") + '" from this device?',
     confirmLabel: "Delete",
     danger: true,
   });
-  if (!confirmed || !state.current || state.current.doc_did !== deletedDocDid) {
+  if (!confirmed) {
     return;
   }
   try {
@@ -2255,8 +2983,21 @@ async function requestDeleteCurrent() {
   }
 }
 
+async function requestDeleteCurrent() {
+  if (!state.current || isDraftDocument(state.current) || isLibraryFileProjection(state.current)) {
+    return;
+  }
+  await requestDeleteDocument(state.current.doc_did, state.current.title);
+}
+
 function readableDocumentsError(error, defaultMessage) {
   const message = String(error && error.message ? error.message : error || "").trim();
+  if (/viewer ['"]?documents['"]? not installed|setup --with documents|publishing needs the documents app/i.test(message)) {
+    return "Couldn't publish — Documents share assets aren't available on this device. Reinstall Documents from App Store, then try again.";
+  }
+  if (/publishing is unavailable on this device/i.test(message)) {
+    return "Publishing isn't available on this device right now.";
+  }
   if (!message || /\b(schema|projection|provider|adapter|capability|affordance|runtime-owned|launch token|hostcall|request failed|failed to fetch|unauthorized|forbidden|[45]\d\d)\b|engine_[a-z_]+/i.test(message)) {
     return defaultMessage;
   }
@@ -2268,17 +3009,63 @@ function wireShellEvents() {
     setDirty(true);
   });
   elements.editor.addEventListener("input", () => {
-    const rendered = renderMarkdownDocument(elements.editor.value);
-    elements.preview.innerHTML = rendered.html;
-    renderOutline(rendered.outline);
     setDirty(true);
+    if (state.findOpen) {
+      updateFindFromQuery(elements.findInput.value, { keepIndex: true });
+    } else {
+      refreshPreviewFromEditor();
+    }
+  });
+  elements.editor.addEventListener("keydown", (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+      event.preventDefault();
+      toggleTaskAtCursor();
+    }
+  });
+  elements.preview.addEventListener("change", (event) => {
+    const checkbox = event.target && event.target.closest
+      ? event.target.closest(".task-checkbox")
+      : null;
+    if (!checkbox || checkbox.disabled) {
+      return;
+    }
+    const lineIndex = Number(checkbox.dataset.sourceLine);
+    if (!Number.isFinite(lineIndex)) {
+      return;
+    }
+    setTaskLineChecked(lineIndex, checkbox.checked);
   });
   elements.newButton.addEventListener("click", () => createDocument(""));
-  elements.saveButton.addEventListener("click", saveCurrent);
+  elements.saveButton.addEventListener("click", () => {
+    saveCurrent().catch((error) => setStatus(error.message || "Save failed.", "warning"));
+  });
   elements.saveAsButton.addEventListener("click", openSaveAsModal);
   elements.publishButton.addEventListener("click", publishCurrent);
   elements.unpublishButton.addEventListener("click", unpublishCurrent);
   elements.deleteButton.addEventListener("click", requestDeleteCurrent);
+  elements.documentsList.addEventListener("contextmenu", (event) => {
+    if (event.target.closest(".document-list-item")) {
+      return;
+    }
+    event.preventDefault();
+    openDocumentContextMenu(event.clientX, event.clientY, {
+      doc_did: "",
+      title: "",
+      pinned: false,
+      latest_published_cid: null,
+      emptyList: true,
+    });
+  });
+  window.document.addEventListener("pointerdown", (event) => {
+    if (!elements.contextMenu || elements.contextMenu.hidden) {
+      return;
+    }
+    if (!event.target.closest("#context-menu")) {
+      hideDocumentContextMenu();
+    }
+  });
+  window.addEventListener("blur", hideDocumentContextMenu);
+  window.addEventListener("resize", hideDocumentContextMenu);
   elements.sidebarToggle.addEventListener("click", () => setSidebarCollapsed(!state.sidebarCollapsed));
   elements.sidebarSearch.addEventListener("input", () => {
     state.filterQuery = elements.sidebarSearch.value || "";
@@ -2290,6 +3077,22 @@ function wireShellEvents() {
   elements.panePreview.addEventListener("click", () => setInspectorView("preview"));
   elements.paneOutline.addEventListener("click", () => setInspectorView("outline"));
   elements.paneHistory.addEventListener("click", () => setInspectorView("history"));
+  elements.findInput.addEventListener("input", () => {
+    updateFindFromQuery(elements.findInput.value);
+  });
+  elements.findInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      stepFind(event.shiftKey ? -1 : 1);
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeFindBar();
+    }
+  });
+  elements.findPrev.addEventListener("click", () => stepFind(-1));
+  elements.findNext.addEventListener("click", () => stepFind(1));
+  elements.findClose.addEventListener("click", closeFindBar);
   elements.saveAsCancel.addEventListener("click", closeSaveAsModal);
   elements.saveAsModal.addEventListener("click", (event) => {
     if (event.target === elements.saveAsModal) {
@@ -2351,6 +3154,19 @@ function wireShellEvents() {
     }
   });
   document.addEventListener("keydown", async (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
+      if (state.mode !== "shell") {
+        return;
+      }
+      event.preventDefault();
+      openFindBar();
+      return;
+    }
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "g" && state.findOpen) {
+      event.preventDefault();
+      stepFind(event.shiftKey ? -1 : 1);
+      return;
+    }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
       event.preventDefault();
       try {
@@ -2358,6 +3174,14 @@ function wireShellEvents() {
       } catch (error) {
         setStatus(error.message || "Save failed.", "warning");
       }
+    }
+    if (event.key === "Escape" && elements.contextMenu && !elements.contextMenu.hidden) {
+      hideDocumentContextMenu();
+      return;
+    }
+    if (event.key === "Escape" && state.findOpen) {
+      closeFindBar();
+      return;
     }
     if (event.key === "Escape" && elements.saveAsModal.classList.contains("open")) {
       closeSaveAsModal();
@@ -2379,7 +3203,10 @@ async function loadShellMode() {
   state.mode = "shell";
   elements.documentsShell.classList.remove("hidden");
   setSidebarCollapsed(window.innerWidth <= 720);
-  setWorkspaceView(window.innerWidth <= 980 ? "write" : "split");
+  /* Write is the default desk — Split/Read are opt-in (Apple Notes calm). */
+  setWorkspaceView(state.initialView === "split" || state.initialView === "read"
+    ? state.initialView
+    : "write");
   setInspectorView("preview");
   wireShellEvents();
   try {

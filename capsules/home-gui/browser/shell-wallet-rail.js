@@ -4,18 +4,18 @@ import {
   pushUiPreferencesToFrameWindow,
   shellState,
   targetById,
-} from "./shell-core.js?v=home-20260720q";
+} from "./shell-core.js?v=home-20260722w";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
-} from "./shell-popovers.js?v=home-20260720q";
+} from "./shell-popovers.js?v=home-20260722w";
 import {
   iframeAllowForLaunch,
   iframeSandboxForLaunch,
   launchHomeTarget,
   openTarget,
-} from "./shell-windows.js?v=home-20260720q";
-import { playUiSound } from "./shell-sounds.js?v=home-20260720q";
+} from "./shell-windows.js?v=home-20260722w";
+import { playUiSound } from "./shell-sounds.js?v=home-20260722w";
 
 /* Wallet rail: a right-hand slide-over that hosts the wallet capsule.
    Chrome only — it launches the wallet through the same host-mediated
@@ -149,13 +149,19 @@ export function bindWalletRail() {
     if (event.relatedTarget && rail.contains(event.relatedTarget)) {
       return;
     }
+    // Stamp leave X — lastPointerClientX goes stale under fullscreen iframes
+    // (they swallow document pointermove), which used to keep the rail stuck
+    // open until the pointer reached the far left of the display.
+    if (Number.isFinite(event.clientX)) {
+      lastPointerClientX = event.clientX;
+    }
     // Far-right gutter sits outside the plate (rail is inset 8px). Stay open
     // while the pointer is still in that strip or over the rail column.
-    if (pointerInEdgeKeepZone(event.clientX)) {
+    if (pointerInEdgeKeepZone(lastPointerClientX)) {
       clearEdgeCloseTimer();
       return;
     }
-    scheduleEdgeClose();
+    scheduleEdgeClose({ leaveX: lastPointerClientX });
   });
   bindEdgeReveal();
   syncPrivacyButton();
@@ -189,7 +195,7 @@ function clearEdgeTimers() {
   clearEdgeCloseTimer();
 }
 
-function scheduleEdgeClose() {
+function scheduleEdgeClose(options = {}) {
   if (!openedByEdgeHover || edgeCloseTimer) {
     return;
   }
@@ -197,13 +203,16 @@ function scheduleEdgeClose() {
   // so a parked pointer outside the strip cannot leave the rail stuck open.
   const graceLeft = Math.max(0, EDGE_OPEN_GRACE_MS - (Date.now() - edgeOpenedAt));
   const delay = graceLeft + EDGE_CLOSE_MS;
+  const leaveX = Number.isFinite(options.leaveX) ? options.leaveX : null;
   edgeCloseTimer = window.setTimeout(() => {
     edgeCloseTimer = 0;
     if (!openedByEdgeHover || !walletRailOpen()) {
       return;
     }
-    // Last-chance: pointer may still sit in the far-right gutter / rail column.
-    if (pointerInEdgeKeepZone(lastPointerClientX)) {
+    // Prefer the leave-event X. Under a fullscreen iframe, lastPointerClientX
+    // freezes inside the keep zone and would cancel a real leave forever.
+    const probeX = leaveX != null ? leaveX : lastPointerClientX;
+    if (pointerInEdgeKeepZone(probeX)) {
       return;
     }
     openedByEdgeHover = false;

@@ -10,7 +10,7 @@ import {
   beginShellInteraction,
   clamp,
   endShellInteraction,
-} from "./shell-core.js?v=home-20260720q";
+} from "./shell-core.js?v=home-20260722w";
 
 const WINDOW_MIN_VISIBLE_DRAG_WIDTH = 96;
 const WINDOW_MIN_VISIBLE_DRAG_HEIGHT = 32;
@@ -215,17 +215,6 @@ export function fitWindowToBrowserAspect(node) {
     return;
   }
   applyWindowBounds(node, browserAspectBoundsFromWidth(node, normalWindowBounds(node)));
-}
-
-export function fitWindowToLargestBrowserAspect(node) {
-  const config = browserAspectConfig(node);
-  if (!config) {
-    return;
-  }
-  applyWindowBounds(
-    node,
-    browserAspectBoundsForState(node, snappedWindowBounds("maximize"), "maximize"),
-  );
 }
 
 export function rememberWindowRestoreBounds(node) {

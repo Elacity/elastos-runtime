@@ -21,7 +21,7 @@ import {
   ignoreRepeatedAction,
   pushUiPreferencesToFrameWindow,
   targetById,
-} from "./shell-core.js?v=home-20260720q";
+} from "./shell-core.js?v=home-20260722w";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -31,8 +31,26 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260720q";
-import { playUiSound } from "./shell-sounds.js?v=home-20260720q";
+} from "./shell-window-geometry.js?v=home-20260722w";
+import { playUiSound } from "./shell-sounds.js?v=home-20260722w";
+import {
+  applyFullscreenStageFromPlacement,
+  bindStageWindowHooks,
+  desktopStageId,
+  ensureDesktopForNewLaunch,
+  forgetClosedFullscreenSpace,
+  getActiveStageId,
+  getExtraDesktops,
+  isDesktopSpace,
+  neighborSpaceAfterClosing,
+  playCloseFullscreenSpaceMotion,
+  restoreExtraDesktops,
+  restoreSpaceOrder,
+  setActiveStage,
+  syncStagePresentation,
+  exitFullscreenStage,
+  toggleFullscreenStage,
+} from "./shell-stages.js?v=home-20260722w";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -191,6 +209,8 @@ function persistedBrowserSessionEntries() {
         maximized:
           entry.node.dataset.maximized === "true" ||
           entry.node.dataset.browserMaximized === "true",
+        fullscreenStage: entry.fullscreenStage === true,
+        desktopSpaceId: entry.desktopSpaceId || desktopStageId(),
         snap: entry.node.dataset.snap || "",
         x: bounds.x,
         y: bounds.y,
@@ -215,11 +235,28 @@ function persistBrowserSession() {
   }
   const rootShell = currentRootShellSessionId();
   const windows = persistedBrowserSessionEntries();
+  const desktops = [...getExtraDesktops()];
+  const activeStage = getActiveStageId();
+  const spaceOrder = Array.isArray(shellState.spaceOrder)
+    ? [...shellState.spaceOrder]
+    : [];
   if (windows.length === 0) {
-    saveShellSessionState({ root_shell: rootShell, windows: [] });
+    saveShellSessionState({
+      root_shell: rootShell,
+      windows: [],
+      desktops,
+      active_stage: activeStage,
+      space_order: spaceOrder,
+    });
     return;
   }
-  saveShellSessionState({ root_shell: rootShell, windows });
+  saveShellSessionState({
+    root_shell: rootShell,
+    windows,
+    desktops,
+    active_stage: activeStage,
+    space_order: spaceOrder,
+  });
 }
 
 function storedSessionRootShell(storedSession) {
@@ -251,21 +288,20 @@ export function normalizeRestorableSession(summary, storedSession, options = {})
     if (SINGLE_SESSION_TARGETS.has(targetId)) {
       seenTargets.add(targetId);
     }
+    const geometry = sanitizeRestoredWindowGeometry(item);
     normalized.push({
       target: targetId,
       hidden: item?.hidden === true,
       active: item?.active === true,
       maximized: item?.maximized === true,
+      fullscreenStage: item?.fullscreenStage === true,
+      desktopSpaceId:
+        typeof item?.desktopSpaceId === "string" && item.desktopSpaceId.startsWith("desk-")
+          ? item.desktopSpaceId
+          : desktopStageId(),
       snap: typeof item?.snap === "string" ? item.snap : "",
       query: restorableLaunchQuery(targetId, item),
-      x: Number.isFinite(item?.x) ? item.x : 48,
-      y: Number.isFinite(item?.y) ? item.y : 60,
-      width: Number.isFinite(item?.width) ? item.width : 560,
-      height: Number.isFinite(item?.height) ? item.height : 404,
-      restoreX: Number.isFinite(item?.restoreX) ? item.restoreX : undefined,
-      restoreY: Number.isFinite(item?.restoreY) ? item.restoreY : undefined,
-      restoreWidth: Number.isFinite(item?.restoreWidth) ? item.restoreWidth : undefined,
-      restoreHeight: Number.isFinite(item?.restoreHeight) ? item.restoreHeight : undefined,
+      ...geometry,
     });
     if (normalized.length >= MAX_SESSION_WINDOWS) {
       break;
@@ -280,6 +316,43 @@ function restorableLaunchQuery(targetId, item) {
     query.browser_instance = nextBrowserInstanceId();
   }
   return query;
+}
+
+/** Drop Mission Control thumb corruption (tiny / 0,0) from saved sessions. */
+function sanitizeRestoredWindowGeometry(item) {
+  let x = Number.isFinite(item?.x) ? item.x : 48;
+  let y = Number.isFinite(item?.y) ? item.y : 60;
+  let width = Number.isFinite(item?.width) ? item.width : 560;
+  let height = Number.isFinite(item?.height) ? item.height : 404;
+  const restoreX = Number.isFinite(item?.restoreX) ? item.restoreX : undefined;
+  const restoreY = Number.isFinite(item?.restoreY) ? item.restoreY : undefined;
+  const restoreWidth = Number.isFinite(item?.restoreWidth) ? item.restoreWidth : undefined;
+  const restoreHeight = Number.isFinite(item?.restoreHeight) ? item.restoreHeight : undefined;
+  const looksThumbStuck =
+    width < 280 ||
+    height < 180 ||
+    (x <= 4 && y <= 4 && (width < 420 || height < 280));
+  if (looksThumbStuck) {
+    if (
+      Number.isFinite(restoreX) &&
+      Number.isFinite(restoreY) &&
+      Number.isFinite(restoreWidth) &&
+      Number.isFinite(restoreHeight) &&
+      restoreWidth >= 280 &&
+      restoreHeight >= 180
+    ) {
+      x = restoreX;
+      y = restoreY;
+      width = restoreWidth;
+      height = restoreHeight;
+    } else {
+      x = 72;
+      y = 72;
+      width = Math.max(560, width);
+      height = Math.max(404, height);
+    }
+  }
+  return { x, y, width, height, restoreX, restoreY, restoreWidth, restoreHeight };
 }
 
 function renderWindowTaskbar() {
@@ -479,6 +552,18 @@ function hideWindowEntries(entries) {
   return true;
 }
 
+function tearDownWindowEntry(entry) {
+  if (!entry) {
+    return;
+  }
+  cleanupFrameAutoFit(entry.node);
+  shellState.windows.delete(entry.id);
+  entry.node.remove();
+  if (entry.fullscreenStage) {
+    forgetClosedFullscreenSpace(entry.id);
+  }
+}
+
 function removeWindowEntries(entries) {
   if (entries.length === 0) {
     return false;
@@ -486,12 +571,54 @@ function removeWindowEntries(entries) {
   const removedActiveWindow = entries.some(
     (entry) => shellState.activeWindowId === entry.id,
   );
+  // Closing a fullscreen Space's only app retires that Space and lands next door.
+  const activeStage = getActiveStageId();
+  const closingFullscreen = entries.filter((entry) => entry.fullscreenStage === true);
+  const leavingFullscreenSpace = closingFullscreen.find((entry) => entry.id === activeStage);
+  const nextSpace = leavingFullscreenSpace
+    ? neighborSpaceAfterClosing(leavingFullscreenSpace.id)
+    : null;
+
+  // Apple: slide the dying fullscreen Space away while the neighbor slides in.
+  // Keep the closing window mounted until that motion finishes.
+  if (leavingFullscreenSpace && nextSpace) {
+    const closing = leavingFullscreenSpace;
+    const others = entries.filter((entry) => entry.id !== closing.id);
+    for (const entry of others) {
+      tearDownWindowEntry(entry);
+    }
+    shellState.activeWindowId = null;
+    const motioned = playCloseFullscreenSpaceMotion(closing.id, nextSpace, {
+      onComplete: () => {
+        tearDownWindowEntry(closing);
+        renderWindowTaskbar();
+        if (isDesktopSpace(nextSpace)) {
+          focusTopVisibleWindow();
+        } else {
+          requireWindowHooks().refreshLauncherIfVisible();
+          persistBrowserSession();
+        }
+      },
+    });
+    if (motioned) {
+      renderWindowTaskbar();
+      return true;
+    }
+    // Reduced-motion / failed choreography — fall through to instant teardown.
+  }
+
   for (const entry of entries) {
-    cleanupFrameAutoFit(entry.node);
-    shellState.windows.delete(entry.id);
-    entry.node.remove();
+    tearDownWindowEntry(entry);
   }
   renderWindowTaskbar();
+  if (nextSpace) {
+    shellState.activeWindowId = null;
+    setActiveStage(nextSpace, { animate: true, focus: true, announce: true });
+    if (isDesktopSpace(nextSpace)) {
+      focusTopVisibleWindow();
+    }
+    return true;
+  }
   if (removedActiveWindow) {
     shellState.activeWindowId = null;
     focusTopVisibleWindow();
@@ -504,15 +631,25 @@ function removeWindowEntries(entries) {
 
 function activateTargetGroup(targetId) {
   const visibleTop = topBrowserWindowEntryForTarget(targetId, { includeHidden: false });
-  if (visibleTop) {
-    focusWindow(visibleTop.id);
-    return true;
-  }
-  const restoreTarget = topBrowserWindowEntryForTarget(targetId);
-  if (!restoreTarget) {
+  const entry = visibleTop || topBrowserWindowEntryForTarget(targetId);
+  if (!entry) {
     return false;
   }
-  return restoreWindow(restoreTarget.id);
+  // Dock / taskbar must Space-switch like Mission Control — focus alone leaves
+  // fullscreen apps invisible when another Space is active.
+  if (entry.fullscreenStage) {
+    setActiveStage(entry.id);
+    return true;
+  }
+  if (entry.node.classList.contains("hidden")) {
+    return restoreWindow(entry.id);
+  }
+  const home = entry.desktopSpaceId || desktopStageId();
+  if (!isDesktopSpace(getActiveStageId()) || getActiveStageId() !== home) {
+    setActiveStage(home, { focus: false });
+  }
+  focusWindow(entry.id);
+  return true;
 }
 
 export function hideAllTargetWindows(targetId) {
@@ -631,13 +768,21 @@ function createWindow({ id, title, x, y, width, height, tone, glyphTarget }) {
     if (shouldIgnoreWindowControl(node, "minimize")) {
       return;
     }
+    const entry = shellState.windows.get(id);
+    // Yellow in a fullscreen Space → leave fullscreen back to Desktop (Mac-ish).
+    // Green still toggles fullscreen; yellow must not leave a hidden fullscreen ghost.
+    if (entry?.fullscreenStage) {
+      exitFullscreenStage(id);
+      return;
+    }
     hideWindow(id);
   });
   node.querySelector("[data-action='maximize']").addEventListener("click", () => {
     if (shouldIgnoreWindowControl(node, "maximize")) {
       return;
     }
-    toggleWindowMaximize(id);
+    // Green = Enter/Exit Fullscreen stage (Mac grammar). Zoom remains dblclick.
+    toggleFullscreenStage(id);
   });
 
   const handle = node.querySelector(".window-head");
@@ -681,6 +826,7 @@ function launchActionKey(targetId, query) {
 }
 
 export function openTarget(targetId, options = {}) {
+  ensureDesktopForNewLaunch();
   if (targetId === "wallet") {
     windowHooks?.retireWalletRailBeforeWindow?.();
   }
@@ -766,8 +912,14 @@ export function handleTaskbarTargetClick(targetId) {
     entry &&
     entry.kind === "browser" &&
     entry.targetId === targetId &&
-    !entry.node.classList.contains("hidden")
+    !entry.node.classList.contains("hidden") &&
+    (!entry.fullscreenStage || getActiveStageId() === entry.id)
   ) {
+    // Same frontmost app: minimize on Desktop; leave fullscreen Space to Desktop.
+    if (entry.fullscreenStage) {
+      setActiveStage(desktopStageId(), { focus: false });
+      return;
+    }
     hideWindow(entry.id);
     return;
   }
@@ -822,10 +974,16 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
     ></iframe>
   `;
 
-  windowHostContainer().appendChild(node);
+  // Place before attach; hide during session restore so nothing flashes at 0,0
+  // before fullscreen / Space sync settles.
   if (restoredPlacement) {
     applyWindowPlacement(node, restoredPlacement);
   }
+  if (shellState.restoringSession) {
+    node.dataset.sessionRestoring = "true";
+  }
+  windowHostContainer().appendChild(node);
+  const activeSpace = getActiveStageId();
   const entry = {
     id: windowId,
     targetId: launched.target,
@@ -834,9 +992,14 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
     kind: "browser",
     title: launched.title,
     launchQuery,
+    fullscreenStage: false,
+    desktopSpaceId: isDesktopSpace(activeSpace) ? activeSpace : desktopStageId(),
   };
   shellState.windows.set(windowId, entry);
   syncBrowserWindow(entry, launched);
+  if (restoredPlacement) {
+    applyFullscreenStageFromPlacement(entry, restoredPlacement);
+  }
   if (entry.targetId === "browser") {
     fitLaunchedWindow(entry);
   }
@@ -1177,9 +1340,12 @@ export async function restoreShellSession() {
   if (!shellState.currentSummary || browserWindowEntries().length > 0) {
     return;
   }
+  const storedSession = loadShellSessionState();
+  restoreExtraDesktops(storedSession?.desktops);
+  restoreSpaceOrder(storedSession?.space_order);
   const restoredWindows = normalizeRestorableSession(
     shellState.currentSummary,
-    loadShellSessionState(),
+    storedSession,
     { rootShell: currentRootShellSessionId() },
   );
   if (restoredWindows.length === 0) {
@@ -1223,15 +1389,45 @@ export async function restoreShellSession() {
     return;
   }
 
+  // Restore the Space the user was on — not "whichever window was focused".
+  // A fullscreen Space can stay in the ring while Desktop is active; jumping
+  // to that fullscreen app on refresh was wrong.
+  const savedStage =
+    typeof storedSession?.active_stage === "string" && storedSession.active_stage.trim()
+      ? storedSession.active_stage.trim()
+      : desktopStageId();
+  setActiveStage(savedStage, { announce: false, animate: false, focus: false });
+
   const activeEntry = restoredEntries.find(
     ({ restoredWindow }) => restoredWindow.active && !restoredWindow.hidden,
   );
   if (activeEntry) {
-    focusWindow(activeEntry.entry.id);
-    return;
+    const entry = activeEntry.entry;
+    const stage = getActiveStageId();
+    const visibleHere = entry.fullscreenStage
+      ? entry.id === stage
+      : isDesktopSpace(stage) &&
+        (entry.desktopSpaceId || desktopStageId()) === stage;
+    if (visibleHere) {
+      focusWindow(entry.id);
+    } else {
+      focusTopVisibleWindow();
+    }
+  } else {
+    focusTopVisibleWindow();
   }
-  focusTopVisibleWindow();
+
+  // Reveal only after Space presentation is correct (no top-left preload flash).
+  for (const { entry } of restoredEntries) {
+    delete entry.node?.dataset?.sessionRestoring;
+  }
+  persistBrowserSession();
 }
+
+bindStageWindowHooks({
+  focusWindow,
+  persistSession: persistBrowserSession,
+});
 
 export function cleanupBeforeUnload() {
   persistBrowserSession();

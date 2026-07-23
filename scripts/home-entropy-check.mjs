@@ -916,6 +916,32 @@ assertToken(
 const shellHostStyle = read("capsules/home/browser/style.css");
 const homeGuiStyle = read("capsules/home-gui/browser/style.css");
 const shellStyle = `${shellHostStyle}\n${homeGuiStyle}`;
+assert(
+  homeGuiStyle.includes("--bar-menu-item-min-h: 1.7rem") &&
+    homeGuiStyle.includes("--bar-menu-font: 0.88rem") &&
+    homeGuiStyle.includes("var(--bar-menu-item-pad)") &&
+    homeGuiStyle.includes("var(--bar-menu-hover)") &&
+    homeGuiStyle.includes(".toolbar-identity-item") &&
+    homeGuiStyle.includes(".toolbar-menu-item") &&
+    homeGuiStyle.includes(".control-centre-row") &&
+    homeGuiStyle.includes(".context-menu-item") &&
+    homeGuiStyle.includes("min-height: var(--bar-menu-item-min-h)"),
+  "Top-bar menus share snug bar-menu tokens (logo, File, Control Centre, desktop context)",
+);
+assert(
+  homeGuiStyle.includes(".control-centre-accents") &&
+    homeGuiStyle.includes("padding: 0.15rem 0.85rem 0.35rem") &&
+    homeGuiStyle.includes("margin: 0 0.85rem"),
+  "Control Centre accent swatches and appearance segment share row inset",
+);
+assert(
+  homeGuiStyle.includes('.control-centre-row[role="switch"]:hover') &&
+    homeGuiStyle.includes('[aria-checked="true"]:hover .control-centre-switch') &&
+    homeGuiStyle.includes("background: var(--brand)"),
+  "Control Centre ON toggles keep brand color on hover (no bleach)",
+);
+
+
 assertToken(
   shellHostStyle,
   "capsules/home/browser/style.css",
@@ -998,6 +1024,164 @@ const shellQuickLook = read("capsules/home-gui/browser/shell-quicklook.js");
 const shellSpotlight = read("capsules/home-gui/browser/shell-spotlight.js");
 const shellKeyboard = read("capsules/home-gui/browser/shell-keyboard.js");
 const shellExpose = read("capsules/home-gui/browser/shell-expose.js");
+const shellStages = read("capsules/home-gui/browser/shell-stages.js");
+assert(
+  shellStages.includes("enterFullscreenStage") &&
+    shellStages.includes("playFullscreenZoomFlip") &&
+    shellStages.includes("Apple grammar: the window you click expands") &&
+    shellStages.includes("No Space-slide — zoom this window into fullscreen") &&
+    shellStages.includes("exitFullscreenStage") &&
+    shellStages.includes("flickStage") &&
+    shellStages.includes("buildStageRing") &&
+    shellStages.includes("addDesktopSpace") &&
+    shellStages.includes("promoteWindowToFullscreenSpace") &&
+    shellPopovers.includes("handleShellEscape") &&
+    shellExpose.includes("mission-spaces-bar") &&
+    shellExpose.includes("mission-space-add") &&
+    shellExpose.includes("confirmMissionSpace") &&
+    shellExpose.includes("applyMissionDrop") &&
+    shellExpose.includes("pointInRect") &&
+    shellExpose.includes("promoteAndStayInOverview") &&
+    shellExpose.includes("dedicated fullscreen Space") &&
+    shellExpose.includes("Minimized floor cards must become a live fullscreen Space") &&
+    shellExpose.includes("placePromoteGhostAt") &&
+    shellExpose.includes("Live-inject the promote card") &&
+    shellExpose.includes("Land in the slot the ghost was previewing") &&
+    shellExpose.includes("assignEntriesToNearestCells") &&
+    shellExpose.includes("nearest free Mission Control cell") &&
+    shellExpose.includes("left stays left") &&
+    shellStages.includes("never a minimized ghost") &&
+    shellStages.includes("neighborSpaceAfterClosing") &&
+    shellStages.includes("forgetClosedFullscreenSpace") &&
+    shellStages.includes("playCloseFullscreenSpaceMotion") &&
+    shellStages.includes("stage-closing-fullscreen") &&
+    shellStages.includes("Slide away + slight shrink") &&
+    shellStages.includes("closeFullscreenGen") &&
+    shellStages.includes("flipRectMotion") &&
+    shellStages.includes("Glossary (engineer nouns") &&
+    shellStages.includes("syncSpacePager") &&
+    shellStages.includes("bindSpaceEdgePeek") &&
+    shellStages.includes("Left-edge dwell peek with") &&
+    shellStages.includes("Above-dock dots removed") &&
+    shellStages.includes("Wallet EDGE_REVEAL_PX owns the right") &&
+    shellStages.includes("pointerleave coords sit on the peek") &&
+    shellStages.includes("stage-edge-sensor-left") &&
+    shellStages.includes("full-height column") &&
+    shellStages.includes("syncSpacePeekKeepColumn") &&
+    shellWindows.includes("active_stage: activeStage") &&
+    shellWindows.includes("Restore the Space the user was on") &&
+    shellSurface.includes("Keep the wave alive across the tiny gaps") &&
+    shellExpose.includes("missionExiting") &&
+    shellExpose.includes("isActive: () => active || missionExiting") &&
+    shellExpose.includes("Never reopen mid exit-zoom") &&
+    shellExpose.includes("rebuildMissionHitCache") &&
+    shellExpose.includes("Membership unchanged — flex order") &&
+    shellExpose.includes("ensureGridTimer") &&
+    shellWindows.includes("Closing a fullscreen Space's only app") &&
+    shellWindows.includes("playCloseFullscreenSpaceMotion") &&
+    shellWindows.includes("leave fullscreen back to Desktop") &&
+    shellExpose.includes("ensurePromoteGhost") &&
+    shellExpose.includes("mission-drag-proxy") &&
+    shellExpose.includes("bindSpaceThumbGesture") &&
+    shellExpose.includes("playMissionEnterMotion") &&
+    shellExpose.includes("mission-space-desk-windows") &&
+    shellExpose.includes("placeFullscreenWindowInThumb") &&
+    shellExpose.includes("syncMissionSpaceMetrics") &&
+    shellExpose.includes("mission-space-live-layer") &&
+    shellExpose.includes("rememberFloorOriginal") &&
+    shellExpose.includes("restoreFloorWindow") &&
+    shellExpose.includes("--mission-thumb-scale") &&
+    shellExpose.includes("Stay on the Space you came from") &&
+    shellExpose.includes("Fullscreen Spaces share the Desktop floor zoom") &&
+    shellExpose.includes("exposeGridTransform") &&
+    shellExpose.includes("cluttered desktop pile") &&
+    shellExpose.includes("Use the viewport") &&
+    shellExpose.includes("stale data-expose-minimized") &&
+    shellExpose.includes("reclaimLiveThumbWindows") &&
+    shellExpose.includes("preview it on the floor") &&
+    shellExpose.includes("playMissionExitZoom") &&
+    shellExpose.includes("inverse of the enter zoom") &&
+    shellExpose.includes("animate: false") &&
+    homeGuiStyle.includes(
+      "body.expose-active .window.expose-card[data-fullscreen-stage=\"true\"]",
+    ) &&
+    homeGuiStyle.includes("collapsing these into a tiny top-left stub") &&
+    !shellExpose.includes("show Desktop floor for organizing") &&
+    !homeGuiStyle.match(
+      /expose-card\[data-fullscreen-stage="true"\]\s*\{\s*inset:\s*auto\s*!important/,
+    ) &&
+    homeGuiStyle.includes("body.expose-active .window.mission-thumb-card") &&
+    homeGuiStyle.includes("--mission-thumb-src-w") &&
+    homeGuiStyle.includes("--mission-space-aspect") &&
+    homeGuiStyle.includes("justify-content: safe center") &&
+    homeGuiStyle.includes("overflow-y: hidden") &&
+    !homeGuiStyle.includes("max-width: min(96vw, 1200px)") &&
+    homeGuiStyle.includes(".mission-space-live-layer") &&
+    shellExpose.includes("Prefer fitting the strip to full width") &&
+    homeGuiStyle.includes("data-session-restoring") &&
+    shellWindows.includes("sanitizeRestoredWindowGeometry") &&
+    shellWindows.includes("sessionRestoring") &&
+    !shellExpose.includes("healStuckMissionWindows") &&
+    homeGuiStyle.includes("body.stage-sliding") &&
+    shellStages.includes("playSpaceSlide") &&
+    shellExpose.includes("dockReservePx") &&
+    shellWindows.includes("Dock / taskbar must Space-switch") &&
+    shellWalletRail.includes("leaveX") &&
+    shellSurface.includes("isExposeOpen") &&
+    shellStages.includes("moveSpaceInRing") &&
+    shellStages.includes("removeDesktopSpace") &&
+    shellStages.includes("canRemoveDesktopSpace") &&
+    shellExpose.includes("beginSpaceReorderLift") &&
+    shellExpose.includes("placeReorderSpacer") &&
+    shellExpose.includes("makeReorderGhost") &&
+    shellExpose.includes("applySpacesBarFlexOrder") &&
+    shellExpose.includes("Place the gap by flex order") &&
+    shellExpose.includes("left-to-right visual order") &&
+    shellExpose.includes("mission-space-close") &&
+    homeGuiStyle.includes(".mission-reorder-spacer") &&
+    homeGuiStyle.includes(".mission-space-close") &&
+    homeGuiStyle.includes("Padding absorbs hover lift") &&
+    homeGuiTemplateHtml.includes("Mission Control") &&
+    homeGuiStyle.includes("data-active-stage") &&
+    homeGuiStyle.includes(".mission-spaces-bar") &&
+    homeGuiStyle.includes(".mission-space-add") &&
+    homeGuiStyle.includes(".mission-space-add-glyph::before") &&
+    homeGuiStyle.includes(".mission-drag-proxy") &&
+    homeGuiStyle.includes(".mission-space-desk-window") &&
+    homeGuiStyle.includes("--mission-thumb-w") &&
+    homeGuiStyle.includes("data-space-visible") &&
+    !shellExpose.includes("promoteAndEnterSpace") &&
+    !shellExpose.includes('addLabel.textContent = "Add"'),
+  "Mission Control: stay-on-promote, Desktop snapshots, enter-to-thumb motion, Dock visible",
+);
+assert(
+  homeGuiTemplateHtml.includes('id="toolbar-mission-control"') &&
+    homeGuiStyle.includes("stage-edge-sensor-top") &&
+    homeGuiStyle.includes("stage-menubar-reveal") &&
+    homeGuiStyle.includes("mission-space-preview-desktop") &&
+    shellExpose.includes("paintSpacePreview") &&
+    shellExpose.includes("layoutThumbWindows") &&
+    shellStages.includes("bindEdgeReveal") &&
+    homeGuiStyle.includes("opacity: 0 !important"),
+  "Mission Control toolbar button, Space previews, no ghost fade, fullscreen edge-reveal chrome",
+);
+assert(
+  homeGuiStyle.includes(".mission-spaces-shelf") &&
+    homeGuiStyle.includes("mission-shelf-in") &&
+    shellExpose.includes("mission-spaces-shelf") &&
+    shellExpose.includes("missionShelfHeight") &&
+    homeGuiStyle.includes("body.expose-active header.toolbar") &&
+    homeGuiStyle.includes("var(--chrome-fill)") &&
+    !homeGuiStyle.includes(
+      "border-bottom: 1px solid color-mix(in srgb, #fff 10%, transparent);"
+    ) &&
+    !homeGuiStyle.includes(
+      ".mission-space-thumb:hover .mission-space-preview,\n.mission-space-thumb:focus-visible .mission-space-preview {\n  transform: translateY(-2px);\n  background:"
+    ),
+  "Mission Control frosted Spaces shelf (chrome-fill fade, no hard line / under-card blob); menubar hidden; no grey thumb bleach",
+);
+
+
 assert(
   (homeGuiJs.match(/export function openHomeGuiTarget\(/g) || []).length === 1,
   "Home GUI must expose one canonical open-target entrypoint",
@@ -1632,8 +1816,8 @@ const gbaLiveSmoke = read("scripts/gba-live-smoke.mjs");
 const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
 const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
-const homeAssetVersion = "home-20260719y";
-const homeGuiAssetVersion = "home-20260720q";
+const homeAssetVersion = "home-20260721b";
+const homeGuiAssetVersion = "home-20260722w";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -2122,8 +2306,8 @@ assert(
     shellJs.includes("focusMode") &&
     homeGuiCore.includes("focusModeEnabled") &&
     homeGuiTemplateHtml.includes('id="control-centre-show-windows"') &&
-    homeGuiTemplateHtml.includes("Show Windows"),
-  "Shell Continuity: home discovery proxy + Focus + Show Windows; no Bluetooth/DID in CC",
+    homeGuiTemplateHtml.includes("Mission Control"),
+  "Shell Continuity: home discovery proxy + Focus + Mission Control; no Bluetooth/DID in CC",
 );
 assert(
   shellExpose.includes("exposeEntries") &&
@@ -2131,9 +2315,10 @@ assert(
     shellExpose.includes("mountExposeCaption") &&
     shellExpose.includes('registerShellPopover("show-windows"') &&
     shellExpose.includes("No open windows") &&
-    homeGuiTemplateHtml.includes("<dt>Show Windows</dt>") &&
-    !homeGuiTemplateHtml.includes("<dt>Mission Control</dt>"),
-  "Show Windows v1 includes minimized windows, captions, empty state; shortcuts say Show Windows",
+    shellExpose.includes("mission-spaces-bar") &&
+    homeGuiTemplateHtml.includes("<dt>Mission Control</dt>") &&
+    !homeGuiTemplateHtml.includes("<dt>Show Windows</dt>"),
+  "Mission Control includes Spaces bar, minimized floor cards, captions; shortcuts say Mission Control",
 );
 assert(
   homeGuiTemplateHtml.includes('id="nc-cal-date"') &&
@@ -2217,8 +2402,10 @@ const persistSessionBlock = sourceBlock(
   "Home browser session persistence",
 );
 assert(
-  persistSessionBlock.includes("saveShellSessionState({ root_shell: rootShell, windows: [] });"),
-  "Home must persist an explicit empty session after the last window closes",
+  persistSessionBlock.includes("windows: []") &&
+    persistSessionBlock.includes("desktops") &&
+    persistSessionBlock.includes("saveShellSessionState({"),
+  "Home must persist an explicit empty session (and Desktop Spaces) after the last window closes",
 );
 assert(
   persistSessionBlock.includes("root_shell: rootShell") &&
@@ -2374,6 +2561,15 @@ assert(
       ) || []
     ).length >= 2,
   "Home host must keep deliver-to-target background-only while Home GUI focuses open-target-with-payload recipients",
+);
+assert(
+  read("capsules/home/browser/home-shell-host.js").includes(
+    "context.source.postMessage(payload, OPAQUE_FRAME_TARGET)",
+  ) &&
+    !read("capsules/home/browser/home-shell-host.js").includes(
+      "context.source.postMessage(payload, context.origin)",
+    ),
+  "Home host must deliver Library/Chat payloads into opaque app frames with * targetOrigin",
 );
 assert(
   shellJs.includes('new Set(["documents", "chat-room"])'),
@@ -2815,6 +3011,14 @@ assert(
 assert(
   chatRoomUi.includes("home:open-target"),
   "Chat Room Attach must ask Home to open Library instead of directly opening host files in shell mode",
+);
+assert(
+  chatRoomUi.includes("post_to_home_shell") &&
+    chatRoomUi.includes("is_trusted_home_shell_message") &&
+    chatRoomUi.includes("home_origin") &&
+    chatRoomUi.includes("window.top()?") &&
+    !chatRoomUi.includes("parent.post_message("),
+  "Chat Room shell messages must target window.top with home_origin (not the GUI parent)",
 );
 assert(
   chatRoomUi.includes("Open Home to attach from Library."),
@@ -4446,22 +4650,73 @@ assert(
     read("capsules/wallet/browser/style.css").includes("Apps-level object blend") &&
     read("capsules/archive-manager/browser/index.html").includes("Apps-level standard polish") &&
     read("capsules/chat-room/browser/style.css").includes(
-      "Exact Apps/marketplace recipe",
+      "Messages shell + Telegram composer",
     ) &&
-    read("capsules/chat-room/browser/style.css").includes(
-      "#chat-card MUST zero its ID padding",
-    ) &&
+    read("capsules/chat-room/browser/style.css").includes(".chat-shell") &&
+    read("capsules/chat-room/browser/style.css").includes(".chat-people") &&
     read("capsules/chat-room/browser/style.css").includes("flex: 0 0 220px") &&
-    read("capsules/chat-room/browser/style.css").includes("--sidebar-bg:") &&
     read("capsules/chat-room/browser/style.css").includes(
-      "grid-template-columns: minmax(0, 1fr) auto",
+      "var(--window-chrome-safe-top, 52px)",
     ) &&
-    read("capsules/chat-room/browser/index.html").includes("chat-room-20260721f") &&
+    read("capsules/chat-room/browser/style.css").includes(".emoji-popover") &&
+    read("capsules/chat-room/browser/style.css").includes(".composer-field") &&
+    !read("capsules/chat-room/browser/style.css").includes(".emoji-strip") &&
+    !read("capsules/chat-room/browser/index.html").includes('class="emoji-strip"') &&
+    read("capsules/chat-room/browser/index.html").includes("chat-room-20260721q") &&
+    read("capsules/chat-room/browser/index.html").includes("chat-room-ui-20260721j") &&
+    read("capsules/chat-room-ui/src/lib.rs").includes(
+      "Seed preview from bytes we just uploaded",
+    ) &&
+    read("capsules/chat-room/browser/style.css").includes(
+      ".composer:has(.composer-field.is-multiline)",
+    ) &&
+    read("capsules/chat-room/browser/index.html").includes(
+      '<textarea id="message-input"',
+    ) &&
+    read("capsules/chat-room/browser/style.css").includes("max-width: min(78%, 22rem)") &&
+    read("capsules/chat-room/browser/style.css").includes(".message-sender") &&
+    read("capsules/chat-room-ui/src/lib.rs").includes("message-sender") &&
+    read("capsules/chat-room-ui/src/lib.rs").includes("media-message") &&
+    read("capsules/chat-room/browser/index.html").includes("Have a link?") &&
+    read("capsules/chat-room/browser/index.html").includes("join-receive-card") &&
+    read("capsules/chat-room/browser/index.html").includes('id="emoji-elephant"') &&
+    read("capsules/chat-room/browser/index.html").includes('id="emoji-think"') &&
+    read("capsules/chat-room/browser/index.html").includes("🐘") &&
+    read("capsules/chat-room/browser/index.html").includes("🤔") &&
+    read("capsules/chat-room-ui/src/lib.rs").includes("sync_composer_field") &&
+    read("capsules/chat-room-ui/src/lib.rs").includes("COMPOSER_MAX_HEIGHT_PX") &&
+    read("capsules/chat-room-ui/src/lib.rs").includes('event.key() != "Enter"') &&
+    read("capsules/chat-room-ui/src/lib.rs").includes("event.shift_key()") &&
+    read("capsules/chat-room/browser/style.css").includes("max-height: 132px") &&
+    read("capsules/chat-room/browser/style.css").includes(".composer-field.is-multiline") &&
+    read("capsules/chat-room-ui/src/lib.rs").includes("copy_via_exec_command") &&
+    read("capsules/chat-room-ui/src/lib.rs").includes(
+      "Always offer paste-to-join in shell People",
+    ) &&
+    read("capsules/chat-room-ui/src/lib.rs").includes('("emoji-elephant", "🐘")') &&
+    read("capsules/chat-room-ui/src/lib.rs").includes("node-row-did") &&
+    read("capsules/chat-room/browser/style.css").includes("min-height: 22px !important") &&
+    read("capsules/chat-room/browser/style.css").includes(".join-receive-card") &&
+    read("capsules/chat-room/browser/style.css").includes(".node-row-did") &&
     read("capsules/chat-room/browser/index.html").includes('aria-label="People"') &&
+    read("capsules/chat-room/browser/index.html").includes('id="chat-card"') &&
+    read("capsules/chat-room/browser/index.html").includes('id="emoji-toggle"') &&
+    read("capsules/chat-room/browser/index.html").includes('id="emoji-popover"') &&
+    read("capsules/chat-room/browser/index.html").includes("class=\"chat-shell") &&
+    !read("capsules/chat-room/browser/index.html").includes('class="card ') &&
+    read("capsules/chat-room/browser/style.css").includes("scrollbar-color:") &&
+    read("capsules/chat-room/browser/style.css").includes(".policy-switch") &&
+    read("capsules/chat-room/browser/style.css").includes("[hidden]") &&
+    read("capsules/chat-room-ui/src/lib.rs").includes('"Web guests"') &&
+    read("capsules/chat-room-ui/src/lib.rs").includes("policy-switch") &&
+    !read("capsules/chat-room/browser/style.css").includes(
+      "var(--sidebar-bg) 92%",
+    ) &&
     homeGuiStyle.includes('.window[data-target="chat-room"] .window-head') &&
     homeGuiStyle.includes("Continuous must not paint a full black bar over Chat") &&
     homeGuiStyle.includes("var(--panel-strong)") &&
     homeGuiStyle.includes("never hardcode a dark strip in light mode") &&
+    homeGuiStyle.includes("background-color: transparent !important") &&
     !homeGuiStyle.includes(
       "color-mix(in srgb, rgba(22, 24, 29, 0.92) 100%, transparent)",
     ) &&
@@ -4472,6 +4727,13 @@ assert(
     homeGuiCore.includes("clearForcedUnifiedSidebarGeometry") &&
     homeGuiCore.includes("Map is the sole mode source") &&
     !homeGuiCore.includes("Hard-pin Chat to the same chrome as Apps/marketplace") &&
+    !shellWindowGeometry.includes("fitWindowToLargestBrowserAspect") &&
+    read("capsules/browser/browser/index.html").includes(
+      "browser.js?v=browser-20260720c",
+    ) &&
+    read("capsules/library/browser/index.html").includes(
+      "src/app.js?v=library-20260720c",
+    ) &&
     read("docs/DESIGN_SYSTEM.md").includes(
       "Chat may temporarily force head/body geometry",
     ) &&
@@ -4944,9 +5206,41 @@ assert(
 );
 assert(
   documents.includes("border-radius: 999px") &&
-    documents.includes("var(--el-lift-strong)"),
-  "Documents list rows must use capsule selection like Apps/Library",
+    documents.includes("var(--el-lift-strong)") &&
+    documents.includes(".document-list-item,\n.share-doc-link {") &&
+    documents.includes("border-radius: 10px") &&
+    documents.includes("documents-20260721o") &&
+    documents.includes('workspaceView: "write"') &&
+    documents.includes('class="view-toggle"') &&
+    documents.includes('id="mode-write"') &&
+    documents.includes("view-toggle-button") &&
+    !documents.includes("workspace-toggle") &&
+    documents.includes("scheduleAutosave") &&
+    documents.includes("Saved · just now") &&
+    documents.includes("task-checkbox") &&
+    documents.includes('id="find-bar"') &&
+    documents.includes("openFindBar") &&
+    documents.includes("Publish — create a shareable link") &&
+    documents.includes("Couldn't publish — Documents share assets") &&
+    documents.includes('id="context-menu"') &&
+    documents.includes("openDocumentContextMenu") &&
+    documents.includes("setDocumentPinned") &&
+    documents.includes("duplicateDocument") &&
+    documents.includes("Pin Note") &&
+    documents.includes('id="status-row"') &&
+    documents.includes("elements.statusRow.hidden") &&
+    documents.includes("--sidebar-compose-size") &&
+    !documents.includes("padding-left: calc(var(--sidebar-compose-size") &&
+    !documents.includes("scrollbar-gutter: stable"),
+  "Documents Notes menu + idle status hidden; list hover full width under + and search",
 );
+assert(
+  documents.includes("--documents-toolbar-band") &&
+    documents.includes("padding-bottom: var(--documents-toolbar-band)") &&
+    documents.includes("align-items: center"),
+  "Documents title row equal vertical band above Write",
+);
+
 assert(
   inbox.includes("button.dataset.actionId = actionId;"),
   "Inbox actions must expose stable action ids",
@@ -6458,7 +6752,7 @@ assert(
 );
 assert(
   libraryIndex.includes('rel="stylesheet" href="library.css?v=library-20260720c"') &&
-    libraryIndex.includes('type="module" src="src/app.js?v=library-20260711d"') &&
+    libraryIndex.includes('type="module" src="src/app.js?v=library-20260720c"') &&
     !libraryIndex.includes("<style>") &&
     !libraryIndex.includes("function renderContent"),
   "Library index must stay a static shell with CSS and app code split out",
@@ -6563,14 +6857,16 @@ assert(
   "Library narrow layout keeps flat blended shell; locked card may keep compact radius",
 );
 assert(
-  chatStyle.includes("width: 100%;") &&
-    chatStyle.includes("padding-top: 0.35rem;"),
-  "Chat Room mobile shell must avoid nested browser gutters",
+  chatStyle.includes(".chat-shell") &&
+    chatStyle.includes("height: 100%;") &&
+    chatStyle.includes("@media (max-width: 760px)"),
+  "Chat Room mobile shell must use full-bleed Messages layout with narrow drawer",
 );
 assert(
-  chatStyle.includes("border-radius: 0.82rem;") &&
-    chatStyle.includes("padding: 0.48rem;"),
-  "Chat Room mobile cards must use compact Home-aligned spacing",
+  chatStyle.includes('.chat-shell[data-roster-open="true"] .chat-people') &&
+    chatStyle.includes("border-radius: 16px;") &&
+    chatStyle.includes(".emoji-popover"),
+  "Chat Room mobile People drawer + Telegram emoji popover must stay Home-aligned",
 );
 assert(
   gba.includes('id="canvas"') &&
@@ -6931,8 +7227,10 @@ assert(
 );
 assert(
   homeGuiCore.includes("HOME_BROWSER_CONTEXT_KEY") &&
-    homeGuiCore.includes("browser_context_id"),
-  "Home open-window restore must be bound to a browser-context id so clearing site data cannot replay stale windows",
+    homeGuiCore.includes("browser_context_id") &&
+    homeGuiCore.includes("browserContextDurable") &&
+    homeGuiCore.includes("Opaque GUI: localStorage throws"),
+  "Home window restore binds browser-context id; opaque GUI adopts host-persisted context across refresh",
 );
 assert(
   homeGuiCore.includes("newBrowserContextId") &&
@@ -9826,10 +10124,12 @@ assert(
     !shellWindows.includes("fitWindowToLargestBrowserAspect") &&
     shellWindows.includes("Browser uses the same stage maximize") &&
     shellWindows.includes("dataset.browserMaximized") &&
-    shellWindows.includes(`syncBrowserWindow(entry, launched);
-  if (entry.targetId === "browser") {
+    shellWindows.includes("syncBrowserWindow(entry, launched);") &&
+    shellWindows.includes("applyFullscreenStageFromPlacement") &&
+    shellWindows.includes(`if (entry.targetId === "browser") {
     fitLaunchedWindow(entry);
   }`) &&
+    shellWindows.includes("toggleFullscreenStage(id)") &&
     !shellWindows.includes("prebootBrowserTarget") &&
     !shellWindows.includes("dataset.preboot") &&
     shellWindows.includes(`if (entry.targetId === "browser") {
@@ -9855,7 +10155,7 @@ assert(
     !shellWindowGeometry.includes(
       'node.dataset.target === BROWSER_TARGET_ID) {\n      node.dataset.maximized = "false";\n      node.dataset.browserMaximized = "true";\n      fitWindowToLargestBrowserAspect',
     ),
-  "Home Browser windows lock 16:9 while windowed; green maximize uses the full stage like other apps; multiple Browser instances allowed; no iframe auto-fit fighting remote resize",
+  "Home Browser windows lock 16:9 while windowed; green Enter Fullscreen stages; Zoom via title dblclick; multiple Browser instances allowed; no iframe auto-fit fighting remote resize",
 );
 assert(
   shellWindows.includes("query: normalizedLaunchQuery(entry.launchQuery)") &&

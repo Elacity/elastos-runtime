@@ -25,6 +25,8 @@ pub struct DocumentsListItem {
     pub updated_at: u64,
     #[serde(default)]
     pub latest_published_cid: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +43,8 @@ pub struct DocumentsDocumentView {
     pub latest_published_cid: Option<String>,
     #[serde(default)]
     pub publish_history: Vec<DocumentsPublishRecord>,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -127,6 +131,8 @@ struct DocumentsMetadata {
     pub publish_history: Vec<DocumentsPublishRecord>,
     #[serde(default)]
     pub source: Option<DocumentsSource>,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -187,6 +193,11 @@ enum DocumentsProviderRequest {
     Unpublish {
         principal_id: String,
         doc_did: String,
+    },
+    SetPin {
+        principal_id: String,
+        doc_did: String,
+        pinned: bool,
     },
 }
 
@@ -512,6 +523,13 @@ fn handle_provider_request_inner(
             documents_delete_local(data_dir, &principal_id, &doc_did)?;
             Ok(json!({}))
         }
+        DocumentsProviderRequest::SetPin {
+            principal_id,
+            doc_did,
+            pinned,
+        } => Ok(json!({
+            "document": documents_set_pin_local(data_dir, &principal_id, &doc_did, pinned)?,
+        })),
         DocumentsProviderRequest::Publish { .. } | DocumentsProviderRequest::Unpublish { .. } => {
             bail!("publish operations require the async provider plane")
         }
@@ -672,17 +690,28 @@ fn documents_operation_error_message(err: anyhow::Error) -> String {
     text
 }
 
+fn documents_viewer_index(viewer_dir: &Path) -> Option<PathBuf> {
+    let browser = viewer_dir.join("browser").join("index.html");
+    if browser.is_file() {
+        return Some(browser);
+    }
+    let root = viewer_dir.join("index.html");
+    if root.is_file() {
+        return Some(root);
+    }
+    None
+}
+
 fn documents_viewer_dir(data_dir: &Path) -> anyhow::Result<PathBuf> {
     let viewer_dir = data_dir.join("capsules").join("documents");
-    if viewer_dir.join("index.html").is_file() {
+    if documents_viewer_index(&viewer_dir).is_some() {
         return Ok(viewer_dir);
     }
 
     bail!(
-        "Viewer 'documents' not installed.\n\n\
-         Run first:\n\n\
-         \x20 elastos setup --with documents\n\n\
-         Then try again."
+        "Publishing needs the Documents app on this device.\n\n\
+         Open App Store and install Documents, then try again.\n\n\
+         Operators: elastos setup --with documents"
     )
 }
 
@@ -975,6 +1004,7 @@ fn documents_view(metadata: &DocumentsMetadata, body: String) -> DocumentsDocume
         updated_at: metadata.updated_at,
         latest_published_cid: metadata.latest_published_cid.clone(),
         publish_history: metadata.publish_history.clone(),
+        pinned: metadata.pinned,
     }
 }
 
@@ -987,6 +1017,7 @@ fn documents_list_item(metadata: &DocumentsMetadata) -> DocumentsListItem {
         working_copy_uri: metadata.working_copy_uri.clone(),
         updated_at: metadata.updated_at,
         latest_published_cid: metadata.latest_published_cid.clone(),
+        pinned: metadata.pinned,
     }
 }
 
@@ -1031,8 +1062,9 @@ fn documents_load_metadata_index(
 
     documents.sort_by(|left, right| {
         right
-            .updated_at
-            .cmp(&left.updated_at)
+            .pinned
+            .cmp(&left.pinned)
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
             .then_with(|| left.title.cmp(&right.title))
     });
     Ok(documents)
@@ -1086,8 +1118,22 @@ fn documents_create_local(
         latest_published_cid: None,
         publish_history: Vec::new(),
         source: None,
+        pinned: false,
     };
     documents_save_metadata(data_dir, &metadata)?;
+    Ok(documents_view(&metadata, body))
+}
+
+pub fn documents_set_pin_local(
+    data_dir: &Path,
+    principal_id: &str,
+    doc_did: &str,
+    pinned: bool,
+) -> anyhow::Result<DocumentsDocumentView> {
+    let mut metadata = documents_load_metadata_for_principal(data_dir, principal_id, doc_did)?;
+    metadata.pinned = pinned;
+    documents_save_metadata(data_dir, &metadata)?;
+    let body = documents_load_body(data_dir, principal_id, &metadata)?;
     Ok(documents_view(&metadata, body))
 }
 
@@ -1139,6 +1185,7 @@ pub fn documents_save_as_local(
         latest_published_cid: None,
         publish_history: Vec::new(),
         source: None,
+        pinned: false,
     };
     documents_save_metadata(data_dir, &metadata)?;
     Ok(documents_view(&metadata, body.to_string()))
@@ -1197,6 +1244,7 @@ pub fn documents_import_chat_attachment_local(
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
         }),
+        pinned: false,
     };
     documents_save_metadata(data_dir, &metadata)?;
     Ok(documents_view(&metadata, request.body))
@@ -1392,6 +1440,44 @@ mod tests {
             "<!doctype html><title>Documents</title>",
         )
         .unwrap();
+    }
+
+    fn install_test_documents_viewer_browser_layout(data_dir: &Path) {
+        let browser_dir = data_dir.join("capsules").join("documents").join("browser");
+        std::fs::create_dir_all(&browser_dir).unwrap();
+        std::fs::write(
+            browser_dir.join("index.html"),
+            "<!doctype html><title>Documents</title>",
+        )
+        .unwrap();
+        std::fs::write(browser_dir.join("elastos-theme.js"), "/* theme */").unwrap();
+        std::fs::write(browser_dir.join("elastos-ui.css"), "/* ui */").unwrap();
+    }
+
+    #[test]
+    fn documents_viewer_dir_accepts_browser_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        install_test_documents_viewer_browser_layout(dir.path());
+        let resolved = documents_viewer_dir(dir.path()).unwrap();
+        assert_eq!(resolved, dir.path().join("capsules").join("documents"));
+        assert!(documents_viewer_index(&resolved)
+            .unwrap()
+            .ends_with("browser/index.html"));
+    }
+
+    #[test]
+    fn documents_set_pin_persists_and_sorts_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = documents_create_local(dir.path(), TEST_PRINCIPAL, Some("Alpha")).unwrap();
+        let second = documents_create_local(dir.path(), TEST_PRINCIPAL, Some("Beta")).unwrap();
+        let pinned = documents_set_pin_local(dir.path(), TEST_PRINCIPAL, &second.doc_did, true)
+            .unwrap();
+        assert!(pinned.pinned);
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
+        assert_eq!(summary[0].doc_did, second.doc_did);
+        assert!(summary[0].pinned);
+        assert_eq!(summary[1].doc_did, first.doc_did);
+        assert!(!summary[1].pinned);
     }
 
     #[test]

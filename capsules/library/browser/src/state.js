@@ -42,10 +42,12 @@ export function createLibraryState({ queryParams, storage, perfTarget }) {
     objectNodeCache: new Map(),
     selectedUris: new Set(),
     selectionAnchorUri: "",
-    view: storage.getItem("library.view") || "grid",
+    // Prefer list (Finder Details). New key so the old grid default does not stick.
+    view: storage.getItem("library.contentView") || "list",
     sort: storage.getItem("library.sort") || "name",
     sortOrder: storage.getItem("library.sortOrder") || "asc",
     sidebarOrder: readStoredStringArray(storage.getItem("library.sidebarOrder")),
+    sidebarWidth: readStoredSidebarWidth(storage.getItem("library.sidebarWidth")),
     showHidden: storage.getItem("library.showHidden") === "true",
     query: "",
     loading: false,
@@ -93,6 +95,14 @@ function readStoredStringArray(value) {
   } catch {
     return [];
   }
+}
+
+function readStoredSidebarWidth(value) {
+  const n = Number.parseInt(String(value || ""), 10);
+  if (!Number.isFinite(n)) {
+    return 220;
+  }
+  return Math.min(420, Math.max(160, n));
 }
 
 export function setLibraryObjects(state, objects) {

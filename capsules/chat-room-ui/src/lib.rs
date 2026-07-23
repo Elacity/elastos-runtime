@@ -13,7 +13,8 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{
     window, Blob, Document, Element, Event, HtmlButtonElement, HtmlElement, HtmlFormElement,
-    HtmlInputElement, MessageEvent, RequestCredentials, Storage,
+    HtmlInputElement, HtmlTextAreaElement, KeyboardEvent, MessageEvent, RequestCredentials,
+    Storage,
 };
 
 const BROWSER_SESSION_API_BASE: &str = "/api/browser/session";
@@ -29,13 +30,22 @@ const APPROVAL_REQUESTED_BADGE: &str = "Waiting";
 const APPROVAL_REQUESTED_DETAIL: &str = "Waiting for approval.";
 const SHELL_ACCESS_UNAVAILABLE_DETAIL: &str =
     "This device is not part of this conversation yet. Join from an invite or connect it first.";
-const EMOJI_BUTTON_IDS: [(&str, &str); 6] = [
+/* Match CSS max-height for the growing composer (~6 lines). */
+const COMPOSER_MAX_HEIGHT_PX: f64 = 132.0;
+
+const EMOJI_BUTTON_IDS: [(&str, &str); 12] = [
     ("emoji-wave", "👋"),
+    ("emoji-thumbsup", "👍"),
+    ("emoji-heart", "❤️"),
+    ("emoji-joy", "😂"),
     ("emoji-fire", "🔥"),
     ("emoji-party", "🎉"),
     ("emoji-clap", "👏"),
-    ("emoji-heart", "❤️"),
     ("emoji-eyes", "👀"),
+    ("emoji-pray", "🙏"),
+    ("emoji-sad", "😢"),
+    ("emoji-think", "🤔"),
+    ("emoji-elephant", "🐘"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +58,8 @@ enum AccessMode {
 struct AppConfig {
     access_mode: AccessMode,
     home_token: Option<String>,
+    /* Home host origin — shell messages go to window.top, not the GUI parent. */
+    home_origin: Option<String>,
     initial_join_invite: Option<String>,
     browser_session_request_storage_key: String,
 }
@@ -91,7 +103,7 @@ struct App {
     chat_card: HtmlElement,
     message_list: HtmlElement,
     composer_form: HtmlFormElement,
-    message_input: HtmlInputElement,
+    message_input: HtmlTextAreaElement,
     attach_button: HtmlButtonElement,
     send_button: HtmlButtonElement,
     participant_toggle: HtmlButtonElement,
@@ -476,7 +488,7 @@ pub fn start() -> Result<(), JsValue> {
         chat_card: element_by_id(&document, "chat-card")?,
         message_list: element_by_id(&document, "message-list")?,
         composer_form: form_by_id(&document, "composer-form")?,
-        message_input: input_by_id(&document, "message-input")?,
+        message_input: textarea_by_id(&document, "message-input")?,
         attach_button: button_by_id(&document, "attach-button")?,
         send_button: button_by_id(&document, "send-button")?,
         participant_toggle: button_by_id(&document, "participant-toggle")?,
@@ -770,6 +782,42 @@ impl App {
             .add_event_listener_with_callback("submit", send_submit.as_ref().unchecked_ref())?;
         send_submit.forget();
 
+        /* Telegram: Enter sends; Shift+Enter inserts a newline (textarea default). */
+        let composer_keys_app = Rc::clone(self);
+        let composer_keydown =
+            Closure::<dyn FnMut(KeyboardEvent)>::wrap(Box::new(move |event: KeyboardEvent| {
+                if event.key() != "Enter" || event.shift_key() {
+                    return;
+                }
+                event.prevent_default();
+                if event.is_composing() || event.key_code() == 229 {
+                    return;
+                }
+                let app = Rc::clone(&composer_keys_app);
+                spawn_local(async move {
+                    app.clear_error();
+                    if let Err(err) = app.send_message().await {
+                        app.set_error(Some(err));
+                    }
+                    let _ = app.render();
+                });
+            }));
+        self.message_input.add_event_listener_with_callback(
+            "keydown",
+            composer_keydown.as_ref().unchecked_ref(),
+        )?;
+        composer_keydown.forget();
+
+        let composer_input_app = Rc::clone(self);
+        let composer_input = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
+            composer_input_app.sync_composer_field();
+        }));
+        self.message_input.add_event_listener_with_callback(
+            "input",
+            composer_input.as_ref().unchecked_ref(),
+        )?;
+        composer_input.forget();
+
         let attach_trigger_app = Rc::clone(self);
         let attach_click = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
             event.prevent_default();
@@ -1039,6 +1087,7 @@ impl App {
                     format!("{current} {emoji}")
                 };
                 emoji_app.message_input.set_value(&next);
+                emoji_app.sync_composer_field();
                 let _ = emoji_app.message_input.focus();
             }));
             button
@@ -1095,15 +1144,10 @@ impl App {
         link_click.forget();
 
         let library_attach_app = Rc::clone(self);
+        let library_attach_home_origin = self.config.home_origin.clone().unwrap_or_default();
         let library_attach =
             Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(move |event: MessageEvent| {
-                let Some(window) = window() else {
-                    return;
-                };
-                let Ok(origin) = window.location().origin() else {
-                    return;
-                };
-                if event.origin() != origin {
+                if !is_trusted_home_shell_message(&event, &library_attach_home_origin) {
                     return;
                 }
                 let data = event.data();
@@ -1142,15 +1186,10 @@ impl App {
         library_attach.forget();
 
         let attachment_result_app = Rc::clone(self);
+        let attachment_result_home_origin = self.config.home_origin.clone().unwrap_or_default();
         let attachment_result =
             Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(move |event: MessageEvent| {
-                let Some(window) = window() else {
-                    return;
-                };
-                let Ok(origin) = window.location().origin() else {
-                    return;
-                };
-                if event.origin() != origin {
+                if !is_trusted_home_shell_message(&event, &attachment_result_home_origin) {
                     return;
                 }
                 let data = event.data();
@@ -1774,7 +1813,37 @@ impl App {
 
         self.send_room_text(&body).await?;
         self.message_input.set_value("");
+        self.sync_composer_field();
         Ok(())
+    }
+
+    fn sync_composer_field(&self) {
+        let _ = self.message_input.style().set_property("height", "auto");
+        let scroll_height = f64::from(self.message_input.scroll_height());
+        let next_height = scroll_height.clamp(0.0, COMPOSER_MAX_HEIGHT_PX);
+        let _ = self
+            .message_input
+            .style()
+            .set_property("height", &format!("{next_height}px"));
+        if let Some(field) = self.message_input.parent_element() {
+            let class_name = field.class_name();
+            let is_multiline = next_height > 40.0;
+            let has_class = class_name.split_whitespace().any(|part| part == "is-multiline");
+            if is_multiline && !has_class {
+                field.set_class_name(&format!("{class_name} is-multiline"));
+            } else if !is_multiline && has_class {
+                let next = class_name
+                    .split_whitespace()
+                    .filter(|part| *part != "is-multiline")
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                field.set_class_name(&next);
+            }
+        }
+        let session_active = self.state.borrow().session_active;
+        let has_text = !self.message_input.value().trim().is_empty();
+        self.send_button
+            .set_disabled(!session_active || !has_text);
     }
 
     async fn send_library_attachment(
@@ -1834,8 +1903,20 @@ impl App {
         )
         .await?;
 
+        /* Seed preview from bytes we just uploaded — poll(since: latest_seq) will not
+        re-deliver this object, so cache_attachment_data_url would never run. */
         let mut state = self.state.borrow_mut();
         state.latest_seq = sent.seq;
+        if let Some(attachment) = sent.attachment.as_ref() {
+            let data_url = format!(
+                "data:{};base64,{}",
+                attachment.mime_type,
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            );
+            state
+                .attachment_urls
+                .insert(attachment.attachment_id.clone(), data_url);
+        }
         state.objects.push(sent);
         state.force_message_follow = true;
         Ok(())
@@ -1874,15 +1955,6 @@ impl App {
         if !self.is_shell_mode() || !clean_uri.starts_with("elastos://") {
             return Ok(false);
         }
-        let Some(window) = window() else {
-            return Ok(false);
-        };
-        let Some(parent) = window.parent()? else {
-            return Ok(false);
-        };
-        if JsObject::is(parent.as_ref(), window.as_ref()) {
-            return Ok(false);
-        }
 
         let message = JsObject::new();
         Reflect::set(
@@ -1905,8 +1977,7 @@ impl App {
             &JsValue::from_str("homeToken"),
             &JsValue::from_str(home_token),
         )?;
-        parent.post_message(&message.into(), &window.location().origin()?)?;
-        Ok(true)
+        self.post_to_home_shell(&message)
     }
 
     fn open_attachment_in_documents(&self, attachment_id: &str) -> Result<bool, JsValue> {
@@ -1940,17 +2011,6 @@ impl App {
                 .ok_or_else(|| JsValue::from_str("Attachment bytes are still loading."))?;
             (attachment, data_url)
         };
-        let Some(window) = window() else {
-            return Err(JsValue::from_str("Browser window is unavailable."));
-        };
-        let Some(parent) = window.parent()? else {
-            return Err(JsValue::from_str("Home shell is unavailable."));
-        };
-        if JsObject::is(parent.as_ref(), window.as_ref()) {
-            return Err(JsValue::from_str(
-                "Open Chat from Home to open attachments in Documents.",
-            ));
-        }
 
         let payload = JsObject::new();
         Reflect::set(
@@ -2001,23 +2061,18 @@ impl App {
             &JsValue::from_str("homeToken"),
             &JsValue::from_str(home_token),
         )?;
-        parent.post_message(&message.into(), &window.location().origin()?)?;
-        Ok(true)
+        match self.post_to_home_shell(&message)? {
+            true => Ok(true),
+            false => Err(JsValue::from_str(
+                "Open Chat from Home to open attachments in Documents.",
+            )),
+        }
     }
 
     fn open_library_from_home(&self) -> Result<bool, JsValue> {
         let Some(home_token) = self.config.home_token.as_deref() else {
             return Ok(false);
         };
-        let Some(window) = window() else {
-            return Ok(false);
-        };
-        let Some(parent) = window.parent()? else {
-            return Ok(false);
-        };
-        if JsObject::is(parent.as_ref(), window.as_ref()) {
-            return Ok(false);
-        }
 
         let message = JsObject::new();
         Reflect::set(
@@ -2047,7 +2102,30 @@ impl App {
             &JsValue::from_str("homeToken"),
             &JsValue::from_str(home_token),
         )?;
-        parent.post_message(&message.into(), &window.location().origin()?)?;
+        self.post_to_home_shell(&message)
+    }
+
+    /* Match Browser/Library: Home host listens on top; GUI parent ignores app open-target. */
+    fn post_to_home_shell(&self, message: &JsObject) -> Result<bool, JsValue> {
+        let Some(home_origin) = self
+            .config
+            .home_origin
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(false);
+        };
+        let Some(window) = window() else {
+            return Ok(false);
+        };
+        let Some(top) = window.top()? else {
+            return Ok(false);
+        };
+        if JsObject::is(top.as_ref(), window.as_ref()) {
+            return Ok(false);
+        }
+        top.post_message(&JsValue::from(message), home_origin)?;
         Ok(true)
     }
 
@@ -2082,7 +2160,25 @@ impl App {
             for attachment in attachments_to_cache {
                 self.cache_attachment_data_url(&attachment).await?;
             }
-            return Ok(changed);
+            /* Heal previews that never cached (e.g. self-upload before seed fix). */
+            let missing = {
+                let state = self.state.borrow();
+                state
+                    .objects
+                    .iter()
+                    .filter_map(|object| object.attachment.clone())
+                    .filter(|attachment| {
+                        !state
+                            .attachment_urls
+                            .contains_key(&attachment.attachment_id)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let healed = !missing.is_empty();
+            for attachment in missing {
+                self.cache_attachment_data_url(&attachment).await?;
+            }
+            return Ok(changed || healed);
         }
 
         let request_id = {
@@ -2319,10 +2415,8 @@ impl App {
             &self.room_access_section,
             !(self.is_shell_mode() && session_active && state.show_access_controls),
         )?;
-        set_hidden(
-            &self.conversation_join_section,
-            !(self.is_shell_mode() && !session_active),
-        )?;
+        /* Always offer paste-to-join in shell People — Auto-session was hiding it. */
+        set_hidden(&self.conversation_join_section, !self.is_shell_mode())?;
         self.conversation_join_submit
             .set_disabled(!self.is_shell_mode());
         let invite_url = state.join_invite_url.as_deref().unwrap_or_default();
@@ -2341,7 +2435,7 @@ impl App {
             .set_disabled(!self.is_shell_mode() || !session_active);
         self.message_input.set_disabled(!session_active);
         self.attach_button.set_disabled(!session_active);
-        self.send_button.set_disabled(!session_active);
+        self.sync_composer_field();
         for button in &self.emoji_buttons {
             button.set_disabled(!session_active);
         }
@@ -2525,22 +2619,23 @@ impl App {
         self.node_list.set_inner_html("");
 
         let policy = &state.room_control.access_policy;
+        /* Short Settings-style labels; detail lives in title for hover/a11y. */
         self.append_policy_row(
             "guest",
-            "Web guest requests",
-            "People joining from the public link still need approval.",
+            "Web guests",
+            "Public-link joiners still need approval.",
             policy.allow_guest_invites,
         )?;
         self.append_policy_row(
             "member",
-            "ElastOS user invites",
+            "Member invites",
             "Invite another trusted ElastOS profile by DID.",
             policy.allow_member_invites,
         )?;
         self.append_policy_row(
             "host",
-            "Guest approvals",
-            "Trusted ElastOS users may approve web guests.",
+            "Guest hosting",
+            "Trusted members may approve web guests.",
             policy.allow_members_to_host_guests,
         )?;
 
@@ -2589,13 +2684,35 @@ impl App {
             let head = self.document.create_element("div")?;
             head.set_class_name("node-row-head");
 
+            /* Role first (human); DID is a quiet mono caption — never the hero. */
             let name = self.document.create_element("div")?;
             name.set_class_name("node-row-name");
-            name.set_text_content(Some(&member_display_name(member)));
+            let profile_name = member
+                .profile_card
+                .as_ref()
+                .map(|profile| profile.display_name.trim())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            name.set_text_content(Some(
+                profile_name
+                    .as_deref()
+                    .unwrap_or_else(|| match member.role.as_str() {
+                        "owner" | "admin" => "Conversation manager",
+                        "member" => "Trusted participant",
+                        _ => "Participant",
+                    }),
+            ));
 
             let detail = self.document.create_element("div")?;
-            detail.set_class_name("node-row-detail");
-            detail.set_text_content(Some(&conversation_role_label(&member.role)));
+            detail.set_class_name("node-row-detail node-row-did");
+            let role = conversation_role_label(&member.role);
+            let did = short_did(&member.member_did);
+            detail.set_text_content(Some(&if profile_name.is_some() {
+                format!("{role} · {did}")
+            } else {
+                did
+            }));
+            detail.set_attribute("title", &member.member_did)?;
 
             head.append_child(&name)?;
             head.append_child(&detail)?;
@@ -2664,8 +2781,10 @@ impl App {
     ) -> Result<(), JsValue> {
         let row = self.document.create_element("div")?;
         row.set_class_name("policy-row");
+        row.set_attribute("title", detail)?;
 
         let copy = self.document.create_element("div")?;
+        copy.set_class_name("policy-row-copy");
         let name = self.document.create_element("div")?;
         name.set_class_name("policy-row-name");
         name.set_text_content(Some(label));
@@ -2677,9 +2796,18 @@ impl App {
 
         let toggle = self.document.create_element("button")?;
         toggle.set_attribute("type", "button")?;
+        toggle.set_class_name("policy-switch");
         toggle.set_attribute("data-room-policy", key)?;
         toggle.set_attribute("data-enabled", if enabled { "true" } else { "false" })?;
         toggle.set_attribute("aria-pressed", if enabled { "true" } else { "false" })?;
+        toggle.set_attribute(
+            "aria-label",
+            &format!(
+                "{label}: {}",
+                if enabled { "On" } else { "Off" }
+            ),
+        )?;
+        /* Visual switch is CSS; keep On/Off for status text / tests. */
         toggle.set_text_content(Some(if enabled { "On" } else { "Off" }));
 
         row.append_child(&copy)?;
@@ -2708,19 +2836,32 @@ impl App {
         for object in objects {
             let item = self.document.create_element("li")?;
             let is_self = object.from_current_session;
-            item.set_class_name(
-                if is_self && object.kind != ConversationObjectKind::System {
-                    "message self-message"
-                } else {
-                    "message"
-                },
-            );
+            let mut message_classes = if is_self && object.kind != ConversationObjectKind::System {
+                "message self-message".to_string()
+            } else {
+                "message".to_string()
+            };
+            if object.kind == ConversationObjectKind::Emoji {
+                message_classes.push_str(" emoji-message");
+            }
+            if object.kind == ConversationObjectKind::Attachment
+                && object
+                    .attachment
+                    .as_ref()
+                    .map(|attachment| attachment.is_image)
+                    .unwrap_or(false)
+            {
+                message_classes.push_str(" media-message");
+            }
+            item.set_class_name(&message_classes);
 
             let meta = self.document.create_element("div")?;
             meta.set_class_name("message-meta");
             let sender = self.document.create_element("span")?;
+            sender.set_class_name("message-sender");
             sender.set_text_content(Some(if is_self { "You" } else { &object.sender }));
             let time = self.document.create_element("span")?;
+            time.set_class_name("message-time");
             time.set_text_content(Some(&format_time(object.created_at)));
             meta.append_child(&sender)?;
             meta.append_child(&time)?;
@@ -2850,6 +2991,7 @@ fn load_config(document: &Document) -> Result<AppConfig, JsValue> {
         .ok_or_else(|| JsValue::from_str("document body unavailable"))?;
     let url = document.url().unwrap_or_default();
     let home_token = extract_fragment_param(&url, "home_token");
+    let home_origin = extract_query_param(&url, "home_origin").filter(|value| !value.is_empty());
     let access_mode = if home_token.is_some() {
         AccessMode::Shell
     } else {
@@ -2861,9 +3003,27 @@ fn load_config(document: &Document) -> Result<AppConfig, JsValue> {
     Ok(AppConfig {
         access_mode,
         home_token,
+        home_origin,
         initial_join_invite,
         browser_session_request_storage_key: BROWSER_SESSION_REQUEST_STORAGE_KEY.to_string(),
     })
+}
+
+fn is_trusted_home_shell_message(event: &MessageEvent, home_origin: &str) -> bool {
+    let home_origin = home_origin.trim();
+    if home_origin.is_empty() || event.origin() != home_origin {
+        return false;
+    }
+    let Some(window) = window() else {
+        return false;
+    };
+    let Ok(Some(top)) = window.top() else {
+        return false;
+    };
+    let Some(source) = event.source() else {
+        return false;
+    };
+    JsObject::is(source.as_ref(), top.as_ref())
 }
 
 fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState {
@@ -3172,10 +3332,20 @@ fn title_case(value: &str) -> String {
 
 fn short_did(value: &str) -> String {
     let trimmed = value.trim();
-    if trimmed.len() <= 24 {
+    if trimmed.len() <= 18 {
         return trimmed.to_string();
     }
-    format!("{}...{}", &trimmed[..14], &trimmed[trimmed.len() - 8..])
+    /* Compact capsule caption — full DID stays on title/hover. */
+    let head = trimmed.chars().take(10).collect::<String>();
+    let tail = trimmed
+        .chars()
+        .rev()
+        .take(5)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{head}…{tail}")
 }
 
 fn trim_sentence(value: &str) -> String {
@@ -3228,6 +3398,15 @@ fn set_hidden(element: &HtmlElement, hidden: bool) -> Result<(), JsValue> {
 }
 
 async fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
+    if copy_via_clipboard_api(text).await.is_ok() {
+        return Ok(());
+    }
+    /* Opaque sandbox: Clipboard API often fails even with allow=clipboard-write.
+       Same legacy path Wallet uses. */
+    copy_via_exec_command(text)
+}
+
+async fn copy_via_clipboard_api(text: &str) -> Result<(), String> {
     let window = window().ok_or_else(|| "window unavailable".to_string())?;
     let clipboard = Reflect::get(window.navigator().as_ref(), &JsValue::from_str("clipboard"))
         .map_err(js_error)?;
@@ -3241,6 +3420,44 @@ async fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
         .await
         .map_err(js_error)?;
     Ok(())
+}
+
+fn copy_via_exec_command(text: &str) -> Result<(), String> {
+    let document = window()
+        .ok_or_else(|| "window unavailable".to_string())?
+        .document()
+        .ok_or_else(|| "document unavailable".to_string())?;
+    let body = document
+        .body()
+        .ok_or_else(|| "document body unavailable".to_string())?;
+    let input = document
+        .create_element("textarea")
+        .map_err(js_error)?
+        .dyn_into::<web_sys::HtmlTextAreaElement>()
+        .map_err(|err| js_error(err.into()))?;
+    input.set_value(text);
+    let _ = input.set_attribute("readonly", "");
+    let _ = input.style().set_property("position", "fixed");
+    let _ = input.style().set_property("left", "-9999px");
+    let _ = input.style().set_property("top", "0");
+    let _ = input.style().set_property("opacity", "0");
+    body.append_child(&input).map_err(js_error)?;
+    let _ = input.focus();
+    input.select();
+    let exec = Reflect::get(document.as_ref(), &JsValue::from_str("execCommand"))
+        .and_then(|value| value.dyn_into::<Function>())
+        .map_err(js_error)?;
+    let ok = exec
+        .call1(document.as_ref(), &JsValue::from_str("copy"))
+        .ok()
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let _ = body.remove_child(&input);
+    if ok {
+        Ok(())
+    } else {
+        Err("Clipboard blocked in this window. Select the link and copy manually.".to_string())
+    }
 }
 
 async fn api_post_json<TReq: Serialize, TResp: DeserializeOwned>(
@@ -3457,6 +3674,13 @@ fn input_by_id(document: &Document, id: &str) -> Result<HtmlInputElement, JsValu
         .get_element_by_id(id)
         .ok_or_else(|| JsValue::from_str(&format!("missing input #{id}")))?
         .dyn_into::<HtmlInputElement>()?)
+}
+
+fn textarea_by_id(document: &Document, id: &str) -> Result<HtmlTextAreaElement, JsValue> {
+    Ok(document
+        .get_element_by_id(id)
+        .ok_or_else(|| JsValue::from_str(&format!("missing textarea #{id}")))?
+        .dyn_into::<HtmlTextAreaElement>()?)
 }
 
 fn button_by_id(document: &Document, id: &str) -> Result<HtmlButtonElement, JsValue> {

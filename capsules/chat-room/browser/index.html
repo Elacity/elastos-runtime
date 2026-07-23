@@ -6,7 +6,8 @@
   <title>Chat</title>
   <script src="./elastos-theme.js"></script>
   <link rel="stylesheet" href="./elastos-ui.css" />
-  <link rel="stylesheet" href="./style.css?v=chat-room-20260721f" />
+  <!-- tip: chat-room-20260721q — composer + optical align; attach needs Home tip 21a+ -->
+  <link rel="stylesheet" href="./style.css?v=chat-room-20260721q" />
 </head>
 <body data-room-session-active="false">
   <script>
@@ -20,110 +21,162 @@
       window.top.postMessage({ type: "home:app-ready", homeToken: homeLaunchToken }, homeOrigin);
     }
   </script>
-  <main id="app-shell" class="shell">
-    <section id="chat-card" class="card chat-card chat-room-shell">
-      <div id="participant-scrim" class="participant-scrim" hidden></div>
-      <button id="participant-toggle" type="button" class="secondary participant-toggle chat-room-toggle">People</button>
-      <!-- Leading People column (Library/System grammar + unified-sidebar). -->
-      <section class="presence-card" aria-label="People">
-        <div class="roster-head">
-          <h3 id="participant-count" class="roster-title">Opening conversation</h3>
-          <div class="roster-actions">
-            <button id="room-access-toggle" type="button" class="secondary room-access-toggle" aria-label="Access settings" title="Access settings" hidden>⚙</button>
-            <button id="participant-close" type="button" class="secondary roster-close" hidden>Close</button>
-          </div>
+
+  <div id="participant-scrim" class="participant-scrim" hidden></div>
+  <button id="participant-toggle" type="button" class="secondary participant-toggle chat-room-toggle">People</button>
+
+  <!-- #chat-card kept for wasm (data-roster-open). Flex shell = Apps store-shell twin. -->
+  <div id="chat-card" class="chat-shell chat-room-shell">
+    <aside class="chat-people" aria-label="People">
+      <div class="roster-head">
+        <h3 id="participant-count" class="roster-title">Opening conversation</h3>
+        <div class="roster-actions">
+          <button id="room-access-toggle" type="button" class="secondary room-access-toggle" aria-label="Access settings" title="Access settings" hidden>⚙</button>
+          <button id="participant-close" type="button" class="secondary roster-close" hidden>Close</button>
         </div>
-        <ol id="participant-list" class="participants"></ol>
-        <section id="browser-access-section" class="browser-access" hidden>
-          <div class="browser-access-head">
-            <h3 id="browser-access-count" class="browser-access-title">Join Requests · 0</h3>
-          </div>
-          <ol id="browser-access-list" class="browser-access-list"></ol>
-        </section>
-        <section id="room-access-section" class="room-access" hidden>
-          <div class="room-access-head">
-            <h3 class="room-access-title">Access</h3>
-          </div>
-          <div id="room-policy-list" class="room-policy-list"></div>
-          <section class="join-link-card">
-            <div class="join-link-copy">
-              <h4>Invite another device</h4>
-              <p>Create a short-lived link that lets another ElastOS profile join this conversation.</p>
-            </div>
-            <button id="conversation-invite-create" type="button">Create join link</button>
-            <div id="conversation-invite-output-row" class="join-link-output" hidden>
-              <input id="conversation-invite-output" type="text" readonly aria-label="Conversation join link" />
-              <button id="conversation-invite-copy" type="button" class="secondary">Copy</button>
-            </div>
-          </section>
-          <form id="node-invite-form" class="node-invite-form" hidden>
-            <input id="node-did-input" type="text" autocomplete="off" placeholder="Advanced DID invite" aria-label="Advanced DID invite" />
-            <button id="node-invite-submit" type="submit">Add</button>
-          </form>
-          <ol id="node-list" class="node-list"></ol>
-        </section>
+      </div>
+      <ol id="participant-list" class="participants"></ol>
+      <section id="browser-access-section" class="browser-access" hidden>
+        <div class="browser-access-head">
+          <h3 id="browser-access-count" class="browser-access-title">Join Requests · 0</h3>
+        </div>
+        <ol id="browser-access-list" class="browser-access-list"></ol>
       </section>
-      <section class="conversation-card">
-        <section id="browser-access-stage" class="browser-access-stage">
-          <div id="browser-access-status-row" class="status-row browser-access-status" hidden>
-            <span id="status-badge" class="badge"></span>
-            <span id="status-detail" class="detail"></span>
-          </div>
-          <div class="browser-access-copy">
-            <h2>Join Conversation</h2>
-            <p class="copy">Enter your name to ask to join this conversation.</p>
-          </div>
-          <form id="browser-access-form" class="stack browser-access-form">
-            <label>
-              <span>Name</span>
-              <input id="display-name" type="text" maxlength="48" autocomplete="nickname" placeholder="Guest" required />
-            </label>
-            <div class="browser-access-actions">
-              <button id="browser-access-submit" type="submit">Ask to join</button>
-              <button id="reset-button" type="button" class="secondary" hidden>Start over</button>
-            </div>
-          </form>
-        </section>
-        <p id="error-text" class="error" hidden></p>
-        <section id="conversation-join-section" class="conversation-join" hidden>
-          <div class="conversation-join-copy">
-            <h2>Join a Conversation</h2>
-            <p>Paste a join code or link from another ElastOS user to connect this device.</p>
-          </div>
-          <form id="conversation-join-form" class="conversation-join-form">
-            <input id="conversation-join-input" type="text" autocomplete="off" placeholder="Paste invite code or link" aria-label="Invite code or link" />
-            <button id="conversation-join-submit" type="submit">Join</button>
-          </form>
-        </section>
-        <ol id="message-list" class="messages"></ol>
-        <div class="emoji-strip" aria-label="Quick emoji">
-          <button id="emoji-wave" type="button" class="emoji-chip" aria-label="Wave" disabled>👋</button>
-          <button id="emoji-fire" type="button" class="emoji-chip" aria-label="Fire" disabled>🔥</button>
-          <button id="emoji-party" type="button" class="emoji-chip" aria-label="Party" disabled>🎉</button>
-          <button id="emoji-clap" type="button" class="emoji-chip" aria-label="Clap" disabled>👏</button>
-          <button id="emoji-heart" type="button" class="emoji-chip" aria-label="Heart" disabled>❤️</button>
-          <button id="emoji-eyes" type="button" class="emoji-chip" aria-label="Eyes" disabled>👀</button>
+      <section id="room-access-section" class="room-access" hidden>
+        <div class="room-access-head">
+          <h3 class="room-access-title">Access</h3>
         </div>
-        <form id="composer-form" class="composer">
-          <input id="message-input" type="text" maxlength="2000" autocomplete="off" placeholder="Say something" disabled />
-          <div class="composer-actions">
-            <button id="attach-button" type="button" class="secondary" disabled>Attach</button>
-            <button id="send-button" type="submit" disabled>Send</button>
+        <div id="room-policy-list" class="room-policy-list"></div>
+        <section class="join-link-card">
+          <div class="join-link-copy">
+            <h4>Invite</h4>
+            <p>Share so another Runtime can join yours</p>
+          </div>
+          <button id="conversation-invite-create" type="button">Create link</button>
+          <div id="conversation-invite-output-row" class="join-link-output" hidden>
+            <input id="conversation-invite-output" type="text" readonly aria-label="Conversation join link" />
+            <button id="conversation-invite-copy" type="button" class="secondary">Copy</button>
+          </div>
+        </section>
+        <form id="node-invite-form" class="node-invite-form" hidden>
+          <input id="node-did-input" type="text" autocomplete="off" placeholder="Advanced DID invite" aria-label="Advanced DID invite" />
+          <button id="node-invite-submit" type="submit">Add</button>
+        </form>
+        <ol id="node-list" class="node-list"></ol>
+      </section>
+
+      <!-- Runtime↔Runtime join — always findable in People (not only before session). -->
+      <section id="conversation-join-section" class="join-link-card join-receive-card" hidden>
+        <div class="join-link-copy">
+          <h4>Have a link?</h4>
+        </div>
+        <form id="conversation-join-form" class="conversation-join-form">
+          <input id="conversation-join-input" type="text" autocomplete="off" placeholder="Paste invite" aria-label="Invite code or link" />
+          <button id="conversation-join-submit" type="submit">Join</button>
+        </form>
+      </section>
+    </aside>
+
+    <main class="chat-thread">
+      <section id="browser-access-stage" class="browser-access-stage">
+        <div id="browser-access-status-row" class="status-row browser-access-status" hidden>
+          <span id="status-badge" class="badge"></span>
+          <span id="status-detail" class="detail"></span>
+        </div>
+        <div class="browser-access-copy">
+          <h2>Join Conversation</h2>
+          <p class="copy">Enter your name to ask to join this conversation.</p>
+        </div>
+        <form id="browser-access-form" class="stack browser-access-form">
+          <label>
+            <span>Name</span>
+            <input id="display-name" type="text" maxlength="48" autocomplete="nickname" placeholder="Guest" required />
+          </label>
+          <div class="browser-access-actions">
+            <button id="browser-access-submit" type="submit">Ask to join</button>
+            <button id="reset-button" type="button" class="secondary" hidden>Start over</button>
           </div>
         </form>
       </section>
-    </section>
-  </main>
+      <p id="error-text" class="error" hidden></p>
+
+      <ol id="message-list" class="messages"></ol>
+
+      <!-- Telegram-style composer: icons in the bar; emoji popover (not a chip strip). -->
+      <form id="composer-form" class="composer">
+        <button id="attach-button" type="button" class="composer-icon" aria-label="Attach" title="Attach" disabled>
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <path d="M12 5v14M5 12h14" />
+          </svg>
+        </button>
+        <div class="composer-field">
+          <button id="emoji-toggle" type="button" class="composer-icon composer-emoji-toggle" aria-label="Emoji" aria-expanded="false" aria-controls="emoji-popover" title="Emoji">
+            <span aria-hidden="true">😊</span>
+          </button>
+          <textarea id="message-input" rows="1" maxlength="2000" autocomplete="off" placeholder="Say something" disabled></textarea>
+          <div id="emoji-popover" class="emoji-popover" hidden role="dialog" aria-label="Quick emoji">
+            <button id="emoji-wave" type="button" class="emoji-chip" aria-label="Wave" disabled>👋</button>
+            <button id="emoji-thumbsup" type="button" class="emoji-chip" aria-label="Thumbs up" disabled>👍</button>
+            <button id="emoji-heart" type="button" class="emoji-chip" aria-label="Heart" disabled>❤️</button>
+            <button id="emoji-joy" type="button" class="emoji-chip" aria-label="Joy" disabled>😂</button>
+            <button id="emoji-fire" type="button" class="emoji-chip" aria-label="Fire" disabled>🔥</button>
+            <button id="emoji-party" type="button" class="emoji-chip" aria-label="Party" disabled>🎉</button>
+            <button id="emoji-clap" type="button" class="emoji-chip" aria-label="Clap" disabled>👏</button>
+            <button id="emoji-eyes" type="button" class="emoji-chip" aria-label="Eyes" disabled>👀</button>
+            <button id="emoji-pray" type="button" class="emoji-chip" aria-label="Thanks" disabled>🙏</button>
+            <button id="emoji-sad" type="button" class="emoji-chip" aria-label="Sad" disabled>😢</button>
+            <button id="emoji-think" type="button" class="emoji-chip" aria-label="Thinking" disabled>🤔</button>
+            <button id="emoji-elephant" type="button" class="emoji-chip" aria-label="Elephant" disabled>🐘</button>
+          </div>
+        </div>
+        <button id="send-button" type="submit" class="composer-send" disabled>Send</button>
+      </form>
+    </main>
+  </div>
+
   <script type="module">
-    import init from "./chat_room_ui.js?v=chat-room-ui-20260721a";
+    import init from "./chat_room_ui.js?v=chat-room-ui-20260721j";
     init({
-      module_or_path: new URL("./chat_room_ui_bg.wasm?v=chat-room-ui-20260721a", import.meta.url),
+      module_or_path: new URL("./chat_room_ui_bg.wasm?v=chat-room-ui-20260721j", import.meta.url),
     });
   </script>
   <script>
-    // Shell menu bar: the WASM app owns the room logic, so the host page
-    // declares the menus and routes each command to the SAME on-screen
-    // control the pointer would use — no second path into the app.
+    (function () {
+      const toggle = document.getElementById("emoji-toggle");
+      const popover = document.getElementById("emoji-popover");
+      if (!toggle || !popover) return;
+
+      function setOpen(open) {
+        popover.hidden = !open;
+        toggle.setAttribute("aria-expanded", open ? "true" : "false");
+      }
+
+      toggle.addEventListener("click", (event) => {
+        event.preventDefault();
+        setOpen(popover.hidden);
+      });
+
+      popover.addEventListener("click", (event) => {
+        if (event.target.closest(".emoji-chip")) {
+          setOpen(false);
+        }
+      });
+
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && !popover.hidden) {
+          setOpen(false);
+          toggle.focus();
+        }
+      });
+
+      document.addEventListener("pointerdown", (event) => {
+        if (popover.hidden) return;
+        if (toggle.contains(event.target) || popover.contains(event.target)) return;
+        setOpen(false);
+      });
+    })();
+  </script>
+  <script>
     (function () {
       const homeToken = new URLSearchParams(window.location.search).get("home_token") || "";
       if (!homeToken || window.parent === window) {
