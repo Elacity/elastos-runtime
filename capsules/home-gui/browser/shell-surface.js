@@ -50,7 +50,7 @@ import {
   mutateDesktopObject,
   formatBadgeCount,
   focusModeEnabled,
-} from "./shell-core.js?v=home-20260723t";
+} from "./shell-core.js?v=home-20260724k";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -64,19 +64,19 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260723t";
-import { playUiSound } from "./shell-sounds.js?v=home-20260723t";
+} from "./shell-windows.js?v=home-20260724k";
+import { playUiSound } from "./shell-sounds.js?v=home-20260724k";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
   setOverlayOpen,
-} from "./shell-popovers.js?v=home-20260723t";
+} from "./shell-popovers.js?v=home-20260724k";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20260723t";
-import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260723t";
-import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260723t";
+} from "./shell-motion.js?v=home-20260724k";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260724k";
+import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260724k";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -2378,15 +2378,17 @@ function dockMagnifyEnabled() {
   return (
     !dockReducedMotion() &&
     !document.body.classList.contains("dragging-target") &&
+    !document.querySelector(".taskbar.is-agent-face") &&
     window.matchMedia?.("(hover: hover) and (min-width: 641px)").matches === true
   );
 }
 
 function rebuildDockIconCache() {
-  /* Launcher has no app container — keep it static (no magnify / lift / shift).
-     App icons still get the normal dock wave. */
+  /* Agent + Apps (system cluster) stay paint-static; pinned/running apps wave. */
   dockState.icons = Array.from(
-    dockState.taskbar.querySelectorAll(".taskbar-item:not(.taskbar-item-launcher)"),
+    dockState.taskbar.querySelectorAll(
+      ".taskbar-item:not(.taskbar-item-launcher):not(.taskbar-item-agent)",
+    ),
   ).map((item) => {
     const rect = item.getBoundingClientRect();
     return {
@@ -2419,15 +2421,18 @@ function resetDockMagnification() {
     }
     entry.item?.style.removeProperty("--dock-shift");
   }
-  const launcherIcon = dockState.taskbar?.querySelector(
-    ".taskbar-item-launcher .taskbar-icon",
-  );
-  if (launcherIcon) {
-    launcherIcon.style.transform = "";
+  clearDockSystemTransforms();
+}
+
+function clearDockSystemTransforms() {
+  for (const selector of [".taskbar-item-launcher", ".taskbar-item-agent"]) {
+    const item = dockState.taskbar?.querySelector(selector);
+    const icon = item?.querySelector(".taskbar-icon");
+    if (icon) {
+      icon.style.transform = "";
+    }
+    item?.style.removeProperty("--dock-shift");
   }
-  dockState.taskbar
-    ?.querySelector(".taskbar-item-launcher")
-    ?.style.removeProperty("--dock-shift");
 }
 
 function applyDockMagnification() {
@@ -2472,16 +2477,8 @@ function applyDockMagnification() {
     entry.node.style.transform = `translate(${shift.toFixed(2)}px, ${lift.toFixed(2)}px) scale(${scale.toFixed(3)})`;
     entry.item?.style.setProperty("--dock-shift", `${shift.toFixed(2)}px`);
   }
-  /* Keep launcher paint-static even if a stale transform lingered. */
-  const launcherIcon = dockState.taskbar?.querySelector(
-    ".taskbar-item-launcher .taskbar-icon",
-  );
-  if (launcherIcon) {
-    launcherIcon.style.transform = "";
-  }
-  dockState.taskbar
-    ?.querySelector(".taskbar-item-launcher")
-    ?.style.removeProperty("--dock-shift");
+  /* Keep Agent + Apps paint-static even if a stale transform lingered. */
+  clearDockSystemTransforms();
   repositionDockTooltip();
 }
 

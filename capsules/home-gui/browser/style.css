@@ -58,6 +58,9 @@
   --shell-motion-leave: 120ms;
   --shell-motion-enter-ease: cubic-bezier(0.2, 0, 0, 1);
   --shell-motion-leave-ease: cubic-bezier(0.4, 0, 1, 1);
+  /* Shelf ↔ Agent morph — even ease-in-out both directions (no fast→slow). */
+  --shelf-morph-duration: 950ms;
+  --shelf-morph-ease: cubic-bezier(0.42, 0, 0.58, 1);
 }
 
 * {
@@ -3147,6 +3150,8 @@ body.dock-autohide::after {
   gap: 6px;
   min-width: 0;
   max-width: 100%;
+  /* Dock-mag icons must paint above the pill. */
+  overflow: visible;
 }
 
 /* Coarse-pointer Space pager (fine pointer uses left-edge peek). */
@@ -3281,6 +3286,15 @@ body.dock-autohide::after {
   align-items: center;
   min-width: 0;
   max-width: 100%;
+  overflow: visible;
+}
+
+/* Agent + Apps sit left of the Shelf divider; pinned/running apps stay right. */
+.taskbar-system {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 2px;
 }
 
 .taskbar-sortable {
@@ -3482,13 +3496,13 @@ body.dock-autohide::after {
    Dark mode → dark-dock (lighter cells). Light mode → light-dock (darker cells). */
 .taskbar-icon-launcher {
   background:
-    url("./icons/apps-launcher/dark-dock/icon-64.png?v=home-20260723t")
+    url("./icons/apps-launcher/dark-dock/icon-64.png?v=home-20260724k")
       center / contain no-repeat;
 }
 
 :root[data-el-theme="light"] .taskbar-icon-launcher {
   background-image:
-    url("./icons/apps-launcher/light-dock/icon-64.png?v=home-20260723t");
+    url("./icons/apps-launcher/light-dock/icon-64.png?v=home-20260724k");
 }
 
 .taskbar-icon-launcher::before {
@@ -3537,6 +3551,624 @@ body.dock-autohide::after {
   margin: 0 6px;
   border-radius: 1px;
   background: var(--hairline);
+}
+
+/* ---- Agent Shelf morph (preview) — same Shelf glass, liquid grow in place ---- */
+/* Width/height are FLIP’d in JS (max-content/auto cannot interpolate). */
+.taskbar {
+  transition: transform 220ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.shelf-morph-stage {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+  min-height: var(--dock-icon-slot);
+  /* Apps face: must stay visible so dock-mag icons can lift above the pill. */
+  overflow: visible;
+  border-radius: inherit;
+}
+
+/*
+  Full-dock liquid sheen — lives on .taskbar (not the inner stage) so it
+  washes the whole pill, not a nested square.
+*/
+.taskbar::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0;
+  background: linear-gradient(
+    100deg,
+    transparent 0%,
+    transparent 38%,
+    rgba(255, 255, 255, 0.06) 46%,
+    rgba(255, 255, 255, 0.16) 50%,
+    rgba(255, 255, 255, 0.06) 54%,
+    transparent 62%,
+    transparent 100%
+  );
+  background-size: 220% 100%;
+  background-position: 120% 0;
+  background-repeat: no-repeat;
+}
+
+.taskbar.is-agent-face[data-agent-morph="grow"] {
+  /* Clip sheen to the pill while stretching; mag is off in this phase. */
+  overflow: hidden;
+}
+
+.taskbar.is-agent-face[data-agent-morph="grow"]::after,
+.taskbar[data-agent-morph="shrink"]::after {
+  animation: shelf-liquid-sheen var(--shelf-morph-duration) var(--shelf-morph-ease) both;
+}
+
+.taskbar[data-agent-morph="shrink"] {
+  overflow: hidden;
+}
+
+@keyframes shelf-liquid-sheen {
+  0% {
+    opacity: 0;
+    background-position: 120% 0;
+  }
+  12% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    background-position: -40% 0;
+  }
+}
+
+.shelf-face-apps {
+  position: relative;
+  z-index: 1;
+}
+
+.shelf-face-agent {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  opacity: 0;
+  pointer-events: none;
+  visibility: hidden;
+}
+
+.shelf-morph-exit {
+  transition-property: opacity, filter;
+  transition-duration: 280ms;
+  transition-timing-function: var(--shelf-morph-ease);
+  transition-delay: 0ms;
+  will-change: opacity, filter;
+}
+
+.shelf-morph-enter {
+  opacity: 0;
+  transform: translateY(8px) scale(0.98);
+  filter: blur(3px);
+  transition-property: opacity, transform, filter;
+  transition-duration: 200ms;
+  transition-timing-function: var(--shell-motion-enter-ease);
+  transition-delay: 0ms;
+  will-change: opacity, transform, filter;
+}
+
+/*
+  Same surface as the Shelf — only geometry changes.
+  background stays var(--dock-fill); no alternate charcoal panel.
+*/
+.taskbar.is-agent-face {
+  height: auto;
+  min-height: 108px;
+  max-height: min(72vh, 520px);
+  width: min(720px, calc(100vw - 48px));
+  max-width: calc(100vw - 48px);
+  padding: 14px 16px 12px;
+  border-radius: 28px;
+  background-color: var(--dock-fill);
+  box-shadow:
+    inset 0 0 0 0.5px var(--hairline),
+    0 0 0 0.5px rgba(0, 0, 0, 0.2),
+    0 10px 28px rgba(0, 0, 0, 0.22);
+  backdrop-filter: blur(14px) saturate(1.08);
+  -webkit-backdrop-filter: blur(14px) saturate(1.08);
+}
+
+.taskbar.is-agent-face #space-pager {
+  display: none !important;
+}
+
+.taskbar.is-agent-face .taskbar-inner {
+  width: 100%;
+  align-items: stretch;
+}
+
+.taskbar.is-agent-face .shelf-morph-stage {
+  width: 100%;
+  min-height: 80px;
+}
+
+.taskbar.is-agent-face .shelf-face-apps {
+  /* Pin to the dock floor so icons don’t ride the upward height FLIP. */
+  position: absolute;
+  left: 0;
+  right: auto;
+  bottom: 0;
+  top: auto;
+  width: max-content;
+  max-width: 100%;
+  height: var(--taskbar-h);
+  display: flex;
+  align-items: center;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.taskbar.is-agent-face .shelf-face-agent {
+  position: relative;
+  inset: auto;
+  width: 100%;
+  min-height: 80px;
+  opacity: 1;
+  visibility: visible;
+}
+
+/* Dock → AI: dissolve in place — opacity/blur only (no translate/scale drift). */
+.taskbar[data-agent-morph="exit"] .shelf-morph-exit,
+.taskbar.is-agent-face .shelf-morph-exit {
+  opacity: 0;
+  transform: none;
+  filter: blur(5px);
+  pointer-events: none;
+}
+
+.taskbar[data-agent-morph="exit"] .shelf-morph-exit .taskbar-icon,
+.taskbar.is-agent-face .shelf-morph-exit .taskbar-icon {
+  /* Kill dock-mag lift/scale so dissolve stays planted. */
+  transform: none !important;
+}
+
+/* Reverse of restore order: targets → divider → Apps → Agent. */
+.taskbar[data-agent-morph="exit"] .shelf-morph-exit[data-morph-exit="3"],
+.taskbar.is-agent-face .shelf-morph-exit[data-morph-exit="3"] {
+  transition-delay: 120ms;
+}
+
+.taskbar[data-agent-morph="exit"] .shelf-morph-exit[data-morph-exit="2"],
+.taskbar.is-agent-face .shelf-morph-exit[data-morph-exit="2"] {
+  transition-delay: 160ms;
+}
+
+.taskbar[data-agent-morph="exit"] .shelf-morph-exit[data-morph-exit="1"],
+.taskbar.is-agent-face .shelf-morph-exit[data-morph-exit="1"] {
+  transition-delay: 200ms;
+}
+
+.taskbar[data-agent-morph="exit"] .shelf-morph-exit[data-morph-exit="0"],
+.taskbar.is-agent-face .shelf-morph-exit[data-morph-exit="0"] {
+  transition-delay: 240ms;
+}
+
+.taskbar[data-agent-morph="exit"] #space-pager {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Phase 2 — stretch only; AI chrome stays hidden until enter. */
+.taskbar.is-agent-face[data-agent-morph="grow"] .shelf-face-agent {
+  pointer-events: none;
+}
+
+.taskbar.is-agent-face[data-agent-morph="grow"] .shelf-morph-enter,
+.taskbar.is-agent-face[data-agent-morph="leave"] .shelf-morph-enter {
+  opacity: 0;
+  transform: translateY(10px) scale(0.97);
+  filter: blur(5px);
+  transition-delay: 0ms;
+}
+
+/* Phase 3 — AI controls sequence in after stretch settles. */
+.taskbar.is-agent-face[data-agent-morph="enter"] .shelf-face-agent {
+  pointer-events: auto;
+}
+
+.taskbar.is-agent-face[data-agent-morph="enter"] .shelf-morph-enter {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  filter: blur(0);
+}
+
+.taskbar.is-agent-face[data-agent-morph="enter"] .shelf-morph-enter[data-morph-enter="0"] {
+  transition-delay: 0ms;
+}
+
+.taskbar.is-agent-face[data-agent-morph="enter"] .shelf-morph-enter[data-morph-enter="1"] {
+  transition-delay: 50ms;
+}
+
+/* Closing: composer out first, then shrink restores Shelf icons. */
+.taskbar[data-agent-morph="leave"] .shelf-morph-enter {
+  transition-duration: 120ms;
+  transition-timing-function: var(--shell-motion-leave-ease);
+}
+
+.taskbar[data-agent-morph="shrink"] .shelf-morph-exit,
+.taskbar:not(.is-agent-face):not([data-agent-morph="exit"]) .shelf-morph-exit {
+  transition-duration: 280ms;
+  transition-timing-function: var(--shelf-morph-ease);
+}
+
+.taskbar[data-agent-morph="shrink"] .shelf-morph-exit[data-morph-exit="0"],
+.taskbar:not(.is-agent-face):not([data-agent-morph="exit"]) .shelf-morph-exit[data-morph-exit="0"] {
+  transition-delay: 120ms;
+}
+
+.taskbar[data-agent-morph="shrink"] .shelf-morph-exit[data-morph-exit="1"],
+.taskbar:not(.is-agent-face):not([data-agent-morph="exit"]) .shelf-morph-exit[data-morph-exit="1"] {
+  transition-delay: 160ms;
+}
+
+.taskbar[data-agent-morph="shrink"] .shelf-morph-exit[data-morph-exit="2"],
+.taskbar:not(.is-agent-face):not([data-agent-morph="exit"]) .shelf-morph-exit[data-morph-exit="2"] {
+  transition-delay: 200ms;
+}
+
+.taskbar[data-agent-morph="shrink"] .shelf-morph-exit[data-morph-exit="3"],
+.taskbar:not(.is-agent-face):not([data-agent-morph="exit"]) .shelf-morph-exit[data-morph-exit="3"] {
+  transition-delay: 240ms;
+}
+
+.taskbar-item-agent .taskbar-icon-agent {
+  width: 100%;
+  height: 100%;
+  border-radius: 12px;
+  background:
+    url("./icons/intelligence/icon-64.png?v=home-20260724k") center / contain no-repeat;
+}
+
+.agent-composer {
+  position: relative;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  min-height: 80px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0;
+}
+
+.agent-composer-field {
+  display: block;
+  margin: 0;
+  flex: 1 1 auto;
+  min-height: 28px;
+}
+
+.agent-composer-input {
+  display: block;
+  width: 100%;
+  min-height: 28px;
+  /* ChatGPT-class grow — JS also caps to ~42vh / 320px. */
+  max-height: min(42vh, 320px);
+  margin: 0;
+  padding: 2px 4px 0 0;
+  border: 0;
+  outline: none;
+  resize: none;
+  overflow-x: hidden;
+  overflow-y: auto;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  line-height: 1.4;
+  caret-color: var(--text);
+  /* Firefox — thin thumb, invisible track (no white gutter). */
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text) 32%, transparent) transparent;
+}
+
+.agent-composer-input::placeholder {
+  color: color-mix(in srgb, var(--text) 42%, transparent);
+  font-weight: 400;
+}
+
+.agent-composer-input::-webkit-scrollbar {
+  width: 8px;
+}
+
+.agent-composer-input::-webkit-scrollbar-track {
+  background: transparent;
+  margin: 4px 0;
+}
+
+.agent-composer-input::-webkit-scrollbar-thumb {
+  background-color: color-mix(in srgb, var(--text) 28%, transparent);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.agent-composer-input::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in srgb, var(--text) 42%, transparent);
+}
+
+.agent-composer-input::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.agent-composer-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 32px;
+  line-height: 1;
+}
+
+.agent-composer-tools-left,
+.agent-composer-tools-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  height: 32px;
+}
+
+.agent-tool-btn,
+.agent-approve-btn,
+.agent-model-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 72%, transparent);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 999px;
+}
+
+.agent-tool-btn {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  font-size: 20px;
+  font-weight: 300;
+}
+
+.agent-tool-btn:hover,
+.agent-approve-btn:hover,
+.agent-model-btn:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+.agent-approve-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 28px;
+  padding: 0 10px 0 8px;
+  white-space: nowrap;
+}
+
+/* Shield + face mark (Cursor-adjacent affordance; not a grant). */
+.agent-approve-mark {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  background:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M8 1.55 13.15 3.35v4.05c0 3.25-2.15 5.55-5.15 6.55-3-1-5.15-3.3-5.15-6.55V3.35L8 1.55Z' stroke='%23c9ced6' stroke-width='1.35'/%3E%3Ccircle cx='8' cy='6.35' r='1.55' stroke='%23c9ced6' stroke-width='1.2'/%3E%3Cpath d='M5.7 10.1c.7.85 1.55 1.25 2.3 1.25s1.6-.4 2.3-1.25' stroke='%23c9ced6' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E")
+      center / 15px no-repeat;
+}
+
+:root[data-el-theme="light"] .agent-approve-mark {
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M8 1.55 13.15 3.35v4.05c0 3.25-2.15 5.55-5.15 6.55-3-1-5.15-3.3-5.15-6.55V3.35L8 1.55Z' stroke='%23485163' stroke-width='1.35'/%3E%3Ccircle cx='8' cy='6.35' r='1.55' stroke='%23485163' stroke-width='1.2'/%3E%3Cpath d='M5.7 10.1c.7.85 1.55 1.25 2.3 1.25s1.6-.4 2.3-1.25' stroke='%23485163' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+
+.agent-model-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 6px;
+  max-width: 200px;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.agent-model-name,
+.agent-model-tier {
+  display: inline-block;
+  line-height: 1;
+  transform: translateY(0.5px); /* optical center vs icons */
+}
+
+.agent-model-name {
+  color: var(--text);
+  font-weight: 550;
+}
+
+.agent-model-tier {
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-weight: 450;
+}
+
+.agent-model-chevron {
+  width: 0;
+  height: 0;
+  margin-left: 1px;
+  border-left: 3.5px solid transparent;
+  border-right: 3.5px solid transparent;
+  border-top: 4.5px solid currentColor;
+  opacity: 0.55;
+  flex: 0 0 auto;
+  /* Optical: CSS triangles sit high; nudge to match cap-height. */
+  transform: translateY(1px);
+}
+
+.agent-mic-mark {
+  width: 16px;
+  height: 16px;
+  display: block;
+  background:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Crect x='5.5' y='1.75' width='5' height='8.5' rx='2.5' stroke='%23c9ced6' stroke-width='1.4'/%3E%3Cpath d='M3.5 7.5a4.5 4.5 0 0 0 9 0' stroke='%23c9ced6' stroke-width='1.4' stroke-linecap='round'/%3E%3Cpath d='M8 12v2.25' stroke='%23c9ced6' stroke-width='1.4' stroke-linecap='round'/%3E%3C/svg%3E")
+      center / 16px no-repeat;
+}
+
+:root[data-el-theme="light"] .agent-mic-mark {
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Crect x='5.5' y='1.75' width='5' height='8.5' rx='2.5' stroke='%23485163' stroke-width='1.4'/%3E%3Cpath d='M3.5 7.5a4.5 4.5 0 0 0 9 0' stroke='%23485163' stroke-width='1.4' stroke-linecap='round'/%3E%3Cpath d='M8 12v2.25' stroke='%23485163' stroke-width='1.4' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+
+.agent-send-btn {
+  width: 30px;
+  height: 30px;
+  margin-left: 2px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  transition:
+    background-color 160ms var(--shell-motion-enter-ease),
+    color 160ms var(--shell-motion-enter-ease),
+    opacity 160ms var(--shell-motion-enter-ease),
+    box-shadow 160ms var(--shell-motion-enter-ease);
+}
+
+/* Idle send — greyed until there is text. */
+.agent-send-btn[data-mode="send"]:disabled {
+  background: color-mix(in srgb, var(--text) 14%, transparent);
+  color: color-mix(in srgb, var(--text) 38%, transparent);
+  cursor: default;
+  box-shadow: none;
+  opacity: 0.85;
+}
+
+/* Ready send — light / clickable once the field has content. */
+.agent-send-btn[data-mode="send"]:not(:disabled) {
+  background: #f2f3f5;
+  color: #12141a;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.22);
+  opacity: 1;
+}
+
+.agent-send-btn[data-mode="send"]:not(:disabled):hover {
+  background: #ffffff;
+}
+
+:root[data-el-theme="light"] .agent-send-btn[data-mode="send"]:not(:disabled) {
+  background: #1d2438;
+  color: #f5f7fa;
+}
+
+:root[data-el-theme="light"] .agent-send-btn[data-mode="send"]:not(:disabled):hover {
+  background: #2a3348;
+}
+
+/* Stop — only while the model is writing / processing. */
+.agent-send-btn[data-mode="stop"] {
+  background: #f2f3f5;
+  color: #12141a;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.22);
+  opacity: 1;
+}
+
+.agent-send-btn[data-mode="stop"]:hover {
+  background: #ffffff;
+}
+
+:root[data-el-theme="light"] .agent-send-btn[data-mode="stop"] {
+  background: #1d2438;
+  color: #f5f7fa;
+}
+
+:root[data-el-theme="light"] .agent-send-btn[data-mode="stop"]:hover {
+  background: #2a3348;
+}
+
+.agent-send-mark {
+  display: block;
+  background: currentColor;
+}
+
+/* ↑ arrow for send */
+.agent-send-btn[data-mode="send"] .agent-send-mark {
+  width: 14px;
+  height: 14px;
+  border-radius: 0;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M8 12.5V3.5M8 3.5 4.2 7.2M8 3.5l3.8 3.7' stroke='black' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+    center / 14px no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M8 12.5V3.5M8 3.5 4.2 7.2M8 3.5l3.8 3.7' stroke='black' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+    center / 14px no-repeat;
+}
+
+/* ■ stop square while processing */
+.agent-send-btn[data-mode="stop"] .agent-send-mark {
+  width: 9px;
+  height: 9px;
+  border-radius: 1.5px;
+  -webkit-mask: none;
+  mask: none;
+}
+
+.agent-flip-back {
+  appearance: none;
+  height: 28px;
+  padding: 0 10px;
+  margin: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 70%, transparent);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.agent-flip-back:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .taskbar,
+  .shelf-morph-stage,
+  .shelf-morph-exit,
+  .shelf-morph-enter {
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+  }
+
+  .shelf-morph-exit,
+  .shelf-morph-enter {
+    filter: none !important;
+    transform: none !important;
+  }
+
+  .taskbar.is-agent-face[data-agent-morph="grow"]::after,
+  .taskbar[data-agent-morph="shrink"]::after {
+    animation: none !important;
+    opacity: 0 !important;
+  }
 }
 
 /* Dock tooltip: shared, non-interactive, positioned above the (possibly

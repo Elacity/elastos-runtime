@@ -1829,7 +1829,7 @@ const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
 const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260723a";
-const homeGuiAssetVersion = "home-20260723t";
+const homeGuiAssetVersion = "home-20260724k";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -2290,6 +2290,38 @@ assert(
     !homeGuiTemplateHtml.includes("Home GUI shell") &&
     !homeGuiTemplateHtml.includes("Runtime data not attached"),
   "Shelf naming + product About/error copy — no Taskbar diglossia or engineer stage-fail strings",
+);
+assert(
+  homeGuiTemplateHtml.includes('data-agent-preview="1"') &&
+    homeGuiTemplateHtml.includes('id="agent-shelf-toggle"') &&
+    homeGuiTemplateHtml.includes('class="shelf-morph-stage"') &&
+    homeGuiTemplateHtml.includes("shelf-morph-exit") &&
+    homeGuiTemplateHtml.indexOf('id="agent-shelf-toggle"') <
+      homeGuiTemplateHtml.indexOf('id="launcher-toggle"') &&
+    homeGuiTemplateHtml.includes('placeholder="Do anything"') &&
+    homeGuiTemplateHtml.includes("Approve for me") &&
+    homeGuiTemplateHtml.includes('id="agent-composer-send"') &&
+    homeGuiTemplateHtml.includes('data-mode="send"') &&
+    shellStyle.includes('max-height: min(42vh, 320px)') &&
+    shellStyle.includes('scrollbar-color:') &&
+    read("capsules/home-gui/browser/agent-shelf.js").includes("syncAgentSendButton") &&
+    read("capsules/home-gui/browser/agent-shelf.js").includes("MORPH_EXIT_MS") &&
+    read("capsules/home-gui/browser/agent-shelf.js").includes("MORPH_STRETCH_MS") &&
+    read("capsules/home-gui/browser/agent-shelf.js").includes("flipTaskbarGeometry") &&
+    read("capsules/home-gui/browser/agent-shelf.js").includes("MORPH_ENTER_AT_MS") &&
+    shellStyle.includes("overflow: visible") &&
+    shellStyle.includes('data-agent-morph="enter"') &&
+    homeGuiTemplateHtml.includes('id="agent-shelf-flip-back"') &&
+    shellStyle.includes(".taskbar.is-agent-face") &&
+    shellStyle.includes("background-color: var(--dock-fill)") &&
+    shellStyle.includes("shelf-liquid-sheen") &&
+    !shellStyle.includes("--shelf-morph-left") &&
+    !shellStyle.includes("rotateY(180deg)") &&
+    read("capsules/home-gui/browser/agent-shelf.js").includes("bindAgentShelf") &&
+    !read("capsules/home-gui/browser/agent-shelf.js").includes("pinShelfLeftEdge") &&
+    homeGuiJs.includes("bindAgentShelf()") &&
+    shellSurface.includes("!document.querySelector(\".taskbar.is-agent-face\")"),
+  "Agent Shelf morph preview: centered grow + Cursor composer crossfade + mag-off",
 );
 assert(
   homeGuiCore.includes('targetId === "chat"') &&

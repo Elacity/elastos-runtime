@@ -457,22 +457,124 @@
   </section>
 </main>
 
-<footer class="taskbar" aria-label="Shelf" data-home-gui-hidden-by-host="hidden" inert hidden>
+<footer
+  class="taskbar"
+  aria-label="Shelf"
+  data-agent-preview="1"
+  data-home-gui-hidden-by-host="hidden"
+  inert
+  hidden
+>
   <div class="taskbar-inner">
     <div id="space-pager" class="space-pager" hidden aria-hidden="true"></div>
-    <div class="taskbar-primary">
-      <button
-        id="launcher-toggle"
-        class="taskbar-item taskbar-item-launcher"
-        type="button"
-        aria-label="Open Apps"
-        aria-controls="launcher"
-        aria-expanded="false"
-        data-label="Apps"
-      >
-        <span class="taskbar-icon taskbar-icon-launcher" aria-hidden="true"></span>
-      </button>
-      <div id="taskbar-targets" class="taskbar-sortable" aria-label="Shelf items"></div>
+    <div class="shelf-morph-stage" id="shelf-morph-stage">
+      <!-- Apps face — dock stays centered; this face fades out in place -->
+      <div class="shelf-face shelf-face-apps" data-shelf-face="apps">
+        <div class="taskbar-primary">
+          <div class="taskbar-system" aria-label="Agent and Apps">
+            <button
+              id="agent-shelf-toggle"
+              class="taskbar-item taskbar-item-agent shelf-morph-exit"
+              data-morph-exit="0"
+              type="button"
+              aria-label="Agent — morph Shelf to chat"
+              aria-pressed="false"
+              data-label="Agent"
+              title="Agent morphs the Shelf — talk privately on this machine"
+            >
+              <span class="taskbar-icon taskbar-icon-agent" aria-hidden="true"></span>
+            </button>
+            <button
+              id="launcher-toggle"
+              class="taskbar-item taskbar-item-launcher shelf-morph-exit"
+              data-morph-exit="1"
+              type="button"
+              aria-label="Open Apps"
+              aria-controls="launcher"
+              aria-expanded="false"
+              data-label="Apps"
+            >
+              <span class="taskbar-icon taskbar-icon-launcher" aria-hidden="true"></span>
+            </button>
+          </div>
+          <div class="taskbar-separator shelf-morph-exit" data-morph-exit="2" aria-hidden="true"></div>
+          <div
+            id="taskbar-targets"
+            class="taskbar-sortable shelf-morph-exit"
+            data-morph-exit="3"
+            aria-label="Shelf items"
+          ></div>
+        </div>
+      </div>
+      <!-- Agent face — same Cursor composer as before; fades in as the dock grows -->
+      <div class="shelf-face shelf-face-agent" data-shelf-face="agent" aria-hidden="true">
+        <div class="agent-composer" role="form" aria-label="Agent composer">
+          <label class="agent-composer-field shelf-morph-enter" data-morph-enter="0">
+            <span class="visually-hidden">Message</span>
+            <textarea
+              id="agent-composer-input"
+              class="agent-composer-input"
+              rows="1"
+              placeholder="Do anything"
+              autocomplete="off"
+              spellcheck="true"
+            ></textarea>
+          </label>
+          <div class="agent-composer-toolbar shelf-morph-enter" data-morph-enter="1">
+            <div class="agent-composer-tools-left">
+              <button
+                id="agent-shelf-flip-back"
+                class="agent-flip-back"
+                type="button"
+                aria-label="Back to Apps Shelf"
+                title="Back to Apps (Esc)"
+              >
+                Apps
+              </button>
+              <button class="agent-tool-btn" type="button" aria-label="Add context" title="Add context">
+                <span aria-hidden="true">+</span>
+              </button>
+              <button
+                class="agent-approve-btn"
+                type="button"
+                aria-label="Approve for me — session tool scope"
+                title="Session tools start at zero. Preview only."
+              >
+                <span class="agent-approve-mark" aria-hidden="true"></span>
+                <span>Approve for me</span>
+              </button>
+            </div>
+            <div class="agent-composer-tools-right">
+              <button
+                id="agent-model-picker"
+                class="agent-model-btn"
+                type="button"
+                aria-haspopup="listbox"
+                aria-expanded="false"
+                title="Local model (preview)"
+              >
+                <span class="agent-model-name">Local</span>
+                <span class="agent-model-tier">preview</span>
+                <span class="agent-model-chevron" aria-hidden="true"></span>
+              </button>
+              <button class="agent-tool-btn agent-mic-btn" type="button" aria-label="Voice input" title="Voice — later">
+                <span class="agent-mic-mark" aria-hidden="true"></span>
+              </button>
+              <button
+                id="agent-composer-send"
+                class="agent-send-btn"
+                type="button"
+                aria-label="Send"
+                title="Enter a message to send"
+                data-mode="send"
+                disabled
+              >
+                <span class="agent-send-mark" aria-hidden="true"></span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </footer>
