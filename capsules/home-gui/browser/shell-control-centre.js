@@ -2,11 +2,11 @@ import {
   closeOtherShellPopovers,
   registerEscapeHandler,
   registerShellPopover,
-} from "./shell-popovers.js?v=home-20260723a";
+} from "./shell-popovers.js?v=home-20260723l";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20260723a";
+} from "./shell-motion.js?v=home-20260723l";
 import {
   fetchJson,
   focusModeEnabled,
@@ -14,16 +14,16 @@ import {
   setDesktopIconsVisible,
   setFocusModeEnabled,
   shellState,
-} from "./shell-core.js?v=home-20260723a";
-import { uiSoundsEnabled, setUiSoundsEnabled, playUiSound } from "./shell-sounds.js?v=home-20260723a";
+} from "./shell-core.js?v=home-20260723l";
+import { uiSoundsEnabled, setUiSoundsEnabled, playUiSound } from "./shell-sounds.js?v=home-20260723l";
 import {
   dockAutoHideEnabled,
   setDockAutoHide,
-} from "./shell-surface.js?v=home-20260723a";
-import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260723a";
-import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260723a";
-import { openTarget } from "./shell-windows.js?v=home-20260723a";
-import { openExpose } from "./shell-expose.js?v=home-20260723a";
+} from "./shell-surface.js?v=home-20260723l";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260723l";
+import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260723l";
+import { openTarget } from "./shell-windows.js?v=home-20260723l";
+import { openExpose } from "./shell-expose.js?v=home-20260723l";
 
 /* Control Centre: the quick layer for controls that already have canonical
    stores — theme, sounds, focus, accent, dock, desktop icons — plus Nearby
@@ -34,6 +34,11 @@ let panel = null;
 let button = null;
 let themeSegment = null;
 let accentRow = null;
+let accentCustomPanel = null;
+let accentCustomPickerRoot = null;
+let accentCustomPicker = null;
+let accentCustomHex = null;
+let accentCustomWriteTimer = 0;
 let focusSwitch = null;
 let approvalsRow = null;
 let approvalsDetail = null;
@@ -60,6 +65,9 @@ export function bindControlCentre() {
   button = document.querySelector("#toolbar-control-centre");
   themeSegment = document.querySelector("#control-centre-theme");
   accentRow = document.querySelector("#control-centre-accent");
+  accentCustomPanel = document.querySelector("#control-centre-accent-custom");
+  accentCustomPickerRoot = document.querySelector("#control-centre-accent-picker");
+  accentCustomHex = document.querySelector("#control-centre-accent-hex");
   focusSwitch = document.querySelector("#control-centre-focus");
   approvalsRow = document.querySelector("#control-centre-approvals");
   approvalsDetail = document.querySelector("#control-centre-approvals-detail");
@@ -110,11 +118,38 @@ export function bindControlCentre() {
     if (!option || !window.elastosTheme?.setAccent) {
       return;
     }
-    window.elastosTheme.setAccent(option.dataset.accentOption);
-    syncAccentRow();
-    window.dispatchEvent(new CustomEvent("elastos:ui-preference-changed", {
-      detail: { key: "accent", value: option.dataset.accentOption },
-    }));
+    const next = option.dataset.accentOption;
+    if (next === "custom") {
+      const hex = window.elastosTheme.accentCustom?.() || "#4f7fff";
+      window.elastosTheme.setAccentCustom?.(hex);
+      window.elastosTheme.setAccent("custom");
+      publishAccentCustom(hex);
+      publishAccent("custom");
+      syncAccentRow({ showCustomEditor: true });
+      accentCustomPicker?.open?.();
+      return;
+    }
+    window.elastosTheme.setAccent(next);
+    publishAccent(next);
+    syncAccentRow({ showCustomEditor: false });
+  });
+
+  if (accentCustomPickerRoot && window.elastosAccentPicker?.mount) {
+    accentCustomPicker = window.elastosAccentPicker.mount(accentCustomPickerRoot, {
+      getHex: () => window.elastosTheme?.accentCustom?.() || "#4f7fff",
+      onChange: (hex) => {
+        commitAccentCustom(hex, { fromWheel: true });
+      },
+    });
+  }
+  accentCustomHex?.addEventListener("change", () => {
+    commitAccentCustom(accentCustomHex.value, { fromWheel: false });
+  });
+  accentCustomHex?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      commitAccentCustom(accentCustomHex.value, { fromWheel: false });
+    }
   });
 
   focusSwitch?.addEventListener("click", () => {
@@ -267,6 +302,58 @@ export function syncControlCentre(summary) {
   syncWalletRow();
 }
 
+function publishAccent(value) {
+  window.dispatchEvent(new CustomEvent("elastos:ui-preference-changed", {
+    detail: { key: "accent", value },
+  }));
+}
+
+function publishAccentCustom(value) {
+  window.dispatchEvent(new CustomEvent("elastos:ui-preference-changed", {
+    detail: { key: "accentCustom", value },
+  }));
+}
+
+function commitAccentCustom(raw, { fromWheel }) {
+  if (!window.elastosTheme?.setAccentCustom) {
+    return;
+  }
+  const hex = window.elastosTheme.normalizeHex?.(raw) || "";
+  if (!hex) {
+    if (accentCustomHex && !fromWheel) {
+      accentCustomHex.value = window.elastosTheme.accentCustom?.() || "#4f7fff";
+    }
+    return;
+  }
+  window.elastosTheme.setAccentCustom(hex);
+  if (window.elastosTheme.accent?.() !== "custom") {
+    window.elastosTheme.setAccent("custom");
+    publishAccent("custom");
+  }
+  if (accentCustomHex && !fromWheel) {
+    accentCustomHex.value = hex;
+  } else if (accentCustomHex && document.activeElement !== accentCustomHex) {
+    accentCustomHex.value = hex;
+  }
+  if (!fromWheel) {
+    accentCustomPicker?.setHex?.(hex);
+  }
+  paintCustomSwatch(hex);
+  window.clearTimeout(accentCustomWriteTimer);
+  accentCustomWriteTimer = window.setTimeout(() => {
+    publishAccentCustom(hex);
+  }, fromWheel ? 120 : 0);
+}
+
+function paintCustomSwatch(hex) {
+  const swatch = accentRow?.querySelector('[data-accent-option="custom"]');
+  if (!swatch) {
+    return;
+  }
+  swatch.style.background = hex;
+  swatch.style.color = hex;
+}
+
 function buildAccentRow() {
   if (!accentRow || accentRow.childElementCount > 0) {
     return;
@@ -291,6 +378,14 @@ function buildAccentRow() {
     swatch.title = swatch.getAttribute("aria-label");
     accentRow.appendChild(swatch);
   }
+  const custom = document.createElement("button");
+  custom.type = "button";
+  custom.className = "control-centre-accent-swatch control-centre-accent-swatch-custom";
+  custom.role = "radio";
+  custom.dataset.accentOption = "custom";
+  custom.setAttribute("aria-label", "Custom");
+  custom.title = "Custom color";
+  accentRow.appendChild(custom);
 }
 
 function syncThemeSegment() {
@@ -309,14 +404,28 @@ function syncThemeSegment() {
   }
 }
 
-function syncAccentRow() {
+function syncAccentRow(options = {}) {
   if (!accentRow) {
     return;
   }
   const accent = window.elastosTheme?.accent?.() || "blue";
+  const hex = window.elastosTheme?.accentCustom?.() || "#4f7fff";
   for (const option of accentRow.querySelectorAll("[data-accent-option]")) {
     const active = option.dataset.accentOption === accent;
     option.setAttribute("aria-checked", active ? "true" : "false");
+  }
+  paintCustomSwatch(hex);
+  accentCustomPicker?.setHex?.(hex);
+  if (accentCustomHex && document.activeElement !== accentCustomHex) {
+    accentCustomHex.value = hex;
+  }
+  const showEditor = options.showCustomEditor === true
+    || (options.showCustomEditor !== false && accent === "custom");
+  if (accentCustomPanel) {
+    accentCustomPanel.hidden = !showEditor;
+  }
+  if (!showEditor) {
+    accentCustomPicker?.close?.();
   }
 }
 

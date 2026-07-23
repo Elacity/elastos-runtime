@@ -1076,8 +1076,12 @@ assert(
     shellWindows.includes("never leave a hidden fullscreen Space ghost") &&
     shellSurface.includes("Keep the wave alive across the tiny gaps") &&
     shellSurface.includes("Mild Shelf wave") &&
-    homeGuiStyle.includes("#e85d4c") &&
+    homeGuiStyle.includes("#f04f5f") &&
+    homeGuiStyle.includes("#aeb4be") &&
+    homeGuiStyle.includes("var(--el-accent, #4f7fff)") &&
+    homeGuiStyle.includes("border-radius: 50%") &&
     homeGuiStyle.includes("ElastOS window tools") &&
+    homeGuiStyle.includes("dynamic system accent") &&
     shellExpose.includes("missionExiting") &&
     shellExpose.includes("pendingMissionFinish") &&
     shellExpose.includes("isActive: () => active || missionExiting") &&
@@ -1824,8 +1828,8 @@ const gbaLiveSmoke = read("scripts/gba-live-smoke.mjs");
 const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
 const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
-const homeAssetVersion = "home-20260721b";
-const homeGuiAssetVersion = "home-20260723a";
+const homeAssetVersion = "home-20260723a";
+const homeGuiAssetVersion = "home-20260723l";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -2117,9 +2121,10 @@ assert(
 );
 assert(
   !shellIndex.includes(`/apps/home-gui/style.css?v=${homeGuiAssetVersion}`) &&
+    homeGuiIndex.includes(`./elastos-ui.css?v=${homeGuiAssetVersion}`) &&
     homeGuiIndex.includes(`./style.css?v=${homeGuiAssetVersion}`) &&
     homeGuiIndex.includes(`./home-gui-shell.js?v=${homeGuiAssetVersion}`),
-  "Home GUI must own its document, stylesheet, and entry module on its isolated capsule origin",
+  "Home GUI must own its document, token sheet, stylesheet, and entry module on its isolated capsule origin",
 );
 assert(
   !shellJs.includes("home-gui/browser") &&
@@ -10655,12 +10660,16 @@ assert(
 assert(
   shellJs.includes('data.type === "home:ui-preference"') &&
     shellJs.includes("UI_PREFERENCE_KEYS") &&
+    shellJs.includes("normalizeAccentCustomHex") &&
+    shellJs.includes('"custom"') &&
     shellJs.includes("pushUiPreferencesToActiveShell") &&
     homeGuiShell.includes('command === "ui-preference"') &&
     homeGuiJs.includes("applyHomeGuiUiPreferences") &&
+    homeGuiJs.includes("accentCustom") &&
     homeGuiJs.includes('type: "elastos:ui-preference"') &&
     systemJs.includes("configureThemeSegment") &&
     systemJs.includes("configureDockAutoHide") &&
+    systemJs.includes("accentCustom") &&
     systemJs.includes('type: "home:ui-preference"'),
   "Shell UI preferences must flow System/GUI -> host store -> GUI apply/fan-out (no opaque-frame localStorage)",
 );

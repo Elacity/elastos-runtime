@@ -13,9 +13,11 @@ cd "$(dirname "$0")/.."
 
 SOURCE_CSS="capsules/_shared/elastos-ui.css"
 SOURCE_JS="capsules/_shared/elastos-theme.js"
+SOURCE_PICKER_JS="capsules/_shared/elastos-accent-picker.js"
 SOURCE_FONT="capsules/_shared/fonts/Inter-latin-var.woff2"
 HEADER="/* GENERATED from ${SOURCE_CSS} — do not edit. Run \`just vendor-ui\`. */"
 JS_HEADER="/* GENERATED from ${SOURCE_JS} — do not edit. Run \`just vendor-ui\`. */"
+PICKER_JS_HEADER="/* GENERATED from ${SOURCE_PICKER_JS} — do not edit. Run \`just vendor-ui\`. */"
 
 # Capsules that consume the shared tokens today. Extend as apps migrate.
 # Entries are the browser-serving dir relative to capsules/ — most apps serve
@@ -56,6 +58,11 @@ stamped_js_source() {
   cat "$SOURCE_JS"
 }
 
+stamped_picker_js_source() {
+  printf '%s\n' "$PICKER_JS_HEADER"
+  cat "$SOURCE_PICKER_JS"
+}
+
 for target_dir in "${TARGETS[@]}"; do
   browser_dir="capsules/${target_dir}"
   css_target="${browser_dir}/elastos-ui.css"
@@ -68,6 +75,7 @@ for target_dir in "${TARGETS[@]}"; do
   fi
 
   js_target="${browser_dir}/elastos-theme.js"
+  picker_js_target="${browser_dir}/elastos-accent-picker.js"
 
   if [[ "$MODE" == "--check" ]]; then
     if [[ ! -f "$css_target" ]] || ! diff -q <(stamped_source) "$css_target" >/dev/null 2>&1; then
@@ -78,6 +86,10 @@ for target_dir in "${TARGETS[@]}"; do
       echo "[vendor-ui] DRIFT: ${js_target} does not match ${SOURCE_JS}" >&2
       FAILED=1
     fi
+    if [[ ! -f "$picker_js_target" ]] || ! diff -q <(stamped_picker_js_source) "$picker_js_target" >/dev/null 2>&1; then
+      echo "[vendor-ui] DRIFT: ${picker_js_target} does not match ${SOURCE_PICKER_JS}" >&2
+      FAILED=1
+    fi
     if [[ ! -f "$font_target" ]] || ! cmp -s "$SOURCE_FONT" "$font_target"; then
       echo "[vendor-ui] DRIFT: ${font_target} does not match ${SOURCE_FONT}" >&2
       FAILED=1
@@ -86,6 +98,7 @@ for target_dir in "${TARGETS[@]}"; do
     mkdir -p "$font_dir"
     stamped_source > "$css_target"
     stamped_js_source > "$js_target"
+    stamped_picker_js_source > "$picker_js_target"
     cp "$SOURCE_FONT" "$font_target"
     echo "[vendor-ui] stamped ${css_target}"
   fi

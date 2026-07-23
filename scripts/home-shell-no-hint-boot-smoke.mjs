@@ -44,7 +44,6 @@ const homeGuiSelectors = [
   "#launcher-empty-state",
   "#launcher-search",
   "#launcher-toggle",
-  "#close-launcher",
   "#toolbar-home",
   "#toolbar-inbox",
   "#toolbar-inbox-count",

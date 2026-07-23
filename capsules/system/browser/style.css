@@ -263,13 +263,13 @@ code {
 }
 
 .shell-choice:focus-visible {
-  outline: 2px solid rgba(59, 130, 246, 0.35);
+  outline: 2px solid color-mix(in srgb, var(--el-accent, #4f7fff) 40%, transparent);
   outline-offset: 2px;
 }
 
 .shell-choice[data-current="true"] {
-  border-color: #2563eb;
-  box-shadow: 0 0 0 1px #2563eb;
+  border-color: var(--el-accent, #4f7fff);
+  box-shadow: 0 0 0 1px var(--el-accent, #4f7fff);
 }
 
 .shell-choice:disabled:not([data-current="true"]) {
@@ -353,7 +353,7 @@ code {
   padding: 2px 7px;
   border-radius: 4px;
   background: rgba(255, 255, 255, 0.92);
-  color: #1d4ed8;
+  color: var(--el-accent, #4f7fff);
   font-size: 10px;
   font-weight: 700;
 }
@@ -664,6 +664,63 @@ code {
 .system-accent-dot[data-accent-option="graphite"] {
   background: #8e8e93;
   color: #8e8e93;
+}
+
+.system-accent-dot-custom {
+  background: conic-gradient(
+    from 180deg,
+    #4f7fff,
+    #bf5af2,
+    #ff375f,
+    #f6921a,
+    #ffd60a,
+    #30b84f,
+    #4f7fff
+  );
+  color: #4f7fff;
+}
+
+.system-accent-custom-popover {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--color-border, var(--el-hairline));
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--el-surface-raised, #fff) 94%, transparent);
+  box-shadow: var(--el-shadow-1, 0 2px 10px rgba(0, 0, 0, 0.08));
+}
+
+.system-accent-custom-popover[hidden] {
+  display: none;
+}
+
+.system-accent-custom-hex {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--color-text-muted, var(--el-muted));
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.system-accent-custom-hex input {
+  width: 6rem;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--color-border, var(--el-hairline));
+  border-radius: 10px;
+  background: var(--el-inset, rgba(0, 0, 0, 0.04));
+  color: var(--color-text-primary, var(--el-text));
+  font: inherit;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.system-accent-custom-hex input:focus {
+  outline: 2px solid var(--el-focus);
+  outline-offset: 1px;
 }
 
 .system-switch input {

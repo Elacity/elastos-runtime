@@ -32,7 +32,8 @@
   --el-soft: rgba(245, 247, 250, 0.48);
   --el-brand: #f6921a;
   --el-brand-strong: #ffb457;
-  --el-focus: rgba(246, 146, 26, 0.55);
+  /* Focus rings follow the live system accent. */
+  --el-focus: color-mix(in srgb, var(--el-accent) 55%, transparent);
   --el-danger: #ff8f8f;
   --el-ok: #34d399;
 
@@ -78,28 +79,30 @@
   --el-dur-exit: 150ms;
   --el-ease: cubic-bezier(0.2, 0, 0, 1);
 
-  /* System accent — ONE accent, chosen by the user in System > Personalization
-     (macOS model), obeyed by every app. Selected via data-el-accent on <html>
-     (absence = blue). Apps consume the derived tones and never define their own
-     accent colors. */
-  --el-accent: #0a84ff;
+  /* System accent — electric blue by default (matches theme runtime:
+     absence of data-el-accent = blue). Orange remains a selectable accent.
+     Apps consume derived tones only. */
+  --el-accent: #4f7fff;
   --el-accent-ink: #ffffff;
   --el-accent-strong: color-mix(in srgb, var(--el-accent) 78%, #ffffff);
   --el-accent-soft: color-mix(in srgb, var(--el-accent) 22%, transparent);
   --el-accent-faint: color-mix(in srgb, var(--el-accent) 11%, transparent);
 }
 
-/* The eight macOS accents. Yellow and orange carry dark ink on filled controls. */
+/* ElastOS accent set (not Apple Personalization octad). */
 :root[data-el-accent="purple"] {
-  --el-accent: #bf5af2;
+  --el-accent: #8b5cf6;
+  --el-accent-ink: #ffffff;
 }
 
 :root[data-el-accent="pink"] {
-  --el-accent: #ff375f;
+  --el-accent: #db2777;
+  --el-accent-ink: #ffffff;
 }
 
 :root[data-el-accent="red"] {
-  --el-accent: #ff453a;
+  --el-accent: #e85d4c;
+  --el-accent-ink: #ffffff;
 }
 
 :root[data-el-accent="orange"] {
@@ -108,16 +111,143 @@
 }
 
 :root[data-el-accent="yellow"] {
-  --el-accent: #ffd60a;
+  --el-accent: #e6b422;
   --el-accent-ink: #161616;
 }
 
 :root[data-el-accent="green"] {
-  --el-accent: #30b84f;
+  --el-accent: #34d399;
+  --el-accent-ink: #161616;
 }
 
 :root[data-el-accent="graphite"] {
-  --el-accent: #8e8e93;
+  --el-accent: #64748b;
+  --el-accent-ink: #ffffff;
+}
+
+:root[data-el-accent="blue"] {
+  --el-accent: #4f7fff;
+  --el-accent-ink: #ffffff;
+}
+
+/* Custom accent: --el-accent / --el-accent-ink are set inline by elastos-theme.js.
+   soft/strong/faint already track var(--el-accent). */
+:root[data-el-accent="custom"] {
+  --el-accent-ink: #ffffff;
+}
+
+/* In-app accent picker (rounded ElastOS chrome — not the OS color dialog). */
+.el-accent-picker {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.el-accent-picker-swatch {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  border-radius: 10px;
+  background: var(--el-accent, #4f7fff);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.35),
+    0 1px 2px rgba(0, 0, 0, 0.08);
+  cursor: pointer;
+  transition: transform 120ms var(--el-ease, cubic-bezier(0.2, 0, 0, 1));
+}
+
+.el-accent-picker-swatch:hover {
+  transform: scale(1.06);
+}
+
+.el-accent-picker-swatch:focus-visible {
+  outline: 2px solid var(--el-focus);
+  outline-offset: 2px;
+}
+
+.el-accent-picker-pop {
+  position: absolute;
+  left: 0;
+  top: calc(100% + 8px);
+  z-index: 40;
+  display: grid;
+  gap: 10px;
+  width: 196px;
+  padding: 12px;
+  border: 1px solid var(--el-hairline, rgba(0, 0, 0, 0.12));
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--el-surface-raised, #ffffff) 94%, transparent);
+  box-shadow: var(--el-shadow-2, 0 12px 28px rgba(0, 0, 0, 0.22));
+  backdrop-filter: blur(var(--el-blur-2, 16px));
+}
+
+.el-accent-picker-pop[hidden] {
+  display: none;
+}
+
+.el-accent-picker-sv {
+  position: relative;
+  width: 100%;
+  height: 132px;
+  border-radius: 12px;
+  overflow: hidden;
+  cursor: crosshair;
+  touch-action: none;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.08);
+}
+
+.el-accent-picker-sv-thumb {
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35), 0 2px 6px rgba(0, 0, 0, 0.25);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.el-accent-picker-hue {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 14px;
+  margin: 0;
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    #ff0000,
+    #ffff00,
+    #00ff00,
+    #00ffff,
+    #0000ff,
+    #ff00ff,
+    #ff0000
+  );
+  outline: none;
+  cursor: pointer;
+}
+
+.el-accent-picker-hue::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: var(--el-accent-picker-hue, #4f7fff);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.28), 0 1px 4px rgba(0, 0, 0, 0.2);
+  cursor: pointer;
+}
+
+.el-accent-picker-hue::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: var(--el-accent-picker-hue, #4f7fff);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.28), 0 1px 4px rgba(0, 0, 0, 0.2);
+  cursor: pointer;
 }
 
 /* Light theme: dark is the default (no attribute); the shell sets
@@ -136,7 +266,7 @@
   --el-soft: rgba(29, 36, 56, 0.5);
   --el-brand: #f6921a;
   --el-brand-strong: #e07f0a;
-  --el-focus: rgba(246, 146, 26, 0.55);
+  --el-focus: color-mix(in srgb, var(--el-accent) 55%, transparent);
   --el-danger: #b14c5a;
   --el-ok: #0a7a52;
 

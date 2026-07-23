@@ -5,8 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>System · ElastOS</title>
 <script src="./elastos-theme.js"></script>
+<script src="./elastos-accent-picker.js"></script>
 <link rel="stylesheet" href="./elastos-ui.css">
-<link rel="stylesheet" href="./style.css?v=system-20260720b">
+<link rel="stylesheet" href="./style.css?v=system-20260723c">
 </head>
 <body>
   <section id="system-locked" class="system-locked" hidden>
@@ -166,7 +167,15 @@
                     <button type="button" class="system-accent-dot" data-accent-option="yellow" role="radio" aria-checked="false" aria-label="Yellow" title="Yellow"></button>
                     <button type="button" class="system-accent-dot" data-accent-option="green" role="radio" aria-checked="false" aria-label="Green" title="Green"></button>
                     <button type="button" class="system-accent-dot" data-accent-option="graphite" role="radio" aria-checked="false" aria-label="Graphite" title="Graphite"></button>
+                    <button type="button" class="system-accent-dot system-accent-dot-custom" data-accent-option="custom" role="radio" aria-checked="false" aria-label="Custom" title="Custom color"></button>
                   </div>
+                </div>
+                <div id="accent-custom-popover" class="system-accent-custom-popover" hidden>
+                  <div id="accent-custom-picker" class="el-accent-picker"></div>
+                  <label class="system-accent-custom-hex">
+                    <span>Hex</span>
+                    <input id="accent-custom-hex" type="text" maxlength="7" spellcheck="false" autocomplete="off" placeholder="#4f7fff" aria-label="Custom accent hex" />
+                  </label>
                 </div>
               </div>
               <div class="pc2-group-row">
@@ -408,6 +417,6 @@
 
     <p class="system-error" hidden></p>
   </main>
-  <script type="module" src="./system.js?v=system-20260720b"></script>
+  <script type="module" src="./system.js?v=system-20260723c"></script>
 </body>
 </html>

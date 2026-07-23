@@ -666,7 +666,7 @@ import { createLibraryUploads } from "./uploads.js";
         button.draggable = true;
         button.title = "Drag to reorder";
         button.innerHTML = `
-          ${iconPlaceholder(placeIcon(root), "place-icon window-sidebar-item-icon")}
+          ${placeIconMarkup(root)}
           <span class="place-label">${escapeHtml(root.label)}</span>
         `;
         elements.places.appendChild(button);
@@ -738,6 +738,18 @@ import { createLibraryUploads } from "./uploads.js";
         public: "icons/sidebar-folder-public.svg",
         webspaces: "icons/sidebar-folder.svg",
       }[id] || "icons/sidebar-folder.svg";
+    }
+
+    /* Favorites icons paint with --el-accent via CSS mask (SVGs are baked #0063f4).
+       Trash keeps its rendered asset. */
+    function placeIconMarkup(root) {
+      const id = typeof root === "string" ? root : root?.id;
+      const src = placeIcon(root);
+      if (id === "trash") {
+        return iconPlaceholder(src, "place-icon window-sidebar-item-icon");
+      }
+      const safeSrc = escapeHtml(src);
+      return `<span class="place-icon place-icon-accent window-sidebar-item-icon" style="--place-mask: url(&quot;${safeSrc}&quot;)" aria-hidden="true"></span>`;
     }
 
     function renderBreadcrumbs() {

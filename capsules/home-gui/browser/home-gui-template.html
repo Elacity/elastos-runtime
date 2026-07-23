@@ -197,6 +197,13 @@
   <div class="control-centre-section" aria-label="Accent">
     <div class="control-centre-label">Accent</div>
     <div id="control-centre-accent" class="control-centre-accents" role="radiogroup" aria-label="Accent color"></div>
+    <div id="control-centre-accent-custom" class="control-centre-accent-custom" hidden>
+      <div id="control-centre-accent-picker" class="el-accent-picker"></div>
+      <label class="control-centre-accent-custom-hex">
+        <span>Hex</span>
+        <input id="control-centre-accent-hex" type="text" maxlength="7" spellcheck="false" autocomplete="off" placeholder="#4f7fff" aria-label="Custom accent hex" />
+      </label>
+    </div>
   </div>
   <div class="control-centre-divider" role="separator"></div>
   <div class="control-centre-section" aria-label="Attention">
@@ -493,9 +500,6 @@
         aria-label="Switch to list view"
         aria-pressed="false"
       ></button>
-      <button id="close-launcher" class="launcher-close launcher-header-btn" type="button" aria-label="Close launcher">
-        <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
-      </button>
     </div>
     <div class="launcher-scroll hide-scrollbar">
       <h1 class="launcher-heading visually-hidden">Apps</h1>
@@ -734,6 +738,8 @@
       </span>
       <span class="active-taskbar-indicator" aria-hidden="true"></span>
     </button>
-    <button class="taskbar-window-count" type="button" hidden></button>
+    <button class="taskbar-window-count" type="button" hidden>
+      <span class="taskbar-window-count-chip"></span>
+    </button>
   </div>
 </template>

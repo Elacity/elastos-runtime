@@ -501,25 +501,113 @@ function configureAccentPicker() {
     return;
   }
   const options = picker.querySelectorAll("[data-accent-option]");
+  const customPanel = document.querySelector("#accent-custom-popover");
+  const customPickerRoot = document.querySelector("#accent-custom-picker");
+  const hexInput = document.querySelector("#accent-custom-hex");
+  let customWriteTimer = 0;
+  let customPicker = null;
+
+  const paintCustom = (hex) => {
+    const swatch = picker.querySelector('[data-accent-option="custom"]');
+    if (swatch) {
+      swatch.style.background = hex;
+      swatch.style.color = hex;
+    }
+  };
+
   const sync = (accent) => {
+    const hex = window.elastosTheme.accentCustom?.() || "#4f7fff";
     for (const option of options) {
       const selected = option.dataset.accentOption === accent;
       option.classList.toggle("active", selected);
       option.setAttribute("aria-checked", selected ? "true" : "false");
     }
+    paintCustom(hex);
+    customPicker?.setHex?.(hex);
+    if (hexInput && document.activeElement !== hexInput) {
+      hexInput.value = hex;
+    }
+    if (customPanel) {
+      customPanel.hidden = accent !== "custom";
+    }
+    if (accent !== "custom") {
+      customPicker?.close?.();
+    }
   };
-  for (const option of options) {
-    option.addEventListener("click", () => {
-      window.elastosTheme.setAccent(option.dataset.accentOption);
-      sync(window.elastosTheme.accent());
-      postUiPreference("accent", option.dataset.accentOption);
+
+  const commitCustom = (raw, { fromWheel }) => {
+    const hex = window.elastosTheme.normalizeHex?.(raw) || "";
+    if (!hex) {
+      if (hexInput && !fromWheel) {
+        hexInput.value = window.elastosTheme.accentCustom?.() || "#4f7fff";
+      }
+      return;
+    }
+    window.elastosTheme.setAccentCustom(hex);
+    if (window.elastosTheme.accent() !== "custom") {
+      window.elastosTheme.setAccent("custom");
+      postUiPreference("accent", "custom");
+    }
+    if (hexInput && (!fromWheel || document.activeElement !== hexInput)) {
+      hexInput.value = hex;
+    }
+    if (!fromWheel) {
+      customPicker?.setHex?.(hex);
+    }
+    paintCustom(hex);
+    window.clearTimeout(customWriteTimer);
+    customWriteTimer = window.setTimeout(() => {
+      postUiPreference("accentCustom", hex);
+    }, fromWheel ? 120 : 0);
+    sync("custom");
+  };
+
+  if (customPickerRoot && window.elastosAccentPicker?.mount) {
+    customPicker = window.elastosAccentPicker.mount(customPickerRoot, {
+      getHex: () => window.elastosTheme.accentCustom?.() || "#4f7fff",
+      onChange: (hex) => {
+        commitCustom(hex, { fromWheel: true });
+      },
     });
   }
+
+  for (const option of options) {
+    option.addEventListener("click", () => {
+      const next = option.dataset.accentOption;
+      if (next === "custom") {
+        const hex = window.elastosTheme.accentCustom?.() || "#4f7fff";
+        window.elastosTheme.setAccentCustom(hex);
+        window.elastosTheme.setAccent("custom");
+        postUiPreference("accentCustom", hex);
+        postUiPreference("accent", "custom");
+        sync("custom");
+        customPicker?.open?.();
+        return;
+      }
+      window.elastosTheme.setAccent(next);
+      sync(next);
+      postUiPreference("accent", next);
+    });
+  }
+  hexInput?.addEventListener("change", () => {
+    commitCustom(hexInput.value, { fromWheel: false });
+  });
+  hexInput?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      commitCustom(hexInput.value, { fromWheel: false });
+    }
+  });
   sync(window.elastosTheme.accent());
   readUiPreferencesFromHome().then((preferences) => {
+    if (typeof preferences.accentCustom === "string") {
+      window.elastosTheme.setAccentCustom(preferences.accentCustom);
+    }
     if (typeof preferences.accent === "string") {
       window.elastosTheme.setAccent(preferences.accent);
       sync(preferences.accent);
+    } else {
+      sync(window.elastosTheme.accent());
     }
   });
 }

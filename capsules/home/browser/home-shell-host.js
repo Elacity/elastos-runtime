@@ -16,7 +16,7 @@ import {
   shellState,
   fetchJson,
   targetById,
-} from "./shell-core.js?v=home-20260721b";
+} from "./shell-core.js?v=home-20260723a";
 import {
   bindHomeUnlock,
   clearHomeSessionLock,
@@ -28,7 +28,7 @@ import {
   requestPasskeyHomeAuthority,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260721b";
+} from "./shell-auth.js?v=home-20260723a";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
@@ -313,12 +313,33 @@ function relayConnectorSheetAnswerToPopup(context, data) {
    key set, values are short enums — cosmetic state only, no authority. */
 const UI_PREFERENCE_KEYS = Object.freeze({
   theme: new Set(["auto", "light", "dark"]),
-  accent: new Set(["blue", "purple", "pink", "red", "orange", "yellow", "green", "graphite"]),
+  accent: new Set([
+    "blue",
+    "purple",
+    "pink",
+    "red",
+    "orange",
+    "yellow",
+    "green",
+    "graphite",
+    "custom",
+  ]),
   dockAutoHide: new Set(["on", "off"]),
   sounds: new Set(["on", "off"]),
   focusMode: new Set(["on", "off"]),
 });
 const UI_PREFERENCE_STORE_PREFIX = "elastos.ui.";
+
+function normalizeAccentCustomHex(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  const hex = value.trim();
+  if (!/^#[0-9A-Fa-f]{6}$/.test(hex)) {
+    return "";
+  }
+  return hex.toLowerCase();
+}
 
 function readUiPreferences() {
   const preferences = {};
@@ -332,22 +353,38 @@ function readUiPreferences() {
       // Host storage unavailable — defaults apply.
     }
   }
+  try {
+    const custom = normalizeAccentCustomHex(
+      window.localStorage?.getItem(`${UI_PREFERENCE_STORE_PREFIX}accentCustom`) || "",
+    );
+    if (custom) {
+      preferences.accentCustom = custom;
+    }
+  } catch (_error) {
+    // Host storage unavailable — defaults apply.
+  }
   return preferences;
 }
 
 function writeUiPreference(key, value) {
-  if (!UI_PREFERENCE_KEYS[key]?.has(value)) {
+  let stored = value;
+  if (key === "accentCustom") {
+    stored = normalizeAccentCustomHex(value);
+    if (!stored) {
+      return false;
+    }
+  } else if (!UI_PREFERENCE_KEYS[key]?.has(value)) {
     return false;
   }
   try {
-    window.localStorage?.setItem(`${UI_PREFERENCE_STORE_PREFIX}${key}`, value);
+    window.localStorage?.setItem(`${UI_PREFERENCE_STORE_PREFIX}${key}`, stored);
   } catch (_error) {
     // Still relay: the GUI applies for this session even without persistence.
   }
   postToActiveShell({
     type: "home:gui-command",
     command: "ui-preference",
-    preferences: { [key]: value },
+    preferences: { [key]: stored },
   });
   return true;
 }

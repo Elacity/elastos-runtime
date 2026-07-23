@@ -50,7 +50,7 @@ import {
   mutateDesktopObject,
   formatBadgeCount,
   focusModeEnabled,
-} from "./shell-core.js?v=home-20260723a";
+} from "./shell-core.js?v=home-20260723l";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -64,19 +64,19 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260723a";
-import { playUiSound } from "./shell-sounds.js?v=home-20260723a";
+} from "./shell-windows.js?v=home-20260723l";
+import { playUiSound } from "./shell-sounds.js?v=home-20260723l";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
   setOverlayOpen,
-} from "./shell-popovers.js?v=home-20260723a";
+} from "./shell-popovers.js?v=home-20260723l";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20260723a";
-import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260723a";
-import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260723a";
+} from "./shell-motion.js?v=home-20260723l";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260723l";
+import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260723l";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -526,7 +526,9 @@ function syncTaskbarGroupButton(entry, targetId, title, openCount) {
     return;
   }
   countButton.hidden = openCount <= 1;
-  countButton.textContent = String(openCount);
+  const chip =
+    countButton.querySelector(".taskbar-window-count-chip") || countButton;
+  chip.textContent = String(openCount);
   countButton.title = `Manage ${title} windows`;
   countButton.setAttribute("aria-label", `Manage ${title}. ${openCount} windows open.`);
   const openGroupMenu = (event) => {
@@ -2381,9 +2383,11 @@ function rebuildDockIconCache() {
     dockState.taskbar.querySelectorAll(".taskbar-item:not(.taskbar-item-launcher)"),
   ).map((item) => {
     const rect = item.getBoundingClientRect();
+    const entry = item.closest(".taskbar-entry");
     return {
       node: item.querySelector(".taskbar-icon"),
       item,
+      count: entry?.querySelector(".taskbar-window-count") || null,
       center: rect.left + rect.width / 2,
     };
   });
@@ -2408,6 +2412,9 @@ function resetDockMagnification() {
   for (const entry of dockState.icons) {
     if (entry.node) {
       entry.node.style.transform = "";
+    }
+    if (entry.count) {
+      entry.count.style.transform = "";
     }
     entry.item?.style.removeProperty("--dock-shift");
   }
@@ -2457,11 +2464,19 @@ function applyDockMagnification() {
     }
     if (scale <= 1.004 && Math.abs(shift) < 0.5) {
       entry.node.style.transform = "";
+      if (entry.count) {
+        entry.count.style.transform = "";
+      }
       entry.item?.style.removeProperty("--dock-shift");
       continue;
     }
     const lift = -(scale - 1) * DOCK_ICON_BASE_PX * DOCK_MAG_LIFT_RATIO;
-    entry.node.style.transform = `translate(${shift.toFixed(2)}px, ${lift.toFixed(2)}px) scale(${scale.toFixed(3)})`;
+    const transform = `translate(${shift.toFixed(2)}px, ${lift.toFixed(2)}px) scale(${scale.toFixed(3)})`;
+    entry.node.style.transform = transform;
+    /* Window-count sits on the same 40×40 icon slot with matching origin. */
+    if (entry.count) {
+      entry.count.style.transform = transform;
+    }
     entry.item?.style.setProperty("--dock-shift", `${shift.toFixed(2)}px`);
   }
   /* Keep launcher paint-static even if a stale transform lingered. */

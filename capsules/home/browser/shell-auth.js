@@ -4,7 +4,7 @@ import {
   fetchJson,
   setHomeAuthorityToken,
   trapTabWithin,
-} from "./shell-core.js?v=home-20260721b";
+} from "./shell-core.js?v=home-20260723a";
 
 const HOME_SESSION_LOCK_KEY = "elastos.home.session_lock";
 

@@ -46,7 +46,8 @@
     }
 
     :root[data-el-theme="light"] .place[data-active="true"] {
-      color: var(--el-accent);
+      /* Selection stays ink + lift — accent personalizes chrome, not sidebar labels. */
+      color: var(--ink);
       background: var(--el-lift-strong);
     }
 
@@ -414,14 +415,10 @@
 
     .place[data-active="true"] {
       border-color: transparent;
-      color: var(--el-accent);
+      /* Labels stay ink; icons track accent (see .place-icon-accent). */
+      color: var(--ink);
       background: var(--el-lift-strong);
       font-weight: 600;
-    }
-
-    .place[data-active="true"] .place-icon img,
-    .place[data-active="true"] .place-icon svg {
-      filter: brightness(0) saturate(100%) invert(36%) sepia(99%) saturate(1942%) hue-rotate(192deg) brightness(101%) contrast(104%);
     }
 
     .place-icon,
@@ -439,6 +436,17 @@
       width: 16px;
       height: 16px;
       display: block;
+    }
+
+    /* Favorites glyphs: mask the asset and fill with live system accent. */
+    .place-icon-accent {
+      width: 16px;
+      height: 16px;
+      background-color: var(--el-accent, #4f7fff);
+      -webkit-mask: var(--place-mask) center / 16px 16px no-repeat;
+      mask: var(--place-mask) center / 16px 16px no-repeat;
+      filter: none;
+      transition: background-color 0.16s ease;
     }
 
     .inline-icon {
@@ -750,8 +758,8 @@
     }
 
     .content[data-view="grid"] .item[data-selected="true"] .item-name {
-      background: var(--brand);
-      color: #161616;
+      background: var(--el-accent, #4f7fff);
+      color: var(--el-accent-ink, #ffffff);
     }
 
     .content[data-view="grid"] .item[data-selected="true"] .file-icon {
@@ -1050,7 +1058,11 @@
       width: var(--progress, 0%);
       height: 100%;
       border-radius: inherit;
-      background: linear-gradient(90deg, var(--accent), var(--brand));
+      background: linear-gradient(
+        90deg,
+        color-mix(in srgb, var(--el-accent, #4f7fff) 72%, #ffffff),
+        var(--el-accent, #4f7fff)
+      );
       transition: width 160ms ease;
     }
 
@@ -1124,7 +1136,7 @@
     }
 
     .menu-item:hover {
-      background: #0a84ff;
+      background: var(--el-accent, #4f7fff);
       color: #fff;
     }
 

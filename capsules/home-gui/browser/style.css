@@ -15,11 +15,12 @@
   --soft: rgba(245, 247, 250, 0.48);
   --brand: #f6921a;
   --brand-strong: #ffb457;
-  --brand-focus: rgba(246, 146, 26, 0.55);
-  --brand-border: rgba(246, 146, 26, 0.72);
-  --brand-ring: rgba(246, 146, 26, 0.24);
-  --brand-glow: rgba(246, 146, 26, 0.26);
-  --brand-line: rgba(246, 146, 26, 0.45);
+  /* Focus / ring helpers follow the live system accent (not fixed brand orange). */
+  --brand-focus: color-mix(in srgb, var(--el-accent, #4f7fff) 55%, transparent);
+  --brand-border: color-mix(in srgb, var(--el-accent, #4f7fff) 72%, transparent);
+  --brand-ring: color-mix(in srgb, var(--el-accent, #4f7fff) 24%, transparent);
+  --brand-glow: color-mix(in srgb, var(--el-accent, #4f7fff) 26%, transparent);
+  --brand-line: color-mix(in srgb, var(--el-accent, #4f7fff) 45%, transparent);
   --shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
   --shadow-soft: 0 12px 28px rgba(0, 0, 0, 0.22);
   --popover-radius: 14px;
@@ -32,7 +33,7 @@
   --bar-menu-item-gap: 0.65rem;
   --bar-menu-font: 0.88rem;
   --bar-menu-divider-margin: 4px 8px;
-  --bar-menu-hover: var(--brand);
+  --bar-menu-hover: var(--el-accent, #4f7fff);
   --window-head-hue: 214;
   --window-head-saturation: 7%;
   --window-head-lightness: 40%;
@@ -592,9 +593,8 @@ img {
   filter: invert(1) hue-rotate(180deg);
 }
 
-:root[data-el-theme="light"] .toolbar-inbox-count {
-  filter: invert(1) hue-rotate(180deg);
-}
+/* Inbox badge uses live accent + accent-ink — no light-theme invert (that was
+   for the old brand-orange pill). */
 
 .inbox-btn {
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6.5 8.5a5.5 5.5 0 1 1 11 0c0 5.5 2.5 6.5 2.5 6.5H4s2.5-1 2.5-6.5'/%3E%3Cpath d='M10 18a2 2 0 0 0 4 0'/%3E%3C/svg%3E");
@@ -610,8 +610,8 @@ img {
   display: grid;
   place-items: center;
   border-radius: 999px;
-  background: var(--brand);
-  color: #111;
+  background: var(--el-accent, #4f7fff);
+  color: var(--el-accent-ink, #ffffff);
   font-size: 9px;
   font-weight: 700;
   line-height: 1;
@@ -743,8 +743,8 @@ img {
   display: grid;
   place-items: center;
   border-radius: 999px;
-  background: var(--brand);
-  color: #111;
+  background: var(--el-accent, #4f7fff);
+  color: var(--el-accent-ink, #ffffff);
   font-size: 9px;
   font-weight: 700;
   line-height: 1;
@@ -897,13 +897,13 @@ img {
 }
 
 .control-centre-accent-swatch:focus-visible {
-  outline: 2px solid var(--brand);
+  outline: 2px solid var(--el-accent, #4f7fff);
   outline-offset: 2px;
 }
 
 .control-centre-accent-swatch[data-accent-option="blue"] {
-  background: #3b82f6;
-  color: #3b82f6;
+  background: #4f7fff;
+  color: #4f7fff;
 }
 
 .control-centre-accent-swatch[data-accent-option="purple"] {
@@ -939,6 +939,64 @@ img {
 .control-centre-accent-swatch[data-accent-option="graphite"] {
   background: #64748b;
   color: #64748b;
+}
+
+.control-centre-accent-swatch-custom {
+  background: conic-gradient(
+    from 180deg,
+    #4f7fff,
+    #8b5cf6,
+    #db2777,
+    #f6921a,
+    #e6b422,
+    #34d399,
+    #4f7fff
+  );
+  color: #4f7fff;
+}
+
+.control-centre-accent-custom {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0.85rem 0.35rem;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid var(--hairline);
+  border-radius: 14px;
+  background: var(--panel-soft);
+}
+
+.control-centre-accent-custom[hidden] {
+  display: none;
+}
+
+.control-centre-accent-custom-hex {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.control-centre-accent-custom-hex input {
+  width: 5.6rem;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  background: var(--panel-strong, var(--panel));
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.control-centre-accent-custom-hex input:focus {
+  outline: none;
+  border-color: var(--brand-border);
+  box-shadow: 0 0 0 2px var(--brand-focus);
 }
 
 .control-centre-divider {
@@ -1042,7 +1100,7 @@ img {
 
 .control-centre-row[aria-checked="true"] .control-centre-switch,
 .control-centre-row[aria-checked="true"]:hover .control-centre-switch {
-  background: var(--brand);
+  background: var(--el-accent, #4f7fff);
 }
 
 .control-centre-row[aria-checked="true"] .control-centre-switch::after {
@@ -1436,8 +1494,8 @@ img {
 }
 
 .nc-cal-day.is-today {
-  background: var(--brand, var(--el-accent, #5b8cff));
-  color: #111;
+  background: var(--el-accent, #4f7fff);
+  color: var(--el-accent-ink, #ffffff);
   font-weight: 700;
 }
 
@@ -1645,8 +1703,8 @@ img {
   min-height: 28px;
   padding: 0 12px;
   border-radius: 6px;
-  background: var(--brand);
-  color: #17110a;
+  background: var(--el-accent, #4f7fff);
+  color: var(--el-accent-ink, #ffffff);
   font-size: 12px;
   font-weight: 700;
 }
@@ -1717,8 +1775,8 @@ img {
 }
 
 .desktop-shortcut.selected {
-  background: rgba(112, 168, 255, 0.18);
-  box-shadow: inset 0 0 0 1px rgba(176, 214, 255, 0.42);
+  background: color-mix(in srgb, var(--el-accent, #4f7fff) 22%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--el-accent, #4f7fff) 48%, transparent);
 }
 
 .desktop-shortcut.drag-source {
@@ -2831,8 +2889,8 @@ body.expose-active .expose-empty {
 }
 
 .desktop-shortcut.editing {
-  background: rgba(112, 168, 255, 0.18);
-  box-shadow: inset 0 0 0 1px rgba(176, 214, 255, 0.42);
+  background: color-mix(in srgb, var(--el-accent, #4f7fff) 22%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--el-accent, #4f7fff) 48%, transparent);
 }
 
 .desktop-shortcut-rename {
@@ -2863,9 +2921,9 @@ body.expose-active .expose-empty {
   position: absolute;
   z-index: 4;
   border-radius: 16px;
-  background: rgba(144, 195, 255, 0.12);
+  background: color-mix(in srgb, var(--el-accent, #4f7fff) 14%, transparent);
   box-shadow:
-    inset 0 0 0 1px rgba(180, 220, 255, 0.55),
+    inset 0 0 0 1px color-mix(in srgb, var(--el-accent, #4f7fff) 55%, transparent),
     0 18px 40px rgba(0, 0, 0, 0.16);
   backdrop-filter: blur(10px);
   pointer-events: none;
@@ -3092,7 +3150,7 @@ body.dock-autohide::after {
 
 .space-pager-dot-current,
 .space-pager-dot[aria-current="true"] {
-  background: var(--brand);
+  background: var(--el-accent, #4f7fff);
   transform: scale(1.15);
 }
 
@@ -3233,6 +3291,8 @@ body.dock-autohide::after {
   display: grid;
   place-items: center;
   border-radius: 10px;
+  /* Running capsules sit slightly below the tile — don't clip them. */
+  overflow: visible;
   touch-action: none;
   cursor: pointer;
   transition: background-color 0.16s ease, transform 0.16s ease;
@@ -3287,8 +3347,8 @@ body.dock-autohide::after {
   display: grid;
   place-items: center;
   border-radius: 999px;
-  background: var(--brand);
-  color: #111;
+  background: var(--el-accent, #4f7fff);
+  color: var(--el-accent-ink, #ffffff);
   font-size: 9px;
   font-weight: 700;
   line-height: 1;
@@ -3325,13 +3385,31 @@ body.dock-autohide::after {
   height: 50px;
 }
 
-/* Window-count chip stays functional (opens the group menu) but is demoted to
-   monochrome — the Dock signals presence with dots; brand orange is for
-   notifications in the system bar, not Dock chrome. */
+/* Window-count overlays the same 40×40 icon slot (5px inset of the 50px
+   entry) so dock magnification can apply an identical transform/origin and
+   the chip rides the icon lift instead of staying pinned to the entry. */
 .taskbar-window-count {
   position: absolute;
-  top: 0;
-  right: 0;
+  top: 5px;
+  left: 5px;
+  width: 40px;
+  height: 40px;
+  min-width: 0;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-end;
+  background: transparent;
+  box-shadow: none;
+  border: 0;
+  cursor: pointer;
+  z-index: 2;
+  transform-origin: 50% 100%;
+  transition: transform 90ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.taskbar-window-count-chip {
   min-width: 16px;
   height: 16px;
   padding: 0 4px;
@@ -3347,12 +3425,12 @@ body.dock-autohide::after {
   box-shadow:
     0 0 0 1px rgba(255, 255, 255, 0.18),
     0 2px 8px rgba(0, 0, 0, 0.28);
-  cursor: pointer;
-  z-index: 2;
+  pointer-events: none;
+  transform: translate(4px, -3px);
 }
 
-.taskbar-window-count:hover,
-.taskbar-window-count:focus-visible {
+.taskbar-window-count:hover .taskbar-window-count-chip,
+.taskbar-window-count:focus-visible .taskbar-window-count-chip {
   background: rgba(62, 65, 72, 0.96);
   color: #fff;
 }
@@ -3360,9 +3438,10 @@ body.dock-autohide::after {
 .taskbar-window-count:focus-visible {
   outline: 2px solid var(--brand-focus);
   outline-offset: 1px;
+  border-radius: 12px;
 }
 
-:root[data-el-theme="light"] .taskbar-window-count {
+:root[data-el-theme="light"] .taskbar-window-count-chip {
   background: rgba(255, 255, 255, 0.94);
   color: rgba(29, 36, 56, 0.9);
   box-shadow:
@@ -3370,8 +3449,8 @@ body.dock-autohide::after {
     0 2px 8px rgba(34, 49, 88, 0.18);
 }
 
-:root[data-el-theme="light"] .taskbar-window-count:hover,
-:root[data-el-theme="light"] .taskbar-window-count:focus-visible {
+:root[data-el-theme="light"] .taskbar-window-count:hover .taskbar-window-count-chip,
+:root[data-el-theme="light"] .taskbar-window-count:focus-visible .taskbar-window-count-chip {
   background: #ffffff;
   color: #1d2438;
 }
@@ -3401,15 +3480,16 @@ body.dock-autohide::after {
     linear-gradient(#3a4358 0 0) right bottom / 9px 9px no-repeat;
 }
 
-/* Shelf running indicator — short capsule (not Mac 4px dots). */
+/* Shelf running indicator — short capsule in the air under the tile (not glued,
+   not sitting on the dock lip). Tracks the live system accent. */
 .active-taskbar-indicator {
   position: absolute;
   left: 50%;
-  bottom: 2px;
+  bottom: 0;
   width: 12px;
   height: 3px;
   border-radius: 2px;
-  background-color: rgba(242, 243, 246, 0.75);
+  background-color: color-mix(in srgb, var(--el-accent, #4f7fff) 55%, transparent);
   transform: translateX(calc(-50% + var(--dock-shift, 0px)));
   opacity: 0;
   pointer-events: none;
@@ -3417,20 +3497,20 @@ body.dock-autohide::after {
 }
 
 :root[data-el-theme="light"] .active-taskbar-indicator {
-  background-color: rgba(55, 62, 68, 0.75);
+  background-color: color-mix(in srgb, var(--el-accent, #4f7fff) 65%, transparent);
 }
 
 .taskbar-item.open .active-taskbar-indicator {
-  opacity: 0.75;
+  opacity: 0.9;
 }
 
 .taskbar-item.active .active-taskbar-indicator {
   opacity: 1;
-  background-color: var(--brand);
+  background-color: var(--el-accent, #4f7fff);
 }
 
 :root[data-el-theme="light"] .taskbar-item.active .active-taskbar-indicator {
-  background-color: var(--brand);
+  background-color: var(--el-accent, #4f7fff);
 }
 
 /* Pinned ⋮ running divider */
@@ -4060,8 +4140,8 @@ body.dragging-target {
 }
 
 .launcher-card.selected .launcher-card-body {
-  background: rgba(112, 168, 255, 0.18);
-  box-shadow: inset 0 0 0 1px rgba(176, 214, 255, 0.4);
+  background: color-mix(in srgb, var(--el-accent, #4f7fff) 22%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--el-accent, #4f7fff) 48%, transparent);
 }
 
 .launcher-item-icon {
@@ -4246,8 +4326,8 @@ body.dragging-target {
 }
 
 .spotlight-item[aria-selected="true"] {
-  background: var(--brand);
-  color: #16171b;
+  background: var(--el-accent, #4f7fff);
+  color: var(--el-accent-ink, #ffffff);
 }
 
 .spotlight-glyph {
@@ -4406,13 +4486,13 @@ body.dragging-target {
   filter: none;
 }
 
-/* ElastOS window tools (Option A): left trio, soft squares, own hues —
-   not Apple traffic-light RGB / circular hover-reveal. */
+/* ElastOS window tools: left circular trio — coral / silver / system accent.
+   Circles are fine as geometry; colors are not Apple RYG candy. */
 .window-traffic-lights {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   padding: 0 8px;
 }
 
@@ -4454,54 +4534,70 @@ body.dragging-target {
 }
 
 .window-action-btn {
-  width: 14px;
-  height: 14px;
-  flex: 0 0 14px;
+  width: 12px;
+  height: 12px;
+  flex: 0 0 12px;
   margin: 0;
   padding: 0;
   display: grid;
   place-items: center;
-  border: 0.5px solid rgba(0, 0, 0, 0.22);
-  border-radius: 3px;
+  border: 0.5px solid rgba(0, 0, 0, 0.18);
+  border-radius: 50%;
   cursor: pointer;
+  transition:
+    filter 0.12s ease,
+    background-color 0.12s ease,
+    border-color 0.12s ease,
+    opacity 0.12s ease;
 }
 
+/* Preferred trio: warm coral · silver · dynamic system accent. */
 .window-action-btn[data-action="close"] {
-  background-color: #e85d4c;
+  background-color: #f04f5f;
 }
 
 .window-action-btn[data-action="minimize"] {
-  background-color: #5c6578;
+  background-color: #aeb4be;
 }
 
 .window-action-btn[data-action="maximize"] {
-  background-color: var(--brand);
+  background-color: var(--el-accent, #4f7fff);
+}
+
+.window-action-btn:hover {
+  filter: brightness(1.08) saturate(1.08);
+}
+
+.window-action-btn:active {
+  filter: brightness(0.88);
 }
 
 .window-action-btn img {
-  width: 8px;
-  height: 8px;
-  opacity: 0.55;
+  width: 7px;
+  height: 7px;
+  opacity: 0;
   transition: opacity 0.12s ease;
 }
 
+/* Glyphs appear on group hover / focus — premium, not always-on glyphs. */
 .window-traffic-lights:hover .window-action-btn img,
 .window-traffic-lights:focus-within .window-action-btn img,
-.window-action-btn:hover img {
-  opacity: 0.92;
+.window-action-btn:hover img,
+.window-action-btn:focus-visible img {
+  opacity: 0.88;
 }
 
-/* Inactive window: tools mute; hovering the group restores color. */
+/* Inactive window: mute to ~40%; hovering the group restores color. */
 .window:not(.window-active) .window-traffic-lights:not(:hover):not(:focus-within) .window-action-btn {
-  background-color: rgba(255, 255, 255, 0.24);
-  border-color: rgba(0, 0, 0, 0.1);
+  opacity: 0.4;
+  filter: grayscale(0.15);
 }
 
 :root[data-el-theme="light"]
   .window:not(.window-active)
   .window-traffic-lights:not(:hover):not(:focus-within)
   .window-action-btn {
-  background-color: rgba(29, 36, 56, 0.18);
+  opacity: 0.42;
 }
 
 .window-body {

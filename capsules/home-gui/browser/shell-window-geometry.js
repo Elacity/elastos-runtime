@@ -10,7 +10,7 @@ import {
   beginShellInteraction,
   clamp,
   endShellInteraction,
-} from "./shell-core.js?v=home-20260723a";
+} from "./shell-core.js?v=home-20260723l";
 
 const WINDOW_MIN_VISIBLE_DRAG_WIDTH = 96;
 const WINDOW_MIN_VISIBLE_DRAG_HEIGHT = 32;
