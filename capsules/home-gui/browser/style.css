@@ -3,7 +3,7 @@
 
 :root {
   color-scheme: dark;
-  --accent: var(--el-accent, #0a84ff);
+  --accent: var(--el-accent, var(--brand));
   --bg: #050608;
   --panel: rgba(22, 24, 29, 0.78);
   --panel-strong: rgba(22, 24, 29, 0.92);
@@ -32,7 +32,7 @@
   --bar-menu-item-gap: 0.65rem;
   --bar-menu-font: 0.88rem;
   --bar-menu-divider-margin: 4px 8px;
-  --bar-menu-hover: #0a84ff;
+  --bar-menu-hover: var(--brand);
   --window-head-hue: 214;
   --window-head-saturation: 7%;
   --window-head-lightness: 40%;
@@ -67,7 +67,7 @@ body {
   overflow: hidden;
   background: var(--bg);
   color: var(--text);
-  font-family: "Inter", "Segoe UI", "SF Pro Text", sans-serif;
+  font-family: "Inter", "Segoe UI", system-ui, sans-serif;
 }
 
 body {
@@ -902,23 +902,23 @@ img {
 }
 
 .control-centre-accent-swatch[data-accent-option="blue"] {
-  background: #0a84ff;
-  color: #0a84ff;
+  background: #3b82f6;
+  color: #3b82f6;
 }
 
 .control-centre-accent-swatch[data-accent-option="purple"] {
-  background: #bf5af2;
-  color: #bf5af2;
+  background: #8b5cf6;
+  color: #8b5cf6;
 }
 
 .control-centre-accent-swatch[data-accent-option="pink"] {
-  background: #ff375f;
-  color: #ff375f;
+  background: #db2777;
+  color: #db2777;
 }
 
 .control-centre-accent-swatch[data-accent-option="red"] {
-  background: #ff453a;
-  color: #ff453a;
+  background: #e85d4c;
+  color: #e85d4c;
 }
 
 .control-centre-accent-swatch[data-accent-option="orange"] {
@@ -927,18 +927,18 @@ img {
 }
 
 .control-centre-accent-swatch[data-accent-option="yellow"] {
-  background: #ffd60a;
-  color: #ffd60a;
+  background: #e6b422;
+  color: #e6b422;
 }
 
 .control-centre-accent-swatch[data-accent-option="green"] {
-  background: #30b84f;
-  color: #30b84f;
+  background: #34d399;
+  color: #34d399;
 }
 
 .control-centre-accent-swatch[data-accent-option="graphite"] {
-  background: #8e8e93;
-  color: #8e8e93;
+  background: #64748b;
+  color: #64748b;
 }
 
 .control-centre-divider {
@@ -3065,10 +3065,35 @@ body.dock-autohide::after {
   max-width: 100%;
 }
 
-/* Legacy host kept hidden — Space switching is left-edge ←/→ peek, not Dock dots. */
-.space-pager,
+/* Coarse-pointer Space pager (fine pointer uses left-edge peek). */
+.space-pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 10px;
+  padding: 2px 4px;
+}
+
 .space-pager[hidden] {
   display: none !important;
+}
+
+.space-pager-dot {
+  width: 7px;
+  height: 7px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--text) 38%, transparent);
+  cursor: pointer;
+}
+
+.space-pager-dot-current,
+.space-pager-dot[aria-current="true"] {
+  background: var(--brand);
+  transform: scale(1.15);
 }
 
 /* Left-edge dual Space control — Dock glass + theme ink (readable light & dark). */
@@ -3376,34 +3401,36 @@ body.dock-autohide::after {
     linear-gradient(#3a4358 0 0) right bottom / 9px 9px no-repeat;
 }
 
-/* macOS-style running dot: only apps with open windows get one; pinned
-   favorites stay clean until launched. Absolute under a centered 40px tile
-   (pill 60px / item 50px / padding 5px) — rides --dock-shift horizontally,
-   never lifts or scales the icon. */
+/* Shelf running indicator — short capsule (not Mac 4px dots). */
 .active-taskbar-indicator {
   position: absolute;
   left: 50%;
-  bottom: 1px;
-  width: 4px;
-  height: 4px;
-  border-radius: 50%;
-  background-color: rgba(242, 243, 246, 0.9);
+  bottom: 2px;
+  width: 12px;
+  height: 3px;
+  border-radius: 2px;
+  background-color: rgba(242, 243, 246, 0.75);
   transform: translateX(calc(-50% + var(--dock-shift, 0px)));
   opacity: 0;
   pointer-events: none;
-  transition: opacity 0.16s ease;
+  transition: opacity 0.16s ease, background-color 0.16s ease;
 }
 
 :root[data-el-theme="light"] .active-taskbar-indicator {
-  background-color: rgba(55, 62, 68, 0.9);
+  background-color: rgba(55, 62, 68, 0.75);
 }
 
 .taskbar-item.open .active-taskbar-indicator {
-  opacity: 0.7;
+  opacity: 0.75;
 }
 
 .taskbar-item.active .active-taskbar-indicator {
   opacity: 1;
+  background-color: var(--brand);
+}
+
+:root[data-el-theme="light"] .taskbar-item.active .active-taskbar-indicator {
+  background-color: var(--brand);
 }
 
 /* Pinned ⋮ running divider */
@@ -4379,20 +4406,18 @@ body.dragging-target {
   filter: none;
 }
 
-/* Traffic lights (macOS): close · minimize · zoom on the LEFT, color-coded
-   12px dots. Symbols stay hidden until the group is hovered or focused —
-   exactly the macOS reveal. The balance spacer mirrors the group's width so
-   the title centers optically in the bar. */
+/* ElastOS window tools (Option A): left trio, soft squares, own hues —
+   not Apple traffic-light RGB / circular hover-reveal. */
 .window-traffic-lights {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   padding: 0 8px;
 }
 
 .window-head-balance {
-  flex: 0 0 68px;
+  flex: 0 0 72px;
 }
 
 .window-head-draggable {
@@ -4429,44 +4454,44 @@ body.dragging-target {
 }
 
 .window-action-btn {
-  width: 12px;
-  height: 12px;
-  flex: 0 0 12px;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
   margin: 0;
   padding: 0;
   display: grid;
   place-items: center;
-  border: 0.5px solid rgba(0, 0, 0, 0.18);
-  border-radius: 50%;
+  border: 0.5px solid rgba(0, 0, 0, 0.22);
+  border-radius: 3px;
   cursor: pointer;
 }
 
 .window-action-btn[data-action="close"] {
-  background-color: #ff5f57;
+  background-color: #e85d4c;
 }
 
 .window-action-btn[data-action="minimize"] {
-  background-color: #febc2e;
+  background-color: #5c6578;
 }
 
 .window-action-btn[data-action="maximize"] {
-  background-color: #28c840;
+  background-color: var(--brand);
 }
 
 .window-action-btn img {
-  width: 7px;
-  height: 7px;
-  opacity: 0;
+  width: 8px;
+  height: 8px;
+  opacity: 0.55;
   transition: opacity 0.12s ease;
 }
 
 .window-traffic-lights:hover .window-action-btn img,
-.window-traffic-lights:focus-within .window-action-btn img {
-  opacity: 0.6;
+.window-traffic-lights:focus-within .window-action-btn img,
+.window-action-btn:hover img {
+  opacity: 0.92;
 }
 
-/* Inactive window: the dots go neutral (macOS); hovering the group restores
-   color even before the window is focused. */
+/* Inactive window: tools mute; hovering the group restores color. */
 .window:not(.window-active) .window-traffic-lights:not(:hover):not(:focus-within) .window-action-btn {
   background-color: rgba(255, 255, 255, 0.24);
   border-color: rgba(0, 0, 0, 0.1);

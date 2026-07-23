@@ -21,7 +21,7 @@ import {
   ignoreRepeatedAction,
   pushUiPreferencesToFrameWindow,
   targetById,
-} from "./shell-core.js?v=home-20260722w";
+} from "./shell-core.js?v=home-20260723a";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -31,8 +31,8 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260722w";
-import { playUiSound } from "./shell-sounds.js?v=home-20260722w";
+} from "./shell-window-geometry.js?v=home-20260723a";
+import { playUiSound } from "./shell-sounds.js?v=home-20260723a";
 import {
   applyFullscreenStageFromPlacement,
   bindStageWindowHooks,
@@ -50,7 +50,8 @@ import {
   syncStagePresentation,
   exitFullscreenStage,
   toggleFullscreenStage,
-} from "./shell-stages.js?v=home-20260722w";
+  windowVisibleOnActiveSpace,
+} from "./shell-stages.js?v=home-20260723a";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -229,6 +230,22 @@ function currentRootShellSessionId() {
   return HOME_GUI_SHELL_ID;
 }
 
+/** Stable Space key for session — survives reminted window ids on restore. */
+function stableSpaceKeyForId(spaceId) {
+  if (!spaceId || isDesktopSpace(spaceId)) {
+    return spaceId || desktopStageId();
+  }
+  const entry = shellState.windows.get(spaceId);
+  if (!entry?.fullscreenStage) {
+    return spaceId;
+  }
+  const inst =
+    typeof entry.launchQuery?.browser_instance === "string"
+      ? entry.launchQuery.browser_instance
+      : "";
+  return `fs:${entry.targetId}:${inst}`;
+}
+
 function persistBrowserSession() {
   if (shellState.restoringSession) {
     return;
@@ -236,10 +253,10 @@ function persistBrowserSession() {
   const rootShell = currentRootShellSessionId();
   const windows = persistedBrowserSessionEntries();
   const desktops = [...getExtraDesktops()];
-  const activeStage = getActiveStageId();
-  const spaceOrder = Array.isArray(shellState.spaceOrder)
-    ? [...shellState.spaceOrder]
-    : [];
+  const activeStage = stableSpaceKeyForId(getActiveStageId());
+  const spaceOrder = (
+    Array.isArray(shellState.spaceOrder) ? shellState.spaceOrder : []
+  ).map((id) => stableSpaceKeyForId(id));
   if (windows.length === 0) {
     saveShellSessionState({
       root_shell: rootShell,
@@ -257,6 +274,37 @@ function persistBrowserSession() {
     active_stage: activeStage,
     space_order: spaceOrder,
   });
+}
+
+function resolveStableSpaceKey(savedKey, restoredEntries) {
+  if (!savedKey || typeof savedKey !== "string") {
+    return desktopStageId();
+  }
+  const key = savedKey.trim();
+  if (isDesktopSpace(key)) {
+    return key;
+  }
+  if (key.startsWith("fs:")) {
+    const parts = key.slice(3).split(":");
+    const targetId = parts[0] || "";
+    const inst = parts.slice(1).join(":");
+    const match = restoredEntries.find(({ entry }) => {
+      if (!entry?.fullscreenStage || entry.targetId !== targetId) {
+        return false;
+      }
+      if (!inst) {
+        return true;
+      }
+      return entry.launchQuery?.browser_instance === inst;
+    });
+    return match?.entry.id || desktopStageId();
+  }
+  // Legacy: window id like "browser--3" — remap by target prefix.
+  const legacyTarget = key.includes("--") ? key.split("--")[0] : key;
+  const legacy = restoredEntries.find(
+    ({ entry }) => entry?.fullscreenStage && entry.targetId === legacyTarget,
+  );
+  return legacy?.entry.id || desktopStageId();
 }
 
 function storedSessionRootShell(storedSession) {
@@ -897,6 +945,11 @@ export function showDesktopHome() {
     entry.node.setAttribute("aria-hidden", "true");
   }
   shellState.activeWindowId = null;
+  setActiveStage(desktopStageId(), {
+    announce: false,
+    animate: false,
+    focus: false,
+  });
   requireWindowHooks().updateTaskbarState();
   persistBrowserSession();
 }
@@ -1052,9 +1105,14 @@ function syncBrowserWindow(entry, launched) {
   if (frame.dataset.route !== launched.route) {
     frame.src = launched.route;
     frame.dataset.route = launched.route;
-    // Fail open: a slow or handshake-shy capsule must still become visible.
+    // Bounded reveal: if load never fires, surface the frame but mark stale
+    // so we do not pretend the capsule handshake succeeded (Principle 11).
     window.setTimeout(() => {
+      if (frame.classList.contains("is-ready")) {
+        return;
+      }
       frame.classList.add("is-ready");
+      node.dataset.frameRevealFallback = "true";
     }, FRAME_REVEAL_FAILSAFE_MS);
     return;
   }
@@ -1158,6 +1216,12 @@ function hideWindow(id) {
 }
 
 export function minimizeWindow(id) {
+  const entry = shellState.windows.get(id);
+  // Same path as yellow control — never leave a hidden fullscreen Space ghost.
+  if (entry?.fullscreenStage) {
+    exitFullscreenStage(id);
+    return;
+  }
   hideWindow(id);
 }
 
@@ -1176,9 +1240,12 @@ export function closeWindow(id) {
 }
 
 function focusTopVisibleWindow() {
+  const active = getActiveStageId();
   const visible = sortWindowEntriesByZOrder(
     Array.from(shellState.windows.values()).filter(
-      (entry) => !entry.node.classList.contains("hidden"),
+      (entry) =>
+        !entry.node.classList.contains("hidden") &&
+        windowVisibleOnActiveSpace(entry, active),
     ),
   );
 
@@ -1342,7 +1409,7 @@ export async function restoreShellSession() {
   }
   const storedSession = loadShellSessionState();
   restoreExtraDesktops(storedSession?.desktops);
-  restoreSpaceOrder(storedSession?.space_order);
+  // space_order remapped after windows remount (stable fs: keys → live ids).
   const restoredWindows = normalizeRestorableSession(
     shellState.currentSummary,
     storedSession,
@@ -1389,13 +1456,18 @@ export async function restoreShellSession() {
     return;
   }
 
+  // Remap stable Space keys (fs:target:instance) → live window ids after remount.
+  const remappedOrder = (
+    Array.isArray(storedSession?.space_order) ? storedSession.space_order : []
+  ).map((key) => resolveStableSpaceKey(key, restoredEntries));
+  restoreSpaceOrder(remappedOrder);
+
   // Restore the Space the user was on — not "whichever window was focused".
-  // A fullscreen Space can stay in the ring while Desktop is active; jumping
-  // to that fullscreen app on refresh was wrong.
-  const savedStage =
+  const savedStageKey =
     typeof storedSession?.active_stage === "string" && storedSession.active_stage.trim()
       ? storedSession.active_stage.trim()
       : desktopStageId();
+  const savedStage = resolveStableSpaceKey(savedStageKey, restoredEntries);
   setActiveStage(savedStage, { announce: false, animate: false, focus: false });
 
   const activeEntry = restoredEntries.find(

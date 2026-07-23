@@ -9,11 +9,11 @@
  * - Expose / Show Windows — Mission Control overview (shell-expose.js)
  */
 
-import { shellState } from "./shell-core.js?v=home-20260722w";
+import { shellState } from "./shell-core.js?v=home-20260723a";
 import {
   rememberWindowRestoreBounds,
   restoreWindowFromSpecialState,
-} from "./shell-window-geometry.js?v=home-20260722w";
+} from "./shell-window-geometry.js?v=home-20260723a";
 
 const DESKTOP_STAGE = "desktop";
 let liveRegion = null;
@@ -114,6 +114,18 @@ function syncMaximizeButton(node, fullscreen) {
   btn.title = fullscreen ? "Exit Fullscreen" : "Enter Fullscreen";
 }
 
+function syncMinimizeButton(node, fullscreen) {
+  const btn = node?.querySelector?.("[data-action='minimize']");
+  if (!btn) {
+    return;
+  }
+  btn.setAttribute(
+    "aria-label",
+    fullscreen ? "Exit Fullscreen" : "Minimize",
+  );
+  btn.title = fullscreen ? "Back to Desktop" : "Minimize";
+}
+
 function persist() {
   try {
     persistSessionFn?.();
@@ -199,7 +211,7 @@ function bindEdgeReveal() {
   });
 }
 
-function windowVisibleOnActiveSpace(entry, active) {
+export function windowVisibleOnActiveSpace(entry, active = getActiveStageId()) {
   if (!entry) {
     return false;
   }
@@ -235,6 +247,7 @@ export function syncStagePresentation() {
     entry.node.dataset.spaceVisible = visible ? "true" : "false";
     entry.node.dataset.stageActive = !desktopLike && visible ? "true" : "false";
     syncMaximizeButton(entry.node, staged);
+    syncMinimizeButton(entry.node, staged);
     if (!document.body.classList.contains("expose-active")) {
       if (!entry.node.classList.contains("expose-card")) {
         entry.node.style.opacity = "";
@@ -1009,17 +1022,53 @@ export function restoreExtraDesktops(desktops) {
 }
 
 /**
- * Above-dock dots removed — Space switching lives on the left-edge dual peek
- * (← / →) so it doesn’t fight Dock magnification hit targets.
+ * Space pager dots: hidden on fine pointer (left-edge peek owns switching).
+ * Shown on coarse/touch as the Overview affordance when ring.length > 1.
  */
 export function syncSpacePager() {
   const host = document.querySelector("#space-pager");
   if (!host) {
     return;
   }
-  host.hidden = true;
-  host.setAttribute("aria-hidden", "true");
+  const fine =
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(hover: hover) and (pointer: fine)").matches;
+  const ring = buildStageRing();
+  const hide =
+    fine ||
+    ring.length < 2 ||
+    document.body.classList.contains("expose-active") ||
+    document.body.classList.contains("mission-exiting");
+  host.hidden = hide;
+  host.setAttribute("aria-hidden", hide ? "true" : "false");
+  if (hide) {
+    host.replaceChildren();
+    return;
+  }
+  const active = getActiveStageId();
   host.replaceChildren();
+  for (const spaceId of ring) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "space-pager-dot";
+    btn.dataset.spaceId = spaceId;
+    const label = spaceLabelForPager(spaceId);
+    btn.title = label;
+    btn.setAttribute("aria-label", label);
+    if (spaceId === active) {
+      btn.classList.add("space-pager-dot-current");
+      btn.setAttribute("aria-current", "true");
+    }
+    btn.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (getActiveStageId() === spaceId) {
+        return;
+      }
+      setActiveStage(spaceId, { animate: true, focus: true });
+    });
+    host.appendChild(btn);
+  }
 }
 
 export function bindSpacePager() {

@@ -966,7 +966,7 @@ assert(
 );
 assert(
   shellHostStyle.includes("min-height: 100dvh;") &&
-    homeGuiStyle.includes("font-family: \"Inter\", \"Segoe UI\", \"SF Pro Text\", sans-serif;"),
+    homeGuiStyle.includes("font-family: \"Inter\", \"Segoe UI\", system-ui, sans-serif;"),
   "Home must use dynamic viewport height for mobile browsers",
 );
 assert(
@@ -1062,16 +1062,24 @@ assert(
     shellStages.includes("syncSpacePager") &&
     shellStages.includes("bindSpaceEdgePeek") &&
     shellStages.includes("Left-edge dwell peek with") &&
-    shellStages.includes("Above-dock dots removed") &&
-    shellStages.includes("Wallet EDGE_REVEAL_PX owns the right") &&
-    shellStages.includes("pointerleave coords sit on the peek") &&
+    shellStages.includes("Space pager dots: hidden on fine pointer") &&
+    shellStages.includes("Wallet") &&
+    shellStages.includes("SPACE_EDGE_REVEAL_PX") &&
+    shellStages.includes("Do not use leave X against the keep right") &&
     shellStages.includes("stage-edge-sensor-left") &&
     shellStages.includes("full-height column") &&
     shellStages.includes("syncSpacePeekKeepColumn") &&
+    shellStages.includes("windowVisibleOnActiveSpace") &&
     shellWindows.includes("active_stage: activeStage") &&
+    shellWindows.includes("stableSpaceKeyForId") &&
     shellWindows.includes("Restore the Space the user was on") &&
+    shellWindows.includes("never leave a hidden fullscreen Space ghost") &&
     shellSurface.includes("Keep the wave alive across the tiny gaps") &&
+    shellSurface.includes("Mild Shelf wave") &&
+    homeGuiStyle.includes("#e85d4c") &&
+    homeGuiStyle.includes("ElastOS window tools") &&
     shellExpose.includes("missionExiting") &&
+    shellExpose.includes("pendingMissionFinish") &&
     shellExpose.includes("isActive: () => active || missionExiting") &&
     shellExpose.includes("Never reopen mid exit-zoom") &&
     shellExpose.includes("rebuildMissionHitCache") &&
@@ -1141,7 +1149,7 @@ assert(
     homeGuiStyle.includes(".mission-reorder-spacer") &&
     homeGuiStyle.includes(".mission-space-close") &&
     homeGuiStyle.includes("Padding absorbs hover lift") &&
-    homeGuiTemplateHtml.includes("Mission Control") &&
+    homeGuiTemplateHtml.includes("Overview") &&
     homeGuiStyle.includes("data-active-stage") &&
     homeGuiStyle.includes(".mission-spaces-bar") &&
     homeGuiStyle.includes(".mission-space-add") &&
@@ -1817,7 +1825,7 @@ const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
 const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260721b";
-const homeGuiAssetVersion = "home-20260722w";
+const homeGuiAssetVersion = "home-20260723a";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -2270,13 +2278,13 @@ assert(
   "Spotlight must not call provider APIs — Continuity allowlist is Home facts only",
 );
 assert(
-  homeGuiTemplateHtml.includes('aria-label="Dock"') &&
-    shellSurface.includes("Pin to Dock") &&
-    shellSurface.includes("Remove from Dock") &&
+  homeGuiTemplateHtml.includes('aria-label="Shelf"') &&
+    shellSurface.includes("Pin to Shelf") &&
+    shellSurface.includes("Remove from Shelf") &&
     !shellSurface.includes("Pin to Taskbar") &&
     !homeGuiTemplateHtml.includes("Home GUI shell") &&
     !homeGuiTemplateHtml.includes("Runtime data not attached"),
-  "Dock naming + product About/error copy — no Taskbar diglossia or engineer stage-fail strings",
+  "Shelf naming + product About/error copy — no Taskbar diglossia or engineer stage-fail strings",
 );
 assert(
   homeGuiCore.includes('targetId === "chat"') &&
@@ -2306,8 +2314,8 @@ assert(
     shellJs.includes("focusMode") &&
     homeGuiCore.includes("focusModeEnabled") &&
     homeGuiTemplateHtml.includes('id="control-centre-show-windows"') &&
-    homeGuiTemplateHtml.includes("Mission Control"),
-  "Shell Continuity: home discovery proxy + Focus + Mission Control; no Bluetooth/DID in CC",
+    homeGuiTemplateHtml.includes("Overview"),
+  "Shell Continuity: home discovery proxy + Focus + Overview; no Bluetooth/DID in Status",
 );
 assert(
   shellExpose.includes("exposeEntries") &&
@@ -2316,9 +2324,10 @@ assert(
     shellExpose.includes('registerShellPopover("show-windows"') &&
     shellExpose.includes("No open windows") &&
     shellExpose.includes("mission-spaces-bar") &&
-    homeGuiTemplateHtml.includes("<dt>Mission Control</dt>") &&
-    !homeGuiTemplateHtml.includes("<dt>Show Windows</dt>"),
-  "Mission Control includes Spaces bar, minimized floor cards, captions; shortcuts say Mission Control",
+    homeGuiTemplateHtml.includes("<dt>Overview</dt>") &&
+    !homeGuiTemplateHtml.includes("<dt>Show Windows</dt>") &&
+    !homeGuiTemplateHtml.includes("<dt>Mission Control</dt>"),
+  "Overview includes Spaces bar, minimized floor cards, captions; shortcuts say Overview",
 );
 assert(
   homeGuiTemplateHtml.includes('id="nc-cal-date"') &&

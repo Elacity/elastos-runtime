@@ -106,8 +106,8 @@
     id="toolbar-mission-control"
     class="toolbar-btn toolbar-mission-btn"
     type="button"
-    aria-label="Mission Control"
-    title="Mission Control (F3)"
+    aria-label="Overview"
+    title="Overview (F3)"
   >
     <span class="mission-control-glyph" aria-hidden="true"></span>
   </button>
@@ -115,8 +115,8 @@
     id="toolbar-control-centre"
     class="toolbar-btn control-centre-btn"
     type="button"
-    aria-label="Control Centre"
-    title="Control Centre"
+    aria-label="Status"
+    title="Status"
     aria-haspopup="dialog"
     aria-expanded="false"
     aria-controls="control-centre"
@@ -173,7 +173,7 @@
   id="control-centre"
   class="control-centre"
   role="group"
-  aria-label="Control Centre"
+  aria-label="Status"
   tabindex="-1"
   aria-hidden="true"
   inert
@@ -242,7 +242,7 @@
       <span class="control-centre-row-label">Enter Fullscreen</span>
     </button>
     <button id="control-centre-show-windows" class="control-centre-row" type="button">
-      <span class="control-centre-row-label">Mission Control</span>
+      <span class="control-centre-row-label">Overview</span>
       <span class="control-centre-row-detail">›</span>
     </button>
   </div>
@@ -445,12 +445,12 @@
     ></section>
     <div id="window-snap-preview" class="window-snap-preview" aria-hidden="true" hidden></div>
     <button id="desktop-first-run-hint" class="desktop-first-run-hint" type="button" hidden>
-      Your files live here. Apps are in the Dock below.
+      Your files live here. Apps are in the Shelf below.
     </button>
   </section>
 </main>
 
-<footer class="taskbar" aria-label="Dock" data-home-gui-hidden-by-host="hidden" inert hidden>
+<footer class="taskbar" aria-label="Shelf" data-home-gui-hidden-by-host="hidden" inert hidden>
   <div class="taskbar-inner">
     <div id="space-pager" class="space-pager" hidden aria-hidden="true"></div>
     <div class="taskbar-primary">
@@ -458,14 +458,14 @@
         id="launcher-toggle"
         class="taskbar-item taskbar-item-launcher"
         type="button"
-        aria-label="Open launcher"
+        aria-label="Open Apps"
         aria-controls="launcher"
         aria-expanded="false"
-        data-label="Launcher"
+        data-label="Apps"
       >
         <span class="taskbar-icon taskbar-icon-launcher"></span>
       </button>
-      <div id="taskbar-targets" class="taskbar-sortable" aria-label="Dock items"></div>
+      <div id="taskbar-targets" class="taskbar-sortable" aria-label="Shelf items"></div>
     </div>
   </div>
 </footer>
@@ -548,7 +548,7 @@
   class="quick-look"
   role="dialog"
   aria-modal="true"
-  aria-label="Quick Look"
+  aria-label="Peek"
   aria-hidden="true"
   inert
   hidden
@@ -561,7 +561,7 @@
       </div>
       <div class="quick-look-actions">
         <button id="quick-look-open" class="quick-look-open" type="button">Open</button>
-        <button id="quick-look-close" class="quick-look-close" type="button" aria-label="Close Quick Look">
+        <button id="quick-look-close" class="quick-look-close" type="button" aria-label="Close Peek">
           <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
         </button>
       </div>
@@ -583,11 +583,13 @@
     </button>
     <h1 id="shortcuts-title" class="shortcuts-title">Keyboard shortcuts</h1>
     <dl class="shortcuts-list">
-      <div class="shortcuts-row"><dt>Search (Spotlight)</dt><dd><kbd>⌘</kbd><kbd>Space</kbd> or <kbd>Ctrl</kbd><kbd>Space</kbd></dd></div>
-      <div class="shortcuts-row"><dt>Quick Look</dt><dd><kbd>Space</kbd> on a desktop icon</dd></div>
-      <div class="shortcuts-row"><dt>Mission Control</dt><dd><kbd>F3</kbd></dd></div>
-      <div class="shortcuts-row"><dt>Switch Space</dt><dd><kbd>⌃←</kbd><kbd>⌃→</kbd></dd></div>
-      <div class="shortcuts-row"><dt>Enter / Exit Fullscreen</dt><dd>Green button</dd></div>
+      <div class="shortcuts-row"><dt>Search (Find)</dt><dd><kbd>⌘</kbd><kbd>Space</kbd> or <kbd>Ctrl</kbd><kbd>Space</kbd></dd></div>
+      <div class="shortcuts-row"><dt>Peek</dt><dd><kbd>Space</kbd> on a desktop icon</dd></div>
+      <div class="shortcuts-row"><dt>Overview</dt><dd><kbd>F3</kbd></dd></div>
+      <div class="shortcuts-row"><dt>Switch Space</dt><dd><kbd>⌃←</kbd><kbd>⌃→</kbd> · left edge peek</dd></div>
+      <div class="shortcuts-row"><dt>Wallet</dt><dd>Right screen edge</dd></div>
+      <div class="shortcuts-row"><dt>Enter / Exit Fullscreen</dt><dd>Orange expand tool (left of title)</dd></div>
+      <div class="shortcuts-row"><dt>Exit Fullscreen</dt><dd>Middle window tool while fullscreen</dd></div>
       <div class="shortcuts-row"><dt>Switch windows</dt><dd><kbd>Alt</kbd><kbd>Tab</kbd></dd></div>
       <div class="shortcuts-row"><dt>Cycle windows</dt><dd><kbd>⌘</kbd><kbd>`</kbd></dd></div>
       <div class="shortcuts-row"><dt>Close window</dt><dd><kbd>⌘</kbd><kbd>W</kbd></dd></div>

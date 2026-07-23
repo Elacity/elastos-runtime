@@ -50,7 +50,7 @@ import {
   mutateDesktopObject,
   formatBadgeCount,
   focusModeEnabled,
-} from "./shell-core.js?v=home-20260722w";
+} from "./shell-core.js?v=home-20260723a";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -64,19 +64,19 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260722w";
-import { playUiSound } from "./shell-sounds.js?v=home-20260722w";
+} from "./shell-windows.js?v=home-20260723a";
+import { playUiSound } from "./shell-sounds.js?v=home-20260723a";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
   setOverlayOpen,
-} from "./shell-popovers.js?v=home-20260722w";
+} from "./shell-popovers.js?v=home-20260723a";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20260722w";
-import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260722w";
-import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260722w";
+} from "./shell-motion.js?v=home-20260723a";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260723a";
+import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260723a";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -442,8 +442,8 @@ function appendTaskbarTrash(summary) {
   const entry = taskbarItemTemplate.content.firstElementChild.cloneNode(true);
   const button = entry.querySelector(".taskbar-item");
   const empty = trashObject.metadata?.empty !== false;
-  button.dataset.label = "Trash";
-  button.setAttribute("aria-label", empty ? "Trash. Empty." : "Trash. Contains items.");
+  button.dataset.label = "Bin";
+  button.setAttribute("aria-label", empty ? "Bin. Empty." : "Bin. Contains items.");
   mountGlyph(button.querySelector(".taskbar-item-icon"), empty ? "trash" : "trash-full");
   button.addEventListener("click", () => {
     openDesktopObject(entryId);
@@ -635,7 +635,7 @@ function desktopShortcutAriaLabel(title) {
 function taskbarItemAriaLabel(title, openCount, isActive) {
   const countLabel = openCount === 1 ? "1 window open" : `${openCount} windows open`;
   if (isActive) {
-    return `${title}. ${countLabel}. Active in Dock.`;
+    return `${title}. ${countLabel}. Active in Shelf.`;
   }
   return `${title}. ${countLabel}.`;
 }
@@ -1680,8 +1680,8 @@ function renderContextMenu(target) {
 
 function taskbarPinMenuItem(targetId) {
   return isTargetPinnedToTaskbar(targetId)
-    ? { action: "unpin-taskbar", label: "Remove from Dock" }
-    : { action: "pin-taskbar", label: "Pin to Dock" };
+    ? { action: "unpin-taskbar", label: "Remove from Shelf" }
+    : { action: "pin-taskbar", label: "Pin to Shelf" };
 }
 
 function appendTargetGroupManagementItems(items, openWindows) {
@@ -1734,11 +1734,11 @@ function desktopObjectContextMenuItems(target) {
   if (isTrashDesktopObject(object)) {
     const items = [];
     if (canOpenDesktopObject(object)) {
-      items.push({ action: "open-desktop-object", label: "Open Trash" });
+      items.push({ action: "open-desktop-object", label: "Open Bin" });
       items.push({ action: "open-desktop-object-new-window", label: "Open in New Window" });
     }
     if (object.metadata?.empty === false && hasObjectCapability(object, "empty_trash")) {
-      items.push({ action: "empty-trash", label: "Empty Trash" });
+      items.push({ action: "empty-trash", label: "Empty Bin" });
     }
     if (items.length > 0 && hasObjectCapability(object, "properties")) {
       items.push({ kind: "divider" });
@@ -2341,12 +2341,11 @@ function hideHomeNotificationToast() {
    a cosine falloff around the pointer. Icon centers are cached on hover entry;
    pointermove only reads clientX and writes transforms inside one rAF per
    frame. Disabled while dragging and under prefers-reduced-motion. */
-const DOCK_MAG_MAX_SCALE = 1.55;
+/* Mild Shelf wave (Wave 2a) — alive neighbors without Apple 1.55/0.3 envelope. */
+const DOCK_MAG_MAX_SCALE = 1.32;
 const DOCK_MAG_RANGE_PX = 88;
 const DOCK_MAG_LIFT_RATIO = 0.35;
-/* Neighbors slide away from the cursor by a fraction of the magnified peers'
-   width growth (macOS grows the whole dock; we spread within the pill). */
-const DOCK_MAG_SPREAD = 0.3;
+const DOCK_MAG_SPREAD = 0.15;
 const DOCK_ICON_BASE_PX = 40;
 const DOCK_TOOLTIP_SHOW_MS = 320;
 const DOCK_TOOLTIP_HIDE_MS = 100;

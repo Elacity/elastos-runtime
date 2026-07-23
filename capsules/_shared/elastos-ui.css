@@ -77,28 +77,29 @@
   --el-dur-exit: 150ms;
   --el-ease: cubic-bezier(0.2, 0, 0, 1);
 
-  /* System accent — ONE accent, chosen by the user in System > Personalization
-     (macOS model), obeyed by every app. Selected via data-el-accent on <html>
-     (absence = blue). Apps consume the derived tones and never define their own
-     accent colors. */
-  --el-accent: #0a84ff;
-  --el-accent-ink: #ffffff;
+  /* System accent — ElastOS brand orange by default. Selected via
+     data-el-accent on <html>. Apps consume derived tones only. */
+  --el-accent: #f6921a;
+  --el-accent-ink: #161616;
   --el-accent-strong: color-mix(in srgb, var(--el-accent) 78%, #ffffff);
   --el-accent-soft: color-mix(in srgb, var(--el-accent) 22%, transparent);
   --el-accent-faint: color-mix(in srgb, var(--el-accent) 11%, transparent);
 }
 
-/* The eight macOS accents. Yellow and orange carry dark ink on filled controls. */
+/* ElastOS accent set (not Apple Personalization octad). */
 :root[data-el-accent="purple"] {
-  --el-accent: #bf5af2;
+  --el-accent: #8b5cf6;
+  --el-accent-ink: #ffffff;
 }
 
 :root[data-el-accent="pink"] {
-  --el-accent: #ff375f;
+  --el-accent: #db2777;
+  --el-accent-ink: #ffffff;
 }
 
 :root[data-el-accent="red"] {
-  --el-accent: #ff453a;
+  --el-accent: #e85d4c;
+  --el-accent-ink: #ffffff;
 }
 
 :root[data-el-accent="orange"] {
@@ -107,16 +108,23 @@
 }
 
 :root[data-el-accent="yellow"] {
-  --el-accent: #ffd60a;
+  --el-accent: #e6b422;
   --el-accent-ink: #161616;
 }
 
 :root[data-el-accent="green"] {
-  --el-accent: #30b84f;
+  --el-accent: #34d399;
+  --el-accent-ink: #161616;
 }
 
 :root[data-el-accent="graphite"] {
-  --el-accent: #8e8e93;
+  --el-accent: #64748b;
+  --el-accent-ink: #ffffff;
+}
+
+:root[data-el-accent="blue"] {
+  --el-accent: #3b82f6;
+  --el-accent-ink: #ffffff;
 }
 
 /* Light theme: dark is the default (no attribute); the shell sets

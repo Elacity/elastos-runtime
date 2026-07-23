@@ -11,17 +11,17 @@ import {
   desktopBackdrop,
   mountGlyph,
   shellState,
-} from "./shell-core.js?v=home-20260722w";
+} from "./shell-core.js?v=home-20260723a";
 import {
   browserWindowEntries,
   focusWindow,
   sortWindowEntriesByZOrder,
-} from "./shell-windows.js?v=home-20260722w";
+} from "./shell-windows.js?v=home-20260723a";
 import {
   closeOtherShellPopovers,
   registerEscapeHandler,
   registerShellPopover,
-} from "./shell-popovers.js?v=home-20260722w";
+} from "./shell-popovers.js?v=home-20260723a";
 import {
   addDesktopSpace,
   assignWindowToDesktop,
@@ -38,7 +38,7 @@ import {
   syncStagePresentation,
   syncSpacePager,
   flipRectMotion,
-} from "./shell-stages.js?v=home-20260722w";
+} from "./shell-stages.js?v=home-20260723a";
 function exposeReducedMotion() {
   return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
 }
@@ -61,6 +61,8 @@ let dragProxy = null;
 let suppressExposeClick = false;
 let missionExitTimer = 0;
 let missionExiting = false;
+/** When Overview exit zoom is aborted mid-flight, still commit the target Space. */
+let pendingMissionFinish = null;
 let ensureGridTimer = 0;
 let missionHitCache = null;
 let lastSpacesBarRingKey = "";
@@ -1454,7 +1456,7 @@ function ensureEmptyNode() {
   emptyNode.hidden = true;
   emptyNode.innerHTML =
     '<p class="expose-empty-title">No open windows</p>' +
-    '<p class="expose-empty-hint">Open an app from the Dock or Search, then try Mission Control again.</p>';
+    '<p class="expose-empty-hint">Open an app from the Shelf or Search, then try Overview again.</p>';
   const stage = document.querySelector("#desktop") || document.body;
   stage.appendChild(emptyNode);
   return emptyNode;
@@ -1705,6 +1707,9 @@ function teardownMissionChrome() {
   missionExitTimer = 0;
   window.clearTimeout(ensureGridTimer);
   ensureGridTimer = 0;
+  const finish = pendingMissionFinish;
+  pendingMissionFinish = null;
+  const wasExiting = missionExiting;
   missionExiting = false;
   missionHitCache = null;
   lastSpacesBarRingKey = "";
@@ -1734,8 +1739,13 @@ function teardownMissionChrome() {
     entry?.node?.classList.remove("mission-exit-hero");
   }
   reparentOrphanWindows();
-  syncStagePresentation();
-  syncSpacePager();
+  // Abort mid exit-zoom must still land on the chosen Space (no half-commit).
+  if (wasExiting && finish) {
+    finishStageAfterMission(finish.stageId, finish.heroWindowId, finish.focusHero);
+  } else {
+    syncStagePresentation();
+    syncSpacePager();
+  }
 }
 
 export function closeExpose() {
@@ -1792,12 +1802,14 @@ function playMissionExitZoom({ heroWindowId = null, targetStage = null, focusHer
     (hero.style.transform || hero.dataset.exposeGridTransform);
 
   if (!canZoom) {
+    pendingMissionFinish = { stageId: stage, heroWindowId, focusHero };
+    missionExiting = true;
     teardownMissionChrome();
-    finishStageAfterMission(stage, heroWindowId, focusHero);
     return;
   }
 
   missionExiting = true;
+  pendingMissionFinish = { stageId: stage, heroWindowId, focusHero };
   endMissionDrag();
   // Keep expose-active through the zoom so card CSS stays stable; block input.
   document.body.classList.add("mission-exiting");
@@ -1848,8 +1860,8 @@ function playMissionExitZoom({ heroWindowId = null, targetStage = null, focusHer
 
   window.clearTimeout(missionExitTimer);
   missionExitTimer = window.setTimeout(() => {
+    // finish applied inside teardown via pendingMissionFinish
     teardownMissionChrome();
-    finishStageAfterMission(stage, heroWindowId, focusHero);
   }, MISSION_EXIT_MS + 20);
 }
 
@@ -1887,7 +1899,7 @@ export function openExpose() {
   const startRects = captureWindowStartRects();
   active = true;
   document.body.classList.add("expose-active");
-  document.body.setAttribute("aria-label", "Mission Control");
+  document.body.setAttribute("aria-label", "Overview");
   syncSpacePager();
   syncMissionSpaceMetrics();
   setChromeInert(true);
