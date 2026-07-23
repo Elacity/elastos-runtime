@@ -63,11 +63,11 @@ export const WINDOW_TOP_INSET = 8;
 export const WINDOW_BOTTOM_INSET = 72;
 export const CONTEXT_MENU_IGNORE_OUTSIDE_MS = 220;
 const HOME_GUI_TEMPLATE_ID = "home-gui-template";
-const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260723l", import.meta.url).href;
+const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260723t", import.meta.url).href;
 const HOME_GUI_UI_STYLESHEET_ID = "home-gui-elastos-ui";
-const HOME_GUI_UI_STYLESHEET_URL = new URL("./elastos-ui.css?v=home-20260723l", import.meta.url).href;
+const HOME_GUI_UI_STYLESHEET_URL = new URL("./elastos-ui.css?v=home-20260723t", import.meta.url).href;
 const HOME_GUI_STYLESHEET_ID = "home-gui-stylesheet";
-const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260723l", import.meta.url).href;
+const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260723t", import.meta.url).href;
 let homeGuiTemplateHtmlPromise = null;
 let homeGuiLaunchToken = "";
 
@@ -1151,9 +1151,124 @@ export function clampDesktopLayoutToViewport() {
   return changed;
 }
 
+/* Tip-busted with home-gui assets so Shelf/Apps pick up new masters. */
+const APP_ICON_ASSET_VERSION = "home-20260723t";
+const APP_ICON_IDS = new Set([
+  "browser",
+  "library",
+  "documents",
+  "inbox",
+  "wallet",
+  "system",
+  "controls",
+  "chat-room",
+  "people",
+  "services",
+  "marketplace",
+  "archive-manager",
+  "gba-emulator",
+  "gba-ucity",
+  "bin",
+  "home",
+  "home-cli",
+  "home-gui",
+  "apps-launcher",
+  "capsules",
+  "security",
+  "elastos",
+  "intelligence",
+  "browser-engine",
+  "browser-exit",
+  "chains",
+  "content-index",
+  "content-storage",
+  "identity",
+  "network",
+  "storage",
+  "wallet-security",
+  "webspaces",
+  "metamask",
+  "unisat",
+  "walletconnect",
+]);
+
+/* Capsule / target names that do not match their icon folder id. */
+const APP_ICON_ALIASES = {
+  trash: "bin",
+  "trash-full": "bin",
+  chat: "chat-room",
+  launcher: "apps-launcher",
+  "browser-engine-adapter": "browser-engine",
+  "exit-provider": "browser-exit",
+  "chain-provider": "chains",
+  "content-block-graph-provider": "content-index",
+  "object-provider": "content-storage",
+  "did-provider": "identity",
+  "net-provider": "network",
+  "ipfs-provider": "storage",
+  "wallet-provider": "wallet-security",
+  "key-provider": "wallet-security",
+  "webspace-provider": "webspaces",
+  "site-provider": "webspaces",
+  "wallet-metamask": "metamask",
+  "wallet-unisat": "unisat",
+  "wallet-walletconnect": "walletconnect",
+  wc: "walletconnect",
+};
+
+export function resolveAppIconId(targetId) {
+  const id = String(targetId || "");
+  if (!id) {
+    return null;
+  }
+  if (APP_ICON_ALIASES[id]) {
+    return APP_ICON_ALIASES[id];
+  }
+  if (APP_ICON_IDS.has(id)) {
+    return id;
+  }
+  if (id.includes("wallet")) {
+    return "wallet";
+  }
+  if (id.includes("ucity")) {
+    return "gba-ucity";
+  }
+  if (id.includes("gba") || id.includes("emu") || id.includes("game")) {
+    return "gba-emulator";
+  }
+  if (id.includes("doc") || id.includes("md") || id.includes("viewer")) {
+    return "documents";
+  }
+  if (id.includes("file")) {
+    return "library";
+  }
+  if (id.includes("room")) {
+    return "chat-room";
+  }
+  return null;
+}
+
+function appIconMarkup(iconId) {
+  const v = APP_ICON_ASSET_VERSION;
+  const src128 = `./icons/${iconId}/icon-128.png?v=${v}`;
+  return `<img class="app-icon-img" src="${src128}" srcset="./icons/${iconId}/icon-64.png?v=${v} 64w, ./icons/${iconId}/icon-128.png?v=${v} 128w, ./icons/${iconId}/icon-256.png?v=${v} 256w" sizes="(max-width: 640px) 48px, 64px" alt="" draggable="false" />`;
+}
+
 export function mountGlyph(container, targetId, forcedTone) {
+  if (!container) {
+    return;
+  }
+  const iconId = resolveAppIconId(targetId);
+  if (iconId) {
+    container.dataset.tone = "raster";
+    container.dataset.icon = iconId;
+    delete container.dataset.forcedTone;
+    container.innerHTML = appIconMarkup(iconId);
+    return;
+  }
   const tone = forcedTone || glyphTone(targetId);
   container.dataset.tone = tone;
+  delete container.dataset.icon;
   container.innerHTML = glyphSvg(targetId);
 }
 

@@ -1,0 +1,223 @@
+{
+  "name": "ElastOS First-Party Icon Expansion",
+  "version": "1.0.0",
+  "basePack": "elastos-app-icons-final-liquid",
+  "assets": [
+    {
+      "id": "browser-engine",
+      "label": "Browser Engine",
+      "metaphor": "Layered rendering viewport with luminous processing core",
+      "provenance": "original-elastos",
+      "files": {
+        "master": "masters/browser-engine.png",
+        "png": {
+          "16": "png/browser-engine/icon-16.png",
+          "32": "png/browser-engine/icon-32.png",
+          "64": "png/browser-engine/icon-64.png",
+          "128": "png/browser-engine/icon-128.png",
+          "256": "png/browser-engine/icon-256.png",
+          "512": "png/browser-engine/icon-512.png",
+          "1024": "png/browser-engine/icon-1024.png"
+        }
+      }
+    },
+    {
+      "id": "browser-exit",
+      "label": "Browser Exit",
+      "metaphor": "Receding glass aperture opening into a bright exterior",
+      "provenance": "original-elastos",
+      "files": {
+        "master": "masters/browser-exit.png",
+        "png": {
+          "16": "png/browser-exit/icon-16.png",
+          "32": "png/browser-exit/icon-32.png",
+          "64": "png/browser-exit/icon-64.png",
+          "128": "png/browser-exit/icon-128.png",
+          "256": "png/browser-exit/icon-256.png",
+          "512": "png/browser-exit/icon-512.png",
+          "1024": "png/browser-exit/icon-1024.png"
+        }
+      }
+    },
+    {
+      "id": "chains",
+      "label": "Chains",
+      "metaphor": "Three interlocked translucent rounded links",
+      "provenance": "original-elastos",
+      "files": {
+        "master": "masters/chains.png",
+        "png": {
+          "16": "png/chains/icon-16.png",
+          "32": "png/chains/icon-32.png",
+          "64": "png/chains/icon-64.png",
+          "128": "png/chains/icon-128.png",
+          "256": "png/chains/icon-256.png",
+          "512": "png/chains/icon-512.png",
+          "1024": "png/chains/icon-1024.png"
+        }
+      }
+    },
+    {
+      "id": "content-index",
+      "label": "Content Index",
+      "metaphor": "Layered tabbed index cards with locator bead",
+      "provenance": "original-elastos",
+      "files": {
+        "master": "masters/content-index.png",
+        "png": {
+          "16": "png/content-index/icon-16.png",
+          "32": "png/content-index/icon-32.png",
+          "64": "png/content-index/icon-64.png",
+          "128": "png/content-index/icon-128.png",
+          "256": "png/content-index/icon-256.png",
+          "512": "png/content-index/icon-512.png",
+          "1024": "png/content-index/icon-1024.png"
+        }
+      }
+    },
+    {
+      "id": "content-storage",
+      "label": "Content Storage",
+      "metaphor": "Translucent content slabs settling into a glass tray",
+      "provenance": "original-elastos",
+      "files": {
+        "master": "masters/content-storage.png",
+        "png": {
+          "16": "png/content-storage/icon-16.png",
+          "32": "png/content-storage/icon-32.png",
+          "64": "png/content-storage/icon-64.png",
+          "128": "png/content-storage/icon-128.png",
+          "256": "png/content-storage/icon-256.png",
+          "512": "png/content-storage/icon-512.png",
+          "1024": "png/content-storage/icon-1024.png"
+        }
+      }
+    },
+    {
+      "id": "identity",
+      "label": "Identity",
+      "metaphor": "Verified personal seal with luminous identity core",
+      "provenance": "original-elastos",
+      "files": {
+        "master": "masters/identity.png",
+        "png": {
+          "16": "png/identity/icon-16.png",
+          "32": "png/identity/icon-32.png",
+          "64": "png/identity/icon-64.png",
+          "128": "png/identity/icon-128.png",
+          "256": "png/identity/icon-256.png",
+          "512": "png/identity/icon-512.png",
+          "1024": "png/identity/icon-1024.png"
+        }
+      }
+    },
+    {
+      "id": "network",
+      "label": "Network",
+      "metaphor": "Persistent five-node mesh across a curved plane",
+      "provenance": "original-elastos",
+      "files": {
+        "master": "masters/network.png",
+        "png": {
+          "16": "png/network/icon-16.png",
+          "32": "png/network/icon-32.png",
+          "64": "png/network/icon-64.png",
+          "128": "png/network/icon-128.png",
+          "256": "png/network/icon-256.png",
+          "512": "png/network/icon-512.png",
+          "1024": "png/network/icon-1024.png"
+        }
+      }
+    },
+    {
+      "id": "storage",
+      "label": "Storage",
+      "metaphor": "Durable infrastructure data volume",
+      "provenance": "original-elastos",
+      "files": {
+        "master": "masters/storage.png",
+        "png": {
+          "16": "png/storage/icon-16.png",
+          "32": "png/storage/icon-32.png",
+          "64": "png/storage/icon-64.png",
+          "128": "png/storage/icon-128.png",
+          "256": "png/storage/icon-256.png",
+          "512": "png/storage/icon-512.png",
+          "1024": "png/storage/icon-1024.png"
+        }
+      }
+    },
+    {
+      "id": "wallet-security",
+      "label": "Wallet Security",
+      "metaphor": "Shield protecting a value capsule",
+      "provenance": "original-elastos",
+      "files": {
+        "master": "masters/wallet-security.png",
+        "png": {
+          "16": "png/wallet-security/icon-16.png",
+          "32": "png/wallet-security/icon-32.png",
+          "64": "png/wallet-security/icon-64.png",
+          "128": "png/wallet-security/icon-128.png",
+          "256": "png/wallet-security/icon-256.png",
+          "512": "png/wallet-security/icon-512.png",
+          "1024": "png/wallet-security/icon-1024.png"
+        }
+      }
+    },
+    {
+      "id": "webspaces",
+      "label": "Webspaces",
+      "metaphor": "Overlapping translucent spatial window planes",
+      "provenance": "original-elastos",
+      "files": {
+        "master": "masters/webspaces.png",
+        "png": {
+          "16": "png/webspaces/icon-16.png",
+          "32": "png/webspaces/icon-32.png",
+          "64": "png/webspaces/icon-64.png",
+          "128": "png/webspaces/icon-128.png",
+          "256": "png/webspaces/icon-256.png",
+          "512": "png/webspaces/icon-512.png",
+          "1024": "png/webspaces/icon-1024.png"
+        }
+      }
+    },
+    {
+      "id": "home-cli",
+      "label": "Home CLI",
+      "metaphor": "Dark glass terminal with command rails and block cursor",
+      "provenance": "original-elastos",
+      "files": {
+        "master": "masters/home-cli.png",
+        "png": {
+          "16": "png/home-cli/icon-16.png",
+          "32": "png/home-cli/icon-32.png",
+          "64": "png/home-cli/icon-64.png",
+          "128": "png/home-cli/icon-128.png",
+          "256": "png/home-cli/icon-256.png",
+          "512": "png/home-cli/icon-512.png",
+          "1024": "png/home-cli/icon-1024.png"
+        }
+      }
+    },
+    {
+      "id": "home-gui",
+      "label": "Home GUI",
+      "metaphor": "Spatial graphical desktop with window, spaces rail and shelf",
+      "provenance": "original-elastos",
+      "files": {
+        "master": "masters/home-gui.png",
+        "png": {
+          "16": "png/home-gui/icon-16.png",
+          "32": "png/home-gui/icon-32.png",
+          "64": "png/home-gui/icon-64.png",
+          "128": "png/home-gui/icon-128.png",
+          "256": "png/home-gui/icon-256.png",
+          "512": "png/home-gui/icon-512.png",
+          "1024": "png/home-gui/icon-1024.png"
+        }
+      }
+    }
+  ]
+}

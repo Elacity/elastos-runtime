@@ -6,12 +6,12 @@ import {
   readStoredBoolean,
   readStoredValue,
   storeValue,
-} from "./wallet-format.js?v=wallet-20260720j";
+} from "./wallet-format.js?v=wallet-20260720k";
 import {
   actionButton,
   methodMark,
   textNode,
-} from "./wallet-render.js?v=wallet-20260720j";
+} from "./wallet-render.js?v=wallet-20260720k";
 
 export function createWalletPreferences({
   closeModal,

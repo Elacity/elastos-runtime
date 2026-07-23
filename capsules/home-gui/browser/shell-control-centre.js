@@ -2,11 +2,11 @@ import {
   closeOtherShellPopovers,
   registerEscapeHandler,
   registerShellPopover,
-} from "./shell-popovers.js?v=home-20260723l";
+} from "./shell-popovers.js?v=home-20260723t";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20260723l";
+} from "./shell-motion.js?v=home-20260723t";
 import {
   fetchJson,
   focusModeEnabled,
@@ -14,16 +14,16 @@ import {
   setDesktopIconsVisible,
   setFocusModeEnabled,
   shellState,
-} from "./shell-core.js?v=home-20260723l";
-import { uiSoundsEnabled, setUiSoundsEnabled, playUiSound } from "./shell-sounds.js?v=home-20260723l";
+} from "./shell-core.js?v=home-20260723t";
+import { uiSoundsEnabled, setUiSoundsEnabled, playUiSound } from "./shell-sounds.js?v=home-20260723t";
 import {
   dockAutoHideEnabled,
   setDockAutoHide,
-} from "./shell-surface.js?v=home-20260723l";
-import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260723l";
-import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260723l";
-import { openTarget } from "./shell-windows.js?v=home-20260723l";
-import { openExpose } from "./shell-expose.js?v=home-20260723l";
+} from "./shell-surface.js?v=home-20260723t";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260723t";
+import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260723t";
+import { openTarget } from "./shell-windows.js?v=home-20260723t";
+import { openExpose } from "./shell-expose.js?v=home-20260723t";
 
 /* Control Centre: the quick layer for controls that already have canonical
    stores — theme, sounds, focus, accent, dock, desktop icons — plus Nearby

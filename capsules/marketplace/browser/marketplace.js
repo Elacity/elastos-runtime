@@ -231,6 +231,88 @@
     `).join("")}</div>`;
   }
 
+  /* First-party liquid masters live in home-gui; App Store loads them via the
+     shared /apps/home-gui/icons/ surface so Shelf and Apps stay one family. */
+  const HOME_ICON_ASSET_VERSION = "home-20260723t";
+  const FIRST_PARTY_ICON_IDS = new Set([
+    "browser",
+    "library",
+    "documents",
+    "inbox",
+    "wallet",
+    "system",
+    "controls",
+    "chat-room",
+    "people",
+    "services",
+    "marketplace",
+    "archive-manager",
+    "gba-emulator",
+    "gba-ucity",
+    "bin",
+    "home",
+    "home-cli",
+    "home-gui",
+    "apps-launcher",
+    "capsules",
+    "security",
+    "elastos",
+    "intelligence",
+    "browser-engine",
+    "browser-exit",
+    "chains",
+    "content-index",
+    "content-storage",
+    "identity",
+    "network",
+    "storage",
+    "wallet-security",
+    "webspaces",
+    "metamask",
+    "unisat",
+    "walletconnect",
+  ]);
+  const FIRST_PARTY_ICON_ALIASES = {
+    trash: "bin",
+    "trash-full": "bin",
+    chat: "chat-room",
+    launcher: "apps-launcher",
+    "browser-engine-adapter": "browser-engine",
+    "exit-provider": "browser-exit",
+    "chain-provider": "chains",
+    "content-block-graph-provider": "content-index",
+    "object-provider": "content-storage",
+    "did-provider": "identity",
+    "net-provider": "network",
+    "ipfs-provider": "storage",
+    "wallet-provider": "wallet-security",
+    "key-provider": "wallet-security",
+    "webspace-provider": "webspaces",
+    "site-provider": "webspaces",
+    "wallet-metamask": "metamask",
+    "wallet-unisat": "unisat",
+    "wallet-walletconnect": "walletconnect",
+    wc: "walletconnect",
+  };
+
+  function resolveFirstPartyIconId(capsule) {
+    const name = String(capsule?.name || "").trim();
+    const launch = String(capsule?.launch_target || "").trim();
+    const candidates = [name, launch].filter(Boolean);
+    for (const raw of candidates) {
+      const id = raw;
+      if (FIRST_PARTY_ICON_ALIASES[id]) return FIRST_PARTY_ICON_ALIASES[id];
+      if (FIRST_PARTY_ICON_IDS.has(id)) return id;
+      if (id.includes("wallet")) return "wallet";
+      if (id.includes("ucity")) return "gba-ucity";
+      if (id.includes("gba") || id.includes("emu") || id.includes("game")) return "gba-emulator";
+      if (id.includes("doc") || id.includes("md") || id.includes("viewer")) return "documents";
+      if (id.includes("file")) return "library";
+      if (id.includes("room")) return "chat-room";
+    }
+    return null;
+  }
+
   function capsuleToApp(capsule, capsulesByName, interfaceEntries) {
     const name = String(capsule.name || "");
     const role = String(capsule.role || "").toLowerCase();
@@ -249,6 +331,7 @@
     const technicalDependencies = requirements
       .map((entry) => String(entry && entry.name || "").trim())
       .filter(Boolean);
+    const iconId = resolveFirstPartyIconId(capsule);
     return {
       id: name,
       name: publicTitle(capsule),
@@ -258,6 +341,7 @@
       size: capsule.cid ? "Verified app" : "Local app",
       version: capsule.version || "",
       icon: appIcon(role),
+      iconId,
       gradient: appGradient(role),
       badges,
       requirements: {
@@ -613,6 +697,10 @@
   }
 
   function appIconHtml(app, extraClass = "") {
+    if (app.iconId) {
+      const src = `/apps/home-gui/icons/${encodeURIComponent(app.iconId)}/icon-128.png?v=${HOME_ICON_ASSET_VERSION}`;
+      return `<span class="app-icon app-icon-raster ${escapeAttr(extraClass)}"><img class="app-icon-img" src="${escapeAttr(src)}" alt="" draggable="false" /></span>`;
+    }
     return `<span class="app-icon ${escapeAttr(app.gradient)} ${escapeAttr(extraClass)}">${icons[app.icon] || icons.package}</span>`;
   }
 

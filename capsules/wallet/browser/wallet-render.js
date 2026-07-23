@@ -3,11 +3,12 @@ import {
   assetColor,
   formatAmount,
   shortAddress,
-} from "./wallet-format.js?v=wallet-20260720j";
+} from "./wallet-format.js?v=wallet-20260720k";
 
 const METHOD_ICON_SRC = Object.freeze({
   metamask: "./icons/metamask.png",
   btc: "./icons/unisat.png",
+  wc: "./icons/walletconnect.png",
   ethereum: "./icons/ethereum.png",
   bitcoin: "./icons/bitcoin.png",
   passkey: "./icons/passkey.png",
@@ -149,6 +150,9 @@ export function methodMarkIconSrc(method, chainNamespace = "") {
   }
   if (method === "btc") {
     return METHOD_ICON_SRC.btc;
+  }
+  if (method === "wc") {
+    return METHOD_ICON_SRC.wc;
   }
   if (method === "passkey") {
     const namespace = String(chainNamespace || "");

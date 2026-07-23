@@ -1,0 +1,433 @@
+{
+  "schemaVersion": 2,
+  "family": "ElastOS First-Party Icons — Final Master",
+  "source": "Original ElastOS commission; generated and refined under the supplied brief",
+  "note": "No SF Symbols, Fluent, Material, Nucleo, or vendor icon assets embedded.",
+  "assets": [
+    {
+      "id": "browser",
+      "label": "Browser",
+      "metaphor": "Gateway lens",
+      "layers": "Two translucent crossing planes and a horizon seam",
+      "ipCheck": "No compass or browser-vendor motif",
+      "files": {
+        "master": "masters/browser.png",
+        "png": {
+          "16": "png/browser/icon-16.png",
+          "32": "png/browser/icon-32.png",
+          "64": "png/browser/icon-64.png",
+          "128": "png/browser/icon-128.png",
+          "256": "png/browser/icon-256.png",
+          "512": "png/browser/icon-512.png",
+          "1024": "png/browser/icon-1024.png"
+        }
+      },
+      "provenance": "original-elastos"
+    },
+    {
+      "id": "library",
+      "label": "Library",
+      "metaphor": "Personal books",
+      "layers": "Four bold book forms with one leaning silhouette",
+      "ipCheck": "Distinct from Finder and Documents",
+      "files": {
+        "master": "masters/library.png",
+        "png": {
+          "16": "png/library/icon-16.png",
+          "32": "png/library/icon-32.png",
+          "64": "png/library/icon-64.png",
+          "128": "png/library/icon-128.png",
+          "256": "png/library/icon-256.png",
+          "512": "png/library/icon-512.png",
+          "1024": "png/library/icon-1024.png"
+        }
+      },
+      "provenance": "original-elastos"
+    },
+    {
+      "id": "documents",
+      "label": "Documents",
+      "metaphor": "Writing pages",
+      "layers": "Foreground glass page over a restrained rear sheet",
+      "ipCheck": "No vendor document glyph",
+      "files": {
+        "master": "masters/documents.png",
+        "png": {
+          "16": "png/documents/icon-16.png",
+          "32": "png/documents/icon-32.png",
+          "64": "png/documents/icon-64.png",
+          "128": "png/documents/icon-128.png",
+          "256": "png/documents/icon-256.png",
+          "512": "png/documents/icon-512.png",
+          "1024": "png/documents/icon-1024.png"
+        }
+      },
+      "provenance": "original-elastos"
+    },
+    {
+      "id": "inbox",
+      "label": "Inbox",
+      "metaphor": "Arrivals intake",
+      "layers": "Cyan foreground tray over two ivory arrival layers",
+      "ipCheck": "No stamp or Mail composition",
+      "files": {
+        "master": "masters/inbox.png",
+        "png": {
+          "16": "png/inbox/icon-16.png",
+          "32": "png/inbox/icon-32.png",
+          "64": "png/inbox/icon-64.png",
+          "128": "png/inbox/icon-128.png",
+          "256": "png/inbox/icon-256.png",
+          "512": "png/inbox/icon-512.png",
+          "1024": "png/inbox/icon-1024.png"
+        }
+      },
+      "provenance": "original-elastos"
+    },
+    {
+      "id": "wallet",
+      "label": "Wallet",
+      "metaphor": "User-controlled value",
+      "layers": "Wallet body, clasp, and contained cards",
+      "ipCheck": "No crypto mark or ambient-authority cue",
+      "files": {
+        "master": "masters/wallet.png",
+        "png": {
+          "16": "png/wallet/icon-16.png",
+          "32": "png/wallet/icon-32.png",
+          "64": "png/wallet/icon-64.png",
+          "128": "png/wallet/icon-128.png",
+          "256": "png/wallet/icon-256.png",
+          "512": "png/wallet/icon-512.png",
+          "1024": "png/wallet/icon-1024.png"
+        }
+      },
+      "provenance": "original-elastos"
+    },
+    {
+      "id": "system",
+      "label": "System",
+      "metaphor": "Machine core",
+      "layers": "Layered graphite processor with amber nucleus",
+      "ipCheck": "Distinct from Settings gears and control rails",
+      "files": {
+        "master": "masters/system.png",
+        "png": {
+          "16": "png/system/icon-16.png",
+          "32": "png/system/icon-32.png",
+          "64": "png/system/icon-64.png",
+          "128": "png/system/icon-128.png",
+          "256": "png/system/icon-256.png",
+          "512": "png/system/icon-512.png",
+          "1024": "png/system/icon-1024.png"
+        }
+      },
+      "provenance": "original-elastos"
+    },
+    {
+      "id": "controls",
+      "label": "Controls",
+      "metaphor": "Adjustments",
+      "layers": "Two broad rails with independently positioned knobs",
+      "ipCheck": "Functionally and visually distinct from System",
+      "files": {
+        "master": "masters/controls.png",
+        "png": {
+          "16": "png/controls/icon-16.png",
+          "32": "png/controls/icon-32.png",
+          "64": "png/controls/icon-64.png",
+          "128": "png/controls/icon-128.png",
+          "256": "png/controls/icon-256.png",
+          "512": "png/controls/icon-512.png",
+          "1024": "png/controls/icon-1024.png"
+        }
+      },
+      "provenance": "original-elastos"
+    },
+    {
+      "id": "chat-room",
+      "label": "Chat",
+      "metaphor": "Conversation",
+      "layers": "Single lifted mint bubble with three bold points",
+      "ipCheck": "No Messages/iMessage treatment",
+      "files": {
+        "master": "masters/chat-room.png",
+        "png": {
+          "16": "png/chat-room/icon-16.png",
+          "32": "png/chat-room/icon-32.png",
+          "64": "png/chat-room/icon-64.png",
+          "128": "png/chat-room/icon-128.png",
+          "256": "png/chat-room/icon-256.png",
+          "512": "png/chat-room/icon-512.png",
+          "1024": "png/chat-room/icon-1024.png"
+        }
+      },
+      "provenance": "original-elastos"
+    },
+    {
+      "id": "people",
+      "label": "People",
+      "metaphor": "Relationships",
+      "layers": "Overlapping blue and mint figures with chromatic separation",
+      "ipCheck": "No Contacts card or address-book clone",
+      "files": {
+        "master": "masters/people.png",
+        "png": {
+          "16": "png/people/icon-16.png",
+          "32": "png/people/icon-32.png",
+          "64": "png/people/icon-64.png",
+          "128": "png/people/icon-128.png",
+          "256": "png/people/icon-256.png",
+          "512": "png/people/icon-512.png",
+          "1024": "png/people/icon-1024.png"
+        }
+      },
+      "provenance": "original-elastos"
+    },
+    {
+      "id": "services",
+      "label": "Sharing",
+      "metaphor": "Capability handoff",
+      "layers": "Three connected colored nodes",
+      "ipCheck": "No AirDrop rings or radio-wave clone",
+      "files": {
+        "master": "masters/services.png",
+        "png": {
+          "16": "png/services/icon-16.png",
+          "32": "png/services/icon-32.png",
+          "64": "png/services/icon-64.png",
+          "128": "png/services/icon-128.png",
+          "256": "png/services/icon-256.png",
+          "512": "png/services/icon-512.png",
+          "1024": "png/services/icon-1024.png"
+        }
+      },
+      "provenance": "original-elastos"
+    },
+    {
+      "id": "marketplace",
+      "label": "Apps",
+      "metaphor": "Capsule catalog",
+      "layers": "Completely unmarked orange market bag",
+      "ipCheck": "No App Store A or ElastOS badge",
+      "files": {
+        "master": "masters/marketplace.png",
+        "png": {
+          "16": "png/marketplace/icon-16.png",
+          "32": "png/marketplace/icon-32.png",
+          "64": "png/marketplace/icon-64.png",
+          "128": "png/marketplace/icon-128.png",
+          "256": "png/marketplace/icon-256.png",
+          "512": "png/marketplace/icon-512.png",
+          "1024": "png/marketplace/icon-1024.png"
+        }
+      },
+      "provenance": "original-elastos"
+    },
+    {
+      "id": "archive-manager",
+      "label": "Archive",
+      "metaphor": "Packed history",
+      "layers": "Ivory archive box, lid, and single pull",
+      "ipCheck": "No vendor archive glyph",
+      "files": {
+        "master": "masters/archive-manager.png",
+        "png": {
+          "16": "png/archive-manager/icon-16.png",
+          "32": "png/archive-manager/icon-32.png",
+          "64": "png/archive-manager/icon-64.png",
+          "128": "png/archive-manager/icon-128.png",
+          "256": "png/archive-manager/icon-256.png",
+          "512": "png/archive-manager/icon-512.png",
+          "1024": "png/archive-manager/icon-1024.png"
+        }
+      },
+      "provenance": "original-elastos"
+    },
+    {
+      "id": "gba-emulator",
+      "label": "GBA Emulator",
+      "metaphor": "Generic handheld play",
+      "layers": "Charcoal handheld with screen and simple controls",
+      "ipCheck": "No Nintendo trade dress or marks",
+      "files": {
+        "master": "masters/gba-emulator.png",
+        "png": {
+          "16": "png/gba-emulator/icon-16.png",
+          "32": "png/gba-emulator/icon-32.png",
+          "64": "png/gba-emulator/icon-64.png",
+          "128": "png/gba-emulator/icon-128.png",
+          "256": "png/gba-emulator/icon-256.png",
+          "512": "png/gba-emulator/icon-512.png",
+          "1024": "png/gba-emulator/icon-1024.png"
+        }
+      },
+      "provenance": "original-elastos"
+    },
+    {
+      "id": "gba-ucity",
+      "label": "uCity",
+      "metaphor": "City world",
+      "layers": "Large translucent city blocks with amber sun",
+      "ipCheck": "Original game-world silhouette",
+      "files": {
+        "master": "masters/gba-ucity.png",
+        "png": {
+          "16": "png/gba-ucity/icon-16.png",
+          "32": "png/gba-ucity/icon-32.png",
+          "64": "png/gba-ucity/icon-64.png",
+          "128": "png/gba-ucity/icon-128.png",
+          "256": "png/gba-ucity/icon-256.png",
+          "512": "png/gba-ucity/icon-512.png",
+          "1024": "png/gba-ucity/icon-1024.png"
+        }
+      },
+      "provenance": "original-elastos"
+    },
+    {
+      "id": "bin",
+      "label": "Bin",
+      "metaphor": "Dock-native empty bin",
+      "layers": "Plate-free translucent silver-grey bin object",
+      "ipCheck": "No Apple Trash photorealism",
+      "files": {
+        "master": "masters/bin.png",
+        "png": {
+          "16": "png/bin/icon-16.png",
+          "32": "png/bin/icon-32.png",
+          "64": "png/bin/icon-64.png",
+          "128": "png/bin/icon-128.png",
+          "256": "png/bin/icon-256.png",
+          "512": "png/bin/icon-512.png",
+          "1024": "png/bin/icon-1024.png"
+        }
+      },
+      "provenance": "original-elastos",
+      "plateFree": true
+    },
+    {
+      "id": "home",
+      "label": "Home",
+      "metaphor": "Personal home",
+      "layers": "Ivory room outline with warm doorway",
+      "ipCheck": "No logo badge",
+      "files": {
+        "master": "masters/home.png",
+        "png": {
+          "16": "png/home/icon-16.png",
+          "32": "png/home/icon-32.png",
+          "64": "png/home/icon-64.png",
+          "128": "png/home/icon-128.png",
+          "256": "png/home/icon-256.png",
+          "512": "png/home/icon-512.png",
+          "1024": "png/home/icon-1024.png"
+        }
+      },
+      "provenance": "original-elastos"
+    },
+    {
+      "id": "apps-launcher",
+      "label": "Apps Launcher",
+      "metaphor": "Dock-native application grid",
+      "layers": "Nine light-grey rounded glass cells on a fully transparent canvas",
+      "ipCheck": "Neutral launcher convention; no plate, color branding, or App Store language",
+      "files": {
+        "master": "masters/apps-launcher.png",
+        "png": {
+          "16": "png/apps-launcher/icon-16.png",
+          "32": "png/apps-launcher/icon-32.png",
+          "64": "png/apps-launcher/icon-64.png",
+          "128": "png/apps-launcher/icon-128.png",
+          "256": "png/apps-launcher/icon-256.png",
+          "512": "png/apps-launcher/icon-512.png",
+          "1024": "png/apps-launcher/icon-1024.png"
+        }
+      },
+      "provenance": "original-elastos",
+      "variants": {
+        "lightDock": "variants/apps-launcher/light-dock",
+        "darkDock": "variants/apps-launcher/dark-dock"
+      }
+    },
+    {
+      "id": "capsules",
+      "label": "Capsules",
+      "metaphor": "Isolated software capsules",
+      "layers": "Five glass-blue capsules in a grounded pile",
+      "ipCheck": "No orange arrow or pharmaceutical markings",
+      "files": {
+        "master": "masters/capsules.png",
+        "png": {
+          "16": "png/capsules/icon-16.png",
+          "32": "png/capsules/icon-32.png",
+          "64": "png/capsules/icon-64.png",
+          "128": "png/capsules/icon-128.png",
+          "256": "png/capsules/icon-256.png",
+          "512": "png/capsules/icon-512.png",
+          "1024": "png/capsules/icon-1024.png"
+        }
+      },
+      "provenance": "original-elastos"
+    },
+    {
+      "id": "security",
+      "label": "Security",
+      "metaphor": "Protected core",
+      "layers": "Layered graphite shield with ivory-blue nucleus",
+      "ipCheck": "No lock, checkmark, logo, or god-mode cue",
+      "files": {
+        "master": "masters/security.png",
+        "png": {
+          "16": "png/security/icon-16.png",
+          "32": "png/security/icon-32.png",
+          "64": "png/security/icon-64.png",
+          "128": "png/security/icon-128.png",
+          "256": "png/security/icon-256.png",
+          "512": "png/security/icon-512.png",
+          "1024": "png/security/icon-1024.png"
+        }
+      },
+      "provenance": "original-elastos"
+    },
+    {
+      "id": "elastos",
+      "label": "ElastOS",
+      "metaphor": "Dedicated ElastOS identity",
+      "layers": "Canonical ivory/orange folded-layer mark",
+      "ipCheck": "Only explicit ElastOS logo in the family",
+      "files": {
+        "master": "masters/elastos.png",
+        "png": {
+          "16": "png/elastos/icon-16.png",
+          "32": "png/elastos/icon-32.png",
+          "64": "png/elastos/icon-64.png",
+          "128": "png/elastos/icon-128.png",
+          "256": "png/elastos/icon-256.png",
+          "512": "png/elastos/icon-512.png",
+          "1024": "png/elastos/icon-1024.png"
+        }
+      },
+      "provenance": "original-elastos"
+    },
+    {
+      "id": "intelligence",
+      "label": "Intelligence",
+      "metaphor": "Reasoning core and connected facets",
+      "layers": "Three translucent cobalt/cyan/mint perspectives synthesize around a warm luminous core",
+      "ipCheck": "Original non-anthropomorphic metaphor; no brain, eye, robot, sparkle, Apple Intelligence loop, OpenAI knot, Gemini or Copilot shape",
+      "files": {
+        "master": "masters/intelligence.png",
+        "png": {
+          "16": "png/intelligence/icon-16.png",
+          "32": "png/intelligence/icon-32.png",
+          "64": "png/intelligence/icon-64.png",
+          "128": "png/intelligence/icon-128.png",
+          "256": "png/intelligence/icon-256.png",
+          "512": "png/intelligence/icon-512.png",
+          "1024": "png/intelligence/icon-1024.png"
+        }
+      },
+      "provenance": "original-elastos"
+    }
+  ]
+}

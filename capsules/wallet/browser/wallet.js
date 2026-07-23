@@ -1,9 +1,9 @@
-import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260720j";
+import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260720k";
 import { createWalletApi,
   readHomeOrigin,
   readLaunchToken,
-  readQueryParam } from "./wallet-api.js?v=wallet-20260720j";
-import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260720j";
+  readQueryParam } from "./wallet-api.js?v=wallet-20260720k";
+import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260720k";
 import {
   BALANCE_NETWORKS,
   MANAGED_CHAIN_NAMESPACES,
@@ -23,14 +23,14 @@ import {
   readText,
   shortAddress,
   validateAddress,
-} from "./wallet-format.js?v=wallet-20260720j";
-import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260720j";
-import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260720j";
-import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260720j";
-import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260720j";
-import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260720j";
-import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260720j";
-import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260720j";
+} from "./wallet-format.js?v=wallet-20260720k";
+import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260720k";
+import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260720k";
+import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260720k";
+import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260720k";
+import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260720k";
+import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260720k";
+import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260720k";
 import {
   accountCard,
   copyButton,
@@ -40,7 +40,7 @@ import {
   methodMark,
   setBusy,
   textNode,
-} from "./wallet-render.js?v=wallet-20260720j";
+} from "./wallet-render.js?v=wallet-20260720k";
 
 const statusNode = document.querySelector("#wallet-status");
 const homeParentOrigin = readHomeOrigin();

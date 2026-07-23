@@ -16,11 +16,11 @@ import {
   toolbarActiveTitleNode,
   canonicalTargetTitle,
   targetTitle,
-} from "./shell-core.js?v=home-20260723l";
+} from "./shell-core.js?v=home-20260723t";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20260723l";
+} from "./shell-motion.js?v=home-20260723t";
 
 /* Resolved lazily — the menubar lives in the lazy GUI template, which is not
    in the DOM at module-evaluation time. */

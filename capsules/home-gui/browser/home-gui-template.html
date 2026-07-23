@@ -470,7 +470,7 @@
         aria-expanded="false"
         data-label="Apps"
       >
-        <span class="taskbar-icon taskbar-icon-launcher"></span>
+        <span class="taskbar-icon taskbar-icon-launcher" aria-hidden="true"></span>
       </button>
       <div id="taskbar-targets" class="taskbar-sortable" aria-label="Shelf items"></div>
     </div>
@@ -735,11 +735,12 @@
       <span class="taskbar-icon">
         <span class="taskbar-item-icon"></span>
         <span class="taskbar-notification-badge" hidden></span>
+        <!-- Nested in .taskbar-icon so dock magnification lifts the chip with the tile. -->
+        <span class="taskbar-window-count" role="button" tabindex="0" hidden>
+          <span class="taskbar-window-count-chip"></span>
+        </span>
       </span>
       <span class="active-taskbar-indicator" aria-hidden="true"></span>
-    </button>
-    <button class="taskbar-window-count" type="button" hidden>
-      <span class="taskbar-window-count-chip"></span>
     </button>
   </div>
 </template>

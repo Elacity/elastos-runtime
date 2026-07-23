@@ -1,4 +1,4 @@
-import { pendingRequests } from "./wallet-activity.js?v=wallet-20260720j";
+import { pendingRequests } from "./wallet-activity.js?v=wallet-20260720k";
 import {
   isBitcoinProofRequest,
   isManagedRequest,
@@ -6,8 +6,8 @@ import {
   requestTiming,
   requestTitle,
   shortAddress,
-} from "./wallet-format.js?v=wallet-20260720j";
-import { actionButton, setBusy, textNode } from "./wallet-render.js?v=wallet-20260720j";
+} from "./wallet-format.js?v=wallet-20260720k";
+import { actionButton, setBusy, textNode } from "./wallet-render.js?v=wallet-20260720k";
 
 export function createWalletRequests({
   fetchJson,

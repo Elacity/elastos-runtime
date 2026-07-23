@@ -1829,7 +1829,7 @@ const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
 const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260723a";
-const homeGuiAssetVersion = "home-20260723l";
+const homeGuiAssetVersion = "home-20260723t";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -4761,7 +4761,7 @@ assert(
     read("capsules/marketplace/browser/marketplace.js").includes(
       "selectDestination(item.dataset.destination)",
     ) &&
-    read("capsules/marketplace/browser/index.html").includes("marketplace-20260720g") &&
+    read("capsules/marketplace/browser/index.html").includes("marketplace-20260720j") &&
     read("capsules/marketplace/browser/index.html").includes('aria-label="Apps"') &&
     !read("capsules/marketplace/browser/index.html").includes('aria-label="Store"') &&
     read("capsules/wallet-metamask/browser/style.css").includes("Apps-level continuous plate") &&

@@ -4,8 +4,8 @@ import {
   isPasskeyManagedAccount,
   readText,
   shortAddress,
-} from "./wallet-format.js?v=wallet-20260720j";
-import { pulseCopied, setBusy, textNode } from "./wallet-render.js?v=wallet-20260720j";
+} from "./wallet-format.js?v=wallet-20260720k";
+import { pulseCopied, setBusy, textNode } from "./wallet-render.js?v=wallet-20260720k";
 
 const accountsSurface = { surface: "accounts" };
 

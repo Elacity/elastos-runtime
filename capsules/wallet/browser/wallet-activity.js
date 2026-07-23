@@ -1,4 +1,4 @@
-import { readText, relativeTime, requestTitle, shortAddress } from "./wallet-format.js?v=wallet-20260720j";
+import { readText, relativeTime, requestTitle, shortAddress } from "./wallet-format.js?v=wallet-20260720k";
 
 export function createWalletActivity({
   activityNode,

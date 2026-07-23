@@ -50,7 +50,7 @@ import {
   mutateDesktopObject,
   formatBadgeCount,
   focusModeEnabled,
-} from "./shell-core.js?v=home-20260723l";
+} from "./shell-core.js?v=home-20260723t";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -64,19 +64,19 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260723l";
-import { playUiSound } from "./shell-sounds.js?v=home-20260723l";
+} from "./shell-windows.js?v=home-20260723t";
+import { playUiSound } from "./shell-sounds.js?v=home-20260723t";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
   setOverlayOpen,
-} from "./shell-popovers.js?v=home-20260723l";
+} from "./shell-popovers.js?v=home-20260723t";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20260723l";
-import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260723l";
-import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260723l";
+} from "./shell-motion.js?v=home-20260723t";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260723t";
+import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260723t";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -549,6 +549,12 @@ function syncTaskbarGroupButton(entry, targetId, title, openCount) {
   };
   countButton.onclick = (event) => {
     if (event.detail !== 0) {
+      return;
+    }
+    openGroupMenu(event);
+  };
+  countButton.onkeydown = (event) => {
+    if (event.key !== "Enter" && event.key !== " ") {
       return;
     }
     openGroupMenu(event);
@@ -2338,17 +2344,17 @@ function hideHomeNotificationToast() {
 }
 
 /* ---- Dock behavior: magnification, tooltips, launch bounce ----
-   Magnification is paint-only: layout slots stay fixed at 40px so hit targets
-   never move; only the inner .taskbar-icon scales (origin bottom-center) with
-   a cosine falloff around the pointer. Icon centers are cached on hover entry;
+   Magnification is paint-only: layout slots stay fixed so hit targets never
+   move; only the inner .taskbar-icon scales (origin bottom-center) with a
+   cosine falloff around the pointer. Icon centers are cached on hover entry;
    pointermove only reads clientX and writes transforms inside one rAF per
    frame. Disabled while dragging and under prefers-reduced-motion. */
 /* Mild Shelf wave (Wave 2a) — alive neighbors without Apple 1.55/0.3 envelope. */
 const DOCK_MAG_MAX_SCALE = 1.32;
-const DOCK_MAG_RANGE_PX = 88;
+const DOCK_MAG_RANGE_PX = 104;
 const DOCK_MAG_LIFT_RATIO = 0.35;
 const DOCK_MAG_SPREAD = 0.15;
-const DOCK_ICON_BASE_PX = 40;
+const DOCK_ICON_BASE_PX = 48;
 const DOCK_TOOLTIP_SHOW_MS = 320;
 const DOCK_TOOLTIP_HIDE_MS = 100;
 
@@ -2383,11 +2389,9 @@ function rebuildDockIconCache() {
     dockState.taskbar.querySelectorAll(".taskbar-item:not(.taskbar-item-launcher)"),
   ).map((item) => {
     const rect = item.getBoundingClientRect();
-    const entry = item.closest(".taskbar-entry");
     return {
       node: item.querySelector(".taskbar-icon"),
       item,
-      count: entry?.querySelector(".taskbar-window-count") || null,
       center: rect.left + rect.width / 2,
     };
   });
@@ -2412,9 +2416,6 @@ function resetDockMagnification() {
   for (const entry of dockState.icons) {
     if (entry.node) {
       entry.node.style.transform = "";
-    }
-    if (entry.count) {
-      entry.count.style.transform = "";
     }
     entry.item?.style.removeProperty("--dock-shift");
   }
@@ -2464,19 +2465,11 @@ function applyDockMagnification() {
     }
     if (scale <= 1.004 && Math.abs(shift) < 0.5) {
       entry.node.style.transform = "";
-      if (entry.count) {
-        entry.count.style.transform = "";
-      }
       entry.item?.style.removeProperty("--dock-shift");
       continue;
     }
     const lift = -(scale - 1) * DOCK_ICON_BASE_PX * DOCK_MAG_LIFT_RATIO;
-    const transform = `translate(${shift.toFixed(2)}px, ${lift.toFixed(2)}px) scale(${scale.toFixed(3)})`;
-    entry.node.style.transform = transform;
-    /* Window-count sits on the same 40×40 icon slot with matching origin. */
-    if (entry.count) {
-      entry.count.style.transform = transform;
-    }
+    entry.node.style.transform = `translate(${shift.toFixed(2)}px, ${lift.toFixed(2)}px) scale(${scale.toFixed(3)})`;
     entry.item?.style.setProperty("--dock-shift", `${shift.toFixed(2)}px`);
   }
   /* Keep launcher paint-static even if a stale transform lingered. */

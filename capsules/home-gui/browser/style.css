@@ -47,8 +47,11 @@
      and the dock clearance — system chrome is never covered. */
   --stage-top: calc(var(--toolbar-h) + env(safe-area-inset-top, 0px));
   --stage-bottom: calc(var(--taskbar-h) + var(--taskbar-offset) + 10px + env(safe-area-inset-bottom, 0px));
-  --taskbar-h: 60px;
+  /* Shelf scale: slightly larger than the original 60/50/40 for XDR density. */
+  --taskbar-h: 72px;
   --taskbar-offset: 12px;
+  --dock-icon-slot: 58px;
+  --dock-icon-pad: 5px;
   --desktop-wallpaper: url("./wallpaper.webp");
   /* Shell chrome motion — water, not switches. */
   --shell-motion-enter: 160ms;
@@ -3010,12 +3013,35 @@ body.expose-active .expose-empty {
     0 8px 18px rgba(0, 0, 0, 0.18);
 }
 
+/* Full-color masters already include the squircle plate — drop tone chrome. */
+.app-glyph[data-tone="raster"],
+.taskbar-item-icon[data-tone="raster"],
+.window-head-icon[data-tone="raster"],
+.desktop-shortcut-icon[data-tone="raster"],
+.launcher-item-icon[data-tone="raster"] {
+  background: transparent;
+  box-shadow: none;
+  color: transparent;
+  overflow: visible;
+}
+
 .app-glyph svg,
 .taskbar-item-icon svg,
 .window-head-icon svg {
   width: 56%;
   height: 56%;
   display: block;
+}
+
+.app-icon-img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+  border-radius: inherit;
+  pointer-events: none;
+  -webkit-user-drag: none;
+  user-select: none;
 }
 
 .app-glyph[data-tone="system"],
@@ -3073,9 +3099,9 @@ body.expose-active .expose-empty {
   width: max-content;
   max-width: calc(100vw - 48px);
   height: var(--taskbar-h);
-  padding-left: 12px;
-  padding-right: 12px;
-  border-radius: 20px;
+  padding-left: 14px;
+  padding-right: 14px;
+  border-radius: 22px;
   background-color: var(--dock-fill);
   box-shadow:
     inset 0 0 0 0.5px var(--hairline),
@@ -3263,9 +3289,9 @@ body.dock-autohide::after {
   justify-content: flex-start;
   min-width: 12px;
   max-width: 100%;
-  min-height: 50px;
+  min-height: var(--dock-icon-slot);
   padding: 0 2px;
-  gap: 2px;
+  gap: 3px;
   /* Magnified icons and tooltips must escape the pill: no clipping here. */
   overflow: visible;
   border-radius: 14px;
@@ -3283,14 +3309,14 @@ body.dock-autohide::after {
 
 .taskbar-item {
   position: relative;
-  width: 50px;
-  height: 50px;
+  width: var(--dock-icon-slot);
+  height: var(--dock-icon-slot);
   /* Icons stay optically centered in the Dock; the running dot is absolute
      and must not participate in that alignment (macOS). */
-  padding: 5px;
+  padding: var(--dock-icon-pad);
   display: grid;
   place-items: center;
-  border-radius: 10px;
+  border-radius: 12px;
   /* Running capsules sit slightly below the tile — don't clip them. */
   overflow: visible;
   touch-action: none;
@@ -3330,7 +3356,7 @@ body.dock-autohide::after {
   display: grid;
   place-items: center;
   border-radius: 10px;
-  /* Magnification is transform-only on this inner node: the 40px layout slot
+  /* Magnification is transform-only on this inner node: the layout slot
      (and hit target) never moves. Grows upward from the dock floor. */
   transform-origin: 50% 100%;
   transition: transform 90ms cubic-bezier(0.2, 0, 0, 1);
@@ -3380,33 +3406,26 @@ body.dock-autohide::after {
 
 .taskbar-entry {
   position: relative;
-  flex: 0 0 50px;
-  width: 50px;
-  height: 50px;
+  flex: 0 0 var(--dock-icon-slot);
+  width: var(--dock-icon-slot);
+  height: var(--dock-icon-slot);
 }
 
-/* Window-count overlays the same 40×40 icon slot (5px inset of the 50px
-   entry) so dock magnification can apply an identical transform/origin and
-   the chip rides the icon lift instead of staying pinned to the entry. */
+/* Window-count lives inside .taskbar-icon so magnification lift/scale owns it. */
 .taskbar-window-count {
   position: absolute;
-  top: 5px;
-  left: 5px;
-  width: 40px;
-  height: 40px;
+  top: -3px;
+  right: -4px;
+  z-index: 2;
   min-width: 0;
   padding: 0;
   margin: 0;
-  display: flex;
-  align-items: flex-start;
-  justify-content: flex-end;
+  border: 0;
   background: transparent;
   box-shadow: none;
-  border: 0;
   cursor: pointer;
-  z-index: 2;
-  transform-origin: 50% 100%;
-  transition: transform 90ms cubic-bezier(0.2, 0, 0, 1);
+  display: grid;
+  place-items: center;
 }
 
 .taskbar-window-count-chip {
@@ -3426,7 +3445,6 @@ body.dock-autohide::after {
     0 0 0 1px rgba(255, 255, 255, 0.18),
     0 2px 8px rgba(0, 0, 0, 0.28);
   pointer-events: none;
-  transform: translate(4px, -3px);
 }
 
 .taskbar-window-count:hover .taskbar-window-count-chip,
@@ -3438,7 +3456,7 @@ body.dock-autohide::after {
 .taskbar-window-count:focus-visible {
   outline: 2px solid var(--brand-focus);
   outline-offset: 1px;
-  border-radius: 12px;
+  border-radius: 999px;
 }
 
 :root[data-el-theme="light"] .taskbar-window-count-chip {
@@ -3459,25 +3477,23 @@ body.dock-autohide::after {
   display: none;
 }
 
-.taskbar-icon-launcher::before {
-  content: "";
-  width: 22px;
-  height: 22px;
-  display: block;
+/* Apps launcher — first-party raster (no CSS 4-square). */
+/* Plate-free Apps launcher dock variants.
+   Dark mode → dark-dock (lighter cells). Light mode → light-dock (darker cells). */
+.taskbar-icon-launcher {
   background:
-    linear-gradient(#ffffff 0 0) left top / 9px 9px no-repeat,
-    linear-gradient(#ffffff 0 0) right top / 9px 9px no-repeat,
-    linear-gradient(#ffffff 0 0) left bottom / 9px 9px no-repeat,
-    linear-gradient(#ffffff 0 0) right bottom / 9px 9px no-repeat;
-  opacity: 0.92;
+    url("./icons/apps-launcher/dark-dock/icon-64.png?v=home-20260723t")
+      center / contain no-repeat;
 }
 
-:root[data-el-theme="light"] .taskbar-icon-launcher::before {
-  background:
-    linear-gradient(#3a4358 0 0) left top / 9px 9px no-repeat,
-    linear-gradient(#3a4358 0 0) right top / 9px 9px no-repeat,
-    linear-gradient(#3a4358 0 0) left bottom / 9px 9px no-repeat,
-    linear-gradient(#3a4358 0 0) right bottom / 9px 9px no-repeat;
+:root[data-el-theme="light"] .taskbar-icon-launcher {
+  background-image:
+    url("./icons/apps-launcher/light-dock/icon-64.png?v=home-20260723t");
+}
+
+.taskbar-icon-launcher::before {
+  content: none;
+  display: none;
 }
 
 /* Shelf running indicator — short capsule in the air under the tile (not glued,
@@ -3517,8 +3533,8 @@ body.dock-autohide::after {
 .taskbar-separator {
   flex: 0 0 1px;
   width: 1px;
-  height: 32px;
-  margin: 0 5px;
+  height: 38px;
+  margin: 0 6px;
   border-radius: 1px;
   background: var(--hairline);
 }
