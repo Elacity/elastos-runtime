@@ -471,8 +471,28 @@
   aria-hidden="true"
   aria-label="Agent"
 >
-  <aside class="agent-harness-sidebar" aria-label="Agent sessions">
-    <div class="agent-harness-brand">Agent</div>
+  <button
+    type="button"
+    id="agent-harness-scrim"
+    class="agent-harness-scrim"
+    hidden
+    aria-hidden="true"
+    tabindex="-1"
+    aria-label="Close sessions"
+  ></button>
+  <aside id="agent-harness-sidebar" class="agent-harness-sidebar" aria-label="Agent sessions">
+    <div class="agent-harness-sidebar-head">
+      <div class="agent-harness-brand">Agent</div>
+      <button
+        id="agent-harness-drawer-close"
+        class="agent-harness-drawer-close"
+        type="button"
+        aria-label="Close sessions"
+        title="Close"
+      >
+        <span aria-hidden="true">×</span>
+      </button>
+    </div>
     <div class="agent-harness-segment" role="group" aria-label="Chat mode">
       <button class="agent-harness-segment-btn is-active" type="button" data-segment="general" aria-pressed="true">
         General
@@ -514,7 +534,20 @@
     <div class="agent-harness-sessions" id="agent-harness-session-list"></div>
   </aside>
   <div class="agent-harness-main">
-    <h2 class="visually-hidden" id="agent-harness-title">New chat</h2>
+    <div class="agent-harness-mobile-bar">
+      <button
+        id="agent-harness-drawer-open"
+        class="agent-harness-drawer-toggle"
+        type="button"
+        aria-label="Open sessions"
+        aria-expanded="false"
+        aria-controls="agent-harness-sidebar"
+        title="Sessions"
+      >
+        <span class="agent-harness-drawer-toggle-mark" aria-hidden="true"></span>
+      </button>
+      <h2 id="agent-harness-title" class="agent-harness-title">New chat</h2>
+    </div>
     <div class="agent-harness-truth visually-hidden" aria-hidden="true">
       <span>On this device</span>
       <span>Tools: none</span>

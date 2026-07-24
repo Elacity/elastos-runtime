@@ -8,7 +8,7 @@ import {
   syncAgentSendButton,
   composerInput as shelfComposerInput,
   hideAgentShelfFace,
-} from "./agent-shelf.js?v=home-20260724an";
+} from "./agent-shelf.js?v=home-20260724ap";
 import {
   enableHarnessMenubarReveal,
   clearHarnessMenubarReveal,
@@ -17,13 +17,17 @@ import {
   getActiveStageId,
   isAgentSpace,
   setActiveStage,
-} from "./shell-stages.js?v=home-20260724an";
+  syncSpacePager,
+} from "./shell-stages.js?v=home-20260724ap";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724ap";
 
-const TIP = "home-20260724an";
+const TIP = "home-20260724ap";
 const HOME_BREATHE_MS = 780;
 const HOME_RISE_MS = 720;
 const HARNESS_CONTENT_AT_MS = 180;
 const PARTICLE_COUNT = 420;
+/** Part X — drawer / pill composer breakpoint (matches Outputs-hide). */
+const HARNESS_NARROW_MQ = "(max-width: 900px)";
 
 const MOCK_REPLY =
   "I'm a local preview on this machine — not live inference yet.\n\n" +
@@ -106,6 +110,36 @@ function prefersReducedMotion() {
  * Lock stream column to the live Shelf composer box — same left + width to the px.
  * Also keeps the under-dock fade flush with the composer top.
  */
+function isNarrowHarness() {
+  return (
+    typeof window.matchMedia === "function" &&
+    window.matchMedia(HARNESS_NARROW_MQ).matches
+  );
+}
+
+function setHarnessDrawerOpen(open) {
+  const next = Boolean(open) && active && isNarrowHarness();
+  document.body.classList.toggle("agent-harness-drawer-open", next);
+  const scrim = document.querySelector("#agent-harness-scrim");
+  if (scrim) {
+    scrim.hidden = !next;
+    scrim.setAttribute("aria-hidden", next ? "false" : "true");
+  }
+  const toggle = document.querySelector("#agent-harness-drawer-open");
+  toggle?.setAttribute("aria-expanded", next ? "true" : "false");
+}
+
+function closeHarnessDrawer() {
+  setHarnessDrawerOpen(false);
+}
+
+function openHarnessDrawer() {
+  if (!active || !isNarrowHarness()) {
+    return;
+  }
+  setHarnessDrawerOpen(true);
+}
+
 function syncComposerGeometry() {
   const taskbar = document.querySelector(".taskbar");
   const main = document.querySelector(".agent-harness-main");
@@ -610,6 +644,7 @@ export function showAgentHarness({ prompt, fromShelf = false, syncStage = true }
 
   const motionGen = (harnessMotionGen += 1);
   active = true;
+  closeHarnessDrawer();
   clearHarnessMenubarReveal();
   document.body.classList.add("agent-harness-active");
   setHarnessChromeInert(true);
@@ -731,6 +766,7 @@ export function hideAgentHarness({ restoreShelfApps = true, syncStage = true } =
   stopMockStream({ keepPartial: true });
   stopParticles();
   active = false;
+  closeHarnessDrawer();
 
   const harness = harnessEl();
   harness?.classList.remove("is-visible");
@@ -827,17 +863,56 @@ export function bindAgentHarness() {
   }
   bound = true;
 
-  /* Esc owned by Shelf (`hideAgentShelfFace`) — one reverse dance, not harness-then-shelf. */
+  /* Esc: drawer (85) before Shelf reverse dance (75). */
+  registerEscapeHandler("agent-harness-drawer", {
+    priority: 85,
+    isActive: () =>
+      active && document.body.classList.contains("agent-harness-drawer-open"),
+    dismiss: () => closeHarnessDrawer(),
+  });
+
+  if (typeof window.matchMedia === "function") {
+    const narrowMq = window.matchMedia(HARNESS_NARROW_MQ);
+    const onNarrowChange = () => {
+      closeHarnessDrawer();
+      if (active) {
+        syncComposerGeometry();
+      }
+      syncSpacePager();
+    };
+    if (typeof narrowMq.addEventListener === "function") {
+      narrowMq.addEventListener("change", onNarrowChange);
+    } else if (typeof narrowMq.addListener === "function") {
+      narrowMq.addListener(onNarrowChange);
+    }
+  }
 
   document.addEventListener("click", (event) => {
+    if (event.target.closest?.("#agent-harness-drawer-open")) {
+      event.preventDefault();
+      openHarnessDrawer();
+      return;
+    }
+    if (
+      event.target.closest?.("#agent-harness-drawer-close") ||
+      event.target.closest?.("#agent-harness-scrim")
+    ) {
+      event.preventDefault();
+      closeHarnessDrawer();
+      return;
+    }
     if (event.target.closest?.("#agent-harness-home")) {
       event.preventDefault();
+      closeHarnessDrawer();
       hideAgentShelfFace();
       return;
     }
     if (event.target.closest?.("#agent-harness-new-chat")) {
       event.preventDefault();
       newChat();
+      if (isNarrowHarness()) {
+        closeHarnessDrawer();
+      }
       return;
     }
     const copyCode = event.target.closest?.(".agent-md-copy");
@@ -876,6 +951,9 @@ export function bindAgentHarness() {
       activeSessionId = sessionBtn.closest(".agent-harness-session")?.dataset.sessionId || null;
       renderSessions();
       renderActiveSession();
+      if (isNarrowHarness()) {
+        closeHarnessDrawer();
+      }
       return;
     }
     const menu = event.target.closest?.(".agent-harness-session-menu");

@@ -1829,7 +1829,7 @@ const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
 const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260723a";
-const homeGuiAssetVersion = "home-20260724an";
+const homeGuiAssetVersion = "home-20260724ap";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -2427,6 +2427,33 @@ assert(
     ),
   "fx2e: TIP const per file, lifecycle helpers, Agent pin/slide/restore entropy",
 );
+assert(
+  read("capsules/home-gui/browser/shell-stages.js").includes("cancelMenubarHide") &&
+    read("capsules/home-gui/browser/shell-stages.js").includes("bindToolbarMenubarLeave") &&
+    read("capsules/home-gui/browser/shell-stages.js").includes(
+      "Arm once — resetting on every pointermove",
+    ),
+  "fx2e: Agent menubar hide arms once on leave (not sticky on pointermove)",
+);
+assert(
+  read("capsules/home-gui/browser/shell-stages.js").includes(
+    'window.matchMedia("(max-width: 900px)").matches',
+  ) &&
+    read("capsules/home-gui/browser/shell-stages.js").includes("narrow ||") &&
+    shellStyle.includes("#space-pager") &&
+    shellStyle.includes("body.agent-harness-drawer-open") &&
+    homeGuiTemplateHtml.includes('id="agent-harness-drawer-open"') &&
+    homeGuiTemplateHtml.includes('id="agent-harness-scrim"') &&
+    read("capsules/home-gui/browser/agent-harness.js").includes(
+      'registerEscapeHandler("agent-harness-drawer"',
+    ) &&
+    read("capsules/home-gui/browser/agent-harness.js").includes("HARNESS_NARROW_MQ") &&
+    shellStyle.includes(".agent-harness-mobile-bar") &&
+    shellStyle.includes("transform: none") &&
+    shellStyle.includes(".taskbar.is-agent-face .agent-approve-btn"),
+  "fx2x Part X: narrow pager hide, drawer sessions, minimal composer",
+);
+
 assert(
   homeGuiCore.includes('targetId === "chat"') &&
     shellStyle.includes("--accent: var(--el-accent"),

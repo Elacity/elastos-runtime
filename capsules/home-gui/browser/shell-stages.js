@@ -10,13 +10,13 @@
  * - Expose / Show Windows — Mission Control overview (shell-expose.js)
  */
 
-import { shellState } from "./shell-core.js?v=home-20260724an";
+import { shellState } from "./shell-core.js?v=home-20260724ap";
 import {
   rememberWindowRestoreBounds,
   restoreWindowFromSpecialState,
-} from "./shell-window-geometry.js?v=home-20260724an";
+} from "./shell-window-geometry.js?v=home-20260724ap";
 
-const TIP = "home-20260724an";
+const TIP = "home-20260724ap";
 const DESKTOP_STAGE = "desktop";
 /** Singleton Agent Space — always in the ring beside Desktop (Mission Control peer). */
 const AGENT_STAGE = "agent";
@@ -151,6 +151,7 @@ function persist() {
 let edgeRevealBound = false;
 let menubarRevealTimer = 0;
 let dockRevealTimer = 0;
+let toolbarLeaveBound = false;
 
 function ensureEdgeSensors() {
   if (document.querySelector(".stage-edge-sensor-top")) {
@@ -172,7 +173,7 @@ function ensureEdgeSensors() {
       return;
     }
     document.body.classList.add("stage-menubar-reveal");
-    window.clearTimeout(menubarRevealTimer);
+    cancelMenubarHide();
   });
   bottom.addEventListener("pointerenter", () => {
     document.body.classList.add("stage-dock-reveal");
@@ -183,20 +184,64 @@ function harnessMenubarRevealActive() {
   return document.body.classList.contains("agent-harness-settled");
 }
 
-function scheduleMenubarHide({ blurToolbar = false, delayMs = 200 } = {}) {
+function cancelMenubarHide() {
   window.clearTimeout(menubarRevealTimer);
+  menubarRevealTimer = 0;
+}
+
+function scheduleMenubarHide({ blurToolbar = false, delayMs = 200 } = {}) {
+  /* Arm once — resetting on every pointermove kept the bar sticky while moving
+     and could miss hide entirely if the pointer stopped without another move. */
+  if (menubarRevealTimer) {
+    return;
+  }
   menubarRevealTimer = window.setTimeout(() => {
+    menubarRevealTimer = 0;
     dismissMenubarReveal({ blurToolbar });
   }, delayMs);
 }
 
+function bindToolbarMenubarLeave() {
+  if (toolbarLeaveBound) {
+    return;
+  }
+  /* Document capture — survives toolbar remount; pointerleave on a one-shot
+     toolbar() node was easy to miss if bindEdgeReveal ran before template. */
+  document.addEventListener(
+    "pointerout",
+    (event) => {
+      const fromToolbar = event.target?.closest?.("header.toolbar");
+      if (!fromToolbar) {
+        return;
+      }
+      const toToolbar = event.relatedTarget?.closest?.("header.toolbar");
+      if (toToolbar) {
+        return;
+      }
+      if (document.body.classList.contains("agent-harness-active")) {
+        if (!harnessMenubarRevealActive()) {
+          return;
+        }
+        scheduleMenubarHide({ blurToolbar: true, delayMs: 160 });
+        return;
+      }
+      if (document.body.classList.contains("stage-active")) {
+        scheduleMenubarHide({ blurToolbar: false, delayMs: 280 });
+      }
+    },
+    true,
+  );
+  toolbarLeaveBound = true;
+}
+
 function bindEdgeReveal() {
   if (edgeRevealBound) {
+    bindToolbarMenubarLeave();
     return;
   }
   edgeRevealBound = true;
   ensureEdgeSensors();
-  const toolbar = () => document.querySelector("header.toolbar");
+  bindToolbarMenubarLeave();
   const dock = () => document.querySelector("footer.taskbar");
   document.addEventListener(
     "pointermove",
@@ -223,7 +268,7 @@ function bindEdgeReveal() {
         }
         if (y <= 6 || overToolbar) {
           document.body.classList.add("stage-menubar-reveal");
-          window.clearTimeout(menubarRevealTimer);
+          cancelMenubarHide();
         } else if (document.body.classList.contains("stage-menubar-reveal")) {
           scheduleMenubarHide({ blurToolbar: true, delayMs: 180 });
         }
@@ -238,8 +283,8 @@ function bindEdgeReveal() {
 
       if (y <= 6 || overToolbar) {
         document.body.classList.add("stage-menubar-reveal");
-        window.clearTimeout(menubarRevealTimer);
-      } else {
+        cancelMenubarHide();
+      } else if (document.body.classList.contains("stage-menubar-reveal")) {
         scheduleMenubarHide({ blurToolbar: false, delayMs: 450 });
       }
       if (y >= h - 8 || overDock) {
@@ -254,13 +299,6 @@ function bindEdgeReveal() {
     },
     { passive: true },
   );
-  toolbar()?.addEventListener("pointerleave", () => {
-    if (document.body.classList.contains("agent-harness-active")) {
-      scheduleMenubarHide({ blurToolbar: true, delayMs: 160 });
-      return;
-    }
-    scheduleMenubarHide({ blurToolbar: false, delayMs: 280 });
-  });
   dock()?.addEventListener("pointerleave", () => {
     window.clearTimeout(dockRevealTimer);
     dockRevealTimer = window.setTimeout(() => {
@@ -274,10 +312,11 @@ export function enableHarnessMenubarReveal() {
   dismissMenubarReveal({ blurToolbar: true });
   ensureEdgeSensors();
   bindEdgeReveal();
+  bindToolbarMenubarLeave();
 }
 
 function dismissMenubarReveal({ blurToolbar = false } = {}) {
-  window.clearTimeout(menubarRevealTimer);
+  cancelMenubarHide();
   document.body.classList.remove("stage-menubar-reveal");
   if (!blurToolbar) {
     return;
@@ -1211,7 +1250,8 @@ export function restoreExtraDesktops(desktops) {
 
 /**
  * Space pager dots: hidden on fine pointer (left-edge peek owns switching).
- * Shown on coarse/touch as the Overview affordance when ring.length > 1.
+ * Part X: also hidden on narrow (≤900px) — Overview / later swipe owns Spaces.
+ * Coarse/wide only: show when ring.length > 1.
  */
 export function syncSpacePager() {
   const host = document.querySelector("#space-pager");
@@ -1221,9 +1261,13 @@ export function syncSpacePager() {
   const fine =
     typeof window.matchMedia === "function" &&
     window.matchMedia("(hover: hover) and (pointer: fine)").matches;
+  const narrow =
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(max-width: 900px)").matches;
   const ring = buildStageRing();
   const hide =
     fine ||
+    narrow ||
     ring.length < 2 ||
     document.body.classList.contains("expose-active") ||
     document.body.classList.contains("mission-exiting");
@@ -1265,6 +1309,15 @@ export function bindSpacePager() {
   }
   spacePagerBound = true;
   syncSpacePager();
+  if (typeof window.matchMedia === "function") {
+    const narrowMq = window.matchMedia("(max-width: 900px)");
+    const onNarrowChange = () => syncSpacePager();
+    if (typeof narrowMq.addEventListener === "function") {
+      narrowMq.addEventListener("change", onNarrowChange);
+    } else if (typeof narrowMq.addListener === "function") {
+      narrowMq.addListener(onNarrowChange);
+    }
+  }
 }
 
 function clearSpacePeekCloseTimer() {

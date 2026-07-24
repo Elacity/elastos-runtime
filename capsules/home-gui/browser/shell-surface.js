@@ -50,7 +50,7 @@ import {
   mutateDesktopObject,
   formatBadgeCount,
   focusModeEnabled,
-} from "./shell-core.js?v=home-20260724an";
+} from "./shell-core.js?v=home-20260724ap";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -64,19 +64,19 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260724an";
-import { playUiSound } from "./shell-sounds.js?v=home-20260724an";
+} from "./shell-windows.js?v=home-20260724ap";
+import { playUiSound } from "./shell-sounds.js?v=home-20260724ap";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
   setOverlayOpen,
-} from "./shell-popovers.js?v=home-20260724an";
+} from "./shell-popovers.js?v=home-20260724ap";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20260724an";
-import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260724an";
-import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260724an";
+} from "./shell-motion.js?v=home-20260724ap";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260724ap";
+import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260724ap";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;

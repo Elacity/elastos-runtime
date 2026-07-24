@@ -3945,11 +3945,98 @@ body.agent-harness-active .taskbar.is-agent-face {
   background: var(--harness-rail);
 }
 
+/* Desktop: scrim / drawer chrome idle. Narrow media shows them. */
+.agent-harness-scrim {
+  display: none;
+}
+
+.agent-harness-sidebar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.agent-harness-drawer-close {
+  display: none;
+  appearance: none;
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  margin: 0 0 8px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 70%, transparent);
+  font: inherit;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  place-items: center;
+}
+
+.agent-harness-drawer-close:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+.agent-harness-mobile-bar {
+  display: none;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 0 12px 8px;
+}
+
+.agent-harness-drawer-toggle {
+  appearance: none;
+  flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+}
+
+.agent-harness-drawer-toggle-mark {
+  display: block;
+  width: 16px;
+  height: 2px;
+  border-radius: 1px;
+  background: currentColor;
+  box-shadow: 0 -5px 0 currentColor, 0 5px 0 currentColor;
+}
+
+.agent-harness-title {
+  margin: 0;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
 .agent-harness-brand {
   padding: 2px 8px 10px;
   font-size: 13px;
   font-weight: 650;
   letter-spacing: -0.02em;
+}
+
+.agent-harness-sidebar-head .agent-harness-brand {
+  padding-bottom: 2px;
 }
 
 .agent-harness-new-chat,
@@ -4462,14 +4549,122 @@ body.agent-harness-active .taskbar.is-agent-face {
   }
 }
 
+/* Part X — narrow: no Space pager; Agent = drawer + pill composer. */
 @media (max-width: 900px) {
   :root {
-    --harness-sidebar-w: 200px;
+    --harness-sidebar-w: min(320px, 86vw);
     --harness-outputs-w: 0px;
+    --agent-column-width: min(720px, calc(100vw - 24px));
+  }
+
+  #space-pager {
+    display: none !important;
   }
 
   .agent-harness-outputs {
     display: none;
+  }
+
+  .agent-harness {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .agent-harness-scrim {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 5;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: rgba(0, 0, 0, 0.38);
+    cursor: pointer;
+  }
+
+  .agent-harness-scrim:not([hidden]) {
+    display: block;
+  }
+
+  .agent-harness-sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    z-index: 6;
+    grid-column: auto;
+    grid-row: auto;
+    width: var(--harness-sidebar-w);
+    max-width: 86vw;
+    padding-top: calc(12px + env(safe-area-inset-top, 0px));
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    box-shadow: 8px 0 32px rgba(0, 0, 0, 0.28);
+    opacity: 1;
+    filter: none;
+    transform: translateX(-105%);
+    transition:
+      transform 280ms var(--harness-ease),
+      box-shadow 280ms var(--harness-ease);
+    pointer-events: auto;
+  }
+
+  .agent-harness.is-visible .agent-harness-sidebar {
+    opacity: 1;
+    filter: none;
+    transform: translateX(-105%);
+    pointer-events: none;
+  }
+
+  body.agent-harness-drawer-open .agent-harness-sidebar,
+  body.agent-harness-drawer-open .agent-harness.is-visible .agent-harness-sidebar {
+    transform: translateX(0);
+    pointer-events: auto;
+  }
+
+  .agent-harness-drawer-close {
+    display: grid;
+  }
+
+  .agent-harness-mobile-bar {
+    display: flex;
+  }
+
+  .agent-harness-main {
+    grid-column: 1;
+    padding-top: calc(10px + env(safe-area-inset-top, 0px));
+  }
+
+  .agent-harness-empty {
+    transform: none;
+    padding-left: 20px;
+    padding-right: 20px;
+  }
+
+  .agent-harness-empty-greeting {
+    font-size: clamp(24px, 7vw, 34px);
+    max-width: 16ch;
+  }
+
+  /* Minimal composer — Home + field + mic/send; hide stub chrome. */
+  .taskbar.is-agent-face {
+    width: var(--agent-column-width, calc(100vw - 24px));
+    max-width: calc(100vw - 24px);
+    min-height: 0;
+    max-height: min(42vh, 300px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  .taskbar.is-agent-face .agent-approve-btn,
+  .taskbar.is-agent-face .agent-composer-tools-left > .agent-tool-btn,
+  .taskbar.is-agent-face .agent-model-btn {
+    display: none !important;
+  }
+
+  .taskbar.is-agent-face .agent-composer-toolbar {
+    gap: 8px;
+  }
+
+  .taskbar.is-agent-face .agent-composer-input {
+    font-size: 16px; /* iOS zoom guard */
   }
 }
 
