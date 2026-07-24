@@ -457,12 +457,92 @@
   </section>
 </main>
 
-<div
-  id="agent-workspace-scrim"
-  class="agent-workspace-scrim"
+<canvas
+  id="agent-home-drop-canvas"
+  class="agent-home-drop-canvas"
   hidden
   aria-hidden="true"
-></div>
+></canvas>
+
+<section
+  id="agent-harness"
+  class="agent-harness"
+  hidden
+  aria-hidden="true"
+  aria-label="Agent"
+>
+  <aside class="agent-harness-sidebar" aria-label="Agent sessions">
+    <div class="agent-harness-brand">Agent</div>
+    <div class="agent-harness-segment" role="group" aria-label="Chat mode">
+      <button class="agent-harness-segment-btn is-active" type="button" data-segment="general" aria-pressed="true">
+        General
+      </button>
+      <button
+        class="agent-harness-segment-btn"
+        type="button"
+        data-segment="develop"
+        aria-pressed="false"
+        disabled
+        title="Develop / ADE — preview later"
+      >
+        Develop
+      </button>
+    </div>
+    <button id="agent-harness-new-chat" class="agent-harness-new-chat" type="button" title="Start a new chat">
+      <span aria-hidden="true">+</span>
+      <span>New chat</span>
+    </button>
+    <button
+      id="agent-harness-home"
+      class="agent-harness-home"
+      type="button"
+      title="Return to Home OS (Esc)"
+    >
+      <span class="agent-harness-home-mark" aria-hidden="true"></span>
+      <span>Home</span>
+    </button>
+    <label class="agent-harness-search-wrap" title="Search — later">
+      <span class="visually-hidden">Search chats</span>
+      <input
+        class="agent-harness-search"
+        type="search"
+        placeholder="Search"
+        disabled
+        aria-disabled="true"
+      />
+    </label>
+    <div class="agent-harness-sessions" id="agent-harness-session-list"></div>
+  </aside>
+  <div class="agent-harness-main">
+    <h2 class="visually-hidden" id="agent-harness-title">New chat</h2>
+    <div class="agent-harness-truth visually-hidden" aria-hidden="true">
+      <span>On this device</span>
+      <span>Tools: none</span>
+    </div>
+    <div class="agent-harness-stream-viewport">
+      <div
+        id="agent-harness-stream"
+        class="agent-harness-stream"
+        role="log"
+        aria-live="polite"
+        aria-relevant="additions"
+      >
+        <div class="agent-harness-stream-column" id="agent-harness-stream-column"></div>
+      </div>
+    </div>
+  </div>
+  <aside class="agent-harness-outputs" aria-label="Outputs preview">
+    <div class="agent-harness-outputs-head">
+      <span>Outputs</span>
+      <span class="agent-harness-outputs-preview">preview</span>
+    </div>
+    <ul class="agent-harness-outputs-list">
+      <li><button type="button" class="agent-harness-output-chip" disabled title="Preview stub — later">plan.md</button></li>
+      <li><button type="button" class="agent-harness-output-chip" disabled title="Preview stub — later">grid.png</button></li>
+      <li><button type="button" class="agent-harness-output-chip" disabled title="Preview stub — later">notes.txt</button></li>
+    </ul>
+  </aside>
+</section>
 
 <footer
   class="taskbar"
@@ -513,129 +593,79 @@
           ></div>
         </div>
       </div>
-      <!-- Agent face — composer; send expands into workspace (still Shelf glass) -->
+      <!-- Agent face — composer only; Send opens Agent Harness above (dock stays) -->
       <div class="shelf-face shelf-face-agent" data-shelf-face="agent" aria-hidden="true">
-        <div class="agent-workspace" id="agent-workspace">
-          <aside class="agent-workspace-sidebar" aria-label="Agent sessions">
-            <div class="agent-workspace-brand">Agent</div>
-            <button
-              id="agent-new-chat"
-              class="agent-new-chat"
-              type="button"
-              title="Start a new chat"
-            >
-              <span aria-hidden="true">+</span>
-              <span>New chat</span>
-            </button>
-            <div class="agent-session-groups" id="agent-session-list">
-              <div class="agent-session-group-label">Today</div>
-              <button class="agent-session-item is-active" type="button" data-session-id="planning" data-title="Planning weekend">
-                Planning weekend
-              </button>
-              <button class="agent-session-item" type="button" data-session-id="wallet" data-title="Wallet permissions?">
-                Wallet permissions?
-              </button>
-              <div class="agent-session-group-label">Earlier</div>
-              <button class="agent-session-item" type="button" data-session-id="downloads" data-title="Downloads summary">
-                Downloads summary
-              </button>
-            </div>
-            <div class="agent-workspace-segment" role="group" aria-label="Chat mode">
-              <button class="agent-segment-btn is-active" type="button" data-segment="general" aria-pressed="true">
-                General
+        <div class="agent-composer" role="form" aria-label="Agent composer">
+          <label class="agent-composer-field shelf-morph-enter" data-morph-enter="0">
+            <span class="visually-hidden">Message</span>
+            <textarea
+              id="agent-composer-input"
+              class="agent-composer-input"
+              rows="1"
+              placeholder="Do anything"
+              autocomplete="off"
+              spellcheck="true"
+            ></textarea>
+          </label>
+          <div class="agent-composer-toolbar shelf-morph-enter" data-morph-enter="1">
+            <div class="agent-composer-tools-left">
+              <button
+                id="agent-shelf-flip-back"
+                class="agent-flip-back"
+                type="button"
+                aria-label="Back to Apps Shelf"
+                title="Back to Apps (Esc)"
+              >
+                Apps
               </button>
               <button
-                class="agent-segment-btn"
+                class="agent-tool-btn"
                 type="button"
-                data-segment="develop"
-                aria-pressed="false"
+                aria-label="Add context"
+                title="Grant-gated — later"
                 disabled
-                title="Develop / ADE — preview later"
               >
-                Develop
+                <span aria-hidden="true">+</span>
+              </button>
+              <button
+                class="agent-approve-btn"
+                type="button"
+                disabled
+                aria-disabled="true"
+                aria-label="Approve for me — session tool scope (preview)"
+                title="Session tools start at zero. Preview only — grant ceremony later."
+              >
+                <span class="agent-approve-mark" aria-hidden="true"></span>
+                <span>Approve for me</span>
               </button>
             </div>
-          </aside>
-          <div class="agent-workspace-main">
-            <header class="agent-workspace-header">
-              <h2 class="agent-session-title" id="agent-session-title">New chat</h2>
-              <div class="agent-locality" title="Private on this machine — preview">
-                <span class="agent-locality-dot" aria-hidden="true"></span>
-                <span>On this device</span>
-              </div>
-            </header>
-            <div
-              id="agent-workspace-stream"
-              class="agent-workspace-stream"
-              role="log"
-              aria-live="polite"
-              aria-relevant="additions"
-            ></div>
-            <div class="agent-composer" role="form" aria-label="Agent composer">
-              <label class="agent-composer-field shelf-morph-enter" data-morph-enter="0">
-                <span class="visually-hidden">Message</span>
-                <textarea
-                  id="agent-composer-input"
-                  class="agent-composer-input"
-                  rows="1"
-                  placeholder="Do anything"
-                  autocomplete="off"
-                  spellcheck="true"
-                ></textarea>
-              </label>
-              <div class="agent-composer-toolbar shelf-morph-enter" data-morph-enter="1">
-                <div class="agent-composer-tools-left">
-                  <button
-                    id="agent-shelf-flip-back"
-                    class="agent-flip-back"
-                    type="button"
-                    aria-label="Back to Apps Shelf"
-                    title="Back to Apps (Esc)"
-                  >
-                    Apps
-                  </button>
-                  <button class="agent-tool-btn" type="button" aria-label="Add context" title="Add context">
-                    <span aria-hidden="true">+</span>
-                  </button>
-                  <button
-                    class="agent-approve-btn"
-                    type="button"
-                    aria-label="Approve for me — session tool scope"
-                    title="Session tools start at zero. Preview only."
-                  >
-                    <span class="agent-approve-mark" aria-hidden="true"></span>
-                    <span>Approve for me</span>
-                  </button>
-                </div>
-                <div class="agent-composer-tools-right">
-                  <button
-                    id="agent-model-picker"
-                    class="agent-model-btn"
-                    type="button"
-                    aria-haspopup="listbox"
-                    aria-expanded="false"
-                    title="Local model (preview)"
-                  >
-                    <span class="agent-model-name">Local</span>
-                    <span class="agent-model-tier">preview</span>
-                    <span class="agent-model-chevron" aria-hidden="true"></span>
-                  </button>
-                  <button class="agent-tool-btn agent-mic-btn" type="button" aria-label="Voice input" title="Voice — later">
-                    <span class="agent-mic-mark" aria-hidden="true"></span>
-                  </button>
-                  <button
-                    id="agent-composer-send"
-                    class="agent-send-btn"
-                    type="button"
-                    aria-label="Send"
-                    title="Enter a message to send"
-                    data-mode="send"
-                    disabled
-                  >
-                    <span class="agent-send-mark" aria-hidden="true"></span>
-                  </button>
-                </div>
-              </div>
+            <div class="agent-composer-tools-right">
+              <button
+                id="agent-model-picker"
+                class="agent-model-btn"
+                type="button"
+                aria-haspopup="listbox"
+                aria-expanded="false"
+                title="Local model (preview)"
+              >
+                <span class="agent-model-name">Local</span>
+                <span class="agent-model-tier">preview</span>
+                <span class="agent-model-chevron" aria-hidden="true"></span>
+              </button>
+              <button class="agent-tool-btn agent-mic-btn" type="button" aria-label="Voice input" title="Voice — later">
+                <span class="agent-mic-mark" aria-hidden="true"></span>
+              </button>
+              <button
+                id="agent-composer-send"
+                class="agent-send-btn"
+                type="button"
+                aria-label="Send"
+                title="Enter a message to send"
+                data-mode="send"
+                disabled
+              >
+                <span class="agent-send-mark" aria-hidden="true"></span>
+              </button>
             </div>
           </div>
         </div>

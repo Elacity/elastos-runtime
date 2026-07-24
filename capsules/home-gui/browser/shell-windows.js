@@ -21,7 +21,7 @@ import {
   ignoreRepeatedAction,
   pushUiPreferencesToFrameWindow,
   targetById,
-} from "./shell-core.js?v=home-20260724m";
+} from "./shell-core.js?v=home-20260724ai";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -31,8 +31,8 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260724m";
-import { playUiSound } from "./shell-sounds.js?v=home-20260724m";
+} from "./shell-window-geometry.js?v=home-20260724ai";
+import { playUiSound } from "./shell-sounds.js?v=home-20260724ai";
 import {
   applyFullscreenStageFromPlacement,
   bindStageWindowHooks,
@@ -51,7 +51,7 @@ import {
   exitFullscreenStage,
   toggleFullscreenStage,
   windowVisibleOnActiveSpace,
-} from "./shell-stages.js?v=home-20260724m";
+} from "./shell-stages.js?v=home-20260724ai";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -232,7 +232,7 @@ function currentRootShellSessionId() {
 
 /** Stable Space key for session — survives reminted window ids on restore. */
 function stableSpaceKeyForId(spaceId) {
-  if (!spaceId || isDesktopSpace(spaceId)) {
+  if (!spaceId || isDesktopSpace(spaceId) || spaceId === "agent") {
     return spaceId || desktopStageId();
   }
   const entry = shellState.windows.get(spaceId);
@@ -281,7 +281,7 @@ function resolveStableSpaceKey(savedKey, restoredEntries) {
     return desktopStageId();
   }
   const key = savedKey.trim();
-  if (isDesktopSpace(key)) {
+  if (key === "agent" || isDesktopSpace(key)) {
     return key;
   }
   if (key.startsWith("fs:")) {
@@ -1416,6 +1416,26 @@ export async function restoreShellSession() {
     { rootShell: currentRootShellSessionId() },
   );
   if (restoredWindows.length === 0) {
+    /* Keep Agent Space + ring even with zero app windows (dual-plane peer). */
+    const remappedOrder = (
+      Array.isArray(storedSession?.space_order) ? storedSession.space_order : []
+    ).map((key) => resolveStableSpaceKey(key, []));
+    restoreSpaceOrder(remappedOrder);
+    const savedStageKey =
+      typeof storedSession?.active_stage === "string" && storedSession.active_stage.trim()
+        ? storedSession.active_stage.trim()
+        : desktopStageId();
+    const savedStage = resolveStableSpaceKey(savedStageKey, []);
+    if (savedStage === "agent" || remappedOrder.includes("agent") || remappedOrder.length > 0) {
+      setActiveStage(savedStage === "agent" ? "agent" : desktopStageId(), {
+        announce: false,
+        animate: false,
+        focus: false,
+        syncHarness: savedStage === "agent",
+      });
+      persistBrowserSession();
+      return;
+    }
     clearShellSessionState();
     return;
   }
@@ -1452,6 +1472,25 @@ export async function restoreShellSession() {
   }
 
   if (restoredEntries.length === 0) {
+    const remappedOrder = (
+      Array.isArray(storedSession?.space_order) ? storedSession.space_order : []
+    ).map((key) => resolveStableSpaceKey(key, []));
+    restoreSpaceOrder(remappedOrder);
+    const savedStageKey =
+      typeof storedSession?.active_stage === "string" && storedSession.active_stage.trim()
+        ? storedSession.active_stage.trim()
+        : desktopStageId();
+    const savedStage = resolveStableSpaceKey(savedStageKey, []);
+    if (savedStage === "agent" || remappedOrder.includes("agent")) {
+      setActiveStage(savedStage === "agent" ? "agent" : desktopStageId(), {
+        announce: false,
+        animate: false,
+        focus: false,
+        syncHarness: savedStage === "agent",
+      });
+      persistBrowserSession();
+      return;
+    }
     clearShellSessionState();
     return;
   }

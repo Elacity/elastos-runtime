@@ -11,17 +11,17 @@ import {
   desktopBackdrop,
   mountGlyph,
   shellState,
-} from "./shell-core.js?v=home-20260724m";
+} from "./shell-core.js?v=home-20260724ai";
 import {
   browserWindowEntries,
   focusWindow,
   sortWindowEntriesByZOrder,
-} from "./shell-windows.js?v=home-20260724m";
+} from "./shell-windows.js?v=home-20260724ai";
 import {
   closeOtherShellPopovers,
   registerEscapeHandler,
   registerShellPopover,
-} from "./shell-popovers.js?v=home-20260724m";
+} from "./shell-popovers.js?v=home-20260724ai";
 import {
   addDesktopSpace,
   assignWindowToDesktop,
@@ -30,6 +30,7 @@ import {
   desktopSpaceLabel,
   desktopStageId,
   getActiveStageId,
+  isAgentSpace,
   isDesktopSpace,
   moveSpaceInRing,
   promoteWindowToFullscreenSpace,
@@ -38,7 +39,7 @@ import {
   syncStagePresentation,
   syncSpacePager,
   flipRectMotion,
-} from "./shell-stages.js?v=home-20260724m";
+} from "./shell-stages.js?v=home-20260724ai";
 function exposeReducedMotion() {
   return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
 }
@@ -85,6 +86,9 @@ function exposeEntries() {
 
 function floorEntriesForSpace(spaceId) {
   const all = exposeEntries();
+  if (isAgentSpace(spaceId)) {
+    return [];
+  }
   if (isDesktopSpace(spaceId)) {
     return all.filter(
       (entry) =>
@@ -107,7 +111,7 @@ function ensureSpacesBar() {
   spacesBar.id = "mission-spaces-bar";
   spacesBar.className = "mission-spaces-bar";
   spacesBar.setAttribute("role", "tablist");
-  spacesBar.setAttribute("aria-label", "Desktops and fullscreen apps");
+  spacesBar.setAttribute("aria-label", "Desktops, Agent, and fullscreen apps");
   spacesShelf.appendChild(spacesBar);
   document.body.appendChild(spacesShelf);
   return spacesBar;
@@ -120,6 +124,9 @@ function missionShelfHeight() {
 }
 
 function spaceLabel(spaceId) {
+  if (isAgentSpace(spaceId)) {
+    return "Agent";
+  }
   if (isDesktopSpace(spaceId)) {
     return desktopSpaceLabel(spaceId);
   }
@@ -158,7 +165,19 @@ function windowPlacementBounds(entry) {
 function paintSpacePreview(previewEl, spaceId) {
   previewEl.replaceChildren();
   previewEl.style.backgroundImage = "";
-  previewEl.classList.remove("mission-space-preview-desktop");
+  previewEl.classList.remove("mission-space-preview-desktop", "mission-space-preview-agent");
+  delete previewEl.dataset.liveThumb;
+  if (isAgentSpace(spaceId)) {
+    previewEl.classList.add("mission-space-preview-agent");
+    const mark = document.createElement("span");
+    mark.className = "mission-space-agent-mark";
+    mark.setAttribute("aria-hidden", "true");
+    const caption = document.createElement("span");
+    caption.className = "mission-space-agent-caption";
+    caption.textContent = "Agent";
+    previewEl.append(mark, caption);
+    return;
+  }
   if (isDesktopSpace(spaceId)) {
     previewEl.classList.add("mission-space-preview-desktop");
     const wallpaper =
@@ -243,6 +262,7 @@ function rebuildMissionHitCache() {
     thumbs.push({
       spaceId,
       desktop: isDesktopSpace(spaceId),
+      agent: isAgentSpace(spaceId),
       rect: thumb.getBoundingClientRect(),
     });
   }
@@ -273,6 +293,10 @@ function hitMissionDrop(clientX, clientY) {
     if (!pointInRect(clientX, clientY, thumb.rect, 6)) {
       continue;
     }
+    if (thumb.agent) {
+      /* Agent Space hosts no windows — not a fullscreen promote target. */
+      return { type: "reject", spaceId: thumb.spaceId };
+    }
     if (thumb.desktop) {
       return { type: "desktop", spaceId: thumb.spaceId };
     }
@@ -282,7 +306,7 @@ function hitMissionDrop(clientX, clientY) {
 }
 
 function dropWillPromote(windowId, drop) {
-  if (!drop || !windowId) {
+  if (!drop || !windowId || drop.type === "reject") {
     return false;
   }
   // Shelf, + , or an existing fullscreen thumb → dedicated fullscreen Space.
@@ -584,7 +608,7 @@ function promoteAndStayInOverview(windowId, insertAt = null) {
 }
 
 function applyMissionDrop(windowId, drop, insertAt = null) {
-  if (!drop || !windowId) {
+  if (!drop || !windowId || drop.type === "reject") {
     return false;
   }
   // Drag to + / shelf / fullscreen thumb → dedicated fullscreen Space (Mac).
@@ -1173,8 +1197,8 @@ function layoutThumbWindows(ring = buildStageRing()) {
     if (spaceId === selectedSpaceId) {
       continue;
     }
-    // Desktop Spaces: schematic preview only (paintSpacePreview).
-    if (isDesktopSpace(spaceId)) {
+    // Desktop + Agent: schematic preview only (paintSpacePreview).
+    if (isDesktopSpace(spaceId) || isAgentSpace(spaceId)) {
       continue;
     }
 
@@ -1349,7 +1373,13 @@ function layoutMissionFloor() {
     showExposeEmpty(true);
     const hint = emptyNode?.querySelector(".expose-empty-hint");
     const title = emptyNode?.querySelector(".expose-empty-title");
-    if (isDesktopSpace(selectedSpaceId)) {
+    if (isAgentSpace(selectedSpaceId)) {
+      if (title) title.textContent = "Agent";
+      if (hint) {
+        hint.textContent =
+          "Your private AI Space. Click Agent above or press Enter to open it — flick here anytime from Desktop.";
+      }
+    } else if (isDesktopSpace(selectedSpaceId)) {
       if (title) title.textContent = `No windows on ${spaceLabel(selectedSpaceId)}`;
       if (hint) {
         hint.textContent =
@@ -1756,6 +1786,10 @@ export function closeExpose() {
 }
 
 function finishStageAfterMission(stageId, heroWindowId, focusHero) {
+  if (isAgentSpace(stageId)) {
+    setActiveStage(stageId, { animate: false, focus: false, announce: true });
+    return;
+  }
   const entry = heroWindowId ? shellState.windows.get(heroWindowId) : null;
   if (entry?.fullscreenStage) {
     setActiveStage(heroWindowId, { animate: false, focus: Boolean(focusHero), announce: true });
@@ -1879,6 +1913,10 @@ function activateExposeCard(windowId) {
 
 function confirmMissionSpace(spaceId) {
   const target = spaceId || selectedSpaceId || desktopStageId();
+  if (isAgentSpace(target)) {
+    playMissionExitZoom({ heroWindowId: null, targetStage: target, focusHero: false });
+    return;
+  }
   let heroId = null;
   if (!isDesktopSpace(target)) {
     heroId = target;

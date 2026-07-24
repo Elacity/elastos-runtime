@@ -9,14 +9,18 @@
  * - Expose / Show Windows — Mission Control overview (shell-expose.js)
  */
 
-import { shellState } from "./shell-core.js?v=home-20260724m";
+import { shellState } from "./shell-core.js?v=home-20260724ai";
 import {
   rememberWindowRestoreBounds,
   restoreWindowFromSpecialState,
-} from "./shell-window-geometry.js?v=home-20260724m";
+} from "./shell-window-geometry.js?v=home-20260724ai";
 
 const DESKTOP_STAGE = "desktop";
+/** Singleton Agent Space — always in the ring beside Desktop (Mission Control peer). */
+const AGENT_STAGE = "agent";
 let liveRegion = null;
+/** Prevents setActiveStage ↔ harness show/hide recursion. */
+let harnessStageSyncLock = false;
 let stageRecency = [];
 let focusWindowFn = null;
 let persistSessionFn = null;
@@ -74,6 +78,14 @@ export function announceStage(message) {
 
 export function desktopStageId() {
   return DESKTOP_STAGE;
+}
+
+export function agentStageId() {
+  return AGENT_STAGE;
+}
+
+export function isAgentSpace(spaceId) {
+  return spaceId === AGENT_STAGE;
 }
 
 export function getExtraDesktops() {
@@ -150,11 +162,30 @@ function ensureEdgeSensors() {
   bottom.setAttribute("aria-hidden", "true");
   document.body.append(top, bottom);
   top.addEventListener("pointerenter", () => {
+    /* Agent: only after settle — avoids enter flash during morph/drop. */
+    if (
+      document.body.classList.contains("agent-harness-active") &&
+      !document.body.classList.contains("agent-harness-settled")
+    ) {
+      return;
+    }
     document.body.classList.add("stage-menubar-reveal");
+    window.clearTimeout(menubarRevealTimer);
   });
   bottom.addEventListener("pointerenter", () => {
     document.body.classList.add("stage-dock-reveal");
   });
+}
+
+function harnessMenubarRevealActive() {
+  return document.body.classList.contains("agent-harness-settled");
+}
+
+function scheduleMenubarHide({ blurToolbar = false, delayMs = 200 } = {}) {
+  window.clearTimeout(menubarRevealTimer);
+  menubarRevealTimer = window.setTimeout(() => {
+    dismissMenubarReveal({ blurToolbar });
+  }, delayMs);
 }
 
 function bindEdgeReveal() {
@@ -168,22 +199,46 @@ function bindEdgeReveal() {
   document.addEventListener(
     "pointermove",
     (event) => {
-      if (isDesktopSpace(getActiveStageId()) || document.body.classList.contains("expose-active")) {
+      const expose = document.body.classList.contains("expose-active");
+      if (expose) {
         document.body.classList.remove("stage-menubar-reveal", "stage-dock-reveal");
         return;
       }
+
+      const harnessActive = document.body.classList.contains("agent-harness-active");
+      const harnessSettled = harnessMenubarRevealActive();
       const y = event.clientY;
       const h = window.innerHeight || 800;
       const overToolbar = Boolean(event.target?.closest?.("header.toolbar"));
       const overDock = Boolean(event.target?.closest?.("footer.taskbar"));
+
+      /* Agent Space — same as FS menubar; dock never tucks (composer hinge). */
+      if (harnessActive) {
+        document.body.classList.remove("stage-dock-reveal");
+        if (!harnessSettled) {
+          dismissMenubarReveal({ blurToolbar: true });
+          return;
+        }
+        if (y <= 6 || overToolbar) {
+          document.body.classList.add("stage-menubar-reveal");
+          window.clearTimeout(menubarRevealTimer);
+        } else if (document.body.classList.contains("stage-menubar-reveal")) {
+          scheduleMenubarHide({ blurToolbar: true, delayMs: 180 });
+        }
+        return;
+      }
+
+      const desktopLike = isDesktopSpace(getActiveStageId());
+      if (desktopLike) {
+        document.body.classList.remove("stage-menubar-reveal", "stage-dock-reveal");
+        return;
+      }
+
       if (y <= 6 || overToolbar) {
         document.body.classList.add("stage-menubar-reveal");
         window.clearTimeout(menubarRevealTimer);
       } else {
-        window.clearTimeout(menubarRevealTimer);
-        menubarRevealTimer = window.setTimeout(() => {
-          document.body.classList.remove("stage-menubar-reveal");
-        }, 450);
+        scheduleMenubarHide({ blurToolbar: false, delayMs: 450 });
       }
       if (y >= h - 8 || overDock) {
         document.body.classList.add("stage-dock-reveal");
@@ -198,10 +253,11 @@ function bindEdgeReveal() {
     { passive: true },
   );
   toolbar()?.addEventListener("pointerleave", () => {
-    window.clearTimeout(menubarRevealTimer);
-    menubarRevealTimer = window.setTimeout(() => {
-      document.body.classList.remove("stage-menubar-reveal");
-    }, 280);
+    if (document.body.classList.contains("agent-harness-active")) {
+      scheduleMenubarHide({ blurToolbar: true, delayMs: 160 });
+      return;
+    }
+    scheduleMenubarHide({ blurToolbar: false, delayMs: 280 });
   });
   dock()?.addEventListener("pointerleave", () => {
     window.clearTimeout(dockRevealTimer);
@@ -211,8 +267,36 @@ function bindEdgeReveal() {
   });
 }
 
+/** Agent harness reuses fullscreen menubar edge-reveal (dock stays put). */
+export function enableHarnessMenubarReveal() {
+  dismissMenubarReveal({ blurToolbar: true });
+  ensureEdgeSensors();
+  bindEdgeReveal();
+}
+
+function dismissMenubarReveal({ blurToolbar = false } = {}) {
+  window.clearTimeout(menubarRevealTimer);
+  document.body.classList.remove("stage-menubar-reveal");
+  if (!blurToolbar) {
+    return;
+  }
+  const toolbar = document.querySelector("header.toolbar");
+  const ae = document.activeElement;
+  if (toolbar && ae && toolbar.contains(ae) && typeof ae.blur === "function") {
+    ae.blur();
+  }
+}
+
+export function clearHarnessMenubarReveal() {
+  dismissMenubarReveal({ blurToolbar: true });
+}
+
 export function windowVisibleOnActiveSpace(entry, active = getActiveStageId()) {
   if (!entry) {
+    return false;
+  }
+  /* Agent Space hosts no browser windows — Desktop you left stays intact. */
+  if (isAgentSpace(active)) {
     return false;
   }
   if (isDesktopSpace(active)) {
@@ -225,16 +309,75 @@ export function windowVisibleOnActiveSpace(entry, active = getActiveStageId()) {
   return entry.fullscreenStage === true && entry.id === active;
 }
 
+/**
+ * Agent ↔ Computer Space switch uses the same Shelf morph dance as the Dock
+ * Agent button — never a sudden empty dock / hard cut.
+ */
+function syncHarnessToActiveStage(next) {
+  if (harnessStageSyncLock) {
+    return;
+  }
+  /* Only block mid-FLIP — "enter" is the settled Agent face and must not trap switches. */
+  const morphPhase = document.querySelector(".taskbar")?.dataset.agentMorph || "";
+  if (morphPhase === "exit" || morphPhase === "grow" || morphPhase === "leave" || morphPhase === "shrink") {
+    return;
+  }
+  harnessStageSyncLock = true;
+  void import("./agent-shelf.js?v=home-20260724ai")
+    .then(async (shelf) => {
+      try {
+        if (isAgentSpace(next)) {
+          if (!shelf.agentShelfFaceActive()) {
+            shelf.showAgentShelfFace();
+            return;
+          }
+          const taskbar = document.querySelector(".taskbar");
+          const phase = taskbar?.dataset.agentMorph || "";
+          const faceReady =
+            taskbar?.classList.contains("is-agent-face") &&
+            (phase === "" || phase === "enter" || phase === "grow");
+          if (!faceReady) {
+            return;
+          }
+          const harness = await import("./agent-harness.js?v=home-20260724ai");
+          if (!harness.agentHarnessActive()) {
+            harness.showAgentHarness({ fromShelf: true, syncStage: false });
+          }
+          return;
+        }
+        if (shelf.agentShelfFaceActive()) {
+          shelf.hideAgentShelfFace();
+          return;
+        }
+        const harness = await import("./agent-harness.js?v=home-20260724ai");
+        if (harness.agentHarnessActive()) {
+          harness.hideAgentHarness({ restoreShelfApps: false, syncStage: false });
+        }
+      } finally {
+        harnessStageSyncLock = false;
+      }
+    })
+    .catch(() => {
+      harnessStageSyncLock = false;
+    });
+}
+
 export function syncStagePresentation() {
   const active = getActiveStageId();
   const desktopLike = isDesktopSpace(active);
+  const agentLike = isAgentSpace(active);
   document.body.dataset.activeStage = active;
-  document.body.dataset.stageKind = desktopLike ? "desktop" : "fullscreen";
-  document.body.classList.toggle("stage-active", !desktopLike);
+  document.body.dataset.stageKind = agentLike ? "agent" : desktopLike ? "desktop" : "fullscreen";
+  /* stage-active tucks the Dock — Agent keeps the Shelf composer, so never set it. */
+  document.body.classList.toggle("stage-active", !desktopLike && !agentLike);
   document.body.classList.toggle("stage-desktop", desktopLike);
+  document.body.classList.toggle("stage-agent", agentLike);
   syncSpacePager();
   if (desktopLike) {
     document.body.classList.remove("stage-menubar-reveal", "stage-dock-reveal");
+  } else if (agentLike) {
+    document.body.classList.remove("stage-dock-reveal");
+    bindEdgeReveal();
   } else {
     bindEdgeReveal();
   }
@@ -245,7 +388,7 @@ export function syncStagePresentation() {
     entry.node.dataset.fullscreenStage = staged ? "true" : "false";
     entry.node.dataset.desktopSpace = entry.desktopSpaceId || DESKTOP_STAGE;
     entry.node.dataset.spaceVisible = visible ? "true" : "false";
-    entry.node.dataset.stageActive = !desktopLike && visible ? "true" : "false";
+    entry.node.dataset.stageActive = !desktopLike && !agentLike && visible ? "true" : "false";
     syncMaximizeButton(entry.node, staged);
     syncMinimizeButton(entry.node, staged);
     if (!document.body.classList.contains("expose-active")) {
@@ -257,6 +400,9 @@ export function syncStagePresentation() {
 }
 
 function nodesForSpace(spaceId) {
+  if (isAgentSpace(spaceId)) {
+    return [];
+  }
   if (isDesktopSpace(spaceId)) {
     return [...shellState.windows.values()]
       .filter(
@@ -457,31 +603,49 @@ function playSpaceSlide(fromId, toId, { announce = true, focus = true } = {}) {
   return true;
 }
 
-export function setActiveStage(stageId, { announce = true, focus = true, animate = true } = {}) {
+export function setActiveStage(
+  stageId,
+  { announce = true, focus = true, animate = true, syncHarness = true } = {},
+) {
   let next = DESKTOP_STAGE;
-  if (isDesktopSpace(stageId)) {
+  if (isAgentSpace(stageId)) {
+    next = AGENT_STAGE;
+  } else if (isDesktopSpace(stageId)) {
     next = stageId;
   } else if (stageEntry(stageId)?.fullscreenStage) {
     next = stageId;
   }
   const prev = getActiveStageId();
-  if (animate && prev !== next && playSpaceSlide(prev, next, { announce, focus })) {
+  /* Agent has no window nodes — skip empty FLIP slide; harness is the surface. */
+  const canSlide =
+    animate &&
+    prev !== next &&
+    !isAgentSpace(prev) &&
+    !isAgentSpace(next) &&
+    playSpaceSlide(prev, next, { announce, focus });
+  if (canSlide) {
     return next;
   }
   shellState.activeStageId = next;
-  if (!isDesktopSpace(next)) {
+  if (!isDesktopSpace(next) && !isAgentSpace(next)) {
     touchRecency(next);
   }
   syncStagePresentation();
+  /* Shelf/harness may already own the dance — skip to avoid a second morph. */
+  if (syncHarness) {
+    syncHarnessToActiveStage(next);
+  }
   if (announce) {
-    if (isDesktopSpace(next)) {
+    if (isAgentSpace(next)) {
+      announceStage("Agent");
+    } else if (isDesktopSpace(next)) {
       announceStage(next === DESKTOP_STAGE ? "Desktop" : spaceLabelForDesktop(next));
     } else {
       const entry = stageEntry(next);
       announceStage(`${entry?.title || "App"}, fullscreen`);
     }
   }
-  if (focus && !isDesktopSpace(next)) {
+  if (focus && !isDesktopSpace(next) && !isAgentSpace(next)) {
     focusWindowFn?.(next);
   }
   persist();
@@ -503,6 +667,9 @@ export function desktopSpaceLabel(spaceId) {
 }
 
 function spaceLabelForPager(spaceId) {
+  if (isAgentSpace(spaceId)) {
+    return "Agent";
+  }
   if (isDesktopSpace(spaceId)) {
     return spaceLabelForDesktop(spaceId);
   }
@@ -672,7 +839,13 @@ function defaultStageRing() {
     const br = bi === -1 ? 999 : bi;
     return ar - br;
   });
-  return [DESKTOP_STAGE, ...getExtraDesktops(), ...staged.map((entry) => entry.id)];
+  /* Agent far left by default; then Desktop(s); then fullscreen app Spaces. */
+  return [
+    AGENT_STAGE,
+    DESKTOP_STAGE,
+    ...getExtraDesktops(),
+    ...staged.map((entry) => entry.id),
+  ];
 }
 
 export function buildStageRing() {
@@ -683,6 +856,11 @@ export function buildStageRing() {
     return fallback;
   }
   const ring = [];
+  /* If the user hasn't placed Agent yet, keep it pinned far left. */
+  if (!order.includes(AGENT_STAGE) && valid.has(AGENT_STAGE)) {
+    ring.push(AGENT_STAGE);
+    valid.delete(AGENT_STAGE);
+  }
   for (const id of order) {
     if (typeof id === "string" && valid.has(id)) {
       ring.push(id);
@@ -816,13 +994,17 @@ export function ensureDesktopForNewLaunch() {
 
 export function exitActiveFullscreenStage() {
   const active = getActiveStageId();
-  if (isDesktopSpace(active)) {
+  if (isDesktopSpace(active) || isAgentSpace(active)) {
     return false;
   }
   return exitFullscreenStage(active);
 }
 
 function spaceHasVisibleContent(spaceId, { ignoreWindowId = null } = {}) {
+  /* Agent hosts no windows — never win neighbor pick via "content". */
+  if (isAgentSpace(spaceId)) {
+    return false;
+  }
   if (isDesktopSpace(spaceId)) {
     return [...shellState.windows.values()].some(
       (entry) =>
@@ -969,10 +1151,14 @@ export function neighborSpaceAfterClosing(closedSpaceId) {
     }
   }
   if (index >= 0) {
-    if (index + 1 < fullRing.length && fullRing[index + 1] !== closedSpaceId) {
+    if (
+      index + 1 < fullRing.length &&
+      fullRing[index + 1] !== closedSpaceId &&
+      !isAgentSpace(fullRing[index + 1])
+    ) {
       return fullRing[index + 1];
     }
-    if (index - 1 >= 0) {
+    if (index - 1 >= 0 && !isAgentSpace(fullRing[index - 1])) {
       return fullRing[index - 1];
     }
   }

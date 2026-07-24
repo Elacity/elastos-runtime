@@ -1829,7 +1829,7 @@ const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
 const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260723a";
-const homeGuiAssetVersion = "home-20260724m";
+const homeGuiAssetVersion = "home-20260724ai";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -2320,16 +2320,51 @@ assert(
     read("capsules/home-gui/browser/agent-shelf.js").includes("bindAgentShelf") &&
     !read("capsules/home-gui/browser/agent-shelf.js").includes("pinShelfLeftEdge") &&
     homeGuiJs.includes("bindAgentShelf()") &&
+    homeGuiJs.includes("bindAgentHarness()") &&
     shellSurface.includes("!document.querySelector(\".taskbar.is-agent-face\")") &&
-    homeGuiTemplateHtml.includes('id="agent-workspace"') &&
-    homeGuiTemplateHtml.includes('id="agent-workspace-stream"') &&
-    homeGuiTemplateHtml.includes('id="agent-new-chat"') &&
-    homeGuiTemplateHtml.includes('id="agent-workspace-scrim"') &&
-    read("capsules/home-gui/browser/agent-shelf.js").includes("expandAgentWorkspace") &&
+    homeGuiTemplateHtml.includes('id="agent-harness"') &&
+    homeGuiTemplateHtml.includes('id="agent-harness-stream"') &&
+    homeGuiTemplateHtml.includes('id="agent-harness-stream-column"') &&
+    homeGuiTemplateHtml.includes('id="agent-harness-home"') &&
+    homeGuiTemplateHtml.includes('id="agent-home-drop-canvas"') &&
+    shellStyle.includes("--agent-column-width") &&
+    shellStyle.includes("agent-harness-stream-viewport") &&
+    !homeGuiTemplateHtml.includes('id="agent-workspace"') &&
+    !homeGuiTemplateHtml.includes("is-agent-workspace") &&
     read("capsules/home-gui/browser/agent-shelf.js").includes("sendAgentComposerMessage") &&
-    shellStyle.includes(".taskbar.is-agent-face.is-agent-workspace") &&
-    shellStyle.includes(".agent-workspace-stream"),
-  "Agent Shelf morph preview: centered grow + Cursor composer + workspace expand + mag-off",
+    read("capsules/home-gui/browser/agent-harness.js").includes("showAgentHarness") &&
+    read("capsules/home-gui/browser/agent-harness.js").includes("hideAgentHarness") &&
+    read("capsules/home-gui/browser/agent-harness.js").includes("sendToAgentHarness") &&
+    shellStyle.includes(".agent-harness") &&
+    shellStyle.includes("body.agent-harness-active") &&
+    !shellStyle.includes(".taskbar.is-agent-face.is-agent-workspace") &&
+    read("capsules/home-gui/browser/shell-stages.js").includes('AGENT_STAGE = "agent"') &&
+    read("capsules/home-gui/browser/shell-stages.js").includes("isAgentSpace") &&
+    read("capsules/home-gui/browser/shell-stages.js").includes("AGENT_STAGE,") &&
+    read("capsules/home-gui/browser/shell-expose.js").includes("mission-space-preview-agent") &&
+    shellStyle.includes(".mission-space-preview-agent"),
+  "Agent Shelf morph + Harness: Home drops, dock stays, composer hinge + mag-off",
+);
+assert(
+  read("capsules/home-gui/browser/shell-stages.js").includes('const AGENT_STAGE = "agent"') &&
+    read("capsules/home-gui/browser/shell-stages.js").includes("export function isAgentSpace") &&
+    read("capsules/home-gui/browser/shell-expose.js").includes('return "Agent"') &&
+    shellStyle.includes("mission-space-preview-agent"),
+  "Agent Space is always-on Mission Control peer (singleton beside Desktop)",
+);
+assert(
+  read("capsules/home-gui/browser/agent-harness.js").includes(
+    `from "./agent-shelf.js?v=${homeGuiAssetVersion}"`,
+  ) &&
+    read("capsules/home-gui/browser/agent-harness.js").includes(
+      `from "./shell-stages.js?v=${homeGuiAssetVersion}"`,
+    ) &&
+    !read("capsules/home-gui/browser/agent-harness.js").includes("home-20260724ae") &&
+    read("capsules/home-gui/browser/shell-expose.js").includes('type: "reject"') &&
+    read("capsules/home-gui/browser/agent-harness.js").includes("harnessMotionGen") &&
+    read("capsules/home-gui/browser/agent-harness.js").includes("hideAgentShelfFace") &&
+    !read("capsules/home-gui/browser/agent-harness.js").includes('registerEscapeHandler("agent-harness"'),
+  "fx2d: harness tip aligned, Esc via Shelf, motion gen, Agent drop reject",
 );
 assert(
   homeGuiCore.includes('targetId === "chat"') &&
