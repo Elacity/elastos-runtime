@@ -1829,7 +1829,7 @@ const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
 const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260723a";
-const homeGuiAssetVersion = "home-20260724k";
+const homeGuiAssetVersion = "home-20260724m";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -2320,8 +2320,16 @@ assert(
     read("capsules/home-gui/browser/agent-shelf.js").includes("bindAgentShelf") &&
     !read("capsules/home-gui/browser/agent-shelf.js").includes("pinShelfLeftEdge") &&
     homeGuiJs.includes("bindAgentShelf()") &&
-    shellSurface.includes("!document.querySelector(\".taskbar.is-agent-face\")"),
-  "Agent Shelf morph preview: centered grow + Cursor composer crossfade + mag-off",
+    shellSurface.includes("!document.querySelector(\".taskbar.is-agent-face\")") &&
+    homeGuiTemplateHtml.includes('id="agent-workspace"') &&
+    homeGuiTemplateHtml.includes('id="agent-workspace-stream"') &&
+    homeGuiTemplateHtml.includes('id="agent-new-chat"') &&
+    homeGuiTemplateHtml.includes('id="agent-workspace-scrim"') &&
+    read("capsules/home-gui/browser/agent-shelf.js").includes("expandAgentWorkspace") &&
+    read("capsules/home-gui/browser/agent-shelf.js").includes("sendAgentComposerMessage") &&
+    shellStyle.includes(".taskbar.is-agent-face.is-agent-workspace") &&
+    shellStyle.includes(".agent-workspace-stream"),
+  "Agent Shelf morph preview: centered grow + Cursor composer + workspace expand + mag-off",
 );
 assert(
   homeGuiCore.includes('targetId === "chat"') &&

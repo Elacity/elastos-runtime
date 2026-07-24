@@ -3496,13 +3496,13 @@ body.dock-autohide::after {
    Dark mode → dark-dock (lighter cells). Light mode → light-dock (darker cells). */
 .taskbar-icon-launcher {
   background:
-    url("./icons/apps-launcher/dark-dock/icon-64.png?v=home-20260724k")
+    url("./icons/apps-launcher/dark-dock/icon-64.png?v=home-20260724m")
       center / contain no-repeat;
 }
 
 :root[data-el-theme="light"] .taskbar-icon-launcher {
   background-image:
-    url("./icons/apps-launcher/light-dock/icon-64.png?v=home-20260724k");
+    url("./icons/apps-launcher/light-dock/icon-64.png?v=home-20260724m");
 }
 
 .taskbar-icon-launcher::before {
@@ -3679,6 +3679,343 @@ body.dock-autohide::after {
   -webkit-backdrop-filter: blur(14px) saturate(1.08);
 }
 
+/* Expanded Agent workspace — same Shelf glass, taller panel after send. */
+.taskbar.is-agent-face.is-agent-workspace {
+  width: min(920px, calc(100vw - 40px));
+  height: min(72vh, 640px);
+  min-height: min(72vh, 520px);
+  max-height: min(72vh, 640px);
+  padding: 0;
+  border-radius: 26px;
+  overflow: hidden;
+  box-shadow:
+    inset 0 0 0 0.5px var(--hairline),
+    0 0 0 0.5px rgba(0, 0, 0, 0.22),
+    0 18px 48px rgba(0, 0, 0, 0.32);
+}
+
+.taskbar.is-agent-face.is-agent-workspace .shelf-morph-stage,
+.taskbar.is-agent-face.is-agent-workspace .shelf-face-agent,
+.taskbar.is-agent-face.is-agent-workspace .agent-workspace {
+  height: 100%;
+  min-height: 0;
+}
+
+.agent-workspace-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 100090;
+  background: rgba(8, 10, 14, 0.28);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 280ms var(--shell-motion-enter-ease);
+}
+
+.agent-workspace-scrim.is-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.agent-workspace {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  align-items: stretch;
+}
+
+.agent-workspace-sidebar {
+  display: none;
+  flex: 0 0 208px;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 0;
+  padding: 14px 12px 12px;
+  border-right: 0.5px solid var(--hairline);
+  background: color-mix(in srgb, var(--text) 3.5%, transparent);
+}
+
+.taskbar.is-agent-workspace .agent-workspace-sidebar {
+  display: flex;
+}
+
+.agent-workspace-brand {
+  padding: 2px 8px 10px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.agent-new-chat {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 34px;
+  margin: 0 0 8px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 560;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  text-align: left;
+}
+
+.agent-new-chat:hover {
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+}
+
+.agent-session-groups {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 0;
+  overflow: auto;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text) 28%, transparent) transparent;
+}
+
+.agent-session-group-label {
+  padding: 10px 8px 4px;
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.agent-session-item {
+  appearance: none;
+  display: block;
+  width: 100%;
+  margin: 0;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 82%, transparent);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 450;
+  letter-spacing: -0.01em;
+  line-height: 1.3;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agent-session-item:hover {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  color: var(--text);
+}
+
+.agent-session-item.is-active {
+  background: color-mix(in srgb, var(--text) 11%, transparent);
+  color: var(--text);
+  font-weight: 560;
+}
+
+.agent-workspace-segment {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px;
+  margin-top: 10px;
+  padding: 3px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+}
+
+.agent-segment-btn {
+  appearance: none;
+  min-height: 28px;
+  margin: 0;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 62%, transparent);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.agent-segment-btn.is-active {
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+  color: var(--text);
+}
+
+.agent-segment-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.agent-workspace-main {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.agent-workspace-header {
+  display: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex: 0 0 auto;
+  min-height: 48px;
+  padding: 10px 18px 8px;
+  border-bottom: 0.5px solid var(--hairline);
+}
+
+.taskbar.is-agent-workspace .agent-workspace-header {
+  display: flex;
+}
+
+.agent-session-title {
+  margin: 0;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agent-locality {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  color: color-mix(in srgb, var(--text) 58%, transparent);
+  font-size: 11px;
+  font-weight: 560;
+  letter-spacing: -0.01em;
+}
+
+.agent-locality-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #3ecf8e;
+  box-shadow: 0 0 0 3px color-mix(in srgb, #3ecf8e 22%, transparent);
+}
+
+.agent-workspace-stream {
+  display: none;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 0;
+  padding: 18px 20px 12px;
+  overflow: auto;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text) 28%, transparent) transparent;
+}
+
+.taskbar.is-agent-workspace .agent-workspace-stream {
+  display: flex;
+}
+
+.agent-msg {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: min(560px, 92%);
+}
+
+.agent-msg-meta {
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+}
+
+.agent-msg-body {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.agent-msg-user {
+  align-self: flex-end;
+  text-align: right;
+}
+
+.agent-msg-user .agent-msg-body {
+  padding: 10px 12px;
+  border-radius: 16px 16px 6px 16px;
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+}
+
+.agent-msg-agent {
+  align-self: flex-start;
+}
+
+.agent-msg-agent .agent-msg-body {
+  padding: 2px 0;
+}
+
+.agent-msg-agent.is-streaming .agent-msg-body::after {
+  content: "";
+  display: inline-block;
+  width: 0.55em;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -0.12em;
+  background: color-mix(in srgb, var(--text) 55%, transparent);
+  animation: agent-caret-blink 900ms steps(1, end) infinite;
+}
+
+@keyframes agent-caret-blink {
+  0%,
+  45% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+
+.taskbar.is-agent-workspace .agent-composer {
+  flex: 0 0 auto;
+  min-height: 0;
+  padding: 10px 14px 12px;
+  border-top: 0.5px solid var(--hairline);
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.taskbar.is-agent-workspace .agent-composer-input {
+  max-height: min(22vh, 140px);
+}
+
+.taskbar.is-agent-workspace .shelf-morph-enter {
+  opacity: 1;
+  transform: none;
+  filter: none;
+}
+
 .taskbar.is-agent-face #space-pager {
   display: none !important;
 }
@@ -3828,7 +4165,7 @@ body.dock-autohide::after {
   height: 100%;
   border-radius: 12px;
   background:
-    url("./icons/intelligence/icon-64.png?v=home-20260724k") center / contain no-repeat;
+    url("./icons/intelligence/icon-64.png?v=home-20260724m") center / contain no-repeat;
 }
 
 .agent-composer {
@@ -4153,9 +4490,14 @@ body.dock-autohide::after {
   .taskbar,
   .shelf-morph-stage,
   .shelf-morph-exit,
-  .shelf-morph-enter {
+  .shelf-morph-enter,
+  .agent-workspace-scrim {
     transition-duration: 0.01ms !important;
     transition-delay: 0ms !important;
+  }
+
+  .agent-msg-agent.is-streaming .agent-msg-body::after {
+    animation: none !important;
   }
 
   .shelf-morph-exit,

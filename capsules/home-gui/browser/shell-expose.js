@@ -11,17 +11,17 @@ import {
   desktopBackdrop,
   mountGlyph,
   shellState,
-} from "./shell-core.js?v=home-20260724k";
+} from "./shell-core.js?v=home-20260724m";
 import {
   browserWindowEntries,
   focusWindow,
   sortWindowEntriesByZOrder,
-} from "./shell-windows.js?v=home-20260724k";
+} from "./shell-windows.js?v=home-20260724m";
 import {
   closeOtherShellPopovers,
   registerEscapeHandler,
   registerShellPopover,
-} from "./shell-popovers.js?v=home-20260724k";
+} from "./shell-popovers.js?v=home-20260724m";
 import {
   addDesktopSpace,
   assignWindowToDesktop,
@@ -38,7 +38,7 @@ import {
   syncStagePresentation,
   syncSpacePager,
   flipRectMotion,
-} from "./shell-stages.js?v=home-20260724k";
+} from "./shell-stages.js?v=home-20260724m";
 function exposeReducedMotion() {
   return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
 }

@@ -9,11 +9,11 @@
  * - Expose / Show Windows — Mission Control overview (shell-expose.js)
  */
 
-import { shellState } from "./shell-core.js?v=home-20260724k";
+import { shellState } from "./shell-core.js?v=home-20260724m";
 import {
   rememberWindowRestoreBounds,
   restoreWindowFromSpecialState,
-} from "./shell-window-geometry.js?v=home-20260724k";
+} from "./shell-window-geometry.js?v=home-20260724m";
 
 const DESKTOP_STAGE = "desktop";
 let liveRegion = null;
