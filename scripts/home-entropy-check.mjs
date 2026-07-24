@@ -1829,7 +1829,7 @@ const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
 const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260723a";
-const homeGuiAssetVersion = "home-20260724ai";
+const homeGuiAssetVersion = "home-20260724an";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -2312,6 +2312,18 @@ assert(
     shellStyle.includes("overflow: visible") &&
     shellStyle.includes('data-agent-morph="enter"') &&
     homeGuiTemplateHtml.includes('id="agent-shelf-flip-back"') &&
+    homeGuiTemplateHtml.includes('title="Back to Home (Esc)"') &&
+    homeGuiTemplateHtml.includes('aria-label="Back to Home"') &&
+    !homeGuiTemplateHtml.includes("Back to Apps") &&
+    shellStyle.includes(
+      "body.agent-harness-active.agent-harness-rising:not(.expose-active) header.toolbar",
+    ) &&
+    shellStyle.includes(
+      "transition: transform 720ms cubic-bezier(0.22, 1, 0.36, 1)",
+    ) &&
+    read("capsules/home-gui/browser/agent-harness.js").includes(
+      "const HOME_RISE_MS = 720",
+    ) &&
     shellStyle.includes(".taskbar.is-agent-face") &&
     shellStyle.includes("background-color: var(--dock-fill)") &&
     shellStyle.includes("shelf-liquid-sheen") &&
@@ -2335,6 +2347,13 @@ assert(
     read("capsules/home-gui/browser/agent-harness.js").includes("showAgentHarness") &&
     read("capsules/home-gui/browser/agent-harness.js").includes("hideAgentHarness") &&
     read("capsules/home-gui/browser/agent-harness.js").includes("sendToAgentHarness") &&
+    read("capsules/home-gui/browser/agent-harness.js").includes("What's on your mind") &&
+    read("capsules/home-gui/browser/agent-harness.js").includes(
+      "Private on this machine · tools start at zero",
+    ) &&
+    shellStyle.includes(".agent-harness-empty-greeting") &&
+    shellStyle.includes(".agent-harness-empty-sub") &&
+    shellStyle.includes("translateX(calc(var(--harness-sidebar-w) / -2))") &&
     shellStyle.includes(".agent-harness") &&
     shellStyle.includes("body.agent-harness-active") &&
     !shellStyle.includes(".taskbar.is-agent-face.is-agent-workspace") &&
@@ -2365,6 +2384,48 @@ assert(
     read("capsules/home-gui/browser/agent-harness.js").includes("hideAgentShelfFace") &&
     !read("capsules/home-gui/browser/agent-harness.js").includes('registerEscapeHandler("agent-harness"'),
   "fx2d: harness tip aligned, Esc via Shelf, motion gen, Agent drop reject",
+);
+assert(
+  read("capsules/home-gui/browser/agent-harness.js").includes(
+    `const TIP = "${homeGuiAssetVersion}"`,
+  ) &&
+    read("capsules/home-gui/browser/agent-shelf.js").includes(
+      `const TIP = "${homeGuiAssetVersion}"`,
+    ) &&
+    read("capsules/home-gui/browser/shell-stages.js").includes(
+      `const TIP = "${homeGuiAssetVersion}"`,
+    ) &&
+    read("capsules/home-gui/browser/agent-shelf.js").includes(
+      "import(`./agent-harness.js?v=${TIP}`)",
+    ) &&
+    read("capsules/home-gui/browser/shell-stages.js").includes(
+      "import(`./agent-shelf.js?v=${TIP}`)",
+    ) &&
+    read("capsules/home-gui/browser/agent-harness.js").includes("scheduleHarnessSettled") &&
+    read("capsules/home-gui/browser/agent-harness.js").includes("teardownHarnessDom") &&
+    read("capsules/home-gui/browser/agent-harness.js").includes("scheduleHarnessTeardown") &&
+    read("capsules/home-gui/browser/agent-harness.js").includes(
+      "sanitize or use a text-safe",
+    ) &&
+    read("capsules/home-gui/browser/shell-stages.js").includes(
+      'keep it pinned far left',
+    ) &&
+    read("capsules/home-gui/browser/shell-stages.js").includes(
+      "!isAgentSpace(prev)",
+    ) &&
+    read("capsules/home-gui/browser/shell-stages.js").includes(
+      "Agent hosts no windows",
+    ) &&
+    read("capsules/home-gui/browser/shell-expose.js").includes(
+      "heroWindowId: null, targetStage: target",
+    ) &&
+    read("capsules/home-gui/browser/shell-windows.js").includes(
+      'key === "agent"',
+    ) &&
+    read("capsules/home-gui/browser/shell-windows.js").includes(
+      'savedStage === "agent"',
+    ),
+  "fx2e: TIP const per file, lifecycle helpers, Agent pin/slide/restore entropy",
 );
 assert(
   homeGuiCore.includes('targetId === "chat"') &&

@@ -3865,6 +3865,15 @@ body.agent-harness-active.stage-menubar-reveal:not(.expose-active) header.toolba
   pointer-events: auto;
 }
 
+/* Leave Agent — slide menubar down with Home rise (~HOME_RISE_MS), not the
+   snappy 200ms edge-reveal. Keep agent-harness-active so the transition rule
+   still applies; stripping it early pops the bar. */
+body.agent-harness-active.agent-harness-rising:not(.expose-active) header.toolbar {
+  transform: translateY(0);
+  pointer-events: none;
+  transition: transform 720ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
 /* Reveal only after settle — sensor off during drop/morph so it can't flash. */
 body.agent-harness-settled:not(.expose-active) .stage-edge-sensor-top {
   display: block;
@@ -4182,25 +4191,49 @@ body.agent-harness-active .taskbar.is-agent-face {
   box-sizing: border-box;
 }
 
+/* Empty hero: optical center of the room above the Shelf.
+   Main sits beside the sidebar, so shift left by half sidebar width to
+   align with the viewport-centered composer. Bottom inset = composer
+   clearance (no extra padding — that was pushing the block too high). */
 .agent-harness-empty {
-  margin: auto 0;
-  max-width: 320px;
-  align-self: center;
-  text-align: center;
-}
-
-.agent-harness-empty-title {
-  margin: 0 0 6px;
-  font-size: 15px;
-  font-weight: 600;
-  letter-spacing: -0.02em;
-}
-
-.agent-harness-empty-copy {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: var(--harness-composer-clearance);
+  left: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
   margin: 0;
-  color: color-mix(in srgb, var(--text) 58%, transparent);
-  font-size: 13px;
-  line-height: 1.45;
+  padding: 0 32px;
+  max-width: none;
+  text-align: center;
+  pointer-events: none;
+  transform: translateX(calc(var(--harness-sidebar-w) / -2));
+}
+
+.agent-harness-empty-greeting {
+  margin: 0 0 12px;
+  max-width: 22ch;
+  color: var(--text);
+  font-size: clamp(28px, 3.6vw, 40px);
+  font-weight: 600;
+  letter-spacing: -0.035em;
+  line-height: 1.12;
+  text-wrap: balance;
+}
+
+.agent-harness-empty-sub {
+  margin: 0;
+  max-width: 42ch;
+  color: color-mix(in srgb, var(--text) 55%, transparent);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  line-height: 1.35;
+  text-wrap: balance;
 }
 
 .agent-harness-outputs {
@@ -4966,7 +4999,8 @@ body.agent-harness-active .taskbar.is-agent-face {
     opacity: 1 !important;
   }
 
-  body.agent-harness-active.stage-menubar-reveal:not(.expose-active) header.toolbar {
+  body.agent-harness-active.stage-menubar-reveal:not(.expose-active) header.toolbar,
+  body.agent-harness-active.agent-harness-rising:not(.expose-active) header.toolbar {
     transform: none !important;
     filter: none !important;
     opacity: 1 !important;

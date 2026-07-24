@@ -1,20 +1,22 @@
 /* Fullscreen Stages + Desktop Spaces — presentation only.
  * Enter/Exit Fullscreen; flick Desktop(s) ↔ fullscreen apps;
  * Mission Control can add Desktops (+) and drag windows into Spaces.
+ * UI ≠ authority: Space switches never mint Capsule/Carrier grants.
  *
  * Glossary (engineer nouns — UI says Desktop / Space only):
  * - Desktop — windowed Space (primary "desktop" or desk-*); many windows
- * - Space — any ring entry: a Desktop or one fullscreen app Space
+ * - Space — any ring entry: a Desktop, Agent, or one fullscreen app Space
  * - Stage — internal id for the active Space (activeStageId); not user copy
  * - Expose / Show Windows — Mission Control overview (shell-expose.js)
  */
 
-import { shellState } from "./shell-core.js?v=home-20260724ai";
+import { shellState } from "./shell-core.js?v=home-20260724an";
 import {
   rememberWindowRestoreBounds,
   restoreWindowFromSpecialState,
-} from "./shell-window-geometry.js?v=home-20260724ai";
+} from "./shell-window-geometry.js?v=home-20260724an";
 
+const TIP = "home-20260724an";
 const DESKTOP_STAGE = "desktop";
 /** Singleton Agent Space — always in the ring beside Desktop (Mission Control peer). */
 const AGENT_STAGE = "agent";
@@ -323,7 +325,7 @@ function syncHarnessToActiveStage(next) {
     return;
   }
   harnessStageSyncLock = true;
-  void import("./agent-shelf.js?v=home-20260724ai")
+  void import(`./agent-shelf.js?v=${TIP}`)
     .then(async (shelf) => {
       try {
         if (isAgentSpace(next)) {
@@ -339,7 +341,7 @@ function syncHarnessToActiveStage(next) {
           if (!faceReady) {
             return;
           }
-          const harness = await import("./agent-harness.js?v=home-20260724ai");
+          const harness = await import(`./agent-harness.js?v=${TIP}`);
           if (!harness.agentHarnessActive()) {
             harness.showAgentHarness({ fromShelf: true, syncStage: false });
           }
@@ -349,7 +351,7 @@ function syncHarnessToActiveStage(next) {
           shelf.hideAgentShelfFace();
           return;
         }
-        const harness = await import("./agent-harness.js?v=home-20260724ai");
+        const harness = await import(`./agent-harness.js?v=${TIP}`);
         if (harness.agentHarnessActive()) {
           harness.hideAgentHarness({ restoreShelfApps: false, syncStage: false });
         }

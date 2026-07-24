@@ -1,12 +1,14 @@
 /* Agent Harness (preview) — Home drops, Shelf stays as composer hinge.
-   UI ≠ authority: never mints grants. */
+   UI ≠ authority (Principle 16): never mints grants, never opens Carrier/
+   capsule ambient paths. Mock stream only until agentic/runtime waves wire
+   explicit, revocable tools (fail-closed). */
 
 import {
   setAgentComposerProcessing,
   syncAgentSendButton,
   composerInput as shelfComposerInput,
   hideAgentShelfFace,
-} from "./agent-shelf.js?v=home-20260724ai";
+} from "./agent-shelf.js?v=home-20260724an";
 import {
   enableHarnessMenubarReveal,
   clearHarnessMenubarReveal,
@@ -15,9 +17,9 @@ import {
   getActiveStageId,
   isAgentSpace,
   setActiveStage,
-} from "./shell-stages.js?v=home-20260724ai";
+} from "./shell-stages.js?v=home-20260724an";
 
-const TIP = "home-20260724ai";
+const TIP = "home-20260724an";
 const HOME_BREATHE_MS = 780;
 const HOME_RISE_MS = 720;
 const HARNESS_CONTENT_AT_MS = 180;
@@ -159,6 +161,26 @@ function streamScrollEl() {
   return document.querySelector("#agent-harness-stream");
 }
 
+function streamViewportEl() {
+  return document.querySelector(".agent-harness-stream-viewport");
+}
+
+function signedInFirstName() {
+  const raw = document.querySelector("#toolbar-identity-menu-name")?.textContent?.trim() || "";
+  if (!raw) {
+    return "";
+  }
+  const first = raw.split(/\s+/)[0] || "";
+  if (first.includes("@")) {
+    return first.split("@")[0] || "";
+  }
+  return first;
+}
+
+function clearEmptyState() {
+  document.querySelector(".agent-harness-empty")?.remove();
+}
+
 /** Pin the transcript to the end after layout settles (markdown/code can grow). */
 function scrollStreamToEnd() {
   const scroller = streamScrollEl();
@@ -228,7 +250,8 @@ function escapeHtml(text) {
 }
 
 /** Tiny markdown for MOCK_REPLY only — escapeHtml on fences/inlines.
- *  When live model tokens arrive: sanitize before innerHTML (seam). */
+ *  SEAM (live model / Carrier-backed replies): sanitize or use a text-safe
+ *  path before innerHTML. UI must never treat model HTML as authority. */
 function renderMarkdown(text) {
   const parts = String(text).split(/```([\s\S]*?)```/g);
   let html = "";
@@ -314,8 +337,7 @@ function appendMessage(role, text, { streaming = false, asHtml = false } = {}) {
   if (!stream) {
     return null;
   }
-  const empty = stream.querySelector(".agent-harness-empty");
-  empty?.remove();
+  clearEmptyState();
 
   const row = document.createElement("div");
   row.className = `agent-msg agent-msg-${role}${streaming ? " is-streaming" : ""}`;
@@ -358,17 +380,26 @@ function appendMessage(role, text, { streaming = false, asHtml = false } = {}) {
 }
 
 function showEmptyState() {
-  const stream = streamEl();
-  if (!stream) {
+  const column = streamEl();
+  const viewport = streamViewportEl();
+  if (!column || !viewport) {
     return;
   }
-  stream.replaceChildren();
+  column.replaceChildren();
+  clearEmptyState();
+  const name = signedInFirstName();
+  const greeting = name
+    ? `What's on your mind, ${name}?`
+    : "What's on your mind?";
   const empty = document.createElement("div");
   empty.className = "agent-harness-empty";
+  empty.setAttribute("role", "status");
   empty.innerHTML =
-    `<p class="agent-harness-empty-title">Private on this machine</p>` +
-    `<p class="agent-harness-empty-copy">Tools start at zero. Send from the Shelf composer below.</p>`;
-  stream.append(empty);
+    `<p class="agent-harness-empty-greeting"></p>` +
+    `<p class="agent-harness-empty-sub">Private on this machine · tools start at zero</p>`;
+  empty.querySelector(".agent-harness-empty-greeting").textContent = greeting;
+  /* Viewport — not the dock-width column — so the hero sits in true room center. */
+  viewport.append(empty);
 }
 
 function renderActiveSession() {
@@ -388,6 +419,7 @@ function renderActiveSession() {
     showEmptyState();
     return;
   }
+  clearEmptyState();
   for (const msg of session.messages) {
     appendMessage(msg.role, msg.text);
   }
@@ -636,6 +668,15 @@ export function showAgentHarness({ prompt, fromShelf = false, syncStage = true }
     }, prefersReducedMotion() ? 40 : HARNESS_CONTENT_AT_MS);
   }
 
+  scheduleHarnessSettled(motionGen);
+
+  if (!fromShelf) {
+    shelfComposerInput()?.focus({ preventScroll: true });
+  }
+}
+
+/** Generation-safe settle after Home breathe — menubar edge-reveal only then. */
+function scheduleHarnessSettled(motionGen) {
   window.setTimeout(() => {
     if (motionGen !== harnessMotionGen || !active) {
       return;
@@ -645,10 +686,41 @@ export function showAgentHarness({ prompt, fromShelf = false, syncStage = true }
     enableHarnessMenubarReveal();
     syncComposerGeometry();
   }, prefersReducedMotion() ? 40 : HOME_BREATHE_MS);
+}
 
-  if (!fromShelf) {
-    shelfComposerInput()?.focus({ preventScroll: true });
+/** Finish leave: clear room chrome; optional Shelf reverse morph. */
+function teardownHarnessDom(motionGen, { restoreShelfApps = true } = {}) {
+  if (motionGen !== harnessMotionGen) {
+    return;
   }
+  const harness = harnessEl();
+  stopDockGeometryObserver();
+  clearHarnessMenubarReveal();
+  setHarnessChromeInert(false);
+  document.body.classList.remove("agent-harness-active", "agent-harness-rising");
+  /* Column CSS vars stay until Shelf morph finishes (shelf clears them). */
+  if (harness) {
+    harness.hidden = true;
+    harness.setAttribute("aria-hidden", "true");
+  }
+  if (restoreShelfApps) {
+    void import(`./agent-shelf.js?v=${TIP}`).then((shelf) => {
+      /* Reverse morph back to Home Shelf — same dance as Dock Agent leave. */
+      if (shelf.agentShelfFaceActive()) {
+        shelf.hideAgentShelfFace();
+      } else {
+        shelf.snapAppsShelfFace();
+      }
+    });
+  }
+}
+
+function scheduleHarnessTeardown(motionGen, opts) {
+  if (prefersReducedMotion()) {
+    teardownHarnessDom(motionGen, opts);
+    return;
+  }
+  window.setTimeout(() => teardownHarnessDom(motionGen, opts), HOME_RISE_MS);
 }
 
 export function hideAgentHarness({ restoreShelfApps = true, syncStage = true } = {}) {
@@ -676,36 +748,7 @@ export function hideAgentHarness({ restoreShelfApps = true, syncStage = true } =
     });
   }
 
-  const finish = () => {
-    if (motionGen !== harnessMotionGen) {
-      return;
-    }
-    stopDockGeometryObserver();
-    clearHarnessMenubarReveal();
-    setHarnessChromeInert(false);
-    document.body.classList.remove("agent-harness-active", "agent-harness-rising");
-    /* Column CSS vars stay until Shelf morph finishes (shelf clears them). */
-    if (harness) {
-      harness.hidden = true;
-      harness.setAttribute("aria-hidden", "true");
-    }
-    if (restoreShelfApps) {
-      void import(`./agent-shelf.js?v=${TIP}`).then((shelf) => {
-        /* Reverse morph back to Apps — same dance as Dock Agent leave. */
-        if (shelf.agentShelfFaceActive()) {
-          shelf.hideAgentShelfFace();
-        } else {
-          shelf.snapAppsShelfFace();
-        }
-      });
-    }
-  };
-
-  if (prefersReducedMotion()) {
-    finish();
-    return;
-  }
-  window.setTimeout(finish, HOME_RISE_MS);
+  scheduleHarnessTeardown(motionGen, { restoreShelfApps });
 }
 
 export function stopAgentHarnessStream() {
@@ -729,8 +772,7 @@ export function sendToAgentHarness(prompt) {
     session.messages.push({ role: "user", text });
     renderSessions();
     setTitle(session.title);
-    const empty = streamEl()?.querySelector(".agent-harness-empty");
-    empty?.remove();
+    clearEmptyState();
     appendMessage("user", text);
     startMockStream(MOCK_REPLY);
     return;

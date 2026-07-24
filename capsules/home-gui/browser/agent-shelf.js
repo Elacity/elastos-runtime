@@ -1,13 +1,16 @@
 /* Agent Shelf morph (preview) — presentation only.
-   UI ≠ authority: morphing never mints grants.
+   UI ≠ authority (Principle 16): morphing never mints grants or Carrier
+   authority. Live tools/grants stay fail-closed until Inbox/agentic waves.
 
    Geometry is FLIP’d in pixels. CSS cannot interpolate width:max-content →
    width:720px or height:auto, which looked like an instant jump + empty wait.
 
    Send opens Agent Harness (Home drops, dock stays) — see agent-harness.js. */
 
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724ai";
-import { hideLauncher } from "./shell-surface.js?v=home-20260724ai";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724an";
+import { hideLauncher } from "./shell-surface.js?v=home-20260724an";
+
+const TIP = "home-20260724an";
 
 let bound = false;
 let morphGeneration = 0;
@@ -195,7 +198,7 @@ function flipTaskbarGeometry(taskbar, applyEndState, durationMs = MORPH_STRETCH_
 }
 
 async function harnessApi() {
-  return import("./agent-harness.js?v=home-20260724ai");
+  return import(`./agent-harness.js?v=${TIP}`);
 }
 
 export async function sendAgentComposerMessage() {
