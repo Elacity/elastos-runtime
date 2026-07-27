@@ -4535,8 +4535,34 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
 }
 
 .agent-harness-truth [data-truth-local],
-.agent-harness-truth [data-truth-tools] {
+.agent-harness-truth [data-truth-model],
+.agent-harness-truth [data-truth-tools],
+.agent-harness-truth [data-truth-context],
+.agent-harness-truth [data-truth-hw] {
   padding: 2px 0;
+}
+
+.agent-harness-truth-sep {
+  opacity: 0.35;
+  user-select: none;
+}
+
+.agent-harness-truth-meter {
+  display: inline-flex;
+  width: 44px;
+  height: 4px;
+  border-radius: 99px;
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+  overflow: hidden;
+  vertical-align: middle;
+}
+
+.agent-harness-truth-meter-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: color-mix(in srgb, var(--accent, #f97316) 55%, var(--text));
+  transition: width 280ms ease;
 }
 
 .agent-harness-truth[data-tools="pending"] [data-truth-tools] {
@@ -4545,6 +4571,11 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
 
 .agent-harness-truth[data-tools="live"] [data-truth-tools] {
   color: color-mix(in srgb, var(--accent, #f97316) 85%, var(--text));
+}
+
+.agent-harness-truth [data-truth-hw][data-hw="warn"],
+.agent-harness-truth[data-hw="warn"] [data-truth-hw] {
+  color: color-mix(in srgb, #c2410c 75%, var(--text));
 }
 
 /* Scrollport fills the main column — no top chrome. Soft fade at top (Codex)

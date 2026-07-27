@@ -8,12 +8,12 @@ import {
   toolbarSystem,
   toolbarIdentityMenu,
   toolbarIdentityMenuName,
-} from "./shell-core.js?v=home-20260724ci";
-import { renderNcTimeChrome } from "./shell-notifications.js?v=home-20260724ci";
+} from "./shell-core.js?v=home-20260724cj";
+import { renderNcTimeChrome } from "./shell-notifications.js?v=home-20260724cj";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20260724ci";
+} from "./shell-motion.js?v=home-20260724cj";
 
 /* System chrome: the ElastOS brand at the far left of the bar is the system
    menu (the macOS Apple-menu position) — show desktop, fullscreen, System,

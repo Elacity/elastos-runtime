@@ -3,46 +3,46 @@ import {
   mountGlyph,
   trapTabWithin,
   launcher,
-} from "./shell-core.js?v=home-20260724ci";
+} from "./shell-core.js?v=home-20260724cj";
 import {
   moveDesktopSelection,
-} from "./shell-surface.js?v=home-20260724ci";
-import { toggleSpotlight } from "./shell-spotlight.js?v=home-20260724ci";
+} from "./shell-surface.js?v=home-20260724cj";
+import { toggleSpotlight } from "./shell-spotlight.js?v=home-20260724cj";
 import {
   focusWindow,
   closeWindow,
   minimizeWindow,
   maximizeActiveWindow,
   sortWindowEntriesByZOrder,
-} from "./shell-windows.js?v=home-20260724ci";
+} from "./shell-windows.js?v=home-20260724cj";
 import {
   applyWindowSnapState,
   restoreWindowFromSpecialState,
-} from "./shell-window-geometry.js?v=home-20260724ci";
+} from "./shell-window-geometry.js?v=home-20260724cj";
 import {
   closeExpose,
   isExposeOpen,
   toggleExpose,
-} from "./shell-expose.js?v=home-20260724ci";
+} from "./shell-expose.js?v=home-20260724cj";
 import {
   hideQuickLook,
   isQuickLookOpen,
   toggleQuickLook,
-} from "./shell-quicklook.js?v=home-20260724ci";
+} from "./shell-quicklook.js?v=home-20260724cj";
 import {
   closeOtherShellPopovers,
   handleShellEscape,
   registerEscapeHandler,
   registerShellPopover,
   setOverlayOpen,
-} from "./shell-popovers.js?v=home-20260724ci";
+} from "./shell-popovers.js?v=home-20260724cj";
 import {
   exitActiveFullscreenStage,
   flickStage,
   getActiveStageId,
   desktopStageId,
   isDesktopSpace,
-} from "./shell-stages.js?v=home-20260724ci";
+} from "./shell-stages.js?v=home-20260724cj";
 
 /* Shell keyboard layer.
  *

@@ -2,7 +2,13 @@
    UI ≠ authority (Principle 16): never mints Carrier/Capsule grants,
    never calls live ai-provider. Label everything Preview · mock. */
 
-const TIP = "home-20260724ci";
+const TIP = "home-20260724cj";
+
+/** Selected mock model id — presentation only until w1. */
+let selectedModelId = "local-preview";
+
+/** Mock context fill 0–1 for truth-strip meter (fx6). */
+let mockContextRatio = 0.12;
 
 export const MOCK_REPLY =
   "I'm a local preview on this machine — not live inference yet.\n\n" +
@@ -46,13 +52,15 @@ export function listModels() {
       tier: "preview",
       fitsDevice: true,
       tokensPerSecEstimate: null,
+      vramGbEstimate: null,
     },
     {
       id: "qwen-stub-small",
       label: "Small local (stub)",
       tier: "fits",
       fitsDevice: true,
-      tokensPerSecEstimate: null,
+      tokensPerSecEstimate: 28,
+      vramGbEstimate: 4,
     },
     {
       id: "spark-stub",
@@ -60,8 +68,85 @@ export function listModels() {
       tier: "unsupported",
       fitsDevice: false,
       tokensPerSecEstimate: null,
+      vramGbEstimate: 48,
     },
   ];
+}
+
+export function getSelectedModelId() {
+  return selectedModelId;
+}
+
+export function setSelectedModelId(modelId) {
+  const match = listModels().find((m) => m.id === modelId);
+  if (match) {
+    selectedModelId = match.id;
+  }
+  return getSelectedModel();
+}
+
+export function getSelectedModel() {
+  return listModels().find((m) => m.id === selectedModelId) || listModels()[0];
+}
+
+/** Advance mock context after a turn (presentation only). */
+export function noteMockTurnTokens(approxTokens = 400) {
+  const bump = Math.min(0.08, Math.max(0.01, approxTokens / 12000));
+  mockContextRatio = Math.min(0.92, mockContextRatio + bump);
+}
+
+export function resetMockContextMeter() {
+  mockContextRatio = 0.12;
+}
+
+/**
+ * Truth-strip snapshot for harness (fx6). UI ≠ authority.
+ * @returns {{
+ *   preview: true,
+ *   locality: string,
+ *   modelLabel: string,
+ *   modelTier: string,
+ *   toolsLabel: string,
+ *   toolsState: "none"|"pending"|"live",
+ *   contextRatio: number,
+ *   contextLabel: string,
+ *   hwLabel: string,
+ *   hwState: "unknown"|"ok"|"warn"
+ * }}
+ */
+export function getTruthSnapshot() {
+  const model = getSelectedModel();
+  const toolsLabel = toolsSummaryLabel();
+  const toolsState = listCapabilities().some((c) => c.state === "granted")
+    ? "live"
+    : listCapabilities().some((c) => c.state === "pending")
+      ? "pending"
+      : "none";
+  const pct = Math.round(mockContextRatio * 100);
+  let hwLabel = "HW unmeasured";
+  let hwState = "unknown";
+  if (model.tier === "unsupported") {
+    hwLabel = "Needs Spark";
+    hwState = "warn";
+  } else if (model.tokensPerSecEstimate != null) {
+    hwLabel = `~${model.tokensPerSecEstimate} tok/s stub`;
+    hwState = "ok";
+  } else if (model.vramGbEstimate != null) {
+    hwLabel = `~${model.vramGbEstimate} GB stub`;
+    hwState = "ok";
+  }
+  return {
+    preview: true,
+    locality: "On this device",
+    modelLabel: model.label,
+    modelTier: model.tier,
+    toolsLabel,
+    toolsState,
+    contextRatio: mockContextRatio,
+    contextLabel: `${pct}% context`,
+    hwLabel,
+    hwState,
+  };
 }
 
 export function listCapabilities() {
@@ -212,6 +297,7 @@ export function resetMockCapabilities() {
     cap.state = "none";
   }
   pendingApprovals.clear();
+  resetMockContextMeter();
 }
 
 /** Paint mock capability state from a persisted session grant (preview only). */

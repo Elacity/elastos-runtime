@@ -8,7 +8,7 @@ import {
   syncAgentSendButton,
   composerInput as shelfComposerInput,
   hideAgentShelfFace,
-} from "./agent-shelf.js?v=home-20260724ci";
+} from "./agent-shelf.js?v=home-20260724cj";
 import {
   enableHarnessMenubarReveal,
   clearHarnessMenubarReveal,
@@ -18,8 +18,8 @@ import {
   isAgentSpace,
   setActiveStage,
   syncSpacePager,
-} from "./shell-stages.js?v=home-20260724ci";
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724ci";
+} from "./shell-stages.js?v=home-20260724cj";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724cj";
 import {
   MOCK_REPLY,
   listCapabilities,
@@ -27,12 +27,14 @@ import {
   resolveMockApproval,
   resetMockCapabilities,
   applyCapabilityState,
-  toolsSummaryLabel,
   wantsLibraryTool,
   wantsWalletTool,
-} from "./mock-agent-provider.js?v=home-20260724ci";
+  getTruthSnapshot,
+  noteMockTurnTokens,
+  getSelectedModel,
+} from "./mock-agent-provider.js?v=home-20260724cj";
 
-const TIP = "home-20260724ci";
+const TIP = "home-20260724cj";
 const HOME_BREATHE_MS = 780;
 const HOME_RISE_MS = 720;
 const HARNESS_CONTENT_AT_MS = 180;
@@ -519,15 +521,51 @@ function syncTruthStrip() {
   if (!root) {
     return;
   }
+  const snap = getTruthSnapshot();
+  const local = root.querySelector("[data-truth-local]");
+  const model = root.querySelector("[data-truth-model]");
   const tools = root.querySelector("[data-truth-tools]");
-  if (tools) {
-    tools.textContent = toolsSummaryLabel();
+  const context = root.querySelector("[data-truth-context]");
+  const contextFill = root.querySelector("[data-truth-context-fill]");
+  const hw = root.querySelector("[data-truth-hw]");
+  if (local) {
+    local.textContent = snap.locality;
   }
-  root.dataset.tools = listCapabilities().some((c) => c.state === "granted")
-    ? "live"
-    : listCapabilities().some((c) => c.state === "pending")
-      ? "pending"
-      : "none";
+  if (model) {
+    model.textContent = snap.modelLabel;
+    model.title = `${snap.modelLabel} · ${snap.modelTier}`;
+  }
+  if (tools) {
+    tools.textContent = snap.toolsLabel;
+  }
+  if (context) {
+    context.textContent = snap.contextLabel;
+    context.title = "Mock context window fill — not live tokenizer";
+  }
+  if (contextFill) {
+    contextFill.style.width = `${Math.round(snap.contextRatio * 100)}%`;
+  }
+  if (hw) {
+    hw.textContent = snap.hwLabel;
+    hw.dataset.hw = snap.hwState;
+    hw.title =
+      snap.hwState === "unknown"
+        ? "Hardware not probed yet (Spark/W2)"
+        : "Stub estimate — not a live probe";
+  }
+  root.dataset.tools = snap.toolsState;
+  root.dataset.hw = snap.hwState;
+  root.dataset.modelTier = snap.modelTier;
+
+  const modelBtnName = document.querySelector(".agent-model-name");
+  const modelBtnTier = document.querySelector(".agent-model-tier");
+  const selected = getSelectedModel();
+  if (modelBtnName && selected) {
+    modelBtnName.textContent = selected.tier === "preview" ? "Local" : selected.label;
+  }
+  if (modelBtnTier && selected) {
+    modelBtnTier.textContent = selected.tier === "unsupported" ? "spark" : selected.tier;
+  }
 }
 
 function appendMessage(role, text, { streaming = false, asHtml = false } = {}) {
@@ -932,6 +970,7 @@ function startMockStream(replyText) {
       if (session) {
         session.messages.push({ role: "agent", text: replyText });
       }
+      noteMockTurnTokens(Math.max(200, Math.round(replyText.length / 3)));
       maybeOfferToolAfterReply();
       syncTruthStrip();
       /* Markdown/code blocks grow after plain-text streaming — re-pin above the Shelf. */

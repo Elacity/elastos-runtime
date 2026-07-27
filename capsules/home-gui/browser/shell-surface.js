@@ -50,7 +50,7 @@ import {
   mutateDesktopObject,
   formatBadgeCount,
   focusModeEnabled,
-} from "./shell-core.js?v=home-20260724ci";
+} from "./shell-core.js?v=home-20260724cj";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -64,19 +64,19 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260724ci";
-import { playUiSound } from "./shell-sounds.js?v=home-20260724ci";
+} from "./shell-windows.js?v=home-20260724cj";
+import { playUiSound } from "./shell-sounds.js?v=home-20260724cj";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
   setOverlayOpen,
-} from "./shell-popovers.js?v=home-20260724ci";
+} from "./shell-popovers.js?v=home-20260724cj";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20260724ci";
-import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260724ci";
-import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260724ci";
+} from "./shell-motion.js?v=home-20260724cj";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260724cj";
+import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260724cj";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -2629,7 +2629,7 @@ export function desktopMarqueeActive() {
   return Boolean(marqueeState?.node);
 }
 
-const SHELF_TIP = "home-20260724ci";
+const SHELF_TIP = "home-20260724cj";
 
 async function shelfMorphApi() {
   return import(`./agent-shelf.js?v=${SHELF_TIP}`);

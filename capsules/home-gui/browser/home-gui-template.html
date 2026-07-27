@@ -622,10 +622,27 @@
         <span class="agent-harness-icon-search" aria-hidden="true"></span>
       </button>
     </div>
-    <div class="agent-harness-truth" aria-live="polite">
+    <div class="agent-harness-truth" aria-live="polite" data-tools="none" data-hw="unknown">
       <span class="agent-harness-truth-preview">preview</span>
       <span data-truth-local>On this device</span>
+      <span class="agent-harness-truth-sep" aria-hidden="true">·</span>
+      <span data-truth-model title="Selected model">Local preview</span>
+      <span class="agent-harness-truth-sep" aria-hidden="true">·</span>
+      <span
+        class="agent-harness-truth-context"
+        data-truth-context
+        title="Mock context window fill — not live tokenizer"
+        >12% context</span
+      >
+      <span class="agent-harness-truth-meter" aria-hidden="true">
+        <span class="agent-harness-truth-meter-fill" data-truth-context-fill style="width: 12%"></span>
+      </span>
+      <span class="agent-harness-truth-sep" aria-hidden="true">·</span>
       <span data-truth-tools>Tools: none</span>
+      <span class="agent-harness-truth-sep" aria-hidden="true">·</span>
+      <span data-truth-hw data-hw="unknown" title="Hardware not probed yet (Spark/W2)"
+        >HW unmeasured</span
+      >
     </div>
     <div class="agent-harness-stream-viewport">
       <div
