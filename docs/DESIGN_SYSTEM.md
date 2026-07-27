@@ -42,10 +42,18 @@ The Home shell follows a familiar desktop anatomy deliberately:
   and the clock (which opens Notification Center).
 - Windows carry traffic-light controls on the left; inactive windows go
   neutral. Maximized windows own the stage between bar and dock, never the bar.
-- The dock is a centered pill with cosine-falloff magnification; running apps
-  get an indicator dot; **Trash anchors the right end** past a divider.
-- All window/dock motion is transform/opacity-only and honors
-  `prefers-reduced-motion`.
+- The dock is a centered pill with cosine-falloff magnification.
+  Layout (left → right): **Agent** · **Apps** · pinned core · temporary
+  running apps · divider · **Bin**. Running apps get an indicator dot.
+- **Membership:** opening an app from Apps places a *temporary* running
+  tile next to Bin (not a permanent pin). Closing the last window removes
+  that tile. Permanent Shelf presence is only via drag into the pinned
+  core, or an explicit Pin action. Drag from core into the running/Bin
+  side unpins.
+- **Motion:** membership changes breathe dock width while Bin (+ divider)
+  rides with the ease; Apps face open/close is height-only (width already
+  matches). Magnified icons stay overflow-visible (in front of the glass).
+  Honor `prefers-reduced-motion`.
 
 ## Window Chrome Modes
 
