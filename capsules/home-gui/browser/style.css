@@ -4578,6 +4578,144 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   color: color-mix(in srgb, #c2410c 75%, var(--text));
 }
 
+.agent-harness-truth-thinking {
+  margin: 0;
+  padding: 2px 7px;
+  border: 0;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: inherit;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+
+.agent-harness-truth-thinking[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--accent, #f97316) 16%, transparent);
+}
+
+.agent-queue {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  width: var(--agent-column-width);
+  max-width: 100%;
+  margin: 0 0 8px;
+  margin-left: var(--agent-column-left, 0px);
+}
+
+.agent-queue[hidden] {
+  display: none !important;
+}
+
+.agent-queue-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.55;
+}
+
+.agent-queue-chip {
+  max-width: 220px;
+  padding: 4px 10px;
+  border: 0;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: color-mix(in srgb, var(--text) 78%, transparent);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 560;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.agent-queue-chip:hover {
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+}
+
+.agent-turn-divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 0 6px;
+  color: color-mix(in srgb, var(--text) 42%, transparent);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.agent-turn-divider::before,
+.agent-turn-divider::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+}
+
+.agent-thinking {
+  margin: 0 0 10px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  color: color-mix(in srgb, var(--text) 72%, transparent);
+}
+
+.agent-thinking-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  list-style: none;
+  font-size: 12px;
+  font-weight: 620;
+}
+
+.agent-thinking-summary::-webkit-details-marker {
+  display: none;
+}
+
+.agent-thinking-hint {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  opacity: 0.45;
+}
+
+.agent-thinking-body {
+  margin: 0;
+  padding: 0 12px 12px;
+  white-space: pre-wrap;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.45;
+  opacity: 0.88;
+}
+
+.agent-thinking.is-streaming .agent-thinking-body::after {
+  content: "▍
+  animation: agent-caret 1s steps(1) infinite;
+}
+
+html[data-agent-reasoning="off"] .agent-thinking {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-thinking.is-streaming .agent-thinking-body::after {
+    animation: none;
+  }
+}
+
 /* Scrollport fills the main column — no top chrome. Soft fade at top (Codex)
    and under the Shelf at the bottom. */
 .agent-harness-stream-viewport {

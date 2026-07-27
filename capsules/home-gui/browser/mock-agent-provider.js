@@ -2,13 +2,20 @@
    UI ≠ authority (Principle 16): never mints Carrier/Capsule grants,
    never calls live ai-provider. Label everything Preview · mock. */
 
-const TIP = "home-20260724cj";
+const TIP = "home-20260724ck";
 
 /** Selected mock model id — presentation only until w1. */
 let selectedModelId = "local-preview";
 
 /** Mock context fill 0–1 for truth-strip meter (fx6). */
 let mockContextRatio = 0.12;
+
+const REASONING_VISIBLE_KEY = "elastos.agent.reasoningVisible";
+
+export const MOCK_THINKING =
+  "Check locality first — answer must stay on this device.\n" +
+  "Tools start at zero; only surface a grant if the user asked for files.\n" +
+  "Keep the reply calm, short, and honest that this is preview mock.";
 
 export const MOCK_REPLY =
   "I'm a local preview on this machine — not live inference yet.\n\n" +
@@ -358,4 +365,40 @@ function mockToolResult(toolId, args) {
 
 export function providerTip() {
   return TIP;
+}
+
+/** Thinking visibility preference (fx7). Default on. */
+export function loadReasoningVisible() {
+  try {
+    if (typeof localStorage === "undefined") {
+      return true;
+    }
+    return localStorage.getItem(REASONING_VISIBLE_KEY) !== "0";
+  } catch {
+    return true;
+  }
+}
+
+export function setReasoningVisible(visible) {
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem(REASONING_VISIBLE_KEY, visible ? "1" : "0");
+    }
+  } catch {
+    /* ignore */
+  }
+  return Boolean(visible);
+}
+
+/** Mock turn payload: thinking then answer (fx7). */
+export function getMockTurn(userText = "") {
+  const wantsFiles = wantsLibraryTool(userText);
+  const thinking = wantsFiles
+    ? `${MOCK_THINKING}\nThey mentioned files — offer Library · Read as a grant card after the answer.`
+    : MOCK_THINKING;
+  return {
+    thinking,
+    answer: MOCK_REPLY,
+    preview: true,
+  };
 }

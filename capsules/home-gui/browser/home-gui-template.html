@@ -643,7 +643,23 @@
       <span data-truth-hw data-hw="unknown" title="Hardware not probed yet (Spark/W2)"
         >HW unmeasured</span
       >
+      <span class="agent-harness-truth-sep" aria-hidden="true">·</span>
+      <button
+        type="button"
+        class="agent-harness-truth-thinking"
+        data-truth-thinking-toggle
+        aria-pressed="true"
+        title="Hide model thinking blocks"
+      >
+        Thinking on
+      </button>
     </div>
+    <div
+      class="agent-queue"
+      data-agent-queue
+      hidden
+      aria-label="Queued follow-up prompts"
+    ></div>
     <div class="agent-harness-stream-viewport">
       <div
         id="agent-harness-stream"

@@ -8,7 +8,7 @@ import {
   syncAgentSendButton,
   composerInput as shelfComposerInput,
   hideAgentShelfFace,
-} from "./agent-shelf.js?v=home-20260724cj";
+} from "./agent-shelf.js?v=home-20260724ck";
 import {
   enableHarnessMenubarReveal,
   clearHarnessMenubarReveal,
@@ -18,8 +18,8 @@ import {
   isAgentSpace,
   setActiveStage,
   syncSpacePager,
-} from "./shell-stages.js?v=home-20260724cj";
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724cj";
+} from "./shell-stages.js?v=home-20260724ck";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724ck";
 import {
   MOCK_REPLY,
   listCapabilities,
@@ -32,9 +32,12 @@ import {
   getTruthSnapshot,
   noteMockTurnTokens,
   getSelectedModel,
-} from "./mock-agent-provider.js?v=home-20260724cj";
+  getMockTurn,
+  loadReasoningVisible,
+  setReasoningVisible,
+} from "./mock-agent-provider.js?v=home-20260724ck";
 
-const TIP = "home-20260724cj";
+const TIP = "home-20260724ck";
 const HOME_BREATHE_MS = 780;
 const HOME_RISE_MS = 720;
 const HARNESS_CONTENT_AT_MS = 180;
@@ -111,6 +114,11 @@ let particleRaf = 0;
 let dockResizeObserver = null;
 let sessions = structuredClone(SEED_SESSIONS);
 let activeSessionId = null;
+/** Follow-up prompts queued while a mock turn is streaming (fx7). */
+let followUpQueue = [];
+let reasoningVisible = loadReasoningVisible();
+/** True while thinking or answer mock stream is in flight. */
+let turnBusy = false;
 
 function setHarnessChromeInert(inert) {
   const nodes = [
@@ -566,6 +574,115 @@ function syncTruthStrip() {
   if (modelBtnTier && selected) {
     modelBtnTier.textContent = selected.tier === "unsupported" ? "spark" : selected.tier;
   }
+
+  const thinkToggle = root.querySelector("[data-truth-thinking-toggle]");
+  if (thinkToggle) {
+    thinkToggle.setAttribute("aria-pressed", reasoningVisible ? "true" : "false");
+    thinkToggle.textContent = reasoningVisible ? "Thinking on" : "Thinking off";
+    thinkToggle.title = reasoningVisible
+      ? "Hide model thinking blocks"
+      : "Show model thinking blocks";
+  }
+  document.documentElement.dataset.agentReasoning = reasoningVisible ? "on" : "off";
+}
+
+function appendTurnDivider(label) {
+  const stream = streamEl();
+  if (!stream) {
+    return null;
+  }
+  const row = document.createElement("div");
+  row.className = "agent-turn-divider";
+  row.setAttribute("role", "separator");
+  row.innerHTML = `<span class="agent-turn-divider-label"></span>`;
+  row.querySelector(".agent-turn-divider-label").textContent = label;
+  stream.append(row);
+  return row;
+}
+
+function appendThinkingBlock(text, { streaming = false, open = true } = {}) {
+  const stream = streamEl();
+  if (!stream) {
+    return null;
+  }
+  clearEmptyState();
+  const details = document.createElement("details");
+  details.className = `agent-thinking${streaming ? " is-streaming" : ""}`;
+  details.dataset.block = "thinking";
+  if (open && reasoningVisible) {
+    details.open = true;
+  }
+  const summary = document.createElement("summary");
+  summary.className = "agent-thinking-summary";
+  summary.innerHTML =
+    `<span class="agent-thinking-label">Thinking</span>` +
+    `<span class="agent-thinking-hint">preview · not authority</span>`;
+  const body = document.createElement("pre");
+  body.className = "agent-thinking-body";
+  body.textContent = text;
+  details.append(summary, body);
+  stream.append(details);
+  scrollStreamToEnd();
+  return details;
+}
+
+function renderFollowUpQueue() {
+  const root = document.querySelector("[data-agent-queue]");
+  if (!root) {
+    return;
+  }
+  root.replaceChildren();
+  root.hidden = followUpQueue.length === 0;
+  if (!followUpQueue.length) {
+    return;
+  }
+  const label = document.createElement("span");
+  label.className = "agent-queue-label";
+  label.textContent = "Queued";
+  root.append(label);
+  for (const item of followUpQueue) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "agent-queue-chip";
+    chip.dataset.queueId = item.id;
+    chip.title = "Remove from queue";
+    chip.textContent = item.text.length > 42 ? `${item.text.slice(0, 41)}…` : item.text;
+    root.append(chip);
+  }
+}
+
+function enqueueFollowUp(text) {
+  followUpQueue.push({ id: `q-${Date.now()}-${followUpQueue.length}`, text });
+  renderFollowUpQueue();
+}
+
+function drainFollowUpQueue() {
+  if (!followUpQueue.length || !active) {
+    return;
+  }
+  const next = followUpQueue.shift();
+  renderFollowUpQueue();
+  if (!next?.text) {
+    return;
+  }
+  const session = sessions.find((s) => s.id === activeSessionId) || ensureSessionForPrompt(next.text);
+  session.messages.push({ role: "user", text: next.text });
+  renderSessions();
+  appendMessage("user", next.text);
+  startMockStreamForPrompt(next.text);
+}
+
+function toggleReasoningVisible() {
+  reasoningVisible = setReasoningVisible(!reasoningVisible);
+  syncTruthStrip();
+  for (const block of document.querySelectorAll(".agent-thinking")) {
+    if (!reasoningVisible) {
+      block.open = false;
+      block.hidden = true;
+    } else {
+      block.hidden = false;
+    }
+  }
 }
 
 function appendMessage(role, text, { streaming = false, asHtml = false } = {}) {
@@ -919,6 +1036,7 @@ function hydrateCapabilitiesFromSession(session) {
 function stopMockStream({ keepPartial = true } = {}) {
   clearStreamTimer();
   streamGeneration += 1;
+  turnBusy = false;
   setAgentComposerProcessing(false);
   const streaming = streamEl()?.querySelector(".agent-msg-agent.is-streaming");
   if (streaming) {
@@ -941,40 +1059,105 @@ function stopMockStream({ keepPartial = true } = {}) {
 }
 
 function startMockStream(replyText) {
+  startMockStreamForPrompt("", replyText);
+}
+
+function startMockStreamForPrompt(userText, replyOverride) {
   stopMockStream({ keepPartial: true });
+  const turn = getMockTurn(userText);
+  const thinkingText = turn.thinking;
+  const replyText = replyOverride || turn.answer || MOCK_REPLY;
   const generation = (streamGeneration += 1);
-  const row = appendMessage("agent", "", { streaming: true });
-  const body = row?.querySelector(".agent-msg-body");
-  if (!body) {
-    return;
-  }
+  turnBusy = true;
   setAgentComposerProcessing(true);
-  let index = 0;
+  appendTurnDivider("Turn");
+
+  const thinking = appendThinkingBlock("", {
+    streaming: reasoningVisible,
+    open: reasoningVisible,
+  });
+  const thinkBody = thinking?.querySelector(".agent-thinking-body");
+  if (thinking && !reasoningVisible) {
+    thinking.hidden = true;
+    if (thinkBody) {
+      thinkBody.textContent = thinkingText;
+    }
+  }
+
+  let phase = reasoningVisible ? "thinking" : "answer";
+  let thinkIndex = 0;
+  let answerRow = null;
+  let answerBody = null;
+  let answerIndex = 0;
+
+  const beginAnswer = () => {
+    phase = "answer";
+    if (thinking) {
+      thinking.classList.remove("is-streaming");
+      if (thinkBody) {
+        thinkBody.textContent = thinkingText;
+      }
+    }
+    answerRow = appendMessage("agent", "", { streaming: true });
+    answerBody = answerRow?.querySelector(".agent-msg-body");
+    answerIndex = 0;
+  };
+
+  if (phase === "answer") {
+    beginAnswer();
+  }
+
   streamTimer = window.setInterval(() => {
     if (generation !== streamGeneration) {
       clearStreamTimer();
       return;
     }
-    index = Math.min(replyText.length, index + 2 + (index % 3));
-    body.textContent = replyText.slice(0, index);
     const scroller = streamScrollEl();
+
+    if (phase === "thinking" && thinkBody) {
+      thinkIndex = Math.min(thinkingText.length, thinkIndex + 3 + (thinkIndex % 2));
+      thinkBody.textContent = thinkingText.slice(0, thinkIndex);
+      if (scroller) {
+        scroller.scrollTop = scroller.scrollHeight;
+      }
+      if (thinkIndex >= thinkingText.length) {
+        beginAnswer();
+      }
+      return;
+    }
+
+    if (!answerBody) {
+      clearStreamTimer();
+      turnBusy = false;
+      setAgentComposerProcessing(false);
+      drainFollowUpQueue();
+      return;
+    }
+
+    answerIndex = Math.min(replyText.length, answerIndex + 2 + (answerIndex % 3));
+    answerBody.textContent = replyText.slice(0, answerIndex);
     if (scroller) {
       scroller.scrollTop = scroller.scrollHeight;
     }
-    if (index >= replyText.length) {
+    if (answerIndex >= replyText.length) {
       clearStreamTimer();
-      row.classList.remove("is-streaming");
-      body.innerHTML = renderMarkdown(replyText);
+      answerRow?.classList.remove("is-streaming");
+      answerBody.innerHTML = renderMarkdown(replyText);
+      turnBusy = false;
       setAgentComposerProcessing(false);
       const session = sessions.find((s) => s.id === activeSessionId);
       if (session) {
-        session.messages.push({ role: "agent", text: replyText });
+        session.messages.push({
+          role: "agent",
+          text: replyText,
+          thinking: thinkingText,
+        });
       }
       noteMockTurnTokens(Math.max(200, Math.round(replyText.length / 3)));
       maybeOfferToolAfterReply();
       syncTruthStrip();
-      /* Markdown/code blocks grow after plain-text streaming — re-pin above the Shelf. */
       scrollStreamToEnd();
+      drainFollowUpQueue();
     }
   }, 18);
 }
@@ -1156,11 +1339,12 @@ export function showAgentHarness({ prompt, fromShelf = false, syncStage = true }
   });
 
   if (prompt) {
+    const openPrompt = String(prompt).trim();
     window.setTimeout(() => {
       if (motionGen !== harnessMotionGen || !active) {
         return;
       }
-      startMockStream(MOCK_REPLY);
+      startMockStreamForPrompt(openPrompt);
     }, prefersReducedMotion() ? 40 : HARNESS_CONTENT_AT_MS);
   }
 
@@ -1263,11 +1447,16 @@ export function sendToAgentHarness(prompt) {
   if (!text) {
     if (active) {
       stopMockStream({ keepPartial: true });
+      turnBusy = false;
     }
     return;
   }
   if (active) {
-    stopMockStream({ keepPartial: true });
+    /* While a turn streams, queue follow-ups instead of cutting the answer. */
+    if (turnBusy) {
+      enqueueFollowUp(text);
+      return;
+    }
     const session = ensureSessionForPrompt(text);
     if (session.title === "New chat" || session.messages.length === 0) {
       session.title = titleFromPrompt(text);
@@ -1277,7 +1466,7 @@ export function sendToAgentHarness(prompt) {
     setTitle(session.title);
     clearEmptyState();
     appendMessage("user", text);
-    startMockStream(MOCK_REPLY);
+    startMockStreamForPrompt(text);
     return;
   }
   showAgentHarness({ prompt: text });
@@ -1295,6 +1484,8 @@ function selectSession(sessionId) {
 
 function newChat() {
   stopMockStream({ keepPartial: false });
+  followUpQueue = [];
+  renderFollowUpQueue();
   const session = {
     id: `s-${Date.now()}`,
     title: "New chat",
@@ -1481,7 +1672,24 @@ export function bindAgentHarness() {
     if (event.target.closest?.("[data-retry]")) {
       event.preventDefault();
       event.target.closest(".agent-msg-stopped")?.remove();
-      startMockStream(MOCK_REPLY);
+      const session = sessions.find((s) => s.id === activeSessionId);
+      const lastUser = [...(session?.messages || [])]
+        .reverse()
+        .find((m) => m.role === "user");
+      startMockStreamForPrompt(lastUser?.text || "");
+      return;
+    }
+    const thinkToggle = event.target.closest?.("[data-truth-thinking-toggle]");
+    if (thinkToggle) {
+      event.preventDefault();
+      toggleReasoningVisible();
+      return;
+    }
+    const queueChip = event.target.closest?.(".agent-queue-chip");
+    if (queueChip?.dataset.queueId) {
+      event.preventDefault();
+      followUpQueue = followUpQueue.filter((q) => q.id !== queueChip.dataset.queueId);
+      renderFollowUpQueue();
       return;
     }
     const grantBtn = event.target.closest?.("[data-grant-decision]");
