@@ -2,7 +2,13 @@
    UI ≠ authority (Principle 16): never mints Carrier/Capsule grants,
    never calls live ai-provider. Label everything Preview · mock. */
 
-const TIP = "home-20260724cl";
+const TIP = "home-20260724cm";
+
+let planMarkdown = `### To-dos
+- [ ] Clarify what to build
+- [/] Sketch capsule surface
+- [ ] Declare capabilities
+- [ ] Local install (later)`;
 
 /** Selected mock model id — presentation only until w1. */
 let selectedModelId = "local-preview";
@@ -401,4 +407,28 @@ export function getMockTurn(userText = "") {
     answer: MOCK_REPLY,
     preview: true,
   };
+}
+
+export function getPlanMarkdown() {
+  return planMarkdown;
+}
+
+export function setPlanMarkdown(markdown) {
+  planMarkdown = String(markdown || "");
+  return planMarkdown;
+}
+
+/** Mock agent refreshes plan when user asks to plan/build. */
+export function maybeUpdatePlanFromPrompt(userText) {
+  const t = String(userText || "").toLowerCase();
+  if (!t.includes("plan") && !t.includes("build") && !t.includes("capsule")) {
+    return planMarkdown;
+  }
+  planMarkdown = `### To-dos
+- [x] Heard the request
+- [/] Draft the approach (preview)
+- [ ] List required capabilities
+- [ ] ADE sandbox write (later)
+- [ ] Local install (later)`;
+  return planMarkdown;
 }

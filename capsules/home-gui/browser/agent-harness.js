@@ -8,7 +8,7 @@ import {
   syncAgentSendButton,
   composerInput as shelfComposerInput,
   hideAgentShelfFace,
-} from "./agent-shelf.js?v=home-20260724cl";
+} from "./agent-shelf.js?v=home-20260724cm";
 import {
   enableHarnessMenubarReveal,
   clearHarnessMenubarReveal,
@@ -18,8 +18,8 @@ import {
   isAgentSpace,
   setActiveStage,
   syncSpacePager,
-} from "./shell-stages.js?v=home-20260724cl";
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724cl";
+} from "./shell-stages.js?v=home-20260724cm";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724cm";
 import {
   MOCK_REPLY,
   listCapabilities,
@@ -35,9 +35,13 @@ import {
   getMockTurn,
   loadReasoningVisible,
   setReasoningVisible,
-} from "./mock-agent-provider.js?v=home-20260724cl";
+  getPlanMarkdown,
+  setPlanMarkdown,
+  maybeUpdatePlanFromPrompt,
+} from "./mock-agent-provider.js?v=home-20260724cm";
 
-const TIP = "home-20260724cl";
+const TIP = "home-20260724cm";
+let workbenchTab = "outputs";
 const HOME_BREATHE_MS = 780;
 const HOME_RISE_MS = 720;
 const HARNESS_CONTENT_AT_MS = 180;
@@ -722,9 +726,83 @@ function syncSessionModeUi() {
       note.textContent = "Chat · Read — answers only · tools start at zero · preview";
     }
   }
-  const outputsHead = document.querySelector(".agent-harness-outputs-head span:first-child");
-  if (outputsHead) {
-    outputsHead.textContent = sessionMode === "build" ? "Outputs · Build" : "Outputs";
+  const title = document.querySelector("[data-workbench-title]");
+  if (title) {
+    title.textContent = sessionMode === "build" ? "Workbench · Build" : "Workbench";
+  }
+  for (const tab of document.querySelectorAll("[data-build-only]")) {
+    tab.hidden = sessionMode !== "build";
+  }
+  if (sessionMode === "build" && (workbenchTab === "outputs" || workbenchTab === "status")) {
+    setWorkbenchTab("plan");
+  } else if (sessionMode === "chat" && (workbenchTab === "diff" || workbenchTab === "plan")) {
+    setWorkbenchTab("status");
+  } else {
+    setWorkbenchTab(workbenchTab);
+  }
+  syncWorkbenchPanels();
+}
+
+function setWorkbenchTab(tabId) {
+  const allowed = new Set([
+    "outputs",
+    "plan",
+    "library",
+    "status",
+    "tools",
+    "diff",
+    "browser",
+    "terminal",
+  ]);
+  workbenchTab = allowed.has(tabId) ? tabId : "outputs";
+  if (workbenchTab === "diff" && sessionMode !== "build") {
+    workbenchTab = "outputs";
+  }
+  for (const tab of document.querySelectorAll("[data-workbench-tab]")) {
+    const on = tab.dataset.workbenchTab === workbenchTab;
+    tab.classList.toggle("is-active", on);
+    tab.setAttribute("aria-selected", on ? "true" : "false");
+  }
+  for (const panel of document.querySelectorAll("[data-workbench-panel]")) {
+    const on = panel.dataset.workbenchPanel === workbenchTab;
+    panel.classList.toggle("is-active", on);
+    panel.hidden = !on;
+  }
+}
+
+function syncWorkbenchPanels() {
+  const plan = document.querySelector("[data-plan-markdown]");
+  if (plan && document.activeElement !== plan) {
+    plan.value = getPlanMarkdown();
+  }
+  const status = document.querySelector("[data-status-panel]");
+  if (status) {
+    const snap = getTruthSnapshot();
+    status.innerHTML =
+      `<div><dt>Locality</dt><dd></dd></div>` +
+      `<div><dt>Model</dt><dd></dd></div>` +
+      `<div><dt>Context</dt><dd></dd></div>` +
+      `<div><dt>Tools</dt><dd></dd></div>` +
+      `<div><dt>Hardware</dt><dd></dd></div>` +
+      `<div><dt>Mode</dt><dd></dd></div>`;
+    const dds = status.querySelectorAll("dd");
+    dds[0].textContent = snap.locality;
+    dds[1].textContent = snap.modelLabel;
+    dds[2].textContent = snap.contextLabel;
+    dds[3].textContent = snap.toolsLabel;
+    dds[4].textContent = snap.hwLabel;
+    dds[5].textContent = `${sessionMode} · ${toolMode} intent`;
+  }
+  const toolsList = document.querySelector("[data-tools-list]");
+  if (toolsList) {
+    toolsList.replaceChildren();
+    for (const cap of listCapabilities()) {
+      const li = document.createElement("li");
+      li.className = "agent-tools-item";
+      li.dataset.state = cap.state;
+      li.textContent = `${cap.label} · ${cap.state}`;
+      toolsList.append(li);
+    }
   }
 }
 
@@ -1342,6 +1420,7 @@ export function showAgentHarness({ prompt, fromShelf = false, syncStage = true }
   if (prompt) {
     const session = ensureSessionForPrompt(prompt);
     session.messages.push({ role: "user", text: prompt });
+    maybeUpdatePlanFromPrompt(prompt);
   } else if (fromShelf) {
     /* Entering with the Shelf morph — land on a clean New chat so the room is visible. */
     const fresh = {
@@ -1538,6 +1617,8 @@ export function sendToAgentHarness(prompt) {
     setTitle(session.title);
     clearEmptyState();
     appendMessage("user", text);
+    maybeUpdatePlanFromPrompt(text);
+    syncWorkbenchPanels();
     startMockStreamForPrompt(text);
     return;
   }
@@ -1635,6 +1716,10 @@ export function bindAgentHarness() {
   }
 
   document.addEventListener("input", (event) => {
+    if (event.target?.matches?.("[data-plan-markdown]")) {
+      setPlanMarkdown(event.target.value);
+      return;
+    }
     if (event.target?.id === "agent-session-search-input") {
       renderSessionSearchResults(event.target.value);
     }
@@ -1767,6 +1852,51 @@ export function bindAgentHarness() {
     if (toolChip?.dataset.toolMode) {
       event.preventDefault();
       setToolMode(toolChip.dataset.toolMode);
+      return;
+    }
+    const wbTab = event.target.closest?.("[data-workbench-tab]");
+    if (wbTab?.dataset.workbenchTab) {
+      event.preventDefault();
+      setWorkbenchTab(wbTab.dataset.workbenchTab);
+      syncWorkbenchPanels();
+      return;
+    }
+    if (event.target.closest?.("[data-tools-demo-grant]")) {
+      event.preventDefault();
+      const grant = {
+        toolId: "library.read",
+        state: "pending",
+        args: { path: "Downloads" },
+      };
+      const session = sessions.find((s) => s.id === activeSessionId);
+      if (session) {
+        session.messages.push(grant);
+      }
+      appendGrantCard(grant);
+      syncTruthStrip();
+      syncWorkbenchPanels();
+      return;
+    }
+    const lib = event.target.closest?.("[data-library-attach]");
+    if (lib?.dataset.libraryAttach) {
+      event.preventDefault();
+      const noun = lib.dataset.libraryAttach;
+      const input = shelfComposerInput();
+      if (input) {
+        const chip = `@${noun}`;
+        input.value = input.value ? `${input.value.trim()} ${chip}` : chip;
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        syncAgentSendButton();
+        input.focus({ preventScroll: true });
+      }
+      return;
+    }
+    const out = event.target.closest?.("[data-output-id]");
+    if (out?.dataset.outputId) {
+      event.preventDefault();
+      window.alert(
+        `Preview artifact: ${out.dataset.outputId}\n\nMock only — not written to disk. ADE sandbox later.`,
+      );
       return;
     }
     const queueChip = event.target.closest?.(".agent-queue-chip");

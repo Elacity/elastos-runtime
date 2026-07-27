@@ -691,16 +691,83 @@
       </div>
     </div>
   </div>
-  <aside class="agent-harness-outputs" aria-label="Outputs preview">
+  <aside class="agent-harness-outputs" aria-label="Workbench" data-workbench-rail>
     <div class="agent-harness-outputs-head">
-      <span>Outputs</span>
+      <span data-workbench-title>Workbench</span>
       <span class="agent-harness-outputs-preview">preview</span>
     </div>
-    <ul class="agent-harness-outputs-list">
-      <li><button type="button" class="agent-harness-output-chip" disabled title="Preview stub — later">plan.md</button></li>
-      <li><button type="button" class="agent-harness-output-chip" disabled title="Preview stub — later">grid.png</button></li>
-      <li><button type="button" class="agent-harness-output-chip" disabled title="Preview stub — later">notes.txt</button></li>
-    </ul>
+    <div class="agent-workbench-tabs" role="tablist" aria-label="Workbench panels">
+      <button type="button" class="agent-workbench-tab is-active" role="tab" data-workbench-tab="outputs" aria-selected="true">Outputs</button>
+      <button type="button" class="agent-workbench-tab" role="tab" data-workbench-tab="plan" aria-selected="false">Plan</button>
+      <button type="button" class="agent-workbench-tab" role="tab" data-workbench-tab="library" aria-selected="false">Library</button>
+      <button type="button" class="agent-workbench-tab" role="tab" data-workbench-tab="status" aria-selected="false">Status</button>
+      <button type="button" class="agent-workbench-tab" role="tab" data-workbench-tab="tools" aria-selected="false">Tools</button>
+      <button type="button" class="agent-workbench-tab" role="tab" data-workbench-tab="diff" aria-selected="false" data-build-only hidden>Diff</button>
+      <button type="button" class="agent-workbench-tab" role="tab" data-workbench-tab="browser" aria-selected="false">Browser</button>
+      <button type="button" class="agent-workbench-tab" role="tab" data-workbench-tab="terminal" aria-selected="false">Term</button>
+    </div>
+    <div class="agent-workbench-panels">
+      <div class="agent-workbench-panel is-active" data-workbench-panel="outputs" role="tabpanel">
+        <ul class="agent-harness-outputs-list" data-outputs-list>
+          <li><button type="button" class="agent-harness-output-chip" data-output-id="plan.md" title="Preview artifact">plan.md</button></li>
+          <li><button type="button" class="agent-harness-output-chip" data-output-id="notes.txt" title="Preview artifact">notes.txt</button></li>
+        </ul>
+        <p class="agent-workbench-hint">Mock artifacts · not written to disk</p>
+      </div>
+      <div class="agent-workbench-panel" data-workbench-panel="plan" role="tabpanel" hidden>
+        <div class="agent-plan-editor" data-plan-root>
+          <label class="visually-hidden" for="agent-plan-markdown">Shared plan</label>
+          <textarea
+            id="agent-plan-markdown"
+            class="agent-plan-markdown"
+            data-plan-markdown
+            spellcheck="false"
+          >### To-dos
+- [ ] Clarify what to build
+- [/] Sketch capsule surface
+- [ ] Declare capabilities
+- [ ] Local install (later)</textarea>
+        </div>
+        <p class="agent-workbench-hint">Shared checklist · human + mock agent</p>
+      </div>
+      <div class="agent-workbench-panel" data-workbench-panel="library" role="tabpanel" hidden>
+        <div class="agent-library-chips" data-library-chips>
+          <button type="button" class="agent-library-chip" data-library-attach="Documents">Documents</button>
+          <button type="button" class="agent-library-chip" data-library-attach="Downloads">Downloads</button>
+          <button type="button" class="agent-library-chip" data-library-attach="Notes">Notes</button>
+        </div>
+        <p class="agent-workbench-hint">Rooted nouns only · no host filesystem</p>
+      </div>
+      <div class="agent-workbench-panel" data-workbench-panel="status" role="tabpanel" hidden>
+        <dl class="agent-status-dl" data-status-panel></dl>
+        <p class="agent-workbench-hint">UI ≠ authority · preview literacy</p>
+      </div>
+      <div class="agent-workbench-panel" data-workbench-panel="tools" role="tabpanel" hidden>
+        <ul class="agent-tools-list" data-tools-list></ul>
+        <button type="button" class="agent-tools-demo" data-tools-demo-grant>
+          Demo Library grant card
+        </button>
+        <p class="agent-workbench-hint">Mock capabilities · Inbox grammar</p>
+      </div>
+      <div class="agent-workbench-panel" data-workbench-panel="diff" role="tabpanel" hidden>
+        <div class="agent-diff-card">
+          <p class="agent-diff-path">capsule.json</p>
+          <pre class="agent-diff-body">+ "name": "weekend-notes"
++ "capabilities": ["library.read"]</pre>
+          <div class="agent-diff-actions">
+            <button type="button" class="agent-diff-btn" disabled title="Needs ADE sandbox grant">Apply</button>
+            <button type="button" class="agent-diff-btn" disabled title="Needs ADE sandbox grant">Reject</button>
+          </div>
+        </div>
+        <p class="agent-workbench-hint">Theatre only · no write authority</p>
+      </div>
+      <div class="agent-workbench-panel" data-workbench-panel="browser" role="tabpanel" hidden>
+        <p class="agent-workbench-empty">Needs net / Browser grant</p>
+      </div>
+      <div class="agent-workbench-panel" data-workbench-panel="terminal" role="tabpanel" hidden>
+        <p class="agent-workbench-empty">Not ambient — ADE sandbox later</p>
+      </div>
+    </div>
   </aside>
 </section>
 
