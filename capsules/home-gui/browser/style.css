@@ -4578,6 +4578,43 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   color: color-mix(in srgb, #c2410c 75%, var(--text));
 }
 
+.agent-tool-modes {
+  display: flex;
+  gap: 4px;
+  margin: 0 12px 4px;
+}
+
+.agent-tool-mode-chip {
+  flex: 1 1 0;
+  margin: 0;
+  padding: 5px 6px;
+  border: 0;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: color-mix(in srgb, var(--text) 62%, transparent);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.agent-tool-mode-chip.is-active {
+  background: color-mix(in srgb, var(--accent, #f97316) 18%, transparent);
+  color: color-mix(in srgb, var(--text) 88%, transparent);
+}
+
+.agent-tool-mode-note {
+  margin: 0 14px 10px;
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-size: 10px;
+  font-weight: 560;
+  line-height: 1.35;
+}
+
+.agent-harness[data-session-mode="build"] .agent-harness-outputs {
+  background: color-mix(in srgb, var(--accent, #f97316) 4%, transparent);
+}
+
 .agent-harness-truth-thinking {
   margin: 0;
   padding: 2px 7px;

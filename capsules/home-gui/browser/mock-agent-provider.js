@@ -2,7 +2,7 @@
    UI ≠ authority (Principle 16): never mints Carrier/Capsule grants,
    never calls live ai-provider. Label everything Preview · mock. */
 
-const TIP = "home-20260724ck";
+const TIP = "home-20260724cl";
 
 /** Selected mock model id — presentation only until w1. */
 let selectedModelId = "local-preview";

@@ -8,7 +8,7 @@ import {
   syncAgentSendButton,
   composerInput as shelfComposerInput,
   hideAgentShelfFace,
-} from "./agent-shelf.js?v=home-20260724ck";
+} from "./agent-shelf.js?v=home-20260724cl";
 import {
   enableHarnessMenubarReveal,
   clearHarnessMenubarReveal,
@@ -18,8 +18,8 @@ import {
   isAgentSpace,
   setActiveStage,
   syncSpacePager,
-} from "./shell-stages.js?v=home-20260724ck";
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724ck";
+} from "./shell-stages.js?v=home-20260724cl";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724cl";
 import {
   MOCK_REPLY,
   listCapabilities,
@@ -35,9 +35,9 @@ import {
   getMockTurn,
   loadReasoningVisible,
   setReasoningVisible,
-} from "./mock-agent-provider.js?v=home-20260724ck";
+} from "./mock-agent-provider.js?v=home-20260724cl";
 
-const TIP = "home-20260724ck";
+const TIP = "home-20260724cl";
 const HOME_BREATHE_MS = 780;
 const HOME_RISE_MS = 720;
 const HARNESS_CONTENT_AT_MS = 180;
@@ -119,6 +119,10 @@ let followUpQueue = [];
 let reasoningVisible = loadReasoningVisible();
 /** True while thinking or answer mock stream is in flight. */
 let turnBusy = false;
+/** Session skin: chat | build — presentation only (fx8). */
+let sessionMode = "chat";
+/** Tool intent chips: read | ask | full — not grants (fx8). */
+let toolMode = "read";
 
 function setHarnessChromeInert(inert) {
   const nodes = [
@@ -685,6 +689,68 @@ function toggleReasoningVisible() {
   }
 }
 
+function syncSessionModeUi() {
+  const harness = harnessEl();
+  harness?.setAttribute("data-session-mode", sessionMode);
+  document.body.dataset.agentSessionMode = sessionMode;
+  document.body.dataset.agentToolMode = toolMode;
+
+  for (const btn of document.querySelectorAll("[data-segment]")) {
+    const on = btn.dataset.segment === sessionMode;
+    btn.classList.toggle("is-active", on);
+    btn.setAttribute("aria-pressed", on ? "true" : "false");
+  }
+  for (const btn of document.querySelectorAll("[data-tool-mode]")) {
+    const on = btn.dataset.toolMode === toolMode;
+    btn.classList.toggle("is-active", on);
+    btn.setAttribute("aria-pressed", on ? "true" : "false");
+  }
+  const note = document.querySelector("[data-tool-mode-note]");
+  if (note) {
+    if (sessionMode === "build") {
+      note.textContent =
+        toolMode === "full"
+          ? "Build · Full intent — still preview; ADE sandbox grant required to write"
+          : toolMode === "ask"
+            ? "Build · Ask — plan/outputs theatre; grants via Inbox cards only"
+            : "Build · Read — plan & inspect; no write authority";
+    } else if (toolMode === "full") {
+      note.textContent = "Chat · Full intent — UI ≠ authority; no ambient tools";
+    } else if (toolMode === "ask") {
+      note.textContent = "Chat · Ask — grant cards may appear; deny by default";
+    } else {
+      note.textContent = "Chat · Read — answers only · tools start at zero · preview";
+    }
+  }
+  const outputsHead = document.querySelector(".agent-harness-outputs-head span:first-child");
+  if (outputsHead) {
+    outputsHead.textContent = sessionMode === "build" ? "Outputs · Build" : "Outputs";
+  }
+}
+
+function setSessionMode(mode) {
+  sessionMode = mode === "build" ? "build" : "chat";
+  if (sessionMode === "build" && toolMode === "read") {
+    toolMode = "ask";
+  }
+  if (sessionMode === "chat" && toolMode === "full") {
+    toolMode = "ask";
+  }
+  syncSessionModeUi();
+  const stream = streamEl();
+  if (stream && !stream.querySelector(".agent-msg, .agent-grant-card, .agent-thinking")) {
+    showEmptyState();
+  }
+}
+
+function setToolMode(mode) {
+  if (mode !== "read" && mode !== "ask" && mode !== "full") {
+    return;
+  }
+  toolMode = mode;
+  syncSessionModeUi();
+}
+
 function appendMessage(role, text, { streaming = false, asHtml = false } = {}) {
   const stream = streamEl();
   if (!stream) {
@@ -963,10 +1029,15 @@ function showEmptyState() {
   const empty = document.createElement("div");
   empty.className = "agent-harness-empty";
   empty.setAttribute("role", "status");
+  const sub =
+    sessionMode === "build"
+      ? "Build mode · plan & outputs theatre · no write authority yet"
+      : "Private on this machine · tools start at zero";
   empty.innerHTML =
     `<p class="agent-harness-empty-greeting"></p>` +
-    `<p class="agent-harness-empty-sub">Private on this machine · tools start at zero</p>`;
+    `<p class="agent-harness-empty-sub"></p>`;
   empty.querySelector(".agent-harness-empty-greeting").textContent = greeting;
+  empty.querySelector(".agent-harness-empty-sub").textContent = sub;
   /* Viewport — not the dock-width column — so the hero sits in true room center. */
   viewport.append(empty);
 }
@@ -1321,6 +1392,7 @@ export function showAgentHarness({ prompt, fromShelf = false, syncStage = true }
   harness.hidden = false;
   harness.setAttribute("aria-hidden", "false");
   syncTruthStrip();
+  syncSessionModeUi();
   renderSessions();
   renderActiveSession();
 
@@ -1683,6 +1755,18 @@ export function bindAgentHarness() {
     if (thinkToggle) {
       event.preventDefault();
       toggleReasoningVisible();
+      return;
+    }
+    const segment = event.target.closest?.("[data-segment]");
+    if (segment?.dataset.segment) {
+      event.preventDefault();
+      setSessionMode(segment.dataset.segment);
+      return;
+    }
+    const toolChip = event.target.closest?.("[data-tool-mode]");
+    if (toolChip?.dataset.toolMode) {
+      event.preventDefault();
+      setToolMode(toolChip.dataset.toolMode);
       return;
     }
     const queueChip = event.target.closest?.(".agent-queue-chip");

@@ -526,21 +526,40 @@
         </button>
       </div>
     </div>
-    <div class="agent-harness-segment" role="group" aria-label="Chat mode">
-      <button class="agent-harness-segment-btn is-active" type="button" data-segment="general" aria-pressed="true">
-        General
+    <div class="agent-harness-segment" role="group" aria-label="Session mode">
+      <button
+        class="agent-harness-segment-btn is-active"
+        type="button"
+        data-segment="chat"
+        aria-pressed="true"
+        title="Chat — answers and grant asks; tools start at zero"
+      >
+        Chat
       </button>
       <button
         class="agent-harness-segment-btn"
         type="button"
-        data-segment="develop"
+        data-segment="build"
         aria-pressed="false"
-        disabled
-        title="Develop / ADE — preview later"
+        title="Build — plan/outputs theatre; no write authority until ADE sandbox"
       >
-        Develop
+        Build
       </button>
     </div>
+    <div class="agent-tool-modes" role="group" aria-label="Tool intent">
+      <button type="button" class="agent-tool-mode-chip is-active" data-tool-mode="read" aria-pressed="true">
+        Read
+      </button>
+      <button type="button" class="agent-tool-mode-chip" data-tool-mode="ask" aria-pressed="false">
+        Ask
+      </button>
+      <button type="button" class="agent-tool-mode-chip" data-tool-mode="full" aria-pressed="false">
+        Full
+      </button>
+    </div>
+    <p class="agent-tool-mode-note" data-tool-mode-note>
+      Intent only · UI ≠ authority · preview
+    </p>
     <button id="agent-harness-new-chat" class="agent-harness-new-chat" type="button" title="Start a new chat">
       <span aria-hidden="true">+</span>
       <span>New chat</span>
