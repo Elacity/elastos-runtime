@@ -2,7 +2,7 @@
    UI ≠ authority (Principle 16): never mints Carrier/Capsule grants,
    never calls live ai-provider. Label everything Preview · mock. */
 
-const TIP = "home-20260724cn";
+const TIP = "home-20260724co";
 
 let planMarkdown = `### To-dos
 - [ ] Clarify what to build
@@ -396,15 +396,88 @@ export function setReasoningVisible(visible) {
   return Boolean(visible);
 }
 
-/** Mock turn payload: thinking then answer (fx7). */
+/**
+ * W1-ready: normalize OpenAI-compat reasoning fields + think tags
+ * (Local Studio / pi-ai pattern — clean-room).
+ */
+export function firstReasoningField(record = {}) {
+  for (const field of ["reasoning_content", "reasoning", "reasoning_text"]) {
+    const value = record[field];
+    if (typeof value === "string" && value.length > 0) {
+      return value;
+    }
+  }
+  return "";
+}
+
+/**
+ * Split model text that may contain <think>…</think> / <thinking> / <analysis>.
+ * @returns {{ thinking: string, answer: string }}
+ */
+export function splitThinkTaggedContent(raw = "") {
+  const text = String(raw || "");
+  const open = /<(think|thinking|analysis)(?:\s[^>]*)?>/i;
+  const close = /<\/(think|thinking|analysis)>/i;
+  const openMatch = text.match(open);
+  if (!openMatch) {
+    return { thinking: "", answer: text };
+  }
+  const afterOpen = text.slice(openMatch.index + openMatch[0].length);
+  const closeMatch = afterOpen.match(close);
+  if (!closeMatch) {
+    return { thinking: afterOpen.trim(), answer: text.slice(0, openMatch.index).trim() };
+  }
+  const thinking = afterOpen.slice(0, closeMatch.index).trim();
+  const before = text.slice(0, openMatch.index).trim();
+  const after = afterOpen.slice(closeMatch.index + closeMatch[0].length).trim();
+  return {
+    thinking,
+    answer: [before, after].filter(Boolean).join("\n\n"),
+  };
+}
+
+/** Mock turn payload: thinking → optional tool → answer + follow-ups (fx7/fx11). */
 export function getMockTurn(userText = "") {
   const wantsFiles = wantsLibraryTool(userText);
+  const wantsWallet = wantsWalletTool(userText);
   const thinking = wantsFiles
-    ? `${MOCK_THINKING}\nThey mentioned files — offer Library · Read as a grant card after the answer.`
-    : MOCK_THINKING;
+    ? `${MOCK_THINKING}\nThey mentioned files — prepare a Library · Read grant after the answer.`
+    : wantsWallet
+      ? `${MOCK_THINKING}\nWallet came up — deny signing; human ceremony only.`
+      : MOCK_THINKING;
+  /** @type {{ id: string, label: string, kind: string } | null} */
+  let toolPreview = null;
+  if (wantsFiles) {
+    toolPreview = {
+      id: "library.read",
+      label: "Library · Read",
+      kind: "read",
+      detail: "Downloads",
+    };
+  } else if (wantsWallet) {
+    toolPreview = {
+      id: "wallet.sign",
+      label: "Wallet · Sign",
+      kind: "deny",
+      detail: "ceremony required",
+    };
+  }
+  const followUps = wantsFiles
+    ? [
+        "Show me what grant looks like",
+        "Stay read-only — just explain",
+        "Switch to Build and draft a plan",
+      ]
+    : [
+        "What tools can I grant later?",
+        "Explain On this device",
+        "Help me plan a small capsule",
+      ];
   return {
     thinking,
     answer: MOCK_REPLY,
+    toolPreview,
+    followUps,
     preview: true,
   };
 }

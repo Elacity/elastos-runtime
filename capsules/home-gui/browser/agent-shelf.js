@@ -7,9 +7,9 @@
 
    Send opens Agent Harness (Home drops, dock stays) — see agent-harness.js. */
 
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724cn";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724co";
 
-const TIP = "home-20260724cn";
+const TIP = "home-20260724co";
 
 let bound = false;
 let morphGeneration = 0;

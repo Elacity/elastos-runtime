@@ -4931,24 +4931,54 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
 
 .agent-thinking {
   margin: 0 0 10px;
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--text) 4%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--text) 4.5%, transparent);
   color: color-mix(in srgb, var(--text) 72%, transparent);
+  overflow: clip;
+  transition: background 220ms ease;
+}
+
+.agent-thinking.is-streaming {
+  background: color-mix(in srgb, var(--accent, #f97316) 7%, transparent);
 }
 
 .agent-thinking-summary {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 12px;
+  padding: 9px 12px;
   cursor: pointer;
   list-style: none;
   font-size: 12px;
   font-weight: 620;
+  user-select: none;
 }
 
 .agent-thinking-summary::-webkit-details-marker {
   display: none;
+}
+
+.agent-thinking-chevron {
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  opacity: 0.55;
+  transition: transform 220ms ease;
+  flex: 0 0 auto;
+}
+
+.agent-thinking[open] .agent-thinking-chevron {
+  transform: rotate(45deg);
+}
+
+.agent-thinking-duration {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 560;
+  opacity: 0.55;
+  font-variant-numeric: tabular-nums;
 }
 
 .agent-thinking-hint {
@@ -4956,12 +4986,24 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   font-weight: 600;
   letter-spacing: 0.03em;
   text-transform: uppercase;
-  opacity: 0.45;
+  opacity: 0.4;
+}
+
+.agent-thinking-body-wrap {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 280ms ease;
+}
+
+.agent-thinking[open] .agent-thinking-body-wrap {
+  grid-template-rows: 1fr;
 }
 
 .agent-thinking-body {
   margin: 0;
-  padding: 0 12px 12px;
+  padding: 0 12px 12px 28px;
+  min-height: 0;
+  overflow: hidden;
   white-space: pre-wrap;
   font-family: inherit;
   font-size: 12px;
@@ -4978,9 +5020,184 @@ html[data-agent-reasoning="off"] .agent-thinking {
   display: none;
 }
 
+.agent-turn-timeline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text) 3.5%, transparent);
+}
+
+.agent-timeline-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 620;
+  color: color-mix(in srgb, var(--text) 42%, transparent);
+}
+
+.agent-timeline-step[data-state="running"] {
+  color: color-mix(in srgb, var(--accent, #f97316) 80%, var(--text));
+}
+
+.agent-timeline-step[data-state="done"] {
+  color: color-mix(in srgb, var(--text) 70%, transparent);
+}
+
+.agent-timeline-step[data-state="denied"] {
+  color: color-mix(in srgb, #c2410c 70%, var(--text));
+}
+
+.agent-timeline-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.45;
+}
+
+.agent-timeline-step[data-state="running"] .agent-timeline-dot {
+  opacity: 1;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent, #f97316) 22%, transparent);
+  animation: agent-timeline-pulse 1.1s ease-in-out infinite;
+}
+
+.agent-timeline-detail {
+  font-weight: 560;
+  opacity: 0.7;
+}
+
+.agent-tool-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+  font-size: 12px;
+}
+
+.agent-tool-row-spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1.5px solid color-mix(in srgb, var(--text) 18%, transparent);
+  border-top-color: var(--accent, #f97316);
+  flex: 0 0 auto;
+}
+
+.agent-tool-row.is-running .agent-tool-row-spinner {
+  animation: agent-spin 0.7s linear infinite;
+}
+
+.agent-tool-row.is-done .agent-tool-row-spinner,
+.agent-tool-row.is-denied .agent-tool-row-spinner {
+  border-color: transparent;
+  background: color-mix(in srgb, var(--accent, #f97316) 55%, transparent);
+  animation: none;
+}
+
+.agent-tool-row.is-denied .agent-tool-row-spinner {
+  background: color-mix(in srgb, #c2410c 70%, transparent);
+}
+
+.agent-tool-row-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.agent-tool-row-name {
+  font-weight: 700;
+}
+
+.agent-tool-row-detail {
+  font-size: 11px;
+  opacity: 0.55;
+}
+
+.agent-tool-row-status {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  opacity: 0.55;
+}
+
+.agent-followups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 14px;
+}
+
+.agent-followup-chip {
+  margin: 0;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  animation: agent-msg-enter 280ms ease both;
+}
+
+.agent-followup-chip:hover {
+  background: color-mix(in srgb, var(--accent, #f97316) 16%, transparent);
+}
+
+.agent-msg-enter {
+  animation: agent-msg-enter 320ms ease both;
+}
+
+@keyframes agent-msg-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes agent-timeline-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent, #f97316) 10%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent, #f97316) 22%, transparent);
+  }
+}
+
+@keyframes agent-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .agent-thinking.is-streaming .agent-thinking-body::after {
-    animation: none;
+  .agent-thinking.is-streaming .agent-thinking-body::after,
+  .agent-timeline-step[data-state="running"] .agent-timeline-dot,
+  .agent-tool-row.is-running .agent-tool-row-spinner,
+  .agent-msg-enter,
+  .agent-followup-chip {
+    animation: none !important;
+  }
+
+  .agent-thinking-body-wrap,
+  .agent-thinking-chevron {
+    transition: none !important;
   }
 }
 

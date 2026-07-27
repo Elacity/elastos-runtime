@@ -8,7 +8,7 @@ import {
   syncAgentSendButton,
   composerInput as shelfComposerInput,
   hideAgentShelfFace,
-} from "./agent-shelf.js?v=home-20260724cn";
+} from "./agent-shelf.js?v=home-20260724co";
 import {
   enableHarnessMenubarReveal,
   clearHarnessMenubarReveal,
@@ -18,8 +18,8 @@ import {
   isAgentSpace,
   setActiveStage,
   syncSpacePager,
-} from "./shell-stages.js?v=home-20260724cn";
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724cn";
+} from "./shell-stages.js?v=home-20260724co";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724co";
 import {
   MOCK_REPLY,
   listCapabilities,
@@ -38,9 +38,9 @@ import {
   getPlanMarkdown,
   setPlanMarkdown,
   maybeUpdatePlanFromPrompt,
-} from "./mock-agent-provider.js?v=home-20260724cn";
+} from "./mock-agent-provider.js?v=home-20260724co";
 
-const TIP = "home-20260724cn";
+const TIP = "home-20260724co";
 let workbenchTab = "outputs";
 
 const STARTER_PROMPTS = [
@@ -676,6 +676,54 @@ function appendTurnDivider(label) {
   return row;
 }
 
+/** Live turn timeline: Thinking → Tool → Answering → Done (fx11). */
+function appendTurnTimeline() {
+  const stream = streamEl();
+  if (!stream) {
+    return null;
+  }
+  const root = document.createElement("div");
+  root.className = "agent-turn-timeline";
+  root.dataset.timeline = "1";
+  root.innerHTML =
+    `<div class="agent-timeline-step" data-step="thinking" data-state="pending">` +
+    `<span class="agent-timeline-dot" aria-hidden="true"></span>` +
+    `<span class="agent-timeline-label">Thinking</span></div>` +
+    `<div class="agent-timeline-step" data-step="tool" data-state="idle" hidden>` +
+    `<span class="agent-timeline-dot" aria-hidden="true"></span>` +
+    `<span class="agent-timeline-label">Tool</span>` +
+    `<span class="agent-timeline-detail"></span></div>` +
+    `<div class="agent-timeline-step" data-step="answer" data-state="pending">` +
+    `<span class="agent-timeline-dot" aria-hidden="true"></span>` +
+    `<span class="agent-timeline-label">Answering</span></div>` +
+    `<div class="agent-timeline-step" data-step="done" data-state="pending">` +
+    `<span class="agent-timeline-dot" aria-hidden="true"></span>` +
+    `<span class="agent-timeline-label">Done</span></div>`;
+  stream.append(root);
+  return root;
+}
+
+function setTimelineStep(timeline, stepId, state, detail = "") {
+  if (!timeline) {
+    return;
+  }
+  const step = timeline.querySelector(`[data-step="${stepId}"]`);
+  if (!step) {
+    return;
+  }
+  if (state === "idle") {
+    step.hidden = true;
+    step.dataset.state = "idle";
+    return;
+  }
+  step.hidden = false;
+  step.dataset.state = state;
+  const detailEl = step.querySelector(".agent-timeline-detail");
+  if (detailEl && detail) {
+    detailEl.textContent = detail;
+  }
+}
+
 function appendThinkingBlock(text, { streaming = false, open = true } = {}) {
   const stream = streamEl();
   if (!stream) {
@@ -685,21 +733,114 @@ function appendThinkingBlock(text, { streaming = false, open = true } = {}) {
   const details = document.createElement("details");
   details.className = `agent-thinking${streaming ? " is-streaming" : ""}`;
   details.dataset.block = "thinking";
+  details.dataset.startedAt = String(Date.now());
   if (open && reasoningVisible) {
     details.open = true;
   }
   const summary = document.createElement("summary");
   summary.className = "agent-thinking-summary";
   summary.innerHTML =
+    `<span class="agent-thinking-chevron" aria-hidden="true"></span>` +
     `<span class="agent-thinking-label">Thinking</span>` +
+    `<span class="agent-thinking-duration" data-thinking-duration></span>` +
     `<span class="agent-thinking-hint">preview · not authority</span>`;
+  const bodyWrap = document.createElement("div");
+  bodyWrap.className = "agent-thinking-body-wrap";
   const body = document.createElement("pre");
   body.className = "agent-thinking-body";
   body.textContent = text;
-  details.append(summary, body);
+  bodyWrap.append(body);
+  details.append(summary, bodyWrap);
   stream.append(details);
   scrollStreamToEnd();
   return details;
+}
+
+function finishThinkingBlock(details, startedAt) {
+  if (!details) {
+    return;
+  }
+  details.classList.remove("is-streaming");
+  details.classList.add("is-complete");
+  const ms = Math.max(400, Date.now() - (startedAt || Date.now()));
+  const sec = (ms / 1000).toFixed(ms >= 10000 ? 0 : 1);
+  const dur = details.querySelector("[data-thinking-duration]");
+  if (dur) {
+    dur.textContent = `Thought for ${sec}s`;
+  }
+  const label = details.querySelector(".agent-thinking-label");
+  if (label) {
+    label.textContent = "Thought";
+  }
+  /* Collapse after a beat — frontier-style; honor reduced motion by skipping delay animation only. */
+  if (details.open && reasoningVisible) {
+    const collapse = () => {
+      if (details.isConnected && reasoningVisible) {
+        details.open = false;
+      }
+    };
+    if (prefersReducedMotion()) {
+      collapse();
+    } else {
+      window.setTimeout(collapse, 900);
+    }
+  }
+}
+
+function appendToolTimelineRow(tool) {
+  const stream = streamEl();
+  if (!stream || !tool) {
+    return null;
+  }
+  const row = document.createElement("div");
+  row.className = "agent-tool-row is-running";
+  row.dataset.toolId = tool.id;
+  row.innerHTML =
+    `<span class="agent-tool-row-spinner" aria-hidden="true"></span>` +
+    `<div class="agent-tool-row-copy">` +
+    `<span class="agent-tool-row-name"></span>` +
+    `<span class="agent-tool-row-detail"></span>` +
+    `</div>` +
+    `<span class="agent-tool-row-status">Running</span>`;
+  row.querySelector(".agent-tool-row-name").textContent = tool.label;
+  row.querySelector(".agent-tool-row-detail").textContent = tool.detail || tool.kind || "";
+  stream.append(row);
+  scrollStreamToEnd();
+  return row;
+}
+
+function finishToolTimelineRow(row, { status = "done", statusLabel = "Done" } = {}) {
+  if (!row) {
+    return;
+  }
+  row.classList.remove("is-running");
+  row.classList.add(status === "error" || status === "denied" ? "is-denied" : "is-done");
+  const statusEl = row.querySelector(".agent-tool-row-status");
+  if (statusEl) {
+    statusEl.textContent = statusLabel;
+  }
+}
+
+function appendFollowUpChips(prompts) {
+  const stream = streamEl();
+  if (!stream || !prompts?.length) {
+    return null;
+  }
+  document.querySelectorAll(".agent-followups").forEach((node) => node.remove());
+  const root = document.createElement("div");
+  root.className = "agent-followups";
+  root.setAttribute("aria-label", "Suggested follow-ups");
+  for (const text of prompts) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "agent-followup-chip";
+    chip.dataset.starter = text;
+    chip.textContent = text;
+    root.append(chip);
+  }
+  stream.append(root);
+  scrollStreamToEnd();
+  return root;
 }
 
 function renderFollowUpQueue() {
@@ -933,11 +1074,15 @@ function appendMessage(role, text, { streaming = false, asHtml = false } = {}) {
   const regen = document.createElement("button");
   regen.type = "button";
   regen.className = "agent-msg-action";
-  regen.disabled = true;
-  regen.title = "Regenerate — later";
+  regen.dataset.regenerate = "1";
+  regen.disabled = role !== "agent" || streaming;
+  regen.title = role === "agent" ? "Regenerate mock reply" : "Regenerate — agent only";
   regen.textContent = "Regenerate";
   actions.append(copyBtn, regen);
 
+  if (!streaming) {
+    row.classList.add("agent-msg-enter");
+  }
   row.append(meta, body, actions);
   stream.append(row);
   scrollStreamToEnd();
@@ -1292,13 +1437,19 @@ function startMockStream(replyText) {
 
 function startMockStreamForPrompt(userText, replyOverride) {
   stopMockStream({ keepPartial: true });
+  document.querySelectorAll(".agent-followups").forEach((node) => node.remove());
   const turn = getMockTurn(userText);
   const thinkingText = turn.thinking;
   const replyText = replyOverride || turn.answer || MOCK_REPLY;
+  const toolPreview = turn.toolPreview;
+  const followUps = turn.followUps || [];
   const generation = (streamGeneration += 1);
+  const thinkStartedAt = Date.now();
   turnBusy = true;
   setAgentComposerProcessing(true);
   appendTurnDivider("Turn");
+  const timeline = appendTurnTimeline();
+  setTimelineStep(timeline, "thinking", "running");
 
   const thinking = appendThinkingBlock("", {
     streaming: reasoningVisible,
@@ -1312,27 +1463,38 @@ function startMockStreamForPrompt(userText, replyOverride) {
     }
   }
 
-  let phase = reasoningVisible ? "thinking" : "answer";
+  let phase = reasoningVisible ? "thinking" : "tool";
   let thinkIndex = 0;
+  let toolRow = null;
+  let toolTicks = 0;
   let answerRow = null;
   let answerBody = null;
   let answerIndex = 0;
 
+  const beginToolOrAnswer = () => {
+    finishThinkingBlock(thinking, thinkStartedAt);
+    setTimelineStep(timeline, "thinking", "done");
+    if (toolPreview) {
+      phase = "tool";
+      toolTicks = 0;
+      setTimelineStep(timeline, "tool", "running", toolPreview.label);
+      toolRow = appendToolTimelineRow(toolPreview);
+    } else {
+      setTimelineStep(timeline, "tool", "idle");
+      beginAnswer();
+    }
+  };
+
   const beginAnswer = () => {
     phase = "answer";
-    if (thinking) {
-      thinking.classList.remove("is-streaming");
-      if (thinkBody) {
-        thinkBody.textContent = thinkingText;
-      }
-    }
+    setTimelineStep(timeline, "answer", "running");
     answerRow = appendMessage("agent", "", { streaming: true });
     answerBody = answerRow?.querySelector(".agent-msg-body");
     answerIndex = 0;
   };
 
-  if (phase === "answer") {
-    beginAnswer();
+  if (phase === "tool") {
+    beginToolOrAnswer();
   }
 
   streamTimer = window.setInterval(() => {
@@ -1349,6 +1511,25 @@ function startMockStreamForPrompt(userText, replyOverride) {
         scroller.scrollTop = scroller.scrollHeight;
       }
       if (thinkIndex >= thinkingText.length) {
+        beginToolOrAnswer();
+      }
+      return;
+    }
+
+    if (phase === "tool") {
+      toolTicks += 1;
+      if (toolTicks >= 14) {
+        const denied = toolPreview?.kind === "deny";
+        finishToolTimelineRow(toolRow, {
+          status: denied ? "denied" : "done",
+          statusLabel: denied ? "Needs ceremony" : "Ready to ask",
+        });
+        setTimelineStep(
+          timeline,
+          "tool",
+          denied ? "denied" : "done",
+          toolPreview?.label || "",
+        );
         beginAnswer();
       }
       return;
@@ -1370,7 +1551,14 @@ function startMockStreamForPrompt(userText, replyOverride) {
     if (answerIndex >= replyText.length) {
       clearStreamTimer();
       answerRow?.classList.remove("is-streaming");
+      answerRow?.classList.add("agent-msg-enter");
       answerBody.innerHTML = renderMarkdown(replyText);
+      const regen = answerRow?.querySelector("[data-regenerate]");
+      if (regen) {
+        regen.disabled = false;
+      }
+      setTimelineStep(timeline, "answer", "done");
+      setTimelineStep(timeline, "done", "done");
       turnBusy = false;
       setAgentComposerProcessing(false);
       const session = sessions.find((s) => s.id === activeSessionId);
@@ -1383,7 +1571,9 @@ function startMockStreamForPrompt(userText, replyOverride) {
       }
       noteMockTurnTokens(Math.max(200, Math.round(replyText.length / 3)));
       maybeOfferToolAfterReply();
+      appendFollowUpChips(followUps);
       syncTruthStrip();
+      syncWorkbenchPanels();
       scrollStreamToEnd();
       drainFollowUpQueue();
     }
@@ -1906,9 +2096,12 @@ export function bindAgentHarness() {
       }, 1200);
       return;
     }
-    if (event.target.closest?.("[data-retry]")) {
+    if (event.target.closest?.("[data-retry]") || event.target.closest?.("[data-regenerate]")) {
       event.preventDefault();
       event.target.closest(".agent-msg-stopped")?.remove();
+      if (turnBusy) {
+        return;
+      }
       const session = sessions.find((s) => s.id === activeSessionId);
       const lastUser = [...(session?.messages || [])]
         .reverse()
