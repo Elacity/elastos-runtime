@@ -21,7 +21,7 @@ import {
   ignoreRepeatedAction,
   pushUiPreferencesToFrameWindow,
   targetById,
-} from "./shell-core.js?v=home-20260724cm";
+} from "./shell-core.js?v=home-20260724cn";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -31,8 +31,8 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260724cm";
-import { playUiSound } from "./shell-sounds.js?v=home-20260724cm";
+} from "./shell-window-geometry.js?v=home-20260724cn";
+import { playUiSound } from "./shell-sounds.js?v=home-20260724cn";
 import {
   applyFullscreenStageFromPlacement,
   bindStageWindowHooks,
@@ -51,7 +51,7 @@ import {
   exitFullscreenStage,
   toggleFullscreenStage,
   windowVisibleOnActiveSpace,
-} from "./shell-stages.js?v=home-20260724cm";
+} from "./shell-stages.js?v=home-20260724cn";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [

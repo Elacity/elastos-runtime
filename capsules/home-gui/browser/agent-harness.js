@@ -8,7 +8,7 @@ import {
   syncAgentSendButton,
   composerInput as shelfComposerInput,
   hideAgentShelfFace,
-} from "./agent-shelf.js?v=home-20260724cm";
+} from "./agent-shelf.js?v=home-20260724cn";
 import {
   enableHarnessMenubarReveal,
   clearHarnessMenubarReveal,
@@ -18,8 +18,8 @@ import {
   isAgentSpace,
   setActiveStage,
   syncSpacePager,
-} from "./shell-stages.js?v=home-20260724cm";
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724cm";
+} from "./shell-stages.js?v=home-20260724cn";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724cn";
 import {
   MOCK_REPLY,
   listCapabilities,
@@ -38,10 +38,67 @@ import {
   getPlanMarkdown,
   setPlanMarkdown,
   maybeUpdatePlanFromPrompt,
-} from "./mock-agent-provider.js?v=home-20260724cm";
+} from "./mock-agent-provider.js?v=home-20260724cn";
 
-const TIP = "home-20260724cm";
+const TIP = "home-20260724cn";
 let workbenchTab = "outputs";
+
+const STARTER_PROMPTS = [
+  { label: "What can you do?", text: "What can you do on this device with tools at zero?" },
+  { label: "Explain locality", text: "Explain On this device and why tools start at zero." },
+  { label: "Draft a capsule plan", text: "Help me plan a small Notes capsule with library.read only." },
+];
+
+function relativeTime(ts) {
+  if (!ts) {
+    return "";
+  }
+  const delta = Date.now() - ts;
+  if (delta < 60_000) {
+    return "now";
+  }
+  if (delta < 3_600_000) {
+    return `${Math.max(1, Math.round(delta / 60_000))}m`;
+  }
+  if (delta < 86_400_000) {
+    return `${Math.max(1, Math.round(delta / 3_600_000))}h`;
+  }
+  return `${Math.max(1, Math.round(delta / 86_400_000))}d`;
+}
+
+function touchSession(session) {
+  if (session) {
+    session.updatedAt = Date.now();
+    session.mode = sessionMode;
+  }
+}
+
+function exportActiveSessionMarkdown() {
+  const session = sessions.find((s) => s.id === activeSessionId);
+  if (!session) {
+    return;
+  }
+  const lines = [`# ${session.title}`, "", `Mode: ${session.mode || sessionMode}`, ""];
+  for (const msg of session.messages) {
+    if (msg.role === "user") {
+      lines.push(`## You`, "", msg.text, "");
+    } else if (msg.role === "agent") {
+      if (msg.thinking) {
+        lines.push(`## Thinking`, "", msg.thinking, "");
+      }
+      lines.push(`## Agent`, "", msg.text, "");
+    } else if (msg.role === "grant") {
+      lines.push(`## Grant · ${msg.label || msg.toolId}`, "", `${msg.state}: ${msg.summary || ""}`, "");
+    }
+  }
+  const blob = new Blob([lines.join("\n")], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${(session.title || "chat").replace(/[^\w\-]+/g, "_").slice(0, 48)}.md`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
 const HOME_BREATHE_MS = 780;
 const HOME_RISE_MS = 720;
 const HARNESS_CONTENT_AT_MS = 180;
@@ -498,17 +555,21 @@ function renderSessions() {
     return;
   }
   list.replaceChildren();
-  const groups = ["Today", "Earlier"];
+  const pinned = sessions.filter((s) => s.pinned);
+  const groups = [
+    { id: "Pinned", items: pinned },
+    { id: "Today", items: sessions.filter((s) => !s.pinned && s.group === "Today") },
+    { id: "Earlier", items: sessions.filter((s) => !s.pinned && s.group === "Earlier") },
+  ];
   for (const group of groups) {
-    const items = sessions.filter((s) => s.group === group);
-    if (!items.length) {
+    if (!group.items.length) {
       continue;
     }
     const label = document.createElement("div");
     label.className = "agent-harness-group-label";
-    label.textContent = group;
+    label.textContent = group.id;
     list.append(label);
-    for (const session of items) {
+    for (const session of group.items) {
       const row = document.createElement("div");
       row.className = `agent-harness-session${session.id === activeSessionId ? " is-active" : ""}`;
       row.dataset.sessionId = session.id;
@@ -516,14 +577,21 @@ function renderSessions() {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "agent-harness-session-btn";
-      btn.textContent = session.title;
+      const title = document.createElement("span");
+      title.className = "agent-harness-session-title";
+      title.textContent = session.title;
+      const meta = document.createElement("span");
+      meta.className = "agent-harness-session-meta";
+      const mode = session.mode || "chat";
+      meta.textContent = [mode, relativeTime(session.updatedAt)].filter(Boolean).join(" · ");
+      btn.append(title, meta);
       btn.title = session.title;
 
       const kebab = document.createElement("button");
       kebab.type = "button";
       kebab.className = "agent-harness-session-menu";
       kebab.setAttribute("aria-label", `Session actions for ${session.title}`);
-      kebab.title = "Rename or delete";
+      kebab.title = "Pin, export, rename, or delete";
       kebab.textContent = "···";
 
       row.append(btn, kebab);
@@ -1116,6 +1184,17 @@ function showEmptyState() {
     `<p class="agent-harness-empty-sub"></p>`;
   empty.querySelector(".agent-harness-empty-greeting").textContent = greeting;
   empty.querySelector(".agent-harness-empty-sub").textContent = sub;
+  const starters = document.createElement("div");
+  starters.className = "agent-starter-chips";
+  for (const item of STARTER_PROMPTS) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "agent-starter-chip";
+    chip.dataset.starter = item.text;
+    chip.textContent = item.label;
+    starters.append(chip);
+  }
+  empty.append(starters);
   /* Viewport — not the dock-width column — so the hero sits in true room center. */
   viewport.append(empty);
 }
@@ -1613,6 +1692,7 @@ export function sendToAgentHarness(prompt) {
       session.title = titleFromPrompt(text);
     }
     session.messages.push({ role: "user", text });
+    touchSession(session);
     renderSessions();
     setTitle(session.title);
     clearEmptyState();
@@ -1928,20 +2008,34 @@ export function bindAgentHarness() {
       }
       return;
     }
+    const starter = event.target.closest?.("[data-starter]");
+    if (starter?.dataset.starter) {
+      event.preventDefault();
+      sendToAgentHarness(starter.dataset.starter);
+      return;
+    }
     const menu = event.target.closest?.(".agent-harness-session-menu");
     if (menu) {
       event.preventDefault();
       const id = menu.closest(".agent-harness-session")?.dataset.sessionId;
-      if (!id) {
+      const session = sessions.find((s) => s.id === id);
+      if (!session) {
         return;
       }
-      const choice = window.prompt('Type "rename" or "delete"', "rename");
+      const choice = window.prompt(
+        'Type "pin", "export", "rename", or "delete"',
+        session.pinned ? "export" : "pin",
+      );
       if (choice === "delete") {
         deleteSession(id);
-      } else if (choice === "rename" || choice === null) {
-        if (choice === "rename") {
-          renameSession(id);
-        }
+      } else if (choice === "rename") {
+        renameSession(id);
+      } else if (choice === "pin") {
+        session.pinned = !session.pinned;
+        renderSessions();
+      } else if (choice === "export") {
+        activeSessionId = id;
+        exportActiveSessionMarkdown();
       }
     }
   });

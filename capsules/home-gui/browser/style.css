@@ -4803,6 +4803,49 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   cursor: pointer;
 }
 
+.agent-harness-session-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.agent-harness-session-title {
+  font-weight: 650;
+}
+
+.agent-harness-session-meta {
+  font-size: 10px;
+  font-weight: 560;
+  opacity: 0.5;
+  text-transform: capitalize;
+}
+
+.agent-starter-chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.agent-starter-chip {
+  margin: 0;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.agent-starter-chip:hover {
+  background: color-mix(in srgb, var(--accent, #f97316) 16%, transparent);
+}
+
 .agent-harness-truth-thinking {
   margin: 0;
   padding: 2px 7px;
