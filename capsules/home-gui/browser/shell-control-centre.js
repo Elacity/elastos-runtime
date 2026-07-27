@@ -2,11 +2,11 @@ import {
   closeOtherShellPopovers,
   registerEscapeHandler,
   registerShellPopover,
-} from "./shell-popovers.js?v=home-20260724ap";
+} from "./shell-popovers.js?v=home-20260724ci";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20260724ap";
+} from "./shell-motion.js?v=home-20260724ci";
 import {
   fetchJson,
   focusModeEnabled,
@@ -14,16 +14,18 @@ import {
   setDesktopIconsVisible,
   setFocusModeEnabled,
   shellState,
-} from "./shell-core.js?v=home-20260724ap";
-import { uiSoundsEnabled, setUiSoundsEnabled, playUiSound } from "./shell-sounds.js?v=home-20260724ap";
+  targetById,
+} from "./shell-core.js?v=home-20260724ci";
+import { uiSoundsEnabled, setUiSoundsEnabled, playUiSound } from "./shell-sounds.js?v=home-20260724ci";
 import {
   dockAutoHideEnabled,
   setDockAutoHide,
-} from "./shell-surface.js?v=home-20260724ap";
-import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260724ap";
-import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260724ap";
-import { openTarget } from "./shell-windows.js?v=home-20260724ap";
-import { openExpose } from "./shell-expose.js?v=home-20260724ap";
+} from "./shell-surface.js?v=home-20260724ci";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260724ci";
+import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260724ci";
+import { showSpotlight } from "./shell-spotlight.js?v=home-20260724ci";
+import { openTarget } from "./shell-windows.js?v=home-20260724ci";
+import { openExpose } from "./shell-expose.js?v=home-20260724ci";
 
 /* Control Centre: the quick layer for controls that already have canonical
    stores — theme, sounds, focus, accent, dock, desktop icons — plus Nearby
@@ -51,6 +53,11 @@ let desktopIconsSwitch = null;
 let showWindowsRow = null;
 let whoamiDetail = null;
 let walletRow = null;
+let quickSpotlightRow = null;
+let quickInboxRow = null;
+let quickInboxDetail = null;
+let quickWalletRow = null;
+let quickWalletDetail = null;
 let thisDeviceRow = null;
 let systemRow = null;
 let outsideDismissBound = false;
@@ -80,6 +87,11 @@ export function bindControlCentre() {
   showWindowsRow = document.querySelector("#control-centre-show-windows");
   whoamiDetail = document.querySelector("#control-centre-whoami-detail");
   walletRow = document.querySelector("#control-centre-wallet");
+  quickSpotlightRow = document.querySelector("#control-centre-spotlight");
+  quickInboxRow = document.querySelector("#control-centre-inbox");
+  quickInboxDetail = document.querySelector("#control-centre-inbox-detail");
+  quickWalletRow = document.querySelector("#control-centre-quick-wallet");
+  quickWalletDetail = document.querySelector("#control-centre-quick-wallet-detail");
   thisDeviceRow = document.querySelector("#control-centre-this-device");
   systemRow = document.querySelector("#control-centre-system");
   if (!panel || !button) {
@@ -213,6 +225,25 @@ export function bindControlCentre() {
     openExpose();
   });
 
+  /* Part XI: phone tray folded into CC — same openers as toolbar (UI ≠ authority). */
+  quickSpotlightRow?.addEventListener("click", () => {
+    hideControlCentre({ restoreFocus: false });
+    showSpotlight();
+  });
+
+  quickInboxRow?.addEventListener("click", () => {
+    hideControlCentre({ restoreFocus: false });
+    showInboxRail();
+  });
+
+  quickWalletRow?.addEventListener("click", () => {
+    if (!walletRailAvailable()) {
+      return;
+    }
+    hideControlCentre({ restoreFocus: false });
+    showWalletRail();
+  });
+
   walletRow?.addEventListener("click", () => {
     if (!walletRailAvailable()) {
       return;
@@ -300,6 +331,7 @@ export function syncControlCentre(summary) {
   syncDesktopIconsSwitch();
   syncWhoami(summary);
   syncWalletRow();
+  syncQuickOpen(summary);
 }
 
 function publishAccent(value) {
@@ -555,8 +587,53 @@ function syncWalletRow() {
     return;
   }
   // Toolbar Wallet is the primary door — keep CC Wallet hidden when the rail
-  // is available (Jobs: quiet money).
+  // is available (Jobs: quiet money). Phone uses Quick open instead (Part XI).
   walletRow.hidden = true;
+}
+
+function walletApprovalCount(summary) {
+  const entries = Array.isArray(summary?.notifications?.entries)
+    ? summary.notifications.entries
+    : [];
+  return entries.filter((entry) => {
+    const actionId = entry?.action_ref?.action_id;
+    return (
+      entry?.kind === "wallet_approval_request" &&
+      typeof actionId === "string" &&
+      actionId.startsWith("wallet-approve-request:")
+    );
+  }).length;
+}
+
+function syncQuickOpen(summary) {
+  const inboxTarget = targetById(summary, "inbox");
+  if (quickInboxRow) {
+    quickInboxRow.hidden = !inboxTarget;
+    quickInboxRow.disabled = !inboxTarget;
+  }
+  if (quickInboxDetail) {
+    if (!inboxTarget) {
+      quickInboxDetail.textContent = "Unavailable";
+    } else {
+      const notifications = summary?.notifications || {};
+      const entries = Array.isArray(notifications.entries) ? notifications.entries : [];
+      const semanticCount =
+        Number(notifications.attention_count || 0) || Number(notifications.unread_count || 0);
+      const badgeCount = Math.max(0, semanticCount || entries.length);
+      quickInboxDetail.textContent =
+        badgeCount > 0 ? `${formatBadgeCount(badgeCount)} pending` : "Open";
+    }
+  }
+
+  const walletOk = walletRailAvailable();
+  if (quickWalletRow) {
+    quickWalletRow.hidden = !walletOk;
+  }
+  if (quickWalletDetail) {
+    const count = walletApprovalCount(summary);
+    quickWalletDetail.textContent =
+      count > 0 ? `${formatBadgeCount(count)} pending` : "Open";
+  }
 }
 
 function bindOutsideDismiss() {

@@ -21,7 +21,7 @@ import {
   ignoreRepeatedAction,
   pushUiPreferencesToFrameWindow,
   targetById,
-} from "./shell-core.js?v=home-20260724ap";
+} from "./shell-core.js?v=home-20260724ci";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -31,8 +31,8 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260724ap";
-import { playUiSound } from "./shell-sounds.js?v=home-20260724ap";
+} from "./shell-window-geometry.js?v=home-20260724ci";
+import { playUiSound } from "./shell-sounds.js?v=home-20260724ci";
 import {
   applyFullscreenStageFromPlacement,
   bindStageWindowHooks,
@@ -51,7 +51,7 @@ import {
   exitFullscreenStage,
   toggleFullscreenStage,
   windowVisibleOnActiveSpace,
-} from "./shell-stages.js?v=home-20260724ap";
+} from "./shell-stages.js?v=home-20260724ci";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -407,7 +407,12 @@ function renderWindowTaskbar() {
   if (!shellState.currentSummary) {
     return;
   }
-  requireWindowHooks().renderTaskbar(shellState.currentSummary);
+  /* Session restore paints once at the end — per-window breathes glitch the dock. */
+  if (shellState.restoringSession) {
+    return;
+  }
+  /* Close/open membership changes — liquid dock width (running slot ↔ Bin). */
+  requireWindowHooks().renderTaskbar(shellState.currentSummary, { animateWidth: true });
 }
 
 function windowHostContainer() {
@@ -1532,6 +1537,19 @@ export async function restoreShellSession() {
   for (const { entry } of restoredEntries) {
     delete entry.node?.dataset?.sessionRestoring;
   }
+
+  /* One liquid dock intro (width + Bin ride + fade runners) — not N breathes. */
+  const intro = requireWindowHooks().introduceDockAfterSessionRestore;
+  if (typeof intro === "function") {
+    try {
+      await intro();
+    } catch (_error) {
+      renderWindowTaskbar();
+    }
+  } else {
+    renderWindowTaskbar();
+  }
+
   persistBrowserSession();
 }
 

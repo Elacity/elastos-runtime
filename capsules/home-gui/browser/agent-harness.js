@@ -8,7 +8,7 @@ import {
   syncAgentSendButton,
   composerInput as shelfComposerInput,
   hideAgentShelfFace,
-} from "./agent-shelf.js?v=home-20260724ap";
+} from "./agent-shelf.js?v=home-20260724ci";
 import {
   enableHarnessMenubarReveal,
   clearHarnessMenubarReveal,
@@ -18,22 +18,27 @@ import {
   isAgentSpace,
   setActiveStage,
   syncSpacePager,
-} from "./shell-stages.js?v=home-20260724ap";
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724ap";
+} from "./shell-stages.js?v=home-20260724ci";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724ci";
+import {
+  MOCK_REPLY,
+  listCapabilities,
+  requestTool,
+  resolveMockApproval,
+  resetMockCapabilities,
+  applyCapabilityState,
+  toolsSummaryLabel,
+  wantsLibraryTool,
+  wantsWalletTool,
+} from "./mock-agent-provider.js?v=home-20260724ci";
 
-const TIP = "home-20260724ap";
+const TIP = "home-20260724ci";
 const HOME_BREATHE_MS = 780;
 const HOME_RISE_MS = 720;
 const HARNESS_CONTENT_AT_MS = 180;
 const PARTICLE_COUNT = 420;
 /** Part X — drawer / pill composer breakpoint (matches Outputs-hide). */
 const HARNESS_NARROW_MQ = "(max-width: 900px)";
-
-const MOCK_REPLY =
-  "I'm a local preview on this machine — not live inference yet.\n\n" +
-  "I start with **no tools**. If you need Downloads or other capsule access, " +
-  "you'll grant it explicitly (Inbox-style). Nothing ambient.\n\n" +
-  "```text\nTools: none\nLocality: this device\n```";
 
 const SEED_SESSIONS = [
   {
@@ -56,7 +61,17 @@ const SEED_SESSIONS = [
       { role: "user", text: "Can the agent touch my Wallet?" },
       {
         role: "agent",
-        text: "Not without an explicit ceremony. Wallet tools stay fail-closed.",
+        text:
+          "Not without an explicit human ceremony. Wallet tools stay fail-closed — " +
+          "never via Approve for me.",
+      },
+      {
+        role: "grant",
+        toolId: "wallet.sign",
+        state: "denied",
+        label: "Wallet · Sign",
+        summary: "Agent wants Wallet signing power",
+        scope: "human ceremony only · never ambient",
       },
     ],
   },
@@ -68,7 +83,18 @@ const SEED_SESSIONS = [
       { role: "user", text: "Summarize my Downloads folder." },
       {
         role: "agent",
-        text: "I'd need a Library read grant first — tools start at zero.",
+        text:
+          "I can only do that if you grant Library read access. " +
+          "Review the grant below — **Preview · mock**, no real Capsule call.",
+      },
+      {
+        role: "grant",
+        toolId: "library.read",
+        state: "pending",
+        args: { path: "Downloads" },
+        label: "Library · Read",
+        summary: "Agent wants to list files in Downloads",
+        scope: "read-only · this session · revocable",
       },
     ],
   },
@@ -120,13 +146,19 @@ function isNarrowHarness() {
 function setHarnessDrawerOpen(open) {
   const next = Boolean(open) && active && isNarrowHarness();
   document.body.classList.toggle("agent-harness-drawer-open", next);
+  if (next) {
+    document.body.classList.remove("agent-harness-sidebar-collapsed");
+  }
   const scrim = document.querySelector("#agent-harness-scrim");
   if (scrim) {
-    scrim.hidden = !next;
-    scrim.setAttribute("aria-hidden", next ? "false" : "true");
+    /* Push layout — scrim unused on narrow; keep hidden. */
+    scrim.hidden = true;
+    scrim.setAttribute("aria-hidden", "true");
   }
   const toggle = document.querySelector("#agent-harness-drawer-open");
   toggle?.setAttribute("aria-expanded", next ? "true" : "false");
+  /* Do not re-run syncComposerGeometry here — transform push must not
+     recompute --agent-column-* or the stream/composer alignment jumps. */
 }
 
 function closeHarnessDrawer() {
@@ -140,10 +172,121 @@ function openHarnessDrawer() {
   setHarnessDrawerOpen(true);
 }
 
+function setSidebarCollapsed(collapsed) {
+  if (!active || isNarrowHarness()) {
+    document.body.classList.remove("agent-harness-sidebar-collapsed");
+    return;
+  }
+  document.body.classList.toggle("agent-harness-sidebar-collapsed", Boolean(collapsed));
+  /* Main width jumps; taskbar size often does not — force column realign. */
+  requestAnimationFrame(() => {
+    requestAnimationFrame(syncComposerGeometry);
+  });
+}
+
+function toggleSidebarCollapsed() {
+  if (!active) {
+    return;
+  }
+  if (isNarrowHarness()) {
+    closeHarnessDrawer();
+    return;
+  }
+  const collapsed = document.body.classList.contains("agent-harness-sidebar-collapsed");
+  setSidebarCollapsed(!collapsed);
+}
+
+function sessionSearchOpen() {
+  const root = document.querySelector("#agent-session-search");
+  return Boolean(root) && !root.hidden;
+}
+
+function renderSessionSearchResults(query = "") {
+  const host = document.querySelector("#agent-session-search-results");
+  if (!host) {
+    return;
+  }
+  host.replaceChildren();
+  const q = String(query || "").trim().toLowerCase();
+  const matches = sessions.filter((session) => {
+    if (!q) {
+      return true;
+    }
+    if (session.title.toLowerCase().includes(q)) {
+      return true;
+    }
+    return (session.messages || []).some((m) =>
+      String(m.text || "").toLowerCase().includes(q),
+    );
+  });
+  if (!matches.length) {
+    const empty = document.createElement("p");
+    empty.className = "agent-session-search-empty";
+    empty.textContent = q ? "No chats match" : "No chats yet";
+    host.append(empty);
+    return;
+  }
+  for (const session of matches) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = `agent-session-search-row${
+      session.id === activeSessionId ? " is-active" : ""
+    }`;
+    row.dataset.sessionId = session.id;
+    row.setAttribute("role", "option");
+    row.innerHTML =
+      `<span class="agent-session-search-row-mark" aria-hidden="true"></span>` +
+      `<span class="agent-session-search-row-title"></span>` +
+      `<span class="agent-session-search-row-when"></span>`;
+    row.querySelector(".agent-session-search-row-title").textContent = session.title;
+    row.querySelector(".agent-session-search-row-when").textContent =
+      session.group || "";
+    host.append(row);
+  }
+}
+
+function openSessionSearch() {
+  if (!active) {
+    return;
+  }
+  const root = document.querySelector("#agent-session-search");
+  const input = document.querySelector("#agent-session-search-input");
+  if (!root) {
+    return;
+  }
+  root.hidden = false;
+  root.inert = false;
+  root.setAttribute("aria-hidden", "false");
+  renderSessionSearchResults(input?.value || "");
+  window.requestAnimationFrame(() => {
+    input?.focus({ preventScroll: true });
+    input?.select?.();
+  });
+}
+
+function closeSessionSearch() {
+  const root = document.querySelector("#agent-session-search");
+  const input = document.querySelector("#agent-session-search-input");
+  if (!root || root.hidden) {
+    return;
+  }
+  root.hidden = true;
+  root.inert = true;
+  root.setAttribute("aria-hidden", "true");
+  if (input) {
+    input.value = "";
+  }
+}
+
 function syncComposerGeometry() {
   const taskbar = document.querySelector(".taskbar");
   const main = document.querySelector(".agent-harness-main");
   if (!taskbar || !main || !document.body.classList.contains("agent-harness-active")) {
+    return;
+  }
+  /* While the push drawer is open, skip — transformed rects would skew
+     --agent-column-* and misalign stream vs Shelf composer. */
+  if (document.body.classList.contains("agent-harness-drawer-open")) {
     return;
   }
   const dock = taskbar.getBoundingClientRect();
@@ -162,6 +305,7 @@ function syncComposerGeometry() {
 
 function observeDockGeometry() {
   const taskbar = document.querySelector(".taskbar");
+  const main = document.querySelector(".agent-harness-main");
   if (!taskbar || typeof ResizeObserver !== "function") {
     return;
   }
@@ -172,6 +316,10 @@ function observeDockGeometry() {
     syncComposerGeometry();
   });
   dockResizeObserver.observe(taskbar);
+  /* Sidebar open/close resizes main without changing the dock pill. */
+  if (main) {
+    dockResizeObserver.observe(main);
+  }
 }
 
 function stopDockGeometryObserver() {
@@ -366,6 +514,22 @@ function renderSessions() {
   }
 }
 
+function syncTruthStrip() {
+  const root = document.querySelector(".agent-harness-truth");
+  if (!root) {
+    return;
+  }
+  const tools = root.querySelector("[data-truth-tools]");
+  if (tools) {
+    tools.textContent = toolsSummaryLabel();
+  }
+  root.dataset.tools = listCapabilities().some((c) => c.state === "granted")
+    ? "live"
+    : listCapabilities().some((c) => c.state === "pending")
+      ? "pending"
+      : "none";
+}
+
 function appendMessage(role, text, { streaming = false, asHtml = false } = {}) {
   const stream = streamEl();
   if (!stream) {
@@ -413,6 +577,222 @@ function appendMessage(role, text, { streaming = false, asHtml = false } = {}) {
   return row;
 }
 
+/**
+ * Inbox-grammar grant card (preview mock). Deny / Allow once update mock
+ * state only — never Capsule/Carrier (Principle 16).
+ */
+function appendGrantCard(spec) {
+  const stream = streamEl();
+  if (!stream || !spec?.toolId) {
+    return null;
+  }
+  clearEmptyState();
+
+  let state = spec.state || "pending";
+  let approvalId = spec.approvalId || "";
+  let label = spec.label || spec.toolId;
+  let summary = spec.summary || "";
+  let scope = spec.scope || "";
+
+  if (state === "pending" && !approvalId) {
+    const req = requestTool({
+      toolId: spec.toolId,
+      args: spec.args || { path: "Downloads" },
+    });
+    if (req.status === "denied") {
+      state = "denied";
+      label = req.label;
+      summary = req.summary;
+      scope = req.scope;
+    } else if (req.status === "needs_approval") {
+      approvalId = req.approvalId || "";
+      label = req.label;
+      summary = req.summary;
+      scope = req.scope;
+      spec.approvalId = approvalId;
+      spec.label = label;
+      spec.summary = summary;
+      spec.scope = scope;
+    } else if (req.status === "ok") {
+      state = "granted";
+      label = req.label;
+      summary = req.summary;
+      scope = req.scope;
+      spec.result = req.result;
+    }
+  }
+
+  const card = document.createElement("article");
+  card.className = `agent-grant-card is-${state}`;
+  card.dataset.role = "grant";
+  card.dataset.toolId = spec.toolId;
+  card.dataset.state = state;
+  card.dataset.preview = "1";
+  if (approvalId) {
+    card.dataset.approvalId = approvalId;
+  }
+
+  const head = document.createElement("div");
+  head.className = "agent-grant-card-head";
+  const title = document.createElement("span");
+  title.className = "agent-grant-card-title";
+  title.textContent = label;
+  const badge = document.createElement("span");
+  badge.className = "agent-grant-card-preview";
+  badge.textContent = "preview · mock";
+  head.append(title, badge);
+
+  const body = document.createElement("p");
+  body.className = "agent-grant-card-summary";
+  body.textContent = summary;
+
+  const scopeEl = document.createElement("p");
+  scopeEl.className = "agent-grant-card-scope";
+  scopeEl.textContent = `Scope: ${scope}`;
+
+  card.append(head, body, scopeEl);
+
+  if (state === "pending") {
+    const actions = document.createElement("div");
+    actions.className = "agent-grant-card-actions";
+    const deny = document.createElement("button");
+    deny.type = "button";
+    deny.className = "agent-grant-btn agent-grant-btn-deny";
+    deny.dataset.grantDecision = "deny";
+    deny.textContent = "Deny";
+    const allow = document.createElement("button");
+    allow.type = "button";
+    allow.className = "agent-grant-btn agent-grant-btn-allow";
+    allow.dataset.grantDecision = "allow_once";
+    allow.textContent = "Allow once";
+    actions.append(deny, allow);
+    card.append(actions);
+  } else {
+    const chip = document.createElement("div");
+    chip.className = "agent-grant-card-chip";
+    chip.textContent =
+      state === "granted"
+        ? "Allowed once · preview mock — no Capsule call"
+        : "Denied · fail-closed";
+    card.append(chip);
+    if (state === "granted" && spec.result) {
+      const result = document.createElement("pre");
+      result.className = "agent-grant-card-result";
+      result.textContent = spec.result;
+      card.append(result);
+    }
+  }
+
+  stream.append(card);
+  syncTruthStrip();
+  scrollStreamToEnd();
+  return card;
+}
+
+function paintGrantCardResolved(card, outcome) {
+  if (!card) {
+    return;
+  }
+  const state = outcome.status === "ok" ? "granted" : "denied";
+  card.dataset.state = state;
+  card.className = `agent-grant-card is-${state}`;
+  card.querySelector(".agent-grant-card-actions")?.remove();
+  card.querySelector(".agent-grant-card-chip")?.remove();
+  card.querySelector(".agent-grant-card-result")?.remove();
+  const chip = document.createElement("div");
+  chip.className = "agent-grant-card-chip";
+  chip.textContent =
+    state === "granted"
+      ? "Allowed once · preview mock — no Capsule call"
+      : "Denied · fail-closed";
+  card.append(chip);
+  if (state === "granted" && outcome.result) {
+    const result = document.createElement("pre");
+    result.className = "agent-grant-card-result";
+    result.textContent = outcome.result;
+    card.append(result);
+  }
+  syncTruthStrip();
+  scrollStreamToEnd();
+}
+
+function resolveGrantFromCard(card, decision) {
+  if (!card || card.dataset.state !== "pending") {
+    return;
+  }
+  const outcome = resolveMockApproval({
+    approvalId: card.dataset.approvalId,
+    toolId: card.dataset.toolId,
+    decision,
+  });
+  const session = sessions.find((s) => s.id === activeSessionId);
+  const grantMsg = session?.messages?.find(
+    (m) =>
+      m.role === "grant" &&
+      m.toolId === card.dataset.toolId &&
+      (m.state === "pending" || !m.state),
+  );
+  if (grantMsg) {
+    grantMsg.state = outcome.status === "ok" ? "granted" : "denied";
+    if (outcome.result) {
+      grantMsg.result = outcome.result;
+    }
+  }
+  paintGrantCardResolved(card, outcome);
+}
+
+function sessionAlreadyHasGrant(session, toolId) {
+  return Boolean(
+    session?.messages?.some((m) => m.role === "grant" && m.toolId === toolId),
+  );
+}
+
+function maybeOfferToolAfterReply() {
+  const session = sessions.find((s) => s.id === activeSessionId);
+  if (!session) {
+    return;
+  }
+  const lastUser = [...session.messages]
+    .reverse()
+    .find((m) => m.role === "user");
+  const text = lastUser?.text || "";
+  if (wantsWalletTool(text) && !sessionAlreadyHasGrant(session, "wallet.sign")) {
+    const req = requestTool({ toolId: "wallet.sign", args: {} });
+    const grant = {
+      role: "grant",
+      toolId: "wallet.sign",
+      state: req.status === "denied" ? "denied" : "pending",
+      approvalId: req.approvalId,
+      label: req.label,
+      summary: req.summary,
+      scope: req.scope,
+    };
+    session.messages.push(grant);
+    appendGrantCard(grant);
+    return;
+  }
+  if (wantsLibraryTool(text) && !sessionAlreadyHasGrant(session, "library.read")) {
+    const req = requestTool({
+      toolId: "library.read",
+      args: { path: "Downloads" },
+    });
+    if (req.status === "needs_approval" || req.status === "denied") {
+      const grant = {
+        role: "grant",
+        toolId: "library.read",
+        state: req.status === "denied" ? "denied" : "pending",
+        approvalId: req.approvalId,
+        label: req.label,
+        summary: req.summary,
+        scope: req.scope,
+        args: { path: "Downloads" },
+      };
+      session.messages.push(grant);
+      appendGrantCard(grant);
+    }
+  }
+}
+
 function showEmptyState() {
   const column = streamEl();
   const viewport = streamViewportEl();
@@ -454,8 +834,47 @@ function renderActiveSession() {
     return;
   }
   clearEmptyState();
+  hydrateCapabilitiesFromSession(session);
   for (const msg of session.messages) {
-    appendMessage(msg.role, msg.text);
+    if (msg.role === "grant") {
+      appendGrantCard(msg);
+    } else {
+      appendMessage(msg.role, msg.text);
+    }
+  }
+  syncTruthStrip();
+}
+
+/** Re-bind mock capability map to this session’s grant messages (preview). */
+function hydrateCapabilitiesFromSession(session) {
+  resetMockCapabilities();
+  for (const msg of session?.messages || []) {
+    if (msg.role !== "grant" || !msg.toolId) {
+      continue;
+    }
+    if (msg.state === "pending") {
+      const req = requestTool({
+        toolId: msg.toolId,
+        args: msg.args || { path: "Downloads" },
+      });
+      if (req.approvalId) {
+        msg.approvalId = req.approvalId;
+      }
+      if (req.label) {
+        msg.label = req.label;
+      }
+      if (req.summary) {
+        msg.summary = req.summary;
+      }
+      if (req.scope) {
+        msg.scope = req.scope;
+      }
+      if (req.status === "denied") {
+        msg.state = "denied";
+      }
+    } else if (msg.state === "granted" || msg.state === "denied") {
+      applyCapabilityState(msg.toolId, msg.state);
+    }
   }
 }
 
@@ -513,6 +932,8 @@ function startMockStream(replyText) {
       if (session) {
         session.messages.push({ role: "agent", text: replyText });
       }
+      maybeOfferToolAfterReply();
+      syncTruthStrip();
       /* Markdown/code blocks grow after plain-text streaming — re-pin above the Shelf. */
       scrollStreamToEnd();
     }
@@ -677,6 +1098,7 @@ export function showAgentHarness({ prompt, fromShelf = false, syncStage = true }
 
   harness.hidden = false;
   harness.setAttribute("aria-hidden", "false");
+  syncTruthStrip();
   renderSessions();
   renderActiveSession();
 
@@ -759,22 +1181,8 @@ function scheduleHarnessTeardown(motionGen, opts) {
 }
 
 export function hideAgentHarness({ restoreShelfApps = true, syncStage = true } = {}) {
-  if (!active && !document.body.classList.contains("agent-harness-active")) {
-    return;
-  }
-  const motionGen = (harnessMotionGen += 1);
-  stopMockStream({ keepPartial: true });
-  stopParticles();
-  active = false;
-  closeHarnessDrawer();
-
-  const harness = harnessEl();
-  harness?.classList.remove("is-visible");
-  clearHarnessMenubarReveal();
-  document.body.classList.remove("agent-harness-settled", "agent-harness-dropping");
-  document.body.classList.add("agent-harness-rising");
-
-  /* Leave Agent Space for Desktop (Agent stays in MC). Shelf owns reverse morph. */
+  /* Persist Desktop even if the room is already torn down — Home/Esc used to
+     leave active_stage stuck on "agent", so refresh re-opened Agent. */
   if (syncStage && isAgentSpace(getActiveStageId())) {
     setActiveStage(desktopStageId(), {
       announce: false,
@@ -783,9 +1191,29 @@ export function hideAgentHarness({ restoreShelfApps = true, syncStage = true } =
       syncHarness: false,
     });
   }
+  if (!active && !document.body.classList.contains("agent-harness-active")) {
+    return;
+  }
+  const motionGen = (harnessMotionGen += 1);
+  stopMockStream({ keepPartial: true });
+  stopParticles();
+  active = false;
+  closeHarnessDrawer();
+  closeSessionSearch();
+  document.body.classList.remove("agent-harness-sidebar-collapsed");
+  resetMockCapabilities();
+  syncTruthStrip();
+
+  const harness = harnessEl();
+  harness?.classList.remove("is-visible");
+  clearHarnessMenubarReveal();
+  document.body.classList.remove("agent-harness-settled", "agent-harness-dropping");
+  document.body.classList.add("agent-harness-rising");
 
   scheduleHarnessTeardown(motionGen, { restoreShelfApps });
 }
+/* resetMockCapabilities on leave — session grant messages still hold preview state;
+   hydrateCapabilitiesFromSession re-binds when a session is painted again. */
 
 export function stopAgentHarnessStream() {
   stopMockStream({ keepPartial: true });
@@ -814,6 +1242,16 @@ export function sendToAgentHarness(prompt) {
     return;
   }
   showAgentHarness({ prompt: text });
+}
+
+function selectSession(sessionId) {
+  if (!sessionId || !sessions.some((s) => s.id === sessionId)) {
+    return;
+  }
+  stopMockStream({ keepPartial: true });
+  activeSessionId = sessionId;
+  renderSessions();
+  renderActiveSession();
 }
 
 function newChat() {
@@ -863,7 +1301,12 @@ export function bindAgentHarness() {
   }
   bound = true;
 
-  /* Esc: drawer (85) before Shelf reverse dance (75). */
+  /* Esc: search (90) → drawer (85) → Shelf reverse dance (75). */
+  registerEscapeHandler("agent-session-search", {
+    priority: 90,
+    isActive: () => active && sessionSearchOpen(),
+    dismiss: () => closeSessionSearch(),
+  });
   registerEscapeHandler("agent-harness-drawer", {
     priority: 85,
     isActive: () =>
@@ -875,6 +1318,8 @@ export function bindAgentHarness() {
     const narrowMq = window.matchMedia(HARNESS_NARROW_MQ);
     const onNarrowChange = () => {
       closeHarnessDrawer();
+      closeSessionSearch();
+      document.body.classList.remove("agent-harness-sidebar-collapsed");
       if (active) {
         syncComposerGeometry();
       }
@@ -887,16 +1332,71 @@ export function bindAgentHarness() {
     }
   }
 
+  document.addEventListener("input", (event) => {
+    if (event.target?.id === "agent-session-search-input") {
+      renderSessionSearchResults(event.target.value);
+    }
+  });
+
   document.addEventListener("click", (event) => {
-    if (event.target.closest?.("#agent-harness-drawer-open")) {
+    if (
+      event.target.closest?.("#agent-harness-search-open") ||
+      event.target.closest?.("#agent-harness-search-open-main")
+    ) {
       event.preventDefault();
-      openHarnessDrawer();
+      openSessionSearch();
       return;
     }
     if (
-      event.target.closest?.("#agent-harness-drawer-close") ||
-      event.target.closest?.("#agent-harness-scrim")
+      event.target.closest?.("#agent-session-search-close") ||
+      (event.target.id === "agent-session-search" &&
+        !event.target.closest?.(".agent-session-search-panel"))
     ) {
+      event.preventDefault();
+      closeSessionSearch();
+      return;
+    }
+    const searchRow = event.target.closest?.(".agent-session-search-row[data-session-id]");
+    if (searchRow) {
+      event.preventDefault();
+      const id = searchRow.dataset.sessionId;
+      closeSessionSearch();
+      if (id) {
+        selectSession(id);
+        if (isNarrowHarness()) {
+          closeHarnessDrawer();
+        }
+      }
+      return;
+    }
+    if (event.target.closest?.("#agent-harness-panel-toggle")) {
+      event.preventDefault();
+      toggleSidebarCollapsed();
+      return;
+    }
+    if (event.target.closest?.("#agent-harness-drawer-open")) {
+      event.preventDefault();
+      if (isNarrowHarness()) {
+        if (document.body.classList.contains("agent-harness-drawer-open")) {
+          closeHarnessDrawer();
+        } else {
+          openHarnessDrawer();
+        }
+      } else {
+        setSidebarCollapsed(false);
+      }
+      return;
+    }
+    /* Push mode: tap nudged main (not sidebar) to close drawer. */
+    if (
+      document.body.classList.contains("agent-harness-drawer-open") &&
+      event.target.closest?.(".agent-harness-main") &&
+      !event.target.closest?.("#agent-harness-drawer-open")
+    ) {
+      closeHarnessDrawer();
+      return;
+    }
+    if (event.target.closest?.("#agent-harness-scrim")) {
       event.preventDefault();
       closeHarnessDrawer();
       return;
@@ -904,6 +1404,7 @@ export function bindAgentHarness() {
     if (event.target.closest?.("#agent-harness-home")) {
       event.preventDefault();
       closeHarnessDrawer();
+      closeSessionSearch();
       hideAgentShelfFace();
       return;
     }
@@ -942,6 +1443,16 @@ export function bindAgentHarness() {
       event.preventDefault();
       event.target.closest(".agent-msg-stopped")?.remove();
       startMockStream(MOCK_REPLY);
+      return;
+    }
+    const grantBtn = event.target.closest?.("[data-grant-decision]");
+    if (grantBtn) {
+      event.preventDefault();
+      const card = grantBtn.closest(".agent-grant-card");
+      const decision = grantBtn.dataset.grantDecision;
+      if (card && (decision === "deny" || decision === "allow_once")) {
+        resolveGrantFromCard(card, decision);
+      }
       return;
     }
     const sessionBtn = event.target.closest?.(".agent-harness-session-btn");

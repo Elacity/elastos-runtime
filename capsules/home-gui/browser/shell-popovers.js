@@ -60,6 +60,13 @@ export function closeOtherShellPopovers(exceptId) {
     if (id === exceptId) {
       continue;
     }
+    /*
+      Apps is a Shelf face (mode), not a transient popover. Closing it belongs
+      to desktop click-off / Apps toggle / Agent face — not context menus etc.
+    */
+    if (id === "launcher") {
+      continue;
+    }
     try {
       close();
     } catch (_error) {

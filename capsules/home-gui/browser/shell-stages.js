@@ -10,13 +10,13 @@
  * - Expose / Show Windows — Mission Control overview (shell-expose.js)
  */
 
-import { shellState } from "./shell-core.js?v=home-20260724ap";
+import { shellState } from "./shell-core.js?v=home-20260724ci";
 import {
   rememberWindowRestoreBounds,
   restoreWindowFromSpecialState,
-} from "./shell-window-geometry.js?v=home-20260724ap";
+} from "./shell-window-geometry.js?v=home-20260724ci";
 
-const TIP = "home-20260724ap";
+const TIP = "home-20260724ci";
 const DESKTOP_STAGE = "desktop";
 /** Singleton Agent Space — always in the ring beside Desktop (Mission Control peer). */
 const AGENT_STAGE = "agent";
@@ -1603,6 +1603,169 @@ export function bindSpaceEdgePeek() {
     },
     { passive: true },
   );
+}
+
+/* Part XII — mobile plane swipe (was fx2c-mobile-swipe-seam).
+   Horizontal flick → flickStage → setActiveStage. UI ≠ authority. */
+const PLANE_SWIPE_NARROW_MQ = "(max-width: 900px)";
+const PLANE_SWIPE_THRESHOLD_PX = 56;
+const PLANE_SWIPE_AXIS_RATIO = 1.35;
+let planeSwipeBound = false;
+let planeSwipeTracking = false;
+let planeSwipePointerId = null;
+let planeSwipeStartX = 0;
+let planeSwipeStartY = 0;
+
+function planeSwipeNarrowActive() {
+  return (
+    typeof window.matchMedia === "function" &&
+    window.matchMedia(PLANE_SWIPE_NARROW_MQ).matches
+  );
+}
+
+function shellChromeBlocksPlaneSwipe() {
+  if (
+    document.body.classList.contains("expose-active") ||
+    document.body.classList.contains("mission-exiting") ||
+    document.body.classList.contains("stage-sliding") ||
+    document.body.classList.contains("agent-harness-drawer-open")
+  ) {
+    return true;
+  }
+  const blockers = [
+    "#launcher",
+    "#control-centre",
+    "#notification-center",
+    "#spotlight",
+    "#wallet-rail",
+    "#inbox-rail",
+    "#about-overlay",
+    "#shortcuts-overlay",
+    "#quick-look",
+  ];
+  for (const sel of blockers) {
+    const node = document.querySelector(sel);
+    if (node && !node.hidden) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function shouldIgnorePlaneSwipeTarget(target) {
+  if (!(target instanceof Element)) {
+    return true;
+  }
+  if (
+    target.closest(
+      'input, textarea, select, [contenteditable="true"], .taskbar, .agent-composer, .agent-harness-sidebar, .agent-harness-mobile-bar',
+    )
+  ) {
+    return true;
+  }
+  if (
+    target.closest(
+      "#launcher, #control-centre, #notification-center, #spotlight, #wallet-rail, #inbox-rail, .toolbar",
+    )
+  ) {
+    return true;
+  }
+  let el = target;
+  while (el && el !== document.documentElement) {
+    if (el instanceof HTMLElement) {
+      const style = window.getComputedStyle(el);
+      const ox = style.overflowX;
+      if (
+        (ox === "auto" || ox === "scroll") &&
+        el.scrollWidth > el.clientWidth + 2
+      ) {
+        return true;
+      }
+    }
+    el = el.parentElement;
+  }
+  return false;
+}
+
+/**
+ * Narrow touch: swipe left/right switches Spaces via flickStage (same grammar
+ * as Overview / edge peek). Fine-pointer desktop keeps edge peek — no trackpad grab.
+ */
+export function bindMobilePlaneSwipe() {
+  if (planeSwipeBound) {
+    return;
+  }
+  planeSwipeBound = true;
+
+  const reset = () => {
+    planeSwipeTracking = false;
+    planeSwipePointerId = null;
+  };
+
+  document.addEventListener(
+    "pointerdown",
+    (event) => {
+      if (!planeSwipeNarrowActive()) {
+        return;
+      }
+      /* Touch/pen always; mouse only when coarse (phone emulation) — never
+         grab a fine-pointer trackpad on a resized desktop window. */
+      if (event.pointerType === "mouse") {
+        const coarse =
+          typeof window.matchMedia === "function" &&
+          window.matchMedia("(pointer: coarse)").matches;
+        if (!coarse) {
+          return;
+        }
+      }
+      if (shellChromeBlocksPlaneSwipe()) {
+        return;
+      }
+      if (shouldIgnorePlaneSwipeTarget(event.target)) {
+        return;
+      }
+      if (buildStageRing().length < 2) {
+        return;
+      }
+      planeSwipeTracking = true;
+      planeSwipePointerId = event.pointerId;
+      planeSwipeStartX = event.clientX;
+      planeSwipeStartY = event.clientY;
+    },
+    { passive: true, capture: true },
+  );
+
+  document.addEventListener(
+    "pointerup",
+    (event) => {
+      if (!planeSwipeTracking || event.pointerId !== planeSwipePointerId) {
+        return;
+      }
+      const dx = event.clientX - planeSwipeStartX;
+      const dy = event.clientY - planeSwipeStartY;
+      reset();
+      if (!planeSwipeNarrowActive() || shellChromeBlocksPlaneSwipe()) {
+        return;
+      }
+      if (Math.abs(dx) < PLANE_SWIPE_THRESHOLD_PX) {
+        return;
+      }
+      if (Math.abs(dx) < Math.abs(dy) * PLANE_SWIPE_AXIS_RATIO) {
+        return;
+      }
+      /* Finger left → Agent→Desktop or Desktop→Agent (dual-plane day one).
+         Overview / MC still own the full Space ring. */
+      const active = getActiveStageId();
+      if (isAgentSpace(active)) {
+        setActiveStage(DESKTOP_STAGE, { animate: true });
+      } else {
+        setActiveStage(AGENT_STAGE, { animate: true });
+      }
+    },
+    { passive: true, capture: true },
+  );
+
+  document.addEventListener("pointercancel", reset, { capture: true });
 }
 
 if (shellState.activeStageId == null) {

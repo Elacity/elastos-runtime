@@ -233,7 +233,7 @@
 
   /* First-party liquid masters live in home-gui; App Store loads them via the
      shared /apps/home-gui/icons/ surface so Shelf and Apps stay one family. */
-  const HOME_ICON_ASSET_VERSION = "home-20260724ap";
+  const HOME_ICON_ASSET_VERSION = "home-20260724as";
   const FIRST_PARTY_ICON_IDS = new Set([
     "browser",
     "library",

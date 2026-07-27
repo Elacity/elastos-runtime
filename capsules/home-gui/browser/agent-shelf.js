@@ -7,10 +7,9 @@
 
    Send opens Agent Harness (Home drops, dock stays) — see agent-harness.js. */
 
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724ap";
-import { hideLauncher } from "./shell-surface.js?v=home-20260724ap";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724ci";
 
-const TIP = "home-20260724ap";
+const TIP = "home-20260724ci";
 
 let bound = false;
 let morphGeneration = 0;
@@ -45,7 +44,27 @@ function scheduleMorph(generation, delayMs, work) {
 }
 
 function composerMaxHeightPx() {
-  return Math.min(320, Math.round(window.innerHeight * 0.42));
+  const hardCap = Math.min(320, Math.round(window.innerHeight * 0.42));
+  const taskbar = taskbarEl();
+  if (!taskbar?.classList.contains("is-agent-face")) {
+    return hardCap;
+  }
+  /* Keep text inside the Shelf pill — dock max minus padding + toolbar. */
+  const narrow =
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(max-width: 900px)").matches;
+  const dockCap = Math.min(
+    Math.round(window.innerHeight * (narrow ? 0.42 : 0.72)),
+    narrow ? 280 : 520,
+  );
+  const cs = window.getComputedStyle(taskbar);
+  const padY =
+    (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+  const toolbar = taskbar.querySelector(".agent-composer-toolbar");
+  const toolH = toolbar?.getBoundingClientRect().height || (narrow ? 36 : 32);
+  const gap = narrow ? 8 : 12;
+  const available = Math.floor(dockCap - padY - toolH - gap);
+  return Math.max(48, Math.min(hardCap, available));
 }
 
 function taskbarEl() {
@@ -125,15 +144,80 @@ function setMorphPhase(taskbar, phase) {
   taskbar.dataset.agentMorph = phase;
 }
 
-function syncFaceAria(agentVisible) {
+function syncFaceAria({ agent = false, launcher = false } = {}) {
   const agentFace = document.querySelector(".shelf-face-agent");
   const appsFace = document.querySelector(".shelf-face-apps");
+  const launcherFace = document.querySelector(".shelf-face-launcher");
   if (agentFace) {
-    agentFace.setAttribute("aria-hidden", agentVisible ? "false" : "true");
+    agentFace.setAttribute("aria-hidden", agent ? "false" : "true");
+  }
+  if (launcherFace) {
+    launcherFace.setAttribute("aria-hidden", launcher ? "false" : "true");
   }
   if (appsFace) {
-    appsFace.setAttribute("aria-hidden", agentVisible ? "true" : "false");
+    /* Idle dock row stays visible under Apps face (pinned icons + drag targets). */
+    appsFace.setAttribute("aria-hidden", agent ? "true" : "false");
   }
+}
+
+function launcherEl() {
+  return document.querySelector("#launcher");
+}
+
+export function launcherShelfFaceActive() {
+  const taskbar = taskbarEl();
+  if (!taskbar) {
+    return false;
+  }
+  if (taskbar.classList.contains("is-launcher-face")) {
+    return true;
+  }
+  const phase = taskbar.dataset.agentMorph || "";
+  return (
+    Boolean(taskbar.dataset.launcherMorphing) &&
+    (phase === "exit" ||
+      phase === "grow" ||
+      phase === "enter" ||
+      phase === "leave" ||
+      phase === "shrink")
+  );
+}
+
+function setLauncherDomOpen(open) {
+  const launcher = launcherEl();
+  const toggle = document.querySelector("#launcher-toggle");
+  if (!launcher) {
+    return;
+  }
+  launcher.hidden = !open;
+  launcher.inert = !open;
+  launcher.setAttribute("aria-hidden", open ? "false" : "true");
+  launcher.dataset.open = open ? "true" : "false";
+  toggle?.setAttribute("aria-expanded", open ? "true" : "false");
+}
+
+/** Idle dock width → Apps face width (height-only grow). Soft min ~320. */
+function lockLauncherFaceWidth(taskbar) {
+  if (!taskbar) {
+    return 0;
+  }
+  const dockW = taskbar.getBoundingClientRect().width;
+  const maxW = Math.max(200, window.innerWidth - 20);
+  const minW = Math.min(320, maxW);
+  const width = Math.round(Math.min(maxW, Math.max(minW, dockW)));
+  /* Inline px width — custom props don't interpolate (was the width jump). */
+  taskbar.style.setProperty("--shelf-launcher-w", `${width}px`);
+  taskbar.style.width = `${width}px`;
+  return width;
+}
+
+function clearLauncherFaceWidth(taskbar) {
+  if (!taskbar) {
+    return;
+  }
+  taskbar.style.removeProperty("--shelf-launcher-w");
+  taskbar.style.removeProperty("width");
+  taskbar.classList.remove("is-launcher-width-easing");
 }
 
 function readBox(taskbar) {
@@ -171,8 +255,14 @@ function clearBoxLock(taskbar) {
   taskbar.style.boxShadow = "";
 }
 
-function geometryTransition(durationMs = MORPH_STRETCH_MS) {
+function geometryTransition(durationMs = MORPH_STRETCH_MS, { freezeHorizontal = false } = {}) {
   const t = `${durationMs}ms ${MORPH_EASE}`;
+  /* Apps face grows height only — width/padding FLIP was the side-nudge. */
+  if (freezeHorizontal) {
+    return [`height ${t}`, `min-height ${t}`, `border-radius ${t}`, `box-shadow ${t}`].join(
+      ", ",
+    );
+  }
   return [
     `width ${t}`,
     `height ${t}`,
@@ -183,18 +273,37 @@ function geometryTransition(durationMs = MORPH_STRETCH_MS) {
   ].join(", ");
 }
 
-function flipTaskbarGeometry(taskbar, applyEndState, durationMs = MORPH_STRETCH_MS) {
+function flipTaskbarGeometry(
+  taskbar,
+  applyEndState,
+  durationMs = MORPH_STRETCH_MS,
+  { freezeHorizontal = false } = {},
+) {
   const from = readBox(taskbar);
   applyEndState();
   const to = readBox(taskbar);
+  if (freezeHorizontal) {
+    to.width = from.width;
+    to.padding = from.padding;
+  }
 
   taskbar.style.transition = "none";
   lockBox(taskbar, from);
   void taskbar.offsetWidth;
 
-  taskbar.style.transition = geometryTransition(durationMs);
+  taskbar.style.transition = geometryTransition(durationMs, { freezeHorizontal });
   lockBox(taskbar, to);
   return to;
+}
+
+/** Drop dock-mag lift/shift for the morph only — mag returns on next hover. */
+function calmDockIconsForMorph(taskbar) {
+  taskbar?.querySelectorAll(".taskbar-icon").forEach((icon) => {
+    icon.style.transform = "";
+  });
+  taskbar?.querySelectorAll(".taskbar-item").forEach((item) => {
+    item.style.removeProperty("--dock-shift");
+  });
 }
 
 async function harnessApi() {
@@ -288,7 +397,6 @@ export function showAgentShelfFace() {
     return;
   }
 
-  hideLauncher();
   const generation = (morphGeneration += 1);
   clearMorphTimer();
   taskbar.querySelectorAll(".taskbar-icon").forEach((icon) => {
@@ -300,15 +408,19 @@ export function showAgentShelfFace() {
   toggle?.setAttribute("aria-pressed", "true");
   setAgentComposerProcessing(false);
 
+  /* Apps face must yield before Agent morph (shared FLIP slot). */
+  snapIdleFromLauncherFace();
+
   setMorphPhase(taskbar, "exit");
-  syncFaceAria(false);
+  syncFaceAria({ agent: false, launcher: false });
 
   scheduleMorph(generation, MORPH_EXIT_MS, () => {
     setMorphPhase(taskbar, "grow");
-    syncFaceAria(true);
+    syncFaceAria({ agent: true, launcher: false });
     autosizeComposer(input);
 
     flipTaskbarGeometry(taskbar, () => {
+      taskbar.classList.remove("is-launcher-face");
       taskbar.classList.add("is-agent-face");
     });
 
@@ -361,15 +473,28 @@ export function snapAgentShelfFace() {
   taskbar.querySelectorAll(".taskbar-item").forEach((item) => {
     item.style.removeProperty("--dock-shift");
   });
+  snapIdleFromLauncherFace();
   taskbar.classList.add("is-agent-face");
   setMorphPhase(taskbar, "enter");
-  syncFaceAria(true);
+  syncFaceAria({ agent: true, launcher: false });
   toggle?.setAttribute("aria-pressed", "true");
   setAgentComposerProcessing(false);
   autosizeComposer(input);
 }
 
-/** Instant Apps face — Space leave / MC → Desktop without reverse morph glitch. */
+function snapIdleFromLauncherFace() {
+  const taskbar = taskbarEl();
+  if (!taskbar) {
+    return;
+  }
+  delete taskbar.dataset.launcherMorphing;
+  taskbar.classList.remove("is-launcher-face", "is-launcher-closing");
+  clearLauncherFaceWidth(taskbar);
+  setLauncherDomOpen(false);
+  document.querySelector("#launcher-toggle")?.setAttribute("aria-expanded", "false");
+}
+
+/** Instant idle Shelf — Space leave / MC → Desktop without reverse morph glitch. */
 export function snapAppsShelfFace() {
   const taskbar = taskbarEl();
   const toggle = document.querySelector("#agent-shelf-toggle");
@@ -380,8 +505,9 @@ export function snapAppsShelfFace() {
   clearMorphTimer();
   clearBoxLock(taskbar);
   taskbar.classList.remove("is-agent-face");
+  snapIdleFromLauncherFace();
   setMorphPhase(taskbar, "");
-  syncFaceAria(false);
+  syncFaceAria({ agent: false, launcher: false });
   toggle?.setAttribute("aria-pressed", "false");
   setAgentComposerProcessing(false);
   document.documentElement.style.removeProperty("--agent-column-width");
@@ -405,7 +531,7 @@ export function hideAgentShelfFace() {
     clearBoxLock(taskbar);
     taskbar.classList.remove("is-agent-face");
     setMorphPhase(taskbar, "");
-    syncFaceAria(false);
+    syncFaceAria({ agent: false, launcher: false });
     document.documentElement.style.removeProperty("--agent-column-width");
     document.documentElement.style.removeProperty("--agent-column-left");
     document.documentElement.style.removeProperty("--harness-composer-clearance");
@@ -414,9 +540,8 @@ export function hideAgentShelfFace() {
 
   if (!taskbar.classList.contains("is-agent-face")) {
     void harnessApi().then((harness) => {
-      if (harness.agentHarnessActive()) {
-        harness.hideAgentHarness({ restoreShelfApps: false, syncStage: false });
-      }
+      /* syncStage: leave Agent Space → Desktop so refresh lands on Home. */
+      harness.hideAgentHarness({ restoreShelfApps: false, syncStage: true });
     });
     finishClosed();
     return;
@@ -424,9 +549,7 @@ export function hideAgentShelfFace() {
 
   if (prefersReducedMotion()) {
     void harnessApi().then((harness) => {
-      if (harness.agentHarnessActive()) {
-        harness.hideAgentHarness({ restoreShelfApps: false, syncStage: false });
-      }
+      harness.hideAgentHarness({ restoreShelfApps: false, syncStage: true });
     });
     snapAppsShelfFace();
     toggle?.focus({ preventScroll: true });
@@ -435,17 +558,15 @@ export function hideAgentShelfFace() {
 
   /* Chrome leaves first; harness exhales as dock begins shrink — not before. */
   setMorphPhase(taskbar, "leave");
-  syncFaceAria(true);
+  syncFaceAria({ agent: true, launcher: false });
 
   scheduleMorph(generation, MORPH_LEAVE_MS, () => {
     void harnessApi().then((harness) => {
-      if (harness.agentHarnessActive()) {
-        harness.hideAgentHarness({ restoreShelfApps: false, syncStage: false });
-      }
+      harness.hideAgentHarness({ restoreShelfApps: false, syncStage: true });
     });
 
     setMorphPhase(taskbar, "shrink");
-    syncFaceAria(false);
+    syncFaceAria({ agent: false, launcher: false });
 
     flipTaskbarGeometry(taskbar, () => {
       taskbar.classList.remove("is-agent-face");
@@ -470,6 +591,166 @@ export function toggleAgentShelfFace() {
   }
 }
 
+/** Morph idle Shelf → Apps launcher face (same FLIP principles as Agent). */
+export function showLauncherShelfFace() {
+  const taskbar = taskbarEl();
+  if (!taskbar) {
+    setLauncherDomOpen(true);
+    return;
+  }
+  if (taskbar.dataset.agentPreview !== "1") {
+    lockLauncherFaceWidth(taskbar);
+    taskbar.classList.add("is-launcher-face");
+    setLauncherDomOpen(true);
+    syncFaceAria({ agent: false, launcher: true });
+    return;
+  }
+  if (taskbar.classList.contains("is-launcher-face") && !taskbar.dataset.agentMorph) {
+    setLauncherDomOpen(true);
+    return;
+  }
+  if (agentShelfFaceActive()) {
+    /* Snap Agent closed so Apps morph owns the dock. */
+    morphGeneration += 1;
+    clearMorphTimer();
+    clearBoxLock(taskbar);
+    taskbar.classList.remove("is-agent-face");
+    setMorphPhase(taskbar, "");
+    document.querySelector("#agent-shelf-toggle")?.setAttribute("aria-pressed", "false");
+    setAgentComposerProcessing(false);
+    void harnessApi().then((harness) => {
+      harness.hideAgentHarness({ restoreShelfApps: false, syncStage: true });
+    });
+  }
+
+  /* Capture idle dock width before any face class — morph grows height only. */
+  lockLauncherFaceWidth(taskbar);
+
+  if (prefersReducedMotion()) {
+    morphGeneration += 1;
+    clearMorphTimer();
+    clearBoxLock(taskbar);
+    taskbar.classList.remove("is-agent-face");
+    taskbar.classList.add("is-launcher-face");
+    taskbar.dataset.launcherMorphing = "1";
+    setMorphPhase(taskbar, "enter");
+    setLauncherDomOpen(true);
+    syncFaceAria({ agent: false, launcher: true });
+    delete taskbar.dataset.launcherMorphing;
+    return;
+  }
+
+  const generation = (morphGeneration += 1);
+  clearMorphTimer();
+  taskbar.dataset.launcherMorphing = "1";
+  /* Calm mag for the stretch only — otherwise lifted icons “fall into place”. */
+  calmDockIconsForMorph(taskbar);
+
+  setLauncherDomOpen(true);
+  setMorphPhase(taskbar, "exit");
+  syncFaceAria({ agent: false, launcher: false });
+
+  scheduleMorph(generation, MORPH_EXIT_MS, () => {
+    setMorphPhase(taskbar, "grow");
+    syncFaceAria({ agent: false, launcher: true });
+
+    flipTaskbarGeometry(
+      taskbar,
+      () => {
+        taskbar.classList.remove("is-agent-face");
+        taskbar.classList.add("is-launcher-face");
+      },
+      MORPH_STRETCH_MS,
+      { freezeHorizontal: true },
+    );
+
+    scheduleMorph(generation, MORPH_ENTER_AT_MS, () => {
+      if (generation !== morphGeneration) {
+        return;
+      }
+      setMorphPhase(taskbar, "enter");
+    });
+
+    window.setTimeout(() => {
+      if (generation !== morphGeneration) {
+        return;
+      }
+      clearBoxLock(taskbar);
+      /* Keep pixel width after FLIP unlock — CSS vars don't ease on pin. */
+      const lockedW = taskbar.style.getPropertyValue("--shelf-launcher-w").trim();
+      if (lockedW) {
+        taskbar.style.width = lockedW;
+      }
+      delete taskbar.dataset.launcherMorphing;
+    }, MORPH_STRETCH_MS + 32);
+  });
+}
+
+export function hideLauncherShelfFace({ snap = false } = {}) {
+  const taskbar = taskbarEl();
+  const toggle = document.querySelector("#launcher-toggle");
+  if (!taskbar) {
+    setLauncherDomOpen(false);
+    return;
+  }
+
+  if (!taskbar.classList.contains("is-launcher-face") && !taskbar.dataset.launcherMorphing) {
+    setLauncherDomOpen(false);
+    return;
+  }
+
+  const generation = (morphGeneration += 1);
+  clearMorphTimer();
+
+  const finishClosed = () => {
+    /* Hold open-face width through the class swap — dismiss is height-only. */
+    const heldW = Math.round(taskbar.getBoundingClientRect().width);
+    clearBoxLock(taskbar);
+    delete taskbar.dataset.launcherMorphing;
+    taskbar.classList.remove("is-launcher-face", "is-launcher-closing");
+    clearLauncherFaceWidth(taskbar);
+    if (heldW > 0) {
+      taskbar.style.width = `${heldW}px`;
+    }
+    setMorphPhase(taskbar, "");
+    setLauncherDomOpen(false);
+    syncFaceAria({ agent: false, launcher: false });
+    toggle?.focus({ preventScroll: true });
+  };
+
+  if (snap || prefersReducedMotion() || !taskbar.classList.contains("is-launcher-face")) {
+    finishClosed();
+    return;
+  }
+
+  taskbar.dataset.launcherMorphing = "1";
+  calmDockIconsForMorph(taskbar);
+  setMorphPhase(taskbar, "leave");
+  syncFaceAria({ agent: false, launcher: true });
+
+  scheduleMorph(generation, MORPH_LEAVE_MS, () => {
+    setMorphPhase(taskbar, "shrink");
+    syncFaceAria({ agent: false, launcher: false });
+
+    /*
+      Keep is-launcher-face through the FLIP and only add is-launcher-closing
+      (height → dock). Height-only FLIP — no width/padding (side-nudge).
+    */
+    flipTaskbarGeometry(
+      taskbar,
+      () => {
+        taskbar.classList.add("is-launcher-closing");
+      },
+      MORPH_STRETCH_MS,
+      { freezeHorizontal: true },
+    );
+
+    scheduleMorph(generation, MORPH_STRETCH_MS, () => {
+      finishClosed();
+    });
+  });
+}
+
 export function bindAgentShelf() {
   if (bound) {
     return;
@@ -481,6 +762,12 @@ export function bindAgentShelf() {
     /* Esc always exits the full Agent dance (harness + Shelf) via hideAgentShelfFace. */
     isActive: () => agentShelfFaceActive(),
     dismiss: () => hideAgentShelfFace(),
+  });
+
+  registerEscapeHandler("launcher-shelf", {
+    priority: 74,
+    isActive: () => launcherShelfFaceActive(),
+    dismiss: () => hideLauncherShelfFace(),
   });
 
   document.addEventListener("click", (event) => {

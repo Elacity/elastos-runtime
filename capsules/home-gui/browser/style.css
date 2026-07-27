@@ -1791,13 +1791,69 @@ img {
 
 .desktop-shortcut-ghost {
   position: fixed;
-  z-index: 1002;
+  /* Above Shelf/dock (100100) so drag isn't trapped behind the pill. */
+  z-index: 100150;
   margin: 0;
   pointer-events: none;
   background: rgba(14, 17, 22, 0.18);
   backdrop-filter: blur(12px);
   user-select: none;
   -webkit-user-select: none;
+}
+
+/* In-dock reorder: icon-sized ghost that rides above the Shelf. */
+.dock-reorder-ghost {
+  position: fixed;
+  z-index: 100160;
+  margin: 0;
+  padding: 0;
+  pointer-events: none;
+  border-radius: 14px;
+  overflow: visible;
+  filter: drop-shadow(0 12px 22px rgba(0, 0, 0, 0.38));
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.dock-reorder-ghost .taskbar-icon {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+}
+
+.dock-reorder-spacer {
+  flex: 0 0 auto;
+  pointer-events: none;
+  visibility: hidden;
+}
+
+.taskbar-entry.dock-reorder-parked {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+  width: 0;
+  min-width: 0;
+  height: 0;
+  margin: 0;
+  overflow: hidden;
+  order: 0;
+}
+
+body.dock-reordering .taskbar-sortable {
+  /* Spacer + flex order do the nudge — drop plate would fight the live gap. */
+  background: transparent;
+  box-shadow: none;
+}
+
+body.dock-reordering .taskbar-entry:not(.dock-reorder-parked) {
+  transition: transform 160ms var(--shelf-morph-ease, cubic-bezier(0.42, 0, 0.58, 1));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body.dock-reordering .taskbar-entry:not(.dock-reorder-parked) {
+    transition: none;
+  }
 }
 
 /* Quick Look: frameless centered preview over the desktop. No dim overlay —
@@ -3353,6 +3409,12 @@ body.dock-autohide::after {
   box-shadow: inset 0 0 0 1px var(--hairline);
 }
 
+/* Drag pinned icon into the running/Bin side — unpin (leave core). */
+.taskbar-sortable.drop-unpin-active {
+  background: color-mix(in srgb, var(--el-accent, #4f7fff) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--el-accent, #4f7fff) 45%, transparent);
+}
+
 .taskbar-item {
   position: relative;
   width: var(--dock-icon-slot);
@@ -3698,6 +3760,12 @@ body.dock-autohide::after {
   height: auto;
   min-height: 108px;
   max-height: min(72vh, 520px);
+  /* Clip growing transcript — never spill text outside the glass pill. */
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
   /* Always viewport-centered — never nudged by sidebar/outputs. */
   left: 0;
   right: 0;
@@ -3940,7 +4008,8 @@ body.agent-harness-active .taskbar.is-agent-face {
   gap: 4px;
   min-width: 0;
   min-height: 0;
-  padding: 18px 14px calc(var(--harness-composer-clearance) + 8px);
+  /* Tight top — Agent + icons sit with the bar, no floaty gap. */
+  padding: 10px 12px calc(var(--harness-composer-clearance) + 8px);
   border-right: 0.5px solid color-mix(in srgb, var(--text) 8%, transparent);
   background: var(--harness-rail);
 }
@@ -3956,30 +4025,94 @@ body.agent-harness-active .taskbar.is-agent-face {
   justify-content: space-between;
   gap: 8px;
   min-width: 0;
+  min-height: 36px;
+  margin: 0 0 2px;
 }
 
-.agent-harness-drawer-close {
-  display: none;
+.agent-harness-sidebar-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+}
+
+.agent-harness-icon-btn {
   appearance: none;
   flex: 0 0 auto;
   width: 32px;
   height: 32px;
-  margin: 0 0 8px;
+  margin: 0;
   padding: 0;
   border: 0;
   border-radius: 8px;
   background: transparent;
-  color: color-mix(in srgb, var(--text) 70%, transparent);
-  font: inherit;
-  font-size: 22px;
-  line-height: 1;
+  color: color-mix(in srgb, var(--text) 72%, transparent);
   cursor: pointer;
+  display: grid;
   place-items: center;
 }
 
-.agent-harness-drawer-close:hover {
+.agent-harness-icon-btn:hover {
   background: color-mix(in srgb, var(--text) 8%, transparent);
   color: var(--text);
+}
+
+/* Claude-style panel glyph — rounded rect with left rail. */
+.agent-harness-icon-panel {
+  display: block;
+  width: 16px;
+  height: 14px;
+  border: 1.5px solid currentColor;
+  border-radius: 3px;
+  background:
+    linear-gradient(currentColor, currentColor) left / 5px 100% no-repeat;
+  opacity: 0.92;
+  box-sizing: border-box;
+}
+
+.agent-harness-icon-search {
+  display: block;
+  width: 14px;
+  height: 14px;
+  border: 1.5px solid currentColor;
+  border-radius: 999px;
+  box-sizing: border-box;
+  position: relative;
+  opacity: 0.92;
+}
+
+.agent-harness-icon-search::after {
+  content: "";
+  position: absolute;
+  right: -3px;
+  bottom: -2px;
+  width: 6px;
+  height: 1.5px;
+  background: currentColor;
+  border-radius: 1px;
+  transform: rotate(45deg);
+  transform-origin: left center;
+}
+
+/* Desktop collapse — sidebar off; main expands; reopen via mobile-bar panel. */
+body.agent-harness-sidebar-collapsed .agent-harness-sidebar {
+  display: none;
+}
+
+body.agent-harness-sidebar-collapsed .agent-harness-main {
+  grid-column: 1 / -1;
+  /* Match open sidebar top inset so panel icon doesn’t jump up. */
+  padding-top: 10px;
+}
+
+body.agent-harness-sidebar-collapsed .agent-harness-mobile-bar {
+  display: flex;
+  min-height: 36px;
+  padding: 0 12px 8px;
+}
+
+body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
+  display: grid;
 }
 
 .agent-harness-mobile-bar {
@@ -3987,8 +4120,8 @@ body.agent-harness-active .taskbar.is-agent-face {
   flex: 0 0 auto;
   align-items: center;
   gap: 10px;
-  min-height: 44px;
-  padding: 0 12px 8px;
+  min-height: 36px;
+  padding: 0 10px 6px;
 }
 
 .agent-harness-drawer-toggle {
@@ -4000,20 +4133,19 @@ body.agent-harness-active .taskbar.is-agent-face {
   padding: 0;
   border: 0;
   border-radius: 10px;
-  background: color-mix(in srgb, var(--text) 8%, transparent);
+  background: transparent;
   color: var(--text);
   cursor: pointer;
   display: grid;
   place-items: center;
 }
 
-.agent-harness-drawer-toggle-mark {
-  display: block;
-  width: 16px;
-  height: 2px;
-  border-radius: 1px;
-  background: currentColor;
-  box-shadow: 0 -5px 0 currentColor, 0 5px 0 currentColor;
+.agent-harness-drawer-toggle:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+#agent-harness-search-open-main {
+  display: none;
 }
 
 .agent-harness-title {
@@ -4029,14 +4161,15 @@ body.agent-harness-active .taskbar.is-agent-face {
 }
 
 .agent-harness-brand {
-  padding: 2px 8px 10px;
-  font-size: 13px;
+  padding: 0;
+  font-size: 15px;
   font-weight: 650;
   letter-spacing: -0.02em;
+  line-height: 1.2;
 }
 
 .agent-harness-sidebar-head .agent-harness-brand {
-  padding-bottom: 2px;
+  padding: 0 4px 0 2px;
 }
 
 .agent-harness-new-chat,
@@ -4083,22 +4216,168 @@ body.agent-harness-active .taskbar.is-agent-face {
   mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M2.5 7.2 8 2.8l5.5 4.4V13a1 1 0 0 1-1 1H9.2v-3.2H6.8V14H3.5a1 1 0 0 1-1-1V7.2Z' stroke='black' stroke-width='1.4' stroke-linejoin='round'/%3E%3C/svg%3E") center / 14px no-repeat;
 }
 
-.agent-harness-search-wrap {
-  display: block;
-  margin: 0 0 8px;
+/* Session search — Claude-style modal (desktop) / full screen (narrow). */
+.agent-session-search {
+  position: fixed;
+  inset: 0;
+  z-index: 100130;
+  display: grid;
+  place-items: start center;
+  padding: calc(12vh + env(safe-area-inset-top, 0px)) 16px 24px;
+  background: color-mix(in srgb, var(--bg, #050608) 55%, transparent);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
 }
 
-.agent-harness-search {
-  width: 100%;
-  height: 30px;
+.agent-session-search[hidden] {
+  display: none;
+}
+
+.agent-session-search-panel {
+  width: min(520px, 100%);
+  max-height: min(72vh, 560px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--panel-strong, #16181d) 96%, transparent);
+  border: 0.5px solid color-mix(in srgb, var(--text) 12%, transparent);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.45);
+}
+
+.agent-session-search-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+  padding: 12px 12px 10px 14px;
+  border-bottom: 0.5px solid color-mix(in srgb, var(--text) 10%, transparent);
+}
+
+.agent-session-search-glyph {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  border: 1.5px solid color-mix(in srgb, var(--text) 55%, transparent);
+  border-radius: 999px;
+  box-sizing: border-box;
+  position: relative;
+  opacity: 0.85;
+}
+
+.agent-session-search-glyph::after {
+  content: "";
+  position: absolute;
+  right: -3px;
+  bottom: -2px;
+  width: 6px;
+  height: 1.5px;
+  background: color-mix(in srgb, var(--text) 55%, transparent);
+  border-radius: 1px;
+  transform: rotate(45deg);
+  transform-origin: left center;
+}
+
+.agent-session-search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 28px;
   margin: 0;
-  padding: 0 10px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  outline: none;
+}
+
+.agent-session-search-input::placeholder {
+  color: color-mix(in srgb, var(--text) 42%, transparent);
+}
+
+.agent-session-search-close {
+  appearance: none;
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  margin: 0;
+  padding: 0;
   border: 0;
   border-radius: 8px;
-  background: color-mix(in srgb, var(--text) 7%, transparent);
-  color: color-mix(in srgb, var(--text) 55%, transparent);
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 65%, transparent);
   font: inherit;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+}
+
+.agent-session-search-close:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+.agent-session-search-results {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px;
+  scrollbar-width: thin;
+}
+
+.agent-session-search-empty {
+  padding: 18px 12px;
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-size: 13px;
+  text-align: center;
+}
+
+.agent-session-search-row {
+  appearance: none;
+  width: 100%;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-session-search-row:hover,
+.agent-session-search-row.is-active {
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+}
+
+.agent-session-search-row-mark {
+  width: 16px;
+  height: 14px;
+  border: 1.4px solid color-mix(in srgb, var(--text) 55%, transparent);
+  border-radius: 3px;
+  opacity: 0.75;
+}
+
+.agent-session-search-row-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-session-search-row-when {
+  color: color-mix(in srgb, var(--text) 45%, transparent);
   font-size: 12px;
+  white-space: nowrap;
 }
 
 .agent-harness-sessions {
@@ -4225,6 +4504,49 @@ body.agent-harness-active .taskbar.is-agent-face {
   overflow: hidden;
 }
 
+/* Always-visible locality / tools truth (Plan Q.4 · fx4). Locked to composer column. */
+.agent-harness-truth {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  width: var(--agent-column-width);
+  max-width: 100%;
+  margin: 0 0 2px;
+  margin-left: var(--agent-column-left, 0px);
+  padding: 2px 0 10px;
+  box-sizing: border-box;
+  color: color-mix(in srgb, var(--text) 55%, transparent);
+  font-size: 11px;
+  font-weight: 560;
+  letter-spacing: -0.01em;
+}
+
+.agent-harness-truth-preview {
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: color-mix(in srgb, var(--text) 50%, transparent);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.agent-harness-truth [data-truth-local],
+.agent-harness-truth [data-truth-tools] {
+  padding: 2px 0;
+}
+
+.agent-harness-truth[data-tools="pending"] [data-truth-tools] {
+  color: color-mix(in srgb, var(--accent, #f97316) 70%, var(--text));
+}
+
+.agent-harness-truth[data-tools="live"] [data-truth-tools] {
+  color: color-mix(in srgb, var(--accent, #f97316) 85%, var(--text));
+}
+
 /* Scrollport fills the main column — no top chrome. Soft fade at top (Codex)
    and under the Shelf at the bottom. */
 .agent-harness-stream-viewport {
@@ -4281,7 +4603,8 @@ body.agent-harness-active .taskbar.is-agent-face {
 /* Empty hero: optical center of the room above the Shelf.
    Main sits beside the sidebar, so shift left by half sidebar width to
    align with the viewport-centered composer. Bottom inset = composer
-   clearance (no extra padding — that was pushing the block too high). */
+   clearance (no extra padding — that was pushing the block too high).
+   When the sidebar is collapsed, main is full-bleed — drop the shift. */
 .agent-harness-empty {
   position: absolute;
   top: 0;
@@ -4299,6 +4622,10 @@ body.agent-harness-active .taskbar.is-agent-face {
   text-align: center;
   pointer-events: none;
   transform: translateX(calc(var(--harness-sidebar-w) / -2));
+}
+
+body.agent-harness-sidebar-collapsed .agent-harness-empty {
+  transform: none;
 }
 
 .agent-harness-empty-greeting {
@@ -4385,6 +4712,119 @@ body.agent-harness-active .taskbar.is-agent-face {
   font-size: 12px;
   text-align: left;
   cursor: not-allowed;
+}
+
+/* Inbox-grammar grant card — preview mock only (UI ≠ authority). */
+.agent-grant-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  max-width: 100%;
+  margin: 2px 0 4px;
+  padding: 12px 14px;
+  border: 0.5px solid color-mix(in srgb, var(--text) 12%, transparent);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--harness-rail) 88%, var(--harness-room));
+  box-sizing: border-box;
+}
+
+.agent-grant-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.agent-grant-card-title {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.agent-grant-card-preview {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.agent-grant-card-summary {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.agent-grant-card-scope {
+  margin: 0;
+  color: color-mix(in srgb, var(--text) 52%, transparent);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.agent-grant-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+  padding-top: 10px;
+  border-top: 0.5px solid color-mix(in srgb, var(--text) 10%, transparent);
+}
+
+.agent-grant-btn {
+  appearance: none;
+  margin: 0;
+  padding: 7px 12px;
+  border: 0.5px solid color-mix(in srgb, var(--text) 14%, transparent);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.agent-grant-btn-allow {
+  background: var(--text);
+  border-color: var(--text);
+  color: var(--harness-room, #0a0a0b);
+}
+
+.agent-grant-btn-deny {
+  color: color-mix(in srgb, #ff8f8f 80%, var(--text));
+  border-color: color-mix(in srgb, #ff8f8f 32%, transparent);
+  background: color-mix(in srgb, #ff8f8f 10%, transparent);
+}
+
+.agent-grant-card-chip {
+  margin-top: 2px;
+  color: color-mix(in srgb, var(--text) 55%, transparent);
+  font-size: 11px;
+  font-weight: 560;
+}
+
+.agent-grant-card.is-denied .agent-grant-card-chip {
+  color: color-mix(in srgb, #ff8f8f 70%, var(--text));
+}
+
+.agent-grant-card-result {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: color-mix(in srgb, var(--text) 78%, transparent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
 }
 
 .agent-msg {
@@ -4555,6 +4995,10 @@ body.agent-harness-active .taskbar.is-agent-face {
     --harness-sidebar-w: min(320px, 86vw);
     --harness-outputs-w: 0px;
     --agent-column-width: min(720px, calc(100vw - 24px));
+    /* Same top inset open (sidebar head) and closed (mobile bar) — no jump. */
+    --harness-chrome-top: calc(14px + env(safe-area-inset-top, 0px));
+    --harness-drawer-ms: 420ms;
+    --harness-drawer-ease: cubic-bezier(0.22, 1, 0.36, 1);
   }
 
   #space-pager {
@@ -4569,20 +5013,13 @@ body.agent-harness-active .taskbar.is-agent-face {
     grid-template-columns: minmax(0, 1fr);
   }
 
+  /* Push sidebar (not dim overlay): rail slides in; main + dock nudge right. */
   .agent-harness-scrim {
-    display: none;
-    position: fixed;
-    inset: 0;
-    z-index: 5;
-    margin: 0;
-    padding: 0;
-    border: 0;
-    background: rgba(0, 0, 0, 0.38);
-    cursor: pointer;
+    display: none !important;
   }
 
-  .agent-harness-scrim:not([hidden]) {
-    display: block;
+  .agent-harness {
+    overflow: hidden;
   }
 
   .agent-harness-sidebar {
@@ -4595,16 +5032,16 @@ body.agent-harness-active .taskbar.is-agent-face {
     grid-row: auto;
     width: var(--harness-sidebar-w);
     max-width: 86vw;
-    padding-top: calc(12px + env(safe-area-inset-top, 0px));
-    padding-bottom: env(safe-area-inset-bottom, 0px);
-    box-shadow: 8px 0 32px rgba(0, 0, 0, 0.28);
+    padding: var(--harness-chrome-top) 12px
+      calc(12px + env(safe-area-inset-bottom, 0px));
+    border-right: 0;
+    box-shadow: none;
     opacity: 1;
     filter: none;
     transform: translateX(-105%);
-    transition:
-      transform 280ms var(--harness-ease),
-      box-shadow 280ms var(--harness-ease);
+    transition: transform var(--harness-drawer-ms) var(--harness-drawer-ease);
     pointer-events: auto;
+    will-change: transform;
   }
 
   .agent-harness.is-visible .agent-harness-sidebar {
@@ -4620,17 +5057,98 @@ body.agent-harness-active .taskbar.is-agent-face {
     pointer-events: auto;
   }
 
-  .agent-harness-drawer-close {
-    display: grid;
+  body.agent-harness-active.agent-harness-drawer-open .agent-harness {
+    z-index: 100120;
+    /* Behind the curve = sidebar rail; chat sheet stays room (separate). */
+    background: var(--harness-rail) !important;
+  }
+
+  /* Mobile: close is tap-the-chat — no panel/close glyph in the rail. */
+  #agent-harness-panel-toggle {
+    display: none !important;
   }
 
   .agent-harness-mobile-bar {
     display: flex;
+    align-items: center;
+    min-height: 40px;
+    /* Match sidebar head band — icon stays put open ↔ closed. */
+    padding: 2px 10px 8px;
+  }
+
+  #agent-harness-search-open-main {
+    display: grid;
+  }
+
+  body.agent-harness-drawer-open #agent-harness-drawer-open,
+  body.agent-harness-drawer-open #agent-harness-search-open-main {
+    display: none !important;
   }
 
   .agent-harness-main {
     grid-column: 1;
-    padding-top: calc(10px + env(safe-area-inset-top, 0px));
+    padding-top: var(--harness-chrome-top);
+    transition:
+      transform var(--harness-drawer-ms) var(--harness-drawer-ease),
+      border-radius var(--harness-drawer-ms) var(--harness-drawer-ease),
+      box-shadow var(--harness-drawer-ms) var(--harness-drawer-ease);
+    will-change: transform;
+  }
+
+  .agent-harness.is-visible .agent-harness-main {
+    transition:
+      opacity 560ms var(--harness-ease),
+      filter 640ms var(--harness-ease),
+      transform var(--harness-drawer-ms) var(--harness-drawer-ease),
+      border-radius var(--harness-drawer-ms) var(--harness-drawer-ease),
+      box-shadow var(--harness-drawer-ms) var(--harness-drawer-ease);
+  }
+
+  /* Push sheet + curve only — no border/depth experiments (settled). */
+  body.agent-harness-drawer-open .agent-harness.is-visible .agent-harness-main {
+    transform: translateX(calc(min(var(--harness-sidebar-w), 86vw) - 2px));
+    border-radius: 36px 0 0 36px;
+    border: 0;
+    box-shadow: none;
+    overflow: hidden;
+    background: var(--harness-room);
+  }
+
+  body.agent-harness-drawer-open .taskbar.is-agent-face {
+    /* Same translate as main — stream column ↔ composer stay locked. */
+    transform: translateX(calc(min(var(--harness-sidebar-w), 86vw) - 2px));
+    transition: transform var(--harness-drawer-ms) var(--harness-drawer-ease);
+    will-change: transform;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .agent-harness-sidebar,
+    .agent-harness-main,
+    .agent-harness.is-visible .agent-harness-main,
+    body.agent-harness-drawer-open .taskbar.is-agent-face {
+      transition-duration: 1ms !important;
+    }
+  }
+
+  .agent-session-search {
+    padding: 0;
+    place-items: stretch;
+    background: var(--bg, #050608);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+
+  .agent-session-search-panel {
+    width: 100%;
+    max-height: none;
+    height: 100%;
+    border-radius: 0;
+    border: 0;
+    box-shadow: none;
+  }
+
+  .agent-session-search-bar {
+    padding-top: calc(12px + env(safe-area-inset-top, 0px));
   }
 
   .agent-harness-empty {
@@ -4644,27 +5162,86 @@ body.agent-harness-active .taskbar.is-agent-face {
     max-width: 16ch;
   }
 
-  /* Minimal composer — Home + field + mic/send; hide stub chrome. */
+  /* Snug composer — Home + Local pill + mic/send; hide Approve/+ only. */
   .taskbar.is-agent-face {
     width: var(--agent-column-width, calc(100vw - 24px));
     max-width: calc(100vw - 24px);
     min-height: 0;
-    max-height: min(42vh, 300px);
-    padding-bottom: env(safe-area-inset-bottom, 0px);
+    max-height: min(42vh, 280px);
+    padding: 12px 12px calc(10px + env(safe-area-inset-bottom, 0px));
+    border-radius: 24px;
+  }
+
+  .taskbar.is-agent-face .shelf-morph-stage {
+    min-height: 0;
+  }
+
+  .taskbar.is-agent-face .agent-composer {
+    min-height: 0;
+    max-height: 100%;
+    gap: 8px;
+    justify-content: flex-start;
+    overflow: hidden;
   }
 
   .taskbar.is-agent-face .agent-approve-btn,
-  .taskbar.is-agent-face .agent-composer-tools-left > .agent-tool-btn,
-  .taskbar.is-agent-face .agent-model-btn {
+  .taskbar.is-agent-face .agent-composer-tools-left > .agent-tool-btn {
     display: none !important;
   }
 
   .taskbar.is-agent-face .agent-composer-toolbar {
-    gap: 8px;
+    gap: 6px;
+    min-height: 36px;
+    align-items: center;
+  }
+
+  .taskbar.is-agent-face .agent-composer-tools-left,
+  .taskbar.is-agent-face .agent-composer-tools-right {
+    height: 36px;
+    gap: 6px;
+    align-items: center;
+  }
+
+  .taskbar.is-agent-face .agent-composer-tools-right {
+    margin-left: auto;
+  }
+
+  /* Compact Local model chip (ChatGPT "High ▾" role — shortened). */
+  .taskbar.is-agent-face .agent-model-btn {
+    display: inline-flex !important;
+    height: 32px;
+    padding: 0 10px;
+    background: color-mix(in srgb, var(--text) 8%, transparent);
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .taskbar.is-agent-face .agent-model-tier {
+    display: none;
+  }
+
+  .taskbar.is-agent-face .agent-flip-back {
+    height: 32px;
+    padding: 0 8px;
+    display: inline-flex;
+    align-items: center;
+  }
+
+  .taskbar.is-agent-face .agent-mic-btn,
+  .taskbar.is-agent-face .agent-send-btn {
+    width: 34px;
+    height: 34px;
+    flex: 0 0 auto;
+    align-self: center;
   }
 
   .taskbar.is-agent-face .agent-composer-input {
     font-size: 16px; /* iOS zoom guard */
+    min-height: 24px;
+    max-height: min(28vh, 180px); /* JS tightens further to pill chrome */
+    padding-top: 0;
+    overflow-y: auto;
   }
 }
 
@@ -4673,13 +5250,24 @@ body.agent-harness-active .taskbar.is-agent-face {
 }
 
 .taskbar.is-agent-face .taskbar-inner {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
   width: 100%;
+  min-height: 0;
+  max-height: 100%;
   align-items: stretch;
+  overflow: hidden;
 }
 
 .taskbar.is-agent-face .shelf-morph-stage {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
   width: 100%;
-  min-height: 80px;
+  min-height: 0;
+  max-height: 100%;
+  overflow: hidden;
 }
 
 .taskbar.is-agent-face .shelf-face-apps {
@@ -4701,14 +5289,20 @@ body.agent-harness-active .taskbar.is-agent-face {
 .taskbar.is-agent-face .shelf-face-agent {
   position: relative;
   inset: auto;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
   width: 100%;
-  min-height: 80px;
+  min-height: 0;
+  max-height: 100%;
+  overflow: hidden;
   opacity: 1;
   visibility: visible;
 }
 
-/* Dock → AI: dissolve in place — opacity/blur only (no translate/scale drift). */
-.taskbar[data-agent-morph="exit"] .shelf-morph-exit,
+/* Dock → AI: dissolve in place — opacity/blur only (no translate/scale drift).
+   Apps launcher morph keeps dock icons (data-launcher-morphing) — exclude. */
+.taskbar[data-agent-morph="exit"]:not([data-launcher-morphing]) .shelf-morph-exit,
 .taskbar.is-agent-face .shelf-morph-exit {
   opacity: 0;
   transform: none;
@@ -4716,34 +5310,34 @@ body.agent-harness-active .taskbar.is-agent-face {
   pointer-events: none;
 }
 
-.taskbar[data-agent-morph="exit"] .shelf-morph-exit .taskbar-icon,
+.taskbar[data-agent-morph="exit"]:not([data-launcher-morphing]) .shelf-morph-exit .taskbar-icon,
 .taskbar.is-agent-face .shelf-morph-exit .taskbar-icon {
   /* Kill dock-mag lift/scale so dissolve stays planted. */
   transform: none !important;
 }
 
 /* Reverse of restore order: targets → divider → Apps → Agent. */
-.taskbar[data-agent-morph="exit"] .shelf-morph-exit[data-morph-exit="3"],
+.taskbar[data-agent-morph="exit"]:not([data-launcher-morphing]) .shelf-morph-exit[data-morph-exit="3"],
 .taskbar.is-agent-face .shelf-morph-exit[data-morph-exit="3"] {
   transition-delay: 120ms;
 }
 
-.taskbar[data-agent-morph="exit"] .shelf-morph-exit[data-morph-exit="2"],
+.taskbar[data-agent-morph="exit"]:not([data-launcher-morphing]) .shelf-morph-exit[data-morph-exit="2"],
 .taskbar.is-agent-face .shelf-morph-exit[data-morph-exit="2"] {
   transition-delay: 160ms;
 }
 
-.taskbar[data-agent-morph="exit"] .shelf-morph-exit[data-morph-exit="1"],
+.taskbar[data-agent-morph="exit"]:not([data-launcher-morphing]) .shelf-morph-exit[data-morph-exit="1"],
 .taskbar.is-agent-face .shelf-morph-exit[data-morph-exit="1"] {
   transition-delay: 200ms;
 }
 
-.taskbar[data-agent-morph="exit"] .shelf-morph-exit[data-morph-exit="0"],
+.taskbar[data-agent-morph="exit"]:not([data-launcher-morphing]) .shelf-morph-exit[data-morph-exit="0"],
 .taskbar.is-agent-face .shelf-morph-exit[data-morph-exit="0"] {
   transition-delay: 240ms;
 }
 
-.taskbar[data-agent-morph="exit"] #space-pager {
+.taskbar[data-agent-morph="exit"]:not([data-launcher-morphing]) #space-pager {
   opacity: 0;
   pointer-events: none;
 }
@@ -4790,28 +5384,28 @@ body.agent-harness-active .taskbar.is-agent-face {
 }
 
 .taskbar[data-agent-morph="shrink"] .shelf-morph-exit,
-.taskbar:not(.is-agent-face):not([data-agent-morph="exit"]) .shelf-morph-exit {
+.taskbar:not(.is-agent-face):not(.is-launcher-face):not([data-agent-morph="exit"]) .shelf-morph-exit {
   transition-duration: 280ms;
   transition-timing-function: var(--shelf-morph-ease);
 }
 
 .taskbar[data-agent-morph="shrink"] .shelf-morph-exit[data-morph-exit="0"],
-.taskbar:not(.is-agent-face):not([data-agent-morph="exit"]) .shelf-morph-exit[data-morph-exit="0"] {
+.taskbar:not(.is-agent-face):not(.is-launcher-face):not([data-agent-morph="exit"]) .shelf-morph-exit[data-morph-exit="0"] {
   transition-delay: 120ms;
 }
 
 .taskbar[data-agent-morph="shrink"] .shelf-morph-exit[data-morph-exit="1"],
-.taskbar:not(.is-agent-face):not([data-agent-morph="exit"]) .shelf-morph-exit[data-morph-exit="1"] {
+.taskbar:not(.is-agent-face):not(.is-launcher-face):not([data-agent-morph="exit"]) .shelf-morph-exit[data-morph-exit="1"] {
   transition-delay: 160ms;
 }
 
 .taskbar[data-agent-morph="shrink"] .shelf-morph-exit[data-morph-exit="2"],
-.taskbar:not(.is-agent-face):not([data-agent-morph="exit"]) .shelf-morph-exit[data-morph-exit="2"] {
+.taskbar:not(.is-agent-face):not(.is-launcher-face):not([data-agent-morph="exit"]) .shelf-morph-exit[data-morph-exit="2"] {
   transition-delay: 200ms;
 }
 
 .taskbar[data-agent-morph="shrink"] .shelf-morph-exit[data-morph-exit="3"],
-.taskbar:not(.is-agent-face):not([data-agent-morph="exit"]) .shelf-morph-exit[data-morph-exit="3"] {
+.taskbar:not(.is-agent-face):not(.is-launcher-face):not([data-agent-morph="exit"]) .shelf-morph-exit[data-morph-exit="3"] {
   transition-delay: 240ms;
 }
 
@@ -4828,12 +5422,15 @@ body.agent-harness-active .taskbar.is-agent-face {
   box-sizing: border-box;
   width: 100%;
   min-width: 0;
-  min-height: 80px;
+  min-height: 0;
+  flex: 1 1 auto;
+  max-height: 100%;
   display: flex;
   flex-direction: column;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 12px;
   padding: 0;
+  overflow: hidden;
 }
 
 .agent-composer-field {
@@ -4841,6 +5438,8 @@ body.agent-harness-active .taskbar.is-agent-face {
   margin: 0;
   flex: 1 1 auto;
   min-height: 28px;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .agent-composer-input {
@@ -4900,6 +5499,7 @@ body.agent-harness-active .taskbar.is-agent-face {
 
 .agent-composer-toolbar {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
@@ -5258,19 +5858,25 @@ body.agent-harness-active .taskbar.is-agent-face {
   display: none;
 }
 
-.launcher {
-  position: fixed;
+/* Apps launcher lives as a Shelf face (morph from dock). Not a floating overlay. */
+.shelf-face-launcher.launcher {
+  position: absolute;
   inset: 0;
-  z-index: 100110;
-  display: grid;
-  place-items: center;
-  padding: calc(56px + env(safe-area-inset-top, 0px)) 18px calc(88px + env(safe-area-inset-bottom, 0px));
-  /* Apps-panel surface (macOS style): the overlay only catches clicks; the
-     modal card below carries the one blurred material — no nested blurs. */
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
   background: transparent;
+  opacity: 0;
+  pointer-events: none;
+  visibility: hidden;
 }
 
-.launcher[hidden] {
+.shelf-face-launcher.launcher[hidden] {
   display: none;
 }
 
@@ -5621,38 +6227,345 @@ body.dragging-target {
   position: relative;
   display: flex;
   flex-direction: column;
-  width: min(680px, 100%);
-  /* Fixed panel size (macOS Apps panel): switching grid/list or filtering
-     changes what's inside, never the box itself. Sized so the icon grid
-     fills it (~4 ranks); longer content scrolls. */
-  height: min(64dvh, 512px);
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
   padding: 0;
   overflow: hidden;
   color: var(--text);
-  border-radius: 20px;
-  background: var(--menu-fill);
-  border: 0.5px solid var(--line);
-  box-shadow: var(--shadow);
-  backdrop-filter: blur(24px);
-  -webkit-backdrop-filter: blur(24px);
-  animation: launcher-enter 160ms cubic-bezier(0.2, 0, 0, 1) both;
+  /* Material is the Shelf dock glass — panel itself is transparent. */
+  border-radius: inherit;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  animation: none;
 }
 
-@keyframes launcher-enter {
-  0% {
-    opacity: 0;
-    transform: scale(0.97) translateY(6px);
-  }
-  100% {
-    opacity: 1;
-    transform: scale(1) translateY(0);
-  }
+/*
+  Apps Shelf face — height grows up from the floor.
+  justify-content:flex-end is mandatory: default .taskbar align-items:center
+  would vertically center the dock mid-shrink (the jump-up bug).
+*/
+.taskbar.is-launcher-face,
+.taskbar.is-launcher-closing,
+.taskbar[data-launcher-morphing] {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-end;
+}
+
+.taskbar.is-launcher-face {
+  /* Pixel width set in JS (inline) so width can interpolate — CSS vars jump. */
+  width: var(--shelf-launcher-w, max-content);
+  max-width: calc(100vw - 20px);
+  height: min(64dvh, 512px);
+  min-height: min(64dvh, 512px);
+  max-height: min(64dvh, 512px);
+  /* Settled: visible so dock-mag can lift above the pill. */
+  overflow: visible;
+  left: 0;
+  right: 0;
+  margin-inline: auto;
+  /* Same horizontal padding as idle dock — padding FLIP was the side-nudge. */
+  padding-left: 14px;
+  padding-right: 14px;
+  border-radius: 20px;
+  background-color: var(--dock-fill);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.28);
+}
+
+/* Liquid dock width — keep in sync with DOCK_WIDTH_MS in shell-surface.js. */
+:root {
+  --dock-width-ms: 780ms;
+}
+
+.taskbar.is-launcher-face.is-launcher-width-easing,
+.taskbar.is-dock-width-easing {
+  transition: width var(--dock-width-ms) var(--shelf-morph-ease, cubic-bezier(0.42, 0, 0.58, 1));
+}
+
+.launcher-fly-icon {
+  position: fixed;
+  z-index: 100200;
+  margin: 0;
+  padding: 0;
+  pointer-events: none;
+  border-radius: 14px;
+  transform: translate(0, 0) scale(1);
+  opacity: 1;
+  transition:
+    transform var(--dock-width-ms) var(--shelf-morph-ease, cubic-bezier(0.42, 0, 0.58, 1)),
+    opacity var(--dock-width-ms) var(--shelf-morph-ease, cubic-bezier(0.42, 0, 0.58, 1));
+  will-change: transform, opacity;
+  filter: drop-shadow(0 12px 22px rgba(0, 0, 0, 0.3));
+}
+
+/* Soft companion fly — fade in the dock slot owns the land. */
+.launcher-fly-icon.launcher-fly-icon-soft {
+  transition:
+    transform 520ms var(--shelf-morph-ease, cubic-bezier(0.42, 0, 0.58, 1)),
+    opacity 520ms var(--shelf-morph-ease, cubic-bezier(0.42, 0, 0.58, 1));
+}
+
+.launcher-card.is-flying-to-dock {
+  opacity: 0.2;
+  transform: scale(0.9);
+  filter: blur(2px);
+  transition:
+    opacity 280ms var(--shelf-morph-ease, cubic-bezier(0.42, 0, 0.58, 1)),
+    transform 280ms var(--shelf-morph-ease, cubic-bezier(0.42, 0, 0.58, 1)),
+    filter 280ms ease;
+  pointer-events: none;
+}
+
+/*
+  Reserved dock slot: invisible while width opens + Bin rides apart,
+  then fades/scales into the gap (is-dock-arrived).
+*/
+.taskbar-item.is-receiving-fly,
+.taskbar-item.is-dock-arriving {
+  opacity: 0 !important;
+  pointer-events: none;
+  transform: scale(0.86);
+  will-change: opacity, transform;
+}
+
+.taskbar-item.is-receiving-fly:not(.is-dock-arriving) {
+  transform: none;
+}
+
+/* Bin (+ divider) only — never FLIP the AI/Apps/pin strip. */
+.taskbar-entry[data-dock-bin="true"].is-dock-bin-sliding,
+.taskbar-separator[data-dock-bin-sep="true"].is-dock-bin-sliding {
+  will-change: transform;
+  z-index: 2;
+}
+
+/* Only the riding Bin — never kill mag transitions on the rest of the strip. */
+body.dock-bin-sliding .is-dock-bin-sliding .taskbar-icon {
+  transition: none !important;
+}
+
+.taskbar-item.is-dock-arriving.is-dock-arrived,
+.taskbar-item.is-receiving-fly.is-fly-landed {
+  opacity: 1 !important;
+  transform: scale(1);
+  transition:
+    opacity 360ms var(--shelf-morph-ease, cubic-bezier(0.42, 0, 0.58, 1)),
+    transform 420ms var(--shelf-morph-ease, cubic-bezier(0.42, 0, 0.58, 1));
+}
+
+.taskbar-item.is-receiving-fly .taskbar-icon,
+.taskbar-item.is-dock-arriving .taskbar-icon {
+  transform: none;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .launcher-popover {
-    animation: none;
+  .taskbar.is-launcher-face.is-launcher-width-easing,
+  .taskbar.is-dock-width-easing {
+    transition: none;
   }
+
+  .launcher-fly-icon,
+  .launcher-fly-icon.launcher-fly-icon-soft,
+  .launcher-card.is-flying-to-dock,
+  .taskbar-item.is-receiving-fly .taskbar-icon,
+  .taskbar-item.is-receiving-fly.is-fly-landed,
+  .taskbar-item.is-dock-arriving,
+  .taskbar-item.is-dock-arriving.is-dock-arrived,
+  .taskbar-entry[data-dock-bin="true"].is-dock-bin-sliding,
+  .taskbar-separator[data-dock-bin-sep="true"].is-dock-bin-sliding {
+    transition: none;
+  }
+}
+
+/* Clip only while height FLIPs — settled face stays overflow:visible for mag. */
+.taskbar.is-launcher-face[data-agent-morph="grow"],
+.taskbar.is-launcher-face[data-agent-morph="shrink"],
+.taskbar.is-launcher-face.is-launcher-closing,
+.taskbar[data-launcher-morphing] {
+  overflow: hidden;
+}
+
+.taskbar.is-launcher-face[data-agent-morph="grow"]::after,
+.taskbar.is-launcher-face[data-agent-morph="shrink"]::after {
+  animation: shelf-liquid-sheen var(--shelf-morph-duration) var(--shelf-morph-ease) both;
+}
+
+.taskbar.is-launcher-face #space-pager {
+  display: none !important;
+}
+
+.taskbar.is-launcher-face .taskbar-inner,
+.taskbar.is-launcher-face .shelf-morph-stage,
+.taskbar[data-launcher-morphing] .taskbar-inner,
+.taskbar[data-launcher-morphing] .shelf-morph-stage {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  max-height: 100%;
+  position: relative;
+  overflow: visible;
+}
+
+.taskbar.is-launcher-face .shelf-face-agent {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/*
+  Planted on the Shelf floor. Left-aligned so width growth opens on the Bin
+  side — AI/Apps/pins stay put (centering was sliding the whole strip).
+*/
+.taskbar.is-launcher-face .shelf-face-apps,
+.taskbar.is-launcher-closing .shelf-face-apps,
+.taskbar[data-launcher-morphing] .shelf-face-apps {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  top: auto;
+  z-index: 4;
+  width: 100%;
+  max-width: 100%;
+  height: var(--taskbar-h);
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  transform: none;
+  overflow: visible;
+  pointer-events: auto;
+  opacity: 1;
+  visibility: visible;
+  filter: none;
+  border-top: 0.5px solid color-mix(in srgb, var(--text) 10%, transparent);
+  box-sizing: border-box;
+}
+
+.taskbar.is-launcher-face .shelf-face-apps .taskbar-primary,
+.taskbar.is-launcher-face .shelf-face-apps .taskbar-sortable {
+  max-width: none;
+}
+
+.taskbar.is-launcher-face .shelf-face-apps .taskbar-primary {
+  width: 100%;
+  justify-content: flex-start;
+}
+
+.taskbar.is-launcher-face .shelf-face-launcher {
+  position: relative;
+  inset: auto;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  max-height: 100%;
+  /* Clear the planted dock row so the grid never sits under icons. */
+  padding-bottom: var(--taskbar-h);
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+/*
+  Close path: keep is-launcher-face + add this — collapses height to dock
+  while flex-end keeps icons on the floor for the whole FLIP (no mid jump).
+*/
+.taskbar.is-launcher-face.is-launcher-closing {
+  height: var(--taskbar-h);
+  min-height: var(--taskbar-h);
+  max-height: var(--taskbar-h);
+  border-radius: 22px;
+}
+
+.taskbar.is-launcher-face.is-launcher-closing .shelf-face-launcher {
+  display: none;
+}
+
+.taskbar.is-launcher-face.is-launcher-closing .shelf-face-apps {
+  border-top: 0;
+}
+
+/* Beat .is-launcher-face flex:1 so the dock row stays floor-sized while height FLIPs. */
+.taskbar.is-launcher-face.is-launcher-closing .taskbar-inner,
+.taskbar.is-launcher-face.is-launcher-closing .shelf-morph-stage {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  flex: 0 0 auto;
+  width: 100%;
+  height: var(--taskbar-h);
+  min-height: var(--taskbar-h);
+  max-height: var(--taskbar-h);
+  overflow: hidden;
+}
+
+.taskbar.is-launcher-face[data-agent-morph="grow"] .shelf-face-launcher {
+  pointer-events: none;
+}
+
+.taskbar.is-launcher-face[data-agent-morph="grow"] .shelf-morph-enter,
+.taskbar.is-launcher-face[data-agent-morph="leave"] .shelf-morph-enter {
+  opacity: 0;
+  transform: translateY(12px) scale(0.97);
+  filter: blur(6px);
+  transition-delay: 0ms;
+}
+
+.taskbar.is-launcher-face[data-agent-morph="enter"] .shelf-face-launcher,
+.taskbar.is-launcher-face:not([data-agent-morph]) .shelf-face-launcher {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+
+.taskbar.is-launcher-face[data-agent-morph="enter"] .shelf-morph-enter,
+.taskbar.is-launcher-face:not([data-agent-morph]) .shelf-morph-enter {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  filter: blur(0);
+}
+
+.taskbar.is-launcher-face[data-agent-morph="enter"] .shelf-morph-enter[data-morph-enter="0"] {
+  transition-delay: 0ms;
+  transition-duration: 320ms;
+}
+
+.taskbar.is-launcher-face[data-agent-morph="enter"] .shelf-morph-enter[data-morph-enter="1"] {
+  transition-delay: 70ms;
+  transition-duration: 360ms;
+}
+
+/*
+  Apps face: no dissolve/blur on the dock row — but DO allow transform so
+  dock magnification still works while expanded.
+*/
+.taskbar[data-launcher-morphing] .shelf-morph-exit,
+.taskbar.is-launcher-face .shelf-morph-exit,
+.taskbar.is-launcher-closing .shelf-morph-exit {
+  opacity: 1;
+  filter: none;
+  pointer-events: auto;
+}
+
+.taskbar[data-launcher-morphing] .shelf-morph-exit .taskbar-icon,
+.taskbar.is-launcher-closing .shelf-morph-exit .taskbar-icon {
+  /* Only kill morph chrome during the FLIP — never settled-face mag. */
+  filter: none;
+  animation: none !important;
+}
+
+/* Dock-width panels are often narrower than the old 680 popup — denser tiles. */
+.taskbar.is-launcher-face .launcher-group-grid {
+  grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
+  gap: 8px 4px;
 }
 
 /* Header: borderless inline search (macOS Apps panel) with the view toggle
@@ -5915,6 +6828,18 @@ body.dragging-target {
   backdrop-filter: blur(24px);
   -webkit-backdrop-filter: blur(24px);
   animation: launcher-enter var(--shell-motion-enter) var(--shell-motion-enter-ease) both;
+}
+
+/* Shared enter keyframes — Spotlight (and former floating Apps) reuse this. */
+@keyframes launcher-enter {
+  0% {
+    opacity: 0;
+    transform: scale(0.97) translateY(6px);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
 }
 
 .spotlight-panel.launcher-leaving {
@@ -6703,15 +7628,76 @@ body.dragging-target {
   }
 }
 
+/* Part XI: phone Quick open lives in Control Centre — hide on wider chrome. */
+.control-centre-quick-open {
+  display: none;
+}
+
 @media (max-width: 640px) {
-  /* Phone shell: bar keeps brand · identity · clock; the focused-window title
-     and identity name yield the space. The clock never hides. */
+  /* Part XI phone bar: Brand · Overview · Control Centre · Clock.
+     Wallet / Inbox / Spotlight fold into Control Centre Quick open.
+     Hit targets grow via padding — glyphs stay desktop-scale (~16px). */
   .toolbar {
-    padding-right: 8px;
+    padding-right: 6px;
+    gap: 0;
   }
 
   .toolbar-btn {
-    margin-left: 7px;
+    margin-left: 4px;
+  }
+
+  /* Full wordmark, slightly compact — never clip (was showing “ELAST”). */
+  .toolbar-brand {
+    width: 88px;
+    min-width: 88px;
+    min-height: 32px;
+    height: 32px;
+    overflow: visible;
+    padding: 0;
+  }
+
+  .toolbar-brand img {
+    width: 88px;
+    height: auto;
+    max-width: 88px;
+  }
+
+  #toolbar-wallet,
+  #toolbar-inbox,
+  #toolbar-spotlight {
+    display: none !important;
+  }
+
+  /* 36px hit box; content-box + padding keeps icon ~16px (not 34px fill). */
+  #toolbar-mission-control,
+  #toolbar-control-centre {
+    width: 36px;
+    height: 36px;
+    min-width: 36px;
+    min-height: 36px;
+    padding: 10px;
+    background-size: 16px 16px;
+    background-origin: content-box;
+    background-position: center;
+  }
+
+  .toolbar-mission-btn .mission-control-glyph {
+    width: 16px;
+    height: 16px;
+  }
+
+  .toolbar-clock {
+    margin-left: 4px;
+    min-height: 36px;
+    padding: 0 4px;
+    display: inline-flex;
+    align-items: center;
+    font-size: 12px;
+    line-height: 1;
+  }
+
+  .control-centre-quick-open {
+    display: block;
   }
 
   .toolbar-active-title,
@@ -6719,9 +7705,38 @@ body.dragging-target {
     display: none;
   }
 
-  .launcher-popover {
-    width: calc(100vw - 24px);
-    height: calc(100dvh - 92px);
+  /* Apps Shelf face — phone: still dock-width (JS var); slightly shorter. */
+  .taskbar.is-launcher-face {
+    height: min(58dvh, 440px);
+    min-height: min(58dvh, 440px);
+    max-height: min(58dvh, 440px);
+    border-radius: 18px;
+  }
+
+  .launcher-scroll {
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+
+  /* Denser 4-up grid — 2-col + 1fr stretched icons left a dead middle gutter. */
+  .launcher[data-view="grid"] .launcher-group-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px 4px;
+  }
+
+  .launcher[data-view="grid"] .launcher-card-body {
+    grid-template-rows: 48px auto;
+    padding: 0.4rem 0.15rem 0.28rem;
+    gap: 0.35rem;
+  }
+
+  .launcher[data-view="grid"] .launcher-item-icon {
+    width: 48px;
+    height: 48px;
+  }
+
+  .launcher[data-view="grid"] .launcher-card-title {
+    font-size: 11px;
   }
 
   /* Windows fill the stage between bar and dock — apps read as full-screen. */

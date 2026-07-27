@@ -50,7 +50,7 @@ import {
   mutateDesktopObject,
   formatBadgeCount,
   focusModeEnabled,
-} from "./shell-core.js?v=home-20260724ap";
+} from "./shell-core.js?v=home-20260724ci";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -64,19 +64,19 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260724ap";
-import { playUiSound } from "./shell-sounds.js?v=home-20260724ap";
+} from "./shell-windows.js?v=home-20260724ci";
+import { playUiSound } from "./shell-sounds.js?v=home-20260724ci";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
   setOverlayOpen,
-} from "./shell-popovers.js?v=home-20260724ap";
+} from "./shell-popovers.js?v=home-20260724ci";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20260724ap";
-import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260724ap";
-import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260724ap";
+} from "./shell-motion.js?v=home-20260724ci";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260724ci";
+import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260724ci";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -382,7 +382,26 @@ function notificationCountsBySourceApp(summary) {
   return counts;
 }
 
-export function renderTaskbar(summary) {
+/**
+ * @param {object} summary
+ * @param {{ animateWidth?: boolean }} [options]
+ *   animateWidth — liquid expand/retract after close/unpin/pin membership changes.
+ *   Skipped while an Apps→dock open choreography owns the pill.
+ */
+export function renderTaskbar(summary, options = {}) {
+  const taskbar = document.querySelector(".taskbar");
+  /* Don’t fight Apps open breathe→ride→reveal with a second width anim. */
+  const animateWidth =
+    options.animateWidth === true &&
+    !dockFlyRevealTargetId &&
+    taskbar;
+  const fromW = animateWidth
+    ? Math.round(taskbar.getBoundingClientRect().width)
+    : null;
+  /* Close/unpin: capture Bin before remount so it can ride with the retract. */
+  const binFirsts = animateWidth ? captureBinSlideRects() : null;
+
+  prunePendingRunningDockIds();
   taskbarTargets.replaceChildren();
   const pinnedIds = new Set(shellState.shellLayoutState.taskbar);
   const notificationCounts = notificationCountsBySourceApp(summary);
@@ -406,10 +425,15 @@ export function renderTaskbar(summary) {
     const entry = taskbarItemTemplate.content.firstElementChild.cloneNode(true);
     const button = entry.querySelector(".taskbar-item");
     const openCount = browserWindowCount(app.target);
+    const pinned = pinnedIds.has(targetId);
     button.dataset.target = app.target;
     button.dataset.label = app.title;
+    button.dataset.pinned = pinned ? "true" : "false";
     mountGlyph(button.querySelector(".taskbar-item-icon"), app.target);
     button.dataset.openWindows = String(openCount);
+    if (dockFlyRevealTargetId === targetId) {
+      button.classList.add("is-receiving-fly", "is-dock-arriving");
+    }
     const badge = button.querySelector(".taskbar-notification-badge");
     const badgeLabel = formatBadgeCount(notificationCounts.get(app.target) || 0);
     if (badge) {
@@ -422,6 +446,12 @@ export function renderTaskbar(summary) {
   }
   appendTaskbarTrash(summary);
   updateTaskbarState();
+  /* Remount invalidates mag node refs — refresh so hover stays in front. */
+  refreshDockMagnificationAfterRemount();
+
+  if (fromW != null) {
+    void breatheDockWidthWithBinRide(fromW, binFirsts);
+  }
 }
 
 /* Trash anchors the right end of the dock, past its own divider (the macOS
@@ -435,14 +465,17 @@ function appendTaskbarTrash(summary) {
   if (taskbarTargets.childElementCount > 0) {
     const separator = document.createElement("span");
     separator.className = "taskbar-separator";
+    separator.dataset.dockBinSep = "true";
     separator.setAttribute("aria-hidden", "true");
     taskbarTargets.appendChild(separator);
   }
   const entryId = desktopObjectEntryId(trashObject);
   const entry = taskbarItemTemplate.content.firstElementChild.cloneNode(true);
+  entry.dataset.dockBin = "true";
   const button = entry.querySelector(".taskbar-item");
   const empty = trashObject.metadata?.empty !== false;
   button.dataset.label = "Bin";
+  button.dataset.dockBin = "true";
   button.setAttribute("aria-label", empty ? "Bin. Empty." : "Bin. Contains items.");
   mountGlyph(button.querySelector(".taskbar-item-icon"), empty ? "trash" : "trash-full");
   button.addEventListener("click", () => {
@@ -456,17 +489,66 @@ function appendTaskbarTrash(summary) {
       kind: "desktop-object",
       entryId,
       source: "taskbar",
+      keepLauncherOpen: true,
     });
   });
   taskbarTargets.appendChild(entry);
 }
 
+/*
+  Running-but-unpinned apps (opened from Apps, not dragged into the core pin
+  strip) live in this set until a real window registers — so the dock can
+  breathe a slot before the window exists. TTL drops failed launches.
+*/
+const pendingRunningDockIds = new Set();
+const pendingRunningDockStartedAt = new Map();
+const PENDING_RUNNING_DOCK_TTL_MS = 4000;
+/* While set, keep icon hidden across renderTaskbar remounts (breathe → reveal). */
+let dockFlyRevealTargetId = null;
+/* Ignore stale width-transition finishers when a newer breathe starts. */
+let dockWidthGeneration = 0;
+
+function notePendingRunningDock(id) {
+  pendingRunningDockIds.add(id);
+  pendingRunningDockStartedAt.set(id, Date.now());
+}
+
+function clearPendingRunningDock(id) {
+  pendingRunningDockIds.delete(id);
+  pendingRunningDockStartedAt.delete(id);
+}
+
+function prunePendingRunningDockIds() {
+  const now = Date.now();
+  for (const id of [...pendingRunningDockIds]) {
+    if (isTargetPinnedToTaskbar(id) || browserWindowCount(id) > 0) {
+      clearPendingRunningDock(id);
+      continue;
+    }
+    const started = pendingRunningDockStartedAt.get(id) || 0;
+    if (now - started > PENDING_RUNNING_DOCK_TTL_MS) {
+      clearPendingRunningDock(id);
+    }
+  }
+}
+
+function nextDockWidthGeneration() {
+  dockWidthGeneration += 1;
+  return dockWidthGeneration;
+}
+
 function visibleTaskbarTargets(summary) {
+  prunePendingRunningDockIds();
   const pinned = shellState.shellLayoutState.taskbar.filter(
     (targetId) => Boolean(targetById(summary, targetId)),
   );
   const openUnpinned = [];
-  for (const entry of sortWindowEntriesByZOrder(browserWindowEntries())) {
+  /*
+    Oldest → newest. New running apps land next to Bin (right), so opening
+    another doesn’t shove existing running icons sideways.
+  */
+  const runningOldestFirst = sortWindowEntriesByZOrder(browserWindowEntries()).reverse();
+  for (const entry of runningOldestFirst) {
     if (
       pinned.includes(entry.targetId) ||
       openUnpinned.includes(entry.targetId) ||
@@ -475,6 +557,17 @@ function visibleTaskbarTargets(summary) {
       continue;
     }
     openUnpinned.push(entry.targetId);
+  }
+  /* Optimistic slots — also append at the Bin edge (newest). */
+  for (const targetId of pendingRunningDockIds) {
+    if (
+      pinned.includes(targetId) ||
+      openUnpinned.includes(targetId) ||
+      !targetById(summary, targetId)
+    ) {
+      continue;
+    }
+    openUnpinned.push(targetId);
   }
   return [...pinned, ...openUnpinned];
 }
@@ -490,7 +583,9 @@ function commitTaskbarLayoutChange() {
   if (!shellState.currentSummary) {
     return;
   }
-  renderTaskbar(shellState.currentSummary);
+  renderTaskbar(shellState.currentSummary, { animateWidth: true });
+  /* Pin/unpin while Apps is open — refresh grid so dock ↔ list stay exclusive. */
+  refreshLauncherIfVisible();
 }
 
 function rerenderShellLayout() {
@@ -578,15 +673,25 @@ export function renderLauncher(summary) {
 }
 
 function launcherSections(summary) {
-  const runningIds = runningLauncherTargetIds(summary);
+  /* Shelf pins live in the dock row — never duplicate them in the Apps grid. */
+  const notOnShelf = (targetId) => !isTargetPinnedToTaskbar(targetId);
+  const runningIds = runningLauncherTargetIds(summary).filter(notOnShelf);
   const runningSet = new Set(runningIds);
   const recentIds = shellState.recentTargetIds.filter(
-    (targetId) => !runningSet.has(targetId) && targetById(summary, targetId),
+    (targetId) =>
+      notOnShelf(targetId) &&
+      !runningSet.has(targetId) &&
+      targetById(summary, targetId),
   );
   const recentSet = new Set(recentIds);
   const allIds = allVisibleTargets(summary)
     .map((app) => app.target)
-    .filter((targetId) => !runningSet.has(targetId) && !recentSet.has(targetId));
+    .filter(
+      (targetId) =>
+        notOnShelf(targetId) &&
+        !runningSet.has(targetId) &&
+        !recentSet.has(targetId),
+    );
   const allTargets = allIds.map((targetId) => targetById(summary, targetId)).filter(Boolean);
   return [
     {
@@ -721,8 +826,10 @@ export function openSelectedLauncherTarget() {
   if (!shellState.selectedLauncherTargetId) {
     return;
   }
-  hideLauncher();
-  openTarget(shellState.selectedLauncherTargetId);
+  const card = visibleLauncherItems().find(
+    (item) => item.dataset.target === shellState.selectedLauncherTargetId,
+  );
+  void openFromLauncher(shellState.selectedLauncherTargetId, card || null);
 }
 
 export function refreshLauncherIfVisible() {
@@ -730,6 +837,766 @@ export function refreshLauncherIfVisible() {
     return;
   }
   renderLauncher(shellState.currentSummary);
+}
+
+function launcherReducedMotion() {
+  return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+}
+
+/**
+  Open from Apps → running slot next to Bin (temporary).
+
+  One motion (never AI/Apps/pins):
+  1) pill widens while Bin + splitter ride right with that width
+  2) mount invisible slot in the opened gap (Bin already there — no second slide)
+  3) fade the app into the gap
+*/
+async function openFromLauncher(targetId, card) {
+  const id = String(targetId || "").trim();
+  if (!id) {
+    return;
+  }
+  const app = shellState.currentSummary
+    ? targetById(shellState.currentSummary, id)
+    : null;
+  const showOnDock = !app || launchTargetKind(app) === "app";
+
+  if (!showOnDock) {
+    openTarget(id);
+    return;
+  }
+
+  const taskbar = document.querySelector(".taskbar");
+  const fromW = taskbar ? Math.round(taskbar.getBoundingClientRect().width) : 0;
+  const alreadyOnDock = Boolean(
+    taskbarTargets?.querySelector(`[data-target="${CSS.escape(id)}"]`),
+  );
+
+  if (!alreadyOnDock && !isTargetPinnedToTaskbar(id)) {
+    dockFlyRevealTargetId = id;
+
+    try {
+      const deltaPx = estimateNewRunningSlotDeltaPx();
+      const grownW =
+        fromW > 0
+          ? await animateDockWidthWithBinRide(fromW, fromW + deltaPx)
+          : 0;
+
+      /* Remount while Bin is still riding — new nodes land at the final spot. */
+      notePendingRunningDock(id);
+      if (shellState.currentSummary) {
+        renderTaskbar(shellState.currentSummary);
+      }
+      const dockItem = taskbarTargets?.querySelector(
+        `[data-target="${CSS.escape(id)}"]`,
+      );
+      dockItem?.classList.add("is-receiving-fly", "is-dock-arriving");
+      /* Old ride nodes are gone; unlock clip so mag works again. */
+      if (taskbar) {
+        taskbar.style.overflow = "";
+      }
+      clearDockBinRideTransforms();
+
+      /*
+        Settle to the exact closed-dock width (grow or quiet shrink). Open face
+        and post-close idle must match so Apps dismiss is height-only.
+      */
+      if (taskbar && grownW > 0) {
+        await settleDockPillWidthExact(taskbar);
+      }
+
+      openTarget(id);
+      await revealDockArrival(card, id);
+      /* Window mount can remount the strip — re-lock to exact closed width. */
+      if (taskbar) {
+        await settleDockPillWidthExact(taskbar);
+      }
+    } finally {
+      clearDockBinRideTransforms();
+      /* Fly id stays set through reveal so window mount can’t start a 2nd breathe. */
+      if (dockFlyRevealTargetId === id) {
+        dockFlyRevealTargetId = null;
+      }
+      const item = taskbarTargets?.querySelector(
+        `[data-target="${CSS.escape(id)}"]`,
+      );
+      item?.classList.remove(
+        "is-receiving-fly",
+        "is-fly-landed",
+        "is-dock-arriving",
+        "is-dock-arrived",
+      );
+      /* Failed launch: drop the optimistic tile on the next prune pass. */
+      if (
+        pendingRunningDockIds.has(id) &&
+        !isTargetPinnedToTaskbar(id) &&
+        browserWindowCount(id) === 0
+      ) {
+        pendingRunningDockStartedAt.set(id, Date.now() - PENDING_RUNNING_DOCK_TTL_MS);
+      }
+    }
+  } else {
+    openTarget(id);
+    await flyLauncherCardToDock(card, id);
+  }
+
+  refreshLauncherIfVisible();
+}
+
+const DOCK_FADE_MS = 360;
+
+/** Fade the reserved tile into the Bin-side gap; soft fly from the Apps card. */
+function revealDockArrival(card, targetId) {
+  return new Promise((resolve) => {
+    const item = taskbarTargets?.querySelector(
+      `[data-target="${CSS.escape(targetId)}"]`,
+    );
+    if (!item) {
+      resolve();
+      return;
+    }
+
+    const finish = () => {
+      /* Keep dockFlyRevealTargetId until openFromLauncher finally — suppresses
+         window-mount animateWidth during the land fade. */
+      item.classList.add("is-dock-arrived", "is-fly-landed");
+      window.setTimeout(() => {
+        item.classList.remove(
+          "is-receiving-fly",
+          "is-fly-landed",
+          "is-dock-arriving",
+          "is-dock-arrived",
+        );
+        startDockLaunchBounce(item);
+        resolve();
+      }, DOCK_FADE_MS + 40);
+    };
+
+    if (launcherReducedMotion() || !card) {
+      finish();
+      return;
+    }
+
+    const fromEl = card.querySelector(".launcher-item-icon") || card;
+    const toEl = item.querySelector(".taskbar-icon") || item;
+    const from = fromEl.getBoundingClientRect();
+    const to = toEl.getBoundingClientRect();
+    if (from.width >= 2 && to.width >= 2) {
+      const fly = fromEl.cloneNode(true);
+      fly.classList.add("launcher-fly-icon", "launcher-fly-icon-soft");
+      fly.setAttribute("aria-hidden", "true");
+      fly.style.width = `${from.width}px`;
+      fly.style.height = `${from.height}px`;
+      fly.style.left = `${from.left}px`;
+      fly.style.top = `${from.top}px`;
+      document.body.appendChild(fly);
+      card.classList.add("is-flying-to-dock");
+      const dx = to.left + to.width / 2 - (from.left + from.width / 2);
+      const dy = to.top + to.height / 2 - (from.top + from.height / 2);
+      const scale = Math.min(
+        to.width / Math.max(from.width, 1),
+        to.height / Math.max(from.height, 1),
+      );
+      requestAnimationFrame(() => {
+        fly.style.transform = `translate(${dx}px, ${dy}px) scale(${scale})`;
+        fly.style.opacity = "0";
+      });
+      window.setTimeout(() => {
+        fly.remove();
+        card.classList.remove("is-flying-to-dock");
+      }, 520);
+    }
+
+    requestAnimationFrame(() => {
+      finish();
+    });
+  });
+}
+
+/** Extra px to open on the Bin side before the new running tile is mounted. */
+function estimateNewRunningSlotDeltaPx() {
+  const root = document.documentElement;
+  const slot =
+    Number.parseFloat(
+      getComputedStyle(root).getPropertyValue("--dock-icon-slot"),
+    ) || 58;
+  const gap = 3;
+  /* .taskbar-separator: 1px + 6px margins each side */
+  const separator = 13;
+  const pinnedCount = shellState.shellLayoutState.taskbar.filter((targetId) =>
+    Boolean(targetById(shellState.currentSummary, targetId)),
+  ).length;
+  let hasRunning = false;
+  for (const entry of browserWindowEntries()) {
+    if (
+      !isTargetPinnedToTaskbar(entry.targetId) &&
+      targetById(shellState.currentSummary, entry.targetId)
+    ) {
+      hasRunning = true;
+      break;
+    }
+  }
+  for (const id of pendingRunningDockIds) {
+    if (!isTargetPinnedToTaskbar(id)) {
+      hasRunning = true;
+      break;
+    }
+  }
+  const needsSeparator = pinnedCount > 0 && !hasRunning;
+  /* Tiny ceil only — large buffers made the open face wider than closed dock. */
+  return Math.ceil(slot + gap + (needsSeparator ? separator : 0) + 1);
+}
+
+/**
+  Dock row is position:absolute (out of flow), so taskbar max-content sizes to
+  the Apps panel — NOT icons+Bin. Measure the strip from real icon boxes.
+*/
+function measureDockStripWidth(taskbar) {
+  const primary =
+    taskbar?.querySelector(".shelf-face-apps .taskbar-primary") ||
+    taskbar?.querySelector(".taskbar-primary");
+  if (!primary) {
+    return 0;
+  }
+  let minLeft = Infinity;
+  let maxRight = -Infinity;
+  const nodes = primary.querySelectorAll(
+    ".taskbar-system, .taskbar-separator, .taskbar-entry, .taskbar-item",
+  );
+  for (const node of nodes) {
+    const rect = node.getBoundingClientRect();
+    if (rect.width < 0.5 && rect.height < 0.5) {
+      continue;
+    }
+    minLeft = Math.min(minLeft, rect.left);
+    maxRight = Math.max(maxRight, rect.right);
+  }
+  if (!Number.isFinite(minLeft) || maxRight <= minLeft) {
+    return Math.ceil(primary.scrollWidth || 0);
+  }
+  return Math.ceil(maxRight - minLeft);
+}
+
+function clampDockPillTargetWidth(toW) {
+  const maxW = Math.max(200, window.innerWidth - 20);
+  const minW = Math.min(320, maxW);
+  return Math.round(Math.min(maxW, Math.max(minW, toW)));
+}
+
+function measureDockPillWidth(taskbar) {
+  const maxW = Math.max(200, window.innerWidth - 20);
+  const minW = Math.min(320, maxW);
+  if (!taskbar) {
+    return minW;
+  }
+  const stripW = measureDockStripWidth(taskbar);
+  const cs = window.getComputedStyle(taskbar);
+  const padX =
+    (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0);
+  /*
+    Exact border-box for the icon strip + pill padding — no fudge gutter.
+    Open-face width must equal closed idle width or Apps close nudges sideways.
+  */
+  return clampDockPillTargetWidth(stripW + padX);
+}
+
+/** Lock launcher/idle pill to an explicit width (never snap back to max-content). */
+function lockDockPillWidth(taskbar, width) {
+  if (!taskbar || !(width > 0)) {
+    return;
+  }
+  const w = Math.round(width);
+  taskbar.style.width = `${w}px`;
+  if (taskbar.classList.contains("is-launcher-face")) {
+    taskbar.style.setProperty("--shelf-launcher-w", `${w}px`);
+  }
+}
+
+/**
+  Match open-face width to the exact post-close dock width.
+  Grow with the liquid ease; shrink snaps (estimate buffer only — no second retract).
+*/
+async function settleDockPillWidthExact(taskbar) {
+  if (!taskbar) {
+    return 0;
+  }
+  const needed = measureDockPillWidth(taskbar);
+  const current = Math.round(taskbar.getBoundingClientRect().width);
+  if (needed > current + 1) {
+    return animateDockWidth(current, needed);
+  }
+  if (needed < current - 1 || current !== needed) {
+    taskbar.classList.remove("is-launcher-width-easing", "is-dock-width-easing");
+    lockDockPillWidth(taskbar, needed);
+  }
+  return needed;
+}
+
+const DOCK_WIDTH_MS = 780;
+const DOCK_WIDTH_EASE = "var(--shelf-morph-ease, cubic-bezier(0.42, 0, 0.58, 1))";
+
+function clearDockBinRideTransforms() {
+  const { binEntry, binSep } = dockBinSlideNodes();
+  for (const node of [binEntry, binSep]) {
+    if (!node) {
+      continue;
+    }
+    node.classList.remove("is-dock-bin-sliding");
+    node.style.transition = "";
+    node.style.transform = "";
+  }
+  document.body.classList.remove("dock-bin-sliding");
+}
+
+function dockWidthEaseClass(taskbar) {
+  return taskbar.classList.contains("is-launcher-face")
+    ? "is-launcher-width-easing"
+    : "is-dock-width-easing";
+}
+
+/**
+  Liquid expand OR retract to an explicit width.
+  Clip only while expanding (Bin safety); retract stays visible for dock-mag.
+  Always holds the settled px width so Apps dismiss stays height-only.
+*/
+function animateDockWidth(fromW, toW) {
+  return new Promise((resolve) => {
+    const taskbar = document.querySelector(".taskbar");
+    if (!taskbar || fromW == null || fromW <= 0) {
+      resolve(0);
+      return;
+    }
+    const gen = nextDockWidthGeneration();
+    const targetW = clampDockPillTargetWidth(toW);
+    const isLauncher = taskbar.classList.contains("is-launcher-face");
+    const easeClass = dockWidthEaseClass(taskbar);
+    const prevOverflow = taskbar.style.overflow;
+
+    taskbar.classList.remove("is-launcher-width-easing", "is-dock-width-easing");
+    taskbar.style.overflow = targetW > fromW ? "hidden" : "";
+    taskbar.style.width = `${fromW}px`;
+    if (isLauncher) {
+      taskbar.style.setProperty("--shelf-launcher-w", `${fromW}px`);
+    }
+    void taskbar.offsetWidth;
+
+    if (targetW === fromW || launcherReducedMotion()) {
+      lockDockPillWidth(taskbar, targetW);
+      taskbar.style.overflow = prevOverflow;
+      resolve(targetW);
+      return;
+    }
+
+    taskbar.classList.add(easeClass);
+    taskbar.style.width = `${targetW}px`;
+    if (isLauncher) {
+      taskbar.style.setProperty("--shelf-launcher-w", `${targetW}px`);
+    }
+
+    let settled = false;
+    const finish = () => {
+      if (settled || gen !== dockWidthGeneration) {
+        return;
+      }
+      settled = true;
+      taskbar.classList.remove(easeClass);
+      taskbar.style.overflow = prevOverflow;
+      lockDockPillWidth(taskbar, targetW);
+      resolve(targetW);
+    };
+    const onEnd = (event) => {
+      if (event.propertyName === "width") {
+        taskbar.removeEventListener("transitionend", onEnd);
+        finish();
+      }
+    };
+    taskbar.addEventListener("transitionend", onEnd);
+    window.setTimeout(finish, DOCK_WIDTH_MS + 40);
+  });
+}
+
+/**
+  Widen the pill while Bin + splitter translate by the same delta — one ease.
+  Leaves ride transforms on so the caller can remount the slot underneath.
+*/
+function animateDockWidthWithBinRide(fromW, toW) {
+  return new Promise((resolve) => {
+    const taskbar = document.querySelector(".taskbar");
+    if (!taskbar || fromW == null || fromW <= 0) {
+      resolve(0);
+      return;
+    }
+    const gen = nextDockWidthGeneration();
+    const targetW = clampDockPillTargetWidth(toW);
+    const rideDx = targetW - fromW;
+    const isLauncher = taskbar.classList.contains("is-launcher-face");
+    const easeClass = dockWidthEaseClass(taskbar);
+    const { binEntry, binSep } = dockBinSlideNodes();
+    const riders = [binSep, binEntry].filter(Boolean);
+
+    taskbar.classList.remove("is-launcher-width-easing", "is-dock-width-easing");
+    taskbar.style.overflow = "hidden";
+    taskbar.style.width = `${fromW}px`;
+    if (isLauncher) {
+      taskbar.style.setProperty("--shelf-launcher-w", `${fromW}px`);
+    }
+
+    for (const node of riders) {
+      node.classList.add("is-dock-bin-sliding");
+      node.style.transition = "none";
+      node.style.transform = "translateX(0)";
+    }
+    document.body.classList.add("dock-bin-sliding");
+    void taskbar.offsetWidth;
+
+    if (targetW === fromW || launcherReducedMotion() || rideDx === 0) {
+      lockDockPillWidth(taskbar, targetW);
+      taskbar.style.overflow = "";
+      clearDockBinRideTransforms();
+      resolve(targetW);
+      return;
+    }
+
+    taskbar.classList.add(easeClass);
+    taskbar.style.width = `${targetW}px`;
+    if (isLauncher) {
+      taskbar.style.setProperty("--shelf-launcher-w", `${targetW}px`);
+    }
+    for (const node of riders) {
+      node.style.transition = `transform ${DOCK_WIDTH_MS}ms ${DOCK_WIDTH_EASE}`;
+      node.style.transform = `translateX(${rideDx}px)`;
+    }
+
+    let settled = false;
+    const finish = () => {
+      if (settled || gen !== dockWidthGeneration) {
+        return;
+      }
+      settled = true;
+      taskbar.classList.remove(easeClass);
+      /* Keep clip + Bin ride until the slot remount lands underneath. */
+      lockDockPillWidth(taskbar, targetW);
+      resolve(targetW);
+    };
+    const onEnd = (event) => {
+      if (event.propertyName === "width") {
+        taskbar.removeEventListener("transitionend", onEnd);
+        finish();
+      }
+    };
+    taskbar.addEventListener("transitionend", onEnd);
+    window.setTimeout(finish, DOCK_WIDTH_MS + 40);
+  });
+}
+
+/**
+  Close / unpin / membership change — Bin rides with the width ease:
+  1) lock pill at pre-remount width (so max-content can’t snap closed)
+  2) FLIP-hold Bin + splitter at their old screen spot
+  3) ease width + Bin together (same duration/ease as open)
+*/
+function breatheDockWidthWithBinRide(fromW, firstMap) {
+  return new Promise((resolve) => {
+    const taskbar = document.querySelector(".taskbar");
+    if (!taskbar || fromW == null || fromW <= 0) {
+      resolve(0);
+      return;
+    }
+
+    const gen = nextDockWidthGeneration();
+    const targetW = measureDockPillWidth(taskbar);
+    const isLauncher = taskbar.classList.contains("is-launcher-face");
+    const easeClass = dockWidthEaseClass(taskbar);
+    const prevOverflow = taskbar.style.overflow;
+
+    const { binEntry, binSep } = dockBinSlideNodes();
+    const moves = [];
+    if (binEntry && firstMap?.has("bin")) {
+      const last = binEntry.getBoundingClientRect();
+      const dx = firstMap.get("bin").left - last.left;
+      if (Math.abs(dx) >= 0.5) {
+        moves.push({ node: binEntry, dx });
+      }
+    }
+    if (
+      binSep?.classList?.contains("taskbar-separator") &&
+      firstMap?.has("sep")
+    ) {
+      const last = binSep.getBoundingClientRect();
+      const dx = firstMap.get("sep").left - last.left;
+      if (Math.abs(dx) >= 0.5) {
+        moves.push({ node: binSep, dx });
+      }
+    }
+
+    if (launcherReducedMotion()) {
+      clearDockBinRideTransforms();
+      lockDockPillWidth(taskbar, targetW);
+      resolve(targetW);
+      return;
+    }
+
+    /* No Bin travel — plain width breathe (e.g. pin that doesn’t move Bin). */
+    if (!moves.length) {
+      resolve(animateDockWidth(fromW, targetW));
+      return;
+    }
+
+    taskbar.classList.remove("is-launcher-width-easing", "is-dock-width-easing");
+    /* Retract: overflow visible so dock-mag stays in front while Bin rides. */
+    taskbar.style.overflow = targetW > fromW ? "hidden" : "";
+    taskbar.style.width = `${fromW}px`;
+    if (isLauncher) {
+      taskbar.style.setProperty("--shelf-launcher-w", `${fromW}px`);
+    }
+
+    document.body.classList.add("dock-bin-sliding");
+    for (const { node, dx } of moves) {
+      node.classList.add("is-dock-bin-sliding");
+      node.style.transition = "none";
+      node.style.transform = `translateX(${dx}px)`;
+    }
+    void taskbar.offsetWidth;
+
+    const finishRide = () => {
+      if (gen !== dockWidthGeneration) {
+        return;
+      }
+      clearDockBinRideTransforms();
+      taskbar.style.overflow = prevOverflow;
+      lockDockPillWidth(taskbar, targetW);
+      refreshDockMagnificationAfterRemount();
+      resolve(targetW);
+    };
+
+    if (targetW === fromW) {
+      for (const { node } of moves) {
+        node.style.transition = `transform ${DOCK_WIDTH_MS}ms ${DOCK_WIDTH_EASE}`;
+        node.style.transform = "translateX(0)";
+      }
+      window.setTimeout(finishRide, DOCK_WIDTH_MS + 40);
+      return;
+    }
+
+    requestAnimationFrame(() => {
+      if (gen !== dockWidthGeneration) {
+        return;
+      }
+      taskbar.classList.add(easeClass);
+      taskbar.style.width = `${targetW}px`;
+      if (isLauncher) {
+        taskbar.style.setProperty("--shelf-launcher-w", `${targetW}px`);
+      }
+      for (const { node } of moves) {
+        node.style.transition = `transform ${DOCK_WIDTH_MS}ms ${DOCK_WIDTH_EASE}`;
+        node.style.transform = "translateX(0)";
+      }
+    });
+
+    let settled = false;
+    const finish = () => {
+      if (settled || gen !== dockWidthGeneration) {
+        return;
+      }
+      settled = true;
+      taskbar.classList.remove(easeClass);
+      finishRide();
+    };
+    const onEnd = (event) => {
+      if (event.propertyName === "width") {
+        taskbar.removeEventListener("transitionend", onEnd);
+        finish();
+      }
+    };
+    taskbar.addEventListener("transitionend", onEnd);
+    window.setTimeout(finish, DOCK_WIDTH_MS + 40);
+  });
+}
+
+/** Bin entry + its divider — the only tiles that should slide on add/remove. */
+function dockBinSlideNodes() {
+  const binEntry =
+    taskbarTargets?.querySelector('.taskbar-entry[data-dock-bin="true"]') ||
+    null;
+  const binSep =
+    taskbarTargets?.querySelector('.taskbar-separator[data-dock-bin-sep="true"]') ||
+    binEntry?.previousElementSibling ||
+    null;
+  return { binEntry, binSep };
+}
+
+/** Capture Bin (+ divider) screen rects before a membership remount. */
+function captureBinSlideRects() {
+  const map = new Map();
+  const { binEntry, binSep } = dockBinSlideNodes();
+  if (binEntry) {
+    const rect = binEntry.getBoundingClientRect();
+    if (rect.width >= 1) {
+      map.set("bin", rect);
+    }
+  }
+  if (
+    binSep?.classList?.contains("taskbar-separator") &&
+    binSep.getBoundingClientRect().width >= 0.5
+  ) {
+    map.set("sep", binSep.getBoundingClientRect());
+  }
+  return map;
+}
+
+/**
+  Session restore: one liquid dock intro after all windows remount.
+  Skips the per-window breathe cascade (that glitched with multiple apps).
+  Pattern matches open/close — width + Bin ride together, then runners fade in.
+*/
+export async function introduceDockAfterSessionRestore() {
+  if (!shellState.currentSummary || !taskbarTargets) {
+    return;
+  }
+  const taskbar = document.querySelector(".taskbar");
+  const fromW = taskbar ? Math.round(taskbar.getBoundingClientRect().width) : 0;
+  const binFirsts = captureBinSlideRects();
+  const beforeIds = new Set();
+  for (const button of taskbarTargets.querySelectorAll(
+    ".taskbar-item[data-target]",
+  )) {
+    beforeIds.add(button.dataset.target);
+  }
+
+  renderTaskbar(shellState.currentSummary);
+
+  const arriving = [];
+  for (const button of taskbarTargets.querySelectorAll(
+    ".taskbar-item[data-target]",
+  )) {
+    const id = button.dataset.target;
+    if (!id || beforeIds.has(id) || isTargetPinnedToTaskbar(id)) {
+      continue;
+    }
+    button.classList.add("is-receiving-fly", "is-dock-arriving");
+    arriving.push(button);
+  }
+
+  if (fromW > 0 && !launcherReducedMotion()) {
+    await breatheDockWidthWithBinRide(fromW, binFirsts);
+  } else if (taskbar) {
+    lockDockPillWidth(taskbar, measureDockPillWidth(taskbar));
+  }
+
+  if (!arriving.length) {
+    return;
+  }
+
+  await new Promise((resolve) => {
+    requestAnimationFrame(() => resolve());
+  });
+  for (const button of arriving) {
+    if (button.isConnected) {
+      button.classList.add("is-dock-arrived", "is-fly-landed");
+    }
+  }
+  await new Promise((resolve) => {
+    window.setTimeout(resolve, DOCK_FADE_MS + 40);
+  });
+  for (const button of arriving) {
+    button.classList.remove(
+      "is-receiving-fly",
+      "is-fly-landed",
+      "is-dock-arriving",
+      "is-dock-arrived",
+    );
+  }
+  if (taskbar) {
+    lockDockPillWidth(taskbar, measureDockPillWidth(taskbar));
+  }
+}
+
+const LAUNCHER_FLY_MS = 780;
+
+function flyLauncherCardToDock(card, targetId) {
+  return new Promise((resolve) => {
+    const dockItem = () =>
+      taskbarTargets?.querySelector(`[data-target="${CSS.escape(targetId)}"]`);
+    let item = dockItem();
+
+    const revealAndBounce = () => {
+      /* Drop the hide-lock before fade-in so a remount can’t re-hide the tile. */
+      if (dockFlyRevealTargetId === targetId) {
+        dockFlyRevealTargetId = null;
+      }
+      item = dockItem() || item;
+      if (!item) {
+        resolve();
+        return;
+      }
+      /* One clean land — opacity only (no scale pop / second flicker). */
+      item.classList.add("is-fly-landed");
+      window.setTimeout(() => {
+        item = dockItem() || item;
+        item?.classList.remove("is-receiving-fly", "is-fly-landed");
+        if (item) {
+          startDockLaunchBounce(item);
+        }
+        resolve();
+      }, 160);
+    };
+
+    if (!card || !item || launcherReducedMotion()) {
+      revealAndBounce();
+      return;
+    }
+
+    item.classList.add("is-receiving-fly");
+
+    const fromEl = card.querySelector(".launcher-item-icon") || card;
+    const toEl = item.querySelector(".taskbar-icon") || item;
+
+    requestAnimationFrame(() => {
+      item = dockItem() || item;
+      const targetEl = item?.querySelector(".taskbar-icon") || item || toEl;
+      const from = fromEl.getBoundingClientRect();
+      const to = targetEl.getBoundingClientRect();
+      if (from.width < 2 || to.width < 2) {
+        revealAndBounce();
+        return;
+      }
+
+      const fly = fromEl.cloneNode(true);
+      fly.classList.add("launcher-fly-icon");
+      fly.setAttribute("aria-hidden", "true");
+      fly.style.width = `${from.width}px`;
+      fly.style.height = `${from.height}px`;
+      fly.style.left = `${from.left}px`;
+      fly.style.top = `${from.top}px`;
+      document.body.appendChild(fly);
+      card.classList.add("is-flying-to-dock");
+
+      const dx = to.left + to.width / 2 - (from.left + from.width / 2);
+      const dy = to.top + to.height / 2 - (from.top + from.height / 2);
+      const scale = Math.min(
+        to.width / Math.max(from.width, 1),
+        to.height / Math.max(from.height, 1),
+      );
+
+      let settled = false;
+      const done = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        fly.remove();
+        card.classList.remove("is-flying-to-dock");
+        revealAndBounce();
+      };
+
+      requestAnimationFrame(() => {
+        fly.style.transform = `translate(${dx}px, ${dy}px) scale(${scale})`;
+        fly.style.opacity = "0.92";
+      });
+      fly.addEventListener("transitionend", done, { once: true });
+      window.setTimeout(done, LAUNCHER_FLY_MS + 80);
+    });
+  });
 }
 
 function attachTargetIconInteractions(node, targetId, source) {
@@ -784,7 +1651,8 @@ function attachTargetIconInteractions(node, targetId, source) {
       return;
     }
     if (source === "launcher") {
-      hideLauncher();
+      void openFromLauncher(targetId, node);
+      return;
     }
     openTarget(targetId);
   });
@@ -855,7 +1723,7 @@ function attachTargetIconInteractions(node, targetId, source) {
       kind: "target",
       targetId,
       source,
-      keepLauncherOpen: source === "launcher",
+      keepLauncherOpen: source === "launcher" || source === "taskbar",
     });
   });
 }
@@ -1234,6 +2102,7 @@ function startTargetDrag() {
     return;
   }
   shellState.dragState.started = true;
+  shellState.dragState.dockInsertAt = -1;
   hideDesktopContextMenu();
   if (shellState.dragState.source === "launcher") {
     // Reveal the desktop drop surface under the ghost.
@@ -1251,7 +2120,33 @@ function startTargetDrag() {
     return;
   }
   document.body.classList.add("dragging-target");
+  resetDockMagnification();
   clearDragSelection();
+
+  /* Dock drags use an icon-sized ghost above the Shelf (not a desktop tile). */
+  if (shellState.dragState.source === "taskbar") {
+    const sourceRect = shellState.dragState.sourceElement.getBoundingClientRect();
+    const ghost = document.createElement("div");
+    ghost.className = "dock-reorder-ghost";
+    ghost.setAttribute("aria-hidden", "true");
+    ghost.style.width = `${Math.round(sourceRect.width)}px`;
+    ghost.style.height = `${Math.round(sourceRect.height)}px`;
+    const icon = shellState.dragState.sourceElement
+      .querySelector(".taskbar-icon")
+      ?.cloneNode(true);
+    if (icon) {
+      icon.querySelector(".taskbar-notification-badge")?.remove();
+      icon.querySelector(".taskbar-window-count")?.remove();
+      ghost.appendChild(icon);
+    } else {
+      mountGlyph(ghost, dragEntry.glyphId);
+    }
+    document.body.appendChild(ghost);
+    shellState.dragState.ghost = ghost;
+    beginDockLiveReorder(shellState.dragState);
+    return;
+  }
+
   const ghost = shortcutTemplate.content.firstElementChild.cloneNode(true);
   ghost.classList.add("desktop-shortcut-ghost");
   mountGlyph(ghost.querySelector(".desktop-shortcut-icon"), dragEntry.glyphId);
@@ -1295,52 +2190,245 @@ function updateDragTarget(clientX, clientY) {
   if (!shellState.dragState) {
     return;
   }
-  taskbarTargets.classList.remove("drop-active");
+  taskbarTargets.classList.remove("drop-active", "drop-unpin-active");
   if (shellState.dragState.source !== "desktop-object") {
     const taskbarTarget = taskbarDropTarget(clientX, clientY);
     if (taskbarTarget) {
+      /* Pinned → running/Bin side = unpin (mirror of drag into core to pin). */
+      if (
+        taskbarTarget.kind === "taskbar" &&
+        isDockUnpinZone(clientX, shellState.dragState)
+      ) {
+        endDockLiveReorder(shellState.dragState);
+        taskbarTargets.classList.add("drop-unpin-active");
+        shellState.dragState.dropTarget = { kind: "taskbar-unpin" };
+        return;
+      }
       taskbarTargets.classList.add("drop-active");
       shellState.dragState.dropTarget = taskbarTarget;
+      syncDockLiveReorder(clientX);
       return;
     }
   }
+  /* Left the Shelf strip — collapse live gap; desktop shortcut path stays. */
+  endDockLiveReorder(shellState.dragState);
   shellState.dragState.dropTarget = desktopDropTarget(clientX, clientY);
 }
 
+/**
+  Running strip left of Bin (after the pinned core). Dropping a pinned icon
+  here unpins it — open apps stay as temporary runners; closed ones leave.
+*/
+function isDockUnpinZone(clientX, state) {
+  if (!state || state.source !== "taskbar" || !taskbarTargets) {
+    return false;
+  }
+  if (!isTargetPinnedToTaskbar(state.targetId)) {
+    return false;
+  }
+  const binEntry = taskbarTargets.querySelector(
+    '.taskbar-entry[data-dock-bin="true"]',
+  );
+  if (!binEntry) {
+    return false;
+  }
+  const others = dockReorderOtherEntries(state.targetId);
+  const binLeft = binEntry.getBoundingClientRect().left;
+  let pinRight = 0;
+  for (const entry of others) {
+    pinRight = Math.max(pinRight, entry.getBoundingClientRect().right);
+  }
+  if (!others.length) {
+    /* Sole pinned app — unpin once the pointer is clearly toward Bin. */
+    const source = dockEntryForTarget(state.targetId);
+    const sourceRight = source?.getBoundingClientRect().right ?? 0;
+    const mid = (sourceRight + binLeft) / 2;
+    return clientX >= mid && clientX < binLeft + 24;
+  }
+  return clientX >= pinRight + 10 && clientX < binLeft + 24;
+}
+
 function taskbarDropTarget(clientX, clientY) {
-  const taskbarRect = taskbarTargets.getBoundingClientRect();
-  const launcherRect = launcherToggleButton.getBoundingClientRect();
-  const left = launcherRect.right + 8;
-  const right = Math.max(left + 24, taskbarRect.right + 24);
-  if (!pointInRect(clientX, clientY, {
-    left,
-    top: launcherRect.top - 10,
-    right,
-    bottom: launcherRect.bottom + 10,
-  })) {
+  if (!taskbarTargets || !launcherToggleButton) {
     return null;
   }
+  const taskbarRect = taskbarTargets.getBoundingClientRect();
+  const launcherRect = launcherToggleButton.getBoundingClientRect();
+  const appsFace = document.querySelector(".shelf-face-apps");
+  const stripRect = appsFace?.getBoundingClientRect?.() || launcherRect;
+  const left = Math.min(launcherRect.left, taskbarRect.left) - 8;
+  const right = Math.max(launcherRect.right + 8, taskbarRect.right + 24);
+  const top = Math.min(stripRect.top, launcherRect.top, taskbarRect.top) - 14;
+  const bottom = Math.max(stripRect.bottom, launcherRect.bottom, taskbarRect.bottom) + 14;
+  if (!pointInRect(clientX, clientY, { left, top, right, bottom })) {
+    return null;
+  }
+  const index = taskbarInsertionIndex(
+    clientX,
+    shellState.dragState?.targetId,
+    shellState.dragState?.dockInsertAt ?? -1,
+  );
   return {
     kind: "taskbar",
-    index: taskbarInsertionIndex(clientX),
+    index,
   };
 }
 
-function taskbarInsertionIndex(clientX) {
-  const pinnedApps = shellState.shellLayoutState.taskbar.filter(
-    (targetId) => Boolean(targetById(shellState.currentSummary, targetId)),
-  );
-  for (let index = 0; index < pinnedApps.length; index += 1) {
-    const button = taskbarTargets.querySelector(`[data-target="${pinnedApps[index]}"]`);
-    if (!button) {
-      continue;
-    }
-    const rect = button.getBoundingClientRect();
+/** Insert index among pinned peers only (dragged id excluded) — matches pinTargetToTaskbar. */
+function taskbarInsertionIndex(clientX, draggedId = "", lastInsertAt = -1) {
+  const others = dockReorderOtherEntries(draggedId);
+  let index = others.length;
+  for (let i = 0; i < others.length; i += 1) {
+    const rect = others[i].getBoundingClientRect();
     if (clientX < rect.left + rect.width / 2) {
-      return index;
+      index = i;
+      break;
     }
   }
-  return pinnedApps.length;
+  if (lastInsertAt >= 0 && lastInsertAt !== index && others.length > 0) {
+    const band = 16;
+    if (index > lastInsertAt) {
+      const gateRect = others[Math.min(lastInsertAt, others.length - 1)].getBoundingClientRect();
+      if (clientX < gateRect.left + gateRect.width / 2 + band) {
+        return lastInsertAt;
+      }
+    } else {
+      const gateRect = others[Math.max(index, 0)].getBoundingClientRect();
+      if (clientX > gateRect.left + gateRect.width / 2 - band) {
+        return lastInsertAt;
+      }
+    }
+  }
+  return index;
+}
+
+function dockReorderOtherEntries(draggedId) {
+  const pinnedApps = shellState.shellLayoutState.taskbar.filter((targetId) =>
+    Boolean(targetById(shellState.currentSummary, targetId)),
+  );
+  const others = [];
+  for (const targetId of pinnedApps) {
+    if (targetId === draggedId) {
+      continue;
+    }
+    const button = taskbarTargets?.querySelector(
+      `[data-target="${CSS.escape(targetId)}"]`,
+    );
+    const entry = button?.closest(".taskbar-entry");
+    if (entry) {
+      others.push(entry);
+    }
+  }
+  return others;
+}
+
+function dockEntryForTarget(targetId) {
+  const button = taskbarTargets?.querySelector(
+    `[data-target="${CSS.escape(targetId)}"]`,
+  );
+  return button?.closest(".taskbar-entry") || null;
+}
+
+function ensureDockReorderSpacer(widthPx, heightPx) {
+  let spacer = taskbarTargets?.querySelector(".dock-reorder-spacer");
+  if (!spacer) {
+    spacer = document.createElement("div");
+    spacer.className = "dock-reorder-spacer";
+    spacer.setAttribute("aria-hidden", "true");
+    taskbarTargets.appendChild(spacer);
+  }
+  const w = Math.max(36, Math.round(widthPx));
+  const h = Math.max(36, Math.round(heightPx));
+  spacer.style.flex = `0 0 ${w}px`;
+  spacer.style.width = `${w}px`;
+  spacer.style.height = `${h}px`;
+  return spacer;
+}
+
+function placeDockReorderSpacer(spacer, insertAt, draggedId) {
+  if (!taskbarTargets || !spacer) {
+    return;
+  }
+  if (spacer.parentNode !== taskbarTargets) {
+    taskbarTargets.appendChild(spacer);
+  }
+  const others = dockReorderOtherEntries(draggedId);
+  const slot = Math.max(0, Math.min(insertAt, others.length));
+  let order = 1;
+  for (let i = 0; i <= others.length; i += 1) {
+    if (i === slot) {
+      spacer.style.order = String(order);
+      order += 1;
+    }
+    if (i < others.length) {
+      others[i].style.order = String(order);
+      order += 1;
+    }
+  }
+  const sourceEntry = dockEntryForTarget(draggedId);
+  if (sourceEntry) {
+    sourceEntry.classList.add("dock-reorder-parked");
+    sourceEntry.style.order = "0";
+  }
+  /* Trash / separators / unpinned runners stay after the pinned strip. */
+  for (const child of taskbarTargets.children) {
+    if (child === spacer || child === sourceEntry || others.includes(child)) {
+      continue;
+    }
+    child.style.order = String(order + 10);
+  }
+}
+
+function beginDockLiveReorder(state) {
+  if (!state || !taskbarTargets) {
+    return;
+  }
+  const sourceRect = state.sourceElement.getBoundingClientRect();
+  const spacer = ensureDockReorderSpacer(sourceRect.width, sourceRect.height);
+  state.dockSpacer = spacer;
+  document.body.classList.add("dock-reordering");
+  taskbarTargets.classList.add("is-live-reorder");
+  const insertAt = taskbarInsertionIndex(state.startClientX, state.targetId, -1);
+  state.dockInsertAt = insertAt;
+  placeDockReorderSpacer(spacer, insertAt, state.targetId);
+}
+
+function syncDockLiveReorder(clientX) {
+  const state = shellState.dragState;
+  if (!state || state.source === "desktop-object") {
+    return;
+  }
+  if (!state.dockSpacer) {
+    beginDockLiveReorder(state);
+  }
+  const insertAt = taskbarInsertionIndex(clientX, state.targetId, state.dockInsertAt ?? -1);
+  if (insertAt === state.dockInsertAt) {
+    return;
+  }
+  state.dockInsertAt = insertAt;
+  if (state.dropTarget?.kind === "taskbar") {
+    state.dropTarget.index = insertAt;
+  }
+  placeDockReorderSpacer(state.dockSpacer, insertAt, state.targetId);
+}
+
+function endDockLiveReorder(state = shellState.dragState) {
+  const spacer =
+    state?.dockSpacer || taskbarTargets?.querySelector(".dock-reorder-spacer");
+  spacer?.remove();
+  if (state) {
+    state.dockSpacer = null;
+    state.dockInsertAt = -1;
+  }
+  document.body.classList.remove("dock-reordering");
+  taskbarTargets?.classList.remove("is-live-reorder");
+  if (!taskbarTargets) {
+    return;
+  }
+  for (const child of [...taskbarTargets.children]) {
+    child.style.removeProperty("order");
+    child.classList.remove("dock-reorder-parked");
+  }
 }
 
 function desktopDropTarget(clientX, clientY) {
@@ -1381,7 +2469,9 @@ export function finishTargetDrag(event) {
 
   state.sourceElement.classList.remove("drag-source");
   let changed = false;
-  if (
+  if (state.dropTarget?.kind === "taskbar-unpin" && state.source === "taskbar") {
+    changed = unpinTargetFromTaskbar(state.targetId) || changed;
+  } else if (
     state.dropTarget &&
     state.dropTarget.kind === "taskbar" &&
     state.source !== "desktop-object"
@@ -1390,7 +2480,7 @@ export function finishTargetDrag(event) {
   } else if (state.dropTarget && state.dropTarget.kind === "desktop") {
     if (state.source === "launcher" || state.source === "taskbar") {
       // Drag out = Add to Desktop. Dock pin stays (independent of desktop
-      // presence), matching macOS aliases — never silent-unpin.
+      // presence), matching macOS aliases — use running-zone drop to unpin.
       changed = addTargetToDesktop(state.targetId) || changed;
       changed = setDesktopIconsVisible(true) || changed;
       changed = setDesktopPosition(state.targetId, state.dropTarget.position) || changed;
@@ -1404,11 +2494,17 @@ export function finishTargetDrag(event) {
   if (state.ghost) {
     state.ghost.remove();
   }
-  taskbarTargets.classList.remove("drop-active");
+  taskbarTargets.classList.remove("drop-active", "drop-unpin-active");
+  endDockLiveReorder(state);
+  state.sourceElement?.classList.remove("dock-reorder-parked");
 
   if (changed) {
     saveShellLayoutState();
-    rerenderShellLayout();
+    if (shellState.currentSummary) {
+      renderDesktop(shellState.currentSummary);
+      renderTaskbar(shellState.currentSummary, { animateWidth: true });
+    }
+    refreshLauncherIfVisible();
   }
 }
 
@@ -1533,6 +2629,12 @@ export function desktopMarqueeActive() {
   return Boolean(marqueeState?.node);
 }
 
+const SHELF_TIP = "home-20260724ci";
+
+async function shelfMorphApi() {
+  return import(`./agent-shelf.js?v=${SHELF_TIP}`);
+}
+
 export function toggleLauncher() {
   if (launcher.hidden) {
     showLauncher();
@@ -1548,31 +2650,39 @@ export function showLauncher() {
   }
   syncLauncherVisibility(true);
   ensureLauncherSelection(activeBrowserTargetId());
+  /* Mag lift mid-open reads as icons sliding — calm, then mag works again settled. */
+  resetDockMagnification();
+  dockState.icons = [];
+  void shelfMorphApi().then((shelf) => {
+    shelf.showLauncherShelfFace();
+  });
   if (shouldFocusLauncherSearch()) {
     launcherSearch.focus();
   }
 }
 
-export function hideLauncher() {
-  syncLauncherVisibility(false);
+export function hideLauncher({ snap = false } = {}) {
   launcherSearch.value = "";
   shellState.selectedLauncherTargetId = null;
   filterLauncherItems("");
+  syncLauncherVisibility(false);
+  resetDockMagnification();
+  dockState.icons = [];
+  void shelfMorphApi().then((shelf) => {
+    shelf.hideLauncherShelfFace({ snap });
+  });
 }
 
 function syncLauncherVisibility(isVisible) {
   if (isVisible) {
     closeOtherShellPopovers("launcher");
   }
-  setOverlayOpen(launcher, isVisible, {
-    invoker: launcherToggleButton,
-    focusEl: isVisible && shouldFocusLauncherSearch() ? launcherSearch : undefined,
-  });
+  /* Morph owns hidden/inert on #launcher (Shelf face). Keep aria + outside guard. */
   launcher.dataset.open = isVisible ? "true" : "false";
   shellState.launcherIgnoreOutsideUntil = isVisible
     ? (window.performance ? window.performance.now() : Date.now()) + 350
     : 0;
-  launcherToggleButton.setAttribute("aria-expanded", isVisible ? "true" : "false");
+  launcherToggleButton?.setAttribute("aria-expanded", isVisible ? "true" : "false");
 }
 
 function shouldFocusLauncherSearch() {
@@ -1581,7 +2691,12 @@ function shouldFocusLauncherSearch() {
 }
 
 export function openDesktopContextMenu(clientX, clientY, target) {
-  if (!target.keepLauncherOpen) {
+  /* Apps Shelf face stays up for dock/launcher chrome; only desktop click-off
+     / Apps toggle / Agent should collapse it. */
+  const appsFaceOpen = Boolean(
+    document.querySelector(".taskbar.is-launcher-face, .taskbar[data-launcher-morphing]"),
+  );
+  if (!target.keepLauncherOpen && !appsFaceOpen) {
     hideLauncher();
   }
   shellState.contextMenuTarget = target;
@@ -1918,7 +3033,12 @@ export function handleContextAction(action) {
   }
   if (action === "open-target") {
     if (shellState.contextMenuTarget.source === "launcher") {
-      hideLauncher();
+      const targetId = shellState.contextMenuTarget.targetId;
+      const card = launcherGrid?.querySelector(
+        `.launcher-card[data-target="${CSS.escape(targetId)}"]`,
+      );
+      void openFromLauncher(targetId, card);
+      return;
     }
     openTarget(shellState.contextMenuTarget.targetId);
     return;
@@ -2384,6 +3504,10 @@ function dockMagnifyEnabled() {
 }
 
 function rebuildDockIconCache() {
+  if (!dockState.taskbar) {
+    dockState.icons = [];
+    return;
+  }
   /* Agent + Apps (system cluster) stay paint-static; pinned/running apps wave. */
   dockState.icons = Array.from(
     dockState.taskbar.querySelectorAll(
@@ -2407,6 +3531,22 @@ function rebuildDockIconCache() {
     }
   }
   dockState.range = Math.max(DOCK_MAG_RANGE_PX, pitch * 2.4);
+}
+
+/** After taskbar remount / width settle — keep live mag on the new nodes. */
+function refreshDockMagnificationAfterRemount() {
+  dockState.icons = [];
+  if (
+    dockState.pointerX == null ||
+    !dockMagnifyEnabled() ||
+    !dockState.taskbar?.matches(":hover")
+  ) {
+    return;
+  }
+  rebuildDockIconCache();
+  if (!dockState.raf) {
+    dockState.raf = window.requestAnimationFrame(applyDockMagnification);
+  }
 }
 
 function resetDockMagnification() {
@@ -2611,7 +3751,10 @@ function setupDock() {
       resetDockMagnification();
       return;
     }
-    if (dockState.icons.length === 0) {
+    if (
+      dockState.icons.length === 0 ||
+      dockState.icons.some((entry) => !entry.item?.isConnected)
+    ) {
       rebuildDockIconCache();
     }
     dockState.pointerX = event.clientX;

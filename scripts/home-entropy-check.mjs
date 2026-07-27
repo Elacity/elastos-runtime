@@ -1829,7 +1829,7 @@ const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
 const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260723a";
-const homeGuiAssetVersion = "home-20260724ap";
+const homeGuiAssetVersion = "home-20260724ci";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -2386,6 +2386,56 @@ assert(
   "fx2d: harness tip aligned, Esc via Shelf, motion gen, Agent drop reject",
 );
 assert(
+  read("capsules/home-gui/browser/mock-agent-provider.js").includes(
+    `const TIP = "${homeGuiAssetVersion}"`,
+  ) &&
+    read("capsules/home-gui/browser/mock-agent-provider.js").includes("listCapabilities") &&
+    read("capsules/home-gui/browser/mock-agent-provider.js").includes("requestTool") &&
+    read("capsules/home-gui/browser/mock-agent-provider.js").includes("resolveMockApproval") &&
+    read("capsules/home-gui/browser/agent-harness.js").includes(
+      `from "./mock-agent-provider.js?v=${homeGuiAssetVersion}"`,
+    ) &&
+    read("capsules/home-gui/browser/agent-harness.js").includes("appendGrantCard") &&
+    read("capsules/home-gui/browser/agent-harness.js").includes("syncTruthStrip") &&
+    homeGuiTemplateHtml.includes("agent-harness-truth") &&
+    homeGuiTemplateHtml.includes("agent-harness-truth-preview") &&
+    !homeGuiTemplateHtml.includes(
+      'class="agent-harness-truth visually-hidden"',
+    ) &&
+    read("capsules/home-gui/browser/agent-harness.js").includes("preview · mock") &&
+    shellStyle.includes(".agent-grant-card") &&
+    shellStyle.includes(".agent-harness-truth") &&
+    homeGuiTemplateHtml.includes("Not the grant path") &&
+    read("capsules/home-gui/browser/mock-agent-provider.js").includes(
+      "never mints Carrier/Capsule grants",
+    ),
+  "fx4: mock provider seams + visible truth strip + Inbox-style grant cards (UI ≠ authority)",
+);
+assert(
+  homeGuiTemplateHtml.includes('data-shelf-face="launcher"') &&
+    homeGuiTemplateHtml.includes('id="launcher"') &&
+    homeGuiTemplateHtml.includes("shelf-face-launcher") &&
+    !homeGuiTemplateHtml.includes('<aside id="launcher"') &&
+    read("capsules/home-gui/browser/agent-shelf.js").includes("showLauncherShelfFace") &&
+    read("capsules/home-gui/browser/agent-shelf.js").includes("hideLauncherShelfFace") &&
+    read("capsules/home-gui/browser/agent-shelf.js").includes("launcherShelfFaceActive") &&
+    shellStyle.includes(".taskbar.is-launcher-face") &&
+    shellStyle.includes("--shelf-launcher-w") &&
+    shellStyle.includes("min(64dvh, 512px)") &&
+    read("capsules/home-gui/browser/agent-shelf.js").includes("lockLauncherFaceWidth") &&
+    read("capsules/home-gui/browser/shell-surface.js").includes("showLauncherShelfFace") &&
+    read("capsules/home-gui/browser/shell-surface.js").includes("notOnShelf") &&
+    read("capsules/home-gui/browser/shell-surface.js").includes("openFromLauncher") &&
+    read("capsules/home-gui/browser/shell-surface.js").includes("flyLauncherCardToDock") &&
+    shellStyle.includes(".shelf-face-launcher.launcher") &&
+    shellStyle.includes("is-launcher-closing") &&
+    shellStyle.includes("launcher-dock-breathe-in") &&
+    shellStyle.includes(".launcher-fly-icon") &&
+    read("capsules/home-gui/browser/shell-surface.js").includes("LAUNCHER_FLY_MS") &&
+    !shellStyle.includes(".launcher {\n  position: fixed"),
+  "Apps launcher: planted close, breathe icons, fluid fly-to-dock",
+);
+assert(
   read("capsules/home-gui/browser/agent-harness.js").includes(
     `const TIP = "${homeGuiAssetVersion}"`,
   ) &&
@@ -2450,8 +2500,76 @@ assert(
     read("capsules/home-gui/browser/agent-harness.js").includes("HARNESS_NARROW_MQ") &&
     shellStyle.includes(".agent-harness-mobile-bar") &&
     shellStyle.includes("transform: none") &&
-    shellStyle.includes(".taskbar.is-agent-face .agent-approve-btn"),
+    shellStyle.includes(".taskbar.is-agent-face .agent-approve-btn") &&
+    shellStyle.includes(
+      "body.agent-harness-active.agent-harness-drawer-open .agent-harness",
+    ) &&
+    shellStyle.includes(".taskbar.is-agent-face .agent-model-tier") &&
+    homeGuiTemplateHtml.indexOf('id="agent-model-picker"') <
+      homeGuiTemplateHtml.indexOf('class="agent-composer-tools-right"'),
   "fx2x Part X: narrow pager hide, drawer sessions, minimal composer",
+);
+assert(
+  read("capsules/home-gui/browser/agent-shelf.js").includes(
+    "hideAgentHarness({ restoreShelfApps: false, syncStage: true })",
+  ) &&
+    read("capsules/home-gui/browser/agent-harness.js").includes(
+      "leave active_stage stuck on \"agent\"",
+    ),
+  "Home/Esc leave Agent persists Desktop active_stage for refresh restore",
+);
+assert(
+  read("capsules/home-gui/browser/agent-shelf.js").includes(
+    "Keep text inside the Shelf pill",
+  ) &&
+    shellStyle.includes(".taskbar.is-agent-face") &&
+    shellStyle.includes("Clip growing transcript") &&
+    read("capsules/home-gui/browser/style.css").includes(
+      "overflow: hidden",
+    ),
+  "Agent composer growth stays contained inside the Shelf pill",
+);
+
+assert(
+  shellStyle.includes("#toolbar-wallet") &&
+    shellStyle.includes("#toolbar-inbox") &&
+    shellStyle.includes("#toolbar-spotlight") &&
+    shellStyle.includes("display: none !important") &&
+    shellStyle.includes(".control-centre-quick-open") &&
+    homeGuiTemplateHtml.includes('id="control-centre-quick-open"') &&
+    homeGuiTemplateHtml.includes('id="control-centre-spotlight"') &&
+    homeGuiTemplateHtml.includes('id="control-centre-inbox"') &&
+    homeGuiTemplateHtml.includes('id="control-centre-quick-wallet"') &&
+    shellControlCentre.includes("syncQuickOpen") &&
+    shellControlCentre.includes("showSpotlight") &&
+    shellControlCentre.includes("Part XI: phone tray folded into CC"),
+  "fx2xi Part XI: phone toolbar calm — tray into Control Centre Quick open",
+);
+
+assert(
+  shellStages.includes("bindMobilePlaneSwipe") &&
+    shellStages.includes("PLANE_SWIPE_NARROW_MQ") &&
+    shellStages.includes("shellChromeBlocksPlaneSwipe") &&
+    shellStages.includes("Part XII — mobile plane swipe") &&
+    homeGuiJs.includes("bindMobilePlaneSwipe()") &&
+    shellStyle.includes("height: auto") &&
+    shellStyle.includes("max-height: calc(100dvh - 100px)") &&
+    shellStyle.includes("repeat(4, minmax(0, 1fr))"),
+  "fx2xii Part XII: mobile plane swipe + Apps panel hugs content on phone",
+);
+
+assert(
+  homeGuiTemplateHtml.includes('id="agent-harness-panel-toggle"') &&
+    homeGuiTemplateHtml.includes('id="agent-harness-search-open"') &&
+    homeGuiTemplateHtml.includes('id="agent-session-search"') &&
+    homeGuiTemplateHtml.includes('id="agent-session-search-input"') &&
+    read("capsules/home-gui/browser/agent-harness.js").includes("openSessionSearch") &&
+    read("capsules/home-gui/browser/agent-harness.js").includes("toggleSidebarCollapsed") &&
+    shellStyle.includes("agent-harness-sidebar-collapsed") &&
+    shellStyle.includes("body.agent-harness-drawer-open .agent-harness.is-visible .agent-harness-main") &&
+    shellStyle.includes("translateX(min(var(--harness-sidebar-w), 86vw))") &&
+    shellStyle.includes(".agent-session-search-panel"),
+  "Agent sidebar: Claude-style panel/search icons, search UI, push drawer on narrow",
 );
 
 assert(

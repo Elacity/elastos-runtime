@@ -179,6 +179,26 @@
   inert
   hidden
 >
+  <div
+    id="control-centre-quick-open"
+    class="control-centre-section control-centre-quick-open"
+    aria-label="Quick open"
+  >
+    <div class="control-centre-label">Quick open</div>
+    <button id="control-centre-spotlight" class="control-centre-row" type="button">
+      <span class="control-centre-row-label">Spotlight</span>
+      <span class="control-centre-row-detail">›</span>
+    </button>
+    <button id="control-centre-inbox" class="control-centre-row" type="button">
+      <span class="control-centre-row-label">Inbox</span>
+      <span id="control-centre-inbox-detail" class="control-centre-row-detail">Open</span>
+    </button>
+    <button id="control-centre-quick-wallet" class="control-centre-row" type="button" hidden>
+      <span class="control-centre-row-label">Wallet</span>
+      <span id="control-centre-quick-wallet-detail" class="control-centre-row-detail">Open</span>
+    </button>
+  </div>
+  <div class="control-centre-divider control-centre-quick-open" role="separator"></div>
   <div class="control-centre-section" role="radiogroup" aria-label="Appearance">
     <div class="control-centre-label">Appearance</div>
     <div id="control-centre-theme" class="control-centre-segment">
@@ -483,15 +503,28 @@
   <aside id="agent-harness-sidebar" class="agent-harness-sidebar" aria-label="Agent sessions">
     <div class="agent-harness-sidebar-head">
       <div class="agent-harness-brand">Agent</div>
-      <button
-        id="agent-harness-drawer-close"
-        class="agent-harness-drawer-close"
-        type="button"
-        aria-label="Close sessions"
-        title="Close"
-      >
-        <span aria-hidden="true">×</span>
-      </button>
+      <div class="agent-harness-sidebar-actions">
+        <button
+          id="agent-harness-panel-toggle"
+          class="agent-harness-icon-btn agent-harness-panel-toggle"
+          type="button"
+          aria-label="Close sidebar"
+          title="Close sidebar"
+        >
+          <span class="agent-harness-icon-panel" aria-hidden="true"></span>
+        </button>
+        <button
+          id="agent-harness-search-open"
+          class="agent-harness-icon-btn agent-harness-search-open"
+          type="button"
+          aria-label="Search chats"
+          title="Search chats"
+          aria-haspopup="dialog"
+          aria-controls="agent-session-search"
+        >
+          <span class="agent-harness-icon-search" aria-hidden="true"></span>
+        </button>
+      </div>
     </div>
     <div class="agent-harness-segment" role="group" aria-label="Chat mode">
       <button class="agent-harness-segment-btn is-active" type="button" data-segment="general" aria-pressed="true">
@@ -521,18 +554,48 @@
       <span class="agent-harness-home-mark" aria-hidden="true"></span>
       <span>Home</span>
     </button>
-    <label class="agent-harness-search-wrap" title="Search — later">
-      <span class="visually-hidden">Search chats</span>
-      <input
-        class="agent-harness-search"
-        type="search"
-        placeholder="Search"
-        disabled
-        aria-disabled="true"
-      />
-    </label>
     <div class="agent-harness-sessions" id="agent-harness-session-list"></div>
   </aside>
+  <div
+    id="agent-session-search"
+    class="agent-session-search"
+    hidden
+    inert
+    aria-hidden="true"
+  >
+    <div
+      class="agent-session-search-panel"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Search chats"
+    >
+      <div class="agent-session-search-bar">
+        <span class="agent-session-search-glyph" aria-hidden="true"></span>
+        <input
+          id="agent-session-search-input"
+          class="agent-session-search-input"
+          type="search"
+          placeholder="Search chats"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button
+          id="agent-session-search-close"
+          class="agent-session-search-close"
+          type="button"
+          aria-label="Close search"
+        >
+          <span aria-hidden="true">×</span>
+        </button>
+      </div>
+      <div
+        id="agent-session-search-results"
+        class="agent-session-search-results"
+        role="listbox"
+        aria-label="Chat results"
+      ></div>
+    </div>
+  </div>
   <div class="agent-harness-main">
     <div class="agent-harness-mobile-bar">
       <button
@@ -544,13 +607,25 @@
         aria-controls="agent-harness-sidebar"
         title="Sessions"
       >
-        <span class="agent-harness-drawer-toggle-mark" aria-hidden="true"></span>
+        <span class="agent-harness-icon-panel" aria-hidden="true"></span>
       </button>
       <h2 id="agent-harness-title" class="agent-harness-title">New chat</h2>
+      <button
+        id="agent-harness-search-open-main"
+        class="agent-harness-icon-btn agent-harness-search-open"
+        type="button"
+        aria-label="Search chats"
+        title="Search chats"
+        aria-haspopup="dialog"
+        aria-controls="agent-session-search"
+      >
+        <span class="agent-harness-icon-search" aria-hidden="true"></span>
+      </button>
     </div>
-    <div class="agent-harness-truth visually-hidden" aria-hidden="true">
-      <span>On this device</span>
-      <span>Tools: none</span>
+    <div class="agent-harness-truth" aria-live="polite">
+      <span class="agent-harness-truth-preview">preview</span>
+      <span data-truth-local>On this device</span>
+      <span data-truth-tools>Tools: none</span>
     </div>
     <div class="agent-harness-stream-viewport">
       <div
@@ -626,6 +701,47 @@
           ></div>
         </div>
       </div>
+      <!-- Launcher face — Apps panel; morphs from idle dock (same FLIP as Agent) -->
+      <div
+        id="launcher"
+        class="shelf-face shelf-face-launcher launcher"
+        data-shelf-face="launcher"
+        data-open="false"
+        data-view="grid"
+        aria-hidden="true"
+        inert
+        hidden
+      >
+        <div class="launcher-popover" role="dialog" aria-modal="true" aria-label="Home launcher">
+          <div class="launcher-header shelf-morph-enter" data-morph-enter="0">
+            <div class="launcher-search-wrap" hidden>
+              <input
+                id="launcher-search"
+                class="launcher-search-field"
+                type="search"
+                autocomplete="off"
+                placeholder="Search"
+                spellcheck="false"
+                tabindex="-1"
+                aria-hidden="true"
+              />
+            </div>
+            <p class="launcher-browse-label">Apps</p>
+            <button
+              id="launcher-view-toggle"
+              class="launcher-header-btn"
+              type="button"
+              aria-label="Switch to list view"
+              aria-pressed="false"
+            ></button>
+          </div>
+          <div class="launcher-scroll hide-scrollbar shelf-morph-enter" data-morph-enter="1">
+            <h1 class="launcher-heading visually-hidden">Apps</h1>
+            <div id="launcher-grid" class="launcher-sections"></div>
+            <p id="launcher-empty-state" class="launcher-empty" hidden>No matching items</p>
+          </div>
+        </div>
+      </div>
       <!-- Agent face — composer only; Send opens Agent Harness above (dock stays) -->
       <div class="shelf-face shelf-face-agent" data-shelf-face="agent" aria-hidden="true">
         <div class="agent-composer" role="form" aria-label="Agent composer">
@@ -652,6 +768,18 @@
                 Home
               </button>
               <button
+                id="agent-model-picker"
+                class="agent-model-btn"
+                type="button"
+                aria-haspopup="listbox"
+                aria-expanded="false"
+                title="Local model (preview)"
+              >
+                <span class="agent-model-name">Local</span>
+                <span class="agent-model-tier">preview</span>
+                <span class="agent-model-chevron" aria-hidden="true"></span>
+              </button>
+              <button
                 class="agent-tool-btn"
                 type="button"
                 aria-label="Add context"
@@ -665,8 +793,8 @@
                 type="button"
                 disabled
                 aria-disabled="true"
-                aria-label="Approve for me — session tool scope (preview)"
-                title="Session tools start at zero. Preview only — grant ceremony later."
+                aria-label="Approve for me — not the grant path (preview)"
+                title="Not the grant path. Use in-chat Inbox-style cards (preview). Never mints power."
               >
                 <span class="agent-approve-mark" aria-hidden="true"></span>
                 <span>Approve for me</span>
@@ -674,18 +802,13 @@
             </div>
             <div class="agent-composer-tools-right">
               <button
-                id="agent-model-picker"
-                class="agent-model-btn"
+                class="agent-tool-btn agent-mic-btn"
                 type="button"
-                aria-haspopup="listbox"
-                aria-expanded="false"
-                title="Local model (preview)"
+                disabled
+                aria-disabled="true"
+                aria-label="Voice input — later"
+                title="Voice — later"
               >
-                <span class="agent-model-name">Local</span>
-                <span class="agent-model-tier">preview</span>
-                <span class="agent-model-chevron" aria-hidden="true"></span>
-              </button>
-              <button class="agent-tool-btn agent-mic-btn" type="button" aria-label="Voice input" title="Voice — later">
                 <span class="agent-mic-mark" aria-hidden="true"></span>
               </button>
               <button
@@ -706,38 +829,6 @@
     </div>
   </div>
 </footer>
-
-<aside id="launcher" class="launcher" aria-hidden="true" data-open="false" data-view="grid" inert hidden>
-  <div class="launcher-popover" role="dialog" aria-modal="true" aria-label="Home launcher">
-    <div class="launcher-header">
-      <div class="launcher-search-wrap" hidden>
-        <input
-          id="launcher-search"
-          class="launcher-search-field"
-          type="search"
-          autocomplete="off"
-          placeholder="Search"
-          spellcheck="false"
-          tabindex="-1"
-          aria-hidden="true"
-        />
-      </div>
-      <p class="launcher-browse-label">Apps</p>
-      <button
-        id="launcher-view-toggle"
-        class="launcher-header-btn"
-        type="button"
-        aria-label="Switch to list view"
-        aria-pressed="false"
-      ></button>
-    </div>
-    <div class="launcher-scroll hide-scrollbar">
-      <h1 class="launcher-heading visually-hidden">Apps</h1>
-      <div id="launcher-grid" class="launcher-sections"></div>
-      <p id="launcher-empty-state" class="launcher-empty" hidden>No matching items</p>
-    </div>
-  </div>
-</aside>
 
 <aside id="spotlight" class="spotlight" aria-hidden="true" inert hidden>
   <div class="spotlight-panel" role="dialog" aria-modal="true" aria-label="Search">

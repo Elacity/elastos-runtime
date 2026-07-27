@@ -24,13 +24,13 @@ import {
   shellInteractionActive,
   shouldIgnoreDesktopKeydown,
   targetById,
-} from "./shell-core.js?v=home-20260724ap";
+} from "./shell-core.js?v=home-20260724ci";
 import {
   bindIdentityMenu,
   clearIdentitySurface,
   syncIdentity,
   updateClock,
-} from "./shell-chrome.js?v=home-20260724ap";
+} from "./shell-chrome.js?v=home-20260724ci";
 import {
   beginDesktopMarquee,
   bindShellSurfaceDom,
@@ -52,14 +52,15 @@ import {
   renderDesktop,
   renderLauncher,
   renderTaskbar,
+  introduceDockAfterSessionRestore,
   selectAllDesktopIcons,
   setDockAutoHide,
   toggleLauncher,
   updateDesktopMarquee,
   updateTaskbarState,
-} from "./shell-surface.js?v=home-20260724ap";
-import { bindAgentShelf } from "./agent-shelf.js?v=home-20260724ap";
-import { bindAgentHarness } from "./agent-harness.js?v=home-20260724ap";
+} from "./shell-surface.js?v=home-20260724ci";
+import { bindAgentShelf } from "./agent-shelf.js?v=home-20260724ci";
+import { bindAgentHarness } from "./agent-harness.js?v=home-20260724ci";
 import {
   closeWindow,
   cleanupBeforeUnload,
@@ -70,47 +71,48 @@ import {
   restoreShellSession,
   showDesktopHome,
   supportsMenuNewWindow,
-} from "./shell-windows.js?v=home-20260724ap";
+} from "./shell-windows.js?v=home-20260724ci";
 import {
   bindShellKeyboard,
   handleDesktopArrowKey,
   retireKeyboardSurfaces,
   toggleShortcutsOverlay,
-} from "./shell-keyboard.js?v=home-20260724ap";
+} from "./shell-keyboard.js?v=home-20260724ci";
 import {
   bindSpotlight,
   hideSpotlight,
   showSpotlight,
-} from "./shell-spotlight.js?v=home-20260724ap";
+} from "./shell-spotlight.js?v=home-20260724ci";
 import {
   bindNotificationCenter,
   hideNotificationCenter,
   recordNotifications,
-} from "./shell-notifications.js?v=home-20260724ap";
+} from "./shell-notifications.js?v=home-20260724ci";
 import {
   bindMenubar,
   closeMenus,
   setMenuManifest,
   syncMenubar,
-} from "./shell-menubar.js?v=home-20260724ap";
+} from "./shell-menubar.js?v=home-20260724ci";
 import {
   bindQuickLook,
   hideQuickLook,
   toggleQuickLook,
-} from "./shell-quicklook.js?v=home-20260724ap";
-import { bindExpose, closeExpose, toggleExpose } from "./shell-expose.js?v=home-20260724ap";
+} from "./shell-quicklook.js?v=home-20260724ci";
+import { bindExpose, closeExpose, toggleExpose } from "./shell-expose.js?v=home-20260724ci";
 import {
+  bindMobilePlaneSwipe,
   bindSpaceEdgePeek,
   bindSpacePager,
   toggleActiveFullscreenStage,
-} from "./shell-stages.js?v=home-20260724ap";
-import { setUiSoundsEnabled } from "./shell-sounds.js?v=home-20260724ap";
-import { setFocusModeEnabled } from "./shell-core.js?v=home-20260724ap";
+} from "./shell-stages.js?v=home-20260724ci";
+import { setUiSoundsEnabled } from "./shell-sounds.js?v=home-20260724ci";
+import { setFocusModeEnabled } from "./shell-core.js?v=home-20260724ci";
 import {
   bindControlCentre,
   hideControlCentre,
   syncControlCentre,
-} from "./shell-control-centre.js?v=home-20260724ap";
+} from "./shell-control-centre.js?v=home-20260724ci";
 import {
   bindWalletRail,
   retireWalletRail,
@@ -119,7 +121,7 @@ import {
   walletRailFrame,
   walletRailOpen,
   walletRailSessionMounted,
-} from "./shell-wallet-rail.js?v=home-20260724ap";
+} from "./shell-wallet-rail.js?v=home-20260724ci";
 import {
   bindInboxRail,
   retireInboxRail,
@@ -128,7 +130,7 @@ import {
   inboxRailFrame,
   inboxRailOpen,
   inboxRailSessionMounted,
-} from "./shell-inbox-rail.js?v=home-20260724ap";
+} from "./shell-inbox-rail.js?v=home-20260724ci";
 import {
   bindConnectorSheet,
   connectorSheetFrame,
@@ -137,7 +139,7 @@ import {
   noteConnectorSheetSummaryRefresh,
   retireConnectorSheet,
   showConnectorSheet,
-} from "./shell-connector-sheet.js?v=home-20260724ap";
+} from "./shell-connector-sheet.js?v=home-20260724ci";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
@@ -153,6 +155,7 @@ bindQuickLook();
 bindExpose();
 bindSpacePager();
 bindSpaceEdgePeek();
+bindMobilePlaneSwipe();
 bindShellKeyboard();
 bindMenubar({ closeWindow, openTarget, supportsNewWindow: supportsMenuNewWindow });
 bindControlCentre();
@@ -188,6 +191,7 @@ export const homeGuiWindowHooks = Object.freeze({
   updateClock,
   renderDesktop,
   renderTaskbar,
+  introduceDockAfterSessionRestore,
   updateTaskbarState,
 });
 
@@ -204,6 +208,7 @@ configureWindowHooks({
   refreshLauncherIfVisible,
   renderDesktop,
   renderTaskbar,
+  introduceDockAfterSessionRestore,
   syncMenubar,
   updateTaskbarState,
   // Host-mediated launches (Anders): GUI never fetch-launches; shell-windows
@@ -1235,8 +1240,13 @@ export function bindHomeGuiInteractions(options = {}) {
     }
     if (
       event.target.closest("#desktop-context-menu") ||
+      event.target.closest("#launcher") ||
       event.target.closest(".launcher-popover") ||
-      event.target.closest("#launcher-toggle")
+      event.target.closest("#launcher-toggle") ||
+      /* Whole Shelf/dock — right-click, drag, pin ops must not collapse Apps. */
+      event.target.closest(".taskbar") ||
+      /* Open windows (incl. close) — Apps stays up like multi-open from the grid. */
+      event.target.closest(".window")
     ) {
       return;
     }
