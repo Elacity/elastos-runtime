@@ -63,10 +63,38 @@ async fn yield_until_close_count(
     );
 }
 
+async fn yield_until_cleanup_obligation_count(state: &GatewayState, expected: usize) {
+    for _ in 0..10_000 {
+        if browser_engine_cleanup_obligation_count(&state.data_dir).await == expected {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!(
+        "cleanup obligations did not reach {expected}; observed {}",
+        browser_engine_cleanup_obligation_count(&state.data_dir).await
+    );
+}
+
 async fn finish_current_reconciliation_sweep() {
     for _ in 0..1_000 {
         tokio::task::yield_now().await;
     }
+}
+
+async fn advance_until_atomic(
+    counter: &std::sync::atomic::AtomicUsize,
+    expected: usize,
+    step: Duration,
+) {
+    for _ in 0..10 {
+        if counter.load(Ordering::SeqCst) >= expected {
+            return;
+        }
+        tokio::time::advance(step).await;
+        finish_current_reconciliation_sweep().await;
+    }
+    yield_until_atomic(counter, expected).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -194,8 +222,7 @@ async fn transient_reconciliation_failure_retries_with_backoff_and_retains_owner
     );
     assert!(close_calls.lock().await.is_empty());
     finish_current_reconciliation_sweep().await;
-    tokio::time::advance(Duration::from_millis(100)).await;
-    yield_until_atomic(&reconciliation_calls, 2).await;
+    advance_until_atomic(&reconciliation_calls, 2, Duration::from_millis(100)).await;
     yield_until_close_count(&close_calls, 1).await;
     assert_eq!(
         browser_launch_reconciliation_obligation_count(&state.data_dir).await,
@@ -238,8 +265,7 @@ async fn reconciliation_timeout_retains_exact_ownership_until_late_terminal_clea
     );
     assert!(close_calls.lock().await.is_empty());
 
-    tokio::time::advance(Duration::from_millis(100)).await;
-    yield_until_atomic(&reconciliation_calls, 2).await;
+    advance_until_atomic(&reconciliation_calls, 2, Duration::from_millis(100)).await;
     yield_until_close_count(&close_calls, 1).await;
     assert_eq!(
         browser_launch_reconciliation_obligation_count(&state.data_dir).await,
@@ -404,6 +430,7 @@ async fn exact_cleanup_ownership_remains_until_typed_terminal_receipt() {
     drop(close_calls_guard);
 
     yield_until_close_count(&close_calls, 3).await;
+    yield_until_cleanup_obligation_count(&state, 0).await;
     reconciler.cancel();
     reconciler.join().await.expect("Runtime shutdown");
     assert_eq!(
