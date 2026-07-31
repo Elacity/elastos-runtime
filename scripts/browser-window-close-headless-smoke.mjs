@@ -557,8 +557,9 @@ try {
     requestId: "headless-close-unknown-completed",
   };
   await shellFrame.evaluate((message) => window.__browserCloseProof.send(message), request);
-  await shellFrame.waitForFunction(() => window.__browserCloseProof.resultCount() === 3);
+  await shellFrame.waitForFunction(() => window.__browserCloseProof.resultCount() === 4);
   const results = await shellFrame.evaluate(() => window.__browserCloseProof.results());
+  const binding = results.at(-2);
   const result = results.at(-1);
   assert(
     state.closeCalls.length === 1 &&
@@ -568,6 +569,17 @@ try {
       state.closeCalls[0].body?.browser_instance === browserInstance,
     "actual Browser did not close the exact Runtime owner once",
     state,
+  );
+  assert(
+    binding.requestId === request.requestId &&
+      binding.state === "pending" &&
+      binding.pageId === "page-2" &&
+      binding.generation === 0 &&
+      binding.cleanupId === "cleanup-2" &&
+      binding.terminalKind === "" &&
+      binding.reason === "cleanup_in_flight",
+    "old retained Browser frame did not bind its exact lifecycle before close",
+    binding,
   );
   assert(
     Object.keys(result).sort().join(",") ===

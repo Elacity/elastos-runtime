@@ -9,6 +9,14 @@ const browserSource = fs.readFileSync(
   new URL("../capsules/browser/browser/browser.js", import.meta.url),
   "utf8",
 );
+const browserCleanupSource = fs.readFileSync(
+  new URL("../capsules/browser/browser/browser-page-cleanup.js", import.meta.url),
+  "utf8",
+);
+const homeShellWindowsSource = fs.readFileSync(
+  new URL("../capsules/home-gui/browser/shell-windows.js", import.meta.url),
+  "utf8",
+);
 const homeGuiShellSource = fs.readFileSync(
   new URL("../capsules/home-gui/browser/home-gui-shell.js", import.meta.url),
   "utf8",
@@ -48,10 +56,20 @@ function extractFunction(source, name) {
 
 function numericConstant(source, name) {
   const match = source.match(
-    new RegExp(`const ${name} = ([0-9_]+);`),
+    new RegExp(`(?:export )?const ${name} = ([0-9_]+);`),
   );
   assert.ok(match, `${name} constant not found`);
   return Number(match[1].replaceAll("_", ""));
+}
+
+function numericArrayConstant(source, name) {
+  const match = source.match(
+    new RegExp(`(?:export )?const ${name} = \\[([^\\]]+)\\];`),
+  );
+  assert.ok(match, `${name} array constant not found`);
+  return [...match[1].matchAll(/[0-9_]+/g)].map((value) =>
+    Number(value[0].replaceAll("_", "")),
+  );
 }
 
 const handshakeSource = [
@@ -60,6 +78,7 @@ const handshakeSource = [
   "hasExactMessageKeys",
   "isHomeBrowserWindowCloseRequest",
   "postHomeBrowserWindowCloseResult",
+  "deliverPendingHomeBrowserWindowClose",
   "runtimeOpenResultPage",
   "pendingWindowCloseOwnership",
   "terminalRuntimeOpenOutcome",
@@ -286,6 +305,7 @@ function createHarness({
     runtimeOwnershipTerminallyAbsent: terminallyAbsent,
     homeWindowCloseInFlight: false,
     homeWindowTerminalCloseConfirmed: false,
+    pendingHomeWindowCloseDelivery: null,
     window: { parent },
     recoverableRuntimePage() {
       return recoverable ? page : null;
@@ -337,7 +357,7 @@ function createHarness({
     },
   });
   vm.runInContext(
-    `${handshakeSource}\nthis.handshake = { finalizeRuntimePageClose, handleHomeBrowserWindowCloseRequest, normalizeRuntimeOpenUrl, settleInitialRuntimeOpenPostFailure };`,
+    `${handshakeSource}\nthis.handshake = { deliverPendingHomeBrowserWindowClose, finalizeRuntimePageClose, handleHomeBrowserWindowCloseRequest, normalizeRuntimeOpenUrl, settleInitialRuntimeOpenPostFailure };`,
     context,
   );
   const request = {
@@ -354,6 +374,7 @@ function createHarness({
     posted,
     request,
     statuses,
+    deliver: context.handshake.deliverPendingHomeBrowserWindowClose,
     finalize: context.handshake.finalizeRuntimePageClose,
     handle: context.handshake.handleHomeBrowserWindowCloseRequest,
     normalizeOpenUrl: context.handshake.normalizeRuntimeOpenUrl,
@@ -382,7 +403,12 @@ test("exact parent request closes the exact owner and returns terminal receipt",
     { ...harness.closeCalls[0].options },
     { explicitRetry: true },
   );
-  assert.deepEqual(Object.keys(harness.posted[0].message).sort(), [
+  assert.equal(harness.posted.length, 2);
+  assert.equal(harness.posted[0].message.state, "pending");
+  assert.equal(harness.posted[0].message.reason, "cleanup_in_flight");
+  assert.equal(harness.posted[0].message.pageId, "page-exact");
+  assert.equal(harness.posted[0].message.cleanupId, "cleanup-exact");
+  assert.deepEqual(Object.keys(harness.posted[1].message).sort(), [
     "browserInstance",
     "cleanupId",
     "generation",
@@ -395,7 +421,7 @@ test("exact parent request closes the exact owner and returns terminal receipt",
     "type",
   ]);
   assert.deepEqual(
-    { ...harness.posted[0].message },
+    { ...harness.posted[1].message },
     {
       type: "elastos.browser.window-close.result/v1",
       requestId: "request-exact",
@@ -410,6 +436,7 @@ test("exact parent request closes the exact owner and returns terminal receipt",
     },
   );
   assert.equal(harness.posted[0].origin, "*");
+  assert.equal(harness.posted[1].origin, "*");
 });
 
 test("timed-out open remains pending while its exact Runtime job is pending", async () => {
@@ -492,9 +519,10 @@ test("timed-out open resolves its completed exact owner before terminal close", 
     { ...harness.closeCalls[0].options },
     { explicitRetry: true },
   );
-  assert.equal(harness.posted[0].message.state, "terminal");
-  assert.equal(harness.posted[0].message.pageId, "page-exact");
-  assert.equal(harness.posted[0].message.cleanupId, "cleanup-exact");
+  assert.equal(harness.posted[0].message.state, "pending");
+  assert.equal(harness.posted.at(-1).message.state, "terminal");
+  assert.equal(harness.posted.at(-1).message.pageId, "page-exact");
+  assert.equal(harness.posted.at(-1).message.cleanupId, "cleanup-exact");
 });
 
 test("ambiguous initial open replays the exact intent and remains nonterminal", async () => {
@@ -914,10 +942,189 @@ test("pending cleanup returns a retryable nonterminal receipt", async () => {
     source: harness.parent,
     data: harness.request,
   });
-  assert.equal(harness.posted[0].message.state, "pending");
-  assert.equal(harness.posted[0].message.reason, "transport_failure");
+  assert.equal(harness.posted[0].message.reason, "cleanup_in_flight");
+  assert.equal(harness.posted[1].message.state, "pending");
+  assert.equal(harness.posted[1].message.reason, "transport_failure");
   assert.match(harness.statuses[0].message, /again to retry/);
   assert.equal(harness.statuses[0].options.sticky, true);
+  for (const substitutedOwner of [
+    { ...harness.owner, page_id: "page-substituted" },
+    { ...harness.owner, generation: 8 },
+    {
+      ...harness.owner,
+      runtime_cleanup: {
+        ...harness.owner.runtime_cleanup,
+        id: "cleanup-substituted",
+      },
+    },
+  ]) {
+    assert.equal(
+      harness.deliver(substitutedOwner, {
+        state: "terminal",
+        page_id: substitutedOwner.page_id,
+        generation: substitutedOwner.generation,
+        terminal_kind: "already_absent",
+      }),
+      false,
+    );
+    assert.equal(harness.posted.length, 2);
+  }
+  assert.equal(
+    harness.deliver(harness.owner, {
+      state: "terminal",
+      page_id: "page-exact",
+      generation: 7,
+      terminal_kind: "already_absent",
+    }),
+    true,
+  );
+  assert.equal(harness.posted.length, 3);
+  assert.deepEqual(
+    { ...harness.posted[2].message },
+    {
+      type: "elastos.browser.window-close.result/v1",
+      requestId: "request-exact",
+      homeToken: "launch-token-exact",
+      browserInstance: "browser:0123456789abcdef0123456789abcdef",
+      state: "terminal",
+      pageId: "page-exact",
+      generation: 7,
+      cleanupId: "cleanup-exact",
+      terminalKind: "already_absent",
+      reason: "",
+    },
+  );
+  assert.equal(
+    harness.deliver(harness.owner, {
+      state: "terminal",
+      page_id: "page-exact",
+      generation: 7,
+      terminal_kind: "already_absent",
+    }),
+    false,
+  );
+  assert.equal(harness.posted.length, 3);
+  assert.equal(harness.closeCalls.length, 1);
+});
+
+test("delayed terminal delivery supports an exact restored owner", async () => {
+  const harness = createHarness({
+    recoverable: true,
+    outcome: {
+      state: "pending",
+      page_id: "page-exact",
+      generation: 0,
+      reason: "transport_failure",
+    },
+  });
+  await harness.handle({
+    origin: "null",
+    source: harness.parent,
+    data: harness.request,
+  });
+  assert.equal(harness.posted[0].message.reason, "cleanup_in_flight");
+  assert.equal(harness.posted[1].message.state, "pending");
+  assert.equal(
+    harness.deliver(harness.owner, {
+      state: "terminal",
+      page_id: "page-exact",
+      generation: 0,
+      terminal_kind: "already_absent",
+    }),
+    true,
+  );
+  assert.equal(harness.posted[2].message.state, "terminal");
+  assert.equal(harness.posted[2].message.generation, 0);
+  assert.equal(harness.posted[2].message.terminalKind, "already_absent");
+});
+
+test("a retry replaces the sole pending Home delivery for the same owner", async () => {
+  const harness = createHarness({
+    outcome: {
+      state: "pending",
+      page_id: "page-exact",
+      generation: 7,
+      reason: "transport_failure",
+    },
+  });
+  await harness.handle({
+    origin: "null",
+    source: harness.parent,
+    data: harness.request,
+  });
+  const retryRequest = { ...harness.request, requestId: "request-retry" };
+  await harness.handle({
+    origin: "null",
+    source: harness.parent,
+    data: retryRequest,
+  });
+  assert.equal(harness.closeCalls.length, 2);
+  assert.deepEqual(
+    harness.posted.map(({ message }) => message.requestId),
+    ["request-exact", "request-exact", "request-retry", "request-retry"],
+  );
+  assert.equal(
+    harness.deliver(harness.owner, {
+      state: "terminal",
+      page_id: "page-exact",
+      generation: 7,
+      terminal_kind: "already_absent",
+    }),
+    true,
+  );
+  assert.deepEqual(
+    harness.posted.map(({ message }) => message.requestId),
+    [
+      "request-exact",
+      "request-exact",
+      "request-retry",
+      "request-retry",
+      "request-retry",
+    ],
+  );
+});
+
+test("Home close deadline covers the complete bounded Runtime retry schedule", () => {
+  const homeTimeout = numericConstant(
+    homeShellWindowsSource,
+    "BROWSER_WINDOW_CLOSE_TIMEOUT_MS",
+  );
+  const attemptTimeout = numericConstant(
+    browserCleanupSource,
+    "RUNTIME_PAGE_CLOSE_TIMEOUT_MS",
+  );
+  const retryDelays = numericArrayConstant(
+    browserCleanupSource,
+    "RUNTIME_PAGE_CLEANUP_RETRY_DELAYS_MS",
+  );
+  const runtimeBound =
+    attemptTimeout * (retryDelays.length + 1) +
+    retryDelays.reduce((sum, delay) => sum + delay, 0);
+  assert.ok(homeTimeout > runtimeBound, { homeTimeout, runtimeBound });
+});
+
+test("pending Home close blocks creation of a replacement Runtime owner", async () => {
+  const context = vm.createContext({
+    runtimeOpenInFlight: 0,
+    homeWindowCloseInFlight: false,
+    pendingHomeWindowCloseDelivery: {},
+    homeWindowTerminalCloseConfirmed: false,
+    currentPage: { page_id: "page-exact" },
+    currentPageGeneration: 7,
+    cleanupPendingError(outcome) {
+      const error = new Error("cleanup pending");
+      error.cleanupOutcome = outcome;
+      return error;
+    },
+  });
+  vm.runInContext(
+    `${extractFunction(browserSource, "requestRuntimeOpen")}\nthis.requestRuntimeOpen = requestRuntimeOpen;`,
+    context,
+  );
+  await assert.rejects(
+    context.requestRuntimeOpen("https://example.com/"),
+    (error) => error?.cleanupOutcome?.reason === "home_window_close_pending",
+  );
 });
 
 test("ownership-changing open returns pending without closing or claiming terminal", async () => {
@@ -959,9 +1166,10 @@ test("recoverable Runtime owner is closed exactly when no current page exists", 
   });
   assert.equal(harness.closeCalls.length, 1);
   assert.equal(harness.closeCalls[0].candidate, harness.owner);
-  assert.equal(harness.posted[0].message.state, "terminal");
-  assert.equal(harness.posted[0].message.terminalKind, "already_absent");
-  assert.equal(harness.posted[0].message.cleanupId, "cleanup-exact");
+  assert.equal(harness.posted[0].message.state, "pending");
+  assert.equal(harness.posted.at(-1).message.state, "terminal");
+  assert.equal(harness.posted.at(-1).message.terminalKind, "already_absent");
+  assert.equal(harness.posted.at(-1).message.cleanupId, "cleanup-exact");
 });
 
 test("source, token, instance, origin, type, and shape substitutions fail closed", async () => {
@@ -994,9 +1202,10 @@ test("unexpected close errors return error receipts without implying terminal", 
     source: harness.parent,
     data: harness.request,
   });
-  assert.equal(harness.posted[0].message.state, "error");
-  assert.equal(harness.posted[0].message.terminalKind, "");
-  assert.equal(harness.posted[0].message.reason, "close_error");
+  assert.equal(harness.posted[0].message.state, "pending");
+  assert.equal(harness.posted.at(-1).message.state, "error");
+  assert.equal(harness.posted.at(-1).message.terminalKind, "");
+  assert.equal(harness.posted.at(-1).message.reason, "close_error");
 });
 
 test("iframe unload and refresh remain teardown-only", () => {

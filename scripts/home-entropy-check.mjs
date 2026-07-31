@@ -4427,6 +4427,8 @@ assert(
     shellWindows.includes('"elastos.browser.window-close.result/v1"') &&
     shellWindows.includes("event.source !== record.frameWindow") &&
     shellWindows.includes("markBrowserWindowCloseState(record.entry, \"retry\")") &&
+    shellWindows.includes("const BROWSER_WINDOW_CLOSE_TIMEOUT_MS = 50_000;") &&
+    shellWindows.includes("Boolean(record.lifecycle)") &&
     shellWindows.includes("Promise.all(entries.map((entry) => closeWindow(entry.id)))") &&
     shellWindows.includes(
       "export function renewBrowserWindowAuthority(id, options = {})",
@@ -4471,10 +4473,13 @@ assert(
       "const BROWSER_AUTHORITY_RENEWAL_ACK_TIMEOUT_MS = 40_000;",
     ) &&
     browserMain.includes("async function handleHomeBrowserWindowCloseRequest(event)") &&
+    browserMain.includes("function deliverPendingHomeBrowserWindowClose(owner, outcome)") &&
+    browserMain.includes("pendingHomeWindowCloseDelivery") &&
     browserMain.includes("runtimeOpenInFlight > 0") &&
     browserMain.includes("await closeRuntimePage(owner, { explicitRetry: true })") &&
+    shellWindows.includes("record.lifecycle = Object.freeze(lifecycle)") &&
     homeShellRegressionSmoke.includes(
-      "nonterminal Browser cleanup did not retain the exact frame and expose retry",
+      "nonterminal Browser cleanup ended the close handshake before Runtime settled",
     ) &&
     homeShellRegressionSmoke.includes(
       "expired Browser authority close blocked in-place renewal of the active owner",
@@ -4492,7 +4497,7 @@ assert(
       "retired old Browser authority remained able to request renewal",
     ) &&
     homeShellRegressionSmoke.includes(
-      "group close did not accept the exact already-absent Browser cleanup receipt",
+      "exact delayed already-absent Browser cleanup did not remove the window",
     ) &&
     browserJs.includes("window.__elastosBrowserCurrentPageId") &&
     gatewayApi.includes('"/api/apps/browser/pages/:page_id/close"') &&

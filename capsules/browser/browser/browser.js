@@ -126,6 +126,7 @@ let unsettledRuntimeOpen = null;
 let runtimeOwnershipTerminallyAbsent = false;
 let homeWindowCloseInFlight = false;
 let homeWindowTerminalCloseConfirmed = false;
+let pendingHomeWindowCloseDelivery = null;
 let selectedBrowserEngineId = params.get("browser_engine_id") || params.get("adapter_id") || "";
 let currentBrowserEngineId = "";
 let selectedRemoteExitId = params.get("remote_exit_id") || "";
@@ -472,6 +473,7 @@ const runtimePageCleanup = createRuntimePageCleanupController({
   },
   onTerminal: (owner, _outcome, failure) => {
     const applied = finalizeRuntimePageClose(owner);
+    deliverPendingHomeBrowserWindowClose(owner, _outcome);
     if (applied && failure && !unloadCleanupStarted) {
       showStatus(
         "Runtime confirmed the failed Browser session closed. You can open the address again or choose another Browser Engine.",
@@ -628,6 +630,26 @@ function postHomeBrowserWindowCloseResult(message, owner, outcome, error = null)
   );
 }
 
+function deliverPendingHomeBrowserWindowClose(owner, outcome) {
+  const delivery = pendingHomeWindowCloseDelivery;
+  const currentOwner = currentRuntimePageOwner();
+  if (
+    !delivery ||
+    outcome?.state !== "terminal" ||
+    !["closed", "already_absent"].includes(outcome.terminal_kind) ||
+    outcome.page_id !== owner?.page_id ||
+    Number(outcome.generation) !== Number(owner?.generation) ||
+    !sameRuntimePageOwner(delivery.owner, owner) ||
+    (currentOwner && !sameRuntimePageOwner(currentOwner, owner))
+  ) {
+    return false;
+  }
+  pendingHomeWindowCloseDelivery = null;
+  homeWindowTerminalCloseConfirmed = true;
+  postHomeBrowserWindowCloseResult(delivery.message, owner, outcome);
+  return true;
+}
+
 async function handleHomeBrowserWindowCloseRequest(event) {
   if (!isHomeBrowserWindowCloseRequest(event)) {
     return false;
@@ -662,6 +684,7 @@ async function handleHomeBrowserWindowCloseRequest(event) {
       const ownership = await resolveRuntimeOwnershipForWindowClose();
       if (ownership.state !== "owned") {
         if (ownership.state === "terminal") {
+          pendingHomeWindowCloseDelivery = null;
           unsettledRuntimeOpen = null;
           runtimeOwnershipTerminallyAbsent = true;
           homeWindowTerminalCloseConfirmed = true;
@@ -687,15 +710,32 @@ async function handleHomeBrowserWindowCloseRequest(event) {
         return true;
       }
     }
+    if (owner) {
+      postHomeBrowserWindowCloseResult(message, owner, {
+        state: "pending",
+        page_id: owner.page_id,
+        generation: owner.generation,
+        reason: "cleanup_in_flight",
+      });
+    }
     const outcome = owner
       ? await closeRuntimePage(owner, { explicitRetry: true })
       : await closeRuntimePage(page, { generation, explicitRetry: true });
     if (outcome?.state === "terminal") {
+      if (
+        pendingHomeWindowCloseDelivery &&
+        sameRuntimePageOwner(pendingHomeWindowCloseDelivery.owner, owner)
+      ) {
+        pendingHomeWindowCloseDelivery = null;
+      }
       unsettledRuntimeOpen = null;
       runtimeOwnershipTerminallyAbsent = true;
       homeWindowTerminalCloseConfirmed = true;
-    }
-    if (outcome?.state !== "terminal") {
+    } else {
+      pendingHomeWindowCloseDelivery = Object.freeze({
+        message: Object.freeze({ ...message }),
+        owner,
+      });
       showStatus(
         "Runtime cleanup is pending. Close Browser again to retry.",
         { sticky: true },
@@ -703,6 +743,12 @@ async function handleHomeBrowserWindowCloseRequest(event) {
     }
     postHomeBrowserWindowCloseResult(message, owner, outcome);
   } catch (_error) {
+    if (
+      pendingHomeWindowCloseDelivery &&
+      sameRuntimePageOwner(pendingHomeWindowCloseDelivery.owner, owner)
+    ) {
+      pendingHomeWindowCloseDelivery = null;
+    }
     showStatus(
       "Runtime cleanup could not be confirmed. Close Browser again to retry.",
       { sticky: true },
@@ -1743,6 +1789,7 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
   if (
     runtimeOpenInFlight > 0 ||
     homeWindowCloseInFlight ||
+    pendingHomeWindowCloseDelivery ||
     homeWindowTerminalCloseConfirmed
   ) {
     throw cleanupPendingError({
@@ -1753,7 +1800,9 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
         ? "runtime_open_in_flight"
         : homeWindowTerminalCloseConfirmed
           ? "home_window_close_confirmed"
-          : "home_window_close_in_flight",
+          : pendingHomeWindowCloseDelivery
+            ? "home_window_close_pending"
+            : "home_window_close_in_flight",
     });
   }
   const nextUrl = normalizeRuntimeOpenUrl(value);

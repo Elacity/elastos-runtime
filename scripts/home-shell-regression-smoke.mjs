@@ -437,6 +437,10 @@ assert(
 );
 const renewedBrowserToken = "browser-window-renewed-token-3";
 const firstBrowserClose = shellWindows.closeWindow(restoredBrowserEntry.id);
+let firstBrowserCloseSettled = false;
+firstBrowserClose.finally(() => {
+  firstBrowserCloseSettled = true;
+});
 const firstBrowserCloseRequest = browserCloseMessages.at(-1);
 assert(
   firstBrowserCloseRequest?.origin === "*" &&
@@ -475,39 +479,83 @@ assert(
 sendWindowEvent("message", {
   origin: "null",
   source: restoredBrowserFrame.contentWindow,
-  data: pendingResult,
-});
-assert(
-  await firstBrowserClose === false &&
-    shellCore.shellState.windows.has(restoredBrowserEntry.id) &&
-    restoredBrowserEntry.node.dataset.browserCloseState === "retry" &&
-    restoredBrowserEntry.node
-      .querySelector("[data-action='close']")
-      .getAttribute("aria-label") === "Retry Browser close",
-  "nonterminal Browser cleanup did not retain the exact frame and expose retry",
-  {
-    state: restoredBrowserEntry.node.dataset.browserCloseState,
-    windows: [...shellCore.shellState.windows.keys()],
-  },
-);
-const secondBrowserClose = shellWindows.closeAllTargetWindows("browser");
-const secondBrowserCloseRequest = browserCloseMessages.at(-1);
-sendWindowEvent("message", {
-  origin: "null",
-  source: restoredBrowserFrame.contentWindow,
   data: {
     ...pendingResult,
-    requestId: secondBrowserCloseRequest.message.requestId,
+    pageId: "page-substituted-before-binding",
     state: "terminal",
     terminalKind: "already_absent",
     reason: "",
   },
 });
 assert(
-  await secondBrowserClose === true &&
+  shellCore.shellState.windows.has(restoredBrowserEntry.id),
+  "an unbound immediate terminal receipt removed Browser",
+);
+sendWindowEvent("message", {
+  origin: "null",
+  source: restoredBrowserFrame.contentWindow,
+  data: pendingResult,
+});
+await Promise.resolve();
+assert(
+  firstBrowserCloseSettled === false &&
+    shellCore.shellState.windows.has(restoredBrowserEntry.id) &&
+    restoredBrowserEntry.node.dataset.browserCloseState === "pending" &&
+    restoredBrowserEntry.node
+      .querySelector("[data-action='close']")
+      .disabled === true &&
+    restoredBrowserEntry.node
+      .querySelector("[data-action='close']")
+      .getAttribute("aria-label") === "Close",
+  "nonterminal Browser cleanup ended the close handshake before Runtime settled",
+  {
+    state: restoredBrowserEntry.node.dataset.browserCloseState,
+    windows: [...shellCore.shellState.windows.keys()],
+  },
+);
+assert(
+  shellWindows.closeWindow(restoredBrowserEntry.id) === firstBrowserClose &&
+    browserCloseMessages.length === 2,
+  "a duplicate close replaced the live Home-to-Browser request",
+);
+for (const substitutedIdentity of [
+  { pageId: "page-wrong" },
+  { generation: 2 },
+  { cleanupId: "cleanup-wrong" },
+]) {
+  sendWindowEvent("message", {
+    origin: "null",
+    source: restoredBrowserFrame.contentWindow,
+    data: {
+      ...pendingResult,
+      ...substitutedIdentity,
+      state: "terminal",
+      terminalKind: "already_absent",
+      reason: "",
+    },
+  });
+}
+await Promise.resolve();
+assert(
+  firstBrowserCloseSettled === false &&
+    shellCore.shellState.windows.has(restoredBrowserEntry.id),
+  "a terminal receipt for a substituted Browser lifecycle removed the window",
+);
+sendWindowEvent("message", {
+  origin: "null",
+  source: restoredBrowserFrame.contentWindow,
+  data: {
+    ...pendingResult,
+    state: "terminal",
+    terminalKind: "already_absent",
+    reason: "",
+  },
+});
+assert(
+  await firstBrowserClose === true &&
     !shellCore.shellState.windows.has(restoredBrowserEntry.id),
-  "group close did not accept the exact already-absent Browser cleanup receipt",
-  { secondBrowserCloseRequest, windows: [...shellCore.shellState.windows.keys()] },
+  "exact delayed already-absent Browser cleanup did not remove the window",
+  { firstBrowserCloseRequest, windows: [...shellCore.shellState.windows.keys()] },
 );
 shellCore.shellState.activeWindowId = null;
 shellCore.shellState.homeBrowserState.session = null;

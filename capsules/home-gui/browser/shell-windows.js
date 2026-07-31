@@ -46,7 +46,8 @@ const WINDOW_MAXIMIZE_CLOSE_GUARD_MS = 360;
 const WINDOW_OPEN_CLOSE_GHOST_GUARD_MS = 2600;
 const WINDOW_CLOSE_GUARD_MOVE_PX = 18;
 const BROWSER_DESKTOP_OPEN_GUARD_MS = 700;
-const BROWSER_WINDOW_CLOSE_TIMEOUT_MS = 10_000;
+// Four 8s Runtime close attempts plus bounded 1.2s, 3s, and 7s retries.
+const BROWSER_WINDOW_CLOSE_TIMEOUT_MS = 50_000;
 const BROWSER_WINDOW_CLOSE_REQUEST_TYPE =
   "elastos.browser.window-close.request/v1";
 const BROWSER_WINDOW_CLOSE_RESULT_TYPE =
@@ -612,11 +613,56 @@ function handleBrowserWindowCloseResult(event) {
   ) {
     return;
   }
+  const lifecycle = {
+    pageId: message.pageId,
+    generation: message.generation,
+    cleanupId: message.cleanupId,
+  };
+  const matchesBoundLifecycle =
+    !record.lifecycle ||
+    (record.lifecycle.pageId === lifecycle.pageId &&
+      record.lifecycle.generation === lifecycle.generation &&
+      record.lifecycle.cleanupId === lifecycle.cleanupId);
+  if (message.state === "pending") {
+    if (
+      message.terminalKind !== "" ||
+      !message.reason ||
+      !matchesBoundLifecycle
+    ) {
+      return;
+    }
+    const hasLifecycle = Boolean(message.pageId && message.cleanupId);
+    if (
+      hasLifecycle !== Boolean(message.pageId || message.cleanupId) ||
+      (!hasLifecycle && message.generation !== 0)
+    ) {
+      return;
+    }
+    if (!record.lifecycle && hasLifecycle) {
+      record.lifecycle = Object.freeze(lifecycle);
+    }
+    return;
+  }
+  if (message.state === "error") {
+    if (message.terminalKind === "" && message.reason) {
+      settleBrowserWindowClose(record, false);
+    }
+    return;
+  }
   const terminal =
-    message.state === "terminal" &&
-    ["closed", "already_absent", "no_page"].includes(message.terminalKind) &&
-    message.reason === "";
-  settleBrowserWindowClose(record, terminal);
+    message.reason === "" &&
+    ((["closed", "already_absent"].includes(message.terminalKind) &&
+      Boolean(message.pageId && message.cleanupId) &&
+      Boolean(record.lifecycle) &&
+      matchesBoundLifecycle) ||
+      (message.terminalKind === "no_page" &&
+        !record.lifecycle &&
+        message.pageId === "" &&
+        message.generation === 0 &&
+        message.cleanupId === ""));
+  if (terminal) {
+    settleBrowserWindowClose(record, true);
+  }
 }
 
 function requestBrowserWindowClose(entry) {

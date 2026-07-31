@@ -17,6 +17,10 @@ const pageId = "browser-page-fixture-0001";
 const principalId = "did:elastos:fixture-home-refresh";
 const recoveredCleanupId = "browser-cleanup:fixture-recovered";
 const openedCleanupId = "browser-cleanup:fixture-opened";
+let releaseBrowserWindowCloseTerminal;
+const browserWindowCloseTerminalGate = new Promise((resolveGate) => {
+  releaseBrowserWindowCloseTerminal = resolveGate;
+});
 
 const state = {
   phase: "placeholder",
@@ -32,6 +36,9 @@ const state = {
   browserPageCount: 0,
   browserVmCount: 0,
   browserCleanupEffects: 0,
+  browserWindowCloseRequests: 0,
+  browserWindowCloseTerminalReceipts: 0,
+  browserReapedCleanupId: null,
   activeCleanupId: null,
   homeStateWrites: [],
   errors: [],
@@ -519,9 +526,39 @@ async function handleApi(req, res, url) {
     const closeRequest = await readBody(req);
     if (
       closeRequest?.schema !== "elastos.browser.close-request/v2" ||
-      closeRequest.cleanup_id !== state.activeCleanupId
+      closeRequest.cleanup_id !==
+        (state.activeCleanupId || state.browserReapedCleanupId)
     ) {
       json(res, 400, { error: "fixture received a mismatched Browser cleanup identifier" });
+      return true;
+    }
+    if (closeRequest.cleanup_id === openedCleanupId) {
+      state.browserWindowCloseRequests += 1;
+      if (state.browserWindowCloseRequests === 1) {
+        json(res, 200, {
+          schema: "elastos.browser.close-result/v1",
+          page_id: pageId,
+          closed: false,
+          already_closed: false,
+          cleanup_id: closeRequest.cleanup_id,
+        });
+        return true;
+      }
+      await browserWindowCloseTerminalGate;
+      state.browserWindowCloseTerminalReceipts += 1;
+      json(res, 200, {
+        schema: "elastos.browser.close-result/v1",
+        page_id: pageId,
+        closed: false,
+        already_closed: true,
+        cleanup_id: closeRequest.cleanup_id,
+        terminal_effects: { page_absent: true },
+        cleanup: {
+          schema: "elastos.browser.runtime-session-cleanup/v1",
+          ok: true,
+          action: "already_absent",
+        },
+      });
       return true;
     }
     state.browserCleanupEffects += 1;
@@ -837,12 +874,67 @@ try {
   assert(state.errors.length === 0, "fixture server recorded errors", state.errors);
   assert(pageErrors.length === 0, "real Home/GUI/Browser source logged errors", pageErrors);
 
+  const restoredTaskbarButton = restoredGui.locator(
+    '.taskbar-item[data-target="browser"]',
+  );
+  assert(
+    await restoredTaskbarButton.getAttribute("data-open-windows") === "1",
+    "restored Browser taskbar entry did not represent exactly one window",
+  );
+  state.browserPageCount = 0;
+  state.browserVmCount = 0;
+  state.activeCleanupId = null;
+  state.browserReapedCleanupId = openedCleanupId;
+  await restoredGui
+    .locator('.window[data-target="browser"] [data-action="close"]')
+    .click();
+  await waitFor(
+    () => state.browserWindowCloseRequests >= 1,
+    5_000,
+    "first nonterminal Browser window close",
+  );
+  assert(
+    await restoredGui.locator('.window[data-target="browser"]').count() === 1 &&
+      await restoredTaskbarButton.getAttribute("data-open-windows") === "1",
+    "nonterminal Browser close removed the shell or taskbar entry",
+  );
+  releaseBrowserWindowCloseTerminal();
+  await waitFor(
+    async () =>
+      await restoredGui.locator('.window[data-target="browser"]').count() === 0,
+    10_000,
+    "delayed already-absent Browser window close",
+  );
+  const finalTaskbarButton = restoredGui.locator(
+    '.taskbar-item[data-target="browser"]',
+  );
+  const finalTaskbarCount = await finalTaskbarButton.count();
+  assert(
+    finalTaskbarCount === 0 ||
+      (await finalTaskbarButton.getAttribute("data-open-windows")) === "0",
+    "terminal Browser close retained an open taskbar entry",
+  );
+  assert(
+      state.browserWindowCloseRequests === 2 &&
+      state.browserWindowCloseTerminalReceipts === 1 &&
+      state.browserCleanupEffects === 1 &&
+      state.browserPageCount === 0 &&
+      state.browserVmCount === 0 &&
+      state.activeCleanupId === null &&
+      state.browserReapedCleanupId === openedCleanupId &&
+      state.browserOpenRequests === 2 &&
+      state.browserOpenEffects === 1,
+    "terminal Browser close duplicated work or retained Runtime residue",
+    state,
+  );
+
   console.log(
     "[home-browser-restored-lifecycle-headless] PASS " +
       `home_refresh=1 shell=${restoredWindowCount} frame=${restoredFrameCount} ` +
       `open_requests=${state.browserOpenRequests} provider_effects=${state.browserOpenEffects} ` +
       `cleanup_effects=${state.browserCleanupEffects} pages=${state.browserPageCount} ` +
-      `vms=${state.browserVmCount} recoverable_cleanup=1 open_id=${openId}`,
+      `vms=${state.browserVmCount} recoverable_cleanup=1 delayed_close=1 ` +
+      `open_id=${openId}`,
   );
 } finally {
   await browser?.close().catch(() => {});
